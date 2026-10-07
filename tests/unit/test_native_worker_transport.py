@@ -14,6 +14,7 @@ from sunpack.pipeline.extraction.internal.sevenzip.sevenzip_runner import (
     _NativeWorkerProcess,
 )
 from sunpack.core.support.resources import get_sevenzip_bridge_worker_path
+from tests.helpers.worker_events import worker_trace_item
 
 
 def _event(kind, job_id="job", **fields):
@@ -41,9 +42,12 @@ def test_interleaved_chunks_preserve_native_tables_and_metadata():
     second = NativeWorkerResultAccumulator("second")
     for job_id, accumulator in [("second", second), ("first", first)]:
         assert accumulator.accept(_event("manifest_chunk", job_id, seq=0, rows=[_row(job_id)]))
-        assert accumulator.accept(_event("trace_chunk", job_id, seq=0, items=[{
-            "index": 0, "path": job_id, "failed": True, "hresult": -2147467259,
-        }]))
+        assert accumulator.accept(_event(
+            "trace_chunk",
+            job_id,
+            seq=0,
+            items=[worker_trace_item(path=job_id, failed=True, hresult=-2147467259)],
+        ))
     for job_id, accumulator in [("first", first), ("second", second)]:
         result = _result(job_id)
         assert accumulator.accept(result) is False

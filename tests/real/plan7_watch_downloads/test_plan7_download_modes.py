@@ -57,8 +57,7 @@ def test_plan7_interleaved_downloads_react_for_every_final_path(tmp_path):
     )
     tick_latencies: list[float] = []
     sampler = MemorySampler()
-    started_at = time.perf_counter()
-    sampler.sample(installed_volumes=0, completed_archives=0, elapsed=0.0, label="baseline")
+    sampler.sample(files_seen=0, completed_files=0, label="baseline")
     try:
         stable = arrive_interleaved(
             harness,
@@ -67,9 +66,8 @@ def test_plan7_interleaved_downloads_react_for_every_final_path(tmp_path):
         )
         for item in cases.values():
             sampler.sample(
-                installed_volumes=len(cases),
-                completed_archives=0,
-                elapsed=time.perf_counter() - started_at,
+                files_seen=len(cases),
+                completed_files=0,
                 label=f"arrived_{item.key}",
             )
         for item in cases.values():
@@ -85,11 +83,10 @@ def test_plan7_interleaved_downloads_react_for_every_final_path(tmp_path):
             )
             item.completion_latency = time.perf_counter() - item.stable_at
             sampler.sample(
-                installed_volumes=len(cases),
-                completed_archives=sum(
+                files_seen=len(cases),
+                completed_files=sum(
                     1 for current in cases.values() if current.completion_latency is not None
                 ),
-                elapsed=time.perf_counter() - started_at,
                 label=f"after_{item.key}",
             )
         assert_plan7_success(
@@ -120,7 +117,7 @@ def test_plan7_direct_final_path_download_does_not_stall_after_completion(tmp_pa
     )
     tick_latencies: list[float] = []
     sampler = MemorySampler()
-    sampler.sample(installed_volumes=0, completed_archives=0, elapsed=0.0, label="baseline")
+    sampler.sample(files_seen=0, completed_files=0, label="baseline")
     try:
         arrive_slowly(
             harness,
@@ -128,7 +125,7 @@ def test_plan7_direct_final_path_download_does_not_stall_after_completion(tmp_pa
             tick_latencies=tick_latencies,
             write_mode="direct_final_path",
         )
-        sampler.sample(installed_volumes=1, completed_archives=0, elapsed=0.0, label="arrived_direct_zip")
+        sampler.sample(files_seen=1, completed_files=0, label="arrived_direct_zip")
         case.stable_at = harness.stable_at_by_name[case.case.entry_path.name]
         drive_watch_until(
             harness.watcher,
@@ -140,9 +137,8 @@ def test_plan7_direct_final_path_download_does_not_stall_after_completion(tmp_pa
         )
         case.completion_latency = time.perf_counter() - case.stable_at
         sampler.sample(
-            installed_volumes=1,
-            completed_archives=1,
-            elapsed=case.completion_latency,
+            files_seen=1,
+            completed_files=1,
             label="after_direct_zip",
         )
         assert_plan7_success(

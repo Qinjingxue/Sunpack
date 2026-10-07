@@ -12,6 +12,7 @@ import pytest
 from sunpack.core.contracts.archive_input import ArchiveInputDescriptor, ArchiveInputPart, InputExtent
 from sunpack.core.contracts.failures import FailureKind
 from tests.helpers.archive_tasks import make_archive_task, make_task_from_descriptor
+from tests.helpers.worker_events import worker_trace_item
 from sunpack.pipeline.extraction.internal.sevenzip.sevenzip_runner import (
     SevenZipRunner,
     _NativeWorkerProcess,
@@ -753,13 +754,34 @@ def test_worker_event_per_item_arrays_become_native_tables():
     )
 
     line = (
-        b'{"type":"result","status":"failed","verified_manifest":'
-        b'{"validated":false,"item_count":2,"file_count":1,'
-        b'"inventory":[0,1,0,3,1],"rows":[[0,"a.txt","",3,3,1,1,1,1,1,1,1,123,"616263"]]},'
-        b'"diagnostics":{"failure_kind":"checksum_error","output_trace":{"total_bytes_written":3,'
-        b'"items":[{"index":0,"path":"dir","is_dir":true},'
-        b'{"index":1,"path":"a.txt","bytes_written":3,"failed":true,"hresult":-2147467259}]}}}\n'
-    )
+        json.dumps({
+            "type": "result",
+            "status": "failed",
+            "verified_manifest": {
+                "validated": False,
+                "item_count": 2,
+                "file_count": 1,
+                "inventory": [0, 1, 0, 3, 1],
+                "rows": [[0, "a.txt", "", 3, 3, 1, 1, 1, 1, 1, 1, 1, 123, "616263"]],
+            },
+            "diagnostics": {
+                "failure_kind": "checksum_error",
+                "output_trace": {
+                    "total_bytes_written": 3,
+                    "items": [
+                        worker_trace_item(index=0, path="dir", is_dir=True),
+                        worker_trace_item(
+                            index=1,
+                            path="a.txt",
+                            bytes_written=3,
+                            failed=True,
+                            hresult=-2147467259,
+                        ),
+                    ],
+                },
+            },
+        }) + "\n"
+    ).encode()
 
     result = parse_worker_json_line(line)
 
@@ -790,6 +812,24 @@ def test_worker_event_rejects_non_objects_and_malformed_rows():
     assert parse_worker_json_line('{"type":"progress","completed_bytes":5}') == {
         "type": "progress", "completed_bytes": 5,
     }
+
+
+def test_worker_manifest_rows_require_inventory():
+    from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import parse_worker_json_line
+
+    assert parse_worker_json_line(json.dumps({
+        "type": "result",
+        "verified_manifest": {"rows": [[0, "a.txt", "", 3, 3, 1, 7, 1, 7, 1, 1, 1, 123, "616263"]]},
+    })) == {}
+
+
+def test_worker_output_trace_requires_complete_items():
+    from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import parse_worker_json_line
+
+    assert parse_worker_json_line(json.dumps({
+        "type": "result",
+        "diagnostics": {"output_trace": {"items": [{"path": "a.txt"}]}},
+    })) == {}
 
 
 def test_worker_manifest_native_parser_preserves_json_escaped_paths():
@@ -837,7 +877,6 @@ def test_worker_manifest_rows_and_inventory_are_order_independent(rows_first):
     }))
 
     manifest = result["verified_manifest"]
-    assert "version" not in manifest
     assert "rows" not in manifest
     assert manifest["inventory"]["complete"] is True
     native = native_worker_manifest(result)
@@ -891,7 +930,12 @@ def test_complete_worker_inventory_drops_transient_native_rows_and_output_trace(
             "inventory": [1, 1, 0, 3, 1],
             "rows": [[0, "a.txt", "", 3, 3, 1, 7, 1, 7, 1, 1, 1, 123, "616263"]],
         },
-        "diagnostics": {"output_trace": {"items": [{"path": "a.txt"}], "files_written": 1}},
+        "diagnostics": {
+            "output_trace": {
+                "items": [worker_trace_item(path="a.txt")],
+                "files_written": 1,
+            }
+        },
     }))
     diagnostics = build_worker_diagnostics(stdout="", stderr="", returncode=0, result_payload=result)
     assert "native_items" in result["diagnostics"]["output_trace"]
@@ -1181,7 +1225,6 @@ def test_worker_async_output_extracts_format_without_source_crc(tmp_path):
     assert worker_result["files_written"] == 1
     assert worker_result["bytes_written"] == len(payload)
     manifest = worker_result["verified_manifest"]
-    assert "version" not in manifest
     row = manifest["native_rows"].file_page(0, 1)[0]
     assert row["mtime_ns"] > 0
     assert row["magic"] == payload

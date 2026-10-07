@@ -1,6 +1,6 @@
 //! Per-file extraction progress manifest owned by Rust.
 //!
-//! Built from the worker's native output trace (or v3 manifest rows) plus a
+//! Built from the worker's native output trace (or manifest rows) plus a
 //! scan of the output directory. Python reads aggregates and bounded pages;
 //! the optional `.sunpack/extraction_manifest.json` file is written and read
 //! here as well.
@@ -26,7 +26,6 @@ enum FileStatus {
     Partial,
     Failed,
     Skipped,
-    #[serde(other)]
     Unverified,
 }
 
@@ -43,23 +42,17 @@ impl FileStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ProgressFile {
     path: String,
     archive_path: String,
     status: FileStatus,
-    #[serde(default)]
     source_round: u32,
-    #[serde(default)]
     bytes_written: u64,
-    #[serde(default)]
     expected_size: Option<u64>,
-    #[serde(default)]
     crc_ok: Option<bool>,
-    #[serde(default)]
     failure_stage: String,
-    #[serde(default)]
     failure_kind: String,
-    #[serde(default)]
     message: String,
 }
 
@@ -80,7 +73,7 @@ impl ProgressFile {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(deny_unknown_fields)]
 struct Summary {
     complete: usize,
     partial: usize,
@@ -109,8 +102,8 @@ impl Summary {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ManifestDocument {
     archive: String,
     out_dir: String,

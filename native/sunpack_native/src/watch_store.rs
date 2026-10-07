@@ -24,25 +24,15 @@ struct PendingRecord {
     path: String,
     size: i64,
     mtime: f64,
-    #[serde(default)]
     file_id: String,
-    #[serde(default)]
     change_usn: i64,
-    #[serde(default)]
     force: bool,
-    #[serde(default)]
     password_scope_dir: String,
-    #[serde(default)]
     source_input_root: String,
-    #[serde(default)]
     internal_recovery: bool,
-    #[serde(default)]
     durable_owner: bool,
-    #[serde(default)]
     active_outputs: BTreeMap<String, String>,
-    #[serde(default)]
     committed_roots: Vec<String>,
-    #[serde(default)]
     completed_sources: Vec<String>,
 }
 
@@ -52,33 +42,20 @@ struct EntryRecord {
     path: String,
     size: i64,
     mtime: f64,
-    #[serde(default)]
     file_id: String,
-    #[serde(default)]
     change_usn: i64,
-    #[serde(default = "pending_status")]
     status: String,
-    #[serde(default)]
     last_error: String,
-    #[serde(default)]
     attempt_count: i64,
-    #[serde(default)]
     failure_kind: String,
-    #[serde(default)]
     failure_stage: String,
-    #[serde(default)]
     failure_payload: Map<String, Value>,
-    #[serde(default)]
     last_attempt_at: f64,
-    #[serde(default)]
     password_generation: i64,
 }
 
-fn pending_status() -> String {
-    "pending".to_string()
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Cursor {
     journal_id: i128,
     next_usn: i128,
@@ -153,6 +130,24 @@ struct SnapshotDocument<'a> {
     watch_cursors: &'a BTreeMap<String, Cursor>,
     pending_work: BTreeMap<&'a str, &'a PendingRecord>,
     entries: BTreeMap<&'a str, &'a EntryRecord>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SnapshotInput {
+    checkpoint_seq: u64,
+    password_generation: i64,
+    password_source_signature: String,
+    watch_cursors: BTreeMap<String, Cursor>,
+    pending_work: BTreeMap<String, PendingRecord>,
+    entries: BTreeMap<String, EntryRecord>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct JournalTransaction {
+    seq: u64,
+    operations: Vec<Value>,
 }
 
 #[pymethods]
@@ -448,6 +443,15 @@ fn invalid(message: impl Into<String>) -> PyErr {
     PyValueError::new_err(message.into())
 }
 
+fn require_fields(object: &Map<String, Value>, required: &[&str]) -> PyResult<()> {
+    if required.iter().any(|name| !object.contains_key(*name))
+        || object.keys().any(|name| !required.contains(&name.as_str()))
+    {
+        return Err(invalid("invalid journal operation fields"));
+    }
+    Ok(())
+}
+
 fn decode_record<T: for<'de> Deserialize<'de>>(value: &Value) -> PyResult<T> {
     if !value.is_object() {
         return Err(PyTypeError::new_err("state record value must be an object"));
@@ -459,46 +463,78 @@ fn decode_operation(operation: &Value) -> PyResult<Operation> {
     let Some(object) = operation.as_object() else {
         return Err(PyTypeError::new_err("journal operation must be an object"));
     };
-    let action = object.get("op").and_then(Value::as_str).unwrap_or("");
+    let action = object
+        .get("op")
+        .and_then(Value::as_str)
+        .ok_or_else(|| PyTypeError::new_err("journal operation op must be a string"))?;
     match action {
         "set_metadata" => {
+            require_fields(object, &["op", "value"])?;
             let value = object
                 .get("value")
                 .and_then(Value::as_object)
                 .ok_or_else(|| PyTypeError::new_err("metadata value must be an object"))?;
+            require_fields(value, &["password_generation", "password_source_signature"])?;
             let generation = value
                 .get("password_generation")
-                .and_then(json_int)
+                .and_then(Value::as_i64)
                 .ok_or_else(|| invalid("metadata password_generation must be an integer"))?;
-            let signature = json_text(value.get("password_source_signature"));
-            return Ok(Operation::SetMetadata(generation.max(0) as i64, signature));
+            let signature = value
+                .get("password_source_signature")
+                .and_then(Value::as_str)
+                .ok_or_else(|| invalid("metadata password_source_signature must be a string"))?;
+            if generation < 0 {
+                return Err(invalid("metadata password_generation must not be negative"));
+            }
+            return Ok(Operation::SetMetadata(generation, signature.to_owned()));
         }
         "set_watch_cursors" => {
+            require_fields(object, &["op", "value"])?;
             let value = object
                 .get("value")
                 .and_then(Value::as_object)
                 .ok_or_else(|| PyTypeError::new_err("watch cursor value must be an object"))?;
-            return Ok(Operation::SetCursors(decode_cursors(value)));
+            let cursors = serde_json::from_value::<BTreeMap<String, Cursor>>(Value::Object(
+                value.clone(),
+            ))
+            .map_err(|error| invalid(format!("invalid watch cursor value: {error}")))?;
+            return Ok(Operation::SetCursors(
+                cursors
+                    .into_iter()
+                    .map(|(key, cursor)| (key.to_lowercase(), cursor))
+                    .collect(),
+            ));
         }
         _ => {}
     }
-    let collection = match object
+    let collection_name = object
         .get("collection")
         .and_then(Value::as_str)
-        .unwrap_or("")
-    {
+        .ok_or_else(|| PyTypeError::new_err("journal operation collection must be a string"))?;
+    let collection = match collection_name {
         "pending_work" => Collection::Pending,
         "entries" => Collection::Entries,
         other => return Err(invalid(format!("unknown state collection: {other}"))),
     };
-    let key = json_text(object.get("key"));
+    if action == "put" {
+        require_fields(object, &["op", "collection", "key", "value"])?;
+    } else {
+        require_fields(object, &["op", "collection", "key"])?;
+    }
+    let key = object
+        .get("key")
+        .and_then(Value::as_str)
+        .ok_or_else(|| PyTypeError::new_err("journal operation key must be a string"))?
+        .to_owned();
     if key.is_empty() {
         return Err(invalid("state operation key must not be empty"));
     }
     match action {
         "delete" => Ok(Operation::Delete(collection, key)),
         "put" => {
-            let value = object.get("value").unwrap_or(&Value::Null);
+            let value = object
+                .get("value")
+                .ok_or_else(|| PyTypeError::new_err("journal put operation requires value"))?;
             Ok(match collection {
                 Collection::Pending => {
                     let record: PendingRecord = decode_record(value)?;
@@ -514,85 +550,37 @@ fn decode_operation(operation: &Value) -> PyResult<Operation> {
     }
 }
 
-fn decode_cursors(value: &Map<String, Value>) -> BTreeMap<String, Cursor> {
-    value
-        .iter()
-        .filter_map(|(key, item)| {
-            let item = item.as_object()?;
-            let field = |name: &str| item.get(name).and_then(json_int).unwrap_or(0);
-            Some((
-                key.to_lowercase(),
-                Cursor {
-                    journal_id: field("journal_id"),
-                    next_usn: field("next_usn"),
-                },
-            ))
-        })
-        .collect()
-}
-
-fn json_int(value: &Value) -> Option<i128> {
-    value
-        .as_i64()
-        .map(i128::from)
-        .or_else(|| value.as_u64().map(i128::from))
-        .or_else(|| value.is_null().then_some(0))
-}
-
-fn json_text(value: Option<&Value>) -> String {
-    match value {
-        None | Some(Value::Null) => String::new(),
-        Some(Value::String(text)) => text.clone(),
-        Some(other) => other.to_string(),
-    }
-}
-
-fn load_records<T: for<'de> Deserialize<'de>>(
-    payload: Option<&Value>,
-    path_of: impl Fn(&T) -> &str,
-) -> HashMap<String, Arc<T>> {
-    let mut records = HashMap::new();
-    let Some(payload) = payload.and_then(Value::as_object) else {
-        return records;
-    };
-    for value in payload.values() {
-        // A record that no longer matches the schema is dropped, as a
-        // dataclass(**value) TypeError was before.
-        if let Ok(record) = decode_record::<T>(value) {
-            records.insert(path_key(path_of(&record)), Arc::new(record));
-        }
-    }
-    records
-}
-
 fn load_snapshot_file(path: &str) -> PyResult<(u64, StateData)> {
     let mut file = TrackedFile::open(path, "watch_state_snapshot_input")?;
     let mut raw = Vec::new();
     std::io::Read::read_to_end(&mut file, &mut raw)?;
-    let payload: Value = serde_json::from_slice(&raw)
-        .map_err(|_| invalid(format!("corrupt watch state snapshot at {path}")))?;
-    let Some(object) = payload.as_object() else {
-        return Err(invalid(format!("invalid watch state snapshot at {path}")));
-    };
-    let metadata = |name: &str| -> PyResult<i128> {
-        match object.get(name) {
-            None => Ok(0),
-            Some(value) => json_int(value)
-                .ok_or_else(|| invalid(format!("invalid watch state snapshot metadata at {path}"))),
-        }
-    };
-    let checkpoint_seq = metadata("checkpoint_seq")?.max(0) as u64;
-    let password_generation = metadata("password_generation")?.max(0) as i64;
+    let snapshot: SnapshotInput = serde_json::from_slice(&raw)
+        .map_err(|error| invalid(format!("corrupt watch state snapshot at {path}: {error}")))?;
+    if snapshot.password_generation < 0 {
+        return Err(invalid(format!(
+            "corrupt watch state snapshot at {path}: negative password_generation"
+        )));
+    }
+    let checkpoint_seq = snapshot.checkpoint_seq;
+    let password_generation = snapshot.password_generation;
     let data = StateData {
-        pending: load_records::<PendingRecord>(object.get("pending_work"), |record| &record.path),
-        entries: load_records::<EntryRecord>(object.get("entries"), |record| &record.path),
+        pending: snapshot
+            .pending_work
+            .into_values()
+            .map(|record| (path_key(&record.path), Arc::new(record)))
+            .collect(),
+        entries: snapshot
+            .entries
+            .into_values()
+            .map(|record| (path_key(&record.path), Arc::new(record)))
+            .collect(),
         password_generation,
-        password_source_signature: json_text(object.get("password_source_signature")),
-        cursors: object
-            .get("watch_cursors")
-            .and_then(Value::as_object)
-            .map(decode_cursors)
-            .unwrap_or_default(),
+        password_source_signature: snapshot.password_source_signature,
+        cursors: snapshot
+            .watch_cursors
+            .into_iter()
+            .map(|(key, cursor)| (key.to_lowercase(), cursor))
+            .collect(),
     };
     Ok((checkpoint_seq, data))
 }
@@ -619,24 +607,18 @@ fn replay_segment_file(
             break;
         }
         line_number += 1;
-        // A torn final append is harmless in any immutable old segment; a
+        // A torn final append is harmless in a sealed segment; a
         // lost transaction is still caught by the next sequence gap.
         if line.last() != Some(&b'\n') {
             break;
         }
         let at = || format!("{path}:{line_number}");
-        let transaction: Value = serde_json::from_slice(&line)
+        let transaction: JournalTransaction = serde_json::from_slice(&line)
             .map_err(|_| invalid(format!("corrupt watch state journal at {}", at())))?;
-        let Some(object) = transaction.as_object() else {
-            return Err(invalid(format!(
-                "invalid watch state journal record at {}",
-                at()
-            )));
-        };
-        let seq = object
-            .get("seq")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| invalid(format!("invalid watch state sequence at {}", at())))?;
+        let seq = transaction.seq;
+        if transaction.operations.is_empty() {
+            return Err(invalid(format!("invalid watch state operations at {}", at())));
+        }
         if seq <= checkpoint_seq {
             continue;
         }
@@ -646,12 +628,8 @@ fn replay_segment_file(
                 at()
             )));
         }
-        let operations = object
-            .get("operations")
-            .and_then(Value::as_array)
-            .filter(|operations| !operations.is_empty())
-            .ok_or_else(|| invalid(format!("invalid watch state operations at {}", at())))?;
-        let decoded = operations
+        let decoded = transaction
+            .operations
             .iter()
             .map(decode_operation)
             .collect::<PyResult<Vec<_>>>()

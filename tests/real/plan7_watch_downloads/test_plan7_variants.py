@@ -26,16 +26,14 @@ def test_plan7_encryption_and_container_variants_are_processed(tmp_path):
     )
     sampler = MemorySampler()
     tick_latencies: list[float] = []
-    started_at = time.perf_counter()
-    sampler.sample(installed_volumes=0, completed_archives=0, elapsed=0.0, label="baseline")
+    sampler.sample(files_seen=0, completed_files=0, label="baseline")
     try:
         for item in cases.values():
             arrive_slowly(harness, item.case.entry_path, tick_latencies=tick_latencies)
             item.stable_at = harness.stable_at_by_name[item.case.entry_path.name]
             sampler.sample(
-                installed_volumes=1,
-                completed_archives=0,
-                elapsed=time.perf_counter() - started_at,
+                files_seen=1,
+                completed_files=0,
                 label=f"arrived_{item.key}",
             )
         for item in cases.values():
@@ -49,11 +47,10 @@ def test_plan7_encryption_and_container_variants_are_processed(tmp_path):
             )
             item.completion_latency = time.perf_counter() - item.stable_at
             sampler.sample(
-                installed_volumes=len(cases),
-                completed_archives=sum(
+                files_seen=len(cases),
+                completed_files=sum(
                     1 for current in cases.values() if current.completion_latency is not None
                 ),
-                elapsed=time.perf_counter() - started_at,
                 label=f"after_{item.key}",
             )
         assert_plan7_success(

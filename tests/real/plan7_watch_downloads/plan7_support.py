@@ -865,7 +865,7 @@ def assert_plan7_success(
 
     if error_info is not None:
         error_info.update({
-            "completed_archives": completed_count,
+            "completed_files": completed_count,
             "pipeline_submissions": len(harness.submit_times),
             "pipeline_run_seconds": [round(duration, 3) for duration in harness.run_durations],
             "fixture_build_seconds": dict(FIXTURE_BUILD_TIMING),
@@ -919,11 +919,11 @@ def assert_plan7_success(
             "\nplan7 memory timeline (archives completed -> parent/worker RSS):\n"
             + "\n".join(
                 f"  {str(item['label']):<18s} "
-                f"completed={item['completed_archives']:>2d} -> "
-                f"parent={item['parent_rss'] / 1024 / 1024:7.1f}MB "
-                f"worker={item['worker_rss'] / 1024 / 1024:6.1f}MB "
+                f"completed={item['completed_files']:>2d} -> "
+                f"parent={item['parent_rss_mib']:7.1f}MB "
+                f"worker={item['worker_rss_mib']:6.1f}MB "
                 f"children={item['child_count']} "
-                f"volumes={item['installed_volumes']}"
+                f"files={item['files_seen']}"
                 for item in timeline
             )
         )

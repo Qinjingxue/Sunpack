@@ -10,6 +10,9 @@ from sunpack.pipeline.extraction.output_inventory import OutputInventory
 from sunpack.pipeline.verification import VerificationScheduler
 from tests.helpers.archive_tasks import make_archive_task
 from tests.helpers.config_factory import make_config
+from tests.helpers.worker_events import worker_trace_item
+from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import parse_worker_json_line
+from sunpack.pipeline.extraction.progress import write_extraction_progress_manifest_payload
 
 
 @pytest.mark.parametrize(
@@ -215,16 +218,44 @@ def test_output_presence_uses_worker_manifest_progress_as_completeness(tmp_path)
     partial = out_dir / "partial.bin"
     complete.write_text("ok", encoding="utf-8")
     partial.write_bytes(b"12345")
-    manifest = out_dir / ".sunpack" / "extraction_manifest.json"
-    manifest.parent.mkdir(parents=True)
-    manifest.write_text(json.dumps({
-        "files": [
-            {"path": str(complete), "archive_path": "complete.txt", "status": "complete", "bytes_written": 2, "expected_size": 2},
-            {"path": str(partial), "archive_path": "partial.bin", "status": "partial", "bytes_written": 5, "expected_size": 10},
-            {"path": "missing.bin", "archive_path": "missing.bin", "status": "failed", "bytes_written": 0, "expected_size": 10},
-        ],
-        "summary": {"complete": 1, "partial": 1, "failed": 1, "total": 3},
-    }), encoding="utf-8")
+    manifest, _ = write_extraction_progress_manifest_payload(
+        archive=str(archive),
+        out_dir=str(out_dir),
+        write_file=True,
+        diagnostics={
+            "result": parse_worker_json_line(json.dumps({
+                "status": "failed",
+                "failure_stage": "item_extract",
+                "failure_kind": "checksum_error",
+                "files_written": 2,
+                "bytes_written": 7,
+                "diagnostics": {
+                    "output_trace": {
+                        "items": [
+                            worker_trace_item(
+                                path="complete.txt",
+                                output_path=str(complete),
+                                bytes_written=2,
+                                expected_size=2,
+                            ),
+                            worker_trace_item(
+                                path="partial.bin",
+                                output_path=str(partial),
+                                failed=True,
+                                bytes_written=5,
+                                expected_size=10,
+                            ),
+                            worker_trace_item(
+                                path="missing.bin",
+                                failed=True,
+                                expected_size=10,
+                            ),
+                        ]
+                    }
+                },
+            }))
+        },
+    )
     task = _task(tmp_path)
     result = ExtractionResult(
         success=True,

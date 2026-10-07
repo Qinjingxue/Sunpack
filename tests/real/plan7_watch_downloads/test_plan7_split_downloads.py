@@ -34,12 +34,11 @@ def test_plan7_split_downloads_out_of_order_complete_and_record_memory(
     harness = start_watch(tmp_path, "split", passwords=passwords)
     sampler = MemorySampler()
     tick_latencies: list[float] = []
-    started_at = time.perf_counter()
-    sampler.sample(installed_volumes=0, completed_archives=0, elapsed=0.0, label="baseline")
+    sampler.sample(files_seen=0, completed_files=0, label="baseline")
     rng = random.Random(0x5EED)
 
     try:
-        installed_volumes = 0
+        files_seen = 0
         arrived_count = 0
         arrival_records = {}
         for plan7_case in cases.values():
@@ -47,15 +46,14 @@ def test_plan7_split_downloads_out_of_order_complete_and_record_memory(
             arrival_records[plan7_case.key] = [path.name for path in order]
             for volume in order:
                 arrive_slowly(harness, volume, tick_latencies=tick_latencies)
-                installed_volumes += 1
+                files_seen += 1
             input_names = set(input_volume_names(plan7_case))
             last_input = next(path for path in reversed(order) if path.name in input_names)
             plan7_case.stable_at = harness.stable_at_by_name[last_input.name]
             arrived_count += 1
             sampler.sample(
-                installed_volumes=installed_volumes,
-                completed_archives=0,
-                elapsed=time.perf_counter() - started_at,
+                files_seen=files_seen,
+                completed_files=0,
                 label=f"arrived_{plan7_case.key}",
             )
 
@@ -71,11 +69,10 @@ def test_plan7_split_downloads_out_of_order_complete_and_record_memory(
             )
             plan7_case.completion_latency = time.perf_counter() - plan7_case.stable_at
             sampler.sample(
-                installed_volumes=installed_volumes,
-                completed_archives=sum(
+                files_seen=files_seen,
+                completed_files=sum(
                     1 for item in cases.values() if item.completion_latency is not None
                 ),
-                elapsed=time.perf_counter() - started_at,
                 label=f"after_{plan7_case.key}",
             )
 

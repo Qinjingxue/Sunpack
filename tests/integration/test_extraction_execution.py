@@ -19,6 +19,7 @@ from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import (
 from sunpack.pipeline.extraction.scheduler import ExtractionScheduler
 from tests.helpers.archive_tasks import make_archive_task
 from tests.helpers.detection_config import with_detection_pipeline
+from tests.helpers.worker_events import worker_trace_item
 
 
 def _completed(*, returncode, stdout, stderr, worker_diagnostics=None):
@@ -232,24 +233,24 @@ class ExtractionExecutionTests(unittest.TestCase):
                         "diagnostics": {
                             "output_trace": {
                                 "items": [
-                                    {
-                                        "path": str(good_path),
-                                        "archive_path": "good.txt",
-                                        "failed": False,
-                                        "bytes_written": 4,
-                                        "expected_size": 4,
-                                        "crc_ok": True,
-                                    },
-                                    {
-                                        "path": str(partial_path),
-                                        "archive_path": "bad.bin",
-                                        "failed": True,
-                                        "bytes_written": 4,
-                                        "expected_size": 8,
-                                        "crc_ok": False,
-                                        "failure_stage": "item_extract",
-                                        "failure_kind": "checksum_error",
-                                    },
+                                    worker_trace_item(
+                                        path="good.txt",
+                                        output_path=str(good_path),
+                                        bytes_written=4,
+                                        expected_size=4,
+                                        source_crc32=1,
+                                        has_source_crc32=True,
+                                        crc_verified=True,
+                                    ),
+                                    worker_trace_item(
+                                        path="bad.bin",
+                                        output_path=str(partial_path),
+                                        failed=True,
+                                        bytes_written=4,
+                                        expected_size=8,
+                                        source_crc32=1,
+                                        has_source_crc32=True,
+                                    ),
                                 ],
                                 "total_bytes_written": 8,
                             }
@@ -298,11 +299,12 @@ class ExtractionExecutionTests(unittest.TestCase):
                         "diagnostics": {
                             "output_trace": {
                                 "items": [
-                                    {
-                                        "path": str(good_path),
-                                        "archive_path": "good.txt",
-                                        "bytes_written": 2,
-                                    },
+                                    worker_trace_item(
+                                        path="good.txt",
+                                        output_path=str(good_path),
+                                        bytes_written=2,
+                                        expected_size=2,
+                                    ),
                                 ],
                             }
                         },

@@ -3,6 +3,7 @@ import json
 from sunpack_native import load_progress_manifest, worker_manifest_from_rows
 
 from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import parse_worker_json_line
+from tests.helpers.worker_events import worker_trace_item
 from sunpack.pipeline.extraction.progress import (
     build_extraction_progress_manifest,
     iter_progress_files,
@@ -14,7 +15,9 @@ def _trace_result(items, **fields):
     return parse_worker_json_line(json.dumps({
         "type": "result",
         **fields,
-        "diagnostics": {"output_trace": {"items": items}},
+        "diagnostics": {
+            "output_trace": {"items": [worker_trace_item(**item) for item in items]}
+        },
     }))
 
 
@@ -124,13 +127,19 @@ def test_progress_manifest_file_round_trips_through_rust(tmp_path):
 
     payload = json.loads((out_dir / ".sunpack" / "extraction_manifest.json").read_text(encoding="utf-8"))
     assert path == str(out_dir / ".sunpack" / "extraction_manifest.json")
-    assert "version" not in payload
     assert payload["summary"]["partial"] == 1
     assert payload["files"][0]["archive_path"] == "雪.txt"
     loaded = load_progress_manifest(path)
     assert loaded.summary == manifest.summary
     assert loaded.file_page(0, 1) == manifest.file_page(0, 1)
     assert load_progress_manifest(str(tmp_path / "missing.json")) is None
+
+
+def test_incomplete_progress_manifest_is_unreadable(tmp_path):
+    path = tmp_path / "incomplete.json"
+    path.write_text(json.dumps({"files": [], "summary": {}}), encoding="utf-8")
+
+    assert load_progress_manifest(str(path)) is None
 
 
 def test_complete_worker_inventory_uses_summary_only_manifest(tmp_path):

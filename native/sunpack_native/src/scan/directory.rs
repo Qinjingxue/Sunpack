@@ -200,7 +200,7 @@ pub(crate) struct NativeWorkerManifest {
 }
 
 impl NativeWorkerManifest {
-    /// Build from parsed v3 rows and the five-column `inventory` summary.
+    /// Build from parsed rows and the five-column `inventory` summary.
     pub(crate) fn from_parts(files: Vec<OutputFileRecord>, inventory: [u64; 5]) -> PyResult<Self> {
         let count = |value: u64, what: &str| {
             usize::try_from(value).map_err(|_| {
@@ -1624,7 +1624,7 @@ pub(crate) fn worker_manifest_from_rows(
         let row = row.bind(py);
         if row.len() != 14 {
             return Err(pyo3::exceptions::PyValueError::new_err(
-                "worker manifest v3 row must contain 14 columns",
+                "worker manifest row must contain 14 columns",
             ));
         }
         let path = row.get_item(1)?.extract::<String>()?;

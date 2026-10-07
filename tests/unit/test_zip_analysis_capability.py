@@ -31,8 +31,6 @@ def test_zip_capabilities_preserve_detection_and_graph_payloads(tmp_path):
     assert report.best_selected.format == "zip"
     assert consistency["error"] == ""
     assert consistency["cd_parseable"] is True
-    assert "schema_version" not in consistency
-    assert "schema_version" not in graph
     assert {"nodes", "edges", "violations", "relation_violations", "explanations", "summary"} <= graph.keys()
 
 

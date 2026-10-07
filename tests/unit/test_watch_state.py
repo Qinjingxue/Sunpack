@@ -42,7 +42,6 @@ def test_checkpoint_uses_unique_atomic_snapshot_writer(tmp_path, monkeypatch):
     assert temporary_paths[0].parent == tmp_path
     assert temporary_paths[0].name.endswith(".tmp")
     payload = json.loads(state_path.read_text(encoding="utf-8"))
-    assert "version" not in payload
     assert payload["checkpoint_seq"] == state.applied_seq
     assert not list(tmp_path.glob(".state.json.*.tmp"))
 
@@ -67,7 +66,6 @@ def test_incremental_update_appends_segment_without_replacing_snapshot(tmp_path,
     journal_text = state.journal_path.read_text(encoding="utf-8")
     assert journal_text.endswith("\n")
     transaction = json.loads(journal_text)
-    assert "version" not in transaction
     assert transaction["seq"] == state.applied_seq
     [reloaded] = WatchStateStore(str(state_path)).pending_work_items()
     assert reloaded.path == str((tmp_path / "queued.7z").resolve())
@@ -107,6 +105,35 @@ def test_corrupt_complete_journal_record_is_reported(tmp_path):
 
     with pytest.raises(WatchStateJournalError, match="corrupt watch state journal"):
         WatchStateStore(str(state.path))
+
+
+def test_snapshot_missing_required_field_is_rejected(tmp_path):
+    state_path = tmp_path / "state.json"
+    state_path.write_text(json.dumps({"checkpoint_seq": 0}), encoding="utf-8")
+
+    with pytest.raises(WatchStateJournalError, match="corrupt watch state snapshot"):
+        WatchStateStore(str(state_path))
+
+
+def test_journal_operation_with_unexpected_field_is_rejected(tmp_path):
+    state_path = tmp_path / "state.json"
+    state = WatchStateStore(str(state_path))
+    state.save()
+    state.journal_path.write_text(
+        json.dumps({
+            "seq": 1,
+            "operations": [{
+                "op": "delete",
+                "collection": "entries",
+                "key": "entry",
+                "unexpected": True,
+            }],
+        }) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(WatchStateJournalError, match="invalid watch state operation"):
+        WatchStateStore(str(state_path))
 
 
 def test_duplicate_sequence_is_rejected(tmp_path):
@@ -433,7 +460,6 @@ def test_native_checkpoint_round_trips_nested_unicode_payload(tmp_path):
 
     payload = json.loads(state_path.read_text(encoding="utf-8"))
     entry = next(iter(payload["entries"].values()))
-    assert "version" not in payload
     assert payload["watch_cursors"]["volume:雪"]["journal_id"] == 2**63 + 17
     assert entry["last_error"] == "bad\n\"password\\雪"
     assert entry["failure_payload"]["nested"]["unicode"] == "雪☃"

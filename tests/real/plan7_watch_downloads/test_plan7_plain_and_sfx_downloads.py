@@ -33,8 +33,7 @@ def test_plan7_plain_and_sfx_downloads_complete_and_record_memory(
     harness = start_watch(tmp_path, "plain_sfx", passwords=passwords)
     sampler = MemorySampler()
     tick_latencies: list[float] = []
-    started_at = time.perf_counter()
-    sampler.sample(installed_volumes=0, completed_archives=0, elapsed=0.0, label="baseline")
+    sampler.sample(files_seen=0, completed_files=0, label="baseline")
 
     try:
         arrived_count = 0
@@ -43,9 +42,8 @@ def test_plan7_plain_and_sfx_downloads_complete_and_record_memory(
             arrived_count += 1
             plan7_case.stable_at = harness.stable_at_by_name[plan7_case.case.entry_path.name]
             sampler.sample(
-                installed_volumes=arrived_count,
-                completed_archives=0,
-                elapsed=time.perf_counter() - started_at,
+                files_seen=arrived_count,
+                completed_files=0,
                 label=f"arrived_{plan7_case.key}",
             )
 
@@ -60,11 +58,10 @@ def test_plan7_plain_and_sfx_downloads_complete_and_record_memory(
             )
             plan7_case.completion_latency = time.perf_counter() - plan7_case.stable_at
             sampler.sample(
-                installed_volumes=len(cases),
-                completed_archives=sum(
+                files_seen=len(cases),
+                completed_files=sum(
                     1 for item in cases.values() if item.completion_latency is not None
                 ),
-                elapsed=time.perf_counter() - started_at,
                 label=f"after_{plan7_case.key}",
             )
 

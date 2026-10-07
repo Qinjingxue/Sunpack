@@ -16,8 +16,8 @@ use std::fmt;
 use std::sync::Arc;
 
 /// One `diagnostics.output_trace.items` entry, as emitted by the worker.
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct OutputTraceItem {
     pub(crate) index: u32,
     pub(crate) path: String,
@@ -280,8 +280,8 @@ impl<'de, 'py> Visitor<'de> for PySeed<'py> {
             let value = map.next_value_seed(PySeed { py, scope: child })?;
             dict.set_item(key, value).map_err(py_error)?;
         }
-        if let Some(files) = rows.filter(|files| !files.is_empty()) {
-            let columns = inventory.unwrap_or([0, files.len() as u64, 0, 0, 0]);
+        if let Some(files) = rows {
+            let columns = inventory.ok_or_else(|| de::Error::missing_field("inventory"))?;
             let manifest = NativeWorkerManifest::from_parts(files, columns).map_err(py_error)?;
             dict.set_item("native_rows", Py::new(py, manifest).map_err(py_error)?)
                 .map_err(py_error)?;
@@ -513,7 +513,7 @@ fn recover_job_id(text: &str) -> Option<String> {
     }
 }
 
-/// `verified_manifest.rows` v3: one fixed 14-column array per regular file.
+/// One fixed 14-column array per regular file in the worker manifest.
 struct WorkerRows(Vec<OutputFileRecord>);
 
 type WorkerRow = (
@@ -541,7 +541,7 @@ impl<'de> Deserialize<'de> for WorkerRows {
             type Value = WorkerRows;
 
             fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-                formatter.write_str("worker manifest v3 rows")
+                formatter.write_str("worker manifest rows")
             }
 
             fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<WorkerRows, A::Error> {

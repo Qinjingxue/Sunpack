@@ -360,25 +360,11 @@ class WatchMemorySample:
     python_peak_mib: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
-        payload = asdict(self)
-        # Compatibility aliases for the original Plan 7 memory timeline.
-        payload.update(
-            {
-                "installed_volumes": self.files_seen,
-                "completed_archives": self.completed_files,
-                "parent_rss": int(self.parent_rss_mib * 1024**2),
-                "worker_rss": int(self.worker_rss_mib * 1024**2),
-            }
-        )
-        return payload
+        return asdict(self)
 
 
 class WatchMemorySampler:
-    """Continuous process-tree sampler with watch/cache/native diagnostics.
-
-    ``sample`` retains the argument names used by the older Plan 7 helper so
-    existing watch tests can use the extracted implementation unchanged.
-    """
+    """Continuous process-tree sampler with watch/cache/native diagnostics."""
 
     def __init__(
         self,
@@ -484,24 +470,16 @@ class WatchMemorySampler:
     def sample(
         self,
         *,
-        installed_volumes: int | None = None,
-        completed_archives: int | None = None,
         files_seen: int | None = None,
         completed_files: int | None = None,
-        elapsed: float | None = None,
         label: str = "",
         collect: bool = True,
     ) -> dict[str, Any]:
-        del elapsed  # elapsed is retained for Plan 7 call compatibility.
         with self._lock:
             if files_seen is not None:
                 self._files_seen = int(files_seen)
-            elif installed_volumes is not None:
-                self._files_seen = int(installed_volumes)
             if completed_files is not None:
                 self._completed_files = int(completed_files)
-            elif completed_archives is not None:
-                self._completed_files = int(completed_archives)
         return self._take(label=label, collect=collect).to_dict()
 
     def start(self) -> None:
@@ -556,7 +534,7 @@ class WatchMemorySampler:
         )
 
     def summary(self) -> dict[str, Any]:
-        """Compatibility summary used by the existing Plan 7 tests."""
+        """Return sample counts and process memory growth."""
 
         rows = list(self.samples)
         completion_rows = [row for row in rows if row.label.startswith("after_")] or rows[1:]
@@ -576,8 +554,8 @@ class WatchMemorySampler:
                 min(row.child_count for row in completion_rows),
                 max(row.child_count for row in completion_rows),
             ],
-            "final_parent_rss": int(final.parent_rss_mib * 1024**2),
-            "final_worker_rss": int(final.worker_rss_mib * 1024**2),
+            "final_parent_rss_bytes": int(final.parent_rss_mib * 1024**2),
+            "final_worker_rss_bytes": int(final.worker_rss_mib * 1024**2),
         }
 
 

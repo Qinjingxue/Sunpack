@@ -3,8 +3,8 @@ use std::io;
 pub const MAGIC: u32 = u32::from_le_bytes(*b"SPWB");
 pub const MAX_VOLUME_GUID_BYTES: usize = 64;
 pub const FILE_ID_BYTES: usize = 16;
-pub const REQUEST_BYTES: usize = 128;
-pub const RESPONSE_BYTES: usize = 48;
+pub const REQUEST_BYTES: usize = 112;
+pub const RESPONSE_BYTES: usize = 42;
 const _: () = assert!(REQUEST_BYTES <= 4096);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -109,14 +109,15 @@ impl Request {
         }
         let mut bytes = [0u8; REQUEST_BYTES];
         bytes[0..4].copy_from_slice(&MAGIC.to_le_bytes());
-        bytes[6..8].copy_from_slice(&(self.opcode as u16).to_le_bytes());
-        bytes[8..16].copy_from_slice(&self.request_id.to_le_bytes());
-        bytes[16..24].copy_from_slice(&self.previous_usn.to_le_bytes());
-        bytes[24..32].copy_from_slice(&self.current_usn.to_le_bytes());
-        bytes[32] = self.file_id_len;
-        bytes[33] = volume.len() as u8;
-        bytes[40..56].copy_from_slice(&self.file_id);
-        bytes[56..56 + volume.len()].copy_from_slice(volume);
+        bytes[4..6].copy_from_slice(&(self.opcode as u16).to_le_bytes());
+        bytes[6..14].copy_from_slice(&self.request_id.to_le_bytes());
+        bytes[14..22].copy_from_slice(&self.previous_usn.to_le_bytes());
+        bytes[22..30].copy_from_slice(&self.current_usn.to_le_bytes());
+        bytes[30] = self.file_id_len;
+        bytes[31] = volume.len() as u8;
+        let file_id_len = usize::from(self.file_id_len);
+        bytes[32..32 + file_id_len].copy_from_slice(&self.file_id[..file_id_len]);
+        bytes[48..48 + volume.len()].copy_from_slice(volume);
         Ok(bytes)
     }
 
@@ -133,42 +134,26 @@ impl Request {
                 "invalid broker request magic",
             ));
         }
-        if bytes[4..6] != [0, 0] {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "broker request contains non-zero reserved bytes",
-            ));
-        }
-        let opcode = Opcode::try_from(u16::from_le_bytes(bytes[6..8].try_into().unwrap()))?;
-        let file_id_len = bytes[32];
-        let volume_len = bytes[33] as usize;
+        let opcode = Opcode::try_from(u16::from_le_bytes(bytes[4..6].try_into().unwrap()))?;
+        let file_id_len = bytes[30];
+        let volume_len = bytes[31] as usize;
         if !matches!(file_id_len, 0 | 8 | 16) || volume_len > MAX_VOLUME_GUID_BYTES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "invalid broker request fields",
             ));
         }
-        if bytes[34..40].iter().any(|byte| *byte != 0)
-            || bytes[40 + file_id_len as usize..56]
-                .iter()
-                .any(|byte| *byte != 0)
-            || bytes[56 + volume_len..].iter().any(|byte| *byte != 0)
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "broker request contains non-zero reserved bytes",
-            ));
-        }
         let mut file_id = [0u8; FILE_ID_BYTES];
-        file_id.copy_from_slice(&bytes[40..56]);
-        let volume_guid = std::str::from_utf8(&bytes[56..56 + volume_len])
+        let file_id_width = usize::from(file_id_len);
+        file_id[..file_id_width].copy_from_slice(&bytes[32..32 + file_id_width]);
+        let volume_guid = std::str::from_utf8(&bytes[48..48 + volume_len])
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "volume GUID is not UTF-8"))?
             .to_owned();
         Ok(Self {
             opcode,
-            request_id: u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
-            previous_usn: i64::from_le_bytes(bytes[16..24].try_into().unwrap()),
-            current_usn: i64::from_le_bytes(bytes[24..32].try_into().unwrap()),
+            request_id: u64::from_le_bytes(bytes[6..14].try_into().unwrap()),
+            previous_usn: i64::from_le_bytes(bytes[14..22].try_into().unwrap()),
+            current_usn: i64::from_le_bytes(bytes[22..30].try_into().unwrap()),
             file_id,
             file_id_len,
             volume_guid,
@@ -203,13 +188,13 @@ impl Response {
     pub fn encode(self) -> [u8; RESPONSE_BYTES] {
         let mut bytes = [0u8; RESPONSE_BYTES];
         bytes[0..4].copy_from_slice(&MAGIC.to_le_bytes());
-        bytes[6..8].copy_from_slice(&(self.status as u16).to_le_bytes());
-        bytes[8..16].copy_from_slice(&self.request_id.to_le_bytes());
-        bytes[16..20].copy_from_slice(&self.win32_error.to_le_bytes());
-        bytes[24..32].copy_from_slice(&self.journal_id.to_le_bytes());
-        bytes[32..36].copy_from_slice(&self.reasons_all.to_le_bytes());
-        bytes[36..40].copy_from_slice(&self.reasons_without_close.to_le_bytes());
-        bytes[40..48].copy_from_slice(&self.next_usn.to_le_bytes());
+        bytes[4..6].copy_from_slice(&(self.status as u16).to_le_bytes());
+        bytes[6..14].copy_from_slice(&self.request_id.to_le_bytes());
+        bytes[14..18].copy_from_slice(&self.win32_error.to_le_bytes());
+        bytes[18..26].copy_from_slice(&self.journal_id.to_le_bytes());
+        bytes[26..30].copy_from_slice(&self.reasons_all.to_le_bytes());
+        bytes[30..34].copy_from_slice(&self.reasons_without_close.to_le_bytes());
+        bytes[34..42].copy_from_slice(&self.next_usn.to_le_bytes());
         bytes
     }
 
@@ -220,22 +205,20 @@ impl Response {
                 "invalid broker response length",
             ));
         }
-        if u32::from_le_bytes(bytes[0..4].try_into().unwrap()) != MAGIC
-            || bytes[4..6] != [0, 0]
-        {
+        if u32::from_le_bytes(bytes[0..4].try_into().unwrap()) != MAGIC {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "invalid broker response header",
             ));
         }
         Ok(Self {
-            status: Status::try_from(u16::from_le_bytes(bytes[6..8].try_into().unwrap()))?,
-            request_id: u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
-            win32_error: u32::from_le_bytes(bytes[16..20].try_into().unwrap()),
-            journal_id: u64::from_le_bytes(bytes[24..32].try_into().unwrap()),
-            reasons_all: u32::from_le_bytes(bytes[32..36].try_into().unwrap()),
-            reasons_without_close: u32::from_le_bytes(bytes[36..40].try_into().unwrap()),
-            next_usn: i64::from_le_bytes(bytes[40..48].try_into().unwrap()),
+            status: Status::try_from(u16::from_le_bytes(bytes[4..6].try_into().unwrap()))?,
+            request_id: u64::from_le_bytes(bytes[6..14].try_into().unwrap()),
+            win32_error: u32::from_le_bytes(bytes[14..18].try_into().unwrap()),
+            journal_id: u64::from_le_bytes(bytes[18..26].try_into().unwrap()),
+            reasons_all: u32::from_le_bytes(bytes[26..30].try_into().unwrap()),
+            reasons_without_close: u32::from_le_bytes(bytes[30..34].try_into().unwrap()),
+            next_usn: i64::from_le_bytes(bytes[34..42].try_into().unwrap()),
         })
     }
 }
@@ -290,37 +273,18 @@ mod tests {
     }
 
     #[test]
-    fn non_zero_reserved_header_bytes_are_rejected() {
-        for offset in 4..6 {
-            let mut request = Request::simple(Opcode::Hello, 1).encode().unwrap();
-            assert_eq!(&request[4..6], &[0, 0]);
-            request[offset] = 3;
-            assert_eq!(
-                Request::decode(&request).unwrap_err().kind(),
-                io::ErrorKind::InvalidData
-            );
+    fn fixed_response_roundtrip_preserves_all_fields() {
+        let response = Response {
+            status: Status::JournalReset,
+            request_id: 0x0102_0304_0506_0708,
+            win32_error: 0x1112_1314,
+            journal_id: 0x2122_2324_2526_2728,
+            reasons_all: 0x3132_3334,
+            reasons_without_close: 0x4142_4344,
+            next_usn: 0x5152_5354_5556_5758,
+        };
 
-            let response = Response::ok(1);
-            let mut encoded = response.encode();
-            assert_eq!(Response::decode(&encoded).unwrap(), response);
-            assert_eq!(&encoded[4..6], &[0, 0]);
-            encoded[offset] = 3;
-            assert_eq!(
-                Response::decode(&encoded).unwrap_err().kind(),
-                io::ErrorKind::InvalidData
-            );
-        }
-    }
-
-    #[test]
-    fn non_zero_reserved_request_bytes_are_rejected() {
-        let mut encoded = Request::simple(Opcode::Hello, 1).encode().unwrap();
-        encoded[127] = 1;
-
-        assert_eq!(
-            Request::decode(&encoded).unwrap_err().kind(),
-            io::ErrorKind::InvalidData
-        );
+        assert_eq!(Response::decode(&response.encode()).unwrap(), response);
     }
 
     #[test]
