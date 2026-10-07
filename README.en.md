@@ -96,7 +96,7 @@ For maximum convenience, SunPack gathers passwords from several sources at run t
 
 ### Recognition Capability
 
-- Identifies potential archive files by analyzing their binary data, including disguised archives embedded within carrier files and multi-volume archives.Currently supports ZIP, ZIPX, RAR, 7z, Zstandard (Zstd), Gzip, TAR, TBZ2, XZ, and LZ4. ZIPX does not support WinZip-specific JPEG, MP3, or WavPack compression methods.LZ4 does not support legacy format or dictionaries.
+- Identifies potential archive files by analyzing their binary data, including disguised archives embedded within carrier files and multi-volume archives.Currently supports ZIP, ZIPX, RAR, 7z, Zstandard (Zstd), Gzip, TAR, TBZ2, XZ, and LZ4. ZIPX does not support WinZip-specific JPEG, MP3, or WavPack compression methods. LZ4 does not support legacy format or dictionaries.
 
 ### Recursive processing
 
