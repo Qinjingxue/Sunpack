@@ -57,8 +57,7 @@ def test_plan7_disguised_split_nested_carrier_survives_two_restarts_and_password
 
     third = start_watch(tmp_path, label, **options)
     try:
-        # Generated inner tasks inherit the original input password scope even
-        # when their retained retry input is under a separate output root.
+        # Promoted inner inputs use the ordinary watch-root password scope.
         restored = third.watcher.state.failed_password_entries_under(str(password_scope))
         assert [Path(item.path) for item in restored] == [retry_input]
         password_file = password_scope / "sunpack-passwords.txt"

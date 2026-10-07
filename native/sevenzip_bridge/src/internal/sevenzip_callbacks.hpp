@@ -678,6 +678,11 @@ namespace sunpack::sevenzip
 
         ~ExtractToDiskCallback() { finalize_output(); }
 
+        void set_default_input_name(const std::wstring &path)
+        {
+            default_input_name_ = std::filesystem::path(path).stem().wstring();
+        }
+
         Int32 operation_result() const { return operation_result_; }
         bool password_requested() const { return password_requested_; }
 
@@ -952,7 +957,8 @@ namespace sunpack::sevenzip
             {
                 // Stream handlers (bzip2/xz/zstd, gzip without FNAME) carry no
                 // item name.  Like 7-Zip's default-name rule, name the payload
-                // after the archive's logical name, which is the output leaf.
+                // after the input filename with its outer extension removed.
+                // Output reservations must never rename a nested volume.
                 name = default_item_name(index);
             }
 
@@ -1210,12 +1216,7 @@ namespace sunpack::sevenzip
     private:
         std::wstring default_item_name(UInt32 index) const
         {
-            std::filesystem::path root(output_dir_);
-            std::wstring leaf = root.filename().wstring();
-            if (leaf.empty())
-            {
-                leaf = root.parent_path().filename().wstring();
-            }
+            const std::wstring &leaf = default_input_name_;
             if (leaf.empty() || leaf == L"." || leaf == L"..")
             {
                 return L"#" + std::to_wstring(index);
@@ -1486,6 +1487,7 @@ namespace sunpack::sevenzip
         std::wstring password_;
 
         std::wstring output_dir_;
+        std::wstring default_input_name_;
 
         ExtractProgressCallback progress_;
 

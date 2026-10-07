@@ -130,11 +130,13 @@ class ArchiveJobExecutor:
         )
         result = self.collect_result(task, outcome)
         if self.origin == "watch":
+            output_task_path, output_dir = task.runtime.pop("watch_active_output", (task.main_path, outcome.planned_out_dir))
             self.extractor.emit_semantic_event(
                 task,
                 "task_output_finished",
                 critical=True,
-                output_dir=outcome.planned_out_dir,
+                task_path=output_task_path,
+                output_dir=output_dir,
                 keep_output=bool(result.output_dir and result.outcome_kind != OutcomeKind.FAILURE),
             )
         if result.output_dir and result.outcome_kind != OutcomeKind.FAILURE:
@@ -198,6 +200,7 @@ class ArchiveJobExecutor:
             return task, terminal
 
         if self.origin == "watch":
+            task.runtime["watch_active_output"] = (task.main_path, planned_out_dir)
             self.extractor.emit_semantic_event(
                 task,
                 "task_output_started",

@@ -194,11 +194,11 @@ def test_plan7_nested_inner_unknown_password_watch_is_password_blocked(
         harness.close()
 
 
-def test_plan7_nested_inner_missing_volume_watch_is_not_outer_volume_blocked(
+def test_plan7_nested_inner_missing_volume_watch_suspends_promoted_input(
     tmp_path,
     plan7_error,
 ):
-    """watch 模式下，生成归档缺分卷是终态失败，不建立等待 blocker。"""
+    """watch 模式下，缺卷内层输入提升后成为普通等待分卷的 blocker。"""
     outer = _nested_missing_volume_outer(tmp_path)
     label = "nested-inner-missing-volume-watch"
     toast_config = plan7_watch_config(passwords=[])
@@ -217,7 +217,9 @@ def test_plan7_nested_inner_missing_volume_watch_is_not_outer_volume_blocked(
         terminal = _terminal_toast(toast_host)
         events = (tmp_path / label / "events.jsonl").read_text(encoding="utf-8")
         missing_volume_reported = result.failed == 1 and any(
-            "nested-inner-split.7z.001" in error for error in result.errors
+            entry.status == "suspended_missing_volume"
+            and Path(entry.path).name == "nested-inner-split.7z.001"
+            for entry in harness.watcher.state.entries.values()
         )
         ignored_at_scan = (
             result.failed == 0
@@ -235,16 +237,17 @@ def test_plan7_nested_inner_missing_volume_watch_is_not_outer_volume_blocked(
             "toast_kind": terminal.kind.value if terminal is not None else "",
         })
         assert missing_volume_reported or ignored_at_scan
-        assert not harness.watcher.state.entries
-        assert '"event":"suspended_missing_volume"' not in events
-        assert terminal is not None
         if missing_volume_reported:
-            assert '"event":"failed_terminal"' in events
-            assert terminal.kind == ToastSnapshotKind.FAILURE
-            report = Path(terminal.actions[-1].target).read_text(encoding="utf-8")
-            assert "nested-inner-split.7z.001" in report
+            entries = list(harness.watcher.state.entries.values())
+            assert len(entries) == 1
+            assert entries[0].status == "suspended_missing_volume"
+            assert Path(entries[0].path).parent == harness.watch_root
+            assert '"event":"suspended_missing_volume"' in events
+            assert '"event":"failed_terminal"' not in events
+            assert terminal is None
         else:
-            assert terminal.kind == ToastSnapshotKind.SUCCESS
+            assert not harness.watcher.state.entries
+            assert terminal is not None and terminal.kind == ToastSnapshotKind.SUCCESS
     finally:
         toast.stop()
         harness.close()

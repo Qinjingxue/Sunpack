@@ -1,9 +1,123 @@
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
+
+type PromotionResult = (HashMap<String, String>, Vec<String>, Vec<String>, String);
+
+#[pyfunction]
+pub(crate) fn promote_blocked_input_files(
+    py: Python<'_>,
+    paths: Vec<String>,
+    destination_dir: String,
+) -> PyResult<PromotionResult> {
+    Ok(py.detach(|| promote_input_files(paths, Path::new(&destination_dir))))
+}
+
+fn promote_input_files(paths: Vec<String>, destination: &Path) -> PromotionResult {
+    promote_input_files_with_move(paths, destination, move_input_no_replace)
+}
+
+fn promote_input_files_with_move(
+    paths: Vec<String>,
+    destination: &Path,
+    mut move_file: impl FnMut(&Path, &Path) -> io::Result<()>,
+) -> PromotionResult {
+    let mut mapping = HashMap::new();
+    let mut removed = Vec::new();
+    let mut parents = HashSet::new();
+    let mut destinations = HashSet::new();
+    let mut sources = HashSet::new();
+    let mut moves = Vec::new();
+    for raw in paths {
+        let source = PathBuf::from(raw);
+        if !sources.insert(normalize_path(&source).to_lowercase()) {
+            continue;
+        }
+        let Some(name) = source.file_name() else {
+            return (mapping, removed, Vec::new(), "input has no basename".into());
+        };
+        let target = destination.join(name);
+        if !source.is_file()
+            || target.try_exists().unwrap_or(true)
+            || !destinations.insert(normalize_path(&target).to_lowercase())
+        {
+            return (
+                mapping,
+                removed,
+                Vec::new(),
+                format!(
+                    "cannot promote {} to {}: missing source or destination exists",
+                    source.display(),
+                    target.display()
+                ),
+            );
+        }
+        if let Some(parent) = source.parent() {
+            parents.insert(parent.to_path_buf());
+        }
+        moves.push((source, target));
+    }
+    for (source, target) in &moves {
+        if let Err(error) = move_file(source, target) {
+            let mut message = error.to_string();
+            for (old, new) in moves.iter().rev() {
+                let old_key = normalize_path(old);
+                if mapping.contains_key(&old_key) {
+                    match move_file(new, old) {
+                        Ok(()) => {
+                            mapping.remove(&old_key);
+                        }
+                        Err(rollback) => {
+                            message.push_str(&format!(
+                                "; rollback {}: {}",
+                                new.display(),
+                                rollback
+                            ));
+                        }
+                    }
+                }
+            }
+            return (mapping, removed, Vec::new(), message);
+        }
+        mapping.insert(normalize_path(source), normalize_path(target));
+    }
+    for parent in &parents {
+        // remove_dir itself atomically checks emptiness; never walk upwards.
+        if fs::remove_dir(parent).is_ok() {
+            removed.push(normalize_path(parent));
+        }
+    }
+    let mut touched: Vec<_> = parents.iter().map(|p| normalize_path(p)).collect();
+    touched.push(normalize_path(destination));
+    (mapping, removed, touched, String::new())
+}
+
+fn move_input_no_replace(source: &Path, destination: &Path) -> io::Result<()> {
+    match rename_no_replace(source, destination) {
+        Ok(()) => Ok(()),
+        Err(error) if error.raw_os_error() == Some(17) => {
+            // A create-new handle prevents a concurrent arrival from being overwritten.
+            let mut input = fs::File::open(source)?;
+            let mut output = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(destination)?;
+            let copied = io::copy(&mut input, &mut output);
+            drop(output);
+            drop(input);
+            if let Err(error) = copied.and_then(|_| fs::remove_file(source)) {
+                let _ = fs::remove_file(destination);
+                return Err(error);
+            }
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
 
 use crate::filesystem::{watch_file_observation_known_kind, WatchFileObservation};
 
@@ -448,6 +562,33 @@ fn mtime_seconds(metadata: &fs::Metadata) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn promotion_rolls_back_preceding_members_on_move_failure() {
+        let root = TestDirectory::new("promotion-rollback");
+        let source = root.path().join("source");
+        let destination = root.path().join("destination");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&destination).unwrap();
+        let first = source.join("game.001");
+        let second = source.join("game.002");
+        fs::write(&first, b"first").unwrap();
+        fs::write(&second, b"second").unwrap();
+        let result = promote_input_files_with_move(
+            vec![normalize_path(&first), normalize_path(&second)],
+            &destination,
+            |old, new| {
+                if old == second {
+                    return Err(io::Error::new(io::ErrorKind::PermissionDenied, "injected"));
+                }
+                rename_no_replace(old, new)
+            },
+        );
+        assert!(result.0.is_empty());
+        assert!(result.3.contains("injected"));
+        assert!(first.is_file() && second.is_file());
+        assert_eq!(fs::read_dir(&destination).unwrap().count(), 0);
+    }
     use std::time::{SystemTime, UNIX_EPOCH};
 
     struct TestDirectory(PathBuf);

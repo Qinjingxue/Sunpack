@@ -342,7 +342,7 @@ def test_retry_lease_upgrade_releases_idle_partial_families(tmp_path):
         tasks = [SimpleNamespace(all_parts=[path]) for path in family]
         runtimes = [SimpleNamespace(
             path_leases=registry,
-            submission=SimpleNamespace(request_id=owner),
+            submission=SimpleNamespace(request_id=owner, origin="foreground"),
             source_cleanup=SimpleNamespace(register=lambda _tasks: None),
         ) for owner in ("first", "second")]
         for runtime, task in zip(runtimes, tasks):

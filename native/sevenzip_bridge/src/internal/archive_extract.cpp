@@ -573,6 +573,7 @@ namespace sunpack::sevenzip
                 std::move(cancel_token));
 #endif
 
+            raw_extract_callback->set_default_input_name(archive_path);
             CMyComPtr<IArchiveExtractCallback> extract_callback(raw_extract_callback);
 
 #ifdef SUP7Z_ENABLE_PIPELINE_TIMING

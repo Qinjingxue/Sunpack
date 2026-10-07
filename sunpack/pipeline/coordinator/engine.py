@@ -23,6 +23,8 @@ from sunpack.pipeline.coordinator.reporting import RunReporter
 from sunpack.pipeline.coordinator.task_scan import ArchiveTaskScanner
 from sunpack.pipeline.coordinator.target_groups import relation_group_to_candidate
 from sunpack.core.contracts.tasks import ArchiveTask
+from sunpack.core.contracts.failures import FailureInfo, FailureKind
+from sunpack.pipeline.postprocess.internal.blocked_input import promote_blocked_input
 from sunpack.pipeline.extraction.scheduler import ExtractionScheduler
 from sunpack.pipeline.extraction.output_inventory import OutputInventory
 from sunpack.core.i18n import I18nContext
@@ -544,6 +546,21 @@ class _PathLeaseRegistry:
             return ()
         selected = tuple(row for row in owned_version if row[0] in keys)
         return selected if len(selected) == len(keys) else ()
+
+    def input_version_for(self, paths: Iterable[str], *, departed_version=()):
+        snapshots = self._snapshot_paths(paths, refresh=True)
+        version = _lease_ownership_version(snapshots)
+        if version or not departed_version:
+            return version
+        expected = {row[0]: row for row in departed_version}
+        # Reuse a consumed generation only if every surviving member is still
+        # unchanged. A changed survivor plus a missing member is a new input.
+        if len(expected) == len(snapshots) and all(
+            item.version_row is None or item.version_row == expected.get(item.key)
+            for item in snapshots
+        ):
+            return departed_version
+        return ()
 
     def completed_watch_output(
         self,
@@ -1332,6 +1349,7 @@ class _RequestRuntime:
         cancellation,
     ) -> bool:
         released_source_ref = False
+        retain_watch_lease = False
         task_key = str(task.key or task.main_path)
         try:
             if self.input_planning_stage.requires_analysis(task):
@@ -1352,35 +1370,6 @@ class _RequestRuntime:
             watch_version = self._watch_generation_for_task(task, depth=depth)
             if watch_version:
                 task.runtime["source_generation"] = watch_version
-            if watch_version and self._watch_task_can_reuse_completed(task):
-                completed_output = self.path_leases.completed_watch_output(
-                    watch_version, deep_detect=self.submission.detection_options.force_scan,
-                )
-                if completed_output:
-                    reused = TargetRunResult(
-                        input_path=task.main_path,
-                        outcome_kind=OutcomeKind.COMPLETE_SUCCESS,
-                        task_key=task.key,
-                        output_dir=completed_output,
-                        verification={"reused_completed_generation": True},
-                    )
-                    with self.context.lock:
-                        self.context.target_results.append(reused)
-                        self.context.processed_keys.add(task.key)
-                    ownership.remember_results([reused])
-                    cleanup_request = self.source_cleanup.release_task(
-                        task,
-                        outcome_kind=OutcomeKind.FAILURE,
-                    )
-                    released_source_ref = True
-                    self._schedule_cleanup(
-                        cleanup_request,
-                        broker=broker,
-                        cancellation=cancellation,
-                        lease_id=id(task),
-                    )
-                    return True
-
             output_dir_resolver = build_output_dir_resolver(
                 [task],
                 ownership.output_dir_for_task,
@@ -1394,8 +1383,16 @@ class _RequestRuntime:
                 broker=broker,
                 cancellation=cancellation,
                 missing_volume_retry=self._resolve_missing_volume_once,
-                ensure_input_lease=self._ensure_task_lease,
+                ensure_input_lease=lambda current: self._ensure_task_lease(current, depth=depth),
             )
+            watch_version = task.runtime.get("source_generation", watch_version)
+            retain_watch_lease = bool(watch_version and outcome.outcome_kind == OutcomeKind.COMPLETE_SUCCESS)
+            ownership.remember_tasks([task])  # Missing-volume retry may adopt a complete family.
+            promoted = False
+            if _should_promote_blocked_input(depth, outcome.outcome_kind, result.failure):
+                result, promoted = await self._promote_blocked_input(
+                    task, result, ownership=ownership, broker=broker, cancellation=cancellation,
+                )
             ownership.remember_results([result])
             output_dir = (
                 result.output_dir
@@ -1412,12 +1409,11 @@ class _RequestRuntime:
                 cleanup_request,
                 broker=broker,
                 cancellation=cancellation,
-                lease_id=id(task),
+                lease_id=None if retain_watch_lease else id(task),
             )
 
-            # A failed descendant still needs its recorded input path for retry.
-            # Propagate this to ancestors instead of remapping an entire subtree.
-            subtree_complete = outcome.outcome_kind == OutcomeKind.COMPLETE_SUCCESS
+            # Retryable nested inputs leave recursive ownership, but remain failed.
+            subtree_complete = outcome.outcome_kind == OutcomeKind.COMPLETE_SUCCESS or promoted
             if output_dir and self.recursion.allows_children(depth):
                 scan_work = await broker.run(
                     "nested_scan",
@@ -1438,6 +1434,13 @@ class _RequestRuntime:
                         cancellation=cancellation,
                     )
                     subtree_complete = subtree_complete and children_complete
+
+            if output_dir and subtree_complete and not os.path.exists(output_dir):
+                ownership.forget_output(output_dir)
+                cleared = replace(result, output_dir="")
+                self._replace_target_result(result, cleared)
+                result = cleared
+                output_dir = ""
 
             if (
                 output_dir
@@ -1468,7 +1471,29 @@ class _RequestRuntime:
             if output_dir:
                 self._shell_updates.add([output_dir])
             return subtree_complete
+        except _CompletedWatchOutput as reused:
+            result = TargetRunResult(
+                input_path=task.main_path, outcome_kind=OutcomeKind.COMPLETE_SUCCESS,
+                task_key=task.key, output_dir=reused.output_dir,
+                verification={"reused_completed_generation": True},
+            )
+            with self.context.lock:
+                self.context.target_results.append(result)
+                self.context.processed_keys.add(task.key)
+            ownership.remember_tasks([task])
+            ownership.remember_results([result])
+            active_output = task.runtime.pop("watch_active_output", None)
+            if active_output is not None:
+                self.extractor.emit_semantic_event(
+                    task, "task_output_finished", critical=True,
+                    task_path=active_output[0], output_dir=active_output[1], keep_output=False,
+                )
+            return True
         finally:
+            if retain_watch_lease:
+                # Same-family retries can consume the completed generation only
+                # after recursion/flatten has settled its final output location.
+                await self.path_leases.release_lease(self.submission.request_id, id(task))
             if not released_source_ref:
                 cleanup_request = self.source_cleanup.release_task(
                     task,
@@ -1528,15 +1553,6 @@ class _RequestRuntime:
             self.submission.request_id,
             part_paths,
         )
-
-    @staticmethod
-    def _watch_task_can_reuse_completed(task) -> bool:
-        part_paths = tuple(task.archive_input().part_paths())
-        carrier = str(task.carrier_path or "")
-        if not carrier or not part_paths:
-            return False
-        part_keys = {path_key(path) for path in part_paths}
-        return path_key(carrier) not in part_keys
 
     def _schedule_cleanup(self, request, *, broker, cancellation, lease_id=None) -> None:
         if not request.should_clean and lease_id is None:
@@ -1598,6 +1614,52 @@ class _RequestRuntime:
         except ValueError:
             return False
 
+    def _replace_target_result(self, old, new) -> None:
+        with self.context.lock:
+            self.context.target_results[:] = [new if item is old else item for item in self.context.target_results]
+
+    async def _promote_blocked_input(self, task, result, *, ownership, broker, cancellation):
+        destination = ownership.input_dir_for_task(task)
+        sources = tuple(task.cleanup_parts or task.all_parts or [task.main_path])
+        # Reserve publication paths as well as sources. A Watch arrival must
+        # not read a partially copied cross-volume input or a half-moved group.
+        destinations = [os.path.join(destination, os.path.basename(path)) for path in sources]
+        await self.path_leases.acquire(
+            self.submission.request_id, [*sources, *destinations], lease_id=id(task),
+        )
+
+        def promote():
+            with promotion_barrier(
+                sources, cache_releasers=(release_archive_sessions_under_roots,), quiesce=False,
+            ):
+                return promote_blocked_input(sources, destination)
+
+        promoted = False
+        try:
+            moved = await broker.run(
+                "postprocess", task.key or task.main_path, promote,
+                request_id=self.submission.request_id, cancellation=cancellation,
+            )
+            task.apply_path_mapping(moved.path_map)
+            ownership.remap_task(task, result.input_path)
+            updated = replace(result, input_path=task.main_path, failure_message="")
+            self._shell_updates.add(moved.touched_dirs)
+            promoted = True
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            residual_map = getattr(exc, "path_map", {})
+            if residual_map:
+                task.apply_path_mapping(residual_map)
+                ownership.remap_task(task, result.input_path)
+            failure = FailureInfo(
+                FailureKind.FILESYSTEM_ERROR, "postprocess", f"Unable to promote blocked nested input: {exc}",
+                details={"blocked_input_failure": result.failure.to_dict(), "destination": destination},
+            )
+            updated = replace(result, input_path=task.main_path, failure=failure, error=failure.message, failure_message="")
+        self._replace_target_result(result, updated)
+        return updated, promoted
+
     async def _flatten_output(self, task, output_dir: str, *, broker, cancellation) -> DirectoryFlattenResult:
         def flatten():
             with promotion_barrier(
@@ -1621,10 +1683,15 @@ class _RequestRuntime:
             result = DirectoryFlattenResult(output_dir, output_dir, errors=(str(exc),))
         with self.context.lock:
             if result.source_dir:
-                self.context.target_results[:] = [
-                    replace(item, output_dir=result.relocate(item.output_dir))
-                    for item in self.context.target_results
-                ]
+                # Keep unrelated result identities stable: their coordinators
+                # may still need to replace a record after recursive promotion.
+                relocated_results = []
+                for item in self.context.target_results:
+                    relocated = result.relocate(item.output_dir)
+                    relocated_results.append(
+                        replace(item, output_dir=relocated) if relocated != item.output_dir else item
+                    )
+                self.context.target_results[:] = relocated_results
                 self.context.cleanup_results[:] = [
                     replace(item, path=result.relocate(item.path))
                     for item in self.context.cleanup_results
@@ -1637,10 +1704,28 @@ class _RequestRuntime:
             self.reporter.relocate_outputs(result)
         return result
 
-    async def _ensure_task_lease(self, task) -> None:
+    async def _ensure_task_lease(self, task, *, depth: int = 1) -> None:
         self.source_cleanup.register([task])
         paths = task.all_parts or [task.main_path]
+        requested_version = (
+            self.path_leases.input_version_for(paths)
+            if self.submission.origin == "watch" and depth == 1 and len(paths) > 1 else ()
+        )
         await self.path_leases.acquire(self.submission.request_id, paths, lease_id=id(task))
+        if self.submission.origin == "watch" and depth == 1 and len(paths) > 1:
+            # A missing-volume retry can replace its input set while awaiting
+            # this lease. Check the final physical generation after acquisition.
+            version = self.path_leases.input_version_for(paths, departed_version=requested_version)
+            task.runtime["source_generation"] = version
+            completed = self.path_leases.completed_watch_output(
+                version, deep_detect=self.submission.detection_options.force_scan,
+            )
+            if completed:
+                raise _CompletedWatchOutput(completed)
+            self._report_progress(task, {
+                "type": "semantic", "event": "task_sources_claimed",
+                "source_paths": tuple(task.cleanup_parts or paths),
+            })
 
     def _plan_task_isolated(self, task):
         stage = ArchiveInputPlanningStage(self.config)
@@ -1660,6 +1745,18 @@ class _RequestRuntime:
         )
 
 
+class _CompletedWatchOutput(Exception):
+    def __init__(self, output_dir: str):
+        self.output_dir = output_dir
+
+
+def _should_promote_blocked_input(depth: int, outcome: OutcomeKind, failure: FailureInfo | None) -> bool:
+    return bool(
+        depth > 1 and outcome == OutcomeKind.FAILURE and failure is not None
+        and (failure.is_password_failure or failure.contains(FailureKind.MISSING_VOLUME))
+    )
+
+
 class _RequestResults:
     """Collect one request's outputs and preserve per-target output settings."""
 
@@ -1670,6 +1767,22 @@ class _RequestResults:
         self._output_targets: dict[str, PipelineTarget] = {}
         self._claimed_paths: list[str] = []
         self._task_paths: dict[str, tuple[str, ...]] = {}
+        self._target_input_dirs = {
+            path_key(target.path): os.path.abspath(target.path if os.path.isdir(target.path) else os.path.dirname(target.path))
+            for target in submission.targets
+        }
+
+    def input_dir_for_task(self, task) -> str:
+        return self._target_input_dirs[path_key(self._target_for_path(task.main_path).path)]
+
+    def forget_output(self, output_dir: str) -> None:
+        self._output_targets.pop(path_key(output_dir), None)
+
+    def remap_task(self, task, old_path: str) -> None:
+        target = self._target_for_path(old_path)
+        self._task_targets[path_key(task.main_path)] = target
+        self._task_paths.pop(path_key(old_path), None)
+        self._task_paths[path_key(task.main_path)] = tuple(task.cleanup_parts or task.all_parts or [task.main_path])
 
     def remember_tasks(self, tasks) -> None:
         for task in tasks:

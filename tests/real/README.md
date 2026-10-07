@@ -14,7 +14,8 @@ The new regression cases cover:
   `plan7_watch_downloads/test_plan7_lz4_wrapped_rar_volumes.py` delivers four
   independently LZ4-wrapped, header-encrypted RAR volumes with the password
   supplied before arrival. Both interleaved rename-commit and final-path writes
-  must automatically recover the complete volume group and extract each member
+  start the real directory monitor, promote the volume group to the input root,
+  and automatically extract each member
   exactly once; Rust inventories verify volume/member sizes and CRC32.
 
 * Plan 5 constructs carriers once with a declared seed. Rust streams source
@@ -28,8 +29,8 @@ The new regression cases cover:
   covers concurrent failures, output hashes, deletion and flattening.
 * Plan 7 adds late-tail delivery, a restart with incomplete volumes, a second
   restart with a retained inner password failure, and a directory-password
-  update. Generated inner tasks inherit the original input password scope;
-  the test asserts that scope before triggering the update.
+  update. Blocked inner inputs are promoted to the original input directory;
+  the test asserts their ordinary password scope before triggering the update.
 * `test_external_structure_corpus.py` generates self-authored samples using
   Windows bsdtar/libarchive and WinRAR, independently of SunPack/7-Zip's usual
   fixture writer. It checks USTAR, PAX long Unicode paths, GNU longname,

@@ -52,7 +52,7 @@ def test_flatten_relocates_nested_outputs_and_reports_retained_work(tmp_path, mo
     expected_nested = root + "/inner" if publish_succeeded else work + "/wrapper/payload/inner"
     assert state.target_results[0].output_dir == actual
     assert state.target_results[1].output_dir.replace("\\", "/") == expected_nested.replace("\\", "/")
-    assert state.target_results[2] == unrelated
+    assert state.target_results[2] is unrelated
     assert response.summary.success_count == 3
     assert response.artifacts.shell_refresh_paths[0] == actual
     assert runtime.reporter._top_level_outputs == [actual]

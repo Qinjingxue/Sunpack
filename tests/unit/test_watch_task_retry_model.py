@@ -1,5 +1,7 @@
 import asyncio
 import os
+from types import SimpleNamespace
+import pytest
 
 import sunpack.runtime.watch.scheduler as scheduler_module
 from sunpack.core.contracts.failures import FailureInfo, FailureKind
@@ -100,12 +102,12 @@ def _response(direct, nested=None):
     )
 
 
-def test_generated_password_failure_is_anchored_to_failed_task(tmp_path, monkeypatch):
+def test_promoted_password_failure_uses_ordinary_input_path(tmp_path, monkeypatch):
     watcher, root, output, sink = _watcher(tmp_path, monkeypatch)
     outer = root / "outer.zip"
     inner_dir = output / "outer"
     inner_dir.mkdir()
-    inner = inner_dir / "inner.zip"
+    inner = root / "inner.zip"
     outer.write_bytes(b"outer")
     inner.write_bytes(b"inner")
     failure = FailureInfo(FailureKind.WRONG_PASSWORD, "password_resolution", "wrong password")
@@ -132,12 +134,12 @@ def test_generated_password_failure_is_anchored_to_failed_task(tmp_path, monkeyp
     assert watcher._output_root_for(str(inner)) == str(output.resolve())
 
 
-def test_password_retry_can_advance_to_the_next_generated_task(tmp_path, monkeypatch):
+def test_password_retry_can_advance_to_next_promoted_input(tmp_path, monkeypatch):
     watcher, root, output, sink = _watcher(tmp_path, monkeypatch)
     second_dir = output / "outer"
     second_dir.mkdir()
-    second = second_dir / "second.zip"
-    third = second_dir / "third.zip"
+    second = root / "second.zip"
+    third = root / "third.zip"
     second.write_bytes(b"second")
     third.write_bytes(b"third")
     second_candidate = _candidate(second)
@@ -181,8 +183,7 @@ def test_shared_output_password_retry_keeps_original_input_detection_mode(tmp_pa
         watcher.output_roots[scheduler_module.path_key(str(ordinary_root))] = str(output)
         outer = root / "outer.bin"
         ordinary = ordinary_root / "ordinary.bin"
-        inner = output / "outer" / "inner.bin"
-        inner.parent.mkdir()
+        inner = root / "inner.bin"
         for path in (outer, ordinary, inner):
             path.write_bytes(b"payload")
         failure = FailureInfo(FailureKind.WRONG_PASSWORD, "password_resolution", "wrong password")
@@ -215,12 +216,12 @@ def test_shared_output_password_retry_keeps_original_input_detection_mode(tmp_pa
     asyncio.run(scenario())
 
 
-def test_generated_missing_volume_is_terminal_and_not_suspended(tmp_path, monkeypatch):
+def test_promoted_missing_volume_suspends_ordinary_input(tmp_path, monkeypatch):
     watcher, root, output, sink = _watcher(tmp_path, monkeypatch)
     outer = root / "outer.zip"
     inner_dir = output / "outer"
     inner_dir.mkdir()
-    inner = inner_dir / "inner.7z.001"
+    inner = root / "inner.7z.001"
     outer.write_bytes(b"outer")
     inner.write_bytes(b"inner")
     failure = FailureInfo(FailureKind.MISSING_VOLUME, "extraction", "missing inner volume")
@@ -232,8 +233,9 @@ def test_generated_missing_volume_is_terminal_and_not_suspended(tmp_path, monkey
 
     assert result.failed == 1
     assert watcher.state.latest_entry_for_path(str(outer)) is None
-    assert watcher.state.latest_entry_for_path(str(inner)) is None
-    assert [action for action, _ in sink.actions] == ["failed"]
+    entry = watcher.state.latest_entry_for_path(str(inner))
+    assert entry is not None and entry.status == "suspended_missing_volume"
+    assert [action for action, _ in sink.actions] == ["suppressed"]
 
 
 def test_direct_missing_volume_still_suspends_watch_input(tmp_path, monkeypatch):
@@ -250,6 +252,77 @@ def test_direct_missing_volume_still_suspends_watch_input(tmp_path, monkeypatch)
     entry = watcher.state.latest_entry_for_path(str(archive))
     assert entry is not None and entry.status == "suspended_missing_volume"
     assert [action for action, _ in sink.actions] == ["suppressed"]
+
+
+def test_volume_retry_finishes_output_using_its_original_record_path(tmp_path, monkeypatch):
+    watcher, root, output, _sink = _watcher(tmp_path, monkeypatch)
+    tail = root / "archive.part2.rar"
+    head = root / "archive.part1.rar"
+    tail.write_text("part")
+    watcher.state.queue_active(_candidate(tail), persist=True, durable=True)
+    task = type("Task", (), {"main_path": str(tail)})()
+    watcher._handle_pipeline_progress(str(tail), "request", task, {
+        "event": "task_output_started", "output_dir": str(output),
+    })
+    task.main_path = str(head)
+    watcher._handle_pipeline_progress(str(tail), "request", task, {
+        "event": "task_output_finished", "task_path": str(tail),
+        "output_dir": str(output), "keep_output": True,
+    })
+    assert not watcher.state.pending_work_for_path(str(tail)).active_outputs
+
+
+def test_late_missing_volume_result_cannot_resurrect_consumed_input(tmp_path, monkeypatch):
+    watcher, root, _output, sink = _watcher(tmp_path, monkeypatch)
+    archive = root / "family.part2.rar"
+    archive.write_text("part")
+    candidate = _candidate(archive)
+    archive.unlink()  # A concurrent complete-family run already cleaned it.
+    failure = FailureInfo(FailureKind.MISSING_VOLUME, "extraction", "missing volume")
+    result = asyncio.run(_complete(watcher, candidate, _response(
+        TargetRunResult(str(archive), OutcomeKind.FAILURE, failure=failure),
+    )))
+    assert not watcher.state.entries
+    assert result.failed == 0
+    assert [action for action, _ in sink.actions] == ["suppressed"]
+
+
+def test_family_completion_preserves_another_inflight_output_record(tmp_path, monkeypatch):
+    watcher, root, output, _sink = _watcher(tmp_path, monkeypatch)
+    archive, other = root / "a.001", root / "a.002"
+    archive.write_text("part")
+    other.write_text("part")
+    candidate = _candidate(archive)
+    watcher.state.queue_active(candidate, persist=True, durable=True)
+    assert watcher.state.record_task_output_started(str(archive), str(archive), str(output))
+    watcher._inflight_requests.append(SimpleNamespace(candidate=candidate))
+    watcher._retire_claimed_paths([str(archive)], _candidate(other))
+    assert watcher.state.pending_work_for_path(str(archive)).active_outputs
+
+
+@pytest.mark.parametrize("departed", [False, True])
+def test_missing_file_exception_is_suppressed_only_for_departed_input(tmp_path, monkeypatch, departed):
+    async def scenario():
+        watcher, root, _output, _sink = _watcher(tmp_path, monkeypatch)
+        archive = root / "a.001"
+        archive.write_text("part")
+        candidate = _candidate(archive)
+        if departed:
+            archive.unlink()
+
+        async def failed():
+            raise FileNotFoundError("input consumed")
+
+        request = _ActivePipelineRequest(notification_id="request", candidate=candidate,
+            task=asyncio.create_task(failed()), source_input_root=str(root))
+        if departed:
+            result = await watcher._complete_candidate(request)
+            assert result.failed == 0 and not watcher.state.entries
+        else:
+            with pytest.raises(FileNotFoundError):
+                await watcher._complete_candidate(request)
+
+    asyncio.run(scenario())
 
 
 def test_coalesced_password_retry_preserves_blocker_until_owner_finishes(tmp_path, monkeypatch):

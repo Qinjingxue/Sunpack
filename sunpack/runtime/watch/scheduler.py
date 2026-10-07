@@ -21,7 +21,6 @@ from sunpack.core.contracts.failures import FailureInfo, FailureKind
 from sunpack.core.contracts.retry_targets import (
     failure_contains,
     failure_is_password,
-    password_retry_results,
     result_error,
     result_failure,
     result_outcome,
@@ -1622,7 +1621,7 @@ class WatchScheduler:
         if name == "task_output_started":
             if not self.state.record_task_output_started(
                 owner_path,
-                str(getattr(archive_task, "main_path", "") or ""),
+                str(event.get("task_path") or getattr(archive_task, "main_path", "") or ""),
                 str(event.get("output_dir") or ""),
             ):
                 raise RuntimeError("watch output start state transition rejected")
@@ -1630,7 +1629,7 @@ class WatchScheduler:
         if name == "task_output_finished":
             if not self.state.record_task_output_finished(
                 owner_path,
-                str(getattr(archive_task, "main_path", "") or ""),
+                str(event.get("task_path") or getattr(archive_task, "main_path", "") or ""),
                 str(event.get("output_dir") or ""),
                 keep_output=bool(event.get("keep_output")),
             ):
@@ -1640,7 +1639,16 @@ class WatchScheduler:
 
     async def _complete_candidate(self, request: _ActivePipelineRequest) -> WatchRunResult:
         candidate = request.candidate
-        response = await request.task
+        try:
+            response = await request.task
+        except FileNotFoundError:
+            if os.path.exists(candidate.path):
+                raise
+            # The input departed during an older request (for example after
+            # successful full-family cleanup). It has no remaining retry work.
+            self._retire_claimed_paths([candidate.path], candidate)
+            self._notify("suppressed", request.notification_id)
+            return WatchRunResult(processed=1)
         summary = response.summary
         self._remember_recent_passwords(response.recent_passwords)
         claimed_paths = _response_claimed_paths(response, candidate.path)
@@ -1689,114 +1697,54 @@ class WatchScheduler:
         if direct_failure is None and target_result is None and len(failures) == 1:
             direct_failure = failures[0]
 
-        direct_missing = bool(
-            direct_failure is not None
-            and failure_contains(direct_failure, FailureKind.MISSING_VOLUME)
-        )
-        direct_password = bool(
-            direct_failure is not None and failure_is_password(direct_failure)
-        )
-        original_scope = _password_scope_for_path(self.state, candidate.path)
-        password_scope_dir = original_scope or os.path.dirname(os.path.abspath(candidate.path))
-        password_scope_signature = _directory_password_signature(password_scope_dir, self.config)
-
-        # The watched input has its own lifecycle even when a recursively generated
-        # archive fails later. Later recovery is anchored to the failed task itself.
         if direct_outcome == OutcomeKind.COMPLETE_SUCCESS:
-            # Watch consumes pipeline ownership facts. It never reconstructs
-            # split/archive membership itself.
             self._retire_claimed_paths(claimed_paths, request.candidate)
 
         waiting_failures: list = []
-        if direct_missing:
-            blockers = [BLOCKER_MISSING_VOLUME]
-            if direct_password:
-                blockers.append(BLOCKER_PASSWORD)
-            payload = _failure_payload(
-                direct_failure,
-                path=candidate.path,
-                blockers=blockers,
-                password_scope_dir=password_scope_dir if direct_password else "",
-                password_scope_signature=password_scope_signature if direct_password else "",
-                source_input_root=request.source_input_root,
-            )
-            error = _failure_message(
-                direct_failure,
-                self.i18n.t("failure.possible_missing_volume"),
-            )
-            self.state.mark(
-                candidate.path,
-                candidate.size,
-                candidate.mtime,
-                file_id=candidate.file_id,
-                change_usn=candidate.change_usn,
-                status="suspended_missing_volume",
-                error=error,
-                failure_payload=payload,
-            )
-            self.log.write(
-                "suspended_missing_volume",
-                path=candidate.path,
-                error=error,
-                failures=[payload],
-                partial_recovery=direct_outcome == OutcomeKind.PARTIAL_SUCCESS,
-            )
-            waiting_failures.append(direct_failure)
-
         recorded_password_failures: list = []
-        retry_results = password_retry_results(summary)
-        if not results and direct_failure is not None:
-            if (
-                failure_is_password(direct_failure)
-                and not failure_contains(direct_failure, FailureKind.MISSING_VOLUME)
-            ):
-                retry_results = [None]
-
+        retired_failures: list = []
+        retry_results = results or ([None] if direct_failure is not None else [])
         for item in retry_results:
             failure = direct_failure if item is None else result_failure(item)
             retry_path = candidate.path if item is None else result_path(item)
             if failure is None or not retry_path:
                 continue
-            retry_candidate = (
-                candidate
-                if path_key(retry_path) == path_key(candidate.path)
-                else _candidate_for_event_path(retry_path)
-            )
-            if retry_candidate is None:
-                # No surviving source means there is no task that can ever retry.
+            missing = failure_contains(failure, FailureKind.MISSING_VOLUME)
+            password = failure_is_password(failure)
+            if not (missing or password):
                 continue
+            retry_candidate = _candidate_for_event_path(retry_path)
+            if retry_candidate is None:
+                # A successful sibling family may have consumed this input
+                # while an earlier incomplete request was still finishing.
+                # Never resurrect a blocker for a deleted physical input.
+                self.state.clear_entries([retry_path])
+                retired_failures.append(failure)
+                continue
+            scope_dir = os.path.dirname(os.path.abspath(retry_path))
+            blockers = ([BLOCKER_MISSING_VOLUME] if missing else []) + ([BLOCKER_PASSWORD] if password else [])
             payload = _failure_payload(
-                failure,
-                path=retry_candidate.path,
-                blockers=[BLOCKER_PASSWORD],
-                password_scope_dir=password_scope_dir,
-                password_scope_signature=password_scope_signature,
-                source_input_root=request.source_input_root,
+                failure, path=retry_candidate.path, blockers=blockers,
+                password_scope_dir=scope_dir if password else "",
+                password_scope_signature=_directory_password_signature(scope_dir, self.config) if password else "",
+                source_input_root=self._source_input_root_for(retry_path),
             )
             error = _failure_message(failure, self.i18n.t("watch.failure.extraction_failed"))
+            status = "suspended_missing_volume" if missing else "failed_password"
             self.state.mark(
-                retry_candidate.path,
-                retry_candidate.size,
-                retry_candidate.mtime,
-                file_id=retry_candidate.file_id,
-                change_usn=retry_candidate.change_usn,
-                status="failed_password",
-                error=error,
-                failure_payload=payload,
+                retry_candidate.path, retry_candidate.size, retry_candidate.mtime,
+                file_id=retry_candidate.file_id, change_usn=retry_candidate.change_usn,
+                status=status, error=error, failure_payload=payload,
             )
-            self.log.write(
-                "failed_password",
-                path=retry_candidate.path,
-                error=error,
-                failures=[payload],
-            )
-            recorded_password_failures.append(failure)
+            self.log.write(status, path=retry_candidate.path, error=error, failures=[payload])
+            (waiting_failures if missing else recorded_password_failures).append(failure)
 
         terminal_failures = [
             failure
             for failure in failures
             if failure not in waiting_failures
             and failure not in recorded_password_failures
+            and failure not in retired_failures
         ]
         failed = summary.failed_tasks
 
@@ -1829,15 +1777,11 @@ class WatchScheduler:
             self._notify("failed", request.notification_id, errors, payloads)
             return WatchRunResult(processed=1, failed=1, errors=errors)
 
-        if direct_missing:
+        if waiting_failures:
             self._notify("suppressed", request.notification_id)
             return WatchRunResult(
-                processed=1,
-                failed=1,
-                errors=[_failure_message(
-                    direct_failure,
-                    self.i18n.t("failure.possible_missing_volume"),
-                )],
+                processed=1, failed=1,
+                errors=[_failure_message(failure, self.i18n.t("failure.possible_missing_volume")) for failure in waiting_failures],
             )
 
         if recorded_password_failures:
@@ -1847,6 +1791,10 @@ class WatchScheduler:
                 for failure in recorded_password_failures
             ]
             return WatchRunResult(processed=1, failed=1, errors=errors)
+
+        if retired_failures and not summary.scan_failed_tasks:
+            self._notify("suppressed", request.notification_id)
+            return WatchRunResult(processed=1)
 
         if failed:
             # Unstructured failures cannot participate in an automatic wait.
@@ -1935,7 +1883,11 @@ class WatchScheduler:
     def _retire_claimed_paths(self, paths: Iterable[str], candidate: WatchCandidate) -> None:
         normalized = dedupe_normalized_paths(paths)
         with self._lock:
-            retired = [path for path in normalized if path_key(path) not in self._pending_by_key]
+            inflight_keys = {path_key(request.candidate.path) for request in self._inflight_requests}
+            retired = [
+                path for path in normalized
+                if path_key(path) not in self._pending_by_key and path_key(path) not in inflight_keys
+            ]
             candidate_pending = path_key(os.path.abspath(candidate.path)) in self._pending_by_key
         if retired:
             self.state.complete_work(retired)
@@ -1965,10 +1917,7 @@ class WatchScheduler:
         matched_root = _longest_matching_root(normalized, self.watch_roots)
         if matched_root is not None:
             return self.output_roots[path_key(matched_root)]
-        # Password retries may start from a recursively generated archive that
-        # already lives under a configured output root.
-        output_root = _longest_matching_root(normalized, list(self.output_roots.values()))
-        return output_root or self._common_root_for(path)
+        return self._common_root_for(path)
 
     def _is_under_watched_root(self, path: str) -> bool:
         normalized = os.path.normcase(os.path.abspath(path))
