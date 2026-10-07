@@ -15,6 +15,8 @@ const PREFIX: u64 = 40;
 const CHECK: u64 = 32;
 const MAC: u64 = 32;
 const BUFFER: usize = 256 * 1024;
+#[cfg(feature = "parallel-decrypt")]
+const MIN_PARALLEL_CHUNK: usize = 4 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
@@ -226,6 +228,17 @@ pub struct Decoder {
     encrypted_end: u64,
     framing_error: Option<Error>,
 }
+struct CpuLease<'a, F: FnMut(usize)> {
+    extra: usize,
+    release: &'a mut F,
+}
+impl<F: FnMut(usize)> Drop for CpuLease<'_, F> {
+    fn drop(&mut self) {
+        if self.extra != 0 {
+            (self.release)(self.extra);
+        }
+    }
+}
 impl Decoder {
     pub fn open<R: Read + Seek>(
         input: &mut R,
@@ -261,31 +274,95 @@ impl Decoder {
         &self,
         input: &mut R,
         output: &mut W,
+        progress: impl FnMut(u64) -> Result<()>,
+    ) -> Result<()> {
+        self.decrypt_with_threads(input, output, 1, progress)
+    }
+    /// Fixed budget for standalone Rust callers/benchmarks. The worker uses
+    /// `decrypt_with_budget` to acquire its actual remaining credits each batch.
+    pub fn decrypt_with_threads<R: Read + Seek, W: Write>(
+        &self,
+        input: &mut R,
+        output: &mut W,
+        threads: usize,
+        progress: impl FnMut(u64) -> Result<()>,
+    ) -> Result<()> {
+        self.decrypt_with_budget(
+            input,
+            output,
+            |wanted| wanted.min(threads.saturating_sub(1)),
+            |_| (),
+            progress,
+        )
+    }
+    pub fn decrypt_with_budget<R: Read + Seek, W: Write>(
+        &self,
+        input: &mut R,
+        output: &mut W,
+        mut acquire: impl FnMut(usize) -> usize,
+        mut release: impl FnMut(usize),
         mut progress: impl FnMut(u64) -> Result<()>,
     ) -> Result<()> {
         if let Some(error) = self.framing_error {
             return Err(error);
         }
+        #[cfg(not(feature = "parallel-decrypt"))]
+        let _ = &mut acquire;
         input.seek(SeekFrom::Start(PREFIX))?;
         let mut mac = blake3::Hasher::new_keyed(&self.keys.auth);
         mac.update(&self.keys.nonce);
         mac.update(&self.header.bytes);
-        let mut cipher =
-            cipher::Stream::new(self.header.bytes[6], &self.keys.key, &self.keys.nonce);
+        let cipher = cipher::Stream::new(self.header.bytes[6], &self.keys.key, &self.keys.nonce);
         let mut buffer = Zeroizing::new(vec![0u8; BUFFER]);
         let mut position = PREFIX;
         while position < self.packed - MAC {
-            progress(position)?;
             let n = ((self.packed - MAC - position).min(BUFFER as u64)) as usize;
             input.read_exact(&mut buffer[..n])?;
-            mac.update(&buffer[..n]); // Authenticate ciphertext/recovery before overwriting the buffer.
+            // Authenticate ciphertext/recovery before overwriting the buffer.
+            mac.update(&buffer[..n]);
             let decrypt_n = self.encrypted_end.saturating_sub(position).min(n as u64) as usize;
             if decrypt_n != 0 {
-                cipher.apply(&mut buffer[..decrypt_n]);
+                {
+                    #[cfg(feature = "parallel-decrypt")]
+                    let extra = {
+                        let slices = decrypt_n / MIN_PARALLEL_CHUNK;
+                        let granted = acquire(slices.saturating_sub(1));
+                        if granted == 0 {
+                            0
+                        } else {
+                            // Initialize the shared executor only after a grant.
+                            // If an explicit Rayon limit is smaller than the CPU
+                            // budget, immediately return credits it cannot use.
+                            let usable =
+                                granted.min(rayon::current_num_threads().saturating_sub(1));
+                            if usable < granted {
+                                release(granted - usable);
+                            }
+                            usable
+                        }
+                    };
+                    #[cfg(not(feature = "parallel-decrypt"))]
+                    let extra = 0;
+                    let _lease = CpuLease {
+                        extra,
+                        release: &mut release,
+                    };
+                    progress(position)?;
+                    #[cfg(feature = "parallel-decrypt")]
+                    cipher.apply_with_threads(
+                        position - PREFIX,
+                        &mut buffer[..decrypt_n],
+                        1 + extra,
+                    );
+                    #[cfg(not(feature = "parallel-decrypt"))]
+                    cipher.apply_at(position - PREFIX, &mut buffer[..decrypt_n]);
+                } // Return extra credits before writing; none are held during I/O.
                 let skip = (PREFIX + CHECK)
                     .saturating_sub(position)
                     .min(decrypt_n as u64) as usize;
                 output.write_all(&buffer[skip..decrypt_n])?;
+            } else {
+                progress(position)?;
             }
             position += n as u64;
         }

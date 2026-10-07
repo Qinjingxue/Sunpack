@@ -169,3 +169,17 @@ def test_prepared_context_is_invalidated_when_input_changes(tmp_path):
     assert enc_fast_verify_passwords(str(path), ["sunpack-test"])["status"] == "no_match"
     native_fixture("flip", path=str(path), offset=40)
     assert enc_fast_verify_passwords(str(path), ["sunpack-test"])["status"] == "match"
+
+
+def test_concurrent_candidate_batches_keep_priority_after_empty_and_rejected_batches():
+    from concurrent.futures import ThreadPoolExecutor
+    path = str(DATA / "algorithm_0.mov")
+    batches = [[], ["wrong"], ["sunpack-test", "sunpack-test"],
+               [f"wrong-{i}" for i in range(13)] + ["sunpack-test", "sunpack-test"]] * 2
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        for _ in range(2):
+            results = list(pool.map(lambda candidates: enc_fast_verify_passwords(path, candidates), batches))
+            for candidates, result in zip(batches, results):
+                expected = candidates.index("sunpack-test") if "sunpack-test" in candidates else -1
+                assert result["matched_index"] == expected
+                assert result["attempts"] == (expected + 1 if expected >= 0 else len(candidates))

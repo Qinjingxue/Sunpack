@@ -9,6 +9,8 @@ type ReadFn = unsafe extern "C" fn(*mut c_void, *mut u8, usize) -> isize;
 type SeekFn = unsafe extern "C" fn(*mut c_void, u64) -> i32;
 type WriteFn = unsafe extern "C" fn(*mut c_void, *const u8, usize) -> i32;
 type ProgressFn = unsafe extern "C" fn(*mut c_void, u64) -> i32;
+type AcquireFn = unsafe extern "C" fn(*mut c_void, u32) -> u32;
+type ReleaseFn = unsafe extern "C" fn(*mut c_void, u32);
 struct Input {
     ctx: *mut c_void,
     read: ReadFn,
@@ -109,14 +111,18 @@ pub unsafe extern "C" fn sup_enc_decrypt(
     seek: SeekFn,
     write: WriteFn,
     progress: ProgressFn,
+    acquire: AcquireFn,
+    release: ReleaseFn,
 ) -> i32 {
     if decoder.is_null() {
         return 4;
     }
     catch_unwind(AssertUnwindSafe(|| {
-        status((*decoder).decrypt(
+        status((*decoder).decrypt_with_budget(
             &mut Input { ctx, read, seek },
             &mut Output { ctx, write },
+            |wanted| acquire(ctx, wanted as u32) as usize,
+            |count| release(ctx, count as u32),
             |n| {
                 if progress(ctx, n) == 0 {
                     Ok(())

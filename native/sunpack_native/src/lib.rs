@@ -218,7 +218,10 @@ fn sunpack_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
         verification::file_crc::compute_directory_crc_manifest,
         m
     )?)?;
-    m.add_function(wrap_pyfunction!(verification::stream_receipt::verify_stream_receipt, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        verification::stream_receipt::verify_stream_receipt,
+        m
+    )?)?;
     m.add_function(wrap_pyfunction!(
         verification::inventory::match_output_inventory_coverage,
         m
@@ -274,7 +277,10 @@ fn sunpack_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m
     )?)?;
     m.add_function(wrap_pyfunction!(postprocess::delete_files_batch, m)?)?;
-    m.add_function(wrap_pyfunction!(postprocess::promote_blocked_input_files, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        postprocess::promote_blocked_input_files,
+        m
+    )?)?;
     m.add_function(wrap_pyfunction!(
         password::enc::enc_fast_verify_passwords,
         m

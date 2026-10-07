@@ -498,7 +498,10 @@ impl NativeCandidateTable {
                             .map(|anchor| anchor.format.as_str())
                             .unwrap_or("");
                         let accepted = detection_enabled
-                            && matches!(format, "tar" | "gzip" | "bzip2" | "xz" | "zstd" | "lz4" | "enc")
+                            && matches!(
+                                format,
+                                "tar" | "gzip" | "bzip2" | "xz" | "zstd" | "lz4" | "enc"
+                            )
                             && confirm_format_identity_native(path, format);
                         Some((index, key, accepted))
                     })

@@ -1920,8 +1920,16 @@ mod tests {
 
     #[test]
     fn zipx_aliases_share_only_the_standard_zip_spanned_size_family() {
-        let expected = vec![split_size_family_key("zip:spanned", r"C:\downloads\payload")];
-        for name in ["payload.zx01", "payload.ZX12", "payload.zipx", "payload.ZIPX"] {
+        let expected = vec![split_size_family_key(
+            "zip:spanned",
+            r"C:\downloads\payload",
+        )];
+        for name in [
+            "payload.zx01",
+            "payload.ZX12",
+            "payload.zipx",
+            "payload.ZIPX",
+        ] {
             assert_eq!(
                 relations_size_filter_split_family_keys(&format!(r"C:\downloads\{name}")),
                 expected,
@@ -1936,7 +1944,12 @@ mod tests {
             assert_eq!(parsed.prefix, "payload");
         }
         assert_eq!(get_logical_name("payload.zipx", false), "payload");
-        for name in ["payload.zx0", "payload.zx00", "payload.zxAA", "payload.zx4294967296"] {
+        for name in [
+            "payload.zx0",
+            "payload.zx00",
+            "payload.zxAA",
+            "payload.zx4294967296",
+        ] {
             assert!(parse_relation_numbered_volume(name).is_none(), "{name}");
         }
     }

@@ -6,9 +6,21 @@ license = "MIT"
 [lib]
 crate-type = ["rlib", "staticlib"]
 
+[[example]]
+name = "throughput"
+path = "../../benchmarks/native/enc_ctr.rs"
+
+[[example]]
+name = "decrypt"
+path = "../../benchmarks/native/enc_decrypt.rs"
+
+[features]
+parallel-kdf = ["argon2/parallel"]
+parallel-decrypt = ["dep:rayon"]
+
 [dependencies]
 aes = "0.8"
-argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
+argon2 = { version = "0.6", default-features = false, features = ["alloc"] }
 blake3 = "1.8"
 blowfish = "0.9"
 cipher = "0.4"
@@ -16,9 +28,10 @@ cipher5 = { package = "cipher", version = "0.5" }
 hkdf = "0.12"
 hmac = "0.12"
 rc6 = "0.1"
+rayon = { version = "1.10", optional = true }
 magma = "0.9"
 sha2 = { version = "0.10", features = ["compress"] }
-serpent = "0.5"
+serpent = "0.6"
 sha3 = "0.10"
 skein = "0.1"
 threefish = "0.5"

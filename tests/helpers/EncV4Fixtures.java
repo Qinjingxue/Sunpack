@@ -68,8 +68,10 @@ public final class EncV4Fixtures {
         try(ZipOutputStream z = new ZipOutputStream(outer)) { z.putNextEntry(new ZipEntry("movie.bin")); z.write(nested); z.closeEntry(); }
         Files.write(root.resolve("nested.enc"), enc(outer.toByteArray(),0,(byte)0,"sunpack-test"));
         // Large authenticated ordinary bytes: the ENC reader must know nothing about ZIP.
-        byte[] large = new byte[32*1024*1024]; new Random(42).nextBytes(large);
-        Files.write(root.resolve("large.enc"),enc(large,0,(byte)0,"sunpack-test"));
+        int largeCode = args.length > 1 ? Integer.parseInt(args[1]) : 0;
+        int largeMiB = args.length > 2 ? Integer.parseInt(args[2]) : 32;
+        byte[] large = new byte[largeMiB*1024*1024]; new Random(42).nextBytes(large);
+        Files.write(root.resolve("large.enc"),enc(large,largeCode,(byte)0,"sunpack-test"));
         Files.write(root.resolve("large.expected"),large);
         byte[] invalid = new byte[512]; System.arraycopy(new byte[]{'S','S','E','F','E',4,99,0},0,invalid,0,8);
         Files.write(root.resolve("invalid_algorithm.enc"),invalid);

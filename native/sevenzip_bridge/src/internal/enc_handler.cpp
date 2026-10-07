@@ -2,6 +2,7 @@
 #include "7zip/Archive/StdAfx.h"
 #include "sevenzip_sdk.hpp"
 #include "sevenzip_bridge/enc.h"
+#include "decoder_cpu_budget.h"
 #include "Common/ComTry.h"
 #include "Windows/PropVariant.h"
 #include "7zip/Common/RegisterArc.h"
@@ -40,7 +41,16 @@ struct Context {
     ISequentialOutStream *output = nullptr;
     IArchiveExtractCallback *callback = nullptr;
     HRESULT error = S_OK;
+    void *cpu_context = sunpack_cpu_current_job_context();
 };
+static uint32_t acquire_cpu(void *p, uint32_t wanted) {
+    auto &c = *static_cast<Context *>(p);
+    return c.cpu_context && wanted ? sunpack_cpu_acquire_extra_for_context(c.cpu_context, wanted, 1) : 0;
+}
+static void release_cpu(void *p, uint32_t count) {
+    auto &c = *static_cast<Context *>(p);
+    sunpack_cpu_release_extra_for_context(c.cpu_context, count);
+}
 static ptrdiff_t read(void *p, uint8_t *dst, size_t n) {
     auto &c = *static_cast<Context *>(p); UInt32 got = 0;
     c.error = c.input->Read(dst, static_cast<UInt32>(n), &got);
@@ -100,7 +110,7 @@ Z7_COM7F_IMF(CHandler::Extract(const UInt32 *indices, UInt32 count, Int32 test, 
     if (test) return callback->SetOperationResult(NExtract::NOperationResult::kOK);
     if (!output) return S_OK;
     Context c{stream, output, callback};
-    const int rc = sup_enc_decrypt(decoder, &c, read, seek, write, progress);
+    const int rc = sup_enc_decrypt(decoder, &c, read, seek, write, progress, acquire_cpu, release_cpu);
     output.Release();
     if (c.error != S_OK) return c.error;
     if (rc == 5) return E_OUTOFMEMORY;

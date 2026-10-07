@@ -5,6 +5,7 @@ use cipher5::{
     consts::{U20, U32},
     BlockCipherEncrypt, KeyInit as KeyInit5,
 };
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 type Rc6 = rc6::RC6<u32, U20, U32>;
 enum Primitive {
@@ -29,7 +30,7 @@ impl Primitive {
                 let mut k: [u8; 32] = key.try_into().unwrap();
                 k.reverse();
                 (
-                    Self::Serpent(serpent::Serpent::new_from_slice(&k).unwrap()),
+                    Self::Serpent(<serpent::Serpent as KeyInit5>::new_from_slice(&k).unwrap()),
                     16,
                 )
             }
@@ -65,7 +66,16 @@ impl Primitive {
     fn encrypt(&self, bytes: &mut [u8]) {
         match self {
             Self::Aes(c) => batch(c, bytes, false),
-            Self::Serpent(c) => batch(c, bytes, true),
+            Self::Serpent(c) => {
+                for block in bytes.chunks_exact_mut(16) {
+                    let mut b = cipher5::Block::<serpent::Serpent>::default();
+                    b.copy_from_slice(block);
+                    b.reverse();
+                    c.encrypt_block(&mut b);
+                    b.reverse();
+                    block.copy_from_slice(&b);
+                }
+            }
             Self::Blowfish(c) => batch(c, bytes, false),
             Self::Twofish(c) => batch(c, bytes, false),
             Self::Gost(c) => batch(c, bytes, true),
@@ -120,6 +130,11 @@ fn batch<C: BlockEncrypt>(cipher: &C, bytes: &mut [u8], reverse: bool) {
 struct Ctr {
     primitive: Primitive,
     size: usize,
+    initial: [u8; 128],
+    state: CtrState,
+}
+#[derive(Zeroize, ZeroizeOnDrop)]
+struct CtrState {
     counter: [u8; 128],
     pad: [u8; 2048],
     used: usize,
@@ -133,29 +148,55 @@ impl Ctr {
         Self {
             primitive,
             size,
+            initial: counter,
+            state: CtrState::new(counter),
+        }
+    }
+    fn apply(&mut self, bytes: &mut [u8]) {
+        self.state.apply(&self.primitive, self.size, bytes);
+    }
+    fn apply_at(&self, offset: u64, bytes: &mut [u8]) {
+        let mut state = CtrState::new(self.initial);
+        let mut carry = offset / self.size as u64;
+        for byte in state.counter[..self.size].iter_mut().rev() {
+            let sum = *byte as u64 + (carry & 0xff);
+            *byte = sum as u8;
+            carry = (carry >> 8) + (sum >> 8);
+        }
+        // The quick proof and arbitrary range boundaries need not be block aligned.
+        let skip = offset as usize % self.size;
+        if skip != 0 {
+            state.apply(&self.primitive, self.size, &mut [0u8; 128][..skip]);
+        }
+        state.apply(&self.primitive, self.size, bytes);
+    }
+}
+impl CtrState {
+    fn new(counter: [u8; 128]) -> Self {
+        Self {
             counter,
             pad: [0; 2048],
             used: 0,
             available: 0,
         }
     }
-    fn apply(&mut self, mut bytes: &mut [u8]) {
+    fn apply(&mut self, primitive: &Primitive, size: usize, mut bytes: &mut [u8]) {
         while !bytes.is_empty() {
             if self.used == self.available {
                 // Only generate what this call needs (especially the 32B password proof).
-                let blocks = bytes.len().div_ceil(self.size).min(16);
-                self.available = blocks * self.size;
+                let blocks = bytes.len().div_ceil(size).min(16);
+                self.available = blocks * size;
                 self.used = 0;
-                for block in self.pad[..self.available].chunks_exact_mut(self.size) {
-                    block.copy_from_slice(&self.counter[..self.size]);
-                    for byte in self.counter[..self.size].iter_mut().rev() {
+                for block in self.pad[..self.available].chunks_exact_mut(size) {
+                    block.copy_from_slice(&self.counter[..size]);
+                    for byte in self.counter[..size].iter_mut().rev() {
                         *byte = byte.wrapping_add(1);
                         if *byte != 0 {
                             break;
                         }
                     }
                 }
-                self.primitive.encrypt(&mut self.pad[..self.available]);
+                primitive.encrypt(&mut self.pad[..self.available]);
             }
             let n = bytes.len().min(self.available - self.used);
             for (b, p) in bytes[..n]
@@ -197,5 +238,32 @@ impl Stream {
         for stage in &mut self.stages {
             stage.apply(bytes);
         }
+    }
+    pub fn apply_at(&self, offset: u64, bytes: &mut [u8]) {
+        for stage in &self.stages {
+            // Share the expanded key; each task owns only its counter and pad.
+            stage.apply_at(offset, bytes);
+        }
+    }
+    #[cfg(feature = "parallel-decrypt")]
+    pub fn apply_with_threads(&self, offset: u64, bytes: &mut [u8], threads: usize) {
+        use rayon::prelude::*;
+        if bytes.is_empty() {
+            return;
+        }
+        let chunk_size = bytes.len().div_ceil(threads.max(1));
+        if chunk_size == bytes.len() {
+            self.apply_at(offset, bytes);
+            return;
+        }
+        // Exactly one CTR operation per granted CPU credit. Rayon cannot fan
+        // this work out beyond these slices, even though the pool is shared.
+        bytes
+            .par_chunks_mut(chunk_size)
+            .with_max_len(1)
+            .enumerate()
+            .for_each(|(index, part)| {
+                self.apply_at(offset + (index * chunk_size) as u64, part);
+            });
     }
 }

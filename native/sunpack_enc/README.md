@@ -18,6 +18,14 @@ workspace, with 64 MiB of aggregate scratch space per batch (six 10 MiB workspac
 for the default KDF). Higher encoded memory costs use fewer workspaces, with at
 least one workspace of the encoded size. Scratch space is dropped at batch exit;
 neither derived keys nor Argon2 buffers live in the prepared-context cache.
+The Python extension enables `parallel-kdf`: Argon2 0.6 computes its four lanes
+in that same Rayon pool, including batches with only one to four candidates.
+The worker build enables only `parallel-decrypt`, so its selected-password KDF
+stays serial. Build these packages separately to preserve Cargo feature isolation.
+Candidate workspace counts account for both the four lanes and the number of
+active ENC batches, to limit scratch retained by nested joins under concurrent
+probes. The active-batch counter is released on every return/error; it retains
+no passwords, keys or workspaces.
 
 Extraction retains only small keys and a 256 KiB streaming buffer. It returns
 one unnamed item, so the existing callback chooses the input filename stem.
@@ -26,6 +34,19 @@ discovery, output verification, cleanup, cancellation and CLI/Watch scheduling
 remain responsible for those behaviours. Recovery container framing is stripped;
 its bytes participate in ENC authentication. Recovery repair and output SHA-256
 passes are not performed.
+
+For each 256 KiB batch the worker acquires the currently available CPU credits
+from the existing broker and divides CTR into that many slices, plus its base
+credit. The count can increase or decrease every batch, including non-power-of-two
+counts. Its only limits are the shared Rayon executor's capacity and at least
+4 KiB of useful work per slice, rather than an algorithm switch or fixed thread
+count. Extra credits are returned immediately after computation, before writes,
+also on cancellation and errors. BLAKE3 remains on the base credit; its measured
+cost does not justify a second parallel scheduling mechanism. COM reads, writes
+and callbacks remain on the job thread. C4 uses each stage's own counter width
+and byte offset. Expanded keys are shared; counter/pad scratch is zeroized on
+drop. The process shares one Rayon executor across jobs, so jobs never create or
+retain separate pools. Serpent uses RustCrypto 0.6's bitsliced implementation.
 
 This initial implementation treats ENC as a complete logical stream. The format
 does not declare the ciphertext length, so it does not infer ENC boundaries inside

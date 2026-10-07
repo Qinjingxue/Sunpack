@@ -2,6 +2,13 @@
 
 Performance measurements and diagnostic profiles live here; behavioural assertions live under `tests/`.
 
+ENC v4 Rust probes live in `native/enc_ctr.rs` (pure CTR) and `native/enc_decrypt.rs`
+(authenticated streaming to a null sink). Run them with `cargo run --manifest-path
+native/Cargo.toml --release -p sunpack-enc --features parallel-decrypt --example throughput --
+256 3 5` or the `decrypt` example. Thread counts are benchmark budgets; the product worker
+acquires remaining CPU credits anew for each batch. Measurements and reproduction commands
+are in [ENC v4 optimization](../docs/zh-CN/benchmark_enc_v4_optimization.md).
+
 List the supported scenarios:
 
 ```powershell

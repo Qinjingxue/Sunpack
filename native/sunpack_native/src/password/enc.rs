@@ -14,6 +14,19 @@ use sunpack_enc::{Error, PasswordProbe, Workspace};
 // Argon2 is memory-hard: bound aggregate scratch space for one batch, rather
 // than allocating one workspace per password or retaining it in the cache.
 const PARALLEL_WORKSPACE_BYTES: usize = 64 * 1024 * 1024;
+static ACTIVE_BATCHES: AtomicUsize = AtomicUsize::new(0);
+struct ActiveBatch;
+impl ActiveBatch {
+    fn enter() -> Self {
+        ACTIVE_BATCHES.fetch_add(1, Ordering::Relaxed);
+        Self
+    }
+}
+impl Drop for ActiveBatch {
+    fn drop(&mut self) {
+        ACTIVE_BATCHES.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 
 #[pyfunction]
 pub(crate) fn enc_fast_verify_passwords(
@@ -118,7 +131,16 @@ impl EncPasswordContext {
         if candidates.is_empty() {
             return None;
         }
+        let _batch = ActiveBatch::enter();
+        // Each password already exposes four lanes to the shared executor.
+        // Distribute candidate workspaces across active batches; otherwise
+        // nested Rayon joins can retain a workspace for every parked candidate.
+        let lanes_in_flight = ACTIVE_BATCHES
+            .load(Ordering::Relaxed)
+            .max(1)
+            .saturating_mul(4);
         let workers = rayon::current_num_threads()
+            .div_ceil(lanes_in_flight)
             .min((PARALLEL_WORKSPACE_BYTES / self.probe.workspace_bytes()).max(1))
             .min(candidates.len().div_ceil(4))
             .max(1);

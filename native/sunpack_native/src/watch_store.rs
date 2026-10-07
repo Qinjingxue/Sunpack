@@ -404,9 +404,8 @@ impl NativeWatchState {
         expected_seq: u64,
     ) -> PyResult<NativeWatchReplay> {
         let mut data = std::mem::take(&mut *self.lock());
-        let replay = py.detach(|| {
-            replay_segment_file(&mut data, &path, checkpoint_seq, expected_seq)
-        });
+        let replay =
+            py.detach(|| replay_segment_file(&mut data, &path, checkpoint_seq, expected_seq));
         *self.lock() = data;
         replay
     }
@@ -494,10 +493,9 @@ fn decode_operation(operation: &Value) -> PyResult<Operation> {
                 .get("value")
                 .and_then(Value::as_object)
                 .ok_or_else(|| PyTypeError::new_err("watch cursor value must be an object"))?;
-            let cursors = serde_json::from_value::<BTreeMap<String, Cursor>>(Value::Object(
-                value.clone(),
-            ))
-            .map_err(|error| invalid(format!("invalid watch cursor value: {error}")))?;
+            let cursors =
+                serde_json::from_value::<BTreeMap<String, Cursor>>(Value::Object(value.clone()))
+                    .map_err(|error| invalid(format!("invalid watch cursor value: {error}")))?;
             return Ok(Operation::SetCursors(
                 cursors
                     .into_iter()
@@ -617,7 +615,10 @@ fn replay_segment_file(
             .map_err(|_| invalid(format!("corrupt watch state journal at {}", at())))?;
         let seq = transaction.seq;
         if transaction.operations.is_empty() {
-            return Err(invalid(format!("invalid watch state operations at {}", at())));
+            return Err(invalid(format!(
+                "invalid watch state operations at {}",
+                at()
+            )));
         }
         if seq <= checkpoint_seq {
             continue;

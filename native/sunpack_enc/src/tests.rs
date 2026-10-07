@@ -246,3 +246,215 @@ fn static_identity_never_runs_kdf() {
         assert!(Header::parse(&data, data.len() as u64).is_ok());
     }
 }
+
+#[test]
+fn ctr_offsets_match_official_vectors_and_full_counter_carries() {
+    for fixture in FIXTURES {
+        let header = Header::parse(fixture, fixture.len() as u64).unwrap();
+        let keys = Workspace::default()
+            .derive(&header, &pw("sunpack-test"))
+            .unwrap();
+        let mut stream = cipher::Stream::new(header.bytes[6], &keys.key, &keys.nonce);
+        // Absolute offsets remain valid even after the serial cursor has advanced.
+        stream.apply(&mut [0; 39]);
+        for offset in [0, 1, 7, 8, 15, 16, 31, 32, 127, 128, 129, 223] {
+            let mut bytes = fixture[40 + offset..fixture.len() - 32].to_vec();
+            stream.apply_at(offset as u64, &mut bytes);
+            let mut expected = vec![b'a'; 32];
+            // Official quick blocks use random alphanumeric text; compare payload only.
+            expected.extend_from_slice(include_bytes!("../tests/data/expected.zip"));
+            let skip = 32usize.saturating_sub(offset);
+            assert_eq!(&bytes[skip..], &expected[offset + skip..]);
+        }
+        // All sizes, especially C4's mixed block sizes, must carry across the
+        // whole nonce and wrap identically to the serial full-width counter.
+        let (_, nonce_len) = header.dimensions();
+        let mut nonce = vec![0xff; nonce_len];
+        nonce[nonce_len - 1] = 0xf8;
+        let stream = cipher::Stream::new(header.bytes[6], &keys.key, &nonce);
+        let mut serial = cipher::Stream::new(header.bytes[6], &keys.key, &nonce);
+        let mut expected = vec![0x53; 4099];
+        serial.apply(&mut expected);
+        for chunk in [1, 7, 31, 129, 513] {
+            let mut bytes = vec![0x53; expected.len()];
+            for (index, part) in bytes.chunks_mut(chunk).enumerate() {
+                stream.apply_at((index * chunk) as u64, part);
+            }
+            assert_eq!(bytes, expected);
+        }
+        if header.bytes[6] != 9 {
+            let offset = (1u64 << 40) + 129;
+            let size = nonce_len;
+            // Starting at 2^(block bits)-8 wraps to block_index-8. Construct
+            // that counter independently to cover offsets beyond 32 bits.
+            let counter = offset / size as u64 - 8;
+            let mut at_nonce = vec![0; nonce_len];
+            at_nonce[nonce_len - 8..].copy_from_slice(&counter.to_be_bytes());
+            let mut serial = cipher::Stream::new(header.bytes[6], &keys.key, &at_nonce);
+            let mut skip = vec![0; offset as usize % size];
+            serial.apply(&mut skip);
+            let mut expected = vec![0x53; 513];
+            serial.apply(&mut expected);
+            let mut actual = vec![0x53; expected.len()];
+            stream.apply_at(offset, &mut actual);
+            assert_eq!(actual, expected);
+        }
+    }
+}
+
+#[cfg(feature = "parallel-decrypt")]
+#[test]
+fn parallel_decryption_authenticates_multibuffer_payload_and_recovery() {
+    for code in 0..10 {
+        let mut header = Header::parse(FIXTURES[code], FIXTURES[code].len() as u64).unwrap();
+        header.bytes[7] = 0;
+        let keys = Workspace::default()
+            .derive(&header, &pw("sunpack-test"))
+            .unwrap();
+        let plaintext: Vec<u8> = (0..(if code == 9 { 2 } else { 1 }) * 1024 * 1024 + 137)
+            .map(|i| (i * 13) as u8)
+            .collect();
+        let mut bytes = header.bytes.to_vec();
+        let mut encrypted = vec![b'a'; 32];
+        encrypted.extend_from_slice(&plaintext);
+        cipher::Stream::new(code as u8, &keys.key, &keys.nonce).apply(&mut encrypted);
+        bytes.extend_from_slice(&encrypted);
+        let encrypted_end = bytes.len() as u64;
+        // A partial final decrypt chunk followed by authenticated recovery bytes.
+        bytes.extend_from_slice(&vec![0x73; BUFFER + 193]);
+        let mut mac = blake3::Hasher::new_keyed(&keys.auth);
+        mac.update(&keys.nonce);
+        mac.update(&bytes);
+        bytes.extend_from_slice(mac.finalize().as_bytes());
+        let decoder = Decoder {
+            header,
+            keys,
+            packed: bytes.len() as u64,
+            encrypted_end,
+            framing_error: None,
+        };
+        for threads in [1, 2, 3, 4, 5, 8, 9] {
+            let mut output = Vec::new();
+            decoder
+                .decrypt_with_threads(&mut Cursor::new(&bytes), &mut output, threads, |_| Ok(()))
+                .unwrap();
+            assert_eq!(output, plaintext);
+        }
+        if code == 9 {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(9)
+                .build()
+                .unwrap()
+                .install(|| {
+                    use std::cell::{Cell, RefCell};
+                    let held = Cell::new(0usize);
+                    let grants = RefCell::new(Vec::new());
+                    let next = Cell::new(0usize);
+                    let acquire = |wanted: usize| {
+                        assert_eq!(held.get(), 0);
+                        let extra = [0, 1, 2, 4, 6, 3, 0, 5][next.get() % 8].min(wanted);
+                        next.set(next.get() + 1);
+                        grants.borrow_mut().push(extra);
+                        held.set(extra);
+                        extra
+                    };
+                    let release = |extra| {
+                        assert!(held.get() >= extra);
+                        held.set(held.get() - extra);
+                    };
+                    struct CheckedWriter<'a> {
+                        held: &'a Cell<usize>,
+                        bytes: Vec<u8>,
+                        fail: bool,
+                    }
+                    impl Write for CheckedWriter<'_> {
+                        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                            assert_eq!(
+                                self.held.get(),
+                                0,
+                                "extra CPU credits held during output I/O"
+                            );
+                            if self.fail {
+                                return Err(std::io::ErrorKind::Other.into());
+                            }
+                            self.bytes.extend_from_slice(bytes);
+                            Ok(bytes.len())
+                        }
+                        fn flush(&mut self) -> std::io::Result<()> {
+                            Ok(())
+                        }
+                    }
+                    let mut output = CheckedWriter {
+                        held: &held,
+                        bytes: Vec::new(),
+                        fail: false,
+                    };
+                    decoder
+                        .decrypt_with_budget(
+                            &mut Cursor::new(&bytes),
+                            &mut output,
+                            acquire,
+                            release,
+                            |_| Ok(()),
+                        )
+                        .unwrap();
+                    assert_eq!(output.bytes, plaintext);
+                    assert_eq!(held.get(), 0);
+                    assert_eq!(&grants.borrow()[..8], &[0, 1, 2, 4, 6, 3, 0, 5]);
+                    // A cancellation while the lease is held must return all credits.
+                    assert_eq!(
+                        decoder.decrypt_with_budget(
+                            &mut Cursor::new(&bytes),
+                            &mut std::io::sink(),
+                            |wanted| {
+                                held.set(wanted);
+                                wanted
+                            },
+                            release,
+                            |_| Err(Error::Cancelled)
+                        ),
+                        Err(Error::Cancelled)
+                    );
+                    assert_eq!(held.get(), 0);
+                    output.fail = true;
+                    assert_eq!(
+                        decoder.decrypt_with_budget(
+                            &mut Cursor::new(&bytes),
+                            &mut output,
+                            acquire,
+                            release,
+                            |_| Ok(())
+                        ),
+                        Err(Error::Io)
+                    );
+                    assert_eq!(held.get(), 0);
+                });
+        }
+        let mut corrupt = bytes.clone();
+        corrupt[encrypted_end as usize + 13] ^= 1;
+        assert_eq!(
+            decoder.decrypt_with_threads(
+                &mut Cursor::new(&corrupt),
+                &mut std::io::sink(),
+                4,
+                |_| Ok(())
+            ),
+            Err(Error::Authentication)
+        );
+        assert_eq!(
+            decoder.decrypt_with_threads(&mut Cursor::new(&bytes), &mut std::io::sink(), 4, |_| {
+                Err(Error::Cancelled)
+            }),
+            Err(Error::Cancelled)
+        );
+        assert_eq!(
+            decoder.decrypt_with_threads(
+                &mut Cursor::new(&bytes[..bytes.len() - 1]),
+                &mut std::io::sink(),
+                4,
+                |_| Ok(())
+            ),
+            Err(Error::Truncated)
+        );
+    }
+}

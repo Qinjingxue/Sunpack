@@ -8,7 +8,7 @@ name = "sunpack_native"
 crate-type = ["cdylib"]
 
 [dependencies]
-sunpack-enc = { path = "../sunpack_enc" }
+sunpack-enc = { path = "../sunpack_enc", features = ["parallel-kdf"] }
 aho-corasick = "1.1"
 aes = "0.9"
 base64 = "0.22"
