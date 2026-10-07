@@ -342,11 +342,12 @@ def test_ordinary_part_words_keep_their_output_name(name, expected):
     assert RelationsScheduler().logical_name_for_archive(name) == expected
 
 
-def test_public_parser_accepts_modern_split_zip_members():
+@pytest.mark.parametrize("suffix", ["z", "zx", "ZX"])
+def test_public_parser_accepts_modern_split_zip_members(suffix):
     scheduler = RelationsScheduler()
 
-    first = scheduler.parse_numbered_volume("archive.z01")
-    later = scheduler.parse_numbered_volume("archive.z12")
+    first = scheduler.parse_numbered_volume(f"archive.{suffix}01")
+    later = scheduler.parse_numbered_volume(f"archive.{suffix}12")
 
     assert first is not None
     assert first["number"] == 1
@@ -354,6 +355,16 @@ def test_public_parser_accepts_modern_split_zip_members():
     assert later is not None
     assert later["number"] == 12
     assert later["style"] == "zip_spanned"
+
+
+@pytest.mark.parametrize("name", ["archive.zipx.part02.zipx", "archive.part02.zipx"])
+def test_public_parser_normalizes_zipx_marker_family(name):
+    parsed = RelationsScheduler().parse_numbered_volume(name)
+
+    assert parsed is not None
+    assert parsed["prefix"] == "archive"
+    assert parsed["style"] == "part_numbered"
+    assert parsed["number"] == 2
 
 
 @pytest.mark.parametrize(
@@ -395,9 +406,10 @@ def test_split_zip_structure_anchor_recovers_decorated_middle_member(tmp_path):
     assert relation_group_to_candidate(group).logical_size == expected_size
 
 
-def test_split_zip_without_terminal_reports_strong_missing_tail(tmp_path):
-    first = tmp_path / "modern.z01"
-    second = tmp_path / "modern.z02"
+@pytest.mark.parametrize("suffix", ["z", "zx"])
+def test_split_zip_without_terminal_reports_strong_missing_tail(tmp_path, suffix):
+    first = tmp_path / f"modern.{suffix}01"
+    second = tmp_path / f"modern.{suffix}02"
     first.write_bytes(_split_zip_first_bytes())
     second.write_bytes(b"opaque-middle-volume")
 

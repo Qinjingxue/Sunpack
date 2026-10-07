@@ -89,7 +89,7 @@ impl AnalysisBinaryView {
             result.set_item("error", "unsupported_version")?;
         } else if !matches!(
             compression_method,
-            0 | 1 | 6 | 8 | 9 | 12 | 14 | 95 | 96 | 98 | 99
+            0 | 1 | 6 | 8 | 9 | 12 | 14 | 93 | 95 | 96 | 98 | 99
         ) {
             result.set_item("error", "unknown_compression_method")?;
         } else if filename_len == 0 || filename_len > 4096 {

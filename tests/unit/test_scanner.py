@@ -142,6 +142,9 @@ def test_directory_scanner_promotes_small_split_member_with_accepted_family_anch
         ("payload.rar", "payload.r00"),
         ("payload.001", "payload.002"),
         ("payload.7z", "payload.7z.002"),
+        ("payload.zx01", "payload.zipx"),
+        ("payload.zipx", "payload.zx01"),
+        ("payload.zx01", "payload.zx02"),
     ],
 )
 def test_directory_scanner_size_deferred_supports_all_split_naming_families(

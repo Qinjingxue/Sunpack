@@ -1216,7 +1216,7 @@ fn normalize_retry_format(format_hint: &str) -> &str {
         .as_str()
     {
         "7z" => "7z",
-        "zip" => "zip",
+        "zip" | "zipx" => "zip",
         "rar" => "rar",
         _ => "",
     }
@@ -1333,7 +1333,7 @@ fn get_logical_name(filename: &str, is_archive: bool) -> String {
     if is_archive
         || matches!(
             ext.as_str(),
-            ".7z" | ".rar" | ".zip" | ".gz" | ".bz2" | ".xz" | ".exe"
+            ".7z" | ".rar" | ".zip" | ".zipx" | ".gz" | ".bz2" | ".xz" | ".exe"
         )
     {
         return clean_logical_name(&base);
@@ -1408,6 +1408,7 @@ pub(crate) fn relations_size_filter_split_family_keys(path: &str) -> Vec<String>
             keys.push(split_size_family_key("zip:zero-numbered", path));
             keys.push(split_size_family_key("zip:spanned", &base));
         }
+        ".zipx" => keys.push(split_size_family_key("zip:spanned", &base)),
         ".rar" => {
             keys.push(split_size_family_key("archive:numeric", path));
             keys.push(split_size_family_key("rar:oldstyle", &base));
@@ -1461,7 +1462,11 @@ fn may_have_size_deferred_split_identity(path: &str) -> bool {
     {
         return true;
     }
-    if name.ends_with(".7z") || name.ends_with(".zip") || name.ends_with(".rar") {
+    if name.ends_with(".7z")
+        || name.ends_with(".zip")
+        || name.ends_with(".zipx")
+        || name.ends_with(".rar")
+    {
         return true;
     }
     let suffix = name.rsplit('.').next().unwrap_or_default();
@@ -1472,6 +1477,12 @@ fn may_have_size_deferred_split_identity(path: &str) -> bool {
     if suffix.len() >= 3
         && matches!(suffix.as_bytes().first(), Some(b'z' | b'r'))
         && suffix.as_bytes()[1..].iter().all(u8::is_ascii_digit)
+    {
+        return true;
+    }
+    if suffix.len() >= 4
+        && suffix.starts_with("zx")
+        && suffix.as_bytes()[2..].iter().all(u8::is_ascii_digit)
     {
         return true;
     }
@@ -1718,6 +1729,7 @@ fn parse_marker_numbered_volume(path: &str) -> Option<ParsedVolume> {
         decorated: !(tail.eq_ignore_ascii_case(".rar")
             || tail.eq_ignore_ascii_case(".7z")
             || tail.eq_ignore_ascii_case(".zip")
+            || tail.eq_ignore_ascii_case(".zipx")
             || (number == 1 && tail.eq_ignore_ascii_case(".exe"))),
     })
 }
@@ -1748,7 +1760,7 @@ fn split_relation_path(path: &str) -> (&str, &str) {
 fn archive_family(value: &str) -> Option<&'static str> {
     match value.to_ascii_lowercase().as_str() {
         "7z" => Some("7z"),
-        "zip" => Some("zip"),
+        "zip" | "zipx" => Some("zip"),
         "rar" | "exe" => Some("rar"),
         _ => None,
     }
@@ -1832,7 +1844,7 @@ fn parse_zip_zero_numbered_re() -> &'static Regex {
 
 fn parse_zip_split_re() -> &'static Regex {
     static VALUE: OnceLock<Regex> = OnceLock::new();
-    VALUE.get_or_init(|| re(r"^(?P<prefix>.+)\.z(?P<number>\d{2,})(?P<tail>(?:\..+)?)$"))
+    VALUE.get_or_init(|| re(r"^(?P<prefix>.+)\.zx?(?P<number>\d{2,})(?P<tail>(?:\..+)?)$"))
 }
 
 fn parse_rar_part_re() -> &'static Regex {
@@ -1904,6 +1916,29 @@ mod tests {
 
         assert!(first.iter().any(|key| tail.contains(key)));
         assert!(!first.iter().any(|key| other.contains(key)));
+    }
+
+    #[test]
+    fn zipx_aliases_share_only_the_standard_zip_spanned_size_family() {
+        let expected = vec![split_size_family_key("zip:spanned", r"C:\downloads\payload")];
+        for name in ["payload.zx01", "payload.ZX12", "payload.zipx", "payload.ZIPX"] {
+            assert_eq!(
+                relations_size_filter_split_family_keys(&format!(r"C:\downloads\{name}")),
+                expected,
+                "{name}"
+            );
+        }
+        assert_eq!(normalize_retry_format(".ZIPX"), "zip");
+        assert_eq!(archive_family("ZIPX"), Some("zip"));
+        for name in ["payload.zipx.part02.zipx", "payload.part02.zipx"] {
+            let parsed = parse_relation_numbered_volume(name).unwrap();
+            assert_eq!(parsed.family, "zip");
+            assert_eq!(parsed.prefix, "payload");
+        }
+        assert_eq!(get_logical_name("payload.zipx", false), "payload");
+        for name in ["payload.zx0", "payload.zx00", "payload.zxAA", "payload.zx4294967296"] {
+            assert!(parse_relation_numbered_volume(name).is_none(), "{name}");
+        }
     }
 
     #[test]

@@ -31,10 +31,68 @@ enum Request {
         source: PathBuf,
         output: PathBuf,
     },
+    ZipMethod {
+        output: PathBuf,
+        method: u16,
+    },
     Flip {
         path: PathBuf,
         offset: u64,
     },
+}
+
+// Independent APPNOTE fixture for methods the archive generator cannot encode.
+// Unsupported methods deliberately contain opaque bytes: the decoder must
+// report unsupported_method before interpreting those bytes.
+fn zip_method(output: &Path, method: u16) -> io::Result<Value> {
+    let name = b"payload.txt";
+    let payload = b"ZIPX method fixture payload";
+    let compressed = if method == 93 {
+        zstd::stream::encode_all(payload.as_slice(), 1)?
+    } else {
+        payload.to_vec()
+    };
+    let crc = crc32fast::hash(payload);
+    let mut local = b"PK\x03\x04".to_vec();
+    for value in [63u16, 0, method, 0, 0] {
+        local.extend_from_slice(&value.to_le_bytes());
+    }
+    for value in [crc, compressed.len() as u32, payload.len() as u32] {
+        local.extend_from_slice(&value.to_le_bytes());
+    }
+    for value in [name.len() as u16, 0] {
+        local.extend_from_slice(&value.to_le_bytes());
+    }
+    local.extend_from_slice(name);
+    local.extend_from_slice(&compressed);
+    let mut central = b"PK\x01\x02".to_vec();
+    for value in [63u16, 63, 0, method, 0, 0] {
+        central.extend_from_slice(&value.to_le_bytes());
+    }
+    for value in [crc, compressed.len() as u32, payload.len() as u32] {
+        central.extend_from_slice(&value.to_le_bytes());
+    }
+    for value in [name.len() as u16, 0, 0, 0, 0] {
+        central.extend_from_slice(&value.to_le_bytes());
+    }
+    for value in [0u32, 0] {
+        central.extend_from_slice(&value.to_le_bytes());
+    }
+    central.extend_from_slice(name);
+    let mut eocd = b"PK\x05\x06".to_vec();
+    for value in [0u16, 0, 1, 1] {
+        eocd.extend_from_slice(&value.to_le_bytes());
+    }
+    for value in [central.len() as u32, local.len() as u32] {
+        eocd.extend_from_slice(&value.to_le_bytes());
+    }
+    eocd.extend_from_slice(&0u16.to_le_bytes());
+    let mut writer = BufWriter::new(File::create(output)?);
+    writer.write_all(&local)?;
+    writer.write_all(&central)?;
+    writer.write_all(&eocd)?;
+    writer.flush()?;
+    Ok(json!({"expected_files": {"payload.txt": {"size": payload.len(), "crc32": crc}}}))
 }
 
 fn seven_zip_uint(value: u64, output: &mut Vec<u8>) {
@@ -317,6 +375,7 @@ fn inventory(root: &Path, directory: &Path, entries: &mut Vec<Value>) -> io::Res
 
 fn run(request: Request) -> io::Result<Value> {
     match request {
+        Request::ZipMethod { output, method } => zip_method(&output, method),
         Request::SevenZipLz4Header { source, output } => seven_zip_lz4_header(&source, &output),
         Request::Flip { path, offset } => {
             let mut file = fs::OpenOptions::new().read(true).write(true).open(path)?;

@@ -67,6 +67,7 @@
         ],
         "allowed_extensions": [
           ".zip",
+          ".zipx",
           ".7z",
           ".rar"
         ]

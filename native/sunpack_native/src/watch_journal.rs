@@ -964,7 +964,6 @@ mod tests {
                 path.clone(),
                 1,
                 1,
-                17,
                 empty_operations(),
                 false,
             )
@@ -1002,7 +1001,6 @@ mod tests {
                 path.clone(),
                 1,
                 1,
-                17,
                 empty_operations(),
                 false,
             )

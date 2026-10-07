@@ -834,8 +834,8 @@ def test_structure_resolution_rejects_current_paths_from_different_directories(
 
 
 @pytest.mark.skipif(get_optional_winrar() is None, reason="WinRAR is required to generate modern split ZIP")
-@pytest.mark.parametrize("opaque_competition", [False, True])
-def test_modern_split_zip_with_camouflaged_names_runs_full_pipeline(tmp_path, opaque_competition):
+@pytest.mark.parametrize("opaque_competition,zipx", [(False, False), (True, False), (False, True)])
+def test_modern_split_zip_with_camouflaged_names_runs_full_pipeline(tmp_path, opaque_competition, zipx):
     winrar = get_optional_winrar()
     assert winrar is not None
     source = tmp_path / "source"
@@ -872,6 +872,9 @@ def test_modern_split_zip_with_camouflaged_names_runs_full_pipeline(tmp_path, op
         marker = suffix.removeprefix(".")
         name = (f"shared.chunk{len(renamed) + 1}.zipdata.bin" if opaque_competition
             else f"shared.alpha.{marker}.useless.{len(renamed)}.fake")
+        if zipx:
+            suffix = ".zipx" if suffix == ".zip" else f".zx{suffix[2:]}"
+            name = f"shared.alpha{suffix}"
         target = mixed / name
         source_part.replace(target)
         renamed.append(target)
@@ -886,6 +889,9 @@ def test_modern_split_zip_with_camouflaged_names_runs_full_pipeline(tmp_path, op
         with_detection_pipeline(
             {
                 "verification": {"enabled": False, "methods": []},
+                "filesystem": {"scan_filters": [
+                    {"name": "size_range", "enabled": True, "gte": MIB if zipx else 0},
+                ]},
             },
             precheck=[
                 {"name": "size_range", "enabled": True, "gte": 0},

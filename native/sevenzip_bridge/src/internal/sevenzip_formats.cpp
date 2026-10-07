@@ -26,7 +26,7 @@ namespace sunpack::sevenzip
 
         std::vector<unsigned char> known_format_ids_for_hint(const std::wstring &hint)
         {
-            if (hint == L"zip")
+            if (hint == L"zip" || hint == L"zipx")
                 return {0x01};
             if (hint == L"7z" || hint == L"sevenzip" || hint == L"seven_zip")
                 return {0x07};
