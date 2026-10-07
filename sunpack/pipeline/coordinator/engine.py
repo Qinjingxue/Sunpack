@@ -1416,6 +1416,7 @@ class _RequestRuntime:
 
             # Retryable nested inputs leave recursive ownership, but remain failed.
             subtree_complete = outcome.outcome_kind == OutcomeKind.COMPLETE_SUCCESS or promoted
+            ran_recursive_children = False
             if output_dir and self.recursion.allows_children(depth):
                 scan_work = await broker.run(
                     "nested_scan",
@@ -1427,6 +1428,7 @@ class _RequestRuntime:
                     cancellation=cancellation,
                 )
                 if scan_work.roots and await self._allow_recursive_depth(depth + 1):
+                    ran_recursive_children = True
                     children_complete = await self._discover_and_run(
                         list(scan_work.roots),
                         scan_session=scan_work.session,
@@ -1438,10 +1440,13 @@ class _RequestRuntime:
                     subtree_complete = subtree_complete and children_complete
 
             if output_dir and subtree_complete:
-                try:
-                    os.rmdir(output_dir)
-                except OSError:
-                    pass
+                if ran_recursive_children:
+                    # Recursion may consume the output tree; a zero-member
+                    # archive's original empty output remains a valid result.
+                    try:
+                        os.rmdir(output_dir)
+                    except OSError:
+                        pass
                 if not os.path.exists(output_dir):
                     ownership.forget_output(output_dir)
                     cleared = replace(result, output_dir="")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import shutil
 from pathlib import Path
 
@@ -7,7 +8,9 @@ import pytest
 
 from tests.helpers.native_fixture import assemble_carrier, assert_exact_tree, file_inventory
 from tests.helpers.tool_config import get_optional_rar, get_optional_winrar
-from tests.real.plan1_real_archives.plan1_support import run_plan1_pipeline
+from sunpack.core.contracts.results import OutcomeKind
+from sunpack.pipeline.coordinator.engine import PipelineEngine
+from tests.real.plan1_real_archives.plan1_support import plan1_config, run_plan1_pipeline
 from scripts.generate_real_structure_corpus import STRUCTURE_CASES, generate
 
 
@@ -46,5 +49,47 @@ def test_external_writer_structure_extracts_exact_members(tmp_path, plan_error, 
     assert summary.partial_success_count == 0
     assert summary.success_count == 1
     result = next(item for item in summary.target_results if Path(item.input_path) == archive)
+    assert result.output_dir
     output_dir = Path(result.output_dir)
+    assert output_dir.is_dir()
     assert_exact_tree(output_dir, sample["expected_files"])
+
+
+@pytest.fixture(scope="module")
+def empty_zip_sample(tmp_path_factory):
+    corpus = tmp_path_factory.mktemp("empty-zip-output")
+    sample = generate(corpus, cases=(("bsdtar-empty-zip", "zip", "zip-empty"),))[0]
+    assert sample["expected_files"] == {}
+    return corpus / sample["file"]
+
+
+@pytest.mark.parametrize("origin", ["foreground", "watch"])
+@pytest.mark.parametrize("container", ["plain", "disguised", "carrier"])
+@pytest.mark.parametrize("flatten", [False, True])
+def test_empty_archive_preserves_output_without_recursive_children(
+    tmp_path, empty_zip_sample, origin, container, flatten,
+):
+    archive = tmp_path / ("empty.zip" if container == "plain" else "payload.unrelated")
+    if container == "carrier":
+        assemble_carrier(archive, [empty_zip_sample], seed=0xC0A905, decoys=True)
+    else:
+        shutil.copyfile(empty_zip_sample, archive)
+    config = plan1_config()
+    config["output"] = {"root": str(tmp_path / "out")}
+    config["post_extract"]["flatten_single_directory"] = flatten
+
+    async def run():
+        async with PipelineEngine(config) as engine:
+            return await engine.run([str(archive)], origin=origin)
+
+    response = asyncio.run(run())
+    assert not response.summary.failed_tasks, response.summary.failures
+    assert len(response.summary.target_results) == 1
+    result = response.summary.target_results[0]
+    assert result.outcome_kind == OutcomeKind.COMPLETE_SUCCESS
+    assert result.output_dir
+    output = Path(result.output_dir)
+    assert output.is_absolute() and output.is_dir()
+    assert output.parent == tmp_path / "out"
+    assert_exact_tree(output, {})
+    assert archive.is_file()
