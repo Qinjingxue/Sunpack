@@ -91,7 +91,7 @@ rebuild/relink requirements for the exact code used to produce the binary.
 
 SunPack vendors the unmodified LZ4 1.10.0 library sources and bundled xxHash at
 `native/third_party/lz4/`. They are compiled into the Rust extension and the
-archive worker for LZ4 Frame and Legacy decoding. The library remains under
+archive worker for LZ4 Frame decoding. The library remains under
 the BSD 2-Clause license. The full notice is distributed at
 [licenses/lz4-license.txt](licenses/lz4-license.txt).
 

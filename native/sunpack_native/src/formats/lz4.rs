@@ -4,13 +4,11 @@ use crate::io::reader::ManagedReader;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use std::ffi::c_void;
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom};
 
 pub(crate) const MAGIC: &[u8] = b"\x04\x22\x4d\x18";
-pub(crate) const LEGACY: &[u8] = b"\x02\x21\x4c\x18";
 pub(crate) const MAX_RECORDS: usize = 1_000_000;
 const MAX_FRAMES: usize = 65_536;
-const LEGACY_MAX: u32 = 8 * 1024 * 1024 + (8 * 1024 * 1024 / 255) + 16;
 
 unsafe extern "C" {
     fn SUNPACK_LZ4_XXH32(input: *const c_void, size: usize, seed: u32) -> u32;
@@ -19,9 +17,6 @@ unsafe extern "C" {
         read: unsafe extern "C" fn(*mut c_void, *mut c_void, usize) -> isize,
         skip: Option<unsafe extern "C" fn(*mut c_void, u64) -> i32>,
         write: unsafe extern "C" fn(*mut c_void, *const c_void, usize) -> i32,
-        dictionary: Option<
-            unsafe extern "C" fn(*mut c_void, u32, i32, *mut *const c_void, *mut usize) -> i32,
-        >,
         progress: Option<unsafe extern "C" fn(*mut c_void, u64, u64) -> i32>,
         result: *mut DecodeResult,
     ) -> i32;
@@ -35,7 +30,6 @@ pub(crate) fn skippable(magic: u32) -> bool {
 }
 pub(crate) fn leading(bytes: &[u8]) -> bool {
     bytes.starts_with(MAGIC)
-        || bytes.starts_with(LEGACY)
         || bytes
             .get(..4)
             .is_some_and(|p| skippable(u32::from_le_bytes(p.try_into().unwrap())))
@@ -50,9 +44,6 @@ pub(crate) fn identity(reader: &ManagedReader, offset: u64) -> Result<bool, &'st
             let size = word(reader, cursor + 4, limit)?;
             advance(&mut cursor, 8 + u64::from(size), limit)?;
             continue;
-        }
-        if magic == 0x184c2102 {
-            return Ok(cursor + 4 <= limit);
         }
         if magic != 0x184d2204 {
             return Ok(false);
@@ -70,7 +61,6 @@ pub(crate) struct Header {
     pub(crate) len: usize,
     pub(crate) block_max: u32,
     pub(crate) content_size: Option<u64>,
-    pub(crate) dictionary_id: Option<u32>,
     pub(crate) block_checksum: bool,
     pub(crate) content_checksum: bool,
 }
@@ -108,8 +98,6 @@ pub(crate) fn parse_header(bytes: &[u8]) -> Result<Header, &'static str> {
         len,
         block_max,
         content_size: size_present.then(|| u64::from_le_bytes(bytes[6..14].try_into().unwrap())),
-        dictionary_id: dict_present
-            .then(|| u32::from_le_bytes(bytes[len - 5..len - 1].try_into().unwrap())),
         block_checksum: flags & 16 != 0,
         content_checksum: flags & 4 != 0,
     })
@@ -121,12 +109,10 @@ pub(crate) struct Index {
     pub(crate) end: u64,
     pub(crate) frames: usize,
     pub(crate) skips: usize,
-    pub(crate) legacy_frames: usize,
     pub(crate) content_checksums: usize,
     pub(crate) block_checksums: usize,
     pub(crate) blocks: usize,
     pub(crate) decoded_size: Option<u64>,
-    pub(crate) dictionaries: Vec<u32>,
     pub(crate) complete: bool,
     pub(crate) error: &'static str,
 }
@@ -177,7 +163,6 @@ pub(crate) fn walk(reader: &ManagedReader, offset: u64, limit: u64) -> Index {
 }
 fn walk_inner(reader: &ManagedReader, limit: u64, index: &mut Index) -> Result<(), &'static str> {
     let mut cursor = index.start;
-    let mut dictionary_ids = std::collections::BTreeSet::new();
     loop {
         if cursor == limit {
             index.end = cursor;
@@ -190,7 +175,6 @@ fn walk_inner(reader: &ManagedReader, limit: u64, index: &mut Index) -> Result<(
             // A partial known magic is a truncated next frame, not carrier junk.
             let tail = field(reader, cursor, (limit - cursor) as usize, limit)?;
             if MAGIC.starts_with(&tail)
-                || LEGACY.starts_with(&tail)
                 || tail.first().is_some_and(|b| (0x50..=0x5f).contains(b))
                     && b"\x2a\x4d\x18".starts_with(&tail[1..])
             {
@@ -240,47 +224,10 @@ fn walk_inner(reader: &ManagedReader, limit: u64, index: &mut Index) -> Result<(
             if header.block_checksum {
                 index.block_checksums += 1;
             }
-            if let Some(id) = header.dictionary_id {
-                if dictionary_ids.insert(id) {
-                    index.dictionaries.push(id);
-                }
-            }
             index.decoded_size = match (index.decoded_size, header.content_size) {
                 (Some(a), Some(b)) => Some(a.checked_add(b).ok_or("lz4_size_overflow")?),
                 _ => None,
             };
-        } else if magic == 0x184c2102 {
-            advance(&mut cursor, 4, limit)?;
-            loop {
-                if cursor == limit {
-                    break;
-                }
-                if index.blocks >= MAX_RECORDS {
-                    return Err("lz4_walk_budget_exhausted");
-                }
-                let size = word(reader, cursor, limit).map_err(|error| {
-                    if error == "os_error" {
-                        error
-                    } else {
-                        "lz4_legacy_boundary_unknown"
-                    }
-                })?;
-                if size == 0x184d2204 || size == 0x184c2102 || skippable(size) {
-                    break;
-                }
-                if size == 0 {
-                    advance(&mut cursor, 4, limit)?;
-                    break;
-                }
-                if size > LEGACY_MAX {
-                    return Err("lz4_legacy_boundary_unknown");
-                }
-                advance(&mut cursor, 4 + u64::from(size), limit)
-                    .map_err(|_| "lz4_legacy_boundary_unknown")?;
-                index.blocks += 1;
-            }
-            index.legacy_frames += 1;
-            index.decoded_size = None;
         } else {
             if index.frames > 0 {
                 return Ok(());
@@ -306,10 +253,7 @@ impl Index {
             self.frames > 0
                 || self.error.starts_with("lz4_") && self.error != "lz4_magic_not_found",
         )?;
-        result.set_item(
-            "plausible",
-            self.frames > 0 || self.error == "lz4_legacy_boundary_unknown",
-        )?;
+        result.set_item("plausible", self.frames > 0)?;
         result.set_item("error", self.error)?;
         result.set_item(
             "damage_flags",
@@ -348,20 +292,15 @@ impl Index {
         result.set_item("structure.stream_count", self.frames)?;
         result.set_item("structure.block_count", self.blocks)?;
         result.set_item("structure.decoded_size", self.decoded_size)?;
-        result.set_item(
-            "information_required",
-            self.error == "lz4_legacy_boundary_unknown",
-        )?;
         let plan = PyDict::new(py);
+        plan.set_item("content_checksum_algorithm", "xxh32")?;
         plan.set_item("input_bytes", self.end.saturating_sub(self.start))?;
         plan.set_item("frames", self.frames)?;
         plan.set_item("skippable_frames", self.skips)?;
-        plan.set_item("legacy_frames", self.legacy_frames)?;
         plan.set_item("content_checked_frames", self.content_checksums)?;
         plan.set_item("block_checked_frames", self.block_checksums)?;
         plan.set_item("expected_size", self.decoded_size)?;
         plan.set_item("complete", self.complete)?;
-        plan.set_item("dictionary_ids", &self.dictionaries)?;
         result.set_item("stream_plan", plan)?;
         Ok(result)
     }
@@ -376,39 +315,13 @@ pub(crate) struct DecodeResult {
     pub(crate) skippable_frames: u64,
     pub(crate) content_checked_frames: u64,
     pub(crate) block_checked_frames: u64,
-    pub(crate) legacy_frames: u64,
-    pub(crate) dictionary_id: u32,
     pub(crate) error: i32,
-}
-#[derive(Clone, Debug, Default)]
-pub(crate) struct Dictionaries {
-    pub(crate) default: String,
-    pub(crate) by_id: std::collections::BTreeMap<u32, String>,
-}
-impl Dictionaries {
-    pub(crate) fn to_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let result = PyDict::new(py);
-        result.set_item("default_dictionary", &self.default)?;
-        let entries = pyo3::types::PyList::empty(py);
-        for (id, path) in &self.by_id {
-            let entry = PyDict::new(py);
-            entry.set_item("id", id)?;
-            entry.set_item("path", path)?;
-            entries.append(entry)?;
-        }
-        result.set_item("dictionaries", entries)?;
-        Ok(result)
-    }
 }
 struct Sample<R> {
     reader: R,
     output: Vec<u8>,
     limit: usize,
     stopped: bool,
-    error: Option<io::Error>,
-    dictionaries: Dictionaries,
-    dictionary: Vec<u8>,
-    dictionary_key: Option<u64>,
     input_remaining: u64,
     read_remaining: u64,
 }
@@ -433,10 +346,7 @@ unsafe extern "C" fn sample_read<R: Read>(
             state.read_remaining -= n as u64;
             n as isize
         }
-        Err(e) => {
-            state.error = Some(e);
-            -1
-        }
+        Err(_) => -1,
     }
 }
 unsafe extern "C" fn sample_write<R: Read>(
@@ -457,63 +367,11 @@ unsafe extern "C" fn sample_write<R: Read>(
     }
 }
 pub(crate) fn sample<R: Read>(reader: R, limit: usize) -> Result<Vec<u8>, &'static str> {
-    sample_with_dictionaries(reader, limit, &Dictionaries::default())
-}
-unsafe extern "C" fn sample_dictionary<R: Read>(
-    opaque: *mut c_void,
-    id: u32,
-    has_id: i32,
-    data: *mut *const c_void,
-    size: *mut usize,
-) -> i32 {
-    let state = &mut *opaque.cast::<Sample<R>>();
-    let keyed = has_id != 0;
-    let key = if keyed { u64::from(id) } else { 1u64 << 32 };
-    if state.dictionary_key == Some(key) {
-        *data = state.dictionary.as_ptr().cast();
-        *size = state.dictionary.len();
-        return 1;
-    }
-    let path = if keyed {
-        state.dictionaries.by_id.get(&id)
-    } else {
-        Some(&state.dictionaries.default)
-    };
-    let Some(path) = path.filter(|path| !path.is_empty()) else {
-        return 0;
-    };
-    let result = (|| -> io::Result<()> {
-        let mut file = std::fs::File::open(path)?;
-        let length = file.metadata()?.len();
-        let tail = length.min(65536) as usize;
-        file.seek(SeekFrom::Start(length - tail as u64))?;
-        state.dictionary.resize(tail, 0);
-        file.read_exact(&mut state.dictionary)?;
-        Ok(())
-    })();
-    if let Err(e) = result {
-        state.error = Some(e);
-        return -1;
-    }
-    state.dictionary_key = Some(key);
-    *data = state.dictionary.as_ptr().cast();
-    *size = state.dictionary.len();
-    1
-}
-pub(crate) fn sample_with_dictionaries<R: Read>(
-    reader: R,
-    limit: usize,
-    dictionaries: &Dictionaries,
-) -> Result<Vec<u8>, &'static str> {
     let state = Sample {
         reader,
         output: Vec::with_capacity(limit),
         limit,
         stopped: false,
-        error: None,
-        dictionaries: dictionaries.clone(),
-        dictionary: Vec::new(),
-        dictionary_key: None,
         input_remaining: u64::MAX,
         read_remaining: u64::MAX,
     };
@@ -532,10 +390,7 @@ unsafe extern "C" fn sample_skip<R: Read + Seek>(opaque: *mut c_void, n: u64) ->
             state.input_remaining -= n;
             0
         }
-        Err(e) => {
-            state.error = Some(e);
-            -1
-        }
+        Err(_) => -1,
     }
 }
 pub(crate) fn sample_seekable<R: Read + Seek>(
@@ -543,17 +398,12 @@ pub(crate) fn sample_seekable<R: Read + Seek>(
     limit: usize,
     input_limit: u64,
     read_budget: u64,
-    dictionaries: &Dictionaries,
 ) -> Result<Vec<u8>, &'static str> {
     let state = Sample {
         reader,
         output: Vec::with_capacity(limit),
         limit,
         stopped: false,
-        error: None,
-        dictionaries: dictionaries.clone(),
-        dictionary: Vec::new(),
-        dictionary_key: None,
         input_remaining: input_limit,
         read_remaining: read_budget,
     };
@@ -570,7 +420,6 @@ fn run_sample<R: Read>(
             sample_read::<R>,
             skip,
             sample_write::<R>,
-            Some(sample_dictionary::<R>),
             None,
             &mut result,
         )
@@ -578,8 +427,8 @@ fn run_sample<R: Read>(
     if state.stopped || rc == 0 {
         Ok(state.output)
     } else {
-        Err(if rc == 5 || rc == 8 {
-            "lz4_dictionary_required"
+        Err(if rc == 5 {
+            "lz4_unsupported"
         } else {
             "lz4_decompression_probe_failed"
         })
@@ -643,7 +492,7 @@ mod tests {
         }
     }
     #[test]
-    fn all_header_layouts_preserve_known_zero_and_dictionary_id() {
+    fn all_header_layouts_preserve_known_zero_and_descriptor_length() {
         for block in 4..=7 {
             for option in 0..32 {
                 let flags = 0x40 | option;
@@ -655,7 +504,10 @@ mod tests {
                 let bytes = frame(b"", flags, block << 4, size, dict);
                 let header = parse_header(&bytes).unwrap();
                 assert_eq!(header.content_size, size);
-                assert_eq!(header.dictionary_id, dict);
+                assert_eq!(
+                    header.len,
+                    7 + usize::from(size.is_some()) * 8 + usize::from(dict.is_some()) * 4
+                );
                 let parsed = index(bytes, 0);
                 assert!(parsed.complete, "{parsed:?}");
                 assert_eq!(parsed.frames, 1);
@@ -699,24 +551,6 @@ mod tests {
         assert_eq!(parse_header(&header).unwrap_err(), "lz4_reserved_bits_set");
     }
     #[test]
-    fn legacy_tail_is_information_required_and_explicit_eof_is_usable() {
-        // A compressed literal-only block: token + five bytes.
-        let mut bytes = LEGACY.to_vec();
-        bytes.extend_from_slice(&6u32.to_le_bytes());
-        bytes.extend_from_slice(b"\x50hello");
-        let parsed = index(bytes.clone(), 0);
-        assert!(parsed.complete);
-        assert_eq!(parsed.legacy_frames, 1);
-        assert_eq!(
-            sample(std::io::Cursor::new(&bytes), 1024).unwrap(),
-            b"hello"
-        );
-        bytes.extend_from_slice(b"trailing carrier");
-        let parsed = index(bytes, 0);
-        assert!(!parsed.complete);
-        assert_eq!(parsed.error, "lz4_legacy_boundary_unknown");
-    }
-    #[test]
     fn sample_checks_checksum_and_returns_bounded_prefix() {
         let payload = vec![b'x'; 60000];
         let mut bytes = frame(&payload, 0x74, 0x40, None, None);
@@ -731,49 +565,26 @@ mod tests {
         *bytes.last_mut().unwrap() ^= 1;
         assert!(sample(std::io::Cursor::new(&bytes), 65536).is_err());
     }
+
     #[test]
-    fn explicit_zero_dictionary_id_never_uses_the_default() {
-        let bytes = frame(b"hello", 0x61, 0x40, None, Some(0));
-        assert_eq!(index(bytes.clone(), 0).dictionaries, [0]);
-        let dictionaries = Dictionaries {
-            default: "default-must-not-be-opened".into(),
-            ..Dictionaries::default()
-        };
-        assert_eq!(
-            sample_with_dictionaries(std::io::Cursor::new(&bytes), 32, &dictionaries),
-            Err("lz4_dictionary_required")
-        );
-        // The missing dependency is required even when this frame's blocks
-        // happen to contain only literals and could decode without a dictionary.
-        assert_eq!(
-            sample(std::io::Cursor::new(&bytes), 32),
-            Err("lz4_dictionary_required")
-        );
-        let mut state = Sample {
-            reader: std::io::Cursor::new(&bytes),
-            output: Vec::new(),
-            limit: 32,
-            stopped: false,
-            error: None,
-            dictionaries,
-            dictionary: Vec::new(),
-            dictionary_key: None,
-            input_remaining: u64::MAX,
-            read_remaining: u64::MAX,
-        };
-        let mut data = std::ptr::null();
-        let mut size = 0;
-        let opaque = (&mut state as *mut Sample<_>).cast();
-        assert_eq!(
-            unsafe {
-                sample_dictionary::<std::io::Cursor<&Vec<u8>>>(opaque, 0, 1, &mut data, &mut size)
-            },
+    fn unsupported_inputs_do_not_need_external_context() {
+        let legacy = b"\x02\x21\x4c\x18\x06\0\0\0\x50hello";
+        assert!(!leading(legacy));
+        assert!(!identity(
+            &ManagedReader::from_bytes(legacy.to_vec(), ReaderConfig::default()),
             0
-        );
-        assert!(
-            state.error.is_none(),
-            "an explicit ID must not open the default path"
-        );
+        )
+        .unwrap());
+        assert_eq!(index(legacy.to_vec(), 0).error, "lz4_magic_not_found");
+        assert!(sample(std::io::Cursor::new(legacy), 32).is_err());
+        for id in [0, 123, u32::MAX] {
+            let bytes = frame(b"hello", 0x61, 0x40, None, Some(id));
+            assert!(index(bytes.clone(), 0).complete);
+            assert_eq!(
+                sample(std::io::Cursor::new(&bytes), 32),
+                Err("lz4_unsupported")
+            );
+        }
     }
 }
 

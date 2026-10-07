@@ -31,7 +31,7 @@ class ArchiveTestCrcMethod:
     name = "archive_test_crc"
 
     def verify(self, evidence: VerificationEvidence, config: dict) -> VerificationStep:
-        if evidence.archive_input.format_hint in {"lz4", "tar.lz4"}:
+        if evidence.archive_input.analysis.get("stream_plan") and evidence.worker_result.get("stream_receipt"):
             return _stream_receipt_result(self.name, evidence)
         max_items = config["max_items"]
         archive_manifest = archive_input_manifest_for_evidence(evidence, max_items=max_items)
@@ -385,7 +385,7 @@ def _stream_receipt_result(method: str, evidence: VerificationEvidence) -> Verif
         decision_hint=DECISION_RETRY_EXTRACT if status == "failed" else "none",
         issues=[VerificationIssue(
             method=method, code="fail.stream_execution_mismatch" if status == "failed" else "info.stream_execution_coverage",
-            message="LZ4 frame sequence, checksums and finalized output were compared with the source plan",
+            message="Stream execution receipt and finalized output were compared with the source plan",
             path=evidence.output_dir, actual=result,
         )],
     )

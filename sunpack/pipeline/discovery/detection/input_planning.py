@@ -132,7 +132,7 @@ class ArchiveInputPlanningStage:
         if self.analyzer is None:
             return False
         descriptor = task.archive_input()
-        # Identity confirmation does not carry frame coverage or dictionaries.
+        # Identity confirmation does not carry stream structure.
         # Embedded tasks already own the canonical plan; reuse it directly.
         if descriptor.format_hint in {"lz4", "tar.lz4"}:
             return not descriptor.analysis.get("stream_plan")
@@ -309,8 +309,7 @@ class ArchiveInputPlanningStage:
             if execution_analysis:
                 analysis["execution"] = execution_analysis
             selected_format = str(getattr(selected, "format", "") or "")
-            if selected_format in {"lz4", "tar.lz4"}:
-                analysis.update(_lz4_execution_analysis(selected, 0))
+            analysis.update(_stream_execution_analysis(selected, 0))
             updated = replace(
                 descriptor,
                 format_hint=selected_format or descriptor.format_hint,
@@ -388,7 +387,7 @@ class ArchiveInputPlanningStage:
             "format_hint": evidence.format,
             "path": task.main_path,
         })
-        payload.update(_lz4_execution_analysis(evidence, segment.start_offset))
+        payload.update(_stream_execution_analysis(evidence, segment.start_offset))
         return payload
 
     def _archive_input_for_segment(
@@ -400,7 +399,7 @@ class ArchiveInputPlanningStage:
         index: int = 1,
     ) -> ArchiveInputDescriptor | None:
         parts = self._ordered_parts(task)
-        if not parts:
+        if not parts or segment.end_offset is None:
             return None
         segment_analysis = {
             "status": evidence.status,
@@ -409,11 +408,15 @@ class ArchiveInputPlanningStage:
             "segment_confidence": float(segment.confidence),
             "segment_source": "analysis",
         }
-        segment_analysis.update(_lz4_execution_analysis(evidence, segment.start_offset))
+        segment_analysis.update(_stream_execution_analysis(evidence, segment.start_offset))
         if evidence.details.get("password_required"):
             segment_analysis["password_required"] = True
         if len(parts) == 1:
-            if int(segment.start_offset) <= 0 and evidence.format not in {"lz4", "tar.lz4"}:
+            try:
+                size = os.path.getsize(parts[0])
+            except OSError:
+                return None
+            if not _strict_subrange(segment.start_offset, segment.end_offset, size):
                 return None
             extent = InputExtent(
                 path=parts[0],
@@ -428,8 +431,6 @@ class ArchiveInputPlanningStage:
                 parts=[ArchiveInputPart(extent=extent)],
                 analysis=dict(segment_analysis),
             )
-        if int(segment.start_offset) <= 0 and evidence.format not in {"lz4", "tar.lz4"}:
-            return None
         if evidence.format == "rar":
             return None
         ranges = self._logical_range_to_file_ranges(
@@ -469,6 +470,17 @@ class ArchiveInputPlanningStage:
         # multi-volume descriptor. Falling back to the single physical file
         # loses the part table and makes encrypted split inputs unverifiable.
         parts = self._ordered_parts(task)
+        if len(parts) == 1 and segment.start_offset > 0 and segment.end_offset is None:
+            try:
+                size = os.path.getsize(parts[0])
+            except OSError:
+                return None
+            # The archive boundary is unresolved until headers are decrypted.
+            # Password probing may use the available suffix without declaring
+            # that suffix a complete extractable archive.
+            return self._archive_input_for_segment(
+                task, evidence, replace(segment, end_offset=size), index=index,
+            )
         if len(parts) > 1 and int(segment.start_offset) <= 0:
             source_input = task.archive_input()
             if len(source_input.parts) > 1:
@@ -509,12 +521,14 @@ class ArchiveInputPlanningStage:
 
     def _logical_range_to_file_ranges(self, parts: list[str], start: int, end: int | None) -> list[dict]:
         ranges = []
+        try:
+            sizes = [os.path.getsize(path) for path in parts]
+        except OSError:
+            return []
+        if not _strict_subrange(start, end, sum(sizes)):
+            return []
         cursor = 0
-        for path in parts:
-            try:
-                size = os.path.getsize(path)
-            except OSError:
-                return []
+        for path, size in zip(parts, sizes):
             part_start = cursor
             part_end = cursor + size
             cursor = part_end
@@ -605,12 +619,15 @@ def _discovery_confirmed(task: ArchiveTask) -> bool:
     }
 
 
-def _lz4_execution_analysis(evidence: ArchiveFormatEvidence, offset: int) -> dict[str, Any]:
-    if evidence is None or evidence.format not in {"lz4", "tar.lz4"}:
+def _strict_subrange(start: int, end: int | None, size: int) -> bool:
+    return end is not None and 0 <= start < end <= size and (start > 0 or end < size)
+
+
+def _stream_execution_analysis(evidence: ArchiveFormatEvidence | None, offset: int) -> dict[str, Any]:
+    if evidence is None:
         return {}
     details = evidence.details
-    plan = dict(details.get("stream_plans", {}).get(str(offset)) or details.get("stream_plan") or {})
-    result = {"lz4": dict(details.get("lz4") or {})}
-    if plan:
-        result["stream_plan"] = plan
-    return result
+    plans = details.get("stream_plans") or {}
+    # A sequence of embedded streams must never inherit the plan at offset zero.
+    plan = plans.get(str(offset)) if plans else (details.get("stream_plan") if offset == 0 else None)
+    return {"stream_plan": plan} if plan else {}

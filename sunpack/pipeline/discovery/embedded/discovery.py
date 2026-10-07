@@ -103,7 +103,6 @@ class EmbeddedDiscovery:
             resolved, reason, findings = self._discover_candidate(candidate)
             if resolved is None:
                 if reason in {
-                    "embedded_information_required",
                     "embedded_password_required",
                     "embedded_wrong_password",
                     "embedded_truncated",
@@ -160,7 +159,6 @@ class EmbeddedDiscovery:
                 )
                 if resolved is None:
                     if reason in {
-                    "embedded_information_required",
                         "embedded_password_required",
                         "embedded_wrong_password",
                         "embedded_truncated",
@@ -291,17 +289,6 @@ class EmbeddedDiscovery:
                 ),
             )
 
-        lz4_config = (self.config.get("analysis") or {}).get("lz4") or {}
-        dictionaries = lz4_config.get("dictionaries") or {}
-        unavailable = next((item for item in scan.candidates if item.format == "lz4" and (
-            item.information_required or any(str(key) not in dictionaries and key not in dictionaries
-                                           for key in (item.stream_plan or {}).get("dictionary_ids", []))
-        )), None)
-        if unavailable is not None:
-            return None, "embedded_information_required", _blocked_findings(
-                path, scan, "embedded_information_required", failed_offset=unavailable.offset,
-            )
-
         physical = [
             item
             for item in scan.candidates
@@ -327,11 +314,7 @@ class EmbeddedDiscovery:
                 logical_name,
                 confidence=float(item.confidence),
                 password_required=item.password_required,
-                execution_analysis=({"stream_plan": dict(item.stream_plan or {}), "lz4": {
-                    "default_dictionary": (os.path.abspath(lz4_config["default_dictionary"])
-                                           if lz4_config.get("default_dictionary") else ""),
-                    "dictionaries": [{"id": int(key), "path": os.path.abspath(value)} for key, value in dictionaries.items()],
-                }} if item.format == "lz4" else None),
+                execution_analysis={"stream_plan": item.stream_plan} if item.stream_plan else None,
             )
             segments.append((descriptor, item.to_dict()))
 

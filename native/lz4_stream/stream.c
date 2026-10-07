@@ -1,27 +1,20 @@
 /* Execution adapter only. Archive identity, boundaries and extraction policy
    belong to the Rust analysis layer. Library validation is never disabled. */
 #include "stream.h"
-#include "lz4.h"
 #define LZ4F_STATIC_LINKING_ONLY
 #include "lz4frame.h"
 #include <stdlib.h>
 #include <string.h>
 
 #define BUFFER_SIZE (256 * 1024)
-#define LEGACY_SIZE (8 * 1024 * 1024)
 #define FRAME_MAGIC 0x184d2204U
-#define LEGACY_MAGIC 0x184c2102U
 
 typedef struct {
     void *opaque;
     sup_lz4_read read;
     sup_lz4_skip skip;
     sup_lz4_write write;
-    sup_lz4_dictionary dictionary;
     sup_lz4_progress progress;
-#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
-    sup_lz4_timing_hook compute_begin, compute_end;
-#endif
     sup_lz4_result *result;
     unsigned char *input, *output;
     size_t pos, size;
@@ -61,20 +54,6 @@ static void consume(stream *s, size_t n) {
     s->pos += n;
     s->result->input_bytes += n;
 }
-static int exact(stream *s, unsigned char *dst, size_t n) {
-    while (n) {
-        size_t take;
-        int rc = need(s, 1);
-        if (rc) return rc;
-        take = s->size-s->pos;
-        if (take > n) take = n;
-        memcpy(dst, s->input+s->pos, take);
-        consume(s, take);
-        dst += take;
-        n -= take;
-    }
-    return SUP_LZ4_OK;
-}
 static int skip_bytes(stream *s, uint64_t n) {
     size_t available = s->size-s->pos;
     size_t take = n < available ? (size_t)n : available;
@@ -112,8 +91,7 @@ static int library_error(size_t rc) {
 static int modern(stream *s) {
     LZ4F_dctx *ctx = NULL;
     LZ4F_frameInfo_t info;
-    const void *dict = NULL;
-    size_t dict_size = 0, header_size, hint, source_size;
+    size_t header_size, hint, source_size;
     uint64_t expected = 0, start_out = s->result->output_bytes;
     unsigned char flags;
     int rc = need(s, 7), has_size;
@@ -130,38 +108,15 @@ static int modern(stream *s) {
     hint = LZ4F_getFrameInfo(ctx, &info, s->input+s->pos, &source_size);
     if (LZ4F_isError(hint)) { rc = library_error(hint); goto done; }
     consume(s, source_size);
-    if (s->dictionary) {
-        int found = s->dictionary(s->opaque, info.dictID, (flags&1)!=0, &dict, &dict_size);
-        if (found < 0) { s->result->dictionary_id=info.dictID; rc = SUP_LZ4_DICTIONARY_IO; goto done; }
-        if (!found && (flags & 1)) {
-            s->result->dictionary_id = info.dictID;
-            rc = SUP_LZ4_DICTIONARY; goto done;
-        }
-    } else if (flags & 1) {
-        s->result->dictionary_id = info.dictID;
-        rc = SUP_LZ4_DICTIONARY; goto done;
-    }
+    if (flags & 1) { rc = SUP_LZ4_UNSUPPORTED; goto done; }
     do {
         size_t dst_size = BUFFER_SIZE;
         rc = need(s, 1);
         if (rc) goto done;
         source_size = s->size-s->pos;
-#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
-        if (s->compute_begin) s->compute_begin(s->opaque);
-#endif
-        hint = LZ4F_decompress_usingDict(ctx, s->output, &dst_size,
-            s->input+s->pos, &source_size, dict, dict_size, NULL);
-#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
-        if (s->compute_end) s->compute_end(s->opaque);
-#endif
-        if (LZ4F_isError(hint)) {
-            rc = library_error(hint);
-            /* A frame can reference an external dictionary without a Dict-ID.
-               Without that context, a failed block cannot prove source damage. */
-            if (!(flags & 1) && !dict_size && LZ4F_getErrorCode(hint) == LZ4F_ERROR_decompressionFailed)
-                rc = SUP_LZ4_DICTIONARY_OR_DATA;
-            goto done;
-        }
+        hint = LZ4F_decompress(ctx, s->output, &dst_size,
+            s->input+s->pos, &source_size, NULL);
+        if (LZ4F_isError(hint)) { rc = library_error(hint); goto done; }
         consume(s, source_size);
         rc = emit(s, s->output, dst_size);
         if (rc) goto done;
@@ -175,65 +130,14 @@ done:
     LZ4F_freeDecompressionContext(ctx);
     return rc;
 }
-static int legacy(stream *s) {
-    unsigned char *input = NULL, *output = NULL;
-    const uint32_t max_packed = (uint32_t)LZ4_compressBound(LEGACY_SIZE);
-    int rc = SUP_LZ4_OK;
-    consume(s, 4);
-    input = (unsigned char *)malloc(max_packed);
-    output = (unsigned char *)malloc(LEGACY_SIZE);
-    if (!input || !output) { rc = SUP_LZ4_MEMORY; goto done; }
-    for (;;) {
-        uint32_t size;
-        int decoded;
-        rc = need(s, 4);
-        if (rc == SUP_LZ4_TRUNCATED && s->pos == s->size) { rc = SUP_LZ4_OK; break; }
-        if (rc) goto done;
-        size = le32(s->input+s->pos);
-        if (size == FRAME_MAGIC || size == LEGACY_MAGIC || is_skip(size)) break;
-        if (!size) { consume(s, 4); break; } /* Linux legacy end marker */
-        if (size > max_packed) { rc = SUP_LZ4_DATA; goto done; }
-        consume(s, 4);
-        rc = exact(s, input, size);
-        if (rc) goto done;
-#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
-        if (s->compute_begin) s->compute_begin(s->opaque);
-#endif
-        decoded = LZ4_decompress_safe((const char *)input, (char *)output, (int)size, LEGACY_SIZE);
-#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
-        if (s->compute_end) s->compute_end(s->opaque);
-#endif
-        if (decoded < 0) { rc = SUP_LZ4_DATA; goto done; }
-        rc = emit(s, output, (size_t)decoded);
-        if (rc) goto done;
-    }
-    ++s->result->frames;
-    ++s->result->legacy_frames;
-done:
-    free(input); free(output);
-    return rc;
-}
-#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
-int sup_lz4_decode_profiled(void *opaque, sup_lz4_read read, sup_lz4_skip skip,
-    sup_lz4_write write, sup_lz4_dictionary dictionary,
-    sup_lz4_progress progress, sup_lz4_timing_hook compute_begin,
-    sup_lz4_timing_hook compute_end, sup_lz4_result *result) {
-#else
 int sup_lz4_decode(void *opaque, sup_lz4_read read, sup_lz4_skip skip,
-    sup_lz4_write write, sup_lz4_dictionary dictionary,
-    sup_lz4_progress progress, sup_lz4_result *result) {
-#endif
+    sup_lz4_write write, sup_lz4_progress progress, sup_lz4_result *result) {
     stream s;
     int rc = SUP_LZ4_OK;
     memset(result, 0, sizeof(*result));
     memset(&s, 0, sizeof(s));
     s.opaque=opaque; s.read=read; s.skip=skip; s.write=write;
-    s.dictionary=dictionary; s.progress=progress;
-#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
-    s.compute_begin=compute_begin; s.compute_end=compute_end; s.result=result;
-#else
-    s.result=result;
-#endif
+    s.progress=progress; s.result=result;
     s.input=(unsigned char *)malloc(BUFFER_SIZE);
     s.output=(unsigned char *)malloc(BUFFER_SIZE);
     if (!s.input || !s.output) { rc=SUP_LZ4_MEMORY; goto done; }
@@ -246,7 +150,6 @@ int sup_lz4_decode(void *opaque, sup_lz4_read read, sup_lz4_skip skip,
         if (rc) break;
         magic = le32(s.input+s.pos);
         if (magic == FRAME_MAGIC) rc=modern(&s);
-        else if (magic == LEGACY_MAGIC) rc=legacy(&s);
         else if (is_skip(magic)) {
             rc=need(&s, 8);
             if (!rc) {
@@ -263,11 +166,3 @@ done:
     result->error=rc;
     return rc;
 }
-#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
-int sup_lz4_decode(void *opaque, sup_lz4_read read, sup_lz4_skip skip,
-    sup_lz4_write write, sup_lz4_dictionary dictionary,
-    sup_lz4_progress progress, sup_lz4_result *result) {
-    return sup_lz4_decode_profiled(opaque, read, skip, write, dictionary,
-        progress, NULL, NULL, result);
-}
-#endif

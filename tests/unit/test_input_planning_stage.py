@@ -250,14 +250,14 @@ def test_input_planning_stage_uses_range_input_for_embedded_password_required_ar
 
     assert task.archive_input().format_hint == "rar"
     segments = knowledge_view.source_extractable_segments(task)
-    assert len(segments) == 1
-    assert segments[0]["archive_input"] == {
+    assert segments == []  # unresolved boundaries are not extractable segments
+    assert knowledge_view.source_password_probe_input(task) == {
         "kind": "archive_input",
         "entry_path": str(carrier),
         "open_mode": "file_range",
         "format_hint": "rar",
         "logical_name": "case",
-        "parts": [{"path": str(carrier), "role": "main", "start": 64}],
+        "parts": [{"path": str(carrier), "role": "main", "start": 64, "end": 200}],
         "analysis": {
             "status": "damaged",
             "confidence": 0.72,
@@ -265,7 +265,6 @@ def test_input_planning_stage_uses_range_input_for_embedded_password_required_ar
             "password_required": True,
         },
     }
-    assert knowledge_view.source_password_probe_input(task) == segments[0]["archive_input"]
 
 
 def test_input_planning_stage_projects_rar_sfx_volume_password_probe(tmp_path):

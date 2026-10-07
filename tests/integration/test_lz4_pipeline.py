@@ -10,6 +10,7 @@ import pytest
 
 from sunpack.core.config.schema import normalize_config
 from sunpack.core.contracts.results import OutcomeKind
+from sunpack.core.contracts.failures import FailureKind
 from sunpack.pipeline.coordinator.engine import PipelineEngine
 from sunpack.pipeline.discovery.embedded.options import EmbeddedOptions
 from tests.helpers.detection_config import with_detection_pipeline
@@ -20,7 +21,6 @@ def config_for(tmp_path, fixtures):
     return normalize_config(with_detection_pipeline({
         "recursive_extract": "4", "cli": {"quiet": True},
         "output": {"root": str(tmp_path / "out")},
-        "analysis": {"lz4": {"dictionaries": {"123": str(fixtures / "dict.raw")}}},
         "post_extract": {"archive_cleanup_mode": "k", "flatten_single_directory": False},
     }))
 
@@ -31,8 +31,7 @@ def config_for(tmp_path, fixtures):
     ("payload.tar.lz4", "expected_tar", 2),
     ("nested.lz4", "expected_standard", 2),
     ("carrier.dat", "expected_concat", 1),
-    ("dictionary.lz4", "expected_dictionary", 1),
-    ("legacy.lz4", "expected_standard", 1),
+    ("prefix_carrier.dat", "expected_standard", 1),
 ])
 def test_pipeline_recurses_and_verifies_lz4_in_both_origins(fixtures, tmp_path, origin, name, expected, count):
     inputs = tmp_path / "inputs"
@@ -92,13 +91,11 @@ def test_cli_extract_detects_disguised_lz4_and_returns_verified_success(fixtures
 
 
 @pytest.mark.parametrize("origin", ["foreground", "watch"])
-@pytest.mark.parametrize("name", ["dictionary.lz4", "dictionary_zero_id.lz4", "dictionary_zero_id_carrier.dat"])
-def test_embedded_dictionary_dependency_is_reported_until_configured(fixtures, tmp_path, origin, name):
+@pytest.mark.parametrize("name", ["unsupported_id_0.lz4", "unsupported_id_123.lz4", "unsupported_id_carrier.dat"])
+def test_unsupported_frame_uses_generic_failure_and_preserves_source(fixtures, tmp_path, origin, name):
     source = tmp_path / name
     shutil.copyfile(fixtures / name, source)
     config = config_for(tmp_path, fixtures)
-    config["analysis"]["lz4"]["dictionaries"] = {}
-    config["analysis"]["lz4"]["default_dictionary"] = str(fixtures / "dict.raw")
     config["post_extract"]["archive_cleanup_mode"] = "d"
 
     async def run():
@@ -107,10 +104,9 @@ def test_embedded_dictionary_dependency_is_reported_until_configured(fixtures, t
 
     response = asyncio.run(run())
     assert response.summary.success_count == 0
-    assert response.summary.target_results or response.summary.scan_failures
-    if name.endswith(".dat"):
-        assert response.summary.scan_failures[0].kind.value == "unknown"
-        assert response.summary.scan_failures[0].details["reason"] == "embedded_information_required"
+    assert response.summary.failed_tasks, response.summary
+    assert all(f.contains(FailureKind.UNSUPPORTED)
+               for f in response.summary.failures), response.summary.failures
     assert source.exists()
 
 

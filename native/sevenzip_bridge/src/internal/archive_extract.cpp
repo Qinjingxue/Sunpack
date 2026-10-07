@@ -119,7 +119,7 @@ namespace sunpack::sevenzip
         {
             for (const auto &item : trace.items)
             {
-                if (!item.failed && item.operation_result == kOpOk)
+                if ((!item.failed && item.operation_result == kOpOk) || item.operation_result == kOpUnsupportedMethod)
                 {
                     continue;
                 }
@@ -225,8 +225,7 @@ namespace sunpack::sevenzip
 
         std::size_t job_buffer_budget = 0,
 
-        std::shared_ptr<std::atomic<bool>> cancel_token = nullptr,
-        const Lz4Options &lz4_options = {}
+        std::shared_ptr<std::atomic<bool>> cancel_token = nullptr
 
     )
     {
@@ -579,23 +578,10 @@ namespace sunpack::sevenzip
 #ifdef SUP7Z_ENABLE_PIPELINE_TIMING
             pipeline_timing->start_pipeline();
             PipelineThreadCpuScope compute_cpu_scope(pipeline_timing.get());
-            PipelineTimingContextScope timing_context(pipeline_timing.get());
-            const bool lz4_input = format.Data4[5] == kLz4FormatId;
-            if (lz4_input) {
-                hr = configure_lz4(archive, lz4_options);
-                if (hr != S_OK) { result.status = PasswordTestStatus::Error; set_failure(result, "archive_config", "dictionary_config", hr); return result; }
-            }
-            if (lz4_input) {
-                hr = archive->Extract(nullptr, static_cast<UInt32>(kAllItems), 0, extract_callback.Interface());
-            } else {
-                PipelineStageScope compute_scope(pipeline_timing.get(), PipelineStage::Compute);
-                hr = archive->Extract(nullptr, static_cast<UInt32>(kAllItems), 0, extract_callback.Interface());
-            }
+            PipelineStageScope compute_scope(pipeline_timing.get(), PipelineStage::Compute);
+            hr = archive->Extract(nullptr, static_cast<UInt32>(kAllItems), 0, extract_callback.Interface());
+            compute_scope.finish();
 #else
-            if (format.Data4[5] == kLz4FormatId) {
-                hr = configure_lz4(archive, lz4_options);
-                if (hr != S_OK) { result.status = PasswordTestStatus::Error; set_failure(result, "archive_config", "dictionary_config", hr); return result; }
-            }
             hr = archive->Extract(nullptr, static_cast<UInt32>(kAllItems), 0, extract_callback.Interface());
 #endif
 
@@ -684,20 +670,6 @@ namespace sunpack::sevenzip
 
                 result.message = dry_run ? "archive dry-run completed" : "archive extracted";
 
-                return result;
-            }
-
-            if (result.has_stream_receipt && (result.stream_receipt.error == 5 ||
-                (result.stream_receipt.error == 8 && hr != E_OUTOFMEMORY))) {
-                result.status = PasswordTestStatus::Error;
-                set_failure(result, "item_extract", "dictionary_required", hr);
-                result.message = "LZ4 dictionary is required (ID " + std::to_string(result.stream_receipt.dictionary_id) + ")";
-                return result;
-            }
-            if (result.has_stream_receipt && result.stream_receipt.error == 9) {
-                result.status = PasswordTestStatus::Error;
-                set_failure(result, "item_extract", "dictionary_or_data", hr);
-                result.message = "LZ4 block cannot be decoded: an unlabelled external dictionary or damaged data may be responsible";
                 return result;
             }
 
@@ -906,8 +878,7 @@ namespace sunpack::sevenzip
 
         std::size_t job_buffer_budget,
 
-        std::shared_ptr<std::atomic<bool>> cancel_token,
-        const Lz4Options &lz4_options
+        std::shared_ptr<std::atomic<bool>> cancel_token
 
     )
     {
@@ -945,7 +916,7 @@ namespace sunpack::sevenzip
             native_volume_input,
             std::move(shared_writer),
             job_buffer_budget,
-            std::move(cancel_token), lz4_options);
+            std::move(cancel_token));
 
 #else
 
@@ -1005,8 +976,7 @@ namespace sunpack::sevenzip
 
         std::size_t job_buffer_budget,
 
-        std::shared_ptr<std::atomic<bool>> cancel_token,
-        const Lz4Options &lz4_options
+        std::shared_ptr<std::atomic<bool>> cancel_token
 
     )
     {
@@ -1039,7 +1009,7 @@ namespace sunpack::sevenzip
             false,
             std::move(shared_writer),
             job_buffer_budget,
-            std::move(cancel_token), lz4_options);
+            std::move(cancel_token));
 
 #else
 

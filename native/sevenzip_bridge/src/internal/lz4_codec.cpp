@@ -88,10 +88,11 @@ Z7_COM7F_IMF(CDecoder::Code(ISequentialInStream *input, ISequentialOutStream *ou
     if (!finish && output_size && !*output_size) return S_OK;
     Context context{input, output, report, input_size, output_size, finish};
     sup_lz4_result result{};
-    const int error = sup_lz4_decode(&context, read, nullptr, write, nullptr, progress, &result);
+    const int error = sup_lz4_decode(&context, read, nullptr, write, progress, &result);
     processed = result.input_bytes;
     if (context.cut) return S_OK;
     if (context.status != S_OK) return context.status;
+    if (error == SUP_LZ4_UNSUPPORTED) return E_NOTIMPL;
     if (error == SUP_LZ4_MEMORY) return E_OUTOFMEMORY;
     if (error) return S_FALSE;
     if ((output_size && result.output_bytes != *output_size) ||

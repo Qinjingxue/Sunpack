@@ -109,12 +109,6 @@ class ArchiveTaskProvider:
 
     def _record_discovery_failures(self, result: StageResult) -> None:
         mapping = {
-            "embedded_information_required": (
-                FailureKind.UNKNOWN,
-                "failure.unknown",
-                "Embedded archive requires dictionary or boundary information",
-                "provide_archive_context",
-            ),
             "embedded_password_required": (
                 FailureKind.PASSWORD_REQUIRED,
                 "failure.password_required",

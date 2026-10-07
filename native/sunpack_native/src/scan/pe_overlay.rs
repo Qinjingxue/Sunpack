@@ -23,7 +23,6 @@ const ARCHIVE_MAGICS: &[(&[u8], &str, &str)] = &[
     (b"\xfd7zXZ\x00", "xz", ".xz"),
     (b"\x28\xb5\x2f\xfd", "zstd", ".zst"),
     (crate::formats::lz4::MAGIC, "lz4", ".lz4"),
-    (crate::formats::lz4::LEGACY, "lz4", ".lz4"),
 ];
 
 /// PE structure facts only; SFX classification belongs to Relations.

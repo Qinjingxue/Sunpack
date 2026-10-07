@@ -126,10 +126,6 @@ fn compare_header(bytes: &[u8]) {
             ours.content_size,
             (bytes[4] & 8 != 0).then_some(reference.content_size)
         );
-        assert_eq!(
-            ours.dictionary_id,
-            (bytes[4] & 1 != 0).then_some(reference.dictionary_id)
-        );
         assert_eq!(ours.content_checksum, reference.content_checksum != 0);
         assert_eq!(ours.block_checksum, reference.block_checksum != 0);
     }

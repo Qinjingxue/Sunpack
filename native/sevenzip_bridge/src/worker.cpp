@@ -420,7 +420,6 @@ private:
 };
 
 struct WorkerArchiveInput {
-    sunpack::sevenzip::Lz4Options lz4_options;
     std::wstring archive_path;
     std::wstring format_hint;
     std::wstring open_mode;
@@ -628,14 +627,6 @@ WorkerArchiveInput parse_archive_input_descriptor(
     input.format_hint = utf8_to_wide(format_hint);
 
     const JsonObjectView analysis = descriptor.object_field("analysis");
-    const JsonObjectView lz4 = analysis.object_field("lz4");
-    input.lz4_options.default_dictionary = utf8_to_wide(lz4.string_field("default_dictionary", ""));
-    for (const auto item : lz4.object_array_field("dictionaries")) {
-        const JsonObjectView entry(item); unsigned long long id = 0;
-        const auto path = entry.string_field("path", "");
-        if (!entry.uint_field("id", &id) || id > 0xffffffffULL || path.empty()) { input.validation_error = "invalid LZ4 dictionary mapping"; break; }
-        input.lz4_options.dictionaries.emplace_back(static_cast<unsigned int>(id), utf8_to_wide(path));
-    }
     const JsonObjectView execution_analysis = analysis.object_field("execution");
     input.analyzed_missing_volume_evidence =
         execution_analysis.string_field("missing_volume_evidence", "");
@@ -1197,8 +1188,8 @@ int run_request(
     }
     auto extract_with_password = [&](const std::wstring& selected_password) {
         return archive_input.ranges.empty()
-            ? extract_archive_with_parts(archive_input.archive_path, archive_input.part_paths, archive_input.format_hint, selected_password, output_dir, codepage, progress, dry_run, archive_input.canonical_names, archive_input.open_mode == L"native_volumes", shared_writer, static_cast<std::size_t>(job_buffer_budget), cancel_token, archive_input.lz4_options)
-            : extract_archive_with_ranges(archive_input.archive_path, archive_input.ranges, archive_input.format_hint, selected_password, output_dir, codepage, progress, dry_run, shared_writer, static_cast<std::size_t>(job_buffer_budget), cancel_token, archive_input.lz4_options);
+            ? extract_archive_with_parts(archive_input.archive_path, archive_input.part_paths, archive_input.format_hint, selected_password, output_dir, codepage, progress, dry_run, archive_input.canonical_names, archive_input.open_mode == L"native_volumes", shared_writer, static_cast<std::size_t>(job_buffer_budget), cancel_token)
+            : extract_archive_with_ranges(archive_input.archive_path, archive_input.ranges, archive_input.format_hint, selected_password, output_dir, codepage, progress, dry_run, shared_writer, static_cast<std::size_t>(job_buffer_budget), cancel_token);
     };
 
     ExtractArchiveResult result;
@@ -1293,11 +1284,11 @@ int run_request(
         ",\"diagnostics\":" + diagnostics_json(result, trace_chunks) : "";
     const auto &sr = result.stream_receipt;
     const std::string stream_receipt_field = result.has_stream_receipt ?
-        ",\"stream_receipt\":{\"format\":\"lz4\",\"input_bytes\":" + std::to_string(sr.input_bytes) +
+        ",\"stream_receipt\":{\"format\":\"" + json_escape(sr.format) + "\",\"input_bytes\":" + std::to_string(sr.input_bytes) +
         ",\"output_bytes\":" + std::to_string(sr.output_bytes) + ",\"frames\":" + std::to_string(sr.frames) +
-        ",\"skippable_frames\":" + std::to_string(sr.skippable_frames) + ",\"legacy_frames\":" + std::to_string(sr.legacy_frames) +
+        ",\"skippable_frames\":" + std::to_string(sr.skippable_frames) +
         ",\"content_checked_frames\":" + std::to_string(sr.content_checked_frames) + ",\"block_checked_frames\":" + std::to_string(sr.block_checked_frames) +
-        ",\"error\":" + std::to_string(sr.error) + ",\"dictionary_id\":" + std::to_string(sr.dictionary_id) + "}" : "";
+        ",\"error\":" + std::to_string(sr.error) + "}" : "";
     const std::string input_trace_field = read_file_timing_enabled() ?
         ",\"input_trace\":" + input_trace_json(result.input_trace) : "";
 #ifdef SUP7Z_ENABLE_PIPELINE_TIMING

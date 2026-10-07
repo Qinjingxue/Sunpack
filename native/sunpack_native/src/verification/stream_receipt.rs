@@ -1,5 +1,5 @@
 //! Match the analysis-owned stream plan against finalized native output.
-//! No source re-decode and no output re-hash: the decoder already checked XXH32.
+//! No source re-decode and no output re-hash: the decoder already checked stream checksums.
 use crate::scan::directory::NativeOutputInventory;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -74,7 +74,9 @@ pub(crate) fn verify_stream_receipt(
         "verification_strength",
         if checked > 0 { "checksum" } else { "manifest" },
     )?;
-    result.set_item("checksum_algorithm", "xxh32")?;
+    if let Some(algorithm) = plan.get_item("content_checksum_algorithm")? {
+        result.set_item("checksum_algorithm", algorithm)?;
+    }
     result.set_item("frames", frames)?;
     result.set_item("content_checked_frames", checked)?;
     Ok(result.unbind())

@@ -2,7 +2,6 @@
 import asyncio
 import concurrent.futures
 import json
-import os
 import subprocess
 from pathlib import Path
 
@@ -14,9 +13,7 @@ from sunpack_native import (
 from sunpack.core.analysis.engine import AnalysisEngine
 from sunpack.core.analysis.embedded.scanner import scan_embedded_archives
 from sunpack.core.contracts.archive_input import ArchiveInputDescriptor, ArchiveInputPart, InputExtent
-from sunpack.core.contracts.discovery import DiscoveryCandidate
 from sunpack.pipeline.discovery.detection.input_planning import ArchiveInputPlanningStage
-from sunpack.pipeline.discovery.embedded.discovery import EmbeddedDiscovery
 from sunpack.pipeline.extraction.output_inventory import collect_output_inventory
 from sunpack.pipeline.extraction.scheduler import ExtractionScheduler
 from sunpack.pipeline.verification.evidence import build_verification_evidence
@@ -76,12 +73,13 @@ def test_frame_options_analysis_is_complete_without_payload_decode(fixtures, blo
     assert plan["expected_size"] == (5 * 1024 * 1024 if bits & 8 else None)
 
 
-@pytest.mark.parametrize("name,frames,legacy,skips", [
-    ("concat.bin", 2, 0, 3), ("legacy.lz4", 1, 1, 0), ("mixed.lz4", 2, 1, 0),
-    ("empty.lz4", 1, 0, 0), ("payload.tar.lz4", 1, 0, 0), ("legacy_zero.lz4", 1, 1, 0),
-    ("high_compression.lz4", 1, 0, 0), ("uncompressed_blocks.lz4", 1, 0, 0),
+@pytest.mark.parametrize("name,frames,skips,integrity", [
+    ("concat.bin", 2, 3, "verified_complete"), ("concat_partial.bin", 2, 0, "verified_partial"),
+    ("frame_4_0.lz4", 1, 0, "unknown"), ("frame_4_5.lz4", 1, 0, "unknown"),
+    ("empty.lz4", 1, 0, "verified_complete"), ("payload.tar.lz4", 1, 0, "verified_complete"),
+    ("high_compression.lz4", 1, 0, "verified_complete"), ("uncompressed_blocks.lz4", 1, 0, "verified_complete"),
 ])
-def test_worker_receipt_matches_plan_and_finalized_inventory(fixtures, tmp_path, name, frames, legacy, skips):
+def test_worker_receipt_matches_plan_and_finalized_inventory(fixtures, tmp_path, name, frames, skips, integrity):
     path = fixtures / name
     report = AnalysisEngine().analyze_path(str(path))
     selected = report.best_selected
@@ -90,17 +88,24 @@ def test_worker_receipt_matches_plan_and_finalized_inventory(fixtures, tmp_path,
     result = worker(descriptor, tmp_path / "output")
     assert result["status"] == "ok"
     receipt = result["stream_receipt"]
-    assert (receipt["frames"], receipt["legacy_frames"], receipt["skippable_frames"]) == (frames, legacy, skips)
+    assert (receipt["frames"], receipt["skippable_frames"]) == (frames, skips)
     inventory = collect_output_inventory(str(tmp_path / "output"), result)
     verified = inventory.verify_stream_receipt(descriptor.analysis["stream_plan"], receipt)
     assert verified["status"] == "passed", verified
-    assert verified["content_integrity"] == ("unknown" if legacy == frames else "verified_partial" if legacy else "verified_complete")
+    assert verified["content_integrity"] == integrity
+    # The checksum algorithm is source-plan diagnostics, not verifier dispatch.
+    neutral_plan = {key: value for key, value in descriptor.analysis["stream_plan"].items()
+                    if key != "content_checksum_algorithm"}
+    neutral = inventory.verify_stream_receipt(neutral_plan, receipt)
+    assert neutral["status"] == "passed" and "checksum_algorithm" not in neutral
+    diagnostic = inventory.verify_stream_receipt(dict(neutral_plan, content_checksum_algorithm="other-checksum"), receipt)
+    assert diagnostic["status"] == "passed" and diagnostic["checksum_algorithm"] == "other-checksum"
     # The old CRC32 evidence must stay empty for LZ4.
     rows = result["verified_manifest"]["native_rows"].file_page()
     assert not rows[0]["crc_ok"]
     forged = dict(receipt, frames=frames + 1)
     assert inventory.verify_stream_receipt(descriptor.analysis["stream_plan"], forged)["status"] == "failed"
-    diagnostics = {"skippable_frames", "legacy_frames", "block_checked_frames"}
+    diagnostics = {"skippable_frames", "block_checked_frames"}
     # Diagnostic changes/omissions must not bind planner and decoder state machines.
     for projected in (
         {key: value for key, value in receipt.items() if key not in diagnostics},
@@ -129,15 +134,6 @@ def test_skippable_prefix_disguised_identity_and_exact_carrier(fixtures, tmp_pat
     assert result["stream_receipt"]["input_bytes"] == item.end_offset - item.offset
 
 
-@pytest.mark.parametrize("name", ["legacy_carrier.dat", "legacy_carrier_short_tail.dat"])
-def test_legacy_unknown_boundary_reports_blocked_and_preserves_source(fixtures, name):
-    path = fixtures / name
-    candidate = DiscoveryCandidate(ArchiveInputDescriptor(entry_path=str(path)), "", (), "embedded", size=path.stat().st_size)
-    result = EmbeddedDiscovery({}).discover([candidate])
-    assert result.findings and result.findings[0].reason == "embedded_information_required"
-    assert not result.resolved_tasks and path.exists()
-
-
 @pytest.mark.parametrize("name,kind", [("bad_content.lz4", "checksum_error"), ("bad_header.lz4", "checksum_error"),
                                         ("bad_block.lz4", "checksum_error"), ("truncated.lz4", "input_truncated")])
 def test_lz4_damage_does_not_become_wrong_password(fixtures, tmp_path, name, kind):
@@ -146,70 +142,6 @@ def test_lz4_damage_does_not_become_wrong_password(fixtures, tmp_path, name, kin
     assert result["status"] == "failed" and not result["wrong_password"]
     assert result["checksum_error"] if kind == "checksum_error" else result["operation_result_name"] == "unexpected_end"
     assert path.exists()
-
-
-@pytest.mark.parametrize("name,default", [("dictionary.lz4", False), ("dictionary_no_id.lz4", True), ("dictionary_zero_id.lz4", False)])
-@pytest.mark.parametrize("relative", [False, True])
-def test_dictionary_flows_through_planning_extraction_and_verification(fixtures, tmp_path, name, default, relative):
-    path = fixtures / name
-    dictionary_path = os.path.relpath(fixtures / "dict.raw") if relative else str(fixtures / "dict.raw")
-    options = {"default_dictionary": dictionary_path if default else "",
-               "dictionaries": {} if default else {"0" if name == "dictionary_zero_id.lz4" else "123": dictionary_path}}
-    task = make_archive_task(path, format_hint="lz4")
-    stage = ArchiveInputPlanningStage({"analysis": {"lz4": options}})
-    stage.plan_task(task)
-    assert task.archive_input().analysis["stream_plan"]["complete"]
-    runner = ExtractionScheduler(extraction_config={"quiet": True})
-    try:
-        result = runner.extract(task, str(tmp_path / "output"))
-        assert result.success, result
-        evidence = build_verification_evidence(task, result)
-        step = ArchiveTestCrcMethod().verify(evidence, {})
-        assert step.status == "passed" and step.content_integrity_hint == "verified_complete", step
-        assert step.verification_strength == "checksum"
-    finally:
-        runner.close()
-
-
-@pytest.mark.parametrize("name,id", [("dictionary.lz4", 123), ("dictionary_zero_id.lz4", 0)])
-@pytest.mark.parametrize("default", [False, True])
-def test_missing_dictionary_is_information_required(fixtures, tmp_path, name, id, default):
-    path = fixtures / name
-    options = {"default_dictionary": str(fixtures / "dict.raw") if default else "", "dictionaries": {}}
-    report = AnalysisEngine({"analysis": {"lz4": options}}).analyze_path(str(path))
-    lz4 = next(e for e in report.evidences if e.format == "lz4")
-    assert lz4.details["information_required"] and lz4.status == "damaged"
-    assert lz4.details["stream_plan"]["missing_dictionary_ids"] == [id]
-    result = worker(ArchiveInputDescriptor(entry_path=str(path), format_hint="lz4", analysis={"lz4": options}), tmp_path / "missing")
-    assert result["failure_kind"] == "dictionary_required" and not result["damaged"]
-    assert result["stream_receipt"]["dictionary_id"] == id and path.exists()
-
-
-@pytest.mark.parametrize("configured", [False, True])
-def test_explicit_zero_dictionary_id_carrier_reuses_dependency_gate(fixtures, tmp_path, configured):
-    path = fixtures / "dictionary_zero_id_carrier.dat"
-    options = {"default_dictionary": str(fixtures / "dict.raw"),
-               "dictionaries": {"0": str(fixtures / "dict.raw")} if configured else {}}
-    candidate = DiscoveryCandidate(ArchiveInputDescriptor(entry_path=str(path)), "", (), "embedded", size=path.stat().st_size)
-    discovery = EmbeddedDiscovery({"analysis": {"lz4": options}}).discover([candidate])
-    if not configured:
-        assert not discovery.resolved_tasks
-        assert discovery.findings[0].reason == "embedded_information_required"
-        assert path.exists()
-        return
-    assert len(discovery.resolved_tasks) == 1
-    result = worker(discovery.resolved_tasks[0].archive_input(), tmp_path / "output")
-    assert result["status"] == "ok"
-    assert fingerprints(tmp_path / "output") == fingerprints(fixtures / "expected_dictionary")
-
-
-def test_explicit_zero_dictionary_id_tar_sample_uses_the_mapping(fixtures):
-    path = fixtures / "payload_zero_id.tar.lz4"
-    options = {"default_dictionary": str(fixtures / "dict_second.raw"),
-               "dictionaries": {"0": str(fixtures / "dict.raw")}}
-    report = AnalysisEngine({"analysis": {"lz4": options}}).analyze_path(str(path))
-    assert report.best_selected.format == "tar.lz4"
-    assert report.best_selected.details["stream_plan"]["dictionary_ids"] == [0]
 
 
 def test_explicit_concat_input_reuses_multivolume_reader_and_worker(fixtures, tmp_path):
@@ -250,43 +182,6 @@ def test_skippable_only_needs_explicit_format_context(fixtures, tmp_path):
     assert result["stream_receipt"]["output_bytes"] == 0
 
 
-def test_unreadable_dictionary_is_information_required_not_damage(fixtures, tmp_path):
-    descriptor = ArchiveInputDescriptor(entry_path=str(fixtures / "dictionary.lz4"), format_hint="lz4",
-        analysis={"lz4": {"dictionaries": [{"id": 123, "path": str(tmp_path / "missing.raw")}]}})
-    result = worker(descriptor, tmp_path / "unreadable")
-    assert result["failure_kind"] == "dictionary_required" and not result["damaged"]
-    assert result["stream_receipt"]["error"] == 8
-
-
-def test_dictionary_without_id_does_not_make_a_false_damage_claim(fixtures, tmp_path):
-    descriptor = ArchiveInputDescriptor(entry_path=str(fixtures / "dictionary_no_id.lz4"), format_hint="lz4")
-    result = worker(descriptor, tmp_path / "unlabelled")
-    assert result["status"] == "failed" and not result["damaged"] and not result["wrong_password"]
-    assert result["failure_kind"] == "dictionary_or_data" and result["stream_receipt"]["error"] == 9
-
-
-@pytest.mark.parametrize("mapping", [{"-1": "dict"}, {"4294967296": "dict"}, {"123": ""},
-                                     {"123": "dict", "00123": "other"}])
-def test_dictionary_configuration_rejects_invalid_or_ambiguous_ids(mapping):
-    with pytest.raises(ValueError):
-        AnalysisEngine({"analysis": {"lz4": {"dictionaries": mapping}}})
-
-
-@pytest.mark.parametrize("large", [False, True])
-def test_each_frame_selects_its_dictionary_and_uses_only_the_effective_tail(fixtures, tmp_path, large):
-    options = {"default_dictionary": "", "dictionaries": {
-        "123": str(fixtures / ("dict_large.raw" if large else "dict.raw")),
-        "4294967295": str(fixtures / "dict_second.raw"),
-    }}
-    task = make_archive_task(fixtures / "dictionary_switch.lz4", format_hint="lz4")
-    ArchiveInputPlanningStage({"analysis": {"lz4": options}}).plan_task(task)
-    descriptor = task.archive_input()
-    assert descriptor.analysis["stream_plan"]["dictionary_ids"] == [123, 4294967295]
-    result = worker(descriptor, tmp_path / "switch")
-    assert result["status"] == "ok" and result["stream_receipt"]["frames"] == 3
-    assert fingerprints(fixtures / "expected_switch") == fingerprints(tmp_path / "switch")
-
-
 def test_confirmed_lz4_planning_does_not_scan_a_gigabyte_skippable_payload(fixtures):
     task = make_archive_task(fixtures / "large_skip.tar.lz4", format_hint="lz4", discovery_source="detection")
     report = ArchiveInputPlanningStage({}).plan_task(task)
@@ -305,7 +200,59 @@ def test_shared_skippable_magic_does_not_claim_a_zstandard_stream_as_lz4(fixture
     assert not any(e.format == "lz4" and e.status != "not_found" for e in report.evidences)
 
 
-def test_shared_worker_interleaves_dictionary_success_damage_and_missing_jobs(fixtures, tmp_path):
+@pytest.mark.parametrize("name", ["unsupported_legacy.bin", "unsupported_legacy_carrier.dat"])
+def test_legacy_is_not_identified_by_analysis_or_embedded_scan(fixtures, name):
+    path = fixtures / name
+    assert not inspect_compression_stream_identity(str(path))["identity_strong"]
+    assert not any(c.format == "lz4" for c in scan_embedded_archives(str(path)).candidates)
+    report = AnalysisEngine().analyze_path(str(path))
+    assert not any(e.format in {"lz4", "tar.lz4"} and e.status != "not_found" for e in report.evidences)
+
+
+@pytest.mark.parametrize("id", [0, 123, 4294967295])
+def test_dict_id_returns_generic_unsupported_and_keeps_source(fixtures, tmp_path, id):
+    path = fixtures / f"unsupported_id_{id}.lz4"
+    task = make_archive_task(path, format_hint="lz4")
+    ArchiveInputPlanningStage({}).plan_task(task)
+    descriptor = task.archive_input()
+    assert descriptor.analysis["stream_plan"]["complete"]
+    result = worker(descriptor, tmp_path / "unsupported")
+    assert result["status"] == "failed" and result["native_status"] == "unsupported"
+    assert result["failure_kind"] == "unsupported_method"
+    assert not result["damaged"] and not result["wrong_password"] and path.exists()
+    assert result["stream_receipt"]["error"] == 5
+
+
+def test_unsupported_tar_sample_does_not_claim_tar(fixtures):
+    report = AnalysisEngine().analyze_path(str(fixtures / "unsupported_id.tar.lz4"))
+    assert report.best_selected.format == "lz4"
+    assert not any(e.format == "tar.lz4" and e.status != "not_found" for e in report.evidences)
+
+
+def test_invalid_backreference_is_generic_data_error(fixtures, tmp_path):
+    result = worker(ArchiveInputDescriptor(entry_path=str(fixtures / "bad_data.lz4"), format_hint="lz4"), tmp_path / "bad")
+    assert result["status"] == "failed" and result["damaged"] and not result["wrong_password"]
+    assert result["stream_receipt"]["error"] == 3
+
+
+def test_stream_verification_dispatch_is_format_neutral(fixtures, tmp_path):
+    task = make_archive_task(fixtures / "frame_7_15.lz4", format_hint="lz4")
+    ArchiveInputPlanningStage({}).plan_task(task)
+    runner = ExtractionScheduler(extraction_config={"quiet": True})
+    try:
+        result = runner.extract(task, str(tmp_path / "output"))
+        assert result.success, result
+        evidence = build_verification_evidence(task, result)
+        from dataclasses import replace
+        neutral = replace(evidence, archive_input=replace(evidence.archive_input, format_hint="other-stream"))
+        step = ArchiveTestCrcMethod().verify(neutral, {})
+        assert step.status == "passed" and step.content_integrity_hint == "verified_complete"
+        assert step.verification_strength == "checksum"
+    finally:
+        runner.close()
+
+
+def test_shared_worker_interleaves_success_damage_and_unsupported_jobs(fixtures, tmp_path):
     from sunpack.pipeline.extraction.internal.sevenzip.sevenzip_runner import _AsyncNativeWorkerProcess
     events = []
 
@@ -315,9 +262,8 @@ def test_shared_worker_interleaves_dictionary_success_damage_and_missing_jobs(fi
         try:
             finished = []
             for i in range(16):
-                name = ("dictionary.lz4", "concat.bin", "bad_content.lz4", "dictionary.lz4")[i % 4]
-                descriptor = ArchiveInputDescriptor(entry_path=str(fixtures / name), format_hint="lz4",
-                    analysis={"lz4": {"dictionaries": [{"id": 123, "path": str(fixtures / "dict.raw")}]}} if i % 4 == 0 else {})
+                name = ("frame_7_15.lz4", "concat.bin", "bad_content.lz4", "unsupported_id_0.lz4")[i % 4]
+                descriptor = ArchiveInputDescriptor(entry_path=str(fixtures / name), format_hint="lz4")
                 request = json.dumps({"job_id": str(i), "origin": "watch" if i % 2 else "foreground",
                     "archive_input": descriptor.to_dict(), "archive_path": descriptor.entry_path,
                     "output_dir": str(tmp_path / str(i))})
@@ -336,6 +282,28 @@ def test_shared_worker_interleaves_dictionary_success_damage_and_missing_jobs(fi
     for i, result in results.items():
         assert result["status"] == ("ok" if i % 4 < 2 else "failed")
         if i % 4 == 3:
-            assert result["failure_kind"] == "dictionary_required"
+            assert result["native_status"] == "unsupported" and result["failure_kind"] == "unsupported_method"
         if i % 4 == 0:
             assert result["stream_receipt"]["content_checked_frames"] == 1
+
+
+def test_prefix_carrier_is_a_strict_subrange_at_zero(fixtures, tmp_path):
+    path = fixtures / "prefix_carrier.dat"
+    task = make_archive_task(path, format_hint="lz4")
+    report = ArchiveInputPlanningStage({}).plan_task(task)
+    assert len(report.extractable_segments) == 1
+    evidence, segment = report.extractable_segments[0]
+    assert segment.start_offset == 0 and segment.end_offset == path.stat().st_size - 29
+    descriptor = ArchiveInputPlanningStage({})._archive_input_for_segment(task, evidence, segment)
+    assert descriptor.open_mode == "file_range"
+    result = worker(descriptor, tmp_path / "prefix")
+    assert result["status"] == "ok"
+    assert result["stream_receipt"]["input_bytes"] == segment.end_offset
+    assert fingerprints(fixtures / "expected_standard") == fingerprints(tmp_path / "prefix")
+
+
+def test_incomplete_split_never_has_a_complete_stream_plan(fixtures):
+    report = AnalysisEngine().analyze_path(str(fixtures / "split.any.001"))
+    assert not report.selected
+    evidence = next(e for e in report.evidences if e.format == "lz4")
+    assert not evidence.details["stream_plan"]["complete"]

@@ -15,7 +15,6 @@ _HIT_FORMATS = {
     "xz": "xz",
     "zstd": "zstd",
     "lz4": "lz4",
-    "lz4_legacy": "lz4",
     "lz4_skippable": "lz4",
     "tar_ustar": "tar",
 }
@@ -32,7 +31,6 @@ class EmbeddedCandidate:
     boundary_kind: str
     extractable: bool
     stream_plan: dict[str, Any] | None = None
-    information_required: bool = False
 
     @property
     def password_required(self) -> bool:
@@ -53,7 +51,7 @@ class EmbeddedCandidate:
             "candidate_kind": self.candidate_kind,
             "boundary_kind": self.boundary_kind,
             "extractable": self.extractable,
-            **({"stream_plan": dict(self.stream_plan or {}), "information_required": self.information_required} if self.format == "lz4" else {}),
+            **({"stream_plan": self.stream_plan} if self.stream_plan else {}),
         }
 
 

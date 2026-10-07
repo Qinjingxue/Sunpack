@@ -1,6 +1,5 @@
 #define LZ4F_STATIC_LINKING_ONLY
 #include "lz4frame.h"
-#include "lz4.h"
 #include "stream.h"
 #define XXH_NAMESPACE SUNPACK_LZ4_
 #include "xxhash.h"
@@ -91,28 +90,21 @@ static void word(Bytes &out, unsigned int n) { for (int i=0;i<4;++i) out.push_ba
 static void save(const std::filesystem::path &path, const Bytes &data) {
     std::ofstream f(path, std::ios::binary); f.write(reinterpret_cast<const char *>(data.data()), data.size()); check(bool(f),"fixture write");
 }
-static Bytes frame(const Bytes &input, int block, bool linked, bool content, bool checksum, bool size, const Bytes *dict=nullptr, unsigned int id=0, int level=0) {
+static Bytes frame(const Bytes &input, int block, bool linked, bool content, bool checksum, bool size, int level=0) {
     LZ4F_preferences_t prefs{};
     prefs.frameInfo.blockSizeID=static_cast<LZ4F_blockSizeID_t>(block);
     prefs.frameInfo.blockMode=linked?LZ4F_blockLinked:LZ4F_blockIndependent;
     prefs.frameInfo.contentChecksumFlag=content?LZ4F_contentChecksumEnabled:LZ4F_noContentChecksum;
     prefs.frameInfo.blockChecksumFlag=checksum?LZ4F_blockChecksumEnabled:LZ4F_noBlockChecksum;
     prefs.frameInfo.contentSize=size?input.size():0;
-    prefs.frameInfo.dictID=id;
     prefs.compressionLevel=level;
     Bytes out(LZ4F_compressFrameBound(input.size(), &prefs));
-    size_t n;
-    if (dict) {
-        LZ4F_cctx *ctx=nullptr; check(!LZ4F_isError(LZ4F_createCompressionContext(&ctx,LZ4F_VERSION)),"compress context");
-        LZ4F_CDict *cdict=LZ4F_createCDict(dict->data(),dict->size()); check(cdict!=nullptr,"compress dictionary");
-        n=LZ4F_compressFrame_usingCDict(ctx,out.data(),out.size(),input.data(),input.size(),cdict,&prefs);
-        LZ4F_freeCDict(cdict); LZ4F_freeCompressionContext(ctx);
-    } else n=LZ4F_compressFrame(out.data(),out.size(),input.data(),input.size(),&prefs);
+    const size_t n=LZ4F_compressFrame(out.data(),out.size(),input.data(),input.size(),&prefs);
     check(!LZ4F_isError(n),"frame compression"); out.resize(n); return out;
 }
 struct Memory {
     const Bytes *source; Bytes output; size_t offset=0, chunk=256*1024;
-    const Bytes *dictionary=nullptr; unsigned int id=0; bool cancel=false;
+    bool cancel=false;
 };
 static ptrdiff_t read_mem(void *p,void *dst,size_t n) {
     auto &s=*static_cast<Memory *>(p); n=(std::min)({n,s.chunk,s.source->size()-s.offset});
@@ -122,27 +114,13 @@ static int write_mem(void *p,const void *src,size_t n) {
     auto &s=*static_cast<Memory *>(p); const auto *b=static_cast<const unsigned char *>(src);
     s.output.insert(s.output.end(),b,b+n); return 0;
 }
-static int dict_mem(void *p,uint32_t id,int has_id,const void **data,size_t *n) {
-    auto &s=*static_cast<Memory *>(p); if (!s.dictionary || (has_id && id!=s.id)) return 0;
-    *data=s.dictionary->data(); *n=s.dictionary->size(); return 1;
-}
 static int progress_mem(void *p,uint64_t,uint64_t) { return static_cast<Memory *>(p)->cancel; }
-static sup_lz4_result decode(const Bytes &source,const Bytes &expected,size_t chunk=256*1024,const Bytes *dictionary=nullptr,unsigned int id=0,int error=0) {
-    Memory s{&source,{},0,chunk,dictionary,id}; sup_lz4_result result{};
-    int rc=sup_lz4_decode(&s,read_mem,nullptr,write_mem,dict_mem,progress_mem,&result);
+static sup_lz4_result decode(const Bytes &source,const Bytes &expected,size_t chunk=256*1024,int error=0) {
+    Memory s{&source,{},0,chunk}; sup_lz4_result result{};
+    int rc=sup_lz4_decode(&s,read_mem,nullptr,write_mem,progress_mem,&result);
     check(rc==error,"decoder result");
     if (!rc) {check(s.output==expected,"decoded content"); check(result.input_bytes==source.size(),"input coverage"); check(result.output_bytes==expected.size(),"output coverage");}
     return result;
-}
-static Bytes legacy(const Bytes &input) {
-    Bytes out; word(out,0x184c2102);
-    for(size_t offset=0;offset<input.size();) {
-        const int n=static_cast<int>((std::min)(input.size()-offset,size_t{8*1024*1024}));
-        Bytes block(LZ4_compressBound(n));
-        const int got=LZ4_compress_default(reinterpret_cast<const char *>(input.data()+offset),reinterpret_cast<char *>(block.data()),n,static_cast<int>(block.size()));
-        check(got>0,"legacy compression");word(out,got);out.insert(out.end(),block.begin(),block.begin()+got); offset+=n;
-    }
-    return out;
 }
 static Bytes tar(const Bytes &input) {
     Bytes out(512,0); std::memcpy(out.data(),"hello.txt",9);std::memcpy(out.data()+100,"0000644",7);
@@ -191,10 +169,14 @@ static void compress_files_to_lz4(const std::vector<std::filesystem::path> &sour
     output.close();
     check(output.good(), "LZ4 benchmark target close");
 }
-static Bytes zero_dictionary_id(Bytes bytes) {
-    check((bytes[4] & 1) != 0, "explicit dictionary field");
+// Construct valid headers with a Dict-ID without adding a dictionary encoder.
+// All IDs, including zero, are outside the self-contained decoding contract.
+static Bytes with_dict_id(Bytes bytes, unsigned int id) {
+    check(!(bytes[4] & 1), "self-contained source header");
     const size_t at = 6 + ((bytes[4] & 8) ? 8 : 0);
-    std::fill(bytes.begin() + at, bytes.begin() + at + 4, 0);
+    Bytes field; word(field, id);
+    bytes.insert(bytes.begin() + at, field.begin(), field.end());
+    bytes[4] |= 1;
     bytes[at + 4] = static_cast<unsigned char>(XXH32(bytes.data() + 4, at, 0) >> 8);
     return bytes;
 }
@@ -207,7 +189,7 @@ static void benchmark(const Bytes &input) {
             Memory memory{&packed}; memory.output.reserve(input.size());
             if(kind) {
                 sup_lz4_result result{};
-                check(sup_lz4_decode(&memory,read_mem,nullptr,write_mem,nullptr,nullptr,&result)==0,"benchmark adapter");
+                check(sup_lz4_decode(&memory,read_mem,nullptr,write_mem,nullptr,&result)==0,"benchmark adapter");
             } else {
                 LZ4F_dctx *ctx=nullptr;check(!LZ4F_isError(LZ4F_createDecompressionContext(&ctx,LZ4F_VERSION)),"benchmark context");
                 std::array<unsigned char,256*1024> buffer;
@@ -254,7 +236,7 @@ int wmain(int argc,wchar_t **argv) {
         }
         auto standard=frame(input,7,true,true,true,true);
         test_codec(standard, input);
-        auto high=frame(input,7,true,true,true,true,nullptr,0,12);
+        auto high=frame(input,7,true,true,true,true,12);
         decode(high,input);save(root/L"high_compression.lz4",high);
         for(size_t chunk:{size_t{1},size_t{7},size_t{31},size_t{4096}})decode(standard,input,chunk);
         Bytes skip; word(skip,0x184d2a5f);word(skip,3);skip.insert(skip.end(),{1,2,3});
@@ -265,49 +247,41 @@ int wmain(int argc,wchar_t **argv) {
         save(root/L"expected_concat"/L"payload",double_input);
         auto result=decode(concatenated,double_input,7);check(result.frames==2&&result.skippable_frames==3&&result.content_checked_frames==2,"concatenation receipt");
         save(root/L"concat.bin",concatenated);
-        auto old=legacy(input);decode(old,input,31);save(root/L"legacy.lz4",old);
-        Bytes legacy_large=input;legacy_large.insert(legacy_large.end(),input.begin(),input.end());
-        legacy_large.insert(legacy_large.end(),input.begin(),input.end());decode(legacy(legacy_large),legacy_large,4096);
-        auto terminated=old;word(terminated,0);decode(terminated,input,31);save(root/L"legacy_zero.lz4",terminated);
-        Bytes mixed=old;mixed.insert(mixed.end(),standard.begin(),standard.end());decode(mixed,double_input,31);save(root/L"mixed.lz4",mixed);
+        const auto unchecked=frame(input,4,false,false,true,false);
+        Bytes partial=standard;partial.insert(partial.end(),unchecked.begin(),unchecked.end());
+        check(decode(partial,double_input,31).content_checked_frames==1,"partial content checksum coverage");
+        save(root/L"concat_partial.bin",partial);
+        Bytes prefix=standard;prefix.resize(prefix.size()+29,0x88);save(root/L"prefix_carrier.dat",prefix);
         auto empty=frame({},4,false,true,true,true);decode(empty,{});save(root/L"empty.lz4",empty);
-        auto damaged=standard;damaged.back()^=1;decode(damaged,{},4096,nullptr,0,SUP_LZ4_CHECKSUM);save(root/L"bad_content.lz4",damaged);
-        auto bad_header=standard;bad_header[14]^=1;decode(bad_header,{},31,nullptr,0,SUP_LZ4_CHECKSUM);save(root/L"bad_header.lz4",bad_header);
-        auto bad_block=standard;bad_block[19]^=1;decode(bad_block,{},31,nullptr,0,SUP_LZ4_CHECKSUM);save(root/L"bad_block.lz4",bad_block);
-        auto truncated=standard;truncated.pop_back();decode(truncated,{},4096,nullptr,0,SUP_LZ4_TRUNCATED);save(root/L"truncated.lz4",truncated);
-        Bytes dictionary(65536);unsigned rng=42;for(auto &b:dictionary){rng=rng*1664525U+1013904223U;b=static_cast<unsigned char>(rng>>24);}
-        Bytes dict_input(dictionary.begin()+2000,dictionary.end());dict_input.insert(dict_input.end(),dictionary.begin()+2000,dictionary.end());
-        const auto dict_frame=frame(dict_input,4,true,true,true,true,&dictionary,123);
-        decode(dict_frame,dict_input,31,&dictionary,123);decode(dict_frame,{},31,nullptr,0,SUP_LZ4_DICTIONARY);
-        save(root/L"dict.raw",dictionary);save(root/L"dictionary.lz4",dict_frame);save(root/L"dictionary_expected.raw",dict_input);
-        std::filesystem::create_directories(root/L"expected_dictionary");
-        save(root/L"expected_dictionary"/L"payload",dict_input);
-        save(root/L"dictionary_no_id.lz4",frame(dict_input,4,true,true,true,true,&dictionary,0));
-        auto zero_id=zero_dictionary_id(dict_frame);
-        decode(zero_id,dict_input,31,&dictionary,0);save(root/L"dictionary_zero_id.lz4",zero_id);
-        check(decode(zero_id,{},31,nullptr,0,SUP_LZ4_DICTIONARY).dictionary_id==0,"missing explicit ID zero");
-        decode(zero_id,{},31,&dictionary,123,SUP_LZ4_DICTIONARY);
-        Memory no_dictionary{&zero_id};sup_lz4_result missing_zero{};
-        check(sup_lz4_decode(&no_dictionary,read_mem,nullptr,write_mem,nullptr,nullptr,&missing_zero)==SUP_LZ4_DICTIONARY,
-              "ID zero also requires context without a dictionary callback");
-        Bytes zero_carrier(1031,0x89);zero_carrier.insert(zero_carrier.end(),zero_id.begin(),zero_id.end());
-        zero_carrier.resize(zero_carrier.size()+29,0x88);save(root/L"dictionary_zero_id_carrier.dat",zero_carrier);
-        save(root/L"payload_zero_id.tar.lz4",zero_dictionary_id(frame(tar(Bytes{'h','e','l','l','o','\n'}),4,true,true,true,true,&dictionary,123)));
-        for(int block=4;block<=7;++block) for(bool linked:{false,true})
-            decode(frame(dict_input,block,linked,true,true,true,&dictionary,123),dict_input,31,&dictionary,123);
-        Bytes padded_dictionary(256*1024,0x89);padded_dictionary.insert(padded_dictionary.end(),dictionary.begin(),dictionary.end());
-        save(root/L"dict_large.raw",padded_dictionary);
-        Bytes second_dictionary=dictionary;for(auto &b:second_dictionary)b^=0x9f;
-        Bytes second_input(second_dictionary.begin()+2000,second_dictionary.end());
-        save(root/L"dict_second.raw",second_dictionary);
-        auto switching=dict_frame;
-        const auto second_frame=frame(second_input,4,false,true,true,true,&second_dictionary,0xffffffffU);
-        switching.insert(switching.end(),second_frame.begin(),second_frame.end());
-        switching.insert(switching.end(),dict_frame.begin(),dict_frame.end());
-        save(root/L"dictionary_switch.lz4",switching);
-        Bytes switching_expected=dict_input;switching_expected.insert(switching_expected.end(),second_input.begin(),second_input.end());
-        switching_expected.insert(switching_expected.end(),dict_input.begin(),dict_input.end());
-        std::filesystem::create_directories(root/L"expected_switch");save(root/L"expected_switch"/L"payload",switching_expected);
+        auto damaged=standard;damaged.back()^=1;decode(damaged,{},4096,SUP_LZ4_CHECKSUM);save(root/L"bad_content.lz4",damaged);
+        auto bad_header=standard;bad_header[14]^=1;decode(bad_header,{},31,SUP_LZ4_CHECKSUM);save(root/L"bad_header.lz4",bad_header);
+        auto bad_block=standard;bad_block[19]^=1;decode(bad_block,{},31,SUP_LZ4_CHECKSUM);save(root/L"bad_block.lz4",bad_block);
+        auto truncated=standard;truncated.pop_back();decode(truncated,{},4096,SUP_LZ4_TRUNCATED);save(root/L"truncated.lz4",truncated);
+        // Unsupported historical magic is never recognized by SunPack.
+        const Bytes old{2,0x21,0x4c,0x18,6,0,0,0,0x50,'h','e','l','l','o'};
+        decode(old,{},31,SUP_LZ4_DATA);save(root/L"unsupported_legacy.bin",old);
+        Bytes old_carrier(1031,0x89);old_carrier.insert(old_carrier.end(),old.begin(),old.end());
+        old_carrier.resize(old_carrier.size()+29,0x88);save(root/L"unsupported_legacy_carrier.dat",old_carrier);
+        for (unsigned int id : {0U,123U,0xffffffffU}) {
+            const auto unsupported=with_dict_id(standard,id);
+            decode(unsupported,{},31,SUP_LZ4_UNSUPPORTED);
+            CMyComPtr<ICompressCoder> coder;
+            check(CreateCoder_Id(EXTERNAL_CODECS_VARS_G 0x04F71104,false,coder)==S_OK && coder,"unsupported codec registered");
+            auto *streams=new CodecStreams(unsupported);CMyComPtr<ISequentialInStream> owner=streams;
+            const UInt64 packed_size=unsupported.size(), output_size=input.size();
+            check(coder->Code(streams,streams,&packed_size,&output_size,streams)==E_NOTIMPL,"codec unsupported status");
+            save(root/(L"unsupported_id_"+std::to_wstring(id)+L".lz4"),unsupported);
+        }
+        auto unsupported_carrier=Bytes(1031,0x89);const auto unsupported=with_dict_id(standard,123);
+        unsupported_carrier.insert(unsupported_carrier.end(),unsupported.begin(),unsupported.end());
+        unsupported_carrier.resize(unsupported_carrier.size()+29,0x88);save(root/L"unsupported_id_carrier.dat",unsupported_carrier);
+        save(root/L"unsupported_id.tar.lz4",with_dict_id(frame(tar(Bytes{'h','e','l','l','o','\n'}),4,true,true,true,true),123));
+        // Structurally valid compressed block with an invalid back-reference.
+        // No off-band dependency diagnosis: this is an ordinary data error.
+        Bytes bad_data=frame({},4,false,false,false,false);
+        Bytes bad_block_data;word(bad_block_data,3);bad_block_data.insert(bad_block_data.end(),{0,0,0});
+        bad_data.insert(bad_data.begin()+7,bad_block_data.begin(),bad_block_data.end());
+        decode(bad_data,{},31,SUP_LZ4_DATA);save(root/L"bad_data.lz4",bad_data);
         save(root/L"payload.tar.lz4",frame(tar(Bytes{'h','e','l','l','o','\n'}),4,true,true,true,true));
         save(root/L"skips_only.lz4",skip);decode(skip,{});
         Bytes skip_zstd=skip;
@@ -336,22 +310,18 @@ int wmain(int argc,wchar_t **argv) {
         check(WriteFile(sparse,tar_frame.data(),static_cast<DWORD>(tar_frame.size()),&processed,nullptr)&&processed==tar_frame.size(),"sparse frame");CloseHandle(sparse);
         save(root/L"nested.lz4",frame(standard,4,true,true,true,true));
         Bytes carrier(1031,0x89);carrier.insert(carrier.end(),concatenated.begin(),concatenated.end());carrier.resize(carrier.size()+29,0x88);save(root/L"carrier.dat",carrier);
-        Bytes uncertain(1031,0x89);uncertain.insert(uncertain.end(),old.begin(),old.end());uncertain.resize(uncertain.size()+29,0x88);save(root/L"legacy_carrier.dat",uncertain);
-        Bytes short_tail(1031,0x89);short_tail.insert(short_tail.end(),old.begin(),old.end());
-        word(short_tail,128);short_tail.resize(short_tail.size()+29,0x88);save(root/L"legacy_carrier_short_tail.dat",short_tail);
         const auto split=standard.size()/2;save(root/L"split.any.001",Bytes(standard.begin(),standard.begin()+split));save(root/L"split.any.002",Bytes(standard.begin()+split,standard.end()));
-        sunpack::sevenzip::Lz4Options options;options.dictionaries.emplace_back(123,(root/L"dict.raw").wstring());
-        auto extracted=sunpack::sevenzip::extract_archive_with_parts((root/L"dictionary.lz4").wstring(),{},L"lz4",L"",(root/L"worker_output").wstring(),L"",nullptr,false,{},false,nullptr,0,nullptr,options);
+        auto extracted=sunpack::sevenzip::extract_archive_with_parts((root/L"frame_7_15.lz4").wstring(),{},L"lz4",L"",(root/L"worker_output").wstring(),L"",nullptr,false);
         if (!extracted.command_ok) std::cerr<<"worker: "<<extracted.message<<" kind="<<extracted.failure_kind<<" hr="<<extracted.hresult<<" op="<<extracted.operation_result<<"\n";
-        check(extracted.command_ok&&extracted.has_stream_receipt&&extracted.stream_receipt.content_checked_frames==1,"worker dictionary extraction");
+        check(extracted.command_ok&&extracted.has_stream_receipt&&extracted.stream_receipt.content_checked_frames==1,"worker extraction");
         check(extracted.output_trace.items.size()==1&&!extracted.output_trace.items[0].crc_verified,"no fake CRC32");
         const auto &output_item=extracted.output_trace.items[0];
         std::ifstream actual(root/L"worker_output"/output_item.output_path,std::ios::binary);
         Bytes extracted_bytes((std::istreambuf_iterator<char>(actual)),std::istreambuf_iterator<char>());
-        check(extracted_bytes==dict_input,"finalized worker output content");
+        check(extracted_bytes==input,"finalized worker output content");
         Memory cancelled{&standard};cancelled.cancel=true;sup_lz4_result cancelled_result{};
-        check(sup_lz4_decode(&cancelled,read_mem,nullptr,write_mem,dict_mem,progress_mem,&cancelled_result)==SUP_LZ4_CANCELLED,"cancellation");
-        std::cout<<"LZ4: "<<cases<<" frame combinations, fragmentation, dictionaries, concatenation, Legacy, checksums, cancellation and worker passed\n";
+        check(sup_lz4_decode(&cancelled,read_mem,nullptr,write_mem,progress_mem,&cancelled_result)==SUP_LZ4_CANCELLED,"cancellation");
+        std::cout<<"LZ4: "<<cases<<" frame combinations, fragmentation, concatenation, unsupported inputs, checksums, cancellation and worker passed\n";
         return 0;
     } catch(const std::exception &e) {std::cerr<<e.what()<<"\n";return 1;}
 }

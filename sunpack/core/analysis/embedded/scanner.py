@@ -54,7 +54,6 @@ def _normalize_native_result(value: dict[str, Any], expected_size: int) -> Embed
             boundary_kind=str(row["boundary_kind"]),
             extractable=bool(row["extractable"]),
             stream_plan=dict(row["stream_plan"]) if row.get("stream_plan") else None,
-            information_required=bool(row.get("information_required", False)),
         ))
 
     raw_hits = value["hits"]
@@ -63,7 +62,7 @@ def _normalize_native_result(value: dict[str, Any], expected_size: int) -> Embed
         "zip_local": "zip", "zip_eocd": "zip", "rar4": "rar", "rar5": "rar",
         "7z": "7z", "gzip": "gzip", "bzip2": "bzip2", "xz": "xz",
         "zstd": "zstd", "tar_ustar": "tar",
-        "lz4": "lz4", "lz4_legacy": "lz4", "lz4_skippable": "lz4",
+        "lz4": "lz4", "lz4_skippable": "lz4",
     }
     hits = []
     for row in raw_hits:
@@ -104,7 +103,6 @@ def embedded_result_from_dict(value: dict[str, Any]) -> EmbeddedScanResult:
                 boundary_kind=str(item["boundary_kind"]),
                 extractable=bool(item["extractable"]),
                 stream_plan=dict(item["stream_plan"]) if item.get("stream_plan") else None,
-                information_required=bool(item.get("information_required", False)),
             )
             for item in value["candidates"]
         ),
