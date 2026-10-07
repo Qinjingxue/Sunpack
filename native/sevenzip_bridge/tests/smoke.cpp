@@ -45,30 +45,9 @@ bool check_numbered_volume_paths() {
 bool check_extraction_handler_selection_is_read_free() {
     using sunpack::sevenzip::extraction_formats_for_hint;
 
-    const auto root = std::filesystem::temp_directory_path() /
-        (L"sunpack-extraction-selector-" + std::to_wstring(GetCurrentProcessId()));
-    std::error_code error;
-    std::filesystem::remove_all(root, error);
-    error.clear();
-    std::filesystem::create_directories(root, error);
-    if (error) {
-        return false;
-    }
-
-    // Put an RAR4 signature on disk. Extraction must not inspect it: the
-    // already-analyzed generic RAR hint maps directly to the fixed handler
-    // order (RAR5, then RAR4).
-    const auto path = root / L"payload.rar";
-    {
-        std::ofstream stream(path, std::ios::binary | std::ios::trunc);
-        const std::vector<unsigned char> rar4 = {'R', 'a', 'r', '!', 0x1A, 0x07, 0x00};
-        stream.write(
-            reinterpret_cast<const char*>(rar4.data()),
-            static_cast<std::streamsize>(rar4.size()));
-    }
-
-    const auto formats = extraction_formats_for_hint(L"rar", path.wstring());
-    std::filesystem::remove_all(root, error);
+    // The selector accepts only the already-analyzed hint, so no input path
+    // can be opened. Generic RAR maps to the fixed order (RAR5, then RAR4).
+    const auto formats = extraction_formats_for_hint(L"rar");
     return formats.size() == 2 &&
         formats[0].Data4[5] == 0xCC &&
         formats[1].Data4[5] == 0x03;

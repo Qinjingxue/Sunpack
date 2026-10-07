@@ -54,6 +54,17 @@ CI 和 acceptance runner（包括根目录 `run_acceptance_tests.ps1`）默认�
 
 `run_acceptance_tests.ps1` 会运行 CLI、unit、functional、integration 和完整 `tests/real` 真实归档/watch 矩阵，并执行 CLI smoke checks。
 
+验收和 CI 入口会先检查依赖导入及组件级源码/产物 UTC 修改时间；缺失或过期时复用
+`scripts/setup_windows_dev.ps1`，完成后重新检查，仍过期则在运行测试前失败。
+共享 USN crate 的修改会同时使 Rust 扩展与 Broker 过期；LZ4、内置 7-Zip/zlib-ng、
+构建配置和 toast 源码也纳入各自组件的检查，构建目录不参与扫描。Broker 只使用
+`.cache/rust-target/<arch>/<target>/release/` 的产物，不回退到 `native/target`。
+这里不保存 manifest，也不计算源码或产物 hash。检查面向正常编辑/Git 工作流，
+不能识别保留旧时间戳的源码替换；这类操作后应主动运行 setup。
+setup 成功构建/安装后，只将旧产物时间推进到该组件的构建开始时间，以支持无需重新链接的
+增量构建；新生成产物保留原时间，不破坏构建系统的增量判断。
+验收入口的 `-SkipEnvironmentRefresh` 仍可显式跳过检查和自动刷新。
+
 脚本中的各测试步骤相互独立：某一步失败或超时后仍会继续执行后续步骤，最后统一汇总；只要存在失败步骤，脚本最终仍返回非零退出码。
 
 Windows x64 的 acceptance 环境准备会自动缓存真实归档生成器到仓库根目录的

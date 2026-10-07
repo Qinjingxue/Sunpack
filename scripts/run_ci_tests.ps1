@@ -1,10 +1,14 @@
 [CmdletBinding()]
 param(
+    [ValidateSet("x64", "arm64")]
+    [string]$Arch = "x64",
     [ValidateRange(0, 32)]
     [int]$ParallelWorkers = 0
 )
 
 $ErrorActionPreference = "Stop"
+
+. (Join-Path $PSScriptRoot "test_environment.ps1")
 
 $repoRoot = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 Set-Location $repoRoot
@@ -49,31 +53,39 @@ function Invoke-TestStep {
     Write-Host ("    PASS ({0:N2}s)" -f $duration) -ForegroundColor Green
 }
 
-function Get-UvBootstrapPythonCommand {
-    foreach ($candidate in @("python", "py")) {
-        try {
-            $resolvedPython = & $candidate -c "import sys; print(sys.executable)" 2>$null
-            if ($LASTEXITCODE -eq 0) {
-                $resolvedPython = @($resolvedPython | Where-Object { $_ }) | Select-Object -Last 1
-                if ($resolvedPython) {
-                    return ([string]$resolvedPython).Trim()
-                }
-            }
-        } catch {
-        }
+function Get-CiEnvironmentRefreshReasons {
+    param([string]$RepoRoot, [string]$VenvPython, [string]$Arch)
+    if (-not (Test-Path -LiteralPath $VenvPython -PathType Leaf)) {
+        ".venv is missing"
+        return
     }
-    throw "A base Python interpreter is required by uv to create .venv, but none was found in PATH."
+    try {
+        & $VenvPython -c "import pytest, xdist, psutil, send2trash, watchdog, zstandard; import sunpack_native as n; assert n.native_available(); assert callable(n.inspect_pe_overlay_structure)" *> $null
+        if ($LASTEXITCODE -ne 0) { "Runtime, test dependencies or native smoke check failed" }
+    } catch {
+        "Runtime, test dependencies or native smoke check failed"
+    }
+    Get-NativeArtifactRefreshReasons -RepoRoot $RepoRoot -Arch $Arch -NativeExtension (Get-NativeExtensionPath -PythonPath $VenvPython)
 }
 
 $venvPython = Join-Path $repoRoot ".venv\Scripts\python.exe"
-if (-not (Test-Path -LiteralPath $venvPython -PathType Leaf)) {
-    $bootstrapPython = Get-UvBootstrapPythonCommand
-    Invoke-TestStep -Label "Prepare .venv with uv" -Command @(
-        "uv", "sync", "--locked", "--extra", "dev", "--python", $bootstrapPython
+$env:PYTHONPATH = $repoRoot
+$refreshReasons = @(Get-CiEnvironmentRefreshReasons -RepoRoot $repoRoot -VenvPython $venvPython -Arch $Arch)
+if ($refreshReasons.Count -gt 0) {
+    Write-Host ("Environment refresh required:`n  - " + ($refreshReasons -join "`n  - ")) -ForegroundColor Yellow
+    Invoke-TestStep -Label "Refresh development environment" -Command @(
+        [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName,
+        "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+        "-File", (Join-Path $PSScriptRoot "setup_windows_dev.ps1"),
+        "-Arch", $Arch, "-SkipAcceptanceTestTools"
     )
+    $remainingReasons = @(Get-CiEnvironmentRefreshReasons -RepoRoot $repoRoot -VenvPython $venvPython -Arch $Arch)
+    if ($remainingReasons.Count -gt 0) {
+        throw ("Environment refresh completed but the environment is still stale:`n  - " + ($remainingReasons -join "`n  - "))
+    }
 }
 if (-not (Test-Path -LiteralPath $venvPython -PathType Leaf)) {
-    throw "uv sync completed without creating the project virtual environment: $venvPython"
+    throw "Development setup completed without creating the project virtual environment: $venvPython"
 }
 $python = $venvPython
 $env:PYTHONPATH = $repoRoot

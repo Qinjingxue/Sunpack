@@ -10,6 +10,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 . (Join-Path $PSScriptRoot "sevenzip_asm_check.ps1")
+. (Join-Path $PSScriptRoot "test_environment.ps1")
 
 function Write-Step {
     param([string]$Message)
@@ -628,6 +629,7 @@ function Build-SevenZipWorker {
     )
 
     Write-Step "Building embedded 7-Zip worker"
+    $buildStartedUtc = [datetime]::UtcNow
     Assert-PathExists -LiteralPath (Join-Path $WrapperRoot "CMakeLists.txt") -Description "7z wrapper CMake project"
     $cmakePlatform = Get-CMakePlatform -BuildArch $BuildArch
     Reset-StaleCMakeBuildDir -SourceDir $WrapperRoot -BuildDir $BuildDir -CMakePlatform $cmakePlatform
@@ -648,6 +650,7 @@ function Build-SevenZipWorker {
     Assert-SevenZipAsmSelection -BuildDir $BuildDir -BuildArch $BuildArch -ArtifactPaths @(
         (Join-Path $ToolsRoot "sunpack_sevenzip_worker.exe")
     )
+    Set-DevelopmentArtifactBuildTime -Path (Join-Path $ToolsRoot "sunpack_sevenzip_worker.exe") -BuildStartedUtc $buildStartedUtc
 }
 
 function Build-ToastLibrary {
@@ -661,6 +664,7 @@ function Build-ToastLibrary {
     )
 
     Write-Step "Building in-process Windows toast library"
+    $buildStartedUtc = [datetime]::UtcNow
     Assert-PathExists -LiteralPath (Join-Path $SourceRoot "CMakeLists.txt") -Description "toast CMake project"
     $cmakePlatform = Get-CMakePlatform -BuildArch $BuildArch
     Reset-StaleCMakeBuildDir -SourceDir $SourceRoot -BuildDir $BuildDir -CMakePlatform $cmakePlatform
@@ -672,6 +676,7 @@ function Build-ToastLibrary {
     $toastDll = Join-Path $BuildDir "Release\sunpack_toast.dll"
     Assert-PathExists -LiteralPath $toastDll -Description "Built toast DLL"
     Copy-Item -LiteralPath $toastDll -Destination (Join-Path $ToolsRoot "sunpack_toast.dll") -Force
+    Set-DevelopmentArtifactBuildTime -Path (Join-Path $ToolsRoot "sunpack_toast.dll") -BuildStartedUtc $buildStartedUtc
 }
 
 function Test-NativeImport {
@@ -779,7 +784,7 @@ $nativeCargoToml = Join-Path $nativeCrateRoot "Cargo.toml"
 $nativeWorkspaceLock = Join-Path $repoRoot "native\Cargo.lock"
 $watchBrokerCargoToml = Join-Path $repoRoot "native\sunpack_watch_broker\Cargo.toml"
 $rustTargetDir = Join-Path $repoRoot (".cache\rust-target\" + $buildArch)
-$watchBrokerBuildPath = Join-Path $rustTargetDir ("$rustTarget\release\sunpack-watch-broker.exe")
+$watchBrokerBuildPath = Get-WatchBrokerBuildPath -RepoRoot $repoRoot -Arch $buildArch
 $sevenZipWrapperRoot = Join-Path $repoRoot "native\sevenzip_bridge"
 $sevenZipWrapperBuildDir = Join-Path $sevenZipWrapperRoot ("build-" + $buildArch)
 $toastHostRoot = Join-Path $repoRoot "native\toast_host"
@@ -821,6 +826,7 @@ $env:PYTHONPATH = $repoRoot
 $env:VIRTUAL_ENV = $venvPath
 
 Write-Step "Building and installing Rust native extension"
+$nativeBuildStartedUtc = [datetime]::UtcNow
 $maturinCommand = Get-MaturinCommand -VenvScripts $venvScripts
 Remove-PreviousNativeExtension -PythonPath $venvPython -VenvPath $venvPath
 New-Item -ItemType Directory -Path $nativeWheelRoot -Force | Out-Null
@@ -837,8 +843,10 @@ Invoke-Native -FilePath $maturinCommand -Arguments @(
 $nativeWheelPath = Get-LatestWheel -WheelRoot $nativeWheelRoot
 Invoke-Native -FilePath "uv" -Arguments @("pip", "install", "--python", $venvPython, "--reinstall", $nativeWheelPath)
 Test-NativeImport -PythonPath $venvPython
+Set-DevelopmentArtifactBuildTime -Path (Get-NativeExtensionPath -PythonPath $venvPython) -BuildStartedUtc $nativeBuildStartedUtc
 
 Write-Step "Building minimal Windows Watch Broker service"
+$brokerBuildStartedUtc = [datetime]::UtcNow
 Invoke-Native -FilePath "cargo" -Arguments @(
     "build",
     "--locked",
@@ -848,6 +856,7 @@ Invoke-Native -FilePath "cargo" -Arguments @(
     "--target-dir", $rustTargetDir
 )
 Assert-PathExists -LiteralPath $watchBrokerBuildPath -Description "SunPack Watch Broker executable"
+Set-DevelopmentArtifactBuildTime -Path $watchBrokerBuildPath -BuildStartedUtc $brokerBuildStartedUtc
 
 Ensure-Bundled7ZipAssets -ToolsRoot $toolsRoot -LicenseDestinationPath $sevenZipLicensePath -BuildArch $buildArch
 if ($buildArch -eq "x64" -and -not $SkipAcceptanceTestTools) {

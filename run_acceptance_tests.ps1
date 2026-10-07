@@ -12,6 +12,8 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+. (Join-Path $PSScriptRoot "scripts\test_environment.ps1")
+
 $repoRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $unelevatedRunner = Join-Path $repoRoot "scripts\run_unelevated_process.py"
 $testArtifactCleanupScript = Join-Path $repoRoot "scripts\cleanup_test_artifacts.ps1"
@@ -519,53 +521,6 @@ function Assert-AcceptanceTestTools {
     Write-Host "    Acceptance generator tools are present and executable." -ForegroundColor Green
 }
 
-function Get-ModuleOrigin {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$PythonPath,
-        [Parameter(Mandatory = $true)]
-        [string]$ModuleName
-    )
-
-    try {
-        $origin = & $PythonPath -c "import importlib.util; spec = importlib.util.find_spec('$ModuleName'); print(spec.origin if spec and spec.origin else '')" 2>$null
-        if ($LASTEXITCODE -ne 0) {
-            return ""
-        }
-        return (($origin | Out-String).Trim())
-    } catch {
-        return ""
-    }
-}
-
-function Get-NewestSourceWriteTime {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Root,
-        [Parameter(Mandatory = $true)]
-        [string[]]$Include
-    )
-
-    $files = @()
-    foreach ($pattern in $Include) {
-        $files += Get-ChildItem -LiteralPath $Root -Filter $pattern -Recurse -File -ErrorAction SilentlyContinue
-    }
-    if (-not $files) {
-        return [datetime]::MinValue
-    }
-    return ($files | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1).LastWriteTimeUtc
-}
-
-function Get-OldestExistingWriteTime {
-    param([string[]]$Paths)
-
-    $files = @($Paths | Where-Object { Test-Path -LiteralPath $_ } | ForEach-Object { Get-Item -LiteralPath $_ })
-    if ($files.Count -eq 0) {
-        return [datetime]::MinValue
-    }
-    return ($files | Sort-Object LastWriteTimeUtc | Select-Object -First 1).LastWriteTimeUtc
-}
-
 function Get-EnvironmentRefreshReasons {
     param(
         [Parameter(Mandatory = $true)]
@@ -582,6 +537,7 @@ function Get-EnvironmentRefreshReasons {
 
     $requiredPythonModules = @(
         "pytest",
+        "xdist",
         "psutil",
         "send2trash",
         "watchdog",
@@ -604,22 +560,11 @@ function Get-EnvironmentRefreshReasons {
     }
 
     $nativeExtension = Get-NativeExtensionPath -PythonPath $VenvPython
-    if (-not $nativeExtension) {
-        $reasons.Add("sunpack_native is not importable from .venv")
+    foreach ($reason in @(Get-NativeArtifactRefreshReasons -RepoRoot $RepoRoot -Arch $Arch -NativeExtension $nativeExtension)) {
+        $reasons.Add($reason)
     }
 
     $toolsRoot = if ($Arch -eq "arm64") { Join-Path $RepoRoot "tools-arm64" } else { Join-Path $RepoRoot "tools" }
-
-    # Runtime artifacts SunPack ships and needs. These must never gain a
-    # standalone 7z.dll: the 7-Zip backend is compiled into the two binaries.
-    $runtimeArtifacts = @(
-        (Join-Path $toolsRoot "sunpack_sevenzip_worker.exe")
-    )
-    foreach ($artifactPath in $runtimeArtifacts) {
-        if (-not (Test-Path -LiteralPath $artifactPath)) {
-            $reasons.Add("required runtime artifact is missing: $artifactPath")
-        }
-    }
 
     # Fixture generators. 7z.dll belongs here: it is the companion module of the
     # 7z.exe command line tool the suite uses to BUILD archives, not a runtime
@@ -645,10 +590,6 @@ function Get-EnvironmentRefreshReasons {
             $reasons.Add("acceptance test generator cannot run: $($tool.Path)")
         }
     }
-    if (($runtimeArtifacts + $fixtureGenerators) | Where-Object { -not (Test-Path -LiteralPath $_) }) {
-        return $reasons
-    }
-
     return $reasons
 }
 
@@ -705,23 +646,6 @@ function Wait-BeforeExit {
     $null = Read-Host
 }
 
-function Get-NativeExtensionPath {
-    param([Parameter(Mandatory = $true)][string]$PythonPath)
-
-    $origin = Get-ModuleOrigin -PythonPath $PythonPath -ModuleName "sunpack_native"
-    if (-not $origin -or -not (Test-Path -LiteralPath $origin -PathType Leaf)) {
-        return ""
-    }
-    $moduleRoot = Split-Path -Parent $origin
-    $extension = Get-ChildItem -LiteralPath $moduleRoot -Filter "sunpack_native*.pyd" -File -ErrorAction SilentlyContinue |
-        Sort-Object LastWriteTimeUtc -Descending |
-        Select-Object -First 1
-    if ($null -eq $extension) {
-        return ""
-    }
-    return $extension.FullName
-}
-
 function Invoke-TestWatchServiceAction {
     param(
         [Parameter(Mandatory = $true)][string]$PowerShellHost,
@@ -764,11 +688,7 @@ if (-not (Test-Path -LiteralPath $venvPython -PathType Leaf)) {
 $python = $venvPython
 $env:PYTHONPATH = $repoRoot
 
-$rustTarget = if ($Arch -eq "arm64") { "aarch64-pc-windows-msvc" } else { "x86_64-pc-windows-msvc" }
-$brokerPath = Join-Path $repoRoot (".cache\rust-target\{0}\{1}\release\sunpack-watch-broker.exe" -f $Arch, $rustTarget)
-if (-not (Test-Path -LiteralPath $brokerPath -PathType Leaf)) {
-    $brokerPath = Join-Path $repoRoot "native\target\release\sunpack-watch-broker.exe"
-}
+$brokerPath = Get-WatchBrokerBuildPath -RepoRoot $repoRoot -Arch $Arch
 $brokerPath = [IO.Path]::GetFullPath($brokerPath)
 if (-not (Test-Path -LiteralPath $brokerPath -PathType Leaf)) {
     throw "Watch Broker executable not found: $brokerPath"
