@@ -320,25 +320,19 @@ impl Decoder {
             input.read_exact(&mut buffer[..n])?;
             // Authenticate ciphertext/recovery before overwriting the buffer.
             mac.update(&buffer[..n]);
+            progress(position)?;
             let decrypt_n = self.encrypted_end.saturating_sub(position).min(n as u64) as usize;
             if decrypt_n != 0 {
                 {
                     #[cfg(feature = "parallel-decrypt")]
                     let extra = {
                         let slices = decrypt_n / MIN_PARALLEL_CHUNK;
-                        let granted = acquire(slices.saturating_sub(1));
-                        if granted == 0 {
+                        let wanted = slices.saturating_sub(1);
+                        if wanted == 0 {
                             0
                         } else {
-                            // Initialize the shared executor only after a grant.
-                            // If an explicit Rayon limit is smaller than the CPU
-                            // budget, immediately return credits it cannot use.
-                            let usable =
-                                granted.min(rayon::current_num_threads().saturating_sub(1));
-                            if usable < granted {
-                                release(granted - usable);
-                            }
-                            usable
+                            // Bound demand by the executor before borrowing CPU.
+                            acquire(wanted.min(rayon::current_num_threads().saturating_sub(1)))
                         }
                     };
                     #[cfg(not(feature = "parallel-decrypt"))]
@@ -347,7 +341,6 @@ impl Decoder {
                         extra,
                         release: &mut release,
                     };
-                    progress(position)?;
                     #[cfg(feature = "parallel-decrypt")]
                     cipher.apply_with_threads(
                         position - PREFIX,
@@ -361,8 +354,6 @@ impl Decoder {
                     .saturating_sub(position)
                     .min(decrypt_n as u64) as usize;
                 output.write_all(&buffer[skip..decrypt_n])?;
-            } else {
-                progress(position)?;
             }
             position += n as u64;
         }

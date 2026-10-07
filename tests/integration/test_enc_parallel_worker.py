@@ -29,7 +29,7 @@ def large_c4(tmp_path_factory):
     return root
 
 
-@pytest.mark.parametrize("capacity,executor_threads", [(1, None), (2, None), (3, None), (5, None), (9, None), (9, 3)])
+@pytest.mark.parametrize("capacity,executor_threads", [(1, None), (2, None), (3, None), (5, None), (9, None), (9, 3), (9, 1)])
 def test_large_c4_uses_only_granted_credits_and_matches_official_bytes(tmp_path, large_c4, capacity, executor_threads):
     request = {"job_id": "c4", "origin": "foreground", "archive_path": str(large_c4 / "large.enc"),
                "format_hint": "enc", "output_dir": str(tmp_path / "out"), "password": "sunpack-test"}
@@ -47,7 +47,11 @@ def test_large_c4_uses_only_granted_credits_and_matches_official_bytes(tmp_path,
     expected = file_inventory(large_c4)["large.expected"]
     assert file_inventory(tmp_path / "out")["large"] == expected
     cpu = next(event for event in events if event.get("event") == "decoder_started")
-    assert cpu["decoder_cpu_credits"] == min(capacity, executor_threads or os.cpu_count() or 1)
+    # The first progress callback precedes borrowing. Rust tests check the
+    # actual requests against data size and executor capacity at acquire time.
+    assert cpu["decoder_cpu_credits"] == 1
+    assert cpu["current_decoder_extra_credits"] == cpu["peak_decoder_extra_credits"] == 0
+    assert not cpu["decoder_parallel"]
 
 
 def test_parallel_c4_releases_credits_after_mac_failure_for_watch_and_cli(tmp_path, large_c4, monkeypatch):
@@ -84,6 +88,6 @@ def test_parallel_c4_releases_credits_after_mac_failure_for_watch_and_cli(tmp_pa
         expected = "wrong_password" if index % 4 == 2 else "damaged" if index % 4 == 3 else "ok"
         assert result["native_status"] == expected, result
     cpu = [e for e in events if e.get("event") == "decoder_started"]
-    assert cpu and all(1 <= e["decoder_cpu_credits"] <= 4 for e in cpu)
+    assert cpu and all(e["decoder_cpu_credits"] == 1 and e["current_decoder_extra_credits"] == 0 for e in cpu)
     final_cpu = next(e for e in cpu if e["job_id"] == "16")
-    assert final_cpu["decoder_cpu_credits"] == min(4, os.cpu_count() or 1)
+    assert final_cpu["peak_decoder_extra_credits"] == 0

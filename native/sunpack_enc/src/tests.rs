@@ -341,6 +341,53 @@ fn parallel_decryption_authenticates_multibuffer_payload_and_recovery() {
             assert_eq!(output, plaintext);
         }
         if code == 9 {
+            for executor_threads in [1usize, 3] {
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(executor_threads)
+                    .build()
+                    .unwrap()
+                    .install(|| {
+                        use std::cell::Cell;
+                        let position = Cell::new(PREFIX);
+                        let held = Cell::new(0usize);
+                        let requests = Cell::new(0usize);
+                        let mut output = Vec::new();
+                        decoder
+                            .decrypt_with_budget(
+                                &mut Cursor::new(&bytes),
+                                &mut output,
+                                |wanted| {
+                                    let decrypt_n = (encrypted_end - position.get())
+                                        .min(BUFFER as u64)
+                                        as usize;
+                                    assert_eq!(
+                                        wanted,
+                                        (decrypt_n / MIN_PARALLEL_CHUNK)
+                                            .saturating_sub(1)
+                                            .min(executor_threads - 1),
+                                        "request exceeds data or executor capacity"
+                                    );
+                                    assert_eq!(held.get(), 0);
+                                    requests.set(requests.get() + 1);
+                                    held.set(wanted);
+                                    wanted
+                                },
+                                |extra| {
+                                    assert_eq!(held.get(), extra);
+                                    held.set(0);
+                                },
+                                |current| {
+                                    assert_eq!(held.get(), 0);
+                                    position.set(current);
+                                    Ok(())
+                                },
+                            )
+                            .unwrap();
+                        assert!(requests.get() > 0);
+                        assert_eq!(held.get(), 0);
+                        assert_eq!(output, plaintext);
+                    });
+            }
             rayon::ThreadPoolBuilder::new()
                 .num_threads(9)
                 .build()
@@ -395,22 +442,22 @@ fn parallel_decryption_authenticates_multibuffer_payload_and_recovery() {
                             &mut output,
                             acquire,
                             release,
-                            |_| Ok(()),
+                            |_| {
+                                assert_eq!(held.get(), 0, "credits held during progress callback");
+                                Ok(())
+                            },
                         )
                         .unwrap();
                     assert_eq!(output.bytes, plaintext);
                     assert_eq!(held.get(), 0);
                     assert_eq!(&grants.borrow()[..8], &[0, 1, 2, 4, 6, 3, 0, 5]);
-                    // A cancellation while the lease is held must return all credits.
+                    // Progress cancellation must happen before any credit request.
                     assert_eq!(
                         decoder.decrypt_with_budget(
                             &mut Cursor::new(&bytes),
                             &mut std::io::sink(),
-                            |wanted| {
-                                held.set(wanted);
-                                wanted
-                            },
-                            release,
+                            |_| panic!("credits requested after cancellation"),
+                            |_| panic!("credits released without a request"),
                             |_| Err(Error::Cancelled)
                         ),
                         Err(Error::Cancelled)
