@@ -75,6 +75,8 @@ Options:
 
 The target architecture must match the architecture of the current Python process.
 
+On x64, setup also prepares the acceptance fixture generators under `.sunpack_test_tools/`: WinRAR 6.22, zstd 1.5.7, and [7-Zip-Zstandard 25.01 / Zstandard 1.5.7 Release 4](https://github.com/mcmilk/7-Zip-zstd/releases/tag/v25.01-v1.5.7-R4). The LZ4 writer is installed at `7zip-zstd/7z.exe` with its companion `7z.dll`; setup checks that it runs and exposes the LZ4 encoder. These tools are excluded from release packages. `-SkipAcceptanceTestTools` skips their preparation.
+
 ## USN Watch Broker
 
 watch uses the NTFS USN Journal to determine whether file contents have changed and whether a file has crossed a write boundary. Operations that need volume-level Journal access are concentrated in `native/sunpack_usn_core` and `native/sunpack_watch_broker`; Python only consumes file observation results and watch state.

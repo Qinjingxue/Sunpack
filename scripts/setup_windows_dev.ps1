@@ -379,6 +379,8 @@ function Ensure-AcceptanceTestTools {
     $requiredRarVersion = "6.22"
     $zstdRoot = Join-Path $testToolsRoot "zstd"
     $zstdPath = Join-Path $zstdRoot "zstd.exe"
+    $sevenZipZstdRoot = Join-Path $testToolsRoot "7zip-zstd"
+    $sevenZipZstdPath = Join-Path $sevenZipZstdRoot "7z.exe"
     New-Item -ItemType Directory -Path $testToolsRoot -Force | Out-Null
 
     $rarReady = (Test-Path -LiteralPath $rarPath) -and
@@ -387,7 +389,8 @@ function Ensure-AcceptanceTestTools {
         (Test-RarGeneratorVersion -FilePath $rarPath -RequiredVersion $requiredRarVersion)
     $zstdReady = (Test-Path -LiteralPath $zstdPath) -and
         (Test-CommandRuns -FilePath $zstdPath -Arguments @("--version"))
-    if ($rarReady -and $zstdReady) {
+    $sevenZipZstdReady = Test-SevenZipZstdGenerator -FilePath $sevenZipZstdPath
+    if ($rarReady -and $zstdReady -and $sevenZipZstdReady) {
         Write-Host "Acceptance archive generator tools are already present." -ForegroundColor Green
         return
     }
@@ -416,12 +419,16 @@ function Ensure-AcceptanceTestTools {
     } else {
         "ACB4E8111511749DC7A3EBEDCA9B04190E37A17AFEB73F55D4425DBF0B90FAD9"
     }
+    # Pin the independent LZ4 fixture writer; keep its companion codec DLL.
+    $sevenZipZstdInstallerUri = "https://github.com/mcmilk/7-Zip-zstd/releases/download/v25.01-v1.5.7-R4/7z25.01-zstd-x64.exe"
 
     $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("sunpack-test-tools-" + [guid]::NewGuid().ToString("N"))
     $rarInstallerPath = Join-Path $tempRoot "winrar-x64-installer.exe"
     $zstdArchivePath = Join-Path $tempRoot "zstd-win64.zip"
     $rarInstallRoot = Join-Path $tempRoot "winrar"
     $zstdExtractRoot = Join-Path $tempRoot "zstd"
+    $sevenZipZstdInstallerPath = Join-Path $tempRoot "7zip-zstd-x64.exe"
+    $sevenZipZstdExtractRoot = Join-Path $tempRoot "7zip-zstd"
     try {
         New-Item -ItemType Directory -Path $tempRoot -Force | Out-Null
 
@@ -477,6 +484,24 @@ function Ensure-AcceptanceTestTools {
             New-Item -ItemType Directory -Path $zstdRoot -Force | Out-Null
             Copy-Item -LiteralPath $zstdSource.FullName -Destination $zstdPath -Force
         }
+        if (-not $sevenZipZstdReady) {
+            Invoke-FileDownload `
+                -Uri $sevenZipZstdInstallerUri `
+                -DestinationPath $sevenZipZstdInstallerPath `
+                -Description "7-Zip-Zstandard x64 LZ4 test generator"
+
+            $sevenZipPath = Join-Path $ToolsRoot "7z.exe"
+            Assert-PathExists -LiteralPath $sevenZipPath -Description "7-Zip extractor for acceptance test tools"
+            Assert-PathExists -LiteralPath (Join-Path $ToolsRoot "7z.dll") -Description "7-Zip CLI companion DLL for acceptance test tools"
+            Invoke-Native -FilePath $sevenZipPath -Arguments @(
+                "x", $sevenZipZstdInstallerPath, ("-o" + $sevenZipZstdExtractRoot), "-y"
+            )
+            if (-not (Test-SevenZipZstdGenerator -FilePath (Join-Path $sevenZipZstdExtractRoot "7z.exe"))) {
+                throw "Downloaded 7-Zip-Zstandard installer does not contain a working LZ4 fixture writer."
+            }
+            Remove-IfExists -LiteralPath $sevenZipZstdRoot
+            Move-Item -LiteralPath $sevenZipZstdExtractRoot -Destination $sevenZipZstdRoot
+        }
     } finally {
         Remove-IfExists -LiteralPath $tempRoot
     }
@@ -491,7 +516,10 @@ function Ensure-AcceptanceTestTools {
         -not (Test-CommandRuns -FilePath $zstdPath -Arguments @("--version"))) {
         throw "Acceptance zstd generator installation is incomplete under $zstdRoot"
     }
-    Write-Host "Acceptance archive generator tools are ready: $rarPath, $zstdPath" -ForegroundColor Green
+    if (-not (Test-SevenZipZstdGenerator -FilePath $sevenZipZstdPath)) {
+        throw "Acceptance 7-Zip-Zstandard generator installation is incomplete under $sevenZipZstdRoot"
+    }
+    Write-Host "Acceptance archive generator tools are ready: $rarPath, $zstdPath, $sevenZipZstdPath" -ForegroundColor Green
 }
 
 function Invoke-Native {
@@ -548,6 +576,21 @@ function Test-CommandRuns {
     try {
         & $FilePath @Arguments *> $null
         return ($LASTEXITCODE -eq 0)
+    } catch {
+        return $false
+    }
+}
+
+function Test-SevenZipZstdGenerator {
+    param([Parameter(Mandatory = $true)][string]$FilePath)
+
+    if (-not (Test-Path -LiteralPath $FilePath -PathType Leaf) -or
+        -not (Test-Path -LiteralPath (Join-Path (Split-Path -Parent $FilePath) "7z.dll") -PathType Leaf)) {
+        return $false
+    }
+    try {
+        $output = (& $FilePath "i" 2>&1 | Out-String)
+        return ($LASTEXITCODE -eq 0 -and $output -match '(?m)^\s*\d+\s+ED\s+\S+\s+LZ4\s*$')
     } catch {
         return $false
     }

@@ -75,6 +75,8 @@ uv sync --locked --extra dev
 
 目标架构必须与当前 Python 进程架构一致。
 
+x64 环境还会在 `.sunpack_test_tools/` 下准备验收测试的压缩包生成器：WinRAR 6.22、zstd 1.5.7 和 [7-Zip-Zstandard 25.01 / Zstandard 1.5.7 Release 4](https://github.com/mcmilk/7-Zip-zstd/releases/tag/v25.01-v1.5.7-R4)。LZ4 生成器安装在 `7zip-zstd/7z.exe`，同时保留配套的 `7z.dll`；脚本检查工具能够运行并提供 LZ4 编码器。这些工具不进入发行包。`-SkipAcceptanceTestTools` 会跳过它们的准备。
+
 ## USN Watch Broker
 
 watch 使用 NTFS USN Journal 判断文件内容变化和文件是否已经跨过写入边界。需要访问卷级 Journal 的操作集中在 `native/sunpack_usn_core` 和 `native/sunpack_watch_broker`，Python 只消费文件观察结果和 watch 状态。
