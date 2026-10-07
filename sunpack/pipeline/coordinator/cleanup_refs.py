@@ -38,8 +38,7 @@ class ReleaseOutcome:
     released: tuple[str, ...] = ()
     #: Paths actually deleted while serving this release.
     deleted: tuple[str, ...] = ()
-    #: Cleanup failures, forwarded to ``summary.cleanup_results`` so the
-    #: request-level retry pass can pick them up.
+    #: Cleanup failures, forwarded to ``summary.cleanup_results`` for reporting.
     failed: tuple[ArchiveCleanupResult, ...] = ()
     #: Orchestration error, for example a promotion barrier timeout.
     error: str = ""

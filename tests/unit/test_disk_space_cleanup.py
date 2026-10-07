@@ -141,8 +141,7 @@ def test_source_cleanup_reports_external_lock_without_timed_retry(tmp_path, monk
 
     assert calls == [str(source)]
     assert len(outcome.failed) == 1
-    assert outcome.failed[0].attempts == 1
-    assert outcome.failed[0].retryable is True
+    assert outcome.failed[0].error_code == 32
     assert tuple(scope._context.cleanup_results) == outcome.failed
     assert source.exists()
 
@@ -215,8 +214,8 @@ def test_source_cleanup_reports_each_failure_once(tmp_path, monkeypatch):
     scope.register([task])
     outcome = _release_and_apply(scope, task, OutcomeKind.COMPLETE_SUCCESS)
 
-    failures = {item.path: (item.error_code, item.attempts) for item in outcome.failed}
-    assert failures == {str(inaccessible): (5, 1), str(busy): (32, 1)}
+    failures = {item.path: item.error_code for item in outcome.failed}
+    assert failures == {str(inaccessible): 5, str(busy): 32}
     assert tuple(scope._context.cleanup_results) == outcome.failed
     assert sorted(calls) == sorted([str(inaccessible), str(busy)])
     assert inaccessible.exists()
@@ -254,7 +253,7 @@ def test_unexpected_source_cleanup_error_reaches_summary_for_each_volume(tmp_pat
     assert all(path.exists() for path in paths)
 
 
-def test_source_cleanup_stops_retrying_nonretryable_failure(tmp_path, monkeypatch):
+def test_source_cleanup_reports_access_denied_once(tmp_path, monkeypatch):
     source = tmp_path / "denied.zip"
     source.write_text("payload")
     calls = []
@@ -273,7 +272,6 @@ def test_source_cleanup_stops_retrying_nonretryable_failure(tmp_path, monkeypatc
     assert calls == [str(source)]
     assert len(outcome.failed) == 1
     assert outcome.failed[0].error_code == 5
-    assert outcome.failed[0].attempts == 1
 
 
 def test_keep_mode_never_enters_source_promotion_barrier(tmp_path, monkeypatch):
@@ -328,12 +326,10 @@ def test_cleanup_result_public_schema_is_stable():
         "failed",
         error_code=32,
     )
-    assert result.retryable
     assert set(asdict(result)) == {
         "path",
         "mode",
         "status",
-        "attempts",
         "error_code",
         "message",
     }

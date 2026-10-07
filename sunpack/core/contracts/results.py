@@ -17,13 +17,8 @@ class ArchiveCleanupResult:
     path: str
     mode: str
     status: str
-    attempts: int = 1
     error_code: int = 0
     message: str = ""
-
-    @property
-    def retryable(self) -> bool:
-        return self.status == "failed" and self.error_code in {32, 33}
 
 
 @dataclass(frozen=True)

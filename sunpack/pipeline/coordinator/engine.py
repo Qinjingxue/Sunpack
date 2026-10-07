@@ -842,7 +842,7 @@ class _SourceCleanup:
         # A sharing violation left after it belongs to another process, so it
         # is reported with the result instead of being retried on a timer.
         pending = tuple(request.cleanup_paths)
-        outcome = await self._apply_once(
+        outcome = await self._run_cleanup(
             ReleaseRequest(
                 task_key=request.task_key,
                 paths=pending,
@@ -850,7 +850,6 @@ class _SourceCleanup:
             ),
             broker=broker,
             cancellation=cancellation,
-            previous={},
         )
         if outcome.failed:
             with self._context.lock:
@@ -866,13 +865,12 @@ class _SourceCleanup:
             error=outcome.error,
         )
 
-    async def _apply_once(
+    async def _run_cleanup(
         self,
         request,
         *,
         broker,
         cancellation=None,
-        previous: dict[str, ArchiveCleanupResult] | None = None,
     ):
         from sunpack.pipeline.coordinator.cleanup_refs import ReleaseOutcome
         from sunpack.core.support.archive_sessions import release_archive_sessions_under_roots
@@ -881,8 +879,6 @@ class _SourceCleanup:
             ResourceLifecycleError,
             promotion_barrier,
         )
-
-        previous = previous or {}
 
         def run_cleanup():
             existing = [path for path in request.paths if os.path.exists(path)]
@@ -893,7 +889,7 @@ class _SourceCleanup:
                     if self._mode() == "keep":
                         cleanup = ArchiveCleanup("keep", self._config.get("cli", {}).get("language", "en"))
                         results.extend(cleanup.cleanup_success_archives(
-                            [[path] for path in existing], previous=previous,
+                            [[path] for path in existing],
                         ))
                     else:
                         actions = self._factory(self._config, stdout=None)
@@ -905,7 +901,6 @@ class _SourceCleanup:
                             results.extend(actions.apply(
                                 archives_to_clean=[[path] for path in existing],
                                 flatten_targets=[],
-                                previous_cleanup=previous,
                             ))
                 except (ResourceBusyError, ResourceLifecycleError) as exc:
                     error = str(exc)
@@ -915,9 +910,6 @@ class _SourceCleanup:
                             path,
                             self._mode(),
                             "failed",
-                            previous.get(path_key(path)).attempts + 1
-                            if path_key(path) in previous
-                            else 1,
                             code or 32,
                             f"cleanup barrier unavailable: {exc}",
                         )
@@ -929,9 +921,6 @@ class _SourceCleanup:
                     path,
                     self._mode(),
                     "missing",
-                    previous.get(path_key(path)).attempts + 1
-                    if path_key(path) in previous
-                    else 1,
                 )
                 for path in request.paths
                 if path_key(path) not in seen
@@ -962,7 +951,6 @@ class _SourceCleanup:
                 task_key=request.task_key, released=request.paths, error=str(exc),
                 failed=tuple(ArchiveCleanupResult(
                     path, self._mode(), "failed",
-                    previous[path_key(path)].attempts + 1 if path_key(path) in previous else 1,
                     int(getattr(exc, "winerror", 0) or 0), str(exc),
                 ) for path in request.paths),
             )

@@ -1851,16 +1851,11 @@ class WatchScheduler:
                 {
                     "path": item.path,
                     "status": item.status,
-                    "attempts": item.attempts,
                     "error_code": item.error_code,
                     "message": item.message,
                 }
                 for item in response.summary.cleanup_results
             ],
-            retry_count=sum(
-                max(0, item.attempts - 1)
-                for item in response.summary.cleanup_results
-            ),
         )
         if cleanup_failed:
             self._notify(

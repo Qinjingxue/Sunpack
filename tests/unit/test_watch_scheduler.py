@@ -99,7 +99,9 @@ def test_existing_watch_success_notification_includes_postprocess_warning(tmp_pa
         state_path=str(tmp_path / "state.json"), initial_scan=False,
     )
     notices = []
+    log_events = []
     watcher._notify = lambda *args: notices.append(args)
+    monkeypatch.setattr(watcher.log, "write", lambda event, **fields: log_events.append((event, fields)))
 
     async def scenario():
         async def complete():
@@ -114,6 +116,10 @@ def test_existing_watch_success_notification_includes_postprocess_warning(tmp_pa
     assert notices[-1][0] == "succeeded"
     assert notices[-1][2] == [output]
     assert notices[-1][3] == [watcher.i18n.t("cleanup.incomplete", count=1)]
+    cleanup_log = next(fields for event, fields in log_events if event == "cleanup")
+    assert "retry_count" not in cleanup_log
+    assert "attempts" not in cleanup_log["results"][0]
+    assert cleanup_log["results"][0]["message"] == "postprocess failed"
 
 
 def test_usn_metadata_reason_does_not_count_as_content_change():

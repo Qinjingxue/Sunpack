@@ -24,44 +24,40 @@ class ArchiveCleanup:
     def cleanup_success_archives(
         self,
         archives_to_clean: Iterable[Iterable[str]],
-        previous: dict[str, ArchiveCleanupResult] | None = None,
     ) -> list[ArchiveCleanupResult]:
         unique_paths = {}
         for parts in archives_to_clean:
             for path in parts:
                 unique_paths.setdefault(_path_key(path), os.path.normpath(path))
         paths = list(unique_paths.values())
-        if previous is None:
-            self._print(self.i18n.t("cleanup.keep_done" if self.mode == "keep" else "cleanup.start"))
-            if not paths:
-                self._print(self.i18n.t("cleanup.none"))
+        self._print(self.i18n.t("cleanup.keep_done" if self.mode == "keep" else "cleanup.start"))
+        if not paths:
+            self._print(self.i18n.t("cleanup.none"))
         results: list[ArchiveCleanupResult] = []
-        pending: list[tuple[str, int]] = []
+        pending: list[str] = []
         for path in paths:
-            prior = (previous or {}).get(_path_key(path))
-            attempts = prior.attempts + 1 if prior else 1
             if self.mode == "keep":
-                results.append(ArchiveCleanupResult(path, self.mode, "kept", attempts))
+                results.append(ArchiveCleanupResult(path, self.mode, "kept"))
                 continue
             if not os.path.exists(path):
-                results.append(ArchiveCleanupResult(path, self.mode, "missing", attempts))
+                results.append(ArchiveCleanupResult(path, self.mode, "missing"))
                 continue
             self._print(self.i18n.t("cleanup.delete" if self.mode == "delete" else "cleanup.recycle",
                                     reason=self.i18n.t("cleanup.label"), filename=os.path.basename(path)))
-            pending.append((path, attempts))
+            pending.append(path)
         if self.mode == "delete":
             try:
-                native_results = list(_native_delete_files_batch([item[0] for item in pending]))
+                native_results = list(_native_delete_files_batch(pending))
             except Exception as exc:
                 code = int(getattr(exc, "winerror", 0) or 0)
                 return [
                     *results,
                     *(
-                        ArchiveCleanupResult(path, self.mode, "failed", attempts, code, str(exc))
-                        for path, attempts in pending
+                        ArchiveCleanupResult(path, self.mode, "failed", code, str(exc))
+                        for path in pending
                     ),
                 ]
-            for index, (path, attempts) in enumerate(pending):
+            for index, path in enumerate(pending):
                 item = native_results[index] if index < len(native_results) else {
                     "status": "error",
                     "error": "Native cleanup returned no result",
@@ -69,18 +65,18 @@ class ArchiveCleanup:
                 }
                 native_status = str(item.get("status") or "error")
                 status = native_status if native_status in {"deleted", "missing"} else "failed"
-                results.append(ArchiveCleanupResult(path, self.mode, status, attempts,
+                results.append(ArchiveCleanupResult(path, self.mode, status,
                                                    int(item.get("error_code") or 0),
                                                    str(item.get("error") or "")))
         else:
-            for path, attempts in pending:
+            for path in pending:
                 try:
                     send2trash(path)
-                    results.append(ArchiveCleanupResult(path, self.mode, "recycled", attempts))
+                    results.append(ArchiveCleanupResult(path, self.mode, "recycled"))
                 except Exception as exc:
                     code = int(getattr(exc, "winerror", 0) or 0)
                     if not code:
                         code = int(getattr(exc, "hresult", 0) or 0) & 0xFFFF
-                    results.append(ArchiveCleanupResult(path, self.mode, "failed", attempts,
+                    results.append(ArchiveCleanupResult(path, self.mode, "failed",
                                                        code, str(exc)))
         return results

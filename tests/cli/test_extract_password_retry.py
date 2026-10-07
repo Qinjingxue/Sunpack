@@ -60,6 +60,8 @@ def test_existing_cli_json_includes_postprocess_failure(tmp_path, monkeypatch, m
     assert serialized["summary"]["cleanup_results"][0]["mode"] == mode
     assert serialized["summary"]["cleanup_results"][0]["path"] == warning.path
     assert serialized["summary"]["cleanup_results"][0]["message"] == warning.message
+    assert "attempts" not in serialized["summary"]["cleanup_results"][0]
+    assert "cleanup_retry_count" not in serialized["summary"]
 
 
 def test_extract_config_combines_clipboard_passwords_for_engine():

@@ -37,7 +37,7 @@
   - [Architecture at a glance](#architecture-at-a-glance)
   - [Testing](#testing)
   - [Reproducible worker vs. 7-Zip benchmark](#reproducible-worker-vs-7-zip-benchmark)
-- [Notice](#notice)
+- [Known Issue](#Known-Issue)
 - [Contributing](#contributing)
 - [License](#license)
 
@@ -244,6 +244,10 @@ followed by the same metrics for `7z.exe`. The raw full-matrix report is
 | ZST              | 104.599          | 181.936            | 0.575      | 23.039                | 9.789                   | 2.354     |
 
 ---
+
+## Known Issue
+
+- When SunPack monitors a download directory, some downloaders may perform final file verification relatively slowly. SunPack may finish processing the archive and clean up the source files before the downloader completes its verification, causing the downloader to consider the source files corrupted and retry the download or report an error.
 
 ## Contributing
 
