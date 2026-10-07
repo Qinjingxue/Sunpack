@@ -15,12 +15,14 @@ name = "decrypt"
 path = "../../benchmarks/native/enc_decrypt.rs"
 
 [features]
-parallel-kdf = ["argon2/parallel"]
+parallel-kdf = ["dep:rayon"]
 parallel-decrypt = ["dep:rayon"]
 
 [dependencies]
 aes = "0.8"
-argon2 = { version = "0.6", default-features = false, features = ["alloc"] }
+# Pin the low-level SIMD API used by the shared-executor adapter. The library's
+# own per-hash helper-thread pool is disabled in both worker and Python builds.
+argon2-rust = { version = "=1.1.0", default-features = false, features = ["std", "internal-api"] }
 blake3 = "1.8"
 blowfish = "0.9"
 cipher = "0.4"
@@ -35,6 +37,5 @@ serpent = "0.6"
 sha3 = "0.10"
 skein = "0.1"
 threefish = "0.5"
-twofish = "0.7"
 crc32fast = "1.4"
 zeroize = { version = "1.8", features = ["derive"] }

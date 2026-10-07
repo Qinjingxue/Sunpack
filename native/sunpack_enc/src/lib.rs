@@ -2,8 +2,13 @@
 //! This is the sole container parser, shared by discovery and the 7-Zip adapter.
 mod cipher;
 mod ffi;
+mod kdf;
 
-use argon2::{Algorithm, Argon2, Block, Params, Version};
+use argon2_rust::{
+    __internal::{secure_wipe_blocks, Block},
+    params::{Memory, TagLen},
+    Params,
+};
 use hkdf::Hkdf;
 use sha3::Sha3_512;
 use skein::{consts::U128, Skein1024};
@@ -59,13 +64,14 @@ impl Header {
         })
     }
     fn params(&self) -> Result<Params> {
-        Params::new(
-            10240 << (self.bytes[7] >> 4),
-            10 << (self.bytes[7] & 15),
-            4,
-            Some(256),
-        )
-        .map_err(|_| Error::Format)
+        Params::builder()
+            .memory(Memory::kib(10240 << (self.bytes[7] >> 4)))
+            .passes(10 << (self.bytes[7] & 15))
+            .lanes(4)
+            .threads(1)
+            .tag_len(TagLen::bytes(256))
+            .build()
+            .map_err(|_| Error::Format)
     }
     fn dimensions(&self) -> (usize, usize) {
         match self.bytes[6] {
@@ -92,6 +98,11 @@ pub struct Workspace {
     #[cfg(test)]
     kdf_runs: usize,
 }
+impl Drop for Workspace {
+    fn drop(&mut self) {
+        secure_wipe_blocks(&mut self.memory);
+    }
+}
 impl Workspace {
     fn derive(&mut self, header: &Header, password: &[u16]) -> Result<Keys> {
         let normalized = normalize_password(password);
@@ -100,9 +111,10 @@ impl Workspace {
             .expand(b"memoryInfo", &mut *master)
             .map_err(|_| Error::Format)?;
         let params = header.params()?;
-        let count = params.block_count();
+        let count = params.memory_blocks() as usize;
         if count != self.memory.len() {
             // The KDF, not candidate count or archive size, determines this bounded allocation.
+            secure_wipe_blocks(&mut self.memory);
             self.memory.clear();
             self.memory
                 .try_reserve_exact(count)
@@ -114,14 +126,14 @@ impl Workspace {
         {
             self.kdf_runs += 1;
         }
-        Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
-            .hash_password_into_with_memory(
-                &*master,
-                &header.bytes[8..40],
-                &mut *derived,
-                &mut self.memory,
-            )
-            .map_err(|_| Error::Format)?;
+        kdf::derive(
+            &params,
+            &*master,
+            header.bytes[8..40].try_into().unwrap(),
+            &mut *derived,
+            &mut self.memory,
+        )
+        .map_err(|_| Error::Format)?;
         let (key_size, nonce_size) = header.dimensions();
         let mut keys = Keys {
             key: vec![0; key_size],
@@ -198,7 +210,7 @@ impl PasswordProbe {
         Ok(Self { header, quick })
     }
     pub fn workspace_bytes(&self) -> usize {
-        self.header.params().unwrap().block_count() * std::mem::size_of::<Block>()
+        self.header.params().unwrap().memory_blocks() as usize * std::mem::size_of::<Block>()
     }
     pub fn matches(&self, password: &[u16], workspace: &mut Workspace) -> Result<bool> {
         match self.keys(password, workspace) {

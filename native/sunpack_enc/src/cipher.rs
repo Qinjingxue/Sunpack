@@ -6,6 +6,8 @@ use cipher5::{
     BlockCipherEncrypt, KeyInit as KeyInit5,
 };
 use zeroize::{Zeroize, ZeroizeOnDrop};
+#[path = "twofish.rs"]
+mod twofish;
 
 type Rc6 = rc6::RC6<u32, U20, U32>;
 enum Primitive {
@@ -38,10 +40,7 @@ impl Primitive {
                 Self::Blowfish(blowfish::Blowfish::new_from_slice(key).unwrap()),
                 8,
             ),
-            4 => (
-                Self::Twofish(twofish::Twofish::new_from_slice(key).unwrap()),
-                16,
-            ),
+            4 => (Self::Twofish(twofish::Twofish::new(key)), 16),
             5 => {
                 let mut k: [u8; 32] = key.try_into().unwrap();
                 for word in k.chunks_exact_mut(4) {
@@ -77,7 +76,7 @@ impl Primitive {
                 }
             }
             Self::Blowfish(c) => batch(c, bytes, false),
-            Self::Twofish(c) => batch(c, bytes, false),
+            Self::Twofish(c) => c.encrypt(bytes),
             Self::Gost(c) => batch(c, bytes, true),
             Self::Threefish(c) => batch(c, bytes, false),
             Self::Rc6(c) => {

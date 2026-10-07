@@ -86,6 +86,7 @@ tests/real/error_records
 .sunpack_bench_inspect
 /benchmarks/.cache/
 /benchmarks/.work/
+/benchmarks/native/enc_kdf_compare/target/
 /.cache/
 
 /benchmarks/.starvation/

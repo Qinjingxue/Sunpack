@@ -96,3 +96,13 @@ the BSD 2-Clause license. The full notice is distributed at
 [licenses/lz4-license.txt](licenses/lz4-license.txt).
 
 Source: https://github.com/lz4/lz4/tree/v1.10.0/lib
+
+## RustCrypto Twofish
+
+The Twofish-256 key schedule and q permutations in
+`native/sunpack_enc/src/twofish.rs` are adapted from RustCrypto twofish 0.7.1
+by Alexander Krotov (2017), under the MIT license. SunPack expands the keyed
+S-box/MDS tables during key setup and shares them across CTR tasks.
+The full notice is distributed at [licenses/twofish-license.txt](licenses/twofish-license.txt).
+
+Source: https://github.com/RustCrypto/block-ciphers/tree/twofish-v0.7.1/twofish
