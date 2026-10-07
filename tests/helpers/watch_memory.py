@@ -278,61 +278,6 @@ def _reader_stats() -> dict[str, Any]:
         return {}
 
 
-def _relation_password_cache_stats() -> dict[str, int]:
-    try:
-        from sunpack.core.passwords import relation_prober
-
-        cache = relation_prober._RELATION_PROBE_CACHE
-        if cache is None:
-            return {"successes": 0, "negative": 0}
-        with cache._lock:
-            return {
-                "successes": len(cache._successes),
-                "negative": len(cache._negative),
-            }
-    except (ImportError, AttributeError, TypeError):
-        return {}
-
-
-def _native_worker_stats(engine: PipelineEngine | None) -> dict[str, Any]:
-    """Observe the single native worker and its native-owned job lifecycle."""
-
-    try:
-        services = getattr(engine, "_services", None)
-        runner = getattr(services, "sevenzip_runner", None)
-        holder = getattr(runner, "_worker_holder", None)
-        if holder is None:
-            return {}
-        with holder._lock:
-            worker = holder._worker
-            if worker is None:
-                return {"worker_alive": False, "closed": bool(holder._closed)}
-            with worker._dispatch_lock:
-                states = [dict(state) for state in worker._job_states.values()]
-            return {
-                "worker_alive": bool(worker.is_alive()),
-                "worker_epoch": worker.worker_epoch,
-                "active_jobs": len(states),
-                "job_states": sorted(state.get("state", "") for state in states),
-                "closed": bool(holder._closed),
-            }
-    except (AttributeError, TypeError, ValueError):
-        return {}
-
-
-def _known_cache_stats(engine: PipelineEngine | None) -> dict[str, Any]:
-    """Collect counters for caches that are explicit in the implementation."""
-
-    return {
-        "global": _cache_stats(),
-        "reader": _reader_stats(),
-        "projection": _projection_stats(),
-        "archive_sessions": _archive_session_count(),
-        "relation_password": _relation_password_cache_stats(),
-        "native_worker": _native_worker_stats(engine),
-    }
-
-
 def _state_stats(watcher: WatchScheduler, state_path: Path) -> dict[str, Any]:
     state = watcher.state
     result = {
@@ -409,7 +354,6 @@ class WatchMemorySample:
     reader: dict[str, Any] = field(default_factory=dict)
     global_cache: dict[str, Any] = field(default_factory=dict)
     archive_sessions: int = 0
-    known_caches: dict[str, Any] = field(default_factory=dict)
     watch_state: dict[str, Any] = field(default_factory=dict)
     engine: dict[str, Any] = field(default_factory=dict)
     python_traced_mib: float = 0.0
@@ -528,7 +472,6 @@ class WatchMemorySampler:
             reader=_reader_stats(),
             global_cache=_cache_stats(),
             archive_sessions=_archive_session_count(),
-            known_caches=_known_cache_stats(self.engine),
             watch_state=state,
             engine=_engine_stats(self.engine),
             python_traced_mib=round(_mib(traced), 3),
@@ -669,19 +612,17 @@ def summarize_watch_memory(rows: list[WatchMemorySample]) -> dict[str, Any]:
     ]
 
     def checkpoint_row(row: WatchMemorySample) -> dict[str, Any]:
-        global_cache = row.known_caches.get("global", {})
-        reader = row.known_caches.get("reader", {})
         return {
             "label": row.label,
             "files_seen": row.files_seen,
             "completed_files": row.completed_files,
             "parent_rss_mib": row.parent_rss_mib,
             "worker_rss_mib": row.worker_rss_mib,
-            "global_cache_entries": global_cache.get("entries", 0),
-            "global_cache_namespaces": global_cache.get("namespaces", {}),
-            "reader_cache_entries": reader.get("cache_entries", 0),
-            "reader_cache_bytes": int(reader.get("hot_cache_bytes", 0) or 0)
-            + int(reader.get("general_cache_bytes", 0) or 0),
+            "global_cache_entries": row.global_cache.get("entries", 0),
+            "global_cache_namespaces": row.global_cache.get("namespaces", {}),
+            "reader_cache_entries": row.reader.get("cache_entries", 0),
+            "reader_cache_bytes": int(row.reader.get("hot_cache_bytes", 0) or 0)
+            + int(row.reader.get("general_cache_bytes", 0) or 0),
             "archive_sessions": row.archive_sessions,
             "watch_state": row.watch_state,
             "engine": row.engine,
@@ -729,7 +670,6 @@ def summarize_watch_memory(rows: list[WatchMemorySample]) -> dict[str, Any]:
         "reader_final": final.reader,
         "global_cache_final": final.global_cache,
         "archive_sessions_final": final.archive_sessions,
-        "known_caches_final": final.known_caches,
         "checkpoint_series": [checkpoint_row(row) for row in checkpoints],
         "watch_state_final": final.watch_state,
         "engine_final": final.engine,
