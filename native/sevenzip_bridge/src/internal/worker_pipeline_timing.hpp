@@ -38,6 +38,7 @@ enum class PipelinePreparePhase : unsigned char
 };
 
 bool pipeline_timing_enabled() noexcept;
+PipelineTiming *current_pipeline_timing() noexcept;
 
 class PipelineTiming final
 {
@@ -74,6 +75,19 @@ private:
     std::array<unsigned long long, 8> mask_ns_{};
     std::array<unsigned long long, 9> prepare_ns_{};
     unsigned long long compute_cpu_ns_ = 0;
+};
+
+class PipelineTimingContextScope final
+{
+public:
+    explicit PipelineTimingContextScope(PipelineTiming *timing) noexcept;
+    ~PipelineTimingContextScope() noexcept;
+
+    PipelineTimingContextScope(const PipelineTimingContextScope &) = delete;
+    PipelineTimingContextScope &operator=(const PipelineTimingContextScope &) = delete;
+
+private:
+    PipelineTiming *previous_ = nullptr;
 };
 
 class PipelineStageScope final

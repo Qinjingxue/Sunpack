@@ -1355,6 +1355,10 @@ namespace sunpack::sevenzip
             {
                 std::lock_guard<std::mutex> io_lock(buffer->io_mutex);
                 const auto file = buffer->file;
+#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+                if (file && file->job->pipeline_timing)
+                    file->job->pipeline_timing->end(PipelineStage::Output);
+#endif
                 end_data_write(file);
                 if (error != ERROR_SUCCESS)
                     result = classify_data_failure(file, error);
@@ -1628,7 +1632,7 @@ namespace sunpack::sevenzip
             const auto chunk = max_write_chunk_.load(std::memory_order_relaxed);
             if (chunk && size > chunk) size = chunk;
 #ifdef SUP7Z_ENABLE_PIPELINE_TIMING
-            PipelineStageScope pipeline_scope(job->pipeline_timing, PipelineStage::Output);
+            if (job->pipeline_timing) job->pipeline_timing->begin(PipelineStage::Output);
 #endif
 #ifdef SUP7Z_ENABLE_WRITER_PROBE
             WriterProbeSpan probe_writefile(job->probe, WriterProbePhase::WriteFile);
@@ -1638,6 +1642,9 @@ namespace sunpack::sevenzip
             const DWORD error = started ? ERROR_SUCCESS : GetLastError();
             if (!started && error != ERROR_IO_PENDING)
             {
+#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+                if (job->pipeline_timing) job->pipeline_timing->end(PipelineStage::Output);
+#endif
                 end_data_write(file);
                 return classify_data_failure(file, error);
             }

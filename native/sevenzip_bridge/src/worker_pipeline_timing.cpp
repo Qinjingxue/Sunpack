@@ -11,6 +11,8 @@ namespace sunpack::sevenzip
 namespace
 {
 
+thread_local PipelineTiming *g_current_pipeline_timing = nullptr;
+
 unsigned long long elapsed_ns(PipelineTiming::Clock::time_point start,
                               PipelineTiming::Clock::time_point end) noexcept
 {
@@ -38,6 +40,22 @@ bool pipeline_timing_enabled() noexcept
         return value && value[0] == '1';
     }();
     return enabled;
+}
+
+PipelineTiming *current_pipeline_timing() noexcept
+{
+    return g_current_pipeline_timing;
+}
+
+PipelineTimingContextScope::PipelineTimingContextScope(PipelineTiming *timing) noexcept
+    : previous_(g_current_pipeline_timing)
+{
+    g_current_pipeline_timing = timing;
+}
+
+PipelineTimingContextScope::~PipelineTimingContextScope() noexcept
+{
+    g_current_pipeline_timing = previous_;
 }
 
 void PipelineTiming::start_pipeline() noexcept

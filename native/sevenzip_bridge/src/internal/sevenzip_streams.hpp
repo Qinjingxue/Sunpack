@@ -110,6 +110,11 @@ namespace sunpack::sevenzip
                 character = static_cast<wchar_t>(character - L'A' + L'a');
             }
         }
+        if ((normalized == L"lz4" || normalized == L"tar.lz4") &&
+            std::getenv("SUNPACK_SEVENZIP_PREFETCH") == nullptr)
+        {
+            config.enabled = false;
+        }
 
         if (normalized == L"tar" ||
             (native_volume_input &&

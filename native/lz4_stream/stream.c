@@ -19,6 +19,9 @@ typedef struct {
     sup_lz4_write write;
     sup_lz4_dictionary dictionary;
     sup_lz4_progress progress;
+#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+    sup_lz4_timing_hook compute_begin, compute_end;
+#endif
     sup_lz4_result *result;
     unsigned char *input, *output;
     size_t pos, size;
@@ -143,8 +146,14 @@ static int modern(stream *s) {
         rc = need(s, 1);
         if (rc) goto done;
         source_size = s->size-s->pos;
+#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+        if (s->compute_begin) s->compute_begin(s->opaque);
+#endif
         hint = LZ4F_decompress_usingDict(ctx, s->output, &dst_size,
             s->input+s->pos, &source_size, dict, dict_size, NULL);
+#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+        if (s->compute_end) s->compute_end(s->opaque);
+#endif
         if (LZ4F_isError(hint)) {
             rc = library_error(hint);
             /* A frame can reference an external dictionary without a Dict-ID.
@@ -187,7 +196,13 @@ static int legacy(stream *s) {
         consume(s, 4);
         rc = exact(s, input, size);
         if (rc) goto done;
+#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+        if (s->compute_begin) s->compute_begin(s->opaque);
+#endif
         decoded = LZ4_decompress_safe((const char *)input, (char *)output, (int)size, LEGACY_SIZE);
+#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+        if (s->compute_end) s->compute_end(s->opaque);
+#endif
         if (decoded < 0) { rc = SUP_LZ4_DATA; goto done; }
         rc = emit(s, output, (size_t)decoded);
         if (rc) goto done;
@@ -198,15 +213,27 @@ done:
     free(input); free(output);
     return rc;
 }
+#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+int sup_lz4_decode_profiled(void *opaque, sup_lz4_read read, sup_lz4_skip skip,
+    sup_lz4_write write, sup_lz4_dictionary dictionary,
+    sup_lz4_progress progress, sup_lz4_timing_hook compute_begin,
+    sup_lz4_timing_hook compute_end, sup_lz4_result *result) {
+#else
 int sup_lz4_decode(void *opaque, sup_lz4_read read, sup_lz4_skip skip,
     sup_lz4_write write, sup_lz4_dictionary dictionary,
     sup_lz4_progress progress, sup_lz4_result *result) {
+#endif
     stream s;
     int rc = SUP_LZ4_OK;
     memset(result, 0, sizeof(*result));
     memset(&s, 0, sizeof(s));
     s.opaque=opaque; s.read=read; s.skip=skip; s.write=write;
-    s.dictionary=dictionary; s.progress=progress; s.result=result;
+    s.dictionary=dictionary; s.progress=progress;
+#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+    s.compute_begin=compute_begin; s.compute_end=compute_end; s.result=result;
+#else
+    s.result=result;
+#endif
     s.input=(unsigned char *)malloc(BUFFER_SIZE);
     s.output=(unsigned char *)malloc(BUFFER_SIZE);
     if (!s.input || !s.output) { rc=SUP_LZ4_MEMORY; goto done; }
@@ -236,3 +263,11 @@ done:
     result->error=rc;
     return rc;
 }
+#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+int sup_lz4_decode(void *opaque, sup_lz4_read read, sup_lz4_skip skip,
+    sup_lz4_write write, sup_lz4_dictionary dictionary,
+    sup_lz4_progress progress, sup_lz4_result *result) {
+    return sup_lz4_decode_profiled(opaque, read, skip, write, dictionary,
+        progress, NULL, NULL, result);
+}
+#endif

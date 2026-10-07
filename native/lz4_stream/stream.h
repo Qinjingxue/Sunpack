@@ -30,6 +30,13 @@ typedef int (*sup_lz4_progress)(void *, uint64_t, uint64_t);
 int sup_lz4_decode(void *opaque, sup_lz4_read read, sup_lz4_skip skip,
     sup_lz4_write write, sup_lz4_dictionary dictionary,
     sup_lz4_progress progress, sup_lz4_result *result);
+#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+typedef void (*sup_lz4_timing_hook)(void *);
+int sup_lz4_decode_profiled(void *opaque, sup_lz4_read read, sup_lz4_skip skip,
+    sup_lz4_write write, sup_lz4_dictionary dictionary,
+    sup_lz4_progress progress, sup_lz4_timing_hook compute_begin,
+    sup_lz4_timing_hook compute_end, sup_lz4_result *result);
+#endif
 
 #ifdef __cplusplus
 }

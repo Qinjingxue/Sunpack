@@ -30,6 +30,8 @@ uv run --locked python -m benchmarks extraction format-matrix --runs 5 --json-ou
 uv run --locked python -m benchmarks extraction cli-format-matrix --runs 3 --prefetch on --json-out benchmarks/results/cli-format-matrix-prefetch-on.json
 uv run --locked python -m benchmarks extraction cli-format-matrix --format zipx --format lz4 --runs 3 --prefetch on --json-out benchmarks/results/cli-zipx-lz4-prefetch-on.json
 uv run --locked python -m benchmarks extraction cli-format-matrix --format zipx --format lz4 --runs 3 --prefetch off --json-out benchmarks/results/cli-zipx-lz4-prefetch-off.json
+cmake --build native/sevenzip_bridge/build-probe --config Release --target sunpack_sevenzip_worker
+uv run --locked python -m benchmarks extraction lz4-io-overlap --worker-path native/sevenzip_bridge/build-probe/Release/sunpack_sevenzip_worker.exe --prefetch compare --runs 5 --json-out benchmarks/results/lz4-io-overlap.json
 uv run --locked python -m benchmarks extraction sevenzip-worker-matrix --runs 3 --warmups 1 --json-out benchmarks/results/sevenzip-worker-baseline.json
 uv run --locked python -m benchmarks extraction worker-vs-7z-300m `
   --sunpack-version v0.7.0 --worker-source-commit c3eaec11 `
@@ -215,6 +217,15 @@ is part of `sunpack_sevenzip_lz4`; build it with
 when it is missing. `--prefetch on|off` controls the native worker's input
 prefetch setting before the persistent worker starts. Run the ZIPX/LZ4 command
 once per setting in separate benchmark processes for an apples-to-apples A/B.
+The worker disables prefetch by default when the request's `format_hint` is
+`lz4` or `tar.lz4`; an explicit `SUNPACK_SEVENZIP_PREFETCH=1` still enables it
+for comparison runs.
+`extraction lz4-io-overlap` uses a worker built with
+`SUP7Z_ENABLE_PIPELINE_TIMING=ON`; it reports physical input-read activity,
+decoder-call wall time, asynchronous output-write activity through IOCP
+completion, and their pairwise/triple overlap. `--prefetch compare` starts a
+fresh worker for each setting and reports the measured overlap as a fraction
+of decoder time and pipeline wall time.
 
 `extraction worker-small-file-scheduling` measures the worker-internal thread
 scheduler under a deliberately adversarial many-small-file workload. It creates

@@ -10,6 +10,9 @@
 #include <algorithm>
 #include <array>
 #include <vector>
+#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+#include "worker_pipeline_timing.hpp"
+#endif
 
 namespace NArchive { namespace NSunpackLz4 {
 Z7_CLASS_IMP_CHandler_IInArchive_1(ISetProperties)
@@ -82,6 +85,9 @@ struct Context {
     std::vector<Byte> dictionary;
     UInt64 packed;
     const std::wstring *dictionary_path = nullptr;
+#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+    sunpack::sevenzip::PipelineTiming *pipeline_timing = nullptr;
+#endif
 };
 static ptrdiff_t read(void *p, void *dst, size_t n) {
     auto &c = *static_cast<Context *>(p); UInt32 got = 0;
@@ -106,6 +112,16 @@ static int progress(void *p, uint64_t in, uint64_t) {
     auto &c = *static_cast<Context *>(p); const UInt64 completed = in;
     c.error = c.progress->SetCompleted(&completed); return c.error == S_OK ? 0 : -1;
 }
+#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+static void compute_begin(void *p) {
+    auto &c = *static_cast<Context *>(p);
+    if (c.pipeline_timing) c.pipeline_timing->begin(sunpack::sevenzip::PipelineStage::Compute);
+}
+static void compute_end(void *p) {
+    auto &c = *static_cast<Context *>(p);
+    if (c.pipeline_timing) c.pipeline_timing->end(sunpack::sevenzip::PipelineStage::Compute);
+}
+#endif
 static int dictionary(void *p, uint32_t id, int has_id, const void **data, size_t *size) {
     auto &c = *static_cast<Context *>(p);
     const std::wstring *path = &c.options->default_dictionary;
@@ -146,7 +162,13 @@ Z7_COM7F_IMF(CHandler::Extract(const UInt32 *indices, UInt32 count, Int32 test, 
     RINOK(callback->PrepareOperation(ask))
     RINOK(InStream_SeekToBegin(stream))
     Context c{stream, output, callback, &options, S_OK, {}, packed};
+#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+    c.pipeline_timing = sunpack::sevenzip::current_pipeline_timing();
+    const int rc = sup_lz4_decode_profiled(&c, read, skip, write, dictionary, progress,
+        compute_begin, compute_end, &receipt);
+#else
     const int rc = sup_lz4_decode(&c, read, skip, write, dictionary, progress, &receipt);
+#endif
     decoded = true;
     output.Release();
     if (c.error != S_OK) return c.error;

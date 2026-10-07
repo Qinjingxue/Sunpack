@@ -578,14 +578,18 @@ namespace sunpack::sevenzip
 
 #ifdef SUP7Z_ENABLE_PIPELINE_TIMING
             pipeline_timing->start_pipeline();
-            {
-                PipelineStageScope compute_scope(pipeline_timing.get(), PipelineStage::Compute);
-                PipelineThreadCpuScope compute_cpu_scope(pipeline_timing.get());
-                if (format.Data4[5] == kLz4FormatId) {
+            PipelineThreadCpuScope compute_cpu_scope(pipeline_timing.get());
+            PipelineTimingContextScope timing_context(pipeline_timing.get());
+            const bool lz4_input = format.Data4[5] == kLz4FormatId;
+            if (lz4_input) {
                 hr = configure_lz4(archive, lz4_options);
                 if (hr != S_OK) { result.status = PasswordTestStatus::Error; set_failure(result, "archive_config", "dictionary_config", hr); return result; }
             }
-            hr = archive->Extract(nullptr, static_cast<UInt32>(kAllItems), 0, extract_callback.Interface());
+            if (lz4_input) {
+                hr = archive->Extract(nullptr, static_cast<UInt32>(kAllItems), 0, extract_callback.Interface());
+            } else {
+                PipelineStageScope compute_scope(pipeline_timing.get(), PipelineStage::Compute);
+                hr = archive->Extract(nullptr, static_cast<UInt32>(kAllItems), 0, extract_callback.Interface());
             }
 #else
             if (format.Data4[5] == kLz4FormatId) {
