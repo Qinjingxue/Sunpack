@@ -96,7 +96,7 @@ Sunpack为达到最大方便性，在使用时会尝试从各处获取密码，�
 
 ### 识别能力
 
-- 通过文件二进制数据识别潜在的压缩文件，支持伪装性嵌入载体文件，分卷文件等，目前支持zip,zipx,rar,7z,zstd,gz,tar,tbz2,xz,lz4(zipx不支持 WinZip 专用 JPEG、MP3、WavPack 算法，lz4不支持legacy和dictionary)
+- 通过文件二进制数据识别潜在的压缩文件，支持伪装性嵌入载体文件，分卷文件等，目前支持zip,zipx,rar,7z,zstd,gz,tar,tbz2,xz,lz4,ENCV4(zipx不支持 WinZip 专用 JPEG、MP3、WavPack 算法，lz4不支持legacy和dictionary)
 
 ### 递归处理
 

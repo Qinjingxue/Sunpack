@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "sunpack_enc",
     "sunpack_native",
     "sunpack_usn_core",
     "sunpack_watch_broker",

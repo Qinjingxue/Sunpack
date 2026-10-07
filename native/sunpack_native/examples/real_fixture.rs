@@ -39,6 +39,10 @@ enum Request {
         path: PathBuf,
         offset: u64,
     },
+    Copy {
+        source: PathBuf,
+        output: PathBuf,
+    },
 }
 
 // Independent APPNOTE fixture for methods the archive generator cannot encode.
@@ -375,6 +379,7 @@ fn inventory(root: &Path, directory: &Path, entries: &mut Vec<Value>) -> io::Res
 
 fn run(request: Request) -> io::Result<Value> {
     match request {
+        Request::Copy { source, output } => Ok(json!({"bytes": fs::copy(source, output)?})),
         Request::ZipMethod { output, method } => zip_method(&output, method),
         Request::SevenZipLz4Header { source, output } => seven_zip_lz4_header(&source, &output),
         Request::Flip { path, offset } => {

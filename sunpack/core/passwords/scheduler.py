@@ -13,6 +13,7 @@ from sunpack.core.passwords.verifier import PasswordBatchVerification, PasswordV
 from sunpack.core.passwords.verifier.rar_fast import RarFastVerifier
 from sunpack.core.passwords.verifier.seven_zip_fast import SevenZipFastVerifier
 from sunpack.core.passwords.verifier.zip_fast import ZipFastVerifier
+from sunpack.core.passwords.verifier.enc_fast import EncFastVerifier
 
 
 class PasswordSearchStatus(str, Enum):
@@ -78,7 +79,7 @@ class PasswordScheduler:
     @classmethod
     def with_fast_verifiers(cls) -> "PasswordScheduler":
         registry = PasswordVerifierRegistry(
-            fast_verifiers=[ZipFastVerifier(), RarFastVerifier(), SevenZipFastVerifier()],
+            fast_verifiers=[ZipFastVerifier(), RarFastVerifier(), SevenZipFastVerifier(), EncFastVerifier()],
         )
         return cls(registry.build())
 

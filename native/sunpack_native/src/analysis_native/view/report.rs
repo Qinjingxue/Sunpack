@@ -1983,6 +1983,11 @@ pub(crate) fn confirm_format_identity(py: Python<'_>, path: &str, format: &str) 
 
 pub(crate) fn confirm_format_identity_native(path: &str, format: &str) -> bool {
     match format {
+        "enc" => {
+            let Ok(reader) = ManagedReader::open(path) else { return false; };
+            let Ok(header) = reader.read_direct_at(0, 40) else { return false; };
+            sunpack_enc::Header::parse(&header, reader.len()).is_ok()
+        }
         "tar" => {
             let reader = match ManagedReader::open(path) {
                 Ok(reader) => reader,

@@ -1205,10 +1205,12 @@ int run_request(
     } else if (password_candidates.empty()) {
         result = extract_with_password(password);
     } else if (password_candidates.size() == 1) {
-        // Single candidate: extract directly; the bounded probe runs once only as a failure diagnostic to preserve the all-candidates-rejected contract.
+        // Single candidate: extract directly. An explicit wrong-password result
+        // is already conclusive; other failures retain the bounded diagnostic.
         result = extract_with_password(password_candidates.front());
         const bool direct_ok = result.status == PasswordTestStatus::Ok && result.command_ok;
-        if (!direct_ok) {
+        result.password_attempts = direct_ok ? 0 : 1;
+        if (!direct_ok && !(result.status == PasswordTestStatus::WrongPassword && result.operation_result == kOpWrongPassword)) {
             const auto probe = run_password_candidate_probe(archive_input, password_candidates);
             result.password_attempts = probe.attempts;
             if (probe.status == PasswordTestStatus::WrongPassword) {

@@ -1,6 +1,7 @@
 #include "sevenzip_formats.hpp"
 
 #include "lz4_handler.hpp"
+#include "sevenzip_bridge/enc.h"
 #include "sevenzip_paths.hpp"
 
 #ifdef _WIN32
@@ -26,6 +27,7 @@ namespace sunpack::sevenzip
 
         std::vector<unsigned char> known_format_ids_for_hint(const std::wstring &hint)
         {
+            if (hint == L"enc") return {kEncFormatId};
             if (hint == L"zip" || hint == L"zipx")
                 return {0x01};
             if (hint == L"7z" || hint == L"sevenzip" || hint == L"seven_zip")
@@ -97,6 +99,7 @@ namespace sunpack::sevenzip
         case 0xCC: return L"rar5";
         case 0xEE: return L"tar";
         case kLz4FormatId: return L"lz4";
+        case kEncFormatId: return L"enc";
         default: return L"";
         }
     }

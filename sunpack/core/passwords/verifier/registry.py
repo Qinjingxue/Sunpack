@@ -102,8 +102,6 @@ class PasswordVerifierChain:
             for verifier in self.fast_verifiers
             if not _normalize_archive_format(str(getattr(verifier, "format_hint", "")))
         ]
-        if not matching:
-            return list(self.fast_verifiers)
         return matching + [verifier for verifier in generic if verifier not in matching]
 
 
@@ -121,6 +119,6 @@ def _normalize_archive_format(value: str) -> str:
     normalized = (value or "").strip().lower().lstrip(".")
     if normalized in {"7zip", "sevenzip", "seven_zip"}:
         return "7z"
-    if normalized in {"zip", "rar", "7z"}:
+    if normalized in {"zip", "rar", "7z", "enc"}:
         return normalized
     return ""

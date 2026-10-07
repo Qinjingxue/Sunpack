@@ -342,9 +342,42 @@ if(WIN32)
     target_compile_definitions(sunpack_lz4_handler PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     apply_release_optimizations(sunpack_lz4_handler)
     apply_source_charset(sunpack_lz4_handler)
+
+    # Share the Rust container implementation with discovery. Keep CRT static,
+    # like every other standalone worker object, on both supported architectures.
+    find_program(SUP_ENC_CARGO cargo REQUIRED)
+    if(SUP7Z_TARGET_UARCH STREQUAL "ARM64" OR SUP7Z_TARGET_UARCH STREQUAL "arm64")
+        set(SUP_ENC_RUST_TARGET aarch64-pc-windows-msvc)
+    else()
+        set(SUP_ENC_RUST_TARGET x86_64-pc-windows-msvc)
+    endif()
+    set(SUP_ENC_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../sunpack_enc")
+    set(SUP_ENC_TARGET_DIR "${CMAKE_CURRENT_BINARY_DIR}/enc-rust")
+    set(SUP_ENC_LIBRARY "${SUP_ENC_TARGET_DIR}/${SUP_ENC_RUST_TARGET}/release/sunpack_enc.lib")
+    file(GLOB SUP_ENC_SOURCES CONFIGURE_DEPENDS "${SUP_ENC_ROOT}/src/*.rs")
+    add_custom_command(OUTPUT "${SUP_ENC_LIBRARY}"
+        COMMAND "${CMAKE_COMMAND}" -E env "RUSTFLAGS=-Ctarget-feature=+crt-static"
+            "${SUP_ENC_CARGO}" build --release --locked --package sunpack-enc
+            --manifest-path "${SUP_ENC_ROOT}/Cargo.toml"
+            --target "${SUP_ENC_RUST_TARGET}" --target-dir "${SUP_ENC_TARGET_DIR}"
+        DEPENDS ${SUP_ENC_SOURCES} "${SUP_ENC_ROOT}/Cargo.toml"
+            "${CMAKE_CURRENT_SOURCE_DIR}/../Cargo.toml" "${CMAKE_CURRENT_SOURCE_DIR}/../Cargo.lock"
+        VERBATIM)
+    add_custom_target(sunpack_enc_rust DEPENDS "${SUP_ENC_LIBRARY}")
+    add_library(sunpack_enc STATIC IMPORTED GLOBAL)
+    set_target_properties(sunpack_enc PROPERTIES IMPORTED_LOCATION "${SUP_ENC_LIBRARY}")
+    add_dependencies(sunpack_enc sunpack_enc_rust)
+    add_library(sunpack_enc_handler OBJECT src/internal/enc_handler.cpp)
+    target_include_directories(sunpack_enc_handler PRIVATE ${SUP7Z_7Z_ROOT}/CPP include)
+    target_compile_definitions(sunpack_enc_handler PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    apply_release_optimizations(sunpack_enc_handler)
+    apply_source_charset(sunpack_enc_handler)
 endif()
 
 function(sup7z_attach_bundled_7z target_name)
+    if(TARGET sunpack_enc_handler)
+        target_sources(${target_name} PRIVATE $<TARGET_OBJECTS:sunpack_enc_handler>)
+    endif()
     if(TARGET sunpack_lz4_handler)
         target_sources(${target_name} PRIVATE $<TARGET_OBJECTS:sunpack_lz4_handler>)
     endif()
@@ -411,6 +444,7 @@ endif()
 if(WIN32)
     target_compile_definitions(sunpack_sevenzip_core PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_link_libraries(sunpack_sevenzip_core PUBLIC OleAut32)
+    target_link_libraries(sunpack_sevenzip_core PUBLIC sunpack_enc Userenv Ws2_32 Bcrypt Ntdll AdvApi32)
 endif()
 target_link_libraries(sunpack_sevenzip_core PUBLIC sunpack_lz4 PRIVATE zlib-ng::zlibstatic)
 if(SUP7Z_ENABLE_PIPELINE_TIMING)

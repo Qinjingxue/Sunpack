@@ -69,6 +69,7 @@ impl InputKey {
 }
 
 pub(crate) enum PasswordContext {
+    Enc(super::enc::EncPasswordContext),
     Zip(super::zip::ZipPasswordContext),
     Rar(super::rar::RarPasswordContext),
     SevenZip(super::seven_zip::SevenZipPasswordContext),
@@ -77,6 +78,7 @@ pub(crate) enum PasswordContext {
 impl PasswordContext {
     fn retained_bytes(&self) -> usize {
         match self {
+            Self::Enc(context) => context.retained_bytes(),
             Self::Zip(context) => context.retained_bytes(),
             Self::Rar(context) => context.retained_bytes(),
             Self::SevenZip(context) => context.retained_bytes(),
@@ -85,6 +87,7 @@ impl PasswordContext {
 
     fn verify(&self, py: Python<'_>, candidates: &[String]) -> PyResult<Py<PyAny>> {
         match self {
+            Self::Enc(context) => context.verify(py, candidates),
             Self::Zip(context) => context.verify(py, candidates),
             Self::Rar(context) => context.verify(py, candidates),
             Self::SevenZip(context) => context.verify(py, candidates),

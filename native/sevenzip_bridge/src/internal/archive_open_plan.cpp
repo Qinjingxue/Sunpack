@@ -34,7 +34,9 @@ CMyComPtr<IInStream> open_stream_for_plan(
     }
     // Structured (canonically named) volumes are already ordered by
     // Relations; re-sorting by physical filename would drop a disguised head.
-    return open_archive_stream(archive_path, part_paths, stream_opened, nullptr, structured_order);
+    // Password confirmation reads bounded evidence. Speculative payload reads
+    // multiply I/O and buffers by candidate count without proving a password.
+    return open_archive_stream(archive_path, part_paths, stream_opened, nullptr, structured_order, InputPrefetchConfig{false});
 }
 
 void apply_plan_metadata(PasswordTestResult& result, const ArchiveOpenPlan& plan) {

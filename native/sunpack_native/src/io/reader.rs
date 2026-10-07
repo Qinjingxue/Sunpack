@@ -722,6 +722,15 @@ impl NativeArchiveSession {
         Ok(dict.unbind())
     }
 
+    fn enc_fast_verify_passwords(
+        &self,
+        py: Python<'_>,
+        passwords: &Bound<'_, PyList>,
+    ) -> PyResult<Py<PyAny>> {
+        self.ensure_open()?;
+        crate::password::enc::enc_fast_verify_passwords_with_reader(py, &self.reader, passwords)
+    }
+
     fn zip_fast_verify_passwords(
         &self,
         py: Python<'_>,

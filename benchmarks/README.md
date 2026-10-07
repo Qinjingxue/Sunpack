@@ -19,6 +19,7 @@ include the test service/pipe identity, Broker binary SHA-256, and connection st
 
 ```powershell
 uv run --locked python -m benchmarks reader password-fast-path --rounds 5
+uv run --no-sync python -m benchmarks reader enc-password-fast-path --path native/sunpack_enc/tests/data/algorithm_0.mov --path C:\path\to\large.enc --wrong-passwords 64 --rounds 3 --jobs 1
 uv run --locked python -m benchmarks reader volume-anchor --files 128 --logical-mib 64 --rounds 5
 uv run --locked python -m benchmarks reader embedded-scan --generate-gib 10 --rounds 3 --skip-cli `
   --iocp-chunk-mib 2 --iocp-buffers 8 --iocp-workers 2
@@ -86,6 +87,13 @@ record both source hashes and all raw wall/CPU samples. These are scheduling
 measurements without archive decoding or filesystem IO.
 
 ## Run timeout
+
+`reader enc-password-fast-path` measures the production Rust quick-block
+verifier on independently generated ENC v4 files. Compare different payload
+sizes with repeated `--path`, and concurrent batches with `--jobs`. In a separate
+process, set `RAYON_NUM_THREADS=1` for the serial baseline. Reports include
+logical reader bytes, wall/CPU samples, peak RSS and residual RSS; Argon2 memory
+depends on the file's KDF parameter, not its payload size or candidate count.
 
 Every scenario runs in a child process under a hard wall-clock deadline, so a
 stale scenario that calls a removed API and blocks forever is killed instead

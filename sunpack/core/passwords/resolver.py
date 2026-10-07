@@ -146,6 +146,8 @@ def archive_structure_password_state(task: Any | None) -> str:
 
     descriptor = _archive_input_descriptor(task)
     if descriptor is not None:
+        if descriptor.format_hint == "enc":
+            return "required"
         analysis = descriptor.analysis if isinstance(descriptor.analysis, dict) else {}
         if analysis.get("password_required"):
             return "required"

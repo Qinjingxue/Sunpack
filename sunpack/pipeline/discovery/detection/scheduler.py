@@ -6,7 +6,7 @@ from sunpack.core.analysis import ArchiveAnalyzer
 from sunpack.core.contracts.discovery import DiscoveryCandidate
 
 
-CONFIRMABLE_FORMATS = frozenset({"tar", "gzip", "bzip2", "xz", "zstd", "lz4"})
+CONFIRMABLE_FORMATS = frozenset({"tar", "gzip", "bzip2", "xz", "zstd", "lz4", "enc"})
 
 
 class DetectionScheduler:

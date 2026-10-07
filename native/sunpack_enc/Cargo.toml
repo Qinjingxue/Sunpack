@@ -1,0 +1,27 @@
+[package]
+name = "sunpack-enc"
+edition = "2021"
+license = "MIT"
+
+[lib]
+crate-type = ["rlib", "staticlib"]
+
+[dependencies]
+aes = "0.8"
+argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
+blake3 = "1.8"
+blowfish = "0.9"
+cipher = "0.4"
+cipher5 = { package = "cipher", version = "0.5" }
+hkdf = "0.12"
+hmac = "0.12"
+rc6 = "0.1"
+magma = "0.9"
+sha2 = { version = "0.10", features = ["compress"] }
+serpent = "0.5"
+sha3 = "0.10"
+skein = "0.1"
+threefish = "0.5"
+twofish = "0.7"
+crc32fast = "1.4"
+zeroize = { version = "1.8", features = ["derive"] }

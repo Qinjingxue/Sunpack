@@ -134,7 +134,7 @@ fn filesystem_file_route(is_dir: bool, anchor: Option<&VolumeAnchor>) -> u8 {
     }
     if matches!(
         anchor.format.as_str(),
-        "tar" | "gzip" | "bzip2" | "xz" | "zstd" | "lz4"
+        "tar" | "gzip" | "bzip2" | "xz" | "zstd" | "lz4" | "enc"
     ) {
         return FILE_ROUTE_DETECTION;
     }
