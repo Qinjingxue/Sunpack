@@ -105,6 +105,7 @@ For maximum convenience, SunPack gathers passwords from several sources at run t
 ### Post-processing
 
 - Automatically flattens meaningless nested single-child directories after a successful extraction, keeping only the top-level folder, and moves the original archive to the Recycle Bin or deletes it (controlled by the `"archive_cleanup_mode": "r"` setting; the Recycle Bin is the default). If processing fails, it automatically cleans up the failed output and reports an error.
+- If files downloaded to a monitored folder need to remain available for BitTorrent seeding, please manually change "archive_cleanup_mode": "r" to "archive_cleanup_mode": "k". Otherwise, the source files may be deleted too quickly due to a race condition.
 
 ### Watch mode monitoring system
 
