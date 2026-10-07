@@ -59,6 +59,8 @@ def test_nested_failure_keeps_retry_path_while_success_still_flattens(tmp_path, 
         assert Path(failed[0].input_path).is_file()
         assert Path(failed[0].input_path) == tmp_path / "inner.7z"
         assert not (tmp_path / "out" / "outer" / "wrapper").exists()
+        assert not (tmp_path / "out" / "outer").exists()
+        assert outer_result.output_dir == ""
         assert not outer.exists(), "promotion must not block successful outer cleanup"
     else:
         assert response.summary.failed_tasks == []

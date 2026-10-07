@@ -93,6 +93,32 @@ async def _complete(watcher, candidate, response):
     return await watcher._complete_candidate(request)
 
 
+@pytest.mark.parametrize("missing_volume", [False, True])
+def test_publication_claim_defers_destination_until_request_finishes(tmp_path, monkeypatch, missing_volume):
+    watcher, root, _output, _sink = _watcher(tmp_path, monkeypatch)
+    destination = root / "inner.rar"
+    probes = []
+    monkeypatch.setattr(scheduler_module, "_candidate_for_event_path",
+        lambda path, since_usn=0: probes.append(path) or _candidate(path))
+    watcher._handle_pipeline_progress(str(root / "outer.zip"), "request", None, {
+        "type": "semantic", "event": "task_sources_claimed",
+        "source_paths": (str(destination),),
+    })
+    destination.write_text("partially published")
+    watcher.enqueue(str(destination), event_type="created")
+    assert probes == []
+    assert not watcher._pending
+    destination.write_text("complete publication")
+    if missing_volume:
+        candidate = _candidate(destination)
+        watcher.state.mark(candidate.path, candidate.size, candidate.mtime,
+            status="suspended_missing_volume", error="missing sibling")
+    watcher._release_pipeline_source_claims("request")
+    assert probes == [str(destination)]
+    assert str(destination) in watcher._pending
+    assert not watcher._active_claims and not watcher._dirty_during_claim
+
+
 def _response(direct, nested=None):
     results = [direct, *([nested] if nested is not None else [])]
     return PipelineResponse(
@@ -287,7 +313,8 @@ def test_late_missing_volume_result_cannot_resurrect_consumed_input(tmp_path, mo
     assert [action for action, _ in sink.actions] == ["suppressed"]
 
 
-def test_family_completion_preserves_another_inflight_output_record(tmp_path, monkeypatch):
+@pytest.mark.parametrize("changed", [False, True])
+def test_family_completion_preserves_another_inflight_output_record(tmp_path, monkeypatch, changed):
     watcher, root, output, _sink = _watcher(tmp_path, monkeypatch)
     archive, other = root / "a.001", root / "a.002"
     archive.write_text("part")
@@ -295,9 +322,12 @@ def test_family_completion_preserves_another_inflight_output_record(tmp_path, mo
     candidate = _candidate(archive)
     watcher.state.queue_active(candidate, persist=True, durable=True)
     assert watcher.state.record_task_output_started(str(archive), str(archive), str(output))
+    watcher.state.mark(candidate.path, candidate.size + int(changed), candidate.mtime,
+        status="suspended_missing_volume", error="missing sibling")
     watcher._inflight_requests.append(SimpleNamespace(candidate=candidate))
     watcher._retire_claimed_paths([str(archive)], _candidate(other))
     assert watcher.state.pending_work_for_path(str(archive)).active_outputs
+    assert (watcher.state.latest_entry_for_path(str(archive)) is not None) == changed
 
 
 @pytest.mark.parametrize("departed", [False, True])

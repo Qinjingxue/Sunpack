@@ -576,7 +576,9 @@ class _PathLeaseRegistry:
         if record is None:
             return ""
         recorded_version, output_dir = record
-        if recorded_version != ownership_version or not output_dir or not os.path.isdir(output_dir):
+        if recorded_version != ownership_version:
+            return ""
+        if not output_dir or not os.path.isdir(output_dir):
             self._completed_watch_generations.pop(key, None)
             return ""
         # Refresh insertion order so the bounded map behaves as a tiny LRU.
@@ -1435,12 +1437,17 @@ class _RequestRuntime:
                     )
                     subtree_complete = subtree_complete and children_complete
 
-            if output_dir and subtree_complete and not os.path.exists(output_dir):
-                ownership.forget_output(output_dir)
-                cleared = replace(result, output_dir="")
-                self._replace_target_result(result, cleared)
-                result = cleared
-                output_dir = ""
+            if output_dir and subtree_complete:
+                try:
+                    os.rmdir(output_dir)
+                except OSError:
+                    pass
+                if not os.path.exists(output_dir):
+                    ownership.forget_output(output_dir)
+                    cleared = replace(result, output_dir="")
+                    self._replace_target_result(result, cleared)
+                    result = cleared
+                    output_dir = ""
 
             if (
                 output_dir
@@ -1621,12 +1628,17 @@ class _RequestRuntime:
     async def _promote_blocked_input(self, task, result, *, ownership, broker, cancellation):
         destination = ownership.input_dir_for_task(task)
         sources = tuple(task.cleanup_parts or task.all_parts or [task.main_path])
-        # Reserve publication paths as well as sources. A Watch arrival must
-        # not read a partially copied cross-volume input or a half-moved group.
+        # Watch admission must claim publication paths before any file appears;
+        # leases additionally protect requests already admitted by Watch.
         destinations = [os.path.join(destination, os.path.basename(path)) for path in sources]
         await self.path_leases.acquire(
             self.submission.request_id, [*sources, *destinations], lease_id=id(task),
         )
+        if self.submission.origin == "watch":
+            self._report_progress(task, {
+                "type": "semantic", "event": "task_sources_claimed",
+                "source_paths": (*sources, *destinations),
+            })
 
         def promote():
             with promotion_barrier(

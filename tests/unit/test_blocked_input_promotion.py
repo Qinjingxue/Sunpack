@@ -63,7 +63,8 @@ def test_collision_preflights_entire_group(tmp_path):
 
 
 @pytest.mark.parametrize("collision", [False, True])
-def test_coordinator_rewrites_recorded_result_and_cleanup_input(tmp_path, collision):
+@pytest.mark.parametrize("origin", ["foreground", "watch"])
+def test_coordinator_rewrites_recorded_result_and_cleanup_input(tmp_path, collision, origin):
     async def scenario():
         source = tmp_path / "out" / "deep" / "nested"
         source.mkdir(parents=True)
@@ -78,7 +79,7 @@ def test_coordinator_rewrites_recorded_result_and_cleanup_input(tmp_path, collis
         task = ArchiveTask.from_archive_input(
             ArchiveInputDescriptor(str(inner)), discovery_source="test",
         )
-        submission = SimpleNamespace(targets=(PipelineTarget(str(outer)),), request_id="request")
+        submission = SimpleNamespace(targets=(PipelineTarget(str(outer)),), request_id="request", origin=origin)
         ownership = _RequestResults(submission, {})
         ownership.remember_results([TargetRunResult(str(outer), OutcomeKind.COMPLETE_SUCCESS, output_dir=str(tmp_path / "out"))])
         ownership.remember_tasks([task])
@@ -93,9 +94,19 @@ def test_coordinator_rewrites_recorded_result_and_cleanup_input(tmp_path, collis
         runtime._shell_updates = SimpleNamespace(add=lambda paths: None)
         from sunpack.pipeline.coordinator.engine import _PathLeaseRegistry
         runtime.path_leases = _PathLeaseRegistry()
+        claims = []
+        runtime._report_progress = lambda task, event: claims.append(event)
 
         class Broker:
             async def run(self, stage, key, function, **kwargs):
+                if origin == "watch":
+                    assert claims == [{
+                        "type": "semantic", "event": "task_sources_claimed",
+                        "source_paths": (str(inner), str(top / inner.name)),
+                    }]
+                    assert not (top / inner.name).exists() or collision
+                else:
+                    assert not claims
                 return function()
 
         result, promoted = await runtime._promote_blocked_input(

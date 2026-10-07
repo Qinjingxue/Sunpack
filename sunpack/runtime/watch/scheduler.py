@@ -985,6 +985,12 @@ class WatchScheduler:
                 previous_hint = self._candidate_baseline_locked(lookup_path)
             if previous_hint is None:
                 previous_hint = _candidate_from_state_entry(self.state.latest_entry_for_path(lookup_path))
+            if event_type == "pipeline_claim_released":
+                entry = self.state.latest_entry_for_path(lookup_path)
+                # A deferred arrival may change split-family membership without
+                # changing the failed anchor's bytes. Do not discard that event
+                # when completion just recorded the anchor as missing a volume.
+                force = force or (entry is not None and entry.status == "suspended_missing_volume")
             candidate = _candidate_for_event_path(
                 path,
                 since_usn=previous_hint.change_usn if previous_hint is not None else 0,
@@ -1883,15 +1889,26 @@ class WatchScheduler:
     def _retire_claimed_paths(self, paths: Iterable[str], candidate: WatchCandidate) -> None:
         normalized = dedupe_normalized_paths(paths)
         with self._lock:
-            inflight_keys = {path_key(request.candidate.path) for request in self._inflight_requests}
+            inflight_candidates = {path_key(request.candidate.path): request.candidate for request in self._inflight_requests}
             retired = [
                 path for path in normalized
-                if path_key(path) not in self._pending_by_key and path_key(path) not in inflight_keys
+                if path_key(path) not in self._pending_by_key and path_key(path) not in inflight_candidates
             ]
             candidate_pending = path_key(os.path.abspath(candidate.path)) in self._pending_by_key
+        cleared = list(retired)
+        for path in normalized:
+            inflight = inflight_candidates.get(path_key(path))
+            if inflight is None:
+                continue
+            recorded = _candidate_from_state_entry(self.state.latest_entry_for_path(path))
+            if recorded is not None and not _candidate_observation_changed(recorded, inflight):
+                # Successful family ownership retires an older blocker even if
+                # a sibling retry still needs its independent output record.
+                cleared.append(path)
         if retired:
             self.state.complete_work(retired)
-            self.state.clear_entries(retired)
+        if cleared:
+            self.state.clear_entries(cleared)
         if not candidate_pending:
             self.state.complete_work_if_matches(candidate)
 

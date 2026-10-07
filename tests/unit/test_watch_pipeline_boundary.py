@@ -93,3 +93,23 @@ def test_consumed_family_generation_rejects_changed_surviving_member(tmp_path):
     second.write_text("changed second")
     assert registry.input_version_for(paths, departed_version=original) == ()
 
+
+def test_late_completed_generation_lookup_preserves_newer_record(tmp_path):
+    registry = _PathLeaseRegistry()
+    path = tmp_path / "a.001"
+    path.write_text("generation A")
+    first = registry.input_version_for([str(path)])
+    output_a, output_b = tmp_path / "out-a", tmp_path / "out-b"
+    output_a.mkdir()
+    output_b.mkdir()
+    registry.remember_completed_watch(first, str(output_a))
+    path.write_text("generation B with different bytes")
+    second = registry.input_version_for([str(path)])
+    assert first != second
+    registry.remember_completed_watch(second, str(output_b))
+    assert registry.completed_watch_output(first) == ""
+    assert registry.completed_watch_output(second) == str(output_b)
+    output_b.rmdir()
+    assert registry.completed_watch_output(second) == ""
+    assert not registry._completed_watch_generations
+
