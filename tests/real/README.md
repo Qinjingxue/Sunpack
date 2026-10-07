@@ -37,6 +37,11 @@ The new regression cases cover:
   duplicate TAR/ZIP members, empty ZIP, legacy CP437 ZIP and solid RAR5 under
   plain names, disguised names and junk-prefixed/suffixed carriers. Expected
   output paths, sizes and CRC32 come from source files, not extraction output.
+* Plan 2, Plan 3 and Plan 7 exercise the official ENC v4 compatibility vector
+  through foreground decryption, wrong-password reporting and watch downloads.
+  Plan 2 gives the ENC vector a `.mov` name to verify signature-based discovery;
+  the fixture is copied by the Rust test helper from
+  `native/sunpack_enc/tests/data/algorithm_0.mov`.
 
 Samples are generated once per structure per test module and reused for all
 three container variants. The ignored `tests/real/corpus/` directory is optional;

@@ -28,9 +28,10 @@ def assert_password_error(
     error_info: dict | None = None,
     *,
     detailed_diagnostics: bool = False,
+    passwords: list[str] | None = None,
 ) -> None:
     """全错密码下必须：0 成功、有失败任务、失败分类为密码错误、marker 未解出。"""
-    passwords = wrong_password_list()
+    passwords = wrong_password_list() if passwords is None else passwords
     diagnostics = (
         error_info.setdefault("diagnostics", {})
         if error_info is not None and detailed_diagnostics
