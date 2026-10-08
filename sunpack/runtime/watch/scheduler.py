@@ -114,6 +114,7 @@ class _ActivePipelineRequest:
     task: asyncio.Task
     registry_owner: str = ""
     source_input_root: str = ""
+    deep_detect: bool = False
 
 
 class WatchScheduler:
@@ -1610,6 +1611,7 @@ class WatchScheduler:
             task=task,
             registry_owner=notification_id if host is not None else "",
             source_input_root=source_input_root,
+            deep_detect=options.force_scan,
         )
 
     def _handle_pipeline_progress(
@@ -1724,6 +1726,15 @@ class WatchScheduler:
                 # A successful sibling family may have consumed this input
                 # while an earlier incomplete request was still finishing.
                 # Never resurrect a blocker for a deleted physical input.
+                self.state.clear_entries([retry_path])
+                retired_failures.append(failure)
+                continue
+            if self.pipeline_engine.completed_watch_family_output(
+                retry_path, deep_detect=request.deep_detect,
+            ):
+                # A newer successful family still owns these exact bytes.
+                # This synchronous check and state update cannot be interleaved
+                # by another completion on the pipeline's event loop.
                 self.state.clear_entries([retry_path])
                 retired_failures.append(failure)
                 continue

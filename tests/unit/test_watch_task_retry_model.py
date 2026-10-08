@@ -12,6 +12,7 @@ from sunpack.core.contracts.pipeline import (
     PipelineResponse,
 )
 from sunpack.core.contracts.results import OutcomeKind, RunSummary, TargetRunResult
+from sunpack.pipeline.coordinator.engine import PipelineEngine, _PathLeaseRegistry
 from sunpack.runtime.watch.roots import WatchRootEntry
 from sunpack.runtime.watch.scanner import WatchCandidate
 from sunpack.runtime.watch.scheduler import WatchScheduler, _ActivePipelineRequest
@@ -93,6 +94,66 @@ async def _complete(watcher, candidate, response):
         source_input_root=watcher._source_input_root_for(candidate.path),
     )
     return await watcher._complete_candidate(request)
+
+
+@pytest.mark.parametrize("invalidation", ["missing_member", "changed_member", "missing_output", "deep_detect"])
+def test_late_failure_cannot_overwrite_unchanged_success_but_new_failure_can(
+    tmp_path, monkeypatch, invalidation,
+):
+    async def scenario():
+        watcher, root, output, _sink = _watcher(tmp_path, monkeypatch)
+        first, second = root / "archive.7z.001", root / "archive.7z.002"
+        first.write_text("first part")
+        second.write_text("second part")
+        completed_output = output / "archive"
+        completed_output.mkdir()
+        engine = object.__new__(PipelineEngine)
+        engine._path_leases = _PathLeaseRegistry()
+        watcher.pipeline_engine.completed_watch_family_output = engine.completed_watch_family_output
+        failure = FailureInfo(FailureKind.MISSING_VOLUME, "relations", "missing volume")
+        failed_response = _response(TargetRunResult(str(second), OutcomeKind.FAILURE, failure=failure))
+        late_result = asyncio.get_running_loop().create_future()
+
+        async def old_pipeline():
+            return await late_result
+
+        old_request = _ActivePipelineRequest(
+            "old-request", _candidate(second), asyncio.create_task(old_pipeline()),
+            source_input_root=str(root),
+        )
+        paths = [str(first), str(second)]
+        registry = engine._path_leases
+        registry.remember_completed_watch(registry.input_version_for(paths), str(completed_output))
+        success_response = PipelineResponse(
+            "success", RunSummary(target_results=(
+                TargetRunResult(str(first), OutcomeKind.COMPLETE_SUCCESS, output_dir=str(completed_output)),
+            )), discovery=PipelineDiscovery(claimed_paths=tuple(paths)),
+        )
+        assert (await _complete(watcher, _candidate(first), success_response)).succeeded == 1
+        late_result.set_result(failed_response)
+        assert (await watcher._complete_candidate(old_request)).failed == 0
+        assert watcher.state.latest_entry_for_path(str(second)) is None
+
+        # The retry member stays unchanged in every case. A single-member
+        # success lookup would incorrectly hide these new failures.
+        if invalidation == "missing_member":
+            first.unlink()
+        elif invalidation == "changed_member":
+            first.write_text("new first part with different bytes")
+        elif invalidation == "missing_output":
+            completed_output.rmdir()
+
+        async def new_pipeline():
+            return failed_response
+
+        new_request = _ActivePipelineRequest(
+            "new-request", _candidate(second), asyncio.create_task(new_pipeline()),
+            source_input_root=str(root), deep_detect=invalidation == "deep_detect",
+        )
+        assert (await watcher._complete_candidate(new_request)).failed == 1
+        assert watcher.state.latest_entry_for_path(str(second)).status == "suspended_missing_volume"
+
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize("missing_volume", [False, True])

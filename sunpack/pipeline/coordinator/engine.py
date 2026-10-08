@@ -95,6 +95,9 @@ class PipelineEngine:
     def is_idle(self) -> bool:
         return not self._active_requests and self._broker.pending_jobs == 0 and self._broker.active_jobs == 0
 
+    def completed_watch_family_output(self, path: str, *, deep_detect: bool = False) -> str:
+        return self._path_leases.completed_watch_family_output(path, deep_detect=deep_detect)
+
     def set_state_changed_callback(self, callback: Callable[[], None] | None) -> None:
         self._state_changed_callback = callback
 
@@ -585,6 +588,20 @@ class _PathLeaseRegistry:
         self._completed_watch_generations.pop(key, None)
         self._completed_watch_generations[key] = record
         return output_dir
+
+    def completed_watch_family_output(self, path: str, *, deep_detect: bool = False) -> str:
+        """Check a late failure against the complete successful physical family."""
+        member_key = path_key(os.path.abspath(os.path.normpath(path)))
+        for (members, mode), (recorded_version, _) in self._completed_watch_generations.items():
+            if mode != deep_detect or member_key not in members:
+                continue
+            # Missing members invalidate this lookup, even when the failed
+            # request's individual member has not changed. Do not reuse a
+            # departed generation here: it could conceal a real missing part.
+            current_version = self.input_version_for(members)
+            if current_version == recorded_version:
+                return self.completed_watch_output(current_version, deep_detect=deep_detect)
+        return ""
 
     def remember_completed_watch(
         self,
