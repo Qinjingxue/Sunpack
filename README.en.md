@@ -39,6 +39,7 @@
   - [Reproducible worker vs. 7-Zip benchmark](#reproducible-worker-vs-7-zip-benchmark)
 - [Known Issue](#Known-Issue)
 - [Contributing](#contributing)
+- [Acknowledgements](#acknowledgements)
 - [License](#license)
 
 ## Installation
@@ -253,13 +254,17 @@ followed by the same metrics for `7z.exe`. The raw full-matrix report is
 
 Contributions are welcome. Use [GitHub Issues](https://github.com/Qinjingxue/Sunpack/issues) to report bugs or suggest improvements, and submit a [Pull Request](https://github.com/Qinjingxue/Sunpack/pulls) to help improve the project.
 
+## Acknowledgements
+
+Thank you to everyone who contributes code, reports issues, or shares suggestions for SunPack. The project also benefits from many open-source projects. Special thanks to the maintainers and contributors of [7-Zip](https://www.7-zip.org/), [zlib-ng](https://github.com/zlib-ng/zlib-ng), [LZ4](https://github.com/lz4/lz4), and [RustCrypto](https://github.com/RustCrypto). See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for details about third-party components and their licenses.
+
 ## License
 
-SunPack-original source code is licensed under the MIT License; see [LICENSE](LICENSE).
+The root [LICENSE](LICENSE) (MIT) applies to SunPack-original code. It does not mean that third-party code or binaries are also licensed under MIT.
 
-The repository also vendors third-party source code, including 7-Zip 26.03 under `native/sevenzip_bridge/7z2603-src/` and zlib-ng 2.3.3 under `native/sevenzip_bridge/zlib-ng-2.3.3/`. Third-party source and binaries remain subject to their original licenses and are not relicensed under MIT. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md), [licenses/](licenses/), and [docs/licensing.md](docs/licensing.md) for the exact license scope and release-compliance information.
+The repository includes several third-party components, including 7-Zip 26.03 at `native/sevenzip_bridge/7z2603-src/`, zlib-ng 2.3.3 at `native/sevenzip_bridge/zlib-ng-2.3.3/`, LZ4 1.10.0 at `native/third_party/lz4/`, and cryptographic algorithm implementations adapted from RustCrypto. These components remain subject to their respective original licenses. For component scope, copyright and license information, and the license materials required for releases, see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md), [licenses/](licenses/), and [docs/licensing.md](docs/licensing.md).
 
-The 7-Zip source license is copied at [licenses/7zip-source-license.txt](licenses/7zip-source-license.txt), the full GNU LGPL 2.1 text is available at [licenses/LGPL-2.1.txt](licenses/LGPL-2.1.txt), and the zlib-ng license is copied at [licenses/zlib-ng-license.txt](licenses/zlib-ng-license.txt).
+The 7-Zip source license is copied at [licenses/7zip-source-license.txt](licenses/7zip-source-license.txt), and the full GNU LGPL 2.1 text is available at [licenses/LGPL-2.1.txt](licenses/LGPL-2.1.txt). License copies for other components are in [licenses/](licenses/).
 
 The [input prefetch optimization experiments](docs/zh-CN/benchmark_worker_prefetch_300m.md)
 were rejected because gains did not hold across single-job and concurrent workloads.

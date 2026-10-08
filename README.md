@@ -39,6 +39,7 @@
   - [可复现的 worker 与 7-Zip 对比测试](#可复现的-worker-与-7-zip-对比测试)
 - [已知问题](#已知问题)
 - [参与贡献](#参与贡献)
+- [致谢](#致谢)
 - [许可证](#许可证)
 
 ## 安装说明
@@ -240,10 +241,14 @@ uv run --locked pytest
 
 欢迎通过 [GitHub Issues](https://github.com/Qinjingxue/Sunpack/issues) 报告问题、提出建议，也欢迎提交 [Pull Request](https://github.com/Qinjingxue/Sunpack/pulls) 改进项目。
 
+## 致谢
+
+感谢所有为 SunPack 提交代码、报告问题和提供建议的贡献者与用户。SunPack 也受益于众多开源项目，特别感谢 [7-Zip](https://www.7-zip.org/)、[zlib-ng](https://github.com/zlib-ng/zlib-ng)、[LZ4](https://github.com/lz4/lz4) 和 [RustCrypto](https://github.com/RustCrypto) 项目及其维护者。相关第三方组件和许可证信息见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+
 ## 许可证
 
-SunPack 原创源代码采用 MIT 许可证，详见 [LICENSE](LICENSE)。
+仓库根目录的 [LICENSE](LICENSE)（MIT）适用于 SunPack 原创代码，不代表第三方代码或二进制也采用 MIT 许可证。
 
-仓库同时包含第三方源码，其中包括位于 `native/sevenzip_bridge/7z2603-src/` 的 7-Zip 26.03 源码，以及位于 `native/sevenzip_bridge/zlib-ng-2.3.3/` 的 zlib-ng 2.3.3 源码。第三方源码和二进制继续受各自原始许可证约束，不因进入 SunPack 仓库而改为 MIT。许可证边界和发布合规要求详见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)、[licenses/](licenses/) 和 [docs/licensing.md](docs/licensing.md)。
+仓库包含多个第三方组件，包括位于 `native/sevenzip_bridge/7z2603-src/` 的 7-Zip 26.03、位于 `native/sevenzip_bridge/zlib-ng-2.3.3/` 的 zlib-ng 2.3.3、位于 `native/third_party/lz4/` 的 LZ4 1.10.0，以及改编自 RustCrypto 的加密算法实现。这些组件仍受各自原始许可证约束。各组件的范围、版权与许可证信息，以及发布时需要附带的许可材料，详见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)、[licenses/](licenses/) 和 [docs/licensing.md](docs/licensing.md)。
 
-7-Zip 源码许可证副本位于 [licenses/7zip-source-license.txt](licenses/7zip-source-license.txt)，GNU LGPL 2.1 完整文本位于 [licenses/LGPL-2.1.txt](licenses/LGPL-2.1.txt)，zlib-ng 许可证副本位于 [licenses/zlib-ng-license.txt](licenses/zlib-ng-license.txt)。
+其中，7-Zip 源码许可证副本位于 [licenses/7zip-source-license.txt](licenses/7zip-source-license.txt)，GNU LGPL 2.1 完整文本位于 [licenses/LGPL-2.1.txt](licenses/LGPL-2.1.txt)；其他组件的许可证副本见 [licenses/](licenses/)。
