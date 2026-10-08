@@ -118,3 +118,25 @@ key across CTR tasks. The full notice is distributed at
 [licenses/serpent-license.txt](licenses/serpent-license.txt).
 
 Source: https://github.com/RustCrypto/block-ciphers/tree/serpent-v0.6.0/serpent
+
+## RustCrypto Threefish
+
+The Threefish-1024 key schedule and round constants in
+`native/sunpack_enc/src/threefish.rs` are adapted from RustCrypto threefish 0.5.2,
+Copyright (c) 2016-2017 Christian Barcenas, Artyom Pavlov, under the MIT license.
+SunPack uses a zero tweak, constant-rotation round cycles, and four-block AVX2
+encryption with scalar tails. The full notice is distributed at
+[licenses/threefish-license.txt](licenses/threefish-license.txt).
+
+Source: https://github.com/RustCrypto/block-ciphers/tree/threefish-v0.5.2/threefish
+
+## RustCrypto Magma/GOST
+
+The GOST 28147-89 TestSbox constants and key ordering in
+`native/sunpack_enc/src/gost.rs` are adapted from RustCrypto magma 0.9.0,
+Copyright (c) 2017 Artyom Pavlov, under the MIT license. SunPack shares
+compile-time substitution/rotation tables and interleaves independent blocks.
+The full notice is distributed at
+[licenses/magma-license.txt](licenses/magma-license.txt).
+
+Source: https://github.com/RustCrypto/block-ciphers/tree/magma-v0.9.0/magma

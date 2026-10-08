@@ -6,8 +6,12 @@ use cipher5::{
     BlockCipherEncrypt, KeyInit as KeyInit5,
 };
 use zeroize::{Zeroize, ZeroizeOnDrop};
+#[path = "gost.rs"]
+mod gost;
 #[path = "serpent.rs"]
 mod serpent;
+#[path = "threefish.rs"]
+mod threefish;
 #[path = "twofish.rs"]
 mod twofish;
 
@@ -18,8 +22,8 @@ enum Primitive {
     Serpent(serpent::Serpent),
     Blowfish(blowfish::Blowfish),
     Twofish(twofish::Twofish),
-    Gost(magma::Gost89Test),
-    Threefish(threefish::Threefish1024),
+    Gost(gost::Gost),
+    Threefish(threefish::Threefish),
     Shacal([u8; 64]),
 }
 impl Primitive {
@@ -36,35 +40,20 @@ impl Primitive {
                 8,
             ),
             4 => (Self::Twofish(twofish::Twofish::new(key)), 16),
-            5 => {
-                let mut k: [u8; 32] = key.try_into().unwrap();
-                for word in k.chunks_exact_mut(4) {
-                    word.reverse();
-                }
-                (
-                    Self::Gost(magma::Gost89Test::new_from_slice(&k).unwrap()),
-                    8,
-                )
-            }
-            7 => (
-                Self::Threefish(threefish::Threefish1024::new_with_tweak(
-                    key.try_into().unwrap(),
-                    &[0; 16],
-                )),
-                128,
-            ),
+            5 => (Self::Gost(gost::Gost::new(key)), 8),
+            7 => (Self::Threefish(threefish::Threefish::new(key)), 128),
             8 => (Self::Shacal(key.try_into().unwrap()), 32),
             _ => unreachable!(),
         }
     }
     fn encrypt(&self, bytes: &mut [u8]) {
         match self {
-            Self::Aes(c) => batch(c, bytes, false),
+            Self::Aes(c) => batch(c, bytes),
             Self::Serpent(c) => c.encrypt(bytes),
-            Self::Blowfish(c) => batch(c, bytes, false),
+            Self::Blowfish(c) => batch(c, bytes),
             Self::Twofish(c) => c.encrypt(bytes),
-            Self::Gost(c) => batch(c, bytes, true),
-            Self::Threefish(c) => batch(c, bytes, false),
+            Self::Gost(c) => c.encrypt(bytes),
+            Self::Threefish(c) => c.encrypt(bytes),
             Self::Rc6(c) => {
                 for block in bytes.chunks_exact_mut(16) {
                     let mut b = cipher5::Block::<Rc6>::default();
@@ -93,21 +82,15 @@ impl Primitive {
         }
     }
 }
-fn batch<C: BlockEncrypt>(cipher: &C, bytes: &mut [u8], reverse: bool) {
+fn batch<C: BlockEncrypt>(cipher: &C, bytes: &mut [u8]) {
     let mut blocks: [Block<C>; 16] = std::array::from_fn(|_| Block::<C>::default());
     let size = blocks[0].len();
     let count = bytes.len() / size;
     for (block, src) in blocks.iter_mut().zip(bytes.chunks_exact(size)) {
         block.copy_from_slice(src);
-        if reverse {
-            block.reverse();
-        }
     }
     cipher.encrypt_blocks(&mut blocks[..count]);
     for (block, dst) in blocks.iter_mut().zip(bytes.chunks_exact_mut(size)) {
-        if reverse {
-            block.reverse();
-        }
         dst.copy_from_slice(block);
     }
 }

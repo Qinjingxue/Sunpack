@@ -35,13 +35,13 @@ hkdf = "0.12"
 hmac = "0.12"
 rc6 = "0.1"
 rayon = { version = "1.10", optional = true }
-magma = "0.9"
 sha2 = { version = "0.10", features = ["compress"] }
 sha3 = "0.10"
 skein = "0.1"
-threefish = "0.5"
 crc32fast = "1.4"
 zeroize = { version = "1.8", features = ["derive"] }
 
 [dev-dependencies]
+magma = "0.9"
 serpent = "0.6"
+threefish = "0.5"

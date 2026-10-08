@@ -1,4 +1,4 @@
-"""Independent SSE C4 payload exercises the worker's CPU-credit integration."""
+"""Independent SSE GOST, Threefish and C4 payloads exercise worker CPU credits."""
 import asyncio
 import json
 import os
@@ -12,17 +12,17 @@ from tests.helpers.native_fixture import file_inventory, native_fixture
 from tests.unit.test_enc_support import BUILD, ROOT
 
 
-@pytest.fixture(scope="module")
-def large_c4(tmp_path_factory):
+@pytest.fixture(scope="module", params=[5, 7, 9], ids=["gost", "threefish", "c4"])
+def large_enc(tmp_path_factory, request):
     jar = ROOT / "reference/implementations/SSEFilePC/S.S.E. File Encryptor for PC/ssefenc.jar"
     java, javac = shutil.which("java"), shutil.which("javac")
     if not java or not javac or not jar.exists():
         pytest.skip("independent large ENC fixture requires Java 17+, javac and the SSE reference jar")
-    root = tmp_path_factory.mktemp("enc-c4")
+    root = tmp_path_factory.mktemp(f"enc-{request.param}")
     subprocess.run([javac, "--release", "17", "-cp", str(jar), "-d", str(root),
                     str(ROOT / "tests/helpers/EncV4Fixtures.java")], check=True, capture_output=True)
     subprocess.run([java, "-cp", os.pathsep.join((str(root), str(jar))), "EncV4Fixtures",
-                    str(root), "9", "2"], check=True, capture_output=True, timeout=60)
+                    str(root), str(request.param), "2"], check=True, capture_output=True, timeout=60)
     damaged = root / "damaged.bin"
     native_fixture("copy", source=str(root / "large.enc"), output=str(damaged))
     native_fixture("flip", path=str(damaged), offset=damaged.stat().st_size - 1)
@@ -30,8 +30,8 @@ def large_c4(tmp_path_factory):
 
 
 @pytest.mark.parametrize("capacity,executor_threads", [(1, None), (2, None), (3, None), (5, None), (9, None), (9, 3), (9, 1)])
-def test_large_c4_uses_only_granted_credits_and_matches_official_bytes(tmp_path, large_c4, capacity, executor_threads):
-    request = {"job_id": "c4", "origin": "foreground", "archive_path": str(large_c4 / "large.enc"),
+def test_large_enc_uses_only_granted_credits_and_matches_official_bytes(tmp_path, large_enc, capacity, executor_threads):
+    request = {"job_id": "enc", "origin": "foreground", "archive_path": str(large_enc / "large.enc"),
                "format_hint": "enc", "output_dir": str(tmp_path / "out"), "password": "sunpack-test"}
     env = os.environ | {"SUNPACK_NATIVE_WORKER_THREAD_CAPACITY": str(capacity)}
     if executor_threads:
@@ -44,7 +44,7 @@ def test_large_c4_uses_only_granted_credits_and_matches_official_bytes(tmp_path,
               if (event := parse_worker_transport_event(line))]
     result = next(event for event in events if event.get("type") == "result")
     assert result["status"] == "ok" and result["verified_manifest"]["validated"], result
-    expected = file_inventory(large_c4)["large.expected"]
+    expected = file_inventory(large_enc)["large.expected"]
     assert file_inventory(tmp_path / "out")["large"] == expected
     cpu = next(event for event in events if event.get("event") == "decoder_started")
     # Open borrowed up to three extra credits for the final KDF and returned
@@ -55,7 +55,7 @@ def test_large_c4_uses_only_granted_credits_and_matches_official_bytes(tmp_path,
     assert not cpu["decoder_parallel"]
 
 
-def test_parallel_c4_releases_credits_after_mac_failure_for_watch_and_cli(tmp_path, large_c4, monkeypatch):
+def test_parallel_enc_releases_credits_after_mac_failure_for_watch_and_cli(tmp_path, large_enc, monkeypatch):
     from sunpack.pipeline.extraction.internal.sevenzip.sevenzip_runner import _AsyncNativeWorkerProcess
 
     monkeypatch.setenv("SUNPACK_NATIVE_WORKER_THREAD_CAPACITY", "4")
@@ -69,7 +69,7 @@ def test_parallel_c4_releases_credits_after_mac_failure_for_watch_and_cli(tmp_pa
                 finished = []
                 for index in range(1 if wave == 2 else 8):
                     job_id = str(wave * 8 + index)
-                    path = large_c4 / ("damaged.bin" if index % 4 == 3 else "large.enc")
+                    path = large_enc / ("damaged.bin" if index % 4 == 3 else "large.enc")
                     password = "wrong" if index % 4 == 2 else "sunpack-test"
                     request = {"job_id": job_id, "origin": "watch" if index % 2 else "foreground",
                                "archive_path": str(path), "format_hint": "enc", "password": password,
@@ -96,12 +96,12 @@ def test_parallel_c4_releases_credits_after_mac_failure_for_watch_and_cli(tmp_pa
 
 @pytest.mark.parametrize("origin", ["foreground", "watch"])
 @pytest.mark.parametrize("incomplete", [False, True])
-def test_c4_carrier_ranges_keep_ctr_continuity_and_reject_missing_tail(tmp_path, large_c4, origin, incomplete):
+def test_enc_carrier_ranges_keep_ctr_continuity_and_reject_missing_tail(tmp_path, large_enc, origin, incomplete):
     from sunpack_native import enc_fast_verify_passwords_from_ranges
     from tests.helpers.native_fixture import assemble_carrier
 
     carrier = tmp_path / "disguised.mkv"
-    segment = assemble_carrier(carrier, [large_c4 / "large.enc"],
+    segment = assemble_carrier(carrier, [large_enc / "large.enc"],
                                junk_min=37, junk_max=37)["segments"][0]
     start, length = segment["offset"], segment["length"]
     # Fragment the header, quick proof, and payload at unaligned boundaries.
@@ -126,6 +126,6 @@ def test_c4_carrier_ranges_keep_ctr_continuity_and_reject_missing_tail(tmp_path,
         assert not result["verified_manifest"]["validated"]
     else:
         assert result["status"] == "ok" and result["verified_manifest"]["validated"], result
-        assert list(file_inventory(tmp_path / "out").values()) == [file_inventory(large_c4)["large.expected"]]
+        assert list(file_inventory(tmp_path / "out").values()) == [file_inventory(large_enc)["large.expected"]]
     cpu = next(event for event in events if event.get("event") == "decoder_started")
     assert cpu["current_decoder_extra_credits"] == 0
