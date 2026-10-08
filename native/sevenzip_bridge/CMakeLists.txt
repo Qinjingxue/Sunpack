@@ -357,7 +357,7 @@ if(WIN32)
     file(GLOB SUP_ENC_SOURCES CONFIGURE_DEPENDS "${SUP_ENC_ROOT}/src/*.rs")
     add_custom_command(OUTPUT "${SUP_ENC_LIBRARY}"
         COMMAND "${CMAKE_COMMAND}" -E env "RUSTFLAGS=-Ctarget-feature=+crt-static"
-            "${SUP_ENC_CARGO}" build --release --locked --package sunpack-enc --features parallel-kdf,parallel-decrypt
+            "${SUP_ENC_CARGO}" build --release --locked --package sunpack-enc
             --manifest-path "${SUP_ENC_ROOT}/Cargo.toml"
             --target "${SUP_ENC_RUST_TARGET}" --target-dir "${SUP_ENC_TARGET_DIR}"
         DEPENDS ${SUP_ENC_SOURCES} "${SUP_ENC_ROOT}/Cargo.toml"

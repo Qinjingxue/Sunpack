@@ -54,7 +54,7 @@ fn open_returns_kdf_credits_before_io_and_on_password_failure() {
             self.input.seek(pos)
         }
     }
-    let run = |_executor_threads: usize| {
+    let run = || {
         for grant in 0..=3 {
             for password in ["sunpack-test", "wrong"] {
                 let held = Cell::new(0);
@@ -68,13 +68,7 @@ fn open_returns_kdf_credits_before_io_and_on_password_failure() {
                     FIXTURES[9].len() as u64,
                     &pw(password),
                     |wanted| {
-                        #[cfg(feature = "parallel-kdf")]
                         assert_eq!(wanted, 3);
-                        #[cfg(not(feature = "parallel-kdf"))]
-                        assert!(
-                            false,
-                            "serial build must not request credits: {wanted}/{_executor_threads}"
-                        );
                         let extra = wanted.min(grant);
                         assert_eq!(held.get(), 0);
                         held.set(extra);
@@ -92,7 +86,6 @@ fn open_returns_kdf_credits_before_io_and_on_password_failure() {
                 } else {
                     assert_eq!(result.unwrap().output_size(), 192);
                 }
-                #[cfg(feature = "parallel-kdf")]
                 assert_eq!(acquired.get(), grant);
             }
         }
@@ -108,16 +101,13 @@ fn open_returns_kdf_credits_before_io_and_on_password_failure() {
             .is_err());
         }
     };
-    #[cfg(feature = "parallel-kdf")]
     for threads in 1..=4 {
         rayon::ThreadPoolBuilder::new()
             .num_threads(threads)
             .build()
             .unwrap()
-            .install(|| run(threads));
+            .install(run);
     }
-    #[cfg(not(feature = "parallel-kdf"))]
-    run(1);
 }
 fn pw(s: &str) -> Vec<u16> {
     s.encode_utf16().collect()
@@ -136,10 +126,16 @@ fn decode(bytes: &[u8], password: &str, expected: &[u8]) {
     let mut output = Vec::new();
     let mut progress = Vec::new();
     decoder
-        .decrypt(&mut input, &mut output, |n| {
-            progress.push(n);
-            Ok(())
-        })
+        .decrypt_with_budget(
+            &mut input,
+            &mut output,
+            |_| 0,
+            |_| (),
+            |n| {
+                progress.push(n);
+                Ok(())
+            },
+        )
         .unwrap();
     assert_eq!(output, expected);
     assert_eq!(progress.last(), Some(&(bytes.len() as u64)));
@@ -252,7 +248,7 @@ fn corruption_cancellation_and_short_reads() {
     assert_eq!(decoder.output_size(), 0);
     assert_eq!(
         decoder
-            .decrypt(&mut input, &mut std::io::sink(), |_| Ok(()))
+            .decrypt_with_budget(&mut input, &mut std::io::sink(), |_| 0, |_| (), |_| Ok(()))
             .unwrap_err(),
         Error::Framing
     );
@@ -273,7 +269,13 @@ fn corruption_cancellation_and_short_reads() {
             .unwrap();
             assert_eq!(
                 decoder
-                    .decrypt(&mut input, &mut std::io::sink(), |_| Ok(()))
+                    .decrypt_with_budget(
+                        &mut input,
+                        &mut std::io::sink(),
+                        |_| 0,
+                        |_| (),
+                        |_| Ok(())
+                    )
                     .unwrap_err(),
                 Error::Authentication
             );
@@ -290,7 +292,13 @@ fn corruption_cancellation_and_short_reads() {
     .unwrap();
     assert_eq!(
         decoder
-            .decrypt(&mut input, &mut std::io::sink(), |_| Err(Error::Cancelled))
+            .decrypt_with_budget(
+                &mut input,
+                &mut std::io::sink(),
+                |_| 0,
+                |_| (),
+                |_| Err(Error::Cancelled)
+            )
             .unwrap_err(),
         Error::Cancelled
     );
@@ -316,7 +324,7 @@ fn corruption_cancellation_and_short_reads() {
     .unwrap();
     let mut output = Vec::new();
     decoder
-        .decrypt(&mut input, &mut output, |_| Ok(()))
+        .decrypt_with_budget(&mut input, &mut output, |_| 0, |_| (), |_| Ok(()))
         .unwrap();
     assert_eq!(output, include_bytes!("../tests/data/expected.zip"));
 }
@@ -409,7 +417,6 @@ fn ctr_offsets_match_official_vectors_and_full_counter_carries() {
     }
 }
 
-#[cfg(feature = "parallel-decrypt")]
 #[test]
 fn parallel_decryption_authenticates_multibuffer_payload_and_recovery() {
     for code in 0..10 {
@@ -440,10 +447,16 @@ fn parallel_decryption_authenticates_multibuffer_payload_and_recovery() {
             encrypted_end,
             framing_error: None,
         };
-        for threads in [1, 2, 3, 4, 5, 8, 9] {
+        for threads in [1usize, 2, 3, 4, 5, 8, 9] {
             let mut output = Vec::new();
             decoder
-                .decrypt_with_threads(&mut Cursor::new(&bytes), &mut output, threads, |_| Ok(()))
+                .decrypt_with_budget(
+                    &mut Cursor::new(&bytes),
+                    &mut output,
+                    |wanted| wanted.min(threads - 1),
+                    |_| (),
+                    |_| Ok(()),
+                )
                 .unwrap();
             assert_eq!(output, plaintext);
         }
@@ -588,25 +601,31 @@ fn parallel_decryption_authenticates_multibuffer_payload_and_recovery() {
         let mut corrupt = bytes.clone();
         corrupt[encrypted_end as usize + 13] ^= 1;
         assert_eq!(
-            decoder.decrypt_with_threads(
+            decoder.decrypt_with_budget(
                 &mut Cursor::new(&corrupt),
                 &mut std::io::sink(),
-                4,
+                |wanted| wanted.min(3),
+                |_| (),
                 |_| Ok(())
             ),
             Err(Error::Authentication)
         );
         assert_eq!(
-            decoder.decrypt_with_threads(&mut Cursor::new(&bytes), &mut std::io::sink(), 4, |_| {
-                Err(Error::Cancelled)
-            }),
+            decoder.decrypt_with_budget(
+                &mut Cursor::new(&bytes),
+                &mut std::io::sink(),
+                |wanted| wanted.min(3),
+                |_| (),
+                |_| { Err(Error::Cancelled) }
+            ),
             Err(Error::Cancelled)
         );
         assert_eq!(
-            decoder.decrypt_with_threads(
+            decoder.decrypt_with_budget(
                 &mut Cursor::new(&bytes[..bytes.len() - 1]),
                 &mut std::io::sink(),
-                4,
+                |wanted| wanted.min(3),
+                |_| (),
                 |_| Ok(())
             ),
             Err(Error::Truncated)

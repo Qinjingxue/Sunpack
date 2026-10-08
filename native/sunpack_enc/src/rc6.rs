@@ -1,12 +1,15 @@
 //! ENC RC6-32/20/32: eight-block AVX2 and scalar tails.
 //! Key expansion/rounds adapted from RustCrypto rc6 0.1.0.
 //! Copyright (c) 2017 Damian Czaja. MIT: licenses/rc6-license.txt.
+use super::backend;
 use std::ops::BitXor;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub(super) struct Rc6 {
     keys: [u32; 44],
+    #[zeroize(skip)]
+    encrypt: backend::Encrypt<Self>,
 }
 trait Word: Copy + BitXor<Output = Self> {
     fn splat(value: u32) -> Self;
@@ -54,31 +57,52 @@ impl Rc6 {
                 .rotate_left(a.wrapping_add(b));
             words[j] = b;
         }
-        Self { keys }
+        Self {
+            keys,
+            encrypt: backend::capabilities().vector(
+                Self::encrypt_scalar,
+                #[cfg(target_arch = "x86_64")]
+                Self::encrypt_avx2,
+                #[cfg(target_arch = "aarch64")]
+                Self::encrypt_neon,
+            ),
+        }
     }
     pub(super) fn encrypt(&self, bytes: &mut [u8]) {
         debug_assert_eq!(bytes.len() % 16, 0);
         #[cfg(target_arch = "x86_64")]
-        let bytes = if bytes.len() >= 128 && std::is_x86_feature_detected!("avx2") {
-            let n = bytes.len() / 128 * 128;
-            let (bulk, tail) = bytes.split_at_mut(n);
-            // SAFETY: CPU/OS detection and complete eight-block groups.
-            unsafe { avx2::encrypt(&self.keys, bulk) };
-            tail
-        } else {
-            bytes
-        };
+        let short = bytes.len() < 128;
         #[cfg(target_arch = "aarch64")]
-        let bytes = if bytes.len() >= 64 && std::arch::is_aarch64_feature_detected!("neon") {
-            let n = bytes.len() / 64 * 64;
-            let (bulk, tail) = bytes.split_at_mut(n);
-            // SAFETY: detected NEON; complete four-block groups, unaligned loads.
+        let short = bytes.len() < 64;
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        let short = true;
+        if short {
+            // Quick proofs need no SIMD group or indirect backend call.
+            self.encrypt_scalar(bytes);
+            return;
+        }
+        // SAFETY: immutable backend bound from process CPU/OS capabilities.
+        unsafe { (self.encrypt)(self, bytes) };
+    }
+    #[cfg(target_arch = "x86_64")]
+    unsafe fn encrypt_avx2(&self, bytes: &mut [u8]) {
+        let n = bytes.len() / 128 * 128;
+        let (bulk, tail) = bytes.split_at_mut(n);
+        if n != 0 {
+            // SAFETY: constructor bound AVX2; complete eight-block groups.
+            unsafe { avx2::encrypt(&self.keys, bulk) };
+        }
+        self.encrypt_scalar(tail);
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe fn encrypt_neon(&self, bytes: &mut [u8]) {
+        let n = bytes.len() / 64 * 64;
+        let (bulk, tail) = bytes.split_at_mut(n);
+        if n != 0 {
+            // SAFETY: constructor bound NEON; complete four-block groups.
             unsafe { neon::encrypt(&self.keys, bulk) };
-            tail
-        } else {
-            bytes
-        };
-        self.encrypt_scalar(bytes);
+        }
+        self.encrypt_scalar(tail);
     }
     fn encrypt_scalar(&self, bytes: &mut [u8]) {
         for block in bytes.chunks_exact_mut(16) {
@@ -244,7 +268,7 @@ mod tests {
                 cipher.encrypt_scalar(&mut scalar[prefix..prefix + blocks * 16]);
                 assert_eq!(scalar, expected);
                 #[cfg(target_arch = "x86_64")]
-                if std::is_x86_feature_detected!("avx2") {
+                if backend::capabilities().avx2 {
                     let mut direct = input.clone();
                     let bulk = blocks / 8 * 128;
                     unsafe { avx2::encrypt(&cipher.keys, &mut direct[prefix..prefix + bulk]) };

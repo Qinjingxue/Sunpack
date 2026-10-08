@@ -18,16 +18,23 @@ workspace, with 64 MiB of aggregate scratch space per batch (six 10 MiB workspac
 for the default KDF). Higher encoded memory costs use fewer workspaces, with at
 least one workspace of the encoded size. Scratch space is dropped at batch exit;
 neither derived keys nor Argon2 buffers live in the prepared-context cache.
-The Python extension enables `parallel-kdf`: Argon2 0.6 computes its four lanes
-in that same Rayon pool, including batches with only one to four candidates.
-The worker build enables only `parallel-decrypt`, so its selected-password KDF
-stays serial. Build these packages separately to preserve Cargo feature isolation.
+Rayon and the parallel-capable KDF/CTR implementations are unconditional crate
+dependencies; the Python extension and worker use the same implementation, with
+no compile-time serial/parallel feature split. Argon2 SIMD fills its four lanes
+on the existing shared executor, bounded by each workspace's granted CPU budget.
+The worker borrows at most three extra credits for the selected-password KDF and
+returns them before reading recovery framing. A one-credit KDF fills lanes
+serially with the same SIMD primitives, without dispatching to Rayon.
 Candidate workspace counts account for both the four lanes and the number of
 active ENC batches, to limit scratch retained by nested joins under concurrent
 probes. The active-batch counter is released on every return/error; it retains
 no passwords, keys or workspaces.
 
-Extraction retains only small keys and a 256 KiB streaming buffer. It returns
+`Decoder::decrypt_with_budget` is the sole authenticated decrypt entry point.
+The caller owns one base credit and supplies acquire/release callbacks; granting
+zero extras is the normal serial case. A standalone fixed budget grants
+`wanted.min(credits.saturating_sub(1))` and uses a no-op release. Extraction
+retains only small keys and a 256 KiB streaming buffer. It returns
 one unnamed item, so the existing callback chooses the input filename stem.
 It knows nothing about ZIP contents or output extensions. Ordinary recursive
 discovery, output verification, cleanup, cancellation and CLI/Watch scheduling
@@ -46,7 +53,28 @@ cost does not justify a second parallel scheduling mechanism. COM reads, writes
 and callbacks remain on the job thread. C4 uses each stage's own counter width
 and byte offset. Expanded keys are shared; counter/pad scratch is zeroized on
 drop. The process shares one Rayon executor across jobs, so jobs never create or
-retain separate pools. Serpent uses RustCrypto 0.6's bitsliced implementation.
+retain separate pools.
+
+Custom cipher ISA policy lives in `src/backend.rs`. One process-wide, immutable
+capability record detects x64 AVX2 and SHA-NI (including SSSE3/SSE4.1), or ARM64
+NEON and SHA2 independently. RC6, Serpent, Threefish and SHACAL bind an encrypt
+function when their key is expanded; the decrypt hot loop does not check ISA
+availability. The record contains only CPU flags, with no keys or scratch space.
+AES, Argon2 and the portable SHACAL compression helper retain their upstream
+runtime-selected backends.
+
+RC6/Serpent/Threefish keep scalar processing for short proofs and incomplete SIMD
+groups; they never pad a 32B proof to a whole SIMD group. SHACAL uses its x64
+two-block SHA-NI kernel or ARM four-block SHA2 kernel, including hardware tails.
+Twofish keeps its eight-block interleave and const-generic tails. Unsupported ISA
+falls back to the existing scalar/portable implementation selected at construction;
+AVX2 does not imply SHA-NI, and NEON does not imply SHA2. Release CPU requirements
+are unchanged. ARM64 backends still await real Windows ARM64 validation.
+
+Bounded parallel MAC and writer probes remain benchmark-only. Production has
+no MAC experiment mode, double buffer, special AES thread policy or ENC-to-ZIP
+streaming route. CPU credits continue to vary by batch; input/output callbacks
+stay on the caller, and plaintext/key buffers are cleared when dropped.
 
 This initial implementation treats ENC as a complete logical stream. The format
 does not declare the ciphertext length, so it does not infer ENC boundaries inside

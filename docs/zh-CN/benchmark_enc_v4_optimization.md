@@ -1,5 +1,128 @@
 # ENC v4 后续优化
 
+## 2026-10-08 方案 A：统一实现与 backend 收口
+
+基线为干净的 `7a3bae84`。本轮目标是减少实现组合、保持已有性能与
+CPU 兼容性，不新增 cipher、线程策略或 IO 路径。结果目录为
+`benchmarks/results/enc-v4-optimization/20261008-consolidation`。
+修改前保存 release examples、worker，以及同一源码的 32B proof 对照。
+
+### 最终实现
+
+- 删除 `parallel-kdf` / `parallel-decrypt` Cargo features 及关闭 feature
+  时的生产实现；Rayon 成为必需依赖。CMake、Python native 和 benchmark
+  构建均不再传这两个 features。KDF/CTR 复用现有共享 executor。
+- 认证解密只留下 `Decoder::decrypt_with_budget`。总额度 1 是正常运行
+  状态；动态 broker、executor 容量限制、4 KiB 最小切片及立即归还
+  extra credits 的语义保留。KDF 仍最多借 3 个 extra，IO 不持有它们。
+- 自定义 cipher 的 ISA 检测集中到 `src/backend.rs` 的 `OnceLock`。
+  x64 AVX2 与 SHA/SSSE3/SSE4.1、ARM64 NEON 与 SHA2 独立判断。
+  RC6/Serpent/Threefish/SHACAL 在构造时绑定函数指针，热循环不再检测
+  自定义 ISA。缓存只包含 CPU flags；函数指针不持有 key、scratch 或 pool。
+- RC6/Serpent/Threefish 保留 scalar short/tail。短输入在间接调用前
+  直接使用 scalar；不为 32B proof 填满 SIMD lanes。Twofish 八块交错、
+  SHACAL 两块 SHA-NI/ARM 四块 SHA2 的算法结构与轮函数不变。
+- 上游 AES、Argon2、portable SHACAL compression 保留各自的 runtime
+  backend。旧 CPU 的 scalar/portable 路径保留，不提高发布 CPU 下限。
+  ARM64 本轮仅修改 dispatch，未编译、执行或测性能。
+- 生产保持一个 256 KiB buffer、串行 BLAKE3 和既有 writer；bounded MAC
+  仍在 benchmark，writer probe 仍只用于独立诊断构建。无生产 MAC 开关、
+  双 buffer、AES 特殊线程策略或 ENC→ZIP 流式分支。
+
+### 32B proof：避免短输入退化
+
+新增 `proof` example，直接复用生产 cipher。每轮 4 MiB 表示独立执行
+131072 次 32B CTR；每次使用 offset 0 和新 CTR scratch。排除 KDF、key
+expansion、文件读取和密码字符检查，**不是完整密码探测耗时**。
+固定 affinity `0,2,4,6`、executor 4；正反顺序 4 次，每进程 9 轮排除
+前 2 轮，各有 28 个样本。下表为 `ns_per_proof` 中位数：
+
+| 算法 | 基线 | 收口后 |
+| --- | ---: | ---: |
+| AES | 243.09 | 239.39 |
+| RC6 | 296.99 | 293.77 |
+| Serpent | 460.56 | 447.69 |
+| Threefish | 385.58 | 382.08 |
+| SHACAL | 261.79 | 259.51 |
+| C4 | 1366.39 | 1338.84 |
+
+初版所有输入都经过绑定指针，Threefish proof 出现约 4% 退化，因此
+最终保留短输入直接 scalar 的入口。复测十算法均未出现这一退化；
+约 1～3% 的差异不作为新提速承诺。初版和最终样本均保留于
+`proof-paired.json`、`proof-final-paired.json`。
+
+### 大载荷与完整认证
+
+Windows x64 / i9-13980HX / release，固定 affinity `0,2,4,6`、executor 4。
+十算法纯 CTR 每轮 32 MiB、256 KiB batch，正反顺序 4 次，每进程 9 轮
+排除 2 轮。1 credit 结果变化为约 -2.9%～+0.7%；4 credits 的多数
+算法变化在约 ±3.3%，Threefish 首次出现较大差异，另作复测。
+
+复测增加两个指向**同一个最终二进制**的标签，64 MiB、13 轮排除
+2 轮、正反顺序 4 次：Threefish 4 credits 的基线/after/same 为
+3261.03/4922.19/4231.63 MiB/s。相同最终二进制之间也相差约 16%，
+首次 -14.7% 没有稳定复现，不能从这组数据得出稳定增益或退化幅度。
+原始记录为 `ctr-final-paired.json`、`ctr-final-repeat.json`，包含全部
+样本；不同算法组合的绝对吞吐不直接互比。
+
+原生 null-sink 包含缓存读取、key expansion、MAC、CTR，排除 Open KDF
+和写盘。AES/SHACAL/C4 分别使用 64/16/8 MiB 独立 Java 输入；每进程
+11 轮排除 2 轮，正反顺序 4 次，共 36 个样本。单位 **MiB/s**：
+
+| 算法 / 总额度 | 基线 | 收口后 | 变化 |
+| --- | ---: | ---: | ---: |
+| AES / 1 | 2188.20 | 2164.48 | -1.1% |
+| AES / 4 | 2295.79 | 2319.78 | +1.0% |
+| SHACAL / 1 | 997.83 | 999.28 | +0.1% |
+| SHACAL / 4 | 1791.55 | 1734.08 | -3.2% |
+| C4 / 1 | 328.79 | 328.12 | -0.2% |
+| C4 / 4 | 893.35 | 906.07 | +1.4% |
+
+真实持久 worker 包含最终 KDF、完整认证和写盘；总容量 4、相同 affinity，
+每档预热一次，正反顺序交替 11 轮。计时外使用 Rust 验证输出 size/CRC32，
+foreground/watch 交错。八任务结果是总吞吐。单位 **MiB/s**：
+
+| 算法 / 任务数 | 基线 | 收口后 | 变化 |
+| --- | ---: | ---: | ---: |
+| AES / 1 | 1367.52 | 1372.59 | +0.4% |
+| AES / 8 | 1020.41 | 985.33 | -3.4% |
+| SHACAL / 1 | 200.72 | 198.26 | -1.2% |
+| SHACAL / 8 | 449.34 | 441.08 | -1.8% |
+| C4 / 1 | 102.87 | 100.57 | -2.2% |
+| C4 / 8 | 197.10 | 196.48 | -0.3% |
+
+对应 `decrypt-final-paired.json`、`worker-final-paired.json`。本机完整路径
+差异约在 ±3.5%；没有本轮新增大幅提速的证据，也不宣称所有机器严格零退化。
+
+### 验证
+
+无旧 features 的 x64 release worker 构建通过，standalone CRT 检查通过。
+`sunpack-enc --release --locked --all-targets`：核心 **19 passed**，
+examples 附带 **19 passed**（含重复复用的 cipher tests）。核心覆盖
+十算法官方 vectors、KDF 额度 1～4、任意 CTR offset/counter carry、
+动态额度、取消/错误/短读及 recovery/MAC 认证。独立 Java worker
+大载荷 fixture 已补齐 Serpent，覆盖全部十算法。
+
+Python 扩展已在现有 `.venv` 中以 release/locked 构建安装。完整密码探测
+另做前后 sanity check：相同 affinity/executor，1 个调用 job，3 错 + 1
+正确候选，每档 21 次排除前 2 次，取剩余 19 次的中位数。单位 **ms**：
+
+| 输入 | 基线 | 收口后 |
+| --- | ---: | ---: |
+| 296B AES vector | 33.35 | 32.89 |
+| Threefish vector | 33.46 | 33.42 |
+| 8 MiB C4 | 33.10 | 32.78 |
+
+这是先 before 后 after 的顺序检查，不是交替 A/B；不能据此承诺密码探测
+加速，只用于确认本轮没有可见延迟问题。对应 `password-before.json`、
+`password-after.json`。
+
+选定 Python/真实 worker 回归：**244 passed, 2 skipped**。覆盖密码调度、
+prepared-context 生命周期、十算法大载荷、额度 1/2/3/5/9、executor
+1/3 限制、错误密码和 MAC 失败后的并发额度归还、CLI/watch 提交、载体
+范围/原始分段及普通递归发现。2 项真实下载 watch 测试因未配置独立
+WatchBroker 测试服务而跳过；未安装或改动系统监控服务。ARM64 未验证。
+
 ## 2026-10-08 第六轮：流水实验收口与 SHACAL SHA-NI
 
 基线为干净的 `6b9cbb7e`，复用第五轮对应的最终 worker，并在修改前

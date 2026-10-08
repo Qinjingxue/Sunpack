@@ -1,5 +1,6 @@
 //! SHACAL-2. SHA-256 compression without feed-forward on the portable path;
 //! SHA-NI/ARMv8 SHA2 run independent blocks with one expanded key schedule.
+use super::backend;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 #[derive(Zeroize, ZeroizeOnDrop)]
@@ -7,6 +8,8 @@ pub(super) struct Shacal {
     key: [u8; 64],
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     rounds: [u32; 64],
+    #[zeroize(skip)]
+    encrypt: backend::Encrypt<Self>,
 }
 impl Shacal {
     pub(super) fn new(key: &[u8]) -> Self {
@@ -15,28 +18,27 @@ impl Shacal {
             key,
             #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
             rounds: expand(&key),
+            encrypt: backend::capabilities().sha(
+                Self::encrypt_portable,
+                #[cfg(target_arch = "x86_64")]
+                Self::encrypt_shani,
+                #[cfg(target_arch = "aarch64")]
+                Self::encrypt_sha2,
+            ),
         }
     }
     pub(super) fn encrypt(&self, bytes: &mut [u8]) {
-        #[cfg(target_arch = "x86_64")]
-        if std::arch::is_x86_feature_detected!("sha")
-            && std::arch::is_x86_feature_detected!("ssse3")
-            && std::arch::is_x86_feature_detected!("sse4.1")
-        {
-            unsafe {
-                x86::encrypt(&self.rounds, bytes);
-            }
-            return;
-        }
-        #[cfg(target_arch = "aarch64")]
-        if std::arch::is_aarch64_feature_detected!("sha2") {
-            // SHA2 on AArch64 includes the Advanced SIMD register operations.
-            unsafe {
-                arm::encrypt(&self.rounds, bytes);
-            }
-            return;
-        }
-        self.encrypt_portable(bytes);
+        debug_assert_eq!(bytes.len() % 32, 0);
+        // SAFETY: immutable backend bound from process CPU/OS capabilities.
+        unsafe { (self.encrypt)(self, bytes) };
+    }
+    #[cfg(target_arch = "x86_64")]
+    unsafe fn encrypt_shani(&self, bytes: &mut [u8]) {
+        unsafe { x86::encrypt(&self.rounds, bytes) };
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe fn encrypt_sha2(&self, bytes: &mut [u8]) {
+        unsafe { arm::encrypt(&self.rounds, bytes) };
     }
     fn encrypt_portable(&self, bytes: &mut [u8]) {
         for block in bytes.chunks_exact_mut(32) {

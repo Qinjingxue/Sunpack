@@ -1,5 +1,5 @@
 //! Authenticated streaming throughput to a null sink, excluding password KDF.
-//! cargo run --release -p sunpack-enc --features parallel-decrypt --example decrypt -- input.enc sunpack-test 4 3
+//! cargo run --release -p sunpack-enc --example decrypt -- input.enc sunpack-test 4 3
 use std::{fs::File, io::sink, time::Instant};
 use sunpack_enc::{Decoder, Workspace};
 
@@ -15,7 +15,13 @@ fn main() {
     for round in 0..rounds {
         let start = Instant::now();
         decoder
-            .decrypt_with_threads(&mut input, &mut sink(), threads, |_| Ok(()))
+            .decrypt_with_budget(
+                &mut input,
+                &mut sink(),
+                |wanted| wanted.min(threads.saturating_sub(1)),
+                |_| (),
+                |_| Ok(()),
+            )
             .unwrap();
         let elapsed = start.elapsed().as_secs_f64();
         println!(

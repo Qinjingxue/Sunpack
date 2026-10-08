@@ -2,6 +2,8 @@
 //! through RustCrypto's runtime-selected hardware backend (no per-byte dispatch).
 use cipher::{Block, BlockEncrypt, KeyInit};
 use zeroize::{Zeroize, ZeroizeOnDrop};
+#[path = "backend.rs"]
+mod backend;
 #[path = "blowfish.rs"]
 mod blowfish;
 #[path = "gost.rs"]
@@ -261,7 +263,6 @@ impl Stream {
             stage.apply_at(offset, bytes);
         }
     }
-    #[cfg(feature = "parallel-decrypt")]
     pub fn apply_with_threads(&self, offset: u64, bytes: &mut [u8], threads: usize) {
         use rayon::prelude::*;
         if bytes.is_empty() {

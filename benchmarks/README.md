@@ -4,7 +4,7 @@ Performance measurements and diagnostic profiles live here; behavioural assertio
 
 ENC v4 Rust probes live in `native/enc_ctr.rs` (pure CTR) and `native/enc_decrypt.rs`
 (authenticated streaming to a null sink). Run them with `cargo run --manifest-path
-native/Cargo.toml --release -p sunpack-enc --features parallel-decrypt --example throughput --
+native/Cargo.toml --release -p sunpack-enc --example throughput --
 256 3 5` or the `decrypt` example. Thread counts are benchmark budgets; the product worker
 acquires remaining CPU credits anew for each batch. Measurements and reproduction commands
 are in [ENC v4 optimization](../docs/zh-CN/benchmark_enc_v4_optimization.md).
@@ -396,3 +396,11 @@ Git revision; both sides use the installed native extension and current worker.
 Use `--origin watch` for the watch submission path. Pure AES diagnostics use the
 existing Rust `throughput` example with `-- 32 9 1 0 raw-aes`; this excludes CTR,
 KDF, authentication and I/O.
+
+For 32B quick-proof computation, use the native `proof` example:
+`cargo run --manifest-path native/Cargo.toml --release -p sunpack-enc --example proof -- 4 9 1 0,1,2,7,8,9`.
+It reports `ns_per_proof` using fresh CTR scratch for each 32B input, while
+excluding KDF/key expansion and file reads. Do not interpret it as complete
+password-probe latency. It shares the production cipher implementation and
+accepts the same CSV runner arguments as `throughput`; Rayon is always available
+in `sunpack-enc`, and CPU credits determine scheduling rather than Cargo features.

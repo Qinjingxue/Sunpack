@@ -1,5 +1,5 @@
 //! Pure CTR throughput, excluding KDF and disk I/O. Uses the production cipher.
-//! cargo run --release -p sunpack-enc --features parallel-decrypt --example throughput -- 256 3 4
+//! cargo run --release -p sunpack-enc --example throughput -- 256 3 4
 #[path = "../../native/sunpack_enc/src/cipher.rs"]
 #[allow(dead_code)]
 mod cipher;
@@ -15,8 +15,6 @@ fn main() {
     let algorithms: Option<Vec<u8>> = args
         .get(4)
         .map(|v| v.split(',').map(|code| code.parse().unwrap()).collect());
-    #[cfg(not(feature = "parallel-decrypt"))]
-    assert_eq!(threads, 1, "enable parallel-decrypt for multiple threads");
     assert!(mib > 0 && rounds > 0 && threads > 0);
     if args.get(5).is_some_and(|v| v == "raw-aes") {
         assert_eq!(threads, 1, "raw AES measures one hardware backend");
@@ -62,14 +60,11 @@ fn main() {
             let stream = cipher::Stream::new(code, &vec![0x73; key_len], &vec![0xff; nonce_len]);
             let start = Instant::now();
             for chunk in 0..mib * 4 {
-                #[cfg(feature = "parallel-decrypt")]
                 stream.apply_with_threads(
                     (chunk * 256 * 1024) as u64,
                     black_box(&mut buffer),
                     threads,
                 );
-                #[cfg(not(feature = "parallel-decrypt"))]
-                stream.apply_at((chunk * 256 * 1024) as u64, black_box(&mut buffer));
             }
             let elapsed = start.elapsed().as_secs_f64();
             black_box(&buffer);

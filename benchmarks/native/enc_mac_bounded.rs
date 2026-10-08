@@ -31,8 +31,6 @@ impl Authenticator {
         }
     }
     fn update_batch(&mut self, mut input: &[u8], threads: usize) {
-        #[cfg(not(feature = "parallel-decrypt"))]
-        let _ = threads;
         if input.is_empty() {
             return;
         }
@@ -47,7 +45,6 @@ impl Authenticator {
             }
             self.push(self.chunk.finalize_non_root(), 1);
         }
-        #[cfg(feature = "parallel-decrypt")]
         if threads > 1 && input.len() >= 2 * MIN_PARALLEL {
             use rayon::prelude::*;
             #[derive(Clone, Copy, Default, Zeroize)]

@@ -22,9 +22,9 @@ path = "../../benchmarks/native/enc_open.rs"
 name = "mac"
 path = "../../benchmarks/native/enc_mac.rs"
 
-[features]
-parallel-kdf = ["dep:rayon"]
-parallel-decrypt = ["dep:rayon"]
+[[example]]
+name = "proof"
+path = "../../benchmarks/native/enc_proof.rs"
 
 [dependencies]
 aes = "0.8"
@@ -35,7 +35,7 @@ blake3 = { version = "1.8", features = ["zeroize"] }
 cipher = "0.4"
 hkdf = "0.12"
 hmac = "0.12"
-rayon = { version = "1.10", optional = true }
+rayon = "1.10"
 sha2 = { version = "0.10", features = ["compress"] }
 sha3 = "0.10"
 skein = "0.1"

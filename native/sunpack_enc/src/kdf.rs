@@ -1,6 +1,5 @@
 //! Argon2id SIMD primitives on SunPack's existing shared Rayon executor.
 //! No helper threads, spin barrier, additional pool or retained scratch cache.
-#[cfg(feature = "parallel-kdf")]
 use argon2_rust::__internal::FillSegmentFn;
 use argon2_rust::{
     Algorithm, Error, Params, Version,
@@ -9,9 +8,9 @@ use argon2_rust::{
         Position,
     },
 };
+use rayon::prelude::*;
 use zeroize::Zeroizing;
 
-#[cfg(feature = "parallel-kdf")]
 struct LaneExecutor<'a> {
     instance: &'a Instance,
     fill: FillSegmentFn,
@@ -21,9 +20,7 @@ struct LaneExecutor<'a> {
 // indexing rules. Rayon joins all lanes before the next slice starts. The
 // borrowed, initialized and 64-byte-aligned arena outlives every scoped task;
 // no Rust reference into its blocks is accessed until all fills return.
-#[cfg(feature = "parallel-kdf")]
 unsafe impl Sync for LaneExecutor<'_> {}
-#[cfg(feature = "parallel-kdf")]
 impl LaneExecutor<'_> {
     fn fill_lane(&self, pass: u32, slice: u32, lane: u32) {
         // SAFETY: unique (lane, slice), bounded position, valid arena. `fill`
@@ -67,50 +64,34 @@ pub(super) fn derive(
         )
     };
     let fill = fill_segment_fn(backend());
-    #[cfg(feature = "parallel-kdf")]
-    {
-        use rayon::prelude::*;
-        let threads = if threads > 1 {
-            threads
-                .min(instance.lanes as usize)
-                .min(rayon::current_num_threads())
-        } else {
-            1
-        };
-        let executor = LaneExecutor {
-            instance: &instance,
-            fill,
-        };
-        for pass in 0..instance.passes {
-            for slice in 0..4 {
-                if threads == 1 {
-                    for lane in 0..instance.lanes {
-                        executor.fill_lane(pass, slice, lane);
-                    }
-                } else {
-                    // Exactly one task per granted credit. A task may fill
-                    // several lanes; all join before the next Argon2 slice.
-                    (0..threads)
-                        .into_par_iter()
-                        .with_max_len(1)
-                        .for_each(|task| {
-                            for lane in (task as u32..instance.lanes).step_by(threads) {
-                                executor.fill_lane(pass, slice, lane);
-                            }
-                        });
-                }
-            }
-        }
-    }
-    #[cfg(not(feature = "parallel-kdf"))]
-    let _ = threads;
-    #[cfg(not(feature = "parallel-kdf"))]
+    let threads = if threads > 1 {
+        threads
+            .min(instance.lanes as usize)
+            .min(rayon::current_num_threads())
+    } else {
+        1
+    };
+    let executor = LaneExecutor {
+        instance: &instance,
+        fill,
+    };
     for pass in 0..instance.passes {
         for slice in 0..4 {
-            for lane in 0..instance.lanes {
-                // SAFETY: this CPU supports the detected backend; valid arena,
-                // bounded position and one writer, with every slice completed.
-                unsafe { fill(&instance, Position::new(pass, lane, slice, 0)) };
+            if threads == 1 {
+                for lane in 0..instance.lanes {
+                    executor.fill_lane(pass, slice, lane);
+                }
+            } else {
+                // Exactly one task per granted credit. A task may fill
+                // several lanes; all join before the next Argon2 slice.
+                (0..threads)
+                    .into_par_iter()
+                    .with_max_len(1)
+                    .for_each(|task| {
+                        for lane in (task as u32..instance.lanes).step_by(threads) {
+                            executor.fill_lane(pass, slice, lane);
+                        }
+                    });
             }
         }
     }

@@ -1,5 +1,5 @@
 //! Worker Open/KDF with a fixed CPU budget; includes arena allocation and wipe.
-//! cargo run --release -p sunpack-enc --features parallel-kdf --example open -- input.enc sunpack-test 4 11
+//! cargo run --release -p sunpack-enc --example open -- input.enc sunpack-test 4 11
 use std::{fs::File, time::Instant};
 use sunpack_enc::Decoder;
 

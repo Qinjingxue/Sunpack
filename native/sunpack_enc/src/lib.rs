@@ -20,7 +20,6 @@ const PREFIX: u64 = 40;
 const CHECK: u64 = 32;
 const MAC: u64 = 32;
 const BUFFER: usize = 256 * 1024;
-#[cfg(feature = "parallel-decrypt")]
 const MIN_PARALLEL_CHUNK: usize = 4 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -281,35 +280,24 @@ impl Decoder {
         mut release: impl FnMut(usize),
     ) -> Result<Self> {
         let probe = PasswordProbe::read(input, length)?;
-        #[cfg(feature = "parallel-kdf")]
         let extra = acquire(3);
-        #[cfg(not(feature = "parallel-kdf"))]
-        let extra = {
-            let _ = &mut acquire;
-            0
-        };
         let keys = {
-            let lease = CpuLease {
+            let mut lease = CpuLease {
                 extra,
                 release: &mut release,
             };
-            #[cfg(feature = "parallel-kdf")]
-            let lease = {
-                let mut lease = lease;
-                if lease.extra != 0 {
-                    // Only initialize the shared executor if CPU was granted.
-                    // Return surplus immediately when its capacity is smaller.
-                    let usable = lease
-                        .extra
-                        .min(3)
-                        .min(rayon::current_num_threads().saturating_sub(1));
-                    if usable != lease.extra {
-                        (lease.release)(lease.extra - usable);
-                        lease.extra = usable;
-                    }
+            if lease.extra != 0 {
+                // Only initialize the shared executor if CPU was granted.
+                // Return surplus immediately when its capacity is smaller.
+                let usable = lease
+                    .extra
+                    .min(3)
+                    .min(rayon::current_num_threads().saturating_sub(1));
+                if usable != lease.extra {
+                    (lease.release)(lease.extra - usable);
+                    lease.extra = usable;
                 }
-                lease
-            };
+            }
             probe.keys(password, &mut Workspace::with_threads(1 + lease.extra))?
         };
         Self::finish_open(input, length, probe, keys)
@@ -342,31 +330,9 @@ impl Decoder {
         }
         self.encrypted_end - PREFIX - CHECK
     }
-    pub fn decrypt<R: Read + Seek, W: Write>(
-        &self,
-        input: &mut R,
-        output: &mut W,
-        progress: impl FnMut(u64) -> Result<()>,
-    ) -> Result<()> {
-        self.decrypt_with_threads(input, output, 1, progress)
-    }
-    /// Fixed budget for standalone Rust callers/benchmarks. The worker uses
-    /// `decrypt_with_budget` to acquire its actual remaining credits each batch.
-    pub fn decrypt_with_threads<R: Read + Seek, W: Write>(
-        &self,
-        input: &mut R,
-        output: &mut W,
-        threads: usize,
-        progress: impl FnMut(u64) -> Result<()>,
-    ) -> Result<()> {
-        self.decrypt_with_budget(
-            input,
-            output,
-            |wanted| wanted.min(threads.saturating_sub(1)),
-            |_| (),
-            progress,
-        )
-    }
+    /// Authenticate and decrypt through one budget-aware path. The caller owns
+    /// one base credit; grant zero extras for serial computation. A fixed budget
+    /// can grant `wanted.min(credits.saturating_sub(1))` with a no-op release.
     pub fn decrypt_with_budget<R: Read + Seek, W: Write>(
         &self,
         input: &mut R,
@@ -378,8 +344,6 @@ impl Decoder {
         if let Some(error) = self.framing_error {
             return Err(error);
         }
-        #[cfg(not(feature = "parallel-decrypt"))]
-        let _ = &mut acquire;
         input.seek(SeekFrom::Start(PREFIX))?;
         let mut mac = Zeroizing::new(blake3::Hasher::new_keyed(&self.keys.auth));
         mac.update(&self.keys.nonce);
@@ -397,7 +361,6 @@ impl Decoder {
             let decrypt_n = self.encrypted_end.saturating_sub(position).min(n as u64) as usize;
             if decrypt_n != 0 {
                 {
-                    #[cfg(feature = "parallel-decrypt")]
                     let extra = {
                         let slices = decrypt_n / MIN_PARALLEL_CHUNK;
                         let wanted = slices.saturating_sub(1);
@@ -408,20 +371,15 @@ impl Decoder {
                             acquire(wanted.min(rayon::current_num_threads().saturating_sub(1)))
                         }
                     };
-                    #[cfg(not(feature = "parallel-decrypt"))]
-                    let extra = 0;
                     let _lease = CpuLease {
                         extra,
                         release: &mut release,
                     };
-                    #[cfg(feature = "parallel-decrypt")]
                     cipher.apply_with_threads(
                         position - PREFIX,
                         &mut buffer[..decrypt_n],
                         1 + extra,
                     );
-                    #[cfg(not(feature = "parallel-decrypt"))]
-                    cipher.apply_at(position - PREFIX, &mut buffer[..decrypt_n]);
                 } // Return extra credits before writing; none are held during I/O.
                 let skip = (PREFIX + CHECK)
                     .saturating_sub(position)

@@ -11,8 +11,6 @@ fn main() {
     let mode = args.get(4).map_or("bounded", String::as_str);
     assert!(mib > 0 && rounds > 0 && threads > 0);
     assert!(matches!(mode, "serial" | "bounded"));
-    #[cfg(not(feature = "parallel-decrypt"))]
-    assert_eq!(threads, 1, "enable parallel-decrypt for multiple threads");
     let data = vec![0x73; 256 * 1024];
     let key = [0x93; 32];
     println!("mode,threads,mib,round,ms,mib_per_second");
