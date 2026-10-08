@@ -1,6 +1,7 @@
 """Official ENC vectors through the existing worker, discovery and verification."""
 import asyncio
 import json
+import shutil
 from pathlib import Path
 
 import pytest
@@ -17,6 +18,15 @@ from sunpack_native import enc_fast_verify_passwords, enc_fast_verify_passwords_
 
 ROOT = Path(__file__).resolve().parents[2]
 DATA = ROOT / "native" / "sunpack_enc" / "tests" / "data"
+
+
+def _flip_byte(path: Path, offset: int) -> None:
+    with path.open("r+b") as stream:
+        stream.seek(offset)
+        value = stream.read(1)
+        assert len(value) == 1
+        stream.seek(offset)
+        stream.write(bytes([value[0] ^ 1]))
 
 
 def worker(path, output, candidates=("sunpack-test",), *, origin="foreground"):
@@ -90,10 +100,9 @@ def test_mac_damage_is_data_damage_after_password_proof(tmp_path):
 
 
 def test_recovery_framing_damage_is_reported_as_damage(tmp_path):
-    from tests.helpers.native_fixture import native_fixture
     path = tmp_path / "recovery.bin"
-    native_fixture("copy", source=str(DATA / "recovery.enc"), output=str(path))
-    native_fixture("flip", path=str(path), offset=path.stat().st_size - 120)
+    shutil.copyfile(DATA / "recovery.enc", path)
+    _flip_byte(path, path.stat().st_size - 120)
     proof = enc_fast_verify_passwords(str(path), ["sunpack-test"])
     assert proof["status"] == "match"
     result = worker(path, tmp_path / "output")
@@ -161,13 +170,12 @@ def test_native_batch_preserves_priority_ranges_and_parallel_context_lifecycle()
 
 
 def test_prepared_context_is_invalidated_when_input_changes(tmp_path):
-    from tests.helpers.native_fixture import native_fixture
     path = tmp_path / "changing.enc"
-    native_fixture("copy", source=str(DATA / "algorithm_0.mov"), output=str(path))
+    shutil.copyfile(DATA / "algorithm_0.mov", path)
     assert enc_fast_verify_passwords(str(path), ["sunpack-test"])["status"] == "match"
-    native_fixture("flip", path=str(path), offset=40)
+    _flip_byte(path, 40)
     assert enc_fast_verify_passwords(str(path), ["sunpack-test"])["status"] == "no_match"
-    native_fixture("flip", path=str(path), offset=40)
+    _flip_byte(path, 40)
     assert enc_fast_verify_passwords(str(path), ["sunpack-test"])["status"] == "match"
 
 

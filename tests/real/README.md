@@ -56,8 +56,11 @@ Binary assembly and hashing use the test-only Cargo example `real_fixture`,
 with bounded buffers (64 KiB for assembly/hashing, 256 KiB input for LZ4).
 LZ4 frames use the pinned upstream encoder with block/content checksums,
 declared content size and linked 64 KiB blocks; multiple sources produce
-concatenated frames without querying the product parser. It is built with the workspace's existing locked
-dependencies and does not add production APIs or dependencies. Python reads
+concatenated frames without querying the product parser. Before running pytest,
+`scripts/setup_windows_dev.ps1` builds it with the workspace's existing locked
+dependencies and installs it as `tools/real_fixture.exe` (`tools-arm64` on ARM64).
+The helper fails explicitly if it is missing and never invokes Cargo during tests.
+This does not add production APIs or dependencies. Python reads
 only text manifests and orchestrates existing fixture/tool paths.
 
 The legacy CP437 case asserts exact names and contents in all three containers.

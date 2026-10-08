@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sysconfig
 from functools import lru_cache
 from pathlib import Path
 
@@ -9,18 +10,14 @@ from pathlib import Path
 @lru_cache(maxsize=1)
 def _fixture_tool() -> Path:
     root = Path(__file__).resolve().parents[2]
-    manifest = root / "native" / "Cargo.toml"
-    command = ["cargo", "--manifest-path", str(manifest)]
-    metadata = subprocess.run(
-        [command[0], "metadata", *command[1:], "--no-deps", "--format-version", "1"],
-        check=True, capture_output=True, text=True, encoding="utf-8",
-    )
-    subprocess.run(
-        [command[0], "build", *command[1:], "--locked", "-p", "sunpack-native",
-         "--example", "real_fixture"],
-        check=True, capture_output=True, text=True, encoding="utf-8",
-    )
-    return Path(json.loads(metadata.stdout)["target_directory"]) / "debug/examples/real_fixture.exe"
+    tools = "tools-arm64" if sysconfig.get_platform() == "win-arm64" else "tools"
+    tool = root / tools / "real_fixture.exe"
+    if not tool.is_file():
+        raise FileNotFoundError(
+            f"Native test fixture tool is missing: {tool}. "
+            "Run scripts/setup_windows_dev.ps1 before pytest; tests never build it."
+        )
+    return tool
 
 
 def native_fixture(operation: str, **arguments) -> dict:

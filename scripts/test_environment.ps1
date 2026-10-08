@@ -92,6 +92,11 @@ function Get-NativeArtifactRefreshReasons {
             $sharedRustTime, $lz4Time,
             (Get-NewestSourceWriteTime -Paths (Join-Path $nativeRoot "sunpack_native"))
         ) },
+        @{ Name = "Native test fixture"; Artifact = (Join-Path $toolsRoot "real_fixture.exe"); InputTime = @(
+            $sharedRustTime, $lz4Time,
+            (Get-NewestSourceWriteTime -Paths (Join-Path $nativeRoot "sunpack_native")),
+            (Get-NewestSourceWriteTime -Paths (Join-Path $nativeRoot "sunpack_enc"))
+        ) },
         @{ Name = "Watch Broker"; Artifact = (Get-WatchBrokerBuildPath -RepoRoot $RepoRoot -Arch $Arch); InputTime = @(
             $sharedRustTime,
             (Get-NewestSourceWriteTime -Paths (Join-Path $nativeRoot "sunpack_watch_broker"))

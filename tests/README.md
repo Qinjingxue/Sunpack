@@ -20,6 +20,7 @@ pytest 收集。pytest 中只保留行为断言；资源或时序稳定性断言
 
 ```powershell
 uv sync --locked --extra test
+.\scripts\setup_windows_dev.ps1 -Arch x64
 $workers = [math]::Max(1, [math]::Floor([Environment]::ProcessorCount / 4))
 uv run --locked pytest -n $workers --dist worksteal
 ```
@@ -61,6 +62,11 @@ CI 和 acceptance runner（包括根目录 `run_acceptance_tests.ps1`）默认�
 `.cache/rust-target/<arch>/<target>/release/` 的产物，不回退到 `native/target`。
 这里不保存 manifest，也不计算源码或产物 hash。检查面向正常编辑/Git 工作流，
 不能识别保留旧时间戳的源码替换；这类操作后应主动运行 setup。
+测试用 Rust `real_fixture.exe` 也由 setup 统一构建并复制到对应架构的 tools 目录，
+纳入 CI/验收的产物过期检查。pytest helper 只调用现成工具，缺失时明确报错，
+不会执行 Cargo metadata/build，避免 xdist worker 重复编译和争用构建锁。
+WinGet manifest 的各场景在同一个 PowerShell 会话中调用真实脚本，使用 pytest
+subtests 分别报告断言结果；普通测试仍使用 worksteal 并行调度。
 setup 成功构建/安装后，只将旧产物时间推进到该组件的构建开始时间，以支持无需重新链接的
 增量构建；新生成产物保留原时间，不破坏构建系统的增量判断。
 验收入口的 `-SkipEnvironmentRefresh` 仍可显式跳过检查和自动刷新。

@@ -888,6 +888,20 @@ Invoke-Native -FilePath "uv" -Arguments @("pip", "install", "--python", $venvPyt
 Test-NativeImport -PythonPath $venvPython
 Set-DevelopmentArtifactBuildTime -Path (Get-NativeExtensionPath -PythonPath $venvPython) -BuildStartedUtc $nativeBuildStartedUtc
 
+Write-Step "Building native test fixture tool"
+$fixtureBuildStartedUtc = [datetime]::UtcNow
+Invoke-Native -FilePath "cargo" -Arguments @(
+    "build", "--locked", "--manifest-path", $nativeCargoToml,
+    "--release", "--target", $rustTarget, "--target-dir", $rustTargetDir,
+    "--example", "real_fixture"
+)
+$fixtureBuildPath = Join-Path $rustTargetDir "$rustTarget\release\examples\real_fixture.exe"
+Assert-PathExists -LiteralPath $fixtureBuildPath -Description "Native test fixture executable"
+New-Item -ItemType Directory -Path $toolsRoot -Force | Out-Null
+$fixtureToolPath = Join-Path $toolsRoot "real_fixture.exe"
+Copy-Item -LiteralPath $fixtureBuildPath -Destination $fixtureToolPath -Force
+Set-DevelopmentArtifactBuildTime -Path $fixtureToolPath -BuildStartedUtc $fixtureBuildStartedUtc
+
 Write-Step "Building minimal Windows Watch Broker service"
 $brokerBuildStartedUtc = [datetime]::UtcNow
 Invoke-Native -FilePath "cargo" -Arguments @(

@@ -1,4 +1,5 @@
 from pathlib import Path
+import json
 import subprocess
 
 
@@ -9,45 +10,7 @@ PREPARE_SCRIPT = ROOT / "scripts" / "prepare_winget_manifest.ps1"
 PRODUCT_CODE = "'{9E8C73E5-C540-4E68-93E0-1FBAAFB89713}_is1'"
 
 
-def _run_prepare(
-    output_root: Path,
-    version: str = "9.8.7",
-    release_tag: str | None = None,
-    release_date: str | None = None,
-) -> subprocess.CompletedProcess[str]:
-    command = [
-        "pwsh",
-        "-NoProfile",
-        "-ExecutionPolicy",
-        "Bypass",
-        "-File",
-        str(PREPARE_SCRIPT),
-        "-Version",
-        version,
-        "-X64Sha256",
-        "a" * 64,
-        "-Arm64Sha256",
-        "b" * 64,
-        "-OutputRoot",
-        str(output_root),
-    ]
-    if release_tag is not None:
-        command += ["-ReleaseTag", release_tag]
-    if release_date is not None:
-        command += ["-ReleaseDate", release_date]
-    return subprocess.run(
-        command,
-        cwd=ROOT,
-        text=True,
-        capture_output=True,
-        encoding="utf-8",
-        errors="replace",
-        check=False,
-    )
-
-
-def test_prepare_winget_manifest_emits_a_complete_multifile_set(tmp_path):
-    result = _run_prepare(tmp_path)
+def _check_complete_multifile_set(tmp_path, result):
 
     assert result.returncode == 0, result.stdout + result.stderr
     manifest_root = tmp_path / "q" / "Qinjingxue" / "SunPack" / "9.8.7"
@@ -85,8 +48,7 @@ def test_prepare_winget_manifest_emits_a_complete_multifile_set(tmp_path):
     assert "Publisher: SunPack" in locale
 
 
-def test_prepare_winget_manifest_keeps_package_version_equal_to_the_release_tag(tmp_path):
-    result = _run_prepare(tmp_path, version="v0.5.1")
+def _check_package_version(tmp_path, result):
 
     assert result.returncode == 0, result.stdout + result.stderr
     # The installers are built from the tag and report it verbatim, so the
@@ -111,8 +73,7 @@ def test_prepare_winget_manifest_keeps_package_version_equal_to_the_release_tag(
     assert "DisplayVersion:" not in installer
 
 
-def test_prepare_winget_manifest_declares_the_inno_product_code(tmp_path):
-    result = _run_prepare(tmp_path)
+def _check_product_code(tmp_path, result):
 
     assert result.returncode == 0, result.stdout + result.stderr
     installer = (
@@ -127,15 +88,13 @@ def test_prepare_winget_manifest_declares_the_inno_product_code(tmp_path):
     assert installer.count(PRODUCT_CODE) == 4
 
 
-def test_prepare_winget_manifest_rejects_a_release_tag_that_differs_from_version(tmp_path):
-    result = _run_prepare(tmp_path, version="9.8.7", release_tag="v9.8.7")
+def _check_release_tag_differs(tmp_path, result):
 
     assert result.returncode != 0
     assert "ReleaseTag must match Version" in (result.stdout or "") + (result.stderr or "")
 
 
-def test_prepare_winget_manifest_records_published_date_in_installer(tmp_path):
-    result = _run_prepare(tmp_path, release_date="2026-10-03")
+def _check_published_date(tmp_path, result):
 
     assert result.returncode == 0, result.stdout + result.stderr
     locale = (
@@ -151,22 +110,68 @@ def test_prepare_winget_manifest_records_published_date_in_installer(tmp_path):
     assert "ReleaseDate:" not in locale
 
 
-def test_prepare_winget_manifest_omits_unspecified_date(tmp_path):
-    result = _run_prepare(tmp_path)
+def _check_unspecified_date(tmp_path, result):
     assert result.returncode == 0, result.stdout + result.stderr
     for path in (tmp_path / "q" / "Qinjingxue" / "SunPack" / "9.8.7").glob("*.yaml"):
         assert "ReleaseDate:" not in path.read_text(encoding="utf-8")
 
 
-def test_prepare_winget_manifest_rejects_invalid_calendar_date(tmp_path):
-    result = _run_prepare(tmp_path, release_date="2026-02-30")
+def _check_invalid_calendar_date(tmp_path, result):
     assert result.returncode != 0
 
 
-def test_prepare_winget_manifest_does_not_overwrite_without_force(tmp_path):
-    first = _run_prepare(tmp_path)
-    second = _run_prepare(tmp_path)
-
+def _check_does_not_overwrite(tmp_path, first, second):
     assert first.returncode == 0, first.stdout + first.stderr
     assert second.returncode != 0
     assert "-Force" in ((second.stdout or "") + (second.stderr or ""))
+
+
+# One pytest item keeps worksteal from distributing cases to separate hosts.
+# Subtests retain independent failure reporting and execute every assertion set.
+CASES = [
+    ("complete_multifile", _check_complete_multifile_set, {}),
+    ("package_version", _check_package_version, {"Version": "v0.5.1"}),
+    ("product_code", _check_product_code, {}),
+    ("release_tag_differs", _check_release_tag_differs, {"ReleaseTag": "v9.8.7"}),
+    ("published_date", _check_published_date, {"ReleaseDate": "2026-10-03"}),
+    ("unspecified_date", _check_unspecified_date, {}),
+    ("invalid_calendar_date", _check_invalid_calendar_date, {"ReleaseDate": "2026-02-30"}),
+    ("does_not_overwrite", _check_does_not_overwrite, {}),
+]
+
+
+def test_prepare_winget_manifest_cases(tmp_path, subtests):
+    requests = []
+    for name, _check, overrides in CASES:
+        arguments = {
+            "Version": "9.8.7", "X64Sha256": "a" * 64, "Arm64Sha256": "b" * 64,
+            "OutputRoot": str(tmp_path / name), **overrides,
+        }
+        requests.append({"id": name, "arguments": arguments})
+    requests.append({"id": "overwrite_second", "arguments": requests[-1]["arguments"]})
+    cases_path = tmp_path / "cases.json"
+    results_path = tmp_path / "results.json"
+    cases_path.write_text(json.dumps(requests), encoding="utf-8")
+    host = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+         "-File", str(ROOT / "tests/helpers/prepare_winget_cases.ps1"),
+         "-PrepareScript", str(PREPARE_SCRIPT), "-CasesPath", str(cases_path),
+         "-ResultsPath", str(results_path)],
+        cwd=ROOT, text=True, capture_output=True, encoding="utf-8", errors="replace",
+        check=False, timeout=120,
+    )
+    assert host.returncode == 0, host.stdout + host.stderr
+    records = json.loads(results_path.read_text(encoding="utf-8"))
+    assert [record["id"] for record in records] == [case["id"] for case in requests]
+    results = {
+        record["id"]: subprocess.CompletedProcess(
+            args=record["id"], returncode=record["returncode"],
+            stdout=record["stdout"], stderr=record["stderr"],
+        ) for record in records
+    }
+    for name, check, _overrides in CASES:
+        with subtests.test(msg=name):
+            if name == "does_not_overwrite":
+                check(tmp_path / name, results[name], results["overwrite_second"])
+            else:
+                check(tmp_path / name, results[name])

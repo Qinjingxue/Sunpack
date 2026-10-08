@@ -1,10 +1,9 @@
 """ENC is an ordinary stream extraction; recursive discovery owns its payload."""
 import asyncio
 import json
-import os
 import subprocess
 import sys
-
+import shutil
 import pytest
 from sunpack.core.contracts.results import OutcomeKind
 from sunpack.pipeline.coordinator.engine import PipelineEngine
@@ -36,7 +35,7 @@ def config_for(tmp_path, passwords=("wrong", "sunpack-test")):
 @pytest.mark.parametrize("name,count", [("algorithm_0.mov", 2), ("nested.enc", 4), ("recovery.enc", 2)])
 def test_ordinary_recursion_authentication_and_no_extension_output(tmp_path, origin, name, count, worker_jobs):
     source = tmp_path / "misnamed.photo"
-    os.link(DATA / name, source)
+    shutil.copyfile(DATA / name, source)
 
     async def run():
         async with PipelineEngine(config_for(tmp_path)) as engine:
@@ -61,7 +60,7 @@ def test_failed_enc_never_recurses_or_deletes_source(tmp_path, origin, name, pas
         pytest.fail("single candidate ran a redundant host password KDF")
 
     monkeypatch.setattr(EncFastVerifier, "verify_batch", unexpected_probe)
-    source = tmp_path / "failed.movie"; os.link(DATA / name, source)
+    source = tmp_path / "failed.movie"; shutil.copyfile(DATA / name, source)
     config = config_for(tmp_path, passwords)
     config["post_extract"]["archive_cleanup_mode"] = "d"
 
@@ -90,7 +89,7 @@ def test_single_candidate_enc_reuses_worker_confirmation_without_host_kdf(
 
     monkeypatch.setattr(EncFastVerifier, "verify_batch", unexpected_probe)
     source = tmp_path / "single.photo"
-    os.link(DATA / name, source)
+    shutil.copyfile(DATA / name, source)
 
     async def run():
         async with PipelineEngine(config_for(tmp_path, ("sunpack-test",))) as engine:
@@ -107,7 +106,7 @@ def test_single_candidate_enc_reuses_worker_confirmation_without_host_kdf(
 
 @pytest.mark.parametrize("direct", [False, True])
 def test_cli_disguised_enc_recurses_through_existing_zip_path(tmp_path, direct):
-    source = tmp_path / "film.mp4"; os.link(DATA / "algorithm_0.mov", source)
+    source = tmp_path / "film.mp4"; shutil.copyfile(DATA / "algorithm_0.mov", source)
     result = subprocess.run([sys.executable, "-B", str(ROOT / "sunpack.py"), "extract", "--json",
                              *(["--direct-file"] if direct else []), "--out-dir", str(tmp_path / "out"),
                              "--cleanup", "k", "--recur", "2", "-p", "sunpack-test",
