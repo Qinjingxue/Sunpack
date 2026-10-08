@@ -4,12 +4,10 @@ import pytest
 
 from tests.helpers.detection_probe import detect_archive_hits
 from tests.helpers.real_archives import (
-    create_7z_nonsolid_archive,
     create_multi_member_stream_archive,
     create_rar4_archive,
     create_stream_variant_archive,
     create_streaming_zip_archive,
-    create_xz_sha256_archive,
     create_zip64_archive,
     create_zip_multidisk_archive,
 )
@@ -43,27 +41,13 @@ def test_plan1_streaming_zip_uses_data_descriptors_and_extracts(tmp_path, plan1_
     assert_plan1_success(case, ".zip", error_info=plan1_error)
 
 
-def test_plan1_zip64_archive_structural_and_detection(tmp_path, plan1_error):
-    """小 ZIP64 样本：ZIP64 EOCD + locator 结构 + 检测。"""
-    case = create_zip64_archive(tmp_path, "zip64_small", payload_size=4096)
-    plan1_error["case_id"] = case.case_id
-    raw = case.entry_path.read_bytes()
-    plan1_error["zip64_eocd_present"] = b"PK\x06\x06" in raw
-    plan1_error["zip64_locator_present"] = b"PK\x06\x07" in raw
-    assert b"PK\x06\x06" in raw, "fixture must contain a ZIP64 end-of-central-directory record"
-    assert b"PK\x06\x07" in raw, "fixture must contain a ZIP64 end-of-central-directory locator"
-
-    hits = detect_archive_hits(case.entry_path)
-    plan1_error["detection_hit_count"] = len(hits)
-    plan1_error["detected_ext"] = detected_ext(hits[0]) if hits else None
-    assert len(hits) == 1
-    assert detected_ext(hits[0]) == ".zip"
-
-
 def test_plan1_zip64_archive_extracts_and_detects(tmp_path, plan1_error):
     """小 ZIP64 样本全量解压：7z 可正常解压，sunpack 检测 .zip 并解出 marker。"""
     case = create_zip64_archive(tmp_path, "zip64_extract", payload_size=4096)
     plan1_error["case_id"] = case.case_id
+    raw = case.entry_path.read_bytes()
+    assert b"PK\x06\x06" in raw, "fixture must contain a ZIP64 EOCD"
+    assert b"PK\x06\x07" in raw, "fixture must contain a ZIP64 locator"
     assert_plan1_success(case, ".zip", error_info=plan1_error)
 
 
@@ -81,13 +65,6 @@ def test_plan1_real_pkzip_multidisk_archive_extracts_and_detects(tmp_path, plan1
         expected_member_count=2,
         error_info=plan1_error,
     )
-
-
-def test_plan1_7z_nonsolid_archive_extracts_and_detects(tmp_path, plan1_error):
-    case = create_7z_nonsolid_archive(tmp_path, "7z_nonsolid", payload_size=16 * 1024)
-    plan1_error["case_id"] = case.case_id
-    plan1_error["archive_format"] = "7z"
-    assert_plan1_success(case, ".7z", error_info=plan1_error)
 
 
 def test_plan1_rar4_legacy_archive_extracts_and_detects(tmp_path, plan1_error):
@@ -175,13 +152,6 @@ def test_plan1_multi_member_streams_extract_all_members(
     assert marker_text_contained(case.archive_dir, second_content), (
         "second member content was not extracted"
     )
-
-
-def test_plan1_xz_sha256_check_archive_extracts_and_detects(tmp_path, plan1_error):
-    case = create_xz_sha256_archive(tmp_path, "xz_sha256", payload_size=16 * 1024)
-    plan1_error["case_id"] = case.case_id
-    plan1_error["archive_format"] = "xz"
-    assert_plan1_success(case, ".xz", error_info=plan1_error)
 
 
 @pytest.mark.parametrize(

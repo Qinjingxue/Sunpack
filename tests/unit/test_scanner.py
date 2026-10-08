@@ -32,16 +32,7 @@ def test_directory_scanner_captures_files_and_directories(tmp_path):
     entries = _entries(snapshot)
     assert any(entry.is_dir and entry.path.name == "nested" for entry in entries)
     assert any(not entry.is_dir and entry.path.name == "archive.zip" for entry in entries)
-
-
-def test_directory_scanner_records_file_size(tmp_path):
-    target = tmp_path / "archive.zip"
-    target.write_bytes(b"PK\x03\x04payload")
-
-    snapshot = DirectoryScanner(str(tmp_path), config=make_config()).scan()
-    entry = next(entry for entry in _entries(snapshot) if entry.path == target)
-
-    assert entry.size == target.stat().st_size
+    assert next(entry for entry in entries if entry.path.name == "archive.zip").size == 4
 
 
 def test_directory_scanner_size_range_filters_files_outside_range(tmp_path):
@@ -52,18 +43,16 @@ def test_directory_scanner_size_range_filters_files_outside_range(tmp_path):
     medium.write_bytes(b"b" * 16)
     large.write_bytes(b"c" * 32)
 
-    snapshot = DirectoryScanner(str(tmp_path), config=make_config({
-        "filesystem": {
-            "scan_filters": [
-                {"name": "size_range", "enabled": True, "gte": 10, "lt": 32},
-            ]
-        }
-    })).scan()
-
-    names = {entry.path.name for entry in _entries(snapshot)}
-    assert "small.zip" not in names
-    assert "medium.zip" in names
-    assert "large.zip" not in names
+    for bounds, expected in (
+        ({"gte": 10, "lt": 32}, {"medium.zip"}),
+        ({"gte": 10}, {"medium.zip", "large.zip"}),
+    ):
+        snapshot = DirectoryScanner(str(tmp_path), config=make_config({
+            "filesystem": {
+                "scan_filters": [{"name": "size_range", "enabled": True, **bounds}]
+            }
+        })).scan()
+        assert {entry.path.name for entry in _entries(snapshot)} == expected
 
 
 def test_directory_scanner_size_range_accepts_human_expression(tmp_path):
@@ -88,25 +77,6 @@ def test_directory_scanner_size_range_accepts_human_expression(tmp_path):
     assert "large.zip" not in names
 
 
-def test_directory_scanner_size_range_gte_filters(tmp_path):
-    small = tmp_path / "small.zip"
-    keep = tmp_path / "keep.zip"
-    small.write_bytes(b"a" * 8)
-    keep.write_bytes(b"b" * 16)
-
-    snapshot = DirectoryScanner(str(tmp_path), config=make_config({
-        "filesystem": {
-            "scan_filters": [
-                {"name": "size_range", "enabled": True, "gte": 10},
-            ]
-        }
-    })).scan()
-
-    names = {entry.path.name for entry in _entries(snapshot)}
-    assert "small.zip" not in names
-    assert "keep.zip" in names
-
-
 def test_directory_scanner_promotes_small_split_member_with_accepted_family_anchor(tmp_path):
     first = tmp_path / "payload.7z.001"
     second = tmp_path / "payload.7z.002"
@@ -116,6 +86,7 @@ def test_directory_scanner_promotes_small_split_member_with_accepted_family_anch
     second.write_bytes(b"b" * 16)
     tail.write_bytes(b"tail")
     unrelated.write_bytes(b"noise")
+    (tmp_path / "unrelated.7z.002").write_bytes(b"noise")
 
     snapshot = DirectoryScanner(str(tmp_path), config=make_config({
         "filesystem": {
@@ -128,6 +99,7 @@ def test_directory_scanner_promotes_small_split_member_with_accepted_family_anch
     names = {entry.path.name for entry in _entries(snapshot)}
     assert {first.name, second.name, tail.name} <= names
     assert unrelated.name not in names
+    assert "unrelated.7z.002" not in names
 
 
 @pytest.mark.parametrize(
@@ -185,23 +157,6 @@ def test_directory_scanner_never_promotes_hard_rejected_split_member(tmp_path):
     names = {entry.path.name for entry in _entries(snapshot)}
     assert first.name in names
     assert blocked_tail.name not in names
-
-
-def test_directory_scanner_does_not_promote_split_shaped_small_files_without_anchor(tmp_path):
-    (tmp_path / "orphan.7z.002").write_bytes(b"small")
-    (tmp_path / "orphan.7z.003").write_bytes(b"small")
-
-    snapshot = DirectoryScanner(str(tmp_path), config=make_config({
-        "filesystem": {
-            "scan_filters": [
-                {"name": "size_range", "enabled": True, "gte": 10},
-            ]
-        }
-    })).scan()
-
-    assert not {"orphan.7z.002", "orphan.7z.003"} & {
-        entry.path.name for entry in _entries(snapshot)
-    }
 
 
 def test_snapshot_from_entries_preserves_anchored_small_split_member(tmp_path):
@@ -651,66 +606,6 @@ def test_directory_scanner_whitelist_non_empty_fields_are_combined_as_constraint
     assert "sample.zip" in names
     assert "sample.rar" not in names
     assert "other.zip" not in names
-
-
-def test_directory_scanner_directory_prune_prunes_directory(tmp_path):
-    blocked_dir = tmp_path / "blocked"
-    blocked_dir.mkdir()
-    (blocked_dir / "payload.zip").write_bytes(b"PK\x03\x04payload")
-    (tmp_path / "keep.zip").write_bytes(b"PK\x03\x04payload")
-
-    snapshot = DirectoryScanner(str(tmp_path), config=make_config({
-        "filesystem": {
-            "scan_filters": [
-                {"name": "directory_prune", "enabled": True, "prune_dir_globs": ["blocked"]},
-            ]
-        }
-    })).scan()
-
-    names = {entry.path.name for entry in _entries(snapshot)}
-    assert "blocked" not in names
-    assert "payload.zip" not in names
-    assert "keep.zip" in names
-
-
-def test_directory_scanner_directory_prune_supports_path_globs(tmp_path):
-    blocked_dir = tmp_path / "$RECYCLE.BIN"
-    blocked_dir.mkdir()
-    (blocked_dir / "payload.zip").write_bytes(b"PK\x03\x04payload")
-    (tmp_path / "keep.zip").write_bytes(b"PK\x03\x04payload")
-
-    snapshot = DirectoryScanner(str(tmp_path), config=make_config({
-        "filesystem": {
-            "scan_filters": [
-                {"name": "directory_prune", "enabled": True, "path_globs": ["$RECYCLE.BIN/**"]},
-            ]
-        }
-    })).scan()
-
-    names = {entry.path.name for entry in _entries(snapshot)}
-    assert "$RECYCLE.BIN" not in names
-    assert "payload.zip" not in names
-    assert "keep.zip" in names
-
-
-def test_directory_scanner_directory_prune_supports_prune_dir_globs(tmp_path):
-    blocked_dir = tmp_path / "node_modules"
-    blocked_dir.mkdir()
-    (blocked_dir / "payload.zip").write_bytes(b"PK\x03\x04payload")
-    (tmp_path / "keep.zip").write_bytes(b"PK\x03\x04payload")
-
-    snapshot = DirectoryScanner(str(tmp_path), config=make_config({
-        "filesystem": {
-            "scan_filters": [
-                {"name": "directory_prune", "enabled": True, "prune_dir_globs": ["node_*"]},
-            ]
-        }
-    })).scan()
-
-    names = {entry.path.name for entry in _entries(snapshot)}
-    assert "node_modules" not in names
-    assert "payload.zip" not in names
-    assert "keep.zip" in names
 
 
 def test_directory_scanner_directory_prune_globs_are_directory_only(tmp_path):

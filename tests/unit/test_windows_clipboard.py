@@ -102,16 +102,6 @@ def test_read_clipboard_passwords_splits_lines_and_skips_empty_lines(monkeypatch
         assert clipboard_module.read_clipboard_passwords() == expected
 
 
-def test_read_clipboard_passwords_keeps_multiline_default_behavior(monkeypatch):
-    monkeypatch.setattr(
-        clipboard_module,
-        "_read_windows_unicode_clipboard",
-        lambda *, max_chars: "a\nb",
-    )
-
-    assert clipboard_module.read_clipboard_passwords() == ["a", "b"]
-
-
 def test_read_clipboard_passwords_preserves_hash_prefix_and_surrounding_spaces(monkeypatch):
     monkeypatch.setattr(
         clipboard_module,

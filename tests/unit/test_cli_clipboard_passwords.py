@@ -16,12 +16,6 @@ def _password_args() -> SimpleNamespace:
     )
 
 
-def test_collect_clipboard_passwords_reads_when_config_enabled(monkeypatch):
-    monkeypatch.setattr(cli_runtime, "read_clipboard_passwords", lambda: ["clip-secret"])
-
-    assert cli_runtime.collect_clipboard_passwords({"passwords": {"clipboard_passwords_enabled": True}}) == ["clip-secret"]
-
-
 def test_collect_clipboard_passwords_skips_when_config_disabled(monkeypatch):
     called = False
 
@@ -36,29 +30,20 @@ def test_collect_clipboard_passwords_skips_when_config_disabled(monkeypatch):
     assert called is False
 
 
-def test_collect_clipboard_passwords_splits_multiline_text(monkeypatch):
-    monkeypatch.setattr(
-        clipboard_module,
-        "_read_windows_unicode_clipboard",
-        lambda *, max_chars: "\r\nfirst\n\nsecond\rfirst\r\n",
-    )
-
-    assert cli_runtime.collect_clipboard_passwords(
-        {"passwords": {"clipboard_passwords_enabled": True}}
-    ) == ["first", "second"]
-
-
 def test_passwords_command_includes_config_enabled_clipboard_password(monkeypatch):
     monkeypatch.setattr(
         passwords_command,
         "load_request_config",
         lambda _cwd: {"passwords": {"clipboard_passwords_enabled": True}},
     )
-    monkeypatch.setattr(cli_runtime, "read_clipboard_passwords", lambda: ["clip-secret"])
+    monkeypatch.setattr(
+        clipboard_module, "_read_windows_unicode_clipboard",
+        lambda *, max_chars: "\r\nfirst\n\nsecond\rfirst\r\n",
+    )
 
     code, result = passwords_command.handle(_password_args(), CliContext(language="en"))
 
     assert code == 0
-    assert result.summary["clipboard_password_count"] == 1
-    assert result.items[0]["clipboard_passwords"] == ["clip-secret"]
-    assert result.items[0]["combined_passwords"] == ["clip-secret"]
+    assert result.summary["clipboard_password_count"] == 2
+    assert result.items[0]["clipboard_passwords"] == ["first", "second"]
+    assert result.items[0]["combined_passwords"] == ["first", "second"]

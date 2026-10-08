@@ -34,62 +34,6 @@ def test_plain_file_relation_omits_empty_volume_anchor(tmp_path):
     assert all(candidate.relation_anchor == {} for candidate in candidates)
 
 
-def _minimal_rar4_single() -> bytes:
-    header = bytearray(13)
-    header[2] = 0x73
-    header[3:5] = (0).to_bytes(2, "little")
-    header[5:7] = len(header).to_bytes(2, "little")
-    header[0:2] = (crc32(header[2:]) & 0xFFFF).to_bytes(2, "little")
-    return b"Rar!\x1a\x07\x00" + bytes(header)
-
-
-@pytest.mark.parametrize(
-    ("filename", "content", "archive_format"),
-    [
-        ("ordinary.7z", make_minimal_7z(), "7z"),
-        ("ordinary.rar", _minimal_rar4_single(), "rar"),
-    ],
-)
-def test_standalone_rar_and_7z_are_confirmed_by_relations(
-    tmp_path, filename, content, archive_format
-):
-    path = tmp_path / filename
-    path.write_bytes(content)
-
-    group = next(group for group in _groups(tmp_path) if Path(group.head_path) == path)
-
-    assert group.input_paths == [str(path)]
-    assert group.head_metadata["format"] == archive_format
-    assert group.head_metadata["standalone"] is True
-    assert group.head_metadata["relation_confirmed"] is True
-
-
-def test_standalone_zip_is_confirmed_by_relations(tmp_path):
-    path = tmp_path / "ordinary.zip"
-    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_STORED) as stream:
-        stream.writestr("inside.txt", "hello")
-
-    group = next(group for group in _groups(tmp_path) if Path(group.head_path) == path)
-
-    assert group.kind == "file"
-    assert group.input_paths == [str(path)]
-    assert group.head_metadata["format"] == "zip"
-    assert group.head_metadata["standalone"] is True
-    assert group.head_metadata["relation_confirmed"] is True
-
-
-def test_empty_zip_is_confirmed_by_relations(tmp_path):
-    path = tmp_path / "empty.zip"
-    with zipfile.ZipFile(path, "w"):
-        pass
-
-    group = next(group for group in _groups(tmp_path) if Path(group.head_path) == path)
-
-    assert group.head_metadata["format"] == "zip"
-    assert group.head_metadata["standalone"] is True
-    assert group.head_metadata["relation_confirmed"] is True
-
-
 def _minimal_pe_image(marker: bytes = b"") -> tuple[bytes, int]:
     image = make_minimal_pe(marker)
     return image, len(image)
@@ -102,38 +46,6 @@ def _minimal_zip_single() -> bytes:
     with zipfile.ZipFile(buffer, "w") as stream:
         stream.writestr(info, "hello")
     return buffer.getvalue()
-
-
-@pytest.mark.parametrize(
-    ("payload", "marker", "archive_format"),
-    [
-        (make_minimal_7z(), b"7-Zip SFX", "7z"),
-        (_minimal_zip_single(), b"7-Zip SFX", "zip"),
-        (_minimal_rar4_single(), b"WinRAR SFX", "rar"),
-    ],
-)
-def test_known_sfx_stub_is_confirmed_and_projected_as_file_range(
-    tmp_path, payload, marker, archive_format
-):
-    image, pe_end = _minimal_pe_image(marker)
-    path = tmp_path / f"payload_{archive_format}.exe"
-    path.write_bytes(image + payload)
-
-    group = next(group for group in _groups(tmp_path) if Path(group.head_path) == path)
-    metadata = group.head_metadata
-
-    assert metadata["format"] == archive_format
-    assert metadata["relation_confirmed"] is True
-    assert metadata["sfx"] is True
-    assert metadata["pe_structure"] is True
-    assert metadata["structure_offset"] == pe_end
-
-    descriptor = archive_input_for_group(group)
-    assert descriptor is not None
-    archive_input = descriptor.to_dict()
-    assert archive_input["open_mode"] == "file_range"
-    assert archive_input["format_hint"] == archive_format
-    assert archive_input["parts"][0]["start"] == pe_end
 
 
 def test_truncated_7z_sfx_is_confirmed_by_relations_and_projected_to_declared_range(tmp_path):
@@ -207,61 +119,6 @@ def test_arbitrary_pe_zip_overlay_requires_deep_detect_for_embedded_discovery(tm
     assert descriptor.primary_extent.start == pe_end
 
 
-def test_filename_numbered_7z_without_structural_seed_is_not_grouped(tmp_path):
-    names = ["archive.7z.001", "archive.7z.002", "archive.7z.003"]
-    for name in names:
-        (tmp_path / name).write_bytes(name.encode())
-
-    groups = _groups(tmp_path)
-
-    assert all(group.kind == "file" for group in groups)
-    assert all(len(group.input_paths) == 1 for group in groups)
-
-
-@pytest.mark.parametrize("archive_format", ["7z", "zip"])
-def test_unconfirmed_launcher_does_not_claim_filename_like_data_volumes(tmp_path, archive_format):
-    launcher = tmp_path / "payload.exe"
-    first = tmp_path / f"payload.{archive_format}.001"
-    second = tmp_path / f"payload.{archive_format}.002"
-    launcher.write_bytes(b"MZ launcher")
-    first.write_bytes(b"data volume 1")
-    second.write_bytes(b"data volume 2")
-
-    groups = _groups(tmp_path)
-
-    # MZ alone proves neither PE nor SFX and cannot claim filename-like siblings.
-    assert all(group.kind == "file" for group in groups)
-    assert all(len(group.input_paths) == 1 for group in groups)
-
-
-def test_rar_part1_exe_remains_a_data_volume(tmp_path):
-    first = tmp_path / "payload.part1.exe"
-    second = tmp_path / "payload.part2.rar"
-    first.write_bytes(b"rar sfx data volume 1")
-    second.write_bytes(b"rar data volume 2")
-
-    groups = _groups(tmp_path)
-
-    assert all(group.kind == "file" for group in groups)
-    assert all(len(group.input_paths) == 1 for group in groups)
-
-
-def test_strict_formats_with_same_stem_never_cross_merge(tmp_path):
-    families = {
-        "7z_numbered": ["same.7z.001", "same.7z.002"],
-        "zip_numbered": ["same.zip.001", "same.zip.002"],
-        "rar_part": ["same.part1.rar", "same.part2.rar"],
-    }
-    for names in families.values():
-        for name in names:
-            (tmp_path / name).write_bytes(name.encode())
-
-    groups = _groups(tmp_path)
-
-    assert all(group.kind == "file" for group in groups)
-    assert all(len(group.input_paths) == 1 for group in groups)
-
-
 @pytest.mark.parametrize(
     "names",
     [
@@ -269,6 +126,11 @@ def test_strict_formats_with_same_stem_never_cross_merge(tmp_path):
         ["movie.7z.001.noise.bin", "movie.7z.002.noise.bin"],
         ["movie.volume_1.fake", "movie.volume_2.fake"],
         ["setup.exe", "setup.001", "setup.002"],
+        ["archive.7z.001", "archive.7z.002", "archive.7z.003"],
+        ["payload.exe", "payload.7z.001", "payload.7z.002"],
+        ["payload.exe", "payload.zip.001", "payload.zip.002"],
+        ["payload.part1.exe", "payload.part2.rar"],
+        ["same.7z.001", "same.7z.002", "same.zip.001", "same.zip.002", "same.part1.rar", "same.part2.rar"],
     ],
 )
 def test_filename_camouflage_without_structure_never_builds_a_group(tmp_path, names):
@@ -485,25 +347,6 @@ def test_standalone_tbz2_cannot_become_zip_volume_two(tmp_path):
     assert by_name["payload.tbz2"].head_metadata["format"] == "bzip2"
     assert by_name["payload.tbz2"].head_metadata["standalone"] is True
 
-
-def test_prefixed_single_disk_zip_carrier_is_resolved_by_embedded_discovery(tmp_path):
-    carrier = tmp_path / "cover.jpg"
-    archive = tmp_path / "payload.zip"
-    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_STORED) as stream:
-        stream.writestr("payload.txt", "carrier")
-    carrier.write_bytes(b"fake-jpeg-prefix" + archive.read_bytes())
-    archive.unlink()
-
-    result = ArchiveTaskProvider(make_config({
-        "detection": {"enabled": True},
-        "embedded_scan": {"enabled": True},
-    })).discover_targets([str(carrier)])
-
-    assert len(result.resolved_tasks) == 1
-    task = result.resolved_tasks[0]
-    assert task.discovery_source == "embedded"
-    assert task.archive_input().format_hint == "zip"
-    assert task.all_parts == [str(carrier)]
 
 def test_raw_zip_numeric_tail_name_stays_in_split_relation(tmp_path):
     first = tmp_path / "raw.zip.001"

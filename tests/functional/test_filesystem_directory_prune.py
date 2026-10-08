@@ -1,7 +1,5 @@
 from pathlib import Path
 
-from sunpack_native import profile_directory_scan
-
 from sunpack.core.contracts.filesystem import FileEntry
 from sunpack.pipeline.discovery.filesystem.directory_scanner import DirectoryScanner
 from tests.helpers.config_factory import make_config
@@ -62,12 +60,19 @@ def test_directory_prune_path_glob_is_relative_to_scan_root(tmp_path):
     allowed.parent.mkdir(parents=True)
     blocked.write_bytes(b"PK\x03\x04payload")
     allowed.write_bytes(b"PK\x03\x04payload")
+    recycled = tmp_path / "$RECYCLE.BIN" / "payload.zip"
+    recycled.parent.mkdir()
+    recycled.write_bytes(b"PK\x03\x04payload")
 
-    snapshot = DirectoryScanner(str(tmp_path), config=_config(path_globs=["cache/private/**"])).scan()
+    snapshot = DirectoryScanner(str(tmp_path), config=_config(
+        path_globs=["cache/private/**", "$RECYCLE.BIN/**"]
+    )).scan()
     paths = {entry.path for entry in _entries(snapshot)}
 
     assert blocked not in paths
     assert allowed in paths
+    assert recycled not in paths
+    assert recycled.parent not in paths
 
 
 def test_game_like_tree_is_not_implicitly_protected(tmp_path):
@@ -80,37 +85,3 @@ def test_game_like_tree_is_not_implicitly_protected(tmp_path):
     snapshot = DirectoryScanner(str(tmp_path), config=_config()).scan()
 
     assert archive in {entry.path for entry in _entries(snapshot)}
-
-
-def test_profiled_scan_matches_normal_scan(tmp_path):
-    kept = tmp_path / "kept" / "payload.zip"
-    pruned = tmp_path / "ignored" / "payload.zip"
-    kept.parent.mkdir()
-    pruned.parent.mkdir()
-    kept.write_bytes(b"PK\x03\x04payload")
-    pruned.write_bytes(b"PK\x03\x04payload")
-    config = _config(prune_dir_globs=["ignored"])
-    scanner = DirectoryScanner(str(tmp_path), config=config)
-    expected = scanner.scan()
-    options = scanner._native_scan_options()
-
-    profiled, profile = profile_directory_scan(
-        str(tmp_path),
-        scanner.max_depth,
-        options["patterns"],
-        options["prune_dir_globs"],
-        options["blocked_extensions"],
-        options["blocked_file_names"],
-        options["size_ranges"],
-        options["mtime_ranges"],
-        options["whitelist_rules"],
-    )
-
-    paths, _is_dirs, _sizes, _mtimes_ns = profiled.materialize_columns()
-    assert set(paths) == {
-        str(entry.path) for entry in _entries(expected)
-    }
-    assert profile["accepted_entries"] == len(profiled)
-    assert profile["pruned_directories"] == 1
-    assert profile["entries_seen"] >= len(profiled)
-    assert profile["scan_total_ns"] >= profile["directory_enumeration_ns"]

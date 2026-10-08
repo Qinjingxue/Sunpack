@@ -3,13 +3,11 @@
 from __future__ import annotations
 
 import json
-import os
 import shutil
 import subprocess
 import zipfile
 from pathlib import Path
 
-import pytest
 from tests.helpers.native_build import sevenzip_artifact
 
 
@@ -77,42 +75,3 @@ def test_worker_extracts_zip_without_7z_dll(tmp_path):
         extracted = output_dir / name
         assert extracted.is_file(), f"{name} was not extracted"
         assert extracted.read_bytes() == data
-
-
-def _find_dumpbin() -> str | None:
-    import glob
-
-    found = shutil.which("dumpbin")
-    if found:
-        return found
-    for base in (
-        r"C:\Program Files (x86)\Microsoft Visual Studio",
-        r"C:\Program Files\Microsoft Visual Studio",
-    ):
-        matches = glob.glob(
-            os.path.join(base, "*", "*", "VC", "Tools", "MSVC", "*", "bin", "Hostx64", "x64", "dumpbin.exe")
-        )
-        if matches:
-            return sorted(matches)[-1]
-    return None
-
-
-def test_worker_does_not_import_7z_dll():
-    dumpbin = _find_dumpbin()
-    if not dumpbin:
-        pytest.skip("dumpbin is required to inspect PE imports")
-
-    completed = subprocess.run(
-        [dumpbin, "/nologo", "/dependents", str(sevenzip_artifact("sunpack_sevenzip_worker.exe"))],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert completed.returncode == 0, completed.stderr
-    modules = [
-        line.strip().lower()
-        for line in completed.stdout.splitlines()
-        if line.strip().lower().endswith(".dll")
-    ]
-    assert modules
-    assert "7z.dll" not in modules

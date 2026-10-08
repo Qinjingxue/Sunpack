@@ -96,92 +96,11 @@ def _extracted(output_root: Path, case: ArchiveCase) -> bool:
     return marker_present(output_root, case.marker_name)
 
 
-def test_watch_single_hp_rar_extracts_with_correct_password(tmp_path):
-    """Single header-encrypted RAR with the right password must extract."""
-    case = _create_case(tmp_path / "fixtures", "watch_hp_single_ok", split=False, password="single-hp-ok")
-    watch_root = tmp_path / "watch"
-    output_root = tmp_path / "out"
-    watch_root.mkdir()
-    output_root.mkdir()
-    (watch_root / "sunpack-passwords.txt").write_text("single-hp-ok\n", encoding="utf-8")
-
-    config = _watch_config()
-    async def scenario():
-        async with PipelineEngine(config) as delegate:
-            watcher = WatchScheduler(
-                config, [str(watch_root)], out_dir=str(output_root),
-                state_path=str(tmp_path / "state.json"), cold_start_seconds=0,
-                initial_scan=False, pipeline_engine=delegate,
-            )
-            destination = watch_root / case.entry_path.name
-            shutil.copy2(case.entry_path, destination); watcher.enqueue(str(destination))
-            await _drive_watch_until(watcher, lambda: _extracted(output_root, case))
-            extracted = list(output_root.rglob(case.marker_name))
-            assert len(extracted) == 1
-            assert extracted[0].read_text(encoding="utf-8") == case.marker_text
-    asyncio.run(scenario())
-
-
-def test_watch_single_hp_rar_reports_wrong_password_without_hanging(tmp_path):
-    """Single header-encrypted RAR without the right password must fail fast."""
-    case = _create_case(tmp_path / "fixtures", "watch_hp_single_wrong", split=False, password="single-hp-right")
-    watch_root = tmp_path / "watch"
-    output_root = tmp_path / "out"
-    watch_root.mkdir()
-    output_root.mkdir()
-    (watch_root / "sunpack-passwords.txt").write_text("wrong-password\n", encoding="utf-8")
-
-    config = _watch_config()
-    async def scenario():
-        async with PipelineEngine(config) as delegate:
-            watcher = WatchScheduler(
-                config, [str(watch_root)], out_dir=str(output_root),
-                state_path=str(tmp_path / "state.json"), cold_start_seconds=0,
-                initial_scan=False, pipeline_engine=delegate,
-            )
-            destination = watch_root / case.entry_path.name
-            shutil.copy2(case.entry_path, destination); watcher.enqueue(str(destination))
-            await _drive_watch_until(watcher, lambda: _password_blocked(watcher))
-            assert not _extracted(output_root, case)
-            blocked_entries = [entry for entry in watcher.state.entries.values() if entry.status == "failed_password"]
-            assert blocked_entries, watcher.state.entries
-            assert BLOCKER_PASSWORD in ((blocked_entries[0].failure_payload or {}).get("blockers") or [])
-            assert (await watcher.run_once()).processed == 0
-    asyncio.run(scenario())
-
-
-def test_watch_split_hp_rar_extracts_with_correct_password(tmp_path):
-    """Split header-encrypted RAR with the right password must extract once."""
-    case = _create_case(tmp_path / "fixtures", "watch_hp_split_ok", split=True, password="split-hp-ok")
-    watch_root = tmp_path / "watch"
-    output_root = tmp_path / "out"
-    watch_root.mkdir()
-    output_root.mkdir()
-    (watch_root / "sunpack-passwords.txt").write_text("split-hp-ok\n", encoding="utf-8")
-
-    config = _watch_config()
-    async def scenario():
-        async with PipelineEngine(config) as delegate:
-            watcher = WatchScheduler(
-                config, [str(watch_root)], out_dir=str(output_root),
-                state_path=str(tmp_path / "state.json"), cold_start_seconds=0,
-                initial_scan=False, pipeline_engine=delegate,
-            )
-            for source in sorted(case.archive_dir.iterdir(), key=lambda path: path.name.lower()):
-                destination = watch_root / source.name
-                shutil.copy2(source, destination); watcher.enqueue(str(destination))
-            await _drive_watch_until(watcher, lambda: _extracted(output_root, case))
-            extracted = list(output_root.rglob(case.marker_name))
-            assert len(extracted) == 1
-            assert extracted[0].read_text(encoding="utf-8") == case.marker_text
-            assert not _password_blocked(watcher)
-    asyncio.run(scenario())
-
-
-def test_watch_split_hp_rar_recovers_after_wrong_then_correct_password(tmp_path):
+@pytest.mark.parametrize("split", [False, True])
+def test_watch_split_hp_rar_recovers_after_wrong_then_correct_password(tmp_path, split):
     """Split header-encrypted RAR: wrong password blocks, correction succeeds."""
     correct = "split-hp-right"
-    case = _create_case(tmp_path / "fixtures", "watch_hp_split_wrong", split=True, password=correct)
+    case = _create_case(tmp_path / "fixtures", "watch_hp_split_wrong", split=split, password=correct)
     watch_root = tmp_path / "watch"
     output_root = tmp_path / "out"
     watch_root.mkdir()
@@ -202,10 +121,14 @@ def test_watch_split_hp_rar_recovers_after_wrong_then_correct_password(tmp_path)
                 shutil.copy2(source, destination); watcher.enqueue(str(destination))
             await _drive_watch_until(watcher, lambda: _password_blocked(watcher))
             assert not _extracted(output_root, case)
+            blocked = [entry for entry in watcher.state.entries.values() if entry.status == "failed_password"]
+            assert BLOCKER_PASSWORD in ((blocked[0].failure_payload or {}).get("blockers") or [])
+            assert (await watcher.run_once()).processed == 0
             password_file.write_text(correct + "\n", encoding="utf-8")
             watcher.notify_password_table_changed(str(password_file))
             await _drive_watch_until(watcher, lambda: _extracted(output_root, case))
             extracted = list(output_root.rglob(case.marker_name))
             assert len(extracted) == 1
             assert extracted[0].read_text(encoding="utf-8") == case.marker_text
+            assert not _password_blocked(watcher)
     asyncio.run(scenario())

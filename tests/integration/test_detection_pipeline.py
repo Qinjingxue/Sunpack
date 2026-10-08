@@ -1,12 +1,8 @@
-import os
 import tempfile
 import unittest
-import zipfile
 from pathlib import Path
 
-from tests.helpers.pipeline_engine import execute_pipeline
 from sunpack.core.config.schema import normalize_config
-from tests.helpers.archive_tasks import make_archive_task
 from sunpack.pipeline.coordinator.task_provider import ArchiveTaskProvider
 from tests.helpers.detection_config import with_detection_pipeline
 
@@ -35,38 +31,6 @@ class DetectionPipelineTests(unittest.TestCase):
             result = ArchiveTaskProvider(minimal_config()).discover_targets([str(archive_path)])
             self.assertEqual(len(result.resolved_tasks), 1)
             self.assertEqual(result.resolved_tasks[0].discovery_source, "relations")
-
-    def test_archive_task_keeps_physical_path_and_exposes_format_hint(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            source = root / "fake_doc.txt"
-            source.write_text("not really a zip", encoding="utf-8")
-
-            task = make_archive_task(
-                source,
-                format_hint="zip",
-                logical_name="fake_doc",
-                discovery_source="detection",
-            )
-
-            self.assertTrue(source.exists())
-            self.assertEqual(os.path.normcase(task.main_path), os.path.normcase(str(source)))
-            self.assertEqual(task.archive_input().format_hint, "zip")
-            self.assertFalse((root / "fake_doc.zip").exists())
-
-    def test_pipeline_can_scan_and_extract_zip(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            archive_path = root / "sample.zip"
-            with zipfile.ZipFile(archive_path, "w") as archive:
-                archive.writestr("hello.txt", "hello from SunPack")
-
-            summary = execute_pipeline(minimal_config(), str(root))
-
-            self.assertEqual(summary.success_count, 1)
-            self.assertEqual(summary.failed_tasks, [])
-            self.assertTrue((root / "sample" / "hello.txt").exists())
-
 
 if __name__ == "__main__":
     unittest.main()

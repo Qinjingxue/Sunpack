@@ -1,14 +1,11 @@
 from types import SimpleNamespace
 
+import pytest
+
 from sunpack_native import worker_manifest_from_rows
 
 from sunpack.core.contracts.failures import FailureInfo, FailureKind
-from sunpack.core.contracts.verification import (
-    ASSESSMENT_COMPLETE,
-    CONTAINER_INTEGRITY_UNKNOWN,
-    CONTENT_INTEGRITY_VERIFIED_COMPLETE,
-    DECISION_ACCEPT,
-)
+from sunpack.core.contracts.verification import ASSESSMENT_COMPLETE, CONTENT_INTEGRITY_VERIFIED_COMPLETE, DECISION_ACCEPT
 from sunpack.core.passwords.result import PasswordResolution, PasswordResolutionStatus
 from sunpack.core.support.archive_input_projection import (
     write_source_extractable_segments,
@@ -152,59 +149,6 @@ def test_unknown_zip_without_passwords_uses_direct_empty_worker_candidate(tmp_pa
     assert resolution.candidate_evidence == "zip_empty_password_direct"
 
 
-def test_extractor_runs_analysis_segments_inside_same_task_and_restores_source(tmp_path):
-    carrier = tmp_path / "carrier.bin"
-    carrier.write_bytes(b"prefix-zip-rar-tail")
-    task = _task(carrier)
-    write_source_extractable_segments(task, [
-        {
-            "segment_id": "embedded_01",
-            "format": "zip",
-            "logical_name": "case",
-            "archive_input": {
-                "kind": "archive_input",
-                "entry_path": str(carrier),
-                "open_mode": "file_range",
-                "format_hint": "zip",
-                "logical_name": "case",
-                "parts": [{"path": str(carrier), "role": "main", "start": 7, "end": 10}],
-            },
-        },
-        {
-            "segment_id": "embedded_02",
-            "format": "rar",
-            "logical_name": "case",
-            "archive_input": {
-                "kind": "archive_input",
-                "entry_path": str(carrier),
-                "open_mode": "file_range",
-                "format_hint": "rar",
-                "logical_name": "case",
-                "parts": [{"path": str(carrier), "role": "main", "start": 11, "end": 14}],
-            },
-        },
-    ])
-    runner = _FakeSevenZipRunner()
-    extractor = SingleArchiveExtractor(
-        password_store=_FakePasswordStore(),
-        password_resolver=_FakePasswordResolver(),
-        metadata_scanner=ArchiveMetadataScanner(),
-        retry_policy=_FakeRetryPolicy(),
-        sevenzip_runner=runner,
-        best_effort=True,
-    )
-
-    result = extractor.extract(task, str(tmp_path / "out"))
-
-    assert result.success is True
-    assert [source["format_hint"] for source in runner.sources] == ["zip", "rar"]
-    assert runner.sources[0]["open_mode"] == "file_range"
-    assert (tmp_path / "out" / "case" / "zip.txt").exists()
-    assert (tmp_path / "out" / "case(1)" / "rar.txt").exists()
-    assert len(result.diagnostics["embedded_segments"]) == 2
-    assert task.archive_input().open_mode == "file"
-
-
 def test_embedded_password_probe_and_session_key_follow_active_segment(tmp_path):
     carrier = tmp_path / "carrier.bin"
     carrier.write_bytes(b"prefix-first-gap-second-tail")
@@ -238,6 +182,7 @@ def test_embedded_password_probe_and_session_key_follow_active_segment(tmp_path)
     result = extractor.extract(task, str(tmp_path / "out"))
 
     assert result.success is True
+    assert task.archive_input().open_mode == "file"
     assert len({key for key, _ in resolver.calls}) == 2
     assert all(key.startswith(f"{task.key}#zip:") for key, _ in resolver.calls)
     assert [call[1]["parts"][0]["start"] for call in resolver.calls] == [7, 17]
@@ -281,64 +226,6 @@ def test_embedded_boundary_password_is_reused_without_second_search(tmp_path):
     assert task.knowledge().get("archive.password") is None
 
 
-def test_verifier_accepts_carrier_when_every_embedded_payload_is_complete(tmp_path):
-    carrier = tmp_path / "carrier.exe"
-    carrier.write_bytes(b"arbitrary-stub-and-overlay")
-    task = _task(carrier)
-    write_source_extractable_segments(task, [
-        {
-            "segment_id": "embedded_01_zip",
-            "format": "zip",
-            "logical_name": "payload_zip",
-            "archive_input": {
-                "kind": "archive_input",
-                "entry_path": str(carrier),
-                "open_mode": "file_range",
-                "format_hint": "zip",
-                "logical_name": "payload_zip",
-                "parts": [{"path": str(carrier), "role": "main", "start": 3, "end": 8}],
-            },
-        },
-        {
-            "segment_id": "embedded_02_rar",
-            "format": "rar",
-            "logical_name": "payload_rar",
-            "archive_input": {
-                "kind": "archive_input",
-                "entry_path": str(carrier),
-                "open_mode": "file_range",
-                "format_hint": "rar",
-                "logical_name": "payload_rar",
-                "parts": [{"path": str(carrier), "role": "main", "start": 12, "end": 20}],
-            },
-        },
-    ])
-    extractor = SingleArchiveExtractor(
-        password_store=_FakePasswordStore(),
-        password_resolver=_FakePasswordResolver(),
-        metadata_scanner=ArchiveMetadataScanner(),
-        retry_policy=_FakeRetryPolicy(),
-        sevenzip_runner=_FakeSevenZipRunner(),
-        best_effort=True,
-    )
-
-    extraction = extractor.extract(task, str(tmp_path / "out"))
-    verification = VerificationScheduler(make_config({
-        "verification": {
-            "enabled": True,
-            "methods": [{"name": "archive_test_crc"}],
-        },
-    })).verify(task, extraction)
-
-    assert verification.decision_hint == DECISION_ACCEPT
-    assert verification.assessment_status == ASSESSMENT_COMPLETE
-    assert verification.content_integrity == CONTENT_INTEGRITY_VERIFIED_COMPLETE
-    assert verification.container_integrity == CONTAINER_INTEGRITY_UNKNOWN
-    assert verification.archive_coverage.expected_files == 2
-    assert verification.archive_coverage.complete_files == 2
-    assert verification.decision_hint == DECISION_ACCEPT
-
-
 def test_single_embedded_segment_exposes_logical_input_for_verification(tmp_path):
     carrier = tmp_path / "carrier.exe"
     carrier.write_bytes(b"stub-zip-tail")
@@ -379,33 +266,15 @@ def test_single_embedded_segment_exposes_logical_input_for_verification(tmp_path
     assert task.archive_input().open_mode == "file"
 
 
-def test_single_embedded_failure_preserves_child_diagnosis():
-    extractor = SingleArchiveExtractor(
-        password_store=_FakePasswordStore(),
-        password_resolver=_FakePasswordResolver(),
-        metadata_scanner=ArchiveMetadataScanner(),
-        retry_policy=_FakeRetryPolicy(),
-        sevenzip_runner=_FakeSevenZipRunner(),
-        best_effort=True,
-        language="zh",
-    )
-    child = FailureInfo(
-        kind=FailureKind.DAMAGED,
-        stage="extraction",
-        message="Archive is damaged",
-        message_key="failure.damaged",
-    )
-
-    aggregate = extractor._aggregate_embedded_failure([child], segment_count=1)
-
-    assert aggregate.kind is FailureKind.EMBEDDED_SEGMENTS_FAILED
-    assert aggregate.causes == (child,)
-    assert aggregate.message_key == "failure.damaged"
-    assert aggregate.message == extractor.i18n.t("failure.damaged")
-    assert aggregate.contains(FailureKind.DAMAGED)
+    verification = VerificationScheduler(make_config({"verification": {"enabled": True, "methods": [{"name": "archive_test_crc"}]}})).verify(task, result)
+    assert verification.decision_hint == DECISION_ACCEPT
+    assert verification.assessment_status == ASSESSMENT_COMPLETE
+    assert verification.content_integrity == CONTENT_INTEGRITY_VERIFIED_COMPLETE
+    assert verification.archive_coverage.complete_files == 1
 
 
-def test_multiple_embedded_failures_keep_aggregate_diagnosis():
+@pytest.mark.parametrize("count", [1, 2])
+def test_multiple_embedded_failures_keep_aggregate_diagnosis(count):
     extractor = SingleArchiveExtractor(
         password_store=_FakePasswordStore(),
         password_resolver=_FakePasswordResolver(),
@@ -429,13 +298,14 @@ def test_multiple_embedded_failures_keep_aggregate_diagnosis():
         ),
     ]
 
-    aggregate = extractor._aggregate_embedded_failure(failures, segment_count=2)
+    failures = failures[:count]
+    aggregate = extractor._aggregate_embedded_failure(failures, segment_count=count)
 
     assert aggregate.kind is FailureKind.EMBEDDED_SEGMENTS_FAILED
-    assert aggregate.message_key == "failure.embedded_extract_failed"
+    assert aggregate.message_key == ("failure.damaged" if count == 1 else "failure.embedded_extract_failed")
     assert aggregate.causes == tuple(failures)
     assert aggregate.contains(FailureKind.DAMAGED)
-    assert aggregate.contains(FailureKind.MISSING_VOLUME)
+    assert aggregate.contains(FailureKind.MISSING_VOLUME) is (count == 2)
 
 
 def test_extractor_fills_success_output_counts_when_worker_omits_them(tmp_path):

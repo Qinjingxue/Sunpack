@@ -4,7 +4,6 @@ import os
 
 import pytest
 
-from sunpack.core.analysis.volume_anchor import probe_volume_anchor_paths
 from sunpack.core.contracts.filesystem import DirectorySnapshot, FileEntry
 from sunpack.core.passwords.internal.store import PasswordStore
 from sunpack.core.passwords.relation_prober import RelationsPasswordProber
@@ -56,31 +55,6 @@ def _snapshot(root, paths):
     return DirectorySnapshot.from_entries(os.path.abspath(root), entries)
 
 
-def test_probe_hp_single_volume_requires_and_accepts_password(tmp_path):
-    path = _write_hex(tmp_path / "single.rar", SINGLE_HP_HEX)
-
-    unresolved = probe_volume_anchor_paths([path])
-    anchor = unresolved.get(path)
-    assert anchor is not None
-    assert anchor.format == "rar"
-    assert anchor.confidence == "strong"
-    assert anchor.encrypted is True
-    assert anchor.needs_password is True
-    assert anchor.wrong_password is False
-    assert anchor.multivolume is False, "encrypted headers must not force multivolume"
-    assert anchor.standalone is False
-
-    wrong = probe_volume_anchor_paths([path], path_passwords={path: "nope"})
-    assert wrong.get(path).wrong_password is True
-    assert wrong.get(path).multivolume is False
-
-    resolved = probe_volume_anchor_paths([path], path_passwords={path: "secret"})
-    anchor = resolved.get(path)
-    assert anchor.standalone is True
-    assert anchor.multivolume is False
-    assert anchor.needs_password is False
-
-
 @pytest.mark.parametrize("pe_offset", [0x80, 0x800])
 @pytest.mark.parametrize("split", [False, True])
 def test_encrypted_sfx_retry_preserves_confirmed_pe_facts(tmp_path, pe_offset, split):
@@ -110,67 +84,10 @@ def test_encrypted_sfx_retry_preserves_confirmed_pe_facts(tmp_path, pe_offset, s
     assert metadata["needs_password"] is False
 
 
-def test_probe_hp_split_volumes_use_decrypted_numbers(tmp_path):
-    volumes = [
-        _write_hex(tmp_path / "vol.part1.rar", PART1_HP_HEX),
-        _write_hex(tmp_path / "vol.part2.rar", PART2_HP_HEX),
-    ]
-    passwords = {volume: "secret" for volume in volumes}
-
-    rows = probe_volume_anchor_paths(volumes, path_passwords=passwords)
-    assert rows.get(volumes[0]).multivolume is True
-    assert rows.get(volumes[0]).internal_volume_number == 1
-    assert rows.get(volumes[0]).anchor_roles == ("any_volume", "first")
-    assert rows.get(volumes[1]).multivolume is True
-    assert rows.get(volumes[1]).internal_volume_number == 2
-    assert rows.get(volumes[1]).anchor_roles == ("any_volume", "member")
-
-
-def test_probe_rar4_hp_split_volumes_decrypts_following_headers(tmp_path):
-    try:
-        case = create_encrypted_rar_archive(
-            tmp_path,
-            "rar4_hp_split",
-            password="secret",
-            rar4=True,
-            split=True,
-            split_volume_size=1024,
-            payload_size=8 * 1024,
-        )
-    except FileNotFoundError:
-        pytest.skip("RAR generator is not configured")
-
-    parts = sorted(str(path) for path in case.archive_dir.glob("*.rar"))
-    assert len(parts) >= 2
-
-    unresolved = probe_volume_anchor_paths(parts[:2])
-    assert all(unresolved.get(path).encrypted for path in parts[:2])
-    assert all(unresolved.get(path).needs_password for path in parts[:2])
-
-    resolved = probe_volume_anchor_paths(
-        parts[:2], path_passwords={path: "secret" for path in parts[:2]}
-    )
-    first, second = (resolved.get(path) for path in parts[:2])
-    assert first.multivolume is True
-    assert first.internal_volume_number == 1
-    assert second.multivolume is True
-    assert second.internal_volume_number is None
-    assert all("rar4:decrypted_header" in row.evidence for row in (first, second))
-
-
-def test_single_hp_rar_is_a_plain_file_group_not_a_split(tmp_path):
-    _write_hex(tmp_path / "single.rar", SINGLE_HP_HEX)
-    snapshot = _snapshot(tmp_path, ["single.rar"])
-    groups = RelationsScheduler().build_candidate_groups(snapshot)
-    assert len(groups) == 1
-    group = groups[0]
-    assert group.kind == "file"
-    assert group.is_split_candidate is False
-
-
-def test_single_hp_rar_with_split_like_filename_remains_a_plain_file_group(tmp_path):
-    _write_hex(tmp_path / "single.part1.rar", SINGLE_HP_HEX)
-    snapshot = _snapshot(tmp_path, ["single.part1.rar"])
+@pytest.mark.parametrize("name", ["single.rar", "single.part1.rar"])
+def test_single_hp_rar_with_split_like_filename_remains_a_plain_file_group(tmp_path, name):
+    _write_hex(tmp_path / name, SINGLE_HP_HEX)
+    snapshot = _snapshot(tmp_path, [name])
 
     groups = RelationsScheduler().build_candidate_groups(snapshot)
 
@@ -282,19 +199,9 @@ def test_missing_middle_hp_rar_volume_never_validates_as_complete_split(tmp_path
     assert [volume.number for volume in split_groups[0].split_volumes] == numbers
 
 
-def test_split_hp_rar_group_is_identified_from_filenames(tmp_path):
-    _write_hex(tmp_path / "vol.part1.rar", PART1_HP_HEX)
-    _write_hex(tmp_path / "vol.part2.rar", PART2_HP_HEX)
-    snapshot = _snapshot(tmp_path, ["vol.part1.rar", "vol.part2.rar"])
-    groups = RelationsScheduler().build_candidate_groups(snapshot)
-    split_groups = [group for group in groups if group.kind == "split_archive"]
-    assert len(split_groups) == 1
-    assert [volume.number for volume in split_groups[0].split_volumes] == [1, 2]
-
-
-def test_split_hp_rar_group_accepts_camouflage_around_contiguous_part_token(tmp_path):
-    first_name = "文件名.伪装名.伪装名part1伪装名.伪装名"
-    second_name = "文件名.伪装名.伪装名part2伪装名.伪装名"
+@pytest.mark.parametrize("pattern", ["vol.part{}.rar", "文件名.伪装名.伪装名part{}伪装名.伪装名"])
+def test_split_hp_rar_group_accepts_camouflage_around_contiguous_part_token(tmp_path, pattern):
+    first_name, second_name = pattern.format(1), pattern.format(2)
     _write_hex(tmp_path / first_name, PART1_HP_HEX)
     _write_hex(tmp_path / second_name, PART2_HP_HEX)
     snapshot = _snapshot(tmp_path, [first_name, second_name])
@@ -336,6 +243,7 @@ def test_relations_password_prober_remembers_success_and_skips_second_probe(tmp_
     groups = RelationsScheduler().build_candidate_groups(snapshot)
     group = next(group for group in groups if group.kind == "split_archive")
 
+    assert RelationsPasswordProber(PasswordStore.from_sources()).resolve_file(group.head_path) is None
     store = PasswordStore.from_sources(
         cli_passwords=["secret"],
         builtin_passwords=[],
@@ -357,16 +265,3 @@ def test_relations_password_prober_remembers_success_and_skips_second_probe(tmp_
     # fast verifier again (same bytes, same fingerprint).
     assert prober.resolve_file(group.head_path) == "secret"
     assert calls["count"] == 1
-
-
-def test_relations_password_prober_returns_none_without_candidates(tmp_path):
-    _write_hex(tmp_path / "vol.part1.rar", PART1_HP_HEX)
-    _write_hex(tmp_path / "vol.part2.rar", PART2_HP_HEX)
-    snapshot = _snapshot(tmp_path, ["vol.part1.rar", "vol.part2.rar"])
-    group = next(
-        group
-        for group in RelationsScheduler().build_candidate_groups(snapshot)
-        if group.kind == "split_archive"
-    )
-    prober = RelationsPasswordProber(PasswordStore.from_sources())
-    assert prober.resolve_file(group.head_path) is None

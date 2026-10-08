@@ -18,45 +18,25 @@ def test_watch_clipboard_passwords_are_persisted_only_inside_managed_block(tmp_p
     builtin_path = tmp_path / "builtin_passwords.txt"
     _seed_builtin_file(builtin_path, "user-secret")
     monkeypatch.setattr(builtin_module, "builtin_password_path", lambda: builtin_path)
+    monkeypatch.setattr(builtin_module, "load_cli_language_from_config", lambda: "zh")
 
-    changed = builtin_module.merge_watch_clipboard_passwords(["clip-a", "clip-b"], max_entries=10)
+    changed = builtin_module.merge_watch_clipboard_passwords(["clip-a", "剪贴板密码"], max_entries=2)
 
     text = builtin_path.read_text(encoding="utf-8")
     assert changed is True
     assert "user-secret" in text
     assert builtin_module.WATCH_CLIPBOARD_BLOCK_BEGIN in text
     assert "clip-a" in text
-    assert "clip-b" in text
-    assert builtin_module.get_builtin_passwords() == ["user-secret", "clip-a", "clip-b"]
+    assert builtin_module.WATCH_CLIPBOARD_BLOCK_END in text
+    assert "# 开始 SUNPACK 监控剪贴板密码" not in text
+    assert builtin_module.get_builtin_passwords() == ["user-secret", "clip-a", "剪贴板密码"]
 
-
-def test_watch_clipboard_password_block_keeps_most_recent_entries(tmp_path, monkeypatch):
-    builtin_path = tmp_path / "builtin_passwords.txt"
-    _seed_builtin_file(builtin_path, "user-secret")
-    monkeypatch.setattr(builtin_module, "builtin_password_path", lambda: builtin_path)
-
-    builtin_module.merge_watch_clipboard_passwords(["a", "b"], max_entries=2)
-    changed = builtin_module.merge_watch_clipboard_passwords(["c"], max_entries=2)
-
+    assert builtin_module.merge_watch_clipboard_passwords(["clip-a"], max_entries=2)
+    assert builtin_module.get_builtin_passwords() == ["user-secret", "剪贴板密码", "clip-a"]
+    assert builtin_module.merge_watch_clipboard_passwords(["clip-c"], max_entries=2)
     text = builtin_path.read_text(encoding="utf-8")
-    assert changed is True
-    assert "\na\n" not in text
-    assert "\nb\n" in text
-    assert "\nc\n" in text
-
-
-def test_watch_clipboard_recopy_moves_password_to_most_recent_position(tmp_path, monkeypatch):
-    builtin_path = tmp_path / "builtin_passwords.txt"
-    _seed_builtin_file(builtin_path, "user-secret")
-    monkeypatch.setattr(builtin_module, "builtin_password_path", lambda: builtin_path)
-
-    builtin_module.merge_watch_clipboard_passwords(["a", "b"], max_entries=2)
-    changed = builtin_module.merge_watch_clipboard_passwords(["a"], max_entries=2)
-
-    assert changed is True
-    assert builtin_module._read_watch_clipboard_block(
-        builtin_path.read_text(encoding="utf-8")
-    ) == ["b", "a"]
+    assert "\n剪贴板密码\n" not in text
+    assert builtin_module.get_builtin_passwords() == ["user-secret", "clip-a", "clip-c"]
 
 
 def test_watch_clipboard_batch_merges_existing_entries_before_truncation(tmp_path, monkeypatch):
@@ -68,21 +48,6 @@ def test_watch_clipboard_batch_merges_existing_entries_before_truncation(tmp_pat
     assert builtin_module.merge_watch_clipboard_passwords(["b", "d", "d", "e"], max_entries=3)
 
     assert builtin_module.get_builtin_passwords() == ["user-secret", "b", "d", "e"]
-
-
-def test_watch_clipboard_password_markers_do_not_change_with_cli_language(tmp_path, monkeypatch):
-    builtin_path = tmp_path / "builtin_passwords.txt"
-    _seed_builtin_file(builtin_path, "user-secret")
-    monkeypatch.setattr(builtin_module, "builtin_password_path", lambda: builtin_path)
-    monkeypatch.setattr(builtin_module, "load_cli_language_from_config", lambda: "zh")
-
-    assert builtin_module.merge_watch_clipboard_passwords(["剪贴板密码"], max_entries=10) is True
-
-    text = builtin_path.read_text(encoding="utf-8")
-    assert builtin_module.WATCH_CLIPBOARD_BLOCK_BEGIN in text
-    assert builtin_module.WATCH_CLIPBOARD_BLOCK_END in text
-    assert "# 开始 SUNPACK 监控剪贴板密码" not in text
-    assert builtin_module.get_builtin_passwords() == ["user-secret", "剪贴板密码"]
 
 
 def test_watch_clipboard_writer_refuses_to_invent_missing_managed_block(tmp_path, monkeypatch):

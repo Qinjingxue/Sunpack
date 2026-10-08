@@ -56,20 +56,13 @@ def test_password_store_remembers_success_at_front():
 
 
 def test_password_store_bounds_recent_success_history():
-    store = PasswordStore.from_sources()
+    store = PasswordStore.from_sources(recent_passwords=[f"initial-{i}" for i in range(MAX_RECENT_PASSWORDS + 1)])
+    assert len(store.recent_passwords) == MAX_RECENT_PASSWORDS
     for index in range(MAX_RECENT_PASSWORDS + 20):
         store.remember_success(f"password-{index}")
 
     assert len(store.recent_passwords) == MAX_RECENT_PASSWORDS
     assert store.recent_passwords[0] == f"password-{MAX_RECENT_PASSWORDS + 19}"
-
-
-def test_password_store_bounds_initial_recent_success_history():
-    store = PasswordStore.from_sources(
-        recent_passwords=[f"password-{index}" for index in range(MAX_RECENT_PASSWORDS + 1)]
-    )
-
-    assert len(store.recent_passwords) == MAX_RECENT_PASSWORDS
 
 
 def test_password_resolver_falls_back_to_relations_archive_input_before_analysis():
@@ -199,155 +192,6 @@ class RecordingNotRequiredFastVerifier:
         )
 
 
-def test_password_resolver_records_archive_password_in_session():
-    session = PasswordSession()
-    resolver = PasswordResolver(FakePasswordTester(), session)
-
-    result = resolver.resolve("sample.zip", archive_key="archive-key")
-
-    assert result.password == "secret"
-    assert result.archive_key == "archive-key"
-    assert session.get_resolved("archive-key") == "secret"
-
-
-def test_password_resolver_trusts_validated_unencrypted_structure_without_retesting():
-    bag = _task_with_structure("zip", {
-        "plausible": True,
-        "central_directory_present": True,
-        "central_directory_walk_ok": True,
-        "central_directory_encrypted_entries": 0,
-        "encryption_scan_complete": True,
-        "password_required": False,
-    })
-    tester = FakePasswordTester()
-    session = PasswordSession()
-    resolver = PasswordResolver(tester, session)
-
-    result = resolver.resolve("sample.zip", task=bag, archive_key="archive-key")
-
-    assert result.password == ""
-    assert result.encrypted is False
-    assert session.get_resolved("archive-key") == ""
-    assert tester.test_without_password_calls == 0
-    assert tester.search_calls == 0
-    assert result.archive_key == "archive-key"
-
-
-def test_password_resolver_trusts_validated_encrypted_structure_without_empty_password_test():
-    bag = _task_with_structure("zip", {
-        "plausible": True,
-        "central_directory_present": True,
-        "central_directory_walk_ok": True,
-        "central_directory_encrypted_entries": 1,
-        "encryption_scan_complete": True,
-        "password_required": True,
-    })
-    tester = FakePasswordTester()
-    session = PasswordSession()
-    resolver = PasswordResolver(tester, session)
-
-    result = resolver.resolve("sample.zip", task=bag, archive_key="archive-key")
-
-    assert result.password == "secret"
-    assert tester.test_without_password_calls == 0
-    assert tester.search_calls == 1
-
-
-def test_password_resolver_uses_validated_rar_structure_password_marker():
-    bag = _task_with_structure("rar", {
-        "plausible": True,
-        "strong_accept": True,
-        "header_crc_ok": True,
-        "header_encrypted": True,
-        "password_required": True,
-    })
-    tester = FakePasswordTester()
-    session = PasswordSession()
-    resolver = PasswordResolver(tester, session)
-
-    result = resolver.resolve("sample.rar", task=bag, archive_key="archive-key")
-
-    assert result.password == "secret"
-    assert result.encrypted is True
-    assert tester.test_without_password_calls == 0
-    assert tester.search_calls == 1
-
-
-def test_password_resolver_uses_validated_seven_zip_encryption_fact():
-    bag = _task_with_structure("7z", {
-        "plausible": True,
-        "strong_accept": True,
-        "next_header_crc_ok": True,
-        "next_header_nid_valid": True,
-        "password_required": True,
-        "encrypted_header": True,
-        "encryption_scan_complete": True,
-    })
-    tester = FakePasswordTester()
-    resolver = PasswordResolver(tester, PasswordSession())
-
-    result = resolver.resolve("sample.7z", task=bag, archive_key="archive-key")
-
-    assert result.password == "secret"
-    assert result.encrypted is True
-    assert tester.test_without_password_calls == 0
-    assert tester.search_calls == 1
-
-
-def test_password_resolver_does_not_recheck_clear_wrong_password_after_encrypted_search():
-    bag = _task_with_structure("zip", {
-        "plausible": True,
-        "central_directory_present": True,
-        "central_directory_walk_ok": True,
-        "central_directory_encrypted_entries": 1,
-        "encryption_scan_complete": True,
-        "password_required": True,
-    })
-    tester = FakeFailingPasswordTester()
-    session = PasswordSession()
-    resolver = PasswordResolver(tester, session)
-
-    result = resolver.resolve("sample.zip", task=bag, archive_key="archive-key")
-
-    assert result.password is None
-    assert result.status == PasswordResolutionStatus.CANDIDATES_EXHAUSTED
-    assert tester.search_calls == 1
-    assert tester.test_without_password_calls == 0
-
-
-def test_password_resolver_preserves_fast_damage_result_without_full_retest():
-    bag = _task_with_structure("zip", {
-        "plausible": True,
-        "central_directory_present": True,
-        "central_directory_walk_ok": True,
-        "central_directory_encrypted_entries": 1,
-        "encryption_scan_complete": True,
-        "password_required": True,
-    })
-    tester = FakeDamagedPasswordTester()
-    session = PasswordSession()
-    resolver = PasswordResolver(tester, session)
-
-    result = resolver.resolve("sample.zip", task=bag, archive_key="archive-key")
-
-    assert result.password is None
-    assert result.status == PasswordResolutionStatus.DAMAGED
-    assert result.error_text == "headers error"
-    assert tester.search_calls == 1
-    assert tester.test_without_password_calls == 0
-
-
-def test_password_resolver_reuses_session_password_without_retesting():
-    session = PasswordSession()
-    session.set_resolved("archive-key", "secret")
-    tester = FakePasswordTester()
-    resolver = PasswordResolver(tester, session)
-
-    result = resolver.resolve("sample.zip", archive_key="archive-key")
-
-    assert result.password == "secret"
-
-
 def test_password_resolver_submits_all_inconclusive_candidates_as_one_batch():
     tester = FakePasswordTester()
     tester.password_store = PasswordStore.from_sources(
@@ -356,12 +200,13 @@ def test_password_resolver_submits_all_inconclusive_candidates_as_one_batch():
     )
     tester.passwords = tester.password_store.candidates()
     session = PasswordSession()
-    scheduler = QueuePasswordScheduler()
+    scheduler = QueuePasswordScheduler(candidate_evidence="zipcrypto_header_byte")
     resolver = PasswordResolver(tester, session, scheduler)
 
     first = resolver.resolve("large.rar", archive_key="archive-key")
 
     assert scheduler.planned == ["", "user-password", "builtin-password"]
+    assert first.candidate_evidence == "zipcrypto_header_byte"
     assert first.password == ""
     assert first.candidate_passwords == ("", "user-password", "builtin-password")
     assert first.requires_extraction_confirmation is True
@@ -497,23 +342,6 @@ def test_password_resolver_skips_candidates_for_intrinsically_unencrypted_format
         assert scheduler.planned == []
 
 
-def test_password_resolver_preserves_candidate_evidence_across_batch_confirmation():
-    tester = FakePasswordTester()
-    tester.password_store = PasswordStore.from_sources(
-        cli_passwords=["first", "second"],
-        builtin_passwords=[],
-    )
-    resolver = PasswordResolver(
-        tester,
-        PasswordSession(),
-        QueuePasswordScheduler(candidate_evidence="zipcrypto_header_byte"),
-    )
-
-    first = resolver.resolve("payload.zip", archive_key="archive-key")
-    assert first.candidate_evidence == "zipcrypto_header_byte"
-    assert first.candidate_passwords == ("", "first", "second")
-
-
 def test_password_resolver_uses_directory_passwords_before_user_and_builtin():
     tester = FakePasswordTester()
     tester.password_store = PasswordStore.from_sources(
@@ -603,3 +431,106 @@ def test_password_store_reads_structured_builtin_file(tmp_path):
     store = PasswordStore.from_sources(builtin_passwords_file=str(builtin_file))
 
     assert store.builtin_passwords == ["#secret", "clip-secret"]
+
+
+def test_validated_structure_password_lifecycle(subtests):
+    cases = [
+        (
+            'zip',
+            {
+                'plausible': True,
+                'central_directory_present': True,
+                'central_directory_walk_ok': True,
+                'central_directory_encrypted_entries': 0,
+                'encryption_scan_complete': True,
+                'password_required': False,
+            },
+            FakePasswordTester,
+            PasswordResolutionStatus.UNENCRYPTED,
+            '',
+        ),
+        (
+            'zip',
+            {
+                'plausible': True,
+                'central_directory_present': True,
+                'central_directory_walk_ok': True,
+                'central_directory_encrypted_entries': 1,
+                'encryption_scan_complete': True,
+                'password_required': True,
+            },
+            FakePasswordTester,
+            PasswordResolutionStatus.RESOLVED,
+            'secret',
+        ),
+        (
+            'rar',
+            {
+                'plausible': True,
+                'strong_accept': True,
+                'header_crc_ok': True,
+                'header_encrypted': True,
+                'password_required': True,
+            },
+            FakePasswordTester,
+            PasswordResolutionStatus.RESOLVED,
+            'secret',
+        ),
+        (
+            '7z',
+            {
+                'plausible': True,
+                'strong_accept': True,
+                'next_header_crc_ok': True,
+                'next_header_nid_valid': True,
+                'password_required': True,
+                'encrypted_header': True,
+                'encryption_scan_complete': True,
+            },
+            FakePasswordTester,
+            PasswordResolutionStatus.RESOLVED,
+            'secret',
+        ),
+        (
+            'zip',
+            {
+                'plausible': True,
+                'central_directory_present': True,
+                'central_directory_walk_ok': True,
+                'central_directory_encrypted_entries': 1,
+                'encryption_scan_complete': True,
+                'password_required': True,
+            },
+            FakeFailingPasswordTester,
+            PasswordResolutionStatus.CANDIDATES_EXHAUSTED,
+            None,
+        ),
+        (
+            'zip',
+            {
+                'plausible': True,
+                'central_directory_present': True,
+                'central_directory_walk_ok': True,
+                'central_directory_encrypted_entries': 1,
+                'encryption_scan_complete': True,
+                'password_required': True,
+            },
+            FakeDamagedPasswordTester,
+            PasswordResolutionStatus.DAMAGED,
+            None,
+        ),
+    ]
+    for fmt, structure, tester_factory, expected_status, password in cases:
+        with subtests.test(format=fmt, status=expected_status):
+            task = _task_with_structure(fmt, structure)
+            tester = tester_factory()
+            session = PasswordSession()
+            resolver = PasswordResolver(tester, session)
+            result = resolver.resolve(f"sample.{fmt}", task=task, archive_key="archive-key")
+            assert result.password == password and result.status == expected_status
+            assert tester.test_without_password_calls == 0
+            assert tester.search_calls == int(structure.get("password_required", False))
+            if password is not None:
+                assert session.get_resolved("archive-key") == password
+                assert resolver.resolve(f"sample.{fmt}", archive_key="archive-key").password == password
+                assert tester.search_calls == int(structure.get("password_required", False))

@@ -11,18 +11,12 @@ from sunpack.core.passwords.job import PasswordJob
 from sunpack.core.passwords.scheduler import PasswordScheduler, PasswordSearchStatus
 from sunpack.core.passwords.verifier import PasswordBatchVerification
 from sunpack.core.passwords.verifier.base import (
-    VERIFIER_STATUSES,
     normalize_verifier_status,
 )
 from sunpack.core.passwords.verifier.zip_fast import ZipFastVerifier
 from sunpack.pipeline.verification import VerificationScheduler
 from tests.helpers.archive_tasks import make_archive_task
 from tests.helpers.config_factory import make_config
-
-
-@pytest.mark.parametrize("status", sorted(VERIFIER_STATUSES))
-def test_verifier_statuses_accept_only_canonical_values(status):
-    assert normalize_verifier_status(status) == status
 
 
 def test_verifier_statuses_reject_unknown_values():

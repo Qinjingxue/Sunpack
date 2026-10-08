@@ -15,7 +15,7 @@ from sunpack.pipeline.extraction.internal.sevenzip.metadata import ArchiveMetada
 @pytest.mark.parametrize(
     ("name", "encoding", "expected_codepage"),
     [
-        ("日本語.txt", "cp932", "932"),
+        ("日本語/説明.txt", "cp932", "932"),
         ("説明書/第一章.txt", "cp932", "932"),
         ("日本語/説明.txt", "utf-8", "65001"),
         ("ﾃｽﾄ.txt", "cp932", "932"),
@@ -26,13 +26,18 @@ from sunpack.pipeline.extraction.internal.sevenzip.metadata import ArchiveMetada
 def test_native_codepage_selection_preserves_known_unicode_families(
     tmp_path, name, encoding, expected_codepage
 ):
-    archive = tmp_path / f"sample-{expected_codepage}.zip"
+    archive = tmp_path / f"sample-{expected_codepage}.data"
     _write_stored_zip(archive, name.encode(encoding), b"payload")
 
     result = ArchiveMetadataScanner().scan(str(archive), format_hint="zip")
 
     assert result.selected_codepage == expected_codepage
     assert result.confidence > 0.0
+    if name == "日本語/説明.txt" and encoding == "cp932":
+        assert result.confidence > 0.5
+    assert result.archive_type == "zip"
+    assert archive.is_file()
+    assert not archive.with_suffix(".zip").exists()
 
 
 def test_shift_jis_kanji_only_zip_scan_uses_cp932(tmp_path):
@@ -44,29 +49,6 @@ def test_shift_jis_kanji_only_zip_scan_uses_cp932(tmp_path):
 
     assert result.selected_codepage == "932"
     assert result.confidence > 0.5
-
-
-def test_shift_jis_zip_scan_selects_cp932(tmp_path):
-    archive = tmp_path / "shift-jis.zip"
-    expected_name = "日本語/説明.txt"
-    _write_stored_zip(archive, expected_name.encode("cp932"), b"payload")
-
-    result = ArchiveMetadataScanner().scan(str(archive), format_hint="zip")
-
-    assert result.selected_codepage == "932"
-    assert result.confidence > 0.5
-
-
-def test_format_hint_scans_disguised_zip_without_renaming_it(tmp_path):
-    archive = tmp_path / "downloaded.data"
-    expected_name = "日本語.txt"
-    _write_stored_zip(archive, expected_name.encode("cp932"), b"payload")
-
-    result = ArchiveMetadataScanner().scan(str(archive), format_hint="zip")
-
-    assert archive.is_file()
-    assert not (tmp_path / "downloaded.zip").exists()
-    assert result.archive_type == "zip"
 
 
 def test_sfx_prefix_uses_physical_central_directory(tmp_path):

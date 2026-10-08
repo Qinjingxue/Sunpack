@@ -42,18 +42,10 @@ def test_mutable_set_copies_before_taking_cache_lock():
 
     assert observations == [False]
     assert lock.acquisitions == 1
-
-
-def test_mutable_get_copies_after_releasing_cache_lock():
-    manager = CacheManager()
-    observations = []
-    value = _CopyProbe(manager, observations)
-
-    manager.set("probe", ("key",), value)
     observations.clear()
     assert manager.get("probe", ("key",)) is value
-
     assert observations == [False]
+    assert lock.acquisitions == 2
 
 
 def test_mutable_cache_keeps_defensive_copy_semantics():

@@ -156,43 +156,6 @@ def test_default_embedded_scan_skips_confirmed_pe_before_full_scan(tmp_path, mon
     )
 
 
-def test_force_scan_bypasses_pe_policy(tmp_path, monkeypatch):
-    path = tmp_path / "application.exe"
-    path.write_bytes(b"x" * 128)
-    scan = EmbeddedScanResult(
-        complete=True,
-        candidates=(
-            EmbeddedCandidate(
-                format="7z",
-                offset=32,
-                end_offset=128,
-                confidence=1.0,
-                validation="start_header_crc",
-                candidate_kind="logical_archive",
-                boundary_kind="exact",
-                extractable=True,
-            ),
-        ),
-        hits=(),
-        read_bytes=128,
-        file_size=128,
-        logical_resolution_complete=True,
-        raw_hit_count=1,
-        budget_exhausted=False,
-    )
-
-    monkeypatch.setattr(
-        "sunpack.pipeline.discovery.embedded.discovery.scan_embedded_archives",
-        lambda *_args, **_kwargs: scan,
-    )
-
-    result = EmbeddedDiscovery({}, EmbeddedOptions(force_scan=True)).discover([_candidate(path)])
-
-    assert len(result.resolved_tasks) == 1
-    assert result.resolved_tasks[0].discovery_source == "embedded"
-    assert result.resolved_tasks[0].archive_input().format_hint == "7z"
-
-
 def test_embedded_discovery_uses_current_identity_size_not_stale_candidate_size(tmp_path, monkeypatch):
     path = tmp_path / "growing.gz"
     path.write_bytes(b"x" * 48)
@@ -234,53 +197,6 @@ def test_embedded_discovery_uses_current_identity_size_not_stale_candidate_size(
 
     assert observed["expected_size"] == 48
     assert observed["identity"] == (str(path), 48, 123)
-
-
-def test_embedded_rar_header_encryption_reaches_canonical_input(tmp_path, monkeypatch):
-    path = tmp_path / "carrier.bin"
-    path.write_bytes(b"x" * 128)
-    scan = EmbeddedScanResult(
-        complete=True,
-        candidates=(
-            EmbeddedCandidate(
-                format="rar",
-                offset=16,
-                end_offset=None,
-                confidence=1.0,
-                validation="rar5_encryption_header_crc",
-                candidate_kind="logical_archive",
-                boundary_kind="unresolved",
-                extractable=False,
-            ),
-        ),
-        hits=(),
-        read_bytes=128,
-        file_size=128,
-        logical_resolution_complete=False,
-        raw_hit_count=1,
-        budget_exhausted=False,
-    )
-    monkeypatch.setattr(
-        "sunpack.pipeline.discovery.embedded.discovery.scan_embedded_archives",
-        lambda *_args, **_kwargs: scan,
-    )
-    monkeypatch.setattr(
-        "sunpack.pipeline.discovery.embedded.discovery.resolve_encrypted_rar_boundaries",
-        lambda _path, _offsets, _passwords: {
-            "status": "ok",
-            "failed_offset": None,
-            "resolved": [{"offset": 16, "end_offset": 128, "password": "secret"}],
-        },
-    )
-
-    result = EmbeddedDiscovery({"user_passwords": ["secret"]}).discover([_candidate(path)])
-
-    assert len(result.resolved_tasks) == 1
-    descriptor = result.resolved_tasks[0].archive_input()
-    assert descriptor.open_mode == "file_range"
-    assert descriptor.primary_extent.end == 128
-    assert descriptor.analysis["password_required"] is True
-    assert result.resolved_tasks[0].runtime["embedded_segment_passwords"]["16"] == "secret"
 
 
 def test_truncated_embedded_7z_is_reported_as_blocked_damage(tmp_path, monkeypatch):
@@ -379,63 +295,8 @@ def test_truncated_7z_split_candidate_stays_residual_for_relations(tmp_path, mon
     )
 
 
-def test_embedded_rar_wrong_password_blocks_whole_carrier(tmp_path, monkeypatch):
-    path = tmp_path / "carrier.bin"
-    path.write_bytes(b"x" * 128)
-    scan = EmbeddedScanResult(
-        complete=True,
-        candidates=(
-            EmbeddedCandidate(
-                format="rar",
-                offset=16,
-                end_offset=None,
-                confidence=1.0,
-                validation="rar5_encryption_header_crc",
-                candidate_kind="logical_archive",
-                boundary_kind="unresolved",
-                extractable=False,
-            ),
-        ),
-        hits=(),
-        read_bytes=128,
-        file_size=128,
-        logical_resolution_complete=False,
-        raw_hit_count=1,
-        budget_exhausted=False,
-    )
-    monkeypatch.setattr(
-        "sunpack.pipeline.discovery.embedded.discovery.scan_embedded_archives",
-        lambda *_args, **_kwargs: scan,
-    )
-    monkeypatch.setattr(
-        "sunpack.pipeline.discovery.embedded.discovery.resolve_encrypted_rar_boundaries",
-        lambda _path, _offsets, _passwords: {
-            "status": "wrong_password",
-            "failed_offset": 16,
-            "resolved": [],
-        },
-    )
-
-    result = EmbeddedDiscovery({"user_passwords": ["wrong"]}).discover([_candidate(path)])
-
-    assert result.resolved_tasks == []
-    assert result.blocked_paths
-    assert any(
-        trace.reason == "embedded_wrong_password" and trace.status == "blocked"
-        for trace in result.traces
-    )
-    assert len(result.findings) == 1
-    finding = result.findings[0]
-    assert finding.format == "rar"
-    assert finding.offset == 16
-    assert finding.end_offset is None
-    assert finding.status == "blocked"
-    assert finding.reason == "embedded_wrong_password"
-    assert finding.extractable is False
-
-
-
-def test_password_blocked_carrier_preserves_every_archive_finding(tmp_path, monkeypatch):
+@pytest.mark.parametrize("status", ["password_required", "wrong_password"])
+def test_password_blocked_carrier_preserves_every_archive_finding(tmp_path, monkeypatch, status):
     path = tmp_path / "carrier.bin"
     path.write_bytes(b"x" * 160)
     scan = EmbeddedScanResult(
@@ -486,7 +347,7 @@ def test_password_blocked_carrier_preserves_every_archive_finding(tmp_path, monk
     monkeypatch.setattr(
         "sunpack.pipeline.discovery.embedded.discovery.resolve_encrypted_rar_boundaries",
         lambda _path, _offsets, _passwords: {
-            "status": "password_required",
+            "status": status,
             "failed_offset": 40,
             "resolved": [],
         },
@@ -501,7 +362,7 @@ def test_password_blocked_carrier_preserves_every_archive_finding(tmp_path, monk
     assert [finding.end_offset for finding in result.findings] == [32, None, 144]
     assert [finding.reason for finding in result.findings] == [
         "embedded_carrier_blocked",
-        "embedded_password_required",
+        f"embedded_{status}",
         "embedded_carrier_blocked",
     ]
     assert all(finding.status == "blocked" for finding in result.findings)

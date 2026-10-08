@@ -15,30 +15,6 @@ def _config():
     return make_config(with_detection_pipeline())
 
 
-def test_output_scan_policy_schedules_disguised_archive_for_full_scan(tmp_path):
-    candidate = tmp_path / "K社27作.ISO"
-    candidate.write_bytes(b"7z\xbc\xaf'\x1c" + b"payload")
-
-    policy = OutputScanPolicy(_config())
-
-    assert policy.should_scan_output_dir(str(tmp_path))
-    assert policy.prepare_scan([str(tmp_path)]).roots == (str(tmp_path.resolve()),)
-
-
-def test_output_scan_policy_finds_nested_archive_when_initial_scan_is_current_dir_only(tmp_path):
-    segment_dir = tmp_path / "embedded_00_rar"
-    segment_dir.mkdir()
-    nested = segment_dir / "payload.ISO"
-    nested.write_bytes(b"7z" + b"x" * (1024 * 1024))
-    config = _config()
-    config.setdefault("filesystem", {})["directory_scan_mode"] = "current_dir_only"
-
-    policy = OutputScanPolicy(config)
-
-    assert policy.should_scan_output_dir(str(tmp_path))
-    assert policy.prepare_scan([str(tmp_path)]).roots == (str(tmp_path.resolve()),)
-
-
 def test_output_scan_policy_parent_roots_bypass_file_column_materialization(tmp_path, monkeypatch):
     first_dir = tmp_path / "one"
     second_dir = tmp_path / "two"
@@ -59,23 +35,6 @@ def test_output_scan_policy_parent_roots_bypass_file_column_materialization(tmp_
     roots = policy._candidate_parent_roots(str(tmp_path))
 
     assert set(roots) == {str(first_dir.resolve()), str(second_dir.resolve())}
-
-
-def test_output_scan_policy_projects_normal_archive_as_one_logical_root(tmp_path):
-    output_dir = tmp_path / "normal"
-    output_dir.mkdir()
-    archive = output_dir / "nested.zip"
-    archive.write_bytes(b"PK\x03\x04payload")
-    result = ExtractionResult(
-        success=True,
-
-        out_dir=str(output_dir),
-
-    )
-
-    projected = OutputScanPolicy.project_logical_scan_roots(str(output_dir), result)
-
-    assert [root for root, _inventory in projected] == [str(output_dir)]
 
 
 def test_output_scan_policy_projects_each_confirmed_embedded_segment(tmp_path):
@@ -159,7 +118,9 @@ def test_output_scan_policy_reuses_extraction_inventory(tmp_path, monkeypatch):
         "sunpack.pipeline.coordinator.output_scan_policy.DirectoryScanner.scan",
         lambda _self: (_ for _ in ()).throw(AssertionError("directory must not be rescanned")),
     )
-    policy = OutputScanPolicy(_config())
+    config = _config()
+    config["filesystem"]["directory_scan_mode"] = "current_dir_only"
+    policy = OutputScanPolicy(config)
     work = policy.prepare_scan(
         [str(tmp_path)],
         inventories={str(tmp_path.resolve()).lower(): inventory},

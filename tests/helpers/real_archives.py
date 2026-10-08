@@ -756,24 +756,6 @@ def _craft_small_zip64(entries: dict[str, bytes]) -> bytes:
     return body + zip64_eocd + locator + classic
 
 
-def create_7z_nonsolid_archive(
-    root: Path,
-    case_id: str,
-    *,
-    payload_size: int = 16 * 1024,
-) -> ArchiveCase:
-    source_dir = root / f"{case_id}_src"
-    payload = write_payload(source_dir, case_id, size_bytes=payload_size)
-    archive_dir = root / case_id
-    archive_dir.mkdir(parents=True, exist_ok=True)
-    archive_path = archive_dir / f"{case_id}.7z"
-    run_cmd([str(require_7z()), "a", str(archive_path), str(source_dir), "-ms=off", "-mx=1", "-y"], archive_dir)
-    shutil.rmtree(source_dir, ignore_errors=True)
-    return _case_from_payload(
-        root, case_id, "7z", archive_dir, archive_path, payload, solid=False
-    )
-
-
 def create_rar4_archive(
     root: Path,
     case_id: str,
@@ -999,21 +981,6 @@ def create_multi_member_stream_archive(
         multi_member=True,
         second_member_content=second_content.decode("utf-8"),
         **stream_metadata,
-    )
-
-
-def create_xz_sha256_archive(
-    root: Path,
-    case_id: str,
-    *,
-    payload_size: int = 16 * 1024,
-) -> ArchiveCase:
-    return create_stream_variant_archive(
-        root,
-        case_id,
-        "xz",
-        payload_size=payload_size,
-        xz_check="sha256",
     )
 
 

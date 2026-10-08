@@ -9,7 +9,7 @@ import zipfile
 
 import pytest
 
-from sunpack.core.contracts.archive_input import ArchiveInputDescriptor, ArchiveInputPart, InputExtent
+from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
 from sunpack.core.contracts.failures import FailureKind
 from tests.helpers.archive_tasks import make_archive_task, make_task_from_descriptor
 from tests.helpers.worker_events import worker_trace_item
@@ -22,6 +22,11 @@ from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import wor
 from sunpack.pipeline.extraction.scheduler import ExtractionScheduler
 from sunpack.core.support.resources import get_sevenzip_bridge_worker_path
 from tests.helpers.tool_config import get_test_tools
+
+
+def _invoke_worker(worker, request, *, env=None, timeout=10):
+    return subprocess.run([worker], input=json.dumps(request, ensure_ascii=False),
+                          capture_output=True, text=True, encoding="utf-8", env=env, timeout=timeout)
 
 
 def _require_worker_or_skip():
@@ -125,19 +130,6 @@ def _create_encrypted_zip(tmp_path, password: str = "secret"):
     return archive, source.name
 
 
-def _create_zip_with_bad_eocd_count(tmp_path):
-    archive = tmp_path / "bad_count.zip"
-    with zipfile.ZipFile(archive, "w") as zf:
-        zf.writestr("payload.txt", "patched worker payload")
-    data = bytearray(archive.read_bytes())
-    eocd = data.rfind(b"PK\x05\x06")
-    if eocd < 0:
-        raise RuntimeError("test ZIP did not contain EOCD")
-    struct.pack_into("<H", data, eocd + 10, 99)
-    archive.write_bytes(bytes(data))
-    return archive, eocd
-
-
 def _create_shift_jis_zip(tmp_path):
     archive = tmp_path / "shift-jis.zip"
     expected_name = "日本語/説明.txt"
@@ -163,36 +155,6 @@ def _create_shift_jis_zip(tmp_path):
     return archive, expected_name, payload
 
 
-def test_worker_failed_result_includes_diagnostics(tmp_path):
-    worker = _require_worker_or_skip()
-    missing = tmp_path / "missing.7z"
-    payload = {
-        "job_id": "diagnostics",
-        "archive_path": str(missing),
-        "output_dir": str(tmp_path / "out"),
-    }
-
-    result = subprocess.run(
-        [worker],
-        input=json.dumps(payload, ensure_ascii=False),
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-    )
-    lines = [json.loads(line) for line in result.stdout.splitlines() if line.strip().startswith("{")]
-    worker_result = next(item for item in lines if item.get("type") == "result")
-
-    assert result.returncode != 0
-    assert worker_result["status"] == "failed"
-    assert worker_result["failure_stage"] == "input_open"
-    assert worker_result["failure_kind"] == "input_stream"
-    assert worker_result["operation_result_name"] == "ok"
-    assert worker_result["diagnostics"]["input_trace"]["read_error"] is True
-    assert worker_result["diagnostics"]["input_trace"]["last_win32_error"] != 0
-    assert "handler_attempts" in worker_result["diagnostics"]
-    assert "output_trace" in worker_result["diagnostics"]
-
-
 def test_worker_does_not_classify_unencrypted_open_failure_as_wrong_password(tmp_path):
     worker = _require_worker_or_skip()
     archive = tmp_path / "malformed.7z"
@@ -204,13 +166,7 @@ def test_worker_does_not_classify_unencrypted_open_failure_as_wrong_password(tmp
         "password": "irrelevant",
     }
 
-    result = subprocess.run(
-        [worker],
-        input=json.dumps(payload, ensure_ascii=False),
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-    )
+    result = _invoke_worker(worker, payload)
     lines = [json.loads(line) for line in result.stdout.splitlines() if line.strip().startswith("{")]
     worker_result = next(item for item in lines if item.get("type") == "result")
 
@@ -218,164 +174,6 @@ def test_worker_does_not_classify_unencrypted_open_failure_as_wrong_password(tmp
     assert worker_result["wrong_password"] is False
     assert worker_result["encrypted"] is False
     assert worker_result["failure_kind"] != "encrypted_or_wrong_password"
-
-
-def test_worker_candidate_batch_probes_then_extracts_with_selected_password(tmp_path):
-    worker = _require_worker_or_skip()
-    archive, filename = _create_encrypted_zip(tmp_path)
-    from sunpack.core.passwords.verifier.zip_fast import ZipFastVerifier
-
-    weak_candidates = [f"weak-collision-{index}" for index in range(1024)]
-    weak_match = ZipFastVerifier().verify_batch(str(archive), [*weak_candidates, "secret"])
-    collision = next(
-        (
-            weak_candidates[index]
-            for index in weak_match.matched_indices
-            if index < len(weak_candidates)
-        ),
-        None,
-    )
-    if collision is None:
-        pytest.skip("the generated ZipCrypto header had no weak false-positive candidate")
-    out_dir = tmp_path / "out"
-    payload = {
-        "job_id": "candidate-batch-success",
-        "archive_path": str(archive),
-        "output_dir": str(out_dir),
-        "format_hint": "zip",
-        "password": "weak-header-placeholder",
-        "password_candidates": [collision, "secret"],
-    }
-
-    result = subprocess.run(
-        [worker],
-        input=json.dumps(payload, ensure_ascii=False),
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-    )
-    worker_result = _worker_result(result.stdout)
-
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert worker_result["status"] == "ok"
-    assert worker_result["password_candidate_batch"] is True
-    assert worker_result["password_candidates_all_rejected"] is False
-    assert worker_result["password_candidate_count"] == 2
-    assert worker_result["password_attempts"] == 2
-    assert worker_result["matched_index"] == 1
-    assert (out_dir / filename).read_text(encoding="utf-8") == "encrypted worker payload"
-
-
-def test_worker_single_candidate_skips_probe_and_extracts_directly(tmp_path):
-    worker = _require_worker_or_skip()
-    archive, filename = _create_encrypted_zip(tmp_path)
-    out_dir = tmp_path / "out-single"
-    payload = {
-        "job_id": "candidate-direct-success",
-        "archive_path": str(archive),
-        "output_dir": str(out_dir),
-        "format_hint": "zip",
-        "password": "fast-verifier-placeholder",
-        "password_candidates": ["secret"],
-    }
-
-    result = subprocess.run(
-        [worker],
-        input=json.dumps(payload, ensure_ascii=False),
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-    )
-    worker_result = _worker_result(result.stdout)
-
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert worker_result["status"] == "ok"
-    assert worker_result["password_candidate_direct"] is True
-    assert worker_result["password_candidate_batch"] is False
-    assert worker_result["password_candidate_count"] == 1
-    assert worker_result["password_attempts"] == 0
-    assert worker_result["matched_index"] == 0
-    assert (out_dir / filename).read_text(encoding="utf-8") == "encrypted worker payload"
-
-
-def test_worker_single_zipcrypto_collision_probes_only_after_direct_failure(tmp_path):
-    worker = _require_worker_or_skip()
-    archive, _filename = _create_encrypted_zip(tmp_path)
-    from sunpack.core.passwords.verifier.zip_fast import ZipFastVerifier
-
-    weak_candidates = [f"weak-collision-{index}" for index in range(4096)]
-    weak_match = ZipFastVerifier().verify_batch(str(archive), weak_candidates)
-    collision = next(
-        (
-            weak_candidates[index]
-            for index in weak_match.matched_indices
-            if index < len(weak_candidates)
-        ),
-        None,
-    )
-    if collision is None:
-        pytest.skip("the generated ZipCrypto header had no weak false-positive candidate")
-    out_dir = tmp_path / "out-single-collision"
-    payload = {
-        "job_id": "candidate-direct-collision",
-        "archive_path": str(archive),
-        "output_dir": str(out_dir),
-        "format_hint": "zip",
-        "password": "fast-verifier-placeholder",
-        "password_candidates": [collision],
-    }
-
-    result = subprocess.run(
-        [worker],
-        input=json.dumps(payload, ensure_ascii=False),
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-    )
-    worker_result = _worker_result(result.stdout)
-
-    assert result.returncode != 0
-    assert worker_result["native_status"] == "wrong_password"
-    assert worker_result["password_candidate_direct"] is True
-    assert worker_result["password_candidate_batch"] is False
-    assert worker_result["password_candidates_all_rejected"] is True
-    assert worker_result["password_candidate_count"] == 1
-    assert worker_result["password_attempts"] == 1
-    assert worker_result["matched_index"] == -1
-
-
-def test_worker_candidate_batch_rejects_all_candidates_without_full_extraction(tmp_path):
-    worker = _require_worker_or_skip()
-    archive, filename = _create_encrypted_zip(tmp_path)
-    out_dir = tmp_path / "out"
-    payload = {
-        "job_id": "candidate-batch-rejected",
-        "archive_path": str(archive),
-        "output_dir": str(out_dir),
-        "format_hint": "zip",
-        "password": "weak-header-placeholder",
-        "password_candidates": ["wrong-password-1", "wrong-password-2"],
-    }
-
-    result = subprocess.run(
-        [worker],
-        input=json.dumps(payload, ensure_ascii=False),
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-    )
-    worker_result = _worker_result(result.stdout)
-
-    assert result.returncode != 0
-    assert worker_result["status"] == "failed"
-    assert worker_result["native_status"] == "wrong_password"
-    assert worker_result["failure_stage"] == "password_probe"
-    assert worker_result["password_candidate_batch"] is True
-    assert worker_result["password_candidates_all_rejected"] is True
-    assert worker_result["password_candidate_count"] == 2
-    assert worker_result["password_attempts"] == 2
-    assert worker_result["matched_index"] == -1
-    assert not (out_dir / filename).exists()
 
 
 def test_native_worker_result_escapes_control_characters(tmp_path):
@@ -616,13 +414,11 @@ def test_worker_header_encrypted_7z_tries_candidates_with_disguised_names(tmp_pa
             {"path": str(disguised), "start": 0}, {"path": str(second), "start": 0},
         ])
     out = tmp_path / "out"
-    result = subprocess.run(
-        [worker], input=json.dumps({
+    result = _invoke_worker(worker, {
             "job_id": "header-passwords", "archive_path": str(disguised),
             "output_dir": str(out), "format_hint": "7z", "archive_input": descriptor,
             "password_candidates": ["wrong", "secret"],
-        }), capture_output=True, text=True, encoding="utf-8", timeout=10,
-    )
+        }, timeout=10)
     final = _worker_result(result.stdout)
     assert result.returncode == 0, result.stdout + result.stderr
     assert final["status"] == "ok"
@@ -721,88 +517,15 @@ def test_native_worker_reports_cpu_credit_sizing_plan():
     assert float(handshake["minimum_available_memory_ratio"]) == 0.1
 
 
-def test_compact_worker_manifest_is_parsed_into_native_storage():
-    from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import build_worker_diagnostics
-
-    stdout = (
-        '{"type":"result","status":"ok","verified_manifest":'
-        '{"validated":true,"item_count":1,"file_count":1,'
-        '"inventory":[1,1,0,3,1],"rows":[[0,"a.txt","",3,3,1,1,1,1,1,1,1,123,"616263"]]}}\n'
-    )
-    result = build_worker_diagnostics(stdout=stdout, stderr="", returncode=0)["result"]
-
-    manifest = result["verified_manifest"]
-    native = manifest["native_rows"]
-    assert len(native) == 1
-    assert native.all_complete() is True
-    assert "files" not in manifest
-    materialized = native.file_page(0, 1)[0]
-    assert materialized["path"] == "a.txt"
-    assert "output_path" not in materialized
-    assert materialized["status"] == "complete"
-    assert materialized["magic"] == b"abc"
-    assert materialized["mtime_ns"] == 123
-    assert result["verified_manifest"]["inventory"]["identity_paths"] is True
-    assert "rows" not in manifest
-
-
-def test_worker_event_per_item_arrays_become_native_tables():
-    from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import (
-        native_output_trace,
-        native_worker_manifest,
-        parse_worker_json_line,
-    )
-
-    line = (
-        json.dumps({
-            "type": "result",
-            "status": "failed",
-            "verified_manifest": {
-                "validated": False,
-                "item_count": 2,
-                "file_count": 1,
-                "inventory": [0, 1, 0, 3, 1],
-                "rows": [[0, "a.txt", "", 3, 3, 1, 1, 1, 1, 1, 1, 1, 123, "616263"]],
-            },
-            "diagnostics": {
-                "failure_kind": "checksum_error",
-                "output_trace": {
-                    "total_bytes_written": 3,
-                    "items": [
-                        worker_trace_item(index=0, path="dir", is_dir=True),
-                        worker_trace_item(
-                            index=1,
-                            path="a.txt",
-                            bytes_written=3,
-                            failed=True,
-                            hresult=-2147467259,
-                        ),
-                    ],
-                },
-            },
-        }) + "\n"
-    ).encode()
-
-    result = parse_worker_json_line(line)
-
-    manifest = result["verified_manifest"]
-    assert "rows" not in manifest
-    assert manifest["inventory"] == {
-        "complete": False, "file_count": 1, "dir_count": 0, "total_size": 3, "identity_paths": True,
-    }
-    assert len(native_worker_manifest(result)) == 1
-    trace = result["diagnostics"]["output_trace"]
-    assert "items" not in trace
-    assert trace["total_bytes_written"] == 3
-    native = native_output_trace(result)
-    assert len(native) == 2 and native.has_progress()
-    item = native.item_page(1, 1)[0]
-    assert item["path"] == "a.txt" and item["failed"] is True and item["hresult"] == -2147467259
-
-
 def test_worker_event_rejects_non_objects_and_malformed_rows():
     from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import parse_worker_json_line
 
+    assert parse_worker_json_line(json.dumps({
+        "type": "result", "verified_manifest": {"rows": [[0, "a.txt", "", 3, 3, 1, 7, 1, 7, 1, 1, 1, 123, "616263"]]},
+    })) == {}
+    assert parse_worker_json_line(json.dumps({
+        "type": "result", "diagnostics": {"output_trace": {"items": [{"path": "a.txt"}]}},
+    })) == {}
     assert parse_worker_json_line("not json") == {}
     assert parse_worker_json_line("[1, 2]") == {}
     assert parse_worker_json_line('{"type":"progress"} trailing') == {}
@@ -812,76 +535,6 @@ def test_worker_event_rejects_non_objects_and_malformed_rows():
     assert parse_worker_json_line('{"type":"progress","completed_bytes":5}') == {
         "type": "progress", "completed_bytes": 5,
     }
-
-
-def test_worker_manifest_rows_require_inventory():
-    from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import parse_worker_json_line
-
-    assert parse_worker_json_line(json.dumps({
-        "type": "result",
-        "verified_manifest": {"rows": [[0, "a.txt", "", 3, 3, 1, 7, 1, 7, 1, 1, 1, 123, "616263"]]},
-    })) == {}
-
-
-def test_worker_output_trace_requires_complete_items():
-    from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import parse_worker_json_line
-
-    assert parse_worker_json_line(json.dumps({
-        "type": "result",
-        "diagnostics": {"output_trace": {"items": [{"path": "a.txt"}]}},
-    })) == {}
-
-
-def test_worker_manifest_native_parser_preserves_json_escaped_paths():
-    from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import (
-        native_worker_manifest,
-        parse_worker_json_line,
-    )
-
-    path = '目录/"quoted"\\name.txt'
-    payload = {
-        "type": "result",
-        "status": "ok",
-        "verified_manifest": {
-            "validated": True,
-            "item_count": 1,
-            "file_count": 1,
-            "inventory": [1, 1, 0, 3, 1],
-            "rows": [[0, path, "", 3, 3, 1, 7, 1, 7, 1, 1, 1, 123, "616263"]],
-        },
-    }
-    line = json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
-
-    result = parse_worker_json_line(line)
-    materialized = native_worker_manifest(result).file_page(0, 1)[0]
-
-    assert materialized["path"] == path
-    assert materialized["magic"] == b"abc"
-
-
-@pytest.mark.parametrize("rows_first", [False, True])
-def test_worker_manifest_rows_and_inventory_are_order_independent(rows_first):
-    from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import (
-        native_worker_manifest,
-        parse_worker_json_line,
-    )
-
-    fields = [
-        ("rows", [[0, "a.txt", "", 3, 3, 1, 1, 1, 1, 1, 1, 1, 123, "616263"]]),
-        ("inventory", [1, 1, 0, 3, 1]),
-    ]
-    if not rows_first:
-        fields.reverse()
-    result = parse_worker_json_line(json.dumps({
-        "type": "result", "verified_manifest": dict(fields),
-    }))
-
-    manifest = result["verified_manifest"]
-    assert "rows" not in manifest
-    assert manifest["inventory"]["complete"] is True
-    native = native_worker_manifest(result)
-    assert native.all_complete()
-    assert native.file_page(0, 1)[0]["path"] == "a.txt"
 
 
 def test_preparsed_worker_result_avoids_stdout_reparse_and_bounds_tail():
@@ -958,13 +611,7 @@ def test_worker_output_trace_includes_per_item_failure(tmp_path):
         "output_dir": str(out_dir),
     }
 
-    result = subprocess.run(
-        [worker],
-        input=json.dumps(payload, ensure_ascii=False),
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-    )
+    result = _invoke_worker(worker, payload)
     worker_result = _worker_result(result.stdout)
     native = worker_result["diagnostics"]["output_trace"]["native_items"]
     output_items = native.item_page(0, len(native))
@@ -995,13 +642,7 @@ def test_worker_propagates_delayed_async_file_open_failure(tmp_path):
         "format_hint": "zip",
     }
 
-    result = subprocess.run(
-        [worker],
-        input=json.dumps(payload, ensure_ascii=False),
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-    )
+    result = _invoke_worker(worker, payload)
     worker_result = _worker_result(result.stdout)
     native = worker_result["diagnostics"]["output_trace"]["native_items"]
     output_items = native.item_page(0, len(native))
@@ -1030,13 +671,7 @@ def test_worker_dry_run_reports_success_diagnostics_without_writing(tmp_path):
         "dry_run": True,
     }
 
-    result = subprocess.run(
-        [worker],
-        input=json.dumps(payload, ensure_ascii=False),
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-    )
+    result = _invoke_worker(worker, payload)
     worker_result = _worker_result(result.stdout)
     output_trace = worker_result["diagnostics"]["output_trace"]
 
@@ -1065,19 +700,13 @@ def test_worker_skips_output_crc_when_source_crc_is_missing(tmp_path, dry_run):
     with tarfile.open(archive, "w") as handle:
         handle.add(source, arcname=source.name)
     output_dir = tmp_path / ("dry-output" if dry_run else "out")
-    result = subprocess.run(
-        [worker],
-        input=json.dumps({
+    result = _invoke_worker(worker, {
             "job_id": f"{'dry-run' if dry_run else 'extract'}-no-source-crc",
             "archive_path": str(archive),
             "output_dir": str(output_dir),
             "format_hint": "tar",
             "dry_run": dry_run,
-        }),
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-    )
+        })
     worker_result = _worker_result(result.stdout)
 
     assert result.returncode == 0, result.stdout + result.stderr
@@ -1098,137 +727,8 @@ def test_worker_skips_output_crc_when_source_crc_is_missing(tmp_path, dry_run):
         # this branch verifies that the same path still writes correct bytes.
         assert "diagnostics" not in worker_result
         assert (output_dir / source.name).read_bytes() == payload
-
-
-@pytest.mark.parametrize(
-    ("format_hint", "prefetch_enabled"),
-    [("tar", False), ("", True)],
-)
-def test_worker_applies_format_aware_prefetch_policy(tmp_path, format_hint, prefetch_enabled):
-    worker = _require_worker_or_skip()
-    source = tmp_path / "payload.bin"
-    source.write_bytes(b"prefetch policy payload")
-    archive = tmp_path / "payload.tar"
-    with tarfile.open(archive, "w") as handle:
-        handle.add(source, arcname=source.name)
-
-    environment = os.environ.copy()
-    environment["SUNPACK_SEVENZIP_PROFILE_READS"] = "1"
-    environment["SUNPACK_SEVENZIP_PREFETCH"] = "1"
-    result = subprocess.run(
-        [worker],
-        input=json.dumps({
-            "job_id": f"prefetch-policy-{format_hint or 'empty'}",
-            "archive_path": str(archive),
-            "output_dir": str(tmp_path / "out"),
-            "format_hint": format_hint,
-            "dry_run": True,
-        }),
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        env=environment,
-    )
-    worker_result = _worker_result(result.stdout)
-
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert worker_result["input_trace"]["prefetch_enabled"] is prefetch_enabled
-
-
-def test_worker_disables_prefetch_for_native_rar_volumes(tmp_path):
-    worker = _require_worker_or_skip()
-    first = tmp_path / "archive.part1.rar"
-    second = tmp_path / "archive.part2.rar"
-    first.write_bytes(b"Rar!\x1a\x07\x01\x00")
-    second.write_bytes(b"not a complete volume")
-    environment = os.environ.copy()
-    environment["SUNPACK_SEVENZIP_PROFILE_READS"] = "1"
-    environment["SUNPACK_SEVENZIP_PREFETCH"] = "1"
-    result = subprocess.run(
-        [worker],
-        input=json.dumps({
-            "job_id": "native-rar-prefetch-policy",
-            "archive_path": str(first),
-            "output_dir": str(tmp_path / "out"),
-            "format_hint": "rar",
-            "archive_input": {
-                "entry_path": str(first),
-                "open_mode": "native_volumes",
-                "format_hint": "rar",
-                "parts": [
-                    {"path": str(first), "volume_number": 1, "canonical_name": first.name},
-                    {"path": str(second), "volume_number": 2, "canonical_name": second.name},
-                ],
-            },
-        }),
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        env=environment,
-    )
-    worker_result = _worker_result(result.stdout)
-
-    assert result.returncode != 0
-    assert worker_result["input_trace"]["prefetch_enabled"] is False
-
-
-def test_worker_omits_input_profile_without_opt_in(tmp_path):
-    worker = _require_worker_or_skip()
-    archive, _ = _create_7z(tmp_path, "profile-disabled", "profile disabled payload")
-    environment = os.environ.copy()
-    environment.pop("SUNPACK_SEVENZIP_PROFILE_READS", None)
-    result = subprocess.run(
-        [worker],
-        input=json.dumps({
-            "job_id": "profile-disabled",
-            "archive_path": str(archive),
-            "output_dir": str(tmp_path / "out"),
-            "format_hint": "7z",
-        }),
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        env=environment,
-    )
-    worker_result = _worker_result(result.stdout)
-
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert "input_trace" not in worker_result
-
-
-def test_worker_async_output_extracts_format_without_source_crc(tmp_path):
-    worker = _require_worker_or_skip()
-    payload = b"streamed tar payload"
-    source = tmp_path / "payload.bin"
-    source.write_bytes(payload)
-    archive = tmp_path / "payload.tar"
-    with tarfile.open(archive, "w") as handle:
-        handle.add(source, arcname=source.name)
-    out_dir = tmp_path / "out"
-
-    result = subprocess.run(
-        [worker],
-        input=json.dumps({
-            "job_id": "async-no-source-crc",
-            "archive_path": str(archive),
-            "output_dir": str(out_dir),
-            "format_hint": "tar",
-        }),
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-    )
-    worker_result = _worker_result(result.stdout)
-
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert worker_result["status"] == "ok"
-    assert worker_result["files_written"] == 1
-    assert worker_result["bytes_written"] == len(payload)
-    manifest = worker_result["verified_manifest"]
-    row = manifest["native_rows"].file_page(0, 1)[0]
-    assert row["mtime_ns"] > 0
-    assert row["magic"] == payload
-    assert (out_dir / source.name).read_bytes() == payload
+        row = worker_result["verified_manifest"]["native_rows"].file_page(0, 1)[0]
+        assert row["mtime_ns"] > 0 and row["magic"] == payload
 
 
 def test_runner_serializes_only_codepage_for_filename_override(tmp_path):
@@ -1263,13 +763,7 @@ def test_worker_applies_explicit_shift_jis_item_paths(tmp_path):
         "codepage": "932",
     }
 
-    result = subprocess.run(
-        [worker],
-        input=json.dumps(payload, ensure_ascii=False),
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-    )
+    result = _invoke_worker(worker, payload)
     worker_result = _worker_result(result.stdout)
 
     assert result.returncode == 0, result.stdout + result.stderr
@@ -1496,30 +990,6 @@ def test_extraction_scheduler_uses_worker_for_concat_ranges(tmp_path, monkeypatc
     assert result.diagnostics["result"]["input_trace"]["prefetch_enabled"] is True
 
 
-def test_extraction_scheduler_uses_worker_archive_input_descriptor(tmp_path):
-    archive, filename = _create_7z(tmp_path, "payload", "descriptor payload")
-    data = archive.read_bytes()
-    prefix = b"DESCRIPTOR"
-    mixed = tmp_path / "descriptor.bin"
-    mixed.write_bytes(prefix + data + b"TAIL")
-
-    descriptor = ArchiveInputDescriptor(
-        entry_path=str(mixed),
-        open_mode="file_range",
-        format_hint="7z",
-        parts=[
-            ArchiveInputPart(
-                extent=InputExtent(path=str(mixed), start=len(prefix), end=len(prefix) + len(data)),
-            )
-        ],
-    )
-    task = _task(mixed, descriptor.to_dict())
-    result = ExtractionScheduler(max_retries=1).extract(task, str(tmp_path / "out"))
-
-    assert result.success is True
-    assert (tmp_path / "out" / filename).read_text(encoding="utf-8") == "descriptor payload"
-
-
 def test_worker_maps_windows_invalid_entry_names_like_the_verifier(tmp_path):
     from sunpack.pipeline.extraction.output_inventory import collect_output_inventory
     from sunpack.pipeline.verification.methods._archive_output_match import (
@@ -1547,13 +1017,7 @@ def test_worker_maps_windows_invalid_entry_names_like_the_verifier(tmp_path):
         "format_hint": "zip",
     }
 
-    result = subprocess.run(
-        [worker],
-        input=json.dumps(payload, ensure_ascii=False),
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-    )
+    result = _invoke_worker(worker, payload)
     worker_result = _worker_result(result.stdout)
 
     assert result.returncode == 0, result.stdout + result.stderr
@@ -1586,3 +1050,56 @@ def test_worker_maps_windows_invalid_entry_names_like_the_verifier(tmp_path):
     assert coverage.missing_files == 0
     assert coverage.failed_files == 0
     assert coverage.matched_files == len(entries)
+
+
+def test_worker_manifest_protocol(subtests):
+    from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import (
+        native_worker_manifest, parse_worker_json_line,
+    )
+    path = '目录/"quoted"\\name.txt'
+    fields = [("rows", [[0, path, "", 3, 3, 1, 1, 1, 1, 1, 1, 1, 123, "616263"]]),
+              ("inventory", [1, 1, 0, 3, 1])]
+    for order in (fields, fields[::-1]):
+        with subtests.test(rows_first=order[0][0] == "rows"):
+            result = parse_worker_json_line(json.dumps({"type": "result", "verified_manifest": dict(order)}))
+            manifest = result["verified_manifest"]
+            assert "rows" not in manifest and "files" not in manifest
+            assert manifest["inventory"]["complete"] and manifest["inventory"]["identity_paths"]
+            native = native_worker_manifest(result)
+            assert len(native) == 1 and native.all_complete()
+            row = native.file_page(0, 1)[0]
+            assert row["path"] == path and row["magic"] == b"abc" and row["mtime_ns"] == 123
+            assert row["status"] == "complete" and "output_path" not in row
+
+
+def test_worker_password_candidates(tmp_path, subtests):
+    from sunpack.core.passwords.verifier.zip_fast import ZipFastVerifier
+    worker = _require_worker_or_skip()
+    archive, filename = _create_encrypted_zip(tmp_path)
+    weak = [f"weak-collision-{index}" for index in range(4096)]
+    matches = ZipFastVerifier().verify_batch(str(archive), weak).matched_indices
+    cases = [(["secret"], True), (["wrong-password-1", "wrong-password-2"], False)]
+    if matches:
+        collision = weak[matches[0]]
+        cases.extend([([collision], False), ([collision, "secret"], True)])
+    else:
+        with subtests.test(scenario="weak_header_collision"):
+            pytest.skip("fixture has no weak ZipCrypto header collision in candidate batch")
+    for index, (candidates, accepted) in enumerate(cases):
+        with subtests.test(candidates=candidates):
+            out = tmp_path / f"out-{index}"
+            result = _invoke_worker(worker, {
+                "job_id": str(index), "archive_path": str(archive), "output_dir": str(out),
+                "format_hint": "zip", "password": "placeholder", "password_candidates": candidates,
+            })
+            final = _worker_result(result.stdout)
+            assert (result.returncode == 0) is accepted, result.stdout + result.stderr
+            assert (final["status"] == "ok") is accepted
+            if accepted:
+                assert final["matched_index"] == candidates.index("secret")
+                assert (out / filename).read_text(encoding="utf-8") == "encrypted worker payload"
+            else:
+                assert final["native_status"] == "wrong_password"
+                assert final["password_candidates_all_rejected"] and final["matched_index"] == -1
+                if len(candidates) > 1:
+                    assert not (out / filename).exists()

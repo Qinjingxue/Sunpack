@@ -93,9 +93,11 @@ def test_password_scheduler_skips_negative_cache_and_reuses_success(tmp_path):
     verifier = FakeVerifier("secret")
     scheduler = PasswordScheduler(verifier, cache=cache, default_batch_size=1)
 
+    events = []
     first = scheduler.run(PasswordJob(
         archive_path=str(archive),
         candidates=PasswordCandidatePipeline.from_values(["bad", "secret"]),
+        progress_callback=events.append,
     ))
     second = scheduler.run(PasswordJob(
         archive_path=str(archive),
@@ -106,6 +108,10 @@ def test_password_scheduler_skips_negative_cache_and_reuses_success(tmp_path):
     assert second.password == "secret"
     assert second.stopped_reason == "cache_hit"
     assert verifier.batches == [["bad"], ["secret"]]
+
+
+    assert [event.stage for event in events] == ["started", "batch_started", "batch_finished", "batch_started", "batch_finished", "finished"]
+    assert events[-1].password_found and events[-1].attempts == 2
 
 
 def test_password_fingerprint_separates_embedded_ranges(tmp_path):
@@ -165,32 +171,6 @@ def test_password_scheduler_caps_batch_to_max_attempts(tmp_path):
     assert verifier.batches == [["bad1", "bad2"]]
 
 
-def test_password_scheduler_reports_progress_events(tmp_path):
-    archive = tmp_path / "sample.7z"
-    archive.write_bytes(b"archive")
-    verifier = FakeVerifier("secret")
-    scheduler = PasswordScheduler(verifier, default_batch_size=1)
-    events = []
-
-    result = scheduler.run(PasswordJob(
-        archive_path=str(archive),
-        candidates=PasswordCandidatePipeline.from_values(["bad", "secret"]),
-        progress_callback=events.append,
-    ))
-
-    assert result.password == "secret"
-    assert [event.stage for event in events] == [
-        "started",
-        "batch_started",
-        "batch_finished",
-        "batch_started",
-        "batch_finished",
-        "finished",
-    ]
-    assert events[-1].password_found is True
-    assert events[-1].attempts == 2
-
-
 def test_password_scheduler_honors_timeout_before_verifying_more_candidates(tmp_path):
     archive = tmp_path / "sample.7z"
     archive.write_bytes(b"archive")
@@ -231,27 +211,6 @@ def test_password_scheduler_does_not_cache_weak_fast_match_as_success(tmp_path):
     assert result.password is None
     assert result.extraction_candidates == ("collision",)
     assert scheduler.cache.get_success(build_archive_fingerprint(str(archive)).key) is None
-
-
-def test_verifier_chain_preserves_weak_candidate_evidence():
-    fast = StaticVerifier(PasswordBatchVerification(
-        ok=True,
-        status="match",
-        matched_index=0,
-        matched_indices=(0, 2),
-        attempts=3,
-        final_confirmation_required=True,
-        match_evidence="zipcrypto_header_byte",
-    ))
-    chain = PasswordVerifierChain([fast])
-
-    outcome = chain.verify_batch("sample.zip", ["collision", "rejected", "secret"])
-
-    assert outcome.ok is True
-    assert outcome.status == "match"
-    assert outcome.final_confirmation_required is True
-    assert outcome.matched_indices == (0, 2)
-    assert outcome.match_evidence == "zipcrypto_header_byte"
 
 
 def test_production_scheduler_uses_only_bounded_fast_verifiers(
@@ -450,43 +409,15 @@ def test_extraction_plan_preserves_zipcrypto_candidate_evidence(tmp_path):
     assert scheduler.cache.has_negative(build_archive_fingerprint(str(archive)).key, "rejected") is True
 
 
-def test_extraction_plan_preserves_untested_suffix_after_weak_early_match(tmp_path):
+@pytest.mark.parametrize("prefix", [[], ["proven-bad"]])
+def test_extraction_plan_caches_only_tested_prefix_before_weak_match(tmp_path, prefix):
     archive = tmp_path / "encrypted.rar"
     archive.write_bytes(b"archive")
     fast = StaticVerifier(PasswordBatchVerification(
         ok=True,
         status="match",
-        matched_index=0,
-        attempts=1,
-        final_confirmation_required=True,
-        match_evidence="rar4_hp_header_crc16",
-    ))
-    scheduler = PasswordScheduler(PasswordVerifierChain([fast]))
-    job = PasswordJob(
-        archive_path=str(archive),
-        archive_input={"format_hint": "rar"},
-        candidates=PasswordCandidatePipeline.from_values(["collision", "secret"]),
-    )
-
-    result = scheduler.plan_for_extraction(job)
-    fingerprint = build_archive_fingerprint(
-        str(archive), archive_input=job.archive_input,
-    ).key
-
-    assert result.password is None
-    assert result.extraction_candidates == ("collision", "secret")
-    assert scheduler.cache.has_negative(fingerprint, "collision") is False
-    assert scheduler.cache.has_negative(fingerprint, "secret") is False
-
-
-def test_extraction_plan_caches_only_tested_prefix_before_weak_match(tmp_path):
-    archive = tmp_path / "encrypted.rar"
-    archive.write_bytes(b"archive")
-    fast = StaticVerifier(PasswordBatchVerification(
-        ok=True,
-        status="match",
-        matched_index=1,
-        attempts=2,
+        matched_index=len(prefix),
+        attempts=len(prefix) + 1,
         final_confirmation_required=True,
         match_evidence="rar4_hp_header_crc16",
     ))
@@ -495,7 +426,7 @@ def test_extraction_plan_caches_only_tested_prefix_before_weak_match(tmp_path):
         archive_path=str(archive),
         archive_input={"format_hint": "rar"},
         candidates=PasswordCandidatePipeline.from_values(
-            ["proven-bad", "collision", "secret"]
+            [*prefix, "collision", "secret"]
         ),
     )
 
@@ -505,7 +436,7 @@ def test_extraction_plan_caches_only_tested_prefix_before_weak_match(tmp_path):
     ).key
 
     assert result.extraction_candidates == ("collision", "secret")
-    assert scheduler.cache.has_negative(fingerprint, "proven-bad") is True
+    assert scheduler.cache.has_negative(fingerprint, "proven-bad") is bool(prefix)
     assert scheduler.cache.has_negative(fingerprint, "collision") is False
     assert scheduler.cache.has_negative(fingerprint, "secret") is False
 

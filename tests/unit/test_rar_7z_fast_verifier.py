@@ -151,41 +151,10 @@ def test_rar_fast_verifier_matches_rar3_hp_encrypted_header(tmp_path):
     assert outcome.final_confirmation_required is True
     assert outcome.match_evidence == "rar4_hp_header_crc16"
 
-
-def test_rar_fast_verifier_rejects_wrong_rar3_hp_encrypted_header(tmp_path):
-    archive = tmp_path / "sample.rar"
-    archive.write_bytes(_rar3_hp_encrypted_header_fixture())
-
-    outcome = RarFastVerifier().verify_batch(str(archive), ["wrong1", "wrong2"])
-
-    assert outcome.ok is False
-    assert outcome.status == "no_match"
-    assert outcome.attempts == 2
-
-
-def test_rar_fast_verifier_matches_rar5_password_check(tmp_path):
-    archive = tmp_path / "sample.rar"
-    archive.write_bytes(_rar5_encryption_header_fixture())
-
-    outcome = RarFastVerifier().verify_batch(str(archive), ["wrong", "U0b7258526OROQY"])
-
-    assert outcome.ok is True
-    assert outcome.status == "match"
-    assert outcome.matched_index == 1
-    assert outcome.attempts == 2
-    assert outcome.final_confirmation_required is False
-    assert outcome.match_evidence == "rar5_password_check"
-
-
-def test_rar_fast_verifier_rejects_wrong_rar5_password_check(tmp_path):
-    archive = tmp_path / "sample.rar"
-    archive.write_bytes(_rar5_encryption_header_fixture())
-
-    outcome = RarFastVerifier().verify_batch(str(archive), ["wrong1", "wrong2"])
-
-    assert outcome.ok is False
-    assert outcome.status == "no_match"
-    assert outcome.attempts == 2
+    rejected = RarFastVerifier().verify_batch(str(archive), ["wrong1", "wrong2"])
+    assert rejected.ok is False
+    assert rejected.status == "no_match"
+    assert rejected.attempts == 2
 
 
 def test_rar_fast_verifier_matches_rar5_file_password_check_without_payload(tmp_path):
@@ -199,16 +168,10 @@ def test_rar_fast_verifier_matches_rar5_file_password_check_without_payload(tmp_
     assert outcome.matched_index == 1
     assert outcome.attempts == 2
 
-
-def test_rar_fast_verifier_rejects_wrong_rar5_file_passwords_without_payload(tmp_path):
-    archive = tmp_path / "file-encrypted.rar"
-    archive.write_bytes(_rar5_file_encryption_fixture())
-
-    outcome = RarFastVerifier().verify_batch(str(archive), ["wrong1", "wrong2"])
-
-    assert outcome.ok is False
-    assert outcome.status == "no_match"
-    assert outcome.attempts == 2
+    rejected = RarFastVerifier().verify_batch(str(archive), ["wrong1", "wrong2"])
+    assert rejected.ok is False
+    assert rejected.status == "no_match"
+    assert rejected.attempts == 2
 
 
 def test_rar_fast_verifier_extends_prefix_only_when_file_check_is_later(tmp_path):
@@ -304,6 +267,18 @@ def test_rar_fast_verifier_reports_missing_noncontiguous_volumes(tmp_path, volum
 def test_rar_fast_verifier_parallel_batch_preserves_first_match(tmp_path):
     archive = tmp_path / "sample.rar"
     archive.write_bytes(_rar5_encryption_header_fixture())
+    verifier = RarFastVerifier()
+    matched = verifier.verify_batch(str(archive), ["wrong", "U0b7258526OROQY"])
+    assert matched.ok is True
+    assert matched.status == "match"
+    assert matched.matched_index == 1
+    assert matched.attempts == 2
+    assert matched.final_confirmation_required is False
+    assert matched.match_evidence == "rar5_password_check"
+    rejected = verifier.verify_batch(str(archive), ["wrong1", "wrong2"])
+    assert rejected.ok is False
+    assert rejected.status == "no_match"
+    assert rejected.attempts == 2
     passwords = [f"wrong-{index}" for index in range(40)]
     passwords[23] = "U0b7258526OROQY"
     passwords[37] = "U0b7258526OROQY"
@@ -356,29 +331,6 @@ def _create_encrypted_header_7z(tmp_path, password: str, compression: str = "0")
     return archive_path
 
 
-def test_seven_zip_fast_verifier_matches_encrypted_header_password(tmp_path):
-    archive = _create_encrypted_header_7z(tmp_path, "secret")
-
-    outcome = SevenZipFastVerifier().verify_batch(str(archive), ["bad", "secret"])
-
-    assert outcome.ok is True
-    assert outcome.status == "match"
-    assert outcome.matched_index == 1
-    assert outcome.attempts == 2
-    assert outcome.final_confirmation_required is False
-    assert outcome.match_evidence == "7z_encrypted_header"
-
-
-def test_seven_zip_fast_verifier_rejects_wrong_encrypted_header_passwords(tmp_path):
-    archive = _create_encrypted_header_7z(tmp_path, "secret")
-
-    outcome = SevenZipFastVerifier().verify_batch(str(archive), ["bad1", "bad2"])
-
-    assert outcome.ok is False
-    assert outcome.status == "no_match"
-    assert outcome.attempts == 2
-
-
 def test_seven_zip_fast_verifier_reads_complete_raw_split_stream(tmp_path):
     archive = _create_encrypted_header_7z(tmp_path, "split-secret", "5")
     archive_input = _raw_split_input(tmp_path, archive, format_hint="7z")
@@ -421,6 +373,18 @@ def test_seven_zip_fast_verifier_defers_callback_volume_family(tmp_path):
 
 def test_seven_zip_fast_verifier_parallel_batch_preserves_first_match(tmp_path):
     archive = _create_encrypted_header_7z(tmp_path, "secret")
+    verifier = SevenZipFastVerifier()
+    matched = verifier.verify_batch(str(archive), ["bad", "secret"])
+    assert matched.ok is True
+    assert matched.status == "match"
+    assert matched.matched_index == 1
+    assert matched.attempts == 2
+    assert matched.final_confirmation_required is False
+    assert matched.match_evidence == "7z_encrypted_header"
+    rejected = verifier.verify_batch(str(archive), ["bad1", "bad2"])
+    assert rejected.ok is False
+    assert rejected.status == "no_match"
+    assert rejected.attempts == 2
     passwords = [f"bad-{index}" for index in range(40)]
     passwords[19] = "secret"
     passwords[35] = "secret"

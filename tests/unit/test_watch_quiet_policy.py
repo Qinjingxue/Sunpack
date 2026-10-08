@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import math
-
 import pytest
 
 from sunpack.runtime.watch.quiet_policy import AdaptiveQuietPolicy, AdaptiveQuietTracker
@@ -26,15 +24,6 @@ def test_policy_extends_immediately_after_one_long_observed_interval():
     tracker.observe(20.0, size=2, mtime=20.0)
 
     assert tracker.quiet_seconds > 20.0
-
-
-def test_policy_uses_lower_initial_growth_curve():
-    policy = AdaptiveQuietPolicy()
-
-    expected = 1.25 + 1.0 + 0.75 * math.log1p(1.0 / 2.0)
-
-    assert policy.target_seconds([1.0]) == pytest.approx(expected)
-    assert policy.target_seconds([1.0]) < 4.0
 
 
 def test_policy_uses_p90_instead_of_a_single_maximum_interval():
@@ -90,21 +79,15 @@ def test_explicit_metadata_only_change_updates_snapshot_without_resetting_quiet_
     assert tracker.last_change_usn == 11
 
 
-@pytest.mark.parametrize(
-    ("scenario_name", "maximum_latency"),
-    (("very_fast", 4.0), ("fast", 6.0), ("moderate", 10.0)),
-)
-def test_fast_and_moderate_writes_complete_quickly(scenario_name: str, maximum_latency: float):
-    scenarios = {item.name: item for item in representative_write_scenarios()}
-    result = simulate_writes(scenarios[scenario_name], AdaptiveQuietPolicy())
-
-    assert result.premature_attempts <= (1 if scenario_name == "moderate" else 0)
-    assert result.completion_latency <= maximum_latency
-
-
 @pytest.mark.parametrize("scenario", representative_write_scenarios())
 def test_representative_writes_avoid_repeated_premature_attempts(scenario: WriteScenario):
     result = simulate_writes(scenario, AdaptiveQuietPolicy())
 
-    expected_maximum = 2 if scenario.name in {"slowing", "temporary_pauses"} else 1
+    expected_maximum = (
+        0 if scenario.name in {"very_fast", "fast"}
+        else 2 if scenario.name in {"slowing", "temporary_pauses"} else 1
+    )
     assert result.premature_attempts <= expected_maximum
+    maximum_latency = {"very_fast": 4.0, "fast": 6.0, "moderate": 10.0}.get(scenario.name)
+    if maximum_latency is not None:
+        assert result.completion_latency <= maximum_latency

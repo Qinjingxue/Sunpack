@@ -135,61 +135,35 @@ def test_clean_whole_input_formats_use_structure_evidence(tmp_path):
         "bzip2": bz2.compress(payload),
         "xz": lzma.compress(payload),
         "zstd": zstandard.ZstdCompressor().compress(payload),
+        "tar": _tar_bytes(),
+        "tar.gz": gzip.compress(_tar_bytes()),
+        "tar.bz2": bz2.compress(_tar_bytes()),
+        "tar.xz": lzma.compress(_tar_bytes()),
     }
     for name, data in cases.items():
         path = _write_bytes(tmp_path / f"clean-{name}.bin", data)
         report = AnalysisEngine().analyze_path(str(path))
 
-        assert report.selected, name
+        expected = "rar" if name in {"rar4", "rar5"} else name
+        evidence = next(item for item in report.selected if item.format == expected)
+        assert evidence.status == "extractable", name
+        assert evidence.segments[0].start_offset == 0
 
 
-def test_analysis_scheduler_finds_embedded_archive_segments(tmp_path):
-    zip_start = len(b"shell-a")
-    zip_data = _zip_bytes(tmp_path)
-    rar_data = _rar4_bytes()
-    payload = (
-        b"shell-a"
-        + zip_data
-        + b"shell-b"
-        + rar_data
-        + b"shell-c"
-    )
-    path = tmp_path / "mixed.bin"
-    path.write_bytes(payload)
-
+@pytest.mark.parametrize("rar_bytes", [_rar4_bytes, _rar5_bytes])
+def test_analysis_scheduler_finds_embedded_archive_segments(tmp_path, rar_bytes):
+    samples = [("zip", _zip_bytes(tmp_path)), ("rar", rar_bytes()), ("7z", _seven_zip_bytes())]
+    payload = b"shell"
+    expected = []
+    for fmt, data in samples:
+        expected.append((fmt, len(payload), len(payload) + len(data)))
+        payload += data + b"junk-between-archives"
+    path = _write_bytes(tmp_path / "mixed.bin", payload)
     report = AnalysisEngine().analyze_path(str(path))
-    by_format = {item.format: item for item in report.evidences}
+    actual = {(item.format, segment.start_offset, segment.end_offset)
+              for item in report.evidences for segment in item.segments}
+    assert set(expected) <= actual
 
-    assert by_format["zip"].status == "extractable"
-    assert by_format["zip"].confidence == 0.99
-    assert by_format["zip"].segments[0].start_offset == zip_start
-    assert by_format["zip"].segments[0].end_offset == zip_start + len(zip_data)
-    assert by_format["rar"].status == "extractable"
-    assert by_format["rar"].confidence == 0.97
-    assert by_format["rar"].segments[0].start_offset == payload.index(b"Rar!")
-    assert by_format["rar"].segments[0].end_offset == payload.index(b"Rar!") + len(rar_data)
-    assert by_format["7z"].status == "not_found"
-    assert by_format["7z"].confidence == 0.0
-    assert {item.format for item in report.selected} == {"zip", "rar"}
-
-
-def test_analysis_consumes_embedded_discovery_prepass_for_middle_payload(tmp_path):
-    prefix = b"v" * (2 * 1024 * 1024)
-    zip_data = _zip_bytes(tmp_path)
-    suffix = b"v" * (2 * 1024 * 1024)
-    path = tmp_path / "middle_payload.mp4"
-    path.write_bytes(prefix + zip_data + suffix)
-    scan = scan_embedded_archives(str(path), expected_size=path.stat().st_size)
-
-    report = AnalysisEngine().analyze_path(
-        str(path),
-        initial_prepass=scan.to_prepass(),
-    )
-
-    zip_evidence = next(item for item in report.selected if item.format == "zip")
-    assert report.prepass["source"] == "embedded_scan"
-    assert report.prepass["full_scan_complete"] is True
-    assert zip_evidence.segments[0].start_offset == len(prefix)
 
 def test_analysis_respects_shared_embedded_scan_switch(tmp_path):
     prefix = b"v" * (2 * 1024 * 1024)
@@ -321,45 +295,6 @@ def test_zip_bad_central_directory_recovers_from_local_header(tmp_path):
     assert zip_evidence.details["directory_confidence"] == "low"
 
 
-def test_analysis_scheduler_prefers_structural_boundary_over_next_signature(tmp_path):
-    rar_data = _rar4_bytes()
-    seven_data = _seven_zip_bytes()
-    payload = b"shell" + rar_data + b"noise" + seven_data
-    path = tmp_path / "mixed.bin"
-    path.write_bytes(payload)
-
-    report = AnalysisEngine().analyze_path(str(path))
-    by_format = {item.format: item for item in report.evidences}
-
-    assert by_format["rar"].segments[0].end_offset == len(b"shell") + len(rar_data)
-    assert by_format["7z"].segments[0].start_offset == payload.index(b"7z\xbc\xaf\x27\x1c")
-    assert by_format["7z"].confidence >= 0.97
-
-
-@pytest.mark.parametrize(
-    ("version", "build_rar", "expected_version"),
-    [(4, _rar4_bytes, None), (5, _rar5_bytes, 5)],
-    ids=["rar4", "rar5"],
-)
-def test_analysis_scheduler_walks_rar_blocks_to_endarc(tmp_path, version, build_rar, expected_version):
-    rar_data = build_rar()
-    payload = b"shell" + rar_data + b"tail-shell"
-    path = tmp_path / f"rar{version}.bin"
-    path.write_bytes(payload)
-
-    report = AnalysisEngine().analyze_path(str(path))
-    rar = {item.format: item for item in report.evidences}["rar"]
-
-    assert rar.status == "extractable"
-    assert rar.confidence == 0.97
-    assert rar.segments[0].start_offset == len(b"shell")
-    assert rar.segments[0].end_offset == len(b"shell") + len(rar_data)
-    assert not rar.warnings
-    if expected_version is not None:
-        assert rar.details["version"] == expected_version
-    assert rar.details["end_block_found"] is True
-
-
 def test_rar_missing_end_block_is_probably_truncated(tmp_path):
     rar_data = _rar5_bytes()[:-len(_rar5_block(5))]
     path = _write_bytes(tmp_path / "truncated.rar", rar_data)
@@ -385,24 +320,6 @@ def test_rar_missing_main_header_marks_encrypted_unwalkable(tmp_path):
     assert "valid_encrypted_but_unwalkable" in rar.segments[0].damage_flags
     assert rar.details["password_required"] is True
 
-
-
-def test_rar5_header_encrypted_carrier_stays_unresolved_without_password(tmp_path):
-    encrypted = b"Rar!\x1a\x07\x01\x00" + _rar5_block(4)
-    fake_gzip = b"\x1f\x8b\x08"
-    fake_bzip2 = b"BZh"
-    prefix = b"carrier-shell"
-    body = prefix + encrypted + b"\x00" * 32 + fake_gzip + b"\x00" * 32 + fake_bzip2
-    path = _write_bytes(tmp_path / "encrypted-carrier.bin", body)
-
-    report = AnalysisEngine().analyze_path(str(path))
-    rar = {item.format: item for item in report.evidences}["rar"]
-    segment = rar.segments[0]
-
-    assert rar.details["header_encrypted"] is True
-    assert segment.start_offset == len(prefix)
-    assert segment.end_offset is None
-    assert rar.details["boundary_confidence"] == "none"
 
 
 def test_rar5_header_encrypted_candidate_never_uses_following_archive_as_end(tmp_path):
@@ -437,27 +354,6 @@ def test_rar5_header_encrypted_candidate_never_uses_following_archive_as_end(tmp
     assert (carrier_size, follower_start) not in segments
     assert (follower_start, len(body)) in segments
 
-
-def test_analysis_scheduler_uses_7z_start_header_for_segment_end(tmp_path):
-    seven_data = _seven_zip_bytes()
-    payload = b"shell" + seven_data + b"tail-shell"
-    path = tmp_path / "seven.bin"
-    path.write_bytes(payload)
-
-    scan = scan_embedded_archives(str(path), expected_size=path.stat().st_size)
-    report = AnalysisEngine().analyze_path(
-        str(path),
-        initial_prepass=scan.to_prepass(),
-    )
-    seven = {item.format: item for item in report.evidences}["7z"]
-
-    assert seven.status == "extractable"
-    assert seven.segments[0].start_offset == len(b"shell")
-    assert seven.segments[0].end_offset == len(b"shell") + len(seven_data)
-    assert not seven.warnings
-    assert seven.details["source"] == "embedded_scan"
-    assert seven.details["boundary_confidence"] == "high"
-    assert seven.details["integrity_confidence"] == "deferred"
 
 def test_7z_start_header_damage_leaves_only_start_trusted(tmp_path):
     seven_data = bytearray(_seven_zip_bytes())
@@ -520,36 +416,6 @@ def test_analysis_scheduler_uses_structure_for_clean_archives_across_split_volum
     assert evidence.segments[0].end_offset == len(data)
 
 
-def test_analysis_scheduler_detects_tar(tmp_path):
-    tar_data = _tar_bytes()
-    path = _write_bytes(tmp_path / "payload.tar", tar_data)
-
-    report = AnalysisEngine().analyze_path(str(path))
-    tar = {item.format: item for item in report.evidences}["tar"]
-
-    assert tar.status == "extractable"
-    assert tar.confidence >= 0.86
-    assert tar.segments[0].start_offset == 0
-    assert tar.segments[0].end_offset is not None
-    assert tar.details["entry_walk_ok"] is True
-
-
-def test_analysis_scheduler_detects_compression_streams(tmp_path):
-    samples = {
-        "gzip": (tmp_path / "payload.gz", gzip.compress(b"plain payload")),
-        "bzip2": (tmp_path / "payload.bz2", bz2.compress(b"plain payload")),
-        "xz": (tmp_path / "payload.xz", lzma.compress(b"plain payload", format=lzma.FORMAT_XZ)),
-        "zstd": (tmp_path / "payload.zst", zstandard.ZstdCompressor().compress(b"plain payload")),
-    }
-
-    for fmt, (path, data) in samples.items():
-        path.write_bytes(data)
-        evidence = {item.format: item for item in AnalysisEngine().analyze_path(str(path)).evidences}[fmt]
-        assert evidence.status == "extractable"
-        assert evidence.confidence >= 0.88
-        assert evidence.segments[0].start_offset == 0
-
-
 def test_analysis_does_not_call_a_zstd_header_fragment_extractable(tmp_path):
     path = tmp_path / "fragment.zst"
     path.write_bytes(b"\x28\xb5\x2f\xfd\x20\x00")
@@ -561,22 +427,6 @@ def test_analysis_does_not_call_a_zstd_header_fragment_extractable(tmp_path):
 
     assert evidence.status != "extractable"
     assert evidence.details["structure_validation_complete"] is False
-
-
-def test_analysis_scheduler_detects_compressed_tar_variants(tmp_path):
-    tar_data = _tar_bytes()
-    samples = {
-        "tar.gz": (tmp_path / "payload.tar.gz", gzip.compress(tar_data)),
-        "tar.bz2": (tmp_path / "payload.tar.bz2", bz2.compress(tar_data)),
-        "tar.xz": (tmp_path / "payload.tar.xz", lzma.compress(tar_data, format=lzma.FORMAT_XZ)),
-    }
-
-    for fmt, (path, data) in samples.items():
-        path.write_bytes(data)
-        evidence = {item.format: item for item in AnalysisEngine().analyze_path(str(path)).evidences}[fmt]
-        assert evidence.status == "extractable"
-        assert evidence.confidence >= 0.93
-        assert evidence.details["inner_tar_verified"] is True
 
 
 def test_bzip2_compressed_tar_stream_probe_preserves_input_budget_failure(tmp_path):

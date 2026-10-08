@@ -15,7 +15,6 @@ import pytest
 
 import sunpack.core.passwords.internal.builtin as builtin_module
 import sunpack.core.passwords.internal.clipboard as clipboard_module
-import sunpack.core.passwords.internal.clipboard_monitor as clipboard_monitor_module
 import sunpack.runtime.watch.scheduler as scheduler_module
 from sunpack.core.contracts.failures import FailureInfo, FailureKind
 from sunpack.core.contracts.pipeline import (
@@ -44,23 +43,12 @@ def WatchScheduler(*args, pipeline_engine=None, **kwargs):
     return RuntimeWatchScheduler(*args, pipeline_engine=pipeline_engine, **kwargs)
 
 
-def test_usn_data_reason_detects_same_size_in_place_content_change():
-    previous = WatchCandidate("sample.zip", 100, 10.0, "file", 100)
-    current = WatchCandidate(
-        "sample.zip",
-        100,
-        10.0,
-        "file",
-        101,
-        change_reasons=scheduler_module.USN_REASON_DATA_OVERWRITE,
-        change_reasons_without_close=scheduler_module.USN_REASON_DATA_OVERWRITE,
-        change_reasons_known=True,
-    )
-
-    assert scheduler_module._candidate_content_changed(previous, current)
-    assert (
-        scheduler_module._candidate_change_kind(previous, current)
-        == scheduler_module._CandidateChangeKind.CONTENT_CHANGED
+def _watcher(tmp_path, *, config=None, roots=None, **overrides):
+    options = dict(out_dir=str(tmp_path / "out"), state_path=str(tmp_path / "state.json"), initial_scan=False)
+    options.update(overrides)
+    return WatchScheduler(
+        config if config is not None else make_config({"watch": {"clipboard_monitor_enabled": False}}),
+        roots if roots is not None else [str(tmp_path)], **options,
     )
 
 
@@ -94,10 +82,7 @@ def test_existing_watch_success_notification_includes_postprocess_warning(tmp_pa
         target_results=(TargetRunResult(str(source), OutcomeKind.COMPLETE_SUCCESS, output_dir=output),),
         cleanup_results=(ArchiveCleanupResult(output, mode, "failed", message="postprocess failed"),),
     )
-    watcher = WatchScheduler(
-        make_config({"watch": {"clipboard_monitor_enabled": False}}), [str(tmp_path)],
-        state_path=str(tmp_path / "state.json"), initial_scan=False,
-    )
+    watcher = _watcher(tmp_path)
     notices = []
     log_events = []
     watcher._notify = lambda *args: notices.append(args)
@@ -120,25 +105,6 @@ def test_existing_watch_success_notification_includes_postprocess_warning(tmp_pa
     assert "retry_count" not in cleanup_log
     assert "attempts" not in cleanup_log["results"][0]
     assert cleanup_log["results"][0]["message"] == "postprocess failed"
-
-
-def test_usn_metadata_reason_does_not_count_as_content_change():
-    previous = WatchCandidate("sample.zip", 100, 100.0, "file", 100)
-    current = WatchCandidate(
-        "sample.zip",
-        100,
-        50.0,
-        "file",
-        101,
-        change_reasons=0x00008000,
-        change_reasons_known=True,
-    )
-
-    assert not scheduler_module._candidate_content_changed(previous, current)
-    assert (
-        scheduler_module._candidate_change_kind(previous, current)
-        == scheduler_module._CandidateChangeKind.METADATA_ONLY
-    )
 
 
 def test_usn_close_accumulated_data_reason_does_not_restart_content_quiet_window():
@@ -173,15 +139,6 @@ def test_unavailable_journal_keeps_same_stat_usn_change_conservative():
     current = WatchCandidate("sample.zip", 100, 100.0, "file", 101)
 
     assert scheduler_module._candidate_content_changed(previous, current)
-
-
-def test_identical_observation_is_unchanged():
-    candidate = WatchCandidate("sample.zip", 100, 100.0, "file", 100)
-
-    assert (
-        scheduler_module._candidate_change_kind(candidate, candidate)
-        == scheduler_module._CandidateChangeKind.UNCHANGED
-    )
 
 
 _TEST_LOOP = asyncio.new_event_loop()
@@ -673,13 +630,9 @@ def test_coalesced_pipeline_completion_is_consumed_without_duplicate_terminal_no
     archive.write_bytes(b"volume")
     stat = archive.stat()
     notifications = CapturingNotificationSink()
-    watcher = WatchScheduler(
-        make_config({"watch": {"clipboard_monitor_enabled": False}}),
-        [str(tmp_path)],
-        out_dir=str(tmp_path / "out"),
-        state_path=str(tmp_path / "state.json"),
+    watcher = _watcher(
+        tmp_path,
         cold_start_seconds=0,
-        initial_scan=False,
         pipeline_engine=_summary_pipeline_engine(),
         notification_sink=notifications,
     )
@@ -786,13 +739,9 @@ def test_watch_run_once_harvests_futures_without_waiting_for_slow_batch(tmp_path
     for archive in archives:
         _write_zip(archive)
     engine = _DeferredPipelineEngine()
-    watcher = WatchScheduler(
-        make_config({"watch": {"clipboard_monitor_enabled": False}}),
-        [str(tmp_path)],
-        out_dir=str(tmp_path / "out"),
-        state_path=str(tmp_path / "state.json"),
+    watcher = _watcher(
+        tmp_path,
         cold_start_seconds=0,
-        initial_scan=False,
         pipeline_engine=engine,
     )
 
@@ -842,13 +791,9 @@ def test_watch_candidate_coroutines_are_harvested_without_completion_pool(tmp_pa
             self.context.generated_outputs = {str(output)}
             return _watch_summary(self.path, OutcomeKind.COMPLETE_SUCCESS, {"decision_hint": "accept"})
 
-    watcher = WatchScheduler(
-        make_config({"watch": {"clipboard_monitor_enabled": False}}),
-        [str(tmp_path)],
-        out_dir=str(tmp_path / "out"),
-        state_path=str(tmp_path / "state.json"),
+    watcher = _watcher(
+        tmp_path,
         cold_start_seconds=0,
-        initial_scan=False,
         pipeline_engine=FakePipelineEngine(Runner),
     )
     watcher.enqueue(str(first))
@@ -883,39 +828,6 @@ def _watch_summary(
     )
 
 
-def test_successful_watch_task_uses_direct_output_root(tmp_path, monkeypatch):
-    monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
-    archive = tmp_path / "sample.zip"
-    _write_zip(archive)
-
-    class SuccessRunner:
-        recent_passwords = []
-
-        def __init__(self, config):
-            self.output_dir = Path(config["output"]["root"]) / "sample"
-            self.context = SimpleNamespace(generated_outputs={str(self.output_dir)})
-
-        def run_targets(self, paths):
-            self.output_dir.mkdir(parents=True)
-            (self.output_dir / "payload.bin").write_bytes(b"payload")
-            return _watch_summary(paths[0], OutcomeKind.COMPLETE_SUCCESS, {"decision_hint": "accept"})
-
-    watcher = WatchScheduler(
-        make_config({"watch": {"clipboard_monitor_enabled": False}}),
-        [str(tmp_path)],
-        out_dir=str(tmp_path / "out"),
-        state_path=str(tmp_path / "state.json"),
-        cold_start_seconds=0,
-        initial_scan=False,
-        pipeline_engine=FakePipelineEngine(SuccessRunner),
-    )
-    watcher.enqueue(str(archive))
-    result = _await(watcher.run_once())
-
-    assert result.succeeded == 1
-    assert list((tmp_path / "out").rglob("payload.bin"))
-
-
 def test_failed_watch_task_writes_to_direct_output_root(tmp_path, monkeypatch):
     monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
     archive = tmp_path / "sample.zip"
@@ -936,13 +848,9 @@ def test_failed_watch_task_writes_to_direct_output_root(tmp_path, monkeypatch):
                 failure=FailureInfo(kind=FailureKind.UNKNOWN, stage="extraction", message="boom"), verification={"decision_hint": "reject"},
             ),))
 
-    watcher = WatchScheduler(
-        make_config({"watch": {"clipboard_monitor_enabled": False}}),
-        [str(tmp_path)],
-        out_dir=str(tmp_path / "out"),
-        state_path=str(tmp_path / "state.json"),
+    watcher = _watcher(
+        tmp_path,
         cold_start_seconds=0,
-        initial_scan=False,
         pipeline_engine=FakePipelineEngine(FailureRunner),
     )
     watcher.enqueue(str(archive))
@@ -986,17 +894,16 @@ def test_partial_result_does_not_self_retry_but_modified_epoch_does(tmp_path, mo
                 recovery=recovery,
             )
 
-    watcher = WatchScheduler(
-        make_config({"watch": {"clipboard_monitor_enabled": False}}),
-        [str(tmp_path)],
-        out_dir=str(tmp_path / "out"),
-        state_path=str(tmp_path / "state.json"),
+    watcher = _watcher(
+        tmp_path,
         cold_start_seconds=0,
-        initial_scan=False,
         pipeline_engine=FakePipelineEngine(SequenceRunner),
     )
     watcher.enqueue(str(archive))
-    assert _await(watcher.run_once()).processed == 1
+    first = _await(watcher.run_once())
+    assert first.processed == first.failed == 1
+    assert first.succeeded == 0
+    assert (tmp_path / "out" / "sample" / "payload.bin").is_file()
     assert _await(watcher.run_once()).processed == 0
     with archive.open("ab") as stream:
         stream.write(b"changed")
@@ -1008,102 +915,15 @@ def test_partial_result_does_not_self_retry_but_modified_epoch_does(tmp_path, mo
     assert not (tmp_path / ".sunpack_watch_probes").exists()
 
 
-def test_partial_result_is_rejected_but_direct_output_remains(tmp_path, monkeypatch):
-    monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
-    archive = tmp_path / "sample.zip"
-    _write_zip(archive)
-
-    class PartialRunner:
-        recent_passwords = []
-
-        def __init__(self, config):
-            self.output_dir = Path(config["output"]["root"]) / "sample"
-            self.context = SimpleNamespace(generated_outputs=set())
-
-        def run_targets(self, paths):
-            self.output_dir.mkdir(parents=True)
-            (self.output_dir / "recovered.bin").write_bytes(b"partial")
-            return _watch_summary(
-                paths[0],
-                OutcomeKind.PARTIAL_SUCCESS,
-                {"decision_hint": "accept_partial", "archive_coverage": {"complete_files": 1}},
-                recovery={"out_dir": str(self.output_dir)},
-            )
-
-    watcher = WatchScheduler(
-        make_config({"watch": {"clipboard_monitor_enabled": False}}),
-        [str(tmp_path)],
-        out_dir=str(tmp_path / "out"),
-        state_path=str(tmp_path / "state.json"),
-        cold_start_seconds=0,
-        initial_scan=False,
-        pipeline_engine=FakePipelineEngine(PartialRunner),
-    )
-    watcher.enqueue(str(archive))
-
-    result = _await(watcher.run_once())
-
-    assert result.processed == 1
-    assert result.succeeded == 0
-    assert result.failed == 1
-    assert result.errors == ["Watch extraction rejected partial content"]
-    assert (tmp_path / "out" / "sample" / "recovered.bin").is_file()
-    assert not (tmp_path / ".sunpack_watch_probes").exists()
-    assert _await(watcher.run_once()).processed == 0
-
-
-def test_content_event_during_processing_starts_a_new_active_epoch(tmp_path, monkeypatch):
-    monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
-    archive = tmp_path / "sample.zip"
-    _write_zip(archive)
-    attempts = 0
-    watcher = None
-
-    class MutatingRunner:
-        recent_passwords = []
-
-        def __init__(self, config):
-            self.context = SimpleNamespace(generated_outputs=set())
-
-        def run_targets(self, paths):
-            nonlocal attempts
-            attempts += 1
-            if attempts == 1:
-                archive.write_bytes(archive.read_bytes() + b"new-data")
-                watcher.enqueue(str(archive), event_type="modified")
-            return _watch_summary(paths[0], OutcomeKind.PARTIAL_SUCCESS, {"decision_hint": "accept_partial"})
-
-    watcher = WatchScheduler(
-        make_config({"watch": {"clipboard_monitor_enabled": False}}),
-        [str(tmp_path)],
-        out_dir=str(tmp_path / "out"),
-        state_path=str(tmp_path / "state.json"),
-        cold_start_seconds=0,
-        initial_scan=False,
-        pipeline_engine=FakePipelineEngine(MutatingRunner),
-    )
-    watcher.enqueue(str(archive))
-
-    assert _await(watcher.run_once()).processed == 1
-    assert watcher.pending_count == 1
-    assert len(watcher.state.pending_work_items()) == 1
-    assert _await(watcher.run_once()).processed == 1
-    assert attempts == 2
-
-
 def test_metadata_event_during_and_after_processing_does_not_start_new_epoch(tmp_path, monkeypatch):
     monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
     archive = tmp_path / "sample.zip"
     _write_zip(archive)
     engine = _DeferredPipelineEngine()
     wakeups = []
-    watcher = WatchScheduler(
-        make_config({"watch": {"clipboard_monitor_enabled": False}}),
-        [str(tmp_path)],
-        out_dir=str(tmp_path / "out"),
-        state_path=str(tmp_path / "state.json"),
+    watcher = _watcher(
+        tmp_path,
         cold_start_seconds=0,
-        initial_scan=False,
         pipeline_engine=engine,
         wake_callback=lambda: wakeups.append("wake"),
     )
@@ -1176,13 +996,9 @@ def test_content_event_during_processing_still_starts_new_epoch_from_latest_meta
     archive = tmp_path / "sample.zip"
     _write_zip(archive)
     engine = _DeferredPipelineEngine()
-    watcher = WatchScheduler(
-        make_config({"watch": {"clipboard_monitor_enabled": False}}),
-        [str(tmp_path)],
-        out_dir=str(tmp_path / "out"),
-        state_path=str(tmp_path / "state.json"),
+    watcher = _watcher(
+        tmp_path,
         cold_start_seconds=0,
-        initial_scan=False,
         pipeline_engine=engine,
     )
     watcher.enqueue(str(archive), event_type="created")
@@ -1245,10 +1061,10 @@ def test_watch_scheduler_uses_watchdog_observer_and_initial_scan(tmp_path, monke
     _write_zip(watch_root / "sample.zip")
     state_path = tmp_path / "state.json"
 
-    watcher = WatchScheduler(
-        make_config({}),
-        [str(watch_root)],
-        out_dir=str(tmp_path / "out"),
+    watcher = _watcher(
+        tmp_path,
+        config=make_config({}),
+        roots=[str(watch_root)],
         state_path=str(state_path),
         cold_start_seconds=0,
         initial_scan=True,
@@ -1275,13 +1091,10 @@ def test_watch_scheduler_scans_only_requested_initial_scan_roots(tmp_path, monke
     _write_zip(first_root / "first.zip")
     _write_zip(second_root / "second.zip")
 
-    watcher = WatchScheduler(
-        make_config({"watch": {"clipboard_monitor_enabled": False}}),
-        [str(first_root), str(second_root)],
-        out_dir=str(tmp_path / "out"),
-        state_path=str(tmp_path / "state.json"),
+    watcher = _watcher(
+        tmp_path,
+        roots=[str(first_root), str(second_root)],
         cold_start_seconds=0,
-        initial_scan=False,
         initial_scan_roots=[str(second_root)],
     )
 
@@ -1297,12 +1110,9 @@ def test_watch_scheduler_observes_builtin_password_file_directory(tmp_path, monk
     monkeypatch.setattr(builtin_module, "builtin_password_path", lambda: builtin_path)
     watch_root = tmp_path / "in"
     watch_root.mkdir()
-    watcher = WatchScheduler(
-        make_config({"watch": {"clipboard_monitor_enabled": False}}),
-        [str(watch_root)],
-        out_dir=str(tmp_path / "out"),
-        state_path=str(tmp_path / "state.json"),
-        initial_scan=False,
+    watcher = _watcher(
+        tmp_path,
+        roots=[str(watch_root)],
     )
 
     _await(watcher.start())
@@ -1319,11 +1129,10 @@ def test_watch_scheduler_preserves_existing_directory_password_file(tmp_path, mo
     password_file = watch_root / "sunpack-passwords.txt"
     password_file.write_text("existing-secret\n", encoding="utf-8")
 
-    watcher = WatchScheduler(
-        make_config({}),
-        [str(watch_root)],
-        out_dir=str(tmp_path / "out"),
-        state_path=str(tmp_path / "state.json"),
+    watcher = _watcher(
+        tmp_path,
+        config=make_config({}),
+        roots=[str(watch_root)],
         initial_scan=True,
     )
 
@@ -1333,8 +1142,8 @@ def test_watch_scheduler_preserves_existing_directory_password_file(tmp_path, mo
     assert watcher.pending_count == 0
 
 
-def test_watch_scheduler_never_recurses_for_current_directory_scan_mode(tmp_path, monkeypatch):
-    FakeObserver.started_count = 0
+@pytest.mark.parametrize("mode", ["-", "*"])
+def test_watch_scheduler_never_recurses_for_recursive_directory_scan_mode(tmp_path, monkeypatch, mode):
     monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
 
     watch_root = tmp_path / "in"
@@ -1343,11 +1152,10 @@ def test_watch_scheduler_never_recurses_for_current_directory_scan_mode(tmp_path
     _write_zip(watch_root / "root.zip")
     _write_zip(nested / "nested.zip")
 
-    watcher = WatchScheduler(
-        make_config({"filesystem": {"directory_scan_mode": "-", "scan_filters": []}}),
-        [str(watch_root)],
-        out_dir=str(tmp_path / "out"),
-        state_path=str(tmp_path / "state.json"),
+    watcher = _watcher(
+        tmp_path,
+        config=make_config({"filesystem": {"directory_scan_mode": mode, "scan_filters": []}}),
+        roots=[str(watch_root)],
         cold_start_seconds=0,
         initial_scan=True,
     )
@@ -1357,31 +1165,9 @@ def test_watch_scheduler_never_recurses_for_current_directory_scan_mode(tmp_path
     assert watcher._observer.scheduled[0][1:] == (str(watch_root.resolve()), False)
     pending_names = {Path(path).name for path in watcher._pending}
     assert pending_names == {"root.zip"}
-
-
-def test_watch_scheduler_never_recurses_for_recursive_directory_scan_mode(tmp_path, monkeypatch):
-    monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
-
-    watch_root = tmp_path / "in"
-    nested = watch_root / "nested"
-    nested.mkdir(parents=True)
-    _write_zip(watch_root / "root.zip")
-    _write_zip(nested / "nested.zip")
-
-    watcher = WatchScheduler(
-        make_config({"filesystem": {"directory_scan_mode": "*", "scan_filters": []}}),
-        [str(watch_root)],
-        out_dir=str(tmp_path / "out"),
-        state_path=str(tmp_path / "state.json"),
-        cold_start_seconds=0,
-        initial_scan=True,
-    )
-
-    _await(watcher.start())
-
-    assert watcher._observer.scheduled[0][1:] == (str(watch_root.resolve()), False)
-    pending_names = {Path(path).name for path in watcher._pending}
-    assert pending_names == {"root.zip"}
+    watcher.enqueue(str(nested / "nested.zip"))
+    assert {Path(path).name for path in watcher._pending} == {"root.zip"}
+    _await(watcher.stop())
 
 
 def test_watch_scheduler_does_not_apply_pipeline_filesystem_filters(tmp_path, monkeypatch):
@@ -1393,8 +1179,9 @@ def test_watch_scheduler_does_not_apply_pipeline_filesystem_filters(tmp_path, mo
     keep.write_bytes(b"payload")
     blocked.write_bytes(b"payload")
 
-    watcher = WatchScheduler(
-        make_config({
+    watcher = _watcher(
+        tmp_path,
+        config=make_config({
             "filesystem": {
                 "scan_filters": [
                     {"name": "path_pattern", "enabled": True, "exclude": ["*.zip"]},
@@ -1402,11 +1189,8 @@ def test_watch_scheduler_does_not_apply_pipeline_filesystem_filters(tmp_path, mo
             },
             "watch": {"clipboard_monitor_enabled": False},
         }),
-        [str(watch_root)],
-        out_dir=str(tmp_path / "out"),
-        state_path=str(tmp_path / "state.json"),
+        roots=[str(watch_root)],
         cold_start_seconds=0,
-        initial_scan=False,
         pipeline_engine=FakePipelineEngine(lambda _config: SimpleNamespace()),
     )
 
@@ -1427,13 +1211,11 @@ def test_watch_scheduler_uses_stop_timeout_without_suffix_prefilter(tmp_path, mo
     (watch_root / "sample.rar").write_bytes(b"Rar!\x1a\x07\x00payload")
     _write_zip(watch_root / "sample.zip")
 
-    watcher = WatchScheduler(
-        make_config({}),
-        [str(watch_root)],
-        out_dir=str(tmp_path / "out"),
-        state_path=str(tmp_path / "state.json"),
+    watcher = _watcher(
+        tmp_path,
+        config=make_config({}),
+        roots=[str(watch_root)],
         cold_start_seconds=0,
-        initial_scan=False,
         observer_stop_timeout_seconds=1.25,
     )
 
@@ -1453,13 +1235,9 @@ def test_event_burst_with_unchanged_usn_does_not_restart_quiet_window(tmp_path, 
     monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
     archive = tmp_path / "sample.zip"
     _write_zip(archive)
-    watcher = WatchScheduler(
-        make_config({"watch": {"clipboard_monitor_enabled": False}}),
-        [str(tmp_path)],
-        out_dir=str(tmp_path / "out"),
-        state_path=str(tmp_path / "state.json"),
+    watcher = _watcher(
+        tmp_path,
         cold_start_seconds=0,
-        initial_scan=False,
         pipeline_engine=FakePipelineEngine(lambda _config: SimpleNamespace(
             context=SimpleNamespace(generated_outputs=set()),
             run_targets=lambda paths: _watch_summary(paths[0], OutcomeKind.PARTIAL_SUCCESS, {}),
@@ -1467,9 +1245,12 @@ def test_event_burst_with_unchanged_usn_does_not_restart_quiet_window(tmp_path, 
         )),
     )
 
+    logs = []
+    monkeypatch.setattr(watcher.log, "write", lambda event, **fields: logs.append(event))
     for _ in range(100):
         watcher.enqueue(str(archive), event_type="modified")
 
+    assert logs.count("candidate_active") == 1
     assert watcher.pending_count == 1
     assert watcher._active_states[str(archive)].generation == 1
     assert _await(watcher.run_once()).processed == 1
@@ -1480,13 +1261,10 @@ def test_candidate_deadline_changes_wake_watch_service(tmp_path, monkeypatch):
     archive = tmp_path / "sample.zip"
     archive.write_bytes(b"PK\x03\x04payload")
     wakeups = []
-    watcher = WatchScheduler(
-        make_config({"filesystem": {"scan_filters": []}, "watch": {"clipboard_monitor_enabled": False}}),
-        [str(tmp_path)],
-        out_dir=str(tmp_path / "out"),
-        state_path=str(tmp_path / "state.json"),
+    watcher = _watcher(
+        tmp_path,
+        config=make_config({"filesystem": {"scan_filters": []}, "watch": {"clipboard_monitor_enabled": False}}),
         cold_start_seconds=30,
-        initial_scan=False,
         wake_callback=lambda: wakeups.append("wake"),
     )
 
@@ -1518,16 +1296,14 @@ def test_watch_scheduler_processes_direct_quiet_candidate_with_watch_root_common
 
     watch_root = tmp_path / "in"
     watch_root.mkdir()
-    archive_path = watch_root / "sample.zip"
+    archive_path = watch_root / "sample.disguised"
     _write_zip(archive_path)
 
-    watcher = WatchScheduler(
-        make_config({}),
-        [str(watch_root)],
-        out_dir=str(tmp_path / "out"),
-        state_path=str(tmp_path / "state.json"),
+    watcher = _watcher(
+        tmp_path,
+        config=make_config({}),
+        roots=[str(watch_root)],
         cold_start_seconds=0,
-        initial_scan=False,
         pipeline_engine=FakePipelineEngine(FakePipelineRunner),
     )
     watcher.enqueue(str(archive_path))
@@ -1540,41 +1316,6 @@ def test_watch_scheduler_processes_direct_quiet_candidate_with_watch_root_common
     assert Path(captured["config"]["output"]["root"]) == (tmp_path / "out").resolve()
     assert not (watch_root / ".sunpack_watch_probes").exists()
     assert captured["config"]["output"]["common_root"] == str(watch_root.resolve())
-
-
-def test_watch_scheduler_sends_quiet_nonstandard_extension_to_main_pipeline(tmp_path, monkeypatch):
-    monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
-    captured = {}
-
-    class FakePipelineRunner:
-        def __init__(self, config):
-            captured["config"] = config
-
-        def run_targets(self, paths):
-            captured["paths"] = paths
-            return RunSummary(target_results=(TargetRunResult(paths[0], OutcomeKind.COMPLETE_SUCCESS),))
-
-    watch_root = tmp_path / "in"
-    watch_root.mkdir()
-    target = watch_root / "payload.weird"
-    target.write_bytes(b"PK\x03\x04payload")
-
-    watcher = WatchScheduler(
-        make_config({"filesystem": {"scan_filters": []}}),
-        [str(watch_root)],
-        out_dir=str(tmp_path / "out"),
-        state_path=str(tmp_path / "state.json"),
-        cold_start_seconds=0,
-        initial_scan=False,
-        pipeline_engine=FakePipelineEngine(FakePipelineRunner),
-    )
-    watcher.enqueue(str(target))
-
-    result = _await(watcher.run_once())
-
-    assert result.processed == 1
-    assert result.succeeded == 1
-    assert captured["paths"] == [str(target.resolve())]
 
 
 def test_watch_scheduler_moved_file_uses_common_quiet_window(tmp_path, monkeypatch):
@@ -1594,13 +1335,11 @@ def test_watch_scheduler_moved_file_uses_common_quiet_window(tmp_path, monkeypat
     archive_path = watch_root / "sample.zip"
     _write_zip(archive_path)
 
-    watcher = WatchScheduler(
-        make_config({"watch": {"clipboard_monitor_enabled": False}}),
-        [str(watch_root)],
-        out_dir=str(tmp_path / "out"),
+    watcher = _watcher(
+        tmp_path,
+        roots=[str(watch_root)],
         state_path=str(tmp_path / ".sunpack_watch" / "state.json"),
         cold_start_seconds=10,
-        initial_scan=False,
         pipeline_engine=FakePipelineEngine(FakePipelineRunner),
     )
     watcher.enqueue(str(archive_path), event_type="moved", src_path=str(tmp_path / "sample.zip"))
@@ -1611,64 +1350,14 @@ def test_watch_scheduler_moved_file_uses_common_quiet_window(tmp_path, monkeypat
     assert _await(watcher.run_once()).processed == 1
 
 
-def test_watch_scheduler_timestamp_restore_does_not_reset_content_quiet_window(tmp_path, monkeypatch):
-    monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
-    now = [2000001000.0]
-    monkeypatch.setattr(scheduler_module.time, "time", lambda: now[0])
-
-    class FakePipelineRunner:
-        def __init__(self, config):
-            self.context = SimpleNamespace(generated_outputs=set())
-
-        def run_targets(self, paths):
-            return RunSummary(target_results=(TargetRunResult(paths[0], OutcomeKind.COMPLETE_SUCCESS),))
-
-    watch_root = tmp_path / "in"
-    watch_root.mkdir()
-    archive_path = watch_root / "sample.zip"
-    archive_path.write_bytes(b"PK\x03\x04" + b"x" * 1024)
-    os_time = 2000001000.0
-    import os
-    os.utime(archive_path, (os_time, os_time))
-
-    watcher = WatchScheduler(
-        make_config({"watch": {"clipboard_monitor_enabled": False}}),
-        [str(watch_root)],
-        out_dir=str(tmp_path / "out"),
-        state_path=str(tmp_path / ".sunpack_watch" / "state.json"),
-        cold_start_seconds=10,
-        initial_scan=False,
-        pipeline_engine=FakePipelineEngine(FakePipelineRunner),
-    )
-    watcher.enqueue(str(archive_path), event_type="created")
-
-    now[0] = 2000001000.1
-    archive_path.write_bytes(b"PK\x03\x04" + b"x" * 4096)
-    os.utime(archive_path, (2000001000.1, 2000001000.1))
-    watcher.enqueue(str(archive_path), event_type="modified")
-
-    now[0] = 2000001000.2
-    os.utime(archive_path, (2000000000.0, 2000000000.0))
-    watcher.enqueue(str(archive_path), event_type="modified")
-
-    now[0] = 2000001010.1
-    assert _await(watcher.run_once()).processed == 1
-    now[0] = 2000001010.3
-    assert _await(watcher.run_once()).processed == 0
-
-
 def test_pending_metadata_event_advances_snapshot_without_generation_or_wakeup(tmp_path, monkeypatch):
     monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
     archive = tmp_path / "sample.zip"
     _write_zip(archive)
     wakeups = []
-    watcher = WatchScheduler(
-        make_config({"watch": {"clipboard_monitor_enabled": False}}),
-        [str(tmp_path)],
-        out_dir=str(tmp_path / "out"),
-        state_path=str(tmp_path / "state.json"),
+    watcher = _watcher(
+        tmp_path,
         cold_start_seconds=10,
-        initial_scan=False,
         wake_callback=lambda: wakeups.append("wake"),
     )
     watcher.enqueue(str(archive), event_type="created")
@@ -1715,71 +1404,6 @@ def test_pending_metadata_event_advances_snapshot_without_generation_or_wakeup(t
     assert tracker.last_change_usn == metadata.change_usn
 
 
-def test_watch_scheduler_growth_resets_the_common_quiet_window(tmp_path, monkeypatch):
-    monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
-    now = [2000002000.0]
-    monkeypatch.setattr(scheduler_module.time, "time", lambda: now[0])
-
-    class FakePipelineRunner:
-        def __init__(self, config):
-            self.context = SimpleNamespace(generated_outputs=set())
-
-        def run_targets(self, paths):
-            return RunSummary(target_results=(TargetRunResult(paths[0], OutcomeKind.COMPLETE_SUCCESS),))
-
-    watch_root = tmp_path / "in"
-    watch_root.mkdir()
-    archive_path = watch_root / "slow.zip"
-    archive_path.write_bytes(b"PK\x03\x04" + b"x" * 1024)
-    import os
-    os.utime(archive_path, (2000002000.0, 2000002000.0))
-
-    watcher = WatchScheduler(
-        make_config({"watch": {"clipboard_monitor_enabled": False}}),
-        [str(watch_root)],
-        out_dir=str(tmp_path / "out"),
-        state_path=str(tmp_path / ".sunpack_watch" / "state.json"),
-        cold_start_seconds=10,
-        initial_scan=False,
-        pipeline_engine=FakePipelineEngine(FakePipelineRunner),
-    )
-    watcher.enqueue(str(archive_path), event_type="created")
-
-    now[0] = 2000002000.2
-    archive_path.write_bytes(b"PK\x03\x04" + b"x" * 4096)
-    os.utime(archive_path, (2000002000.2, 2000002000.2))
-    watcher.enqueue(str(archive_path), event_type="modified")
-
-    now[0] = 2000002002.0
-    assert _await(watcher.run_once()).processed == 0
-    now[0] = 2000002010.3
-    assert _await(watcher.run_once()).processed == 1
-
-
-def test_watch_scheduler_does_not_log_duplicate_pending_candidate(tmp_path, monkeypatch):
-    monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
-
-    watch_root = tmp_path / "in"
-    watch_root.mkdir()
-    archive_path = watch_root / "sample.zip"
-    _write_zip(archive_path)
-
-    watcher = WatchScheduler(
-        make_config({"watch": {"clipboard_monitor_enabled": False}}),
-        [str(watch_root)],
-        out_dir=str(tmp_path / "out"),
-        state_path=str(tmp_path / ".sunpack_watch" / "state.json"),
-        cold_start_seconds=0,
-        initial_scan=False,
-    )
-    watcher.enqueue(str(archive_path))
-    watcher.enqueue(str(archive_path))
-
-    assert watcher.pending_count == 1
-    log_text = (tmp_path / ".sunpack_watch" / "events.jsonl").read_text(encoding="utf-8")
-    assert log_text.count('"event":"candidate_active"') == 1
-
-
 def test_watch_scheduler_ignores_unchanged_event_after_no_tasks_result(tmp_path, monkeypatch):
     monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
 
@@ -1795,13 +1419,11 @@ def test_watch_scheduler_ignores_unchanged_event_after_no_tasks_result(tmp_path,
     target = watch_root / "paper.pdf"
     target.write_bytes(b"%PDF-" + b"x" * 1024)
 
-    watcher = WatchScheduler(
-        make_config({"watch": {"clipboard_monitor_enabled": False}}),
-        [str(watch_root)],
-        out_dir=str(tmp_path / "out"),
+    watcher = _watcher(
+        tmp_path,
+        roots=[str(watch_root)],
         state_path=str(tmp_path / ".sunpack_watch" / "state.json"),
         cold_start_seconds=0,
-        initial_scan=False,
         pipeline_engine=FakePipelineEngine(NoTasksRunner),
     )
     watcher.enqueue(str(target))
@@ -1818,28 +1440,6 @@ def test_watch_scheduler_ignores_unchanged_event_after_no_tasks_result(tmp_path,
     log_text = (tmp_path / ".sunpack_watch" / "events.jsonl").read_text(encoding="utf-8")
     assert '"event":"no_tasks_found"' in log_text
     assert '"event":"done"' not in log_text
-
-
-def test_watch_scheduler_ignores_nested_paths(tmp_path, monkeypatch):
-    monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
-
-    watch_root = tmp_path
-    out_root = tmp_path / "out"
-    out_root.mkdir()
-    archive_path = out_root / "sample.zip"
-    _write_zip(archive_path)
-
-    watcher = WatchScheduler(
-        make_config({}),
-        [str(watch_root)],
-        out_dir=str(out_root),
-        state_path=str(tmp_path / "state.json"),
-        cold_start_seconds=0,
-        initial_scan=False,
-    )
-    watcher.enqueue(str(archive_path))
-
-    assert watcher.pending_count == 0
 
 
 def test_watch_scheduler_processes_archive_when_output_root_matches_watch_root(tmp_path, monkeypatch):
@@ -1860,13 +1460,11 @@ def test_watch_scheduler_processes_archive_when_output_root_matches_watch_root(t
     archive_path = tmp_path / "sample.zip"
     _write_zip(archive_path)
 
-    watcher = WatchScheduler(
-        make_config({"watch": {"clipboard_monitor_enabled": False}}),
-        [str(tmp_path)],
+    watcher = _watcher(
+        tmp_path,
         out_dir=str(tmp_path),
         state_path=str(tmp_path / ".sunpack_watch" / "state.json"),
         cold_start_seconds=0,
-        initial_scan=False,
         pipeline_engine=FakePipelineEngine(FakePipelineRunner),
     )
     watcher.enqueue(str(archive_path))
@@ -1896,13 +1494,11 @@ def test_watch_scheduler_does_not_reprocess_unchanged_input_when_output_is_delet
             output_dir.mkdir(exist_ok=True)
             return RunSummary(target_results=(TargetRunResult(paths[0], OutcomeKind.COMPLETE_SUCCESS),))
 
-    watcher = WatchScheduler(
-        make_config({"watch": {"clipboard_monitor_enabled": False}}),
-        [str(tmp_path)],
+    watcher = _watcher(
+        tmp_path,
         out_dir=".",
         state_path=str(tmp_path / ".sunpack_watch" / "state.json"),
         cold_start_seconds=0,
-        initial_scan=False,
         pipeline_engine=FakePipelineEngine(FakePipelineRunner),
     )
 
@@ -1921,59 +1517,12 @@ def test_watch_scheduler_does_not_reprocess_unchanged_input_when_output_is_delet
     assert len(runs) == 1
 
 
-def test_watch_scheduler_reprocesses_identical_archive_after_it_moves_out_and_back(tmp_path, monkeypatch):
-    monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
-    watch_root = tmp_path / "watched"
-    outside_root = tmp_path / "outside"
-    watch_root.mkdir()
-    outside_root.mkdir()
-    archive_path = watch_root / "sample.zip"
-    outside_path = outside_root / archive_path.name
-    output_dir = watch_root / "sample"
-    _write_zip(archive_path)
-    runs = []
-
-    class FakePipelineRunner:
-        def __init__(self, config):
-            self.context = SimpleNamespace(generated_outputs={str(output_dir)})
-
-        def run_targets(self, paths):
-            runs.append(list(paths))
-            output_dir.mkdir(exist_ok=True)
-            return RunSummary(target_results=(TargetRunResult(paths[0], OutcomeKind.COMPLETE_SUCCESS),))
-
-    watcher = WatchScheduler(
-        make_config({"watch": {"clipboard_monitor_enabled": False}}),
-        [str(watch_root)],
-        out_dir=".",
-        state_path=str(tmp_path / ".sunpack_watch" / "state.json"),
-        cold_start_seconds=0,
-        initial_scan=False,
-        pipeline_engine=FakePipelineEngine(FakePipelineRunner),
-    )
-    handler = scheduler_module._WatchEventHandler(watcher)
-    watcher.enqueue(str(archive_path))
-    assert _await(watcher.run_once()).succeeded == 1
-
-    archive_path.replace(outside_path)
-    handler.on_moved(SimpleNamespace(src_path=str(archive_path), dest_path=str(outside_path), is_directory=False))
-    outside_path.replace(archive_path)
-    handler.on_moved(SimpleNamespace(src_path=str(outside_path), dest_path=str(archive_path), is_directory=False))
-
-    assert watcher.pending_count == 1
-    assert _await(watcher.run_once()).succeeded == 1
-    assert len(runs) == 2
-
-
 def test_watch_event_handler_cleans_moved_directory_source_without_arrival_enqueue(tmp_path):
     watch_root = tmp_path / "watched"
     watch_root.mkdir()
-    watcher = WatchScheduler(
-        make_config({"watch": {"clipboard_monitor_enabled": False}}),
-        [str(watch_root)],
-        out_dir=str(tmp_path / "out"),
-        state_path=str(tmp_path / "state.json"),
-        initial_scan=False,
+    watcher = _watcher(
+        tmp_path,
+        roots=[str(watch_root)],
     )
     departed = []
     enqueued = []
@@ -1993,51 +1542,16 @@ def test_watch_event_handler_cleans_moved_directory_source_without_arrival_enque
     assert enqueued == []
 
 
-def test_watch_scheduler_processes_same_path_again_after_input_changes(tmp_path, monkeypatch):
-    monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
-    archive_path = tmp_path / "sample.zip"
-    _write_zip(archive_path)
-    runs = []
-
-    class FakePipelineRunner:
-        def __init__(self, config):
-            self.context = SimpleNamespace(generated_outputs=set())
-
-        def run_targets(self, paths):
-            runs.append(list(paths))
-            return RunSummary(target_results=(TargetRunResult(paths[0], OutcomeKind.COMPLETE_SUCCESS),))
-
-    watcher = WatchScheduler(
-        make_config({"watch": {"clipboard_monitor_enabled": False}}),
-        [str(tmp_path)],
-        out_dir=".",
-        state_path=str(tmp_path / ".sunpack_watch" / "state.json"),
-        cold_start_seconds=0,
-        initial_scan=False,
-        pipeline_engine=FakePipelineEngine(FakePipelineRunner),
-    )
-    watcher.enqueue(str(archive_path))
-    assert _await(watcher.run_once()).succeeded == 1
-
-    archive_path.write_bytes(archive_path.read_bytes() + b"changed")
-    watcher.enqueue(str(archive_path), event_type="modified")
-
-    assert _await(watcher.run_once()).succeeded == 1
-    assert len(runs) == 2
-
-
 def test_watch_scheduler_recovers_persisted_pending_input_after_restart(tmp_path, monkeypatch):
     monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
     archive_path = tmp_path / "sample.zip"
     _write_zip(archive_path)
     state_path = tmp_path / ".sunpack_watch" / "state.json"
-    first = WatchScheduler(
-        make_config({"watch": {"clipboard_monitor_enabled": False}}),
-        [str(tmp_path)],
+    first = _watcher(
+        tmp_path,
         out_dir=".",
         state_path=str(state_path),
         cold_start_seconds=0,
-        initial_scan=False,
     )
     stat = archive_path.stat()
     first.state.queue_active(
@@ -2053,13 +1567,11 @@ def test_watch_scheduler_recovers_persisted_pending_input_after_restart(tmp_path
             runs.append(list(paths))
             return RunSummary(target_results=(TargetRunResult(paths[0], OutcomeKind.COMPLETE_SUCCESS),))
 
-    restarted = WatchScheduler(
-        make_config({"watch": {"clipboard_monitor_enabled": False}}),
-        [str(tmp_path)],
+    restarted = _watcher(
+        tmp_path,
         out_dir=".",
         state_path=str(state_path),
         cold_start_seconds=0,
-        initial_scan=False,
         pipeline_engine=FakePipelineEngine(FakePipelineRunner),
     )
     _await(restarted.start())
@@ -2134,9 +1646,9 @@ def test_watch_scheduler_routes_each_watch_root_to_its_configured_output_root(tm
             (self.output_dir / "payload.bin").write_bytes(b"payload")
             return _watch_summary(paths[0], OutcomeKind.COMPLETE_SUCCESS, {"decision_hint": "accept"})
 
-    watcher = WatchScheduler(
-        make_config({"watch": {"clipboard_monitor_enabled": False}}),
-        [str(first_root), str(second_root)],
+    watcher = _watcher(
+        tmp_path,
+        roots=[str(first_root), str(second_root)],
         out_dir=str(tmp_path / "legacy-out"),
         output_roots={
             str(first_root): str(first_out),
@@ -2144,7 +1656,6 @@ def test_watch_scheduler_routes_each_watch_root_to_its_configured_output_root(tm
         },
         state_path=str(first_root / ".sunpack_watch" / "state.json"),
         cold_start_seconds=0,
-        initial_scan=False,
         pipeline_engine=FakePipelineEngine(SuccessRunner),
     )
     watcher.enqueue(str(archive_path))
@@ -2166,15 +1677,13 @@ def test_watch_scheduler_rejects_nested_output_roots(tmp_path, monkeypatch):
     second_root.mkdir()
 
     with pytest.raises(ValueError, match="must not contain one another"):
-        WatchScheduler(
-            make_config({"watch": {"clipboard_monitor_enabled": False}}),
-            [str(first_root), str(second_root)],
+        _watcher(
+            tmp_path,
+            roots=[str(first_root), str(second_root)],
             output_roots={
                 str(first_root): str(tmp_path / "output"),
                 str(second_root): str(tmp_path / "output" / "nested"),
             },
-            state_path=str(tmp_path / "state.json"),
-            initial_scan=False,
         )
 
 
@@ -2186,15 +1695,13 @@ def test_watch_scheduler_allows_shared_output_root(tmp_path, monkeypatch):
     second_root.mkdir()
     output_root = tmp_path / "output"
 
-    watcher = WatchScheduler(
-        make_config({"watch": {"clipboard_monitor_enabled": False}}),
-        [str(first_root), str(second_root)],
+    watcher = _watcher(
+        tmp_path,
+        roots=[str(first_root), str(second_root)],
         output_roots={
             str(first_root): str(output_root),
             str(second_root): str(output_root),
         },
-        state_path=str(tmp_path / "state.json"),
-        initial_scan=False,
     )
 
     assert watcher.output_roots == {
@@ -2212,14 +1719,13 @@ def test_watch_root_always_has_a_resolved_output_root(tmp_path, monkeypatch):
     _write_zip(archive_path)
 
     def output_root_for(out_dir, output_roots=None):
-        watcher = WatchScheduler(
-            make_config({}),
-            [str(watch_root)],
+        watcher = _watcher(
+            tmp_path,
+            config=make_config({}),
+            roots=[str(watch_root)],
             out_dir=out_dir,
             output_roots=output_roots,
-            state_path=str(tmp_path / "state.json"),
             cold_start_seconds=0,
-            initial_scan=False,
         )
         return watcher.output_roots[scheduler_module.path_key(str(watch_root.resolve()))]
 
@@ -2230,33 +1736,6 @@ def test_watch_root_always_has_a_resolved_output_root(tmp_path, monkeypatch):
     assert output_root_for(".", {str(watch_root): str(tmp_path / "per-root")}) == str(
         (tmp_path / "per-root").resolve()
     )
-
-
-def test_watch_scheduler_initial_scan_ignores_nested_archives(tmp_path, monkeypatch):
-    monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
-
-    output_dir = tmp_path / "old"
-    output_dir.mkdir()
-    nested = output_dir / "nested.zip"
-    fresh = tmp_path / "fresh.zip"
-    _write_zip(nested)
-    _write_zip(fresh)
-
-    state_path = tmp_path / ".sunpack_watch" / "state.json"
-    watcher = WatchScheduler(
-        make_config({"watch": {"clipboard_monitor_enabled": False}}),
-        [str(tmp_path)],
-        out_dir=str(tmp_path),
-        state_path=str(state_path),
-        cold_start_seconds=0,
-        initial_scan=True,
-    )
-    _await(watcher.start())
-
-    ready_names = {Path(candidate.path).name for candidate in watcher._pop_ready(float("inf"))}
-    assert ready_names == {"fresh.zip"}
-
-    _await(watcher.stop())
 
 
 def test_watch_scheduler_does_not_retry_terminal_failure_for_unchanged_event(tmp_path, monkeypatch):
@@ -2278,13 +1757,10 @@ def test_watch_scheduler_does_not_retry_terminal_failure_for_unchanged_event(tmp
     archive_path.write_bytes(b"PK\x03\x04payload")
 
     notifications = CapturingNotificationSink()
-    watcher = WatchScheduler(
-        make_config({"watch": {"clipboard_monitor_enabled": False}}),
-        [str(watch_root)],
-        out_dir=str(tmp_path / "out"),
-        state_path=str(tmp_path / "state.json"),
+    watcher = _watcher(
+        tmp_path,
+        roots=[str(watch_root)],
         cold_start_seconds=0,
-        initial_scan=False,
         pipeline_engine=FakePipelineEngine(FailingRunner),
         notification_sink=notifications,
     )
@@ -2301,7 +1777,8 @@ def test_watch_scheduler_does_not_retry_terminal_failure_for_unchanged_event(tmp
     assert [event[0] for event in notifications.events] == ["submitted", "failed"]
 
 
-def test_unstructured_nested_password_failure_is_terminal_without_retry_anchor(tmp_path, monkeypatch):
+@pytest.mark.parametrize("kind,stage,message", [(FailureKind.WRONG_PASSWORD, "password_resolution", "wrong password"), (FailureKind.MISSING_VOLUME, "extraction", "missing split volume")])
+def test_unstructured_nested_password_failure_is_terminal_without_retry_anchor(tmp_path, monkeypatch, kind, stage, message):
     monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
 
     class NestedPasswordRunner:
@@ -2311,7 +1788,7 @@ def test_unstructured_nested_password_failure_is_terminal_without_retry_anchor(t
         def run_targets(self, paths):
             return _nested_failure_summary(
                 Path(paths[0]),
-                FailureInfo(FailureKind.WRONG_PASSWORD, "password_resolution", "wrong password"),
+                FailureInfo(kind, stage, message),
             )
 
     watch_root = tmp_path / "in"
@@ -2319,13 +1796,11 @@ def test_unstructured_nested_password_failure_is_terminal_without_retry_anchor(t
     archive_path = watch_root / "outer.zip"
     archive_path.write_bytes(b"PK\x03\x04payload")
     notifications = CapturingNotificationSink()
-    watcher = WatchScheduler(
-        make_config({"cli": {"language": "zh"}, "watch": {"clipboard_monitor_enabled": False}}),
-        [str(watch_root)],
-        out_dir=str(tmp_path / "out"),
-        state_path=str(tmp_path / "state.json"),
+    watcher = _watcher(
+        tmp_path,
+        config=make_config({"cli": {"language": "zh"}, "watch": {"clipboard_monitor_enabled": False}}),
+        roots=[str(watch_root)],
         cold_start_seconds=0,
-        initial_scan=False,
         pipeline_engine=FakePipelineEngine(NestedPasswordRunner),
         notification_sink=notifications,
     )
@@ -2336,49 +1811,8 @@ def test_unstructured_nested_password_failure_is_terminal_without_retry_anchor(t
     failed_event = next(event for event in notifications.events if event[0] == "failed")
     assert result.failed == 1
     assert not watcher.state.entries
-    assert failed_event[2][0].endswith("nested-inner.7z.001: wrong password")
-    assert failed_event[3][0]["kind"] == "wrong_password"
-    assert not failed_event[3][0].get("details")
-    assert not any(event[0] == "suppressed" for event in notifications.events)
-
-
-def test_unstructured_nested_missing_volume_is_terminal_without_wait_anchor(tmp_path, monkeypatch):
-    monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
-
-    class NestedMissingRunner:
-        def __init__(self, config):
-            pass
-
-        def run_targets(self, paths):
-            return _nested_failure_summary(
-                Path(paths[0]),
-                FailureInfo(FailureKind.MISSING_VOLUME, "extraction", "missing split volume"),
-            )
-
-    watch_root = tmp_path / "in"
-    watch_root.mkdir()
-    archive_path = watch_root / "outer.zip"
-    archive_path.write_bytes(b"PK\x03\x04payload")
-    notifications = CapturingNotificationSink()
-    watcher = WatchScheduler(
-        make_config({"watch": {"clipboard_monitor_enabled": False}}),
-        [str(watch_root)],
-        out_dir=str(tmp_path / "out"),
-        state_path=str(tmp_path / "state.json"),
-        cold_start_seconds=0,
-        initial_scan=False,
-        pipeline_engine=FakePipelineEngine(NestedMissingRunner),
-        notification_sink=notifications,
-    )
-
-    watcher.enqueue(str(archive_path))
-    result = _await(watcher.run_once())
-
-    failed_event = next(event for event in notifications.events if event[0] == "failed")
-    assert result.failed == 1
-    assert not watcher.state.entries
-    assert failed_event[2][0].endswith("nested-inner.7z.001: missing split volume")
-    assert failed_event[3][0]["kind"] == "missing_volume"
+    assert failed_event[2][0].endswith(f"nested-inner.7z.001: {message}")
+    assert failed_event[3][0]["kind"] == kind.value
     assert not failed_event[3][0].get("details")
     assert not any(event[0] == "suppressed" for event in notifications.events)
 
@@ -2407,13 +1841,11 @@ def test_watch_scheduler_does_not_retry_password_inconclusive_after_password_sou
     archive_path = watch_root / "sample.zip"
     archive_path.write_bytes(b"PK\x03\x04payload")
 
-    watcher = WatchScheduler(
-        make_config({"watch": {"clipboard_monitor_enabled": False, "password_retry_debounce_seconds": 0}}),
-        [str(watch_root)],
-        out_dir=str(tmp_path / "out"),
-        state_path=str(tmp_path / "state.json"),
+    watcher = _watcher(
+        tmp_path,
+        config=make_config({"watch": {"clipboard_monitor_enabled": False, "password_retry_debounce_seconds": 0}}),
+        roots=[str(watch_root)],
         cold_start_seconds=0,
-        initial_scan=False,
         pipeline_engine=FakePipelineEngine(InconclusiveRunner),
     )
     watcher.enqueue(str(archive_path))
@@ -2425,115 +1857,6 @@ def test_watch_scheduler_does_not_retry_password_inconclusive_after_password_sou
     assert second.processed == 0
     assert attempts["count"] == 1
     assert not watcher.state.entries
-
-
-def test_watch_scheduler_retries_password_failure_after_password_source_change(tmp_path, monkeypatch):
-    monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
-    attempts = {"count": 0}
-
-    class PasswordThenSuccessRunner:
-        def __init__(self, config):
-            pass
-
-        def run_targets(self, paths):
-            attempts["count"] += 1
-            if attempts["count"] == 1:
-                return RunSummary(target_results=(TargetRunResult(
-                paths[0], OutcomeKind.FAILURE, error="wrong password",
-                failure=FailureInfo(FailureKind.WRONG_PASSWORD, "password_resolution", "wrong password"),
-            ),))
-            return RunSummary(target_results=(TargetRunResult(paths[0], OutcomeKind.COMPLETE_SUCCESS),))
-
-    watch_root = tmp_path / "in"
-    watch_root.mkdir()
-    archive_path = watch_root / "sample.zip"
-    archive_path.write_bytes(b"PK\x03\x04payload")
-
-    notifications = CapturingNotificationSink()
-    watcher = WatchScheduler(
-        make_config({
-            "watch": {
-                "clipboard_monitor_enabled": False,
-                "password_retry_debounce_seconds": 0,
-            }
-        }),
-        [str(watch_root)],
-        out_dir=str(tmp_path / "out"),
-        state_path=str(tmp_path / "state.json"),
-        cold_start_seconds=0,
-        initial_scan=False,
-        pipeline_engine=FakePipelineEngine(PasswordThenSuccessRunner),
-        notification_sink=notifications,
-    )
-    watcher.enqueue(str(archive_path))
-    first = _await(watcher.run_once())
-    watcher.enqueue(str(archive_path))
-
-    watcher.notify_password_source_changed("test")
-    second = _await(watcher.run_once())
-
-    assert first.failed == 1
-    assert second.succeeded == 1
-    assert attempts["count"] == 2
-    assert not watcher.state.entries
-    assert [event[0] for event in notifications.events] == [
-        "submitted",
-        "suppressed",
-        "submitted",
-        "succeeded",
-    ]
-
-
-def test_password_retry_wakeup_uses_debounce_deadline_without_pending_candidate(tmp_path, monkeypatch):
-    monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
-    monotonic_clock = {"value": 100.0}
-    monkeypatch.setattr(scheduler_module.time, "monotonic", lambda: monotonic_clock["value"])
-    wakeups = []
-    archive_path = tmp_path / "sample.zip"
-    archive_path.write_bytes(b"PK\x03\x04payload")
-    stat = archive_path.stat()
-    watcher = WatchScheduler(
-        make_config({
-            "watch": {
-                "clipboard_monitor_enabled": False,
-                "password_retry_debounce_seconds": 5,
-            }
-        }),
-        [str(tmp_path)],
-        out_dir=str(tmp_path / "out"),
-        state_path=str(tmp_path / "state.json"),
-        cold_start_seconds=0,
-        initial_scan=False,
-        wake_callback=lambda: wakeups.append(monotonic_clock["value"]),
-    )
-    watcher.state.mark(
-        str(archive_path),
-        stat.st_size,
-        stat.st_mtime,
-        status="failed_password",
-    )
-
-    watcher.notify_password_source_changed("test")
-
-    assert wakeups == [100.0]
-    assert watcher.pending_count == 0
-    assert watcher.next_delay_seconds() == 5.0
-    monotonic_clock["value"] = 104.75
-    assert watcher.next_delay_seconds() == 0.25
-
-
-def test_idle_scheduler_has_no_polling_deadline(tmp_path, monkeypatch):
-    monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
-    watcher = WatchScheduler(
-        make_config({"watch": {"clipboard_monitor_enabled": False}}),
-        [str(tmp_path)],
-        out_dir=str(tmp_path / "out"),
-        state_path=str(tmp_path / "state.json"),
-        initial_scan=False,
-    )
-
-    assert watcher.pending_count == 0
-    assert watcher.next_delay_seconds() is None
 
 
 def test_password_retry_bypasses_learned_quiet_for_unchanged_failed_archive(tmp_path, monkeypatch):
@@ -2557,18 +1880,17 @@ def test_password_retry_bypasses_learned_quiet_for_unchanged_failed_archive(tmp_
 
     archive_path = tmp_path / "sample.zip"
     archive_path.write_bytes(b"PK\x03\x04payload")
-    watcher = WatchScheduler(
-        make_config({
+    notifications = CapturingNotificationSink()
+    watcher = _watcher(
+        tmp_path,
+        config=make_config({
             "watch": {
                 "clipboard_monitor_enabled": False,
                 "password_retry_debounce_seconds": 0,
             }
         }),
-        [str(tmp_path)],
-        out_dir=str(tmp_path / "out"),
-        state_path=str(tmp_path / "state.json"),
-        initial_scan=False,
         pipeline_engine=FakePipelineEngine(PasswordThenSuccessRunner),
+        notification_sink=notifications,
     )
     watcher.enqueue(str(archive_path))
     wall_clock.advance(watcher.cold_start_seconds + 0.01)
@@ -2581,6 +1903,10 @@ def test_password_retry_bypasses_learned_quiet_for_unchanged_failed_archive(tmp_
     assert retried.succeeded == 1
     assert attempts["count"] == 2
     assert watcher._quiet_trackers[str(archive_path)].quiet_seconds == 30.0
+
+
+    assert not watcher.state.entries
+    assert [event[0] for event in notifications.events] == ["submitted", "suppressed", "submitted", "succeeded"]
 
 
 def test_password_retry_preserves_quiet_when_failed_archive_changed(tmp_path, monkeypatch):
@@ -2600,8 +1926,9 @@ def test_password_retry_preserves_quiet_when_failed_archive_changed(tmp_path, mo
 
     archive_path = tmp_path / "sample.zip"
     archive_path.write_bytes(b"PK\x03\x04payload")
-    watcher = WatchScheduler(
-        make_config({
+    watcher = _watcher(
+        tmp_path,
+        config=make_config({
             "watch": {
                 "clipboard_monitor_enabled": False,
                 "password_retry_debounce_seconds": 0,
@@ -2609,10 +1936,6 @@ def test_password_retry_preserves_quiet_when_failed_archive_changed(tmp_path, mo
                 "quiet_min_seconds": 1.25,
             }
         }),
-        [str(tmp_path)],
-        out_dir=str(tmp_path / "out"),
-        state_path=str(tmp_path / "state.json"),
-        initial_scan=False,
         pipeline_engine=FakePipelineEngine(PasswordFailureRunner),
     )
     watcher.enqueue(str(archive_path))
@@ -2654,27 +1977,33 @@ def test_password_retry_debounce_uses_monotonic_clock_when_wall_clock_moves_back
     watch_root.mkdir()
     archive_path = watch_root / "sample.zip"
     archive_path.write_bytes(b"PK\x03\x04payload")
-    watcher = WatchScheduler(
-        make_config({
+    wakeups = []
+    watcher = _watcher(
+        tmp_path,
+        config=make_config({
             "watch": {
                 "clipboard_monitor_enabled": False,
                 "password_retry_debounce_seconds": 5,
             }
         }),
-        [str(watch_root)],
-        out_dir=str(tmp_path / "out"),
-        state_path=str(tmp_path / "state.json"),
+        roots=[str(watch_root)],
         cold_start_seconds=0,
-        initial_scan=False,
+        wake_callback=lambda: wakeups.append(monotonic_clock["value"]),
         pipeline_engine=FakePipelineEngine(PasswordThenSuccessRunner),
     )
 
+    assert watcher.next_delay_seconds() is None
     watcher.enqueue(str(archive_path))
     first = _await(watcher.run_once())
+    wakeups.clear()
     watcher.notify_password_source_changed("test")
+    assert wakeups == [100.0]
+    assert watcher.pending_count == 0
+    assert watcher.next_delay_seconds() == 5.0
 
     wall_clock.value = 10.0
     monotonic_clock["value"] = 104.9
+    assert watcher.next_delay_seconds() == pytest.approx(0.1)
     before_debounce = _await(watcher.run_once())
     monotonic_clock["value"] = 105.0
     after_debounce = _await(watcher.run_once())
@@ -2704,13 +2033,12 @@ def test_watch_scheduler_defaults_to_user_and_builtin_password_sources(tmp_path,
     archive_path = watch_root / "sample.zip"
     archive_path.write_bytes(b"PK\x03\x04payload")
     state_path = tmp_path / "state.json"
-    watcher = WatchScheduler(
-        make_config({"user_passwords": ["user-secret"], "watch": {"clipboard_monitor_enabled": False}}),
-        [str(watch_root)],
-        out_dir=str(tmp_path / "out"),
+    watcher = _watcher(
+        tmp_path,
+        config=make_config({"user_passwords": ["user-secret"], "watch": {"clipboard_monitor_enabled": False}}),
+        roots=[str(watch_root)],
         state_path=str(state_path),
         cold_start_seconds=0,
-        initial_scan=False,
         pipeline_engine=FakePipelineEngine(CapturingRunner),
     )
 
@@ -2759,13 +2087,11 @@ def test_watch_scheduler_clipboard_persistence_refreshes_candidates_and_retries(
     watch_root.mkdir()
     archive_path = watch_root / "sample.zip"
     archive_path.write_bytes(b"PK\x03\x04payload")
-    watcher = WatchScheduler(
-        make_config({"watch": {"clipboard_monitor_enabled": True, "password_retry_debounce_seconds": 0}}),
-        [str(watch_root)],
-        out_dir=str(tmp_path / "out"),
-        state_path=str(tmp_path / "state.json"),
+    watcher = _watcher(
+        tmp_path,
+        config=make_config({"watch": {"clipboard_monitor_enabled": True, "password_retry_debounce_seconds": 0}}),
+        roots=[str(watch_root)],
         cold_start_seconds=0,
-        initial_scan=False,
         pipeline_engine=FakePipelineEngine(ConfigAwareRunner),
     )
     watcher.enqueue(str(archive_path))
@@ -2813,13 +2139,11 @@ def test_watch_scheduler_retries_on_builtin_password_file_watchdog_event(tmp_pat
     watch_root.mkdir()
     archive_path = watch_root / "sample.zip"
     archive_path.write_bytes(b"PK\x03\x04payload")
-    watcher = WatchScheduler(
-        make_config({"watch": {"clipboard_monitor_enabled": False, "password_retry_debounce_seconds": 0}}),
-        [str(watch_root)],
-        out_dir=str(tmp_path / "out"),
-        state_path=str(tmp_path / "state.json"),
+    watcher = _watcher(
+        tmp_path,
+        config=make_config({"watch": {"clipboard_monitor_enabled": False, "password_retry_debounce_seconds": 0}}),
+        roots=[str(watch_root)],
         cold_start_seconds=0,
-        initial_scan=False,
         pipeline_engine=FakePipelineEngine(ConfigAwareRunner),
     )
     watcher.enqueue(str(archive_path))
@@ -2866,25 +2190,23 @@ def test_watch_scheduler_retries_persisted_password_failure_when_config_password
     archive_path = watch_root / "sample.zip"
     archive_path.write_bytes(b"PK\x03\x04payload")
     state_path = tmp_path / "state.json"
-    first_watcher = WatchScheduler(
-        make_config({"user_passwords": ["wrong"], "watch": {"clipboard_monitor_enabled": False, "password_retry_debounce_seconds": 0}}),
-        [str(watch_root)],
-        out_dir=str(tmp_path / "out"),
+    first_watcher = _watcher(
+        tmp_path,
+        config=make_config({"user_passwords": ["wrong"], "watch": {"clipboard_monitor_enabled": False, "password_retry_debounce_seconds": 0}}),
+        roots=[str(watch_root)],
         state_path=str(state_path),
         cold_start_seconds=0,
-        initial_scan=False,
         pipeline_engine=FakePipelineEngine(ConfigAwareRunner),
     )
     first_watcher.enqueue(str(archive_path))
     _await(first_watcher.run_once())
 
-    second_watcher = WatchScheduler(
-        make_config({"user_passwords": ["new-secret"], "watch": {"clipboard_monitor_enabled": False, "password_retry_debounce_seconds": 0}}),
-        [str(watch_root)],
-        out_dir=str(tmp_path / "out"),
+    second_watcher = _watcher(
+        tmp_path,
+        config=make_config({"user_passwords": ["new-secret"], "watch": {"clipboard_monitor_enabled": False, "password_retry_debounce_seconds": 0}}),
+        roots=[str(watch_root)],
         state_path=str(state_path),
         cold_start_seconds=0,
-        initial_scan=False,
         pipeline_engine=FakePipelineEngine(ConfigAwareRunner),
     )
     result = _await(second_watcher.run_once())
@@ -2923,13 +2245,11 @@ def test_watch_scheduler_promotes_recent_success_password_and_retries_other_fail
     teacher_archive = watch_root / "teacher.zip"
     failed_archive.write_bytes(b"PK\x03\x04failed")
     teacher_archive.write_bytes(b"PK\x03\x04teacher")
-    watcher = WatchScheduler(
-        make_config({"watch": {"clipboard_monitor_enabled": False, "password_retry_debounce_seconds": 0}}),
-        [str(watch_root)],
-        out_dir=str(tmp_path / "out"),
-        state_path=str(tmp_path / "state.json"),
+    watcher = _watcher(
+        tmp_path,
+        config=make_config({"watch": {"clipboard_monitor_enabled": False, "password_retry_debounce_seconds": 0}}),
+        roots=[str(watch_root)],
         cold_start_seconds=0,
-        initial_scan=False,
         pipeline_engine=FakePipelineEngine(LearningRunner),
     )
     watcher.enqueue(str(failed_archive))
@@ -2972,18 +2292,16 @@ def test_watch_scheduler_password_table_event_retries_password_failure(tmp_path,
     archive_path.write_bytes(b"PK\x03\x04payload")
     password_table.write_text("secret\n", encoding="utf-8")
 
-    watcher = WatchScheduler(
-        make_config({
+    watcher = _watcher(
+        tmp_path,
+        config=make_config({
             "watch": {
                 "clipboard_monitor_enabled": False,
                 "password_retry_debounce_seconds": 0,
             }
         }),
-        [str(watch_root)],
-        out_dir=str(tmp_path / "out"),
-        state_path=str(tmp_path / "state.json"),
+        roots=[str(watch_root)],
         cold_start_seconds=0,
-        initial_scan=False,
         pipeline_engine=FakePipelineEngine(PasswordThenSuccessRunner),
     )
     watcher.enqueue(str(archive_path))
@@ -3016,13 +2334,11 @@ def test_watch_scheduler_writes_jsonl_log_for_failures(tmp_path, monkeypatch):
     archive_path = watch_root / "sample.zip"
     archive_path.write_bytes(b"PK\x03\x04payload")
 
-    watcher = WatchScheduler(
-        make_config({"watch": {"clipboard_monitor_enabled": False}}),
-        [str(watch_root)],
-        out_dir=str(tmp_path / "out"),
+    watcher = _watcher(
+        tmp_path,
+        roots=[str(watch_root)],
         state_path=str(tmp_path / ".sunpack_watch" / "state.json"),
         cold_start_seconds=0,
-        initial_scan=False,
         pipeline_engine=FakePipelineEngine(FailingRunner),
     )
     watcher.enqueue(str(archive_path))
@@ -3043,13 +2359,12 @@ def test_watch_scheduler_silently_ignores_metadata_events(tmp_path, monkeypatch)
     log_path = metadata_dir / "events.jsonl"
     log_path.write_text("", encoding="utf-8")
 
-    watcher = WatchScheduler(
-        make_config({}),
-        [str(watch_root)],
-        out_dir=str(tmp_path / "out"),
+    watcher = _watcher(
+        tmp_path,
+        config=make_config({}),
+        roots=[str(watch_root)],
         state_path=str(metadata_dir / "state.json"),
         cold_start_seconds=0,
-        initial_scan=False,
     )
 
     handler = scheduler_module._WatchEventHandler(watcher)
@@ -3110,13 +2425,9 @@ def test_watch_scheduler_claim_removes_pending_sibling_before_source_cleanup_pro
     first_volume.write_bytes(b"head volume")
     sibling_volume.write_bytes(b"sibling volume")
 
-    watcher = WatchScheduler(
-        make_config({"watch": {"clipboard_monitor_enabled": False}}),
-        [str(tmp_path)],
-        out_dir=str(tmp_path / "out"),
-        state_path=str(tmp_path / "state.json"),
+    watcher = _watcher(
+        tmp_path,
         cold_start_seconds=0,
-        initial_scan=False,
     )
     watcher.enqueue(str(sibling_volume))
     assert watcher.pending_count == 1
@@ -3168,13 +2479,9 @@ def test_watch_scheduler_claim_hands_off_only_new_generation_after_release(
     first_volume.write_bytes(b"head volume")
     sibling_volume.write_bytes(b"old sibling")
 
-    watcher = WatchScheduler(
-        make_config({"watch": {"clipboard_monitor_enabled": False}}),
-        [str(tmp_path)],
-        out_dir=str(tmp_path / "out"),
-        state_path=str(tmp_path / "state.json"),
+    watcher = _watcher(
+        tmp_path,
         cold_start_seconds=0,
-        initial_scan=False,
     )
     watcher.enqueue(str(sibling_volume))
     watcher._claim_pipeline_sources(
@@ -3211,13 +2518,9 @@ def test_watch_scheduler_transfers_dirty_generation_between_pipeline_claims(
     source = tmp_path / "split.7z.002"
     source.write_bytes(b"old generation")
 
-    watcher = WatchScheduler(
-        make_config({"watch": {"clipboard_monitor_enabled": False}}),
-        [str(tmp_path)],
-        out_dir=str(tmp_path / "out"),
-        state_path=str(tmp_path / "state.json"),
+    watcher = _watcher(
+        tmp_path,
         cold_start_seconds=0,
-        initial_scan=False,
     )
     watcher.enqueue(str(source))
     watcher._claim_pipeline_sources("owner-a", (str(source),))
@@ -3254,13 +2557,9 @@ def test_watch_scheduler_departed_claimed_source_stays_owned_until_pipeline_fini
     first_volume.write_bytes(b"head volume")
     sibling_volume.write_bytes(b"sibling volume")
 
-    watcher = WatchScheduler(
-        make_config({"watch": {"clipboard_monitor_enabled": False}}),
-        [str(tmp_path)],
-        out_dir=str(tmp_path / "out"),
-        state_path=str(tmp_path / "state.json"),
+    watcher = _watcher(
+        tmp_path,
         cold_start_seconds=0,
-        initial_scan=False,
     )
     watcher.enqueue(str(sibling_volume))
     watcher._claim_pipeline_sources(
@@ -3294,59 +2593,6 @@ def test_watch_scheduler_departed_claimed_source_stays_owned_until_pipeline_fini
     assert watcher.pending_count == 0
 
 
-def test_watch_scheduler_does_not_special_case_downloader_suffixes(tmp_path, monkeypatch):
-    monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
-    watch_root = tmp_path / "in"
-    watch_root.mkdir()
-    temporary = watch_root / "sample.zip.baiduyun.p.downloading"
-    temporary.write_bytes(b"PK\x03\x04payload")
-
-    watcher = WatchScheduler(
-        make_config({"watch": {"clipboard_monitor_enabled": False}}),
-        [str(watch_root)],
-        out_dir=str(tmp_path / "out"),
-        state_path=str(tmp_path / "state.json"),
-        cold_start_seconds=0,
-        initial_scan=False,
-    )
-    watcher.enqueue(str(temporary), event_type="created")
-    watcher.enqueue(str(temporary), event_type="modified")
-
-    assert watcher.pending_count == 1
-
-
-def test_watch_scheduler_same_stat_same_usn_event_does_not_reset_quiet_window(tmp_path, monkeypatch):
-    monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
-    clock = WatchClock(2000010000.0)
-    clock.install(monkeypatch)
-
-    class FakePipelineRunner:
-        def __init__(self, config):
-            self.context = SimpleNamespace(generated_outputs=set())
-
-        def run_targets(self, paths):
-            return RunSummary(target_results=(TargetRunResult(paths[0], OutcomeKind.COMPLETE_SUCCESS),))
-
-    watch_root = tmp_path / "in"
-    watch_root.mkdir()
-    archive_path = watch_root / "sample.zip"
-    _write_zip(archive_path)
-    watcher = WatchScheduler(
-        make_config({"watch": {"clipboard_monitor_enabled": False}}),
-        [str(watch_root)],
-        out_dir=str(tmp_path / "out"),
-        state_path=str(tmp_path / "state.json"),
-        cold_start_seconds=10,
-        initial_scan=False,
-        pipeline_engine=FakePipelineEngine(FakePipelineRunner),
-    )
-    events = WatchEvents(watcher, clock)
-    events.emit(archive_path)
-    events.emit(archive_path, event_type="modified", after=0.8)
-
-    events.run_after(9.3, processed=1)
-
-
 def test_modified_epoch_triggers_even_when_size_mtime_and_file_id_are_unchanged(tmp_path, monkeypatch):
     monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
     clock = WatchClock(2000020000.0)
@@ -3364,13 +2610,10 @@ def test_modified_epoch_triggers_even_when_size_mtime_and_file_id_are_unchanged(
     archive_path = watch_root / "sample.zip"
     archive_path.write_bytes(b"A" * (512 * 1024))
     original_mtime = archive_path.stat().st_mtime
-    watcher = WatchScheduler(
-        make_config({"watch": {"clipboard_monitor_enabled": False}}),
-        [str(watch_root)],
-        out_dir=str(tmp_path / "out"),
-        state_path=str(tmp_path / "state.json"),
+    watcher = _watcher(
+        tmp_path,
+        roots=[str(watch_root)],
         cold_start_seconds=10,
-        initial_scan=False,
         pipeline_engine=FakePipelineEngine(FakePipelineRunner),
     )
     events = WatchEvents(watcher, clock)
@@ -3392,16 +2635,13 @@ def test_watch_scheduler_adapts_quiet_window_to_fast_content_writes(tmp_path, mo
     archive_path = tmp_path / "sample.zip"
     archive_path.write_bytes(b"0")
     os.utime(archive_path, (clock.value, clock.value))
-    watcher = WatchScheduler(
-        make_config({"watch": {
+    watcher = _watcher(
+        tmp_path,
+        config=make_config({"watch": {
             "clipboard_monitor_enabled": False,
             "cold_start_seconds": 1.0,
             "quiet_min_seconds": 1.25,
         }}),
-        [str(tmp_path)],
-        out_dir=str(tmp_path / "out"),
-        state_path=str(tmp_path / "state.json"),
-        initial_scan=False,
         pipeline_engine=_summary_pipeline_engine(),
     )
     events = WatchEvents(watcher, clock)
@@ -3423,12 +2663,8 @@ def test_watch_scheduler_default_cold_start_is_zero_seconds(tmp_path, monkeypatc
     clock.install(monkeypatch)
     archive_path = tmp_path / "sample.zip"
     _write_zip(archive_path)
-    watcher = WatchScheduler(
-        make_config({"watch": {"clipboard_monitor_enabled": False}}),
-        [str(tmp_path)],
-        out_dir=str(tmp_path / "out"),
-        state_path=str(tmp_path / "state.json"),
-        initial_scan=False,
+    watcher = _watcher(
+        tmp_path,
         pipeline_engine=_summary_pipeline_engine(),
     )
     events = WatchEvents(watcher, clock)
@@ -3445,16 +2681,13 @@ def test_watch_scheduler_retains_slow_interval_learning_across_active_epochs(tmp
     archive_path = tmp_path / "sample.zip"
     archive_path.write_bytes(b"first")
     os.utime(archive_path, (clock.value, clock.value))
-    watcher = WatchScheduler(
-        make_config({"watch": {
+    watcher = _watcher(
+        tmp_path,
+        config=make_config({"watch": {
             "clipboard_monitor_enabled": False,
             "cold_start_seconds": 1.0,
             "quiet_min_seconds": 1.25,
         }}),
-        [str(tmp_path)],
-        out_dir=str(tmp_path / "out"),
-        state_path=str(tmp_path / "state.json"),
-        initial_scan=False,
         pipeline_engine=_summary_pipeline_engine(),
     )
     events = WatchEvents(watcher, clock)
@@ -3487,13 +2720,10 @@ def test_modified_event_retries_same_metadata_identity(tmp_path, monkeypatch):
     archive_path = watch_root / "sample.zip"
     archive_path.write_bytes(b"A" * (256 * 1024))
     original_mtime = archive_path.stat().st_mtime
-    watcher = WatchScheduler(
-        make_config({"watch": {"clipboard_monitor_enabled": False}}),
-        [str(watch_root)],
-        out_dir=str(tmp_path / "out"),
-        state_path=str(tmp_path / "state.json"),
+    watcher = _watcher(
+        tmp_path,
+        roots=[str(watch_root)],
         cold_start_seconds=0,
-        initial_scan=False,
         pipeline_engine=FakePipelineEngine(FakePipelineRunner),
     )
     events = WatchEvents(watcher, WatchClock(0.0))

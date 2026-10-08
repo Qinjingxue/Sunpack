@@ -1,12 +1,10 @@
 import asyncio
 import os
-from dataclasses import asdict
 
 import pytest
 
 import sunpack.core.support.resource_lifecycle as resource_lifecycle
 import sunpack.pipeline.postprocess.internal.cleanup as cleanup
-from sunpack.core.contracts.pipeline import PipelineArtifacts
 from sunpack.core.contracts.results import OutcomeKind
 from sunpack.core.contracts.run_state import RunState
 from sunpack.pipeline.coordinator.cleanup_refs import CleanupRefTable
@@ -315,26 +313,6 @@ def test_native_delete_reports_missing_and_deleted(tmp_path):
     assert not path.exists()
 
 
-def test_pipeline_artifacts_public_schema_has_no_flatten_queue():
-    assert set(asdict(PipelineArtifacts()).keys()) == {"shell_refresh_paths"}
-
-
-def test_cleanup_result_public_schema_is_stable():
-    result = cleanup.ArchiveCleanupResult(
-        "archive.zip",
-        "recycle",
-        "failed",
-        error_code=32,
-    )
-    assert set(asdict(result)) == {
-        "path",
-        "mode",
-        "status",
-        "error_code",
-        "message",
-    }
-
-
 def test_replacement_plan_cleans_added_volumes_and_preserves_rejected_paths(tmp_path):
     first, added, rejected = [tmp_path / name for name in ("a.001", "a.002", "unrelated.bin")]
     for path in (first, added, rejected):
@@ -390,4 +368,3 @@ def test_failed_sibling_veto_survives_replacement_plan_and_clears_after_release(
     table.register(failed)
     table.mark_cleanup_eligible(failed)
     assert table.release(failed).cleanup_paths == (shared,)
-

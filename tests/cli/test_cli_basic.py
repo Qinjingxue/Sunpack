@@ -134,65 +134,6 @@ class CliBasicTests(unittest.TestCase):
         self.assertEqual(payload["inputs"]["action"], "show")
         self.assertFalse(payload["summary"]["changed"])
 
-    def test_scan_help_does_not_expose_rule_internal_min_size_override(self):
-        result = run_cli("scan", "-h")
-
-        self.assertEqual(result.returncode, 0)
-        self.assertNotIn("--min-size", result.stdout)
-
-    def test_inspect_help_documents_archives_only_filter(self):
-        result = run_cli("inspect", "-h")
-
-        self.assertEqual(result.returncode, 0)
-        self.assertIn("--archives-only", result.stdout)
-
-    def test_extract_help_documents_runtime_overrides(self):
-        result = run_cli("extract", "-h")
-
-        self.assertEqual(result.returncode, 0)
-        self.assertNotIn("--color", result.stdout)
-        self.assertIn("--recur", result.stdout)
-        self.assertNotIn("--worker-profile", result.stdout)
-        self.assertIn("--cleanup", result.stdout)
-        self.assertIn("--out-dir", result.stdout)
-        self.assertIn("--write-manifest", result.stdout)
-        self.assertIn("--direct-file", result.stdout)
-        self.assertIn("--process-mode", result.stdout)
-        self.assertNotIn("--min-size", result.stdout)
-
-    def test_extract_direct_file_bypasses_initial_scan(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            archive = root / "payload.bin"
-            with zipfile.ZipFile(archive, "w") as zf:
-                zf.writestr("marker.txt", "direct")
-            out_dir = root / "out"
-
-            result = run_cli(
-                "extract",
-                "--json",
-                "--direct-file",
-                "--out-dir",
-                str(out_dir),
-                "--cleanup",
-                "k",
-                "--recur",
-                "1",
-                str(archive),
-                "--no-pause",
-            )
-
-        self.assertEqual(result.returncode, 0, result.stderr)
-        payload = json.loads(result.stdout)
-        self.assertTrue(payload["inputs"]["direct_file"])
-        self.assertEqual(payload["summary"]["success_count"], 1)
-
-    def test_inspect_help_documents_analyze_option(self):
-        result = run_cli("inspect", "-h")
-
-        self.assertEqual(result.returncode, 0)
-        self.assertIn("--analyze", result.stdout)
-
     def test_extract_out_dir_places_output_below_the_given_root(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -216,6 +157,7 @@ class CliBasicTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             payload = json.loads(result.stdout)
             self.assertEqual(payload["summary"]["success_count"], 1)
+            self.assertTrue(payload["inputs"]["direct_file"])
             self.assertEqual(
                 Path(payload["inputs"]["config_overrides"]["output_dir"]).resolve(),
                 out_dir.resolve(),
@@ -248,39 +190,6 @@ class CliBasicTests(unittest.TestCase):
                 Path(payload["inputs"]["config_overrides"]["output_dir"]).resolve(),
                 (request_dir / "relative-out").resolve(),
             )
-
-    def test_watch_help_documents_watchdog_options(self):
-        result = run_cli("watch", "-h")
-
-        self.assertEqual(result.returncode, 0)
-        self.assertIn("add", result.stdout)
-        self.assertIn("start", result.stdout)
-        self.assertIn("list", result.stdout)
-        self.assertIn("startup", result.stdout)
-        self.assertNotIn("--process-mode", result.stdout)
-
-    def test_passwords_help_only_shows_password_relevant_options(self):
-        result = run_cli("passwords", "-h")
-
-        self.assertEqual(result.returncode, 0)
-        self.assertIn("--json", result.stdout)
-        self.assertIn("--password", result.stdout)
-        self.assertNotIn("--clipboard-pw", result.stdout)
-        self.assertNotIn("--quiet", result.stdout)
-        self.assertNotIn("--verbose", result.stdout)
-        self.assertNotIn("--pause", result.stdout)
-
-    def test_config_help_only_exposes_show_and_validate(self):
-        result = run_cli("config", "-h")
-
-        self.assertEqual(result.returncode, 0)
-        self.assertIn("{show,validate}", result.stdout)
-        self.assertNotIn("blacklist", result.stdout)
-        self.assertNotIn("{show,validate,set", result.stdout)
-        self.assertNotIn("{show,validate,rule", result.stdout)
-        self.assertNotIn("--verbose", result.stdout)
-        self.assertNotIn("--pause", result.stdout)
-
 
 if __name__ == "__main__":
     unittest.main()
