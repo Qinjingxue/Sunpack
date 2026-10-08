@@ -10,14 +10,8 @@ import zipfile
 from pathlib import Path
 
 import pytest
+from tests.helpers.native_build import sevenzip_artifact
 
-
-REPO_ROOT = Path(__file__).resolve().parents[2]
-BUILD_CANDIDATES = (
-    REPO_ROOT / "native" / "sevenzip_bridge" / "build-x64" / "Release",
-    REPO_ROOT / "native" / "sevenzip_bridge" / "build-arm64" / "Release",
-    REPO_ROOT / "native" / "sevenzip_bridge" / "build" / "Release",
-)
 
 PAYLOAD_FILES = {
     "hello.txt": b"hello sunpack\n" * 40,
@@ -25,19 +19,11 @@ PAYLOAD_FILES = {
 }
 
 
-def _built_artifact(name: str) -> Path:
-    for candidate in BUILD_CANDIDATES:
-        artifact = candidate / name
-        if artifact.is_file():
-            return artifact
-    pytest.skip(f"{name} has not been built under native/sevenzip_bridge/build*")
-
-
 def _stage_without_7z_dll(tmp_path: Path, *names: str) -> Path:
     staging = tmp_path / "embedded-backend"
     staging.mkdir(parents=True, exist_ok=True)
     for name in names:
-        shutil.copy2(_built_artifact(name), staging / name)
+        shutil.copy2(sevenzip_artifact(name), staging / name)
     assert list(staging.glob("7z.dll")) == []
     return staging
 
@@ -117,7 +103,7 @@ def test_worker_does_not_import_7z_dll():
         pytest.skip("dumpbin is required to inspect PE imports")
 
     completed = subprocess.run(
-        [dumpbin, "/nologo", "/dependents", str(_built_artifact("sunpack_sevenzip_worker.exe"))],
+        [dumpbin, "/nologo", "/dependents", str(sevenzip_artifact("sunpack_sevenzip_worker.exe"))],
         capture_output=True,
         text=True,
         check=False,

@@ -705,7 +705,9 @@ $watchEnvironmentNames = @(
     "SUNPACK_WATCH_BROKER_SERVICE_NAME",
     "SUNPACK_WATCH_BROKER_PIPE_NAME",
     "SUNPACK_WATCH_BROKER_BINARY_PATH",
-    "SUNPACK_WATCH_BROKER_BINARY_SHA256"
+    "SUNPACK_WATCH_BROKER_BINARY_SHA256",
+    "SUNPACK_TEST_ARCH",
+    "SUNPACK_TEST_BUILD_PROFILE"
 )
 $watchEnvironmentBackup = @{}
 foreach ($name in $watchEnvironmentNames) {
@@ -716,6 +718,9 @@ $watchServiceCleanupFailed = $false
 $persistentRuntimeCleanupFailed = $false
 
 try {
+    $env:SUNPACK_TEST_ARCH = $Arch.ToLowerInvariant()
+    $env:SUNPACK_TEST_BUILD_PROFILE = $BuildProfile.ToLowerInvariant()
+    Write-Host "Native test build: $Arch/$BuildProfile"
     $env:SUNPACK_WATCH_BROKER_SERVICE_NAME = $watchServiceName
     $env:SUNPACK_WATCH_BROKER_PIPE_NAME = $watchPipeName
     $env:SUNPACK_WATCH_BROKER_BINARY_PATH = $brokerPath

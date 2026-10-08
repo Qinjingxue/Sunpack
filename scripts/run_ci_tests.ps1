@@ -92,23 +92,37 @@ if (-not (Test-Path -LiteralPath $venvPython -PathType Leaf)) {
 $python = $venvPython
 $env:PYTHONPATH = $repoRoot
 
-Invoke-TestStep -Label "Native extension smoke test" -Command @(
-    $python,
-    "-c",
-    "import sunpack_native as n; assert n.native_available(); assert callable(n.inspect_pe_overlay_structure)"
-)
-Invoke-TestStep -Label "Parallel unit, functional, and CLI tests" -Command @(
-    $python,
-    "-m", "pytest", "-q",
-    "-n", [string]$ParallelWorkers,
-    "--dist", "worksteal",
-    "tests/unit", "tests/functional", "tests/cli"
-)
-Invoke-TestStep -Label "CLI help smoke test" -Command @($python, "sunpack.py", "--help")
-Invoke-TestStep -Label "CLI passwords smoke test" -Command @($python, "sunpack.py", "passwords", "--json")
-Invoke-TestStep -Label "CLI scan smoke test" -Command @($python, "sunpack.py", "scan", (Join-Path $repoRoot "tests"), "--json")
-Invoke-TestStep -Label "CLI inspect smoke test" -Command @($python, "sunpack.py", "inspect", (Join-Path $repoRoot "tests"), "--json")
-Invoke-TestStep -Label "CLI config smoke test" -Command @($python, "sunpack.py", "config", "--json", "show")
+$testEnvironmentNames = @("SUNPACK_TEST_ARCH", "SUNPACK_TEST_BUILD_PROFILE")
+$testEnvironmentBackup = @{}
+foreach ($name in $testEnvironmentNames) {
+    $testEnvironmentBackup[$name] = [Environment]::GetEnvironmentVariable($name, "Process")
+}
+try {
+    $env:SUNPACK_TEST_ARCH = $Arch.ToLowerInvariant()
+    $env:SUNPACK_TEST_BUILD_PROFILE = $BuildProfile.ToLowerInvariant()
+    Write-Host "Native test build: $Arch/$BuildProfile"
+    Invoke-TestStep -Label "Native extension smoke test" -Command @(
+        $python,
+        "-c",
+        "import sunpack_native as n; assert n.native_available(); assert callable(n.inspect_pe_overlay_structure)"
+    )
+    Invoke-TestStep -Label "Parallel unit, functional, and CLI tests" -Command @(
+        $python,
+        "-m", "pytest", "-q",
+        "-n", [string]$ParallelWorkers,
+        "--dist", "worksteal",
+        "tests/unit", "tests/functional", "tests/cli"
+    )
+    Invoke-TestStep -Label "CLI help smoke test" -Command @($python, "sunpack.py", "--help")
+    Invoke-TestStep -Label "CLI passwords smoke test" -Command @($python, "sunpack.py", "passwords", "--json")
+    Invoke-TestStep -Label "CLI scan smoke test" -Command @($python, "sunpack.py", "scan", (Join-Path $repoRoot "tests"), "--json")
+    Invoke-TestStep -Label "CLI inspect smoke test" -Command @($python, "sunpack.py", "inspect", (Join-Path $repoRoot "tests"), "--json")
+    Invoke-TestStep -Label "CLI config smoke test" -Command @($python, "sunpack.py", "config", "--json", "show")
+} finally {
+    foreach ($name in $testEnvironmentNames) {
+        [Environment]::SetEnvironmentVariable($name, $testEnvironmentBackup[$name], "Process")
+    }
+}
 
 Write-Host ""
 Write-Host "Summary" -ForegroundColor Cyan

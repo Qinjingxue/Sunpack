@@ -12,7 +12,7 @@ from sunpack.pipeline.discovery.detection.input_planning import ArchiveInputPlan
 from sunpack.pipeline.discovery.filesystem.directory_scanner import DirectoryScanner
 from tests.helpers.archive_tasks import make_archive_task
 from tests.helpers.config_factory import make_config
-from tests.unit.test_lz4_support import BUILD
+from tests.helpers.native_build import sevenzip_artifact
 import subprocess
 from sunpack_native import enc_fast_verify_passwords, enc_fast_verify_passwords_from_ranges
 
@@ -33,7 +33,7 @@ def worker(path, output, candidates=("sunpack-test",), *, origin="foreground"):
     request = {"job_id": output.name, "origin": origin, "archive_path": str(path),
                "archive_input": {"kind": "file", "entry_path": str(path), "format_hint": "enc"},
                "output_dir": str(output), "password_candidates": list(candidates)}
-    completed = subprocess.run([str(BUILD / "sunpack_sevenzip_worker.exe")],
+    completed = subprocess.run([str(sevenzip_artifact("sunpack_sevenzip_worker.exe"))],
                                input=json.dumps(request, ensure_ascii=False), text=True,
                                capture_output=True, encoding="utf-8", timeout=30,
                                creationflags=subprocess.CREATE_NO_WINDOW)
@@ -129,7 +129,7 @@ def test_shared_worker_interleaves_watch_cli_success_wrong_password_and_damage(t
     events = []
 
     async def run():
-        process = _AsyncNativeWorkerProcess(str(BUILD / "sunpack_sevenzip_worker.exe"), None)
+        process = _AsyncNativeWorkerProcess(str(sevenzip_artifact("sunpack_sevenzip_worker.exe")), None)
         await process.start()
         try:
             finished = []

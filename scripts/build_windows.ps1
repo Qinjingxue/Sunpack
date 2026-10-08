@@ -1094,7 +1094,8 @@ if ($runAcceptanceTests) {
         "-File", (Join-Path $repoRoot "run_acceptance_tests.ps1"),
         "-NoWait",
         "-SkipEnvironmentRefresh",
-        "-Arch", $buildArch
+        "-Arch", $buildArch,
+        "-BuildProfile", "release"
     )
 } else {
     Write-Host "Skipping acceptance tests by request." -ForegroundColor Yellow

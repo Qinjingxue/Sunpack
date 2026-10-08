@@ -86,6 +86,21 @@ Rust 的 ci/release 产物分别位于对应 profile 目录，CMake CI 使用 `b
 发布使用 `build-<arch>`。测试 fixture 仍只预构建一次。`-Clean` 只清理 native 构建输出，
 保留 `.venv`；setup 和打包脚本通过 uv 同步现有环境。
 
+验收和 CI runner 将 `-Arch`/`-BuildProfile` 通过 `SUNPACK_TEST_ARCH` 和
+`SUNPACK_TEST_BUILD_PROFILE` 传给 pytest（包括 xdist 和降权子进程），退出时恢复
+调用方的环境变量。native worker、LZ4 fixture 和内置 7-Zip 测试统一通过
+`tests/helpers/native_build.py` 选择对应产物，不搜索其他架构或 profile 的旧目录，
+指定产物缺失时明确失败，避免错误跳过覆盖。直接运行 pytest 默认使用当前 Python
+架构的 `ci` 产物，与开发 setup 一致；测试 release 产物时显式设置：
+
+```powershell
+$env:SUNPACK_TEST_ARCH = "x64"
+$env:SUNPACK_TEST_BUILD_PROFILE = "release"
+uv run --locked pytest -n 2 --dist worksteal
+```
+
+`build_windows.ps1` 内部运行验收时显式传 `-BuildProfile release`，测试本次打包构建。
+
 release workflow 的 setup 使用 `-BootstrapOnly -SkipAcceptanceTestTools`，只同步 Python
 依赖并准备外部 7-Zip 工具，完整 native 构建只在 `build_windows.ps1` 中执行一次。
 两个 CMake 项目共享 MSBuild 文件并行配置，`-BuildJobs 4` 配合 `--parallel 4`，

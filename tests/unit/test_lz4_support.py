@@ -19,9 +19,9 @@ from sunpack.pipeline.extraction.scheduler import ExtractionScheduler
 from sunpack.pipeline.verification.evidence import build_verification_evidence
 from sunpack.pipeline.verification.methods.archive_test_crc import ArchiveTestCrcMethod
 from tests.helpers.archive_tasks import make_archive_task
+from tests.helpers.native_build import sevenzip_artifact
 
 ROOT = Path(__file__).resolve().parents[2]
-BUILD = ROOT / "native" / "sevenzip_bridge" / "build-x64" / "Release"
 
 
 def fingerprints(path):
@@ -32,9 +32,7 @@ def fingerprints(path):
 
 @pytest.fixture(scope="module")
 def fixtures(tmp_path_factory):
-    generator = BUILD / "sunpack_sevenzip_lz4.exe"
-    if not generator.is_file():
-        pytest.skip("Build the sunpack_sevenzip_lz4 native fixture/test target")
+    generator = sevenzip_artifact("sunpack_sevenzip_lz4.exe")
     folder = tmp_path_factory.mktemp("lz4_native")
     subprocess.run([str(generator), str(folder)], check=True, capture_output=True, timeout=60)
     return folder
@@ -44,7 +42,7 @@ def worker(descriptor, output):
     request = {"job_id": output.name, "archive_input": descriptor.to_dict(),
                "archive_path": descriptor.entry_path, "output_dir": str(output)}
     completed = subprocess.run(
-        [str(BUILD / "sunpack_sevenzip_worker.exe")], input=json.dumps(request),
+        [str(sevenzip_artifact("sunpack_sevenzip_worker.exe"))], input=json.dumps(request),
         capture_output=True, text=True, encoding="utf-8", timeout=30,
         creationflags=subprocess.CREATE_NO_WINDOW,
     )
@@ -257,7 +255,7 @@ def test_shared_worker_interleaves_success_damage_and_unsupported_jobs(fixtures,
     events = []
 
     async def run():
-        process = _AsyncNativeWorkerProcess(str(BUILD / "sunpack_sevenzip_worker.exe"), None)
+        process = _AsyncNativeWorkerProcess(str(sevenzip_artifact("sunpack_sevenzip_worker.exe")), None)
         await process.start()
         try:
             finished = []

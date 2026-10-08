@@ -4,12 +4,16 @@ import json
 import os
 import shutil
 import subprocess
+from pathlib import Path
 
 import pytest
 
 from sunpack_native import parse_worker_transport_event
 from tests.helpers.native_fixture import file_inventory, native_fixture
-from tests.unit.test_enc_support import BUILD, ROOT
+from tests.helpers.native_build import sevenzip_artifact
+
+
+ROOT = Path(__file__).resolve().parents[2]
 
 
 @pytest.fixture(scope="module", params=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9], ids=["aes", "rc6", "serpent", "blowfish256", "twofish", "gost", "blowfish448", "threefish", "shacal", "c4"])
@@ -36,7 +40,7 @@ def test_large_enc_uses_only_granted_credits_and_matches_official_bytes(tmp_path
     env = os.environ | {"SUNPACK_NATIVE_WORKER_THREAD_CAPACITY": str(capacity)}
     if executor_threads:
         env["RAYON_NUM_THREADS"] = str(executor_threads)
-    completed = subprocess.run([str(BUILD / "sunpack_sevenzip_worker.exe")],
+    completed = subprocess.run([str(sevenzip_artifact("sunpack_sevenzip_worker.exe"))],
                                input=json.dumps(request), capture_output=True, text=True, encoding="utf-8",
                                timeout=30, creationflags=subprocess.CREATE_NO_WINDOW,
                                env=env)
@@ -62,7 +66,7 @@ def test_parallel_enc_releases_credits_after_mac_failure_for_watch_and_cli(tmp_p
     events = []
 
     async def run():
-        process = _AsyncNativeWorkerProcess(str(BUILD / "sunpack_sevenzip_worker.exe"), None)
+        process = _AsyncNativeWorkerProcess(str(sevenzip_artifact("sunpack_sevenzip_worker.exe")), None)
         await process.start()
         try:
             for wave in range(3):
@@ -114,7 +118,7 @@ def test_enc_carrier_ranges_keep_ctr_continuity_and_reject_missing_tail(tmp_path
                "archive_input": {"kind": "archive_input", "entry_path": str(carrier),
                                  "open_mode": "concat_ranges", "format_hint": "enc", "ranges": ranges},
                "output_dir": str(tmp_path / "out"), "password_candidates": ["sunpack-test"]}
-    completed = subprocess.run([str(BUILD / "sunpack_sevenzip_worker.exe")],
+    completed = subprocess.run([str(sevenzip_artifact("sunpack_sevenzip_worker.exe"))],
                                input=json.dumps(request), capture_output=True, text=True, encoding="utf-8",
                                timeout=30, creationflags=subprocess.CREATE_NO_WINDOW,
                                env=os.environ | {"SUNPACK_NATIVE_WORKER_THREAD_CAPACITY": "4"})
