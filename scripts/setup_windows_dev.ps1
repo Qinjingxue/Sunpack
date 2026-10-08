@@ -3,7 +3,12 @@ param(
     [switch]$Clean,
     [ValidateSet("x64", "arm64")]
     [string]$Arch = "x64",
-    [switch]$SkipAcceptanceTestTools
+    [switch]$SkipAcceptanceTestTools,
+    [switch]$BootstrapOnly,
+    [ValidateSet("release", "ci")]
+    [string]$BuildProfile = "ci",
+    [ValidateRange(1, 64)]
+    [int]$BuildJobs = 4
 )
 
 Set-StrictMode -Version Latest
@@ -276,7 +281,7 @@ function Ensure-Bundled7ZipAssets {
         Invoke-FileDownload -Uri $downloadInfo.InstallerUri -DestinationPath $installerPath -Description "7-Zip $BuildArch installer"
 
         Write-Host "Installing 7-Zip into temporary workspace $installRoot" -ForegroundColor Yellow
-        $process = Start-Process -FilePath $installerPath -ArgumentList @("/S", "/D=$installRoot") -Wait -PassThru
+        $process = Start-Process -FilePath $installerPath -ArgumentList @("/S", "/D=$installRoot") -WindowStyle Hidden -Wait -PassThru
         if ($process.ExitCode -ne 0) {
             throw "7-Zip installer exited with code $($process.ExitCode)"
         }
@@ -676,10 +681,10 @@ function Build-SevenZipWorker {
     Assert-PathExists -LiteralPath (Join-Path $WrapperRoot "CMakeLists.txt") -Description "7z wrapper CMake project"
     $cmakePlatform = Get-CMakePlatform -BuildArch $BuildArch
     Reset-StaleCMakeBuildDir -SourceDir $WrapperRoot -BuildDir $BuildDir -CMakePlatform $cmakePlatform
-    Invoke-Native -FilePath $CMakeCommand -Arguments @("-S", $WrapperRoot, "-B", $BuildDir, "-A", $cmakePlatform, "-DCMAKE_BUILD_TYPE=Release", "-DSUP7Z_USE_X64_ASM=ON", "-DSUP7Z_USE_ARM64_ASM=ON")
+    Invoke-Native -FilePath $CMakeCommand -Arguments @("-S", $WrapperRoot, "-B", $BuildDir, "-A", $cmakePlatform, "-DCMAKE_BUILD_TYPE=Release", "-DSUP7Z_USE_X64_ASM=ON", "-DSUP7Z_USE_ARM64_ASM=ON", "-DSUP7Z_ENABLE_LTO=$lto", "-DSUP7Z_RUST_PROFILE=$BuildProfile", "-DSUNPACK_BUILD_JOBS=$BuildJobs")
     Remove-Item -LiteralPath (Join-Path $BuildDir "Release\sunpack_sevenzip.dll") -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath (Join-Path $ToolsRoot "sunpack_sevenzip.dll") -Force -ErrorAction SilentlyContinue
-    Invoke-Native -FilePath $CMakeCommand -Arguments @("--build", $BuildDir, "--config", "Release")
+    Invoke-Native -FilePath $CMakeCommand -Arguments @("--build", $BuildDir, "--config", "Release", "--parallel", [string]$BuildJobs)
     if ((Get-ProcessBuildArch) -eq $BuildArch) {
         Invoke-Native -FilePath $CTestCommand -Arguments @("--test-dir", $BuildDir, "-C", "Release", "--output-on-failure")
     } else {
@@ -711,8 +716,8 @@ function Build-ToastLibrary {
     Assert-PathExists -LiteralPath (Join-Path $SourceRoot "CMakeLists.txt") -Description "toast CMake project"
     $cmakePlatform = Get-CMakePlatform -BuildArch $BuildArch
     Reset-StaleCMakeBuildDir -SourceDir $SourceRoot -BuildDir $BuildDir -CMakePlatform $cmakePlatform
-    Invoke-Native -FilePath $CMakeCommand -Arguments @("-S", $SourceRoot, "-B", $BuildDir, "-A", $cmakePlatform, "-DCMAKE_BUILD_TYPE=Release")
-    Invoke-Native -FilePath $CMakeCommand -Arguments @("--build", $BuildDir, "--config", "Release")
+    Invoke-Native -FilePath $CMakeCommand -Arguments @("-S", $SourceRoot, "-B", $BuildDir, "-A", $cmakePlatform, "-DCMAKE_BUILD_TYPE=Release", "-DSUNPACK_TOAST_ENABLE_LTO=$lto", "-DSUNPACK_BUILD_JOBS=$BuildJobs")
+    Invoke-Native -FilePath $CMakeCommand -Arguments @("--build", $BuildDir, "--config", "Release", "--parallel", [string]$BuildJobs)
     if ((Get-ProcessBuildArch) -eq $BuildArch) {
         Invoke-Native -FilePath $CTestCommand -Arguments @("--test-dir", $BuildDir, "-C", "Release", "--output-on-failure")
     }
@@ -827,13 +832,15 @@ $nativeCargoToml = Join-Path $nativeCrateRoot "Cargo.toml"
 $nativeWorkspaceLock = Join-Path $repoRoot "native\Cargo.lock"
 $watchBrokerCargoToml = Join-Path $repoRoot "native\sunpack_watch_broker\Cargo.toml"
 $rustTargetDir = Join-Path $repoRoot (".cache\rust-target\" + $buildArch)
-$watchBrokerBuildPath = Get-WatchBrokerBuildPath -RepoRoot $repoRoot -Arch $buildArch
+$watchBrokerBuildPath = Get-WatchBrokerBuildPath -RepoRoot $repoRoot -Arch $buildArch -BuildProfile $BuildProfile
 $sevenZipWrapperRoot = Join-Path $repoRoot "native\sevenzip_bridge"
-$sevenZipWrapperBuildDir = Join-Path $sevenZipWrapperRoot ("build-" + $buildArch)
+$buildSuffix = if ($BuildProfile -eq "ci") { "-ci" } else { "" }
+$lto = if ($BuildProfile -eq "ci") { "OFF" } else { "ON" }
+$sevenZipWrapperBuildDir = Join-Path $sevenZipWrapperRoot ("build-" + $buildArch + $buildSuffix)
 $toastHostRoot = Join-Path $repoRoot "native\toast_host"
-$toastHostBuildDir = Join-Path $toastHostRoot ("build-" + $buildArch)
+$toastHostBuildDir = Join-Path $toastHostRoot ("build-" + $buildArch + $buildSuffix)
 $buildRoot = Join-Path $repoRoot "build"
-$nativeWheelRoot = Join-Path $buildRoot ("native-wheels-dev-" + $buildArch)
+$nativeWheelRoot = Join-Path $buildRoot ("native-wheels-dev-" + $buildArch + $buildSuffix)
 $toolsRoot = if ($buildArch -eq "x64") { Join-Path $repoRoot "tools" } else { Join-Path $repoRoot ("tools-" + $buildArch) }
 $sevenZipLicensePath = Join-Path $repoRoot "licenses\7zip-license.txt"
 
@@ -844,8 +851,14 @@ Assert-PathExists -LiteralPath $watchBrokerCargoToml -Description "SunPack Watch
 Assert-CommandExists -Command "cargo" -Description "Rust toolchain"
 Assert-CommandExists -Command "uv" -Description "uv dependency manager"
 if ($Clean) {
-    Write-Step "Cleaning local virtual environment"
-    Remove-IfExists -LiteralPath $venvPath
+    Write-Step "Cleaning native build outputs"
+    foreach ($output in @($rustTargetDir, $sevenZipWrapperBuildDir, $toastHostBuildDir, $nativeWheelRoot)) {
+        $fullOutput = [IO.Path]::GetFullPath($output)
+        if (-not $fullOutput.StartsWith(([IO.Path]::GetFullPath($repoRoot) + "\"), [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Build output is outside the repository: $output"
+        }
+        Remove-IfExists -LiteralPath $fullOutput
+    }
 }
 
 Write-Step "Preparing local virtual environment"
@@ -853,8 +866,8 @@ $venvConfigPath = Join-Path $venvPath "pyvenv.cfg"
 if (Test-Path -LiteralPath $venvConfigPath) {
     $venvConfig = Get-Content -LiteralPath $venvConfigPath -Raw
     if ($venvConfig -match "include-system-site-packages\s*=\s*true") {
-        Write-Host "Recreating local virtual environment without global site-packages." -ForegroundColor Yellow
-        Remove-IfExists -LiteralPath $venvPath
+        Write-Host "Disabling global site-packages in the existing virtual environment." -ForegroundColor Yellow
+        [IO.File]::WriteAllText($venvConfigPath, ($venvConfig -replace "include-system-site-packages\s*=\s*true", "include-system-site-packages = false"), [Text.UTF8Encoding]::new($false))
     }
 }
 $syncArguments = @("sync", "--locked", "--extra", "dev")
@@ -868,6 +881,15 @@ $env:Path = "$venvScripts;$env:Path"
 $env:PYTHONPATH = $repoRoot
 $env:VIRTUAL_ENV = $venvPath
 
+Ensure-Bundled7ZipAssets -ToolsRoot $toolsRoot -LicenseDestinationPath $sevenZipLicensePath -BuildArch $buildArch
+if ($buildArch -eq "x64" -and -not $SkipAcceptanceTestTools) {
+    Ensure-AcceptanceTestTools -RepoRoot $repoRoot -ToolsRoot $toolsRoot
+}
+if ($BootstrapOnly) {
+    Write-Host "Bootstrap complete; native compilation is deferred to build_windows.ps1." -ForegroundColor Green
+    return
+}
+
 Write-Step "Building and installing Rust native extension"
 $nativeBuildStartedUtc = [datetime]::UtcNow
 $maturinCommand = Get-MaturinCommand -VenvScripts $venvScripts
@@ -878,7 +900,8 @@ Invoke-Native -FilePath $maturinCommand -Arguments @(
     "build",
     "--locked",
     "--manifest-path", $nativeCargoToml,
-    "--release",
+    "--interpreter", $venvPython,
+    "--profile", $BuildProfile,
     "--target", $rustTarget,
     "--target-dir", $rustTargetDir,
     "--out", $nativeWheelRoot
@@ -890,12 +913,31 @@ Set-DevelopmentArtifactBuildTime -Path (Get-NativeExtensionPath -PythonPath $ven
 
 Write-Step "Building native test fixture tool"
 $fixtureBuildStartedUtc = [datetime]::UtcNow
-Invoke-Native -FilePath "cargo" -Arguments @(
-    "build", "--locked", "--manifest-path", $nativeCargoToml,
-    "--release", "--target", $rustTarget, "--target-dir", $rustTargetDir,
-    "--example", "real_fixture"
-)
-$fixtureBuildPath = Join-Path $rustTargetDir "$rustTarget\release\examples\real_fixture.exe"
+# Match maturin's runnable-interpreter environment: otherwise the example build
+# invalidates PyO3's build script and the next wheel recompiles the extension.
+# Signature format: PyO3/maturin src/python_interpreter/mod.rs environment_signature.
+$pythonSignature = & $venvPython -c "import sys, struct; print('{}-{}.{}-{}bit'.format(sys.implementation.name, sys.version_info.major, sys.version_info.minor, struct.calcsize('P') * 8))"
+if ($LASTEXITCODE -ne 0) { throw "Cannot identify the fixture Python interpreter" }
+$fixtureEnvironmentBackup = @{}
+foreach ($name in @("PYO3_PYTHON", "PYO3_ENVIRONMENT_SIGNATURE", "PYTHON_SYS_EXECUTABLE", "PYO3_BUILD_EXTENSION_MODULE")) {
+    $fixtureEnvironmentBackup[$name] = [Environment]::GetEnvironmentVariable($name, "Process")
+}
+try {
+    $env:PYO3_PYTHON = $venvPython
+    $env:PYTHON_SYS_EXECUTABLE = $venvPython
+    $env:PYO3_ENVIRONMENT_SIGNATURE = ([string]$pythonSignature).Trim()
+    $env:PYO3_BUILD_EXTENSION_MODULE = "1"
+    Invoke-Native -FilePath "cargo" -Arguments @(
+        "build", "--locked", "--manifest-path", $nativeCargoToml,
+        "--profile", $BuildProfile, "--target", $rustTarget, "--target-dir", $rustTargetDir,
+        "--example", "real_fixture"
+    )
+} finally {
+    foreach ($name in $fixtureEnvironmentBackup.Keys) {
+        [Environment]::SetEnvironmentVariable($name, $fixtureEnvironmentBackup[$name], "Process")
+    }
+}
+$fixtureBuildPath = Join-Path $rustTargetDir "$rustTarget\$BuildProfile\examples\real_fixture.exe"
 Assert-PathExists -LiteralPath $fixtureBuildPath -Description "Native test fixture executable"
 New-Item -ItemType Directory -Path $toolsRoot -Force | Out-Null
 $fixtureToolPath = Join-Path $toolsRoot "real_fixture.exe"
@@ -908,17 +950,13 @@ Invoke-Native -FilePath "cargo" -Arguments @(
     "build",
     "--locked",
     "--manifest-path", $watchBrokerCargoToml,
-    "--release",
+    "--profile", $BuildProfile,
     "--target", $rustTarget,
     "--target-dir", $rustTargetDir
 )
 Assert-PathExists -LiteralPath $watchBrokerBuildPath -Description "SunPack Watch Broker executable"
 Set-DevelopmentArtifactBuildTime -Path $watchBrokerBuildPath -BuildStartedUtc $brokerBuildStartedUtc
 
-Ensure-Bundled7ZipAssets -ToolsRoot $toolsRoot -LicenseDestinationPath $sevenZipLicensePath -BuildArch $buildArch
-if ($buildArch -eq "x64" -and -not $SkipAcceptanceTestTools) {
-    Ensure-AcceptanceTestTools -RepoRoot $repoRoot -ToolsRoot $toolsRoot
-}
 $cmakeCommand = Get-CMakeCommand -VenvScripts $venvScripts
 $ctestCommand = Get-CTestCommand -VenvScripts $venvScripts
 Build-SevenZipWorker -CMakeCommand $cmakeCommand -CTestCommand $ctestCommand -WrapperRoot $sevenZipWrapperRoot -BuildDir $sevenZipWrapperBuildDir -ToolsRoot $toolsRoot -BuildArch $buildArch

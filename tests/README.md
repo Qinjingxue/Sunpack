@@ -25,8 +25,8 @@ $workers = [math]::Max(1, [math]::Floor([Environment]::ProcessorCount / 4))
 uv run --locked pytest -n $workers --dist worksteal
 ```
 
-CI 和 acceptance runner 默认使用逻辑 CPU 核心数的四分之一（向下取整，至少 1 个）
-作为 worker 数量；本地直接运行 pytest 仍建议按机器性能手动调整，避免 `-n auto` 在高核心数
+本地 CI 和 acceptance runner 默认使用逻辑 CPU 核心数的四分之一（向下取整，至少 1 个）
+作为 worker 数量；GitHub Actions 验收显式使用 2 个 worker。本地直接运行 pytest 仍建议按机器性能手动调整，避免 `-n auto` 在高核心数
 机器上造成过多进程与磁盘竞争。
 性能、内存稳定性以及需要 Watch Broker 的测试必须使用 `-n 0`。Acceptance runner
 会自动将 Broker/Plan 7 独占测试与普通并行测试分开；直接运行性能或内存测试时仍需
@@ -50,7 +50,7 @@ uv run --locked python -m benchmarks --list
 .\scripts\run_ci_tests.ps1
 ```
 
-CI 和 acceptance runner（包括根目录 `run_acceptance_tests.ps1`）默认使用逻辑 CPU 核心数的四分之一（下限为 1）个 worker，
+本地 CI 和 acceptance runner（包括根目录 `run_acceptance_tests.ps1`）默认使用逻辑 CPU 核心数的四分之一（下限为 1）个 worker，
 也可通过 `-ParallelWorkers` 调整，例如 `.\scripts\run_ci_tests.ps1 -ParallelWorkers 4`。
 
 `run_acceptance_tests.ps1` 会运行 CLI、unit、functional、integration 和完整 `tests/real` 真实归档/watch 矩阵，并执行 CLI smoke checks。
@@ -59,17 +59,47 @@ CI 和 acceptance runner（包括根目录 `run_acceptance_tests.ps1`）默认�
 `scripts/setup_windows_dev.ps1`，完成后重新检查，仍过期则在运行测试前失败。
 共享 USN crate 的修改会同时使 Rust 扩展与 Broker 过期；LZ4、内置 7-Zip/zlib-ng、
 构建配置和 toast 源码也纳入各自组件的检查，构建目录不参与扫描。Broker 只使用
-`.cache/rust-target/<arch>/<target>/release/` 的产物，不回退到 `native/target`。
+`.cache/rust-target/<arch>/<target>/<profile>/` 的产物，不回退到 `native/target`。
 这里不保存 manifest，也不计算源码或产物 hash。检查面向正常编辑/Git 工作流，
 不能识别保留旧时间戳的源码替换；这类操作后应主动运行 setup。
 测试用 Rust `real_fixture.exe` 也由 setup 统一构建并复制到对应架构的 tools 目录，
 纳入 CI/验收的产物过期检查。pytest helper 只调用现成工具，缺失时明确报错，
 不会执行 Cargo metadata/build，避免 xdist worker 重复编译和争用构建锁。
+fixture 构建使用与 maturin 一致的 Python/PyO3 环境，避免在 wheel 和 fixture
+之间来回使 PyO3 的 Cargo 缓存失效；构建后恢复调用方的环境变量。
 WinGet manifest 的各场景在同一个 PowerShell 会话中调用真实脚本，使用 pytest
 subtests 分别报告断言结果；普通测试仍使用 worksteal 并行调度。
 setup 成功构建/安装后，只将旧产物时间推进到该组件的构建开始时间，以支持无需重新链接的
 增量构建；新生成产物保留原时间，不破坏构建系统的增量判断。
 验收入口的 `-SkipEnvironmentRefresh` 仍可显式跳过检查和自动刷新。
+
+开发 setup、CI 和验收入口默认使用 `-BuildProfile ci`：Rust 保留 `opt-level=3`，关闭 LTO、使用
+16 个 codegen units；C++ 保留 Release 优化和静态 CRT，关闭 IPO/LTO，包括 worker
+内嵌的 Rust ENC 库。正式发布保持 Rust fat LTO 和 C++ LTO。可在本地复用同一配置：
+
+```powershell
+.\scripts\setup_windows_dev.ps1 -Arch x64 -BuildProfile ci -BuildJobs 4
+.\run_acceptance_tests.ps1 -NoWait -BuildProfile ci -ParallelWorkers 2
+```
+
+Rust 的 ci/release 产物分别位于对应 profile 目录，CMake CI 使用 `build-<arch>-ci`，
+发布使用 `build-<arch>`。测试 fixture 仍只预构建一次。`-Clean` 只清理 native 构建输出，
+保留 `.venv`；setup 和打包脚本通过 uv 同步现有环境。
+
+release workflow 的 setup 使用 `-BootstrapOnly -SkipAcceptanceTestTools`，只同步 Python
+依赖并准备外部 7-Zip 工具，完整 native 构建只在 `build_windows.ps1` 中执行一次。
+两个 CMake 项目共享 MSBuild 文件并行配置，`-BuildJobs 4` 配合 `--parallel 4`，
+通过 MultiToolTask 限制跨项目的编译进程总数，避免项目级与文件级并行相乘。
+
+Actions 按架构、profile、Python ABI、Rust/CMake/MSVC 工具链、锁文件和 native
+源码缓存 Cargo registry/git、Rust target 和 CMake build 目录。仅当源码指纹相同时
+恢复缓存中的输入时间戳，使 checkout 不会使有效的 CMake 产物过期；源码变化的
+fallback 缓存保留新时间戳，正常触发重编译。该缓存快照仅用于 Actions，开发产物
+preflight 仍扫描当前输入时间戳。真实 fixture 生成器另行缓存。
+
+Nuitka 的编译缓存位于 `.cache/nuitka/<arch>` 并在 Actions 间持久化；正式发布继续
+`--lto=yes`。手动 workflow 可勾选 `fast_build`，或本地传 `build_windows.ps1 -FastBuild`，
+仅关闭 Nuitka LTO 以加快构建验证；tag 触发的正式发布始终保持完整优化。
 
 脚本中的各测试步骤相互独立：某一步失败或超时后仍会继续执行后续步骤，最后统一汇总；只要存在失败步骤，脚本最终仍返回非零退出码。
 

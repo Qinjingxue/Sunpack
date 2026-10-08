@@ -2,6 +2,8 @@
 param(
     [ValidateSet("x64", "arm64")]
     [string]$Arch = "x64",
+    [ValidateSet("release", "ci")]
+    [string]$BuildProfile = "ci",
     [ValidateRange(0, 32)]
     [int]$ParallelWorkers = 0
 )
@@ -65,7 +67,7 @@ function Get-CiEnvironmentRefreshReasons {
     } catch {
         "Runtime, test dependencies or native smoke check failed"
     }
-    Get-NativeArtifactRefreshReasons -RepoRoot $RepoRoot -Arch $Arch -NativeExtension (Get-NativeExtensionPath -PythonPath $VenvPython)
+    Get-NativeArtifactRefreshReasons -RepoRoot $RepoRoot -Arch $Arch -NativeExtension (Get-NativeExtensionPath -PythonPath $VenvPython) -BuildProfile $BuildProfile
 }
 
 $venvPython = Join-Path $repoRoot ".venv\Scripts\python.exe"
@@ -77,7 +79,7 @@ if ($refreshReasons.Count -gt 0) {
         [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName,
         "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
         "-File", (Join-Path $PSScriptRoot "setup_windows_dev.ps1"),
-        "-Arch", $Arch, "-SkipAcceptanceTestTools"
+        "-Arch", $Arch, "-BuildProfile", $BuildProfile, "-SkipAcceptanceTestTools"
     )
     $remainingReasons = @(Get-CiEnvironmentRefreshReasons -RepoRoot $repoRoot -VenvPython $venvPython -Arch $Arch)
     if ($remainingReasons.Count -gt 0) {

@@ -98,3 +98,6 @@ runtime-v2-0000000000000000.state
 tests/real/corpus/
 
 演示样本/
+
+native/toast_host/build-*/
+/tools-arm64/

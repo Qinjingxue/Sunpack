@@ -7,6 +7,11 @@ on:
         description: "Version label to use in build artifact filenames, for example v0.1.0. Leave empty to derive it from git."
         required: false
         type: string
+      fast_build:
+        description: "Manual build verification: disable Nuitka LTO. Tagged releases always use full optimization."
+        required: false
+        default: false
+        type: boolean
   push:
     tags:
       - "v*"
@@ -105,7 +110,6 @@ jobs:
 
   build:
     name: Build ${{ matrix.arch }}
-    needs: build-notes
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 150
     strategy:
@@ -149,10 +153,27 @@ jobs:
           cargo --version
           rustc -Vv
 
-      - name: Prepare native/tool environment
+      - name: Restore native build cache
+        id: native-cache
+        uses: ./.github/actions/native-cache
+        with:
+          arch: ${{ matrix.arch }}
+          profile: release
+          python-version: ${{ matrix.python_version }}
+          source-key: ${{ hashFiles('native/**', 'scripts/**', 'sunpack.manifest') }}
+
+      - name: Restore Nuitka compiler cache
+        uses: actions/cache@v4
+        with:
+          path: .cache/nuitka/${{ matrix.arch }}
+          key: nuitka-v1-${{ runner.os }}-${{ matrix.arch }}-py${{ matrix.python_version }}-${{ steps.native-cache.outputs.toolchain }}-${{ hashFiles('uv.lock') }}-${{ github.event_name == 'workflow_dispatch' && inputs.fast_build && 'fast' || 'lto' }}-${{ hashFiles('sunpack/**', 'sunpack.py', 'scripts/build_windows.ps1') }}
+          restore-keys: |
+            nuitka-v1-${{ runner.os }}-${{ matrix.arch }}-py${{ matrix.python_version }}-${{ steps.native-cache.outputs.toolchain }}-${{ hashFiles('uv.lock') }}-${{ github.event_name == 'workflow_dispatch' && inputs.fast_build && 'fast' || 'lto' }}-
+
+      - name: Bootstrap Python and external tools
         shell: pwsh
         run: |
-          .\scripts\setup_windows_dev.ps1 -Arch ${{ matrix.arch }} -SkipAcceptanceTestTools
+          .\scripts\setup_windows_dev.ps1 -Arch ${{ matrix.arch }} -SkipAcceptanceTestTools -BootstrapOnly
 
       - name: Show toolchain architecture
         shell: pwsh
@@ -191,6 +212,9 @@ jobs:
           GIT_EVENT_NAME: ${{ github.event_name }}
           GIT_REF_NAME: ${{ github.ref_name }}
           IS_TAG_REF: ${{ startsWith(github.ref, 'refs/tags/') }}
+          FAST_BUILD: ${{ github.event_name == 'workflow_dispatch' && inputs.fast_build && 'true' || 'false' }}
+          NUITKA_CACHE_DIR: ${{ github.workspace }}\.cache\nuitka\${{ matrix.arch }}
+          CLCACHE_BASEDIR: ${{ github.workspace }}
         run: |
           $version = ""
           if ($env:GIT_EVENT_NAME -eq "workflow_dispatch" -and $env:RELEASE_TAG_INPUT) {
@@ -206,6 +230,8 @@ jobs:
             SkipTests = $true
             NoPause = $true
             Arch = "${{ matrix.arch }}"
+            BuildJobs = 4
+            FastBuild = ($env:FAST_BUILD -eq "true")
           }
           if ($version -ne "") {
             $buildArgs.Version = $version

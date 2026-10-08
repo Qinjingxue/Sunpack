@@ -9,7 +9,9 @@ endif()
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
-set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
+option(SUNPACK_TOAST_ENABLE_LTO "Enable final release link-time optimization" ON)
+set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE ${SUNPACK_TOAST_ENABLE_LTO})
+include("${CMAKE_CURRENT_SOURCE_DIR}/../cmake/SunpackParallelBuild.cmake")
 
 add_library(sunpack_toast SHARED src/main.cpp)
 target_compile_definitions(sunpack_toast PRIVATE
@@ -25,10 +27,11 @@ if(MSVC)
     )
     target_compile_options(sunpack_toast PRIVATE
         /utf-8 /permissive- /W4
-        $<$<CONFIG:Release>:/O2 /Oi /Ot /GL /Gy /Gw /GF>
+        $<$<CONFIG:Release>:/O2 /Oi /Ot /Gy /Gw /GF>
     )
     target_link_options(sunpack_toast PRIVATE
-        $<$<CONFIG:Release>:/LTCG /OPT:REF /OPT:ICF>
+        $<$<CONFIG:Release>:/OPT:REF /OPT:ICF>
+        $<$<AND:$<CONFIG:Release>,$<BOOL:${SUNPACK_TOAST_ENABLE_LTO}>>:/LTCG>
     )
 endif()
 target_link_libraries(sunpack_toast PRIVATE

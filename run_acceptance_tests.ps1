@@ -5,6 +5,8 @@ param(
     [switch]$SkipEnvironmentRefresh,
     [ValidateSet("x64", "arm64")]
     [string]$Arch = "x64",
+    [ValidateSet("release", "ci")]
+    [string]$BuildProfile = "ci",
     [ValidateRange(0, 32)]
     [int]$ParallelWorkers = 0,
     [int]$StepTimeoutSeconds = 900
@@ -560,7 +562,7 @@ function Get-EnvironmentRefreshReasons {
     }
 
     $nativeExtension = Get-NativeExtensionPath -PythonPath $VenvPython
-    foreach ($reason in @(Get-NativeArtifactRefreshReasons -RepoRoot $RepoRoot -Arch $Arch -NativeExtension $nativeExtension)) {
+    foreach ($reason in @(Get-NativeArtifactRefreshReasons -RepoRoot $RepoRoot -Arch $Arch -NativeExtension $nativeExtension -BuildProfile $BuildProfile)) {
         $reasons.Add($reason)
     }
 
@@ -625,7 +627,7 @@ function Ensure-AcceptanceEnvironment {
     Invoke-Native -FilePath "powershell" -Arguments @(
         "-ExecutionPolicy", "Bypass",
         "-File", (Join-Path $RepoRoot "scripts\setup_windows_dev.ps1"),
-        "-Arch", $Arch
+        "-Arch", $Arch, "-BuildProfile", $BuildProfile
     )
 
     # Verify persistence immediately; a successful setup subprocess is not
@@ -688,7 +690,7 @@ if (-not (Test-Path -LiteralPath $venvPython -PathType Leaf)) {
 $python = $venvPython
 $env:PYTHONPATH = $repoRoot
 
-$brokerPath = Get-WatchBrokerBuildPath -RepoRoot $repoRoot -Arch $Arch
+$brokerPath = Get-WatchBrokerBuildPath -RepoRoot $repoRoot -Arch $Arch -BuildProfile $BuildProfile
 $brokerPath = [IO.Path]::GetFullPath($brokerPath)
 if (-not (Test-Path -LiteralPath $brokerPath -PathType Leaf)) {
     throw "Watch Broker executable not found: $brokerPath"

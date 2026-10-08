@@ -13,3 +13,10 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = "symbols"
+
+# Correctness tests keep optimization but avoid the final release link cost.
+[profile.ci]
+inherits = "release"
+lto = false
+codegen-units = 16
+strip = false

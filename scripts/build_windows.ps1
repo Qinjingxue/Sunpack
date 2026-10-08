@@ -3,6 +3,10 @@ param(
     [switch]$SkipTests,
     [switch]$Clean,
     [switch]$NoPause,
+    # Manual build verification only; tagged releases keep Nuitka LTO enabled.
+    [switch]$FastBuild,
+    [ValidateRange(1, 64)]
+    [int]$BuildJobs = 4,
     # Nuitka currently warns that C-level PGO is unsupported for standalone builds.
     # Keep it opt-in for local experiments only; release builds use LTO by default.
     [switch]$ExperimentalCProfileGuidedOptimization,
@@ -567,12 +571,12 @@ function Build-SevenZipWorker {
     # x64 uses MASM for LZMA/CRC/AES/SHA; ARM64 uses clang-cl only for LzmaDecOpt.S while
     # CRC/AES/SHA keep the upstream C/intrinsics implementations. Each architecture has an
     # explicit OFF switch for same-commit A/B benchmarking and rollback.
-    Invoke-Native -FilePath $CMakeCommand -Arguments @("-S", $WrapperRoot, "-B", $BuildDir, "-A", $cmakePlatform, "-DCMAKE_BUILD_TYPE=Release", "-DSUP7Z_USE_X64_ASM=ON", "-DSUP7Z_USE_ARM64_ASM=ON")
+    Invoke-Native -FilePath $CMakeCommand -Arguments @("-S", $WrapperRoot, "-B", $BuildDir, "-A", $cmakePlatform, "-DCMAKE_BUILD_TYPE=Release", "-DSUP7Z_USE_X64_ASM=ON", "-DSUP7Z_USE_ARM64_ASM=ON", "-DSUP7Z_ENABLE_LTO=ON", "-DSUP7Z_RUST_PROFILE=release", "-DSUNPACK_BUILD_JOBS=$BuildJobs")
     # The old in-process wrapper DLL target is gone. Remove stale incremental-build artifacts
     # so a previous sunpack_sevenzip.dll cannot be mistaken for a current output.
     Remove-Item -LiteralPath (Join-Path $BuildDir "Release\sunpack_sevenzip.dll") -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath (Join-Path $ToolsRoot "sunpack_sevenzip.dll") -Force -ErrorAction SilentlyContinue
-    Invoke-Native -FilePath $CMakeCommand -Arguments @("--build", $BuildDir, "--config", "Release")
+    Invoke-Native -FilePath $CMakeCommand -Arguments @("--build", $BuildDir, "--config", "Release", "--parallel", [string]$BuildJobs)
     if ((Get-ProcessBuildArch) -eq $BuildArch) {
         Invoke-Native -FilePath $CTestCommand -Arguments @("--test-dir", $BuildDir, "-C", "Release", "--output-on-failure")
     } else {
@@ -605,8 +609,8 @@ function Build-ToastLibrary {
     Assert-PathExists -LiteralPath (Join-Path $SourceRoot "CMakeLists.txt") -Description "toast CMake project"
     $cmakePlatform = Get-CMakePlatform -BuildArch $BuildArch
     Reset-StaleCMakeBuildDir -SourceDir $SourceRoot -BuildDir $BuildDir -CMakePlatform $cmakePlatform
-    Invoke-Native -FilePath $CMakeCommand -Arguments @("-S", $SourceRoot, "-B", $BuildDir, "-A", $cmakePlatform, "-DCMAKE_BUILD_TYPE=Release")
-    Invoke-Native -FilePath $CMakeCommand -Arguments @("--build", $BuildDir, "--config", "Release")
+    Invoke-Native -FilePath $CMakeCommand -Arguments @("-S", $SourceRoot, "-B", $BuildDir, "-A", $cmakePlatform, "-DCMAKE_BUILD_TYPE=Release", "-DSUNPACK_TOAST_ENABLE_LTO=ON", "-DSUNPACK_BUILD_JOBS=$BuildJobs")
+    Invoke-Native -FilePath $CMakeCommand -Arguments @("--build", $BuildDir, "--config", "Release", "--parallel", [string]$BuildJobs)
     if ((Get-ProcessBuildArch) -eq $BuildArch) {
         Invoke-Native -FilePath $CTestCommand -Arguments @("--test-dir", $BuildDir, "-C", "Release", "--output-on-failure")
     } else {
@@ -788,7 +792,8 @@ function Invoke-NuitkaStandaloneBuild {
         "-m", "nuitka",
         "--standalone",
         "--assume-yes-for-downloads",
-        "--lto=yes",
+        "--lto=$(if ($FastBuild) { 'no' } else { 'yes' })",
+        "--jobs=$BuildJobs",
         "--output-dir=$OutputRoot",
         "--output-filename=$ExecutableName",
         "--windows-console-mode=$ConsoleMode",
@@ -989,16 +994,22 @@ Assert-CommandExists -Command "uv" -Description "uv dependency manager"
 Assert-PeMachine -LiteralPath $sevenZipPath -BuildArch $buildArch -Description "Bundled 7-Zip executable"
 
 if ($Clean) {
-    Write-Step "Cleaning build virtual environment"
-    Remove-IfExists -LiteralPath $venvPath
+    Write-Step "Cleaning native build outputs"
+    foreach ($output in @($rustTargetDir, $sevenZipWrapperBuildDir, $toastHostBuildDir)) {
+        $fullOutput = [IO.Path]::GetFullPath($output)
+        if (-not $fullOutput.StartsWith(([IO.Path]::GetFullPath($repoRoot) + "\"), [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Build output is outside the repository: $output"
+        }
+        Remove-IfExists -LiteralPath $fullOutput
+    }
 }
 
 Write-Step "Preparing build virtual environment"
 if (Test-Path -LiteralPath (Join-Path $venvPath "pyvenv.cfg")) {
     $venvConfig = Get-Content -LiteralPath (Join-Path $venvPath "pyvenv.cfg") -Raw
-    if ($venvConfig -match "include-system-site-packages\\s*=\\s*true") {
-        Write-Host "Recreating build environment without global site-packages." -ForegroundColor Yellow
-        Remove-IfExists -LiteralPath $venvPath
+    if ($venvConfig -match "include-system-site-packages\s*=\s*true") {
+        Write-Host "Disabling global site-packages in the existing virtual environment." -ForegroundColor Yellow
+        [IO.File]::WriteAllText((Join-Path $venvPath "pyvenv.cfg"), ($venvConfig -replace "include-system-site-packages\s*=\s*true", "include-system-site-packages = false"), [Text.UTF8Encoding]::new($false))
     }
 }
 $syncArguments = @("sync", "--locked", "--extra", "dev")
@@ -1029,6 +1040,7 @@ Invoke-Native -FilePath $maturinCommand -Arguments @(
     "build",
     "--locked",
     "--manifest-path", $nativeCargoToml,
+    "--interpreter", $venvPython,
     "--release",
     "--target", $rustTarget,
     "--target-dir", $rustTargetDir,

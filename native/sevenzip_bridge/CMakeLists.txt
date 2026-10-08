@@ -14,22 +14,26 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_C_STANDARD 99)
 
-set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
+option(SUP7Z_ENABLE_LTO "Enable final release link-time optimization" ON)
+set(SUP7Z_RUST_PROFILE "release" CACHE STRING "Cargo profile for the embedded ENC library")
+set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE ${SUP7Z_ENABLE_LTO})
+include("${CMAKE_CURRENT_SOURCE_DIR}/../cmake/SunpackParallelBuild.cmake")
 
 function(apply_release_optimizations target_name)
     if(MSVC)
         target_compile_options(${target_name} PRIVATE
-            $<$<CONFIG:Release>:/O2 /Oi /Ot /GL /Gy /Gw /GF>
+            $<$<CONFIG:Release>:/O2 /Oi /Ot /Gy /Gw /GF>
         )
         target_link_options(${target_name} PRIVATE
-            $<$<CONFIG:Release>:/LTCG /OPT:REF /OPT:ICF>
+            $<$<CONFIG:Release>:/OPT:REF /OPT:ICF>
+            $<$<AND:$<CONFIG:Release>,$<BOOL:${SUP7Z_ENABLE_LTO}>>:/LTCG>
         )
     else()
         target_compile_options(${target_name} PRIVATE
-            $<$<CONFIG:Release>:-O3 -flto -ffunction-sections -fdata-sections>
+            $<$<CONFIG:Release>:-O3 -ffunction-sections -fdata-sections>
         )
         target_link_options(${target_name} PRIVATE
-            $<$<CONFIG:Release>:-flto -Wl,--gc-sections>
+            $<$<CONFIG:Release>:-Wl,--gc-sections>
         )
     endif()
 endfunction()
@@ -353,11 +357,11 @@ if(WIN32)
     endif()
     set(SUP_ENC_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../sunpack_enc")
     set(SUP_ENC_TARGET_DIR "${CMAKE_CURRENT_BINARY_DIR}/enc-rust")
-    set(SUP_ENC_LIBRARY "${SUP_ENC_TARGET_DIR}/${SUP_ENC_RUST_TARGET}/release/sunpack_enc.lib")
+    set(SUP_ENC_LIBRARY "${SUP_ENC_TARGET_DIR}/${SUP_ENC_RUST_TARGET}/${SUP7Z_RUST_PROFILE}/sunpack_enc.lib")
     file(GLOB SUP_ENC_SOURCES CONFIGURE_DEPENDS "${SUP_ENC_ROOT}/src/*.rs")
     add_custom_command(OUTPUT "${SUP_ENC_LIBRARY}"
         COMMAND "${CMAKE_COMMAND}" -E env "RUSTFLAGS=-Ctarget-feature=+crt-static"
-            "${SUP_ENC_CARGO}" build --release --locked --package sunpack-enc
+            "${SUP_ENC_CARGO}" build --profile "${SUP7Z_RUST_PROFILE}" --locked --package sunpack-enc
             --manifest-path "${SUP_ENC_ROOT}/Cargo.toml"
             --target "${SUP_ENC_RUST_TARGET}" --target-dir "${SUP_ENC_TARGET_DIR}"
         DEPENDS ${SUP_ENC_SOURCES} "${SUP_ENC_ROOT}/Cargo.toml"

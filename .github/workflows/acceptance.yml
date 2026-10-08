@@ -44,12 +44,26 @@ jobs:
           cargo --version
           rustc -Vv
 
+      - name: Restore native build cache
+        uses: ./.github/actions/native-cache
+        with:
+          arch: x64
+          profile: ci
+          python-version: "3.11"
+          source-key: ${{ hashFiles('native/**', 'scripts/**', 'sunpack.manifest') }}
+
+      - name: Cache acceptance fixture generators
+        uses: actions/cache@v4
+        with:
+          path: .sunpack_test_tools
+          key: acceptance-tools-v1-${{ runner.os }}-x64-${{ hashFiles('scripts/setup_windows_dev.ps1') }}
+
       - name: Prepare acceptance environment
         shell: pwsh
         run: |
-          .\scripts\setup_windows_dev.ps1 -Arch x64
+          .\scripts\setup_windows_dev.ps1 -Arch x64 -BuildProfile ci -BuildJobs 4
 
       - name: Run acceptance tests
         shell: pwsh
         run: |
-          .\run_acceptance_tests.ps1 -NoWait -SkipEnvironmentRefresh -StepTimeoutSeconds 900
+          .\run_acceptance_tests.ps1 -NoWait -SkipEnvironmentRefresh -BuildProfile ci -ParallelWorkers 2 -StepTimeoutSeconds 900

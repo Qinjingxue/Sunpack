@@ -1,0 +1,77 @@
+name: Native build cache
+description: Restore architecture and profile specific Rust/CMake build state
+inputs:
+  arch:
+    required: true
+    description: Target architecture
+  profile:
+    required: true
+    description: Cargo profile
+  python-version:
+    required: true
+    description: Python ABI used by maturin
+  source-key:
+    required: true
+    description: Fingerprint of tracked native sources and build configuration
+outputs:
+  toolchain:
+    description: Rust, CMake, Visual Studio and MSVC versions
+    value: ${{ steps.toolchain.outputs.id }}
+runs:
+  using: composite
+  steps:
+    - name: Identify native toolchain
+      id: toolchain
+      shell: pwsh
+      run: |
+        $rust = ((rustc -Vv | Select-String '^commit-hash:') -replace '^commit-hash: ', '').Trim()
+        if ($LASTEXITCODE -ne 0 -or -not $rust) { throw 'Cannot identify rustc' }
+        $cmake = ((cmake --version | Select-Object -First 1) -replace '^cmake version ', '').Trim()
+        if ($LASTEXITCODE -ne 0 -or -not $cmake) { throw 'Cannot identify CMake' }
+        $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+        $vs = 'unregistered'
+        $versionFile = $null
+        if (Test-Path -LiteralPath $vswhere) {
+          $vsRoot = & $vswhere -latest -products '*' -property installationPath
+          if ($vsRoot) {
+            $candidate = Join-Path $vsRoot 'VC\Auxiliary\Build\Microsoft.VCToolsVersion.default.txt'
+            if (Test-Path -LiteralPath $candidate) {
+              $versionFile = Get-Item -LiteralPath $candidate
+              $vs = & $vswhere -latest -products '*' -property installationVersion
+            }
+          }
+        }
+        if (-not $versionFile) {
+          # Also support unregistered Build Tools and native ARM64 installations.
+          $versionFile = Get-ChildItem -Path @(
+            "${env:ProgramFiles(x86)}\Microsoft Visual Studio\*\*\VC\Auxiliary\Build\Microsoft.VCToolsVersion.default.txt",
+            "$env:ProgramFiles\Microsoft Visual Studio\*\*\VC\Auxiliary\Build\Microsoft.VCToolsVersion.default.txt"
+          ) -File -ErrorAction SilentlyContinue |
+            Sort-Object { [version](Get-Content -LiteralPath $_.FullName -Raw).Trim() } -Descending |
+            Select-Object -First 1
+        }
+        if (-not $versionFile) { throw 'Cannot identify MSVC Build Tools' }
+        $msvc = (Get-Content -LiteralPath $versionFile.FullName -Raw).Trim()
+        "id=$rust-$cmake-$vs-$msvc" >> $env:GITHUB_OUTPUT
+    - name: Restore Cargo and CMake cache
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          .cache/rust-target/${{ inputs.arch }}
+          .cache/native-source-times-${{ inputs.arch }}-${{ inputs.profile }}.json
+          native/sevenzip_bridge/build-${{ inputs.arch }}${{ inputs.profile == 'ci' && '-ci' || '' }}
+          native/toast_host/build-${{ inputs.arch }}${{ inputs.profile == 'ci' && '-ci' || '' }}
+        key: native-v1-${{ runner.os }}-${{ inputs.arch }}-${{ inputs.profile }}-py${{ inputs.python-version }}-${{ steps.toolchain.outputs.id }}-${{ hashFiles('native/Cargo.lock', 'uv.lock') }}-${{ inputs.source-key }}
+        restore-keys: |
+          native-v1-${{ runner.os }}-${{ inputs.arch }}-${{ inputs.profile }}-py${{ inputs.python-version }}-${{ steps.toolchain.outputs.id }}-${{ hashFiles('native/Cargo.lock', 'uv.lock') }}-
+          native-v1-${{ runner.os }}-${{ inputs.arch }}-${{ inputs.profile }}-py${{ inputs.python-version }}-${{ steps.toolchain.outputs.id }}-
+    - name: Restore unchanged source timestamps
+      shell: pwsh
+      env:
+        NATIVE_SOURCE_KEY: ${{ inputs.source-key }}
+        NATIVE_ARCH: ${{ inputs.arch }}
+        NATIVE_PROFILE: ${{ inputs.profile }}
+      run: |
+        .\scripts\restore_native_cache_times.ps1 -SourceKey $env:NATIVE_SOURCE_KEY -Arch $env:NATIVE_ARCH -BuildProfile $env:NATIVE_PROFILE
