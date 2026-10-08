@@ -752,8 +752,6 @@ try {
         "--dist", "worksteal",
         "tests/integration", "tests/real",
         "--ignore", "tests/integration/test_disk_full_pause_resume.py",
-        # Optional SSE reference tests require an external JAR; run them explicitly when available.
-        "--ignore", "tests/integration/test_enc_parallel_worker.py",
         "--durations=20"
     )
     Invoke-TestStep -Label "Parallel administrator VHD disk-full tests" -KeepElevationIfAdministrator -Command @(
