@@ -93,11 +93,14 @@ async def _run_once(
     passwords: list[str],
     cold_start_seconds: float,
     timeout: float,
+    case_key: str | None = None,
 ) -> dict[str, Any]:
     root = workspace.work / "watch"
+    if case_key:
+        root = root / case_key
     root.mkdir(parents=True, exist_ok=True)
     destination = root / source.name
-    state_path = workspace.work / "state.json"
+    state_path = workspace.work / (f"{case_key}.state.json" if case_key else "state.json")
 
     config = load_config()
     config["cli"] = {**(config.get("cli") or {}), "quiet": True, "verbose": False}

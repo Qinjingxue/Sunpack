@@ -28,6 +28,7 @@ uv run --locked python -m benchmarks reader embedded-scan --generate-plan5-mib 5
 uv run --locked python -m benchmarks scan hotspots . --mode full --json-out benchmarks/results/scan-hotspots.json
 uv run --locked python -m benchmarks extraction format-matrix --runs 5 --json-out benchmarks/results/extraction-benchmark.json
 uv run --locked python -m benchmarks extraction cli-format-matrix --runs 3 --prefetch on --json-out benchmarks/results/cli-format-matrix-prefetch-on.json
+uv run --locked python -m benchmarks extraction cli-format-matrix --format zipx --format lz4 --format enc --runs 3 --prefetch on --json-out benchmarks/results/cli-zipx-lz4-enc-prefetch-on.json
 uv run --locked python -m benchmarks extraction cli-format-matrix --format zipx --format lz4 --runs 3 --prefetch on --json-out benchmarks/results/cli-zipx-lz4-prefetch-on.json
 uv run --locked python -m benchmarks extraction cli-format-matrix --format zipx --format lz4 --runs 3 --prefetch off --json-out benchmarks/results/cli-zipx-lz4-prefetch-off.json
 cmake --build native/sevenzip_bridge/build-probe --config Release --target sunpack_sevenzip_worker
@@ -48,6 +49,8 @@ uv run --locked python -m benchmarks extraction worker-small-file-scheduling --j
 uv run --locked python -m benchmarks extraction worker-single-file-write --baseline-worker-path C:\path\to\before\sunpack_sevenzip_worker.exe --candidate-worker-path C:\path\to\after\sunpack_sevenzip_worker.exe --payload-gib 1 --writer-threads 4 --runs 3 --warmups 1
 uv run --locked python -m benchmarks extraction worker-resource-pressure --modes cpu,io --capacities 1,2,4 --jobs 4
 uv run --locked python -m benchmarks watch real-file C:\path\to\sample.jpg --wrong-password-count 100 --password '⑨' --json-out benchmarks/results/watch-real-file.json
+uv run --locked python -m benchmarks watch cli-format-matrix --runs 3 --json-out benchmarks/results/watch-cli-format-matrix.json
+uv run --locked python -m benchmarks watch cli-format-matrix --format zipx --format lz4 --runs 3 --json-out benchmarks/results/watch-cli-zipx-lz4-baseline.json
 uv run --locked python -m benchmarks watch arrival-matrix C:\path\to\sample.jpg --quiet-values 0,1.25 --runs 2 --wrong-password-count 100 --password '⑨' --json-out benchmarks/results/watch-arrival-matrix.json
 uv run --locked python -m benchmarks watch split-arrival C:\path\to\archive.7z.001 C:\path\to\archive.7z.002 C:\path\to\archive.7z.003 C:\path\to\archive.7z.004 --quiet-values 0,1.25 --chunk-mib 4 --chunk-delay-ms 50 --json-out benchmarks/results/watch-split-arrival.json
 uv run --locked python -m benchmarks watch format-matrix --runs 3 --warmups 1 --json-out benchmarks/results/watch-format-matrix.json
@@ -207,18 +210,22 @@ catalog. The full interpretation, machine identity, and recorded v0.7.0 result
 are documented in [English](../docs/benchmark_worker_vs_7z_300m.md) and
 [简体中文](../docs/zh-CN/benchmark_worker_vs_7z_300m.md).
 
-`extraction cli-format-matrix` includes ZIPX (ZIP using LZMA compression) and
-LZ4 in its fixed 300 MiB full-format corpus. ZIPX is rebuilt from the existing
-payload members; LZ4 is one frame containing the concatenated 300 MiB raw
-members, so both cases produce exactly 300 MiB of output. The LZ4 corpus writer
-is part of `sunpack_sevenzip_lz4`; build it with
+Both `extraction cli-format-matrix` and `watch cli-format-matrix` use the fixed
+300 MiB `few_large` payload. ZIPX is rebuilt from the existing payload members;
+LZ4 is one frame containing the concatenated 300 MiB raw members; ENC is an
+authenticated SSE v4 stream generated from a deterministic 300 MiB payload
+with the reference Java encoder. Each case validates exactly 300 MiB of output.
+ENC fixture generation requires Java 17+, `javac`, and the repository's
+`reference/implementations/SSEFilePC/.../ssefenc.jar`; the fixture password is
+`sunpack-test`. The LZ4 corpus writer is part of `sunpack_sevenzip_lz4`; build it with
 `cmake --build native/sevenzip_bridge/build-x64 --config Release --target sunpack_sevenzip_lz4`
 when it is missing. `--prefetch on|off` controls the native worker's input
 prefetch setting before the persistent worker starts. Run the ZIPX/LZ4 command
 once per setting in separate benchmark processes for an apples-to-apples A/B.
 The worker disables prefetch by default when the request's `format_hint` is
 `lz4` or `tar.lz4`; an explicit `SUNPACK_SEVENZIP_PREFETCH=1` still enables it
-for comparison runs.
+for comparison runs. To compare with revisions that predate ENC support, select
+only ZIPX and LZ4 in both CLI and watch commands.
 
 `extraction worker-small-file-scheduling` measures the worker-internal thread
 scheduler under a deliberately adversarial many-small-file workload. It creates

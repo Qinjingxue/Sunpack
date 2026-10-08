@@ -61,6 +61,7 @@ FORMATS = (
     "tzst",
     "zipx",
     "lz4",
+    "enc",
 )
 
 DEFAULT_WORKER = (
@@ -72,10 +73,20 @@ DEFAULT_WORKER = (
     / "sunpack_sevenzip_worker.exe"
 )
 DEFAULT_LZ4_TOOL = ROOT / "native" / "sevenzip_bridge" / "build-x64" / "Release" / "sunpack_sevenzip_lz4.exe"
+ENC_FIXTURE_SOURCE = ROOT / "tests" / "helpers" / "EncV4Fixtures.java"
+ENC_REFERENCE_JAR = (
+    ROOT
+    / "reference"
+    / "implementations"
+    / "SSEFilePC"
+    / "S.S.E. File Encryptor for PC"
+    / "ssefenc.jar"
+)
+ENC_FIXTURE_PASSWORD = "sunpack-test"
 
 
 def _ensure_special_archives(lz4_tool: Path, timeout_seconds: float) -> None:
-    """Build one real ZIPX and one real LZ4 frame from the fixed 300 MiB inputs."""
+    """Build ZIPX and LZ4 inputs from the fixed 300 MiB workload."""
     zipx_dir = CORPUS_ROOT / "few_large-zipx"
     zipx_path = zipx_dir / "few_large.zipx"
     if not zipx_path.is_file():
@@ -151,6 +162,74 @@ def _ensure_special_archives(lz4_tool: Path, timeout_seconds: float) -> None:
             shutil.rmtree(source, ignore_errors=True)
 
 
+def _ensure_enc_archive(timeout_seconds: float) -> None:
+    """Generate one authenticated 300 MiB ENC stream using the reference encoder."""
+    enc_dir = CORPUS_ROOT / "few_large-enc"
+    enc_path = enc_dir / "large.enc"
+    temporary = enc_dir / "large.enc.tmp"
+    if enc_path.is_file() and enc_path.stat().st_size > PAYLOAD_BYTES:
+        temporary.unlink(missing_ok=True)
+        return
+    if not ENC_FIXTURE_SOURCE.is_file() or not ENC_REFERENCE_JAR.is_file():
+        raise FileNotFoundError(
+            "ENC benchmark fixture requires tests/helpers/EncV4Fixtures.java and "
+            "the reference ssefenc.jar"
+        )
+    java = shutil.which("java")
+    javac = shutil.which("javac")
+    if not java or not javac:
+        raise FileNotFoundError("ENC benchmark fixture requires Java 17+ and javac")
+
+    fixture_root = CORPUS_ROOT.parent / "enc-fixture"
+    classes = fixture_root / "classes"
+    staging = fixture_root / "staging"
+    shutil.rmtree(staging, ignore_errors=True)
+    classes.mkdir(parents=True, exist_ok=True)
+    staging.mkdir(parents=True, exist_ok=True)
+    class_file = classes / "EncV4Fixtures.class"
+    if not class_file.is_file() or class_file.stat().st_mtime < ENC_FIXTURE_SOURCE.stat().st_mtime:
+        compiled = subprocess.run(
+            [javac, "--release", "17", "-cp", str(ENC_REFERENCE_JAR), "-d", str(classes), str(ENC_FIXTURE_SOURCE)],
+            cwd=ROOT,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            timeout=timeout_seconds,
+            check=False,
+        )
+        if compiled.returncode != 0:
+            raise RuntimeError(f"cannot compile ENC fixture generator: {compiled.stderr[-2000:].decode(errors='replace')}")
+
+    try:
+        generated = subprocess.run(
+            [
+                java,
+                "-Xmx2g",
+                "-cp",
+                os.pathsep.join((str(classes), str(ENC_REFERENCE_JAR))),
+                "EncV4Fixtures",
+                str(staging),
+                "0",
+                "300",
+            ],
+            cwd=ROOT,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            timeout=timeout_seconds,
+            check=False,
+        )
+        generated_path = staging / "large.enc"
+        if generated.returncode != 0 or not generated_path.is_file():
+            raise RuntimeError(f"cannot generate 300 MiB ENC corpus: {generated.stderr[-2000:].decode(errors='replace')}")
+        enc_dir.mkdir(parents=True, exist_ok=True)
+        temporary.unlink(missing_ok=True)
+        shutil.move(str(generated_path), temporary)
+        temporary.replace(enc_path)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+
+
 def _archive_for(format_name: str) -> Path:
     case_root = CORPUS_ROOT / f"few_large-{format_name}"
     if not case_root.is_dir():
@@ -173,6 +252,10 @@ def _validate_corpus(selected_formats: tuple[str, ...]) -> dict[str, Path]:
         if archive.stat().st_size <= 0:
             raise RuntimeError(f"archive is empty: {archive}")
     return archives
+
+
+def _password_args(format_name: str) -> list[str]:
+    return ["--password", ENC_FIXTURE_PASSWORD] if format_name == "enc" else []
 
 
 def _patch_worker_path(worker_path: Path):
@@ -245,6 +328,7 @@ async def _run_cli_once(
     output: Path,
     profiler: RequestRuntimeProfiler,
     timeout_seconds: float,
+    format_name: str,
 ) -> dict[str, Any]:
     from sunpack.runtime.cli.cli import async_main
 
@@ -257,6 +341,7 @@ async def _run_cli_once(
         "--no-flatten",
         "--no-builtin-pw",
         "--no-dir-pw",
+        *_password_args(format_name),
         "--quiet",
         "--no-pause",
         "-o",
@@ -307,6 +392,8 @@ async def _run(args: argparse.Namespace) -> int:
     selected_formats = tuple(args.formats or FORMATS)
     if {"zipx", "lz4"}.intersection(selected_formats):
         _ensure_special_archives(args.lz4_tool.resolve(), args.timeout)
+    if "enc" in selected_formats:
+        _ensure_enc_archive(args.timeout)
     archives = _validate_corpus(selected_formats)
     worker_path = args.worker_path.resolve()
     if not worker_path.is_file():
@@ -362,6 +449,7 @@ async def _run(args: argparse.Namespace) -> int:
                                             "--no-flatten",
                                             "--no-builtin-pw",
                                             "--no-dir-pw",
+                                            *_password_args(format_name),
                                             "--quiet",
                                             "--no-pause",
                                             "-o",
@@ -402,6 +490,7 @@ async def _run(args: argparse.Namespace) -> int:
                                 output,
                                 profiler,
                                 args.timeout,
+                                format_name,
                             )
                             warmup_rows.append(
                                 {
@@ -424,7 +513,13 @@ async def _run(args: argparse.Namespace) -> int:
                     shutil.rmtree(output, ignore_errors=True)
                     output.mkdir(parents=True, exist_ok=True)
                     try:
-                        row = await _run_cli_once(archive, output, profiler, args.timeout)
+                        row = await _run_cli_once(
+                            archive,
+                            output,
+                            profiler,
+                            args.timeout,
+                            format_name,
+                        )
                         row.update(
                             {
                                 "format": format_name,
@@ -434,6 +529,12 @@ async def _run(args: argparse.Namespace) -> int:
                                 "payload_bytes": PAYLOAD_BYTES,
                             }
                         )
+                        if row["passed"] and row["output"]["total_bytes"] != PAYLOAD_BYTES:
+                            row["passed"] = False
+                            row["error"] = (
+                                f"expected {PAYLOAD_BYTES} output bytes, "
+                                f"got {row['output']['total_bytes']}"
+                            )
                         all_rows.append(row)
                         print(
                             f"  run {run}/{args.runs}: {row['cli_elapsed_seconds']:.3f}s "
