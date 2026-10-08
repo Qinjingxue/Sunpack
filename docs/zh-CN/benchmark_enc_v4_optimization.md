@@ -1,5 +1,177 @@
 # ENC v4 后续优化
 
+## 2026-10-08 第六轮：流水实验收口与 SHACAL SHA-NI
+
+基线为干净的 `6b9cbb7e`，复用第五轮对应的最终 worker，并在修改前
+保存本轮 baseline release examples。结果目录为
+`benchmarks/results/enc-v4-optimization/20261008-round6`。
+最终生产只保留 SHACAL x64 两块 SHA-NI；MAC/CTR 流水及 AES CTR
+单线程策略均撤回，`lib.rs` 与本轮基线一致。writer 只做诊断。
+
+### MAC(next) 与 CTR(current)：完成真实重叠，撤回生产实现
+
+实验使用两个 256 KiB Zeroizing buffer。先认证首块，之后先读下一块，
+再临时向既有 broker 借一个 extra credit，用现有 Rayon executor
+执行两个独立任务：单线程 MAC(next) 与单线程 CTR(current)。两者完成
+立即归还额度，再调用原有 output writer，交换两个 buffer。
+没有新增 pool、IO thread、derived-key IPC 或 ENC→ZIP 特殊路径。
+
+只对多 batch 的 AES 使用流水；慢 cipher 保留原来的 CTR 并行。
+没有 extra credit 或 executor 只有一个线程时串行执行；progress、
+read/write 均不持有额外额度。MAC 顺序涵盖全部 ciphertext/recovery，
+quick proof 的 32B 不写出，CTR offset 保持原来的完整 counter 语义。
+实验通过全算法多 buffer、MAC/恢复尾部损坏、取消、截断测试。
+最终删除生产流水和额外 buffer，实验源、patch、二进制只存结果目录。
+
+Windows x64 / i9-13980HX / release。AES 使用独立 Java/SSE 64 MiB
+输入。原生 null-sink 包含缓存读取、MAC、CTR，排除 KDF 和写盘；
+固定 affinity `0,2,4,6`、executor 4，每进程 11 轮排除前 2 轮，
+正反顺序 4 次取 36 个样本中位数。所有表格单位为 **MiB/s**：
+
+| 总额度 | 原路径 | 双 buffer | 变化 |
+| --- | ---: | ---: | ---: |
+| 1 | 2146.20 | 2136.01 | -0.5% |
+| 2 | 1981.30 | 2466.19 | +24.5% |
+| 4 | 2176.64 | 1880.80 | -13.6% |
+
+不设置 affinity/executor 的复测为每进程 21 轮、排除 2 轮、正反顺序
+4 次（76 样本）：额度 1 为 1991.73→2006.96，额度 2 为
+1684.97→2179.40，额度 4 为 1342.84→2095.71。真实重叠可以改善
+某些调度条件下的结果，但没有达到 3.5～4 GiB/s 的筛选目标。
+不能把不同 executor/affinity 组的绝对值直接比较。
+
+真实持久 worker 包含最终 KDF、MAC、CTR、写盘；每档预热一次，
+正反顺序交替 21 轮，总 CPU 容量 4，不限制 Rayon pool。每轮在
+计时外用 Rust 验证全部输出 size/CRC32，foreground/watch 交错：
+
+| 自然调度 / 任务数 | 原路径 | 双 buffer | 变化 |
+| --- | ---: | ---: | ---: |
+| 第一组 / 1 | 1039.37 | 1470.14 | +41.4% |
+| 第一组 / 8 | 2138.98 | 2093.15 | -2.1% |
+| 加入串行对照后 / 1 | 952.45 | 1250.50 | +31.3% |
+| 加入串行对照后 / 8 | 2803.68 | 2540.60 | -9.4% |
+
+同一组额外构建了“MAC→AES CTR，CTR 始终单线程”的对照：单文件
+1308.61、八文件 2394.98。流水单文件反而比这一串行对照低 **4.4%**，
+说明原路径的改善不能全部归因于计算阶段重叠。串行 CTR 策略也导致
+本组八文件相对原路径回退 **14.6%**，因此同样不保留。
+
+另测固定 affinity、总容量 2：单文件 1375.41→1530.46（+11.3%），
+八文件 2221.00→2126.91（-4.2%）。按照本轮“稳定大收益且多任务
+不能明显回退”的要求，撤回这套流水。它与上一轮并行 MAC 是不同
+实验；这里实测了真正同时运行的 MAC/CTR。原因中的调度/缓存影响
+尚未单独 profile，不将其写成已证实的唯一瓶颈。
+
+原始文件：`pipeline-null-paired.json`、`pipeline-null-natural.json`、
+`pipeline-worker-natural.json`、`pipeline-worker-controls-natural.json`、
+`pipeline-worker-credit2.json`。这是本机、256 KiB 批次、既有共享
+executor 的结果，不外推所有 CPU、文件大小或更复杂的流水设计。
+
+### SHACAL：保留两块 SHA-NI，四块没有额外收益
+
+x64 检测 SHA/SSSE3/SSE4.1，使用 SHA-NI 交错处理两个独立 block；
+单个完整尾块使用同一 const-generic kernel。SHACAL 不做 SHA 的
+feed-forward，输入输出保持大端。复用 ARM 已有的 64 轮展开函数，
+每个 cipher 只展开一次；原始 key 和固定 256B schedule 随 cipher
+清零。不支持所需 ISA 的机器复用原来 `compress256` 的 fallback。
+没有新增 heap、pool 或不同的密码探测链路。
+
+指令语义参考 Rust 官方
+[`_mm_sha256rnds2_epu32`](https://doc.rust-lang.org/core/arch/x86_64/fn._mm_sha256rnds2_epu32.html)。
+新增 16 组随机 key、0～33 块、非对齐与尾部保护的独立 SHA compression
+对照；保留全部官方 ENC vectors、counter carry/offset 测试。
+
+纯 CTR 每轮 64 MiB、256 KiB batch，affinity `0,2,4,6`、executor 4；
+9 轮排除 2 轮，正反顺序 4 次，共 28 个有效样本：
+
+| 算法 / 额度 | 基线 | 两块 | 四块 | 两块 / 基线 |
+| --- | ---: | ---: | ---: | ---: |
+| SHACAL / 1 | 968.08 | 1386.83 | 1376.20 | 1.43× |
+| SHACAL / 4 | 3159.11 | 4326.50 | 4237.49 | 1.37× |
+| C4 / 1 | 320.30 | 358.10 | 360.00 | 1.12× |
+| C4 / 4 | 1054.01 | 1113.92 | 1122.94 | 1.06× |
+
+两块在 SHACAL 自身两档均略快、同时状态数更少，因此选择两块，
+不保留四块开关。记录为 `shacal-ways-paired.json`。
+
+最终完整认证 null-sink 使用独立 Java SHACAL 16 MiB、C4 8 MiB，
+同样 affinity/executor；11 轮排除 2 轮、正反顺序 4 次（36 样本）：
+
+| 算法 / 额度 | 基线 | 最终版 | 倍率 |
+| --- | ---: | ---: | ---: |
+| SHACAL / 1 | 633.28 | 984.38 | 1.55× |
+| SHACAL / 4 | 1419.72 | 1774.64 | 1.25× |
+| C4 / 1 | 280.10 | 340.72 | 1.22× |
+| C4 / 4 | 763.27 | 905.05 | 1.19× |
+
+最终真实 worker 总容量 4、同样 affinity，预热一次、交替 11 轮，
+计时包括 KDF/写盘，输出验证在计时外：
+
+| 算法 / 同批任务数 | 基线 | 最终版 | 变化 |
+| --- | ---: | ---: | ---: |
+| SHACAL 16 MiB / 1 | 592.47 | 644.89 | +8.8% |
+| SHACAL 16 MiB / 8 | 1124.81 | 1220.12 | +8.5% |
+| C4 8 MiB / 1 | 304.67 | 305.05 | +0.1% |
+| C4 8 MiB / 8 | 563.74 | 585.14 | +3.8% |
+| AES 64 MiB / 1 | 1277.24 | 1299.19 | +1.7% |
+| AES 64 MiB / 8 | 2844.12 | 2772.55 | -2.5% |
+
+最终 AES 路径源码完全一致，本组小波动不算 AES 提速或已证实退化。
+SHACAL 的纯计算收益不能当成所有文件的端到端收益；C4 没有大幅
+真实 worker 提升。记录为 `decrypt-final-paired.json`、
+`worker-final-paired.json`。
+
+### AES writer copy：诊断完成，不改生产接口
+
+复用已有 `SUP7Z_ENABLE_WRITER_PROBE` build；同一个二进制分别以
+`memory`、`memory-nocopy`、`real` 启动独立持久 worker。前两者
+保留解码、认证、KDF、writer staging/queue/capacity 生命周期，但
+不调用实际 WriteFile；nocopy 另外跳过 staging memcpy。
+每个模式预热一次、交替 21 轮；总容量 4、AES 64 MiB。
+
+| 调度 / 任务数 | memory | memory-nocopy | real | nocopy / memory |
+| --- | ---: | ---: | ---: | ---: |
+| 自然 / 1 | 1015.16 | 954.45 | 975.64 | 0.94× |
+| 自然 / 8 | 2310.27 | 2967.68 | 2421.00 | 1.28× |
+| affinity / 1 | 1317.60 | 1406.49 | 1329.39 | 1.07× |
+| affinity / 8 | 3596.32 | 3607.33 | 2745.00 | 1.00× |
+
+固定核心的单文件差值不到 10%，多文件自然调度的 28% 没有在
+固定核心下复现，不满足稳定超过 30% 再考虑耦合改造的标准。
+因此保留现有 Rust buffer→C++ writer memcpy。
+自然调度 probe 的 copy 累计中位数约单任务 5.35ms、八任务 29.39ms；
+各 job/thread phase 可能重叠，不能直接累加成整个 batch wall time。
+
+扩展原有 `worker_enc_batch_ab` 的 `--writer-mode LABEL=MODE`，显式
+标记无输出诊断。memory 模式不校验输出 CRC，检查成功状态、报告
+字节数、probe 激活且没有输出文件；real 模式保持完整 Rust size/CRC
+验证。它们不是能输出明文的 zero-copy 实现，绝对吞吐也不能当成
+真实落盘性能。生产默认不编译 probe。
+记录为 `writer-memory-paired.json`、`writer-memory-affinity.json`。
+
+所有文件使用缓存输入、真实输出不 fsync；这些是本机计算/缓存写入
+对照，不能解释成冷盘持久吞吐。Python 只调度和处理 JSON 指标，
+数据生成、解密及输出校验继续由 Java/Rust/native 完成。
+
+### 验证与 ARM64 范围
+
+最终 ENC release tests：默认 feature 17 个生产测试通过；
+`parallel-kdf,parallel-decrypt` 18 个通过；两种配置各有 9 个独立
+example 对照通过。x64 worker（含 standalone CRT 检查）及 `.venv`
+Rust 扩展重新构建。真实 worker 的独立 Java 大载荷测试加入 algo 8，
+覆盖 1/2/3/5/9 额度、1/3 executor、损坏/错误密码、CLI/watch、
+伪装载体与非对齐 concat ranges/缺尾；递归嵌套继续走普通输出发现。
+最终 Python 回归 **232 passed、2 skipped（34.90s）**。两项跳过为
+真实 watch 下载测试缺少已配置的隔离 WatchBroker 测试环境；未为
+性能修改安装或切换系统监控服务。覆盖 password scheduler/failure/
+lifecycle、ENC pipeline、全部 worker 大载荷、普通递归解密与错误
+密码路径。`cargo fmt --check`、`git diff --check` 通过。
+
+遵守此前 ARM64 只修改、不在本机验证的要求，本轮不进行 ARM64
+编译、测试或性能验证；已有 ARM backend 不增加新设计。Windows
+ARM64 十算法真机 benchmark 仍待具备硬件环境，不能依据本轮 x64
+数据宣称 ARM 性能已验证。Twofish、密码探测及 ENC→ZIP 架构不改。
+
 ## 2026-10-08 第五轮：Twofish 交错、MAC 实验与 ARM64 后端
 
 基线为干净的 `dc208f41`。本轮保留 Twofish 八块交错和 ARM64 后端，

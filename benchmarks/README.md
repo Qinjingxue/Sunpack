@@ -378,8 +378,19 @@ uv run python -m benchmarks.scenarios.reader_enc_single_candidate_ab --baseline 
 The worker comparison expects an independently generated `large.expected` beside
 each `large.enc`, validates native size/CRC outside the timer, and includes final
 KDF, authentication and real output writes. Pass several `LABEL=PATH` workers to
-compare prebuilt stream-buffer sizes. `--affinity 0,2,4,6` optionally holds the
+compare prebuilt stream policies. `--affinity 0,2,4,6` optionally holds the
 benchmark workers to the same logical CPUs; production scheduling is unaffected.
+
+For ENC writer copy diagnosis, build the worker with
+`SUP7Z_ENABLE_WRITER_PROBE=ON` and pass the same binary as `memory=PATH` and
+`nocopy=PATH`, adding `--writer-mode memory=memory --writer-mode nocopy=memory-nocopy`.
+These diagnostic sinks retain decoder/MAC/KDF and writer queueing but create no
+output files; `memory-nocopy` additionally skips the staging memcpy. They cannot
+validate output CRC and are explicitly marked as diagnostics. A `real=PATH`
+worker with `--writer-mode real=real` provides the validated write reference.
+Compare alternating repeated trials under both natural scheduling and affinity;
+profile phase sums overlap across jobs and cannot be added to wall time.
+
 The scheduler comparison loads only the old scheduler from the specified local
 Git revision; both sides use the installed native extension and current worker.
 Use `--origin watch` for the watch submission path. Pure AES diagnostics use the

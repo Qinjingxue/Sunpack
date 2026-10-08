@@ -1,13 +1,15 @@
 """Paired ENC worker measurements: authenticated reads, CTR and real writes.
 
-Prebuild each worker with the desired Rust stream buffer and pass LABEL=PATH.
+Prebuild each worker with the desired Rust stream policy and pass LABEL=PATH.
 Python only schedules jobs/metrics; Rust validates output CRC outside the timer.
+Writer memory modes require a probe build and intentionally produce no files.
 """
 from __future__ import annotations
 
 import argparse
 import asyncio
 import json
+import os
 from pathlib import Path
 import statistics
 import tempfile
@@ -19,11 +21,18 @@ from sunpack.pipeline.extraction.internal.sevenzip.sevenzip_runner import _Async
 
 
 async def run(args):
+    modes = dict(spec.split("=", 1) for spec in args.writer_mode)
+    labels = {spec.split("=", 1)[0] for spec in args.worker}
+    if len(modes) != len(args.writer_mode) or not modes.keys() <= labels:
+        raise ValueError("writer modes require unique existing worker labels")
+    if any(mode not in {"real", "memory", "memory-nocopy"} for mode in modes.values()):
+        raise ValueError("writer modes: real, memory, memory-nocopy")
     report = {"method": "Persistent workers; alternating order; one warmup; cached inputs; "
-              "no fsync; output size/CRC validation and cleanup outside timer; KDF included.",
+              "no fsync; real outputs: size/CRC validation and cleanup outside timer; "
+              "memory modes: no output files or CRC validation; KDF included.",
               "capacity": args.capacity, "concurrency": args.concurrency, "rounds": args.rounds,
               "logical_cpu_affinity": args.affinity,
-              "workers": {}, "results": []}
+              "writer_modes": modes, "workers": {}, "results": []}
     workers = {}
     work_root = Path("benchmarks/.work/enc").resolve()
     work_root.mkdir(parents=True, exist_ok=True)
@@ -36,7 +45,20 @@ async def run(args):
             process = _AsyncNativeWorkerProcess(report["workers"][label], None,
                                                {"thread_capacity": args.capacity})
             workers[label] = process
-            await process.start()
+            mode = modes.get(label)
+            saved_env = {name: os.environ.get(name) for name in
+                         ("SUNPACK_WRITER_PROBE", "SUNPACK_WRITER_PROBE_MODE")}
+            try:
+                if mode:
+                    os.environ["SUNPACK_WRITER_PROBE"] = "1"
+                    os.environ["SUNPACK_WRITER_PROBE_MODE"] = mode
+                await process.start()
+            finally:
+                for name, value in saved_env.items():
+                    if value is None:
+                        os.environ.pop(name, None)
+                    else:
+                        os.environ[name] = value
             if args.affinity:
                 psutil.Process(process.process.pid).cpu_affinity(args.affinity)
         for path in args.path:
@@ -51,6 +73,7 @@ async def run(args):
                         labels.reverse()
                     for label in labels:
                         worker = workers[label]
+                        memory_sink = modes.get(label, "real").startswith("memory")
                         with tempfile.TemporaryDirectory(prefix="worker-enc-", dir=work_root) as temp:
                             output = Path(temp)
                             results, errors, events = {}, [], []
@@ -80,19 +103,30 @@ async def run(args):
                             elapsed = (time.perf_counter() - started) * 1000
                             assert not errors and len(results) == width, (errors, results)
                             for result in results.values():
-                                assert result["status"] == "ok" and result["verified_manifest"]["validated"], result
+                                assert result["status"] == "ok", result
+                                if not memory_sink:
+                                    assert result["verified_manifest"]["validated"], result
                                 assert result["bytes_written"] == expected["size"], result
-                            actual = compute_directory_crc_manifest(str(output), width + 1)
-                            assert actual["status"] == "ok" and not actual.get("truncated"), actual
-                            assert len(actual["files"]) == width
-                            assert all(row["size"] == expected["size"] and row["crc32"] == expected["crc32"]
-                                       for row in actual["files"]), actual
+                            if memory_sink:
+                                assert not any(p.is_file() for p in output.rglob("*")), "diagnostic sink wrote files"
+                            else:
+                                actual = compute_directory_crc_manifest(str(output), width + 1)
+                                assert actual["status"] == "ok" and not actual.get("truncated"), actual
+                                assert len(actual["files"]) == width
+                                assert all(row["size"] == expected["size"] and row["crc32"] == expected["crc32"]
+                                           for row in actual["files"]), actual
                             memory = psutil.Process(worker.process.pid).memory_info()
                             row = {"trial": trial, "ms": elapsed,
                                    "mib_s": expected["size"] * width / (1024**2) * 1000 / elapsed,
                                    "rss_mib": memory.rss / 1024**2,
                                    "peak_rss_mib": getattr(memory, "peak_wset", memory.rss) / 1024**2,
+                                   "diagnostic_only_no_output": memory_sink,
+                                   "writer_profiles": [json.loads(line.removeprefix("WRITER_PROBE "))
+                                                       for line in worker.take_stderr()
+                                                       if line.startswith("WRITER_PROBE ")],
                                    "cpu_events": events}
+                            if memory_sink and trial == -1 and not row["writer_profiles"]:
+                                raise RuntimeError("memory sinks require a worker built with writer probes")
                             if trial >= 0:
                                 samples[label].append(row)
                 entry = {"path": str(path), "bytes": expected["size"], "concurrency": width,
@@ -113,6 +147,7 @@ async def run(args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--worker", action="append", required=True, help="LABEL=PATH")
+    parser.add_argument("--writer-mode", action="append", default=[], help="LABEL=real|memory|memory-nocopy; probe builds only")
     parser.add_argument("--path", type=Path, action="append", required=True)
     parser.add_argument("--password", default="sunpack-test")
     parser.add_argument("--capacity", type=int, default=4)
