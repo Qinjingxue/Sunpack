@@ -207,7 +207,8 @@ def test_rar_fast_verifier_reads_complete_raw_split_stream(tmp_path):
 def test_verifier_chain_reaches_structured_rar_without_format_hint(tmp_path, sfx):
     first = tmp_path / ("archive.part1.exe" if sfx else "archive.part1.rar")
     second = tmp_path / "archive.part2.rar"
-    first.write_bytes((make_minimal_pe(b"WinRAR SFX") if sfx else b"") + _rar5_encryption_header_fixture())
+    pe_prefix = make_minimal_pe(b"WinRAR SFX") if sfx else b""
+    first.write_bytes(pe_prefix + _rar5_encryption_header_fixture())
     second.write_bytes(b"Rar!\x1a\x07\x01\x00trailing-volume")
     archive_input = {
         "kind": "archive_input",
@@ -215,7 +216,8 @@ def test_verifier_chain_reaches_structured_rar_without_format_hint(tmp_path, sfx
         "open_mode": "sfx_with_volumes" if sfx else "native_volumes",
         "volume_style": "rar_sfx_part" if sfx else "rar_part",
         "parts": [
-            {"path": str(first), "role": "first", "volume_number": 1, "canonical_name": first.name},
+            {"path": str(first), "role": "first", "volume_number": 1,
+             "canonical_name": first.name, "start": len(pe_prefix)},
             {"path": str(second), "role": "member", "volume_number": 2, "canonical_name": second.name},
         ],
     }

@@ -739,7 +739,7 @@ try {
 
     Invoke-TestStep -Label "Parallel CLI, unit, and functional tests" -Command @(
         $python,
-        "-m", "pytest", "-q",
+        "-m", "pytest", "-q", "-rs",
         "-n", [string]$ParallelWorkers,
         "--dist", "worksteal",
         "tests/cli", "tests/unit", "tests/functional",
@@ -747,16 +747,18 @@ try {
     )
     Invoke-TestStep -Label "Parallel integration and real tests" -Command @(
         $python,
-        "-m", "pytest", "-q",
+        "-m", "pytest", "-q", "-rs",
         "-n", [string]$ParallelWorkers,
         "--dist", "worksteal",
         "tests/integration", "tests/real",
         "--ignore", "tests/integration/test_disk_full_pause_resume.py",
+        # Optional SSE reference tests require an external JAR; run them explicitly when available.
+        "--ignore", "tests/integration/test_enc_parallel_worker.py",
         "--durations=20"
     )
     Invoke-TestStep -Label "Parallel administrator VHD disk-full tests" -KeepElevationIfAdministrator -Command @(
         $python,
-        "-m", "pytest", "-q",
+        "-m", "pytest", "-q", "-rs",
         "-n", [string]$ParallelWorkers,
         "--dist", "worksteal",
         "tests/integration/test_disk_full_pause_resume.py",
