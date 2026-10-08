@@ -385,10 +385,11 @@ impl Decoder {
         mac.update(&self.keys.nonce);
         mac.update(&self.header.bytes);
         let cipher = cipher::Stream::new(self.header.bytes[6], &self.keys.key, &self.keys.nonce);
-        let mut buffer = Zeroizing::new(vec![0u8; BUFFER]);
+        let capacity = (self.packed - MAC - PREFIX).min(BUFFER as u64) as usize;
+        let mut buffer = Zeroizing::new(vec![0u8; capacity]);
         let mut position = PREFIX;
         while position < self.packed - MAC {
-            let n = ((self.packed - MAC - position).min(BUFFER as u64)) as usize;
+            let n = ((self.packed - MAC - position).min(buffer.len() as u64)) as usize;
             input.read_exact(&mut buffer[..n])?;
             // Authenticate ciphertext/recovery before overwriting the buffer.
             mac.update(&buffer[..n]);

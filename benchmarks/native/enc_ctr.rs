@@ -4,6 +4,7 @@
 #[allow(dead_code)]
 mod cipher;
 
+use ::cipher::{Block, BlockEncrypt, KeyInit};
 use std::{hint::black_box, time::Instant};
 
 fn main() {
@@ -17,6 +18,26 @@ fn main() {
     #[cfg(not(feature = "parallel-decrypt"))]
     assert_eq!(threads, 1, "enable parallel-decrypt for multiple threads");
     assert!(mib > 0 && rounds > 0 && threads > 0);
+    if args.get(5).is_some_and(|v| v == "raw-aes") {
+        assert_eq!(threads, 1, "raw AES measures one hardware backend");
+        let aes = aes::Aes256::new_from_slice(&[0x73; 32]).unwrap();
+        let mut blocks = vec![Block::<aes::Aes256>::default(); 256 * 1024 / 16];
+        println!("algorithm,threads,mib,round,ms,mib_per_second");
+        for round in 0..rounds {
+            let start = Instant::now();
+            for _ in 0..mib * 4 {
+                aes.encrypt_blocks(black_box(&mut blocks));
+            }
+            let elapsed = start.elapsed().as_secs_f64();
+            black_box(&blocks);
+            println!(
+                "0,1,{mib},{round},{:.3},{:.3}",
+                elapsed * 1000.0,
+                mib as f64 / elapsed
+            );
+        }
+        return;
+    }
     let mut buffer = vec![0u8; 256 * 1024];
     println!("algorithm,threads,mib,round,ms,mib_per_second");
     for (code, key_len, nonce_len) in [

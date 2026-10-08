@@ -382,7 +382,7 @@ fn ctr_offsets_match_official_vectors_and_full_counter_carries() {
         let mut serial = cipher::Stream::new(header.bytes[6], &keys.key, &nonce);
         let mut expected = vec![0x53; 4099];
         serial.apply(&mut expected);
-        for chunk in [1, 7, 31, 129, 513] {
+        for chunk in [1, 7, 31, 129, 513, 2047, 2048, 2049, 4097] {
             let mut bytes = vec![0x53; expected.len()];
             for (index, part) in bytes.chunks_mut(chunk).enumerate() {
                 stream.apply_at((index * chunk) as u64, part);

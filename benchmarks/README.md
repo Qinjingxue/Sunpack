@@ -367,3 +367,21 @@ The following obsolete probes were intentionally removed during consolidation:
 Use pytest only for stable product contracts. Opt-in timing/resource assertions are
 marked `performance` and run with `pytest --run-performance`; multi-GB large-archive
 tests additionally require `--run-large-archive-performance`.
+
+ENC comparisons can also run directly as modules:
+
+```powershell
+uv run python -m benchmarks.scenarios.worker_enc_batch_ab --worker before=PATH_TO_BASELINE_WORKER --worker after=PATH_TO_CURRENT_WORKER --path PATH_TO_LARGE_ENC --concurrency 1,8 --capacity 4 --rounds 11 --json-out benchmarks/results/enc-worker-ab.json
+uv run python -m benchmarks.scenarios.reader_enc_single_candidate_ab --baseline BASELINE_GIT_REVISION --path native/sunpack_enc/tests/data/algorithm_0.mov --rounds 11 --json-out benchmarks/results/enc-single-candidate-ab.json
+```
+
+The worker comparison expects an independently generated `large.expected` beside
+each `large.enc`, validates native size/CRC outside the timer, and includes final
+KDF, authentication and real output writes. Pass several `LABEL=PATH` workers to
+compare prebuilt stream-buffer sizes. `--affinity 0,2,4,6` optionally holds the
+benchmark workers to the same logical CPUs; production scheduling is unaffected.
+The scheduler comparison loads only the old scheduler from the specified local
+Git revision; both sides use the installed native extension and current worker.
+Use `--origin watch` for the watch submission path. Pure AES diagnostics use the
+existing Rust `throughput` example with `-- 32 9 1 0 raw-aes`; this excludes CTR,
+KDF, authentication and I/O.

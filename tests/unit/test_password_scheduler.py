@@ -324,6 +324,74 @@ def test_extraction_plan_accepts_strong_fast_proof_and_caches_it(tmp_path):
     assert fast.batches == [["bad", "secret"]]
 
 
+@pytest.mark.parametrize("mode", ["file", "file_range", "concat_ranges"])
+@pytest.mark.parametrize("confirmed", [True, False])
+def test_single_enc_candidate_uses_extraction_confirmation_and_cache(tmp_path, mode, confirmed):
+    archive = tmp_path / "disguised.movie"
+    archive.write_text("fingerprint fixture", encoding="utf-8")
+    fast = FakeVerifier("secret")
+    scheduler = PasswordScheduler(fast)
+    descriptor = {"format_hint": "enc", "open_mode": mode}
+    if mode != "file":
+        descriptor["parts"] = [{"path": str(archive), "start": 2, "end": 12}]
+    job = PasswordJob(
+        archive_path=str(archive), archive_input=descriptor,
+        candidates=PasswordCandidatePipeline.from_values(["secret", "secret"]),
+    )
+    key = build_archive_fingerprint(str(archive), archive_input=descriptor).key
+
+    result = scheduler.plan_for_extraction(job)
+    assert result.status == PasswordSearchStatus.INCONCLUSIVE
+    assert result.password is None and result.attempts == 0
+    assert result.extraction_candidates == ("secret",)
+    assert fast.batches == []
+    assert scheduler.cache.get_success(key) is None
+    assert not scheduler.cache.has_negative(key, "secret")
+    if confirmed:
+        scheduler.remember_extraction_success(key, "secret")
+    else:
+        scheduler.remember_extraction_rejection(key, "secret")
+    repeated = scheduler.plan_for_extraction(job)
+    assert repeated.status == (PasswordSearchStatus.FOUND if confirmed else PasswordSearchStatus.EXHAUSTED)
+    assert fast.batches == []
+
+
+def test_single_enc_candidate_after_negative_cache_filtering(tmp_path):
+    archive = tmp_path / "input.data"
+    archive.write_text("fingerprint fixture", encoding="utf-8")
+    scheduler = PasswordScheduler(FakeVerifier("secret"))
+    descriptor = {"format_hint": "enc"}
+    scheduler.remember_extraction_rejection(
+        build_archive_fingerprint(str(archive), archive_input=descriptor).key, "bad",
+    )
+    result = scheduler.plan_for_extraction(PasswordJob(
+        archive_path=str(archive), archive_input=descriptor,
+        candidates=PasswordCandidatePipeline.from_values(["bad", "secret"]),
+    ))
+    assert result.extraction_candidates == ("secret",) and result.attempts == 0
+    assert scheduler.verifier.batches == []
+
+
+@pytest.mark.parametrize("descriptor,candidates", [
+    ({"format_hint": "enc"}, ["bad", "secret"]),
+    ({"format_hint": "zip"}, ["secret"]),
+    ({}, ["secret"]),
+])
+def test_single_candidate_shortcut_requires_enc_descriptor(tmp_path, descriptor, candidates):
+    archive = tmp_path / "misleading.enc"
+    archive.write_text("fingerprint fixture", encoding="utf-8")
+    fast = StaticVerifier(PasswordBatchVerification(
+        ok=True, status="match", matched_index=len(candidates) - 1,
+        attempts=len(candidates), final_confirmation_required=False,
+    ))
+    result = PasswordScheduler(PasswordVerifierChain([fast])).plan_for_extraction(PasswordJob(
+        archive_path=str(archive), archive_input=descriptor,
+        candidates=PasswordCandidatePipeline.from_values(candidates),
+    ))
+    assert result.password == "secret"
+    assert fast.batches == [candidates]
+
+
 def test_extraction_plan_accepts_not_required_fast_result(tmp_path):
     archive = tmp_path / "plain.embedded"
     archive.write_bytes(b"archive")

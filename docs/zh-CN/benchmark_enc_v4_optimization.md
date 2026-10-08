@@ -1,5 +1,150 @@
 # ENC v4 后续优化
 
+## 2026-10-08 第四轮：CTR 公共层和单候选最终确认
+
+基线为干净的 `c9258e83`。修改源码前保存该版本的 release examples 和
+第三轮构建的 x64 worker；新旧版本使用相同 Cargo.lock、构建参数与独立
+Java/SSE 输入。RC6/Blowfish 的第三轮实现已在此基线中，本轮不重复计算
+它们此前的收益。结果目录：`benchmarks/results/enc-v4-optimization/20261008-round4`。
+
+### 实现与边界
+
+- CTR refill 用满已有 2048 B pad：8/16/32/128 B cipher block 分别最多
+  256/128/64/16 blocks。AES adapter 内部分成最多 16 blocks 的组调用
+  原有 RustCrypto backend，保留最后一组。没有增加 pad 或引入新 AES 实现。
+- 8/16 B counter 分别使用 u64/u128 big-endian wrapping arithmetic 批量
+  填充，消除逐 block 动态长度复制和逐 byte 进位。32/128 B counter
+  继续使用原有全宽进位。整个 nonce 回绕、任意 offset、跨块/跨 refill
+  的分段语义不变。32 B password proof 仍只生成它所需的完整 blocks。
+- 流式读取保持 256 KiB 上限；短输入按实际的 ciphertext/recovery 长度
+  分配 buffer。例如 296 B ENC 的工作 buffer 从 256 KiB 降至 224 B。
+  buffer 仍由 Zeroizing 在本次解密结束时清零并释放。
+- 密码调度完成去重、成功缓存和负缓存处理后，若 Rust 输入描述明确为
+  ENC 且只剩一个候选，直接复用 worker 已有的单候选 extraction-confirmation
+  路径。正确候选只在最终 Decoder::open 运行一次 KDF；成功/明确拒绝后
+  才进入既有缓存确认流程。多个候选继续走 Rust fast proof，独立密码探测
+  API 不变。损坏等非密码失败仍保留 worker 原有的有界诊断，可能再做 proof。
+- 密钥不通过 IPC，也没有新增归档分析、ENC→ZIP 特殊通路、线程池、后台
+  缓冲任务或等待。CPU 额度仍按原有每批 acquire/release，写出前归还；
+  加密载荷输出为普通文件，继续由递归发现处理 ZIP。
+
+### CTR 与完整认证解密
+
+Windows x64 / i9-13980HX / release / `parallel-kdf,parallel-decrypt`。
+为减少混合核心迁移干扰，这组对照进程使用相同 logical CPU affinity
+`0,2,4,6`；只作用于 benchmark，不改变产品并发和 CPU broker。每算法
+独立进程，顺序为基线→新版→新版→基线，各 9 轮，去掉每组前 2 轮，
+共 14 个有效样本取中位数。与第三轮的自然调度绝对吞吐不能直接横比。
+纯 CTR 每轮 32 MiB，每次仍处理 256 KiB；单位 MiB/s。
+
+| 算法 | 基线 1 额度 | 新版 1 额度 | 倍率 | 基线 4 额度 | 新版 4 额度 | 倍率 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| AES-256 | 2655.99 | 6201.54 | 2.34× | 6429.97 | 9467.49 | 1.47× |
+| RC6 | 1325.93 | 1816.75 | 1.37× | 3784.46 | 4746.52 | 1.25× |
+| Serpent | 619.10 | 753.04 | 1.22× | 2038.65 | 2368.59 | 1.16× |
+| Blowfish-256 | 536.81 | 712.44 | 1.33× | 1725.92 | 2082.28 | 1.21× |
+| Twofish-256 | 287.19 | 298.52 | 1.04× | 1040.08 | 1099.56 | 1.06× |
+| GOST | 280.64 | 318.99 | 1.14× | 994.44 | 1087.63 | 1.09× |
+| Blowfish-448 | 527.16 | 721.81 | 1.37× | 1833.70 | 2208.08 | 1.20× |
+| Threefish-1024 | 1713.53 | 1717.25 | 1.00× | 4171.59 | 4341.94 | 1.04× |
+| SHACAL-2 | 1019.71 | 978.56 | 0.96× | 3080.43 | 3005.64 | 0.98× |
+| C4 | 279.50 | 323.87 | 1.16× | 919.32 | 1004.24 | 1.09× |
+
+单独放宽 refill 的初测没有取得 AES 大跳；大部分 AES/RC6/Blowfish
+收益来自整数 counter fill。SHACAL 本轮略慢，不宣称每个算法都改善。
+同 affinity 下纯 AES encrypt_blocks 的中位吞吐约 10276 MiB/s，而新
+CTR 约 6202 MiB/s；差值还包含必须执行的 counter fill/XOR，以及不同的
+block group/data layout，不等于可免费消除的开销。本轮复用上游 AES
+硬件 backend，没有再维护一套 AES-NI/VAES round-key 或 runtime dispatch。
+
+完整认证解密包含文件读取、key expansion、完整 BLAKE3 MAC 和 CTR，输出
+到 null sink，排除 Open/KDF。AES 为独立 Java 64 MiB 输入，RC6/两种
+Blowfish/C4 为 8 MiB；相同 affinity、交替顺序和中位数方法。
+
+| 算法 | 基线 1 额度 | 新版 1 额度 | 倍率 | 基线 4 额度 | 新版 4 额度 | 倍率 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| AES-256 | 1447.98 | 2049.40 | 1.42× | 1350.05 | 1453.53 | 1.08× |
+| RC6 | 902.01 | 1179.28 | 1.31× | 1161.06 | 1264.66 | 1.09× |
+| Blowfish-256 | 457.39 | 578.91 | 1.27× | 837.98 | 956.12 | 1.14× |
+| Blowfish-448 | 460.74 | 576.87 | 1.25× | 833.74 | 949.19 | 1.14× |
+| C4 | 237.56 | 266.63 | 1.12× | 547.93 | 597.13 | 1.09× |
+
+### 真实 worker 和读取批次取舍
+
+新增 `benchmarks.scenarios.worker_enc_batch_ab`，通过原有持久 worker transport
+执行真实写出；包含最终 KDF、认证、输出 manifest 和 job 完成。每档预热
+一次，再交替顺序测 7 轮；broker 总额度固定为 4，分别提交 1/8 个任务，
+并发批次交错 foreground/watch origin。对每次输出在计时外由 Rust 校验
+size/CRC32，完成后删除临时输出。缓存输入、不清系统 cache、不 fsync；
+测量包含正常写回影响，不能视作冷盘持续吞吐或整个递归链路吞吐。
+本次 sweep 使用自然 OS 调度；以下各列只有读取 batch 不同，均包含新版 CTR。
+
+| 输入 / 同批任务数 | 256 KiB | 512 KiB | 1 MiB | 2 MiB | 4 MiB |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| AES 64 MiB / 1 | 1014.6 | 1247.3 | 1204.2 | 1324.9 | 1346.1 |
+| AES 64 MiB / 8 | 2842.4 | 2333.3 | 2211.1 | 2712.0 | 1965.8 |
+| C4 8 MiB / 1 | 258.6 | 262.3 | 270.8 | 268.7 | 267.4 |
+| C4 8 MiB / 8 | 557.2 | 549.4 | 531.5 | 524.4 | 491.2 |
+
+较大 batch 改善单 AES 任务，但没有稳定改善并发吞吐；会增加每个 active
+解密的 buffer 和额度持有时间。因此生产保留 256 KiB。worker peak RSS
+约 86 MiB，各档差异很小，峰值由并行 KDF 主导；不能把此峰值解释为
+更大 buffer 没有逐任务内存成本。修改小输入分配无需抬高大输入内存上限。
+
+另用相同 `0,2,4,6` affinity、基线/最终 256 KiB worker 做 11 轮交替复测：
+
+| 输入 / 同批任务数 | 基线 | 新版 | 倍率 |
+| --- | ---: | ---: | ---: |
+| AES 64 MiB / 1 | 1079.2 | 1314.7 | 1.22× |
+| AES 64 MiB / 8 | 2126.6 | 2301.5 | 1.08× |
+| C4 8 MiB / 1 | 272.2 | 282.4 | 1.04× |
+| C4 8 MiB / 8 | 463.0 | 509.8 | 1.10× |
+
+自然 OS 调度的独立 11 轮复测中，AES 单/八任务约 1.06/1.09×，C4 约
+1.03/1.05×，也保持正收益。真实 worker 的增益小于纯 CTR，不能把 AES
+的 2.34× 直接套到实际写盘或嵌套解压。两份完整复测和 sweep JSON 都保留。
+
+### 单密码候选端到端
+
+`benchmarks.scenarios.reader_enc_single_candidate_ab` 从本地 `c9258e83`
+载入旧 scheduler，与新 scheduler 交替运行；两侧使用相同 worker 与
+原生扩展。每轮创建新的 PipelineEngine/worker，计时 engine.run，包含
+ENC 解密成普通文件、发现 ZIP、继续解压和清理流程。每档预热一次，
+11 轮取中位数，无 CPU affinity 设置，官方 296 B 伪装 `.mov` 输入。
+
+| origin | 基线 | 新版 | 耗时减少 |
+| --- | ---: | ---: | ---: |
+| foreground | 55.93 ms | 38.38 ms | 31.4% |
+| watch | 54.09 ms | 38.07 ms | 29.6% |
+
+逐轮记录的 host ENC proof 次数由 1 降至 0；正确密码的最终 Open/KDF
+仍由 Rust Decoder 执行一次。多候选吞吐及单独 password-probe API 没有
+改变；此次收益是去掉重复 KDF，不是削减 Argon2 工作量或传递 derived key。
+这里的 watch 是生产 PipelineEngine 的 watch submission path，真实服务
+下载监听属于下面单独的验证限制。
+
+### 验证与限制
+
+重新构建 x64 worker 和 `.venv` 中的 release 原生扩展后，Rust 默认 feature
+15 项、并行 feature 16 项全部通过。新增独立逐 block counter 对照，覆盖
+全部九种基础 cipher、8197 B、多次 2 KiB refill、2047/2048/2049 B 分段、
+全 nonce 进位/回绕，以及 proof 不过度生成。原有官方十算法、Unicode、
+KDF 参数、超 32 位 offset、短读、取消、写出错误、MAC/recovery 和额度
+归还测试继续通过。
+
+Python 相关回归共 208 项通过：包括 scheduler/cache/failure/lifecycle、
+官方 ENC、CLI/watch submission、嵌套递归、单候选无 host proof、错误
+密码/MAC 损坏保留源文件、独立 Java 大载荷 AES/RC6/两种 Blowfish/
+GOST/Threefish/C4，1/2/3/5/9 broker 容量、1/3 executor 线程、非对齐
+分段载体及缺失尾段，现有 Plan 2 解密/Plan 3 错误密码行为。2 项真实
+watch 下载监听测试因本次没有隔离的临时 Watch Broker 服务而跳过；
+当前进程没有管理员 token，没有启动服务安装脚本的交互式提权。
+
+ARM64 的生产 cipher 源码独立 harness cargo check 通过；这不是完整
+ARM64 extension/worker 构建或硬件性能验证。本轮改动为可移植 counter
+和调度层，保留已有 ARM fallback；没有声称实现或测试 NEON backend。
+读/MAC↔CTR 双 buffer 和 BLAKE3 parallel 本轮均未引入。
+
 ## 2026-10-08 第三轮：RC6 AVX2 和 Blowfish 八块交错
 
 基线为干净的 `d5038a82`，Windows x64、i9-13980HX、release，启用

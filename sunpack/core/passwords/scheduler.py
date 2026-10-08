@@ -231,6 +231,23 @@ class PasswordScheduler:
             self._emit_finished(job, result, started_at, candidates_seen=0, skipped=skipped)
             return result
 
+        # The authoritative Rust descriptor identifies ENC independently of its
+        # physical name. One remaining candidate needs only the worker's Open;
+        # the ordinary extraction-confirmation path commits success/rejection.
+        if (
+            len(candidates) == 1
+            and str((job.archive_input or {}).get("format_hint") or "").strip().lower() == "enc"
+        ):
+            result = PasswordSearchResult(
+                password=None,
+                status=PasswordSearchStatus.INCONCLUSIVE,
+                attempts=0,
+                stopped_reason="extraction_confirmation_required",
+                extraction_candidates=tuple(candidates),
+            )
+            self._emit_finished(job, result, started_at, len(candidates), skipped)
+            return result
+
         batch_size = max(1, int(job.batch_size or self.default_batch_size))
         inconclusive: list[str] = []
         inconclusive_evidence = ""

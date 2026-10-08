@@ -71,13 +71,15 @@ impl Primitive {
 fn batch<C: BlockEncrypt>(cipher: &C, bytes: &mut [u8]) {
     let mut blocks: [Block<C>; 16] = std::array::from_fn(|_| Block::<C>::default());
     let size = blocks[0].len();
-    let count = bytes.len() / size;
-    for (block, src) in blocks.iter_mut().zip(bytes.chunks_exact(size)) {
-        block.copy_from_slice(src);
-    }
-    cipher.encrypt_blocks(&mut blocks[..count]);
-    for (block, dst) in blocks.iter_mut().zip(bytes.chunks_exact_mut(size)) {
-        dst.copy_from_slice(block);
+    for group in bytes.chunks_mut(size * blocks.len()) {
+        let count = group.len() / size;
+        for (block, src) in blocks.iter_mut().zip(group.chunks_exact(size)) {
+            block.copy_from_slice(src);
+        }
+        cipher.encrypt_blocks(&mut blocks[..count]);
+        for (block, dst) in blocks.iter_mut().zip(group.chunks_exact_mut(size)) {
+            dst.copy_from_slice(block);
+        }
     }
 }
 
@@ -138,15 +140,36 @@ impl CtrState {
         while !bytes.is_empty() {
             if self.used == self.available {
                 // Only generate what this call needs (especially the 32B password proof).
-                let blocks = bytes.len().div_ceil(size).min(16);
+                let blocks = bytes.len().div_ceil(size).min(self.pad.len() / size);
                 self.available = blocks * size;
                 self.used = 0;
-                for block in self.pad[..self.available].chunks_exact_mut(size) {
-                    block.copy_from_slice(&self.counter[..size]);
-                    for byte in self.counter[..size].iter_mut().rev() {
-                        *byte = byte.wrapping_add(1);
-                        if *byte != 0 {
-                            break;
+                match size {
+                    8 => {
+                        let mut counter = u64::from_be_bytes(self.counter[..8].try_into().unwrap());
+                        for block in self.pad[..self.available].chunks_exact_mut(8) {
+                            block.copy_from_slice(&counter.to_be_bytes());
+                            counter = counter.wrapping_add(1);
+                        }
+                        self.counter[..8].copy_from_slice(&counter.to_be_bytes());
+                    }
+                    16 => {
+                        let mut counter =
+                            u128::from_be_bytes(self.counter[..16].try_into().unwrap());
+                        for block in self.pad[..self.available].chunks_exact_mut(16) {
+                            block.copy_from_slice(&counter.to_be_bytes());
+                            counter = counter.wrapping_add(1);
+                        }
+                        self.counter[..16].copy_from_slice(&counter.to_be_bytes());
+                    }
+                    _ => {
+                        for block in self.pad[..self.available].chunks_exact_mut(size) {
+                            block.copy_from_slice(&self.counter[..size]);
+                            for byte in self.counter[..size].iter_mut().rev() {
+                                *byte = byte.wrapping_add(1);
+                                if *byte != 0 {
+                                    break;
+                                }
+                            }
                         }
                     }
                 }
@@ -166,6 +189,59 @@ impl CtrState {
 }
 pub(crate) struct Stream {
     stages: Vec<Ctr>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn full_pad_refills_match_independent_single_block_counters() {
+        for (code, key_len) in [
+            (0, 32),
+            (1, 32),
+            (2, 32),
+            (3, 32),
+            (4, 32),
+            (5, 32),
+            (6, 56),
+            (7, 128),
+            (8, 64),
+        ] {
+            let key = vec![0x73; key_len];
+            let (primitive, size) = Primitive::new(code, &key);
+            for tail in [0xf8, 0xff] {
+                let mut nonce = vec![0xff; size];
+                nonce[size - 1] = tail;
+                let mut counter = nonce.clone();
+                let mut expected = Vec::new();
+                for _ in 0..8197usize.div_ceil(size) {
+                    let mut block = counter.clone();
+                    primitive.encrypt(&mut block);
+                    expected.extend_from_slice(&block);
+                    for byte in counter.iter_mut().rev() {
+                        let (value, carry) = byte.overflowing_add(1);
+                        *byte = value;
+                        if !carry {
+                            break;
+                        }
+                    }
+                }
+                expected.truncate(8197);
+                for chunk in [32, 2047, 2048, 2049, 8197] {
+                    let mut state = Ctr::new(code, &key, &nonce);
+                    let mut actual = vec![0; expected.len()];
+                    for part in actual.chunks_mut(chunk) {
+                        state.apply(part);
+                    }
+                    assert_eq!(actual, expected, "cipher {code}, chunk {chunk}");
+                }
+                let mut proof = Ctr::new(code, &key, &nonce);
+                proof.apply(&mut [0; 32]);
+                assert_eq!(proof.state.available, 32usize.div_ceil(size) * size);
+            }
+        }
+    }
 }
 impl Stream {
     pub fn new(code: u8, key: &[u8], nonce: &[u8]) -> Self {

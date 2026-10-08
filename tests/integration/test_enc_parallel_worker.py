@@ -12,7 +12,7 @@ from tests.helpers.native_fixture import file_inventory, native_fixture
 from tests.unit.test_enc_support import BUILD, ROOT
 
 
-@pytest.fixture(scope="module", params=[1, 3, 5, 6, 7, 9], ids=["rc6", "blowfish256", "gost", "blowfish448", "threefish", "c4"])
+@pytest.fixture(scope="module", params=[0, 1, 3, 5, 6, 7, 9], ids=["aes", "rc6", "blowfish256", "gost", "blowfish448", "threefish", "c4"])
 def large_enc(tmp_path_factory, request):
     jar = ROOT / "reference/implementations/SSEFilePC/S.S.E. File Encryptor for PC/ssefenc.jar"
     java, javac = shutil.which("java"), shutil.which("javac")
@@ -113,7 +113,7 @@ def test_enc_carrier_ranges_keep_ctr_continuity_and_reject_missing_tail(tmp_path
     request = {"job_id": "ranges", "origin": origin, "archive_path": str(carrier),
                "archive_input": {"kind": "archive_input", "entry_path": str(carrier),
                                  "open_mode": "concat_ranges", "format_hint": "enc", "ranges": ranges},
-               "output_dir": str(tmp_path / "out"), "password": "sunpack-test"}
+               "output_dir": str(tmp_path / "out"), "password_candidates": ["sunpack-test"]}
     completed = subprocess.run([str(BUILD / "sunpack_sevenzip_worker.exe")],
                                input=json.dumps(request), capture_output=True, text=True, encoding="utf-8",
                                timeout=30, creationflags=subprocess.CREATE_NO_WINDOW,
