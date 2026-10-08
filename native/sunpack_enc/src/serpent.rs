@@ -2,6 +2,7 @@
 //! Key schedule and Boolean circuits adapted from RustCrypto serpent 0.6.0.
 //! Copyright (c) 2019-2024 The RustCrypto Project Developers
 //! Copyright (c) 2019 Jonathan Serra. MIT: licenses/serpent-license.txt.
+#[cfg(target_arch = "x86_64")]
 use super::backend;
 use std::ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign, BitXor, BitXorAssign, Not, Shl};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
@@ -9,6 +10,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub(super) struct Serpent {
     keys: [[u32; 4]; 33],
+    #[cfg(target_arch = "x86_64")]
     #[zeroize(skip)]
     encrypt: backend::Encrypt<Self>,
 }
@@ -65,30 +67,20 @@ impl Serpent {
         }
         Self {
             keys,
-            encrypt: backend::capabilities().vector(
-                Self::encrypt_scalar,
-                #[cfg(target_arch = "x86_64")]
-                Self::encrypt_avx2,
-                #[cfg(target_arch = "aarch64")]
-                Self::encrypt_neon,
-            ),
+            #[cfg(target_arch = "x86_64")]
+            encrypt: backend::capabilities().vector(Self::encrypt_scalar, Self::encrypt_avx2),
         }
     }
     pub(super) fn encrypt(&self, bytes: &mut [u8]) {
         debug_assert_eq!(bytes.len() % 16, 0);
         #[cfg(target_arch = "x86_64")]
-        let short = bytes.len() < 128;
-        #[cfg(target_arch = "aarch64")]
-        let short = bytes.len() < 64;
-        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-        let short = true;
-        if short {
-            // Quick proofs need no SIMD group or indirect backend call.
-            self.encrypt_scalar(bytes);
+        if bytes.len() >= 128 {
+            // SAFETY: immutable backend bound from CPU/OS capabilities.
+            unsafe { (self.encrypt)(self, bytes) };
             return;
         }
-        // SAFETY: immutable backend bound from process CPU/OS capabilities.
-        unsafe { (self.encrypt)(self, bytes) };
+        // ARM64 reuses this implementation for every block count.
+        self.encrypt_scalar(bytes);
     }
     #[cfg(target_arch = "x86_64")]
     unsafe fn encrypt_avx2(&self, bytes: &mut [u8]) {
@@ -97,16 +89,6 @@ impl Serpent {
         if n != 0 {
             // SAFETY: constructor bound AVX2; complete eight-block groups.
             unsafe { avx2::encrypt(&self.keys, bulk) };
-        }
-        self.encrypt_scalar(tail);
-    }
-    #[cfg(target_arch = "aarch64")]
-    unsafe fn encrypt_neon(&self, bytes: &mut [u8]) {
-        let n = bytes.len() / 64 * 64;
-        let (bulk, tail) = bytes.split_at_mut(n);
-        if n != 0 {
-            // SAFETY: constructor bound NEON; complete four-block groups.
-            unsafe { neon::encrypt(&self.keys, bulk) };
         }
         self.encrypt_scalar(tail);
     }
@@ -285,17 +267,13 @@ mod avx2 {
     }
 }
 
-#[cfg(target_arch = "aarch64")]
-#[path = "serpent_neon.rs"]
-mod neon;
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use cipher5::{BlockCipherEncrypt, KeyInit};
 
     #[test]
-    fn scalar_and_avx2_match_upstream_with_tails_and_unaligned_slices() {
+    fn scalar_and_accelerated_match_upstream_with_tails_and_unaligned_slices() {
         let mut seed = 0x7319a953u32;
         let mut next = || {
             seed ^= seed << 13;

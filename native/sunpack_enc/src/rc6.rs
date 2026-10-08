@@ -1,6 +1,7 @@
 //! ENC RC6-32/20/32: eight-block AVX2 and scalar tails.
 //! Key expansion/rounds adapted from RustCrypto rc6 0.1.0.
 //! Copyright (c) 2017 Damian Czaja. MIT: licenses/rc6-license.txt.
+#[cfg(target_arch = "x86_64")]
 use super::backend;
 use std::ops::BitXor;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
@@ -8,6 +9,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub(super) struct Rc6 {
     keys: [u32; 44],
+    #[cfg(target_arch = "x86_64")]
     #[zeroize(skip)]
     encrypt: backend::Encrypt<Self>,
 }
@@ -59,30 +61,26 @@ impl Rc6 {
         }
         Self {
             keys,
-            encrypt: backend::capabilities().vector(
-                Self::encrypt_scalar,
-                #[cfg(target_arch = "x86_64")]
-                Self::encrypt_avx2,
-                #[cfg(target_arch = "aarch64")]
-                Self::encrypt_neon,
-            ),
+            #[cfg(target_arch = "x86_64")]
+            encrypt: backend::capabilities().vector(Self::encrypt_scalar, Self::encrypt_avx2),
         }
     }
     pub(super) fn encrypt(&self, bytes: &mut [u8]) {
         debug_assert_eq!(bytes.len() % 16, 0);
         #[cfg(target_arch = "x86_64")]
-        let short = bytes.len() < 128;
-        #[cfg(target_arch = "aarch64")]
-        let short = bytes.len() < 64;
-        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-        let short = true;
-        if short {
-            // Quick proofs need no SIMD group or indirect backend call.
-            self.encrypt_scalar(bytes);
+        if bytes.len() >= 128 {
+            // SAFETY: immutable backend bound from CPU/OS capabilities.
+            unsafe { (self.encrypt)(self, bytes) };
             return;
         }
-        // SAFETY: immutable backend bound from process CPU/OS capabilities.
-        unsafe { (self.encrypt)(self, bytes) };
+        #[cfg(target_arch = "aarch64")]
+        if bytes.len() >= 64 {
+            // SAFETY: Windows ARM64 guarantees NEON; four complete blocks.
+            unsafe { self.encrypt_neon(bytes) };
+            return;
+        }
+        // Short proofs need neither padded SIMD lanes nor an indirect call.
+        self.encrypt_scalar(bytes);
     }
     #[cfg(target_arch = "x86_64")]
     unsafe fn encrypt_avx2(&self, bytes: &mut [u8]) {
@@ -99,7 +97,7 @@ impl Rc6 {
         let n = bytes.len() / 64 * 64;
         let (bulk, tail) = bytes.split_at_mut(n);
         if n != 0 {
-            // SAFETY: constructor bound NEON; complete four-block groups.
+            // SAFETY: Windows ARM64 baseline NEON; complete four-block groups.
             unsafe { neon::encrypt(&self.keys, bulk) };
         }
         self.encrypt_scalar(tail);
@@ -242,7 +240,7 @@ mod tests {
         BlockCipherEncrypt,
     };
     #[test]
-    fn scalar_and_avx2_match_upstream_with_unaligned_groups_and_tails() {
+    fn scalar_and_accelerated_match_upstream_with_unaligned_groups_and_tails() {
         let mut seed = 0x591a_130du32;
         let mut next = || {
             seed ^= seed << 13;
@@ -272,6 +270,15 @@ mod tests {
                     let mut direct = input.clone();
                     let bulk = blocks / 8 * 128;
                     unsafe { avx2::encrypt(&cipher.keys, &mut direct[prefix..prefix + bulk]) };
+                    cipher.encrypt_scalar(&mut direct[prefix + bulk..prefix + blocks * 16]);
+                    assert_eq!(direct, expected);
+                }
+                #[cfg(target_arch = "aarch64")]
+                {
+                    let mut direct = input.clone();
+                    let bulk = blocks / 4 * 64;
+                    // Target baseline permits forcing NEON independently of dispatch.
+                    unsafe { neon::encrypt(&cipher.keys, &mut direct[prefix..prefix + bulk]) };
                     cipher.encrypt_scalar(&mut direct[prefix + bulk..prefix + blocks * 16]);
                     assert_eq!(direct, expected);
                 }

@@ -57,19 +57,29 @@ retain separate pools.
 
 Custom cipher ISA policy lives in `src/backend.rs`. One process-wide, immutable
 capability record detects x64 AVX2 and SHA-NI (including SSSE3/SSE4.1), or ARM64
-NEON and SHA2 independently. RC6, Serpent, Threefish and SHACAL bind an encrypt
-function when their key is expanded; the decrypt hot loop does not check ISA
+SHA2. RC6, Serpent and Threefish bind their x64 vector backend at key expansion;
+SHACAL binds its SHA backend. The decrypt hot loop does not check ISA
 availability. The record contains only CPU flags, with no keys or scratch space.
 AES, Argon2 and the portable SHACAL compression helper retain their upstream
 runtime-selected backends.
 
-RC6/Serpent/Threefish keep scalar processing for short proofs and incomplete SIMD
-groups; they never pad a 32B proof to a whole SIMD group. SHACAL uses its x64
+x64 RC6/Serpent/Threefish keep scalar processing for short proofs and incomplete
+SIMD groups. Windows ARM64 RC6 directly uses baseline NEON for four-block bulk,
+with scalar short/tail processing; it retains no backend pointer or NEON flag.
+ARM64 Serpent and Threefish use the existing scalar implementation for all sizes.
+On the native ARM runner, custom Serpent NEON did not improve on scalar, while
+two-block Threefish NEON took 550ns versus scalar's 291ns; those backends were
+removed. No cipher pads a 32B proof to a SIMD group. SHACAL uses its x64
 two-block SHA-NI kernel or ARM four-block SHA2 kernel, including hardware tails.
 Twofish keeps its eight-block interleave and const-generic tails. Unsupported ISA
 falls back to the existing scalar/portable implementation selected at construction;
 AVX2 does not imply SHA-NI, and NEON does not imply SHA2. Release CPU requirements
-are unchanged. ARM64 backends still await real Windows ARM64 validation.
+are unchanged.
+Direct ISA tests compare NEON against scalar/upstream and SHA2 against portable
+compression; SHA2-unavailable dispatch is tested with instruction-free callbacks.
+ARM64 path selection was measured with short-block crossover and 32B proof/
+1- and 4-credit CTR on a native Windows ARM64 runner. The temporary workflow and
+crossover harness are removed after verification; correctness tests remain.
 
 Bounded parallel MAC and writer probes remain benchmark-only. Production has
 no MAC experiment mode, double buffer, special AES thread policy or ENC-to-ZIP

@@ -34,7 +34,7 @@ impl Word for V {
         }
     }
 }
-// V is private and used only under the detected NEON entry point.
+// V is private and used only under the Windows ARM64 baseline NEON entry point.
 #[target_feature(enable = "neon")]
 pub(super) unsafe fn encrypt(keys: &[u32; 44], bytes: &mut [u8]) {
     let n = bytes.len() / 128 * 128;

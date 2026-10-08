@@ -2,6 +2,7 @@
 //! Key schedule/constants adapted from RustCrypto threefish 0.5.2.
 //! Copyright (c) 2016-2017 Christian Barcenas, Artyom Pavlov.
 //! MIT license: licenses/threefish-license.txt.
+#[cfg(target_arch = "x86_64")]
 use super::backend;
 use std::ops::BitXor;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
@@ -9,6 +10,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub(super) struct Threefish {
     keys: [[u64; 16]; 21],
+    #[cfg(target_arch = "x86_64")]
     #[zeroize(skip)]
     encrypt: backend::Encrypt<Self>,
 }
@@ -59,30 +61,20 @@ impl Threefish {
         }
         Self {
             keys,
-            encrypt: backend::capabilities().vector(
-                Self::encrypt_scalar,
-                #[cfg(target_arch = "x86_64")]
-                Self::encrypt_avx2,
-                #[cfg(target_arch = "aarch64")]
-                Self::encrypt_neon,
-            ),
+            #[cfg(target_arch = "x86_64")]
+            encrypt: backend::capabilities().vector(Self::encrypt_scalar, Self::encrypt_avx2),
         }
     }
     pub(super) fn encrypt(&self, bytes: &mut [u8]) {
         debug_assert_eq!(bytes.len() % 128, 0);
         #[cfg(target_arch = "x86_64")]
-        let short = bytes.len() < 512;
-        #[cfg(target_arch = "aarch64")]
-        let short = bytes.len() < 256;
-        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-        let short = true;
-        if short {
-            // A 32B proof generates one block, never a padded SIMD group.
-            self.encrypt_scalar(bytes);
+        if bytes.len() >= 512 {
+            // SAFETY: immutable backend bound from CPU/OS capabilities.
+            unsafe { (self.encrypt)(self, bytes) };
             return;
         }
-        // SAFETY: immutable backend bound from process CPU/OS capabilities.
-        unsafe { (self.encrypt)(self, bytes) };
+        // ARM64 reuses this implementation for every block count.
+        self.encrypt_scalar(bytes);
     }
     #[cfg(target_arch = "x86_64")]
     unsafe fn encrypt_avx2(&self, bytes: &mut [u8]) {
@@ -91,16 +83,6 @@ impl Threefish {
         if n != 0 {
             // SAFETY: constructor bound AVX2; complete four-block groups.
             unsafe { avx2::encrypt(&self.keys, bulk) };
-        }
-        self.encrypt_scalar(tail);
-    }
-    #[cfg(target_arch = "aarch64")]
-    unsafe fn encrypt_neon(&self, bytes: &mut [u8]) {
-        let n = bytes.len() / 256 * 256;
-        let (bulk, tail) = bytes.split_at_mut(n);
-        if n != 0 {
-            // SAFETY: constructor bound NEON; complete two-block groups.
-            unsafe { neon::encrypt(&self.keys, bulk) };
         }
         self.encrypt_scalar(tail);
     }
@@ -231,15 +213,11 @@ mod avx2 {
     }
 }
 
-#[cfg(target_arch = "aarch64")]
-#[path = "threefish_neon.rs"]
-mod neon;
-
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
-    fn scalar_and_avx2_match_upstream_for_unaligned_groups_and_tails() {
+    fn scalar_and_accelerated_match_upstream_for_unaligned_groups_and_tails() {
         let mut seed = 0x92f1_038du32;
         let mut next = || {
             seed ^= seed << 13;
