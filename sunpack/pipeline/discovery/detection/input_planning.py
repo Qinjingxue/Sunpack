@@ -204,7 +204,7 @@ class ArchiveInputPlanningStage:
                     self._apply_selected_segment(task, evidence, segment, index=index, write_knowledge=False)
             with _phase(phase_timer, f"{phase_prefix}_batched_write"):
                 password_probe_input = (
-                    self._password_probe_input_for_segment(task, *selected_segment)
+                    self._password_probe_input_for_segment(task, *selected_segment[:2])
                     if selected_segment is not None
                     else self._structured_volume_source(task)
                 )
@@ -227,7 +227,6 @@ class ArchiveInputPlanningStage:
                 task,
                 evidence,
                 segment,
-                index,
             )
             _write_plan_knowledge(
                 task,
@@ -346,12 +345,12 @@ class ArchiveInputPlanningStage:
     ) -> list[dict[str, Any]]:
         payloads: list[dict[str, Any]] = []
         for evidence, segment, index in candidates:
-            archive_input = self._archive_input_for_segment(task, evidence, segment, index=index)
+            archive_input = self._archive_input_for_segment(task, evidence, segment)
             if archive_input is None:
                 continue
             segment_payload = self._segment_payload(task, evidence, segment)
             payloads.append({
-                "segment_id": f"embedded_{index:02d}_{str(evidence.format or 'archive').replace('/', '_')}",
+                "segment_id": f"embedded_{index:02d}",
                 "index": int(index),
                 "format": str(evidence.format or ""),
                 "start_offset": int(segment.start_offset),
@@ -365,7 +364,7 @@ class ArchiveInputPlanningStage:
                     "warnings": list(evidence.warnings),
                     "details": dict(evidence.details or {}),
                 },
-                "logical_name": self._segment_logical_name(task, evidence, index),
+                "logical_name": task.logical_name,
                 "segment": segment_payload,
                 "archive_input": archive_input.to_dict(),
             })
@@ -395,8 +394,6 @@ class ArchiveInputPlanningStage:
         task: ArchiveTask,
         evidence: ArchiveFormatEvidence,
         segment: ArchiveSegment,
-        *,
-        index: int = 1,
     ) -> ArchiveInputDescriptor | None:
         parts = self._ordered_parts(task)
         if not parts or segment.end_offset is None:
@@ -427,7 +424,7 @@ class ArchiveInputPlanningStage:
                 entry_path=parts[0],
                 open_mode="file_range",
                 format_hint=evidence.format,
-                logical_name=self._segment_logical_name(task, evidence, index),
+                logical_name=task.logical_name,
                 parts=[ArchiveInputPart(extent=extent)],
                 analysis=dict(segment_analysis),
             )
@@ -444,7 +441,7 @@ class ArchiveInputPlanningStage:
             entry_path=task.main_path,
             open_mode="concat_ranges",
             format_hint=evidence.format,
-            logical_name=self._segment_logical_name(task, evidence, index),
+            logical_name=task.logical_name,
             extents=[InputExtent(path=item["path"], start=item["start"], end=item.get("end")) for item in ranges],
             analysis=dict(segment_analysis),
         )
@@ -454,13 +451,11 @@ class ArchiveInputPlanningStage:
         task: ArchiveTask,
         evidence: ArchiveFormatEvidence,
         segment: ArchiveSegment,
-        index: int,
     ) -> ArchiveInputDescriptor | None:
         archive_input = self._archive_input_for_segment(
             task,
             evidence,
             segment,
-            index=index,
         )
         if archive_input is not None:
             return archive_input
@@ -479,7 +474,7 @@ class ArchiveInputPlanningStage:
             # Password probing may use the available suffix without declaring
             # that suffix a complete extractable archive.
             return self._archive_input_for_segment(
-                task, evidence, replace(segment, end_offset=size), index=index,
+                task, evidence, replace(segment, end_offset=size),
             )
         if len(parts) > 1 and int(segment.start_offset) <= 0:
             source_input = task.archive_input()
@@ -504,7 +499,7 @@ class ArchiveInputPlanningStage:
             entry_path=first_part,
             open_mode="file_range",
             format_hint="rar",
-            logical_name=self._segment_logical_name(task, evidence, index),
+            logical_name=task.logical_name,
             parts=[ArchiveInputPart(extent=extent, role="main")],
             analysis={
                 "status": evidence.status,
@@ -548,15 +543,6 @@ class ArchiveInputPlanningStage:
                 "end": int(local_end),
             })
         return ranges
-
-    def _segment_logical_name(self, task: ArchiveTask, evidence: ArchiveFormatEvidence, index: int) -> str:
-        base = str(task.logical_name or os.path.splitext(os.path.basename(task.main_path))[0] or "archive")
-        if knowledge_view.get(task, "source.selected_segment.index", 0):
-            return base
-        if index <= 0:
-            return base
-        fmt = str(evidence.format or "archive").replace("/", "_")
-        return f"{base}_{index:02d}_{fmt}"
 
 
 def _phase(timer: Callable[..., Any] | None, name: str):

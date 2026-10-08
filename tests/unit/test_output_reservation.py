@@ -1,4 +1,5 @@
 from tests.helpers.archive_tasks import make_archive_task
+from concurrent.futures import ThreadPoolExecutor
 from sunpack.core.support.output_paths import next_available_path
 from sunpack.core.support.output_reservation import OutputReservationRegistry, build_output_dir_resolver
 
@@ -95,4 +96,28 @@ def test_output_reservations_disambiguate_concurrent_requests_before_directories
     registry.release("first")
     third = build_output_dir_resolver([first_task], default, reservation_registry=registry, owner="third")
     assert third(first_task) == str(tmp_path / "shared")
+
+
+def test_concurrent_formats_share_numbered_directory_family(tmp_path):
+    registry = OutputReservationRegistry()
+    default = str(tmp_path / "release.v2")
+
+    def reserve(index):
+        fmt = "zip" if index % 2 else "7z"
+        task = make_archive_task(tmp_path / f"release.v2.{fmt}", logical_name="release.v2", format_hint=fmt)
+        resolver = build_output_dir_resolver(
+            [task], lambda _task: default, reservation_registry=registry, owner=str(index),
+        )
+        return resolver(task), task.archive_input().format_hint
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        results = list(executor.map(reserve, range(32)))
+
+    assert {path for path, _ in results} == {
+        default, *(str(tmp_path / f"release.v2({index})") for index in range(1, 32)),
+    }
+    assert {fmt for _, fmt in results} == {"zip", "7z"}
+    for index in range(32):
+        registry.release(str(index))
+    assert registry.reserve(default, "next", set()) == default
 

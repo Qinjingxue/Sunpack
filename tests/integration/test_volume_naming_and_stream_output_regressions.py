@@ -4,6 +4,7 @@ import io
 import shutil
 import subprocess
 import tarfile
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -149,7 +150,7 @@ def test_unnamed_xz_stream_keeps_input_name_under_output_collision(tmp_path, emb
         assembled = assemble_carrier(stream, [standalone], junk_min=1024, junk_max=2048)
         assert assembled
     output_root = tmp_path / "out"
-    collision = output_root / "inner.7z"
+    collision = output_root / "inner"
     collision.mkdir(parents=True)
     (collision / "existing.txt").write_text("existing", encoding="utf-8")
     before = file_inventory(inputs)
@@ -171,6 +172,7 @@ def test_unnamed_xz_stream_keeps_input_name_under_output_collision(tmp_path, emb
     assert all(result.outcome_kind == OutcomeKind.COMPLETE_SUCCESS for result in results)
     outer = next(result for result in results if result.input_path == str(stream))
     assert Path(outer.output_dir) != collision
+    assert Path(outer.output_dir).name == "inner(1)"
     recovered = Path(outer.output_dir) / inner.name
     assert recovered.is_file(), file_inventory(output_root)
     assert file_inventory(Path(outer.output_dir))[inner.name] == file_inventory(tmp_path)[inner.name]
@@ -179,3 +181,75 @@ def test_unnamed_xz_stream_keeps_input_name_under_output_collision(tmp_path, emb
     assert file_inventory(Path(nested.output_dir)) == file_inventory(payload_root)
     assert (collision / "existing.txt").read_text(encoding="utf-8") == "existing"
     assert file_inventory(inputs) == before
+
+
+@pytest.mark.parametrize("origin", ["foreground", "watch"])
+def test_concurrent_same_filename_formats_use_only_numbered_output_dirs(tmp_path, origin):
+    inputs = tmp_path / "inputs"
+    inputs.mkdir()
+    zip_path = inputs / "release.v2.zip"
+    tar_path = inputs / "release.v2.tar"
+    with zipfile.ZipFile(zip_path, "w") as archive:
+        archive.writestr("zip.txt", b"zip payload")
+    with tarfile.open(tar_path, "w") as archive:
+        member = tarfile.TarInfo("tar.txt")
+        member.size = len(b"tar payload")
+        archive.addfile(member, io.BytesIO(b"tar payload"))
+    output = tmp_path / "out"
+    config = normalize_config(with_detection_pipeline({
+        "output": {"root": str(output)},
+        "post_extract": {"archive_cleanup_mode": "k", "flatten_single_directory": False},
+    }))
+
+    async def run():
+        async with PipelineEngine(config) as engine:
+            return await asyncio.gather(*(
+                engine.run([str(path)], direct=True, origin=origin) for path in (zip_path, tar_path)
+            ))
+
+    responses = asyncio.run(run())
+    results = [result for response in responses for result in response.summary.target_results]
+    assert len(results) == 2
+    assert all(result.outcome_kind == OutcomeKind.COMPLETE_SUCCESS for result in results)
+    assert {Path(result.output_dir).name for result in results} == {"release.v2", "release.v2(1)"}
+    for result in results:
+        name = "zip.txt" if result.input_path == str(zip_path) else "tar.txt"
+        assert (Path(result.output_dir) / name).read_bytes() == name[:3].encode() + b" payload"
+
+
+@pytest.mark.parametrize("origin", ["foreground", "watch"])
+def test_embedded_formats_share_filename_and_isolate_numbered_payload_dirs(tmp_path, origin):
+    zip_path = tmp_path / "first.zip"
+    with zipfile.ZipFile(zip_path, "w") as archive:
+        archive.writestr("zip.txt", b"zip payload")
+    payload = tmp_path / "seven.txt"
+    payload.write_bytes(b"7z payload")
+    seven_path = tmp_path / "second.7z"
+    sevenzip = Path(__file__).resolve().parents[2] / "tools" / "7z.exe"
+    subprocess.run([str(sevenzip), "a", "-t7z", str(seven_path), str(payload)],
+        check=True, capture_output=True)
+    inputs = tmp_path / "inputs"
+    inputs.mkdir()
+    carrier = inputs / "carrier name.v2.jpg"
+    assemble_carrier(carrier, [zip_path, seven_path], junk_min=1024, junk_max=2048)
+    output = tmp_path / "out"
+    config = normalize_config(with_detection_pipeline({
+        "output": {"root": str(output)},
+        "post_extract": {"archive_cleanup_mode": "k", "flatten_single_directory": False},
+    }))
+
+    async def run():
+        async with PipelineEngine(config) as engine:
+            return await engine.run([str(carrier)], origin=origin,
+                detection_options=EmbeddedOptions(force_scan=True))
+
+    response = asyncio.run(run())
+    assert not response.summary.failed_tasks, response.summary.failures
+    assert len(response.summary.target_results) == 1
+    outer = Path(response.summary.target_results[0].output_dir)
+    assert outer.name == "carrier name.v2"
+    assert {path.name for path in outer.iterdir() if path.is_dir()} == {
+        "carrier name.v2", "carrier name.v2(1)",
+    }
+    assert next(outer.rglob("zip.txt")).read_bytes() == b"zip payload"
+    assert next(outer.rglob("seven.txt")).read_bytes() == b"7z payload"

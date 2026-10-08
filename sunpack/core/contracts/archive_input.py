@@ -66,6 +66,7 @@ class ArchiveInputDescriptor:
     entry_path: str
     open_mode: ArchiveOpenMode = "file"
     format_hint: str = ""
+    # Rust-provided filename; format and input identity belong to their own attributes.
     logical_name: str = ""
     volume_style: str = ""
     parts: list[ArchiveInputPart] = field(default_factory=list)

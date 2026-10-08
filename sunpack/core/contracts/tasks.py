@@ -32,7 +32,6 @@ class ArchiveTask:
         descriptor = _archive_input
         if not descriptor.entry_path:
             raise ValueError("ArchiveTask requires an archive input entry path")
-        logical_name = str(descriptor.logical_name or descriptor.entry_path)
         self.carrier_path = str(self.carrier_path or descriptor.entry_path)
         self.cleanup_parts = list(dedupe_values([
             *descriptor.part_paths(),
@@ -40,11 +39,7 @@ class ArchiveTask:
             self.carrier_path,
         ]))
         if not self.key:
-            self.key = (
-                logical_name
-                if descriptor.open_mode in {"native_volumes", "sfx_with_volumes"}
-                else descriptor.entry_path
-            )
+            self.key = descriptor.entry_path
         self._knowledge = ArchiveKnowledge()
         self._archive_input = descriptor
         self._initialize_knowledge(
@@ -190,7 +185,7 @@ def _segment_payload(index: int, descriptor: ArchiveInputDescriptor, evidence: d
     confidence = descriptor.analysis.get("segment_confidence", evidence.get("confidence"))
     damage_flags = descriptor.analysis.get("damage_flags") or evidence.get("damage_flags") or ()
     return {
-        "segment_id": f"embedded_{index:02d}_{descriptor.format_hint.replace('/', '_')}",
+        "segment_id": f"embedded_{index:02d}",
         "index": index,
         "format": descriptor.format_hint,
         "start_offset": int(start_offset),

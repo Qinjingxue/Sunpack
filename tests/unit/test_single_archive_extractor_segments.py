@@ -158,28 +158,28 @@ def test_extractor_runs_analysis_segments_inside_same_task_and_restores_source(t
     task = _task(carrier)
     write_source_extractable_segments(task, [
         {
-            "segment_id": "embedded_01_zip",
+            "segment_id": "embedded_01",
             "format": "zip",
-            "logical_name": "case_01_zip",
+            "logical_name": "case",
             "archive_input": {
                 "kind": "archive_input",
                 "entry_path": str(carrier),
                 "open_mode": "file_range",
                 "format_hint": "zip",
-                "logical_name": "case_01_zip",
+                "logical_name": "case",
                 "parts": [{"path": str(carrier), "role": "main", "start": 7, "end": 10}],
             },
         },
         {
-            "segment_id": "embedded_02_rar",
+            "segment_id": "embedded_02",
             "format": "rar",
-            "logical_name": "case_02_rar",
+            "logical_name": "case",
             "archive_input": {
                 "kind": "archive_input",
                 "entry_path": str(carrier),
                 "open_mode": "file_range",
                 "format_hint": "rar",
-                "logical_name": "case_02_rar",
+                "logical_name": "case",
                 "parts": [{"path": str(carrier), "role": "main", "start": 11, "end": 14}],
             },
         },
@@ -199,8 +199,8 @@ def test_extractor_runs_analysis_segments_inside_same_task_and_restores_source(t
     assert result.success is True
     assert [source["format_hint"] for source in runner.sources] == ["zip", "rar"]
     assert runner.sources[0]["open_mode"] == "file_range"
-    assert (tmp_path / "out" / "embedded_01_zip" / "zip.txt").exists()
-    assert (tmp_path / "out" / "embedded_02_rar" / "rar.txt").exists()
+    assert (tmp_path / "out" / "case" / "zip.txt").exists()
+    assert (tmp_path / "out" / "case(1)" / "rar.txt").exists()
     assert len(result.diagnostics["embedded_segments"]) == 2
     assert task.archive_input().open_mode == "file"
 
@@ -210,17 +210,17 @@ def test_embedded_password_probe_and_session_key_follow_active_segment(tmp_path)
     carrier.write_bytes(b"prefix-first-gap-second-tail")
     task = _task(carrier)
     segments = []
-    for index, (name, start, end) in enumerate((("first", 7, 12), ("second", 17, 23)), start=1):
+    for index, (start, end) in enumerate(((7, 12), (17, 23)), start=1):
         segments.append({
-            "segment_id": f"embedded_{index:02d}_zip",
+            "segment_id": f"embedded_{index:02d}",
             "format": "zip",
-            "logical_name": name,
+            "logical_name": "case",
             "archive_input": {
                 "kind": "archive_input",
                 "entry_path": str(carrier),
                 "open_mode": "file_range",
                 "format_hint": "zip",
-                "logical_name": name,
+                "logical_name": "case",
                 "parts": [{"path": str(carrier), "role": "main", "start": start, "end": end}],
             },
         })
@@ -238,7 +238,8 @@ def test_embedded_password_probe_and_session_key_follow_active_segment(tmp_path)
     result = extractor.extract(task, str(tmp_path / "out"))
 
     assert result.success is True
-    assert [key for key, _ in resolver.calls] == [f"{task.key}#first", f"{task.key}#second"]
+    assert len({key for key, _ in resolver.calls}) == 2
+    assert all(key.startswith(f"{task.key}#zip:") for key, _ in resolver.calls)
     assert [call[1]["parts"][0]["start"] for call in resolver.calls] == [7, 17]
 
 

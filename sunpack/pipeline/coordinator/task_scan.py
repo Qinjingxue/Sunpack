@@ -1,6 +1,8 @@
 import os
 from typing import Any
 
+from sunpack_native import relations_logical_name
+
 from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
 from sunpack.core.contracts.discovery import StageResult
 from sunpack.core.contracts.run_state import RunState
@@ -129,7 +131,7 @@ class ArchiveTaskScanner:
 def direct_file_task(path: str, all_parts: list[str] | None = None) -> ArchiveTask:
     path = os.path.abspath(os.path.normpath(path))
     name = os.path.basename(path)
-    logical_name = name
+    logical_name = relations_logical_name(name, True) or name
     parts = [
         os.path.abspath(os.path.normpath(item))
         for item in (all_parts or [path])

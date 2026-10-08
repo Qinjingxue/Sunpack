@@ -342,6 +342,22 @@ def test_ordinary_part_words_keep_their_output_name(name, expected):
     assert RelationsScheduler().logical_name_for_archive(name) == expected
 
 
+@pytest.mark.parametrize("name,expected", [
+    ("release.v2.tar.gz", "release.v2"),
+    ("release.v2.tar.xz", "release.v2"),
+    ("release.v2.tar.gz.001", "release.v2"),
+    ("release.v2.zip.txt", "release.v2"),
+    ("release.v2.zip.001", "release.v2"),
+    ("release.v2.part1.rar.001", "release.v2"),
+    ("release.v2.TAR.ZST", "release.v2"),
+    ("release.v2.lz4", "release.v2"),
+    ("版本.v2.tar.bz2", "版本.v2"),
+    (".zip", ".zip"),
+])
+def test_archive_filename_excludes_format_suffixes_and_keeps_name_dots(name, expected):
+    assert RelationsScheduler().logical_name_for_archive(name) == expected
+
+
 @pytest.mark.parametrize("suffix", ["z", "zx", "ZX"])
 def test_public_parser_accepts_modern_split_zip_members(suffix):
     scheduler = RelationsScheduler()

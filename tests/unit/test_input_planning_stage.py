@@ -94,7 +94,7 @@ def test_input_planning_stage_writes_extractable_segment_without_switching_task_
         "entry_path": str(archive),
         "open_mode": "file_range",
         "format_hint": "zip",
-        "logical_name": "case_01_zip",
+        "logical_name": "case",
         "parts": [{"path": str(archive), "role": "main", "start": 4, "end": 40}],
         "analysis": {"status": "extractable", "confidence": 0.99, "damage_flags": []},
     }
@@ -186,13 +186,14 @@ def test_input_planning_stage_records_multiple_segments_on_original_task(tmp_pat
     assert tasks == [task]
     assert task.archive_input().format_hint == "rar"
     segments = knowledge_view.source_extractable_segments(task)
-    assert [item["logical_name"] for item in segments] == ["case_01_rar", "case_02_7z"]
+    assert [item["logical_name"] for item in segments] == ["case", "case"]
+    assert [item["segment_id"] for item in segments] == ["embedded_01", "embedded_02"]
     assert segments[0]["archive_input"] == {
         "kind": "archive_input",
         "entry_path": str(carrier),
         "open_mode": "file_range",
         "format_hint": "rar",
-        "logical_name": "case_01_rar",
+        "logical_name": "case",
         "parts": [{"path": str(carrier), "role": "main", "start": 4, "end": 32}],
         "analysis": {"status": "extractable", "confidence": 0.97, "damage_flags": []},
     }
@@ -369,7 +370,7 @@ def test_input_planning_stage_maps_split_logical_segment_to_concat_ranges(tmp_pa
         "entry_path": str(part1),
         "open_mode": "concat_ranges",
         "format_hint": "7z",
-        "logical_name": "case_01_7z",
+        "logical_name": "case",
         "ranges": [
             {"path": str(part1), "start": 8, "end": 10},
             {"path": str(part2), "start": 0, "end": 10},

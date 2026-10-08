@@ -6,7 +6,7 @@ from dataclasses import dataclass, replace
 import os
 from typing import Any
 
-from sunpack_native import inspect_pe_image
+from sunpack_native import inspect_pe_image, relations_logical_name
 
 from sunpack.core.contracts.archive_input import (
     ArchiveInputDescriptor,
@@ -302,16 +302,15 @@ class EmbeddedDiscovery:
 
         physical.sort(key=lambda item: (item.offset, -item.confidence, item.format))
         segments: list[tuple[ArchiveInputDescriptor, dict[str, Any]]] = []
-        base_name = candidate.logical_name or os.path.basename(path)
-        for index, item in enumerate(physical, start=1):
-            logical_name = f"{base_name}_{index:02d}_{item.format}"
+        base_name = candidate.logical_name or relations_logical_name(os.path.basename(path), True)
+        for item in physical:
             descriptor = _descriptor_for_candidate(
                 path,
                 size,
                 item.format,
                 item.offset,
                 item.end_offset,
-                logical_name,
+                base_name,
                 confidence=float(item.confidence),
                 password_required=item.password_required,
                 execution_analysis={"stream_plan": item.stream_plan} if item.stream_plan else None,
@@ -359,14 +358,14 @@ def _blocked_findings(
     """Project already-scanned archive identities without creating execution tasks."""
 
     resolved_rows = resolved_rows or {}
-    base_name = os.path.basename(path)
+    base_name = relations_logical_name(os.path.basename(path), True)
     findings: list[DiscoveryFinding] = []
     logical = [
         item
         for item in scan.candidates
         if item.candidate_kind == "logical_archive"
     ]
-    for index, item in enumerate(logical, start=1):
+    for item in logical:
         resolved = resolved_rows.get(item.offset)
         end_offset = resolved[0] if resolved is not None else item.end_offset
         boundary_kind = "exact" if resolved is not None else item.boundary_kind
@@ -381,7 +380,7 @@ def _blocked_findings(
             format=item.format,
             status="blocked",
             reason=finding_reason,
-            logical_name=f"{base_name}_{index:02d}_{item.format}",
+            logical_name=base_name,
             part_paths=(path,),
             offset=int(item.offset),
             end_offset=int(end_offset) if end_offset is not None else None,

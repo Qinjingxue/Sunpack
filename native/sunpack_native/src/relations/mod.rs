@@ -1342,18 +1342,6 @@ fn get_logical_name(filename: &str, is_archive: bool) -> String {
 }
 
 fn logical_name_from_parsed(parsed: &ParsedVolume) -> String {
-    if matches!(
-        parsed.style,
-        "rar_part" | "rar_sfx_part" | "part_numbered" | "rar_oldstyle" | "zip_spanned"
-    ) || parsed.family == "generic"
-    {
-        return clean_logical_name(&parsed.prefix);
-    }
-    let suffix = format!(".{}", parsed.family);
-    let lower = parsed.prefix.to_ascii_lowercase();
-    if lower.ends_with(&suffix) {
-        return clean_logical_name(&parsed.prefix[..parsed.prefix.len() - suffix.len()]);
-    }
     clean_logical_name(&parsed.prefix)
 }
 
@@ -1805,7 +1793,24 @@ fn basename(path: &str) -> &str {
 }
 
 fn clean_logical_name(value: &str) -> String {
-    value.trim().trim_end_matches('.').to_string()
+    let mut name = value.trim().trim_end_matches('.');
+    // Keep archive suffixes in the format/volume attributes, never in the
+    // logical filename. Work on borrowed slices even for compound suffixes.
+    let basename_start = name.len() - basename(name).len();
+    while let Some((stem, suffix)) = name[basename_start..].rsplit_once('.') {
+        if stem.is_empty()
+            || ![
+                "7z", "rar", "zip", "zipx", "tar", "gz", "gzip", "bz2", "bzip2", "xz",
+                "zst", "zstd", "lz4", "tgz", "tbz", "tbz2", "txz", "exe", "enc",
+            ]
+            .iter()
+            .any(|ext| suffix.eq_ignore_ascii_case(ext))
+        {
+            break;
+        }
+        name = &name[..basename_start + stem.len()];
+    }
+    name.to_string()
 }
 
 fn re(pattern: &str) -> Regex {

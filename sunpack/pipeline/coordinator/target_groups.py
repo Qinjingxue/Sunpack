@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from sunpack_native import relations_logical_name
+
 from sunpack.core.contracts.discovery import DiscoveryCandidate
 from sunpack.core.contracts.archive_input import ArchiveInputDescriptor, ArchiveInputPart, InputExtent
 from sunpack.core.contracts.filesystem import DirectorySnapshot
@@ -64,7 +66,7 @@ def filesystem_candidate(
             logical_name=(
                 logical_name
                 if logical_name is not None
-                else path.rsplit("\\", 1)[-1].rsplit("/", 1)[-1]
+                else relations_logical_name(path.rsplit("\\", 1)[-1].rsplit("/", 1)[-1], True)
             ),
             format_hint=str(format_hint or "").lower(),
         ),

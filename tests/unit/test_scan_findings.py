@@ -38,7 +38,7 @@ def test_scan_report_preserves_blocked_findings_without_creating_tasks(monkeypat
         format="rar",
         status="blocked",
         reason="embedded_password_required",
-        logical_name="carrier.bin_01_rar",
+        logical_name="carrier",
         part_paths=("carrier.bin",),
         offset=128,
         end_offset=None,
@@ -60,8 +60,8 @@ def test_scan_report_preserves_blocked_findings_without_creating_tasks(monkeypat
 
 def test_scan_report_projects_multiple_embedded_findings_from_one_task(monkeypatch):
     path = "carrier.bin"
-    first = _segment(path, "zip", 16, 64, "carrier_01_zip")
-    second = _segment(path, "7z", 96, 160, "carrier_02_7z")
+    first = _segment(path, "zip", 16, 64, "carrier")
+    second = _segment(path, "7z", 96, 160, "carrier")
     task = ArchiveTask.from_archive_input(
         first[0],
         discovery_source="embedded",
@@ -78,6 +78,7 @@ def test_scan_report_projects_multiple_embedded_findings_from_one_task(monkeypat
 
     assert len(report.tasks) == 1
     assert [finding.format for finding in report.findings] == ["zip", "7z"]
+    assert [finding.logical_name for finding in report.findings] == ["carrier", "carrier"]
     assert [finding.offset for finding in report.findings] == [16, 96]
     assert [finding.end_offset for finding in report.findings] == [64, 160]
     assert all(finding.status == "resolved" for finding in report.findings)

@@ -108,6 +108,8 @@ class OutputPathAllocator:
         path: str,
         reserved: Container[str],
         local_reserved: Container[str] = (),
+        *,
+        is_directory: bool = False,
     ) -> str:
         candidate = os.path.normpath(path)
         key = absolute_path_key(candidate)
@@ -115,7 +117,8 @@ class OutputPathAllocator:
             return candidate
 
         parent = os.path.dirname(candidate)
-        stem, extension = os.path.splitext(os.path.basename(candidate))
+        name = os.path.basename(candidate)
+        stem, extension = (name, "") if is_directory else os.path.splitext(name)
         match = re.fullmatch(r"(.*)\((\d+)\)", stem)
         base_stem = stem if match is None else match.group(1)
         start = 1 if match is None else int(match.group(2)) + 1

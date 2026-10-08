@@ -6,6 +6,8 @@ from contextlib import nullcontext
 from typing import Any, Callable
 
 from sunpack.core.support.resource_lifecycle import task_walk
+from sunpack.core.support.output_paths import OutputPathAllocator
+from sunpack.core.support.path_keys import absolute_path_key
 
 from sunpack.core.contracts.failures import FailureInfo, FailureKind
 from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
@@ -475,9 +477,8 @@ class SingleArchiveExtractor:
     def _password_archive_key(task: ArchiveTask) -> str:
         """Keep password resolution state local to the active logical input.
 
-        Ordinary tasks retain their historical key.  Carved/concatenated
-        inputs include the planner-assigned logical name, which is stable and
-        unique per embedded segment.
+        Ordinary tasks retain their key. Carved/concatenated inputs use
+        their format and physical ranges; the filename is display data.
         """
         try:
             descriptor = task.archive_input()
@@ -485,13 +486,11 @@ class SingleArchiveExtractor:
             return task.key
         if descriptor.open_mode not in {"file_range", "concat_ranges"}:
             return task.key
-        logical_name = str(descriptor.logical_name or "").strip()
-        if logical_name:
-            return f"{task.key}#{logical_name}"
-        extent = descriptor.primary_extent
-        if extent is not None:
-            return f"{task.key}#range:{int(extent.start)}:{extent.end}"
-        return f"{task.key}#{descriptor.open_mode}:{descriptor.entry_path}"
+        extents = descriptor.extents if descriptor.open_mode == "concat_ranges" else (
+            part.extent for part in descriptor.parts
+        )
+        ranges = tuple((extent.path, extent.start, extent.end) for extent in extents)
+        return f"{task.key}#{descriptor.format_hint}:{ranges!r}"
 
     def _failed(
         self,
@@ -719,10 +718,19 @@ class SingleArchiveExtractor:
         any_success = False
         any_partial = False
         segment_failures: list[FailureInfo] = []
+        segment_paths: set[str] = set()
+        segment_allocator = OutputPathAllocator()
 
         for position, segment in enumerate(segments, start=1):
-            fmt = str(segment.get("format") or "archive").replace("/", "_") or "archive"
-            segment_id = str(segment.get("segment_id") or f"embedded_{position:02d}_{fmt}")
+            segment_id = str(segment.get("segment_id") or f"embedded_{position:02d}")
+            with _phase(phase_timer, f"{phase_prefix}_segment_descriptor"):
+                descriptor = ArchiveInputDescriptor.from_any(
+                    segment.get("archive_input") if isinstance(segment.get("archive_input"), dict) else None,
+                    archive_path=archive,
+                    part_paths=all_parts,
+                    format_hint=str(segment.get("format") or ""),
+                    logical_name=str(segment.get("logical_name") or task.logical_name),
+                )
             # A single embedded payload is the logical archive represented by
             # this task (the common SFX case).  Extract it at the task output
             # root so manifest paths continue to match.  Multiple independent
@@ -730,16 +738,13 @@ class SingleArchiveExtractor:
             segment_dir = (
                 out_dir
                 if len(segments) == 1
-                else os.path.join(out_dir, self._safe_segment_dir_name(segment_id, position, fmt))
-            )
-            with _phase(phase_timer, f"{phase_prefix}_segment_descriptor"):
-                descriptor = ArchiveInputDescriptor.from_any(
-                    segment.get("archive_input") if isinstance(segment.get("archive_input"), dict) else None,
-                    archive_path=archive,
-                    part_paths=all_parts,
-                    format_hint=str(segment.get("format") or ""),
-                    logical_name=str(segment.get("logical_name") or segment_id),
+                else segment_allocator.next_available(
+                    os.path.join(out_dir, self._safe_segment_dir_name(descriptor.logical_name, position)),
+                    segment_paths,
+                    is_directory=True,
                 )
+            )
+            segment_paths.add(absolute_path_key(segment_dir))
             try:
                 with _phase(phase_timer, f"{phase_prefix}_segment_set_archive_input"):
                     # Carrier archive knowledge is not valid for each
@@ -948,10 +953,10 @@ class SingleArchiveExtractor:
         )
 
     @staticmethod
-    def _safe_segment_dir_name(segment_id: str, position: int, fmt: str) -> str:
-        raw = segment_id or f"embedded_{position:02d}_{fmt or 'archive'}"
-        safe = "".join(ch if ch.isalnum() or ch in {"-", "_", "."} else "_" for ch in raw)
-        return safe or f"embedded_{position:02d}_{fmt or 'archive'}"
+    def _safe_segment_dir_name(logical_name: str, position: int) -> str:
+        raw = os.path.basename(logical_name) or f"embedded_{position:02d}"
+        safe = "".join("_" if ch in '<>:"/\\|?*' or ord(ch) < 32 else ch for ch in raw)
+        return safe if safe.strip(".") else f"embedded_{position:02d}"
 
 
     @staticmethod

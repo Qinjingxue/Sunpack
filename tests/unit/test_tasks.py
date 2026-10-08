@@ -18,7 +18,7 @@ def test_archive_task_key_uses_path_for_non_split_same_stem_archives():
     assert second.key == "C:/work/collision.zip"
 
 
-def test_archive_task_key_keeps_logical_name_for_split_archives():
+def test_archive_task_key_uses_entry_path_for_split_archives():
     descriptor = ArchiveInputDescriptor.from_split_volumes(
         archive_path="C:/work/game.7z.001",
         volumes=[{
@@ -34,7 +34,18 @@ def test_archive_task_key_keeps_logical_name_for_split_archives():
     )
     task = make_task_from_descriptor(descriptor)
 
-    assert task.key == "game"
+    assert task.key == "C:/work/game.7z.001"
+
+    other = make_task_from_descriptor(ArchiveInputDescriptor.from_split_volumes(
+        archive_path="C:/work/game.zip.001",
+        volumes=[{
+            "path": "C:/work/game.zip.001", "number": 1, "style": "numeric_suffix",
+            "prefix": "game.zip.", "width": 3, "role": "first",
+        }],
+        format_hint="zip", logical_name="game",
+    ))
+    assert other.logical_name == task.logical_name
+    assert other.key != task.key
 
 
 def test_archive_input_normalizes_rar_sfx_head_with_rar_members():

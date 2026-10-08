@@ -1,4 +1,5 @@
 from tests.helpers.archive_tasks import make_archive_task
+from sunpack.pipeline.coordinator.task_scan import direct_file_task
 from sunpack.core.support.output_paths import default_output_dir_for_task
 from sunpack.core.support.output_reservation import build_output_dir_resolver
 
@@ -64,3 +65,24 @@ def test_nested_archive_under_output_root_keeps_generated_parent(tmp_path):
     )
 
     assert result == str(output_root / "outer" / "inner")
+
+
+def test_direct_input_keeps_filename_separate_from_disguised_format(tmp_path):
+    source = tmp_path / "release.v2.zip.txt"
+    task = direct_file_task(str(source))
+
+    assert task.logical_name == "release.v2"
+    assert task.main_path == str(source)
+    assert task.archive_input().format_hint == ""
+    assert default_output_dir_for_task(task) == str(tmp_path / "release.v2")
+
+
+def test_directory_numbering_appends_after_dotted_filename(tmp_path):
+    archive = tmp_path / "release.v2.zip"
+    (tmp_path / "release.v2").mkdir()
+    (tmp_path / "release.v2(1)").mkdir()
+    task = direct_file_task(str(archive))
+
+    resolver = build_output_dir_resolver([task], default_output_dir_for_task)
+
+    assert resolver(task) == str(tmp_path / "release.v2(2)")
