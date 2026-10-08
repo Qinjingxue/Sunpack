@@ -244,6 +244,10 @@ jobs:
     name: Acceptance Tests
     uses: ./.github/workflows/acceptance.yml
 
+  enc:
+    name: ENC Windows Backends
+    uses: ./.github/workflows/enc.yml
+
   release:
     name: Publish GitHub Release
     if: ${{ startsWith(github.ref, 'refs/tags/') }}
@@ -251,6 +255,7 @@ jobs:
       - build-notes
       - build
       - acceptance
+      - enc
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:

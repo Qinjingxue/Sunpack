@@ -292,10 +292,26 @@ mod neon;
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    #[ignore = "manual ARM64 crossover measurement"]
+    fn arm64_crossover() {
+        let cipher = Serpent::new(&[0x73; 32]);
+        backend::arm_tests::crossover(
+            "serpent",
+            &cipher,
+            16,
+            4,
+            &[1, 2, 3, 4, 5, 8],
+            Serpent::encrypt_scalar,
+            Serpent::encrypt_neon,
+            Serpent::encrypt,
+        );
+    }
     use cipher5::{BlockCipherEncrypt, KeyInit};
 
     #[test]
-    fn scalar_and_avx2_match_upstream_with_tails_and_unaligned_slices() {
+    fn scalar_and_accelerated_match_upstream_with_tails_and_unaligned_slices() {
         let mut seed = 0x7319a953u32;
         let mut next = || {
             seed ^= seed << 13;
@@ -324,6 +340,14 @@ mod tests {
                 let mut scalar = bytes.clone();
                 cipher.encrypt_scalar(&mut scalar[prefix..prefix + blocks * 16]);
                 assert_eq!(scalar, expected);
+                #[cfg(target_arch = "aarch64")]
+                {
+                    let mut direct = bytes.clone();
+                    let bulk = blocks / 4 * 64;
+                    unsafe { neon::encrypt(&cipher.keys, &mut direct[prefix..prefix + bulk]) };
+                    cipher.encrypt_scalar(&mut direct[prefix + bulk..prefix + blocks * 16]);
+                    assert_eq!(direct, expected);
+                }
                 cipher.encrypt(&mut bytes[prefix..prefix + blocks * 16]);
                 assert_eq!(bytes, expected);
                 #[cfg(target_arch = "x86_64")]

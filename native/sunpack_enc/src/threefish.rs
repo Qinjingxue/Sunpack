@@ -238,8 +238,24 @@ mod neon;
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_arch = "aarch64")]
     #[test]
-    fn scalar_and_avx2_match_upstream_for_unaligned_groups_and_tails() {
+    #[ignore = "manual ARM64 crossover measurement"]
+    fn arm64_crossover() {
+        let cipher = Threefish::new(&[0x73; 128]);
+        backend::arm_tests::crossover(
+            "threefish",
+            &cipher,
+            128,
+            2,
+            &[1, 2, 3, 4],
+            Threefish::encrypt_scalar,
+            Threefish::encrypt_neon,
+            Threefish::encrypt,
+        );
+    }
+    #[test]
+    fn scalar_and_accelerated_match_upstream_for_unaligned_groups_and_tails() {
         let mut seed = 0x92f1_038du32;
         let mut next = || {
             seed ^= seed << 13;
@@ -273,6 +289,14 @@ mod tests {
                     let mut direct = input.clone();
                     let bulk = blocks / 4 * 512;
                     unsafe { avx2::encrypt(&cipher.keys, &mut direct[prefix..prefix + bulk]) };
+                    cipher.encrypt_scalar(&mut direct[prefix + bulk..prefix + blocks * 128]);
+                    assert_eq!(direct, expected);
+                }
+                #[cfg(target_arch = "aarch64")]
+                {
+                    let mut direct = input.clone();
+                    let bulk = blocks / 2 * 256;
+                    unsafe { neon::encrypt(&cipher.keys, &mut direct[prefix..prefix + bulk]) };
                     cipher.encrypt_scalar(&mut direct[prefix + bulk..prefix + blocks * 128]);
                     assert_eq!(direct, expected);
                 }

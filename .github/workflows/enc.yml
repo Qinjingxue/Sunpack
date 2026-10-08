@@ -1,0 +1,114 @@
+name: ENC Windows Backends
+
+on:
+  pull_request:
+    paths:
+      - "native/**"
+      - "sunpack/**"
+      - "tests/**enc*"
+      - "tests/helpers/**"
+      - "scripts/**"
+      - ".github/workflows/enc.yml"
+  workflow_dispatch:
+    inputs:
+      measure_arm64:
+        description: "Measure ARM64 short/bulk crossover (diagnostic, no timing gate)"
+        type: boolean
+        default: true
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  enc:
+    name: ENC ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: windows-2022
+            target: x86_64-pc-windows-msvc
+            python: "3.11"
+          - arch: arm64
+            runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            python: "3.12"
+    env:
+      PYTHONPATH: ${{ github.workspace }}
+      CARGO_TARGET_DIR: ${{ github.workspace }}\.cache\rust-target\${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+          architecture: ${{ matrix.arch }}
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - name: Set up native Rust
+        shell: pwsh
+        run: |
+          rustup default stable
+          rustup target add ${{ matrix.target }}
+          rustc -Vv
+          $hostInfo = rustc -Vv
+          if ($hostInfo -notcontains "host: ${{ matrix.target }}") {
+            throw "ENC tests must execute on the native target host"
+          }
+      - name: Rust ENC correctness
+        shell: pwsh
+        run: |
+          cargo test --manifest-path native/Cargo.toml --locked -p sunpack-enc --release --lib -- --nocapture 2>&1 | Tee-Object enc-rust.txt
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: ARM64 crossover
+        if: matrix.arch == 'arm64' && inputs.measure_arm64 == true
+        shell: pwsh
+        run: |
+          cargo test --manifest-path native/Cargo.toml --locked -p sunpack-enc --release --lib arm64_crossover -- --ignored --nocapture --test-threads=1 2>&1 | Tee-Object enc-crossover.txt
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Prepare native worker and Python extension
+        shell: pwsh
+        run: .\scripts\setup_windows_dev.ps1 -Arch ${{ matrix.arch }} -SkipAcceptanceTestTools
+      # Java only generates independent fixtures; x64 Java can also run on Windows ARM.
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "21"
+          architecture: x64
+      - name: Prepare official SSE fixture engine
+        shell: pwsh
+        run: |
+          $referenceRoot = "reference/implementations/SSEFilePC"
+          New-Item -ItemType Directory -Force $referenceRoot | Out-Null
+          Invoke-WebRequest https://paranoiaworks.mobi/download/files/SSEFilePC.zip -OutFile "$env:RUNNER_TEMP/SSEFilePC.zip"
+          Expand-Archive -LiteralPath "$env:RUNNER_TEMP/SSEFilePC.zip" -DestinationPath $referenceRoot
+          if (-not (Test-Path "$referenceRoot/S.S.E. File Encryptor for PC/ssefenc.jar")) {
+            throw "Official SSE fixture engine missing"
+          }
+          java -version
+          javac -version
+      - name: Worker ENC vectors, concurrency, ranges and recursion
+        shell: pwsh
+        run: |
+          & .\.venv\Scripts\python.exe -m pytest -q tests/unit/test_enc_support.py tests/integration/test_enc_parallel_worker.py tests/integration/test_enc_pipeline.py --junitxml=enc-worker.xml
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          [xml]$report = Get-Content enc-worker.xml
+          foreach ($suite in $report.testsuites.testsuite) {
+            if ([int]$suite.skipped -ne 0) { throw "ENC coverage was skipped" }
+          }
+      - name: Upload ENC validation
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: enc-validation-${{ matrix.arch }}
+          path: |
+            enc-rust.txt
+            enc-crossover.txt
+            enc-worker.xml
+          if-no-files-found: warn
+          retention-days: 14

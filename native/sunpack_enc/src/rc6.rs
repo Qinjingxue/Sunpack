@@ -237,12 +237,28 @@ mod neon;
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    #[ignore = "manual ARM64 crossover measurement"]
+    fn arm64_crossover() {
+        let cipher = Rc6::new(&[0x73; 32]);
+        backend::arm_tests::crossover(
+            "rc6",
+            &cipher,
+            16,
+            4,
+            &[1, 2, 3, 4, 5, 8],
+            Rc6::encrypt_scalar,
+            Rc6::encrypt_neon,
+            Rc6::encrypt,
+        );
+    }
     use cipher5::{
         consts::{U20, U32},
         BlockCipherEncrypt,
     };
     #[test]
-    fn scalar_and_avx2_match_upstream_with_unaligned_groups_and_tails() {
+    fn scalar_and_accelerated_match_upstream_with_unaligned_groups_and_tails() {
         let mut seed = 0x591a_130du32;
         let mut next = || {
             seed ^= seed << 13;
@@ -272,6 +288,15 @@ mod tests {
                     let mut direct = input.clone();
                     let bulk = blocks / 8 * 128;
                     unsafe { avx2::encrypt(&cipher.keys, &mut direct[prefix..prefix + bulk]) };
+                    cipher.encrypt_scalar(&mut direct[prefix + bulk..prefix + blocks * 16]);
+                    assert_eq!(direct, expected);
+                }
+                #[cfg(target_arch = "aarch64")]
+                {
+                    let mut direct = input.clone();
+                    let bulk = blocks / 4 * 64;
+                    // Target baseline permits forcing NEON independently of dispatch.
+                    unsafe { neon::encrypt(&cipher.keys, &mut direct[prefix..prefix + bulk]) };
                     cipher.encrypt_scalar(&mut direct[prefix + bulk..prefix + blocks * 16]);
                     assert_eq!(direct, expected);
                 }

@@ -11,12 +11,13 @@ from sunpack.pipeline.discovery.detection.input_planning import ArchiveInputPlan
 from sunpack.pipeline.discovery.filesystem.directory_scanner import DirectoryScanner
 from tests.helpers.archive_tasks import make_archive_task
 from tests.helpers.config_factory import make_config
-from tests.unit.test_lz4_support import BUILD
+from sunpack.core.support.resources import get_sevenzip_bridge_worker_path
 import subprocess
 from sunpack_native import enc_fast_verify_passwords, enc_fast_verify_passwords_from_ranges
 
 ROOT = Path(__file__).resolve().parents[2]
 DATA = ROOT / "native" / "sunpack_enc" / "tests" / "data"
+BUILD = Path(get_sevenzip_bridge_worker_path()).parent
 
 
 def worker(path, output, candidates=("sunpack-test",), *, origin="foreground"):

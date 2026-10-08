@@ -57,7 +57,8 @@ retain separate pools.
 
 Custom cipher ISA policy lives in `src/backend.rs`. One process-wide, immutable
 capability record detects x64 AVX2 and SHA-NI (including SSSE3/SSE4.1), or ARM64
-NEON and SHA2 independently. RC6, Serpent, Threefish and SHACAL bind an encrypt
+SHA2. Windows ARM64 NEON is a target baseline, so vector backends bind without
+runtime NEON detection. RC6, Serpent, Threefish and SHACAL bind an encrypt
 function when their key is expanded; the decrypt hot loop does not check ISA
 availability. The record contains only CPU flags, with no keys or scratch space.
 AES, Argon2 and the portable SHACAL compression helper retain their upstream
@@ -69,7 +70,14 @@ two-block SHA-NI kernel or ARM four-block SHA2 kernel, including hardware tails.
 Twofish keeps its eight-block interleave and const-generic tails. Unsupported ISA
 falls back to the existing scalar/portable implementation selected at construction;
 AVX2 does not imply SHA-NI, and NEON does not imply SHA2. Release CPU requirements
-are unchanged. ARM64 backends still await real Windows ARM64 validation.
+are unchanged. `ENC Windows Backends` runs native release library tests and
+worker ENC tests on Windows x64 and ARM64, including independent SSE large
+payloads for all ten algorithms, CLI/Watch concurrency, carriers and recursion.
+Direct ISA tests compare NEON against scalar/upstream and SHA2 against portable
+compression; SHA2-unavailable dispatch is tested with instruction-free callbacks.
+Manual workflow runs can also measure RC6/Serpent 1–5/8-block, Threefish 1–4-block,
+and SHACAL 1–4-block crossover via ignored `arm64_crossover` tests. Measurements
+exclude KDF/key expansion and report padded SIMD separately from normal dispatch.
 
 Bounded parallel MAC and writer probes remain benchmark-only. Production has
 no MAC experiment mode, double buffer, special AES thread policy or ENC-to-ZIP
