@@ -10,6 +10,8 @@ mod gost;
 mod rc6;
 #[path = "serpent.rs"]
 mod serpent;
+#[path = "shacal.rs"]
+mod shacal;
 #[path = "threefish.rs"]
 mod threefish;
 #[path = "twofish.rs"]
@@ -23,7 +25,7 @@ enum Primitive {
     Twofish(twofish::Twofish),
     Gost(gost::Gost),
     Threefish(threefish::Threefish),
-    Shacal([u8; 64]),
+    Shacal(shacal::Shacal),
 }
 impl Primitive {
     fn new(code: u8, key: &[u8]) -> (Self, usize) {
@@ -35,7 +37,7 @@ impl Primitive {
             4 => (Self::Twofish(twofish::Twofish::new(key)), 16),
             5 => (Self::Gost(gost::Gost::new(key)), 8),
             7 => (Self::Threefish(threefish::Threefish::new(key)), 128),
-            8 => (Self::Shacal(key.try_into().unwrap()), 32),
+            8 => (Self::Shacal(shacal::Shacal::new(key)), 32),
             _ => unreachable!(),
         }
     }
@@ -48,23 +50,7 @@ impl Primitive {
             Self::Gost(c) => c.encrypt(bytes),
             Self::Threefish(c) => c.encrypt(bytes),
             Self::Rc6(c) => c.encrypt(bytes),
-            Self::Shacal(key) => {
-                for block in bytes.chunks_exact_mut(32) {
-                    let mut state = [0u32; 8];
-                    for (dst, src) in state.iter_mut().zip(block.chunks_exact(4)) {
-                        *dst = u32::from_be_bytes(src.try_into().unwrap());
-                    }
-                    let initial = state;
-                    // SHA-256 compression is SHACAL-2 plus feed-forward. Undo the
-                    // latter, reusing the upstream optimized round implementation.
-                    sha2::compress256(&mut state, &[(*key).into()]);
-                    for ((value, old), dst) in
-                        state.iter().zip(initial).zip(block.chunks_exact_mut(4))
-                    {
-                        dst.copy_from_slice(&value.wrapping_sub(old).to_be_bytes());
-                    }
-                }
-            }
+            Self::Shacal(c) => c.encrypt(bytes),
         }
     }
 }

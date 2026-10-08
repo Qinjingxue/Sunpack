@@ -137,24 +137,82 @@ impl Twofish {
             ^ self.tables[3][b[3] as usize]
     }
     pub(super) fn encrypt(&self, bytes: &mut [u8]) {
-        for block in bytes.chunks_exact_mut(16) {
-            let mut p = [0u32; 4];
+        debug_assert_eq!(bytes.len() % 16, 0);
+        for group in bytes.chunks_exact_mut(128) {
+            self.encrypt_group::<8>(group);
+        }
+        let n = bytes.len() / 128 * 128;
+        let tail = &mut bytes[n..];
+        match tail.len() / 16 {
+            0 => (),
+            1 => self.encrypt_group::<1>(tail),
+            2 => self.encrypt_group::<2>(tail),
+            3 => self.encrypt_group::<3>(tail),
+            4 => self.encrypt_group::<4>(tail),
+            5 => self.encrypt_group::<5>(tail),
+            6 => self.encrypt_group::<6>(tail),
+            7 => self.encrypt_group::<7>(tail),
+            _ => unreachable!(),
+        }
+    }
+    #[inline(always)]
+    fn encrypt_group<const N: usize>(&self, bytes: &mut [u8]) {
+        let mut states = [[0u32; 4]; N];
+        for (p, block) in states.iter_mut().zip(bytes.chunks_exact(16)) {
             for (i, word) in block.chunks_exact(4).enumerate() {
                 p[i] = u32::from_le_bytes(word.try_into().unwrap()) ^ self.keys[i];
             }
-            for round in 0..8 {
-                let k = 4 * round + 8;
+        }
+        for round in 0..8 {
+            let k = 4 * round + 8;
+            for p in &mut states {
                 let t1 = self.g(p[1].rotate_left(8));
                 let t0 = self.g(p[0]).wrapping_add(t1);
                 p[2] = (p[2] ^ t0.wrapping_add(self.keys[k])).rotate_right(1);
                 p[3] = p[3].rotate_left(1) ^ t1.wrapping_add(t0).wrapping_add(self.keys[k + 1]);
+            }
+            for p in &mut states {
                 let t1 = self.g(p[3].rotate_left(8));
                 let t0 = self.g(p[2]).wrapping_add(t1);
                 p[0] = (p[0] ^ t0.wrapping_add(self.keys[k + 2])).rotate_right(1);
                 p[1] = p[1].rotate_left(1) ^ t1.wrapping_add(t0).wrapping_add(self.keys[k + 3]);
             }
+        }
+        for (p, block) in states.into_iter().zip(bytes.chunks_exact_mut(16)) {
             for (i, value) in [p[2], p[3], p[0], p[1]].into_iter().enumerate() {
                 block[4 * i..4 * i + 4].copy_from_slice(&(value ^ self.keys[4 + i]).to_le_bytes());
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cipher::{BlockEncrypt, KeyInit};
+    #[test]
+    fn interleaved_groups_and_tails_match_upstream() {
+        let mut seed = 0x731d_936bu32;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed as u8
+        };
+        for _ in 0..16 {
+            let key: [u8; 32] = std::array::from_fn(|_| next());
+            let cipher = Twofish::new(&key);
+            let reference = ::twofish::Twofish::new_from_slice(&key).unwrap();
+            for count in 0..=33 {
+                let prefix = count * 3 % 32;
+                let mut bytes: Vec<u8> = (0..prefix + count * 16 + 7).map(|_| next()).collect();
+                let mut expected = bytes.clone();
+                for block in expected[prefix..prefix + count * 16].chunks_exact_mut(16) {
+                    reference
+                        .encrypt_block(cipher::Block::<::twofish::Twofish>::from_mut_slice(block));
+                }
+                cipher.encrypt(&mut bytes[prefix..prefix + count * 16]);
+                assert_eq!(bytes, expected);
             }
         }
     }

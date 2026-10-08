@@ -68,6 +68,16 @@ impl Threefish {
         } else {
             bytes
         };
+        #[cfg(target_arch = "aarch64")]
+        let bytes = if bytes.len() >= 256 && std::arch::is_aarch64_feature_detected!("neon") {
+            let n = bytes.len() / 256 * 256;
+            let (bulk, tail) = bytes.split_at_mut(n);
+            // SAFETY: detected NEON; complete two-block groups, unaligned loads.
+            unsafe { neon::encrypt(&self.keys, bulk) };
+            tail
+        } else {
+            bytes
+        };
         self.encrypt_scalar(bytes);
     }
     fn encrypt_scalar(&self, bytes: &mut [u8]) {
@@ -196,6 +206,10 @@ mod avx2 {
         }
     }
 }
+
+#[cfg(target_arch = "aarch64")]
+#[path = "threefish_neon.rs"]
+mod neon;
 
 #[cfg(test)]
 mod tests {

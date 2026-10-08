@@ -464,7 +464,8 @@ fn parallel_decryption_authenticates_multibuffer_payload_and_recovery() {
                                 &mut Cursor::new(&bytes),
                                 &mut output,
                                 |wanted| {
-                                    let decrypt_n = (encrypted_end - position.get())
+                                    let decrypt_n = encrypted_end
+                                        .saturating_sub(position.get())
                                         .min(BUFFER as u64)
                                         as usize;
                                     assert_eq!(

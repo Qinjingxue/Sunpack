@@ -1,5 +1,166 @@
 # ENC v4 后续优化
 
+## 2026-10-08 第五轮：Twofish 交错、MAC 实验与 ARM64 后端
+
+基线为干净的 `dc208f41`。本轮保留 Twofish 八块交错和 ARM64 后端，
+撤回未取得稳定端到端收益的并行 MAC。结果目录：
+`benchmarks/results/enc-v4-optimization/20261008-round5`。
+修改前保存了基线 release examples/worker；最终 worker 与扩展重新构建。
+
+### Twofish：保留八块交错
+
+复用已有 4 KiB keyed S-box/MDS table 和 key schedule，每半轮依次处理
+多块独立状态，隐藏 table lookup 的依赖延迟。bulk 使用八块，尾部
+1～7 块使用同一 const-generic round function；删除原来的逐块完整轮
+实现。没有 SIMD gather、额外 keyed table、heap buffer 或线程池。
+全部 CTR 切片继续共享一个展开密钥；key/table 在 cipher 释放时清零。
+
+新增独立 RustCrypto Twofish 对照，覆盖 16 组随机 key、0～33 blocks、
+非对齐切片和所有尾块数。真实 worker 加入独立 Java/SSE Twofish 大载荷，
+覆盖既有额度、executor、错误密码、MAC 损坏、CLI/watch 和载体分段测试。
+
+Windows x64 / i9-13980HX / release / `parallel-kdf,parallel-decrypt`。
+新增 `benchmarks.scenarios.enc_compute_ab`，交替执行预先构建的原生
+examples。统一 affinity `0,2,4,6`、`RAYON_NUM_THREADS=4`；只改变
+benchmark 进程，产品不设置这些参数。每进程 9 轮，排除前 2 轮，
+正/反顺序共 4 次，28 个有效样本取中位数。单位均为 MiB/s。
+与前轮不同 executor 设置的绝对吞吐不可直接横比。
+
+纯 CTR 每轮 64 MiB，每次仍处理 256 KiB：
+
+| 额度 | 基线逐块 | 四块交错 | 八块交错 | 八块 / 基线 |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 318.45 | 605.78 | 640.88 | 2.01× |
+| 4 | 1170.02 | 2074.87 | 2197.83 | 1.88× |
+
+八块比四块再快约 6%，因此保留八块。四块仅用于 A/B，没有保留生产
+开关或另一套 round function。
+
+完整认证解密包含缓存文件读取、key expansion、MAC 和 CTR，输出到
+null sink，排除 Open/KDF/实际写盘。AES 输入 64 MiB，Twofish/C4 为
+独立 Java 8 MiB；同样 28 样本的方法：
+
+| 算法 / 额度 | 基线 | 最终版 | 倍率 |
+| --- | ---: | ---: | ---: |
+| AES / 1 | 2230.75 | 2222.14 | 1.00× |
+| AES / 4 | 2331.53 | 2299.75 | 0.99× |
+| Twofish / 1 | 294.43 | 541.79 | 1.84× |
+| Twofish / 4 | 835.13 | 1299.99 | 1.56× |
+| C4 / 1 | 285.23 | 283.85 | 1.00× |
+| C4 / 4 | 796.02 | 801.52 | 1.01× |
+
+原始样本为 `twofish-ways-paired.json`、`decrypt-final-paired.json`。
+实际 worker 的测量包含最终 KDF 和写盘，收益不能套用纯 CTR 倍率。
+
+最终持久 worker 保持 broker 总额度 4，分别提交 1/8 个任务，交错
+foreground/watch origin。每档预热一次，固定 affinity 交替 11 轮，
+另做不设置 affinity 的自然调度 21 轮；每次输出在计时外由 Rust 核对
+size/CRC32。输入缓存、输出不 fsync，不能解释为冷盘持续吞吐。
+
+| Twofish 8 MiB / 同批任务数 | affinity 基线 | affinity 最终 | 倍率 | 自然调度基线 | 自然调度最终 | 倍率 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 277.71 | 317.13 | 1.14× | 199.69 | 213.79 | 1.07× |
+| 8 | 518.49 | 668.76 | 1.29× | 356.43 | 408.91 | 1.15× |
+
+8 MiB 单任务的 KDF/写出成本明显，不能把 cipher 的 2.01× 当作
+用户端到端速度。自然调度复测中，AES 64 MiB 单/八任务为基线
+1050.60/2132.41、新版 1037.14/2135.25；C4 8 MiB 为基线
+187.42/317.91、新版 188.42/316.70，均没有稳定的大幅变化。
+
+第一组 affinity 的 AES 单任务曾从 1352.61 降至 1231.08，随后增加
+到 21 轮并同时启动两个相同最终二进制的进程，基线为 1309.13、
+两个最终进程为 1316.81/1333.29。因此保留全部样本，不将第一组
+差值当成已确认的生产退化或宣称 AES 提速。原始记录为
+`worker-final-paired.json`、`worker-aes-repeat.json`、
+`worker-final-natural.json`。自然调度 worker peak RSS 约 87.5 MiB，
+主要峰值仍来自并行 KDF；256 KiB 流式 buffer 上限不变。
+
+### BLAKE3：完成有界实验，生产保持单线程认证
+
+上游 [`Hasher::update`](https://docs.rs/blake3/latest/blake3/struct.Hasher.html)
+始终单线程；`update_rayon` 自行递归分工，接口不接受每次调用的线程
+预算。为遵守共享 CPU broker，实验复用上游 hazmat 的 subtree hash
+和 keyed merge，不自行实现 hash rounds：每批按实际授予额度生成最多
+四个串行 leaf task，使用现有 Rayon executor，一次入队；前缀、最后
+partial chunk 和 ROOT 合并遵守原始 BLAKE3 tree shape。
+
+完整解密实验将原有每批 CpuLease 覆盖 MAC 和 CTR 两个连续阶段；
+AES 的额外额度优先给 MAC，CTR 单线程。需求上限由数据量及 executor
+共同限制；read/progress 在借额之前，write 在归还之后。恢复元数据
+也完整认证。未新增 pool、IO task、双 buffer 或密钥 IPC。
+
+单独 MAC 使用 256 KiB 数据块和 ENC 的 56 B nonce/header 前缀，每轮
+128 MiB；同一 affinity、4 线程 executor、28 样本。最终可复现的
+benchmark-only 实现位于 `benchmarks/native/enc_mac_bounded.rs`：
+
+| 额度 | 上游 serial | bounded | 倍率 |
+| --- | ---: | ---: | ---: |
+| 1 | 5230.38 | 5148.74 | 0.98× |
+| 2 | 5186.59 | 6653.73 | 1.28× |
+| 3 | 5136.21 | 7182.84 | 1.40× |
+| 4 | 5213.50 | 7137.80 | 1.37× |
+
+本机单线程 MAC 已超过 5 GiB/s，不能预设它只有 2～3 GiB/s。初版
+递归 join 的调度成本反而减速，已删除；一次任务计划的版本才取得
+上述局部收益。独立上游 Hasher 对照覆盖空输入、1024 B chunk、
+64/128/256 KiB 边界、1 MiB、不同前缀/分段及 1/2/3/4/5/9 额度，
+并在每次 update 后逐一核对 finalize 结果。
+
+完整认证 A/B 中，AES 1/4 额度分别为基线 2072.18/2191.44，实验
+2067.92/2152.64，约 1.00/0.98×。原始记录为
+`mac-final-paired.json` 和 `decrypt-bounded-paired.json`。
+
+随后使用真实持久 worker，broker 总额度 4，相同 affinity，不额外
+设置 executor 线程数；预热一次、交替 11 轮，计时包含 Open/KDF、
+认证和写盘，Rust 在计时外核对每次输出 size/CRC32：
+
+| 输入 / 同批任务数 | 基线 | MAC 实验版 | 倍率 |
+| --- | ---: | ---: | ---: |
+| AES 64 MiB / 1 | 1245.17 | 1284.73 | 1.03× |
+| AES 64 MiB / 8 | 2471.04 | 2315.67 | 0.94× |
+| C4 8 MiB / 1 | 318.29 | 321.48 | 1.01× |
+| C4 8 MiB / 8 | 564.09 | 559.95 | 0.99× |
+
+记录为 `worker-bounded-paired.json`。单 MAC 的增益没有转化为稳定的
+完整解密收益，八任务 AES 还下降约 6.3%，因此撤回生产 MAC 调度
+改动，仍由上游 Hasher 顺序认证。保留独立 benchmark 和测量记录；
+不会因一个局部数字增加产品复杂度。生产新增 Hasher 的 Zeroizing
+释放，正常完成、取消和错误退出时清除临时认证状态。
+
+### ARM64：实现四套后端，仅修改源码
+
+- Serpent：NEON 四块，复用已有 Boolean circuits、轮函数和 key schedule，
+  保留 ENC 的 word/byte 反转规则；不足四块继续 scalar。
+- RC6：NEON 四 lane，bulk 交错两组共八块，复用已有乘法/加法/可变
+  rotate 轮函数和展开密钥；不足四块继续 scalar。
+- Threefish-1024：NEON 两块，复用已有 80 轮、rotation/permutation 和
+  zero-tweak key schedule；不足两块继续 scalar。
+- SHACAL-2：ARMv8 SHA2 指令四块交错，key 的 SHA-256 message schedule
+  和 64 个 round constant 只展开一次，直接输出 rounds，不做 feed-forward。
+  1～3 尾块也使用硬件路径；无 SHA2 的 CPU 复用原有 compress256 fallback。
+
+入口均通过 runtime feature detection，支持非对齐缓冲；没有第二套
+容器/密码分析，CTR offset、载体 ranges 和递归发现链路继续复用原实现。
+SHACAL 原有 cipher enum 内的 fallback 已移至统一模块并删除旧实现。
+所有展开密钥随 cipher 清零释放，没有新全局缓存或每块 heap 分配。
+
+**按本轮要求，没有做 ARM64 编译、执行或性能验证，也不宣称收益倍数。**
+本机通过的官方向量与集成测试只验证 x64 路径；ARM64 类型检查和
+硬件正确性/性能仍需要后续在目标机器上执行。
+
+### x64 验证
+
+Rust release 默认 feature 16 项、并行 feature 17 项通过；examples
+包含 MAC 上游对照 1 项和 cipher 对照 7 项，两种 feature 配置均通过。
+保持原有全算法/Unicode/KDF、完整 counter 进位、任意 offset、短读、
+取消、认证恢复数据和额度归还覆盖。最终 x64 worker 与 `.venv` release
+扩展重新构建；相关 Python 回归 **220 项通过、2 项跳过**。
+覆盖 scheduler/cache/failure/lifecycle、官方 ENC、CLI/watch submission、
+嵌套递归、错误密码/MAC 损坏保留源文件、八种独立 Java 大载荷算法，
+以及 1/2/3/5/9 broker 容量、1/3 executor、非对齐载体 ranges、缺失尾段
+和并发失败后的额度归还。两项真实 watch 下载监听测试因本次没有配置
+隔离的临时 Watch Broker 服务而跳过；本轮没有执行 ARM64 验证。
+
 ## 2026-10-08 第四轮：CTR 公共层和单候选最终确认
 
 基线为干净的 `c9258e83`。修改源码前保存该版本的 release examples 和

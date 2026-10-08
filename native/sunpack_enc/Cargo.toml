@@ -18,6 +18,10 @@ path = "../../benchmarks/native/enc_decrypt.rs"
 name = "open"
 path = "../../benchmarks/native/enc_open.rs"
 
+[[example]]
+name = "mac"
+path = "../../benchmarks/native/enc_mac.rs"
+
 [features]
 parallel-kdf = ["dep:rayon"]
 parallel-decrypt = ["dep:rayon"]
@@ -27,7 +31,7 @@ aes = "0.8"
 # Pin the low-level SIMD API used by the shared-executor adapter. The library's
 # own per-hash helper-thread pool is disabled in both worker and Python builds.
 argon2-rust = { version = "=1.1.0", default-features = false, features = ["std", "internal-api"] }
-blake3 = "1.8"
+blake3 = { version = "1.8", features = ["zeroize"] }
 cipher = "0.4"
 hkdf = "0.12"
 hmac = "0.12"
@@ -45,3 +49,4 @@ rc6 = "0.1"
 magma = "0.9"
 serpent = "0.6"
 threefish = "0.5"
+twofish = "0.7"

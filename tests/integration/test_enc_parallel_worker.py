@@ -12,7 +12,7 @@ from tests.helpers.native_fixture import file_inventory, native_fixture
 from tests.unit.test_enc_support import BUILD, ROOT
 
 
-@pytest.fixture(scope="module", params=[0, 1, 3, 5, 6, 7, 9], ids=["aes", "rc6", "blowfish256", "gost", "blowfish448", "threefish", "c4"])
+@pytest.fixture(scope="module", params=[0, 1, 3, 4, 5, 6, 7, 9], ids=["aes", "rc6", "blowfish256", "twofish", "gost", "blowfish448", "threefish", "c4"])
 def large_enc(tmp_path_factory, request):
     jar = ROOT / "reference/implementations/SSEFilePC/S.S.E. File Encryptor for PC/ssefenc.jar"
     java, javac = shutil.which("java"), shutil.which("javac")

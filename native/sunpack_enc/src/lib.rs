@@ -381,7 +381,7 @@ impl Decoder {
         #[cfg(not(feature = "parallel-decrypt"))]
         let _ = &mut acquire;
         input.seek(SeekFrom::Start(PREFIX))?;
-        let mut mac = blake3::Hasher::new_keyed(&self.keys.auth);
+        let mut mac = Zeroizing::new(blake3::Hasher::new_keyed(&self.keys.auth));
         mac.update(&self.keys.nonce);
         mac.update(&self.header.bytes);
         let cipher = cipher::Stream::new(self.header.bytes[6], &self.keys.key, &self.keys.nonce);
