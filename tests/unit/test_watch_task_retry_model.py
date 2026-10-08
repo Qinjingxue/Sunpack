@@ -1,5 +1,6 @@
 import asyncio
 import os
+from dataclasses import replace
 from types import SimpleNamespace
 import pytest
 
@@ -14,6 +15,7 @@ from sunpack.core.contracts.results import OutcomeKind, RunSummary, TargetRunRes
 from sunpack.runtime.watch.roots import WatchRootEntry
 from sunpack.runtime.watch.scanner import WatchCandidate
 from sunpack.runtime.watch.scheduler import WatchScheduler, _ActivePipelineRequest
+from sunpack.runtime.watch.state import WatchStateStore
 from tests.helpers.config_factory import make_config
 from tests.helpers.fake_pipeline_engine import FakePipelineEngine
 
@@ -314,16 +316,23 @@ def test_late_missing_volume_result_cannot_resurrect_consumed_input(tmp_path, mo
 
 
 @pytest.mark.parametrize("changed", [False, True])
-def test_family_completion_preserves_another_inflight_output_record(tmp_path, monkeypatch, changed):
+@pytest.mark.parametrize("storage", ["memory", "journal", "checkpoint"])
+def test_family_completion_preserves_another_inflight_output_record(tmp_path, monkeypatch, changed, storage):
     watcher, root, output, _sink = _watcher(tmp_path, monkeypatch)
     archive, other = root / "a.001", root / "a.002"
     archive.write_text("part")
     other.write_text("part")
-    candidate = _candidate(archive)
+    candidate = replace(_candidate(archive), mtime=1791458483.9542453)
     watcher.state.queue_active(candidate, persist=True, durable=True)
     assert watcher.state.record_task_output_started(str(archive), str(archive), str(output))
     watcher.state.mark(candidate.path, candidate.size + int(changed), candidate.mtime,
         status="suspended_missing_volume", error="missing sibling")
+    if storage != "memory":
+        if storage == "checkpoint":
+            watcher.state.save()
+        else:
+            watcher.state.flush()
+        watcher.state = WatchStateStore(str(watcher.state.path))
     watcher._inflight_requests.append(SimpleNamespace(candidate=candidate))
     watcher._retire_claimed_paths([str(archive)], _candidate(other))
     assert watcher.state.pending_work_for_path(str(archive)).active_outputs

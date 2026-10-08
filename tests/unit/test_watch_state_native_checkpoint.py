@@ -1,5 +1,8 @@
 import json
 
+import pytest
+
+from sunpack.runtime.watch.scanner import WatchCandidate
 from sunpack.runtime.watch.state import WatchStateStore
 
 
@@ -25,3 +28,31 @@ def test_native_checkpoint_persists_only_declared_dataclass_fields(tmp_path):
     assert "runtime_only_probe" not in persisted
     assert persisted["path"] == str(archive)
     assert WatchStateStore(str(state_path)).latest_entry_for_path(str(archive)) is not None
+
+
+@pytest.mark.parametrize("storage", ["journal", "checkpoint"])
+def test_native_state_replay_preserves_fractional_mtime_identity(tmp_path, storage):
+    state_path = tmp_path / "state.json"
+    state = WatchStateStore(str(state_path))
+    # Real timestamp from the split-volume recovery failure: default JSON
+    # float decoding changed this value by one binary64 precision unit.
+    candidate = WatchCandidate(
+        str(tmp_path / "archive.7z.001"), 65536, 1791458483.9542453,
+        file_id="same-file", change_usn=600524574000,
+    )
+    state.queue_active(candidate, durable_owner=True, durable=True)
+    state.mark(
+        candidate.path, candidate.size, candidate.mtime,
+        file_id=candidate.file_id, change_usn=candidate.change_usn,
+        status="suspended_missing_volume",
+    )
+    if storage == "checkpoint":
+        state.save()
+    else:
+        state.flush()
+
+    recovered = WatchStateStore(str(state_path))
+    assert recovered.pending_work_for_path(candidate.path).mtime.hex() == candidate.mtime.hex()
+    assert recovered.latest_entry_for_path(candidate.path).mtime.hex() == candidate.mtime.hex()
+    recovered.complete_work_if_matches(candidate)
+    assert recovered.pending_work_count == 0
