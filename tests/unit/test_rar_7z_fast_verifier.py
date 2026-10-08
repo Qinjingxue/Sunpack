@@ -4,7 +4,10 @@ import zlib
 import pytest
 
 from sunpack.core.passwords.verifier.rar_fast import RarFastVerifier
+from sunpack.core.passwords.verifier.enc_fast import EncFastVerifier
+from sunpack.core.passwords.verifier.registry import PasswordVerifierChain
 from sunpack.core.passwords.verifier.seven_zip_fast import SevenZipFastVerifier
+from tests.helpers.fs_builder import make_minimal_pe
 from tests.helpers.tool_config import get_test_tools
 
 
@@ -200,24 +203,24 @@ def test_rar_fast_verifier_reads_complete_raw_split_stream(tmp_path):
     assert outcome.matched_index == 1
 
 
-def test_rar_fast_verifier_uses_structured_first_volume(tmp_path):
-    first = tmp_path / "archive.part1.rar"
+@pytest.mark.parametrize("sfx", [False, True])
+def test_verifier_chain_reaches_structured_rar_without_format_hint(tmp_path, sfx):
+    first = tmp_path / ("archive.part1.exe" if sfx else "archive.part1.rar")
     second = tmp_path / "archive.part2.rar"
-    first.write_bytes(_rar5_encryption_header_fixture())
+    first.write_bytes((make_minimal_pe(b"WinRAR SFX") if sfx else b"") + _rar5_encryption_header_fixture())
     second.write_bytes(b"Rar!\x1a\x07\x01\x00trailing-volume")
     archive_input = {
         "kind": "archive_input",
         "entry_path": str(first),
-        "open_mode": "native_volumes",
-        "format_hint": "rar",
-        "volume_style": "rar_part",
+        "open_mode": "sfx_with_volumes" if sfx else "native_volumes",
+        "volume_style": "rar_sfx_part" if sfx else "rar_part",
         "parts": [
             {"path": str(first), "role": "first", "volume_number": 1, "canonical_name": first.name},
             {"path": str(second), "role": "member", "volume_number": 2, "canonical_name": second.name},
         ],
     }
 
-    outcome = RarFastVerifier().verify_batch(
+    outcome = PasswordVerifierChain([EncFastVerifier(), RarFastVerifier()]).verify_batch(
         str(first),
         ["wrong", "U0b7258526OROQY"],
         part_paths=[str(first), str(second)],

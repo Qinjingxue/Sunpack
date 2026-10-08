@@ -14,8 +14,7 @@ class EncFastVerifier:
                      archive_input: dict | None = None) -> PasswordBatchVerification:
         if requires_volume_aware_verifier(archive_path, part_paths=part_paths, archive_input=archive_input):
             return PasswordBatchVerification(
-                ok=False, status="needs_volume_or_tail_damaged", attempts=0,
-                error_text="ENC requires a complete logical byte stream", terminal=True,
+                ok=False, status="unsupported_method", attempts=0,
             )
         path, ranges = verifier_input(archive_path, part_paths=part_paths, archive_input=archive_input)
         with borrow_archive_sessions([item.get("path") for item in ranges] if ranges else [path]) as sessions:
