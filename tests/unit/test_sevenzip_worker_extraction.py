@@ -105,31 +105,6 @@ def _create_7z_with_nested_file(tmp_path):
     return archive
 
 
-def _create_encrypted_zip(tmp_path, password: str = "secret"):
-    seven_zip = _require_7z_or_skip()
-    source = tmp_path / "encrypted-source.txt"
-    source.write_text("encrypted worker payload", encoding="utf-8")
-    archive = tmp_path / "encrypted.zip"
-    result = subprocess.run(
-        [
-            str(seven_zip),
-            "a",
-            str(archive),
-            str(source),
-            "-tzip",
-            "-mx=0",
-            "-y",
-            f"-p{password}",
-        ],
-        cwd=str(tmp_path),
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"7z failed:\n{result.stdout}\n{result.stderr}")
-    return archive, source.name
-
-
 def _create_shift_jis_zip(tmp_path):
     archive = tmp_path / "shift-jis.zip"
     expected_name = "日本語/説明.txt"
@@ -1075,16 +1050,26 @@ def test_worker_manifest_protocol(subtests):
 def test_worker_password_candidates(tmp_path, subtests):
     from sunpack.core.passwords.verifier.zip_fast import ZipFastVerifier
     worker = _require_worker_or_skip()
-    archive, filename = _create_encrypted_zip(tmp_path)
-    weak = [f"weak-collision-{index}" for index in range(4096)]
-    matches = ZipFastVerifier().verify_batch(str(archive), weak).matched_indices
-    cases = [(["secret"], True), (["wrong-password-1", "wrong-password-2"], False)]
-    if matches:
-        collision = weak[matches[0]]
-        cases.extend([([collision], False), ([collision, "secret"], True)])
-    else:
-        with subtests.test(scenario="weak_header_collision"):
-            pytest.skip("fixture has no weak ZipCrypto header collision in candidate batch")
+    filename = "encrypted-source.txt"
+    archive = tmp_path / "encrypted.zip"
+    # Generated once with 7z a -tzip -mx=0 -psecret. Keep its encrypted header
+    # fixed: weak-collision-106 passes the header byte but cannot decrypt payload.
+    archive.write_bytes(bytes.fromhex(
+        "504b030414000100000034b6485d948d9273240000001800000014000000"
+        "656e637279707465642d736f757263652e7478740007aac394e221fd2271e576"
+        "e14e4b5ef054b1a73dea25e21d78403ed8dc850bd4acbf74504b01023f0014"
+        "000100000034b6485d948d9273240000001800000014002400000000000000"
+        "2000000000000000656e637279707465642d736f757263652e7478740a002000"
+        "00000000010018003ea1e33e3457dd0100000000000000000000000000000000"
+        "504b0506000000000100010066000000560000000000"
+    ))
+    collision = "weak-collision-106"
+    proof = ZipFastVerifier().verify_batch(str(archive), [collision, "secret"])
+    assert proof.matched_indices == (0, 1)
+    assert proof.match_evidence == "zipcrypto_header_byte"
+    assert proof.final_confirmation_required
+    cases = [(["secret"], True), (["wrong-password-1", "wrong-password-2"], False),
+             ([collision], False), ([collision, "secret"], True)]
     for index, (candidates, accepted) in enumerate(cases):
         with subtests.test(candidates=candidates):
             out = tmp_path / f"out-{index}"

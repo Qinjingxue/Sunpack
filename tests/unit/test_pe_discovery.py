@@ -158,7 +158,7 @@ def test_invalid_coff_carriers_are_scanned_instead_of_skipped(tmp_path, pe_offse
 @pytest.mark.parametrize("pe_offset", [0x80, 0x800])
 @pytest.mark.parametrize("archive_format,payload", [
     ("7z", make_minimal_7z()), ("zip", make_zip({"payload.txt": "contents"})),
-])
+], ids=["7z", "zip"])
 def test_deep_anchor_reuses_pe_facts_for_nonleading_archives(tmp_path, pe_offset, archive_format, payload):
     image = make_minimal_pe(pe_offset=pe_offset)
     path = tmp_path / "image.jpg"
@@ -172,7 +172,7 @@ def test_deep_anchor_reuses_pe_facts_for_nonleading_archives(tmp_path, pe_offset
 
 @pytest.mark.parametrize("archive_format,payload", [
     ("7z", make_minimal_7z()), ("zip", make_zip({"payload.txt": "contents"})),
-])
+], ids=["7z", "zip"])
 def test_deep_anchor_candidate_refined_to_none_does_not_authorize_archive_search(tmp_path, archive_format, payload):
     image = make_minimal_pe(pe_offset=0x800).replace(b"PE\x00\x00", b"NO\x00\x00")
     path = tmp_path / "invalid_image.jpg"

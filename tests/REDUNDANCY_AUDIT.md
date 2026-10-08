@@ -176,11 +176,27 @@
 
 无剩余调用的 fixture、工具函数和重复初始化随测试删除；watch/worker 共有构造器统一复用。
 
+## 对后续审计风险的复核
+
+- 热重载：`test_service_reload_lifecycle` 已分别修改 runtime mode、tray enabled、language 和 roots；每次只改变一种配置，再调用 reload。断言包括运行模式回调、不重启 scheduler、启动托盘、语言变化刷新同一托盘，以及无变化时不重启。原有覆盖不只包含目录变化。
+- Worker 候选：`test_worker_password_candidates` 改用固定的 7-Zip ZipCrypto 样本及固定候选 `weak-collision-106`。先确认碰撞候选和正确密码均通过 header-byte 弱校验且需要最终确认，再检查碰撞候选单独失败、碰撞后正确候选成功并输出完整内容。移除每次构造随机加密头、搜索 4096 个候选和找不到碰撞就 skip 的路径。
+- 嵌套终止：`test_unstructured_nested_password_failure_is_terminal_without_retry_anchor` 原本就参数化 WRONG_PASSWORD/password_resolution 和 MISSING_VOLUME/extraction；现在为这两个场景增加名称，并确认相同输入再次到达也不会重试、排队或重复发送失败通知。
+- 递归扫描：`test_output_scan_policy_reuses_extraction_inventory` 同一个函数参数化有/无 inventory。两条路径均在 current_dir_only 配置下发现子目录中的伪装 `.ISO` 输入；有 inventory 的路径禁止进入实际 fallback 扫描。
+- 真实组合：`test_cli_disguised_split_carrier_multilevel_passwords` 通过原有 7z/ZIP/RAR、已知/未知叶层密码矩阵执行。现在显式限制初始目录扫描为 `-`，仍保留无限递归解压 `--recur *`；最终验证多层载体、伪装内层 ZIP 的完整输出树、失败分支和源卷保留。初始目录深度与递归解压深度是不同配置。
+
+以上补充没有增加测试函数，也没有恢复诊断字段定位测试。没有执行 mutation testing，不能据此声称错误检出率完全不变。
+
+完整验收额外发现 `test_pe_discovery.py` 的两个参数表使用含当前时间的 ZIP 字节自动生成测试 ID，跨秒收集时各 xdist worker 的 ID 不一致。为这两个参数表显式设置格式 ID，保留全部输入和断言，不降低并发。
+
+2026-10-08 的完整验收还观察到一次未修改用例的功能失败：`test_plan7_four_lz4_wrapped_encrypted_rar_volumes_extract_automatically[delete-direct_final_path]` 超时，结束时 watch 保留缺卷状态，part2 仍在输出目录，未形成完整重试卷集。原因尚未定位，不能以其他验收通过消除这条证据；本轮未修改该测试或生产代码，也未增加等待或降低并发。详细记录保存在 [error record](error_records/20261008_225455_663a22361e35_001_tests_real_plan7_watch_downloads_test_plan7_lz4_wrapped_rar_volumes.py__test_plan7_four_lz4_wrapped_encrypted_rar_volumes_extract_automatically_delete-direct_final_path_.txt)。
+
 ## 验收
 
 使用 `.\run_acceptance_tests.ps1 -NoWait -VerboseOutput`，默认 8 个 worker，x64/ci，保留环境预检和临时 Watch Broker 安装/卸载。
 
-- CLI、unit、functional：1517 passed，1 skipped，51 subtests passed。
+最后一次完整验收退出码为 0。保持相同并发和测试断言重跑后，上述 LZ4/RAR watch 超时未再次发生；这只说明该次重跑通过，间歇性失败的原因仍待单独排查。
+
+- CLI、unit、functional：1518 passed，1 skipped，51 subtests passed（后续审计补充后）。
 - integration、real：725 passed，1 skipped。
 - 管理员 VHD disk-full：8 skipped；当前进程不满足管理员执行条件。
 - CLI help/passwords/scan/inspect/config smoke checks 全部通过。

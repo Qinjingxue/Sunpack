@@ -1,3 +1,5 @@
+import pytest
+
 from sunpack_native import worker_manifest_from_rows
 
 from sunpack.core.contracts.extraction import ExtractionResult
@@ -106,30 +108,33 @@ def test_output_scan_policy_scans_projected_embedded_roots_with_their_inventorie
     assert {candidate.entry_path for candidate in candidates} == {str(first.resolve()), str(second.resolve())}
 
 
-def test_output_scan_policy_reuses_extraction_inventory(tmp_path, monkeypatch):
+@pytest.mark.parametrize("has_inventory", [True, False], ids=["inventory", "native-scan"])
+def test_output_scan_policy_reuses_extraction_inventory(tmp_path, monkeypatch, has_inventory):
     segment_dir = tmp_path / "embedded_00_rar"
     segment_dir.mkdir()
     nested = segment_dir / "payload.ISO"
     payload = b"PK" + b"x" * (1024 * 1024)
     nested.write_bytes(payload)
-    inventory = collect_output_inventory(str(tmp_path))
-
-    monkeypatch.setattr(
-        "sunpack.pipeline.coordinator.output_scan_policy.DirectoryScanner.scan",
-        lambda _self: (_ for _ in ()).throw(AssertionError("directory must not be rescanned")),
-    )
+    inventories = {}
+    if has_inventory:
+        inventories[str(tmp_path.resolve()).lower()] = collect_output_inventory(str(tmp_path))
     config = _config()
     config["filesystem"]["directory_scan_mode"] = "current_dir_only"
     policy = OutputScanPolicy(config)
+    if has_inventory:
+        monkeypatch.setattr(
+            policy, "_scan_output",
+            lambda *_args: (_ for _ in ()).throw(AssertionError("directory must not be rescanned")),
+        )
     work = policy.prepare_scan(
         [str(tmp_path)],
-        inventories={str(tmp_path.resolve()).lower(): inventory},
+        inventories=inventories,
     )
     roots = list(work.roots)
     assert roots == [str(tmp_path.resolve())]
     assert work.session is not None
     assert work.session.include_raw_snapshots is True
-    candidates = build_candidates_for_targets(roots, session=work.session, config=_config())
+    candidates = build_candidates_for_targets(roots, session=work.session, config=config)
     assert [candidate.entry_path for candidate in candidates] == [str(nested.resolve())]
 
 

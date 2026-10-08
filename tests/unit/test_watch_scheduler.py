@@ -1777,7 +1777,10 @@ def test_watch_scheduler_does_not_retry_terminal_failure_for_unchanged_event(tmp
     assert [event[0] for event in notifications.events] == ["submitted", "failed"]
 
 
-@pytest.mark.parametrize("kind,stage,message", [(FailureKind.WRONG_PASSWORD, "password_resolution", "wrong password"), (FailureKind.MISSING_VOLUME, "extraction", "missing split volume")])
+@pytest.mark.parametrize("kind,stage,message", [
+    (FailureKind.WRONG_PASSWORD, "password_resolution", "wrong password"),
+    (FailureKind.MISSING_VOLUME, "extraction", "missing split volume"),
+], ids=["wrong-password", "missing-volume"])
 def test_unstructured_nested_password_failure_is_terminal_without_retry_anchor(tmp_path, monkeypatch, kind, stage, message):
     monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
 
@@ -1815,6 +1818,10 @@ def test_unstructured_nested_password_failure_is_terminal_without_retry_anchor(t
     assert failed_event[3][0]["kind"] == kind.value
     assert not failed_event[3][0].get("details")
     assert not any(event[0] == "suppressed" for event in notifications.events)
+    watcher.enqueue(str(archive_path))
+    assert _await(watcher.run_once()).processed == 0
+    assert watcher.pending_count == 0
+    assert [event[0] for event in notifications.events] == ["submitted", "failed"]
 
 
 def test_watch_scheduler_does_not_retry_password_inconclusive_after_password_source_change(tmp_path, monkeypatch):
