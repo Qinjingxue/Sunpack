@@ -28,12 +28,9 @@ aes = "0.8"
 # own per-hash helper-thread pool is disabled in both worker and Python builds.
 argon2-rust = { version = "=1.1.0", default-features = false, features = ["std", "internal-api"] }
 blake3 = "1.8"
-blowfish = "0.9"
 cipher = "0.4"
-cipher5 = { package = "cipher", version = "0.5" }
 hkdf = "0.12"
 hmac = "0.12"
-rc6 = "0.1"
 rayon = { version = "1.10", optional = true }
 sha2 = { version = "0.10", features = ["compress"] }
 sha3 = "0.10"
@@ -42,6 +39,9 @@ crc32fast = "1.4"
 zeroize = { version = "1.8", features = ["derive"] }
 
 [dev-dependencies]
+blowfish = "0.9"
+cipher5 = { package = "cipher", version = "0.5" }
+rc6 = "0.1"
 magma = "0.9"
 serpent = "0.6"
 threefish = "0.5"

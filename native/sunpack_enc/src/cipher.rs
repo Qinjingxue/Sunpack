@@ -1,13 +1,13 @@
 //! CTR uses a full big-endian counter for every block size. AES batches blocks
 //! through RustCrypto's runtime-selected hardware backend (no per-byte dispatch).
 use cipher::{Block, BlockEncrypt, KeyInit};
-use cipher5::{
-    consts::{U20, U32},
-    BlockCipherEncrypt, KeyInit as KeyInit5,
-};
 use zeroize::{Zeroize, ZeroizeOnDrop};
+#[path = "blowfish.rs"]
+mod blowfish;
 #[path = "gost.rs"]
 mod gost;
+#[path = "rc6.rs"]
+mod rc6;
 #[path = "serpent.rs"]
 mod serpent;
 #[path = "threefish.rs"]
@@ -15,10 +15,9 @@ mod threefish;
 #[path = "twofish.rs"]
 mod twofish;
 
-type Rc6 = rc6::RC6<u32, U20, U32>;
 enum Primitive {
     Aes(aes::Aes256),
-    Rc6(Rc6),
+    Rc6(rc6::Rc6),
     Serpent(serpent::Serpent),
     Blowfish(blowfish::Blowfish),
     Twofish(twofish::Twofish),
@@ -30,15 +29,9 @@ impl Primitive {
     fn new(code: u8, key: &[u8]) -> (Self, usize) {
         match code {
             0 => (Self::Aes(aes::Aes256::new_from_slice(key).unwrap()), 16),
-            1 => (
-                Self::Rc6(<Rc6 as KeyInit5>::new_from_slice(key).unwrap()),
-                16,
-            ),
+            1 => (Self::Rc6(rc6::Rc6::new(key)), 16),
             2 => (Self::Serpent(serpent::Serpent::new(key)), 16),
-            3 | 6 => (
-                Self::Blowfish(blowfish::Blowfish::new_from_slice(key).unwrap()),
-                8,
-            ),
+            3 | 6 => (Self::Blowfish(blowfish::Blowfish::new(key)), 8),
             4 => (Self::Twofish(twofish::Twofish::new(key)), 16),
             5 => (Self::Gost(gost::Gost::new(key)), 8),
             7 => (Self::Threefish(threefish::Threefish::new(key)), 128),
@@ -50,18 +43,11 @@ impl Primitive {
         match self {
             Self::Aes(c) => batch(c, bytes),
             Self::Serpent(c) => c.encrypt(bytes),
-            Self::Blowfish(c) => batch(c, bytes),
+            Self::Blowfish(c) => c.encrypt(bytes),
             Self::Twofish(c) => c.encrypt(bytes),
             Self::Gost(c) => c.encrypt(bytes),
             Self::Threefish(c) => c.encrypt(bytes),
-            Self::Rc6(c) => {
-                for block in bytes.chunks_exact_mut(16) {
-                    let mut b = cipher5::Block::<Rc6>::default();
-                    b.copy_from_slice(block);
-                    c.encrypt_block(&mut b);
-                    block.copy_from_slice(&b);
-                }
-            }
+            Self::Rc6(c) => c.encrypt(bytes),
             Self::Shacal(key) => {
                 for block in bytes.chunks_exact_mut(32) {
                     let mut state = [0u32; 8];

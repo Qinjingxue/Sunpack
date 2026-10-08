@@ -1,5 +1,127 @@
 # ENC v4 后续优化
 
+## 2026-10-08 第三轮：RC6 AVX2 和 Blowfish 八块交错
+
+基线为干净的 `d5038a82`，Windows x64、i9-13980HX、release，启用
+`parallel-kdf,parallel-decrypt`。修改源码前构建并保存 baseline examples；
+新旧版本使用相同 Cargo.lock、release profile、benchmark 源码和输入。
+
+### 实现与内存
+
+- RC6-32/20/32 每个 AVX2 向量状态含 8 个独立 block，交错两个状态，
+  一组处理 16 blocks。寄存器中完成转置、u32 wrapping multiply/add、
+  xor 和逐 lane 可变旋转；旋转计数掩码为 31，包括零旋转。CPU/OS
+  运行时检测后才进入 AVX2。剩余完整的 8 blocks 使用单状态 AVX2，
+  更短尾部和非 AVX2/ARM64 使用同一轮函数的标量路径。round key 仍为
+  44 × u32 = 176 B，展开一次后供所有 CTR 任务共享，退出时清零。
+- Blowfish-256/448 共享同一实现，每组交错 8 个独立 block 的 16 轮
+  table lookup，专门处理 1～7 blocks 的尾组；使用 ENC 原有 big-endian
+  block 约定。每个 stream 仍只有一份 18-word P-array 和 4 × 256-word
+  keyed S-box，共 4168 B，退出时清零。key expansion 复用同一标量轮
+  函数；没有第二份 keyed table，没有全局密钥缓存。
+- 原生产 RC6 逐块适配器和 Blowfish 通用 adapter 已移除。两个上游 cipher
+  库及 cipher 0.5 接口移至 ENC 的 dev-dependencies，用作独立测试参考。
+  复用原有 CTR counter/pad、共享 executor 和 CPU broker；没有新增线程池、
+  流式缓冲区、归档分析路径或密钥 IPC。KDF/密码候选调度保持不变。
+
+### 性能
+
+纯 CTR：每算法独立进程，16 MiB、7 轮、256 KiB 原有生产缓冲区。
+每档基线→新版→新版→基线，各取 14 轮中位数，单位 MiB/s。
+
+| 算法 | 基线 1 额度 | 新版 1 额度 | 倍率 | 基线 4 额度 | 新版 4 额度 | 倍率 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| AES-256 | 2845.28 | 2857.12 | 1.00× | 4337.78 | 4288.42 | 0.99× |
+| RC6 | 484.38 | 1398.97 | 2.89× | 1073.58 | 2303.61 | 2.15× |
+| Serpent | 644.33 | 651.56 | 1.01× | 1331.74 | 1327.16 | 1.00× |
+| Blowfish-256 | 327.40 | 610.31 | 1.86× | 794.04 | 1448.95 | 1.82× |
+| Twofish-256 | 314.80 | 315.55 | 1.00× | 881.29 | 870.65 | 0.99× |
+| GOST | 313.57 | 315.88 | 1.01× | 899.89 | 892.89 | 0.99× |
+| Blowfish-448 | 324.47 | 602.38 | 1.86× | 800.94 | 1440.52 | 1.80× |
+| Threefish-1024 | 1939.12 | 1939.36 | 1.00× | 2583.77 | 2524.09 | 0.98× |
+| SHACAL-2 | 1082.62 | 1087.09 | 1.00× | 2429.95 | 2562.59 | 1.05× |
+| C4 | 299.91 | 302.53 | 1.01× | 749.99 | 732.48 | 0.98× |
+
+完整认证解密：独立 Java 64 MiB AES、8 MiB RC6/两种 Blowfish/C4。
+含读取、key expansion 和完整 BLAKE3 MAC，输出到 null sink，不含 Open/KDF；
+同样交替运行两组，每档每版 14 轮中位数，单位 MiB/s。
+
+| 算法 | 基线 1 额度 | 新版 1 额度 | 倍率 | 基线 4 额度 | 新版 4 额度 | 倍率 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| AES-256 | 1506.67 | 1511.34 | 1.00× | 1359.43 | 1347.96 | 0.99× |
+| RC6 | 420.65 | 988.03 | 2.35× | 800.96 | 1152.29 | 1.44× |
+| Blowfish-256 | 294.98 | 506.92 | 1.72× | 642.73 | 891.16 | 1.39× |
+| Blowfish-448 | 294.37 | 513.82 | 1.75× | 640.09 | 890.95 | 1.39× |
+| C4 | 251.26 | 253.98 | 1.01× | 561.32 | 547.54 | 0.98× |
+
+单线程 RC6 CTR 约 2.89×、两种 Blowfish 约 1.86×；完整认证解密
+分别约 2.35×、1.72/1.75×。未修改算法有小幅双向波动，不把这些差异
+认定为本轮收益。中间 A/B 的 RC6 单向量组约 1076～1112 MiB/s，
+交错双组约 1348～1377 MiB/s。Blowfish 四块/八块同机交替对照：
+单额度分别约 549～551 / 610～614 MiB/s；四额度的 256-bit key 约
+1326 / 1440 MiB/s，448-bit key 约 1367 / 1368 MiB/s。因此选择八块，
+不宣称每种额度/密钥都能取得相同比例的额外收益。
+以上是本机 cached-file/null-sink 测量，不能当作实际写盘或整个递归流程吞吐。
+
+AES 的纯 CTR 单额度约 2857 MiB/s，完整认证路径约 1511 MiB/s；
+四额度纯 CTR 约 4288 MiB/s，完整路径却只有 1348 MiB/s，与基线一致。
+因此 read/MAC 和调度仍有研究空间，但差值不等于可重叠的独立阶段耗时。
+当前不能据此保证双 buffer 的收益；本轮保留原有串行 read+MAC→CTR，
+将来实验需要在相同总 CPU 额度下比较，处理借不到 extra credit 的回退、
+取消/短读/写出错误、双 buffer 的释放和有序认证，以及多任务吞吐。
+
+### 验证
+
+Rust 默认 feature 14 项、并行 feature 15 项全部通过。RC6 独立对照上游
+24 组随机密钥、0～33 blocks、标量/直接 AVX2/dispatcher、非对齐前缀
+和保护后缀；覆盖单/双向量组以及全部尾部。Blowfish 两种 key size 各
+12 组随机密钥、0～33 blocks，独立对照 key expansion、轮函数和全部
+尾组。原有官方十种算法、Unicode、KDF 参数、counter 全宽进位/回绕、
+任意 offset/chunking、多缓冲区并行认证、短读、取消、输出失败和 CPU
+额度生命周期测试继续通过。
+
+重新构建 x64 worker 和 `.venv` 中的 release 原生扩展后，108 项 ENC
+生产单元/集成测试全部通过，无跳过。复用原来的大载荷 worker fixture，
+新增 RC6、Blowfish-256、Blowfish-448 三种独立 Java 2 MiB 输入，原有
+GOST/Threefish/C4 同时继续验证。覆盖 1/2/3/5/9 CPU broker 容量、
+1/3 executor 线程、CLI/watch 混跑、错误候选、MAC 损坏和额度归还。
+伪装扩展名、嵌套递归、并发密码候选、分段载体跨非对齐 header/proof/
+payload 范围和缺失尾段均通过；准备状态失效和重复正确候选的优先级
+规则继续通过。输出比较使用既有 native CRC32/字节比较，没有添加
+输出 SHA-256 校验。
+
+安装 `aarch64-pc-windows-msvc` Rust 标准库后，直接引用生产 `cipher.rs`
+及其各 backend 的独立 Rust harness 已通过 ARM64 `cargo check`，包含
+`parallel-decrypt`。完整 `sunpack-enc` 的 ARM64 检查仍被本机缺少交叉
+C 编译器/headers 阻断：BLAKE3 NEON C 源码的 `assert.h` include 失败。
+因此只记录 cipher 模块编译通过，不宣称整个 ARM64 库构建或实机运行
+通过；本轮没有新增 NEON/ARMv8 专用 cipher 实现。harness 直接引用
+生产源码，没有修改生产依赖来绕过该构建错误。
+
+Clippy 无错误，只有原有 Twofish range-loop 和两处 KDF auto-deref 提示。
+worker standalone CRT 检查、打包脚本 PowerShell 语法和
+`git diff --check` 通过。许可分别保存于 `licenses/rc6-license.txt`、
+`licenses/blowfish-license.txt`，接入 notices 和 Windows 打包流程。
+
+原始对照与中间 batch-width A/B 数据保存在
+`benchmarks/results/enc-v4-optimization/20261008-round3/`。
+完整认证输入由原有 `tests/helpers/EncV4Fixtures.java` 独立生成，位于
+`benchmarks/.work/enc/20261008-round3/algorithm-{0,1,3,6}/large.enc`；
+C4 继续使用既有 8 MiB 样本。
+
+```powershell
+cargo build --manifest-path native/Cargo.toml --release -p sunpack-enc `
+  --features parallel-kdf,parallel-decrypt --examples
+foreach ($code in 0..9) { & native/target/release/examples/throughput.exe 16 7 1 "$code" }
+foreach ($code in 0..9) { & native/target/release/examples/throughput.exe 16 7 4 "$code" }
+native/target/release/examples/decrypt.exe benchmarks/.work/enc/20261008-round3/algorithm-0/large.enc sunpack-test 4 7
+cargo test --manifest-path native/Cargo.toml --release -p sunpack-enc --lib
+cargo test --manifest-path native/Cargo.toml --release -p sunpack-enc `
+  --features parallel-kdf,parallel-decrypt --lib
+uv run --no-sync pytest tests/unit/test_enc_support.py `
+  tests/integration/test_enc_pipeline.py tests/integration/test_enc_parallel_worker.py -q
+```
+
 ## 2026-10-08 第二轮：Threefish AVX2 和 GOST 交错计算
 
 本轮基线为 `1ff1aac4`，Windows x64、i9-13980HX、release，启用

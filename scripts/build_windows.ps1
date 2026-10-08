@@ -930,6 +930,8 @@ $twofishLicensePath = Join-Path $repoRoot "licenses\twofish-license.txt"
 $serpentLicensePath = Join-Path $repoRoot "licenses\serpent-license.txt"
 $threefishLicensePath = Join-Path $repoRoot "licenses\threefish-license.txt"
 $magmaLicensePath = Join-Path $repoRoot "licenses\magma-license.txt"
+$blowfishLicensePath = Join-Path $repoRoot "licenses\blowfish-license.txt"
+$rc6LicensePath = Join-Path $repoRoot "licenses\rc6-license.txt"
 $thirdPartyNoticesPath = Join-Path $repoRoot "THIRD_PARTY_NOTICES.md"
 $distRoot = Join-Path $repoRoot "dist"
 $buildRoot = Join-Path $repoRoot "build"
@@ -979,6 +981,8 @@ Assert-PathExists -LiteralPath $twofishLicensePath -Description "RustCrypto Twof
 Assert-PathExists -LiteralPath $serpentLicensePath -Description "RustCrypto Serpent license file"
 Assert-PathExists -LiteralPath $threefishLicensePath -Description "RustCrypto Threefish license file"
 Assert-PathExists -LiteralPath $magmaLicensePath -Description "RustCrypto Magma/GOST license file"
+Assert-PathExists -LiteralPath $blowfishLicensePath -Description "RustCrypto Blowfish license file"
+Assert-PathExists -LiteralPath $rc6LicensePath -Description "RustCrypto RC6 license file"
 Assert-PathExists -LiteralPath $thirdPartyNoticesPath -Description "Third-party notices file"
 Assert-CommandExists -Command "cargo" -Description "Rust toolchain"
 Assert-CommandExists -Command "uv" -Description "uv dependency manager"
@@ -1148,6 +1152,8 @@ Copy-Item -LiteralPath $twofishLicensePath -Destination (Join-Path $distLicenses
 Copy-Item -LiteralPath $serpentLicensePath -Destination (Join-Path $distLicensesRoot "serpent-license.txt") -Force
 Copy-Item -LiteralPath $threefishLicensePath -Destination (Join-Path $distLicensesRoot "threefish-license.txt") -Force
 Copy-Item -LiteralPath $magmaLicensePath -Destination (Join-Path $distLicensesRoot "magma-license.txt") -Force
+Copy-Item -LiteralPath $blowfishLicensePath -Destination (Join-Path $distLicensesRoot "blowfish-license.txt") -Force
+Copy-Item -LiteralPath $rc6LicensePath -Destination (Join-Path $distLicensesRoot "rc6-license.txt") -Force
 Copy-Item -LiteralPath $thirdPartyNoticesPath -Destination $distThirdPartyNoticesPath -Force
 
 $distScriptsRoot = Join-Path $distAppRoot "scripts"
@@ -1170,6 +1176,8 @@ Assert-PathExists -LiteralPath (Join-Path $distLicensesRoot "twofish-license.txt
 Assert-PathExists -LiteralPath (Join-Path $distLicensesRoot "serpent-license.txt") -Description "Packaged RustCrypto Serpent license file"
 Assert-PathExists -LiteralPath (Join-Path $distLicensesRoot "threefish-license.txt") -Description "Packaged RustCrypto Threefish license file"
 Assert-PathExists -LiteralPath (Join-Path $distLicensesRoot "magma-license.txt") -Description "Packaged RustCrypto Magma/GOST license file"
+Assert-PathExists -LiteralPath (Join-Path $distLicensesRoot "blowfish-license.txt") -Description "Packaged RustCrypto Blowfish license file"
+Assert-PathExists -LiteralPath (Join-Path $distLicensesRoot "rc6-license.txt") -Description "Packaged RustCrypto RC6 license file"
 Assert-PathExists -LiteralPath $distThirdPartyNoticesPath -Description "Packaged third-party notices file"
 Assert-PathMissing -LiteralPath (Join-Path $distToolsRoot "7z.dll") -Description "Legacy standalone tools/7z.dll (the 7-Zip backend is embedded)"
 Assert-PeMachine -LiteralPath (Join-Path $distToolsRoot "sunpack_sevenzip_worker.exe") -BuildArch $buildArch -Description "Packaged tools/sunpack_sevenzip_worker.exe"

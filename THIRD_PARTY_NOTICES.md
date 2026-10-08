@@ -140,3 +140,25 @@ The full notice is distributed at
 [licenses/magma-license.txt](licenses/magma-license.txt).
 
 Source: https://github.com/RustCrypto/block-ciphers/tree/magma-v0.9.0/magma
+
+## RustCrypto RC6
+
+The RC6-32/20/32 key expansion and rounds in `native/sunpack_enc/src/rc6.rs`
+are adapted from RustCrypto rc6 0.1.0, Copyright (c) 2017 Damian Czaja,
+under the MIT license. SunPack uses an AVX2 backend with eight blocks per
+vector state, interleaved states, and scalar tails. The full notice is
+distributed at [licenses/rc6-license.txt](licenses/rc6-license.txt).
+
+Source: https://github.com/RustCrypto/block-ciphers/tree/rc6-v0.1.0/rc6
+
+## RustCrypto Blowfish
+
+The Blowfish key expansion and initial P/S constants in
+`native/sunpack_enc/src/blowfish.rs` and `blowfish_init.rs` are adapted from
+RustCrypto blowfish 0.9.1, Copyright (c) 2006-2009 Graydon Hoare and
+Copyright (c) 2009-2013 Mozilla Foundation, under the MIT license.
+SunPack interleaves independent blocks and shares one expanded key across
+CTR tasks. The full notice is distributed at
+[licenses/blowfish-license.txt](licenses/blowfish-license.txt).
+
+Source: https://github.com/RustCrypto/block-ciphers/tree/blowfish-v0.9.1/blowfish

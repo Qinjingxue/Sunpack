@@ -1,4 +1,4 @@
-"""Independent SSE GOST, Threefish and C4 payloads exercise worker CPU credits."""
+"""Independent SSE payloads exercise worker CPU credits and cipher backends."""
 import asyncio
 import json
 import os
@@ -12,7 +12,7 @@ from tests.helpers.native_fixture import file_inventory, native_fixture
 from tests.unit.test_enc_support import BUILD, ROOT
 
 
-@pytest.fixture(scope="module", params=[5, 7, 9], ids=["gost", "threefish", "c4"])
+@pytest.fixture(scope="module", params=[1, 3, 5, 6, 7, 9], ids=["rc6", "blowfish256", "gost", "blowfish448", "threefish", "c4"])
 def large_enc(tmp_path_factory, request):
     jar = ROOT / "reference/implementations/SSEFilePC/S.S.E. File Encryptor for PC/ssefenc.jar"
     java, javac = shutil.which("java"), shutil.which("javac")
