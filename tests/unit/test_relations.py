@@ -24,6 +24,27 @@ def _groups(tmp_path: Path):
     return RelationsScheduler().build_candidate_groups(DirectoryScanner(str(tmp_path), config=make_config()).scan())
 
 
+def test_deleted_lz4_wrapped_head_cannot_join_readable_split_family(tmp_path):
+    from tests.helpers.native_fixture import create_lz4_frames
+
+    first = tmp_path / "archive.7z.001"
+    second = tmp_path / "archive.7z.002"
+    wrapped = tmp_path / "archive.7z.001.lz4"
+    payload = make_minimal_7z()
+    first.write_bytes(payload[:32])
+    second.write_bytes(payload[32:])
+    create_lz4_frames(wrapped, [first])
+    snapshot = DirectoryScanner(str(tmp_path), config=make_config()).scan()
+    wrapped.unlink()
+
+    groups = RelationsScheduler().build_candidate_groups(snapshot)
+
+    group = next(group for group in groups if group.kind == "split_archive")
+    assert group.input_paths == [str(first), str(second)]
+    assert group.head_metadata["relation_confirmed"] is True
+    assert all(str(wrapped) not in item.input_paths for item in groups if item.kind == "split_archive")
+
+
 def test_plain_file_relation_omits_empty_volume_anchor(tmp_path):
     path = tmp_path / "ordinary.bin"
     path.write_bytes(b"ordinary data")

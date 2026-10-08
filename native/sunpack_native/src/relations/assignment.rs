@@ -370,6 +370,9 @@ pub(super) fn resolve_buckets(
                 if !row.relation_member_eligible {
                     continue;
                 }
+                if row.anchor.as_ref().is_some_and(|a| !a.error.is_empty()) {
+                    continue;
+                }
                 let f = StructuralFacts::from_row(row, format);
                 if f.sfx_role == SfxRole::LauncherCompanion {
                     companions.push(i);

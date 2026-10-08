@@ -7,6 +7,13 @@ pub(super) fn validate(validation: &mut ProposalValidation) {
         if validation
             .anchors
             .values()
+            .any(|a| !a.error.is_empty())
+        {
+            validation.status = ProposalStatus::Reject;
+            validation.reason = Some(RelationFailureReason::CorruptArchive);
+        } else if validation
+            .anchors
+            .values()
             .any(|a| a.needs_password || a.wrong_password)
         {
             validation.status = ProposalStatus::NeedsPassword;
@@ -20,19 +27,19 @@ pub(super) fn validate(validation: &mut ProposalValidation) {
     if proposal
         .volumes
         .iter()
-        .any(|p| get(&p.0).is_some_and(|a| a.needs_password || a.wrong_password))
+        .any(|p| get(&p.0).is_some_and(|a| !a.error.is_empty()))
     {
-        validation.status = ProposalStatus::NeedsPassword;
-        validation.reason = Some(RelationFailureReason::NeedsPassword);
+        validation.status = ProposalStatus::Reject;
+        validation.reason = Some(RelationFailureReason::CorruptArchive);
         return;
     }
     if proposal
         .volumes
         .iter()
-        .any(|p| get(&p.0).is_some_and(|a| !a.error.is_empty()))
+        .any(|p| get(&p.0).is_some_and(|a| a.needs_password || a.wrong_password))
     {
-        validation.status = ProposalStatus::Reject;
-        validation.reason = Some(RelationFailureReason::CorruptArchive);
+        validation.status = ProposalStatus::NeedsPassword;
+        validation.reason = Some(RelationFailureReason::NeedsPassword);
         return;
     }
     validation.status = assignment_status(
@@ -58,15 +65,15 @@ pub(super) fn assignment_status<'a>(
 ) -> ProposalStatus {
     if parts
         .clone()
-        .any(|(_, a)| a.is_some_and(|a| a.needs_password || a.wrong_password))
-    {
-        return ProposalStatus::NeedsPassword;
-    }
-    if parts
-        .clone()
         .any(|(_, a)| a.is_some_and(|a| !a.error.is_empty()))
     {
         return ProposalStatus::Reject;
+    }
+    if parts
+        .clone()
+        .any(|(_, a)| a.is_some_and(|a| a.needs_password || a.wrong_password))
+    {
+        return ProposalStatus::NeedsPassword;
     }
     let head = parts.clone().find(|(n, _)| *n == 1).and_then(|(_, a)| a);
     let last_part = parts.clone().last();

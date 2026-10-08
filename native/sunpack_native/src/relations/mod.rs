@@ -2044,6 +2044,36 @@ mod tests {
     }
 
     #[test]
+    fn encrypted_relations_require_readable_anchors_even_with_existing_failure() {
+        for reason in [None, Some(RelationFailureReason::MissingVolume)] {
+            let path = "archive.part1.rar";
+            let mut validation = validation_with_owned_paths(ProposalStatus::Inconclusive, &[path]);
+            validation.reason = reason;
+            validation.anchors.insert(path.into(), VolumeAnchor {
+                format: "rar".into(),
+                needs_password: true,
+                ..Default::default()
+            });
+            validate::validate(&mut validation);
+            assert_eq!(validation.status, ProposalStatus::NeedsPassword);
+            assert_eq!(
+                validate::assignment_status("rar", false, [(1, validation.anchors.get(path))].into_iter()),
+                ProposalStatus::NeedsPassword,
+            );
+
+            validation.reason = reason;
+            validation.anchors.get_mut(path).unwrap().error = "input could not be read".into();
+            validate::validate(&mut validation);
+            assert_eq!(validation.status, ProposalStatus::Reject);
+            assert_eq!(validation.reason, Some(RelationFailureReason::CorruptArchive));
+            assert_eq!(
+                validate::assignment_status("rar", false, [(1, validation.anchors.get(path))].into_iter()),
+                ProposalStatus::Reject,
+            );
+        }
+    }
+
+    #[test]
     fn inverted_conflict_index_preserves_status_scoping() {
         let validations = vec![
             validation_with_owned_paths(
