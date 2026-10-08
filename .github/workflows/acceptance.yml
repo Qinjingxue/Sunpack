@@ -36,34 +36,6 @@ jobs:
           enable-cache: true
           cache-dependency-glob: uv.lock
 
-      - name: Set up Java 17
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "17"
-
-      - name: Prepare official ENC reference
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          $archive = Join-Path $env:RUNNER_TEMP "SSEFilePC.zip"
-          $extracted = Join-Path $env:RUNNER_TEMP "SSEFilePC-reference"
-          Invoke-WebRequest -Uri "https://paranoiaworks.mobi/download/files/SSEFilePC.zip" -OutFile $archive
-          Expand-Archive -LiteralPath $archive -DestinationPath $extracted -Force
-          $jars = @(Get-ChildItem -LiteralPath $extracted -Recurse -File -Filter "ssefenc.jar")
-          if ($jars.Count -ne 1) {
-            throw "Expected one ssefenc.jar in the official SSEFilePC.zip, found $($jars.Count)"
-          }
-          $dest = Join-Path $env:GITHUB_WORKSPACE "reference/implementations/SSEFilePC/S.S.E. File Encryptor for PC"
-          New-Item -ItemType Directory -Path $dest -Force | Out-Null
-          $referenceJar = Join-Path $dest "ssefenc.jar"
-          Copy-Item -LiteralPath $jars[0].FullName -Destination $referenceJar -Force
-          $jarEntries = & jar --list --file $referenceJar
-          if ($LASTEXITCODE -ne 0 -or $jarEntries -notcontains "com/paranoiaworks/sse/Encryptor.class") {
-            throw "The official SSE reference jar is invalid or incompatible with EncV4Fixtures.java"
-          }
-          Write-Host "Official SSE ENC reference is ready: $referenceJar"
-
       - name: Set up Rust
         shell: pwsh
         run: |

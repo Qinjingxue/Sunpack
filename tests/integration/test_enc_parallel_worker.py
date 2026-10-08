@@ -14,19 +14,14 @@ from tests.helpers.native_build import sevenzip_artifact
 
 
 ROOT = Path(__file__).resolve().parents[2]
+DATA = ROOT / "tests/data/enc_parallel"
 
 
 @pytest.fixture(scope="module", params=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9], ids=["aes", "rc6", "serpent", "blowfish256", "twofish", "gost", "blowfish448", "threefish", "shacal", "c4"])
 def large_enc(tmp_path_factory, request):
-    jar = ROOT / "reference/implementations/SSEFilePC/S.S.E. File Encryptor for PC/ssefenc.jar"
-    java, javac = shutil.which("java"), shutil.which("javac")
-    if not java or not javac or not jar.exists():
-        pytest.skip("independent large ENC fixture requires Java 17+, javac and the SSE reference jar")
     root = tmp_path_factory.mktemp(f"enc-{request.param}")
-    subprocess.run([javac, "--release", "17", "-cp", str(jar), "-d", str(root),
-                    str(ROOT / "tests/helpers/EncV4Fixtures.java")], check=True, capture_output=True)
-    subprocess.run([java, "-cp", os.pathsep.join((str(root), str(jar))), "EncV4Fixtures",
-                    str(root), str(request.param), "2"], check=True, capture_output=True, timeout=60)
+    shutil.copyfile(DATA / f"algorithm_{request.param}.enc", root / "large.enc")
+    shutil.copyfile(DATA / "large.expected", root / "large.expected")
     damaged = root / "damaged.bin"
     native_fixture("copy", source=str(root / "large.enc"), output=str(damaged))
     native_fixture("flip", path=str(damaged), offset=damaged.stat().st_size - 1)

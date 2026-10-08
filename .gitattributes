@@ -2,3 +2,7 @@
 # validated there as YAML. Keep them on LF so the local files, the Git blobs, and
 # the submitted manifests stay identical.
 packaging/winget/manifests/**/*.yaml text eol=lf
+
+# Official ENC compatibility assets must remain byte-for-byte unchanged on Windows.
+tests/data/enc_parallel/*.enc binary
+tests/data/enc_parallel/large.expected binary

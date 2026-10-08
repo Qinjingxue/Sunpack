@@ -52,6 +52,15 @@ public final class EncV4Fixtures {
     }
     public static void main(String[] args) throws Exception {
         Path root = Paths.get(args[0]); Files.createDirectories(root);
+        if (args.length > 1 && args[1].equals("--large-only")) {
+            int largeMiB = args.length > 2 ? Integer.parseInt(args[2]) : 2;
+            byte[] large = new byte[largeMiB*1024*1024]; new Random(42).nextBytes(large);
+            Files.write(root.resolve("large.expected"), large);
+            for (int code=0;code<10;code++) {
+                Files.write(root.resolve("algorithm_"+code+".enc"), enc(large,code,(byte)0,"sunpack-test"));
+            }
+            return;
+        }
         byte[] zip = zip("SunPack official ENC v4 compatibility\n".getBytes("UTF-8"));
         Files.write(root.resolve("expected.zip"), zip);
         for (int code=0;code<10;code++) Files.write(root.resolve("algorithm_"+code+".mov"), enc(zip,code,(byte)0,"sunpack-test"));
