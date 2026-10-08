@@ -2,13 +2,6 @@
 
 Performance measurements and diagnostic profiles live here; behavioural assertions live under `tests/`.
 
-ENC v4 Rust probes live in `native/enc_ctr.rs` (pure CTR) and `native/enc_decrypt.rs`
-(authenticated streaming to a null sink). Run them with `cargo run --manifest-path
-native/Cargo.toml --release -p sunpack-enc --example throughput --
-256 3 5` or the `decrypt` example. Thread counts are benchmark budgets; the product worker
-acquires remaining CPU credits anew for each batch. Measurements and reproduction commands
-are in [ENC v4 optimization](../docs/zh-CN/benchmark_enc_v4_optimization.md).
-
 List the supported scenarios:
 
 ```powershell
@@ -26,7 +19,6 @@ include the test service/pipe identity, Broker binary SHA-256, and connection st
 
 ```powershell
 uv run --locked python -m benchmarks reader password-fast-path --rounds 5
-uv run --no-sync python -m benchmarks reader enc-password-fast-path --path native/sunpack_enc/tests/data/algorithm_0.mov --path C:\path\to\large.enc --wrong-passwords 64 --rounds 3 --jobs 1
 uv run --locked python -m benchmarks reader volume-anchor --files 128 --logical-mib 64 --rounds 5
 uv run --locked python -m benchmarks reader embedded-scan --generate-gib 10 --rounds 3 --skip-cli `
   --iocp-chunk-mib 2 --iocp-buffers 8 --iocp-workers 2
@@ -94,13 +86,6 @@ record both source hashes and all raw wall/CPU samples. These are scheduling
 measurements without archive decoding or filesystem IO.
 
 ## Run timeout
-
-`reader enc-password-fast-path` measures the production Rust quick-block
-verifier on independently generated ENC v4 files. Compare different payload
-sizes with repeated `--path`, and concurrent batches with `--jobs`. In a separate
-process, set `RAYON_NUM_THREADS=1` for the serial baseline. Reports include
-logical reader bytes, wall/CPU samples, peak RSS and residual RSS; Argon2 memory
-depends on the file's KDF parameter, not its payload size or candidate count.
 
 Every scenario runs in a child process under a hard wall-clock deadline, so a
 stale scenario that calls a removed API and blocks forever is killed instead
@@ -367,40 +352,3 @@ The following obsolete probes were intentionally removed during consolidation:
 Use pytest only for stable product contracts. Opt-in timing/resource assertions are
 marked `performance` and run with `pytest --run-performance`; multi-GB large-archive
 tests additionally require `--run-large-archive-performance`.
-
-ENC comparisons can also run directly as modules:
-
-```powershell
-uv run python -m benchmarks.scenarios.worker_enc_batch_ab --worker before=PATH_TO_BASELINE_WORKER --worker after=PATH_TO_CURRENT_WORKER --path PATH_TO_LARGE_ENC --concurrency 1,8 --capacity 4 --rounds 11 --json-out benchmarks/results/enc-worker-ab.json
-uv run python -m benchmarks.scenarios.reader_enc_single_candidate_ab --baseline BASELINE_GIT_REVISION --path native/sunpack_enc/tests/data/algorithm_0.mov --rounds 11 --json-out benchmarks/results/enc-single-candidate-ab.json
-```
-
-The worker comparison expects an independently generated `large.expected` beside
-each `large.enc`, validates native size/CRC outside the timer, and includes final
-KDF, authentication and real output writes. Pass several `LABEL=PATH` workers to
-compare prebuilt stream policies. `--affinity 0,2,4,6` optionally holds the
-benchmark workers to the same logical CPUs; production scheduling is unaffected.
-
-For ENC writer copy diagnosis, build the worker with
-`SUP7Z_ENABLE_WRITER_PROBE=ON` and pass the same binary as `memory=PATH` and
-`nocopy=PATH`, adding `--writer-mode memory=memory --writer-mode nocopy=memory-nocopy`.
-These diagnostic sinks retain decoder/MAC/KDF and writer queueing but create no
-output files; `memory-nocopy` additionally skips the staging memcpy. They cannot
-validate output CRC and are explicitly marked as diagnostics. A `real=PATH`
-worker with `--writer-mode real=real` provides the validated write reference.
-Compare alternating repeated trials under both natural scheduling and affinity;
-profile phase sums overlap across jobs and cannot be added to wall time.
-
-The scheduler comparison loads only the old scheduler from the specified local
-Git revision; both sides use the installed native extension and current worker.
-Use `--origin watch` for the watch submission path. Pure AES diagnostics use the
-existing Rust `throughput` example with `-- 32 9 1 0 raw-aes`; this excludes CTR,
-KDF, authentication and I/O.
-
-For 32B quick-proof computation, use the native `proof` example:
-`cargo run --manifest-path native/Cargo.toml --release -p sunpack-enc --example proof -- 4 9 1 0,1,2,7,8,9`.
-It reports `ns_per_proof` using fresh CTR scratch for each 32B input, while
-excluding KDF/key expansion and file reads. Do not interpret it as complete
-password-probe latency. It shares the production cipher implementation and
-accepts the same CSV runner arguments as `throughput`; Rayon is always available
-in `sunpack-enc`, and CPU credits determine scheduling rather than Cargo features.

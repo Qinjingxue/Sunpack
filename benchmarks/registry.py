@@ -15,7 +15,6 @@ _ROWS = [
     ("scheduling", "broker-queue", "benchmarks.scenarios.broker_queue", "Committed versus working-tree broker queue selection and throughput."),
     ("scheduling", "watch-source-claims", "benchmarks.scenarios.watch_source_claims", "Watch source claim/release indexes versus committed baseline, including maintenance cost."),
     ("reader", "password-fast-path", "benchmarks.scenarios.reader_password_fast_path", "Password candidate fast paths."),
-    ("reader", "enc-password-fast-path", "benchmarks.scenarios.reader_enc_password_fast_path", "ENC v4 bounded Rust password batches, IO and scratch-memory release."),
     ("reader", "password-size-scaling", "benchmarks.scenarios.reader_password_size_scaling", "Password cost versus payload size."),
     ("reader", "seven-zip-password", "benchmarks.scenarios.reader_seven_zip_password", "7z password probe optimization."),
     ("reader", "embedded-scan", "benchmarks.scenarios.reader_embedded_scan", "Native and CLI embedded scanning."),

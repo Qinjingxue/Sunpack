@@ -6,26 +6,6 @@ license = "MIT"
 [lib]
 crate-type = ["rlib", "staticlib"]
 
-[[example]]
-name = "throughput"
-path = "../../benchmarks/native/enc_ctr.rs"
-
-[[example]]
-name = "decrypt"
-path = "../../benchmarks/native/enc_decrypt.rs"
-
-[[example]]
-name = "open"
-path = "../../benchmarks/native/enc_open.rs"
-
-[[example]]
-name = "mac"
-path = "../../benchmarks/native/enc_mac.rs"
-
-[[example]]
-name = "proof"
-path = "../../benchmarks/native/enc_proof.rs"
-
 [dependencies]
 aes = "0.8"
 # Pin the low-level SIMD API used by the shared-executor adapter. The library's
