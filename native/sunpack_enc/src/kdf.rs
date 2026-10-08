@@ -38,6 +38,7 @@ pub(super) fn derive(
     salt: &[u8; 32],
     output: &mut [u8; 256],
     memory: &mut [Block],
+    threads: usize,
 ) -> Result<(), Error> {
     if memory.len() != params.memory_blocks() as usize || params.tag_len_bytes() != output.len() {
         return Err(Error::IncorrectParameter);
@@ -69,18 +70,40 @@ pub(super) fn derive(
     #[cfg(feature = "parallel-kdf")]
     {
         use rayon::prelude::*;
+        let threads = if threads > 1 {
+            threads
+                .min(instance.lanes as usize)
+                .min(rayon::current_num_threads())
+        } else {
+            1
+        };
         let executor = LaneExecutor {
             instance: &instance,
             fill,
         };
         for pass in 0..instance.passes {
             for slice in 0..4 {
-                (0..instance.lanes)
-                    .into_par_iter()
-                    .for_each(|lane| executor.fill_lane(pass, slice, lane));
+                if threads == 1 {
+                    for lane in 0..instance.lanes {
+                        executor.fill_lane(pass, slice, lane);
+                    }
+                } else {
+                    // Exactly one task per granted credit. A task may fill
+                    // several lanes; all join before the next Argon2 slice.
+                    (0..threads)
+                        .into_par_iter()
+                        .with_max_len(1)
+                        .for_each(|task| {
+                            for lane in (task as u32..instance.lanes).step_by(threads) {
+                                executor.fill_lane(pass, slice, lane);
+                            }
+                        });
+                }
             }
         }
     }
+    #[cfg(not(feature = "parallel-kdf"))]
+    let _ = threads;
     #[cfg(not(feature = "parallel-kdf"))]
     for pass in 0..instance.passes {
         for slice in 0..4 {

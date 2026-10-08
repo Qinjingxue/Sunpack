@@ -95,6 +95,7 @@ struct Keys {
 #[derive(Default)]
 pub struct Workspace {
     memory: Vec<Block>,
+    kdf_threads: Option<usize>,
     #[cfg(test)]
     kdf_runs: usize,
 }
@@ -104,6 +105,13 @@ impl Drop for Workspace {
     }
 }
 impl Workspace {
+    /// Bound lane scheduling to the caller's CPU budget. One thread uses the
+    /// same SIMD backend without initializing or dispatching to Rayon.
+    pub fn with_threads(threads: usize) -> Self {
+        let mut workspace = Self::default();
+        workspace.kdf_threads = Some(threads.max(1));
+        workspace
+    }
     fn derive(&mut self, header: &Header, password: &[u16]) -> Result<Keys> {
         let normalized = normalize_password(password);
         let mut master = Zeroizing::new([0u8; 256]);
@@ -132,6 +140,7 @@ impl Workspace {
             header.bytes[8..40].try_into().unwrap(),
             &mut *derived,
             &mut self.memory,
+            self.kdf_threads.unwrap_or(4),
         )
         .map_err(|_| Error::Format)?;
         let (key_size, nonce_size) = header.dimensions();
@@ -260,6 +269,57 @@ impl Decoder {
     ) -> Result<Self> {
         let probe = PasswordProbe::read(input, length)?;
         let keys = probe.keys(password, workspace)?;
+        Self::finish_open(input, length, probe, keys)
+    }
+    /// Worker final KDF: borrow at most three extra credits, then return them
+    /// before reading recovery framing. No derived keys cross process boundaries.
+    pub fn open_with_budget<R: Read + Seek>(
+        input: &mut R,
+        length: u64,
+        password: &[u16],
+        mut acquire: impl FnMut(usize) -> usize,
+        mut release: impl FnMut(usize),
+    ) -> Result<Self> {
+        let probe = PasswordProbe::read(input, length)?;
+        #[cfg(feature = "parallel-kdf")]
+        let extra = acquire(3);
+        #[cfg(not(feature = "parallel-kdf"))]
+        let extra = {
+            let _ = &mut acquire;
+            0
+        };
+        let keys = {
+            let lease = CpuLease {
+                extra,
+                release: &mut release,
+            };
+            #[cfg(feature = "parallel-kdf")]
+            let lease = {
+                let mut lease = lease;
+                if lease.extra != 0 {
+                    // Only initialize the shared executor if CPU was granted.
+                    // Return surplus immediately when its capacity is smaller.
+                    let usable = lease
+                        .extra
+                        .min(3)
+                        .min(rayon::current_num_threads().saturating_sub(1));
+                    if usable != lease.extra {
+                        (lease.release)(lease.extra - usable);
+                        lease.extra = usable;
+                    }
+                }
+                lease
+            };
+            probe.keys(password, &mut Workspace::with_threads(1 + lease.extra))?
+        };
+        Self::finish_open(input, length, probe, keys)
+    }
+    fn finish_open<R: Read + Seek>(
+        input: &mut R,
+        length: u64,
+        probe: PasswordProbe,
+        keys: Keys,
+    ) -> Result<Self> {
         // A password-only Test must succeed after a valid quick proof even if
         // recovery framing is damaged. Report that damage during real Extract,
         // so generic encrypted-CRC heuristics cannot turn it into a bad password.

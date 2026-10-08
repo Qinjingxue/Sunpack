@@ -106,3 +106,15 @@ S-box/MDS tables during key setup and shares them across CTR tasks.
 The full notice is distributed at [licenses/twofish-license.txt](licenses/twofish-license.txt).
 
 Source: https://github.com/RustCrypto/block-ciphers/tree/twofish-v0.7.1/twofish
+
+## RustCrypto Serpent
+
+The Serpent-256 key schedule and Boolean S-box circuits in
+`native/sunpack_enc/src/serpent.rs` are adapted from RustCrypto serpent 0.6.0,
+Copyright (c) 2019-2024 The RustCrypto Project Developers and
+Copyright (c) 2019 Jonathan Serra, under the MIT license. SunPack uses the same
+circuits for scalar blocks and eight-block AVX2 encryption, sharing one expanded
+key across CTR tasks. The full notice is distributed at
+[licenses/serpent-license.txt](licenses/serpent-license.txt).
+
+Source: https://github.com/RustCrypto/block-ciphers/tree/serpent-v0.6.0/serpent

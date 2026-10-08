@@ -82,7 +82,8 @@ Z7_COM7F_IMF(CHandler::Open(IInStream *input, const UInt64 *, IArchiveOpenCallba
     RINOK(crypto->CryptoGetTextPassword(&password))
     Context c{input};
     const int rc = sup_enc_open(&c, read, seek, packed,
-        reinterpret_cast<const uint16_t *>(password), SysStringLen(password), &decoder, &unpacked);
+        reinterpret_cast<const uint16_t *>(password), SysStringLen(password), &decoder, &unpacked,
+        acquire_cpu, release_cpu);
     SysFreeString(password);
     if (c.error != S_OK) return c.error;
     if (rc == 5) return E_OUTOFMEMORY;

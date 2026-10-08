@@ -47,10 +47,11 @@ def test_large_c4_uses_only_granted_credits_and_matches_official_bytes(tmp_path,
     expected = file_inventory(large_c4)["large.expected"]
     assert file_inventory(tmp_path / "out")["large"] == expected
     cpu = next(event for event in events if event.get("event") == "decoder_started")
-    # The first progress callback precedes borrowing. Rust tests check the
-    # actual requests against data size and executor capacity at acquire time.
+    # Open borrowed up to three extra credits for the final KDF and returned
+    # all of them before this first extraction progress callback.
     assert cpu["decoder_cpu_credits"] == 1
-    assert cpu["current_decoder_extra_credits"] == cpu["peak_decoder_extra_credits"] == 0
+    assert cpu["current_decoder_extra_credits"] == 0
+    assert cpu["peak_decoder_extra_credits"] == min(3, capacity - 1)
     assert not cpu["decoder_parallel"]
 
 
@@ -90,4 +91,41 @@ def test_parallel_c4_releases_credits_after_mac_failure_for_watch_and_cli(tmp_pa
     cpu = [e for e in events if e.get("event") == "decoder_started"]
     assert cpu and all(e["decoder_cpu_credits"] == 1 and e["current_decoder_extra_credits"] == 0 for e in cpu)
     final_cpu = next(e for e in cpu if e["job_id"] == "16")
-    assert final_cpu["peak_decoder_extra_credits"] == 0
+    assert final_cpu["peak_decoder_extra_credits"] == 3
+
+
+@pytest.mark.parametrize("origin", ["foreground", "watch"])
+@pytest.mark.parametrize("incomplete", [False, True])
+def test_c4_carrier_ranges_keep_ctr_continuity_and_reject_missing_tail(tmp_path, large_c4, origin, incomplete):
+    from sunpack_native import enc_fast_verify_passwords_from_ranges
+    from tests.helpers.native_fixture import assemble_carrier
+
+    carrier = tmp_path / "disguised.mkv"
+    segment = assemble_carrier(carrier, [large_c4 / "large.enc"],
+                               junk_min=37, junk_max=37)["segments"][0]
+    start, length = segment["offset"], segment["length"]
+    # Fragment the header, quick proof, and payload at unaligned boundaries.
+    cuts = [0, 20, 40, 71, 72, 65543, length - (33 if incomplete else 0)]
+    ranges = [{"path": str(carrier), "start": start + a, "end": start + b}
+              for a, b in zip(cuts, cuts[1:])]
+    proof = enc_fast_verify_passwords_from_ranges(ranges, ["wrong", "sunpack-test", "sunpack-test"])
+    assert proof["status"] == "match" and proof["matched_index"] == 1
+    request = {"job_id": "ranges", "origin": origin, "archive_path": str(carrier),
+               "archive_input": {"kind": "archive_input", "entry_path": str(carrier),
+                                 "open_mode": "concat_ranges", "format_hint": "enc", "ranges": ranges},
+               "output_dir": str(tmp_path / "out"), "password": "sunpack-test"}
+    completed = subprocess.run([str(BUILD / "sunpack_sevenzip_worker.exe")],
+                               input=json.dumps(request), capture_output=True, text=True, encoding="utf-8",
+                               timeout=30, creationflags=subprocess.CREATE_NO_WINDOW,
+                               env=os.environ | {"SUNPACK_NATIVE_WORKER_THREAD_CAPACITY": "4"})
+    events = [event for line in completed.stdout.splitlines()
+              if (event := parse_worker_transport_event(line))]
+    result = next(event for event in events if event.get("type") == "result")
+    if incomplete:
+        assert result["native_status"] == "damaged" and not result["wrong_password"], result
+        assert not result["verified_manifest"]["validated"]
+    else:
+        assert result["status"] == "ok" and result["verified_manifest"]["validated"], result
+        assert list(file_inventory(tmp_path / "out").values()) == [file_inventory(large_c4)["large.expected"]]
+    cpu = next(event for event in events if event.get("event") == "decoder_started")
+    assert cpu["current_decoder_extra_credits"] == 0

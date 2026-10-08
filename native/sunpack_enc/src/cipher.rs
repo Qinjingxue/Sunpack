@@ -6,6 +6,8 @@ use cipher5::{
     BlockCipherEncrypt, KeyInit as KeyInit5,
 };
 use zeroize::{Zeroize, ZeroizeOnDrop};
+#[path = "serpent.rs"]
+mod serpent;
 #[path = "twofish.rs"]
 mod twofish;
 
@@ -28,14 +30,7 @@ impl Primitive {
                 Self::Rc6(<Rc6 as KeyInit5>::new_from_slice(key).unwrap()),
                 16,
             ),
-            2 => {
-                let mut k: [u8; 32] = key.try_into().unwrap();
-                k.reverse();
-                (
-                    Self::Serpent(<serpent::Serpent as KeyInit5>::new_from_slice(&k).unwrap()),
-                    16,
-                )
-            }
+            2 => (Self::Serpent(serpent::Serpent::new(key)), 16),
             3 | 6 => (
                 Self::Blowfish(blowfish::Blowfish::new_from_slice(key).unwrap()),
                 8,
@@ -65,16 +60,7 @@ impl Primitive {
     fn encrypt(&self, bytes: &mut [u8]) {
         match self {
             Self::Aes(c) => batch(c, bytes, false),
-            Self::Serpent(c) => {
-                for block in bytes.chunks_exact_mut(16) {
-                    let mut b = cipher5::Block::<serpent::Serpent>::default();
-                    b.copy_from_slice(block);
-                    b.reverse();
-                    c.encrypt_block(&mut b);
-                    b.reverse();
-                    block.copy_from_slice(&b);
-                }
-            }
+            Self::Serpent(c) => c.encrypt(bytes),
             Self::Blowfish(c) => batch(c, bytes, false),
             Self::Twofish(c) => c.encrypt(bytes),
             Self::Gost(c) => batch(c, bytes, true),

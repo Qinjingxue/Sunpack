@@ -1,5 +1,5 @@
 //! Synchronous COM stream adaptation. No paths, Python values, or worker policy.
-use crate::{Decoder, Error, Workspace};
+use crate::{Decoder, Error};
 use std::{
     ffi::c_void,
     io::{Read, Seek, SeekFrom, Write},
@@ -77,6 +77,8 @@ pub unsafe extern "C" fn sup_enc_open(
     password_len: usize,
     decoder: *mut *mut Decoder,
     output_size: *mut u64,
+    acquire: AcquireFn,
+    release: ReleaseFn,
 ) -> i32 {
     if decoder.is_null() || output_size.is_null() || (password.is_null() && password_len != 0) {
         return 4;
@@ -91,7 +93,13 @@ pub unsafe extern "C" fn sup_enc_open(
         let mut input = Input { ctx, read, seek };
         // Only the selected password reaches extraction. KDF memory is released
         // at the end of Open; the decoder retains just its small derived keys.
-        let opened = Decoder::open(&mut input, length, pw, &mut Workspace::default());
+        let opened = Decoder::open_with_budget(
+            &mut input,
+            length,
+            pw,
+            |wanted| acquire(ctx, wanted as u32) as usize,
+            |count| release(ctx, count as u32),
+        );
         match opened {
             Ok(value) => {
                 *output_size = value.output_size();

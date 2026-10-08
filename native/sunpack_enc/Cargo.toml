@@ -14,6 +14,10 @@ path = "../../benchmarks/native/enc_ctr.rs"
 name = "decrypt"
 path = "../../benchmarks/native/enc_decrypt.rs"
 
+[[example]]
+name = "open"
+path = "../../benchmarks/native/enc_open.rs"
+
 [features]
 parallel-kdf = ["dep:rayon"]
 parallel-decrypt = ["dep:rayon"]
@@ -33,9 +37,11 @@ rc6 = "0.1"
 rayon = { version = "1.10", optional = true }
 magma = "0.9"
 sha2 = { version = "0.10", features = ["compress"] }
-serpent = "0.6"
 sha3 = "0.10"
 skein = "0.1"
 threefish = "0.5"
 crc32fast = "1.4"
 zeroize = { version = "1.8", features = ["derive"] }
+
+[dev-dependencies]
+serpent = "0.6"

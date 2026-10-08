@@ -12,6 +12,113 @@ const FIXTURES: [&[u8]; 10] = [
     include_bytes!("../tests/data/algorithm_8.mov"),
     include_bytes!("../tests/data/algorithm_9.mov"),
 ];
+
+#[test]
+fn kdf_credit_counts_preserve_official_keys() {
+    for fixture in [
+        FIXTURES[2],
+        FIXTURES[9],
+        include_bytes!("../tests/data/params_10.enc"),
+    ] {
+        let header = Header::parse(fixture, fixture.len() as u64).unwrap();
+        let serial = Workspace::with_threads(1)
+            .derive(&header, &pw("sunpack-test"))
+            .unwrap();
+        for threads in [2, 3, 4] {
+            let parallel = Workspace::with_threads(threads)
+                .derive(&header, &pw("sunpack-test"))
+                .unwrap();
+            assert_eq!(parallel.key, serial.key);
+            assert_eq!(parallel.nonce, serial.nonce);
+            assert_eq!(parallel.auth, serial.auth);
+        }
+    }
+}
+
+#[test]
+fn open_returns_kdf_credits_before_io_and_on_password_failure() {
+    use std::cell::Cell;
+    struct CheckedReader<'a> {
+        input: Cursor<&'a [u8]>,
+        held: &'a Cell<usize>,
+    }
+    impl Read for CheckedReader<'_> {
+        fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+            assert_eq!(self.held.get(), 0, "KDF credits held during input I/O");
+            self.input.read(bytes)
+        }
+    }
+    impl Seek for CheckedReader<'_> {
+        fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+            assert_eq!(self.held.get(), 0, "KDF credits held during seek");
+            self.input.seek(pos)
+        }
+    }
+    let run = |_executor_threads: usize| {
+        for grant in 0..=3 {
+            for password in ["sunpack-test", "wrong"] {
+                let held = Cell::new(0);
+                let acquired = Cell::new(0);
+                let mut input = CheckedReader {
+                    input: Cursor::new(FIXTURES[9]),
+                    held: &held,
+                };
+                let result = Decoder::open_with_budget(
+                    &mut input,
+                    FIXTURES[9].len() as u64,
+                    &pw(password),
+                    |wanted| {
+                        #[cfg(feature = "parallel-kdf")]
+                        assert_eq!(wanted, 3);
+                        #[cfg(not(feature = "parallel-kdf"))]
+                        assert!(
+                            false,
+                            "serial build must not request credits: {wanted}/{_executor_threads}"
+                        );
+                        let extra = wanted.min(grant);
+                        assert_eq!(held.get(), 0);
+                        held.set(extra);
+                        acquired.set(extra);
+                        extra
+                    },
+                    |extra| {
+                        assert!(held.get() >= extra);
+                        held.set(held.get() - extra);
+                    },
+                );
+                assert_eq!(held.get(), 0);
+                if password == "wrong" {
+                    assert!(matches!(result, Err(Error::Password)));
+                } else {
+                    assert_eq!(result.unwrap().output_size(), 192);
+                }
+                #[cfg(feature = "parallel-kdf")]
+                assert_eq!(acquired.get(), grant);
+            }
+        }
+        // Invalid/short input is rejected before requesting CPU or KDF memory.
+        for bytes in [&FIXTURES[0][..39], b"bad header".as_slice()] {
+            assert!(Decoder::open_with_budget(
+                &mut Cursor::new(bytes),
+                bytes.len() as u64,
+                &pw("sunpack-test"),
+                |_| panic!("invalid header requested credits"),
+                |_| panic!("unexpected release"),
+            )
+            .is_err());
+        }
+    };
+    #[cfg(feature = "parallel-kdf")]
+    for threads in 1..=4 {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap()
+            .install(|| run(threads));
+    }
+    #[cfg(not(feature = "parallel-kdf"))]
+    run(1);
+}
 fn pw(s: &str) -> Vec<u16> {
     s.encode_utf16().collect()
 }

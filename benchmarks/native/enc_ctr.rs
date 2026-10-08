@@ -11,6 +11,9 @@ fn main() {
     let mib: usize = args.get(1).map_or(256, |v| v.parse().unwrap());
     let rounds: usize = args.get(2).map_or(3, |v| v.parse().unwrap());
     let threads: usize = args.get(3).map_or(1, |v| v.parse().unwrap());
+    let algorithms: Option<Vec<u8>> = args
+        .get(4)
+        .map(|v| v.split(',').map(|code| code.parse().unwrap()).collect());
     #[cfg(not(feature = "parallel-decrypt"))]
     assert_eq!(threads, 1, "enable parallel-decrypt for multiple threads");
     assert!(mib > 0 && rounds > 0 && threads > 0);
@@ -28,6 +31,12 @@ fn main() {
         (8, 64, 32),
         (9, 256, 192),
     ] {
+        if algorithms
+            .as_ref()
+            .is_some_and(|codes| !codes.contains(&code))
+        {
+            continue;
+        }
         for round in 0..rounds {
             let stream = cipher::Stream::new(code, &vec![0x73; key_len], &vec![0xff; nonce_len]);
             let start = Instant::now();

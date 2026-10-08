@@ -142,7 +142,9 @@ impl EncPasswordContext {
         let workers = rayon::current_num_threads()
             .div_ceil(lanes_in_flight)
             .min((PARALLEL_WORKSPACE_BYTES / self.probe.workspace_bytes()).max(1))
-            .min(candidates.len().div_ceil(4))
+            // Lanes already account for each KDF's executor demand above.
+            // Dividing candidate count by four again serializes small batches.
+            .min(candidates.len())
             .max(1);
         let chunk_size = candidates.len().div_ceil(workers);
         let earliest = AtomicUsize::new(candidates.len());

@@ -175,6 +175,8 @@ def test_concurrent_candidate_batches_keep_priority_after_empty_and_rejected_bat
     from concurrent.futures import ThreadPoolExecutor
     path = str(DATA / "algorithm_0.mov")
     batches = [[], ["wrong"], ["sunpack-test", "sunpack-test"],
+               ["wrong", "sunpack-test", "sunpack-test", "later"],
+               ["wrong1", "wrong2", "wrong3", "wrong4"],
                [f"wrong-{i}" for i in range(13)] + ["sunpack-test", "sunpack-test"]] * 2
     with ThreadPoolExecutor(max_workers=8) as pool:
         for _ in range(2):
