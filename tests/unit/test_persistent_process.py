@@ -7,6 +7,8 @@ import struct
 import threading
 import time
 
+import pytest
+
 from sunpack.core.support import runtime_identity
 from sunpack.runtime.cli import persistent_process
 
@@ -714,5 +716,116 @@ def test_persistent_runtime_reuses_engine_for_request_only_config(monkeypatch):
         assert callbacks == [state_changed]
         await persistent_runtime.close_persistent_runtime()
         assert callbacks[-1] is None
+
+    asyncio.run(scenario())
+
+
+def test_persistent_runtime_concurrent_first_requests_share_worker_and_outputs(tmp_path):
+    from sunpack.runtime.cli import persistent_runtime
+    from tests.helpers.config_factory import make_config
+
+    async def scenario():
+        await persistent_runtime.close_persistent_runtime()
+        persistent_runtime.enable_persistent_runtime()
+        engines = []
+        try:
+            config = make_config()
+            engines = await asyncio.gather(
+                persistent_runtime.shared_pipeline_engine(config),
+                persistent_runtime.shared_pipeline_engine(config),
+            )
+            assert engines[0] is engines[1]
+            worker = engines[0]._services.sevenzip_runner._async_worker_holder._worker
+            assert worker.is_alive()
+            output = str(tmp_path / "shared")
+            reserved = [
+                engine._services.output_reservations.reserve(output, str(index), set())
+                for index, engine in enumerate(engines)
+            ]
+            assert reserved == [output, str(tmp_path / "shared(1)")]
+            await persistent_runtime.close_persistent_runtime()
+            assert not worker.is_alive()
+        finally:
+            await persistent_runtime.close_persistent_runtime()
+            # Also clean up orphaned engines when this regression fails.
+            for engine in engines:
+                await engine.aclose(graceful=True)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("interruption", ["error", "cancel", "shutdown"])
+def test_persistent_runtime_interrupted_initialization_releases_owner(monkeypatch, interruption):
+    from sunpack.runtime.cli import persistent_runtime
+
+    async def scenario():
+        await persistent_runtime.close_persistent_runtime()
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        created = []
+
+        class FakeEngine:
+            def __init__(self, config):
+                self.closed = False
+                self.callback = None
+                created.append(self)
+
+            async def __aenter__(self):
+                if self is created[0]:
+                    entered.set()
+                    await release.wait()
+                    if interruption == "error":
+                        raise RuntimeError("startup failed")
+                return self
+
+            def set_state_changed_callback(self, callback):
+                self.callback = callback
+
+            def reconfigure_request(self, config):
+                pass
+
+            async def aclose(self, *, graceful=True):
+                self.closed = True
+
+        monkeypatch.setattr(persistent_runtime, "PipelineEngine", FakeEngine)
+        persistent_runtime.enable_persistent_runtime(state_changed=lambda: None)
+        requests = []
+        closing = None
+        try:
+            first = asyncio.create_task(persistent_runtime.shared_pipeline_engine({}))
+            requests.append(first)
+            await entered.wait()
+            waiting = asyncio.create_task(persistent_runtime.shared_pipeline_engine({}))
+            requests.append(waiting)
+            await asyncio.sleep(0)
+            assert len(created) == 1
+            if interruption == "shutdown":
+                closing = asyncio.create_task(persistent_runtime.close_persistent_runtime())
+                await asyncio.sleep(0)
+            elif interruption == "cancel":
+                first.cancel()
+            release.set()
+            outcomes = await asyncio.wait_for(
+                asyncio.gather(*requests, return_exceptions=True), timeout=2,
+            )
+            assert created[0].closed and created[0].callback is None
+            if closing is not None:
+                await closing
+                assert all(isinstance(outcome, RuntimeError) for outcome in outcomes)
+                assert persistent_runtime.current_pipeline_engine() is None
+                assert len(created) == 1
+            else:
+                expected = asyncio.CancelledError if interruption == "cancel" else RuntimeError
+                assert isinstance(outcomes[0], expected)
+                assert outcomes[1] is persistent_runtime.current_pipeline_engine()
+                assert len(created) == 2 and not created[1].closed
+            await persistent_runtime.close_persistent_runtime()
+            assert all(engine.closed and engine.callback is None for engine in created)
+        finally:
+            release.set()
+            await asyncio.gather(*requests, return_exceptions=True)
+            if closing is not None:
+                await closing
+            await persistent_runtime.close_persistent_runtime()
 
     asyncio.run(scenario())
