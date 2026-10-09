@@ -719,12 +719,12 @@ class WatchService:
                 wake_callback=self._wake_scheduler,
             )
             await scheduler.start()
-        except Exception:
+        except BaseException:
             if toast_coordinator is not None:
                 toast_coordinator.stop()
             if scheduler is not None:
                 try:
-                    await scheduler.stop()
+                    await scheduler.aclose()
                 except Exception:
                     pass
             if pipeline_engine is not None and self._owns_pipeline_engine:
@@ -747,19 +747,23 @@ class WatchService:
         )
 
     async def _stop_scheduler(self) -> None:
-        if self.scheduler is not None:
-            await self.scheduler.stop()
-            drain = getattr(self.scheduler, "drain", None)
-            if drain is not None:
-                await drain()
-        self.scheduler = None
-        if self.toast_coordinator is not None:
-            self.toast_coordinator.stop()
-        self.toast_coordinator = None
-        if self.pipeline_engine is not None and self._owns_pipeline_engine:
-            await self.pipeline_engine.aclose(graceful=True)
-            self.pipeline_engine = None
-        self._last_idle_tick_signature = None
+        try:
+            if self.scheduler is not None:
+                await self.scheduler.aclose()
+        finally:
+            self.scheduler = None
+            try:
+                if self.toast_coordinator is not None:
+                    self.toast_coordinator.stop()
+            finally:
+                self.toast_coordinator = None
+                try:
+                    if self.pipeline_engine is not None and self._owns_pipeline_engine:
+                        await self.pipeline_engine.aclose(graceful=True)
+                finally:
+                    if self._owns_pipeline_engine:
+                        self.pipeline_engine = None
+                    self._last_idle_tick_signature = None
 
     def _reconcile_toast_host(self, config: dict) -> None:
         watch_config = config["watch"]

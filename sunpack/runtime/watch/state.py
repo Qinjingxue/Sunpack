@@ -14,6 +14,7 @@ from sunpack_native import NativeWatchState, watch_path_key
 
 from sunpack.runtime.watch.journal_commit import (
     JournalTicket,
+    open_state_stream,
     seed_state_stream,
     submit_segment_seal,
     submit_state_transaction,
@@ -40,13 +41,37 @@ class _StatePathCoordinator:
         # Snapshot publication, WAL retirement and reload form one lifecycle.
         # Keep it separate so ordinary state mutations can continue during I/O.
         self.checkpoint_lock = threading.Lock()
+        self.next_sequence = 1
+        self.segment_start: int | None = None
+
+    def seed(self, last_seq: int) -> int:
+        self.next_sequence = max(self.next_sequence, int(last_seq) + 1)
+        if self.segment_start is None:
+            self.segment_start = int(last_seq) + 1
+        return self.segment_start
+
+    def reserve(self, floor: int) -> tuple[int, int]:
+        seq = max(self.next_sequence, int(floor) + 1)
+        self.next_sequence = seq + 1
+        if self.segment_start is None:
+            self.segment_start = seq
+        return seq, self.segment_start
+
+    def rotate(self, boundary: int) -> tuple[int, int] | None:
+        if self.next_sequence - 1 != boundary:
+            return None
+        old_start = self.current_segment(boundary + 1)
+        if old_start > boundary:
+            return None
+        self.segment_start = boundary + 1
+        return old_start, self.segment_start
+
+    def current_segment(self, fallback: int) -> int:
+        return self.segment_start if self.segment_start is not None else fallback
 
 
 _STATE_PATH_COORDINATORS_GUARD = threading.Lock()
 _STATE_PATH_COORDINATORS: weakref.WeakValueDictionary[str, _StatePathCoordinator] = weakref.WeakValueDictionary()
-_SEQUENCE_GUARD = threading.Lock()
-_SEQUENCE_NEXT: dict[str, int] = {}
-_SEQUENCE_SEGMENT_START: dict[str, int] = {}
 
 
 def _state_path_key(path: Path) -> str:
@@ -61,48 +86,6 @@ def _state_path_coordinator(path: Path) -> _StatePathCoordinator:
             coordinator = _StatePathCoordinator()
             _STATE_PATH_COORDINATORS[key] = coordinator
         return coordinator
-
-
-def _seed_sequence(path: Path, last_seq: int) -> int:
-    key = _state_path_key(path)
-    with _SEQUENCE_GUARD:
-        _SEQUENCE_NEXT[key] = max(_SEQUENCE_NEXT.get(key, 1), int(last_seq) + 1)
-        return _SEQUENCE_SEGMENT_START.setdefault(key, int(last_seq) + 1)
-
-
-def _reserve_sequence(path: Path, floor: int) -> tuple[int, int]:
-    key = _state_path_key(path)
-    with _SEQUENCE_GUARD:
-        seq = max(_SEQUENCE_NEXT.get(key, 1), int(floor) + 1)
-        _SEQUENCE_NEXT[key] = seq + 1
-        segment_start = _SEQUENCE_SEGMENT_START.setdefault(key, seq)
-        return seq, segment_start
-
-
-def _sequence_tail(path: Path) -> int:
-    with _SEQUENCE_GUARD:
-        return _SEQUENCE_NEXT.get(_state_path_key(path), 1) - 1
-
-
-def _current_sequence_segment(path: Path, fallback: int) -> int:
-    with _SEQUENCE_GUARD:
-        return _SEQUENCE_SEGMENT_START.get(_state_path_key(path), int(fallback))
-
-
-def _rotate_sequence_segment(path: Path, boundary: int) -> tuple[int, int] | None:
-    """Atomically cut the WAL only when this store owns the full sequence prefix."""
-
-    key = _state_path_key(path)
-    with _SEQUENCE_GUARD:
-        if _SEQUENCE_NEXT.get(key, 1) - 1 != int(boundary):
-            return None
-        old_start = _SEQUENCE_SEGMENT_START.setdefault(key, int(boundary) + 1)
-        if old_start > int(boundary):
-            return None
-        new_start = int(boundary) + 1
-        _SEQUENCE_SEGMENT_START[key] = new_start
-        return old_start, new_start
-
 
 
 def _sync_file_path(path: Path) -> None:
@@ -190,6 +173,10 @@ class WatchStateStore:
         self._compact_bytes = max(1, int(compact_bytes))
         self._hard_compact_bytes = max(self._compact_bytes, int(hard_compact_bytes))
         self._writer_stream = _state_path_key(self.path)
+        self._journal_stream = open_state_stream(self._writer_stream)
+        self._closing = False
+        self._closed = False
+        self._journal_waiters = 0
         self._native = NativeWatchState()
 
         self._checkpoint_seq = 0
@@ -206,8 +193,16 @@ class WatchStateStore:
         self._persistence_fault: BaseException | None = None
         self._snapshot_exists = False
         self._external_sequence_gap = False
-        self.load()
-        seed_state_stream(stream=self._writer_stream, seq=self._applied_seq)
+        try:
+            self.load()
+            seed_state_stream(stream=self._writer_stream, seq=self._applied_seq)
+        except BaseException:
+            # A retained startup traceback must not own a native WAL stream.
+            try:
+                self.close()
+            except Exception:
+                pass
+            raise
 
     @property
     def password_generation(self) -> int:
@@ -237,7 +232,9 @@ class WatchStateStore:
 
     @property
     def journal_path(self) -> Path:
-        start = _current_sequence_segment(self.path, self._active_segment_start)
+        with self._state_lock:
+            self._ensure_open_locked()
+            start = self._path_coordinator.current_segment(self._active_segment_start)
         return self._segment_path(start)
 
     def _segment_path(self, start_seq: int) -> Path:
@@ -281,7 +278,11 @@ class WatchStateStore:
     def load(self) -> None:
         # A reader must see either the old snapshot plus its WAL, or the new
         # snapshot after retirement; never mix the two publication generations.
-        with self._path_coordinator.checkpoint_lock, self._state_lock:
+        with self._state_lock:
+            self._ensure_open_locked()
+            coordinator = self._path_coordinator
+        with coordinator.checkpoint_lock, self._state_lock:
+            self._ensure_open_locked()
             self._reset_memory_locked()
             if self.path.exists():
                 try:
@@ -297,7 +298,7 @@ class WatchStateStore:
                 self._applied_seq = self._checkpoint_seq
 
             self._load_journal_segments_locked()
-            self._active_segment_start = _seed_sequence(self.path, self._applied_seq)
+            self._active_segment_start = self._path_coordinator.seed(self._applied_seq)
             self._update_compaction_due_locked()
 
     def _load_journal_segments_locked(self) -> None:
@@ -328,6 +329,7 @@ class WatchStateStore:
         """Force one checkpoint and wait until it covers the current sequence."""
 
         with self._checkpoint_condition:
+            self._ensure_open_locked()
             self._raise_persistence_fault_locked()
             target_seq = self._applied_seq
             self._request_checkpoint_locked(force=True)
@@ -345,13 +347,20 @@ class WatchStateStore:
         """Flush all journal operations submitted before this call."""
 
         with self._state_lock:
+            self._ensure_open_locked()
             self._raise_persistence_fault_locked()
             ticket = submit_stream_flush(
                 stream=self._writer_stream,
                 target_seq=self._applied_seq,
                 on_error=self._on_journal_error,
             )
-        ticket.wait()
+            self._journal_waiters += 1
+        try:
+            ticket.wait()
+        finally:
+            with self._checkpoint_condition:
+                self._journal_waiters -= 1
+                self._checkpoint_condition.notify_all()
         with self._state_lock:
             self._raise_persistence_fault_locked()
 
@@ -359,10 +368,43 @@ class WatchStateStore:
         """Request a checkpoint without doing snapshot work on the caller."""
 
         with self._state_lock:
+            self._ensure_open_locked()
             if not force and not self._compaction_due:
                 return False
             self._request_checkpoint_locked(force=force)
             return True
+
+    def trim_idle_storage(self) -> None:
+        with self._state_lock:
+            self._ensure_open_locked()
+            self._native.trim_idle_storage()
+
+    def close(self) -> None:
+        """Finish existing work and release WAL ownership without a new snapshot."""
+        with self._checkpoint_condition:
+            while self._closing and not self._closed:
+                self._checkpoint_condition.wait()
+            if self._closed:
+                return
+            self._closing = True
+            while self._checkpoint_running or self._journal_waiters:
+                self._checkpoint_condition.wait()
+        try:
+            self._journal_stream.close()
+            with self._state_lock:
+                self._raise_persistence_fault_locked()
+        finally:
+            with self._checkpoint_condition:
+                self._closed = True
+                self._native.reset()
+                self._segment_records.clear()
+                self._segment_bytes.clear()
+                self._path_coordinator = None
+                self._checkpoint_condition.notify_all()
+
+    def _ensure_open_locked(self) -> None:
+        if self._closing or self._closed:
+            raise RuntimeError("Watch state store is closed")
 
     @property
     def compaction_due(self) -> bool:
@@ -393,6 +435,7 @@ class WatchStateStore:
 
     def _apply_in_memory_locked(self, operations: list[dict[str, Any]]) -> None:
         """Apply operations that intentionally bypass the WAL."""
+        self._ensure_open_locked()
         self._native.apply(self._native.decode_operations(operations))
 
     def _reset_memory_locked(self) -> None:
@@ -438,7 +481,9 @@ class WatchStateStore:
                     pass
 
     def _request_checkpoint_locked(self, *, force: bool = False) -> None:
-        if _sequence_tail(self.path) != self._applied_seq:
+        if self._closing or self._closed:
+            return
+        if (self._path_coordinator.next_sequence - 1) != self._applied_seq:
             self._external_sequence_gap = True
         if self._external_sequence_gap:
             if force:
@@ -475,7 +520,7 @@ class WatchStateStore:
                     self._checkpoint_running = False
                     self._checkpoint_condition.notify_all()
                     return
-                if _sequence_tail(self.path) != self._applied_seq:
+                if (self._path_coordinator.next_sequence - 1) != self._applied_seq:
                     self._external_sequence_gap = True
                     self._checkpoint_error = RuntimeError(
                         "cannot checkpoint a WatchStateStore that does not own the full sequence prefix"
@@ -485,7 +530,7 @@ class WatchStateStore:
                     return
                 boundary = self._applied_seq
                 view = self._capture_snapshot_locked()
-                rotation = _rotate_sequence_segment(self.path, boundary)
+                rotation = self._path_coordinator.rotate(boundary)
                 if rotation is not None:
                     old_start, new_start = rotation
                     self._active_segment_start = new_start
@@ -498,10 +543,7 @@ class WatchStateStore:
                         on_error=self._on_journal_error,
                     )
                 else:
-                    self._active_segment_start = _current_sequence_segment(
-                        self.path,
-                        boundary + 1,
-                    )
+                    self._active_segment_start = self._path_coordinator.current_segment(boundary + 1)
                 self._checkpoint_requested = False
 
             error: BaseException | None = None
@@ -541,7 +583,7 @@ class WatchStateStore:
                     self._checkpoint_running = False
                     return
                 if (
-                    self._applied_seq > boundary
+                    not self._closing and self._applied_seq > boundary
                     and (self._checkpoint_requested or self._compaction_due)
                 ):
                     continue
@@ -599,10 +641,11 @@ class WatchStateStore:
     ) -> None:
         if not operations:
             return
+        self._ensure_open_locked()
         self._raise_persistence_fault_locked()
         decoded = self._native.decode_operations(operations)
         previous_seq = self._applied_seq
-        seq, segment_start = _reserve_sequence(self.path, previous_seq)
+        seq, segment_start = self._path_coordinator.reserve(previous_seq)
         if seq != previous_seq + 1:
             self._external_sequence_gap = True
         self._active_segment_start = segment_start
@@ -630,11 +673,14 @@ class WatchStateStore:
         # reached the writer.  Durable tickets additionally include the fsync
         # barrier.  The global state lock is released for that wait, so unrelated
         # Watch state progression is never serialized behind physical I/O.
+        self._journal_waiters += 1
         self._state_lock.release()
         try:
             ticket.wait()
         finally:
             self._state_lock.acquire()
+            self._journal_waiters -= 1
+            self._checkpoint_condition.notify_all()
         self._raise_persistence_fault_locked()
 
     def _update_compaction_due_locked(self) -> None:

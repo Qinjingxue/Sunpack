@@ -163,11 +163,11 @@ class WatchHarness:
             return
         with self.timer.measure("watch_close"):
             if self.async_stop is not None:
-                self.loop.run_until_complete(self.async_stop())
+                self.watcher.stop = self.async_stop
             # Match WatchService shutdown: harvest submitted requests before
             # closing the engine, including tasks already removed from its
             # active-request map after completing with an exception.
-            self.loop.run_until_complete(self.watcher.drain())
+            self.loop.run_until_complete(self.watcher.aclose())
             if self.delegate is not None:
                 self.loop.run_until_complete(self.delegate.aclose())
             self.loop.close()

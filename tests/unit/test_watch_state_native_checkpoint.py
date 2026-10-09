@@ -56,3 +56,37 @@ def test_native_state_replay_preserves_fractional_mtime_identity(tmp_path, stora
     assert recovered.latest_entry_for_path(candidate.path).mtime.hex() == candidate.mtime.hex()
     recovered.complete_work_if_matches(candidate)
     assert recovered.pending_work_count == 0
+
+
+def test_idle_trim_releases_peak_capacity_without_losing_live_or_frozen_state(tmp_path):
+    from sunpack_native import NativeWatchState
+
+    state = WatchStateStore(str(tmp_path / "state.json"))
+    candidates = [WatchCandidate(str(tmp_path / f"{index}.bin"), index, 1.0) for index in range(512)]
+    for candidate in candidates:
+        state.queue_active(candidate, persist=False)
+    for candidate in candidates[:32]:
+        state.mark(candidate.path, candidate.size, candidate.mtime, status="failed_password")
+    state.merge_watch_cursors({"c:": {"journal_id": 1, "next_usn": 2}})
+    state.mark_password_source_changed("password-set")
+    frozen = state._native.capture(state.applied_seq)
+    peak = state._native.storage_capacities()
+    state.complete_work(candidate.path for candidate in candidates[1:])
+    state.clear_entries(candidate.path for candidate in candidates[1:32])
+    state.trim_idle_storage()
+    assert state._native.storage_capacities()[0] < peak[0]
+    assert state.pending_work_count == state.entry_count == 1
+    assert state.watch_cursor_snapshot()["c:"] == {"journal_id": 1, "next_usn": 2}
+    assert state.password_source_signature == "password-set"
+    snapshot = tmp_path / "frozen.json"
+    snapshot.touch()
+    frozen.write(str(snapshot))
+    restored = NativeWatchState()
+    restored.load_snapshot(str(snapshot))
+    assert restored.pending_count == 512
+    assert restored.entry_count == 32
+    state.complete_work([candidates[0].path])
+    state.clear_entries([candidates[0].path])
+    state.trim_idle_storage()
+    assert state._native.storage_capacities() == (0, 0)
+    state.close()

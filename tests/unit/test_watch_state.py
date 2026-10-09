@@ -108,11 +108,16 @@ def test_corrupt_complete_journal_record_is_reported(tmp_path):
 
 
 def test_snapshot_missing_required_field_is_rejected(tmp_path):
+    from sunpack.runtime.watch.journal_commit import journal_stats
+
     state_path = tmp_path / "state.json"
     state_path.write_text(json.dumps({"checkpoint_seq": 0}), encoding="utf-8")
 
-    with pytest.raises(WatchStateJournalError, match="corrupt watch state snapshot"):
+    with pytest.raises(WatchStateJournalError, match="corrupt watch state snapshot") as error:
         WatchStateStore(str(state_path))
+    # Retaining the startup exception/traceback must not retain native ownership.
+    assert error.value.__traceback__ is not None
+    assert not journal_stats(watch_state_module._state_path_key(state_path))["registered"]
 
 
 def test_journal_operation_with_unexpected_field_is_rejected(tmp_path):
@@ -212,6 +217,39 @@ def test_checkpoint_does_not_block_state_progress(tmp_path, monkeypatch):
         first.path,
         second.path,
     }
+
+
+def test_close_waits_for_existing_checkpoint_before_releasing_stream(tmp_path, monkeypatch):
+    from sunpack.runtime.watch.journal_commit import journal_stats
+
+    state = WatchStateStore(str(tmp_path / "state.json"), compact_records=1)
+    entered, release = Event(), Event()
+    real_write = state._write_snapshot_view
+
+    def paused_snapshot(view):
+        entered.set()
+        assert release.wait(5)
+        real_write(view)
+
+    monkeypatch.setattr(state, "_write_snapshot_view", paused_snapshot)
+    candidate = _candidate(tmp_path / "queued.7z")
+    state.queue_active(candidate, durable=False)
+    assert entered.wait(2)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        closing = executor.submit(state.close)
+        try:
+            with pytest.raises(FutureTimeoutError):
+                closing.result(timeout=0.05)
+            assert journal_stats(state._writer_stream)["registered"]
+        finally:
+            release.set()
+        closing.result(timeout=2)
+    assert not journal_stats(state._writer_stream)["registered"]
+    with pytest.raises(RuntimeError, match="closed"):
+        state.queue_active(_candidate(tmp_path / "late.7z"))
+    recovered = WatchStateStore(str(state.path))
+    assert recovered.pending_work_for_path(candidate.path) is not None
+    recovered.close()
 
 
 def test_hard_limit_never_runs_snapshot_on_mutation_thread(tmp_path, monkeypatch):

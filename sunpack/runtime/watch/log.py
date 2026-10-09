@@ -4,6 +4,7 @@ import json
 import os
 import threading
 import time
+import weakref
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -15,7 +16,7 @@ DEFAULT_EVENTS_MAX_BYTES = 1 * 1024 * 1024
 DEFAULT_EVENTS_BACKUP_COUNT = 1
 
 _PATH_LOCKS_GUARD = threading.Lock()
-_PATH_LOCKS: dict[str, threading.Lock] = {}
+_PATH_LOCKS: weakref.WeakValueDictionary[str, threading.Lock] = weakref.WeakValueDictionary()
 
 
 def append_jsonl_record(
@@ -70,6 +71,7 @@ class WatchLogStore:
         backup_count: int = DEFAULT_EVENTS_BACKUP_COUNT,
     ):
         self.path = Path(path)
+        self._path_lock = _path_lock(self.path)
         self.max_bytes = max(1, int(max_bytes))
         self.backup_count = max(1, int(backup_count))
         self._throttle_lock = threading.Lock()

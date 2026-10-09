@@ -7,6 +7,7 @@ from sunpack_native import (
     watch_journal_flush_all as _native_flush_all,
     watch_journal_request_flush as _native_request_flush,
     watch_journal_seed as _native_seed,
+    watch_journal_open as open_state_stream,
     watch_journal_stats as _native_stats,
     watch_journal_submit_append as _native_submit_append,
     watch_journal_submit_seal as _native_submit_seal,

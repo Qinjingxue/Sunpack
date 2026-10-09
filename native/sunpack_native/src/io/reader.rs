@@ -1553,31 +1553,34 @@ impl ReaderManager {
                 .map_err(|_| io::Error::other("shared reader cache shard poisoned"))?;
             removed_entries += shard.entries.len();
             removed_bytes += shard.hot_size + shard.general_size;
-            shard.entries.clear();
-            shard.by_identity.clear();
-            shard.hot_order.clear();
-            shard.general_order.clear();
+            let retired = (
+                std::mem::take(&mut shard.entries),
+                std::mem::take(&mut shard.by_identity),
+                std::mem::take(&mut shard.hot_order),
+                std::mem::take(&mut shard.general_order),
+            );
             shard.hot_size = 0;
             shard.general_size = 0;
             shard.hot_stale = 0;
             shard.general_stale = 0;
             shard.generation = 0;
+            drop(shard);
+            drop(retired);
         }
         let mut handles = self
             .handles
             .lock()
             .map_err(|_| io::Error::other("reader manager handle lock poisoned"))?;
         let removed_handles = handles.entries.len();
-        let sources = handles
-            .entries
-            .drain()
-            .map(|(_identity, entry)| entry.source)
-            .collect::<Vec<_>>();
-        handles.by_path.clear();
-        handles.order.clear();
+        let entries = std::mem::take(&mut handles.entries);
+        let retired = (
+            std::mem::take(&mut handles.by_path),
+            std::mem::take(&mut handles.order),
+        );
         drop(handles);
-        for source in sources {
-            source.close()?;
+        drop(retired);
+        for entry in entries.into_values() {
+            entry.source.close()?;
         }
         Ok((removed_handles, removed_entries, removed_bytes))
     }
@@ -2139,6 +2142,22 @@ pub(crate) fn reader_cache_stats(py: Python<'_>) -> PyResult<Py<PyDict>> {
     dict.set_item("general_cache_bytes", general_bytes)?;
     dict.set_item("open_handles", handles)?;
     dict.set_item("cache_shards", CACHE_SHARDS)?;
+    let mut capacity = 0usize;
+    for shard in &manager.cache_shards {
+        let shard = shard
+            .lock()
+            .map_err(|_| io::Error::other("shared reader cache shard poisoned"))?;
+        capacity += shard.entries.capacity()
+            + shard.by_identity.capacity()
+            + shard.hot_order.capacity()
+            + shard.general_order.capacity();
+    }
+    let handles = manager
+        .handles
+        .lock()
+        .map_err(|_| io::Error::other("reader manager handle lock poisoned"))?;
+    capacity += handles.entries.capacity() + handles.by_path.capacity() + handles.order.capacity();
+    dict.set_item("container_capacity", capacity)?;
     Ok(dict.unbind())
 }
 

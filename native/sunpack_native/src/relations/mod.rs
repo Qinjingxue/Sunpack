@@ -1800,8 +1800,8 @@ fn clean_logical_name(value: &str) -> String {
     while let Some((stem, suffix)) = name[basename_start..].rsplit_once('.') {
         if stem.is_empty()
             || ![
-                "7z", "rar", "zip", "zipx", "tar", "gz", "gzip", "bz2", "bzip2", "xz",
-                "zst", "zstd", "lz4", "tgz", "tbz", "tbz2", "txz", "exe", "enc",
+                "7z", "rar", "zip", "zipx", "tar", "gz", "gzip", "bz2", "bzip2", "xz", "zst",
+                "zstd", "lz4", "tgz", "tbz", "tbz2", "txz", "exe", "enc",
             ]
             .iter()
             .any(|ext| suffix.eq_ignore_ascii_case(ext))
@@ -2049,15 +2049,22 @@ mod tests {
             let path = "archive.part1.rar";
             let mut validation = validation_with_owned_paths(ProposalStatus::Inconclusive, &[path]);
             validation.reason = reason;
-            validation.anchors.insert(path.into(), VolumeAnchor {
-                format: "rar".into(),
-                needs_password: true,
-                ..Default::default()
-            });
+            validation.anchors.insert(
+                path.into(),
+                VolumeAnchor {
+                    format: "rar".into(),
+                    needs_password: true,
+                    ..Default::default()
+                },
+            );
             validate::validate(&mut validation);
             assert_eq!(validation.status, ProposalStatus::NeedsPassword);
             assert_eq!(
-                validate::assignment_status("rar", false, [(1, validation.anchors.get(path))].into_iter()),
+                validate::assignment_status(
+                    "rar",
+                    false,
+                    [(1, validation.anchors.get(path))].into_iter()
+                ),
                 ProposalStatus::NeedsPassword,
             );
 
@@ -2065,9 +2072,16 @@ mod tests {
             validation.anchors.get_mut(path).unwrap().error = "input could not be read".into();
             validate::validate(&mut validation);
             assert_eq!(validation.status, ProposalStatus::Reject);
-            assert_eq!(validation.reason, Some(RelationFailureReason::CorruptArchive));
             assert_eq!(
-                validate::assignment_status("rar", false, [(1, validation.anchors.get(path))].into_iter()),
+                validation.reason,
+                Some(RelationFailureReason::CorruptArchive)
+            );
+            assert_eq!(
+                validate::assignment_status(
+                    "rar",
+                    false,
+                    [(1, validation.anchors.get(path))].into_iter()
+                ),
                 ProposalStatus::Reject,
             );
         }

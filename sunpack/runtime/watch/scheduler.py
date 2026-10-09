@@ -90,6 +90,18 @@ class _CandidateChangeKind(Enum):
     CONTENT_CHANGED = auto()
 
 
+@dataclass(slots=True)
+class _CandidateObservation:
+    """Only the facts needed to reject delayed events for a retained source."""
+
+    size: int
+    mtime: float
+    file_id: str
+    change_usn: int
+    quiet_seconds: float = 0.0
+    last_content_event_at: float | None = None
+
+
 @dataclass
 class WatchRunResult:
     processed: int = 0
@@ -215,13 +227,15 @@ class WatchScheduler:
         self._pending_by_key: dict[str, set[str]] = {}
         self._inflight_requests: list[_ActivePipelineRequest] = []
         self._inflight_path_counts: dict[str, int] = {}
+        self._completion_batches: set[asyncio.Future] = set()
         self._active_states: dict[str, _ActiveCandidateState] = {}
         self._active_epoch = 0
         # Incremental ready index. Entries are invalidated lazily by active
         # lifecycle epoch + generation, avoiding heap delete/search.
         self._ready_heap: list[tuple[float, int, int, str, str]] = []
-        self._latest_observations: dict[str, WatchCandidate] = {}
+        self._latest_observations: dict[str, _CandidateObservation] = {}
         self._quiet_trackers: dict[str, AdaptiveQuietTracker] = {}
+        self._closed = False
         self._password_dirty_dirs: dict[str, float] = {}
         self._observer = Observer()
         self._observer_resource = None
@@ -313,6 +327,8 @@ class WatchScheduler:
         )
 
     def _start_blocking(self):
+        if self._closed:
+            raise RuntimeError("Watch scheduler is closed")
         if self._started:
             return
         self._ensure_directory_password_files()
@@ -646,9 +662,50 @@ class WatchScheduler:
             with self._lock:
                 active = list(self._inflight_requests)
             if not active:
+                if self._completion_batches:
+                    await asyncio.gather(*tuple(self._completion_batches), return_exceptions=True)
+                    continue
                 return result
             await asyncio.gather(*(request.task for request in active), return_exceptions=True)
             self._merge_run_result(result, await self._harvest_completed_requests())
+
+    async def aclose(self) -> None:
+        async def close() -> None:
+            try:
+                await self.stop()
+            finally:
+                try:
+                    await self.drain()
+                finally:
+                    await self.pipeline_engine.work_broker.run(
+                        "watch_close", "watch", self._close_blocking,
+                        request_id="watch", origin="watch",
+                    )
+
+        task = asyncio.create_task(close())
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            await task
+            raise
+
+    def _close_blocking(self) -> None:
+        with self._claim_gate, self._lock:
+            self._closed = True
+        try:
+            self.state.close()
+        finally:
+            with self._claim_gate, self._lock:
+                self._pending.clear()
+                self._pending_by_key.clear()
+                self._active_states.clear()
+                self._ready_heap.clear()
+                self._quiet_trackers.clear()
+                self._latest_observations.clear()
+                self._active_claims.clear()
+                self._claims_by_owner.clear()
+                self._dirty_during_claim.clear()
+                self._password_dirty_dirs.clear()
 
     def _stop_blocking(self):
         if not self._started:
@@ -701,12 +758,26 @@ class WatchScheduler:
                 self._inflight_requests = [
                     request for request in self._inflight_requests if id(request) not in completed_ids
                 ]
-                self._unregister_inflight_requests_locked(completed)
         result = WatchRunResult()
         if completed:
-            finished = await asyncio.gather(
+            finishing = asyncio.gather(
                 *(self._finish_active_request(request) for request in completed),
             )
+            self._completion_batches.add(finishing)
+            try:
+                try:
+                    finished = await asyncio.shield(finishing)
+                except asyncio.CancelledError:
+                    await finishing
+                    raise
+            finally:
+                with self._lock:
+                    self._unregister_inflight_requests_locked(completed)
+                for request in completed:
+                    self._retire_quiet_tracker(request.candidate.path)
+                self._completion_batches.discard(finishing)
+                if not self._completion_batches:
+                    self._completion_batches.clear()
             for single in finished:
                 self._merge_run_result(result, single)
         return result
@@ -922,7 +993,7 @@ class WatchScheduler:
         with self._lock:
             if self._cache_cleanup_deadline is None or now < self._cache_cleanup_deadline:
                 return
-            if self._pending or self._inflight_requests:
+            if self._pending or self._inflight_requests or self._inflight_path_counts:
                 return
         if self._external_activity_requested:
             return
@@ -933,16 +1004,26 @@ class WatchScheduler:
             with self._lock:
                 if self._cache_cleanup_deadline is None or now < self._cache_cleanup_deadline:
                     return
-                if self._pending or self._inflight_requests:
+                if self._pending or self._inflight_requests or self._inflight_path_counts:
                     return
                 self._cache_cleanup_deadline = None
+                self._pending.clear()
+                self._pending_by_key.clear()
+                self._active_states.clear()
+                self._ready_heap.clear()
+                self._inflight_path_counts.clear()
             from sunpack.runtime.cli.runtime_state import runtime_host
 
             host = runtime_host()
             if host is not None:
                 await host.expire_cli_process_mode_override()
+            # Claims can retire pending siblings as well as the submitted seed.
+            # Their trackers are released here without a per-family index.
+            for path in tuple(self._quiet_trackers):
+                self._retire_quiet_tracker(path)
             if not self.runtime_cache_cleanup_enabled:
                 return
+            self.state.trim_idle_storage()
             self.log.write("cache_cleanup_started")
             started = time.perf_counter()
             report = await self.pipeline_engine.clear_runtime_caches()
@@ -981,6 +1062,8 @@ class WatchScheduler:
             return
         lookup_path = os.path.abspath(path)
         with self._claim_gate:
+            if self._closed:
+                return
             if self._defer_claimed_path_locked(lookup_path):
                 return
             with self._lock:
@@ -1023,7 +1106,7 @@ class WatchScheduler:
                 state = self._active_states.get(candidate.path)
                 if state is not None:
                     self._store_pending_locked(candidate.path, candidate)
-                    self._latest_observations[candidate.path] = candidate
+                    self._remember_observation_locked(candidate)
                     quiet_seconds = self._observe_candidate_activity(
                         candidate,
                         now,
@@ -1072,7 +1155,7 @@ class WatchScheduler:
                             durable=durable_owner,
                         )
                     self._store_pending_locked(candidate.path, candidate)
-                    self._latest_observations[candidate.path] = candidate
+                    self._remember_observation_locked(candidate)
                     became_active = True
                     self._active_states[candidate.path] = self._new_active_state_locked(
                         last_event_at=now,
@@ -1084,7 +1167,7 @@ class WatchScheduler:
                     )
                 else:
                     self._store_pending_locked(candidate.path, candidate)
-                    self._latest_observations[candidate.path] = candidate
+                    self._remember_observation_locked(candidate)
                     active_quiet_seconds = self._observe_candidate_activity(
                         candidate,
                         now,
@@ -1294,6 +1377,10 @@ class WatchScheduler:
                 ]
                 for candidate_path in observation_paths:
                     self._latest_observations.pop(candidate_path, None)
+                if not self._latest_observations:
+                    self._latest_observations.clear()
+                if not self._quiet_trackers:
+                    self._quiet_trackers.clear()
             pending_record = self.state.pending_work_for_path(normalized)
             recovery_armed = bool(
                 pending_record is not None
@@ -1446,6 +1533,12 @@ class WatchScheduler:
                 return
             self._remove_pending_locked(path)
             self._active_states.pop(path, None)
+            self._quiet_trackers.pop(path, None)
+            self._latest_observations.pop(path, None)
+            if not self._quiet_trackers:
+                self._quiet_trackers.clear()
+            if not self._latest_observations:
+                self._latest_observations.clear()
 
     def _record_boundary_activity(
         self,
@@ -1466,7 +1559,7 @@ class WatchScheduler:
             ):
                 return
             self._store_pending_locked(path, candidate)
-            self._latest_observations[path] = candidate
+            self._remember_observation_locked(candidate)
             state.last_event_at = now
             learned_quiet_seconds = self._observe_candidate_activity(
                 candidate,
@@ -1494,11 +1587,35 @@ class WatchScheduler:
             ):
                 return False
             self._store_pending_locked(path, candidate)
-            self._latest_observations[path] = candidate
+            self._remember_observation_locked(candidate)
             self._observe_candidate_activity(candidate, time.time(), content_changed=False)
             return True
 
-    def _candidate_baseline_locked(self, path: str) -> WatchCandidate | None:
+    def _remember_observation_locked(self, candidate: WatchCandidate) -> None:
+        previous = self._latest_observations.get(candidate.path)
+        self._latest_observations[candidate.path] = _CandidateObservation(
+            candidate.size, candidate.mtime, candidate.file_id, candidate.change_usn,
+            previous.quiet_seconds if previous is not None else 0.0,
+            previous.last_content_event_at if previous is not None else None,
+        )
+
+    def _retire_quiet_tracker(self, path: str) -> None:
+        with self._claim_gate, self._lock:
+            key = path_key(os.path.abspath(path))
+            if (key in self._pending_by_key or key in self._inflight_path_counts
+                    or key in self._active_claims):
+                return
+            tracker = self._quiet_trackers.pop(path, None)
+            observation = self._latest_observations.get(path)
+            if observation is not None and tracker is not None:
+                # A later write may be the next chunk of a slow download. Keep
+                # its last interval boundary and floor, but release the model.
+                observation.quiet_seconds = tracker.quiet_seconds
+                observation.last_content_event_at = tracker.last_content_event_at
+            if not self._quiet_trackers:
+                self._quiet_trackers.clear()
+
+    def _candidate_baseline_locked(self, path: str) -> WatchCandidate | _CandidateObservation | None:
         normalized = os.path.abspath(path)
         return (
             self._pending.get(normalized)
@@ -1508,12 +1625,13 @@ class WatchScheduler:
         )
 
     def _accept_metadata_observation_locked(self, candidate: WatchCandidate, now: float) -> None:
-        self._latest_observations[candidate.path] = candidate
+        self._remember_observation_locked(candidate)
         self.state.advance_entry_observation(candidate)
         state = self._active_states.get(candidate.path)
         if state is not None:
             self._store_pending_locked(candidate.path, candidate)
-        self._observe_candidate_activity(candidate, now, content_changed=False)
+        if candidate.path in self._active_states or candidate.path in self._quiet_trackers:
+            self._observe_candidate_activity(candidate, now, content_changed=False)
 
     def _observe_candidate_activity(
         self,
@@ -1526,6 +1644,13 @@ class WatchScheduler:
         tracker = self._quiet_trackers.get(candidate.path)
         if tracker is None:
             tracker = AdaptiveQuietTracker(self._quiet_policy)
+            observation = self._latest_observations.get(candidate.path)
+            if observation is not None:
+                tracker.quiet_seconds = max(tracker.quiet_seconds, observation.quiet_seconds)
+                tracker.last_content_event_at = observation.last_content_event_at
+                tracker.last_size = observation.size
+                tracker.last_mtime = observation.mtime
+                tracker.last_change_usn = observation.change_usn
             self._quiet_trackers[candidate.path] = tracker
         return tracker.observe(
             now,
@@ -2120,7 +2245,7 @@ def _candidate_for_event_path(path: str, *, since_usn: int = 0) -> WatchCandidat
     return _watch_candidate_for_path(path, since_usn=since_usn)
 
 
-def _candidate_observation_changed(previous: WatchCandidate, current: WatchCandidate) -> bool:
+def _candidate_observation_changed(previous: WatchCandidate | _CandidateObservation, current: WatchCandidate) -> bool:
     return (
         previous.size != current.size
         or previous.mtime != current.mtime
@@ -2138,7 +2263,7 @@ def _candidate_matches_password_failure(candidate: WatchCandidate, entry: WatchS
 
 
 def _candidate_change_kind(
-    previous: WatchCandidate | None,
+    previous: WatchCandidate | _CandidateObservation | None,
     current: WatchCandidate,
 ) -> _CandidateChangeKind:
     if previous is None:

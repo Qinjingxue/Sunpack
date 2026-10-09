@@ -49,6 +49,8 @@ fn sunpack_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
         )?)?;
     }
     m.add_class::<watch_store::NativeWatchState>()?;
+    m.add_class::<watch_journal::NativeJournalStream>()?;
+    m.add_function(wrap_pyfunction!(watch_journal::watch_journal_open, m)?)?;
     m.add_class::<watch_store::NativeWatchOperations>()?;
     m.add_class::<watch_store::NativeWatchSnapshot>()?;
     m.add_class::<watch_store::NativeWatchReplay>()?;

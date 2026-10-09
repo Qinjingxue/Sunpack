@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import zipfile
 from types import SimpleNamespace
 
 import pytest
@@ -130,6 +131,99 @@ def test_watch_deadline_clears_only_after_idle_window(tmp_path):
     watcher._store_pending_locked("busy", object())
     _TEST_LOOP.run_until_complete(watcher._maybe_clear_idle_caches())
     assert engine.clear_calls == 1
+
+
+def test_completed_family_cache_waits_for_watch_callbacks_and_foreground(tmp_path):
+    from sunpack.pipeline.coordinator.engine import PipelineEngine
+
+    async def scenario():
+        config = make_config({"watch": {"clipboard_monitor_enabled": False}})
+        async with PipelineEngine(config) as engine:
+            watcher = WatchScheduler(config, [str(tmp_path)], out_dir=str(tmp_path / "out"),
+                state_path=str(tmp_path / "state.json"), initial_scan=False, pipeline_engine=engine)
+            parts = [tmp_path / "a.001", tmp_path / "a.002"]
+            for part in parts:
+                part.write_text("part")
+            output = tmp_path / "output"
+            output.mkdir()
+            version = engine._path_leases.input_version_for(map(str, parts))
+            engine._path_leases.remember_completed_watch(version, str(output))
+            watcher._inflight_path_counts["completion"] = 1
+            watcher._cache_cleanup_deadline = 0
+            await watcher._maybe_clear_idle_caches()
+            assert engine._path_leases.completed_watch_output(version) == str(output)
+            watcher._inflight_path_counts.clear()
+            await watcher.set_external_activity(True)
+            watcher._cache_cleanup_deadline = 0
+            await watcher._maybe_clear_idle_caches()
+            assert engine._path_leases.completed_watch_output(version) == str(output)
+            await watcher.set_external_activity(False)
+            watcher._cache_cleanup_deadline = 0
+            await watcher._maybe_clear_idle_caches()
+            assert not engine._path_leases._completed_watch_generations
+            await watcher.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_retained_sources_release_models_and_native_capacity_across_batches(tmp_path):
+    from sunpack_native import reader_cache_stats
+    from sunpack.pipeline.coordinator.engine import PipelineEngine
+    from sunpack.runtime.watch.journal_commit import journal_stats
+
+    # Existing one-shot clears cannot detect per-file retention across completed
+    # batches. Exercise real detection/extraction with disguised retained ZIPs.
+    async def scenario():
+        root = tmp_path / "watch"
+        root.mkdir()
+        config = make_config({
+            "watch": {"clipboard_monitor_enabled": False, "cold_start_seconds": 0,
+                "quiet_min_seconds": 0, "quiet_max_seconds": 0},
+            "post_extract": {"archive_cleanup_mode": "k"},
+        })
+        async with PipelineEngine(config) as engine:
+            watcher = WatchScheduler(config, [str(root)], out_dir=str(tmp_path / "out"),
+                state_path=str(tmp_path / "state.json"), initial_scan=False, pipeline_engine=engine)
+            sources = []
+            for batch in range(3):
+                for offset in range(8):
+                    index = batch * 8 + offset
+                    source = root / f"archive-{index}.bin"
+                    with zipfile.ZipFile(source, "w") as archive:
+                        archive.writestr(f"payload-{index}.txt", f"payload-{index}" * 100)
+                    sources.append(source)
+                    watcher.enqueue(str(source))
+
+                async def settle():
+                    succeeded = 0
+                    while watcher.pending_count or watcher._inflight_requests or watcher._completion_batches:
+                        result = await watcher.run_once()
+                        assert result.failed == 0, result.errors
+                        succeeded += result.succeeded
+                        if watcher.pending_count or watcher._inflight_requests:
+                            await asyncio.sleep(0.001)
+                    return succeeded
+
+                assert await asyncio.wait_for(settle(), 15) == 8
+                assert not watcher._quiet_trackers
+                watcher._cache_cleanup_deadline = 0
+                await watcher._maybe_clear_idle_caches()
+                assert watcher.state._native.storage_capacities() == (0, 0)
+                assert reader_cache_stats()["container_capacity"] == 0
+                assert not engine._path_leases._completed_watch_generations
+                assert len(watcher._latest_observations) == len(sources)
+                for source in sources:
+                    watcher.enqueue(str(source), event_type="modified")
+                assert (await watcher.run_once()).processed == 0
+            assert len(list((tmp_path / "out").rglob("payload-*.txt"))) == 24
+            for source in sources:
+                source.unlink()
+                watcher.notify_path_departed(str(source))
+            assert not watcher._latest_observations
+            await watcher.aclose()
+            assert not journal_stats(watcher.state._writer_stream)["registered"]
+
+    asyncio.run(scenario())
 
 
 def test_external_activity_resets_and_rearms_idle_cleanup(tmp_path):

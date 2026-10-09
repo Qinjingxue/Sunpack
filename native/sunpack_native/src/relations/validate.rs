@@ -4,11 +4,7 @@ use super::*;
 /// head/tail/role facts that the collector already acquired.
 pub(super) fn validate(validation: &mut ProposalValidation) {
     if validation.reason.is_some() {
-        if validation
-            .anchors
-            .values()
-            .any(|a| !a.error.is_empty())
-        {
+        if validation.anchors.values().any(|a| !a.error.is_empty()) {
             validation.status = ProposalStatus::Reject;
             validation.reason = Some(RelationFailureReason::CorruptArchive);
         } else if validation

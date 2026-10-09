@@ -232,6 +232,10 @@ class PipelineEngine:
         if not self.is_idle():
             return {"skipped": "engine_busy"}
 
+        # This registry belongs to the asyncio loop, not the broker worker.
+        completed_watch = len(self._path_leases._completed_watch_generations)
+        self._path_leases._completed_watch_generations.clear()
+
         def clear() -> dict:
             from sunpack.core.support.runtime_cache_cleanup import (
                 clear_all_runtime_caches,
@@ -240,6 +244,7 @@ class PipelineEngine:
 
             before = runtime_cache_stats()
             cleared = clear_all_runtime_caches()
+            cleared["completed_watch_generations"] = completed_watch
             if self._services is not None:
                 cleared["output_reservations"] = self._services.output_reservations.clear_idle_cache()
             after = runtime_cache_stats()

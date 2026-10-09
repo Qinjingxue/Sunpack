@@ -23,6 +23,8 @@ def _watch_scheduler_shell(scheduler_module):
     scheduler._inflight_path_counts = {}
     scheduler._active_epoch = 0
     scheduler._ready_heap = []
+    scheduler._closed = False
+    scheduler._completion_batches = set()
     return scheduler
 
 

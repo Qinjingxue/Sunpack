@@ -109,6 +109,14 @@ impl StateData {
     }
 }
 
+fn trim_map<K: Eq + std::hash::Hash, V>(map: &mut HashMap<K, V>) {
+    if map.is_empty() {
+        *map = HashMap::new();
+    } else if map.capacity() > 256.max(map.len().saturating_mul(4)) {
+        map.shrink_to(map.len().saturating_mul(2));
+    }
+}
+
 /// Decoded journal operations, validated before their WAL record is submitted.
 #[pyclass(module = "sunpack_native", frozen)]
 pub(crate) struct NativeWatchOperations {
@@ -235,6 +243,18 @@ impl NativeWatchState {
 
     fn reset(&self) {
         *self.lock() = StateData::default();
+    }
+
+    /// Capacity-only maintenance: never changes records or checkpoint views.
+    fn trim_idle_storage(&self) {
+        let mut data = self.lock();
+        trim_map(&mut data.pending);
+        trim_map(&mut data.entries);
+    }
+
+    fn storage_capacities(&self) -> (usize, usize) {
+        let data = self.lock();
+        (data.pending.capacity(), data.entries.capacity())
     }
 
     #[getter]

@@ -26,6 +26,9 @@ class _SchedulerLifecycle:
     async def stop(self):
         pass
 
+    async def aclose(self):
+        await self.stop()
+
 
 class FakeRunner:
     pass

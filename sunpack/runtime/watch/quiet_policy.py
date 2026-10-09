@@ -75,7 +75,7 @@ class AdaptiveQuietPolicy:
         return current + self.shrink_alpha * (target - current)
 
 
-@dataclass
+@dataclass(slots=True)
 class AdaptiveQuietTracker:
     policy: AdaptiveQuietPolicy
     quiet_seconds: float = field(init=False)

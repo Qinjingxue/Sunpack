@@ -32,16 +32,24 @@ pub(crate) struct NativeJournalTicket {
     seq: u64,
     goal: TicketGoal,
     bytes_written: Arc<AtomicU64>,
+    retired: Arc<Mutex<Option<StreamFrontier>>>,
 }
 
 impl NativeJournalTicket {
     fn new(shared: Arc<Shared>, stream: String, seq: u64, goal: TicketGoal) -> Self {
+        let retired = lock_state(&shared)
+            .streams
+            .entry(stream.clone())
+            .or_default()
+            .retired
+            .clone();
         Self {
             shared,
             stream,
             seq,
             goal,
             bytes_written: Arc::new(AtomicU64::new(0)),
+            retired,
         }
     }
 
@@ -49,7 +57,7 @@ impl NativeJournalTicket {
         let mut state = lock_state(&self.shared);
         loop {
             match state.streams.get(&self.stream) {
-                Some(stream) => {
+                Some(stream) if Arc::ptr_eq(&stream.retired, &self.retired) => {
                     if let Some(error) = &stream.error {
                         return Err(error.clone());
                     }
@@ -62,13 +70,65 @@ impl NativeJournalTicket {
                         return Ok(());
                     }
                 }
-                None => {}
+                _ => {
+                    let retired = self.retired.lock().unwrap_or_else(|p| p.into_inner());
+                    let frontier = retired
+                        .as_ref()
+                        .ok_or("Watch journal stream is unavailable")?;
+                    if let Some(error) = &frontier.error {
+                        return Err(error.clone());
+                    }
+                    let done = match goal {
+                        TicketGoal::Written => frontier.written >= self.seq,
+                        TicketGoal::Durable => frontier.durable >= self.seq,
+                        TicketGoal::Sealed => frontier.sealed >= self.seq,
+                    };
+                    return if done {
+                        Ok(())
+                    } else {
+                        Err("Watch journal stream closed before the requested frontier".to_string())
+                    };
+                }
             }
             state = self
                 .shared
                 .cv
                 .wait(state)
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+}
+
+struct StreamFrontier {
+    written: u64,
+    durable: u64,
+    sealed: u64,
+    error: Option<String>,
+}
+
+/// A store owns a stream until drain/checkpoint completion. Dropping a store
+/// also submits release through the existing writer, without blocking GC.
+#[pyclass(module = "sunpack_native")]
+pub(crate) struct NativeJournalStream {
+    runtime: Arc<JournalRuntime>,
+    stream: Option<String>,
+}
+
+#[pymethods]
+impl NativeJournalStream {
+    fn close(&mut self, py: Python<'_>) -> PyResult<()> {
+        if let Some(stream) = self.stream.take() {
+            py.detach(|| self.runtime.release(stream, true))
+                .map_err(PyRuntimeError::new_err)?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for NativeJournalStream {
+    fn drop(&mut self) {
+        if let Some(stream) = self.stream.take() {
+            let _ = self.runtime.release(stream, false);
         }
     }
 }
@@ -102,6 +162,9 @@ struct SegmentState {
 
 #[derive(Default)]
 struct StreamState {
+    owners: usize,
+    closing: bool,
+    retired: Arc<Mutex<Option<StreamFrontier>>>,
     written_seq: u64,
     durable_seq: u64,
     requested_seq: u64,
@@ -136,6 +199,14 @@ impl Shared {
 }
 
 enum WriterCommand {
+    Open {
+        stream: String,
+        done: mpsc::Sender<()>,
+    },
+    Release {
+        stream: String,
+        done: Option<mpsc::Sender<u64>>,
+    },
     Append {
         stream: String,
         path: PathBuf,
@@ -162,6 +233,70 @@ struct JournalRuntime {
 }
 
 impl JournalRuntime {
+    fn open(self: &Arc<Self>, stream: String) -> Result<NativeJournalStream, String> {
+        // Ownership admission shares the writer's ordering with Release. A
+        // queued GC release cannot retire a newly opened incarnation, and a
+        // failed old stream's queued appends are drained before reopening.
+        let (tx, rx) = mpsc::channel();
+        self.writer_tx
+            .send(WriterCommand::Open {
+                stream: stream.clone(),
+                done: tx,
+            })
+            .map_err(|_| "native Watch journal writer is unavailable".to_string())?;
+        rx.recv()
+            .map_err(|_| "native Watch journal open barrier failed".to_string())?;
+        Ok(NativeJournalStream {
+            runtime: self.clone(),
+            stream: Some(stream),
+        })
+    }
+
+    fn release(&self, stream: String, wait: bool) -> Result<(), String> {
+        let retired = {
+            let state = lock_state(&self.shared);
+            state.streams.get(&stream).map(|s| s.retired.clone())
+        };
+        let (tx, rx) = mpsc::channel();
+        self.writer_tx
+            .send(WriterCommand::Release {
+                stream: stream.clone(),
+                done: wait.then_some(tx),
+            })
+            .map_err(|_| "native Watch journal writer is unavailable".to_string())?;
+        if !wait {
+            return Ok(());
+        }
+        let target = rx
+            .recv()
+            .map_err(|_| "native Watch journal release barrier failed".to_string())?;
+        let Some(retired) = retired else {
+            return Ok(());
+        };
+        let mut state = lock_state(&self.shared);
+        loop {
+            if let Some(frontier) = retired.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
+                return match &frontier.error {
+                    Some(error) => Err(error.clone()),
+                    None => Ok(()),
+                };
+            }
+            if let Some(entry) = state.streams.get(&stream) {
+                if let Some(error) = &entry.error {
+                    return Err(error.clone());
+                }
+                if entry.owners != 0 && entry.durable_seq >= target {
+                    return Ok(());
+                }
+            }
+            state = self
+                .shared
+                .cv
+                .wait(state)
+                .unwrap_or_else(|p| p.into_inner());
+        }
+    }
+
     fn start() -> Arc<Self> {
         let shared = Arc::new(Shared::new());
         let (writer_tx, writer_rx) = mpsc::channel();
@@ -344,7 +479,31 @@ fn fail_stream(shared: &Shared, stream: &str, error: impl Into<String>) {
     if stream_state.error.is_none() {
         stream_state.error = Some(error.into());
     }
+    retire_closed_stream(&mut state, stream);
     shared.cv.notify_all();
+}
+
+fn retire_closed_stream(state: &mut RuntimeState, key: &str) {
+    let ready = state.streams.get(key).is_some_and(|s| {
+        s.closing && s.owners == 0 && (s.error.is_some() || s.durable_seq >= s.written_seq)
+    });
+    if !ready {
+        return;
+    }
+    let stream = state.streams.remove(key).expect("checked stream");
+    *stream.retired.lock().unwrap_or_else(|p| p.into_inner()) = Some(StreamFrontier {
+        written: stream.written_seq,
+        durable: stream.durable_seq,
+        sealed: stream.sealed_seq,
+        error: stream.error.clone(),
+    });
+    if state.streams.is_empty() {
+        state.streams = HashMap::new();
+    } else if state.streams.capacity() > 256.max(state.streams.len().saturating_mul(4)) {
+        state
+            .streams
+            .shrink_to(state.streams.len().saturating_mul(2));
+    }
 }
 
 fn open_segment(path: &Path) -> io::Result<TrackedFile> {
@@ -533,6 +692,32 @@ fn writer_loop(shared: Arc<Shared>, rx: mpsc::Receiver<WriterCommand>) {
             },
         };
         match command {
+            WriterCommand::Open { stream, done } => {
+                let mut state = lock_state(&shared);
+                let entry = state.streams.entry(stream).or_default();
+                entry.owners += 1;
+                entry.closing = false;
+                shared.cv.notify_all();
+                let _ = done.send(());
+            }
+            WriterCommand::Release { stream, done } => {
+                let mut state = lock_state(&shared);
+                let mut target = 0;
+                if let Some(entry) = state.streams.get_mut(&stream) {
+                    target = entry.written_seq;
+                    entry.requested_seq = entry.requested_seq.max(target);
+                    entry.owners = entry.owners.saturating_sub(1);
+                    if entry.owners == 0 {
+                        entry.closing = true;
+                        entry.requested_seq = entry.requested_seq.max(entry.written_seq);
+                    }
+                }
+                retire_closed_stream(&mut state, &stream);
+                shared.cv.notify_all();
+                if let Some(done) = done {
+                    let _ = done.send(target);
+                }
+            }
             WriterCommand::Append {
                 stream,
                 path,
@@ -678,6 +863,7 @@ struct FlushSnapshot {
 
 struct FlushWork {
     stream: String,
+    retired: Arc<Mutex<Option<StreamFrontier>>>,
     target: u64,
     segments: Vec<FlushSnapshot>,
 }
@@ -780,6 +966,7 @@ fn next_flush_work(shared: &Shared) -> FlushWork {
             if segments.is_empty() {
                 stream.durable_seq = stream.durable_seq.max(target);
                 close_ready_segments(stream);
+                retire_closed_stream(&mut state, &key);
                 shared.cv.notify_all();
                 continue;
             }
@@ -787,6 +974,7 @@ fn next_flush_work(shared: &Shared) -> FlushWork {
             stream.coalesce_micros_total = stream.coalesce_micros_total.saturating_add(window);
             return FlushWork {
                 stream: key,
+                retired: stream.retired.clone(),
                 target,
                 segments,
             };
@@ -804,6 +992,7 @@ fn flusher_loop(shared: Arc<Shared>) {
         let work = next_flush_work(&shared);
         let FlushWork {
             stream,
+            retired,
             target,
             segments,
         } = work;
@@ -823,19 +1012,22 @@ fn flusher_loop(shared: Arc<Shared>) {
         let flush_micros = flush_started.elapsed().as_micros().min(u64::MAX as u128) as u64;
         drop(segments);
 
-        if let Some(error) = flush_error {
-            fail_stream(
-                &shared,
-                &stream,
-                format!("native Watch journal flush failed: {error}"),
-            );
-            continue;
-        }
-
         let mut state = lock_state(&shared);
         let Some(stream_state) = state.streams.get_mut(&stream) else {
             continue;
         };
+        // A failed old stream may have been retired and reopened during fsync.
+        if !Arc::ptr_eq(&stream_state.retired, &retired) {
+            continue;
+        }
+        if let Some(error) = flush_error {
+            stream_state
+                .error
+                .get_or_insert_with(|| format!("native Watch journal flush failed: {error}"));
+            retire_closed_stream(&mut state, &stream);
+            shared.cv.notify_all();
+            continue;
+        }
         for (start, epoch) in epochs {
             if let Some(segment) = stream_state.segments.get_mut(&start) {
                 segment.flushed_epoch = segment.flushed_epoch.max(epoch);
@@ -846,8 +1038,15 @@ fn flusher_loop(shared: Arc<Shared>) {
         stream_state.last_flush_micros = flush_micros;
         stream_state.durable_seq = stream_state.durable_seq.max(target);
         close_ready_segments(stream_state);
+        retire_closed_stream(&mut state, &stream);
         shared.cv.notify_all();
     }
+}
+
+#[pyfunction]
+pub(crate) fn watch_journal_open(py: Python<'_>, stream: String) -> PyResult<NativeJournalStream> {
+    py.detach(|| runtime().open(stream))
+        .map_err(PyRuntimeError::new_err)
 }
 
 #[pyfunction]
@@ -905,6 +1104,8 @@ pub(crate) fn watch_journal_stats(py: Python<'_>, stream: String) -> PyResult<Py
     let state = lock_state(&runtime().shared);
     let snapshot = state.streams.get(&stream);
     let result = PyDict::new(py);
+    result.set_item("registered", snapshot.is_some())?;
+    result.set_item("owners", snapshot.map_or(0, |s| s.owners))?;
     if let Some(stream) = snapshot {
         result.set_item("written_seq", stream.written_seq)?;
         result.set_item("durable_seq", stream.durable_seq)?;

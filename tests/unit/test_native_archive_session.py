@@ -75,6 +75,7 @@ def test_clear_archive_sessions_releases_native_blocks_and_handles(tmp_path):
     assert populated["open_handles"] >= 1
     assert populated["cache_entries"] >= 1
     assert populated["hot_cache_bytes"] + populated["general_cache_bytes"] > 0
+    assert populated["container_capacity"] > 0
 
     clear_archive_sessions()
 
@@ -83,6 +84,7 @@ def test_clear_archive_sessions_releases_native_blocks_and_handles(tmp_path):
     assert cleared["cache_entries"] == 0
     assert cleared["hot_cache_bytes"] == 0
     assert cleared["general_cache_bytes"] == 0
+    assert cleared["container_capacity"] == 0
 
 
 def test_session_analysis_view_preserves_cache_budget_and_eof_semantics(tmp_path):

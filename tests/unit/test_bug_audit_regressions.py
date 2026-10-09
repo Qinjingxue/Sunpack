@@ -14,7 +14,7 @@ from sunpack.core.support.archive_sessions import (
     get_archive_session,
 )
 from sunpack.core.support.output_reservation import OutputReservationRegistry
-from sunpack.pipeline.coordinator.engine import PipelineEngine
+from sunpack.pipeline.coordinator.engine import PipelineEngine, _PathLeaseRegistry
 
 
 def _powershell(script):
@@ -174,6 +174,7 @@ def test_bug_regression_engine_idle_cleanup_includes_output_allocator(
             return action()
 
     engine = PipelineEngine.__new__(PipelineEngine)
+    engine._path_leases = _PathLeaseRegistry()
     engine._services = SimpleNamespace(output_reservations=registry)
     engine._broker = Broker()
     engine.is_idle = lambda: True

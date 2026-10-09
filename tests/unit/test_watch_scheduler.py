@@ -253,6 +253,10 @@ def _indexed_scheduler_for_test():
     watcher._active_states = {}
     watcher._active_epoch = 0
     watcher._ready_heap = []
+    watcher._closed = False
+    watcher._completion_batches = set()
+    watcher._quiet_trackers = {}
+    watcher._latest_observations = {}
     watcher._password_dirty_dirs = {}
     watcher._cache_cleanup_deadline = None
     watcher.password_retry_debounce_seconds = 0.0
@@ -975,6 +979,54 @@ def test_partial_result_does_not_self_retry_but_modified_epoch_does(tmp_path, mo
     assert not (tmp_path / ".sunpack_watch_probes").exists()
 
 
+
+def _observation_version(value):
+    return (value.size, value.mtime, value.file_id, value.change_usn)
+
+def test_cancelled_harvest_and_close_wait_for_completion_callbacks(tmp_path):
+    from sunpack.runtime.watch.journal_commit import journal_stats
+
+    async def scenario():
+        watcher = _watcher(tmp_path, cold_start_seconds=0)
+        archive = tmp_path / "retained.zip"
+        _write_zip(archive)
+        watcher.enqueue(str(archive))
+        candidate = watcher._pop_ready(time.time())[0]
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def completed_pipeline():
+            return None
+
+        async def complete_request(_request):
+            entered.set()
+            await release.wait()
+            return scheduler_module.WatchRunResult(processed=1)
+
+        watcher._complete_candidate = complete_request
+        task = asyncio.create_task(completed_pipeline())
+        await task
+        request = scheduler_module._ActivePipelineRequest("request", candidate, task, 0)
+        watcher._register_inflight_requests_locked([request])
+        harvest = asyncio.create_task(watcher._harvest_completed_requests())
+        await entered.wait()
+        harvest.cancel()
+        closing = asyncio.create_task(watcher.aclose())
+        await asyncio.sleep(0)
+        assert not closing.done()
+        assert watcher._completion_batches
+        assert watcher._quiet_trackers
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await harvest
+        await closing
+        assert not watcher._completion_batches
+        assert not watcher._quiet_trackers
+        assert not watcher._latest_observations
+        assert not journal_stats(watcher.state._writer_stream)["registered"]
+
+    asyncio.run(scenario())
+
+
 def test_metadata_event_during_and_after_processing_does_not_start_new_epoch(tmp_path, monkeypatch):
     monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
     archive = tmp_path / "sample.zip"
@@ -1018,7 +1070,7 @@ def test_metadata_event_during_and_after_processing_does_not_start_new_epoch(tmp
     watcher.enqueue(str(archive), event_type="modified")
 
     assert watcher.pending_count == 0
-    assert watcher._latest_observations[str(archive)] == metadata
+    assert _observation_version(watcher._latest_observations[str(archive)]) == _observation_version(metadata)
     assert len(wakeups) == wakeups_before
     assert (
         tracker.last_content_event_at,
@@ -1047,7 +1099,7 @@ def test_metadata_event_during_and_after_processing_does_not_start_new_epoch(tmp
     )
     watcher.enqueue(str(archive), event_type="modified")
     assert watcher.pending_count == 0
-    assert watcher._latest_observations[str(archive)] == metadata_after
+    assert _observation_version(watcher._latest_observations[str(archive)]) == _observation_version(metadata_after)
     assert _await(watcher.run_once()).processed == 0
 
 
@@ -1102,7 +1154,7 @@ def test_content_event_during_processing_still_starts_new_epoch_from_latest_meta
     watcher.enqueue(str(archive), event_type="modified")
 
     assert watcher.pending_count == 1
-    assert watcher._latest_observations[str(archive)] == content
+    assert _observation_version(watcher._latest_observations[str(archive)]) == _observation_version(content)
     engine.handles[0].complete_no_tasks()
     assert _await(watcher.run_once()).processed == 1
     assert len(engine.handles) == 2
@@ -1451,7 +1503,7 @@ def test_pending_metadata_event_advances_snapshot_without_generation_or_wakeup(t
     watcher.enqueue(str(archive), event_type="modified")
 
     assert watcher._pending[str(archive)] == metadata
-    assert watcher._latest_observations[str(archive)] == metadata
+    assert _observation_version(watcher._latest_observations[str(archive)]) == _observation_version(metadata)
     assert state.generation == generation
     assert state.last_event_at == last_event_at
     assert len(wakeups) == wakeups_before
@@ -1961,15 +2013,18 @@ def test_password_retry_bypasses_learned_quiet_for_unchanged_failed_archive(tmp_
     )
     watcher.enqueue(str(archive_path))
     wall_clock.advance(watcher.cold_start_seconds + 0.01)
-    assert _await(watcher.run_once()).failed == 1
     watcher._quiet_trackers[str(archive_path)].quiet_seconds = 30.0
+    assert _await(watcher.run_once()).failed == 1
+    assert str(archive_path) not in watcher._quiet_trackers
+    assert watcher._latest_observations[str(archive_path)].quiet_seconds == 30.0
 
     watcher.notify_password_source_changed("test")
     retried = _await(watcher.run_once())
 
     assert retried.succeeded == 1
     assert attempts["count"] == 2
-    assert watcher._quiet_trackers[str(archive_path)].quiet_seconds == 30.0
+    assert str(archive_path) not in watcher._quiet_trackers
+    assert watcher._latest_observations[str(archive_path)].quiet_seconds == 30.0
 
 
     assert not watcher.state.entries
@@ -2007,8 +2062,10 @@ def test_password_retry_preserves_quiet_when_failed_archive_changed(tmp_path, mo
     )
     watcher.enqueue(str(archive_path))
     wall_clock.advance(watcher.cold_start_seconds + 0.01)
-    assert _await(watcher.run_once()).failed == 1
     watcher._quiet_trackers[str(archive_path)].quiet_seconds = 30.0
+    assert _await(watcher.run_once()).failed == 1
+    assert str(archive_path) not in watcher._quiet_trackers
+    assert watcher._latest_observations[str(archive_path)].quiet_seconds == 30.0
     archive_path.write_bytes(b"PK\x03\x04changed-payload")
 
     watcher.notify_password_source_changed("test")

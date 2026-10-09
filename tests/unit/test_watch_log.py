@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import weakref
 
 from sunpack.runtime.watch.log import (
     DEFAULT_EVENTS_MAX_BYTES,
@@ -31,6 +32,13 @@ def test_watch_log_rotates_before_append_and_bounds_backups(tmp_path):
     assert all(item.stat().st_size <= 160 for item in rotated)
     assert all(record["event"] == "test_event" for item in rotated for record in _records(item))
     assert _records(path)[-1]["index"] == 19
+    another_owner = WatchLogStore(str(path))
+    assert another_owner._path_lock is store._path_lock
+    lock = weakref.ref(store._path_lock)
+    del store
+    assert lock() is another_owner._path_lock
+    del another_owner
+    assert lock() is None
 
 
 def test_watch_log_keeps_an_oversized_record_intact(tmp_path):
