@@ -32,7 +32,7 @@ pub(crate) struct NativeJournalTicket {
     seq: u64,
     goal: TicketGoal,
     bytes_written: Arc<AtomicU64>,
-    retired: Arc<Mutex<Option<StreamFrontier>>>,
+    retired: Arc<OnceLock<StreamFrontier>>,
 }
 
 impl NativeJournalTicket {
@@ -54,34 +54,44 @@ impl NativeJournalTicket {
     }
 
     fn wait_for(&self, goal: TicketGoal) -> Result<(), String> {
-        let mut state = lock_state(&self.shared);
+        self.shared
+            .wait_for(&self.stream, &self.retired, self.seq, goal)
+    }
+}
+
+impl Shared {
+    fn wait_for(
+        &self,
+        key: &str,
+        retired: &Arc<OnceLock<StreamFrontier>>,
+        seq: u64,
+        goal: TicketGoal,
+    ) -> Result<(), String> {
+        let mut state = lock_state(self);
         loop {
-            match state.streams.get(&self.stream) {
-                Some(stream) if Arc::ptr_eq(&stream.retired, &self.retired) => {
+            match state.streams.get(key) {
+                Some(stream) if Arc::ptr_eq(&stream.retired, retired) => {
                     if let Some(error) = &stream.error {
                         return Err(error.clone());
                     }
                     let done = match goal {
-                        TicketGoal::Written => stream.written_seq >= self.seq,
-                        TicketGoal::Durable => stream.durable_seq >= self.seq,
-                        TicketGoal::Sealed => stream.sealed_seq >= self.seq,
+                        TicketGoal::Written => stream.written_seq >= seq,
+                        TicketGoal::Durable => stream.durable_seq >= seq,
+                        TicketGoal::Sealed => stream.sealed_seq >= seq,
                     };
                     if done {
                         return Ok(());
                     }
                 }
                 _ => {
-                    let retired = self.retired.lock().unwrap_or_else(|p| p.into_inner());
-                    let frontier = retired
-                        .as_ref()
-                        .ok_or("Watch journal stream is unavailable")?;
+                    let frontier = retired.get().ok_or("Watch journal stream is unavailable")?;
                     if let Some(error) = &frontier.error {
                         return Err(error.clone());
                     }
                     let done = match goal {
-                        TicketGoal::Written => frontier.written >= self.seq,
-                        TicketGoal::Durable => frontier.durable >= self.seq,
-                        TicketGoal::Sealed => frontier.sealed >= self.seq,
+                        TicketGoal::Written => frontier.written >= seq,
+                        TicketGoal::Durable => frontier.durable >= seq,
+                        TicketGoal::Sealed => frontier.sealed >= seq,
                     };
                     return if done {
                         Ok(())
@@ -91,7 +101,6 @@ impl NativeJournalTicket {
                 }
             }
             state = self
-                .shared
                 .cv
                 .wait(state)
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -118,7 +127,7 @@ pub(crate) struct NativeJournalStream {
 impl NativeJournalStream {
     fn close(&mut self, py: Python<'_>) -> PyResult<()> {
         if let Some(stream) = self.stream.take() {
-            py.detach(|| self.runtime.release(stream, true))
+            py.detach(|| self.runtime.release(stream))
                 .map_err(PyRuntimeError::new_err)?;
         }
         Ok(())
@@ -128,7 +137,10 @@ impl NativeJournalStream {
 impl Drop for NativeJournalStream {
     fn drop(&mut self) {
         if let Some(stream) = self.stream.take() {
-            let _ = self.runtime.release(stream, false);
+            let _ = self
+                .runtime
+                .writer_tx
+                .send(WriterCommand::Release { stream, done: None });
         }
     }
 }
@@ -164,7 +176,7 @@ struct SegmentState {
 struct StreamState {
     owners: usize,
     closing: bool,
-    retired: Arc<Mutex<Option<StreamFrontier>>>,
+    retired: Arc<OnceLock<StreamFrontier>>,
     written_seq: u64,
     durable_seq: u64,
     requested_seq: u64,
@@ -252,7 +264,7 @@ impl JournalRuntime {
         })
     }
 
-    fn release(&self, stream: String, wait: bool) -> Result<(), String> {
+    fn release(&self, stream: String) -> Result<(), String> {
         let retired = {
             let state = lock_state(&self.shared);
             state.streams.get(&stream).map(|s| s.retired.clone())
@@ -261,40 +273,19 @@ impl JournalRuntime {
         self.writer_tx
             .send(WriterCommand::Release {
                 stream: stream.clone(),
-                done: wait.then_some(tx),
+                done: Some(tx),
             })
             .map_err(|_| "native Watch journal writer is unavailable".to_string())?;
-        if !wait {
-            return Ok(());
-        }
         let target = rx
             .recv()
             .map_err(|_| "native Watch journal release barrier failed".to_string())?;
         let Some(retired) = retired else {
             return Ok(());
         };
-        let mut state = lock_state(&self.shared);
-        loop {
-            if let Some(frontier) = retired.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
-                return match &frontier.error {
-                    Some(error) => Err(error.clone()),
-                    None => Ok(()),
-                };
-            }
-            if let Some(entry) = state.streams.get(&stream) {
-                if let Some(error) = &entry.error {
-                    return Err(error.clone());
-                }
-                if entry.owners != 0 && entry.durable_seq >= target {
-                    return Ok(());
-                }
-            }
-            state = self
-                .shared
-                .cv
-                .wait(state)
-                .unwrap_or_else(|p| p.into_inner());
-        }
+        // The flusher retires the last owner's stream under the same state
+        // lock that publishes durability, so this also waits for retirement.
+        self.shared
+            .wait_for(&stream, &retired, target, TicketGoal::Durable)
     }
 
     fn start() -> Arc<Self> {
@@ -491,11 +482,12 @@ fn retire_closed_stream(state: &mut RuntimeState, key: &str) {
         return;
     }
     let stream = state.streams.remove(key).expect("checked stream");
-    *stream.retired.lock().unwrap_or_else(|p| p.into_inner()) = Some(StreamFrontier {
+    // Removal uniquely owns publication; tickets only read this terminal state.
+    let _ = stream.retired.set(StreamFrontier {
         written: stream.written_seq,
         durable: stream.durable_seq,
         sealed: stream.sealed_seq,
-        error: stream.error.clone(),
+        error: stream.error,
     });
     if state.streams.is_empty() {
         state.streams = HashMap::new();
@@ -709,7 +701,6 @@ fn writer_loop(shared: Arc<Shared>, rx: mpsc::Receiver<WriterCommand>) {
                     entry.owners = entry.owners.saturating_sub(1);
                     if entry.owners == 0 {
                         entry.closing = true;
-                        entry.requested_seq = entry.requested_seq.max(entry.written_seq);
                     }
                 }
                 retire_closed_stream(&mut state, &stream);
@@ -863,7 +854,7 @@ struct FlushSnapshot {
 
 struct FlushWork {
     stream: String,
-    retired: Arc<Mutex<Option<StreamFrontier>>>,
+    retired: Arc<OnceLock<StreamFrontier>>,
     target: u64,
     segments: Vec<FlushSnapshot>,
 }

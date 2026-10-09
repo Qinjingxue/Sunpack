@@ -1996,10 +1996,11 @@ impl ReaderManager {
         Ok(data)
     }
 
-    fn cache_totals(&self) -> io::Result<(usize, usize, usize)> {
+    fn cache_totals(&self) -> io::Result<(usize, usize, usize, usize)> {
         let mut entries = 0usize;
         let mut hot_bytes = 0usize;
         let mut general_bytes = 0usize;
+        let mut capacity = 0usize;
         for shard in &self.cache_shards {
             let shard = shard
                 .lock()
@@ -2007,8 +2008,12 @@ impl ReaderManager {
             entries += shard.entries.len();
             hot_bytes += shard.hot_size;
             general_bytes += shard.general_size;
+            capacity += shard.entries.capacity()
+                + shard.by_identity.capacity()
+                + shard.hot_order.capacity()
+                + shard.general_order.capacity();
         }
-        Ok((entries, hot_bytes, general_bytes))
+        Ok((entries, hot_bytes, general_bytes, capacity))
     }
 }
 
@@ -2096,13 +2101,16 @@ fn cache_tier(source: &FileSource, index: u64) -> CacheTier {
 #[pyfunction]
 pub(crate) fn reader_cache_stats(py: Python<'_>) -> PyResult<Py<PyDict>> {
     let manager = manager();
-    let (entries, hot_bytes, general_bytes) = manager.cache_totals()?;
-    let handles = manager
-        .handles
-        .lock()
-        .map_err(|_| io::Error::other("reader manager handle lock poisoned"))?
-        .entries
-        .len();
+    let (entries, hot_bytes, general_bytes, mut capacity) = manager.cache_totals()?;
+    let handles = {
+        let handles = manager
+            .handles
+            .lock()
+            .map_err(|_| io::Error::other("reader manager handle lock poisoned"))?;
+        capacity +=
+            handles.entries.capacity() + handles.by_path.capacity() + handles.order.capacity();
+        handles.entries.len()
+    };
     let dict = PyDict::new(py);
     dict.set_item(
         "logical_bytes",
@@ -2142,21 +2150,6 @@ pub(crate) fn reader_cache_stats(py: Python<'_>) -> PyResult<Py<PyDict>> {
     dict.set_item("general_cache_bytes", general_bytes)?;
     dict.set_item("open_handles", handles)?;
     dict.set_item("cache_shards", CACHE_SHARDS)?;
-    let mut capacity = 0usize;
-    for shard in &manager.cache_shards {
-        let shard = shard
-            .lock()
-            .map_err(|_| io::Error::other("shared reader cache shard poisoned"))?;
-        capacity += shard.entries.capacity()
-            + shard.by_identity.capacity()
-            + shard.hot_order.capacity()
-            + shard.general_order.capacity();
-    }
-    let handles = manager
-        .handles
-        .lock()
-        .map_err(|_| io::Error::other("reader manager handle lock poisoned"))?;
-    capacity += handles.entries.capacity() + handles.by_path.capacity() + handles.order.capacity();
     dict.set_item("container_capacity", capacity)?;
     Ok(dict.unbind())
 }

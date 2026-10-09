@@ -765,11 +765,10 @@ class WatchScheduler:
             )
             self._completion_batches.add(finishing)
             try:
-                try:
-                    finished = await asyncio.shield(finishing)
-                except asyncio.CancelledError:
-                    await finishing
-                    raise
+                finished = await asyncio.shield(finishing)
+            except asyncio.CancelledError:
+                await finishing
+                raise
             finally:
                 with self._lock:
                     self._unregister_inflight_requests_locked(completed)

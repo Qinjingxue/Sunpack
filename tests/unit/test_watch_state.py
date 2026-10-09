@@ -72,15 +72,32 @@ def test_incremental_update_appends_segment_without_replacing_snapshot(tmp_path,
 
 
 def test_failed_journal_append_faults_store(tmp_path):
+    from sunpack_native import watch_journal_request_flush
+    from sunpack.runtime.watch.journal_commit import journal_stats
+
     state = WatchStateStore(str(tmp_path / "state.json"))
     state.save()
     # Force native OpenOptions(file) to fail without relying on Python internals.
-    state.journal_path.mkdir()
+    journal_path = state.journal_path
+    journal_path.mkdir()
 
     with pytest.raises(RuntimeError, match="native Watch journal append failed"):
         state.queue_active(_candidate(tmp_path / "queued.7z"), durable=True)
     with pytest.raises(RuntimeError, match="persistence is unavailable"):
         state.queue_active(_candidate(tmp_path / "second.7z"), durable=True)
+    ticket = watch_journal_request_flush(state._writer_stream, state.applied_seq)
+    with pytest.raises(RuntimeError, match="native Watch journal append failed"):
+        state.close()
+    assert not journal_stats(state._writer_stream)["registered"]
+
+    # Normal-owner tests cannot cover error retirement: old tickets must keep
+    # the error while a new store can write to the same path successfully.
+    journal_path.rmdir()
+    reopened = WatchStateStore(str(state.path))
+    reopened.queue_active(_candidate(tmp_path / "reopened.7z"), durable=True)
+    with pytest.raises(RuntimeError, match="native Watch journal append failed"):
+        ticket.wait()
+    reopened.close()
 
 
 def test_truncated_segment_tail_is_ignored_and_recovered(tmp_path):
