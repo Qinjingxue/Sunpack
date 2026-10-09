@@ -1067,6 +1067,7 @@ class WatchStateStore:
         status: str,
         error: str = "",
         failure_payload: dict[str, Any] | None = None,
+        password_generation: int | None = None,
     ) -> None:
         with self._state_lock:
             key = _path_key(path)
@@ -1092,7 +1093,7 @@ class WatchStateStore:
                 failure_stage=str(payload.get("stage") or ""),
                 failure_payload=payload,
                 last_attempt_at=time.time(),
-                password_generation=self.password_generation,
+                password_generation=self.password_generation if password_generation is None else password_generation,
             )
             self._commit_operations_locked([
                 self._put_operation("entries", key, entry),

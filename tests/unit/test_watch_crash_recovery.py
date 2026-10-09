@@ -160,6 +160,7 @@ def test_startup_blocker_reconciliation_is_targeted(tmp_path, monkeypatch):
         path=str(password_archive),
         status="failed_password",
         password_scope_dir=str(scope),
+        password_generation=0,
         failure_payload={"password_scope_signature": "old"},
     )
     missing_entry = SimpleNamespace(
@@ -170,6 +171,7 @@ def test_startup_blocker_reconciliation_is_targeted(tmp_path, monkeypatch):
     )
     scheduler.state = SimpleNamespace(
         entry_items=lambda: [password_entry, missing_entry],
+        password_generation=0,
     )
     scheduler.config = {}
     calls = []

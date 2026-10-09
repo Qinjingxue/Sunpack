@@ -93,6 +93,7 @@ def test_existing_watch_success_notification_includes_postprocess_warning(tmp_pa
             return PipelineResponse("request", summary, PipelineArtifacts((output,)))
         request = scheduler_module._ActivePipelineRequest(
             "notice", WatchCandidate(str(source), 6, 1.0), asyncio.create_task(complete()),
+            password_generation=watcher.state.password_generation,
         )
         return await watcher._complete_candidate(request)
 
@@ -507,6 +508,64 @@ def test_watch_pop_ready_uses_heap_without_pending_mapping_scan(monkeypatch):
     assert watcher._active_states == {}
 
 
+@pytest.mark.parametrize("failure_stage", ["rename", "observation", "attempt", "log"])
+def test_watch_ready_batch_survives_one_candidate_error(tmp_path, monkeypatch, failure_stage):
+    root = tmp_path / "in"
+    root.mkdir()
+    paths = [root / name for name in ("first.disguised", "middle.download", "last.zip")]
+    for path in paths:
+        _write_zip(path)
+    watcher = _watcher(tmp_path, roots=[str(root)], cold_start_seconds=0)
+    for path in paths:
+        watcher.enqueue(str(path))
+
+    native_ready = scheduler_module.watch_file_is_ready
+    observe = scheduler_module._candidate_for_event_path
+    record_attempt = watcher.state.record_attempt
+    write_log = watcher.log.write
+    middle = str(paths[1])
+
+    def readiness(path):
+        if path == middle and failure_stage == "rename":
+            paths[1].rename(root / "completed.zip")
+        return native_ready(path)
+
+    def observation(path, *, since_usn=0):
+        if path == middle and failure_stage == "observation":
+            raise OSError("transient observation failure")
+        return observe(path, since_usn=since_usn)
+
+    def attempt(path, *args):
+        if path == middle and failure_stage == "attempt":
+            raise OSError("state write failure")
+        return record_attempt(path, *args)
+
+    def log(event, **fields):
+        if fields.get("path") == middle and event == "candidate_quiet" and failure_stage == "log":
+            raise OSError("log write failure")
+        return write_log(event, **fields)
+
+    with monkeypatch.context() as probes:
+        probes.setattr(scheduler_module, "watch_file_is_ready", readiness)
+        probes.setattr(scheduler_module, "_candidate_for_event_path", observation)
+        probes.setattr(watcher.state, "record_attempt", attempt)
+        probes.setattr(watcher.log, "write", log)
+        ready = watcher._pop_ready(time.time() + 100)
+
+    assert {candidate.path for candidate in ready} == {
+        str(paths[0]), str(paths[2]), *([middle] if failure_stage == "log" else []),
+    }
+    if failure_stage in {"observation", "attempt"}:
+        assert [candidate.path for candidate in watcher._pop_ready(time.time() + 200)] == [middle]
+    elif failure_stage == "rename":
+        assert watcher.pending_count == 0
+        scheduler_module._WatchEventHandler(watcher).on_moved(SimpleNamespace(
+            src_path=middle, dest_path=str(root / "completed.zip"), is_directory=False,
+        ))
+        assert [candidate.path for candidate in watcher._pop_ready(time.time() + 200)] == [str(root / "completed.zip")]
+    assert watcher.pending_count == 0
+
+
 def test_watch_ready_index_rejects_stale_entry_from_previous_active_lifecycle(monkeypatch):
     watcher = _indexed_scheduler_for_test()
     path = os.path.abspath("recreated.zip")
@@ -657,6 +716,7 @@ def test_coalesced_pipeline_completion_is_consumed_without_duplicate_terminal_no
             notification_id="watch-request",
             candidate=candidate,
             task=task,
+            password_generation=watcher.state.password_generation,
         )
         return await watcher._complete_candidate(request)
 

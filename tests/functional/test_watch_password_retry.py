@@ -33,7 +33,8 @@ async def _wait_for_completed_watch_run(watcher: WatchScheduler, *, timeout: flo
 
 
 @pytest.mark.parametrize("source", ["directory", "watch_clipboard"])
-def test_watch_retries_real_encrypted_zip_after_password_source_update(tmp_path, monkeypatch, source):
+@pytest.mark.parametrize("update_timing", ["after_failure", "before_failure", "before_failure_restart"])
+def test_watch_retries_real_encrypted_zip_after_password_source_update(tmp_path, monkeypatch, source, update_timing):
     seven_zip = get_test_tools().get("seven_zip")
     if seven_zip is None or not seven_zip.is_file():
         pytest.skip("7z.exe is required for encrypted watch retry coverage")
@@ -90,17 +91,30 @@ def test_watch_retries_real_encrypted_zip_after_password_source_update(tmp_path,
     }
     async def scenario():
         async with PipelineEngine(config) as engine:
+            result_ready = asyncio.Event()
+            release_result = asyncio.Event()
+            if update_timing != "after_failure":
+                run = engine.run
+
+                async def delayed_result(*args, **kwargs):
+                    response = await run(*args, **kwargs)
+                    if not result_ready.is_set():
+                        result_ready.set()
+                        await release_result.wait()
+                    return response
+
+                monkeypatch.setattr(engine, "run", delayed_result)
             watcher = WatchScheduler(
                 config, [str(watch_root)], out_dir=str(output_root),
                 state_path=str(tmp_path / "state.json"), cold_start_seconds=0,
                 initial_scan=False, pipeline_engine=engine,
             )
             watcher.enqueue(str(archive))
-            first = await _wait_for_completed_watch_run(watcher)
-            assert first.failed == 1, first
-            first_entries = list(watcher.state.entries.values())
-            assert len(first_entries) == 1, first_entries
-            assert first_entries[0].status == "failed_password"
+            if update_timing == "after_failure":
+                first = await _wait_for_completed_watch_run(watcher)
+            else:
+                await watcher.run_once()
+                await asyncio.wait_for(result_ready.wait(), timeout=10)
             if source == "directory":
                 directory_password_file.write_text(password + "\n", encoding="utf-8")
                 watcher.notify_password_table_changed(str(directory_password_file))
@@ -111,7 +125,31 @@ def test_watch_retries_real_encrypted_zip_after_password_source_update(tmp_path,
                     lambda: [password],
                 )
                 watcher._clipboard_monitor._handle_clipboard_update()
+            if update_timing != "after_failure":
+                # Consume the directory notification while the old failure is
+                # still in flight; completion must recover the missed retry.
+                watcher._process_password_dirty_dirs(time.monotonic())
+                release_result.set()
+                first = await watcher.drain()
+            assert first.failed == 1, first
+            first_entries = list(watcher.state.entries.values())
+            assert len(first_entries) == 1, first_entries
+            assert first_entries[0].status == "failed_password"
+            assert first_entries[0].password_generation < watcher.state.password_generation
+            if update_timing == "before_failure_restart":
+                watcher.state.flush()
+                watcher = WatchScheduler(
+                    config, [str(watch_root)], out_dir=str(output_root),
+                    state_path=str(tmp_path / "state.json"), cold_start_seconds=0,
+                    initial_scan=False, pipeline_engine=engine,
+                )
+                # Exercise startup reconciliation without starting a real
+                # Observer or clipboard listener in this pipeline test.
+                watcher._reconcile_persisted_blockers()
             second = await _wait_for_completed_watch_run(watcher)
+            await watcher.run_once()
+            assert watcher.pending_count == 0
+            assert not watcher._inflight_requests
             return second, watcher, list(output_root.rglob("payload.txt"))
     second, watcher, extracted = asyncio.run(scenario())
 

@@ -1,4 +1,4 @@
-use pyo3::exceptions::{PyOSError, PyRuntimeError};
+use pyo3::exceptions::{PyFileNotFoundError, PyOSError, PyRuntimeError};
 use pyo3::prelude::*;
 use std::path::Path;
 
@@ -205,7 +205,13 @@ pub(crate) fn watch_volume_cursor(path: &str) -> PyResult<(String, u64, i64)> {
 pub(crate) fn watch_file_is_ready(path: &str) -> PyResult<bool> {
     #[cfg(windows)]
     {
-        return windows::watch_file_is_ready(Path::new(path)).map_err(os_error);
+        return windows::watch_file_is_ready(Path::new(path)).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                PyFileNotFoundError::new_err(error.to_string())
+            } else {
+                os_error(error)
+            }
+        });
     }
     #[cfg(not(windows))]
     {

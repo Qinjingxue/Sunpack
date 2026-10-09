@@ -112,6 +112,7 @@ class _ActivePipelineRequest:
     notification_id: str
     candidate: WatchCandidate
     task: asyncio.Task
+    password_generation: int
     registry_owner: str = ""
     source_input_root: str = ""
     deep_detect: bool = False
@@ -596,7 +597,7 @@ class WatchScheduler:
                 payload = entry.failure_payload if isinstance(entry.failure_payload, dict) else {}
                 previous = str(payload.get("password_scope_signature") or "")
                 current = _directory_password_signature(entry.password_scope_dir, self.config)
-                if previous != current:
+                if entry.password_generation < self.state.password_generation or previous != current:
                     self.enqueue(
                         entry.path,
                         force=True,
@@ -1352,57 +1353,86 @@ class WatchScheduler:
             # gate. Therefore cleanup can never publish a claim in the middle
             # of a candidate/readiness probe and later reject that same probe.
             with self._claim_gate:
-                if path_key(os.path.abspath(path)) in self._active_claims:
-                    self._reschedule_generation(path, epoch, generation)
-                    continue
-                refreshed = _candidate_for_event_path(path, since_usn=candidate.change_usn)
-                if refreshed is None:
-                    self._drop_active(path, epoch, generation)
-                    self.state.forget_path(path)
-                    continue
-                if _candidate_observation_changed(candidate, refreshed):
-                    if _candidate_content_changed(candidate, refreshed):
-                        self._record_boundary_activity(path, epoch, generation, refreshed, now)
+                try:
+                    if path_key(os.path.abspath(path)) in self._active_claims:
+                        self._reschedule_generation(path, epoch, generation)
                         continue
-                    if not self._update_boundary_metadata(path, epoch, generation, refreshed):
+                    refreshed = _candidate_for_event_path(path, since_usn=candidate.change_usn)
+                    if refreshed is None:
+                        self._drop_active(path, epoch, generation)
+                        self.state.forget_path(path)
                         continue
-                    candidate = refreshed
-                if not watch_file_is_ready(path):
+                    if _candidate_observation_changed(candidate, refreshed):
+                        if _candidate_content_changed(candidate, refreshed):
+                            self._record_boundary_activity(path, epoch, generation, refreshed, now)
+                            continue
+                        if not self._update_boundary_metadata(path, epoch, generation, refreshed):
+                            continue
+                        candidate = refreshed
+                    try:
+                        file_ready = watch_file_is_ready(path)
+                    except FileNotFoundError:
+                        # The source may disappear after its metadata probe.
+                        # Only this candidate departs; the rest of due survives.
+                        self._drop_active(path, epoch, generation)
+                        self.state.forget_path(path)
+                        continue
+                    if not file_ready:
+                        self._record_boundary_activity(
+                            path,
+                            epoch,
+                            generation,
+                            refreshed,
+                            now,
+                            content_changed=False,
+                        )
+                        self.log.write_throttled(
+                            "candidate_busy",
+                            throttle_key=os.path.normcase(os.path.abspath(path)),
+                            interval_seconds=30.0,
+                            path=path,
+                        )
+                        continue
+                    identified = refreshed
+                    with self._lock:
+                        state = self._active_states.get(path)
+                        if (
+                            state is None
+                            or state.epoch != epoch
+                            or state.generation != generation
+                        ):
+                            continue
+                    # Keep the active generation recoverable until the attempt
+                    # is recorded. The admission gate excludes source events;
+                    # persistence does not need to hold the scheduler lock.
+                    self.state.record_attempt(
+                        identified.path,
+                        identified.size,
+                        identified.mtime,
+                        identified.file_id,
+                        identified.change_usn,
+                    )
+                    with self._lock:
+                        ready.append(identified)
+                        self._remove_pending_locked(path)
+                        self._active_states.pop(path, None)
+                    self.log.write("candidate_quiet", path=path, generation=generation, quiet_seconds=quiet_seconds)
+                except Exception as exc:
+                    # Reuse the existing boundary policy for a failed probe or
+                    # state write. Generation checks preserve newer events, and
+                    # a candidate already handed to ready cannot be requeued.
                     self._record_boundary_activity(
-                        path,
-                        epoch,
-                        generation,
-                        refreshed,
-                        now,
-                        content_changed=False,
+                        path, epoch, generation, candidate, now, content_changed=False,
                     )
-                    self.log.write_throttled(
-                        "candidate_busy",
-                        throttle_key=os.path.normcase(os.path.abspath(path)),
-                        interval_seconds=30.0,
-                        path=path,
-                    )
-                    continue
-                identified = refreshed
-                with self._lock:
-                    state = self._active_states.get(path)
-                    if (
-                        state is None
-                        or state.epoch != epoch
-                        or state.generation != generation
-                    ):
-                        continue
-                    self._remove_pending_locked(path)
-                    self._active_states.pop(path, None)
-                self.state.record_attempt(
-                    identified.path,
-                    identified.size,
-                    identified.mtime,
-                    identified.file_id,
-                    identified.change_usn,
-                )
-                self.log.write("candidate_quiet", path=path, generation=generation, quiet_seconds=quiet_seconds)
-                ready.append(identified)
+                    try:
+                        self.log.write_throttled(
+                            "candidate_error", throttle_key=self._scheduler_path_key(path),
+                            interval_seconds=30.0, path=path,
+                            error=str(exc), error_type=type(exc).__name__,
+                        )
+                    except Exception:
+                        # A diagnostic failure must not discard the batch.
+                        pass
         return ready
 
     def _drop_active(self, path: str, epoch: int, generation: int) -> None:
@@ -1542,6 +1572,7 @@ class WatchScheduler:
         notification_id = uuid.uuid4().hex
         with self._password_source_lock:
             run_config = dict(self.config)
+            password_generation = self.state.password_generation
             retry_entry = self.state.latest_entry_for_path(candidate.path)
             pending = self.state.pending_work_for_path(candidate.path)
             scope_dir = ""
@@ -1609,6 +1640,7 @@ class WatchScheduler:
             notification_id=notification_id,
             candidate=candidate,
             task=task,
+            password_generation=password_generation,
             registry_owner=notification_id if host is not None else "",
             source_input_root=source_input_root,
             deep_detect=options.force_scan,
@@ -1748,11 +1780,23 @@ class WatchScheduler:
             )
             error = _failure_message(failure, self.i18n.t("watch.failure.extraction_failed"))
             status = "suspended_missing_volume" if missing else "failed_password"
-            self.state.mark(
-                retry_candidate.path, retry_candidate.size, retry_candidate.mtime,
-                file_id=retry_candidate.file_id, change_usn=retry_candidate.change_usn,
-                status=status, error=error, failure_payload=payload,
-            )
+            with self._password_source_lock:
+                # Publish before comparing under the same lock used by password
+                # updates: either this completion or the update queues a retry.
+                self.state.mark(
+                    retry_candidate.path, retry_candidate.size, retry_candidate.mtime,
+                    file_id=retry_candidate.file_id, change_usn=retry_candidate.change_usn,
+                    status=status, error=error, failure_payload=payload,
+                    password_generation=request.password_generation,
+                )
+                retry_password = (
+                    password and not missing
+                    and request.password_generation < self.state.password_generation
+                )
+            if retry_password:
+                self.notify_password_table_changed(
+                    os.path.join(scope_dir, DIRECTORY_PASSWORD_FILE_NAME), bump_generation=False,
+                )
             self.log.write(status, path=retry_candidate.path, error=error, failures=[payload])
             (waiting_failures if missing else recorded_password_failures).append(failure)
 
