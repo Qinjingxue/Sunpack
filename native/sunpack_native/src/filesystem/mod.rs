@@ -67,7 +67,7 @@ pub(crate) fn validate_ntfs_watch_root(path: &str) -> PyResult<()> {
         }
         windows::watch_file_observation(path, None).map_err(|error| {
             PyRuntimeError::new_err(format!(
-                "watch mode requires an active readable NTFS USN journal for '{}': {}",
+                "watch mode requires readable NTFS file identity for '{}': {}",
                 path.display(),
                 error
             ))

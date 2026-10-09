@@ -254,7 +254,10 @@ fn read_file_usn(handle: Handle) -> io::Result<WatchFileObservation> {
     {
         return Err(io::Error::last_os_error());
     }
-    let bytes = &output[..bytes_returned as usize];
+    parse_file_usn_record(&output[..bytes_returned as usize])
+}
+
+fn parse_file_usn_record(bytes: &[u8]) -> io::Result<WatchFileObservation> {
     if bytes.len() < 32 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -286,10 +289,12 @@ fn read_file_usn(handle: Handle) -> io::Result<WatchFileObservation> {
         ));
     }
     let change_usn = i64::from_le_bytes(bytes[usn_offset..usn_offset + 8].try_into().unwrap());
-    if change_usn <= 0 {
+    // Zero is a valid per-file USN when no change has been journaled for it.
+    // Journal availability is checked separately on the volume by the broker.
+    if change_usn < 0 {
         return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "NTFS USN journal is unavailable for this path",
+            io::ErrorKind::InvalidData,
+            "NTFS returned a negative file USN",
         ));
     }
     let file_id = bytes[8..file_id_end]
@@ -435,6 +440,30 @@ fn nul_terminated(values: &[u16]) -> &[u16] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_usn_observation_preserves_identity_without_a_journal_record() {
+        for (version, length, usn_offset, expected_file_id) in [
+            (2u16, 64usize, 24usize, "0000000000001234"),
+            (3, 80, 40, "00000000000000000000000000001234"),
+            (4, 64, 40, "00000000000000000000000000001234"),
+        ] {
+            let mut record = vec![0u8; length];
+            record[..4].copy_from_slice(&(length as u32).to_le_bytes());
+            record[4..6].copy_from_slice(&version.to_le_bytes());
+            record[8..16].copy_from_slice(&0x1234u64.to_le_bytes());
+            for usn in [0i64, 127] {
+                record[usn_offset..usn_offset + 8].copy_from_slice(&usn.to_le_bytes());
+                let observation = parse_file_usn_record(&record)
+                    .expect("zero USN is valid for an unchanged pre-existing file or directory");
+                assert_eq!(observation.file_id, expected_file_id);
+                assert_eq!(observation.change_usn, usn);
+                assert!(!observation.change_reasons_known);
+            }
+            record[usn_offset..usn_offset + 8].copy_from_slice(&(-1i64).to_le_bytes());
+            assert!(parse_file_usn_record(&record).is_err());
+        }
+    }
 
     #[test]
     fn nearest_existing_ancestor_walks_up_to_a_real_directory() {
