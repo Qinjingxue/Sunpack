@@ -429,6 +429,7 @@ class WatchService:
         self._broker_acquired = False
         self._ready_event = asyncio.Event()
         self._reload_lock = asyncio.Lock()
+        self._configuration_tasks: set[asyncio.Task] = set()
         self._startup_error: BaseException | None = None
         self.log = WatchLogStore(os.path.join(self.state_dir, "events.jsonl"))
 
@@ -466,11 +467,12 @@ class WatchService:
             )
             if self._control_queue is None:
                 self._control_queue = asyncio.Queue()
-            await self._start_scheduler(
-                initial_scan=bool(initial_scan),
-                initial_scan_roots=initial_scan_roots,
-            )
-            self._reconcile_tray()
+            async with self._reload_lock:
+                await self._start_scheduler(
+                    initial_scan=bool(initial_scan),
+                    initial_scan_roots=initial_scan_roots,
+                )
+                self._reconcile_tray()
             self._ready_event.set()
             if once:
                 if self.scheduler is None:
@@ -540,32 +542,36 @@ class WatchService:
             self.log.write("service_error", error=str(exc), error_type=type(exc).__name__)
             raise
         finally:
+            self._stop_requested = True
             self._stop_config_observer()
-            try:
-                self._stop_tray()
-            except Exception as exc:
-                tray_shutdown_error = exc
-            try:
-                await self._stop_scheduler()
-            except Exception as exc:
-                self.log.write(
-                    "scheduler_stop_error",
-                    error=str(exc),
-                    error_type=type(exc).__name__,
-                )
-            if self._broker_acquired:
+            # Finish an admitted configuration change before releasing any
+            # service resources. Queued changes reject the stop flag below.
+            async with self._reload_lock:
                 try:
-                    _release_watch_broker()
-                    self.log.write("watch_broker_released")
+                    self._stop_tray()
+                except Exception as exc:
+                    tray_shutdown_error = exc
+                try:
+                    await self._stop_scheduler()
                 except Exception as exc:
                     self.log.write(
-                        "watch_broker_release_error",
+                        "scheduler_stop_error",
                         error=str(exc),
                         error_type=type(exc).__name__,
                     )
-                finally:
-                    self._broker_acquired = False
-            self._stop_toast_host()
+                if self._broker_acquired:
+                    try:
+                        _release_watch_broker()
+                        self.log.write("watch_broker_released")
+                    except Exception as exc:
+                        self.log.write(
+                            "watch_broker_release_error",
+                            error=str(exc),
+                            error_type=type(exc).__name__,
+                        )
+                    finally:
+                        self._broker_acquired = False
+                self._stop_toast_host()
             self.log.write("service_stopped", state_dir=self.state_dir)
             if tray_shutdown_error is not None:
                 raise tray_shutdown_error
@@ -586,56 +592,64 @@ class WatchService:
         deep_detect: bool | None = None,
         initial_scan: bool = True,
     ) -> dict:
-        async with self._reload_lock:
-            roots_path, added, updated = add_watch_roots(paths, output_dir=output_dir, deep_detect=deep_detect)
-            if not added and not updated:
-                self.log.write("watch_roots_add_skipped", requested=_normalize_scan_roots(paths))
-                return {
-                    "roots_path": str(roots_path),
-                    "added": [],
-                    "updated": [],
-                    "applied": False,
-                }
-            new_service_config = service_config_from(self.config)
+        return await asyncio.shield(self._start_configuration_change(
+            lambda: self._add_roots_unlocked(paths, output_dir, deep_detect, initial_scan),
+        ))
+
+    async def _add_roots_unlocked(self, paths, output_dir, deep_detect, initial_scan) -> dict:
+        roots_path, added, updated = add_watch_roots(paths, output_dir=output_dir, deep_detect=deep_detect)
+        if not added and not updated:
+            self.log.write("watch_roots_add_skipped", requested=_normalize_scan_roots(paths))
+            return {
+                "roots_path": str(roots_path),
+                "added": [],
+                "updated": [],
+                "applied": False,
+            }
+        new_service_config = service_config_from(self.config)
+        applied = await self._apply_configuration(
+            self.config,
+            new_service_config,
+            service_state_dir(self.config),
+            initial_scan_roots=added + updated if initial_scan else None,
+        )
+        return {
+            "roots_path": str(roots_path),
+            "added": added,
+            "updated": updated,
+            "applied": applied,
+        }
+
+    async def remove_roots(self, paths: list[str]) -> dict:
+        return await asyncio.shield(self._start_configuration_change(
+            lambda: self._remove_roots_unlocked(paths),
+        ))
+
+    async def _remove_roots_unlocked(self, paths: list[str]) -> dict:
+        # Stop/reconcile the running scheduler before removing its watch
+        # state, so an in-flight extraction cannot race reconfiguration.
+        roots_path, removed = remove_watch_roots(paths, cleanup=False)
+        if not removed:
+            self.log.write("watch_roots_remove_skipped", requested=_normalize_scan_roots(paths))
+            return {
+                "roots_path": str(roots_path),
+                "removed": [],
+                "applied": False,
+            }
+        new_service_config = service_config_from(self.config)
+        try:
             applied = await self._apply_configuration(
                 self.config,
                 new_service_config,
                 service_state_dir(self.config),
-                initial_scan_roots=added + updated if initial_scan else None,
             )
-            return {
-                "roots_path": str(roots_path),
-                "added": added,
-                "updated": updated,
-                "applied": applied,
-            }
-
-    async def remove_roots(self, paths: list[str]) -> dict:
-        async with self._reload_lock:
-            # Stop/reconcile the running scheduler before removing its watch
-            # state, so an in-flight extraction cannot race reconfiguration.
-            roots_path, removed = remove_watch_roots(paths, cleanup=False)
-            if not removed:
-                self.log.write("watch_roots_remove_skipped", requested=_normalize_scan_roots(paths))
-                return {
-                    "roots_path": str(roots_path),
-                    "removed": [],
-                    "applied": False,
-                }
-            new_service_config = service_config_from(self.config)
-            try:
-                applied = await self._apply_configuration(
-                    self.config,
-                    new_service_config,
-                    service_state_dir(self.config),
-                )
-            finally:
-                _cleanup_removed_watch_root_artifacts(removed)
-            return {
-                "roots_path": str(roots_path),
-                "removed": removed,
-                "applied": applied,
-            }
+        finally:
+            _cleanup_removed_watch_root_artifacts(removed)
+        return {
+            "roots_path": str(roots_path),
+            "removed": removed,
+            "applied": applied,
+        }
 
     def request_stop(self) -> None:
         if self._loop is not None:
@@ -647,7 +661,7 @@ class WatchService:
 
     def request_reload(self) -> None:
         if self._loop is not None:
-            self._loop.call_soon_threadsafe(lambda: asyncio.create_task(self._reload_config()))
+            self._loop.call_soon_threadsafe(self._start_configuration_change, self._reload_config_unlocked)
 
     async def _start_scheduler(
         self,
@@ -824,7 +838,7 @@ class WatchService:
             self._stop_requested = True
             return
         if event == CONTROL_RELOAD:
-            asyncio.create_task(self._reload_config())
+            self._start_configuration_change(self._reload_config_unlocked)
 
     def _should_log_scheduler_tick(self, result) -> bool:
         if result.processed or result.failed or result.errors:
@@ -892,8 +906,27 @@ class WatchService:
             self._loop.call_soon_threadsafe(self._control_queue.put_nowait, CONTROL_RELOAD)
 
     async def _reload_config(self) -> bool:
-        async with self._reload_lock:
-            return await self._reload_config_unlocked()
+        return await asyncio.shield(self._start_configuration_change(self._reload_config_unlocked))
+
+    def _start_configuration_change(self, operation) -> asyncio.Task:
+        async def apply():
+            async with self._reload_lock:
+                if self._stop_requested:
+                    raise RuntimeError("watch service is stopping")
+                return await operation()
+
+        # The service owns the transaction; a CLI only owns its shielded wait.
+        task = asyncio.create_task(apply(), name="sunpack-watch-configuration")
+        self._configuration_tasks.add(task)
+        task.add_done_callback(self._configuration_finished)
+        return task
+
+    def _configuration_finished(self, task: asyncio.Task) -> None:
+        self._configuration_tasks.discard(task)
+        if not task.cancelled():
+            error = task.exception()
+            if error is not None:
+                self.log.write("configuration_change_failed", error=str(error), error_type=type(error).__name__)
 
     async def _reload_config_unlocked(self) -> bool:
         try:

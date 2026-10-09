@@ -174,7 +174,7 @@ class RuntimeHost:
                 return {"stopped": False, "running": False, "generation": self._watch_generation}
             self.log_event("watch_stopping")
             service.request_stop()
-        result = await asyncio.gather(task, return_exceptions=True)
+        result = await asyncio.shield(asyncio.gather(task, return_exceptions=True))
         error = result[0] if result and isinstance(result[0], BaseException) else None
         async with self._lock:
             if self._watch_task is task:

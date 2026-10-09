@@ -11,6 +11,178 @@ from sunpack.runtime.cli.runtime_host import RuntimeHost
 from tests.helpers.config_factory import make_config
 
 
+@pytest.mark.parametrize("action", ["reload", "add", "remove"])
+def test_watch_configuration_survives_disconnect_and_finishes_before_stop(tmp_path, monkeypatch, action):
+    from copy import deepcopy
+    import threading
+
+    import sunpack.runtime.cli.persistent_process as protocol_module
+    import sunpack.runtime.cli.runtime_host as host_module
+    import sunpack.runtime.watch.scheduler as scheduler_module
+    import sunpack.runtime.watch.service as service_module
+    from sunpack.core.support.resource_lifecycle import resource_snapshot
+    from sunpack.pipeline.coordinator.async_work import AsyncWorkBroker
+    from sunpack.runtime.cli.runtime_state import set_runtime_host
+    from tests.helpers.fake_pipeline_engine import FakePipelineEngine
+
+    roots = [tmp_path / name for name in ("first", "second", "third")]
+    for root in roots:
+        root.mkdir()
+    roots_path = tmp_path / "roots.txt"
+    roots_path.write_text("\n".join(map(str, roots if action == "remove" else roots[:1])), encoding="utf-8")
+    config = make_config({"watch": {
+        "state_dir": str(tmp_path / "state"), "tray_enabled": False,
+        "toast_enabled": False, "clipboard_monitor_enabled": False,
+        "directory_password_file_auto_create": False,
+    }})
+    monkeypatch.setattr(host_module, "load_config", lambda: config)
+    monkeypatch.setattr(service_module, "load_config", lambda: deepcopy(config))
+    monkeypatch.setattr(service_module, "watch_roots_path", lambda: roots_path)
+    monkeypatch.setattr(service_module, "_acquire_watch_broker", lambda: None)
+    monkeypatch.setattr(service_module, "_release_watch_broker", lambda: None)
+    monkeypatch.setattr(service_module.WatchService, "_start_config_observer", lambda self: None)
+
+    class Observer:
+        def schedule(self, *_args, **_kwargs):
+            pass
+
+        def start(self):
+            pass
+
+        def stop(self):
+            pass
+
+        def join(self, **_kwargs):
+            pass
+
+    monkeypatch.setattr(scheduler_module, "Observer", Observer)
+    for name in ("_prepare_usn_startup_baseline", "_recover_usn_startup_gap"):
+        monkeypatch.setattr(scheduler_module.WatchScheduler, name, lambda self: None)
+
+    async def scenario():
+        engine = FakePipelineEngine(lambda _config: None)
+        engine.work_broker = AsyncWorkBroker(thread_capacity=2)
+        entered, release, stopping = asyncio.Event(), threading.Event(), asyncio.Event()
+        schedulers, protocols, requests = [], [], []
+        loop = asyncio.get_running_loop()
+        original_start = scheduler_module.WatchScheduler._start_blocking
+        original_stop = service_module.WatchService.request_stop
+
+        def start(scheduler):
+            schedulers.append(scheduler)
+            if len(schedulers) > 1:
+                loop.call_soon_threadsafe(entered.set)
+                assert release.wait(5), "test did not release watch initialization"
+            original_start(scheduler)
+
+        def stop(service):
+            original_stop(service)
+            stopping.set()
+
+        async def shared_engine(_config):
+            return engine
+
+        monkeypatch.setattr(scheduler_module.WatchScheduler, "_start_blocking", start)
+        monkeypatch.setattr(service_module.WatchService, "request_stop", stop)
+        monkeypatch.setattr(host_module, "shared_pipeline_engine", shared_engine)
+        host = RuntimeHost()
+        set_runtime_host(host)
+
+        async def change(index):
+            if action == "reload":
+                config["watch"]["cold_start_seconds"] += 1
+                return await host.reload_watch()
+            if action == "add":
+                return await host.add_watch_roots([str(roots[index])], initial_scan=False)
+            return await host.remove_watch_roots([str(roots[index])])
+
+        async def execute(payload, _protocol):
+            if payload["argv"][-1] == "stop":
+                await host.stop_watch()
+            else:
+                await change(1)
+            return 0
+
+        monkeypatch.setattr(protocol_module, "_execute_streaming_request_async", execute)
+
+        class Transport:
+            def write(self, _frame):
+                pass
+
+            def get_write_buffer_size(self):
+                return 0
+
+            def close(self):
+                pass
+
+        def request(command):
+            protocol = protocol_module._PipeRequestProtocol(
+                b"t" * 32, on_connected=lambda: None, on_closed=lambda: None,
+                on_completed=lambda: None, on_shutdown=lambda: None,
+            )
+            protocol.connection_made(Transport())
+            task = protocol._request_task = asyncio.create_task(protocol._run_request({"argv": ["watch", command]}))
+            protocols.append(protocol)
+            requests.append(task)
+            return protocol, task
+
+        watch_task = None
+        try:
+            await host.start_watch(tray_enabled=False)
+            service, watch_task = host._watch_service, host._watch_task
+            protocol, task = request(action)
+            await asyncio.wait_for(entered.wait(), 1)
+            protocol.connection_lost(None)
+            result = await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 1)
+            assert isinstance(result[0], asyncio.CancelledError)
+            assert host._foreground_requests == 0 and host.watch_enabled
+            release.set()
+            # Wait through the public configuration gate, then check ownership.
+            await service.reload()
+            assert service.scheduler is schedulers[-1] and service.scheduler._started
+            assert not service.scheduler._external_activity_requested
+
+            entered.clear()
+            release.clear()
+            changing = asyncio.create_task(change(2))
+            requests.append(changing)
+            await asyncio.wait_for(entered.wait(), 1)
+            protocol, task = request("stop")
+            await asyncio.wait_for(stopping.wait(), 1)
+            protocol.connection_lost(None)
+            result = await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 1)
+            assert isinstance(result[0], asyncio.CancelledError)
+            assert not watch_task.done()
+            # A queued reload must not restart monitoring after shutdown.
+            queued = asyncio.create_task(service.reload())
+            requests.append(queued)
+            release.set()
+            await asyncio.wait_for(asyncio.gather(changing, watch_task), 2)
+            queued_result = await asyncio.gather(queued, return_exceptions=True)
+            assert isinstance(queued_result[0], RuntimeError)
+            await asyncio.sleep(0)
+            assert not host.watch_enabled and service.scheduler is None
+            assert not service._configuration_tasks
+            assert not resource_snapshot(map(str, roots))
+            with pytest.raises(RuntimeError, match="stopping"):
+                await service.reload()
+        finally:
+            release.set()
+            for protocol in protocols:
+                protocol.connection_lost(None)
+            if host._watch_service is not None:
+                host._watch_service.request_stop()
+            await asyncio.gather(*requests, *([watch_task] if watch_task else []),
+                                 *(protocol._output_task for protocol in protocols), return_exceptions=True)
+            for scheduler in schedulers:
+                if scheduler._started:
+                    await scheduler.stop()
+            await engine.work_broker.close()
+            set_runtime_host(None)
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("startup_outcome", ["running", "failed", "failed_cleanup"])
 def test_watch_start_disconnect_releases_request_and_keeps_host_ownership(tmp_path, monkeypatch, startup_outcome):
     import sunpack.runtime.cli.persistent_process as protocol_module
