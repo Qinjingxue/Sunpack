@@ -131,6 +131,26 @@ def test_repeated_store_reopen_reuses_one_wal_segment(tmp_path):
     recovered.close()
 
 
+def test_checkpoint_rotation_still_starts_a_new_wal_segment(tmp_path):
+    state_path = tmp_path / "state.json"
+    first = WatchStateStore(str(state_path))
+    first.queue_active(_candidate(tmp_path / "first.7z"), durable=True)
+    original_segment = first.journal_path
+    first.save()
+    first.close()
+
+    second = WatchStateStore(str(state_path))
+    assert second.journal_path != original_segment
+    second.queue_active(_candidate(tmp_path / "second.7z", 2), durable=True)
+    rotated_segment = second.journal_path
+    second.close()
+
+    reopened = WatchStateStore(str(state_path))
+    assert reopened.journal_path == rotated_segment
+    assert reopened.applied_seq == 2
+    reopened.close()
+
+
 @pytest.mark.parametrize("has_valid_record", [False, True])
 def test_reopen_repairs_torn_tail_before_appending(tmp_path, has_valid_record):
     state_path = tmp_path / "state.json"
