@@ -393,6 +393,26 @@ def _try_send(payload: dict[str, Any]) -> dict[str, Any] | None:
         connection.close()
 
 
+class _ConnectionOutputQueue(asyncio.Queue[bytes | None]):
+    """Loop-owned output: closing retires queued frames and rejects late writes."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.closed = False
+
+    def put_nowait(self, frame: bytes | None) -> None:
+        if not self.closed:
+            super().put_nowait(frame)
+
+    def close(self) -> None:
+        self.closed = True
+        while not self.empty():
+            self.get_nowait()
+            self.task_done()
+        # A frame already taken by the pump remains its responsibility. Its
+        # finally block acknowledges it when cancellation interrupts the send.
+
+
 class _PipeRequestProtocol(asyncio.Protocol):
     """One-request named-pipe protocol with incremental request and input parsing."""
 
@@ -420,7 +440,8 @@ class _PipeRequestProtocol(asyncio.Protocol):
         self._input_size: int | None = None
         self._input_waiter: asyncio.Future[str] | None = None
         self._request_task: asyncio.Task[None] | None = None
-        self._output_queue: asyncio.Queue[bytes | None] = asyncio.Queue()
+        self._request_finishing = False
+        self._output_queue = _ConnectionOutputQueue()
         self._output_task: asyncio.Task[None] | None = None
         self._write_ready = asyncio.Event()
         self._write_ready.set()
@@ -429,7 +450,7 @@ class _PipeRequestProtocol(asyncio.Protocol):
         self._connected_at = time.monotonic()
 
     @property
-    def output_queue(self) -> asyncio.Queue[bytes | None]:
+    def output_queue(self) -> _ConnectionOutputQueue:
         return self._output_queue
 
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
@@ -457,9 +478,10 @@ class _PipeRequestProtocol(asyncio.Protocol):
 
     def connection_lost(self, exc: Exception | None) -> None:
         self._closed = True
+        self._output_queue.close()
         if self._input_waiter is not None and not self._input_waiter.done():
             self._input_waiter.set_exception(ConnectionError("persistent pipe client disconnected"))
-        if self._request_task is not None and not self._request_task.done():
+        if self._request_task is not None and not self._request_task.done() and not self._request_finishing:
             self._request_task.cancel()
         if self._output_task is not None and not self._output_task.done():
             self._output_task.cancel()
@@ -592,6 +614,9 @@ class _PipeRequestProtocol(asyncio.Protocol):
         except Exception:
             pass
         finally:
+            # Disconnect cancels execution, but must not interrupt host release
+            # after the request has already entered its cleanup phase.
+            self._request_finishing = True
             if foreground_active:
                 host.log_event(
                     "foreground_request_finished",
@@ -619,9 +644,13 @@ class _PipeRequestProtocol(asyncio.Protocol):
                     self._output_queue.task_done()
         except asyncio.CancelledError:
             raise
+        except (ConnectionError, OSError):
+            self._abort()
+        finally:
+            self._output_queue.close()
 
     async def send_frame(self, frame: bytes) -> None:
-        if self._closed:
+        if self._closed or self._output_queue.closed:
             raise ConnectionError("persistent pipe transport is closed")
         await self._output_queue.put(frame)
 
@@ -649,6 +678,7 @@ class _PipeRequestProtocol(asyncio.Protocol):
 
     def _abort(self) -> None:
         self._closed = True
+        self._output_queue.close()
         if self._transport is not None:
             self._transport.close()
 
@@ -924,7 +954,7 @@ class _AsyncConnectionTextStream:
     def __init__(
         self,
         loop: asyncio.AbstractEventLoop,
-        queue: asyncio.Queue[bytes | None],
+        queue: _ConnectionOutputQueue,
         kind: int,
         *,
         is_tty: bool = False,
@@ -939,6 +969,8 @@ class _AsyncConnectionTextStream:
 
     def write(self, text: str) -> int:
         value = str(text)
+        if self.queue.closed:
+            return len(value)
         data = value.encode("utf-8", "surrogatepass")
         if data:
             frame = struct.pack("!BI", self.kind, len(data)) + data
@@ -958,7 +990,7 @@ class _StreamRequestConnection:
     def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         self.reader = reader
         self.writer = writer
-        self.output_queue: asyncio.Queue[bytes | None] = asyncio.Queue()
+        self.output_queue = _ConnectionOutputQueue()
         self._output_task: asyncio.Task[None] | None = None
 
     async def start(self) -> None:
@@ -970,15 +1002,18 @@ class _StreamRequestConnection:
             await self._output_task
 
     async def _pump_output(self) -> None:
-        while True:
-            frame = await self.output_queue.get()
-            try:
-                if frame is None:
-                    return
-                self.writer.write(frame)
-                await self.writer.drain()
-            finally:
-                self.output_queue.task_done()
+        try:
+            while True:
+                frame = await self.output_queue.get()
+                try:
+                    if frame is None:
+                        return
+                    self.writer.write(frame)
+                    await self.writer.drain()
+                finally:
+                    self.output_queue.task_done()
+        finally:
+            self.output_queue.close()
 
     async def send_frame(self, frame: bytes) -> None:
         await self.output_queue.put(frame)

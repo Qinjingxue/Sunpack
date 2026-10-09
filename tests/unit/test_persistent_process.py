@@ -169,7 +169,7 @@ def test_streaming_request_forwards_output_before_final_result(monkeypatch):
 
 def test_connection_stream_preserves_client_tty_capability():
     async def scenario():
-        queue = asyncio.Queue()
+        queue = persistent_process._ConnectionOutputQueue()
         stream = persistent_process._AsyncConnectionTextStream(
             asyncio.get_running_loop(), queue, 1, is_tty=True, terminal_columns=93
         )
@@ -565,6 +565,116 @@ def test_protocol_incrementally_parses_a_fragmented_request(monkeypatch):
     )
     assert completed == [True]
     assert closed
+
+
+@pytest.mark.parametrize("disconnect_phase", ["queued", "flushing", "write_error", "finishing"])
+def test_protocol_disconnect_releases_request_and_discards_late_output(monkeypatch, disconnect_phase):
+    from sunpack.runtime.cli import cli
+    from sunpack.runtime.cli.runtime_host import RuntimeHost
+    from sunpack.runtime.cli.runtime_state import set_runtime_host
+
+    async def scenario():
+        host = RuntimeHost()
+        set_runtime_host(host)
+        entered = asyncio.Event()
+        parked = asyncio.Event()
+        streams = []
+        completed = []
+        closed = []
+        disconnected = asyncio.Event()
+        finishing = asyncio.Event()
+        finish_foreground = host.foreground_finished
+
+        async def foreground_finished():
+            finishing.set()
+            await finish_foreground()
+
+        monkeypatch.setattr(host, "foreground_finished", foreground_finished)
+
+        def on_closed():
+            closed.append(True)
+            disconnected.set()
+
+        protocol = persistent_process._PipeRequestProtocol(
+            b"t" * 32,
+            on_connected=lambda: None,
+            on_closed=on_closed,
+            on_completed=lambda: completed.append(True),
+            on_shutdown=lambda: None,
+        )
+
+        class Transport:
+            def write(self, _data):
+                if disconnect_phase == "write_error":
+                    raise BrokenPipeError("client disconnected")
+
+            def get_write_buffer_size(self):
+                return 300000 if disconnect_phase == "flushing" else 0
+
+            def close(self):
+                if disconnect_phase == "write_error":
+                    asyncio.get_running_loop().call_soon(protocol.connection_lost, None)
+
+        async def command(*_args, stdout, **_kwargs):
+            streams.append(stdout)
+            stdout.write("progress 1\n")
+            stdout.write("progress 2\n")
+            entered.set()
+            if disconnect_phase == "finishing":
+                await host._foreground_state_lock.acquire()
+                return 0
+            if disconnect_phase == "flushing":
+                await protocol.flush_output()
+            await parked.wait()
+
+        monkeypatch.setattr(cli, "async_main", command)
+        protocol.connection_made(Transport())
+        if disconnect_phase == "flushing":
+            protocol.pause_writing()
+        request = protocol._request_task = asyncio.create_task(protocol._run_request({
+            "cwd": os.getcwd(), "argv": ["extract"],
+        }))
+        try:
+            await asyncio.wait_for(entered.wait(), 1)
+            # queued covers writes already scheduled on the loop; flushing
+            # covers a frame held by transport backpressure plus queued frames.
+            if disconnect_phase == "write_error":
+                await asyncio.wait_for(disconnected.wait(), 1)
+            else:
+                if disconnect_phase == "finishing":
+                    await asyncio.wait_for(finishing.wait(), 1)
+                protocol.connection_lost(None)
+                if disconnect_phase == "finishing":
+                    host._foreground_state_lock.release()
+            streams[0].write("late loop output\n")
+            await asyncio.to_thread(streams[0].write, "late worker output\n")
+            result = await asyncio.wait_for(asyncio.gather(request, return_exceptions=True), 1)
+            if disconnect_phase == "finishing":
+                assert result[0] is None
+            else:
+                assert isinstance(result[0], asyncio.CancelledError)
+            await asyncio.gather(protocol._output_task, return_exceptions=True)
+            await asyncio.sleep(0)
+            await asyncio.wait_for(protocol.flush_output(), 1)
+            assert protocol.output_queue.empty()
+            assert host._foreground_requests == 0
+            assert not host._foreground_gate_requested
+            assert closed == [True]
+            assert completed == ([True] if disconnect_phase == "finishing" else [])
+            # The shared host must still admit and release the next request.
+            await host.foreground_started()
+            await host.foreground_finished()
+            assert host._foreground_requests == 0
+            assert not host._foreground_gate_requested
+        finally:
+            if host._foreground_state_lock.locked():
+                host._foreground_state_lock.release()
+            request.cancel()
+            protocol._output_task.cancel()
+            await asyncio.gather(request, protocol._output_task, return_exceptions=True)
+            set_runtime_host(None)
+
+    asyncio.run(scenario())
 
 
 def test_protocol_rejects_a_different_runtime_build_id():
