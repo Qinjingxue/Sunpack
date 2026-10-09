@@ -1,6 +1,6 @@
 import json
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from pathlib import Path
 from threading import Event
 from types import SimpleNamespace
@@ -236,6 +236,51 @@ def test_hard_limit_never_runs_snapshot_on_mutation_thread(tmp_path, monkeypatch
     assert checkpoint_thread_ids
     assert all(thread_id != caller_thread_id for thread_id in checkpoint_thread_ids)
     assert WatchStateStore(str(state.path)).pending_work_items()
+
+
+@pytest.mark.parametrize("reload_during_checkpoint", [False, True])
+def test_state_handoff_preserves_newer_checkpoint(tmp_path, monkeypatch, reload_during_checkpoint):
+    state_path = tmp_path / "state.json"
+    first = _candidate(tmp_path / "first.7z", 1)
+    second = _candidate(tmp_path / "second.7z", 2)
+    old = WatchStateStore(str(state_path))
+    old.queue_active(first, durable=True)
+    successor = None if reload_during_checkpoint else WatchStateStore(str(state_path))
+    entered, release, handoff = Event(), Event(), Event()
+    real_write = old._write_snapshot_view
+
+    def paused_snapshot(view):
+        entered.set()
+        assert release.wait(5)
+        real_write(view)
+
+    def replace_store():
+        handoff.set()
+        current = successor or WatchStateStore(str(state_path))
+        current.queue_active(second, durable=True)
+        current.save()
+        return current.applied_seq
+
+    monkeypatch.setattr(old, "_write_snapshot_view", paused_snapshot)
+    old.compact_if_needed(force=True)
+    assert entered.wait(2)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        replacement = executor.submit(replace_store)
+        try:
+            assert handoff.wait(2)
+            # Handoff must not finish while the prior publisher still owns
+            # the snapshot and the journal segments it is about to retire.
+            with pytest.raises(FutureTimeoutError):
+                replacement.result(timeout=0.05)
+        finally:
+            release.set()
+            with old._checkpoint_condition:
+                assert old._checkpoint_condition.wait_for(lambda: not old._checkpoint_running, timeout=2)
+        latest_seq = replacement.result(timeout=2)
+
+    recovered = WatchStateStore(str(state_path))
+    assert recovered.applied_seq == latest_seq
+    assert {item.path for item in recovered.pending_work_items()} == {first.path, second.path}
 
 
 

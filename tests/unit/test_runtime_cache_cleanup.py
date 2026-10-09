@@ -310,6 +310,82 @@ def test_foreground_lifecycle_clears_runtime_caches_after_idle(tmp_path):
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("replace_scheduler", [False, True])
+def test_disconnect_during_foreground_admission_restores_idle_cleanup(tmp_path, replace_scheduler):
+    from sunpack.runtime.cli.persistent_process import _PipeRequestProtocol
+    from sunpack.runtime.cli.runtime_state import set_runtime_host
+
+    async def scenario():
+        engine = _BlockingCleanupEngine()
+        config = make_config({"watch": {"clipboard_monitor_enabled": False}})
+
+        def scheduler(name):
+            return WatchScheduler(
+                config, [str(tmp_path)], out_dir=str(tmp_path / "out"),
+                state_path=str(tmp_path / name), initial_scan=False, pipeline_engine=engine,
+            )
+
+        watcher = scheduler("state.json")
+        host = RuntimeHost()
+        host._watch_service = SimpleNamespace(scheduler=watcher)
+        host._watch_task = SimpleNamespace(done=lambda: False)
+        set_runtime_host(host)
+        watcher._cache_cleanup_deadline = 0
+        cleanup = asyncio.create_task(watcher._maybe_clear_idle_caches())
+        await engine.cleanup_started.wait()
+        protocol = _PipeRequestProtocol(
+            b"t" * 32, on_connected=lambda: None, on_closed=lambda: None,
+            on_completed=lambda: None, on_shutdown=lambda: None,
+        )
+
+        class Transport:
+            def write(self, _frame):
+                pass
+
+            def get_write_buffer_size(self):
+                return 0
+
+            def close(self):
+                pass
+
+        protocol.connection_made(Transport())
+        request = protocol._request_task = asyncio.create_task(protocol._run_request({"argv": ["extract"]}))
+        current = watcher
+        try:
+            await asyncio.sleep(0)
+            assert watcher._external_activity_gate_acquiring
+            if replace_scheduler:
+                current = scheduler("replacement.json")
+                host._watch_service.scheduler = current
+                # WatchService hands an outstanding host gate to its successor.
+                await current.set_external_activity(host._foreground_gate_requested)
+            protocol.connection_lost(None)
+            result = await asyncio.wait_for(asyncio.gather(request, return_exceptions=True), 1)
+            assert isinstance(result[0], asyncio.CancelledError)
+            engine.release_cleanup.set()
+            await cleanup
+            assert host._foreground_requests == 0
+            assert not host._foreground_gate_requested
+            for item in {watcher, current}:
+                assert not item._external_activity_requested
+                assert not item._runtime_cache_gate.locked()
+            current._cache_cleanup_deadline = 0
+            await current._maybe_clear_idle_caches()
+            assert engine.clear_calls == 2
+            # A following request can still acquire and release the same gate.
+            await host.foreground_started()
+            await host.foreground_finished()
+            assert not current._runtime_cache_gate.locked()
+        finally:
+            engine.release_cleanup.set()
+            request.cancel()
+            protocol._output_task.cancel()
+            await asyncio.gather(request, protocol._output_task, cleanup, return_exceptions=True)
+            set_runtime_host(None)
+
+    asyncio.run(scenario())
+
+
 def test_external_activity_release_during_pending_acquire_leaves_gate_free(tmp_path):
     async def scenario():
         engine = _BlockingCleanupEngine()

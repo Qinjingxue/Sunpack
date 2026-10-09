@@ -6,6 +6,7 @@ import os
 import stat
 import threading
 import time
+import weakref
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -33,8 +34,16 @@ class WatchStateJournalError(RuntimeError):
     """The durable Watch state sequence is corrupt or discontinuous."""
 
 
-_STATE_PATH_LOCKS_GUARD = threading.Lock()
-_STATE_PATH_LOCKS: dict[str, threading.RLock] = {}
+class _StatePathCoordinator:
+    def __init__(self) -> None:
+        self.state_lock = threading.RLock()
+        # Snapshot publication, WAL retirement and reload form one lifecycle.
+        # Keep it separate so ordinary state mutations can continue during I/O.
+        self.checkpoint_lock = threading.Lock()
+
+
+_STATE_PATH_COORDINATORS_GUARD = threading.Lock()
+_STATE_PATH_COORDINATORS: weakref.WeakValueDictionary[str, _StatePathCoordinator] = weakref.WeakValueDictionary()
 _SEQUENCE_GUARD = threading.Lock()
 _SEQUENCE_NEXT: dict[str, int] = {}
 _SEQUENCE_SEGMENT_START: dict[str, int] = {}
@@ -44,14 +53,14 @@ def _state_path_key(path: Path) -> str:
     return os.path.normcase(os.path.abspath(str(path)))
 
 
-def _state_path_lock(path: Path) -> threading.RLock:
+def _state_path_coordinator(path: Path) -> _StatePathCoordinator:
     key = _state_path_key(path)
-    with _STATE_PATH_LOCKS_GUARD:
-        lock = _STATE_PATH_LOCKS.get(key)
-        if lock is None:
-            lock = threading.RLock()
-            _STATE_PATH_LOCKS[key] = lock
-        return lock
+    with _STATE_PATH_COORDINATORS_GUARD:
+        coordinator = _STATE_PATH_COORDINATORS.get(key)
+        if coordinator is None:
+            coordinator = _StatePathCoordinator()
+            _STATE_PATH_COORDINATORS[key] = coordinator
+        return coordinator
 
 
 def _seed_sequence(path: Path, last_seq: int) -> int:
@@ -174,7 +183,8 @@ class WatchStateStore:
         hard_compact_bytes: int = DEFAULT_JOURNAL_HARD_BYTES,
     ):
         self.path = Path(path)
-        self._state_lock = _state_path_lock(self.path)
+        self._path_coordinator = _state_path_coordinator(self.path)
+        self._state_lock = self._path_coordinator.state_lock
         self._checkpoint_condition = threading.Condition(self._state_lock)
         self._compact_records = max(1, int(compact_records))
         self._compact_bytes = max(1, int(compact_bytes))
@@ -269,7 +279,9 @@ class WatchStateStore:
         return value if value >= 1 else None
 
     def load(self) -> None:
-        with self._state_lock:
+        # A reader must see either the old snapshot plus its WAL, or the new
+        # snapshot after retirement; never mix the two publication generations.
+        with self._path_coordinator.checkpoint_lock, self._state_lock:
             self._reset_memory_locked()
             if self.path.exists():
                 try:
@@ -450,6 +462,12 @@ class WatchStateStore:
         ).start()
 
     def _checkpoint_loop(self) -> None:
+        # Acquire before capturing the view so an older store cannot publish
+        # after a newer one. The existing prefix check rejects stale stores.
+        with self._path_coordinator.checkpoint_lock:
+            self._checkpoint_under_gate()
+
+    def _checkpoint_under_gate(self) -> None:
         while True:
             seal_ticket: JournalTicket | None = None
             with self._state_lock:

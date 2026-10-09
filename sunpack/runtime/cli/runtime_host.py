@@ -255,7 +255,21 @@ class RuntimeHost:
                 service = self._watch_service
                 scheduler = service.scheduler if service is not None else None
                 if scheduler is not None:
-                    await scheduler.set_external_activity(True)
+                    try:
+                        await scheduler.set_external_activity(True)
+                    except BaseException:
+                        # Admission has not incremented the count yet, so the
+                        # protocol cannot release it. Roll back both the gate
+                        # we awaited and a replacement that inherited it.
+                        self._foreground_gate_requested = False
+                        try:
+                            await scheduler.set_external_activity(False)
+                        finally:
+                            service = self._watch_service
+                            current = service.scheduler if service is not None else None
+                            if current is not None and current is not scheduler:
+                                await current.set_external_activity(False)
+                        raise
             self._foreground_requests += 1
         self.log_event("foreground_started", foreground_requests=self._foreground_requests)
 
