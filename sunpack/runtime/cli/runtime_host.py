@@ -119,6 +119,14 @@ class RuntimeHost:
             self._watch_task = task
             self._watch_generation += 1
             generation = self._watch_generation
+            # The host owns this task even if its initiating CLI disconnects
+            # before readiness. Monitor completion from the moment it exists.
+            task.add_done_callback(
+                lambda completed: asyncio.create_task(
+                    self._watch_done(completed, generation),
+                    name="sunpack-runtime-watch-finished",
+                )
+            )
             self.log_event(
                 "watch_starting",
                 initial_scan=bool(initial_scan),
@@ -128,21 +136,17 @@ class RuntimeHost:
             self._notify_state_changed()
         try:
             await service.wait_ready()
-        except BaseException as exc:
+        except Exception as exc:
             self._last_watch_error = str(exc)
-            await asyncio.gather(task, return_exceptions=True)
+            # A disconnect during failed-start cleanup must not cancel the
+            # host-owned service task either.
+            await asyncio.shield(asyncio.gather(task, return_exceptions=True))
             async with self._lock:
                 if self._watch_task is task:
                     self._watch_service = None
                     self._watch_task = None
             self._notify_state_changed()
             raise
-        task.add_done_callback(
-            lambda completed: asyncio.create_task(
-                self._watch_done(completed, generation),
-                name="sunpack-runtime-watch-finished",
-            )
-        )
         self.log_event("watch_started")
         return {"started": True, "running": True, "generation": generation}
 

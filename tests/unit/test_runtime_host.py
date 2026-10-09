@@ -4,9 +4,131 @@ import asyncio
 import os
 from types import SimpleNamespace
 
+import pytest
+
 from sunpack.pipeline.coordinator.archive_registry import ActiveArchiveRegistry
 from sunpack.runtime.cli.runtime_host import RuntimeHost
 from tests.helpers.config_factory import make_config
+
+
+@pytest.mark.parametrize("startup_outcome", ["running", "failed", "failed_cleanup"])
+def test_watch_start_disconnect_releases_request_and_keeps_host_ownership(tmp_path, monkeypatch, startup_outcome):
+    import sunpack.runtime.cli.persistent_process as protocol_module
+    import sunpack.runtime.cli.runtime_host as host_module
+    import sunpack.runtime.watch.service as service_module
+    from sunpack.runtime.cli.runtime_state import set_runtime_host
+    from sunpack.runtime.watch.scheduler import WatchScheduler
+    from tests.helpers.fake_pipeline_engine import FakePipelineEngine
+
+    config = make_config({"watch": {
+        "state_dir": str(tmp_path / "state"), "tray_enabled": False,
+        "toast_enabled": False, "clipboard_monitor_enabled": False,
+    }})
+    engine = FakePipelineEngine(lambda _config: None)
+    monkeypatch.setattr(host_module, "load_config", lambda: config)
+    monkeypatch.setattr(service_module, "load_config", lambda: config)
+    monkeypatch.setattr(service_module, "_read_watch_root_entries", lambda *_args, **_kwargs: [
+        service_module.WatchRootEntry(str(tmp_path), str(tmp_path / "out")),
+    ])
+    monkeypatch.setattr(service_module, "_acquire_watch_broker", lambda: None)
+    monkeypatch.setattr(service_module, "_release_watch_broker", lambda: None)
+    monkeypatch.setattr(service_module.WatchService, "_start_config_observer", lambda self: None)
+
+    async def shared_engine(_config):
+        return engine
+
+    monkeypatch.setattr(host_module, "shared_pipeline_engine", shared_engine)
+
+    async def scenario():
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        cleanup_entered = asyncio.Event()
+        release_cleanup = asyncio.Event()
+
+        async def initialize(self):
+            entered.set()
+            await release.wait()
+            if startup_outcome != "running":
+                raise RuntimeError("initialization failed after disconnect")
+
+        monkeypatch.setattr(WatchScheduler, "start", initialize)
+        original_stop = service_module.WatchService._stop_scheduler
+
+        async def stop_scheduler(self):
+            if startup_outcome == "failed_cleanup" and self._startup_error is not None:
+                cleanup_entered.set()
+                await release_cleanup.wait()
+            await original_stop(self)
+
+        monkeypatch.setattr(service_module.WatchService, "_stop_scheduler", stop_scheduler)
+        host = RuntimeHost()
+        set_runtime_host(host)
+
+        async def execute(_payload, _protocol):
+            await host.start_watch(tray_enabled=False, initial_scan=True)
+            return 0
+
+        monkeypatch.setattr(protocol_module, "_execute_streaming_request_async", execute)
+        protocol = protocol_module._PipeRequestProtocol(
+            b"t" * 32, on_connected=lambda: None, on_closed=lambda: None,
+            on_completed=lambda: None, on_shutdown=lambda: None,
+        )
+
+        class Transport:
+            def write(self, _frame):
+                pass
+
+            def get_write_buffer_size(self):
+                return 0
+
+            def close(self):
+                pass
+
+        protocol.connection_made(Transport())
+        request = protocol._request_task = asyncio.create_task(protocol._run_request({"argv": ["watch", "start"]}))
+        watch_task = None
+        try:
+            await asyncio.wait_for(entered.wait(), 1)
+            service, watch_task = host._watch_service, host._watch_task
+            if startup_outcome == "failed_cleanup":
+                release.set()
+                await asyncio.wait_for(cleanup_entered.wait(), 1)
+            protocol.connection_lost(None)
+            # The request must finish independently of service startup/cleanup.
+            result = await asyncio.wait_for(asyncio.gather(request, return_exceptions=True), 1)
+            assert isinstance(result[0], asyncio.CancelledError)
+            assert host._foreground_requests == 0
+            assert not host._foreground_gate_requested
+            assert host.watch_enabled and not watch_task.done()
+
+            release.set()
+            release_cleanup.set()
+            if startup_outcome != "running":
+                await asyncio.gather(watch_task, return_exceptions=True)
+                # Let the existing completion callback release host ownership.
+                await asyncio.sleep(0)
+                assert not host.watch_enabled
+                assert host._watch_service is None and host._watch_task is None
+                assert "initialization failed after disconnect" in host.watch_status()["last_error"]
+            else:
+                await asyncio.wait_for(service.wait_ready(), 1)
+                scheduler = service.scheduler
+                assert host.watch_enabled
+                assert not scheduler._external_activity_requested
+                assert not scheduler._runtime_cache_gate.locked()
+                assert (await host.start_watch(tray_enabled=False))["started"] is False
+                await host.stop_watch()
+                assert host._watch_service is None and host._watch_task is None
+        finally:
+            release.set()
+            release_cleanup.set()
+            if host._watch_service is not None:
+                host._watch_service.request_stop()
+            request.cancel()
+            await asyncio.gather(request, protocol._output_task, *([watch_task] if watch_task else []), return_exceptions=True)
+            set_runtime_host(None)
+
+    asyncio.run(scenario())
 
 
 def test_archive_registry_detects_watch_owner_by_file_identity(tmp_path):
