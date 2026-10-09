@@ -44,10 +44,10 @@ class _StatePathCoordinator:
         self.next_sequence = 1
         self.segment_start: int | None = None
 
-    def seed(self, last_seq: int) -> int:
+    def seed(self, last_seq: int, *, resume_segment: int | None = None) -> int:
         self.next_sequence = max(self.next_sequence, int(last_seq) + 1)
         if self.segment_start is None:
-            self.segment_start = int(last_seq) + 1
+            self.segment_start = resume_segment if resume_segment is not None else int(last_seq) + 1
         return self.segment_start
 
     def reserve(self, floor: int) -> tuple[int, int]:
@@ -297,12 +297,15 @@ class WatchStateStore:
                 self._checkpoint_seq = int(checkpoint_seq)
                 self._applied_seq = self._checkpoint_seq
 
-            self._load_journal_segments_locked()
-            self._active_segment_start = self._path_coordinator.seed(self._applied_seq)
+            resume_segment = self._load_journal_segments_locked()
+            self._active_segment_start = self._path_coordinator.seed(
+                self._applied_seq, resume_segment=resume_segment,
+            )
             self._update_compaction_due_locked()
 
-    def _load_journal_segments_locked(self) -> None:
+    def _load_journal_segments_locked(self) -> int | None:
         expected_seq = self._checkpoint_seq + 1
+        last_segment: tuple[Path, int, bool] | None = None
         for path in self._journal_paths():
             segment_start = self._segment_start_from_path(path)
             if segment_start is None:
@@ -317,6 +320,7 @@ class WatchStateStore:
                 continue
             except ValueError as exc:
                 raise WatchStateJournalError(str(exc)) from exc
+            last_segment = (path, segment_start, bool(replay.records))
             if replay.records:
                 self._applied_seq = int(replay.applied_seq)
                 expected_seq = int(replay.expected_seq)
@@ -324,6 +328,41 @@ class WatchStateStore:
                 self._segment_bytes[segment_start] = int(replay.bytes)
                 self._journal_records += int(replay.records)
                 self._journal_bytes += int(replay.bytes)
+
+        # A live store has already chosen the active segment for this path.
+        # On a fresh open, keep appending to the last recovered segment rather
+        # than creating one WAL file per watch restart.
+        if self._path_coordinator.segment_start is not None or last_segment is None:
+            return None
+        path, start, has_records = last_segment
+        if not has_records and start != self._applied_seq + 1:
+            return None  # An obsolete segment fully covered by the snapshot.
+        self._truncate_incomplete_journal_tail(path)
+        return start
+
+    @staticmethod
+    def _truncate_incomplete_journal_tail(path: Path) -> None:
+        """Discard only a torn final WAL record before appending to its segment."""
+        with open_service_file(path, "rb+") as handle:
+            handle.seek(0, os.SEEK_END)
+            end = handle.tell()
+            if not end:
+                return
+            handle.seek(end - 1)
+            if handle.read(1) == b"\n":
+                return
+            cursor = end
+            valid_end = 0
+            while cursor:
+                start = max(0, cursor - 8192)
+                handle.seek(start)
+                newline = handle.read(cursor - start).rfind(b"\n")
+                if newline >= 0:
+                    valid_end = start + newline + 1
+                    break
+                cursor = start
+            handle.truncate(valid_end)
+            os.fsync(handle.fileno())
 
     def save(self) -> None:
         """Force one checkpoint and wait until it covers the current sequence."""

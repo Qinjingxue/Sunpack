@@ -114,6 +114,70 @@ def test_truncated_segment_tail_is_ignored_and_recovered(tmp_path):
     assert recovered.applied_seq == 1
 
 
+def test_repeated_store_reopen_reuses_one_wal_segment(tmp_path):
+    state_path = tmp_path / "state.json"
+    segments = set()
+    for index in range(16):
+        store = WatchStateStore(str(state_path))
+        store.queue_active(_candidate(tmp_path / f"queued-{index}.7z", index + 1), durable=True)
+        segments.add(store.journal_path)
+        store.close()
+
+    assert len(segments) == 1
+    assert len(list(tmp_path.glob("state.journal.*.jsonl"))) == 1
+    recovered = WatchStateStore(str(state_path))
+    assert recovered.applied_seq == 16
+    assert recovered.pending_work_count == 16
+    recovered.close()
+
+
+def test_checkpoint_rotation_still_starts_a_new_wal_segment(tmp_path):
+    state_path = tmp_path / "state.json"
+    first = WatchStateStore(str(state_path))
+    first.queue_active(_candidate(tmp_path / "first.7z"), durable=True)
+    original_segment = first.journal_path
+    first.save()
+    first.close()
+
+    second = WatchStateStore(str(state_path))
+    assert second.journal_path != original_segment
+    second.queue_active(_candidate(tmp_path / "second.7z", 2), durable=True)
+    rotated_segment = second.journal_path
+    second.close()
+
+    reopened = WatchStateStore(str(state_path))
+    assert reopened.journal_path == rotated_segment
+    assert reopened.applied_seq == 2
+    reopened.close()
+
+
+@pytest.mark.parametrize("has_valid_record", [False, True])
+def test_reopen_repairs_torn_tail_before_appending(tmp_path, has_valid_record):
+    state_path = tmp_path / "state.json"
+    first = WatchStateStore(str(state_path))
+    if has_valid_record:
+        first.queue_active(_candidate(tmp_path / "first.7z"), durable=True)
+    segment = first.journal_path
+    first.close()
+    with open(segment, "ab") as handle:
+        handle.write(b'{"seq":999,"operations":[')
+
+    reopened = WatchStateStore(str(state_path))
+    assert reopened.journal_path == segment
+    reopened.queue_active(_candidate(tmp_path / "second.7z", 2), durable=True)
+    reopened.close()
+
+    assert b'{"seq":999' not in segment.read_bytes()
+    assert len(list(tmp_path.glob("state.journal.*.jsonl"))) == 1
+    recovered = WatchStateStore(str(state_path))
+    assert recovered.applied_seq == (2 if has_valid_record else 1)
+    assert {item.path for item in recovered.pending_work_items()} == {
+        str((tmp_path / name).resolve())
+        for name in (("first.7z", "second.7z") if has_valid_record else ("second.7z",))
+    }
+    recovered.close()
+
+
 def test_corrupt_complete_journal_record_is_reported(tmp_path):
     state = WatchStateStore(str(tmp_path / "state.json"))
     state.queue_active(_candidate(tmp_path / "queued.7z"), durable=True)
