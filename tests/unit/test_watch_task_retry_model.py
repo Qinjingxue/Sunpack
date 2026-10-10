@@ -414,7 +414,7 @@ def test_missing_file_exception_is_suppressed_only_for_departed_input(tmp_path, 
             archive.unlink()
 
         async def failed():
-            raise FileNotFoundError("input consumed")
+            raise FileNotFoundError(2, "input consumed", str(archive))
 
         request = _ActivePipelineRequest(notification_id="request", candidate=candidate,
             task=asyncio.create_task(failed()), password_generation=watcher.state.password_generation,

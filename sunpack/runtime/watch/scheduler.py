@@ -128,6 +128,7 @@ class _ActivePipelineRequest:
     registry_owner: str = ""
     source_input_root: str = ""
     deep_detect: bool = False
+    source_paths: tuple[str, ...] = ()
 
 
 class WatchScheduler:
@@ -808,6 +809,7 @@ class WatchScheduler:
             # PipelineEngine.run() is done here, so its path lease and any
             # source cleanup promotion have already ended. Hand off only paths
             # that actually changed while this request owned them.
+            request.source_paths = ()
             self._release_pipeline_source_claims(request.notification_id)
             if request.registry_owner:
                 from sunpack.runtime.cli.runtime_state import runtime_host
@@ -1749,6 +1751,7 @@ class WatchScheduler:
                     notification_id,
                     archive_task,
                     event,
+                    request=request,
                 ),
                 request_config=run_config,
                 origin="watch",
@@ -1760,7 +1763,9 @@ class WatchScheduler:
             raise
         self._reset_idle_cache_cleanup()
         task.add_done_callback(lambda _task: self._wake_service())
-        return _ActivePipelineRequest(
+        # No await separates task creation and this assignment; the callback
+        # receives the request before the pipeline gets its first loop turn.
+        request = _ActivePipelineRequest(
             notification_id=notification_id,
             candidate=candidate,
             task=task,
@@ -1769,6 +1774,7 @@ class WatchScheduler:
             source_input_root=source_input_root,
             deep_detect=options.force_scan,
         )
+        return request
 
     def _handle_pipeline_progress(
         self,
@@ -1776,10 +1782,16 @@ class WatchScheduler:
         notification_id: str,
         archive_task,
         event: dict,
+        *,
+        request: _ActivePipelineRequest | None = None,
     ) -> None:
         name = str(event.get("event") or "")
         if name == "task_sources_claimed":
             source_paths = event.get("source_paths") or getattr(archive_task, "cleanup_parts", ()) or ()
+            if request is not None and event.get("depth") == 1:
+                # Reuse the published tuple. Keep this request's input evidence
+                # even if live source claims transfer to a newer family owner.
+                request.source_paths = tuple(source_paths)
             self._claim_pipeline_sources(notification_id, source_paths)
             return
         if name == "task_output_started":
@@ -1805,12 +1817,20 @@ class WatchScheduler:
         candidate = request.candidate
         try:
             response = await request.task
-        except FileNotFoundError:
-            if os.path.exists(candidate.path):
+        except FileNotFoundError as exc:
+            missing_path = os.path.abspath(os.fsdecode(exc.filename)) if exc.filename else ""
+            if (
+                not missing_path
+                or not any(
+                    path_key(path) == path_key(missing_path)
+                    for path in (candidate.path, *request.source_paths)
+                )
+                or os.path.exists(missing_path)
+            ):
                 raise
-            # The input departed during an older request (for example after
-            # successful full-family cleanup). It has no remaining retry work.
-            self._retire_claimed_paths([candidate.path], candidate)
+            # A submitted sibling can survive while the actual input is renamed.
+            # Retire only that stale input, preserving newly queued generations.
+            self._retire_claimed_paths([missing_path], candidate)
             self._notify("suppressed", request.notification_id)
             return WatchRunResult(processed=1)
         summary = response.summary

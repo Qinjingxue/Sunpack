@@ -1308,6 +1308,7 @@ class _RequestRuntime:
                     "type": "semantic",
                     "event": "task_sources_claimed",
                     "source_paths": claimed_sources,
+                    "depth": depth,
                 },
             )
 

@@ -111,8 +111,8 @@ async def watch_scenario(root, mode):
             started = set()
             progress_lock = threading.Lock()
 
-            def progress(owner, notification, task, event):
-                original(owner, notification, task, event)
+            def progress(owner, notification, task, event, **kwargs):
+                original(owner, notification, task, event, **kwargs)
                 if mode == "concurrent" and event.get("event") == "task_output_started":
                     with progress_lock:
                         started.add(owner)

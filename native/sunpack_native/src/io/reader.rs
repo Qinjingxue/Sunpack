@@ -636,7 +636,19 @@ impl NativeArchiveSession {
 impl NativeArchiveSession {
     #[new]
     fn new(py: Python<'_>, path: String) -> PyResult<Self> {
-        let reader = py.detach(|| ManagedReader::open(&path))?;
+        let reader = py.detach(|| ManagedReader::open(&path)).map_err(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                // Watch must identify the vanished physical member, which can
+                // differ from the candidate that triggered a volume request.
+                pyo3::exceptions::PyFileNotFoundError::new_err((
+                    error.raw_os_error().unwrap_or(2),
+                    error.to_string(),
+                    path.clone(),
+                ))
+            } else {
+                error.into()
+            }
+        })?;
         Ok(Self {
             path,
             reader,

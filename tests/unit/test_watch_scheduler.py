@@ -736,6 +736,64 @@ def _write_zip(path: Path):
         archive.writestr("inside.txt", "ok")
 
 
+@pytest.mark.parametrize("case", ["renamed", "transferred", "recreated", "output", "nested", "unknown"])
+def test_watch_missing_input_completion_uses_request_sources(tmp_path, case):
+    """Retire stale physical input, while preserving replacement and real IO errors."""
+    seed = tmp_path / "family.payload.002"
+    head = tmp_path / "family.payload.001.downloading"
+    seed.write_bytes(b"sibling")
+    head.write_bytes(b"head")
+    watcher = _watcher(tmp_path)
+    retired = []
+    notices = []
+    watcher._retire_claimed_paths = lambda paths, candidate: retired.extend(paths)
+    watcher._notify = lambda *args: notices.append(args)
+    sources = (str(head), str(seed))
+
+    async def scenario():
+        failure_path = str(head)
+        if case in {"output", "nested"}:
+            failure_path = str(tmp_path / "out" / "missing" / "inner.7z")
+        error = (FileNotFoundError("missing unspecified path") if case == "unknown"
+                 else FileNotFoundError(2, "missing file", failure_path))
+
+        async def fail():
+            raise error
+
+        request = scheduler_module._ActivePipelineRequest(
+            "owner", WatchCandidate(str(seed), 7, 1), asyncio.create_task(fail()), 0,
+        )
+        watcher._handle_pipeline_progress(str(seed), "owner", SimpleNamespace(),
+                                         {"event": "task_sources_claimed", "depth": 1,
+                                          "source_paths": sources}, request=request)
+        if case == "nested":
+            watcher._handle_pipeline_progress(str(seed), "owner", SimpleNamespace(),
+                                             {"event": "task_sources_claimed", "depth": 2,
+                                              "source_paths": (failure_path,)}, request=request)
+        assert request.source_paths is sources
+        if case == "transferred":
+            watcher._claim_pipeline_sources("new-owner", sources)
+            assert "owner" not in watcher._claims_by_owner
+        head.rename(tmp_path / "family.payload.001")
+        if case == "recreated":
+            head.write_bytes(b"new-generation")
+            watcher.enqueue(str(head))
+        if case in {"renamed", "transferred"}:
+            result = await watcher._complete_candidate(request)
+            assert result.failed == result.succeeded == 0
+            assert retired == [str(head)]
+            assert notices == [("suppressed", "owner")]
+        else:
+            with pytest.raises(FileNotFoundError):
+                await watcher._complete_candidate(request)
+            assert not retired and not notices
+            if case == "recreated":
+                watcher._release_pipeline_source_claims("owner")
+                assert str(head) in watcher._pending
+
+    _await(scenario())
+
+
 def _nested_failure_summary(path: Path, failure: FailureInfo):
     return RunSummary(
         target_results=(
@@ -1006,6 +1064,7 @@ def test_cancelled_harvest_and_close_wait_for_completion_callbacks(tmp_path):
         task = asyncio.create_task(completed_pipeline())
         await task
         request = scheduler_module._ActivePipelineRequest("request", candidate, task, 0)
+        request.source_paths = (str(archive),)
         watcher._register_inflight_requests_locked([request])
         harvest = asyncio.create_task(watcher._harvest_completed_requests())
         await entered.wait()
@@ -1020,6 +1079,7 @@ def test_cancelled_harvest_and_close_wait_for_completion_callbacks(tmp_path):
             await harvest
         await closing
         assert not watcher._completion_batches
+        assert not request.source_paths
         assert not watcher._quiet_trackers
         assert not watcher._latest_observations
         assert not journal_stats(watcher.state._writer_stream)["registered"]
