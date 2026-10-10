@@ -26,7 +26,6 @@ const RAR_INITIAL_PREFIX_SCAN: usize = 16 * 1024;
 const MAX_RAR_PREFIX_SCAN: usize = 1024 * 1024;
 const RAR3_KDF_ITERATIONS: u32 = 0x40000;
 const RAR4_MIN_HEADER_SIZE: usize = 7;
-const RAR4_HP_DECRYPT_LIMIT: usize = 4096;
 const PARALLEL_PASSWORD_THRESHOLD: usize = 4;
 const RAR4_MAIN_HEADER_PASSWORD: u16 = 0x0080;
 const RAR4_FILE_PASSWORD: u16 = 0x0004;
@@ -360,7 +359,6 @@ enum RarPasswordMaterial {
     Header {
         salt: [u8; 8],
         encrypted: Vec<u8>,
-        main_header_present: bool,
     },
 }
 
@@ -379,18 +377,10 @@ impl RarPasswordContext {
             RarPasswordMaterial::Stored { encrypted, probe } => {
                 verify_rar4_stored_data(py, encrypted, candidates, probe)
             }
-            RarPasswordMaterial::Header {
-                salt,
-                encrypted,
-                main_header_present,
-            } => {
+            RarPasswordMaterial::Header { salt, encrypted } => {
                 let matched = py.detach(|| {
                     let matches = |password: &String| {
-                        if *main_header_present {
-                            decrypt_rar4_header(encrypted, password, salt).is_some()
-                        } else {
-                            rar3_hp_password_matches(password, salt, encrypted)
-                        }
+                        decrypt_rar4_header(encrypted, password, salt).is_some()
                     };
                     if candidates.len() >= PARALLEL_PASSWORD_THRESHOLD {
                         candidates.par_iter().position_first(matches)
@@ -404,7 +394,7 @@ impl RarPasswordContext {
                         "match",
                         index as i32,
                         (index + 1) as i32,
-                        "rar3/rar4 -hp encrypted header matched",
+                        "rar4 -hp encrypted header matched",
                         Some(true),
                         Some("rar4_hp_header_crc16"),
                     )
@@ -414,7 +404,7 @@ impl RarPasswordContext {
                         "no_match",
                         -1,
                         candidates.len() as i32,
-                        "rar3/rar4 -hp encrypted header did not match",
+                        "rar4 -hp encrypted header did not match",
                     )
                 }
             }
@@ -463,17 +453,14 @@ fn prepare_rar_data(data: &[u8]) -> Result<RarPasswordContext, PreparedStatus> {
 fn prepare_rar4(data: &[u8]) -> Result<RarPasswordMaterial, PreparedStatus> {
     let main = parse_rar4_block(data, RAR4_SIGNATURE.len())
         .filter(|block| block.header_type == 0x73)
-        .filter(|block| block.flags & RAR4_MAIN_HEADER_PASSWORD != 0);
-    let payload = &data[RAR4_SIGNATURE.len()..];
-    if main.is_none() && parse_rar4_plain_header(payload).is_some() {
-        // A readable header that is not a plain main header proves nothing
-        // about file encryption.
-        return Err(PreparedStatus::new(
-            "unknown_needs_final_verifier",
-            "rar3/rar4 layout without a plaintext main header is not supported by the fast verifier",
-        ));
-    }
-    let offset = main.map_or(RAR4_SIGNATURE.len(), |main| main.next_offset);
+        .filter(|block| block.flags & RAR4_MAIN_HEADER_PASSWORD != 0)
+        .ok_or_else(|| {
+            PreparedStatus::new(
+                "unknown_needs_final_verifier",
+                "rar4 encrypted headers require a CRC-valid plaintext main header",
+            )
+        })?;
+    let offset = main.next_offset;
     let salt_block = data.get(offset..offset.saturating_add(24)).ok_or_else(|| {
         ReadFault::short_read(
             "read_record",
@@ -486,15 +473,10 @@ fn prepare_rar4(data: &[u8]) -> Result<RarPasswordMaterial, PreparedStatus> {
     })?;
     let salt = salt_block[..8].try_into().unwrap();
     let encrypted = &data[offset + 8..];
-    let len = if main.is_some() {
-        encrypted.len() & !0x0f
-    } else {
-        encrypted.len().min(RAR4_HP_DECRYPT_LIMIT) & !0x0f
-    };
+    let len = encrypted.len() & !0x0f;
     Ok(RarPasswordMaterial::Header {
         salt,
         encrypted: encrypted[..len].to_vec(),
-        main_header_present: main.is_some(),
     })
 }
 
@@ -571,26 +553,19 @@ fn parse_rar4_block(data: &[u8], offset: usize) -> Option<Rar4Block> {
 ///
 /// In the normal RAR4 layout the Main Header remains plaintext and carries
 /// MHD_PASSWORD; the salt is immediately after that header and all following
-/// block headers are AES-CBC encrypted.  A few legacy inputs instead encrypt
-/// the first header directly after the signature, so retain that form as a
-/// fallback for the existing verifier path.
+/// block headers are AES-CBC encrypted.
 pub(crate) fn rar4_decrypt_header_flags(data: &[u8], password: &str) -> Option<u16> {
-    let main = parse_rar4_block(data, RAR4_SIGNATURE.len());
-    if let Some(main) = main.filter(|block| block.header_type == 0x73) {
-        if main.flags & RAR4_MAIN_HEADER_PASSWORD == 0 {
-            return None;
-        }
-        let encrypted_offset = main.next_offset.checked_add(8)?;
-        let encrypted = data.get(encrypted_offset..)?;
-        let first = decrypt_rar4_header(encrypted, password, &data[main.next_offset..])?;
-        return (0x72..=0x7b)
-            .contains(&first.header_type)
-            .then_some(main.flags);
+    let main =
+        parse_rar4_block(data, RAR4_SIGNATURE.len()).filter(|block| block.header_type == 0x73)?;
+    if main.flags & RAR4_MAIN_HEADER_PASSWORD == 0 {
+        return None;
     }
-
-    let payload = data.get(RAR4_SIGNATURE.len()..)?;
-    let first = decrypt_rar4_header(payload.get(8..)?, password, &payload[..])?;
-    (first.header_type == 0x73).then_some(first.flags)
+    let encrypted_offset = main.next_offset.checked_add(8)?;
+    let encrypted = data.get(encrypted_offset..)?;
+    let first = decrypt_rar4_header(encrypted, password, &data[main.next_offset..])?;
+    (0x72..=0x7b)
+        .contains(&first.header_type)
+        .then_some(main.flags)
 }
 
 fn decrypt_rar4_header(encrypted: &[u8], password: &str, salt_source: &[u8]) -> Option<Rar4Block> {
@@ -754,18 +729,6 @@ fn rar4_stored_password_matches(
     decrypted.len() >= unpacked_size && crc32(&decrypted[..unpacked_size]) == expected_crc
 }
 
-fn rar3_hp_password_matches(password: &str, salt: &[u8; 8], encrypted_prefix: &[u8]) -> bool {
-    let (key, iv) = derive_rar3_key_iv(password, Some(salt));
-    let mut plaintext = encrypted_prefix.to_vec();
-    let decrypted = match Aes128CbcDecryptor::new(&key.into(), &iv.into())
-        .decrypt_padded::<NoPadding>(&mut plaintext)
-    {
-        Ok(decrypted) => decrypted,
-        Err(_) => return false,
-    };
-    parse_rar4_plain_header(decrypted).is_some()
-}
-
 fn derive_rar3_key_iv(password: &str, salt: Option<&[u8; 8]>) -> ([u8; 16], [u8; 16]) {
     let mut password_bytes = Vec::with_capacity(password.len() * 2 + salt.map_or(0, |_| 8));
     for unit in password.encode_utf16() {
@@ -795,36 +758,6 @@ fn derive_rar3_key_iv(password: &str, salt: Option<&[u8; 8]>) -> ([u8; 16], [u8;
         key[src + 3] = digest[src];
     }
     (key, iv)
-}
-
-fn parse_rar4_plain_header(data: &[u8]) -> Option<Rar4Header> {
-    if data.len() < RAR4_MIN_HEADER_SIZE {
-        return None;
-    }
-    let stored_crc = u16::from_le_bytes([data[0], data[1]]);
-    let header_type = data[2];
-    if !(0x72..=0x7b).contains(&header_type) {
-        return None;
-    }
-    let header_size = u16::from_le_bytes([data[5], data[6]]) as usize;
-    if !(RAR4_MIN_HEADER_SIZE..=data.len()).contains(&header_size) {
-        return None;
-    }
-    let computed_crc = (crc32(&data[2..header_size]) & 0xffff) as u16;
-    if computed_crc != stored_crc {
-        return None;
-    }
-    Some(Rar4Header {
-        header_type,
-        header_size,
-    })
-}
-
-struct Rar4Header {
-    #[allow(dead_code)]
-    header_type: u8,
-    #[allow(dead_code)]
-    header_size: usize,
 }
 
 fn verify_rar5_material(

@@ -119,12 +119,6 @@ def _rar5_file_encryption_fixture(
     return prefix + _rar5_block(file_body)
 
 
-def _rar3_hp_encrypted_header_fixture() -> bytes:
-    salt = bytes.fromhex("45109af8ab5f297a")
-    encrypted_header = bytes.fromhex("adbf6c5385d7a40373e8f77d7b89d317")
-    return b"Rar!\x1a\x07\x00" + salt + encrypted_header
-
-
 def test_rar_fast_verifier_preserves_multiple_match_indices_from_native():
     outcome = RarFastVerifier._from_outcome({
         "status": "match",
@@ -139,25 +133,6 @@ def test_rar_fast_verifier_preserves_multiple_match_indices_from_native():
     assert outcome.matched_index == 0
     assert outcome.matched_indices == (0, 2)
     assert outcome.final_confirmation_required is True
-
-
-def test_rar_fast_verifier_matches_rar3_hp_encrypted_header(tmp_path):
-    archive = tmp_path / "sample.rar"
-    archive.write_bytes(_rar3_hp_encrypted_header_fixture())
-
-    outcome = RarFastVerifier().verify_batch(str(archive), ["wrong", "hashcat"])
-
-    assert outcome.ok is True
-    assert outcome.status == "match"
-    assert outcome.matched_index == 1
-    assert outcome.attempts == 2
-    assert outcome.final_confirmation_required is True
-    assert outcome.match_evidence == "rar4_hp_header_crc16"
-
-    rejected = RarFastVerifier().verify_batch(str(archive), ["wrong1", "wrong2"])
-    assert rejected.ok is False
-    assert rejected.status == "no_match"
-    assert rejected.attempts == 2
 
 
 def test_rar_fast_verifier_matches_rar5_file_password_check_without_payload(tmp_path):

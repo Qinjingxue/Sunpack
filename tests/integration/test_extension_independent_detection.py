@@ -4,6 +4,7 @@ from binascii import crc32
 import pytest
 
 from sunpack.pipeline.coordinator.task_provider import ArchiveTaskProvider
+from sunpack.core.passwords.verifier.rar_fast import RarFastVerifier
 from tests.helpers.detection_probe import detect_archive_hits, detection_pipeline_config
 from tests.helpers.real_archives import ArchiveFixtureFactory
 from tests.helpers.tool_config import get_optional_rar
@@ -74,3 +75,26 @@ def test_signature_bytes_without_valid_structure_are_not_accepted(tmp_path):
     fake.write_bytes(b"noise" * 100 + b"7z\xbc\xaf\x27\x1c" + b"not-a-seven-zip" * 100)
 
     assert detect_archive_hits(fake) == []
+
+
+def test_headerless_rar_fragment_is_not_confirmed_with_matching_password(tmp_path):
+    # This decryptable fragment used to report a password match despite having
+    # no CRC-valid plaintext main header and never becoming an extraction task.
+    fragment = b"Rar!\x1a\x07\x00" + bytes.fromhex(
+        "45109af8ab5f297aadbf6c5385d7a40373e8f77d7b89d317"
+    )
+    config = detection_pipeline_config()
+    config["user_passwords"] = ["hashcat"]
+    for name, data in (
+        ("fragment.rar", fragment),
+        ("fragment.bin", fragment),
+        ("carrier.bin", b"prefix" + fragment + b"tail"),
+    ):
+        path = tmp_path / name
+        path.write_bytes(data)
+        result = ArchiveTaskProvider(config).discover_targets([str(path)])
+        assert not result.resolved_tasks
+        if data == fragment:
+            outcome = RarFastVerifier().verify_batch(str(path), ["hashcat"])
+            assert outcome.status == "unknown_needs_final_verifier"
+            assert outcome.attempts == 0

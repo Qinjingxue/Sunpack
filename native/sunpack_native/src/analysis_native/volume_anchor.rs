@@ -517,26 +517,6 @@ fn probe_rar(prefix: &[u8], offset: usize, out: &mut VolumeAnchor, password: Opt
             out.anchor_roles.push("standalone");
             out.evidence.push("rar4:single_archive_header");
         }
-    } else if let Some(flags) =
-        password.and_then(|password| rar4_decrypt_header_flags(&prefix[offset..], password))
-    {
-        initialize_rar_anchor(out, offset);
-        out.encrypted = true;
-        out.evidence.push("rar4:decrypted_header");
-        out.multivolume = flags & 0x0001 != 0;
-        if out.multivolume {
-            out.anchor_roles.push(if flags & 0x0100 != 0 {
-                "first"
-            } else {
-                "member"
-            });
-            out.internal_volume_number = (flags & 0x0100 != 0).then_some(1);
-            out.evidence.push(rar4_volume_naming_evidence(flags));
-            out.needs_password = false;
-        } else {
-            out.standalone = true;
-            out.anchor_roles.push("standalone");
-        }
     } else {
         return false;
     }
