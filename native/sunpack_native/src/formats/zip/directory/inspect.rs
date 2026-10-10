@@ -14,7 +14,13 @@ pub(crate) fn inspect_zip_directory_consistency(
         result.set_item("error", "eocd_not_found")?;
         return Ok(result.unbind());
     };
-    let resolved = resolve_central_directory(&data, &eocd);
+    let resolved = match resolve_central_directory(&data, &eocd) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            result.set_item("error", error)?;
+            return Ok(result.unbind());
+        }
+    };
     let physical_cd_offset = resolved.physical_offset;
     let cd_end = resolved.end;
     let archive_offset = resolved.archive_offset;
@@ -570,7 +576,13 @@ pub(crate) fn inspect_zip_structure_graph(
         zip_graph_explanation(py, &explanations, "tail_truncation", false, "tail.trailing_bytes", 0, "tail bytes exist after EOCD")?;
     }
 
-    let resolved = resolve_central_directory(&data, &eocd);
+    let resolved = match resolve_central_directory(&data, &eocd) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            result.set_item("error", error)?;
+            return Ok(result.unbind());
+        }
+    };
     let physical_cd_offset = resolved.physical_offset;
     let cd_end = resolved.end;
     let archive_offset = resolved.archive_offset;

@@ -8,7 +8,7 @@
 
 #include "internal/sevenzip_callbacks.hpp"
 #include "internal/sevenzip_streams.hpp"
-#include "../7z2603-src/C/7zCrc.h"
+#include "../7z2604-src/C/7zCrc.h"
 
 #include <cstdio>
 #include <cstring>

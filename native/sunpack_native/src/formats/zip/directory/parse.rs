@@ -53,7 +53,7 @@ struct ResolvedCentralDirectory {
 /// EOCD.  When the naive `directory_end - cd_size` position does not carry a
 /// central-directory signature but the declared offset does, the declared
 /// offset wins (SFX/junk tolerance), mirroring inspect.rs.
-fn resolve_central_directory(data: &[u8], eocd: &EocdInfo) -> ResolvedCentralDirectory {
+fn resolve_central_directory(data: &[u8], eocd: &EocdInfo) -> Result<ResolvedCentralDirectory, &'static str> {
     let mut declared_offset = u64::from(eocd.cd_offset);
     let mut declared_size = u64::from(eocd.cd_size);
     let mut total_entries = u64::from(eocd.total_entries);
@@ -62,19 +62,20 @@ fn resolve_central_directory(data: &[u8], eocd: &EocdInfo) -> ResolvedCentralDir
     if eocd.offset >= 76 {
         let block_start = eocd.offset - 76;
         let block = &data[block_start..eocd.offset];
-        if &block[..4] == ZIP64_EOCD_SIG
-            && u64_le(block, 4) == 44
-            && &block[56..60] == ZIP64_LOCATOR_SIG
-        {
-            declared_offset = u64_le(block, 48);
-            declared_size = u64_le(block, 40);
-            total_entries = u64_le(block, 32);
-            disk_entries = u64_le(block, 24);
+        if let Some((record, _)) = zip64::parse_fixed_tail(block)? {
+            declared_offset = record.cd_offset;
+            declared_size = record.cd_size;
+            total_entries = record.total_entries;
+            disk_entries = record.disk_entries;
             directory_end = block_start as u64;
         }
     }
-    let naive = directory_end.saturating_sub(declared_size) as usize;
-    let declared = declared_offset as usize;
+    let naive = usize::try_from(directory_end.saturating_sub(declared_size))
+        .map_err(|_| "central_directory_size_out_of_range")?;
+    let declared = usize::try_from(declared_offset)
+        .map_err(|_| "central_directory_offset_out_of_range")?;
+    let declared_size = usize::try_from(declared_size)
+        .map_err(|_| "central_directory_size_out_of_range")?;
     let physical_offset = if !zip_has_signature_at(data, naive, CD_SIG)
         && zip_has_signature_at(data, declared, CD_SIG)
     {
@@ -82,17 +83,17 @@ fn resolve_central_directory(data: &[u8], eocd: &EocdInfo) -> ResolvedCentralDir
     } else {
         naive
     };
-    let end = physical_offset.saturating_add(declared_size as usize).min(data.len());
-    let archive_offset = physical_offset.saturating_sub(declared_offset as usize);
-    ResolvedCentralDirectory {
+    let end = physical_offset.saturating_add(declared_size).min(data.len());
+    let archive_offset = physical_offset.saturating_sub(declared);
+    Ok(ResolvedCentralDirectory {
         physical_offset,
         end,
         archive_offset,
         declared_offset: declared,
-        declared_size: declared_size as usize,
+        declared_size,
         total_entries,
         disk_entries,
-    }
+    })
 }
 
 struct CentralDirectoryRecord<'a> {

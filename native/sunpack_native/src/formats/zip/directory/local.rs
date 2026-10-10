@@ -65,21 +65,21 @@ fn find_zip64_eocd(data: &[u8], before: usize) -> Option<Zip64Eocd> {
     if pos + 56 > data.len() {
         return None;
     }
-    let record_size = u64_le(data, pos + 4);
+    let record = zip64::parse_record(&data[pos..]).ok()?;
     let end = pos
         .checked_add(12)?
-        .checked_add(usize::try_from(record_size).ok()?)?;
+        .checked_add(usize::try_from(record.record_size).ok()?)?;
     if end > data.len() || end < pos + 56 {
         return None;
     }
     Some(Zip64Eocd {
         offset: pos,
         end,
-        total_entries: u64_le(data, pos + 32),
-        cd_size: u64_le(data, pos + 40),
-        cd_offset: u64_le(data, pos + 48),
-        disk: u32_le(data, pos + 16),
-        cd_disk: u32_le(data, pos + 20),
+        total_entries: record.total_entries,
+        cd_size: record.cd_size,
+        cd_offset: record.cd_offset,
+        disk: record.disk,
+        cd_disk: record.cd_disk,
     })
 }
 
@@ -99,10 +99,11 @@ fn find_zip64_locator(data: &[u8], eocd_offset: usize) -> Option<Zip64Locator> {
     if pos + 20 > data.len() {
         return None;
     }
+    let locator = zip64::parse_locator(&data[pos..]).ok()?;
     Some(Zip64Locator {
         offset: pos,
         end: pos + 20,
-        zip64_eocd_offset: u64_le(data, pos + 8),
-        total_disks: u32_le(data, pos + 16),
+        zip64_eocd_offset: locator.record_offset,
+        total_disks: locator.total_disks,
     })
 }

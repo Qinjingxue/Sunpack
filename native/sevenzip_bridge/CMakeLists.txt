@@ -45,7 +45,7 @@ function(apply_source_charset target_name)
     endif()
 endfunction()
 
-set(SUP7Z_7Z_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/7z2603-src")
+set(SUP7Z_7Z_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/7z2604-src")
 
 # zlib-ng supplies Deflate decoding and IEEE CRC32. Keep the exact
 # benchmarked 2.3.3 sources in-tree so native builds remain deterministic and

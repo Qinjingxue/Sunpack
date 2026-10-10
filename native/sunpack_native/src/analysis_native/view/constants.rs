@@ -2,7 +2,6 @@ const ZIP_LOCAL: &[u8] = b"PK\x03\x04";
 const ZIP_CENTRAL: &[u8] = b"PK\x01\x02";
 const ZIP_EOCD: &[u8] = b"PK\x05\x06";
 const ZIP64_EOCD: &[u8] = b"PK\x06\x06";
-const ZIP64_LOCATOR: &[u8] = b"PK\x06\x07";
 const ZIP64_EOCD_RECORD_SIZE: usize = 56;
 const ZIP64_EOCD_LOCATOR_SIZE: usize = 20;
 const RAR4: &[u8] = b"Rar!\x1a\x07\x00";

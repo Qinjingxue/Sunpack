@@ -1,4 +1,5 @@
 mod filename_encoding;
+pub(crate) mod zip64;
 pub(crate) use filename_encoding::analyze_zip_filename_encoding;
 
 include!("constants.rs");

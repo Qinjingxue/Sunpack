@@ -9,15 +9,22 @@ and release-compliance guidance.
 
 ## 7-Zip source code
 
-SunPack vendors the 7-Zip 26.03 source tree at:
+SunPack vendors the 7-Zip 26.04 source tree at:
 
-`native/sevenzip_bridge/7z2603-src/`
+`native/sevenzip_bridge/7z2604-src/`
+
+This is SunPack's trimmed and modified source subset. The 26.04 update imports
+the ZIP64, XZ, vector and limited-stream runtime fixes, while preserving
+SunPack's codec and CPU-budget patches. Compiler-only annotations and changes
+outside the supported runtime paths are omitted. See
+[the synchronization record](docs/zh-CN/sevenzip_26_04_sync_review.md) for the
+upstream provenance and exact scope.
 
 That subtree is not covered by SunPack's MIT License. It remains under the
 upstream 7-Zip source license. The authoritative license file imported with the
 source is:
 
-`native/sevenzip_bridge/7z2603-src/DOC/License.txt`
+`native/sevenzip_bridge/7z2604-src/DOC/License.txt`
 
 A convenience copy is distributed at
 [licenses/7zip-source-license.txt](licenses/7zip-source-license.txt).
@@ -25,7 +32,7 @@ A convenience copy is distributed at
 7-Zip Copyright (C) 1999-2026 Igor Pavlov and other respective copyright
 holders.
 
-The upstream 7-Zip 26.03 source license identifies the following file-specific
+The upstream 7-Zip 26.04 source license identifies the following file-specific
 terms:
 
 - `CPP/7zip/Compress/Rar*`: GNU LGPL plus the unRAR license restriction.

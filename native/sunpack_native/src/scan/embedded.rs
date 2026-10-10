@@ -780,7 +780,11 @@ fn validate_zip_eocd(
         || classic_cd_offset == u32::MAX as u64
         || classic_entries_on_disk == u16::MAX as u64
         || classic_entries_total == u16::MAX as u64;
-    let zip64 = parse_zip64_end_records(file, eocd_offset)?;
+    let zip64 = match parse_zip64_end_records(file, eocd_offset) {
+        Ok(records) => records,
+        Err(error) if error.kind() == io::ErrorKind::InvalidData => return Ok(None),
+        Err(error) => return Err(error),
+    };
     if needs_zip64 && zip64.is_none() {
         return Ok(None);
     }
@@ -876,8 +880,10 @@ fn parse_zip64_end_records(
         return Ok(None);
     }
     let locator_disk = u32::from_le_bytes(locator[4..8].try_into().unwrap());
-    let recorded_record_offset = u64::from_le_bytes(locator[8..16].try_into().unwrap());
-    let disk_count = u32::from_le_bytes(locator[16..20].try_into().unwrap());
+    let locator_fields = crate::formats::zip::zip64::parse_locator(&locator)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let recorded_record_offset = locator_fields.record_offset;
+    let disk_count = locator_fields.total_disks;
     if locator_disk != 0 || disk_count != 1 || eocd_offset < 32 {
         return Ok(None);
     }
@@ -899,19 +905,20 @@ fn parse_zip64_end_records(
     if fixed.len() != 56 || &fixed[..4] != b"PK\x06\x06" {
         return Ok(None);
     }
-    let record_size = u64::from_le_bytes(fixed[4..12].try_into().unwrap());
-    if record_size < 44 || record_offset.checked_add(12 + record_size) != Some(eocd_offset - 20) {
+    let record = crate::formats::zip::zip64::parse_record(&fixed)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    if record_offset.checked_add(12 + record.record_size) != Some(eocd_offset - 20) {
         return Ok(None);
     }
     Ok(Some(Zip64EndRecords {
         record_offset,
         recorded_record_offset,
-        disk: u32::from_le_bytes(fixed[16..20].try_into().unwrap()),
-        cd_disk: u32::from_le_bytes(fixed[20..24].try_into().unwrap()),
-        entries_on_disk: u64::from_le_bytes(fixed[24..32].try_into().unwrap()),
-        entries_total: u64::from_le_bytes(fixed[32..40].try_into().unwrap()),
-        cd_size: u64::from_le_bytes(fixed[40..48].try_into().unwrap()),
-        cd_offset: u64::from_le_bytes(fixed[48..56].try_into().unwrap()),
+        disk: record.disk,
+        cd_disk: record.cd_disk,
+        entries_on_disk: record.disk_entries,
+        entries_total: record.total_entries,
+        cd_size: record.cd_size,
+        cd_offset: record.cd_offset,
     }))
 }
 

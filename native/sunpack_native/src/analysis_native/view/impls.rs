@@ -261,21 +261,25 @@ impl AnalysisBinaryView {
                 "zip.zip64_eocd_tail",
                 FieldLocation::Tail,
             ) {
-                if block.len() == ZIP64_EOCD_RECORD_SIZE + ZIP64_EOCD_LOCATOR_SIZE
-                    && &block[..4] == ZIP64_EOCD
-                    && u64_le(&block, 4) == ZIP64_EOCD_RECORD_SIZE as u64 - 12
-                    && &block[ZIP64_EOCD_RECORD_SIZE..ZIP64_EOCD_RECORD_SIZE + 4] == ZIP64_LOCATOR
-                {
+                let parsed = match crate::formats::zip::zip64::parse_fixed_tail(block.as_slice()) {
+                    Ok(parsed) => parsed,
+                    Err(error) => {
+                        result.set_item("zip64", true)?;
+                        result.set_item("error", error)?;
+                        return Ok(result.unbind());
+                    }
+                };
+                if let Some((record, locator)) = parsed {
                     zip64_present = true;
                     zip64_locator_present = true;
                     zip64_eocd_offset = block_offset;
-                    zip64_declared_total_disks = u32_le(&block, ZIP64_EOCD_RECORD_SIZE + 16);
-                    effective_disk_number = u64::from(u32_le(&block, 16));
-                    effective_central_directory_disk = u64::from(u32_le(&block, 20));
-                    effective_disk_entries = u64_le(&block, 24);
-                    effective_total_entries = u64_le(&block, 32);
-                    effective_central_directory_size = u64_le(&block, 40);
-                    effective_central_directory_offset = u64_le(&block, 48);
+                    zip64_declared_total_disks = locator.total_disks;
+                    effective_disk_number = u64::from(record.disk);
+                    effective_central_directory_disk = u64::from(record.cd_disk);
+                    effective_disk_entries = record.disk_entries;
+                    effective_total_entries = record.total_entries;
+                    effective_central_directory_size = record.cd_size;
+                    effective_central_directory_offset = record.cd_offset;
                     directory_end = block_offset;
                 }
             }

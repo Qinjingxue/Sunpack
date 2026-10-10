@@ -249,6 +249,6 @@ uv run --locked pytest
 
 仓库根目录的 [LICENSE](LICENSE)（MIT）适用于 SunPack 原创代码，不代表第三方代码或二进制也采用 MIT 许可证。
 
-仓库包含多个第三方组件，包括位于 `native/sevenzip_bridge/7z2603-src/` 的 7-Zip 26.03、位于 `native/sevenzip_bridge/zlib-ng-2.3.3/` 的 zlib-ng 2.3.3、位于 `native/third_party/lz4/` 的 LZ4 1.10.0，以及改编自 RustCrypto 的加密算法实现。这些组件仍受各自原始许可证约束。各组件的范围、版权与许可证信息，以及发布时需要附带的许可材料，详见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)、[licenses/](licenses/) 和 [docs/licensing.md](docs/licensing.md)。
+仓库包含多个第三方组件，包括位于 `native/sevenzip_bridge/7z2604-src/` 的 7-Zip 26.04、位于 `native/sevenzip_bridge/zlib-ng-2.3.3/` 的 zlib-ng 2.3.3、位于 `native/third_party/lz4/` 的 LZ4 1.10.0，以及改编自 RustCrypto 的加密算法实现。这些组件仍受各自原始许可证约束。各组件的范围、版权与许可证信息，以及发布时需要附带的许可材料，详见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)、[licenses/](licenses/) 和 [docs/licensing.md](docs/licensing.md)。
 
 其中，7-Zip 源码许可证副本位于 [licenses/7zip-source-license.txt](licenses/7zip-source-license.txt)，GNU LGPL 2.1 完整文本位于 [licenses/LGPL-2.1.txt](licenses/LGPL-2.1.txt)；其他组件的许可证副本见 [licenses/](licenses/)。

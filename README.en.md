@@ -262,7 +262,7 @@ Thank you to everyone who contributes code, reports issues, or shares suggestion
 
 The root [LICENSE](LICENSE) (MIT) applies to SunPack-original code. It does not mean that third-party code or binaries are also licensed under MIT.
 
-The repository includes several third-party components, including 7-Zip 26.03 at `native/sevenzip_bridge/7z2603-src/`, zlib-ng 2.3.3 at `native/sevenzip_bridge/zlib-ng-2.3.3/`, LZ4 1.10.0 at `native/third_party/lz4/`, and cryptographic algorithm implementations adapted from RustCrypto. These components remain subject to their respective original licenses. For component scope, copyright and license information, and the license materials required for releases, see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md), [licenses/](licenses/), and [docs/licensing.md](docs/licensing.md).
+The repository includes several third-party components, including 7-Zip 26.04 at `native/sevenzip_bridge/7z2604-src/`, zlib-ng 2.3.3 at `native/sevenzip_bridge/zlib-ng-2.3.3/`, LZ4 1.10.0 at `native/third_party/lz4/`, and cryptographic algorithm implementations adapted from RustCrypto. These components remain subject to their respective original licenses. For component scope, copyright and license information, and the license materials required for releases, see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md), [licenses/](licenses/), and [docs/licensing.md](docs/licensing.md).
 
 The 7-Zip source license is copied at [licenses/7zip-source-license.txt](licenses/7zip-source-license.txt), and the full GNU LGPL 2.1 text is available at [licenses/LGPL-2.1.txt](licenses/LGPL-2.1.txt). License copies for other components are in [licenses/](licenses/).
 

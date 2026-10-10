@@ -13,16 +13,21 @@ The root MIT License does **not** relicense third-party source code vendored in
 this repository. Third-party files remain under the licenses identified by
 their upstream projects and by [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md).
 
-## Vendored 7-Zip 26.03 source
+## Vendored 7-Zip 26.04 source
 
-The repository vendors 7-Zip 26.03 source code at:
+The vendored tree is a trimmed, locally modified subset. The 26.04 runtime
+fixes were imported selectively; see
+[the synchronization record](zh-CN/sevenzip_26_04_sync_review.md) for the scope
+and preserved SunPack modifications.
 
-`native/sevenzip_bridge/7z2603-src/`
+The repository vendors 7-Zip 26.04 source code at:
+
+`native/sevenzip_bridge/7z2604-src/`
 
 That subtree is governed by the upstream 7-Zip source license, not by SunPack's
 MIT License. The authoritative copy bundled with the source tree is:
 
-`native/sevenzip_bridge/7z2603-src/DOC/License.txt`
+`native/sevenzip_bridge/7z2604-src/DOC/License.txt`
 
 A convenience copy is also kept at:
 
@@ -52,7 +57,7 @@ restriction: they may not be used to recreate the proprietary RAR compression
 algorithm. See the upstream 7-Zip license text for the exact terms.
 
 Prefer keeping SunPack-specific integration code outside the vendored
-`7z2603-src/` tree where practical. This keeps upstream provenance and license
+`7z2604-src/` tree where practical. This keeps upstream provenance and license
 boundaries easy to audit and reduces merge friction when updating 7-Zip.
 
 ## Vendored zlib-ng 2.3.3 source
