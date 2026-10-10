@@ -440,15 +440,22 @@ fn resolve_logical_candidates(candidates: &mut Vec<EmbeddedCandidate>) {
     // Once an exact logical range is proven, every signature strictly inside
     // that range belongs to the archive payload. Nested archives are discovered
     // after extraction by the recursive pipeline, never as peer carrier slices.
-    let exact_ranges = candidates
-        .iter()
-        .filter(|item| item.candidate_kind == "logical_archive")
-        .filter_map(|item| item.end_offset.map(|end| (item.offset, end)))
-        .collect::<Vec<_>>();
+    // The caller sorts by offset. Delay each same-start group's coverage so
+    // equal starts survive the original strict start < offset rule. Ranges
+    // from removed candidates still contribute, preserving overlap semantics.
+    let mut group_start = None;
+    let mut covered_until = 0;
+    let mut group_end = 0;
     candidates.retain(|item| {
-        !exact_ranges
-            .iter()
-            .any(|(start, end)| *start < item.offset && item.offset < *end)
+        if group_start != Some(item.offset) {
+            covered_until = covered_until.max(group_end);
+            group_start = Some(item.offset);
+            group_end = 0;
+        }
+        if item.candidate_kind == "logical_archive" {
+            group_end = group_end.max(item.end_offset.unwrap_or(0));
+        }
+        item.offset >= covered_until
     });
 }
 
@@ -1651,6 +1658,40 @@ mod tests {
     use std::io::Write;
     use xz2::write::XzEncoder;
 
+    // Equal starts, crossing/removed ranges, anchors and zero-width endpoints
+    // are independent of stream parsing. Check the strict interval semantics.
+    #[test]
+    fn linear_candidate_resolution_preserves_strict_interval_ownership() {
+        for shift in 0..8 {
+            let mut inputs = (0..192u64)
+                .map(|i| {
+                    let offset = i / 3;
+                    let end = (i % 7 != 0).then_some(offset + (i * 17 + shift) % 21);
+                    let mut item = candidate("zip", offset, end, 1.0, "matrix");
+                    if i % 5 == 0 {
+                        item.candidate_kind = "anchor";
+                    }
+                    item
+                })
+                .collect::<Vec<_>>();
+            let project =
+                |item: &EmbeddedCandidate| (item.offset, item.end_offset, item.candidate_kind);
+            let expected = inputs
+                .iter()
+                .filter(|item| {
+                    !inputs.iter().any(|owner| {
+                        owner.candidate_kind == "logical_archive"
+                            && owner
+                                .end_offset
+                                .is_some_and(|end| owner.offset < item.offset && item.offset < end)
+                    })
+                })
+                .map(project)
+                .collect::<Vec<_>>();
+            resolve_logical_candidates(&mut inputs);
+            assert_eq!(inputs.iter().map(project).collect::<Vec<_>>(), expected);
+        }
+    }
     fn reference_raw_hits(data: &[u8]) -> Vec<RawHit> {
         let mut hits = Vec::new();
         for matched in embedded_matcher().find_overlapping_iter(data) {

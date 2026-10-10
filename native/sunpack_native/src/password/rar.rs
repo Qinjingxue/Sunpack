@@ -12,7 +12,6 @@ use aes::{Aes128, Aes256};
 use cbc::Decryptor;
 use crc32fast::hash as crc32_hash;
 use hmac::{Hmac, Mac};
-use pbkdf2::pbkdf2_hmac;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use rayon::prelude::*;
@@ -738,14 +737,31 @@ fn derive_rar3_key_iv(password: &str, salt: Option<&[u8; 8]>) -> ([u8; 16], [u8;
         password_bytes.extend_from_slice(salt);
     }
 
+    // Batch the unchanged SHA1 byte stream, stopping immediately after each
+    // IV checkpoint. The workspace belongs only to this password attempt.
+    let record_len = password_bytes.len() + 3;
+    let batch_size = (4096 / record_len).clamp(1, 64);
+    let mut records = vec![0u8; record_len * batch_size];
+    for record in records.chunks_exact_mut(record_len) {
+        record[..password_bytes.len()].copy_from_slice(&password_bytes);
+    }
     let mut sha = Sha1::new();
     let mut iv = [0u8; 16];
-    for i in 0..RAR3_KDF_ITERATIONS {
-        sha.update(&password_bytes);
-        sha.update(&i.to_le_bytes()[..3]);
-        if i & 0x3fff == 0 {
+    let mut next = 0u32;
+    let mut checkpoint_end = 1u32;
+    while next < RAR3_KDF_ITERATIONS {
+        let count = (batch_size as u32)
+            .min(RAR3_KDF_ITERATIONS - next)
+            .min(checkpoint_end - next) as usize;
+        for (index, record) in records.chunks_exact_mut(record_len).take(count).enumerate() {
+            record[record_len - 3..].copy_from_slice(&(next + index as u32).to_le_bytes()[..3]);
+        }
+        sha.update(&records[..count * record_len]);
+        next += count as u32;
+        if next == checkpoint_end {
             let digest = sha.clone().finalize();
-            iv[(i / 0x4000) as usize] = digest[19];
+            iv[((next - 1) / 0x4000) as usize] = digest[19];
+            checkpoint_end += 0x4000;
         }
     }
     let digest = sha.finalize();
@@ -790,11 +806,11 @@ fn find_rar5_password_match(candidates: &[String], header: &Rar5EncryptionHeader
     if candidates.len() >= PARALLEL_PASSWORD_THRESHOLD {
         candidates
             .par_iter()
-            .position_first(|password| rar5_password_check_matches(password, header))
+            .position_first(|password| rar5_checked_aes_key(password, header).is_some())
     } else {
         candidates
             .iter()
-            .position(|password| rar5_password_check_matches(password, header))
+            .position(|password| rar5_checked_aes_key(password, header).is_some())
     }
 }
 
@@ -971,13 +987,13 @@ fn parse_rar5_encryption_body(
     })
 }
 
-fn rar5_password_check_matches(password: &str, header: &Rar5EncryptionHeader) -> bool {
+fn rar5_checked_aes_key(password: &str, header: &Rar5EncryptionHeader) -> Option<[u8; 32]> {
     if !header.has_password_check {
-        return false;
+        return None;
     }
     let iterations = 1u32.checked_shl(header.lg2_count as u32).unwrap_or(0);
     if iterations == 0 {
-        return false;
+        return None;
     }
     let password_bytes = password.as_bytes();
     let mut salt_extended = [0u8; 20];
@@ -987,16 +1003,13 @@ fn rar5_password_check_matches(password: &str, header: &Rar5EncryptionHeader) ->
     // RAR's PBKDF2 uses the same HMAC key for every round. Clone the
     // precomputed inner/outer SHA-256 states, as the official UnRAR
     // implementation does, instead of rebuilding ipad/opad every time.
-    let mac_template = match HmacSha256::new_from_slice(password_bytes) {
-        Ok(mac) => mac,
-        Err(_) => return false,
-    };
+    let mac_template = HmacSha256::new_from_slice(password_bytes).ok()?;
     let mut mac = mac_template.clone();
     mac.update(&salt_extended);
     let mut block: [u8; 32] = mac.finalize().into_bytes().into();
     let mut final_hash = block;
     let round_counts = [iterations, 17, 17];
-    let mut result2 = [0u8; 32];
+    let mut key = [0u8; 32];
     for (round_index, count) in round_counts.iter().enumerate() {
         for _ in 1..*count {
             let mut mac = mac_template.clone();
@@ -1006,15 +1019,17 @@ fn rar5_password_check_matches(password: &str, header: &Rar5EncryptionHeader) ->
                 *f ^= *b;
             }
         }
-        if round_index == 2 {
-            result2 = final_hash;
+        if round_index == 0 {
+            // The first PBKDF2 checkpoint is the AES key. The following
+            // rounds derive RAR's password check from this same chain.
+            key = final_hash;
         }
     }
     let mut derived_check = [0u8; 8];
-    for (index, byte) in result2.iter().enumerate() {
+    for (index, byte) in final_hash.iter().enumerate() {
         derived_check[index % 8] ^= *byte;
     }
-    derived_check == header.password_check
+    (derived_check == header.password_check).then_some(key)
 }
 
 /// Decrypt the RAR5 archive main header of a header-encrypted (-hp) archive.
@@ -1033,15 +1048,7 @@ pub(crate) fn rar5_decrypt_main_header(data: &[u8], password: &str) -> Option<(u
     if !header.has_password_check || header.header_end == 0 {
         return None;
     }
-    if !rar5_password_check_matches(password, &header) {
-        return None;
-    }
-    let iterations = 1u32.checked_shl(header.lg2_count as u32).unwrap_or(0);
-    if iterations == 0 {
-        return None;
-    }
-    let mut key = [0u8; 32];
-    pbkdf2_hmac::<Sha256>(password.as_bytes(), &header.salt, iterations, &mut key);
+    let key = rar5_checked_aes_key(password, &header)?;
 
     let iv_offset = header.header_end;
     let iv: [u8; 16] = data
@@ -1200,14 +1207,9 @@ fn probe_rar5_encrypted_terminal(
     let Some(header) = parse_rar5_encryption_body(&full, after_flags, full.len()) else {
         return Ok(Some(RarTerminalProof::default()));
     };
-    if !header.has_password_check || !rar5_password_check_matches(password, &header) {
+    let Some(key) = rar5_checked_aes_key(password, &header) else {
         return Ok(None);
-    }
-    let iterations = 1u32
-        .checked_shl(header.lg2_count as u32)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid RAR5 KDF count"))?;
-    let mut key = [0u8; 32];
-    pbkdf2_hmac::<Sha256>(password.as_bytes(), &header.salt, iterations, &mut key);
+    };
     let encrypted_header_offset = block_offset
         .checked_add(total_size as u64)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "RAR5 IV offset overflow"))?;
@@ -1530,6 +1532,83 @@ fn le_u32(bytes: &[u8], offset: usize) -> Option<u32> {
 
 fn crc32(bytes: &[u8]) -> u32 {
     crc32_hash(bytes)
+}
+
+#[cfg(test)]
+mod kdf_regression_tests {
+    use super::*;
+
+    // Real archives do not force every SHA1 checkpoint alignment or key length.
+    // One scalar byte-stream oracle checks all key/IV bytes for salt and UTF-16.
+    #[test]
+    fn rar4_batched_kdf_preserves_key_and_all_iv_checkpoints() {
+        let long = "长🔐password".repeat(70);
+        for password in ["", "secret", "密碼🔐", long.as_str()] {
+            for salt in [None, Some(&[0x91u8; 8])] {
+                let mut raw = password
+                    .encode_utf16()
+                    .flat_map(u16::to_le_bytes)
+                    .collect::<Vec<_>>();
+                if let Some(salt) = salt {
+                    raw.extend_from_slice(salt);
+                }
+                let mut sha = Sha1::new();
+                let mut iv = [0u8; 16];
+                for counter in 0..RAR3_KDF_ITERATIONS {
+                    sha.update(&raw);
+                    sha.update(&counter.to_le_bytes()[..3]);
+                    if counter % 0x4000 == 0 {
+                        iv[(counter / 0x4000) as usize] = sha.clone().finalize()[19];
+                    }
+                }
+                let digest = sha.finalize();
+                let mut key = [0u8; 16];
+                for (target, source) in key.chunks_exact_mut(4).zip(digest[..16].chunks_exact(4)) {
+                    target.copy_from_slice(source);
+                    target.reverse();
+                }
+                assert_eq!(derive_rar3_key_iv(password, salt), (key, iv));
+            }
+        }
+    }
+
+    #[test]
+    fn rar5_checked_key_matches_standard_pbkdf2_checkpoints() {
+        for password in ["", "secret", "密碼🔐", &"long-password".repeat(10)] {
+            for lg2_count in [0, 4, 10] {
+                let iterations = 1u32 << lg2_count;
+                let mut header = Rar5EncryptionHeader {
+                    lg2_count,
+                    salt: [0x73; 16],
+                    has_password_check: true,
+                    password_check: [0; 8],
+                    header_end: 0,
+                };
+                let mut key = [0u8; 32];
+                let mut check = [0u8; 32];
+                pbkdf2::pbkdf2_hmac::<Sha256>(
+                    password.as_bytes(),
+                    &header.salt,
+                    iterations,
+                    &mut key,
+                );
+                pbkdf2::pbkdf2_hmac::<Sha256>(
+                    password.as_bytes(),
+                    &header.salt,
+                    iterations + 32,
+                    &mut check,
+                );
+                for (index, byte) in check.iter().enumerate() {
+                    header.password_check[index % 8] ^= byte;
+                }
+                assert_eq!(rar5_checked_aes_key(password, &header), Some(key));
+                header.password_check[0] ^= 1;
+                assert_eq!(rar5_checked_aes_key(password, &header), None);
+                header.has_password_check = false;
+                assert_eq!(rar5_checked_aes_key(password, &header), None);
+            }
+        }
+    }
 }
 
 #[cfg(test)]

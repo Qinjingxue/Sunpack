@@ -117,8 +117,14 @@ impl<'a> ByteCursor<'a> {
             return invalid("unexpected_end_of_stream");
         }
         let mut output = Vec::with_capacity(count);
-        for _ in 0..count {
+        while output.len() < count {
+            // Reuse read_byte's refill/EOF handling, then consume the rest of
+            // this window as a slice instead of checking every stored byte.
             output.push(self.read_byte()?);
+            let start = (self.pos - self.buffer_start) as usize;
+            let available = (count - output.len()).min(self.buffer.len() - start);
+            output.extend_from_slice(&self.buffer[start..start + available]);
+            self.pos += available as u64;
         }
         Ok(output)
     }
@@ -538,13 +544,25 @@ impl DeflateOutput {
         if !self.is_verifying() {
             return self.add_count(bytes.len() as u64);
         }
-        for (index, &byte) in bytes.iter().enumerate() {
-            self.write_byte(byte)?;
-            if !self.is_verifying() {
-                return self.add_count((bytes.len() - index - 1) as u64);
+        if bytes.len() as u64 > self.verify_limit.unwrap().saturating_sub(self.decoded_size) {
+            self.disable_integrity();
+            return self.add_count(bytes.len() as u64);
+        }
+        let mut next = 0;
+        while next < bytes.len() {
+            let count = (bytes.len() - next)
+                .min(DEFLATE_WINDOW_SIZE - self.window_pos)
+                .min(BUFFER_SIZE - self.pending.len());
+            let slice = &bytes[next..next + count];
+            self.window[self.window_pos..self.window_pos + count].copy_from_slice(slice);
+            self.window_pos = (self.window_pos + count) % DEFLATE_WINDOW_SIZE;
+            self.pending.extend_from_slice(slice);
+            next += count;
+            if self.pending.len() == BUFFER_SIZE {
+                self.flush_pending();
             }
         }
-        Ok(())
+        self.add_count(bytes.len() as u64)
     }
 
     fn repeat(&mut self, distance: u64, length: u64) -> ValidationResult<()> {
@@ -554,16 +572,31 @@ impl DeflateOutput {
         if !self.is_verifying() {
             return self.add_count(length);
         }
+        if length > self.verify_limit.unwrap().saturating_sub(self.decoded_size) {
+            self.disable_integrity();
+            return self.add_count(length);
+        }
+        // DEFLATE matches have at most 258 bytes. Seed their first period
+        // from the ring, then expand it with slices, including distance=1
+        // and overlapping matches. No heap allocation per match.
+        let mut matched = [0u8; 258];
         let mut remaining = length;
         while remaining > 0 {
-            if !self.is_verifying() {
-                return self.add_count(remaining);
-            }
+            let count = remaining.min(matched.len() as u64) as usize;
             let distance = distance as usize;
             let source = (self.window_pos + DEFLATE_WINDOW_SIZE - distance) % DEFLATE_WINDOW_SIZE;
-            let byte = self.window[source];
-            self.write_byte(byte)?;
-            remaining -= 1;
+            let period = distance.min(count);
+            let first = period.min(DEFLATE_WINDOW_SIZE - source);
+            matched[..first].copy_from_slice(&self.window[source..source + first]);
+            matched[first..period].copy_from_slice(&self.window[..period - first]);
+            let mut filled = period;
+            while filled < count {
+                let copied = filled.min(count - filled);
+                matched.copy_within(..copied, filled);
+                filled += copied;
+            }
+            self.write_bytes(&matched[..count])?;
+            remaining -= count as u64;
         }
         Ok(())
     }
@@ -1541,6 +1574,38 @@ mod tests {
 
     fn reader(data: Vec<u8>) -> ManagedReader {
         ManagedReader::from_bytes(data, ReaderConfig::default())
+    }
+
+    // The small archive fixtures cannot force every overlapping match across
+    // ring/CRC-buffer boundaries. Compare one bounded matrix to a flat output.
+    #[test]
+    fn deflate_bulk_output_preserves_overlap_ring_crc_and_integrity_limit() {
+        let seed = (0..BUFFER_SIZE + 37)
+            .map(|i| (i % 251) as u8)
+            .collect::<Vec<_>>();
+        let mut expected = seed.clone();
+        for distance in [1, 2, 3, 7, 258, DEFLATE_WINDOW_SIZE] {
+            for length in [1, 3, 258] {
+                for _ in 0..length {
+                    expected.push(expected[expected.len() - distance]);
+                }
+            }
+        }
+        for limit in [expected.len() as u64, expected.len() as u64 - 1, 0] {
+            let mut output = DeflateOutput::verifying(limit);
+            output.write_bytes(&seed).unwrap();
+            for distance in [1, 2, 3, 7, 258, DEFLATE_WINDOW_SIZE] {
+                for length in [1, 3, 258] {
+                    output.repeat(distance as u64, length).unwrap();
+                }
+            }
+            assert_eq!(output.decoded_size(), expected.len() as u64);
+            assert_eq!(
+                output.finish_checksum(),
+                (limit >= expected.len() as u64).then(|| crc32(&expected))
+            );
+        }
+        assert!(DeflateOutput::counting().repeat(1, 1).is_err());
     }
 
     // Independent coverage: lookahead byte ownership at all bit alignments,
