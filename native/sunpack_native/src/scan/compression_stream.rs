@@ -168,48 +168,74 @@ impl<'a, 'b> LsbBits<'a, 'b> {
     }
 
     fn align_byte(&mut self) {
+        // Lookup decoding may have fetched bytes beyond the current block.
+        // Drop padding bits, but return every unconsumed whole byte.
+        self.cursor.pos -= u64::from(self.count / 8);
         self.bits = 0;
         self.count = 0;
+    }
+
+    fn fill_available(&mut self, count: u8) -> ValidationResult<()> {
+        while self.count < count && self.cursor.pos < self.cursor.limit {
+            self.bits |= u64::from(self.cursor.read_byte()?) << self.count;
+            self.count += 8;
+        }
+        Ok(())
     }
 }
 
 struct MsbBits<'a, 'b> {
     cursor: &'a mut ByteCursor<'b>,
-    current: u8,
-    remaining: u8,
+    bits: u64,
+    count: u8,
 }
 
 impl<'a, 'b> MsbBits<'a, 'b> {
     fn new(cursor: &'a mut ByteCursor<'b>) -> Self {
         Self {
             cursor,
-            current: 0,
-            remaining: 0,
+            bits: 0,
+            count: 0,
         }
     }
 
     fn read(&mut self, count: u8) -> ValidationResult<u32> {
-        let mut value = 0u32;
-        for _ in 0..count {
-            if self.remaining == 0 {
-                self.current = self.cursor.read_byte()?;
-                self.remaining = 8;
-            }
-            value = (value << 1) | u32::from(self.current >> 7);
-            self.current <<= 1;
-            self.remaining -= 1;
+        self.fill_available(count)?;
+        if self.count < count {
+            return invalid("unexpected_end_of_stream");
         }
+        self.count -= count;
+        let value = (self.bits >> self.count) as u32;
+        self.bits &= (1u64 << self.count) - 1;
         Ok(value)
     }
 
-    fn align_zero(&mut self) -> ValidationResult<()> {
-        if self.remaining > 0 && self.current >> (8 - self.remaining) != 0 {
-            return invalid("nonzero_stream_padding");
+    fn fill_available(&mut self, count: u8) -> ValidationResult<()> {
+        while self.count < count && self.cursor.pos < self.cursor.limit {
+            self.bits = (self.bits << 8) | u64::from(self.cursor.read_byte()?);
+            self.count += 8;
         }
-        self.current = 0;
-        self.remaining = 0;
         Ok(())
     }
+
+    fn align_zero(&mut self) -> ValidationResult<()> {
+        let padding = self.count % 8;
+        if self.bits >> (self.count - padding) != 0 {
+            return invalid("nonzero_stream_padding");
+        }
+        self.cursor.pos -= u64::from(self.count / 8);
+        self.bits = 0;
+        self.count = 0;
+        Ok(())
+    }
+}
+
+const HUFFMAN_LOOKUP_BITS: u8 = 9;
+
+#[derive(Clone, Copy)]
+enum BitOrder {
+    Lsb,
+    Msb,
 }
 
 #[derive(Clone)]
@@ -219,10 +245,12 @@ struct Huffman {
     first_symbol: [usize; 24],
     symbols: Vec<u16>,
     max_len: usize,
+    lookup: Box<[u32]>,
+    lookup_bits: u8,
 }
 
 impl Huffman {
-    fn new(lengths: &[u8], max_allowed: usize) -> ValidationResult<Self> {
+    fn new(lengths: &[u8], max_allowed: usize, order: BitOrder) -> ValidationResult<Self> {
         let mut counts = [0u16; 24];
         let mut max_len = 0usize;
         for &length in lengths {
@@ -263,16 +291,49 @@ impl Huffman {
                 }
             }
         }
+        // Bounded, block-local decode table; no retained input or shared cache.
+        let lookup_bits = HUFFMAN_LOOKUP_BITS.min(max_len as u8);
+        let mut lookup = vec![0u32; 1usize << lookup_bits].into_boxed_slice();
+        for length in 1..=usize::from(lookup_bits) {
+            for index in 0..usize::from(counts[length]) {
+                let code = first_code[length] + index as u32;
+                let symbol = symbols[first_symbol[length] + index];
+                let entry = ((length as u32) << 16) | u32::from(symbol);
+                let suffix_bits = usize::from(lookup_bits) - length;
+                for suffix in 0..1usize << suffix_bits {
+                    let canonical = ((code as usize) << suffix_bits) | suffix;
+                    let slot = match order {
+                        BitOrder::Msb => canonical,
+                        BitOrder::Lsb => {
+                            canonical.reverse_bits() >> (usize::BITS - u32::from(lookup_bits))
+                        }
+                    };
+                    lookup[slot] = entry;
+                }
+            }
+        }
         Ok(Self {
             counts,
             first_code,
             first_symbol,
             symbols,
             max_len,
+            lookup,
+            lookup_bits,
         })
     }
 
     fn decode_lsb(&self, bits: &mut LsbBits<'_, '_>) -> ValidationResult<u16> {
+        bits.fill_available(self.lookup_bits)?;
+        if bits.count >= self.lookup_bits {
+            let entry = self.lookup[(bits.bits & ((1u64 << self.lookup_bits) - 1)) as usize];
+            if entry != 0 {
+                let length = (entry >> 16) as u8;
+                bits.bits >>= length;
+                bits.count -= length;
+                return Ok(entry as u16);
+            }
+        }
         let mut code = 0u32;
         for length in 1..=self.max_len {
             code = (code << 1) | bits.read(1)?;
@@ -286,6 +347,15 @@ impl Huffman {
     }
 
     fn decode_msb(&self, bits: &mut MsbBits<'_, '_>) -> ValidationResult<u16> {
+        bits.fill_available(self.lookup_bits)?;
+        if bits.count >= self.lookup_bits {
+            let entry = self.lookup[(bits.bits >> (bits.count - self.lookup_bits)) as usize];
+            if entry != 0 {
+                bits.count -= (entry >> 16) as u8;
+                bits.bits &= (1u64 << bits.count) - 1;
+                return Ok(entry as u16);
+            }
+        }
         let mut code = 0u32;
         for length in 1..=self.max_len {
             code = (code << 1) | bits.read(1)?;
@@ -306,7 +376,10 @@ fn fixed_deflate_trees() -> ValidationResult<(Huffman, Huffman)> {
     literals[256..280].fill(7);
     literals[280..].fill(8);
     let distances = vec![5u8; 32];
-    Ok((Huffman::new(&literals, 15)?, Huffman::new(&distances, 15)?))
+    Ok((
+        Huffman::new(&literals, 15, BitOrder::Lsb)?,
+        Huffman::new(&distances, 15, BitOrder::Lsb)?,
+    ))
 }
 
 fn dynamic_deflate_trees(bits: &mut LsbBits<'_, '_>) -> ValidationResult<(Huffman, Huffman)> {
@@ -323,7 +396,7 @@ fn dynamic_deflate_trees(bits: &mut LsbBits<'_, '_>) -> ValidationResult<(Huffma
     for index in 0..code_count {
         code_lengths[ORDER[index]] = bits.read(3)? as u8;
     }
-    let code_tree = Huffman::new(&code_lengths, 7)?;
+    let code_tree = Huffman::new(&code_lengths, 7, BitOrder::Lsb)?;
     let total = literal_count + distance_count;
     let mut lengths = Vec::with_capacity(total);
     while lengths.len() < total {
@@ -360,8 +433,8 @@ fn dynamic_deflate_trees(bits: &mut LsbBits<'_, '_>) -> ValidationResult<(Huffma
         return invalid("deflate_end_code_missing");
     }
     Ok((
-        Huffman::new(&lengths[..literal_count], 15)?,
-        Huffman::new(&lengths[literal_count..], 15)?,
+        Huffman::new(&lengths[..literal_count], 15, BitOrder::Lsb)?,
+        Huffman::new(&lengths[literal_count..], 15, BitOrder::Lsb)?,
     ))
 }
 
@@ -849,7 +922,7 @@ pub(crate) fn validate_bzip2_structure(
                     }
                     lengths.push(current as u8);
                 }
-                tables.push(Huffman::new(&lengths, 20)?);
+                tables.push(Huffman::new(&lengths, 20, BitOrder::Msb)?);
             }
 
             let eob = (n_in_use + 1) as u16;
@@ -1468,6 +1541,82 @@ mod tests {
 
     fn reader(data: Vec<u8>) -> ManagedReader {
         ManagedReader::from_bytes(data, ReaderConfig::default())
+    }
+
+    // Independent coverage: lookahead byte ownership at all bit alignments,
+    // short codes at EOF, and 15/20-bit codes absent from the tiny real-stream
+    // fixtures. One bounded matrix catches boundary/truncation regressions.
+    #[test]
+    fn huffman_lookup_preserves_codes_eof_and_following_bytes() {
+        for (max_len, order) in [(15, BitOrder::Lsb), (20, BitOrder::Msb)] {
+            let mut lengths = (1..=max_len as u8).collect::<Vec<_>>();
+            lengths.push(max_len as u8);
+            let tree = Huffman::new(&lengths, max_len, order).unwrap();
+            for prefix in 0..8 {
+                let mut logical = vec![0u8; prefix];
+                for (symbol, &length) in lengths.iter().enumerate() {
+                    // Complete canonical comb tree: 0, 10, 110, ... , 111... .
+                    let code = if symbol == max_len {
+                        (1u32 << length) - 1
+                    } else {
+                        (1u32 << length) - 2
+                    };
+                    for shift in (0..length).rev() {
+                        logical.push(((code >> shift) & 1) as u8);
+                    }
+                }
+                logical.push(0); // shortest code, including insufficient lookup bits at EOF
+                let byte_count = logical.len().div_ceil(8);
+                let mut data = vec![0u8; byte_count];
+                for (index, bit) in logical.iter().enumerate() {
+                    let shift = match order {
+                        BitOrder::Lsb => index % 8,
+                        BitOrder::Msb => 7 - index % 8,
+                    };
+                    data[index / 8] |= bit << shift;
+                }
+                for tail in [false, true] {
+                    let mut input = data.clone();
+                    if tail {
+                        input.extend_from_slice(&[0xa5, 0x5a]);
+                    }
+                    let source = reader(input.clone());
+                    let mut cursor = ByteCursor::new(&source, 0, input.len() as u64);
+                    match order {
+                        BitOrder::Lsb => {
+                            let mut bits = LsbBits::new(&mut cursor);
+                            bits.read(prefix as u8).unwrap();
+                            for symbol in 0..lengths.len() {
+                                assert_eq!(tree.decode_lsb(&mut bits).unwrap(), symbol as u16);
+                            }
+                            assert_eq!(tree.decode_lsb(&mut bits).unwrap(), 0);
+                            bits.align_byte();
+                        }
+                        BitOrder::Msb => {
+                            let mut bits = MsbBits::new(&mut cursor);
+                            bits.read(prefix as u8).unwrap();
+                            for symbol in 0..lengths.len() {
+                                assert_eq!(tree.decode_msb(&mut bits).unwrap(), symbol as u16);
+                            }
+                            assert_eq!(tree.decode_msb(&mut bits).unwrap(), 0);
+                            bits.align_zero().unwrap();
+                        }
+                    }
+                    assert_eq!(cursor.position(), byte_count as u64);
+                    if tail {
+                        assert_eq!(cursor.read_exact(2).unwrap(), [0xa5, 0x5a]);
+                    }
+                }
+            }
+            let source = reader(vec![0xff]);
+            let mut cursor = ByteCursor::new(&source, 0, 1);
+            let error = match order {
+                BitOrder::Lsb => tree.decode_lsb(&mut LsbBits::new(&mut cursor)),
+                BitOrder::Msb => tree.decode_msb(&mut MsbBits::new(&mut cursor)),
+            }
+            .unwrap_err();
+            assert_eq!(error.code(), "unexpected_end_of_stream");
+        }
     }
 
     #[test]

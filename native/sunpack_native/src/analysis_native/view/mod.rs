@@ -1,6 +1,7 @@
 use crate::io::read_fault::{FieldLocation, ReadFault};
 use crate::io::reader::{ManagedReader, ReaderConfig};
 use bzip2::read::BzDecoder;
+use crc32fast::hash as crc32;
 use flate2::read::GzDecoder;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};

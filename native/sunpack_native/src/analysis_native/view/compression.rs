@@ -38,15 +38,3 @@ fn read_vint(data: &[u8], offset: usize) -> Option<(u64, usize)> {
     }
     None
 }
-
-fn crc32(bytes: &[u8]) -> u32 {
-    let mut crc = 0xFFFF_FFFFu32;
-    for byte in bytes {
-        crc ^= *byte as u32;
-        for _ in 0..8 {
-            let mask = (crc & 1).wrapping_neg();
-            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
-        }
-    }
-    !crc
-}

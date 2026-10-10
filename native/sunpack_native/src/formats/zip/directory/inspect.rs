@@ -2159,7 +2159,7 @@ fn deflate_payload_info(input: &[u8], expected_size: Option<u64>, require_exact_
             return Some(DeflateInfo {
                 consumed: decompressor.total_in() as usize,
                 uncompressed_size: decompressor.total_out(),
-                crc32: crc.finish(),
+                crc32: crc.finalize(),
             });
         }
         if decompressor.total_in() as usize >= input.len() {

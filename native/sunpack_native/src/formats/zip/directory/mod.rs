@@ -93,35 +93,7 @@ struct DeflateInfo {
     crc32: u32,
 }
 
-struct Crc32 {
-    value: u32,
-}
-
-impl Crc32 {
-    fn new() -> Self {
-        Self { value: 0xFFFF_FFFF }
-    }
-
-    fn update(&mut self, bytes: &[u8]) {
-        for byte in bytes {
-            self.value ^= *byte as u32;
-            for _ in 0..8 {
-                let mask = (self.value & 1).wrapping_neg();
-                self.value = (self.value >> 1) ^ (0xEDB8_8320 & mask);
-            }
-        }
-    }
-
-    fn finish(self) -> u32 {
-        !self.value
-    }
-}
-
-fn crc32_bytes(bytes: &[u8]) -> u32 {
-    let mut crc = Crc32::new();
-    crc.update(bytes);
-    crc.finish()
-}
+use crc32fast::{hash as crc32_bytes, Hasher as Crc32};
 
 fn descriptor_at(
     data: &[u8],

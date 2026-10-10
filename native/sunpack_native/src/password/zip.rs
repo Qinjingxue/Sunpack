@@ -4,7 +4,7 @@ use crate::password::context::{verify_prepared, InputKey, PasswordContext, Prepa
 use crate::password::input::{
     parse_ranges, parse_volumes, ranges_key, ranges_total_len, VirtualRangeReader, VolumeSet,
 };
-use pbkdf2::pbkdf2_hmac;
+use hmac::{Hmac, Mac};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use rayon::prelude::*;
@@ -920,9 +920,59 @@ fn winzip_aes_verifier_matches(
     verifier: &[u8],
     key_len: usize,
 ) -> bool {
-    let mut derived = vec![0u8; key_len * 2 + 2];
-    pbkdf2_hmac::<Sha1>(password, salt, 1000, &mut derived);
-    &derived[key_len * 2..key_len * 2 + 2] == verifier
+    // PBKDF2 output blocks are independent. Only the block containing the
+    // two-byte verifier is needed; encryption/authentication keys are unused
+    // during candidate filtering. Keep all collisions for the final verifier.
+    let offset = key_len * 2;
+    let block_index = (offset / 20 + 1) as u32;
+    let template = Hmac::<Sha1>::new_from_slice(password).expect("HMAC accepts any key length");
+    let mut mac = template.clone();
+    mac.update(salt);
+    mac.update(&block_index.to_be_bytes());
+    let mut previous = mac.finalize().into_bytes();
+    let mut derived = previous;
+    for _ in 1..1000 {
+        let mut mac = template.clone();
+        mac.update(&previous);
+        previous = mac.finalize().into_bytes();
+        for (value, byte) in derived.iter_mut().zip(previous.iter()) {
+            *value ^= byte;
+        }
+    }
+    &derived[offset % 20..offset % 20 + 2] == verifier
+}
+
+#[cfg(test)]
+mod aes_verifier_tests {
+    use super::*;
+
+    // Independent coverage: every AES strength's non-first PBKDF2 block and
+    // long/UTF-8 HMAC keys against full PBKDF2, beyond archive success checks.
+    // This small oracle matrix catches block/offset errors without archive IO.
+    #[test]
+    fn selective_verifier_matches_full_pbkdf2_for_all_strengths() {
+        for password in ["", "password", "⑨密码", &"long-key".repeat(16)] {
+            for (key_len, salt_len) in [(16, 8), (24, 12), (32, 16)] {
+                let salt = vec![0xa5; salt_len];
+                let mut full = vec![0u8; key_len * 2 + 2];
+                pbkdf2::pbkdf2_hmac::<Sha1>(password.as_bytes(), &salt, 1000, &mut full);
+                let verifier = &full[key_len * 2..];
+                assert!(winzip_aes_verifier_matches(
+                    password.as_bytes(),
+                    &salt,
+                    verifier,
+                    key_len
+                ));
+                let rejected = [verifier[0] ^ 1, verifier[1]];
+                assert!(!winzip_aes_verifier_matches(
+                    password.as_bytes(),
+                    &salt,
+                    &rejected,
+                    key_len
+                ));
+            }
+        }
+    }
 }
 
 fn zipcrypto_header_matches(password: &[u8], encrypted_header: &[u8; 12], expected: u8) -> bool {

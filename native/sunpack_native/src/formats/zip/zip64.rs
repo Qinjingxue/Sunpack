@@ -45,7 +45,10 @@ pub(crate) fn parse_record(bytes: &[u8]) -> Result<EndRecord, &'static str> {
     }
     if record.cd_size >= OFFSET_LIMIT
         || record.cd_offset >= OFFSET_LIMIT
-        || record.cd_offset.checked_add(record.cd_size).is_none_or(|end| end >= OFFSET_LIMIT)
+        || record
+            .cd_offset
+            .checked_add(record.cd_size)
+            .is_none_or(|end| end >= OFFSET_LIMIT)
     {
         return Err("zip64_central_directory_overflow");
     }

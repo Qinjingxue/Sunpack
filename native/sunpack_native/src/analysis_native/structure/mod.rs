@@ -1,6 +1,7 @@
 use crate::io::read_fault::{read_exact_field, seek_field, FieldLocation, ReadFault};
 use crate::io::reader::{ManagedReader, SourceCursor};
 use crate::scan::magic::rfind_subslice;
+use crc32fast::hash as crc32;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use std::io::Read;
