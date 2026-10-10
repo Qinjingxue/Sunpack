@@ -2,8 +2,8 @@
 use crate::io::iocp;
 use crate::io::reader::{CachedBytes, ManagedReader};
 use crate::scan::compression_stream::{
-    resolve_xz_boundary_exact, validate_bzip2_structure, validate_gzip_structure,
-    validate_zstd_structure, ValidationError,
+    read_xz_footer, resolve_xz_boundary_exact, validate_bzip2_structure, validate_gzip_structure,
+    validate_zstd_structure, ValidationError, XzFooter,
 };
 use aho_corasick::{packed, AhoCorasick};
 use crc32fast::hash as crc32;
@@ -375,6 +375,11 @@ fn validate_raw_hits(
     raw_hits: &[RawHit],
     xz_footer_ends: &[u64],
 ) -> io::Result<Vec<EmbeddedCandidate>> {
+    let mut xz_footers = XzFooterEvidence {
+        ends: xz_footer_ends,
+        next_unchecked: 0,
+        valid: Vec::new(),
+    };
     let zip_eocd_hits = raw_hits
         .iter()
         .filter(|hit| hit.kind == "zip_eocd")
@@ -411,7 +416,7 @@ fn validate_raw_hits(
         }
 
         let resolved = if hit.kind == "xz" {
-            validate_xz(reader, file_size, hit.offset, xz_footer_ends)?
+            validate_xz(reader, file_size, hit.offset, &mut xz_footers)?
         } else {
             validate_candidate(reader, file_size, hit.kind, hit.offset)?
         };
@@ -1351,11 +1356,20 @@ fn validate_bzip2(
     )))
 }
 
+// One physical-order analysis owns these facts. Invalid footers are discarded
+// by advancing the cursor; only independently valid metadata is retained, and
+// nothing survives this scan. Read lazily to preserve the existing I/O order.
+struct XzFooterEvidence<'a> {
+    ends: &'a [u64],
+    next_unchecked: usize,
+    valid: Vec<XzFooter>,
+}
+
 fn validate_xz(
     file: &ManagedReader,
     size: u64,
     offset: u64,
-    footer_ends: &[u64],
+    footers: &mut XzFooterEvidence<'_>,
 ) -> std::io::Result<Option<EmbeddedCandidate>> {
     let header = read_at(file, offset, 12)?;
     if header.len() < 12
@@ -1370,12 +1384,32 @@ fn validate_xz(
     if crc32(&header[6..8]) != stored {
         return Ok(None);
     }
-    let first_possible = footer_ends.partition_point(|end| *end < offset + 24);
-    for &end in &footer_ends[first_possible..] {
-        if end > size {
-            break;
+    // Headers arrive in increasing physical order. No later header can need
+    // an unchecked footer that precedes this minimum boundary.
+    footers.next_unchecked = footers
+        .next_unchecked
+        .max(footers.ends.partition_point(|end| *end < offset + 24));
+    let mut next_valid = footers
+        .valid
+        .partition_point(|footer| footer.end < offset + 24);
+    loop {
+        while next_valid == footers.valid.len() {
+            let Some(&end) = footers.ends.get(footers.next_unchecked) else {
+                return Ok(None);
+            };
+            footers.next_unchecked += 1;
+            if end > size {
+                return Ok(None);
+            }
+            match read_xz_footer(file, end) {
+                Ok(footer) => footers.valid.push(footer),
+                Err(ValidationError::Invalid(_)) => continue,
+                Err(ValidationError::Io(error)) => return Err(error),
+            }
         }
-        match resolve_xz_boundary_exact(file, offset, end) {
+        let end = footers.valid[next_valid].end;
+        next_valid += 1;
+        match resolve_xz_boundary_exact(file, offset, end, &footers.valid) {
             Ok(structure) => {
                 return Ok(Some(candidate(
                     "xz",
@@ -1389,7 +1423,6 @@ fn validate_xz(
             Err(ValidationError::Io(error)) => return Err(error),
         }
     }
-    Ok(None)
 }
 
 fn validate_zstd(
@@ -1657,6 +1690,88 @@ mod tests {
     use std::fs;
     use std::io::Write;
     use xz2::write::XzEncoder;
+
+    // Ordinary valid-stream fixtures do not cover tail facts shared by many
+    // earlier false headers, or unrelated footer reads after a conclusive match.
+    #[test]
+    fn xz_footer_evidence_preserves_false_headers_peers_and_lazy_io() {
+        use crate::io::reader::ReaderConfig;
+        let mut encoder = XzEncoder::new(Vec::new(), 1);
+        encoder.write_all(b"xz payload").unwrap();
+        let stream = encoder.finish().unwrap();
+        let mut data = b"carrier-prefix".to_vec();
+        for variant in 0..4 {
+            data.extend_from_slice(&stream[..12]);
+            data.extend_from_slice(b"broken stream contents");
+            let mut footer = stream[stream.len() - 12..].to_vec();
+            match variant {
+                0 => footer[0] ^= 1,
+                1 => footer[8] = 1,
+                2 => footer[9] = 2,
+                _ => footer[4..8].fill(0),
+            }
+            if variant != 0 {
+                let checksum = crc32(&footer[4..10]);
+                footer[..4].copy_from_slice(&checksum.to_le_bytes());
+            }
+            data.extend_from_slice(&footer);
+            data.extend_from_slice(b"invalid gap");
+        }
+        let mut expected = Vec::new();
+        for _ in 0..2 {
+            expected.push(data.len() as u64);
+            data.extend_from_slice(&stream);
+            data.extend_from_slice(b"peer separator");
+        }
+        let mut hits = scan_sample(&data, 0, 0);
+        let mut ends = hits
+            .iter()
+            .filter(|hit| hit.kind == "xz_footer")
+            .map(|hit| hit.offset + 2)
+            .collect::<Vec<_>>();
+        ends.sort_unstable();
+        hits.retain(|hit| hit.kind != "xz_footer");
+        hits.sort_by_key(|hit| hit.offset);
+        let source = ManagedReader::from_bytes(data, ReaderConfig::default());
+        let candidates = validate_raw_hits(&source, source.len(), &hits, &ends).unwrap();
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|item| item.offset)
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert!(candidates.iter().all(|item| item.boundary_kind == "exact"));
+
+        let mut data = stream.clone();
+        data.extend_from_slice(b"unrelated tail");
+        for _ in 0..100 {
+            data.extend_from_slice(b"bad footerYZ");
+        }
+        let hits = scan_sample(&data, 0, 0);
+        let mut ends = hits
+            .iter()
+            .filter(|hit| hit.kind == "xz_footer")
+            .map(|hit| hit.offset + 2)
+            .collect::<Vec<_>>();
+        ends.sort_unstable();
+        let source = ManagedReader::from_bytes(
+            data,
+            ReaderConfig {
+                max_read_bytes: Some(512),
+                ..ReaderConfig::default()
+            },
+        );
+        let mut facts = XzFooterEvidence {
+            ends: &ends,
+            next_unchecked: 0,
+            valid: Vec::new(),
+        };
+        let matched = validate_xz(&source, source.len(), 0, &mut facts)
+            .unwrap()
+            .unwrap();
+        assert_eq!(matched.end_offset, Some(stream.len() as u64));
+    }
 
     // Equal starts, crossing/removed ranges, anchors and zero-width endpoints
     // are independent of stream parsing. Check the strict interval semantics.

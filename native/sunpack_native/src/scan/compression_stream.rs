@@ -3,6 +3,7 @@ use crc32fast::{hash as crc32, Hasher};
 use std::io;
 
 const BUFFER_SIZE: usize = 64 * 1024;
+const INITIAL_PROBE_BYTES: usize = 256;
 const MAX_RECORDS: usize = 1_000_000;
 const GZIP_MAGIC: &[u8] = b"\x1f\x8b\x08";
 const BZIP2_MAGIC: &[u8] = b"BZh";
@@ -96,8 +97,15 @@ impl<'a> ByteCursor<'a> {
             || self.pos < self.buffer_start
             || self.pos >= self.buffer_start + self.buffer.len() as u64;
         if outside {
+            // Most carrier candidates end inside this first small window.
+            // Grow only after consuming it; long streams retain bulk reads.
+            let window_size = if self.buffer_start == u64::MAX {
+                INITIAL_PROBE_BYTES
+            } else {
+                BUFFER_SIZE
+            };
             self.buffer_start = self.pos;
-            let count = BUFFER_SIZE.min((self.limit - self.pos) as usize);
+            let count = window_size.min((self.limit - self.pos) as usize);
             self.buffer = self.reader.read_cached_at(self.pos, count)?;
             if self.buffer.is_empty() {
                 return invalid("unexpected_end_of_stream");
@@ -255,6 +263,17 @@ struct Huffman {
     lookup_bits: u8,
 }
 
+#[derive(Clone, Copy)]
+struct LsbHuffman<'a> {
+    counts: &'a [u16; 24],
+    first_code: &'a [u32; 24],
+    first_symbol: &'a [usize; 24],
+    symbols: &'a [u16],
+    max_len: usize,
+    lookup: &'a [u32],
+    lookup_bits: u8,
+}
+
 impl Huffman {
     fn new(lengths: &[u8], max_allowed: usize, order: BitOrder) -> ValidationResult<Self> {
         let mut counts = [0u16; 24];
@@ -329,27 +348,20 @@ impl Huffman {
         })
     }
 
+    fn lsb(&self) -> LsbHuffman<'_> {
+        LsbHuffman {
+            counts: &self.counts,
+            first_code: &self.first_code,
+            first_symbol: &self.first_symbol,
+            symbols: &self.symbols,
+            max_len: self.max_len,
+            lookup: &self.lookup,
+            lookup_bits: self.lookup_bits,
+        }
+    }
+
     fn decode_lsb(&self, bits: &mut LsbBits<'_, '_>) -> ValidationResult<u16> {
-        bits.fill_available(self.lookup_bits)?;
-        if bits.count >= self.lookup_bits {
-            let entry = self.lookup[(bits.bits & ((1u64 << self.lookup_bits) - 1)) as usize];
-            if entry != 0 {
-                let length = (entry >> 16) as u8;
-                bits.bits >>= length;
-                bits.count -= length;
-                return Ok(entry as u16);
-            }
-        }
-        let mut code = 0u32;
-        for length in 1..=self.max_len {
-            code = (code << 1) | bits.read(1)?;
-            let first = self.first_code[length];
-            let count = u32::from(self.counts[length]);
-            if code >= first && code - first < count {
-                return Ok(self.symbols[self.first_symbol[length] + (code - first) as usize]);
-            }
-        }
-        invalid("invalid_huffman_symbol")
+        self.lsb().decode(bits)
     }
 
     fn decode_msb(&self, bits: &mut MsbBits<'_, '_>) -> ValidationResult<u16> {
@@ -375,18 +387,108 @@ impl Huffman {
     }
 }
 
-fn fixed_deflate_trees() -> ValidationResult<(Huffman, Huffman)> {
-    let mut literals = vec![0u8; 288];
-    literals[..144].fill(8);
-    literals[144..256].fill(9);
-    literals[256..280].fill(7);
-    literals[280..].fill(8);
-    let distances = vec![5u8; 32];
-    Ok((
-        Huffman::new(&literals, 15, BitOrder::Lsb)?,
-        Huffman::new(&distances, 15, BitOrder::Lsb)?,
-    ))
+impl LsbHuffman<'_> {
+    fn decode(&self, bits: &mut LsbBits<'_, '_>) -> ValidationResult<u16> {
+        bits.fill_available(self.lookup_bits)?;
+        if bits.count >= self.lookup_bits {
+            let entry = self.lookup[(bits.bits & ((1u64 << self.lookup_bits) - 1)) as usize];
+            if entry != 0 {
+                let length = (entry >> 16) as u8;
+                bits.bits >>= length;
+                bits.count -= length;
+                return Ok(entry as u16);
+            }
+        }
+        let mut code = 0u32;
+        for length in 1..=self.max_len {
+            code = (code << 1) | bits.read(1)?;
+            let first = self.first_code[length];
+            let count = u32::from(self.counts[length]);
+            if code >= first && code - first < count {
+                return Ok(self.symbols[self.first_symbol[length] + (code - first) as usize]);
+            }
+        }
+        invalid("invalid_huffman_symbol")
+    }
 }
+
+// RFC 1951 fixed codes are input-independent protocol constants. Generate
+// their lookup entries at compile time and use the same LSB decoder as dynamic
+// tables, including its short-code fallback at the physical end of a stream.
+const fn fixed_literal_symbols() -> [u16; 288] {
+    let mut symbols = [0; 288];
+    let mut i = 0;
+    while i < symbols.len() {
+        symbols[i] = if i < 24 {
+            256 + i as u16
+        } else if i < 168 {
+            (i - 24) as u16
+        } else if i < 176 {
+            280 + (i - 168) as u16
+        } else {
+            144 + (i - 176) as u16
+        };
+        i += 1;
+    }
+    symbols
+}
+
+const fn fixed_lookup<const N: usize>(distance: bool) -> [u32; N] {
+    let mut entries = [0; N];
+    let mut i = 0;
+    while i < N {
+        let (length, symbol) = if distance {
+            (5, (i as u32).reverse_bits() >> 27)
+        } else {
+            let code = (i as u32).reverse_bits() >> 23;
+            if code >> 2 < 24 {
+                (7, 256 + (code >> 2))
+            } else if code >> 1 < 192 {
+                (8, (code >> 1) - 48)
+            } else if code >> 1 < 200 {
+                (8, 280 + (code >> 1) - 192)
+            } else {
+                (9, 144 + code - 400)
+            }
+        };
+        entries[i] = (length << 16) | symbol;
+        i += 1;
+    }
+    entries
+}
+
+const FIXED_LITERAL_SYMBOLS: [u16; 288] = fixed_literal_symbols();
+const FIXED_LITERAL_LOOKUP: [u32; 512] = fixed_lookup::<512>(false);
+const FIXED_DISTANCE_LOOKUP: [u32; 32] = fixed_lookup::<32>(true);
+const FIXED_LITERAL_TREE: LsbHuffman<'static> = LsbHuffman {
+    counts: &[
+        0, 0, 0, 0, 0, 0, 0, 24, 152, 112, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    ],
+    first_code: &[
+        0, 0, 0, 0, 0, 0, 0, 0, 48, 400, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    ],
+    first_symbol: &[
+        0, 0, 0, 0, 0, 0, 0, 0, 24, 176, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    ],
+    symbols: &FIXED_LITERAL_SYMBOLS,
+    max_len: 9,
+    lookup: &FIXED_LITERAL_LOOKUP,
+    lookup_bits: 9,
+};
+const FIXED_DISTANCE_TREE: LsbHuffman<'static> = LsbHuffman {
+    counts: &[
+        0, 0, 0, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    ],
+    first_code: &[0; 24],
+    first_symbol: &[0; 24],
+    symbols: &[
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+        25, 26, 27, 28, 29, 30, 31,
+    ],
+    max_len: 5,
+    lookup: &FIXED_DISTANCE_LOOKUP,
+    lookup_bits: 5,
+};
 
 fn dynamic_deflate_trees(bits: &mut LsbBits<'_, '_>) -> ValidationResult<(Huffman, Huffman)> {
     let literal_count = bits.read(5)? as usize + 257;
@@ -640,13 +742,15 @@ fn parse_deflate(
                 output.add_count(u64::from(length))?;
             }
         } else if block_type == 1 || block_type == 2 {
+            let dynamic_trees;
             let (literal_tree, distance_tree) = if block_type == 1 {
-                fixed_deflate_trees()?
+                (FIXED_LITERAL_TREE, FIXED_DISTANCE_TREE)
             } else {
-                dynamic_deflate_trees(bits)?
+                dynamic_trees = dynamic_deflate_trees(bits)?;
+                (dynamic_trees.0.lsb(), dynamic_trees.1.lsb())
             };
             loop {
-                let symbol = literal_tree.decode_lsb(bits)?;
+                let symbol = literal_tree.decode(bits)?;
                 match symbol {
                     0..=255 => output.write_byte(symbol as u8)?,
                     256 => break,
@@ -654,7 +758,7 @@ fn parse_deflate(
                         let index = usize::from(symbol - 257);
                         let length = u64::from(LENGTH_BASE[index])
                             + u64::from(bits.read(LENGTH_EXTRA[index])?);
-                        let distance_symbol = distance_tree.decode_lsb(bits)? as usize;
+                        let distance_symbol = distance_tree.decode(bits)? as usize;
                         if distance_symbol >= DIST_BASE.len() {
                             return invalid("invalid_deflate_distance_symbol");
                         }
@@ -1092,10 +1196,42 @@ fn xz_check_size(check_id: u8) -> ValidationResult<u64> {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct XzFooter {
+    pub(crate) end: u64,
+    flags: [u8; 2],
+    check_size: u64,
+    index_size: u64,
+}
+
+pub(crate) fn read_xz_footer(reader: &ManagedReader, end: u64) -> ValidationResult<XzFooter> {
+    let start = end
+        .checked_sub(12)
+        .ok_or(ValidationError::Invalid("xz_footer_missing"))?;
+    let footer = reader.read_cached_at(start, 12)?;
+    if footer.len() != 12 || &footer[10..12] != b"YZ" {
+        return invalid("xz_footer_magic_invalid");
+    }
+    if u32::from_le_bytes(footer[0..4].try_into().unwrap()) != crc32(&footer[4..10]) {
+        return invalid("xz_footer_crc_bad");
+    }
+    let flags = [footer[8], footer[9]];
+    if flags[0] != 0 || flags[1] & 0xf0 != 0 {
+        return invalid("xz_stream_flags_invalid");
+    }
+    Ok(XzFooter {
+        end,
+        flags,
+        check_size: xz_check_size(flags[1] & 0x0f)?,
+        index_size: (u64::from(u32::from_le_bytes(footer[4..8].try_into().unwrap())) + 1) * 4,
+    })
+}
+
 pub(crate) fn resolve_xz_boundary_exact(
     reader: &ManagedReader,
     offset: u64,
     limit: u64,
+    footer_evidence: &[XzFooter],
 ) -> ValidationResult<StructureValidation> {
     if limit < offset + 24 {
         return invalid("xz_header_or_footer_missing");
@@ -1105,32 +1241,38 @@ pub(crate) fn resolve_xz_boundary_exact(
     let mut total_blocks = 0usize;
     let mut checksum_present = false;
     while reverse_end > offset {
-        while reverse_end >= offset + 4 {
-            let word = reader.read_cached_at(reverse_end - 4, 4)?;
-            if word.as_slice() != [0, 0, 0, 0] {
-                break;
+        // Proven YZ footers cannot end with a zero padding word. Reuse their
+        // independent facts, including on reverse walks of preceding streams.
+        let mut known = footer_evidence
+            .binary_search_by_key(&reverse_end, |footer| footer.end)
+            .ok();
+        if known.is_none() {
+            while reverse_end >= offset + 4 {
+                let word = reader.read_cached_at(reverse_end - 4, 4)?;
+                if word.as_slice() != [0, 0, 0, 0] {
+                    break;
+                }
+                reverse_end -= 4;
             }
-            reverse_end -= 4;
+            known = footer_evidence
+                .binary_search_by_key(&reverse_end, |footer| footer.end)
+                .ok();
         }
         if reverse_end < offset + 24 {
             return invalid("xz_footer_missing");
         }
         let footer_start = reverse_end - 12;
-        let footer = reader.read_cached_at(footer_start, 12)?;
-        if footer.len() != 12 || &footer[10..12] != b"YZ" {
-            return invalid("xz_footer_magic_invalid");
-        }
-        if u32::from_le_bytes(footer[0..4].try_into().unwrap()) != crc32(&footer[4..10]) {
-            return invalid("xz_footer_crc_bad");
-        }
-        let flags = [footer[8], footer[9]];
-        if flags[0] != 0 || flags[1] & 0xf0 != 0 {
-            return invalid("xz_stream_flags_invalid");
-        }
-        let check_size = xz_check_size(flags[1] & 0x0f)?;
+        let footer = match known {
+            Some(index) => footer_evidence[index],
+            None => read_xz_footer(reader, reverse_end)?,
+        };
+        let XzFooter {
+            flags,
+            check_size,
+            index_size,
+            ..
+        } = footer;
         checksum_present |= check_size != 0;
-
-        let index_size = (u64::from(u32::from_le_bytes(footer[4..8].try_into().unwrap())) + 1) * 4;
         let index_start = footer_start
             .checked_sub(index_size)
             .ok_or(ValidationError::Invalid("xz_backward_size_out_of_range"))?;
@@ -1245,20 +1387,13 @@ pub(crate) fn validate_xz_structure_exact(
             return invalid("xz_footer_missing");
         }
         let footer_start = reverse_end - 12;
-        let footer = reader.read_cached_at(footer_start, 12)?;
-        if footer.len() != 12 || &footer[10..12] != b"YZ" {
-            return invalid("xz_footer_magic_invalid");
-        }
-        if u32::from_le_bytes(footer[0..4].try_into().unwrap()) != crc32(&footer[4..10]) {
-            return invalid("xz_footer_crc_bad");
-        }
-        let flags = [footer[8], footer[9]];
-        if flags[0] != 0 || flags[1] & 0xf0 != 0 {
-            return invalid("xz_stream_flags_invalid");
-        }
-        let check_size = xz_check_size(flags[1] & 0x0f)?;
+        let XzFooter {
+            flags,
+            check_size,
+            index_size,
+            ..
+        } = read_xz_footer(reader, reverse_end)?;
         checksum_present |= check_size != 0;
-        let index_size = (u64::from(u32::from_le_bytes(footer[4..8].try_into().unwrap())) + 1) * 4;
         let index_start = footer_start
             .checked_sub(index_size)
             .ok_or(ValidationError::Invalid("xz_backward_size_out_of_range"))?;
@@ -1574,6 +1709,84 @@ mod tests {
 
     fn reader(data: Vec<u8>) -> ManagedReader {
         ManagedReader::from_bytes(data, ReaderConfig::default())
+    }
+
+    // Independent of archive codecs: cover every fixed symbol, bit alignment,
+    // the short-code EOF fallback, and lookahead ownership across probe refill.
+    #[test]
+    fn fixed_deflate_constants_decode_all_rfc_codes_and_short_eof() {
+        for prefix in 0..8 {
+            for distance in [false, true] {
+                let count = if distance { 32 } else { 288 };
+                let mut logical = vec![0u8; prefix];
+                for symbol in 0..count {
+                    let (code, length) = if distance {
+                        (symbol, 5)
+                    } else {
+                        match symbol {
+                            0..=143 => (0x30 + symbol, 8),
+                            144..=255 => (0x190 + symbol - 144, 9),
+                            256..=279 => (symbol - 256, 7),
+                            _ => (0xc0 + symbol - 280, 8),
+                        }
+                    };
+                    for shift in (0..length).rev() {
+                        logical.push(((code >> shift) & 1) as u8);
+                    }
+                }
+                let byte_count = logical.len().div_ceil(8);
+                let mut data = vec![0u8; byte_count];
+                for (index, bit) in logical.iter().enumerate() {
+                    data[index / 8] |= bit << (index % 8);
+                }
+                data.extend_from_slice(&[0xa5, 0x5a]);
+                let source = reader(data.clone());
+                let mut cursor = ByteCursor::new(&source, 0, data.len() as u64);
+                let mut bits = LsbBits::new(&mut cursor);
+                bits.read(prefix as u8).unwrap();
+                let tree = if distance {
+                    FIXED_DISTANCE_TREE
+                } else {
+                    FIXED_LITERAL_TREE
+                };
+                for symbol in 0..count {
+                    assert_eq!(tree.decode(&mut bits).unwrap(), symbol as u16);
+                }
+                bits.align_byte();
+                assert_eq!(cursor.position(), byte_count as u64);
+                assert_eq!(cursor.read_exact(2).unwrap(), [0xa5, 0x5a]);
+            }
+        }
+        let source = reader(vec![0]);
+        let mut cursor = ByteCursor::new(&source, 0, 1);
+        let mut bits = LsbBits::new(&mut cursor);
+        assert_eq!(FIXED_LITERAL_TREE.decode(&mut bits).unwrap(), 256);
+        assert_eq!(
+            FIXED_LITERAL_TREE.decode(&mut bits).unwrap_err().code(),
+            "unexpected_end_of_stream"
+        );
+    }
+
+    // A short logical stream must fit its read budget even in a large carrier;
+    // existing whole-file fixtures do not detect reads of unrelated tail data.
+    #[test]
+    fn tiny_gzip_boundary_preserves_unrelated_carrier_read_budget() {
+        let member = gzip_member(b"");
+        let end = member.len() as u64;
+        let mut data = member;
+        data.extend_from_slice(b"carrier-tail");
+        data.resize(2 * BUFFER_SIZE, 0);
+        let source = ManagedReader::from_bytes(
+            data,
+            ReaderConfig {
+                max_read_bytes: Some(512),
+                ..ReaderConfig::default()
+            },
+        );
+        let result = validate_gzip_structure(&source, 0, source.len()).unwrap();
+        assert_eq!(result.end_offset, end);
+        assert_eq!(result.stream_count, 1);
+        assert_eq!(result.decoded_size, Some(0));
     }
 
     // The small archive fixtures cannot force every overlapping match across
