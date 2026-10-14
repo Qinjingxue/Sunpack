@@ -47,7 +47,7 @@ def test_progress_displays_nested_archive_parent_chain_and_final_page(tmp_path, 
     assert "[扫描中] 正在查找压缩包…" in output
     assert "[扫描完成] 发现 1 个待处理压缩包" in output
     assert "[递归扫描] 第 2 层发现 1 个嵌套压缩包" in output
-    assert "└─ [成功 2/2] inner.7z（来自 outer.zip）" in output
+    assert "+- [成功 2/2] inner.7z（来自 outer.zip）" in output
     assert "完整成功：2  部分恢复：0  解压失败：0  扫描错误：0" in output
     assert "递归层级：2 层，处理嵌套包：1 个" in output
     assert f"输出位置：{outer_output}" in output
