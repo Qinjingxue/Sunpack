@@ -449,7 +449,7 @@ class RunReporter:
 
     @staticmethod
     def _tree_prefix(depth: int) -> str:
-        return "" if depth <= 1 else "  " * (depth - 1) + "└─ "
+        return "" if depth <= 1 else "  " * (depth - 1) + "+- "
 
     def _output_location(self) -> str:
         outputs = [os.path.abspath(os.path.normpath(path)) for path in self._top_level_outputs if path]
