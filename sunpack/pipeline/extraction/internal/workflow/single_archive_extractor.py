@@ -326,11 +326,6 @@ class SingleArchiveExtractor:
                 selected_password = self._worker_selected_password(resolution, run_result)
                 if selected_password is not None:
                     correct_pwd = selected_password
-                failure = self._downgrade_ambiguous_split_empty_password(
-                    resolution,
-                    failure,
-                    is_split=is_split,
-                )
                 if failure.details.get("evidence") == "zipcrypto_entry_crc_proven_before_failure":
                     self.password_resolver.confirm_extraction(resolution, password=correct_pwd)
                 elif failure.kind == FailureKind.WRONG_PASSWORD and worker_result.get("password_candidates_all_rejected"):
@@ -629,40 +624,6 @@ class SingleArchiveExtractor:
             details={"diagnostic": resolution.error_text, "read_error": read_error},
         )
 
-    @staticmethod
-    def _downgrade_ambiguous_split_empty_password(
-        resolution: PasswordResolution,
-        failure: FailureInfo,
-        *,
-        is_split: bool,
-    ) -> FailureInfo:
-        """Do not turn an incomplete split stream into password evidence.
-
-        With an unknown encryption state the resolver deliberately tries the
-        empty password as an extraction transaction.  Some archive backends
-        report a truncated split stream as ``wrong_password``.  Rejecting the
-        empty candidate in that situation poisons the fingerprint cache and
-        creates a password-only watch blocker.  Positive encryption facts and
-        non-empty user/store candidates retain the normal password behavior.
-        """
-        if (
-            not is_split
-            or failure.kind is not FailureKind.WRONG_PASSWORD
-            or resolution.password != ""
-            or resolution.encrypted is True
-        ):
-            return failure
-        return FailureInfo(
-            kind=FailureKind.PASSWORD_INCONCLUSIVE,
-            stage=failure.stage,
-            message_key="failure.password_state_unknown",
-            message=failure.message,
-            details={
-                **dict(failure.details or {}),
-                "evidence": "ambiguous_empty_password_on_split_input",
-                "original_failure": failure.to_dict(),
-            },
-        )
 
     def _extract_embedded_segments_state_machine(
         self,
