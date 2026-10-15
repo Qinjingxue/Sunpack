@@ -23,10 +23,10 @@ from sunpack.pipeline.extraction.internal.workflow.retry_policy import ExtractRe
 
 
 @pytest.mark.parametrize("encrypted", [None, True])
-def test_split_empty_password_failure_preserves_classification_and_cache(tmp_path, encrypted):
-    # Only a complete extraction attempt detects a discarded downgrade or a
-    # poisoned rejection cache; the classifier tests cannot. This replaces the
-    # two helper-only checks with one cheap worker-stubbed behavior test.
+@pytest.mark.parametrize("candidate_passwords", [("",), ("", "wrong-password")])
+def test_split_empty_password_worker_rejection_is_not_downgraded(tmp_path, encrypted, candidate_passwords):
+    # A conclusive worker rejection must not be overwritten because the first
+    # candidate is empty and the split archive encryption state is unknown.
     archive = str(tmp_path / "payload.7z.001")
     task = ArchiveTask.from_archive_input(ArchiveInputDescriptor(
         entry_path=archive, open_mode="native_volumes", format_hint="7z",
@@ -38,7 +38,7 @@ def test_split_empty_password_failure_preserves_classification_and_cache(tmp_pat
         status=PasswordResolutionStatus.RESOLVED,
         encrypted=encrypted,
         requires_extraction_confirmation=True,
-        candidate_passwords=("",),
+        candidate_passwords=candidate_passwords,
     )
     rejected = []
     extractor = SingleArchiveExtractor(
@@ -50,7 +50,7 @@ def test_split_empty_password_failure_preserves_classification_and_cache(tmp_pat
             emit_semantic_event=lambda *a, **k: None,
             extract_attempt=lambda **k: _worker_completed({
                 "wrong_password": True, "native_status": "wrong_password",
-                "password_candidates_all_rejected": True, "password_attempts": 1,
+                "password_candidates_all_rejected": True, "password_attempts": len(candidate_passwords),
             }),
         ),
         quiet=True,
@@ -58,11 +58,11 @@ def test_split_empty_password_failure_preserves_classification_and_cache(tmp_pat
     extractor._resolve_password = lambda *args: resolution
     result = extractor.extract(task, str(tmp_path / "out"))
 
-    assert result.failure.kind is (FailureKind.WRONG_PASSWORD if encrypted else FailureKind.PASSWORD_INCONCLUSIVE)
-    assert result.failure.is_password_failure is bool(encrypted)
-    assert rejected == ([resolution] if encrypted else [])
-    assert result.diagnostics["password_candidates_rejected"] == int(bool(encrypted))
-    assert result.diagnostics["password_candidates_inconclusive"] == int(encrypted is None)
+    assert result.failure.kind is FailureKind.WRONG_PASSWORD
+    assert result.failure.is_password_failure
+    assert rejected == [resolution]
+    assert result.diagnostics["password_candidates_rejected"] == len(candidate_passwords)
+    assert result.diagnostics["password_candidates_inconclusive"] == 0
 
 
 def test_password_probe_tail_failure_maps_to_missing_volume_with_ambiguous_cli_message():
