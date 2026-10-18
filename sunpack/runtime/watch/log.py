@@ -52,14 +52,12 @@ def _path_lock(path: Path) -> threading.Lock:
         return lock
 
 
-
 class WatchLogStore:
     def __init__(
         self,
         path: str,
         *,
         max_bytes: int = DEFAULT_EVENTS_MAX_BYTES,
-        backup_count: int = DEFAULT_EVENTS_BACKUP_COUNT,
         wake_callback: Callable[[], None] | None = None,
     ):
         self.path = Path(path)
