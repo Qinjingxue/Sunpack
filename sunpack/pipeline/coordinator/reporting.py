@@ -513,6 +513,11 @@ def _terminal_supports_updates(stream: Any) -> bool:
         # a wrapper/redirection can point at a different console or a pipe.
         handle = msvcrt.get_osfhandle(stream.fileno())
         kernel32 = ctypes.windll.kernel32
+        # ctypes defaults to 32-bit arguments; console HANDLEs are pointer-sized.
+        kernel32.GetConsoleMode.argtypes = (ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32))
+        kernel32.GetConsoleMode.restype = ctypes.c_int
+        kernel32.SetConsoleMode.argtypes = (ctypes.c_void_p, ctypes.c_uint32)
+        kernel32.SetConsoleMode.restype = ctypes.c_int
         mode = ctypes.c_uint32()
         if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
             return False
