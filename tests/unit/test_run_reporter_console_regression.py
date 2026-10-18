@@ -5,6 +5,7 @@ mocking the renderer. The pipeline integration test exercises the native worker.
 """
 import io
 import os
+import re
 import sys
 from types import SimpleNamespace
 
@@ -119,7 +120,8 @@ def test_console_row_reserves_a_column_to_avoid_unexpected_wrap(tmp_path, monkey
     task = _task(tmp_path / ("很长的嵌套归档名称" * 5 + ".zip"))
     reporter.tasks_discovered(1, [task])
     row = reporter._format_task_row(reporter._task_rows[id(task)])
-    assert reporting._display_width(row) < stream.terminal_columns
+    plain = re.sub(r"\033\[[0-9;]*m", "", row)
+    assert reporting._display_width(plain) < stream.terminal_columns
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="requires real Windows console handles")
