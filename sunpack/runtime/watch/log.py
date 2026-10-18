@@ -14,7 +14,6 @@ from sunpack.core.support.resource_lifecycle import open_service_file
 
 
 DEFAULT_EVENTS_MAX_BYTES = 1 * 1024 * 1024
-DEFAULT_EVENTS_BACKUP_COUNT = 1
 
 _PATH_LOCKS_GUARD = threading.Lock()
 _PATH_LOCKS: weakref.WeakValueDictionary[str, threading.Lock] = weakref.WeakValueDictionary()
@@ -25,13 +24,11 @@ def append_jsonl_record(
     record: dict[str, Any],
     *,
     max_bytes: int = DEFAULT_EVENTS_MAX_BYTES,
-    backup_count: int = DEFAULT_EVENTS_BACKUP_COUNT,
 ) -> None:
-    """Append one JSONL record, rotating the file before it exceeds its limit."""
+    """Append a JSONL record, resetting the log if the next record exceeds its limit."""
     target = Path(path)
     encoded = (json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
     limit = max(1, int(max_bytes))
-    backups = max(1, int(backup_count))
     lock = _path_lock(target)
     with lock:
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -39,9 +36,8 @@ def append_jsonl_record(
             current_size = target.stat().st_size
         except FileNotFoundError:
             current_size = 0
-        if current_size > 0 and current_size + len(encoded) > limit:
-            _rotate_jsonl(target, backups)
-        with open_service_file(target, "ab") as handle:
+        mode = "wb" if current_size > 0 and current_size + len(encoded) > limit else "ab"
+        with open_service_file(target, mode) as handle:
             handle.write(encoded)
 
 
@@ -55,27 +51,17 @@ def _path_lock(path: Path) -> threading.Lock:
         return lock
 
 
-def _rotate_jsonl(path: Path, backup_count: int) -> None:
-    for index in range(backup_count, 0, -1):
-        source = path if index == 1 else path.with_name(f"{path.name}.{index - 1}")
-        destination = path.with_name(f"{path.name}.{index}")
-        if source.exists():
-            os.replace(source, destination)
-
-
 class WatchLogStore:
     def __init__(
         self,
         path: str,
         *,
         max_bytes: int = DEFAULT_EVENTS_MAX_BYTES,
-        backup_count: int = DEFAULT_EVENTS_BACKUP_COUNT,
         wake_callback: Callable[[], None] | None = None,
     ):
         self.path = Path(path)
         self._path_lock = _path_lock(self.path)
         self.max_bytes = max(1, int(max_bytes))
-        self.backup_count = max(1, int(backup_count))
         self._throttle_lock = threading.Lock()
         self._last_throttled_write: dict[tuple[str, str], tuple[float, float]] = {}
         self._next_throttle_expiry: float | None = None
@@ -120,7 +106,6 @@ class WatchLogStore:
                 self.path,
                 record,
                 max_bytes=self.max_bytes,
-                backup_count=self.backup_count,
             )
         except Exception:
             return
