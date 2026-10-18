@@ -518,3 +518,52 @@ def test_encrypted_comment_zip_in_nested_carriers_runs_for_both_origins(tmp_path
         assert response.summary.success_count == 2
         leaf = next(item for item in response.summary.target_results if Path(item.input_path).name == "inner.jpg")
         assert (Path(leaf.output_dir) / "secret.txt").read_bytes() == PAYLOAD
+
+
+def test_real_native_zip_progress_stays_complete_after_watch_semantic_finish(tmp_path):
+    """Extract a real ZIP through the native worker and retain final UI state.
+
+    Watch emits task_output_finished after task_finished; it must not reset the
+    terminal's completed row to extracting/0%, even without byte fields.
+    """
+    from tests.helpers.config_factory import make_config
+
+    payload = b"native progress payload" * 16384
+    archive = tmp_path / "real-progress.zip"
+    archive.write_bytes(make_zip({"payload.bin": payload}))
+    config = make_config({
+        "recursive_extract": "1",
+        "output": {"root": str(tmp_path / "out")},
+        "verification": {"enabled": False, "methods": []},
+        "post_extract": {"archive_cleanup_mode": "k", "flatten_single_directory": False},
+    })
+    output = io.StringIO()
+    output.isatty = lambda: True
+    output.supports_terminal_updates = True
+    output.terminal_columns = 100
+    events = []
+    reporters = []
+
+    engine = PipelineEngine(config)
+    _configure_request_runtime(engine, lambda runtime: reporters.append(runtime.reporter))
+
+    async def run():
+        async with engine:
+            return await engine.run(
+                [str(archive)], direct=True, origin="watch", stdout=output,
+                progress_callback=lambda task, event: events.append(dict(event)),
+            )
+
+    response = asyncio.run(run())
+    assert response.summary.success_count == 1
+    assert (Path(response.summary.target_results[0].output_dir) / "payload.bin").read_bytes() == payload
+    assert any(event.get("type") == "progress" for event in events)
+    assert any(event.get("event") == "extract_ready" for event in events)
+    assert any(event.get("event") == "task_output_finished" for event in events)
+    reporter = reporters[0]
+    rows = list(reporter._task_rows.values())
+    assert len(rows) == 1
+    assert rows[0]["state"] == "complete"
+    assert rows[0]["progress_known"] is True
+    assert rows[0]["progress"] == 1.0
+    assert "100%" in output.getvalue()
