@@ -4,11 +4,16 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: "Version label to use in build artifact filenames, for example v0.1.0. Leave empty to derive it from git."
+        description: "Tag for a manual Release (e.g. v1.1.11), or just a package version label when not publishing."
         required: false
         type: string
+      publish_release:
+        description: "Publish a GitHub Release when manually running this workflow (tag pushes always publish)."
+        required: false
+        default: false
+        type: boolean
       fast_build:
-        description: "Manual build verification: disable Nuitka LTO. Tagged releases always use full optimization."
+        description: "Skip Nuitka LTO for manual build-only runs. Publishing always uses full optimization."
         required: false
         default: false
         type: boolean
@@ -28,6 +33,9 @@ jobs:
     name: Generate build notes
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    outputs:
+      release_tag: ${{ steps.notes.outputs.release_tag }}
+      target_sha: ${{ steps.notes.outputs.target_sha }}
 
     steps:
       - name: Checkout
@@ -39,51 +47,82 @@ jobs:
         id: notes
         shell: bash
         env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           IS_TAG_REF: ${{ startsWith(github.ref, 'refs/tags/') }}
           REF_NAME: ${{ github.ref_name }}
           RELEASE_TAG_INPUT: ${{ github.event.inputs.release_tag || '' }}
-          SHA: ${{ github.sha }}
+          SHOULD_PUBLISH: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish_release) }}
         run: |
           set -euo pipefail
-          # Remove stale local tag refs first; this matters when a release tag is
-          # deleted and recreated at a different commit.
           git fetch --force --prune --tags
+          git fetch --force origin +refs/heads/main:refs/remotes/origin/main
 
-          target="${SHA}"
+          target="$(git rev-parse HEAD)"
           current_tag=""
-          if [ "${IS_TAG_REF}" = "true" ]; then
+          if [[ "${IS_TAG_REF}" == "true" ]]; then
             current_tag="${REF_NAME}"
-            target="$(git rev-list -n 1 "${current_tag}")"
-          elif [ -n "${RELEASE_TAG_INPUT}" ]; then
+            if [[ -n "${RELEASE_TAG_INPUT}" && "${RELEASE_TAG_INPUT}" != "${current_tag}" ]]; then
+              echo "The manually entered tag differs from the selected tag ref." >&2
+              exit 1
+            fi
+          elif [[ -n "${RELEASE_TAG_INPUT}" ]]; then
             current_tag="${RELEASE_TAG_INPUT}"
           fi
 
-          previous_tag=""
-          if [ "${IS_TAG_REF}" = "true" ]; then
-            previous_tag="$(git describe --tags --match 'v*' --exclude="${current_tag}" --abbrev=0 "${target}^" 2>/dev/null || true)"
-          else
-            previous_tag="$(git describe --tags --match 'v*' --abbrev=0 "${target}" 2>/dev/null || true)"
+          if [[ "${SHOULD_PUBLISH}" == "true" ]]; then
+            if [[ ! "${current_tag}" =~ ^v[0-9][A-Za-z0-9._-]*$ ]]; then
+              echo "Publishing requires a version tag such as v1.1.11." >&2
+              exit 1
+            fi
+            existing_commit="$(git rev-parse --verify --quiet "refs/tags/${current_tag}^{commit}" || true)"
+            if [[ -n "${existing_commit}" && "${existing_commit}" != "${target}" ]]; then
+              echo "Tag ${current_tag} points to ${existing_commit}, but this run builds ${target}." >&2
+              echo "Select the matching tag ref in Run workflow, or choose a new tag." >&2
+              exit 1
+            fi
+            if [[ "${IS_TAG_REF}" != "true" ]] && ! git merge-base --is-ancestor "${target}" refs/remotes/origin/main; then
+              echo "Manual publishing must build a commit on main." >&2
+              exit 1
+            fi
           fi
 
-          if [ -n "${previous_tag}" ]; then
-            range="${previous_tag}..${target}"
-            compare_label="${previous_tag}..${current_tag:-${REF_NAME}}"
-          else
-            range="${target}"
-            compare_label="${current_tag:-${REF_NAME}}"
+          # Choose the most recently published Release on main, rather than a nearby tag.
+          # This repository's Releases record an immutable commit SHA as target_commitish.
+          releases="$(gh api --paginate "repos/${GH_REPO}/releases?per_page=100" \
+            --jq '.[] | select(.draft == false and .published_at != null) | [.published_at, .tag_name, .target_commitish] | @tsv' | sort -r)"
+
+          previous_version=""
+          previous_commit=""
+          while IFS=$'\t' read -r published_at version commit; do
+            [[ -n "${published_at}" && -n "${version}" ]] || continue
+            [[ "${version}" != "${current_tag}" ]] || continue
+            [[ "${commit}" =~ ^[0-9a-fA-F]{40}$ ]] || continue
+            [[ "${commit}" != "${target}" ]] || continue
+            git cat-file -e "${commit}^{commit}" 2>/dev/null || continue
+            git merge-base --is-ancestor "${commit}" refs/remotes/origin/main || continue
+            git merge-base --is-ancestor "${commit}" "${target}" || continue
+            previous_version="${version}"
+            previous_commit="${commit}"
+            break
+          done <<< "${releases}"
+
+          range="${target}"
+          if [[ -n "${previous_commit}" ]]; then
+            range="${previous_commit}..${target}"
           fi
 
           {
             echo "# SunPack build notes"
             echo
-            if [ -n "${current_tag}" ]; then
+            if [[ -n "${current_tag}" ]]; then
               echo "Build version: ${current_tag}"
             else
               echo "Build ref: ${REF_NAME}"
             fi
             echo "Commit: ${target}"
-            if [ -n "${previous_tag}" ]; then
-              echo "Changes since: ${previous_tag}"
+            if [[ -n "${previous_version}" ]]; then
+              echo "Changes since published Release: ${previous_version}"
             else
               echo "Changes since: initial history"
             fi
@@ -92,13 +131,14 @@ jobs:
           } > build-notes.md
 
           commits="$(git log --format='- %s (%h)' "${range}")"
-          if [ -n "${commits}" ]; then
+          if [[ -n "${commits}" ]]; then
             printf '%s\n' "${commits}" >> build-notes.md
           else
-            echo "- No commits found in ${compare_label}." >> build-notes.md
+            echo "- No commits since the previous published Release." >> build-notes.md
           fi
 
-          echo "previous_tag=${previous_tag}" >> "${GITHUB_OUTPUT}"
+          echo "release_tag=${current_tag}" >> "${GITHUB_OUTPUT}"
+          echo "target_sha=${target}" >> "${GITHUB_OUTPUT}"
 
       - name: Upload build notes
         uses: actions/upload-artifact@v7
@@ -110,6 +150,7 @@ jobs:
 
   build:
     name: Build ${{ matrix.arch }}
+    needs: build-notes
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 150
     strategy:
@@ -166,9 +207,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: .cache/nuitka/${{ matrix.arch }}
-          key: nuitka-v1-${{ runner.os }}-${{ matrix.arch }}-py${{ matrix.python_version }}-${{ steps.native-cache.outputs.toolchain }}-${{ hashFiles('uv.lock') }}-${{ github.event_name == 'workflow_dispatch' && inputs.fast_build && 'fast' || 'lto' }}-${{ hashFiles('sunpack/**', 'sunpack.py', 'scripts/build_windows.ps1') }}
+          key: nuitka-v1-${{ runner.os }}-${{ matrix.arch }}-py${{ matrix.python_version }}-${{ steps.native-cache.outputs.toolchain }}-${{ hashFiles('uv.lock') }}-${{ github.event_name == 'workflow_dispatch' && !inputs.publish_release && inputs.fast_build && 'fast' || 'lto' }}-${{ hashFiles('sunpack/**', 'sunpack.py', 'scripts/build_windows.ps1') }}
           restore-keys: |
-            nuitka-v1-${{ runner.os }}-${{ matrix.arch }}-py${{ matrix.python_version }}-${{ steps.native-cache.outputs.toolchain }}-${{ hashFiles('uv.lock') }}-${{ github.event_name == 'workflow_dispatch' && inputs.fast_build && 'fast' || 'lto' }}-
+            nuitka-v1-${{ runner.os }}-${{ matrix.arch }}-py${{ matrix.python_version }}-${{ steps.native-cache.outputs.toolchain }}-${{ hashFiles('uv.lock') }}-${{ github.event_name == 'workflow_dispatch' && !inputs.publish_release && inputs.fast_build && 'fast' || 'lto' }}-
 
       - name: Bootstrap Python and external tools
         shell: pwsh
@@ -212,7 +253,7 @@ jobs:
           GIT_EVENT_NAME: ${{ github.event_name }}
           GIT_REF_NAME: ${{ github.ref_name }}
           IS_TAG_REF: ${{ startsWith(github.ref, 'refs/tags/') }}
-          FAST_BUILD: ${{ github.event_name == 'workflow_dispatch' && inputs.fast_build && 'true' || 'false' }}
+          FAST_BUILD: ${{ github.event_name == 'workflow_dispatch' && !inputs.publish_release && inputs.fast_build && 'true' || 'false' }}
           NUITKA_CACHE_DIR: ${{ github.workspace }}\.cache\nuitka\${{ matrix.arch }}
           CLCACHE_BASEDIR: ${{ github.workspace }}
         run: |
@@ -268,11 +309,12 @@ jobs:
 
   acceptance:
     name: Acceptance Tests
+    needs: build-notes
     uses: ./.github/workflows/acceptance.yml
 
   release:
     name: Publish GitHub Release
-    if: ${{ startsWith(github.ref, 'refs/tags/') }}
+    if: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish_release) }}
     needs:
       - build-notes
       - build
@@ -299,8 +341,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          TAG_NAME: ${{ github.ref_name }}
-          RELEASE_TARGET: ${{ github.sha }}
+          TAG_NAME: ${{ needs.build-notes.outputs.release_tag }}
+          RELEASE_TARGET: ${{ needs.build-notes.outputs.target_sha }}
         shell: bash
         run: |
           set -euo pipefail
