@@ -101,6 +101,59 @@ def test_sunpack_payload_recurses_across_concurrent_origins(tmp_path):
         assert not (Path(leaf.output_dir) / ".sunpack").exists()
 
 
+def test_deep_detect_only_applies_to_initial_round_in_real_pipeline(tmp_path):
+    """Deep must find the initial carrier without unpacking its APK/PE outputs."""
+    from sunpack.pipeline.discovery.embedded.options import EmbeddedOptions
+    from tests.helpers.config_factory import make_config
+    from tests.helpers.fs_builder import make_minimal_pe
+
+    apk_bytes = make_zip({"apk-only.txt": b"apk resource"})
+    exe_bytes = make_minimal_pe() + make_zip({"exe-only.txt": b"exe resource"})
+    nested_bytes = make_zip({"nested-only.txt": b"ordinary archive"})
+    carrier = tmp_path / "carrier.bin"
+    carrier.write_bytes(b"non-archive prefix" * 16 + make_zip({
+        "client.apk": apk_bytes,
+        "launcher.exe": exe_bytes,
+        "nested.zip": nested_bytes,
+    }))
+    output_root = tmp_path / "out"
+    config = make_config({
+        "recursive_extract": "2",
+        "recursive_authorization": {"enabled": False},
+        "filesystem": {
+            "scan_filters_enabled": True,
+            "scan_filters": [{
+                "name": "blacklist",
+                "enabled": True,
+                "blocked_extensions": [".bin", ".apk"],
+            }],
+        },
+        "output": {"root": str(output_root)},
+        "post_extract": {"archive_cleanup_mode": "k", "flatten_single_directory": False},
+    })
+
+    async def run():
+        async with PipelineEngine(config) as engine:
+            return await engine.run(
+                [str(carrier)],
+                detection_options=EmbeddedOptions(force_scan=True),
+                stdout=io.StringIO(),
+                stderr=io.StringIO(),
+            )
+
+    response = asyncio.run(run())
+    assert response.summary.failed_tasks == []
+    assert response.summary.success_count == 2
+    assert {Path(item.input_path).name for item in response.summary.target_results} == {
+        "carrier.bin", "nested.zip",
+    }
+    assert [path.read_bytes() for path in output_root.rglob("client.apk")] == [apk_bytes]
+    assert [path.read_bytes() for path in output_root.rglob("launcher.exe")] == [exe_bytes]
+    assert [path.read_bytes() for path in output_root.rglob("nested-only.txt")] == [b"ordinary archive"]
+    assert not list(output_root.rglob("apk-only.txt"))
+    assert not list(output_root.rglob("exe-only.txt"))
+
+
 def _configure_request_runtime(engine, callback):
     factory = engine._request_runtime_factory
 
