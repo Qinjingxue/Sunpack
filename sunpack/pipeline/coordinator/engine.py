@@ -13,7 +13,6 @@ from typing import Any, Awaitable, Callable, Iterable, TextIO
 from sunpack.core.support.path_keys import case_key, path_key_is_under, path_key
 from sunpack.core.support.path_map import PathMap
 from sunpack.pipeline.discovery.detection.input_planning import ArchiveInputPlanningStage
-from sunpack.core.config.detection_view import discovery_run_config
 from sunpack.core.contracts.pipeline import PipelineArtifacts, PipelineDiscovery, PipelineResponse, PipelineTarget
 from sunpack.core.contracts.results import ArchiveCleanupResult, DirectoryFlattenResult, OutcomeKind, TargetRunResult
 from sunpack.core.contracts.run_state import RunState
@@ -144,7 +143,6 @@ class PipelineEngine:
             raise ValueError("PipelineEngine.run requires at least one target")
         request_config = copy.deepcopy(request_config if request_config is not None else self.config)
         detection_options = detection_options or EmbeddedOptions()
-        request_config = discovery_run_config(request_config, deep_detect=detection_options.force_scan)
         user_passwords = tuple(request_config.get("user_passwords", self._user_passwords) or [])
         builtin_passwords = tuple(request_config.get("builtin_passwords", self._builtin_passwords) or [])
         request_config["user_passwords"] = list(user_passwords)
@@ -1054,6 +1052,10 @@ class _RequestRuntime:
             self.context,
             detection_options=detection_options,
         )
+        self.recursive_scanner = (
+            ArchiveTaskScanner(self.config, self.context)
+            if detection_options.force_scan else self.task_scanner
+        )
         self.input_planning_stage = ArchiveInputPlanningStage(
             self.config,
         )
@@ -1221,10 +1223,11 @@ class _RequestRuntime:
         if not roots:
             return True
         self.reporter.scan_started(depth)
+        scanner = self.task_scanner if depth == 1 else self.recursive_scanner
         discovered = await broker.run(
             "discover_detect",
             self.submission.request_id,
-            self.task_scanner.discover_targets,
+            scanner.discover_targets,
             roots,
             scan_session=scan_session,
             is_recursive_scan=depth > 1,
@@ -1234,7 +1237,7 @@ class _RequestRuntime:
         return await self._run_discovery_batch(
             discovered,
             roots=roots,
-            scan_session=scan_session or self.task_scanner.last_scan_session,
+            scan_session=scan_session or scanner.last_scan_session,
             depth=depth,
             direct=False,
             ownership=ownership,
