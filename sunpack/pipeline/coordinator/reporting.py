@@ -56,6 +56,7 @@ class RunReporter:
         self._interactive = not self.quiet and _terminal_supports_updates(self.stdout)
         self._use_color = self._interactive and os.environ.get("NO_COLOR") is None
         self._panel_tasks: list[int] = []
+        self._panel_row_index: dict[int, int] = {}
         self._task_rows: dict[int, dict[str, Any]] = {}
         self._last_streamed_progress: dict[int, int] = {}
         # (volume_key, episode_id) -> 仍在等待该 episode 的 job_id 集合；收到 space_resumed 时移除。
@@ -82,6 +83,7 @@ class RunReporter:
                     "lineage": parent_lineage,
                     "state": "waiting",
                     "progress": 0.0,
+                    "progress_known": False,
                     "completed_bytes": 0,
                     "total_bytes": 0,
                     "detail": "",
@@ -102,6 +104,7 @@ class RunReporter:
             self._print(message)
             if self._interactive:
                 self._panel_tasks = [id(task) for task in tasks]
+                self._panel_row_index = {task_id: i for i, task_id in enumerate(self._panel_tasks)}
                 for task_id in self._panel_tasks:
                     self._print(self._format_task_row(self._task_rows[task_id]))
 
@@ -133,18 +136,23 @@ class RunReporter:
         if name in _SPACE_EVENTS:
             self._space_progress(task, name, event)
             return
+        if event.get("type") != "progress":
+            return
         try:
             completed = max(0, int(event.get("completed_bytes", 0) or 0))
             total = max(0, int(event.get("total_bytes", 0) or 0))
         except (TypeError, ValueError):
             return
-        progress = min(1.0, completed / total) if total > 0 else 0.0
+        known = total > 0
+        progress = min(1.0, completed / total) if known else 0.0
         with self._lock:
-            row = self._task_rows.get(id(task))
+            task_id = id(task)
+            row = self._task_rows.get(task_id)
             if row is None:
                 return
-            old_percent = int(float(row.get("progress", 0.0)) * 100)
-            new_percent = int(progress * 100)
+            old_percent = int(float(row.get("progress", 0.0)) * 100) if row.get("progress_known") else None
+            new_percent = int(progress * 100) if known else None
+            old_state = row.get("state")
             # 磁盘满暂停期间不得把状态改回 extracting：暂停是"等待"，不是进度。
             if row.get("space_blocked"):
                 self._remember_progress_locked(row, progress, completed, total)
@@ -152,20 +160,26 @@ class RunReporter:
             row.update({
                 "state": "extracting",
                 "progress": progress,
+                "progress_known": known,
                 "completed_bytes": completed,
                 "total_bytes": total,
             })
-            if self._interactive and new_percent != old_percent:
-                self._render_panel_locked(force=False)
-            elif not self._interactive:
-                # Terminals without cursor control get a throttled, line-based bar that also
-                # works through wrappers and redirected output without flooding logs.
-                task_id = id(task)
+            if self._interactive:
+                if new_percent != old_percent or old_state != "extracting":
+                    self._render_panel_locked(force=False, task_id=task_id)
+            else:
+                # One indeterminate line until a known total arrives; determinate
+                # progress remains throttled to 10% increments.
                 last_percent = self._last_streamed_progress.get(task_id, -10)
-                displayed_percent = (new_percent // 10) * 10
-                if new_percent >= 100 or displayed_percent >= last_percent + 10:
-                    self._last_streamed_progress[task_id] = displayed_percent
-                    self._print(self._format_task_row(row))
+                if not known:
+                    if last_percent != -1:
+                        self._last_streamed_progress[task_id] = -1
+                        self._print(self._format_task_row(row))
+                else:
+                    displayed_percent = (new_percent // 10) * 10
+                    if last_percent < 0 or displayed_percent >= last_percent + 10:
+                        self._last_streamed_progress[task_id] = displayed_percent
+                        self._print(self._format_task_row(row))
 
     # 空间不足暂停/恢复：按 (volume_key, episode_id) 去重；space_status 是低频诊断（默认 15s），不是看门狗保活。
     def _space_progress(self, task: Any, event: str, payload: dict[str, Any]) -> None:
@@ -181,7 +195,7 @@ class RunReporter:
                 self._space_blocked_jobs.pop(key, None)
                 self._restore_progress_locked(row)
                 if self._interactive:
-                    self._render_panel_locked(force=True)
+                    self._render_panel_locked(force=True, task_id=id(task))
                 return
 
             row["space_blocked"] = True
@@ -196,7 +210,7 @@ class RunReporter:
             else:
                 row["detail"] = ""
             if self._interactive:
-                self._render_panel_locked(force=True)
+                self._render_panel_locked(force=True, task_id=id(task))
             elif not self._interactive and event == "space_blocked":
                 self._print(self.i18n.t(
                     "report.disk_paused",
@@ -217,6 +231,7 @@ class RunReporter:
         self, row: dict[str, Any], progress: float, completed: int, total: int
     ) -> None:
         row["progress"] = progress
+        row["progress_known"] = total > 0
         row["completed_bytes"] = completed
         row["total_bytes"] = total
 
@@ -376,22 +391,26 @@ class RunReporter:
             row["state"] = state
         if progress is not None:
             row["progress"] = min(1.0, max(0.0, float(progress)))
+            row["progress_known"] = True
         if detail is not None:
             row["detail"] = detail
-        self._render_panel_locked(force=force)
+        self._render_panel_locked(force=force, task_id=id(task))
 
-    def _render_panel_locked(self, *, force: bool) -> None:
-        if not self._interactive or not self._panel_tasks:
+    def _render_panel_locked(self, *, force: bool, task_id: int) -> None:
+        if not self._interactive:
+            return
+        row_index = self._panel_row_index.get(task_id)
+        if row_index is None:
             return
         now = time.monotonic()
         if not force and now - self._last_render_at < 0.08:
             return
         self._last_render_at = now
-        self.stdout.write(f"\033[{len(self._panel_tasks)}A")
-        for task_id in self._panel_tasks:
-            row = self._task_rows.get(task_id)
-            text = self._format_task_row(row) if row is not None else ""
-            self.stdout.write(f"\r\033[2K{text}\n")
+        # Cursor rests immediately below the panel; replace only the changed row.
+        lines_up = len(self._panel_tasks) - row_index
+        row = self._task_rows.get(task_id)
+        text = self._format_task_row(row) if row is not None else ""
+        self.stdout.write(f"\033[{lines_up}A\r\033[2K{text}\033[{lines_up}B\r")
         self.stdout.flush()
 
     def _format_task_row(self, row: dict[str, Any]) -> str:
@@ -399,9 +418,11 @@ class RunReporter:
         task = row.get("task")
         state = str(row.get("state") or "waiting")
         progress = float(row.get("progress", 0.0) or 0.0)
+        known = bool(row.get("progress_known"))
         percent = max(0, min(100, int(progress * 100)))
-        filled = max(0, min(20, int(progress * 20)))
+        filled = max(0, min(20, int(progress * 20))) if known else 0
         bar = "#" * filled + "-" * (20 - filled)
+        percent_text = f"{percent:3d}%" if known else " --%"
         labels = {
             "waiting": "report.status.waiting",
             "preparing": "report.status.preparing",
@@ -434,14 +455,21 @@ class RunReporter:
             detail = self.i18n.t("report.detail.error", error=detail)
         else:
             detail = ""
-        fixed = f"{prefix}[{plain_label}] [{bar}] {percent:3d}%  "
+        fixed = f"{prefix}[{plain_label}] [{bar}] {percent_text}  "
         fixed_width = _display_width(fixed)
         terminal_columns = getattr(self.stdout, "terminal_columns", None)
         if not isinstance(terminal_columns, int) or terminal_columns <= 0:
             terminal_columns = shutil.get_terminal_size(fallback=(120, 30)).columns
-        available = max(1, terminal_columns - fixed_width)
+        if terminal_columns <= fixed_width:
+            # A narrow/resized console must not wrap a panel row and corrupt
+            # relative cursor positioning. Omit the bar in this edge case.
+            return _truncate_display(
+                f"{prefix}[{plain_label}] {percent_text} {_task_name(task)}",
+                max(1, terminal_columns - 1),
+            )
+        available = max(0, terminal_columns - fixed_width - 1)
         suffix = _truncate_display(f"{_task_name(task)}{relation}{detail}", available)
-        return f"{prefix}[{label}] [{bar}] {percent:3d}%  {suffix}"
+        return f"{prefix}[{label}] [{bar}] {percent_text}  {suffix}"
 
     @staticmethod
     def _tree_prefix(depth: int) -> str:
@@ -475,15 +503,25 @@ def _terminal_supports_updates(stream: Any) -> bool:
     forwarded_capability = getattr(stream, "supports_terminal_updates", None)
     if forwarded_capability is not None:
         return bool(forwarded_capability)
+    if os.name != "nt":
+        return False
     try:
         import ctypes
+        import msvcrt
 
-        handle = ctypes.windll.kernel32.GetStdHandle(-11)
+        # Query the actual destination stream, not GetStdHandle(STD_OUTPUT_HANDLE):
+        # a wrapper/redirection can point at a different console or a pipe.
+        handle = msvcrt.get_osfhandle(stream.fileno())
+        kernel32 = ctypes.windll.kernel32
         mode = ctypes.c_uint32()
-        if not ctypes.windll.kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+        if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
             return False
-        return bool(ctypes.windll.kernel32.SetConsoleMode(handle, mode.value | 0x0004))
-    except Exception:
+        if not mode.value & 0x0004 and not kernel32.SetConsoleMode(handle, mode.value | 0x0004):
+            return False
+        if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            return False
+        return bool(mode.value & 0x0004)
+    except (AttributeError, OSError, ValueError, TypeError):
         return False
 
 
