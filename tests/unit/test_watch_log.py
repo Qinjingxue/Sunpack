@@ -8,6 +8,7 @@ import sunpack.runtime.watch.log as log_module
 from sunpack.runtime.watch.log import (
     DEFAULT_EVENTS_MAX_BYTES,
     WatchLogStore,
+    append_jsonl_record,
 )
 
 
@@ -19,20 +20,17 @@ def test_watch_log_defaults_to_one_megabyte():
     assert DEFAULT_EVENTS_MAX_BYTES == 1 * 1024 * 1024
 
 
-def test_watch_log_rotates_before_append_and_bounds_backups(tmp_path):
+def test_watch_log_resets_at_limit_without_creating_backups(tmp_path):
     path = tmp_path / "events.jsonl"
-    store = WatchLogStore(str(path), max_bytes=160, backup_count=2)
+    store = WatchLogStore(str(path), max_bytes=160)
 
     for index in range(20):
         store.write("test_event", index=index, message="payload")
 
-    rotated = [path, path.with_name("events.jsonl.1"), path.with_name("events.jsonl.2")]
     assert path.exists()
-    assert path.with_name("events.jsonl.1").exists()
-    assert path.with_name("events.jsonl.2").exists()
-    assert not path.with_name("events.jsonl.3").exists()
-    assert all(item.stat().st_size <= 160 for item in rotated)
-    assert all(record["event"] == "test_event" for item in rotated for record in _records(item))
+    assert path.stat().st_size <= 160
+    assert not list(tmp_path.glob("events.jsonl.*"))
+    assert all(record["event"] == "test_event" for record in _records(path))
     assert _records(path)[-1]["index"] == 19
     another_owner = WatchLogStore(str(path))
     assert another_owner._path_lock is store._path_lock
@@ -41,6 +39,18 @@ def test_watch_log_rotates_before_append_and_bounds_backups(tmp_path):
     assert lock() is another_owner._path_lock
     del another_owner
     assert lock() is None
+
+
+def test_watch_log_rollover_discards_old_records(tmp_path):
+    path = tmp_path / "events.jsonl"
+    first = {"event": "first", "message": "a" * 32}
+    second = {"event": "second", "message": "b" * 32}
+
+    append_jsonl_record(path, first, max_bytes=80)
+    append_jsonl_record(path, second, max_bytes=80)
+
+    assert _records(path) == [second]
+    assert not list(tmp_path.glob("events.jsonl.*"))
 
 
 def test_watch_log_keeps_an_oversized_record_intact(tmp_path):
