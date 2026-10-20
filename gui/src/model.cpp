@@ -95,15 +95,29 @@ std::string text_at(HANDLE f, uint64_t offset, size_t count) {
     out.resize(got); return out;
 }
 bool terminal(const Task& task) { return task.status=="taskSucceeded" || task.status=="taskFailed"; }
-using RootIndex=std::vector<std::pair<std::wstring,std::string>>;
+// Longest directory-prefix match by walking up the task path, not by scanning
+// every watch root for every task. Normalized keys retain the existing NT
+// case-folding/UNC rules; trimming the final separator also handles C:\\ roots.
+using RootIndex=std::unordered_map<std::wstring,std::string>;
 RootIndex index_roots(const WatchRoots& roots) {
     RootIndex index; index.reserve(roots.entries.size());
-    for(auto& root:roots.entries) index.emplace_back(path_key(root.input),utf8(root.input.wstring()));
-    std::stable_sort(index.begin(),index.end(),[](auto& a,auto& b){return a.first.size()>b.first.size();});
+    for(const auto& root:roots.entries) {
+        auto key=path_key(root.input);
+        while(!key.empty() && (key.back()==L'\\\\' || key.back()==L'/')) key.pop_back();
+        index.emplace(std::move(key),utf8(root.input.wstring()));
+    }
     return index;
 }
 std::string indexed_root(const std::wstring& key,const RootIndex& index) {
-    for(auto& root:index) if(is_under(key,root.first)) return root.second;
+    std::wstring current=key;
+    while(!current.empty() && (current.back()==L'\\\\' || current.back()==L'/')) current.pop_back();
+    while(!current.empty()) {
+        auto found=index.find(current);
+        if(found!=index.end()) return found->second;
+        auto separator=current.find_last_of(L"\\\\/");
+        if(separator==std::wstring::npos) break;
+        current.resize(separator);
+    }
     return "@other";
 }
 std::optional<double> iso_timestamp(const std::string& text) {
