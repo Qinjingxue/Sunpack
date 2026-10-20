@@ -41,6 +41,14 @@ password file with `passwords` saved records plus `history` clipboard entries, a
   (used by tests), so it measures the harness, not the app.
 * `model_*` – backend projections on the same seeded files, measured after the window is
   gone: event-log parse, task/password/config/directory projections.
+* `model_task_rows_phases.{cold,warm,unchanged}.{filter_ms,sort_ms,project_ms}` –
+  separate filtered selection/root lookup, sort, and JSON row construction costs.
+  The warm run reuses lazy task path/time metadata; unchanged selection skips
+  JSON projection entirely (when the worker knows the source has not changed).
+* `phase_counts.page_switch*::dispatch_{paints,layouts,draws}` – full window
+  paints, root layouts and draw-tree operations inside each synchronous tab
+  dispatch. Compare against `core_ui_trace.page_switch*::*duration` to identify
+  whether the first-frame cost is an unnecessary synchronous layout or drawing.
 * `password_state_query` – harness cost of serializing the 3000-row password state, next to
   the password save measurements.
 * `page_switch_baseline_*` / `page_switch_end_*` – the same tab interaction measured at the
@@ -171,3 +179,29 @@ latency for a filtered result is dominated by the worker round trip, not the vir
   it repainted at display refresh, so transition CPU scaled with the panel refresh rate.
 * The benchmark never starts the watch service or the CLI; it only exercises the manager
   window and its file projections.
+
+## Further optimization trial (2026-10-20)
+
+This branch adds low-allocation, correctness-constrained hot-path changes:
+
+- Filter requests first compute the sorted task ID selection. When IDs are
+  unchanged **and no underlying task, root, or language changed**, the worker
+  avoids constructing/sending 5000 JSON rows. Real log updates explicitly
+  invalidate this shortcut; task `sequence` alone is not a valid mutation
+  version for regrouping or departed multipart members.
+- Task projections lazily reuse parsed path directory/name and formatted time
+  while their source path/timestamp remains identical; per-projection status
+  translations are memoized across matching rows. The cache stores only small
+  display scalars on existing Task objects, not an extra resident JSON snapshot.
+- Core UI skips strictly identical primitive assignments to reactive state,
+  avoiding redundant effects/layout invalidation; object and array writes keep
+  their original semantics. Decorative page and navigation-indicator transitions
+  are now 170 ms (system animation setting still takes precedence).
+- The benchmark reports model filtering, sorting and construction separately,
+  plus each tab dispatch's repaint/layout/draw count. Use the same `--rounds
+  30` x 5 and `--rounds 100` x 2 protocol, with unchanged machine/screen
+  settings, and compare cold-start, no-op filter, and warm/full refresh.
+
+**Do not infer a numeric speedup from source changes.** Re-run a Windows Release
+benchmark and confirm existing UI and file-contract integration suites before
+merging. Changes do not introduce a background poller or new IPC.

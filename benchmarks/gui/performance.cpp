@@ -30,6 +30,8 @@ std::mutex trace_mutex;
 std::string trace_phase;
 std::string active_action;
 std::atomic<uint64_t> motion_stop_count{0}, paint_count{0}, animation_frame_count{0}, property_frame_count{0};
+std::atomic<uint64_t> layout_count{0}, draw_count{0};
+std::map<std::string,std::vector<double>> phase_counts;
 LARGE_INTEGER qpc_frequency{};
 
 double now_ms() { LARGE_INTEGER v{}; QueryPerformanceCounter(&v); return 1000.0*v.QuadPart/qpc_frequency.QuadPart; }
@@ -52,6 +54,8 @@ void trace_sink(const UiTraceEvent* e,void*) {
     if(!e) return;
     if(e->name && !std::strcmp(e->name,"motion_stopped")) motion_stop_count.fetch_add(1,std::memory_order_relaxed);
     if(e->name && !std::strcmp(e->name,"paint_and_validate")) paint_count.fetch_add(1,std::memory_order_relaxed);
+    if(e->name && !std::strcmp(e->name,"layout_root_duration")) layout_count.fetch_add(1,std::memory_order_relaxed);
+    if(e->name && !std::strcmp(e->name,"draw_tree_duration")) draw_count.fetch_add(1,std::memory_order_relaxed);
     if(e->name && !std::strcmp(e->name,"animation_frame")) animation_frame_count.fetch_add(1,std::memory_order_relaxed);
     if(e->name && !std::strcmp(e->name,"property_animation_frame")) property_frame_count.fetch_add(1,std::memory_order_relaxed);
     bool has_duration=false,has_frame_interval=false;
@@ -103,7 +107,8 @@ Json summarize() {
             {"process_cpu_million_cycles",distribution(s.cpu_mcycles)}};
         if(name=="idle_5s") actions[name]["process_cpu_ms"]=distribution(s.cpu_ms);
     }
-    Json traces=Json::object();
+    Json traces=Json::object(), counts=Json::object();
+    for(auto& [name,values]:phase_counts) counts[name]=distribution(values);
     std::lock_guard<std::mutex> lock(trace_mutex);
     for(auto& [name,values]:trace_samples) traces[name]=distribution(values);
     if(trace_samples.find("all::animation_frame_interval_ms")!=trace_samples.end()) {
@@ -111,7 +116,7 @@ Json summarize() {
         traces["animation_frame_interval_ms"]["over_16_7ms"] = std::count_if(frames.begin(),frames.end(),[](double x){return x>16.7;});
         traces["animation_frame_interval_ms"]["over_33_3ms"] = std::count_if(frames.begin(),frames.end(),[](double x){return x>33.3;});
     }
-    return {{"actions",actions},{"core_ui_trace",traces}};
+    return {{"actions",actions},{"core_ui_trace",traces},{"phase_counts",counts}};
 }
 Json page_state(UiPage page,const char* key) {
     char* raw=ui_page_get_json(page,key);
@@ -365,10 +370,14 @@ int wmain(int argc,wchar_t** argv) {
             measure("json_dump_tasks",[&]{ensure(!tasks_document.dump().empty(),"task dump");});
 
             auto nav=[&](const char* button,const char* page,const char* tag="page_switch") {
+                const uint64_t paints=paint_count.load(), layouts=layout_count.load(), draws=draw_count.load();
                 measure(std::string(tag)+"_dispatch",[&]{
                     click(app,button);
                     wait_for([&]{return page_state(app.page(),"tab")==page;},"page switch");
                 });
+                phase_counts[std::string(tag)+"::dispatch_paints"].push_back(double(paint_count.load()-paints));
+                phase_counts[std::string(tag)+"::dispatch_layouts"].push_back(double(layout_count.load()-layouts));
+                phase_counts[std::string(tag)+"::dispatch_draws"].push_back(double(draw_count.load()-draws));
                 measure(std::string(tag)+"_settled",[&]{wait_settled(app);});
             };
             scroll_list(app,"taskListScroll","taskItems",options.rounds,report);
@@ -529,9 +538,22 @@ int wmain(int argc,wchar_t** argv) {
             ensure(backend_log.tasks.size()==options.tasks,"event log task count");
         });
         View backend_view;
+        TaskProjectionStats cold_phases, warm_phases, reused_phases;
+        std::vector<std::wstring> baseline_ids, repeated_ids;
         measure("model_task_rows",[&]{
-            ensure(task_rows(backend_log,backend_roots,backend_view,"en").value("total",0)==options.tasks,"task projection count");
+            ensure(task_rows(backend_log,backend_roots,backend_view,"en",&baseline_ids,nullptr,&cold_phases).value("total",0)==options.tasks,"task projection count");
         });
+        measure("model_task_rows_warm",[&]{
+            ensure(task_rows(backend_log,backend_roots,backend_view,"en",nullptr,nullptr,&warm_phases).value("total",0)==options.tasks,"warm task projection count");
+        });
+        measure("model_task_rows_unchanged",[&]{
+            ensure(task_rows(backend_log,backend_roots,backend_view,"en",&repeated_ids,&baseline_ids,&reused_phases).is_null(),"same selection must reuse UI state");
+        });
+        report["model_task_rows_phases"]={
+            {"cold",{{"filter_ms",cold_phases.filter_ms},{"sort_ms",cold_phases.sort_ms},{"project_ms",cold_phases.project_ms}}},
+            {"warm",{{"filter_ms",warm_phases.filter_ms},{"sort_ms",warm_phases.sort_ms},{"project_ms",warm_phases.project_ms}}},
+            {"unchanged",{{"filter_ms",reused_phases.filter_ms},{"sort_ms",reused_phases.sort_ms},{"project_ms",reused_phases.project_ms}}}
+        };
         measure("model_password_rows",[&]{
             ensure(password_rows(backend_passwords,backend_view,"en").value("total",0)==options.passwords,"password projection count");
         });

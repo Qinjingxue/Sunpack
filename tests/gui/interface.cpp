@@ -7,6 +7,7 @@
 #include <cstring>
 #include <ui/ui_context.h>
 #include <ui/ui_window.h>
+#include <ui/uix/script_runtime.h>
 #include <ui/controls.h>
 using namespace spg;
 namespace {
@@ -326,6 +327,28 @@ void drag_after_wheel(Application& app) {
     settle_motion(app);
     ui_window_set_size(app.window(),1120,720);
 }
+void scalar_reactivity_noop() {
+    ui::uix::ScriptRuntime runtime;
+    auto* ctx=runtime.ctx();
+    JSValue target=JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx,target,"label",JS_NewString(ctx,"idle"));
+    JSValue state=runtime.MakeReactive(target);
+    unsigned evaluations=0;
+    runtime.WatchEffect([&] {
+        ++evaluations;
+        JSValue value=JS_GetPropertyStr(ctx,state,"label");
+        JS_FreeValue(ctx,value);
+    });
+    assert(evaluations==1);
+    assert(JS_SetPropertyStr(ctx,state,"label",JS_NewString(ctx,"idle"))==1);
+    assert(evaluations==1); // Identical string content must not invalidate.
+    assert(JS_SetPropertyStr(ctx,state,"label",JS_NewString(ctx,"active"))==1);
+    assert(evaluations==2);
+    assert(JS_SetPropertyStr(ctx,state,"label",JS_NewString(ctx,"active"))==1);
+    assert(evaluations==2);
+    JS_FreeValue(ctx,state);
+    JS_FreeValue(ctx,target);
+}
 }
 int wmain(int argc,wchar_t** argv) {
     if(argc>1 && std::wstring(argv[1])==L"--fake-cli") {
@@ -339,6 +362,7 @@ int wmain(int argc,wchar_t** argv) {
     auto gate_name=L"Local\\SunPack.GUI.TestCommand."+std::to_wstring(GetCurrentProcessId());
     Handle gate(CreateEventW(nullptr,TRUE,TRUE,gate_name.c_str()));
     try {
+        scalar_reactivity_noop();
         atomic_write(dir/"sunpack_config.json",R"({"cli":{"language":"zh"},"runtime":{"process_mode":"normal"},"recursive_extract":"*","watch":{"state_dir":".sunpack_watch","out_dir":".","toast_enabled":true},"unknown":9007199254740993})");
         atomic_write(dir/"builtin_passwords.json",R"({"passwords":[{"value":"  #中文  "}],"clipboard_history":["history"]})");
         atomic_write(dir/"sunpack_watch_roots.txt",utf8(dir.wstring())+"\n");

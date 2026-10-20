@@ -1,6 +1,7 @@
 #include "model.hpp"
 #include "presentation.hpp"
 #include <algorithm>
+#include <chrono>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -596,12 +597,28 @@ bool EventLog::refresh(bool missing_is_final) {
 }
 namespace {
 // Both snapshot and incremental updates project a task identically.
-Json project_task(const std::wstring& key,const Task& t,const RootIndex& roots,const std::string& language) {
-    const fs::path path=wide(t.path);
+Json project_task(const std::wstring& key,const Task& t,const RootIndex& roots,
+    const std::string& language,std::unordered_map<std::string,std::string>& translated_statuses) {
+    auto& cache=t.display;
+    if(cache.path!=t.path) {
+        const fs::path path=wide(t.path);
+        cache.directory=utf8(path.parent_path().wstring());
+        cache.filename=utf8(path.filename().wstring());
+        cache.path=t.path;
+    }
+    if(!cache.time_valid || cache.timestamp!=t.timestamp || cache.has_timestamp!=t.has_timestamp) {
+        cache.time=task_time(t);
+        cache.timestamp=t.timestamp;
+        cache.has_timestamp=t.has_timestamp;
+        cache.time_valid=true;
+    }
     const char* tone=t.status=="taskSucceeded"?"success":t.status=="taskFailed"?"failure":
         t.status=="taskWaiting"?"waiting":"info";
-    return {{"id",utf8(key)},{"name",t.name.empty()?utf8(path.filename().wstring()):t.name},{"directory",utf8(path.parent_path().wstring())},
-        {"path",t.path},{"root",indexed_root(key,roots)},{"status",t.status},{"statusText",tr(t.waiting_reason.empty()?t.status:t.waiting_reason,language)},{"partCount",t.multipart?t.members.size():0},{"time",task_time(t)},
+    const auto& label=t.waiting_reason.empty()?t.status:t.waiting_reason;
+    auto found=translated_statuses.find(label);
+    if(found==translated_statuses.end()) found=translated_statuses.emplace(label,tr(label,language)).first;
+    return {{"id",utf8(key)},{"name",t.name.empty()?cache.filename:t.name},{"directory",cache.directory},
+        {"path",t.path},{"root",indexed_root(key,roots)},{"status",t.status},{"statusText",found->second},{"partCount",t.multipart?t.members.size():0},{"time",cache.time},
         {"statusTone",tone},{"outputs",t.outputs},{"sortTimestamp",t.timestamp},{"sortSequence",t.sequence}};
 }
 bool task_matches(const Task& t,const std::wstring& key,const RootIndex& roots,const View& v,
@@ -612,29 +629,57 @@ bool task_matches(const Task& t,const std::wstring& key,const RootIndex& roots,c
     return std::any_of(t.members.begin(),t.members.end(),[&](const auto& member){return contains_folded(utf8(member),folded_query);});
 }
 }
-Json task_rows(const EventLog& log,const WatchRoots& roots,const View& v,const std::string& language) {
+Json task_rows(const EventLog& log,const WatchRoots& roots,const View& v,const std::string& language,
+    std::vector<std::wstring>* selected_ids,const std::vector<std::wstring>* previous_ids,
+    TaskProjectionStats* stats) {
+    using Clock=std::chrono::steady_clock;
+    const auto started=stats?Clock::now():Clock::time_point{};
     const auto root_index=index_roots(roots);
     const auto query=fold_search(v.task_query);
     using TaskEntry=decltype(log.tasks)::value_type;
     std::vector<const TaskEntry*> rows;
+    rows.reserve(log.tasks.size());
     for(auto& pair:log.tasks) if(task_matches(pair.second,pair.first,root_index,v,query)) rows.push_back(&pair);
+    const auto filtered=stats?Clock::now():Clock::time_point{};
     std::sort(rows.begin(),rows.end(),[](const auto& a,const auto& b){
         if(a->second.timestamp!=b->second.timestamp) return a->second.timestamp>b->second.timestamp;
         return a->second.sequence>b->second.sequence;
     });
-    Json result={{"rows",Json::array()},{"total",rows.size()},{"malformed",log.malformed}};
-    for(auto& task:rows) result["rows"].push_back(project_task(task->first,task->second,root_index,language));
+    const auto sorted=stats?Clock::now():Clock::time_point{};
+    if(selected_ids) {
+        selected_ids->clear();
+        selected_ids->reserve(rows.size());
+        for(const auto* task:rows) selected_ids->push_back(task->first);
+    }
+    const bool unchanged=previous_ids && selected_ids && *selected_ids==*previous_ids;
+    Json result;
+    if(!unchanged) {
+        result={{"rows",Json::array()},{"total",rows.size()},{"malformed",log.malformed}};
+        auto& projected=result["rows"];
+        std::unordered_map<std::string,std::string> labels;
+        for(auto* task:rows) projected.push_back(project_task(task->first,task->second,root_index,language,labels));
+    }
+    if(stats) {
+        const auto finished=Clock::now();
+        auto millis=[](Clock::duration d){return std::chrono::duration<double,std::milli>(d).count();};
+        stats->filter_ms=millis(filtered-started);
+        stats->sort_ms=millis(sorted-filtered);
+        stats->project_ms=millis(finished-sorted);
+        stats->selected=rows.size();
+        stats->reused=unchanged;
+    }
     return result;
 }
 Json task_delta(const EventLog& log,const WatchRoots& roots,const View& v,const std::string& language) {
     const auto root_index=index_roots(roots);
     const auto query=fold_search(v.task_query);
+    std::unordered_map<std::string,std::string> labels;
     Json changes=Json::array();
     for(const auto& key:log.changed_keys) {
         Json change={{"id",utf8(key)}};
         auto it=log.tasks.find(key);
         if(it!=log.tasks.end() && task_matches(it->second,key,root_index,v,query))
-            change["row"]=project_task(key,it->second,root_index,language);
+            change["row"]=project_task(key,it->second,root_index,language,labels);
         changes.push_back(std::move(change));
     }
     return {{"changes",std::move(changes)},{"malformed",log.malformed}};
