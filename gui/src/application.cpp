@@ -325,7 +325,8 @@ void Application::navigate(const std::string& tab) {
     motion::finish(window_,("page-"+page_value(page_,"tab").get<std::string>()).c_str());
     set_text(page_,"tab",tab);
     set_text(page_,"actionError","");
-    ui_window_relayout(window_);
+    // Tab targets retain fixed sidebar geometry; reactive tab visibility already
+    // schedules layout. Avoid forcing an extra full-tree layout on every switch.
     motion::enter(window_,("page-"+tab).c_str());
     motion::select(window_,"navIndicator",tab=="tasks"?"tabTasks":tab=="config"?"tabConfig":"tabPasswords");
 }
