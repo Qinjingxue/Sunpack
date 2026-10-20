@@ -40,6 +40,15 @@ struct Task {
     bool has_timestamp = false;
     uint64_t sequence = 0;
     std::vector<std::string> outputs;
+    // Lazy path/time display data: validated against source values on every
+    // projection, so regrouping and reused Task objects cannot show stale data.
+    struct DisplayCache {
+        std::string path, directory, filename;
+        std::string time;
+        double timestamp = 0;
+        bool has_timestamp = false, time_valid = false;
+    };
+    mutable DisplayCache display;
 };
 class EventLog {
     fs::path path_;
@@ -67,7 +76,19 @@ public:
 struct View {
     std::string task_query, task_root, task_status, password_query, password_scope = "@all";
 };
-Json task_rows(const EventLog& log, const WatchRoots& roots, const View& view, const std::string& language = "zh");
+struct TaskProjectionStats {
+    double filter_ms = 0, sort_ms = 0, project_ms = 0;
+    size_t selected = 0;
+    bool reused = false;
+};
+// When previous_ids matches the newly selected and sorted IDs, returning null
+// means the caller can keep its existing full UI state; only use when the
+// underlying tasks, watch roots and language have NOT changed.
+Json task_rows(const EventLog& log, const WatchRoots& roots, const View& view,
+    const std::string& language = "zh",
+    std::vector<std::wstring>* selected_ids = nullptr,
+    const std::vector<std::wstring>* previous_ids = nullptr,
+    TaskProjectionStats* stats = nullptr);
 Json task_delta(const EventLog& log, const WatchRoots& roots, const View& view, const std::string& language = "zh");
 // Resolve only on activation so removed/moved output directories fall back then.
 fs::path task_directory(const Json& row);
