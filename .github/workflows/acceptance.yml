@@ -45,12 +45,13 @@ jobs:
           rustc -Vv
 
       - name: Restore native build cache
+        id: native-cache
         uses: ./.github/actions/native-cache
         with:
           arch: x64
           profile: ci
           python-version: "3.11"
-          source-key: ${{ hashFiles('native/**', 'gui/**', 'tests/gui/**', 'scripts/**', 'sunpack.manifest') }}
+          source-key: ${{ hashFiles('native/**', 'scripts/**', '!scripts/build_gui.ps1', 'sunpack.manifest') }}
 
       - name: Cache acceptance fixture generators
         uses: actions/cache@v4
@@ -63,12 +64,133 @@ jobs:
         run: |
           .\scripts\setup_windows_dev.ps1 -Arch x64 -BuildProfile ci -BuildJobs 4
 
+      - name: Save native build cache after successful compilation
+        if: ${{ steps.native-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            .cache/rust-target/x64
+            .cache/native-source-times-x64-ci.json
+            native/sevenzip_bridge/build-x64-ci
+            native/toast_host/build-x64-ci
+          key: ${{ steps.native-cache.outputs.cache-key }}
+
+      - name: Upload native wheel for GUI cross-language contracts
+        uses: actions/upload-artifact@v7
+        with:
+          name: sunpack-native-wheel-ci-x64
+          path: build/native-wheels-dev-x64-ci/sunpack_native-*.whl
+          if-no-files-found: error
+          retention-days: 1
+
       - name: Run acceptance tests
         shell: pwsh
         run: |
           .\run_acceptance_tests.ps1 -NoWait -SkipEnvironmentRefresh -BuildProfile ci -ParallelWorkers 2 -StepTimeoutSeconds 900
 
-      - name: Build and verify Core UI manager
+  gui:
+    name: GUI Native Build and Tests
+    runs-on: windows-2022
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          architecture: x64
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Restore GUI build cache
+        id: gui-cache
+        uses: ./.github/actions/gui-cache
+        with:
+          arch: x64
+          source-key: ${{ hashFiles('gui/**', 'tests/gui/**', 'scripts/build_gui.ps1', 'scripts/restore_native_cache_times.ps1', 'sunpack.manifest', 'sunpack_advanced_config.json', 'native/third_party/lz4/**') }}
+
+      - name: Compile GUI and native tests
         shell: pwsh
         run: |
-          .\scripts\build_gui.ps1 -Arch x64 -Jobs 4
+          .\scripts\build_gui.ps1 -Arch x64 -Jobs 4 -SkipTests
+
+      - name: Save GUI build cache before running tests
+        if: ${{ steps.gui-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            .cache/gui-x64
+            .cache/gui-source-times-x64-release.json
+          key: ${{ steps.gui-cache.outputs.cache-key }}
+
+      - name: Upload GUI native contract binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: sunpack-gui-test-ci-x64
+          path: .cache/gui-x64/Release/sunpack_gui_tests.exe
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Run GUI CTest suite
+        shell: pwsh
+        run: |
+          .\scripts\build_gui.ps1 -Arch x64 -TestsOnly -SkipPythonTests
+
+  gui-python-contracts:
+    name: GUI Python Integration Contracts
+    needs: [acceptance, gui]
+    runs-on: windows-2022
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          architecture: x64
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Prepare Python test dependencies
+        shell: pwsh
+        run: uv sync --locked --extra dev
+
+      - name: Download native Python wheel
+        uses: actions/download-artifact@v8
+        with:
+          name: sunpack-native-wheel-ci-x64
+          path: build/gui-contract-wheel
+
+      - name: Download GUI native test binary
+        uses: actions/download-artifact@v8
+        with:
+          name: sunpack-gui-test-ci-x64
+          path: .cache/gui-x64/Release
+
+      - name: Run cross-language GUI integration tests
+        shell: pwsh
+        run: |
+          $wheel = Get-ChildItem -LiteralPath build/gui-contract-wheel -Filter 'sunpack_native-*.whl' -File | Select-Object -First 1
+          if (-not $wheel) { throw 'Native Python wheel artifact missing' }
+          uv pip install --python .\.venv\Scripts\python.exe --reinstall $wheel.FullName
+          if ($LASTEXITCODE -ne 0) { throw 'Installing native Python wheel failed' }
+          & .\.venv\Scripts\python.exe -m pytest tests/gui/test_integration.py -q
+          if ($LASTEXITCODE -ne 0) { throw 'GUI cross-language contracts failed' }

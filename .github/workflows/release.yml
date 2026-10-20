@@ -200,7 +200,14 @@ jobs:
           arch: ${{ matrix.arch }}
           profile: release
           python-version: ${{ matrix.python_version }}
-          source-key: ${{ hashFiles('native/**', 'gui/**', 'tests/gui/**', 'scripts/**', 'sunpack.manifest') }}
+          source-key: ${{ hashFiles('native/**', 'scripts/**', '!scripts/build_gui.ps1', 'sunpack.manifest') }}
+
+      - name: Restore GUI build cache
+        id: gui-cache
+        uses: ./.github/actions/gui-cache
+        with:
+          arch: ${{ matrix.arch }}
+          source-key: ${{ hashFiles('gui/**', 'tests/gui/**', 'scripts/build_gui.ps1', 'scripts/restore_native_cache_times.ps1', 'sunpack.manifest', 'sunpack_advanced_config.json', 'native/third_party/lz4/**') }}
 
       - name: Restore Nuitka compiler cache
         uses: actions/cache@v4
@@ -278,10 +285,37 @@ jobs:
           }
           .\scripts\build_windows.ps1 @buildArgs
 
-      - name: Build and verify Core UI manager
+      - name: Save native cache after package compilation
+        if: ${{ steps.native-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            .cache/rust-target/${{ matrix.arch }}
+            .cache/native-source-times-${{ matrix.arch }}-release.json
+            native/sevenzip_bridge/build-${{ matrix.arch }}
+            native/toast_host/build-${{ matrix.arch }}
+          key: ${{ steps.native-cache.outputs.cache-key }}
+
+      - name: Compile GUI test binaries without reconfiguring the packaged app
         shell: pwsh
         run: |
-          .\scripts\build_gui.ps1 -Arch ${{ matrix.arch }} -Jobs 4
+          .\scripts\build_gui.ps1 -Arch ${{ matrix.arch }} -Jobs 4 -SkipConfigure -SkipTests
+
+      - name: Save GUI build cache before tests
+        if: ${{ steps.gui-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            .cache/gui-${{ matrix.arch }}
+            .cache/gui-source-times-${{ matrix.arch }}-release.json
+          key: ${{ steps.gui-cache.outputs.cache-key }}
+
+      - name: Verify Core UI manager
+        shell: pwsh
+        run: |
+          .\scripts\build_gui.ps1 -Arch ${{ matrix.arch }} -TestsOnly
 
       - name: Validate release package
         shell: pwsh

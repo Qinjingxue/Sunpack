@@ -7,7 +7,8 @@ param(
     [switch]$SkipTests,
     [switch]$ApplicationOnly,
     [switch]$SkipConfigure,
-    [switch]$TestsOnly
+    [switch]$TestsOnly,
+    [switch]$SkipPythonTests
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -45,7 +46,7 @@ if (-not $SkipTests -and $hostArch -eq $Arch) {
     & $ctest --test-dir $BuildDir -C Release --output-on-failure
     if ($LASTEXITCODE -ne 0) { throw 'GUI tests failed' }
     $python = Join-Path $repoRoot '.venv\Scripts\python.exe'
-    if (Test-Path -LiteralPath $python) {
+    if (-not $SkipPythonTests -and (Test-Path -LiteralPath $python)) {
         $previousTestBinary = $env:SUNPACK_GUI_TEST_BINARY
         $env:SUNPACK_GUI_TEST_BINARY = Join-Path $BuildDir 'Release\sunpack_gui_tests.exe'
         try {
