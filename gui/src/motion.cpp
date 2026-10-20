@@ -35,8 +35,8 @@ void enter(UiWindow handle, const char* id, float x, float y) {
     // never control sizes or scroll offsets. No outgoing blank frame is shown.
     widget->opacity = 0.72f; widget->animationX = x; widget->animationY = y;
     window->AnimateProperty(widget, ui::AnimProperty::Opacity, 0.72f, 1, 83, ui::EasingFunction::Linear);
-    if(x) window->AnimateProperty(widget, ui::AnimProperty::TranslateX, x, 0, 250, ui::EasingFunction::FluentEnter);
-    if(y) window->AnimateProperty(widget, ui::AnimProperty::TranslateY, y, 0, 250, ui::EasingFunction::FluentEnter);
+    if(x) window->AnimateProperty(widget, ui::AnimProperty::TranslateX, x, 0, 170, ui::EasingFunction::FluentEnter);
+    if(y) window->AnimateProperty(widget, ui::AnimProperty::TranslateY, y, 0, 170, ui::EasingFunction::FluentEnter);
 }
 void select(UiWindow handle, const char* id, const char* targetId) {
     auto* window = ui::GetContext().GetWindow(handle);
@@ -47,6 +47,6 @@ void select(UiWindow handle, const char* id, const char* targetId) {
         window->CancelPropertyAnimation(indicator, ui::AnimProperty::TranslateY);
         indicator->animationY = offset; window->Invalidate(); return;
     }
-    window->AnimateProperty(indicator, ui::AnimProperty::TranslateY, indicator->animationY, offset, 250, ui::EasingFunction::FluentStandard);
+    window->AnimateProperty(indicator, ui::AnimProperty::TranslateY, indicator->animationY, offset, 170, ui::EasingFunction::FluentStandard);
 }
 }
