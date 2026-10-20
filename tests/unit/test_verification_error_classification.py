@@ -35,3 +35,20 @@ def test_password_and_execution_failures_leave_integrity_unknown():
 def test_unknown_item_extraction_failure_is_payload_damage_but_password_is_not():
     assert classify_verification_error("unknown", "item_extract").content_integrity == "payload_damaged"
     assert classify_verification_error("wrong_password", "item_extract").content_integrity == "unknown"
+
+
+def test_item_extract_stage_keeps_container_structure_failures_out_of_payload_damage():
+    # The worker reports header/recognition failures with the item_extract stage.
+    # They are container evidence, so the stage must not promote them to payload
+    # damage: that would reject an otherwise complete extraction.
+    for kind in (
+        "headers_error",
+        "not_archive",
+        "structure_recognition",
+        "central_directory_bad",
+        "central_directory_missing",
+    ):
+        classified = classify_verification_error(kind, "item_extract")
+        assert classified.content_integrity == "unknown"
+        assert classified.container_integrity == "structurally_damaged"
+        assert classified.category == "container_structure"

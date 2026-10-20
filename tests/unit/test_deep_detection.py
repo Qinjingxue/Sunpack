@@ -77,7 +77,8 @@ def test_one_engine_keeps_watch_and_cli_detection_modes_per_request(tmp_path, mo
             )
             await engine.run([str(tmp_path / "next-watch.bin")], origin="watch")
         assert [request.detection_options.force_scan for request in observed] == [True, False, False]
-        assert [request.config["filesystem"]["scan_filters_enabled"] for request in observed] == [False, True, True]
+        # The deep override now belongs to the first scanner, not the whole request.
+        assert [request.config["filesystem"]["scan_filters_enabled"] for request in observed] == [True, True, True]
         assert config["filesystem"]["scan_filters_enabled"] is True
 
     asyncio.run(scenario())

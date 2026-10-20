@@ -68,7 +68,14 @@ _EXECUTION = {
 def classify_verification_error(failure_kind: str, failure_stage: str = "") -> VerificationErrorClass:
     kind = str(failure_kind or "").strip().lower()
     stage = str(failure_stage or "").strip().lower()
-    if kind in _PAYLOAD_DAMAGE or (stage == "item_extract" and kind not in _PASSWORD | _INCOMPLETE_CONTENT | _EXECUTION):
+    # The item_extract stage only proves payload damage for kinds that are not
+    # already classified.  Container-structure kinds keep their own verdict,
+    # otherwise a header/recognition failure would be reported as a damaged
+    # payload and a complete extraction would be rejected instead of accepted.
+    if kind in _PAYLOAD_DAMAGE or (
+        stage == "item_extract"
+        and kind not in _PASSWORD | _INCOMPLETE_CONTENT | _EXECUTION | _STRUCTURAL_ONLY
+    ):
         return VerificationErrorClass(
             content_integrity=CONTENT_INTEGRITY_PAYLOAD_DAMAGED,
             category="payload_damage",

@@ -16,7 +16,6 @@ from sunpack.core.support.path_keys import case_key, path_key
 from sunpack_native import fast_hash128
 
 from sunpack.core.config.fields.watch import DEFAULT_WATCH_CONFIG
-from sunpack.core.config.detection_view import discovery_run_config
 from sunpack.pipeline.discovery.embedded.options import EmbeddedOptions
 from sunpack.core.contracts.failures import FailureInfo, FailureKind
 from sunpack.core.support.filesystem_scan_errors import filesystem_scan_failure
@@ -1709,7 +1708,6 @@ class WatchScheduler:
             "root": output_root,
             "common_root": self._common_root_for(candidate.path),
         }
-        run_config = discovery_run_config(run_config, deep_detect=options.force_scan)
         from sunpack.runtime.cli.runtime_state import runtime_host
 
         host = runtime_host()

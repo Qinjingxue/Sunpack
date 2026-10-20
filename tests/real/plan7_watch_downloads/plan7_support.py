@@ -821,7 +821,20 @@ def assert_plan7_success(
             )
             if plan7_case.archive_format in {"lz4", "tar.lz4"}:
                 assert_expected_files_extracted(plan7_case.case, root)
-    assert not any(harness.watcher.state.entries.values()), "watch state must not retain failures"
+    entries = harness.watcher.state.entries
+    assert not any(entries.values()), {
+        "message": "watch state must not retain failures",
+        "pending": harness.watcher.pending_count,
+        "entries": {
+            path: {
+                "status": entry.status,
+                "error": entry.last_error,
+                "exists": Path(path).exists(),
+                "failure": entry.failure_payload,
+            }
+            for path, entry in entries.items()
+        },
+    }
     assert harness.submit_times, "pipeline never submitted any archive"
 
     completed_count = len(cases)

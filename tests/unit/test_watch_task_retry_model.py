@@ -302,7 +302,7 @@ def test_shared_output_password_retry_keeps_original_input_detection_mode(tmp_pa
             assert request is not None
             await request.task
         assert [item["detection_options"].force_scan for item in captured] == [True, False]
-        assert captured[0]["request_config"]["filesystem"]["scan_filters_enabled"] is False
+        assert captured[0]["request_config"]["filesystem"]["scan_filters_enabled"] is True
         assert watcher.config["filesystem"]["scan_filters_enabled"] is True
 
     asyncio.run(scenario())

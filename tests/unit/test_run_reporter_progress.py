@@ -148,7 +148,7 @@ def test_interactive_panel_updates_fixed_row_with_progress_and_colors(tmp_path, 
     reporter.tasks_discovered(1, [task])
     reporter.task_started(task, 1)
     reporter._last_render_at = 0.0
-    reporter.task_progress(task, {"completed_bytes": 50, "total_bytes": 100})
+    reporter.task_progress(task, {"type": "progress", "completed_bytes": 50, "total_bytes": 100})
     reporter.task_status(task, "extracting")
     reporter.task_finished(task, _outcome(tmp_path / "large"), 1)
 
@@ -171,7 +171,7 @@ def test_interactive_row_accounts_for_wide_status_and_archive_characters(tmp_pat
     task = _task(tmp_path / ("很长的嵌套压缩包名称" * 8 + ".zip"))
 
     reporter.tasks_discovered(2, [task])
-    reporter.task_progress(task, {"completed_bytes": 50, "total_bytes": 100})
+    reporter.task_progress(task, {"type": "progress", "completed_bytes": 50, "total_bytes": 100})
 
     row = reporter._format_task_row(reporter._task_rows[id(task)])
     plain_row = re.sub(r"\033\[[0-9;]*m", "", row)
@@ -193,9 +193,9 @@ def test_noninteractive_terminal_streams_throttled_progress_bar(tmp_path, monkey
     task = _task(tmp_path / "large.7z")
 
     reporter.tasks_discovered(1, [task])
-    reporter.task_progress(task, {"completed_bytes": 5, "total_bytes": 100})
-    reporter.task_progress(task, {"completed_bytes": 9, "total_bytes": 100})
-    reporter.task_progress(task, {"completed_bytes": 50, "total_bytes": 100})
+    reporter.task_progress(task, {"type": "progress", "completed_bytes": 5, "total_bytes": 100})
+    reporter.task_progress(task, {"type": "progress", "completed_bytes": 9, "total_bytes": 100})
+    reporter.task_progress(task, {"type": "progress", "completed_bytes": 50, "total_bytes": 100})
 
     output = capsys.readouterr().out
     assert output.count("正在解压") == 2
