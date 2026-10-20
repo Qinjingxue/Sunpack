@@ -640,13 +640,11 @@ UI_API void ui_page_set_text(UiPage p, const char* name, const wchar_t* value) {
 UI_API int ui_page_set_json(UiPage p, const char* name, const char* utf8_json) {
     auto* e = ui::page::Registry().Get(p);
     if (!e || !e->state || !name || !utf8_json) return -1;
-    ui::expr::Value v;
     std::string err;
-    if (!ui::expr::ParseJson(std::string(utf8_json), v, err)) {
+    if (!e->state->SetJsonText(name, utf8_json, std::strlen(utf8_json), err)) {
         e->lastError = std::string("ui_page_set_json: ") + err;
         return -1;
     }
-    e->state->SetValue(name, std::move(v));
     return 0;
 }
 
