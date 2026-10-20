@@ -338,12 +338,15 @@ void roots(Fixture& f) {
     auto cached_first=task_rows(log,all,view);
     auto& changed=log.tasks.at(path_key(wide(changed_path)));
     auto original_path=changed.path;
+    const auto original_timestamp=changed.timestamp;
     changed.path=utf8((f.dir/L"新名字"/"patched.zip").wstring());
     changed.timestamp=1234;
     auto cached_second=task_rows(log,all,view);
     assert(cached_second["rows"][0]["directory"]==utf8((f.dir/L"新名字").wstring()));
     assert(cached_second["rows"][0]["time"]!=cached_first["rows"][0]["time"]);
+    // Restore both source values before comparing with the earlier delta.
     changed.path=original_path;
+    changed.timestamp=original_timestamp;
     auto latest=task_rows(log,all,view);
     assert(delta["changes"].size()==1 && latest["rows"][0]["status"]=="taskFailed");
     assert(delta["changes"][0]["row"]==latest["rows"][0]);

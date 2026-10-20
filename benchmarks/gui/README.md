@@ -131,38 +131,68 @@ Confirmed effects:
   snapshot, instead of re-reading and re-projecting the whole 3000-record file.
 * Idle now shows 0–1 paint and 0 animation frames in the 5 s sample.
 
-## Remaining hotspots (post-optimization)
+## Second optimization round (commit a8e1aa0f)
 
-1. **Full task projection is the largest data-path cost**: `task_rows` 55–57 ms for 5000
-   rows (≈11 µs/row), `Json::dump` 8 ms and `ui_page_set_json` 26 ms, ≈90 ms per broad
-   filter/refresh. Root lookup is no longer a factor; the per-row work is path
-   UTF-8⇄UTF-16 conversion, `_localtime64_s`+`strftime`, `tr()` lookups, an 11-field JSON
-   object and the sort. Reusing projected rows keyed by task sequence/language/root
-   generation, or precomputing time text and directory at accept time, is the next step.
-   This path runs on startup, on each broad search keystroke, on language changes and on
-   log rebuilds.
-2. **Tab switch hitch**: 34–68 ms synchronous dispatch before the first transition frame
-   (about 6 full repaints and 2 full layouts; the explicit navigation relayout is gone, the
-   remaining layouts come from list viewport/paint-time layout requests). The 250 ms
-   transition itself is cheap now (43–58 M cycles ≈ 15–20 ms CPU). Shortening the
-   synchronous block needs fewer repaints per click or avoiding layout during paint.
-3. **Startup**: 367–438 ms from open to first data, split into ≈130–140 ms open (UIX
-   compile/window) and ≈240–270 ms data (event-log parse ≈50 ms, task projection ≈55 ms,
-   dump+apply ≈35 ms, password/config projections, message queue and first paint).
-4. **Password save**: UI ack 83–165 ms, dominated by the 48–100 ms file replace wait
-   (disk/AV); the UI update is no longer the bottleneck.
-5. **Memory**: unchanged by the fixes — ≈50 MB for an empty window (D2D/DirectWrite/fonts
-   plus a 1680x1080 surface) and 97–105 MB after a session with 5000 tasks and 3000
-   passwords.
+Same protocol (`--rounds 30` ×5, `--rounds 100` ×2), same host state caveat. The table
+compares against the round-1 medians above.
+
+| Metric | Round 1 | Round 2 | Change |
+| --- | --- | --- | --- |
+| open → first data | 380 ms | 369 ms | −3 % |
+| data phase after open | 245 ms | 238 ms | −3 % |
+| apply 5000-row task state | 26.2 ms | 25.9 ms | ~0 % |
+| transition until settled (wall) | 245 ms | 166 ms | **−32 %** |
+| transition CPU (`settled` cycles) | 55.7 M | 35.3 M | **−37 %** |
+| tab switch dispatch | 34–68 ms | 41–49 ms | host-dependent |
+| password save UI ack | 83–165 ms | 83–159 ms | ~0 % |
+| memory after data / after session | 72.7 / 99.6 MiB | 81.0 / 104.0 MiB | +8.3 / +4.4 MiB |
+| task projection (cold / warm / unchanged) | 55–57 / — / — ms | 50.1 / 41.7 / 1.9 ms | — / −17 % / −96 % |
+
+* The 170 ms decorative transition is the largest visible win: the same switch now settles
+  in 166 ms (was 245 ms) with 35 M cycles of CPU (was 56 M). The 100-round stress runs show
+  the same 168/166 ms and no motion stalls.
+* Task projection is now instrumented in phases (`model_task_rows_phases`). The lazy display
+  cache removes the path/name/time formatting from repeated projections: 50.1 ms cold →
+  41.7 ms warm (−17 %). An unchanged selection skips JSON construction entirely
+  (1.9 ms, −96 %), which is what makes broad search keystrokes cheap when the result set
+  does not change.
+* The cold projection is unchanged (~49 ms of the 50 ms is row JSON construction), so
+  startup only moves −3 %: the first projection after a log rebuild or a filter that changes
+  the selection still pays it.
+* Tab dispatch is not measurably cheaper: the new `phase_counts` show 6.1 full paints and
+  2.0 layouts per switch, the same as round 1. The focus/transaction coalescing does not
+  reduce the count in this click flow.
+* Memory after data rose +8.3 MiB (working set, all 5 runs): the per-task display cache plus
+  the retained 5000 selection IDs. That is a trade for the warm/no-op projection savings and
+  should be gated if memory is a release criterion.
+* In 2 of 5 protocol runs the 5 s idle sample painted 120/403 times (up to 2.2 G cycles);
+  4 follow-up runs with the new `idle::*` trace attribution stayed at 0–1 paints and only
+  showed plain `paint_reason_4` requests, no animation events. Treat it as an unattributed
+  one-batch artifact until it reproduces with the trace on.
+
+## Remaining hotspots after round 2
+
+1. **Task row JSON construction** is now essentially the whole projection: ≈41 ms warm and
+   ≈49 ms cold for 5000 rows, in `project_task`/`Json` object building (11 fields per row)
+   plus `utf8(key)` and the root lookup. The display cache only removed the path/time part
+   (~8 ms). Next options: emit the row JSON text directly instead of building an object tree,
+   or cache per-task projected JSON (memory trade-off), or send a delta for filters instead
+   of a snapshot.
+2. **Tab switch dispatch**: 6 full repaints + 2 layouts, 41–49 ms on this host, unchanged by
+   the round-2 coalescing. The transition itself is now 166 ms / 35 M cycles.
+3. **Startup**: 369 ms to data = ≈130 ms open + ≈238 ms data (log parse, cold projection
+   ≈50 ms, dump+apply ≈35 ms, password/config projections, queue and first paint).
+4. **Password save**: ack 83–165 ms, dominated by the file replace wait (48–100 ms).
+5. **Memory**: +8.3 MiB after data versus round 1 from the projection cache and selection
+   retention; the empty-window baseline (~50 MB) is unchanged.
 6. **Test-only**: `ui_page_get_json` still takes ≈98 ms for 5000 rows (and the benchmark's
    `password_state_query` ≈30 ms) because it converts through `expr::Value` before emitting
    JSON. It measures the harness, not the app; a direct `JS_JSONStringify` path would make
    large-state polling cheap.
 
-The `page_switch_baseline` / `page_switch_end` probes stayed within host noise (30-round
-`config↔tasks`: baseline 34–38 ms, end 27–52 ms; 100-round: baseline 36–40 ms, end 52 ms),
-and the widget count stays at 346 → 689 after the first config/password mount. No
-per-session leak was found; the end-probe spread is not yet a trend.
+The `page_switch_baseline` / `page_switch_end` probes showed no session growth in the
+100-round runs (baseline 38.2/40.6 ms → end 41.9/33.9 ms; round 1 still had 36–40 → 52 ms),
+and the widget count stays at 346 → 689 after the first config/password mount.
 
 ## Not hotspots
 
@@ -202,6 +232,7 @@ This branch adds low-allocation, correctness-constrained hot-path changes:
   30` x 5 and `--rounds 100` x 2 protocol, with unchanged machine/screen
   settings, and compare cold-start, no-op filter, and warm/full refresh.
 
-**Do not infer a numeric speedup from source changes.** Re-run a Windows Release
-benchmark and confirm existing UI and file-contract integration suites before
-merging. Changes do not introduce a background poller or new IPC.
+**Measured** with the protocol above on this machine (see "Second optimization round"):
+transition wall −32 % and CPU −37 %, warm projection −17 %, unchanged selection −96 %,
+startup −3 %, dispatch ~0 %, working set +8.3 MiB after data. Existing UI and file-contract
+integration suites pass; the changes do not introduce a background poller or new IPC.

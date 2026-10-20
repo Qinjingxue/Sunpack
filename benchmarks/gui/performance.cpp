@@ -60,15 +60,18 @@ void trace_sink(const UiTraceEvent* e,void*) {
     if(e->name && !std::strcmp(e->name,"property_animation_frame")) property_frame_count.fetch_add(1,std::memory_order_relaxed);
     bool has_duration=false,has_frame_interval=false;
     double duration=0,frame_interval=0;
+    int64_t frame_reasons=0; bool has_frame_reasons=false;
     for(uint32_t i=0;i<e->field_count;++i) {
         const auto& f=e->fields[i];
         if(f.key && !std::strcmp(f.key,"duration_ms") && f.type==UI_TRACE_FIELD_F64) {
             duration=f.f64; has_duration=true;
         } else if(f.key && !std::strcmp(f.key,"frame_interval_ms") && f.type==UI_TRACE_FIELD_F64) {
             frame_interval=f.f64; has_frame_interval=true;
+        } else if(f.key && !std::strcmp(f.key,"frame_reasons") && f.type==UI_TRACE_FIELD_I64) {
+            frame_reasons=f.i64; has_frame_reasons=true;
         }
     }
-    if(!has_duration&&!has_frame_interval) return;
+    if(!has_duration&&!has_frame_interval&&!has_frame_reasons) return;
     std::lock_guard<std::mutex> lock(trace_mutex);
     const std::string name=e->name?e->name:"";
     if(has_duration) {
@@ -79,6 +82,9 @@ void trace_sink(const UiTraceEvent* e,void*) {
         trace_samples["all::animation_frame_interval_ms"].push_back(frame_interval);
         if(!trace_phase.empty()) trace_samples[trace_phase+"::animation_frame_interval_ms"].push_back(frame_interval);
     }
+    // Which frame reasons produce paints inside a measured action (idle must not paint at all).
+    if(has_frame_reasons && !trace_phase.empty())
+        phase_counts[trace_phase+"::paint_reason_"+std::to_string(frame_reasons)].push_back(1.0);
 }
 template<class F> void measure(const std::string& name,F&& fn) {
     { std::lock_guard<std::mutex> lock(trace_mutex); trace_phase=name; }
@@ -509,9 +515,12 @@ int wmain(int argc,wchar_t** argv) {
             for(size_t i=0;i<5;i++) { nav("tabConfig","config","page_switch_end"); nav("tabTasks","tasks","page_switch_end"); }
             const uint64_t idle_paint_start=paint_count.load(), idle_anim_start=animation_frame_count.load(),
                 idle_prop_start=property_frame_count.load();
+            { std::lock_guard<std::mutex> lock(trace_mutex); trace_phase="idle"; }
             idle_sample(5000);
+            { std::lock_guard<std::mutex> lock(trace_mutex); trace_phase.clear(); }
             // Idle must stay quiet: a lingering animation timer shows up here as
-            // one paint/animation frame per timer tick.
+            // one paint/animation frame per timer tick, and core_ui_trace.idle::*
+            // names the event that kept firing.
             report["idle_paints"]=paint_count.load()-idle_paint_start;
             report["idle_animation_frames"]=animation_frame_count.load()-idle_anim_start;
             report["idle_property_frames"]=property_frame_count.load()-idle_prop_start;
@@ -554,6 +563,15 @@ int wmain(int argc,wchar_t** argv) {
             {"warm",{{"filter_ms",warm_phases.filter_ms},{"sort_ms",warm_phases.sort_ms},{"project_ms",warm_phases.project_ms}}},
             {"unchanged",{{"filter_ms",reused_phases.filter_ms},{"sort_ms",reused_phases.sort_ms},{"project_ms",reused_phases.project_ms}}}
         };
+        // Live bytes held by the per-task lazy display cache, so a projection
+        // speedup can be weighed against the memory it retains.
+        size_t display_cache_bytes=0;
+        for(auto& entry:backend_log.tasks) {
+            const auto& cache=entry.second.display;
+            display_cache_bytes+=cache.path.capacity()+cache.directory.capacity()+
+                cache.filename.capacity()+cache.time.capacity();
+        }
+        report["task_display_cache_bytes"]=display_cache_bytes;
         measure("model_password_rows",[&]{
             ensure(password_rows(backend_passwords,backend_view,"en").value("total",0)==options.passwords,"password projection count");
         });
