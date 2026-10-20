@@ -56,6 +56,8 @@ public:
     void SetNumber(const std::string& name, double v);
     void SetString(const std::string& name, const std::string& v);
     void SetValue(const std::string& name, ui::expr::Value v);
+    // Parse text straight into QuickJS; avoid an intermediate expr::Value round trip.
+    bool SetJsonText(const std::string& name, const char* json, size_t length, std::string& error);
     bool CallJsonMethod(const std::string& name, const std::string& json);
 
     bool GetValue(const std::string& name, ui::expr::Value& out) const;
