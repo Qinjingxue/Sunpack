@@ -351,6 +351,26 @@ void scalar_reactivity_noop() {
     JS_FreeValue(ctx,state);
     JS_FreeValue(ctx,target);
 }
+void bound_style_updates() {
+    // Task cards keep their ID. They cannot detect stale descendant selectors
+    // when an ID changes while the bound class stays equal. This one in-memory
+    // page covers that independent behavior without another window or waits.
+    auto page=ui_page_load_string(R"(
+        <script>export default {data(){return {item:{id:'before',tone:'good',text:'same'}};}};</script>
+        <template><div :id="item.id" :class="item.tone"><label id="sample">{{ item.text }}</label></div></template>
+        <style>.good label {color:#00ff00;} #after label {background-color:#0000ff;} .bad label {color:#ff0000;}</style>
+    )"); assert(page);
+    auto handle=ui_page_root(page);
+    auto root=ui::GetContext().handles.Lookup(handle); assert(root);
+    auto* label=dynamic_cast<ui::LabelWidget*>(root->FindById("sample")); assert(label);
+    assert(label->css.hasFg && label->css.fg.g==1 && label->Text()==L"same");
+    assert(ui_page_set_json(page,"item",R"({"id":"after","tone":"good","text":"same"})")==0);
+    assert(label->bgColor.b==1 && label->bgColor.a==1);
+    assert(ui_page_set_json(page,"item",R"({"id":"after","tone":"bad","text":"changed"})")==0);
+    assert(label->css.hasFg && label->css.fg.r==1 && label->Text()==L"changed");
+    ui_widget_destroy(handle);
+    ui_page_destroy(page);
+}
 }
 int wmain(int argc,wchar_t** argv) {
     if(argc>1 && std::wstring(argv[1])==L"--fake-cli") {
@@ -374,6 +394,7 @@ int wmain(int argc,wchar_t** argv) {
             options.cli={executable_path(),dir,{L"--fake-cli",gate_name}};
             Application app(options); std::cerr<<"Opening UI\n"; app.open(); std::cerr<<"UI opened\n";
             pump([&]{return state(app.page(),"ready")==true;});
+            bound_style_updates();
             // Direct QuickJS JSON parsing must reject malformed input without
             // replacing an existing reactive list.
             auto initial_tasks=state(app.page(),"tasks");

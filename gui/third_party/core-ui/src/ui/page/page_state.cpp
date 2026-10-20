@@ -645,6 +645,10 @@ void PageState::ApplyBindingToWidget(Widget* w, const std::string& prop, const u
             ui::GetContext().RequestAnimTimerUpdate();
         }
     } _invalidate{shouldInvalidate};
+    auto refreshStyle = [](auto&& self, Widget* x) -> void {
+        if (x->recomputeStyle) x->recomputeStyle(x->lastStateBits);
+        for (auto& child : x->Children()) self(self, child.get());
+    };
 
     // SVG shape attribute: "shape[N].<attr>" routes to SvgWidget::SetShapeProperty.
     if (prop.size() > 6 && prop.compare(0, 6, "shape[") == 0) {
@@ -661,8 +665,14 @@ void PageState::ApplyBindingToWidget(Widget* w, const std::string& prop, const u
     }
 
     if (prop == "text") {
-        if (auto* lbl = dynamic_cast<LabelWidget*>(w))  lbl->SetText(ToWide(v.ToString()));
-        else if (auto* btn = dynamic_cast<ButtonWidget*>(w)) btn->SetText(ToWide(v.ToString()));
+        auto text = ToWide(v.ToString());
+        if (auto* lbl = dynamic_cast<LabelWidget*>(w)) {
+            if (lbl->Text() == text) { shouldInvalidate = false; traceBindingNoop(); return; }
+            lbl->SetText(text);
+        } else if (auto* btn = dynamic_cast<ButtonWidget*>(w)) {
+            if (btn->Text() == text) { shouldInvalidate = false; traceBindingNoop(); return; }
+            btn->SetText(text);
+        }
         return;
     }
     if (prop == "placeholder") {
@@ -674,7 +684,12 @@ void PageState::ApplyBindingToWidget(Widget* w, const std::string& prop, const u
          * 唯一 id 让 ui_page_on_widget_mount 能挂回调. 调用时机: bindings 首次
          * eval 时设 w->id, 紧接着 DispatchMountHooks 走 tree 命中 hook. id
          * 之后变化只更新值, 不联动 unmount/mount lifecycle — caller 别依赖. */
-        w->id = v.ToString();
+        auto id = v.ToString();
+        if (w->id == id) { shouldInvalidate = false; traceBindingNoop(); return; }
+        w->id = std::move(id);
+        // ID selectors (including descendant selectors) must be refreshed
+        // here; an unchanged class binding no longer performs that work.
+        refreshStyle(refreshStyle, w);
         return;
     }
     if (prop == "class") {
@@ -687,12 +702,12 @@ void PageState::ApplyBindingToWidget(Widget* w, const std::string& prop, const u
             } else tok += c;
         }
         if (!tok.empty()) tokens.push_back(std::move(tok));
+        // Keyed row replacements re-evaluate bindings even when only status
+        // or time changed. Reapplying the same class cascades CSS over the
+        // whole card and can dominate the cost of a streaming task delta.
+        if (w->dynamicClasses == tokens) { shouldInvalidate = false; traceBindingNoop(); return; }
         w->dynamicClasses = std::move(tokens);
-        std::function<void(Widget*)> refresh = [&](Widget* x) {
-            if (x->recomputeStyle) x->recomputeStyle(x->lastStateBits);
-            for (auto& c : x->Children()) refresh(c.get());
-        };
-        refresh(w);
+        refreshStyle(refreshStyle, w);
         return;
     }
     if (prop == "chip-labels" || prop == "chipLabels") {
@@ -715,6 +730,7 @@ void PageState::ApplyBindingToWidget(Widget* w, const std::string& prop, const u
     }
     if (prop == "visible") {
         bool nv = v.ToBool();
+        if (w->visible == nv) { shouldInvalidate = false; traceBindingNoop(); return; }
         if (w->visible != nv) {
             w->visible = nv;
             // visible flips ⇒ widget participates in flex layout differently
@@ -745,6 +761,7 @@ void PageState::ApplyBindingToWidget(Widget* w, const std::string& prop, const u
     }
     if (prop == "enabled") {
         bool nv = v.ToBool();
+        if (w->enabled == nv) { shouldInvalidate = false; traceBindingNoop(); return; }
         if (w->enabled != nv) {
             w->enabled = nv;
             // Re-cascade so any `:disabled` selector flips its match. Without

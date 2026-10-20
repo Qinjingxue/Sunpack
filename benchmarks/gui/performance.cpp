@@ -56,6 +56,14 @@ uint64_t working_set() {
 }
 void trace_sink(const UiTraceEvent* e,void*) {
     if(!e) return;
+    if(e->name && (!std::strcmp(e->name,"apply_binding") || !std::strcmp(e->name,"binding_noop"))) {
+        std::lock_guard<std::mutex> lock(trace_mutex);
+        if(!trace_phase.empty()) for(uint32_t i=0;i<e->field_count;++i) {
+            const auto& field=e->fields[i];
+            if(field.key && !std::strcmp(field.key,"prop") && field.str)
+                phase_counts[trace_phase+"::"+e->name+"_"+field.str].push_back(1);
+        }
+    }
     if(e->name && !std::strcmp(e->name,"motion_started")) motion_active.store(true,std::memory_order_relaxed);
     if(e->name && !std::strcmp(e->name,"motion_stopped")) {
         motion_active.store(false,std::memory_order_relaxed);
@@ -307,7 +315,7 @@ void scroll_list(Application& app,const char* scroll_id,const char* list_id,size
 }
 void ensure(bool ok,const char* message) { if(!ok) throw std::runtime_error(message); }
 void write_utf8(const fs::path& path,const std::string& data) { atomic_write(path,data); }
-struct RunOptions { size_t tasks=5000,passwords=3000,history=3000,roots=250,rounds=30; };
+struct RunOptions { size_t tasks=5000,passwords=3000,history=3000,roots=250,rounds=30,log_history_events=0; };
 RunOptions parse_args(int argc,wchar_t** argv) {
     RunOptions o;
     for(int i=1;i<argc;i+=2) {
@@ -318,6 +326,7 @@ RunOptions parse_args(int argc,wchar_t** argv) {
         else if(std::wstring(argv[i])==L"--history") o.history=v;
         else if(std::wstring(argv[i])==L"--roots") o.roots=v;
         else if(std::wstring(argv[i])==L"--rounds") o.rounds=v;
+        else if(std::wstring(argv[i])==L"--log-history-events") o.log_history_events=v;
         else throw std::runtime_error("Unknown option");
     }
     o.rounds=std::clamp<size_t>(o.rounds,5,100);
@@ -349,6 +358,19 @@ void seed(const fs::path& dir,const RunOptions& o) {
         log+=row.dump()+"\n";
     }
     write_utf8(dir/".sunpack_watch"/"events.jsonl",log);
+    // Grow event history independently of the number of distinct task cards.
+    // Stream latency after startup should depend on the appended tail, not
+    // on how many old events already occupy the file.
+    if(o.log_history_events && o.tasks) {
+        const auto line=Json{{"event","done"},{"path",utf8((monitored/"task-00000000.zip").wstring())},{"ts",1}}.dump()+"\n";
+        std::string chunk;
+        for(size_t i=0;i<o.log_history_events;++i) {
+            chunk+=line;
+            if(chunk.size()>=65536 || i+1==o.log_history_events) {
+                append_log_lines(dir/".sunpack_watch"/"events.jsonl",chunk); chunk.clear();
+            }
+        }
+    }
     Json passwords=Json::array(),history=Json::array();
     for(size_t i=0;i<o.passwords;i++) passwords.push_back({{"value","saved-password-"+std::to_string(i)},{"scopes",Json::array({utf8(monitored.wstring())})}});
     for(size_t i=0;i<o.history;i++) history.push_back("clipboard-password-"+std::to_string(i));
@@ -547,6 +569,8 @@ int wmain(int argc,wchar_t** argv) {
             }
             ensure(widget(app,("task-"+log_ids[0]).c_str()),"target task row not mounted");
             const auto benchmark_log=dir/".sunpack_watch"/"events.jsonl";
+            report["log_history_events"]=options.log_history_events;
+            report["log_bytes_before_updates"]=fs::file_size(benchmark_log);
             double log_stamp=1e7;
             auto log_line=[&](const char* type,const std::string& path,double stamp) {
                 Json event={{"event",type},{"path",path},{"time","2026-10-19T09:15:42.731112+00:00"},
@@ -583,19 +607,31 @@ int wmain(int argc,wchar_t** argv) {
             });
             // A writer thread appends every ~1 ms while the UI consumes updates.
             // Only the final event yields taskFailed, so the wait cannot finish early.
+            double stream_started=0,stream_written=0;
             std::thread log_stream([&]{
+                // Sleep(1) can be rounded to the system timer period. Keep
+                // the intended load stable without changing global resolution.
+                Handle timer(CreateWaitableTimerExW(nullptr,nullptr,CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,TIMER_ALL_ACCESS));
+                if(!timer.value) std::terminate();
+                stream_started=now_ms();
                 double stamp=log_stamp+1000;
                 for(int i=0;i<200;++i) {
                     append_log_lines(benchmark_log,log_line(i%2?"processing_started":"done",log_paths[0],++stamp));
-                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    LARGE_INTEGER due{}; due.QuadPart=-10000;
+                    if(!SetWaitableTimer(timer,&due,0,nullptr,nullptr,FALSE) ||
+                       WaitForSingleObject(timer,INFINITE)!=WAIT_OBJECT_0) std::terminate();
                 }
                 append_log_lines(benchmark_log,log_line("failed_terminal",log_paths[0],++stamp));
+                stream_written=now_ms();
             });
             measure("log_update_stream_200",[&]{
                 wait_for([&]{return row_status_text(app,log_ids[0])==status_text("taskFailed");},
                     "200-event log stream",30000,1);
             });
+            const double stream_visible=now_ms();
             log_stream.join();
+            report["log_stream_writer_ms"]=stream_written-stream_started;
+            report["log_stream_tail_to_ui_ms"]=std::max(0.0,stream_visible-stream_written);
             click(app,"taskSearch");
             ui_debug_key_mod(app.window(),'A',1,0,0); ui_debug_type_char(app.window(),8);
             const size_t target=options.tasks-1;

@@ -22,6 +22,10 @@ Local changes:
   row objects keep untouched rows' binding effects instead of disposing and
   rebuilding them on every delta. Global dependencies remain reactive; nested
   loop scopes and changed declared indices still rebind normally.
+- Skip unchanged bound label/button text, IDs, CSS classes, visibility and
+  enabled state. Changed IDs refresh descendant selectors directly; changed
+  classes still cascade normally. Avoid repeated CSS work and animation-host
+  scans during log streams and saving-state updates.
 
 - Honor `text-align` on text buttons, retaining centered text by default;
   task filename links use left alignment with the directory text below them.

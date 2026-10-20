@@ -312,7 +312,9 @@ void Application::apply_pending() {
         auto widget=ui_widget_find_by_id(ui_page_root(page_),id.get<std::string>().c_str());
         if(widget) { ui_debug_scroll_set(widget,0); ui_widget_destroy(widget); }
     }
-    start_save();
+    // Only an acknowledgement advances the save queue. Data/log publishes
+    // must not rewrite recordSaving/pendingFields and rebind hidden editors.
+    if(!ack.is_null()) start_save();
     if(closing_ && active_save_.is_null() && saves_.empty()) PostMessageW(hwnd_,WM_CLOSE,0,0);
     if(!transition.empty()) {
         ui_window_relayout(window_);
