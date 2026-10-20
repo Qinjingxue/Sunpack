@@ -32,12 +32,20 @@ set_property(TARGET sunpack_gui_data PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEA
 target_link_libraries(sunpack_gui_data PUBLIC nlohmann_json::nlohmann_json
   shell32 ole32 advapi32 ntdll)
 ui_core_embed_text(sunpack_gui_data FILE resources/catalog.json OUT catalog_json.h VAR kCatalogJson)
-add_executable(SunPackGUI WIN32 src/main.cpp src/application.cpp src/motion.cpp resources/app.rc)
+# Compile the application implementation only once for the shipping executable,
+# UI integration tests and optional performance benchmark. It owns main_uix.h,
+# so the parallel consumers never race to regenerate the same header.
+add_library(sunpack_gui_app OBJECT src/application.cpp src/motion.cpp)
+target_include_directories(sunpack_gui_app PRIVATE "${core_ui_SOURCE_DIR}/src")
+target_link_libraries(sunpack_gui_app PRIVATE sunpack_gui_data core-ui)
+set_property(TARGET sunpack_gui_app PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
+ui_core_embed_text(sunpack_gui_app FILE resources/main.uix OUT main_uix.h VAR kMainUix)
+
+add_executable(SunPackGUI WIN32 src/main.cpp resources/app.rc)
 target_include_directories(SunPackGUI PRIVATE "${core_ui_SOURCE_DIR}/src")
-# Enable MSVC /GL + /LTCG for the shipped GUI executable in Release builds only.
+# Keep Release /GL + /LTCG enabled on shipped application code.
 set_property(TARGET SunPackGUI PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
-target_link_libraries(SunPackGUI PRIVATE sunpack_gui_data core-ui comctl32)
-ui_core_embed_text(SunPackGUI FILE resources/main.uix OUT main_uix.h VAR kMainUix)
+target_link_libraries(SunPackGUI PRIVATE sunpack_gui_app sunpack_gui_data core-ui comctl32)
 target_link_options(SunPackGUI PRIVATE /OPT:REF /OPT:ICF
   "/MANIFESTINPUT:${CMAKE_CURRENT_SOURCE_DIR}/../sunpack.manifest")
 enable_testing()
@@ -45,21 +53,25 @@ add_executable(sunpack_gui_tests ../tests/gui/manager.cpp ../tests/gui/service_m
 ui_core_embed_text(sunpack_gui_tests FILE ../sunpack_advanced_config.json OUT defaults_json.h VAR kDefaultsJson)
 target_link_libraries(sunpack_gui_tests PRIVATE sunpack_gui_data)
 target_compile_options(sunpack_gui_tests PRIVATE /UNDEBUG)
+# sunpack_gui_data contains /GL objects: request LTCG up front rather than
+# letting LINK restart automatically after encountering the static library.
+target_link_options(sunpack_gui_tests PRIVATE "$<$<CONFIG:Release>:/LTCG>")
 add_test(NAME gui_file_contracts COMMAND sunpack_gui_tests)
-add_executable(sunpack_gui_ui_tests ../tests/gui/interface.cpp src/application.cpp src/motion.cpp resources/app.rc)
+add_executable(sunpack_gui_ui_tests ../tests/gui/interface.cpp resources/app.rc)
 target_include_directories(sunpack_gui_ui_tests PRIVATE "${core_ui_SOURCE_DIR}/src")
 ui_core_embed_text(sunpack_gui_ui_tests FILE ../sunpack_advanced_config.json OUT ui_defaults_json.h VAR kUiDefaultsJson)
-target_link_libraries(sunpack_gui_ui_tests PRIVATE sunpack_gui_data core-ui comctl32)
-# The application owns the shared generated header. Two MSBuild projects
-# producing the same file can otherwise overwrite it during parallel builds.
-add_dependencies(sunpack_gui_ui_tests SunPackGUI)
+target_link_libraries(sunpack_gui_ui_tests PRIVATE sunpack_gui_app sunpack_gui_data core-ui comctl32)
 target_compile_options(sunpack_gui_ui_tests PRIVATE /UNDEBUG)
+target_link_options(sunpack_gui_ui_tests PRIVATE "$<$<CONFIG:Release>:/LTCG>")
 add_test(NAME gui_interface COMMAND sunpack_gui_ui_tests)
-add_executable(sunpack_gui_performance ../benchmarks/gui/performance.cpp src/application.cpp src/motion.cpp resources/app.rc)
+
+# One MSBuild invocation can schedule all independent targets in parallel.
+add_custom_target(sunpack_gui_checks DEPENDS SunPackGUI sunpack_gui_tests sunpack_gui_ui_tests)
+add_executable(sunpack_gui_performance ../benchmarks/gui/performance.cpp resources/app.rc)
 target_include_directories(sunpack_gui_performance PRIVATE "${core_ui_SOURCE_DIR}/src")
 ui_core_embed_text(sunpack_gui_performance FILE ../sunpack_advanced_config.json OUT gui_perf_defaults.h VAR kGuiPerfDefaultsJson)
-target_link_libraries(sunpack_gui_performance PRIVATE sunpack_gui_data core-ui comctl32 psapi)
-add_dependencies(sunpack_gui_performance SunPackGUI)
+target_link_libraries(sunpack_gui_performance PRIVATE sunpack_gui_app sunpack_gui_data core-ui comctl32 psapi)
+target_link_options(sunpack_gui_performance PRIVATE "$<$<CONFIG:Release>:/LTCG>")
 # Only the manager is shipped; no debug server or demo is started by this host.
 install(TARGETS SunPackGUI RUNTIME DESTINATION .)
 FetchContent_GetProperties(quickjs)
