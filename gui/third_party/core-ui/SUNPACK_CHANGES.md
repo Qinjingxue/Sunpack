@@ -72,3 +72,7 @@ Motion references:
 - https://learn.microsoft.com/en-us/windows/apps/design/motion/page-transitions
 - https://github.com/microsoft/microsoft-ui-xaml/blob/main/controls/dev/CommonStyles/ToggleSwitch_themeresources.xaml
 - https://github.com/microsoft/microsoft-ui-xaml/blob/main/dxaml/xcp/dxaml/lib/ComboBox_Partial.cpp
+
+- Expose read-only ToggleWidget::Animating() to the integration tests. The
+  switch's own motion is checked without conflating it with other window
+  animations or requiring trace events when reduced motion is enabled.
