@@ -21,8 +21,12 @@ runs:
       id: toolchain
       shell: pwsh
       run: |
-        $cmake = ((cmake --version | Select-Object -First 1) -replace '^cmake version ', '').Trim()
-        if ($LASTEXITCODE -ne 0 -or -not $cmake) { throw 'Cannot identify CMake' }
+        # Capture all output before selecting the first line: early pipe closure
+        # can cause pip-distributed CMake to return a non-zero code on Windows.
+        $cmakeOutput = @(cmake --version)
+        $cmakeExit = $LASTEXITCODE
+        $cmake = ((@($cmakeOutput)[0]) -replace '^cmake version ', '').Trim()
+        if ($cmakeExit -ne 0 -or -not $cmake) { throw "Cannot identify CMake (exit=$cmakeExit, output=$cmakeOutput)" }
         $files = @(Get-ChildItem -Path @(
           "${env:ProgramFiles(x86)}\Microsoft Visual Studio\*\*\VC\Auxiliary\Build\Microsoft.VCToolsVersion.default.txt",
           "$env:ProgramFiles\Microsoft Visual Studio\*\*\VC\Auxiliary\Build\Microsoft.VCToolsVersion.default.txt"
