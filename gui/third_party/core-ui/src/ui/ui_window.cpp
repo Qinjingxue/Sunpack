@@ -3063,11 +3063,17 @@ void UiWindowImpl::OnMouseWheel(float x, float y, int delta) {
         // HitTest would otherwise deliver this wheel event to the ScrollView
         // or other widget behind it.
         bool handledByDropdown = false;
+        bool dismissedDropdown = false;
         ForEachWidget(root_.get(), [&](Widget* w) {
             if (handledByDropdown) return;
             auto* cb = dynamic_cast<ComboBoxWidget*>(w);
             if (cb && cb->IsOpen() && cb->OnMouseWheel(e)) {
                 handledByDropdown = true;
+            } else if (cb && cb->IsOpen()) {
+                // Dismiss outside-wheel input before the anchor can scroll
+                // out of a clipped pane. Close freezes its exit geometry.
+                cb->Close();
+                dismissedDropdown = true;
             }
         });
         if (handledByDropdown) {
@@ -3122,7 +3128,7 @@ void UiWindowImpl::OnMouseWheel(float x, float y, int delta) {
                 }
             }
         }
-        if (handled || hookFired) {
+        if (handled || hookFired || dismissedDropdown) {
             // Wheel handlers can produce a continuous stream of state changes
             // just like captured drag moves. Force the current window to paint
             // the latest zoom/scroll state instead of waiting for a later click

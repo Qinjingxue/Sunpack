@@ -177,14 +177,15 @@ export default {
   .directory-pane { flex:1; padding:8px 4px 4px; gap:4px; }
   .directory-tools { gap:8px; flex-shrink:0; }
   .directory-tools > button { width:100%; flex-shrink:0; }
+  .directory-tools > input { width:100%; }
   .directory-list { gap:2px; }
   .directory-list > button { width:100%; flex-shrink:0; }
-  .directory-item { min-height:44px; padding:4px 8px; flex-shrink:0; }
+  .directory-item { min-height:52px; padding:8px 12px; flex-shrink:0; }
   .directory-item .column { gap:2px; }
   .directory-name, .directory-path { white-space:nowrap; }
   .directory-actions button { flex:1; flex-shrink:0; }
-  .selected-directory { gap:3px; }
-  .selected-directory label { font-size:12px; color:var(--fg-2); }
+  .selected-directory { font-size:12px; color:var(--fg-2); }
+  .search-field { placeholder-color:var(--fg-2); }
   .task-filters { flex-wrap:wrap; }
   .task-filters input { min-width:180px; }
   .card { padding:16px 20px; gap:10px; border:1px solid var(--card-border); border-radius:8px; }
@@ -218,11 +219,12 @@ export default {
   .input-row { flex-direction:row; flex-wrap:wrap; align-items:center; gap:8px; }
   .input-row input { min-width:140px; }
   .inline-form { flex-shrink:0; }
-  .composer-fields { flex-direction:row; flex-wrap:wrap; gap:16px; }
-  .composer-field { width:46%; min-width:180px; gap:6px; }
+  .composer-fields { flex-direction:row; flex-wrap:wrap; justify-content:space-between; gap:16px; }
+  .composer-field { width:46%; min-width:180px; gap:8px; }
   .scope-value { white-space:pre-wrap; }
+  .password-toolbar { flex-direction:row; flex-wrap:wrap; align-items:center; gap:16px; }
   .password-tabs { flex-direction:row; flex-wrap:wrap; align-items:center; gap:8px; }
-  .password-tabs input { flex:1; min-width:180px; }
+  .password-search { width:220px; flex-shrink:0; }
   input, select { height:32px; }
   .content > input, .sidebar > input, .inline-form textarea { display:block; width:100%; }
   textarea { min-height:90px; }
@@ -246,7 +248,7 @@ export default {
   .runtime-dot.running { background:#6ccb5f; }
   .setting-description { color:var(--fg-2); font-size:12px; }
   .choice-host { height:32px; flex-direction:row; }
-  .password-input { height:90px; }
+  .password-input { height:90px; flex-shrink:0; }
   .history-list { gap:0px; border:1px solid var(--card-border); border-radius:8px; padding:0px 12px; }
   .history-list.light { background:#fbfbfb; }
   .history-list.dark { background:#2b2b2b; }
@@ -295,7 +297,7 @@ export default {
       <div id="directoryPane" v-show="tab==='tasks'" class="directory-pane">
         <div class="directory-tools">
         <div class="row"><label class="subheading fill">{{ texts.roots }}</label><label class="muted">{{ directoryCount }}</label><button id="newRoot" @click="editRoot(null)">{{ texts.addRoot }}</button></div>
-        <div class="row"><label class="muted">{{ texts.searchDirectory }}</label><input id="directorySearch" class="fill" :value="directoryQuery" @input="searchDirectory"/></div>
+        <input id="directorySearch" type="search" class="search-field" :placeholder="texts.searchDirectory" :value="directoryQuery" @input="searchDirectory"/>
         <button id="allRoots" :class="!taskRoot?'context-item on':'context-item'" @click="selectRoot('')"><label>{{ texts.allDirectories }}</label></button>
         </div>
         <ScrollView id="directoryListScroll"><VirtualList id="directoryItems" class="directory-list" estimated-height="60px">
@@ -311,10 +313,10 @@ export default {
       <div id="page-tasks" v-show="tab==='tasks'" class="content">
         <div class="page-header"><label class="heading">{{ texts.tasks }}</label></div>
         <label v-show="!rootEditor &amp;&amp; saveErrors['@roots']" class="error">{{ saveErrors['@roots'] }}</label>
-        <div v-show="chosenDirectory.path &amp;&amp; !rootEditor" class="selected-directory"><label>{{ chosenDirectory.path }}</label><label>{{ texts.output }}{{ chosenDirectory.effectiveOutput }}</label></div>
-        <div v-show="!rootEditor" class="column"><label class="muted">{{ texts.taskSearch }}</label><div class="row task-filters"><input id="taskSearch" class="fill" :value="taskQuery" @input="searchTasks"/>
+        <label v-show="chosenDirectory.path &amp;&amp; !rootEditor" class="selected-directory">{{ chosenDirectory.path }}</label>
+        <div v-show="!rootEditor" class="row task-filters"><input id="taskSearch" type="search" class="fill search-field" :placeholder="texts.taskSearch" :value="taskQuery" @input="searchTasks"/>
           <div id="taskStatusHost" style="width:180px;height:32px"/>
-        </div></div>
+        </div>
         <ScrollView id="taskListScroll"><div id="taskBody" class="column">
         <div id="rootForm" v-show="rootEditor" class="card inline-form" :enabled="!!rootOriginal||!recordSaving.roots">
           <div class="row"><label class="subheading">{{ rootOriginal?texts.editRoot:texts.addRoot }}</label><div class="spacer"/><button id="closeRootEditor" @click="leaveRoot()">{{ texts.back }}</button></div>
@@ -333,7 +335,7 @@ export default {
       </div>
       <div id="page-config" v-show="tab==='config'" class="content">
         <div class="page-header"><label class="heading">{{ texts.config }}</label></div>
-        <label class="muted">{{ texts.settingSearch }}</label><input id="configSearch" :value="configQuery" @input="searchConfig"/>
+        <input id="configSearch" type="search" class="search-field" :placeholder="texts.settingSearch" :value="configQuery" @input="searchConfig"/>
         <ScrollView id="configListScroll"><div id="configBlocks" class="column">
           <div v-show="!configCategory &amp;&amp; !configQuery" class="card settings-row">
             <div class="setting-copy"><label class="setting-title">{{ texts.startup }}</label><label class="muted">{{ texts.startupDescription }}</label></div>
@@ -369,12 +371,12 @@ export default {
       <div id="page-passwords" v-show="tab==='passwords'" class="content">
         <div class="page-header"><label class="heading">{{ texts.passwords }}</label></div>
         <label v-show="!passwordEditor &amp;&amp; saveErrors['@passwords']" class="error">{{ saveErrors['@passwords'] }}</label>
-        <div class="password-tabs"><button id="newPassword" :class="passwordEditor &amp;&amp; !passwordOriginal?'on':''" @click="editPassword(null)">{{ texts.addPasswords }}</button><button id="savedPasswords" :class="passwordScope==='@all' &amp;&amp; !passwordEditor?'on':''" @click="selectScope('@all')">{{ texts.savedPasswords }}</button><button id="clipboardHistory" :class="passwordScope==='@history' &amp;&amp; !passwordEditor?'on':''" @click="selectScope('@history')">{{ texts.history }}</button><label class="muted">{{ texts.passwordSearch }}</label><input id="passwordSearch" :value="passwordQuery" @input="searchPasswords"/></div>
+        <div class="password-toolbar"><input id="passwordSearch" type="search" class="search-field password-search" :placeholder="texts.passwordSearch" :value="passwordQuery" @input="searchPasswords"/><div class="password-tabs"><button id="newPassword" :class="passwordEditor &amp;&amp; !passwordOriginal?'on':''" @click="editPassword(null)">{{ texts.addPasswords }}</button><button id="savedPasswords" :class="passwordScope==='@all' &amp;&amp; !passwordEditor?'on':''" @click="selectScope('@all')">{{ texts.savedPasswords }}</button><button id="clipboardHistory" :class="passwordScope==='@history' &amp;&amp; !passwordEditor?'on':''" @click="selectScope('@history')">{{ texts.history }}</button></div></div>
         <ScrollView id="passwordListScroll"><div id="passwordBody" class="column">
           <div id="passwordForm" v-show="passwordEditor" class="card inline-form" :enabled="!!passwordOriginal||!recordSaving.passwords">
             <div class="row"><label class="subheading">{{ passwordOriginal?texts.editPassword:texts.addPasswords }}</label><div class="spacer"/><button id="closePasswordEditor" @click="leavePassword()">{{ texts.back }}</button></div>
-              <div class="composer-fields"><div class="composer-field"><label class="subheading">{{ texts.passwordText }}</label><label v-show="!passwordOriginal" class="muted">{{ texts.batchHint }}</label><textarea id="passwordValue" v-model="passwordValue" @blur="commitPassword()" class="password-input"/></div>
-              <div class="composer-field"><label class="subheading">{{ texts.scopeLabel }}</label><label class="muted">{{ texts.scopeDescription }}</label><textarea id="passwordScopes" v-model="scopeText" @blur="commitPassword()" class="password-input"/></div></div>
+              <div class="composer-fields"><div class="composer-field"><label class="subheading">{{ texts.passwordText }}</label><textarea id="passwordValue" v-model="passwordValue" @blur="commitPassword()" class="password-input"/><label v-show="!passwordOriginal" class="muted">{{ texts.batchHint }}</label></div>
+              <div class="composer-field"><label class="subheading">{{ texts.scopeLabel }}</label><textarea id="passwordScopes" v-model="scopeText" @blur="commitPassword()" class="password-input"/><label class="muted">{{ texts.scopeDescription }}</label></div></div>
               <label v-show="saveErrors['@passwords']" class="error">{{ saveErrors['@passwords'] }}</label><div class="action-row"><button id="browseScope" @click="send('browse',{target:'scopeText'})">{{ texts.chooseScope }}</button><button v-show="passwordOriginal &amp;&amp; scopeText" @click="passwordAction('global',{})">{{ texts.makeGlobal }}</button><button id="finishPassword" v-show="!passwordOriginal" @click="passwordAction('save')">{{ texts.addToList }}</button><button id="deletePassword" v-show="passwordOriginal" @click="passwordAction('delete')">{{ texts.deletePassword }}</button></div>
           </div>
           <div :class="'history-list '+appearance"><label v-show="passwords.total===0" class="muted">{{ texts.noPasswords }}</label>

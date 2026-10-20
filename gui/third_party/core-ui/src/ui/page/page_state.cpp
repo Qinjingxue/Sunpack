@@ -644,6 +644,10 @@ void PageState::ApplyBindingToWidget(Widget* w, const std::string& prop, const u
         else if (auto* btn = dynamic_cast<ButtonWidget*>(w)) btn->SetText(ToWide(v.ToString()));
         return;
     }
+    if (prop == "placeholder") {
+        if (auto* input = dynamic_cast<TextInputWidget*>(w)) input->SetPlaceholder(ToWide(v.ToString()));
+        return;
+    }
     if (prop == "id") {
         /* :id="..." 动态 id (build 98+ L26). 主用例 v-for 给每个 iteration
          * 唯一 id 让 ui_page_on_widget_mount 能挂回调. 调用时机: bindings 首次

@@ -1283,7 +1283,9 @@ WidgetPtr ConstructInput(const ui::uix::Node& node, const std::string& text) {
             break;
         }
     }
-    return std::make_shared<TextInputWidget>(ph);
+    auto input = std::make_shared<TextInputWidget>(ph);
+    input->SetSearchIcon(type == "search");
+    return input;
 }
 
 }  // namespace

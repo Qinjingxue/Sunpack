@@ -225,8 +225,8 @@
       "en": "Add passwords"
     },
     "passwordSearch": {
-      "zh": "搜索",
-      "en": "Search"
+      "zh": "搜索密码",
+      "en": "Search passwords"
     },
     "noPasswords": {
       "zh": "没有匹配的密码。",
@@ -253,8 +253,8 @@
       "en": "Applies to"
     },
     "scopeDescription": {
-      "zh": "每行一个完整目录路径（含子目录）；新密码留空表示全部目录。",
-      "en": "One full folder path per line, including subfolders. Leave blank for new passwords to apply everywhere."
+      "zh": "每行一个目录，含子目录。新密码留空适用全部目录。",
+      "en": "One folder per line, with subfolders. Blank for new passwords: all folders."
     },
     "chooseScope": {
       "zh": "添加适用目录",

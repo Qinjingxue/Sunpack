@@ -905,7 +905,7 @@ bool TextInputWidget::GetCaretRect(D2D1_RECT_F* out) const {
     if (!g_activeMeasureContext) return false;
     float fontSize = (css.fontSize > 0) ? css.fontSize : theme::kFontSizeNormal;
     int pos = std::min(std::max(cursorPos_, 0), (int)text_.size());
-    float x = rect.left + 11.0f - scrollX_ +
+    float x = rect.left + TextInset() - scrollX_ +
               g_activeMeasureContext->MeasureTextWidth(text_.substr(0, pos),
                                                        fontSize);
     *out = {x, rect.top + 5, x + 1.5f, rect.bottom - 6};
@@ -914,7 +914,7 @@ bool TextInputWidget::GetCaretRect(D2D1_RECT_F* out) const {
 
 int TextInputWidget::CharIndexFromX(MeasureContext& measure, float x) const {
     float fontSize = (css.fontSize > 0) ? css.fontSize : theme::kFontSizeNormal;
-    float textX = rect.left + 11.0f - scrollX_;
+    float textX = rect.left + TextInset() - scrollX_;
     if (x <= textX) return 0;
 
     for (int i = 0; i <= (int)text_.size(); i++) {
@@ -944,7 +944,7 @@ void TextInputWidget::DeleteSelection() {
 
 void TextInputWidget::EnsureCursorVisible(MeasureContext& measure) {
     float fontSize = (css.fontSize > 0) ? css.fontSize : theme::kFontSizeNormal;
-    float textAreaW = rect.right - rect.left - 22.0f;  // 11px padding each side
+    float textAreaW = std::max(0.0f, rect.right - rect.left - TextInset() - 11.0f);
     std::wstring before = text_.substr(0, cursorPos_);
     float cursorX = measure.MeasureTextWidth(before, fontSize, nullptr);
 
@@ -1031,7 +1031,14 @@ void TextInputWidget::OnDraw(Renderer& r) {
         }
     }
 
-    D2D1_RECT_F textArea = {rect.left + 11, rect.top + 5, rect.right - 11, rect.bottom - 6};
+    if (searchIcon_) {
+        // Compact Fluent-style magnifier; no glyph font or extra widget needed.
+        float x = rect.left + 11.0f, y = (rect.top + rect.bottom) * 0.5f;
+        auto color = css.hasPlaceholderColor ? css.placeholderColor : theme::kContentText();
+        r.DrawRoundedRect({x, y - 6, x + 10, y + 4}, 5, 5, color, 1.0f);
+        r.DrawLine(x + 8.5f, y + 2.5f, x + 13.5f, y + 7.5f, color, 1.0f);
+    }
+    D2D1_RECT_F textArea = {rect.left + TextInset(), rect.top + 5, rect.right - 11, rect.bottom - 6};
     r.PushClip(textArea);
 
     if (text_.empty()) {
@@ -1046,7 +1053,7 @@ void TextInputWidget::OnDraw(Renderer& r) {
     D2D1_COLOR_F caret = css.hasCaretColor ? css.caretColor : accent;
 
     if (!text_.empty()) {
-        float textX = rect.left + 11.0f - scrollX_;
+        float textX = rect.left + TextInset() - scrollX_;
         D2D1_RECT_F drawArea = {textX, rect.top, textX + 10000, rect.bottom};
         bool selDrawn = false;
 
@@ -1112,7 +1119,7 @@ void TextInputWidget::OnDraw(Renderer& r) {
     }
 
     if (text_.empty() && focused && ShouldShowCaret()) {
-        float cursorX = rect.left + 11.0f;
+        float cursorX = rect.left + TextInset();
         float cy1 = rect.top + 5, cy2 = rect.bottom - 5;
         r.DrawLine(cursorX, cy1, cursorX, cy2, caret, 1.5f);
     }
@@ -1976,6 +1983,8 @@ void ComboBoxWidget::OnDraw(Renderer& r) {
 }
 
 ComboBoxWidget::DropdownLayout ComboBoxWidget::ComputeDropdownLayout_() const {
+    // Exit in screen space even if the owning scroll pane moves meanwhile.
+    if (!open_ && PopupAnimating()) return closingLayout_;
     const int totalRows = (int)items_.size();
     if (totalRows <= 0 || itemHeight_ <= 0.0f) return {};
 
@@ -2036,7 +2045,8 @@ void ComboBoxWidget::OpenDropdown_() {
 
 void ComboBoxWidget::Close() {
     if (!open_) return;
-    open_ = false; // Stop accepting popup input immediately, retain its exit frame.
+    closingLayout_ = ComputeDropdownLayout_();
+    open_ = false; // Stop accepting popup input immediately.
     hoveredIndex_ = -1;
     AnimatePopup_(false);
 }
@@ -2143,7 +2153,7 @@ void ComboBoxWidget::OnDrawOverlay(Renderer& r) {
     const int totalRows = (int)items_.size();
     const bool canScroll = totalRows > layout.visibleRows;
     const float labelRight = canScroll ? dropBg.right - 12.0f : dropBg.right - 4.0f;
-    for (int row = 0; row < layout.visibleRows; ++row) {
+    for (int row = 0; row < layout.visibleRows && dropdownScrollIndex_ + row < totalRows; ++row) {
         const int i = dropdownScrollIndex_ + row;
         float iy = dropBg.top + itemHeight_ * row;
         D2D1_RECT_F itemRect = {dropBg.left + 4, iy + 1, dropBg.right - 4, iy + itemHeight_ - 1};
@@ -2479,12 +2489,13 @@ void VirtualListWidget::DoLayout() {
         // A subtree's intrinsic height may change after wrapping at this width.
         // Two local passes settle that row, never the offscreen list.
         for (int pass = 0; pass < 2; ++pass) {
-            float h = std::max(1.0f, child->SizeHint().height);
+            float h = std::max(1.0f, std::clamp(child->SizeHint().height, child->minH, child->maxH));
             float y = rect.top + padT + Sum(indices_[i]);
             child->rect = {rect.left + padL, y, rect.right - padR, y + h};
             child->DoLayout();
         }
-        float h = std::max(1.0f, child->SizeHint().height) + gap_;
+        // Match VBox's min/max constraints for both layout and cached height.
+        float h = std::max(1.0f, std::clamp(child->SizeHint().height, child->minH, child->maxH)) + gap_;
         if (std::abs(h - heights_[indices_[i]]) > 0.5f) {
             MeasureRow(indices_[i], h); changed = true;
         }

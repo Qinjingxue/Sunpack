@@ -271,6 +271,9 @@ public:
 
     const std::wstring& Text() const { return text_; }
     void SetText(const std::wstring& t) { text_ = t; cursorPos_ = (int)t.size(); selectionStart_ = selectionEnd_ = -1; ResetCaretBlink(); }
+    const std::wstring& Placeholder() const { return placeholder_; }
+    void SetPlaceholder(const std::wstring& value) { placeholder_ = value; }
+    void SetSearchIcon(bool value) { searchIcon_ = value; }
     static UINT EffectiveCaretBlinkMs();
     void ResetCaretBlink();
     bool ShouldShowCaret() const;
@@ -292,6 +295,7 @@ public:
 private:
     std::wstring text_;
     std::wstring placeholder_;
+    bool searchIcon_ = false;
     int cursorPos_ = 0;
     int selectionStart_ = -1;
     int selectionEnd_ = -1;
@@ -299,6 +303,7 @@ private:
     uint64_t caretBlinkStartTick_ = 0;
     bool dragging_ = false;
 
+    float TextInset() const { return searchIcon_ ? 32.0f : 11.0f; }
     int CharIndexFromX(MeasureContext& measure, float x) const;
     void DeleteSelection();
     bool HasSelection() const { return selectionStart_ >= 0 && selectionEnd_ >= 0 && selectionStart_ != selectionEnd_; }
@@ -545,6 +550,7 @@ private:
         int visibleRows = 0;
         bool opensUpward = false;
     };
+    DropdownLayout closingLayout_{};
 
     DropdownLayout ComputeDropdownLayout_() const;
     void OpenDropdown_();

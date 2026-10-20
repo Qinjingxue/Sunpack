@@ -147,6 +147,26 @@ void click(Application& app,const char* id) {
     assert(ui_debug_click(app.window(),widget)==0);
     ui_widget_destroy(widget);
 }
+void search_config(Application& app,const wchar_t* query) {
+    // Use the real search input: its handler also resets the virtual viewport.
+    // Setting configQuery directly skips that command and assumes rows outside
+    // the old viewport already have widgets before the next layout.
+    click(app,"configSearch");
+    assert(ui_debug_key_mod(app.window(),'A',1,0,0)==0);
+    assert(ui_debug_type_char(app.window(),8)==0);
+    if(*query) assert(ui_debug_type_text(app.window(),query)==0);
+    pump([&]{return state(app.page(),"configQuery")==utf8(query) &&
+        state(app.page(),"requests").empty() && !state(app.page(),"dispatch").get<bool>();},"Configuration search");
+    ui_window_relayout(app.window());
+}
+void search_hints(Application& app) {
+    auto* root=ui::GetContext().GetWindow(app.window())->Root().get();
+    for(auto pair:{std::pair<const char*,const char*>{"directorySearch","searchDirectory"},
+                   {"taskSearch","taskSearch"},{"configSearch","settingSearch"},{"passwordSearch","passwordSearch"}}) {
+        auto* input=dynamic_cast<ui::TextInputWidget*>(root->FindById(pair.first));
+        assert(input && input->Placeholder()==wide(state(app.page(),"texts")[pair.second].get<std::string>()));
+    }
+}
 void button_texts(Application& app,bool relayout=true) {
     if(relayout) ui_window_relayout(app.window());
     char* dump=ui_debug_dump_tree(app.window()); assert(dump);
@@ -233,15 +253,23 @@ void virtual_tail(Application& app,const char* list_id,const char* scroll_id,siz
     auto* list=dynamic_cast<ui::VirtualListWidget*>(ui::GetContext().GetWindow(app.window())->Root()->FindById(list_id));
     assert(list && total>0 && list->Children().size()<40);
     auto* scroll=dynamic_cast<ui::ScrollViewWidget*>(ui::GetContext().GetWindow(app.window())->Root()->FindById(scroll_id)); assert(scroll);
+    auto scroll_to=[&](float y) {
+        // Programmatic scroll must use the window's renderer-backed measurer,
+        // exactly like the production scroll command, including newly mounted rows.
+        ui::GetContext().GetWindow(app.window())->ScrollWithMeasureContext(scroll,y);
+        ui_window_relayout(app.window());
+    };
     for(int visit=0;visit<3;++visit) {
         // Estimated heights settle when the last variable-height rows mount.
-        for(int pass=0;pass<3;++pass) { scroll->SetScrollY(1e9f); ui_window_relayout(app.window()); }
+        for(int pass=0;pass<3;++pass) scroll_to(1e9f);
+        if(list->Indices().empty() || list->Indices().back()!=total-1)
+            std::cerr<<"Virtual tail "<<list_id<<" expected="<<total<<" last="<<(list->Indices().empty()?0:list->Indices().back())<<" scroll="<<scroll->ScrollY()<<"\n";
         assert(!list->Indices().empty() && list->Indices().back()==total-1);
         assert(list->Children().size()<40);
         const auto& last=list->Children().back()->rect;
         auto viewport=scroll->rect;
         assert(last.top<viewport.bottom && last.bottom<=viewport.bottom+2);
-        scroll->SetScrollY(0); ui_window_relayout(app.window());
+        scroll_to(0);
         if(list->Indices().empty() || list->Indices().front()!=0 || list->Children().size()>=40) {
             std::cerr<<"Virtual top "<<list_id<<" indices="; for(auto index:list->Indices()) std::cerr<<index<<","; std::cerr<<" rect="<<list->rect.top<<","<<list->rect.bottom<<" scroll="<<rendered_widget(app,scroll_id)<<"\n";
         }
@@ -509,6 +537,37 @@ int wmain(int argc,wchar_t** argv) {
             assert(ui_debug_combo_select(app.window(),theme,0)==0);
             assert(state(app.page(),"appearance")==system_appearance);
             popup_motion(app,"themeSelector");
+            {
+                auto* root=ui::GetContext().GetWindow(app.window())->Root().get();
+                auto* combo=dynamic_cast<ui::ComboBoxWidget*>(root->FindById("themeSelector"));
+                auto* scroll=dynamic_cast<ui::ScrollViewWidget*>(root->FindById("configListScroll"));
+                assert(combo && scroll);
+                BOOL animations=TRUE; SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION,0,&animations,0);
+                for(bool fading:{false,true}) {
+                    click(app,"themeSelector");
+                    pump([&]{return !combo->PopupAnimating();},"Popup before wheel");
+                    auto selected=combo->SelectedIndex();
+                    auto drop=combo->DropdownRect();
+                    float before=scroll->ScrollY();
+                    // The overlay consumes its own wheel, without scrolling
+                    // the settings behind it or changing the selected value.
+                    assert(ui_debug_wheel_at(app.window(),(drop.left+drop.right)/2,(drop.top+drop.bottom)/2,-120)==0);
+                    assert(combo->IsOpen() && scroll->ScrollY()==before && combo->SelectedIndex()==selected);
+                    AnimationFrames exit;
+                    if(fading) assert(ui_debug_key(app.window(),VK_ESCAPE)==0);
+                    assert(ui_debug_wheel_at(app.window(),scroll->rect.left+12,scroll->rect.top+12,-120)==0);
+                    assert(scroll->ScrollY()>before && !combo->IsOpen());
+                    if(animations) {
+                        assert(combo->PopupAnimating() && combo->PopupOpacity()>0);
+                        auto frozen=combo->DropdownRect();
+                        assert(frozen.left==drop.left && frozen.top==drop.top && frozen.right==drop.right && frozen.bottom==drop.bottom);
+                    }
+                    pump([&]{return !combo->PopupAnimating() && (!animations || exit.stopped);},"Popup wheel exit");
+                    assert(combo->PopupOpacity()==0 && combo->PopupProgress()==0 && combo->SelectedIndex()==selected);
+                    ui::GetContext().GetWindow(app.window())->ScrollWithMeasureContext(scroll,0);
+                }
+                screenshot(app,L"dropdown-scrolled-closed.png");
+            }
             ui_window_set_size(app.window(),850,560); ui_window_relayout(app.window());
             auto popup_scroll=ui_widget_find_by_id(ui_page_root(app.page()),"configListScroll"); assert(popup_scroll);
             auto viewport=rect(app,"configListScroll"), recursive=rect(app,"select-/recursive_extract");
@@ -526,7 +585,7 @@ int wmain(int argc,wchar_t** argv) {
             ui_widget_destroy(priority);
             finish_input(app);
             pump([&]{return read_json(dir/"sunpack_config.json")["runtime"]["process_mode"]=="high";});
-            ui_page_set_text(app.page(),"configQuery",L"toast_enabled");
+            search_config(app,L"toast_enabled");
             auto toast=ui_widget_find_by_id(ui_page_root(app.page()),"toggle-/watch/toast_enabled"); assert(toast);
             assert(ui_debug_toggle_set(app.window(),toast,0)==0);
             assert(state(app.page(),"toggleDrafts").size()==1 && state(app.page(),"drafts").empty());
@@ -564,8 +623,7 @@ int wmain(int argc,wchar_t** argv) {
             pump([&]{return state(app.page(),"tab")=="tasks";});
             pump([&]{return state(app.page(),"saving")==false;});
             click(app,"tabConfig"); pump([&]{return state(app.page(),"tab")=="config";});
-            ui_page_set_text(app.page(),"configQuery",L"");
-            click(app,"configSearch"); ui_debug_type_text(app.window(),L"out_dir");
+            search_config(app,L"out_dir");
             if(state(app.page(),"configQuery")!="out_dir")
                 throw std::runtime_error("Config search: "+state(app.page(),"configQuery").dump()+" error="+ui_page_last_error(app.page()));
             ui_window_set_size(app.window(),850,560);
@@ -605,14 +663,16 @@ int wmain(int argc,wchar_t** argv) {
             pump([&]{return state(app.page(),"language")=="en";});
             assert(state(app.page(),"texts")["config"]=="Settings");
             assert(state(app.page(),"fields")[0]["label"]=="Language");
+            search_hints(app);
             screenshot(app,L"configuration-english.png");
             button_texts(app);
-            ui_page_set_text(app.page(),"configQuery",L"language");
+            search_config(app,L"language");
             auto language=ui_widget_find_by_id(ui_page_root(app.page()),"select-/cli/language"); assert(language);
             assert(ui_debug_combo_select(app.window(),language,0)==0);
             ui_widget_destroy(language);
             finish_input(app);
             pump([&]{return state(app.page(),"language")=="zh";});
+            search_hints(app);
             ui_window_set_size(app.window(),1120,720);
             click(app,"tabPasswords"); pump([&]{return state(app.page(),"tab")=="passwords";});
             std::cerr<<"Password view mounted\n";
@@ -620,6 +680,7 @@ int wmain(int argc,wchar_t** argv) {
             assert(state(app.page(),"passwordScope")=="@all");
             assert(!ui_widget_find_by_id(ui_page_root(app.page()),"globalPasswords"));
             auto add_bounds=rect(app,"newPassword"), saved_bounds=rect(app,"savedPasswords");
+            assert(rect(app,"passwordSearch").right<add_bounds.left);
             assert(add_bounds.left<saved_bounds.left && add_bounds.top==saved_bounds.top);
             assert(state(app.page(),"texts")["back"]=="返回");
             click(app,"newPassword"); assert(state(app.page(),"passwordEditor")==true);
@@ -655,7 +716,7 @@ int wmain(int argc,wchar_t** argv) {
             click(app,"newPassword"); click(app,"passwordValue"); ui_debug_type_text(app.window(),L"pending global");
             click(app,"finishPassword"); finish_input(app);
             click(app,"tabConfig"); pump([&]{return state(app.page(),"tab")=="config";});
-            ui_page_set_text(app.page(),"configQuery",L"out_dir");
+            search_config(app,L"out_dir");
             output=ui_widget_find_by_id(ui_page_root(app.page()),"input-/watch/out_dir"); ui_text_input_set_text(output,L""); ui_widget_destroy(output);
             click(app,"input-/watch/out_dir"); ui_debug_type_text(app.window(),L"batch-output");
             auto background=read_json(dir/"builtin_passwords.json"); assert(background["passwords"].size()==5);
@@ -758,8 +819,9 @@ int wmain(int argc,wchar_t** argv) {
             auto complete=parse_json(kUiDefaultsJson); complete["watch"]["state_dir"]="elsewhere";
             atomic_write(dir/"sunpack_config.json",complete.dump());
             pump([&]{return state(app.page(),"fields").size()>100;});
-            ui_page_set_json(app.page(),"drafts","{}"); ui_page_set_text(app.page(),"configQuery",L"");
+            ui_page_set_json(app.page(),"drafts","{}");
             click(app,"tabConfig"); pump([&]{return state(app.page(),"tab")=="config";});
+            search_config(app,L"");
             ui_window_relayout(app.window());
             button_texts(app);
             auto startup_before=rect(app,"startupToggle");
@@ -795,7 +857,7 @@ int wmain(int argc,wchar_t** argv) {
                 ui_widget_destroy(item); ui_widget_destroy(scroll);
             }
             screenshot(app,L"advanced-settings-small.png");
-            ui_page_set_text(app.page(),"configQuery",L"白名单");
+            search_config(app,L"白名单");
             auto blocks=state(app.page(),"matchingBlocks");
             if(blocks.size()!=1 || blocks[0]["fields"].size()!=5) std::cerr<<"Whitelist groups: "<<blocks<<"\n";
             assert(blocks.size()==1 && blocks[0]["fields"].size()==5);
@@ -835,12 +897,20 @@ int wmain(int argc,wchar_t** argv) {
                 auto bounds=ui_widget_get_rect(handle); ui_widget_destroy(handle);
                 if(bounds.top>=list_rect.top && bounds.bottom<=list_rect.bottom) ++visible;
             }
-            assert(visible>=3);
-            screenshot(app,L"directories-small.png");
+            // Padded two-line directory cards still leave two complete rows
+            // in the minimum window, instead of squeezing text into 32 px.
+            assert(visible>=2);
             auto first=state(app.page(),"shownDirectories")[1];
             click(app,("directory-"+first["id"].get<std::string>()).c_str());
             pump([&]{return state(app.page(),"tasks")["total"]==0;});
             assert(state(app.page(),"chosenDirectory")["path"]==first["path"]);
+            {
+                auto card=rendered_widget(app,"directory-"+first["id"].get<std::string>());
+                auto bounds=card["rect"], copy=card["children"][0]["rect"];
+                assert(copy[1].get<float>()-bounds[1].get<float>()>=7);
+                assert(bounds[3].get<float>()-copy[3].get<float>()>=7);
+            }
+            screenshot(app,L"directories-small.png");
             click(app,"editSelectedRoot");
             assert(state(app.page(),"rootInput")==first["path"]);
             click(app,"closeRootEditor"); click(app,"allRoots");
@@ -880,14 +950,14 @@ int wmain(int argc,wchar_t** argv) {
             assert(read_json(dir/"builtin_passwords.json")["clipboard_history"]==history["clipboard_history"]);
             click(app,"closePasswordEditor");
             click(app,"tabConfig"); pump([&]{return state(app.page(),"tab")=="config";});
-            ui_page_set_text(app.page(),"configQuery",L"max_folders");
+            search_config(app,L"max_folders");
             auto invalid_input=ui_widget_find_by_id(ui_page_root(app.page()),"input-/watch/max_folders"); assert(invalid_input);
             ui_text_input_set_text(invalid_input,L""); ui_widget_destroy(invalid_input);
             click(app,"input-/watch/max_folders"); ui_debug_type_text(app.window(),L"0");
             assert(ui_debug_key(app.window(),VK_RETURN)==0);
             pump([&]{return state(app.page(),"saveErrors").contains("/watch/max_folders") && !state(app.page(),"saving").get<bool>();});
             assert(read_json(dir/"sunpack_config.json")["watch"]["max_folders"]==16);
-            ui_page_set_text(app.page(),"configQuery",L"out_dir");
+            search_config(app,L"out_dir");
             auto independent=ui_widget_find_by_id(ui_page_root(app.page()),"input-/watch/out_dir"); assert(independent);
             ui_text_input_set_text(independent,L""); ui_widget_destroy(independent);
             click(app,"input-/watch/out_dir"); ui_debug_type_text(app.window(),L"independent");
@@ -897,13 +967,13 @@ int wmain(int argc,wchar_t** argv) {
             PostMessageW(static_cast<HWND>(ui_window_hwnd(app.window())),WM_CLOSE,0,0);
             pump([&]{return state(app.page(),"closeError")!="" && !state(app.page(),"saving").get<bool>();});
             assert(IsWindow(static_cast<HWND>(ui_window_hwnd(app.window()))));
-            ui_page_set_text(app.page(),"configQuery",L"max_folders");
+            search_config(app,L"max_folders");
             invalid_input=ui_widget_find_by_id(ui_page_root(app.page()),"input-/watch/max_folders"); assert(invalid_input);
             ui_text_input_set_text(invalid_input,L""); ui_widget_destroy(invalid_input);
             click(app,"input-/watch/max_folders"); ui_debug_type_text(app.window(),L"17");
             finish_input(app);
             assert(read_json(dir/"sunpack_config.json")["watch"]["max_folders"]==17);
-            ui_page_set_text(app.page(),"configQuery",L"out_dir");
+            search_config(app,L"out_dir");
             auto closing_input=ui_widget_find_by_id(ui_page_root(app.page()),"input-/watch/out_dir"); assert(closing_input);
             ui_text_input_set_text(closing_input,L""); ui_widget_destroy(closing_input);
             click(app,"input-/watch/out_dir"); ui_debug_type_text(app.window(),L"close-flush");
