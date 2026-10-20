@@ -51,6 +51,11 @@ target_link_libraries(sunpack_gui_ui_tests PRIVATE sunpack_gui_data core-ui comc
 add_dependencies(sunpack_gui_ui_tests SunPackGUI)
 target_compile_options(sunpack_gui_ui_tests PRIVATE /UNDEBUG)
 add_test(NAME gui_interface COMMAND sunpack_gui_ui_tests)
+add_executable(sunpack_gui_performance ../benchmarks/gui/performance.cpp src/application.cpp src/motion.cpp resources/app.rc)
+target_include_directories(sunpack_gui_performance PRIVATE "${core_ui_SOURCE_DIR}/src")
+ui_core_embed_text(sunpack_gui_performance FILE ../sunpack_advanced_config.json OUT gui_perf_defaults.h VAR kGuiPerfDefaultsJson)
+target_link_libraries(sunpack_gui_performance PRIVATE sunpack_gui_data core-ui comctl32 psapi)
+add_dependencies(sunpack_gui_performance SunPackGUI)
 # Only the manager is shipped; no debug server or demo is started by this host.
 install(TARGETS SunPackGUI RUNTIME DESTINATION .)
 FetchContent_GetProperties(quickjs)
