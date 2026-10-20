@@ -16,14 +16,17 @@ std::string trim(std::string s) {
     if (start == std::string::npos) return {};
     return s.substr(start, s.find_last_not_of(" \t\r\n") - start + 1);
 }
+// Search uses the same non-expanding Windows casing as path identity.
+std::wstring fold_search(const std::string& text) {
+    auto w=wide(text);
+    if(!w.empty()) CharLowerBuffW(w.data(),DWORD(w.size()));
+    return w;
+}
+bool contains_folded(const std::string& text, const std::wstring& folded_query) {
+    return folded_query.empty() || fold_search(text).find(folded_query)!=std::wstring::npos;
+}
 bool contains(const std::string& text, const std::string& query) {
-    // Search uses the same non-expanding Windows casing as path identity.
-    auto fold = [](std::string s) {
-        auto w = wide(s);
-        CharLowerBuffW(w.data(), DWORD(w.size()));
-        return w;
-    };
-    return query.empty() || fold(text).find(fold(query)) != std::wstring::npos;
+    return query.empty() || contains_folded(text,fold_search(query));
 }
 bool absolute_windows(const std::string& value) {
     auto p = wide(value); std::replace(p.begin(), p.end(), L'/', L'\\');
@@ -601,18 +604,20 @@ Json project_task(const std::wstring& key,const Task& t,const RootIndex& roots,c
         {"path",t.path},{"root",indexed_root(key,roots)},{"status",t.status},{"statusText",tr(t.waiting_reason.empty()?t.status:t.waiting_reason,language)},{"partCount",t.multipart?t.members.size():0},{"time",task_time(t)},
         {"statusTone",tone},{"outputs",t.outputs},{"sortTimestamp",t.timestamp},{"sortSequence",t.sequence}};
 }
-bool task_matches(const Task& t,const std::wstring& key,const RootIndex& roots,const View& v) {
+bool task_matches(const Task& t,const std::wstring& key,const RootIndex& roots,const View& v,
+    const std::wstring& folded_query) {
     if(t.status.empty() || (!v.task_status.empty() && t.status!=v.task_status) ||
         (!v.task_root.empty() && indexed_root(key,roots)!=v.task_root)) return false;
-    if(contains(t.path,v.task_query) || contains(t.name,v.task_query)) return true;
-    return std::any_of(t.members.begin(),t.members.end(),[&](const auto& member){return contains(utf8(member),v.task_query);});
+    if(contains_folded(t.path,folded_query) || contains_folded(t.name,folded_query)) return true;
+    return std::any_of(t.members.begin(),t.members.end(),[&](const auto& member){return contains_folded(utf8(member),folded_query);});
 }
 }
 Json task_rows(const EventLog& log,const WatchRoots& roots,const View& v,const std::string& language) {
     const auto root_index=index_roots(roots);
+    const auto query=fold_search(v.task_query);
     using TaskEntry=decltype(log.tasks)::value_type;
     std::vector<const TaskEntry*> rows;
-    for(auto& pair:log.tasks) if(task_matches(pair.second,pair.first,root_index,v)) rows.push_back(&pair);
+    for(auto& pair:log.tasks) if(task_matches(pair.second,pair.first,root_index,v,query)) rows.push_back(&pair);
     std::sort(rows.begin(),rows.end(),[](const auto& a,const auto& b){
         if(a->second.timestamp!=b->second.timestamp) return a->second.timestamp>b->second.timestamp;
         return a->second.sequence>b->second.sequence;
@@ -623,11 +628,12 @@ Json task_rows(const EventLog& log,const WatchRoots& roots,const View& v,const s
 }
 Json task_delta(const EventLog& log,const WatchRoots& roots,const View& v,const std::string& language) {
     const auto root_index=index_roots(roots);
+    const auto query=fold_search(v.task_query);
     Json changes=Json::array();
     for(const auto& key:log.changed_keys) {
         Json change={{"id",utf8(key)}};
         auto it=log.tasks.find(key);
-        if(it!=log.tasks.end() && task_matches(it->second,key,root_index,v))
+        if(it!=log.tasks.end() && task_matches(it->second,key,root_index,v,query))
             change["row"]=project_task(key,it->second,root_index,language);
         changes.push_back(std::move(change));
     }
