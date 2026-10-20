@@ -604,6 +604,9 @@ private:
 class UI_API VirtualListWidget : public VBoxWidget {
 public:
     float estimatedHeight = 80;
+    // Opt-in: callers replace changed item objects instead of mutating them.
+    // Unchanged item identities can retain their existing binding effects.
+    bool immutableItems = false;
     std::function<void()> onRangeChanged;
     void SetCount(size_t count);
     void InvalidateHeights();

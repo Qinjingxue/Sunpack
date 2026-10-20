@@ -2319,7 +2319,14 @@ void PageState::RebuildJsLoop(JsLoopRuntime& rt, bool viewportOnly) {
             // (item, idx) JSValues + re-collect dep set for bindings.
             auto iter = std::move(found->second);
             oldByKey.erase(found);
-            if (viewportOnly) {
+            // Immutable lists replace every changed item object. Retain the
+            // effects of untouched rows; global reactive dependencies remain
+            // subscribed and still run on their own writes. Nested scopes and
+            // a declared index changing position require the normal rebind.
+            const bool unchangedItem = virtualList && virtualList->immutableItems && !rt.outerIter &&
+                JS_IsObject(itemVal) && JS_IsStrictEqual(ctx, itemVal, iter->itemValue) &&
+                (rt.spec->indexVar.empty() || JS_IsStrictEqual(ctx, idxVal, iter->idxValue));
+            if (viewportOnly || unchangedItem) {
                 JS_FreeValue(ctx, itemVal); JS_FreeValue(ctx, idxVal);
             } else {
                 JS_FreeValue(ctx, iter->itemValue);

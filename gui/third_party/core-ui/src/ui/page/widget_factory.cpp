@@ -1001,6 +1001,7 @@ WidgetPtr ConstructByTag(const std::string& tag, const std::string& text,
         auto list = std::make_shared<VirtualListWidget>();
         for (const auto& a : node.attrs)
             if (a.name == "estimated-height") list->estimatedHeight = std::max(1.0f, ResolvePx(a.rawValue));
+            else if (a.name == "immutable-items") list->immutableItems = a.rawValue == "true";
         return list;
     }
     if (tag == "gh_img_view" || tag == "gh-img-view" ||

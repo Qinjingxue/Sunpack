@@ -153,8 +153,8 @@ private:
     void CommitDeferredVisualWindowRect();
     bool PresentPreparedVisualWindowFrame(uint64_t generation);
     void BeginAnimationFrame();
-    void EnsureAnimationTimer();
-    void StopAnimationTimer();
+    void StartAnimationFrames();
+    void StopAnimationFrames();
     bool HasAnimationFrameWork() const;
     void PaintAndValidate();
     void OnResize(UINT width, UINT height);
@@ -229,7 +229,7 @@ private:
     bool        startupRevealPending_ = false;
     bool        startupRevealPosted_ = false;
     bool        caretBlinkTimerRunning_ = false;
-    bool        toggleAnimTimerRunning_ = false;
+    bool        animationFramesActive_ = false;
     bool        renderFramePosted_ = false;
     AnimationHost animationHost_;
     AnimationManager propertyAnimations_;

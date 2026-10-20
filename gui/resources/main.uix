@@ -1,5 +1,17 @@
 <window title="SunPack" width="1120" height="720" min-width="850" min-height="560" centered="true" frameless="false"/>
 <script>
+// Weak keys let snapshots/filter changes release their old row index. Values
+// reference the existing rows; no second projection or resident row copy.
+const taskIndexes=new WeakMap();
+function taskBefore(a,b) {
+  return a.sortTimestamp>b.sortTimestamp ||
+    (a.sortTimestamp===b.sortTimestamp && a.sortSequence>b.sortSequence);
+}
+function taskPosition(rows,row) {
+  let lo=0,hi=rows.length;
+  while(lo<hi) { let mid=(lo+hi)>>>1; if(taskBefore(rows[mid],row)) lo=mid+1; else hi=mid; }
+  return lo;
+}
 export default {
   data() { return {
     tab:'tasks',theme:'system',themeChoice:0,appearance:'light',language:'en',texts:{},dispatch:false,requests:[],ready:false,busy:false,
@@ -43,15 +55,51 @@ export default {
     searchConfig(value) { this.configQuery=value; this.send('scrollTop',{id:'configBlocks'}); },
     searchTasks(value) { this.taskQuery=value; this.filterTasks(); },
     applyTaskDelta(patch) {
-      // Log bursts can update many rows at once. Collapse duplicate IDs, filter
-      // removed/replaced rows in one pass, then merge the sorted additions;
-      // repeated findIndex + splice shifted the full list once per change.
-      if(!patch.changes.length) { this.tasks.malformed=patch.malformed; return; }
+      if(!patch.changes.length) {
+        if(this.tasks.malformed!==patch.malformed)
+          this.tasks={rows:this.tasks.rows,total:this.tasks.total,malformed:patch.malformed};
+        return;
+      }
+      let rows=this.tasks.rows,index=taskIndexes.get(rows);
+      if(!index) { index=new Map(); for(let row of rows) index.set(row.id,row); taskIndexes.set(rows,index); }
       let updates=new Map(),order=0;
-      for(let change of patch.changes) updates.set(change.id,{row:change.row||null,order:order++});
-      let rows=this.tasks.rows.filter(row=>!updates.has(row.id));
+      for(let change of patch.changes) {
+        updates.delete(change.id); // iteration order follows the final event
+        updates.set(change.id,{row:change.row||null,order:order++});
+      }
+      // Small deltas touch only changed rows. The index holds row references,
+      // so moving a row never requires rebuilding thousands of ID positions.
+      if(updates.size<=32) {
+        let copied=false;
+        updates.forEach((update,id)=>{
+          let old=index.get(id),next=update.row;
+          if(old) {
+            let pos=taskPosition(rows,old);
+            while(pos<rows.length && rows[pos]!==old) ++pos; // equal sort keys
+            if(next && (pos===0 || taskBefore(rows[pos-1],next)) &&
+               (pos+1===rows.length || !taskBefore(rows[pos+1],next))) {
+              rows[pos]=next; index.set(id,next); return;
+            }
+            if(!copied) { rows=rows.slice(); copied=true; }
+            rows.splice(pos,1); index.delete(id);
+          }
+          if(next) {
+            if(!copied) { rows=rows.slice(); copied=true; }
+            rows.splice(taskPosition(rows,next),0,next); index.set(id,next);
+          }
+        });
+        // core-ui observes the top-level state write; keep untouched row
+        // objects, then notify bindings once per batch. A positional change
+        // gets a new array so VirtualList also invalidates measured heights.
+        if(copied) taskIndexes.set(rows,index);
+        this.tasks={rows:rows,total:rows.length,malformed:patch.malformed};
+        return;
+      }
+      // Large batches use a linear merge instead of shifting the list once
+      // per change.
+      rows=rows.filter(row=>!updates.has(row.id));
       let added=[];
-      updates.forEach(update=>{ if(update.row) added.push(update); });
+      updates.forEach((update,id)=>{ index.delete(id); if(update.row) { added.push(update); index.set(id,update.row); } });
       added.sort((a,b)=>{
         if(a.row.sortTimestamp!==b.row.sortTimestamp) return a.row.sortTimestamp>b.row.sortTimestamp?-1:1;
         if(a.row.sortSequence!==b.row.sortSequence) return a.row.sortSequence>b.row.sortSequence?-1:1;
@@ -66,6 +114,7 @@ export default {
       }
       while(i<rows.length) merged.push(rows[i++]);
       while(j<added.length) merged.push(added[j++].row);
+      taskIndexes.set(merged,index);
       this.tasks={rows:merged,total:merged.length,malformed:patch.malformed};
     },
     applyPasswordDelta(patch) {
@@ -345,7 +394,7 @@ export default {
           <label class="muted">{{ texts.rootOutput }}</label><div class="input-row"><input id="rootOutput" class="fill" v-model="rootOutput" @blur="commitRoot()" @submit="commitRoot()"/><button id="browseOutput" @click="send('browse',{target:'rootOutput'})">{{ texts.chooseOutput }}</button></div>
           <label v-show="saveErrors['@roots']" class="error">{{ errorText(saveErrors['@roots']) }}</label><div class="action-row"><toggle id="rootDeepToggle" :checked="rootDeep" @change="v=>{rootDeep=v;commitRoot();}"/><label>{{ texts.deep }}</label><button id="finishRoot" v-show="!rootOriginal" @click="rootAction('save')">{{ texts.addToList }}</button><button v-show="rootOriginal" @click="rootAction('delete')">{{ texts.deleteRoot }}</button></div>
         </div>
-          <VirtualList id="taskItems" class="column" estimated-height="68px"><div v-for="t in tasks.rows" :key="t.id" :id="'task-'+t.id" :class="'task '+appearance">
+          <VirtualList id="taskItems" class="column" estimated-height="68px" immutable-items="true"><div v-for="t in tasks.rows" :key="t.id" :id="'task-'+t.id" :class="'task '+appearance">
             <div class="row"><button :id="'taskName-'+t.id" class="taskname" @click="send('openTask',{task:t})">{{ t.name }}</button><div class="spacer"/><label class="status" :class="'status-'+t.statusTone">{{ t.statusText }}</label></div>
             <div class="row task-meta"><label :id="'taskRoot-'+t.id" class="muted fill">{{ t.partCount ? texts.identifiedParts.replace('{count}',t.partCount)+' · ' : '' }}{{ texts.taskFolder }}{{ t.directory }}</label><label class="time">{{ t.time }}</label></div>
           </div>

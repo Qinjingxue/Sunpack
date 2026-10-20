@@ -65,9 +65,9 @@ public:
     size_t malformed = 0;
     uint64_t bytes_parsed = 0; // Diagnostic counter, never persisted.
     bool retry_required = false;
-    // Changes from the latest refresh, bounded for an inexpensive UI delta.
+    // Distinct changes from the latest refresh, including removed task IDs.
     std::unordered_set<std::wstring> changed_keys;
-    bool rebuilt = false, changed_overflow = false;
+    bool rebuilt = false;
     void set_path(const fs::path& path);
     bool refresh(bool missing_is_final = false);
     void accept(const Json& event);

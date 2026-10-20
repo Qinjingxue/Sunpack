@@ -432,11 +432,11 @@ std::string root_for(const fs::path& path,const WatchRoots& roots) {
 void EventLog::set_path(const fs::path& p) {
     if (path_==p) return;
     path_=p; offset_=identity_=sequence_=volume_=0; prefix_.clear(); anchor_.clear(); pending_.clear(); tasks.clear(); aliases_.clear(); malformed=0;
-    changed_keys.clear(); rebuilt=true; changed_overflow=false;
+    changed_keys.clear(); rebuilt=true;
 }
 void EventLog::mark_changed(const std::wstring& key) {
     ++sequence_;
-    if(changed_keys.size()<32) changed_keys.insert(key); else changed_overflow=true;
+    changed_keys.insert(key);
 }
 void EventLog::erase_task(const std::wstring& key) {
     auto it=tasks.find(key);
@@ -534,20 +534,26 @@ void EventLog::accept(const Json& j) {
     } else if(event=="done") status="taskSucceeded";
     else if(event=="failed_terminal" || event=="partial_rejected") status="taskFailed";
     else return;
-    auto& task=tasks[key];
-    task.path=task.name.empty()?path:task.path;
-    task.status=std::move(status); task.waiting_reason=std::move(reason);
-    task.outputs.clear(); task.timestamp=0; task.has_timestamp=false;
+    std::vector<std::string> outputs;
+    double timestamp=0;
+    bool has_timestamp=false;
     if(j.contains("output_dirs") && j["output_dirs"].is_array())
-        for(auto& output:j["output_dirs"]) if(output.is_string() && !output.get_ref<const std::string&>().empty()) task.outputs.push_back(output.get<std::string>());
-    if(j.contains("ts") && j["ts"].is_number()) { task.timestamp=j["ts"].get<double>(); task.has_timestamp=std::isfinite(task.timestamp); if(!task.has_timestamp) task.timestamp=0; }
+        for(auto& output:j["output_dirs"]) if(output.is_string() && !output.get_ref<const std::string&>().empty()) outputs.push_back(output.get<std::string>());
+    if(j.contains("ts") && j["ts"].is_number()) { timestamp=j["ts"].get<double>(); has_timestamp=std::isfinite(timestamp); if(!has_timestamp) timestamp=0; }
     else if(j.contains("time") && j["time"].is_string()) {
-        if(auto parsed=iso_timestamp(j["time"].get<std::string>())) { task.timestamp=*parsed; task.has_timestamp=true; }
+        if(auto parsed=iso_timestamp(j["time"].get<std::string>())) { timestamp=*parsed; has_timestamp=true; }
     }
+    auto& task=tasks[key];
+    const auto& next_path=task.name.empty()?path:task.path;
+    if(task.path==next_path && task.status==status && task.waiting_reason==reason &&
+       task.outputs==outputs && task.timestamp==timestamp && task.has_timestamp==has_timestamp) return;
+    task.path=next_path;
+    task.status=std::move(status); task.waiting_reason=std::move(reason);
+    task.outputs=std::move(outputs); task.timestamp=timestamp; task.has_timestamp=has_timestamp;
     mark_changed(key); task.sequence=sequence_;
 }
 bool EventLog::refresh(bool missing_is_final) {
-    retry_required=false; changed_keys.clear(); changed_overflow=false; rebuilt=false;
+    retry_required=false; changed_keys.clear(); rebuilt=false;
     Handle f(CreateFileW(path_.c_str(),GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,OPEN_EXISTING,FILE_FLAG_SEQUENTIAL_SCAN,nullptr));
     if(f.value==INVALID_HANDLE_VALUE) {
         if(GetLastError()==ERROR_FILE_NOT_FOUND || GetLastError()==ERROR_PATH_NOT_FOUND) {
@@ -570,6 +576,14 @@ bool EventLog::refresh(bool missing_is_final) {
     while(offset_<size) {
         auto chunk=text_at(f,offset_,size_t(std::min<uint64_t>(65536,size-offset_)));
         if(chunk.empty()) break;
+        // Retain anchors from the bytes actually parsed, not a later file
+        // read which could already belong to a concurrent rewrite.
+        if(!offset_) {
+            prefix_=chunk.substr(0,4096);
+            auto line=prefix_.find('\n'); if(line!=std::string::npos) prefix_.resize(line+1);
+        }
+        if(chunk.size()>=256) anchor_=chunk.substr(chunk.size()-256);
+        else { anchor_+=chunk; if(anchor_.size()>256) anchor_.erase(0,anchor_.size()-256); }
         offset_+=chunk.size(); bytes_parsed+=chunk.size(); pending_+=chunk;
         size_t start=0, end;
         while((end=pending_.find('\n',start))!=std::string::npos) {
@@ -580,18 +594,19 @@ bool EventLog::refresh(bool missing_is_final) {
         pending_.erase(0,start);
         if(pending_.size()>16*1024*1024) throw std::runtime_error("logRecordTooLarge");
     }
-    if(prefix_.empty() && offset_) {
-        prefix_=text_at(f,0,size_t(std::min<uint64_t>(4096,offset_)));
-        auto line=prefix_.find('\n'); if(line!=std::string::npos) prefix_.resize(line+1);
-    }
-    anchor_=text_at(f,offset_-std::min<uint64_t>(256,offset_),size_t(std::min<uint64_t>(256,offset_)));
     BY_HANDLE_FILE_INFORMATION after{};
     if(!GetFileInformationByHandle(f,&after)) win_error("opLogGeneration");
     if(after.nFileSizeHigh!=info.nFileSizeHigh || after.nFileSizeLow!=info.nFileSizeLow ||
         CompareFileTime(&after.ftLastWriteTime,&info.ftLastWriteTime)!=0) {
-        // A write overlapped this read. Rebuild from the newly observed generation;
-        // this is a response to actual I/O, never an idle retry timer.
-        identity_=0; retry_required=true;
+        const auto after_size=(uint64_t(after.nFileSizeHigh)<<32)|after.nFileSizeLow;
+        // A growing log with unchanged parsed anchors can resume at offset_;
+        // forcing a rebuild here replays the entire history during streams.
+        // Same-size writes, truncations and changed anchors still rebuild.
+        const bool appended=after_size>size &&
+            (prefix_.empty() || text_at(f,0,prefix_.size())==prefix_) &&
+            (anchor_.empty() || text_at(f,offset_-anchor_.size(),anchor_.size())==anchor_);
+        if(!appended) identity_=0;
+        retry_required=true;
     }
     return changed;
 }

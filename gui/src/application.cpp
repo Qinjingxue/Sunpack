@@ -863,7 +863,7 @@ void Application::work() {
             if(language_changed) { patch["language"]=language; patch["texts"]=interface_texts(language); }
             if(tasks_changed || language_changed || !previous_patch.contains("tasks")) {
                 if(task_delta_eligible && !language_changed && previous_patch.contains("tasks") &&
-                   !log.rebuilt && !log.changed_overflow) {
+                   !log.rebuilt) {
                     patch["taskDelta"]=task_delta(log,roots,view,language);
                     task_selection_known=false;
                 } else {
@@ -875,6 +875,9 @@ void Application::work() {
                     task_selection_known=true;
                     if(!projected.is_null()) patch["tasks"]=std::move(projected);
                 }
+                // The projection owns the changes now. Release copied path
+                // keys even when the log goes idle after a large burst/rebuild.
+                log.changed_keys.clear();
             }
             if(passwords_changed || language_changed || !previous_patch.contains("passwords")) {
                 if(!password_delta.is_null() && !language_changed && previous_patch.contains("passwords"))

@@ -18,6 +18,11 @@ Local changes:
   disposes callbacks, effects and closures. Wheel input supplies the text
   measurer for newly mounted rows.
 
+- Add opt-in `immutable-items="true"` to VirtualList. Lists that replace changed
+  row objects keep untouched rows' binding effects instead of disposing and
+  rebuilding them on every delta. Global dependencies remain reactive; nested
+  loop scopes and changed declared indices still rebind normally.
+
 - Honor `text-align` on text buttons, retaining centered text by default;
   task filename links use left alignment with the directory text below them.
 - Wire focus, blur and submit handlers inside keyed loop scopes as well as
@@ -26,7 +31,10 @@ Local changes:
   interrupted animations from their current visual position.
 - Pace visible motion on the existing render thread with vertical sync. Request
   the next animation frame after presentation, carrying window identity rather
-  than widget pointers across threads. Stop on completion, hide or destruction.
+  than widget pointers across threads. Remove the competing 16 ms widget/property
+  timer and its 60 fps cap; follow the display refresh rate. Prepared frames
+  resume after commit and hidden frames on show/restore. Stop on completion,
+  hide or destruction without idle wakeups.
 - Add paint-only translation and Windows Fluent entrance/point-to-point easing.
 - Give ToggleSwitch separate movement, color and hover/pressed shape animations,
   keyboard handling, dark-theme thumb contrast and system animation preference.

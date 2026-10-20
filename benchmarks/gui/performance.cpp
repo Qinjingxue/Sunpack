@@ -33,6 +33,7 @@ std::mutex trace_mutex;
 std::string trace_phase;
 std::string active_action;
 std::atomic<uint64_t> motion_stop_count{0}, paint_count{0}, animation_frame_count{0}, property_frame_count{0};
+std::atomic<bool> motion_active{false};
 std::atomic<uint64_t> layout_count{0}, draw_count{0};
 std::map<std::string,std::vector<double>> phase_counts;
 LARGE_INTEGER qpc_frequency{};
@@ -55,7 +56,11 @@ uint64_t working_set() {
 }
 void trace_sink(const UiTraceEvent* e,void*) {
     if(!e) return;
-    if(e->name && !std::strcmp(e->name,"motion_stopped")) motion_stop_count.fetch_add(1,std::memory_order_relaxed);
+    if(e->name && !std::strcmp(e->name,"motion_started")) motion_active.store(true,std::memory_order_relaxed);
+    if(e->name && !std::strcmp(e->name,"motion_stopped")) {
+        motion_active.store(false,std::memory_order_relaxed);
+        motion_stop_count.fetch_add(1,std::memory_order_relaxed);
+    }
     if(e->name && !std::strcmp(e->name,"paint_and_validate")) paint_count.fetch_add(1,std::memory_order_relaxed);
     if(e->name && !std::strcmp(e->name,"layout_root_duration")) layout_count.fetch_add(1,std::memory_order_relaxed);
     if(e->name && !std::strcmp(e->name,"draw_tree_duration")) draw_count.fetch_add(1,std::memory_order_relaxed);
@@ -242,7 +247,9 @@ void wait_settled(Application& app) {
     ULONGLONG next_report=1000;
     uint64_t last_paint=paint_count.load(), last_anim=animation_frame_count.load(), last_prop=property_frame_count.load();
     wait_for([&]{
-        if(settled(root.get(),app,root.get())) return true;
+        // Visual epsilon alone can declare an easing curve settled before
+        // its actual final frames, incorrectly charging those frames to idle.
+        if(!motion_active.load(std::memory_order_relaxed) && settled(root.get(),app,root.get())) return true;
         const auto elapsed=GetTickCount64()-start;
         if(elapsed>=next_report) {
             next_report=elapsed+1000;
@@ -553,7 +560,7 @@ int wmain(int argc,wchar_t** argv) {
                 wait_for([&]{return row_status_text(app,log_ids[0])==status_text("taskProcessing");},
                     "single log update",10000,1);
             });
-            // Ten changed tasks in one write: still a delta (under the 32-key cap).
+            // Ten changed tasks in one write, delivered as one delta.
             measure("log_update_delta_10",[&]{
                 std::string text;
                 for(size_t i=1;i<std::min<size_t>(10,log_paths.size());++i)
@@ -563,8 +570,8 @@ int wmain(int argc,wchar_t** argv) {
                 wait_for([&]{return row_status_text(app,log_ids[0])==status_text("taskSucceeded");},
                     "10-row log delta",10000,1);
             });
-            // Forty changed tasks exceed the worker's 32-key delta cap, so the
-            // worker must project and publish the full task snapshot.
+            // Forty changed tasks used to exceed the 32-key cap. Keep the
+            // report key for before/after comparisons; this must stay a delta.
             measure("log_update_overflow_40",[&]{
                 std::string text;
                 for(size_t i=1;i<log_paths.size();++i)

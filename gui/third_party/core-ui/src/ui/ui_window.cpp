@@ -102,10 +102,8 @@ private:
     MeasureContext* previous_ = nullptr;
 };
 
-constexpr UINT_PTR kToggleAnimTimerId = 0xCA12;
 constexpr UINT_PTR kWindowOpenAnimTimerId = 0xCA13;
 constexpr UINT_PTR kWindowCloseAnimTimerId = 0xCA14;
-constexpr UINT kToggleAnimIntervalMs = 16;
 constexpr UINT kWindowAnimIntervalMs = 16;
 
 constexpr float kPopPeakScale = 1.02f;       // 关闭动画微弹峰值
@@ -182,7 +180,7 @@ static void ForEachWidget(Widget* w, const std::function<void(Widget*)>& fn) {
 
 UiWindowImpl::UiWindowImpl() = default;
 UiWindowImpl::~UiWindowImpl() {
-    StopAnimationTimer();
+    StopAnimationFrames();
     /* toast 叠加窗 owner = hwnd_, DestroyWindow(hwnd_) 会连带销毁它, 但仍要
      * 显式 KillTimer + timeEndPeriod 配对 (DestroyToast 负责), 防泄漏时钟精度. */
     DestroyToast();
@@ -550,7 +548,7 @@ void UiWindowImpl::ShowImmediate(bool activate) {
 }
 
 void UiWindowImpl::Hide() {
-    StopAnimationTimer();
+    StopAnimationFrames();
     ShowWindow(hwnd_, SW_HIDE);
 }
 
@@ -1135,24 +1133,19 @@ bool UiWindowImpl::HasAnimationFrameWork() const {
     return !animationHost_.Empty() || propertyAnimations_.HasActive();
 }
 
-void UiWindowImpl::EnsureAnimationTimer() {
-    if (!hwnd_ || toggleAnimTimerRunning_ || !HasAnimationFrameWork()) return;
+void UiWindowImpl::StartAnimationFrames() {
+    if (!hwnd_ || animationFramesActive_ || !HasAnimationFrameWork()) return;
     if (!IsWindowVisible(hwnd_) || IsIconic(hwnd_)) return;
-    // Drive motion with a real, animation-only timer (approximately 60 fps).
-    // Render-thread callbacks alone can stop after a skipped/prepared present,
-    // leaving a mid-flight animation with no further messages. A timer also
-    // prevents 240 Hz screens from rendering decorative motion at 240 fps.
-    // StopAnimationTimer kills it as soon as the last animation finishes.
-    if (SetTimer(hwnd_, kToggleAnimTimerId, kToggleAnimIntervalMs, nullptr) != 0) {
-        toggleAnimTimerRunning_ = true;
-        TraceEvent("core_window", "motion_started");
-    }
+    // The caller requests the first paint. Subsequent visible frames are
+    // requested after VSync presentation, at the display's actual refresh rate.
+    // Prepared frames resume on commit, hidden/skipped frames on show/restore.
+    animationFramesActive_ = true;
+    TraceEvent("core_window", "motion_started");
 }
 
-void UiWindowImpl::StopAnimationTimer() {
-    if (hwnd_ && toggleAnimTimerRunning_) KillTimer(hwnd_, kToggleAnimTimerId);
-    if (toggleAnimTimerRunning_) TraceEvent("core_window", "motion_stopped");
-    toggleAnimTimerRunning_ = false;
+void UiWindowImpl::StopAnimationFrames() {
+    if (animationFramesActive_) TraceEvent("core_window", "motion_stopped");
+    animationFramesActive_ = false;
 }
 
 void UiWindowImpl::UpdateToggleAnimTimer() {
@@ -1214,10 +1207,10 @@ void UiWindowImpl::UpdateToggleAnimTimer() {
 
     bool needsTimer = HasAnimationFrameWork();
     if (needsTimer) {
-        EnsureAnimationTimer();
+        StartAnimationFrames();
         Invalidate();
     } else {
-        StopAnimationTimer();
+        StopAnimationFrames();
     }
 }
 
@@ -1225,7 +1218,7 @@ void UiWindowImpl::RegisterAnimatingWidget(Widget* w, AnimationInvalidation inva
     if (!hwnd_ || !w) return;
 
     animationHost_.RegisterWidget(w, invalidation);
-    EnsureAnimationTimer();
+    StartAnimationFrames();
     Invalidate();
 }
 
@@ -1233,7 +1226,7 @@ void UiWindowImpl::AnimateProperty(Widget* target, AnimProperty prop, float from
                                    float durationMs, EasingFunction easing,
                                    std::function<void()> onComplete) {
     propertyAnimations_.Animate(target, prop, from, to, durationMs, easing, std::move(onComplete));
-    EnsureAnimationTimer();
+    StartAnimationFrames();
     Invalidate();
 }
 
@@ -1417,10 +1410,10 @@ LRESULT UiWindowImpl::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
     }
 
     case WM_SHOWWINDOW:
-        if (wParam) UpdateToggleAnimTimer(); else StopAnimationTimer();
+        if (wParam) UpdateToggleAnimTimer(); else StopAnimationFrames();
         break;
     case WM_SIZE: {
-        if (wParam == SIZE_MINIMIZED) StopAnimationTimer(); else UpdateToggleAnimTimer();
+        if (wParam == SIZE_MINIMIZED) StopAnimationFrames(); else UpdateToggleAnimTimer();
         TraceScope wmSizeScope("core_window", "wm_size_duration");
         {
             TraceEvent("core_window", "wm_size",
@@ -1585,14 +1578,6 @@ LRESULT UiWindowImpl::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                 Invalidate();
             } else {
                 UpdateCaretBlinkTimer();
-            }
-            return 0;
-        }
-        if (wParam == kToggleAnimTimerId) {
-            if (HasAnimationFrameWork()) {
-                Invalidate();
-            } else {
-                StopAnimationTimer();
             }
             return 0;
         }
@@ -2014,7 +1999,7 @@ LRESULT UiWindowImpl::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         return 0;
 
     case WM_DESTROY: {
-        StopAnimationTimer();
+        StopAnimationFrames();
         if (caretBlinkTimerRunning_) {
             KillTimer(hwnd_, kCaretBlinkTimerId);
             caretBlinkTimerRunning_ = false;
@@ -2231,7 +2216,7 @@ void UiWindowImpl::BeginAnimationFrame() {
     if (!anyAnimating) {
         animationHost_.Clear();
         lastAnimationFrameTick_ = 0;
-        if (!propertyAnimations_.HasActive()) StopAnimationTimer();
+        if (!propertyAnimations_.HasActive()) StopAnimationFrames();
     }
 }
 
@@ -2310,7 +2295,7 @@ DisplayList UiWindowImpl::OnPaint(uint64_t frameGeneration) {
         ui::LayoutDirtyFlag() = false;
         LayoutRoot();
     }
-    if (HasAnimationFrameWork()) EnsureAnimationTimer(); else StopAnimationTimer();
+    if (HasAnimationFrameWork()) StartAnimationFrames(); else StopAnimationFrames();
 
     const bool recordDisplayList = canRecordDisplayList;
     DisplayListRecorder recorder;

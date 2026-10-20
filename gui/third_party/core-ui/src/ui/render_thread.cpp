@@ -402,10 +402,15 @@ void RenderThread::ThreadMain() {
             it->second &&
             it->second->Matches(job->window)) {
             completedGenerations_[job->window.window_id] = job->generation;
-            // HWND and its generation are checked again on the UI thread.
-            // UI's animation-only 16 ms timer now owns frame pacing. Do not
-            // post a second frame per Present: that bypasses the 60 fps cap,
-            // and a Skipped/Prepared result could otherwise strand motion.
+            // Only a visible presented frame drives the next animation frame.
+            // Present(1) supplies VSync pacing without a competing WM_TIMER.
+            // Prepared frames resume when committed by the UI; hidden/skipped
+            // frames resume on show/restore, never in an idle render loop.
+            // Validate the window identity again on the UI thread.
+            if (job->animate && renderResult == RenderFrameResult::Presented)
+                PostMessageW(job->hwnd, kUiCoreAnimationFrameMessage,
+                             static_cast<WPARAM>(job->window.window_id),
+                             static_cast<LPARAM>(job->window.hwnd_generation));
             if (renderResult == RenderFrameResult::Presented && resources_.DeviceLost()) {
                 resources_.MarkDeviceRecovered();
                 TraceEvent("render_thread", "device_recovered",

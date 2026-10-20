@@ -53,7 +53,7 @@ Json rendered_widget(Application& app,const std::string& id) {
     };
     auto* found=find(tree); assert(found); return *found;
 }
-void pump(const std::function<bool()>& condition, const char* phase="UI event") {
+void pump(const std::function<bool()>& condition, const char* phase="UI event", bool allow_timers=true) {
     auto deadline=GetTickCount64()+10000;
     for(;;) {
         try { if(condition()) return; }
@@ -66,7 +66,7 @@ void pump(const std::function<bool()>& condition, const char* phase="UI event") 
         if(!left) throw std::runtime_error(std::string(phase)+" timed out");
         MsgWaitForMultipleObjectsEx(0,nullptr,left,QS_ALLINPUT,MWMO_INPUTAVAILABLE);
         MSG message;
-        while(PeekMessageW(&message,nullptr,0,0,PM_REMOVE)) { if(message.message==WM_QUIT) continue; TranslateMessage(&message); DispatchMessageW(&message); }
+        while(PeekMessageW(&message,nullptr,0,0,PM_REMOVE)) { if(message.message==WM_QUIT || (!allow_timers && message.message==WM_TIMER)) continue; TranslateMessage(&message); DispatchMessageW(&message); }
     }
 }
 void settle_motion(Application& app) {
@@ -188,7 +188,9 @@ void popup_motion(Application& app,const char* id,bool upward=false) {
     open();
     assert(combo->IsOpen());
     if(animations) assert(combo->PopupAnimating() && combo->PopupOpacity()<1 && combo->PopupProgress()<1);
-    pump([&]{return !combo->PopupAnimating() && (!animations || animation.stopped);},"Popup entrance");
+    // Motion must advance from presented frames, without depending on a
+    // low-frequency WM_TIMER. Completion-only checks with timers miss that.
+    pump([&]{return !combo->PopupAnimating() && (!animations || animation.stopped);},"Render-paced popup entrance",false);
     auto bounds=combo->rect, drop=combo->DropdownRect();
     assert(combo->PopupOpacity()==1 && combo->PopupProgress()==1);
     if(upward && drop.bottom>bounds.top) {
@@ -379,6 +381,35 @@ int wmain(int argc,wchar_t** argv) {
             assert(state(app.page(),"tasks")==initial_tasks);
             assert(ui_page_set_json(app.page(),"tasks",initial_tasks.dump().c_str())==0);
             pump([&]{return state(app.page(),"runtime")["known"]==true;});
+            {
+                // One lifecycle scenario catches orphaned property motion after
+                // prepared presents and hide/restore. Ordinary popup completion
+                // cannot detect these paths. It adds only three short animations
+                // to this existing real-window fixture, with no FPS threshold.
+                settle_motion(app);
+                auto* window=ui::GetContext().GetWindow(app.window());
+                auto* target=window->Root()->FindById("page-tasks"); assert(target);
+                bool complete=false;
+                auto start=[&] {
+                    complete=false;
+                    target->opacity=0.6f;
+                    window->AnimateProperty(target,ui::AnimProperty::Opacity,0.6f,1,120,
+                        ui::EasingFunction::Linear,[&]{complete=true;});
+                };
+                start();
+                pump([&]{return complete;},"Render-paced property animation",false);
+                int x=0,y=0,width=0,height=0;
+                window->GetWindowRectScreen(&x,&y,&width,&height);
+                start();
+                window->BeginCanvasVisualTransaction();
+                window->SetWindowRect(x,y,width-1,height);
+                window->EndCanvasVisualTransaction();
+                pump([&]{return complete;},"Motion after prepared present",false);
+                window->SetWindowRect(x,y,width,height);
+                start(); window->Hide(); window->ShowImmediate(false);
+                pump([&]{return complete;},"Motion after hide and restore",false);
+                assert(target->opacity==1);
+            }
             BOOL disabled=TRUE;
             if(SUCCEEDED(DwmGetWindowAttribute(static_cast<HWND>(ui_window_hwnd(app.window())),DWMWA_TRANSITIONS_FORCEDISABLED,&disabled,sizeof(disabled)))) assert(!disabled);
             std::cerr<<"Initial files loaded\n";
@@ -394,6 +425,58 @@ int wmain(int argc,wchar_t** argv) {
             auto delta_json=Json{{"changes",Json::array({Json{{"id",tail["id"]},{"row",tail}}})},{"malformed",0}}.dump();
             assert(ui_page_call_json(app.page(),"applyTaskDelta",delta_json.c_str())==0);
             assert(state(app.page(),"tasks")["rows"][0]["id"]==tail["id"]);
+            // Reordering alone misses stale ID indexes, removals and coalesced
+            // changes. Exercise those together in the existing mounted list;
+            // compare against an independent full snapshot after each batch.
+            auto saved_tasks=state(app.page(),"tasks");
+            auto expected=saved_tasks;
+            auto apply_changes=[&](const Json& changes) {
+                std::map<std::string,Json> by_id;
+                for(auto& row:expected["rows"]) by_id[row["id"].get<std::string>()]=row;
+                for(auto& change:changes) {
+                    auto id=change["id"].get<std::string>();
+                    if(change.contains("row")) by_id[id]=change["row"]; else by_id.erase(id);
+                }
+                std::vector<Json> rows;
+                for(auto& pair:by_id) rows.push_back(pair.second);
+                std::sort(rows.begin(),rows.end(),[](const Json& a,const Json& b) {
+                    if(a["sortTimestamp"]!=b["sortTimestamp"]) return a["sortTimestamp"]>b["sortTimestamp"];
+                    return a["sortSequence"]>b["sortSequence"];
+                });
+                expected={{"rows",rows},{"total",rows.size()},{"malformed",7}};
+                auto patch=Json{{"changes",changes},{"malformed",7}}.dump();
+                assert(ui_page_call_json(app.page(),"applyTaskDelta",patch.c_str())==0);
+                auto actual=state(app.page(),"tasks");
+                if(!Json::diff(expected,actual).empty()) {
+                    std::cerr<<"Task delta mismatch ("<<changes.size()<<" changes): "<<Json::diff(expected,actual).dump()<<'\n';
+                }
+                assert(Json::diff(expected,actual).empty());
+            };
+            apply_changes(Json::array()); // malformed count with no changed rows
+            // Retained item bindings must still observe global text changes.
+            auto saved_texts=state(app.page(),"texts"),changed_texts=saved_texts;
+            changed_texts["taskFolder"]="folder-after-delta: ";
+            assert(ui_page_set_json(app.page(),"texts",changed_texts.dump().c_str())==0);
+            assert(rendered_widget(app,"taskRoot-"+tail["id"].get<std::string>())["text"]==
+                "folder-after-delta: "+tail["directory"].get<std::string>());
+            assert(ui_page_set_json(app.page(),"texts",saved_texts.dump().c_str())==0);
+            auto moved=tail; moved["sortTimestamp"]=2e12; moved["statusText"]="updated";
+            apply_changes(Json::array({Json{{"id",moved["id"]},{"row",moved}}}));
+            assert(rendered_widget(app,"task-"+moved["id"].get<std::string>()).dump().find("updated")!=std::string::npos);
+            auto newcomer=moved; newcomer["id"]="delta-new"; newcomer["sortTimestamp"]=3e12;
+            apply_changes(Json::array({Json{{"id",moved["id"]}},Json{{"id",newcomer["id"]},{"row",newcomer}},
+                Json{{"id",newcomer["id"]}},Json{{"id",moved["id"]},{"row",tail}}}));
+            Json bulk=Json::array();
+            for(size_t i=0;i<70;++i) {
+                auto row=expected["rows"][i]; row["sortTimestamp"]=4e12+double(i);
+                bulk.push_back(Json{{"id",row["id"]},{"row",row}});
+            }
+            bulk.push_back(Json{{"id",tail["id"]}}); apply_changes(bulk);
+            apply_changes(Json::array({Json{{"id",newcomer["id"]},{"row",newcomer}}}));
+            assert(ui_page_set_json(app.page(),"tasks",saved_tasks.dump().c_str())==0);
+            expected=saved_tasks;
+            apply_changes(Json::array({Json{{"id",tail["id"]},{"row",moved}}}));
+            assert(ui_page_set_json(app.page(),"tasks",saved_tasks.dump().c_str())==0);
             virtual_tail(app,"taskItems","taskListScroll",512);
             auto task=state(app.page(),"tasks")["rows"][0];
             assert(task["time"].get<std::string>().size()==19);

@@ -37,6 +37,27 @@ void projection(Fixture& f) {
         assert(log.tasks.begin()->second.sequence>sequence);
         assert(!log.tasks.begin()->second.status.empty());
     }
+    // Existing scalar/reset checks miss duplicate invalidations and dropped
+    // IDs in an appended burst. Reuse this JSONL fixture to cover both without
+    // another process or a timing-sensitive performance assertion.
+    auto sequence=task.sequence;
+    overwrite(p,event("partial_rejected",source,5),true);
+    assert(!log.refresh() && log.changed_keys.empty() && task.sequence==sequence);
+    auto output_event=Json{{"event","partial_rejected"},{"path",utf8(source.wstring())},{"ts",5},{"output_dirs",{"new-output"}}};
+    overwrite(p,output_event.dump()+"\n",true);
+    assert(log.refresh() && task.outputs==std::vector<std::string>{"new-output"});
+    overwrite(p,event("failed_password",source,5),true); assert(log.refresh());
+    overwrite(p,event("suspended_missing_volume",source,5),true); assert(log.refresh());
+    assert(task.waiting_reason=="taskWaitingVolumes" && task.outputs.empty());
+    std::string burst;
+    for(int i=0;i<80;++i) burst+=event("done",f.dir/("burst-"+std::to_string(i)+".fake"),10);
+    overwrite(p,burst,true); assert(log.refresh() && !log.rebuilt);
+    assert(task_delta(log,{},{}).at("changes").size()==80);
+    overwrite(p,burst,true); assert(!log.refresh() && log.changed_keys.empty());
+    burst.clear();
+    for(int i=0;i<80;++i) burst+=event("done",f.dir/("burst-"+std::to_string(i)+".fake"),11);
+    overwrite(p,burst,true); assert(log.refresh() && !log.rebuilt);
+    assert(task_delta(log,{},{}).at("changes").size()==80); // time-only changes still sort
     auto reset_source=f.dir/L"载体.fake";
     std::string replacement=event("processing_started",reset_source,50);
     for(int i=0;i<120;++i) replacement+=Json({{"event","scheduler_tick"},{"padding",std::string(80,'x')}}).dump()+"\n";
@@ -107,7 +128,7 @@ void logical_projection(Fixture& f) {
     auto replay=[&](Json record) {
         record["ts"]=++ts;
         overwrite(file,record.dump()+"\n",true); log.refresh();
-        if(log.rebuilt || log.changed_overflow) {
+        if(log.rebuilt) {
             displayed.clear();
             auto snapshot=task_rows(log,{},{});
             for(auto& row:snapshot["rows"]) displayed[row["id"]]=row;
