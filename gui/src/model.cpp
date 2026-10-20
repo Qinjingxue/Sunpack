@@ -391,10 +391,12 @@ void edit_root(const fs::path& p,const std::string& op,const std::string& origin
     FileMutex lock(p,L"SunPackWatchRoots");
     atomic_write(p,roots_text(apply_root_changes(read_roots(p),p.parent_path(),Json::array({Json{{"operation",op},{"original",original},{"input",input},{"output",output},{"deep",deep}}}))));
 }
-Json save_changes(const fs::path& dir,const Json& fields,const Json& passwords,const Json& roots) {
+Json save_changes(const fs::path& dir,const Json& fields,const Json& passwords,const Json& roots,
+    PasswordSaveSnapshot* password_snapshot) {
     Json result={{"saved",Json::array()},{"error",""},{"section",""}};
     struct Write { std::string section; fs::path path; std::string text; };
     std::vector<Write> writes;
+    Json committed_passwords;
     std::unique_ptr<FileMutex> config_lock,password_lock,roots_lock;
     std::string section;
     try {
@@ -403,10 +405,18 @@ Json save_changes(const fs::path& dir,const Json& fields,const Json& passwords,c
         if(!passwords.empty()) password_lock=std::make_unique<FileMutex>(dir/"builtin_passwords.json");
         if(!roots.empty()) roots_lock=std::make_unique<FileMutex>(dir/"sunpack_watch_roots.txt",L"SunPackWatchRoots");
         if(!fields.empty()) { section="config"; auto path=dir/"sunpack_config.json"; writes.push_back({section,path,patch_config(read_file(path),fields)}); }
-        if(!passwords.empty()) { section="passwords"; auto path=dir/"builtin_passwords.json"; writes.push_back({section,path,apply_password_changes(read_json(path),passwords).dump(2)+"\n"}); }
+        if(!passwords.empty()) {
+            section="passwords"; auto path=dir/"builtin_passwords.json";
+            committed_passwords=apply_password_changes(read_json(path),passwords);
+            writes.push_back({section,path,committed_passwords.dump(2)+"\n"});
+        }
         if(!roots.empty()) { section="roots"; auto path=dir/"sunpack_watch_roots.txt"; writes.push_back({section,path,roots_text(apply_root_changes(read_roots(path),dir,roots))}); }
         for(auto& write:writes) {
             section=write.section; atomic_write(write.path,write.text); result["saved"].push_back(section);
+            if(section=="passwords" && password_snapshot) {
+                password_snapshot->document=std::move(committed_passwords);
+                password_snapshot->file_text=std::move(write.text);
+            }
         }
     } catch(const ConfigEditError& error) { result["error"]=error.what(); result["section"]=section; result["field"]=error.pointer; }
     catch(const std::exception& error) { result["error"]=error.what(); result["section"]=section; }
