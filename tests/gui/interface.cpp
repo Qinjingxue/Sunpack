@@ -149,6 +149,9 @@ void settle_motion(Application& app) {
     }); } catch(...) { std::cerr<<"Unfinished motion: "<<pending<<'\n'; throw; }
 }
 void click(Application& app,const char* id) {
+    // Conditional editor views mount during the UI event turn. Drain the
+    // preceding input's events before locating the next click target.
+    ui_debug_pump();
     ui_window_relayout(app.window());
     // Scroll the containing pane as a person would before clicking an action
     // in a long inline form. Never click through a clipped viewport.
@@ -178,7 +181,12 @@ void click(Application& app,const char* id) {
         char* info=ui_debug_dump_widget(widget); std::cerr<<id<<": "<<(info?info:"")<<"\n"; ui_debug_free(info);
     }
     assert(ui_debug_widget_is_visible(widget)==1);
-    assert(ui_debug_click(app.window(),widget)==0);
+    auto clicked=ui_debug_click(app.window(),widget);
+    if(clicked!=0) {
+        std::cerr<<"Click failed: "<<id<<" "<<rendered_widget(app,id)<<'\n';
+        for(auto key:{"taskRoot","chosenDirectory","rootEditor","rootDirty","rootOriginal","listTarget","saveErrors"}) std::cerr<<key<<"="<<state(app.page(),key)<<'\n';
+    }
+    assert(clicked==0);
     ui_widget_destroy(widget);
 }
 void search_config(Application& app,const wchar_t* query) {
@@ -192,6 +200,14 @@ void search_config(Application& app,const wchar_t* query) {
     pump([&]{return state(app.page(),"configQuery")==utf8(query) &&
         state(app.page(),"requests").empty() && !state(app.page(),"dispatch").get<bool>();},"Configuration search");
     ui_window_relayout(app.window());
+}
+// Exercise the explicit import boundary shared by rule/password/folder lists.
+void import_entries(Application& app,const wchar_t* text) {
+    click(app,"importList"); click(app,"listImportText");
+    assert(ui_debug_type_text(app.window(),text)==0);
+    click(app,"previewImport");
+    assert(!state(app.page(),"listPreview").empty());
+    click(app,"applyImport");
 }
 void search_hints(Application& app) {
     auto* root=ui::GetContext().GetWindow(app.window())->Root().get();
@@ -319,6 +335,7 @@ void virtual_tail(Application& app,const char* list_id,const char* scroll_id,siz
             auto anchor=list->Children().back()->id;
             auto top=list->Children().back()->rect.top;
             const char* data_key=!std::strcmp(list_id,"configItems")?"fields":
+                !std::strcmp(list_id,"listItems")?"listRows":
                 !std::strcmp(list_id,"directoryItems")?"directories":
                 !std::strcmp(list_id,"passwordItems")?"passwords":"tasks";
             auto replacement=state(app.page(),data_key).dump();
@@ -357,7 +374,7 @@ void scrolled_config_edits(Application& app) {
     for(auto id:{"/filesystem/scan_filters/0/enabled","/filesystem/scan_filters/0/prune_dir_globs","/runtime/process_mode"}) {
         const std::string pointer=id;
         const std::string control=(pointer.find("enabled")!=std::string::npos?"toggle-":
-            pointer.find("prune_dir_globs")!=std::string::npos?"lines-":"select-")+pointer;
+            pointer.find("prune_dir_globs")!=std::string::npos?"list-":"select-")+pointer;
         window->ScrollWithMeasureContext(scroll,0);
         // Visit preceding rows through the real measured scrolling path.
         for(int pass=0;pass<200 && !window->Root()->FindById(control);++pass) {
@@ -370,14 +387,17 @@ void scrolled_config_edits(Application& app) {
         const auto before=scroll->ScrollY(), top=rect(app,"field-"+pointer).top;
         auto unchanged=[&] {
             ui_window_relayout(app.window());
-            if(std::abs(scroll->ScrollY()-before)>0.5f || std::abs(rect(app,"field-"+pointer).top-top)>0.5f)
+            if(std::abs(scroll->ScrollY()-before)>0.5f || std::abs(rect(app,"field-"+pointer).top-top)>0.5f) {
+                std::cerr<<"Config viewport: before="<<before<<" after="<<scroll->ScrollY()<<" top="<<top<<" afterTop="<<rect(app,"field-"+pointer).top<<'\n';
                 throw std::runtime_error("Editing moved configuration viewport: "+pointer);
+            }
         };
         auto handle=ui_widget_find_by_id(ui_page_root(app.page()),control.c_str()); assert(handle);
         if(control.find("toggle-")==0) assert(ui_debug_toggle_set(app.window(),handle,0)==0);
-        else if(control.find("lines-")==0) {
-            assert(ui_debug_key_mod(app.window(),'A',1,0,0)==0);
-            assert(ui_debug_type_text(app.window(),L".git\nnode_modules\nskipped-directory")==0);
+        else if(control.find("list-")==0) {
+            click(app,"listEntry");
+            assert(ui_debug_type_text(app.window(),L"skipped-directory")==0);
+            click(app,"putListEntry"); click(app,"saveList");
         } else {
             assert(ui_debug_key(app.window(),VK_ESCAPE)==0);
             assert(ui_debug_combo_select(app.window(),handle,2)==0);
@@ -388,7 +408,7 @@ void scrolled_config_edits(Application& app) {
         pump([&] {
             for(auto& field:state(app.page(),"fields")) if(field["id"]==pointer) {
                 if(control.find("toggle-")==0) return field["boolean"]==false;
-                if(control.find("lines-")==0) return field["text"]==".git\nnode_modules\nskipped-directory";
+                if(control.find("list-")==0) return field["items"].back()=="skipped-directory";
                 return field["text"]=="high";
             }
             return false;
@@ -397,6 +417,67 @@ void scrolled_config_edits(Application& app) {
     }
     window->ScrollWithMeasureContext(scroll,0);
     ui_window_relayout(app.window());
+}
+// One real-window scenario covers lossless collection editing, virtual rows,
+// cancel and concurrent-file conflict. Scalar/record tests cannot detect these
+// failures; sharing their fixture avoids another process/window startup.
+void structured_config(Application& app,const fs::path& dir) {
+    const std::string pointer="/filesystem/scan_filters/0/prune_dir_globs";
+    auto config=read_json(dir/"sunpack_config.json");
+    Json values=Json::array({"", "a\nb", "  spaced  ", "duplicate", "duplicate"});
+    for(int i=0;i<180;++i) values.push_back("rule-"+std::to_string(i));
+    config[Json::json_pointer(pointer)]=values;
+    atomic_write(dir/"sunpack_config.json",config.dump());
+    auto current=[&] { for(auto& f:state(app.page(),"fields")) if(f["id"]==pointer) return f; return Json(); };
+    pump([&]{return current().value("items",Json())==values;});
+    search_config(app,L"prune_dir_globs");
+    assert(!ui::GetContext().GetWindow(app.window())->Root()->FindById("lines-"+pointer));
+    click(app,("list-"+pointer).c_str());
+    assert(rendered_widget(app,"putListEntry")["text"]==state(app.page(),"texts")["addToList"]);
+    screenshot(app,L"structured-rules-open.png");
+    virtual_tail(app,"listItems","listScroll",values.size());
+    button_texts(app); screenshot(app,L"structured-rules-small.png");
+    click(app,"listSearch"); ui_debug_type_text(app.window(),L"spaced");
+    // Search a visible stable row, then use the multiline editor for one item.
+    ui_window_relayout(app.window());
+    click(app,"edit-list-2");
+    click(app,"listEntry"); assert(ui_debug_key_mod(app.window(),'A',1,0,0)==0);
+    ui_debug_type_text(app.window(),L"  changed  "); click(app,"putListEntry");
+    click(app,"listSearch"); assert(ui_debug_key_mod(app.window(),'A',1,0,0)==0); ui_debug_type_char(app.window(),8); ui_window_relayout(app.window());
+    click(app,"edit-list-1"); assert(state(app.page(),"listMultiline")==true);
+    assert(state(app.page(),"listEntry")=="a\nb"); click(app,"putListEntry");
+    // Empty strings and duplicate entries survive an explicit full-list save.
+    click(app,"saveList"); finish_input(app); values[2]="  changed  ";
+    assert(read_json(dir/"sunpack_config.json")[Json::json_pointer(pointer)]==values);
+    // Continue editing the same collection while our first write owns the
+    // worker. Its acknowledgement advances the baseline, not the active rows.
+    {
+        FileMutex hold(dir/"sunpack_config.json");
+        click(app,("list-"+pointer).c_str());
+        click(app,"listEntry"); ui_debug_type_text(app.window(),L"first save"); click(app,"saveList");
+        click(app,("list-"+pointer).c_str());
+        click(app,"listEntry"); ui_debug_type_text(app.window(),L"continued edit"); click(app,"putListEntry");
+    }
+    finish_input(app);
+    assert(state(app.page(),"listRows").back()["value"]=="continued edit");
+    click(app,"saveList"); finish_input(app); values.push_back("first save"); values.push_back("continued edit");
+    assert(read_json(dir/"sunpack_config.json")[Json::json_pointer(pointer)]==values);
+    click(app,("list-"+pointer).c_str()); click(app,"remove-list-0"); click(app,"cancelList");
+    assert(read_json(dir/"sunpack_config.json")[Json::json_pointer(pointer)]==values);
+    click(app,("list-"+pointer).c_str());
+    click(app,"listEntry"); ui_debug_type_text(app.window(),L"local"); click(app,"putListEntry");
+    config=read_json(dir/"sunpack_config.json"); config[Json::json_pointer(pointer)]=Json::array({"external"});
+    atomic_write(dir/"sunpack_config.json",config.dump());
+    pump([&]{return current()["items"]==Json::array({"external"});});
+    click(app,"saveList");
+    pump([&]{return state(app.page(),"saveErrors").contains(pointer)&&!state(app.page(),"saving").get<bool>();});
+    assert(read_json(dir/"sunpack_config.json")[Json::json_pointer(pointer)]==Json::array({"external"}));
+    // Reopen the preserved draft and explicitly retry against the latest file.
+    click(app,("list-"+pointer).c_str()); assert(state(app.page(),"listRows").size()==values.size()+1);
+    click(app,"saveList"); finish_input(app); values.push_back("local");
+    assert(read_json(dir/"sunpack_config.json")[Json::json_pointer(pointer)]==values);
+    assert(state(app.page(),"listRows").empty() && state(app.page(),"listField").is_null());
+    search_config(app,L"");
 }
 void resize_tasks(Application& app) {
     settle_motion(app);
@@ -951,8 +1032,9 @@ int wmain(int argc,wchar_t** argv) {
             assert(add_bounds.left<saved_bounds.left && add_bounds.top==saved_bounds.top);
             assert(state(app.page(),"texts")["back"]=="返回");
             click(app,"newPassword"); assert(state(app.page(),"passwordEditor")==true);
-            click(app,"passwordValue"); ui_debug_type_text(app.window(),L"添加的密码\n  #批量  \n\n添加的密码");
-            assert(state(app.page(),"passwordValue")=="添加的密码\n  #批量  \n\n添加的密码");
+            click(app,"managePasswords"); import_entries(app,L"添加的密码\n  #批量  \n\n添加的密码");
+            assert(state(app.page(),"listRows").size()==3);
+            click(app,"saveList"); assert(state(app.page(),"passwordValues").size()==3);
             screenshot(app,L"passwords.png");
             ui_window_set_size(app.window(),850,560);
             screenshot(app,L"password-editor-small.png");
@@ -972,15 +1054,26 @@ int wmain(int argc,wchar_t** argv) {
             click(app,"tabTasks"); pump([&]{return state(app.page(),"tab")=="tasks";});
             click(app,"newRoot");
             assert(rendered_widget(app,"directoryPane").value("visible",true));
-            click(app,"rootInput"); ui_debug_type_text(app.window(),(pending_root.wstring()+L"\n"+pending_second.wstring()+L"\n"+pending_root.wstring()).c_str());
+            click(app,"manageRoots"); import_entries(app,(pending_root.wstring()+L"\n"+pending_second.wstring()+L"\n"+pending_root.wstring()).c_str()); click(app,"saveList");
             button_texts(app); screenshot(app,L"root-inline-batch-small.png");
-            click(app,"finishRoot"); finish_input(app);
+            click(app,"finishRoot");
+            auto root_request=state(app.page(),"requests"); finish_input(app);
+            if(state(app.page(),"rootEditor")==true) {
+                std::cerr<<"Root creation remained open: request="<<root_request<<'\n';
+                for(auto key:{"rootInput","rootOutput","rootPaths","rootBaseline","rootSession","rootDirty"}) std::cerr<<key<<"="<<state(app.page(),key)<<'\n';
+            }
+            assert(state(app.page(),"rootEditor")==false);
             assert(read_file(dir/"sunpack_watch_roots.txt")!=disk_roots);
             click(app,"tabPasswords"); pump([&]{return state(app.page(),"tab")=="passwords";});
             click(app,"newPassword"); click(app,"passwordValue"); ui_debug_type_text(app.window(),L"pending scoped");
-            click(app,"passwordScopes"); ui_debug_type_text(app.window(),pending_root.c_str());
+            click(app,"scopeSelected"); click(app,"manageScopes");
+            click(app,"listEntry"); ui_debug_type_text(app.window(),pending_root.c_str()); click(app,"putListEntry"); click(app,"saveList");
             click(app,"finishPassword"); finish_input(app);
             click(app,"newPassword"); click(app,"passwordValue"); ui_debug_type_text(app.window(),L"pending global");
+            click(app,"scopeSelected"); click(app,"finishPassword");
+            assert(state(app.page(),"saveErrors")["@passwords"]=="scopeRequired");
+            assert(read_json(dir/"builtin_passwords.json")["passwords"].size()==4);
+            click(app,"scopeGlobal");
             click(app,"finishPassword"); finish_input(app);
             click(app,"tabConfig"); pump([&]{return state(app.page(),"tab")=="config";});
             search_config(app,L"out_dir");
@@ -1015,7 +1108,7 @@ int wmain(int argc,wchar_t** argv) {
                 assert(edit.top==remove.top && edit.bottom==remove.bottom && edit.right<remove.left);
             }
             screenshot(app,L"passwords-unified.png");
-            // Existing records auto-save on blur and retain their editor. A
+            // Explicit completed edits retain their editor. A
             // second completed edit while the first owns the writer lock must
             // rebase onto our own saved record rather than conflict with it.
             auto record=state(app.page(),"passwords")["rows"][0];
@@ -1023,13 +1116,15 @@ int wmain(int argc,wchar_t** argv) {
             screenshot(app,L"passwords-edit.png");
             assert(!ui::GetContext().GetWindow(app.window())->Root()->FindById("password-"+record["id"].get<std::string>()));
             auto password_input=ui_widget_find_by_id(ui_page_root(app.page()),"passwordValue"); assert(password_input);
-            ui_text_area_set_text(password_input,L""); ui_widget_destroy(password_input);
+            ui_text_input_set_text(password_input,L""); ui_widget_destroy(password_input);
             click(app,"passwordValue"); ui_debug_type_text(app.window(),L"edited password");
             {
                 FileMutex hold(dir/"builtin_passwords.json");
-                click(app,"passwordScopes"); ui_debug_pump();
-                click(app,"passwordValue"); assert(ui_debug_key(app.window(),VK_END)==0); ui_debug_type_text(app.window(),L" latest");
                 ui_window_focus_widget(app.window(),0); ui_debug_pump();
+                assert(!state(app.page(),"saving").get<bool>());
+                click(app,"finishPassword"); ui_debug_pump();
+                click(app,"passwordValue"); assert(ui_debug_key(app.window(),VK_END)==0); ui_debug_type_text(app.window(),L" latest");
+                click(app,"finishPassword"); ui_debug_pump();
             }
             finish_input(app);
             assert(state(app.page(),"passwordEditor")==true);
@@ -1063,10 +1158,11 @@ int wmain(int argc,wchar_t** argv) {
             pump([&]{return state(app.page(),"taskRoot")==utf8(pending_root.wstring());});
             click(app,"editSelectedRoot"); ui_debug_pump();
             click(app,"rootOutput"); ui_debug_type_text(app.window(),L"automatic-output");
-            assert(ui_debug_key(app.window(),VK_RETURN)==0);
+            click(app,"finishRoot");
             finish_input(app);
             auto deep=ui_widget_find_by_id(ui_page_root(app.page()),"rootDeepToggle"); assert(deep);
             assert(ui_debug_toggle_set(app.window(),deep,1)==0); ui_widget_destroy(deep);
+            click(app,"finishRoot");
             finish_input(app);
             assert(state(app.page(),"rootEditor")==true);
             bool updated=false;
@@ -1156,6 +1252,7 @@ int wmain(int argc,wchar_t** argv) {
             }
             ui_widget_destroy(block);
             screenshot(app,L"whitelist-block-small.png");
+            structured_config(app,dir);
             // Dense views must remain usable with many folders/history items,
             // including after the directory scrollbar becomes active.
             std::string many_roots=utf8(dir.wstring())+"\n";

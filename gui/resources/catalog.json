@@ -49,8 +49,8 @@
       "en": "All folders"
     },
     "rootBatchHint": {
-      "zh": "每行一个目录，可粘贴多行；以下设置应用于本次添加的所有目录。",
-      "en": "One folder per line. The settings below apply to all folders in this batch."
+      "zh": "选择或管理目录；以下设置应用于本次添加的所有目录。",
+      "en": "Choose or manage folders. These settings apply to all folders being added."
     },
     "rootsEmpty": {
       "zh": "请至少输入一个目录。",
@@ -232,25 +232,17 @@
       "zh": "密码",
       "en": "Password"
     },
-    "batchHint": {
-      "zh": "每行一个密码，可批量粘贴。",
-      "en": "One password per line."
-    },
     "scopeLabel": {
       "zh": "作用范围",
       "en": "Applies to"
     },
     "scopeDescription": {
-      "zh": "每行一个目录，含子目录。新密码留空适用全部目录。",
-      "en": "One folder per line, with subfolders. Blank for new passwords: all folders."
+      "zh": "包含所选目录的子目录。请至少添加一个目录。",
+      "en": "Includes subfolders. Add at least one folder."
     },
     "chooseScope": {
       "zh": "添加适用目录",
       "en": "Add folder"
-    },
-    "makeGlobal": {
-      "zh": "适用于全部目录",
-      "en": "Apply everywhere"
     },
     "deletePassword": {
       "zh": "删除密码",
@@ -260,10 +252,25 @@
       "zh": "条",
       "en": "entries"
     },
-    "scopeGuard": {
-      "zh": "请保留至少一个目录，或点击“适用于全部目录”。",
-      "en": "Keep at least one folder, or choose Apply everywhere."
+    "scopeRequired": {
+      "zh": "请添加目录，或选择“全部目录”。",
+      "en": "Add a folder or select All folders."
     },
+    "manageEntries": {"zh":"管理条目","en":"Manage entries"},
+    "saveEntries": {"zh":"保存","en":"Save"},
+    "cancelEntries": {"zh":"取消","en":"Cancel"},
+    "searchEntries": {"zh":"搜索条目","en":"Search entries"},
+    "newEntry": {"zh":"新增条目","en":"New entry"},
+    "emptyEntry": {"zh":"（空字符串）","en":"(empty string)"},
+    "updateEntry": {"zh":"更新条目","en":"Update entry"},
+    "importEntries": {"zh":"批量导入","en":"Bulk import"},
+    "previewEntries": {"zh":"预览导入","en":"Preview import"},
+    "multilineEntry": {"zh":"条目内换行","en":"Multiline entry"},
+    "importHint": {"zh":"每行导入一个条目，忽略空行；密码和规则保留首尾空格。先预览，再导入。","en":"One entry per line; blank lines are skipped. Password and rule whitespace is preserved. Preview before importing."},
+    "selectedFolders": {"zh":"指定目录","en":"Selected folders"},
+    "unsavedEntries": {"zh":"请先保存或取消当前编辑。","en":"Save or cancel the current edit first."},
+    "folderEntryRequired": {"zh":"请输入一个目录路径。","en":"Enter one folder path."},
+    "finishImport": {"zh":"请先预览并导入，或清空批量输入。","en":"Preview and import the batch, or clear the import text first."},
     "operationFailed": {
       "zh": "操作未完成",
       "en": "Could not complete the action"
@@ -1016,8 +1023,8 @@
         "en": "Skipped folders"
       },
       "description": {
-        "zh": "每行一条，支持通配符。",
-        "en": "One pattern per line; wildcards supported."
+        "zh": "支持通配符，可逐项管理规则。",
+        "en": "Manage individual patterns; wildcards supported."
       }
     },
     "/filesystem/scan_filters/@directory_prune/path_globs": {
@@ -1026,8 +1033,8 @@
         "en": "Path patterns"
       },
       "description": {
-        "zh": "每行一条，支持通配符。",
-        "en": "One pattern per line; wildcards supported."
+        "zh": "支持通配符，可逐项管理规则。",
+        "en": "Manage individual patterns; wildcards supported."
       }
     },
     "/filesystem/scan_filters/@whitelist/enabled": {
@@ -1046,8 +1053,8 @@
         "en": "Path patterns"
       },
       "description": {
-        "zh": "每行一条，支持通配符。",
-        "en": "One pattern per line; wildcards supported."
+        "zh": "支持通配符，可逐项管理规则。",
+        "en": "Manage individual patterns; wildcards supported."
       }
     },
     "/filesystem/scan_filters/@whitelist/prune_dir_globs": {
@@ -1056,8 +1063,8 @@
         "en": "Allowed folders"
       },
       "description": {
-        "zh": "每行一条，支持通配符。",
-        "en": "One pattern per line; wildcards supported."
+        "zh": "支持通配符，可逐项管理规则。",
+        "en": "Manage individual patterns; wildcards supported."
       }
     },
     "/filesystem/scan_filters/@whitelist/allowed_files": {
@@ -1066,8 +1073,8 @@
         "en": "File names"
       },
       "description": {
-        "zh": "每行一个。",
-        "en": "One per line."
+        "zh": "按文件名匹配。",
+        "en": "Match by file name."
       }
     },
     "/filesystem/scan_filters/@whitelist/allowed_extensions": {
@@ -1076,8 +1083,8 @@
         "en": "Extensions"
       },
       "description": {
-        "zh": "每行一个，如 .zip；也会影响伪装扩展名的压缩包。",
-        "en": "One per line, e.g. .zip; also affects archives with disguised extensions."
+        "zh": "扩展名如 .zip；也会影响伪装扩展名的压缩包。",
+        "en": "Extensions such as .zip; also affects archives with disguised extensions."
       }
     },
     "/filesystem/scan_filters/@blacklist/enabled": {
@@ -1096,8 +1103,8 @@
         "en": "File names"
       },
       "description": {
-        "zh": "每行一个。",
-        "en": "One per line."
+        "zh": "按文件名匹配。",
+        "en": "Match by file name."
       }
     },
     "/filesystem/scan_filters/@blacklist/blocked_extensions": {
@@ -1106,8 +1113,8 @@
         "en": "Extensions"
       },
       "description": {
-        "zh": "每行一个，如 .zip；也会影响伪装扩展名的压缩包。",
-        "en": "One per line, e.g. .zip; also affects archives with disguised extensions."
+        "zh": "扩展名如 .zip；也会影响伪装扩展名的压缩包。",
+        "en": "Extensions such as .zip; also affects archives with disguised extensions."
       }
     },
     "/filesystem/scan_filters/@size_range/enabled": {
@@ -1503,8 +1510,8 @@
         "en": "Additional monitored folders"
       },
       "description": {
-        "zh": "每行一个目录。",
-        "en": "One folder per line."
+        "zh": "附加监控目录，可逐项管理。",
+        "en": "Additional monitored folders, managed individually."
       }
     },
     "/watch/out_dir": {

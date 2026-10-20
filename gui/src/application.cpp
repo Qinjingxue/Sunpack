@@ -8,7 +8,6 @@
 #include <shlobj.h>
 #include <ui/ui_context.h>
 #include <ui/ui_window.h>
-#include <sstream>
 #include <chrono>
 #include <map>
 
@@ -143,11 +142,6 @@ void Application::save_field(const std::string& id,Json draft) {
         auto field=std::find_if(fields.begin(),fields.end(),[&](const Json& f){return f["id"]==id;});
         if(field==fields.end()) throw std::runtime_error("configConflict");
         auto text=draft.at("text").get<std::string>();
-        if((*field)["editor"]=="lines") {
-            Json lines=Json::array(); std::istringstream input(text); std::string line;
-            while(std::getline(input,line)) { if(!line.empty() && line.back()=='\r') line.pop_back(); if(!line.empty()) lines.push_back(line); }
-            text=lines.dump();
-        }
         Json edit={{"pointer",id},{"label",(*field)["label"]},{"original",draft["original"]},
             {"type",(*field)["editor"]=="recursive"?Json("string"):(*field)["type"]},
             {"text",text},{"boolean",draft["boolean"]},{"draft",draft}};
@@ -188,6 +182,10 @@ void Application::acknowledge_save(const Json& ack) {
     if(ok && kind=="config") {
         const auto& edit=job["fields"][0]; auto id=edit["pointer"].get<std::string>();
         auto original=edit["type"]=="string"?Json(edit["text"]).dump():edit["type"]=="boolean"?Json(edit["boolean"]).dump():edit["text"].get<std::string>();
+        if(page_value(page_,"listTarget")=="config") {
+            auto saved=Json{{"id",id},{"previous",edit["original"]},{"original",original},{"text",edit["draft"]["text"]}}.dump();
+            if(ui_page_call_json(page_,"rebaseListField",saved.c_str())!=0) throw std::runtime_error("uiBindingFailed");
+        }
         for(auto name:{"drafts","toggleDrafts"}) {
             auto drafts=page_value(page_,name);
             if(drafts.contains(id)) {
@@ -216,15 +214,13 @@ void Application::acknowledge_save(const Json& ack) {
         Json baseline, expected; std::string original;
         if(replace && password) {
             Json record={{"value",edit["value"]}};
-            std::string scopes;
             if(!edit["scopes"].empty()) record["scopes"]=edit["scopes"];
-            for(auto& scope:edit["scopes"]) { if(!scopes.empty()) scopes+='\n'; scopes+=scope.get<std::string>(); }
-            original=record.dump(); baseline={{"value",edit["value"]},{"scopes",scopes}};
+            original=record.dump(); baseline={{"value",edit["value"]},{"scopes",edit["scopes"]},{"global",edit["scopes"].empty()},{"values",Json::array()}};
         } else if(replace) {
             original=utf8(resolve_path(wide(edit["input"].get<std::string>()),options_.data_dir).wstring());
             auto output=edit["output"].get<std::string>(); auto first=output.find_first_not_of(" \t\r\n");
             output=first==std::string::npos?"":output.substr(first,output.find_last_not_of(" \t\r\n")-first+1);
-            baseline={{"input",original},{"output",output},{"deep",edit["deep"]}};
+            baseline={{"input",original},{"output",output},{"deep",edit["deep"]},{"paths",Json::array()}};
             expected={{"output",output},{"deep",edit["deep"]}};
         }
         if(replace) for(auto& queued:saves_) if(queued["kind"]==kind && queued["key"]==job["key"]) {
@@ -232,24 +228,31 @@ void Application::acknowledge_save(const Json& ack) {
             if(!password) queued["edit"]["expected"]=expected;
         }
         if(page_value(page_,session)==job["key"]) {
-            Json current=password?Json{{"value",page_value(page_,"passwordValue")},{"scopes",page_value(page_,"scopeText")}}:
-                Json{{"input",page_value(page_,"rootInput")},{"output",page_value(page_,"rootOutput")},{"deep",page_value(page_,"rootDeep")}};
-            bool unchanged=current==job["snapshot"];
+            Json current=password?Json{{"value",page_value(page_,"passwordValue")},{"scopes",page_value(page_,"scopePaths")},{"global",page_value(page_,"scopeGlobal")},{"values",page_value(page_,"passwordValues")}}:
+                Json{{"input",page_value(page_,"rootInput")},{"output",page_value(page_,"rootOutput")},{"deep",page_value(page_,"rootDeep")},{"paths",page_value(page_,"rootPaths")}};
+            // UI object transport can enumerate keys in a different order.
+            // ordered_json object equality is order-sensitive; compare fields
+            // without copying/normalizing the collection payloads.
+            const auto& snapshot=job.at("snapshot");
+            bool unchanged=current.size()==snapshot.size();
+            for(auto it=current.begin();unchanged && it!=current.end();++it)
+                unchanged=snapshot.contains(it.key()) && snapshot[it.key()]==it.value();
             if(replace) {
                 set_text(page_,password?"passwordOriginal":"rootOriginal",original);
                 set_text(page_,password?"passwordBaseline":"rootBaseline",baseline.dump());
                 if(!password) { auto text=expected.dump(); ui_page_set_json(page_,"rootExpected",text.c_str()); }
                 if(unchanged) {
                     set_text(page_,password?"passwordValue":"rootInput",baseline[password?"value":"input"]);
-                    set_text(page_,password?"scopeText":"rootOutput",baseline[password?"scopes":"output"]);
+                    if(password) { auto text=baseline["scopes"].dump(); ui_page_set_json(page_,"scopePaths",text.c_str()); }
+                    else set_text(page_,"rootOutput",baseline["output"]);
                 }
             }
             if(unchanged && job.contains("nextState")) {
                 for(auto it=job["nextState"].begin();it!=job["nextState"].end();++it) { auto text=it.value().dump(); ui_page_set_json(page_,it.key().c_str(),text.c_str()); }
                 if(job["nextState"].value(password?"passwordEditor":"rootEditor",false)) reveal_form(password);
                 if(job["nextState"].contains(password?"passwordEditor":"rootEditor") && !job["nextState"][password?"passwordEditor":"rootEditor"].get<bool>()) {
-                    if(password) for(auto name:{"passwordOriginal","passwordValue","scopeText","passwordBaseline"}) set_text(page_,name,"");
-                    else for(auto name:{"rootOriginal","rootInput","rootOutput","rootBaseline"}) set_text(page_,name,"");
+                    if(password) { for(auto name:{"passwordOriginal","passwordValue","passwordBaseline"}) set_text(page_,name,""); ui_page_set_json(page_,"scopePaths","[]"); ui_page_set_json(page_,"passwordValues","[]"); }
+                    else { for(auto name:{"rootOriginal","rootInput","rootOutput","rootBaseline"}) set_text(page_,name,""); ui_page_set_json(page_,"rootPaths","[]"); }
                 }
                 if(job["nextState"].contains("passwordScope")) handle_command(Json{{"op","filterPasswords"},{"payload",{{"query",page_value(page_,"passwordQuery")},{"scope",page_value(page_,"passwordScope")}}}});
                 if(job["nextState"].contains("taskRoot")) {
@@ -479,7 +482,7 @@ void Application::handle_command(Json command) {
     if(op=="navigate") { navigate(p.value("tab",std::string())); return; }
     if(op=="scrollTop" || op=="animateView") {
         const auto id=p.value("id",std::string());
-        const char* scroll=id=="configBlocks"?"configListScroll":id=="directoryItems"?"directoryListScroll":nullptr;
+        const char* scroll=id=="configBlocks"?"configListScroll":id=="directoryItems"?"directoryListScroll":id=="listItems"?"listScroll":nullptr;
         if(scroll) {
             auto widget=ui_widget_find_by_id(ui_page_root(page_),scroll);
             if(widget) { ui_debug_scroll_set(widget,0); ui_widget_destroy(widget); }
@@ -496,16 +499,15 @@ void Application::handle_command(Json command) {
         auto selected=choose_directory(hwnd_);
         if(!selected.empty()) {
             auto target=p.value("target",std::string());
-            if(target=="scopeText" || (target=="rootInput" && page_value(page_,"rootOriginal")=="")) {
-                auto text=page_value(page_,target.c_str()).get<std::string>();
-                if(!text.empty() && text.back()!='\n') text+='\n';
-                text+=utf8(selected.wstring()); set_text(page_,target.c_str(),text);
+            if(target=="scopePaths" || (target=="rootInput" && page_value(page_,"rootOriginal")=="")) {
+                const char* field=target=="scopePaths"?"scopePaths":"rootPaths";
+                auto paths=page_value(page_,field), value=Json(utf8(selected.wstring()));
+                if(std::find(paths.begin(),paths.end(),value)==paths.end()) paths.push_back(value);
+                auto text=paths.dump(); ui_page_set_json(page_,field,text.c_str());
+                if(target=="scopePaths") ui_page_set_bool(page_,"scopeGlobal",false);
+            } else if(target=="listEntry") {
+                set_text(page_,"listEntry",utf8(selected.wstring()));
             } else if(target=="rootInput" || target=="rootOutput") set_text(page_,target.c_str(),utf8(selected.wstring()));
-            // Folder selection completes an edit without another keystroke.
-            // Reuse the input's bound commit callback, including new-form guards.
-            auto root=ui::GetContext().GetWindow(window_)->Root();
-            auto* input=root->FindById(target=="scopeText"?"passwordScopes":target);
-            if(input && input->onBlurHook) { auto commit=input->onBlurHook; commit(); }
         }
         return;
     }
@@ -544,6 +546,9 @@ LRESULT CALLBACK Application::subclass(HWND hwnd,UINT message,WPARAM wparam,LPAR
     auto* self=reinterpret_cast<Application*>(data);
     try {
         if(message==WM_CLOSE && !self->stopping_) {
+            if(page_value(self->page_,"listTarget")!="" || page_value(self->page_,"rootDirty")==true || page_value(self->page_,"passwordDirty")==true) {
+                self->set_error("closeError","unsavedEntries"); return 0;
+            }
             if(!self->closing_ || (self->active_save_.is_null() && self->saves_.empty() && page_value(self->page_,"saveErrors").empty())) {
                 self->closing_=true;
                 ui_window_focus_widget(self->window_,0); // Commit the focused input through its blur handler.

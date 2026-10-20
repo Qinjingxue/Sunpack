@@ -717,7 +717,7 @@ Json password_rows(const Json& passwords,const View& v,const std::string& langua
     Json rows=Json::array();
     if(v.password_scope=="@history") {
         for(auto& p:passwords.value("clipboard_history",Json::array())) if(contains(p.get<std::string>(),v.password_query))
-            rows.push_back({{"id",std::to_string(rows.size())},{"value",p},{"original",""},{"scopes",""}});
+            rows.push_back({{"id",std::to_string(rows.size())},{"value",p},{"original",""},{"scopes",""},{"scopePaths",Json::array()}});
     } else {
         for(auto& p:passwords.value("passwords",Json::array())) {
             std::string scopes;
@@ -725,7 +725,7 @@ Json password_rows(const Json& passwords,const View& v,const std::string& langua
                 auto scope=s.get<std::string>(); if(!scopes.empty()) scopes+="\n"; scopes+=scope;
             }
             if(!contains(p["value"].get<std::string>()+"\n"+(scopes.empty()?tr("allFolders",language):scopes),v.password_query)) continue;
-            rows.push_back({{"id",p.dump()+"#"+std::to_string(rows.size())},{"value",p["value"]},{"original",p.dump()},{"scopes",scopes}});
+            rows.push_back({{"id",p.dump()+"#"+std::to_string(rows.size())},{"value",p["value"]},{"original",p.dump()},{"scopes",scopes},{"scopePaths",p.value("scopes",Json::array())}});
         }
     }
     const auto total=rows.size();
@@ -751,13 +751,12 @@ Json config_fields(const Json& config,const std::string& source,const std::strin
         auto field=describe_setting(pointer,module,language);
         std::string editor=field["editor"], text=item.is_string()?item.get<std::string>():raw;
         bool lines=item.is_array() && std::all_of(item.begin(),item.end(),[](const Json& i){return i.is_string();});
-        if(lines) { text.clear(); for(auto& i:item) { if(!text.empty()) text+='\n'; text+=i.get<std::string>(); } }
-        if(editor.empty()) editor=!field["known"].get<bool>()?"readonly":!field["options"].empty()?"choice":lines?"lines":type=="boolean"?"toggle":type=="string"||type=="number"?"text":"readonly";
+        if(editor.empty()) editor=lines?"list":!field["known"].get<bool>()?"readonly":!field["options"].empty()?"choice":type=="boolean"?"toggle":type=="string"||type=="number"?"text":"readonly";
         int choice=-1;
         for(size_t i=0;i<field["options"].size();++i) if(field["options"][i]["value"]==item) choice=int(i);
         if(editor=="recursive" && choice<0) choice=2;
         field.update(Json{{"id",pointer},{"key",pointer+"@"+language},{"type",type},{"original",raw},{"text",text},{"boolean",item.is_boolean()?item.get<bool>():false},
-            {"editor",editor},{"choice",choice}});
+            {"editor",editor},{"choice",choice},{"items",lines?item:Json::array()}});
         rows.push_back(std::move(field));
     };
     walk(config,"",""); return rows;
