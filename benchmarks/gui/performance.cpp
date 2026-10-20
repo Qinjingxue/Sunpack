@@ -498,7 +498,14 @@ int wmain(int argc,wchar_t** argv) {
             wait_settled(app);
             report["widgets_after_ui"]=widget_count(app);
             for(size_t i=0;i<5;i++) { nav("tabConfig","config","page_switch_end"); nav("tabTasks","tasks","page_switch_end"); }
+            const uint64_t idle_paint_start=paint_count.load(), idle_anim_start=animation_frame_count.load(),
+                idle_prop_start=property_frame_count.load();
             idle_sample(5000);
+            // Idle must stay quiet: a lingering animation timer shows up here as
+            // one paint/animation frame per timer tick.
+            report["idle_paints"]=paint_count.load()-idle_paint_start;
+            report["idle_animation_frames"]=animation_frame_count.load()-idle_anim_start;
+            report["idle_property_frames"]=property_frame_count.load()-idle_prop_start;
             ui_trace_set_sink(nullptr,nullptr);
             report["memory_mib_after_ui"] = double(working_set())/1048576.0;
         }
