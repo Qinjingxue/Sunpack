@@ -1,0 +1,50 @@
+name: GUI build cache
+description: Restore only the Windows Core UI CMake build tree
+inputs:
+  arch:
+    required: true
+    description: Target architecture
+  source-key:
+    required: true
+    description: GUI-only sources and build configuration fingerprint
+outputs:
+  cache-key:
+    description: Primary GUI cache key for an explicit post-build save
+    value: ${{ steps.cache.outputs.cache-primary-key }}
+  cache-hit:
+    description: Whether the primary GUI cache key was restored
+    value: ${{ steps.cache.outputs.cache-hit }}
+runs:
+  using: composite
+  steps:
+    - name: Identify GUI toolchain
+      id: toolchain
+      shell: pwsh
+      run: |
+        $cmake = ((cmake --version | Select-Object -First 1) -replace '^cmake version ', '').Trim()
+        if ($LASTEXITCODE -ne 0 -or -not $cmake) { throw 'Cannot identify CMake' }
+        $files = @(Get-ChildItem -Path @(
+          "${env:ProgramFiles(x86)}\Microsoft Visual Studio\*\*\VC\Auxiliary\Build\Microsoft.VCToolsVersion.default.txt",
+          "$env:ProgramFiles\Microsoft Visual Studio\*\*\VC\Auxiliary\Build\Microsoft.VCToolsVersion.default.txt"
+        ) -File -ErrorAction SilentlyContinue)
+        $versionFile = $files | Sort-Object { [version](Get-Content -LiteralPath $_.FullName -Raw).Trim() } -Descending | Select-Object -First 1
+        if (-not $versionFile) { throw 'Cannot identify MSVC Build Tools' }
+        $msvc = (Get-Content -LiteralPath $versionFile.FullName -Raw).Trim()
+        "id=$cmake-$msvc" >> $env:GITHUB_OUTPUT
+    - name: Restore GUI CMake cache
+      id: cache
+      uses: actions/cache/restore@v4
+      with:
+        path: |
+          .cache/gui-${{ inputs.arch }}
+          .cache/gui-source-times-${{ inputs.arch }}-release.json
+        key: gui-v1-${{ runner.os }}-${{ inputs.arch }}-${{ steps.toolchain.outputs.id }}-${{ inputs.source-key }}
+        restore-keys: |
+          gui-v1-${{ runner.os }}-${{ inputs.arch }}-${{ steps.toolchain.outputs.id }}-
+    - name: Restore unchanged GUI input timestamps
+      shell: pwsh
+      env:
+        GUI_SOURCE_KEY: ${{ inputs.source-key }}
+        GUI_ARCH: ${{ inputs.arch }}
+      run: |
+        .\scripts\restore_native_cache_times.ps1 -SourceKey $env:GUI_SOURCE_KEY -Arch $env:GUI_ARCH -BuildProfile release -Scope gui

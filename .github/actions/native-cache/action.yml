@@ -17,6 +17,12 @@ outputs:
   toolchain:
     description: Rust, CMake, Visual Studio and MSVC versions
     value: ${{ steps.toolchain.outputs.id }}
+  cache-key:
+    description: Exact key to save after a successful native compilation
+    value: ${{ steps.cache.outputs.cache-primary-key }}
+  cache-hit:
+    description: Whether the primary key was restored
+    value: ${{ steps.cache.outputs.cache-hit }}
 runs:
   using: composite
   steps:
@@ -54,13 +60,13 @@ runs:
         $msvc = (Get-Content -LiteralPath $versionFile.FullName -Raw).Trim()
         "id=$rust-$cmake-$vs-$msvc" >> $env:GITHUB_OUTPUT
     - name: Restore Cargo and CMake cache
-      uses: actions/cache@v4
+      id: cache
+      uses: actions/cache/restore@v4
       with:
         path: |
           ~/.cargo/registry
           ~/.cargo/git
           .cache/rust-target/${{ inputs.arch }}
-          .cache/gui-${{ inputs.arch }}
           .cache/native-source-times-${{ inputs.arch }}-${{ inputs.profile }}.json
           native/sevenzip_bridge/build-${{ inputs.arch }}${{ inputs.profile == 'ci' && '-ci' || '' }}
           native/toast_host/build-${{ inputs.arch }}${{ inputs.profile == 'ci' && '-ci' || '' }}
