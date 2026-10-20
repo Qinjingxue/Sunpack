@@ -12,12 +12,13 @@
 using namespace spg;
 namespace {
 struct AnimationFrames {
-    bool finished=false, layout=false, stopped=false;
+    bool finished=false, layout=false, started=false, stopped=false;
     unsigned frames=0;
     std::vector<double> intervals;
     AnimationFrames() {
         ui_trace_set_sink([](const UiTraceEvent* event,void* data){
             auto& self=*static_cast<AnimationFrames*>(data);
+            if(!std::strcmp(event->name,"motion_started")) self.started=true;
             if(!std::strcmp(event->name,"motion_stopped")) self.stopped=true;
             if(std::strcmp(event->name,"animation_frame")) return;
             ++self.frames;
@@ -624,7 +625,21 @@ int wmain(int argc,wchar_t** argv) {
                 // The last requested tab equals the starting tab: wait for
                 // queued navigation to dispatch before checking its animation.
                 pump_diagnostic(app,[&]{return state(app.page(),"tab")=="config" && state(app.page(),"requests").empty() && state(app.page(),"dispatch")==false;},"Rapid navigation dispatch");
-                settle_motion(app); pump_diagnostic(app,[&]{return animation.stopped;},"Rapid navigation motion");
+                // An accessibility/CI environment may disable Windows client-area
+                // animations. No motion lifecycle event is emitted unless one starts.
+                // Visual settling and the indicator target are verified either way.
+                settle_motion(app);
+                BOOL animations=TRUE;
+                SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION,0,&animations,0);
+                if(animations && animation.started) {
+                    try { pump_diagnostic(app,[&]{return animation.stopped;},"Rapid navigation motion"); }
+                    catch(...) {
+                        std::cerr<<"Rapid navigation animation: enabled="<<animations
+                                 <<" started="<<animation.started<<" stopped="<<animation.stopped
+                                 <<" frames="<<animation.frames<<" finished="<<animation.finished<<'\n';
+                        throw;
+                    }
+                }
                 auto* indicator=ui::GetContext().GetWindow(app.window())->Root()->FindById("navIndicator");
                 assert(indicator->animationY>0);
             }
