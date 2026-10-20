@@ -567,6 +567,7 @@ private:
     AnimatedFloat popupOpacity_{0.0f, 83.0f, EasingFunction::Linear};
     AnimatedFloat popupProgress_{0.0f, 167.0f, EasingFunction::FluentEnter};
     float itemHeight_ = 28.0f;
+    static constexpr float kDropdownPadding = 4.0f;
     static constexpr int kMaxVisibleRows = 12;
 };
 

@@ -1994,8 +1994,8 @@ ComboBoxWidget::DropdownLayout ComboBoxWidget::ComputeDropdownLayout_() const {
     const float aboveBottom = rect.top - gap;
     const float belowSpace = (std::max)(0.0f, vp.bottom - belowTop);
     const float aboveSpace = (std::max)(0.0f, aboveBottom - vp.top);
-    const int belowRows = static_cast<int>(std::floor(belowSpace / itemHeight_));
-    const int aboveRows = static_cast<int>(std::floor(aboveSpace / itemHeight_));
+    const int belowRows = static_cast<int>(std::floor((std::max)(0.0f, belowSpace - 2 * kDropdownPadding) / itemHeight_));
+    const int aboveRows = static_cast<int>(std::floor((std::max)(0.0f, aboveSpace - 2 * kDropdownPadding) / itemHeight_));
     const int desiredRows = (std::min)(totalRows, kMaxVisibleRows);
 
     DropdownLayout layout{};
@@ -2013,7 +2013,7 @@ ComboBoxWidget::DropdownLayout ComboBoxWidget::ComputeDropdownLayout_() const {
 
     if (layout.visibleRows <= 0) return layout;
 
-    const float height = layout.visibleRows * itemHeight_;
+    const float height = layout.visibleRows * itemHeight_ + 2 * kDropdownPadding;
     layout.rect = layout.opensUpward
         ? D2D1_RECT_F{rect.left, aboveBottom - height, rect.right, aboveBottom}
         : D2D1_RECT_F{rect.left, belowTop, rect.right, belowTop + height};
@@ -2085,8 +2085,9 @@ int ComboBoxWidget::DropdownItemAt(float x, float y) const {
         return -1;
     }
     y -= PopupOffset_(layout);
-    if (y < drop.top || y >= drop.bottom) return -1;
-    const int visibleRow = static_cast<int>((y - drop.top) / itemHeight_);
+    const float contentTop = drop.top + kDropdownPadding;
+    if (y < contentTop || y >= drop.bottom - kDropdownPadding) return -1;
+    const int visibleRow = static_cast<int>((y - contentTop) / itemHeight_);
     const int index = dropdownScrollIndex_ + visibleRow;
     return index >= 0 && index < (int)items_.size() ? index : -1;
 }
@@ -2155,7 +2156,7 @@ void ComboBoxWidget::OnDrawOverlay(Renderer& r) {
     const float labelRight = canScroll ? dropBg.right - 12.0f : dropBg.right - 4.0f;
     for (int row = 0; row < layout.visibleRows && dropdownScrollIndex_ + row < totalRows; ++row) {
         const int i = dropdownScrollIndex_ + row;
-        float iy = dropBg.top + itemHeight_ * row;
+        float iy = dropBg.top + kDropdownPadding + itemHeight_ * row;
         D2D1_RECT_F itemRect = {dropBg.left + 4, iy + 1, dropBg.right - 4, iy + itemHeight_ - 1};
 
         // Base background (e.g. to make items visually distinct from the
@@ -2236,8 +2237,13 @@ bool ComboBoxWidget::OnMouseUp(const MouseEvent& e) {
 }
 
 bool ComboBoxWidget::OnMouseWheel(const MouseEvent& e) {
-    if (!open_ || DropdownItemAt(e.x, e.y) < 0) return false;
+    if (!open_) return false;
     const auto layout = ComputeDropdownLayout_();
+    const auto& drop = layout.rect;
+    // The popup owns wheel input over its padding too; it must not reach the
+    // scroll pane behind it just because there is no selectable item here.
+    if (layout.visibleRows <= 0 || e.x < drop.left || e.x >= drop.right ||
+        e.y < drop.top || e.y >= drop.bottom) return false;
     const int maxScroll = (std::max)(0, (int)items_.size() - layout.visibleRows);
     if (maxScroll <= 0) return true;
 

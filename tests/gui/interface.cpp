@@ -196,7 +196,13 @@ void popup_motion(Application& app,const char* id,bool upward=false) {
         throw std::runtime_error("Expected popup to open upward");
     }
     if(animations) assert(animation.frames>1 && !animation.layout);
+    const int visibleRows=static_cast<int>((drop.bottom-drop.top)/combo->ItemHeight());
+    const float padding=((drop.bottom-drop.top)-visibleRows*combo->ItemHeight())/2;
+    float hoverX=(drop.left+drop.right)/2;
+    assert(ui_debug_mouse_move(app.window(),hoverX,drop.top+padding+combo->ItemHeight()/2)==0);
     screenshot(app,upward?L"dropdown-up.png":L"dropdown-down.png");
+    assert(ui_debug_mouse_move(app.window(),hoverX,drop.bottom-padding-combo->ItemHeight()/2)==0);
+    screenshot(app,upward?L"dropdown-up-last.png":L"dropdown-down-last.png");
     animation.stopped=false;
     assert(ui_debug_key(app.window(),VK_ESCAPE)==0);
     assert(!combo->IsOpen());
@@ -206,7 +212,7 @@ void popup_motion(Application& app,const char* id,bool upward=false) {
     assert(combo->IsOpen());
     pump([&]{return !combo->PopupAnimating() && (!animations || animation.stopped);},"Popup reversal");
     drop=combo->DropdownRect();
-    float x=(drop.left+drop.right)/2,y=drop.top+(combo->SelectedIndex()+0.5f)*combo->ItemHeight();
+    float x=(drop.left+drop.right)/2,y=drop.top+padding+(combo->SelectedIndex()+0.5f)*combo->ItemHeight();
     int selected=combo->DropdownItemAt(x,y); assert(selected==combo->SelectedIndex());
     animation.stopped=false;
     assert(ui_debug_mouse_down(app.window(),x,y)==0);
@@ -697,6 +703,10 @@ int wmain(int argc,wchar_t** argv) {
             click(app,"passwordSearch"); ui_debug_type_text(app.window(),L"pending scoped");
             pump([&]{return state(app.page(),"passwords")["total"]==1;});
             assert(state(app.page(),"passwords")["rows"][0]["scopes"]==utf8(pending_root.wstring()));
+            ui_debug_type_text(app.window(),L" no match");
+            pump([&]{return state(app.page(),"passwords")["total"]==0;});
+            screenshot(app,L"passwords-empty.png");
+            for(int i=0;i<9;++i) ui_debug_type_char(app.window(),8);
             for(int i=0;i<14;++i) ui_debug_type_char(app.window(),8);
             pump([&]{return state(app.page(),"passwords")["total"]==5;});
             ui_window_relayout(app.window());
@@ -714,6 +724,8 @@ int wmain(int argc,wchar_t** argv) {
             // rebase onto our own saved record rather than conflict with it.
             auto record=state(app.page(),"passwords")["rows"][0];
             click(app,("edit-password-"+record["id"].get<std::string>()).c_str());
+            screenshot(app,L"passwords-edit.png");
+            assert(!ui::GetContext().GetWindow(app.window())->Root()->FindById("password-"+record["id"].get<std::string>()));
             auto password_input=ui_widget_find_by_id(ui_page_root(app.page()),"passwordValue"); assert(password_input);
             ui_text_area_set_text(password_input,L""); ui_widget_destroy(password_input);
             click(app,"passwordValue"); ui_debug_type_text(app.window(),L"edited password");
@@ -734,8 +746,7 @@ int wmain(int argc,wchar_t** argv) {
             assert(state(app.page(),"passwordEditor")==true);
             assert(state(app.page(),"passwordValue")=="edited password latest");
             assert(read_json(dir/"builtin_passwords.json")["clipboard_history"]==history_before_delete);
-            record=state(app.page(),"passwords")["rows"][0];
-            click(app,("delete-password-"+record["id"].get<std::string>()).c_str()); finish_input(app);
+            click(app,"deletePassword"); finish_input(app);
             assert(read_json(dir/"builtin_passwords.json")["passwords"].size()==3);
             assert(state(app.page(),"passwordEditor")==false);
             click(app,"tabTasks"); pump([&]{return state(app.page(),"tab")=="tasks";});

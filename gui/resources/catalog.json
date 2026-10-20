@@ -148,10 +148,6 @@
       "zh": "删除目录",
       "en": "Remove folder"
     },
-    "noTasks": {
-      "zh": "没有符合筛选条件的任务。",
-      "en": "No matching tasks."
-    },
     "taskCount": {
       "zh": "个任务",
       "en": "tasks"
@@ -212,10 +208,6 @@
       "zh": "搜索配置名称或说明",
       "en": "Search settings and descriptions"
     },
-    "noSettings": {
-      "zh": "没有匹配的配置。",
-      "en": "No matching settings."
-    },
     "rounds": {
       "zh": "轮数（正整数）",
       "en": "Rounds (positive integer)"
@@ -227,10 +219,6 @@
     "passwordSearch": {
       "zh": "搜索密码",
       "en": "Search passwords"
-    },
-    "noPasswords": {
-      "zh": "没有匹配的密码。",
-      "en": "No matching passwords."
     },
     "editPassword": {
       "zh": "编辑密码",

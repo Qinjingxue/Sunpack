@@ -18,6 +18,7 @@ export default {
     errorList() { return Object.keys(this.errors).map(k=>k+': '+this.errors[k]); },
     shownDirectories() { let q=this.directoryQuery.toLowerCase(); return this.directories.filter(d=>d.watch&&d.path.toLowerCase().indexOf(q)>=0); },
     directoryCount() { return this.directories.filter(d=>d.watch).length; },
+    shownPasswords() { return this.passwordEditor&&this.passwordOriginal&&this.passwordScope==='@all'?this.passwords.rows.filter(p=>p.original!==this.passwordOriginal):this.passwords.rows; },
     chosenDirectory() { return this.directories.find(d=>d.watch&&d.path===this.taskRoot)||{path:'',effectiveOutput:''}; },
     categories() { let seen={}; return this.fields.filter(f=>{ if(seen[f.category]) return false; seen[f.category]=true; return true; }).map(f=>({id:f.category,label:f.categoryLabel})); },
     configBlocks() {
@@ -326,7 +327,6 @@ export default {
           <label class="muted">{{ texts.rootOutput }}</label><div class="input-row"><input id="rootOutput" class="fill" v-model="rootOutput" @blur="commitRoot()" @submit="commitRoot()"/><button id="browseOutput" @click="send('browse',{target:'rootOutput'})">{{ texts.chooseOutput }}</button></div>
           <label v-show="saveErrors['@roots']" class="error">{{ errorText(saveErrors['@roots']) }}</label><div class="action-row"><toggle id="rootDeepToggle" :checked="rootDeep" @change="v=>{rootDeep=v;commitRoot();}"/><label>{{ texts.deep }}</label><button id="finishRoot" v-show="!rootOriginal" @click="rootAction('save')">{{ texts.addToList }}</button><button v-show="rootOriginal" @click="rootAction('delete')">{{ texts.deleteRoot }}</button></div>
         </div>
-          <label v-show="tasks.total===0" class="muted">{{ texts.noTasks }}</label>
           <VirtualList id="taskItems" class="column" estimated-height="68px"><div v-for="t in tasks.rows" :key="t.id" :id="'task-'+t.id" :class="'task '+appearance">
             <div class="row"><button :id="'taskName-'+t.id" class="taskname" @click="send('openTask',{task:t})">{{ t.name }}</button><div class="spacer"/><label class="status" :class="'status-'+t.statusTone">{{ t.statusText }}</label></div>
             <div class="row task-meta"><label :id="'taskRoot-'+t.id" class="muted fill">{{ t.partCount ? texts.identifiedParts.replace('{count}',t.partCount)+' · ' : '' }}{{ texts.taskFolder }}{{ t.directory }}</label><label class="time">{{ t.time }}</label></div>
@@ -367,7 +367,6 @@ export default {
             </div>
           </div>
           </VirtualList>
-          <label v-show="matchingBlocks.length===0" class="muted">{{ texts.noSettings }}</label>
         </div></ScrollView>
       </div>
       <div id="page-passwords" v-show="tab==='passwords'" class="content">
@@ -377,12 +376,12 @@ export default {
         <ScrollView id="passwordListScroll"><div id="passwordBody" class="column">
           <div id="passwordForm" v-show="passwordEditor" class="card inline-form" :enabled="!!passwordOriginal||!recordSaving.passwords">
             <div class="row"><label class="subheading">{{ passwordOriginal?texts.editPassword:texts.addPasswords }}</label><div class="spacer"/><button id="closePasswordEditor" @click="leavePassword()">{{ texts.back }}</button></div>
-              <div class="composer-fields"><div class="composer-field"><label class="subheading">{{ texts.passwordText }}</label><textarea id="passwordValue" v-model="passwordValue" @blur="commitPassword()" class="password-input"/><label v-show="!passwordOriginal" class="muted">{{ texts.batchHint }}</label></div>
+              <div class="composer-fields"><div class="composer-field"><label class="subheading">{{ texts.passwordText }}</label><textarea id="passwordValue" v-model="passwordValue" @blur="commitPassword()" class="password-input"/><label class="muted">{{ texts.batchHint }}</label></div>
               <div class="composer-field"><label class="subheading">{{ texts.scopeLabel }}</label><textarea id="passwordScopes" v-model="scopeText" @blur="commitPassword()" class="password-input"/><label class="muted">{{ texts.scopeDescription }}</label></div></div>
               <label v-show="saveErrors['@passwords']" class="error">{{ errorText(saveErrors['@passwords']) }}</label><div class="action-row"><button id="browseScope" @click="send('browse',{target:'scopeText'})">{{ texts.chooseScope }}</button><button v-show="passwordOriginal &amp;&amp; scopeText" @click="passwordAction('global',{})">{{ texts.makeGlobal }}</button><button id="finishPassword" v-show="!passwordOriginal" @click="passwordAction('save')">{{ texts.addToList }}</button><button id="deletePassword" v-show="passwordOriginal" @click="passwordAction('delete')">{{ texts.deletePassword }}</button></div>
           </div>
-          <div :class="'history-list '+appearance"><label v-show="passwords.total===0" class="muted">{{ texts.noPasswords }}</label>
-            <VirtualList id="passwordItems" style="gap:0px" estimated-height="64px"><div v-for="p in passwords.rows" :key="p.id" :id="'password-'+p.id" class="history-entry">
+          <div v-show="shownPasswords.length>0" :class="'history-list '+appearance">
+            <VirtualList id="passwordItems" v-show="shownPasswords.length>0" style="gap:0px" estimated-height="64px"><div v-for="p in shownPasswords" :key="p.id" :id="'password-'+p.id" class="history-entry">
               <div class="row history-row" :class="'row history-row '+(passwordScope==='@all'?'password-row':'')"><div class="password-copy"><label>{{ p.value }}</label><label v-show="passwordScope==='@all'" class="muted scope-value">{{ texts.scopeLabel }} · {{ p.scopes||texts.allFolders }}</label></div><button v-show="passwordScope==='@history'" class="history-copy" :id="'copy-history-'+p.id" @click="editPassword(p)">{{ texts.copyPassword }}</button><button v-show="passwordScope==='@all'" :id="'edit-password-'+p.id" @click="editPassword(p)">{{ texts.edit }}</button><button v-show="passwordScope==='@all'" :id="'delete-password-'+p.id" :enabled="!recordSaving.passwords" @click="deleteListedPassword(p)">{{ texts.delete }}</button></div>
               <div class="history-divider"/>
             </div>
