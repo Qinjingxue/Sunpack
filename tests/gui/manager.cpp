@@ -316,11 +316,34 @@ void roots(Fixture& f) {
         log.accept(Json({{"event","done"},{"path",utf8((f.dir/std::to_wstring(i)/"file").wstring())},{"ts",i}}));
     }
     auto rows=task_rows(log,all,view); assert(rows["total"]==501 && rows["rows"].size()==501 && !rows.contains("pages"));
+    // Identical membership and ordering may reuse the previous UI state,
+    // without keeping a second JSON copy. A narrower filter must rebuild.
+    std::vector<std::wstring> first_ids, second_ids;
+    TaskProjectionStats phases;
+    auto first=task_rows(log,all,view,"zh",&first_ids,nullptr,&phases);
+    assert(first==rows && first_ids.size()==501 && phases.selected==501 && !phases.reused);
+    assert(task_rows(log,all,view,"zh",&second_ids,&first_ids,&phases).is_null());
+    assert(phases.reused && first_ids==second_ids);
+    view.task_query="file-no-match";
+    assert(task_rows(log,all,view,"zh",&second_ids,&first_ids,&phases)["total"]==0);
+    assert(!phases.reused);
+    view.task_query.clear();
     assert(directory_rows(all,Json::object()).size()==503);
     log.changed_keys.clear();
     auto changed_path=utf8((f.dir/L"0"/L"file").wstring());
     log.accept(Json{{"event","failed_terminal"},{"path",changed_path},{"ts",99999}});
     auto delta=task_delta(log,all,view);
+    // Cached formatting must follow actual task modifications even when the
+    // task's ordering sequence is not changed (regrouping is such a case).
+    auto cached_first=task_rows(log,all,view);
+    auto& changed=log.tasks.at(path_key(wide(changed_path)));
+    auto original_path=changed.path;
+    changed.path=utf8((f.dir/L"新名字"/"patched.zip").wstring());
+    changed.timestamp=1234;
+    auto cached_second=task_rows(log,all,view);
+    assert(cached_second["rows"][0]["directory"]==utf8((f.dir/L"新名字").wstring()));
+    assert(cached_second["rows"][0]["time"]!=cached_first["rows"][0]["time"]);
+    changed.path=original_path;
     auto latest=task_rows(log,all,view);
     assert(delta["changes"].size()==1 && latest["rows"][0]["status"]=="taskFailed");
     assert(delta["changes"][0]["row"]==latest["rows"][0]);
