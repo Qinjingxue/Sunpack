@@ -348,6 +348,12 @@ int wmain(int argc,wchar_t** argv) {
             options.cli={executable_path(),dir,{L"--fake-cli",gate_name}};
             Application app(options); std::cerr<<"Opening UI\n"; app.open(); std::cerr<<"UI opened\n";
             pump([&]{return state(app.page(),"ready")==true;});
+            // Direct QuickJS JSON parsing must reject malformed input without
+            // replacing an existing reactive list.
+            auto initial_tasks=state(app.page(),"tasks");
+            assert(ui_page_set_json(app.page(),"tasks","{invalid")!=0);
+            assert(state(app.page(),"tasks")==initial_tasks);
+            assert(ui_page_set_json(app.page(),"tasks",initial_tasks.dump().c_str())==0);
             pump([&]{return state(app.page(),"runtime")["known"]==true;});
             BOOL disabled=TRUE;
             if(SUCCEEDED(DwmGetWindowAttribute(static_cast<HWND>(ui_window_hwnd(app.window())),DWMWA_TRANSITIONS_FORCEDISABLED,&disabled,sizeof(disabled)))) assert(!disabled);
@@ -739,6 +745,11 @@ int wmain(int argc,wchar_t** argv) {
             assert(state(app.page(),"passwordEditor")==true);
             assert(parse_json(state(app.page(),"passwordOriginal").get<std::string>())["value"]=="edited password latest");
             assert(read_json(dir/"builtin_passwords.json")["passwords"][0]["value"]=="edited password latest");
+            auto projected_after_edit=state(app.page(),"passwords")["rows"];
+            assert(projected_after_edit.size()==saved_rows.size());
+            assert(projected_after_edit[0]["value"]=="edited password latest");
+            assert(projected_after_edit[0]["id"]==projected_after_edit[0]["original"].get<std::string>()+"#0");
+            assert(projected_after_edit[1]==saved_rows[1]); // untouched row retained by delta
             auto other=state(app.page(),"passwords")["rows"][1];
             auto history_before_delete=read_json(dir/"builtin_passwords.json")["clipboard_history"];
             click(app,("delete-password-"+other["id"].get<std::string>()).c_str()); finish_input(app);

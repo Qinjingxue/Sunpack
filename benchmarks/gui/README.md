@@ -56,7 +56,12 @@ password file with `passwords` saved records plus `history` clipboard entries, a
 * `wait_settled` fails after 5 s and prints the widget that keeps the settle predicate
   false, with a frame counter. Do not raise that timeout to hide a stall.
 
-## Baseline (2026-10-20, dev branch)
+## Baseline (2026-10-20, dev branch before GUI performance fixes)
+
+The measurements below are the **pre-optimization** baseline. Changes on the
+`fix/gui-benchmark-hotspots-20261020` branch require a Windows Release rerun
+before numerical speedup claims can be made. The benchmark and its workload
+remain unchanged for an apples-to-apples comparison.
 
 Windows 11 26200, i9-13980HX, 2560x1600 at 240 Hz and 150% DPI (surface 1680x1080), Release.
 

@@ -16,14 +16,17 @@ std::string trim(std::string s) {
     if (start == std::string::npos) return {};
     return s.substr(start, s.find_last_not_of(" \t\r\n") - start + 1);
 }
+// Search uses the same non-expanding Windows casing as path identity.
+std::wstring fold_search(const std::string& text) {
+    auto w=wide(text);
+    if(!w.empty()) CharLowerBuffW(w.data(),DWORD(w.size()));
+    return w;
+}
+bool contains_folded(const std::string& text, const std::wstring& folded_query) {
+    return folded_query.empty() || fold_search(text).find(folded_query)!=std::wstring::npos;
+}
 bool contains(const std::string& text, const std::string& query) {
-    // Search uses the same non-expanding Windows casing as path identity.
-    auto fold = [](std::string s) {
-        auto w = wide(s);
-        CharLowerBuffW(w.data(), DWORD(w.size()));
-        return w;
-    };
-    return query.empty() || fold(text).find(fold(query)) != std::wstring::npos;
+    return query.empty() || contains_folded(text,fold_search(query));
 }
 bool absolute_windows(const std::string& value) {
     auto p = wide(value); std::replace(p.begin(), p.end(), L'/', L'\\');
@@ -95,15 +98,29 @@ std::string text_at(HANDLE f, uint64_t offset, size_t count) {
     out.resize(got); return out;
 }
 bool terminal(const Task& task) { return task.status=="taskSucceeded" || task.status=="taskFailed"; }
-using RootIndex=std::vector<std::pair<std::wstring,std::string>>;
+// Longest directory-prefix match by walking up the task path, not by scanning
+// every watch root for every task. Normalized keys retain the existing NT
+// case-folding/UNC rules; trimming the final separator also handles C:\\ roots.
+using RootIndex=std::unordered_map<std::wstring,std::string>;
 RootIndex index_roots(const WatchRoots& roots) {
     RootIndex index; index.reserve(roots.entries.size());
-    for(auto& root:roots.entries) index.emplace_back(path_key(root.input),utf8(root.input.wstring()));
-    std::stable_sort(index.begin(),index.end(),[](auto& a,auto& b){return a.first.size()>b.first.size();});
+    for(const auto& root:roots.entries) {
+        auto key=path_key(root.input);
+        while(!key.empty() && (key.back()==L'\\' || key.back()==L'/')) key.pop_back();
+        index.emplace(std::move(key),utf8(root.input.wstring()));
+    }
     return index;
 }
 std::string indexed_root(const std::wstring& key,const RootIndex& index) {
-    for(auto& root:index) if(is_under(key,root.first)) return root.second;
+    std::wstring current=key;
+    while(!current.empty() && (current.back()==L'\\' || current.back()==L'/')) current.pop_back();
+    while(!current.empty()) {
+        auto found=index.find(current);
+        if(found!=index.end()) return found->second;
+        auto separator=current.find_last_of(L"\\/");
+        if(separator==std::wstring::npos) break;
+        current.resize(separator);
+    }
     return "@other";
 }
 std::optional<double> iso_timestamp(const std::string& text) {
@@ -377,10 +394,12 @@ void edit_root(const fs::path& p,const std::string& op,const std::string& origin
     FileMutex lock(p,L"SunPackWatchRoots");
     atomic_write(p,roots_text(apply_root_changes(read_roots(p),p.parent_path(),Json::array({Json{{"operation",op},{"original",original},{"input",input},{"output",output},{"deep",deep}}}))));
 }
-Json save_changes(const fs::path& dir,const Json& fields,const Json& passwords,const Json& roots) {
+Json save_changes(const fs::path& dir,const Json& fields,const Json& passwords,const Json& roots,
+    PasswordSaveSnapshot* password_snapshot) {
     Json result={{"saved",Json::array()},{"error",""},{"section",""}};
     struct Write { std::string section; fs::path path; std::string text; };
     std::vector<Write> writes;
+    Json committed_passwords;
     std::unique_ptr<FileMutex> config_lock,password_lock,roots_lock;
     std::string section;
     try {
@@ -389,10 +408,18 @@ Json save_changes(const fs::path& dir,const Json& fields,const Json& passwords,c
         if(!passwords.empty()) password_lock=std::make_unique<FileMutex>(dir/"builtin_passwords.json");
         if(!roots.empty()) roots_lock=std::make_unique<FileMutex>(dir/"sunpack_watch_roots.txt",L"SunPackWatchRoots");
         if(!fields.empty()) { section="config"; auto path=dir/"sunpack_config.json"; writes.push_back({section,path,patch_config(read_file(path),fields)}); }
-        if(!passwords.empty()) { section="passwords"; auto path=dir/"builtin_passwords.json"; writes.push_back({section,path,apply_password_changes(read_json(path),passwords).dump(2)+"\n"}); }
+        if(!passwords.empty()) {
+            section="passwords"; auto path=dir/"builtin_passwords.json";
+            committed_passwords=apply_password_changes(read_json(path),passwords);
+            writes.push_back({section,path,committed_passwords.dump(2)+"\n"});
+        }
         if(!roots.empty()) { section="roots"; auto path=dir/"sunpack_watch_roots.txt"; writes.push_back({section,path,roots_text(apply_root_changes(read_roots(path),dir,roots))}); }
         for(auto& write:writes) {
             section=write.section; atomic_write(write.path,write.text); result["saved"].push_back(section);
+            if(section=="passwords" && password_snapshot) {
+                password_snapshot->document=std::move(committed_passwords);
+                password_snapshot->file_text=std::move(write.text);
+            }
         }
     } catch(const ConfigEditError& error) { result["error"]=error.what(); result["section"]=section; result["field"]=error.pointer; }
     catch(const std::exception& error) { result["error"]=error.what(); result["section"]=section; }
@@ -577,18 +604,20 @@ Json project_task(const std::wstring& key,const Task& t,const RootIndex& roots,c
         {"path",t.path},{"root",indexed_root(key,roots)},{"status",t.status},{"statusText",tr(t.waiting_reason.empty()?t.status:t.waiting_reason,language)},{"partCount",t.multipart?t.members.size():0},{"time",task_time(t)},
         {"statusTone",tone},{"outputs",t.outputs},{"sortTimestamp",t.timestamp},{"sortSequence",t.sequence}};
 }
-bool task_matches(const Task& t,const std::wstring& key,const RootIndex& roots,const View& v) {
+bool task_matches(const Task& t,const std::wstring& key,const RootIndex& roots,const View& v,
+    const std::wstring& folded_query) {
     if(t.status.empty() || (!v.task_status.empty() && t.status!=v.task_status) ||
         (!v.task_root.empty() && indexed_root(key,roots)!=v.task_root)) return false;
-    if(contains(t.path,v.task_query) || contains(t.name,v.task_query)) return true;
-    return std::any_of(t.members.begin(),t.members.end(),[&](const auto& member){return contains(utf8(member),v.task_query);});
+    if(contains_folded(t.path,folded_query) || contains_folded(t.name,folded_query)) return true;
+    return std::any_of(t.members.begin(),t.members.end(),[&](const auto& member){return contains_folded(utf8(member),folded_query);});
 }
 }
 Json task_rows(const EventLog& log,const WatchRoots& roots,const View& v,const std::string& language) {
     const auto root_index=index_roots(roots);
+    const auto query=fold_search(v.task_query);
     using TaskEntry=decltype(log.tasks)::value_type;
     std::vector<const TaskEntry*> rows;
-    for(auto& pair:log.tasks) if(task_matches(pair.second,pair.first,root_index,v)) rows.push_back(&pair);
+    for(auto& pair:log.tasks) if(task_matches(pair.second,pair.first,root_index,v,query)) rows.push_back(&pair);
     std::sort(rows.begin(),rows.end(),[](const auto& a,const auto& b){
         if(a->second.timestamp!=b->second.timestamp) return a->second.timestamp>b->second.timestamp;
         return a->second.sequence>b->second.sequence;
@@ -599,11 +628,12 @@ Json task_rows(const EventLog& log,const WatchRoots& roots,const View& v,const s
 }
 Json task_delta(const EventLog& log,const WatchRoots& roots,const View& v,const std::string& language) {
     const auto root_index=index_roots(roots);
+    const auto query=fold_search(v.task_query);
     Json changes=Json::array();
     for(const auto& key:log.changed_keys) {
         Json change={{"id",utf8(key)}};
         auto it=log.tasks.find(key);
-        if(it!=log.tasks.end() && task_matches(it->second,key,root_index,v))
+        if(it!=log.tasks.end() && task_matches(it->second,key,root_index,v,query))
             change["row"]=project_task(key,it->second,root_index,language);
         changes.push_back(std::move(change));
     }

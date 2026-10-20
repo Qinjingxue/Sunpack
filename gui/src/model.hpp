@@ -24,9 +24,13 @@ void edit_root(const fs::path& path, const std::string& operation, const std::st
     const std::string& input, const std::string& output, bool deep);
 Json apply_password_changes(Json document, const Json& edits);
 WatchRoots apply_root_changes(WatchRoots roots, const fs::path& base, const Json& edits);
+// The saved document is already parsed while validating the write; return it
+// to the GUI instead of immediately re-reading and re-projecting the file.
+struct PasswordSaveSnapshot { Json document; std::string file_text; };
 // Preflight every file under the existing locks, then replace each file once.
 // A write failure reports completed sections so remaining drafts can be retried.
-Json save_changes(const fs::path& directory, const Json& fields, const Json& passwords, const Json& roots);
+Json save_changes(const fs::path& directory, const Json& fields, const Json& passwords,
+    const Json& roots, PasswordSaveSnapshot* password_snapshot = nullptr);
 std::string root_for(const fs::path& path, const WatchRoots& roots);
 struct Task {
     std::string path, name, status, waiting_reason;

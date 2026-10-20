@@ -403,12 +403,9 @@ void RenderThread::ThreadMain() {
             it->second->Matches(job->window)) {
             completedGenerations_[job->window.window_id] = job->generation;
             // HWND and its generation are checked again on the UI thread.
-            // No widget pointer crosses the thread boundary; the final frame
-            // carries animate=false, ending the loop without an idle wakeup.
-            if (job->animate && renderResult == RenderFrameResult::Presented)
-                PostMessageW(job->hwnd, kUiCoreAnimationFrameMessage,
-                             static_cast<WPARAM>(job->window.window_id),
-                             static_cast<LPARAM>(job->window.hwnd_generation));
+            // UI's animation-only 16 ms timer now owns frame pacing. Do not
+            // post a second frame per Present: that bypasses the 60 fps cap,
+            // and a Skipped/Prepared result could otherwise strand motion.
             if (renderResult == RenderFrameResult::Presented && resources_.DeviceLost()) {
                 resources_.MarkDeviceRecovered();
                 TraceEvent("render_thread", "device_recovered",

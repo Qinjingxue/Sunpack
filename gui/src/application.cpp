@@ -92,6 +92,8 @@ void Application::publish(Json patch) {
     // Preserve all deltas while an earlier UI update is still pending.
     // A later full snapshot supersedes previous incremental updates.
     if(patch.contains("tasks")) pending_.erase("taskDelta");
+    if(patch.contains("passwords")) pending_.erase("passwordDelta");
+    if(patch.contains("passwordDelta") && pending_.contains("passwords")) patch.erase("passwordDelta");
     if(patch.contains("taskDelta") && pending_.contains("taskDelta")) {
         for(auto& change:patch["taskDelta"]["changes"])
             pending_["taskDelta"]["changes"].push_back(std::move(change));
@@ -265,6 +267,7 @@ void Application::apply_pending() {
     auto transition=patch.value("viewTransition",Json::object()); patch.erase("viewTransition");
     auto reset_scroll=patch.value("resetScroll",Json::array()); patch.erase("resetScroll");
     auto task_delta_patch=patch.value("taskDelta",Json()); patch.erase("taskDelta");
+    auto password_delta_patch=patch.value("passwordDelta",Json()); patch.erase("passwordDelta");
     VisualBatch visual(window_);
     auto ack=patch.value("saveAck",Json()); patch.erase("saveAck");
     if(patch.contains("fields")) bind_controls(patch["fields"]);
@@ -277,6 +280,11 @@ void Application::apply_pending() {
         auto encoded=task_delta_patch.dump();
         if(ui_page_call_json(page_,"applyTaskDelta",encoded.c_str())!=0)
             throw std::runtime_error("taskBindingFailed");
+    }
+    if(!password_delta_patch.is_null()) {
+        auto encoded=password_delta_patch.dump();
+        if(ui_page_call_json(page_,"applyPasswordDelta",encoded.c_str())!=0)
+            throw std::runtime_error("passwordBindingFailed");
     }
     if(patch.contains("fields")) {
         auto drafts=page_value(page_,"drafts");
@@ -325,7 +333,8 @@ void Application::navigate(const std::string& tab) {
     motion::finish(window_,("page-"+page_value(page_,"tab").get<std::string>()).c_str());
     set_text(page_,"tab",tab);
     set_text(page_,"actionError","");
-    ui_window_relayout(window_);
+    // Tab targets retain fixed sidebar geometry; reactive tab visibility already
+    // schedules layout. Avoid forcing an extra full-tree layout on every switch.
     motion::enter(window_,("page-"+tab).c_str());
     motion::select(window_,"navIndicator",tab=="tasks"?"tabTasks":tab=="config"?"tabConfig":"tabPasswords");
 }
@@ -700,6 +709,7 @@ void Application::work() {
             }
             bool tasks_changed=false,passwords_changed=false,dirs_changed=false,config_changed=false;
             bool task_delta_eligible=true;
+            Json password_delta;
             Json edit_feedback=Json::object();
             if(!data_watcher || !data_watcher->alive() || (!data_watcher->direct() && fs::is_directory(dir))) {
                 try {
@@ -719,6 +729,7 @@ void Application::work() {
                         view.task_status=p.value("status",std::string()); tasks_changed=true;
                         if(switch_root) edit_feedback["viewTransition"]={{"id","taskBody"},{"y",12}};
                     } else if(op=="filterPasswords") {
+                        password_delta=Json(); // Filter changes require the whole result set.
                         if(!edit_feedback.contains("resetScroll")) edit_feedback["resetScroll"]=Json::array();
                         edit_feedback["resetScroll"].push_back("passwordListScroll");
                         auto scope=p.value("scope",std::string("@all"));
@@ -727,12 +738,37 @@ void Application::work() {
                         passwords_changed=true;
                     } else if(op=="commit") {
                         auto kind=p.at("kind").get<std::string>();
+                        PasswordSaveSnapshot saved_passwords;
                         auto result=save_changes(dir,p.value("fields",Json::array()),
                             kind=="passwords"?Json::array({p.at("edit")}):Json::array(),
-                            kind=="roots"?Json::array({p.at("edit")}):Json::array());
+                            kind=="roots"?Json::array({p.at("edit")}):Json::array(),
+                            kind=="passwords"?&saved_passwords:nullptr);
                         for(auto& section:result["saved"]) {
                             if(section=="config") flags|=Config;
-                            if(section=="passwords") { flags|=Passwords; passwords_changed=dirs_changed=true; }
+                            if(section=="passwords") {
+                                // The atomic write already validated and built this snapshot.
+                                // Under the single-writer GUI contract there is no need to
+                                // parse the same file again after our own rename notification.
+                                passwords=std::move(saved_passwords.document);
+                                last_passwords=std::move(saved_passwords.file_text);
+                                passwords_read=true;
+                                flags&=~Passwords;
+                                retries.erase(Passwords);
+                                // A single replacement preserves ordering and filtered count
+                                // in the unfiltered saved-password view.
+                                const auto& edit=p.at("edit");
+                                if(edit.value("operation",std::string())=="replace" &&
+                                   view.password_query.empty() && view.password_scope=="@all" &&
+                                   !passwords_changed && previous_patch.contains("passwords")) {
+                                    Json record={{"value",edit.value("value",std::string())}};
+                                    auto scopes=edit.value("scopes",Json::array());
+                                    if(!scopes.empty()) record["scopes"]=std::move(scopes);
+                                    auto projected=password_rows(Json{{"passwords",Json::array({std::move(record)})}},view,language);
+                                    if(!projected["rows"].empty())
+                                        password_delta={{"original",edit.at("original")},{"row",projected["rows"][0]}};
+                                } else password_delta=Json();
+                                passwords_changed=true;
+                            }
                             if(section=="roots") { flags|=Roots; tasks_changed=dirs_changed=true; task_delta_eligible=false; }
                         }
                         auto message=result["error"].get<std::string>();
@@ -814,7 +850,11 @@ void Application::work() {
                     patch["taskDelta"]=task_delta(log,roots,view,language);
                 else patch["tasks"]=task_rows(log,roots,view,language);
             }
-            if(passwords_changed || language_changed || !previous_patch.contains("passwords")) patch["passwords"]=password_rows(passwords,view,language);
+            if(passwords_changed || language_changed || !previous_patch.contains("passwords")) {
+                if(!password_delta.is_null() && !language_changed && previous_patch.contains("passwords"))
+                    patch["passwordDelta"]=std::move(password_delta);
+                else patch["passwords"]=password_rows(passwords,view,language);
+            }
             if(config_changed || language_changed || !previous_patch.contains("fields")) patch["fields"]=config_fields(config,last_config,language);
             if(dirs_changed || !previous_patch.contains("directories")) patch["directories"]=directory_rows(roots,config);
             if(flags&Startup || !previous_patch.contains("startup")) {
@@ -825,11 +865,11 @@ void Application::work() {
             for(auto it=errors.begin();it!=errors.end();++it) displayed_errors[tr(it.key(),language)]=translated_error(it.value().get<std::string>(),language);
             patch["errors"]=std::move(displayed_errors); patch["logPath"]=utf8(log.path().wstring()); patch["ready"]=true;
             Json changed_patch=Json::object();
-            for(auto it=patch.begin();it!=patch.end();++it) if(!previous_patch.contains(it.key()) || it.key()=="tasks" || it.key()=="passwords" || it.key()=="taskDelta" || previous_patch[it.key()]!=it.value()) {
+            for(auto it=patch.begin();it!=patch.end();++it) if(!previous_patch.contains(it.key()) || it.key()=="tasks" || it.key()=="passwords" || it.key()=="taskDelta" || it.key()=="passwordDelta" || previous_patch[it.key()]!=it.value()) {
                 // These projections are generated only after source/filter
                 // changes. Keep an initialization marker, not a second full
                 // resident copy of the task/password list.
-                previous_patch[it.key()]=(it.key()=="tasks" || it.key()=="passwords" || it.key()=="taskDelta")?Json():it.value();
+                previous_patch[it.key()]=(it.key()=="tasks" || it.key()=="passwords" || it.key()=="taskDelta" || it.key()=="passwordDelta")?Json():it.value();
                 changed_patch[it.key()]=std::move(it.value());
             }
             changed_patch.update(edit_feedback);

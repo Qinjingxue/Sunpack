@@ -1138,14 +1138,11 @@ bool UiWindowImpl::HasAnimationFrameWork() const {
 void UiWindowImpl::EnsureAnimationTimer() {
     if (!hwnd_ || toggleAnimTimerRunning_ || !HasAnimationFrameWork()) return;
     if (!IsWindowVisible(hwnd_) || IsIconic(hwnd_)) return;
-    // The existing render thread paces visible motion by VSync and posts the
-    // next frame only after presentation. Keep the legacy timer as a fallback
-    // before a render surface is ready, without changing system timer precision.
-    if (renderThreadPresentActive_ && renderWindowId_.IsValid()) {
-        toggleAnimTimerRunning_ = true;
-        TraceEvent("core_window", "motion_started");
-        return;
-    }
+    // Drive motion with a real, animation-only timer (approximately 60 fps).
+    // Render-thread callbacks alone can stop after a skipped/prepared present,
+    // leaving a mid-flight animation with no further messages. A timer also
+    // prevents 240 Hz screens from rendering decorative motion at 240 fps.
+    // StopAnimationTimer kills it as soon as the last animation finishes.
     if (SetTimer(hwnd_, kToggleAnimTimerId, kToggleAnimIntervalMs, nullptr) != 0) {
         toggleAnimTimerRunning_ = true;
         TraceEvent("core_window", "motion_started");
