@@ -27,11 +27,15 @@ FetchContent_MakeAvailable(json)
 add_library(sunpack_gui_data STATIC src/platform.cpp src/model.cpp src/presentation.cpp
   ../native/third_party/lz4/xxhash.c)
 target_include_directories(sunpack_gui_data PUBLIC src PRIVATE ../native/third_party/lz4)
+# Enable MSVC /GL for the GUI data library in Release builds only.
+set_property(TARGET sunpack_gui_data PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
 target_link_libraries(sunpack_gui_data PUBLIC nlohmann_json::nlohmann_json
   shell32 ole32 advapi32 ntdll)
 ui_core_embed_text(sunpack_gui_data FILE resources/catalog.json OUT catalog_json.h VAR kCatalogJson)
 add_executable(SunPackGUI WIN32 src/main.cpp src/application.cpp src/motion.cpp resources/app.rc)
 target_include_directories(SunPackGUI PRIVATE "${core_ui_SOURCE_DIR}/src")
+# Enable MSVC /GL + /LTCG for the shipped GUI executable in Release builds only.
+set_property(TARGET SunPackGUI PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
 target_link_libraries(SunPackGUI PRIVATE sunpack_gui_data core-ui comctl32)
 ui_core_embed_text(SunPackGUI FILE resources/main.uix OUT main_uix.h VAR kMainUix)
 target_link_options(SunPackGUI PRIVATE /OPT:REF /OPT:ICF
