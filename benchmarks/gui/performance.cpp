@@ -1,4 +1,5 @@
 #include "application.hpp"
+#include "presentation.hpp"
 #include "gui_perf_defaults.h"
 #include <ui/ui_context.h>
 #include <ui/ui_window.h>
@@ -11,12 +12,14 @@
 #include <cmath>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <iomanip>
 #include <iostream>
 #include <map>
 #include <mutex>
 #include <numeric>
 #include <sstream>
+#include <thread>
 #include <vector>
 
 using namespace spg;
@@ -165,6 +168,30 @@ size_t widget_count(const ui::Widget* w) {
 size_t widget_count(Application& app) {
     auto window=ui::GetContext().GetWindow(app.window());
     return window?widget_count(window->Root().get()):0;
+}
+// Status label text of a currently mounted task row, or empty when the row is
+// not in the virtual list's mounted range. Cheaper than serializing tasks state.
+std::wstring row_status_text(Application& app,const std::string& row_id) {
+    auto* row=widget(app,("task-"+row_id).c_str());
+    if(!row) return {};
+    const std::wstring* found=nullptr;
+    std::function<void(ui::Widget*)> walk=[&](ui::Widget* w) {
+        if(found || !w) return;
+        if(auto* label=dynamic_cast<ui::LabelWidget*>(w)) {
+            for(auto& name:w->classList) if(name=="status") { found=&label->Text(); return; }
+        }
+        for(auto& child:w->Children()) walk(child.get());
+    };
+    walk(row);
+    return found?*found:std::wstring{};
+}
+void append_log_lines(const fs::path& path,const std::string& text) {
+    Handle file(CreateFileW(path.c_str(),FILE_APPEND_DATA,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
+        nullptr,OPEN_ALWAYS,FILE_ATTRIBUTE_NORMAL,nullptr));
+    if(file.value==INVALID_HANDLE_VALUE) win_error("opAppendLog");
+    DWORD written=0;
+    if(!WriteFile(file,text.data(),DWORD(text.size()),&written,nullptr) || written!=text.size())
+        win_error("opAppendLog");
 }
 void click(Application& app,const char* id) {
     auto* w=widget(app,id); if(!w) throw std::runtime_error(std::string("Missing widget: ")+id);
@@ -498,6 +525,70 @@ int wmain(int argc,wchar_t** argv) {
             scroll_list(app,"passwordListScroll","passwordItems",options.rounds,report);
 
             nav("tabTasks","tasks");
+            // The task list is sorted by timestamp, so the rows that receive new
+            // log events stay on top and remain mounted while the worker applies
+            // the update. Reset the scroll range so the target row is mounted.
+            auto task_scroll_top=ui_widget_find_by_id(ui_page_root(app.page()),"taskListScroll");
+            if(task_scroll_top) { ui_debug_scroll_set(task_scroll_top,0); ui_widget_destroy(task_scroll_top); ui_window_relayout(app.window()); }
+            pump_messages(); wait_settled(app);
+            auto task_snapshot=page_state(app.page(),"tasks");
+            ensure(task_snapshot["rows"].size()==options.tasks,"task rows before log updates");
+            std::vector<std::string> log_paths,log_ids;
+            for(size_t i=0;i<std::min<size_t>(40,task_snapshot["rows"].size());++i) {
+                log_paths.push_back(task_snapshot["rows"][i]["path"].get<std::string>());
+                log_ids.push_back(task_snapshot["rows"][i]["id"].get<std::string>());
+            }
+            ensure(widget(app,("task-"+log_ids[0]).c_str()),"target task row not mounted");
+            const auto benchmark_log=dir/".sunpack_watch"/"events.jsonl";
+            double log_stamp=1e7;
+            auto log_line=[&](const char* type,const std::string& path,double stamp) {
+                Json event={{"event",type},{"path",path},{"time","2026-10-19T09:15:42.731112+00:00"},
+                    {"ts",stamp},{"output_dirs",Json::array({"."})}};
+                return event.dump()+"\n";
+            };
+            auto status_text=[](const char* key){return wide(tr(key,"en"));};
+            // One event: worker refresh + one-row delta + one mounted row rebind.
+            measure("log_update_single",[&]{
+                append_log_lines(benchmark_log,log_line("processing_started",log_paths[0],log_stamp+=1));
+                wait_for([&]{return row_status_text(app,log_ids[0])==status_text("taskProcessing");},
+                    "single log update",10000,1);
+            });
+            // Ten changed tasks in one write: still a delta (under the 32-key cap).
+            measure("log_update_delta_10",[&]{
+                std::string text;
+                for(size_t i=1;i<std::min<size_t>(10,log_paths.size());++i)
+                    text+=log_line("done",log_paths[i],log_stamp+=1);
+                text+=log_line("done",log_paths[0],log_stamp+=1); // target stays the newest row
+                append_log_lines(benchmark_log,text);
+                wait_for([&]{return row_status_text(app,log_ids[0])==status_text("taskSucceeded");},
+                    "10-row log delta",10000,1);
+            });
+            // Forty changed tasks exceed the worker's 32-key delta cap, so the
+            // worker must project and publish the full task snapshot.
+            measure("log_update_overflow_40",[&]{
+                std::string text;
+                for(size_t i=1;i<log_paths.size();++i)
+                    text+=log_line("done",log_paths[i],log_stamp+=1);
+                text+=log_line("processing_started",log_paths[0],log_stamp+=1);
+                append_log_lines(benchmark_log,text);
+                wait_for([&]{return row_status_text(app,log_ids[0])==status_text("taskProcessing");},
+                    "40-row log overflow",20000,1);
+            });
+            // A writer thread appends every ~1 ms while the UI consumes updates.
+            // Only the final event yields taskFailed, so the wait cannot finish early.
+            std::thread log_stream([&]{
+                double stamp=log_stamp+1000;
+                for(int i=0;i<200;++i) {
+                    append_log_lines(benchmark_log,log_line(i%2?"processing_started":"done",log_paths[0],++stamp));
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+                append_log_lines(benchmark_log,log_line("failed_terminal",log_paths[0],++stamp));
+            });
+            measure("log_update_stream_200",[&]{
+                wait_for([&]{return row_status_text(app,log_ids[0])==status_text("taskFailed");},
+                    "200-event log stream",30000,1);
+            });
+            log_stream.join();
             click(app,"taskSearch");
             ui_debug_key_mod(app.window(),'A',1,0,0); ui_debug_type_char(app.window(),8);
             const size_t target=options.tasks-1;
