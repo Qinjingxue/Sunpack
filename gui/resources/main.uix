@@ -17,7 +17,6 @@ export default {
     passwordDirty() { return this.passwordEditor&&(this.passwordOriginal?JSON.stringify({value:this.passwordValue,scopes:this.scopeText})!==this.passwordBaseline:this.passwordValue.length>0); },
     errorList() { return Object.keys(this.errors).map(k=>k+': '+this.errors[k]); },
     shownDirectories() { let q=this.directoryQuery.toLowerCase(); return this.directories.filter(d=>d.watch&&d.path.toLowerCase().indexOf(q)>=0); },
-    directoryCount() { return this.directories.filter(d=>d.watch).length; },
     shownPasswords() { return this.passwordEditor&&this.passwordOriginal&&this.passwordScope==='@all'?this.passwords.rows.filter(p=>p.original!==this.passwordOriginal):this.passwords.rows; },
     chosenDirectory() { return this.directories.find(d=>d.watch&&d.path===this.taskRoot)||{path:'',effectiveOutput:''}; },
     categories() { let seen={}; return this.fields.filter(f=>{ if(seen[f.category]) return false; seen[f.category]=true; return true; }).map(f=>({id:f.category,label:f.categoryLabel})); },
@@ -44,22 +43,30 @@ export default {
     searchConfig(value) { this.configQuery=value; this.send('scrollTop',{id:'configBlocks'}); },
     searchTasks(value) { this.taskQuery=value; this.filterTasks(); },
     applyTaskDelta(patch) {
-      // Shallow-copy row references, rather than serialize all task objects.
-      // A new array identity invalidates any position-based height estimates.
-      let rows=this.tasks.rows.slice();
-      for(let change of patch.changes) {
-        let old=rows.findIndex(t=>t.id===change.id);
-        if(old>=0) rows.splice(old,1);
-        if(!change.row) continue;
-        let row=change.row,lo=0,hi=rows.length;
-        while(lo<hi) {
-          let mid=(lo+hi)>>1,other=rows[mid];
-          if(other.sortTimestamp>row.sortTimestamp || (other.sortTimestamp===row.sortTimestamp && other.sortSequence>row.sortSequence)) lo=mid+1;
-          else hi=mid;
-        }
-        rows.splice(lo,0,row);
+      // Log bursts can update many rows at once. Collapse duplicate IDs, filter
+      // removed/replaced rows in one pass, then merge the sorted additions;
+      // repeated findIndex + splice shifted the full list once per change.
+      if(!patch.changes.length) { this.tasks.malformed=patch.malformed; return; }
+      let updates=new Map(),order=0;
+      for(let change of patch.changes) updates.set(change.id,{row:change.row||null,order:order++});
+      let rows=this.tasks.rows.filter(row=>!updates.has(row.id));
+      let added=[];
+      updates.forEach(update=>{ if(update.row) added.push(update); });
+      added.sort((a,b)=>{
+        if(a.row.sortTimestamp!==b.row.sortTimestamp) return a.row.sortTimestamp>b.row.sortTimestamp?-1:1;
+        if(a.row.sortSequence!==b.row.sortSequence) return a.row.sortSequence>b.row.sortSequence?-1:1;
+        return b.order-a.order;
+      });
+      let merged=[],i=0,j=0;
+      while(i<rows.length&&j<added.length) {
+        let old=rows[i],next=added[j].row;
+        let oldBefore=old.sortTimestamp>next.sortTimestamp ||
+          (old.sortTimestamp===next.sortTimestamp && old.sortSequence>next.sortSequence);
+        if(oldBefore) merged.push(rows[i++]); else merged.push(added[j++].row);
       }
-      this.tasks={rows:rows,total:rows.length,malformed:patch.malformed};
+      while(i<rows.length) merged.push(rows[i++]);
+      while(j<added.length) merged.push(added[j++].row);
+      this.tasks={rows:merged,total:merged.length,malformed:patch.malformed};
     },
     searchPasswords(value) { this.passwordQuery=value; this.filterPasswords(); },
     filterTasks() { this.send('filterTasks',{query:this.taskQuery,root:this.taskRoot,status:this.statusNames[this.taskStatus]||''}); },
@@ -299,7 +306,7 @@ export default {
       </div>
       <div id="directoryPane" v-show="tab==='tasks'" class="directory-pane">
         <div class="directory-tools">
-        <div class="row"><label class="subheading fill">{{ texts.roots }}</label><label class="muted">{{ directoryCount }}</label><button id="newRoot" @click="editRoot(null)">{{ texts.addRoot }}</button></div>
+        <div class="row"><label class="subheading fill">{{ texts.roots }}</label><button id="newRoot" @click="editRoot(null)">{{ texts.addRoot }}</button></div>
         <input id="directorySearch" type="search" class="search-field" :placeholder="texts.searchDirectory" :value="directoryQuery" @input="searchDirectory"/>
         <button id="allRoots" :class="!taskRoot?'context-item on':'context-item'" @click="selectRoot('')"><label>{{ texts.allDirectories }}</label></button>
         </div>
