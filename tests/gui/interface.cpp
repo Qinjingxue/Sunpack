@@ -69,6 +69,26 @@ void pump(const std::function<bool()>& condition, const char* phase="UI event", 
         while(PeekMessageW(&message,nullptr,0,0,PM_REMOVE)) { if(message.message==WM_QUIT || (!allow_timers && message.message==WM_TIMER)) continue; TranslateMessage(&message); DispatchMessageW(&message); }
     }
 }
+// Print a state snapshot only if a UI wait fails; successful waits retain the
+// original message pump, timeout and scheduling behavior.
+void pump_diagnostic(Application& app,const std::function<bool()>& condition,const char* phase) {
+    try { pump(condition,phase); }
+    catch(...) {
+        std::cerr<<"UI wait diagnostic ["<<phase<<"]";
+        for(const char* key:{"tab","taskQuery","taskRoot","taskStatus","requests","dispatch",
+                             "errors","logPath","actionError","busy","lastCommand"}) {
+            try { std::cerr<<" "<<key<<"="<<state(app.page(),key).dump(); }
+            catch(const std::exception& e) { std::cerr<<" "<<key<<"=<unavailable: "<<e.what()<<">"; }
+        }
+        try {
+            auto tasks=state(app.page(),"tasks");
+            std::cerr<<" tasks.total="<<tasks.value("total",-1)
+                     <<" tasks.malformed="<<tasks.value("malformed",0);
+        } catch(const std::exception& e) { std::cerr<<" tasks=<unavailable: "<<e.what()<<">"; }
+        std::cerr<<'\n';
+        throw;
+    }
+}
 void settle_motion(Application& app) {
     Json pending;
     try { pump([&] {
@@ -290,7 +310,7 @@ void drag_after_wheel(Application& app) {
     // scrollbar overlaps the visible page, but must never receive pointer input.
     ui_window_set_size(app.window(),850,560);
     click(app,"tabConfig");
-    pump([&]{return state(app.page(),"tab")=="config";});
+    pump_diagnostic(app,[&]{return state(app.page(),"tab")=="config";},"Scrollbar test: navigate to settings");
     settle_motion(app);
     auto root=ui::GetContext().GetWindow(app.window())->Root();
     auto* active=dynamic_cast<ui::ScrollViewWidget*>(root->FindById("configListScroll"));
@@ -325,7 +345,7 @@ void drag_after_wheel(Application& app) {
         assert(active->ScrollY()==released && hidden->ScrollY()==hidden_y);
     }
     ui_widget_destroy(scroll);
-    click(app,"tabTasks"); pump([&]{return state(app.page(),"tab")=="tasks";});
+    click(app,"tabTasks"); pump_diagnostic(app,[&]{return state(app.page(),"tab")=="tasks";},"Scrollbar test: navigate to tasks");
     settle_motion(app);
     ui_window_set_size(app.window(),1120,720);
 }
@@ -418,7 +438,7 @@ int wmain(int argc,wchar_t** argv) {
             const char* phases[]={"processing_started","failed_terminal","suspended_missing_volume","done"};
             for(int i=0;i<512;++i) many+=Json({{"event",phases[i%4]},{"path",utf8((dir/"history"/("task-"+std::to_string(i)+".001")).wstring())},{"time","2026-10-19T09:15:42.731112+00:00"},{"output_dirs",{utf8(dir.wstring())}}}).dump()+"\n";
             atomic_write(dir/".sunpack_watch"/"events.jsonl",many);
-            pump([&]{return state(app.page(),"tasks")["total"]==512;});
+            pump_diagnostic(app,[&]{return state(app.page(),"tasks")["total"]==512;},"Load 512 tasks");
             virtual_tail(app,"taskItems","taskListScroll",512);
             auto tail=state(app.page(),"tasks")["rows"][511];
             tail["sortTimestamp"]=1e12;
@@ -502,20 +522,20 @@ int wmain(int argc,wchar_t** argv) {
             ui_debug_pump();
             drag_after_wheel(app);
             atomic_write(dir/".sunpack_watch"/"events.jsonl",Json({{"event","done"},{"path",utf8((dir/"carrier.001").wstring())}}).dump()+"\n");
-            pump([&]{return state(app.page(),"tasks")["total"]==1;});
+            pump_diagnostic(app,[&]{return state(app.page(),"tasks")["total"]==1;},"Log replacement");
             assert(!state(app.page(),"texts").contains("otherTasks"));
             assert(rect(app,"allRoots").top>=rect(app,"directorySearch").bottom);
             click(app,"taskSearch"); ui_debug_type_text(app.window(),L"missing");
-            try { pump([&]{return state(app.page(),"tasks")["total"]==0;}); }
+            try { pump_diagnostic(app,[&]{return state(app.page(),"tasks")["total"]==0;},"Task search filter"); }
             catch(...) { std::cerr<<"Search tasks: "<<state(app.page(),"taskQuery")<<" requests="<<state(app.page(),"requests")<<" error="<<ui_page_last_error(app.page())<<"\n"; screenshot(app,L"search-failed.png"); throw; }
             for(int i=0;i<7;++i) ui_debug_type_char(app.window(),8);
-            try { pump([&]{return state(app.page(),"tasks")["total"]==1;}); }
+            try { pump_diagnostic(app,[&]{return state(app.page(),"tasks")["total"]==1;},"Clear task search"); }
             catch(...) { std::cerr<<"Clear tasks: "<<state(app.page(),"taskQuery")<<"\n"; throw; }
             auto status=ui_widget_find_by_id(ui_page_root(app.page()),"taskStatus"); assert(status);
             assert(ui_debug_combo_select(app.window(),status,1)==0);
-            pump([&]{return state(app.page(),"tasks")["total"]==0;});
+            pump_diagnostic(app,[&]{return state(app.page(),"tasks")["total"]==0;},"Task status filter");
             assert(ui_debug_combo_select(app.window(),status,0)==0);
-            pump([&]{return state(app.page(),"tasks")["total"]==1;});
+            pump_diagnostic(app,[&]{return state(app.page(),"tasks")["total"]==1;},"Clear status filter");
             // The status selector handle belongs to Application, like themeSelector.
             assert(!ui_widget_find_by_id(ui_page_root(app.page()),"filterTasks"));
             assert(!ui_widget_find_by_id(ui_page_root(app.page()),"saveAll"));
@@ -531,10 +551,10 @@ int wmain(int argc,wchar_t** argv) {
             assert(directory_bounds.left>=navigation_bounds.left && directory_bounds.right<=navigation_bounds.right);
             assert(task_bounds.left>=navigation_bounds.right);
             click(app,"watchStart");
-            pump([&]{return state(app.page(),"lastCommand").value("action",std::string())=="start";});
+            pump_diagnostic(app,[&]{return state(app.page(),"lastCommand").value("action",std::string())=="start";},"Watch start command");
             assert(read_json(dir/"cli-arguments.json")==Json::array({"watch","start"}));
             assert(state(app.page(),"actionError")=="");
-            pump([&]{return state(app.page(),"runtime")["known"]==true;});
+            pump_diagnostic(app,[&]{return state(app.page(),"runtime")["known"]==true;},"Runtime status");
             assert(!ui_widget_find_by_id(ui_page_root(app.page()),"refresh"));
             auto stable_commands=[&](const char* id,const std::string& action,const Json& args) {
                 auto tab=state(app.page(),"tab").get<std::string>();
@@ -548,14 +568,14 @@ int wmain(int argc,wchar_t** argv) {
                 ui_window_relayout(app.window());
                 auto during=ui_widget_get_rect(page);
                 assert(during.left==rect.left && during.top==rect.top && during.right==rect.right && during.bottom==rect.bottom);
-                pump([&]{return state(app.page(),"busy")==true && read_json(dir/"cli-arguments.json")==args;});
+                pump_diagnostic(app,[&]{return state(app.page(),"busy")==true && read_json(dir/"cli-arguments.json")==args;},"CLI request dispatch");
                 if(ui_widget_get_opacity(page)<0.999f || ui_debug_widget_is_visible(page)!=1) {
                     std::cerr<<"Command visibility: "<<id<<" opacity="<<ui_widget_get_opacity(page)<<" visible="<<ui_debug_widget_is_visible(page)<<"\n";
                     screenshot(app,L"command-visibility.png");
                     throw std::runtime_error("Command changed page visibility");
                 }
                 SetEvent(gate);
-                pump([&]{return state(app.page(),"lastCommand").value("action",std::string())==action && state(app.page(),"busy")==false;});
+                pump_diagnostic(app,[&]{return state(app.page(),"lastCommand").value("action",std::string())==action && state(app.page(),"busy")==false;},"CLI command completion");
                 assert(read_json(dir/"cli-arguments.json")==args);
                 assert(state(app.page(),"actionError")=="");
                 auto after=ui_widget_get_rect(page);
@@ -563,18 +583,18 @@ int wmain(int argc,wchar_t** argv) {
                 assert(ui_widget_get_opacity(page)>=0.999f && ui_debug_widget_is_visible(page)==1);
                 ui_widget_destroy(page);
             };
-            click(app,"tabPasswords"); pump([&]{return state(app.page(),"tab")=="passwords";});
+            click(app,"tabPasswords"); pump_diagnostic(app,[&]{return state(app.page(),"tab")=="passwords";},"Navigate to passwords");
             settle_motion(app);
             assert(rect(app,"monitorControls").top==monitor_bounds.top);
             stable_commands("watchStop","stop",Json::array({"watch","stop"}));
-            click(app,"tabConfig"); pump([&]{return state(app.page(),"tab")=="config";});
+            click(app,"tabConfig"); pump_diagnostic(app,[&]{return state(app.page(),"tab")=="config";},"Navigate to settings");
             settle_motion(app);
             assert(rect(app,"monitorControls").top==monitor_bounds.top);
             stable_commands("watchStart","start",Json::array({"watch","start"}));
-            click(app,"tabConfig"); pump([&]{return state(app.page(),"tab")=="config";});
+            click(app,"tabConfig"); pump_diagnostic(app,[&]{return state(app.page(),"tab")=="config";},"Navigate to settings");
             auto content=ui_widget_find_by_id(ui_page_root(app.page()),"page-config");
             assert(content && ui_widget_get_opacity(content)>0); // No blank incoming frame.
-            pump([&]{return ui_widget_get_opacity(content)>=0.999f;}); ui_widget_destroy(content);
+            pump_diagnostic(app,[&]{return ui_widget_get_opacity(content)>=0.999f;},"Settings page opacity"); ui_widget_destroy(content);
             {
                 // Navigation must finish at the latest selection even when
                 // interrupted; the indicator travels rather than blinking.
@@ -582,8 +602,8 @@ int wmain(int argc,wchar_t** argv) {
                 click(app,"tabPasswords"); click(app,"tabTasks"); click(app,"tabConfig");
                 // The last requested tab equals the starting tab: wait for
                 // queued navigation to dispatch before checking its animation.
-                pump([&]{return state(app.page(),"tab")=="config" && state(app.page(),"requests").empty() && state(app.page(),"dispatch")==false;});
-                settle_motion(app); pump([&]{return animation.stopped;});
+                pump_diagnostic(app,[&]{return state(app.page(),"tab")=="config" && state(app.page(),"requests").empty() && state(app.page(),"dispatch")==false;},"Rapid navigation dispatch");
+                settle_motion(app); pump_diagnostic(app,[&]{return animation.stopped;},"Rapid navigation motion");
                 auto* indicator=ui::GetContext().GetWindow(app.window())->Root()->FindById("navIndicator");
                 assert(indicator->animationY>0);
             }
