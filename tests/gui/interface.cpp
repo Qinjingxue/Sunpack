@@ -94,7 +94,8 @@ void pump_diagnostic(Application& app,const std::function<bool()>& condition,con
 // (a different view may still be animating). Reduced-motion environments are
 // allowed to change the value immediately with no animation trace at all.
 void await_toggle_motion(Application& app,const char* id,bool animations,
-                         const AnimationFrames& trace,const char* phase) {
+                         const AnimationFrames& trace,const char* phase,
+                         bool requireMultipleFrames=false) {
     auto* window=ui::GetContext().GetWindow(app.window());
     auto current=[&] { return dynamic_cast<ui::ToggleWidget*>(window->Root()->FindById(id)); };
     auto diagnostics=[&] {
@@ -119,7 +120,9 @@ void await_toggle_motion(Application& app,const char* id,bool animations,
     };
     try {
         pump([&]{auto* toggle=current(); return toggle && (!animations || !toggle->Animating());},phase);
-        if(animations && (trace.frames<2 || trace.layout))
+        // A 167 ms switch slide should take more than one frame; 83 ms hover
+        // feedback can complete in a single frame on a loaded CI runner.
+        if(animations && (trace.layout || (requireMultipleFrames && trace.frames<2)))
             throw std::runtime_error(std::string(phase)+": unexpected paint-frame trace");
     } catch(...) {
         diagnostics();
@@ -846,7 +849,7 @@ int wmain(int argc,wchar_t** argv) {
                 assert(ui_debug_toggle_set(app.window(),toast,0)==0);
                 native=dynamic_cast<ui::ToggleWidget*>(ui::GetContext().GetWindow(app.window())->Root()->FindById("toggle-/watch/toast_enabled"));
                 assert(native && !native->On());
-                await_toggle_motion(app,"toggle-/watch/toast_enabled",animations!=FALSE,animation,"Toggle motion");
+                await_toggle_motion(app,"toggle-/watch/toast_enabled",animations!=FALSE,animation,"Toggle motion",true);
             }
             finish_input(app);
             // Auto-save can refresh the filtered field while the pointer is
