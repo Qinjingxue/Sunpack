@@ -214,6 +214,13 @@ jobs:
         shell: pwsh
         run: |
           .\scripts\setup_windows_dev.ps1 -Arch ${{ matrix.arch }} -SkipAcceptanceTestTools -BootstrapOnly
+          if ($LASTEXITCODE -ne 0) { throw 'Windows bootstrap failed' }
+          # Reuse the pinned CMake/Python executables in later workflow steps.
+          $venvScripts = Join-Path $PWD '.venv\Scripts'
+          if (-not (Test-Path -LiteralPath (Join-Path $venvScripts 'cmake.exe'))) {
+            throw 'Pinned CMake binary was not installed'
+          }
+          $venvScripts >> $env:GITHUB_PATH
 
       - name: Restore GUI build cache
         id: gui-cache
