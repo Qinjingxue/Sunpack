@@ -113,6 +113,17 @@ jobs:
           enable-cache: true
           cache-dependency-glob: uv.lock
 
+      - name: Prepare isolated GUI Python and CMake toolchain
+        shell: pwsh
+        run: |
+          uv sync --locked --extra dev
+          if ($LASTEXITCODE -ne 0) { throw 'GUI Python dependencies failed' }
+          $venvScripts = Join-Path $PWD '.venv\Scripts'
+          if (-not (Test-Path -LiteralPath (Join-Path $venvScripts 'cmake.exe'))) {
+            throw 'Pinned GUI CMake binary not installed'
+          }
+          $venvScripts >> $env:GITHUB_PATH
+
       - name: Restore GUI build cache
         id: gui-cache
         uses: ./.github/actions/gui-cache

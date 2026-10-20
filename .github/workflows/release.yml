@@ -202,13 +202,6 @@ jobs:
           python-version: ${{ matrix.python_version }}
           source-key: ${{ hashFiles('native/**', 'scripts/**', '!scripts/build_gui.ps1', 'sunpack.manifest') }}
 
-      - name: Restore GUI build cache
-        id: gui-cache
-        uses: ./.github/actions/gui-cache
-        with:
-          arch: ${{ matrix.arch }}
-          source-key: ${{ hashFiles('gui/**', 'tests/gui/**', 'scripts/build_gui.ps1', 'scripts/restore_native_cache_times.ps1', 'sunpack.manifest', 'sunpack_advanced_config.json', 'native/third_party/lz4/**') }}
-
       - name: Restore Nuitka compiler cache
         uses: actions/cache@v4
         with:
@@ -221,6 +214,13 @@ jobs:
         shell: pwsh
         run: |
           .\scripts\setup_windows_dev.ps1 -Arch ${{ matrix.arch }} -SkipAcceptanceTestTools -BootstrapOnly
+
+      - name: Restore GUI build cache
+        id: gui-cache
+        uses: ./.github/actions/gui-cache
+        with:
+          arch: ${{ matrix.arch }}
+          source-key: ${{ hashFiles('gui/**', 'tests/gui/**', 'scripts/build_gui.ps1', 'scripts/restore_native_cache_times.ps1', 'sunpack.manifest', 'sunpack_advanced_config.json', 'native/third_party/lz4/**') }}
 
       - name: Show toolchain architecture
         shell: pwsh
