@@ -103,18 +103,18 @@ RootIndex index_roots(const WatchRoots& roots) {
     RootIndex index; index.reserve(roots.entries.size());
     for(const auto& root:roots.entries) {
         auto key=path_key(root.input);
-        while(!key.empty() && (key.back()==L'\\\\' || key.back()==L'/')) key.pop_back();
+        while(!key.empty() && (key.back()==L'\\' || key.back()==L'/')) key.pop_back();
         index.emplace(std::move(key),utf8(root.input.wstring()));
     }
     return index;
 }
 std::string indexed_root(const std::wstring& key,const RootIndex& index) {
     std::wstring current=key;
-    while(!current.empty() && (current.back()==L'\\\\' || current.back()==L'/')) current.pop_back();
+    while(!current.empty() && (current.back()==L'\\' || current.back()==L'/')) current.pop_back();
     while(!current.empty()) {
         auto found=index.find(current);
         if(found!=index.end()) return found->second;
-        auto separator=current.find_last_of(L"\\\\/");
+        auto separator=current.find_last_of(L"\\/");
         if(separator==std::wstring::npos) break;
         current.resize(separator);
     }
