@@ -295,6 +295,14 @@ void roots(Fixture& f) {
     auto all=read_roots(p); assert(all.entries.size()==2);
     assert(root_for(nested/"x.bin",all)==utf8(nested.wstring()));
     assert(root_for(f.dir/"Data2"/"x.bin",all)==utf8(f.dir.wstring()));
+    // The nearest path-component root wins even with hundreds of unrelated
+    // roots; sibling prefixes must never match each other.
+    WatchRoots prefix_roots;
+    prefix_roots.entries={{f.dir,"",false},{nested,"",false},{f.dir/"Data2","",false}};
+    assert(root_for(nested/"deep"/"part.zip",prefix_roots)==utf8(nested.wstring()));
+    assert(root_for(f.dir/"Data2"/"part.zip",prefix_roots)==utf8((f.dir/"Data2").wstring()));
+    assert(root_for(f.dir/"Data20"/"part.zip",prefix_roots)==utf8(f.dir.wstring()));
+    assert(root_for(f.dir.parent_path()/"untracked.zip",prefix_roots)=="@other");
     fails([&]{edit_root(p,"save","",utf8(nested.wstring()),"",false);});
     edit_root(p,"delete",utf8(nested.wstring()),utf8(nested.wstring()),"",false);
     assert(read_file(p).find("# 保留注释")!=std::string::npos);
@@ -350,9 +358,23 @@ void batch_editing(Fixture& fixture) {
     }
     auto retry=save_changes(dir,Json::array(),Json::array(),root);
     assert(retry["error"]=="" && retry["saved"]==Json::array({"roots"}));
+    // Successful commits expose their already-validated on-disk snapshot.
+    // A failed preflight must never report a committed snapshot.
+    PasswordSaveSnapshot failed_snapshot;
+    Json bad_password=Json::array({Json{{"operation","replace"},{"original","{\"value\":\"not found\"}"},{"value","bad"},{"scopes",Json::array()}}});
+    auto rejected_password=save_changes(dir,Json::array(),bad_password,Json::array(),&failed_snapshot);
+    assert(rejected_password["saved"].empty() && failed_snapshot.document.is_null());
+    PasswordSaveSnapshot snapshot;
+    Json updated_password=Json::array({Json{{"operation","replace"},
+        {"original",Json{{"value","changed"},{"scopes",{utf8(dir.wstring())}}}.dump()},
+        {"value","fast-delta"},{"scopes",{utf8(dir.wstring())}}}});
+    auto committed=save_changes(dir,Json::array(),updated_password,Json::array(),&snapshot);
+    assert(committed["error"]=="" && committed["saved"]==Json::array({"passwords"}));
+    assert(snapshot.document==read_json(passwords) && snapshot.file_text==read_file(passwords));
+    assert(snapshot.document["passwords"][0]["value"]=="fast-delta");
     assert(read_file(config).find("123456789012345678901234567890")!=std::string::npos);
     assert(read_json(config)["watch"]["toast_enabled"]==false);
-    assert(read_json(passwords)["passwords"][0]["value"]=="changed");
+    assert(read_json(passwords)["passwords"][0]["value"]=="fast-delta");
     assert(read_json(passwords)["clipboard_history"][0]=="latest background history");
     assert(read_roots(roots).entries[0].deep && read_file(roots).find("# retained")!=std::string::npos);
     // Batch folder additions preflight together and ignore identical duplicates.
