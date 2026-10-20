@@ -1103,7 +1103,7 @@ if ($runAcceptanceTests) {
 
 Write-Step "Building Core UI management panel"
 $guiBuildDir = Join-Path $repoRoot (".cache\gui-" + $buildArch)
-& (Join-Path $repoRoot "scripts\build_gui.ps1") -Arch $buildArch -CMakeCommand $cmakeCommand -BuildDir $guiBuildDir -Jobs $BuildJobs -SkipTests:$SkipTests
+& (Join-Path $repoRoot "scripts\build_gui.ps1") -Arch $buildArch -CMakeCommand $cmakeCommand -BuildDir $guiBuildDir -Jobs $BuildJobs -SkipTests:$SkipTests -ApplicationOnly:$SkipTests
 
 Write-Step "Building Windows release with Nuitka"
     $nuitkaEntryRoot = Join-Path $nuitkaBuildRoot "entries"

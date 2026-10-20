@@ -90,6 +90,45 @@ void pump_diagnostic(Application& app,const std::function<bool()>& condition,con
         throw;
     }
 }
+// Wait on the switch that was changed, rather than on all window animations
+// (a different view may still be animating). Reduced-motion environments are
+// allowed to change the value immediately with no animation trace at all.
+void await_toggle_motion(Application& app,const char* id,bool animations,
+                         const AnimationFrames& trace,const char* phase,
+                         bool requireMultipleFrames=false) {
+    auto* window=ui::GetContext().GetWindow(app.window());
+    auto current=[&] { return dynamic_cast<ui::ToggleWidget*>(window->Root()->FindById(id)); };
+    auto diagnostics=[&] {
+        auto* toggle=current();
+        std::cerr<<"Toggle diagnostic ["<<phase<<"] id="<<id
+                 <<" clientAnimations="<<animations
+                 <<" found="<<(toggle!=nullptr)
+                 <<" on="<<(toggle?int(toggle->On()):-1)
+                 <<" animating="<<(toggle?int(toggle->Animating()):-1)
+                 <<" trace.started="<<trace.started
+                 <<" trace.finished="<<trace.finished
+                 <<" trace.stopped="<<trace.stopped
+                 <<" trace.frames="<<trace.frames
+                 <<" trace.layout="<<trace.layout;
+        try {
+            std::cerr<<" drafts="<<state(app.page(),"toggleDrafts").dump()
+                     <<" pending="<<state(app.page(),"pendingFields").dump()
+                     <<" saving="<<state(app.page(),"saving").dump()
+                     <<" errors="<<state(app.page(),"saveErrors").dump();
+        } catch(const std::exception& e) { std::cerr<<" diagnosticError="<<e.what(); }
+        std::cerr<<'\n';
+    };
+    try {
+        pump([&]{auto* toggle=current(); return toggle && (!animations || !toggle->Animating());},phase);
+        // A 167 ms switch slide should take more than one frame; 83 ms hover
+        // feedback can complete in a single frame on a loaded CI runner.
+        if(animations && (trace.layout || (requireMultipleFrames && trace.frames<2)))
+            throw std::runtime_error(std::string(phase)+": unexpected paint-frame trace");
+    } catch(...) {
+        diagnostics();
+        throw;
+    }
+}
 void settle_motion(Application& app) {
     Json pending;
     try { pump([&] {
@@ -801,10 +840,16 @@ int wmain(int argc,wchar_t** argv) {
             assert(state(app.page(),"toggleDrafts").size()==1 && state(app.page(),"drafts").empty());
             assert(ui_debug_toggle_set(app.window(),toast,1)==0);
             {
-            AnimationFrames animation;
-            assert(ui_debug_toggle_set(app.window(),toast,0)==0);
-            pump([&]{return animation.finished && animation.stopped;},"Toggle motion");
-            assert(animation.frames>1 && !animation.layout);
+                BOOL animations=TRUE;
+                if(!SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION,0,&animations,0))
+                    throw std::runtime_error("Cannot query Windows client-area animation setting");
+                auto* native=dynamic_cast<ui::ToggleWidget*>(ui::GetContext().GetWindow(app.window())->Root()->FindById("toggle-/watch/toast_enabled"));
+                assert(native && native->On()); // A no-op SetOn(false) cannot start motion.
+                AnimationFrames animation;
+                assert(ui_debug_toggle_set(app.window(),toast,0)==0);
+                native=dynamic_cast<ui::ToggleWidget*>(ui::GetContext().GetWindow(app.window())->Root()->FindById("toggle-/watch/toast_enabled"));
+                assert(native && !native->On());
+                await_toggle_motion(app,"toggle-/watch/toast_enabled",animations!=FALSE,animation,"Toggle motion",true);
             }
             finish_input(app);
             // Auto-save can refresh the filtered field while the pointer is
@@ -815,17 +860,19 @@ int wmain(int argc,wchar_t** argv) {
                 AnimationFrames animation;
                 auto bounds=ui_widget_get_rect(toast);
                 float x=(bounds.left+bounds.right)/2,y=(bounds.top+bounds.bottom)/2;
+                BOOL animations=TRUE;
+                if(!SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION,0,&animations,0))
+                    throw std::runtime_error("Cannot query Windows client-area animation setting");
                 assert(ui_debug_mouse_move(app.window(),x,y)==0);
-                pump([&]{return animation.finished && animation.stopped;},"Toggle hover");
-                animation.finished=animation.stopped=false;
+                await_toggle_motion(app,"toggle-/watch/toast_enabled",animations!=FALSE,animation,"Toggle hover");
+                animation.finished=animation.stopped=false; animation.frames=0; animation.layout=false;
                 assert(ui_debug_mouse_down(app.window(),x,y)==0);
-                pump([&]{return animation.finished && animation.stopped;},"Toggle press");
+                await_toggle_motion(app,"toggle-/watch/toast_enabled",animations!=FALSE,animation,"Toggle press");
                 assert(ui_debug_mouse_up(app.window(),x,y)==0);
-                    assert(ui_debug_key(app.window(),VK_SPACE)==0);
-                    animation.finished=animation.stopped=false;
+                assert(ui_debug_key(app.window(),VK_SPACE)==0);
+                animation.finished=animation.stopped=false; animation.frames=0; animation.layout=false;
                 assert(ui_debug_mouse_move(app.window(),0,0)==0);
-                pump([&]{return animation.finished && animation.stopped;},"Toggle release");
-                assert(!animation.layout);
+                await_toggle_motion(app,"toggle-/watch/toast_enabled",animations!=FALSE,animation,"Toggle release");
             }
             ui_widget_destroy(toast);
             click(app,"tabTasks"); // Rapid navigation must not overwrite automatic writes.

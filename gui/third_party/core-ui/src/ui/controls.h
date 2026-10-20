@@ -731,6 +731,8 @@ public:
     }
 
     bool On() const { return on_; }
+    // The GUI integration test observes this switch, not other window motion.
+    bool Animating() const { return animating_; }
     const std::wstring& Text() const { return text_; }
     void SetText(const std::wstring& t) { text_ = t; ui::RequestLayout(); }
     void SetOn(bool v);
