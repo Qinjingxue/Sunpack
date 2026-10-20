@@ -68,6 +68,17 @@ export default {
       while(j<added.length) merged.push(added[j++].row);
       this.tasks={rows:merged,total:merged.length,malformed:patch.malformed};
     },
+    applyPasswordDelta(patch) {
+      // The writer already committed a verified replacement. Keep the rest of
+      // the saved-password list (and its mounted virtual rows) intact.
+      let rows=this.passwords.rows.slice();
+      let i=rows.findIndex(row=>row.original===patch.original);
+      if(i<0) { this.filterPasswords(); return; } // Recover from stale UI state.
+      let replacement=patch.row;
+      replacement.id=replacement.original+'#'+i;
+      rows[i]=replacement;
+      this.passwords={rows:rows,total:rows.length};
+    },
     searchPasswords(value) { this.passwordQuery=value; this.filterPasswords(); },
     filterTasks() { this.send('filterTasks',{query:this.taskQuery,root:this.taskRoot,status:this.statusNames[this.taskStatus]||''}); },
     selectRoot(path) { if(this.rootOriginal&&this.rootDirty) { this.rootAction('save',{taskRoot:path,rootEditor:false}); return; } this.taskRoot=path; this.filterTasks(); },
