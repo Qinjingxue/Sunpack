@@ -17,6 +17,11 @@ Local changes:
   updates reuse cached list data and existing iteration bindings; unmount
   disposes callbacks, effects and closures. Wheel input supplies the text
   measurer for newly mounted rows.
+- Preserve measured virtual row heights by iteration key across array
+  replacements, including autosave receipts and file notifications. Remapping
+  uses temporary indices derived from the existing JS snapshots, retaining no
+  additional item/key cache. Surviving visible keys anchor list reorders;
+  mounted rows still remeasure actual content changes during normal layout.
 
 - Add opt-in `immutable-items="true"` to VirtualList. Lists that replace changed
   row objects keep untouched rows' binding effects instead of disposing and

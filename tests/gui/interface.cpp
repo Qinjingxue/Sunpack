@@ -272,12 +272,92 @@ void virtual_tail(Application& app,const char* list_id,const char* scroll_id,siz
         const auto& last=list->Children().back()->rect;
         auto viewport=scroll->rect;
         assert(last.top<viewport.bottom && last.bottom<=viewport.bottom+2);
+        if(visit==0) {
+            // A file watcher/save receipt replaces arrays even when row keys
+            // and geometry are unchanged. Check the scrolled view, not only
+            // reachability after resetting it to the top.
+            auto before=scroll->ScrollY(), height=list->SizeHint().height;
+            auto anchor=list->Children().back()->id;
+            auto top=list->Children().back()->rect.top;
+            const char* data_key=!std::strcmp(list_id,"configItems")?"fields":
+                !std::strcmp(list_id,"directoryItems")?"directories":
+                !std::strcmp(list_id,"passwordItems")?"passwords":"tasks";
+            auto replacement=state(app.page(),data_key).dump();
+            assert(ui_page_set_json(app.page(),data_key,replacement.c_str())==0);
+            ui_window_relayout(app.window());
+            auto* row=list->FindById(anchor);
+            if(!row || std::abs(scroll->ScrollY()-before)>0.5f ||
+               std::abs(list->SizeHint().height-height)>0.5f || std::abs(row->rect.top-top)>0.5f)
+                throw std::runtime_error(std::string("Data refresh moved virtual view: ")+list_id);
+            if(!std::strcmp(list_id,"taskItems")) {
+                auto reordered=state(app.page(),data_key);
+                auto first=reordered["rows"][0];
+                reordered["rows"].erase(reordered["rows"].begin());
+                reordered["rows"].push_back(first);
+                auto encoded=reordered.dump();
+                assert(ui_page_set_json(app.page(),data_key,encoded.c_str())==0);
+                ui_window_relayout(app.window());
+                row=list->FindById(anchor);
+                assert(row && std::abs(row->rect.top-top)<0.5f && scroll->ScrollY()<before);
+                assert(ui_page_set_json(app.page(),data_key,replacement.c_str())==0);
+                ui_window_relayout(app.window());
+                row=list->FindById(anchor);
+                assert(row && std::abs(row->rect.top-top)<0.5f && std::abs(scroll->ScrollY()-before)<0.5f);
+            }
+        }
         scroll_to(0);
         if(list->Indices().empty() || list->Indices().front()!=0 || list->Children().size()>=40) {
             std::cerr<<"Virtual top "<<list_id<<" indices="; for(auto index:list->Indices()) std::cerr<<index<<","; std::cerr<<" rect="<<list->rect.top<<","<<list->rect.bottom<<" scroll="<<rendered_widget(app,scroll_id)<<"\n";
         }
         assert(!list->Indices().empty() && list->Indices().front()==0 && list->Children().size()<40);
     }
+}
+void scrolled_config_edits(Application& app) {
+    auto* window=ui::GetContext().GetWindow(app.window());
+    auto* scroll=dynamic_cast<ui::ScrollViewWidget*>(window->Root()->FindById("configListScroll")); assert(scroll);
+    for(auto id:{"/filesystem/scan_filters/0/enabled","/filesystem/scan_filters/0/prune_dir_globs","/runtime/process_mode"}) {
+        const std::string pointer=id;
+        const std::string control=(pointer.find("enabled")!=std::string::npos?"toggle-":
+            pointer.find("prune_dir_globs")!=std::string::npos?"lines-":"select-")+pointer;
+        window->ScrollWithMeasureContext(scroll,0);
+        // Visit preceding rows through the real measured scrolling path.
+        for(int pass=0;pass<200 && !window->Root()->FindById(control);++pass) {
+            window->ScrollWithMeasureContext(scroll,scroll->ScrollY()+200);
+            ui_window_relayout(app.window());
+        }
+        click(app,control.c_str());
+        ui_window_relayout(app.window());
+        assert(scroll->ScrollY()>0);
+        const auto before=scroll->ScrollY(), top=rect(app,"field-"+pointer).top;
+        auto unchanged=[&] {
+            ui_window_relayout(app.window());
+            if(std::abs(scroll->ScrollY()-before)>0.5f || std::abs(rect(app,"field-"+pointer).top-top)>0.5f)
+                throw std::runtime_error("Editing moved configuration viewport: "+pointer);
+        };
+        auto handle=ui_widget_find_by_id(ui_page_root(app.page()),control.c_str()); assert(handle);
+        if(control.find("toggle-")==0) assert(ui_debug_toggle_set(app.window(),handle,0)==0);
+        else if(control.find("lines-")==0) {
+            assert(ui_debug_key_mod(app.window(),'A',1,0,0)==0);
+            assert(ui_debug_type_text(app.window(),L".git\nnode_modules\nskipped-directory")==0);
+        } else {
+            assert(ui_debug_key(app.window(),VK_ESCAPE)==0);
+            assert(ui_debug_combo_select(app.window(),handle,2)==0);
+        }
+        ui_widget_destroy(handle);
+        unchanged(); // Includes typing before blur or a save acknowledgement.
+        finish_input(app);
+        pump([&] {
+            for(auto& field:state(app.page(),"fields")) if(field["id"]==pointer) {
+                if(control.find("toggle-")==0) return field["boolean"]==false;
+                if(control.find("lines-")==0) return field["text"]==".git\nnode_modules\nskipped-directory";
+                return field["text"]=="high";
+            }
+            return false;
+        },"Scrolled configuration save notification");
+        unchanged();
+    }
+    window->ScrollWithMeasureContext(scroll,0);
+    ui_window_relayout(app.window());
 }
 void resize_tasks(Application& app) {
     settle_motion(app);
@@ -987,6 +1067,7 @@ int wmain(int argc,wchar_t** argv) {
             auto startup_before=rect(app,"startupToggle");
             auto config_scroll=ui_widget_find_by_id(ui_page_root(app.page()),"configListScroll"); assert(config_scroll);
             virtual_tail(app,"configItems","configListScroll",state(app.page(),"matchingBlocks").size());
+            scrolled_config_edits(app);
             ui_window_relayout(app.window()); button_texts(app);
             auto startup_after=rect(app,"startupToggle");
             assert(startup_before.right-startup_before.left==startup_after.right-startup_after.left);

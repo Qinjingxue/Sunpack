@@ -2429,20 +2429,47 @@ void VirtualListWidget::MeasureRow(size_t index, float height) {
     for (size_t i = index + 1; i < sums_.size(); i += i & -i) sums_[i] += delta;
 }
 
-void VirtualListWidget::InvalidateHeights() {
-    heights_.clear(); sums_.clear();
+void VirtualListWidget::RebuildSums() {
+    sums_.assign(heights_.size() + 1, 0);
+    // Linear construction; no per-item widgets, closures, or event hooks.
+    for (size_t i = 1; i < sums_.size(); ++i) {
+        sums_[i] += heights_[i - 1];
+        size_t parent = i + (i & -i);
+        if (parent < sums_.size()) sums_[parent] += sums_[i];
+    }
+}
+
+void VirtualListWidget::RemapRows(const std::vector<size_t>& previousIndices) {
+    bool unchanged = previousIndices.size() == heights_.size();
+    for (size_t i = 0; unchanged && i < previousIndices.size(); ++i)
+        unchanged = previousIndices[i] == i;
+    if (unchanged) return;
+
+    auto* ancestor = Parent();
+    while (ancestor && !dynamic_cast<ScrollViewWidget*>(ancestor)) ancestor = ancestor->Parent();
+    auto* scroll = dynamic_cast<ScrollViewWidget*>(ancestor);
+    const size_t anchor = scroll ? RowAt(std::max(0.0f, scroll->rect.top - rect.top - padT)) : 0;
+    const float before = Sum(anchor);
+    size_t nextAnchor = previousIndices.size();
+    std::vector<float> next(previousIndices.size(), std::max(1.0f, estimatedHeight + gap_));
+    for (size_t i = 0; i < previousIndices.size(); ++i) {
+        const size_t old = previousIndices[i];
+        if (old < heights_.size()) next[i] = heights_[old];
+        if (old == anchor && old < heights_.size()) nextAnchor = i;
+    }
+    heights_ = std::move(next);
+    RebuildSums();
+    // A surviving visible key keeps its screen position across insert/reorder.
+    // Lists below the viewport must not move the surrounding page.
+    if (scroll && scroll->rect.top >= rect.top + padT && nextAnchor < heights_.size())
+        scroll->CorrectVirtualAnchor(Sum(nextAnchor) - before);
+    ui::RequestLayout();
 }
 
 void VirtualListWidget::SetCount(size_t count) {
     if (heights_.size() != count) {
         heights_.resize(count, std::max(1.0f, estimatedHeight + gap_));
-        sums_.assign(count + 1, 0);
-        // Linear construction; no per-item widgets, closures, or event hooks.
-        for (size_t i = 1; i <= count; ++i) {
-            sums_[i] += heights_[i - 1];
-            size_t parent = i + (i & -i);
-            if (parent <= count) sums_[parent] += sums_[i];
-        }
+        RebuildSums();
         ui::RequestLayout();
     }
     RefreshViewport();
