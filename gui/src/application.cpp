@@ -328,8 +328,10 @@ void Application::apply_pending() {
 void Application::navigate(const std::string& tab) {
     if(tab!="tasks" && tab!="config" && tab!="passwords") return;
     if(page_value(page_,"tab")==tab) return;
-    ui_window_focus_widget(window_,0);
+    // Focus loss may publish its own input/blur repaint. Begin the visual
+    // transaction first, so that repaint coalesces with the page switch.
     VisualBatch visual(window_);
+    ui_window_focus_widget(window_,0);
     motion::finish(window_,("page-"+page_value(page_,"tab").get<std::string>()).c_str());
     set_text(page_,"tab",tab);
     set_text(page_,"actionError","");
