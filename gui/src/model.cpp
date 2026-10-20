@@ -1,4 +1,5 @@
 #include "model.hpp"
+#include "range_editor.hpp"
 #include "presentation.hpp"
 #include <algorithm>
 #include <chrono>
@@ -757,6 +758,18 @@ Json config_fields(const Json& config,const std::string& source,const std::strin
         if(editor=="recursive" && choice<0) choice=2;
         field.update(Json{{"id",pointer},{"key",pointer+"@"+language},{"type",type},{"original",raw},{"text",text},{"boolean",item.is_boolean()?item.get<bool>():false},
             {"editor",editor},{"choice",choice},{"items",lines?item:Json::array()}});
+        if(editor=="size_range" || editor=="datetime_range") {
+            field["key"]=pointer+"@"+language+"@"+editor;
+            field["range"]=range_editor(text,editor=="datetime_range");
+            // Explicit aliases still intersect with the expression.
+            const auto& parent=config.at(Json::json_pointer(pointer.substr(0,pointer.rfind('/'))));
+            std::string extra;
+            for(auto it=parent.begin();it!=parent.end();++it) {
+                if(it.key()=="name"||it.key()=="enabled"||it.key()=="range"||it.key()=="date") continue;
+                if(!extra.empty()) extra+="; "; extra+=it.key()+" = "+(tokens?tokens->token(pointer.substr(0,pointer.rfind('/')+1)+pointer_escape(it.key())):it.value().dump());
+            }
+            field["rangeExtra"]=extra;
+        }
         rows.push_back(std::move(field));
     };
     walk(config,"",""); return rows;

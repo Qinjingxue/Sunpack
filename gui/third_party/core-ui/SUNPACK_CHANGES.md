@@ -11,6 +11,10 @@ preserved.
 
 Local changes:
 
+- Wire QuickJS `@change` / `@input` on ComboBox to its integer selection
+  callback in both ordinary and loop scopes. Range comparison/unit selectors
+  use the existing UIX controls and autosave flow.
+
 - Add `VirtualList` for one keyed `v-for` inside a ScrollView: viewport-only
   mounting, small overscan, focused-editor retention, variable measured row
   heights, Fenwick position lookup and scroll-anchor correction. Viewport

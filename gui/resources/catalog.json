@@ -1,5 +1,65 @@
 {
   "ui": {
+    "opRangeDate": {
+      "zh": "打开日期时间选择器",
+      "en": "Open date/time picker"
+    },
+    "rangeMin": {
+      "zh": "最小文件大小",
+      "en": "Minimum file size"
+    },
+    "rangeMax": {
+      "zh": "最大文件大小",
+      "en": "Maximum file size"
+    },
+    "rangeStart": {
+      "zh": "起始时间",
+      "en": "Start time"
+    },
+    "rangeEnd": {
+      "zh": "结束时间",
+      "en": "End time"
+    },
+    "rangeHint": {
+      "zh": "上下限可独立留空，留空表示不限制。大小单位按 1024 换算。",
+      "en": "Leave either bound empty for no limit. Size units use powers of 1024."
+    },
+    "rangeTimeHint": {
+      "zh": "电脑本地时间，精确到分钟；留空表示不限制。",
+      "en": "Computer local time, to the minute; leave empty for no limit."
+    },
+    "rangeChoose": {
+      "zh": "选择日期时间",
+      "en": "Choose date/time"
+    },
+    "rangeAdvanced": {
+      "zh": "编辑原始表达式",
+      "en": "Edit expression"
+    },
+    "rangeSimple": {
+      "zh": "范围选择",
+      "en": "Range controls"
+    },
+    "rangeFallback": {
+      "zh": "此表达式保留原文，请在此编辑。",
+      "en": "This expression is preserved; edit it here."
+    },
+    "rangeExtra": {
+      "zh": "同时生效的额外配置：",
+      "en": "Additional settings also apply: "
+    },
+    "rangeNumber": {
+      "zh": "请输入非负整数，换算后的字节数不能超过 18446744073709551615。",
+      "en": "Enter a nonnegative integer; bytes must not exceed 18446744073709551615."
+    },
+    "rangeDate": {
+      "zh": "请输入有效的本地日期和时间（YYYY-MM-DD HH:mm）。",
+      "en": "Enter a valid local date and time (YYYY-MM-DD HH:mm)."
+    },
+    "rangeOrder": {
+      "zh": "下限不能大于上限；相同时两个边界必须都包含。",
+      "en": "The lower bound must precede the upper bound, or both must include the same value."
+    },
     "title": {
       "zh": "SunPack 管理面板",
       "en": "SunPack Manager"
@@ -1128,13 +1188,14 @@
       }
     },
     "/filesystem/scan_filters/@size_range/range": {
+      "editor": "size_range",
       "label": {
         "zh": "文件大小条件",
         "en": "File size condition"
       },
       "description": {
-        "zh": "例如 r > 0 B；支持大小比较表达式。",
-        "en": "For example, r > 0 B. Supports size comparison expressions."
+        "zh": "设置文件大小的上下限，并选择是否包含边界。",
+        "en": "Set lower and upper file sizes and choose whether to include each boundary."
       }
     },
     "/filesystem/scan_filters/@mtime_range/enabled": {
@@ -1148,13 +1209,14 @@
       }
     },
     "/filesystem/scan_filters/@mtime_range/date": {
+      "editor": "datetime_range",
       "label": {
         "zh": "修改时间条件",
         "en": "Modification time condition"
       },
       "description": {
-        "zh": "例如 20270101 00:00 > d >= 20240101 00:00。",
-        "en": "For example, 20270101 00:00 > d >= 20240101 00:00."
+        "zh": "按电脑本地时间设置固定的起止日期和时间。",
+        "en": "Set fixed start and end dates and times in computer local time."
       }
     },
     "/performance/persistent_server_idle_seconds": {

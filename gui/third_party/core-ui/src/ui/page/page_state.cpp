@@ -2479,6 +2479,11 @@ void PageState::WireLoopScopeEventEx(Widget* target, const std::string& evName,
         target->onFloatChanged = [callHandler, ctx](float v) {
             callHandler(JS_NewFloat64(ctx, static_cast<double>(v)));
         };
+        if (auto* combo = dynamic_cast<ComboBoxWidget*>(target)) {
+            combo->onSelectionChanged = [callHandler, ctx](int index) {
+                callHandler(JS_NewInt32(ctx, index));
+            };
+        }
     } else if (evName == "dblclick") {
         target->onMouseDblClickHook = [callHandler, ctx](const ui::MouseEvent& e) {
             JSValue obj = JS_NewObject(ctx);
@@ -2937,6 +2942,11 @@ void PageState::WireQuickJSEvent(Widget* target, const std::string& evName,
         target->onFloatChanged = [callHandler, ctx](float v) {
             callHandler(JS_NewFloat64(ctx, static_cast<double>(v)));
         };
+        if (auto* combo = dynamic_cast<ComboBoxWidget*>(target)) {
+            combo->onSelectionChanged = [callHandler, ctx](int index) {
+                callHandler(JS_NewInt32(ctx, index));
+            };
+        }
     } else {
         errors_.push_back("@" + evName + " not supported on QuickJS path");
     }

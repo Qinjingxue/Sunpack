@@ -60,3 +60,28 @@ def test_packaged_manager_launch_releases_native_process_handle(tmp_path, monkey
     monkeypatch.setattr(manager, "launch_unelevated", launch)
     manager.launch_manager()
     assert calls == [([str(tmp_path / "SunPackGUI.exe")], {"cwd": str(tmp_path)}), "closed"]
+
+
+def test_gui_ranges_keep_runtime_boundaries_exact():
+    """Native GUI serialization must survive the real config parsers, including
+    a >2**53 byte boundary. C++ roundtrips cannot detect Python float rounding;
+    one tiny existing test-binary process covers this language boundary.
+    """
+    from datetime import datetime
+    from sunpack.pipeline.discovery.filesystem.filters.modules.size_range import NumericRange
+    from sunpack.pipeline.discovery.filesystem.filters.modules.mtime_range import MtimeRangeScanFilter
+
+    arch = "arm64" if platform.machine().lower() in {"arm64", "aarch64"} else "x64"
+    binary = Path(os.environ.get("SUNPACK_GUI_TEST_BINARY", Path(__file__).resolve().parents[2] / ".cache" / f"gui-{arch}" / "Release" / "sunpack_gui_tests.exe"))
+    if not binary.is_file():
+        pytest.skip("Build the native GUI with scripts/build_gui.ps1")
+    expressions = json.loads(subprocess.check_output([str(binary), "--ranges"], text=True, encoding="utf-8"))
+    size = NumericRange.from_config({"range": expressions["size"]})
+    assert not size.allows(9007199254740992)
+    assert size.allows(9007199254740993)
+    assert not NumericRange.from_config({"range": expressions["size"], "lt": 9007199254740993}).allows(9007199254740993)
+    time = MtimeRangeScanFilter.from_config({"date": expressions["time"]}).value_range
+    lower = int(datetime(2024, 2, 29, 12, 34).timestamp() * 1_000_000_000)
+    upper = int(datetime(2027, 1, 1).timestamp() * 1_000_000_000)
+    assert time.allows(lower) and not time.allows(lower - 1)
+    assert not time.allows(upper) and time.allows(upper - 1)

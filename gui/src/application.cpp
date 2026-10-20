@@ -1,6 +1,7 @@
 #include "application.hpp"
 #include "motion.hpp"
 #include "presentation.hpp"
+#include "range_editor.hpp"
 #include "main_uix.h"
 #include <commctrl.h>
 #include <dwmapi.h>
@@ -26,6 +27,63 @@ struct ReadRetry {
     unsigned attempts=0;
     Clock::time_point due=Clock::time_point::max();
 };
+struct RangeDateDialog {
+    SYSTEMTIME value{};
+    std::wstring title,save,cancel;
+    HWND date=nullptr,time=nullptr;
+};
+INT_PTR CALLBACK range_date_dialog(HWND hwnd,UINT message,WPARAM wparam,LPARAM lparam) {
+    auto* state=reinterpret_cast<RangeDateDialog*>(GetWindowLongPtrW(hwnd,DWLP_USER));
+    if(message==WM_INITDIALOG) {
+        state=reinterpret_cast<RangeDateDialog*>(lparam); SetWindowLongPtrW(hwnd,DWLP_USER,lparam);
+        SetWindowTextW(hwnd,state->title.c_str());
+        auto dpi=GetDpiForWindow(hwnd); auto px=[&](int n){return MulDiv(n,dpi,96);};
+        SetWindowPos(hwnd,nullptr,0,0,px(378),px(150),SWP_NOMOVE|SWP_NOZORDER);
+        auto font=GetStockObject(DEFAULT_GUI_FONT);
+        auto control=[&](DWORD style,const wchar_t* name,const wchar_t* text,int id,int x,int y,int width,int height) {
+            auto child=CreateWindowExW(0,name,text,WS_CHILD|WS_VISIBLE|WS_TABSTOP|style,px(x),px(y),px(width),px(height),hwnd,reinterpret_cast<HMENU>(INT_PTR(id)),GetModuleHandleW(nullptr),nullptr);
+            SendMessageW(child,WM_SETFONT,reinterpret_cast<WPARAM>(font),TRUE); return child;
+        };
+        state->date=control(DTS_SHORTDATEFORMAT,DATETIMEPICK_CLASSW,L"",100,12,12,195,28);
+        state->time=control(DTS_TIMEFORMAT|DTS_UPDOWN,DATETIMEPICK_CLASSW,L"",101,217,12,128,28);
+        SendMessageW(state->date,DTM_SETFORMATW,0,reinterpret_cast<LPARAM>(L"yyyy-MM-dd"));
+        SendMessageW(state->time,DTM_SETFORMATW,0,reinterpret_cast<LPARAM>(L"HH:mm"));
+        DateTime_SetSystemtime(state->date,GDT_VALID,&state->value); DateTime_SetSystemtime(state->time,GDT_VALID,&state->value);
+        control(BS_DEFPUSHBUTTON,L"BUTTON",state->save.c_str(),IDOK,137,66,100,30);
+        control(BS_PUSHBUTTON,L"BUTTON",state->cancel.c_str(),IDCANCEL,245,66,100,30);
+        RECT owner{},bounds{}; GetWindowRect(GetWindow(hwnd,GW_OWNER),&owner); GetWindowRect(hwnd,&bounds);
+        MONITORINFO info{sizeof(info)}; GetMonitorInfoW(MonitorFromWindow(hwnd,MONITOR_DEFAULTTONEAREST),&info);
+        int x=std::clamp<LONG>((owner.left+owner.right-(bounds.right-bounds.left))/2,info.rcWork.left,std::max(info.rcWork.left,info.rcWork.right-(bounds.right-bounds.left)));
+        int y=std::clamp<LONG>((owner.top+owner.bottom-(bounds.bottom-bounds.top))/2,info.rcWork.top,std::max(info.rcWork.top,info.rcWork.bottom-(bounds.bottom-bounds.top)));
+        SetWindowPos(hwnd,nullptr,x,y,0,0,SWP_NOSIZE|SWP_NOZORDER);
+        return TRUE;
+    }
+    if(message==WM_COMMAND && (LOWORD(wparam)==IDOK || LOWORD(wparam)==IDCANCEL)) {
+        if(LOWORD(wparam)==IDOK) {
+            SYSTEMTIME time{};
+            if(DateTime_GetSystemtime(state->date,&state->value)!=GDT_VALID || DateTime_GetSystemtime(state->time,&time)!=GDT_VALID) return TRUE;
+            state->value.wHour=time.wHour; state->value.wMinute=time.wMinute; state->value.wSecond=state->value.wMilliseconds=0;
+        }
+        EndDialog(hwnd,LOWORD(wparam)); return TRUE;
+    }
+    if(message==WM_CLOSE) { EndDialog(hwnd,IDCANCEL); return TRUE; }
+    return FALSE;
+}
+bool choose_range_date(HWND owner,const std::string& initial,const std::string& language,SYSTEMTIME& value) {
+    INITCOMMONCONTROLSEX common{sizeof(common),ICC_DATE_CLASSES};
+    if(!InitCommonControlsEx(&common)) win_error("opRangeDate");
+    RangeDateDialog state;
+    if(!range_datetime(initial,state.value)) GetLocalTime(&state.value);
+    state.title=wide(tr("rangeChoose",language)); state.save=wide(tr("saveEntries",language)); state.cancel=wide(tr("cancelEntries",language));
+    // Empty in-memory template. Windows owns the modal loop and all children.
+    struct { DLGTEMPLATE dialog; WORD menu=0,windowClass=0,title=0; } layout{};
+    layout.dialog.style=WS_POPUP|WS_CAPTION|WS_SYSMENU|DS_MODALFRAME;
+    layout.dialog.cx=240; layout.dialog.cy=85;
+    auto result=DialogBoxIndirectParamW(GetModuleHandleW(nullptr),&layout.dialog,owner,range_date_dialog,reinterpret_cast<LPARAM>(&state));
+    if(result==-1) win_error("opRangeDate");
+    if(result!=IDOK) return false;
+    value=state.value; return true;
+}
 UiThemeMode system_theme() {
     DWORD light=1, size=sizeof(light);
     RegGetValueW(HKEY_CURRENT_USER,L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
@@ -142,6 +200,7 @@ void Application::save_field(const std::string& id,Json draft) {
         auto field=std::find_if(fields.begin(),fields.end(),[&](const Json& f){return f["id"]==id;});
         if(field==fields.end()) throw std::runtime_error("configConflict");
         auto text=draft.at("text").get<std::string>();
+        if(draft.contains("range")) text=range_expression(draft["range"],(*field)["editor"]=="datetime_range");
         Json edit={{"pointer",id},{"label",(*field)["label"]},{"original",draft["original"]},
             {"type",(*field)["editor"]=="recursive"?Json("string"):(*field)["type"]},
             {"text",text},{"boolean",draft["boolean"]},{"draft",draft}};
@@ -290,6 +349,11 @@ void Application::apply_pending() {
             throw std::runtime_error("passwordBindingFailed");
     }
     if(patch.contains("fields")) {
+        auto modes=page_value(page_,"advancedRanges"); auto count=modes.size();
+        for(auto it=modes.begin();it!=modes.end();) {
+            if(std::none_of(patch["fields"].begin(),patch["fields"].end(),[&](const Json& f){return f["id"]==it.key();})) it=modes.erase(it); else ++it;
+        }
+        if(modes.size()!=count) { auto text=modes.dump(); ui_page_set_json(page_,"advancedRanges",text.c_str()); }
         auto drafts=page_value(page_,"drafts");
         for(auto it=controls_.begin();it!=controls_.end();) {
             bool exists=std::any_of(patch["fields"].begin(),patch["fields"].end(),[&](const Json& f){return f["id"]==it->first;});
@@ -508,6 +572,16 @@ void Application::handle_command(Json command) {
             } else if(target=="listEntry") {
                 set_text(page_,"listEntry",utf8(selected.wstring()));
             } else if(target=="rootInput" || target=="rootOutput") set_text(page_,target.c_str(),utf8(selected.wstring()));
+        }
+        return;
+    }
+    if(op=="pickRangeDate") {
+        auto side=p.at("side").get<std::string>();
+        if(side!="lower" && side!="upper") return;
+        SYSTEMTIME selected{};
+        if(choose_range_date(hwnd_,p.at("value"),page_value(page_,"language"),selected)) {
+            auto reply=Json{{"id",p.at("id")},{"side",side},{"value",range_datetime_text(selected)}}.dump();
+            if(ui_page_call_json(page_,"pickedRange",reply.c_str())!=0) throw std::runtime_error("uiBindingFailed");
         }
         return;
     }

@@ -130,7 +130,7 @@ def parse_size_value(value: Any) -> int | None:
     match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)\s*([a-zA-Z]+)?", text)
     if not match:
         return _int_or_none(text)
-    number = float(match.group(1))
+    digits = match.group(1)
     unit = (match.group(2) or "B").lower()
     factors = {
         "b": 1,
@@ -152,7 +152,9 @@ def parse_size_value(value: Any) -> int | None:
     factor = factors.get(unit)
     if factor is None:
         return None
-    return int(number * factor)
+    # GUI ranges are serialized as integer bytes. Keep large boundaries exact
+    # when passing the parsed configuration to the existing native scanner.
+    return int(digits) * factor if "." not in digits else int(float(digits) * factor)
 
 
 def _comparison_to_range(left: str, operator: str, right: str, value_parser, *, variable: str) -> NumericRange:

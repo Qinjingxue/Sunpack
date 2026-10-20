@@ -5,6 +5,7 @@
 #include <iostream>
 #include <dwmapi.h>
 #include <cstring>
+#include <commctrl.h>
 #include <ui/ui_context.h>
 #include <ui/ui_window.h>
 #include <ui/uix/script_runtime.h>
@@ -421,6 +422,98 @@ void scrolled_config_edits(Application& app) {
 // One real-window scenario covers lossless collection editing, virtual rows,
 // cancel and concurrent-file conflict. Scalar/record tests cannot detect these
 // failures; sharing their fixture avoids another process/window startup.
+struct RangeDialogDriver {
+    inline static RangeDialogDriver* active=nullptr;
+    HHOOK hook=nullptr; bool seen=false,cancel=false;
+    explicit RangeDialogDriver(bool cancel=false):cancel(cancel) {
+        active=this;
+        hook=SetWindowsHookExW(WH_CALLWNDPROCRET,[](int code,WPARAM wp,LPARAM lp)->LRESULT {
+            auto* event=reinterpret_cast<CWPRETSTRUCT*>(lp);
+            if(code==HC_ACTION && active && event->message==WM_INITDIALOG) {
+                HWND dialog=event->hwnd; wchar_t name[32]{}; GetClassNameW(dialog,name,32);
+                if(!std::wcscmp(name,L"#32770") && GetDlgItem(dialog,100) && GetDlgItem(dialog,101)) {
+                    active->seen=true;
+                    SYSTEMTIME date{}; date.wYear=2024; date.wMonth=2; date.wDay=29; date.wHour=12; date.wMinute=34;
+                    DateTime_SetSystemtime(GetDlgItem(dialog,100),GDT_VALID,&date);
+                    DateTime_SetSystemtime(GetDlgItem(dialog,101),GDT_VALID,&date);
+                    PostMessageW(dialog,WM_COMMAND,active->cancel?IDCANCEL:IDOK,0);
+                }
+            }
+            return CallNextHookEx(nullptr,code,wp,lp);
+        },nullptr,GetCurrentThreadId()); assert(hook);
+    }
+    ~RangeDialogDriver() { UnhookWindowsHookEx(hook); active=nullptr; }
+};
+void range_config(Application& app,const fs::path& dir) {
+    auto field=[&](const std::string& module) { for(auto& f:state(app.page(),"fields")) if(f["module"]==module && f["type"]=="string") return f; return Json(); };
+    auto size=field("size_range"),time=field("mtime_range"); assert(!size.is_null() && !time.is_null());
+    auto id=size["id"].get<std::string>(),tid=time["id"].get<std::string>();
+    auto input=[&](const std::string& control,const wchar_t* value) {
+        click(app,control.c_str()); assert(ui_debug_key_mod(app.window(),'A',1,0,0)==0);
+        assert(ui_debug_type_char(app.window(),8)==0); if(*value) assert(ui_debug_type_text(app.window(),value)==0);
+    };
+    search_config(app,L"size_range");
+    assert(field("size_range")["range"]["lowerOp"]==0);
+    input("range-lower-"+id,L"9007199254740993"); finish_input(app);
+    pump([&]{return field("size_range")["text"]=="9007199254740993 < r";},"Exact size range save");
+    input("range-upper-"+id,L"1"); ui_window_focus_widget(app.window(),0);
+    pump([&]{return state(app.page(),"saveErrors").contains(id);},"Range ordering validation");
+    assert(read_json(dir/"sunpack_config.json")[Json::json_pointer(id)]=="9007199254740993 < r");
+    input("range-upper-"+id,L""); finish_input(app);
+    input("range-lower-"+id,L"2"); finish_input(app);
+    auto unit=ui_widget_find_by_id(ui_page_root(app.page()),("range-lower-unit-"+id).c_str()); assert(unit);
+    assert(ui_debug_combo_select(app.window(),unit,2)==0); ui_widget_destroy(unit); finish_input(app);
+    try { pump([&]{return field("size_range")["text"]=="2097152 < r";},"Size unit conversion"); }
+    catch(...) { std::cerr<<"Range unit: field="<<field("size_range")<<" drafts="<<state(app.page(),"drafts")<<" errors="<<state(app.page(),"saveErrors")<<'\n'; throw; }
+    auto boundary=ui_widget_find_by_id(ui_page_root(app.page()),("range-lower-op-"+id).c_str()); assert(boundary);
+    assert(ui_debug_combo_select(app.window(),boundary,1)==0); ui_widget_destroy(boundary); finish_input(app);
+    pump([&]{return field("size_range")["text"]=="2097152 <= r";},"Inclusive boundary save");
+    {
+        FileMutex hold(dir/"sunpack_config.json");
+        input("range-lower-"+id,L"3"); click(app,"configSearch"); ui_debug_pump();
+        input("range-lower-"+id,L"4");
+    }
+    pump([&]{return field("size_range")["text"]=="3145728 <= r" && !state(app.page(),"saving").get<bool>();},"Range acknowledgement during typing");
+    assert(state(app.page(),"drafts")[id]["range"]["lower"]=="4");
+    finish_input(app);
+    pump([&]{return field("size_range")["text"]=="4194304 <= r";},"Continued range edit");
+    screenshot(app,L"range-size-small.png");
+    auto before_mode=read_file(dir/"sunpack_config.json");
+    click(app,("range-mode-"+id).c_str());
+    assert(read_file(dir/"sunpack_config.json")==before_mode);
+    click(app,("range-mode-"+id).c_str());
+    input("range-lower-"+id,L"5");
+    // External edits refresh the projection without rewriting advanced values.
+    auto config=read_json(dir/"sunpack_config.json"); config[Json::json_pointer(id)]="r == 17";
+    auto parent=id.substr(0,id.rfind('/')); config[Json::json_pointer(parent+"/gte")]=7;
+    atomic_write(dir/"sunpack_config.json",config.dump());
+    pump([&]{auto f=field("size_range"); return f["text"]=="r == 17" && f["range"]["supported"]==false;},"Advanced range reload");
+    click(app,"configSearch");
+    pump([&]{return state(app.page(),"saveErrors").contains(id);},"Range external conflict");
+    assert(state(app.page(),"drafts")[id]["range"]["lower"]=="5");
+    assert(read_json(dir/"sunpack_config.json")[Json::json_pointer(id)]=="r == 17");
+    ui_window_relayout(app.window());
+    assert(!field("size_range")["rangeExtra"].get<std::string>().empty());
+    input("range-expression-"+id,L"r == 19");
+    try { finish_input(app); }
+    catch(...) { std::cerr<<"Range conflict correction: field="<<field("size_range")<<" drafts="<<state(app.page(),"drafts")<<" file="<<read_json(dir/"sunpack_config.json")[Json::json_pointer(id)]<<" query="<<state(app.page(),"configQuery")<<" control="<<rendered_widget(app,"range-expression-"+id)<<'\n'; screenshot(app,L"range-conflict-failure.png"); throw; }
+    assert(read_json(dir/"sunpack_config.json")[Json::json_pointer(parent+"/gte")]==7);
+    search_config(app,L"mtime_range");
+    input("range-lower-"+tid,L"2023-02-29 00:00"); ui_window_focus_widget(app.window(),0);
+    pump([&]{return state(app.page(),"saveErrors").contains(tid);},"Leap date validation");
+    {
+        RangeDialogDriver driver;
+        click(app,("range-lower-pick-"+tid).c_str()); finish_input(app); assert(driver.seen);
+    }
+    pump([&]{return field("mtime_range")["text"].get<std::string>().find("20240229 12:34")!=std::string::npos;},"Native date selection");
+    auto before=read_file(dir/"sunpack_config.json");
+    {
+        RangeDialogDriver driver(true);
+        click(app,("range-upper-pick-"+tid).c_str()); finish_input(app); assert(driver.seen);
+    }
+    assert(read_file(dir/"sunpack_config.json")==before);
+    screenshot(app,L"range-time-small.png");
+}
 void structured_config(Application& app,const fs::path& dir) {
     const std::string pointer="/filesystem/scan_filters/0/prune_dir_globs";
     auto config=read_json(dir/"sunpack_config.json");
@@ -1252,6 +1345,7 @@ int wmain(int argc,wchar_t** argv) {
             }
             ui_widget_destroy(block);
             screenshot(app,L"whitelist-block-small.png");
+            range_config(app,dir);
             structured_config(app,dir);
             // Dense views must remain usable with many folders/history items,
             // including after the directory scrollbar becomes active.

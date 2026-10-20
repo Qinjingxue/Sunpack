@@ -1,5 +1,6 @@
 #include "model.hpp"
 #include "presentation.hpp"
+#include "range_editor.hpp"
 #include "defaults_json.h"
 #include <cassert>
 #include <fstream>
@@ -248,6 +249,39 @@ void editing(Fixture& f) {
 // Existing file/edit tests only check rejection. This coarse scenario catches
 // leaked message keys, frozen locales and lost Windows codes across the same
 // exception/string boundary used by background saves, without extra processes.
+void range_editing(Fixture& fixture) {
+    auto size=range_editor("10 GiB >= r > 0 B",false);
+    assert(size["supported"]==true && size["lowerOp"]==0 && size["upperOp"]==1);
+    assert(range_expression(size,false)=="0 < r <= 10737418240");
+    auto time=range_editor("20270101 00:00 > d >= 20240229 12:34",true);
+    assert(time["supported"]==true && time["lower"]=="2024-02-29 12:34" && time["upperOp"]==0);
+    assert(range_expression(time,true)=="20240229 12:34 <= d < 20270101 00:00");
+    time["lower"]="2023-02-29 00:00"; fails([&]{range_expression(time,true);});
+    time["lower"]="2028-01-01 00:00"; fails([&]{range_expression(time,true);});
+    size["lower"]="9007199254740993"; size["lowerUnit"]=0; size["upper"]="";
+    assert(range_expression(size,false)=="9007199254740993 < r");
+    assert(range_editor(range_expression(size,false),false)["lower"]==size["lower"]);
+    size["lower"]="18446744073709551615";
+    assert(range_expression(size,false)=="18446744073709551615 < r");
+    size["lowerUnit"]=1; fails([&]{range_expression(size,false);});
+    size["lower"]="-1"; fails([&]{range_expression(size,false);});
+    size["lower"]="2"; size["lowerUnit"]=0; size["upper"]="1"; size["upperUnit"]=0; fails([&]{range_expression(size,false);});
+    size["lower"]="1"; fails([&]{range_expression(size,false);});
+    size["lowerOp"]=1; assert(range_expression(size,false)=="1 <= r <= 1");
+    size["lower"]=""; size["upper"]=""; assert(range_expression(size,false).empty());
+    for(auto text:{"r == 20", "r > 1.5 MiB", "r >= 18446744073709551616", "r > nope"}) assert(range_editor(text,false)["supported"]==false);
+    assert(range_editor("d > 2024-01-01T00:00:01+08:00",true)["supported"]==false);
+    std::string source=R"({"filesystem":{"scan_filters":[{"name":"size_range","enabled":true,"range":"r > 0 B","gte":2,"eq":null},{"name":"mtime_range","enabled":false,"date":"d == 20240101"}]},"unknown":123456789012345678901234567890})";
+    auto config=parse_json(source);
+    auto path=fixture.dir/"ranges.json"; atomic_write(path,source);
+    auto rows=config_fields(config,read_file(path));
+    auto field=rows[1];
+    assert(field["editor"]=="size_range" && field["rangeExtra"].get<std::string>().find("gte = 2")!=std::string::npos);
+    save_config_field(path,field["id"],field["original"],"string",range_expression(field["range"],false),false);
+    auto updated=read_json(path);
+    assert(updated["filesystem"]["scan_filters"][0]["gte"]==2 && updated["filesystem"]["scan_filters"][1]["date"]=="d == 20240101");
+    assert(read_file(path).find("123456789012345678901234567890")!=std::string::npos);
+}
 void localization(Fixture& fixture) {
     auto rejected=[&](const std::function<void()>& action,const char* expected) {
         try { action(); assert(false); }
@@ -446,7 +480,12 @@ int wmain(int argc,wchar_t** argv) {
     if(argc==3 && std::wstring(argv[1])==L"--mutex") { std::cout<<utf8(mutex_name(argv[2]))<<"\n"<<utf8(mutex_name(argv[2],L"SunPackWatchRoots"))<<"\n"; return 0; }
     if(argc>=2 && std::wstring(argv[1])==L"--echo") { Json args=Json::array(); for(int i=2;i<argc;++i) args.push_back(utf8(argv[i])); std::cout<<args.dump(); return 7; }
     if(argc==4 && std::wstring(argv[1])==L"--password-add") { edit_password(argv[2],"add",Json(),Json({{"value",utf8(argv[3])}})); return 0; }
-    try { Fixture f; projection(f); logical_projection(f); editing(f); roots(f); localization(f); installer_upgrade(f); batch_editing(f); service_notifications(); std::cout<<"GUI file contracts passed\n"; }
+    if(argc==2 && std::wstring(argv[1])==L"--ranges") {
+        auto size=range_editor("r > 0 B",false); size["lower"]="9007199254740993"; size["lowerOp"]=1;
+        auto time=range_editor("20270101 00:00 > d >= 20240229 12:34",true);
+        std::cout<<Json{{"size",range_expression(size,false)},{"time",range_expression(time,true)}}.dump(); return 0;
+    }
+    try { Fixture f; projection(f); logical_projection(f); editing(f); roots(f); range_editing(f); localization(f); installer_upgrade(f); batch_editing(f); service_notifications(); std::cout<<"GUI file contracts passed\n"; }
     catch(const std::exception& e) { std::cerr<<e.what()<<"\n"; return 1; }
     CliCommand cli{executable_path(),fs::temp_directory_path(),{L"--echo"}};
     Handle stop(CreateEventW(nullptr,TRUE,FALSE,nullptr));
