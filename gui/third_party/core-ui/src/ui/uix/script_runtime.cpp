@@ -57,8 +57,22 @@ JSValue ProxySetTrap(JSContext* ctx, JSValueConst /*this_val*/,
 
     auto* self = static_cast<ScriptRuntime*>(JS_GetContextOpaque(ctx));
 
-    // Pass-through write: target[key] = value (dup so target retains ownership).
+    // The UI writes a few unchanged scalar values while switching pages.
+    // Do not notify reactive effects for a strict-equal primitive; doing so
+    // repeatedly rebinds controls, invalidates layout and schedules paints.
+    // Object/array writes must retain reference/identity update semantics.
     JSAtom atom = JS_ValueToAtom(ctx, key);
+    if (JS_IsString(value) || JS_IsNumber(value) || JS_IsBool(value) ||
+        JS_IsNull(value) || JS_IsUndefined(value)) {
+        JSValue previous = JS_GetProperty(ctx, target, atom);
+        bool same = !JS_IsException(previous) && JS_IsStrictEqual(ctx, previous, value);
+        JS_FreeValue(ctx, previous);
+        if (same) {
+            JS_FreeAtom(ctx, atom);
+            return JS_TRUE;
+        }
+    }
+    // Pass-through write: target[key] = value (dup so target retains ownership).
     int rc = JS_SetProperty(ctx, target, atom, JS_DupValue(ctx, value));
     JS_FreeAtom(ctx, atom);
     if (rc < 0) return JS_EXCEPTION;
