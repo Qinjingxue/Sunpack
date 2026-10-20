@@ -609,7 +609,7 @@ public:
     bool immutableItems = false;
     std::function<void()> onRangeChanged;
     void SetCount(size_t count);
-    void InvalidateHeights();
+    void RemapRows(const std::vector<size_t>& previousIndices);
     const std::vector<size_t>& Indices() const { return indices_; }
     void RefreshViewport();
     void DoLayout() override;
@@ -621,6 +621,7 @@ private:
     float Sum(size_t count) const;
     size_t RowAt(float y) const;
     void MeasureRow(size_t index, float height);
+    void RebuildSums();
 };
 
 // ---- ScrollView ----

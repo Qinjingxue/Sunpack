@@ -2296,11 +2296,36 @@ void PageState::RebuildJsLoop(JsLoopRuntime& rt, bool viewportOnly) {
     JS_FreeValue(ctx, lenV);
     if (virtualList) {
         if (!viewportOnly) {
-            // The same number of different items must not inherit previous
-            // rows' measured heights (e.g. two equally sized filter results).
+            // A save/file notification often replaces the array while keeping
+            // the same keys. Retain measured heights by key, not array identity
+            // or position. Build only temporary metadata from the already owned
+            // old snapshot; no resident copy of every item's key or JS value.
             if (!JS_IsArray(rt.virtualItems) ||
-                JS_VALUE_GET_PTR(rt.virtualItems) != JS_VALUE_GET_PTR(list))
-                virtualList->InvalidateHeights();
+                JS_VALUE_GET_PTR(rt.virtualItems) != JS_VALUE_GET_PTR(list)) {
+                std::unordered_map<std::string, size_t> oldPositions;
+                if (JS_IsArray(rt.virtualItems)) {
+                    JSValue oldLenV = JS_GetPropertyStr(ctx, rt.virtualItems, "length");
+                    uint32_t oldLen = 0;
+                    JS_ToUint32(ctx, &oldLen, oldLenV);
+                    JS_FreeValue(ctx, oldLenV);
+                    oldPositions.reserve(oldLen);
+                    for (uint32_t i = 0; i < oldLen; ++i) {
+                        JSValue item = JS_GetPropertyUint32(ctx, rt.virtualItems, i);
+                        JSValue index = JS_NewInt32(ctx, static_cast<int>(i));
+                        oldPositions.emplace(ComputeIterationKey(rt, item, index, i), i);
+                        JS_FreeValue(ctx, item); JS_FreeValue(ctx, index);
+                    }
+                }
+                std::vector<size_t> previousIndices(len, static_cast<size_t>(-1));
+                for (uint32_t i = 0; i < len; ++i) {
+                    JSValue item = JS_GetPropertyUint32(ctx, list, i);
+                    JSValue index = JS_NewInt32(ctx, static_cast<int>(i));
+                    auto found = oldPositions.find(ComputeIterationKey(rt, item, index, i));
+                    if (found != oldPositions.end()) previousIndices[i] = found->second;
+                    JS_FreeValue(ctx, item); JS_FreeValue(ctx, index);
+                }
+                virtualList->RemapRows(previousIndices);
+            }
             JS_FreeValue(ctx, rt.virtualItems);
             rt.virtualItems = JS_DupValue(ctx, list);
         }
