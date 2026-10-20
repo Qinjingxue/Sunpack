@@ -434,6 +434,27 @@ void PageState::SetValue(const std::string& name, ui::expr::Value v) {
     JS_SetPropertyStr(ctx, jsState_, name.c_str(), parsed);
 }
 
+bool PageState::SetJsonText(const std::string& name, const char* json, size_t length, std::string& error) {
+    if (!jsRt_ || JS_IsUndefined(jsState_)) {
+        error = "QuickJS state unavailable";
+        return false;
+    }
+    JSContext* ctx = jsRt_->ctx();
+    JSValue value = JS_ParseJSON(ctx, json, length, "<set_json>");
+    auto failed = [&]() {
+        JSValue exception = JS_GetException(ctx);
+        const char* message = JS_ToCString(ctx, exception);
+        error = message ? message : "QuickJS JSON error";
+        if (message) JS_FreeCString(ctx, message);
+        JS_FreeValue(ctx, exception);
+        return false;
+    };
+    if (JS_IsException(value)) return failed();
+    // The proxy setter takes ownership and triggers normal reactive bindings.
+    if (JS_SetPropertyStr(ctx, jsState_, name.c_str(), value) < 0) return failed();
+    return true;
+}
+
 bool PageState::CallJsonMethod(const std::string& name,const std::string& json) {
     if(!jsRt_ || JS_IsUndefined(jsState_)) return false;
     JSContext* ctx=jsRt_->ctx();
