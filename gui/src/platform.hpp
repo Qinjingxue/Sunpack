@@ -59,15 +59,24 @@ struct CliCommand { fs::path executable, cwd; std::vector<std::wstring> prefix; 
 struct CliResult { DWORD code; std::string output; };
 CliResult run_cli(const CliCommand& cli, const std::vector<std::wstring>& args, HANDLE stop);
 fs::path executable_path();
-// Name is lowercased by the directory notification consumer.
-bool is_runtime_state_name(const std::wstring& name);
-// Cache only a verified live process handle; an exited PID is never reused.
-class RuntimeMonitor {
-    std::wstring expected_;
-    Handle process_;
+// Owned and destroyed on the thread that performs the alertable SCM wait.
+class ServiceMonitor {
+    struct Subscription {
+        SC_HANDLE handle = nullptr;
+        SERVICE_NOTIFYW notification{};
+        bool pending = false, changed = false;
+        static void CALLBACK notified(void* parameter);
+        void arm(DWORD mask);
+        void close();
+        ~Subscription() { close(); }
+    } database_, service_;
+    std::wstring name_;
+    bool running_ = false;
 public:
-    explicit RuntimeMonitor(const fs::path& executable);
+    explicit ServiceMonitor(const wchar_t* name = L"SunPackWatchBroker") : name_(name) {}
+    ServiceMonitor(const ServiceMonitor&) = delete;
+    ServiceMonitor& operator=(const ServiceMonitor&) = delete;
+    bool changed() const { return database_.changed || service_.changed; }
     bool running();
-    HANDLE process_handle() const { return process_.value==INVALID_HANDLE_VALUE?nullptr:process_.value; }
 };
 }

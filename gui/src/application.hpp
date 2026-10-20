@@ -19,7 +19,7 @@ class Application {
     UiWindow window_ = 0;
     HWND hwnd_ = nullptr;
     Handle stop_{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
-    Handle runtime_changed_{CreateEventW(nullptr, FALSE, FALSE, nullptr)};
+    Handle service_refresh_{CreateEventW(nullptr, FALSE, FALSE, nullptr)};
     std::mutex mutex_;
     std::condition_variable cv_;
     std::deque<Json> commands_;

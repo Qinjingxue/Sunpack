@@ -4,39 +4,11 @@
 #include <iostream>
 #include <dwmapi.h>
 #include <cstring>
-#include <process.h>
 #include <ui/ui_context.h>
 #include <ui/ui_window.h>
 #include <ui/controls.h>
 using namespace spg;
 namespace {
-struct RuntimeChild {
-    Handle process, thread;
-    explicit RuntimeChild(const fs::path& image) {
-        auto command=quote_arg(image.wstring());
-        STARTUPINFOW startup{}; startup.cb=sizeof(startup); PROCESS_INFORMATION info{};
-        if(!CreateProcessW(image.c_str(),command.data(),nullptr,nullptr,FALSE,CREATE_SUSPENDED|CREATE_NO_WINDOW,nullptr,nullptr,&startup,&info)) win_error("UI runtime fixture");
-        process.value=info.hProcess; thread.value=info.hThread;
-    }
-    ~RuntimeChild() { exit(); }
-    void exit() {
-        if(WaitForSingleObject(process,0)==WAIT_TIMEOUT) { assert(TerminateProcess(process,1)); assert(WaitForSingleObject(process,10000)==WAIT_OBJECT_0); }
-    }
-};
-int isolated_interface() {
-    // The production manager resolves the runtime beside its own image. Run
-    // this whole coarse scenario in a temporary installation, never the build
-    // output or a real installation, without adding test paths to the host.
-    auto install=fs::temp_directory_path()/(L"sunpack-gui-install-"+std::to_wstring(GetCurrentProcessId()));
-    fs::create_directory(install);
-    try {
-        auto image=install/L"sunpack_gui_ui_tests.exe";
-        fs::copy_file(executable_path(),image);
-        const wchar_t* args[]={image.c_str(),L"--isolated",nullptr};
-        auto code=_wspawnv(_P_WAIT,image.c_str(),args);
-        fs::remove_all(install); return code<0?1:int(code);
-    } catch(...) { std::error_code ec; fs::remove_all(install,ec); throw; }
-}
 struct AnimationFrames {
     bool finished=false, layout=false, stopped=false;
     unsigned frames=0;
@@ -355,7 +327,6 @@ int wmain(int argc,wchar_t** argv) {
         assert(WaitForSingleObject(gate,10000)==WAIT_OBJECT_0);
         std::cout<<args.dump(); return 0;
     }
-    if(argc==1) return isolated_interface();
     CoInitializeEx(nullptr,COINIT_APARTMENTTHREADED);
     auto dir=fs::temp_directory_path()/(L"sunpack-gui-ui-"+std::to_wstring(GetCurrentProcessId())); fs::create_directory(dir);
     auto gate_name=L"Local\\SunPack.GUI.TestCommand."+std::to_wstring(GetCurrentProcessId());
@@ -368,26 +339,9 @@ int wmain(int argc,wchar_t** argv) {
         {
             Options options; options.data_dir=dir; options.allow_cli=true;
             options.cli={executable_path(),dir,{L"--fake-cli",gate_name}};
-            std::unique_ptr<RuntimeChild> replacement;
             Application app(options); std::cerr<<"Opening UI\n"; app.open(); std::cerr<<"UI opened\n";
             pump([&]{return state(app.page(),"ready")==true;});
             pump([&]{return state(app.page(),"runtime")["known"]==true;});
-            assert(state(app.page(),"runtime")["running"]==false);
-            auto runtime_image=executable_path().parent_path()/"sunpack-runtime.exe";
-            fs::copy_file(executable_path(),runtime_image);
-            auto runtime_state=dir/"runtime-v2-gui-fixture.state";
-            {
-                RuntimeChild current(runtime_image);
-                atomic_write(runtime_state,"existing runtime metadata");
-                pump([&]{return state(app.page(),"runtime")["running"]==true;},"Runtime filesystem discovery");
-                current.exit(); // Leave stale metadata: exit must wake the handle wait.
-                pump([&]{return state(app.page(),"runtime")["running"]==false;},"Runtime kernel exit");
-            }
-            // Keep a replacement alive through the rest of the UI scenario.
-            // Application destruction must cancel its process wait and join.
-            replacement=std::make_unique<RuntimeChild>(runtime_image);
-            atomic_write(runtime_state,"replacement runtime metadata");
-            pump([&]{return state(app.page(),"runtime")["running"]==true;},"Runtime restart");
             BOOL disabled=TRUE;
             if(SUCCEEDED(DwmGetWindowAttribute(static_cast<HWND>(ui_window_hwnd(app.window())),DWMWA_TRANSITIONS_FORCEDISABLED,&disabled,sizeof(disabled)))) assert(!disabled);
             std::cerr<<"Initial files loaded\n";

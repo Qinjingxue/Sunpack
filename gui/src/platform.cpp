@@ -8,7 +8,6 @@
 #include <sstream>
 #include <stdexcept>
 #include <memory>
-#include <tlhelp32.h>
 
 extern "C" NTSYSAPI WCHAR NTAPI RtlDowncaseUnicodeChar(WCHAR);
 namespace spg {
@@ -160,7 +159,7 @@ DirectoryWatcher::DirectoryWatcher(const fs::path& directory, std::function<void
                 CharLowerBuffW(name.data(),DWORD(name.size()));
                 // Missing target directories are observed through their existing ancestor.
                 if (subtree || name == L"sunpack_config.json" || name == L"builtin_passwords.json" ||
-                    name == L"sunpack_watch_roots.txt" || name == L"events.jsonl" || is_runtime_state_name(name)) changed(path);
+                    name == L"sunpack_watch_roots.txt" || name == L"events.jsonl") changed(path);
                 if (!item->NextEntryOffset) break;
                 offset += item->NextEntryOffset;
             }
@@ -211,30 +210,79 @@ std::wstring quote_arg(const std::wstring& arg) {
     out.append(slash * 2, L'\\'); out += L'"'; return out;
 }
 fs::path executable_path() { std::wstring s(32768, 0); auto n = GetModuleFileNameW(nullptr, s.data(), DWORD(s.size())); s.resize(n); return s; }
-bool is_runtime_state_name(const std::wstring& name) {
-    return name.size()>14 && name.compare(0,8,L"runtime-")==0 && name.compare(name.size()-6,6,L".state")==0;
+void CALLBACK ServiceMonitor::Subscription::notified(void* parameter) {
+    auto* notification=static_cast<SERVICE_NOTIFYW*>(parameter);
+    auto* self=static_cast<Subscription*>(notification->pContext);
+    self->pending=false;
+    self->changed=true;
+    // SCM calls may themselves perform alertable RPC waits. Never query,
+    // close or rearm here; the waiting thread consumes the result afterwards.
+    if(notification->pszServiceNames) {
+        LocalFree(notification->pszServiceNames); notification->pszServiceNames=nullptr;
+    }
 }
-RuntimeMonitor::RuntimeMonitor(const fs::path& executable):expected_(path_key(executable)) {}
-bool RuntimeMonitor::running() {
-    if(process_.value!=INVALID_HANDLE_VALUE) {
-        if(WaitForSingleObject(process_,0)==WAIT_TIMEOUT) return true;
-        CloseHandle(process_.value); process_.value=INVALID_HANDLE_VALUE;
+void ServiceMonitor::Subscription::arm(DWORD mask) {
+    notification={};
+    notification.dwVersion=SERVICE_NOTIFY_STATUS_CHANGE;
+    notification.pfnNotifyCallback=notified; notification.pContext=this;
+    changed=false; pending=true; // A callback can run inside the RPC below.
+    auto error=NotifyServiceStatusChangeW(handle,mask,&notification);
+    if(error!=ERROR_SUCCESS) { pending=false; SetLastError(error); win_error("Subscribe service status"); }
+}
+void ServiceMonitor::Subscription::close() {
+    if(handle) {
+        CloseServiceHandle(handle); handle=nullptr;
+        // Cancellation prevents new APCs. Drain already queued callbacks while
+        // their buffer/context is still alive, before reusing or destroying it.
+        while(SleepEx(0,TRUE)==WAIT_IO_COMPLETION) {}
     }
-    Handle snapshot(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS,0));
-    if(snapshot.value==INVALID_HANDLE_VALUE) win_error("Runtime process snapshot");
-    PROCESSENTRY32W entry{}; entry.dwSize=sizeof(entry);
-    const auto filename=fs::path(expected_).filename().wstring();
-    for(BOOL more=Process32FirstW(snapshot,&entry);more;more=Process32NextW(snapshot,&entry)) {
-        if(CompareStringOrdinal(entry.szExeFile,-1,filename.c_str(),-1,TRUE)!=CSTR_EQUAL) continue;
-        Handle process(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION|SYNCHRONIZE,FALSE,entry.th32ProcessID));
-        if(!process.value) continue;
-        wchar_t path[32768]; DWORD count=DWORD(std::size(path));
-        if(!QueryFullProcessImageNameW(process,0,path,&count) || path_key(std::wstring(path,count))!=expected_ ||
-            WaitForSingleObject(process,0)!=WAIT_TIMEOUT) continue;
-        process_.value=process.value; process.value=INVALID_HANDLE_VALUE;
-        return true;
+    pending=changed=false; notification={};
+}
+bool ServiceMonitor::running() {
+    if(service_.pending) return running_;
+    for(unsigned attempt=0;;++attempt) {
+        try {
+            auto error=service_.changed?service_.notification.dwNotificationStatus:
+                database_.changed?database_.notification.dwNotificationStatus:ERROR_SUCCESS;
+            if(error==ERROR_SERVICE_NOTIFY_CLIENT_LAGGING) {
+                service_.close(); database_.close();
+            } else if(error==ERROR_SERVICE_MARKED_FOR_DELETE ||
+                (service_.changed && (service_.notification.dwNotificationTriggered&SERVICE_NOTIFY_DELETE_PENDING))) {
+                service_.close();
+            } else if(error!=ERROR_SUCCESS) { SetLastError(error); win_error("Service status notification"); }
+            if(!service_.handle) {
+                if(!database_.handle) {
+                    database_.handle=OpenSCManagerW(nullptr,nullptr,SC_MANAGER_CONNECT|SC_MANAGER_ENUMERATE_SERVICE);
+                    if(!database_.handle) win_error("Open service manager");
+                }
+                // Arm before opening: installation/removal in this gap cannot
+                // be lost, even when the service is not installed at GUI start.
+                if(!database_.pending) database_.arm(SERVICE_NOTIFY_CREATED|SERVICE_NOTIFY_DELETED);
+                service_.handle=OpenServiceW(database_.handle,name_.c_str(),SERVICE_QUERY_STATUS);
+                if(!service_.handle) {
+                    error=GetLastError();
+                    if(error==ERROR_SERVICE_DOES_NOT_EXIST || error==ERROR_SERVICE_MARKED_FOR_DELETE) return running_=false;
+                    win_error("Open Watch Broker service");
+                }
+                database_.close();
+            }
+            SERVICE_STATUS_PROCESS status{}; DWORD bytes=0;
+            if(!QueryServiceStatusEx(service_.handle,SC_STATUS_PROCESS_INFO,reinterpret_cast<BYTE*>(&status),sizeof(status),&bytes))
+                win_error("Query Watch Broker status");
+            constexpr DWORD states=SERVICE_NOTIFY_STOPPED|SERVICE_NOTIFY_START_PENDING|SERVICE_NOTIFY_STOP_PENDING|
+                SERVICE_NOTIFY_RUNNING|SERVICE_NOTIFY_CONTINUE_PENDING|SERVICE_NOTIFY_PAUSE_PENDING|SERVICE_NOTIFY_PAUSED;
+            // Excluding the queried state also covers a transition between the
+            // query and subscription: SCM queues an APC for the new state.
+            service_.arm((states&~(1u<<(status.dwCurrentState-1)))|SERVICE_NOTIFY_DELETE_PENDING);
+            return running_=status.dwCurrentState==SERVICE_RUNNING;
+        } catch(const WinError& error) {
+            service_.close(); database_.close();
+            // One immediate reconnect after an observed lag, never idle retries.
+            if(attempt==0 && (error.code==ERROR_SERVICE_NOTIFY_CLIENT_LAGGING ||
+                error.code==ERROR_SERVICE_MARKED_FOR_DELETE || error.code==ERROR_SERVICE_DOES_NOT_EXIST)) continue;
+            throw;
+        }
     }
-    return false;
 }
 CliResult run_cli(const CliCommand& cli, const std::vector<std::wstring>& args, HANDLE stop) {
     if (!fs::is_regular_file(cli.executable)) throw std::runtime_error("未找到 SunPack CLI；请安装完整发行包或传入 --cli");

@@ -37,7 +37,7 @@ ui_core_embed_text(SunPackGUI FILE resources/main.uix OUT main_uix.h VAR kMainUi
 target_link_options(SunPackGUI PRIVATE /OPT:REF /OPT:ICF
   "/MANIFESTINPUT:${CMAKE_CURRENT_SOURCE_DIR}/../sunpack.manifest")
 enable_testing()
-add_executable(sunpack_gui_tests ../tests/gui/manager.cpp)
+add_executable(sunpack_gui_tests ../tests/gui/manager.cpp ../tests/gui/service_monitor.cpp)
 ui_core_embed_text(sunpack_gui_tests FILE ../sunpack_advanced_config.json OUT defaults_json.h VAR kDefaultsJson)
 target_link_libraries(sunpack_gui_tests PRIVATE sunpack_gui_data)
 target_compile_options(sunpack_gui_tests PRIVATE /UNDEBUG)

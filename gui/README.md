@@ -94,15 +94,19 @@ GUI 关闭即退出，Watch 的生命周期独立于 GUI。
   `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\SunPackWatchService`。
   CLI 输出以自动删除的临时句柄捕获，不保存额外历史，不启动 GUI 的 IPC 服务。
   成功保存与 CLI 退出码 0 不弹出提示；失败在当前操作区域显示。
-  任务页首次打开时查找 GUI 同目录的 `sunpack-runtime.exe`，以进程完整路径核对安装目录，
-  忽略其他目录中的同名进程。找到后持有进程内核句柄，复用注册表观察线程通过
-  `WaitForMultipleObjects(INFINITE)` 等待退出，退出后释放句柄并查找仍存活的实例。
-  复用数据目录已有的文件观察器，收到持久运行时 `runtime-<identity>.state` 的创建、
-  原子替换或删除通知后重新查找；文件只作为提示，不读取其内容，残留文件不代表存活。
-  Watch 和 CLI 共用持久运行时的状态文件。观察器挂好或重新绑定后再检查一次，
-  避免初始化期间漏掉启动；窗口激活和 CLI 命令完成也触发一次检查。
-  不引入 IPC、定时器、进程枚举轮询或额外观察线程；GUI 关闭时唤醒并等待
-  观察线程结束，进程与事件句柄随各自生命周期释放。文件和注册表仍使用变化通知。
+  运行标志读取 Windows SCM 中 `SunPackWatchBroker` 的状态，仅 `SERVICE_RUNNING`
+  显示运行中；普通 runtime 命令和残留状态文件不影响该标志。
+  复用注册表观察线程，通过 `NotifyServiceStatusChangeW` 订阅状态变化，使用
+  `WaitForMultipleObjectsEx(INFINITE, TRUE)` 接收 APC。回调只记录结果并释放 SCM 返回的
+  名称缓冲区，状态读取和重新订阅由等待线程完成，避免回调中的 SCM/RPC 重入。
+  查询后订阅其他状态，覆盖查询和订阅之间的变化；服务未安装或正在卸载时，改为
+  订阅 SCM 服务创建/删除事件，安装后自动恢复。访问失败显示状态未知，窗口激活或
+  CLI 命令完成可触发一次重试；通知落后时立即重连一次，不安排定时重试。
+  不引入应用层 IPC、轮询、新线程或后台服务。关闭时在观察线程上取消订阅并排空
+  已入队 APC，之后释放通知缓冲区；线程结束后 GUI 再释放其余事件句柄。
+  该标志表示监控代理运行：最后一个 Watch 客户端退出后 broker 约一秒后停止，
+  一次性 Watch 也可能短暂启动 broker，因此不等同于长期监控任务已启用。
+  APC 和取消规则参照 [Microsoft 的服务状态通知文档](https://learn.microsoft.com/en-us/windows/win32/api/winsvc/nf-winsvc-notifyservicestatuschangew)。
   状态未变化时不更新界面。主界面不显示数据目录或日志路径页脚。
   资源管理器入口定位文件，避免执行伪装成 `.exe` 的压缩包。
 

@@ -524,7 +524,7 @@ LRESULT CALLBACK Application::subclass(HWND hwnd,UINT message,WPARAM wparam,LPAR
         }
         if(message==Dispatch) { self->dispatch(); return 0; }
         if(message==Update) { self->apply_pending(); return 0; }
-        if(message==WM_ACTIVATE && LOWORD(wparam)!=WA_INACTIVE) { self->changed(Startup); SetEvent(self->runtime_changed_); }
+        if(message==WM_ACTIVATE && LOWORD(wparam)!=WA_INACTIVE) { self->changed(Startup); SetEvent(self->service_refresh_); }
         if(message==WM_SETTINGCHANGE && page_value(self->page_,"theme")=="system") apply_theme(self->page_,system_theme(),self->hwnd_);
     } catch(const std::exception& e) { set_text(self->page_,"actionError",translated_error(e.what(),page_value(self->page_,"language").get<std::string>())); }
     return DefSubclassProc(hwnd,message,wparam,lparam);
@@ -560,7 +560,7 @@ void Application::open() {
     SendMessageW(hwnd_,WM_SETICON,ICON_SMALL,reinterpret_cast<LPARAM>(icon));
     SetPropW(hwnd_,mutex_name(options_.data_dir,L"SunPack.GUI").c_str(),reinterpret_cast<HANDLE>(1));
     if(!SetWindowSubclass(hwnd_,subclass,1,reinterpret_cast<DWORD_PTR>(this))) win_error("GUI subclass");
-    if(!runtime_changed_.value) win_error("Runtime change event");
+    if(!service_refresh_.value) win_error("Service refresh event");
     ui_page_on_widget_mount(page_,"dispatch",[](UiPage,UiWidget,void* context){
         auto* self=static_cast<Application*>(context); PostMessageW(self->hwnd_,Dispatch,0,0);
     },this);
@@ -586,27 +586,25 @@ void Application::open() {
         RegOpenKeyExW(HKEY_CURRENT_USER,L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",0,KEY_NOTIFY,&key);
         Handle event(CreateEventW(nullptr,TRUE,FALSE,nullptr));
         bool watching=key && RegNotifyChangeKeyValue(key,FALSE,REG_NOTIFY_CHANGE_LAST_SET,event,TRUE)==ERROR_SUCCESS;
-        RuntimeMonitor runtime(executable_path().parent_path()/"sunpack-runtime.exe");
+        ServiceMonitor broker;
         Json previous;
         bool refresh=true;
         for(;;) {
-            if(refresh) {
+            if(refresh || broker.changed()) {
                 Json status;
-                try { status={{"known",true},{"running",runtime.running()}}; }
+                try { status={{"known",true},{"running",broker.running()}}; }
                 catch(...) { status={{"known",false},{"running",false}}; }
                 if(status!=previous) { publish({{"runtime",status}}); previous=std::move(status); }
                 refresh=false;
             }
-            // Filesystem hints remain signaled until consumed; a process that
-            // exits during discovery leaves its kernel handle signaled as well.
-            HANDLE waits[]={stop_,runtime_changed_,nullptr,nullptr};
-            DWORD count=2, process_index=MAXDWORD, registry_index=MAXDWORD;
-            if(auto process=runtime.process_handle()) { process_index=count; waits[count++]=process; }
-            if(watching) { registry_index=count; waits[count++]=event; }
-            auto signal=WaitForMultipleObjects(count,waits,FALSE,INFINITE);
+            // SCM RPC may already have delivered an APC while subscribing.
+            if(broker.changed()) continue;
+            HANDLE waits[]={stop_,service_refresh_,event};
+            auto signal=WaitForMultipleObjectsEx(watching?3:2,waits,FALSE,INFINITE,TRUE);
             if(signal==WAIT_OBJECT_0 || signal==WAIT_FAILED) break;
-            if(signal==WAIT_OBJECT_0+1 || (process_index!=MAXDWORD && signal==WAIT_OBJECT_0+process_index)) refresh=true;
-            if(registry_index!=MAXDWORD && signal==WAIT_OBJECT_0+registry_index) {
+            if(signal==WAIT_IO_COMPLETION) continue;
+            if(signal==WAIT_OBJECT_0+1) refresh=true;
+            if(watching && signal==WAIT_OBJECT_0+2) {
                 ResetEvent(event); changed(Startup);
                 watching=RegNotifyChangeKeyValue(key,FALSE,REG_NOTIFY_CHANGE_LAST_SET,event,TRUE)==ERROR_SUCCESS;
             }
@@ -639,9 +637,8 @@ void Application::work() {
         auto on_data=[this,dir_key](const fs::path& path){
             auto name=path.filename().wstring(); CharLowerBuffW(name.data(),DWORD(name.size()));
             if(path.empty() || is_under(dir_key,path_key(path))) {
-                SetEvent(runtime_changed_); changed(Config|Passwords|Roots); return;
+                changed(Config|Passwords|Roots); return;
             }
-            if(is_runtime_state_name(name) && path_key(path.parent_path())==dir_key) SetEvent(runtime_changed_);
             if(name.empty() || name==L"sunpack_config.json") changed(Config);
             if(name.empty() || name==L"builtin_passwords.json") changed(Passwords);
             if(name.empty() || name==L"sunpack_watch_roots.txt") changed(Roots);
@@ -682,9 +679,6 @@ void Application::work() {
             if(!data_watcher || !data_watcher->alive() || (!data_watcher->direct() && fs::is_directory(dir))) {
                 try {
                     data_watcher=std::make_unique<DirectoryWatcher>(dir,on_data); errors.erase("文件观察器");
-                    // Reconcile after arming, covering starts between the initial
-                    // process snapshot and this watch (also after a rebind).
-                    SetEvent(runtime_changed_);
                 }
                 catch(const std::exception& e) { errors["文件观察器"]=e.what(); }
             }
@@ -728,7 +722,7 @@ void Application::work() {
                         else if(action=="startupEnable" || action=="startupDisable") { args.push_back(L"startup"); args.push_back(action=="startupEnable"?L"enable":L"disable"); }
                         else throw std::runtime_error("不支持的 CLI 操作");
                         auto result=run_cli(options_.cli,args,stop_);
-                        SetEvent(runtime_changed_);
+                        SetEvent(service_refresh_);
                         try { wide(result.output); } catch(...) { result.output=tr("cliEncoding",language); }
                         Json feedback={{"busy",false},{"lastCommand",{{"action",action},{"code",result.code}}}};
                         if(result.code!=0) {

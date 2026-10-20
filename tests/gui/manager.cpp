@@ -6,6 +6,7 @@
 #include <iostream>
 
 using namespace spg;
+void service_notifications();
 namespace {
 void fails(const std::function<void()>& action) { bool failed=false; try { action(); } catch(const std::exception&) { failed=true; } assert(failed); }
 struct Fixture {
@@ -256,67 +257,13 @@ void batch_editing(Fixture& fixture) {
     view.password_query=utf8(dir.wstring());
     auto matches=password_rows(saved,view); assert(matches["total"]==1 && matches["rows"][0]["scopes"]==utf8(dir.wstring()));
 }
-void runtime_identity(Fixture& fixture) {
-    struct Child {
-        Handle process, thread;
-        Child(const fs::path& path) {
-            auto command=quote_arg(path.wstring())+L" --echo";
-            STARTUPINFOW startup{}; startup.cb=sizeof(startup); PROCESS_INFORMATION info{};
-            if(!CreateProcessW(path.c_str(),command.data(),nullptr,nullptr,FALSE,CREATE_SUSPENDED|CREATE_NO_WINDOW,nullptr,nullptr,&startup,&info)) win_error("Test runtime");
-            process.value=info.hProcess; thread.value=info.hThread;
-        }
-        void exit() { ResumeThread(thread); assert(WaitForSingleObject(process,10000)==WAIT_OBJECT_0); }
-        ~Child() { if(WaitForSingleObject(process,0)==WAIT_TIMEOUT) { TerminateProcess(process,1); WaitForSingleObject(process,10000); } }
-    };
-    auto installed=fixture.dir/"installed"/"sunpack-runtime.exe", other=fixture.dir/"other"/"sunpack-runtime.exe";
-    fs::create_directories(installed.parent_path()); fs::create_directories(other.parent_path());
-    fs::copy_file(executable_path(),installed); fs::copy_file(executable_path(),other);
-    RuntimeMonitor monitor(installed);
-    assert(!monitor.running());
-    auto data=fixture.dir/"runtime-data", state=data/"runtime-v2-fixture.state";
-    fs::create_directory(data);
-    Handle changed(CreateEventW(nullptr,FALSE,FALSE,nullptr)); assert(changed.value);
-    DirectoryWatcher watcher(data,[&](const fs::path& path){
-        auto name=path.filename().wstring(); CharLowerBuffW(name.data(),DWORD(name.size()));
-        if(path.empty() || is_runtime_state_name(name)) SetEvent(changed);
-    });
-    Child unrelated(other);
-    atomic_write(state,"stale state is only a discovery hint");
-    assert(WaitForSingleObject(changed,10000)==WAIT_OBJECT_0);
-    assert(!monitor.running()); // Same name, different installation, despite a state file.
-    {
-        Child current(installed);
-        atomic_write(state,"replacement state");
-        assert(WaitForSingleObject(changed,10000)==WAIT_OBJECT_0);
-        assert(monitor.running());
-        fs::remove(state); // Metadata can disappear while the process is still alive.
-        assert(WaitForSingleObject(changed,10000)==WAIT_OBJECT_0);
-        assert(monitor.running());
-        current.exit();
-        assert(WaitForSingleObject(monitor.process_handle(),10000)==WAIT_OBJECT_0);
-        assert(!monitor.running());
-    }
-    {
-        Child restarted(installed);
-        atomic_write(state,"left behind on crash");
-        assert(WaitForSingleObject(changed,10000)==WAIT_OBJECT_0);
-        assert(monitor.running());
-        // The cached object itself signals exit, without asking the monitor to
-        // rescan. It stays valid until the observer consumes that transition.
-        auto process=monitor.process_handle(); assert(process);
-        assert(WaitForSingleObject(process,0)==WAIT_TIMEOUT);
-        restarted.exit(); assert(WaitForSingleObject(process,10000)==WAIT_OBJECT_0);
-        assert(!monitor.running() && !monitor.process_handle());
-    }
-    unrelated.exit();
-}
 }
 int wmain(int argc,wchar_t** argv) {
     CoInitializeEx(nullptr,COINIT_MULTITHREADED);
     if(argc==3 && std::wstring(argv[1])==L"--mutex") { std::cout<<utf8(mutex_name(argv[2]))<<"\n"<<utf8(mutex_name(argv[2],L"SunPackWatchRoots"))<<"\n"; return 0; }
     if(argc>=2 && std::wstring(argv[1])==L"--echo") { Json args=Json::array(); for(int i=2;i<argc;++i) args.push_back(utf8(argv[i])); std::cout<<args.dump(); return 7; }
     if(argc==4 && std::wstring(argv[1])==L"--password-add") { edit_password(argv[2],"add",Json(),Json({{"value",utf8(argv[3])}})); return 0; }
-    try { Fixture f; projection(f); editing(f); roots(f); installer_upgrade(f); batch_editing(f); runtime_identity(f); std::cout<<"GUI file contracts passed\n"; }
+    try { Fixture f; projection(f); editing(f); roots(f); installer_upgrade(f); batch_editing(f); service_notifications(); std::cout<<"GUI file contracts passed\n"; }
     catch(const std::exception& e) { std::cerr<<e.what()<<"\n"; return 1; }
     CliCommand cli{executable_path(),fs::temp_directory_path(),{L"--echo"}};
     Handle stop(CreateEventW(nullptr,TRUE,FALSE,nullptr));
