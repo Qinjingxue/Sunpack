@@ -234,6 +234,7 @@ def test_departed_unowned_path_is_still_forgotten(tmp_path):
     scheduler.log = SimpleNamespace(write=lambda *_args, **_kwargs: None)
     scheduler._wake_callback = None
 
+    source.unlink()
     scheduler.notify_path_departed(str(source))
 
     assert state.pending_work_for_path(str(source)) is None

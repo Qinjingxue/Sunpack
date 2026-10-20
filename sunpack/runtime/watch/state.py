@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field, replace
-import errno
 import os
-import stat
 import threading
 import time
 import weakref
@@ -31,6 +29,7 @@ from sunpack.core.support.resource_lifecycle import (
 DEFAULT_JOURNAL_COMPACT_RECORDS = 8192
 DEFAULT_JOURNAL_COMPACT_BYTES = 8 * 1024 * 1024
 DEFAULT_JOURNAL_HARD_BYTES = 256 * 1024 * 1024
+_recorded_file_presence = NativeWatchState.file_presence
 
 
 class WatchStateJournalError(RuntimeError):
@@ -1047,9 +1046,16 @@ class WatchStateStore:
                 self._delete_operation("pending_work", key),
             ], durable=use_durable)
 
-    def forget_path(self, path: str, *, recursive: bool = False) -> bool:
+    def forget_path(self, path: str, *, recursive: bool = False, missing_only: bool = False) -> bool:
+        """Retire records; filesystem events only retire proven missing inputs.
+
+        Missing-only retirement preserves pending output recovery even when
+        the event names an ancestor directory rather than its owner file.
+        """
         with self._state_lock:
-            pending_keys, entry_keys = self._native.keys_matching(os.path.abspath(path), recursive)
+            pending_keys, entry_keys = self._native.keys_matching(
+                os.path.abspath(path), recursive, missing_only=missing_only,
+            )
             operations = [
                 *(self._delete_operation("pending_work", key) for key in pending_keys),
                 *(self._delete_operation("entries", key) for key in entry_keys),
@@ -1154,12 +1160,12 @@ class WatchStateStore:
                 for key in sorted(keys)
             ])
 
-    def prune_missing_records(self) -> int:
-        """Remove retry records whose concrete filesystem paths are gone."""
+    def prune_missing_records(self, path: str | None = None, *, recursive: bool = False) -> int:
+        """Remove proven missing blockers in one scope, preserving recovery."""
         with self._state_lock:
             entry_keys = [
                 key
-                for key, recorded_path in self._native.entry_paths()
+                for key, recorded_path in self._native.entry_paths(path, recursive)
                 if _recorded_file_presence(recorded_path) is False
             ]
             self._commit_operations_locked([
@@ -1224,18 +1230,22 @@ class WatchStateStore:
         error: str = "",
         failure_payload: dict[str, Any] | None = None,
         password_generation: int | None = None,
-    ) -> None:
+    ) -> bool:
+        """Publish a live blocker, or retire it when its source is already gone."""
         with self._state_lock:
             key = _path_key(path)
             previous = self._entry_record(key)
             payload = dict(failure_payload or {})
             blockers = {str(value) for value in payload.get("blockers") or []}
-            if status not in {"failed_password", "suspended_missing_volume"} and not blockers:
+            if (
+                (status not in {"failed_password", "suspended_missing_volume"} and not blockers)
+                or _recorded_file_presence(path) is False
+            ):
                 if previous is not None:
                     self._commit_operations_locked([
                         self._delete_operation("entries", key),
                     ], durable=True)
-                return
+                return False
             entry = WatchStateEntry(
                 path=os.path.abspath(path),
                 size=size,
@@ -1254,23 +1264,11 @@ class WatchStateStore:
             self._commit_operations_locked([
                 self._put_operation("entries", key, entry),
             ], durable=True)
+            return True
 
 def _path_key(path: str) -> str:
     # One key function with NativeWatchState, which keys its record maps.
     return watch_path_key(str(path))
-
-
-def _recorded_file_presence(path: str) -> bool | None:
-    """Return ``True``/``False`` for known file presence, ``None`` if unknown."""
-
-    if not str(path or "").strip():
-        return False
-    try:
-        return stat.S_ISREG(os.stat(path).st_mode)
-    except OSError as exc:
-        if exc.errno in {errno.ENOENT, errno.ENOTDIR} or getattr(exc, "winerror", None) in {2, 3}:
-            return False
-        return None
 
 
 def _is_path_under(path: str, root: str) -> bool:

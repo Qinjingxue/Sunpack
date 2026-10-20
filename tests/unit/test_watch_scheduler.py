@@ -1510,6 +1510,7 @@ def test_candidate_deadline_changes_wake_watch_service(tmp_path, monkeypatch):
     watcher.enqueue(str(archive), event_type="modified")
     assert wakeups == ["wake", "wake"]
 
+    archive.unlink()
     watcher.notify_path_departed(str(archive))
     assert wakeups == ["wake", "wake", "wake"]
 

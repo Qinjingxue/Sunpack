@@ -41,7 +41,7 @@ from sunpack.runtime.watch.scanner import (
     watch_volume_cursor,
 )
 from sunpack.runtime.watch.scanner import _candidate_for as _watch_candidate_for_path
-from sunpack.runtime.watch.state import WatchStateEntry, WatchStateStore
+from sunpack.runtime.watch.state import WatchStateEntry, WatchStateStore, _recorded_file_presence
 from sunpack.runtime.watch.roots import WatchRootEntry
 from sunpack.runtime.watch.toast import NullWatchNotificationSink
 from sunpack.core.i18n import I18nContext
@@ -1348,6 +1348,19 @@ class WatchScheduler:
     def notify_path_departed(self, path: str, *, recursive: bool = False) -> None:
         normalized = os.path.abspath(path)
         with self._claim_gate:
+            # Delete/move notifications may arrive after the path was recreated,
+            # or while it is temporarily unqueryable. Neither proves departure.
+            if _recorded_file_presence(normalized) is not False and not recursive:
+                return
+            missing_paths: dict[str, bool] = {}
+
+            def departed(candidate_path: str) -> bool:
+                if not _paths_match(candidate_path, normalized, recursive=recursive):
+                    return False
+                if candidate_path not in missing_paths:
+                    missing_paths[candidate_path] = _recorded_file_presence(candidate_path) is False
+                return missing_paths[candidate_path]
+
             claimed = [
                 (claim_path, owner)
                 for claim_path, owner in self._active_claims.items()
@@ -1364,7 +1377,7 @@ class WatchScheduler:
                 pending_paths = [
                     candidate_path
                     for candidate_path in self._pending
-                    if _paths_match(candidate_path, normalized, recursive=recursive)
+                    if departed(candidate_path)
                 ]
                 for candidate_path in pending_paths:
                     self._remove_pending_locked(candidate_path)
@@ -1372,14 +1385,14 @@ class WatchScheduler:
                 tracker_paths = [
                     candidate_path
                     for candidate_path in self._quiet_trackers
-                    if _paths_match(candidate_path, normalized, recursive=recursive)
+                    if departed(candidate_path)
                 ]
                 for candidate_path in tracker_paths:
                     self._quiet_trackers.pop(candidate_path, None)
                 observation_paths = [
                     candidate_path
                     for candidate_path in self._latest_observations
-                    if _paths_match(candidate_path, normalized, recursive=recursive)
+                    if departed(candidate_path)
                 ]
                 for candidate_path in observation_paths:
                     self._latest_observations.pop(candidate_path, None)
@@ -1392,11 +1405,13 @@ class WatchScheduler:
                 pending_record is not None
                 and (pending_record.active_outputs or pending_record.committed_roots)
             )
-            forgotten = (
-                False
-                if inflight_owned or recovery_armed
-                else self.state.forget_path(normalized, recursive=recursive)
-            )
+            if inflight_owned or recovery_armed:
+                # Only output recovery needs ownership protection. A blocker
+                # for a vanished source is already invalid, including siblings.
+                self.state.prune_missing_records(normalized, recursive=recursive)
+                forgotten = False
+            else:
+                forgotten = self.state.forget_path(normalized, recursive=recursive, missing_only=True)
         self.log.write(
             "candidate_departed",
             path=normalized,
@@ -1900,7 +1915,7 @@ class WatchScheduler:
                 # A successful sibling family may have consumed this input
                 # while an earlier incomplete request was still finishing.
                 # Never resurrect a blocker for a deleted physical input.
-                self.state.clear_entries([retry_path])
+                self.state.prune_missing_records(retry_path)
                 retired_failures.append(failure)
                 continue
             if self.pipeline_engine.completed_watch_family_output(
@@ -1924,7 +1939,7 @@ class WatchScheduler:
             with self._password_source_lock:
                 # Publish before comparing under the same lock used by password
                 # updates: either this completion or the update queues a retry.
-                self.state.mark(
+                published = self.state.mark(
                     retry_candidate.path, retry_candidate.size, retry_candidate.mtime,
                     file_id=retry_candidate.file_id, change_usn=retry_candidate.change_usn,
                     status=status, error=error, failure_payload=payload,
@@ -1934,6 +1949,9 @@ class WatchScheduler:
                     password and not missing
                     and request.password_generation < self.state.password_generation
                 )
+            if not published:
+                retired_failures.append(failure)
+                continue
             if retry_password:
                 self._mark_all_password_failures_dirty()
             self.log.write(status, path=retry_candidate.path, error=error, failures=[payload])

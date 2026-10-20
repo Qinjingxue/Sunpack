@@ -314,6 +314,7 @@ def test_journal_operation_with_unexpected_field_is_rejected(tmp_path):
 def test_duplicate_sequence_is_rejected(tmp_path):
     state_path = tmp_path / "state.json"
     archive = tmp_path / "failed.7z"
+    archive.touch()
     state = WatchStateStore(str(state_path))
     state.mark(
         str(archive),
@@ -631,11 +632,18 @@ def test_active_work_persists_force_cause_for_restart(tmp_path):
     assert pending.force is True
 
 
-def test_prune_missing_records_removes_stale_entries(tmp_path):
+def test_prune_missing_records_scopes_stale_entries_without_removing_recovery(tmp_path):
     state = WatchStateStore(str(tmp_path / "state.json"))
-    present = tmp_path / "present.zip"
-    missing = tmp_path / "missing.zip"
+    directory = tmp_path / "group"
+    directory.mkdir()
+    present = directory / "present.zip"
+    missing = directory / "missing.zip"
+    committed = directory / "committed.zip"
+    unrelated = tmp_path / "unrelated.zip"
     present.write_bytes(b"present")
+    missing.touch()
+    committed.touch()
+    unrelated.touch()
 
     state.mark(
         str(present),
@@ -651,12 +659,28 @@ def test_prune_missing_records_removes_stale_entries(tmp_path):
         status="failed_password",
         failure_payload={"blockers": ["password"]},
     )
+    state.mark(str(unrelated), 1, 1.0, status="failed_password")
+    state.queue_active(_candidate(missing), durable_owner=True, persist=True, durable=True)
+    state.record_task_output_started(str(missing), str(missing), str(tmp_path / "partial-output"))
+    state.mark(str(committed), 1, 1.0, status="suspended_missing_volume")
+    state.queue_active(_candidate(committed), durable_owner=True, persist=True, durable=True)
+    output = str(tmp_path / "committed-output")
+    state.record_task_output_started(str(committed), str(committed), output)
+    state.record_task_output_finished(str(committed), str(committed), output, keep_output=True)
 
-    removed_entries = state.prune_missing_records()
+    missing.unlink()
+    committed.unlink()
+    unrelated.unlink()
+    removed_entries = state.prune_missing_records(str(directory), recursive=True)
 
-    assert removed_entries == 1
+    assert removed_entries == 2
     assert state.latest_entry_for_path(str(present)) is not None
     assert state.latest_entry_for_path(str(missing)) is None
+    assert state.latest_entry_for_path(str(unrelated)) is not None
+    assert not state.forget_path(str(directory), recursive=True, missing_only=True)
+    assert state.pending_work_for_path(str(missing)).active_outputs
+    assert state.pending_work_for_path(str(committed)).committed_roots == [output]
+    assert state.prune_missing_records() == 1
 
 
 def test_prune_missing_records_retains_records_when_presence_is_unknown(tmp_path, monkeypatch):
@@ -670,22 +694,18 @@ def test_prune_missing_records_retains_records_when_presence_is_unknown(tmp_path
         status="failed_password",
         failure_payload={"blockers": ["password"]},
     )
-    original_stat = watch_state_module.os.stat
-
-    def blocked_stat(path, *args, **kwargs):
-        if str(path).casefold() == str(archive).casefold():
-            raise PermissionError("temporary access failure")
-        return original_stat(path, *args, **kwargs)
-
-    monkeypatch.setattr(watch_state_module.os, "stat", blocked_stat)
+    archive.unlink()
+    monkeypatch.setattr(watch_state_module, "_recorded_file_presence", lambda _path: None)
 
     assert state.prune_missing_records() == 0
     assert state.latest_entry_for_path(str(archive)) is not None
+    assert state.mark(str(archive), 1, 1.0, status="failed_password")
 
 
 def test_native_checkpoint_round_trips_nested_unicode_payload(tmp_path):
     state_path = tmp_path / "state.json"
     archive = tmp_path / "雪-special.zip"
+    archive.touch()
     state = WatchStateStore(str(state_path))
     state.mark(
         str(archive),

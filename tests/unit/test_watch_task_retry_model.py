@@ -97,6 +97,112 @@ async def _complete(watcher, candidate, response):
     return await watcher._complete_candidate(request)
 
 
+@pytest.mark.parametrize("failure_kind", [FailureKind.MISSING_VOLUME, FailureKind.WRONG_PASSWORD])
+def test_departed_claimed_blocker_is_retired_without_losing_recovery(tmp_path, monkeypatch, failure_kind):
+    # Covers the missing hand-off between departure and source-claim release;
+    # the existing late-failure test starts with an already successful family.
+    async def scenario():
+        watcher, root, output, _sink = _watcher(tmp_path, monkeypatch)
+        try:
+            head = root / "archive.part1.rar"
+            temporary = root / "archive.part2.rar.downloading"
+            final = root / "archive.part2.rar"
+            head.write_text("head")
+            temporary.write_text("part")
+            candidate = _candidate(temporary)
+            failure = FailureInfo(failure_kind, "password_resolution", "blocked input")
+            assert (await _complete(watcher, candidate, _response(
+                TargetRunResult(str(temporary), OutcomeKind.FAILURE, failure=failure),
+            ))).failed == 1
+            watcher.state.queue_active(candidate, durable_owner=True, persist=True, durable=True)
+            active = str(output / "active")
+            committed = str(output / "committed")
+            watcher.state.record_task_output_started(str(temporary), str(temporary), committed)
+            watcher.state.record_task_output_finished(str(temporary), str(temporary), committed, keep_output=True)
+            watcher.state.record_task_output_started(str(temporary), str(head), active)
+            recovery = watcher.state.pending_work_for_path(str(temporary))
+            watcher._claim_pipeline_sources("owner", [str(head), str(temporary)])
+
+            temporary.rename(final)
+            watcher.notify_path_departed(str(temporary))
+            assert watcher.state.latest_entry_for_path(str(temporary)) is None
+            assert watcher.state.pending_work_for_path(str(temporary)) == recovery
+            watcher._release_pipeline_source_claims("owner")
+            assert (await _complete(watcher, _candidate(head), PipelineResponse(
+                "success", RunSummary(target_results=(
+                    TargetRunResult(str(head), OutcomeKind.COMPLETE_SUCCESS, output_dir=str(output)),
+                )), discovery=PipelineDiscovery(claimed_paths=(str(head), str(final))),
+            ))).succeeded == 1
+            assert not watcher.state.entries
+            watcher.state.save()
+            reopened = WatchStateStore(str(watcher.state.path))
+            try:
+                assert not reopened.entries
+                assert reopened.pending_work_for_path(str(temporary)) == recovery
+            finally:
+                reopened.close()
+        finally:
+            await watcher.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_departure_between_failure_observation_and_publication_cannot_resurrect_blocker(tmp_path, monkeypatch):
+    # Force the narrow race without a sleep or a load-sensitive thread schedule.
+    async def scenario():
+        watcher, root, _output, sink = _watcher(tmp_path, monkeypatch)
+        try:
+            source = root / "archive.blob"
+            source.write_text("partial archive")
+            candidate = _candidate(source)
+            original_mark = watcher.state.mark
+
+            def depart_before_mark(*args, **kwargs):
+                source.unlink()
+                watcher.notify_path_departed(str(source))
+                return original_mark(*args, **kwargs)
+
+            monkeypatch.setattr(watcher.state, "mark", depart_before_mark)
+            failure = FailureInfo(FailureKind.WRONG_PASSWORD, "extraction", "wrong password")
+            result = await _complete(watcher, candidate, _response(
+                TargetRunResult(str(source), OutcomeKind.FAILURE, failure=failure),
+            ))
+            assert not watcher.state.entries
+            assert result.failed == 0
+            assert sink.actions[-1][0] == "suppressed"
+        finally:
+            await watcher.aclose()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("recursive", [False, True])
+def test_delayed_departure_preserves_recreated_input_and_pending_work(tmp_path, monkeypatch, recursive):
+    # A delayed delete/move notification must not erase a new generation's
+    # blocker or its queued crash-recovery work, including directory events.
+    async def scenario():
+        watcher, root, _output, _sink = _watcher(tmp_path, monkeypatch)
+        try:
+            directory = root
+            source = directory / "archive.blob"
+            source.write_text("old")
+            source.unlink()
+            source.write_text("new archive")
+            watcher.enqueue(str(source))
+            candidate = _candidate(source)
+            watcher.state.mark(candidate.path, candidate.size, candidate.mtime, status="failed_password")
+            entry = watcher.state.latest_entry_for_path(str(source))
+            pending = watcher.state.pending_work_for_path(str(source))
+            watcher.notify_path_departed(str(directory if recursive else source), recursive=recursive)
+            assert watcher.state.latest_entry_for_path(str(source)) == entry
+            assert watcher.state.pending_work_for_path(str(source)) == pending
+            assert watcher.pending_count == 1
+        finally:
+            await watcher.aclose()
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("invalidation", ["missing_member", "changed_member", "missing_output", "deep_detect"])
 def test_late_failure_cannot_overwrite_unchanged_success_but_new_failure_can(
     tmp_path, monkeypatch, invalidation,

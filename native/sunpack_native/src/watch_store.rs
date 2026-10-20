@@ -18,6 +18,21 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 const SNAPSHOT_BUFFER_BYTES: usize = 1024 * 1024;
 
+fn recorded_file_presence(path: &str) -> Option<bool> {
+    match std::fs::metadata(path) {
+        Ok(metadata) => Some(metadata.is_file()),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Some(false)
+        }
+        Err(_) => None,
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PendingRecord {
@@ -330,39 +345,101 @@ impl NativeWatchState {
         self.lock().entries.contains_key(&path_key(path))
     }
 
-    /// Keys of both collections at ``path`` (or under it when recursive).
-    fn keys_matching(&self, path: &str, recursive: bool) -> (Vec<String>, Vec<String>) {
+    /// Missing-only retirement keeps durable output recovery, even under a removed directory.
+    #[pyo3(signature = (path, recursive, *, missing_only=false))]
+    fn keys_matching(
+        &self,
+        py: Python<'_>,
+        path: &str,
+        recursive: bool,
+        missing_only: bool,
+    ) -> (Vec<String>, Vec<String>) {
         let expected = path_key(path);
         let matches =
             |key: &String| key == &expected || (recursive && is_path_under(key, &expected));
-        let data = self.lock();
-        let mut pending: Vec<String> = data
-            .pending
-            .keys()
-            .filter(|key| matches(key))
-            .cloned()
-            .collect();
-        let mut entries: Vec<String> = data
-            .entries
-            .keys()
-            .filter(|key| matches(key))
-            .cloned()
-            .collect();
-        pending.sort();
-        entries.sort();
-        (pending, entries)
+        let (pending, entries): (Vec<_>, Vec<_>) = {
+            let data = self.lock();
+            if recursive {
+                (
+                    data.pending
+                        .iter()
+                        .filter(|(key, _)| matches(key))
+                        .map(|(key, record)| (key.clone(), Arc::clone(record)))
+                        .collect(),
+                    data.entries
+                        .iter()
+                        .filter(|(key, _)| matches(key))
+                        .map(|(key, record)| (key.clone(), Arc::clone(record)))
+                        .collect(),
+                )
+            } else {
+                (
+                    data.pending
+                        .get(&expected)
+                        .map(|record| (expected.clone(), Arc::clone(record)))
+                        .into_iter()
+                        .collect(),
+                    data.entries
+                        .get(&expected)
+                        .map(|record| (expected.clone(), Arc::clone(record)))
+                        .into_iter()
+                        .collect(),
+                )
+            }
+        };
+        py.detach(move || {
+            let mut pending: Vec<_> = pending
+                .into_iter()
+                .filter(|(_, record)| {
+                    !missing_only
+                        || (record.active_outputs.is_empty()
+                            && record.committed_roots.is_empty()
+                            && recorded_file_presence(&record.path) == Some(false))
+                })
+                .map(|(key, _)| key)
+                .collect();
+            let mut entries: Vec<_> = entries
+                .into_iter()
+                .filter(|(_, record)| {
+                    !missing_only || recorded_file_presence(&record.path) == Some(false)
+                })
+                .map(|(key, _)| key)
+                .collect();
+            pending.sort();
+            entries.sort();
+            (pending, entries)
+        })
     }
 
-    /// ``(key, recorded path)`` of every retry entry.
-    fn entry_paths(&self) -> Vec<(String, String)> {
-        let mut paths: Vec<_> = self
-            .lock()
-            .entries
-            .iter()
-            .map(|(key, value)| (key.clone(), value.path.clone()))
-            .collect();
+    /// ``(key, recorded path)`` in the requested retry-entry scope.
+    #[pyo3(signature = (path=None, recursive=false))]
+    fn entry_paths(&self, path: Option<&str>, recursive: bool) -> Vec<(String, String)> {
+        let expected = path.map(path_key);
+        let data = self.lock();
+        let mut paths: Vec<_> = if let Some(key) = expected.as_ref().filter(|_| !recursive) {
+            data.entries
+                .get(key)
+                .map(|record| (key.clone(), record.path.clone()))
+                .into_iter()
+                .collect()
+        } else {
+            data.entries
+                .iter()
+                .filter(|(key, _)| {
+                    expected
+                        .as_ref()
+                        .is_none_or(|expected| *key == expected || is_path_under(key, expected))
+                })
+                .map(|(key, record)| (key.clone(), record.path.clone()))
+                .collect()
+        };
         paths.sort();
         paths
+    }
+
+    #[staticmethod]
+    fn file_presence(py: Python<'_>, path: &str) -> Option<bool> {
+        py.detach(|| recorded_file_presence(path))
     }
 
     fn watch_cursors<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
