@@ -2626,6 +2626,8 @@ def test_watch_scheduler_claim_removes_pending_sibling_before_source_cleanup_pro
     watcher.enqueue(str(sibling_volume))
     assert watcher.pending_count == 1
 
+    groups = [{"path": str(first_volume), "name": "split.7z",
+               "members": [str(first_volume), str(sibling_volume)]}]
     observed = []
     real_candidate = scheduler_module._candidate_for_event_path
 
@@ -2644,8 +2646,14 @@ def test_watch_scheduler_claim_removes_pending_sibling_before_source_cleanup_pro
         {
             "event": "task_sources_claimed",
             "source_paths": (str(first_volume), str(sibling_volume)),
+            "groups": groups,
         },
     )
+
+    import json
+    records = [json.loads(line) for line in watcher.log.path.read_text(encoding="utf-8").splitlines()]
+    claim = next(record for record in records if record["event"] == "pipeline_sources_claimed")
+    assert claim["path"] == str(first_volume) and claim["groups"] == groups
 
     # The pipeline claim consumes the old sibling event. During cleanup, even
     # a new watchdog event becomes only a dirty bit; no native file observation

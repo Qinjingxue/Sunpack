@@ -39,7 +39,7 @@ std::wstring scope_key(const fs::path& path) {
 }
 void check_text(const Json& value) {
     if (!value.is_string() || value.get_ref<const std::string&>().find('\0') != std::string::npos)
-        throw std::runtime_error("密码及作用域必须是无 NUL 的有效 Unicode 字符串");
+        throw std::runtime_error("passwordUnicodeRequired");
     wide(value.get<std::string>());
 }
 std::string pointer_escape(const std::string& key) {
@@ -89,19 +89,12 @@ struct JsonTokens {
 };
 std::string text_at(HANDLE f, uint64_t offset, size_t count) {
     LARGE_INTEGER pos{}; pos.QuadPart = offset;
-    if (!SetFilePointerEx(f, pos, nullptr, FILE_BEGIN)) win_error("Seek log");
+    if (!SetFilePointerEx(f, pos, nullptr, FILE_BEGIN)) win_error("opSeekLog");
     std::string out(count, 0); DWORD got = 0;
-    if (count && !ReadFile(f, out.data(), DWORD(count), &got, nullptr)) win_error("Read log");
+    if (count && !ReadFile(f, out.data(), DWORD(count), &got, nullptr)) win_error("opReadLog");
     out.resize(got); return out;
 }
-std::string event_status(const std::string& event) {
-    static const std::unordered_map<std::string,std::string> names = {
-        {"candidate_active","等待处理"}, {"candidate_busy","等待文件释放"}, {"candidate_quiet","准备处理"},
-        {"processing_started","正在处理"}, {"done","成功"}, {"failed_terminal","失败"}, {"partial_rejected","失败"},
-        {"failed_password","挂起：等待密码"}, {"suspended_missing_volume","挂起：等待分卷"},
-        {"retry_password_failure","等待重试"}, {"no_tasks_found","跳过"}, {"pipeline_request_coalesced","已合并"}};
-    auto it = names.find(event); return it == names.end() ? "" : it->second;
-}
+bool terminal(const Task& task) { return task.status=="taskSucceeded" || task.status=="taskFailed"; }
 using RootIndex=std::vector<std::pair<std::wstring,std::string>>;
 RootIndex index_roots(const WatchRoots& roots) {
     RootIndex index; index.reserve(roots.entries.size());
@@ -143,35 +136,37 @@ std::string task_time(const Task& task) {
 }
 Json parse_json(const std::string& text) {
     std::vector<std::set<std::string>> fields;
-    return Json::parse(text, [&fields](int, Json::parse_event_t event, Json& value) {
+    try { return Json::parse(text, [&fields](int, Json::parse_event_t event, Json& value) {
         if (event == Json::parse_event_t::object_start) fields.emplace_back();
         else if (event == Json::parse_event_t::key && !fields.back().insert(value.get<std::string>()).second)
-            throw std::runtime_error("JSON 包含重复字段");
+            throw std::runtime_error("jsonDuplicateKey");
         else if (event == Json::parse_event_t::object_end) fields.pop_back();
         return true;
-    });
+    }); } catch(const Json::parse_error& error) {
+        throw std::runtime_error(error_text("invalidJson",{{"byte",error.byte}}));
+    }
 }
 Json read_json(const fs::path& path) { return parse_json(read_file(path)); }
 void validate_passwords(const Json& j) {
     if (!j.is_object() || !j.contains("passwords") || !j["passwords"].is_array())
-        throw std::runtime_error("密码文件必须包含 passwords 数组");
+        throw std::runtime_error("passwordArrayRequired");
     for (auto it=j.begin(); it!=j.end(); ++it)
-        if (it.key() != "passwords" && it.key() != "clipboard_history") throw std::runtime_error("密码文件含未知字段");
+        if (it.key() != "passwords" && it.key() != "clipboard_history") throw std::runtime_error("passwordFileUnknownField");
     for (auto& record : j["passwords"]) {
-        if (!record.is_object() || !record.contains("value")) throw std::runtime_error("密码记录缺少 value");
+        if (!record.is_object() || !record.contains("value")) throw std::runtime_error("passwordValueRequired");
         check_text(record["value"]);
         for (auto it=record.begin(); it!=record.end(); ++it)
-            if (it.key() != "value" && it.key() != "scopes") throw std::runtime_error("密码记录含未知字段");
+            if (it.key() != "value" && it.key() != "scopes") throw std::runtime_error("passwordRecordUnknownField");
         if (record.contains("scopes")) {
-            if (!record["scopes"].is_array() || record["scopes"].empty()) throw std::runtime_error("目录密码的 scopes 不能为空");
+            if (!record["scopes"].is_array() || record["scopes"].empty()) throw std::runtime_error("passwordScopesEmpty");
             for (auto& scope : record["scopes"]) {
                 check_text(scope);
-                if (!absolute_windows(scope.get<std::string>())) throw std::runtime_error("密码作用域必须是 Windows 绝对目录");
+                if (!absolute_windows(scope.get<std::string>())) throw std::runtime_error("passwordScopeAbsolute");
             }
         }
     }
     if (j.contains("clipboard_history")) {
-        if (!j["clipboard_history"].is_array()) throw std::runtime_error("clipboard_history 必须为数组");
+        if (!j["clipboard_history"].is_array()) throw std::runtime_error("clipboardArrayRequired");
         for (auto& item : j["clipboard_history"]) check_text(item);
     }
 }
@@ -190,10 +185,10 @@ static std::string patch_config(std::string source,const Json& edits) {
         bool boolean=edit.at("boolean");
         try {
         Json::json_pointer target(pointer);
-        if (!j.contains(target) || tokens.token(pointer) != original) throw std::runtime_error("该字段已被外部修改，请重新选择后保存");
+        if (!j.contains(target) || tokens.token(pointer) != original) throw std::runtime_error("settingChanged");
         Json replacement = type == "string" ? Json(text) : type == "boolean" ? Json(boolean) : parse_json(text);
         if ((type == "number" && !replacement.is_number()) || (type == "array" && !replacement.is_array()) ||
-            (type == "object" && !replacement.is_object())) throw std::runtime_error("输入类型与字段类型不一致");
+            (type == "object" && !replacement.is_object())) throw std::runtime_error("settingTypeMismatch");
         std::string module;
         auto parent=pointer.substr(0,pointer.find_last_of('/'));
         if(j.contains(Json::json_pointer(parent))) {
@@ -223,7 +218,7 @@ void upgrade_config_file(const fs::path& path) {
     if(!fs::exists(path)) return;
     auto source=read_file(path);
     auto document=parse_json(source);
-    if(!document.is_object()) throw std::runtime_error("Configuration must be a JSON object");
+    if(!document.is_object()) throw std::runtime_error("configObjectRequired");
     bool changed=false;
     auto erase_member=[&](const std::string& pointer) {
         JsonTokens tokens(source,true);
@@ -270,19 +265,19 @@ static void patch_password(Json& j, const std::string& op, const Json& original,
     }
     else {
         auto it = std::find(records.begin(), records.end(), original);
-        if (it == records.end()) throw std::runtime_error("密码记录已被外部修改，请重新选择");
+        if (it == records.end()) throw std::runtime_error("passwordChanged");
         if (op == "delete") records.erase(it);
         else if (op == "removeScope") {
-            if (!it->contains("scopes") || scope.empty()) throw std::runtime_error("只能移除直接绑定的作用域");
+            if (!it->contains("scopes") || scope.empty()) throw std::runtime_error("scopeNotDirect");
             auto& scopes = (*it)["scopes"];
             auto end = std::remove_if(scopes.begin(), scopes.end(), [selected_scope=scope_key(wide(scope))](const Json& s) {
                 return scope_key(wide(s.get<std::string>())) == selected_scope;
             });
-            if (end == scopes.end()) throw std::runtime_error("当前目录不是直接作用域");
+            if (end == scopes.end()) throw std::runtime_error("scopeInherited");
             scopes.erase(end, scopes.end());
             if (scopes.empty()) records.erase(it);
         } else if (op == "replace") *it = replacement;
-        else throw std::runtime_error("未知密码操作");
+        else throw std::runtime_error("passwordOperationUnknown");
     }
     validate_passwords(j);
 }
@@ -320,11 +315,11 @@ WatchRoots parse_roots(const std::string& raw, const fs::path& base) {
             auto sep=value.find('|',at); parts.push_back(trim(value.substr(at,sep==std::string::npos?sep:sep-at)));
             if (sep==std::string::npos) break; at=sep+1;
         }
-        if (parts.size()>3) throw std::runtime_error("监控目录每行最多包含 input | output | deep_detect");
+        if (parts.size()>3) throw std::runtime_error("rootsLineInvalid");
         if (parts[0].empty()) continue;
         std::string deep = parts.size()==3 ? parts[2] : "";
         std::transform(deep.begin(),deep.end(),deep.begin(),[](unsigned char c){ return char(tolower(c)); });
-        if (!deep.empty() && deep!="true" && deep!="false") throw std::runtime_error("deep_detect 只能是 true 或 false");
+        if (!deep.empty() && deep!="true" && deep!="false") throw std::runtime_error("deepDetectInvalid");
         WatchRoot entry{resolve_path(wide(parts[0]),base), parts.size()>=2?parts[1]:"", deep=="true"};
         auto key=path_key(entry.input); auto it=positions.find(key);
         if (it==positions.end()) { positions[key]=result.entries.size(); result.entries.push_back(entry); }
@@ -342,11 +337,11 @@ WatchRoots apply_root_changes(WatchRoots roots,const fs::path& base,const Json& 
         bool deep=edit.at("deep");
         auto path = resolve_path(wide(input),base);
         if (input.empty() || input.find_first_of("|\r\n") != std::string::npos || output.find_first_of("|\r\n") != std::string::npos)
-            throw std::runtime_error("目录不能为空且不能包含分隔符或换行");
-        if (op!="delete" && !fs::is_directory(path)) throw std::runtime_error("监控目录必须是已存在的文件夹");
+            throw std::runtime_error("rootInvalid");
+        if (op!="delete" && !fs::is_directory(path)) throw std::runtime_error("rootMissing");
         auto previous = original.empty()?std::wstring():path_key(wide(original));
         auto it=std::find_if(roots.entries.begin(),roots.entries.end(),[&](auto& r){return path_key(r.input)==previous;});
-        if (!original.empty() && it==roots.entries.end()) throw std::runtime_error("监控目录已被外部删除");
+        if (!original.empty() && it==roots.entries.end()) throw std::runtime_error("rootRemoved");
         if(!original.empty() && edit.contains("expected") && !edit["expected"].is_null() &&
             (it->output!=edit["expected"].value("output",std::string()) || it->deep!=edit["expected"].value("deep",false)))
             throw std::runtime_error("rootConflict");
@@ -356,7 +351,7 @@ WatchRoots apply_root_changes(WatchRoots roots,const fs::path& base,const Json& 
             auto duplicate=std::find_if(roots.entries.begin(),roots.entries.end(),[&](auto& r){return path_key(r.input)==key;});
             if (duplicate!=roots.entries.end() && duplicate!=it) {
                 if(batch && duplicate->output==trim(output) && duplicate->deep==deep) return;
-                throw std::runtime_error("监控目录已存在");
+                throw std::runtime_error("rootDuplicate");
             }
             WatchRoot replacement{path,trim(output),deep};
             if(it==roots.entries.end()) roots.entries.push_back(replacement); else *it=replacement;
@@ -408,46 +403,142 @@ std::string root_for(const fs::path& path,const WatchRoots& roots) {
 }
 void EventLog::set_path(const fs::path& p) {
     if (path_==p) return;
-    path_=p; offset_=identity_=sequence_=volume_=0; prefix_.clear(); anchor_.clear(); pending_.clear(); tasks.clear(); malformed=0;
+    path_=p; offset_=identity_=sequence_=volume_=0; prefix_.clear(); anchor_.clear(); pending_.clear(); tasks.clear(); aliases_.clear(); malformed=0;
     changed_keys.clear(); rebuilt=true; changed_overflow=false;
 }
-void EventLog::accept(const Json& j) {
-    if (!j.is_object() || !j.contains("event") || !j["event"].is_string() || !j.contains("path") || !j["path"].is_string()) return;
-    auto event=j["event"].get<std::string>(), path=j["path"].get<std::string>();
-    if (path.empty()) return;
-    auto status=event_status(event); auto key=path_key(wide(path));
-    if (status.empty()) return;
-    Task t; t.path=path; t.status=status; t.sequence=++sequence_;
-    if(j.contains("output_dirs") && j["output_dirs"].is_array())
-        for(auto& output:j["output_dirs"]) if(output.is_string() && !output.get_ref<const std::string&>().empty()) t.outputs.push_back(output.get<std::string>());
-    if(j.contains("ts") && j["ts"].is_number()) { t.timestamp=j["ts"].get<double>(); t.has_timestamp=std::isfinite(t.timestamp); if(!t.has_timestamp) t.timestamp=0; }
-    else if(j.contains("time") && j["time"].is_string()) {
-        if(auto parsed=iso_timestamp(j["time"].get<std::string>())) { t.timestamp=*parsed; t.has_timestamp=true; }
-    }
-    tasks[key]=std::move(t);
+void EventLog::mark_changed(const std::wstring& key) {
+    ++sequence_;
     if(changed_keys.size()<32) changed_keys.insert(key); else changed_overflow=true;
+}
+void EventLog::erase_task(const std::wstring& key) {
+    auto it=tasks.find(key);
+    if(it==tasks.end()) return;
+    for(auto& member:it->second.members) aliases_.erase(member);
+    tasks.erase(it); mark_changed(key);
+}
+void EventLog::accept_group(const Json& group) {
+    if(!group.is_object() || !group.contains("path") || !group["path"].is_string() ||
+        !group.contains("members") || !group["members"].is_array()) return;
+    auto path=group["path"].get<std::string>();
+    if(path.empty()) return;
+    std::unordered_set<std::wstring> members;
+    for(auto& member:group["members"]) if(member.is_string() && !member.get_ref<const std::string&>().empty()) {
+        members.insert(path_key(wide(member.get_ref<const std::string&>())));
+    }
+    if(members.empty()) return;
+    auto key=path_key(wide(path));
+    std::unordered_set<std::wstring> previous;
+    for(auto& member:members) {
+        auto alias=aliases_.find(member);
+        auto old=alias==aliases_.end()?member:alias->second;
+        if(tasks.count(old)) previous.insert(old);
+    }
+    if(tasks.count(key)) previous.insert(key);
+    // Keep the established card ID even when a newly arrived first volume
+    // changes the descriptor's main path. Provisional request cards retire.
+    for(auto& old:previous) if(!tasks.at(old).name.empty()) { key=old; break; }
+    Task task;
+    for(auto& old:previous) {
+        auto& candidate=tasks.at(old);
+        if(candidate.sequence>task.sequence) task=candidate;
+    }
+    for(auto& old:previous) erase_task(old);
+    task.path=path;
+    task.name=group.value("name",std::string());
+    if(task.name.empty()) task.name=utf8(fs::path(wide(path)).filename().wstring());
+    task.multipart=task.multipart || members.size()>1;
+    task.members=std::move(members);
+    for(auto& member:task.members) aliases_[member]=key;
+    tasks[key]=std::move(task); mark_changed(key);
+}
+void EventLog::accept(const Json& j) {
+    if(!j.is_object() || !j.contains("event") || !j["event"].is_string()) return;
+    auto event=j["event"].get<std::string>();
+    if(event=="pipeline_sources_claimed") {
+        if(j.contains("groups") && j["groups"].is_array()) for(auto& group:j["groups"]) accept_group(group);
+        return;
+    }
+    if(!j.contains("path") || !j["path"].is_string()) return;
+    auto path=j["path"].get<std::string>();
+    if(path.empty()) return;
+    auto physical=path_key(wide(path));
+    auto alias=aliases_.find(physical);
+    auto key=alias==aliases_.end()?physical:alias->second;
+    if(event=="candidate_departed") {
+        bool recursive=j.value("recursive",false);
+        std::vector<std::wstring> affected;
+        if(recursive) {
+            for(auto& pair:tasks) if(!terminal(pair.second)) {
+                if(pair.second.members.empty()) {
+                    if(is_under(pair.first,physical)) affected.push_back(pair.first);
+                } else for(auto& member:pair.second.members) if(is_under(member,physical)) {
+                    affected.push_back(pair.first); break;
+                }
+            }
+        } else if(tasks.count(key) && !terminal(tasks.at(key))) affected.push_back(key);
+        for(auto& id:affected) {
+            auto& task=tasks.at(id);
+            for(auto it=task.members.begin();it!=task.members.end();) {
+                if(recursive?is_under(*it,physical):*it==physical) {
+                    aliases_.erase(*it); it=task.members.erase(it);
+                } else ++it;
+            }
+            if(task.members.empty()) erase_task(id);
+            else {
+                if(!task.status.empty()) { task.status="taskWaiting"; task.waiting_reason="taskWaitingVolumes"; }
+                mark_changed(id);
+            }
+        }
+        return;
+    }
+    if(event=="no_tasks_found" || event=="pipeline_request_coalesced") {
+        auto it=tasks.find(key);
+        // A sibling request ending says nothing about its confirmed owner's
+        // outcome. Never erase the shared card (or completed history).
+        if(it!=tasks.end() && !terminal(it->second) &&
+            (it->second.name.empty() || (event=="no_tasks_found" && it->second.members.size()==1))) erase_task(key);
+        return;
+    }
+    std::string status, reason;
+    if(event=="processing_started") status="taskProcessing";
+    else if(event=="failed_password" || event=="suspended_missing_volume") {
+        status="taskWaiting"; reason=event=="failed_password"?"taskWaitingPassword":"taskWaitingVolumes";
+    } else if(event=="done") status="taskSucceeded";
+    else if(event=="failed_terminal" || event=="partial_rejected") status="taskFailed";
+    else return;
+    auto& task=tasks[key];
+    task.path=task.name.empty()?path:task.path;
+    task.status=std::move(status); task.waiting_reason=std::move(reason);
+    task.outputs.clear(); task.timestamp=0; task.has_timestamp=false;
+    if(j.contains("output_dirs") && j["output_dirs"].is_array())
+        for(auto& output:j["output_dirs"]) if(output.is_string() && !output.get_ref<const std::string&>().empty()) task.outputs.push_back(output.get<std::string>());
+    if(j.contains("ts") && j["ts"].is_number()) { task.timestamp=j["ts"].get<double>(); task.has_timestamp=std::isfinite(task.timestamp); if(!task.has_timestamp) task.timestamp=0; }
+    else if(j.contains("time") && j["time"].is_string()) {
+        if(auto parsed=iso_timestamp(j["time"].get<std::string>())) { task.timestamp=*parsed; task.has_timestamp=true; }
+    }
+    mark_changed(key); task.sequence=sequence_;
 }
 bool EventLog::refresh(bool missing_is_final) {
     retry_required=false; changed_keys.clear(); changed_overflow=false; rebuilt=false;
     Handle f(CreateFileW(path_.c_str(),GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,OPEN_EXISTING,FILE_FLAG_SEQUENTIAL_SCAN,nullptr));
     if(f.value==INVALID_HANDLE_VALUE) {
         if(GetLastError()==ERROR_FILE_NOT_FOUND || GetLastError()==ERROR_PATH_NOT_FOUND) {
-            if(!missing_is_final) { SetLastError(ERROR_FILE_NOT_FOUND); win_error("Read event log"); }
-            bool changed=!tasks.empty(); rebuilt=changed; offset_=identity_=volume_=0; prefix_.clear(); anchor_.clear(); pending_.clear(); tasks.clear(); malformed=0; return changed;
+            if(!missing_is_final) { SetLastError(ERROR_FILE_NOT_FOUND); win_error("opReadEventLog"); }
+            bool changed=!tasks.empty(); rebuilt=changed; offset_=identity_=volume_=0; prefix_.clear(); anchor_.clear(); pending_.clear(); tasks.clear(); aliases_.clear(); malformed=0; return changed;
         }
-        win_error("Read event log");
+        win_error("opReadEventLog");
     }
     BY_HANDLE_FILE_INFORMATION info{};
-    if(!GetFileInformationByHandle(f,&info)) win_error("Log identity");
+    if(!GetFileInformationByHandle(f,&info)) win_error("opLogIdentity");
     uint64_t id=(uint64_t(info.nFileIndexHigh)<<32)|info.nFileIndexLow;
     uint64_t size=(uint64_t(info.nFileSizeHigh)<<32)|info.nFileSizeLow;
     bool reset=id!=identity_ || info.dwVolumeSerialNumber!=volume_ || size<offset_;
     if(!reset && !prefix_.empty()) reset=text_at(f,0,prefix_.size())!=prefix_;
     if(!reset && !anchor_.empty()) reset=text_at(f,offset_-anchor_.size(),anchor_.size())!=anchor_;
     bool changed=reset; rebuilt=reset;
-    if(reset) { offset_=sequence_=0; prefix_.clear(); anchor_.clear(); pending_.clear(); tasks.clear(); malformed=0; }
+    if(reset) { offset_=sequence_=0; prefix_.clear(); anchor_.clear(); pending_.clear(); tasks.clear(); aliases_.clear(); malformed=0; }
     identity_=id; volume_=info.dwVolumeSerialNumber;
-    // Parse bounded chunks, retaining only the unfinished final record and one state per path.
+    // Parse bounded chunks, retaining only the unfinished record and logical task projections.
     while(offset_<size) {
         auto chunk=text_at(f,offset_,size_t(std::min<uint64_t>(65536,size-offset_)));
         if(chunk.empty()) break;
@@ -459,7 +550,7 @@ bool EventLog::refresh(bool missing_is_final) {
             start=end+1;
         }
         pending_.erase(0,start);
-        if(pending_.size()>16*1024*1024) throw std::runtime_error("日志单行超过大小限制");
+        if(pending_.size()>16*1024*1024) throw std::runtime_error("logRecordTooLarge");
     }
     if(prefix_.empty() && offset_) {
         prefix_=text_at(f,0,size_t(std::min<uint64_t>(4096,offset_)));
@@ -467,7 +558,7 @@ bool EventLog::refresh(bool missing_is_final) {
     }
     anchor_=text_at(f,offset_-std::min<uint64_t>(256,offset_),size_t(std::min<uint64_t>(256,offset_)));
     BY_HANDLE_FILE_INFORMATION after{};
-    if(!GetFileInformationByHandle(f,&after)) win_error("Log generation");
+    if(!GetFileInformationByHandle(f,&after)) win_error("opLogGeneration");
     if(after.nFileSizeHigh!=info.nFileSizeHigh || after.nFileSizeLow!=info.nFileSizeLow ||
         CompareFileTime(&after.ftLastWriteTime,&info.ftLastWriteTime)!=0) {
         // A write overlapped this read. Rebuild from the newly observed generation;
@@ -478,30 +569,32 @@ bool EventLog::refresh(bool missing_is_final) {
 }
 namespace {
 // Both snapshot and incremental updates project a task identically.
-Json project_task(const Task& t,const RootIndex& roots,const std::string& language) {
+Json project_task(const std::wstring& key,const Task& t,const RootIndex& roots,const std::string& language) {
     const fs::path path=wide(t.path);
-    auto key=path_key(path);
-    const char* tone=t.status=="成功"?"success":t.status=="失败"?"failure":
-        (t.status.rfind("等待",0)==0 || t.status.rfind("挂起",0)==0 || t.status=="准备处理")?"waiting":"info";
-    return {{"id",utf8(key)},{"name",utf8(path.filename().wstring())},{"directory",utf8(path.parent_path().wstring())},
-        {"path",t.path},{"root",indexed_root(key,roots)},{"status",t.status},{"statusText",tr(t.status,language)},{"time",task_time(t)},
+    const char* tone=t.status=="taskSucceeded"?"success":t.status=="taskFailed"?"failure":
+        t.status=="taskWaiting"?"waiting":"info";
+    return {{"id",utf8(key)},{"name",t.name.empty()?utf8(path.filename().wstring()):t.name},{"directory",utf8(path.parent_path().wstring())},
+        {"path",t.path},{"root",indexed_root(key,roots)},{"status",t.status},{"statusText",tr(t.waiting_reason.empty()?t.status:t.waiting_reason,language)},{"partCount",t.multipart?t.members.size():0},{"time",task_time(t)},
         {"statusTone",tone},{"outputs",t.outputs},{"sortTimestamp",t.timestamp},{"sortSequence",t.sequence}};
 }
 bool task_matches(const Task& t,const std::wstring& key,const RootIndex& roots,const View& v) {
-    return contains(t.path,v.task_query) && (v.task_status.empty() || t.status==v.task_status) &&
-        (v.task_root.empty() || indexed_root(key,roots)==v.task_root);
+    if(t.status.empty() || (!v.task_status.empty() && t.status!=v.task_status) ||
+        (!v.task_root.empty() && indexed_root(key,roots)!=v.task_root)) return false;
+    if(contains(t.path,v.task_query) || contains(t.name,v.task_query)) return true;
+    return std::any_of(t.members.begin(),t.members.end(),[&](const auto& member){return contains(utf8(member),v.task_query);});
 }
 }
 Json task_rows(const EventLog& log,const WatchRoots& roots,const View& v,const std::string& language) {
     const auto root_index=index_roots(roots);
-    std::vector<const Task*> rows;
-    for(auto& pair:log.tasks) if(task_matches(pair.second,pair.first,root_index,v)) rows.push_back(&pair.second);
-    std::sort(rows.begin(),rows.end(),[](auto a,auto b){
-        if(a->timestamp!=b->timestamp) return a->timestamp>b->timestamp;
-        return a->sequence>b->sequence;
+    using TaskEntry=decltype(log.tasks)::value_type;
+    std::vector<const TaskEntry*> rows;
+    for(auto& pair:log.tasks) if(task_matches(pair.second,pair.first,root_index,v)) rows.push_back(&pair);
+    std::sort(rows.begin(),rows.end(),[](const auto& a,const auto& b){
+        if(a->second.timestamp!=b->second.timestamp) return a->second.timestamp>b->second.timestamp;
+        return a->second.sequence>b->second.sequence;
     });
     Json result={{"rows",Json::array()},{"total",rows.size()},{"malformed",log.malformed}};
-    for(auto* task:rows) result["rows"].push_back(project_task(*task,root_index,language));
+    for(auto& task:rows) result["rows"].push_back(project_task(task->first,task->second,root_index,language));
     return result;
 }
 Json task_delta(const EventLog& log,const WatchRoots& roots,const View& v,const std::string& language) {
@@ -511,7 +604,7 @@ Json task_delta(const EventLog& log,const WatchRoots& roots,const View& v,const 
         Json change={{"id",utf8(key)}};
         auto it=log.tasks.find(key);
         if(it!=log.tasks.end() && task_matches(it->second,key,root_index,v))
-            change["row"]=project_task(it->second,root_index,language);
+            change["row"]=project_task(key,it->second,root_index,language);
         changes.push_back(std::move(change));
     }
     return {{"changes",std::move(changes)},{"malformed",log.malformed}};
@@ -528,7 +621,7 @@ fs::path task_directory(const Json& row) {
     }
     if(exists(monitored)) return monitored;
     if(exists(input.parent_path())) return input.parent_path();
-    throw std::runtime_error("路径当前不存在");
+    throw std::runtime_error("pathMissing");
 }
 Json password_rows(const Json& passwords,const View& v,const std::string& language) {
     Json rows=Json::array();

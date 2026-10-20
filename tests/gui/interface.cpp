@@ -1,4 +1,5 @@
 #include "application.hpp"
+#include "presentation.hpp"
 #include "ui_defaults_json.h"
 #include <cassert>
 #include <iostream>
@@ -347,7 +348,7 @@ int wmain(int argc,wchar_t** argv) {
             std::cerr<<"Initial files loaded\n";
             assert(state(app.page(),"tasks")["total"]==1);
             std::string many;
-            const char* phases[]={"processing_started","failed_terminal","candidate_busy","done"};
+            const char* phases[]={"processing_started","failed_terminal","suspended_missing_volume","done"};
             for(int i=0;i<512;++i) many+=Json({{"event",phases[i%4]},{"path",utf8((dir/"history"/("task-"+std::to_string(i)+".001")).wstring())},{"time","2026-10-19T09:15:42.731112+00:00"},{"output_dirs",{utf8(dir.wstring())}}}).dump()+"\n";
             atomic_write(dir/".sunpack_watch"/"events.jsonl",many);
             pump([&]{return state(app.page(),"tasks")["total"]==512;});
@@ -609,6 +610,16 @@ int wmain(int argc,wchar_t** argv) {
             click(app,"configSearch"); pump([&]{return state(app.page(),"saveErrors").contains("/watch/out_dir");});
             assert(read_json(dir/"sunpack_config.json")["watch"]["out_dir"]=="external");
             assert(state(app.page(),"drafts")["/watch/out_dir"]["text"]=="unsaved");
+            auto conflict=state(app.page(),"saveErrors")["/watch/out_dir"];
+            assert(conflict["source"]=="settingChanged");
+            assert(conflict["text"]==tr("settingChanged","zh"));
+            changed["cli"]["language"]="en"; atomic_write(dir/"sunpack_config.json",changed.dump());
+            pump([&]{return state(app.page(),"saveErrors")["/watch/out_dir"]["text"]==tr("settingChanged","en");});
+            screenshot(app,L"error-english.png");
+            assert(rendered_widget(app,"field-/watch/out_dir").dump().find("Default output folder")!=std::string::npos);
+            changed["cli"]["language"]="zh"; atomic_write(dir/"sunpack_config.json",changed.dump());
+            pump([&]{return state(app.page(),"saveErrors")["/watch/out_dir"]["text"]==tr("settingChanged","zh");});
+
             click(app,"input-/watch/out_dir"); ui_debug_type_text(app.window(),L" corrected");
             finish_input(app);
             assert(read_json(dir/"sunpack_config.json")["watch"]["out_dir"]=="unsaved corrected");
@@ -757,9 +768,19 @@ int wmain(int argc,wchar_t** argv) {
             assert(fs::is_directory(pending_root));
             pump([&]{return state(app.page(),"taskRoot")=="";});
 
-            atomic_write(dir/".sunpack_watch"/"events.jsonl",Json({{"event","failed_password"},{"path",utf8((dir/"carrier.001").wstring())}}).dump()+"\n");
-            try { pump([&]{return state(app.page(),"tasks")["rows"][0]["status"]=="挂起：等待密码";}); }
+            auto main=utf8((dir/"carrier.001").wstring()), sibling=utf8((dir/"disguised.blob").wstring());
+            atomic_write(dir/".sunpack_watch"/"events.jsonl",
+                Json{{"event","pipeline_sources_claimed"},{"path",sibling},{"groups",Json::array({
+                    Json{{"path",main},{"name","movie.7z"},{"members",{main,sibling}}}})}}.dump()+"\n"+
+                Json{{"event","failed_password"},{"path",sibling}}.dump()+"\n");
+            try { pump([&]{return state(app.page(),"tasks")["rows"][0]["status"]=="taskWaiting";}); }
             catch(...) { std::cerr<<"Log model: "<<state(app.page(),"tasks")<<" errors="<<state(app.page(),"errors")<<"\n"; throw; }
+            auto grouped=state(app.page(),"tasks")["rows"][0];
+            assert(grouped["name"]=="movie.7z" && grouped["partCount"]==2);
+            assert(state(app.page(),"statusNames")==Json::array({"","taskProcessing","taskWaiting","taskSucceeded","taskFailed"}));
+            assert(rendered_widget(app,"taskRoot-"+grouped["id"].get<std::string>())["text"]==
+                "已识别 2 个分卷 · 监控目录："+utf8(dir.wstring()));
+            screenshot(app,L"grouped-waiting.png");
             std::cerr<<"Log replacement observed\n";
             atomic_write(dir/"sunpack_config.json","{");
             pump([&]{return state(app.page(),"errors").contains("sunpack_config.json");});

@@ -52,6 +52,8 @@ class Application {
     void start_save();
     void acknowledge_save(const Json& ack);
     void save_error(const std::string& key, const std::string& message);
+    void set_error(const char* field, const std::string& message);
+    void refresh_error_texts();
     static LRESULT CALLBACK subclass(HWND, UINT, WPARAM, LPARAM, UINT_PTR, DWORD_PTR);
 public:
     explicit Application(Options options) : options_(std::move(options)) {}

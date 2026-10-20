@@ -1230,7 +1230,9 @@ class WatchScheduler:
         self._dirty_during_claim.setdefault(owner, {})[key] = normalized
         return True
 
-    def _claim_pipeline_sources(self, owner: str, paths: Iterable[str]) -> None:
+    def _claim_pipeline_sources(
+        self, owner: str, paths: Iterable[str], *, path: str = "", groups: list[dict] | None = None,
+    ) -> None:
         normalized = dedupe_normalized_paths(
             os.path.abspath(str(path))
             for path in paths
@@ -1267,6 +1269,8 @@ class WatchScheduler:
                     self._active_states.pop(candidate_path, None)
         self.log.write(
             "pipeline_sources_claimed",
+            path=path,
+            groups=groups or (),
             owner=owner,
             path_count=len(normalized),
             retired_pending=len(retired_pending),
@@ -1773,7 +1777,9 @@ class WatchScheduler:
                 # Reuse the published tuple. Keep this request's input evidence
                 # even if live source claims transfer to a newer family owner.
                 request.source_paths = tuple(source_paths)
-            self._claim_pipeline_sources(notification_id, source_paths)
+            self._claim_pipeline_sources(
+                notification_id, source_paths, path=owner_path, groups=event.get("groups"),
+            )
             return
         if name == "task_output_started":
             if not self.state.record_task_output_started(

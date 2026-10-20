@@ -1,4 +1,4 @@
-<window title="SunPack Manager" width="1120" height="720" min-width="850" min-height="560" centered="true" frameless="false"/>
+<window title="SunPack" width="1120" height="720" min-width="850" min-height="560" centered="true" frameless="false"/>
 <script>
 export default {
   data() { return {
@@ -7,7 +7,7 @@ export default {
     tasks:{rows:[],total:0,malformed:0},passwords:{rows:[],total:0},fields:[],directories:[],
     startup:{enabled:false,command:''},directoryQuery:'',
     taskQuery:'',taskRoot:'',taskStatus:0,
-    statusNames:['','等待处理','等待文件释放','准备处理','正在处理','成功','失败','挂起：等待密码','挂起：等待分卷','等待重试','跳过','已合并'],
+    statusNames:['','taskProcessing','taskWaiting','taskSucceeded','taskFailed'],
     rootEditor:false,rootOriginal:'',rootInput:'',rootOutput:'',rootDeep:false,
     configCategory:'',configQuery:'',drafts:{},toggleDrafts:{},saving:false,saveErrors:{},closeError:'',pendingFields:[],recordSaving:{passwords:false,roots:false},rootSession:0,passwordSession:0,rootBaseline:'',rootExpected:null,passwordBaseline:'',
     passwordScope:'@all',passwordQuery:'',passwordOriginal:'',passwordValue:'',scopeText:'',passwordEditor:false
@@ -24,7 +24,7 @@ export default {
       let groups=[],seen={};
       this.fields.forEach(f=>{
         let g=seen[f.block];
-        if(!g) { g={id:f.block,key:f.block+'@'+this.language,label:f.blockLabel,module:f.module,category:f.category,fields:[],primary:false}; seen[f.block]=g; groups.push(g); }
+        if(!g) { g={id:f.block,key:f.key,label:f.blockLabel,module:f.module,category:f.category,fields:[],primary:false}; seen[f.block]=g; groups.push(g); }
         if(f.primary) { g.fields.unshift(f); g.primary=true; } else g.fields.push(f);
       });
       return groups;
@@ -74,9 +74,10 @@ export default {
     },
     rootEdit(operation) {
       let edit={operation:operation,original:this.rootOriginal,input:this.rootInput,output:this.rootOutput,deep:this.rootDeep,expected:this.rootExpected};
-      if(operation==='save'&&!this.rootOriginal) { edit.operation='addMany'; edit.inputs=this.rootInput.split(/\r?\n/).map(s=>s.trim()).filter(s=>s.length>0); if(!edit.inputs.length) throw new Error(this.texts.rootsEmpty); }
+      if(operation==='save'&&!this.rootOriginal) { edit.operation='addMany'; edit.inputs=this.rootInput.split(/\r?\n/).map(s=>s.trim()).filter(s=>s.length>0); if(!edit.inputs.length) throw new Error('rootsEmpty'); }
       return edit;
     },
+    errorText(error) { return error && typeof error==='object' ? error.text : (this.texts[error]||error); },
     setSaveError(key,message) { let errors=Object.assign({},this.saveErrors); if(message) errors[key]=message; else delete errors[key]; this.saveErrors=errors; },
     commitRoot() { if(this.rootOriginal) this.rootAction('save',{}); },
     leaveRoot() { if(this.rootOriginal&&(this.rootDirty||this.recordSaving.roots)) this.rootAction('save',{rootEditor:false}); else { this.rootEditor=false; this.rootOriginal=''; this.rootInput=''; this.rootOutput=''; this.rootBaseline=''; this.rootExpected=null; this.setSaveError('@roots',''); this.closeError=''; } },
@@ -111,10 +112,10 @@ export default {
     },
     passwordEdit(operation) {
       let scopes=this.scopeText.split(/\r?\n/).map(s=>s.trim()).filter(s=>s.length>0);
-      if(operation==='save'&&this.passwordOriginal&&JSON.parse(this.passwordOriginal).scopes&&scopes.length===0) throw new Error(this.texts.scopeGuard);
+      if(operation==='save'&&this.passwordOriginal&&JSON.parse(this.passwordOriginal).scopes&&scopes.length===0) throw new Error('scopeGuard');
       if(operation==='global') scopes=[];
       let values=this.passwordValue.split(/\r?\n/).filter(s=>s.length>0);
-      if(!this.passwordOriginal&&operation==='save'&&values.length===0) throw new Error(this.texts.batchEmpty);
+      if(!this.passwordOriginal&&operation==='save'&&values.length===0) throw new Error('batchEmpty');
       return {operation:operation==='save'||operation==='global'?(this.passwordOriginal?'replace':'addMany'):operation,
         original:this.passwordOriginal,value:this.passwordValue,values:values,scopes:scopes};
     },
@@ -191,6 +192,7 @@ export default {
   .card { padding:16px 20px; gap:10px; border:1px solid var(--card-border); border-radius:8px; }
   .settings-row { flex-direction:row; align-items:center; gap:16px; }
   .setting-copy { flex:1; gap:4px; }
+  .setting-copy > label { width:100%; flex-shrink:0; }
   .setting-title { font-size:14px; }
   .task { padding:10px 14px; gap:4px; border:1px solid var(--card-border); border-radius:8px; }
   .taskname { flex-shrink:1; background:#00000001; padding:0px; min-height:24px; border:0px; color:var(--fg); font-size:14px; font-weight:600; text-align:left; }
@@ -208,7 +210,7 @@ export default {
   .light .status-info { color:#005a9e; background:#e5f1fb; }
   .dark .status-info { color:#75b6e7; background:#243b50; }
   .time { color:var(--fg-2); font-size:12px; }
-  .error { color:#d15b48; font-size:12px; }
+  .error { color:#d15b48; font-size:12px; width:100%; flex-shrink:0; }
   .light .card, .task.light, .card.light { background:#fbfbfb; border:1px solid #e5e5e5; }
   .dark .card, .task.dark, .card.dark { background:#2b2b2b; border:1px solid #303030; }
   /* Actions keep their intrinsic text width even when a scrollbar appears.
@@ -272,7 +274,7 @@ export default {
         </div>
         <div id="monitorControls" class="monitor-controls">
           <div class="row monitor-actions"><button id="watchStart" :enabled="cliAllowed" @click="send('cli',{action:'start'})">{{ texts.startWatch }}</button><button id="watchStop" :enabled="cliAllowed" @click="send('cli',{action:'stop'})">{{ texts.stopWatch }}</button></div>
-          <label v-show="actionError" class="error">{{ actionError }}</label>
+          <label v-show="actionError" class="error">{{ errorText(actionError) }}</label>
         </div>
       <div id="navItems" class="nav-items">
         <button id="tabTasks" :class="tab==='tasks'?'nav-item on':'nav-item'" @click="go('tasks')">
@@ -312,7 +314,7 @@ export default {
       <div class="workspace">
       <div id="page-tasks" v-show="tab==='tasks'" class="content">
         <div class="page-header"><label class="heading">{{ texts.tasks }}</label></div>
-        <label v-show="!rootEditor &amp;&amp; saveErrors['@roots']" class="error">{{ saveErrors['@roots'] }}</label>
+        <label v-show="!rootEditor &amp;&amp; saveErrors['@roots']" class="error">{{ errorText(saveErrors['@roots']) }}</label>
         <label v-show="chosenDirectory.path &amp;&amp; !rootEditor" class="selected-directory">{{ chosenDirectory.path }}</label>
         <div v-show="!rootEditor" class="row task-filters"><input id="taskSearch" type="search" class="fill search-field" :placeholder="texts.taskSearch" :value="taskQuery" @input="searchTasks"/>
           <div id="taskStatusHost" style="width:180px;height:32px"/>
@@ -322,12 +324,12 @@ export default {
           <div class="row"><label class="subheading">{{ rootOriginal?texts.editRoot:texts.addRoot }}</label><div class="spacer"/><button id="closeRootEditor" @click="leaveRoot()">{{ texts.back }}</button></div>
           <label class="muted">{{ rootOriginal?texts.inputDirectory:texts.rootBatchHint }}</label><textarea id="rootInput" v-model="rootInput" @blur="commitRoot()" style="height:84px"/><button id="browseRoot" @click="send('browse',{target:'rootInput'})">{{ texts.chooseDirectory }}</button>
           <label class="muted">{{ texts.rootOutput }}</label><div class="input-row"><input id="rootOutput" class="fill" v-model="rootOutput" @blur="commitRoot()" @submit="commitRoot()"/><button id="browseOutput" @click="send('browse',{target:'rootOutput'})">{{ texts.chooseOutput }}</button></div>
-          <label v-show="saveErrors['@roots']" class="error">{{ saveErrors['@roots'] }}</label><div class="action-row"><toggle id="rootDeepToggle" :checked="rootDeep" @change="v=>{rootDeep=v;commitRoot();}"/><label>{{ texts.deep }}</label><button id="finishRoot" v-show="!rootOriginal" @click="rootAction('save')">{{ texts.addToList }}</button><button v-show="rootOriginal" @click="rootAction('delete')">{{ texts.deleteRoot }}</button></div>
+          <label v-show="saveErrors['@roots']" class="error">{{ errorText(saveErrors['@roots']) }}</label><div class="action-row"><toggle id="rootDeepToggle" :checked="rootDeep" @change="v=>{rootDeep=v;commitRoot();}"/><label>{{ texts.deep }}</label><button id="finishRoot" v-show="!rootOriginal" @click="rootAction('save')">{{ texts.addToList }}</button><button v-show="rootOriginal" @click="rootAction('delete')">{{ texts.deleteRoot }}</button></div>
         </div>
           <label v-show="tasks.total===0" class="muted">{{ texts.noTasks }}</label>
           <VirtualList id="taskItems" class="column" estimated-height="68px"><div v-for="t in tasks.rows" :key="t.id" :id="'task-'+t.id" :class="'task '+appearance">
             <div class="row"><button :id="'taskName-'+t.id" class="taskname" @click="send('openTask',{task:t})">{{ t.name }}</button><div class="spacer"/><label class="status" :class="'status-'+t.statusTone">{{ t.statusText }}</label></div>
-            <div class="row task-meta"><label :id="'taskRoot-'+t.id" class="muted fill">{{ texts.taskFolder }}{{ t.directory }}</label><label class="time">{{ t.time }}</label></div>
+            <div class="row task-meta"><label :id="'taskRoot-'+t.id" class="muted fill">{{ t.partCount ? texts.identifiedParts.replace('{count}',t.partCount)+' · ' : '' }}{{ texts.taskFolder }}{{ t.directory }}</label><label class="time">{{ t.time }}</label></div>
           </div>
           </VirtualList>
         </div></ScrollView>
@@ -360,7 +362,7 @@ export default {
               </div>
             </div>
             <textarea v-show="f.editor==='lines'" :id="'lines-'+f.id" :value="drafts[f.id]?drafts[f.id].text:f.text" @input="v=>changeField(f,v)" @blur="commitField(f)" style="height:110px"/>
-            <label v-show="saveErrors[f.id]" class="error">{{ saveErrors[f.id] }}</label>
+            <label v-show="saveErrors[f.id]" class="error">{{ errorText(saveErrors[f.id]) }}</label>
             </div>
             </div>
           </div>
@@ -370,14 +372,14 @@ export default {
       </div>
       <div id="page-passwords" v-show="tab==='passwords'" class="content">
         <div class="page-header"><label class="heading">{{ texts.passwords }}</label></div>
-        <label v-show="!passwordEditor &amp;&amp; saveErrors['@passwords']" class="error">{{ saveErrors['@passwords'] }}</label>
+        <label v-show="!passwordEditor &amp;&amp; saveErrors['@passwords']" class="error">{{ errorText(saveErrors['@passwords']) }}</label>
         <div class="password-toolbar"><input id="passwordSearch" type="search" class="search-field password-search" :placeholder="texts.passwordSearch" :value="passwordQuery" @input="searchPasswords"/><div class="password-tabs"><button id="newPassword" :class="passwordEditor &amp;&amp; !passwordOriginal?'on':''" @click="editPassword(null)">{{ texts.addPasswords }}</button><button id="savedPasswords" :class="passwordScope==='@all' &amp;&amp; !passwordEditor?'on':''" @click="selectScope('@all')">{{ texts.savedPasswords }}</button><button id="clipboardHistory" :class="passwordScope==='@history' &amp;&amp; !passwordEditor?'on':''" @click="selectScope('@history')">{{ texts.history }}</button></div></div>
         <ScrollView id="passwordListScroll"><div id="passwordBody" class="column">
           <div id="passwordForm" v-show="passwordEditor" class="card inline-form" :enabled="!!passwordOriginal||!recordSaving.passwords">
             <div class="row"><label class="subheading">{{ passwordOriginal?texts.editPassword:texts.addPasswords }}</label><div class="spacer"/><button id="closePasswordEditor" @click="leavePassword()">{{ texts.back }}</button></div>
               <div class="composer-fields"><div class="composer-field"><label class="subheading">{{ texts.passwordText }}</label><textarea id="passwordValue" v-model="passwordValue" @blur="commitPassword()" class="password-input"/><label v-show="!passwordOriginal" class="muted">{{ texts.batchHint }}</label></div>
               <div class="composer-field"><label class="subheading">{{ texts.scopeLabel }}</label><textarea id="passwordScopes" v-model="scopeText" @blur="commitPassword()" class="password-input"/><label class="muted">{{ texts.scopeDescription }}</label></div></div>
-              <label v-show="saveErrors['@passwords']" class="error">{{ saveErrors['@passwords'] }}</label><div class="action-row"><button id="browseScope" @click="send('browse',{target:'scopeText'})">{{ texts.chooseScope }}</button><button v-show="passwordOriginal &amp;&amp; scopeText" @click="passwordAction('global',{})">{{ texts.makeGlobal }}</button><button id="finishPassword" v-show="!passwordOriginal" @click="passwordAction('save')">{{ texts.addToList }}</button><button id="deletePassword" v-show="passwordOriginal" @click="passwordAction('delete')">{{ texts.deletePassword }}</button></div>
+              <label v-show="saveErrors['@passwords']" class="error">{{ errorText(saveErrors['@passwords']) }}</label><div class="action-row"><button id="browseScope" @click="send('browse',{target:'scopeText'})">{{ texts.chooseScope }}</button><button v-show="passwordOriginal &amp;&amp; scopeText" @click="passwordAction('global',{})">{{ texts.makeGlobal }}</button><button id="finishPassword" v-show="!passwordOriginal" @click="passwordAction('save')">{{ texts.addToList }}</button><button id="deletePassword" v-show="passwordOriginal" @click="passwordAction('delete')">{{ texts.deletePassword }}</button></div>
           </div>
           <div :class="'history-list '+appearance"><label v-show="passwords.total===0" class="muted">{{ texts.noPasswords }}</label>
             <VirtualList id="passwordItems" style="gap:0px" estimated-height="64px"><div v-for="p in passwords.rows" :key="p.id" :id="'password-'+p.id" class="history-entry">
@@ -390,7 +392,7 @@ export default {
       </div>
       </div>
     </div>
-    <label v-show="closeError" class="error">{{ closeError }}</label>
+    <label v-show="closeError" class="error">{{ errorText(closeError) }}</label>
     <div v-show="errorList.length" class="card"><label class="error">{{ texts.fileProblems }}</label><label v-for="e in errorList" :key="e" class="error">{{ e }}</label></div>
     <div v-if="dispatch" id="dispatch" :visible="false" style="position:absolute;left:0px;top:0px;width:0px;height:0px"/>
   </div>

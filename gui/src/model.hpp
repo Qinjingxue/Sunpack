@@ -29,7 +29,9 @@ WatchRoots apply_root_changes(WatchRoots roots, const fs::path& base, const Json
 Json save_changes(const fs::path& directory, const Json& fields, const Json& passwords, const Json& roots);
 std::string root_for(const fs::path& path, const WatchRoots& roots);
 struct Task {
-    std::string path, status;
+    std::string path, name, status, waiting_reason;
+    std::unordered_set<std::wstring> members;
+    bool multipart = false;
     double timestamp = 0;
     bool has_timestamp = false;
     uint64_t sequence = 0;
@@ -40,6 +42,11 @@ class EventLog {
     uint64_t offset_ = 0, identity_ = 0, sequence_ = 0;
     DWORD volume_ = 0;
     std::string prefix_, anchor_, pending_;
+    // Only backend-confirmed members are aliases; filenames are never inferred.
+    std::unordered_map<std::wstring, std::wstring> aliases_;
+    void mark_changed(const std::wstring& key);
+    void erase_task(const std::wstring& key);
+    void accept_group(const Json& group);
 public:
     std::unordered_map<std::wstring, Task> tasks;
     size_t malformed = 0;

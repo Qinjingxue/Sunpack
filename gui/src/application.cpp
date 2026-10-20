@@ -69,11 +69,11 @@ Options parse_options(const std::vector<std::wstring>& args) {
         if(args[i]==L"--data-dir" && i+1<args.size()) { result.data_dir=resolve_path(args[++i]); custom=true; }
         else if(args[i]==L"--cli" && i+1<args.size()) result.cli.executable=resolve_path(args[++i]);
         else if(args[i]==L"--cli-prefix" && i+1<args.size()) result.cli.prefix.push_back(args[++i]);
-        else throw std::runtime_error("参数：--data-dir <目录> --cli <可执行文件> [--cli-prefix <单个参数>]...");
+        else throw std::runtime_error("guiArguments");
     }
     if(result.data_dir.empty()) {
         PWSTR dir=nullptr;
-        if(FAILED(SHGetKnownFolderPath(FOLDERID_ProgramData,0,nullptr,&dir))) throw std::runtime_error("无法确定 ProgramData");
+        if(FAILED(SHGetKnownFolderPath(FOLDERID_ProgramData,0,nullptr,&dir))) throw std::runtime_error("programDataUnavailable");
         result.data_dir=fs::path(dir)/"SunPack"; CoTaskMemFree(dir);
     }
     // A fixture data directory cannot control the installed runtime accidentally.
@@ -101,10 +101,29 @@ void Application::publish(Json patch) {
     for(auto it=patch.begin();it!=patch.end();++it) pending_[it.key()]=std::move(it.value());
     if(!notified_) { notified_=true; PostMessageW(hwnd_,Update,0,0); }
 }
+void Application::set_error(const char* field,const std::string& message) {
+    Json value="";
+    if(!message.empty()) value={{"source",message},{"text",translated_error(message,page_value(page_,"language").get<std::string>())}};
+    auto encoded=value.dump(); ui_page_set_json(page_,field,encoded.c_str());
+}
 void Application::save_error(const std::string& key,const std::string& message) {
     auto errors=page_value(page_,"saveErrors");
-    if(message.empty()) errors.erase(key); else errors[key]=message;
+    if(message.empty()) errors.erase(key);
+    else errors[key]={{"source",message},{"text",translated_error(message,page_value(page_,"language").get<std::string>())}};
     auto encoded=errors.dump(); ui_page_set_json(page_,"saveErrors",encoded.c_str());
+}
+void Application::refresh_error_texts() {
+    auto language=page_value(page_,"language").get<std::string>();
+    auto refresh=[&](Json& error) {
+        if(error.is_object() && error.contains("source")) error["text"]=translated_error(error["source"].get<std::string>(),language);
+    };
+    auto errors=page_value(page_,"saveErrors");
+    for(auto& error:errors) refresh(error);
+    auto encoded=errors.dump(); ui_page_set_json(page_,"saveErrors",encoded.c_str());
+    for(auto field:{"actionError","closeError"}) {
+        auto error=page_value(page_,field); refresh(error);
+        encoded=error.dump(); ui_page_set_json(page_,field,encoded.c_str());
+    }
 }
 bool Application::field_pending(const std::string& id) const {
     auto match=[&](const Json& job){return job.is_object() && job.value("kind",std::string())=="config" && job.value("key",std::string())==id;};
@@ -131,7 +150,7 @@ void Application::save_field(const std::string& id,Json draft) {
             {"type",(*field)["editor"]=="recursive"?Json("string"):(*field)["type"]},
             {"text",text},{"boolean",draft["boolean"]},{"draft",draft}};
         queue_save(Json{{"kind","config"},{"key",id},{"fields",Json::array({edit})}});
-    } catch(const std::exception& e) { save_error(id,translated_error(e.what(),page_value(page_,"language").get<std::string>())); }
+    } catch(const std::exception& e) { save_error(id,e.what()); }
 }
 void Application::queue_save(Json job) {
     const auto kind=job.at("kind").get<std::string>();
@@ -249,14 +268,15 @@ void Application::apply_pending() {
     VisualBatch visual(window_);
     auto ack=patch.value("saveAck",Json()); patch.erase("saveAck");
     if(patch.contains("fields")) bind_controls(patch["fields"]);
+    auto action=patch.value("actionError",Json()); patch.erase("actionError");
     for(auto it=patch.begin();it!=patch.end();++it) {
         auto text=it.value().dump();
-        if(ui_page_set_json(page_,it.key().c_str(),text.c_str())!=0) throw std::runtime_error("Core UI 数据绑定失败");
+        if(ui_page_set_json(page_,it.key().c_str(),text.c_str())!=0) throw std::runtime_error("uiBindingFailed");
     }
     if(!task_delta_patch.is_null()) {
         auto encoded=task_delta_patch.dump();
         if(ui_page_call_json(page_,"applyTaskDelta",encoded.c_str())!=0)
-            throw std::runtime_error("Core UI 增量任务绑定失败");
+            throw std::runtime_error("taskBindingFailed");
     }
     if(patch.contains("fields")) {
         auto drafts=page_value(page_,"drafts");
@@ -277,6 +297,7 @@ void Application::apply_pending() {
             ++it;
         }
     }
+    if(!action.is_null()) set_error("actionError",action.get<std::string>());
     if(!ack.is_null()) acknowledge_save(ack);
     if(patch.contains("fields") || !ack.is_null()) sync_toggles();
     for(auto& id:reset_scroll) {
@@ -291,6 +312,7 @@ void Application::apply_pending() {
     }
     if(patch.contains("language")) {
         auto language=patch["language"].get<std::string>();
+        refresh_error_texts();
         ui_window_set_title(window_,wide(tr("title",language)).c_str());
         rebuild_theme(language);
     }
@@ -362,7 +384,7 @@ void Application::bind_controls(const Json& fields) {
                     auto encoded=drafts.dump(); ui_page_set_json(self->page_,"toggleDrafts",encoded.c_str());
                     self->save_error(id,"");
                     self->save_field(id);
-                    } catch(const std::exception& e) { self->save_error(binding->field["id"],translated_error(e.what(),page_value(self->page_,"language").get<std::string>())); }
+                    } catch(const std::exception& e) { self->save_error(binding->field["id"],e.what()); }
                 },binding);
                 ui_widget_add_child(parent,widget); ui_widget_destroy(widget); return;
             }
@@ -388,7 +410,7 @@ void Application::bind_controls(const Json& fields) {
                     auto encoded=drafts.dump(); ui_page_set_json(self->page_,"drafts",encoded.c_str());
                     self->save_error(id,"");
                     self->save_field(id);
-                } catch(const std::exception& e) { set_text(self->page_,"actionError",translated_error(e.what(),page_value(self->page_,"language").get<std::string>())); }
+                } catch(const std::exception& e) { self->set_error("actionError",e.what()); }
             },binding);
             ui_widget_add_child(parent,combo); ui_widget_destroy(combo);
         },binding.get());
@@ -434,7 +456,7 @@ void Application::dispatch() {
     ui_page_set_bool(page_,"dispatch",false);
     if(commands.is_array()) for(auto& command:commands) {
         try { handle_command(std::move(command)); }
-        catch(const std::exception& e) { set_text(page_,"actionError",translated_error(e.what(),page_value(page_,"language").get<std::string>())); }
+        catch(const std::exception& e) { set_error("actionError",e.what()); }
     }
 }
 void Application::handle_command(Json command) {
@@ -487,7 +509,7 @@ void Application::handle_command(Json command) {
         if(!path.empty() && fs::exists(path)) {
             if(fs::is_directory(path)) {
                 auto result=ShellExecuteW(hwnd_,L"explore",path.c_str(),nullptr,nullptr,SW_SHOWNORMAL);
-                if(reinterpret_cast<INT_PTR>(result)<=32) throw std::runtime_error("无法在资源管理器中打开路径");
+                if(reinterpret_cast<INT_PTR>(result)<=32) throw std::runtime_error("explorerFailed");
                 return;
             }
             auto folder=fs::path(path).parent_path();
@@ -498,8 +520,8 @@ void Application::handle_command(Json command) {
                 result=SHOpenFolderAndSelectItems(parent,1,&child,0);
             }
             CoTaskMemFree(item); CoTaskMemFree(parent);
-            if(FAILED(result)) throw std::runtime_error("无法在资源管理器中打开路径");
-        } else throw std::runtime_error("路径当前不存在");
+            if(FAILED(result)) throw std::runtime_error("explorerFailed");
+        } else throw std::runtime_error("pathMissing");
         return;
     }
     { std::lock_guard<std::mutex> lock(mutex_); commands_.push_back(std::move(command)); }
@@ -520,47 +542,50 @@ LRESULT CALLBACK Application::subclass(HWND hwnd,UINT message,WPARAM wparam,LPAR
             }
             if(!self->active_save_.is_null() || !self->saves_.empty()) return 0;
             auto errors=page_value(self->page_,"saveErrors");
-            if(!errors.empty()) { self->closing_=false; set_text(self->page_,"closeError",errors.begin().value()); return 0; }
+            if(!errors.empty()) { self->closing_=false; auto encoded=errors.begin().value().dump(); ui_page_set_json(self->page_,"closeError",encoded.c_str()); return 0; }
         }
         if(message==Dispatch) { self->dispatch(); return 0; }
         if(message==Update) { self->apply_pending(); return 0; }
         if(message==WM_ACTIVATE && LOWORD(wparam)!=WA_INACTIVE) { self->changed(Startup); SetEvent(self->service_refresh_); }
         if(message==WM_SETTINGCHANGE && page_value(self->page_,"theme")=="system") apply_theme(self->page_,system_theme(),self->hwnd_);
-    } catch(const std::exception& e) { set_text(self->page_,"actionError",translated_error(e.what(),page_value(self->page_,"language").get<std::string>())); }
+    } catch(const std::exception& e) { self->set_error("actionError",e.what()); }
     return DefSubclassProc(hwnd,message,wparam,lparam);
 }
 void Application::open() {
-    const char* stage="初始化渲染器";
+    auto language=startup_language(options_.data_dir);
+    const char* stage="stageRenderer";
     try {
     ui_init_with_theme(system_theme());
-    stage="加载图标";
+    stage="stageLogo";
     auto module=GetModuleHandleW(nullptr);
     auto resource=FindResourceW(module,MAKEINTRESOURCEW(2),RT_RCDATA);
-    if(!resource) win_error("FindResource SunPack logo");
+    if(!resource) win_error("opFindLogo");
     auto logo=LoadResource(module,resource);
     auto bytes=LockResource(logo); auto size=SizeofResource(module,resource);
-    if(!bytes || !size) throw std::runtime_error("无法加载 SunPack 图标资源");
+    if(!bytes || !size) throw std::runtime_error("logoLoadFailed");
     ui_asset_register_blob("sunpack.png",bytes,size);
-    stage="设置中文字体";
+    stage="stageFonts";
     ui_theme_set_cjk_font(L"Segoe UI Variable Text",L"Microsoft YaHei UI");
-    stage="加载布局";
+    stage="stageLayout";
     page_=ui_page_load_string(kMainUix);
-    if(!page_) throw std::runtime_error("无法加载管理面板布局");
-    auto texts=interface_texts("en").dump(); ui_page_set_json(page_,"texts",texts.c_str());
+    if(!page_) throw std::runtime_error("layoutLoadFailed");
+    auto texts=interface_texts(language).dump(); ui_page_set_json(page_,"texts",texts.c_str());
+    set_text(page_,"language",language);
     apply_theme(page_,system_theme());
-    stage="创建窗口";
+    stage="stageWindow";
     UiWindowConfig window_config{}; window_config.skip_animation=1;
     window_=ui_page_prepare_window(page_,&window_config);
     if(!window_) throw std::runtime_error(ui_page_last_error(page_));
-    stage="绑定窗口事件";
+    stage="stageEvents";
     hwnd_=static_cast<HWND>(ui_window_hwnd(window_));
+    ui_window_set_title(window_,wide(tr("title",language)).c_str());
     style_frame(hwnd_,system_theme());
     auto icon=LoadIconW(GetModuleHandleW(nullptr),MAKEINTRESOURCEW(1));
     SendMessageW(hwnd_,WM_SETICON,ICON_BIG,reinterpret_cast<LPARAM>(icon));
     SendMessageW(hwnd_,WM_SETICON,ICON_SMALL,reinterpret_cast<LPARAM>(icon));
     SetPropW(hwnd_,mutex_name(options_.data_dir,L"SunPack.GUI").c_str(),reinterpret_cast<HANDLE>(1));
-    if(!SetWindowSubclass(hwnd_,subclass,1,reinterpret_cast<DWORD_PTR>(this))) win_error("GUI subclass");
-    if(!service_refresh_.value) win_error("Service refresh event");
+    if(!SetWindowSubclass(hwnd_,subclass,1,reinterpret_cast<DWORD_PTR>(this))) win_error("opWindowEvents");
+    if(!service_refresh_.value) win_error("opServiceRefresh");
     ui_page_on_widget_mount(page_,"dispatch",[](UiPage,UiWidget,void* context){
         auto* self=static_cast<Application*>(context); PostMessageW(self->hwnd_,Dispatch,0,0);
     },this);
@@ -568,7 +593,7 @@ void Application::open() {
         // The lifecycle API registers an owning handle; release it on every dispatch.
         if(widget) ui_widget_destroy(widget);
     },nullptr);
-    rebuild_theme("en");
+    rebuild_theme(language);
     ui_window_on_close(window_,[](UiWindow,void* context){
         auto* self=static_cast<Application*>(context);
         { std::lock_guard<std::mutex> lock(self->mutex_); self->stopping_=true; }
@@ -578,7 +603,7 @@ void Application::open() {
     ui_window_show_immediate(window_);
     // Keep native maximize/minimize transitions enabled after preparation/show.
     style_frame(hwnd_,system_theme());
-    stage="启动文件观察器";
+    stage="stageWatchers";
     worker_=std::thread([this]{ work(); });
     registry_=std::thread([this]{
         HKEY key{};
@@ -611,7 +636,7 @@ void Application::open() {
         }
         if(key) RegCloseKey(key);
     });
-    } catch(const std::exception& e) { throw std::runtime_error(std::string(stage)+"："+e.what()); }
+    } catch(const std::exception& e) { throw std::runtime_error(error_text("startupFailure",{{"stage",{{"source",stage}}},{"detail",{{"source",e.what()}}}})); }
 }
 int Application::run() { open(); return ui_run(); }
 Application::~Application() {
@@ -627,9 +652,9 @@ Application::~Application() {
 }
 void Application::work() {
     CoInitializeEx(nullptr,COINIT_MULTITHREADED);
+    std::string language="en";
     try {
         Json config=Json::object(), passwords={{"passwords",Json::array()}};
-        std::string language="en";
         WatchRoots roots; EventLog log; View view;
         Json errors=Json::object();
         auto dir=options_.data_dir;
@@ -678,9 +703,9 @@ void Application::work() {
             Json edit_feedback=Json::object();
             if(!data_watcher || !data_watcher->alive() || (!data_watcher->direct() && fs::is_directory(dir))) {
                 try {
-                    data_watcher=std::make_unique<DirectoryWatcher>(dir,on_data); errors.erase("文件观察器");
+                    data_watcher=std::make_unique<DirectoryWatcher>(dir,on_data); errors.erase("fileObserver");
                 }
-                catch(const std::exception& e) { errors["文件观察器"]=e.what(); }
+                catch(const std::exception& e) { errors["fileObserver"]=e.what(); }
             }
             for(auto& command:commands) {
                 auto op=command.value("op",std::string()); auto p=command.value("payload",Json::object());
@@ -710,29 +735,29 @@ void Application::work() {
                             if(section=="passwords") { flags|=Passwords; passwords_changed=dirs_changed=true; }
                             if(section=="roots") { flags|=Roots; tasks_changed=dirs_changed=true; task_delta_eligible=false; }
                         }
-                        auto message=translated_error(result["error"].get<std::string>(),language);
-                        if(result.contains("field") && p.contains("fields")) for(auto& field:p["fields"])
-                            if(field["pointer"]==result["field"]) { message=field.value("label",field["pointer"].get<std::string>())+": "+message; break; }
+                        auto message=result["error"].get<std::string>();
                         edit_feedback["saveAck"]={{"job",p},{"ok",message.empty()},{"error",message}};
                     } else if(op=="cli") {
-                        if(!options_.allow_cli) throw std::runtime_error("测试数据目录未绑定 CLI；请显式传入 --cli");
+                        if(!options_.allow_cli) throw std::runtime_error("cliUnbound");
                         auto action=p.value("action",std::string());
                         std::vector<std::wstring> args={L"watch"};
                         if(action=="start" || action=="stop") args.push_back(wide(action));
                         else if(action=="startupEnable" || action=="startupDisable") { args.push_back(L"startup"); args.push_back(action=="startupEnable"?L"enable":L"disable"); }
-                        else throw std::runtime_error("不支持的 CLI 操作");
+                        else throw std::runtime_error("cliOperationUnknown");
                         auto result=run_cli(options_.cli,args,stop_);
                         SetEvent(service_refresh_);
-                        try { wide(result.output); } catch(...) { result.output=tr("cliEncoding",language); }
                         Json feedback={{"busy",false},{"lastCommand",{{"action",action},{"code",result.code}}}};
                         if(result.code!=0) {
-                            auto message=tr("cliFailed",language); auto at=message.find("{code}"); message.replace(at,6,std::to_string(result.code));
-                            feedback["actionError"]=message+"\n"+result.output;
+                            Json output;
+                            try { wide(result.output); output=std::move(result.output); }
+                            catch(...) { output={{"source","cliEncoding"}}; }
+                            feedback["actionError"]=error_text("cliFailureOutput",{
+                                {"failure",{{"source",error_text("cliFailed",{{"code",result.code}})}}},{"output",output}});
                         }
                         publish(std::move(feedback)); flags|=Startup;
-                    } else throw std::runtime_error("未知界面操作");
+                    } else throw std::runtime_error("uiOperationUnknown");
                 } catch(const std::exception& e) {
-                    auto message=translated_error(e.what(),language);
+                    auto message=std::string(e.what());
                     if(op=="commit") edit_feedback["saveAck"]={{"job",p},{"ok",false},{"error",message}};
                     else publish({{"busy",false},{"actionError",message}});
                 }
@@ -752,7 +777,7 @@ void Application::work() {
                 catch(const std::exception& e) { errors[file]=e.what(); }
             };
             read(Config,"sunpack_config.json",last_config,config_read,[&](const std::string& text){
-                auto value=parse_json(text); if(!value.is_object()) throw std::runtime_error("配置顶层必须是 JSON 对象");
+                auto value=parse_json(text); if(!value.is_object()) throw std::runtime_error("configObjectRequired");
                 config=std::move(value); config_changed=dirs_changed=true;
             });
             read(Passwords,"builtin_passwords.json",last_passwords,passwords_read,[&](const std::string& text){
@@ -769,8 +794,8 @@ void Application::work() {
                         auto name=path.filename().wstring(); CharLowerBuffW(name.data(),DWORD(name.size()));
                         std::error_code ec;
                         if(path.empty() || name==L"events.jsonl" || fs::is_directory(path,ec)) changed(Log);
-                    }); errors.erase("日志观察器");
-                } catch(const std::exception& e) { errors["日志观察器"]=e.what(); }
+                    }); errors.erase("logObserver");
+                } catch(const std::exception& e) { errors["logObserver"]=e.what(); }
                 log.set_path(log_dir/"events.jsonl"); flags|=Log; tasks_changed=true; task_delta_eligible=false;
             }
             if(flags&Log) {
@@ -810,7 +835,7 @@ void Application::work() {
             changed_patch.update(edit_feedback);
             if(!changed_patch.empty()) publish(std::move(changed_patch));
         }
-    } catch(const std::exception& e) { publish({{"actionError",translated_error(e.what(),"en")},{"ready",true}}); }
+    } catch(const std::exception& e) { publish({{"actionError",e.what()},{"ready",true}}); }
     CoUninitialize();
 }
 }

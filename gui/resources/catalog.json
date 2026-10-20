@@ -324,55 +324,39 @@
       "zh": "每轮询问",
       "en": "Ask after each round"
     },
-    "等待处理": {
-      "zh": "等待处理",
-      "en": "Queued"
-    },
-    "等待文件释放": {
-      "zh": "等待文件释放",
-      "en": "Waiting for file release"
-    },
-    "准备处理": {
-      "zh": "准备处理",
-      "en": "Preparing"
-    },
-    "正在处理": {
-      "zh": "正在处理",
+    "taskProcessing": {
+      "zh": "处理中",
       "en": "Processing"
     },
-    "成功": {
+    "taskWaiting": {
+      "zh": "等待中",
+      "en": "Waiting"
+    },
+    "taskSucceeded": {
       "zh": "成功",
       "en": "Succeeded"
     },
-    "失败": {
+    "taskFailed": {
       "zh": "失败",
       "en": "Failed"
     },
-    "挂起：等待密码": {
-      "zh": "挂起：等待密码",
+    "taskWaitingPassword": {
+      "zh": "等待密码",
       "en": "Waiting for password"
     },
-    "挂起：等待分卷": {
-      "zh": "挂起：等待分卷",
+    "taskWaitingVolumes": {
+      "zh": "等待分卷",
       "en": "Waiting for volumes"
     },
-    "等待重试": {
-      "zh": "等待重试",
-      "en": "Retry pending"
+    "identifiedParts": {
+      "zh": "已识别 {count} 个分卷",
+      "en": "Identified {count} volumes"
     },
-    "跳过": {
-      "zh": "跳过",
-      "en": "Skipped"
-    },
-    "已合并": {
-      "zh": "已合并",
-      "en": "Coalesced"
-    },
-    "文件观察器": {
+    "fileObserver": {
       "zh": "文件观察器",
       "en": "File observer"
     },
-    "日志观察器": {
+    "logObserver": {
       "zh": "日志观察器",
       "en": "Log observer"
     },
@@ -399,6 +383,342 @@
     "configConflict": {
       "zh": "配置已在外部删除，请放弃更改后重新编辑。",
       "en": "A setting was removed externally. Discard changes and edit it again."
+    },
+    "settingChanged": {
+      "zh": "该字段已被外部修改，请重新选择后保存",
+      "en": "This setting changed in another program. Review the latest value and edit it again."
+    },
+    "settingTypeMismatch": {
+      "zh": "输入类型与字段类型不一致",
+      "en": "The value has the wrong type for this setting."
+    },
+    "passwordChanged": {
+      "zh": "密码记录已被外部修改，请重新选择",
+      "en": "This password changed in another program. Open it again to edit the latest value."
+    },
+    "passwordScopeAbsolute": {
+      "zh": "密码作用域必须是 Windows 绝对目录",
+      "en": "Password folders must use absolute Windows paths."
+    },
+    "rootInvalid": {
+      "zh": "目录不能为空且不能包含分隔符或换行",
+      "en": "The folder must not be empty or contain separators or line breaks."
+    },
+    "rootMissing": {
+      "zh": "监控目录必须是已存在的文件夹",
+      "en": "Choose an existing folder to monitor."
+    },
+    "rootDuplicate": {
+      "zh": "监控目录已存在",
+      "en": "This folder is already monitored."
+    },
+    "rootRemoved": {
+      "zh": "监控目录已被外部删除",
+      "en": "This monitored folder was removed in another program."
+    },
+    "pathMissing": {
+      "zh": "路径当前不存在",
+      "en": "The path does not currently exist."
+    },
+    "explorerFailed": {
+      "zh": "无法在资源管理器中打开路径",
+      "en": "Could not open the path in Explorer."
+    },
+    "cliMissing": {
+      "zh": "未找到 SunPack CLI；请安装完整发行包或传入 --cli",
+      "en": "SunPack CLI was not found. Install the complete package or specify --cli."
+    },
+    "cliUnbound": {
+      "zh": "测试数据目录未绑定 CLI；请显式传入 --cli",
+      "en": "This data folder has no CLI configured. Specify --cli."
+    },
+    "configObjectRequired": {
+      "zh": "配置顶层必须是 JSON 对象",
+      "en": "The configuration must be a JSON object."
+    },
+    "jsonDuplicateKey": {
+      "zh": "JSON 包含重复字段",
+      "en": "The JSON contains duplicate properties."
+    },
+    "fileTooLarge": {
+      "zh": "文件超过可编辑大小限制",
+      "en": "The file exceeds the editable size limit."
+    },
+    "watchNotificationsUnsupported": {
+      "zh": "目录不支持文件变化通知",
+      "en": "The folder does not support file change notifications."
+    },
+    "folderPickerFailed": {
+      "zh": "无法打开目录选择器",
+      "en": "Could not open the folder picker."
+    },
+    "logRecordTooLarge": {
+      "zh": "日志单行超过大小限制",
+      "en": "A log entry exceeds the size limit."
+    },
+    "passwordScopesEmpty": {
+      "zh": "目录密码的 scopes 不能为空",
+      "en": "A folder password needs at least one folder."
+    },
+    "passwordUnicodeRequired": {
+      "zh": "密码及作用域必须是无 NUL 的有效 Unicode 字符串",
+      "en": "Passwords and folders must be valid Unicode without NUL characters."
+    },
+    "passwordArrayRequired": {
+      "zh": "密码文件必须包含 passwords 数组",
+      "en": "The password file must contain a passwords array."
+    },
+    "passwordFileUnknownField": {
+      "zh": "密码文件含未知字段",
+      "en": "The password file contains an unknown property."
+    },
+    "passwordValueRequired": {
+      "zh": "密码记录缺少 value",
+      "en": "A password record is missing its value."
+    },
+    "passwordRecordUnknownField": {
+      "zh": "密码记录含未知字段",
+      "en": "A password record contains an unknown property."
+    },
+    "clipboardArrayRequired": {
+      "zh": "clipboard_history 必须为数组",
+      "en": "Clipboard history must be an array."
+    },
+    "scopeNotDirect": {
+      "zh": "只能移除直接绑定的作用域",
+      "en": "Only directly assigned folders can be removed."
+    },
+    "scopeInherited": {
+      "zh": "当前目录不是直接作用域",
+      "en": "This folder is inherited and cannot be removed here."
+    },
+    "rootsLineInvalid": {
+      "zh": "监控目录每行最多包含 input | output | deep_detect",
+      "en": "Each monitored-folder line accepts input | output | deep_detect."
+    },
+    "deepDetectInvalid": {
+      "zh": "deep_detect 只能是 true 或 false",
+      "en": "Deep detection must be true or false."
+    },
+    "passwordOperationUnknown": {
+      "zh": "未知密码操作",
+      "en": "Unknown password operation."
+    },
+    "guiArguments": {
+      "zh": "参数：--data-dir <目录> --cli <可执行文件> [--cli-prefix <单个参数>]...",
+      "en": "Arguments: --data-dir <folder> --cli <executable> [--cli-prefix <argument>]..."
+    },
+    "upgradeArguments": {
+      "zh": "参数：--upgrade-data <数据目录>",
+      "en": "Arguments: --upgrade-data <data folder>"
+    },
+    "programDataUnavailable": {
+      "zh": "无法确定 ProgramData",
+      "en": "Could not locate ProgramData."
+    },
+    "uiBindingFailed": {
+      "zh": "界面数据绑定失败",
+      "en": "Could not update the interface data."
+    },
+    "taskBindingFailed": {
+      "zh": "任务列表更新失败",
+      "en": "Could not update the task list."
+    },
+    "logoLoadFailed": {
+      "zh": "无法加载 SunPack 图标资源",
+      "en": "Could not load the SunPack logo."
+    },
+    "layoutLoadFailed": {
+      "zh": "无法加载管理面板布局",
+      "en": "Could not load the manager layout."
+    },
+    "cliOperationUnknown": {
+      "zh": "不支持的 CLI 操作",
+      "en": "Unsupported CLI operation."
+    },
+    "uiOperationUnknown": {
+      "zh": "未知界面操作",
+      "en": "Unknown interface operation."
+    },
+    "stageRenderer": {
+      "zh": "初始化渲染器",
+      "en": "Initialize renderer"
+    },
+    "stageLogo": {
+      "zh": "加载图标",
+      "en": "Load logo"
+    },
+    "stageFonts": {
+      "zh": "设置字体",
+      "en": "Set up fonts"
+    },
+    "stageLayout": {
+      "zh": "加载布局",
+      "en": "Load layout"
+    },
+    "stageWindow": {
+      "zh": "创建窗口",
+      "en": "Create window"
+    },
+    "stageEvents": {
+      "zh": "绑定窗口事件",
+      "en": "Bind window events"
+    },
+    "stageWatchers": {
+      "zh": "启动文件观察器",
+      "en": "Start file observers"
+    },
+    "startupFailure": {
+      "zh": "启动失败（{stage}）：{detail}",
+      "en": "Startup failed ({stage}): {detail}"
+    },
+    "windowsFailure": {
+      "zh": "{operation}失败（Windows 错误 {code}）：{detail}",
+      "en": "{operation} failed (Windows error {code}): {detail}"
+    },
+    "windowsMessageUnavailable": {
+      "zh": "系统未提供此错误的说明",
+      "en": "No system message is available for this error."
+    },
+    "invalidJson": {
+      "zh": "JSON 格式无效，请检查第 {byte} 字节附近",
+      "en": "Invalid JSON near byte {byte}."
+    },
+    "cliFailureOutput": {
+      "zh": "{failure}\n{output}",
+      "en": "{failure}\n{output}"
+    },
+    "opEncodeUtf8": {
+      "zh": "编码 UTF-8",
+      "en": "Encode UTF-8"
+    },
+    "opDecodeUtf8": {
+      "zh": "解码 UTF-8",
+      "en": "Decode UTF-8"
+    },
+    "opCreateMutex": {
+      "zh": "创建文件锁",
+      "en": "Create file lock"
+    },
+    "opWaitMutex": {
+      "zh": "等待文件锁",
+      "en": "Wait for file lock"
+    },
+    "opReadFile": {
+      "zh": "读取文件",
+      "en": "Read file"
+    },
+    "opFileSize": {
+      "zh": "读取文件大小",
+      "en": "Read file size"
+    },
+    "opCreateTemp": {
+      "zh": "创建临时文件",
+      "en": "Create temporary file"
+    },
+    "opWriteFile": {
+      "zh": "写入文件",
+      "en": "Write file"
+    },
+    "opFlushFile": {
+      "zh": "刷新文件",
+      "en": "Flush file"
+    },
+    "opReplaceFile": {
+      "zh": "替换文件",
+      "en": "Replace file"
+    },
+    "opWatchDirectory": {
+      "zh": "监控目录",
+      "en": "Watch folder"
+    },
+    "opReadStartupRegistry": {
+      "zh": "读取启动项注册表",
+      "en": "Read startup registry"
+    },
+    "opReadStartupValue": {
+      "zh": "读取启动项",
+      "en": "Read startup entry"
+    },
+    "opSubscribeService": {
+      "zh": "订阅服务状态",
+      "en": "Subscribe to service status"
+    },
+    "opServiceNotification": {
+      "zh": "接收服务状态通知",
+      "en": "Receive service status notification"
+    },
+    "opOpenServiceManager": {
+      "zh": "打开服务管理器",
+      "en": "Open service manager"
+    },
+    "opOpenWatchService": {
+      "zh": "打开监控服务",
+      "en": "Open Watch Broker service"
+    },
+    "opQueryWatchStatus": {
+      "zh": "查询监控服务状态",
+      "en": "Query Watch Broker status"
+    },
+    "opCaptureCli": {
+      "zh": "捕获 CLI 输出",
+      "en": "Capture CLI output"
+    },
+    "opCliAttributes": {
+      "zh": "设置 CLI 进程属性",
+      "en": "Set CLI process attributes"
+    },
+    "opCliHandles": {
+      "zh": "设置 CLI 进程句柄",
+      "en": "Set CLI process handles"
+    },
+    "opLaunchCli": {
+      "zh": "启动 CLI",
+      "en": "Launch CLI"
+    },
+    "opReadCliOutput": {
+      "zh": "读取 CLI 输出",
+      "en": "Read CLI output"
+    },
+    "opSeekLog": {
+      "zh": "定位日志",
+      "en": "Seek log"
+    },
+    "opReadLog": {
+      "zh": "读取日志",
+      "en": "Read log"
+    },
+    "opReadEventLog": {
+      "zh": "读取事件日志",
+      "en": "Read event log"
+    },
+    "opLogIdentity": {
+      "zh": "读取日志标识",
+      "en": "Read log identity"
+    },
+    "opLogGeneration": {
+      "zh": "读取日志更新信息",
+      "en": "Read log generation"
+    },
+    "opCommandLine": {
+      "zh": "读取命令行",
+      "en": "Read command line"
+    },
+    "opGuiInstance": {
+      "zh": "创建管理面板实例",
+      "en": "Create manager instance"
+    },
+    "opFindLogo": {
+      "zh": "查找 SunPack 图标资源",
+      "en": "Find SunPack logo resource"
+    },
+    "opWindowEvents": {
+      "zh": "设置窗口事件",
+      "en": "Set up window events"
+    },
+    "opServiceRefresh": {
+      "zh": "创建服务刷新事件",
+      "en": "Create service refresh event"
     }
   },
   "groups": {

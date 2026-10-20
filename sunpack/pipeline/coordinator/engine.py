@@ -59,6 +59,16 @@ class _Submission:
     progress_callback: Callable[[Any, dict[str, Any]], None] | None = None
 
 
+def _task_source_group(task: ArchiveTask) -> dict[str, Any]:
+    # Presentation reuses the confirmed descriptor; cleanup/publication claims
+    # can also contain carriers and destinations that are not archive members.
+    return {
+        "path": task.main_path,
+        "name": os.path.basename(task.logical_name),
+        "members": task.all_parts or [task.main_path],
+    }
+
+
 class PipelineEngine:
     """Single-event-loop owner for independently completing requests."""
 
@@ -1314,6 +1324,7 @@ class _RequestRuntime:
                     "type": "semantic",
                     "event": "task_sources_claimed",
                     "source_paths": claimed_sources,
+                    "groups": [_task_source_group(task) for task in tasks],
                     "depth": depth,
                 },
             )
@@ -1685,6 +1696,12 @@ class _RequestRuntime:
                 request_id=self.submission.request_id, cancellation=cancellation,
             )
             task.apply_path_mapping(moved.path_map)
+            if self.submission.origin == "watch":
+                self._report_progress(task, {
+                    "type": "semantic", "event": "task_sources_claimed",
+                    "source_paths": tuple(task.cleanup_parts or task.all_parts or [task.main_path]),
+                    "groups": [_task_source_group(task)],
+                })
             ownership.remap_task(task, result.input_path)
             updated = replace(result, input_path=task.main_path, failure_message="")
             self._shell_updates.add(moved.touched_dirs)
@@ -1757,6 +1774,7 @@ class _RequestRuntime:
             self._report_progress(task, {
                 "type": "semantic", "event": "task_sources_claimed",
                 "source_paths": tuple(task.cleanup_parts or paths),
+                "groups": [_task_source_group(task)],
             })
 
     def _plan_task_isolated(self, task):

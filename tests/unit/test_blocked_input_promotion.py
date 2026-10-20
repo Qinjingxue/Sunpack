@@ -123,6 +123,11 @@ def test_coordinator_rewrites_recorded_result_and_cleanup_input(tmp_path, collis
             assert promoted and result.input_path == str(top / inner.name)
             assert result.failure is original.failure
             assert task.cleanup_parts == [str(top / inner.name)]
+            if origin == "watch":
+                assert claims[-1]["groups"] == [{
+                    "path": str(top / inner.name), "name": inner.name,
+                    "members": [str(top / inner.name)],
+                }]
             assert ownership.response(runtime.context, recent_passwords=()).discovery.blocked_paths == (str(top / inner.name),)
 
     asyncio.run(scenario())

@@ -28,9 +28,9 @@ void projection(Fixture& f) {
     overwrite(p,event("candidate_active",source,1)+event("processing_started",source,2)+event("done",source,3)+event("cleanup",source,4));
     assert(log.refresh()); assert(log.tasks.size()==1);
     auto& task=log.tasks.begin()->second;
-    assert(task.status=="成功"); // Cleanup never replaces the task's terminal state.
+    assert(task.status=="taskSucceeded"); // Cleanup never replaces the task's terminal state.
     auto parsed=log.bytes_parsed; assert(!log.refresh()); assert(log.bytes_parsed==parsed);
-    for(auto type:{"failed_terminal","failed_password","suspended_missing_volume","retry_password_failure","done","partial_rejected","pipeline_request_coalesced","no_tasks_found"}) {
+    for(auto type:{"failed_terminal","failed_password","suspended_missing_volume","done","partial_rejected"}) {
         auto line=event(type,source,5); overwrite(p,line.substr(0,line.size()-2),true); log.refresh();
         auto sequence=log.tasks.begin()->second.sequence;
         overwrite(p,line.substr(line.size()-2),true); log.refresh();
@@ -93,6 +93,83 @@ void projection(Fixture& f) {
     fs::remove(nested); fs::remove(monitor);
     fails([&]{task_directory(row);});
 }
+// One real JSONL replay covers logical ownership, removal and delta delivery.
+// The original projection scenario cannot expose cross-path aliasing failures;
+// without this scenario duplicate/stale cards can pass all scalar status checks.
+void logical_projection(Fixture& f) {
+    EventLog log; auto file=f.dir/"logical.jsonl"; log.set_path(file);
+    auto a=utf8((f.dir/"parts"/"disguised.a").wstring());
+    auto b=utf8((f.dir/"parts"/"unrelated.bin").wstring());
+    auto c=utf8((f.dir/"parts"/"third.blob").wstring());
+    auto other=utf8((f.dir/"parts-extra"/"unrelated.bin").wstring());
+    std::unordered_map<std::string,Json> displayed;
+    int ts=0;
+    auto replay=[&](Json record) {
+        record["ts"]=++ts;
+        overwrite(file,record.dump()+"\n",true); log.refresh();
+        if(log.rebuilt || log.changed_overflow) {
+            displayed.clear();
+            auto snapshot=task_rows(log,{},{});
+            for(auto& row:snapshot["rows"]) displayed[row["id"]]=row;
+        } else { auto delta=task_delta(log,{},{}); for(auto& change:delta["changes"]) {
+            auto id=change["id"].get<std::string>();
+            if(change.contains("row")) displayed[id]=change["row"]; else displayed.erase(id);
+        }}
+        auto snapshot=task_rows(log,{},{});
+        assert(displayed.size()==snapshot["total"].get<size_t>());
+        for(auto& row:snapshot["rows"]) assert(displayed.at(row["id"].get<std::string>())==row);
+    };
+    auto send=[&](const char* type,const std::string& path) { replay(Json{{"event",type},{"path",path}}); };
+    auto group=[&](const std::string& path,const std::vector<std::string>& members) {
+        replay(Json{{"event","pipeline_sources_claimed"},{"path",path},
+            {"groups",Json::array({Json{{"path",path},{"name","movie.rar"},{"members",members}}})}});
+    };
+    auto row=[&]() { return task_rows(log,{},{}).at("rows").at(0); };
+    // Unrecognized and preparation events do not create visible work.
+    overwrite(file,event("candidate_active",wide(a),0)); log.refresh();
+    assert(task_rows(log,{},{}).at("total")==0);
+    send("processing_started",b); group(b,{b}); send("suspended_missing_volume",b);
+    auto id=row()["id"];
+    assert(row()["status"]=="taskWaiting" && row()["statusText"]=="等待分卷");
+    send("processing_started",a);
+    group(a,{a,b,c}); // Main path changes; the existing logical card survives.
+    assert(displayed.size()==1 && row()["id"]==id && row()["name"]=="movie.rar");
+    assert(row()["partCount"]==3 && row()["status"]=="taskProcessing");
+    View member_search; member_search.task_query="unrelated.bin";
+    assert(task_rows(log,{},member_search).at("total")==1);
+    send("suspended_missing_volume",a);
+    send("retry_password_failure",b); // No change to the waiting reason.
+    assert(row()["statusText"]=="等待分卷");
+    send("pipeline_request_coalesced",a);
+    assert(displayed.size()==1);
+    replay(Json{{"event","candidate_departed"},{"path",b},{"forgotten",false}});
+    assert(row()["partCount"]==2 && row()["statusText"]=="等待分卷");
+    send("processing_started",c); send("failed_password",a);
+    View waiting; waiting.task_status="taskWaiting";
+    assert(task_rows(log,{},waiting).at("total")==1);
+    assert(task_rows(log,{},waiting,"en").at("rows").at(0).at("statusText")=="Waiting for password");
+    // Recursive deletion has a path boundary and ignores persistent-state flags.
+    send("failed_password",other);
+    replay(Json{{"event","candidate_departed"},{"path",utf8((f.dir/"parts").wstring())},{"recursive",true},{"forgotten",false}});
+    assert(displayed.size()==1 && row()["path"]==other);
+    send("candidate_departed",other); assert(displayed.empty());
+    send("processing_started",a); send("no_tasks_found",a); assert(displayed.empty());
+    send("processing_started",b); send("pipeline_request_coalesced",b); assert(displayed.empty());
+    // Two tasks in one claim must stay independent, including nested inputs.
+    replay(Json{{"event","pipeline_sources_claimed"},{"path",a},{"groups",Json::array({
+        Json{{"path",a},{"name","movie.rar"},{"members",{a,b}}},
+        Json{{"path",other},{"name","inner.zip"},{"members",{other}}}})}});
+    assert(displayed.empty());
+    send("processing_started",a); send("failed_password",other);
+    assert(displayed.size()==2);
+    send("done",b); send("pipeline_request_coalesced",a); send("no_tasks_found",b);
+    send("candidate_departed",a); send("candidate_departed",b);
+    assert(displayed.size()==2); // Terminal history remains and aliases retain the result.
+    send("candidate_departed",other); assert(displayed.size()==1 && row()["status"]=="taskSucceeded");
+    // Reset must release aliases as well as visible history.
+    overwrite(file,event("processing_started",wide(b),100)); assert(log.refresh() && log.rebuilt);
+    assert(row()["name"]=="unrelated.bin" && row()["partCount"]==0);
+}
 void editing(Fixture& f) {
     auto p=f.dir/"builtin_passwords.json";
     Json original={{"value","  #中文 密码  "},{"scopes",{"C:/A","D:/B"}}};
@@ -147,6 +224,43 @@ void editing(Fixture& f) {
     }
     assert(log_directory(f.dir,Json({{"watch",{{"state_dir","other"}}}}))==f.dir/"other");
 }
+// Existing file/edit tests only check rejection. This coarse scenario catches
+// leaked message keys, frozen locales and lost Windows codes across the same
+// exception/string boundary used by background saves, without extra processes.
+void localization(Fixture& fixture) {
+    auto rejected=[&](const std::function<void()>& action,const char* expected) {
+        try { action(); assert(false); }
+        catch(const std::exception& error) {
+            assert(std::string(error.what())==expected);
+            auto zh=translated_error(error.what(),"zh"), en=translated_error(error.what(),"en");
+            assert(zh==tr(expected,"zh") && en==tr(expected,"en") && zh!=en && en!=expected);
+        }
+    };
+    rejected([]{parse_json(R"({"a":1,"a":2})");},"jsonDuplicateKey");
+    rejected([]{validate_passwords(Json::object());},"passwordArrayRequired");
+    rejected([]{parse_roots("C:/input | out | maybe",{});},"deepDetectInvalid");
+    try { parse_json("{invalid}"); assert(false); }
+    catch(const std::exception& error) {
+        assert(translated_error(error.what(),"en").find("Invalid JSON near byte ")==0);
+        assert(translated_error(error.what(),"zh").find("JSON 格式无效")==0);
+    }
+    try { read_file(fixture.dir/"missing-file"); assert(false); }
+    catch(const WinError& error) {
+        assert(error.code==ERROR_FILE_NOT_FOUND);
+        auto en=translated_error(error.what(),"en"), zh=translated_error(error.what(),"zh");
+        assert(en.find("Read file failed (Windows error 2): ")==0 && en.find("opReadFile")==std::string::npos);
+        assert(zh.find("读取文件失败（Windows 错误 2）")==0 && en!=zh);
+        auto startup=error_text("startupFailure",{{"stage",{{"source","stageLayout"}}},{"detail",{{"source",error.what()}}}});
+        assert(translated_error(startup,"en").find("Startup failed (Load layout): Read file failed")==0);
+    }
+    auto literal=error_text("cliFailureOutput",{{"failure",{{"source","pathMissing"}}},{"output","taskFailed {code}"}});
+    assert(translated_error(literal,"en")=="The path does not currently exist.\ntaskFailed {code}");
+    auto data=fixture.dir/"locale"; fs::create_directory(data);
+    assert(startup_language(data)=="en");
+    atomic_write(data/"sunpack_config.json",R"({"cli":{"language":"zh"}})");
+    assert(startup_language(data)=="zh");
+    atomic_write(data/"sunpack_config.json","{"); assert(startup_language(data)=="en");
+}
 void installer_upgrade(Fixture& fixture) {
     auto path=fixture.dir/"upgrade.json";
     const std::string keep=R"("advanced":{"integer":123456789012345678901234567890,"text":"directory_password_file_auto_create"})";
@@ -200,9 +314,9 @@ void roots(Fixture& f) {
     log.accept(Json{{"event","failed_terminal"},{"path",changed_path},{"ts",99999}});
     auto delta=task_delta(log,all,view);
     auto latest=task_rows(log,all,view);
-    assert(delta["changes"].size()==1 && latest["rows"][0]["status"]=="失败");
+    assert(delta["changes"].size()==1 && latest["rows"][0]["status"]=="taskFailed");
     assert(delta["changes"][0]["row"]==latest["rows"][0]);
-    view.task_status="成功";
+    view.task_status="taskSucceeded";
     auto removal=task_delta(log,all,view);
     assert(removal["changes"].size()==1 && !removal["changes"][0].contains("row"));
 }
@@ -263,7 +377,7 @@ int wmain(int argc,wchar_t** argv) {
     if(argc==3 && std::wstring(argv[1])==L"--mutex") { std::cout<<utf8(mutex_name(argv[2]))<<"\n"<<utf8(mutex_name(argv[2],L"SunPackWatchRoots"))<<"\n"; return 0; }
     if(argc>=2 && std::wstring(argv[1])==L"--echo") { Json args=Json::array(); for(int i=2;i<argc;++i) args.push_back(utf8(argv[i])); std::cout<<args.dump(); return 7; }
     if(argc==4 && std::wstring(argv[1])==L"--password-add") { edit_password(argv[2],"add",Json(),Json({{"value",utf8(argv[3])}})); return 0; }
-    try { Fixture f; projection(f); editing(f); roots(f); installer_upgrade(f); batch_editing(f); service_notifications(); std::cout<<"GUI file contracts passed\n"; }
+    try { Fixture f; projection(f); logical_projection(f); editing(f); roots(f); localization(f); installer_upgrade(f); batch_editing(f); service_notifications(); std::cout<<"GUI file contracts passed\n"; }
     catch(const std::exception& e) { std::cerr<<e.what()<<"\n"; return 1; }
     CliCommand cli{executable_path(),fs::temp_directory_path(),{L"--echo"}};
     Handle stop(CreateEventW(nullptr,TRUE,FALSE,nullptr));

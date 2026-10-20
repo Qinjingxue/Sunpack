@@ -39,6 +39,13 @@ std::string tr(const std::string& key,const std::string& language) {
     const auto& texts=catalog()["ui"];
     return texts.contains(key)?local(texts[key],language):key;
 }
+std::string startup_language(const fs::path& data_dir) {
+    try { return gui_language(read_json(data_dir/"sunpack_config.json")); }
+    catch(const std::exception&) { return "en"; }
+}
+std::string error_text(const std::string& key,const Json& arguments) {
+    return Json{{"$guiError",key},{"arguments",arguments}}.dump();
+}
 Json interface_texts(const std::string& language) {
     Json result=Json::object();
     for(auto it=catalog()["ui"].begin();it!=catalog()["ui"].end();++it) result[it.key()]=local(it.value(),language);
@@ -81,42 +88,45 @@ void validate_setting(const std::string& pointer,const Json& value,const std::st
             (meta.contains("max") && !meta["max"].is_null() && number>meta["max"].get<double>()) || (meta.value("integer",false) && std::floor(number)!=number)) throw std::runtime_error("validation");
     }
 }
+namespace {
+std::string windows_message(DWORD code,const std::string& language) {
+    wchar_t* buffer=nullptr;
+    auto locale=language=="zh"?MAKELANGID(LANG_CHINESE,SUBLANG_CHINESE_SIMPLIFIED):MAKELANGID(LANG_ENGLISH,SUBLANG_ENGLISH_US);
+    auto size=FormatMessageW(FORMAT_MESSAGE_ALLOCATE_BUFFER|FORMAT_MESSAGE_FROM_SYSTEM|FORMAT_MESSAGE_IGNORE_INSERTS,
+        nullptr,code,locale,reinterpret_cast<wchar_t*>(&buffer),0,nullptr);
+    if(!size) return tr("windowsMessageUnavailable",language);
+    std::wstring message(buffer,size); LocalFree(buffer);
+    auto end=message.find_last_not_of(L" \t\r\n");
+    message.resize(end==std::wstring::npos?0:end+1);
+    return utf8(message);
+}
+std::string render_error(const std::string& message,const std::string& language,unsigned depth) {
+    if(depth>8 || message.rfind("{\"$guiError\":",0)!=0) return tr(message,language);
+    auto value=Json::parse(message,nullptr,false);
+    if(!value.is_object() || !value.contains("$guiError") || !value["$guiError"].is_string() ||
+        !value.contains("arguments") || !value["arguments"].is_object()) return message;
+    auto key=value["$guiError"].get<std::string>();
+    auto& arguments=value["arguments"];
+    if(key=="windowsFailure" && arguments.contains("code") && arguments["code"].is_number_unsigned())
+        arguments["detail"]=windows_message(arguments["code"].get<DWORD>(),language);
+    auto pattern=tr(key,language);
+    std::string result;
+    size_t at=0;
+    while(at<pattern.size()) {
+        auto begin=pattern.find('{',at), end=begin==std::string::npos?begin:pattern.find('}',begin+1);
+        if(end==std::string::npos) { result+=pattern.substr(at); break; }
+        result+=pattern.substr(at,begin-at);
+        auto field=arguments.find(pattern.substr(begin+1,end-begin-1));
+        if(field==arguments.end()) result+=pattern.substr(begin,end-begin+1);
+        else if(field->is_object() && field->contains("source") && (*field)["source"].is_string())
+            result+=render_error((*field)["source"].get_ref<const std::string&>(),language,depth+1);
+        else result+=field->is_string()?field->get_ref<const std::string&>():field->dump();
+        at=end+1;
+    }
+    return result;
+}
+}
 std::string translated_error(const std::string& message,const std::string& language) {
-    if(catalog()["ui"].contains(message)) return tr(message,language);
-    // Keep OS / parser diagnostics, translated application errors come from the catalog.
-    if(language=="zh") return message;
-    static const std::pair<const char*,const char*> errors[]={
-        {"该字段已被外部修改，请重新选择后保存","This setting changed in another program. Review the latest value and edit it again."},
-        {"输入类型与字段类型不一致","The value has the wrong type for this setting."},
-        {"密码记录已被外部修改，请重新选择","This password changed in another program. Open it again to edit the latest value."},
-        {"密码作用域必须是 Windows 绝对目录","Password folders must use absolute Windows paths."},
-        {"目录不能为空且不能包含分隔符或换行","The folder must not be empty or contain separators or line breaks."},
-        {"监控目录必须是已存在的文件夹","Choose an existing folder to monitor."},
-        {"监控目录已存在","This folder is already monitored."},
-        {"监控目录已被外部删除","This monitored folder was removed in another program."},
-        {"路径当前不存在","The path does not currently exist."},
-        {"无法在资源管理器中打开路径","Could not open the path in Explorer."},
-        {"未找到 SunPack CLI；请安装完整发行包或传入 --cli","SunPack CLI was not found. Install the complete package or specify --cli."},
-        {"测试数据目录未绑定 CLI；请显式传入 --cli","This data folder has no CLI configured. Specify --cli."},
-        {"配置顶层必须是 JSON 对象","The configuration must be a JSON object."},
-        {"JSON 包含重复字段","The JSON contains duplicate properties."},
-        {"文件超过可编辑大小限制","The file exceeds the editable size limit."},
-        {"目录不支持文件变化通知","The folder does not support file change notifications."},
-        {"无法打开目录选择器","Could not open the folder picker."},
-        {"日志单行超过大小限制","A log entry exceeds the size limit."},
-        {"目录密码的 scopes 不能为空","A folder password needs at least one folder."},
-        {"密码及作用域必须是无 NUL 的有效 Unicode 字符串","Passwords and folders must be valid Unicode without NUL characters."},
-        {"密码文件必须包含 passwords 数组","The password file must contain a passwords array."},
-        {"密码文件含未知字段","The password file contains an unknown property."},
-        {"密码记录缺少 value","A password record is missing its value."},
-        {"密码记录含未知字段","A password record contains an unknown property."},
-        {"clipboard_history 必须为数组","Clipboard history must be an array."},
-        {"只能移除直接绑定的作用域","Only directly assigned folders can be removed."},
-        {"当前目录不是直接作用域","This folder is inherited and cannot be removed here."},
-        {"监控目录每行最多包含 input | output | deep_detect","Each monitored-folder line accepts input | output | deep_detect."},
-        {"deep_detect 只能是 true 或 false","Deep detection must be true or false."},
-    };
-    for(auto& item:errors) if(message==item.first) return item.second;
-    return message;
+    return render_error(message,language,0);
 }
 }
