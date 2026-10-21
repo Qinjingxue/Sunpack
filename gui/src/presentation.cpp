@@ -67,7 +67,7 @@ Json describe_setting(const std::string& pointer,const std::string& module,const
     if(primary) label=block_label;
     Json result={{"label",label},{"category",category},{"categoryLabel",groups.contains(category)?local(groups[category],language):tr("readOnly",language)},
         {"block",block},{"blockLabel",block_label},{"module",module},{"primary",primary},
-        {"description",meta.contains("description")?local(meta["description"],language):tr("unknownDescription",language)},
+        {"description",meta.contains("description")?local(meta["description"],language):meta.empty()?tr("unknownDescription",language):std::string()},
         {"editor",meta.value("editor",std::string())},{"options",Json::array()},{"known",!meta.empty()}};
     if(meta.contains("options")) for(auto& option:meta["options"]) result["options"].push_back({{"value",option["value"]},{"label",local(option["label"],language)}});
     return result;

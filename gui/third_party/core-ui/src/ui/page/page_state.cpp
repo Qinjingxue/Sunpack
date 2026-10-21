@@ -856,9 +856,21 @@ void PageState::ApplyBindingToWidget(Widget* w, const std::string& prop, const u
     if (prop == "value") {
         const bool painted = w->PaintedOnce();
         if (auto* ti = dynamic_cast<TextInputWidget*>(w)) {
-            ti->SetText(ToWide(v.ToString()));   // no animation, painted check irrelevant
+            auto text = ToWide(v.ToString());
+            if (ti->Text() == text) {
+                traceBindingNoop();
+                shouldInvalidate = false;
+                return;
+            }
+            ti->SetText(text);
         } else if (auto* ta = dynamic_cast<TextAreaWidget*>(w)) {
-            ta->SetText(ToWide(v.ToString()));
+            auto text = ToWide(v.ToString());
+            if (ta->Text() == text) {
+                traceBindingNoop();
+                shouldInvalidate = false;
+                return;
+            }
+            ta->SetText(text);
         } else if (auto* ci = dynamic_cast<ChipsInputWidget*>(w)) {
             std::wstring nv = ToWide(v.ToString());
             if (ci->Value() == nv) {  // avoid clobbering caret on echo
@@ -2107,6 +2119,7 @@ void PageState::DestroyJsIteration(JsLoopRuntime& rt, JsLoopIteration& iter) {
         widget->onSubmitHook = {}; widget->onTextChanged = {};
         widget->onValueChanged = {}; widget->onFloatChanged = {};
         widget->onMouseDblClickHook = {};
+        widget->onMouseDownHook = {};
         if (auto* combo = dynamic_cast<ComboBoxWidget*>(widget)) combo->onSelectionChanged = {};
         for (const auto& child : widget->Children()) self(self, child.get());
     };
@@ -2526,8 +2539,14 @@ void PageState::WireLoopScopeEventEx(Widget* target, const std::string& evName,
             JS_SetPropertyStr(ctx, obj, "button", JS_NewInt32(ctx, e.leftBtn ? 0 : -1));
             callHandler(obj);
         };
+    } else if (evName == "mousedown") {
+        target->onMouseDownHook = [callHandler, ctx, target](const ui::MouseEvent& e) {
+            JSValue obj = JS_NewObject(ctx);
+            JS_SetPropertyStr(ctx, obj, "offsetX", JS_NewFloat64(ctx, e.x - target->rect.left));
+            JS_SetPropertyStr(ctx, obj, "button", JS_NewInt32(ctx, e.button));
+            callHandler(obj);
+        };
     }
-    // Other pointer events (mousedown / mouseup / wheel) — add as needed.
 }
 
 std::unique_ptr<CondInIter> PageState::BuildCondInIter(

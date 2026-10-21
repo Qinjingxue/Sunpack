@@ -10,6 +10,7 @@
 #include <ui/ui_context.h>
 #include <ui/ui_window.h>
 #include <ui/controls.h>
+#include <ui/measure_context.h>
 #include <chrono>
 #include <cmath>
 #include <map>
@@ -617,7 +618,27 @@ void Application::handle_command(Json command) {
         }
         ui_window_relayout(window_);
         auto* target=window->Root()->FindById(root?"root-"+part+"-input-"+id:"password-input-"+id);
-        if(target) window->FocusWidget(target,false);
+        if(target) {
+            window->FocusWidget(target,false);
+            if(p.contains("pointerX") && p["pointerX"].is_number()) {
+                if(auto* input=dynamic_cast<ui::TextInputWidget*>(target)) {
+                    ui::MeasureContext measure; measure.BindRenderer(&window->GetRenderer());
+                    float offset=0;
+                    if(root && !input->Text().empty()) {
+                        auto* label=window->Root()->FindById("root-"+part+"-value-"+id);
+                        if(label) {
+                            float font=label->css.fontSize>0?label->css.fontSize:theme::kFontSizeNormal;
+                            auto shown=window->GetRenderer().EllipsizeStart(input->Text(),label->ContentWidth(),font);
+                            if(shown!=input->Text() && !shown.empty()) {
+                                auto hidden=input->Text().size()-(shown.size()-1);
+                                offset=measure.MeasureTextWidth(input->Text().substr(0,hidden),font)-measure.MeasureTextWidth(L"\u2026",font);
+                            }
+                        }
+                    }
+                    input->PlaceCaretFromX(measure,target->rect.left+p["pointerX"].get<float>(),offset);
+                }
+            }
+        }
         return;
     }
     if(op=="browseRoot") {

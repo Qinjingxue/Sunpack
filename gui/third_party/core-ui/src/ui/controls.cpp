@@ -915,6 +915,15 @@ bool TextInputWidget::GetCaretRect(D2D1_RECT_F* out) const {
     return true;
 }
 
+void TextInputWidget::PlaceCaretFromX(MeasureContext& measure, float x, float textOffset) {
+    scrollX_ = textOffset;
+    cursorPos_ = CharIndexFromX(measure, x);
+    ClearSelection();
+    dragging_ = false;
+    EnsureCursorVisible(measure);
+    ResetCaretBlink();
+}
+
 int TextInputWidget::CharIndexFromX(MeasureContext& measure, float x) const {
     float fontSize = (css.fontSize > 0) ? css.fontSize : theme::kFontSizeNormal;
     float textX = rect.left + TextInset() - scrollX_;

@@ -12,7 +12,6 @@
       "zh": "范围过滤器必须作为完整模块保存。",
       "en": "Save the range filter as a complete module."
     },
-
     "opRangeDate": {
       "zh": "打开日期时间选择器",
       "en": "Open date/time picker"
@@ -34,12 +33,12 @@
       "en": "End time (exclusive)"
     },
     "rangeHint": {
-      "zh": "上下限均包含；留空表示不限制。支持小数单位，最小值向上、最大值向下取整到字节。",
-      "en": "Both bounds are inclusive; blank means unlimited. Decimal units round the minimum up and maximum down to bytes."
+      "zh": "上下限均包含，留空不限，支持小数单位",
+      "en": "Inclusive bounds; leave blank for no limit; decimal units supported"
     },
     "rangeTimeHint": {
-      "zh": "显示电脑本地时间，精确到分钟，以 UTC 保存；留空表示不限制。",
-      "en": "Displays computer local time to the minute and stores UTC; blank means unlimited."
+      "zh": "本地时间，精确到分钟，留空不限",
+      "en": "Local time to the minute; leave blank for no limit"
     },
     "rangeChoose": {
       "zh": "选择日期时间",
@@ -49,12 +48,30 @@
       "zh": "选择",
       "en": "Choose"
     },
-    "rangePrevious": { "zh": "上个月", "en": "Previous month" },
-    "rangeNext": { "zh": "下个月", "en": "Next month" },
-    "rangeToday": { "zh": "今天", "en": "Today" },
-    "rangeClock": { "zh": "时间", "en": "Time" },
-    "rangePopupTimeHint": { "zh": "本地时间，按分钟以 UTC 保存。", "en": "Local time, saved as UTC minutes." },
-    "rangeConfirm": { "zh": "确认", "en": "Confirm" },
+    "rangePrevious": {
+      "zh": "上个月",
+      "en": "Previous month"
+    },
+    "rangeNext": {
+      "zh": "下个月",
+      "en": "Next month"
+    },
+    "rangeToday": {
+      "zh": "今天",
+      "en": "Today"
+    },
+    "rangeClock": {
+      "zh": "时间",
+      "en": "Time"
+    },
+    "rangePopupTimeHint": {
+      "zh": "本地时间，精确到分钟",
+      "en": "Local time to the minute"
+    },
+    "rangeConfirm": {
+      "zh": "确认",
+      "en": "Confirm"
+    },
     "rangeCalendarKeys": {
       "zh": "方向键选日 · Enter 确认 · Esc 取消",
       "en": "Arrows: date · Enter: confirm · Esc: cancel"
@@ -228,8 +245,8 @@
       "en": "Start Watch at sign-in"
     },
     "startupDescription": {
-      "zh": "登录 Windows 后自动监控目录。",
-      "en": "Automatically monitor folders when you sign in to Windows."
+      "zh": "登录 Windows 后自动监控目录",
+      "en": "Monitor folders when you sign in to Windows"
     },
     "enabled": {
       "zh": "已启用",
@@ -250,10 +267,6 @@
     "theme": {
       "zh": "界面主题",
       "en": "App theme"
-    },
-    "themeDescription": {
-      "zh": "选择管理面板的显示外观。",
-      "en": "Choose how the manager looks."
     },
     "system": {
       "zh": "跟随系统",
@@ -299,19 +312,58 @@
       "zh": "条",
       "en": "entries"
     },
-    "manageEntries": {"zh":"管理条目","en":"Manage entries"},
-    "saveEntries": {"zh":"保存","en":"Save"},
-    "cancelEntries": {"zh":"取消","en":"Cancel"},
-    "searchEntries": {"zh":"搜索条目","en":"Search entries"},
-    "newEntry": {"zh":"新增条目","en":"New entry"},
-    "emptyEntry": {"zh":"（空字符串）","en":"(empty string)"},
-    "updateEntry": {"zh":"更新条目","en":"Update entry"},
-    "importEntries": {"zh":"批量导入","en":"Bulk import"},
-    "previewEntries": {"zh":"预览导入","en":"Preview import"},
-    "multilineEntry": {"zh":"条目内换行","en":"Multiline entry"},
-    "importHint": {"zh":"每行导入一个条目，忽略空行；保留条目首尾空格。先预览，再导入。","en":"One entry per line; blank lines are skipped. Entry whitespace is preserved. Preview before importing."},
-    "unsavedEntries": {"zh":"请先保存或取消当前编辑。","en":"Save or cancel the current edit first."},
-    "finishImport": {"zh":"请先预览并导入，或清空批量输入。","en":"Preview and import the batch, or clear the import text first."},
+    "manageEntries": {
+      "zh": "管理条目",
+      "en": "Manage entries"
+    },
+    "saveEntries": {
+      "zh": "保存",
+      "en": "Save"
+    },
+    "cancelEntries": {
+      "zh": "取消",
+      "en": "Cancel"
+    },
+    "searchEntries": {
+      "zh": "搜索条目",
+      "en": "Search entries"
+    },
+    "newEntry": {
+      "zh": "新增条目",
+      "en": "New entry"
+    },
+    "emptyEntry": {
+      "zh": "（空字符串）",
+      "en": "(empty string)"
+    },
+    "updateEntry": {
+      "zh": "更新条目",
+      "en": "Update entry"
+    },
+    "importEntries": {
+      "zh": "批量导入",
+      "en": "Bulk import"
+    },
+    "previewEntries": {
+      "zh": "预览导入",
+      "en": "Preview import"
+    },
+    "multilineEntry": {
+      "zh": "条目内换行",
+      "en": "Multiline entry"
+    },
+    "importHint": {
+      "zh": "每行导入一个条目，忽略空行；保留条目首尾空格。先预览，再导入。",
+      "en": "One entry per line; blank lines are skipped. Entry whitespace is preserved. Preview before importing."
+    },
+    "unsavedEntries": {
+      "zh": "请先保存或取消当前编辑。",
+      "en": "Save or cancel the current edit first."
+    },
+    "finishImport": {
+      "zh": "请先预览并导入，或清空批量输入。",
+      "en": "Preview and import the batch, or clear the import text first."
+    },
     "operationFailed": {
       "zh": "操作未完成",
       "en": "Could not complete the action"
@@ -333,8 +385,8 @@
       "en": "Managed in the configuration file"
     },
     "unknownDescription": {
-      "zh": "附加配置；保留原值及其他未知配置。",
-      "en": "Additional setting. Other unrecognized values are preserved."
+      "zh": "附加配置，保留原值",
+      "en": "Additional setting; original value preserved"
     },
     "validation": {
       "zh": "输入值不符合此项说明。",
@@ -821,10 +873,6 @@
         "zh": "文件大小",
         "en": "File size"
       },
-      "description": {
-        "zh": "按包含上下限的整数字节范围筛选。",
-        "en": "Filter by an inclusive range of integer bytes."
-      },
       "editor": "size_range"
     },
     "/filesystem/scan_filters/@mtime_range": {
@@ -832,21 +880,16 @@
         "zh": "修改时间",
         "en": "Modification time"
       },
-      "description": {
-        "zh": "开始时间包含，结束时间不包含；以 UTC 保存。",
-        "en": "Includes the start and excludes the end; stored in UTC."
-      },
       "editor": "datetime_range"
     },
-
     "/cli/language": {
       "label": {
         "zh": "语言",
         "en": "Language"
       },
       "description": {
-        "zh": "保存后同时用于管理面板和命令行。",
-        "en": "Applies to the manager and CLI after saving."
+        "zh": "同时用于管理面板和命令行",
+        "en": "Applies to the manager and command line"
       },
       "options": [
         {
@@ -871,8 +914,8 @@
         "en": "Nested extraction"
       },
       "description": {
-        "zh": "处理压缩包内的压缩包；指定轮数时至少为 1。",
-        "en": "Extract archives found inside archives; fixed rounds must be at least 1."
+        "zh": "指定轮数时至少为 1",
+        "en": "Use at least 1 for a fixed round count"
       },
       "editor": "recursive",
       "options": [
@@ -905,18 +948,14 @@
         "en": "Nested archive selection"
       },
       "description": {
-        "zh": "根据压缩包占比决定是否继续解压。",
-        "en": "Use archive ratios to decide whether to keep extracting."
+        "zh": "根据压缩包占比决定是否继续解压",
+        "en": "Use archive ratios to decide whether to keep extracting"
       }
     },
     "/recursive_authorization/byte_ratio_exponent": {
       "label": {
         "zh": "压缩包字节占比权重",
         "en": "Archive byte-ratio exponent"
-      },
-      "description": {
-        "zh": "必须大于 0。",
-        "en": "Must be greater than 0."
       },
       "min": 0,
       "max": null,
@@ -926,10 +965,6 @@
       "label": {
         "zh": "项目占比权重",
         "en": "Project-ratio exponent"
-      },
-      "description": {
-        "zh": "必须大于 0。",
-        "en": "Must be greater than 0."
       },
       "min": 0,
       "max": null,
@@ -941,8 +976,8 @@
         "en": "Score adjustment"
       },
       "description": {
-        "zh": "正数提高评分，负数降低评分。",
-        "en": "Positive values raise the score; negative values lower it."
+        "zh": "正数提高评分，负数降低评分",
+        "en": "Positive values raise the score; negative values lower it"
       },
       "min": null,
       "max": null,
@@ -954,8 +989,8 @@
         "en": "Minimum score"
       },
       "description": {
-        "zh": "0–1；达到此值才继续解压。",
-        "en": "0–1; continue extracting at or above this score."
+        "zh": "达到此值才继续解压",
+        "en": "Continue extraction at or above this score"
       },
       "min": 0,
       "max": 1,
@@ -967,8 +1002,8 @@
         "en": "Minimum archive ratio"
       },
       "description": {
-        "zh": "0–1；压缩包占总大小的最低比例。",
-        "en": "0–1; minimum share of total size occupied by archives."
+        "zh": "压缩包占总大小的最低比例",
+        "en": "Minimum archive share of the total size"
       },
       "min": 0,
       "max": 1,
@@ -978,10 +1013,6 @@
       "label": {
         "zh": "其他项目上限",
         "en": "Other item limit"
-      },
-      "description": {
-        "zh": "非负整数。",
-        "en": "Non-negative integer."
       },
       "min": 0,
       "max": null,
@@ -994,8 +1025,8 @@
         "en": "Original archive"
       },
       "description": {
-        "zh": "仅在解压成功后处理。",
-        "en": "Applies after successful extraction."
+        "zh": "仅在解压成功后处理",
+        "en": "Applies after successful extraction"
       },
       "options": [
         {
@@ -1027,8 +1058,8 @@
         "en": "Flatten single folder"
       },
       "description": {
-        "zh": "输出只有一层文件夹时，将内容上移一层。",
-        "en": "Move contents up one level when there is only one output folder."
+        "zh": "只有一层文件夹时将内容上移",
+        "en": "Move contents up when output has a single folder"
       }
     },
     "/filesystem/directory_scan_mode": {
@@ -1037,8 +1068,8 @@
         "en": "Scan scope"
       },
       "description": {
-        "zh": "监控模式只处理各目录中的直接文件。",
-        "en": "Watch handles files directly inside each monitored folder."
+        "zh": "监控模式只处理各目录中的直接文件",
+        "en": "Watch handles files directly inside each monitored folder"
       },
       "options": [
         {
@@ -1061,20 +1092,12 @@
       "label": {
         "zh": "扫描筛选",
         "en": "Scan filters"
-      },
-      "description": {
-        "zh": "按下方规则筛选文件。",
-        "en": "Filter files using the rules below."
       }
     },
     "/filesystem/scan_filters/@directory_prune/enabled": {
       "label": {
         "zh": "跳过目录",
         "en": "Skip folders"
-      },
-      "description": {
-        "zh": "跳过匹配的目录和路径。",
-        "en": "Skip matching folders and paths."
       }
     },
     "/filesystem/scan_filters/@directory_prune/prune_dir_globs": {
@@ -1083,8 +1106,8 @@
         "en": "Skipped folders"
       },
       "description": {
-        "zh": "支持通配符，可逐项管理规则。",
-        "en": "Manage individual patterns; wildcards supported."
+        "zh": "支持通配符，可逐项管理规则",
+        "en": "Manage individual patterns; wildcards supported"
       }
     },
     "/filesystem/scan_filters/@directory_prune/path_globs": {
@@ -1093,8 +1116,8 @@
         "en": "Path patterns"
       },
       "description": {
-        "zh": "支持通配符，可逐项管理规则。",
-        "en": "Manage individual patterns; wildcards supported."
+        "zh": "支持通配符，可逐项管理规则",
+        "en": "Manage individual patterns; wildcards supported"
       }
     },
     "/filesystem/scan_filters/@whitelist/enabled": {
@@ -1103,8 +1126,8 @@
         "en": "Allow list"
       },
       "description": {
-        "zh": "只处理符合下方条件的文件。",
-        "en": "Process only files matching the conditions below."
+        "zh": "只处理符合下方条件的文件",
+        "en": "Process only files matching the conditions below"
       }
     },
     "/filesystem/scan_filters/@whitelist/path_globs": {
@@ -1113,8 +1136,8 @@
         "en": "Path patterns"
       },
       "description": {
-        "zh": "支持通配符，可逐项管理规则。",
-        "en": "Manage individual patterns; wildcards supported."
+        "zh": "支持通配符，可逐项管理规则",
+        "en": "Manage individual patterns; wildcards supported"
       }
     },
     "/filesystem/scan_filters/@whitelist/prune_dir_globs": {
@@ -1123,18 +1146,14 @@
         "en": "Allowed folders"
       },
       "description": {
-        "zh": "支持通配符，可逐项管理规则。",
-        "en": "Manage individual patterns; wildcards supported."
+        "zh": "支持通配符，可逐项管理规则",
+        "en": "Manage individual patterns; wildcards supported"
       }
     },
     "/filesystem/scan_filters/@whitelist/allowed_files": {
       "label": {
         "zh": "文件名",
         "en": "File names"
-      },
-      "description": {
-        "zh": "按文件名匹配。",
-        "en": "Match by file name."
       }
     },
     "/filesystem/scan_filters/@whitelist/allowed_extensions": {
@@ -1143,8 +1162,8 @@
         "en": "Extensions"
       },
       "description": {
-        "zh": "扩展名如 .zip；也会影响伪装扩展名的压缩包。",
-        "en": "Extensions such as .zip; also affects archives with disguised extensions."
+        "zh": "扩展名如 .zip；也会影响伪装扩展名的压缩包",
+        "en": "Extensions such as .zip; also affects archives with disguised extensions"
       }
     },
     "/filesystem/scan_filters/@blacklist/enabled": {
@@ -1153,18 +1172,14 @@
         "en": "Block list"
       },
       "description": {
-        "zh": "跳过下方文件名和扩展名。",
-        "en": "Skip the file names and extensions below."
+        "zh": "跳过下方文件名和扩展名",
+        "en": "Skip the file names and extensions below"
       }
     },
     "/filesystem/scan_filters/@blacklist/blocked_files": {
       "label": {
         "zh": "文件名",
         "en": "File names"
-      },
-      "description": {
-        "zh": "按文件名匹配。",
-        "en": "Match by file name."
       }
     },
     "/filesystem/scan_filters/@blacklist/blocked_extensions": {
@@ -1173,18 +1188,14 @@
         "en": "Extensions"
       },
       "description": {
-        "zh": "扩展名如 .zip；也会影响伪装扩展名的压缩包。",
-        "en": "Extensions such as .zip; also affects archives with disguised extensions."
+        "zh": "扩展名如 .zip；也会影响伪装扩展名的压缩包",
+        "en": "Extensions such as .zip; also affects archives with disguised extensions"
       }
     },
     "/performance/persistent_server_idle_seconds": {
       "label": {
         "zh": "后台服务空闲退出（秒）",
         "en": "Service idle timeout (s)"
-      },
-      "description": {
-        "zh": "连续空闲多久后退出。",
-        "en": "Exit after this much idle time."
       },
       "min": 0,
       "max": null
@@ -1193,10 +1204,6 @@
       "label": {
         "zh": "无进展超时（秒）",
         "en": "No-progress timeout (s)"
-      },
-      "description": {
-        "zh": "任务长期无进展时判定超时。",
-        "en": "Time out tasks that stop making progress."
       },
       "min": 0,
       "max": null
@@ -1207,8 +1214,8 @@
         "en": "Worker threads"
       },
       "description": {
-        "zh": "非负整数；0 为自动。",
-        "en": "Non-negative integer; 0 selects automatically."
+        "zh": "0 为自动",
+        "en": "0 for automatic"
       },
       "min": 0,
       "max": null,
@@ -1220,8 +1227,8 @@
         "en": "Stage threads"
       },
       "description": {
-        "zh": "非负整数；0 为自动。",
-        "en": "Non-negative integer; 0 selects automatically."
+        "zh": "0 为自动",
+        "en": "0 for automatic"
       },
       "min": 0,
       "max": null,
@@ -1232,10 +1239,6 @@
         "zh": "阶段排队上限",
         "en": "Pending stage limit"
       },
-      "description": {
-        "zh": "至少 1。",
-        "en": "At least 1."
-      },
       "min": 1,
       "max": null,
       "integer": true
@@ -1244,10 +1247,6 @@
       "label": {
         "zh": "任务排队上限",
         "en": "Queued task limit"
-      },
-      "description": {
-        "zh": "至少 1。",
-        "en": "At least 1."
       },
       "min": 1,
       "max": null,
@@ -1259,8 +1258,8 @@
         "en": "Waiting task priority step"
       },
       "description": {
-        "zh": "至少 1；防止低优先级任务一直等待。",
-        "en": "At least 1; prevent low-priority tasks from waiting indefinitely."
+        "zh": "防止低优先级任务一直等待",
+        "en": "Prevents low-priority tasks from waiting indefinitely"
       },
       "min": 1,
       "max": null,
@@ -1271,10 +1270,6 @@
         "zh": "队列拥堵重试次数",
         "en": "Queue congestion retries"
       },
-      "description": {
-        "zh": "非负整数。",
-        "en": "Non-negative integer."
-      },
       "min": 0,
       "max": null,
       "integer": true
@@ -1284,10 +1279,6 @@
         "zh": "写入线程数",
         "en": "Writer threads"
       },
-      "description": {
-        "zh": "至少 1。",
-        "en": "At least 1."
-      },
       "min": 1,
       "max": null,
       "integer": true
@@ -1296,10 +1287,6 @@
       "label": {
         "zh": "单任务缓冲上限（字节）",
         "en": "Task buffer limit (bytes)"
-      },
-      "description": {
-        "zh": "非负整数。",
-        "en": "Non-negative integer."
       },
       "min": 0,
       "max": null,
@@ -1311,8 +1298,8 @@
         "en": "Pause new tasks when resources are low"
       },
       "description": {
-        "zh": "等待内存和磁盘空间恢复后继续。",
-        "en": "Resume when memory and disk space are available."
+        "zh": "等待内存和磁盘空间恢复后继续",
+        "en": "Resume when memory and disk space are available"
       }
     },
     "/performance/worker/space_poll_interval_ms": {
@@ -1321,8 +1308,8 @@
         "en": "Resource recheck interval (ms)"
       },
       "description": {
-        "zh": "至少 1；仅在资源不足时复查。",
-        "en": "At least 1; recheck only while resources are low."
+        "zh": "仅在资源不足时复查",
+        "en": "Recheck only when resources are insufficient"
       },
       "min": 1,
       "max": null,
@@ -1332,10 +1319,6 @@
       "label": {
         "zh": "资源状态报告间隔（毫秒）",
         "en": "Resource report interval (ms)"
-      },
-      "description": {
-        "zh": "至少 1。",
-        "en": "At least 1."
       },
       "min": 1,
       "max": null,
@@ -1347,8 +1330,8 @@
         "en": "Minimum available memory ratio"
       },
       "description": {
-        "zh": "0–1；低于此值时暂停新任务。",
-        "en": "0–1; pause new tasks below this value."
+        "zh": "低于此值时暂停新任务",
+        "en": "Pause new tasks below this ratio"
       },
       "min": 0,
       "max": 1
@@ -1359,8 +1342,8 @@
         "en": "Process priority"
       },
       "description": {
-        "zh": "后台模式减少对其他程序的影响。",
-        "en": "Background mode reduces the impact on other apps."
+        "zh": "后台模式减少对其他程序的影响",
+        "en": "Background mode reduces the impact on other apps"
       },
       "options": [
         {
@@ -1392,8 +1375,8 @@
         "en": "Initial delay (s)"
       },
       "description": {
-        "zh": "非负数；发现新文件后等待多久再处理。",
-        "en": "Non-negative; wait this long before processing a new file."
+        "zh": "发现新文件后等待多久再处理",
+        "en": "Wait after discovering a new file"
       },
       "min": 0,
       "integer": false
@@ -1404,8 +1387,8 @@
         "en": "Minimum stable time (s)"
       },
       "description": {
-        "zh": "非负数；文件停止变化后再等待多久。",
-        "en": "Non-negative; wait this long after a file stops changing."
+        "zh": "文件停止变化后的等待时间",
+        "en": "Wait after a file stops changing"
       },
       "min": 0,
       "integer": false
@@ -1416,8 +1399,8 @@
         "en": "Maximum stable wait (s)"
       },
       "description": {
-        "zh": "不小于首次处理等待和最短稳定等待。",
-        "en": "Must cover both the initial delay and minimum stable time."
+        "zh": "不小于首次处理等待和最短稳定等待",
+        "en": "Must cover both the initial delay and minimum stable time"
       },
       "min": 0,
       "integer": false
@@ -1428,8 +1411,8 @@
         "en": "Write confirmation interval (s)"
       },
       "description": {
-        "zh": "非负数；再次确认文件已停止写入。",
-        "en": "Non-negative; confirm that the file has stopped being written."
+        "zh": "再次确认文件已停止写入",
+        "en": "Confirm that file writing has stopped"
       },
       "min": 0,
       "integer": false
@@ -1439,10 +1422,6 @@
         "zh": "同时处理目录数",
         "en": "Concurrent folders"
       },
-      "description": {
-        "zh": "至少 1。",
-        "en": "At least 1."
-      },
       "min": 1,
       "integer": true
     },
@@ -1450,10 +1429,6 @@
       "label": {
         "zh": "停止等待上限（秒）",
         "en": "Stop timeout (s)"
-      },
-      "description": {
-        "zh": "停止文件监控时最多等待多久。",
-        "en": "Maximum wait when stopping the file watcher."
       },
       "min": 0,
       "integer": false
@@ -1464,18 +1439,14 @@
         "en": "Clear idle cache"
       },
       "description": {
-        "zh": "空闲时释放可重建的缓存。",
-        "en": "Release rebuildable caches while idle."
+        "zh": "空闲时释放可重建的缓存",
+        "en": "Release rebuildable caches while idle"
       }
     },
     "/watch/runtime_cache_cleanup_idle_seconds": {
       "label": {
         "zh": "缓存清理等待（秒）",
         "en": "Cache cleanup delay (s)"
-      },
-      "description": {
-        "zh": "空闲多久后清理缓存。",
-        "en": "Clear caches after this much idle time."
       },
       "min": 0,
       "integer": false
@@ -1486,8 +1457,8 @@
         "en": "Password retry merge interval (s)"
       },
       "description": {
-        "zh": "合并短时间内重复的重试请求。",
-        "en": "Combine repeated retry requests within this interval."
+        "zh": "合并短时间内重复的重试请求",
+        "en": "Combine repeated retry requests within this interval"
       },
       "min": 0,
       "integer": false
@@ -1496,10 +1467,6 @@
       "label": {
         "zh": "保存剪贴板密码历史",
         "en": "Save clipboard password history"
-      },
-      "description": {
-        "zh": "将剪贴板中的密码候选存入历史。",
-        "en": "Save clipboard password candidates in history."
       }
     },
     "/watch/clipboard_builtin_max_entries": {
@@ -1508,8 +1475,8 @@
         "en": "Clipboard history limit"
       },
       "description": {
-        "zh": "至少 1；超出时移除最旧的记录。",
-        "en": "At least 1; remove oldest entries when full."
+        "zh": "超出时移除最旧记录",
+        "en": "Remove the oldest entries when full"
       },
       "min": 1,
       "integer": true
@@ -1520,18 +1487,14 @@
         "en": "Start Watch by default"
       },
       "description": {
-        "zh": "控制主程序启动行为；当前监控在任务页启停。",
-        "en": "Sets startup behavior; use Tasks to start or stop the current Watch."
+        "zh": "当前监控在任务页启停",
+        "en": "Start or stop the current monitor on the Tasks page"
       }
     },
     "/watch/roots": {
       "label": {
         "zh": "附加监控目录",
         "en": "Additional monitored folders"
-      },
-      "description": {
-        "zh": "附加监控目录，可逐项管理。",
-        "en": "Additional monitored folders, managed individually."
       }
     },
     "/watch/out_dir": {
@@ -1540,38 +1503,26 @@
         "en": "Default output folder"
       },
       "description": {
-        "zh": "“.” 表示输入目录旁；可按监控目录单独设置。",
-        "en": "“.” places output beside the input; each monitored folder can override it."
+        "zh": "“.” 表示输入目录旁，可按监控目录单独设置",
+        "en": "“.” means beside the input; each monitored folder can override it"
       }
     },
     "/watch/tray_enabled": {
       "label": {
         "zh": "托盘图标",
         "en": "Tray icon"
-      },
-      "description": {
-        "zh": "在 Windows 通知区域显示图标。",
-        "en": "Show an icon in the Windows notification area."
       }
     },
     "/watch/toast_enabled": {
       "label": {
         "zh": "桌面通知",
         "en": "Desktop notifications"
-      },
-      "description": {
-        "zh": "显示解压进度和结果。",
-        "en": "Show extraction progress and results."
       }
     },
     "/watch/toast_update_interval_ms": {
       "label": {
         "zh": "进度通知间隔（毫秒）",
         "en": "Progress update interval (ms)"
-      },
-      "description": {
-        "zh": "至少 10。",
-        "en": "At least 10."
       },
       "min": 10,
       "integer": true
@@ -1582,8 +1533,8 @@
         "en": "Result merge interval (ms)"
       },
       "description": {
-        "zh": "合并连续完成的结果通知。",
-        "en": "Combine results completed close together."
+        "zh": "合并连续完成的结果通知",
+        "en": "Combine results completed close together"
       },
       "min": 0,
       "integer": true
@@ -1594,8 +1545,8 @@
         "en": "Report retention (days)"
       },
       "description": {
-        "zh": "至少 1；到期后自动清理。",
-        "en": "At least 1; remove expired reports automatically."
+        "zh": "到期后自动清理",
+        "en": "Remove reports after this time"
       },
       "min": 1,
       "integer": true
@@ -1605,10 +1556,6 @@
         "zh": "报告数量上限",
         "en": "Report count limit"
       },
-      "description": {
-        "zh": "至少 1。",
-        "en": "At least 1."
-      },
       "min": 1,
       "integer": true
     },
@@ -1616,10 +1563,6 @@
       "label": {
         "zh": "报告空间上限（字节）",
         "en": "Report size limit (bytes)"
-      },
-      "description": {
-        "zh": "至少 1024。",
-        "en": "At least 1024."
       },
       "min": 1024,
       "integer": true
@@ -1630,8 +1573,8 @@
         "en": "Log and state folder"
       },
       "description": {
-        "zh": "留空使用数据目录下的 .sunpack_watch。",
-        "en": "Leave blank to use .sunpack_watch in the data folder."
+        "zh": "留空使用数据目录下的 .sunpack_watch",
+        "en": "Leave blank to use .sunpack_watch in the data folder"
       }
     },
     "/passwords/clipboard_passwords_enabled": {
@@ -1640,8 +1583,8 @@
         "en": "Use clipboard passwords"
       },
       "description": {
-        "zh": "尝试用当前剪贴板文本解密。",
-        "en": "Try the current clipboard text as a password."
+        "zh": "尝试用当前剪贴板文本解密",
+        "en": "Try the current clipboard text as a password"
       }
     },
     "/extraction/content_requirement": {
@@ -1650,8 +1593,8 @@
         "en": "Required extraction result"
       },
       "description": {
-        "zh": "可选择只接受完整结果，或允许恢复部分内容。",
-        "en": "Require complete results or allow partial recovery."
+        "zh": "可选择只接受完整结果，或允许恢复部分内容",
+        "en": "Require complete results or allow partial recovery"
       },
       "options": [
         {
@@ -1676,8 +1619,8 @@
         "en": "Embedded archives"
       },
       "description": {
-        "zh": "查找夹在其他数据中的压缩包。",
-        "en": "Find archives embedded inside other data."
+        "zh": "查找夹在其他数据中的压缩包",
+        "en": "Find archives embedded inside other data"
       }
     },
     "/embedded_scan/recursive_candidate_ratio": {
@@ -1686,8 +1629,8 @@
         "en": "Nested candidate ratio"
       },
       "description": {
-        "zh": "0–1；控制内嵌压缩包的递归筛选。",
-        "en": "0–1; controls selection of embedded archives for nested extraction."
+        "zh": "控制内嵌压缩包的递归筛选",
+        "en": "Controls recursive filtering of embedded archives"
       },
       "min": 0,
       "max": 1
@@ -1698,18 +1641,14 @@
         "en": "Input planning cache"
       },
       "description": {
-        "zh": "复用已分析的输入计划。",
-        "en": "Reuse input plans already analyzed."
+        "zh": "复用已分析的输入计划",
+        "en": "Reuse input plans already analyzed"
       }
     },
     "/input_planning/cache_size": {
       "label": {
         "zh": "缓存条数上限",
         "en": "Cache entry limit"
-      },
-      "description": {
-        "zh": "非负整数。",
-        "en": "Non-negative integer."
       },
       "min": 0,
       "max": null,
@@ -1720,10 +1659,6 @@
         "zh": "并发读取数",
         "en": "Concurrent reads"
       },
-      "description": {
-        "zh": "至少 1。",
-        "en": "At least 1."
-      },
       "min": 1,
       "max": null,
       "integer": true
@@ -1733,10 +1668,6 @@
         "zh": "共享缓存上限（MiB）",
         "en": "Shared cache limit (MiB)"
       },
-      "description": {
-        "zh": "分析压缩包时共用的缓存大小。",
-        "en": "Cache shared by archive analysis tasks."
-      },
       "min": 0,
       "max": null,
       "integer": true
@@ -1745,10 +1676,6 @@
       "label": {
         "zh": "单包读取上限（MiB）",
         "en": "Per-archive read limit (MiB)"
-      },
-      "description": {
-        "zh": "分析一个压缩包最多读取的数据量。",
-        "en": "Maximum data read when analyzing one archive."
       },
       "min": 0,
       "max": null,
@@ -1760,18 +1687,14 @@
         "en": "Read file headers and tails"
       },
       "description": {
-        "zh": "先读取文件两端，辅助识别格式。",
-        "en": "Read both ends of a file to help identify its format."
+        "zh": "先读取文件两端，辅助识别格式",
+        "en": "Read both ends of a file to help identify its format"
       }
     },
     "/analysis/prepass/head_bytes": {
       "label": {
         "zh": "文件头读取量（字节）",
         "en": "Header read size (bytes)"
-      },
-      "description": {
-        "zh": "非负整数。",
-        "en": "Non-negative integer."
       },
       "min": 0,
       "max": null,
@@ -1781,10 +1704,6 @@
       "label": {
         "zh": "文件尾读取量（字节）",
         "en": "Tail read size (bytes)"
-      },
-      "description": {
-        "zh": "非负整数。",
-        "en": "Non-negative integer."
       },
       "min": 0,
       "max": null,
@@ -1796,8 +1715,8 @@
         "en": "Detection confidence"
       },
       "description": {
-        "zh": "0–1；达到此值才视为可解压。",
-        "en": "0–1; accept an archive for extraction at or above this value."
+        "zh": "达到此值才视为可解压",
+        "en": "Treat as extractable at or above this confidence"
       },
       "min": 0,
       "max": 1
@@ -1806,20 +1725,12 @@
       "label": {
         "zh": "ZIP",
         "en": "ZIP"
-      },
-      "description": {
-        "zh": "识别此类压缩包。",
-        "en": "Recognize this archive format."
       }
     },
     "/analysis/modules/@zip/max_cd_entries_to_walk": {
       "label": {
         "zh": "目录项检查上限",
         "en": "Directory entry limit"
-      },
-      "description": {
-        "zh": "非负整数。",
-        "en": "Non-negative integer."
       },
       "min": 0,
       "integer": true
@@ -1828,20 +1739,12 @@
       "label": {
         "zh": "RAR",
         "en": "RAR"
-      },
-      "description": {
-        "zh": "识别此类压缩包。",
-        "en": "Recognize this archive format."
       }
     },
     "/analysis/modules/@rar/max_blocks_to_walk": {
       "label": {
         "zh": "数据块检查上限",
         "en": "Block check limit"
-      },
-      "description": {
-        "zh": "非负整数。",
-        "en": "Non-negative integer."
       },
       "min": 0,
       "integer": true
@@ -1850,20 +1753,12 @@
       "label": {
         "zh": "7z",
         "en": "7z"
-      },
-      "description": {
-        "zh": "识别此类压缩包。",
-        "en": "Recognize this archive format."
       }
     },
     "/analysis/modules/@seven_zip/max_next_header_check_bytes": {
       "label": {
         "zh": "文件头读取上限（字节）",
         "en": "Header read limit (bytes)"
-      },
-      "description": {
-        "zh": "非负整数。",
-        "en": "Non-negative integer."
       },
       "min": 0,
       "integer": true
@@ -1872,20 +1767,12 @@
       "label": {
         "zh": "TAR",
         "en": "TAR"
-      },
-      "description": {
-        "zh": "识别此类压缩包。",
-        "en": "Recognize this archive format."
       }
     },
     "/analysis/modules/@tar/max_entries_to_walk": {
       "label": {
         "zh": "归档项检查上限",
         "en": "Archive entry limit"
-      },
-      "description": {
-        "zh": "非负整数。",
-        "en": "Non-negative integer."
       },
       "min": 0,
       "integer": true
@@ -1894,20 +1781,12 @@
       "label": {
         "zh": "GZIP",
         "en": "GZIP"
-      },
-      "description": {
-        "zh": "识别此类压缩包。",
-        "en": "Recognize this archive format."
       }
     },
     "/analysis/modules/@gzip/max_probe_bytes": {
       "label": {
         "zh": "读取上限（字节）",
         "en": "Read limit (bytes)"
-      },
-      "description": {
-        "zh": "非负整数。",
-        "en": "Non-negative integer."
       },
       "min": 0,
       "integer": true
@@ -1916,20 +1795,12 @@
       "label": {
         "zh": "BZIP2",
         "en": "BZIP2"
-      },
-      "description": {
-        "zh": "识别此类压缩包。",
-        "en": "Recognize this archive format."
       }
     },
     "/analysis/modules/@bzip2/max_probe_bytes": {
       "label": {
         "zh": "读取上限（字节）",
         "en": "Read limit (bytes)"
-      },
-      "description": {
-        "zh": "非负整数。",
-        "en": "Non-negative integer."
       },
       "min": 0,
       "integer": true
@@ -1938,20 +1809,12 @@
       "label": {
         "zh": "XZ",
         "en": "XZ"
-      },
-      "description": {
-        "zh": "识别此类压缩包。",
-        "en": "Recognize this archive format."
       }
     },
     "/analysis/modules/@xz/max_probe_bytes": {
       "label": {
         "zh": "读取上限（字节）",
         "en": "Read limit (bytes)"
-      },
-      "description": {
-        "zh": "非负整数。",
-        "en": "Non-negative integer."
       },
       "min": 0,
       "integer": true
@@ -1960,30 +1823,18 @@
       "label": {
         "zh": "LZ4",
         "en": "LZ4"
-      },
-      "description": {
-        "zh": "识别此类压缩包。",
-        "en": "Recognize this archive format."
       }
     },
     "/analysis/modules/@tar_lz4/enabled": {
       "label": {
         "zh": "TAR + LZ4",
         "en": "TAR + LZ4"
-      },
-      "description": {
-        "zh": "识别此类压缩包。",
-        "en": "Recognize this archive format."
       }
     },
     "/analysis/modules/@tar_lz4/max_probe_bytes": {
       "label": {
         "zh": "读取上限（字节）",
         "en": "Read limit (bytes)"
-      },
-      "description": {
-        "zh": "非负整数。",
-        "en": "Non-negative integer."
       },
       "min": 0,
       "integer": true
@@ -1992,20 +1843,12 @@
       "label": {
         "zh": "Zstandard",
         "en": "Zstandard"
-      },
-      "description": {
-        "zh": "识别此类压缩包。",
-        "en": "Recognize this archive format."
       }
     },
     "/analysis/modules/@zstd/max_probe_bytes": {
       "label": {
         "zh": "读取上限（字节）",
         "en": "Read limit (bytes)"
-      },
-      "description": {
-        "zh": "非负整数。",
-        "en": "Non-negative integer."
       },
       "min": 0,
       "integer": true
@@ -2014,20 +1857,12 @@
       "label": {
         "zh": "TAR + GZIP",
         "en": "TAR + GZIP"
-      },
-      "description": {
-        "zh": "识别此类压缩包。",
-        "en": "Recognize this archive format."
       }
     },
     "/analysis/modules/@tar_gz/max_probe_bytes": {
       "label": {
         "zh": "读取上限（字节）",
         "en": "Read limit (bytes)"
-      },
-      "description": {
-        "zh": "非负整数。",
-        "en": "Non-negative integer."
       },
       "min": 0,
       "integer": true
@@ -2036,20 +1871,12 @@
       "label": {
         "zh": "TAR + BZIP2",
         "en": "TAR + BZIP2"
-      },
-      "description": {
-        "zh": "识别此类压缩包。",
-        "en": "Recognize this archive format."
       }
     },
     "/analysis/modules/@tar_bz2/max_probe_bytes": {
       "label": {
         "zh": "读取上限（字节）",
         "en": "Read limit (bytes)"
-      },
-      "description": {
-        "zh": "非负整数。",
-        "en": "Non-negative integer."
       },
       "min": 0,
       "integer": true
@@ -2058,20 +1885,12 @@
       "label": {
         "zh": "TAR + XZ",
         "en": "TAR + XZ"
-      },
-      "description": {
-        "zh": "识别此类压缩包。",
-        "en": "Recognize this archive format."
       }
     },
     "/analysis/modules/@tar_xz/max_probe_bytes": {
       "label": {
         "zh": "读取上限（字节）",
         "en": "Read limit (bytes)"
-      },
-      "description": {
-        "zh": "非负整数。",
-        "en": "Non-negative integer."
       },
       "min": 0,
       "integer": true
@@ -2080,20 +1899,12 @@
       "label": {
         "zh": "TAR + Zstandard",
         "en": "TAR + Zstandard"
-      },
-      "description": {
-        "zh": "识别此类压缩包。",
-        "en": "Recognize this archive format."
       }
     },
     "/analysis/modules/@tar_zst/max_probe_bytes": {
       "label": {
         "zh": "读取上限（字节）",
         "en": "Read limit (bytes)"
-      },
-      "description": {
-        "zh": "非负整数。",
-        "en": "Non-negative integer."
       },
       "min": 0,
       "integer": true
@@ -2102,20 +1913,12 @@
       "label": {
         "zh": "结果验证",
         "en": "Result verification"
-      },
-      "description": {
-        "zh": "检查解压是否成功。",
-        "en": "Check whether extraction succeeded."
       }
     },
     "/verification/max_retries": {
       "label": {
         "zh": "失败重试上限",
         "en": "Failure retry limit"
-      },
-      "description": {
-        "zh": "非负整数。",
-        "en": "Non-negative integer."
       },
       "min": 0,
       "max": null,
@@ -2127,18 +1930,14 @@
         "en": "Clean up failed output"
       },
       "description": {
-        "zh": "移除验证失败产生的不完整文件。",
-        "en": "Remove incomplete output after failed verification."
+        "zh": "移除验证失败产生的不完整文件",
+        "en": "Remove incomplete output after failed verification"
       }
     },
     "/verification/complete_accept_threshold": {
       "label": {
         "zh": "完整结果最低评分",
         "en": "Minimum complete-result score"
-      },
-      "description": {
-        "zh": "0–1。",
-        "en": "0–1."
       },
       "min": 0,
       "max": 1
@@ -2147,10 +1946,6 @@
       "label": {
         "zh": "部分恢复最低评分",
         "en": "Minimum partial-recovery score"
-      },
-      "description": {
-        "zh": "0–1。",
-        "en": "0–1."
       },
       "min": 0,
       "max": 1
@@ -2161,8 +1956,8 @@
         "en": "Retry failed verification"
       },
       "description": {
-        "zh": "受上方重试次数限制。",
-        "en": "Limited by the retry count above."
+        "zh": "受上方重试次数限制",
+        "en": "Limited by the retry count above"
       }
     },
     "/verification/methods/@extraction_exit_signal/enabled": {
@@ -2171,8 +1966,8 @@
         "en": "Extraction exit signal"
       },
       "description": {
-        "zh": "检查解压程序的退出结果。",
-        "en": "Check the extractor exit result."
+        "zh": "检查解压程序的退出结果",
+        "en": "Check the extractor exit result"
       }
     },
     "/verification/methods/@output_presence/enabled": {
@@ -2181,28 +1976,20 @@
         "en": "Output check"
       },
       "description": {
-        "zh": "检查是否生成输出文件。",
-        "en": "Check that output files were created."
+        "zh": "检查是否生成输出文件",
+        "en": "Check that output files were created"
       }
     },
     "/verification/methods/@manifest_size_match/enabled": {
       "label": {
         "zh": "文件数量与大小",
         "en": "File count and size"
-      },
-      "description": {
-        "zh": "比对预期文件数量和大小。",
-        "en": "Compare expected file counts and sizes."
       }
     },
     "/verification/methods/@manifest_size_match/max_expected_names": {
       "label": {
         "zh": "比对文件数上限",
         "en": "Compared file limit"
-      },
-      "description": {
-        "zh": "非负整数。",
-        "en": "Non-negative integer."
       },
       "min": 0,
       "integer": true
@@ -2211,10 +1998,6 @@
       "label": {
         "zh": "允许的文件数量差",
         "en": "Allowed file count difference"
-      },
-      "description": {
-        "zh": "非负整数。",
-        "en": "Non-negative integer."
       },
       "min": 0,
       "integer": true
@@ -2225,8 +2008,8 @@
         "en": "Allowed file count ratio difference"
       },
       "description": {
-        "zh": "非负数；0.05 表示 5%。",
-        "en": "Non-negative; 0.05 means 5%."
+        "zh": "0.05 表示 5%",
+        "en": "0.05 means 5%"
       },
       "min": 0
     },
@@ -2234,10 +2017,6 @@
       "label": {
         "zh": "允许的大小差（字节）",
         "en": "Allowed size difference (bytes)"
-      },
-      "description": {
-        "zh": "非负整数。",
-        "en": "Non-negative integer."
       },
       "min": 0,
       "integer": true
@@ -2248,8 +2027,8 @@
         "en": "Allowed size ratio difference"
       },
       "description": {
-        "zh": "非负数；0.02 表示 2%。",
-        "en": "Non-negative; 0.02 means 2%."
+        "zh": "0.02 表示 2%",
+        "en": "0.02 means 2%"
       },
       "min": 0
     },
@@ -2259,18 +2038,14 @@
         "en": "Archive CRC verification"
       },
       "description": {
-        "zh": "使用压缩包校验信息检查完整性。",
-        "en": "Check integrity using archive checksums."
+        "zh": "使用压缩包校验信息检查完整性",
+        "en": "Check integrity using archive checksums"
       }
     },
     "/verification/methods/@archive_test_crc/max_items": {
       "label": {
         "zh": "校验项目上限",
         "en": "Checked item limit"
-      },
-      "description": {
-        "zh": "非负整数。",
-        "en": "Non-negative integer."
       },
       "min": 0,
       "integer": true
@@ -2279,10 +2054,6 @@
       "label": {
         "zh": "报告项目上限",
         "en": "Reported item limit"
-      },
-      "description": {
-        "zh": "非负整数。",
-        "en": "Non-negative integer."
       },
       "min": 0,
       "integer": true
@@ -2293,8 +2064,8 @@
         "en": "Format detection"
       },
       "description": {
-        "zh": "按内容识别格式，支持伪装扩展名和分卷。",
-        "en": "Identify formats by content, including disguised extensions and split volumes."
+        "zh": "按内容识别格式，支持伪装扩展名和分卷",
+        "en": "Identify formats by content, including disguised extensions and split volumes"
       }
     }
   },

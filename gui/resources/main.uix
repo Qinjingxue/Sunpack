@@ -24,7 +24,7 @@ export default {
     startup:{enabled:false,command:''},directoryQuery:'',
     taskQuery:'',taskRoot:'',taskStatus:0,
     statusNames:['','taskProcessing','taskWaiting','taskSucceeded','taskFailed'],
-    rootRows:[],rootDrafts:{},rootNew:[],rootCell:'',rootPart:'',rootNext:0,rootQuery:'',
+    rootRows:[],rootDrafts:{},rootNew:[],rootCell:'',rootPart:'',rootNext:0,rootQuery:'',cellPointer:null,
     configCategory:'',configQuery:'',drafts:{},toggleDrafts:{},saving:false,saveErrors:{},closeError:'',pendingFields:[],recordSaving:{passwords:false,roots:false},
     passwordRoot:'',passwordHistory:false,passwordHistoryTarget:false,passwordQuery:'',passwordDrafts:{},passwordNew:[],passwordCell:'',passwordNext:0,
     listTarget:'',listTitle:'',listField:null,listRows:[],listNext:0,listQuery:'',listEntry:'',listEditing:-1,listMultiline:false,listImport:false,listImportText:'',listPreview:[],listError:''
@@ -62,9 +62,27 @@ export default {
       });
       return groups;
     },
-    matchingBlocks() { let q=this.configQuery.toLowerCase(); return this.configBlocks.filter(g=>(!this.configCategory||g.category===this.configCategory)&&(!q||(g.label+' '+g.module+' '+g.fields.map(f=>f.label+' '+f.description+' '+f.id).join(' ')).toLowerCase().indexOf(q)>=0)); },
+    matchingBlocks() { return this.configBlocks.filter(g=>(!this.configCategory||g.category===this.configCategory)&&(!this.configQuery.trim()||this.matchesConfig([g.label,...g.fields.map(f=>this.configText(f))].join(' ')))); },
+    showStartupSetting() { return !this.configCategory&&this.matchesConfig([this.texts.startup,this.texts.startupDescription,this.startup.enabled?this.texts.startupOff:this.texts.startupOn].join(' ')); },
+    showThemeSetting() { return !this.configCategory&&this.matchesConfig([this.texts.theme,this.texts.system,this.texts.light,this.texts.dark].join(' ')); },
   },
   methods: {
+    matchesConfig(text) { return !this.configQuery.trim()||text.toLowerCase().includes(this.configQuery.trim().toLowerCase()); },
+    configText(f) {
+      let t=this.texts,d=this.drafts[f.id]||f,parts=[f.label,f.description,f.categoryLabel,...f.options.map(o=>o.label)];
+      if(f.editor==='text'||f.editor==='recursive') parts.push(d.text);
+      if(f.editor==='recursive') parts.push(t.rounds);
+      if(f.editor==='readonly') parts.push(t.readOnly);
+      if(f.editor==='list') { let items=this.drafts[f.id]?JSON.parse(d.text):f.items; parts.push(t.manageEntries,this.listCount(items),this.listSummary(items)); }
+      if(this.isRange(f)) {
+        let r=this.rangeValue(f),date=f.editor==='datetime_range';
+        parts.push(t.rangeEnable,date?t.rangeTimeHint:t.rangeHint,date?t.rangeStart:t.rangeMin,date?t.rangeEnd:t.rangeMax,r.lower,r.upper);
+        if(date) parts.push(t.rangePick,t.rangeChoose,'YYYY-MM-DD HH:mm'); else parts.push('B KiB MiB GiB TiB');
+      }
+      return parts.join(' ');
+    },
+    rememberCellPointer(id,part,event) { this.cellPointer=event.button===0?{id:id,part:part,x:event.offsetX}:null; },
+    cellPointerX(id,part) { let p=this.cellPointer; this.cellPointer=null; return p&&p.id===id&&p.part===part?p.x:null; },
     send(op,payload) {
       if(op==='cli') { if(this.busy) return; this.busy=true; this.actionError=''; }
       let requests=op==='filterTasks'||op==='filterPasswords'?this.requests.filter(r=>r.op!==op):this.requests;
@@ -231,7 +249,7 @@ export default {
     beginRoot(r,part) {
       if(this.rootCell===r.id&&this.rootPart===part) return;
       this.finishRootCell(); this.ensureRootDraft(r); this.rootCell=r.id; this.rootPart=part;
-      this.send('focusRoot',{id:r.id,part:part});
+      this.send('focusRoot',{id:r.id,part:part,pointerX:this.cellPointerX(r.id,part)});
     },
     changeRoot(r,part,value) {
       let d=Object.assign({},this.ensureRootDraft(r),{[part]:value,error:''});
@@ -431,7 +449,7 @@ export default {
     beginPassword(p) {
       if(this.passwordCell===p.id) return;
       this.finishPasswordCell(); this.ensurePasswordDraft(p); this.passwordCell=p.id;
-      this.send('focusPassword',{id:p.id,part:'value'});
+      this.send('focusPassword',{id:p.id,part:'value',pointerX:this.cellPointerX(p.id,'value')});
     },
     changePassword(p,value) {
       let d=Object.assign({},this.ensurePasswordDraft(p),{value:value,batch:/[\r\n]/.test(value),error:''}); this.putPasswordDraft(d);
@@ -690,7 +708,7 @@ export default {
   .runtime-badge { width:92px; flex-direction:row; align-items:center; gap:7px; flex-shrink:0; }
   .runtime-dot { width:8px; height:8px; border-radius:4px; background:#8a8a8a; flex-shrink:0; }
   .runtime-dot.running { background:#6ccb5f; }
-  .setting-description { color:var(--fg-2); font-size:12px; }
+  .setting-description { color:var(--fg-2); font-size:12px; white-space:normal; }
   .choice-host { height:32px; flex-direction:row; }
   .list-manager { flex:1; padding:20px; gap:12px; }
   .light .list-manager { background:#f3f3f3; }
@@ -807,11 +825,11 @@ export default {
         <div class="page-header"><label class="heading">{{ texts.config }}</label></div>
         <input id="configSearch" type="search" class="search-field" :placeholder="texts.settingSearch" :value="configQuery" @input="searchConfig"/>
         <ScrollView id="configListScroll"><div id="configBlocks" class="column">
-          <div v-show="!configCategory &amp;&amp; !configQuery" class="card settings-row">
+          <div id="startupSetting" v-show="showStartupSetting" class="card settings-row">
             <div class="setting-copy"><label class="setting-title">{{ texts.startup }}</label><label class="muted">{{ texts.startupDescription }}</label></div>
             <button id="startupToggle" :enabled="cliAllowed" @click="send('cli',{action:startup.enabled?'startupDisable':'startupEnable'})">{{ startup.enabled?texts.startupOff:texts.startupOn }}</button>
           </div>
-          <div v-show="!configCategory &amp;&amp; !configQuery" class="card settings-row"><div class="setting-copy"><label class="setting-title">{{ texts.theme }}</label><label class="muted">{{ texts.themeDescription }}</label></div><div id="themeHost" style="width:180px;height:32px"/></div>
+          <div id="themeSetting" v-show="showThemeSetting" class="card settings-row"><div class="setting-copy"><label class="setting-title">{{ texts.theme }}</label></div><div id="themeHost" style="width:180px;height:32px"/></div>
           <VirtualList id="configItems" class="column" estimated-height="140px"><div v-for="g in matchingBlocks" :key="g.key" :id="'block-'+g.id" :class="'setting-card '+appearance">
             <label v-show="(g.fields.length>1||g.module) &amp;&amp; !g.primary" class="block-heading">{{ g.label }}</label>
             <!-- This Core UI version binds inner loops through a conditional
@@ -871,12 +889,12 @@ export default {
           <ScrollView id="rootListScroll"><VirtualList id="rootItems" estimated-height="62px" style="gap:8px"><div v-for="r in shownRootRows" :key="r.id" :id="'root-row-'+r.id" class="history-entry">
             <div class="root-columns root-row">
               <div class="root-path-column"><div class="root-path-cell">
-                <button v-show="rootCell!==r.id||rootPart!=='input'" :id="'root-input-text-'+r.id" class="password-text" @click="beginRoot(r,'input')"><label :id="'root-input-value-'+r.id" :class="rootDraft(r).input?'password-text-value':'password-text-value muted'" :ellipsis-start="true">{{ rootDraft(r).input||texts.rootPasteHint }}</label><div class="password-hover-line"/></button>
+                <button v-show="rootCell!==r.id||rootPart!=='input'" :id="'root-input-text-'+r.id" class="password-text" @mousedown="e=>rememberCellPointer(r.id,'input',e)" @click="beginRoot(r,'input')"><label :id="'root-input-value-'+r.id" :class="rootDraft(r).input?'password-text-value':'password-text-value muted'" :ellipsis-start="true">{{ rootDraft(r).input||texts.rootPasteHint }}</label><div class="password-hover-line"/></button>
                 <input v-show="rootCell===r.id &amp;&amp; rootPart==='input'" :id="'root-input-input-'+r.id" :value="rootDraft(r).input" :placeholder="texts.rootPasteHint" :ellipsis-start="true" @input="v=>changeRoot(r,'input',v)" @blur="blurRoot(r,'input')" @submit="finishRootCell()"/>
                 <button class="root-browse" :id="'browse-root-input-'+r.id" @click="browseRoot(r,'input')"><svg viewBox="0 0 24 24" fill="none"><path d="M3 6h7l2 2h9v11H3V6Z" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
               </div></div>
               <div class="root-path-column"><div class="root-path-cell">
-                <button v-show="rootCell!==r.id||rootPart!=='output'" :id="'root-output-text-'+r.id" class="password-text" @click="beginRoot(r,'output')"><label :id="'root-output-value-'+r.id" :class="rootDraft(r).output?'password-text-value':'password-text-value muted'" :ellipsis-start="true">{{ rootDraft(r).output||texts.rootOutputHint }}</label><div class="password-hover-line"/></button>
+                <button v-show="rootCell!==r.id||rootPart!=='output'" :id="'root-output-text-'+r.id" class="password-text" @mousedown="e=>rememberCellPointer(r.id,'output',e)" @click="beginRoot(r,'output')"><label :id="'root-output-value-'+r.id" :class="rootDraft(r).output?'password-text-value':'password-text-value muted'" :ellipsis-start="true">{{ rootDraft(r).output||texts.rootOutputHint }}</label><div class="password-hover-line"/></button>
                 <input v-show="rootCell===r.id &amp;&amp; rootPart==='output'" :id="'root-output-input-'+r.id" :value="rootDraft(r).output" :placeholder="texts.rootOutputHint" :ellipsis-start="true" @input="v=>changeRoot(r,'output',v)" @blur="blurRoot(r,'output')" @submit="finishRootCell()"/>
                 <button class="root-browse" :id="'browse-root-output-'+r.id" @click="browseRoot(r,'output')"><svg viewBox="0 0 24 24" fill="none"><path d="M3 6h7l2 2h9v11H3V6Z" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
               </div></div>
@@ -896,7 +914,7 @@ export default {
             <VirtualList id="passwordItems" v-show="shownPasswords.length>0" style="gap:8px" estimated-height="62px"><div v-for="p in shownPasswords" :key="p.id" :id="'password-'+p.id" class="history-entry">
               <div v-show="!passwordHistory" class="password-table-row">
                 <div class="password-value-column">
-                  <button v-show="passwordCell!==p.id" :id="'password-text-'+p.id" class="password-text" @click="beginPassword(p)"><label :id="'password-value-'+p.id" class="password-text-value">{{ passwordDraft(p).value }}</label><div :id="'password-hover-'+p.id" class="password-hover-line"/></button>
+                  <button v-show="passwordCell!==p.id" :id="'password-text-'+p.id" class="password-text" @mousedown="e=>rememberCellPointer(p.id,'value',e)" @click="beginPassword(p)"><label :id="'password-value-'+p.id" class="password-text-value">{{ passwordDraft(p).value }}</label><div :id="'password-hover-'+p.id" class="password-hover-line"/></button>
                   <input v-show="passwordCell===p.id" :id="'password-input-'+p.id" :value="passwordDraft(p).value" :placeholder="texts.passwordPasteHint" @input="v=>changePassword(p,v)" @blur="blurPassword(p)" @submit="finishPasswordCell()"/>
                 </div>
                 <button class="password-actions" :id="'delete-password-'+p.id" @click="deleteListedPassword(p)">{{ texts.delete }}</button>

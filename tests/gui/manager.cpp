@@ -273,7 +273,7 @@ void editing(Fixture& f) {
         auto defaults=parse_json(kDefaultsJson);
         for(auto& field:config_fields(defaults,kDefaultsJson,language)) {
             if(!field["known"].get<bool>()) throw std::runtime_error("Missing setting description: "+field["id"].get<std::string>());
-            assert(!field["label"].get<std::string>().empty() && !field["description"].get<std::string>().empty());
+            assert(!field["label"].get<std::string>().empty());
         }
         assert(!describe_setting("/retired/enabled","",language)["known"].get<bool>());
         assert(!describe_setting("/watch/directory_password_file_auto_create","",language)["known"].get<bool>());

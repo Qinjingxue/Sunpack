@@ -274,6 +274,9 @@ public:
     const std::wstring& Placeholder() const { return placeholder_; }
     void SetPlaceholder(const std::wstring& value) { placeholder_ = value; }
     void SetSearchIcon(bool value) { searchIcon_ = value; }
+    // Transfer a click from a display-only cell into this editor. textOffset
+    // is the horizontal offset of the displayed text (including a trimmed head).
+    void PlaceCaretFromX(MeasureContext& measure, float x, float textOffset = 0);
     static UINT EffectiveCaretBlinkMs();
     void ResetCaretBlink();
     bool ShouldShowCaret() const;

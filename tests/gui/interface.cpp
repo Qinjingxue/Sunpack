@@ -197,6 +197,14 @@ void search_config(Application& app,const wchar_t* query) {
         state(app.page(),"requests").empty() && !state(app.page(),"dispatch").get<bool>();},"Configuration search");
     ui_window_relayout(app.window());
 }
+// Existing edit scenarios locate controls through their translated labels.
+void search_setting(Application& app,const std::string& id) {
+    for(auto& field:state(app.page(),"fields")) if(field["id"]==id || field["module"]==id) {
+        auto label=wide(field["label"].get<std::string>());
+        search_config(app,label.c_str()); return;
+    }
+    throw std::runtime_error("Setting not found: "+id);
+}
 void edit_password(Application& app,const std::string& id,const wchar_t* value) {
     click(app,("password-text-"+id).c_str());
     pump([&]{auto* f=ui::GetContext().GetWindow(app.window())->FocusedWidget(); return f&&f->id=="password-input-"+id;},"Password cell focus");
@@ -502,6 +510,86 @@ void popup_key(ui::UiWindowImpl* popup,int key) {
     if(key!=VK_ESCAPE && key!=VK_RETURN && ui::GetContext().GetWindow(window)!=popup)
         throw std::runtime_error("Date popup lost activation during keyboard operation");
 }
+// One shared-window scenario covers translated search sources that control-edit
+// tests never query: options, hints, values and the two standalone settings.
+void localized_config_search(Application& app) {
+    auto matches=[&](const std::string& query,const std::string& id) {
+        auto text=wide(query); search_config(app,text.c_str());
+        for(auto& block:state(app.page(),"matchingBlocks"))
+            for(auto& f:block["fields"]) if(f["id"]==id) return;
+        throw std::runtime_error("Translated search missed "+id+": "+query);
+    };
+    for(auto language:{"en","zh"}) {
+        search_setting(app,"/cli/language");
+        auto selector=ui_widget_find_by_id(ui_page_root(app.page()),"select-/cli/language"); assert(selector);
+        assert(ui_debug_combo_select(app.window(),selector,std::strcmp(language,"zh")==0?0:1)==0);
+        ui_widget_destroy(selector); finish_input(app);
+        pump([&]{return state(app.page(),"language")==language;},"Search language changed");
+        auto fields=state(app.page(),"fields"),texts=state(app.page(),"texts");
+        for(auto& f:fields) {
+            if(f["id"]=="/runtime/process_mode") matches(f["options"][0]["label"],f["id"]);
+            if(f["id"]=="/watch/enabled") matches(f["description"],f["id"]);
+            if(f["id"]=="/watch/state_dir") matches(f["text"],f["id"]);
+            if(f["editor"]=="datetime_range") matches(texts["rangeEnd"],f["id"]);
+            if(f["editor"]=="size_range") matches("GiB",f["id"]);
+        }
+        search_config(app,wide(texts["dark"].get<std::string>()).c_str());
+        assert(state(app.page(),"showThemeSetting")==true);
+        search_config(app,wide(texts["startupDescription"].get<std::string>()).c_str());
+        assert(state(app.page(),"showStartupSetting")==true);
+        search_config(app,L"max_pending_stage_jobs");
+        assert(state(app.page(),"matchingBlocks").empty());
+    }
+    search_config(app,L"");
+}
+// Real pointer clicks plus reversible typing distinguish a positioned caret
+// from focus-only behavior; tail paths cover the display's ellipsis transform.
+void inline_cell_caret(Application& app) {
+    ui_window_set_size(app.window(),850,560);
+    auto* window=ui::GetContext().GetWindow(app.window());
+    auto check=[&](const std::string& display,const std::string& labelId,const std::string& editor,bool tail) {
+        ui_window_relayout(app.window());
+        auto* label=dynamic_cast<ui::LabelWidget*>(window->Root()->FindById(labelId)); assert(label);
+        auto text=label->Text(),shown=text;
+        float font=label->css.fontSize>0?label->css.fontSize:theme::kFontSizeNormal;
+        auto& renderer=window->GetRenderer();
+        if(tail) shown=renderer.EllipsizeStart(text,label->ContentWidth(),font);
+        size_t hidden=shown==text?0:text.size()-(shown.size()-1);
+        size_t index=shown.size()/2;
+        if(hidden) index=std::max(size_t(1),index);
+        size_t expected=hidden?hidden+index-1:index;
+        float x=label->ContentLeft()+renderer.MeasureTextWidth(shown.substr(0,index),font);
+        auto bounds=rect(app,display);
+        float y=(bounds.top+bounds.bottom)/2;
+        assert(ui_debug_mouse_down(app.window(),x,y)==0);
+        assert(ui_debug_mouse_up(app.window(),x,y)==0);
+        pump([&]{auto* f=window->FocusedWidget();return f&&f->id==editor;},"Pointer-positioned cell");
+        assert(ui_debug_type_char(app.window(),L'X')==0);
+        auto* input=dynamic_cast<ui::TextInputWidget*>(window->FocusedWidget()); assert(input);
+        auto edited=text; edited.insert(expected,1,L'X');
+        if(input->Text()!=edited) throw std::runtime_error("Caret did not follow cell click: "+editor+
+            " expected="+utf8(edited)+" actual="+utf8(input->Text())+" x="+std::to_string(x)+
+            " pointer="+state(app.page(),"cellPointer").dump()+" requests="+state(app.page(),"requests").dump());
+        assert(ui_debug_type_char(app.window(),8)==0);
+        if(input->Text()!=text) throw std::runtime_error("Caret moved while rebinding cell: "+editor+
+            " expected="+utf8(text)+" actual="+utf8(input->Text()));
+    };
+    click(app,"tabPasswords"); pump([&]{return state(app.page(),"tab")=="passwords";}); settle_motion(app);
+    auto rows=state(app.page(),"passwords")["rows"]; assert(!rows.empty());
+    auto id=rows[0]["id"].get<std::string>();
+    check("password-text-"+id,"password-value-"+id,"password-input-"+id,false);
+    click(app,"passwordSearch"); finish_input(app);
+    click(app,"tabRoots"); pump([&]{return state(app.page(),"tab")=="roots";}); settle_motion(app);
+    auto roots=state(app.page(),"rootRows"); assert(!roots.empty());
+    id=roots[0]["id"].get<std::string>();
+    check("root-input-text-"+id,"root-input-value-"+id,"root-input-input-"+id,true);
+    click(app,"rootSearch"); finish_input(app);
+    edit_root_cell(app,id,"output",L"C:/输出/long-folder-name/another-folder/last-folder");
+    click(app,"rootSearch"); finish_input(app);
+    check("root-output-text-"+id,"root-output-value-"+id,"root-output-input-"+id,true);
+    click(app,"rootSearch"); finish_input(app);
+    click(app,"tabConfig"); pump([&]{return state(app.page(),"tab")=="config";}); settle_motion(app);
+}
 void config_categories(Application& app) {
     search_config(app,L"");
     auto categories=state(app.page(),"categories"); assert(categories.size()>2);
@@ -561,7 +649,7 @@ void range_config(Application& app,const fs::path& dir) {
         }
         button_texts(app);
     };
-    search_config(app,L"size_range");
+    search_setting(app,"size_range");
     layout(id,false);
     auto bound=[&](const std::string& module,const std::string& key) {return parse_json(field(module)["text"])[key];};
     assert(field("size_range")["range"]["enabled"]==true);
@@ -600,7 +688,7 @@ void range_config(Application& app,const fs::path& dir) {
     assert(read_json(dir/"sunpack_config.json")[Json::json_pointer(id)]["min_bytes"]==8388608);
     input("range-lower-"+id,L"6"); finish_input(app);
     assert(read_json(dir/"sunpack_config.json")[Json::json_pointer(id)]["min_bytes"]==6291456);
-    search_config(app,L"mtime_range");
+    search_setting(app,"mtime_range");
     input("range-lower-"+tid,L"2023-02-29 00:00"); ui_window_focus_widget(app.window(),0);
     pump([&]{return state(app.page(),"saveErrors").contains(tid);},"Leap date validation");
     input("range-lower-"+tid,L"2024-01-31 12:34"); finish_input(app);
@@ -689,11 +777,11 @@ void range_config(Application& app,const fs::path& dir) {
     auto queued=Json::array({request}).dump(); ui_page_set_json(app.page(),"requests",queued.c_str());
     SendMessageW(static_cast<HWND>(ui_window_hwnd(app.window())),WM_APP+0x401,0,0); ui_debug_pump();
     assert(date_popup(app) && oldTree.expired());
-    search_config(app,L"size_range");
+    search_setting(app,"size_range");
     pump([&]{return !date_popup(app);},"Date settings switch exit");
     assert(!date_popup(app));
     assert(read_file(dir/"sunpack_config.json")==before);
-    search_config(app,L"mtime_range");
+    search_setting(app,"mtime_range");
     auto theme=ui_widget_find_by_id(ui_page_root(app.page()),"themeSelector"); assert(theme);
     auto choice=state(app.page(),"themeChoice").get<int>();
     auto otherTheme=state(app.page(),"appearance")=="dark"?1:2;
@@ -740,7 +828,7 @@ void structured_config(Application& app,const fs::path& dir) {
     atomic_write(dir/"sunpack_config.json",config.dump());
     auto current=[&] { for(auto& f:state(app.page(),"fields")) if(f["id"]==pointer) return f; return Json(); };
     pump([&]{return current().value("items",Json())==values;});
-    search_config(app,L"prune_dir_globs");
+    search_setting(app,"/filesystem/scan_filters/0/prune_dir_globs");
     assert(!ui::GetContext().GetWindow(app.window())->Root()->FindById("lines-"+pointer));
     click(app,("list-"+pointer).c_str());
     assert(rendered_widget(app,"putListEntry")["text"]==state(app.page(),"texts")["addToList"]);
@@ -1004,6 +1092,8 @@ int wmain(int argc,wchar_t** argv) {
                 click(app,"tabConfig"); pump([&]{return state(app.page(),"tab")=="config";});
                 if(acceptance) {
                     settle_motion(app);
+                    localized_config_search(app);
+                    inline_cell_caret(app);
                     virtual_tail(app,"configItems","configListScroll",state(app.page(),"matchingBlocks").size());
                     scrolled_config_edits(app);
                     resize_tasks(app);
@@ -1320,7 +1410,7 @@ int wmain(int argc,wchar_t** argv) {
             ui_widget_destroy(priority);
             finish_input(app);
             pump([&]{return read_json(dir/"sunpack_config.json")["runtime"]["process_mode"]=="high";});
-            search_config(app,L"toast_enabled");
+            search_setting(app,"/watch/toast_enabled");
             auto toast=ui_widget_find_by_id(ui_page_root(app.page()),"toggle-/watch/toast_enabled"); assert(toast);
             assert(ui_debug_toggle_set(app.window(),toast,0)==0);
             assert(state(app.page(),"toggleDrafts").size()==1 && state(app.page(),"drafts").empty());
@@ -1366,9 +1456,7 @@ int wmain(int argc,wchar_t** argv) {
             pump([&]{return state(app.page(),"tab")=="tasks";});
             pump([&]{return state(app.page(),"saving")==false;});
             click(app,"tabConfig"); pump([&]{return state(app.page(),"tab")=="config";});
-            search_config(app,L"out_dir");
-            if(state(app.page(),"configQuery")!="out_dir")
-                throw std::runtime_error("Config search: "+state(app.page(),"configQuery").dump()+" error="+ui_page_last_error(app.page()));
+            search_setting(app,"/watch/out_dir");
             ui_window_set_size(app.window(),850,560);
             auto output=ui_widget_find_by_id(ui_page_root(app.page()),"input-/watch/out_dir"); assert(output);
             ui_text_input_set_text(output,L""); click(app,"input-/watch/out_dir"); ui_debug_type_text(app.window(),L"输出目录");
@@ -1419,7 +1507,7 @@ int wmain(int argc,wchar_t** argv) {
             search_hints(app);
             screenshot(app,L"configuration-english.png");
             button_texts(app);
-            search_config(app,L"language");
+            search_setting(app,"/cli/language");
             auto language=ui_widget_find_by_id(ui_page_root(app.page()),"select-/cli/language"); assert(language);
             assert(ui_debug_combo_select(app.window(),language,0)==0);
             ui_widget_destroy(language);
@@ -1975,21 +2063,21 @@ int wmain(int argc,wchar_t** argv) {
             }
             assert(history_matches==1 && state(app.page(),"passwordDrafts").empty());
             click(app,"tabConfig"); pump([&]{return state(app.page(),"tab")=="config";});
-            search_config(app,L"max_folders");
+            search_setting(app,"/watch/max_folders");
             auto invalid_input=ui_widget_find_by_id(ui_page_root(app.page()),"input-/watch/max_folders"); assert(invalid_input);
             ui_text_input_set_text(invalid_input,L""); ui_widget_destroy(invalid_input);
             click(app,"input-/watch/max_folders"); ui_debug_type_text(app.window(),L"0");
             assert(ui_debug_key(app.window(),VK_RETURN)==0);
             pump([&]{return state(app.page(),"saveErrors").contains("/watch/max_folders") && !state(app.page(),"saving").get<bool>();});
             assert(read_json(dir/"sunpack_config.json")["watch"]["max_folders"]==16);
-            search_config(app,L"out_dir");
+            search_setting(app,"/watch/out_dir");
             auto independent=ui_widget_find_by_id(ui_page_root(app.page()),"input-/watch/out_dir"); assert(independent);
             ui_text_input_set_text(independent,L""); ui_widget_destroy(independent);
             click(app,"input-/watch/out_dir"); ui_debug_type_text(app.window(),L"independent");
             assert(ui_debug_key(app.window(),VK_RETURN)==0);
             pump([&]{return read_json(dir/"sunpack_config.json")["watch"]["out_dir"]=="independent" && !state(app.page(),"saving").get<bool>();});
             assert(state(app.page(),"saveErrors").contains("/watch/max_folders"));
-            search_config(app,L"mtime_range");
+            search_setting(app,"mtime_range");
             std::string closingDate;
             for(auto& f:state(app.page(),"fields")) if(f["module"]=="mtime_range" && f["type"]=="object") closingDate=f["id"];
             assert(!closingDate.empty());
@@ -2000,13 +2088,13 @@ int wmain(int argc,wchar_t** argv) {
             pump([&]{return state(app.page(),"closeError")!="" && !state(app.page(),"saving").get<bool>();});
             assert(!date_popup(app) && closingTree.expired());
             assert(IsWindow(static_cast<HWND>(ui_window_hwnd(app.window()))));
-            search_config(app,L"max_folders");
+            search_setting(app,"/watch/max_folders");
             invalid_input=ui_widget_find_by_id(ui_page_root(app.page()),"input-/watch/max_folders"); assert(invalid_input);
             ui_text_input_set_text(invalid_input,L""); ui_widget_destroy(invalid_input);
             click(app,"input-/watch/max_folders"); ui_debug_type_text(app.window(),L"17");
             finish_input(app);
             assert(read_json(dir/"sunpack_config.json")["watch"]["max_folders"]==17);
-            search_config(app,L"out_dir");
+            search_setting(app,"/watch/out_dir");
             auto closing_input=ui_widget_find_by_id(ui_page_root(app.page()),"input-/watch/out_dir"); assert(closing_input);
             ui_text_input_set_text(closing_input,L""); ui_widget_destroy(closing_input);
             click(app,"input-/watch/out_dir"); ui_debug_type_text(app.window(),L"close-flush");

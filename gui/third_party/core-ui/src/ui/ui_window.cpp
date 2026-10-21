@@ -2962,7 +2962,10 @@ void UiWindowImpl::OnMouseDown(float x, float y) {
         StampDomMouseState(e, 0);
         // Fire @mousedown hook before the widget's own logic — see
         // OnMouseMove for the rationale (subclasses don't all forward).
-        if (hit->onMouseDownHook) hit->onMouseDownHook(e);
+        // Match click routing for labels/icons inside an interactive cell.
+        Widget* pointerTarget = hit;
+        while (pointerTarget && !pointerTarget->onMouseDownHook) pointerTarget = pointerTarget->Parent();
+        if (pointerTarget) pointerTarget->onMouseDownHook(e);
         hit->OnMouseDown(e);
     }
     UpdateCaretBlinkTimer();

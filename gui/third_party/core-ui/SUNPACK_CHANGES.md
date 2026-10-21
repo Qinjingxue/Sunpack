@@ -11,6 +11,13 @@ preserved.
 
 Local changes:
 
+- Deliver loop-scoped mouse-down offsets through label/icon children to the
+  interactive ancestor, and disconnect the hook when a virtual row unmounts.
+  TextInputWidget can place its caret using the existing text hit test with a
+  supplied display offset, including a head-ellipsized directory cell.
+- Skip equal TextInput/TextArea value bindings so input echoes preserve the
+  caret, selection and horizontal scroll instead of resetting them to the end.
+
 - Smooth wheel travel uses the existing finite, VSync-paced animation host.
   Accumulate repeated input, reverse from the visual position, and cancel on
   thumb/track input or programmatic positioning. Keep virtual anchors independent
