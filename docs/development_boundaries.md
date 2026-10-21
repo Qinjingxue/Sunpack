@@ -89,7 +89,7 @@ sunpack.runtime.watch
 
 ### pipeline.discovery.relations
 
-`sunpack.pipeline.discovery.relations` handles relationships between files: strict volume primary files, members, SFX companions, arbitration of structural evidence, and logical names. Initial discovery must not group files directly by loose file names; after a missing volume is confirmed, only one re-search constrained by a structural anchor is allowed. External modules may only call `RelationsScheduler`, and must not depend on `sunpack.pipeline.discovery.relations.internal` directly. See [Structure-first volume resolution](volume_resolution.md) for the complete contract.
+`sunpack.pipeline.discovery.relations` handles relationships between files: strict volume primary files, members, SFX companions, arbitration of structural evidence, and logical names. Initial discovery must not group files directly by loose file names; after a missing volume is confirmed, only one re-search constrained by a structural anchor is allowed. External modules may only call `RelationsScheduler`, and must not depend on `sunpack.pipeline.discovery.relations.internal` directly.
 
 Publicly allowed relation capabilities include:
 

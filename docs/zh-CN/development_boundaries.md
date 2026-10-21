@@ -89,7 +89,7 @@ sunpack.runtime.watch
 
 ### pipeline.discovery.relations
 
-`sunpack.pipeline.discovery.relations` 负责文件关系：严格分卷主文件、成员、SFX companion、结构证据仲裁和逻辑名。初始发现不得用宽松文件名直接建组；确认缺卷后只允许执行一次由结构锚点约束的重找。外部模块只能调用 `RelationsScheduler`，不得直接依赖 `sunpack.pipeline.discovery.relations.internal`。完整契约见 [Structure-first volume resolution](volume_resolution.md)。
+`sunpack.pipeline.discovery.relations` 负责文件关系：严格分卷主文件、成员、SFX companion、结构证据仲裁和逻辑名。初始发现不得用宽松文件名直接建组；确认缺卷后只允许执行一次由结构锚点约束的重找。外部模块只能调用 `RelationsScheduler`，不得直接依赖 `sunpack.pipeline.discovery.relations.internal`。
 
 允许公开的关系能力包括：
 
