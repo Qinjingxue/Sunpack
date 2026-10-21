@@ -372,7 +372,7 @@ void seed(const fs::path& dir,const RunOptions& o) {
         }
     }
     Json passwords=Json::array(),history=Json::array();
-    for(size_t i=0;i<o.passwords;i++) passwords.push_back({{"value","saved-password-"+std::to_string(i)},{"scopes",Json::array({utf8(monitored.wstring())})}});
+    for(size_t i=0;i<o.passwords;i++) passwords.push_back({{"value","saved-password-"+std::to_string(i)}});
     for(size_t i=0;i<o.history;i++) history.push_back("clipboard-password-"+std::to_string(i));
     write_utf8(dir/"builtin_passwords.json",Json{{"passwords",passwords},{"clipboard_history",history}}.dump(2)+"\n");
 }
@@ -510,27 +510,27 @@ int wmain(int argc,wchar_t** argv) {
                 }
             });
             auto rows=page_state(app.page(),"passwords").at("rows");
-            auto edit_id="edit-password-"+rows.at(0).at("id").get<std::string>();
+            auto edit_id="password-text-"+rows.at(0).at("id").get<std::string>();
             for(size_t i=0;i<options.rounds;i++) {
-                measure("password_edit_open",[&]{click(app,edit_id.c_str()); wait_for([&]{return page_state(app.page(),"passwordEditor")==true;},"password editor");});
-                measure("password_edit_close",[&]{click(app,"closePasswordEditor"); wait_for([&]{return page_state(app.page(),"passwordEditor")==false;},"password editor close");});
+                measure("password_edit_open",[&]{click(app,edit_id.c_str()); wait_for([&]{return page_state(app.page(),"passwordCell")!="";},"password editor");});
+                measure("password_edit_close",[&]{click(app,"passwordSearch"); wait_for([&]{return page_state(app.page(),"passwordCell")=="";},"password editor close");});
             }
             for(size_t i=0;i<std::min<size_t>(options.rounds,1);i++) {
                 auto current=page_state(app.page(),"passwords").at("rows").at(0);
-                auto current_edit_id="edit-password-"+current.at("id").get<std::string>();
+                auto current_edit_id="password-text-"+current.at("id").get<std::string>();
                 auto replacement="perf-edited-"+std::to_string(i);
                 measure("password_edit_form_open",[&]{
                     click(app,current_edit_id.c_str());
-                    wait_for([&]{return page_state(app.page(),"passwordEditor")==true;},"password editor open");
+                    wait_for([&]{return page_state(app.page(),"passwordCell")!="";},"password editor open");
                 });
                 measure("password_edit_input",[&]{
-                    click(app,"passwordValue");
+                    click(app,("password-input-"+current.at("id").get<std::string>()).c_str());
                     ensure(ui_debug_key_mod(app.window(),'A',1,0,0)==0,"select password failed");
                     ensure(ui_debug_type_char(app.window(),8)==0,"clear password failed");
                     ensure(ui_debug_type_text(app.window(),wide(replacement).c_str())==0,"edit password failed");
                 });
                 measure("password_edit_commit_dispatch",[&]{
-                    click(app,"closePasswordEditor");
+                    click(app,"passwordSearch");
                 });
                 measure("password_edit_file_replace_wait",[&]{
                     wait_for([&]{return password_file_changed.load(std::memory_order_acquire);},"password file replace");
@@ -539,7 +539,7 @@ int wmain(int argc,wchar_t** argv) {
                     wait_for([&]{
                         // Cheap flags first: only the final poll pays for a full
                         // password-list serialization.
-                        if(page_state(app.page(),"passwordEditor").get<bool>()) return false;
+                        if(page_state(app.page(),"passwordCell")!="") return false;
                         if(page_state(app.page(),"recordSaving").value("passwords",false)) return false;
                         auto state=page_state(app.page(),"passwords");
                         return !state.at("rows").empty() && state.at("rows").at(0).value("value",std::string())==replacement;

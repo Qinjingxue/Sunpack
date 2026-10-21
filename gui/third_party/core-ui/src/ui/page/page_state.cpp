@@ -679,6 +679,10 @@ void PageState::ApplyBindingToWidget(Widget* w, const std::string& prop, const u
         if (auto* input = dynamic_cast<TextInputWidget*>(w)) input->SetPlaceholder(ToWide(v.ToString()));
         return;
     }
+    if (prop == "ellipsis-start") {
+        w->ellipsisStart = v.ToBool();
+        return;
+    }
     if (prop == "id") {
         /* :id="..." 动态 id (build 98+ L26). 主用例 v-for 给每个 iteration
          * 唯一 id 让 ui_page_on_widget_mount 能挂回调. 调用时机: bindings 首次
@@ -733,6 +737,9 @@ void PageState::ApplyBindingToWidget(Widget* w, const std::string& prop, const u
         if (w->visible == nv) { shouldInvalidate = false; traceBindingNoop(); return; }
         if (w->visible != nv) {
             w->visible = nv;
+            if (!nv) {
+                if (auto* window = GetContext().FindWindowByWidget(w)) window->ClearHiddenHover(w);
+            }
             // visible flips ⇒ widget participates in flex layout differently
             // (invisible siblings are skipped in DoLayout). Without a relayout
             // the freshly-shown widget keeps the zero rect it got while
@@ -2087,6 +2094,18 @@ void PageState::DestroyJsIteration(JsLoopRuntime& rt, JsLoopIteration& iter) {
     // Fire unmount hooks before any teardown so callbacks can still read
     // widget state.
     if (iter.mountedRoot) DispatchUnmountHooks(iter.mountedRoot.get());
+    // Input dispatch/focus can still hold the native widget after its virtual
+    // iteration is removed. Disconnect borrowed JS callbacks before freeing
+    // the iteration's functions and item values.
+    auto disconnect = [](auto&& self, Widget* widget) -> void {
+        widget->onClick = {}; widget->onFocusHook = {}; widget->onBlurHook = {};
+        widget->onSubmitHook = {}; widget->onTextChanged = {};
+        widget->onValueChanged = {}; widget->onFloatChanged = {};
+        widget->onMouseDblClickHook = {};
+        if (auto* combo = dynamic_cast<ComboBoxWidget*>(widget)) combo->onSelectionChanged = {};
+        for (const auto& child : widget->Children()) self(self, child.get());
+    };
+    if (iter.mountedRoot) disconnect(disconnect, iter.mountedRoot.get());
     // Tear down nested v-if runtimes first — their inner effects reference
     // the iteration's itemValue/idxValue, which we're about to JS_FreeValue.
     // Recurse through innerConditionals (v-if inside v-if inside v-for).
@@ -2437,27 +2456,35 @@ void PageState::WireLoopScopeEventEx(Widget* target, const std::string& evName,
     // callHandler: prepends [outerItem, outerIdx?,] item, idx? before $event.
     // outer scope only present when this v-for is nested inside v-if inside v-for.
     auto callHandler = [this, ctx, fn, iter, hasIdx, evName, rt](JSValue arg) {
+        // A handler may remove its own row synchronously. Own the function,
+        // arguments and diagnostics until JS_Call returns; do not access its
+        // iteration or the native callback's captures after entering JS.
+        auto* context = ctx;
+        auto* owner = this;
+        const auto eventName = evName;
+        JSValue function = JS_DupValue(context, fn);
         JSValue args[5];
         int argc = 0;
         if (rt && rt->outerIter) {
-            args[argc++] = rt->outerIter->itemValue;
-            if (rt->outerHasIdx) args[argc++] = rt->outerIter->idxValue;
+            args[argc++] = JS_DupValue(context, rt->outerIter->itemValue);
+            if (rt->outerHasIdx) args[argc++] = JS_DupValue(context, rt->outerIter->idxValue);
         }
-        args[argc++] = iter->itemValue;
-        if (hasIdx) args[argc++] = iter->idxValue;
+        args[argc++] = JS_DupValue(context, iter->itemValue);
+        if (hasIdx) args[argc++] = JS_DupValue(context, iter->idxValue);
         args[argc++] = arg;
-        JSValue r = JS_Call(ctx, fn, jsState_, argc, args);
+        JSValue r = JS_Call(context, function, owner->jsState_, argc, args);
         if (JS_IsException(r)) {
-            JSValue exc = JS_GetException(ctx);
-            const char* msg = JS_ToCString(ctx, exc);
+            JSValue exc = JS_GetException(context);
+            const char* msg = JS_ToCString(context, exc);
             if (msg) {
-                errors_.push_back("v-for @" + evName + " threw: " + msg);
-                JS_FreeCString(ctx, msg);
+                owner->errors_.push_back("v-for @" + eventName + " threw: " + msg);
+                JS_FreeCString(context, msg);
             }
-            JS_FreeValue(ctx, exc);
+            JS_FreeValue(context, exc);
         }
-        JS_FreeValue(ctx, r);
-        JS_FreeValue(ctx, arg);
+        JS_FreeValue(context, r);
+        for (int i = 0; i < argc; ++i) JS_FreeValue(context, args[i]);
+        JS_FreeValue(context, function);
     };
 
     if (evName == "click") {

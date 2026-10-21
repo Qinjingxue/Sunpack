@@ -372,12 +372,16 @@ public:
     Widget* FocusedWidget() const { return focusedWidget_; }
 
     /* build 174: 编程式设焦点 + 亮焦点环 (键盘导航可见)。供 ui_window_focus_widget
-     * C API (msgbox 初始焦点落在按钮上 + 方向键移焦点用)。w=null 清焦点。 */
-    void FocusWidget(Widget* w);
+     * C API (msgbox 初始焦点落在按钮上 + 方向键移焦点用)。w=null 清焦点。
+     * 鼠标触发的行内替换可传 false，保留控件本身的聚焦样式。 */
+    void FocusWidget(Widget* w, bool showFocusRing = true);
 
     // Called from ui::Context::NotifyWidgetDestroyed when a widget dies
     // unexpectedly (v-for iter destroyed while cursor on it).
     void NotifyWidgetDestroyed(class Widget* w);
+
+    // Drop hover on a hidden subtree before an inline replacement is shown.
+    void ClearHiddenHover(Widget* subtree);
 
     /* DPI scale for coordinate conversion */
     float DpiScale() const { return dpiScale_; }

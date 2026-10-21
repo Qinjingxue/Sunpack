@@ -1269,7 +1269,12 @@ void Renderer::DrawLine(float x1, float y1, float x2, float y2, const D2D1_COLOR
 
 void Renderer::DrawText(const std::wstring& text, const D2D1_RECT_F& rect, const D2D1_COLOR_F& color,
                          float fontSize, DWRITE_TEXT_ALIGNMENT align, DWRITE_FONT_WEIGHT weight,
-                         DWRITE_PARAGRAPH_ALIGNMENT vAlign, bool wordWrap, const wchar_t* family) {
+                         DWRITE_PARAGRAPH_ALIGNMENT vAlign, bool wordWrap, const wchar_t* family, bool ellipsisStart) {
+    if (ellipsisStart) {
+        DrawText(EllipsizeStart(text, rect.right - rect.left, fontSize, family, weight), rect,
+                 color, fontSize, align, weight, vAlign, false, family);
+        return;
+    }
     if (auto* recorder = ActiveDisplayListRecorder()) {
         TextStyle style;
         style.color = color;
@@ -1348,7 +1353,7 @@ float Renderer::MeasureTextWidth(const std::wstring& text, float fontSize,
 
     TextWidthKey key{fmt.Get(), text};
     auto cached = textWidthCache_.find(key);
-    if (cached != textWidthCache_.end()) return cached->second;
+    if (cached != textWidthCache_.end()) return cached->second.width;
     TraceEvent("core_renderer", "measure_text_width_miss");
 
     ComPtr<IDWriteTextLayout> layout;
@@ -1371,9 +1376,41 @@ float Renderer::MeasureTextWidth(const std::wstring& text, float fontSize,
             textWidthChars_ = 0;
         }
         textWidthChars_ += text.size();
-        textWidthCache_.emplace(std::move(key), width);
+        textWidthCache_.emplace(std::move(key), MeasuredText{width});
     }
     return width;
+}
+
+std::wstring Renderer::EllipsizeStart(const std::wstring& text, float width, float fontSize,
+                                     const wchar_t* family, DWRITE_FONT_WEIGHT weight) {
+    if (MeasureTextWidth(text, fontSize, family, weight) <= width) return text;
+    auto format = GetTextFormat(fontSize, family, weight);
+    TextWidthKey key{format.Get(), text};
+    auto cached = textWidthCache_.find(key);
+    if (cached != textWidthCache_.end())
+        for (const auto& tail : cached->second.tails) if (tail.width == width) return tail.text;
+    auto suffix = [&](size_t count) {
+        size_t start = text.size() - count;
+        if (start < text.size() && text[start] >= 0xDC00 && text[start] <= 0xDFFF) ++start;
+        return std::wstring(L"\u2026") + text.substr(start);
+    };
+    size_t lo = 0, hi = text.size();
+    while (lo < hi) {
+        auto mid = lo + (hi - lo + 1) / 2;
+        if (MeasureTextWidth(suffix(mid), fontSize, family, weight) <= width) lo = mid;
+        else hi = mid - 1;
+    }
+    auto result = suffix(lo);
+    // Measuring suffixes can clear the bounded width cache. Look up again;
+    // never hold a cache iterator across text measurement. Two variants cover
+    // a collapsed selector and its popup; the existing UTF-16 cap bounds both.
+    cached = textWidthCache_.find(key);
+    if (cached != textWidthCache_.end()) {
+        auto& entry = cached->second;
+        auto& tail = entry.tails[entry.nextTail++ % 2];
+        tail.width = width; tail.text = result;
+    }
+    return result;
 }
 
 float Renderer::MeasureTextHeight(const std::wstring& text, float maxWidth, float fontSize,

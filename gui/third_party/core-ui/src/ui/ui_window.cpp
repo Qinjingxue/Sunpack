@@ -564,6 +564,25 @@ void UiWindowImpl::NotifyWidgetDestroyed(Widget* w) {
     propertyAnimations_.Cancel(w);
 }
 
+void UiWindowImpl::ClearHiddenHover(Widget* subtree) {
+    if (!subtree) return;
+    auto* ancestor = hoveredWidget_;
+    while (ancestor && ancestor != subtree) ancestor = ancestor->Parent();
+    if (!ancestor) return;
+
+    // Keep the visible ancestors hovered. A subsequent mouse move can enter
+    // the replacement even if it occupies exactly the same rectangle.
+    auto* previous = hoveredWidget_;
+    hoveredWidget_ = subtree->Parent();
+    for (auto* w = previous; w != hoveredWidget_; w = w->Parent()) {
+        w->hovered = false;
+        w->RefreshCssState();
+    }
+    tooltipVisible_ = false;
+    tooltipWidget_ = nullptr;
+    if (tooltipTimerId_) { KillTimer(hwnd_, tooltipTimerId_); tooltipTimerId_ = 0; }
+}
+
 void UiWindowImpl::ActivateForMouseInput() {
     if (!hwnd_ || toolWindow_) return;
 
@@ -3587,13 +3606,16 @@ void UiWindowImpl::UpdateCaretBlinkTimer() {
 
 void UiWindowImpl::SetFocus(Widget* w) {
     if (focusedWidget_ == w) return;
-    if (focusedWidget_) {
-        focusedWidget_->SetFocused(false);
-        focusedWidget_->RefreshCssState();
-        if (auto* ti = dynamic_cast<TextInputWidget*>(focusedWidget_)) ti->focused = false;
-        if (auto* ta = dynamic_cast<TextAreaWidget*>(focusedWidget_)) ta->focused = false;
-    }
+    auto previous = focusedWidget_ ? focusedWidget_->shared_from_this() : WidgetPtr{};
+    auto next = w ? w->shared_from_this() : WidgetPtr{};
     focusedWidget_ = w;
+    if (previous) {
+        previous->SetFocused(false);
+        previous->RefreshCssState();
+        if (auto* ti = dynamic_cast<TextInputWidget*>(previous.get())) ti->focused = false;
+        if (auto* ta = dynamic_cast<TextAreaWidget*>(previous.get())) ta->focused = false;
+    }
+    if (focusedWidget_ != w) { UpdateCaretBlinkTimer(); return; }
     if (w) {
         w->SetFocused(true);
         w->RefreshCssState();
@@ -3608,11 +3630,10 @@ void UiWindowImpl::ClearFocus() {
     SetFocus(nullptr);
 }
 
-void UiWindowImpl::FocusWidget(Widget* w) {
+void UiWindowImpl::FocusWidget(Widget* w, bool showFocusRing) {
     SetFocus(w);
-    /* 亮焦点环 — 编程式设焦点视同键盘导航 (让用户看见焦点落在哪个按钮)。 */
-    showFocusRing_ = true;
-    ShowFocusRing() = true;
+    showFocusRing_ = showFocusRing;
+    ShowFocusRing() = showFocusRing;
     Invalidate();
 }
 

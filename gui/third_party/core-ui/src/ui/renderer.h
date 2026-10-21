@@ -128,7 +128,10 @@ public:
                   DWRITE_FONT_WEIGHT weight = DWRITE_FONT_WEIGHT_NORMAL,
                   DWRITE_PARAGRAPH_ALIGNMENT vAlign = DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
                   bool wordWrap = false,
-                  const wchar_t* family = nullptr);
+                  const wchar_t* family = nullptr, bool ellipsisStart = false);
+    std::wstring EllipsizeStart(const std::wstring& text, float width, float fontSize,
+                                const wchar_t* family = nullptr,
+                                DWRITE_FONT_WEIGHT weight = DWRITE_FONT_WEIGHT_NORMAL);
     float MeasureTextWidth(const std::wstring& text, float fontSize,
                            const wchar_t* family = nullptr,  /* nullptr = 用 DefaultFontFamily() */
                            DWRITE_FONT_WEIGHT weight = DWRITE_FONT_WEIGHT_NORMAL);
@@ -432,9 +435,15 @@ private:
             return std::hash<std::wstring>{}(key.text) ^ std::hash<void*>{}(key.format);
         }
     };
-    // Scalars only: never retain DWrite layouts. Bound both entries and UTF-16
-    // payload so resizing a full task page stays cheap without an unbounded log cache.
-    std::unordered_map<TextWidthKey, float, TextWidthKeyHash> textWidthCache_;
+    // Widths and at most two clipped strings per source; never DWrite layouts.
+    // Both entry count and source UTF-16 payload are bounded. Clipped strings
+    // cannot grow beyond their source, so resizing cannot retain unbounded text.
+    struct MeasuredText {
+        float width;
+        struct Tail { float width = -1; std::wstring text; } tails[2];
+        unsigned nextTail = 0;
+    };
+    std::unordered_map<TextWidthKey, MeasuredText, TextWidthKeyHash> textWidthCache_;
     size_t textWidthChars_ = 0;
     void ClearTextCaches();
     /* SVG 描边图标共用一个 round-cap/round-join 风格，避免锐角处出尖刺 */

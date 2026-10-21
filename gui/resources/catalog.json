@@ -100,6 +100,14 @@
       "zh": "剪贴板历史",
       "en": "Clipboard history"
     },
+    "saveHistoryToDirectory": {
+      "zh": "保存到当前目录",
+      "en": "Save to folder"
+    },
+    "saveHistoryGlobally": {
+      "zh": "保存到全部目录",
+      "en": "Save globally"
+    },
     "savedPasswords": {
       "zh": "密码列表",
       "en": "Saved passwords"
@@ -280,41 +288,17 @@
       "zh": "搜索密码",
       "en": "Search passwords"
     },
-    "editPassword": {
-      "zh": "编辑密码",
-      "en": "Edit password"
-    },
-    "copyPassword": {
-      "zh": "保存到密码列表",
-      "en": "Save a copy"
+    "passwordPasteHint": {
+      "zh": "可粘贴多行内容",
+      "en": "Paste multiple lines of passwords"
     },
     "passwordText": {
       "zh": "密码",
       "en": "Password"
     },
-    "scopeLabel": {
-      "zh": "作用范围",
-      "en": "Applies to"
-    },
-    "scopeDescription": {
-      "zh": "包含所选目录的子目录。请至少添加一个目录。",
-      "en": "Includes subfolders. Add at least one folder."
-    },
-    "chooseScope": {
-      "zh": "添加适用目录",
-      "en": "Add folder"
-    },
-    "deletePassword": {
-      "zh": "删除密码",
-      "en": "Delete password"
-    },
     "entries": {
       "zh": "条",
       "en": "entries"
-    },
-    "scopeRequired": {
-      "zh": "请添加目录，或选择“全部目录”。",
-      "en": "Add a folder or select All folders."
     },
     "manageEntries": {"zh":"管理条目","en":"Manage entries"},
     "saveEntries": {"zh":"保存","en":"Save"},
@@ -326,8 +310,7 @@
     "importEntries": {"zh":"批量导入","en":"Bulk import"},
     "previewEntries": {"zh":"预览导入","en":"Preview import"},
     "multilineEntry": {"zh":"条目内换行","en":"Multiline entry"},
-    "importHint": {"zh":"每行导入一个条目，忽略空行；密码和规则保留首尾空格。先预览，再导入。","en":"One entry per line; blank lines are skipped. Password and rule whitespace is preserved. Preview before importing."},
-    "selectedFolders": {"zh":"指定目录","en":"Selected folders"},
+    "importHint": {"zh":"每行导入一个条目，忽略空行；保留条目首尾空格。先预览，再导入。","en":"One entry per line; blank lines are skipped. Entry whitespace is preserved. Preview before importing."},
     "unsavedEntries": {"zh":"请先保存或取消当前编辑。","en":"Save or cancel the current edit first."},
     "folderEntryRequired": {"zh":"请输入一个目录路径。","en":"Enter one folder path."},
     "finishImport": {"zh":"请先预览并导入，或清空批量输入。","en":"Preview and import the batch, or clear the import text first."},

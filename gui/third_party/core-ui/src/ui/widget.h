@@ -74,6 +74,7 @@ inline bool& ShowFocusRing() {
 class UI_API Widget : public std::enable_shared_from_this<Widget> {
 public:
     virtual ~Widget();
+    bool ellipsisStart = false;
 
     // ---- Tree ----
     void AddChild(WidgetPtr child);

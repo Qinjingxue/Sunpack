@@ -130,7 +130,7 @@ void LabelWidget::OnDraw(Renderer& r) {
         r.DrawText(text_, textRect, c, fs, align_, weight, vAlign, true);
         r.PopClip();
     } else {
-        r.DrawText(text_, textRect, c, fs, align_, weight, vAlign, wrap_);
+        r.DrawText(text_, textRect, c, fs, align_, weight, vAlign, wrap_, nullptr, ellipsisStart);
     }
 }
 
@@ -287,7 +287,7 @@ D2D1_SIZE_F LabelWidget::SizeHint() const {
                 : (lineHeightRatio_ > 0.0f) ? (lineHeightRatio_ * fontSize_)
                                             : (fontSize_ * 1.3f);
     float h = fixedH > 0 ? fixedH : lineH;
-    if (wrap_ && fixedW > 0) {
+    if (wrap_ && !ellipsisStart && fixedW > 0) {
         /* 仅 fixedW 显式约束时 SizeHint 能可靠预测 wrap 后的高度. 没 fixedW
          * 时父宽未知 (要等 DoLayout 分配 rect 才知道), SizeHint 给单行高;
          * 父级层 layout 时若分配 rect.width < intrinsic, draw 时按 rect
@@ -305,7 +305,9 @@ D2D1_SIZE_F LabelWidget::SizeHint() const {
                  * 1.4 阈值: 单行实际 ratio ≈ 1.2, 用 1.4 当 "definitely > 1 line"
                  * 边界, 防 ceil(1.23) 错误判 2 行. */
                 int numLines = std::max(1, (int)std::ceil(textH / (fontSize_ * 1.4f)));
-                h = numLines * lineH;
+                // The ratio estimates a line count, but can round down for
+                // long paragraphs. Never allocate less than DWrite will draw.
+                h = std::max(textH, numLines * lineH);
                 if (maxLines_ > 0) {
                     float maxH = lineH * maxLines_;
                     if (h > maxH) h = maxH;
@@ -427,9 +429,9 @@ void ButtonWidget::OnDraw(Renderer& r) {
         D2D1_RECT_F iconRect = {rect.left + 11, rect.top, rect.left + 31, rect.bottom};
         r.DrawIcon(icon_, iconRect, textColor, 12.0f);
         D2D1_RECT_F textRect = {rect.left + 33, rect.top, rect.right - 11, rect.bottom};
-        r.DrawText(text_, textRect, textColor, fontSize_, DWRITE_TEXT_ALIGNMENT_LEADING);
+        r.DrawText(text_, textRect, textColor, fontSize_, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, false, nullptr, ellipsisStart);
     } else {
-        r.DrawText(text_, rect, textColor, fontSize_, textAlign_);
+        r.DrawText(text_, rect, textColor, fontSize_, textAlign_, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, false, nullptr, ellipsisStart);
     }
 }
 
@@ -1052,6 +1054,14 @@ void TextInputWidget::OnDraw(Renderer& r) {
 
     D2D1_COLOR_F caret = css.hasCaretColor ? css.caretColor : accent;
 
+    if (!focused && ellipsisStart && !text_.empty()) {
+        r.DrawText(text_, textArea, fg, fontSize, DWRITE_TEXT_ALIGNMENT_LEADING,
+                   DWRITE_FONT_WEIGHT_NORMAL, DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
+                   false, nullptr, true);
+        r.PopClip();
+        return;
+    }
+
     if (!text_.empty()) {
         float textX = rect.left + TextInset() - scrollX_;
         D2D1_RECT_F drawArea = {textX, rect.top, textX + 10000, rect.bottom};
@@ -1233,6 +1243,7 @@ bool TextInputWidget::OnKeyDown(int vk) {
         if (HasSelection()) {
             SetClipboardText(GetSelectedText());
             DeleteSelection();
+            if (onTextChanged) onTextChanged(text_);
         }
         return true;
     }
@@ -1249,6 +1260,7 @@ bool TextInputWidget::OnKeyDown(int vk) {
         ResetCaretBlink();
         extern MeasureContext* g_activeMeasureContext;
         if (g_activeMeasureContext) EnsureCursorVisible(*g_activeMeasureContext);
+        if (onTextChanged) onTextChanged(text_);
         return true;
     }
     if (ctrl && vk == 'A') {
@@ -1975,7 +1987,7 @@ void ComboBoxWidget::OnDraw(Renderer& r) {
 
     D2D1_RECT_F textArea = {rect.left + 10, rect.top, rect.right - 28, rect.bottom};
     if (selectedIndex_ >= 0 && selectedIndex_ < (int)items_.size()) {
-        r.DrawText(items_[selectedIndex_], textArea, fg, fontSize);
+        r.DrawText(items_[selectedIndex_], textArea, fg, fontSize, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, false, nullptr, ellipsisStart);
     }
 
     D2D1_RECT_F arrowArea = {rect.right - 28, rect.top, rect.right, rect.bottom};
@@ -2185,7 +2197,7 @@ void ComboBoxWidget::OnDrawOverlay(Renderer& r) {
         }
         D2D1_RECT_F labelR = {dropBg.left + 16, iy, labelRight, iy + itemHeight_};
         r.DrawText(items_[i], labelR, itemColor, fontSize,
-                   DWRITE_TEXT_ALIGNMENT_LEADING, weight);
+                   DWRITE_TEXT_ALIGNMENT_LEADING, weight, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, false, nullptr, ellipsisStart);
     }
 
     if (canScroll) {

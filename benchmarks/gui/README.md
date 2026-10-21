@@ -59,7 +59,7 @@ password file with `passwords` saved records plus `history` clipboard entries, a
 * `wait_for` drains the message queue **before** sampling state. Sampling first made a
   notification that had already been delivered visible only after the next unrelated
   message (caret blink, paint), which reported phantom 0.9–14 s waits.
-* Waits query cheap state first (`ready`, `passwordEditor`, `recordSaving`) and serialize
+* Waits query cheap state first (`ready`, `passwordCell`, `recordSaving`) and serialize
   the large arrays only on the poll that can finish.
 * `wait_settled` fails after 5 s and prints the widget that keeps the settle predicate
   false, with a frame counter. Do not raise that timeout to hide a stall.

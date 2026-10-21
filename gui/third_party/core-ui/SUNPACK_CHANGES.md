@@ -38,6 +38,10 @@ Local changes:
 
 - Honor `text-align` on text buttons, retaining centered text by default;
   task filename links use left alignment with the directory text below them.
+- Clear hover state on reactively hidden subtrees, keeping visible ancestors
+  intact so inline replacements do not inherit a stale underline or tooltip.
+- Allow programmatic focus without the keyboard navigation ring for inline
+  replacements; retain each input's native background and accent underline.
 - Wire focus, blur and submit handlers inside keyed loop scopes as well as
   ordinary templates, allowing inline settings to commit at edit completion.
 - Sample finite animations with a monotonic high precision clock and continue
@@ -63,6 +67,19 @@ Local changes:
   and DWrite format. Keep at most 1024 scalar results and 65536 UTF-16 characters;
   clear on font/fallback changes, factory reinitialization and target release.
   No retained text layouts or background work.
+
+- Disconnect virtual-row callbacks before releasing their JS scope, and retain
+  the current JS function/arguments until reentrant handlers return. Focus changes
+  keep both widgets alive and publish the new focus before blur callbacks. This
+  prevents use-after-free when a save or external snapshot removes an edited row.
+- Shared `:ellipsis-start` rendering for directory labels, previews and dropdown
+  labels. Preserve the right-hand path suffix and UTF-16 code point boundaries;
+  cache up to two measured suffixes in the existing bounded width cache.
+  Cache reset follows the renderer's font/factory lifecycle; no retained layouts.
+- Emit TextInput text-change events after Ctrl+V/Ctrl+X, matching ordinary input.
+  Multi-line paste reaches the password table as one event and one atomic batch.
+- Keep wrapped labels at least as tall as their measured DWrite text. Estimated
+  line counts can understate long paragraphs and let text overflow an auto row.
 
 The framework is MIT licensed; see [LICENSE](LICENSE). The original license and
 copyright notices are preserved, including [LunaSVG](third_party/lunasvg/LICENSE),

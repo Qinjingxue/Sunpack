@@ -9,6 +9,7 @@
 #include <shlobj.h>
 #include <ui/ui_context.h>
 #include <ui/ui_window.h>
+#include <ui/controls.h>
 #include <chrono>
 #include <map>
 
@@ -212,7 +213,7 @@ void Application::queue_save(Json job) {
     if(kind!="config" && kind!="passwords" && kind!="roots") return;
     auto key=job.at("key");
     set_text(page_,"closeError","");
-    save_error(kind=="config"?key.get<std::string>():"@"+kind,"");
+    save_error(kind=="passwords"?"@password:"+key.get<std::string>():kind=="config"?key.get<std::string>():"@"+kind,"");
     auto previous=std::find_if(saves_.begin(),saves_.end(),[&](const Json& queued){return queued["kind"]==kind && queued["key"]==key;});
     if(previous!=saves_.end()) *previous=std::move(job); else saves_.push_back(std::move(job));
     start_save();
@@ -237,7 +238,71 @@ void Application::start_save() {
 void Application::acknowledge_save(const Json& ack) {
     const auto& job=ack.at("job"); auto kind=job.at("kind").get<std::string>();
     bool ok=ack.at("ok").get<bool>();
-    save_error(kind=="config"?job["key"].get<std::string>():"@"+kind,ack.at("error"));
+    save_error(kind=="passwords"?"@password:"+job["key"].get<std::string>():kind=="config"?job["key"].get<std::string>():"@"+kind,ack.at("error"));
+    if(kind=="passwords") {
+        const auto& edit=job.at("edit");
+        const bool removed=ok && ack.at("passwordOriginal").get<std::string>().empty();
+        std::string original;
+        Json rebases=Json::array(),row_rebases=Json::array();
+        if(ok) {
+            struct Rebase { const Json* record; std::string original; };
+            std::vector<Rebase> records;
+            std::unordered_map<std::string,size_t> changed;
+            for(auto& group:ack.at("passwordRebases")) {
+                const auto& record=group.at("record");
+                const auto index=records.size();
+                records.push_back({&record,record.is_null()?std::string():record.dump()});
+                for(auto& previous:group.at("originals")) changed.emplace(previous.get<std::string>(),index);
+            }
+            // Merging another directory into a shared password also changes
+            // the baseline of already queued edits in its other directories.
+            for(auto it=saves_.begin();it!=saves_.end();) {
+                auto& queued=*it;
+                if(queued["kind"]!=kind || queued["key"]==job["key"]) { ++it; continue; }
+                auto found=changed.find(queued["edit"]["original"].get<std::string>());
+                if(found==changed.end()) { ++it; continue; }
+                auto& rebase=records[found->second];
+                bool missing=!password_matches_scope(*rebase.record,queued["edit"].value("scope",std::string()));
+                auto& operation=queued["edit"]["operation"];
+                if(missing && (operation=="delete" || operation=="removeScope")) { it=saves_.erase(it); continue; }
+                queued["edit"]["original"]=missing?std::string():rebase.original;
+                if(missing) operation="addMany";
+                ++it;
+            }
+            auto drafts=page_value(page_,"passwordDrafts");
+            for(auto it=drafts.begin();it!=drafts.end();++it) {
+                if(it.key()==job["key"].get<std::string>()) continue;
+                auto previous=it.value().at("original").get<std::string>();
+                auto found=changed.find(previous); if(found==changed.end()) continue;
+                auto& rebase=records[found->second];
+                bool missing=!password_matches_scope(*rebase.record,it.value().value("scope",std::string()));
+                bool pending=std::any_of(saves_.begin(),saves_.end(),[&](const Json& queued){return queued["kind"]==kind && queued["key"]==it.key();});
+                rebases.push_back({{"key",it.key()},{"previous",previous},{"original",missing?std::string():rebase.original},{"removed",missing},{"pending",pending}});
+            }
+            auto scope=page_value(page_,"passwordScope").get<std::string>();
+            if(scope!="@history") for(size_t i=0;i<records.size();++i) if(password_matches_scope(*records[i].record,scope))
+                row_rebases.push_back({{"originals",ack["passwordRebases"][i]["originals"]},{"original",records[i].original}});
+            original=ack.at("passwordOriginal").get<std::string>();
+            if(removed) saves_.erase(std::remove_if(saves_.begin(),saves_.end(),[&](const Json& queued) {
+                return queued["kind"]==kind && queued["key"]==job["key"] && (queued["edit"]["operation"]=="delete" || queued["edit"]["operation"]=="removeScope");
+            }),saves_.end());
+            for(auto& queued:saves_) if(queued["kind"]==kind && queued["key"]==job["key"] && queued["edit"]["original"]==edit["original"]) {
+                queued["edit"]["original"]=original;
+                if(removed) queued["edit"]["operation"]="addMany";
+                else if(queued["edit"]["operation"]=="addMany") queued["edit"]["operation"]="replace";
+                if(queued["edit"]["values"]==edit["values"] && edit["values"].size()>1)
+                    queued["edit"]["values"]=Json::array({edit["value"]});
+            }
+        }
+        bool pending=std::any_of(saves_.begin(),saves_.end(),[&](const Json& queued){return queued["kind"]==kind && queued["key"]==job["key"];});
+        auto reply=Json{{"key",job["key"]},{"snapshot",job["snapshot"]},{"ok",ok},{"error",ack["error"]},
+            {"original",original},{"pending",pending},{"removed",removed},{"rebases",std::move(rebases)},{"rowRebases",std::move(row_rebases)}};
+        if(!ok) reply["error"]=page_value(page_,"saveErrors")["@password:"+job["key"].get<std::string>()];
+        auto encoded=reply.dump();
+        if(ui_page_call_json(page_,"passwordSaved",encoded.c_str())!=0) throw std::runtime_error("passwordBindingFailed");
+        active_save_=Json();
+        return;
+    }
     if(ok && kind=="config") {
         const auto& edit=job["fields"][0]; auto id=edit["pointer"].get<std::string>();
         auto original=edit["type"]=="string"?Json(edit["text"]).dump():edit["type"]=="boolean"?Json(edit["boolean"]).dump():edit["text"].get<std::string>();
@@ -261,59 +326,42 @@ void Application::acknowledge_save(const Json& ack) {
             queued["fields"][0]["original"]=original; queued["fields"][0]["draft"]["original"]=original;
         }
     } else if(ok) {
-        bool password=kind=="passwords";
-        auto session=password?"passwordSession":"rootSession";
         const auto& edit=job.at("edit");
-        if(!password && edit["operation"]=="delete" && page_value(page_,"taskRoot")==edit["original"]) {
+        if(edit["operation"]=="delete" && page_value(page_,"taskRoot")==edit["original"]) {
             set_text(page_,"taskRoot","");
             auto statuses=page_value(page_,"statusNames"); auto index=page_value(page_,"taskStatus").get<size_t>();
             handle_command(Json{{"op","filterTasks"},{"payload",{{"query",page_value(page_,"taskQuery")},{"root",""},{"status",statuses.at(index)}}}});
         }
-        const bool replace=password?edit["operation"]=="replace":edit["operation"]=="save";
-        Json baseline, expected; std::string original;
-        if(replace && password) {
-            Json record={{"value",edit["value"]}};
-            if(!edit["scopes"].empty()) record["scopes"]=edit["scopes"];
-            original=record.dump(); baseline={{"value",edit["value"]},{"scopes",edit["scopes"]},{"global",edit["scopes"].empty()},{"values",Json::array()}};
-        } else if(replace) {
+        const bool replace=edit["operation"]=="save";
+        Json baseline,expected; std::string original;
+        if(replace) {
             original=utf8(resolve_path(wide(edit["input"].get<std::string>()),options_.data_dir).wstring());
             auto output=edit["output"].get<std::string>(); auto first=output.find_first_not_of(" \t\r\n");
             output=first==std::string::npos?"":output.substr(first,output.find_last_not_of(" \t\r\n")-first+1);
             baseline={{"input",original},{"output",output},{"deep",edit["deep"]},{"paths",Json::array()}};
             expected={{"output",output},{"deep",edit["deep"]}};
+            for(auto& queued:saves_) if(queued["kind"]==kind && queued["key"]==job["key"]) {
+                queued["edit"]["original"]=original; queued["edit"]["expected"]=expected;
+            }
         }
-        if(replace) for(auto& queued:saves_) if(queued["kind"]==kind && queued["key"]==job["key"]) {
-            queued["edit"]["original"]=original;
-            if(!password) queued["edit"]["expected"]=expected;
-        }
-        if(page_value(page_,session)==job["key"]) {
-            Json current=password?Json{{"value",page_value(page_,"passwordValue")},{"scopes",page_value(page_,"scopePaths")},{"global",page_value(page_,"scopeGlobal")},{"values",page_value(page_,"passwordValues")}}:
-                Json{{"input",page_value(page_,"rootInput")},{"output",page_value(page_,"rootOutput")},{"deep",page_value(page_,"rootDeep")},{"paths",page_value(page_,"rootPaths")}};
-            // UI object transport can enumerate keys in a different order.
-            // ordered_json object equality is order-sensitive; compare fields
-            // without copying/normalizing the collection payloads.
+        if(page_value(page_,"rootSession")==job["key"]) {
+            Json current={{"input",page_value(page_,"rootInput")},{"output",page_value(page_,"rootOutput")},{"deep",page_value(page_,"rootDeep")},{"paths",page_value(page_,"rootPaths")}};
             const auto& snapshot=job.at("snapshot");
             bool unchanged=current.size()==snapshot.size();
             for(auto it=current.begin();unchanged && it!=current.end();++it)
                 unchanged=snapshot.contains(it.key()) && snapshot[it.key()]==it.value();
             if(replace) {
-                set_text(page_,password?"passwordOriginal":"rootOriginal",original);
-                set_text(page_,password?"passwordBaseline":"rootBaseline",baseline.dump());
-                if(!password) { auto text=expected.dump(); ui_page_set_json(page_,"rootExpected",text.c_str()); }
-                if(unchanged) {
-                    set_text(page_,password?"passwordValue":"rootInput",baseline[password?"value":"input"]);
-                    if(password) { auto text=baseline["scopes"].dump(); ui_page_set_json(page_,"scopePaths",text.c_str()); }
-                    else set_text(page_,"rootOutput",baseline["output"]);
-                }
+                set_text(page_,"rootOriginal",original); set_text(page_,"rootBaseline",baseline.dump());
+                auto text=expected.dump(); ui_page_set_json(page_,"rootExpected",text.c_str());
+                if(unchanged) { set_text(page_,"rootInput",baseline["input"]); set_text(page_,"rootOutput",baseline["output"]); }
             }
             if(unchanged && job.contains("nextState")) {
                 for(auto it=job["nextState"].begin();it!=job["nextState"].end();++it) { auto text=it.value().dump(); ui_page_set_json(page_,it.key().c_str(),text.c_str()); }
-                if(job["nextState"].value(password?"passwordEditor":"rootEditor",false)) reveal_form(password);
-                if(job["nextState"].contains(password?"passwordEditor":"rootEditor") && !job["nextState"][password?"passwordEditor":"rootEditor"].get<bool>()) {
-                    if(password) { for(auto name:{"passwordOriginal","passwordValue","passwordBaseline"}) set_text(page_,name,""); ui_page_set_json(page_,"scopePaths","[]"); ui_page_set_json(page_,"passwordValues","[]"); }
-                    else { for(auto name:{"rootOriginal","rootInput","rootOutput","rootBaseline"}) set_text(page_,name,""); ui_page_set_json(page_,"rootPaths","[]"); }
+                if(job["nextState"].value("rootEditor",false)) reveal_form();
+                if(job["nextState"].contains("rootEditor") && !job["nextState"]["rootEditor"].get<bool>()) {
+                    for(auto name:{"rootOriginal","rootInput","rootOutput","rootBaseline"}) set_text(page_,name,"");
+                    ui_page_set_json(page_,"rootPaths","[]");
                 }
-                if(job["nextState"].contains("passwordScope")) handle_command(Json{{"op","filterPasswords"},{"payload",{{"query",page_value(page_,"passwordQuery")},{"scope",page_value(page_,"passwordScope")}}}});
                 if(job["nextState"].contains("taskRoot")) {
                     auto statuses=page_value(page_,"statusNames"); auto index=page_value(page_,"taskStatus").get<size_t>();
                     handle_command(Json{{"op","filterTasks"},{"payload",{{"query",page_value(page_,"taskQuery")},{"root",page_value(page_,"taskRoot")},{"status",statuses.at(index)}}}});
@@ -332,11 +380,20 @@ void Application::apply_pending() {
     auto password_delta_patch=patch.value("passwordDelta",Json()); patch.erase("passwordDelta");
     VisualBatch visual(window_);
     auto ack=patch.value("saveAck",Json()); patch.erase("saveAck");
+    const bool cell_ack=!ack.is_null() && ack["job"]["kind"]=="passwords";
+    if(cell_ack) acknowledge_save(ack);
+    Json password_snapshot;
+    if(patch.contains("passwords")) { password_snapshot=std::move(patch["passwords"]); patch.erase("passwords"); }
     if(patch.contains("fields")) bind_controls(patch["fields"]);
     auto action=patch.value("actionError",Json()); patch.erase("actionError");
     for(auto it=patch.begin();it!=patch.end();++it) {
         auto text=it.value().dump();
         if(ui_page_set_json(page_,it.key().c_str(),text.c_str())!=0) throw std::runtime_error("uiBindingFailed");
+    }
+    if(patch.contains("directories")) ui_page_call_json(page_,"syncPasswordDirectory","{}");
+    if(!password_snapshot.is_null()) {
+        auto encoded=password_snapshot.dump();
+        if(ui_page_call_json(page_,"applyPasswords",encoded.c_str())!=0) throw std::runtime_error("passwordBindingFailed");
     }
     if(!task_delta_patch.is_null()) {
         auto encoded=task_delta_patch.dump();
@@ -373,7 +430,8 @@ void Application::apply_pending() {
         }
     }
     if(!action.is_null()) set_error("actionError",action.get<std::string>());
-    if(!ack.is_null()) acknowledge_save(ack);
+    if(!ack.is_null() && !cell_ack) acknowledge_save(ack);
+    if(!ack.is_null()) ui_page_call_json(page_,"prunePasswordDrafts","{}");
     if(patch.contains("fields") || !ack.is_null()) sync_toggles();
     for(auto& id:reset_scroll) {
         auto widget=ui_widget_find_by_id(ui_page_root(page_),id.get<std::string>().c_str());
@@ -418,15 +476,15 @@ void Application::sync_toggles() {
         ui_toggle_set_on(widget,on); ui_widget_destroy(widget);
     }
 }
-void Application::reveal_form(bool password) {
+void Application::reveal_form() {
     ui_window_relayout(window_);
-    auto scroll=ui_widget_find_by_id(ui_page_root(page_),password?"passwordListScroll":"taskListScroll");
+    auto scroll=ui_widget_find_by_id(ui_page_root(page_),"taskListScroll");
     // Core UI exposes programmatic scrolling through this public entry point;
     // it only adjusts the viewport and does not start a debug server.
     if(scroll) { ui_debug_scroll_set(scroll,0); ui_widget_destroy(scroll); }
-    auto input=ui_widget_find_by_id(ui_page_root(page_),password?"passwordValue":"rootInput");
+    auto input=ui_widget_find_by_id(ui_page_root(page_),"rootInput");
     if(input) { ui_window_focus_widget(window_,input); ui_widget_destroy(input); }
-    motion::enter(window_,password?"passwordForm":"rootForm",0,12);
+    motion::enter(window_,"rootForm",0,12);
 }
 void Application::bind_controls(const Json& fields) {
     for(auto& field:fields) {
@@ -558,17 +616,40 @@ void Application::handle_command(Json command) {
         if(id=="configBlocks") { VisualBatch visual(window_); ui_window_relayout(window_); motion::enter(window_,id.c_str(),0,12); }
         return;
     }
-    if(op=="revealForm") { reveal_form(p.value("kind",std::string())=="password"); return; }
+    if(op=="revealForm") { reveal_form(); return; }
+    if(op=="clearPasswordError") { save_error("@password:"+p.at("id").get<std::string>(),""); return; }
+    if(op=="discardPassword") {
+        auto encoded=p.at("id").dump();
+        if(ui_page_call_json(page_,"discardPassword",encoded.c_str())!=0) throw std::runtime_error("passwordBindingFailed");
+        return;
+    }
+    if(op=="focusPassword") {
+        auto id=p.at("id").get<std::string>(), part=p.at("part").get<std::string>();
+        auto* window=ui::GetContext().GetWindow(window_);
+        if(part=="none") {
+            auto* focused=window->FocusedWidget();
+            if(focused && focused->id=="password-input-"+id) window->FocusWidget(nullptr,false);
+            return;
+        }
+        if(part!="value" || page_value(page_,"passwordCell")!=id) return;
+        if(p.value("top",false)) {
+            auto scroll=ui_widget_find_by_id(ui_page_root(page_),"passwordListScroll");
+            if(scroll) { ui_debug_scroll_set(scroll,0); ui_widget_destroy(scroll); }
+        }
+        ui_window_relayout(window_);
+        auto* target=window->Root()->FindById("password-input-"+id);
+        if(target) window->FocusWidget(target,false);
+        return;
+    }
     if(op=="browse") {
         auto selected=choose_directory(hwnd_);
         if(!selected.empty()) {
             auto target=p.value("target",std::string());
-            if(target=="scopePaths" || (target=="rootInput" && page_value(page_,"rootOriginal")=="")) {
-                const char* field=target=="scopePaths"?"scopePaths":"rootPaths";
+            if(target=="rootInput" && page_value(page_,"rootOriginal")=="") {
+                const char* field="rootPaths";
                 auto paths=page_value(page_,field), value=Json(utf8(selected.wstring()));
                 if(std::find(paths.begin(),paths.end(),value)==paths.end()) paths.push_back(value);
                 auto text=paths.dump(); ui_page_set_json(page_,field,text.c_str());
-                if(target=="scopePaths") ui_page_set_bool(page_,"scopeGlobal",false);
             } else if(target=="listEntry") {
                 set_text(page_,"listEntry",utf8(selected.wstring()));
             } else if(target=="rootInput" || target=="rootOutput") set_text(page_,target.c_str(),utf8(selected.wstring()));
@@ -619,8 +700,12 @@ void Application::handle_command(Json command) {
 LRESULT CALLBACK Application::subclass(HWND hwnd,UINT message,WPARAM wparam,LPARAM lparam,UINT_PTR,DWORD_PTR data) {
     auto* self=reinterpret_cast<Application*>(data);
     try {
+        if((message==WM_MOUSEWHEEL || message==WM_MOUSEHWHEEL || message==WM_KILLFOCUS) && page_value(self->page_,"passwordCell")!="") {
+            ui_window_focus_widget(self->window_,0);
+            self->dispatch();
+        }
         if(message==WM_CLOSE && !self->stopping_) {
-            if(page_value(self->page_,"listTarget")!="" || page_value(self->page_,"rootDirty")==true || page_value(self->page_,"passwordDirty")==true) {
+            if(page_value(self->page_,"listTarget")!="" || page_value(self->page_,"rootDirty")==true) {
                 self->set_error("closeError","unsavedEntries"); return 0;
             }
             if(!self->closing_ || (self->active_save_.is_null() && self->saves_.empty() && page_value(self->page_,"saveErrors").empty())) {
@@ -832,10 +917,20 @@ void Application::work() {
                     } else if(op=="commit") {
                         auto kind=p.at("kind").get<std::string>();
                         PasswordSaveSnapshot saved_passwords;
+                        Json password_edits=Json::array();
+                        if(kind=="passwords") {
+                            password_edits.push_back(p.at("edit"));
+                            const auto& edit=p.at("edit");
+                            if(edit["operation"]=="replace" && edit["values"].size()>1) {
+                                auto tail=edit["values"]; tail.erase(tail.begin());
+                                password_edits.push_back({{"operation","addMany"},{"values",std::move(tail)},{"scopes",edit["scopes"]}});
+                            }
+                        }
                         auto result=save_changes(dir,p.value("fields",Json::array()),
-                            kind=="passwords"?Json::array({p.at("edit")}):Json::array(),
+                            password_edits,
                             kind=="roots"?Json::array({p.at("edit")}):Json::array(),
                             kind=="passwords"?&saved_passwords:nullptr);
+                        std::string password_original;
                         for(auto& section:result["saved"]) {
                             if(section=="config") flags|=Config;
                             if(section=="passwords") {
@@ -850,15 +945,17 @@ void Application::work() {
                                 // A single replacement preserves ordering and filtered count
                                 // in the unfiltered saved-password view.
                                 const auto& edit=p.at("edit");
+                                if(!saved_passwords.record.is_null()) password_original=saved_passwords.record.dump();
                                 if(edit.value("operation",std::string())=="replace" &&
-                                   view.password_query.empty() && view.password_scope=="@all" &&
+                                   !saved_passwords.count_changed && !saved_passwords.record.is_null() &&
+                                   edit["values"].size()<=1 && view.password_query.empty() && view.password_scope=="@all" &&
                                    !passwords_changed && previous_patch.contains("passwords")) {
                                     Json record={{"value",edit.value("value",std::string())}};
                                     auto scopes=edit.value("scopes",Json::array());
                                     if(!scopes.empty()) record["scopes"]=std::move(scopes);
                                     auto projected=password_rows(Json{{"passwords",Json::array({std::move(record)})}},view,language);
                                     if(!projected["rows"].empty())
-                                        password_delta={{"original",edit.at("original")},{"row",projected["rows"][0]}};
+                                        password_delta={{"scope",view.password_scope},{"original",edit.at("original")},{"row",projected["rows"][0]}};
                                 } else password_delta=Json();
                                 passwords_changed=true;
                             }
@@ -866,6 +963,10 @@ void Application::work() {
                         }
                         auto message=result["error"].get<std::string>();
                         edit_feedback["saveAck"]={{"job",p},{"ok",message.empty()},{"error",message}};
+                        if(kind=="passwords") {
+                            edit_feedback["saveAck"]["passwordOriginal"]=password_original;
+                            edit_feedback["saveAck"]["passwordRebases"]=std::move(saved_passwords.rebases);
+                        }
                     } else if(op=="cli") {
                         if(!options_.allow_cli) throw std::runtime_error("cliUnbound");
                         auto action=p.value("action",std::string());

@@ -214,6 +214,43 @@ void editing(Fixture& f) {
     assert(read_file(p)==before); // A bad record cannot commit a partial batch.
     edit_password(p,"addMany",Json(),Json::array({Json{{"value"," # batch "}},Json{{"value"," # batch "}},Json{{"value","other"}}}));
     assert(read_json(p)["passwords"].size()==4 && read_json(p)["clipboard_history"].back()=="latest");
+    // Add, replacement and scope changes share runtime-compatible coverage:
+    // globals subsume scoped copies; distinct scopes share one stored record.
+    Json scope_a={{"value","same"},{"scopes",{"C:/A"}}},scope_b={{"value","same"},{"scopes",{"D:/B"}}};
+    Json document={{"passwords",{scope_a,scope_b}},{"clipboard_history",{"retained"}}},retained;
+    auto apply=[&](const char* operation,const Json& old,const char* value,Json scopes) {
+        document=apply_password_changes(std::move(document),Json::array({Json{{"operation",operation},{"original",old.is_null()?"":old.dump()},{"value",value},{"values",{value}},{"scopes",scopes}}}),&retained);
+    };
+    apply("addMany",Json(),"same",{"c:\\a\\child"});
+    assert(document["passwords"]==Json::array({Json{{"value","same"},{"scopes",{"C:/A","D:/B"}}}}) && retained.is_null());
+    auto combined=document["passwords"][0];
+    document=apply_password_changes(std::move(document),Json::array({Json{{"operation","replace"},{"original",combined.dump()},{"scope","D:/B"},{"value","same"},{"scopes",{"C:/A"}}}}),&retained);
+    assert(document["passwords"]==Json::array({scope_a}) && retained.is_null());
+    apply("addMany",Json(),"same",Json::array()); assert(document["passwords"]==Json::array({Json{{"value","same"}}}) && !retained.is_null());
+    apply("addMany",Json(),"same",{"D:/B"}); assert(document["passwords"].size()==1 && retained.is_null());
+    apply("addMany",Json(),"different",{"D:/B"});
+    apply("replace",document["passwords"].back(),"same",{"D:/B"});
+    assert(document["passwords"].size()==1 && retained.is_null() && document["clipboard_history"][0]=="retained");
+    Json earlier={{"value","earlier"}},existing={{"value","same"}};
+    document["passwords"]=Json::array({earlier,existing});
+    apply("replace",earlier,"same",Json::array());
+    assert(document["passwords"]==Json::array({existing}) && retained.is_null());
+    // A multi-scope legacy record is edited/deleted only in the selected
+    // directory; other associations survive the same atomic transaction.
+    Json multi={{"value","old"},{"scopes",{"C:/A","D:/B"}}};
+    document={{"passwords",{multi}}};
+    document=apply_password_changes(std::move(document),Json::array({Json{{"operation","replace"},{"original",multi.dump()},{"scope","c:\\a"},{"value","new"},{"scopes",{"C:/A"}}}}),&retained);
+    assert(retained==Json({{"value","new"},{"scopes",{"C:/A"}}}));
+    assert(document["passwords"].size()==2 && document["passwords"][1]==Json({{"value","old"},{"scopes",{"D:/B"}}}));
+    auto selected=document["passwords"][0];
+    document=apply_password_changes(std::move(document),Json::array({Json{{"operation","removeScope"},{"original",selected.dump()},{"scope","C:/A"}}}));
+    assert(document["passwords"]==Json::array({Json{{"value","old"},{"scopes",{"D:/B"}}}}));
+    edit_password(p,"add",Json(),Json{{"value","shared stored"},{"scopes",{"C:/A"}}});
+    edit_password(p,"add",Json(),Json{{"value","shared stored"},{"scopes",{"D:/B","c:\\a\\"}}});
+    auto stored=read_json(p)["passwords"];
+    assert(std::count_if(stored.begin(),stored.end(),[](const Json& row){return row["value"]=="shared stored";})==1);
+    auto shared=std::find_if(stored.begin(),stored.end(),[](const Json& row){return row["value"]=="shared stored";});
+    assert((*shared)["scopes"]==Json::array({"C:/A","D:/B"}));
     auto c=f.dir/"sunpack_config.json";
     atomic_write(c,R"({"watch":{"out_dir":"."},"unknown":{"large":9007199254740993,"huge":123456789012345678901234567890},"filters":[{"name":"x","rules":["*","r",3]}]})");
     save_config_field(c,"/watch/out_dir","\".\"","string","中文",false);
@@ -458,6 +495,13 @@ void batch_editing(Fixture& fixture) {
     assert(read_json(passwords)["passwords"][0]["value"]=="fast-delta");
     assert(read_json(passwords)["clipboard_history"][0]=="latest background history");
     assert(read_roots(roots).entries[0].deep && read_file(roots).find("# retained")!=std::string::npos);
+    PasswordSaveSnapshot joined;
+    auto previous_record=snapshot.record.dump(),joined_scope=utf8((dir.parent_path()/L"joined-scope").wstring());
+    auto joined_result=save_changes(dir,Json::array(),Json::array({Json{{"operation","addMany"},{"values",{"fast-delta"}},{"scopes",{joined_scope}}}}),Json::array(),&joined);
+    assert(joined_result["error"]=="" && !joined.count_changed);
+    assert(joined.document["passwords"].size()==1 && joined.record["scopes"].size()==2);
+    assert(joined.rebases.size()==1 && joined.rebases[0]["originals"]==Json::array({previous_record}) && joined.rebases[0]["record"]==joined.record);
+    assert(password_matches_scope(joined.record,utf8(dir.wstring())) && password_matches_scope(joined.record,joined_scope));
     // Batch folder additions preflight together and ignore identical duplicates.
     auto first=dir/"first", second=dir/"second"; fs::create_directory(first); fs::create_directory(second);
     Json batch=Json::array({Json{{"operation","addMany"},{"inputs",{utf8(first.wstring()),utf8((dir/"missing").wstring())}},{"output",""},{"deep",true}}});
@@ -470,9 +514,10 @@ void batch_editing(Fixture& fixture) {
     View view;
     auto saved=read_json(passwords);
     saved["passwords"].push_back({{"value","everywhere"}});
-    assert(password_rows(saved,view)["total"]==2);
-    view.password_query=utf8(dir.wstring());
-    auto matches=password_rows(saved,view); assert(matches["total"]==1 && matches["rows"][0]["scopes"]==utf8(dir.wstring()));
+    assert(password_rows(saved,view)["total"]==1 && password_rows(saved,view)["rows"][0]["value"]=="everywhere");
+    view.password_scope=utf8(dir.wstring());
+    auto matches=password_rows(saved,view); assert(matches["total"]==1 && matches["rows"][0]["value"]=="fast-delta");
+    view.password_scope=utf8((dir/"child").wstring()); assert(password_rows(saved,view)["total"]==0);
 }
 }
 int wmain(int argc,wchar_t** argv) {

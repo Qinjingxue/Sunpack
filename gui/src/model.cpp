@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <chrono>
 #include <set>
+#include <map>
 #include <sstream>
 #include <stdexcept>
 #include <iomanip>
@@ -41,6 +42,13 @@ std::wstring scope_key(const fs::path& path) {
     auto key=path_key(path);
     while(!key.empty() && (key.back()==L'\\' || key.back()==L'/')) key.pop_back();
     return key;
+}
+bool password_matches_scope_key(const Json& record,const std::wstring& selected) {
+    if(record.is_null()) return false;
+    if(selected.empty()) return !record.contains("scopes");
+    return record.contains("scopes") && std::any_of(record["scopes"].begin(),record["scopes"].end(),[&](const Json& path) {
+        return scope_key(wide(path.get<std::string>()))==selected;
+    });
 }
 void check_text(const Json& value) {
     if (!value.is_string() || value.get_ref<const std::string&>().find('\0') != std::string::npos)
@@ -152,6 +160,9 @@ std::string task_time(const Task& task) {
     std::strftime(text,sizeof(text),"%Y-%m-%d %H:%M:%S",&local);
     return text;
 }
+}
+bool password_matches_scope(const Json& record,const std::string& scope) {
+    return password_matches_scope_key(record,scope.empty() || scope=="@all"?std::wstring():scope_key(wide(scope)));
 }
 Json parse_json(const std::string& text) {
     std::vector<std::set<std::string>> fields;
@@ -270,21 +281,87 @@ void upgrade_config_file(const fs::path& path) {
     }
     if(changed) { parse_json(source); atomic_write(path,source); }
 }
-static void patch_password(Json& j, const std::string& op, const Json& original,
+// Scope identity and ancestry match the runtime's directory-scoped lookup.
+// Only values touched by this edit are normalized; unrelated legacy entries
+// and significant password whitespace remain intact.
+static Json deduplicate_passwords(Json& records, const std::unordered_set<std::string>& values, size_t target, size_t existing_count) {
+    struct Scope { Json path; bool other = false; };
+    struct Group {
+        std::vector<size_t> rows;
+        std::map<std::wstring,Scope> scopes;
+        bool global = false, other_global = false;
+    };
+    std::unordered_map<std::string,Group> groups;
+    for(size_t i=0;i<records.size();++i) {
+        const auto& value=records[i]["value"].get_ref<const std::string&>();
+        if(!values.count(value)) continue;
+        auto& group=groups[value]; group.rows.push_back(i);
+        const bool other=i!=target && i<existing_count;
+        if(!records[i].contains("scopes")) { group.global=true; if(other) group.other_global=true; }
+        else for(auto& path:records[i]["scopes"]) {
+            auto entry=group.scopes.try_emplace(scope_key(wide(path.get<std::string>())),Scope{path}).first;
+            if(other) { if(!entry->second.other) entry->second.path=path; entry->second.other=true; }
+        }
+    }
+    std::vector<bool> keep(records.size(),true);
+    Json saved;
+    for(auto& [value,group]:groups) {
+        auto covered=[&](std::wstring key,bool other) {
+            for(;;) {
+                auto found=group.scopes.find(key);
+                if(found!=group.scopes.end() && (!other || found->second.other)) return true;
+                auto slash=key.rfind(L'\\');
+                if(slash==std::wstring::npos) return false;
+                key.resize(slash);
+            }
+        };
+        auto inherited=[&](const std::wstring& key) {
+            auto slash=key.rfind(L'\\');
+            return slash!=std::wstring::npos && covered(key.substr(0,slash),false);
+        };
+        const bool selected=std::find(group.rows.begin(),group.rows.end(),target)!=group.rows.end();
+        bool contributes=false,visible=false;
+        if(selected) {
+            if(!records[target].contains("scopes")) { contributes=!group.other_global; visible=true; }
+            else if(!group.global) for(auto& path:records[target]["scopes"]) {
+                auto key=scope_key(wide(path.get<std::string>()));
+                if(!group.other_global && !covered(key,true)) contributes=true;
+                if(!inherited(key)) visible=true;
+            }
+        }
+        // Keep an existing row's file position when a new scope joins it.
+        auto canonical=group.rows.front();
+        if(canonical==target) for(auto index:group.rows) if(index!=target && index<existing_count) { canonical=index; break; }
+        Json record={{"value",value}};
+        if(!group.global) {
+            Json paths=Json::array();
+            for(auto& [key,scope]:group.scopes) if(!inherited(key)) paths.push_back(std::move(scope.path));
+            record["scopes"]=std::move(paths);
+        }
+        records[canonical]=std::move(record);
+        for(auto i:group.rows) if(i!=canonical) keep[i]=false;
+        if(selected && contributes && visible) saved=records[canonical];
+    }
+    size_t out=0;
+    for(size_t i=0;i<records.size();++i) if(keep[i]) { if(out!=i) records[out]=std::move(records[i]); ++out; }
+    records.erase(records.begin()+out,records.end());
+    return saved;
+}
+static Json patch_password(Json& j, const std::string& op, const Json& original,
     const Json& replacement, const std::string& scope) {
     auto& records = j["passwords"];
-    if (op == "add") records.push_back(replacement);
+    const auto previous_count=records.size();
+    size_t target=records.size();
+    std::unordered_set<std::string> touched;
+    if (op == "add") { records.push_back(replacement); }
     else if(op=="addMany") {
         if(!replacement.is_array() || replacement.empty()) throw std::runtime_error("batchEmpty");
-        // One production mutex and one atomic write for the complete batch. Exact
-        // duplicates are ignored; whitespace and # are part of the password.
-        std::set<std::string> existing;
-        for(auto& record:records) existing.insert(record.dump());
-        for(auto& record:replacement) if(existing.insert(record.dump()).second) records.push_back(record);
+        for(auto& record:replacement) records.push_back(record);
     }
     else {
         auto it = std::find(records.begin(), records.end(), original);
         if (it == records.end()) throw std::runtime_error("passwordChanged");
+        target=size_t(it-records.begin());
         if (op == "delete") records.erase(it);
         else if (op == "removeScope") {
             if (!it->contains("scopes") || scope.empty()) throw std::runtime_error("scopeNotDirect");
@@ -295,17 +372,38 @@ static void patch_password(Json& j, const std::string& op, const Json& original,
             if (end == scopes.end()) throw std::runtime_error("scopeInherited");
             scopes.erase(end, scopes.end());
             if (scopes.empty()) records.erase(it);
-        } else if (op == "replace") *it = replacement;
+        } else if (op == "replace") {
+            Json remaining;
+            if(!scope.empty()) {
+                if(!it->contains("scopes")) throw std::runtime_error("scopeNotDirect");
+                remaining=*it;
+                auto& paths=remaining["scopes"];
+                auto end=std::remove_if(paths.begin(),paths.end(),[selected=scope_key(wide(scope))](const Json& path) {
+                    return scope_key(wide(path.get<std::string>()))==selected;
+                });
+                if(end==paths.end()) throw std::runtime_error("scopeInherited");
+                paths.erase(end,paths.end());
+            }
+            *it=replacement;
+            // Editing one displayed scope must preserve all other scope links.
+            if(!remaining.is_null() && !remaining["scopes"].empty()) records.push_back(std::move(remaining));
+        }
         else throw std::runtime_error("passwordOperationUnknown");
     }
     validate_passwords(j);
+    if(!original.is_null()) touched.insert(original["value"].get<std::string>());
+    if(op=="addMany") for(auto& record:replacement) touched.insert(record["value"].get<std::string>());
+    else if(op=="add" || op=="replace") touched.insert(replacement["value"].get<std::string>());
+    if(op!="add" && op!="addMany" && op!="replace") target=records.size();
+    return deduplicate_passwords(records,touched,target,op=="addMany"?previous_count:records.size());
 }
 void edit_password(const fs::path& p,const std::string& op,const Json& original,const Json& replacement,const std::string& scope) {
     FileMutex lock(p); auto document=read_json(p); validate_passwords(document);
     patch_password(document,op,original,replacement,scope); atomic_write(p,document.dump(2)+"\n");
 }
-Json apply_password_changes(Json document,const Json& edits) {
+Json apply_password_changes(Json document,const Json& edits,Json* saved_record) {
     validate_passwords(document);
+    bool first=true;
     for(auto& edit:edits) {
         Json replacement={{"value",edit.value("value",std::string())}};
         auto scopes=edit.value("scopes",Json::array()); if(!scopes.empty()) replacement["scopes"]=scopes;
@@ -316,7 +414,9 @@ Json apply_password_changes(Json document,const Json& edits) {
             replacement=std::move(batch);
         }
         auto original=edit.value("original",std::string());
-        patch_password(document,op,original.empty()?Json():parse_json(original),replacement,edit.value("scope",std::string()));
+        auto record=patch_password(document,op,original.empty()?Json():parse_json(original),replacement,edit.value("scope",std::string()));
+        if(first && saved_record) *saved_record=std::move(record);
+        first=false;
     }
     return document;
 }
@@ -402,6 +502,9 @@ Json save_changes(const fs::path& dir,const Json& fields,const Json& passwords,c
     struct Write { std::string section; fs::path path; std::string text; };
     std::vector<Write> writes;
     Json committed_passwords;
+    Json saved_record;
+    Json password_rebases=Json::array();
+    bool password_count_changed=false;
     std::unique_ptr<FileMutex> config_lock,password_lock,roots_lock;
     std::string section;
     try {
@@ -412,7 +515,34 @@ Json save_changes(const fs::path& dir,const Json& fields,const Json& passwords,c
         if(!fields.empty()) { section="config"; auto path=dir/"sunpack_config.json"; writes.push_back({section,path,patch_config(read_file(path),fields)}); }
         if(!passwords.empty()) {
             section="passwords"; auto path=dir/"builtin_passwords.json";
-            committed_passwords=apply_password_changes(read_json(path),passwords);
+            auto current=read_json(path); auto count=current["passwords"].size();
+            std::unordered_map<std::string,std::vector<std::string>> originals;
+            if(password_snapshot) {
+                std::unordered_set<std::string> affected;
+                for(auto& edit:passwords) {
+                    if(edit.contains("value") && edit["value"].is_string()) affected.insert(edit["value"].get<std::string>());
+                    if(edit.contains("values")) for(auto& value:edit["values"]) if(value.is_string()) affected.insert(value.get<std::string>());
+                    auto original=edit.value("original",std::string());
+                    if(!original.empty()) affected.insert(parse_json(original)["value"].get<std::string>());
+                }
+                for(auto& record:current["passwords"]) {
+                    const auto& value=record["value"].get_ref<const std::string&>();
+                    if(affected.count(value)) originals[value].push_back(record.dump());
+                }
+            }
+            committed_passwords=apply_password_changes(std::move(current),passwords,&saved_record);
+            if(!originals.empty()) {
+                std::unordered_map<std::string,const Json*> records;
+                for(auto& record:committed_passwords["passwords"]) records.emplace(record["value"].get<std::string>(),&record);
+                for(auto& [value,previous]:originals) {
+                    auto found=records.find(value);
+                    const auto record=found==records.end()?Json():*found->second;
+                    const auto encoded=record.is_null()?std::string():record.dump();
+                    previous.erase(std::remove(previous.begin(),previous.end(),encoded),previous.end());
+                    if(!previous.empty()) password_rebases.push_back({{"originals",std::move(previous)},{"record",record}});
+                }
+            }
+            password_count_changed=count!=committed_passwords["passwords"].size();
             writes.push_back({section,path,committed_passwords.dump(2)+"\n"});
         }
         if(!roots.empty()) { section="roots"; auto path=dir/"sunpack_watch_roots.txt"; writes.push_back({section,path,roots_text(apply_root_changes(read_roots(path),dir,roots))}); }
@@ -421,6 +551,9 @@ Json save_changes(const fs::path& dir,const Json& fields,const Json& passwords,c
             if(section=="passwords" && password_snapshot) {
                 password_snapshot->document=std::move(committed_passwords);
                 password_snapshot->file_text=std::move(write.text);
+                password_snapshot->record=std::move(saved_record);
+                password_snapshot->rebases=std::move(password_rebases);
+                password_snapshot->count_changed=password_count_changed;
             }
         }
     } catch(const ConfigEditError& error) { result["error"]=error.what(); result["section"]=section; result["field"]=error.pointer; }
@@ -718,19 +851,17 @@ Json password_rows(const Json& passwords,const View& v,const std::string& langua
     Json rows=Json::array();
     if(v.password_scope=="@history") {
         for(auto& p:passwords.value("clipboard_history",Json::array())) if(contains(p.get<std::string>(),v.password_query))
-            rows.push_back({{"id",std::to_string(rows.size())},{"value",p},{"original",""},{"scopes",""},{"scopePaths",Json::array()}});
+            rows.push_back({{"id",std::to_string(rows.size())},{"value",p},{"original",""}});
     } else {
+        const auto selected=v.password_scope=="@all"?std::wstring():scope_key(wide(v.password_scope));
         for(auto& p:passwords.value("passwords",Json::array())) {
-            std::string scopes;
-            if(p.contains("scopes")) for(auto& s:p["scopes"]) {
-                auto scope=s.get<std::string>(); if(!scopes.empty()) scopes+="\n"; scopes+=scope;
-            }
-            if(!contains(p["value"].get<std::string>()+"\n"+(scopes.empty()?tr("allFolders",language):scopes),v.password_query)) continue;
-            rows.push_back({{"id",p.dump()+"#"+std::to_string(rows.size())},{"value",p["value"]},{"original",p.dump()},{"scopes",scopes},{"scopePaths",p.value("scopes",Json::array())}});
+            if(!password_matches_scope_key(p,selected)) continue;
+            if(!contains(p["value"].get<std::string>(),v.password_query)) continue;
+            rows.push_back({{"id",p.dump()+"#"+std::to_string(rows.size())},{"value",p["value"]},{"original",p.dump()}});
         }
     }
     const auto total=rows.size();
-    return {{"rows",std::move(rows)},{"total",total}};
+    return {{"rows",std::move(rows)},{"total",total},{"scope",v.password_scope}};
 }
 Json config_fields(const Json& config,const std::string& source,const std::string& language) {
     Json rows=Json::array();

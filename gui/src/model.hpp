@@ -9,6 +9,7 @@ using Json = nlohmann::ordered_json;
 Json parse_json(const std::string& text);
 Json read_json(const fs::path& path);
 void validate_passwords(const Json& document);
+bool password_matches_scope(const Json& record, const std::string& scope);
 void save_config_field(const fs::path& path, const std::string& pointer, const std::string& original,
     const std::string& type, const std::string& text, bool boolean);
 // Installer-only upgrade: remove retired fields without reserializing user values.
@@ -22,11 +23,11 @@ WatchRoots parse_roots(const std::string& text, const fs::path& base);
 WatchRoots read_roots(const fs::path& path);
 void edit_root(const fs::path& path, const std::string& operation, const std::string& original,
     const std::string& input, const std::string& output, bool deep);
-Json apply_password_changes(Json document, const Json& edits);
+Json apply_password_changes(Json document, const Json& edits, Json* saved_record = nullptr);
 WatchRoots apply_root_changes(WatchRoots roots, const fs::path& base, const Json& edits);
 // The saved document is already parsed while validating the write; return it
 // to the GUI instead of immediately re-reading and re-projecting the file.
-struct PasswordSaveSnapshot { Json document; std::string file_text; };
+struct PasswordSaveSnapshot { Json document; std::string file_text; Json record, rebases; bool count_changed = false; };
 // Preflight every file under the existing locks, then replace each file once.
 // A write failure reports completed sections so remaining drafts can be retried.
 Json save_changes(const fs::path& directory, const Json& fields, const Json& passwords,

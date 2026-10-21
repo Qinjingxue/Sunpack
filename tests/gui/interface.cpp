@@ -202,7 +202,36 @@ void search_config(Application& app,const wchar_t* query) {
         state(app.page(),"requests").empty() && !state(app.page(),"dispatch").get<bool>();},"Configuration search");
     ui_window_relayout(app.window());
 }
-// Exercise the explicit import boundary shared by rule/password/folder lists.
+void edit_password(Application& app,const std::string& id,const wchar_t* value) {
+    click(app,("password-text-"+id).c_str());
+    pump([&]{auto* f=ui::GetContext().GetWindow(app.window())->FocusedWidget(); return f&&f->id=="password-input-"+id;},"Password cell focus");
+    assert(ui_debug_key_mod(app.window(),'A',1,0,0)==0);
+    assert(ui_debug_type_char(app.window(),8)==0);
+    assert(ui_debug_type_text(app.window(),value)==0);
+}
+void paste_password(Application& app,const wchar_t* value) {
+    // Exercise the actual Ctrl+V path, including its single multi-line input
+    // event. Restore the user's clipboard formats after the synchronous paste.
+    auto owner=ui::GetContext().GetWindow(app.window())->Handle();
+    assert(OpenClipboard(owner));
+    // Eager copies are essential: OleGetClipboard's wrapper refers to the live
+    // clipboard and cannot restore its old contents after EmptyClipboard.
+    std::vector<std::pair<UINT,HANDLE>> previous;
+    for(UINT format=0;(format=EnumClipboardFormats(format))!=0;) {
+        if(auto original=GetClipboardData(format))
+            if(auto copy=OleDuplicateData(original,format,0)) previous.emplace_back(format,copy);
+    }
+    EmptyClipboard();
+    size_t bytes=(wcslen(value)+1)*sizeof(wchar_t);
+    auto memory=GlobalAlloc(GMEM_MOVEABLE,bytes); assert(memory);
+    auto data=GlobalLock(memory); assert(data); memcpy(data,value,bytes); GlobalUnlock(memory);
+    assert(SetClipboardData(CF_UNICODETEXT,memory)); CloseClipboard();
+    assert(ui_debug_key_mod(app.window(),'V',1,0,0)==0);
+    assert(OpenClipboard(owner)); EmptyClipboard();
+    for(auto [format,copy]:previous) assert(SetClipboardData(format,copy));
+    CloseClipboard();
+}
+// Exercise the explicit import boundary shared by rule/folder lists.
 void import_entries(Application& app,const wchar_t* text) {
     click(app,"importList"); click(app,"listImportText");
     assert(ui_debug_type_text(app.window(),text)==0);
@@ -1124,22 +1153,33 @@ int wmain(int argc,wchar_t** argv) {
             assert(rect(app,"passwordSearch").right<add_bounds.left);
             assert(add_bounds.left<saved_bounds.left && add_bounds.top==saved_bounds.top);
             assert(state(app.page(),"texts")["back"]=="返回");
-            click(app,"newPassword"); assert(state(app.page(),"passwordEditor")==true);
-            click(app,"managePasswords"); import_entries(app,L"添加的密码\n  #批量  \n\n添加的密码");
-            assert(state(app.page(),"listRows").size()==3);
-            click(app,"saveList"); assert(state(app.page(),"passwordValues").size()==3);
+            click(app,"newPassword");
+            auto new_id=state(app.page(),"passwordCell").get<std::string>();
+            pump([&]{auto* f=ui::GetContext().GetWindow(app.window())->FocusedWidget(); return f&&f->id=="password-input-"+new_id;},"New password focus");
+            auto* empty=dynamic_cast<ui::TextInputWidget*>(ui::GetContext().GetWindow(app.window())->FocusedWidget());
+            assert(empty && empty->Placeholder()==L"可粘贴多行内容");
+            assert(empty->focused && !ui::ShowFocusRing());
             screenshot(app,L"passwords.png");
             ui_window_set_size(app.window(),850,560);
             screenshot(app,L"password-editor-small.png");
             assert(read_json(dir/"builtin_passwords.json")["passwords"].size()==1);
-            click(app,"finishPassword"); finish_input(app);
-            try { pump([&]{return read_json(dir/"builtin_passwords.json")["passwords"].size()==3;}); }
-            catch(...) { std::cerr<<"Save password: "<<state(app.page(),"actionError")<<"\n"; throw; }
+            paste_password(app,L"添加的密码\r\n  #批量  \n\n添加的密码");
+            finish_input(app);
+            try { pump([&]{return state(app.page(),"passwords")["total"]==3;},"Pasted password batch"); }
+            catch(...) {
+                for(auto key:{"passwords","passwordCell","passwordDrafts","requests","saving","actionError","errors"}) std::cerr<<key<<"="<<state(app.page(),key)<<'\n';
+                std::cerr<<"disk="<<read_json(dir/"builtin_passwords.json")<<'\n'; throw;
+            }
+            assert(state(app.page(),"passwordCell")=="");
+            assert(state(app.page(),"passwordNew").empty());
+            assert(state(app.page(),"passwordDrafts").empty());
             assert(read_json(dir/"builtin_passwords.json")["passwords"][2]["value"]=="  #批量  ");
-            std::cerr<<"Password saved\n";
-            try { pump([&]{return state(app.page(),"passwords")["total"]==3;}); }
-            catch(...) { std::cerr<<"Password model: "<<state(app.page(),"passwords")<<" errors="<<state(app.page(),"errors")<<"\n"; throw; }
-            std::cerr<<"Password model updated\n";
+            std::cerr<<"Password paste saved\n";
+            auto before_blank=read_json(dir/"builtin_passwords.json");
+            click(app,"newPassword"); ui_debug_pump(); click(app,"passwordSearch"); finish_input(app);
+            assert(state(app.page(),"passwordNew").empty() && state(app.page(),"passwordDrafts").empty());
+            assert(read_json(dir/"builtin_passwords.json")==before_blank);
+            std::cerr<<"Blank password removed\n";
             // Creation actions persist immediately. Unrelated incomplete forms
             // never join another field or record's automatic write.
             auto pending_root=dir/L"pending-root", pending_second=dir/L"pending-second"; fs::create_directory(pending_root); fs::create_directory(pending_second);
@@ -1158,86 +1198,206 @@ int wmain(int argc,wchar_t** argv) {
             assert(state(app.page(),"rootEditor")==false);
             assert(read_file(dir/"sunpack_watch_roots.txt")!=disk_roots);
             click(app,"tabPasswords"); pump([&]{return state(app.page(),"tab")=="passwords";});
-            click(app,"newPassword"); click(app,"passwordValue"); ui_debug_type_text(app.window(),L"pending scoped");
-            click(app,"scopeSelected"); click(app,"manageScopes");
-            click(app,"listEntry"); ui_debug_type_text(app.window(),pending_root.c_str()); click(app,"putListEntry"); click(app,"saveList");
-            click(app,"finishPassword"); finish_input(app);
-            click(app,"newPassword"); click(app,"passwordValue"); ui_debug_type_text(app.window(),L"pending global");
-            click(app,"scopeSelected"); click(app,"finishPassword");
-            assert(state(app.page(),"saveErrors")["@passwords"]=="scopeRequired");
-            assert(read_json(dir/"builtin_passwords.json")["passwords"].size()==4);
-            click(app,"scopeGlobal");
-            click(app,"finishPassword"); finish_input(app);
-            click(app,"tabConfig"); pump([&]{return state(app.page(),"tab")=="config";});
-            search_config(app,L"out_dir");
-            output=ui_widget_find_by_id(ui_page_root(app.page()),"input-/watch/out_dir"); ui_text_input_set_text(output,L""); ui_widget_destroy(output);
-            click(app,"input-/watch/out_dir"); ui_debug_type_text(app.window(),L"batch-output");
-            auto background=read_json(dir/"builtin_passwords.json"); assert(background["passwords"].size()==5);
-            background["clipboard_history"].push_back("external while editing"); atomic_write(dir/"builtin_passwords.json",background.dump());
-            screenshot(app,L"automatic-save.png");
-            finish_input(app);
-            assert(read_json(dir/"sunpack_config.json")["watch"]["out_dir"]=="batch-output");
-            assert(read_roots(dir/"sunpack_watch_roots.txt").entries.size()==3);
-            auto committed=read_json(dir/"builtin_passwords.json"); assert(committed["passwords"].size()==5);
-            assert(committed["passwords"][3]["scopes"][0]==utf8(pending_root.wstring()));
-            assert(committed["clipboard_history"].back()=="external while editing");
-            click(app,"tabPasswords"); pump([&]{return state(app.page(),"tab")=="passwords";});
-            click(app,"passwordSearch"); ui_debug_type_text(app.window(),L"pending scoped");
-            pump([&]{return state(app.page(),"passwords")["total"]==1;});
-            assert(state(app.page(),"passwords")["rows"][0]["scopes"]==utf8(pending_root.wstring()));
-            ui_debug_type_text(app.window(),L" no match");
-            pump([&]{return state(app.page(),"passwords")["total"]==0;});
-            screenshot(app,L"passwords-empty.png");
-            for(int i=0;i<9;++i) ui_debug_type_char(app.window(),8);
-            for(int i=0;i<14;++i) ui_debug_type_char(app.window(),8);
-            pump([&]{return state(app.page(),"passwords")["total"]==5;});
-            ui_window_relayout(app.window());
-            auto saved_rows=state(app.page(),"passwords")["rows"];
-            for(auto& entry:saved_rows) {
-                auto id=entry["id"].get<std::string>();
-                auto row=rect(app,"password-"+id), edit=rect(app,"edit-password-"+id);
-                assert(std::abs((row.top+row.bottom-1)/2-(edit.top+edit.bottom)/2)<=1);
-                auto remove=rect(app,"delete-password-"+id);
-                assert(edit.top==remove.top && edit.bottom==remove.bottom && edit.right<remove.left);
+            assert(rendered_widget(app,"directoryPane").value("visible",true));
+            for(const char* action:{"newRoot","editSelectedRoot","deleteSelectedRoot"}) {
+                auto* control=ui::GetContext().GetWindow(app.window())->Root()->FindById(action); assert(control);
+                bool visible=true;
+                for(auto* parent=control;parent;parent=parent->Parent()) if(!parent->visible) { visible=false; break; }
+                assert(!visible);
             }
-            screenshot(app,L"passwords-unified.png");
-            // Explicit completed edits retain their editor. A
-            // second completed edit while the first owns the writer lock must
-            // rebase onto our own saved record rather than conflict with it.
-            auto record=state(app.page(),"passwords")["rows"][0];
-            click(app,("edit-password-"+record["id"].get<std::string>()).c_str());
-            screenshot(app,L"passwords-edit.png");
-            assert(!ui::GetContext().GetWindow(app.window())->Root()->FindById("password-"+record["id"].get<std::string>()));
-            auto password_input=ui_widget_find_by_id(ui_page_root(app.page()),"passwordValue"); assert(password_input);
-            ui_text_input_set_text(password_input,L""); ui_widget_destroy(password_input);
-            click(app,"passwordValue"); ui_debug_type_text(app.window(),L"edited password");
+            auto choose_password_root=[&](const fs::path& path,size_t count) {
+                click(app,path.empty()?"allRoots":("directory-"+utf8(path_key(path))).c_str());
+                auto selected=path.empty()?std::string("@all"):utf8(path.wstring());
+                pump([&]{auto p=state(app.page(),"passwords");return p.value("scope","")==selected && p["total"]==count;},"Password directory projection");
+                assert(state(app.page(),"passwordRoot")== (path.empty()?"":utf8(path.wstring())));
+            };
+            auto password_id=[&](const std::string& value) {
+                auto rows=state(app.page(),"passwords")["rows"];
+                for(auto& row:rows) if(row["value"]==value) return row["id"].get<std::string>();
+                throw std::runtime_error("Password row missing: "+value);
+            };
+            auto has_password=[&](const std::string& value) {
+                auto passwords=read_json(dir/"builtin_passwords.json")["passwords"];
+                return std::any_of(passwords.begin(),passwords.end(),[&](const Json& row){return row["value"]==value;});
+            };
+            auto unchanged_task_root=state(app.page(),"taskRoot");
+            choose_password_root(pending_root,0);
+            assert(state(app.page(),"taskRoot")==unchanged_task_root);
+            click(app,"newPassword"); ui_debug_pump();
+            auto scoped_id=state(app.page(),"passwordCell").get<std::string>();
             {
                 FileMutex hold(dir/"builtin_passwords.json");
-                ui_window_focus_widget(app.window(),0); ui_debug_pump();
-                assert(!state(app.page(),"saving").get<bool>());
-                click(app,"finishPassword"); ui_debug_pump();
-                click(app,"passwordValue"); assert(ui_debug_key(app.window(),VK_END)==0); ui_debug_type_text(app.window(),L" latest");
-                click(app,"finishPassword"); ui_debug_pump();
+                ui_debug_type_text(app.window(),L"pending scoped");
+                assert(ui_debug_key(app.window(),VK_RETURN)==0); ui_debug_pump();
+                assert(state(app.page(),"passwordCell")=="");
+                // Switch while the writer is blocked: the job retains the
+                // directory where editing began, not the next selection.
+                click(app,("directory-"+utf8(path_key(pending_second))).c_str());
+                assert(state(app.page(),"passwordRoot")==utf8(pending_second.wstring()));
+                assert(state(app.page(),"shownPasswords").empty());
             }
             finish_input(app);
-            assert(state(app.page(),"passwordEditor")==true);
-            assert(parse_json(state(app.page(),"passwordOriginal").get<std::string>())["value"]=="edited password latest");
-            assert(read_json(dir/"builtin_passwords.json")["passwords"][0]["value"]=="edited password latest");
-            auto projected_after_edit=state(app.page(),"passwords")["rows"];
-            assert(projected_after_edit.size()==saved_rows.size());
-            assert(projected_after_edit[0]["value"]=="edited password latest");
-            assert(projected_after_edit[0]["id"]==projected_after_edit[0]["original"].get<std::string>()+"#0");
-            assert(projected_after_edit[1]==saved_rows[1]); // untouched row retained by delta
-            auto other=state(app.page(),"passwords")["rows"][1];
-            auto history_before_delete=read_json(dir/"builtin_passwords.json")["clipboard_history"];
-            click(app,("delete-password-"+other["id"].get<std::string>()).c_str()); finish_input(app);
-            assert(read_json(dir/"builtin_passwords.json")["passwords"].size()==4);
-            assert(state(app.page(),"passwordEditor")==true);
-            assert(state(app.page(),"passwordValue")=="edited password latest");
-            assert(read_json(dir/"builtin_passwords.json")["clipboard_history"]==history_before_delete);
-            click(app,"deletePassword"); finish_input(app);
-            assert(read_json(dir/"builtin_passwords.json")["passwords"].size()==3);
-            assert(state(app.page(),"passwordEditor")==false);
+            choose_password_root(pending_second,0);
+            auto scoped_file=read_json(dir/"builtin_passwords.json");
+            assert(scoped_file["passwords"].back()==Json({{"value","pending scoped"},{"scopes",{utf8(pending_root.wstring())}}}));
+            choose_password_root(pending_root,1);
+            scoped_id=password_id("pending scoped");
+            // An own receipt arriving while typing must preserve the editor.
+            {
+                FileMutex hold(dir/"builtin_passwords.json");
+                edit_password(app,scoped_id,L"scoped receipt"); click(app,"passwordSearch"); ui_debug_pump();
+                edit_password(app,scoped_id,L"scoped receipt latest");
+            }
+            pump([&]{return !state(app.page(),"saving").get<bool>();},"Scoped receipt while typing");
+            assert(state(app.page(),"passwordCell")==scoped_id);
+            assert(state(app.page(),"passwordDrafts")[scoped_id]["value"]=="scoped receipt latest");
+            click(app,"passwordSearch"); finish_input(app);
+            assert(has_password("scoped receipt latest") && !has_password("pending scoped"));
+            choose_password_root(fs::path(),3);
+            assert(state(app.page(),"taskRoot")==unchanged_task_root);
+            // Search is confined to this exact scope; globals do not include
+            // scoped passwords and scoped views do not include globals/parents.
+            click(app,"passwordSearch"); ui_debug_type_text(app.window(),L"scoped receipt");
+            pump([&]{return state(app.page(),"passwords")["total"]==0;});
+            screenshot(app,L"passwords-empty.png");
+            assert(ui_debug_key_mod(app.window(),'A',1,0,0)==0); ui_debug_type_char(app.window(),8);
+            pump([&]{return state(app.page(),"passwords")["total"]==3;});
+            auto saved_rows=state(app.page(),"passwords")["rows"];
+            auto id=saved_rows[0]["id"].get<std::string>();
+            float narrow=rect(app,"password-text-"+id).right-rect(app,"password-text-"+id).left;
+            ui_window_set_size(app.window(),1120,720); ui_window_relayout(app.window());
+            assert(rect(app,"password-text-"+id).right-rect(app,"password-text-"+id).left>narrow+20);
+            ui_window_set_size(app.window(),850,560); ui_window_relayout(app.window());
+            auto* password_window=ui::GetContext().GetWindow(app.window());
+            assert(!password_window->Root()->FindById("passwordTableHeader"));
+            auto* password_scroll=password_window->Root()->FindById("passwordListScroll");
+            assert(password_scroll->Parent()->css.borderWidth>0);
+            auto password_theme=ui_widget_find_by_id(ui_page_root(app.page()),"themeSelector"); assert(password_theme);
+            for(int mode:{2,1}) {
+                assert(ui_debug_combo_select(app.window(),password_theme,mode)==0);
+                auto value=rect(app,"password-text-"+id);
+                assert(ui_debug_mouse_move(app.window(),(value.left+value.right)/2,(value.top+value.bottom)/2)==0);
+                auto* line=password_window->Root()->FindById("password-hover-"+id);
+                auto* text=password_window->Root()->FindById("password-text-"+id);
+                assert(line && line->bgColor.a>0 && line->bgColor.r==(mode==2?1.0f:0.0f));
+                assert(text->cursor==ui::CursorKind::Text);
+                assert(text->css.hasFg && (mode==2?text->css.fg.r>0.8f:text->css.fg.r<0.2f));
+                auto displayed=rect(app,"password-value-"+id);
+                click(app,("password-text-"+id).c_str());
+                pump([&]{auto* f=password_window->FocusedWidget();return f&&f->id=="password-input-"+id;});
+                auto editor=rect(app,"password-input-"+id);
+                auto* label=password_window->Root()->FindById("password-value-"+id);
+                assert(std::abs(displayed.left+label->padL-editor.left-11)<0.1f);
+                assert(std::abs(displayed.top-editor.top)<0.1f && std::abs(displayed.bottom-editor.bottom)<0.1f);
+                auto* input=dynamic_cast<ui::TextInputWidget*>(password_window->FocusedWidget());
+                assert(input && input->focused && !ui::ShowFocusRing());
+                assert(input->css.borderWidth<0 && !input->css.hasBorderColor);
+                screenshot(app,mode==2?L"password-focus-dark.png":L"password-focus-light.png");
+                if(mode==2) { assert(ui_debug_key(app.window(),VK_RETURN)==0); pump([&]{return !password_window->FocusedWidget();}); }
+                else click(app,"passwordSearch");
+                assert(!text->hovered && line->bgColor.a==0);
+                assert(!password_window->Root()->FindById("password-scope-"+id));
+            }
+            assert(ui_debug_combo_select(app.window(),password_theme,0)==0); ui_widget_destroy(password_theme);
+            auto& path_renderer=password_window->GetRenderer();
+            auto long_directory=L"C:\\很长的父目录\\another-parent\\final-folder-\U0001F600";
+            for(float width:{95.0f,160.0f,210.0f}) {
+                auto clipped=path_renderer.EllipsizeStart(long_directory,width,14);
+                assert(clipped.front()==L'…' && clipped.back()==long_directory[wcslen(long_directory)-1]);
+                assert(wide(utf8(clipped))==clipped && path_renderer.MeasureTextWidth(clipped,14)<=width);
+            }
+            auto other_id=saved_rows[1]["id"].get<std::string>();
+            {
+                FileMutex hold(dir/"builtin_passwords.json");
+                edit_password(app,id,L"edited password"); click(app,"passwordSearch"); ui_debug_pump();
+                edit_password(app,id,L"edited password latest");
+                auto bounds=rect(app,"passwordListScroll");
+                POINT point{int((bounds.left+bounds.right)*password_window->DpiScale()/2),int((bounds.top+bounds.bottom)*password_window->DpiScale()/2)};
+                ClientToScreen(password_window->Handle(),&point);
+                SendMessageW(password_window->Handle(),WM_MOUSEWHEEL,MAKEWPARAM(0,-WHEEL_DELTA),MAKELPARAM(point.x,point.y));
+                assert(state(app.page(),"passwordCell")=="");
+                edit_password(app,other_id,L"second edited"); click(app,"passwordSearch"); ui_debug_pump();
+            }
+            finish_input(app);
+            assert(has_password("edited password latest") && has_password("second edited"));
+            assert(state(app.page(),"passwordDrafts").empty());
+            auto global_value=state(app.page(),"passwords")["rows"][0]["value"].get<std::string>();
+            // Merge an edited row into an existing global, including when a
+            // dedup receipt arrives while the same row is being edited again.
+            click(app,"newPassword"); ui_debug_pump();
+            auto continuing_id=state(app.page(),"passwordCell").get<std::string>();
+            ui_debug_type_text(app.window(),L"merge source"); click(app,"passwordSearch"); finish_input(app);
+            {
+                FileMutex hold(dir/"builtin_passwords.json");
+                edit_password(app,continuing_id,wide(global_value).c_str()); click(app,"passwordSearch"); ui_debug_pump();
+                edit_password(app,continuing_id,L"continue after merge");
+            }
+            pump([&]{return !state(app.page(),"saving").get<bool>();},"Dedup receipt while typing");
+            assert(state(app.page(),"passwordDrafts")[continuing_id]["value"]=="continue after merge");
+            click(app,"passwordSearch"); finish_input(app);
+            assert(has_password(global_value) && has_password("continue after merge"));
+            edit_password(app,continuing_id,L""); click(app,"passwordSearch"); finish_input(app);
+            assert(!has_password("continue after merge") && !password_window->Root()->FindById("password-"+continuing_id));
+            // Exact-directory filtering and legacy multi-scope edits/deletes.
+            auto legacy=Json{{"value","legacy\nliteral"},{"scopes",{utf8(pending_root.wstring()),utf8(pending_second.wstring())}}};
+            auto legacy_file=read_json(dir/"builtin_passwords.json"); legacy_file["passwords"].push_back(legacy);
+            { FileMutex lock(dir/"builtin_passwords.json"); atomic_write(dir/"builtin_passwords.json",legacy_file.dump()); }
+            choose_password_root(pending_root,2);
+            auto legacy_id=password_id("legacy\nliteral");
+            click(app,("password-text-"+legacy_id).c_str()); ui_debug_pump(); click(app,"passwordSearch"); finish_input(app);
+            assert(read_json(dir/"builtin_passwords.json")["passwords"].back()==legacy);
+            edit_password(app,legacy_id,L""); paste_password(app,L"first #\r\n  second  \nfirst #"); finish_input(app);
+            assert(state(app.page(),"passwords")["total"]==3);
+            assert(has_password("first #") && has_password("  second  ") && has_password("legacy\nliteral"));
+            choose_password_root(pending_second,1);
+            auto remaining_id=password_id("legacy\nliteral");
+            edit_password(app,remaining_id,L""); click(app,"passwordSearch"); finish_input(app);
+            assert(state(app.page(),"passwords")["total"]==0 && !has_password("legacy\nliteral"));
+            choose_password_root(pending_root,3);
+            auto first_id=password_id("first #");
+            edit_password(app,first_id,L"conflicting draft");
+            auto scoped_conflict=read_json(dir/"builtin_passwords.json");
+            for(auto& row:scoped_conflict["passwords"]) if(row["value"]=="first #") row["value"]="external replacement";
+            { FileMutex lock(dir/"builtin_passwords.json"); atomic_write(dir/"builtin_passwords.json",scoped_conflict.dump()); }
+            pump([&]{auto rows=state(app.page(),"passwords")["rows"];for(auto& row:rows) if(row["value"]=="external replacement") return true; return false;},"External scoped replacement");
+            click(app,"passwordSearch");
+            pump([&]{return state(app.page(),"saveErrors").contains("@password:"+first_id) && !state(app.page(),"saving").get<bool>();},"Scoped password conflict");
+            assert(state(app.page(),"passwordDrafts")[first_id]["value"]=="conflicting draft" && has_password("external replacement"));
+            click(app,("discard-password-"+first_id).c_str()); finish_input(app);
+            assert(state(app.page(),"passwordDrafts").empty());
+            screenshot(app,L"passwords-directory.png");
+            // Copying/adding in a folder stays local; a duplicate of a global
+            // value is discarded rather than creating a redundant local copy.
+            auto before_duplicate=read_json(dir/"builtin_passwords.json");
+            click(app,"newPassword"); ui_debug_pump(); ui_debug_type_text(app.window(),wide(global_value).c_str());
+            assert(ui_debug_key(app.window(),VK_RETURN)==0); finish_input(app);
+            assert(read_json(dir/"builtin_passwords.json")==before_duplicate);
+            // The same visible password in two directories is one JSON record.
+            // Its merged baseline must remain usable while typing continues.
+            choose_password_root(pending_second,0);
+            click(app,"newPassword"); ui_debug_pump();
+            auto shared_id=state(app.page(),"passwordCell").get<std::string>();
+            {
+                FileMutex hold(dir/"builtin_passwords.json");
+                ui_debug_type_text(app.window(),L"scoped receipt latest"); click(app,"passwordSearch"); ui_debug_pump();
+                edit_password(app,shared_id,L"shared next");
+            }
+            pump([&]{return !state(app.page(),"saving").get<bool>();},"Merged scope receipt while typing");
+            assert(state(app.page(),"passwordCell")==shared_id && state(app.page(),"passwordDrafts")[shared_id]["value"]=="shared next");
+            auto merged_file=read_json(dir/"builtin_passwords.json")["passwords"];
+            auto shared=std::find_if(merged_file.begin(),merged_file.end(),[](const Json& row){return row["value"]=="scoped receipt latest";});
+            assert(shared!=merged_file.end() && (*shared)["scopes"].size()==2);
+            assert(std::count_if(merged_file.begin(),merged_file.end(),[](const Json& row){return row["value"]=="scoped receipt latest";})==1);
+            click(app,"passwordSearch"); finish_input(app);
+            assert(has_password("shared next") && has_password("scoped receipt latest"));
+            edit_password(app,shared_id,L"scoped receipt latest"); click(app,"passwordSearch"); finish_input(app);
+            assert(!has_password("shared next"));
+            edit_password(app,shared_id,L""); click(app,"passwordSearch"); finish_input(app);
+            assert(state(app.page(),"passwords")["total"]==0 && has_password("scoped receipt latest"));
+            choose_password_root(pending_root,3);
+            assert(password_id("scoped receipt latest").size()>0);
+            choose_password_root(fs::path(),3);
+            screenshot(app,L"passwords-unified.png");
             click(app,"tabTasks"); pump([&]{return state(app.page(),"tab")=="tasks";});
             click(app,("directory-"+utf8(path_key(pending_second))).c_str());
             auto edit_root_bounds=rect(app,"editSelectedRoot"), delete_root_bounds=rect(app,"deleteSelectedRoot");
@@ -1399,12 +1559,16 @@ int wmain(int argc,wchar_t** argv) {
             auto history=read_json(dir/"builtin_passwords.json"); history["clipboard_history"]=Json::array();
             for(int i=0;i<320;++i) history["clipboard_history"].push_back("candidate-"+std::to_string(i));
             history["clipboard_history"][0]="  #history value  ";
+            history["clipboard_history"][1]=std::string(180,'x');
+            history["clipboard_history"][2]="first line\nsecond line\nthird line";
             for(int i=0;i<240;++i) history["passwords"].push_back({{"value","virtual-password-"+std::to_string(i)},
                 {"scopes",Json::array({utf8(dir.wstring()),utf8((dir/"nested").wstring())})}});
             atomic_write(dir/"builtin_passwords.json",history.dump());
             click(app,"tabPasswords"); pump([&]{return state(app.page(),"tab")=="passwords";});
-            click(app,"savedPasswords"); pump([&]{return state(app.page(),"passwords")["total"]==history["passwords"].size();});
-            virtual_tail(app,"passwordItems","passwordListScroll",history["passwords"].size());
+            click(app,("directory-"+utf8(path_key(dir))).c_str());
+            click(app,"savedPasswords"); pump([&]{return state(app.page(),"passwords")["total"]==240;});
+            virtual_tail(app,"passwordItems","passwordListScroll",240);
+            virtual_tail(app,"directoryItems","directoryListScroll",73);
             click(app,"clipboardHistory"); pump([&]{return state(app.page(),"passwords")["total"]==320;});
             ui_window_set_size(app.window(),850,560); ui_window_relayout(app.window());
             virtual_tail(app,"passwordItems","passwordListScroll",320);
@@ -1414,20 +1578,54 @@ int wmain(int argc,wchar_t** argv) {
                 auto handle=ui_widget_find_by_id(ui_page_root(app.page()),("password-"+entry["id"].get<std::string>()).c_str());
                 if(!handle) continue;
                 auto bounds=ui_widget_get_rect(handle); ui_widget_destroy(handle);
-                if(bounds.bottom-bounds.top>44) std::cerr<<"History row: "<<rendered_widget(app,"password-"+entry["id"].get<std::string>())<<'\n';
-                assert(bounds.bottom-bounds.top<=44);
+                if(entry["id"]!="1" && entry["id"]!="2") assert(bounds.bottom-bounds.top<=44);
                 if(bounds.top>=history_view.top && bounds.bottom<=history_view.bottom) ++visible;
             }
-            assert(visible>=6);
-            auto copy_info=rendered_widget(app,"copy-history-0");
-            assert(copy_info["textWidth"].get<float>()<=copy_info["availWidth"].get<float>());
+            assert(visible>=3);
+            auto history_action=rendered_widget(app,"save-history-0");
+            assert(history_action["text"]==state(app.page(),"texts")["saveHistoryToDirectory"]);
+            assert(history_action["textWidth"].get<float>()<=history_action["availWidth"].get<float>());
+            for(int i:{1,2}) {
+                auto history_text=rendered_widget(app,"history-value-"+std::to_string(i));
+                auto history_button=rect(app,("save-history-"+std::to_string(i)).c_str());
+                auto history_bounds=rect(app,("password-"+std::to_string(i)).c_str());
+                auto text_bounds=history_text["rect"];
+                assert(text_bounds[3].get<float>()-text_bounds[1].get<float>()>32);
+                assert(text_bounds[0].get<float>()>=history_bounds.left);
+                assert(text_bounds[2].get<float>()+11<=history_button.left);
+                assert(text_bounds[1].get<float>()>=history_bounds.top+3);
+                assert(text_bounds[3].get<float>()<=history_bounds.bottom-3);
+                assert(history_text["text"]==history["clipboard_history"][i]);
+                auto* history_label=dynamic_cast<ui::LabelWidget*>(password_window->Root()->FindById("history-value-"+std::to_string(i)));
+                assert(history_label);
+                auto history_font=history_label->css.fontSize>0?history_label->css.fontSize:theme::kFontSizeNormal;
+                auto history_height=path_renderer.MeasureTextHeight(history_label->Text(),
+                    history_label->ContentWidth(),history_font);
+                assert(history_height<=history_label->rect.bottom-history_label->rect.top+0.5f);
+                if(i==1) assert(history_text["textWidth"].get<float>()>history_text["availWidth"].get<float>());
+            }
             screenshot(app,L"clipboard-history-small.png");
             button_texts(app);
-            click(app,"copy-history-0");
-            assert(state(app.page(),"passwordValue")=="  #history value  ");
-            assert(state(app.page(),"passwordOriginal")=="");
-            assert(read_json(dir/"builtin_passwords.json")["clipboard_history"]==history["clipboard_history"]);
-            click(app,"closePasswordEditor");
+            for(int i:{0,1,2}) {
+                click(app,("save-history-"+std::to_string(i)).c_str()); finish_input(app);
+                assert(state(app.page(),"passwordHistory")==true && state(app.page(),"passwordCell")=="");
+                auto history_saved=read_json(dir/"builtin_passwords.json");
+                assert(history_saved["passwords"].back()["value"]==history["clipboard_history"][i]);
+                assert(history_saved["passwords"].back()["scopes"]==Json::array({utf8(dir.wstring())}));
+                assert(history_saved["clipboard_history"]==history["clipboard_history"]);
+                assert(state(app.page(),"passwordDrafts").empty());
+            }
+            click(app,"allRoots");
+            assert(state(app.page(),"passwordHistory")==true && state(app.page(),"passwordRoot")=="");
+            assert(rendered_widget(app,"save-history-0")["text"]==state(app.page(),"texts")["saveHistoryGlobally"]);
+            button_texts(app);
+            click(app,"save-history-0"); finish_input(app);
+            click(app,"save-history-0"); finish_input(app);
+            auto history_global=read_json(dir/"builtin_passwords.json"); size_t history_matches=0;
+            for(auto& record:history_global["passwords"]) if(record["value"]==history["clipboard_history"][0]) {
+                ++history_matches; assert(record["scopes"].empty());
+            }
+            assert(history_matches==1 && state(app.page(),"passwordDrafts").empty());
             click(app,"tabConfig"); pump([&]{return state(app.page(),"tab")=="config";});
             search_config(app,L"max_folders");
             auto invalid_input=ui_widget_find_by_id(ui_page_root(app.page()),"input-/watch/max_folders"); assert(invalid_input);
