@@ -180,7 +180,7 @@ void click(Application& app,const char* id) {
     auto clicked=ui_debug_click(app.window(),widget);
     if(clicked!=0) {
         std::cerr<<"Click failed: "<<id<<" "<<rendered_widget(app,id)<<'\n';
-        for(auto key:{"taskRoot","rootCell","rootPart","rootDrafts","listTarget","saveErrors"}) std::cerr<<key<<"="<<state(app.page(),key)<<'\n';
+        for(auto key:{"taskRoot","rootCell","rootPart","rootDrafts","saveErrors"}) std::cerr<<key<<"="<<state(app.page(),key)<<'\n';
     }
     assert(clicked==0);
     ui_widget_destroy(widget);
@@ -254,14 +254,6 @@ void paste_password(Application& app,const wchar_t* value) {
     pump([&]{return OpenClipboard(owner)!=FALSE;},"Clipboard restoration"); EmptyClipboard();
     for(auto [format,copy]:previous) assert(SetClipboardData(format,copy));
     CloseClipboard();
-}
-// Exercise the explicit import boundary shared by rule/folder lists.
-void import_entries(Application& app,const wchar_t* text) {
-    click(app,"importList"); click(app,"listImportText");
-    assert(ui_debug_type_text(app.window(),text)==0);
-    click(app,"previewImport");
-    assert(!state(app.page(),"listPreview").empty());
-    click(app,"applyImport");
 }
 void search_hints(Application& app) {
     auto* root=ui::GetContext().GetWindow(app.window())->Root().get();
@@ -394,7 +386,6 @@ void virtual_tail(Application& app,const char* list_id,const char* scroll_id,siz
     auto anchor=list->Children().back()->id;
     auto top=list->Children().back()->rect.top;
     const char* data_key=!std::strcmp(list_id,"configItems")?"fields":
-        !std::strcmp(list_id,"listItems")?"listRows":
         !std::strcmp(list_id,"directoryItems")?"directories":
         !std::strcmp(list_id,"passwordItems")?"passwords":
         !std::strcmp(list_id,"rootItems")?"rootRows":"tasks";
@@ -432,7 +423,7 @@ void scrolled_config_edits(Application& app) {
     for(auto id:{"/filesystem/scan_filters/0/enabled","/filesystem/scan_filters/0/prune_dir_globs","/runtime/process_mode"}) {
         const std::string pointer=id;
         const std::string control=(pointer.find("enabled")!=std::string::npos?"toggle-":
-            pointer.find("prune_dir_globs")!=std::string::npos?"list-":"select-")+pointer;
+            pointer.find("prune_dir_globs")!=std::string::npos?"tag-input-":"select-")+pointer;
         window->ScrollWithMeasureContext(scroll,0);
         // Visit preceding rows through the real measured scrolling path.
         for(int pass=0;pass<200 && !window->Root()->FindById(control);++pass) {
@@ -452,10 +443,9 @@ void scrolled_config_edits(Application& app) {
         };
         auto handle=ui_widget_find_by_id(ui_page_root(app.page()),control.c_str()); assert(handle);
         if(control.find("toggle-")==0) assert(ui_debug_toggle_set(app.window(),handle,0)==0);
-        else if(control.find("list-")==0) {
-            click(app,"listEntry");
+        else if(control.find("tag-input-")==0) {
             assert(ui_debug_type_text(app.window(),L"skipped-directory")==0);
-            click(app,"putListEntry"); click(app,"saveList");
+            assert(ui_debug_key(app.window(),VK_RETURN)==0);
         } else {
             assert(ui_debug_key(app.window(),VK_ESCAPE)==0);
             assert(ui_debug_combo_select(app.window(),handle,2)==0);
@@ -466,7 +456,7 @@ void scrolled_config_edits(Application& app) {
         pump([&] {
             for(auto& field:state(app.page(),"fields")) if(field["id"]==pointer) {
                 if(control.find("toggle-")==0) return field["boolean"]==false;
-                if(control.find("list-")==0) return field["items"].back()=="skipped-directory";
+                if(control.find("tag-input-")==0) return field["items"].back()=="skipped-directory";
                 return field["text"]=="high";
             }
             return false;
@@ -819,62 +809,84 @@ void range_config(Application& app,const fs::path& dir) {
     layout(tid,true);
     screenshot(app,L"range-time-small.png");
 }
-void structured_config(Application& app,const fs::path& dir) {
-    const std::string pointer="/filesystem/scan_filters/0/prune_dir_globs";
+// Enter/delete are explicit writes; blur, scrolling and snapshot refreshes
+// must preserve unsubmitted text. This shares the existing configuration fixture.
+void tag_config(Application& app,const fs::path& dir) {
+    const std::string pointer="/filesystem/scan_filters/0/prune_dir_globs",inputId="tag-input-"+pointer;
     auto config=read_json(dir/"sunpack_config.json");
-    Json values=Json::array({"", "a\nb", "  spaced  ", "duplicate", "duplicate"});
+    Json values=Json::array({"",std::string("a")+char(10)+"b","  spaced  ","duplicate","duplicate"});
     for(int i=0;i<180;++i) values.push_back("rule-"+std::to_string(i));
-    config[Json::json_pointer(pointer)]=values;
-    atomic_write(dir/"sunpack_config.json",config.dump());
-    auto current=[&] { for(auto& f:state(app.page(),"fields")) if(f["id"]==pointer) return f; return Json(); };
+    auto disk=[&]{return read_json(dir/"sunpack_config.json")[Json::json_pointer(pointer)];};
+    auto current=[&]{for(auto& f:state(app.page(),"fields")) if(f["id"]==pointer) return f;return Json();};
+    config[Json::json_pointer(pointer)]=values; atomic_write(dir/"sunpack_config.json",config.dump());
     pump([&]{return current().value("items",Json())==values;});
-    search_setting(app,"/filesystem/scan_filters/0/prune_dir_globs");
-    assert(!ui::GetContext().GetWindow(app.window())->Root()->FindById("lines-"+pointer));
-    click(app,("list-"+pointer).c_str());
-    assert(rendered_widget(app,"putListEntry")["text"]==state(app.page(),"texts")["addToList"]);
-    screenshot(app,L"structured-rules-open.png");
-    virtual_tail(app,"listItems","listScroll",values.size());
-    button_texts(app); screenshot(app,L"structured-rules-small.png");
-    click(app,"listSearch"); ui_debug_type_text(app.window(),L"spaced");
-    // Search a visible stable row, then use the multiline editor for one item.
-    ui_window_relayout(app.window());
-    click(app,"edit-list-2");
-    click(app,"listEntry"); assert(ui_debug_key_mod(app.window(),'A',1,0,0)==0);
-    ui_debug_type_text(app.window(),L"  changed  "); click(app,"putListEntry");
-    click(app,"listSearch"); assert(ui_debug_key_mod(app.window(),'A',1,0,0)==0); ui_debug_type_char(app.window(),8); ui_window_relayout(app.window());
-    click(app,"edit-list-1"); assert(state(app.page(),"listMultiline")==true);
-    assert(state(app.page(),"listEntry")=="a\nb"); click(app,"putListEntry");
-    // Empty strings and duplicate entries survive an explicit full-list save.
-    click(app,"saveList"); finish_input(app); values[2]="  changed  ";
-    assert(read_json(dir/"sunpack_config.json")[Json::json_pointer(pointer)]==values);
-    // Continue editing the same collection while our first write owns the
-    // worker. Its acknowledgement advances the baseline, not the active rows.
+    search_setting(app,pointer);
+    auto* window=ui::GetContext().GetWindow(app.window());
+    assert(!window->Root()->FindById("listManager") && !window->Root()->FindById("list-"+pointer));
+    auto scroll=[&]{return dynamic_cast<ui::ScrollViewWidget*>(window->Root()->FindById("tag-scroll-"+pointer));};
+    auto input=[&]{return dynamic_cast<ui::TextInputWidget*>(window->Root()->FindById(inputId));};
+    assert(scroll() && scroll()->NeedsScrollbar());
+    auto* cloud=window->Root()->FindById("tags-"+pointer); assert(cloud && cloud->Children().empty());
+    auto region=rect(app,"tag-scroll-"+pointer),left=rect(app,inputId);
+    assert(region.left>=left.right && region.bottom-region.top<=114);
+    click(app,inputId.c_str()); assert(ui_debug_type_text(app.window(),L"unsubmitted")==0);
+    click(app,"configSearch");
+    assert(disk()==values && state(app.page(),"tagInputs")[pointer]=="unsubmitted");
+    window->ScrollWithMeasureContext(scroll(),1000000); ui_window_relayout(app.window());
+    assert(scroll()->ScrollY()>0 && disk()==values);
+    screenshot(app,L"tag-config-tail.png");
+    search_config(app,L"");
+    virtual_tail(app,"configItems","configListScroll",state(app.page(),"matchingBlocks").size());
+    search_setting(app,pointer);
+    assert(input() && input()->Text()==L"unsubmitted" && disk()==values);
+    // A different category and a different main page both discard input only.
+    click(app,"category-watch"); pump([&]{return state(app.page(),"configCategory")=="watch";});
+    assert(state(app.page(),"tagInputs").empty());
+    click(app,"category-all"); pump([&]{return state(app.page(),"configCategory")=="";});
+    search_setting(app,pointer);
+    click(app,inputId.c_str()); assert(ui_debug_type_text(app.window(),L"discard me")==0);
+    click(app,"tabTasks"); pump([&]{return state(app.page(),"tab")=="tasks";});
+    assert(state(app.page(),"tagInputs").empty() && disk()==values);
+    click(app,"tabConfig"); pump([&]{return state(app.page(),"tab")=="config";});
+    search_setting(app,pointer); assert(input()->Text().empty());
+    auto add=[&](const wchar_t* value) {
+        click(app,inputId.c_str()); assert(ui_debug_type_text(app.window(),value)==0);
+        assert(ui_debug_key(app.window(),VK_RETURN)==0); ui_debug_pump();
+    };
+    add(L"  new tag #  "); finish_input(app); values.push_back("  new tag #  ");
+    assert(disk()==values && input()->Text().empty());
     {
         FileMutex hold(dir/"sunpack_config.json");
-        click(app,("list-"+pointer).c_str());
-        click(app,"listEntry"); ui_debug_type_text(app.window(),L"first save"); click(app,"saveList");
-        click(app,("list-"+pointer).c_str());
-        click(app,"listEntry"); ui_debug_type_text(app.window(),L"continued edit"); click(app,"putListEntry");
+        add(L"first"); add(L"second");
+        click(app,inputId.c_str()); assert(ui_debug_type_text(app.window(),L"still unsubmitted")==0);
     }
-    finish_input(app);
-    assert(state(app.page(),"listRows").back()["value"]=="continued edit");
-    click(app,"saveList"); finish_input(app); values.push_back("first save"); values.push_back("continued edit");
-    assert(read_json(dir/"sunpack_config.json")[Json::json_pointer(pointer)]==values);
-    click(app,("list-"+pointer).c_str()); click(app,"remove-list-0"); click(app,"cancelList");
-    assert(read_json(dir/"sunpack_config.json")[Json::json_pointer(pointer)]==values);
-    click(app,("list-"+pointer).c_str());
-    click(app,"listEntry"); ui_debug_type_text(app.window(),L"local"); click(app,"putListEntry");
-    config=read_json(dir/"sunpack_config.json"); config[Json::json_pointer(pointer)]=Json::array({"external"});
-    atomic_write(dir/"sunpack_config.json",config.dump());
-    pump([&]{return current()["items"]==Json::array({"external"});});
-    click(app,"saveList");
+    finish_input(app); values.push_back("first"); values.push_back("second");
+    assert(disk()==values && input()->Text()==L"still unsubmitted");
+    window->ScrollWithMeasureContext(scroll(),0); ui_window_relayout(app.window());
+    // Remove just the first empty-string tag through its actual close affordance.
+    cloud=window->Root()->FindById("tags-"+pointer);
+    auto label=wide(state(app.page(),"texts")["emptyEntry"].get<std::string>());
+    float x=cloud->rect.left+window->GetRenderer().MeasureTextWidth(label,13)+19,y=cloud->rect.top+13;
+    assert(ui_debug_mouse_down(app.window(),x,y)==0); assert(ui_debug_mouse_up(app.window(),x,y)==0);
+    finish_input(app); values.erase(values.begin());
+    assert(disk()==values && input()->Text()==L"still unsubmitted");
+    screenshot(app,L"tag-config-inline.png");
+    // Conflict must preserve our submitted collection and keep the external file.
+    click(app,"tabTasks"); pump([&]{return state(app.page(),"tab")=="tasks";});
+    click(app,"tabConfig"); pump([&]{return state(app.page(),"tab")=="config";});
+    search_setting(app,pointer);
+    {
+        FileMutex hold(dir/"sunpack_config.json");
+        config=read_json(dir/"sunpack_config.json");config[Json::json_pointer(pointer)]=Json::array({"external"});
+        atomic_write(dir/"sunpack_config.json",config.dump());
+        add(L"local");
+    }
     pump([&]{return state(app.page(),"saveErrors").contains(pointer)&&!state(app.page(),"saving").get<bool>();});
-    assert(read_json(dir/"sunpack_config.json")[Json::json_pointer(pointer)]==Json::array({"external"}));
-    // Reopen the preserved draft and explicitly retry against the latest file.
-    click(app,("list-"+pointer).c_str()); assert(state(app.page(),"listRows").size()==values.size()+1);
-    click(app,"saveList"); finish_input(app); values.push_back("local");
-    assert(read_json(dir/"sunpack_config.json")[Json::json_pointer(pointer)]==values);
-    assert(state(app.page(),"listRows").empty() && state(app.page(),"listField").is_null());
+    values.push_back("local");
+    assert(disk()==Json::array({"external"}) && parse_json(state(app.page(),"drafts")[pointer]["text"])==values);
+    pump([&]{return current()["items"]==Json::array({"external"});});
+    // One explicit follow-up write rebases against the newest snapshot.
+    add(L"retry"); finish_input(app);values.push_back("retry");assert(disk()==values);
     search_config(app,L"");
 }
 void resize_tasks(Application& app) {
@@ -1096,6 +1108,7 @@ int wmain(int argc,wchar_t** argv) {
                     inline_cell_caret(app);
                     virtual_tail(app,"configItems","configListScroll",state(app.page(),"matchingBlocks").size());
                     scrolled_config_edits(app);
+                    tag_config(app,dir);
                     resize_tasks(app);
                     popup_motion(app,"themeSelector");
                 }
@@ -1920,7 +1933,7 @@ int wmain(int argc,wchar_t** argv) {
             ui_widget_destroy(block);
             screenshot(app,L"whitelist-block-small.png");
             range_config(app,dir);
-            structured_config(app,dir);
+            tag_config(app,dir);
             // Dense views must remain usable with many folders/history items,
             // including after the directory scrollbar becomes active.
             std::string many_roots=utf8(dir.wstring())+"\n";

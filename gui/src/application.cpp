@@ -2,6 +2,7 @@
 #include "motion.hpp"
 #include "presentation.hpp"
 #include "range_editor.hpp"
+#include "tag_collection.hpp"
 #include "main_uix.h"
 #include <commctrl.h>
 #include <dwmapi.h>
@@ -17,6 +18,10 @@
 
 namespace spg {
 namespace {
+void update_tags(TagCollection& tags,const Json& field,const Json& drafts,const std::string& language) {
+    auto id=field["id"].get<std::string>();
+    tags.SetItems((drafts.contains(id)?drafts[id]["text"]:field["text"]).get_ref<const std::string&>(),wide(tr("emptyEntry",language)),wide(tr("noTags",language)));
+}
 // Keep host messages outside Core UI's startup/render message range.
 constexpr UINT Dispatch = WM_APP + 0x401, Update = WM_APP + 0x402, DateResult = WM_APP + 0x403;
 constexpr unsigned Config = 1, Passwords = 2, Roots = 4, Log = 8, Startup = 16;
@@ -311,10 +316,6 @@ void Application::acknowledge_save(const Json& ack) {
     if(ok && kind=="config") {
         const auto& edit=job["fields"][0]; auto id=edit["pointer"].get<std::string>();
         auto original=edit["type"]=="string"?Json(edit["text"]).dump():edit["type"]=="boolean"?Json(edit["boolean"]).dump():edit["text"].get<std::string>();
-        if(page_value(page_,"listTarget")=="config") {
-            auto saved=Json{{"id",id},{"previous",edit["original"]},{"original",original},{"text",edit["draft"]["text"]}}.dump();
-            if(ui_page_call_json(page_,"rebaseListField",saved.c_str())!=0) throw std::runtime_error("uiBindingFailed");
-        }
         for(auto name:{"drafts","toggleDrafts"}) {
             auto drafts=page_value(page_,name);
             if(drafts.contains(id)) {
@@ -377,7 +378,7 @@ void Application::apply_pending() {
         for(auto it=controls_.begin();it!=controls_.end();) {
             bool exists=std::any_of(patch["fields"].begin(),patch["fields"].end(),[&](const Json& f){return f["id"]==it->first;});
             if(!exists) {
-                auto host=(it->second->field["editor"]=="toggle"?"toggle-host-":"choice-")+it->first;
+                auto host=(it->second->field["editor"]=="toggle"?"toggle-host-":it->second->field["editor"]=="list"?"tags-host-":"choice-")+it->first;
                 ui_page_on_widget_mount(page_,host.c_str(),nullptr,nullptr);
                 ui_page_on_widget_unmount(page_,host.c_str(),nullptr,nullptr);
                 it=controls_.erase(it); continue;
@@ -396,6 +397,7 @@ void Application::apply_pending() {
     if(!ack.is_null()) ui_page_call_json(page_,"prunePasswordDrafts","{}");
     if(!ack.is_null() || !directory_snapshot.is_null()) ui_page_call_json(page_,"pruneRootDrafts","{}");
     if(patch.contains("fields") || !ack.is_null()) sync_toggles();
+    if(patch.contains("fields") || !ack.is_null()) sync_tags();
     for(auto& id:reset_scroll) {
         auto widget=ui_widget_find_by_id(ui_page_root(page_),id.get<std::string>().c_str());
         if(widget) { ui_debug_scroll_set(widget,0); ui_widget_destroy(widget); }
@@ -431,6 +433,7 @@ void Application::navigate(const std::string& tab) {
     // transaction first, so that repaint coalesces with the page switch.
     VisualBatch visual(window_);
     ui_window_focus_widget(window_,0);
+    ui_page_set_json(page_,"tagInputs","{}");
     motion::finish(window_,("page-"+page_value(page_,"tab").get<std::string>()).c_str());
     set_text(page_,"tab",tab);
     set_text(page_,"actionError","");
@@ -448,19 +451,38 @@ void Application::sync_toggles() {
         ui_toggle_set_on(widget,on); ui_widget_destroy(widget);
     }
 }
+void Application::sync_tags(const std::string& id) {
+    auto drafts=page_value(page_,"drafts");
+    auto language=page_value(page_,"language").get<std::string>();
+    auto* root=ui::GetContext().GetWindow(window_)->Root().get();
+    for(auto& pair:controls_) if((id.empty() || pair.first==id) && pair.second->field["editor"]=="list") {
+        if(auto* tags=dynamic_cast<TagCollection*>(root->FindById("tags-"+pair.first))) update_tags(*tags,pair.second->field,drafts,language);
+    }
+}
 void Application::bind_controls(const Json& fields) {
     for(auto& field:fields) {
         auto editor=field.value("editor",std::string());
-        if(editor!="choice" && editor!="recursive" && editor!="toggle") continue;
+        if(editor!="choice" && editor!="recursive" && editor!="toggle" && editor!="list") continue;
         auto id=field["id"].get<std::string>();
         auto& binding=controls_[id];
         if(!binding) binding=std::make_unique<ControlBinding>(ControlBinding{this,field});
         else binding->field=field;
-        auto host=(editor=="toggle"?"toggle-host-":"choice-")+id;
+        auto host=(editor=="toggle"?"toggle-host-":editor=="list"?"tags-host-":"choice-")+id;
         ui_page_on_widget_mount(page_,host.c_str(),[](UiPage,UiWidget parent,void* context){
             auto* binding=static_cast<ControlBinding*>(context); auto* self=binding->owner;
             auto id=binding->field["id"].get<std::string>();
             bool toggle=binding->field["editor"]=="toggle";
+            if(binding->field["editor"]=="list") {
+                auto* host=ui::GetContext().handles.LookupRaw(parent);
+                if(!host || host->FindById("tags-"+id)) return;
+                auto tags=std::make_shared<TagCollection>(); tags->id="tags-"+id;
+                tags->onRemove=[self,id](size_t index,const std::wstring& value) {
+                    auto payload=Json{{"id",id},{"index",index},{"value",utf8(value)}}.dump();
+                    if(ui_page_call_json(self->page_,"removeTag",payload.c_str())!=0) self->set_error("actionError","uiBindingFailed");
+                };
+                update_tags(*tags,binding->field,page_value(self->page_,"drafts"),page_value(self->page_,"language").get<std::string>());
+                host->AddChild(tags); return;
+            }
             // Nested scope mounting visits descendants again when its parent
             // mounts. One native selector belongs to each host for its lifetime.
             auto existing=ui_widget_find_by_id(parent,((toggle?"toggle-":"select-")+id).c_str());
@@ -514,7 +536,11 @@ void Application::bind_controls(const Json& fields) {
             },binding);
             ui_widget_add_child(parent,combo); ui_widget_destroy(combo);
         },binding.get());
-        ui_page_on_widget_unmount(page_,host.c_str(),[](UiPage,UiWidget widget,void*){ui_widget_destroy(widget);},nullptr);
+        ui_page_on_widget_unmount(page_,host.c_str(),[](UiPage,UiWidget widget,void*){
+            auto* host=ui::GetContext().handles.LookupRaw(widget);
+            if(host) for(auto& child:host->Children()) if(auto* tags=dynamic_cast<TagCollection*>(child.get())) tags->onRemove={};
+            ui_widget_destroy(widget);
+        },nullptr);
     }
 }
 void Application::rebuild_theme(const std::string& language) {
@@ -564,6 +590,7 @@ void Application::handle_command(Json command) {
     auto op=command.value("op",std::string());
     auto p=command.value("payload",Json::object());
     if(op=="navigate") { navigate(p.value("tab",std::string())); return; }
+    if(op=="syncTags") { sync_tags(p.at("id").get<std::string>()); return; }
     if(op=="scrollTop" || op=="animateView") {
         if(p.contains("category") && page_value(page_,"configCategory")==p["category"]) return;
         if(p.value("id",std::string())=="configBlocks") date_popup_.reset();
@@ -573,9 +600,10 @@ void Application::handle_command(Json command) {
             // Publishing from the click handler paints the new page once at
             // full opacity before this posted command can start its entrance.
             motion::finish(window_,id.c_str());
+            ui_page_set_json(page_,"tagInputs","{}");
             set_text(page_,"configCategory",p.at("category").get<std::string>());
         }
-        const char* scroll=id=="configBlocks"?"configListScroll":id=="directoryItems"?"directoryListScroll":id=="listItems"?"listScroll":nullptr;
+        const char* scroll=id=="configBlocks"?"configListScroll":id=="directoryItems"?"directoryListScroll":nullptr;
         if(scroll) {
             auto widget=ui_widget_find_by_id(ui_page_root(page_),scroll);
             if(widget) { ui_debug_scroll_set(widget,0); ui_widget_destroy(widget); }
@@ -747,9 +775,6 @@ LRESULT CALLBACK Application::subclass(HWND hwnd,UINT message,WPARAM wparam,LPAR
             self->dispatch();
         }
         if(message==WM_CLOSE && !self->stopping_) {
-            if(page_value(self->page_,"listTarget")!="") {
-                self->set_error("closeError","unsavedEntries"); return 0;
-            }
             ui_window_focus_widget(self->window_,0);
             ui_page_call_json(self->page_,"finishRootCell","{}");
             self->dispatch();

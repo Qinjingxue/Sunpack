@@ -34,6 +34,7 @@ class Application {
     UiWidget status_widget_ = 0;
     void bind_controls(const Json& fields);
     void sync_toggles();
+    void sync_tags(const std::string& id = {});
     void rebuild_theme(const std::string& language);
     void navigate(const std::string& tab);
     void work();

@@ -27,7 +27,7 @@ export default {
     rootRows:[],rootDrafts:{},rootNew:[],rootCell:'',rootPart:'',rootNext:0,rootQuery:'',cellPointer:null,
     configCategory:'',configQuery:'',drafts:{},toggleDrafts:{},saving:false,saveErrors:{},closeError:'',pendingFields:[],recordSaving:{passwords:false,roots:false},
     passwordRoot:'',passwordHistory:false,passwordHistoryTarget:false,passwordQuery:'',passwordDrafts:{},passwordNew:[],passwordCell:'',passwordNext:0,
-    listTarget:'',listTitle:'',listField:null,listRows:[],listNext:0,listQuery:'',listEntry:'',listEditing:-1,listMultiline:false,listImport:false,listImportText:'',listPreview:[],listError:''
+    tagInputs:{}
   }; },
   computed: {
     passwordScope() { return this.passwordHistoryTarget?'@history':this.passwordRoot||'@all'; },
@@ -38,7 +38,6 @@ export default {
       for(let d of Object.values(this.rootDrafts)) if(!ids.has(d.id)&&(d.pending||d.error||this.rootCell===d.id)) rows.push(d);
       return rows.filter(r=>{let d=this.rootDraft(r);return r.id===this.rootCell||d.pending||d.error||!q||(d.input+' '+d.output).toLowerCase().includes(q);});
     },
-    matchingListRows() { let q=this.listQuery.toLowerCase(); return this.listRows.filter(r=>r.value.toLowerCase().indexOf(q)>=0); },
     errorList() { return Object.keys(this.errors).map(k=>k+': '+this.errors[k]); },
     shownDirectories() { let q=this.directoryQuery.toLowerCase(); return this.directories.filter(d=>d.watch&&d.path.toLowerCase().indexOf(q)>=0); },
     shownPasswords() {
@@ -73,7 +72,7 @@ export default {
       if(f.editor==='text'||f.editor==='recursive') parts.push(d.text);
       if(f.editor==='recursive') parts.push(t.rounds);
       if(f.editor==='readonly') parts.push(t.readOnly);
-      if(f.editor==='list') { let items=this.drafts[f.id]?JSON.parse(d.text):f.items; parts.push(t.manageEntries,this.listCount(items),this.listSummary(items)); }
+      if(f.editor==='list') parts.push(t.tagInputPlaceholder,this.tagValues(f).map(v=>this.entryLabel(v)).join(' '));
       if(this.isRange(f)) {
         let r=this.rangeValue(f),date=f.editor==='datetime_range';
         parts.push(t.rangeEnable,date?t.rangeTimeHint:t.rangeHint,date?t.rangeStart:t.rangeMin,date?t.rangeEnd:t.rangeMax,r.lower,r.upper);
@@ -88,7 +87,7 @@ export default {
       let requests=op==='filterTasks'||op==='filterPasswords'?this.requests.filter(r=>r.op!==op):this.requests;
       this.requests=requests.concat([{op:op,payload:payload||{}}]); this.dispatch=true;
     },
-    go(tab) { if(this.listTarget) { this.closeError=this.texts.unsavedEntries; return; } this.send('navigate',{tab:tab}); },
+    go(tab) { this.send('navigate',{tab:tab}); },
     selectCategory(category) { this.send('animateView',{id:'configBlocks',category:category}); },
     searchDirectory(value) { this.directoryQuery=value; this.send('scrollTop',{id:'directoryItems'}); },
     searchConfig(value) { this.configQuery=value; this.send('scrollTop',{id:'configBlocks'}); },
@@ -548,45 +547,24 @@ export default {
       }
       if(changed) this.passwordDrafts=drafts;
     },
-    listCount(values) { return values.length+' '+this.texts.entries; },
     isDirectoryValue(value) { return typeof value==='string'&&/^(?:[a-zA-Z]:[\\/]|[\\/]{2}|\.{1,2}(?:[\\/]|$)|~[\\/])/.test(value); },
-    entryLabel(value) { return value.length?value.replace(/\r/g,'␍').replace(/\n/g,'↵'):this.texts.emptyEntry; },
-    listSummary(values,paths) { return values.slice(0,3).map(v=>{let s=this.entryLabel(v);return !paths&&!this.isDirectoryValue(v)&&s.length>60?s.slice(0,60)+'…':s;}).join(' · ')+(values.length>3?' …':''); },
-    searchList(value) { this.listQuery=value; this.send('scrollTop',{id:'listItems'}); },
-    rebaseListField(saved) {
-      if(this.listField&&this.listField.id===saved.id&&this.listField.original===saved.previous)
-        this.listField=Object.assign({},this.listField,{original:saved.original,text:saved.text});
+    entryLabel(value) { return value.length?value.split(String.fromCharCode(13)).join('␍').split(String.fromCharCode(10)).join('↵'):this.texts.emptyEntry; },
+    tagField(f) { return this.fields.find(current=>current.id===f.id)||f; },
+    tagValues(f) { f=this.tagField(f); return this.drafts[f.id]?JSON.parse(this.drafts[f.id].text):f.items; },
+    changeTagInput(f,value) { this.tagInputs=Object.assign({},this.tagInputs,{[f.id]:value}); },
+    saveTags(f,values) {
+      f=this.tagField(f); this.changeField(f,JSON.stringify(values));
+      this.send('syncTags',{id:f.id}); this.commitField(f);
     },
-    openList(target,field) {
-      field=this.fields.find(current=>current.id===field.id)||field;
-      let values=this.drafts[field.id]?JSON.parse(this.drafts[field.id].text):field.items;
-      this.listField=Object.assign({},field);
-      this.listTitle=field.label;
-      this.listRows=values.map((value,id)=>({id:id,value:value})); this.listNext=values.length;
-      this.listQuery=''; this.listEntry=''; this.listEditing=-1; this.listMultiline=false; this.listImport=false; this.listImportText=''; this.listPreview=[]; this.listError=''; this.listTarget=target;
+    addTag(f) {
+      let value=this.tagInputs[f.id]||''; if(!value.length) return;
+      this.saveTags(f,this.tagValues(f).concat([value]));
+      let inputs=Object.assign({},this.tagInputs); delete inputs[f.id]; this.tagInputs=inputs;
     },
-    closeList() { this.listTarget=''; this.listRows=[]; this.listField=null; this.listTitle=''; this.listQuery=''; this.listEntry=''; this.listImportText=''; this.listPreview=[]; this.listError=''; this.closeError=''; },
-    editListRow(row) { this.listEditing=row.id; this.listEntry=row.value; this.listMultiline=/[\r\n]/.test(row.value); },
-    putListEntry() {
-      let value=this.listEntry;
-      if(this.listEditing<0) this.listRows=this.listRows.concat([{id:this.listNext++,value:value}]);
-      else this.listRows=this.listRows.map(r=>r.id===this.listEditing?{id:r.id,value:value}:r);
-      this.listEntry=''; this.listEditing=-1; this.listMultiline=false; this.listError=''; return true;
-    },
-    removeListRow(id) { this.listRows=this.listRows.filter(r=>r.id!==id); if(this.listEditing===id) {this.listEditing=-1;this.listEntry='';} },
-    previewImport() {
-      // Line parsing is confined to this explicit import boundary. Password
-      // whitespace is significant; blank lines are intentionally skipped.
-      this.listPreview=this.listImportText.split(/\r\n|\n|\r/).filter(v=>v.length>0).map((value,id)=>({id:id,value:value}));
-    },
-    applyImport() { let next=this.listNext,rows=this.listPreview.map(r=>({id:next++,value:r.value})); this.listNext=next; this.listRows=this.listRows.concat(rows); this.listImport=false; this.listImportText=''; this.listPreview=[]; this.listError=''; },
-    saveList() {
-      if(this.listImportText.length) {this.listError=this.texts.finishImport;return;}
-      if((this.listEntry.length||this.listEditing>=0)&&!this.putListEntry()) return;
-      let values=this.listRows.map(r=>r.value);
-      let f=this.listField,draft={original:f.original,text:JSON.stringify(values),boolean:f.boolean,baselineText:f.text,baselineBoolean:f.boolean};
-      this.drafts=Object.assign({},this.drafts,{[f.id]:draft}); this.commitField(f);
-      this.closeList();
+    removeTag(p) {
+      let f=this.fields.find(f=>f.id===p.id); if(!f||f.editor!=='list') return;
+      let values=this.tagValues(f); if(p.index<0||p.index>=values.length||values[p.index]!==p.value) return;
+      this.saveTags(f,values.filter((value,index)=>index!==p.index));
     }
 
   }
@@ -710,14 +688,10 @@ export default {
   .runtime-dot.running { background:#6ccb5f; }
   .setting-description { color:var(--fg-2); font-size:12px; white-space:normal; }
   .choice-host { height:32px; flex-direction:row; }
-  .list-manager { flex:1; padding:20px; gap:12px; }
-  .light .list-manager { background:#f3f3f3; }
-  .dark .list-manager { background:#202020; }
-  .list-row { min-height:44px; padding:6px 0px; flex-direction:row; align-items:center; gap:8px; }
-  .list-value { flex:1; white-space:pre-wrap; }
-  .collection-preview { white-space:nowrap; }
-  .list-import { flex:1; gap:10px; }
-  #listEntry, #listMultiline, #listImportText { width:100%; }
+  .tag-setting { align-items:flex-start; }
+  .tag-setting .setting-copy { width:190px; flex:0; flex-shrink:1; gap:8px; }
+  .tag-setting .setting-copy input { width:100%; }
+  .tag-region { height:112px; min-width:0px; padding:6px 18px 6px 6px; border:1px solid var(--card-border); border-radius:6px; }
   .history-entry { gap:0px; padding:0px 12px; border:1px solid var(--card-border); border-radius:8px; }
   .light .history-entry, .light .root-header { background:#fbfbfb; }
   .dark .history-entry, .dark .root-header { background:#2b2b2b; }
@@ -759,7 +733,7 @@ export default {
 <template>
   <div :class="'app '+appearance">
     <div class="body">
-      <div id="navigation" class="navigation" :enabled="!listTarget">
+      <div id="navigation" class="navigation">
         <div id="identity" class="identity">
           <img id="appIcon" class="app-icon" src="sunpack.png" width="40" height="40" object-fit="contain"/>
           <div id="brand" class="column fill" style="gap:3px"><label class="brand">SunPack</label><label class="muted">{{ texts.manager }}</label></div>
@@ -807,7 +781,7 @@ export default {
       </div>
       </div>
       <div class="workspace">
-      <div id="page-tasks" v-show="tab==='tasks' &amp;&amp; !listTarget" class="content">
+      <div id="page-tasks" v-show="tab==='tasks'" class="content">
         <div class="page-header"><label class="heading">{{ texts.tasks }}</label></div>
         <div class="row task-filters"><input id="taskSearch" type="search" class="fill search-field" :placeholder="texts.taskSearch" :value="taskQuery" @input="searchTasks"/>
           <div id="taskStatusHost" style="width:180px;height:32px"/>
@@ -821,7 +795,7 @@ export default {
         </div></ScrollView>
         <label v-show="tasks.malformed" class="error">{{ tasks.malformed }} {{ texts.invalidLogs }}</label>
       </div>
-      <div id="page-config" v-show="tab==='config' &amp;&amp; !listTarget" class="content">
+      <div id="page-config" v-show="tab==='config'" class="content">
         <div class="page-header"><label class="heading">{{ texts.config }}</label></div>
         <input id="configSearch" type="search" class="search-field" :placeholder="texts.settingSearch" :value="configQuery" @input="searchConfig"/>
         <ScrollView id="configListScroll"><div id="configBlocks" class="column">
@@ -837,15 +811,15 @@ export default {
             <div v-if="true" class="block-fields">
             <div v-for="f in g.fields" :key="f.key" :id="'field-'+f.id" class="setting-item">
             <div v-show="f.id!==g.fields[0].id" class="setting-divider"/>
-            <div class="settings-row">
-              <div class="setting-copy"><label :class="f.primary?'subheading':'setting-title'">{{ f.label }}</label><label v-show="f.description" class="setting-description">{{ f.description }}</label></div>
-              <div v-show="!isRange(f)" class="setting-control">
+            <div class="settings-row" :class="f.editor==='list'?'tag-setting':''">
+              <div class="setting-copy"><label :class="f.primary?'subheading':'setting-title'">{{ f.label }}</label><label v-show="f.description" class="setting-description">{{ f.description }}</label><input v-show="f.editor==='list'" :id="'tag-input-'+f.id" :value="tagInputs[f.id]||''" :placeholder="texts.tagInputPlaceholder" @input="v=>changeTagInput(f,v)" @submit="addTag(f)"/></div>
+              <ScrollView v-if="f.editor==='list'" :id="'tag-scroll-'+f.id" class="tag-region"><div :id="'tags-host-'+f.id"/></ScrollView>
+              <div v-show="!isRange(f) &amp;&amp; f.editor!=='list'" class="setting-control">
                 <div v-show="f.editor==='toggle'" :id="'toggle-host-'+f.id" class="toggle-host"/>
                 <div v-show="f.editor==='choice'||f.editor==='recursive'" :id="'choice-'+f.id" class="choice-host"/>
                 <input v-show="f.editor==='text'" :ellipsis-start="isDirectoryValue(drafts[f.id]?drafts[f.id].text:f.text)" :id="'input-'+f.id" :value="drafts[f.id]?drafts[f.id].text:f.text" @input="v=>changeField(f,v)" @blur="commitField(f)" @submit="commitField(f)"/>
                 <div v-show="f.editor==='recursive' &amp;&amp; (drafts[f.id]?drafts[f.id].choice:f.choice)===2" class="column"><label class="muted">{{ texts.rounds }}</label><input :id="'rounds-'+f.id" :value="drafts[f.id]?drafts[f.id].text:f.text" @input="v=>changeField(f,v)" @blur="commitField(f)" @submit="commitField(f)"/></div>
                 <label v-show="f.editor==='readonly'" class="muted">{{ texts.readOnly }}</label>
-                <div v-show="f.editor==='list'" class="action-row"><label>{{ listCount(drafts[f.id]?JSON.parse(drafts[f.id].text):f.items) }}</label><button :id="'list-'+f.id" @click="openList('config',f)">{{ texts.manageEntries }}</button></div>
               </div>
             </div>
             <!-- Range modules have one draft and one atomic save target. -->
@@ -873,7 +847,6 @@ export default {
                 </div>
               </div>
             </div>
-            <label v-show="f.editor==='list'" class="muted collection-preview" :ellipsis-start="(f.items||[]).some(v=>isDirectoryValue(v))">{{ listSummary(drafts[f.id]?JSON.parse(drafts[f.id].text):f.items) }}</label>
             <label v-show="saveErrors[f.id]" class="error">{{ errorText(saveErrors[f.id]) }}</label>
             </div>
             </div>
@@ -881,7 +854,7 @@ export default {
           </VirtualList>
         </div></ScrollView>
       </div>
-      <div id="page-roots" v-show="tab==='roots' &amp;&amp; !listTarget" class="content">
+      <div id="page-roots" v-show="tab==='roots'" class="content">
         <div class="page-header"><label class="heading">{{ texts.rootManagement }}</label></div>
         <div class="password-toolbar"><input id="rootSearch" type="search" class="management-search search-field" :placeholder="texts.searchDirectory" :value="rootQuery" @input="searchRoots"/><button id="addRoot" @click="addRoot()">{{ texts.addRoot }}</button></div>
         <div class="root-table">
@@ -905,7 +878,7 @@ export default {
           </div></VirtualList></ScrollView>
         </div>
       </div>
-      <div id="page-passwords" v-show="tab==='passwords' &amp;&amp; !listTarget" class="content">
+      <div id="page-passwords" v-show="tab==='passwords'" class="content">
         <div class="page-header"><label class="heading">{{ texts.passwords }}</label></div>
         <div class="password-toolbar"><input id="passwordSearch" type="search" class="search-field management-search" :placeholder="texts.passwordSearch" :value="passwordQuery" @input="searchPasswords"/><div class="password-tabs"><button id="newPassword" @click="addPassword()">{{ texts.addPasswords }}</button><button id="savedPasswords" :class="!passwordHistoryTarget?'on':''" @click="selectPasswordView(false)">{{ texts.savedPasswords }}</button><button id="clipboardHistory" :class="passwordHistoryTarget?'on':''" @click="selectPasswordView(true)">{{ texts.history }}</button></div></div>
         <div class="password-table">
@@ -926,19 +899,6 @@ export default {
             </VirtualList>
           </div>
         </div></ScrollView></div>
-      </div>
-      <!-- Keep the shell mounted like the existing pages. Nested dynamic
-           v-if scopes in this Core UI version can leave duplicate IDs when
-           reopening. Clearing the row arrays releases all virtual entries. -->
-      <div id="listManager" v-show="listTarget" class="list-manager">
-        <div class="row"><label class="heading fill">{{ listTitle }}</label><button id="cancelList" @click="closeList()">{{ texts.cancelEntries }}</button><button id="saveList" @click="saveList()">{{ texts.saveEntries }}</button></div>
-        <div v-show="!listImport" class="action-row"><label>{{ listCount(listRows) }}</label><input id="listSearch" type="search" class="fill" :value="listQuery" @input="searchList" :placeholder="texts.searchEntries"/></div>
-        <label v-show="listError" class="error">{{ listError }}</label>
-        <ScrollView id="listScroll" v-show="!listImport"><VirtualList id="listItems" estimated-height="48px"><div v-for="r in matchingListRows" :key="r.id" :id="'list-row-'+r.id" class="list-row"><label class="list-value" :ellipsis-start="isDirectoryValue(r.value)">{{ entryLabel(r.value) }}</label><button :id="'edit-list-'+r.id" @click="editListRow(r)">{{ texts.edit }}</button><button :id="'remove-list-'+r.id" @click="removeListRow(r.id)">{{ texts.delete }}</button></div></VirtualList></ScrollView>
-        <div v-show="!listImport" class="column"><label>{{ listEditing===-1?texts.newEntry:texts.edit }}</label><input :ellipsis-start="isDirectoryValue(listEntry)" id="listEntry" v-show="!listMultiline" v-model="listEntry" @submit="putListEntry()"/><textarea id="listMultiline" v-show="listMultiline" v-model="listEntry" style="height:90px"/>
-          <div class="action-row"><button id="putListEntry" @click="putListEntry()">{{ listEditing===-1?texts.addToList:texts.updateEntry }}</button><button v-show="listTarget==='config'" id="toggleListMultiline" @click="listMultiline=!listMultiline">{{ texts.multilineEntry }}</button><button id="importList" @click="listImport=!listImport">{{ texts.importEntries }}</button></div>
-        </div>
-        <div v-show="listImport" class="list-import"><label class="muted">{{ texts.importHint }}</label><textarea id="listImportText" v-model="listImportText" @input="v=>{listImportText=v;listPreview=[];}" style="height:100px"/><div class="action-row"><button id="previewImport" @click="previewImport()">{{ texts.previewEntries }}</button><button id="applyImport" :enabled="listPreview.length>0" @click="applyImport()">{{ texts.importEntries }} · {{ listPreview.length }}</button><button id="cancelImport" @click="listImport=false;listImportText='';listPreview=[];listError=''">{{ texts.cancelEntries }}</button></div><ScrollView><VirtualList id="importPreviewItems" estimated-height="28px"><label v-for="r in listPreview" :key="r.id" :ellipsis-start="isDirectoryValue(r.value)">{{ entryLabel(r.value) }}</label></VirtualList></ScrollView></div>
       </div>
       </div>
     </div>

@@ -312,57 +312,17 @@
       "zh": "条",
       "en": "entries"
     },
-    "manageEntries": {
-      "zh": "管理条目",
-      "en": "Manage entries"
-    },
-    "saveEntries": {
-      "zh": "保存",
-      "en": "Save"
-    },
     "cancelEntries": {
       "zh": "取消",
       "en": "Cancel"
-    },
-    "searchEntries": {
-      "zh": "搜索条目",
-      "en": "Search entries"
-    },
-    "newEntry": {
-      "zh": "新增条目",
-      "en": "New entry"
     },
     "emptyEntry": {
       "zh": "（空字符串）",
       "en": "(empty string)"
     },
-    "updateEntry": {
-      "zh": "更新条目",
-      "en": "Update entry"
-    },
-    "importEntries": {
-      "zh": "批量导入",
-      "en": "Bulk import"
-    },
-    "previewEntries": {
-      "zh": "预览导入",
-      "en": "Preview import"
-    },
-    "multilineEntry": {
-      "zh": "条目内换行",
-      "en": "Multiline entry"
-    },
-    "importHint": {
-      "zh": "每行导入一个条目，忽略空行；保留条目首尾空格。先预览，再导入。",
-      "en": "One entry per line; blank lines are skipped. Entry whitespace is preserved. Preview before importing."
-    },
     "unsavedEntries": {
       "zh": "请先保存或取消当前编辑。",
       "en": "Save or cancel the current edit first."
-    },
-    "finishImport": {
-      "zh": "请先预览并导入，或清空批量输入。",
-      "en": "Preview and import the batch, or clear the import text first."
     },
     "operationFailed": {
       "zh": "操作未完成",
@@ -459,10 +419,6 @@
     "runtimeUnknown": {
       "zh": "状态未知",
       "en": "Status unavailable"
-    },
-    "addToList": {
-      "zh": "添加到列表",
-      "en": "Add to list"
     },
     "rootConflict": {
       "zh": "此监控目录已被其他程序修改，请放弃更改后重新编辑。",
@@ -803,6 +759,14 @@
     "opServiceRefresh": {
       "zh": "创建服务刷新事件",
       "en": "Create service refresh event"
+    },
+    "tagInputPlaceholder": {
+      "zh": "输入后按 Enter 添加",
+      "en": "Type a tag and press Enter"
+    },
+    "noTags": {
+      "zh": "暂无条目",
+      "en": "No tags yet"
     }
   },
   "groups": {
