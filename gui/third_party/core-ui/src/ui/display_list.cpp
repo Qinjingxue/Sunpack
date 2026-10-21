@@ -97,7 +97,7 @@ bool EqualDrawCommand(const DisplayList& a, size_t ai, const DisplayList& b, siz
     }
 }
 
-DisplayListBounds AnalyzeDisplayList(const DisplayList& list) {
+DisplayListBounds AnalyzeDisplayList(const DisplayList& list, DisplayListInkQuery inkQuery, void* inkContext) {
     DisplayListBounds result;
     result.commands.resize(list.commands.size());
     result.ends.assign(list.commands.size(),size_t(-1));
@@ -139,9 +139,14 @@ DisplayListBounds AnalyzeDisplayList(const DisplayList& list) {
         D2D1_RECT_F bounds{};
         if(c.type==DrawCommandType::Clear) bounds=clips.back();
         else if(c.type==DrawCommandType::DrawText || c.type==DrawCommandType::DrawSvgIcon || c.type==DrawCommandType::DrawSvgDocument) {
-            // DirectWrite overhangs and arbitrary SVG strokes may escape rect.
-            // Their active clip is a conservative, exact damage footprint.
-            bounds=clips.back();
+            D2D1_RECT_F ink{};
+            if (inkQuery && inkQuery(list, i, ink, inkContext)) {
+                // Allow grid fitting and anti-aliasing beyond the DIP ink box.
+                const float pad=2/scale;
+                ink=TransformRect(ink,matrix);
+                ink={ink.left-pad,ink.top-pad,ink.right+pad,ink.bottom+pad};
+                bounds=IntersectRect(clips.back(),ink);
+            } else bounds=clips.back();
         } else if(c.type==DrawCommandType::DrawSvgTextRuns || c.type==DrawCommandType::DrawBackdropBlur) {
             result.incremental=false; bounds=window;
         } else {

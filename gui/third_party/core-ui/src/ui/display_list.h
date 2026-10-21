@@ -290,7 +290,11 @@ struct DisplayListBounds {
     std::vector<size_t> ends;
     bool incremental = true;
 };
-DisplayListBounds AnalyzeDisplayList(const DisplayList& list);
+// Optional device-resolved local ink bounds, before the command/stack transform.
+// Unknown resources retain their conservative clip footprint.
+using DisplayListInkQuery = bool (*)(const DisplayList&, size_t, D2D1_RECT_F&, void*);
+DisplayListBounds AnalyzeDisplayList(const DisplayList& list, DisplayListInkQuery inkQuery = nullptr,
+                                     void* inkContext = nullptr);
 D2D1_RECT_F DisplayListDamage(const DisplayList& previous, const DisplayListBounds& oldBounds,
                              const DisplayList& next, const DisplayListBounds& newBounds);
 

@@ -2725,9 +2725,12 @@ std::unique_ptr<PageState::JsLoopIteration> PageState::BuildJsIteration(
 
     JSContext* ctx = jsRt_->ctx();
 
-    iter->subPage = CompileIterationTemplate(*rt.spec->templateNode,
-                                              *page_.ownedStylesheet,
-                                              page_.cssVars);
+    {
+        TraceScope scope("page_state","iteration_compile_duration");
+        iter->subPage = CompileIterationTemplate(*rt.spec->templateNode,
+                                                  *page_.ownedStylesheet,
+                                                  page_.cssVars);
+    }
     if (!iter->subPage.root) return iter;
     iter->mountedRoot = iter->subPage.root;
 

@@ -44,6 +44,26 @@ ui::DisplayList scene(Surface& surface,int step) {
     base.text_render_mode=int(surface.renderer.TextRenderMode());
     ui::DisplayListRecorder r(std::move(base));
     r.Clear(D2D1::ColorF(step>=14?0x202020:0xf3f3f3));
+    if (step>=21) {
+        // Isolated ink changes must erase old overhangs without repainting an
+        // unrelated rounded layer. Alignment, wrap and live transforms all
+        // contribute to the true DirectWrite paint origin.
+        r.FillRect({0,0,420,320},D2D1::ColorF(0xfafafa));
+        ui::TextStyle style; style.font_family=L"Segoe UI"; style.font_size=19;
+        style.alignment=step%3; style.paragraph_alignment=(step/2)%3;
+        style.word_wrap=step%2!=0;
+        r.PushClip({9,9,410,310});
+        r.PushTransform(D2D1::Matrix3x2F::Scale(1.0f,1.05f)*
+            D2D1::Matrix3x2F::Rotation(3)*D2D1::Matrix3x2F::Translation(0.125f*(step%3),0.375f));
+        r.DrawText(step%2?L"中文 e\u0301 😀 fff italic-overhang":L"更新 / shorter",{18,24,275,122},style);
+        r.PopTransform();
+        r.PushRoundedClip({40,180,360,280},12,12);
+        r.FillRect({30,170,370,290},D2D1::ColorF(0x90a0b0));
+        r.DrawText(L"unchanged clipped text",{50,185,350,270},style);
+        r.PopRoundedClip();
+        r.PopClip();
+        return r.Finish();
+    }
     r.FillRect({0,0,96,320},D2D1::ColorF(0xdddddd));
     ui::TextStyle text; text.font_family=L"Segoe UI"; text.font_size=14;
     r.DrawText(L"导航 / Navigation",{3,5,94,55},text);
@@ -80,7 +100,7 @@ ui::DisplayList scene(Surface& surface,int step) {
 // replay, including alternating buffers, fractional motion, alpha and lifecycle.
 void rendering_contracts() {
     Surface actual(20),reference(700);
-    for(int step=0;step<21;++step) {
+    for(int step=0;step<31;++step) {
         if(step==18) {
             for(auto* surface:{&actual,&reference}) {
                 SetWindowPos(surface->hwnd,nullptr,0,0,720,500,SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE);

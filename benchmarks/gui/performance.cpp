@@ -30,7 +30,7 @@ using namespace spg;
 namespace {
 using Clock=std::chrono::steady_clock;
 struct CpuTime { uint64_t ticks=0; };
-struct Samples { std::vector<double> wall,cpu_ms,cpu_mcycles,gpu_ms; };
+struct Samples { std::vector<double> wall,cpu_ms,cpu_mcycles,gpu_ms,ui_mcycles; };
 // Scheduler-accounted process engine time, not Present/VSync wait. Engines
 // may overlap, so this is a sum of busy times rather than GPU utilization.
 class GpuTime {
@@ -66,6 +66,7 @@ std::string trace_phase;
 std::string active_action;
 double last_present_ms=0;
 std::string last_present_phase;
+thread_local uint64_t present_cycles=0;
 std::atomic<uint64_t> motion_stop_count{0}, paint_count{0}, animation_frame_count{0}, property_frame_count{0};
 std::atomic<bool> motion_active{false};
 std::atomic<uint64_t> layout_count{0}, draw_count{0};
@@ -83,6 +84,9 @@ CpuTime process_cpu() {
 uint64_t process_cycles() {
     ULONG64 cycles=0; QueryProcessCycleTime(GetCurrentProcess(),&cycles); return cycles;
 }
+uint64_t ui_cycles() {
+    ULONG64 cycles=0; QueryThreadCycleTime(GetCurrentThread(),&cycles); return cycles;
+}
 uint64_t working_set() {
     PROCESS_MEMORY_COUNTERS_EX m{}; m.cb=sizeof(m);
     return GetProcessMemoryInfo(GetCurrentProcess(),reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&m),sizeof(m))
@@ -90,6 +94,9 @@ uint64_t working_set() {
 }
 void trace_sink(const UiTraceEvent* e,void*) {
     if(!e) return;
+    if(e->name && !std::strcmp(e->name,"present_begin")) {
+        ULONG64 cycles=0; QueryThreadCycleTime(GetCurrentThread(),&cycles); present_cycles=cycles;
+    }
     if(e->name && !std::strcmp(e->name,"frame_damage")) {
         std::lock_guard<std::mutex> lock(trace_mutex);
         if(!trace_phase.empty()) for(uint32_t i=0;i<e->field_count;++i) {
@@ -134,6 +141,9 @@ void trace_sink(const UiTraceEvent* e,void*) {
     std::lock_guard<std::mutex> lock(trace_mutex);
     const std::string name=e->name?e->name:"";
     if(name=="present_duration") {
+        ULONG64 cycles=0; QueryThreadCycleTime(GetCurrentThread(),&cycles);
+        if(present_cycles && !trace_phase.empty())
+            trace_samples[trace_phase+"::present_thread_million_cycles"].push_back(double(cycles-present_cycles)/1000000.0);
         const double tick=now_ms();
         if(last_present_phase==trace_phase && last_present_ms>0 && !trace_phase.empty())
             trace_samples[trace_phase+"::present_interval_ms"].push_back(tick-last_present_ms);
@@ -157,7 +167,7 @@ template<class F> void measure(const std::string& name,F&& fn) {
     const auto gpu_before=gpu_sample?gpu_time().read():std::nullopt;
     { std::lock_guard<std::mutex> lock(trace_mutex); trace_phase=name; }
     active_action=name;
-    const double wall=now_ms(); const auto cycles=process_cycles(); const auto cpu=process_cpu();
+    const double wall=now_ms(); const auto cycles=process_cycles(); const auto cpu=process_cpu(); const auto ui=ui_cycles();
     fn();
     const auto cpu_after=process_cpu(); const auto cycles_after=process_cycles(); const double elapsed=now_ms()-wall;
     { std::lock_guard<std::mutex> lock(trace_mutex); trace_phase.clear(); }
@@ -165,6 +175,7 @@ template<class F> void measure(const std::string& name,F&& fn) {
     auto& out=samples[name]; out.wall.push_back(elapsed);
     out.cpu_ms.push_back(double(cpu_after.ticks-cpu.ticks)/10000.0);
     out.cpu_mcycles.push_back(double(cycles_after-cycles)/1000000.0);
+    out.ui_mcycles.push_back(double(ui_cycles()-ui)/1000000.0);
     const auto gpu_after=gpu_sample?gpu_time().read():std::nullopt;
     if(gpu_before && gpu_after && *gpu_after>=*gpu_before) out.gpu_ms.push_back(double(*gpu_after-*gpu_before)/10000.0);
     if(elapsed>1000) std::cerr<<"slow GUI sample: "<<name<<" took "<<std::fixed<<std::setprecision(1)<<elapsed<<" ms\n";
@@ -182,6 +193,7 @@ Json summarize() {
         actions[name]={{"wall_ms",distribution(s.wall)},
             {"process_cpu_million_cycles",distribution(s.cpu_mcycles)}};
         actions[name]["process_cpu_ms"]=distribution(s.cpu_ms);
+        actions[name]["ui_thread_million_cycles"]=distribution(s.ui_mcycles);
         if(!s.gpu_ms.empty()) actions[name]["gpu_engine_busy_ms"]=distribution(s.gpu_ms);
     }
     Json traces=Json::object(), counts=Json::object();
@@ -546,15 +558,19 @@ int wmain(int argc,wchar_t** argv) {
                 ui_window_set_size(app.window(),1100+int(i%6)*8,700+int(i%3)*8); pump_messages();
             });
             ui_window_set_size(app.window(),1120,720); pump_messages();
+            const auto config_block_count=page_state(app.page(),"matchingBlocks").size();
             measure("config_wheel_traverse",[&]{
                 for(int step=0;step<1500;++step) {
                     const auto paints=paint_count.load();
+                    const float old_scroll=allScroll->ScrollY();
                     auto bounds=allScroll->rect;
                     ensure(ui_debug_wheel_at(app.window(),bounds.left+20,bounds.top+20,-120)==0,"configuration wheel failed");
-                    wait_for([&]{return paint_count.load()>paints;},"configuration wheel frame");
-                    if(!allItems->Children().empty() &&
-                       allItems->Indices().back()+1==page_state(app.page(),"matchingBlocks").size() &&
-                       allItems->Children().back()->rect.bottom<=bounds.bottom) break;
+                    wait_for([&]{return paint_count.load()>paints || !allScroll->ScrollAnimating();},"configuration wheel frame");
+                    // Read the static list count once, outside timing. Padding
+                    // can put the last row beyond bounds.bottom at the clamped
+                    // end; stop when motion is exhausted and offset is stable.
+                    if(!allItems->Indices().empty() && allItems->Indices().back()+1==config_block_count &&
+                       !allScroll->ScrollAnimating() && allScroll->ScrollY()==old_scroll) break;
                 }
                 wait_for([&]{return !allScroll->ScrollAnimating();},"configuration wheel completion");
             });

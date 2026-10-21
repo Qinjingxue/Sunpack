@@ -262,7 +262,7 @@ namespace {
 /* 共享 D3D11 设备创建 (HW → WARP 回退)。free-threaded API, 可在任意线程跑。 */
 Microsoft::WRL::ComPtr<ID3D11Device> CreateSharedD3DDevice() {
     Microsoft::WRL::ComPtr<ID3D11Device> dev;
-    UINT creationFlags = D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_PREVENT_INTERNAL_THREADING_OPTIMIZATIONS;
+    UINT creationFlags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
     D3D_FEATURE_LEVEL featureLevels[] = {
         D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0,
         D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_10_0
@@ -1001,11 +1001,13 @@ void Renderer::ClearTextCaches() {
 }
 
 ComPtr<IDWriteTextLayout> Renderer::GetDrawTextLayout(const std::wstring& text, IDWriteTextFormat* format,
-    float width, float height, DWRITE_TEXT_ALIGNMENT align, DWRITE_PARAGRAPH_ALIGNMENT paragraph, bool wrap) {
+    float width, float height, DWRITE_TEXT_ALIGNMENT align, DWRITE_PARAGRAPH_ALIGNMENT paragraph, bool wrap,
+    D2D1_RECT_F* ink) {
     TextLayoutKey key{format, text, FloatBits(width), FloatBits(height), int(align), int(paragraph), wrap};
     auto found = textLayoutCache_.find(key);
     if (found != textLayoutCache_.end()) {
         textLayouts_.splice(textLayouts_.begin(), textLayouts_, found->second);
+        if (ink && found->second->hasInk) *ink=found->second->ink;
         return found->second->layout;
     }
     ComPtr<IDWriteTextLayout> layout;
@@ -1019,6 +1021,10 @@ ComPtr<IDWriteTextLayout> Renderer::GetDrawTextLayout(const std::wstring& text, 
         dwFactory_->CreateEllipsisTrimmingSign(format, &ellipsis);
         if (ellipsis) layout->SetTrimming(&trimming, ellipsis.Get());
     }
+    DWRITE_OVERHANG_METRICS overhang{};
+    const bool hasInk=SUCCEEDED(layout->GetOverhangMetrics(&overhang));
+    const D2D1_RECT_F localInk{-overhang.left,-overhang.top,width+overhang.right,height+overhang.bottom};
+    if (ink && hasInk) *ink=localInk;
     // A long clipboard entry is drawn correctly but must not evict the whole
     // working set or retain megabytes of glyph/layout data after scrolling away.
     if (text.size() <= 4096) {
@@ -1034,10 +1040,52 @@ ComPtr<IDWriteTextLayout> Renderer::GetDrawTextLayout(const std::wstring& text, 
         entry.key = key;
         entry.key.text = entry.text;
         entry.layout = layout;
+        entry.ink=localInk; entry.hasInk=hasInk;
         textLayoutChars_ += text.size();
         textLayoutCache_.emplace(entry.key, textLayouts_.begin());
     }
     return layout;
+}
+
+ComPtr<IDWriteTextLayout> Renderer::GetTextPaint(const std::wstring& text, D2D1_RECT_F rect,
+    float size, const wchar_t* family, DWRITE_FONT_WEIGHT weight, DWRITE_TEXT_ALIGNMENT align,
+    DWRITE_PARAGRAPH_ALIGNMENT paragraph, bool wrap, D2D1_POINT_2F& origin, D2D1_RECT_F* ink) {
+    const float width=rect.right-rect.left;
+    if (width<=0 || rect.bottom<=rect.top || !dwFactory_) return nullptr;
+    if (!wrap && paragraph==DWRITE_PARAGRAPH_ALIGNMENT_CENTER) {
+        rect.top-=2.0f; rect.bottom+=2.0f;
+    }
+    origin={rect.left,rect.top};
+    auto format=GetTextFormat(size,(family && *family)?family:theme::kFontFamily,weight);
+    if (!format) return nullptr;
+    return GetDrawTextLayout(text,format.Get(),width,rect.bottom-rect.top,align,paragraph,wrap,ink);
+}
+
+static D2D1_RECT_F CullBounds(const D2D1_RECT_F& rect, const D2D1_MATRIX_3X2_F& m);
+
+bool Renderer::CommandInkBounds(const DisplayList& list, size_t index, D2D1_RECT_F& ink) {
+    const auto& command=list.commands[index];
+    if (command.type==DrawCommandType::DrawSvgDocument && ctx5_ &&
+        command.svg_document_ref_index<list.svg_document_refs.size()) {
+        auto* cached=GetSvgDocument(list.svg_document_refs[command.svg_document_ref_index]);
+        if (!cached) return false;
+        ResolveSvgInk(*cached);
+        if (!cached->hasInk) return false;
+        ink=CullBounds(cached->ink,command.transform);
+        return true;
+    }
+    if (command.type!=DrawCommandType::DrawText || command.text_index>=list.text_pool.size()) return false;
+    const auto& style=command.text_style;
+    D2D1_POINT_2F origin{};
+    ink.left=std::numeric_limits<float>::quiet_NaN();
+    auto layout=GetTextPaint(list.text_pool[command.text_index],command.rect,style.font_size,
+        style.font_family.c_str(),static_cast<DWRITE_FONT_WEIGHT>(style.weight),
+        static_cast<DWRITE_TEXT_ALIGNMENT>(style.alignment),static_cast<DWRITE_PARAGRAPH_ALIGNMENT>(style.paragraph_alignment),
+        style.word_wrap,origin,&ink);
+    if (!layout || !std::isfinite(ink.left) || !std::isfinite(ink.top) ||
+        !std::isfinite(ink.right) || !std::isfinite(ink.bottom)) return false;
+    ink={ink.left+origin.x,ink.top+origin.y,ink.right+origin.x,ink.bottom+origin.y};
+    return true;
 }
 
 ComPtr<IDWriteTextFormat> Renderer::GetTextFormat(float fontSize, const wchar_t* family,
@@ -1370,27 +1418,11 @@ void Renderer::DrawText(const std::wstring& text, const D2D1_RECT_F& rect, const
         recorder->DrawText(text, rect, style);
     }
     auto brush = GetBrush(color);
-    auto fmt = GetTextFormat(fontSize, (family && *family) ? family : theme::kFontFamily, weight);
-    if (!brush || !fmt || !dwFactory_) return;
-
-    float layoutW = rect.right - rect.left;
-    float layoutH = rect.bottom - rect.top;
-    if (layoutW <= 0 || layoutH <= 0) return;
-
-    float drawTop = rect.top;
-    float drawLayoutH = layoutH;
-    if (!wordWrap && vAlign == DWRITE_PARAGRAPH_ALIGNMENT_CENTER) {
-        // Some CJK fallback glyphs overhang the nominal line box by a pixel or
-        // two at fractional DPI scales. Expand the layout symmetrically so the
-        // visual center stays unchanged while DirectWrite has room for ink.
-        constexpr float kVerticalOverhangPad = 2.0f;
-        drawTop -= kVerticalOverhangPad;
-        drawLayoutH += kVerticalOverhangPad * 2.0f;
-    }
-
-    auto layout = GetDrawTextLayout(text, fmt.Get(), layoutW, drawLayoutH, align, vAlign, wordWrap);
+    if (!brush) return;
+    D2D1_POINT_2F origin{};
+    auto layout=GetTextPaint(text,rect,fontSize,family,weight,align,vAlign,wordWrap,origin);
     if (!layout) return;
-    ctx_->DrawTextLayout({rect.left, drawTop}, layout.Get(), brush.Get());
+    ctx_->DrawTextLayout(origin, layout.Get(), brush.Get());
 }
 
 ComPtr<IDWriteTextLayout> Renderer::CreateTextLayout(const std::wstring& text,
@@ -2574,7 +2606,9 @@ void Renderer::PrepareDisplayList(const DisplayList& list) {
             SetTextRenderMode(static_cast<theme::TextRenderMode>(list.text_render_mode));
         }
     }
-    nextBounds_=AnalyzeDisplayList(list);
+    nextBounds_=AnalyzeDisplayList(list,[](const DisplayList& source,size_t index,D2D1_RECT_F& ink,void* context) {
+        return static_cast<Renderer*>(context)->CommandInkBounds(source,index,ink);
+    },this);
     const size_t oldFirst=opacityFirst_,oldEnd=opacityEnd_;
     opacityPush_=size_t(-1);
     for(size_t i=0;i<list.commands.size();++i) {
@@ -2690,32 +2724,73 @@ void Renderer::ReplayDisplayList(const DisplayList& list) {
     PruneImageBitmapCacheTo(list.image_refs);
 }
 
-void Renderer::DrawCachedSvgDocument(const SvgDocumentRef& source, const D2D1_MATRIX_3X2_F& transform) {
+Renderer::CachedSvgDocument* Renderer::GetSvgDocument(const SvgDocumentRef& source) {
     for(auto it=svgDocuments_.begin();it!=svgDocuments_.end();++it) if(EqualSvgDocument(it->source,source)) {
         svgDocuments_.splice(svgDocuments_.begin(),svgDocuments_,it);
-        auto& cached=svgDocuments_.front();
-        DrawSvgStepsOrdered(ctx5_.Get(),source.steps,source.viewport_w,source.viewport_h,transform,&cached.content,&cached.shadows);
-        return;
+        return &svgDocuments_.front();
     }
     size_t bytes=0;
     for(const auto& step:source.steps) bytes+=step.xml.size()+step.shadow_xml.size();
     if(bytes>16384 || source.steps.size()>64) {
-        DrawSvgStepsOrdered(ctx5_.Get(),source.steps,source.viewport_w,source.viewport_h,transform,nullptr,nullptr);
-        return;
+        return nullptr;
     }
     while(!svgDocuments_.empty() && (svgDocuments_.size()>=64 || svgDocumentBytes_+bytes>131072)) {
         svgDocumentBytes_-=svgDocuments_.back().bytes;
         svgDocuments_.pop_back();
     }
     svgDocuments_.push_front({source,{},{},bytes}); svgDocumentBytes_+=bytes;
-    auto& cached=svgDocuments_.front();
-    DrawSvgStepsOrdered(ctx5_.Get(),source.steps,source.viewport_w,source.viewport_h,transform,&cached.content,&cached.shadows);
+    return &svgDocuments_.front();
+}
+
+void Renderer::ResolveSvgInk(CachedSvgDocument& cached) {
+    if (cached.inkResolved) return;
+    cached.inkResolved=true;
+    // Text must be rasterized with the live transform for DirectWrite snapping.
+    // Shadow effects can have unbounded output; keep their conservative path.
+    for (const auto& step:cached.source.steps)
+        if (!step.shadow_xml.empty() || step.xml.find("<text")!=std::string::npos ||
+            step.xml.find("<foreignObject")!=std::string::npos) return;
+    ComPtr<ID2D1CommandList> commands;
+    if (FAILED(ctx_->CreateCommandList(&commands))) return;
+    ComPtr<ID2D1Image> target; ctx_->GetTarget(&target);
+    D2D1_MATRIX_3X2_F transform{}; ctx_->GetTransform(&transform);
+    ctx_->SetTarget(commands.Get());
+    ctx_->BeginDraw();
+    ctx_->SetTransform(D2D1::Matrix3x2F::Identity());
+    const auto& source=cached.source;
+    DrawSvgStepsOrdered(ctx5_.Get(),source.steps,source.viewport_w,source.viewport_h,
+        D2D1::Matrix3x2F::Identity(),&cached.content,&cached.shadows);
+    const HRESULT drawn=ctx_->EndDraw();
+    ctx_->SetTarget(target.Get());
+    ctx_->SetTransform(transform);
+    if (FAILED(drawn) || FAILED(commands->Close())) return;
+    D2D1_RECT_F bounds{};
+    if (FAILED(ctx_->GetImageLocalBounds(commands.Get(),&bounds)) || !std::isfinite(bounds.left) ||
+        !std::isfinite(bounds.top) || !std::isfinite(bounds.right) || !std::isfinite(bounds.bottom)) return;
+    cached.geometry=std::move(commands); cached.ink=bounds; cached.hasInk=true;
+}
+
+void Renderer::DrawCachedSvgDocument(const SvgDocumentRef& source, const D2D1_MATRIX_3X2_F& transform) {
+    auto* cached=GetSvgDocument(source);
+    if (cached && cached->geometry) {
+        ctx_->SetTransform(transform);
+        ctx_->DrawImage(cached->geometry.Get());
+    } else DrawSvgStepsOrdered(ctx5_.Get(),source.steps,source.viewport_w,source.viewport_h,transform,
+        cached?&cached->content:nullptr,cached?&cached->shadows:nullptr);
 }
 
 void Renderer::ReplayDisplayListRange(const DisplayList& list, size_t first, size_t end, bool useRetained) {
     std::vector<D2D1_MATRIX_3X2_F> transformStack;
     size_t retainedIndex=0;
     for (size_t i=first; i<end; ++i) {
+        if (replayBounds_ && replayBounds_->ends[i]!=size_t(-1) && replayBounds_->ends[i]<end) {
+            const auto& b=replayBounds_->commands[i];
+            if (b.right<=replayDamage_.left || b.left>=replayDamage_.right ||
+                b.bottom<=replayDamage_.top || b.top>=replayDamage_.bottom) {
+                i=replayBounds_->ends[i];
+                continue;
+            }
+        }
         if(useRetained && !replayingCache_) {
             while(retainedIndex<opacityCommands_.size() && opacityCommands_[retainedIndex].end<=i) ++retainedIndex;
             if(retainedIndex<opacityCommands_.size() && opacityCommands_[retainedIndex].first==i) {

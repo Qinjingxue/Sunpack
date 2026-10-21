@@ -2805,7 +2805,7 @@ bool ScrollViewWidget::OnMouseWheel(const MouseEvent& e) {
     if (animate) scrollVelocity_ = (target - scrollPosition_) * kWheelDecay;
     else { scrollPosition_ = target; scrollVelocity_ = 0; }
     scrollTick_ = now;
-    scrollPending_ = true;
+    scrollPending_ = scrollPending_ || scrollVelocity_ != 0 || scrollPosition_ != double(scrollY_);
     if (ScrollAnimating()) GetContext().RegisterAnimatingWidget(this);
     return true;
 }

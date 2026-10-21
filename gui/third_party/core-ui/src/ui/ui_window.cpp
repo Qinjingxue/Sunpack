@@ -1368,6 +1368,10 @@ LRESULT UiWindowImpl::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         } else {
             ValidateRect(hwnd_, nullptr);
         }
+        // A scroll frame is paced by the render-thread completion message.
+        // WM_PAINT can still be queued from the invalidation that started the
+        // in-flight frame; consume it without recording a superseded list.
+        if (scrollFrameGeneration_ != 0) return 0;
         RequestRenderFrame(FrameReason::Paint, PresentPolicy::Deferred);
         return 0;
 
@@ -1979,7 +1983,9 @@ LRESULT UiWindowImpl::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             static_cast<uint64_t>(lParam) == renderWindowId_.hwnd_generation) {
             if (scrollFrameGeneration_ && RenderThread::Instance().LastCompletedGeneration(
                     renderWindowId_.window_id) >= scrollFrameGeneration_) scrollFrameGeneration_ = 0;
-            if (!scrollFrameGeneration_ && (HasAnimationFrameWork() || scrollPaintPending_)) Invalidate();
+            if (!scrollFrameGeneration_ &&
+                (HasAnimationFrameWork() || scrollPaintPending_ || frameScheduler_.HasPending()))
+                Invalidate();
         }
         return 0;
     case kMsgRenderFrame: {
@@ -2292,6 +2298,14 @@ void UiWindowImpl::BeginAnimationFrame() {
 
 void UiWindowImpl::PaintAndValidate() {
     if (!hwnd_) return;
+    // A scroll frame already submitted to the render thread owns the next
+    // presentation. Drain duplicate paint notifications without consuming
+    // scheduler state or rebuilding the widget display list; completion will
+    // schedule the latest scroll position.
+    if (scrollFrameGeneration_ != 0) {
+        ValidateRect(hwnd_, nullptr);
+        return;
+    }
     auto frame = frameScheduler_.BeginFrame();
     TraceEvent("core_window", "paint_and_validate",
                {TraceI64("frame_reasons", static_cast<int64_t>(frame.reasons)),
@@ -3168,6 +3182,7 @@ void UiWindowImpl::OnMouseWheel(float x, float y, int delta) {
         Widget* hit = root_->HitTest(dx, dy);
         bool handled = false;
         bool smoothScroll = false;
+        bool scrollHandled = false;
         bool hookFired = false;
 
         // Fire @wheel hook on the hit widget (subclass overrides may not
@@ -3206,6 +3221,7 @@ void UiWindowImpl::OnMouseWheel(float x, float y, int delta) {
             else if (auto* sv = dynamic_cast<ScrollViewWidget*>(w)) {
                 if (sv->visible) {
                     handled = sv->OnMouseWheel(e);
+                    scrollHandled = handled;
                     smoothScroll = handled && sv->ScrollAnimating();
                     // The next scroll frame shifts arranged rows and refills
                     // virtualization under its renderer-backed measure scope.
@@ -3214,7 +3230,8 @@ void UiWindowImpl::OnMouseWheel(float x, float y, int delta) {
         }
         if (handled || hookFired || dismissedDropdown) {
             // ScrollView shares the thumb's coalesced presentation path.
-            if (smoothScroll) QueueScrollFrame(); else InvalidateNow();
+            if (smoothScroll) QueueScrollFrame();
+            else if (!scrollHandled || hookFired || dismissedDropdown) InvalidateNow();
         }
     }
 }

@@ -449,9 +449,14 @@ private:
         SvgDocumentRef source;
         std::vector<ComPtr<ID2D1SvgDocument>> content, shadows;
         size_t bytes = 0;
+        ComPtr<ID2D1CommandList> geometry;
+        D2D1_RECT_F ink{};
+        bool inkResolved = false, hasInk = false;
     };
     std::list<CachedSvgDocument> svgDocuments_;
     size_t svgDocumentBytes_ = 0;
+    CachedSvgDocument* GetSvgDocument(const SvgDocumentRef& source);
+    void ResolveSvgInk(CachedSvgDocument& cached);
     void DrawCachedSvgDocument(const SvgDocumentRef& source, const D2D1_MATRIX_3X2_F& transform);
     std::unordered_map<TextFormatKey, ComPtr<IDWriteTextFormat>, TextFormatKeyHash> textFormatCache_;
     struct TextWidthKey {
@@ -497,13 +502,20 @@ private:
         std::wstring text;
         TextLayoutKey key;
         ComPtr<IDWriteTextLayout> layout;
+        D2D1_RECT_F ink{};
+        bool hasInk = false;
     };
     // Keys borrow the stable list nodes; erase the map entry before its node.
     std::list<TextLayoutEntry> textLayouts_;
     std::unordered_map<TextLayoutKey, std::list<TextLayoutEntry>::iterator, TextLayoutHash> textLayoutCache_;
     size_t textLayoutChars_ = 0;
     ComPtr<IDWriteTextLayout> GetDrawTextLayout(const std::wstring& text, IDWriteTextFormat* format,
-        float width, float height, DWRITE_TEXT_ALIGNMENT align, DWRITE_PARAGRAPH_ALIGNMENT paragraph, bool wrap);
+        float width, float height, DWRITE_TEXT_ALIGNMENT align, DWRITE_PARAGRAPH_ALIGNMENT paragraph, bool wrap,
+        D2D1_RECT_F* ink = nullptr);
+    ComPtr<IDWriteTextLayout> GetTextPaint(const std::wstring& text, D2D1_RECT_F rect,
+        float size, const wchar_t* family, DWRITE_FONT_WEIGHT weight, DWRITE_TEXT_ALIGNMENT align,
+        DWRITE_PARAGRAPH_ALIGNMENT paragraph, bool wrap, D2D1_POINT_2F& origin, D2D1_RECT_F* ink = nullptr);
+    bool CommandInkBounds(const DisplayList& list, size_t index, D2D1_RECT_F& ink);
     void ClearTextCaches();
     /* SVG 描边图标共用一个 round-cap/round-join 风格，避免锐角处出尖刺 */
     ComPtr<ID2D1StrokeStyle> roundStrokeStyle_;

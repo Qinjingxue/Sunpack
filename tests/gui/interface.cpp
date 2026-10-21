@@ -989,6 +989,9 @@ void drag_after_wheel(Application& app) {
         assert(active->ScrollY()==before && animation.submitted==0);
         pump([&]{return !active->ScrollAnimating() && animation.finished;},"Coalesced wheel",false);
         assert(active->ScrollY()>before && hidden->ScrollY()==hidden_y);
+        // One submitted display list is enough for each paced animation
+        // frame; queued WM_PAINTs must not create superseded jobs.
+        assert(animation.submitted<=animation.frames+1);
     }
     for(int delta:{-120,120,-120,120}) {
         const float before_wheel=active->ScrollY();
@@ -1048,6 +1051,18 @@ void drag_after_wheel(Application& app) {
         float released=active->ScrollY();
         assert(ui_debug_mouse_move(app.window(),x,y+dy*2)==0);
         assert(active->ScrollY()==released && hidden->ScrollY()==hidden_y);
+    }
+    window->ScrollWithMeasureContext(active,0);
+    window->InvalidateNow(); settle_motion(app);
+    UpdateWindow(hwnd);
+    {
+        AnimationFrames animation;
+        for(int i=0;i<20;++i) assert(ui_debug_wheel(app.window(),scroll,120)==0);
+        assert(!active->ScrollAnimating() && active->ScrollY()==0 && animation.submitted==0);
+        assert(!GetUpdateRect(hwnd,nullptr,FALSE));
+        // Ignoring the outward impulse must not strand the next inward one.
+        assert(ui_debug_wheel(app.window(),scroll,-120)==0);
+        pump([&]{return !active->ScrollAnimating() && active->ScrollY()>0;},"Reverse at scroll boundary",false);
     }
     ui_widget_destroy(scroll);
     click(app,"tabTasks"); pump_diagnostic(app,[&]{return state(app.page(),"tab")=="tasks";},"Scrollbar test: navigate to tasks");
