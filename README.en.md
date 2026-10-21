@@ -22,9 +22,9 @@
 
 - [Installation](#installation)
 - [Usage guide](#usage-guide)
-  - [Graphical manager](#graphical-manager)
   - [Command overview](#command-overview)
   - [Password management](#password-management)
+  - [GUI manager](#gui-manager)
 - [Core capabilities](#core-capabilities)
   - [Recursive processing](#recursive-processing)
   - [Post-processing](#post-processing)
@@ -68,17 +68,6 @@ $r = Invoke-RestMethod 'https://api.github.com/repos/Qinjingxue/Sunpack/releases
 
 ## Usage guide
 
-### Graphical manager
-
-Open the manager from the Watch tray to manage tasks, monitored folders, passwords, and settings in one place.
-
-- **Compact**: the GUI executable is about 4 MB and uses little memory.
-- **No extra runtime**: a C++ Windows interface with no dependency on a browser engine, .NET, or similar external runtimes.
-- **Fast and responsive**: opens quickly and keeps interactions snappy while managing tasks, folders, passwords, and settings.
-- **Exits when closed**: the GUI does not stay resident in the background.
-
-![SunPack tasks: folder filtering and statuses for successful, processing, and waiting tasks](docs/images/gui.en.png)
-
 ### Command overview
 
 | Command     | Short form | Description                                                          |
@@ -96,7 +85,7 @@ Open the manager from the Watch tray to manage tasks, monitored folders, passwor
 
 ### Password management
 
-Use the [manager](#graphical-manager) to edit passwords by folder or save clipboard history entries as password candidates.
+Use the [manager](#gui-manager) to edit passwords by folder or save clipboard history entries as password candidates.
 
 For maximum convenience, SunPack gathers passwords from several sources at run time, tries all candidate passwords at high speed — with thousands of candidates it is nearly imperceptible — and automatically finds and uses the correct one. The password sources are:
 
@@ -105,6 +94,17 @@ For maximum convenience, SunPack gathers passwords from several sources at run t
 - Clipboard: the clipboard text is read as a password before extraction.
 
 Recent successes only reorder currently eligible candidates and never expand their scope. File events refresh the password snapshot when the JSON file changes.
+
+### GUI manager
+
+Open the manager from the Watch tray or by searching for Sunpackgui in the Start menu to manage tasks, monitored folders, passwords, and settings in one place.
+
+- **Compact**: the GUI executable is about 4 MB and uses little memory.
+- **No extra runtime**: a C++ Windows interface with no dependency on a browser engine, .NET, or similar external runtimes.
+- **Fast and responsive**: opens quickly and keeps interactions snappy while managing tasks, folders, passwords, and settings.
+- **Exits when closed**: the GUI does not stay resident in the background.
+
+![SunPack settings](docs/images/gui.en.png)
 
 ---
 
