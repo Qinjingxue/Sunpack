@@ -6,6 +6,10 @@
 #include <ui/controls.h>
 #include <ui/debug_trace.h>
 #include <psapi.h>
+#include <pdh.h>
+#include <pdhmsg.h>
+#include <optional>
+#pragma comment(lib, "pdh.lib")
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -26,12 +30,42 @@ using namespace spg;
 namespace {
 using Clock=std::chrono::steady_clock;
 struct CpuTime { uint64_t ticks=0; };
-struct Samples { std::vector<double> wall,cpu_ms,cpu_mcycles; };
+struct Samples { std::vector<double> wall,cpu_ms,cpu_mcycles,gpu_ms; };
+// Scheduler-accounted process engine time, not Present/VSync wait. Engines
+// may overlap, so this is a sum of busy times rather than GPU utilization.
+class GpuTime {
+    PDH_HQUERY query_ = nullptr;
+    PDH_HCOUNTER counter_ = nullptr;
+public:
+    GpuTime() {
+        if(PdhOpenQueryW(nullptr,0,&query_)!=ERROR_SUCCESS) return;
+        if(PdhAddEnglishCounterW(query_,L"\\GPU Engine(*)\\Running Time",0,&counter_)!=ERROR_SUCCESS) counter_=nullptr;
+    }
+    ~GpuTime() { if(query_) PdhCloseQuery(query_); }
+    std::optional<uint64_t> read() {
+        if(!counter_ || PdhCollectQueryData(query_)!=ERROR_SUCCESS) return {};
+        DWORD bytes=0,count=0;
+        if(PdhGetRawCounterArrayW(counter_,&bytes,&count,nullptr)!=PDH_MORE_DATA) return {};
+        std::vector<unsigned char> data(bytes);
+        auto* items=reinterpret_cast<PDH_RAW_COUNTER_ITEM_W*>(data.data());
+        if(PdhGetRawCounterArrayW(counter_,&bytes,&count,items)!=ERROR_SUCCESS) return {};
+        const auto prefix=L"pid_"+std::to_wstring(GetCurrentProcessId())+L"_";
+        uint64_t total=0; bool found=false;
+        for(DWORD i=0;i<count;++i) if(items[i].szName && std::wstring_view(items[i].szName).substr(0,prefix.size())==prefix &&
+            (items[i].RawValue.CStatus==PDH_CSTATUS_VALID_DATA || items[i].RawValue.CStatus==PDH_CSTATUS_NEW_DATA)) {
+            total+=uint64_t(items[i].RawValue.FirstValue); found=true;
+        }
+        return found?std::optional<uint64_t>(total):std::nullopt;
+    }
+};
+GpuTime& gpu_time() { static GpuTime value; return value; }
 std::map<std::string,Samples> samples;
 std::map<std::string,std::vector<double>> trace_samples;
 std::mutex trace_mutex;
 std::string trace_phase;
 std::string active_action;
+double last_present_ms=0;
+std::string last_present_phase;
 std::atomic<uint64_t> motion_stop_count{0}, paint_count{0}, animation_frame_count{0}, property_frame_count{0};
 std::atomic<bool> motion_active{false};
 std::atomic<uint64_t> layout_count{0}, draw_count{0};
@@ -56,6 +90,15 @@ uint64_t working_set() {
 }
 void trace_sink(const UiTraceEvent* e,void*) {
     if(!e) return;
+    if(e->name && !std::strcmp(e->name,"frame_damage")) {
+        std::lock_guard<std::mutex> lock(trace_mutex);
+        if(!trace_phase.empty()) for(uint32_t i=0;i<e->field_count;++i) {
+            const auto& f=e->fields[i];
+            if(!f.key) continue;
+            if(f.type==UI_TRACE_FIELD_F64) phase_counts[trace_phase+"::"+f.key].push_back(f.f64);
+            else if(f.type==UI_TRACE_FIELD_I64) phase_counts[trace_phase+"::"+f.key].push_back(double(f.i64));
+        }
+    }
     if(e->name && (!std::strcmp(e->name,"apply_binding") || !std::strcmp(e->name,"binding_noop"))) {
         std::lock_guard<std::mutex> lock(trace_mutex);
         if(!trace_phase.empty()) for(uint32_t i=0;i<e->field_count;++i) {
@@ -90,6 +133,12 @@ void trace_sink(const UiTraceEvent* e,void*) {
     if(!has_duration&&!has_frame_interval&&!has_frame_reasons) return;
     std::lock_guard<std::mutex> lock(trace_mutex);
     const std::string name=e->name?e->name:"";
+    if(name=="present_duration") {
+        const double tick=now_ms();
+        if(last_present_phase==trace_phase && last_present_ms>0 && !trace_phase.empty())
+            trace_samples[trace_phase+"::present_interval_ms"].push_back(tick-last_present_ms);
+        last_present_ms=tick; last_present_phase=trace_phase;
+    }
     if(has_duration) {
         trace_samples["all::"+name].push_back(duration);
         if(!trace_phase.empty()) trace_samples[trace_phase+"::"+name].push_back(duration);
@@ -103,6 +152,9 @@ void trace_sink(const UiTraceEvent* e,void*) {
         phase_counts[trace_phase+"::paint_reason_"+std::to_string(frame_reasons)].push_back(1.0);
 }
 template<class F> void measure(const std::string& name,F&& fn) {
+    // Avoid adding counter collection to short dispatch/layout samples.
+    const bool gpu_sample=name.find("settled")!=std::string::npos || name=="config_wheel_traverse" || name=="pointer_same_target";
+    const auto gpu_before=gpu_sample?gpu_time().read():std::nullopt;
     { std::lock_guard<std::mutex> lock(trace_mutex); trace_phase=name; }
     active_action=name;
     const double wall=now_ms(); const auto cycles=process_cycles(); const auto cpu=process_cpu();
@@ -113,6 +165,8 @@ template<class F> void measure(const std::string& name,F&& fn) {
     auto& out=samples[name]; out.wall.push_back(elapsed);
     out.cpu_ms.push_back(double(cpu_after.ticks-cpu.ticks)/10000.0);
     out.cpu_mcycles.push_back(double(cycles_after-cycles)/1000000.0);
+    const auto gpu_after=gpu_sample?gpu_time().read():std::nullopt;
+    if(gpu_before && gpu_after && *gpu_after>=*gpu_before) out.gpu_ms.push_back(double(*gpu_after-*gpu_before)/10000.0);
     if(elapsed>1000) std::cerr<<"slow GUI sample: "<<name<<" took "<<std::fixed<<std::setprecision(1)<<elapsed<<" ms\n";
 }
 Json distribution(std::vector<double> values) {
@@ -127,7 +181,8 @@ Json summarize() {
     for(auto& [name,s]:samples) {
         actions[name]={{"wall_ms",distribution(s.wall)},
             {"process_cpu_million_cycles",distribution(s.cpu_mcycles)}};
-        if(name=="idle_5s") actions[name]["process_cpu_ms"]=distribution(s.cpu_ms);
+        actions[name]["process_cpu_ms"]=distribution(s.cpu_ms);
+        if(!s.gpu_ms.empty()) actions[name]["gpu_engine_busy_ms"]=distribution(s.gpu_ms);
     }
     Json traces=Json::object(), counts=Json::object();
     for(auto& [name,values]:phase_counts) counts[name]=distribution(values);
@@ -413,6 +468,21 @@ int wmain(int argc,wchar_t** argv) {
             report["widgets_after_load"]=widget_count(app);
             ui_window_set_size(app.window(),1120,720); ui_window_relayout(app.window());
             wait_settled(app);
+
+            // Same hit target and no visual changes: input hooks still run,
+            // but pointer packet rate must not determine rendering cost.
+            const auto heading=widget(app,"page-tasks")->Children().front()->rect;
+            ui_debug_mouse_move(app.window(),heading.left+10,heading.top+10);
+            pump_messages(); wait_settled(app);
+            measure("pointer_same_target",[&]{
+                for(int i=0;i<1000;++i) {
+                    ui_debug_mouse_move(app.window(),heading.left+10+float(i%2),heading.top+10);
+                }
+                // Keep a no-change packet burst separate from OS-generated
+                // WM_MOUSELEAVE when the physical pointer is in another app.
+                // Drain once afterwards; both revisions use this same sequence.
+                pump_messages();
+            });
 
             // Apply/query cost of the two large projections in their production
             // form: JSON text -> page state (QuickJS) and page state -> JSON.

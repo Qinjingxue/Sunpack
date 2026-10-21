@@ -58,7 +58,7 @@ public:
                   RenderSurfaceKind surfaceKind = RenderSurfaceKind::HwndSwapChain);
     void Unregister();
     void ReleaseDeviceResources();
-    RenderFrameResult RenderFrame(const FrameJob& job);
+    RenderFrameResult RenderFrame(FrameJob& job);
     RenderFrameResult PresentPrepared(bool skipVSync);
     int ScreenshotRegion(D2D1_RECT_F region, const std::wstring& outPath, float dpiScale);
 

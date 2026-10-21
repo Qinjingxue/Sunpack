@@ -615,6 +615,7 @@ public:
     void RemapRows(const std::vector<size_t>& previousIndices);
     const std::vector<size_t>& Indices() const { return indices_; }
     void RefreshViewport();
+    void InvalidateRowLayouts() { rowLayouts_.clear(); }
     void DoLayout() override;
     D2D1_SIZE_F SizeHint() const override;
 private:
@@ -624,6 +625,8 @@ private:
     float realizedViewportHeight_ = 0;
     bool realizedRangeValid_ = false;
     bool refreshing_ = false;
+    struct RowLayout { std::weak_ptr<Widget> widget; float width, height; };
+    std::unordered_map<Widget*, RowLayout> rowLayouts_;
     float Sum(size_t count) const;
     size_t RowAt(float y) const;
     void MeasureRow(size_t index, float height);
@@ -634,6 +637,11 @@ private:
 class UI_API ScrollViewWidget : public Widget {
 public:
     void SetContent(WidgetPtr content);
+    bool ClearPointerHover() {
+        const bool changed=hovered || hoveringBar_;
+        hovered=hoveringBar_=false;
+        return changed;
+    }
 
     float ScrollY() const { return scrollY_; }
     /* 走与鼠标滚动同一条纯偏移路径 (build 285) —— 此前只改字段不动 rect,

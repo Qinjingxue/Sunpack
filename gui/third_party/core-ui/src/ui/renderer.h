@@ -14,6 +14,8 @@
 #include <memory>
 #include <vector>
 #include <unordered_map>
+#include <list>
+#include <string_view>
 #include <cstdint>
 #include "theme.h"
 #include "display_list.h"
@@ -257,6 +259,8 @@ public:
     void PushTransform(const D2D1_MATRIX_3X2_F& transform);
     void PopTransform();
     void ReplayDisplayList(const DisplayList& list);
+    void PrepareDisplayList(const DisplayList& list);
+    void RenderDisplayList(DisplayList list, bool incremental);
 
     // SVG icon support
     SvgIcon ParseSvgIcon(const std::string& svgContent);
@@ -424,6 +428,31 @@ private:
     ComPtr<IUnknown>           dcompTarget_;
     ComPtr<IUnknown>           dcompVisual_;
     std::unordered_map<ColorKey, ComPtr<ID2D1SolidColorBrush>, ColorKeyHash> brushCache_;
+    ComPtr<ID2D1SolidColorBrush> transientBrush_;
+    std::vector<ComPtr<ID2D1Layer>> layerPool_;
+    size_t layerDepth_ = 0;
+    ID2D1Layer* AcquireLayer();
+    DisplayList previousDisplayList_;
+    DisplayListBounds previousBounds_;
+    DisplayListBounds nextBounds_;
+    RECT presentDamage_{};
+    RECT previousDamage_{};
+    bool partialPresent_ = false;
+    struct RetainedDrawRange { size_t first, end; ComPtr<ID2D1CommandList> commands; };
+    std::vector<RetainedDrawRange> opacityCommands_;
+    size_t opacityFirst_ = 0, opacityEnd_ = 0, opacityPush_ = size_t(-1);
+    bool replayingCache_ = false;
+    const DisplayListBounds* replayBounds_ = nullptr;
+    D2D1_RECT_F replayDamage_{};
+    void ReplayDisplayListRange(const DisplayList& list, size_t first, size_t end, bool useRetained = false);
+    struct CachedSvgDocument {
+        SvgDocumentRef source;
+        std::vector<ComPtr<ID2D1SvgDocument>> content, shadows;
+        size_t bytes = 0;
+    };
+    std::list<CachedSvgDocument> svgDocuments_;
+    size_t svgDocumentBytes_ = 0;
+    void DrawCachedSvgDocument(const SvgDocumentRef& source, const D2D1_MATRIX_3X2_F& transform);
     std::unordered_map<TextFormatKey, ComPtr<IDWriteTextFormat>, TextFormatKeyHash> textFormatCache_;
     struct TextWidthKey {
         IDWriteTextFormat* format;
@@ -445,6 +474,36 @@ private:
     };
     std::unordered_map<TextWidthKey, MeasuredText, TextWidthKeyHash> textWidthCache_;
     size_t textWidthChars_ = 0;
+    struct TextLayoutKey {
+        IDWriteTextFormat* format = nullptr;
+        std::wstring_view text;
+        uint32_t width = 0, height = 0;
+        int align = 0, paragraph = 0;
+        bool wrap = false;
+        bool operator==(const TextLayoutKey& b) const {
+            return format == b.format && text == b.text && width == b.width && height == b.height &&
+                   align == b.align && paragraph == b.paragraph && wrap == b.wrap;
+        }
+    };
+    struct TextLayoutHash {
+        size_t operator()(const TextLayoutKey& k) const {
+            size_t h = std::hash<std::wstring_view>{}(k.text) ^ std::hash<void*>{}(k.format);
+            for (auto n : {k.width, k.height, uint32_t(k.align), uint32_t(k.paragraph), uint32_t(k.wrap)})
+                h ^= n + size_t(0x9e3779b9) + (h << 6) + (h >> 2);
+            return h;
+        }
+    };
+    struct TextLayoutEntry {
+        std::wstring text;
+        TextLayoutKey key;
+        ComPtr<IDWriteTextLayout> layout;
+    };
+    // Keys borrow the stable list nodes; erase the map entry before its node.
+    std::list<TextLayoutEntry> textLayouts_;
+    std::unordered_map<TextLayoutKey, std::list<TextLayoutEntry>::iterator, TextLayoutHash> textLayoutCache_;
+    size_t textLayoutChars_ = 0;
+    ComPtr<IDWriteTextLayout> GetDrawTextLayout(const std::wstring& text, IDWriteTextFormat* format,
+        float width, float height, DWRITE_TEXT_ALIGNMENT align, DWRITE_PARAGRAPH_ALIGNMENT paragraph, bool wrap);
     void ClearTextCaches();
     /* SVG 描边图标共用一个 round-cap/round-join 风格，避免锐角处出尖刺 */
     ComPtr<ID2D1StrokeStyle> roundStrokeStyle_;
@@ -466,6 +525,7 @@ private:
     std::wstring          latinFontOverride_;
     std::wstring          cjkFontOverride_;
     bool                  hasRenderModeOverride_ = false;
+    bool                  frameTextEnvironment_ = false;
     theme::TextRenderMode renderModeOverride_ = theme::TextRenderMode::Smooth;
     DisplayListRecorder*  displayListRecorder_ = nullptr;
     int                   displayListRecorderPauseDepth_ = 0;

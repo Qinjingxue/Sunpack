@@ -8,6 +8,7 @@
 #include "renderer.h"
 #include "resource_store.h"
 #include "ui_context.h"
+#include "ui_window.h"
 #include <algorithm>
 #include <cmath>
 #include <functional>
@@ -460,8 +461,9 @@ void ButtonWidget::DoLayout() {
 }
 
 bool ButtonWidget::OnMouseMove(const MouseEvent& e) {
+    const bool wasHovered = hovered;
     hovered = Contains(e.x, e.y);
-    return hovered;
+    return hovered != wasHovered;
 }
 
 bool ButtonWidget::OnMouseDown(const MouseEvent& e) {
@@ -599,8 +601,9 @@ bool CheckBoxWidget::OnMouseUp(const MouseEvent& e) {
 }
 
 bool CheckBoxWidget::OnMouseMove(const MouseEvent& e) {
+    const bool wasHovered = hovered;
     hovered = e.x >= rect.left && e.x < ContentRight_() && e.y >= rect.top && e.y < rect.bottom;
-    return hovered;
+    return hovered != wasHovered;
 }
 
 D2D1_SIZE_F CheckBoxWidget::SizeHint() const {
@@ -706,6 +709,7 @@ bool SliderWidget::OnMouseDown(const MouseEvent& e) {
 }
 
 bool SliderWidget::OnMouseMove(const MouseEvent& e) {
+    const bool wasHovered = hovered;
     bool inBounds = Contains(e.x, e.y);
     // Only show hover animation when mouse is near the thumb, not the whole track
     float thumbR = 10.0f;
@@ -724,7 +728,7 @@ bool SliderWidget::OnMouseMove(const MouseEvent& e) {
         if (onFloatChanged) onFloatChanged(value_);
         return true;
     }
-    return inBounds;
+    return hovered != wasHovered;
 }
 
 bool SliderWidget::OnMouseUp(const MouseEvent& e) {
@@ -1175,6 +1179,7 @@ bool TextInputWidget::OnMouseDown(const MouseEvent& e) {
 }
 
 bool TextInputWidget::OnMouseMove(const MouseEvent& e) {
+    const bool wasHovered = hovered;
     hovered = Contains(e.x, e.y);
     if (dragging_ && focused) {
         extern MeasureContext* g_activeMeasureContext;
@@ -1184,7 +1189,7 @@ bool TextInputWidget::OnMouseMove(const MouseEvent& e) {
         selectionEnd_ = cursorPos_;
         return true;
     }
-    return hovered;
+    return hovered != wasHovered;
 }
 
 bool TextInputWidget::OnMouseUp(const MouseEvent& e) {
@@ -1754,6 +1759,7 @@ bool TextAreaWidget::OnMouseDown(const MouseEvent& e) {
 }
 
 bool TextAreaWidget::OnMouseMove(const MouseEvent& e) {
+    const bool wasHovered = hovered;
     hovered = Contains(e.x, e.y);
     if (draggingThumb_) {
         float trackH = (rect.bottom - 4) - (rect.top + 4);
@@ -1776,7 +1782,7 @@ bool TextAreaWidget::OnMouseMove(const MouseEvent& e) {
         selectionEnd_ = cursorPos_;
         return true;
     }
-    return hovered;
+    return hovered != wasHovered;
 }
 
 bool TextAreaWidget::OnMouseUp(const MouseEvent& e) {
@@ -2054,6 +2060,7 @@ void ComboBoxWidget::ClampDropdownScroll_(int visibleRows) {
 void ComboBoxWidget::OpenDropdown_() {
     if (open_ || items_.empty()) return;
     open_ = true;
+    if (auto* window = GetContext().FindWindowByWidget(this)) window->TrackOpenComboBox(this);
     const auto layout = ComputeDropdownLayout_();
     ClampDropdownScroll_(layout.visibleRows);
     if (selectedIndex_ < dropdownScrollIndex_) {
@@ -2243,9 +2250,11 @@ bool ComboBoxWidget::OnMouseDown(const MouseEvent& e) {
 }
 
 bool ComboBoxWidget::OnMouseMove(const MouseEvent& e) {
+    const bool wasHovered = hovered;
+    const int oldIndex = hoveredIndex_;
     hovered = Contains(e.x, e.y);
     hoveredIndex_ = DropdownItemAt(e.x, e.y);
-    return hovered || open_;
+    return hovered != wasHovered || hoveredIndex_ != oldIndex;
 }
 
 bool ComboBoxWidget::OnMouseUp(const MouseEvent& e) {
@@ -2549,6 +2558,17 @@ void VirtualListWidget::RefreshViewport() {
     refreshing_ = false;
 }
 
+namespace {
+// Only a viewport refill may reuse surviving row layouts. Ordinary data,
+// font, theme and root layout passes always measure the actual controls.
+thread_local bool viewportLayout = false;
+struct ViewportLayoutScope {
+    bool previous = viewportLayout;
+    ViewportLayoutScope() { viewportLayout = true; }
+    ~ViewportLayoutScope() { viewportLayout = previous; }
+};
+}
+
 void VirtualListWidget::DoLayout() {
     TraceScope scope("core_controls", "virtual_list_layout_duration");
     RefreshViewport();
@@ -2558,8 +2578,21 @@ void VirtualListWidget::DoLayout() {
     size_t anchor = scroll ? RowAt(std::max(0.0f, scroll->rect.top - rect.top - padT)) : 0;
     float anchorBefore = Sum(anchor);
     bool changed = false;
+    std::unordered_map<Widget*, RowLayout> nextLayouts;
+    nextLayouts.reserve(children_.size());
     for (size_t i = 0; i < std::min(children_.size(), indices_.size()); ++i) {
         auto& child = children_[i];
+        const float width = rect.right - padR - (rect.left + padL);
+        auto cached = rowLayouts_.find(child.get());
+        const bool reuse = viewportLayout && cached != rowLayouts_.end() &&
+            cached->second.widget.lock() == child && cached->second.width == width &&
+            std::abs(child->rect.bottom-child->rect.top-cached->second.height)<=0.5f;
+        if (reuse) {
+            const float y = rect.top + padT + Sum(indices_[i]);
+            ShiftSubtreeRects(child.get(), rect.left + padL - child->rect.left, y - child->rect.top);
+            nextLayouts.emplace(child.get(), cached->second);
+            continue;
+        }
         // A subtree's intrinsic height may change after wrapping at this width.
         // Two local passes settle that row, never the offscreen list.
         float h = std::max(1.0f, std::clamp(child->SizeHint().height, child->minH, child->maxH));
@@ -2572,11 +2605,13 @@ void VirtualListWidget::DoLayout() {
             h = measured;
         }
         // Match VBox's min/max constraints for both layout and cached height.
+        nextLayouts.emplace(child.get(), RowLayout{child, width, h});
         h += gap_;
         if (std::abs(h - heights_[indices_[i]]) > 0.5f) {
             MeasureRow(indices_[i], h); changed = true;
         }
     }
+    rowLayouts_ = std::move(nextLayouts);
     if (changed) {
         if (scroll) scroll->CorrectVirtualAnchor(Sum(anchor) - anchorBefore);
         ui::RequestLayout();
@@ -2696,6 +2731,7 @@ void ScrollViewWidget::ApplyScrollDelta_(float oldScrollY) {
     // page invalidation; unresolved local layout still falls back to the root.
     if (!layoutWasDirty) for (int pass = 0; pass < 3 && ui::LayoutDirtyFlag(); ++pass) {
         ui::LayoutDirtyFlag() = false;
+        ViewportLayoutScope viewportScope;
         DoLayout();
     }
 }
@@ -2978,8 +3014,9 @@ bool RadioButtonWidget::OnMouseUp(const MouseEvent& e) {
 }
 
 bool RadioButtonWidget::OnMouseMove(const MouseEvent& e) {
+    const bool wasHovered = hovered;
     hovered = e.x >= rect.left && e.x < ContentRight_() && e.y >= rect.top && e.y < rect.bottom;
-    return hovered;
+    return hovered != wasHovered;
 }
 
 D2D1_SIZE_F RadioButtonWidget::SizeHint() const {
@@ -3119,9 +3156,10 @@ bool ToggleWidget::OnMouseUp(const MouseEvent& e) {
 }
 
 bool ToggleWidget::OnMouseMove(const MouseEvent& e) {
+    const bool wasHovered = hovered;
     hovered = e.x >= rect.left && e.x < ContentRight_() && e.y >= rect.top && e.y < rect.bottom;
     UpdateInteraction();
-    return hovered;
+    return hovered != wasHovered;
 }
 
 bool ToggleWidget::OnMouseDown(const MouseEvent&) {
@@ -4354,8 +4392,9 @@ void IconButtonWidget::OnDraw(Renderer& r) {
 }
 
 bool IconButtonWidget::OnMouseMove(const MouseEvent& e) {
+    const bool wasHovered = hovered;
     hovered = Contains(e.x, e.y);
-    return hovered;
+    return hovered != wasHovered;
 }
 
 bool IconButtonWidget::OnMouseDown(const MouseEvent& e) {
@@ -4608,11 +4647,12 @@ bool CustomWidget::OnMouseDown(const MouseEvent& e) {
 }
 
 bool CustomWidget::OnMouseMove(const MouseEvent& e) {
+    const bool wasHovered = hovered;
     hovered = Contains(e.x, e.y);
     if (mouseMoveCb) {
         return mouseMoveCb(apiHandle, e.x, e.y, e.leftBtn ? 1 : 0, mouseMoveUd) != 0;
     }
-    return hovered;
+    return hovered != wasHovered;
 }
 
 bool CustomWidget::OnMouseUp(const MouseEvent& e) {
@@ -5256,6 +5296,8 @@ bool NumberBoxWidget::OnMouseDown(const MouseEvent& e) {
 }
 
 bool NumberBoxWidget::OnMouseMove(const MouseEvent& e) {
+    const bool wasHovered = hovered;
+    const int oldButton = hoveredBtn_;
     hovered = Contains(e.x, e.y);
     hoveredBtn_ = -1;
     if (hovered) {
@@ -5263,7 +5305,7 @@ bool NumberBoxWidget::OnMouseMove(const MouseEvent& e) {
         if (e.x >= upR.left && e.y < upR.bottom) hoveredBtn_ = 0;
         else if (e.x >= downR.left && e.y >= downR.top) hoveredBtn_ = 1;
     }
-    return hovered;
+    return hovered != wasHovered || hoveredBtn_ != oldButton;
 }
 
 bool NumberBoxWidget::OnMouseUp(const MouseEvent& e) {
@@ -5385,8 +5427,9 @@ void NavItemWidget::OnDraw(Renderer& r) {
 }
 
 bool NavItemWidget::OnMouseMove(const MouseEvent& e) {
+    const bool wasHovered = hovered;
     hovered = Contains(e.x, e.y);
-    return hovered;
+    return hovered != wasHovered;
 }
 
 bool NavItemWidget::OnMouseDown(const MouseEvent& e) {

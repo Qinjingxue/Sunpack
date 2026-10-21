@@ -209,6 +209,8 @@ public:
     int width_px = 0;
     int height_px = 0;
     float dpi_scale = 1.0f;
+    std::wstring default_font, latin_font, cjk_font;
+    int text_render_mode = -1;
 
     std::vector<DrawCommand> commands;
     std::vector<std::wstring> text_pool;
@@ -278,5 +280,18 @@ private:
 
     DisplayList list_;
 };
+
+// Exact comparisons (including side pools), shared by damage tracking and
+// retained animation content. No content hashes or additional resource copies.
+bool EqualDrawCommand(const DisplayList& a, size_t ai, const DisplayList& b, size_t bi);
+bool EqualSvgDocument(const SvgDocumentRef& a, const SvgDocumentRef& b);
+struct DisplayListBounds {
+    std::vector<D2D1_RECT_F> commands;
+    std::vector<size_t> ends;
+    bool incremental = true;
+};
+DisplayListBounds AnalyzeDisplayList(const DisplayList& list);
+D2D1_RECT_F DisplayListDamage(const DisplayList& previous, const DisplayListBounds& oldBounds,
+                             const DisplayList& next, const DisplayListBounds& newBounds);
 
 } // namespace ui

@@ -242,6 +242,7 @@ bool Renderer::Init() {
     dwFactory_  = ownedDwFactory_.Get();
     wicFactory_ = ownedWicFactory_.Get();
     brushCache_.clear();
+    transientBrush_.Reset();
     ClearTextCaches();
     return true;
 }
@@ -327,6 +328,11 @@ bool Renderer::EnsureSharedDevice() {
     ComPtr<IDXGIDevice> dxgiDevice;
     HRESULT hr = s_d3dDevice.As(&dxgiDevice);
     if (FAILED(hr)) return false;
+
+    // Interactive animation consumes the newest input each refresh. Do not
+    // let cheap cached frames accumulate three frames of driver queue latency.
+    ComPtr<IDXGIDevice1> lowLatencyDevice;
+    if(SUCCEEDED(dxgiDevice.As(&lowLatencyDevice))) lowLatencyDevice->SetMaximumFrameLatency(1);
 
     hr = factory_->CreateDevice(dxgiDevice.Get(), s_d2dDevice.GetAddressOf());
     if (FAILED(hr)) return false;
@@ -560,11 +566,18 @@ bool Renderer::CreateRenderTargetForLayered(HWND hwnd) {
 }
 
 void Renderer::ReleaseRenderTarget() {
+    opacityCommands_.clear();
+    previousDisplayList_.Clear();
+    previousBounds_ = {};
+    layerPool_.clear();
+    layerDepth_ = 0;
+    partialPresent_ = false;
     if (ctx_) {
         ctx_->SetTarget(nullptr);
     }
     transformStack_.clear();
     brushCache_.clear();
+    transientBrush_.Reset();
     imageBitmapCache_.clear();
     ClearTextCaches();
     targetBitmap_.Reset();
@@ -582,6 +595,12 @@ void Renderer::ReleaseRenderTarget() {
 void Renderer::Resize(UINT width, UINT height) {
     DebugAssertTargetThread("Resize");
     if (!ctx_ || !swapChain_) return;
+    opacityCommands_.clear();
+    previousDisplayList_.Clear();
+    previousBounds_ = {};
+    partialPresent_ = false;
+    layerPool_.clear();
+    layerDepth_ = 0;
     TraceScope resizeScope("core_renderer", "renderer_resize_duration");
     TraceEvent("core_renderer", "renderer_resize_begin",
                {TraceU64("w_px", width), TraceU64("h_px", height)});
@@ -591,6 +610,7 @@ void Renderer::Resize(UINT width, UINT height) {
         ctx_->SetTarget(nullptr);
         targetBitmap_.Reset();
         brushCache_.clear();
+        transientBrush_.Reset();
     }
 
     HRESULT hr = S_OK;
@@ -644,6 +664,8 @@ void Renderer::Resize(UINT width, UINT height) {
 void Renderer::BeginDraw() {
     DebugAssertTargetThread("BeginDraw");
     transformStack_.clear();
+    layerDepth_ = 0;
+    partialPresent_ = false;
     ctx_->BeginDraw();
     ctx_->SetTransform(D2D1::Matrix3x2F::Identity());
 }
@@ -660,13 +682,15 @@ HRESULT Renderer::EndDraw() {
      * DWM。给"绘制隐藏窗但不上屏"用 (避免 DWM 未合成窗的 Present 在 AMD 死锁)。 */
     if (swapChain_ && !skipPresent) {
         DXGI_PRESENT_PARAMETERS params = {};
+        if (partialPresent_) { params.DirtyRectsCount = 1; params.pDirtyRects = &presentDamage_; }
         UINT syncInterval = skipVSync ? 0 : 1;
         TraceEvent("core_renderer", "present_begin",
                    {TraceU64("sync_interval", syncInterval),
                     TraceBool("skip_vsync", skipVSync)});
         {
             TraceScope presentScope("core_renderer", "present_duration");
-            swapChain_->Present1(syncInterval, 0, &params);
+            const HRESULT presented = swapChain_->Present1(syncInterval, 0, &params);
+            if (FAILED(presented)) hr = presented;
         }
     }
     skipVSync = false;
@@ -678,6 +702,7 @@ HRESULT Renderer::PresentPrepared(bool skipVsync) {
     DebugAssertTargetThread("PresentPrepared");
     if (!swapChain_) return S_FALSE;
     DXGI_PRESENT_PARAMETERS params = {};
+    if (partialPresent_) { params.DirtyRectsCount = 1; params.pDirtyRects = &presentDamage_; }
     const UINT syncInterval = skipVsync ? 0 : 1;
     TraceEvent("core_renderer", "present_prepared_begin",
                {TraceU64("sync_interval", syncInterval),
@@ -947,17 +972,72 @@ ComPtr<ID2D1SolidColorBrush> Renderer::GetBrush(const D2D1_COLOR_F& color) {
         return it->second;
     }
 
+    if (brushCache_.size() >= 128) {
+        if (!transientBrush_) ctx_->CreateSolidColorBrush(color, &transientBrush_);
+        else transientBrush_->SetColor(color);
+        return transientBrush_;
+    }
     ComPtr<ID2D1SolidColorBrush> brush;
     if (SUCCEEDED(ctx_->CreateSolidColorBrush(color, brush.GetAddressOf())) && brush) {
+        // Animated float colors have effectively unlimited cardinality. Keep
+        // stable brushes hot without retaining every intermediate frame color.
         brushCache_.emplace(std::move(key), brush);
     }
     return brush;
 }
 
 void Renderer::ClearTextCaches() {
+    svgDocuments_.clear();
+    svgDocumentBytes_=0;
+    opacityCommands_.clear();
+    previousDisplayList_.Clear();
+    previousBounds_ = {};
+    textLayoutCache_.clear();
+    textLayouts_.clear();
+    textLayoutChars_ = 0;
     textWidthCache_.clear();
     textWidthChars_ = 0;
     textFormatCache_.clear();
+}
+
+ComPtr<IDWriteTextLayout> Renderer::GetDrawTextLayout(const std::wstring& text, IDWriteTextFormat* format,
+    float width, float height, DWRITE_TEXT_ALIGNMENT align, DWRITE_PARAGRAPH_ALIGNMENT paragraph, bool wrap) {
+    TextLayoutKey key{format, text, FloatBits(width), FloatBits(height), int(align), int(paragraph), wrap};
+    auto found = textLayoutCache_.find(key);
+    if (found != textLayoutCache_.end()) {
+        textLayouts_.splice(textLayouts_.begin(), textLayouts_, found->second);
+        return found->second->layout;
+    }
+    ComPtr<IDWriteTextLayout> layout;
+    if (FAILED(dwFactory_->CreateTextLayout(text.data(), UINT32(text.size()), format, width, height, &layout))) return nullptr;
+    layout->SetTextAlignment(align);
+    layout->SetParagraphAlignment(paragraph);
+    layout->SetWordWrapping(wrap ? DWRITE_WORD_WRAPPING_WRAP : DWRITE_WORD_WRAPPING_NO_WRAP);
+    if (!wrap) {
+        DWRITE_TRIMMING trimming{DWRITE_TRIMMING_GRANULARITY_CHARACTER, 0, 0};
+        ComPtr<IDWriteInlineObject> ellipsis;
+        dwFactory_->CreateEllipsisTrimmingSign(format, &ellipsis);
+        if (ellipsis) layout->SetTrimming(&trimming, ellipsis.Get());
+    }
+    // A long clipboard entry is drawn correctly but must not evict the whole
+    // working set or retain megabytes of glyph/layout data after scrolling away.
+    if (text.size() <= 4096) {
+        while (!textLayouts_.empty() && (textLayouts_.size() >= 512 || textLayoutChars_ + text.size() > 65536)) {
+            auto& last = textLayouts_.back();
+            textLayoutChars_ -= last.text.size();
+            textLayoutCache_.erase(last.key);
+            textLayouts_.pop_back();
+        }
+        textLayouts_.emplace_front();
+        auto& entry = textLayouts_.front();
+        entry.text = text;
+        entry.key = key;
+        entry.key.text = entry.text;
+        entry.layout = layout;
+        textLayoutChars_ += text.size();
+        textLayoutCache_.emplace(entry.key, textLayouts_.begin());
+    }
+    return layout;
 }
 
 ComPtr<IDWriteTextFormat> Renderer::GetTextFormat(float fontSize, const wchar_t* family,
@@ -1002,11 +1082,13 @@ const wchar_t* Renderer::DefaultFontFamily() const {
 }
 
 const wchar_t* Renderer::LatinFontFamily() const {
+    if (frameTextEnvironment_) return latinFontOverride_.empty()?nullptr:latinFontOverride_.c_str();
     if (!latinFontOverride_.empty()) return latinFontOverride_.c_str();
     return theme::LatinFontFamily();  /* 可能返回 nullptr */
 }
 
 const wchar_t* Renderer::CjkFontFamily() const {
+    if (frameTextEnvironment_) return cjkFontOverride_.empty()?nullptr:cjkFontOverride_.c_str();
     if (!cjkFontOverride_.empty()) return cjkFontOverride_.c_str();
     return theme::CjkFontFamily();    /* 可能返回 nullptr */
 }
@@ -1029,6 +1111,7 @@ void Renderer::SetCjkFonts(const wchar_t* latin, const wchar_t* cjk) {
 }
 
 void Renderer::SetTextRenderMode(theme::TextRenderMode mode) {
+    if(!hasRenderModeOverride_ || renderModeOverride_!=mode) ClearTextCaches();
     hasRenderModeOverride_ = true;
     renderModeOverride_ = mode;
     ApplyTextRenderMode();  /* 立刻应用到 ctx_（如已创建） */
@@ -1305,25 +1388,8 @@ void Renderer::DrawText(const std::wstring& text, const D2D1_RECT_F& rect, const
         drawLayoutH += kVerticalOverhangPad * 2.0f;
     }
 
-    ComPtr<IDWriteTextLayout> layout;
-    HRESULT hr = dwFactory_->CreateTextLayout(
-        text.c_str(), (UINT32)text.length(), fmt.Get(), layoutW, drawLayoutH, &layout);
-    if (FAILED(hr) || !layout) return;
-
-    layout->SetTextAlignment(align);
-    layout->SetParagraphAlignment(vAlign);
-
-    if (wordWrap) {
-        layout->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
-    } else {
-        layout->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
-        // Enable character ellipsis trimming (text too long → "abc...")
-        DWRITE_TRIMMING trimming = { DWRITE_TRIMMING_GRANULARITY_CHARACTER, 0, 0 };
-        ComPtr<IDWriteInlineObject> ellipsis;
-        dwFactory_->CreateEllipsisTrimmingSign(fmt.Get(), &ellipsis);
-        if (ellipsis) layout->SetTrimming(&trimming, ellipsis.Get());
-    }
-
+    auto layout = GetDrawTextLayout(text, fmt.Get(), layoutW, drawLayoutH, align, vAlign, wordWrap);
+    if (!layout) return;
     ctx_->DrawTextLayout({rect.left, drawTop}, layout.Get(), brush.Get());
 }
 
@@ -2394,6 +2460,19 @@ void Renderer::PopClip() {
     ctx_->PopAxisAlignedClip();
 }
 
+ID2D1Layer* Renderer::AcquireLayer() {
+    const size_t depth = layerDepth_++;
+    if (replayingCache_) return nullptr;
+    // Deeper exceptional nesting uses D2D's automatic layer management.
+    if (depth >= 8) return nullptr;
+    if (depth == layerPool_.size()) {
+        ComPtr<ID2D1Layer> layer;
+        ctx_->CreateLayer(nullptr, &layer);
+        layerPool_.push_back(std::move(layer));
+    }
+    return layerPool_[depth].Get();
+}
+
 void Renderer::PushRoundedClip(const D2D1_RECT_F& rect, float rx, float ry) {
     if (auto* recorder = ActiveDisplayListRecorder()) {
         recorder->PushRoundedClip(rect, rx, ry);
@@ -2402,9 +2481,8 @@ void Renderer::PushRoundedClip(const D2D1_RECT_F& rect, float rx, float ry) {
     ComPtr<ID2D1RoundedRectangleGeometry> geom;
     factory_->CreateRoundedRectangleGeometry(D2D1::RoundedRect(rect, rx, ry),
                                              geom.GetAddressOf());
-    ComPtr<ID2D1Layer> layer;
-    ctx_->CreateLayer(nullptr, layer.GetAddressOf());
-    if (geom && layer) {
+    auto* layer = AcquireLayer();
+    if (geom) {
         /* D2D1_LAYER_OPTIONS_INITIALIZE_FOR_CLEARTYPE — 必须 (build 96+ L25):
          * layer 默认 OPTIONS_NONE 会把 ClearType sub-pixel 渲染关掉, layer 内
          * DrawText 在 CLEARTYPE 模式 (lib build 92+ 默认) 下文字几乎不可见.
@@ -2417,7 +2495,7 @@ void Renderer::PushRoundedClip(const D2D1_RECT_F& rect, float rx, float ry) {
                                   D2D1::Matrix3x2F::Identity(), 1.0f,
                                   nullptr,
                                   D2D1_LAYER_OPTIONS_INITIALIZE_FOR_CLEARTYPE),
-            layer.Get());
+            layer);
     }
 }
 
@@ -2427,6 +2505,7 @@ void Renderer::PopRoundedClip() {
     }
     if (!ctx_) return;
     ctx_->PopLayer();
+    if (layerDepth_) --layerDepth_;
 }
 
 void Renderer::PushOpacity(float opacity, const D2D1_RECT_F& bounds) {
@@ -2434,14 +2513,9 @@ void Renderer::PushOpacity(float opacity, const D2D1_RECT_F& bounds) {
         recorder->PushOpacity(opacity, bounds);
     }
     if (!ctx_) return;
-    ComPtr<ID2D1Layer> layer;
-    ctx_->CreateLayer(nullptr, layer.GetAddressOf());
-    if (layer) {
-        ctx_->PushLayer(
-            D2D1::LayerParameters(bounds, nullptr, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
-                                  D2D1::Matrix3x2F::Identity(), opacity),
-            layer.Get());
-    }
+    ctx_->PushLayer(
+        D2D1::LayerParameters(bounds, nullptr, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+                              D2D1::Matrix3x2F::Identity(), opacity), AcquireLayer());
 }
 
 void Renderer::PopOpacity() {
@@ -2450,6 +2524,7 @@ void Renderer::PopOpacity() {
     }
     if (!ctx_) return;
     ctx_->PopLayer();
+    if (layerDepth_) --layerDepth_;
 }
 
 void Renderer::PushTransform(const D2D1_MATRIX_3X2_F& transform) {
@@ -2483,10 +2558,179 @@ static bool BuildGeometry(ID2D1Factory* factory, const std::vector<std::string>&
                           ID2D1PathGeometry** outGeometry);
 }
 
+void Renderer::PrepareDisplayList(const DisplayList& list) {
+    // Snapshot window-resolved fonts/mode on the UI thread. Retained layouts
+    // and SVG text never outlive a fallback or rendering-parameter change.
+    if(list.text_render_mode>=0) {
+        if(!frameTextEnvironment_ || defaultFontOverride_!=list.default_font ||
+           latinFontOverride_!=list.latin_font || cjkFontOverride_!=list.cjk_font) {
+            defaultFontOverride_=list.default_font;
+            latinFontOverride_=list.latin_font;
+            cjkFontOverride_=list.cjk_font;
+            frameTextEnvironment_=true;
+            ClearTextCaches(); RebuildFontFallback();
+        }
+        if(!hasRenderModeOverride_ || int(renderModeOverride_)!=list.text_render_mode) {
+            SetTextRenderMode(static_cast<theme::TextRenderMode>(list.text_render_mode));
+        }
+    }
+    nextBounds_=AnalyzeDisplayList(list);
+    const size_t oldFirst=opacityFirst_,oldEnd=opacityEnd_;
+    opacityPush_=size_t(-1);
+    for(size_t i=0;i<list.commands.size();++i) {
+        if(list.commands[i].type!=DrawCommandType::PushOpacity) continue;
+        const size_t pop=nextBounds_.ends[i];
+        if(pop==size_t(-1) || pop<=i+8 || pop-i>2048) continue;
+        size_t first=i+1,end=pop;
+        const auto& m=list.commands[first].transform;
+        if(list.commands[first].type==DrawCommandType::PushTransform &&
+           list.commands[end-1].type==DrawCommandType::PopTransform &&
+           m._11==1 && m._22==1 && m._12==0 && m._21==0 && nextBounds_.ends[first]==end-1) { ++first; --end; }
+        opacityPush_=i; opacityFirst_=first; opacityEnd_=end;
+        bool stable=oldFirst==first && oldEnd==end && previousDisplayList_.commands.size()>end;
+        size_t chars=0;
+        for(size_t n=first;n<end && stable;++n) {
+            stable=EqualDrawCommand(previousDisplayList_,n,list,n);
+            const auto& c=list.commands[n];
+            if(c.type==DrawCommandType::DrawText && c.text_index<list.text_pool.size()) chars+=list.text_pool[c.text_index].size();
+        }
+        if(!stable || chars>65536) { opacityCommands_.clear(); break; }
+        if(!opacityCommands_.empty()) break;
+        // DirectWrite snaps glyph origins using the live transform. Retaining
+        // glyph runs before a fractional translation changes that snapping.
+        // Cache ordered geometry spans and replay text live between them.
+        auto geometry=[&](size_t index) {
+            const auto& command=list.commands[index];
+            const auto type=command.type;
+            if(type<DrawCommandType::FillRect || type==DrawCommandType::DrawText ||
+               type==DrawCommandType::DrawSvgTextRuns || type==DrawCommandType::DrawBackdropBlur) return false;
+            if(type==DrawCommandType::DrawSvgDocument) {
+                if(command.svg_document_ref_index>=list.svg_document_refs.size()) return false;
+                for(const auto& step:list.svg_document_refs[command.svg_document_ref_index].steps)
+                    if(step.xml.find("<text")!=std::string::npos || step.xml.find("<foreignObject")!=std::string::npos) return false;
+            }
+            return true;
+        };
+        ComPtr<ID2D1Image> target; ctx_->GetTarget(&target);
+        D2D1_MATRIX_3X2_F saved{}; ctx_->GetTransform(&saved);
+        for(size_t begin=first;begin<end && opacityCommands_.size()<64;) {
+            if(!geometry(begin)) { ++begin; continue; }
+            size_t finish=begin+1;
+            while(finish<end && geometry(finish)) ++finish;
+            if(finish-begin<2 && list.commands[begin].type!=DrawCommandType::DrawSvgIcon && list.commands[begin].type!=DrawCommandType::DrawSvgDocument) { begin=finish; continue; }
+            ComPtr<ID2D1CommandList> retained;
+            if(FAILED(ctx_->CreateCommandList(&retained))) break;
+            ctx_->SetTarget(retained.Get());
+            ctx_->BeginDraw();
+            ctx_->SetTransform(D2D1::Matrix3x2F::Identity());
+            replayingCache_=true;
+            ReplayDisplayListRange(list,begin,finish);
+            replayingCache_=false;
+            const HRESULT drawn=ctx_->EndDraw();
+            ctx_->SetTarget(target.Get());
+            ctx_->SetTransform(saved);
+            if(FAILED(drawn) || FAILED(retained->Close())) { opacityCommands_.clear(); break; }
+            opacityCommands_.push_back({begin,finish,std::move(retained)});
+            begin=finish;
+        }
+        break;
+    }
+    if(opacityPush_==size_t(-1)) opacityCommands_.clear();
+}
+
+void Renderer::RenderDisplayList(DisplayList list, bool incremental) {
+    TraceScope scope("core_renderer","replay_display_list_duration");
+    const float scale=list.dpi_scale>0?list.dpi_scale:1;
+    D2D1_RECT_F full{0,0,list.width_px/scale,list.height_px/scale};
+    auto damage=incremental?DisplayListDamage(previousDisplayList_,previousBounds_,list,nextBounds_):full;
+    // A pixel-aligned outer clip must include anti-aliasing at both the old and
+    // new edges. The entire dirty rectangle is repainted, including its clear;
+    // DXGI flip-sequential preserves/copies the coherent area outside it.
+    presentDamage_={std::max(0L,LONG(std::floor(damage.left*scale))-2),
+                    std::max(0L,LONG(std::floor(damage.top*scale))-2),
+                    std::min(LONG(list.width_px),LONG(std::ceil(damage.right*scale))+2),
+                    std::min(LONG(list.height_px),LONG(std::ceil(damage.bottom*scale))+2)};
+    if(damage.right<=damage.left || damage.bottom<=damage.top) presentDamage_={};
+    const RECT changed=presentDamage_;
+    // Two flip-sequential buffers alternate. Repaint last frame's changes as
+    // well, so this back buffer is coherent even before Present (readback,
+    // overlapping alpha layers and screenshots must see the same image).
+    if(incremental && previousDamage_.right>previousDamage_.left && previousDamage_.bottom>previousDamage_.top) {
+        if(presentDamage_.right<=presentDamage_.left || presentDamage_.bottom<=presentDamage_.top) presentDamage_=previousDamage_;
+        else presentDamage_={std::min(presentDamage_.left,previousDamage_.left),std::min(presentDamage_.top,previousDamage_.top),
+                             std::max(presentDamage_.right,previousDamage_.right),std::max(presentDamage_.bottom,previousDamage_.bottom)};
+    }
+    previousDamage_=changed;
+    if(presentDamage_.right<=presentDamage_.left || presentDamage_.bottom<=presentDamage_.top) presentDamage_={0,0,1,1};
+    partialPresent_=incremental && (presentDamage_.left>0 || presentDamage_.top>0 ||
+        presentDamage_.right<list.width_px || presentDamage_.bottom<list.height_px);
+    if(partialPresent_) {
+        replayDamage_={presentDamage_.left/scale,presentDamage_.top/scale,presentDamage_.right/scale,presentDamage_.bottom/scale};
+        ctx_->PushAxisAlignedClip(replayDamage_,D2D1_ANTIALIAS_MODE_ALIASED);
+        replayBounds_=&nextBounds_;
+    }
+    ReplayDisplayListRange(list,0,list.commands.size(),true);
+    PruneImageBitmapCacheTo(list.image_refs);
+    replayBounds_=nullptr;
+    if(partialPresent_) ctx_->PopAxisAlignedClip();
+    TraceEvent("core_renderer","frame_damage",{
+        TraceF64("area_fraction",double(presentDamage_.right-presentDamage_.left)*(presentDamage_.bottom-presentDamage_.top)/std::max(1.0,double(list.width_px)*list.height_px)),
+        TraceI64("retained_ranges",int64_t(opacityCommands_.size())),
+        TraceI64("text_layouts",int64_t(textLayouts_.size())),
+        TraceI64("text_utf16",int64_t(textLayoutChars_)),
+        TraceI64("brushes",int64_t(brushCache_.size()+(transientBrush_?1:0))),
+        TraceI64("svg_documents",int64_t(svgDocuments_.size()))});
+    previousDisplayList_=std::move(list);
+    previousBounds_=std::move(nextBounds_);
+}
+
 void Renderer::ReplayDisplayList(const DisplayList& list) {
     if (!ctx_) return;
+    ReplayDisplayListRange(list, 0, list.commands.size());
+    PruneImageBitmapCacheTo(list.image_refs);
+}
+
+void Renderer::DrawCachedSvgDocument(const SvgDocumentRef& source, const D2D1_MATRIX_3X2_F& transform) {
+    for(auto it=svgDocuments_.begin();it!=svgDocuments_.end();++it) if(EqualSvgDocument(it->source,source)) {
+        svgDocuments_.splice(svgDocuments_.begin(),svgDocuments_,it);
+        auto& cached=svgDocuments_.front();
+        DrawSvgStepsOrdered(ctx5_.Get(),source.steps,source.viewport_w,source.viewport_h,transform,&cached.content,&cached.shadows);
+        return;
+    }
+    size_t bytes=0;
+    for(const auto& step:source.steps) bytes+=step.xml.size()+step.shadow_xml.size();
+    if(bytes>16384 || source.steps.size()>64) {
+        DrawSvgStepsOrdered(ctx5_.Get(),source.steps,source.viewport_w,source.viewport_h,transform,nullptr,nullptr);
+        return;
+    }
+    while(!svgDocuments_.empty() && (svgDocuments_.size()>=64 || svgDocumentBytes_+bytes>131072)) {
+        svgDocumentBytes_-=svgDocuments_.back().bytes;
+        svgDocuments_.pop_back();
+    }
+    svgDocuments_.push_front({source,{},{},bytes}); svgDocumentBytes_+=bytes;
+    auto& cached=svgDocuments_.front();
+    DrawSvgStepsOrdered(ctx5_.Get(),source.steps,source.viewport_w,source.viewport_h,transform,&cached.content,&cached.shadows);
+}
+
+void Renderer::ReplayDisplayListRange(const DisplayList& list, size_t first, size_t end, bool useRetained) {
     std::vector<D2D1_MATRIX_3X2_F> transformStack;
-    for (const auto& cmd : list.commands) {
+    size_t retainedIndex=0;
+    for (size_t i=first; i<end; ++i) {
+        if(useRetained && !replayingCache_) {
+            while(retainedIndex<opacityCommands_.size() && opacityCommands_[retainedIndex].end<=i) ++retainedIndex;
+            if(retainedIndex<opacityCommands_.size() && opacityCommands_[retainedIndex].first==i) {
+                const auto& retained=opacityCommands_[retainedIndex];
+                ctx_->DrawImage(retained.commands.Get());
+                i=retained.end-1;
+                continue;
+            }
+        }
+        const auto& cmd=list.commands[i];
+        if (replayBounds_ && cmd.type>=DrawCommandType::FillRect) {
+            const auto& b=replayBounds_->commands[i];
+            if(b.right<=replayDamage_.left || b.left>=replayDamage_.right ||
+               b.bottom<=replayDamage_.top || b.top>=replayDamage_.bottom) continue;
+        }
         switch (cmd.type) {
         case DrawCommandType::Clear:
             Clear(cmd.color);
@@ -2508,6 +2752,7 @@ void Renderer::ReplayDisplayList(const DisplayList& list) {
             break;
         case DrawCommandType::PushOpacity:
             PushOpacity(cmd.opacity, cmd.rect);
+
             break;
         case DrawCommandType::PopOpacity:
             PopOpacity();
@@ -2640,9 +2885,7 @@ void Renderer::ReplayDisplayList(const DisplayList& list) {
 
             D2D1_MATRIX_3X2_F oldXform = D2D1::Matrix3x2F::Identity();
             ctx5_->GetTransform(&oldXform);
-            DrawSvgStepsOrdered(ctx5_.Get(), ref.steps, ref.viewport_w,
-                                ref.viewport_h, cmd.transform * oldXform,
-                                nullptr, nullptr);
+            DrawCachedSvgDocument(ref,cmd.transform * oldXform);
             ctx5_->SetTransform(oldXform);
             break;
         }
@@ -2657,7 +2900,6 @@ void Renderer::ReplayDisplayList(const DisplayList& list) {
             break;
         }
     }
-    PruneImageBitmapCacheTo(list.image_refs);
 }
 
 // ---- SVG icon parsing and rendering ----

@@ -31,6 +31,7 @@
 namespace ui {
 
 class ScrollViewWidget;
+class ComboBoxWidget;
 
 class UI_API UiWindowImpl {
 public:
@@ -121,6 +122,7 @@ public:
     // Public so Context::UpdateAnimTimers can fire it after a binding
     // application flips a widget into animating_=true outside an event handler.
     void UpdateToggleAnimTimer();
+    void TrackOpenComboBox(ComboBoxWidget* widget);
     void RegisterAnimatingWidget(Widget* w,
                                  AnimationInvalidation invalidation = AnimationInvalidation::Paint);
     void AnimateProperty(Widget* target, AnimProperty prop, float from, float to,
@@ -221,6 +223,8 @@ private:
     MeasureContext measureContext_;
     WidgetPtr   root_;
     Widget*     hoveredWidget_ = nullptr;
+    std::vector<std::weak_ptr<Widget>> openComboBoxes_;
+    std::vector<std::weak_ptr<Widget>> hoveredScrollViews_;
     Widget*     pressedWidget_ = nullptr;
     ContextMenuPtr activeMenu_;
 

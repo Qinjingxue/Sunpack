@@ -13,6 +13,7 @@
 #include <ui/controls.h>
 #include <ui/ui_debug.h>
 using namespace spg;
+void rendering_contracts();
 namespace {
 constexpr int virtualTaskCount=96, virtualPasswordCount=80, virtualHistoryCount=96;
 struct AnimationFrames {
@@ -52,7 +53,8 @@ UiRect rect(Application& app,const std::string& id) {
 }
 Json rendered_widget(Application& app,const std::string& id) {
     auto* window=ui::GetContext().GetWindow(app.window());
-    auto* widget=window->Root()->FindById(id); assert(widget);
+    auto* widget=window->Root()->FindById(id);
+    if(!widget) throw std::runtime_error("Missing rendered widget: "+id+"; configQuery="+state(app.page(),"configQuery").dump());
     return parse_json(ui::DebugDumpTree(widget,&window->GetRenderer()));
 }
 void pump(const std::function<bool()>& condition, const char* phase="UI event", bool allow_timers=true) {
@@ -1002,8 +1004,8 @@ void drag_after_wheel(Application& app) {
         float y=bounds.top+active->ScrollY()/(extent-height)*(height-thumb)+thumb/2;
         float dy=delta<0?12.0f:-12.0f;
         assert(ui_debug_mouse_move(app.window(),x,y)==0);
-        // Hover itself paints a frame of the in-flight wheel animation.
-        // Press the thumb at its current position, without a forced layout.
+        // Hover may queue an in-flight wheel frame. Press the thumb at the
+        // latest visual position, without a forced layout or synchronous paint.
         y=bounds.top+active->ScrollY()/(extent-height)*(height-thumb)+thumb/2;
         float from=active->ScrollY();
         assert(ui_debug_mouse_down(app.window(),x,y)==0);
@@ -1110,6 +1112,7 @@ int wmain(int argc,wchar_t** argv) {
     Handle gate(CreateEventW(nullptr,TRUE,TRUE,gate_name.c_str()));
     try {
         scalar_reactivity_noop();
+        rendering_contracts();
         atomic_write(dir/"sunpack_config.json",R"({"cli":{"language":"zh"},"runtime":{"process_mode":"normal"},"recursive_extract":"*","watch":{"state_dir":".sunpack_watch","out_dir":".","toast_enabled":true},"unknown":9007199254740993})");
         if(rangesOnly || acceptance) {
             auto config=parse_json(kUiDefaultsJson); config["watch"]["state_dir"]=".sunpack_watch";
@@ -1133,6 +1136,23 @@ int wmain(int argc,wchar_t** argv) {
                 click(app,"tabConfig"); pump([&]{return state(app.page(),"tab")=="config";});
                 if(acceptance) {
                     settle_motion(app);
+                    auto* native=ui::GetContext().GetWindow(app.window());
+                    auto heading=native->Root()->FindById("page-config")->Children().front()->rect;
+                    native->SimMouseMove(heading.left+10,heading.top+10);
+                    pump([&]{return !GetUpdateRect(native->Handle(),nullptr,FALSE);});
+                    // Pumping may deliver WM_MOUSELEAVE if the physical cursor
+                    // is outside this test window. Establish hover again, finish
+                    // that legitimate paint, then observe only unchanged packets.
+                    native->SimMouseMove(heading.left+10,heading.top+10);
+                    UpdateWindow(native->Handle());
+                    assert(!GetUpdateRect(native->Handle(),nullptr,FALSE));
+                    {
+                        AnimationFrames unchanged;
+                        for(int packet=0;packet<10;++packet)
+                            native->SimMouseMove(heading.left+10+float(packet%2),heading.top+10);
+                        assert(!GetUpdateRect(native->Handle(),nullptr,FALSE));
+                        assert(unchanged.submitted==0);
+                    }
                     localized_config_search(app);
                     inline_cell_caret(app);
                     virtual_tail(app,"configItems","configListScroll",state(app.page(),"matchingBlocks").size());
@@ -1533,10 +1553,14 @@ int wmain(int argc,wchar_t** argv) {
             assert(conflict["text"]==tr("settingChanged","zh"));
             changed["cli"]["language"]="en"; atomic_write(dir/"sunpack_config.json",changed.dump());
             pump([&]{return state(app.page(),"saveErrors")["/watch/out_dir"]["text"]==tr("settingChanged","en");});
+            // The translated search label no longer matches after a language
+            // replacement. Locate the field using its current visible label.
+            search_setting(app,"/watch/out_dir");
             screenshot(app,L"error-english.png");
             assert(rendered_widget(app,"field-/watch/out_dir").dump().find("Default output folder")!=std::string::npos);
             changed["cli"]["language"]="zh"; atomic_write(dir/"sunpack_config.json",changed.dump());
             pump([&]{return state(app.page(),"saveErrors")["/watch/out_dir"]["text"]==tr("settingChanged","zh");});
+            search_setting(app,"/watch/out_dir");
 
             click(app,"input-/watch/out_dir"); ui_debug_type_text(app.window(),L" corrected");
             finish_input(app);

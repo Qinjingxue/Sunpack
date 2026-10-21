@@ -46,7 +46,7 @@ void RenderWindow::ReleaseDeviceResources() {
     ReleaseResources();
 }
 
-RenderFrameResult RenderWindow::RenderFrame(const FrameJob& job) {
+RenderFrameResult RenderWindow::RenderFrame(FrameJob& job) {
     if (!job.window.IsValid() ||
         !Matches(job.window) ||
         hwnd_ == nullptr ||
@@ -107,8 +107,10 @@ RenderFrameResult RenderWindow::RenderFrame(const FrameJob& job) {
     renderer_->skipVSync = visible && !job.animate &&
                            job.policy != PresentPolicy::Final &&
                            job.policy != PresentPolicy::Screenshot;
+    renderer_->PrepareDisplayList(job.display_list);
     renderer_->BeginDraw();
-    renderer_->ReplayDisplayList(job.display_list);
+    renderer_->RenderDisplayList(std::move(job.display_list), !sizeChanged && !job.defer_present &&
+        visible && surfaceKind_==RenderSurfaceKind::HwndSwapChain && job.policy!=PresentPolicy::Screenshot);
     HRESULT hr = renderer_->EndDraw();
     if (hr == D2DERR_RECREATE_TARGET) {
         ReleaseResources();

@@ -5,6 +5,9 @@ data directory, opens the real `Application` in-process, drives it through the C
 API and reports wall time and process CPU cycles per action plus the Core UI trace durations
 attributed to the action that caused them.
 
+The five GUI rendering/input optimizations and their repeat-run measurements are
+documented in [optimization-2026-10-21.md](optimization-2026-10-21.md).
+
 ## Build and run
 
 ```powershell
@@ -27,6 +30,20 @@ password file with `passwords` saved records plus `history` clipboard entries, a
 * `actions.<name>.wall_ms` / `process_cpu_million_cycles` – p50/p95/max over the sampled
   rounds; CPU cycles are taken from `QueryProcessCycleTime`, so they include the render
   thread.
+* `process_cpu_ms` uses `GetProcessTimes` (all process threads, coarse Windows
+  accounting; aggregate long actions rather than interpreting short zero samples).
+  Selected long actions also report `gpu_engine_busy_ms`: differences of PDH
+  `GPU Engine(*)\\Running Time` counters filtered to this process. This is summed
+  engine busy time, not GPU utilization, frame latency or time blocked in Present;
+  overlapping engines can contribute simultaneously. Missing counters are omitted.
+* `pointer_same_target` injects a burst of 1000 move packets over the same heading,
+  draining messages once after the burst (otherwise the physical cursor outside
+  the test window generates a spurious leave after every packet). It is a synthetic event-pressure scenario; the
+  native acceptance test separately checks unchanged hover causes no invalidation.
+* `phase_counts.<action>::area_fraction|text_layouts|text_utf16|brushes|svg_documents|retained_ranges`
+  reports damage area and retained cache sizes. `core_ui_trace.<action>::present_interval_ms`
+  records completion-to-completion intervals using QPC. Gaps at page transitions
+  can include idle time, so inspect continuous animation phases separately.
 * `core_ui_trace.all::<event>` – duration distributions of every Core UI trace event over
   the whole run; `core_ui_trace.<action>::<event>` restricts them to the window of one
   measured action.
@@ -58,10 +75,13 @@ password file with `passwords` saved records plus `history` clipboard entries, a
 
 Configuration diagnostics also traverse all blocks twice in 96-DIP increments
 (`config_traverse_cold`/`config_traverse_warm`), resize the configuration page in
-8-DIP steps (`config_resize`), and feed wheel input after each presented frame
+8-DIP steps (`config_resize`), and feed wheel input after each recorded paint
 until the last block (`config_wheel_traverse`). This includes buffer refills and
 large cards that alternating at the tail misses. The wheel scenario uses frame
-events, without a pacing sleep. `virtual_refill_duration`,
+events, without a pacing sleep. Recording and presentation counts can differ;
+compare per-present work as well as total traversal cost when the frame scheduler
+changes. Short `scroll_*` actions measure dispatch rather than the full animation.
+`virtual_refill_duration`,
 `virtual_list_layout_duration` and `scroll_layout_duration` separate template
 mounting from measurement; the traversal action includes all synchronous work
 and message processing, even when layout happens before paint recording.

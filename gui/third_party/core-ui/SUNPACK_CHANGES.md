@@ -11,6 +11,32 @@ preserved.
 
 Local changes:
 
+- Compare consecutive display lists and replay/present a conservative dirty
+  rectangle. Include both alternating swap-chain buffers' changes; resize,
+  screenshots, prepared frames, backdrop sampling and SVG text runs retain full
+  replay. Resource ownership moves with the previous list and clears on target
+  release. Text/SVG damage uses the active clip to preserve overhangs.
+- Cache DirectWrite draw layouts (512 entries / 65536 UTF-16 units), SVG documents
+  (64 entries / 128 KiB XML), brushes and opacity/rounded-clip layers with bounded
+  lifetimes. Snapshot fonts/fallback/rendering mode in each submitted frame and
+  invalidate dependent caches when they change.
+- Retain at most 64 ordered geometry command spans for one stable opacity
+  animation subtree. Replay text at its live fractional transform to preserve
+  DirectWrite glyph snapping; release retained spans when content/target changes
+  or the animation ends. No raster scaling or change to animation timing.
+- Coalesce pointer invalidations through the existing posted frame scheduler;
+  preserve the existing independent animation submission cadence. Unchanged
+  pointer input no longer paints or scans the entire tree: open combos register weak handles,
+  scroll hover follows old/new hit ancestry, and pointer leave clears only hover
+  state without synthesizing a drag. Transactions/resize keep their barriers.
+- Set the shared DXGI device's maximum driver frame latency to one. The default
+  three queued frames caused uneven Present completion intervals with cheaper
+  cached animation frames on the measured 240 Hz display. Keep Present(1), the
+  existing completion-driven animation host, durations and easing unchanged.
+- Reuse surviving virtual rows' layouts only during viewport refill. Data changes,
+  font changes and ordinary root/resize layouts still measure the actual controls;
+  the cache contains only mounted rows with weak identities.
+
 - Deliver loop-scoped mouse-down offsets through label/icon children to the
   interactive ancestor, and disconnect the hook when a virtual row unmounts.
   TextInputWidget can place its caret using the existing text hit test with a

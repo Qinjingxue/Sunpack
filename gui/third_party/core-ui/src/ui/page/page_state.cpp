@@ -2297,6 +2297,7 @@ void PageState::RebuildJsLoop(JsLoopRuntime& rt, bool viewportOnly) {
     } rebuilding(rt.rebuilding);
     JSContext* ctx = jsRt_->ctx();
     auto* virtualList = dynamic_cast<VirtualListWidget*>(rt.spec->parentWidget);
+    if (virtualList && !viewportOnly) virtualList->InvalidateRowLayouts();
 
     // Build outer args (for nested v-for inside v-if inside v-for).
     JSValue outerArgs[2];

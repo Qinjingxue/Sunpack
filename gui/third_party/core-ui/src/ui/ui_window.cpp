@@ -1552,7 +1552,8 @@ LRESULT UiWindowImpl::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
         }
         OnMouseMove((float)GET_X_LPARAM(lParam), (float)GET_Y_LPARAM(lParam)); return 0;
-    case WM_MOUSELEAVE:
+    case WM_MOUSELEAVE: {
+        bool changed=hoveredWidget_!=nullptr || tooltipVisible_;
         if (hoveredWidget_) {
             for (Widget* w = hoveredWidget_; w; w = w->Parent()) {
                 w->hovered = false;
@@ -1562,7 +1563,12 @@ LRESULT UiWindowImpl::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             hoveredWidget_ = nullptr;
         }
         tooltipVisible_ = false; tooltipWidget_ = nullptr;
-        InvalidateNow(); return 0;
+        for(auto& weak:hoveredScrollViews_) if(auto alive=weak.lock())
+            changed=static_cast<ScrollViewWidget*>(alive.get())->ClearPointerHover()||changed;
+        hoveredScrollViews_.clear();
+        if(changed) Invalidate();
+        return 0;
+    }
     case WM_LBUTTONDOWN:
         OnMouseDown((float)GET_X_LPARAM(lParam), (float)GET_Y_LPARAM(lParam)); return 0;
     case WM_LBUTTONUP:
@@ -2374,6 +2380,10 @@ DisplayList UiWindowImpl::OnPaint(uint64_t frameGeneration) {
         base.width_px = static_cast<int>(clientWidthPx_);
         base.height_px = static_cast<int>(clientHeightPx_);
         base.dpi_scale = dpiScale_;
+        base.default_font=renderer_.DefaultFontFamily();
+        if(auto* font=renderer_.LatinFontFamily()) base.latin_font=font;
+        if(auto* font=renderer_.CjkFontFamily()) base.cjk_font=font;
+        base.text_render_mode=int(renderer_.TextRenderMode());
         recorder.Reset(std::move(base));
         previousRecorder = renderer_.DisplayListRecorderTarget();
         renderer_.SetDisplayListRecorder(&recorder);
@@ -2661,6 +2671,16 @@ static void StampDomMouseState(MouseEvent& e, int button) {
     e.alt   = (GetKeyState(VK_MENU)    & 0x8000) != 0;
 }
 
+void UiWindowImpl::TrackOpenComboBox(ComboBoxWidget* widget) {
+    openComboBoxes_.erase(std::remove_if(openComboBoxes_.begin(), openComboBoxes_.end(),
+        [](const auto& weak) {
+            auto alive = weak.lock();
+            return !alive || !static_cast<ComboBoxWidget*>(alive.get())->IsOpen();
+        }), openComboBoxes_.end());
+    for (auto& weak : openComboBoxes_) if (weak.lock().get() == widget) return;
+    openComboBoxes_.push_back(widget->weak_from_this());
+}
+
 void UiWindowImpl::OnMouseMove(float x, float y) {
     ActiveMeasureContextScope measureScope(measureContext_, renderer_);
     float dx = x / dpiScale_, dy = y / dpiScale_;
@@ -2782,27 +2802,31 @@ void UiWindowImpl::OnMouseMove(float x, float y) {
             if (hit->OnMouseMove(e)) repaintNow = true;
         }
 
-        ForEachWidget(root_.get(), [&](Widget* w) {
-            auto* cb = dynamic_cast<ComboBoxWidget*>(w);
-            if (cb && cb->IsOpen()) {
-                MouseEvent e{dx, dy};
-                if (cb->OnMouseMove(e)) repaintNow = true;
-            }
-        });
-
-        // Update ScrollView scrollbar hover state (overlay scrollbar)
-        ForEachWidget(root_.get(), [&](Widget* w) {
-            auto* sv = dynamic_cast<ScrollViewWidget*>(w);
-            if (sv && sv->visible && sv->NeedsScrollbar()) {
-                MouseEvent e{dx, dy};
-                if (sv->OnMouseMove(e)) repaintNow = true;
-            }
-        });
+        // Open overlays are registered once; scroll hover follows the hit
+        // ancestry and the previous ancestry, never hidden sibling pages.
+        MouseEvent move{dx, dy};
+        for (auto& weak : openComboBoxes_) if (auto alive = weak.lock()) {
+            auto* combo = static_cast<ComboBoxWidget*>(alive.get());
+            if (combo->IsOpen() && combo != hit && combo->OnMouseMove(move)) repaintNow = true;
+        }
+        std::vector<std::weak_ptr<Widget>> nextScrolls;
+        for (Widget* w = hit; w; w = w->Parent()) if (auto* scroll = dynamic_cast<ScrollViewWidget*>(w)) {
+            nextScrolls.push_back(scroll->weak_from_this());
+            if (scroll != hit && scroll->OnMouseMove(move)) repaintNow = true;
+        }
+        for (auto& weak : hoveredScrollViews_) if (auto alive = weak.lock()) {
+            bool retained = false;
+            for (auto& next : nextScrolls) if (next.lock().get() == alive.get()) { retained = true; break; }
+            if (!retained && alive->OnMouseMove(move)) repaintNow = true;
+        }
+        hoveredScrollViews_ = std::move(nextScrolls);
     }
-    if (scrollFrameGeneration_) QueueScrollFrame();
-    else if (repaintNow || HasPendingPaint()) InvalidateNow();
-    else Invalidate();
-    UpdateToggleAnimTimer();  // start timer if Slider thumb needs animation
+    if (repaintNow) {
+        if (scrollFrameGeneration_) QueueScrollFrame();
+        else Invalidate();
+    }
+    // Controls register their finite animations when their target changes.
+    // A no-op mouse packet must neither scan/rebuild the host nor paint.
 
     TRACKMOUSEEVENT tme{sizeof(tme), TME_LEAVE, hwnd_, 0};
     TrackMouseEvent(&tme);
@@ -3120,18 +3144,21 @@ void UiWindowImpl::OnMouseWheel(float x, float y, int delta) {
         // or other widget behind it.
         bool handledByDropdown = false;
         bool dismissedDropdown = false;
-        ForEachWidget(root_.get(), [&](Widget* w) {
-            if (handledByDropdown) return;
-            auto* cb = dynamic_cast<ComboBoxWidget*>(w);
-            if (cb && cb->IsOpen() && cb->OnMouseWheel(e)) {
-                handledByDropdown = true;
-            } else if (cb && cb->IsOpen()) {
-                // Dismiss outside-wheel input before the anchor can scroll
-                // out of a clipped pane. Close freezes its exit geometry.
+        for (auto& weak : openComboBoxes_) {
+            if (handledByDropdown) break;
+            auto alive=weak.lock();
+            if (!alive) continue;
+            auto* cb=static_cast<ComboBoxWidget*>(alive.get());
+            if (!cb->IsOpen()) continue;
+            bool visible=true;
+            for (auto* ancestor=cb->Parent();ancestor;ancestor=ancestor->Parent()) if (!ancestor->visible) { visible=false; break; }
+            if (!visible) { cb->Close(); continue; }
+            if (cb->OnMouseWheel(e)) handledByDropdown=true;
+            else {
                 cb->Close();
-                dismissedDropdown = true;
+                dismissedDropdown=true;
             }
-        });
+        }
         if (handledByDropdown) {
             InvalidateNow();
             return;
