@@ -18,7 +18,8 @@
 
 namespace ui {
 
-// Millisecond animation time without GetTickCount64's ~15.6 ms quantization.
+// QPC time; scroll integration retains sub-millisecond samples on fast displays.
+UI_API double AnimationTimeMs();
 UI_API uint64_t AnimationClockMs();
 
 struct UI_API AnimationSpec {

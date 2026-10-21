@@ -31,12 +31,12 @@ void enter(UiWindow handle, const char* id, float x, float y) {
     reset(window, widget);
     for(auto* parent = widget; parent; parent = parent->Parent()) if(!parent->visible) return;
     if(!enabled()) { window->Invalidate(); return; }
-    // The incoming view stays readable throughout. Translation affects paint,
-    // never control sizes or scroll offsets. No outgoing blank frame is shown.
-    widget->opacity = 0.72f; widget->animationX = x; widget->animationY = y;
-    window->AnimateProperty(widget, ui::AnimProperty::Opacity, 0.72f, 1, 83, ui::EasingFunction::Linear);
-    if(x) window->AnimateProperty(widget, ui::AnimProperty::TranslateX, x, 0, 170, ui::EasingFunction::FluentEnter);
-    if(y) window->AnimateProperty(widget, ui::AnimProperty::TranslateY, y, 0, 170, ui::EasingFunction::FluentEnter);
+    // Fluent entrance: commit the new data/layout before fading and translating.
+    // Translation affects paint, never control sizes or scroll offsets.
+    widget->opacity = 0; widget->animationX = x; widget->animationY = y;
+    window->AnimateProperty(widget, ui::AnimProperty::Opacity, 0, 1, 167, ui::EasingFunction::Linear);
+    if(x) window->AnimateProperty(widget, ui::AnimProperty::TranslateX, x, 0, 250, ui::EasingFunction::FluentEnter);
+    if(y) window->AnimateProperty(widget, ui::AnimProperty::TranslateY, y, 0, 250, ui::EasingFunction::FluentEnter);
 }
 void select(UiWindow handle, const char* id, const char* targetId) {
     auto* window = ui::GetContext().GetWindow(handle);

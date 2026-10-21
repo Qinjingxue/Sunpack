@@ -316,6 +316,7 @@ void UiWindowImpl::UnregisterRenderWindow() {
     RenderThread::Instance().UnregisterWindow(renderWindowId_);
     renderWindowId_ = {};
     renderThreadPresentActive_ = false;
+    scrollFrameGeneration_ = 0;
 }
 
 void UiWindowImpl::SetIconFromPixels(const uint8_t* rgba, int w, int h) {
@@ -626,6 +627,13 @@ void UiWindowImpl::InvalidateNow() {
     }
 }
 
+void UiWindowImpl::QueueScrollFrame() {
+    scrollPaintPending_ = true;
+    // kMsgRenderFrame is a posted message, so it cannot be starved like
+    // WM_PAINT by a stream of captured WM_MOUSEMOVE input.
+    if (!scrollFrameGeneration_) Invalidate();
+}
+
 bool UiWindowImpl::HasPendingPaint() const {
     if (!hwnd_) return false;
     return GetUpdateRect(hwnd_, nullptr, FALSE) != FALSE;
@@ -662,7 +670,10 @@ void UiWindowImpl::SubmitFrameJob(const FrameRequest& frame, DisplayList display
     job.priority = static_cast<int>(frame.policy);
     job.render_thread_present = renderThreadPresentActive_;
     job.defer_present = deferNextFramePresent_ && FrameRequiresPresentBarrier(frame);
-    job.animate = HasAnimationFrameWork();
+    job.animate = HasAnimationFrameWork() || scrollFrameRecorded_ || scrollFrameGeneration_ != 0;
+    if (scrollFrameRecorded_ && !job.defer_present &&
+        IsWindowVisible(hwnd_) && !IsIconic(hwnd_)) scrollFrameGeneration_ = frame.generation;
+    scrollFrameRecorded_ = false;
     job.display_list = std::move(displayList);
     TraceEvent("core_window", "frame_job_submitted",
                {TraceU64("frame_generation", frame.generation),
@@ -822,7 +833,12 @@ void UiWindowImpl::CommitDeferredVisualWindowRect() {
 bool UiWindowImpl::PresentPreparedVisualWindowFrame(uint64_t generation) {
     if (!hwnd_ || !renderWindowId_.IsValid() || !renderThreadPresentActive_) return false;
     const bool presented = RenderThread::Instance().PresentPrepared(renderWindowId_, true, 1000);
-    if (presented && HasAnimationFrameWork()) Invalidate();
+    if (presented) {
+        // A prepared transaction can supersede the scroll job before it ever
+        // presents. Its commit is the acknowledgement in that case.
+        scrollFrameGeneration_ = 0;
+        if (HasAnimationFrameWork() || scrollPaintPending_) Invalidate();
+    }
     TraceEvent("core_window",
                presented ? "visual_transaction_prepared_presented"
                          : "visual_transaction_prepared_present_failed",
@@ -1188,6 +1204,8 @@ void UiWindowImpl::UpdateToggleAnimTimer() {
             if (combo && combo->PopupAnimating()) {
                 needsWidgetTimer = true;
             }
+            auto* scroll = dynamic_cast<ScrollViewWidget*>(w);
+            if (scroll && scroll->ScrollAnimating()) needsWidgetTimer = true;
             auto* rb = dynamic_cast<RadioButtonWidget*>(w);
             if (rb && rb->animating_) {
                 needsWidgetTimer = true;
@@ -1238,7 +1256,8 @@ void UiWindowImpl::RegisterAnimatingWidget(Widget* w, AnimationInvalidation inva
 
     animationHost_.RegisterWidget(w, invalidation);
     StartAnimationFrames();
-    Invalidate();
+    if (dynamic_cast<ScrollViewWidget*>(w)) QueueScrollFrame();
+    else Invalidate();
 }
 
 void UiWindowImpl::AnimateProperty(Widget* target, AnimProperty prop, float from, float to,
@@ -1429,10 +1448,12 @@ LRESULT UiWindowImpl::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
     }
 
     case WM_SHOWWINDOW:
-        if (wParam) UpdateToggleAnimTimer(); else StopAnimationFrames();
+        if (wParam) UpdateToggleAnimTimer();
+        else { scrollFrameGeneration_ = 0; StopAnimationFrames(); }
         break;
     case WM_SIZE: {
-        if (wParam == SIZE_MINIMIZED) StopAnimationFrames(); else UpdateToggleAnimTimer();
+        if (wParam == SIZE_MINIMIZED) { scrollFrameGeneration_ = 0; StopAnimationFrames(); }
+        else UpdateToggleAnimTimer();
         TraceScope wmSizeScope("core_window", "wm_size_duration");
         {
             TraceEvent("core_window", "wm_size",
@@ -1949,8 +1970,11 @@ LRESULT UiWindowImpl::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
     }
     case kUiCoreAnimationFrameMessage:
         if (static_cast<uint64_t>(wParam) == renderWindowId_.window_id &&
-            static_cast<uint64_t>(lParam) == renderWindowId_.hwnd_generation &&
-            HasAnimationFrameWork()) Invalidate();
+            static_cast<uint64_t>(lParam) == renderWindowId_.hwnd_generation) {
+            if (scrollFrameGeneration_ && RenderThread::Instance().LastCompletedGeneration(
+                    renderWindowId_.window_id) >= scrollFrameGeneration_) scrollFrameGeneration_ = 0;
+            if (!scrollFrameGeneration_ && (HasAnimationFrameWork() || scrollPaintPending_)) Invalidate();
+        }
         return 0;
     case kMsgRenderFrame: {
         renderFramePosted_ = false;
@@ -1974,6 +1998,7 @@ LRESULT UiWindowImpl::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
         }
         lastDeviceRecoveryGeneration_ = deviceGeneration;
+        scrollFrameGeneration_ = 0;
         TraceEvent("core_window", "render_device_lost_recovery_requested",
                    {TraceU64("window_id", renderWindowId_.window_id),
                     TraceU64("hwnd_generation", renderWindowId_.hwnd_generation),
@@ -2122,6 +2147,8 @@ LRESULT UiWindowImpl::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
 
 void UiWindowImpl::BeginAnimationFrame() {
     if (animationHost_.Empty()) return;
+    // Wheel motion can mount/measure virtual rows on an animation frame.
+    ActiveMeasureContextScope measureScope(measureContext_, renderer_);
 
     uint64_t frameTick = AnimationClockMs();
     double frameIntervalMs = lastAnimationFrameTick_ != 0
@@ -2134,12 +2161,18 @@ void UiWindowImpl::BeginAnimationFrame() {
     bool needsLayout = false;
     int inputWidgets = (int)animationHost_.Size();
     int tickedWidgets = 0;
-    std::vector<AnimationTarget> stillAnimating;
-    const auto activeTargets = animationHost_.Targets();
-    stillAnimating.reserve(activeTargets.size());
+    // Scrolling can release animated controls in virtual rows during this loop.
+    // Weak frame-local references never retain those rows after unmounting.
+    std::vector<std::pair<AnimationInvalidation, std::weak_ptr<Widget>>> activeTargets;
+    activeTargets.reserve(animationHost_.Size());
+    for (const auto& target : animationHost_.Targets())
+        if (target.widget) activeTargets.emplace_back(target.invalidation, target.widget->weak_from_this());
+    size_t remaining = 0;
 
-    for (const AnimationTarget& target : activeTargets) {
-        Widget* w = target.widget;
+    for (size_t i = 0; i < activeTargets.size(); ++i) {
+        const auto target = activeTargets[i];
+        auto alive = target.second.lock();
+        Widget* w = alive.get();
         if (!w) continue;
         bool keep = false;
         bool ticked = false;
@@ -2162,6 +2195,13 @@ void UiWindowImpl::BeginAnimationFrame() {
             combo->UpdateAnimation();
             ticked = true;
             if (combo->PopupAnimating()) keep = true;
+        }
+        auto* scroll = dynamic_cast<ScrollViewWidget*>(w);
+        if (scroll && scroll->ScrollAnimating()) {
+            scrollFrameRecorded_ = true;
+            scroll->UpdateScrollAnimation();
+            ticked = true;
+            if (scroll->ScrollAnimating()) keep = true;
         }
         auto* rb = dynamic_cast<RadioButtonWidget*>(w);
         if (rb && rb->animating_) {
@@ -2207,15 +2247,20 @@ void UiWindowImpl::BeginAnimationFrame() {
 
         if (keep) {
             anyAnimating = true;
-            stillAnimating.push_back(target);
-            if (HasAnimationInvalidation(target.invalidation, AnimationInvalidation::Layout)) {
+            activeTargets[remaining++] = target;
+            if (HasAnimationInvalidation(target.first, AnimationInvalidation::Layout)) {
                 needsLayout = true;
             }
         }
         if (ticked) ++tickedWidgets;
     }
 
-    animationHost_.ReplaceTargets(std::move(stillAnimating));
+    std::vector<AnimationTarget> nextTargets;
+    nextTargets.reserve(remaining);
+    for (size_t i = 0; i < remaining; ++i)
+        if (auto alive = activeTargets[i].second.lock()) nextTargets.push_back({alive.get(), activeTargets[i].first});
+    animationHost_.ReplaceTargets(std::move(nextTargets));
+    anyAnimating = !animationHost_.Empty();
 
     if (needsLayout) {
         LayoutRoot();
@@ -2287,6 +2332,9 @@ DisplayList UiWindowImpl::OnPaint(uint64_t frameGeneration) {
         ValidateRect(hwnd_, nullptr);
         return {};
     }
+
+    scrollFrameRecorded_ = scrollPaintPending_;
+    scrollPaintPending_ = false;
 
     // Consume any pending layout request from dynamic widget mutations
     // (v-if mount, v-for re-key, etc.) before drawing the new state.
@@ -2663,11 +2711,10 @@ void UiWindowImpl::OnMouseMove(float x, float y) {
         // 下一行空指针崩溃 (GuoheView 拖出图片到其他窗口即触发).
         if (!pressedWidget_) { Invalidate(); return; }
         const bool handled = pressedWidget_->OnMouseMove(e);
-        // Captured drags can produce a continuous stream of WM_MOUSEMOVE. If
-        // we only invalidate, WM_PAINT may not run until the mouse stops, so
-        // the visual state jumps to the final position. Keep this generic for
-        // all pressed widgets that explicitly handle drag moves.
-        if (handled) InvalidateNow();
+        // ScrollView coalesces input onto posted presentation frames. Other
+        // drag controls retain their existing immediate rendering behavior.
+        if (dynamic_cast<ScrollViewWidget*>(pressedWidget_)) QueueScrollFrame();
+        else if (handled) InvalidateNow();
         else Invalidate();
         return;
     }
@@ -2752,7 +2799,8 @@ void UiWindowImpl::OnMouseMove(float x, float y) {
             }
         });
     }
-    if (repaintNow || HasPendingPaint()) InvalidateNow();
+    if (scrollFrameGeneration_) QueueScrollFrame();
+    else if (repaintNow || HasPendingPaint()) InvalidateNow();
     else Invalidate();
     UpdateToggleAnimTimer();  // start timer if Slider thumb needs animation
 
@@ -2859,7 +2907,7 @@ void UiWindowImpl::OnMouseDown(float x, float y) {
             pressedWidget_ = sv;
             SetCapture(hwnd_);
             UpdateCaretBlinkTimer();
-            InvalidateNow();
+            QueueScrollFrame();
             return;
         }
     }
@@ -2944,7 +2992,8 @@ void UiWindowImpl::CancelMouseCapture() {
     if (w->onMouseUpHook) w->onMouseUpHook(e);
     w->OnMouseUp(e);
     SetCursor(LoadCursor(nullptr, IDC_ARROW));
-    InvalidateNow();
+    if (dynamic_cast<ScrollViewWidget*>(w)) QueueScrollFrame();
+    else InvalidateNow();
 }
 
 void UiWindowImpl::OnMouseDoubleClick(float x, float y) {
@@ -2973,6 +3022,7 @@ void UiWindowImpl::OnMouseDoubleClick(float x, float y) {
 
 void UiWindowImpl::OnMouseUp(float x, float y) {
     float dx = x / dpiScale_, dy = y / dpiScale_;
+    const bool scrollCapture = dynamic_cast<ScrollViewWidget*>(pressedWidget_) != nullptr;
 
     if (pressedWidget_) {
         // Lifetime guard: an @click handler may end up unmounting THIS
@@ -3042,7 +3092,8 @@ void UiWindowImpl::OnMouseUp(float x, float y) {
     }
 
     UpdateToggleAnimTimer();
-    InvalidateNow();
+    if (scrollCapture) QueueScrollFrame();
+    else InvalidateNow();
 }
 
 void UiWindowImpl::ScrollWithMeasureContext(ScrollViewWidget* scroll,float y) {
@@ -3051,7 +3102,8 @@ void UiWindowImpl::ScrollWithMeasureContext(ScrollViewWidget* scroll,float y) {
 }
 
 void UiWindowImpl::OnMouseWheel(float x, float y, int delta) {
-    // Virtual rows may mount and measure during this input event.
+    // Other wheel controls may measure during input; ScrollView only queues
+    // its view change and realizes rows on the presentation frame.
     ActiveMeasureContextScope measureScope(measureContext_, renderer_);
     float dx = x / dpiScale_, dy = y / dpiScale_;
 
@@ -3085,6 +3137,7 @@ void UiWindowImpl::OnMouseWheel(float x, float y, int delta) {
         // HitTest to find deepest widget, then bubble up looking for scroll handler
         Widget* hit = root_->HitTest(dx, dy);
         bool handled = false;
+        bool smoothScroll = false;
         bool hookFired = false;
 
         // Fire @wheel hook on the hit widget (subclass overrides may not
@@ -3123,18 +3176,15 @@ void UiWindowImpl::OnMouseWheel(float x, float y, int delta) {
             else if (auto* sv = dynamic_cast<ScrollViewWidget*>(w)) {
                 if (sv->visible) {
                     handled = sv->OnMouseWheel(e);
-                    // ScrollView already shifts its arranged subtree. A second
-                    // layout here runs outside ActiveMeasureContextScope and
-                    // replaces measured CJK button widths with ASCII estimates.
+                    smoothScroll = handled && sv->ScrollAnimating();
+                    // The next scroll frame shifts arranged rows and refills
+                    // virtualization under its renderer-backed measure scope.
                 }
             }
         }
         if (handled || hookFired || dismissedDropdown) {
-            // Wheel handlers can produce a continuous stream of state changes
-            // just like captured drag moves. Force the current window to paint
-            // the latest zoom/scroll state instead of waiting for a later click
-            // or low-priority WM_PAINT dispatch.
-            InvalidateNow();
+            // ScrollView shares the thumb's coalesced presentation path.
+            if (smoothScroll) QueueScrollFrame(); else InvalidateNow();
         }
     }
 }

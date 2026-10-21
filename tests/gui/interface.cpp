@@ -15,13 +15,15 @@ using namespace spg;
 namespace {
 struct AnimationFrames {
     bool finished=false, layout=false, started=false, stopped=false;
-    unsigned frames=0;
+    unsigned frames=0, submitted=0, rootLayouts=0;
     std::vector<double> intervals;
     AnimationFrames() {
         ui_trace_set_sink([](const UiTraceEvent* event,void* data){
             auto& self=*static_cast<AnimationFrames*>(data);
             if(!std::strcmp(event->name,"motion_started")) self.started=true;
             if(!std::strcmp(event->name,"motion_stopped")) self.stopped=true;
+            if(!std::strcmp(event->name,"frame_job_submitted")) ++self.submitted;
+            if(!std::strcmp(event->name,"layout_root_duration")) ++self.rootLayouts;
             if(std::strcmp(event->name,"animation_frame")) return;
             ++self.frames;
             for(uint32_t i=0;i<event->field_count;++i) {
@@ -138,6 +140,7 @@ void settle_motion(Application& app) {
         auto root=ui::GetContext().GetWindow(app.window())->Root();
         std::function<bool(ui::Widget*)> settled=[&](ui::Widget* widget) {
             if(!widget->visible) return true;
+            if(auto* scroll=dynamic_cast<ui::ScrollViewWidget*>(widget); scroll && scroll->ScrollAnimating()) return false;
             if(widget->opacity<0.999f || std::abs(widget->animationX)>0.01f) { pending.push_back({widget->id,widget->opacity,widget->animationX}); return false; }
             if(widget->id=="navIndicator") {
                 auto tab=state(app.page(),"tab").get<std::string>();
@@ -186,7 +189,7 @@ void click(Application& app,const char* id) {
     auto clicked=ui_debug_click(app.window(),widget);
     if(clicked!=0) {
         std::cerr<<"Click failed: "<<id<<" "<<rendered_widget(app,id)<<'\n';
-        for(auto key:{"taskRoot","chosenDirectory","rootCell","rootPart","rootDrafts","listTarget","saveErrors"}) std::cerr<<key<<"="<<state(app.page(),key)<<'\n';
+        for(auto key:{"taskRoot","rootCell","rootPart","rootDrafts","listTarget","saveErrors"}) std::cerr<<key<<"="<<state(app.page(),key)<<'\n';
     }
     assert(clicked==0);
     ui_widget_destroy(widget);
@@ -780,10 +783,40 @@ void drag_after_wheel(Application& app) {
     assert(active && hidden && active->NeedsScrollbar() && hidden->NeedsScrollbar());
     auto scroll=ui_widget_find_by_id(ui_page_root(app.page()),"configListScroll"); assert(scroll);
     const float hidden_y=hidden->ScrollY();
+    auto* window=ui::GetContext().GetWindow(app.window());
+    const auto hwnd=static_cast<HWND>(ui_window_hwnd(app.window()));
+    const float dpi=GetDpiForWindow(hwnd)/96.0f;
+    auto move=[&](float x,float y) {
+        SendMessageW(hwnd,WM_MOUSEMOVE,MK_LBUTTON,MAKELPARAM(int(std::lround(x*dpi)),int(std::lround(y*dpi))));
+    };
+    {
+        // Real wheel motion must advance and stop without a timer or global
+        // layout; programmatic virtual-tail checks cannot cover its scheduler.
+        AnimationFrames animation;
+        assert(ui_debug_wheel(app.window(),scroll,-360)==0);
+        pump([&]{return !active->ScrollAnimating() && (!animation.started || animation.stopped);},"Smooth wheel completion",false);
+        if(!(active->ScrollY()>0 && hidden->ScrollY()==hidden_y && !animation.layout))
+            std::cerr<<"Wheel: active="<<active->ScrollY()<<" hidden="<<hidden->ScrollY()<<" beforeHidden="<<hidden_y<<" layout="<<animation.layout<<" frames="<<animation.frames<<'\n';
+        assert(active->ScrollY()>0 && hidden->ScrollY()==hidden_y && !animation.layout);
+    }
+    {
+        // Multiple physical wheel packets before presentation must coalesce;
+        // neither a view mutation nor synchronous rendering belongs in input.
+        AnimationFrames animation;
+        const auto bounds=active->rect;
+        const float before=active->ScrollY();
+        POINT pt{int((bounds.left+20)*dpi),int((bounds.top+20)*dpi)};
+        ClientToScreen(hwnd,&pt);
+        for(int delta:{-30,-30,-30,-30})
+            SendMessageW(hwnd,WM_MOUSEWHEEL,MAKEWPARAM(0,short(delta)),MAKELPARAM(pt.x,pt.y));
+        assert(active->ScrollY()==before && animation.submitted==0);
+        pump([&]{return !active->ScrollAnimating() && animation.finished;},"Coalesced wheel",false);
+        assert(active->ScrollY()>before && hidden->ScrollY()==hidden_y);
+    }
     for(int delta:{-120,120,-120,120}) {
         const float before_wheel=active->ScrollY();
         assert(ui_debug_wheel(app.window(),scroll,delta)==0);
-        assert(std::abs(active->ScrollY()-before_wheel)>0.1f);
+        pump([&]{return std::abs(active->ScrollY()-before_wheel)>0.1f;},"Wheel before thumb drag");
         // No relayout between wheel and press: that can hide routing failures.
         const auto bounds=active->rect;
         float height=bounds.bottom-bounds.top;
@@ -792,13 +825,39 @@ void drag_after_wheel(Application& app) {
         float thumb=std::max(20.0f,height*height/extent);
         float x=bounds.right-4;
         float y=bounds.top+active->ScrollY()/(extent-height)*(height-thumb)+thumb/2;
-        float from=active->ScrollY(),dy=delta<0?12.0f:-12.0f;
+        float dy=delta<0?12.0f:-12.0f;
         assert(ui_debug_mouse_move(app.window(),x,y)==0);
+        // Hover itself paints a frame of the in-flight wheel animation.
+        // Press the thumb at its current position, without a forced layout.
+        y=bounds.top+active->ScrollY()/(extent-height)*(height-thumb)+thumb/2;
+        float from=active->ScrollY();
         assert(ui_debug_mouse_down(app.window(),x,y)==0);
         assert(GetCapture()==static_cast<HWND>(ui_window_hwnd(app.window())));
         assert(std::abs(active->ScrollY()-from)<0.1f);
-        assert(ui_debug_mouse_move(app.window(),x,y+dy)==0);
+        {
+            AnimationFrames animation;
+            // A burst ending at the original pointer position must not walk
+            // through intermediate ranges or create frames for every packet.
+            for(int i=0;i<16;++i) move(x,y+dy*(i%2?1:3));
+            move(x,y);
+            assert(active->ScrollY()==from && animation.submitted==0 && animation.rootLayouts==0);
+            pump([&]{return !active->ScrollAnimating() && animation.finished;},"Coalesced thumb packets",false);
+            // Physical pointer positions have pixel precision at fractional DPI.
+            const float tolerance=(extent-height)/(height-thumb)/dpi+0.2f;
+            assert(std::abs(active->ScrollY()-from)<=tolerance);
+            from=active->ScrollY();
+            move(x,y+dy);
+            // A watcher/save snapshot may commit while pointer input is queued.
+            // Its visual transaction must not strand the pending scroll frame.
+            auto fields=state(app.page(),"fields").dump();
+            ui_window_begin_canvas_visual_transaction(app.window());
+            assert(ui_page_set_json(app.page(),"fields",fields.c_str())==0);
+            window->Invalidate();
+            ui_window_end_canvas_visual_transaction(app.window());
+            pump([&]{return !active->ScrollAnimating() && active->ScrollY()!=from;},"Thumb presentation",false);
+        }
         assert(ui_debug_mouse_up(app.window(),x,y+dy)==0);
+        assert(!active->ScrollAnimating());
         if((active->ScrollY()-from)*dy<=0 || hidden->ScrollY()!=hidden_y)
             throw std::runtime_error("Scrollbar drag after wheel was lost or sent to the hidden task page");
         assert(GetCapture()!=static_cast<HWND>(ui_window_hwnd(app.window())));
@@ -880,7 +939,12 @@ int wmain(int argc,wchar_t** argv) {
             Options options; options.data_dir=dir; options.allow_cli=true;
             options.cli={executable_path(),dir,{L"--fake-cli",gate_name}};
             Application app(options); std::cerr<<"Opening UI\n"; app.open(); std::cerr<<"UI opened\n";
+            // The old show-before-load path flashed an incomplete first page.
+            assert(!IsWindowVisible(static_cast<HWND>(ui_window_hwnd(app.window()))));
             pump([&]{return state(app.page(),"ready")==true;});
+            assert(IsWindowVisible(static_cast<HWND>(ui_window_hwnd(app.window()))));
+            assert(state(app.page(),"errors").empty() && state(app.page(),"actionError")=="");
+            screenshot(app,L"startup.png");
             if(rangesOnly) {
                 pump([&]{return state(app.page(),"fields").size()>100;});
                 click(app,"tabConfig"); pump([&]{return state(app.page(),"tab")=="config";});
@@ -1165,13 +1229,14 @@ int wmain(int argc,wchar_t** argv) {
                     AnimationFrames exit;
                     if(fading) assert(ui_debug_key(app.window(),VK_ESCAPE)==0);
                     assert(ui_debug_wheel_at(app.window(),scroll->rect.left+12,scroll->rect.top+12,-120)==0);
-                    assert(scroll->ScrollY()>before && !combo->IsOpen());
+                    assert(!combo->IsOpen());
                     if(animations) {
                         assert(combo->PopupAnimating() && combo->PopupOpacity()>0);
                         auto frozen=combo->DropdownRect();
                         assert(frozen.left==drop.left && frozen.top==drop.top && frozen.right==drop.right && frozen.bottom==drop.bottom);
                     }
-                    pump([&]{return !combo->PopupAnimating() && (!animations || exit.stopped);},"Popup wheel exit");
+                    pump([&]{return !combo->PopupAnimating() && !scroll->ScrollAnimating() && (!animations || exit.stopped);},"Popup wheel exit");
+                    assert(scroll->ScrollY()>before);
                     assert(combo->PopupOpacity()==0 && combo->PopupProgress()==0 && combo->SelectedIndex()==selected);
                     ui::GetContext().GetWindow(app.window())->ScrollWithMeasureContext(scroll,0);
                 }
@@ -1448,7 +1513,8 @@ int wmain(int argc,wchar_t** argv) {
             auto* password_window=ui::GetContext().GetWindow(app.window());
             assert(!password_window->Root()->FindById("passwordTableHeader"));
             auto* password_scroll=password_window->Root()->FindById("passwordListScroll");
-            assert(password_scroll->Parent()->css.borderWidth>0);
+            auto* password_card=password_window->Root()->FindById("password-"+id);
+            assert(password_scroll->Parent()->css.borderWidth<=0 && password_card && password_card->css.borderWidth>0);
             auto password_theme=ui_widget_find_by_id(ui_page_root(app.page()),"themeSelector"); assert(password_theme);
             for(int mode:{2,1}) {
                 assert(ui_debug_combo_select(app.window(),password_theme,mode)==0);
@@ -1581,7 +1647,20 @@ int wmain(int argc,wchar_t** argv) {
                 assert(!ui_widget_find_by_id(ui_page_root(app.page()),action));
             click(app,"tabRoots"); pump([&]{return state(app.page(),"tab")=="roots";});
             button_texts(app);
+            {
+                FileMutex lock(dir/"builtin_passwords.json");
+                auto document=read_json(dir/"builtin_passwords.json");
+                document["passwords"].push_back({{"value","deleted-root-only"},{"scopes",{utf8(pending_second.wstring())}}});
+                document["passwords"].push_back({{"value","deleted-root-shared"},{"scopes",{utf8(pending_second.wstring()),utf8(pending_root.wstring())}}});
+                document["passwords"].push_back({{"value","deletion-global"}});
+                atomic_write(dir/"builtin_passwords.json",document.dump());
+            }
             click(app,("delete-root-"+root_row_id(app,pending_second)).c_str()); finish_input(app);
+            auto after_root_delete=read_json(dir/"builtin_passwords.json")["passwords"];
+            assert(std::none_of(after_root_delete.begin(),after_root_delete.end(),[](const Json& p){return p["value"]=="deleted-root-only";}));
+            auto shared_after=std::find_if(after_root_delete.begin(),after_root_delete.end(),[](const Json& p){return p["value"]=="deleted-root-shared";});
+            assert(shared_after!=after_root_delete.end() && (*shared_after)["scopes"]==Json::array({utf8(pending_root.wstring())}));
+            assert(std::any_of(after_root_delete.begin(),after_root_delete.end(),[](const Json& p){return p["value"]=="deletion-global" && !p.contains("scopes");}));
             assert(state(app.page(),"taskRoot")=="");
             assert(read_roots(dir/"sunpack_watch_roots.txt").entries.size()==2);
             assert(fs::is_directory(pending_second));
@@ -1650,11 +1729,14 @@ int wmain(int argc,wchar_t** argv) {
             // Inspect the actual wheel result before any forced relayout can
             // repair a width computed without the window's text measurer.
             ui_debug_wheel(app.window(),config_scroll,-120);
+            auto* smooth_config=dynamic_cast<ui::ScrollViewWidget*>(ui::GetContext().GetWindow(app.window())->Root()->FindById("configListScroll"));
+            pump([&]{return !smooth_config->ScrollAnimating();},"Scrolled settings measurement");
             auto startup_wheel=rect(app,"startupToggle");
             if(std::abs((startup_before.right-startup_before.left)-(startup_wheel.right-startup_wheel.left))>0.1f)
                 throw std::runtime_error("Wheel changed startup button width");
             button_texts(app,false);
             ui_debug_wheel(app.window(),config_scroll,120);
+            pump([&]{return !smooth_config->ScrollAnimating();},"Reverse settings wheel");
             button_texts(app,false);
             auto scroll_bounds=ui_widget_get_rect(config_scroll);
             float bar_x=scroll_bounds.right-4,bar_y=scroll_bounds.top+8;
@@ -1718,7 +1800,7 @@ int wmain(int argc,wchar_t** argv) {
             auto first=state(app.page(),"shownDirectories")[1];
             click(app,("directory-"+first["id"].get<std::string>()).c_str());
             pump([&]{return state(app.page(),"tasks")["total"]==0;});
-            assert(state(app.page(),"chosenDirectory")["path"]==first["path"]);
+            assert(state(app.page(),"taskRoot")==first["path"]);
             {
                 auto card=rendered_widget(app,"directory-"+first["id"].get<std::string>());
                 auto bounds=card["rect"], copy=card["children"][0]["rect"];
@@ -1729,9 +1811,15 @@ int wmain(int argc,wchar_t** argv) {
             click(app,"allRoots");
             click(app,"tabRoots"); pump([&]{return state(app.page(),"tab")=="roots";});
             auto root_header_before=rect(app,"rootTableHeader");
+            assert(std::abs((root_header_before.right-root_header_before.left)-
+                (rect(app,"rootListScroll").right-rect(app,"rootListScroll").left-20))<0.5f);
             virtual_tail(app,"rootItems","rootListScroll",73);
             auto root_header_after=rect(app,"rootTableHeader");
             assert(root_header_before.top==root_header_after.top && root_header_before.bottom==root_header_after.bottom);
+            auto root_search=rect(app,"rootSearch");
+            assert(std::abs(root_search.right-root_search.left-220)<0.5f);
+            auto* first_root=ui::GetContext().GetWindow(app.window())->Root()->FindById("root-row-"+state(app.page(),"shownRootRows")[0]["id"].get<std::string>());
+            assert(first_root && first_root->css.borderWidth>0);
             screenshot(app,L"roots-table-small.png");
             auto roots_before_blank=read_file(dir/"sunpack_watch_roots.txt");
             click(app,"addRoot");
@@ -1754,7 +1842,17 @@ int wmain(int argc,wchar_t** argv) {
             click(app,"savedPasswords"); pump([&]{return state(app.page(),"passwords")["total"]==240;});
             virtual_tail(app,"passwordItems","passwordListScroll",240);
             virtual_tail(app,"directoryItems","directoryListScroll",73);
+            // Inspect the event boundary before dispatching the async request:
+            // populated saved rows must retain their layout until history arrives.
+            auto previous_passwords=state(app.page(),"passwords");
+            assert(ui_page_call_json(app.page(),"selectPasswordView","true")==0);
+            assert(state(app.page(),"passwordHistoryTarget")==true && state(app.page(),"passwordHistory")==false);
+            assert(state(app.page(),"passwords")==previous_passwords && state(app.page(),"shownPasswords").size()==240);
+            // Reverse before the worker receives either request; latest intent wins.
+            assert(ui_page_call_json(app.page(),"selectPasswordView","false")==0);
+            assert(ui_page_call_json(app.page(),"selectPasswordView","true")==0);
             click(app,"clipboardHistory"); pump([&]{return state(app.page(),"passwords")["total"]==320;});
+            assert(state(app.page(),"passwordHistory")==true);
             ui_window_set_size(app.window(),850,560); ui_window_relayout(app.window());
             virtual_tail(app,"passwordItems","passwordListScroll",320);
             auto history_view=rect(app,"passwordListScroll"); visible=0;
@@ -1763,7 +1861,7 @@ int wmain(int argc,wchar_t** argv) {
                 auto handle=ui_widget_find_by_id(ui_page_root(app.page()),("password-"+entry["id"].get<std::string>()).c_str());
                 if(!handle) continue;
                 auto bounds=ui_widget_get_rect(handle); ui_widget_destroy(handle);
-                if(entry["id"]!="1" && entry["id"]!="2") assert(bounds.bottom-bounds.top<=44);
+                if(entry["id"]!="1" && entry["id"]!="2") assert(bounds.bottom-bounds.top<=56);
                 if(bounds.top>=history_view.top && bounds.bottom<=history_view.bottom) ++visible;
             }
             assert(visible>=3);

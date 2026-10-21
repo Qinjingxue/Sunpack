@@ -483,8 +483,8 @@ static std::string roots_text(const WatchRoots& roots) {
     return content;
 }
 void edit_root(const fs::path& p,const std::string& op,const std::string& original,const std::string& input,const std::string& output,bool deep) {
-    FileMutex lock(p,L"SunPackWatchRoots");
-    atomic_write(p,roots_text(apply_root_changes(read_roots(p),p.parent_path(),Json::array({Json{{"operation",op},{"original",original},{"input",input},{"output",output},{"deep",deep}}}))));
+    auto result=save_changes(p.parent_path(),Json::array(),Json::array(),Json::array({Json{{"operation",op},{"original",original},{"input",input},{"output",output},{"deep",deep}}}));
+    if(result["error"]!="") throw std::runtime_error(result["error"].get<std::string>());
 }
 Json save_changes(const fs::path& dir,const Json& fields,const Json& passwords,const Json& roots,
     PasswordSaveSnapshot* password_snapshot) {
@@ -495,17 +495,34 @@ Json save_changes(const fs::path& dir,const Json& fields,const Json& passwords,c
     Json saved_record;
     Json password_rebases=Json::array();
     bool password_count_changed=false;
+    const bool deleting_roots=std::any_of(roots.begin(),roots.end(),[](const Json& edit){return edit.at("operation")=="delete";});
+    std::unordered_set<std::wstring> removed_scopes;
+    std::string root_text,original_password_text;
     std::unique_ptr<FileMutex> config_lock,password_lock,roots_lock;
     std::string section;
     try {
-        // Fixed acquisition order; runtime writers acquire only their own file.
+        // Keep GUI writers in a fixed acquisition order. Runtime writers keep
+        // using their existing individual file locks.
         if(!fields.empty()) config_lock=std::make_unique<FileMutex>(dir/"sunpack_config.json");
-        if(!passwords.empty()) password_lock=std::make_unique<FileMutex>(dir/"builtin_passwords.json");
+        if(!passwords.empty() || deleting_roots) password_lock=std::make_unique<FileMutex>(dir/"builtin_passwords.json");
         if(!roots.empty()) roots_lock=std::make_unique<FileMutex>(dir/"sunpack_watch_roots.txt",L"SunPackWatchRoots");
         if(!fields.empty()) { section="config"; auto path=dir/"sunpack_config.json"; writes.push_back({section,path,patch_config(read_file(path),fields)}); }
-        if(!passwords.empty()) {
+        if(!roots.empty()) {
+            section="roots";
+            auto updated=apply_root_changes(read_roots(dir/"sunpack_watch_roots.txt"),dir,roots);
+            std::unordered_set<std::wstring> remaining;
+            for(auto& entry:updated.entries) remaining.insert(scope_key(entry.input.wstring()));
+            for(auto& edit:roots) if(edit.at("operation")=="delete" && !edit.value("original",std::string()).empty()) {
+                auto key=scope_key(resolve_path(wide(edit.at("original").get<std::string>()),dir).wstring());
+                if(!remaining.count(key)) removed_scopes.insert(std::move(key));
+            }
+            root_text=roots_text(updated);
+        }
+        if(!passwords.empty() || (!removed_scopes.empty() && fs::exists(dir/"builtin_passwords.json"))) {
             section="passwords"; auto path=dir/"builtin_passwords.json";
-            auto current=read_json(path); auto count=current["passwords"].size();
+            original_password_text=read_file(path);
+            auto current=parse_json(original_password_text); validate_passwords(current);
+            auto count=current["passwords"].size();
             std::unordered_map<std::string,std::vector<std::string>> originals;
             if(password_snapshot) {
                 std::unordered_set<std::string> affected;
@@ -521,6 +538,28 @@ Json save_changes(const fs::path& dir,const Json& fields,const Json& passwords,c
                 }
             }
             committed_passwords=apply_password_changes(std::move(current),passwords,&saved_record);
+            bool cleaned=false;
+            if(!removed_scopes.empty()) {
+                auto& rows=committed_passwords["passwords"];
+                size_t kept=0;
+                for(size_t i=0;i<rows.size();++i) {
+                    auto& record=rows[i];
+                    if(record.contains("scopes")) {
+                        auto& scopes=record["scopes"];
+                        auto matches=[&](const Json& scope){return removed_scopes.count(scope_key(wide(scope.get<std::string>())));};
+                        auto first=std::find_if(scopes.begin(),scopes.end(),matches);
+                        if(first!=scopes.end()) {
+                            auto previous=password_snapshot?record.dump():std::string();
+                            scopes.erase(std::remove_if(first,scopes.end(),matches),scopes.end()); cleaned=true;
+                            if(password_snapshot) password_rebases.push_back({{"originals",Json::array({previous})},{"record",scopes.empty()?Json():record}});
+                        }
+                        if(scopes.empty()) continue;
+                    }
+                    if(kept!=i) rows[kept]=std::move(record);
+                    ++kept;
+                }
+                rows.erase(rows.begin()+kept,rows.end());
+            }
             if(!originals.empty()) {
                 std::unordered_map<std::string,const Json*> records;
                 for(auto& record:committed_passwords["passwords"]) records.emplace(record["value"].get<std::string>(),&record);
@@ -533,11 +572,21 @@ Json save_changes(const fs::path& dir,const Json& fields,const Json& passwords,c
                 }
             }
             password_count_changed=count!=committed_passwords["passwords"].size();
-            writes.push_back({section,path,committed_passwords.dump(2)+"\n"});
+            if(!passwords.empty() || cleaned) writes.push_back({section,path,committed_passwords.dump(2)+"\n"});
         }
-        if(!roots.empty()) { section="roots"; auto path=dir/"sunpack_watch_roots.txt"; writes.push_back({section,path,roots_text(apply_root_changes(read_roots(path),dir,roots))}); }
+        if(!roots.empty()) writes.push_back({"roots",dir/"sunpack_watch_roots.txt",std::move(root_text)});
         for(auto& write:writes) {
-            section=write.section; atomic_write(write.path,write.text); result["saved"].push_back(section);
+            section=write.section;
+            try { atomic_write(write.path,write.text); }
+            catch(...) {
+                if(section=="roots" && deleting_roots && std::find(result["saved"].begin(),result["saved"].end(),"passwords")!=result["saved"].end()) {
+                    atomic_write(dir/"builtin_passwords.json",original_password_text);
+                    auto& saved=result["saved"]; saved.erase(std::remove(saved.begin(),saved.end(),Json("passwords")),saved.end());
+                    if(password_snapshot) *password_snapshot=PasswordSaveSnapshot{};
+                }
+                throw;
+            }
+            result["saved"].push_back(section);
             if(section=="passwords" && password_snapshot) {
                 password_snapshot->document=std::move(committed_passwords);
                 password_snapshot->file_text=std::move(write.text);

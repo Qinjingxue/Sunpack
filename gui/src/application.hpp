@@ -25,7 +25,7 @@ class Application {
     std::condition_variable cv_;
     std::deque<Json> commands_;
     Json pending_ = Json::object();
-    bool notified_ = false, stopping_ = false, choosing_directory_ = false;
+    bool notified_ = false, stopping_ = false, choosing_directory_ = false, shown_ = false;
     unsigned dirty_ = 15;
     std::thread worker_, registry_;
     struct ControlBinding { Application* owner; Json field; };
@@ -42,6 +42,7 @@ class Application {
     void dispatch();
     void handle_command(Json command);
     void apply_pending();
+    void reveal();
     // UI-thread queue: one write in flight, latest completed edit per key.
     std::deque<Json> saves_;
     Json active_save_;

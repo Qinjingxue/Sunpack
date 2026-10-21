@@ -26,11 +26,11 @@ export default {
     statusNames:['','taskProcessing','taskWaiting','taskSucceeded','taskFailed'],
     rootRows:[],rootDrafts:{},rootNew:[],rootCell:'',rootPart:'',rootNext:0,rootQuery:'',
     configCategory:'',configQuery:'',drafts:{},toggleDrafts:{},saving:false,saveErrors:{},closeError:'',pendingFields:[],recordSaving:{passwords:false,roots:false},
-    passwordRoot:'',passwordHistory:false,passwordQuery:'',passwordDrafts:{},passwordNew:[],passwordCell:'',passwordNext:0,
+    passwordRoot:'',passwordHistory:false,passwordHistoryTarget:false,passwordQuery:'',passwordDrafts:{},passwordNew:[],passwordCell:'',passwordNext:0,
     listTarget:'',listTitle:'',listField:null,listRows:[],listNext:0,listQuery:'',listEntry:'',listEditing:-1,listMultiline:false,listImport:false,listImportText:'',listPreview:[],listError:''
   }; },
   computed: {
-    passwordScope() { return this.passwordHistory?'@history':this.passwordRoot||'@all'; },
+    passwordScope() { return this.passwordHistoryTarget?'@history':this.passwordRoot||'@all'; },
     directorySelection() { return this.tab==='passwords'?this.passwordRoot:this.taskRoot; },
     rootDirty() { return Object.values(this.rootDrafts).some(d=>!d.original&&!d.pending&&(d.input.length||d.output.length)); },
     shownRootRows() {
@@ -42,8 +42,8 @@ export default {
     errorList() { return Object.keys(this.errors).map(k=>k+': '+this.errors[k]); },
     shownDirectories() { let q=this.directoryQuery.toLowerCase(); return this.directories.filter(d=>d.watch&&d.path.toLowerCase().indexOf(q)>=0); },
     shownPasswords() {
-      if(this.passwordScope==='@history') return this.passwords.rows;
-      let saved=this.passwords.scope===this.passwordScope?this.passwords.rows:[],ids=passwordIndexes.get(saved);
+      if(this.passwordHistory) return this.passwords.rows;
+      let saved=this.passwords.scope===(this.passwordRoot||'@all')?this.passwords.rows:[],ids=passwordIndexes.get(saved);
       if(!ids) { ids=new Set(saved.map(p=>p.id)); passwordIndexes.set(saved,ids); }
       let extra=this.passwordNew.filter(p=>p.scope===this.passwordRoot&&!ids.has(p.id)),rows=extra.length?extra.concat(saved):saved;
       for(let id of Object.keys(this.passwordDrafts)) {
@@ -52,7 +52,6 @@ export default {
       }
       return rows;
     },
-    chosenDirectory() { return this.directories.find(d=>d.watch&&d.path===this.taskRoot)||{path:'',effectiveOutput:''}; },
     categories() { let seen={}; return this.fields.filter(f=>{ if(seen[f.category]) return false; seen[f.category]=true; return true; }).map(f=>({id:f.category,label:f.categoryLabel})); },
     configBlocks() {
       let groups=[],seen={};
@@ -163,7 +162,7 @@ export default {
         let group=ids.get(p.original);
         p.id=group&&group.next<group.ids.length?group.ids[group.next++]:'saved-'+(++this.passwordNext);
       }
-      if(!this.passwordHistory) {
+      if(snapshot.scope!=='@history') {
         // Own save receipts must not move a new row from the top to the end
         // while the same mouse gesture selects another row or directory.
         let byId=new Map(snapshot.rows.map(p=>[p.id,p])),rows=[];
@@ -179,21 +178,25 @@ export default {
         snapshot.rows=rows;
       }
       this.passwords=snapshot;
+      this.passwordHistory=snapshot.scope==='@history';
     },
     searchPasswords(value) { this.passwordQuery=value; this.filterPasswords(); },
     filterTasks() { this.send('filterTasks',{query:this.taskQuery,root:this.taskRoot,status:this.statusNames[this.taskStatus]||''}); },
     selectRoot(path) { this.taskRoot=path; this.filterTasks(); },
     filterPasswords() { this.send('filterPasswords',{query:this.passwordQuery,scope:this.passwordScope}); },
-    selectPasswordView(history) { this.finishPasswordCell(); this.passwordHistory=history; this.filterPasswords(); },
+    selectPasswordView(history) {
+      if(this.passwordHistoryTarget===history) return;
+      this.finishPasswordCell(); this.passwordHistoryTarget=history; this.filterPasswords();
+    },
     selectDirectory(path) {
       if(this.tab!=='passwords') { this.selectRoot(path); return; }
       this.finishPasswordCell(); this.passwordRoot=path;
-      if(!this.passwordHistory) this.filterPasswords();
+      if(!this.passwordHistoryTarget) this.filterPasswords();
     },
     syncPasswordDirectory() {
       if(this.passwordRoot&&!this.directories.some(d=>d.watch&&d.path===this.passwordRoot)) {
         this.finishPasswordCell(); this.passwordRoot='';
-        if(!this.passwordHistory) this.filterPasswords();
+        if(!this.passwordHistoryTarget) this.filterPasswords();
       }
     },
     errorText(error) { return error && typeof error==='object' ? error.text : (this.texts[error]||error); },
@@ -309,6 +312,21 @@ export default {
       });
     },
     rootSaved(ack) {
+      if(ack.ok&&ack.removedPasswordScopes.length) {
+        let removed=new Set(ack.removedPasswordScopes),rebased=new Map(),drafts=Object.assign({},this.passwordDrafts);
+        for(let group of ack.passwordRebases||[]) for(let previous of group.originals) rebased.set(previous,group.record?JSON.stringify(group.record):'');
+        for(let id of Object.keys(drafts)) {
+          let d=drafts[id];
+          if(removed.has(d.scope)) { delete drafts[id]; if(this.passwordCell===id) this.passwordCell=''; }
+          else if(rebased.has(d.original)) drafts[id]=Object.assign({},d,{original:rebased.get(d.original)});
+        }
+        this.passwordDrafts=drafts;
+        this.passwordNew=this.passwordNew.filter(p=>!removed.has(p.scope));
+        this.requests=this.requests.filter(r=>r.op!=='saveRecord'||r.payload.kind!=='passwords'||!removed.has(r.payload.edit.scope)).map(r=>{
+          if(r.op!=='saveRecord'||r.payload.kind!=='passwords'||!rebased.has(r.payload.edit.original)) return r;
+          return Object.assign({},r,{payload:Object.assign({},r.payload,{edit:Object.assign({},r.payload.edit,{original:rebased.get(r.payload.edit.original)})})});
+        });
+      }
       if(ack.ok) this.rebaseRootRequests(ack.records);
       let claimed=new Map(this.rootRows.map(r=>[r.identity,r.id])),records=new Map(ack.records.map(r=>[r.id,r]));
       let drafts=Object.assign({},this.rootDrafts),removed=new Set(),renamed=new Map(),pendingIds=new Set(ack.pending);
@@ -332,7 +350,7 @@ export default {
             d.original=record.input; d.identity=record.identity; d.expected={output:record.output,deep:record.deep};
             renamed.set(d.id,{original:record.input,identity:record.identity});
             if(this.taskRoot===previous&&previous!==record.input) { this.taskRoot=record.input; this.filterTasks(); }
-            if(this.passwordRoot===previous&&previous!==record.input) { this.passwordRoot=record.input; if(!this.passwordHistory) this.filterPasswords(); }
+            if(this.passwordRoot===previous&&previous!==record.input) { this.passwordRoot=record.input; if(!this.passwordHistoryTarget) this.filterPasswords(); }
             if(same&&this.rootCell!==d.id) Object.assign(d,{input:record.input,output:record.output,deep:record.deep});
           }
           d.baseline=JSON.stringify(same?this.rootValue(d):sent.value); d.submitted='';
@@ -398,7 +416,7 @@ export default {
     addPassword() {
       this.finishPasswordCell();
       let row={id:'new-'+(++this.passwordNext),original:'',value:'',scope:this.passwordRoot};
-      this.passwordHistory=false; this.passwordQuery=''; this.filterPasswords();
+      this.passwordHistory=this.passwordHistoryTarget=false; this.passwordQuery=''; this.filterPasswords();
       this.passwordNew=this.passwordNew.concat([row]); this.ensurePasswordDraft(row);
       this.passwordCell=row.id; this.send('focusPassword',{id:row.id,part:'value',top:true});
     },
@@ -606,7 +624,6 @@ export default {
   .directory-item { min-height:52px; padding:8px 12px; flex-shrink:0; }
   .directory-item .column { gap:2px; }
   .directory-name, .directory-path { white-space:nowrap; }
-  .selected-directory { font-size:12px; color:var(--fg-2); }
   .search-field { placeholder-color:var(--fg-2); }
   .task-filters { flex-wrap:wrap; }
   .task-filters input { min-width:180px; }
@@ -641,7 +658,7 @@ export default {
   .action-row { flex-direction:row; flex-wrap:wrap; align-items:center; gap:8px; }
   .password-toolbar { flex-direction:row; flex-wrap:wrap; align-items:center; gap:16px; }
   .password-tabs { flex-direction:row; flex-wrap:wrap; align-items:center; gap:8px; }
-  .password-search { width:220px; flex-shrink:0; }
+  .management-search { width:220px; flex-shrink:0; }
   input, select { height:32px; }
   .content > input, .sidebar > input { display:block; width:100%; }
   textarea { min-height:90px; }
@@ -683,11 +700,11 @@ export default {
   .collection-preview { white-space:nowrap; }
   .list-import { flex:1; gap:10px; }
   #listEntry, #listMultiline, #listImportText { width:100%; }
-  .history-list { gap:0px; border:1px solid var(--card-border); border-radius:8px; padding:0px 12px; }
-  .history-list.light { background:#fbfbfb; }
-  .history-list.dark { background:#2b2b2b; }
-  .history-entry { gap:0px; }
-  .history-row { flex-direction:row; align-items:center; gap:12px; padding:4px 0px; min-height:40px; }
+  .history-entry { gap:0px; padding:0px 12px; border:1px solid var(--card-border); border-radius:8px; }
+  .light .history-entry, .light .root-header { background:#fbfbfb; }
+  .dark .history-entry, .dark .root-header { background:#2b2b2b; }
+  .history-entry > .action-row { padding-bottom:10px; }
+  .history-row { flex-direction:row; align-items:center; gap:12px; padding:10px 0px; min-height:52px; }
   .password-table-row { flex-direction:row; align-items:center; gap:12px; }
   .password-table { flex:1; gap:2px; }
   .password-table-row { padding:10px 0px; min-height:52px; }
@@ -704,10 +721,9 @@ export default {
   .history-content { flex:1; min-width:0px; gap:0px; }
   .history-text { width:100%; white-space:pre-wrap; }
   .history-save { width:132px; flex-shrink:0; }
-  .history-divider { height:1px; background:var(--card-border); }
-  .root-table { flex:1; gap:0px; }
+  .root-table { flex:1; gap:6px; }
   .root-columns { flex-direction:row; align-items:center; gap:12px; }
-  .root-header { padding:7px 18px 7px 0px; flex-shrink:0; border-bottom:1px solid var(--card-border); }
+  .root-header { padding:10px 12px; margin:2px 18px 0px 2px; flex-shrink:0; border:1px solid var(--card-border); border-radius:8px; }
   .root-header .root-path-column { padding:0px 11px; white-space:nowrap; }
   .root-header .root-deep-column { text-align:center; white-space:nowrap; }
   .root-row { padding:10px 0px; min-height:52px; }
@@ -775,7 +791,6 @@ export default {
       <div class="workspace">
       <div id="page-tasks" v-show="tab==='tasks' &amp;&amp; !listTarget" class="content">
         <div class="page-header"><label class="heading">{{ texts.tasks }}</label></div>
-        <label v-show="chosenDirectory.path" class="selected-directory" :ellipsis-start="true">{{ chosenDirectory.path }}</label>
         <div class="row task-filters"><input id="taskSearch" type="search" class="fill search-field" :placeholder="texts.taskSearch" :value="taskQuery" @input="searchTasks"/>
           <div id="taskStatusHost" style="width:180px;height:32px"/>
         </div>
@@ -850,10 +865,10 @@ export default {
       </div>
       <div id="page-roots" v-show="tab==='roots' &amp;&amp; !listTarget" class="content">
         <div class="page-header"><label class="heading">{{ texts.rootManagement }}</label></div>
-        <div class="row"><input id="rootSearch" type="search" class="fill search-field" :placeholder="texts.searchDirectory" :value="rootQuery" @input="searchRoots"/><button id="addRoot" @click="addRoot()">{{ texts.addRoot }}</button></div>
-        <div :class="'root-table history-list '+appearance">
+        <div class="password-toolbar"><input id="rootSearch" type="search" class="management-search search-field" :placeholder="texts.searchDirectory" :value="rootQuery" @input="searchRoots"/><button id="addRoot" @click="addRoot()">{{ texts.addRoot }}</button></div>
+        <div class="root-table">
           <div id="rootTableHeader" class="root-columns root-header"><label class="root-path-column">{{ texts.roots }}</label><label class="root-path-column">{{ texts.rootOutput }}</label><label class="root-deep-column">{{ texts.deep }}</label><div class="password-actions"/></div>
-          <ScrollView id="rootListScroll"><VirtualList id="rootItems" estimated-height="53px" style="gap:0px"><div v-for="r in shownRootRows" :key="r.id" :id="'root-row-'+r.id" class="history-entry">
+          <ScrollView id="rootListScroll"><VirtualList id="rootItems" estimated-height="62px" style="gap:8px"><div v-for="r in shownRootRows" :key="r.id" :id="'root-row-'+r.id" class="history-entry">
             <div class="root-columns root-row">
               <div class="root-path-column"><div class="root-path-cell">
                 <button v-show="rootCell!==r.id||rootPart!=='input'" :id="'root-input-text-'+r.id" class="password-text" @click="beginRoot(r,'input')"><label :id="'root-input-value-'+r.id" :class="rootDraft(r).input?'password-text-value':'password-text-value muted'" :ellipsis-start="true">{{ rootDraft(r).input||texts.rootPasteHint }}</label><div class="password-hover-line"/></button>
@@ -869,18 +884,16 @@ export default {
               <button class="password-actions" :id="'delete-root-'+r.id" @click="deleteListedRoot(r)">{{ texts.delete }}</button>
             </div>
             <div v-show="rootDraft(r).error" class="action-row"><label class="error">{{ errorText(rootDraft(r).error) }}</label><button :enabled="!rootDraft(r).pending" @click="commitRoots([rootDraft(r)])">{{ texts.saveEntries }}</button><button :enabled="!rootDraft(r).pending" @click="discardRoot(r.id)">{{ texts.cancelEntries }}</button></div>
-            <div class="history-divider"/>
           </div></VirtualList></ScrollView>
         </div>
       </div>
       <div id="page-passwords" v-show="tab==='passwords' &amp;&amp; !listTarget" class="content">
         <div class="page-header"><label class="heading">{{ texts.passwords }}</label></div>
-        <label v-show="passwordRoot" class="selected-directory" :ellipsis-start="true">{{ passwordRoot }}</label>
-        <div class="password-toolbar"><input id="passwordSearch" type="search" class="search-field password-search" :placeholder="texts.passwordSearch" :value="passwordQuery" @input="searchPasswords"/><div class="password-tabs"><button id="newPassword" @click="addPassword()">{{ texts.addPasswords }}</button><button id="savedPasswords" :class="!passwordHistory?'on':''" @click="selectPasswordView(false)">{{ texts.savedPasswords }}</button><button id="clipboardHistory" :class="passwordHistory?'on':''" @click="selectPasswordView(true)">{{ texts.history }}</button></div></div>
-        <div :class="'password-table history-list '+appearance">
+        <div class="password-toolbar"><input id="passwordSearch" type="search" class="search-field management-search" :placeholder="texts.passwordSearch" :value="passwordQuery" @input="searchPasswords"/><div class="password-tabs"><button id="newPassword" @click="addPassword()">{{ texts.addPasswords }}</button><button id="savedPasswords" :class="!passwordHistoryTarget?'on':''" @click="selectPasswordView(false)">{{ texts.savedPasswords }}</button><button id="clipboardHistory" :class="passwordHistoryTarget?'on':''" @click="selectPasswordView(true)">{{ texts.history }}</button></div></div>
+        <div class="password-table">
         <ScrollView id="passwordListScroll"><div id="passwordBody" class="column">
           <div v-show="shownPasswords.length>0">
-            <VirtualList id="passwordItems" v-show="shownPasswords.length>0" style="gap:0px" estimated-height="56px"><div v-for="p in shownPasswords" :key="p.id" :id="'password-'+p.id" class="history-entry">
+            <VirtualList id="passwordItems" v-show="shownPasswords.length>0" style="gap:8px" estimated-height="62px"><div v-for="p in shownPasswords" :key="p.id" :id="'password-'+p.id" class="history-entry">
               <div v-show="!passwordHistory" class="password-table-row">
                 <div class="password-value-column">
                   <button v-show="passwordCell!==p.id" :id="'password-text-'+p.id" class="password-text" @click="beginPassword(p)"><label :id="'password-value-'+p.id" class="password-text-value">{{ passwordDraft(p).value }}</label><div :id="'password-hover-'+p.id" class="password-hover-line"/></button>
@@ -891,7 +904,6 @@ export default {
               <div v-show="passwordDraft(p).error" class="action-row"><label class="error">{{ errorText(passwordDraft(p).error) }}</label><button :id="'discard-password-'+p.id" :enabled="!passwordDraft(p).pending" @click="discardPassword(p.id)">{{ texts.cancelEntries }}</button></div>
               <div v-show="passwordHistory" class="history-row"><div class="history-content"><label class="history-text" :id="'history-value-'+p.id">{{ p.value }}</label></div><button class="history-save" :id="'save-history-'+p.id" :enabled="!historyDraft(p).pending" @click="saveHistory(p)">{{ passwordRoot?texts.saveHistoryToDirectory:texts.saveHistoryGlobally }}</button></div>
               <div v-show="passwordHistory &amp;&amp; historyDraft(p).error" class="action-row"><label class="error">{{ errorText(historyDraft(p).error) }}</label><button @click="discardPassword(historyDraft(p).id)">{{ texts.cancelEntries }}</button></div>
-              <div class="history-divider"/>
             </div>
             </VirtualList>
           </div>

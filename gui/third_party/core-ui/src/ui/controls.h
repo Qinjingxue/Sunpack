@@ -617,6 +617,9 @@ public:
 private:
     std::vector<float> heights_, sums_;
     std::vector<size_t> indices_;
+    size_t realizedFirst_ = 0, realizedLast_ = 0;
+    float realizedViewportHeight_ = 0;
+    bool realizedRangeValid_ = false;
     bool refreshing_ = false;
     float Sum(size_t count) const;
     size_t RowAt(float y) const;
@@ -633,9 +636,11 @@ public:
     /* 走与鼠标滚动同一条纯偏移路径 (build 285) —— 此前只改字段不动 rect,
      * 内容要等下一次全局布局才归位, 长列表里那次布局就是每帧 O(n) 的来源。 */
     void SetScrollY(float y) {
+        CancelScrollMotion();
         const float oldScroll = scrollY_;
         scrollY_ = y;
         ClampScroll();
+        scrollPosition_ = scrollY_;
         ApplyScrollDelta_(oldScroll);
     }
 
@@ -648,6 +653,8 @@ public:
     void DoLayout() override;
 
     bool NeedsScrollbar() const;
+    bool ScrollAnimating() const { return scrollPending_ || scrollVelocity_ != 0; }
+    void UpdateScrollAnimation();
     // Preserve the first visible row when estimated heights become measured.
     void CorrectVirtualAnchor(float delta);
 
@@ -655,6 +662,12 @@ private:
     WidgetPtr content_;
     float scrollY_ = 0;
     float contentHeight_ = 0;
+    // Input changes only the pending view. Both thumb and wheel commit it once
+    // per presentation frame; velocity is DIP/ms and survives wheel impulses.
+    double scrollPosition_ = 0, scrollVelocity_ = 0;
+    double scrollTick_ = 0;
+    bool scrollPending_ = false;
+    static constexpr double kWheelDecay = 0.018; // exponential decay per ms
     bool draggingThumb_ = false;
     bool hoveringBar_ = false;
     float dragStartY_ = 0;
@@ -665,14 +678,12 @@ private:
 
     float ThumbWidth() const { return (hoveringBar_ || draggingThumb_) ? kThumbWide : kThumbThin; }
     void ClampScroll();
+    void CancelScrollMotion();
+    void AdvanceScrollMotion(double now);
+    void QueueScrollTo(float y);
 
-    /* 纯滚动路径 (build 285): 只有 scrollY_ 变了、内容一个字没动时用。
-     * DoLayout() 会跑两遍 content_->DoLayout() (一遍量高度一遍定位) 外加一次
-     * 全子树递归 measure —— 2000 行实测 2.0ms/帧, 而滚动根本不改变任何尺寸。
-     * 这里改成把整棵子树的 rect 平移 delta, 同样 O(n) 但常数小一个量级。
-     *
-     * 调用方: 三个鼠标 handler (滚轮 / 拖 thumb / 点轨道跳转) —— 它们按定义
-     * 只改偏移。内容变化仍然走完整的 DoLayout()。 */
+    // Offset already arranged rows; refill the bounded realization buffer only
+    // near its edge. Scrolling within it must not remeasure any row.
     void ApplyScrollDelta_(float oldScrollY);
     float VisibleHeight() const;
     D2D1_RECT_F ThumbRect() const;

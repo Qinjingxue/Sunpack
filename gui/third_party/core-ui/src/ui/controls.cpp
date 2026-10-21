@@ -2456,6 +2456,7 @@ void VirtualListWidget::RemapRows(const std::vector<size_t>& previousIndices) {
     for (size_t i = 0; unchanged && i < previousIndices.size(); ++i)
         unchanged = previousIndices[i] == i;
     if (unchanged) return;
+    realizedRangeValid_ = false;
 
     auto* ancestor = Parent();
     while (ancestor && !dynamic_cast<ScrollViewWidget*>(ancestor)) ancestor = ancestor->Parent();
@@ -2480,6 +2481,7 @@ void VirtualListWidget::RemapRows(const std::vector<size_t>& previousIndices) {
 
 void VirtualListWidget::SetCount(size_t count) {
     if (heights_.size() != count) {
+        realizedRangeValid_ = false;
         heights_.resize(count, std::max(1.0f, estimatedHeight + gap_));
         RebuildSums();
         ui::RequestLayout();
@@ -2498,9 +2500,25 @@ void VirtualListWidget::RefreshViewport() {
     while (ancestor && !dynamic_cast<ScrollViewWidget*>(ancestor)) ancestor = ancestor->Parent();
     float top = ancestor ? std::max(0.0f, ancestor->rect.top - rect.top - padT) : 0;
     float bottom = top + (ancestor ? std::max(0.0f, ancestor->rect.bottom - ancestor->rect.top) : 600);
-    size_t first = RowAt(std::max(0.0f, top - 160));
-    size_t last = std::min(heights_.size(), RowAt(bottom + 160) + 1);
+    // Keep the previous realization window until its 160-DIP buffer is nearly
+    // consumed. Rebuilding on every row boundary needlessly runs JS bindings
+    // and full layout during otherwise paint-only scrolling.
+    const bool refill = !realizedRangeValid_ ||
+        std::abs(bottom - top - realizedViewportHeight_) > 0.5f ||
+        (realizedFirst_ != 0 && top < Sum(realizedFirst_) + 48) ||
+        (realizedLast_ != heights_.size() && bottom > Sum(realizedLast_) - 48);
+    size_t first = refill ? RowAt(std::max(0.0f, top - 160)) : realizedFirst_;
+    size_t last = refill ? std::min(heights_.size(), RowAt(bottom + 160) + 1) : realizedLast_;
+    if (!refill && indices_.size() == last - first) {
+        refreshing_ = false;
+        return; // No pinned row to retire, no new widgets/bindings or allocation.
+    }
+    realizedFirst_ = first;
+    realizedLast_ = last;
+    realizedRangeValid_ = true;
+    realizedViewportHeight_ = bottom - top;
     std::vector<size_t> next;
+    next.reserve(last - first + 1);
     for (size_t i = first; i < last; ++i) next.push_back(i);
     // Keep a focused text editor alive when it scrolls out of view, so blur
     // autosave and IME composition never depend on widget destruction.
@@ -2555,7 +2573,7 @@ namespace {
 void RefreshVirtualLists(Widget* w) {
     if (!w->visible) return;
     if (auto* list = dynamic_cast<VirtualListWidget*>(w)) {
-        list->DoLayout(); return;
+        list->RefreshViewport(); return;
     }
     for (auto& child : w->Children()) RefreshVirtualLists(child.get());
 }
@@ -2635,6 +2653,7 @@ void ScrollViewWidget::DoLayout() {
     // Scrollbar overlays content (absolute positioning, no space reserved)
     float cw = visW;
     ClampScroll();
+    if (!ScrollAnimating()) scrollPosition_ = scrollY_;
 
     // Final layout with correct scroll offset and width
     content_->rect = {rect.left + padL, rect.top + padT - scrollY_,
@@ -2654,6 +2673,7 @@ void ScrollViewWidget::ApplyScrollDelta_(float oldScrollY) {
 void ScrollViewWidget::CorrectVirtualAnchor(float delta) {
     if (std::abs(delta) < 0.5f || !content_) return;
     scrollY_ += delta;
+    scrollPosition_ += delta;
     if (draggingThumb_) dragStartScroll_ += delta;
     ShiftSubtreeRects(content_.get(), 0, -delta);
 }
@@ -2700,15 +2720,82 @@ bool ScrollViewWidget::OnMouseWheel(const MouseEvent& e) {
     if (!Contains(e.x, e.y)) return false;
     // 内容完全适配视口时不消耗滚轮事件，让父容器处理
     if (!NeedsScrollbar()) return false;
-    const float oldScroll = scrollY_;
-    scrollY_ -= e.delta * 0.3f;
-    ClampScroll();
-    ApplyScrollDelta_(oldScroll);   /* 纯偏移变化, 不重跑布局 */
+    if (draggingThumb_) return true;
+    UINT lines = 3;
+    SystemParametersInfoW(SPI_GETWHEELSCROLLLINES, 0, &lines, 0);
+    const double step = -double(e.delta) / WHEEL_DELTA *
+        (lines == WHEEL_PAGESCROLL ? VisibleHeight() : lines * 16.0);
+    if (step == 0) return true;
+    BOOL animate = TRUE;
+    SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &animate, 0);
+    const auto now = AnimationTimeMs();
+    AdvanceScrollMotion(now);
+    // Like InteractionTracker's additional-velocity requests: integrate the
+    // existing inertia before adding this impulse, rather than restart a
+    // fixed-duration easing curve for each wheel packet. Reverse immediately.
+    if (scrollVelocity_ * step < 0) scrollVelocity_ = 0;
+    const double target = std::clamp(scrollPosition_ + scrollVelocity_ / kWheelDecay + step,
+        0.0, double(std::max(0.0f, contentHeight_ - VisibleHeight())));
+    if (animate) scrollVelocity_ = (target - scrollPosition_) * kWheelDecay;
+    else { scrollPosition_ = target; scrollVelocity_ = 0; }
+    scrollTick_ = now;
+    scrollPending_ = true;
+    if (ScrollAnimating()) GetContext().RegisterAnimatingWidget(this);
     return true;
+}
+
+void ScrollViewWidget::CancelScrollMotion() {
+    scrollVelocity_ = 0;
+    scrollPosition_ = scrollY_;
+    scrollTick_ = 0;
+    scrollPending_ = false;
+}
+
+void ScrollViewWidget::QueueScrollTo(float y) {
+    scrollVelocity_ = 0;
+    scrollPosition_ = std::clamp(y, 0.0f, std::max(0.0f, contentHeight_ - VisibleHeight()));
+    scrollPending_ = true;
+    GetContext().RegisterAnimatingWidget(this);
+}
+
+void ScrollViewWidget::AdvanceScrollMotion(double now) {
+    if (scrollVelocity_ == 0) return;
+    const double factor = std::exp(-kWheelDecay * double(now - scrollTick_));
+    scrollPosition_ += scrollVelocity_ / kWheelDecay * (1 - factor);
+    scrollVelocity_ *= factor;
+    scrollTick_ = now;
+    // Complete the remaining subpixel travel exactly and retire the frame
+    // source. No timer, stationary-drag loop or asymptotic idle animation.
+    if (std::abs(scrollVelocity_ / kWheelDecay) < 0.1) {
+        scrollPosition_ += scrollVelocity_ / kWheelDecay;
+        scrollVelocity_ = 0;
+    }
+    const double limit = std::max(0.0f, contentHeight_ - VisibleHeight());
+    if ((scrollPosition_ <= 0 && scrollVelocity_ < 0) ||
+        (scrollPosition_ >= limit && scrollVelocity_ > 0)) {
+        scrollPosition_ = std::clamp(scrollPosition_, 0.0, limit);
+        scrollVelocity_ = 0;
+    }
+}
+
+void ScrollViewWidget::UpdateScrollAnimation() {
+    for (Widget* parent = this; parent; parent = parent->Parent()) {
+        if (!parent->visible) { CancelScrollMotion(); return; }
+    }
+    AdvanceScrollMotion(AnimationTimeMs());
+    const float oldScroll = scrollY_;
+    scrollY_ = float(scrollPosition_);
+    ClampScroll();
+    scrollPosition_ = std::clamp(scrollPosition_, 0.0,
+        double(std::max(0.0f, contentHeight_ - VisibleHeight())));
+    scrollPending_ = false;
+    ApplyScrollDelta_(oldScroll);
 }
 
 bool ScrollViewWidget::OnMouseDown(const MouseEvent& e) {
     if (NeedsScrollbar() && e.x >= rect.right - kBarSpace - 2 && e.x < rect.right - 2) {
+        // Thumb/track input takes ownership of the current visual position.
+        CancelScrollMotion();
         // Click anywhere in scrollbar track area
         draggingThumb_ = true;
         dragStartY_ = e.y;
@@ -2718,20 +2805,18 @@ bool ScrollViewWidget::OnMouseDown(const MouseEvent& e) {
         float visH = VisibleHeight();
         float trackRange = visH - thumbH;
         if (trackRange > 0 && (e.y < thumb.top || e.y > thumb.bottom)) {
-            const float oldScroll = scrollY_;
             float targetY = e.y - thumbH / 2 - rect.top;
             float maxScroll = contentHeight_ - visH;
-            scrollY_ = targetY / (visH - thumbH) * maxScroll;
-            ClampScroll();
-            ApplyScrollDelta_(oldScroll);
+            QueueScrollTo(targetY / trackRange * maxScroll);
         }
-        dragStartScroll_ = scrollY_;
+        dragStartScroll_ = float(scrollPosition_);
         return true;
     }
     return false;
 }
 
 bool ScrollViewWidget::OnMouseMove(const MouseEvent& e) {
+    const bool wasHovered = hovered, wasHoveringBar = hoveringBar_;
     hovered = Contains(e.x, e.y);
     if (draggingThumb_) {
         float visH = VisibleHeight();
@@ -2739,18 +2824,15 @@ bool ScrollViewWidget::OnMouseMove(const MouseEvent& e) {
         float thumbH = std::max(20.0f, visH * ratio);
         float trackRange = visH - thumbH;
         if (trackRange > 0) {
-            const float oldScroll = scrollY_;
             float dy = e.y - dragStartY_;
             float maxScroll = contentHeight_ - visH;
-            scrollY_ = dragStartScroll_ + dy * (maxScroll / trackRange);
-            ClampScroll();
-            ApplyScrollDelta_(oldScroll);
+            QueueScrollTo(dragStartScroll_ + dy * (maxScroll / trackRange));
         }
         return true;
     }
     // Detect hover over scrollbar area for visual width change (no layout impact)
     hoveringBar_ = NeedsScrollbar() && hovered && e.x >= rect.right - kBarSpace - 2 && e.x < rect.right - 2;
-    return hovered;
+    return hovered != wasHovered || hoveringBar_ != wasHoveringBar;
 }
 
 bool ScrollViewWidget::OnMouseUp(const MouseEvent& e) {

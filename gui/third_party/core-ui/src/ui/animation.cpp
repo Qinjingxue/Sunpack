@@ -6,10 +6,14 @@
 
 namespace ui {
 
-uint64_t AnimationClockMs() {
+double AnimationTimeMs() {
     static const int64_t frequency = [] { LARGE_INTEGER f{}; QueryPerformanceFrequency(&f); return f.QuadPart; }();
     LARGE_INTEGER now{}; QueryPerformanceCounter(&now);
-    return uint64_t(now.QuadPart / frequency) * 1000 + uint64_t(now.QuadPart % frequency) * 1000 / frequency;
+    return double(now.QuadPart) * (1000.0 / double(frequency));
+}
+
+uint64_t AnimationClockMs() {
+    return static_cast<uint64_t>(AnimationTimeMs());
 }
 
 // ---- AnimatedFloat ----

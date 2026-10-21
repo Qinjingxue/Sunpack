@@ -231,6 +231,13 @@ private:
     bool        caretBlinkTimerRunning_ = false;
     bool        animationFramesActive_ = false;
     bool        renderFramePosted_ = false;
+    // Scroll packets update a pending view while one VSync frame is in flight.
+    // The renderer's completion message releases the next frame, without
+    // blocking pointer input or running frames during a stationary thumb drag.
+    uint64_t    scrollFrameGeneration_ = 0;
+    bool        scrollPaintPending_ = false;
+    bool        scrollFrameRecorded_ = false;
+    void QueueScrollFrame();
     AnimationHost animationHost_;
     AnimationManager propertyAnimations_;
     uint64_t    lastAnimationFrameTick_ = 0;

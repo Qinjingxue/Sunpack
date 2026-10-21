@@ -11,6 +11,13 @@ preserved.
 
 Local changes:
 
+- Smooth wheel travel uses the existing finite, VSync-paced animation host.
+  Accumulate repeated input, reverse from the visual position, and cancel on
+  thumb/track input or programmatic positioning. Keep virtual anchors independent
+  of the remaining travel and supply the renderer's measurer on animation frames.
+  Weak frame-local animation targets tolerate virtual rows unmounting mid-frame;
+  completed/hidden motion releases frame requests without polling.
+
 - Release the temporary root handle after attaching a prepared/opened page to
   its window. Repeated date popup creation now releases each page tree on close.
 
@@ -63,6 +70,18 @@ Local changes:
   motion, on the same finite paint-only animation host. Respect system settings.
 - Remove the redundant ScrollView layout during wheel dispatch: scrolling already
   shifts arranged rectangles, and the extra layout lost the text measure context.
+- Unify thumb and wheel view changes on presentation frames. Coalesce pending
+  input while the current scroll frame presents; never synchronously paint/wait
+  for each mouse packet. Generation checks cover superseded frames, device loss,
+  hidden windows and the final non-animated position/pressed-state frame.
+- Replace per-packet restarted wheel easing with integrated exponential inertia
+  and additive velocity, respecting system scroll lines/pages and reduced motion.
+  Thumb tracking stays direct, with no release inertia or stationary frame loop.
+  Preserve sub-millisecond QPC samples for scrolling on high-refresh displays.
+- Separate virtual-row realization from row measurement. Keep the existing
+  bounded 160-DIP overscan with refill hysteresis; pure offset updates never call
+  row layout. Resize, data changes and buffer refills still measure normally and
+  preserve virtual anchors and focused editors.
 - Route scrollbar presses through the actual hit widget's ancestor chain instead
   of sweeping all ScrollViews. Hidden pages with stale bounds cannot capture a
   visible scrollbar's drag; nested scrollbars respect clipping and stacking.
@@ -96,6 +115,10 @@ Motion references:
 - https://learn.microsoft.com/en-us/windows/apps/design/motion/page-transitions
 - https://github.com/microsoft/microsoft-ui-xaml/blob/main/controls/dev/CommonStyles/ToggleSwitch_themeresources.xaml
 - https://github.com/microsoft/microsoft-ui-xaml/blob/main/dxaml/xcp/dxaml/lib/ComboBox_Partial.cpp
+- https://github.com/microsoft/microsoft-ui-xaml/blob/main/controls/dev/ScrollView/ScrollBarController.cpp
+- https://github.com/microsoft/microsoft-ui-xaml/blob/main/controls/dev/ScrollPresenter/ScrollPresenter.cpp
+- https://github.com/microsoft/microsoft-ui-xaml/blob/main/controls/dev/Repeater/ViewportManager.cpp
+- https://learn.microsoft.com/en-us/windows/apps/develop/composition/interaction-tracker-manipulations
 
 - Expose read-only ToggleWidget::Animating() to the integration tests. The
   switch's own motion is checked without conflating it with other window

@@ -510,6 +510,34 @@ void batch_editing(Fixture& fixture) {
     view.password_scope=utf8(dir.wstring());
     auto matches=password_rows(saved,view); assert(matches["total"]==1 && matches["rows"][0]["value"]=="fast-delta");
     view.password_scope=utf8((dir/"child").wstring()); assert(password_rows(saved,view)["total"]==0);
+    // GUI deletion removes exactly the deleted scope, preserving shared/global
+    // entries, separately monitored children, similar prefixes and history.
+    auto child=first/"child"; fs::create_directory(child);
+    edit_root(roots,"save","",utf8(child.wstring()),"",false);
+    auto alias=first.wstring(); CharUpperBuffW(alias.data(),DWORD(alias.size())); alias+=L"/";
+    Json cleanup={{"passwords",Json::array({
+        Json{{"value","only"},{"scopes",{utf8(alias),utf8(first.wstring())}}},
+        Json{{"value","shared"},{"scopes",{utf8(first.wstring()),utf8(second.wstring())}}},
+        Json{{"value","global"}},Json{{"value","child"},{"scopes",{utf8(child.wstring())}}},
+        Json{{"value","sibling-prefix"},{"scopes",{utf8((dir/"first2").wstring())}}}
+    })},{"clipboard_history",{"only","background update"}}};
+    atomic_write(passwords,cleanup.dump());
+    Json deletion=Json::array({Json{{"operation","delete"},{"original",utf8(first.wstring())},{"input",utf8(first.wstring())},{"output",""},{"deep",false}}});
+    auto roots_before=read_file(roots), passwords_before=read_file(passwords);
+    {
+        Handle held(CreateFileW(roots.c_str(),GENERIC_READ,FILE_SHARE_READ,nullptr,OPEN_EXISTING,0,nullptr));
+        PasswordSaveSnapshot rolled_back;
+        auto failure=save_changes(dir,Json::array(),Json::array(),deletion,&rolled_back);
+        assert(failure["error"]!="" && failure["saved"].empty() && rolled_back.document.is_null());
+        assert(read_file(roots)==roots_before && read_file(passwords)==passwords_before);
+    }
+    PasswordSaveSnapshot cleaned;
+    auto removed=save_changes(dir,Json::array(),Json::array(),deletion,&cleaned);
+    cleanup["passwords"].erase(cleanup["passwords"].begin());
+    cleanup["passwords"][0]["scopes"]=Json::array({utf8(second.wstring())});
+    assert(removed["error"]=="" && removed["saved"]==Json::array({"passwords","roots"}));
+    assert(read_json(passwords)==cleanup && cleaned.document==cleanup && cleaned.rebases.size()==2);
+    assert(read_roots(roots).entries.size()==3 && fs::is_directory(first));
 }
 }
 int wmain(int argc,wchar_t** argv) {

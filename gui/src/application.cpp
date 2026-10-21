@@ -193,6 +193,30 @@ void Application::acknowledge_save(const Json& ack) {
     bool ok=ack.at("ok").get<bool>();
     if(kind=="roots") {
         Json records=Json::array(),pending=Json::array();
+        Json removed_scopes=Json::array();
+        if(ok) {
+            std::unordered_set<std::wstring> removed;
+            for(auto& edit:job.at("edits")) if(edit.at("operation")=="delete") {
+                auto path=edit.at("original").get<std::string>();
+                removed_scopes.push_back(path); removed.insert(path_key(wide(path)));
+            }
+            std::unordered_map<std::string,std::string> rebased;
+            if(ack.contains("passwordRebases") && ack["passwordRebases"].is_array())
+                for(auto& group:ack["passwordRebases"]) if(!group["record"].is_null())
+                    for(auto& previous:group["originals"]) rebased.emplace(previous.get<std::string>(),group["record"].dump());
+            for(auto it=saves_.begin();it!=saves_.end();) {
+                if((*it)["kind"]!="passwords") { ++it; continue; }
+                auto& edit=(*it)["edit"];
+                auto scope=edit.value("scope",std::string());
+                if(!scope.empty() && removed.count(path_key(wide(scope)))) {
+                    save_error("@password:"+(*it)["key"].get<std::string>(),"");
+                    it=saves_.erase(it); continue;
+                }
+                auto found=rebased.find(edit.value("original",std::string()));
+                if(found!=rebased.end()) edit["original"]=found->second;
+                ++it;
+            }
+        }
         for(auto& edit:job.at("edits")) {
             auto id=edit.at("row").get<std::string>();
             save_error("@root:"+id,ack.at("error"));
@@ -211,6 +235,8 @@ void Application::acknowledge_save(const Json& ack) {
         }
         for(auto& queued:saves_) if(queued["kind"]==kind) for(auto& edit:queued["edits"]) pending.push_back(edit["row"]);
         auto reply=Json{{"snapshot",job.at("snapshot")},{"ok",ok},{"error",ack.at("error")},{"records",std::move(records)},{"pending",std::move(pending)}};
+        reply["removedPasswordScopes"]=std::move(removed_scopes);
+        reply["passwordRebases"]=ack.value("passwordRebases",Json::array());
         if(!ok) reply["error"]=page_value(page_,"saveErrors")["@root:"+job["edits"][0]["row"].get<std::string>()];
         auto encoded=reply.dump();
         if(ui_page_call_json(page_,"rootSaved",encoded.c_str())!=0) throw std::runtime_error("uiBindingFailed");
@@ -377,7 +403,8 @@ void Application::apply_pending() {
     // must not rewrite recordSaving/pendingFields and rebind hidden editors.
     if(!ack.is_null()) start_save();
     if(closing_ && active_save_.is_null() && saves_.empty()) PostMessageW(hwnd_,WM_CLOSE,0,0);
-    if(!transition.empty()) {
+    if(!transition.empty() && (transition["id"]!="passwordBody" ||
+       (!password_snapshot.is_null() && password_snapshot["scope"]==page_value(page_,"passwordScope")))) {
         ui_window_relayout(window_);
         motion::enter(window_,transition.at("id").get<std::string>().c_str(),transition.value("x",0.0f),transition.value("y",0.0f));
     }
@@ -388,6 +415,12 @@ void Application::apply_pending() {
         ui_window_set_title(window_,wide(tr("title",language)).c_str());
         rebuild_theme(language);
     }
+}
+void Application::reveal() {
+    if(shown_) return;
+    shown_=true;
+    ui_window_show_immediate(window_);
+    style_frame(hwnd_,system_theme());
 }
 void Application::navigate(const std::string& tab) {
     date_popup_.reset();
@@ -703,10 +736,19 @@ LRESULT CALLBACK Application::subclass(HWND hwnd,UINT message,WPARAM wparam,LPAR
             if(!errors.empty()) { self->closing_=false; auto encoded=errors.begin().value().dump(); ui_page_set_json(self->page_,"closeError",encoded.c_str()); return 0; }
         }
         if(message==Dispatch) { self->dispatch(); return 0; }
-        if(message==Update) { self->apply_pending(); return 0; }
+        if(message==Update) {
+            self->apply_pending();
+            // Reveal after committing the first data/layout transaction.
+            // Service notifications may precede the data snapshot.
+            if(page_value(self->page_,"ready")==true) self->reveal();
+            return 0;
+        }
         if(message==WM_ACTIVATE && LOWORD(wparam)!=WA_INACTIVE) { self->changed(Startup); SetEvent(self->service_refresh_); }
         if(message==WM_SETTINGCHANGE && page_value(self->page_,"theme")=="system") apply_theme(self->page_,system_theme(),self->hwnd_);
-    } catch(const std::exception& e) { self->set_error("actionError",e.what()); }
+    } catch(const std::exception& e) {
+        self->set_error("actionError",e.what());
+        self->reveal(); // A binding failure must remain visible and closable.
+    }
     return DefSubclassProc(hwnd,message,wparam,lparam);
 }
 void Application::open() {
@@ -758,9 +800,6 @@ void Application::open() {
         SetEvent(self->stop_); self->cv_.notify_all(); ui_quit(0);
     },this);
     ui_page_set_bool(page_,"cliAllowed",options_.allow_cli);
-    ui_window_show_immediate(window_);
-    // Keep native maximize/minimize transitions enabled after preparation/show.
-    style_frame(hwnd_,system_theme());
     stage="stageWatchers";
     worker_=std::thread([this]{ work(); });
     registry_=std::thread([this]{
@@ -837,6 +876,7 @@ void Application::work() {
         std::vector<std::wstring> last_visible_tasks;
         bool task_selection_known=false;
         std::map<unsigned,ReadRetry> retries;
+        bool initial_load_complete=false;
         auto retry_io=[&](unsigned bit,const WinError& error) {
             if(error.code!=ERROR_SHARING_VIOLATION && error.code!=ERROR_LOCK_VIOLATION && error.code!=ERROR_FILE_NOT_FOUND && error.code!=ERROR_PATH_NOT_FOUND) return;
             auto& retry=retries[bit];
@@ -911,7 +951,7 @@ void Application::work() {
                         auto result=save_changes(dir,p.value("fields",Json::array()),
                             password_edits,
                             kind=="roots"?p.at("edits"):Json::array(),
-                            kind=="passwords"?&saved_passwords:nullptr);
+                            &saved_passwords);
                         std::string password_original;
                         for(auto& section:result["saved"]) {
                             if(section=="config") flags|=Config;
@@ -926,7 +966,7 @@ void Application::work() {
                                 retries.erase(Passwords);
                                 // A single replacement preserves ordering and filtered count
                                 // in the unfiltered saved-password view.
-                                const auto& edit=p.at("edit");
+                                const auto& edit=kind=="passwords"?p.at("edit"):Json::object();
                                 if(!saved_passwords.record.is_null()) password_original=saved_passwords.record.dump();
                                 if(edit.value("operation",std::string())=="replace" &&
                                    !saved_passwords.count_changed && !saved_passwords.record.is_null() &&
@@ -949,6 +989,7 @@ void Application::work() {
                             edit_feedback["saveAck"]["passwordOriginal"]=password_original;
                             edit_feedback["saveAck"]["passwordRebases"]=std::move(saved_passwords.rebases);
                         }
+                        if(kind=="roots") edit_feedback["saveAck"]["passwordRebases"]=std::move(saved_passwords.rebases);
                     } else if(op=="cli") {
                         if(!options_.allow_cli) throw std::runtime_error("cliUnbound");
                         auto action=p.value("action",std::string());
@@ -1056,7 +1097,10 @@ void Application::work() {
             }
             auto displayed_errors=Json::object();
             for(auto it=errors.begin();it!=errors.end();++it) displayed_errors[tr(it.key(),language)]=translated_error(it.value().get<std::string>(),language);
-            patch["errors"]=std::move(displayed_errors); patch["logPath"]=utf8(log.path().wstring()); patch["ready"]=true;
+            // Reuse observed I/O retries before revealing the initial snapshot.
+            // Permanent failures still reveal their error after retries finish.
+            initial_load_complete|=std::none_of(retries.begin(),retries.end(),[](const auto& retry){return retry.second.due!=Clock::time_point::max();});
+            patch["errors"]=std::move(displayed_errors); patch["logPath"]=utf8(log.path().wstring()); patch["ready"]=initial_load_complete;
             Json changed_patch=Json::object();
             for(auto it=patch.begin();it!=patch.end();++it) if(!previous_patch.contains(it.key()) || it.key()=="tasks" || it.key()=="passwords" || it.key()=="taskDelta" || it.key()=="passwordDelta" || previous_patch[it.key()]!=it.value()) {
                 // These projections are generated only after source/filter
