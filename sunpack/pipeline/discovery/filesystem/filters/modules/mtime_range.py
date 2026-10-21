@@ -49,8 +49,7 @@ def utc_minute_ns(value: Any) -> int | None:
 
 
 def time_bounds(config: dict[str, Any]) -> NumericRange:
-    if validate_range_fields(config, ("start_utc", "end_utc")):
-        return NumericRange(gt=0, lt=0)
+    validate_range_fields(config, ("start_utc", "end_utc"))
     start, end = (utc_minute_ns(config.get(key)) for key in ("start_utc", "end_utc"))
     if start is not None and end is not None and start >= end:
         raise ValueError("start_utc must precede end_utc")

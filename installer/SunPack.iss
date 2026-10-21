@@ -71,7 +71,6 @@ english.TaskAddToPathFailed=Failed to add sunpack to the system PATH.
 english.TaskContextMenuFailed=Failed to register the sunpack folder context menu.
 english.TaskContextMenuRemoveFailed=Failed to remove the existing sunpack context menu.
 english.PrepareRuntimeRunning=sunpack runtime processes are still running. Please stop them and run the installer again.
-english.PrepareWatchStateQueryFailed=Could not determine the existing sunpack Watch state directory. Repair the existing installation and run the installer again.
 english.PrepareBrokerRemoveFailed=The existing sunpack Watch Broker service could not be removed. Restart Windows and run the installer again.
 english.PrepareOldFilesRemoveFailed=Some old sunpack files could not be removed. Close sunpack and run the installer again.
 english.UninstallStopFailed=sunpack runtime processes or the Watch Broker service could not be stopped. Please restart Windows and run the uninstaller again.
@@ -81,7 +80,6 @@ english.WatchRootsFileMapping=# Optional columns: input folder | output folder |
 english.WatchRootsFileDeepDetect=# deep_detect accepts true or false; blank defaults to false.
 english.WatchRootsFileExample=# Example: C:\Downloads | D:\Extracted | true
 english.EditableConfigCreateFailed=Failed to create the initial editable configuration file: %s
-english.EditableConfigUpgradeFailed=Failed to upgrade SunPack data: %s. Check the file format and permissions, then run Setup again.
 chinesesimplified.TaskAddToPath=将 sunpack 添加到系统 PATH
 chinesesimplified.TaskContextMenu=注册 sunpack 文件夹右键菜单
 chinesesimplified.TaskAutostart=Windows 启动时运行 sunpack 监控
@@ -101,7 +99,6 @@ chinesesimplified.TaskAddToPathFailed=无法将 sunpack 添加到系统 PATH。
 chinesesimplified.TaskContextMenuFailed=无法注册 sunpack 文件夹右键菜单。
 chinesesimplified.TaskContextMenuRemoveFailed=无法清理现有 sunpack 右键菜单。
 chinesesimplified.PrepareRuntimeRunning=sunpack 运行时进程仍在运行。请先停止这些进程，然后重新运行安装程序。
-chinesesimplified.PrepareWatchStateQueryFailed=无法确定现有 sunpack Watch 状态目录。请修复现有安装，然后重新运行安装程序。
 chinesesimplified.PrepareBrokerRemoveFailed=无法删除现有 sunpack Watch Broker 服务。请重启 Windows，然后重新运行安装程序。
 chinesesimplified.PrepareOldFilesRemoveFailed=无法删除部分旧版 sunpack 文件。请关闭 sunpack，然后重新运行安装程序。
 chinesesimplified.UninstallStopFailed=无法停止 sunpack 运行时进程或 Watch Broker 服务。请重启 Windows，然后重新运行卸载程序。
@@ -111,7 +108,6 @@ chinesesimplified.WatchRootsFileMapping=# 可选字段格式：输入目录 | �
 chinesesimplified.WatchRootsFileDeepDetect=# deep_detect 可填写 true 或 false；留空时默认为 false。
 chinesesimplified.WatchRootsFileExample=# 示例：C:\Downloads | D:\Extracted | true
 chinesesimplified.EditableConfigCreateFailed=无法创建初始可编辑配置文件：%s
-chinesesimplified.EditableConfigUpgradeFailed=无法升级 SunPack 数据：%s。请检查文件格式和权限后重新运行安装程序。
 
 [Tasks]
 Name: "addtopath"; Description: "{cm:TaskAddToPath}"; GroupDescription: "{cm:GroupShellIntegration}"
@@ -121,7 +117,8 @@ Name: "autostart"; Description: "{cm:TaskAutostart}"; GroupDescription: "{cm:Gro
 [Files]
 Source: "{#SourceDir}\*"; DestDir: "{app}"; Excludes: "sunpack.exe,sunpack_config.json,sunpack_watch_roots.txt,builtin_passwords.json"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#SourceDir}\sunpack.exe"; DestDir: "{app}\bin"; Flags: ignoreversion
-Source: "{#SourceDir}\sunpack_config.json"; DestDir: "{commonappdata}\SunPack"; Flags: onlyifdoesntexist skipifsourcedoesntexist
+Source: "{#SourceDir}\sunpack_config.json"; DestDir: "{commonappdata}\SunPack"; Flags: onlyifdoesntexist
+Source: "{#SourceDir}\builtin_passwords.json"; DestDir: "{commonappdata}\SunPack"; Flags: onlyifdoesntexist
 
 [Dirs]
 Name: "{app}"; Flags: uninsalwaysuninstall
@@ -150,10 +147,7 @@ const
   StartupRegistryKey = 'Software\Microsoft\Windows\CurrentVersion\Run';
   StartupValueName = 'SunPackWatchService';
   PathMarkerName = 'PathAddedByInstaller';
-  UpgradeWatchStateDirValueName = 'UpgradeWatchStateDir';
   WatchBrokerServiceName = 'SunPackWatchBroker';
-  WatchClipboardBlockBegin = '#!SUNPACK-WATCH-CLIPBOARD-BEGIN';
-  WatchClipboardBlockEnd = '#!SUNPACK-WATCH-CLIPBOARD-END';
   WatchBrokerServiceSddl = 'D:(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;LCRP;;;IU)';
 
 function RunServiceControl(const Parameters: string; var ResultCode: Integer): Boolean;
@@ -326,8 +320,6 @@ begin
   if not RegQueryStringValue(HKLM, EnvironmentRegistryKey, 'Path', CurrentPath) then
     CurrentPath := '';
   NewPath := CurrentPath;
-  if InstallerOwnsMachinePath and PathContains(NewPath, ExpandConstant('{app}')) then
-    NewPath := PathWithoutEntry(NewPath, ExpandConstant('{app}'));
   if not PathContains(NewPath, AppPath) then
   begin
     if (NewPath <> '') and (NewPath[Length(NewPath)] <> ';') then
@@ -344,18 +336,20 @@ begin
     Result := RegWriteDWordValue(HKLM, SunPackRegistryKey, PathMarkerName, 1);
 end;
 
-procedure RemoveMachinePath;
+function RemoveMachinePath(const AppDirectory: string): Boolean;
 var
   CurrentPath: string;
   NewPath: string;
 begin
+  Result := True;
   if not InstallerOwnsMachinePath then
     Exit;
   if not RegQueryStringValue(HKLM, EnvironmentRegistryKey, 'Path', CurrentPath) then
     CurrentPath := '';
-  NewPath := PathWithoutEntry(CurrentPath, ExpandConstant('{app}'));
-  NewPath := PathWithoutEntry(NewPath, ExpandConstant('{app}\bin'));
-  if not RegWriteExpandStringValue(HKLM, EnvironmentRegistryKey, 'Path', NewPath) then
+  NewPath := PathWithoutEntry(CurrentPath, AppDirectory);
+  NewPath := PathWithoutEntry(NewPath, AddBackslash(AppDirectory) + 'bin');
+  Result := RegWriteExpandStringValue(HKLM, EnvironmentRegistryKey, 'Path', NewPath);
+  if not Result then
   begin
     Log('Failed to remove SunPack from the system PATH.');
     Exit;
@@ -450,77 +444,80 @@ begin
   end;
 end;
 
-function ExistingLauncherPath: string;
+function RequiresDataReset(const Version: string): Boolean;
+var
+  Packed: Int64;
+  Value: string;
 begin
-  Result := ExpandConstant('{app}\bin\sunpack.exe');
-  if not FileExists(Result) then
-    Result := ExpandConstant('{app}\sunpack.exe');
+  Value := Version;
+  if Copy(Value, 1, 1) = 'v' then
+    Delete(Value, 1, 1);
+  { Missing or unversioned installations cannot provide current-format data. }
+  Result := True;
+  if StrToVersion(Value, Packed) then
+    Result := Packed < PackVersionComponents(1, 2, 0, 0);
 end;
 
-function QueryExistingWatchState(
-  var WatchStateDir: string;
-  var WatchRunning: Boolean
-): Boolean;
+function InstalledDataRequiresReset: Boolean;
 var
-  ExistingApp: string;
-  PowerShellPath: string;
+  Version: string;
+begin
+  RegQueryStringValue(HKLM64,
+    'Software\Microsoft\Windows\CurrentVersion\Uninstall\{9E8C73E5-C540-4E68-93E0-1FBAAFB89713}_is1',
+    'DisplayVersion', Version);
+  Result := RequiresDataReset(Version);
+end;
+
+function RemoveDataDirectory(const Path: string): Boolean;
+begin
+  Result := not DirExists(Path);
+  if not Result then
+    Result := DelTree(Path, True, True, True);
+end;
+
+function ExistingApplicationDirectory: string;
+begin
+  if not RegQueryStringValue(HKLM64,
+    'Software\Microsoft\Windows\CurrentVersion\Uninstall\{9E8C73E5-C540-4E68-93E0-1FBAAFB89713}_is1',
+    'InstallLocation', Result) or (Trim(Result) = '') then
+    Result := ExpandConstant('{app}');
+end;
+
+function RemoveInstalledData: Boolean;
+var
   Command: string;
-  Parameters: string;
   ResultCode: Integer;
 begin
-  Result := False;
-  WatchStateDir := '';
-  WatchRunning := False;
-  RegDeleteValue(HKLM, SunPackRegistryKey, UpgradeWatchStateDirValueName);
-  ExistingApp := ExistingLauncherPath;
-  if not FileExists(ExistingApp) then
-    Exit;
-
-  PowerShellPath := ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe');
+  { Locate custom Watch data, then remove whole directories without conversion. }
   Command :=
-    '$ErrorActionPreference = ''Stop''; ' +
-    'try { ' +
-    '  $json = (& ' + PowerShellSingleQuotedString(ExistingApp) + ' watch status --json 2>$null | Out-String); ' +
-    '  if ($LASTEXITCODE -ne 0) { exit 2 }; ' +
-    '  $status = $json | ConvertFrom-Json; ' +
-    '  $stateDir = [string]$status.summary.state_dir; ' +
-    '  if ([string]::IsNullOrWhiteSpace($stateDir) -or -not [System.IO.Path]::IsPathRooted($stateDir)) { exit 2 }; ' +
-    '  $stateDir = [System.IO.Path]::GetFullPath($stateDir); ' +
-    '  $key = [Microsoft.Win32.Registry]::LocalMachine.CreateSubKey(' +
-         PowerShellSingleQuotedString(SunPackRegistryKey) + '); ' +
-    '  try { $key.SetValue(' + PowerShellSingleQuotedString(UpgradeWatchStateDirValueName) +
-         ', $stateDir, [Microsoft.Win32.RegistryValueKind]::String) } finally { $key.Dispose() }; ' +
-    '  if ($status.summary.running -eq $true) { exit 0 }; ' +
-    '  exit 1; ' +
-    '} catch { exit 2 }';
-  Parameters := '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ' + AddQuotes(Command);
-  ResultCode := -1;
+    '$ErrorActionPreference = ''Stop''; $state = ''''; ' +
+    '$data = ' + PowerShellSingleQuotedString(ExpandConstant('{commonappdata}\SunPack')) + '; ' +
+    'foreach ($file in @(' + PowerShellSingleQuotedString(AddBackslash(ExistingApplicationDirectory) + 'sunpack_advanced_config.json') +
+    ', (Join-Path $data ''sunpack_config.json''))) { ' +
+    '  if (Test-Path -LiteralPath $file) { ' +
+    '    try { $config = Get-Content -LiteralPath $file -Raw -Encoding UTF8 | ConvertFrom-Json; ' +
+    '      if ($null -ne $config.watch.state_dir) { $state = ([string]$config.watch.state_dir).Trim() } ' +
+    '    } catch { } ' +
+    '  } ' +
+    '}; ' +
+    'if ($state) { ' +
+    '  if ($state -eq ''~'') { $state = $env:USERPROFILE } ' +
+    '  elseif ($state.StartsWith(''~\'') -or $state.StartsWith(''~/'')) { $state = Join-Path $env:USERPROFILE $state.Substring(2) }; ' +
+    '  if (-not [IO.Path]::IsPathRooted($state)) { $state = Join-Path $data $state }; ' +
+    '  if (Test-Path -LiteralPath $state) { Remove-Item -LiteralPath $state -Recurse -Force } ' +
+    '}';
+  Result := Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+    '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ' + AddQuotes(Command),
+    '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  if Result then Result := ResultCode = 0;
+  if Result then Result := RemoveDataDirectory(ExpandConstant('{commonappdata}\SunPack'));
+end;
 
-  if not Exec(
-    PowerShellPath,
-    Parameters,
-    '',
-    SW_HIDE,
-    ewWaitUntilTerminated,
-    ResultCode
-  ) then
-    Log('Failed to query the existing SunPack Watch state before upgrade.');
-
-  Result := RegQueryStringValue(HKLM, SunPackRegistryKey, UpgradeWatchStateDirValueName, WatchStateDir);
-  RegDeleteValue(HKLM, SunPackRegistryKey, UpgradeWatchStateDirValueName);
-  Result := Result and (WatchStateDir <> '') and ((ResultCode = 0) or (ResultCode = 1));
-  if not Result then
-  begin
-    Log(Format('Existing SunPack Watch state query failed with exit code %d.', [ResultCode]));
-    Exit;
-  end;
-
-  Log('Existing SunPack Watch state directory: ' + WatchStateDir);
-  WatchRunning := ResultCode = 0;
-  if WatchRunning then
-    Log('Existing SunPack Watch is running and will be restored after upgrade.')
-  else
-    Log('Existing SunPack Watch is not running; upgrade will leave it stopped.');
+function ExistingLauncherPath: string;
+begin
+  Result := AddBackslash(ExistingApplicationDirectory) + 'bin\sunpack.exe';
+  if not FileExists(Result) then
+    Result := AddBackslash(ExistingApplicationDirectory) + 'sunpack.exe';
 end;
 
 function RunContextMenuScript(RegisterMenu: Boolean): Boolean;
@@ -593,8 +590,8 @@ var
 begin
   Result := True;
   CliAppPath := ExistingLauncherPath;
-  RuntimeAppPath := ExpandConstant('{app}\sunpack-runtime.exe');
-  GuiAppPath := ExpandConstant('{app}\SunPackGUI.exe');
+  RuntimeAppPath := AddBackslash(ExistingApplicationDirectory) + 'sunpack-runtime.exe';
+  GuiAppPath := AddBackslash(ExistingApplicationDirectory) + 'SunPackGUI.exe';
   if (not FileExists(CliAppPath)) and (not FileExists(RuntimeAppPath)) and (not FileExists(GuiAppPath)) then
     Exit;
   PowerShellPath := ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe');
@@ -630,140 +627,6 @@ begin
   Result := WaitForExistingRuntimesToExit;
 end;
 
-function IsPersistentProgramDataFile(const FileName: string): Boolean;
-begin
-  Result :=
-    (CompareText(FileName, 'sunpack_config.json') = 0) or
-    (CompareText(FileName, 'sunpack_watch_roots.txt') = 0) or
-    (CompareText(FileName, 'builtin_passwords.txt') = 0) or
-    (CompareText(FileName, 'builtin_passwords.json') = 0);
-end;
-
-function ClearDirectory(Path: string): Boolean;
-var
-  SearchPath: string;
-  ItemPath: string;
-  FindData: TFindRec;
-begin
-  Result := True;
-  if not DirExists(Path) then
-    Exit;
-
-  SearchPath := AddBackslash(Path) + '*';
-  if not FindFirst(SearchPath, FindData) then
-    Exit;
-  try
-    repeat
-      if (FindData.Name <> '.') and (FindData.Name <> '..') then
-      begin
-        ItemPath := AddBackslash(Path) + FindData.Name;
-        if DirExists(ItemPath) then
-        begin
-          if not DelTree(ItemPath, True, True, True) and DirExists(ItemPath) then
-          begin
-            Log('Failed to remove old SunPack directory: ' + ItemPath);
-            Result := False;
-          end;
-        end
-        else if not DeleteFile(ItemPath) and FileExists(ItemPath) then
-        begin
-          Log('Failed to remove old SunPack file: ' + ItemPath);
-          Result := False;
-        end;
-      end;
-    until not FindNext(FindData);
-  finally
-    FindClose(FindData);
-  end;
-end;
-
-function ClearWatchDurableState(const WatchStateDir: string): Boolean;
-var
-  Patterns: TArrayOfString;
-  Index: Integer;
-  ItemPath: string;
-  FindData: TFindRec;
-begin
-  Result := True;
-  if (WatchStateDir = '') or (not DirExists(WatchStateDir)) then
-    Exit;
-
-  { A configured state directory may also contain user data. Never recurse or remove it. }
-  SetArrayLength(Patterns, 3);
-  Patterns[0] := 'state.json';
-  Patterns[1] := 'state.journal.*.jsonl';
-  Patterns[2] := '.state.json.*.tmp';
-  for Index := 0 to GetArrayLength(Patterns) - 1 do
-  begin
-    if FindFirst(AddBackslash(WatchStateDir) + Patterns[Index], FindData) then
-    begin
-      try
-        repeat
-          ItemPath := AddBackslash(WatchStateDir) + FindData.Name;
-          if not DirExists(ItemPath) then
-          begin
-            if not DeleteFile(ItemPath) and FileExists(ItemPath) then
-            begin
-              Log('Failed to remove old SunPack Watch durable state file: ' + ItemPath);
-              Result := False;
-            end;
-          end;
-        until not FindNext(FindData);
-      finally
-        FindClose(FindData);
-      end;
-    end;
-  end;
-end;
-
-function ClearProgramDataExceptPersistentFiles: Boolean;
-var
-  DataPath: string;
-  SearchPath: string;
-  ItemPath: string;
-  FindData: TFindRec;
-begin
-  Result := True;
-  DataPath := ExpandConstant('{commonappdata}\SunPack');
-  if not DirExists(DataPath) then
-    Exit;
-
-  SearchPath := AddBackslash(DataPath) + '*';
-  if not FindFirst(SearchPath, FindData) then
-    Exit;
-  try
-    repeat
-      if (FindData.Name <> '.') and (FindData.Name <> '..') then
-      begin
-        ItemPath := AddBackslash(DataPath) + FindData.Name;
-        if DirExists(ItemPath) then
-        begin
-          if not DelTree(ItemPath, True, True, True) and DirExists(ItemPath) then
-          begin
-            Log('Failed to remove old SunPack runtime state directory: ' + ItemPath);
-            Result := False;
-          end;
-        end
-        else if not IsPersistentProgramDataFile(FindData.Name) then
-        begin
-          if not DeleteFile(ItemPath) and FileExists(ItemPath) then
-          begin
-            Log('Failed to remove old SunPack runtime state file: ' + ItemPath);
-            Result := False;
-          end;
-        end;
-      end;
-    until not FindNext(FindData);
-  finally
-    FindClose(FindData);
-  end;
-end;
-
-function ClearInstallDirectory: Boolean;
-begin
-  Result := ClearDirectory(ExpandConstant('{app}'));
-end;
-
 procedure AppendTextLine(var Lines: TArrayOfString; const Line: string);
 var
   Index: Integer;
@@ -779,129 +642,6 @@ begin
     RaiseException(Format(CustomMessage('EditableConfigCreateFailed'), [FilePath]));
 end;
 
-function PasswordJsonString(const Value: string): string;
-var
-  Index: Integer;
-  Ch: Char;
-begin
-  Result := '"';
-  for Index := 1 to Length(Value) do
-  begin
-    Ch := Value[Index];
-    if (Ch = '"') or (Ch = '\') then
-      Result := Result + '\' + Ch
-    else if Ord(Ch) < 32 then
-      Result := Result + '\u' + Format('%.4x', [Ord(Ch)])
-    else
-      Result := Result + Ch;
-  end;
-  Result := Result + '"';
-end;
-
-procedure UpgradeEditableData(const AppPath, DataPath: string);
-var
-  ResultCode: Integer;
-begin
-  { Validate any existing password JSON before removing obsolete text files.
-    Reuse the native JSON token editor for config cleanup; no UI is started. }
-  if not Exec(AddBackslash(AppPath) + 'SunPackGUI.exe',
-    '--upgrade-data ' + AddQuotes(DataPath), DataPath, SW_HIDE,
-    ewWaitUntilTerminated, ResultCode) then
-    RaiseException(Format(CustomMessage('EditableConfigUpgradeFailed'), [DataPath]));
-  if ResultCode <> 0 then
-    RaiseException(Format(CustomMessage('EditableConfigUpgradeFailed'), [DataPath]));
-end;
-
-procedure DeleteLegacyPasswordFiles(const DataPath: string);
-var
-  OldPath: string;
-begin
-  OldPath := AddBackslash(DataPath) + 'builtin_passwords.txt';
-  if FileExists(OldPath) and not DeleteFile(OldPath) then
-    RaiseException(Format(CustomMessage('EditableConfigUpgradeFailed'), [OldPath]));
-  if FileExists(OldPath + '.bak') and not DeleteFile(OldPath + '.bak') then
-    RaiseException(Format(CustomMessage('EditableConfigUpgradeFailed'), [OldPath + '.bak']));
-end;
-
-procedure EnsurePasswordJson(const DataPath: string);
-var
-  TargetPath, OldPath, Value, Passwords, History: string;
-  RawText: AnsiString;
-  Decoded: string;
-  LegacyLines: TStringList;
-  Lines, Output: TArrayOfString;
-  Index, BlockBegin, BlockEnd: Integer;
-begin
-  TargetPath := AddBackslash(DataPath) + 'builtin_passwords.json';
-  if FileExists(TargetPath) then
-  begin
-    DeleteLegacyPasswordFiles(DataPath);
-    Exit;
-  end;
-  OldPath := AddBackslash(DataPath) + 'builtin_passwords.txt';
-  Passwords := '';
-  History := '';
-  if FileExists(OldPath) then
-  begin
-    if not LoadStringFromFile(OldPath, RawText) then
-      RaiseException(Format(CustomMessage('EditableConfigCreateFailed'), [OldPath]));
-    Decoded := Utf8Decode(RawText);
-    if Pos(#0, Decoded) > 0 then
-      RaiseException('Password values cannot contain NUL.');
-    for Index := 1 to Length(Decoded) do
-      case Ord(Decoded[Index]) of
-        11, 12, 28, 29, 30, 133, 8232, 8233: Decoded[Index] := #10;
-      end;
-    LegacyLines := TStringList.Create;
-    try
-      LegacyLines.Text := Decoded;
-      SetArrayLength(Lines, LegacyLines.Count);
-      for Index := 0 to LegacyLines.Count - 1 do
-        Lines[Index] := LegacyLines.Strings[Index];
-    finally
-      LegacyLines.Free;
-    end;
-    BlockBegin := -1;
-    BlockEnd := -1;
-    for Index := 0 to GetArrayLength(Lines) - 1 do
-    begin
-      if (BlockBegin < 0) and (Lines[Index] = WatchClipboardBlockBegin) then
-        BlockBegin := Index
-      else if (BlockBegin >= 0) and (BlockEnd < 0) and (Lines[Index] = WatchClipboardBlockEnd) then
-        BlockEnd := Index;
-    end;
-    for Index := 0 to GetArrayLength(Lines) - 1 do
-    begin
-      Value := Lines[Index];
-      if (Value <> '') and (Value <> WatchClipboardBlockBegin) and (Value <> WatchClipboardBlockEnd) and
-         (Value <> '# Built-in common password list. You can edit this file; use one password per line.') and
-         (Value <> '# 此文件为内置高频密码配置表，用户可自行编辑，每行一个密码。') and
-         (Value <> '# The following section is managed automatically by SunPack Watch.') and
-         (Value <> '# 以下区域由 SunPack Watch 自动维护，请勿手动编辑。') then
-      begin
-        if (BlockBegin >= 0) and (BlockEnd > BlockBegin) and (Index > BlockBegin) and (Index < BlockEnd) then
-        begin
-          if History <> '' then History := History + ',';
-          History := History + PasswordJsonString(Value);
-        end
-        else
-        begin
-          if Passwords <> '' then Passwords := Passwords + ',';
-          Passwords := Passwords + '{"value":' + PasswordJsonString(Value) + '}';
-        end;
-      end;
-    end;
-  end
-  else
-    Passwords := '{"value":"123456"},{"value":"123"},{"value":"0000"},{"value":"789"}';
-  SetArrayLength(Output, 1);
-  Output[0] := '{"passwords":[' + Passwords + '],"clipboard_history":[' + History + ']}';
-  SaveUTF8TextLines(TargetPath + '.tmp', Output);
-  if not RenameFile(TargetPath + '.tmp', TargetPath) then
-    RaiseException(Format(CustomMessage('EditableConfigCreateFailed'), [TargetPath]));
-  DeleteLegacyPasswordFiles(DataPath);
-end;
-
 procedure EnsureLocalizedEditableConfigFiles;
 var
   DataPath: string;
@@ -912,9 +652,6 @@ begin
   if not ForceDirectories(DataPath) then
     RaiseException(Format(CustomMessage('EditableConfigCreateFailed'), [DataPath]));
   SecurePasswordDataDirectory(DataPath);
-
-  UpgradeEditableData(ExpandConstant('{app}'), DataPath);
-  EnsurePasswordJson(DataPath);
 
   FilePath := AddBackslash(DataPath) + 'sunpack_watch_roots.txt';
   if not FileExists(FilePath) then
@@ -929,32 +666,7 @@ begin
 end;
 
 var
-  ExistingInstallation: Boolean;
-  RestartWatchAfterUpgrade: Boolean;
-  ExistingWatchStateDir: string;
   StartupTaskDefaultApplied: Boolean;
-
-procedure RestoreWatchAfterUpgrade;
-var
-  ResultCode: Integer;
-begin
-  if not RestartWatchAfterUpgrade then
-    Exit;
-
-  if not Exec(
-    ExpandConstant('{app}\sunpack-runtime.exe'),
-    '--launch-watch-unelevated',
-    ExpandConstant('{app}'),
-    SW_HIDE,
-    ewWaitUntilTerminated,
-    ResultCode
-  ) then
-    Log('Failed to run the unelevated SunPack Watch restore helper after upgrade.')
-  else if ResultCode <> 0 then
-    Log(Format('SunPack Watch restore helper exited with code %d.', [ResultCode]))
-  else
-    Log('SunPack Watch was restored after upgrade.');
-end;
 
 procedure ApplyStartupTaskDefault;
 var
@@ -966,6 +678,11 @@ begin
 
   if HasExplicitTaskSelection then
     Exit;
+  if InstalledDataRequiresReset then
+  begin
+    WizardSelectTasks('addtopath,contextmenu,!autostart');
+    Exit;
+  end;
   if not FileExists(ExistingLauncherPath) then
     Exit;
   if not QueryOriginalUserStartupEnabled(Enabled) then
@@ -1015,17 +732,6 @@ end;
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
   ApplyStartupTaskDefault;
-  ExistingInstallation := FileExists(ExistingLauncherPath);
-  RestartWatchAfterUpgrade := False;
-  ExistingWatchStateDir := '';
-  if ExistingInstallation then
-  begin
-    if not QueryExistingWatchState(ExistingWatchStateDir, RestartWatchAfterUpgrade) then
-    begin
-      Result := CustomMessage('PrepareWatchStateQueryFailed');
-      Exit;
-    end;
-  end;
   if not StopExistingProcessesAndWait then
   begin
     Result := CustomMessage('PrepareRuntimeRunning');
@@ -1036,17 +742,22 @@ begin
     Result := CustomMessage('PrepareBrokerRemoveFailed');
     Exit;
   end;
-  if not ClearWatchDurableState(ExistingWatchStateDir) then
+  if not RemoveMachinePath(ExistingApplicationDirectory) then
   begin
-    Result := CustomMessage('PrepareOldFilesRemoveFailed');
+    Result := CustomMessage('TaskAddToPathFailed');
     Exit;
   end;
-  if not ClearProgramDataExceptPersistentFiles then
+  if InstalledDataRequiresReset then
   begin
-    Result := CustomMessage('PrepareOldFilesRemoveFailed');
-    Exit;
+    Log('Removing pre-1.2.0 or unversioned SunPack data for a fresh installation.');
+    if not RemoveInstalledData then
+    begin
+      Result := CustomMessage('PrepareOldFilesRemoveFailed');
+      Exit;
+    end;
   end;
-  if not ClearInstallDirectory then
+  if not RemoveDataDirectory(ExistingApplicationDirectory) or
+     not RemoveDataDirectory(ExpandConstant('{app}')) then
   begin
     Result := CustomMessage('PrepareOldFilesRemoveFailed');
     Exit;
@@ -1082,20 +793,18 @@ begin
       RaiseException(CustomMessage('ToastRegisterLaunchFailed'))
     else if ResultCode <> 0 then
       RaiseException(Format(CustomMessage('ToastRegisterCommandFailed'), [ResultCode]));
-    if ExistingInstallation or WizardIsTaskSelected('contextmenu') then
+    if not RunContextMenuScript(False) then
+      RaiseException(CustomMessage('TaskContextMenuRemoveFailed'));
+    if WizardIsTaskSelected('contextmenu') then
     begin
-      if not RunContextMenuScript(False) then
-        RaiseException(CustomMessage('TaskContextMenuRemoveFailed'));
       if not RunContextMenuScript(True) then
         RaiseException(CustomMessage('TaskContextMenuFailed'));
     end;
-    if InstallerOwnsMachinePath or ((not ExistingInstallation) and WizardIsTaskSelected('addtopath')) then
+    if WizardIsTaskSelected('addtopath') then
     begin
       if not AddMachinePath then
         RaiseException(CustomMessage('TaskAddToPathFailed'));
     end;
-    if ExistingInstallation then
-      RestoreWatchAfterUpgrade;
     ApplySelectedStartupState;
   end;
 end;
@@ -1106,6 +815,6 @@ begin
   begin
     StopAndDeleteBrokerService;
     RunContextMenuScript(False);
-    RemoveMachinePath;
+    RemoveMachinePath(ExpandConstant('{app}'));
   end;
 end;

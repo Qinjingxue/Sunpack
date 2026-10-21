@@ -358,10 +358,10 @@ export default {
       if(!index) { index=new Map(); for(let field of fields) if(this.isRange(field)) index.set(field.id,field); rangeIndexes.set(fields,index); }
       return index.get(f.id)||f;
     },
-    rangeValue(f) { return (this.drafts[f.id]&&this.drafts[f.id].range)||this.rangeField(f).range||{enabled:false,matchNone:false,lower:'',upper:'',lowerUnit:0,upperUnit:0}; },
+    rangeValue(f) { return (this.drafts[f.id]&&this.drafts[f.id].range)||this.rangeField(f).range||{enabled:false,lower:'',upper:'',lowerUnit:0,upperUnit:0}; },
     changeRange(f,key,value,commit) {
       f=this.rangeField(f);
-      let range=Object.assign({},this.rangeValue(f),key==='reset'?{matchNone:false,lower:'',upper:'',lowerUnit:0,upperUnit:0}:{[key]:value});
+      let range=Object.assign({},this.rangeValue(f),{[key]:value});
       let text=JSON.stringify(range);
       this.changeField(f,text);
       // Preserve incomplete/invalid input and selected units until save succeeds.
@@ -369,7 +369,6 @@ export default {
       this.drafts=Object.assign({},this.drafts,{[f.id]:Object.assign({},d,{range:range})});
       if(commit) this.commitField(f);
     },
-    resetRange(f) { this.changeRange(f,'reset',null,true); },
     pickedRange(p) { let f=this.fields.find(f=>f.id===p.id); if(f) this.changeRange(f,p.side,p.value,true); },
     changeField(f,value) {
       f=this.fields.find(current=>current.id===f.id)||f;
@@ -811,8 +810,7 @@ export default {
             <!-- Range modules have one draft and one atomic save target. -->
             <div v-if="isRange(f)" class="range-editor">
               <div class="action-row"><toggle :id="'range-enabled-'+f.id" :checked="rangeValue(f).enabled" @change="v=>changeRange(f,'enabled',v,true)"/><label>{{ texts.rangeEnable }}</label></div>
-              <div v-show="rangeValue(f).matchNone" class="action-row"><label>{{ texts.rangeMatchNone }}</label><button :id="'range-reset-'+f.id" @click="resetRange(f)">{{ texts.rangeReset }}</button></div>
-              <div :enabled="!rangeValue(f).matchNone" class="column">
+              <div class="column">
                 <label class="muted">{{ f.editor==='datetime_range'?texts.rangeTimeHint:texts.rangeHint }}</label>
                 <div class="range-pair">
                   <div :id="'range-lower-group-'+f.id" :class="f.editor==='datetime_range'?'range-group range-time':'range-group'">

@@ -461,10 +461,8 @@ class WatchService:
             next_scheduler_run: float | None = 0.0
             active_scheduler = None
             while not self._stop_requested:
-                # Use the event-loop clock for scheduling.  Keeping this clock
-                # separate from the legacy control-bridge module clock is
-                # important for async callers (and makes injected control
-                # event timing unable to perturb asyncio's own timers).
+                # Schedule against the event-loop clock so wall-clock changes
+                # cannot perturb pending work or asyncio timers.
                 now = self._loop.time()
                 if self.scheduler is not None:
                     if self.scheduler is not active_scheduler:

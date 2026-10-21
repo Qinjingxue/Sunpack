@@ -12,8 +12,6 @@ void validate_passwords(const Json& document);
 bool password_matches_scope(const Json& record, const std::string& scope);
 void save_config_field(const fs::path& path, const std::string& pointer, const std::string& original,
     const std::string& type, const std::string& text, bool boolean);
-// Installer-only upgrade: remove retired fields without reserializing user values.
-void upgrade_config_file(const fs::path& path);
 // original is the exact selected record, not an index that external edits can move.
 void edit_password(const fs::path& path, const std::string& operation, const Json& original,
     const Json& replacement, const std::string& scope = {});

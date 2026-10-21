@@ -66,22 +66,16 @@ class SizeRangeScanFilter:
 UINT64_MAX = (1 << 64) - 1
 
 
-def validate_range_fields(config: dict[str, Any], bounds: tuple[str, str]) -> bool:
-    unknown = config.keys() - {"name", "enabled", "match_none", *bounds}
+def validate_range_fields(config: dict[str, Any], bounds: tuple[str, str]) -> None:
+    unknown = config.keys() - {"name", "enabled", *bounds}
     if unknown:
         raise ValueError(f"Unknown range filter fields: {', '.join(sorted(unknown))}")
-    for key in ("enabled", "match_none"):
-        if key in config and type(config[key]) is not bool:
-            raise ValueError(f"{key} must be a boolean")
-    match_none = config.get("match_none", False)
-    if match_none and any(config.get(key) is not None for key in bounds):
-        raise ValueError("match_none requires empty bounds")
-    return match_none
+    if "enabled" in config and type(config["enabled"]) is not bool:
+        raise ValueError("enabled must be a boolean")
 
 
 def size_bounds(config: dict[str, Any]) -> NumericRange:
-    if validate_range_fields(config, ("min_bytes", "max_bytes")):
-        return NumericRange(gt=0, lt=0)
+    validate_range_fields(config, ("min_bytes", "max_bytes"))
     lower, upper = (config.get(key) for key in ("min_bytes", "max_bytes"))
     for value in (lower, upper):
         if value is not None and (type(value) is not int or not 0 <= value <= UINT64_MAX):

@@ -4,25 +4,13 @@
       "zh": "启用此过滤器",
       "en": "Enable this filter"
     },
-    "rangeMatchNone": {
-      "zh": "当前条件不会匹配任何文件。",
-      "en": "This filter matches no files."
-    },
-    "rangeReset": {
-      "zh": "重置范围",
-      "en": "Reset range"
-    },
     "rangeFormat": {
-      "zh": "范围配置格式已更新，请通过安装器升级旧配置。",
-      "en": "The range format has changed. Upgrade old configuration through the installer."
+      "zh": "范围配置只能包含启用状态和结构化上下限。",
+      "en": "Range configuration accepts only enabled state and structured bounds."
     },
     "rangeAtomic": {
       "zh": "范围过滤器必须作为完整模块保存。",
       "en": "Save the range filter as a complete module."
-    },
-    "rangeMigration": {
-      "zh": "无法迁移旧范围配置，原文件保持不变。",
-      "en": "Cannot migrate the legacy range. The original file was preserved."
     },
 
     "opRangeDate": {
@@ -545,10 +533,6 @@
     "guiArguments": {
       "zh": "参数：--data-dir <目录> --cli <可执行文件> [--cli-prefix <单个参数>]...",
       "en": "Arguments: --data-dir <folder> --cli <executable> [--cli-prefix <argument>]..."
-    },
-    "upgradeArguments": {
-      "zh": "参数：--upgrade-data <数据目录>",
-      "en": "Arguments: --upgrade-data <data folder>"
     },
     "programDataUnavailable": {
       "zh": "无法确定 ProgramData",

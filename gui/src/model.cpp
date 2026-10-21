@@ -1,6 +1,5 @@
 #include "model.hpp"
 #include "range_editor.hpp"
-#include "range_migration.hpp"
 #include "presentation.hpp"
 #include <algorithm>
 #include <chrono>
@@ -66,9 +65,7 @@ std::string pointer_escape(const std::string& key) {
 struct JsonTokens {
     const std::string& source;
     size_t at=0;
-    bool collect_members=false;
     std::unordered_map<std::string,std::pair<size_t,size_t>> ranges;
-    std::unordered_map<std::string,std::pair<size_t,size_t>> members;
     void space() { while(at<source.size() && (source[at]==' ' || source[at]=='\t' || source[at]=='\r' || source[at]=='\n')) ++at; }
     void string() {
         ++at;
@@ -83,7 +80,7 @@ struct JsonTokens {
                 auto key=parse_json(source.substr(begin,at-begin)).get<std::string>();
                 auto child=path+"/"+pointer_escape(key);
                 space(); ++at; value(child);
-                if(collect_members) members[child]={begin,at-begin}; space();
+                space();
                 if(source.at(at)!=',') break; ++at; space();
             }
             ++at;
@@ -98,7 +95,7 @@ struct JsonTokens {
         else while(at<source.size() && std::string(",]} \t\r\n").find(source[at])==std::string::npos) ++at;
         ranges[path]={start,at-start};
     }
-    explicit JsonTokens(const std::string& text,bool properties=false):source(text),collect_members(properties) { if(text.rfind("\xef\xbb\xbf",0)==0) at=3; value(""); }
+    explicit JsonTokens(const std::string& text):source(text) { if(text.rfind("\xef\xbb\xbf",0)==0) at=3; value(""); }
     std::string token(const std::string& path) const { auto r=ranges.at(path); return source.substr(r.first,r.second); }
 };
 std::string text_at(HANDLE f, uint64_t offset, size_t count) {
@@ -248,64 +245,8 @@ void save_config_field(const fs::path& p,const std::string& pointer,const std::s
     FileMutex lock(p);
     atomic_write(p,patch_config(read_file(p),Json::array({Json{{"pointer",pointer},{"original",original},{"type",type},{"text",text},{"boolean",boolean}}})));
 }
-void upgrade_config_file(const fs::path& path) {
-    FileMutex lock(path);
-    if(!fs::exists(path)) return;
-    auto source=read_file(path);
-    auto document=parse_json(source);
-    if(!document.is_object()) throw std::runtime_error("configObjectRequired");
-    bool changed=false;
-    // Resolve every replacement before the single final write. Unknown JSON
-    // outside these module tokens retains its original text and precision.
-    const auto filters=Json::json_pointer("/filesystem/scan_filters");
-    if(document.contains(filters) && document.at(filters).is_array()) {
-        JsonTokens tokens(source);
-        struct Replacement {size_t at,length;std::string text;}; std::vector<Replacement> replacements;
-        const auto& modules=document.at(filters);
-        for(size_t i=0;i<modules.size();++i) {
-            const auto& old=modules[i];
-            if(!old.is_object() || !old.contains("name") || (old["name"]!="size_range" && old["name"]!="mtime_range")) continue;
-            const auto pointer="/filesystem/scan_filters/"+std::to_string(i); Json replacement;
-            if(migrate_range_module(old,replacement,[&](const std::string& key){return tokens.token(pointer+"/"+pointer_escape(key));})) {
-                auto span=tokens.ranges.at(pointer); replacements.push_back({span.first,span.second,replacement.dump()});
-            }
-        }
-        for(auto it=replacements.rbegin();it!=replacements.rend();++it) source.replace(it->at,it->length,it->text);
-        if(!replacements.empty()) {changed=true;document=parse_json(source);}
-    }
-    auto erase_member=[&](const std::string& pointer) {
-        JsonTokens tokens(source,true);
-        auto range=tokens.members.at(pointer);
-        size_t begin=range.first, end=range.first+range.second, next=end;
-        auto whitespace=[](char c){return c==' ' || c=='\t' || c=='\r' || c=='\n';};
-        while(next<source.size() && whitespace(source[next])) ++next;
-        if(next<source.size() && source[next]==',') end=next+1;
-        else {
-            auto previous=begin;
-            while(previous && whitespace(source[previous-1])) --previous;
-            if(previous && source[previous-1]==',') begin=previous-1;
-        }
-        source.erase(begin,end-begin); changed=true;
-    };
-    // Removed by the structured-password refactor after the dev branch was
-    // created. These paths are migration data, never GUI field aliases.
-    const std::pair<const char*,std::vector<const char*>> retired[]={
-        {"watch",{"directory_password_file_auto_create","password_retry_include_subtree"}},
-        {"passwords",{"directory_passwords_enabled","directory_passwords_max_file_bytes","directory_passwords_max_password_length"}}
-    };
-    for(auto& section:retired) {
-        if(!document.contains(section.first) || !document[section.first].is_object()) continue;
-        auto& object=document[section.first]; bool removed=false;
-        for(auto field:section.second) if(object.contains(field)) {
-            erase_member(std::string("/")+section.first+"/"+field);
-            object.erase(field); removed=true;
-        }
-        if(removed && object.empty()) { erase_member(std::string("/")+section.first); document.erase(section.first); }
-    }
-    if(changed) { parse_json(source); atomic_write(path,source); }
-}
 // Scope identity and ancestry match the runtime's directory-scoped lookup.
-// Only values touched by this edit are normalized; unrelated legacy entries
+// Only values touched by this edit are normalized; unrelated entries
 // and significant password whitespace remain intact.
 static Json deduplicate_passwords(Json& records, const std::unordered_set<std::string>& values, size_t target, size_t existing_count) {
     struct Scope { Json path; bool other = false; };

@@ -6,6 +6,8 @@ Edit `sunpack_config.json` to change everyday settings. When running from source
 
 Objects are merged by field, and `filesystem.scan_filters` entries are merged by `name`. Other arrays are replaced as a whole. Watch reloads configuration changes automatically.
 
+When installing over a version below 1.2.0, the installer removes the application directory, `%ProgramData%\SunPack`, and any configured custom Watch state directory before installing fresh defaults. All settings, passwords, monitored roots, logs, and state are deleted. Unrecognized or missing installed versions use the same reset policy. Reinstalling 1.2.0 or newer preserves the data directory; application files and advanced defaults are replaced.
+
 Check your changes and view the resulting configuration:
 
 ```powershell
@@ -55,13 +57,26 @@ Set `filesystem.scan_filters_enabled` to `false` to turn off all scan filters. T
 
 Available filters are `directory_prune` (skip directories), `whitelist` (include selected paths, names, or extensions), `blacklist` (exclude them), `size_range`, and `mtime_range`. Edit their fields in `sunpack_config.json`; the shipped `sunpack_advanced_config.json` shows the expected shapes. Extension filters can hide archives with disguised names.
 
+Size bounds are inclusive integer bytes from 0 to 18446744073709551615. Equal bounds select one exact size. Time bounds use UTC minute strings in `YYYY-MM-DDTHH:mmZ` format, including the start and excluding the end. `null` leaves that side unbounded; specify both bounds explicitly to override defaults. For example:
+
+```json
+{
+  "filesystem": {
+    "scan_filters": [
+      {"name": "size_range", "enabled": true, "min_bytes": 1, "max_bytes": null},
+      {"name": "mtime_range", "enabled": true, "start_utc": "2024-01-01T00:00Z", "end_utc": "2027-01-01T00:00Z"}
+    ]
+  }
+}
+```
+
+The GUI edits time in the Windows local time zone and saves UTC. Size units accept decimals with exact byte rounding. Expressions, field aliases, and second/subsecond timestamps are not accepted; runtime configuration migration is not provided.
+
 ## Watch and passwords
 
 Add a monitored directory with `python sunpack.py watch add C:\Downloads`. Use `-o E:\Output` to choose its output directory, or set `watch.out_dir` for roots without one. `watch list` shows the configured roots. Watch monitors files directly in each root, not its subdirectories.
 
 Persistent passwords come only from `builtin_passwords.json`, including its `clipboard_history`. Add records with `value` to `passwords`; optional `scopes` lists absolute directories and applies to their descendants too. Omit `scopes` for global passwords. Runtime sources are explicit input (`-p`, `--pw-file`, or the password prompt) and the current clipboard.
-
-Legacy `sunpack-passwords.txt` files are no longer read automatically. Add any passwords you still need to the JSON file yourself.
 
 ```json
 {

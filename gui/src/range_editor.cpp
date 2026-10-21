@@ -2,7 +2,6 @@
 #include <algorithm>
 #include <limits>
 #include <cstdio>
-#include <set>
 
 namespace spg {
 namespace {
@@ -106,10 +105,9 @@ void validate_range_module(const Json& module,bool datetime) {
     if(!module.is_object() || module.value("name",std::string())!=(datetime?"mtime_range":"size_range")) throw std::runtime_error("validation");
     const std::string low=datetime?"start_utc":"min_bytes", high=datetime?"end_utc":"max_bytes";
     for(auto it=module.begin();it!=module.end();++it)
-        if(it.key()!="name" && it.key()!="enabled" && it.key()!="match_none" && it.key()!=low && it.key()!=high) throw std::runtime_error("rangeFormat");
-    for(auto key:{"enabled","match_none"}) if(module.contains(key) && !module[key].is_boolean()) throw std::runtime_error("validation");
+        if(it.key()!="name" && it.key()!="enabled" && it.key()!=low && it.key()!=high) throw std::runtime_error("rangeFormat");
+    if(module.contains("enabled") && !module["enabled"].is_boolean()) throw std::runtime_error("validation");
     Json lower=module.value(low,Json()),upper=module.value(high,Json());
-    if(module.value("match_none",false) && (!lower.is_null() || !upper.is_null())) throw std::runtime_error("validation");
     for(auto& value:{lower,upper}) if(!value.is_null()) {
         if(datetime) { if(!value.is_string()) throw std::runtime_error("rangeDate"); range_utc_minutes(value.get<std::string>()); }
         else if(!value.is_number_unsigned() && !(value.is_number_integer() && value.get<int64_t>()>=0)) throw std::runtime_error("rangeNumber");
@@ -120,7 +118,7 @@ void validate_range_module(const Json& module,bool datetime) {
 }
 Json range_editor(const Json& module,const DYNAMIC_TIME_ZONE_INFORMATION* zone) {
     bool datetime=module.value("name",std::string())=="mtime_range"; validate_range_module(module,datetime);
-    Json result={{"enabled",module.value("enabled",false)},{"matchNone",module.value("match_none",false)},{"lower",""},{"upper",""},{"lowerUnit",0},{"upperUnit",0}};
+    Json result={{"enabled",module.value("enabled",false)},{"lower",""},{"upper",""},{"lowerUnit",0},{"upperUnit",0}};
     for(auto side:{"lower","upper"}) {
         auto value=module.value(datetime?(std::string(side)=="lower"?"start_utc":"end_utc"):(std::string(side)=="lower"?"min_bytes":"max_bytes"),Json());
         if(value.is_null()) continue;
@@ -139,8 +137,7 @@ Json range_configuration(const Json& form,bool datetime,const DYNAMIC_TIME_ZONE_
     Json result={{"name",datetime?"mtime_range":"size_range"},{"enabled",form.at("enabled")}};
     const std::string low=datetime?"start_utc":"min_bytes",high=datetime?"end_utc":"max_bytes";
     result[low]=Json(); result[high]=Json();
-    if(form.at("matchNone").get<bool>()) result["match_none"]=true;
-    else for(auto side:{"lower","upper"}) {
+    for(auto side:{"lower","upper"}) {
         if(trim(form.at(side).get<std::string>()).empty()) continue;
         auto key=std::string(side)=="lower"?low:high;
         result[key]=datetime?Json(time_value(form,side,zone)):Json(size_value(form.at(side),form.at(std::string(side)+"Unit"),std::string(side)=="lower"));

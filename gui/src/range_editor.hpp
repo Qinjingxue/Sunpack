@@ -2,7 +2,7 @@
 #include "model.hpp"
 
 namespace spg {
-// Structured configuration only. Legacy interpretation belongs to the installer.
+// Structured configuration only.
 Json range_editor(const Json& module, const DYNAMIC_TIME_ZONE_INFORMATION* zone = nullptr);
 Json range_configuration(const Json& form, bool datetime, const DYNAMIC_TIME_ZONE_INFORMATION* zone = nullptr);
 void validate_range_module(const Json& module, bool datetime);

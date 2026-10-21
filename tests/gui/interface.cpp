@@ -557,14 +557,6 @@ void range_config(Application& app,const fs::path& dir) {
     assert(read_json(dir/"sunpack_config.json")[Json::json_pointer(id)]["min_bytes"]==8388608);
     input("range-lower-"+id,L"6"); finish_input(app);
     assert(read_json(dir/"sunpack_config.json")[Json::json_pointer(id)]["min_bytes"]==6291456);
-    config=read_json(dir/"sunpack_config.json");
-    config[Json::json_pointer(id)]={{"name","size_range"},{"enabled",true},{"min_bytes",Json()},{"max_bytes",Json()},{"match_none",true}};
-    atomic_write(dir/"sunpack_config.json",config.dump());
-    pump([&]{return field("size_range")["range"]["matchNone"]==true;},"Empty migrated range reload");
-    ui_window_relayout(app.window());
-    click(app,("range-reset-"+id).c_str()); finish_input(app);
-    pump([&]{return field("size_range")["range"]["matchNone"]==false;},"Empty range reset");
-    assert(bound("size_range","min_bytes").is_null() && bound("size_range","max_bytes").is_null());
     search_config(app,L"mtime_range");
     input("range-lower-"+tid,L"2023-02-29 00:00"); ui_window_focus_widget(app.window(),0);
     pump([&]{return state(app.page(),"saveErrors").contains(tid);},"Leap date validation");

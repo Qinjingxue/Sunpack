@@ -364,56 +364,6 @@ void localization(Fixture& fixture) {
     assert(startup_language(data)=="zh");
     atomic_write(data/"sunpack_config.json","{"); assert(startup_language(data)=="en");
 }
-void installer_upgrade(Fixture& fixture) {
-    auto path=fixture.dir/"upgrade.json";
-    const std::string keep=R"("advanced":{"integer":123456789012345678901234567890,"text":"directory_password_file_auto_create"})";
-    const std::vector<std::string> inputs={
-        R"({"watch":{"directory_password_file_auto_create":true,"password_retry_include_subtree":false}})",
-        R"({"passwords":{"directory_passwords_enabled":true,"directory_passwords_max_file_bytes":1048576,"directory_passwords_max_password_length":512},"watch":{"directory_password_file_auto_create":false}})",
-        "{\"watch\":{\"directory_password_file_auto_create\":true,\"quiet_max_seconds\":13,\"password_retry_include_subtree\":false},"+keep+"}",
-        "{\"passwords\":{\"clipboard_passwords_enabled\":true,\"directory_passwords_enabled\":false,\"directory_passwords_max_file_bytes\":1,\"directory_passwords_max_password_length\":1},"+keep+"}"
-    };
-    for(auto& input:inputs) {
-        atomic_write(path,input); upgrade_config_file(path);
-        auto output=read_file(path); auto config=parse_json(output);
-        assert(!config.contains(Json::json_pointer("/watch/directory_password_file_auto_create")));
-        assert(!config.contains(Json::json_pointer("/watch/password_retry_include_subtree")));
-        for(auto name:{"directory_passwords_enabled","directory_passwords_max_file_bytes","directory_passwords_max_password_length"})
-            assert(!config.contains(Json::json_pointer(std::string("/passwords/")+name)));
-        if(config.contains("advanced")) assert(output.find(keep)!=std::string::npos);
-        if(config.contains("watch")) assert(config["watch"]["quiet_max_seconds"]==13);
-        if(config.contains("passwords")) assert(config["passwords"]["clipboard_passwords_enabled"]==true);
-        upgrade_config_file(path); assert(read_file(path)==output);
-    }
-    const std::vector<std::pair<std::string,Json>> ranges={
-        {R"({"name":"size_range","enabled":true,"range":"r > 0 B"})",Json{{"min_bytes",1},{"max_bytes",Json()}}},
-        {R"({"name":"size_range","range":"r >= 2 MiB","gt":2097152,"greater_than":99999999,"max":3000000})",Json{{"min_bytes",2097153},{"max_bytes",3000000}}},
-        {R"({"name":"size_range","range":"r == 1024","eq":2048,"min":2000})",Json{{"min_bytes",2048},{"max_bytes",2048}}},
-        {R"({"name":"size_range","range":"10 > r > 0 < r","gt":null,"greater_than":100})",Json{{"min_bytes",1},{"max_bytes",9}}},
-        {R"({"name":"size_range","range":"r < 100 B","lte":50,"less_than_or_equal":2})",Json{{"min_bytes",Json()},{"max_bytes",50}}},
-        {R"({"name":"size_range","range":"","gte":9007199254740993,"eq":18446744073709551615})",Json{{"min_bytes",std::numeric_limits<uint64_t>::max()},{"max_bytes",std::numeric_limits<uint64_t>::max()}}},
-        {R"({"name":"size_range","range":null})",Json{{"min_bytes",Json()},{"max_bytes",Json()}}},
-        {R"({"name":"size_range","range":"r > 18446744073709551615"})",Json{{"match_none",true}}},
-        {R"({"name":"mtime_range","date":"d > 2024-01-01T12:30:25Z"})",Json{{"start_utc","2024-01-01T12:30Z"},{"end_utc",Json()}}},
-        {R"({"name":"mtime_range","date":"d == 2024-01-01T00:00+08:00"})",Json{{"start_utc","2023-12-31T16:00Z"},{"end_utc","2023-12-31T16:01Z"}}},
-        {R"({"name":"mtime_range","date":"d >= 2024-01-01T12:30:00Z","before":1704112260000000000})",Json{{"start_utc","2024-01-01T12:30Z"},{"end_utc","2024-01-01T12:31Z"}}},
-        {R"({"name":"mtime_range","date":"20200101 > d > 20260101"})",Json{{"match_none",true}}},
-    };
-    for(auto& scenario:ranges) {
-        auto source="{\"filesystem\":{\"scan_filters\":["+scenario.first+"]},"+keep+"}";
-        atomic_write(path,source); upgrade_config_file(path); auto first=read_file(path);auto upgraded=read_json(path)["filesystem"]["scan_filters"][0];
-        for(auto it=scenario.second.begin();it!=scenario.second.end();++it) assert(upgraded[it.key()]==it.value());
-        auto datetime=upgraded["name"]=="mtime_range";
-        assert(upgraded.contains(datetime?"start_utc":"min_bytes") && upgraded.contains(datetime?"end_utc":"max_bytes"));
-        validate_range_module(upgraded,datetime);
-        assert(first.find(keep)!=std::string::npos); upgrade_config_file(path); assert(read_file(path)==first);
-    }
-    auto invalid=std::string(R"({"filesystem":{"scan_filters":[{"name":"size_range","range":"r > 0"},{"name":"mtime_range","date":"broken"}]}})");
-    atomic_write(path,invalid); fails([&]{upgrade_config_file(path);}); assert(read_file(path)==invalid);
-    // Retained advanced values are not normalized or reformatted on upgrade.
-    atomic_write(path,kDefaultsJson); upgrade_config_file(path); assert(read_file(path)==kDefaultsJson);
-    atomic_write(path,"{invalid}"); fails([&]{upgrade_config_file(path);}); assert(read_file(path)=="{invalid}");
-}
 void roots(Fixture& f) {
     auto p=f.dir/"sunpack_watch_roots.txt";
     atomic_write(p,"# 保留注释\n"+utf8(f.dir.wstring())+" | relative | false\n"+utf8(f.dir.wstring())+" | 末条 | TRUE\n");
@@ -575,7 +525,7 @@ int wmain(int argc,wchar_t** argv) {
         time["lower"]="2024-02-29 12:34";time["upper"]="2027-01-01 00:00";
         std::cout<<Json{{"size",range_configuration(size,false)},{"time",range_configuration(time,true,&east)}}.dump(); return 0;
     }
-    try { Fixture f; projection(f); logical_projection(f); editing(f); roots(f); range_editing(f); localization(f); installer_upgrade(f); batch_editing(f); service_notifications(); std::cout<<"GUI file contracts passed\n"; }
+    try { Fixture f; projection(f); logical_projection(f); editing(f); roots(f); range_editing(f); localization(f); batch_editing(f); service_notifications(); std::cout<<"GUI file contracts passed\n"; }
     catch(const std::exception& e) { std::cerr<<e.what()<<"\n"; return 1; }
     CliCommand cli{executable_path(),fs::temp_directory_path(),{L"--echo"}};
     Handle stop(CreateEventW(nullptr,TRUE,FALSE,nullptr));

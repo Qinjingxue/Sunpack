@@ -105,7 +105,8 @@ def test_structured_filter_protocol_rejects_old_and_invalid_fields():
         for config in invalid:
             with pytest.raises(ValueError):
                 cls.from_config(config)
-        assert not cls.from_config({"match_none": True}).value_range.allows(0)
+        with pytest.raises(ValueError):
+            cls.from_config({"match_none": True})
         assert cls.from_config({}).value_range.allows(None)
     point = SizeRangeScanFilter.from_config({"min_bytes": (1 << 64) - 1, "max_bytes": (1 << 64) - 1}).value_range
     assert point.allows((1 << 64) - 1) and not point.allows((1 << 64) - 2)
