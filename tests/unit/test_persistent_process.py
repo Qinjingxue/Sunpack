@@ -801,7 +801,6 @@ def test_persistent_runtime_reuses_engine_for_request_only_config(monkeypatch):
 
     monkeypatch.setattr(persistent_runtime, "PipelineEngine", FakeEngine)
     monkeypatch.setattr(persistent_runtime, "config_source_key", lambda: ("same", None, None))
-    persistent_runtime.enable_persistent_runtime()
     first = {
         "output": {"root": "one", "common_root": "a"},
         "cli": {"quiet": True},
@@ -943,4 +942,54 @@ def test_persistent_runtime_interrupted_initialization_releases_owner(monkeypatc
                 await closing
             await persistent_runtime.close_persistent_runtime()
 
+    asyncio.run(scenario())
+
+
+def test_cli_password_snapshot_hot_updates_without_watch_or_request_io(tmp_path, monkeypatch):
+    # Unique coverage: the CLI-only server observes JSON events, pins requests and releases its observer.
+    import sunpack.core.passwords.internal.builtin as builtin
+    from sunpack.runtime.cli import persistent_runtime
+    from tests.helpers.passwords import write_password_json
+    path = tmp_path / "builtin_passwords.json"
+    write_password_json(path, ["before"])
+    monkeypatch.setattr(builtin, "builtin_password_path", lambda: path)
+    async def scenario():
+        await persistent_runtime.close_persistent_runtime()
+        persistent_runtime.enable_persistent_runtime()
+        source = builtin.password_file_source()
+        changed = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        reload = source.reload
+        def observed_reload():
+            previous = source.snapshot
+            updated = reload()
+            if updated is not previous:
+                loop.call_soon_threadsafe(changed.set)
+            return updated
+        monkeypatch.setattr(source, "reload", observed_reload)
+        reads = []
+        read = builtin.read_shared_utf8_text
+        def record(*args, **kwargs):
+            reads.append(args[0])
+            return read(*args, **kwargs)
+        monkeypatch.setattr(builtin, "read_shared_utf8_text", record)
+        try:
+            pinned = persistent_runtime.load_request_config()["password_snapshot"]
+            persistent_runtime.load_request_config()
+            assert reads == []
+            temp = path.with_suffix(".tmp")
+            write_password_json(temp, ["after"])
+            temp.replace(path)
+            await asyncio.wait_for(changed.wait(), 5)
+            assert pinned.global_passwords == ("before",)
+            assert persistent_runtime.load_request_config()["password_snapshot"].global_passwords == ("after",)
+            changed.clear()
+            path.unlink()
+            await asyncio.wait_for(changed.wait(), 5)
+            assert not persistent_runtime.load_request_config()["password_snapshot"].global_passwords
+            assert not path.exists()
+        finally:
+            await persistent_runtime.close_persistent_runtime()
+        assert persistent_runtime._PASSWORD_OBSERVER is None
+        assert persistent_runtime._PASSWORD_RELOAD_TASK is None
     asyncio.run(scenario())

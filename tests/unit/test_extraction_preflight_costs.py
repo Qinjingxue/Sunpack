@@ -19,7 +19,7 @@ def test_successful_first_attempt_does_not_query_python_free_space(tmp_path):
         emit_semantic_event=lambda *_args, **_kwargs: None,
     )
     extractor = SingleArchiveExtractor(
-        password_store=SimpleNamespace(has_candidates=lambda: False),
+        password_store=SimpleNamespace(has_candidates=lambda **_kwargs: False),
         password_resolver=SimpleNamespace(password_tester=SimpleNamespace(passwords=[])),
         metadata_scanner=SimpleNamespace(scan_for_task=lambda *_args, **_kwargs: SimpleNamespace(selected_codepage=None, error=None)),
         retry_policy=SimpleNamespace(max_retries=1),

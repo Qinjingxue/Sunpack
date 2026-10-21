@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tests.helpers.passwords import write_password_json
+
 import sunpack.core.passwords.internal.builtin as builtin_module
 import sunpack.core.passwords.internal.clipboard as clipboard_module
 import sunpack.core.passwords.internal.clipboard_monitor as clipboard_monitor_module
@@ -8,13 +10,8 @@ from sunpack.core.passwords.internal.clipboard_monitor import _WindowsClipboardL
 
 
 def test_clipboard_monitor_persists_clipboard_passwords_and_notifies(tmp_path, monkeypatch):
-    builtin_path = tmp_path / "builtin_passwords.txt"
-    builtin_path.write_text(
-        "existing\n"
-        f"{builtin_module.WATCH_CLIPBOARD_BLOCK_BEGIN}\n"
-        f"{builtin_module.WATCH_CLIPBOARD_BLOCK_END}\n",
-        encoding="utf-8",
-    )
+    builtin_path = tmp_path / "builtin_passwords.json"
+    write_password_json(builtin_path, ["existing"])
     monkeypatch.setattr(builtin_module, "builtin_password_path", lambda: builtin_path)
     monkeypatch.setattr(
         clipboard_module,
@@ -26,19 +23,18 @@ def test_clipboard_monitor_persists_clipboard_passwords_and_notifies(tmp_path, m
     notifications = []
 
     monitor = ClipboardPasswordMonitor(
-        on_passwords_changed=notifications.append,
         max_entries=30,
         enabled=True,
     )
 
     monitor._handle_clipboard_update()
 
-    passwords = builtin_module.get_builtin_passwords()
-    assert notifications == ["clipboard"]
+    passwords = list(builtin_module.password_file_source().reload().global_passwords)
+    assert notifications == []
     assert "existing" in passwords
     assert passwords == ["existing"] + [f"clip-{index}" for index in range(5, 35)]
     monitor._handle_clipboard_update()
-    assert notifications == ["clipboard"]
+    assert notifications == []
 
 
 def test_windows_clipboard_loop_reads_current_clipboard_after_listener_registration():
@@ -156,13 +152,8 @@ def test_windows_clipboard_loop_unregisters_class_before_releasing_wndproc():
 
 
 def test_clipboard_monitor_persists_multiline_text(tmp_path, monkeypatch):
-    builtin_path = tmp_path / "builtin_passwords.txt"
-    original = (
-        "existing\n"
-        f"{builtin_module.WATCH_CLIPBOARD_BLOCK_BEGIN}\n"
-        f"{builtin_module.WATCH_CLIPBOARD_BLOCK_END}\n"
-    )
-    builtin_path.write_text(original, encoding="utf-8")
+    builtin_path = tmp_path / "builtin_passwords.json"
+    write_password_json(builtin_path, ["existing"])
     monkeypatch.setattr(builtin_module, "builtin_password_path", lambda: builtin_path)
     monkeypatch.setattr(
         clipboard_module,
@@ -172,15 +163,14 @@ def test_clipboard_monitor_persists_multiline_text(tmp_path, monkeypatch):
 
     notifications = []
     monitor = ClipboardPasswordMonitor(
-        on_passwords_changed=notifications.append,
         max_entries=30,
         enabled=True,
     )
 
     monitor._handle_clipboard_update()
 
-    assert builtin_module.get_builtin_passwords() == ["existing", "first line", "second line"]
-    assert notifications == ["clipboard"]
+    assert builtin_module.password_file_source().reload().global_passwords == ("existing", "first line", "second line")
+    assert notifications == []
 
     persisted = builtin_path.read_text(encoding="utf-8")
     monkeypatch.setattr(
@@ -190,4 +180,4 @@ def test_clipboard_monitor_persists_multiline_text(tmp_path, monkeypatch):
     )
     monitor._handle_clipboard_update()
     assert builtin_path.read_text(encoding="utf-8") == persisted
-    assert notifications == ["clipboard"]
+    assert notifications == []

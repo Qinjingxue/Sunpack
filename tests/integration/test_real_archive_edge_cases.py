@@ -39,7 +39,7 @@ def edge_config(passwords: list[str] | None = None, *, allow_partial: bool = Fal
         {"name": "seven_zip_structure", "enabled": True},
         {"name": "rar_structure", "enabled": True},
     ], precheck=[
-        {"name": "size_range", "enabled": True, "gte": 0},
+        {"name": "size_range", "enabled": True, "min_bytes": 0},
         {"name": "zip_structure_accept", "enabled": True},
         {"name": "tar_structure_accept", "enabled": True},
         {"name": "seven_zip_structure_accept", "enabled": True},

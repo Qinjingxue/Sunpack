@@ -74,7 +74,8 @@ def test_extract_config_combines_clipboard_passwords_for_engine():
     )
     config = extract._extract_run_config({}, password_summary)
 
-    assert config["user_passwords"] == ["cli-secret", "shared-secret", "clipboard-secret"]
+    assert config["user_passwords"] == ["cli-secret", "shared-secret"]
+    assert config["clipboard_passwords"] == ["clipboard-secret", "shared-secret"]
 
 
 def test_extract_preserves_scan_failure_when_target_succeeds(tmp_path, monkeypatch):

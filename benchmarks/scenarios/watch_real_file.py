@@ -72,7 +72,7 @@ def _phase_seconds(profiler: RequestRuntimeProfiler) -> dict[str, float]:
 
 
 def _output_summary(root: Path, source_name: str) -> dict[str, Any]:
-    excluded = {source_name, "sunpack-passwords.txt", "state.json", "events.jsonl"}
+    excluded = {source_name, "state.json", "events.jsonl"}
     files = [
         path
         for path in root.rglob("*")

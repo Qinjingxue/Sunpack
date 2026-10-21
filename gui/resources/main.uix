@@ -1,0 +1,910 @@
+<window title="SunPack" width="1120" height="720" min-width="850" min-height="560" centered="true" frameless="false"/>
+<script>
+// Weak keys let snapshots/filter changes release their old row index. Values
+// reference the existing rows; no second projection or resident row copy.
+const taskIndexes=new WeakMap();
+// Loop event closures can retain the previous row object after a snapshot.
+// Resolve the two range fields from the current snapshot without retaining it.
+const rangeIndexes=new WeakMap();
+const passwordIndexes=new WeakMap();
+function taskBefore(a,b) {
+  return a.sortTimestamp>b.sortTimestamp ||
+    (a.sortTimestamp===b.sortTimestamp && a.sortSequence>b.sortSequence);
+}
+function taskPosition(rows,row) {
+  let lo=0,hi=rows.length;
+  while(lo<hi) { let mid=(lo+hi)>>>1; if(taskBefore(rows[mid],row)) lo=mid+1; else hi=mid; }
+  return lo;
+}
+export default {
+  data() { return {
+    tab:'tasks',theme:'system',themeChoice:0,appearance:'light',language:'en',texts:{},dispatch:false,requests:[],ready:false,busy:false,
+    actionError:'',lastCommand:{},errors:{},logPath:'',cliAllowed:false,runtime:{known:false,running:false},
+    tasks:{rows:[],total:0,malformed:0},passwords:{rows:[],total:0},fields:[],directories:[],
+    startup:{enabled:false,command:''},directoryQuery:'',
+    taskQuery:'',taskRoot:'',taskStatus:0,
+    statusNames:['','taskProcessing','taskWaiting','taskSucceeded','taskFailed'],
+    rootRows:[],rootDrafts:{},rootNew:[],rootCell:'',rootPart:'',rootNext:0,rootQuery:'',cellPointer:null,
+    configCategory:'',configQuery:'',drafts:{},toggleDrafts:{},saving:false,saveErrors:{},closeError:'',pendingFields:[],recordSaving:{passwords:false,roots:false},
+    passwordRoot:'',passwordHistory:false,passwordHistoryTarget:false,passwordQuery:'',passwordDrafts:{},passwordNew:[],passwordCell:'',passwordNext:0,
+    tagInputs:{}
+  }; },
+  computed: {
+    passwordScope() { return this.passwordHistoryTarget?'@history':this.passwordRoot||'@all'; },
+    directorySelection() { return this.tab==='passwords'?this.passwordRoot:this.taskRoot; },
+    rootDirty() { return Object.values(this.rootDrafts).some(d=>!d.original&&!d.pending&&(d.input.length||d.output.length)); },
+    shownRootRows() {
+      let q=this.rootQuery.toLowerCase(),rows=this.rootNew.concat(this.rootRows),ids=new Set(rows.map(r=>r.id));
+      for(let d of Object.values(this.rootDrafts)) if(!ids.has(d.id)&&(d.pending||d.error||this.rootCell===d.id)) rows.push(d);
+      return rows.filter(r=>{let d=this.rootDraft(r);return r.id===this.rootCell||d.pending||d.error||!q||(d.input+' '+d.output).toLowerCase().includes(q);});
+    },
+    errorList() { return Object.keys(this.errors).map(k=>k+': '+this.errors[k]); },
+    shownDirectories() { let q=this.directoryQuery.toLowerCase(); return this.directories.filter(d=>d.watch&&d.path.toLowerCase().indexOf(q)>=0); },
+    shownPasswords() {
+      if(this.passwordHistory) return this.passwords.rows;
+      let saved=this.passwords.scope===(this.passwordRoot||'@all')?this.passwords.rows:[],ids=passwordIndexes.get(saved);
+      if(!ids) { ids=new Set(saved.map(p=>p.id)); passwordIndexes.set(saved,ids); }
+      let extra=this.passwordNew.filter(p=>p.scope===this.passwordRoot&&!ids.has(p.id)),rows=extra.length?extra.concat(saved):saved;
+      for(let id of Object.keys(this.passwordDrafts)) {
+        let d=this.passwordDrafts[id];
+        if((d.original||d.historyValue===undefined)&&d.scope===this.passwordRoot&&!ids.has(id)&&!extra.some(p=>p.id===id)&&(d.pending||d.error||this.passwordCell===id)) rows=rows.concat([d]);
+      }
+      return rows;
+    },
+    categories() { let seen={}; return this.fields.filter(f=>{ if(seen[f.category]) return false; seen[f.category]=true; return true; }).map(f=>({id:f.category,label:f.categoryLabel})); },
+    configBlocks() {
+      let groups=[],seen={};
+      this.fields.forEach(f=>{
+        let g=seen[f.block];
+        if(!g) { g={id:f.block,key:f.key,label:f.blockLabel,module:f.module,category:f.category,fields:[],primary:false}; seen[f.block]=g; groups.push(g); }
+        if(f.primary) { g.fields.unshift(f); g.primary=true; } else g.fields.push(f);
+      });
+      return groups;
+    },
+    matchingBlocks() { return this.configBlocks.filter(g=>(!this.configCategory||g.category===this.configCategory)&&(!this.configQuery.trim()||this.matchesConfig([g.label,...g.fields.map(f=>this.configText(f))].join(' ')))); },
+    showStartupSetting() { return !this.configCategory&&this.matchesConfig([this.texts.startup,this.startup.enabled?this.texts.startupOff:this.texts.startupOn].join(' ')); },
+    showThemeSetting() { return !this.configCategory&&this.matchesConfig([this.texts.theme,this.texts.system,this.texts.light,this.texts.dark].join(' ')); },
+  },
+  methods: {
+    matchesConfig(text) { return !this.configQuery.trim()||text.toLowerCase().includes(this.configQuery.trim().toLowerCase()); },
+    configText(f) {
+      let t=this.texts,d=this.drafts[f.id]||f,parts=[f.label,f.description,f.categoryLabel,...f.options.map(o=>o.label)];
+      if(f.editor==='text'||f.editor==='recursive') parts.push(d.text);
+      if(f.editor==='recursive') parts.push(t.rounds);
+      if(f.editor==='readonly') parts.push(t.readOnly);
+      if(f.editor==='list') parts.push(t.tagInputPlaceholder,this.tagValues(f).map(v=>this.entryLabel(v)).join(' '));
+      if(this.isRange(f)) {
+        let r=this.rangeValue(f),date=f.editor==='datetime_range';
+        parts.push(t.rangeEnable,date?t.rangeStart:t.rangeMin,date?t.rangeEnd:t.rangeMax,r.lower,r.upper);
+        if(date) parts.push(t.rangePick,t.rangeChoose,'YYYY-MM-DD HH:mm'); else parts.push('B KiB MiB GiB TiB');
+      }
+      return parts.join(' ');
+    },
+    rememberCellPointer(id,part,event) { this.cellPointer=event.button===0?{id:id,part:part,x:event.offsetX}:null; },
+    cellPointerX(id,part) { let p=this.cellPointer; this.cellPointer=null; return p&&p.id===id&&p.part===part?p.x:null; },
+    send(op,payload) {
+      if(op==='cli') { if(this.busy) return; this.busy=true; this.actionError=''; }
+      let requests=op==='filterTasks'||op==='filterPasswords'?this.requests.filter(r=>r.op!==op):this.requests;
+      this.requests=requests.concat([{op:op,payload:payload||{}}]); this.dispatch=true;
+    },
+    go(tab) { this.send('navigate',{tab:tab}); },
+    selectCategory(category) { this.send('animateView',{id:'configBlocks',category:category}); },
+    searchDirectory(value) { this.directoryQuery=value; this.send('scrollTop',{id:'directoryItems'}); },
+    searchConfig(value) { this.configQuery=value; this.send('scrollTop',{id:'configBlocks'}); },
+    searchTasks(value) { this.taskQuery=value; this.filterTasks(); },
+    applyTaskDelta(patch) {
+      if(!patch.changes.length) {
+        if(this.tasks.malformed!==patch.malformed)
+          this.tasks={rows:this.tasks.rows,total:this.tasks.total,malformed:patch.malformed};
+        return;
+      }
+      let rows=this.tasks.rows,index=taskIndexes.get(rows);
+      if(!index) { index=new Map(); for(let row of rows) index.set(row.id,row); taskIndexes.set(rows,index); }
+      let updates=new Map(),order=0;
+      for(let change of patch.changes) {
+        updates.delete(change.id); // iteration order follows the final event
+        updates.set(change.id,{row:change.row||null,order:order++});
+      }
+      // Small deltas touch only changed rows. The index holds row references,
+      // so moving a row never requires rebuilding thousands of ID positions.
+      if(updates.size<=32) {
+        let copied=false;
+        updates.forEach((update,id)=>{
+          let old=index.get(id),next=update.row;
+          if(old) {
+            let pos=taskPosition(rows,old);
+            while(pos<rows.length && rows[pos]!==old) ++pos; // equal sort keys
+            if(next && (pos===0 || taskBefore(rows[pos-1],next)) &&
+               (pos+1===rows.length || !taskBefore(rows[pos+1],next))) {
+              rows[pos]=next; index.set(id,next); return;
+            }
+            if(!copied) { rows=rows.slice(); copied=true; }
+            rows.splice(pos,1); index.delete(id);
+          }
+          if(next) {
+            if(!copied) { rows=rows.slice(); copied=true; }
+            rows.splice(taskPosition(rows,next),0,next); index.set(id,next);
+          }
+        });
+        // core-ui observes the top-level state write; keep untouched row
+        // objects, then notify bindings once per batch. A positional change
+        // gets a new array so VirtualList also invalidates measured heights.
+        if(copied) taskIndexes.set(rows,index);
+        this.tasks={rows:rows,total:rows.length,malformed:patch.malformed};
+        return;
+      }
+      // Large batches use a linear merge instead of shifting the list once
+      // per change.
+      rows=rows.filter(row=>!updates.has(row.id));
+      let added=[];
+      updates.forEach((update,id)=>{ index.delete(id); if(update.row) { added.push(update); index.set(id,update.row); } });
+      added.sort((a,b)=>{
+        if(a.row.sortTimestamp!==b.row.sortTimestamp) return a.row.sortTimestamp>b.row.sortTimestamp?-1:1;
+        if(a.row.sortSequence!==b.row.sortSequence) return a.row.sortSequence>b.row.sortSequence?-1:1;
+        return b.order-a.order;
+      });
+      let merged=[],i=0,j=0;
+      while(i<rows.length&&j<added.length) {
+        let old=rows[i],next=added[j].row;
+        let oldBefore=old.sortTimestamp>next.sortTimestamp ||
+          (old.sortTimestamp===next.sortTimestamp && old.sortSequence>next.sortSequence);
+        if(oldBefore) merged.push(rows[i++]); else merged.push(added[j++].row);
+      }
+      while(i<rows.length) merged.push(rows[i++]);
+      while(j<added.length) merged.push(added[j++].row);
+      taskIndexes.set(merged,index);
+      this.tasks={rows:merged,total:merged.length,malformed:patch.malformed};
+    },
+    applyPasswordDelta(patch) {
+      if(patch.scope!==this.passwordScope) return;
+      // The writer already committed a verified replacement. Keep the rest of
+      // the saved-password list (and its mounted virtual rows) intact.
+      let rows=this.passwords.rows.slice();
+      let i=rows.findIndex(row=>row.original===patch.original);
+      if(i<0) { this.filterPasswords(); return; } // Recover from stale UI state.
+      let replacement=patch.row;
+      replacement.id=rows[i].id;
+      rows[i]=replacement;
+      this.passwords={rows:rows,total:rows.length,scope:patch.scope};
+    },
+    applyPasswords(snapshot) {
+      if(snapshot.scope!==this.passwordScope) return;
+      // Own save receipts rebase drafts before snapshots arrive. Preserve the
+      // mounted row/input, including focus and measured height, across renames.
+      let order=this.passwordNew.concat(this.passwords.rows),ids=new Map(),reserved=new Set();
+      let remember=(original,id)=>{ let group=ids.get(original); if(!group) { group={ids:[],next:0}; ids.set(original,group); } group.ids.push(id); };
+      for(let id of Object.keys(this.passwordDrafts)) { let d=this.passwordDrafts[id]; if(d.original&&d.scope===this.passwordRoot) { remember(d.original,id); reserved.add(id); } }
+      if(this.passwords.scope===snapshot.scope) for(let p of this.passwords.rows) if(p.original&&!reserved.has(p.id)) remember(p.original,p.id);
+      for(let p of snapshot.rows) if(p.original) {
+        let group=ids.get(p.original);
+        p.id=group&&group.next<group.ids.length?group.ids[group.next++]:'saved-'+(++this.passwordNext);
+      }
+      if(snapshot.scope!=='@history') {
+        // Own save receipts must not move a new row from the top to the end
+        // while the same mouse gesture selects another row or directory.
+        let byId=new Map(snapshot.rows.map(p=>[p.id,p])),rows=[];
+        for(let id of Object.keys(this.passwordDrafts)) {
+          let d=this.passwordDrafts[id];
+          if(d.historyValue===undefined&&d.scope===this.passwordRoot&&!byId.has(id)&&!d.original&&(d.pending||d.error||this.passwordCell===id)) byId.set(id,d);
+        }
+        for(let previous of order) if(byId.has(previous.id)) {
+          let current=byId.get(previous.id); byId.delete(previous.id);
+          rows.push(current.original&&current.original===previous.original?previous:current);
+        }
+        for(let current of byId.values()) rows.push(current);
+        snapshot.rows=rows;
+      }
+      this.passwords=snapshot;
+      this.passwordHistory=snapshot.scope==='@history';
+    },
+    searchPasswords(value) { this.passwordQuery=value; this.filterPasswords(); },
+    filterTasks() { this.send('filterTasks',{query:this.taskQuery,root:this.taskRoot,status:this.statusNames[this.taskStatus]||''}); },
+    selectRoot(path) { this.taskRoot=path; this.filterTasks(); },
+    filterPasswords() { this.send('filterPasswords',{query:this.passwordQuery,scope:this.passwordScope}); },
+    selectPasswordView(history) {
+      if(this.passwordHistoryTarget===history) return;
+      this.finishPasswordCell(); this.passwordHistoryTarget=history; this.filterPasswords();
+    },
+    selectDirectory(path) {
+      if(this.tab!=='passwords') { this.selectRoot(path); return; }
+      this.finishPasswordCell(); this.passwordRoot=path;
+      if(!this.passwordHistoryTarget) this.filterPasswords();
+    },
+    syncPasswordDirectory() {
+      if(this.passwordRoot&&!this.directories.some(d=>d.watch&&d.path===this.passwordRoot)) {
+        this.finishPasswordCell(); this.passwordRoot='';
+        if(!this.passwordHistoryTarget) this.filterPasswords();
+      }
+    },
+    errorText(error) { return error && typeof error==='object' ? error.text : (this.texts[error]||error); },
+    setSaveError(key,message) { let errors=Object.assign({},this.saveErrors); if(message) errors[key]=message; else delete errors[key]; this.saveErrors=errors; },
+    rootDraft(r) { return this.rootDrafts[r.id]||r; },
+    rootValue(d) { return {input:d.input,output:d.output,deep:d.deep}; },
+    rootDraftState(r) { return Object.assign({},r,{expected:r.original?{output:r.output,deep:r.deep}:null,baseline:JSON.stringify(this.rootValue(r)),pending:false,error:'',submitted:''}); },
+    putRootDraft(d) { this.rootDrafts=Object.assign({},this.rootDrafts,{[d.id]:d}); },
+    ensureRootDraft(r) {
+      let d=this.rootDrafts[r.id];
+      if(!d) { r=this.rootRows.find(current=>current.id===r.id)||this.rootNew.find(current=>current.id===r.id)||r; d=this.rootDraftState(r); this.putRootDraft(d); }
+      return d;
+    },
+    makeRoot(input,output,deep) { return {id:'root-'+(++this.rootNext),original:'',input:input,output:output,deep:deep}; },
+    addRoot() {
+      this.finishRootCell(); this.rootQuery='';
+      let r=this.makeRoot('','',false); this.rootNew=[r].concat(this.rootNew); this.ensureRootDraft(r);
+      this.rootCell=r.id; this.rootPart='input'; this.send('focusRoot',{id:r.id,part:'input',top:true});
+    },
+    searchRoots(value) { this.finishRootCell(); this.rootQuery=value; this.send('scrollTop',{id:'rootItems'}); },
+    applyDirectories(snapshot) {
+      let previous=this.rootNew.concat(this.rootRows),identities=new Map();
+      for(let r of previous) if(r.original) identities.set(r.identity,r.id);
+      for(let d of Object.values(this.rootDrafts)) if(d.original) identities.set(d.identity,d.id);
+      let rows=snapshot.filter(d=>d.watch).map(d=>({id:identities.get(d.id)||'root-'+(++this.rootNext),identity:d.id,original:d.path,input:d.path,output:d.output,deep:d.deep}));
+      let order=new Map(previous.map((r,i)=>[r.id,i]));
+      rows.sort((a,b)=>(order.has(a.id)?order.get(a.id):previous.length)-(order.has(b.id)?order.get(b.id):previous.length));
+      let ids=new Set(rows.map(r=>r.id)); this.rootNew=this.rootNew.filter(r=>!ids.has(r.id)); this.rootRows=rows; this.directories=snapshot;
+      this.syncPasswordDirectory();
+      if(this.taskRoot&&!snapshot.some(d=>d.watch&&d.path===this.taskRoot)) { this.taskRoot=''; this.filterTasks(); }
+    },
+    beginRoot(r,part) {
+      if(this.rootCell===r.id&&this.rootPart===part) return;
+      this.finishRootCell(); this.ensureRootDraft(r); this.rootCell=r.id; this.rootPart=part;
+      this.send('focusRoot',{id:r.id,part:part,pointerX:this.cellPointerX(r.id,part)});
+    },
+    changeRoot(r,part,value) {
+      let d=Object.assign({},this.ensureRootDraft(r),{[part]:value,error:''});
+      if(!/[\r\n]/.test(value)) {
+        if(part==='input'&&!d.original&&(!d.output||d.output===this.rootDraft(r).input)) d.output=value;
+        this.putRootDraft(d); return;
+      }
+      let lines=value.split(/\r\n|\r|\n/).map(v=>v.trim()).filter(v=>v.length),rows=[];
+      if(!lines.length) { d[part]=''; this.putRootDraft(d); this.finishRootCell(); return; }
+      if(part==='input') {
+        if(!d.original&&(!d.output||d.output===this.rootDraft(r).input)) d.output=lines[0];
+        d.input=lines[0]; rows.push(d);
+        let extra=lines.slice(1).map(input=>this.makeRoot(input,input,d.deep)); this.rootNew=this.rootNew.concat(extra); rows=rows.concat(extra);
+      } else {
+        let current=this.shownRootRows,start=current.findIndex(p=>p.id===r.id),extra=[];
+        for(let i=0;i<lines.length;i++) {
+          let row=current[start+i]; if(!row) { row=this.makeRoot('',lines[i],false); extra.push(row); }
+          rows.push(Object.assign({},this.rootDrafts[row.id]||this.rootDraftState(row),{output:lines[i],error:''}));
+        }
+        this.rootNew=this.rootNew.concat(extra);
+      }
+      let drafts=Object.assign({},this.rootDrafts);
+      for(let row of rows) drafts[row.id]=Object.assign({},drafts[row.id]||this.rootDraftState(row),row);
+      this.rootDrafts=drafts;
+      this.rootCell=''; this.rootPart=''; this.send('focusRoot',{id:r.id,part:'none'}); this.commitRoots(rows);
+    },
+    commitRoots(rows,remove) {
+      let edits=[],snapshot=[],drafts=Object.assign({},this.rootDrafts),discard=[];
+      for(let row of rows) {
+        let d=Object.assign({},drafts[row.id]||this.rootDraftState(row));
+        d.input=d.input.trim(); d.output=d.output.trim();
+        let deleting=!!remove||!d.input;
+        if(deleting&&!d.original&&!d.pending) {
+          if(!remove&&d.output) drafts[d.id]=Object.assign({},d,{error:'rootsEmpty'});
+          else discard.push(d.id);
+          continue;
+        }
+        let value=this.rootValue(d),sent=JSON.stringify({value:value,remove:deleting});
+        if(d.pending&&d.submitted===sent) continue;
+        if(!deleting&&d.original&&!d.pending&&!d.error&&JSON.stringify(value)===d.baseline) { drafts[d.id]=d; continue; }
+        drafts[d.id]=Object.assign({},d,{pending:true,error:'',submitted:sent});
+        snapshot.push({id:d.id,value:value,remove:deleting});
+        edits.push({row:d.id,operation:deleting?'delete':d.original?'save':'addMany',original:d.original,input:d.input||d.original,inputs:[d.input],output:d.output,deep:d.deep,expected:d.expected});
+      }
+      this.rootDrafts=drafts;
+      for(let id of discard) this.discardRoot(id);
+      if(edits.length) this.send('saveRecord',{kind:'roots',key:edits[0].row,edits:edits,snapshot:snapshot});
+      this.pruneRootDrafts();
+    },
+    finishRootCell() {
+      let id=this.rootCell; if(!id) return;
+      this.rootCell=''; this.rootPart=''; let d=this.rootDrafts[id]; if(d) this.commitRoots([d]);
+      this.send('focusRoot',{id:id,part:'none'});
+    },
+    blurRoot(r,part) { if(this.rootCell===r.id&&this.rootPart===part) this.send('blurRoot',{id:r.id,part:part}); },
+    browseRoot(r,part) { let d=this.ensureRootDraft(r); this.send('browseRoot',{id:r.id,part:part,value:d[part],input:d.input}); },
+    rootPicked(p) {
+      let d=this.rootDrafts[p.id]; if(!d) return;
+      if(p.value) { this.changeRoot(d,p.part,p.value); if(this.rootCell===p.id) this.finishRootCell(); else this.commitRoots([this.rootDraft(d)]); }
+      else { this.rootCell=d.id; this.rootPart=p.part; this.send('focusRoot',{id:d.id,part:p.part}); }
+    },
+    toggleRoot(r,value) { this.finishRootCell(); let d=Object.assign({},this.ensureRootDraft(r),{deep:value,error:''}); this.putRootDraft(d); this.commitRoots([d]); },
+    deleteListedRoot(r) { if(this.rootCell===r.id) { this.rootCell=''; this.rootPart=''; } this.commitRoots([this.ensureRootDraft(r)],true); },
+    discardRoot(id) {
+      if(this.rootCell===id) { this.rootCell=''; this.rootPart=''; }
+      let drafts=Object.assign({},this.rootDrafts); delete drafts[id]; this.rootDrafts=drafts;
+      this.rootNew=this.rootNew.filter(r=>r.id!==id); this.send('clearRootError',{id:id});
+    },
+    rebaseRootRequests(records) {
+      let index=new Map(records.map(r=>[r.id,r]));
+      this.requests=this.requests.map(request=>{
+        if(request.op!=='saveRecord'||request.payload.kind!=='roots') return request;
+        let edits=request.payload.edits.map(edit=>{
+          let r=index.get(edit.row); if(!r) return edit;
+          return Object.assign({},edit,{original:r.remove?'':r.input,input:edit.operation==='delete'?r.input:edit.input,expected:r.remove?null:{output:r.output,deep:r.deep},operation:edit.operation==='delete'?'delete':r.remove?'addMany':'save'});
+        });
+        return Object.assign({},request,{payload:Object.assign({},request.payload,{edits:edits})});
+      });
+    },
+    rootSaved(ack) {
+      if(ack.ok&&ack.removedPasswordScopes.length) {
+        let removed=new Set(ack.removedPasswordScopes),rebased=new Map(),drafts=Object.assign({},this.passwordDrafts);
+        for(let group of ack.passwordRebases||[]) for(let previous of group.originals) rebased.set(previous,group.record?JSON.stringify(group.record):'');
+        for(let id of Object.keys(drafts)) {
+          let d=drafts[id];
+          if(removed.has(d.scope)) { delete drafts[id]; if(this.passwordCell===id) this.passwordCell=''; }
+          else if(rebased.has(d.original)) drafts[id]=Object.assign({},d,{original:rebased.get(d.original)});
+        }
+        this.passwordDrafts=drafts;
+        this.passwordNew=this.passwordNew.filter(p=>!removed.has(p.scope));
+        this.requests=this.requests.filter(r=>r.op!=='saveRecord'||r.payload.kind!=='passwords'||!removed.has(r.payload.edit.scope)).map(r=>{
+          if(r.op!=='saveRecord'||r.payload.kind!=='passwords'||!rebased.has(r.payload.edit.original)) return r;
+          return Object.assign({},r,{payload:Object.assign({},r.payload,{edit:Object.assign({},r.payload.edit,{original:rebased.get(r.payload.edit.original)})})});
+        });
+      }
+      if(ack.ok) this.rebaseRootRequests(ack.records);
+      let claimed=new Map(this.rootRows.map(r=>[r.identity,r.id])),records=new Map(ack.records.map(r=>[r.id,r]));
+      let drafts=Object.assign({},this.rootDrafts),removed=new Set(),renamed=new Map(),pendingIds=new Set(ack.pending);
+      for(let request of this.requests) if(request.op==='saveRecord'&&request.payload.kind==='roots') for(let edit of request.payload.edits) pendingIds.add(edit.row);
+      for(let sent of ack.snapshot) {
+        let d=drafts[sent.id]; if(!d) continue;
+        let current=this.rootValue(d),pending=pendingIds.has(d.id);
+        d=Object.assign({},d,{pending:pending,error:ack.ok?'':ack.error});
+        if(ack.ok) {
+          let record=records.get(d.id),same=JSON.stringify(current)===JSON.stringify(sent.value);
+          if(record.remove) {
+            removed.add(d.id);
+            if(!pending&&this.rootCell!==d.id&&same) { delete drafts[d.id]; continue; }
+            d.original=''; d.expected=null;
+          } else {
+            let previous=d.original;
+            if(d.identity!==record.identity&&claimed.get(d.identity)===d.id) claimed.delete(d.identity);
+            let duplicate=claimed.has(record.identity)&&claimed.get(record.identity)!==d.id;
+            if(duplicate&&!pending&&this.rootCell!==d.id&&same) { removed.add(d.id); delete drafts[d.id]; continue; }
+            claimed.set(record.identity,d.id);
+            d.original=record.input; d.identity=record.identity; d.expected={output:record.output,deep:record.deep};
+            renamed.set(d.id,{original:record.input,identity:record.identity});
+            if(this.taskRoot===previous&&previous!==record.input) { this.taskRoot=record.input; this.filterTasks(); }
+            if(this.passwordRoot===previous&&previous!==record.input) { this.passwordRoot=record.input; if(!this.passwordHistoryTarget) this.filterPasswords(); }
+            if(same&&this.rootCell!==d.id) Object.assign(d,{input:record.input,output:record.output,deep:record.deep});
+          }
+          d.baseline=JSON.stringify(same?this.rootValue(d):sent.value); d.submitted='';
+        }
+        drafts[d.id]=d;
+      }
+      this.rootDrafts=drafts;
+      this.rootNew=this.rootNew.filter(r=>!removed.has(r.id));
+      this.rootRows=this.rootRows.filter(r=>!removed.has(r.id)).map(r=>renamed.has(r.id)?Object.assign({},r,renamed.get(r.id)):r);
+    },
+    pruneRootDrafts() {
+      let ids=new Set(this.rootRows.map(r=>r.id)),drafts=Object.assign({},this.rootDrafts);
+      for(let d of Object.values(drafts)) if(d.original&&!d.pending&&!d.error&&this.rootCell!==d.id&&ids.has(d.id)&&JSON.stringify(this.rootValue(d))===d.baseline) delete drafts[d.id];
+      this.rootDrafts=drafts;
+    },
+    commitField(f) {
+      let draft=this.drafts[f.id]||this.toggleDrafts[f.id];
+      if(draft) this.send('saveField',{id:f.id,draft:Object.assign({},draft)});
+    },
+    isRange(f) { return f.editor==='size_range'||f.editor==='datetime_range'; },
+    rangeField(f) {
+      let fields=this.fields,index=rangeIndexes.get(fields);
+      if(!index) { index=new Map(); for(let field of fields) if(this.isRange(field)) index.set(field.id,field); rangeIndexes.set(fields,index); }
+      return index.get(f.id)||f;
+    },
+    rangeValue(f) { return (this.drafts[f.id]&&this.drafts[f.id].range)||this.rangeField(f).range||{enabled:false,lower:'',upper:'',lowerUnit:0,upperUnit:0}; },
+    changeRange(f,key,value,commit) {
+      f=this.rangeField(f);
+      let range=Object.assign({},this.rangeValue(f),{[key]:value});
+      let text=JSON.stringify(range);
+      this.changeField(f,text);
+      // Preserve incomplete/invalid input and selected units until save succeeds.
+      let d=this.drafts[f.id]||{original:f.original,text:text,boolean:f.boolean,baselineText:f.text,baselineBoolean:f.boolean};
+      this.drafts=Object.assign({},this.drafts,{[f.id]:Object.assign({},d,{range:range})});
+      if(commit) this.commitField(f);
+    },
+    pickedRange(p) {
+      let f=this.fields.find(f=>f.id===p.id); if(!f) return;
+      this.changeRange(f,p.side,p.value,false);
+      // The popup validates in its opening timezone. Preserve that UTC minute
+      // if the system timezone changes before the asynchronous save completes.
+      let range=this.drafts[f.id].range;
+      range[p.side+'OriginalLocal']=p.value; range[p.side+'Utc']=p.utc;
+      this.commitField(f);
+    },
+    changeField(f,value) {
+      f=this.fields.find(current=>current.id===f.id)||f;
+      let d=this.drafts[f.id]||{original:f.original,text:f.text,boolean:f.boolean,choice:f.choice,baselineText:f.text,baselineBoolean:f.boolean};
+      if(this.saveErrors[f.id]&&this.pendingFields.indexOf(f.id)<0) { d.original=f.original; d.baselineText=f.text; d.baselineBoolean=f.boolean; }
+      d.text=value;
+      delete d.range;
+      let next=Object.assign({},this.drafts);
+      if(d.text===d.baselineText&&this.pendingFields.indexOf(f.id)<0) delete next[f.id]; else next[f.id]=d;
+      this.drafts=next; this.setSaveError(f.id,'');
+    },
+    passwordDraft(p) { return this.passwordDrafts[p.id]||p; },
+    passwordText(p) { return this.passwordDraft(p).value.replace(/[\r\n]/g,' '); },
+    putPasswordDraft(d) { this.passwordDrafts=Object.assign({},this.passwordDrafts,{[d.id]:d}); },
+    ensurePasswordDraft(p) {
+      let d=this.passwordDrafts[p.id];
+      if(!d) { d={id:p.id,original:p.original,value:p.value,scope:this.passwordRoot,pending:false,error:'',submitted:''}; this.putPasswordDraft(d); }
+      return d;
+    },
+    addPassword() {
+      this.finishPasswordCell();
+      let row={id:'new-'+(++this.passwordNext),original:'',value:'',scope:this.passwordRoot};
+      this.passwordHistory=this.passwordHistoryTarget=false; this.passwordQuery=''; this.filterPasswords();
+      this.passwordNew=this.passwordNew.concat([row]); this.ensurePasswordDraft(row);
+      this.passwordCell=row.id; this.send('focusPassword',{id:row.id,part:'value',top:true});
+    },
+    historyDraft(p) {
+      return Object.values(this.passwordDrafts).find(d=>d.historyValue===p.value&&d.scope===this.passwordRoot)||{};
+    },
+    saveHistory(p) {
+      let d=this.historyDraft(p); if(d.pending) return;
+      if(!d.id) d={id:'history-'+(++this.passwordNext),original:'',value:p.value,historyValue:p.value,scope:this.passwordRoot,pending:false,error:'',submitted:''};
+      this.commitPassword(d);
+    },
+    beginPassword(p) {
+      if(this.passwordCell===p.id) return;
+      this.finishPasswordCell(); this.ensurePasswordDraft(p); this.passwordCell=p.id;
+      this.send('focusPassword',{id:p.id,part:'value',pointerX:this.cellPointerX(p.id,'value')});
+    },
+    changePassword(p,value) {
+      let d=Object.assign({},this.ensurePasswordDraft(p),{value:value,batch:/[\r\n]/.test(value),error:''}); this.putPasswordDraft(d);
+      // A paste is one text-change event. Preserve spaces/#, skip blank lines,
+      // and send one atomic batch through the existing password writer.
+      if(/[\r\n]/.test(value)) this.finishPasswordCell();
+    },
+    commitPassword(d,operation) {
+      let values=d.batch?d.value.split(/\r\n|\r|\n/).filter(v=>v.length>0):[d.value];
+      if(operation!=='delete'&&(!d.value.length||!values.length)) {
+        if(!d.original&&!d.pending) { this.send('discardPassword',{id:d.id}); return; }
+        operation='delete';
+      }
+      let scopes=d.scope?[d.scope]:[],snapshot=JSON.stringify({value:d.value,scopes:scopes,operation:operation||'save'});
+      if(d.pending&&d.submitted===snapshot) return;
+      if(operation!=='delete'&&d.original&&!d.pending&&!d.error) {
+        let baseline=JSON.parse(d.original);
+        if(baseline.value===d.value) { this.discardPassword(d.id); return; }
+      }
+      d=Object.assign({},d,{pending:true,error:'',submitted:snapshot}); this.putPasswordDraft(d);
+      this.send('saveRecord',{kind:'passwords',key:d.id,snapshot:snapshot,
+        edit:{operation:operation==='delete'?(d.scope?'removeScope':'delete'):d.original?'replace':'addMany',scope:d.scope,original:d.original,value:values[0]||'',values:values,scopes:scopes}});
+    },
+    finishPasswordCell() {
+      let id=this.passwordCell; if(!id) return;
+      this.passwordCell=''; let d=this.passwordDrafts[id];
+      if(d) this.commitPassword(d);
+      this.send('focusPassword',{id:id,part:'none'});
+    },
+    blurPassword(p) { if(this.passwordCell===p.id) this.finishPasswordCell(); },
+    deleteListedPassword(p) {
+      if(this.passwordCell===p.id) this.passwordCell='';
+      let d=this.ensurePasswordDraft(p);
+      if(!d.original&&!d.pending) { this.discardPassword(p.id); return; }
+      this.commitPassword(d,'delete');
+    },
+    discardPassword(id) {
+      if(this.passwordCell===id) this.passwordCell='';
+      let drafts=Object.assign({},this.passwordDrafts); delete drafts[id]; this.passwordDrafts=drafts;
+      this.passwordNew=this.passwordNew.filter(p=>p.id!==id);
+      this.send('clearPasswordError',{id:id});
+    },
+    rebasePasswordRequests(id,previous,original,removed,sent) {
+      let pending=false,requests=[];
+      for(let r of this.requests) {
+        if(r.op!=='saveRecord'||r.payload.kind!=='passwords'||r.payload.key!==id||r.payload.edit.original!==previous) { requests.push(r); continue; }
+        if(removed&&(r.payload.edit.operation==='delete'||r.payload.edit.operation==='removeScope')) continue;
+        pending=true;
+        let edit=Object.assign({},r.payload.edit,{original:original});
+        if(removed) edit.operation='addMany';
+        else if(edit.operation==='addMany') edit.operation='replace';
+        if(!removed&&sent===JSON.parse(r.payload.snapshot).value&&/[\r\n]/.test(sent)) edit.values=[JSON.parse(original).value];
+        requests.push(Object.assign({},r,{payload:Object.assign({},r.payload,{edit:edit})}));
+      }
+      this.requests=requests; return pending;
+    },
+    passwordSaved(ack) {
+      let identities=new Map();
+      for(let r of ack.rowRebases) for(let previous of r.originals) identities.set(previous,r.original);
+      if(identities.size&&this.passwords.scope===this.passwordScope) {
+        let changed=false,rows=this.passwords.rows.map(row=>{
+          let original=identities.get(row.original); if(!original) return row;
+          changed=true; return Object.assign({},row,{original:original});
+        });
+        if(changed) this.passwords=Object.assign({},this.passwords,{rows:rows});
+      }
+      for(let rebase of ack.rebases) {
+        let draft=this.passwordDrafts[rebase.key]; if(!draft||draft.original!==rebase.previous) continue;
+        let pending=this.rebasePasswordRequests(draft.id,draft.original,rebase.original,rebase.removed)||rebase.pending;
+        let d=Object.assign({},draft,{original:rebase.original,pending:pending});
+        if(rebase.removed&&!pending&&this.passwordCell!==d.id&&d.value===JSON.parse(rebase.previous).value) this.discardPassword(d.id);
+        else this.putPasswordDraft(d);
+      }
+      let d=this.passwordDrafts[ack.key]; if(!d) return;
+      d=Object.assign({},d,{pending:ack.pending,error:ack.ok?'':ack.error});
+      if(ack.ok) {
+        let previous=d.original,sent=JSON.parse(ack.snapshot);
+        // A completion can arrive before the UI's posted dispatch message.
+        // Rebase those requests too, not just the native pending-save queue.
+        d.pending=this.rebasePasswordRequests(d.id,previous,ack.original,ack.removed,sent.value)||d.pending;
+        d.original=ack.original;
+        if(ack.removed&&!d.pending&&this.passwordCell!==d.id&&d.value===sent.value) { this.discardPassword(d.id); return; }
+        if(!ack.removed&&d.value===sent.value) { d.value=JSON.parse(ack.original).value; d.batch=false; }
+        if(d.submitted===ack.snapshot) d.submitted='';
+      }
+      this.putPasswordDraft(d);
+    },
+    prunePasswordDrafts() {
+      this.passwordNew=this.passwordNew.filter(p=>!this.passwordDrafts[p.id]||!this.passwordDrafts[p.id].original);
+      let drafts=Object.assign({},this.passwordDrafts),changed=false;
+      for(let id of Object.keys(drafts)) {
+        let d=drafts[id];
+        if(id===this.passwordCell||d.pending||d.error||!d.original) continue;
+        let baseline=JSON.parse(d.original);
+        if(d.value===baseline.value) { delete drafts[id]; changed=true; }
+      }
+      if(changed) this.passwordDrafts=drafts;
+    },
+    isDirectoryValue(value) { return typeof value==='string'&&/^(?:[a-zA-Z]:[\\/]|[\\/]{2}|\.{1,2}(?:[\\/]|$)|~[\\/])/.test(value); },
+    entryLabel(value) { return value.length?value.split(String.fromCharCode(13)).join('␍').split(String.fromCharCode(10)).join('↵'):this.texts.emptyEntry; },
+    tagField(f) { return this.fields.find(current=>current.id===f.id)||f; },
+    tagValues(f) { f=this.tagField(f); return this.drafts[f.id]?JSON.parse(this.drafts[f.id].text):f.items; },
+    changeTagInput(f,value) { this.tagInputs=Object.assign({},this.tagInputs,{[f.id]:value}); },
+    saveTags(f,values) {
+      f=this.tagField(f); this.changeField(f,JSON.stringify(values));
+      this.send('syncTags',{id:f.id}); this.commitField(f);
+    },
+    addTag(f) {
+      let value=this.tagInputs[f.id]||''; if(!value.length) return;
+      this.saveTags(f,this.tagValues(f).concat([value]));
+      let inputs=Object.assign({},this.tagInputs); delete inputs[f.id]; this.tagInputs=inputs;
+    },
+    removeTag(p) {
+      let f=this.fields.find(f=>f.id===p.id); if(!f||f.editor!=='list') return;
+      let values=this.tagValues(f); if(p.index<0||p.index>=values.length||values[p.index]!==p.value) return;
+      this.saveTags(f,values.filter((value,index)=>index!==p.index));
+    }
+
+  }
+}
+</script>
+<style>
+  .app { flex:1; gap:0px; color:var(--fg); font-size:14px; }
+  .light { background:#f3f3f3; }
+  .dark { background:#202020; }
+  label { display:block; }
+  .navigation { width:280px; flex-shrink:0; padding:16px 12px 8px; gap:4px; }
+  .identity { flex-direction:row; align-items:center; gap:12px; padding:0px 4px 8px; flex-shrink:0; }
+  .monitor-controls { gap:8px; padding:0px 4px 8px; flex-shrink:0; }
+  .monitor-actions button { flex:1; }
+  .app-icon { width:40px; height:40px; flex-shrink:0; }
+  .brand { font-size:20px; font-weight:600; }
+  .nav-item { display:flex; width:100%; flex-direction:row; align-items:center; height:40px; padding:0px 4px; gap:12px; border:0px; border-radius:4px; background:#00000001; color:var(--fg); }
+  .light .nav-item:hover { background:#ebebeb; }
+  .dark .nav-item:hover { background:#2d2d2d; }
+  .light .on { background:#e6e6e6; color:var(--fg); }
+  .dark .on { background:#363636; color:var(--fg); }
+  .nav-icon { width:18px; height:18px; color:var(--fg); }
+  .nav-mark { width:3px; height:16px; }
+  /* Four 40 px entries and three gaps; the overlaid selection indicator
+     must not reserve an additional row below the navigation. */
+  .nav-items { height:172px; gap:4px; flex-shrink:0; }
+  .nav-indicator { position:absolute; left:4px; top:12px; width:3px; height:16px; border-radius:2px; background:var(--accent-text); }
+  .light .nav-indicator { background:#0067c0; }
+  .dark .nav-indicator { background:#60cdff; }
+  .spacer { flex:1; }
+  .body { flex:1; flex-direction:row; }
+  .sidebar { flex:1; padding:20px 8px 0px; gap:8px; }
+  .sidebar-heading { font-size:12px; color:var(--fg-2); padding:0px 4px 4px; }
+  .sidebar button { min-height:32px; }
+  .context-item { display:flex; width:100%; flex-direction:row; align-items:center; padding:7px 12px; gap:10px; border:0px; background:#00000001; color:var(--fg); }
+  .context-item:hover { background:var(--sidebar-hover); }
+  .content { flex:1; padding:24px 28px 24px; gap:16px; }
+  .workspace { flex:1; gap:12px; }
+  .page-header { flex-direction:row; flex-wrap:wrap; align-items:center; gap:12px; padding-bottom:4px; }
+  .row { flex-direction:row; align-items:center; gap:8px; }
+  .column { gap:8px; }
+  .fill { flex:1; }
+  .heading { font-size:28px; font-weight:600; }
+  .subheading { font-size:14px; font-weight:600; }
+  .muted { color:var(--fg-2); font-size:12px; }
+  .small { font-size:12px; }
+  .directory-pane { flex:1; padding:8px 4px 4px; gap:4px; }
+  .directory-tools { gap:8px; flex-shrink:0; }
+  .directory-tools > button { width:100%; flex-shrink:0; }
+  .directory-tools > input { width:100%; }
+  .directory-list { gap:2px; }
+  .directory-list > button { width:100%; flex-shrink:0; }
+  .directory-item { min-height:52px; padding:8px 12px; flex-shrink:0; }
+  .directory-item .column { gap:2px; }
+  .directory-name, .directory-path { white-space:nowrap; }
+  .search-field { placeholder-color:var(--fg-2); }
+  .task-filters { flex-wrap:wrap; }
+  .task-filters input { min-width:180px; }
+  .card { padding:16px 20px; gap:10px; border:1px solid var(--card-border); border-radius:8px; }
+  .settings-row { flex-direction:row; align-items:center; gap:16px; }
+  .setting-copy { flex:1; gap:4px; justify-content:center; }
+  .setting-copy > label { width:100%; flex-shrink:0; }
+  .setting-title { font-size:14px; }
+  .task { padding:10px 14px; gap:4px; border:1px solid var(--card-border); border-radius:8px; }
+  .taskname { flex-shrink:1; background:#00000001; padding:0px; min-height:24px; border:0px; color:var(--fg); font-size:14px; font-weight:600; text-align:left; }
+  .light .taskname:hover { color:#0067c0; }
+  .dark .taskname:hover { color:#60cdff; }
+  .task-meta { align-items:flex-end; }
+  .task-meta .time { flex-shrink:0; white-space:nowrap; }
+  .status { font-size:14px; font-weight:600; padding:4px 10px; border-radius:4px; flex-shrink:0; white-space:nowrap; }
+  .light .status-success { color:#0f6b35; background:#dff6dd; }
+  .dark .status-success { color:#6ccb5f; background:#263c28; }
+  .light .status-waiting { color:#7a4e00; background:#fff4ce; }
+  .dark .status-waiting { color:#fce100; background:#433d24; }
+  .light .status-failure { color:#a4262c; background:#fde7e9; }
+  .dark .status-failure { color:#ff99a4; background:#442726; }
+  .light .status-info { color:#005a9e; background:#e5f1fb; }
+  .dark .status-info { color:#75b6e7; background:#243b50; }
+  .time { color:var(--fg-2); font-size:12px; }
+  .error { color:#d15b48; font-size:12px; width:100%; flex-shrink:0; }
+  .light .card, .task.light, .card.light { background:#fbfbfb; border:1px solid #e5e5e5; }
+  .dark .card, .task.dark, .card.dark { background:#2b2b2b; border:1px solid #303030; }
+  /* Actions keep their intrinsic text width even when a scrollbar appears.
+     Flexible text/inputs yield space; action rows wrap instead of shrinking. */
+  button { padding:6px 12px; border-radius:4px; min-height:32px; flex-shrink:0; cursor:pointer; }
+  toggle { flex-shrink:0; }
+  .action-row { flex-direction:row; flex-wrap:wrap; align-items:center; gap:8px; }
+  .password-toolbar { flex-direction:row; flex-wrap:wrap; align-items:center; gap:16px; }
+  .password-tabs { flex-direction:row; flex-wrap:wrap; align-items:center; gap:8px; }
+  .management-search { width:220px; flex-shrink:0; }
+  input, select { height:32px; }
+  .content > input, .sidebar > input { display:block; width:100%; }
+  textarea { min-height:90px; }
+  /* Core UI scrollbars overlay the viewport (up to 9 px plus a 2 px
+     inset). Reserve 18 px for the bar and shadows in every scroll pane. */
+  ScrollView { flex:1; padding:2px 18px 6px 2px; }
+  .setting-control { width:220px; gap:8px; justify-content:center; }
+  .range-editor { gap:8px; }
+  .range-pair { flex-direction:row; flex-wrap:wrap; align-items:flex-start; gap:16px; }
+  .range-group { width:194px; flex-shrink:0; gap:6px; }
+  .range-group.range-time { width:246px; }
+  .range-bound { flex-direction:row; align-items:center; gap:6px; }
+  .range-bound input { width:112px; flex-shrink:0; }
+  .range-bound .range-date { width:168px; }
+  .range-bound select { width:52px; height:32px; flex-shrink:0; }
+  .range-bound .range-unit { width:76px; }
+  .range-pick { width:72px; padding:6px 8px; }
+  .setting-control input, .setting-control textarea { width:100%; }
+  .toggle-host { height:26px; align-items:flex-end; }
+  .setting-card { padding:16px 20px; gap:10px; border:1px solid var(--card-border); border-radius:8px; }
+  .setting-card.light { background:#fbfbfb; border:1px solid #e5e5e5; }
+  .setting-card.dark { background:#2b2b2b; border:1px solid #303030; }
+  .setting-card { gap:0px; padding:0px 20px; }
+  .block-fields { gap:0px; }
+  .setting-item { gap:0px; }
+  .setting-item > .settings-row { padding:16px 0px; min-height:32px; }
+  .setting-item > .range-editor, .setting-item > .error { margin-bottom:16px; }
+  .setting-item > textarea { width:100%; }
+  .setting-divider { height:1px; background:var(--card-border); }
+  .block-heading { padding:16px 0px 0px; font-size:14px; font-weight:600; }
+  .runtime-badge { width:92px; flex-direction:row; align-items:center; gap:7px; flex-shrink:0; }
+  .runtime-dot { width:8px; height:8px; border-radius:4px; background:#8a8a8a; flex-shrink:0; }
+  .runtime-dot.running { background:#6ccb5f; }
+  .setting-description { color:var(--fg-2); font-size:12px; white-space:normal; }
+  .choice-host { height:32px; flex-direction:row; }
+  .tag-setting .setting-copy { width:190px; flex:0; flex-shrink:1; gap:8px; }
+  .tag-setting .setting-copy input { width:100%; }
+  .tag-region { height:112px; min-width:0px; padding:6px 18px 6px 6px; border:1px solid var(--card-border); border-radius:6px; }
+  .history-entry { gap:0px; padding:0px 12px; border:1px solid var(--card-border); border-radius:8px; }
+  .light .history-entry, .light .root-header { background:#fbfbfb; }
+  .dark .history-entry, .dark .root-header { background:#2b2b2b; }
+  .history-entry > .action-row { padding-bottom:10px; }
+  .history-row { flex-direction:row; align-items:center; gap:12px; padding:10px 0px; min-height:52px; }
+  .password-table-row { flex-direction:row; align-items:center; gap:12px; }
+  .password-table { flex:1; gap:2px; }
+  .password-table-row { padding:10px 0px; min-height:52px; }
+  .password-value-column { flex:1; min-width:0px; }
+  .password-value-column input { width:100%; }
+  .password-actions { width:72px; flex-shrink:0; margin-left:16px; }
+  .password-text { width:100%; height:32px; flex-shrink:1; background:#00000001; color:var(--fg); border:0px; padding:0px; text-align:left; cursor:text; }
+  .password-text-value { width:100%; height:32px; padding:0px 11px; color:var(--fg); white-space:nowrap; }
+  .password-hover-line { position:absolute; left:0px; bottom:0px; width:100%; height:1px; background:#00000000; }
+  .light .password-text:hover .password-hover-line { background:#00000073; }
+  .dark .password-text:hover .password-hover-line { background:#ffffff8a; }
+  .light .password-text:hover { background:#00000008; }
+  .dark .password-text:hover { background:#ffffff08; }
+  .history-content { flex:1; min-width:0px; gap:0px; }
+  .history-text { width:100%; white-space:pre-wrap; }
+  .history-save { width:132px; flex-shrink:0; }
+  .root-table { flex:1; gap:6px; }
+  .root-columns { flex-direction:row; align-items:center; gap:12px; }
+  .root-header { padding:10px 12px; margin:2px 18px 0px 2px; flex-shrink:0; border:1px solid var(--card-border); border-radius:8px; }
+  .root-header .root-path-column { padding:0px 11px; white-space:nowrap; }
+  .root-header .root-deep-column { text-align:center; white-space:nowrap; }
+  .root-row { padding:10px 0px; min-height:52px; }
+  .root-path-column { flex:1; min-width:0px; gap:0px; }
+  .root-deep-column { width:104px; flex-shrink:0; align-items:center; }
+  .root-path-cell { width:100%; height:32px; gap:0px; }
+  .root-path-cell input { width:100%; height:32px; padding:0px 35px 0px 11px; }
+  .root-path-cell .password-text-value { padding:0px 35px 0px 11px; }
+  .root-browse { position:absolute; top:4px; right:4px; width:24px; height:24px; padding:3px; border:0px; background:#00000001; color:var(--fg); }
+  .light .root-browse:hover { background:#0000000d; }
+  .dark .root-browse:hover { background:#ffffff16; }
+  .root-browse svg { width:16px; height:16px; }
+  .nav-item { transition:background-color 140ms ease-out; }
+</style>
+<template>
+  <div :class="'app '+appearance">
+    <div class="body">
+      <div id="navigation" class="navigation">
+        <div id="identity" class="identity">
+          <img id="appIcon" class="app-icon" src="sunpack.png" width="40" height="40" object-fit="contain"/>
+          <div id="brand" class="column fill" style="gap:3px"><label class="brand">SunPack</label><label class="muted">{{ texts.manager }}</label></div>
+          <div id="runtimeStatus" class="runtime-badge"><div :class="runtime.known &amp;&amp; runtime.running?'runtime-dot running':'runtime-dot'"/><label class="muted">{{ !runtime.known?texts.runtimeUnknown:runtime.running?texts.runtimeRunning:texts.runtimeStopped }}</label></div>
+        </div>
+        <div id="monitorControls" class="monitor-controls">
+          <div class="row monitor-actions"><button id="watchStart" :enabled="cliAllowed" @click="send('cli',{action:'start'})">{{ texts.startWatch }}</button><button id="watchStop" :enabled="cliAllowed" @click="send('cli',{action:'stop'})">{{ texts.stopWatch }}</button></div>
+          <label v-show="actionError" class="error">{{ errorText(actionError) }}</label>
+        </div>
+      <div id="navItems" class="nav-items">
+        <button id="tabTasks" :class="tab==='tasks'?'nav-item on':'nav-item'" @click="go('tasks')">
+          <div class="nav-mark"/>
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none"><path d="m3 6 1.5 1.5L7 5M10 6h11M3 12l1.5 1.5L7 11M10 12h11M3 18l1.5 1.5L7 17M10 18h11" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg><label>{{ texts.tasks }}</label>
+        </button>
+        <button id="tabConfig" :class="tab==='config'?'nav-item on':'nav-item'" @click="go('config')">
+          <div class="nav-mark"/>
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none"><path d="M4 7h16M4 17h16M8 4v6M16 14v6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg><label>{{ texts.config }}</label>
+        </button>
+        <button id="tabRoots" :class="tab==='roots'?'nav-item on':'nav-item'" @click="go('roots')">
+          <div class="nav-mark"/>
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none"><path d="M3 6h7l2 2h9v11H3V6Z" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg><label>{{ texts.rootManagement }}</label>
+        </button>
+        <button id="tabPasswords" :class="tab==='passwords'?'nav-item on':'nav-item'" @click="go('passwords')">
+          <div class="nav-mark"/>
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none"><path d="M14 5a5 5 0 1 1-2 8l-7 7H2v-3l7-7a5 5 0 0 1 5-5Z" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg><label>{{ texts.passwords }}</label>
+        </button>
+        <div id="navIndicator" class="nav-indicator"/>
+      </div>
+      <div v-show="tab==='config'" class="sidebar">
+        <label class="sidebar-heading">{{ texts.categories }}</label>
+        <button id="category-all" :class="!configCategory?'context-item on':'context-item'" @click="selectCategory('')"><label>{{ texts.allSettings }}</label></button>
+        <ScrollView id="categoryScroll"><div class="column"><button v-for="c in categories" :key="c.id" :id="'category-'+c.id" :class="configCategory===c.id?'context-item on':'context-item'" @click="selectCategory(c.id)"><label>{{ c.label }}</label></button></div></ScrollView>
+      </div>
+      <div id="directoryPane" v-show="tab==='tasks'||tab==='passwords'" class="directory-pane">
+        <div class="directory-tools">
+        <label class="subheading">{{ texts.roots }}</label>
+        <input id="directorySearch" type="search" class="search-field" :placeholder="texts.searchDirectory" :value="directoryQuery" @input="searchDirectory"/>
+        <button id="allRoots" :class="!directorySelection?'context-item on':'context-item'" @click="selectDirectory('')"><label>{{ texts.allDirectories }}</label></button>
+        </div>
+        <ScrollView id="directoryListScroll"><VirtualList id="directoryItems" class="directory-list" estimated-height="60px">
+          <button v-for="d in shownDirectories" :key="d.id" :id="'directory-'+d.id" class="context-item directory-item" :class="directorySelection===d.path?'on':''" @click="selectDirectory(d.path)">
+            <div class="column fill"><label :ellipsis-start="true" class="directory-name">{{ d.name||d.path }}</label><label :ellipsis-start="true" class="muted directory-path">{{ d.path }}</label></div>
+          </button>
+        </VirtualList></ScrollView>
+      </div>
+      </div>
+      <div class="workspace">
+      <div id="page-tasks" v-show="tab==='tasks'" class="content">
+        <div class="page-header"><label class="heading">{{ texts.tasks }}</label></div>
+        <div class="row task-filters"><input id="taskSearch" type="search" class="fill search-field" :placeholder="texts.taskSearch" :value="taskQuery" @input="searchTasks"/>
+          <div id="taskStatusHost" style="width:180px;height:32px"/>
+        </div>
+        <ScrollView id="taskListScroll"><div id="taskBody" class="column">
+          <VirtualList id="taskItems" class="column" estimated-height="68px" immutable-items="true"><div v-for="t in tasks.rows" :key="t.id" :id="'task-'+t.id" :class="'task '+appearance">
+            <div class="row"><button :id="'taskName-'+t.id" class="taskname" @click="send('openTask',{task:t})">{{ t.name }}</button><div class="spacer"/><label class="status" :class="'status-'+t.statusTone">{{ t.statusText }}</label></div>
+            <div class="row task-meta"><label :id="'taskRoot-'+t.id" class="muted fill" :ellipsis-start="true">{{ t.partCount ? texts.identifiedParts.replace('{count}',t.partCount)+' · ' : '' }}{{ texts.taskFolder }}{{ t.directory }}</label><label class="time">{{ t.time }}</label></div>
+          </div>
+          </VirtualList>
+        </div></ScrollView>
+        <label v-show="tasks.malformed" class="error">{{ tasks.malformed }} {{ texts.invalidLogs }}</label>
+      </div>
+      <div id="page-config" v-show="tab==='config'" class="content">
+        <div class="page-header"><label class="heading">{{ texts.config }}</label></div>
+        <input id="configSearch" type="search" class="search-field" :placeholder="texts.settingSearch" :value="configQuery" @input="searchConfig"/>
+        <ScrollView id="configListScroll"><div id="configBlocks" class="column">
+          <div id="startupSetting" v-show="showStartupSetting" class="card settings-row">
+            <div class="setting-copy"><label class="setting-title">{{ texts.startup }}</label></div>
+            <button id="startupToggle" :enabled="cliAllowed" @click="send('cli',{action:startup.enabled?'startupDisable':'startupEnable'})">{{ startup.enabled?texts.startupOff:texts.startupOn }}</button>
+          </div>
+          <div id="themeSetting" v-show="showThemeSetting" class="card settings-row"><div class="setting-copy"><label class="setting-title">{{ texts.theme }}</label></div><div id="themeHost" style="width:180px;height:32px"/></div>
+          <VirtualList id="configItems" class="column" estimated-height="140px"><div v-for="g in matchingBlocks" :key="g.key" :id="'block-'+g.id" :class="'setting-card '+appearance">
+            <label v-show="(g.fields.length>1||g.module) &amp;&amp; !g.primary" class="block-heading">{{ g.label }}</label>
+            <!-- This Core UI version binds inner loops through a conditional
+                 scope. Groups are always nonempty; visibility uses v-show. -->
+            <div v-if="true" class="block-fields">
+            <div v-for="f in g.fields" :key="f.key" :id="'field-'+f.id" class="setting-item">
+            <div v-show="f.id!==g.fields[0].id" class="setting-divider"/>
+            <div class="settings-row" :class="f.editor==='list'?'tag-setting':''">
+              <div class="setting-copy"><label :class="f.primary?'subheading':'setting-title'">{{ f.label }}</label><label v-show="f.description" class="setting-description">{{ f.description }}</label><input v-show="f.editor==='list'" :id="'tag-input-'+f.id" :value="tagInputs[f.id]||''" :placeholder="texts.tagInputPlaceholder" @input="v=>changeTagInput(f,v)" @submit="addTag(f)"/></div>
+              <ScrollView v-if="f.editor==='list'" :id="'tag-scroll-'+f.id" class="tag-region"><div :id="'tags-host-'+f.id"/></ScrollView>
+              <div v-show="!isRange(f) &amp;&amp; f.editor!=='list'" class="setting-control">
+                <div v-show="f.editor==='toggle'" :id="'toggle-host-'+f.id" class="toggle-host"/>
+                <div v-show="f.editor==='choice'||f.editor==='recursive'" :id="'choice-'+f.id" class="choice-host"/>
+                <input v-show="f.editor==='text'" :ellipsis-start="isDirectoryValue(drafts[f.id]?drafts[f.id].text:f.text)" :id="'input-'+f.id" :value="drafts[f.id]?drafts[f.id].text:f.text" @input="v=>changeField(f,v)" @blur="commitField(f)" @submit="commitField(f)"/>
+                <div v-show="f.editor==='recursive' &amp;&amp; (drafts[f.id]?drafts[f.id].choice:f.choice)===2" class="column"><label class="muted">{{ texts.rounds }}</label><input :id="'rounds-'+f.id" :value="drafts[f.id]?drafts[f.id].text:f.text" @input="v=>changeField(f,v)" @blur="commitField(f)" @submit="commitField(f)"/></div>
+                <label v-show="f.editor==='readonly'" class="muted">{{ texts.readOnly }}</label>
+              </div>
+            </div>
+            <!-- Range modules have one draft and one atomic save target. -->
+            <div v-if="isRange(f)" class="range-editor">
+              <div class="action-row"><toggle :id="'range-enabled-'+f.id" :checked="rangeValue(f).enabled" @change="v=>changeRange(f,'enabled',v,true)"/><label>{{ texts.rangeEnable }}</label></div>
+              <div class="column">
+                <div class="range-pair">
+                  <div :id="'range-lower-group-'+f.id" :class="f.editor==='datetime_range'?'range-group range-time':'range-group'">
+                    <label>{{ f.editor==='datetime_range'?texts.rangeStart:texts.rangeMin }}</label>
+                    <div class="range-bound">
+                      <input :id="'range-lower-'+f.id" :class="f.editor==='datetime_range'?'range-date':''" :value="rangeValue(f).lower" :placeholder="f.editor==='datetime_range'?'YYYY-MM-DD HH:mm':''" @input="v=>changeRange(f,'lower',v,false)" @blur="commitField(f)" @submit="commitField(f)"/>
+                      <select v-show="f.editor==='size_range'" class="range-unit" :id="'range-lower-unit-'+f.id" :value="rangeValue(f).lowerUnit" @change="v=>changeRange(f,'lowerUnit',v,true)"><option>B</option><option>KiB</option><option>MiB</option><option>GiB</option><option>TiB</option></select>
+                      <button v-show="f.editor==='datetime_range'" class="range-pick" focus-indicator="underline" :title="texts.rangeChoose" :id="'range-lower-pick-'+f.id" @click="send('pickRangeDate',{id:f.id,side:'lower',value:rangeValue(f).lower})">{{ texts.rangePick }}</button>
+                    </div>
+                  </div>
+                  <div :id="'range-upper-group-'+f.id" :class="f.editor==='datetime_range'?'range-group range-time':'range-group'">
+                    <label>{{ f.editor==='datetime_range'?texts.rangeEnd:texts.rangeMax }}</label>
+                    <div class="range-bound">
+                      <input :id="'range-upper-'+f.id" :class="f.editor==='datetime_range'?'range-date':''" :value="rangeValue(f).upper" :placeholder="f.editor==='datetime_range'?'YYYY-MM-DD HH:mm':''" @input="v=>changeRange(f,'upper',v,false)" @blur="commitField(f)" @submit="commitField(f)"/>
+                      <select v-show="f.editor==='size_range'" class="range-unit" :id="'range-upper-unit-'+f.id" :value="rangeValue(f).upperUnit" @change="v=>changeRange(f,'upperUnit',v,true)"><option>B</option><option>KiB</option><option>MiB</option><option>GiB</option><option>TiB</option></select>
+                      <button v-show="f.editor==='datetime_range'" class="range-pick" focus-indicator="underline" :title="texts.rangeChoose" :id="'range-upper-pick-'+f.id" @click="send('pickRangeDate',{id:f.id,side:'upper',value:rangeValue(f).upper})">{{ texts.rangePick }}</button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <label v-show="saveErrors[f.id]" class="error">{{ errorText(saveErrors[f.id]) }}</label>
+            </div>
+            </div>
+          </div>
+          </VirtualList>
+        </div></ScrollView>
+      </div>
+      <div id="page-roots" v-show="tab==='roots'" class="content">
+        <div class="page-header"><label class="heading">{{ texts.rootManagement }}</label></div>
+        <div class="password-toolbar"><input id="rootSearch" type="search" class="management-search search-field" :placeholder="texts.searchDirectory" :value="rootQuery" @input="searchRoots"/><button id="addRoot" @click="addRoot()">{{ texts.addRoot }}</button></div>
+        <div class="root-table">
+          <div id="rootTableHeader" class="root-columns root-header"><label class="root-path-column">{{ texts.roots }}</label><label class="root-path-column">{{ texts.rootOutput }}</label><label class="root-deep-column">{{ texts.deep }}</label><div class="password-actions"/></div>
+          <ScrollView id="rootListScroll"><VirtualList id="rootItems" estimated-height="62px" style="gap:8px"><div v-for="r in shownRootRows" :key="r.id" :id="'root-row-'+r.id" class="history-entry">
+            <div class="root-columns root-row">
+              <div class="root-path-column"><div class="root-path-cell">
+                <button v-show="rootCell!==r.id||rootPart!=='input'" :id="'root-input-text-'+r.id" class="password-text" @mousedown="e=>rememberCellPointer(r.id,'input',e)" @click="beginRoot(r,'input')"><label :id="'root-input-value-'+r.id" :class="rootDraft(r).input?'password-text-value':'password-text-value muted'" :ellipsis-start="true">{{ rootDraft(r).input||texts.rootPasteHint }}</label><div class="password-hover-line"/></button>
+                <input v-show="rootCell===r.id &amp;&amp; rootPart==='input'" :id="'root-input-input-'+r.id" :value="rootDraft(r).input" :placeholder="texts.rootPasteHint" :ellipsis-start="true" @input="v=>changeRoot(r,'input',v)" @blur="blurRoot(r,'input')" @submit="finishRootCell()"/>
+                <button class="root-browse" :id="'browse-root-input-'+r.id" @click="browseRoot(r,'input')"><svg viewBox="0 0 24 24" fill="none"><path d="M3 6h7l2 2h9v11H3V6Z" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+              </div></div>
+              <div class="root-path-column"><div class="root-path-cell">
+                <button v-show="rootCell!==r.id||rootPart!=='output'" :id="'root-output-text-'+r.id" class="password-text" @mousedown="e=>rememberCellPointer(r.id,'output',e)" @click="beginRoot(r,'output')"><label :id="'root-output-value-'+r.id" :class="rootDraft(r).output?'password-text-value':'password-text-value muted'" :ellipsis-start="true">{{ rootDraft(r).output||texts.rootOutputHint }}</label><div class="password-hover-line"/></button>
+                <input v-show="rootCell===r.id &amp;&amp; rootPart==='output'" :id="'root-output-input-'+r.id" :value="rootDraft(r).output" :placeholder="texts.rootOutputHint" :ellipsis-start="true" @input="v=>changeRoot(r,'output',v)" @blur="blurRoot(r,'output')" @submit="finishRootCell()"/>
+                <button class="root-browse" :id="'browse-root-output-'+r.id" @click="browseRoot(r,'output')"><svg viewBox="0 0 24 24" fill="none"><path d="M3 6h7l2 2h9v11H3V6Z" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+              </div></div>
+              <div class="root-deep-column"><toggle :id="'root-deep-'+r.id" :checked="rootDraft(r).deep" @change="v=>toggleRoot(r,v)"/></div>
+              <button class="password-actions" :id="'delete-root-'+r.id" @click="deleteListedRoot(r)">{{ texts.delete }}</button>
+            </div>
+            <div v-show="rootDraft(r).error" class="action-row"><label class="error">{{ errorText(rootDraft(r).error) }}</label><button :enabled="!rootDraft(r).pending" @click="commitRoots([rootDraft(r)])">{{ texts.saveEntries }}</button><button :enabled="!rootDraft(r).pending" @click="discardRoot(r.id)">{{ texts.cancelEntries }}</button></div>
+          </div></VirtualList></ScrollView>
+        </div>
+      </div>
+      <div id="page-passwords" v-show="tab==='passwords'" class="content">
+        <div class="page-header"><label class="heading">{{ texts.passwords }}</label></div>
+        <div class="password-toolbar"><input id="passwordSearch" type="search" class="search-field management-search" :placeholder="texts.passwordSearch" :value="passwordQuery" @input="searchPasswords"/><div class="password-tabs"><button id="newPassword" @click="addPassword()">{{ texts.addPasswords }}</button><button id="savedPasswords" :class="!passwordHistoryTarget?'on':''" @click="selectPasswordView(false)">{{ texts.savedPasswords }}</button><button id="clipboardHistory" :class="passwordHistoryTarget?'on':''" @click="selectPasswordView(true)">{{ texts.history }}</button></div></div>
+        <div class="password-table">
+        <ScrollView id="passwordListScroll"><div id="passwordBody" class="column">
+          <div v-show="shownPasswords.length>0">
+            <VirtualList id="passwordItems" v-show="shownPasswords.length>0" style="gap:8px" estimated-height="62px"><div v-for="p in shownPasswords" :key="p.id" :id="'password-'+p.id" class="history-entry">
+              <div v-show="!passwordHistory" class="password-table-row">
+                <div class="password-value-column">
+                  <button v-show="passwordCell!==p.id" :id="'password-text-'+p.id" class="password-text" @mousedown="e=>rememberCellPointer(p.id,'value',e)" @click="beginPassword(p)"><label :id="'password-value-'+p.id" class="password-text-value">{{ passwordText(p) }}</label><div :id="'password-hover-'+p.id" class="password-hover-line"/></button>
+                  <input v-show="passwordCell===p.id" :id="'password-input-'+p.id" :value="passwordDraft(p).value" :placeholder="texts.passwordPasteHint" @input="v=>changePassword(p,v)" @blur="blurPassword(p)" @submit="finishPasswordCell()"/>
+                </div>
+                <button class="password-actions" :id="'delete-password-'+p.id" @click="deleteListedPassword(p)">{{ texts.delete }}</button>
+              </div>
+              <div v-show="passwordDraft(p).error" class="action-row"><label class="error">{{ errorText(passwordDraft(p).error) }}</label><button :id="'discard-password-'+p.id" :enabled="!passwordDraft(p).pending" @click="discardPassword(p.id)">{{ texts.cancelEntries }}</button></div>
+              <div v-show="passwordHistory" class="history-row"><div class="history-content"><label class="history-text" :id="'history-value-'+p.id">{{ p.value }}</label></div><button class="history-save" :id="'save-history-'+p.id" :enabled="!historyDraft(p).pending" @click="saveHistory(p)">{{ passwordRoot?texts.saveHistoryToDirectory:texts.saveHistoryGlobally }}</button></div>
+              <div v-show="passwordHistory &amp;&amp; historyDraft(p).error" class="action-row"><label class="error">{{ errorText(historyDraft(p).error) }}</label><button @click="discardPassword(historyDraft(p).id)">{{ texts.cancelEntries }}</button></div>
+            </div>
+            </VirtualList>
+          </div>
+        </div></ScrollView></div>
+      </div>
+      </div>
+    </div>
+    <label v-show="closeError" class="error">{{ errorText(closeError) }}</label>
+    <div v-show="errorList.length" class="card"><label class="error">{{ texts.fileProblems }}</label><label v-for="e in errorList" :key="e" class="error">{{ e }}</label></div>
+    <div v-if="dispatch" id="dispatch" :visible="false" style="position:absolute;left:0px;top:0px;width:0px;height:0px"/>
+  </div>
+</template>

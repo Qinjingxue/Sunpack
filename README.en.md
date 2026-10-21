@@ -22,6 +22,7 @@
 
 - [Installation](#installation)
 - [Usage guide](#usage-guide)
+  - [Graphical manager](#graphical-manager)
   - [Command overview](#command-overview)
   - [Password management](#password-management)
 - [Core capabilities](#core-capabilities)
@@ -46,7 +47,7 @@
 
 ### System requirements
 
-SunPack supports only Windows 10 version 1703 or later and Windows 11. Watch mode only supports NTFS.
+SunPack supports only Windows 10 version 1709 or later and Windows 11. Watch mode only supports NTFS.
 
 Download the latest `sunpack-windows-<arch>-<version>-setup.exe` from [GitHub Releases](https://github.com/Qinjingxue/Sunpack/releases/latest).
 
@@ -67,6 +68,17 @@ $r = Invoke-RestMethod 'https://api.github.com/repos/Qinjingxue/Sunpack/releases
 
 ## Usage guide
 
+### Graphical manager
+
+Open the manager from the Watch tray to manage tasks, monitored folders, passwords, and settings in one place.
+
+- **Compact**: the GUI executable is about 4 MB and uses little memory.
+- **No extra runtime**: a C++ Windows interface with no dependency on a browser engine, .NET, or similar external runtimes.
+- **Fast and responsive**: opens quickly and keeps interactions snappy while managing tasks, folders, passwords, and settings.
+- **Exits when closed**: the GUI does not stay resident in the background.
+
+![SunPack tasks: folder filtering and statuses for successful, processing, and waiting tasks](docs/images/gui.en.png)
+
 ### Command overview
 
 | Command     | Short form | Description                                                          |
@@ -84,12 +96,15 @@ $r = Invoke-RestMethod 'https://api.github.com/repos/Qinjingxue/Sunpack/releases
 
 ### Password management
 
+Use the [manager](#graphical-manager) to edit passwords by folder or save clipboard history entries as password candidates.
+
 For maximum convenience, SunPack gathers passwords from several sources at run time, tries all candidate passwords at high speed — with thousands of candidates it is nearly imperceptible — and automatically finds and uses the correct one. The password sources are:
 
-- Built-in password file: used on every extraction. It can be opened and edited from the tray context menu in watch mode, and lives at `%ProgramData%\SunPack\builtin_passwords.txt` in the installed version. Watch mode automatically collects clipboard history into this file, with a default limit of 30 entries.
+- JSON password file: the installed version uses `%ProgramData%\SunPack\builtin_passwords.json`, editable on the manager's Passwords page. Records in `passwords` contain `value` and optional `scopes` listing absolute directories; omit `scopes` for global use. Watch maintains a separate `clipboard_history`, limited to 30 entries by default.
 - User input: the context menu, and the interactive password prompt launched from the CLI.
 - Clipboard: the clipboard text is read as a password before extraction.
-- Per-directory password file: SunPack automatically looks for `sunpack-passwords.txt` in the directory and reads each line as one password; watch mode creates it automatically by default. Set `watch.directory_password_file_auto_create` to `false` to disable automatic creation.
+
+Recent successes only reorder currently eligible candidates and never expand their scope. File events refresh the password snapshot when the JSON file changes.
 
 ---
 
@@ -256,7 +271,7 @@ Contributions are welcome. Use [GitHub Issues](https://github.com/Qinjingxue/Sun
 
 ## Acknowledgements
 
-Thank you to everyone who contributes code, reports issues, or shares suggestions for SunPack. The project also benefits from many open-source projects. Special thanks to the maintainers and contributors of [7-Zip](https://www.7-zip.org/), [zlib-ng](https://github.com/zlib-ng/zlib-ng), [LZ4](https://github.com/lz4/lz4), and [RustCrypto](https://github.com/RustCrypto). See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for details about third-party components and their licenses.
+Thank you to everyone who contributes code, reports issues, or shares suggestions for SunPack. The project also benefits from many open-source projects. Special thanks to the maintainers and contributors of [Core UI](https://github.com/ghboke/core-ui) (SunPack's native UI framework), [7-Zip](https://www.7-zip.org/), [zlib-ng](https://github.com/zlib-ng/zlib-ng), [LZ4](https://github.com/lz4/lz4), and [RustCrypto](https://github.com/RustCrypto). See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for details about third-party components and their licenses.
 
 ## License
 

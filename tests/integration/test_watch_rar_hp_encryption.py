@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from tests.helpers.passwords import write_password_json
+import sunpack.core.passwords.internal.builtin as builtin
+
 import asyncio
 import shutil
 import time
@@ -97,7 +100,7 @@ def _extracted(output_root: Path, case: ArchiveCase) -> bool:
 
 
 @pytest.mark.parametrize("split", [False, True])
-def test_watch_split_hp_rar_recovers_after_wrong_then_correct_password(tmp_path, split):
+def test_watch_split_hp_rar_recovers_after_wrong_then_correct_password(tmp_path, split, monkeypatch):
     """Split header-encrypted RAR: wrong password blocks, correction succeeds."""
     correct = "split-hp-right"
     case = _create_case(tmp_path / "fixtures", "watch_hp_split_wrong", split=split, password=correct)
@@ -105,8 +108,9 @@ def test_watch_split_hp_rar_recovers_after_wrong_then_correct_password(tmp_path,
     output_root = tmp_path / "out"
     watch_root.mkdir()
     output_root.mkdir()
-    password_file = watch_root / "sunpack-passwords.txt"
-    password_file.write_text("wrong-password\n", encoding="utf-8")
+    password_file = tmp_path / "builtin_passwords.json"
+    monkeypatch.setattr(builtin, "builtin_password_path", lambda: password_file)
+    write_password_json(password_file, scopes=[("wrong-password", [str(watch_root)])])
 
     config = _watch_config()
     async def scenario():
@@ -124,8 +128,8 @@ def test_watch_split_hp_rar_recovers_after_wrong_then_correct_password(tmp_path,
             blocked = [entry for entry in watcher.state.entries.values() if entry.status == "failed_password"]
             assert BLOCKER_PASSWORD in ((blocked[0].failure_payload or {}).get("blockers") or [])
             assert (await watcher.run_once()).processed == 0
-            password_file.write_text(correct + "\n", encoding="utf-8")
-            watcher.notify_password_table_changed(str(password_file))
+            write_password_json(password_file, scopes=[(correct, [str(watch_root)])])
+            watcher.notify_password_source_changed("builtin_password_file")
             await _drive_watch_until(watcher, lambda: _extracted(output_root, case))
             extracted = list(output_root.rglob(case.marker_name))
             assert len(extracted) == 1

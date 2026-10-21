@@ -245,7 +245,8 @@ def test_waiting_input_survives_death_and_retries_when_resolved(tmp_path, kind):
     if missing is not None:
         (tmp_path / "withheld-volume").rename(missing)
     else:
-        (tmp_path / "input" / "sunpack-passwords.txt").write_text("wal-test-secret\n", encoding="utf-8")
+        from tests.helpers.passwords import write_password_json
+        write_password_json(tmp_path / "builtin_passwords.json", scopes=[("wal-test-secret", [str(tmp_path / "input")])])
     recovered = _run_child(tmp_path, "watch", "recover")
     assert recovered["pending"] == 0
     assert recovered["entries"] == []

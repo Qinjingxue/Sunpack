@@ -1,3 +1,5 @@
+import json
+from sunpack.core.passwords.internal.builtin import _parse_document
 from types import SimpleNamespace
 
 from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
@@ -39,7 +41,10 @@ def test_password_store_orders_user_recent_builtin_and_dedupes():
         builtin_passwords=["builtin", "shared"],
     )
 
-    assert store.candidates(directory_passwords=["dir", "clip"]) == ["recent", "dir", "clip", "cli", "shared", "builtin"]
+    store.snapshot = _parse_document(json.dumps({"passwords": [
+        {"value": "builtin"}, {"value": "dir", "scopes": ["D:/Work"]}, {"value": "clip", "scopes": ["D:/Work"]}
+    ]}))[0]
+    assert store.candidates("D:/Work") == ["dir", "clip", "cli", "shared", "builtin"]
 
 
 def test_password_store_remembers_success_at_front():
@@ -52,7 +57,7 @@ def test_password_store_remembers_success_at_front():
     store.remember_success("secret")
 
     assert store.recent_passwords == ["secret", "old"]
-    assert store.candidates() == ["secret", "old", "cli"]
+    assert store.candidates() == ["secret", "cli"]
 
 
 def test_password_store_bounds_recent_success_history():
@@ -342,7 +347,7 @@ def test_password_resolver_skips_candidates_for_intrinsically_unencrypted_format
         assert scheduler.planned == []
 
 
-def test_password_resolver_uses_directory_passwords_before_user_and_builtin():
+def test_password_resolver_uses_scoped_passwords_before_user_and_builtin():
     tester = FakePasswordTester()
     tester.password_store = PasswordStore.from_sources(
         cli_passwords=["user-password"],
@@ -352,11 +357,11 @@ def test_password_resolver_uses_directory_passwords_before_user_and_builtin():
     scheduler = QueuePasswordScheduler()
     resolver = PasswordResolver(tester, PasswordSession(), scheduler)
 
-    first = resolver.resolve(
-        "large.rar",
-        archive_key="archive-key",
-        directory_passwords=["directory-password", "user-password"],
-    )
+    tester.password_store.snapshot = _parse_document(json.dumps({"passwords": [
+        {"value": "builtin-password"}, {"value": "directory-password", "scopes": ["D:/Work"]},
+        {"value": "user-password", "scopes": ["D:/Work"]}
+    ]}))[0]
+    first = resolver.resolve("large.rar", archive_key="archive-key", scope_path="D:/Work")
 
     assert scheduler.planned == ["", "directory-password", "user-password", "clipboard-password", "builtin-password"]
     assert first.password == ""
@@ -417,20 +422,11 @@ def test_hundreds_of_archives_reuse_confirmed_password_after_one_candidate_batch
 
 
 def test_password_store_reads_structured_builtin_file(tmp_path):
-    builtin_file = tmp_path / "builtin_passwords.txt"
-    builtin_file.write_text(
-        "# Built-in common password list. You can edit this file; use one password per line.\n"
-        "#secret\n"
-        "# The following section is managed automatically by SunPack Watch.\n"
-        "#!SUNPACK-WATCH-CLIPBOARD-BEGIN\n"
-        "clip-secret\n"
-        "#!SUNPACK-WATCH-CLIPBOARD-END\n",
-        encoding="utf-8",
-    )
-
-    store = PasswordStore.from_sources(builtin_passwords_file=str(builtin_file))
-
-    assert store.builtin_passwords == ["#secret", "clip-secret"]
+    from tests.helpers.passwords import write_password_json
+    path = tmp_path / "builtin_passwords.json"
+    write_password_json(path, ["#secret"], history=["clip-secret"])
+    store = PasswordStore.from_sources(builtin_passwords_file=str(path))
+    assert store.builtin_passwords == ("#secret", "clip-secret")
 
 
 def test_validated_structure_password_lifecycle(subtests):

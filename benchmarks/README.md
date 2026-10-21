@@ -65,6 +65,23 @@ uv run --no-sync python -m benchmarks scheduling watch-source-claims --baseline-
 uv run --no-sync python -m benchmarks memory watch-source-indexes --paths 4096 --batches 12 --warmups 2
 ```
 
+## GUI benchmark
+
+The manager window has its own in-process benchmark. It seeds an event log with 5000
+tasks, 3000 passwords and 250 watch roots, opens the real `Application`, and drives
+click/type/scroll through the Core UI debug API while recording wall time, process
+CPU cycles and Core UI trace durations per action:
+
+```powershell
+pwsh scripts/build_gui.ps1 -SkipTests
+cmake --build .cache/gui-x64 --config Release --target sunpack_gui_performance --parallel
+.cache/gui-x64/Release/sunpack_gui_performance.exe --rounds 30 > gui-perf.json
+```
+
+Options are `--tasks`, `--passwords`, `--history`, `--roots` and `--rounds` (5..100).
+See [gui/README.md](gui/README.md) for the report fields, the current baseline and the
+observed hotspots.
+
 `scheduling watch-source-claims` compares watch claim, release, and state
 retirement against the committed scheduler. The lifecycle case includes pending
 index maintenance, metadata updates, dirty events, partial ownership transfer,

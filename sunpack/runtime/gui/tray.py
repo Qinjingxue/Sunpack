@@ -5,10 +5,8 @@ import threading
 from ctypes import wintypes
 from pathlib import Path
 
-from sunpack.core.config.payload_io import read_config_payload
-from sunpack.runtime.watch.service import watch_roots_path
 from sunpack.core.i18n import I18nContext
-from sunpack.core.passwords.internal.builtin import builtin_password_path, get_builtin_passwords
+from sunpack.runtime.gui.manager import launch_manager
 from sunpack.runtime.watch.startup import disable_startup, enable_startup, startup_status
 from sunpack.core.support.process_executable import current_process_executable
 
@@ -34,9 +32,9 @@ SM_CYSMICON = 50
 MF_STRING = 0x00000000
 TPM_RIGHTBUTTON = 0x0002
 WM_RBUTTONUP = 0x0205
+WM_LBUTTONUP = 0x0202
 WM_LBUTTONDBLCLK = 0x0203
 IDI_APPLICATION = 32512
-SW_SHOWNORMAL = 1
 WS_EX_TOOLWINDOW = 0x00000080
 MSGFLT_ALLOW = 1
 USER_DEFAULT_SCREEN_DPI = 96
@@ -45,12 +43,10 @@ LRESULT = getattr(wintypes, "LRESULT", ctypes.c_ssize_t)
 WPARAM = getattr(wintypes, "WPARAM", ctypes.c_size_t)
 LPARAM = getattr(wintypes, "LPARAM", ctypes.c_void_p)
 
-ID_OPEN_CONFIG = 1001
-ID_OPEN_WATCH_ROOTS = 1002
+ID_OPEN_MANAGER = 1001
 ID_RELOAD = 1003
 ID_EXIT = 1004
 ID_TOGGLE_STARTUP = 1005
-ID_OPEN_BUILTIN_PASSWORDS = 1006
 
 TASKBAR_CREATED_MESSAGE_NAME = "TaskbarCreated"
 
@@ -438,8 +434,11 @@ class WindowsTrayIcon:
         if msg in {WM_DISPLAYCHANGE, WM_DPICHANGED}:
             self._refresh_icon_for_display(hwnd, msg)
             return 0
-        if msg == WM_TRAYICON and lparam in {WM_RBUTTONUP, WM_LBUTTONDBLCLK}:
+        if msg == WM_TRAYICON and lparam == WM_RBUTTONUP:
             self._show_menu(hwnd)
+            return 0
+        if msg == WM_TRAYICON and lparam in {WM_LBUTTONUP, WM_LBUTTONDBLCLK}:
+            launch_manager()
             return 0
         if msg == WM_COMMAND:
             self._handle_command(int(wparam) & 0xFFFF)
@@ -479,16 +478,8 @@ class WindowsTrayIcon:
         menu = self.user32.CreatePopupMenu()
         try:
             self.user32.AppendMenuW(
-                menu, MF_STRING, ID_OPEN_CONFIG,
-                self._text("open_config"),
-            )
-            self.user32.AppendMenuW(
-                menu, MF_STRING, ID_OPEN_WATCH_ROOTS,
-                self._text("open_watch_roots"),
-            )
-            self.user32.AppendMenuW(
-                menu, MF_STRING, ID_OPEN_BUILTIN_PASSWORDS,
-                self._text("open_builtin_passwords"),
+                menu, MF_STRING, ID_OPEN_MANAGER,
+                self._text("open_manager"),
             )
             self.user32.AppendMenuW(
                 menu, MF_STRING, ID_TOGGLE_STARTUP,
@@ -522,13 +513,8 @@ class WindowsTrayIcon:
             self.user32.DestroyMenu(menu)
 
     def _handle_command(self, command_id: int) -> None:
-        if command_id == ID_OPEN_CONFIG:
-            config_path, _ = read_config_payload()
-            self._open_path(str(config_path))
-        elif command_id == ID_OPEN_WATCH_ROOTS:
-            self._open_watch_roots_file()
-        elif command_id == ID_OPEN_BUILTIN_PASSWORDS:
-            self._open_builtin_passwords_file()
+        if command_id == ID_OPEN_MANAGER:
+            launch_manager()
         elif command_id == ID_TOGGLE_STARTUP:
             self._toggle_startup()
         elif command_id == ID_RELOAD:
@@ -537,25 +523,6 @@ class WindowsTrayIcon:
             self.service.request_stop()
             if self._hwnd:
                 self.user32.PostMessageW(self._hwnd, WM_CLOSE, 0, 0)
-
-    def _open_path(self, path: str) -> None:
-        self.shell32.ShellExecuteW(None, "open", path, None, None, SW_SHOWNORMAL)
-
-    def _open_watch_roots_file(self) -> None:
-        roots_path = watch_roots_path()
-        try:
-            roots_path.parent.mkdir(parents=True, exist_ok=True)
-            roots_path.touch(exist_ok=True)
-        except OSError:
-            return
-        self._open_path(str(roots_path))
-
-    def _open_builtin_passwords_file(self) -> None:
-        passwords_path = builtin_password_path()
-        if not passwords_path.exists():
-            get_builtin_passwords()
-        if passwords_path.exists():
-            self._open_path(str(passwords_path))
 
     def _startup_menu_label(self) -> str:
         try:

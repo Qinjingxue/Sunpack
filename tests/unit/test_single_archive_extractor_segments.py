@@ -22,7 +22,7 @@ from tests.helpers.config_factory import make_config
 
 
 class _FakePasswordStore:
-    def has_candidates(self):
+    def has_candidates(self, **_kwargs):
         return False
 
 

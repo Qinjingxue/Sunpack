@@ -17,7 +17,7 @@ def minimal_config():
         },
     }, precheck=[
         {"name": "blacklist", "enabled": True, "blocked_files": []},
-        {"name": "size_range", "enabled": True, "gte": 0},
+        {"name": "size_range", "enabled": True, "min_bytes": 0},
         {"name": "zip_structure_accept", "enabled": True},
     ]))
 

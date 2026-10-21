@@ -20,7 +20,6 @@ from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import com
 from sunpack.pipeline.extraction.progress import build_extraction_progress_manifest, has_recoverable_partial_outputs
 from sunpack.core.contracts.extraction import ExtractionResult
 from sunpack.core.passwords.result import PasswordResolution, PasswordResolutionStatus
-from sunpack.core.passwords.internal.local_files import directory_password_context_from_task
 from sunpack.core.passwords.resolver import archive_structure_requires_password
 from sunpack.core.support import archive_knowledge_projection as knowledge_view
 from sunpack.core.support.archive_input_projection import write_source_password_probe_input
@@ -400,7 +399,7 @@ class SingleArchiveExtractor:
 
     def _resolve_password(self, task: ArchiveTask, archive_path: str, part_paths: list[str]):
         archive_key = self._password_archive_key(task)
-        directory_passwords = directory_password_context_from_task(task)
+        scope_path = task.runtime.get("password_scope_dir") or os.path.dirname(os.path.abspath(task.main_path))
         known_password = knowledge_view.archive_password(task)
         if known_password is not None:
             return PasswordResolution(
@@ -408,7 +407,7 @@ class SingleArchiveExtractor:
                 status=PasswordResolutionStatus.RESOLVED,
                 archive_key=archive_key,
             )
-        if not self._password_store_has_candidates(directory_passwords) and not self._task_requires_password(task):
+        if not self.password_store.has_candidates(scope_path=scope_path) and not self._task_requires_password(task):
             format_hint = str(task.archive_input().format_hint or "").strip().lower().lstrip(".")
             direct_zip_candidate = format_hint in {"zip", "jar", "docx", "xlsx", "apk"}
             return PasswordResolution(
@@ -424,18 +423,12 @@ class SingleArchiveExtractor:
             task,
             part_paths=part_paths,
             archive_key=archive_key,
-            directory_passwords=directory_passwords,
+            scope_path=scope_path,
         )
 
     @staticmethod
     def _task_requires_password(task: ArchiveTask) -> bool:
         return archive_structure_requires_password(task)
-
-    def _password_store_has_candidates(self, directory_passwords: list[str]) -> bool:
-        try:
-            return bool(self.password_store.has_candidates(directory_passwords=directory_passwords))
-        except TypeError:
-            return bool(directory_passwords or self.password_store.has_candidates())
 
     def _startupinfo(self):
         startupinfo = subprocess.STARTUPINFO()
@@ -691,7 +684,7 @@ class SingleArchiveExtractor:
                 with _phase(phase_timer, f"{phase_prefix}_segment_set_archive_input"):
                     # Carrier archive knowledge is not valid for each
                     # independent logical archive. Runtime-only context such as
-                    # inherited directory passwords lives outside ArchiveKnowledge.
+                    # the original password scope lives outside ArchiveKnowledge.
                     task.set_knowledge({})
                     task.set_archive_input(descriptor)
                     # Embedded boundary resolution may already have proven the

@@ -37,14 +37,6 @@ def normalize_watch_config(value: Any) -> dict[str, Any]:
         _float_field(config, "runtime_cache_cleanup_idle_seconds"),
     )
     config["password_retry_debounce_seconds"] = max(0.0, _float_field(config, "password_retry_debounce_seconds"))
-    config["password_retry_include_subtree"] = require_boolean(
-        config["password_retry_include_subtree"],
-        "watch.password_retry_include_subtree",
-    )
-    config["directory_password_file_auto_create"] = require_boolean(
-        config["directory_password_file_auto_create"],
-        "watch.directory_password_file_auto_create",
-    )
     config["clipboard_monitor_enabled"] = require_boolean(
         config["clipboard_monitor_enabled"],
         "watch.clipboard_monitor_enabled",

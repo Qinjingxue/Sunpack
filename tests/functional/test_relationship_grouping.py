@@ -12,7 +12,7 @@ from tests.helpers.detection_config import with_detection_pipeline
 
 SCAN_CONFIG = normalize_config(with_detection_pipeline({
 }, precheck=[
-    {"name": "size_range", "enabled": True, "gte": 0},
+    {"name": "size_range", "enabled": True, "min_bytes": 0},
     {"name": "embedded_payload_identity", "enabled": True},
 ]))
 

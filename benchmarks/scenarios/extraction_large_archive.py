@@ -300,9 +300,9 @@ class RequestRuntimeProfiler:
             ("_inspect_tasks_before_extract", "job_password_preflight"),
         ):
             _wrap(job, name, timings, label)
-        password_contexts = _child(job, "directory_password_contexts")
-        _wrap(password_contexts, "annotate", timings, "job_directory_password_annotate")
-        _wrap(password_contexts, "remember", timings, "job_directory_password_remember")
+        password_contexts = _child(job, "password_scope_context")
+        _wrap(password_contexts, "annotate", timings, "job_password_scope_annotate")
+        _wrap(password_contexts, "remember", timings, "job_password_scope_remember")
         reporter = runtime.reporter
         _wrap(reporter, "tasks_discovered", timings, "job_report_tasks_discovered")
         _wrap(reporter, "task_finished", timings, "job_report_task_finished")
@@ -367,10 +367,10 @@ def _timing_totals(timings: TimingMap) -> dict[str, float]:
 def _derived_timing(timings: TimingMap) -> dict[str, float]:
     total = lambda label: sum(timings.get(label, []))
     job_direct_children = sum(total(label) for label in (
-        "job_directory_password_annotate",
+        "job_password_scope_annotate",
         "job_output_dir_resolver",
         "job_collect_result",
-        "job_directory_password_remember",
+        "job_password_scope_remember",
         "job_password_preflight",
         "job_report_task_finished",
     ))

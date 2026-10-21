@@ -85,7 +85,7 @@ async def watch_scenario(root, mode):
     from sunpack.runtime.watch.scheduler import WatchScheduler
 
     manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
-    builtin.builtin_password_path = lambda: root / "builtin_passwords.txt"
+    builtin.builtin_password_path = lambda: root / "builtin_passwords.json"
     config = load_config()
     config["cli"]["quiet"] = True
     config["user_passwords"] = ["wrong-candidate"]
@@ -93,8 +93,7 @@ async def watch_scenario(root, mode):
         config["user_passwords"].append("wal-test-secret")
     config["builtin_passwords"] = []
     config["post_extract"].update(archive_cleanup_mode="keep", flatten_single_directory=False)
-    config["watch"].update(clipboard_monitor_enabled=False,
-                          directory_password_file_auto_create=False)
+    config["watch"].update(clipboard_monitor_enabled=False)
     input_roots = list(dict.fromkeys(str(Path(path).parent) for path in manifest["sources"]))
     output_roots = {path: str(root / "output" / str(index)) if len(input_roots) > 1
                     else str(root / "output") for index, path in enumerate(input_roots)}

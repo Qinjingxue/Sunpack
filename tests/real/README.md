@@ -47,7 +47,7 @@ The new regression cases cover:
   healthy / separately encrypted ZIP branches. A mixed-group Pipeline case
   covers concurrent failures, output hashes, deletion and flattening.
 * Plan 7 adds late-tail delivery, a restart with incomplete volumes, a second
-  restart with a retained inner password failure, and a directory-password
+  restart with a retained inner password failure, and a scoped JSON password
   update. Blocked inner inputs are promoted to the original input directory;
   the test asserts their ordinary password scope before triggering the update.
 * `test_external_structure_corpus.py` generates self-authored samples using

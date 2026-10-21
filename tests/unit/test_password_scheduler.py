@@ -249,7 +249,8 @@ def test_extraction_plan_accepts_strong_fast_proof_and_caches_it(tmp_path):
     )
 
     first = scheduler.plan_for_extraction(job)
-    second = scheduler.plan_for_extraction(job)
+    from dataclasses import replace
+    second = scheduler.plan_for_extraction(replace(job, candidates=["bad", "secret"]))
 
     assert first.password == "secret"
     assert first.stopped_reason == "fast_proof"

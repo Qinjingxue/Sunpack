@@ -15,7 +15,6 @@ def normalize_extraction_config(value: Any) -> dict[str, Any]:
         raise ValueError("extraction must be an object")
     config = dict(DEFAULT_EXTRACTION_CONFIG)
     config.update(value)
-    config.pop("write_progress_manifest", None)
     requirement = str(config.get("content_requirement") or CONTENT_REQUIREMENT_COMPLETE).strip().lower()
     if requirement not in CONTENT_REQUIREMENTS:
         raise ValueError("extraction.content_requirement must be 'complete' or 'allow_partial'")

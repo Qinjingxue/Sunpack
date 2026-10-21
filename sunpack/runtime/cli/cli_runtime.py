@@ -1,5 +1,5 @@
 import os
-from dataclasses import asdict
+from dataclasses import fields
 from typing import Any
 
 from sunpack.runtime.cli.cli_types import CliPasswordSummary
@@ -8,18 +8,15 @@ from sunpack.core.config.schema import normalize_config_value
 from sunpack.core.config.detection_view import directory_scan_mode, scan_filter_config, scan_filters_enabled
 from sunpack.core.config.cli_settings import load_cli_language_from_config
 from sunpack.core.i18n import I18nContext
-from sunpack.core.passwords import dedupe_passwords, get_builtin_passwords, PasswordStore, read_password_file
+from sunpack.core.passwords import dedupe_passwords, PasswordStore, read_password_file
 from sunpack.core.passwords.internal.clipboard import read_clipboard_passwords
+from sunpack.core.passwords.internal.builtin import password_file_source
+from sunpack.core.passwords.internal.store import EMPTY_PASSWORD_SNAPSHOT
 
 
 def build_effective_config(config: dict) -> dict[str, Any]:
     size_rule = scan_filter_config(config, "size_range")
-    size_range_min_bytes = None
-    if isinstance(size_rule, dict):
-        if "gte" in size_rule:
-            size_range_min_bytes = size_rule["gte"]
-        elif "greater_than_or_equal" in size_rule:
-            size_range_min_bytes = size_rule["greater_than_or_equal"]
+    size_range_min_bytes = size_rule.get("min_bytes") if isinstance(size_rule, dict) else None
     return {
         "size_range_min_bytes": size_range_min_bytes,
         "worker": {
@@ -159,23 +156,24 @@ def build_password_summary(
     use_builtin_passwords: bool,
     recent_passwords: list[str] | None = None,
     clipboard_passwords: list[str] | None = None,
+    password_snapshot=None,
 ) -> CliPasswordSummary:
     recent = dedupe_passwords(recent_passwords or [])
     clipboard = dedupe_passwords(clipboard_passwords or [])
-    builtin = get_builtin_passwords() if use_builtin_passwords else []
+    snapshot = (password_snapshot if password_snapshot is not None else password_file_source().snapshot) if use_builtin_passwords else EMPTY_PASSWORD_SNAPSHOT
     store = PasswordStore.from_sources(
         cli_passwords=user_passwords,
         clipboard_passwords=clipboard,
         recent_passwords=recent,
-        builtin_passwords=builtin,
+        password_snapshot=snapshot,
     )
     return CliPasswordSummary(
         user_passwords=store.user_passwords,
         clipboard_passwords=store.clipboard_passwords,
         recent_passwords=store.recent_passwords,
         builtin_passwords=store.builtin_passwords,
-        combined_passwords=store.candidates(),
         use_builtin_passwords=use_builtin_passwords,
+        password_snapshot=snapshot,
     )
 
 
@@ -205,9 +203,6 @@ def apply_runtime_config_overrides(config: dict, args, *, base_dir: str | None =
     if getattr(args, "allow_partial", False):
         overrides["content_requirement"] = "allow_partial"
         section("extraction", {})["content_requirement"] = "allow_partial"
-    if getattr(args, "directory_passwords", None) is not None:
-        overrides["directory_passwords"] = bool(args.directory_passwords)
-        section("passwords", {})["directory_passwords_enabled"] = bool(args.directory_passwords)
     apply_config_overrides(config, payload)
     return overrides
 
@@ -255,4 +250,4 @@ def inspect_result_to_item(res) -> dict[str, Any]:
     }
 
 def password_summary_item(summary: CliPasswordSummary) -> dict[str, Any]:
-    return asdict(summary)
+    return {**{f.name: getattr(summary, f.name) for f in fields(summary) if f.name != "password_snapshot"}, "combined_passwords": summary.combined_passwords}

@@ -242,7 +242,7 @@ def test_pipeline_runner_uses_tmp_path_and_applies_success_postprocess(tmp_path,
             "flatten_single_directory": True,
         },
     }, precheck=[
-        {"name": "size_range", "enabled": True, "gte": 0},
+        {"name": "size_range", "enabled": True, "min_bytes": 0},
         {"name": "zip_structure_accept", "enabled": True},
     ]))
 

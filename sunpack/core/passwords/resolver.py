@@ -196,7 +196,7 @@ class PasswordResolver:
         task: Any | None = None,
         part_paths: list[str] | None = None,
         archive_key: str = "",
-        directory_passwords: list[str] | None = None,
+        scope_path: str = "",
     ) -> PasswordResolution:
         archive_key = archive_key or _archive_key(task) or archive_path
         if self.password_session.has_resolved(archive_key):
@@ -222,9 +222,8 @@ class PasswordResolver:
             archive_input=archive_input,
         )
 
-        directory_passwords = list(directory_passwords or [])
         has_candidates = self.password_tester.password_store.has_candidates(
-            directory_passwords=directory_passwords
+            scope_path=scope_path
         )
         if not has_candidates:
             if password_state == "required":
@@ -247,7 +246,7 @@ class PasswordResolver:
             task=task,
             part_paths=part_paths,
             fingerprint=fingerprint,
-            directory_passwords=directory_passwords,
+            scope_path=scope_path,
             include_empty=password_state == "unknown",
         )
         if search.status in {
@@ -263,9 +262,7 @@ class PasswordResolver:
                 self._promote_success(resolution.password)
             return resolution
         if search.extraction_candidates:
-            candidate_passwords = tuple(
-                dict.fromkeys(search.extraction_candidates)
-            )
+            candidate_passwords = tuple(search.extraction_candidates)
             return self._confirmation_resolution(
                 archive_key,
                 candidate_passwords[0],
@@ -315,13 +312,13 @@ class PasswordResolver:
         task: Any | None,
         part_paths: list[str] | None,
         fingerprint,
-        directory_passwords: list[str] | None,
+        scope_path: str,
         include_empty: bool = False,
     ) -> PasswordSearchResult:
         archive_input = self._archive_input_for_password_probe(task)
         candidates = PasswordCandidatePipeline.from_password_store(
             self.password_tester.password_store,
-            directory_passwords=directory_passwords,
+            scope_path=scope_path,
             include_empty=include_empty,
         )
         return self.password_scheduler.plan_for_extraction(PasswordJob(

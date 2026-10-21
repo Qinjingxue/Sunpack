@@ -20,10 +20,6 @@ class RelationsScheduler:
         """Forward discovered-password notifications to the watch scheduler."""
         self._builder.set_password_callback(callback)
 
-    def refresh_password_sources(self) -> None:
-        """Synchronize the relation prober's store with live sources."""
-        self._builder.refresh_password_sources()
-
     def build_candidate_groups(
         self,
         snapshot: DirectorySnapshot,

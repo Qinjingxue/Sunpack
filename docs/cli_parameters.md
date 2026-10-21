@@ -79,8 +79,7 @@ Options:
 | `-p PASSWORD`, `--password PASSWORD` | Provide one extraction password; may be repeated. |
 | `-P PASSWORD_FILE`, `--pw-file PASSWORD_FILE` | Read passwords from a text file, one per line. |
 | `-a`, `--ask-pw` | Prompt for passwords interactively in the terminal; an empty line ends input. |
-| `--no-builtin-pw`, `--no-bpw` | Disable the built-in password table. |
-| `--no-dir-pw`, `--no-dpw` | Disable `sunpack-passwords.txt` from the archive's own directory. |
+| `--no-builtin-pw`, `--no-bpw` | Disable persistent JSON passwords, including clipboard history. |
 | `-d`, `--deep-detect` | Enable a full embedded scan for unresolved candidates and disable all filesystem scan filters for this request. |
 | `-r VALUE`, `--recur VALUE` | Override the number of nested extraction rounds; accepts a positive integer, `*`, or `?`. |
 | `-c VALUE`, `--cleanup VALUE` | Override how the original archive is handled on success: `d` delete, `r` Recycle Bin, `k` keep. |
@@ -198,7 +197,7 @@ Subcommands and options:
 | `add PATH...` | `-s`, `--start` | Start continuous monitoring after adding. |
 | `add PATH...` | `-i`, `--initial-scan` | Run an initial scan for newly added roots or roots whose deep mode changed. |
 | `add PATH...` | `-d`, `--deep-detect` | Persist `deep_detect=true` for each input root; update already registered roots too. |
-| `remove PATH...`, `rm PATH...` | — | Remove a monitored root by input directory, and clean up that root's per-directory password file. |
+| `remove PATH...`, `rm PATH...` | — | Remove a monitored root by input directory. |
 | `list`, `ls` | — | List the persisted input directories. |
 | `reload` | — | Re-read the configuration and monitored roots. |
 | `stop` | — | Stop continuous monitoring. |
@@ -233,10 +232,9 @@ Options:
 | `-p PASSWORD`, `--password PASSWORD` | Provide a password; may be repeated. |
 | `-P PASSWORD_FILE`, `--pw-file PASSWORD_FILE` | Read passwords from a text file, one per line. |
 | `-a`, `--ask-pw` | Prompt for passwords interactively in the terminal. |
-| `--no-builtin-pw`, `--no-bpw` | Do not use the built-in password table. |
-| `--no-dir-pw`, `--no-dpw` | This command has no target archive and will not read a per-directory password file; in `extract` it disables per-directory passwords. |
+| `--no-builtin-pw`, `--no-bpw` | Do not use persistent JSON passwords or clipboard history. |
 
-Because `passwords` has no archive path, it outputs a summary of command-line input, the most recent successful password, clipboard passwords, and built-in passwords; it does not load `sunpack-passwords.txt` for any directory. During archive extraction, the candidate order is "most recent successful password → per-directory passwords → CLI arguments and password files → clipboard → built-in passwords". Duplicates are removed, and the empty password is tried first when necessary.
+`passwords` has no archive path and summarizes global candidates. Extraction tries eligible recent successes first, then matching JSON scopes, CLI input, the current clipboard, and JSON global passwords and clipboard history. Candidates are deduplicated, with an empty password tried first when necessary.
 
 Examples:
 

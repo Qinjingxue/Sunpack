@@ -5,16 +5,12 @@
   "runtime": {
     "process_mode": "high"
   },
-  "watch": {
-    "directory_password_file_auto_create": true
-  },
   "recursive_extract": "*",
   "recursive_authorization": {
     "enabled": true
   },
   "embedded_scan": {
-    "enabled": true,
-    "recursive_candidate_ratio": 0.3
+    "enabled": true
   },
   "post_extract": {
     "archive_cleanup_mode": "r",
@@ -89,12 +85,14 @@
       {
         "name": "size_range",
         "enabled": true,
-        "range": "r > 0 B"
+        "min_bytes": 1,
+        "max_bytes": null
       },
       {
         "name": "mtime_range",
         "enabled": false,
-        "date": "20270101 00:00 > d >= 20240101 00:00"
+        "start_utc": null,
+        "end_utc": null
       }
     ]
   }

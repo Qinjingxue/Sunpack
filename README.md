@@ -22,6 +22,7 @@
 
 - [安装说明](#安装说明)
 - [使用指南](#使用指南)
+  - [图形管理面板](#图形管理面板)
   - [命令速览](#命令速览)
   - [密码管理](#密码管理)
 - [核心能力](#核心能力)
@@ -46,7 +47,7 @@
 
 ### 系统要求
 
-SunPack 仅支持 Windows 10 版本 1703 及更高版本和 Windows 11。其中Watch模式仅支持NTFS文件系统。
+SunPack 仅支持 Windows 10 版本 1709 及更高版本和 Windows 11。其中Watch模式仅支持NTFS文件系统。
 
 从 [GitHub Releases](https://github.com/Qinjingxue/Sunpack/releases/latest) 下载最新的 `sunpack-windows-<arch>-<version>-setup.exe`
 
@@ -67,6 +68,17 @@ $r = Invoke-RestMethod 'https://api.github.com/repos/Qinjingxue/Sunpack/releases
 
 ## 使用指南
 
+### 图形管理面板
+
+从 Watch 托盘打开管理面板，任务、监控目录、密码与配置集中管理。
+
+- **程序小巧**：GUI 本体约 4 MB，内存占用低。
+- **无需额外运行时**：纯C++ 仿Windows 界面，不依赖浏览器内核、.NET 等外部运行时。
+- **启动快、操作流畅**：打开和交互响应迅速，任务、目录、密码与配置一屏管理。
+- **用完即退出**：关闭窗口后 GUI 完全退出，不在后台常驻。
+
+![SunPack 任务状态：按目录筛选，查看成功、处理中及等待密码或分卷的任务](docs/images/gui.zh-CN.png)
+
 ### 命令速览
 
 | 命令        | 简写  | 说明                                         |
@@ -84,12 +96,15 @@ $r = Invoke-RestMethod 'https://api.github.com/repos/Qinjingxue/Sunpack/releases
 
 ### 密码管理
 
+在[图形管理面板](#图形管理面板)的“密码管理”页中，可按目录编辑密码，或将剪贴板历史保存为候选密码。
+
 Sunpack为达到最大方便性，在使用时会尝试从各处获取密码，高速尝试所有候选密码，在上千候选密码下几乎无感速度，自动找到正确密码并使用，使用的密码来源有：
 
-- 内置密码文件：每次解压均使用，可在watch模式下使用托盘右键菜单打开修改，安装版位于%ProgramData%\SunPack\builtin_passwords.txt。其中watch模式会自动收集剪贴板历史记录写入该文件，上限配置默认30条
+- JSON 密码文件：安装版位于 `%ProgramData%\SunPack\builtin_passwords.json`，可在管理面板的“密码管理”页面编辑。`passwords` 中的记录使用 `value` 保存密码，可用 `scopes` 指定多个绝对目录；省略即全局生效。Watch 自动维护独立的 `clipboard_history`，默认最多 30 条。
 - 用户输入：右键菜单，CLI调出的交互输入密码模式的输入
 - 剪贴板：解压前自动读取剪贴板文本作为密码
-- 目录下的密码记录文件：自动寻找目录下的sunpack-passwords.txt，读取每行作为一个密码；watch模式默认会自动创建，可将 `watch.directory_password_file_auto_create` 设为 `false` 关闭自动创建
+
+最近成功记录仅调整本次有效候选的顺序，不会扩大密码作用域。密码文件变化通过文件事件热更新。
 
 ---
 
@@ -243,7 +258,7 @@ uv run --locked pytest
 
 ## 致谢
 
-感谢所有为 SunPack 提交代码、报告问题和提供建议的贡献者与用户。SunPack 也受益于众多开源项目，特别感谢 [7-Zip](https://www.7-zip.org/)、[zlib-ng](https://github.com/zlib-ng/zlib-ng)、[LZ4](https://github.com/lz4/lz4) 和 [RustCrypto](https://github.com/RustCrypto) 项目及其维护者。相关第三方组件和许可证信息见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+感谢所有为 SunPack 提交代码、报告问题和提供建议的贡献者与用户。SunPack 也受益于众多开源项目，特别感谢 [Core UI](https://github.com/ghboke/core-ui)（SunPack 的原生 UI 技术栈）、[7-Zip](https://www.7-zip.org/)、[zlib-ng](https://github.com/zlib-ng/zlib-ng)、[LZ4](https://github.com/lz4/lz4) 和 [RustCrypto](https://github.com/RustCrypto) 项目及其维护者。相关第三方组件和许可证信息见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 
 ## 许可证
 

@@ -60,9 +60,10 @@ def test_plan7_disguised_split_nested_carrier_survives_two_restarts_and_password
         # Promoted inner inputs use the ordinary watch-root password scope.
         restored = third.watcher.state.failed_password_entries_under(str(password_scope))
         assert [Path(item.path) for item in restored] == [retry_input]
-        password_file = password_scope / "sunpack-passwords.txt"
-        password_file.write_text("\n".join(["wrong-again", *case.passwords]) + "\n", encoding="utf-8")
-        third.watcher.notify_password_table_changed(str(password_file))
+        from tests.helpers.passwords import write_password_json
+        password_file = third.watcher._password_file_source.path
+        write_password_json(password_file, scopes=[(password, [str(password_scope)]) for password in ["wrong-again", *case.passwords]])
+        third.watcher.notify_password_source_changed("builtin_password_file")
         result = drive_watch_until(third.watcher, lambda: marker_present(third.output_root, case.blocked.marker_name))
         assert result.failed == 0
         assert result.succeeded == 1

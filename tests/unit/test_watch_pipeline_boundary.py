@@ -4,9 +4,11 @@ from types import SimpleNamespace
 import asyncio
 import pytest
 
+from sunpack.core.contracts.archive_input import ArchiveInputDescriptor, InputExtent
 from sunpack.core.contracts.pipeline import PipelineDiscovery
 from sunpack.pipeline.coordinator.engine import _CompletedWatchOutput, _PathLeaseRegistry, _RequestRuntime
 from sunpack.runtime.watch.scheduler import _response_claimed_paths
+from tests.helpers.archive_tasks import make_task_from_descriptor
 
 
 def test_watch_consumes_pipeline_claimed_paths_without_reconstructing_membership(tmp_path):
@@ -68,7 +70,10 @@ def test_retry_checks_completed_final_family_after_acquiring_lease(tmp_path):
             detection_options=SimpleNamespace(force_scan=False))
         runtime.source_cleanup = SimpleNamespace(register=lambda tasks: None)
         runtime._report_progress = lambda task, event: None
-        task = SimpleNamespace(all_parts=list(map(str, parts)), cleanup_parts=[], runtime={})
+        task = make_task_from_descriptor(ArchiveInputDescriptor(
+            str(parts[0]), open_mode="concat_ranges", logical_name="a.7z",
+            extents=[InputExtent(str(path)) for path in parts],
+        ))
         with pytest.raises(_CompletedWatchOutput) as stopped:
             await runtime._ensure_task_lease(task)
         assert stopped.value.output_dir == str(output)

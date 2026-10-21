@@ -142,7 +142,7 @@ class DiscoveryScanSession:
         if encrypted:
             builder = self.relations._builder
             groups = [builder._candidate_group_from_native(raw) for raw in encrypted]
-            discovered = builder._discover_directory_passwords([group for group in groups if group is not None])
+            discovered = builder._discover_passwords([group for group in groups if group is not None])
             if discovered:
                 table.retry_relations(
                     snapshot.raw_native_snapshot,

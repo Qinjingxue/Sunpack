@@ -20,6 +20,7 @@ _ROWS = [
     ("reader", "embedded-scan", "benchmarks.scenarios.reader_embedded_scan", "Native and CLI embedded scanning."),
     ("reader", "volume-anchor", "benchmarks.scenarios.reader_volume_anchor", "Bounded native volume-anchor probing."),
     ("memory", "residual-rss", "benchmarks.scenarios.memory_residual_rss", "Residual RSS and Python allocations."),
+    ("memory", "password-store", "benchmarks.scenarios.password_store", "Password snapshot memory and unrelated-scope query scaling."),
     ("memory", "watch-source-indexes", "benchmarks.scenarios.watch_source_index_retention", "Watch source-index object collection and empty-table capacity across unique batches."),
     ("memory", "worker-manifest", "benchmarks.scenarios.memory_worker_manifest", "Native manifest materialization."),
     ("memory", "many-tasks", "benchmarks.scenarios.memory_many_tasks", "Python and native worker memory growth across formats."),

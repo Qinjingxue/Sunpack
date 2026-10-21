@@ -41,25 +41,19 @@ from sunpack.runtime.watch.scanner import (
     watch_volume_cursor,
 )
 from sunpack.runtime.watch.scanner import _candidate_for as _watch_candidate_for_path
-from sunpack.runtime.watch.state import WatchStateEntry, WatchStateStore
+from sunpack.runtime.watch.state import WatchStateEntry, WatchStateStore, _recorded_file_presence
 from sunpack.runtime.watch.roots import WatchRootEntry
 from sunpack.runtime.watch.toast import NullWatchNotificationSink
 from sunpack.core.i18n import I18nContext
 from sunpack.core.passwords.internal import builtin as builtin_passwords_module
-from sunpack.core.passwords.internal.builtin import get_builtin_passwords
+from sunpack.core.passwords.internal.builtin import password_file_source
 from sunpack.core.passwords.internal.clipboard_monitor import ClipboardPasswordMonitor
 from sunpack.core.passwords.internal.lists import dedupe_passwords
-from sunpack.core.passwords.internal.local_files import (
-    DIRECTORY_PASSWORD_FILE_NAME,
-    discover_directory_passwords_for_archive,
-    is_directory_password_file,
-)
-from sunpack.core.passwords.internal.store import MAX_RECENT_PASSWORDS
+
 from sunpack.core.support.collections import dedupe_normalized_paths
 from sunpack.core.support.resource_lifecycle import (
     ResourceKind,
     lifecycle_registration,
-    open_service_file,
     register_service_resource,
 )
 from sunpack.pipeline.postprocess.output_cleanup import (
@@ -129,6 +123,7 @@ class _ActivePipelineRequest:
     source_input_root: str = ""
     deep_detect: bool = False
     source_paths: tuple[str, ...] = ()
+    password_scope_dir: str = ""
 
 
 class WatchScheduler:
@@ -237,7 +232,8 @@ class WatchScheduler:
         self._latest_observations: dict[str, _CandidateObservation] = {}
         self._quiet_trackers: dict[str, AdaptiveQuietTracker] = {}
         self._closed = False
-        self._password_dirty_dirs: dict[str, float] = {}
+        self._password_reload_at: float | None = None
+        self._password_retry_at: float | None = None
         self._observer = Observer()
         self._observer_resource = None
         self._started = False
@@ -289,17 +285,13 @@ class WatchScheduler:
             ),
         )
         self.password_retry_debounce_seconds = max(0.0, float(watch_config["password_retry_debounce_seconds"]))
-        self.password_retry_include_subtree = bool(watch_config["password_retry_include_subtree"])
-        self.directory_password_file_auto_create = bool(watch_config["directory_password_file_auto_create"])
         self._configured_user_passwords = dedupe_passwords(list(config.get("user_passwords") or []))
-        self._configured_builtin_passwords = dedupe_passwords(list(config.get("builtin_passwords") or []))
+        self._password_file_source = password_file_source()
         self.builtin_password_file = os.path.abspath(str(builtin_passwords_module.builtin_password_path()))
-        self._recent_passwords: list[str] = []
         self._password_source_signature = self._refresh_password_sources()
         if self.state.record_password_source_signature(self._password_source_signature):
             self._mark_all_password_failures_dirty()
         self._clipboard_monitor = ClipboardPasswordMonitor(
-            on_passwords_changed=self.notify_password_source_changed,
             enabled=bool(watch_config["clipboard_monitor_enabled"]),
             max_entries=int(watch_config["clipboard_builtin_max_entries"]),
         )
@@ -332,7 +324,6 @@ class WatchScheduler:
             raise RuntimeError("Watch scheduler is closed")
         if self._started:
             return
-        self._ensure_directory_password_files()
         self._prepare_usn_startup_baseline()
         removed_entries = self.state.prune_missing_records()
         if removed_entries:
@@ -364,6 +355,7 @@ class WatchScheduler:
             except BaseException:
                 self._release_observer()
                 raise
+        self._publish_password_update()
         self._clipboard_monitor.start()
         self._started = True
         self._recover_persisted_work()
@@ -619,10 +611,7 @@ class WatchScheduler:
             if not os.path.exists(entry.path):
                 continue
             if entry.status == "failed_password":
-                payload = entry.failure_payload if isinstance(entry.failure_payload, dict) else {}
-                previous = str(payload.get("password_scope_signature") or "")
-                current = _directory_password_signature(entry.password_scope_dir, self.config)
-                if entry.password_generation < self.state.password_generation or previous != current:
+                if entry.password_generation < self.state.password_generation:
                     self.enqueue(
                         entry.path,
                         force=True,
@@ -639,20 +628,6 @@ class WatchScheduler:
                     force=True,
                     event_type="startup_missing_volume_reconcile",
                 )
-
-    def _ensure_directory_password_files(self) -> None:
-        if not self.directory_password_file_auto_create:
-            return
-        for root in self.watch_roots:
-            if not os.path.isdir(root):
-                continue
-            password_file = Path(root) / DIRECTORY_PASSWORD_FILE_NAME
-            if not is_directory_password_file(str(password_file), self.config):
-                continue
-            try:
-                open_service_file(password_file, "x", encoding="utf-8").close()
-            except FileExistsError:
-                pass
 
     async def stop(self):
         await self.pipeline_engine.work_broker.run(
@@ -715,7 +690,8 @@ class WatchScheduler:
                 self._active_claims.clear()
                 self._claims_by_owner.clear()
                 self._dirty_during_claim.clear()
-                self._password_dirty_dirs.clear()
+                self._password_reload_at = None
+                self._password_retry_at = None
 
     def _stop_blocking(self):
         if not self._started:
@@ -736,7 +712,16 @@ class WatchScheduler:
         self._observer.join(timeout=self.observer_stop_timeout_seconds)
 
     async def run_once(self) -> WatchRunResult:
-        self._process_password_dirty_dirs(time.monotonic())
+        now = time.monotonic()
+        with self._lock:
+            reload_due = self._password_reload_at is not None and self._password_reload_at <= now
+            if reload_due:
+                self._password_reload_at = None
+        if reload_due:
+            await self.pipeline_engine.work_broker.run(
+                "password_reload", "watch", self._publish_password_update, request_id="watch", origin="watch",
+            )
+        self._process_password_retries(time.monotonic())
         result = await self._harvest_completed_requests()
         ready = self._pop_ready(time.time())
         active_requests = []
@@ -941,15 +926,10 @@ class WatchScheduler:
                 if next_ready is None
                 else max(0.0, next_ready[0] - now)
             )
-            if self._password_dirty_dirs:
-                password_delay = max(
-                    0.0,
-                    min(
-                        changed_at + self.password_retry_debounce_seconds - monotonic_now
-                        for changed_at in self._password_dirty_dirs.values()
-                    ),
-                )
-                delay = password_delay if delay is None else min(delay, password_delay)
+            for deadline in (self._password_reload_at, self._password_retry_at):
+                if deadline is not None:
+                    password_delay = max(0.0, deadline - monotonic_now)
+                    delay = password_delay if delay is None else min(delay, password_delay)
             if self._cache_cleanup_deadline is not None and not self._cache_cleanup_blocked_locked():
                 cleanup_delay = max(0.0, self._cache_cleanup_deadline - monotonic_now)
                 delay = cleanup_delay if delay is None else min(delay, cleanup_delay)
@@ -1087,9 +1067,6 @@ class WatchScheduler:
         _state_prequeued: bool = False,
     ):
         if self.should_ignore_event_path(path):
-            return
-        if is_directory_password_file(path, self.config):
-            self._log_candidate_ignored(path, "directory_password_file")
             return
         lookup_path = os.path.abspath(path)
         with self._claim_gate:
@@ -1252,7 +1229,9 @@ class WatchScheduler:
         self._dirty_during_claim.setdefault(owner, {})[key] = normalized
         return True
 
-    def _claim_pipeline_sources(self, owner: str, paths: Iterable[str]) -> None:
+    def _claim_pipeline_sources(
+        self, owner: str, paths: Iterable[str], *, path: str = "", groups: list[dict] | None = None,
+    ) -> None:
         normalized = dedupe_normalized_paths(
             os.path.abspath(str(path))
             for path in paths
@@ -1289,6 +1268,8 @@ class WatchScheduler:
                     self._active_states.pop(candidate_path, None)
         self.log.write(
             "pipeline_sources_claimed",
+            path=path,
+            groups=groups or (),
             owner=owner,
             path_count=len(normalized),
             retired_pending=len(retired_pending),
@@ -1348,31 +1329,38 @@ class WatchScheduler:
             self.enqueue(path)
 
     def notify_password_source_changed(self, reason: str, path: str = "") -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._password_reload_at = time.monotonic() + self.password_retry_debounce_seconds
+        self._wake_service()
+
+    def _publish_password_update(self) -> None:
         with self._password_source_lock:
-            previous_signature = self._password_source_signature
             signature = self._refresh_password_sources()
-            if reason in {"builtin_password_file", "clipboard"} and signature == previous_signature:
+            if signature == self._password_source_signature:
                 return
             self._password_source_signature = signature
             generation = self.state.mark_password_source_changed(signature)
-            self.log.write("password_source_changed", reason=reason, path=path, password_generation=generation)
-            if path:
-                self.notify_password_table_changed(path, bump_generation=False)
-                return
+            self.log.write("password_source_changed", password_generation=generation)
             self._mark_all_password_failures_dirty()
-
-    def notify_password_table_changed(self, path: str, *, bump_generation: bool = True) -> None:
-        if bump_generation:
-            self.notify_password_source_changed("directory_password_file", path)
-            return
-        directory = os.path.dirname(os.path.abspath(path))
-        with self._lock:
-            self._password_dirty_dirs[directory] = time.monotonic()
-        self._wake_service()
 
     def notify_path_departed(self, path: str, *, recursive: bool = False) -> None:
         normalized = os.path.abspath(path)
         with self._claim_gate:
+            # Delete/move notifications may arrive after the path was recreated,
+            # or while it is temporarily unqueryable. Neither proves departure.
+            if _recorded_file_presence(normalized) is not False and not recursive:
+                return
+            missing_paths: dict[str, bool] = {}
+
+            def departed(candidate_path: str) -> bool:
+                if not _paths_match(candidate_path, normalized, recursive=recursive):
+                    return False
+                if candidate_path not in missing_paths:
+                    missing_paths[candidate_path] = _recorded_file_presence(candidate_path) is False
+                return missing_paths[candidate_path]
+
             claimed = [
                 (claim_path, owner)
                 for claim_path, owner in self._active_claims.items()
@@ -1389,7 +1377,7 @@ class WatchScheduler:
                 pending_paths = [
                     candidate_path
                     for candidate_path in self._pending
-                    if _paths_match(candidate_path, normalized, recursive=recursive)
+                    if departed(candidate_path)
                 ]
                 for candidate_path in pending_paths:
                     self._remove_pending_locked(candidate_path)
@@ -1397,14 +1385,14 @@ class WatchScheduler:
                 tracker_paths = [
                     candidate_path
                     for candidate_path in self._quiet_trackers
-                    if _paths_match(candidate_path, normalized, recursive=recursive)
+                    if departed(candidate_path)
                 ]
                 for candidate_path in tracker_paths:
                     self._quiet_trackers.pop(candidate_path, None)
                 observation_paths = [
                     candidate_path
                     for candidate_path in self._latest_observations
-                    if _paths_match(candidate_path, normalized, recursive=recursive)
+                    if departed(candidate_path)
                 ]
                 for candidate_path in observation_paths:
                     self._latest_observations.pop(candidate_path, None)
@@ -1417,11 +1405,13 @@ class WatchScheduler:
                 pending_record is not None
                 and (pending_record.active_outputs or pending_record.committed_roots)
             )
-            forgotten = (
-                False
-                if inflight_owned or recovery_armed
-                else self.state.forget_path(normalized, recursive=recursive)
-            )
+            if inflight_owned or recovery_armed:
+                # Only output recovery needs ownership protection. A blocker
+                # for a vanished source is already invalid, including siblings.
+                self.state.prune_missing_records(normalized, recursive=recursive)
+                forgotten = False
+            else:
+                forgotten = self.state.forget_path(normalized, recursive=recursive, missing_only=True)
         self.log.write(
             "candidate_departed",
             path=normalized,
@@ -1692,27 +1682,17 @@ class WatchScheduler:
             learn_interval=learn_interval,
         )
 
-    def _process_password_dirty_dirs(self, now: float) -> None:
-        ready_dirs: list[str] = []
+    def _process_password_retries(self, now: float) -> None:
         with self._lock:
-            for directory, changed_at in list(self._password_dirty_dirs.items()):
-                if now - changed_at >= self.password_retry_debounce_seconds:
-                    ready_dirs.append(directory)
-                    self._password_dirty_dirs.pop(directory, None)
-        for directory in ready_dirs:
-            entries = self.state.failed_password_entries_under(
-                directory,
-                include_subtree=self.password_retry_include_subtree,
-            )
-            for entry in entries:
-                if os.path.exists(entry.path):
-                    self.log.write("retry_password_failure", path=entry.path, directory=directory)
-                    self.enqueue(
-                        entry.path,
-                        force=True,
-                        event_type="password_retry",
-                        _password_retry_snapshot=entry,
-                    )
+            if self._password_retry_at is None or now < self._password_retry_at:
+                return
+            self._password_retry_at = None
+        for entry in self.state.entry_items():
+            if (entry.status == "failed_password"
+                    and entry.password_generation < self.state.password_generation
+                    and os.path.exists(entry.path)):
+                self.log.write("retry_password_failure", path=entry.path)
+                self.enqueue(entry.path, force=True, event_type="password_retry", _password_retry_snapshot=entry)
 
     async def _submit_candidate(
         self,
@@ -1736,19 +1716,7 @@ class WatchScheduler:
                 scope_dir = retry_entry.password_scope_dir
             elif pending is not None:
                 scope_dir = str(pending.password_scope_dir or "")
-            if scope_dir:
-                scoped_passwords = discover_directory_passwords_for_archive(
-                    os.path.join(scope_dir, "__sunpack_password_retry__"),
-                    self.config,
-                )
-                run_config["user_passwords"] = dedupe_passwords([
-                    *list(run_config.get("user_passwords") or []),
-                    *scoped_passwords,
-                ])
-            self.pipeline_engine.update_password_sources(
-                user_passwords=run_config.get("user_passwords", []),
-                builtin_passwords=run_config.get("builtin_passwords", []),
-            )
+            run_config["password_scope_dir"] = scope_dir or os.path.dirname(candidate.path)
         output_root = self._output_root_for(candidate.path)
         run_config["output"] = {
             **(run_config.get("output", {}) if isinstance(run_config.get("output"), dict) else {}),
@@ -1802,6 +1770,7 @@ class WatchScheduler:
             registry_owner=notification_id if host is not None else "",
             source_input_root=source_input_root,
             deep_detect=options.force_scan,
+            password_scope_dir=run_config["password_scope_dir"],
         )
         return request
 
@@ -1821,7 +1790,9 @@ class WatchScheduler:
                 # Reuse the published tuple. Keep this request's input evidence
                 # even if live source claims transfer to a newer family owner.
                 request.source_paths = tuple(source_paths)
-            self._claim_pipeline_sources(notification_id, source_paths)
+            self._claim_pipeline_sources(
+                notification_id, source_paths, path=owner_path, groups=event.get("groups"),
+            )
             return
         if name == "task_output_started":
             if not self.state.record_task_output_started(
@@ -1863,7 +1834,6 @@ class WatchScheduler:
             self._notify("suppressed", request.notification_id)
             return WatchRunResult(processed=1)
         summary = response.summary
-        self._remember_recent_passwords(response.recent_passwords)
         claimed_paths = _response_claimed_paths(response, candidate.path)
         coalesced_from = response.discovery.coalesced_from_request_id
         if coalesced_from:
@@ -1945,7 +1915,7 @@ class WatchScheduler:
                 # A successful sibling family may have consumed this input
                 # while an earlier incomplete request was still finishing.
                 # Never resurrect a blocker for a deleted physical input.
-                self.state.clear_entries([retry_path])
+                self.state.prune_missing_records(retry_path)
                 retired_failures.append(failure)
                 continue
             if self.pipeline_engine.completed_watch_family_output(
@@ -1957,12 +1927,11 @@ class WatchScheduler:
                 self.state.clear_entries([retry_path])
                 retired_failures.append(failure)
                 continue
-            scope_dir = os.path.dirname(os.path.abspath(retry_path))
+            scope_dir = request.password_scope_dir or os.path.dirname(os.path.abspath(candidate.path))
             blockers = ([BLOCKER_MISSING_VOLUME] if missing else []) + ([BLOCKER_PASSWORD] if password else [])
             payload = _failure_payload(
                 failure, path=retry_candidate.path, blockers=blockers,
                 password_scope_dir=scope_dir if password else "",
-                password_scope_signature=_directory_password_signature(scope_dir, self.config) if password else "",
                 source_input_root=self._source_input_root_for(retry_path),
             )
             error = _failure_message(failure, self.i18n.t("watch.failure.extraction_failed"))
@@ -1970,7 +1939,7 @@ class WatchScheduler:
             with self._password_source_lock:
                 # Publish before comparing under the same lock used by password
                 # updates: either this completion or the update queues a retry.
-                self.state.mark(
+                published = self.state.mark(
                     retry_candidate.path, retry_candidate.size, retry_candidate.mtime,
                     file_id=retry_candidate.file_id, change_usn=retry_candidate.change_usn,
                     status=status, error=error, failure_payload=payload,
@@ -1980,10 +1949,11 @@ class WatchScheduler:
                     password and not missing
                     and request.password_generation < self.state.password_generation
                 )
+            if not published:
+                retired_failures.append(failure)
+                continue
             if retry_password:
-                self.notify_password_table_changed(
-                    os.path.join(scope_dir, DIRECTORY_PASSWORD_FILE_NAME), bump_generation=False,
-                )
+                self._mark_all_password_failures_dirty()
             self.log.write(status, path=retry_candidate.path, error=error, failures=[payload])
             # Nuitka 4.1.3 loses list mutation tracking through a conditional receiver.
             if missing:
@@ -2195,38 +2165,18 @@ class WatchScheduler:
         return bool(self.metadata_dir and _is_relative_to(normalized, self.metadata_dir))
 
     def _refresh_password_sources(self) -> str:
-        with self._password_source_lock:
-            builtin_passwords = dedupe_passwords([*self._configured_builtin_passwords, *get_builtin_passwords()])
-            user_passwords = dedupe_passwords([*self._recent_passwords, *self._configured_user_passwords])
-            signature = _password_source_signature(
-                self._configured_user_passwords,
-                builtin_passwords,
-            )
-            self.config["user_passwords"] = user_passwords
-            self.config["builtin_passwords"] = builtin_passwords
-        return signature
-
-    def _remember_recent_passwords(self, passwords: Iterable[str] | None) -> None:
-        incoming = dedupe_passwords([str(value) for value in list(passwords or []) if str(value)])
-        with self._password_source_lock:
-            updated = dedupe_passwords([*incoming, *self._recent_passwords])
-            updated = updated[:MAX_RECENT_PASSWORDS]
-            if updated == self._recent_passwords:
-                return
-            self._recent_passwords = updated
-        self.notify_password_source_changed("recent_password")
+        snapshot = self._password_file_source.reload()
+        self.config["user_passwords"] = self._configured_user_passwords
+        self.config.pop("builtin_passwords", None)
+        self.config["password_snapshot"] = snapshot
+        return _password_source_signature(self._configured_user_passwords, snapshot.signature)
 
     def _mark_all_password_failures_dirty(self) -> None:
-        now = time.monotonic()
-        marked = False
-        entries = self.state.entry_items()
+        if not any(entry.status == "failed_password" for entry in self.state.entry_items()):
+            return
         with self._lock:
-            for entry in entries:
-                if entry.status == "failed_password":
-                    self._password_dirty_dirs[entry.password_scope_dir] = now
-                    marked = True
-        if marked:
-            self._wake_service()
+            self._password_retry_at = time.monotonic()
+        self._wake_service()
 
 
 class _WatchEventHandler(FileSystemEventHandler):
@@ -2268,9 +2218,6 @@ class _WatchEventHandler(FileSystemEventHandler):
         if self.scheduler.is_builtin_password_file(path):
             self.scheduler.notify_password_source_changed("builtin_password_file", path="")
             return
-        if is_directory_password_file(path, self.scheduler.config):
-            self.scheduler.notify_password_table_changed(path)
-            return
         self.scheduler.notify_path_departed(path, recursive=is_directory)
 
     def _handle(self, event: FileSystemEvent, event_type: str):
@@ -2285,9 +2232,6 @@ class _WatchEventHandler(FileSystemEventHandler):
             self.scheduler.notify_password_source_changed("builtin_password_file", path="")
             return
         if self.scheduler.should_ignore_event_path(path):
-            return
-        if is_directory_password_file(path, self.scheduler.config):
-            self.scheduler.notify_password_table_changed(path)
             return
         try:
             self.scheduler.enqueue(path, event_type=event_type, src_path=src_path)
@@ -2413,10 +2357,10 @@ def _summary_outcome_kind(summary: RunSummary, target_result: TargetRunResult | 
 
 def _password_source_signature(
     user_passwords: list[str],
-    builtin_passwords: list[str],
+    snapshot_signature: str,
 ) -> str:
     payload = json.dumps(
-        [user_passwords, builtin_passwords],
+        [user_passwords, snapshot_signature],
         ensure_ascii=False,
         separators=(",", ":"),
     ).encode("utf-8")
@@ -2437,7 +2381,6 @@ def _failure_payload(
     path: str = "",
     blockers: list[str] | None = None,
     password_scope_dir: str = "",
-    password_scope_signature: str = "",
     source_input_root: str = "",
 ) -> dict:
     payload = _failure_to_dict(failure)
@@ -2447,8 +2390,6 @@ def _failure_payload(
         payload["blockers"] = list(blockers)
     if password_scope_dir:
         payload["password_scope_dir"] = os.path.abspath(password_scope_dir)
-    if password_scope_signature:
-        payload["password_scope_signature"] = password_scope_signature
     if path:
         details = payload.get("details") if isinstance(payload.get("details"), dict) else {}
         payload["details"] = {**details, "path": os.path.abspath(path)}
@@ -2469,25 +2410,6 @@ def _password_scope_for_path(state: WatchStateStore, path: str) -> str:
         return entry.password_scope_dir
     pending = state.pending_work_for_path(path)
     return str(pending.password_scope_dir or "") if pending is not None else ""
-
-
-def _directory_password_signature(scope_dir: str, config: dict) -> str:
-    if not scope_dir:
-        return ""
-    path = os.path.join(os.path.abspath(scope_dir), DIRECTORY_PASSWORD_FILE_NAME)
-    if not is_directory_password_file(path, config):
-        return "disabled"
-    try:
-        stat_result = os.stat(path)
-    except FileNotFoundError:
-        return "missing"
-    except OSError as exc:
-        return f"unknown:{getattr(exc, 'winerror', None) or exc.errno or 0}"
-    return ":".join((
-        str(int(stat_result.st_size)),
-        str(stat_result.st_mtime_ns),
-        str(stat_result.st_ctime_ns),
-    ))
 
 
 def _summary_processed_no_tasks(summary: RunSummary) -> bool:

@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 
 from sunpack.core.contracts.failures import FailureInfo, FailureKind
-from sunpack.core.passwords.internal.local_files import DIRECTORY_PASSWORD_FILE_NAME
+from tests.helpers.passwords import write_password_json
 from sunpack.pipeline.coordinator.engine import PipelineEngine
 from sunpack.pipeline.coordinator.task_provider import ArchiveTaskProvider
 from sunpack.runtime.watch.scheduler import WatchScheduler
@@ -175,7 +175,7 @@ def test_cli_nested_disguised_split_groups_keep_failure_classifications(tmp_path
     try:
         result = subprocess.run(
             [*bootstrap, "extract", identity, "--json", "--no-pause",
-             "--no-builtin-pw", "--no-dir-pw", "--cleanup", "k", "--recur", "*", "--deep-detect",
+             "--no-builtin-pw", "--cleanup", "k", "--recur", "*", "--deep-detect",
              "--out-dir", str(output), "-p", "wrong-candidate", "-p", "known", str(outer)],
             cwd=root, env=environment,
             capture_output=True, text=True, encoding="utf-8", timeout=30,
@@ -329,9 +329,9 @@ def test_watch_dual_faults_resume_after_each_blocker_is_resolved(
                     missing.write_bytes(missing_data)
                     watcher.enqueue(str(missing), event_type="created")
                 else:
-                    table = case.archive_dir / DIRECTORY_PASSWORD_FILE_NAME
-                    table.write_text(password + "\n", encoding="utf-8")
-                    watcher.notify_password_table_changed(str(table))
+                    table = watcher._password_file_source.path
+                    write_password_json(table, scopes=[(password, [str(case.archive_dir)])])
+                    watcher.notify_password_source_changed("builtin_password_file")
 
             try:
                 watcher.enqueue(str(case.entry_path))

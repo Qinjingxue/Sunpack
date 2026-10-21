@@ -17,7 +17,7 @@ def scan_config(blocked_files=None, blocked_extensions=None):
             "directory_scan_mode": "*",
         },
     }, precheck=[
-        {"name": "size_range", "enabled": True, "gte": 0},
+        {"name": "size_range", "enabled": True, "min_bytes": 0},
         {
             "name": "blacklist",
             "enabled": True,

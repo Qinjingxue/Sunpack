@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from sunpack.core.passwords.candidates import PasswordCandidatePipeline, PasswordCandidate
+
 import time
 from dataclasses import dataclass
 from enum import Enum
@@ -7,7 +9,6 @@ from itertools import chain, islice
 from typing import Literal
 
 from sunpack.core.passwords.cache import PasswordAttemptCache
-from sunpack.core.passwords.candidates import PasswordCandidate
 from sunpack.core.passwords.fingerprint import build_archive_fingerprint
 from sunpack.core.passwords.job import PasswordJob
 from sunpack.core.passwords.verifier import PasswordBatchVerification, PasswordVerifier, PasswordVerifierRegistry
@@ -94,7 +95,7 @@ class PasswordScheduler:
             archive_input=job.archive_input,
         )
         cached_success = self.cache.get_success(fingerprint.key)
-        if cached_success is not None:
+        if cached_success is not None and _allows_cached_password(job, cached_success):
             result = PasswordSearchResult(
                 password=cached_success,
                 status=(
@@ -185,7 +186,7 @@ class PasswordScheduler:
             archive_input=job.archive_input,
         )
         cached_success = self.cache.get_success(fingerprint.key)
-        if cached_success is not None:
+        if cached_success is not None and _allows_cached_password(job, cached_success):
             result = PasswordSearchResult(
                 password=cached_success,
                 status=(
@@ -199,17 +200,19 @@ class PasswordScheduler:
             self._emit_finished(job, result, started_at, candidates_seen=0, skipped=0)
             return result
 
-        seen: set[str] = set()
+        pipeline = job.candidate_pipeline()
+        seen: set[str] | None = None if isinstance(pipeline, PasswordCandidatePipeline) else set()
         skipped = 0
         candidates_seen = 0
 
         def available_candidates():
             nonlocal skipped, candidates_seen
-            for candidate in job.candidate_pipeline():
+            for candidate in pipeline:
                 password = _candidate_value(candidate)
-                if password in seen:
-                    continue
-                seen.add(password)
+                if seen is not None:
+                    if password in seen:
+                        continue
+                    seen.add(password)
                 if self.cache.has_negative(fingerprint.key, password):
                     skipped += 1
                     continue
@@ -515,3 +518,16 @@ def _call_fast_verifier(
         part_paths=part_paths,
         archive_input=archive_input,
     )
+
+
+def _allows_cached_password(job: PasswordJob, password: str) -> bool:
+    if password == "":
+        return True
+    candidates = job.candidate_pipeline()
+    if isinstance(candidates, PasswordCandidatePipeline):
+        return candidates.allows(password)
+    # Bare iterables are caller-owned; only a repeatable collection can validate
+    # a cache hit without consuming the upcoming verifier stream.
+    if iter(candidates) is candidates:
+        return False
+    return any((candidate.value if isinstance(candidate, PasswordCandidate) else candidate) == password for candidate in candidates)

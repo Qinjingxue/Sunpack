@@ -165,6 +165,8 @@ if ($null -eq $nativeExtension) {
 
 Assert-PeMachine -LiteralPath (Join-Path $root "sunpack.exe") -BuildArch $Arch -Description "sunpack.exe"
 Assert-PeMachine -LiteralPath (Join-Path $root "sunpack-runtime.exe") -BuildArch $Arch -Description "sunpack-runtime.exe"
+Assert-PeMachine -LiteralPath (Join-Path $root "SunPackGUI.exe") -BuildArch $Arch -Description "SunPackGUI.exe"
+Assert-PeSubsystem -LiteralPath (Join-Path $root "SunPackGUI.exe") -Expected 2 -Description "SunPackGUI.exe"
 Assert-PeSubsystem -LiteralPath (Join-Path $root "sunpack.exe") -Expected 3 -Description "sunpack.exe"
 Assert-PeSubsystem -LiteralPath (Join-Path $root "sunpack-runtime.exe") -Expected 2 -Description "sunpack-runtime.exe"
 Assert-PathMissing -LiteralPath (Join-Path $root "sunpack-watch.exe") -Description "retired duplicate watch executable"

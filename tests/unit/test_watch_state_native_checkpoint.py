@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 import pytest
 
@@ -10,6 +11,7 @@ def test_native_checkpoint_persists_only_declared_dataclass_fields(tmp_path):
     state_path = tmp_path / "state.json"
     state = WatchStateStore(str(state_path))
     archive = tmp_path / "archive.7z"
+    archive.touch()
     state.mark(
         str(archive),
         7,
@@ -43,6 +45,7 @@ def test_native_state_replay_preserves_fractional_mtime_identity(tmp_path, stora
         file_id="same-file", change_usn=600524574000,
     ) for name in ("archive.7z.001", "İ.7z.001", "i\u0307.7z.001")]
     for candidate in candidates:
+        Path(candidate.path).touch()
         state.queue_active(candidate, durable_owner=True, durable=True)
         state.mark(
             candidate.path, candidate.size, candidate.mtime,
@@ -73,6 +76,7 @@ def test_idle_trim_releases_peak_capacity_without_losing_live_or_frozen_state(tm
     for candidate in candidates:
         state.queue_active(candidate, persist=False)
     for candidate in candidates[:32]:
+        Path(candidate.path).touch()
         state.mark(candidate.path, candidate.size, candidate.mtime, status="failed_password")
     state.merge_watch_cursors({"c:": {"journal_id": 1, "next_usn": 2}})
     state.mark_password_source_changed("password-set")

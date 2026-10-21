@@ -3,7 +3,7 @@ from datetime import datetime
 
 from sunpack.pipeline.discovery.filesystem.filters.modules.mtime_range import (
     MtimeRangeScanFilter,
-    _mtime_or_none,
+    utc_minute_ns,
 )
 from sunpack.pipeline.extraction.internal.workflow.single_archive_extractor import (
     SingleArchiveExtractor,
@@ -57,13 +57,15 @@ def test_async_worker_failure_reaches_failed_process_fallback():
     assert result == "failed-process"
 
 
-def test_compact_yyyymmdd_is_parsed_as_a_date_before_numeric_timestamp():
-    expected = int(datetime.strptime("20240101", "%Y%m%d").timestamp() * 1_000_000_000)
-
-    assert _mtime_or_none("20240101") == expected
-
-    configured = MtimeRangeScanFilter.from_config({"since": "20240101"})
+def test_time_filter_only_accepts_utc_minutes():
+    import pytest
+    from datetime import timezone
+    expected = int(datetime(2024, 1, 1, tzinfo=timezone.utc).timestamp()) * 1_000_000_000
+    configured = MtimeRangeScanFilter.from_config({"start_utc": "2024-01-01T00:00Z"})
     assert configured.value_range.gte == expected
+    for value in ("20240101", "2024-01-01T00:00:00Z", "2024-01-01T00:00+08:00", expected):
+        with pytest.raises(ValueError):
+            utc_minute_ns(value)
 
 
 def test_async_retry_resubmits_without_timed_backoff(monkeypatch):

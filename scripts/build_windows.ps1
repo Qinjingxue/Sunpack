@@ -1101,6 +1101,10 @@ if ($runAcceptanceTests) {
     Write-Host "Skipping acceptance tests by request" -ForegroundColor Yellow
 }
 
+Write-Step "Building Core UI management panel"
+$guiBuildDir = Join-Path $repoRoot (".cache\gui-" + $buildArch)
+& (Join-Path $repoRoot "scripts\build_gui.ps1") -Arch $buildArch -CMakeCommand $cmakeCommand -BuildDir $guiBuildDir -Jobs $BuildJobs -SkipTests:$SkipTests -ApplicationOnly:$SkipTests
+
 Write-Step "Building Windows release with Nuitka"
     $nuitkaEntryRoot = Join-Path $nuitkaBuildRoot "entries"
     $nuitkaRuntimeEntryPath = Join-Path $nuitkaEntryRoot "sunpack-runtime.py"
@@ -1125,6 +1129,9 @@ Write-Step "Building Windows release with Nuitka"
         (Join-Path $nuitkaRuntimeDist $runtimeExeName)
     )
     Copy-NuitkaDistContents -Source $nuitkaRuntimeDist -Destination $distAppRoot
+Copy-Item -LiteralPath (Join-Path $guiBuildDir "Release\SunPackGUI.exe") -Destination (Join-Path $distAppRoot "SunPackGUI.exe") -Force
+Assert-PeMachine -LiteralPath (Join-Path $distAppRoot "SunPackGUI.exe") -BuildArch $buildArch -Description "Packaged GUI manager"
+Assert-PeSubsystem -LiteralPath (Join-Path $distAppRoot "SunPackGUI.exe") -Expected 2 -Description "Packaged GUI manager"
 Copy-Item -LiteralPath $launcherBuildPath -Destination $distExePath -Force
 New-Item -ItemType Directory -Path $distServiceRoot -Force | Out-Null
 Copy-Item -LiteralPath $watchBrokerBuildPath -Destination $distWatchBrokerPath -Force
@@ -1142,12 +1149,12 @@ Assert-PathMissing -LiteralPath (Join-Path $distAppRoot "sunpack-watch.exe") -De
 Assert-PackagedNativeExtension -PackageRoot $distAppRoot -BuildArch $buildArch
 
 Write-Step "Adding release metadata and helper scripts"
-$distPasswordPath = Join-Path $distAppRoot "builtin_passwords.txt"
+$distPasswordPath = Join-Path $distAppRoot "builtin_passwords.json"
 $distConfigPath = Join-Path $distAppRoot "sunpack_config.json"
 $distWatchRootsPath = Join-Path $distAppRoot "sunpack_watch_roots.txt"
 $distAdvancedConfigPath = Join-Path $distAppRoot "sunpack_advanced_config.json"
 $distIconPath = Join-Path $distAppRoot "sunpack.ico"
-Copy-Item -LiteralPath (Join-Path $repoRoot "builtin_passwords.txt") -Destination $distPasswordPath -Force
+Copy-Item -LiteralPath (Join-Path $repoRoot "builtin_passwords.json") -Destination $distPasswordPath -Force
 Copy-Item -LiteralPath (Join-Path $repoRoot "sunpack_config.json") -Destination $distConfigPath -Force
 Copy-IfExists -Source (Join-Path $repoRoot "sunpack_watch_roots.txt") -Destination $distWatchRootsPath
 Copy-Item -LiteralPath $iconPath -Destination $distIconPath -Force
@@ -1155,6 +1162,7 @@ Copy-IfExists -Source (Join-Path $repoRoot "sunpack_advanced_config.json") -Dest
 Copy-PackagedRuntimeTools -Source $toolsRoot -Destination $distToolsRoot
 
 New-Item -ItemType Directory -Path $distLicensesRoot -Force | Out-Null
+Copy-Item -Path (Join-Path $guiBuildDir "licenses\*.txt") -Destination $distLicensesRoot -Force
 Copy-Item -LiteralPath $mitLicensePath -Destination (Join-Path $distLicensesRoot "SunPack-MIT.txt") -Force
 Copy-Item -LiteralPath $sevenZipLicensePath -Destination (Join-Path $distLicensesRoot "7zip-license.txt") -Force
 Copy-Item -LiteralPath $sevenZipSourceLicensePath -Destination (Join-Path $distLicensesRoot "7zip-source-license.txt") -Force

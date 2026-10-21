@@ -43,12 +43,12 @@ def test_load_config_merges_simple_config_over_advanced_config(tmp_path, monkeyp
     advanced = tmp_path / "sunpack_advanced_config.json"
     payload = _advanced_payload()
     payload["runtime"] = {"process_mode": "background"}
-    payload["filesystem"]["scan_filters"] = [{"name": "size_range", "enabled": True, "range": "r >= 1 MB"}]
+    payload["filesystem"]["scan_filters"] = [{"name": "size_range", "enabled": True, "min_bytes": 1048576, "max_bytes": None}]
     _write_json(advanced, payload)
     _write_json(simple, {
         "cli": {"language": "zh"},
         "runtime": {"process_mode": "high"},
-        "filesystem": {"scan_filters": [{"name": "size_range", "enabled": True, "range": "r >= 2 MB"}]},
+        "filesystem": {"scan_filters": [{"name": "size_range", "enabled": True, "min_bytes": 2097152, "max_bytes": None}]},
         "performance": {"worker": {"minimum_available_memory_ratio": 0.2}},
     })
     monkeypatch.setattr(loader, "_candidate_config_paths", _layered_config_paths(simple, advanced))
@@ -56,7 +56,8 @@ def test_load_config_merges_simple_config_over_advanced_config(tmp_path, monkeyp
     assert config["cli"]["language"] == "zh"
     assert config["runtime"]["process_mode"] == "high"
     assert config["filesystem"]["directory_scan_mode"] == "recursive"
-    assert config["filesystem"]["scan_filters"][0]["range"] == "r >= 2 MB"
+    assert config["filesystem"]["scan_filters"][0]["min_bytes"] == 2097152
+    assert config["filesystem"]["scan_filters"][0]["max_bytes"] is None
     assert config["performance"]["worker"]["watchdog_no_progress_timeout_seconds"] == 180
     assert config["performance"]["worker"]["minimum_available_memory_ratio"] == 0.2
 
@@ -228,7 +229,7 @@ def test_load_config_applies_inline_env_override_last(tmp_path, monkeypatch):
     _write_json(advanced, _advanced_payload())
     _write_json(simple, {
         "filesystem": {"scan_filters": [
-            {"name": "size_range", "enabled": True, "range": "r >= 2 MB"},
+            {"name": "size_range", "enabled": True, "min_bytes": 2097152, "max_bytes": None},
             {"name": "blacklist", "enabled": True, "blocked_extensions": [".tmp"]},
         ]},
     })
@@ -241,7 +242,7 @@ def test_load_config_applies_inline_env_override_last(tmp_path, monkeypatch):
     filters = {item["name"]: item for item in config["filesystem"]["scan_filters"]}
 
     assert filters["size_range"]["enabled"] is False
-    assert filters["size_range"]["range"] == "r >= 2 MB"
+    assert filters["size_range"]["min_bytes"] == 2097152
     assert filters["blacklist"]["enabled"] is True
 
 

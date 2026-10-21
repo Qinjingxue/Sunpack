@@ -201,7 +201,6 @@ def command_for(archive: Path, output: Path, password: str, recursive: str) -> l
         "k",
         "--no-flatten",
         "--no-builtin-pw",
-        "--no-dir-pw",
         "--quiet",
         "--no-pause",
         "-o",

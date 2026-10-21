@@ -18,7 +18,7 @@ from sunpack.pipeline.extraction.scheduler import ExtractionScheduler
 from sunpack.pipeline.postprocess.output_cleanup import OutputCleanupEvent, cleanup_output_for_retry
 from sunpack.core.contracts.verification import DECISION_ACCEPT, DECISION_ACCEPT_PARTIAL, DECISION_RETRY_EXTRACT
 
-from sunpack.core.passwords.directory_context import DirectoryPasswordContextStore
+from sunpack.core.passwords.directory_context import PasswordScopeContext
 from sunpack.pipeline.verification import VerificationResult, VerificationScheduler
 from sunpack.pipeline.verification.error_classification import classify_verification_error
 from sunpack.core.contracts.verification import (
@@ -104,7 +104,7 @@ class ArchiveJobExecutor:
         self.request_id = str(request_id or "")
         self.origin = str(origin or "")
         self.verifier = VerificationScheduler(self.config, password_session=self.extractor.password_session)
-        self.directory_password_contexts = DirectoryPasswordContextStore(self.config)
+        self.password_scope_context = self.config.get("password_scope_context") or PasswordScopeContext(self.config.get("password_scope_dir", ""))
 
     async def execute_async(
         self,
@@ -140,7 +140,7 @@ class ArchiveJobExecutor:
                 keep_output=bool(result.output_dir and result.outcome_kind != OutcomeKind.FAILURE),
             )
         if result.output_dir and result.outcome_kind != OutcomeKind.FAILURE:
-            self.directory_password_contexts.remember(result.output_dir, task)
+            self.password_scope_context.remember(result.output_dir, task)
         return task, outcome, result
 
     async def _execute_one_async(
@@ -317,7 +317,7 @@ class ArchiveJobExecutor:
                             "confirmed_structure",
                             "anchor_constrained_filename",
                         ]
-                        self.directory_password_contexts.annotate([task])
+                        self.password_scope_context.annotate([task])
                         continue
                 if self._must_stop_for_proven_content_loss(task, result, verification):
                     return current_outcome

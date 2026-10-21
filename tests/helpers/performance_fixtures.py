@@ -14,7 +14,7 @@ def pressure_scan_config() -> dict:
         "detection": {"enabled": True},
         "embedded_scan": {"enabled": True, "recursive_candidate_ratio": 1e-9},
         "filesystem": {"scan_filters": [
-            {"name": "size_range", "enabled": True, "gte": 0},
+            {"name": "size_range", "enabled": True, "min_bytes": 0},
             {"name": "blacklist", "enabled": True,
              "blocked_extensions": [".jar", ".docx", ".apk", ".xlsx"]},
         ]},

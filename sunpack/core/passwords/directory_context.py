@@ -1,102 +1,45 @@
 from __future__ import annotations
 
 import os
-from collections import OrderedDict
-from concurrent.futures import Future
 from threading import RLock
-from typing import Any
-
-from sunpack.core.support.path_keys import case_key
-from sunpack_native import file_generation_tokens
-
-from sunpack.core.passwords.internal.lists import dedupe_passwords
-from sunpack.core.passwords.internal.local_files import (
-    DIRECTORY_PASSWORD_CONTEXT_KEY,
-    DIRECTORY_PASSWORD_FILE_NAME,
-    discover_directory_passwords_for_archive,
-    is_directory_password_file,
-)
+from sunpack.core.support.path_keys import absolute_path_key
+from sunpack.core.passwords.internal.store import password_scope_key
 
 
-class DirectoryPasswordContextStore:
-    """Propagate directory password hints across recursive extraction outputs."""
+class PasswordScopeContext:
+    """Request-owned original input directories, including recursive outputs."""
 
-    def __init__(self, config: dict[str, Any] | None = None):
-        self.config = config or {}
-        self._contexts: dict[str, list[str]] = {}
-        self._local: OrderedDict[str, tuple[str | None, Future[list[str]]]] = OrderedDict()
+    def __init__(self, scope_dir: str = ""):
+        self.scope_dir = scope_dir
+        self._outputs: dict[str, str] = {}
         self._lock = RLock()
 
-    def annotate(self, tasks: list[Any]) -> None:
-        directories = dict.fromkeys(
-            case_key(os.path.dirname(os.path.abspath(task.main_path)))
-            for task in tasks
-        )
-        local_by_directory = {}
-        if is_directory_password_file(DIRECTORY_PASSWORD_FILE_NAME, self.config):
-            paths = [os.path.join(directory, DIRECTORY_PASSWORD_FILE_NAME) for directory in directories]
-            for directory, generation in zip(directories, file_generation_tokens(paths)):
-                local_by_directory[directory] = self._local_for(directory, generation)
-        for task in tasks:
-            inherited = self.inherited_for(task.main_path)
-            directory = case_key(os.path.dirname(os.path.abspath(task.main_path)))
-            local = local_by_directory.get(directory, [])
-            task.runtime[DIRECTORY_PASSWORD_CONTEXT_KEY] = dedupe_passwords([*inherited, *local])
+    def __deepcopy__(self, memo):
+        return self
 
-    def _local_for(self, directory: str, generation: str | None) -> list[str]:
-        with self._lock:
-            cached = self._local.get(directory)
-            owner = cached is None or cached[0] != generation
-            if owner:
-                future: Future[list[str]] = Future()
-                self._local[directory] = (generation, future)
-            else:
-                future = cached[1]
-            self._local.move_to_end(directory)
-        if owner:
-            try:
-                values = (
-                    discover_directory_passwords_for_archive(
-                        os.path.join(directory, DIRECTORY_PASSWORD_FILE_NAME), self.config,
-                    )
-                    if generation is not None else []
-                )
-            except BaseException as exc:
-                future.set_exception(exc)
-                with self._lock:
-                    if self._local.get(directory) == (generation, future):
-                        self._local.pop(directory)
-                raise
-            else:
-                future.set_result(values)
-                with self._lock:
-                    while len(self._local) > 512:
-                        key, (_, oldest) = next(iter(self._local.items()))
-                        if not oldest.done():
-                            break
-                        self._local.pop(key)
-        return future.result()
-
-    def remember(self, output_dir: str, task: Any) -> None:
-        if not output_dir:
-            return
-        values = task.runtime.get(DIRECTORY_PASSWORD_CONTEXT_KEY)
-        if not isinstance(values, list):
-            return
-        context = dedupe_passwords([str(value) for value in values if isinstance(value, str)])
-        with self._lock:
-            self._contexts[case_key(os.path.abspath(output_dir))] = context
-
-    def inherited_for(self, archive_path: str) -> list[str]:
-        if not archive_path:
-            return []
-        archive_key = case_key(os.path.abspath(archive_path))
+    def for_path(self, archive_path: str) -> str:
+        key = absolute_path_key(archive_path)
         with self._lock:
             while True:
-                context = self._contexts.get(archive_key)
-                if context is not None:
-                    return list(context)
-                parent = os.path.dirname(archive_key)
-                if parent == archive_key:
-                    return []
-                archive_key = parent
+                scope = self._outputs.get(key.rstrip("\\/"))
+                if scope is not None:
+                    return scope
+                parent = os.path.dirname(key)
+                if parent == key:
+                    break
+                key = parent
+        return self.scope_dir or os.path.dirname(os.path.abspath(archive_path))
+
+    def annotate(self, tasks) -> None:
+        for task in tasks:
+            task.runtime.setdefault("password_scope_dir", self.for_path(task.main_path))
+
+    def remember(self, output_dir: str, task) -> None:
+        if output_dir:
+            with self._lock:
+                self._outputs[password_scope_key(output_dir)] = task.runtime.get("password_scope_dir") or self.for_path(task.main_path)
+
+
+def password_scope_for_path(config: dict, path: str) -> str:
+    context = config.get("password_scope_context")
+    return context.for_path(path) if context is not None else config.get("password_scope_dir") or os.path.dirname(os.path.abspath(path))

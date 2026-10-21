@@ -62,6 +62,8 @@ try {
         [System.Text.UTF8Encoding]::new($false)
     )
 
+    Copy-Item -LiteralPath (Join-Path $repoRoot "builtin_passwords.json") -Destination $sourceDir
+
     foreach ($arch in @("x64", "arm64")) {
         $arguments = @(
             "/Qp",

@@ -18,7 +18,7 @@ from tests.helpers.fs_builder import make_minimal_7z, make_minimal_pe, make_zip
 def _config():
     return make_config({
         "embedded_scan": {"enabled": True},
-        "filesystem": {"scan_filters": [{"name": "size_range", "enabled": True, "gte": 0}]},
+        "filesystem": {"scan_filters": [{"name": "size_range", "enabled": True, "min_bytes": 0}]},
     })
 
 

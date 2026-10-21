@@ -24,6 +24,10 @@ class _ConfigSnapshot:
     normalized_config: dict[str, Any]
 
 
+_PASSWORD_OBSERVER = None
+_PASSWORD_RELOAD_TASK: asyncio.Task | None = None
+_PASSWORD_RELOAD_PENDING = False
+
 _ENGINE: PipelineEngine | None = None
 _ENGINE_LOCK = asyncio.Lock()
 _CONFIG_SNAPSHOTS: dict[ConfigSourceKey, _ConfigSnapshot] = {}
@@ -32,16 +36,50 @@ _STATE_CHANGED_CALLBACK: Callable[[], None] | None = None
 
 
 def enable_persistent_runtime(*, state_changed: Callable[[], None] | None = None) -> None:
-    global _ENGINE_LOCK, _STATE_CHANGED_CALLBACK
+    global _ENGINE_LOCK, _STATE_CHANGED_CALLBACK, _PASSWORD_OBSERVER
     if not server_runtime_active():
         _ENGINE_LOCK = asyncio.Lock()
     _STATE_CHANGED_CALLBACK = state_changed
     set_server_runtime_active(True)
+    if _PASSWORD_OBSERVER is None:
+        from sunpack.core.passwords.internal.builtin import password_file_source
+        from sunpack.runtime.watch.config_observer import ConfigFileObserver
+        source = password_file_source()
+        observer = ConfigFileObserver(source.path.parent, [source.path.name], _password_file_changed,
+                                      loop=asyncio.get_running_loop())
+        observer.start()
+        _PASSWORD_OBSERVER = observer
+        source.reload()
+
+
+def _password_file_changed() -> None:
+    global _PASSWORD_RELOAD_TASK, _PASSWORD_RELOAD_PENDING
+    _PASSWORD_RELOAD_PENDING = True
+    if _PASSWORD_RELOAD_TASK is None:
+        from sunpack.core.passwords.internal.builtin import password_file_source
+        _PASSWORD_RELOAD_TASK = asyncio.create_task(_reload_password_file(password_file_source()))
+
+
+async def _reload_password_file(source) -> None:
+    global _PASSWORD_RELOAD_TASK, _PASSWORD_RELOAD_PENDING
+    try:
+        while _PASSWORD_RELOAD_PENDING:
+            _PASSWORD_RELOAD_PENDING = False
+            await asyncio.to_thread(source.reload)
+    finally:
+        _PASSWORD_RELOAD_TASK = None
 
 
 async def close_persistent_runtime() -> None:
-    global _ENGINE, _LATEST_IDLE_SECONDS, _STATE_CHANGED_CALLBACK
+    global _ENGINE, _LATEST_IDLE_SECONDS, _STATE_CHANGED_CALLBACK, _PASSWORD_OBSERVER
     set_server_runtime_active(False)
+    if _PASSWORD_OBSERVER is not None:
+        _PASSWORD_OBSERVER.stop()
+        _PASSWORD_OBSERVER = None
+    if _PASSWORD_RELOAD_TASK is not None:
+        await _PASSWORD_RELOAD_TASK
+    from sunpack.core.passwords.internal.builtin import clear_password_file_source
+    clear_password_file_source()
     async with _ENGINE_LOCK:
         engine, _ENGINE = _ENGINE, None
         _CONFIG_SNAPSHOTS.clear()
@@ -95,9 +133,10 @@ def _snapshot_for(request_cwd: str | Path | None) -> _ConfigSnapshot:
 
 def load_request_config(request_cwd: str | Path | None = None) -> dict[str, Any]:
     """Load config for one CLI request, retaining persistent snapshots by source path."""
-    if not server_runtime_active():
-        return load_config(request_cwd)
-    return copy.deepcopy(_snapshot_for(request_cwd).normalized_config)
+    from sunpack.core.passwords.internal.builtin import password_file_source
+    config = load_config(request_cwd) if not server_runtime_active() else copy.deepcopy(_snapshot_for(request_cwd).normalized_config)
+    config["password_snapshot"] = password_file_source().snapshot
+    return config
 
 
 def load_request_config_payload(request_cwd: str | Path | None = None) -> tuple[Path, dict[str, Any]]:

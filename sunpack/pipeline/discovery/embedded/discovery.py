@@ -29,8 +29,8 @@ from sunpack.core.analysis.embedded.result import (
     embedded_candidate_requires_password,
     embedded_scan_prepass,
 )
-from sunpack.core.passwords.internal.lists import dedupe_passwords
-from sunpack.core.passwords.internal.local_files import discover_directory_passwords_for_archive
+from sunpack.core.passwords.directory_context import password_scope_for_path
+from sunpack.core.passwords.internal.store import PasswordStore
 from sunpack.core.support.global_cache_manager import file_identity
 from sunpack.pipeline.discovery.embedded.options import EmbeddedOptions
 
@@ -86,6 +86,7 @@ class EmbeddedDiscovery:
         self.config = config
         self.options = options or EmbeddedOptions()
         self.gate = EmbeddedScanGate(config, self.options)
+        self.password_store = PasswordStore.from_config(config)
 
     def discover(
         self,
@@ -343,11 +344,7 @@ class EmbeddedDiscovery:
         )
 
     def _password_candidates(self, path: str) -> list[str]:
-        return dedupe_passwords([
-            *discover_directory_passwords_for_archive(path, self.config),
-            *list(self.config.get("user_passwords") or []),
-            *list(self.config.get("builtin_passwords") or []),
-        ])
+        return self.password_store.candidates(password_scope_for_path(self.config, path))
 
 
 def _blocked_findings(

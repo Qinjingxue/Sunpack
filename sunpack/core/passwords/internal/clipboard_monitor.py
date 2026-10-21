@@ -3,7 +3,6 @@ from __future__ import annotations
 import ctypes
 import threading
 from ctypes import wintypes
-from typing import Callable
 
 from sunpack.core.passwords.internal.builtin import merge_watch_clipboard_passwords
 from sunpack.core.passwords.internal.clipboard import read_clipboard_passwords
@@ -18,11 +17,9 @@ class ClipboardPasswordMonitor:
     def __init__(
         self,
         *,
-        on_passwords_changed: Callable[[str], None],
         max_entries: int = 30,
         enabled: bool = True,
     ):
-        self.on_passwords_changed = on_passwords_changed
         self.max_entries = max(1, int(max_entries))
         self.enabled = bool(enabled)
         self._thread: threading.Thread | None = None
@@ -54,8 +51,7 @@ class ClipboardPasswordMonitor:
         passwords = read_clipboard_passwords()
         if not passwords:
             return
-        if merge_watch_clipboard_passwords(passwords, max_entries=self.max_entries):
-            self.on_passwords_changed("clipboard")
+        merge_watch_clipboard_passwords(passwords, max_entries=self.max_entries)
 
     def _run_windows_loop(self) -> None:
         try:

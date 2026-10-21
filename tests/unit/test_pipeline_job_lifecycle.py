@@ -26,7 +26,7 @@ def test_batched_jobs_finish_independent_work_and_nested_batches_before_raising(
         runtime._claim_tasks = lambda tasks: tasks
         runtime.source_cleanup = NS(register=lambda tasks: None)
         runtime.reporter = NS(tasks_discovered=lambda *a, **k: None)
-        runtime.job_executor = NS(directory_password_contexts=NS(annotate=lambda tasks: None))
+        runtime.job_executor = NS(password_scope_context=NS(annotate=lambda tasks: None))
         seen = set()
         children_done = asyncio.Event()
 
@@ -88,3 +88,65 @@ def test_flatten_cleanup_drain_does_not_wait_for_unrelated_paths(tmp_path):
 
     asyncio.run(scenario())
 
+
+def test_watch_claim_publishes_each_confirmed_task_and_updated_volume_members(tmp_path):
+    """Catch aggregate-claim grouping and retry membership loss.
+
+    Other lifecycle tests use foreground integer jobs and cannot detect either
+    GUI contract failure. One file-free batch also covers the retry claim path.
+    """
+    import threading
+    from types import SimpleNamespace as NS
+    from sunpack.core.contracts.archive_input import ArchiveInputDescriptor, InputExtent
+    from sunpack.core.contracts.tasks import ArchiveTask
+    from sunpack.pipeline.coordinator.engine import _PathLeaseRegistry
+    from sunpack.pipeline.coordinator.async_work import AsyncWorkBroker, CancellationToken
+    from sunpack.pipeline.discovery.embedded.options import EmbeddedOptions
+
+    async def scenario():
+        paths = [str(tmp_path / name) for name in ("disguised.a", "unrelated.blob", "late.bin")]
+        first = ArchiveTask.from_archive_input(ArchiveInputDescriptor(
+            paths[0], open_mode="concat_ranges", logical_name="movie.7z",
+            extents=[InputExtent(path) for path in paths[:2]],
+        ), discovery_source="test", cleanup_paths=[str(tmp_path / "carrier")])
+        second = ArchiveTask.from_archive_input(ArchiveInputDescriptor(
+            str(tmp_path / "inner.zip"), logical_name="inner.zip",
+        ), discovery_source="test")
+        runtime = object.__new__(_RequestRuntime)
+        runtime.submission = NS(origin="watch", request_id="claim", detection_options=EmbeddedOptions())
+        runtime.recursive_authorization = NS(authorize_batch=lambda tasks, *a, **k: NS(allowed_tasks=tasks, skipped=()))
+        runtime.task_scanner = NS(last_scan_session=None)
+        runtime.context = NS(lock=threading.Lock(), policy_skips=[])
+        runtime._claim_tasks = lambda tasks: tasks
+        runtime.source_cleanup = NS(register=lambda tasks: None)
+        runtime.reporter = NS(tasks_discovered=lambda *a, **k: None)
+        runtime.job_executor = NS(password_scope_context=NS(annotate=lambda tasks: None))
+        runtime.path_leases = _PathLeaseRegistry()
+        claims = []
+        runtime._report_progress = lambda task, event: claims.append(event)
+
+        async def job(task, **kwargs):
+            return True
+
+        runtime._execute_job = job
+        broker = AsyncWorkBroker(thread_capacity=2, max_pending_jobs=4)
+        try:
+            assert await runtime._run_discovery_batch(
+                [first, second], roots=[], scan_session=None, depth=1, direct=True,
+                ownership=None, broker=broker, cancellation=CancellationToken(),
+            )
+            assert claims[0]["groups"] == [
+                {"path": paths[0], "name": "movie.7z", "members": paths[:2]},
+                {"path": second.main_path, "name": "inner.zip", "members": [second.main_path]},
+            ]
+            assert str(tmp_path / "carrier") in claims[0]["source_paths"]
+            first.set_archive_input(ArchiveInputDescriptor(
+                paths[0], open_mode="concat_ranges", logical_name="movie.7z",
+                extents=[InputExtent(path) for path in paths],
+            ))
+            await runtime._ensure_task_lease(first)
+            assert claims[-1]["groups"] == [{"path": paths[0], "name": "movie.7z", "members": paths}]
+        finally:
+            await broker.close()
+
+    asyncio.run(scenario())

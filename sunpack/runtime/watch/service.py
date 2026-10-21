@@ -1,16 +1,14 @@
 from __future__ import annotations
 
-import ctypes
+from sunpack.core.platform.windows.file_mutex import file_mutex, file_mutex_name
+
 import asyncio
 import os
 from copy import deepcopy
-from contextlib import contextmanager
-from ctypes import wintypes
 from dataclasses import dataclass, replace
 from pathlib import Path
 
 from sunpack.core.support.path_keys import case_key, path_key
-from sunpack_native import fast_hash64
 
 from sunpack.core.config.fields.watch import DEFAULT_WATCH_CONFIG
 from sunpack.core.config.loader import ADVANCED_CONFIG_FILENAME, SIMPLE_CONFIG_FILENAME, load_config
@@ -20,7 +18,6 @@ from sunpack.runtime.watch.log import WatchLogStore
 from sunpack.runtime.watch.scheduler import WatchScheduler
 from sunpack.runtime.watch.roots import WatchRootEntry
 from sunpack.runtime.watch.toast import WatchToastCoordinator
-from sunpack.core.passwords.internal.local_files import DIRECTORY_PASSWORD_FILE_NAME
 from sunpack.core.support.resources import get_resource_path
 from sunpack.core.support.resource_lifecycle import (
     read_task_text,
@@ -32,16 +29,11 @@ SERVICE_STATE = "state.json"
 WATCH_ROOTS_FILENAME = "sunpack_watch_roots.txt"
 # Optional columns: ``<input root> | <output root> | <deep_detect>``.
 WATCH_ROOT_OUTPUT_SEPARATOR = "|"
-ROOTS_MUTEX_PREFIX = "Local\\SunPackWatchRoots"
 CONTROL_STOP = "stop"
 CONTROL_RELOAD = "reload"
 CONTROL_SCHEDULER_WAKEUP = "scheduler_wakeup"
 CONFIG_RELOAD_DEBOUNCE_SECONDS = 0.5
 
-WAIT_ABANDONED = 0x00000080
-WAIT_OBJECT_0 = 0x00000000
-WAIT_FAILED = 0xFFFFFFFF
-INFINITE = 0xFFFFFFFF
 
 
 @dataclass(frozen=True)
@@ -354,7 +346,7 @@ def add_watch_roots(
     return roots_path, added, updated
 
 
-def remove_watch_roots(paths: list[str], *, cleanup: bool = True) -> tuple[Path, list[str]]:
+def remove_watch_roots(paths: list[str]) -> tuple[Path, list[str]]:
     roots_path = watch_roots_path()
     with _watch_roots_mutex(roots_path):
         expected = {path_key(normalize_root(path)) for path in paths}
@@ -369,22 +361,8 @@ def remove_watch_roots(paths: list[str], *, cleanup: bool = True) -> tuple[Path,
                 kept.append(entry)
         if removed:
             _write_watch_root_entries_unlocked(kept, roots_path)
-    if cleanup:
-        _cleanup_removed_watch_root_artifacts(removed)
     return roots_path, removed
 
-
-def _cleanup_removed_watch_root_artifacts(roots: list[str]) -> None:
-    """Remove service-owned artifacts for roots that were actually removed."""
-
-    for root in roots:
-        normalized = normalize_root(root)
-        password_file = Path(normalized) / DIRECTORY_PASSWORD_FILE_NAME
-        try:
-            if password_file.is_file() or password_file.is_symlink():
-                password_file.unlink()
-        except OSError:
-            pass
 
 def list_watch_roots() -> tuple[Path, list[str]]:
     roots_path = watch_roots_path()
@@ -483,10 +461,8 @@ class WatchService:
             next_scheduler_run: float | None = 0.0
             active_scheduler = None
             while not self._stop_requested:
-                # Use the event-loop clock for scheduling.  Keeping this clock
-                # separate from the legacy control-bridge module clock is
-                # important for async callers (and makes injected control
-                # event timing unable to perturb asyncio's own timers).
+                # Schedule against the event-loop clock so wall-clock changes
+                # cannot perturb pending work or asyncio timers.
                 now = self._loop.time()
                 if self.scheduler is not None:
                     if self.scheduler is not active_scheduler:
@@ -628,7 +604,7 @@ class WatchService:
     async def _remove_roots_unlocked(self, paths: list[str]) -> dict:
         # Stop/reconcile the running scheduler before removing its watch
         # state, so an in-flight extraction cannot race reconfiguration.
-        roots_path, removed = remove_watch_roots(paths, cleanup=False)
+        roots_path, removed = remove_watch_roots(paths)
         if not removed:
             self.log.write("watch_roots_remove_skipped", requested=_normalize_scan_roots(paths))
             return {
@@ -637,14 +613,11 @@ class WatchService:
                 "applied": False,
             }
         new_service_config = service_config_from(self.config)
-        try:
-            applied = await self._apply_configuration(
-                self.config,
-                new_service_config,
-                service_state_dir(self.config),
-            )
-        finally:
-            _cleanup_removed_watch_root_artifacts(removed)
+        applied = await self._apply_configuration(
+            self.config,
+            new_service_config,
+            service_state_dir(self.config),
+        )
         return {
             "roots_path": str(roots_path),
             "removed": removed,
@@ -1017,40 +990,8 @@ class WatchService:
 
 
 def watch_roots_mutex_name(path: Path | None = None) -> str:
-    roots_path = path or watch_roots_path()
-    identity = case_key(os.path.abspath(str(roots_path)))
-    digest = fast_hash64(identity.encode("utf-8", errors="surrogatepass"))
-    return f"{ROOTS_MUTEX_PREFIX}-{digest}"
+    return file_mutex_name(path or watch_roots_path(), prefix="SunPackWatchRoots")
 
 
-@contextmanager
 def _watch_roots_mutex(path: Path | None = None):
-    kernel32 = _kernel32()
-    handle = kernel32.CreateMutexW(None, False, watch_roots_mutex_name(path))
-    if not handle:
-        raise OSError(ctypes.GetLastError(), "CreateMutexW failed for watch roots")
-    try:
-        result = kernel32.WaitForSingleObject(handle, INFINITE)
-        if result not in {WAIT_OBJECT_0, WAIT_ABANDONED}:
-            if result == WAIT_FAILED:
-                raise OSError(ctypes.GetLastError(), "WaitForSingleObject failed for watch roots")
-            raise OSError(result, "Unexpected WaitForSingleObject result for watch roots")
-        try:
-            yield
-        finally:
-            kernel32.ReleaseMutex(handle)
-    finally:
-        kernel32.CloseHandle(handle)
-
-
-def _kernel32():
-    kernel32 = ctypes.windll.kernel32
-    kernel32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
-    kernel32.CreateMutexW.restype = wintypes.HANDLE
-    kernel32.ReleaseMutex.argtypes = [wintypes.HANDLE]
-    kernel32.ReleaseMutex.restype = wintypes.BOOL
-    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-    kernel32.CloseHandle.restype = wintypes.BOOL
-    kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
-    kernel32.WaitForSingleObject.restype = wintypes.DWORD
-    return kernel32
+    return file_mutex(path or watch_roots_path(), prefix="SunPackWatchRoots")

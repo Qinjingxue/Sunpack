@@ -510,7 +510,7 @@ def test_remove_watch_root_cleans_service_owned_artifacts(tmp_path, monkeypatch)
     _, removed = service_module.remove_watch_roots([str(watched)])
 
     assert removed == [str(watched.resolve())]
-    assert not (watched / "sunpack-passwords.txt").exists()
+    assert (watched / "sunpack-passwords.txt").read_text(encoding="utf-8") == "watch-password\n"
     assert (other_root / "sunpack-passwords.txt").read_text(encoding="utf-8") == "keep-me\n"
 
 
@@ -639,7 +639,7 @@ def test_watch_add_deep_updates_existing_root_and_preserves_output(tmp_path, mon
     assert added == updated == []
     assert service_module._read_watch_root_entries() == [entry]
     service_module.add_watch_roots([str(tmp_path / "new")], deep_detect=True)
-    service_module.remove_watch_roots([str(tmp_path / "new")], cleanup=False)
+    service_module.remove_watch_roots([str(tmp_path / "new")])
     assert service_module._read_watch_root_entries() == [entry]
 
 
@@ -1086,7 +1086,7 @@ def test_watch_root_edits_preserve_hash_comments(tmp_path, monkeypatch):
     assert "# Watched folders. Add one folder per line." in after_add
     assert "# Example: C:\\Downloads | D:\\Extracted" in after_add
 
-    service_module.remove_watch_roots([str(first)], cleanup=False)
+    service_module.remove_watch_roots([str(first)])
     after_remove = roots_path.read_text(encoding="utf-8")
     assert "# Watched folders. Add one folder per line." in after_remove
     assert "# Example: C:\\Downloads | D:\\Extracted" in after_remove

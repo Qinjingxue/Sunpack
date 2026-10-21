@@ -29,15 +29,17 @@ def apply_default_test_config_overrides():
         os.environ.pop("SUNPACK_CONFIG_OVERRIDES", None)
 
 
-@pytest.fixture(scope="session", autouse=True)
-def isolate_builtin_password_file(tmp_path_factory):
+@pytest.fixture(autouse=True)
+def isolate_builtin_password_file(tmp_path):
     """Prevent watch tests from persisting clipboard contents into the checkout."""
     import sunpack.core.passwords.internal.builtin as builtin_module
 
-    builtin_path = tmp_path_factory.mktemp("sunpack-resources") / "builtin_passwords.txt"
+    builtin_path = tmp_path / "sunpack-resources" / "builtin_passwords.json"
     monkeypatch = pytest.MonkeyPatch()
     monkeypatch.setattr(builtin_module, "builtin_password_path", lambda: builtin_path)
+    builtin_module.clear_password_file_source()
     yield
+    builtin_module.clear_password_file_source()
     monkeypatch.undo()
 
 REPO_ROOT = Path(__file__).resolve().parents[1]

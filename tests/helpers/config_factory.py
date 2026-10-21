@@ -20,7 +20,7 @@ def make_config(payload: dict[str, Any] | None = None) -> dict[str, Any]:
 CONFIGS: dict[str, dict[str, Any]] = {
     "minimal": {
         "detection": {"enabled": True},
-        "filesystem": {"scan_filters": [{"name": "size_range", "enabled": True, "gte": 0}]},
+        "filesystem": {"scan_filters": [{"name": "size_range", "enabled": True, "min_bytes": 0}]},
     },
     "embedded_archive_loose": {
         "detection": {"enabled": True},

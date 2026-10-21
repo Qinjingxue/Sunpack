@@ -11,7 +11,9 @@ import pytest
 from sunpack.core.config.loader import load_config
 from sunpack.core.config.schema import normalize_config
 from sunpack.core.contracts.filesystem import DirectorySnapshot, FileEntry
-from sunpack.core.passwords.directory_context import DirectoryPasswordContextStore
+from sunpack.core.passwords.directory_context import PasswordScopeContext
+from sunpack.core.passwords.internal.store import PasswordStore
+from tests.helpers.passwords import write_password_json
 from sunpack.pipeline.coordinator.engine import PipelineEngine
 from sunpack.pipeline.coordinator.target_groups import relation_group_to_candidate
 from sunpack.pipeline.coordinator.task_provider import ArchiveTaskProvider
@@ -406,16 +408,16 @@ def test_structural_head_number_position_orders_real_opaque_members(tmp_path, ar
     assert set(group.input_paths) == set(inputs)
     assert [part.number for part in group.split_volumes] == [number for number, _ in paths]
     assert group.head_metadata.get("volume_set_incomplete") is not True
-    if password:
-        (case.archive_dir / "sunpack-passwords.txt").write_text(
-            f"wrong-password\n{password}\n", encoding="utf-8")
     tasks = RelationResolver().resolve([relation_group_to_candidate(group)]).resolved_tasks
     assert len(tasks) == 1
     config = load_config()
     planned = ArchiveInputPlanningStage(config).plan_task_to_tasks(tasks[0])
     assert len(planned) == 1
-    DirectoryPasswordContextStore(config).annotate(planned)
-    extractor = ExtractionScheduler(max_retries=0)
+    PasswordScopeContext().annotate(planned)
+    config["password_snapshot"] = write_password_json(tmp_path / "passwords.json", scopes=[
+        (value, [str(case.archive_dir)]) for value in ["wrong-password", password] if value
+    ])
+    extractor = ExtractionScheduler(password_store=PasswordStore.from_config(config), max_retries=0)
     output = tmp_path / "output"
     try:
         result = extractor.extract(planned[0], str(output))
@@ -595,7 +597,7 @@ def test_mixed_directory_schedules_only_one_structural_head_per_format(mixed_rea
         with_detection_pipeline(
             {},
             precheck=[
-                {"name": "size_range", "enabled": True, "gte": 0},
+                {"name": "size_range", "enabled": True, "min_bytes": 0},
                 {"name": "relation_archive_accept", "enabled": True},
             ],
         )
@@ -630,7 +632,7 @@ def test_pipeline_uses_initial_structure_group_without_missing_volume_retry(
                 },
             },
             precheck=[
-                {"name": "size_range", "enabled": True, "gte": 0},
+                {"name": "size_range", "enabled": True, "min_bytes": 0},
                 {"name": "relation_archive_accept", "enabled": True},
             ],
         )
@@ -687,7 +689,7 @@ def test_pipeline_middle_volume_target_exposes_resolved_physical_family(mixed_re
                 },
             },
             precheck=[
-                {"name": "size_range", "enabled": True, "gte": 0},
+                {"name": "size_range", "enabled": True, "min_bytes": 0},
                 {"name": "relation_archive_accept", "enabled": True},
             ],
         )
@@ -890,11 +892,11 @@ def test_modern_split_zip_with_camouflaged_names_runs_full_pipeline(tmp_path, op
             {
                 "verification": {"enabled": False, "methods": []},
                 "filesystem": {"scan_filters": [
-                    {"name": "size_range", "enabled": True, "gte": MIB if zipx else 0},
+                    {"name": "size_range", "enabled": True, "min_bytes": MIB if zipx else 0},
                 ]},
             },
             precheck=[
-                {"name": "size_range", "enabled": True, "gte": 0},
+                {"name": "size_range", "enabled": True, "min_bytes": 0},
                 {"name": "relation_archive_accept", "enabled": True},
             ],
         )
@@ -995,10 +997,6 @@ def test_encrypted_plain_and_sfx_volume_matrix_with_shared_stem_and_noisy_suffix
         passwords["sfxrar"],
         passwords["sfxzip"],
     ]
-    (mixed / "sunpack-passwords.txt").write_text(
-        "\n".join(password_candidates) + "\n",
-        encoding="utf-8",
-    )
 
     config = normalize_config(
         with_detection_pipeline(
@@ -1007,12 +1005,15 @@ def test_encrypted_plain_and_sfx_volume_matrix_with_shared_stem_and_noisy_suffix
                 "process": {},
             },
             precheck=[
-                {"name": "size_range", "enabled": True, "gte": 0},
+                {"name": "size_range", "enabled": True, "min_bytes": 0},
                 {"name": "relation_archive_accept", "enabled": True},
                 {"name": "embedded_payload_identity", "enabled": True},
             ],
         )
     )
+    config["password_snapshot"] = write_password_json(tmp_path / "passwords.json", scopes=[
+        (value, [str(mixed)]) for value in password_candidates
+    ])
     tasks = ArchiveTaskProvider(config).scan_targets([str(mixed)])
     split_tasks = [task for task in tasks if len(task.archive_input().parts) >= 3]
 
@@ -1035,8 +1036,9 @@ def test_encrypted_plain_and_sfx_volume_matrix_with_shared_stem_and_noisy_suffix
         task_by_variant[variant] = planned[0]
 
     planned_tasks = list(task_by_variant.values())
-    DirectoryPasswordContextStore(config).annotate(planned_tasks)
+    PasswordScopeContext().annotate(planned_tasks)
     extractor = ExtractionScheduler(
+        password_store=PasswordStore.from_config(config),
         max_retries=1,
         process_config={},
         extraction_config=config.get("extraction"),

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tests.helpers.passwords import write_password_json
+
 import asyncio
 import subprocess
 import time
@@ -42,11 +44,8 @@ def test_concurrent_header_encrypted_rar_retry_cleans_single_and_disguised_volum
     for path in volumes:
         path.rename(path.with_name(path.name + '.jpg'))
     archives = list(root.iterdir())
-    builtin_path = tmp_path / 'builtin_passwords.txt'
-    builtin_path.write_text(
-        'wrong\n' + builtin.WATCH_CLIPBOARD_BLOCK_BEGIN + '\n'
-        + builtin.WATCH_CLIPBOARD_BLOCK_END + '\n', encoding='utf-8',
-    )
+    builtin_path = tmp_path / 'builtin_passwords.json'
+    write_password_json(builtin_path, ['wrong'])
     monkeypatch.setattr(builtin, 'builtin_password_path', lambda: builtin_path)
     monkeypatch.setattr(clipboard, 'read_clipboard_passwords', lambda: [password])
     config = load_config()
@@ -55,12 +54,13 @@ def test_concurrent_header_encrypted_rar_retry_cleans_single_and_disguised_volum
     config['cli']['quiet'] = True
     config['post_extract']['archive_cleanup_mode'] = 'delete'
     config['watch']['clipboard_monitor_enabled'] = False
+    config['watch']['password_retry_debounce_seconds'] = 0
 
     async def settle(watcher):
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
             await watcher.run_once()
-            if not watcher.pending_count and not watcher._inflight_requests and not watcher._password_dirty_dirs:
+            if not watcher.pending_count and not watcher._inflight_requests and watcher._password_reload_at is None and watcher._password_retry_at is None:
                 return
             await asyncio.sleep(0.01)
         pytest.fail('password retry/cleanup did not settle before the barrier timeout')
@@ -89,6 +89,7 @@ def test_concurrent_header_encrypted_rar_retry_cleans_single_and_disguised_volum
                 assert all(entry.status == 'failed_password' for entry in entries)
                 responses.clear()
                 watcher._clipboard_monitor._handle_clipboard_update()
+                watcher.notify_password_source_changed("builtin_password_file")
                 await settle(watcher)
                 assert sum(response.summary.success_count for response in responses) == 2
                 assert not any(response.summary.cleanup_results for response in responses)

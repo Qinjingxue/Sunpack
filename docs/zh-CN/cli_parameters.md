@@ -79,8 +79,7 @@ python sunpack.py extract [options] <paths...>
 | `-p PASSWORD`, `--password PASSWORD` | 提供一个解压密码，可重复传入。 |
 | `-P PASSWORD_FILE`, `--pw-file PASSWORD_FILE` | 从文本文件读取密码，每行一个。 |
 | `-a`, `--ask-pw` | 在终端交互输入密码，空行结束。 |
-| `--no-builtin-pw`, `--no-bpw` | 禁用内置密码表。 |
-| `--no-dir-pw`, `--no-dpw` | 禁用归档同目录的 `sunpack-passwords.txt`。 |
+| `--no-builtin-pw`, `--no-bpw` | 禁用 JSON 持久化密码及其中的剪贴板历史。 |
 | `-d`, `--deep-detect` | 对检测未解决的候选启用完整嵌入扫描，并关闭本次请求的全部 filesystem 扫描过滤模块。 |
 | `-r VALUE`, `--recur VALUE` | 覆盖嵌套解压轮数，接受正整数、`*` 或 `?`。 |
 | `-c VALUE`, `--cleanup VALUE` | 覆盖成功后的原归档处理：`d` 删除，`r` 回收站，`k` 保留。 |
@@ -198,7 +197,7 @@ G:\Incoming | | true
 | `add PATH...` | `-s`, `--start` | 添加后启动持续监控。 |
 | `add PATH...` | `-i`, `--initial-scan` | 对新增根或 deep 模式发生变化的根执行初始扫描。 |
 | `add PATH...` | `-d`, `--deep-detect` | 将各输入目录的 `deep_detect` 写为 `true`；已登记目录也会更新。 |
-| `remove PATH...`, `rm PATH...` | — | 按输入目录移除监控根，并清理该根的同目录密码文件。 |
+| `remove PATH...`, `rm PATH...` | — | 按输入目录移除监控根。 |
 | `list`, `ls` | — | 列出持久化的输入目录。 |
 | `reload` | — | 重新读取配置和监控根。 |
 | `stop` | — | 停止持续监控。 |
@@ -233,10 +232,9 @@ python sunpack.py passwords [options]
 | `-p PASSWORD`, `--password PASSWORD` | 提供密码，可重复传入。 |
 | `-P PASSWORD_FILE`, `--pw-file PASSWORD_FILE` | 从文本文件读取密码，每行一个。 |
 | `-a`, `--ask-pw` | 在终端交互输入密码。 |
-| `--no-builtin-pw`, `--no-bpw` | 不使用内置密码表。 |
-| `--no-dir-pw`, `--no-dpw` | 该命令没有目标归档，不会读取同目录密码文件；在 `extract` 中用于关闭同目录密码。 |
+| `--no-builtin-pw`, `--no-bpw` | 不使用 JSON 持久化密码及其中的剪贴板历史。 |
 
-`passwords` 没有归档路径，因此输出命令行输入、最近成功密码、剪贴板密码和内置密码的汇总；它不会为某个目录加载 `sunpack-passwords.txt`。归档解压时的候选顺序是“最近成功密码 → 同目录密码 → CLI 参数和密码文件 → 剪贴板 → 内置密码”，重复项会去重，必要时会先尝试空密码。
+`passwords` 没有归档路径，因此仅汇总全局候选。归档解压时，最近成功的有效密码优先，其后依次为 JSON 中匹配作用域的密码、CLI 输入、当前剪贴板、JSON 全局密码及剪贴板历史。重复项会去重，必要时先尝试空密码。
 
 示例：
 

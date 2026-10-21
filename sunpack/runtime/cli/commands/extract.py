@@ -137,11 +137,11 @@ async def handle(args, ctx):
                 passwords,
                 use_builtin_passwords=not args.no_builtin_passwords,
                 clipboard_passwords=clipboard_passwords,
+                password_snapshot=initial_password_summary.password_snapshot,
             )
-            run_config["user_passwords"] = dedupe_passwords(
-                password_summary.user_passwords + password_summary.clipboard_passwords
-            )
-            run_config["builtin_passwords"] = list(password_summary.builtin_passwords)
+            run_config["user_passwords"] = password_summary.user_passwords
+            run_config["clipboard_passwords"] = password_summary.clipboard_passwords
+            run_config["password_snapshot"] = password_summary.password_snapshot
             response = await engine.run(
                 current_targets,
                 direct=bool(getattr(args, "direct_file", False)),
@@ -201,6 +201,7 @@ async def handle(args, ctx):
         use_builtin_passwords=not args.no_builtin_passwords,
         recent_passwords=recent_passwords,
         clipboard_passwords=clipboard_passwords,
+        password_snapshot=initial_password_summary.password_snapshot,
     )
 
     final_summary = RunSummary(
@@ -270,10 +271,9 @@ def _extract_run_config(
         **(config.get("extraction", {}) if isinstance(config.get("extraction"), dict) else {}),
         "quiet": not verbose,
     }
-    run_config["user_passwords"] = dedupe_passwords(
-        password_summary.user_passwords + password_summary.clipboard_passwords
-    )
-    run_config["builtin_passwords"] = password_summary.builtin_passwords
+    run_config["user_passwords"] = password_summary.user_passwords
+    run_config["clipboard_passwords"] = password_summary.clipboard_passwords
+    run_config["password_snapshot"] = password_summary.password_snapshot
     return run_config
 
 

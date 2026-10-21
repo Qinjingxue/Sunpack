@@ -22,8 +22,9 @@ class ExtractionScheduler:
         extraction_config: dict | None = None,
         sevenzip_runner: SevenZipRunner | None = None,
         output_stream=None,
+        password_store: PasswordStore | None = None,
     ):
-        self.password_store = PasswordStore.from_sources(
+        self.password_store = password_store or PasswordStore.from_sources(
             cli_passwords=cli_passwords or [],
             builtin_passwords=builtin_passwords or [],
         )

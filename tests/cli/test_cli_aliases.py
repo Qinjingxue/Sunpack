@@ -48,7 +48,6 @@ def test_command_aliases_preserve_handler_inputs(parser, short, full):
     (["-F"], ["--no-flatten"]),
     (["-k"], ["--allow-partial"]),
     (["--no-bpw"], ["--no-builtin-pw"]),
-    (["--no-dpw"], ["--no-dir-pw"]),
     (["--direct"], ["--direct-file"]),
 ])
 def test_extract_aliases_preserve_handler_inputs(parser, short, full):
@@ -67,8 +66,8 @@ def test_inspect_and_password_short_options(parser):
     assert vars(parser.parse_args(["i", ".", "--archives", "--analysis"])) == vars(
         parser.parse_args(["inspect", ".", "--archives-only", "--analyze"])
     )
-    assert vars(parser.parse_args(["pw", "-P", "pw.txt", "-a", "--no-bpw", "--no-dpw"])) == vars(
-        parser.parse_args(["passwords", "--pw-file", "pw.txt", "--ask-pw", "--no-builtin-pw", "--no-dir-pw"])
+    assert vars(parser.parse_args(["pw", "-P", "pw.txt", "-a", "--no-bpw"])) == vars(
+        parser.parse_args(["passwords", "--pw-file", "pw.txt", "--ask-pw", "--no-builtin-pw"])
     )
 
 

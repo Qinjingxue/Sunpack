@@ -30,10 +30,6 @@ class FakePipelineEngine:
     def recent_passwords(self):
         return list(self._recent_passwords)
 
-    def update_password_sources(self, *, user_passwords, builtin_passwords):
-        self.user_passwords = list(user_passwords)
-        self.builtin_passwords = list(builtin_passwords)
-
     def is_idle(self):
         return True
 

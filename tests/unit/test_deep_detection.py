@@ -15,8 +15,8 @@ from tests.helpers.config_factory import make_config
 @pytest.mark.parametrize("rule", [
     {"name": "blacklist", "enabled": True, "blocked_extensions": [".bin"]},
     {"name": "whitelist", "enabled": True, "allowed_extensions": [".zip"]},
-    {"name": "size_range", "enabled": True, "gte": 1024},
-    {"name": "mtime_range", "enabled": True, "lt": 1},
+    {"name": "size_range", "enabled": True, "min_bytes": 1024},
+    {"name": "mtime_range", "enabled": True, "end_utc": "1970-01-01T00:00Z"},
 ])
 @pytest.mark.parametrize("recursive", [False, True])
 def test_deep_discovery_disables_each_filesystem_filter(tmp_path, rule, recursive):

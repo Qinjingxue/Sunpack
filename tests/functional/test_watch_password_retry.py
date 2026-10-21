@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tests.helpers.passwords import write_password_json
+
 import asyncio
 import subprocess
 import time
@@ -32,7 +34,7 @@ async def _wait_for_completed_watch_run(watcher: WatchScheduler, *, timeout: flo
     pytest.fail("watch pipeline did not complete before timeout")
 
 
-@pytest.mark.parametrize("source", ["directory", "watch_clipboard"])
+@pytest.mark.parametrize("source", ["scoped_json", "watch_clipboard"])
 @pytest.mark.parametrize("update_timing", ["after_failure", "before_failure", "before_failure_restart"])
 def test_watch_retries_real_encrypted_zip_after_password_source_update(tmp_path, monkeypatch, source, update_timing):
     seven_zip = get_test_tools().get("seven_zip")
@@ -70,16 +72,16 @@ def test_watch_retries_real_encrypted_zip_after_password_source_update(tmp_path,
     if completed.returncode != 0:
         pytest.skip(f"encrypted ZIP fixture could not be created: {completed.stderr or completed.stdout}")
 
-    builtin_path = tmp_path / "builtin_passwords.txt"
+    builtin_path = tmp_path / "builtin_passwords.json"
     monkeypatch.setattr(builtin_module, "builtin_password_path", lambda: builtin_path)
-    directory_password_file = watch_root / "sunpack-passwords.txt"
-    if source == "directory":
+    write_password_json(builtin_path)
+    if source == "scoped_json":
         wrong_password = "wrong-password"
         while zip_fast_verify_passwords(str(archive), [wrong_password]).get("status") != "no_match":
             # Traditional ZipCrypto has only a one-byte header check, so an
             # arbitrary wrong password has a 1/256 false-positive chance.
             wrong_password = f"wrong-password-{uuid.uuid4().hex}"
-        directory_password_file.write_text(wrong_password + "\n", encoding="utf-8")
+        write_password_json(builtin_path, scopes=[(wrong_password, [str(watch_root)])])
 
     config = load_config()
     config["cli"] = {**(config.get("cli") or {}), "quiet": True}
@@ -115,9 +117,8 @@ def test_watch_retries_real_encrypted_zip_after_password_source_update(tmp_path,
             else:
                 await watcher.run_once()
                 await asyncio.wait_for(result_ready.wait(), timeout=10)
-            if source == "directory":
-                directory_password_file.write_text(password + "\n", encoding="utf-8")
-                watcher.notify_password_table_changed(str(directory_password_file))
+            if source == "scoped_json":
+                write_password_json(builtin_path, scopes=[(password, [str(watch_root)])])
             else:
                 monkeypatch.setattr(
                     clipboard_monitor_module,
@@ -125,10 +126,12 @@ def test_watch_retries_real_encrypted_zip_after_password_source_update(tmp_path,
                     lambda: [password],
                 )
                 watcher._clipboard_monitor._handle_clipboard_update()
+            scheduler_module._WatchEventHandler(watcher)._handle_path(str(builtin_path), event_type="modified")
+            await watcher.run_once()
             if update_timing != "after_failure":
                 # Consume the directory notification while the old failure is
                 # still in flight; completion must recover the missed retry.
-                watcher._process_password_dirty_dirs(time.monotonic())
+                watcher._process_password_retries(time.monotonic())
                 release_result.set()
                 first = await watcher.drain()
             assert first.failed == 1, first
@@ -211,12 +214,9 @@ def test_watch_aggregates_all_zipcrypto_fast_matches(tmp_path, monkeypatch, incl
     combined = zip_fast_verify_passwords(str(archive), supplied_passwords)
     assert tuple(combined.get("matched_indices") or ()) == tuple(range(len(supplied_passwords)))
 
-    builtin_path = tmp_path / "builtin_passwords.txt"
+    builtin_path = tmp_path / "builtin_passwords.json"
     monkeypatch.setattr(builtin_module, "builtin_password_path", lambda: builtin_path)
-    (watch_root / "sunpack-passwords.txt").write_text(
-        "".join(f"{candidate}\n" for candidate in supplied_passwords),
-        encoding="utf-8",
-    )
+    write_password_json(builtin_path, scopes=[(candidate, [str(watch_root)]) for candidate in supplied_passwords])
     config = load_config()
     config["cli"] = {**(config.get("cli") or {}), "quiet": True}
     config["post_extract"] = {**config.get("post_extract", {}), "archive_cleanup_mode": "keep"}

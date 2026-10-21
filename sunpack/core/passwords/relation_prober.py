@@ -81,7 +81,7 @@ class RelationsPasswordProber:
         self,
         path: str,
         *,
-        directory_passwords: list[str] | None = None,
+        scope_path: str = "",
         part_paths: list[str] | None = None,
         archive_input: dict | None = None,
     ) -> str | None:
@@ -90,12 +90,9 @@ class RelationsPasswordProber:
             return None
         probe_parts = list(part_paths) if part_paths is not None else [path]
         fingerprint = build_archive_fingerprint(path, probe_parts, archive_input)
-        cached = self.scheduler.cache.get_success(fingerprint.key)
-        if cached is not None:
-            return cached
         candidates = PasswordCandidatePipeline.from_password_store(
             self.password_store,
-            directory_passwords=directory_passwords,
+            scope_path=scope_path,
         )
         result = self.scheduler.plan_for_extraction(PasswordJob(
             archive_path=path,

@@ -33,7 +33,6 @@ def test_watch_configuration_survives_disconnect_and_finishes_before_stop(tmp_pa
     config = make_config({"watch": {
         "state_dir": str(tmp_path / "state"), "tray_enabled": False,
         "toast_enabled": False, "clipboard_monitor_enabled": False,
-        "directory_password_file_auto_create": False,
     }})
     monkeypatch.setattr(host_module, "load_config", lambda: config)
     monkeypatch.setattr(service_module, "load_config", lambda: deepcopy(config))

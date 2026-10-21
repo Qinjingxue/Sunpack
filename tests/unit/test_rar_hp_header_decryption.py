@@ -129,7 +129,7 @@ def test_password_retry_keeps_unencrypted_structure_facts_native(tmp_path, monke
             path.unlink()
         return {rar_path: "secret"}
 
-    monkeypatch.setattr(scheduler._builder, "_discover_directory_passwords", discover)
+    monkeypatch.setattr(scheduler._builder, "_discover_passwords", discover)
     groups = scheduler.build_candidate_groups(snapshot)
     zip_group = next(group for group in groups if group.head_metadata.get("format") == "zip")
     assert zip_group.head_metadata["relation_confirmed"] is True
@@ -259,6 +259,9 @@ def test_relations_password_prober_remembers_success_and_skips_second_probe(tmp_
     prober.scheduler.verifier.verify_fast_batch = counting_verify
     assert prober.resolve_file(group.head_path) == "secret"
     assert calls["count"] == 1
+
+    # Shared proof caches must not make a removed password eligible again.
+    assert RelationsPasswordProber(PasswordStore.from_sources()).resolve_file(group.head_path) is None
     assert store.recent_passwords == ["secret"]
 
     # The second probe hits the PasswordAttemptCache without touching the

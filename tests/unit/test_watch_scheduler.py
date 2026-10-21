@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tests.helpers.passwords import write_password_json
+
 import asyncio
 import os
 import sys
@@ -310,7 +312,8 @@ def _indexed_scheduler_for_test():
     watcher._completion_batches = set()
     watcher._quiet_trackers = {}
     watcher._latest_observations = {}
-    watcher._password_dirty_dirs = {}
+    watcher._password_reload_at = None
+    watcher._password_retry_at = None
     watcher._cache_cleanup_deadline = None
     watcher.log = SimpleNamespace(next_history_expiry=None, clear_expired_history=lambda: None)
     watcher.password_retry_debounce_seconds = 0.0
@@ -886,9 +889,6 @@ class _DeferredPipelineEngine:
         self.handles = []
         self.work_broker = FakePipelineEngine(lambda _config: None).work_broker
 
-    def update_password_sources(self, *, user_passwords, builtin_passwords):
-        return None
-
     @property
     def recent_passwords(self):
         return []
@@ -1307,7 +1307,7 @@ def test_watch_scheduler_uses_watchdog_observer_and_initial_scan(tmp_path, monke
 
     assert watcher.pending_count == 1
     assert FakeObserver.started_count == 1
-    assert (watch_root / "sunpack-passwords.txt").read_text(encoding="utf-8") == ""
+    assert not (watch_root / "sunpack-passwords.txt").exists()
 
     _await(watcher.stop())
     assert FakeObserver.stopped_count == 1
@@ -1339,7 +1339,7 @@ def test_watch_scheduler_scans_only_requested_initial_scan_roots(tmp_path, monke
 
 def test_watch_scheduler_observes_builtin_password_file_directory(tmp_path, monkeypatch):
     monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
-    builtin_path = tmp_path / "resources" / "builtin_passwords.txt"
+    builtin_path = tmp_path / "resources" / "builtin_passwords.json"
     monkeypatch.setattr(builtin_module, "builtin_password_path", lambda: builtin_path)
     watch_root = tmp_path / "in"
     watch_root.mkdir()
@@ -1372,7 +1372,6 @@ def test_watch_scheduler_preserves_existing_directory_password_file(tmp_path, mo
     _await(watcher.start())
 
     assert password_file.read_text(encoding="utf-8") == "existing-secret\n"
-    assert watcher.pending_count == 0
 
 
 @pytest.mark.parametrize("mode", ["-", "*"])
@@ -1511,6 +1510,7 @@ def test_candidate_deadline_changes_wake_watch_service(tmp_path, monkeypatch):
     watcher.enqueue(str(archive), event_type="modified")
     assert wakeups == ["wake", "wake"]
 
+    archive.unlink()
     watcher.notify_path_departed(str(archive))
     assert wakeups == ["wake", "wake", "wake"]
 
@@ -2090,7 +2090,7 @@ def test_watch_scheduler_does_not_retry_password_inconclusive_after_password_sou
     )
     watcher.enqueue(str(archive_path))
     first = _await(watcher.run_once())
-    watcher.notify_password_source_changed("test")
+    _change_password_source(watcher)
     second = _await(watcher.run_once())
 
     assert first.failed == 1
@@ -2139,7 +2139,7 @@ def test_password_retry_bypasses_learned_quiet_for_unchanged_failed_archive(tmp_
     assert str(archive_path) not in watcher._quiet_trackers
     assert watcher._latest_observations[str(archive_path)].quiet_seconds == 30.0
 
-    watcher.notify_password_source_changed("test")
+    _change_password_source(watcher)
     retried = _await(watcher.run_once())
 
     assert retried.succeeded == 1
@@ -2189,7 +2189,7 @@ def test_password_retry_preserves_quiet_when_failed_archive_changed(tmp_path, mo
     assert watcher._latest_observations[str(archive_path)].quiet_seconds == 30.0
     archive_path.write_bytes(b"PK\x03\x04changed-payload")
 
-    watcher.notify_password_source_changed("test")
+    _change_password_source(watcher)
     retried = _await(watcher.run_once())
 
     assert retried.processed == 0
@@ -2241,7 +2241,7 @@ def test_password_retry_debounce_uses_monotonic_clock_when_wall_clock_moves_back
     watcher.enqueue(str(archive_path))
     first = _await(watcher.run_once())
     wakeups.clear()
-    watcher.notify_password_source_changed("test")
+    _change_password_source(watcher)
     assert wakeups == [100.0]
     assert watcher.pending_count == 0
     assert watcher.next_delay_seconds() == 5.0
@@ -2261,7 +2261,7 @@ def test_password_retry_debounce_uses_monotonic_clock_when_wall_clock_moves_back
 
 def test_watch_scheduler_defaults_to_user_and_builtin_password_sources(tmp_path, monkeypatch):
     monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
-    monkeypatch.setattr(scheduler_module, "get_builtin_passwords", lambda: ["builtin-secret"])
+    _set_passwords(tmp_path, monkeypatch, ["builtin-secret"])
     captured = []
 
     class CapturingRunner:
@@ -2291,7 +2291,7 @@ def test_watch_scheduler_defaults_to_user_and_builtin_password_sources(tmp_path,
     _await(watcher.run_once())
 
     assert captured[0]["user_passwords"] == ["user-secret"]
-    assert captured[0]["builtin_passwords"] == ["builtin-secret"]
+    assert captured[0]["password_snapshot"].global_passwords == ("builtin-secret",)
     state_text = "\n".join(
         path.read_text(encoding="utf-8")
         for path in (state_path, watcher.state.journal_path)
@@ -2303,7 +2303,7 @@ def test_watch_scheduler_defaults_to_user_and_builtin_password_sources(tmp_path,
 
 def test_watch_scheduler_clipboard_persistence_refreshes_candidates_and_retries(tmp_path, monkeypatch):
     monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
-    builtin_path = tmp_path / "builtin_passwords.txt"
+    builtin_path = tmp_path / "builtin_passwords.json"
     monkeypatch.setattr(builtin_module, "builtin_password_path", lambda: builtin_path)
     monkeypatch.setattr(
         clipboard_module,
@@ -2319,7 +2319,7 @@ def test_watch_scheduler_clipboard_persistence_refreshes_candidates_and_retries(
             self.config = config
 
         def run_targets(self, paths):
-            candidates = list(self.config.get("builtin_passwords") or [])
+            candidates = list(self.config["password_snapshot"].global_passwords)
             attempts.append(candidates)
             if "clipboard-secret" in candidates:
                 return RunSummary(target_results=(TargetRunResult(paths[0], OutcomeKind.COMPLETE_SUCCESS),))
@@ -2352,17 +2352,17 @@ def test_watch_scheduler_clipboard_persistence_refreshes_candidates_and_retries(
     assert "clipboard-secret" not in attempts[0]
     assert "clipboard-secret" in attempts[1]
     assert "clipboard-secret" in builtin_path.read_text(encoding="utf-8")
-    assert watcher.state.password_generation == generation
+    assert watcher.state.password_generation == generation + 1
 
 
 def test_watch_scheduler_retries_on_builtin_password_file_watchdog_event(tmp_path, monkeypatch):
     monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
-    builtin_path = tmp_path / "resources" / "builtin_passwords.txt"
+    builtin_path = tmp_path / "resources" / "builtin_passwords.json"
     builtin_path.parent.mkdir()
-    builtin_path.write_text("wrong\n", encoding="utf-8")
+    write_password_json(builtin_path, ["wrong"])
     monkeypatch.setattr(builtin_module, "builtin_password_path", lambda: builtin_path)
     builtin_passwords = ["wrong"]
-    monkeypatch.setattr(scheduler_module, "get_builtin_passwords", lambda: list(builtin_passwords))
+    write_password_json(builtin_path, builtin_passwords)
     attempts = []
 
     class ConfigAwareRunner:
@@ -2372,8 +2372,8 @@ def test_watch_scheduler_retries_on_builtin_password_file_watchdog_event(tmp_pat
             self.config = config
 
         def run_targets(self, paths):
-            attempts.append(list(self.config.get("builtin_passwords") or []))
-            if "new-secret" in self.config.get("builtin_passwords", []):
+            attempts.append(list(self.config["password_snapshot"].global_passwords))
+            if "new-secret" in self.config["password_snapshot"].global_passwords:
                 return RunSummary(target_results=(TargetRunResult(paths[0], OutcomeKind.COMPLETE_SUCCESS),))
             return RunSummary(target_results=(TargetRunResult(
                 paths[0], OutcomeKind.FAILURE, error="wrong password",
@@ -2395,11 +2395,12 @@ def test_watch_scheduler_retries_on_builtin_password_file_watchdog_event(tmp_pat
     _await(watcher.run_once())
 
     builtin_passwords.append("new-secret")
+    write_password_json(builtin_path, builtin_passwords)
     assert _await(watcher.run_once()).processed == 0
     handler = scheduler_module._WatchEventHandler(watcher)
     handler.on_moved(
         SimpleNamespace(
-            src_path=str(builtin_path.with_name(".builtin_passwords.txt.tmp")),
+            src_path=str(builtin_path.with_name(".builtin_passwords.json.tmp")),
             dest_path=str(builtin_path),
             is_directory=False,
         )
@@ -2412,7 +2413,7 @@ def test_watch_scheduler_retries_on_builtin_password_file_watchdog_event(tmp_pat
 
 def test_watch_scheduler_retries_persisted_password_failure_when_config_passwords_change(tmp_path, monkeypatch):
     monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
-    monkeypatch.setattr(scheduler_module, "get_builtin_passwords", lambda: [])
+    _set_passwords(tmp_path, monkeypatch, [])
     attempts = []
 
     class ConfigAwareRunner:
@@ -2460,9 +2461,9 @@ def test_watch_scheduler_retries_persisted_password_failure_when_config_password
     assert attempts == [["wrong"], ["new-secret"]]
 
 
-def test_watch_scheduler_promotes_recent_success_password_and_retries_other_failures(tmp_path, monkeypatch):
+def test_watch_scheduler_success_hints_do_not_create_new_password_sources(tmp_path, monkeypatch):
     monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
-    monkeypatch.setattr(scheduler_module, "get_builtin_passwords", lambda: [])
+    _set_passwords(tmp_path, monkeypatch, [])
     attempts = []
 
     class LearningRunner:
@@ -2504,61 +2505,10 @@ def test_watch_scheduler_promotes_recent_success_password_and_retries_other_fail
     retried = _await(watcher.run_once())
 
     assert learned.succeeded == 1
-    assert retried.succeeded == 1
-    assert attempts == [
-        ("failed.zip", []),
-        ("teacher.zip", []),
-        ("failed.zip", ["learned-secret"]),
-    ]
+    assert retried.processed == 0
+    assert attempts == [("failed.zip", []), ("teacher.zip", [])]
 
 
-@pytest.mark.parametrize("filename", ["sunpack-passwords.txt", "SUNPACK-PASSWORDS.TXT"])
-def test_watch_scheduler_password_table_event_retries_password_failure(tmp_path, monkeypatch, filename):
-    monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
-    attempts = {"count": 0}
-
-    class PasswordThenSuccessRunner:
-        def __init__(self, config):
-            pass
-
-        def run_targets(self, paths):
-            attempts["count"] += 1
-            if attempts["count"] == 1:
-                return RunSummary(target_results=(TargetRunResult(
-                paths[0], OutcomeKind.FAILURE, error="password required",
-                failure=FailureInfo(FailureKind.PASSWORD_REQUIRED, "password_resolution", "password required"),
-            ),))
-            return RunSummary(target_results=(TargetRunResult(paths[0], OutcomeKind.COMPLETE_SUCCESS),))
-
-    watch_root = tmp_path / "in"
-    watch_root.mkdir()
-    archive_path = watch_root / "sample.zip"
-    password_table = watch_root / filename
-    archive_path.write_bytes(b"PK\x03\x04payload")
-    password_table.write_text("secret\n", encoding="utf-8")
-
-    watcher = _watcher(
-        tmp_path,
-        config=make_config({
-            "watch": {
-                "clipboard_monitor_enabled": False,
-                "password_retry_debounce_seconds": 0,
-            }
-        }),
-        roots=[str(watch_root)],
-        cold_start_seconds=0,
-        pipeline_engine=FakePipelineEngine(PasswordThenSuccessRunner),
-    )
-    watcher.enqueue(str(archive_path))
-    _await(watcher.run_once())
-
-    handler = scheduler_module._WatchEventHandler(watcher)
-    handler._handle_path(str(password_table))
-    result = _await(watcher.run_once())
-
-    assert result.succeeded == 1
-    assert attempts["count"] == 2
-    assert not any(path.lower().endswith("sunpack-passwords.txt") for path in watcher._pending)
 
 
 def test_watch_scheduler_writes_jsonl_log_for_failures(tmp_path, monkeypatch):
@@ -2677,6 +2627,8 @@ def test_watch_scheduler_claim_removes_pending_sibling_before_source_cleanup_pro
     watcher.enqueue(str(sibling_volume))
     assert watcher.pending_count == 1
 
+    groups = [{"path": str(first_volume), "name": "split.7z",
+               "members": [str(first_volume), str(sibling_volume)]}]
     observed = []
     real_candidate = scheduler_module._candidate_for_event_path
 
@@ -2695,8 +2647,14 @@ def test_watch_scheduler_claim_removes_pending_sibling_before_source_cleanup_pro
         {
             "event": "task_sources_claimed",
             "source_paths": (str(first_volume), str(sibling_volume)),
+            "groups": groups,
         },
     )
+
+    import json
+    records = [json.loads(line) for line in watcher.log.path.read_text(encoding="utf-8").splitlines()]
+    claim = next(record for record in records if record["event"] == "pipeline_sources_claimed")
+    assert claim["path"] == str(first_volume) and claim["groups"] == groups
 
     # The pipeline claim consumes the old sibling event. During cleanup, even
     # a new watchdog event becomes only a dirty bit; no native file observation
@@ -2980,3 +2938,48 @@ def test_modified_event_retries_same_metadata_identity(tmp_path, monkeypatch):
     events.emit(archive_path, event_type="modified")
     WatchState.assert_processed(_await(events.watcher.run_once()), 1)
     assert len(attempts) == 2
+
+
+def _set_passwords(tmp_path, monkeypatch, values):
+    path = tmp_path / "test-passwords.json"
+    write_password_json(path, values)
+    monkeypatch.setattr(builtin_module, "builtin_password_path", lambda: path)
+
+
+def _change_password_source(watcher):
+    path = watcher._password_file_source.path
+    write_password_json(path, [*watcher._password_file_source.snapshot.global_passwords, f"changed-{len(watcher._password_file_source.snapshot.global_passwords)}"])
+    watcher.notify_password_source_changed("builtin_password_file")
+
+
+def test_password_file_events_publish_only_semantic_updates(tmp_path, monkeypatch):
+    # Unique coverage: watchdog replacement/deletion and retry generations, without scheduler restart.
+    _set_passwords(tmp_path, monkeypatch, ["before"])
+    watcher = _watcher(tmp_path, config=make_config({"watch": {
+        "clipboard_monitor_enabled": False, "password_retry_debounce_seconds": 0,
+    }}))
+    handler = scheduler_module._WatchEventHandler(watcher)
+    path = watcher._password_file_source.path
+    first = watcher.config["password_snapshot"]
+    generation = watcher.state.password_generation
+    for _ in range(3):
+        handler._handle_path(str(path), event_type="modified")
+        _await(watcher.run_once())
+    assert watcher.state.password_generation == generation
+    assert watcher.config["password_snapshot"] is first
+    path.write_text('{"passwords":[', encoding="utf-8")
+    handler._handle_path(str(path), event_type="modified")
+    _await(watcher.run_once())
+    assert watcher.config["password_snapshot"] is first
+    write_password_json(path, ["after"])
+    handler.on_moved(SimpleNamespace(src_path=str(path.with_suffix(".tmp")), dest_path=str(path), is_directory=False))
+    _await(watcher.run_once())
+    assert watcher.state.password_generation == generation + 1
+    assert watcher.config["password_snapshot"].global_passwords == ("after",)
+    path.unlink()
+    handler.on_deleted(SimpleNamespace(src_path=str(path), is_directory=False))
+    _await(watcher.run_once())
+    assert watcher.state.password_generation == generation + 2
+    assert not watcher.config["password_snapshot"].global_passwords
+    assert watcher.next_delay_seconds() is None
+    assert not path.exists()

@@ -157,6 +157,7 @@ class WatchHarness:
     run_durations: list[float] = field(default_factory=list)
     timer: Plan7Timing = field(default_factory=Plan7Timing)
     label: str = "watch"
+    restore_password_path: Any = None
 
     def close(self) -> None:
         if self.loop is None:
@@ -172,6 +173,10 @@ class WatchHarness:
                 self.loop.run_until_complete(self.delegate.aclose())
             self.loop.close()
             self.loop = None
+        if self.restore_password_path is not None:
+            from sunpack.core.passwords.internal import builtin
+            builtin.builtin_password_path = self.restore_password_path
+            builtin.clear_password_file_source()
         print(self.timer.report(f"plan7 timing ({self.label})"))
 
 
@@ -501,10 +506,14 @@ def start_watch(
     output_root = tmp_path / label / "out"
     watch_root.mkdir(parents=True, exist_ok=True)
     output_root.mkdir(parents=True, exist_ok=True)
-    (watch_root / "sunpack-passwords.txt").write_text(
-        "\n".join(passwords) + "\n",
-        encoding="utf-8",
-    )
+    from sunpack.core.passwords.internal import builtin
+    from tests.helpers.passwords import write_password_json
+    password_path = tmp_path / label / "builtin_passwords.json"
+    if not password_path.exists():
+        write_password_json(password_path, scopes=[(password, [str(watch_root)]) for password in passwords])
+    restore_password_path = builtin.builtin_password_path
+    builtin.builtin_password_path = lambda: password_path
+    builtin.clear_password_file_source()
     config = plan7_watch_config(passwords=passwords)
     config["post_extract"]["archive_cleanup_mode"] = cleanup_mode
     config["post_extract"]["flatten_single_directory"] = flatten_single_directory
@@ -558,6 +567,7 @@ def start_watch(
         run_durations=run_durations,
         timer=timer,
         label=label,
+        restore_password_path=restore_password_path,
     )
 
 

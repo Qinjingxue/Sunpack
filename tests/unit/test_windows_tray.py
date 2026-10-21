@@ -5,53 +5,20 @@ import sys
 import textwrap
 from types import SimpleNamespace
 
-import sunpack.runtime.watch.service as service_module
 import sunpack.runtime.gui.tray as tray_module
 from sunpack.runtime.gui.tray import WindowsTrayIcon, _tray_language_from_service
 
 
-def test_tray_open_watch_roots_file_creates_and_opens_txt(tmp_path, monkeypatch):
-    roots_path = tmp_path / "sunpack_watch_roots.txt"
-    opened = []
-    tray = object.__new__(WindowsTrayIcon)
-    tray._open_path = opened.append
-    monkeypatch.setattr(service_module, "watch_roots_path", lambda: roots_path)
-    monkeypatch.setattr(tray_module, "watch_roots_path", lambda: roots_path)
-
-    tray._open_watch_roots_file()
-
-    assert roots_path.exists()
-    assert opened == [str(roots_path)]
-
-
-def test_tray_open_builtin_passwords_file_creates_and_opens_txt(tmp_path, monkeypatch):
-    passwords_path = tmp_path / "builtin_passwords.txt"
-    opened = []
-    tray = object.__new__(WindowsTrayIcon)
-    tray._open_path = opened.append
-
-    monkeypatch.setattr(tray_module, "builtin_password_path", lambda: passwords_path)
-
-    def create_passwords_file():
-        passwords_path.write_text("123456\n", encoding="utf-8")
-        return ["123456"]
-
-    monkeypatch.setattr(tray_module, "get_builtin_passwords", create_passwords_file)
-
-    tray._open_builtin_passwords_file()
-
-    assert passwords_path.exists()
-    assert opened == [str(passwords_path)]
-
-
-def test_tray_builtin_password_command_opens_passwords_file():
+def test_tray_opens_manager_from_menu_and_left_click(monkeypatch):
     calls = []
     tray = object.__new__(WindowsTrayIcon)
-    tray._open_builtin_passwords_file = lambda: calls.append("open")
-
-    tray._handle_command(tray_module.ID_OPEN_BUILTIN_PASSWORDS)
-
-    assert calls == ["open"]
+    tray._show_menu = lambda hwnd: calls.append(("menu", hwnd))
+    monkeypatch.setattr(tray_module, "launch_manager", lambda: calls.append("manager"))
+    tray._handle_command(tray_module.ID_OPEN_MANAGER)
+    for event in (tray_module.WM_LBUTTONUP, tray_module.WM_LBUTTONDBLCLK):
+        assert tray._wndproc(123, tray_module.WM_TRAYICON, 0, event) == 0
+    assert tray._wndproc(123, tray_module.WM_TRAYICON, 0, tray_module.WM_RBUTTONUP) == 0
+    assert calls == ["manager", "manager", "manager", ("menu", 123)]
 
 
 def test_tray_uses_chinese_text_when_cli_language_is_zh():
@@ -62,9 +29,7 @@ def test_tray_uses_chinese_text_when_cli_language_is_zh():
     tray = object.__new__(WindowsTrayIcon)
     tray.language = "zh"
 
-    assert tray._text("open_config") == "打开配置文件"
-    assert tray._text("open_watch_roots") == "打开监控目录列表"
-    assert tray._text("open_builtin_passwords") == "打开内置密码文件"
+    assert tray._text("open_manager") == "打开管理面板"
     assert tray._text("exit") == "退出"
 
 
@@ -76,9 +41,7 @@ def test_tray_defaults_to_english_text():
     tray = object.__new__(WindowsTrayIcon)
     tray.language = "en"
 
-    assert tray._text("open_config") == "Open config"
-    assert tray._text("open_watch_roots") == "Open watch folders file"
-    assert tray._text("open_builtin_passwords") == "Open built-in passwords file"
+    assert tray._text("open_manager") == "Open management panel"
     assert tray._text("exit") == "Exit"
 
 

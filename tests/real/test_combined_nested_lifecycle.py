@@ -10,6 +10,7 @@ import pytest
 
 from sunpack.core.contracts.failures import FailureKind
 from tests.helpers.pipeline_engine import execute_pipeline
+from tests.helpers.passwords import write_password_json
 from tests.helpers.tool_config import get_optional_rar
 from tests.real.nested_cases import assert_nested_outputs, build_nested_case
 from tests.real.plan1_real_archives.plan1_support import plan1_config
@@ -35,7 +36,7 @@ def test_cli_disguised_split_carrier_multilevel_passwords(tmp_path, plan_error, 
     environment = {**os.environ, "SUNPACK_CONFIG_OVERRIDES": json.dumps(overrides)}
     command = [
         sys.executable, "-B", str(root / "sunpack.py"), "extract", "--json", "--no-pause",
-        "--no-builtin-pw", "--no-dir-pw", "--cleanup", "k", "--recur", "*", "--deep-detect",
+        "--no-builtin-pw", "--cleanup", "k", "--recur", "*", "--deep-detect",
         "--out-dir", str(out_dir), "-p", "definitely-wrong",
     ]
     for password in passwords:
@@ -60,7 +61,11 @@ def test_cli_disguised_split_carrier_multilevel_passwords(tmp_path, plan_error, 
 def test_concurrent_nested_groups_isolate_password_failure_and_cleanup(tmp_path, plan_error):
     healthy = build_nested_case(tmp_path, "healthy", "7z")
     blocked = build_nested_case(tmp_path, "blocked", "zip")
-    config = plan1_config(passwords=[*healthy.passwords, *blocked.passwords[:2]])
+    config = plan1_config(passwords=[])
+    config["password_snapshot"] = write_password_json(tmp_path / "passwords.json", scopes=[
+        *((value, [str(healthy.outer.archive_dir)]) for value in healthy.passwords),
+        *((value, [str(blocked.outer.archive_dir)]) for value in blocked.passwords[:2]),
+    ])
     config["output"] = {"root": str(tmp_path / "out")}
     config["post_extract"].update(archive_cleanup_mode="delete", flatten_single_directory=True)
     summary = execute_pipeline(config, [str(healthy.outer.archive_dir), str(blocked.outer.archive_dir)])
