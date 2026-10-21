@@ -73,20 +73,11 @@ $r = Invoke-RestMethod 'https://api.github.com/repos/Qinjingxue/Sunpack/releases
 Open the manager from the Watch tray to manage tasks, monitored folders, passwords, and settings in one place.
 
 - **Compact**: the GUI executable is about 4 MB and uses little memory.
-- **No extra runtime**: a native Windows interface with no dependency on a browser engine, .NET, or similar external runtimes.
+- **No extra runtime**: a C++ Windows interface with no dependency on a browser engine, .NET, or similar external runtimes.
 - **Fast and responsive**: opens quickly and keeps interactions snappy while managing tasks, folders, passwords, and settings.
-- **Exits when closed**: the GUI does not stay resident in the background; Watch continues running independently.
+- **Exits when closed**: the GUI does not stay resident in the background.
 
-![SunPack tasks: folder filtering and statuses for successful, processing, and waiting tasks](docs/images/gui-tasks.en.jpg)
-
-<details>
-<summary>View settings and the light theme</summary>
-
-![SunPack settings: search, categories, and inline editing](docs/images/gui-settings.en.jpg)
-
-</details>
-
-> Screenshots show the dev branch with demo data. See the [GUI guide](gui/README.md) for build instructions.
+![SunPack tasks: folder filtering and statuses for successful, processing, and waiting tasks](docs/images/gui.en.png)
 
 ### Command overview
 

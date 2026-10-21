@@ -6,6 +6,10 @@
 
 #include "ui_core.h"
 
+#ifndef UI_CORE_ENABLE_TIMING_TRACE
+#define UI_CORE_ENABLE_TIMING_TRACE 0
+#endif
+
 namespace ui {
 
 void EmitTrace(const char* source,
@@ -58,6 +62,7 @@ inline void TraceEvent(const char* source,
 
 class TraceScope {
 public:
+#if UI_CORE_ENABLE_TIMING_TRACE
     TraceScope(const char* source, const char* name)
         : source_(source), name_(name), enabled_(IsTraceEnabled()) {
         if (enabled_) QueryPerformanceCounter(&start_);
@@ -82,6 +87,9 @@ private:
     const char* name_;
     bool enabled_;
     LARGE_INTEGER start_{};
+#else
+    constexpr TraceScope(const char*, const char*) noexcept {}
+#endif
 };
 
 }  // namespace ui

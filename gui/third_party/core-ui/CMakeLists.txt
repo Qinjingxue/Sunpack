@@ -163,13 +163,19 @@ set(UI_CORE_WIN_VERSION_DEFS
     NTDDI_VERSION=0x0A000004
 )
 
+# Timing scopes are diagnostics only. Keep them in Debug builds so Release
+# rendering and layout paths contain no QPC/trace-scope instrumentation.
+set(UI_CORE_TRACE_DEFINITIONS
+    UI_CORE_ENABLE_TIMING_TRACE=$<CONFIG:Debug>
+)
+
 if(UI_CORE_STATIC)
     # ---- Static-only build: core-ui.lib (linked into exe) ----
     add_library(core-ui STATIC ${UI_CORE_SOURCES})
     target_compile_definitions(core-ui
         PUBLIC  UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX UI_CORE_STATIC
                 ${UI_CORE_WIN_VERSION_DEFS}
-        PRIVATE UI_CORE_BUILDING
+        PRIVATE UI_CORE_BUILDING ${UI_CORE_TRACE_DEFINITIONS}
     )
     target_link_libraries(core-ui PUBLIC ${UI_CORE_SYSTEM_LIBS} qjs lunasvg)
 else()
@@ -179,7 +185,7 @@ else()
     target_compile_definitions(core-ui
         PUBLIC  UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX
                 ${UI_CORE_WIN_VERSION_DEFS}
-        PRIVATE UI_CORE_BUILDING
+        PRIVATE UI_CORE_BUILDING ${UI_CORE_TRACE_DEFINITIONS}
     )
     target_link_libraries(core-ui PRIVATE ${UI_CORE_SYSTEM_LIBS} qjs lunasvg)
 
@@ -194,7 +200,7 @@ else()
         target_compile_definitions(core-ui-static
             PUBLIC  UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX UI_CORE_STATIC
                     ${UI_CORE_WIN_VERSION_DEFS}
-            PRIVATE UI_CORE_BUILDING
+            PRIVATE UI_CORE_BUILDING ${UI_CORE_TRACE_DEFINITIONS}
         )
         target_link_libraries(core-ui-static PUBLIC ${UI_CORE_SYSTEM_LIBS} qjs lunasvg)
         target_include_directories(core-ui-static

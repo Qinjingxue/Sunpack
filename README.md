@@ -73,20 +73,11 @@ $r = Invoke-RestMethod 'https://api.github.com/repos/Qinjingxue/Sunpack/releases
 从 Watch 托盘打开管理面板，任务、监控目录、密码与配置集中管理。
 
 - **程序小巧**：GUI 本体约 4 MB，内存占用低。
-- **无需额外运行时**：纯原生 Windows 界面，不依赖浏览器内核、.NET 等外部运行时。
+- **无需额外运行时**：纯C++ 仿Windows 界面，不依赖浏览器内核、.NET 等外部运行时。
 - **启动快、操作流畅**：打开和交互响应迅速，任务、目录、密码与配置一屏管理。
-- **用完即退出**：关闭窗口后 GUI 完全退出，不在后台常驻；Watch 监控独立运行。
+- **用完即退出**：关闭窗口后 GUI 完全退出，不在后台常驻。
 
-![SunPack 任务状态：按目录筛选，查看成功、处理中及等待密码或分卷的任务](docs/images/gui-tasks.zh-CN.jpg)
-
-<details>
-<summary>查看配置管理与浅色外观</summary>
-
-![SunPack 配置管理：搜索设置、分类浏览与原地编辑](docs/images/gui-settings.zh-CN.jpg)
-
-</details>
-
-> 截图来自 dev 分支，使用演示数据。GUI 构建说明见 [GUI 说明](gui/README.md)。
+![SunPack 任务状态：按目录筛选，查看成功、处理中及等待密码或分卷的任务](docs/images/gui.zh-CN.png)
 
 ### 命令速览
 
