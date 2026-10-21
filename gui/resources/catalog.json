@@ -32,14 +32,6 @@
       "zh": "结束时间（不包含）",
       "en": "End time (exclusive)"
     },
-    "rangeHint": {
-      "zh": "上下限均包含，留空不限，支持小数单位",
-      "en": "Inclusive bounds; leave blank for no limit; decimal units supported"
-    },
-    "rangeTimeHint": {
-      "zh": "本地时间，精确到分钟，留空不限",
-      "en": "Local time to the minute; leave blank for no limit"
-    },
     "rangeChoose": {
       "zh": "选择日期时间",
       "en": "Choose date/time"
@@ -241,12 +233,8 @@
       "en": "invalid log entries skipped"
     },
     "startup": {
-      "zh": "开机启动监控",
-      "en": "Start Watch at sign-in"
-    },
-    "startupDescription": {
-      "zh": "登录 Windows 后自动监控目录",
-      "en": "Monitor folders when you sign in to Windows"
+      "zh": "开机启动",
+      "en": "Start at sign-in"
     },
     "enabled": {
       "zh": "已启用",
@@ -851,10 +839,6 @@
         "zh": "语言",
         "en": "Language"
       },
-      "description": {
-        "zh": "同时用于管理面板和命令行",
-        "en": "Applies to the manager and command line"
-      },
       "options": [
         {
           "value": "zh",
@@ -939,10 +923,6 @@
         "zh": "评分调整",
         "en": "Score adjustment"
       },
-      "description": {
-        "zh": "正数提高评分，负数降低评分",
-        "en": "Positive values raise the score; negative values lower it"
-      },
       "min": null,
       "max": null,
       "exclusive": false
@@ -952,10 +932,6 @@
         "zh": "最低评分",
         "en": "Minimum score"
       },
-      "description": {
-        "zh": "达到此值才继续解压",
-        "en": "Continue extraction at or above this score"
-      },
       "min": 0,
       "max": 1,
       "exclusive": false
@@ -964,10 +940,6 @@
       "label": {
         "zh": "最低压缩包占比",
         "en": "Minimum archive ratio"
-      },
-      "description": {
-        "zh": "压缩包占总大小的最低比例",
-        "en": "Minimum archive share of the total size"
       },
       "min": 0,
       "max": 1,
@@ -1020,10 +992,6 @@
       "label": {
         "zh": "展开单层文件夹",
         "en": "Flatten single folder"
-      },
-      "description": {
-        "zh": "只有一层文件夹时将内容上移",
-        "en": "Move contents up when output has a single folder"
       }
     },
     "/filesystem/directory_scan_mode": {
@@ -1070,8 +1038,8 @@
         "en": "Skipped folders"
       },
       "description": {
-        "zh": "支持通配符，可逐项管理规则",
-        "en": "Manage individual patterns; wildcards supported"
+        "zh": "支持通配符",
+        "en": "Wildcards supported"
       }
     },
     "/filesystem/scan_filters/@directory_prune/path_globs": {
@@ -1080,8 +1048,8 @@
         "en": "Path patterns"
       },
       "description": {
-        "zh": "支持通配符，可逐项管理规则",
-        "en": "Manage individual patterns; wildcards supported"
+        "zh": "支持通配符",
+        "en": "Wildcards supported"
       }
     },
     "/filesystem/scan_filters/@whitelist/enabled": {
@@ -1100,8 +1068,8 @@
         "en": "Path patterns"
       },
       "description": {
-        "zh": "支持通配符，可逐项管理规则",
-        "en": "Manage individual patterns; wildcards supported"
+        "zh": "支持通配符",
+        "en": "Wildcards supported"
       }
     },
     "/filesystem/scan_filters/@whitelist/prune_dir_globs": {
@@ -1110,8 +1078,8 @@
         "en": "Allowed folders"
       },
       "description": {
-        "zh": "支持通配符，可逐项管理规则",
-        "en": "Manage individual patterns; wildcards supported"
+        "zh": "支持通配符",
+        "en": "Wildcards supported"
       }
     },
     "/filesystem/scan_filters/@whitelist/allowed_files": {
@@ -1260,10 +1228,6 @@
       "label": {
         "zh": "资源不足时暂停新任务",
         "en": "Pause new tasks when resources are low"
-      },
-      "description": {
-        "zh": "等待内存和磁盘空间恢复后继续",
-        "en": "Resume when memory and disk space are available"
       }
     },
     "/performance/worker/space_poll_interval_ms": {
@@ -1292,10 +1256,6 @@
       "label": {
         "zh": "最低可用内存比例",
         "en": "Minimum available memory ratio"
-      },
-      "description": {
-        "zh": "低于此值时暂停新任务",
-        "en": "Pause new tasks below this ratio"
       },
       "min": 0,
       "max": 1
@@ -1337,10 +1297,6 @@
       "label": {
         "zh": "首次处理等待（秒）",
         "en": "Initial delay (s)"
-      },
-      "description": {
-        "zh": "发现新文件后等待多久再处理",
-        "en": "Wait after discovering a new file"
       },
       "min": 0,
       "integer": false
@@ -1401,10 +1357,6 @@
       "label": {
         "zh": "清理空闲缓存",
         "en": "Clear idle cache"
-      },
-      "description": {
-        "zh": "空闲时释放可重建的缓存",
-        "en": "Release rebuildable caches while idle"
       }
     },
     "/watch/runtime_cache_cleanup_idle_seconds": {
@@ -1420,10 +1372,6 @@
         "zh": "密码重试合并间隔（秒）",
         "en": "Password retry merge interval (s)"
       },
-      "description": {
-        "zh": "合并短时间内重复的重试请求",
-        "en": "Combine repeated retry requests within this interval"
-      },
       "min": 0,
       "integer": false
     },
@@ -1437,10 +1385,6 @@
       "label": {
         "zh": "剪贴板历史上限",
         "en": "Clipboard history limit"
-      },
-      "description": {
-        "zh": "超出时移除最旧记录",
-        "en": "Remove the oldest entries when full"
       },
       "min": 1,
       "integer": true
@@ -1496,10 +1440,6 @@
         "zh": "结果通知合并间隔（毫秒）",
         "en": "Result merge interval (ms)"
       },
-      "description": {
-        "zh": "合并连续完成的结果通知",
-        "en": "Combine results completed close together"
-      },
       "min": 0,
       "integer": true
     },
@@ -1507,10 +1447,6 @@
       "label": {
         "zh": "报告保留时间（天）",
         "en": "Report retention (days)"
-      },
-      "description": {
-        "zh": "到期后自动清理",
-        "en": "Remove reports after this time"
       },
       "min": 1,
       "integer": true
@@ -1545,20 +1481,12 @@
       "label": {
         "zh": "使用剪贴板密码",
         "en": "Use clipboard passwords"
-      },
-      "description": {
-        "zh": "尝试用当前剪贴板文本解密",
-        "en": "Try the current clipboard text as a password"
       }
     },
     "/extraction/content_requirement": {
       "label": {
         "zh": "解压结果要求",
         "en": "Required extraction result"
-      },
-      "description": {
-        "zh": "可选择只接受完整结果，或允许恢复部分内容",
-        "en": "Require complete results or allow partial recovery"
       },
       "options": [
         {
@@ -1649,10 +1577,6 @@
       "label": {
         "zh": "文件头尾预读",
         "en": "Read file headers and tails"
-      },
-      "description": {
-        "zh": "先读取文件两端，辅助识别格式",
-        "en": "Read both ends of a file to help identify its format"
       }
     },
     "/analysis/prepass/head_bytes": {
@@ -1677,10 +1601,6 @@
       "label": {
         "zh": "识别置信度",
         "en": "Detection confidence"
-      },
-      "description": {
-        "zh": "达到此值才视为可解压",
-        "en": "Treat as extractable at or above this confidence"
       },
       "min": 0,
       "max": 1
@@ -1892,10 +1812,6 @@
       "label": {
         "zh": "清理失败输出",
         "en": "Clean up failed output"
-      },
-      "description": {
-        "zh": "移除验证失败产生的不完整文件",
-        "en": "Remove incomplete output after failed verification"
       }
     },
     "/verification/complete_accept_threshold": {
@@ -1928,20 +1844,12 @@
       "label": {
         "zh": "解压退出信号",
         "en": "Extraction exit signal"
-      },
-      "description": {
-        "zh": "检查解压程序的退出结果",
-        "en": "Check the extractor exit result"
       }
     },
     "/verification/methods/@output_presence/enabled": {
       "label": {
         "zh": "输出检查",
         "en": "Output check"
-      },
-      "description": {
-        "zh": "检查是否生成输出文件",
-        "en": "Check that output files were created"
       }
     },
     "/verification/methods/@manifest_size_match/enabled": {

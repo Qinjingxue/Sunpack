@@ -26,11 +26,7 @@ void update_tags(TagCollection& tags,const Json& field,const Json& drafts,const 
 constexpr UINT Dispatch = WM_APP + 0x401, Update = WM_APP + 0x402, DateResult = WM_APP + 0x403;
 constexpr unsigned Config = 1, Passwords = 2, Roots = 4, Log = 8, Startup = 16;
 using Clock=std::chrono::steady_clock;
-struct VisualBatch {
-    UiWindow window;
-    explicit VisualBatch(UiWindow w):window(w) { ui_window_begin_canvas_visual_transaction(w); }
-    ~VisualBatch() { ui_window_end_canvas_visual_transaction(window); }
-};
+using motion::VisualBatch;
 struct ReadRetry {
     unsigned attempts=0;
     Clock::time_point due=Clock::time_point::max();

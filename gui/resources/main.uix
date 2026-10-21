@@ -62,7 +62,7 @@ export default {
       return groups;
     },
     matchingBlocks() { return this.configBlocks.filter(g=>(!this.configCategory||g.category===this.configCategory)&&(!this.configQuery.trim()||this.matchesConfig([g.label,...g.fields.map(f=>this.configText(f))].join(' ')))); },
-    showStartupSetting() { return !this.configCategory&&this.matchesConfig([this.texts.startup,this.texts.startupDescription,this.startup.enabled?this.texts.startupOff:this.texts.startupOn].join(' ')); },
+    showStartupSetting() { return !this.configCategory&&this.matchesConfig([this.texts.startup,this.startup.enabled?this.texts.startupOff:this.texts.startupOn].join(' ')); },
     showThemeSetting() { return !this.configCategory&&this.matchesConfig([this.texts.theme,this.texts.system,this.texts.light,this.texts.dark].join(' ')); },
   },
   methods: {
@@ -75,7 +75,7 @@ export default {
       if(f.editor==='list') parts.push(t.tagInputPlaceholder,this.tagValues(f).map(v=>this.entryLabel(v)).join(' '));
       if(this.isRange(f)) {
         let r=this.rangeValue(f),date=f.editor==='datetime_range';
-        parts.push(t.rangeEnable,date?t.rangeTimeHint:t.rangeHint,date?t.rangeStart:t.rangeMin,date?t.rangeEnd:t.rangeMax,r.lower,r.upper);
+        parts.push(t.rangeEnable,date?t.rangeStart:t.rangeMin,date?t.rangeEnd:t.rangeMax,r.lower,r.upper);
         if(date) parts.push(t.rangePick,t.rangeChoose,'YYYY-MM-DD HH:mm'); else parts.push('B KiB MiB GiB TiB');
       }
       return parts.join(' ');
@@ -625,7 +625,7 @@ export default {
   .task-filters input { min-width:180px; }
   .card { padding:16px 20px; gap:10px; border:1px solid var(--card-border); border-radius:8px; }
   .settings-row { flex-direction:row; align-items:center; gap:16px; }
-  .setting-copy { flex:1; gap:4px; }
+  .setting-copy { flex:1; gap:4px; justify-content:center; }
   .setting-copy > label { width:100%; flex-shrink:0; }
   .setting-title { font-size:14px; }
   .task { padding:10px 14px; gap:4px; border:1px solid var(--card-border); border-radius:8px; }
@@ -661,7 +661,7 @@ export default {
   /* Core UI scrollbars overlay the viewport (up to 9 px plus a 2 px
      inset). Reserve 18 px for the bar and shadows in every scroll pane. */
   ScrollView { flex:1; padding:2px 18px 6px 2px; }
-  .setting-control { width:220px; gap:8px; }
+  .setting-control { width:220px; gap:8px; justify-content:center; }
   .range-editor { gap:8px; }
   .range-pair { flex-direction:row; flex-wrap:wrap; align-items:flex-start; gap:16px; }
   .range-group { width:194px; flex-shrink:0; gap:6px; }
@@ -679,7 +679,9 @@ export default {
   .setting-card.dark { background:#2b2b2b; border:1px solid #303030; }
   .setting-card { gap:0px; padding:0px 20px; }
   .block-fields { gap:0px; }
-  .setting-item { padding:16px 0px; gap:10px; }
+  .setting-item { gap:0px; }
+  .setting-item > .settings-row { padding:16px 0px; min-height:32px; }
+  .setting-item > .range-editor, .setting-item > .error { margin-bottom:16px; }
   .setting-item > textarea { width:100%; }
   .setting-divider { height:1px; background:var(--card-border); }
   .block-heading { padding:16px 0px 0px; font-size:14px; font-weight:600; }
@@ -688,7 +690,6 @@ export default {
   .runtime-dot.running { background:#6ccb5f; }
   .setting-description { color:var(--fg-2); font-size:12px; white-space:normal; }
   .choice-host { height:32px; flex-direction:row; }
-  .tag-setting { align-items:flex-start; }
   .tag-setting .setting-copy { width:190px; flex:0; flex-shrink:1; gap:8px; }
   .tag-setting .setting-copy input { width:100%; }
   .tag-region { height:112px; min-width:0px; padding:6px 18px 6px 6px; border:1px solid var(--card-border); border-radius:6px; }
@@ -800,7 +801,7 @@ export default {
         <input id="configSearch" type="search" class="search-field" :placeholder="texts.settingSearch" :value="configQuery" @input="searchConfig"/>
         <ScrollView id="configListScroll"><div id="configBlocks" class="column">
           <div id="startupSetting" v-show="showStartupSetting" class="card settings-row">
-            <div class="setting-copy"><label class="setting-title">{{ texts.startup }}</label><label class="muted">{{ texts.startupDescription }}</label></div>
+            <div class="setting-copy"><label class="setting-title">{{ texts.startup }}</label></div>
             <button id="startupToggle" :enabled="cliAllowed" @click="send('cli',{action:startup.enabled?'startupDisable':'startupEnable'})">{{ startup.enabled?texts.startupOff:texts.startupOn }}</button>
           </div>
           <div id="themeSetting" v-show="showThemeSetting" class="card settings-row"><div class="setting-copy"><label class="setting-title">{{ texts.theme }}</label></div><div id="themeHost" style="width:180px;height:32px"/></div>
@@ -826,7 +827,6 @@ export default {
             <div v-if="isRange(f)" class="range-editor">
               <div class="action-row"><toggle :id="'range-enabled-'+f.id" :checked="rangeValue(f).enabled" @change="v=>changeRange(f,'enabled',v,true)"/><label>{{ texts.rangeEnable }}</label></div>
               <div class="column">
-                <label class="muted">{{ f.editor==='datetime_range'?texts.rangeTimeHint:texts.rangeHint }}</label>
                 <div class="range-pair">
                   <div :id="'range-lower-group-'+f.id" :class="f.editor==='datetime_range'?'range-group range-time':'range-group'">
                     <label>{{ f.editor==='datetime_range'?texts.rangeStart:texts.rangeMin }}</label>

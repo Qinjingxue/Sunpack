@@ -12,10 +12,15 @@ namespace {
 // A widget opacity layer alone would leave an opaque window flashing behind it.
 class PopupSurface final : public ui::Widget {
     HWND hwnd_;
+    int alpha_=-1;
 public:
     explicit PopupSurface(HWND hwnd) : hwnd_(hwnd) { id = "datePopupSurface"; }
     void DrawTree(ui::Renderer& renderer) override {
-        SetLayeredWindowAttributes(hwnd_,0,BYTE(std::clamp(opacity,0.0f,1.0f)*255),LWA_ALPHA);
+        int alpha=int(std::clamp(opacity,0.0f,1.0f)*255);
+        if(alpha!=alpha_) {
+            SetLayeredWindowAttributes(hwnd_,0,BYTE(alpha),LWA_ALPHA);
+            alpha_=alpha;
+        }
         for(auto& child:Children()) child->DrawTree(renderer);
     }
 };
@@ -83,6 +88,6 @@ void popup(UiWindow handle, bool opening, std::function<void()> complete) {
         if(complete) complete();
         return;
     }
-    window->AnimateProperty(surface,ui::AnimProperty::Opacity,surface->opacity,target,opening?167.0f:83.0f,ui::EasingFunction::Linear,std::move(complete));
+    window->AnimateProperty(surface,ui::AnimProperty::Opacity,surface->opacity,target,opening?100.0f:67.0f,ui::EasingFunction::Linear,std::move(complete));
 }
 }

@@ -109,27 +109,28 @@ void DatePopup::position() {
 }
 void DatePopup::render() {
     auto text=range_datetime_text(date_);
-    set(page_,"month",text.substr(0,7)); set(page_,"selected",text.substr(0,10));
+    set(page_,"selected",text.substr(0,10)); set(page_,"error","");
+    // Moving within a month changes only selection. Keep the grid's objects,
+    // bindings and measured geometry instead of replacing all 42 entries.
+    auto month=text.substr(0,7);
+    if(month==rendered_month_) return;
+    set(page_,"month",month);
     set(page_,"previous",date_.wYear>1 || date_.wMonth>1);
     set(page_,"next",date_.wYear<9999 || date_.wMonth<12);
     auto first=first_day(date_),start=first-weekday(first);
-    SYSTEMTIME today{}; GetLocalTime(&today);
-    auto todayText=range_datetime_text(today).substr(0,10);
     Json days=Json::array();
     for(int index=0;index<42;++index) {
-        Json day={{"index",index},{"text",""},{"valid",false},{"other",false},{"today",false},{"selected",false}};
+        Json day={{"index",index},{"key",""},{"text",""},{"valid",false},{"other",false}};
         try {
             auto value=range_calendar_time((start+index)*86400);
             auto key=range_datetime_text(value).substr(0,10);
-            day.update({{"text",std::to_string(value.wDay)},{"valid",true},{"other",value.wMonth!=date_.wMonth},
-                        {"today",key==todayText},{"selected",key==text.substr(0,10)}});
+            day.update({{"key",key},{"text",std::to_string(value.wDay)},{"valid",true},{"other",value.wMonth!=date_.wMonth}});
         } catch(const std::runtime_error&) {} // Empty cells outside years 1..9999.
         days.push_back(std::move(day));
     }
-    set(page_,"days",days); set(page_,"error","");
+    set(page_,"days",days); rendered_month_=month;
 }
 void DatePopup::focus_day() {
-    ui_window_relayout(window_);
     auto root=ui_page_root(page_);
     auto id="date-day-"+std::to_string(weekday(first_day(date_))+date_.wDay-1);
     auto widget=ui_widget_find_by_id(root,id.c_str());
@@ -137,11 +138,13 @@ void DatePopup::focus_day() {
     ui_widget_destroy(root);
 }
 void DatePopup::move_days(int days) {
+    motion::VisualBatch visual(window_);
     try { date_=range_calendar_time(range_calendar_seconds(date_)+int64_t(days)*86400); }
     catch(const std::runtime_error&) { return; }
     render(); focus_day();
 }
 void DatePopup::move_months(int months) {
+    motion::VisualBatch visual(window_);
     int month=int(date_.wYear-1)*12+date_.wMonth-1+months;
     if(month<0 || month>=9999*12) return;
     auto value=date_; value.wYear=WORD(month/12+1); value.wMonth=WORD(month%12+1);
@@ -156,6 +159,7 @@ void DatePopup::notify(bool cancel) {
     else PostMessageW(owner_,message_,generation_,0);
 }
 void DatePopup::dispatch() {
+    motion::VisualBatch visual(window_);
     auto requests=state(page_,"requests"); set(page_,"requests",Json::array()); ui_page_set_bool(page_,"dispatch",false);
     if(cancelled_ || closing_) return;
     for(auto& request:requests) {

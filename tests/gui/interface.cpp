@@ -526,7 +526,7 @@ void localized_config_search(Application& app) {
         }
         search_config(app,wide(texts["dark"].get<std::string>()).c_str());
         assert(state(app.page(),"showThemeSetting")==true);
-        search_config(app,wide(texts["startupDescription"].get<std::string>()).c_str());
+        search_config(app,wide(texts["startup"].get<std::string>()).c_str());
         assert(state(app.page(),"showStartupSetting")==true);
         search_config(app,L"max_pending_stage_jobs");
         assert(state(app.page(),"matchingBlocks").empty());
@@ -752,6 +752,22 @@ void range_config(Application& app,const fs::path& dir) {
     // Cancel, outside activation, settings switch and superseded completion
     // exercise different lifetime paths, sharing the existing real window.
     popup=open("upper"); oldTree=popup->Root();
+    popup_click(popup,"dateToday");
+    popup_key(popup,VK_RIGHT);
+    // Selection is the only accent. A formerly selected 'today' must return
+    // to the same text color as the other ordinary days. File saves cannot
+    // detect that visual state, so reuse this popup before its existing cancel.
+    auto normal=popup->Root()->FindById("datePopup")->css.fg;
+    int selectedDays=0;
+    for(int index=0;index<42;++index) {
+        auto* day=popup->Root()->FindById("date-day-"+std::to_string(index)); assert(day);
+        auto has=[&](const char* name){return std::find(day->dynamicClasses.begin(),day->dynamicClasses.end(),name)!=day->dynamicClasses.end();};
+        if(has("selected")) { ++selectedDays; assert(day==popup->FocusedWidget()); }
+        else if(!has("other")) assert(std::abs(day->css.fg.r-normal.r)<0.001f &&
+            std::abs(day->css.fg.g-normal.g)<0.001f && std::abs(day->css.fg.b-normal.b)<0.001f);
+    }
+    assert(selectedDays==1);
+    if(*shots) assert(ui_debug_screenshot(popup->windowId,(fs::path(shots)/L"date-popup-selection.png").c_str())==0);
     popup_click(popup,"datePrevious");
     popup_key(popup,VK_ESCAPE);
     pump([&]{return !date_popup(app);},"Date cancellation exit");
@@ -830,6 +846,10 @@ void tag_config(Application& app,const fs::path& dir) {
     auto* cloud=window->Root()->FindById("tags-"+pointer); assert(cloud && cloud->Children().empty());
     auto region=rect(app,"tag-scroll-"+pointer),left=rect(app,inputId);
     assert(region.left>=left.right && region.bottom-region.top<=114);
+    auto* copy=input()->Parent(); auto* row=copy->Parent(); auto* item=row->Parent();
+    assert(std::abs(copy->rect.top+copy->rect.bottom-region.top-region.bottom)<0.2f);
+    assert(std::abs(region.top-row->rect.top-row->rect.bottom+region.bottom)<0.2f);
+    assert(row->rect.top-item->rect.top<=1.1f && std::abs(item->rect.bottom-row->rect.bottom)<0.1f);
     click(app,inputId.c_str()); assert(ui_debug_type_text(app.window(),L"unsubmitted")==0);
     click(app,"configSearch");
     assert(disk()==values && state(app.page(),"tagInputs")[pointer]=="unsubmitted");
@@ -867,7 +887,7 @@ void tag_config(Application& app,const fs::path& dir) {
     // Remove just the first empty-string tag through its actual close affordance.
     cloud=window->Root()->FindById("tags-"+pointer);
     auto label=wide(state(app.page(),"texts")["emptyEntry"].get<std::string>());
-    float x=cloud->rect.left+window->GetRenderer().MeasureTextWidth(label,13)+19,y=cloud->rect.top+13;
+    float x=cloud->rect.left+window->GetRenderer().MeasureTextWidth(label,13)+25,y=cloud->rect.top+13;
     assert(ui_debug_mouse_down(app.window(),x,y)==0); assert(ui_debug_mouse_up(app.window(),x,y)==0);
     finish_input(app); values.erase(values.begin());
     assert(disk()==values && input()->Text()==L"still unsubmitted");

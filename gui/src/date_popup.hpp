@@ -15,6 +15,7 @@ class DatePopup {
     SYSTEMTIME date_{};
     DYNAMIC_TIME_ZONE_INFORMATION zone_{};
     std::string language_;
+    std::string rendered_month_;
     bool cancelled_ = false, confirming_ = false, positioning_ = false;
     bool closing_ = false, closed_ = false;
     void render();
