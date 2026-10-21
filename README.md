@@ -22,6 +22,7 @@
 
 - [安装说明](#安装说明)
 - [使用指南](#使用指南)
+  - [图形管理面板](#图形管理面板)
   - [命令速览](#命令速览)
   - [密码管理](#密码管理)
 - [核心能力](#核心能力)
@@ -67,6 +68,26 @@ $r = Invoke-RestMethod 'https://api.github.com/repos/Qinjingxue/Sunpack/releases
 
 ## 使用指南
 
+### 图形管理面板
+
+从 Watch 托盘打开管理面板，任务、监控目录、密码与配置集中管理。
+
+- **程序小巧**：GUI 本体约 4 MB，内存占用低。
+- **无需额外运行时**：纯原生 Windows 界面，不依赖浏览器内核、.NET 等外部运行时。
+- **启动快、操作流畅**：打开和交互响应迅速，任务、目录、密码与配置一屏管理。
+- **用完即退出**：关闭窗口后 GUI 完全退出，不在后台常驻；Watch 监控独立运行。
+
+![SunPack 任务状态：按目录筛选，查看成功、处理中及等待密码或分卷的任务](docs/images/gui-tasks.zh-CN.jpg)
+
+<details>
+<summary>查看配置管理与浅色外观</summary>
+
+![SunPack 配置管理：搜索设置、分类浏览与原地编辑](docs/images/gui-settings.zh-CN.jpg)
+
+</details>
+
+> 截图来自 dev 分支，使用演示数据。GUI 构建说明见 [GUI 说明](gui/README.md)。
+
 ### 命令速览
 
 | 命令        | 简写  | 说明                                         |
@@ -84,7 +105,7 @@ $r = Invoke-RestMethod 'https://api.github.com/repos/Qinjingxue/Sunpack/releases
 
 ### 密码管理
 
-点击 Watch 托盘或选择“打开管理面板”，可在原生 GUI 中查看日志任务、编辑监控目录、配置及密码；配置页也提供 Watch 开机自启开关。管理面板通过文件和现有 CLI 命令工作，关闭后退出。GUI 的开发构建和验证见 [GUI 说明](gui/README.md)。
+在[图形管理面板](#图形管理面板)的“密码管理”页中，可按目录编辑密码，或将剪贴板历史保存为候选密码。
 
 Sunpack为达到最大方便性，在使用时会尝试从各处获取密码，高速尝试所有候选密码，在上千候选密码下几乎无感速度，自动找到正确密码并使用，使用的密码来源有：
 
@@ -246,7 +267,7 @@ uv run --locked pytest
 
 ## 致谢
 
-感谢所有为 SunPack 提交代码、报告问题和提供建议的贡献者与用户。SunPack 也受益于众多开源项目，特别感谢 [7-Zip](https://www.7-zip.org/)、[zlib-ng](https://github.com/zlib-ng/zlib-ng)、[LZ4](https://github.com/lz4/lz4) 和 [RustCrypto](https://github.com/RustCrypto) 项目及其维护者。相关第三方组件和许可证信息见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+感谢所有为 SunPack 提交代码、报告问题和提供建议的贡献者与用户。SunPack 也受益于众多开源项目，特别感谢 [Core UI](https://github.com/ghboke/core-ui)（SunPack 的原生 UI 技术栈）、[7-Zip](https://www.7-zip.org/)、[zlib-ng](https://github.com/zlib-ng/zlib-ng)、[LZ4](https://github.com/lz4/lz4) 和 [RustCrypto](https://github.com/RustCrypto) 项目及其维护者。相关第三方组件和许可证信息见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 
 ## 许可证
 
