@@ -78,7 +78,8 @@ void pump_diagnostic(Application& app,const std::function<bool()>& condition,con
     catch(...) {
         std::cerr<<"UI wait diagnostic ["<<phase<<"]";
         for(const char* key:{"tab","taskQuery","taskRoot","taskStatus","requests","dispatch",
-                             "errors","logPath","actionError","busy","lastCommand"}) {
+                             "errors","logPath","actionError","busy","lastCommand",
+                             "saving","pendingFields","saveErrors","drafts","tagInputs"}) {
             try { std::cerr<<" "<<key<<"="<<state(app.page(),key).dump(); }
             catch(const std::exception& e) { std::cerr<<" "<<key<<"=<unavailable: "<<e.what()<<">"; }
         }
@@ -819,7 +820,7 @@ void tag_config(Application& app,const fs::path& dir) {
     auto disk=[&]{return read_json(dir/"sunpack_config.json")[Json::json_pointer(pointer)];};
     auto current=[&]{for(auto& f:state(app.page(),"fields")) if(f["id"]==pointer) return f;return Json();};
     config[Json::json_pointer(pointer)]=values; atomic_write(dir/"sunpack_config.json",config.dump());
-    pump([&]{return current().value("items",Json())==values;});
+    pump_diagnostic(app,[&]{return current().value("items",Json())==values;},"TAG fixture reload");
     search_setting(app,pointer);
     auto* window=ui::GetContext().GetWindow(app.window());
     assert(!window->Root()->FindById("listManager") && !window->Root()->FindById("list-"+pointer));
@@ -877,14 +878,22 @@ void tag_config(Application& app,const fs::path& dir) {
     search_setting(app,pointer);
     {
         FileMutex hold(dir/"sunpack_config.json");
+        // Capture the local baseline before publishing the external version.
+        // Otherwise the file notification can win during add()'s message pump
+        // and turn this intended conflict into a successful, rebased save.
+        add(L"local");
+        pump_diagnostic(app,[&]{
+            auto pending=state(app.page(),"pendingFields");
+            return std::find(pending.begin(),pending.end(),pointer)!=pending.end() &&
+                state(app.page(),"saving").get<bool>();
+        },"TAG local save queued");
         config=read_json(dir/"sunpack_config.json");config[Json::json_pointer(pointer)]=Json::array({"external"});
         atomic_write(dir/"sunpack_config.json",config.dump());
-        add(L"local");
     }
-    pump([&]{return state(app.page(),"saveErrors").contains(pointer)&&!state(app.page(),"saving").get<bool>();});
+    pump_diagnostic(app,[&]{return state(app.page(),"saveErrors").contains(pointer)&&!state(app.page(),"saving").get<bool>();},"TAG external conflict");
     values.push_back("local");
     assert(disk()==Json::array({"external"}) && parse_json(state(app.page(),"drafts")[pointer]["text"])==values);
-    pump([&]{return current()["items"]==Json::array({"external"});});
+    pump_diagnostic(app,[&]{return current()["items"]==Json::array({"external"});},"TAG external reload");
     // One explicit follow-up write rebases against the newest snapshot.
     add(L"retry"); finish_input(app);values.push_back("retry");assert(disk()==values);
     search_config(app,L"");
@@ -1095,12 +1104,12 @@ int wmain(int argc,wchar_t** argv) {
             Application app(options); std::cerr<<"Opening UI\n"; app.open(); std::cerr<<"UI opened\n";
             // The old show-before-load path flashed an incomplete first page.
             assert(!IsWindowVisible(static_cast<HWND>(ui_window_hwnd(app.window()))));
-            pump([&]{return state(app.page(),"ready")==true;});
+            pump_diagnostic(app,[&]{return state(app.page(),"ready")==true;},"Initial snapshot");
             assert(IsWindowVisible(static_cast<HWND>(ui_window_hwnd(app.window()))));
             assert(state(app.page(),"errors").empty() && state(app.page(),"actionError")=="");
             screenshot(app,L"startup.png");
             if(rangesOnly || acceptance) {
-                pump([&]{return state(app.page(),"fields").size()>100;});
+                pump_diagnostic(app,[&]{return state(app.page(),"fields").size()>100;},"Configuration fields loaded");
                 click(app,"tabConfig"); pump([&]{return state(app.page(),"tab")=="config";});
                 if(acceptance) {
                     settle_motion(app);
