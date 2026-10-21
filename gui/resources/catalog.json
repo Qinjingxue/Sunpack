@@ -32,17 +32,13 @@
       "zh": "选择日期时间",
       "en": "Choose date/time"
     },
-    "rangeAdvanced": {
-      "zh": "编辑原始表达式",
-      "en": "Edit expression"
+    "rangePick": {
+      "zh": "选择",
+      "en": "Choose"
     },
-    "rangeSimple": {
-      "zh": "范围选择",
-      "en": "Range controls"
-    },
-    "rangeFallback": {
-      "zh": "此表达式保留原文，请在此编辑。",
-      "en": "This expression is preserved; edit it here."
+    "rangePreserved": {
+      "zh": "当前条件无法表示为上下限，已保留原配置。",
+      "en": "This condition cannot be shown as bounds. The existing setting is preserved."
     },
     "rangeExtra": {
       "zh": "同时生效的额外配置：",

@@ -402,11 +402,6 @@ void Application::apply_pending() {
             throw std::runtime_error("passwordBindingFailed");
     }
     if(patch.contains("fields")) {
-        auto modes=page_value(page_,"advancedRanges"); auto count=modes.size();
-        for(auto it=modes.begin();it!=modes.end();) {
-            if(std::none_of(patch["fields"].begin(),patch["fields"].end(),[&](const Json& f){return f["id"]==it.key();})) it=modes.erase(it); else ++it;
-        }
-        if(modes.size()!=count) { auto text=modes.dump(); ui_page_set_json(page_,"advancedRanges",text.c_str()); }
         auto drafts=page_value(page_,"drafts");
         for(auto it=controls_.begin();it!=controls_.end();) {
             bool exists=std::any_of(patch["fields"].begin(),patch["fields"].end(),[&](const Json& f){return f["id"]==it->first;});

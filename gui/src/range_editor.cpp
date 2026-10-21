@@ -69,7 +69,7 @@ Json range_editor(const std::string& text,bool datetime) {
     try {
         auto input=trim_range(text);
         if(input.empty()) return result;
-        // Longer/custom expressions stay in the lossless text editor. Bound
+        // Longer/custom expressions remain unchanged in the configuration. Bound
         // the small presentation parser independently of external file size.
         if(input.size()>256) throw std::runtime_error("advanced");
         static const std::regex comparison(R"((<=|>=|==|=|<|>))");

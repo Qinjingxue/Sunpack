@@ -494,7 +494,30 @@ void range_config(Application& app,const fs::path& dir) {
         click(app,control.c_str()); assert(ui_debug_key_mod(app.window(),'A',1,0,0)==0);
         assert(ui_debug_type_char(app.window(),8)==0); if(*value) assert(ui_debug_type_text(app.window(),value)==0);
     };
+    auto layout=[&](const std::string& pointer,bool datetime) {
+        auto lowerId="range-lower-group-"+pointer,upperId="range-upper-group-"+pointer;
+        ui_window_set_size(app.window(),1120,720); ui_window_relayout(app.window());
+        auto lower=rect(app,lowerId),upper=rect(app,upperId);
+        assert(std::abs(lower.top-upper.top)<0.1f && upper.left>=lower.right);
+        assert(!ui_widget_find_by_id(ui_page_root(app.page()),("range-mode-"+pointer).c_str()));
+        assert(!ui_widget_find_by_id(ui_page_root(app.page()),("range-expression-"+pointer).c_str()));
+        auto op=rect(app,"range-lower-op-"+pointer),value=rect(app,"range-lower-"+pointer);
+        assert(op.right-op.left<65 && value.right-value.left<(datetime?180:130));
+        button_texts(app);
+        screenshot(app,datetime?L"range-time-wide.png":L"range-size-wide.png");
+        ui_window_set_size(app.window(),850,560); ui_window_relayout(app.window());
+        lower=rect(app,lowerId); upper=rect(app,upperId);
+        assert(upper.top>=lower.bottom && std::abs(upper.left-lower.left)<0.1f);
+        for(auto side:{"lower","upper"}) {
+            auto group=rect(app,"range-"+std::string(side)+"-group-"+pointer);
+            auto inputBounds=rect(app,"range-"+std::string(side)+"-"+pointer);
+            auto last=rect(app,"range-"+std::string(side)+(datetime?"-pick-":"-unit-")+pointer);
+            assert(inputBounds.left>=group.left && last.right<=group.right+0.1f && last.bottom<=group.bottom+0.1f);
+        }
+        button_texts(app);
+    };
     search_config(app,L"size_range");
+    layout(id,false);
     assert(field("size_range")["range"]["lowerOp"]==0);
     input("range-lower-"+id,L"9007199254740993"); finish_input(app);
     pump([&]{return field("size_range")["text"]=="9007199254740993 < r";},"Exact size range save");
@@ -520,26 +543,28 @@ void range_config(Application& app,const fs::path& dir) {
     finish_input(app);
     pump([&]{return field("size_range")["text"]=="4194304 <= r";},"Continued range edit");
     screenshot(app,L"range-size-small.png");
-    auto before_mode=read_file(dir/"sunpack_config.json");
-    click(app,("range-mode-"+id).c_str());
-    assert(read_file(dir/"sunpack_config.json")==before_mode);
-    click(app,("range-mode-"+id).c_str());
     input("range-lower-"+id,L"5");
-    // External edits refresh the projection without rewriting advanced values.
-    auto config=read_json(dir/"sunpack_config.json"); config[Json::json_pointer(id)]="r == 17";
+    // Structured edits retain their conflict recovery; unsupported legacy
+    // conditions remain read-only and are never silently replaced.
+    auto config=read_json(dir/"sunpack_config.json"); config[Json::json_pointer(id)]="r >= 8388608";
     auto parent=id.substr(0,id.rfind('/')); config[Json::json_pointer(parent+"/gte")]=7;
     atomic_write(dir/"sunpack_config.json",config.dump());
-    pump([&]{auto f=field("size_range"); return f["text"]=="r == 17" && f["range"]["supported"]==false;},"Advanced range reload");
+    pump([&]{return field("size_range")["text"]=="r >= 8388608";},"Range reload");
     click(app,"configSearch");
     pump([&]{return state(app.page(),"saveErrors").contains(id);},"Range external conflict");
     assert(state(app.page(),"drafts")[id]["range"]["lower"]=="5");
-    assert(read_json(dir/"sunpack_config.json")[Json::json_pointer(id)]=="r == 17");
-    ui_window_relayout(app.window());
-    assert(!field("size_range")["rangeExtra"].get<std::string>().empty());
-    input("range-expression-"+id,L"r == 19");
-    try { finish_input(app); }
-    catch(...) { std::cerr<<"Range conflict correction: field="<<field("size_range")<<" drafts="<<state(app.page(),"drafts")<<" file="<<read_json(dir/"sunpack_config.json")[Json::json_pointer(id)]<<" query="<<state(app.page(),"configQuery")<<" control="<<rendered_widget(app,"range-expression-"+id)<<'\n'; screenshot(app,L"range-conflict-failure.png"); throw; }
+    assert(read_json(dir/"sunpack_config.json")[Json::json_pointer(id)]=="r >= 8388608");
+    input("range-lower-"+id,L"6"); finish_input(app);
     assert(read_json(dir/"sunpack_config.json")[Json::json_pointer(parent+"/gte")]==7);
+    config=read_json(dir/"sunpack_config.json"); config[Json::json_pointer(id)]="r == 17";
+    atomic_write(dir/"sunpack_config.json",config.dump());
+    pump([&]{auto f=field("size_range"); return f["text"]=="r == 17" && f["range"]["supported"]==false;},"Legacy range preservation");
+    ui_window_relayout(app.window());
+    assert(rendered_widget(app,"range-preserved-"+id)["text"]=="r == 17");
+    assert(!field("size_range")["rangeExtra"].get<std::string>().empty());
+    assert(!ui_widget_find_by_id(ui_page_root(app.page()),("range-expression-"+id).c_str()));
+    auto preserved=read_file(dir/"sunpack_config.json");
+    click(app,"configSearch"); ui_debug_pump(); assert(read_file(dir/"sunpack_config.json")==preserved);
     search_config(app,L"mtime_range");
     input("range-lower-"+tid,L"2023-02-29 00:00"); ui_window_focus_widget(app.window(),0);
     pump([&]{return state(app.page(),"saveErrors").contains(tid);},"Leap date validation");
@@ -554,6 +579,7 @@ void range_config(Application& app,const fs::path& dir) {
         click(app,("range-upper-pick-"+tid).c_str()); finish_input(app); assert(driver.seen);
     }
     assert(read_file(dir/"sunpack_config.json")==before);
+    layout(tid,true);
     screenshot(app,L"range-time-small.png");
 }
 void structured_config(Application& app,const fs::path& dir) {
