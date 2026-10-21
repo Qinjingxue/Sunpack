@@ -424,6 +424,7 @@ export default {
       this.drafts=next; this.setSaveError(f.id,'');
     },
     passwordDraft(p) { return this.passwordDrafts[p.id]||p; },
+    passwordText(p) { return this.passwordDraft(p).value.replace(/[\r\n]/g,' '); },
     putPasswordDraft(d) { this.passwordDrafts=Object.assign({},this.passwordDrafts,{[d.id]:d}); },
     ensurePasswordDraft(p) {
       let d=this.passwordDrafts[p.id];
@@ -705,7 +706,7 @@ export default {
   .password-value-column input { width:100%; }
   .password-actions { width:72px; flex-shrink:0; margin-left:16px; }
   .password-text { width:100%; height:32px; flex-shrink:1; background:#00000001; color:var(--fg); border:0px; padding:0px; text-align:left; cursor:text; }
-  .password-text-value { width:100%; height:32px; padding:0px 11px; color:var(--fg); }
+  .password-text-value { width:100%; height:32px; padding:0px 11px; color:var(--fg); white-space:nowrap; }
   .password-hover-line { position:absolute; left:0px; bottom:0px; width:100%; height:1px; background:#00000000; }
   .light .password-text:hover .password-hover-line { background:#00000073; }
   .dark .password-text:hover .password-hover-line { background:#ffffff8a; }
@@ -887,7 +888,7 @@ export default {
             <VirtualList id="passwordItems" v-show="shownPasswords.length>0" style="gap:8px" estimated-height="62px"><div v-for="p in shownPasswords" :key="p.id" :id="'password-'+p.id" class="history-entry">
               <div v-show="!passwordHistory" class="password-table-row">
                 <div class="password-value-column">
-                  <button v-show="passwordCell!==p.id" :id="'password-text-'+p.id" class="password-text" @mousedown="e=>rememberCellPointer(p.id,'value',e)" @click="beginPassword(p)"><label :id="'password-value-'+p.id" class="password-text-value">{{ passwordDraft(p).value }}</label><div :id="'password-hover-'+p.id" class="password-hover-line"/></button>
+                  <button v-show="passwordCell!==p.id" :id="'password-text-'+p.id" class="password-text" @mousedown="e=>rememberCellPointer(p.id,'value',e)" @click="beginPassword(p)"><label :id="'password-value-'+p.id" class="password-text-value">{{ passwordText(p) }}</label><div :id="'password-hover-'+p.id" class="password-hover-line"/></button>
                   <input v-show="passwordCell===p.id" :id="'password-input-'+p.id" :value="passwordDraft(p).value" :placeholder="texts.passwordPasteHint" @input="v=>changePassword(p,v)" @blur="blurPassword(p)" @submit="finishPasswordCell()"/>
                 </div>
                 <button class="password-actions" :id="'delete-password-'+p.id" @click="deleteListedPassword(p)">{{ texts.delete }}</button>

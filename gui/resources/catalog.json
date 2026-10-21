@@ -353,8 +353,8 @@
       "en": "Fixed number of rounds"
     },
     "recursiveInfinite": {
-      "zh": "持续解压嵌套压缩包",
-      "en": "Keep extracting nested archives"
+      "zh": "无限递归",
+      "en": "Unlimited recursion"
     },
     "recursivePrompt": {
       "zh": "每轮询问",
@@ -858,20 +858,16 @@
     },
     "/recursive_extract": {
       "label": {
-        "zh": "嵌套解压",
-        "en": "Nested extraction"
-      },
-      "description": {
-        "zh": "指定轮数时至少为 1",
-        "en": "Use at least 1 for a fixed round count"
+        "zh": "递归解压模式",
+        "en": "Recursive extraction mode"
       },
       "editor": "recursive",
       "options": [
         {
           "value": "*",
           "label": {
-            "zh": "持续解压嵌套压缩包",
-            "en": "Keep extracting nested archives"
+            "zh": "无限递归",
+            "en": "Unlimited recursion"
           }
         },
         {
@@ -896,8 +892,8 @@
         "en": "Nested archive selection"
       },
       "description": {
-        "zh": "根据压缩包占比决定是否继续解压",
-        "en": "Use archive ratios to decide whether to keep extracting"
+        "zh": "根据压缩包占比决定是否递归解压，可避免误解压",
+        "en": "Use archive ratios to decide whether to extract recursively and avoid unintended extraction"
       }
     },
     "/recursive_authorization/byte_ratio_exponent": {
@@ -957,12 +953,8 @@
     },
     "/post_extract/archive_cleanup_mode": {
       "label": {
-        "zh": "原始压缩包",
-        "en": "Original archive"
-      },
-      "description": {
-        "zh": "仅在解压成功后处理",
-        "en": "Applies after successful extraction"
+        "zh": "解压文件后的处理方式",
+        "en": "Archive handling after extraction"
       },
       "options": [
         {
@@ -990,18 +982,14 @@
     },
     "/post_extract/flatten_single_directory": {
       "label": {
-        "zh": "展开单层文件夹",
-        "en": "Flatten single folder"
+        "zh": "压平单子目录",
+        "en": "Flatten single subfolder"
       }
     },
     "/filesystem/directory_scan_mode": {
       "label": {
         "zh": "扫描范围",
         "en": "Scan scope"
-      },
-      "description": {
-        "zh": "监控模式只处理各目录中的直接文件",
-        "en": "Watch handles files directly inside each monitored folder"
       },
       "options": [
         {
@@ -1022,8 +1010,12 @@
     },
     "/filesystem/scan_filters_enabled": {
       "label": {
-        "zh": "扫描筛选",
-        "en": "Scan filters"
+        "zh": "扫描筛选器整体开关",
+        "en": "Master switch for scan filters"
+      },
+      "description": {
+        "zh": "禁用后所有扫描筛选均不会生效",
+        "en": "Disabling this turns off all scan filters"
       }
     },
     "/filesystem/scan_filters/@directory_prune/enabled": {
@@ -1092,10 +1084,6 @@
       "label": {
         "zh": "扩展名",
         "en": "Extensions"
-      },
-      "description": {
-        "zh": "扩展名如 .zip；也会影响伪装扩展名的压缩包",
-        "en": "Extensions such as .zip; also affects archives with disguised extensions"
       }
     },
     "/filesystem/scan_filters/@blacklist/enabled": {
@@ -1118,10 +1106,6 @@
       "label": {
         "zh": "扩展名",
         "en": "Extensions"
-      },
-      "description": {
-        "zh": "扩展名如 .zip；也会影响伪装扩展名的压缩包",
-        "en": "Extensions such as .zip; also affects archives with disguised extensions"
       }
     },
     "/performance/persistent_server_idle_seconds": {
@@ -1266,8 +1250,8 @@
         "en": "Process priority"
       },
       "description": {
-        "zh": "后台模式减少对其他程序的影响",
-        "en": "Background mode reduces the impact on other apps"
+        "zh": "优先级越高速度越快，内存占用越大",
+        "en": "Higher priority increases speed and memory usage"
       },
       "options": [
         {
@@ -1511,8 +1495,8 @@
         "en": "Embedded archives"
       },
       "description": {
-        "zh": "查找夹在其他数据中的压缩包",
-        "en": "Find archives embedded inside other data"
+        "zh": "查找嵌入文件二进制中的压缩包，例如伪装成图片的压缩包",
+        "en": "Find archives embedded in file binaries, such as archives disguised as images"
       }
     },
     "/embedded_scan/recursive_candidate_ratio": {
