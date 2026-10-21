@@ -11,6 +11,9 @@ preserved.
 
 Local changes:
 
+- Release the temporary root handle after attaching a prepared/opened page to
+  its window. Repeated date popup creation now releases each page tree on close.
+
 - Wire QuickJS `@change` / `@input` on ComboBox to its integer selection
   callback in both ordinary and loop scopes. Range comparison/unit selectors
   use the existing UIX controls and autosave flow.

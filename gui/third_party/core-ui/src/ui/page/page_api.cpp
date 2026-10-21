@@ -577,6 +577,9 @@ static UiWindow page_open_or_prepare_(UiPage p,
     if (root) {
         UiWidget h = ui::GetContext().handles.Insert(root);
         ui_window_set_root(win, h);
+        // SetRoot retains the shared tree. Release this temporary owning handle
+        // so repeatedly opening/closing owned pages does not retain every root.
+        ui_widget_destroy(h);
     }
     e->state->AttachWindow(win);
 

@@ -49,6 +49,16 @@
       "zh": "选择",
       "en": "Choose"
     },
+    "rangePrevious": { "zh": "上个月", "en": "Previous month" },
+    "rangeNext": { "zh": "下个月", "en": "Next month" },
+    "rangeToday": { "zh": "今天", "en": "Today" },
+    "rangeClock": { "zh": "时间", "en": "Time" },
+    "rangePopupTimeHint": { "zh": "本地时间，按分钟以 UTC 保存。", "en": "Local time, saved as UTC minutes." },
+    "rangeConfirm": { "zh": "确认", "en": "Confirm" },
+    "rangeCalendarKeys": {
+      "zh": "方向键选日 · Enter 确认 · Esc 取消",
+      "en": "Arrows: date · Enter: confirm · Esc: cancel"
+    },
     "rangeNumber": {
       "zh": "请输入非负数，换算后的整数字节不能超过 18446744073709551615。",
       "en": "Enter a nonnegative value whose integer byte count does not exceed 18446744073709551615."

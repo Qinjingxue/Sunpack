@@ -369,7 +369,15 @@ export default {
       this.drafts=Object.assign({},this.drafts,{[f.id]:Object.assign({},d,{range:range})});
       if(commit) this.commitField(f);
     },
-    pickedRange(p) { let f=this.fields.find(f=>f.id===p.id); if(f) this.changeRange(f,p.side,p.value,true); },
+    pickedRange(p) {
+      let f=this.fields.find(f=>f.id===p.id); if(!f) return;
+      this.changeRange(f,p.side,p.value,false);
+      // The popup validates in its opening timezone. Preserve that UTC minute
+      // if the system timezone changes before the asynchronous save completes.
+      let range=this.drafts[f.id].range;
+      range[p.side+'OriginalLocal']=p.value; range[p.side+'Utc']=p.utc;
+      this.commitField(f);
+    },
     changeField(f,value) {
       f=this.fields.find(current=>current.id===f.id)||f;
       let d=this.drafts[f.id]||{original:f.original,text:f.text,boolean:f.boolean,choice:f.choice,baselineText:f.text,baselineBoolean:f.boolean};

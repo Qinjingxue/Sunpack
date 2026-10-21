@@ -11,12 +11,13 @@
 #include <ui/ui_window.h>
 #include <ui/controls.h>
 #include <chrono>
+#include <cmath>
 #include <map>
 
 namespace spg {
 namespace {
 // Keep host messages outside Core UI's startup/render message range.
-constexpr UINT Dispatch = WM_APP + 0x401, Update = WM_APP + 0x402;
+constexpr UINT Dispatch = WM_APP + 0x401, Update = WM_APP + 0x402, DateResult = WM_APP + 0x403;
 constexpr unsigned Config = 1, Passwords = 2, Roots = 4, Log = 8, Startup = 16;
 using Clock=std::chrono::steady_clock;
 struct VisualBatch {
@@ -28,63 +29,6 @@ struct ReadRetry {
     unsigned attempts=0;
     Clock::time_point due=Clock::time_point::max();
 };
-struct RangeDateDialog {
-    SYSTEMTIME value{};
-    std::wstring title,save,cancel;
-    HWND date=nullptr,time=nullptr;
-};
-INT_PTR CALLBACK range_date_dialog(HWND hwnd,UINT message,WPARAM wparam,LPARAM lparam) {
-    auto* state=reinterpret_cast<RangeDateDialog*>(GetWindowLongPtrW(hwnd,DWLP_USER));
-    if(message==WM_INITDIALOG) {
-        state=reinterpret_cast<RangeDateDialog*>(lparam); SetWindowLongPtrW(hwnd,DWLP_USER,lparam);
-        SetWindowTextW(hwnd,state->title.c_str());
-        auto dpi=GetDpiForWindow(hwnd); auto px=[&](int n){return MulDiv(n,dpi,96);};
-        SetWindowPos(hwnd,nullptr,0,0,px(378),px(150),SWP_NOMOVE|SWP_NOZORDER);
-        auto font=GetStockObject(DEFAULT_GUI_FONT);
-        auto control=[&](DWORD style,const wchar_t* name,const wchar_t* text,int id,int x,int y,int width,int height) {
-            auto child=CreateWindowExW(0,name,text,WS_CHILD|WS_VISIBLE|WS_TABSTOP|style,px(x),px(y),px(width),px(height),hwnd,reinterpret_cast<HMENU>(INT_PTR(id)),GetModuleHandleW(nullptr),nullptr);
-            SendMessageW(child,WM_SETFONT,reinterpret_cast<WPARAM>(font),TRUE); return child;
-        };
-        state->date=control(DTS_SHORTDATEFORMAT,DATETIMEPICK_CLASSW,L"",100,12,12,195,28);
-        state->time=control(DTS_TIMEFORMAT|DTS_UPDOWN,DATETIMEPICK_CLASSW,L"",101,217,12,128,28);
-        SendMessageW(state->date,DTM_SETFORMATW,0,reinterpret_cast<LPARAM>(L"yyyy-MM-dd"));
-        SendMessageW(state->time,DTM_SETFORMATW,0,reinterpret_cast<LPARAM>(L"HH:mm"));
-        DateTime_SetSystemtime(state->date,GDT_VALID,&state->value); DateTime_SetSystemtime(state->time,GDT_VALID,&state->value);
-        control(BS_DEFPUSHBUTTON,L"BUTTON",state->save.c_str(),IDOK,137,66,100,30);
-        control(BS_PUSHBUTTON,L"BUTTON",state->cancel.c_str(),IDCANCEL,245,66,100,30);
-        RECT owner{},bounds{}; GetWindowRect(GetWindow(hwnd,GW_OWNER),&owner); GetWindowRect(hwnd,&bounds);
-        MONITORINFO info{sizeof(info)}; GetMonitorInfoW(MonitorFromWindow(hwnd,MONITOR_DEFAULTTONEAREST),&info);
-        int x=std::clamp<LONG>((owner.left+owner.right-(bounds.right-bounds.left))/2,info.rcWork.left,std::max(info.rcWork.left,info.rcWork.right-(bounds.right-bounds.left)));
-        int y=std::clamp<LONG>((owner.top+owner.bottom-(bounds.bottom-bounds.top))/2,info.rcWork.top,std::max(info.rcWork.top,info.rcWork.bottom-(bounds.bottom-bounds.top)));
-        SetWindowPos(hwnd,nullptr,x,y,0,0,SWP_NOSIZE|SWP_NOZORDER);
-        return TRUE;
-    }
-    if(message==WM_COMMAND && (LOWORD(wparam)==IDOK || LOWORD(wparam)==IDCANCEL)) {
-        if(LOWORD(wparam)==IDOK) {
-            SYSTEMTIME time{};
-            if(DateTime_GetSystemtime(state->date,&state->value)!=GDT_VALID || DateTime_GetSystemtime(state->time,&time)!=GDT_VALID) return TRUE;
-            state->value.wHour=time.wHour; state->value.wMinute=time.wMinute; state->value.wSecond=state->value.wMilliseconds=0;
-        }
-        EndDialog(hwnd,LOWORD(wparam)); return TRUE;
-    }
-    if(message==WM_CLOSE) { EndDialog(hwnd,IDCANCEL); return TRUE; }
-    return FALSE;
-}
-bool choose_range_date(HWND owner,const std::string& initial,const std::string& language,SYSTEMTIME& value) {
-    INITCOMMONCONTROLSEX common{sizeof(common),ICC_DATE_CLASSES};
-    if(!InitCommonControlsEx(&common)) win_error("opRangeDate");
-    RangeDateDialog state;
-    if(!range_datetime(initial,state.value)) GetLocalTime(&state.value);
-    state.title=wide(tr("rangeChoose",language)); state.save=wide(tr("saveEntries",language)); state.cancel=wide(tr("cancelEntries",language));
-    // Empty in-memory template. Windows owns the modal loop and all children.
-    struct { DLGTEMPLATE dialog; WORD menu=0,windowClass=0,title=0; } layout{};
-    layout.dialog.style=WS_POPUP|WS_CAPTION|WS_SYSMENU|DS_MODALFRAME;
-    layout.dialog.cx=240; layout.dialog.cy=85;
-    auto result=DialogBoxIndirectParamW(GetModuleHandleW(nullptr),&layout.dialog,owner,range_date_dialog,reinterpret_cast<LPARAM>(&state));
-    if(result==-1) win_error("opRangeDate");
-    if(result!=IDOK) return false;
-    value=state.value; return true;
-}
 UiThemeMode system_theme() {
     DWORD light=1, size=sizeof(light);
     RegGetValueW(HKEY_CURRENT_USER,L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
@@ -438,6 +382,7 @@ void Application::apply_pending() {
         motion::enter(window_,transition.at("id").get<std::string>().c_str(),transition.value("x",0.0f),transition.value("y",0.0f));
     }
     if(patch.contains("language")) {
+        date_popup_.reset();
         auto language=patch["language"].get<std::string>();
         refresh_error_texts();
         ui_window_set_title(window_,wide(tr("title",language)).c_str());
@@ -445,6 +390,7 @@ void Application::apply_pending() {
     }
 }
 void Application::navigate(const std::string& tab) {
+    date_popup_.reset();
     if(tab!="tasks" && tab!="config" && tab!="roots" && tab!="passwords") return;
     if(page_value(page_,"tab")==tab) return;
     // Focus loss may publish its own input/blur repaint. Begin the visual
@@ -585,6 +531,7 @@ void Application::handle_command(Json command) {
     auto p=command.value("payload",Json::object());
     if(op=="navigate") { navigate(p.value("tab",std::string())); return; }
     if(op=="scrollTop" || op=="animateView") {
+        if(p.value("id",std::string())=="configBlocks") date_popup_.reset();
         const auto id=p.value("id",std::string());
         const char* scroll=id=="configBlocks"?"configListScroll":id=="directoryItems"?"directoryListScroll":id=="listItems"?"listScroll":nullptr;
         if(scroll) {
@@ -649,11 +596,23 @@ void Application::handle_command(Json command) {
     if(op=="pickRangeDate") {
         auto side=p.at("side").get<std::string>();
         if(side!="lower" && side!="upper") return;
-        SYSTEMTIME selected{};
-        if(choose_range_date(hwnd_,p.at("value"),page_value(page_,"language"),selected)) {
-            auto reply=Json{{"id",p.at("id")},{"side",side},{"value",range_datetime_text(selected)}}.dump();
-            if(ui_page_call_json(page_,"pickedRange",reply.c_str())!=0) throw std::runtime_error("uiBindingFailed");
-        }
+        date_popup_.reset();
+        auto id=p.at("id").get<std::string>();
+        if(page_value(page_,"tab")!="config") return;
+        ui_window_relayout(window_);
+        auto root=ui_page_root(page_);
+        auto anchor=ui_widget_find_by_id(root,("range-"+side+"-"+id).c_str());
+        ui_widget_destroy(root);
+        if(!anchor) return; // The virtual row may have been filtered/unmounted.
+        auto rect=ui_widget_get_rect(anchor); ui_widget_destroy(anchor);
+        auto dpi=ui_window_dpi(window_);
+        POINT start{LONG(std::lround(rect.left*dpi/96)),LONG(std::lround(rect.top*dpi/96))};
+        POINT end{LONG(std::lround(rect.right*dpi/96)),LONG(std::lround(rect.bottom*dpi/96))};
+        ClientToScreen(hwnd_,&start); ClientToScreen(hwnd_,&end);
+        RECT screen{start.x,start.y,end.x,end.y};
+        date_popup_=std::make_unique<DatePopup>(window_,DateResult,++date_generation_,screen,id,side,
+            p.at("value"),page_value(page_,"language"),page_value(page_,"appearance"));
+        date_popup_->show();
         return;
     }
     if(op=="saveField") { save_field(p.at("id"),p.value("draft",Json())); return; }
@@ -687,9 +646,35 @@ void Application::handle_command(Json command) {
     { std::lock_guard<std::mutex> lock(mutex_); commands_.push_back(std::move(command)); }
     cv_.notify_one();
 }
+void Application::finish_date_popup(UINT_PTR generation) {
+    if(!date_popup_ || generation!=date_generation_) return;
+    if(date_popup_->cancelled()) { date_popup_.reset(); return; }
+    if(!date_popup_->confirming()) return;
+    try {
+        auto id=date_popup_->field, side=date_popup_->side, value=date_popup_->value();
+        auto fields=page_value(page_,"fields"),drafts=page_value(page_,"drafts");
+        auto field=std::find_if(fields.begin(),fields.end(),[&](const Json& f){return f["id"]==id;});
+        if(field==fields.end()) { date_popup_.reset(); return; }
+        auto form=drafts.contains(id) && drafts[id].contains("range")?drafts[id]["range"]:field->at("range");
+        form[side]=value;
+        auto module=range_configuration(form,true,date_popup_->zone());
+        auto utc=module.at(side=="lower"?"start_utc":"end_utc");
+        auto reply=Json{{"id",id},{"side",side},{"value",value},{"utc",utc}}.dump();
+        date_popup_.reset();
+        if(ui_page_call_json(page_,"pickedRange",reply.c_str())!=0) throw std::runtime_error("uiBindingFailed");
+    } catch(const std::exception& e) {
+        if(date_popup_) date_popup_->error(e.what());
+        else throw;
+    }
+}
 LRESULT CALLBACK Application::subclass(HWND hwnd,UINT message,WPARAM wparam,LPARAM lparam,UINT_PTR,DWORD_PTR data) {
     auto* self=reinterpret_cast<Application*>(data);
     try {
+        if(message==DateResult) { self->finish_date_popup(wparam); return 0; }
+        if(message==WM_CLOSE || message==WM_LBUTTONDOWN || message==WM_RBUTTONDOWN || message==WM_NCLBUTTONDOWN ||
+           message==WM_MOUSEWHEEL || message==WM_MOUSEHWHEEL || message==WM_MOVE || message==WM_SIZE ||
+           message==WM_DPICHANGED || message==WM_DISPLAYCHANGE || message==WM_TIMECHANGE || message==WM_SETTINGCHANGE)
+            self->date_popup_.reset();
         if((message==WM_MOUSEWHEEL || message==WM_MOUSEHWHEEL || message==WM_KILLFOCUS) && !self->choosing_directory_ &&
            (page_value(self->page_,"passwordCell")!="" || page_value(self->page_,"rootCell")!="")) {
             ui_window_focus_widget(self->window_,0);
@@ -813,6 +798,7 @@ void Application::open() {
 }
 int Application::run() { open(); return ui_run(); }
 Application::~Application() {
+    date_popup_.reset();
     { std::lock_guard<std::mutex> lock(mutex_); stopping_=true; }
     SetEvent(stop_); cv_.notify_all();
     if(worker_.joinable()) worker_.join();

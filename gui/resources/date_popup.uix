@@ -1,0 +1,75 @@
+<window title="SunPack" width="352" height="504" frameless="true" resizable="false"/>
+<script>
+export default {
+  data() { return {appearance:'light',texts:{},month:'',selected:'',time:'',days:[],weekdays:[],cellWidth:40,error:'',previous:true,next:true,requests:[],dispatch:false}; },
+  methods: {
+    send(op,value) { this.requests=this.requests.concat([{op:op,value:value}]); this.dispatch=true; }
+  }
+}
+</script>
+<style>
+  .popup { flex:1; padding:16px; gap:12px; color:var(--fg); font-size:14px; border:1px solid var(--border); border-radius:8px; }
+  .light { background:#fafafa; }
+  .dark { background:#2b2b2b; }
+  label { display:block; }
+  .title { font-size:16px; font-weight:600; }
+  .scroll { flex:1; }
+  .body { gap:8px; padding-right:8px; }
+  .row { flex-direction:row; align-items:center; gap:4px; flex-shrink:0; }
+  .month { flex:1; text-align:center; font-weight:600; }
+  .arrow { width:32px; height:32px; padding:0px; flex-shrink:0; }
+  .weekday { height:24px; flex-shrink:0; text-align:center; font-size:12px; color:var(--fg-2); }
+  .calendar { flex-direction:row; flex-wrap:wrap; gap:4px; }
+  .day { height:32px; flex-shrink:0; min-width:0px; padding:0px; border:0px; border-radius:4px; background:#00000001; color:var(--fg); }
+  .light .day:hover { background:#eaeaea; }
+  .dark .day:hover { background:#404040; }
+  .day.other { color:var(--fg-2); }
+  .day.today { border:1px solid var(--accent-text); }
+  .light .day.selected { background:#0067c0; color:#ffffff; }
+  .dark .day.selected { background:#60cdff; color:#000000; }
+  .selected-date { font-weight:600; }
+  .time { width:88px; height:32px; }
+  .today-button { margin-left:auto; height:32px; }
+  .help { padding-top:8px; gap:4px; }
+  .hint { color:var(--fg-2); font-size:12px; white-space:normal; }
+  .error { font-size:12px; white-space:normal; }
+  .light .error { color:#c42b1c; }
+  .dark .error { color:#ff99a4; }
+  .footer { gap:8px; flex-shrink:0; }
+  .footer button { flex:1; height:32px; }
+  .signal { position:absolute; width:0px; height:0px; opacity:0; }
+</style>
+<template>
+  <div :class="'popup '+appearance" id="datePopup">
+    <label class="title">{{ texts.rangeChoose }}</label>
+    <scroll-view class="scroll" id="dateScroll">
+      <div class="body">
+        <div class="row">
+          <button class="arrow" id="datePrevious" :disabled="!previous" :title="texts.rangePrevious" @click="send('month',-1)">‹</button>
+          <label class="month" id="dateMonth">{{ month }}</label>
+          <button class="arrow" id="dateNext" :disabled="!next" :title="texts.rangeNext" @click="send('month',1)">›</button>
+        </div>
+        <div class="row"><label v-for="day in weekdays" class="weekday" :width="cellWidth">{{ day }}</label></div>
+        <div class="calendar">
+          <button v-for="day in days" :id="'date-day-'+day.index" :class="'day'+(day.other?' other':'')+(day.today?' today':'')+(day.selected?' selected':'')" :width="cellWidth" :disabled="!day.valid" @click="send('day',day.index)">{{ day.text }}</button>
+        </div>
+        <label class="selected-date" id="dateSelected">{{ selected }}</label>
+        <div class="row">
+          <label>{{ texts.rangeClock }}</label>
+          <input class="time" id="dateTime" :value="time" placeholder="HH:mm" @input="v=>{time=v;error='';}" @submit="send('confirm',0)"/>
+          <button class="today-button" id="dateToday" @click="send('today',0)">{{ texts.rangeToday }}</button>
+        </div>
+        <label class="error" id="dateError" v-show="error">{{ error }}</label>
+        <div class="help">
+          <label class="hint">{{ texts.rangeCalendarKeys }}</label>
+          <label class="hint">{{ texts.rangePopupTimeHint }}</label>
+        </div>
+      </div>
+    </scroll-view>
+    <div class="row footer">
+      <button id="dateCancel" @click="send('cancel',0)">{{ texts.cancelEntries }}</button>
+      <button id="dateConfirm" type="primary" @click="send('confirm',0)">{{ texts.rangeConfirm }}</button>
+    </div>
+    <label v-if="dispatch" id="dateDispatch" class="signal"></label>
+  </div>
+</template>

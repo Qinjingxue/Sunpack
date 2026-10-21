@@ -465,28 +465,37 @@ void scrolled_config_edits(Application& app) {
 // One real-window scenario covers lossless collection editing, virtual rows,
 // cancel and concurrent-file conflict. Scalar/record tests cannot detect these
 // failures; sharing their fixture avoids another process/window startup.
-struct RangeDialogDriver {
-    inline static RangeDialogDriver* active=nullptr;
-    HHOOK hook=nullptr; bool seen=false,cancel=false;
-    explicit RangeDialogDriver(bool cancel=false):cancel(cancel) {
-        active=this;
-        hook=SetWindowsHookExW(WH_CALLWNDPROCRET,[](int code,WPARAM wp,LPARAM lp)->LRESULT {
-            auto* event=reinterpret_cast<CWPRETSTRUCT*>(lp);
-            if(code==HC_ACTION && active && event->message==WM_INITDIALOG) {
-                HWND dialog=event->hwnd; wchar_t name[32]{}; GetClassNameW(dialog,name,32);
-                if(!std::wcscmp(name,L"#32770") && GetDlgItem(dialog,100) && GetDlgItem(dialog,101)) {
-                    active->seen=true;
-                    SYSTEMTIME date{}; date.wYear=2024; date.wMonth=2; date.wDay=29; date.wHour=12; date.wMinute=34;
-                    DateTime_SetSystemtime(GetDlgItem(dialog,100),GDT_VALID,&date);
-                    DateTime_SetSystemtime(GetDlgItem(dialog,101),GDT_VALID,&date);
-                    PostMessageW(dialog,WM_COMMAND,active->cancel?IDCANCEL:IDOK,0);
-                }
-            }
-            return CallNextHookEx(nullptr,code,wp,lp);
-        },nullptr,GetCurrentThreadId()); assert(hook);
-    }
-    ~RangeDialogDriver() { UnhookWindowsHookEx(hook); active=nullptr; }
-};
+// Locate the actual owned Core UI HWND; no test-only production API.
+ui::UiWindowImpl* date_popup(Application& app) {
+    struct Search { HWND owner; ui::UiWindowImpl* result=nullptr; unsigned count=0; } search{static_cast<HWND>(ui_window_hwnd(app.window()))};
+    EnumThreadWindows(GetCurrentThreadId(),[](HWND hwnd,LPARAM data)->BOOL {
+        auto& s=*reinterpret_cast<Search*>(data);
+        wchar_t name[64]{}; GetClassNameW(hwnd,name,64);
+        if(GetWindow(hwnd,GW_OWNER)==s.owner && !std::wcscmp(name,L"UiCore_Window")) {
+            auto* w=reinterpret_cast<ui::UiWindowImpl*>(GetWindowLongPtrW(hwnd,GWLP_USERDATA));
+            if(w && w->Root() && w->Root()->FindById("datePopup")) { s.result=w; ++s.count; }
+        }
+        return TRUE;
+    },reinterpret_cast<LPARAM>(&search));
+    assert(search.count<=1); return search.result;
+}
+void popup_click(ui::UiWindowImpl* popup,const char* id) {
+    auto window=popup->windowId;
+    auto* widget=popup->Root()->FindById(id); assert(widget);
+    auto handle=ui::GetContext().handles.Insert(widget->shared_from_this());
+    assert(ui_debug_click(popup->windowId,handle)==0); ui_widget_destroy(handle); ui_debug_pump();
+    if(std::strcmp(id,"dateCancel") && std::strcmp(id,"dateConfirm") && ui::GetContext().GetWindow(window)!=popup)
+        throw std::runtime_error("Date popup lost activation during pointer operation");
+}
+void popup_key(ui::UiWindowImpl* popup,int key) {
+    // Real HWND dispatch includes the popup's keyboard routing subclass.
+    auto window=popup->windowId;
+    SendMessageW(popup->Handle(),WM_KEYDOWN,key,0); ui_debug_pump();
+    // External desktop activation legitimately cancels the popup. Never retain
+    // a raw test-driver pointer across a message pump without checking its ID.
+    if(key!=VK_ESCAPE && key!=VK_RETURN && ui::GetContext().GetWindow(window)!=popup)
+        throw std::runtime_error("Date popup lost activation during keyboard operation");
+}
 void range_config(Application& app,const fs::path& dir) {
     auto field=[&](const std::string& module) { for(auto& f:state(app.page(),"fields")) if(f["module"]==module && f["type"]=="object") return f; return Json(); };
     auto size=field("size_range"),time=field("mtime_range"); assert(!size.is_null() && !time.is_null());
@@ -560,15 +569,114 @@ void range_config(Application& app,const fs::path& dir) {
     search_config(app,L"mtime_range");
     input("range-lower-"+tid,L"2023-02-29 00:00"); ui_window_focus_widget(app.window(),0);
     pump([&]{return state(app.page(),"saveErrors").contains(tid);},"Leap date validation");
-    {
-        RangeDialogDriver driver;
-        click(app,("range-lower-pick-"+tid).c_str()); finish_input(app); assert(driver.seen);
-    }
-    pump([&]{return field("mtime_range")["range"]["lower"]=="2024-02-29 12:34";},"Native date selection");
+    input("range-lower-"+tid,L"2024-01-31 12:34"); finish_input(app);
     auto before=read_file(dir/"sunpack_config.json");
-    {
-        RangeDialogDriver driver(true);
-        click(app,("range-upper-pick-"+tid).c_str()); finish_input(app); assert(driver.seen);
+    auto open=[&](const std::string& side) {
+        click(app,("range-"+side+"-pick-"+tid).c_str()); ui_debug_pump();
+        auto* popup=date_popup(app); assert(popup);
+        assert(GetWindow(popup->Handle(),GW_OWNER)==ui_window_hwnd(app.window()));
+        assert(!(GetWindowLongPtrW(popup->Handle(),GWL_STYLE)&WS_CAPTION));
+        RECT bounds{}; GetWindowRect(popup->Handle(),&bounds);
+        MONITORINFO monitor{sizeof(monitor)}; GetMonitorInfoW(MonitorFromWindow(popup->Handle(),MONITOR_DEFAULTTONEAREST),&monitor);
+        assert(bounds.left>=monitor.rcWork.left && bounds.right<=monitor.rcWork.right);
+        assert(bounds.top>=monitor.rcWork.top && bounds.bottom<=monitor.rcWork.bottom);
+        auto focused=popup->FocusedWidget();
+        if(!focused || focused->id.rfind("date-day-",0)!=0) {
+            char* tree=ui_debug_dump_tree(popup->windowId);
+            std::cerr<<"Popup focus="<<(focused?focused->id:"none")<<" tree="<<(tree?tree:"")<<'\n'; ui_debug_free(tree);
+            throw std::runtime_error("Calendar initial focus missing");
+        }
+        return popup;
+    };
+    auto* popup=open("lower");
+    std::weak_ptr<ui::Widget> oldTree=popup->Root();
+    popup_key(popup,VK_NEXT); // Jan 31 -> Feb 29 in a leap year.
+    auto* label=dynamic_cast<ui::LabelWidget*>(popup->Root()->FindById("dateSelected"));
+    assert(label && label->Text()==L"2024-02-29");
+    popup_key(popup,VK_RIGHT);
+    assert(label->Text()==L"2024-03-01");
+    popup_key(popup,VK_LEFT);
+    wchar_t shots[MAX_PATH]{};
+    if(GetEnvironmentVariableW(L"SUNPACK_GUI_SCREENSHOTS",shots,MAX_PATH))
+        assert(ui_debug_screenshot(popup->windowId,(fs::path(shots)/L"date-popup.png").c_str())==0);
+    popup_key(popup,VK_TAB);
+    assert(popup->FocusedWidget()->id=="dateTime"); // One calendar Tab stop.
+    assert(ui_debug_key_mod(popup->windowId,'A',1,0,0)==0);
+    assert(ui_debug_type_text(popup->windowId,L"25:70")==0);
+    popup_key(popup,VK_RETURN);
+    popup=date_popup(app); assert(popup);
+    auto* error=dynamic_cast<ui::LabelWidget*>(popup->Root()->FindById("dateError"));
+    assert(error && !error->Text().empty() && date_popup(app)==popup);
+    assert(read_file(dir/"sunpack_config.json")==before);
+    assert(ui_debug_key_mod(popup->windowId,'A',1,0,0)==0);
+    assert(ui_debug_type_text(popup->windowId,L"12:34")==0);
+    popup_key(popup,VK_TAB); // Remove the input selection before visual QA.
+    ui_window_relayout(popup->windowId);
+    assert(dynamic_cast<ui::TextInputWidget*>(popup->Root()->FindById("dateTime"))->Text()==L"12:34");
+    popup_click(popup,"dateConfirm");
+    pump([&]{return field("mtime_range")["range"]["lower"]=="2024-02-29 12:34";},"Core UI date selection");
+    assert(!date_popup(app) && oldTree.expired());
+    // Model a timezone change between popup validation and the queued save.
+    // The UI handoff must retain the confirmed UTC rather than reinterpret the
+    // displayed local minute in the current zone. No machine timezone change.
+    auto confirmedUtc=range_utc_text(range_utc_minutes(bound("mtime_range","start_utc"))+60);
+    auto confirmed=Json{{"id",tid},{"side","lower"},{"value","2024-02-29 12:34"},{"utc",confirmedUtc}}.dump();
+    assert(ui_page_call_json(app.page(),"pickedRange",confirmed.c_str())==0);
+    finish_input(app);
+    assert(bound("mtime_range","start_utc")==confirmedUtc);
+    before=read_file(dir/"sunpack_config.json");
+    // Cancel, outside activation, settings switch and superseded completion
+    // exercise different lifetime paths, sharing the existing real window.
+    popup=open("upper"); oldTree=popup->Root();
+    popup_click(popup,"datePrevious");
+    popup_key(popup,VK_ESCAPE);
+    assert(!date_popup(app) && oldTree.expired());
+    popup=open("lower"); oldTree=popup->Root();
+    SendMessageW(popup->Handle(),WM_ACTIVATE,WA_INACTIVE,0); ui_debug_pump();
+    assert(!date_popup(app) && oldTree.expired());
+    popup=open("lower"); oldTree=popup->Root();
+    // Replace before draining the old Esc completion. The generation prevents
+    // a queued result from closing the newly opened upper-bound popup.
+    SendMessageW(popup->Handle(),WM_KEYDOWN,VK_ESCAPE,0);
+    auto request=Json{{"op","pickRangeDate"},{"payload",{{"id",tid},{"side","upper"},{"value","2024-03-01 00:00"}}}};
+    auto queued=Json::array({request}).dump(); ui_page_set_json(app.page(),"requests",queued.c_str());
+    SendMessageW(static_cast<HWND>(ui_window_hwnd(app.window())),WM_APP+0x401,0,0); ui_debug_pump();
+    assert(date_popup(app) && oldTree.expired());
+    search_config(app,L"size_range");
+    assert(!date_popup(app));
+    assert(read_file(dir/"sunpack_config.json")==before);
+    search_config(app,L"mtime_range");
+    auto theme=ui_widget_find_by_id(ui_page_root(app.page()),"themeSelector"); assert(theme);
+    auto choice=state(app.page(),"themeChoice").get<int>();
+    auto otherTheme=state(app.page(),"appearance")=="dark"?1:2;
+    assert(ui_debug_combo_select(app.window(),theme,otherTheme)==0);
+    popup=open("lower");
+    if(*shots) assert(ui_debug_screenshot(popup->windowId,(fs::path(shots)/L"date-popup-other-theme.png").c_str())==0);
+    popup_key(popup,VK_ESCAPE);
+    assert(ui_debug_combo_select(app.window(),theme,choice)==0); ui_widget_destroy(theme);
+    // Exercise placement on each attached monitor, including negative screen
+    // coordinates and its real DPI. No desktop resolution or scaling changes.
+    std::vector<RECT> workAreas;
+    EnumDisplayMonitors(nullptr,nullptr,[](HMONITOR monitor,HDC,LPRECT,LPARAM context)->BOOL {
+        MONITORINFO info{sizeof(info)}; assert(GetMonitorInfoW(monitor,&info));
+        reinterpret_cast<std::vector<RECT>*>(context)->push_back(info.rcWork); return TRUE;
+    },reinterpret_cast<LPARAM>(&workAreas));
+    for(auto work:workAreas) for(bool bottom:{false,true}) {
+        LONG y=bottom?work.bottom-40:work.top+10;
+        RECT anchor{work.left+20,y,work.left+180,y+24};
+        std::weak_ptr<ui::Widget> tree;
+        {
+            DatePopup placed(app.window(),WM_APP+0x403,0,anchor,tid,"lower","2024-02-29 12:34",
+                             state(app.page(),"language"),state(app.page(),"appearance"));
+            auto* actual=date_popup(app); assert(actual); tree=actual->Root();
+            RECT bounds{}; GetWindowRect(actual->Handle(),&bounds);
+            assert(bounds.left>=work.left && bounds.right<=work.right && bounds.top>=work.top && bounds.bottom<=work.bottom);
+            if(bottom && bounds.bottom-bounds.top<anchor.top-work.top) assert(bounds.bottom<anchor.top);
+            if(!bottom && bounds.bottom-bounds.top<work.bottom-anchor.bottom) assert(bounds.top>anchor.bottom);
+            auto* first=actual->Root()->FindById("date-day-0"),*seventh=actual->Root()->FindById("date-day-6"),*eighth=actual->Root()->FindById("date-day-7");
+            assert(first && seventh && eighth && std::abs(first->rect.top-seventh->rect.top)<0.1f && eighth->rect.top>first->rect.bottom);
+        }
+        assert(tree.expired());
     }
     assert(read_file(dir/"sunpack_config.json")==before);
     layout(tid,true);
@@ -753,6 +861,7 @@ int wmain(int argc,wchar_t** argv) {
         assert(WaitForSingleObject(gate,10000)==WAIT_OBJECT_0);
         std::cout<<args.dump(); return 0;
     }
+    const bool rangesOnly=argc==2 && std::wstring(argv[1])==L"--ranges";
     CoInitializeEx(nullptr,COINIT_APARTMENTTHREADED);
     auto dir=fs::temp_directory_path()/(L"sunpack-gui-ui-"+std::to_wstring(GetCurrentProcessId())); fs::create_directory(dir);
     auto gate_name=L"Local\\SunPack.GUI.TestCommand."+std::to_wstring(GetCurrentProcessId());
@@ -760,6 +869,10 @@ int wmain(int argc,wchar_t** argv) {
     try {
         scalar_reactivity_noop();
         atomic_write(dir/"sunpack_config.json",R"({"cli":{"language":"zh"},"runtime":{"process_mode":"normal"},"recursive_extract":"*","watch":{"state_dir":".sunpack_watch","out_dir":".","toast_enabled":true},"unknown":9007199254740993})");
+        if(rangesOnly) {
+            auto config=parse_json(kUiDefaultsJson); config["watch"]["state_dir"]=".sunpack_watch";
+            atomic_write(dir/"sunpack_config.json",config.dump());
+        }
         atomic_write(dir/"builtin_passwords.json",R"({"passwords":[{"value":"  #中文  "}],"clipboard_history":["history"]})");
         atomic_write(dir/"sunpack_watch_roots.txt",utf8(dir.wstring())+"\n");
         atomic_write(dir/".sunpack_watch"/"events.jsonl",Json({{"event","done"},{"path",utf8((dir/"carrier.001").wstring())}}).dump()+"\n");
@@ -768,6 +881,19 @@ int wmain(int argc,wchar_t** argv) {
             options.cli={executable_path(),dir,{L"--fake-cli",gate_name}};
             Application app(options); std::cerr<<"Opening UI\n"; app.open(); std::cerr<<"UI opened\n";
             pump([&]{return state(app.page(),"ready")==true;});
+            if(rangesOnly) {
+                pump([&]{return state(app.page(),"fields").size()>100;});
+                click(app,"tabConfig"); pump([&]{return state(app.page(),"tab")=="config";});
+                range_config(app,dir);
+                // Same range scenario as the full suite, with the real owner
+                // close path and none of the unrelated animation timing checks.
+                std::string timeId;
+                for(auto& f:state(app.page(),"fields")) if(f["module"]=="mtime_range" && f["type"]=="object") timeId=f["id"];
+                click(app,("range-lower-pick-"+timeId).c_str()); ui_debug_pump();
+                assert(date_popup(app));
+                PostMessageW(static_cast<HWND>(ui_window_hwnd(app.window())),WM_CLOSE,0,0);
+                pump([&]{return !IsWindow(static_cast<HWND>(ui_window_hwnd(app.window())));});
+            } else {
             bound_style_updates();
             // Direct QuickJS JSON parsing must reject malformed input without
             // replacing an existing reactive list.
@@ -1700,8 +1826,16 @@ int wmain(int argc,wchar_t** argv) {
             assert(ui_debug_key(app.window(),VK_RETURN)==0);
             pump([&]{return read_json(dir/"sunpack_config.json")["watch"]["out_dir"]=="independent" && !state(app.page(),"saving").get<bool>();});
             assert(state(app.page(),"saveErrors").contains("/watch/max_folders"));
+            search_config(app,L"mtime_range");
+            std::string closingDate;
+            for(auto& f:state(app.page(),"fields")) if(f["module"]=="mtime_range" && f["type"]=="object") closingDate=f["id"];
+            assert(!closingDate.empty());
+            click(app,("range-lower-pick-"+closingDate).c_str()); ui_debug_pump();
+            auto* closingPopup=date_popup(app); assert(closingPopup);
+            std::weak_ptr<ui::Widget> closingTree=closingPopup->Root();
             PostMessageW(static_cast<HWND>(ui_window_hwnd(app.window())),WM_CLOSE,0,0);
             pump([&]{return state(app.page(),"closeError")!="" && !state(app.page(),"saving").get<bool>();});
+            assert(!date_popup(app) && closingTree.expired());
             assert(IsWindow(static_cast<HWND>(ui_window_hwnd(app.window()))));
             search_config(app,L"max_folders");
             invalid_input=ui_widget_find_by_id(ui_page_root(app.page()),"input-/watch/max_folders"); assert(invalid_input);
@@ -1716,6 +1850,7 @@ int wmain(int argc,wchar_t** argv) {
             PostMessageW(static_cast<HWND>(ui_window_hwnd(app.window())),WM_CLOSE,0,0);
             pump([&]{return !IsWindow(static_cast<HWND>(ui_window_hwnd(app.window())));});
             assert(read_json(dir/"sunpack_config.json")["watch"]["out_dir"]=="close-flush");
+            }
         }
         fs::remove_all(dir); std::cout<<"GUI interface and observation passed\n";
     } catch(const std::exception& e) { std::cerr<<e.what()<<"\n"; std::error_code ec; fs::remove_all(dir,ec); return 1; }

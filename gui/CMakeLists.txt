@@ -35,11 +35,12 @@ ui_core_embed_text(sunpack_gui_data FILE resources/catalog.json OUT catalog_json
 # Compile the application implementation only once for the shipping executable,
 # UI integration tests and optional performance benchmark. It owns main_uix.h,
 # so the parallel consumers never race to regenerate the same header.
-add_library(sunpack_gui_app OBJECT src/application.cpp src/motion.cpp)
+add_library(sunpack_gui_app OBJECT src/application.cpp src/motion.cpp src/date_popup.cpp)
 target_include_directories(sunpack_gui_app PRIVATE "${core_ui_SOURCE_DIR}/src")
 target_link_libraries(sunpack_gui_app PRIVATE sunpack_gui_data core-ui)
 set_property(TARGET sunpack_gui_app PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
 ui_core_embed_text(sunpack_gui_app FILE resources/main.uix OUT main_uix.h VAR kMainUix)
+ui_core_embed_text(sunpack_gui_app FILE resources/date_popup.uix OUT date_popup_uix.h VAR kDatePopupUix)
 
 add_executable(SunPackGUI WIN32 src/main.cpp resources/app.rc)
 target_include_directories(SunPackGUI PRIVATE "${core_ui_SOURCE_DIR}/src")

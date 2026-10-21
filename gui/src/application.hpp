@@ -1,5 +1,6 @@
 #pragma once
 #include "model.hpp"
+#include "date_popup.hpp"
 #include <ui_core.h>
 #include <condition_variable>
 #include <deque>
@@ -45,6 +46,9 @@ class Application {
     std::deque<Json> saves_;
     Json active_save_;
     bool closing_ = false;
+    std::unique_ptr<DatePopup> date_popup_;
+    UINT_PTR date_generation_ = 0;
+    void finish_date_popup(UINT_PTR generation);
     bool field_pending(const std::string& id) const;
     void save_field(const std::string& id, Json draft = Json());
     void queue_save(Json job);
