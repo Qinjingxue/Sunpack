@@ -172,6 +172,8 @@ public:
     bool hovered = false;
     bool pressed = false;
     bool focusable = false;
+    enum class FocusIndicator { Default, Underline, None };
+    FocusIndicator focusIndicator = FocusIndicator::Default;
     bool focused_ = false;
     bool tabStop = true;    // false = skip this widget in Tab traversal
     int  tabIndex = -1;     // -1 = auto (tree order), >=0 = explicit

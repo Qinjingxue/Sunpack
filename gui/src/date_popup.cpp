@@ -1,5 +1,6 @@
 #include "date_popup.hpp"
 #include "presentation.hpp"
+#include "motion.hpp"
 #include "date_popup_uix.h"
 #include <commctrl.h>
 #include <dwmapi.h>
@@ -70,10 +71,22 @@ DatePopup::~DatePopup() {
     if(page_) ui_page_destroy(page_);
 }
 void DatePopup::show() {
+    motion::popup(window_,true);
     ui_window_show_immediate(window_);
     // Core UI deliberately shows tool windows without activation. This popup
     // accepts keyboard input, so activate it explicitly within the owner thread.
     SetActiveWindow(hwnd_); SetFocus(hwnd_); focus_day();
+}
+void DatePopup::close() {
+    if(closing_) return;
+    closing_=true;
+    confirming_=false; // Ignore duplicate queued confirmations during exit.
+    // Cancellation has no value to validate; a successful confirmation has
+    // already been handed to the owner's existing atomic save path.
+    motion::popup(window_,false,[this] {
+        closed_=true;
+        PostMessageW(owner_,message_,generation_,0);
+    });
 }
 void DatePopup::position() {
     if(positioning_) return;
@@ -137,14 +150,14 @@ void DatePopup::move_months(int months) {
     date_=value; render(); focus_day();
 }
 void DatePopup::notify(bool cancel) {
-    if(cancelled_) return;
+    if(cancelled_ || closing_) return;
     cancelled_=cancel; confirming_=!cancel;
-    PostMessageW(owner_,message_,generation_,0);
-    if(cancel) ui_window_hide(window_);
+    if(cancel) close();
+    else PostMessageW(owner_,message_,generation_,0);
 }
 void DatePopup::dispatch() {
     auto requests=state(page_,"requests"); set(page_,"requests",Json::array()); ui_page_set_bool(page_,"dispatch",false);
-    if(cancelled_) return;
+    if(cancelled_ || closing_) return;
     for(auto& request:requests) {
         auto op=request.at("op").get<std::string>();
         if(op=="cancel") { notify(true); return; }
@@ -169,6 +182,7 @@ void DatePopup::error(const std::string& key) { confirming_=false; set(page_,"er
 LRESULT CALLBACK DatePopup::subclass(HWND hwnd,UINT message,WPARAM wp,LPARAM lp,UINT_PTR,DWORD_PTR data) {
     auto* self=reinterpret_cast<DatePopup*>(data);
     try {
+        if(self->closing_ && (message==WM_KEYDOWN || message==WM_CHAR || message==WM_LBUTTONDOWN || message==WM_LBUTTONUP || message==WM_MOUSEWHEEL)) return 0;
         if(message==DispatchDate) { self->dispatch(); return 0; }
         if(message==WM_CLOSE || (message==WM_ACTIVATE && LOWORD(wp)==WA_INACTIVE)) { self->notify(true); return 0; }
         if(message==WM_KEYDOWN) {

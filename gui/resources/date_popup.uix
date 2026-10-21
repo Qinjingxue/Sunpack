@@ -24,7 +24,7 @@ export default {
   .light .day:hover { background:#eaeaea; }
   .dark .day:hover { background:#404040; }
   .day.other { color:var(--fg-2); }
-  .day.today { border:1px solid var(--accent-text); }
+  .day.today { color:var(--accent-text); font-weight:600; }
   .light .day.selected { background:#0067c0; color:#ffffff; }
   .dark .day.selected { background:#60cdff; color:#000000; }
   .selected-date { font-weight:600; }
@@ -51,7 +51,7 @@ export default {
         </div>
         <div class="row"><label v-for="day in weekdays" class="weekday" :width="cellWidth">{{ day }}</label></div>
         <div class="calendar">
-          <button v-for="day in days" :id="'date-day-'+day.index" :class="'day'+(day.other?' other':'')+(day.today?' today':'')+(day.selected?' selected':'')" :width="cellWidth" :disabled="!day.valid" @click="send('day',day.index)">{{ day.text }}</button>
+          <button v-for="day in days" focus-indicator="none" :id="'date-day-'+day.index" :class="'day'+(day.other?' other':'')+(day.today?' today':'')+(day.selected?' selected':'')" :width="cellWidth" :disabled="!day.valid" @click="send('day',day.index)">{{ day.text }}</button>
         </div>
         <label class="selected-date" id="dateSelected">{{ selected }}</label>
         <div class="row">

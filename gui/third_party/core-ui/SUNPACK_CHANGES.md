@@ -103,6 +103,18 @@ Local changes:
 - Keep wrapped labels at least as tall as their measured DWrite text. Estimated
   line counts can understate long paragraphs and let text overflow an auto row.
 
+- Reuse intrinsic main-axis measurements within each HBox/VBox layout pass,
+  skip unchanged ScrollView final allocations and stable virtual-row passes.
+  Realization refills settle within their own ScrollView; preexisting page
+  invalidations and unconverged layout retain the root fallback. Resize dispatch
+  only ensures dirty layout when a JavaScript resize handler actually exists.
+- Share parameterized loop binding/handler functions by filename and full
+  source in each ScriptRuntime. Bound the cache to 512 entries/128 KiB source
+  and release functions before the JS context; retain no row values or widgets.
+- Add static focus-indicator="underline"/"none" for controls with their own
+  selection feedback. Clear surviving children's parent pointers when a root
+  wrapper is destroyed, including page roots retained until page teardown.
+
 The framework is MIT licensed; see [LICENSE](LICENSE). The original license and
 copyright notices are preserved, including [LunaSVG](third_party/lunasvg/LICENSE),
 [PlutoVG](third_party/lunasvg/plutovg/LICENSE), and the additional notices in their

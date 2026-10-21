@@ -16,6 +16,7 @@ class DatePopup {
     DYNAMIC_TIME_ZONE_INFORMATION zone_{};
     std::string language_;
     bool cancelled_ = false, confirming_ = false, positioning_ = false;
+    bool closing_ = false, closed_ = false;
     void render();
     void focus_day();
     void move_days(int days);
@@ -33,6 +34,8 @@ public:
     DatePopup(const DatePopup&) = delete;
     DatePopup& operator=(const DatePopup&) = delete;
     void show();
+    void close();
+    bool closed() const { return closed_; }
     bool cancelled() const { return cancelled_; }
     bool confirming() const { return confirming_; }
     std::string value() const;

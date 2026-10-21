@@ -56,6 +56,30 @@ password file with `passwords` saved records plus `history` clipboard entries, a
 
 ## Measurement rules
 
+Configuration diagnostics also traverse all blocks twice in 96-DIP increments
+(`config_traverse_cold`/`config_traverse_warm`), resize the configuration page in
+8-DIP steps (`config_resize`), and feed wheel input after each presented frame
+until the last block (`config_wheel_traverse`). This includes buffer refills and
+large cards that alternating at the tail misses. The wheel scenario uses frame
+events, without a pacing sleep. `virtual_refill_duration`,
+`virtual_list_layout_duration` and `scroll_layout_duration` separate template
+mounting from measurement; the traversal action includes all synchronous work
+and message processing, even when layout happens before paint recording.
+
+2026-10-21 local comparison, Release, 100 tasks/passwords/history, 10 roots and
+5 rounds, with the same complete configuration and 106 samples per traversal:
+
+| Metric | Before | After |
+| --- | ---: | ---: |
+| Cold configuration traversal operation p95 | 28.89 ms | 13.83 ms |
+| Configuration resize operation p50 | 10.33 ms | 2.93 ms |
+| Configuration resize operation maximum | 14.43 ms | 3.95 ms |
+
+The added actual-wheel traversal recorded a 24 ms maximum animation frame
+interval in this run. Idle recorded zero paints, widget animation frames and
+property animation frames. These are local observations, not timing assertions
+or a guarantee for other displays and system loads.
+
 * `wait_for` drains the message queue **before** sampling state. Sampling first made a
   notification that had already been delivered visible only after the next unrelated
   message (caret blink, paint), which reported phantom 0.9–14 s waits.

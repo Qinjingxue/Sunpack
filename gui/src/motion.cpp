@@ -3,9 +3,22 @@
 // Both motion and controls share the window's finite frame scheduler.
 #include <ui/ui_context.h>
 #include <ui/ui_window.h>
+#include <algorithm>
 
 namespace spg::motion {
 namespace {
+// The window owns this wrapper and its original page tree. Animate alpha with
+// the existing presentation clock, including the popup's background/border.
+// A widget opacity layer alone would leave an opaque window flashing behind it.
+class PopupSurface final : public ui::Widget {
+    HWND hwnd_;
+public:
+    explicit PopupSurface(HWND hwnd) : hwnd_(hwnd) { id = "datePopupSurface"; }
+    void DrawTree(ui::Renderer& renderer) override {
+        SetLayeredWindowAttributes(hwnd_,0,BYTE(std::clamp(opacity,0.0f,1.0f)*255),LWA_ALPHA);
+        for(auto& child:Children()) child->DrawTree(renderer);
+    }
+};
 bool enabled() {
     BOOL value = TRUE;
     SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &value, 0);
@@ -48,5 +61,28 @@ void select(UiWindow handle, const char* id, const char* targetId) {
         indicator->animationY = offset; window->Invalidate(); return;
     }
     window->AnimateProperty(indicator, ui::AnimProperty::TranslateY, indicator->animationY, offset, 170, ui::EasingFunction::FluentStandard);
+}
+void popup(UiWindow handle, bool opening, std::function<void()> complete) {
+    auto* window = ui::GetContext().GetWindow(handle);
+    if(!window || !window->Root()) { if(complete) complete(); return; }
+    auto* surface = dynamic_cast<PopupSurface*>(window->Root().get());
+    if(!surface) {
+        auto frame=std::make_shared<PopupSurface>(window->Handle());
+        auto contents=window->Root();
+        frame->opacity=opening?0.0f:1.0f;
+        frame->AddChild(contents);
+        SetWindowLongPtrW(window->Handle(),GWL_EXSTYLE,GetWindowLongPtrW(window->Handle(),GWL_EXSTYLE)|WS_EX_LAYERED);
+        SetLayeredWindowAttributes(window->Handle(),0,opening?0:255,LWA_ALPHA);
+        surface=frame.get();
+        window->SetRoot(std::move(frame));
+    }
+    const float target=opening?1.0f:0.0f;
+    if(!enabled()) {
+        window->CancelPropertyAnimation(surface,ui::AnimProperty::Opacity);
+        surface->opacity=target; window->Invalidate();
+        if(complete) complete();
+        return;
+    }
+    window->AnimateProperty(surface,ui::AnimProperty::Opacity,surface->opacity,target,opening?167.0f:83.0f,ui::EasingFunction::Linear,std::move(complete));
 }
 }

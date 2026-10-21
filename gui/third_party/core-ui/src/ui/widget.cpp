@@ -77,6 +77,9 @@ void ResolvePercentSizing(Widget* child, float parentW, float parentH) {
 // — otherwise OnMouseMove dereferences a freed pointer after a v-for
 // row destroys itself out from under the cursor.
 Widget::~Widget() {
+    // Pages and input dispatch may keep children alive after their window's
+    // root wrapper is released. Their ancestry must not point into freed memory.
+    for (auto& child : children_) if (child && child->parent_ == this) child->parent_ = nullptr;
     GetContext().NotifyWidgetDestroyed(this);
 }
 
@@ -599,7 +602,12 @@ Widget* Widget::FindById(const std::string& targetId) {
 // ---- Focus ----
 
 void Widget::DrawFocusRing(Renderer& r) {
-    if (!focused_ || !focusable || !ShowFocusRing()) return;
+    if (!focused_ || !focusable || focusIndicator == FocusIndicator::None) return;
+    if (focusIndicator == FocusIndicator::Underline) {
+        r.FillRect({rect.left+2,rect.bottom-2,rect.right-2,rect.bottom},theme::kAccent());
+        return;
+    }
+    if (!ShowFocusRing()) return;
     D2D1_RECT_F ring = {rect.left - 1, rect.top - 1, rect.right + 1, rect.bottom + 1};
     r.DrawRoundedRect(ring, 3, 3, theme::kAccent(), 1.5f);
 }
@@ -645,7 +653,9 @@ void VBoxWidget::DoLayout() {
     // First pass: measure fixed children, sum flex weights
     float usedH = 0;
     float totalFlex = 0;
-    for (auto* child : vis) {
+    std::vector<float> heights(vis.size());
+    for (size_t i = 0; i < vis.size(); ++i) {
+        auto* child = vis[i];
         usedH += child->marginT + child->marginB;
         if (child->expanding && child->fixedH <= 0) {
             totalFlex += child->flex;
@@ -653,6 +663,7 @@ void VBoxWidget::DoLayout() {
             float h = child->fixedH > 0 ? child->fixedH : child->SizeHint().height;
             if (h <= 0) h = 24.0f;
             h = std::clamp(h, child->minH, child->maxH);
+            heights[i] = h;
             usedH += h;
         }
     }
@@ -660,16 +671,12 @@ void VBoxWidget::DoLayout() {
     float remaining = std::max(0.0f, totalH - usedH - gapTotal);
 
     // Compute each child's main-axis size (height)
-    std::vector<float> heights(vis.size());
     for (size_t i = 0; i < vis.size(); i++) {
         auto* child = vis[i];
         float h;
         if (child->expanding && child->fixedH <= 0) {
             h = totalFlex > 0 ? remaining * (child->flex / totalFlex) : 0;
-        } else {
-            h = child->fixedH > 0 ? child->fixedH : child->SizeHint().height;
-            if (h <= 0) h = 24.0f;
-        }
+        } else continue; // Reuse this pass's intrinsic measurement.
         heights[i] = std::clamp(h, child->minH, child->maxH);
     }
 
@@ -821,7 +828,9 @@ void HBoxWidget::DoLayout() {
     // First pass: measure fixed children, sum flex weights
     float usedW = 0;
     float totalFlex = 0;
-    for (auto* child : vis) {
+    std::vector<float> widths(vis.size());
+    for (size_t i = 0; i < vis.size(); ++i) {
+        auto* child = vis[i];
         usedW += child->marginL + child->marginR;
         if (child->expanding && child->fixedW <= 0) {
             totalFlex += child->flex;
@@ -829,6 +838,7 @@ void HBoxWidget::DoLayout() {
             float w = child->fixedW > 0 ? child->fixedW : child->SizeHint().width;
             if (w <= 0) w = 60.0f;
             w = std::clamp(w, child->minW, child->maxW);
+            widths[i] = w;
             usedW += w;
         }
     }
@@ -836,16 +846,12 @@ void HBoxWidget::DoLayout() {
     float remaining = std::max(0.0f, totalW - usedW - gapTotal);
 
     // Compute each child's main-axis size (width)
-    std::vector<float> widths(vis.size());
     for (size_t i = 0; i < vis.size(); i++) {
         auto* child = vis[i];
         float w;
         if (child->expanding && child->fixedW <= 0) {
             w = totalFlex > 0 ? remaining * (child->flex / totalFlex) : 0;
-        } else {
-            w = child->fixedW > 0 ? child->fixedW : child->SizeHint().width;
-            if (w <= 0) w = 60.0f;
-        }
+        } else continue;
         widths[i] = std::clamp(w, child->minW, child->maxW);
     }
 

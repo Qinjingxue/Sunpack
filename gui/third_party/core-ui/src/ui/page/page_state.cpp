@@ -1470,7 +1470,6 @@ void PageState::AttachWindow(uint64_t winHandle) {
 
 void PageState::DispatchQuickJSResize(int width, int height) {
     if (!jsRt_ || JS_IsUndefined(jsState_) || JS_IsUndefined(jsOptions_)) return;
-    EnsurePageLayout(this);
 
     JSContext* ctx = jsRt_->ctx();
     JSValue fn = JS_GetPropertyStr(ctx, jsOptions_, "onResize");
@@ -1481,6 +1480,12 @@ void PageState::DispatchQuickJSResize(int width, int height) {
     if (!JS_IsFunction(ctx, fn)) {
         JS_FreeValue(ctx, fn);
         return;
+    }
+    // UiWindow already arranged the new client size. Pages without a resize
+    // handler must not pay for another complete layout on every WM_SIZE.
+    if (ui::LayoutDirtyFlag()) {
+        ui::LayoutDirtyFlag() = false;
+        EnsurePageLayout(this);
     }
 
     JSValue args[2] = { JS_NewInt32(ctx, width), JS_NewInt32(ctx, height) };
@@ -2262,6 +2267,7 @@ void PageState::RewireIterationBindings(JsLoopRuntime& rt, JsLoopIteration& iter
 }
 
 void PageState::RebuildJsLoop(JsLoopRuntime& rt, bool viewportOnly) {
+    TraceScope scope("page_state", viewportOnly ? "virtual_refill_duration" : "loop_rebuild_duration");
 
     /* 整个重建过程合成一批: 中途每条绑定各自 InvalidateAllWindows +
      * UpdateAnimTimers 是 O(n^2) 的来源 (见 ui_context.h BeginBatch 注释)。

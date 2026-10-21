@@ -186,6 +186,11 @@ private:
     JSContext*  ctx_;
     std::string lastError_;
     void*       userData_ = nullptr;
+    // Template functions take row data as arguments and capture no widgets.
+    std::unordered_map<std::string, JSValue> templateClosures_;
+    size_t templateSourceBytes_ = 0;
+    JSValue CompileTemplateClosure(const std::string& source, const std::string& filename);
+    void ClearTemplateClosures();
 
     // (target_ptr, key) → set<effect_id> that read this property.
     struct DepKey {

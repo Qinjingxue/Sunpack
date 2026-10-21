@@ -455,6 +455,39 @@ int wmain(int argc,wchar_t** argv) {
             ui_window_set_size(app.window(),1120,720); ui_window_relayout(app.window());
 
             nav("tabConfig","config");
+            // Traverse every variable-height configuration block, including
+            // cold row mounts. Alternating at the tail misses refill stalls.
+            auto* configWindow=ui::GetContext().GetWindow(app.window());
+            auto* allScroll=dynamic_cast<ui::ScrollViewWidget*>(widget(app,"configListScroll"));
+            auto* allItems=dynamic_cast<ui::VirtualListWidget*>(widget(app,"configItems"));
+            for(int tour=0;tour<2;++tour) {
+                configWindow->ScrollWithMeasureContext(allScroll,0); ui_window_relayout(app.window());
+                for(int step=0;step<800;++step) {
+                    float before=allScroll->ScrollY();
+                    measure(tour?"config_traverse_warm":"config_traverse_cold",[&]{
+                        configWindow->ScrollWithMeasureContext(allScroll,before+96);
+                        pump_messages();
+                    });
+                    if(allScroll->ScrollY()<=before && allItems->Indices().back()+1==page_state(app.page(),"matchingBlocks").size()) break;
+                }
+            }
+            configWindow->ScrollWithMeasureContext(allScroll,0); ui_window_relayout(app.window());
+            for(size_t i=0;i<12;++i) measure("config_resize",[&]{
+                ui_window_set_size(app.window(),1100+int(i%6)*8,700+int(i%3)*8); pump_messages();
+            });
+            ui_window_set_size(app.window(),1120,720); pump_messages();
+            measure("config_wheel_traverse",[&]{
+                for(int step=0;step<1500;++step) {
+                    const auto paints=paint_count.load();
+                    auto bounds=allScroll->rect;
+                    ensure(ui_debug_wheel_at(app.window(),bounds.left+20,bounds.top+20,-120)==0,"configuration wheel failed");
+                    wait_for([&]{return paint_count.load()>paints;},"configuration wheel frame");
+                    if(!allItems->Children().empty() &&
+                       allItems->Indices().back()+1==page_state(app.page(),"matchingBlocks").size() &&
+                       allItems->Children().back()->rect.bottom<=bounds.bottom) break;
+                }
+                wait_for([&]{return !allScroll->ScrollAnimating();},"configuration wheel completion");
+            });
             scroll_list(app,"configListScroll","configItems",options.rounds,report);
             auto config_fields=page_state(app.page(),"fields");
             report["config_field_count"]=config_fields.size();

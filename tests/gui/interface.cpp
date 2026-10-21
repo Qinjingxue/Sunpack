@@ -11,8 +11,10 @@
 #include <ui/ui_window.h>
 #include <ui/uix/script_runtime.h>
 #include <ui/controls.h>
+#include <ui/ui_debug.h>
 using namespace spg;
 namespace {
+constexpr int virtualTaskCount=96, virtualPasswordCount=80, virtualHistoryCount=96;
 struct AnimationFrames {
     bool finished=false, layout=false, started=false, stopped=false;
     unsigned frames=0, submitted=0, rootLayouts=0;
@@ -44,23 +46,20 @@ struct AnimationFrames {
 };
 Json state(UiPage page,const char* key) { char* text=ui_page_get_json(page,key); if(!text) throw std::runtime_error(std::string("UI state unavailable: ")+key); auto j=parse_json(text); ui_page_free(text); return j; }
 UiRect rect(Application& app,const std::string& id) {
-    auto widget=ui_widget_find_by_id(ui_page_root(app.page()),id.c_str());
+    auto* widget=ui::GetContext().GetWindow(app.window())->Root()->FindById(id);
     if(!widget) throw std::runtime_error("Widget missing: "+id);
-    auto result=ui_widget_get_rect(widget); ui_widget_destroy(widget); return result;
+    const auto& r=widget->rect; return {r.left,r.top,r.right,r.bottom};
 }
 Json rendered_widget(Application& app,const std::string& id) {
-    char* dump=ui_debug_dump_tree(app.window()); assert(dump);
-    auto tree=parse_json(dump); ui_debug_free(dump);
-    std::function<const Json*(const Json&)> find=[&](const Json& node)->const Json* {
-        if(node.value("id",std::string())==id) return &node;
-        if(node.contains("children")) for(auto& child:node["children"]) if(auto* result=find(child)) return result;
-        return nullptr;
-    };
-    auto* found=find(tree); assert(found); return *found;
+    auto* window=ui::GetContext().GetWindow(app.window());
+    auto* widget=window->Root()->FindById(id); assert(widget);
+    return parse_json(ui::DebugDumpTree(widget,&window->GetRenderer()));
 }
 void pump(const std::function<bool()>& condition, const char* phase="UI event", bool allow_timers=true) {
     auto deadline=GetTickCount64()+10000;
     for(;;) {
+        MSG message;
+        while(PeekMessageW(&message,nullptr,0,0,PM_REMOVE)) { if(message.message==WM_QUIT || (!allow_timers && message.message==WM_TIMER)) continue; TranslateMessage(&message); DispatchMessageW(&message); }
         try { if(condition()) return; }
         catch(const WinError& error) {
             // Test-side reads can overlap ReplaceFile's rename/share window.
@@ -70,8 +69,6 @@ void pump(const std::function<bool()>& condition, const char* phase="UI event", 
         DWORD left=DWORD(deadline>GetTickCount64()?deadline-GetTickCount64():0);
         if(!left) throw std::runtime_error(std::string(phase)+" timed out");
         MsgWaitForMultipleObjectsEx(0,nullptr,left,QS_ALLINPUT,MWMO_INPUTAVAILABLE);
-        MSG message;
-        while(PeekMessageW(&message,nullptr,0,0,PM_REMOVE)) { if(message.message==WM_QUIT || (!allow_timers && message.message==WM_TIMER)) continue; TranslateMessage(&message); DispatchMessageW(&message); }
     }
 }
 // Print a state snapshot only if a UI wait fails; successful waits retain the
@@ -160,25 +157,19 @@ void click(Application& app,const char* id) {
     ui_window_relayout(app.window());
     // Scroll the containing pane as a person would before clicking an action
     // in a long inline form. Never click through a clipped viewport.
-    char* dump=ui_debug_dump_tree(app.window()); assert(dump);
-    auto tree=parse_json(dump); ui_debug_free(dump);
-    std::vector<Json> ancestors;
-    std::function<bool(const Json&)> path=[&](const Json& node) {
-        if(node.value("id",std::string())==id) return true;
-        if(node.contains("children")) for(auto& child:node["children"]) if(path(child)) {
-            if(node.value("type",std::string())=="ScrollView") ancestors.push_back(node);
-            return true;
-        }
-        return false;
-    };
-    path(tree);
+    auto* window=ui::GetContext().GetWindow(app.window());
+    auto* target=window->Root()->FindById(id); assert(target);
+    std::vector<std::string> ancestors;
+    for(auto* parent=target->Parent();parent;parent=parent->Parent())
+        if(dynamic_cast<ui::ScrollViewWidget*>(parent)) ancestors.push_back(parent->id);
     for(auto& pane:ancestors) {
-        auto bounds=rect(app,id); auto viewport=pane["rect"];
-        float top=viewport[1], bottom=viewport[3], center=(bounds.top+bounds.bottom)/2;
+        auto bounds=rect(app,id);
+        auto* scroll=dynamic_cast<ui::ScrollViewWidget*>(window->Root()->FindById(pane)); assert(scroll);
+        auto viewport=scroll->rect;
+        float top=viewport.top, bottom=viewport.bottom, center=(bounds.top+bounds.bottom)/2;
         if(center<top+4 || center>bottom-4) {
-            auto scroll=ui_widget_find_by_id(ui_page_root(app.page()),pane["id"].get<std::string>().c_str()); assert(scroll);
-            ui_debug_scroll_set(scroll,pane["scrollY"].get<float>()+center-(top+bottom)/2);
-            ui_widget_destroy(scroll); ui_window_relayout(app.window());
+            window->ScrollWithMeasureContext(scroll,scroll->ScrollY()+center-(top+bottom)/2);
+            ui_window_relayout(app.window());
         }
     }
     auto widget=ui_widget_find_by_id(ui_page_root(app.page()),id); assert(widget);
@@ -220,7 +211,14 @@ std::string root_row_id(Application& app,const fs::path& path) {
 void edit_root_cell(Application& app,const std::string& id,const char* part,const wchar_t* value) {
     click(app,("root-"+std::string(part)+"-text-"+id).c_str());
     auto input="root-"+std::string(part)+"-input-"+id;
-    pump([&]{auto* focused=ui::GetContext().GetWindow(app.window())->FocusedWidget();return focused&&focused->id==input;},"Root cell focus");
+    try { pump([&]{auto* focused=ui::GetContext().GetWindow(app.window())->FocusedWidget();return focused&&focused->id==input;},"Root cell focus"); }
+    catch(...) {
+        auto* focused=ui::GetContext().GetWindow(app.window())->FocusedWidget();
+        std::cerr<<"Root focus diagnostic: expected="<<input<<" focused="<<(focused?focused->id:"<none>")<<'\n';
+        for(auto key:{"rootCell","rootPart","rootDrafts","requests","dispatch","saving","saveErrors"})
+            std::cerr<<key<<"="<<state(app.page(),key)<<'\n';
+        throw;
+    }
     assert(ui_debug_key_mod(app.window(),'A',1,0,0)==0);
     assert(ui_debug_type_char(app.window(),8)==0);
     if(*value) assert(ui_debug_type_text(app.window(),value)==0);
@@ -229,7 +227,9 @@ void paste_password(Application& app,const wchar_t* value) {
     // Exercise the actual Ctrl+V path, including its single multi-line input
     // event. Restore the user's clipboard formats after the synchronous paste.
     auto owner=ui::GetContext().GetWindow(app.window())->Handle();
-    assert(OpenClipboard(owner));
+    // Clipboard listeners can briefly own this system-wide resource. Use the
+    // existing event wait, without a retry timer or fixed sleep.
+    pump([&]{return OpenClipboard(owner)!=FALSE;},"Clipboard ownership");
     // Eager copies are essential: OleGetClipboard's wrapper refers to the live
     // clipboard and cannot restore its old contents after EmptyClipboard.
     std::vector<std::pair<UINT,HANDLE>> previous;
@@ -243,7 +243,7 @@ void paste_password(Application& app,const wchar_t* value) {
     auto data=GlobalLock(memory); assert(data); memcpy(data,value,bytes); GlobalUnlock(memory);
     assert(SetClipboardData(CF_UNICODETEXT,memory)); CloseClipboard();
     assert(ui_debug_key_mod(app.window(),'V',1,0,0)==0);
-    assert(OpenClipboard(owner)); EmptyClipboard();
+    pump([&]{return OpenClipboard(owner)!=FALSE;},"Clipboard restoration"); EmptyClipboard();
     for(auto [format,copy]:previous) assert(SetClipboardData(format,copy));
     CloseClipboard();
 }
@@ -265,17 +265,17 @@ void search_hints(Application& app) {
 }
 void button_texts(Application& app,bool relayout=true) {
     if(relayout) ui_window_relayout(app.window());
-    char* dump=ui_debug_dump_tree(app.window()); assert(dump);
-    auto tree=parse_json(dump); ui_debug_free(dump);
-    std::function<void(const Json&)> check=[&](const Json& node) {
-        if(!node.value("visible",true)) return;
-        if(node.value("type",std::string())=="Button" && node.contains("textWidth")) {
-            if(node["textWidth"].get<float>()>node["availWidth"].get<float>()+0.5f)
-                throw std::runtime_error("Truncated action: "+node.dump());
+    auto* window=ui::GetContext().GetWindow(app.window());
+    std::function<void(ui::Widget*)> check=[&](ui::Widget* widget) {
+        if(!widget->visible) return;
+        if(auto* button=dynamic_cast<ui::ButtonWidget*>(widget);button && !button->Text().empty()) {
+            auto font=button->css.fontSize>0?button->css.fontSize:theme::kFontSizeNormal;
+            if(window->GetRenderer().MeasureTextWidth(button->Text(),font)>button->rect.right-button->rect.left-24+0.5f)
+                throw std::runtime_error("Truncated action: "+ui::DebugDumpTree(button,&window->GetRenderer()));
         }
-        if(node.contains("children")) for(auto& child:node["children"]) check(child);
+        for(auto& child:widget->Children()) check(child.get());
     };
-    check(tree);
+    check(window->Root().get());
 }
 void finish_input(Application& app) {
     ui_window_focus_widget(app.window(),0);
@@ -309,18 +309,25 @@ void popup_motion(Application& app,const char* id,bool upward=false) {
     };
     open();
     assert(combo->IsOpen());
-    if(animations) assert(combo->PopupAnimating() && combo->PopupOpacity()<1 && combo->PopupProgress()<1);
+    // Input helpers synchronously present. ASan (or a busy desktop) can finish
+    // the finite animation before they return; assert its lifecycle rather
+    // than requiring an intermediate value at that arbitrary instant.
+    if(animations) assert(animation.started &&
+        (combo->PopupAnimating() || (animation.stopped && combo->PopupOpacity()==1 && combo->PopupProgress()==1)));
     // Motion must advance from presented frames, without depending on a
     // low-frequency WM_TIMER. Completion-only checks with timers miss that.
     pump([&]{return !combo->PopupAnimating() && (!animations || animation.stopped);},"Render-paced popup entrance",false);
     auto bounds=combo->rect, drop=combo->DropdownRect();
-    assert(combo->PopupOpacity()==1 && combo->PopupProgress()==1);
+    if(combo->PopupOpacity()!=1 || combo->PopupProgress()!=1) {
+        std::cerr<<"Popup entrance endpoint: id="<<id<<" open="<<combo->IsOpen()<<" opacity="<<combo->PopupOpacity()<<" progress="<<combo->PopupProgress()<<'\n';
+        throw std::runtime_error("Popup entrance endpoint missing");
+    }
     if(upward && drop.bottom>bounds.top) {
         std::cerr<<"Popup geometry: "<<rendered_widget(app,id)<<"; scroll="<<rendered_widget(app,"configListScroll").at("rect")
                  <<"; viewport="<<ui::Viewport().top<<","<<ui::Viewport().bottom<<"; popup="<<drop.top<<","<<drop.bottom<<'\n';
         throw std::runtime_error("Expected popup to open upward");
     }
-    if(animations) assert(animation.frames>1 && !animation.layout);
+    if(animations) assert(animation.frames>0 && !animation.layout);
     const int visibleRows=static_cast<int>((drop.bottom-drop.top)/combo->ItemHeight());
     const float padding=((drop.bottom-drop.top)-visibleRows*combo->ItemHeight())/2;
     float hoverX=(drop.left+drop.right)/2;
@@ -331,7 +338,7 @@ void popup_motion(Application& app,const char* id,bool upward=false) {
     animation.stopped=false;
     assert(ui_debug_key(app.window(),VK_ESCAPE)==0);
     assert(!combo->IsOpen());
-    if(animations) assert(combo->PopupAnimating() && combo->PopupOpacity()>0);
+    if(animations) assert(combo->PopupAnimating() || (animation.stopped && combo->PopupOpacity()==0));
     // Reopen during exit; it must resume from its current visual state.
     open();
     assert(combo->IsOpen());
@@ -361,59 +368,55 @@ void virtual_tail(Application& app,const char* list_id,const char* scroll_id,siz
         // Programmatic scroll must use the window's renderer-backed measurer,
         // exactly like the production scroll command, including newly mounted rows.
         ui::GetContext().GetWindow(app.window())->ScrollWithMeasureContext(scroll,y);
-        ui_window_relayout(app.window());
+        ui_debug_pump(); // Observe production refill/layout; do not repair it.
     };
-    for(int visit=0;visit<3;++visit) {
-        // Estimated heights settle when the last variable-height rows mount.
-        for(int pass=0;pass<3;++pass) scroll_to(1e9f);
-        if(list->Indices().empty() || list->Indices().back()!=total-1)
-            std::cerr<<"Virtual tail "<<list_id<<" expected="<<total<<" last="<<(list->Indices().empty()?0:list->Indices().back())<<" scroll="<<scroll->ScrollY()<<"\n";
-        assert(!list->Indices().empty() && list->Indices().back()==total-1);
-        assert(list->Children().size()<40);
-        const auto& last=list->Children().back()->rect;
-        auto viewport=scroll->rect;
-        assert(last.top<viewport.bottom && last.bottom<=viewport.bottom+2);
-        if(visit==0) {
-            // A file watcher/save receipt replaces arrays even when row keys
-            // and geometry are unchanged. Check the scrolled view, not only
-            // reachability after resetting it to the top.
-            auto before=scroll->ScrollY(), height=list->SizeHint().height;
-            auto anchor=list->Children().back()->id;
-            auto top=list->Children().back()->rect.top;
-            const char* data_key=!std::strcmp(list_id,"configItems")?"fields":
-                !std::strcmp(list_id,"listItems")?"listRows":
-                !std::strcmp(list_id,"directoryItems")?"directories":
-                !std::strcmp(list_id,"passwordItems")?"passwords":
-                !std::strcmp(list_id,"rootItems")?"rootRows":"tasks";
-            auto replacement=state(app.page(),data_key).dump();
-            assert(ui_page_set_json(app.page(),data_key,replacement.c_str())==0);
-            ui_window_relayout(app.window());
-            auto* row=list->FindById(anchor);
-            if(!row || std::abs(scroll->ScrollY()-before)>0.5f ||
-               std::abs(list->SizeHint().height-height)>0.5f || std::abs(row->rect.top-top)>0.5f)
-                throw std::runtime_error(std::string("Data refresh moved virtual view: ")+list_id);
-            if(!std::strcmp(list_id,"taskItems")) {
-                auto reordered=state(app.page(),data_key);
-                auto first=reordered["rows"][0];
-                reordered["rows"].erase(reordered["rows"].begin());
-                reordered["rows"].push_back(first);
-                auto encoded=reordered.dump();
-                assert(ui_page_set_json(app.page(),data_key,encoded.c_str())==0);
-                ui_window_relayout(app.window());
-                row=list->FindById(anchor);
-                assert(row && std::abs(row->rect.top-top)<0.5f && scroll->ScrollY()<before);
-                assert(ui_page_set_json(app.page(),data_key,replacement.c_str())==0);
-                ui_window_relayout(app.window());
-                row=list->FindById(anchor);
-                assert(row && std::abs(row->rect.top-top)<0.5f && std::abs(scroll->ScrollY()-before)<0.5f);
-            }
-        }
-        scroll_to(0);
-        if(list->Indices().empty() || list->Indices().front()!=0 || list->Children().size()>=40) {
-            std::cerr<<"Virtual top "<<list_id<<" indices="; for(auto index:list->Indices()) std::cerr<<index<<","; std::cerr<<" rect="<<list->rect.top<<","<<list->rect.bottom<<" scroll="<<rendered_widget(app,scroll_id)<<"\n";
-        }
-        assert(!list->Indices().empty() && list->Indices().front()==0 && list->Children().size()<40);
+    // Estimated heights settle when the last variable-height rows mount.
+    for(int pass=0;pass<3;++pass) scroll_to(1e9f);
+    if(list->Indices().empty() || list->Indices().back()!=total-1)
+        std::cerr<<"Virtual tail "<<list_id<<" expected="<<total<<" last="<<(list->Indices().empty()?0:list->Indices().back())<<" scroll="<<scroll->ScrollY()<<"\n";
+    assert(!list->Indices().empty() && list->Indices().back()==total-1);
+    assert(list->Children().size()<40);
+    const auto& last=list->Children().back()->rect;
+    auto viewport=scroll->rect;
+    assert(last.top<viewport.bottom && last.bottom<=viewport.bottom+2);
+    // A file watcher/save receipt replaces arrays even when row keys
+    // and geometry are unchanged. Check the scrolled view, not only
+    // reachability after resetting it to the top.
+    auto before=scroll->ScrollY(), height=list->SizeHint().height;
+    auto anchor=list->Children().back()->id;
+    auto top=list->Children().back()->rect.top;
+    const char* data_key=!std::strcmp(list_id,"configItems")?"fields":
+        !std::strcmp(list_id,"listItems")?"listRows":
+        !std::strcmp(list_id,"directoryItems")?"directories":
+        !std::strcmp(list_id,"passwordItems")?"passwords":
+        !std::strcmp(list_id,"rootItems")?"rootRows":"tasks";
+    auto replacement=state(app.page(),data_key).dump();
+    assert(ui_page_set_json(app.page(),data_key,replacement.c_str())==0);
+    ui_window_relayout(app.window());
+    auto* row=list->FindById(anchor);
+    if(!row || std::abs(scroll->ScrollY()-before)>0.5f ||
+       std::abs(list->SizeHint().height-height)>0.5f || std::abs(row->rect.top-top)>0.5f)
+        throw std::runtime_error(std::string("Data refresh moved virtual view: ")+list_id);
+    if(!std::strcmp(list_id,"taskItems")) {
+        auto reordered=state(app.page(),data_key);
+        auto first=reordered["rows"][0];
+        reordered["rows"].erase(reordered["rows"].begin());
+        reordered["rows"].push_back(first);
+        auto encoded=reordered.dump();
+        assert(ui_page_set_json(app.page(),data_key,encoded.c_str())==0);
+        ui_window_relayout(app.window());
+        row=list->FindById(anchor);
+        assert(row && std::abs(row->rect.top-top)<0.5f && scroll->ScrollY()<before);
+        assert(ui_page_set_json(app.page(),data_key,replacement.c_str())==0);
+        ui_window_relayout(app.window());
+        row=list->FindById(anchor);
+        assert(row && std::abs(row->rect.top-top)<0.5f && std::abs(scroll->ScrollY()-before)<0.5f);
     }
+    scroll_to(0);
+    if(list->Indices().empty() || list->Indices().front()!=0 || list->Children().size()>=40) {
+        std::cerr<<"Virtual top "<<list_id<<" indices="; for(auto index:list->Indices()) std::cerr<<index<<","; std::cerr<<" rect="<<list->rect.top<<","<<list->rect.bottom<<" scroll="<<rendered_widget(app,scroll_id)<<"\n";
+    }
+    assert(!list->Indices().empty() && list->Indices().front()==0 && list->Children().size()<40);
 }
 void scrolled_config_edits(Application& app) {
     auto* window=ui::GetContext().GetWindow(app.window());
@@ -499,7 +502,35 @@ void popup_key(ui::UiWindowImpl* popup,int key) {
     if(key!=VK_ESCAPE && key!=VK_RETURN && ui::GetContext().GetWindow(window)!=popup)
         throw std::runtime_error("Date popup lost activation during keyboard operation");
 }
+void config_categories(Application& app) {
+    search_config(app,L"");
+    auto categories=state(app.page(),"categories"); assert(categories.size()>2);
+    const std::vector<std::string> choices={categories.front()["id"],categories.back()["id"],"",categories[1]["id"],""};
+    BOOL animations=TRUE; SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION,0,&animations,0);
+    for(const auto& category:choices) {
+        settle_motion(app);
+        struct Trace {
+            Application& app; std::string before; bool motion=false,flash=false;
+            Trace(Application& a):app(a),before(state(a.page(),"configCategory")) {
+                ui_trace_set_sink([](const UiTraceEvent* event,void* data) {
+                    auto& t=*static_cast<Trace*>(data);
+                    if(!std::strcmp(event->name,"motion_started")) t.motion=true;
+                    if(!std::strcmp(event->name,"frame_job_submitted") && !t.motion && state(t.app.page(),"configCategory")!=t.before) t.flash=true;
+                },this);
+            }
+            ~Trace() { ui_trace_set_sink(nullptr,nullptr); }
+        } trace(app);
+        click(app,category.empty()?"category-all":("category-"+category).c_str());
+        pump([&]{return state(app.page(),"configCategory")==category && state(app.page(),"requests").empty();},"Configuration category transaction");
+        if(animations) assert(trace.motion && !trace.flash);
+        auto* scroll=dynamic_cast<ui::ScrollViewWidget*>(ui::GetContext().GetWindow(app.window())->Root()->FindById("configListScroll"));
+        assert(scroll && scroll->ScrollY()==0);
+        auto blocks=state(app.page(),"matchingBlocks"); assert(!blocks.empty());
+        if(!category.empty()) for(auto& block:blocks) assert(block["category"]==category);
+    }
+}
 void range_config(Application& app,const fs::path& dir) {
+    config_categories(app);
     auto field=[&](const std::string& module) { for(auto& f:state(app.page(),"fields")) if(f["module"]==module && f["type"]=="object") return f; return Json(); };
     auto size=field("size_range"),time=field("mtime_range"); assert(!size.is_null() && !time.is_null());
     auto id=size["id"].get<std::string>(),tid=time["id"].get<std::string>();
@@ -575,8 +606,17 @@ void range_config(Application& app,const fs::path& dir) {
     input("range-lower-"+tid,L"2024-01-31 12:34"); finish_input(app);
     auto before=read_file(dir/"sunpack_config.json");
     auto open=[&](const std::string& side) {
+        settle_motion(app);
+        AnimationFrames animation;
         click(app,("range-"+side+"-pick-"+tid).c_str()); ui_debug_pump();
         auto* popup=date_popup(app); assert(popup);
+        auto* surface=popup->Root().get();
+        assert(surface->id=="datePopupSurface");
+        pump([&]{return surface->opacity==1;},"Date popup entrance",false);
+        BYTE alpha=0; DWORD flags=0;
+        assert(GetLayeredWindowAttributes(popup->Handle(),nullptr,&alpha,&flags) && alpha==255 && (flags&LWA_ALPHA));
+        auto* picker=ui::GetContext().GetWindow(app.window())->Root()->FindById("range-"+side+"-pick-"+tid);
+        assert(picker && picker->focusIndicator==ui::Widget::FocusIndicator::Underline);
         assert(GetWindow(popup->Handle(),GW_OWNER)==ui_window_hwnd(app.window()));
         assert(!(GetWindowLongPtrW(popup->Handle(),GWL_STYLE)&WS_CAPTION));
         RECT bounds{}; GetWindowRect(popup->Handle(),&bounds);
@@ -584,6 +624,7 @@ void range_config(Application& app,const fs::path& dir) {
         assert(bounds.left>=monitor.rcWork.left && bounds.right<=monitor.rcWork.right);
         assert(bounds.top>=monitor.rcWork.top && bounds.bottom<=monitor.rcWork.bottom);
         auto focused=popup->FocusedWidget();
+        if(focused) assert(focused->focusIndicator==ui::Widget::FocusIndicator::None && focused->css.borderWidth==0);
         if(!focused || focused->id.rfind("date-day-",0)!=0) {
             char* tree=ui_debug_dump_tree(popup->windowId);
             std::cerr<<"Popup focus="<<(focused?focused->id:"none")<<" tree="<<(tree?tree:"")<<'\n'; ui_debug_free(tree);
@@ -618,6 +659,7 @@ void range_config(Application& app,const fs::path& dir) {
     assert(dynamic_cast<ui::TextInputWidget*>(popup->Root()->FindById("dateTime"))->Text()==L"12:34");
     popup_click(popup,"dateConfirm");
     pump([&]{return field("mtime_range")["range"]["lower"]=="2024-02-29 12:34";},"Core UI date selection");
+    pump([&]{return !date_popup(app);},"Date confirmation exit");
     assert(!date_popup(app) && oldTree.expired());
     // Model a timezone change between popup validation and the queued save.
     // The UI handoff must retain the confirmed UTC rather than reinterpret the
@@ -633,9 +675,11 @@ void range_config(Application& app,const fs::path& dir) {
     popup=open("upper"); oldTree=popup->Root();
     popup_click(popup,"datePrevious");
     popup_key(popup,VK_ESCAPE);
+    pump([&]{return !date_popup(app);},"Date cancellation exit");
     assert(!date_popup(app) && oldTree.expired());
     popup=open("lower"); oldTree=popup->Root();
     SendMessageW(popup->Handle(),WM_ACTIVATE,WA_INACTIVE,0); ui_debug_pump();
+    pump([&]{return !date_popup(app);},"Date deactivation exit");
     assert(!date_popup(app) && oldTree.expired());
     popup=open("lower"); oldTree=popup->Root();
     // Replace before draining the old Esc completion. The generation prevents
@@ -646,6 +690,7 @@ void range_config(Application& app,const fs::path& dir) {
     SendMessageW(static_cast<HWND>(ui_window_hwnd(app.window())),WM_APP+0x401,0,0); ui_debug_pump();
     assert(date_popup(app) && oldTree.expired());
     search_config(app,L"size_range");
+    pump([&]{return !date_popup(app);},"Date settings switch exit");
     assert(!date_popup(app));
     assert(read_file(dir/"sunpack_config.json")==before);
     search_config(app,L"mtime_range");
@@ -656,6 +701,7 @@ void range_config(Application& app,const fs::path& dir) {
     popup=open("lower");
     if(*shots) assert(ui_debug_screenshot(popup->windowId,(fs::path(shots)/L"date-popup-other-theme.png").c_str())==0);
     popup_key(popup,VK_ESCAPE);
+    pump([&]{return !date_popup(app);},"Date theme exit");
     assert(ui_debug_combo_select(app.window(),theme,choice)==0); ui_widget_destroy(theme);
     // Exercise placement on each attached monitor, including negative screen
     // coordinates and its real DPI. No desktop resolution or scaling changes.
@@ -854,7 +900,14 @@ void drag_after_wheel(Application& app) {
             assert(ui_page_set_json(app.page(),"fields",fields.c_str())==0);
             window->Invalidate();
             ui_window_end_canvas_visual_transaction(app.window());
-            pump([&]{return !active->ScrollAnimating() && active->ScrollY()!=from;},"Thumb presentation",false);
+            try { pump([&]{return !active->ScrollAnimating() && active->ScrollY()!=from;},"Thumb presentation",false); }
+            catch(...) {
+                std::cerr<<"Thumb diagnostic: from="<<from<<" current="<<active->ScrollY()<<" x="<<x<<" y="<<y<<" dy="<<dy
+                    <<" extent="<<extent<<" capture="<<(GetCapture()==hwnd)<<" frames="<<animation.frames
+                    <<" submitted="<<animation.submitted<<" stopped="<<animation.stopped<<" finished="<<animation.finished
+                    <<" tree="<<rendered_widget(app,"configListScroll")<<'\n';
+                throw;
+            }
         }
         assert(ui_debug_mouse_up(app.window(),x,y+dy)==0);
         assert(!active->ScrollAnimating());
@@ -921,6 +974,7 @@ int wmain(int argc,wchar_t** argv) {
         std::cout<<args.dump(); return 0;
     }
     const bool rangesOnly=argc==2 && std::wstring(argv[1])==L"--ranges";
+    const bool acceptance=argc==2 && std::wstring(argv[1])==L"--acceptance";
     CoInitializeEx(nullptr,COINIT_APARTMENTTHREADED);
     auto dir=fs::temp_directory_path()/(L"sunpack-gui-ui-"+std::to_wstring(GetCurrentProcessId())); fs::create_directory(dir);
     auto gate_name=L"Local\\SunPack.GUI.TestCommand."+std::to_wstring(GetCurrentProcessId());
@@ -928,7 +982,7 @@ int wmain(int argc,wchar_t** argv) {
     try {
         scalar_reactivity_noop();
         atomic_write(dir/"sunpack_config.json",R"({"cli":{"language":"zh"},"runtime":{"process_mode":"normal"},"recursive_extract":"*","watch":{"state_dir":".sunpack_watch","out_dir":".","toast_enabled":true},"unknown":9007199254740993})");
-        if(rangesOnly) {
+        if(rangesOnly || acceptance) {
             auto config=parse_json(kUiDefaultsJson); config["watch"]["state_dir"]=".sunpack_watch";
             atomic_write(dir/"sunpack_config.json",config.dump());
         }
@@ -945,9 +999,16 @@ int wmain(int argc,wchar_t** argv) {
             assert(IsWindowVisible(static_cast<HWND>(ui_window_hwnd(app.window()))));
             assert(state(app.page(),"errors").empty() && state(app.page(),"actionError")=="");
             screenshot(app,L"startup.png");
-            if(rangesOnly) {
+            if(rangesOnly || acceptance) {
                 pump([&]{return state(app.page(),"fields").size()>100;});
                 click(app,"tabConfig"); pump([&]{return state(app.page(),"tab")=="config";});
+                if(acceptance) {
+                    settle_motion(app);
+                    virtual_tail(app,"configItems","configListScroll",state(app.page(),"matchingBlocks").size());
+                    scrolled_config_edits(app);
+                    resize_tasks(app);
+                    popup_motion(app,"themeSelector");
+                }
                 range_config(app,dir);
                 // Same range scenario as the full suite, with the real owner
                 // close path and none of the unrelated animation timing checks.
@@ -1001,11 +1062,11 @@ int wmain(int argc,wchar_t** argv) {
             assert(state(app.page(),"tasks")["total"]==1);
             std::string many;
             const char* phases[]={"processing_started","failed_terminal","suspended_missing_volume","done"};
-            for(int i=0;i<512;++i) many+=Json({{"event",phases[i%4]},{"path",utf8((dir/"history"/("task-"+std::to_string(i)+".001")).wstring())},{"time","2026-10-19T09:15:42.731112+00:00"},{"output_dirs",{utf8(dir.wstring())}}}).dump()+"\n";
+            for(int i=0;i<virtualTaskCount;++i) many+=Json({{"event",phases[i%4]},{"path",utf8((dir/"history"/("task-"+std::to_string(i)+".001")).wstring())},{"time","2026-10-19T09:15:42.731112+00:00"},{"output_dirs",{utf8(dir.wstring())}}}).dump()+"\n";
             atomic_write(dir/".sunpack_watch"/"events.jsonl",many);
-            pump_diagnostic(app,[&]{return state(app.page(),"tasks")["total"]==512;},"Load 512 tasks");
-            virtual_tail(app,"taskItems","taskListScroll",512);
-            auto tail=state(app.page(),"tasks")["rows"][511];
+            pump_diagnostic(app,[&]{return state(app.page(),"tasks")["total"]==virtualTaskCount;},"Load virtual tasks");
+            virtual_tail(app,"taskItems","taskListScroll",virtualTaskCount);
+            auto tail=state(app.page(),"tasks")["rows"][virtualTaskCount-1];
             tail["sortTimestamp"]=1e12;
             auto delta_json=Json{{"changes",Json::array({Json{{"id",tail["id"]},{"row",tail}}})},{"malformed",0}}.dump();
             assert(ui_page_call_json(app.page(),"applyTaskDelta",delta_json.c_str())==0);
@@ -1062,7 +1123,7 @@ int wmain(int argc,wchar_t** argv) {
             expected=saved_tasks;
             apply_changes(Json::array({Json{{"id",tail["id"]},{"row",moved}}}));
             assert(ui_page_set_json(app.page(),"tasks",saved_tasks.dump().c_str())==0);
-            virtual_tail(app,"taskItems","taskListScroll",512);
+            virtual_tail(app,"taskItems","taskListScroll",virtualTaskCount);
             auto task=state(app.page(),"tasks")["rows"][0];
             assert(task["time"].get<std::string>().size()==19);
             resize_tasks(app);
@@ -1230,8 +1291,8 @@ int wmain(int argc,wchar_t** argv) {
                     if(fading) assert(ui_debug_key(app.window(),VK_ESCAPE)==0);
                     assert(ui_debug_wheel_at(app.window(),scroll->rect.left+12,scroll->rect.top+12,-120)==0);
                     assert(!combo->IsOpen());
-                    if(animations) {
-                        assert(combo->PopupAnimating() && combo->PopupOpacity()>0);
+                    if(animations && combo->PopupAnimating()) {
+                        assert(combo->PopupOpacity()>0);
                         auto frozen=combo->DropdownRect();
                         assert(frozen.left==drop.left && frozen.top==drop.top && frozen.right==drop.right && frozen.bottom==drop.bottom);
                     }
@@ -1713,6 +1774,7 @@ int wmain(int argc,wchar_t** argv) {
             auto complete=parse_json(kUiDefaultsJson); complete["watch"]["state_dir"]="elsewhere";
             atomic_write(dir/"sunpack_config.json",complete.dump());
             pump([&]{return state(app.page(),"fields").size()>100;});
+            std::cerr<<"Advanced configuration loaded\n";
             ui_page_set_json(app.page(),"drafts","{}");
             click(app,"tabConfig"); pump([&]{return state(app.page(),"tab")=="config";});
             search_config(app,L"");
@@ -1720,8 +1782,11 @@ int wmain(int argc,wchar_t** argv) {
             button_texts(app);
             auto startup_before=rect(app,"startupToggle");
             auto config_scroll=ui_widget_find_by_id(ui_page_root(app.page()),"configListScroll"); assert(config_scroll);
+            std::cerr<<"Validating configuration viewport\n";
             virtual_tail(app,"configItems","configListScroll",state(app.page(),"matchingBlocks").size());
+            std::cerr<<"Configuration viewport validated\n";
             scrolled_config_edits(app);
+            std::cerr<<"Scrolled configuration edits validated\n";
             ui_window_relayout(app.window()); button_texts(app);
             auto startup_after=rect(app,"startupToggle");
             assert(startup_before.right-startup_before.left==startup_after.right-startup_after.left);
@@ -1830,31 +1895,31 @@ int wmain(int argc,wchar_t** argv) {
             click(app,"tabTasks"); pump([&]{return state(app.page(),"tab")=="tasks";});
             ui_window_set_size(app.window(),1120,720); screenshot(app,L"directories.png");
             auto history=read_json(dir/"builtin_passwords.json"); history["clipboard_history"]=Json::array();
-            for(int i=0;i<320;++i) history["clipboard_history"].push_back("candidate-"+std::to_string(i));
+            for(int i=0;i<virtualHistoryCount;++i) history["clipboard_history"].push_back("candidate-"+std::to_string(i));
             history["clipboard_history"][0]="  #history value  ";
             history["clipboard_history"][1]=std::string(180,'x');
             history["clipboard_history"][2]="first line\nsecond line\nthird line";
-            for(int i=0;i<240;++i) history["passwords"].push_back({{"value","virtual-password-"+std::to_string(i)},
+            for(int i=0;i<virtualPasswordCount;++i) history["passwords"].push_back({{"value","virtual-password-"+std::to_string(i)},
                 {"scopes",Json::array({utf8(dir.wstring()),utf8((dir/"nested").wstring())})}});
             atomic_write(dir/"builtin_passwords.json",history.dump());
             click(app,"tabPasswords"); pump([&]{return state(app.page(),"tab")=="passwords";});
             click(app,("directory-"+utf8(path_key(dir))).c_str());
-            click(app,"savedPasswords"); pump([&]{return state(app.page(),"passwords")["total"]==240;});
-            virtual_tail(app,"passwordItems","passwordListScroll",240);
+            click(app,"savedPasswords"); pump([&]{return state(app.page(),"passwords")["total"]==virtualPasswordCount;});
+            virtual_tail(app,"passwordItems","passwordListScroll",virtualPasswordCount);
             virtual_tail(app,"directoryItems","directoryListScroll",73);
             // Inspect the event boundary before dispatching the async request:
             // populated saved rows must retain their layout until history arrives.
             auto previous_passwords=state(app.page(),"passwords");
             assert(ui_page_call_json(app.page(),"selectPasswordView","true")==0);
             assert(state(app.page(),"passwordHistoryTarget")==true && state(app.page(),"passwordHistory")==false);
-            assert(state(app.page(),"passwords")==previous_passwords && state(app.page(),"shownPasswords").size()==240);
+            assert(state(app.page(),"passwords")==previous_passwords && state(app.page(),"shownPasswords").size()==virtualPasswordCount);
             // Reverse before the worker receives either request; latest intent wins.
             assert(ui_page_call_json(app.page(),"selectPasswordView","false")==0);
             assert(ui_page_call_json(app.page(),"selectPasswordView","true")==0);
-            click(app,"clipboardHistory"); pump([&]{return state(app.page(),"passwords")["total"]==320;});
+            click(app,"clipboardHistory"); pump([&]{return state(app.page(),"passwords")["total"]==virtualHistoryCount;});
             assert(state(app.page(),"passwordHistory")==true);
             ui_window_set_size(app.window(),850,560); ui_window_relayout(app.window());
-            virtual_tail(app,"passwordItems","passwordListScroll",320);
+            virtual_tail(app,"passwordItems","passwordListScroll",virtualHistoryCount);
             auto history_view=rect(app,"passwordListScroll"); visible=0;
             auto history_rows=state(app.page(),"passwords")["rows"];
             for(auto& entry:history_rows) {

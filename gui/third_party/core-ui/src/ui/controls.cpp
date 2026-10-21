@@ -2,6 +2,7 @@
 #include "event.h"
 #include "asset.h"
 #include "display_list.h"
+#include "debug_trace.h"
 #include "draw_api_context.h"
 #include "measure_context.h"
 #include "renderer.h"
@@ -2540,6 +2541,7 @@ void VirtualListWidget::RefreshViewport() {
 }
 
 void VirtualListWidget::DoLayout() {
+    TraceScope scope("core_controls", "virtual_list_layout_duration");
     RefreshViewport();
     auto* ancestor = Parent();
     while (ancestor && !dynamic_cast<ScrollViewWidget*>(ancestor)) ancestor = ancestor->Parent();
@@ -2551,14 +2553,17 @@ void VirtualListWidget::DoLayout() {
         auto& child = children_[i];
         // A subtree's intrinsic height may change after wrapping at this width.
         // Two local passes settle that row, never the offscreen list.
+        float h = std::max(1.0f, std::clamp(child->SizeHint().height, child->minH, child->maxH));
         for (int pass = 0; pass < 2; ++pass) {
-            float h = std::max(1.0f, std::clamp(child->SizeHint().height, child->minH, child->maxH));
             float y = rect.top + padT + Sum(indices_[i]);
             child->rect = {rect.left + padL, y, rect.right - padR, y + h};
             child->DoLayout();
+            float measured = std::max(1.0f, std::clamp(child->SizeHint().height, child->minH, child->maxH));
+            if (std::abs(measured - h) <= 0.5f) { h = measured; break; }
+            h = measured;
         }
         // Match VBox's min/max constraints for both layout and cached height.
-        float h = std::max(1.0f, std::clamp(child->SizeHint().height, child->minH, child->maxH)) + gap_;
+        h += gap_;
         if (std::abs(h - heights_[indices_[i]]) > 0.5f) {
             MeasureRow(indices_[i], h); changed = true;
         }
@@ -2614,6 +2619,7 @@ D2D1_RECT_F ScrollViewWidget::ThumbRect() const {
 }
 
 void ScrollViewWidget::DoLayout() {
+    TraceScope scope("core_controls", "scroll_layout_duration");
     if (!content_) return;
 
     /* Build 110 (L29 follow-up): 应用 padding 给 content 区域. 之前
@@ -2656,10 +2662,16 @@ void ScrollViewWidget::DoLayout() {
     if (!ScrollAnimating()) scrollPosition_ = scrollY_;
 
     // Final layout with correct scroll offset and width
-    content_->rect = {rect.left + padL, rect.top + padT - scrollY_,
+    const D2D1_RECT_F finalRect = {rect.left + padL, rect.top + padT - scrollY_,
                         rect.left + padL + cw,
                         rect.top + padT - scrollY_ + contentHeight_};
-    content_->DoLayout();
+    // Most resizes/refills keep the same extent. The first pass already
+    // arranged these rows; only a changed allocation needs another layout.
+    const auto previous = content_->rect;
+    content_->rect = finalRect;
+    if (std::abs(previous.left-finalRect.left)>0.01f || std::abs(previous.top-finalRect.top)>0.01f ||
+        std::abs(previous.right-finalRect.right)>0.01f || std::abs(previous.bottom-finalRect.bottom)>0.01f)
+        content_->DoLayout();
 }
 
 void ScrollViewWidget::ApplyScrollDelta_(float oldScrollY) {
@@ -2667,7 +2679,16 @@ void ScrollViewWidget::ApplyScrollDelta_(float oldScrollY) {
     const float dy = -(scrollY_ - oldScrollY);   /* 内容反向移动 */
     if (dy == 0.0f) return;
     ShiftSubtreeRects(content_.get(), 0.0f, dy);
+    const bool layoutWasDirty = ui::LayoutDirtyFlag();
     RefreshVirtualLists(content_.get());
+    // Realization changes only this viewport's content. Its extent and anchor
+    // are owned here, so mounting a row must not remeasure the sidebar and
+    // every other pane twice in the same animation frame. Preserve any prior
+    // page invalidation; unresolved local layout still falls back to the root.
+    if (!layoutWasDirty) for (int pass = 0; pass < 3 && ui::LayoutDirtyFlag(); ++pass) {
+        ui::LayoutDirtyFlag() = false;
+        DoLayout();
+    }
 }
 
 void ScrollViewWidget::CorrectVirtualAnchor(float delta) {

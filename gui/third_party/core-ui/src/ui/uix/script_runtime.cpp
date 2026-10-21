@@ -117,6 +117,7 @@ ScriptRuntime::~ScriptRuntime() {
         if (!JS_IsUndefined(c.cachedValue)) JS_FreeValue(ctx_, c.cachedValue);
     }
     computeds_.clear();
+    ClearTemplateClosures();
 
     JS_FreeValue(ctx_, trapGet_);
     JS_FreeValue(ctx_, trapSet_);
@@ -259,6 +260,30 @@ JSValue ScriptRuntime::CompileHandlerClosure(const std::string& jsExpr,
     return v;
 }
 
+void ScriptRuntime::ClearTemplateClosures() {
+    for (auto& entry : templateClosures_) JS_FreeValue(ctx_, entry.second);
+    templateClosures_.clear();
+    templateSourceBytes_ = 0;
+}
+
+JSValue ScriptRuntime::CompileTemplateClosure(const std::string& source, const std::string& filename) {
+    auto key = filename + '\n' + source;
+    auto found = templateClosures_.find(key);
+    if (found != templateClosures_.end()) {
+        lastError_.clear();
+        return JS_DupValue(ctx_, found->second);
+    }
+    JSValue value = JS_Eval(ctx_, source.c_str(), source.size(), filename.c_str(), JS_EVAL_TYPE_GLOBAL);
+    if (JS_IsException(value)) { CaptureException(ctx_, lastError_); return value; }
+    lastError_.clear();
+    if (key.size() <= 8192) {
+        if (templateClosures_.size() >= 512 || templateSourceBytes_ + key.size() > 131072) ClearTemplateClosures();
+        templateSourceBytes_ += key.size();
+        templateClosures_.emplace(std::move(key), JS_DupValue(ctx_, value));
+    }
+    return value;
+}
+
 JSValue ScriptRuntime::CompileLoopBindingClosure(const std::string& jsExpr,
                                                   const std::string& loopVar,
                                                   const std::string& indexVar,
@@ -273,14 +298,7 @@ JSValue ScriptRuntime::CompileLoopBindingClosure(const std::string& jsExpr,
     src += "){return (";
     src += jsExpr;
     src += ");})";
-    JSValue v = JS_Eval(ctx_, src.c_str(), src.size(),
-                        filename.c_str(), JS_EVAL_TYPE_GLOBAL);
-    if (JS_IsException(v)) {
-        CaptureException(ctx_, lastError_);
-    } else {
-        lastError_.clear();
-    }
-    return v;
+    return CompileTemplateClosure(src, filename);
 }
 
 JSValue ScriptRuntime::CompileLoopHandlerClosure(const std::string& jsExpr,
@@ -298,14 +316,7 @@ JSValue ScriptRuntime::CompileLoopHandlerClosure(const std::string& jsExpr,
     src += "){var __r=(";
     src += jsExpr;
     src += ");if(typeof __r==='function')__r.call(this,$event);})";
-    JSValue v = JS_Eval(ctx_, src.c_str(), src.size(),
-                        filename.c_str(), JS_EVAL_TYPE_GLOBAL);
-    if (JS_IsException(v)) {
-        CaptureException(ctx_, lastError_);
-    } else {
-        lastError_.clear();
-    }
-    return v;
+    return CompileTemplateClosure(src, filename);
 }
 
 JSValue ScriptRuntime::CompileLoopBindingClosure(const std::string& jsExpr,
@@ -324,11 +335,7 @@ JSValue ScriptRuntime::CompileLoopBindingClosure(const std::string& jsExpr,
     src += "){return (";
     src += jsExpr;
     src += ");})";
-    JSValue v = JS_Eval(ctx_, src.c_str(), src.size(),
-                        filename.c_str(), JS_EVAL_TYPE_GLOBAL);
-    if (JS_IsException(v)) CaptureException(ctx_, lastError_);
-    else lastError_.clear();
-    return v;
+    return CompileTemplateClosure(src, filename);
 }
 
 JSValue ScriptRuntime::CompileLoopHandlerClosure(const std::string& jsExpr,
@@ -350,11 +357,7 @@ JSValue ScriptRuntime::CompileLoopHandlerClosure(const std::string& jsExpr,
     src += "){var __r=(";
     src += jsExpr;
     src += ");if(typeof __r==='function')__r.call(this,$event);})";
-    JSValue v = JS_Eval(ctx_, src.c_str(), src.size(),
-                        filename.c_str(), JS_EVAL_TYPE_GLOBAL);
-    if (JS_IsException(v)) CaptureException(ctx_, lastError_);
-    else lastError_.clear();
-    return v;
+    return CompileTemplateClosure(src, filename);
 }
 
 JSValue ScriptRuntime::MakeReactive(JSValueConst target) {

@@ -564,8 +564,16 @@ void Application::handle_command(Json command) {
     auto p=command.value("payload",Json::object());
     if(op=="navigate") { navigate(p.value("tab",std::string())); return; }
     if(op=="scrollTop" || op=="animateView") {
+        if(p.contains("category") && page_value(page_,"configCategory")==p["category"]) return;
         if(p.value("id",std::string())=="configBlocks") date_popup_.reset();
         const auto id=p.value("id",std::string());
+        if(id=="configBlocks" && p.contains("category")) {
+            // Commit category, viewport and entrance in the dispatch transaction.
+            // Publishing from the click handler paints the new page once at
+            // full opacity before this posted command can start its entrance.
+            motion::finish(window_,id.c_str());
+            set_text(page_,"configCategory",p.at("category").get<std::string>());
+        }
         const char* scroll=id=="configBlocks"?"configListScroll":id=="directoryItems"?"directoryListScroll":id=="listItems"?"listScroll":nullptr;
         if(scroll) {
             auto widget=ui_widget_find_by_id(ui_page_root(page_),scroll);
@@ -681,7 +689,8 @@ void Application::handle_command(Json command) {
 }
 void Application::finish_date_popup(UINT_PTR generation) {
     if(!date_popup_ || generation!=date_generation_) return;
-    if(date_popup_->cancelled()) { date_popup_.reset(); return; }
+    if(date_popup_->closed()) { date_popup_.reset(); return; }
+    if(date_popup_->cancelled()) return;
     if(!date_popup_->confirming()) return;
     try {
         auto id=date_popup_->field, side=date_popup_->side, value=date_popup_->value();
@@ -693,8 +702,8 @@ void Application::finish_date_popup(UINT_PTR generation) {
         auto module=range_configuration(form,true,date_popup_->zone());
         auto utc=module.at(side=="lower"?"start_utc":"end_utc");
         auto reply=Json{{"id",id},{"side",side},{"value",value},{"utc",utc}}.dump();
-        date_popup_.reset();
         if(ui_page_call_json(page_,"pickedRange",reply.c_str())!=0) throw std::runtime_error("uiBindingFailed");
+        date_popup_->close();
     } catch(const std::exception& e) {
         if(date_popup_) date_popup_->error(e.what());
         else throw;
@@ -706,8 +715,10 @@ LRESULT CALLBACK Application::subclass(HWND hwnd,UINT message,WPARAM wparam,LPAR
         if(message==DateResult) { self->finish_date_popup(wparam); return 0; }
         if(message==WM_CLOSE || message==WM_LBUTTONDOWN || message==WM_RBUTTONDOWN || message==WM_NCLBUTTONDOWN ||
            message==WM_MOUSEWHEEL || message==WM_MOUSEHWHEEL || message==WM_MOVE || message==WM_SIZE ||
-           message==WM_DPICHANGED || message==WM_DISPLAYCHANGE || message==WM_TIMECHANGE || message==WM_SETTINGCHANGE)
-            self->date_popup_.reset();
+           message==WM_DPICHANGED || message==WM_DISPLAYCHANGE || message==WM_TIMECHANGE || message==WM_SETTINGCHANGE) {
+            if(message==WM_CLOSE) self->date_popup_.reset();
+            else if(self->date_popup_) self->date_popup_->close();
+        }
         if((message==WM_MOUSEWHEEL || message==WM_MOUSEHWHEEL || message==WM_KILLFOCUS) && !self->choosing_directory_ &&
            (page_value(self->page_,"passwordCell")!="" || page_value(self->page_,"rootCell")!="")) {
             ui_window_focus_widget(self->window_,0);
