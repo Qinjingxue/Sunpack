@@ -40,6 +40,10 @@ fn native_available() -> bool {
 #[pymodule]
 fn sunpack_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(native_available, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        io::resource_lifecycle::read_shared_utf8_text,
+        m
+    )?)?;
     m.add_function(wrap_pyfunction!(path_keys::path_key, m)?)?;
     m.add_function(wrap_pyfunction!(fast_hash::fast_hash64, m)?)?;
     m.add_function(wrap_pyfunction!(fast_hash::fast_hash128, m)?)?;

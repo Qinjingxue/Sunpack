@@ -47,7 +47,7 @@ export default {
       let extra=this.passwordNew.filter(p=>p.scope===this.passwordRoot&&!ids.has(p.id)),rows=extra.length?extra.concat(saved):saved;
       for(let id of Object.keys(this.passwordDrafts)) {
         let d=this.passwordDrafts[id];
-        if(d.scope===this.passwordRoot&&!ids.has(id)&&!extra.some(p=>p.id===id)&&(d.pending||d.error||this.passwordCell===id)) rows=rows.concat([d]);
+        if((d.original||d.historyValue===undefined)&&d.scope===this.passwordRoot&&!ids.has(id)&&!extra.some(p=>p.id===id)&&(d.pending||d.error||this.passwordCell===id)) rows=rows.concat([d]);
       }
       return rows;
     },
@@ -185,7 +185,7 @@ export default {
         let byId=new Map(snapshot.rows.map(p=>[p.id,p])),rows=[];
         for(let id of Object.keys(this.passwordDrafts)) {
           let d=this.passwordDrafts[id];
-          if(d.scope===this.passwordRoot&&!byId.has(id)&&!d.original&&(d.pending||d.error||this.passwordCell===id)) byId.set(id,d);
+          if(d.historyValue===undefined&&d.scope===this.passwordRoot&&!byId.has(id)&&!d.original&&(d.pending||d.error||this.passwordCell===id)) byId.set(id,d);
         }
         for(let previous of order) if(byId.has(previous.id)) {
           let current=byId.get(previous.id); byId.delete(previous.id);

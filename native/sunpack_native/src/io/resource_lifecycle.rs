@@ -161,6 +161,20 @@ impl Drop for TrackedFile {
     }
 }
 
+/// Read one UTF-8 snapshot without blocking an atomic replacement of its path.
+#[pyfunction]
+pub(crate) fn read_shared_utf8_text(py: Python<'_>, path: PathBuf) -> PyResult<String> {
+    Ok(py.detach(move || -> io::Result<String> {
+        let mut file = TrackedFile::open_reader(path, "shared_text")?;
+        let mut text = String::new();
+        file.file_mut().read_to_string(&mut text)?;
+        if text.starts_with('\u{feff}') {
+            text.drain(..3);
+        }
+        Ok(text)
+    })?)
+}
+
 impl NativeResourceGuard {
     #[track_caller]
     pub(crate) fn register(

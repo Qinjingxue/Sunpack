@@ -1,5 +1,7 @@
 """Cross-language file identity and tray launch contracts, absent from C++ tests."""
 import os
+import ctypes
+from ctypes import wintypes
 import platform
 import subprocess
 import json
@@ -30,8 +32,21 @@ def test_native_edit_preserves_python_clipboard_update_under_same_mutex(tmp_path
     if not binary.is_file():
         pytest.skip("Build the native GUI with scripts/build_gui.ps1")
     path = tmp_path / "builtin_passwords.json"
-    path.write_text(json.dumps({"passwords": [{"value": "initial"}], "clipboard_history": []}), encoding="utf-8")
+    path.write_text(json.dumps({"passwords": [{"value": "initial"}], "clipboard_history": []}), encoding="utf-8-sig")
     monkeypatch.setattr(builtin, "builtin_password_path", lambda: path)
+    # ReplaceFile holds DELETE access. A concurrent reader must share DELETE,
+    # even though it only reads. Ordinary Python open deterministically fails here.
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                                   wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    handle = kernel32.CreateFileW(str(path), 0x80010000, 7, None, 3, 0, None)
+    assert handle != wintypes.HANDLE(-1).value
+    try:
+        assert builtin.read_builtin_password_file(path).global_passwords == ("initial",)
+    finally:
+        kernel32.CloseHandle(handle)
     with file_mutex(path):
         process = subprocess.Popen([str(binary), "--password-add", str(path), " GUI # 中文 "], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         assert builtin.merge_watch_clipboard_passwords(["后台新密码"])
@@ -39,6 +54,9 @@ def test_native_edit_preserves_python_clipboard_update_under_same_mutex(tmp_path
     assert process.returncode == 0, (stdout, stderr)
     document = json.loads(path.read_text(encoding="utf-8"))
     assert document == {"passwords": [{"value": "initial"}, {"value": " GUI # 中文 "}], "clipboard_history": ["后台新密码"]}
+    assert builtin.read_builtin_password_file(path).global_passwords == ("initial", " GUI # 中文 ", "后台新密码")
+    from sunpack_native import native_resource_snapshot
+    assert native_resource_snapshot([str(tmp_path)]) == []
 
 
 def test_packaged_manager_launch_releases_native_process_handle(tmp_path, monkeypatch):

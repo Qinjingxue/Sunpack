@@ -191,11 +191,11 @@ sys.exit(0 if builtin.merge_watch_clipboard_passwords([sys.argv[2]], max_entries
     assert doc["passwords"] == original_records
     assert set(doc["clipboard_history"]) == {f"clip-{i}" for i in range(4)}
     reads = []
-    read = builtin.read_task_text
+    read = builtin.read_shared_utf8_text
     def count_read(*args, **kwargs):
         reads.append(args[0])
         return read(*args, **kwargs)
-    monkeypatch.setattr(builtin, "read_task_text", count_read)
+    monkeypatch.setattr(builtin, "read_shared_utf8_text", count_read)
     assert builtin.merge_watch_clipboard_passwords(["last", "last"], max_entries=2)
     assert reads == [path]
     doc = json.loads(path.read_text(encoding="utf-8"))

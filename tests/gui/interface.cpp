@@ -2084,6 +2084,31 @@ int wmain(int argc,wchar_t** argv) {
             }
             screenshot(app,L"clipboard-history-small.png");
             button_texts(app);
+            auto reject_history_save=[&] {
+                auto path=dir/"builtin_passwords.json";
+                auto before=read_file(path);
+                std::string failed_id;
+                {
+                    Handle held(CreateFileW(path.c_str(),GENERIC_READ,FILE_SHARE_READ,nullptr,OPEN_EXISTING,0,nullptr));
+                    assert(held.value!=INVALID_HANDLE_VALUE);
+                    click(app,"save-history-0");
+                    pump([&] {
+                        auto drafts=state(app.page(),"passwordDrafts");
+                        for(auto& draft:drafts.items()) {
+                            auto& d=draft.value();
+                            if(d.value("historyValue",std::string())==history["clipboard_history"][0] &&
+                               !d["pending"].get<bool>() && !d["error"].empty()) failed_id=draft.key();
+                        }
+                        return !failed_id.empty() && state(app.page(),"saving")==false;
+                    },"Rejected history save");
+                    assert(read_file(path)==before);
+                }
+                click(app,"savedPasswords"); pump([&]{return state(app.page(),"passwordHistory")==false;});
+                for(auto& row:state(app.page(),"shownPasswords")) assert(row["id"]!=failed_id);
+                click(app,"clipboardHistory"); pump([&]{return state(app.page(),"passwordHistory")==true;});
+                assert(!state(app.page(),"passwordDrafts")[failed_id]["error"].empty());
+            };
+            reject_history_save();
             for(int i:{0,1,2}) {
                 click(app,("save-history-"+std::to_string(i)).c_str()); finish_input(app);
                 assert(state(app.page(),"passwordHistory")==true && state(app.page(),"passwordCell")=="");
@@ -2097,6 +2122,7 @@ int wmain(int argc,wchar_t** argv) {
             assert(state(app.page(),"passwordHistory")==true && state(app.page(),"passwordRoot")=="");
             assert(rendered_widget(app,"save-history-0")["text"]==state(app.page(),"texts")["saveHistoryGlobally"]);
             button_texts(app);
+            reject_history_save();
             click(app,"save-history-0"); finish_input(app);
             click(app,"save-history-0"); finish_input(app);
             auto history_global=read_json(dir/"builtin_passwords.json"); size_t history_matches=0;

@@ -113,8 +113,8 @@
       "en": "Paste one or more folders"
     },
     "rootOutputHint": {
-      "zh": "默认输出目录",
-      "en": "Default output folder"
+      "zh": "同监控目录",
+      "en": "Same as monitored folder"
     },
     "searchDirectory": {
       "zh": "搜索目录",

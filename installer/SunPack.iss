@@ -38,6 +38,7 @@ RestartApplications=no
 UsePreviousAppDir=yes
 UsePreviousTasks=yes
 UsedUserAreasWarning=no
+MinVersion=10.0.16299
 
 #if TargetArch == "arm64"
 ArchitecturesAllowed=arm64

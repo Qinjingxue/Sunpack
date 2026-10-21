@@ -10,10 +10,10 @@ import uuid
 from threading import RLock
 from pathlib import Path
 from types import MappingProxyType
-from sunpack_native import file_generation_tokens
+from sunpack_native import file_generation_tokens, read_shared_utf8_text
 
 from sunpack.core.platform.windows.file_mutex import file_mutex
-from sunpack.core.support.resource_lifecycle import open_service_file, read_task_text, write_task_text
+from sunpack.core.support.resource_lifecycle import open_service_file, write_task_text
 from sunpack.core.support.resources import get_resource_path
 from sunpack.core.passwords.internal.store import PasswordSnapshot, EMPTY_PASSWORD_SNAPSHOT, password_scope_key
 
@@ -168,7 +168,7 @@ def _parse_document(text: str, previous: PasswordSnapshot = EMPTY_PASSWORD_SNAPS
 
 
 def read_builtin_password_file(path: str | Path, previous=EMPTY_PASSWORD_SNAPSHOT) -> PasswordSnapshot:
-    return _parse_document(read_task_text(path, encoding="utf-8-sig"), previous)[0]
+    return _parse_document(read_shared_utf8_text(path), previous)[0]
 
 
 class PasswordFileSource:
@@ -223,7 +223,7 @@ def merge_watch_clipboard_passwords(passwords: list[str], *, max_entries: int = 
     temp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     try:
         with file_mutex(path):
-            original = read_task_text(path, encoding="utf-8-sig")
+            original = read_shared_utf8_text(path)
             _, history, bounds = _parse_document(original, build_index=False)
             updated = list(dict.fromkeys(history))
             for value in dict.fromkeys(passwords):

@@ -968,11 +968,11 @@ def test_cli_password_snapshot_hot_updates_without_watch_or_request_io(tmp_path,
             return updated
         monkeypatch.setattr(source, "reload", observed_reload)
         reads = []
-        read = builtin.read_task_text
+        read = builtin.read_shared_utf8_text
         def record(*args, **kwargs):
             reads.append(args[0])
             return read(*args, **kwargs)
-        monkeypatch.setattr(builtin, "read_task_text", record)
+        monkeypatch.setattr(builtin, "read_shared_utf8_text", record)
         try:
             pinned = persistent_runtime.load_request_config()["password_snapshot"]
             persistent_runtime.load_request_config()
