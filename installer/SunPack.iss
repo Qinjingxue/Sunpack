@@ -521,6 +521,42 @@ begin
     Result := AddBackslash(ExistingApplicationDirectory) + 'sunpack.exe';
 end;
 
+function QueryExistingWatchRunning: Boolean;
+var
+  ExistingApp, Command, Parameters: string;
+  ResultCode: Integer;
+begin
+  Result := False;
+  ExistingApp := ExistingLauncherPath;
+  if not FileExists(ExistingApp) then
+    Exit;
+
+  Command :=
+    '$ErrorActionPreference = ''Stop''; ' +
+    'try { ' +
+    '  $json = (& ' + PowerShellSingleQuotedString(ExistingApp) + ' watch status --json 2>$null | Out-String); ' +
+    '  if ($LASTEXITCODE -ne 0) { exit 2 }; ' +
+    '  $status = $json | ConvertFrom-Json; ' +
+    '  if ($status.summary.running -isnot [bool]) { exit 2 }; ' +
+    '  if ($status.summary.running) { exit 0 }; ' +
+    '  exit 1; ' +
+    '} catch { exit 2 }';
+  Parameters := '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ' + AddQuotes(Command);
+  ResultCode := -1;
+  if not Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+              Parameters, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+    Log('Failed to query the existing SunPack Watch state before upgrade.')
+  else if ResultCode = 0 then
+  begin
+    Result := True;
+    Log('Existing SunPack Watch is running and will be restored after upgrade.');
+  end
+  else if ResultCode = 1 then
+    Log('Existing SunPack Watch is not running; upgrade will leave it stopped.')
+  else
+    Log(Format('Existing SunPack Watch state query failed with exit code %d; upgrade will not auto-start Watch.', [ResultCode]));
+end;
+
 function RunContextMenuScript(RegisterMenu: Boolean): Boolean;
 var
   PowerShellPath: string;
@@ -668,6 +704,33 @@ end;
 
 var
   StartupTaskDefaultApplied: Boolean;
+  ExistingWatchStateCaptured: Boolean;
+  RestartWatchAfterUpgrade: Boolean;
+
+procedure RestoreWatchAfterUpgrade;
+var
+  ResultCode: Integer;
+begin
+  if not RestartWatchAfterUpgrade then
+    Exit;
+
+  if not Exec(
+    ExpandConstant('{app}\sunpack-runtime.exe'),
+    '--launch-watch-unelevated',
+    ExpandConstant('{app}'),
+    SW_HIDE,
+    ewWaitUntilTerminated,
+    ResultCode
+  ) then
+    Log('Failed to run the unelevated SunPack Watch restore helper after upgrade.')
+  else if ResultCode <> 0 then
+    Log(Format('SunPack Watch restore helper exited with code %d.', [ResultCode]))
+  else
+  begin
+    RestartWatchAfterUpgrade := False;
+    Log('SunPack Watch was restored after upgrade.');
+  end;
+end;
 
 procedure ApplyStartupTaskDefault;
 var
@@ -733,6 +796,12 @@ end;
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
   ApplyStartupTaskDefault;
+  { PrepareToInstall can be retried after Watch has already been stopped. }
+  if not ExistingWatchStateCaptured then
+  begin
+    RestartWatchAfterUpgrade := QueryExistingWatchRunning;
+    ExistingWatchStateCaptured := True;
+  end;
   if not StopExistingProcessesAndWait then
   begin
     Result := CustomMessage('PrepareRuntimeRunning');
@@ -807,6 +876,7 @@ begin
         RaiseException(CustomMessage('TaskAddToPathFailed'));
     end;
     ApplySelectedStartupState;
+    RestoreWatchAfterUpgrade;
   end;
 end;
 

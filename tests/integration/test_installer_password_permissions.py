@@ -209,8 +209,13 @@ const
   PathMarkerName = 'PathAddedByInstaller';
 var
   StopStage: Integer;
+  ExistingWatchStateCaptured, RestartWatchAfterUpgrade: Boolean;
 procedure ApplyStartupTaskDefault;
 begin
+end;
+function QueryExistingWatchRunning: Boolean;
+begin
+  Result := False;
 end;
 function StopExistingProcessesAndWait: Boolean;
 begin
