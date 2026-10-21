@@ -24,7 +24,7 @@ class Application {
     std::condition_variable cv_;
     std::deque<Json> commands_;
     Json pending_ = Json::object();
-    bool notified_ = false, stopping_ = false;
+    bool notified_ = false, stopping_ = false, choosing_directory_ = false;
     unsigned dirty_ = 15;
     std::thread worker_, registry_;
     struct ControlBinding { Application* owner; Json field; };
@@ -33,7 +33,6 @@ class Application {
     UiWidget status_widget_ = 0;
     void bind_controls(const Json& fields);
     void sync_toggles();
-    void reveal_form();
     void rebuild_theme(const std::string& language);
     void navigate(const std::string& tab);
     void work();

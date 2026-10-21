@@ -140,7 +140,7 @@ void settle_motion(Application& app) {
             if(widget->opacity<0.999f || std::abs(widget->animationX)>0.01f) { pending.push_back({widget->id,widget->opacity,widget->animationX}); return false; }
             if(widget->id=="navIndicator") {
                 auto tab=state(app.page(),"tab").get<std::string>();
-                auto* target=root->FindById(tab=="tasks"?"tabTasks":tab=="config"?"tabConfig":"tabPasswords");
+                auto* target=root->FindById(tab=="tasks"?"tabTasks":tab=="config"?"tabConfig":tab=="roots"?"tabRoots":"tabPasswords");
                 if(std::abs(widget->rect.top+widget->animationY+(widget->rect.bottom-widget->rect.top)/2-(target->rect.top+target->rect.bottom)/2)>0.01f) { pending.push_back({widget->id,widget->rect.top,widget->animationY,target->rect.top,target->rect.bottom}); return false; }
             } else if(std::abs(widget->animationY)>0.01f) { pending.push_back({widget->id,widget->animationY}); return false; }
             for(auto& child:widget->Children()) if(!settled(child.get())) return false;
@@ -185,7 +185,7 @@ void click(Application& app,const char* id) {
     auto clicked=ui_debug_click(app.window(),widget);
     if(clicked!=0) {
         std::cerr<<"Click failed: "<<id<<" "<<rendered_widget(app,id)<<'\n';
-        for(auto key:{"taskRoot","chosenDirectory","rootEditor","rootDirty","rootOriginal","listTarget","saveErrors"}) std::cerr<<key<<"="<<state(app.page(),key)<<'\n';
+        for(auto key:{"taskRoot","chosenDirectory","rootCell","rootPart","rootDrafts","listTarget","saveErrors"}) std::cerr<<key<<"="<<state(app.page(),key)<<'\n';
     }
     assert(clicked==0);
     ui_widget_destroy(widget);
@@ -208,6 +208,18 @@ void edit_password(Application& app,const std::string& id,const wchar_t* value) 
     assert(ui_debug_key_mod(app.window(),'A',1,0,0)==0);
     assert(ui_debug_type_char(app.window(),8)==0);
     assert(ui_debug_type_text(app.window(),value)==0);
+}
+std::string root_row_id(Application& app,const fs::path& path) {
+    for(auto& r:state(app.page(),"rootRows")) if(path_key(wide(r["input"].get<std::string>()))==path_key(path)) return r["id"].get<std::string>();
+    throw std::runtime_error("Root row missing: "+utf8(path.wstring()));
+}
+void edit_root_cell(Application& app,const std::string& id,const char* part,const wchar_t* value) {
+    click(app,("root-"+std::string(part)+"-text-"+id).c_str());
+    auto input="root-"+std::string(part)+"-input-"+id;
+    pump([&]{auto* focused=ui::GetContext().GetWindow(app.window())->FocusedWidget();return focused&&focused->id==input;},"Root cell focus");
+    assert(ui_debug_key_mod(app.window(),'A',1,0,0)==0);
+    assert(ui_debug_type_char(app.window(),8)==0);
+    if(*value) assert(ui_debug_type_text(app.window(),value)==0);
 }
 void paste_password(Application& app,const wchar_t* value) {
     // Exercise the actual Ctrl+V path, including its single multi-line input
@@ -367,7 +379,8 @@ void virtual_tail(Application& app,const char* list_id,const char* scroll_id,siz
             const char* data_key=!std::strcmp(list_id,"configItems")?"fields":
                 !std::strcmp(list_id,"listItems")?"listRows":
                 !std::strcmp(list_id,"directoryItems")?"directories":
-                !std::strcmp(list_id,"passwordItems")?"passwords":"tasks";
+                !std::strcmp(list_id,"passwordItems")?"passwords":
+                !std::strcmp(list_id,"rootItems")?"rootRows":"tasks";
             auto replacement=state(app.page(),data_key).dump();
             assert(ui_page_set_json(app.page(),data_key,replacement.c_str())==0);
             ui_window_relayout(app.window());
@@ -1184,27 +1197,47 @@ int wmain(int argc,wchar_t** argv) {
             // never join another field or record's automatic write.
             auto pending_root=dir/L"pending-root", pending_second=dir/L"pending-second"; fs::create_directory(pending_root); fs::create_directory(pending_second);
             auto disk_roots=read_file(dir/"sunpack_watch_roots.txt");
-            click(app,"tabTasks"); pump([&]{return state(app.page(),"tab")=="tasks";});
-            click(app,"newRoot");
-            assert(rendered_widget(app,"directoryPane").value("visible",true));
-            click(app,"manageRoots"); import_entries(app,(pending_root.wstring()+L"\n"+pending_second.wstring()+L"\n"+pending_root.wstring()).c_str()); click(app,"saveList");
+            click(app,"tabRoots"); pump([&]{return state(app.page(),"tab")=="roots";});
+            click(app,"addRoot");
+            auto new_root_id=state(app.page(),"rootCell").get<std::string>();
+            pump([&]{auto* focused=ui::GetContext().GetWindow(app.window())->FocusedWidget();return focused&&focused->id=="root-input-input-"+new_root_id;});
+            paste_password(app,(pending_root.wstring()+L"\n"+pending_second.wstring()+L"\n"+pending_root.wstring()).c_str());
+            finish_input(app);
             button_texts(app); screenshot(app,L"root-inline-batch-small.png");
-            click(app,"finishRoot");
-            auto root_request=state(app.page(),"requests"); finish_input(app);
-            if(state(app.page(),"rootEditor")==true) {
-                std::cerr<<"Root creation remained open: request="<<root_request<<'\n';
-                for(auto key:{"rootInput","rootOutput","rootPaths","rootBaseline","rootSession","rootDirty"}) std::cerr<<key<<"="<<state(app.page(),key)<<'\n';
-            }
-            assert(state(app.page(),"rootEditor")==false);
+            assert(state(app.page(),"rootCell")=="");
+            assert(state(app.page(),"rootRows").size()==3 && state(app.page(),"rootDrafts").empty());
+            for(auto& entry:read_roots(dir/"sunpack_watch_roots.txt").entries)
+                if(entry.input==pending_root || entry.input==pending_second) assert(entry.output==utf8(entry.input.wstring()));
             assert(read_file(dir/"sunpack_watch_roots.txt")!=disk_roots);
+            auto first_root_id=root_row_id(app,pending_root),second_root_id=root_row_id(app,pending_second);
+            edit_root_cell(app,first_root_id,"output",L"");
+            paste_password(app,L"batch-output-a\nbatch-output-b"); finish_input(app);
+            for(auto& entry:read_roots(dir/"sunpack_watch_roots.txt").entries) {
+                if(entry.input==pending_root) assert(entry.output=="batch-output-a");
+                if(entry.input==pending_second) assert(entry.output=="batch-output-b");
+            }
+            {
+                FileMutex hold(dir/"sunpack_watch_roots.txt",L"SunPackWatchRoots");
+                edit_root_cell(app,first_root_id,"output",L"receipt");
+                assert(ui_debug_key(app.window(),VK_RETURN)==0); ui_debug_pump();
+                edit_root_cell(app,first_root_id,"output",L"receipt latest");
+            }
+            pump([&]{return !state(app.page(),"saving").get<bool>();},"Root receipt while editing");
+            assert(state(app.page(),"rootDrafts")[first_root_id]["output"]=="receipt latest");
+            auto root_display=rect(app,"root-output-value-"+first_root_id);
+            auto root_input_bounds=rect(app,"root-output-input-"+first_root_id);
+            assert(root_display.top==root_input_bounds.top && root_display.bottom==root_input_bounds.bottom);
+            auto* root_editor=dynamic_cast<ui::TextInputWidget*>(ui::GetContext().GetWindow(app.window())->Root()->FindById("root-output-input-"+first_root_id));
+            assert(root_editor && root_editor->focused && !ui::ShowFocusRing());
+            click(app,("root-output-text-"+second_root_id).c_str());
+            pump([&]{auto* focused=ui::GetContext().GetWindow(app.window())->FocusedWidget();return focused&&focused->id=="root-output-input-"+second_root_id;}); finish_input(app);
+            assert(root_row_id(app,pending_root)==first_root_id && root_row_id(app,pending_second)==second_root_id);
+            if(!state(app.page(),"rootDrafts").empty()) std::cerr<<"Root drafts: "<<state(app.page(),"rootDrafts")<<"; cell="<<state(app.page(),"rootCell")<<'\n';
+            assert(state(app.page(),"rootDrafts").empty());
             click(app,"tabPasswords"); pump([&]{return state(app.page(),"tab")=="passwords";});
             assert(rendered_widget(app,"directoryPane").value("visible",true));
-            for(const char* action:{"newRoot","editSelectedRoot","deleteSelectedRoot"}) {
-                auto* control=ui::GetContext().GetWindow(app.window())->Root()->FindById(action); assert(control);
-                bool visible=true;
-                for(auto* parent=control;parent;parent=parent->Parent()) if(!parent->visible) { visible=false; break; }
-                assert(!visible);
-            }
+            for(const char* action:{"newRoot","editSelectedRoot","deleteSelectedRoot","rootForm","manageRoots"})
+                assert(!ui::GetContext().GetWindow(app.window())->Root()->FindById(action));
             auto choose_password_root=[&](const fs::path& path,size_t count) {
                 click(app,path.empty()?"allRoots":("directory-"+utf8(path_key(path))).c_str());
                 auto selected=path.empty()?std::string("@all"):utf8(path.wstring());
@@ -1400,35 +1433,37 @@ int wmain(int argc,wchar_t** argv) {
             screenshot(app,L"passwords-unified.png");
             click(app,"tabTasks"); pump([&]{return state(app.page(),"tab")=="tasks";});
             click(app,("directory-"+utf8(path_key(pending_second))).c_str());
-            auto edit_root_bounds=rect(app,"editSelectedRoot"), delete_root_bounds=rect(app,"deleteSelectedRoot");
-            assert(edit_root_bounds.top==delete_root_bounds.top && edit_root_bounds.bottom==delete_root_bounds.bottom);
+            for(const char* action:{"newRoot","editSelectedRoot","deleteSelectedRoot","rootForm"})
+                assert(!ui_widget_find_by_id(ui_page_root(app.page()),action));
+            click(app,"tabRoots"); pump([&]{return state(app.page(),"tab")=="roots";});
             button_texts(app);
-            click(app,"deleteSelectedRoot"); finish_input(app);
+            click(app,("delete-root-"+root_row_id(app,pending_second)).c_str()); finish_input(app);
             assert(state(app.page(),"taskRoot")=="");
             assert(read_roots(dir/"sunpack_watch_roots.txt").entries.size()==2);
             assert(fs::is_directory(pending_second));
+            click(app,"tabTasks"); pump([&]{return state(app.page(),"tab")=="tasks";});
             click(app,("directory-"+utf8(path_key(pending_root))).c_str());
             pump([&]{return state(app.page(),"taskRoot")==utf8(pending_root.wstring());});
-            click(app,"editSelectedRoot"); ui_debug_pump();
-            click(app,"rootOutput"); ui_debug_type_text(app.window(),L"automatic-output");
-            click(app,"finishRoot");
+            click(app,"tabRoots"); pump([&]{return state(app.page(),"tab")=="roots";});
+            auto root_edit_id=root_row_id(app,pending_root);
+            edit_root_cell(app,root_edit_id,"output",L"automatic-output");
+            assert(ui_debug_key(app.window(),VK_RETURN)==0);
             finish_input(app);
-            auto deep=ui_widget_find_by_id(ui_page_root(app.page()),"rootDeepToggle"); assert(deep);
+            auto deep=ui_widget_find_by_id(ui_page_root(app.page()),("root-deep-"+root_edit_id).c_str()); assert(deep);
             assert(ui_debug_toggle_set(app.window(),deep,1)==0); ui_widget_destroy(deep);
-            click(app,"finishRoot");
             finish_input(app);
-            assert(state(app.page(),"rootEditor")==true);
+            assert(root_row_id(app,pending_root)==root_edit_id && state(app.page(),"rootCell")=="");
             bool updated=false;
             auto root_snapshot=read_roots(dir/"sunpack_watch_roots.txt");
             for(auto& entry:root_snapshot.entries)
                 if(path_key(entry.input)==path_key(pending_root)) { updated=entry.output=="automatic-output" && entry.deep; }
             assert(updated);
-            click(app,"deleteSelectedRoot"); finish_input(app);
-            assert(state(app.page(),"rootEditor")==false);
+            click(app,("delete-root-"+root_edit_id).c_str()); finish_input(app);
             assert(read_roots(dir/"sunpack_watch_roots.txt").entries.size()==1);
             assert(fs::is_directory(pending_root));
             pump([&]{return state(app.page(),"taskRoot")=="";});
 
+            click(app,"tabTasks"); pump([&]{return state(app.page(),"tab")=="tasks";});
             auto main=utf8((dir/"carrier.001").wstring()), sibling=utf8((dir/"disguised.blob").wstring());
             atomic_write(dir/".sunpack_watch"/"events.jsonl",
                 Json{{"event","pipeline_sources_claimed"},{"path",sibling},{"groups",Json::array({
@@ -1517,14 +1552,9 @@ int wmain(int argc,wchar_t** argv) {
             ui_window_relayout(app.window());
             auto list_rect=rect(app,"directoryListScroll");
             screenshot(app,L"directories-small.png");
-            assert(list_rect.bottom-list_rect.top>=132);
-            auto button_before=rect(app,"newRoot");
             auto list=ui_widget_find_by_id(ui_page_root(app.page()),"directoryListScroll");
             assert(ui_debug_scroll_set(list,100000)==0); ui_widget_destroy(list); ui_window_relayout(app.window());
-            auto button_after=rect(app,"newRoot");
-            assert(button_before.left==button_after.left && button_before.right==button_after.right && button_before.top==button_after.top);
-            auto button_info=rendered_widget(app,"newRoot");
-            assert(button_info["textWidth"].get<float>()<=button_info["availWidth"].get<float>());
+            assert(!ui_widget_find_by_id(ui_page_root(app.page()),"newRoot"));
             virtual_tail(app,"directoryItems","directoryListScroll",73);
             assert(!ui_widget_find_by_id(ui_page_root(app.page()),"moreDirectories"));
             list=ui_widget_find_by_id(ui_page_root(app.page()),"directoryListScroll");
@@ -1534,7 +1564,9 @@ int wmain(int argc,wchar_t** argv) {
                 auto handle=ui_widget_find_by_id(ui_page_root(app.page()),("directory-"+directory["id"].get<std::string>()).c_str());
                 if(!handle) continue;
                 auto bounds=ui_widget_get_rect(handle); ui_widget_destroy(handle);
-                if(bounds.top>=list_rect.top && bounds.bottom<=list_rect.bottom) ++visible;
+                // Fractional DPI can put a fully visible bottom edge a few
+                // float units beyond the viewport after flex division.
+                if(bounds.top>=list_rect.top-0.5f && bounds.bottom<=list_rect.bottom+0.5f) ++visible;
             }
             // Padded two-line directory cards still leave two complete rows
             // in the minimum window, instead of squeezing text into 32 px.
@@ -1550,11 +1582,20 @@ int wmain(int argc,wchar_t** argv) {
                 assert(bounds[3].get<float>()-copy[3].get<float>()>=7);
             }
             screenshot(app,L"directories-small.png");
-            click(app,"editSelectedRoot");
-            assert(state(app.page(),"rootInput")==first["path"]);
-            click(app,"closeRootEditor"); click(app,"allRoots");
-            click(app,"newRoot"); assert(state(app.page(),"rootEditor")==true);
-            click(app,"closeRootEditor");
+            click(app,"allRoots");
+            click(app,"tabRoots"); pump([&]{return state(app.page(),"tab")=="roots";});
+            auto root_header_before=rect(app,"rootTableHeader");
+            virtual_tail(app,"rootItems","rootListScroll",73);
+            auto root_header_after=rect(app,"rootTableHeader");
+            assert(root_header_before.top==root_header_after.top && root_header_before.bottom==root_header_after.bottom);
+            screenshot(app,L"roots-table-small.png");
+            auto roots_before_blank=read_file(dir/"sunpack_watch_roots.txt");
+            click(app,"addRoot");
+            pump([&]{auto* focused=ui::GetContext().GetWindow(app.window())->FocusedWidget();return focused&&focused->id=="root-input-input-"+state(app.page(),"rootCell").get<std::string>();});
+            click(app,"rootSearch"); finish_input(app);
+            assert(state(app.page(),"rootNew").empty() && state(app.page(),"rootDrafts").empty());
+            assert(read_file(dir/"sunpack_watch_roots.txt")==roots_before_blank);
+            click(app,"tabTasks"); pump([&]{return state(app.page(),"tab")=="tasks";});
             ui_window_set_size(app.window(),1120,720); screenshot(app,L"directories.png");
             auto history=read_json(dir/"builtin_passwords.json"); history["clipboard_history"]=Json::array();
             for(int i=0;i<320;++i) history["clipboard_history"].push_back("candidate-"+std::to_string(i));

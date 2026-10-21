@@ -181,11 +181,18 @@ StartupInfo read_startup() {
     if (rc != ERROR_SUCCESS && rc != ERROR_FILE_NOT_FOUND) { SetLastError(rc); win_error("opReadStartupValue"); }
     return result;
 }
-fs::path choose_directory(HWND owner) {
+fs::path choose_directory(HWND owner, const fs::path& initial) {
     IFileOpenDialog* dialog = nullptr;
     if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dialog))))
         throw std::runtime_error("folderPickerFailed");
     dialog->SetOptions(FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
+    std::error_code ec;
+    if(!initial.empty() && fs::is_directory(initial,ec)) {
+        IShellItem* folder=nullptr;
+        if(SUCCEEDED(SHCreateItemFromParsingName(initial.c_str(),nullptr,IID_PPV_ARGS(&folder)))) {
+            dialog->SetFolder(folder); folder->Release();
+        }
+    }
     fs::path result;
     if (SUCCEEDED(dialog->Show(owner))) {
         IShellItem* item = nullptr;

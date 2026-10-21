@@ -213,9 +213,18 @@ void Application::queue_save(Json job) {
     if(kind!="config" && kind!="passwords" && kind!="roots") return;
     auto key=job.at("key");
     set_text(page_,"closeError","");
-    save_error(kind=="passwords"?"@password:"+key.get<std::string>():kind=="config"?key.get<std::string>():"@"+kind,"");
+    if(kind=="roots") for(auto& edit:job.at("edits")) save_error("@root:"+edit.at("row").get<std::string>(),"");
+    else save_error(kind=="passwords"?"@password:"+key.get<std::string>():key.get<std::string>(),"");
     auto previous=std::find_if(saves_.begin(),saves_.end(),[&](const Json& queued){return queued["kind"]==kind && queued["key"]==key;});
-    if(previous!=saves_.end()) *previous=std::move(job); else saves_.push_back(std::move(job));
+    if(previous!=saves_.end() && kind=="roots") {
+        // A later edit to the first row must not drop the other rows of an
+        // already queued atomic paste. Replace only overlapping row values.
+        for(auto pair:{std::pair<const char*,const char*>{"edits","row"},{"snapshot","id"}}) for(auto& item:job[pair.first]) {
+            auto& items=(*previous)[pair.first];
+            auto found=std::find_if(items.begin(),items.end(),[&](const Json& old){return old[pair.second]==item[pair.second];});
+            if(found==items.end()) items.push_back(item); else *found=item;
+        }
+    } else if(previous!=saves_.end()) *previous=std::move(job); else saves_.push_back(std::move(job));
     start_save();
 }
 void Application::start_save() {
@@ -238,7 +247,32 @@ void Application::start_save() {
 void Application::acknowledge_save(const Json& ack) {
     const auto& job=ack.at("job"); auto kind=job.at("kind").get<std::string>();
     bool ok=ack.at("ok").get<bool>();
-    save_error(kind=="passwords"?"@password:"+job["key"].get<std::string>():kind=="config"?job["key"].get<std::string>():"@"+kind,ack.at("error"));
+    if(kind=="roots") {
+        Json records=Json::array(),pending=Json::array();
+        for(auto& edit:job.at("edits")) {
+            auto id=edit.at("row").get<std::string>();
+            save_error("@root:"+id,ack.at("error"));
+            if(!ok) continue;
+            bool remove=edit.at("operation")=="delete";
+            auto input=remove?std::string():utf8(resolve_path(wide(edit.at("input").get<std::string>()),options_.data_dir).wstring());
+            auto output=edit.at("output").get<std::string>(); auto first=output.find_first_not_of(" \t\r\n");
+            output=first==std::string::npos?"":output.substr(first,output.find_last_not_of(" \t\r\n")-first+1);
+            records.push_back({{"id",id},{"input",input},{"identity",remove?std::string():utf8(path_key(wide(input)))},{"output",output},{"deep",edit.at("deep")},{"remove",remove}});
+            for(auto& queued:saves_) if(queued["kind"]==kind) for(auto& next:queued["edits"]) if(next["row"]==id) {
+                next["original"]=input;
+                next["expected"]=remove?Json():Json{{"output",output},{"deep",edit["deep"]}};
+                if(next["operation"]=="delete") next["input"]=input;
+                else next["operation"]=remove?"addMany":"save";
+            }
+        }
+        for(auto& queued:saves_) if(queued["kind"]==kind) for(auto& edit:queued["edits"]) pending.push_back(edit["row"]);
+        auto reply=Json{{"snapshot",job.at("snapshot")},{"ok",ok},{"error",ack.at("error")},{"records",std::move(records)},{"pending",std::move(pending)}};
+        if(!ok) reply["error"]=page_value(page_,"saveErrors")["@root:"+job["edits"][0]["row"].get<std::string>()];
+        auto encoded=reply.dump();
+        if(ui_page_call_json(page_,"rootSaved",encoded.c_str())!=0) throw std::runtime_error("uiBindingFailed");
+        active_save_=Json(); return;
+    }
+    save_error(kind=="passwords"?"@password:"+job["key"].get<std::string>():job["key"].get<std::string>(),ack.at("error"));
     if(kind=="passwords") {
         const auto& edit=job.at("edit");
         const bool removed=ok && ack.at("passwordOriginal").get<std::string>().empty();
@@ -325,49 +359,6 @@ void Application::acknowledge_save(const Json& ack) {
         for(auto& queued:saves_) if(queued["kind"]==kind && queued["key"]==job["key"] && queued["fields"][0]["original"]==edit["original"]) {
             queued["fields"][0]["original"]=original; queued["fields"][0]["draft"]["original"]=original;
         }
-    } else if(ok) {
-        const auto& edit=job.at("edit");
-        if(edit["operation"]=="delete" && page_value(page_,"taskRoot")==edit["original"]) {
-            set_text(page_,"taskRoot","");
-            auto statuses=page_value(page_,"statusNames"); auto index=page_value(page_,"taskStatus").get<size_t>();
-            handle_command(Json{{"op","filterTasks"},{"payload",{{"query",page_value(page_,"taskQuery")},{"root",""},{"status",statuses.at(index)}}}});
-        }
-        const bool replace=edit["operation"]=="save";
-        Json baseline,expected; std::string original;
-        if(replace) {
-            original=utf8(resolve_path(wide(edit["input"].get<std::string>()),options_.data_dir).wstring());
-            auto output=edit["output"].get<std::string>(); auto first=output.find_first_not_of(" \t\r\n");
-            output=first==std::string::npos?"":output.substr(first,output.find_last_not_of(" \t\r\n")-first+1);
-            baseline={{"input",original},{"output",output},{"deep",edit["deep"]},{"paths",Json::array()}};
-            expected={{"output",output},{"deep",edit["deep"]}};
-            for(auto& queued:saves_) if(queued["kind"]==kind && queued["key"]==job["key"]) {
-                queued["edit"]["original"]=original; queued["edit"]["expected"]=expected;
-            }
-        }
-        if(page_value(page_,"rootSession")==job["key"]) {
-            Json current={{"input",page_value(page_,"rootInput")},{"output",page_value(page_,"rootOutput")},{"deep",page_value(page_,"rootDeep")},{"paths",page_value(page_,"rootPaths")}};
-            const auto& snapshot=job.at("snapshot");
-            bool unchanged=current.size()==snapshot.size();
-            for(auto it=current.begin();unchanged && it!=current.end();++it)
-                unchanged=snapshot.contains(it.key()) && snapshot[it.key()]==it.value();
-            if(replace) {
-                set_text(page_,"rootOriginal",original); set_text(page_,"rootBaseline",baseline.dump());
-                auto text=expected.dump(); ui_page_set_json(page_,"rootExpected",text.c_str());
-                if(unchanged) { set_text(page_,"rootInput",baseline["input"]); set_text(page_,"rootOutput",baseline["output"]); }
-            }
-            if(unchanged && job.contains("nextState")) {
-                for(auto it=job["nextState"].begin();it!=job["nextState"].end();++it) { auto text=it.value().dump(); ui_page_set_json(page_,it.key().c_str(),text.c_str()); }
-                if(job["nextState"].value("rootEditor",false)) reveal_form();
-                if(job["nextState"].contains("rootEditor") && !job["nextState"]["rootEditor"].get<bool>()) {
-                    for(auto name:{"rootOriginal","rootInput","rootOutput","rootBaseline"}) set_text(page_,name,"");
-                    ui_page_set_json(page_,"rootPaths","[]");
-                }
-                if(job["nextState"].contains("taskRoot")) {
-                    auto statuses=page_value(page_,"statusNames"); auto index=page_value(page_,"taskStatus").get<size_t>();
-                    handle_command(Json{{"op","filterTasks"},{"payload",{{"query",page_value(page_,"taskQuery")},{"root",page_value(page_,"taskRoot")},{"status",statuses.at(index)}}}});
-                }
-            }
-        }
     }
     active_save_=Json();
 }
@@ -380,17 +371,22 @@ void Application::apply_pending() {
     auto password_delta_patch=patch.value("passwordDelta",Json()); patch.erase("passwordDelta");
     VisualBatch visual(window_);
     auto ack=patch.value("saveAck",Json()); patch.erase("saveAck");
-    const bool cell_ack=!ack.is_null() && ack["job"]["kind"]=="passwords";
+    const bool cell_ack=!ack.is_null() && (ack["job"]["kind"]=="passwords" || ack["job"]["kind"]=="roots");
     if(cell_ack) acknowledge_save(ack);
     Json password_snapshot;
     if(patch.contains("passwords")) { password_snapshot=std::move(patch["passwords"]); patch.erase("passwords"); }
+    Json directory_snapshot;
+    if(patch.contains("directories")) { directory_snapshot=std::move(patch["directories"]); patch.erase("directories"); }
     if(patch.contains("fields")) bind_controls(patch["fields"]);
     auto action=patch.value("actionError",Json()); patch.erase("actionError");
     for(auto it=patch.begin();it!=patch.end();++it) {
         auto text=it.value().dump();
         if(ui_page_set_json(page_,it.key().c_str(),text.c_str())!=0) throw std::runtime_error("uiBindingFailed");
     }
-    if(patch.contains("directories")) ui_page_call_json(page_,"syncPasswordDirectory","{}");
+    if(!directory_snapshot.is_null()) {
+        auto encoded=directory_snapshot.dump();
+        if(ui_page_call_json(page_,"applyDirectories",encoded.c_str())!=0) throw std::runtime_error("uiBindingFailed");
+    }
     if(!password_snapshot.is_null()) {
         auto encoded=password_snapshot.dump();
         if(ui_page_call_json(page_,"applyPasswords",encoded.c_str())!=0) throw std::runtime_error("passwordBindingFailed");
@@ -432,6 +428,7 @@ void Application::apply_pending() {
     if(!action.is_null()) set_error("actionError",action.get<std::string>());
     if(!ack.is_null() && !cell_ack) acknowledge_save(ack);
     if(!ack.is_null()) ui_page_call_json(page_,"prunePasswordDrafts","{}");
+    if(!ack.is_null() || !directory_snapshot.is_null()) ui_page_call_json(page_,"pruneRootDrafts","{}");
     if(patch.contains("fields") || !ack.is_null()) sync_toggles();
     for(auto& id:reset_scroll) {
         auto widget=ui_widget_find_by_id(ui_page_root(page_),id.get<std::string>().c_str());
@@ -453,7 +450,7 @@ void Application::apply_pending() {
     }
 }
 void Application::navigate(const std::string& tab) {
-    if(tab!="tasks" && tab!="config" && tab!="passwords") return;
+    if(tab!="tasks" && tab!="config" && tab!="roots" && tab!="passwords") return;
     if(page_value(page_,"tab")==tab) return;
     // Focus loss may publish its own input/blur repaint. Begin the visual
     // transaction first, so that repaint coalesces with the page switch.
@@ -465,7 +462,7 @@ void Application::navigate(const std::string& tab) {
     // Tab targets retain fixed sidebar geometry; reactive tab visibility already
     // schedules layout. Avoid forcing an extra full-tree layout on every switch.
     motion::enter(window_,("page-"+tab).c_str());
-    motion::select(window_,"navIndicator",tab=="tasks"?"tabTasks":tab=="config"?"tabConfig":"tabPasswords");
+    motion::select(window_,"navIndicator",tab=="tasks"?"tabTasks":tab=="config"?"tabConfig":tab=="roots"?"tabRoots":"tabPasswords");
 }
 void Application::sync_toggles() {
     auto drafts=page_value(page_,"toggleDrafts");
@@ -475,16 +472,6 @@ void Application::sync_toggles() {
         bool on=drafts.contains(pair.first)?drafts[pair.first]["boolean"].get<bool>():pair.second->field["boolean"].get<bool>();
         ui_toggle_set_on(widget,on); ui_widget_destroy(widget);
     }
-}
-void Application::reveal_form() {
-    ui_window_relayout(window_);
-    auto scroll=ui_widget_find_by_id(ui_page_root(page_),"taskListScroll");
-    // Core UI exposes programmatic scrolling through this public entry point;
-    // it only adjusts the viewport and does not start a debug server.
-    if(scroll) { ui_debug_scroll_set(scroll,0); ui_widget_destroy(scroll); }
-    auto input=ui_widget_find_by_id(ui_page_root(page_),"rootInput");
-    if(input) { ui_window_focus_widget(window_,input); ui_widget_destroy(input); }
-    motion::enter(window_,"rootForm",0,12);
 }
 void Application::bind_controls(const Json& fields) {
     for(auto& field:fields) {
@@ -616,44 +603,52 @@ void Application::handle_command(Json command) {
         if(id=="configBlocks") { VisualBatch visual(window_); ui_window_relayout(window_); motion::enter(window_,id.c_str(),0,12); }
         return;
     }
-    if(op=="revealForm") { reveal_form(); return; }
+    if(op=="clearRootError") { save_error("@root:"+p.at("id").get<std::string>(),""); return; }
+    if(op=="blurRoot") {
+        if(choosing_directory_ || page_value(page_,"rootCell")!=p.at("id") || page_value(page_,"rootPart")!=p.at("part")) return;
+        auto* focused=ui::GetContext().GetWindow(window_)->FocusedWidget();
+        auto suffix=p.at("part").get<std::string>()+"-"+p.at("id").get<std::string>();
+        if(focused && focused->id=="browse-root-"+suffix) return;
+        ui_page_call_json(page_,"finishRootCell","{}"); return;
+    }
     if(op=="clearPasswordError") { save_error("@password:"+p.at("id").get<std::string>(),""); return; }
     if(op=="discardPassword") {
         auto encoded=p.at("id").dump();
         if(ui_page_call_json(page_,"discardPassword",encoded.c_str())!=0) throw std::runtime_error("passwordBindingFailed");
         return;
     }
-    if(op=="focusPassword") {
+    if(op=="focusPassword" || op=="focusRoot") {
         auto id=p.at("id").get<std::string>(), part=p.at("part").get<std::string>();
         auto* window=ui::GetContext().GetWindow(window_);
+        bool root=op=="focusRoot";
         if(part=="none") {
             auto* focused=window->FocusedWidget();
-            if(focused && focused->id=="password-input-"+id) window->FocusWidget(nullptr,false);
+            if(focused && (root?(focused->id=="root-input-input-"+id || focused->id=="root-output-input-"+id):focused->id=="password-input-"+id)) window->FocusWidget(nullptr,false);
             return;
         }
-        if(part!="value" || page_value(page_,"passwordCell")!=id) return;
+        if(root) { if((part!="input" && part!="output") || page_value(page_,"rootCell")!=id || page_value(page_,"rootPart")!=part) return; }
+        else if(part!="value" || page_value(page_,"passwordCell")!=id) return;
         if(p.value("top",false)) {
-            auto scroll=ui_widget_find_by_id(ui_page_root(page_),"passwordListScroll");
+            auto scroll=ui_widget_find_by_id(ui_page_root(page_),root?"rootListScroll":"passwordListScroll");
             if(scroll) { ui_debug_scroll_set(scroll,0); ui_widget_destroy(scroll); }
         }
         ui_window_relayout(window_);
-        auto* target=window->Root()->FindById("password-input-"+id);
+        auto* target=window->Root()->FindById(root?"root-"+part+"-input-"+id:"password-input-"+id);
         if(target) window->FocusWidget(target,false);
         return;
     }
-    if(op=="browse") {
-        auto selected=choose_directory(hwnd_);
-        if(!selected.empty()) {
-            auto target=p.value("target",std::string());
-            if(target=="rootInput" && page_value(page_,"rootOriginal")=="") {
-                const char* field="rootPaths";
-                auto paths=page_value(page_,field), value=Json(utf8(selected.wstring()));
-                if(std::find(paths.begin(),paths.end(),value)==paths.end()) paths.push_back(value);
-                auto text=paths.dump(); ui_page_set_json(page_,field,text.c_str());
-            } else if(target=="listEntry") {
-                set_text(page_,"listEntry",utf8(selected.wstring()));
-            } else if(target=="rootInput" || target=="rootOutput") set_text(page_,target.c_str(),utf8(selected.wstring()));
-        }
+    if(op=="browseRoot") {
+        auto part=p.at("part").get<std::string>(); if(part!="input" && part!="output") return;
+        auto value=p.at("value").get<std::string>();
+        auto base=options_.data_dir;
+        if(part=="output" && !p.at("input").get<std::string>().empty()) base=resolve_path(wide(p.at("input").get<std::string>()),base);
+        choosing_directory_=true;
+        fs::path selected;
+        try { selected=choose_directory(hwnd_,value.empty()?fs::path():resolve_path(wide(value),base)); }
+        catch(...) { choosing_directory_=false; throw; }
+        choosing_directory_=false;
+        auto picked=Json{{"id",p.at("id")},{"part",part},{"value",utf8(selected.wstring())}}.dump();
+        if(ui_page_call_json(page_,"rootPicked",picked.c_str())!=0) throw std::runtime_error("uiBindingFailed");
         return;
     }
     if(op=="pickRangeDate") {
@@ -700,14 +695,20 @@ void Application::handle_command(Json command) {
 LRESULT CALLBACK Application::subclass(HWND hwnd,UINT message,WPARAM wparam,LPARAM lparam,UINT_PTR,DWORD_PTR data) {
     auto* self=reinterpret_cast<Application*>(data);
     try {
-        if((message==WM_MOUSEWHEEL || message==WM_MOUSEHWHEEL || message==WM_KILLFOCUS) && page_value(self->page_,"passwordCell")!="") {
+        if((message==WM_MOUSEWHEEL || message==WM_MOUSEHWHEEL || message==WM_KILLFOCUS) && !self->choosing_directory_ &&
+           (page_value(self->page_,"passwordCell")!="" || page_value(self->page_,"rootCell")!="")) {
             ui_window_focus_widget(self->window_,0);
+            ui_page_call_json(self->page_,"finishRootCell","{}");
             self->dispatch();
         }
         if(message==WM_CLOSE && !self->stopping_) {
-            if(page_value(self->page_,"listTarget")!="" || page_value(self->page_,"rootDirty")==true) {
+            if(page_value(self->page_,"listTarget")!="") {
                 self->set_error("closeError","unsavedEntries"); return 0;
             }
+            ui_window_focus_widget(self->window_,0);
+            ui_page_call_json(self->page_,"finishRootCell","{}");
+            self->dispatch();
+            if(page_value(self->page_,"rootDirty")==true) { self->set_error("closeError","unsavedEntries"); return 0; }
             if(!self->closing_ || (self->active_save_.is_null() && self->saves_.empty() && page_value(self->page_,"saveErrors").empty())) {
                 self->closing_=true;
                 ui_window_focus_widget(self->window_,0); // Commit the focused input through its blur handler.
@@ -928,7 +929,7 @@ void Application::work() {
                         }
                         auto result=save_changes(dir,p.value("fields",Json::array()),
                             password_edits,
-                            kind=="roots"?Json::array({p.at("edit")}):Json::array(),
+                            kind=="roots"?p.at("edits"):Json::array(),
                             kind=="passwords"?&saved_passwords:nullptr);
                         std::string password_original;
                         for(auto& section:result["saved"]) {

@@ -451,7 +451,14 @@ WatchRoots read_roots(const fs::path& p) {
     return parse_roots(read_file(p),p.parent_path());
 }
 WatchRoots apply_root_changes(WatchRoots roots,const fs::path& base,const Json& edits) {
-    auto apply=[&](const Json& edit,const std::string& input,bool batch) {
+    // Normalize each existing key once. A multi-line paste must not rescan
+    // and normalize the complete directory list for every added row.
+    std::unordered_map<std::wstring,size_t> indices;
+    indices.reserve(roots.entries.size()+edits.size());
+    for(size_t i=0;i<roots.entries.size();++i) indices.emplace(path_key(roots.entries[i].input),i);
+    std::vector<bool> removed(roots.entries.size(),false);
+    bool compact=false;
+    auto apply=[&](const Json& edit,const std::string& input) {
         std::string op=edit.at("operation"), original=edit.value("original",std::string()), output=edit.at("output");
         bool deep=edit.at("deep");
         auto path = resolve_path(wide(input),base);
@@ -459,29 +466,48 @@ WatchRoots apply_root_changes(WatchRoots roots,const fs::path& base,const Json& 
             throw std::runtime_error("rootInvalid");
         if (op!="delete" && !fs::is_directory(path)) throw std::runtime_error("rootMissing");
         auto previous = original.empty()?std::wstring():path_key(wide(original));
-        auto it=std::find_if(roots.entries.begin(),roots.entries.end(),[&](auto& r){return path_key(r.input)==previous;});
-        if (!original.empty() && it==roots.entries.end()) throw std::runtime_error("rootRemoved");
+        auto found=indices.find(previous);
+        auto index=found==indices.end()?size_t(-1):found->second;
+        if (!original.empty() && index==size_t(-1)) throw std::runtime_error("rootRemoved");
         if(!original.empty() && edit.contains("expected") && !edit["expected"].is_null() &&
-            (it->output!=edit["expected"].value("output",std::string()) || it->deep!=edit["expected"].value("deep",false)))
+            (roots.entries[index].output!=edit["expected"].value("output",std::string()) || roots.entries[index].deep!=edit["expected"].value("deep",false)))
             throw std::runtime_error("rootConflict");
-        if (op=="delete") { if(it!=roots.entries.end()) roots.entries.erase(it); }
+        auto remove=[&] {
+            if(index!=size_t(-1)) { removed[index]=true; indices.erase(previous); compact=true; }
+        };
+        if (op=="delete") remove();
         else {
             auto key=path_key(path);
-            auto duplicate=std::find_if(roots.entries.begin(),roots.entries.end(),[&](auto& r){return path_key(r.input)==key;});
-            if (duplicate!=roots.entries.end() && duplicate!=it) {
-                if(batch && duplicate->output==trim(output) && duplicate->deep==deep) return;
+            auto duplicate=indices.find(key);
+            if (duplicate!=indices.end() && duplicate->second!=index) {
+                const auto& record=roots.entries[duplicate->second];
+                if(record.output==trim(output) && record.deep==deep) { remove(); return; }
                 throw std::runtime_error("rootDuplicate");
             }
             WatchRoot replacement{path,trim(output),deep};
-            if(it==roots.entries.end()) roots.entries.push_back(replacement); else *it=replacement;
+            if(index==size_t(-1)) {
+                indices.emplace(std::move(key),roots.entries.size());
+                roots.entries.push_back(std::move(replacement)); removed.push_back(false);
+            } else {
+                indices.erase(previous); indices[std::move(key)]=index;
+                roots.entries[index]=std::move(replacement);
+            }
         }
     };
     for(auto& edit:edits) {
         if(edit.at("operation")=="addMany") {
             const auto& inputs=edit.at("inputs");
             if(!inputs.is_array() || inputs.empty()) throw std::runtime_error("rootsEmpty");
-            for(auto& input:inputs) apply(edit,input.get<std::string>(),true);
-        } else apply(edit,edit.at("input").get<std::string>(),false);
+            for(auto& input:inputs) apply(edit,input.get<std::string>());
+        } else apply(edit,edit.at("input").get<std::string>());
+    }
+    if(compact) {
+        size_t count=0;
+        for(size_t i=0;i<roots.entries.size();++i) if(!removed[i]) {
+            if(count!=i) roots.entries[count]=std::move(roots.entries[i]);
+            ++count;
+        }
+        roots.entries.resize(count);
     }
     return roots;
 }

@@ -84,6 +84,18 @@
       "zh": "监控目录",
       "en": "Monitored folders"
     },
+    "rootManagement": {
+      "zh": "监控目录管理",
+      "en": "Monitored folders"
+    },
+    "rootPasteHint": {
+      "zh": "可粘贴多行目录",
+      "en": "Paste one or more folders"
+    },
+    "rootOutputHint": {
+      "zh": "默认输出目录",
+      "en": "Default output folder"
+    },
     "searchDirectory": {
       "zh": "搜索目录",
       "en": "Search folders"
@@ -115,10 +127,6 @@
     "allFolders": {
       "zh": "全部目录",
       "en": "All folders"
-    },
-    "rootBatchHint": {
-      "zh": "选择或管理目录；以下设置应用于本次添加的所有目录。",
-      "en": "Choose or manage folders. These settings apply to all folders being added."
     },
     "rootsEmpty": {
       "zh": "请至少输入一个目录。",
@@ -184,37 +192,17 @@
       "zh": "全部状态",
       "en": "All statuses"
     },
-    "editRoot": {
-      "zh": "编辑监控目录",
-      "en": "Edit monitored folder"
-    },
     "back": {
       "zh": "返回",
       "en": "Back"
     },
-    "inputDirectory": {
-      "zh": "输入目录",
-      "en": "Input folder"
-    },
-    "chooseDirectory": {
-      "zh": "选择目录",
-      "en": "Browse"
-    },
     "rootOutput": {
-      "zh": "输出目录；留空使用默认位置",
-      "en": "Output folder; leave blank for the default"
-    },
-    "chooseOutput": {
-      "zh": "选择输出",
-      "en": "Browse output"
+      "zh": "输出目录",
+      "en": "Output folder"
     },
     "deep": {
       "zh": "深度检测",
       "en": "Deep detection"
-    },
-    "deleteRoot": {
-      "zh": "删除目录",
-      "en": "Remove folder"
     },
     "taskCount": {
       "zh": "个任务",
@@ -312,7 +300,6 @@
     "multilineEntry": {"zh":"条目内换行","en":"Multiline entry"},
     "importHint": {"zh":"每行导入一个条目，忽略空行；保留条目首尾空格。先预览，再导入。","en":"One entry per line; blank lines are skipped. Entry whitespace is preserved. Preview before importing."},
     "unsavedEntries": {"zh":"请先保存或取消当前编辑。","en":"Save or cancel the current edit first."},
-    "folderEntryRequired": {"zh":"请输入一个目录路径。","en":"Enter one folder path."},
     "finishImport": {"zh":"请先预览并导入，或清空批量输入。","en":"Preview and import the batch, or clear the import text first."},
     "operationFailed": {
       "zh": "操作未完成",

@@ -24,15 +24,20 @@ export default {
     startup:{enabled:false,command:''},directoryQuery:'',
     taskQuery:'',taskRoot:'',taskStatus:0,
     statusNames:['','taskProcessing','taskWaiting','taskSucceeded','taskFailed'],
-    rootEditor:false,rootOriginal:'',rootInput:'',rootPaths:[],rootOutput:'',rootDeep:false,
-    configCategory:'',configQuery:'',drafts:{},toggleDrafts:{},advancedRanges:{},saving:false,saveErrors:{},closeError:'',pendingFields:[],recordSaving:{passwords:false,roots:false},rootSession:0,rootBaseline:'',rootExpected:null,
+    rootRows:[],rootDrafts:{},rootNew:[],rootCell:'',rootPart:'',rootNext:0,rootQuery:'',
+    configCategory:'',configQuery:'',drafts:{},toggleDrafts:{},advancedRanges:{},saving:false,saveErrors:{},closeError:'',pendingFields:[],recordSaving:{passwords:false,roots:false},
     passwordRoot:'',passwordHistory:false,passwordQuery:'',passwordDrafts:{},passwordNew:[],passwordCell:'',passwordNext:0,
     listTarget:'',listTitle:'',listField:null,listRows:[],listNext:0,listQuery:'',listEntry:'',listEditing:-1,listMultiline:false,listImport:false,listImportText:'',listPreview:[],listError:''
   }; },
   computed: {
     passwordScope() { return this.passwordHistory?'@history':this.passwordRoot||'@all'; },
     directorySelection() { return this.tab==='passwords'?this.passwordRoot:this.taskRoot; },
-    rootDirty() { return this.rootEditor&&JSON.stringify({input:this.rootInput,output:this.rootOutput,deep:this.rootDeep,paths:this.rootPaths})!==this.rootBaseline; },
+    rootDirty() { return Object.values(this.rootDrafts).some(d=>!d.original&&!d.pending&&(d.input.length||d.output.length)); },
+    shownRootRows() {
+      let q=this.rootQuery.toLowerCase(),rows=this.rootNew.concat(this.rootRows),ids=new Set(rows.map(r=>r.id));
+      for(let d of Object.values(this.rootDrafts)) if(!ids.has(d.id)&&(d.pending||d.error||this.rootCell===d.id)) rows.push(d);
+      return rows.filter(r=>{let d=this.rootDraft(r);return r.id===this.rootCell||d.pending||d.error||!q||(d.input+' '+d.output).toLowerCase().includes(q);});
+    },
     matchingListRows() { let q=this.listQuery.toLowerCase(); return this.listRows.filter(r=>r.value.toLowerCase().indexOf(q)>=0); },
     errorList() { return Object.keys(this.errors).map(k=>k+': '+this.errors[k]); },
     shownDirectories() { let q=this.directoryQuery.toLowerCase(); return this.directories.filter(d=>d.watch&&d.path.toLowerCase().indexOf(q)>=0); },
@@ -177,7 +182,7 @@ export default {
     },
     searchPasswords(value) { this.passwordQuery=value; this.filterPasswords(); },
     filterTasks() { this.send('filterTasks',{query:this.taskQuery,root:this.taskRoot,status:this.statusNames[this.taskStatus]||''}); },
-    selectRoot(path) { if(this.rootDirty) { this.setSaveError('@roots','unsavedEntries'); return; } if(this.rootEditor) this.leaveRoot(); this.taskRoot=path; this.filterTasks(); },
+    selectRoot(path) { this.taskRoot=path; this.filterTasks(); },
     filterPasswords() { this.send('filterPasswords',{query:this.passwordQuery,scope:this.passwordScope}); },
     selectPasswordView(history) { this.finishPasswordCell(); this.passwordHistory=history; this.filterPasswords(); },
     selectDirectory(path) {
@@ -191,29 +196,157 @@ export default {
         if(!this.passwordHistory) this.filterPasswords();
       }
     },
-    rootState(d) { let input=d?d.path:'',output=d?d.output:'',deep=d?d.deep:false; return {rootSession:this.rootSession+1,rootOriginal:input,rootInput:input,rootPaths:[],rootOutput:output,rootDeep:deep,rootExpected:d?{output:output,deep:deep}:null,rootBaseline:JSON.stringify({input:input,output:output,deep:deep,paths:[]}),rootEditor:true}; },
-    editRoot(d) { if(this.recordSaving.roots) return; if(this.rootDirty) { this.setSaveError('@roots','unsavedEntries'); return; } Object.assign(this,this.rootState(d)); this.send('revealForm',{kind:'root'}); },
-    deleteListedRoot(d) {
-      if(this.recordSaving.roots) return;
-      if(this.rootOriginal===d.path) { this.rootAction('delete'); return; }
-      this.send('saveRecord',{kind:'roots',key:'delete:'+d.id,edit:{operation:'delete',original:d.path,input:d.path,output:d.output,deep:d.deep,expected:{output:d.output,deep:d.deep}}});
-    },
-    rootEdit(operation) {
-      let edit={operation:operation,original:this.rootOriginal,input:this.rootInput,output:this.rootOutput,deep:this.rootDeep,expected:this.rootExpected};
-      if(operation==='save'&&!this.rootOriginal) { edit.operation='addMany'; edit.inputs=this.rootPaths.concat(this.rootInput.trim()?[this.rootInput.trim()]:[]); if(!edit.inputs.length) throw new Error('rootsEmpty'); }
-      return edit;
-    },
     errorText(error) { return error && typeof error==='object' ? error.text : (this.texts[error]||error); },
     setSaveError(key,message) { let errors=Object.assign({},this.saveErrors); if(message) errors[key]=message; else delete errors[key]; this.saveErrors=errors; },
-    leaveRoot() { this.rootSession++; this.rootEditor=false; this.rootOriginal=''; this.rootInput=''; this.rootPaths=[]; this.rootOutput=''; this.rootBaseline=''; this.rootExpected=null; this.setSaveError('@roots',''); this.closeError=''; },
-    rootAction(operation,nextState) {
-      if(!this.rootOriginal&&this.recordSaving.roots) return;
-      if(operation==='save'&&!this.rootDirty&&!this.recordSaving.roots) { Object.assign(this,nextState||{rootEditor:false}); return; }
-      try {
-        let edit=this.rootEdit(operation),snapshot={input:this.rootInput,output:this.rootOutput,deep:this.rootDeep,paths:this.rootPaths};
-        this.setSaveError('@roots','');
-        this.send('saveRecord',{kind:'roots',key:this.rootSession,edit:edit,snapshot:snapshot,nextState:nextState||{rootEditor:false}});
-      } catch(e) { this.setSaveError('@roots',e.message); }
+    rootDraft(r) { return this.rootDrafts[r.id]||r; },
+    rootValue(d) { return {input:d.input,output:d.output,deep:d.deep}; },
+    rootDraftState(r) { return Object.assign({},r,{expected:r.original?{output:r.output,deep:r.deep}:null,baseline:JSON.stringify(this.rootValue(r)),pending:false,error:'',submitted:''}); },
+    putRootDraft(d) { this.rootDrafts=Object.assign({},this.rootDrafts,{[d.id]:d}); },
+    ensureRootDraft(r) {
+      let d=this.rootDrafts[r.id];
+      if(!d) { r=this.rootRows.find(current=>current.id===r.id)||this.rootNew.find(current=>current.id===r.id)||r; d=this.rootDraftState(r); this.putRootDraft(d); }
+      return d;
+    },
+    makeRoot(input,output,deep) { return {id:'root-'+(++this.rootNext),original:'',input:input,output:output,deep:deep}; },
+    addRoot() {
+      this.finishRootCell(); this.rootQuery='';
+      let r=this.makeRoot('','',false); this.rootNew=[r].concat(this.rootNew); this.ensureRootDraft(r);
+      this.rootCell=r.id; this.rootPart='input'; this.send('focusRoot',{id:r.id,part:'input',top:true});
+    },
+    searchRoots(value) { this.finishRootCell(); this.rootQuery=value; this.send('scrollTop',{id:'rootItems'}); },
+    applyDirectories(snapshot) {
+      let previous=this.rootNew.concat(this.rootRows),identities=new Map();
+      for(let r of previous) if(r.original) identities.set(r.identity,r.id);
+      for(let d of Object.values(this.rootDrafts)) if(d.original) identities.set(d.identity,d.id);
+      let rows=snapshot.filter(d=>d.watch).map(d=>({id:identities.get(d.id)||'root-'+(++this.rootNext),identity:d.id,original:d.path,input:d.path,output:d.output,deep:d.deep}));
+      let order=new Map(previous.map((r,i)=>[r.id,i]));
+      rows.sort((a,b)=>(order.has(a.id)?order.get(a.id):previous.length)-(order.has(b.id)?order.get(b.id):previous.length));
+      let ids=new Set(rows.map(r=>r.id)); this.rootNew=this.rootNew.filter(r=>!ids.has(r.id)); this.rootRows=rows; this.directories=snapshot;
+      this.syncPasswordDirectory();
+      if(this.taskRoot&&!snapshot.some(d=>d.watch&&d.path===this.taskRoot)) { this.taskRoot=''; this.filterTasks(); }
+    },
+    beginRoot(r,part) {
+      if(this.rootCell===r.id&&this.rootPart===part) return;
+      this.finishRootCell(); this.ensureRootDraft(r); this.rootCell=r.id; this.rootPart=part;
+      this.send('focusRoot',{id:r.id,part:part});
+    },
+    changeRoot(r,part,value) {
+      let d=Object.assign({},this.ensureRootDraft(r),{[part]:value,error:''});
+      if(!/[\r\n]/.test(value)) {
+        if(part==='input'&&!d.original&&(!d.output||d.output===this.rootDraft(r).input)) d.output=value;
+        this.putRootDraft(d); return;
+      }
+      let lines=value.split(/\r\n|\r|\n/).map(v=>v.trim()).filter(v=>v.length),rows=[];
+      if(!lines.length) { d[part]=''; this.putRootDraft(d); this.finishRootCell(); return; }
+      if(part==='input') {
+        if(!d.original&&(!d.output||d.output===this.rootDraft(r).input)) d.output=lines[0];
+        d.input=lines[0]; rows.push(d);
+        let extra=lines.slice(1).map(input=>this.makeRoot(input,input,d.deep)); this.rootNew=this.rootNew.concat(extra); rows=rows.concat(extra);
+      } else {
+        let current=this.shownRootRows,start=current.findIndex(p=>p.id===r.id),extra=[];
+        for(let i=0;i<lines.length;i++) {
+          let row=current[start+i]; if(!row) { row=this.makeRoot('',lines[i],false); extra.push(row); }
+          rows.push(Object.assign({},this.rootDrafts[row.id]||this.rootDraftState(row),{output:lines[i],error:''}));
+        }
+        this.rootNew=this.rootNew.concat(extra);
+      }
+      let drafts=Object.assign({},this.rootDrafts);
+      for(let row of rows) drafts[row.id]=Object.assign({},drafts[row.id]||this.rootDraftState(row),row);
+      this.rootDrafts=drafts;
+      this.rootCell=''; this.rootPart=''; this.send('focusRoot',{id:r.id,part:'none'}); this.commitRoots(rows);
+    },
+    commitRoots(rows,remove) {
+      let edits=[],snapshot=[],drafts=Object.assign({},this.rootDrafts),discard=[];
+      for(let row of rows) {
+        let d=Object.assign({},drafts[row.id]||this.rootDraftState(row));
+        d.input=d.input.trim(); d.output=d.output.trim();
+        let deleting=!!remove||!d.input;
+        if(deleting&&!d.original&&!d.pending) {
+          if(!remove&&d.output) drafts[d.id]=Object.assign({},d,{error:'rootsEmpty'});
+          else discard.push(d.id);
+          continue;
+        }
+        let value=this.rootValue(d),sent=JSON.stringify({value:value,remove:deleting});
+        if(d.pending&&d.submitted===sent) continue;
+        if(!deleting&&d.original&&!d.pending&&!d.error&&JSON.stringify(value)===d.baseline) { drafts[d.id]=d; continue; }
+        drafts[d.id]=Object.assign({},d,{pending:true,error:'',submitted:sent});
+        snapshot.push({id:d.id,value:value,remove:deleting});
+        edits.push({row:d.id,operation:deleting?'delete':d.original?'save':'addMany',original:d.original,input:d.input||d.original,inputs:[d.input],output:d.output,deep:d.deep,expected:d.expected});
+      }
+      this.rootDrafts=drafts;
+      for(let id of discard) this.discardRoot(id);
+      if(edits.length) this.send('saveRecord',{kind:'roots',key:edits[0].row,edits:edits,snapshot:snapshot});
+      this.pruneRootDrafts();
+    },
+    finishRootCell() {
+      let id=this.rootCell; if(!id) return;
+      this.rootCell=''; this.rootPart=''; let d=this.rootDrafts[id]; if(d) this.commitRoots([d]);
+      this.send('focusRoot',{id:id,part:'none'});
+    },
+    blurRoot(r,part) { if(this.rootCell===r.id&&this.rootPart===part) this.send('blurRoot',{id:r.id,part:part}); },
+    browseRoot(r,part) { let d=this.ensureRootDraft(r); this.send('browseRoot',{id:r.id,part:part,value:d[part],input:d.input}); },
+    rootPicked(p) {
+      let d=this.rootDrafts[p.id]; if(!d) return;
+      if(p.value) { this.changeRoot(d,p.part,p.value); if(this.rootCell===p.id) this.finishRootCell(); else this.commitRoots([this.rootDraft(d)]); }
+      else { this.rootCell=d.id; this.rootPart=p.part; this.send('focusRoot',{id:d.id,part:p.part}); }
+    },
+    toggleRoot(r,value) { this.finishRootCell(); let d=Object.assign({},this.ensureRootDraft(r),{deep:value,error:''}); this.putRootDraft(d); this.commitRoots([d]); },
+    deleteListedRoot(r) { if(this.rootCell===r.id) { this.rootCell=''; this.rootPart=''; } this.commitRoots([this.ensureRootDraft(r)],true); },
+    discardRoot(id) {
+      if(this.rootCell===id) { this.rootCell=''; this.rootPart=''; }
+      let drafts=Object.assign({},this.rootDrafts); delete drafts[id]; this.rootDrafts=drafts;
+      this.rootNew=this.rootNew.filter(r=>r.id!==id); this.send('clearRootError',{id:id});
+    },
+    rebaseRootRequests(records) {
+      let index=new Map(records.map(r=>[r.id,r]));
+      this.requests=this.requests.map(request=>{
+        if(request.op!=='saveRecord'||request.payload.kind!=='roots') return request;
+        let edits=request.payload.edits.map(edit=>{
+          let r=index.get(edit.row); if(!r) return edit;
+          return Object.assign({},edit,{original:r.remove?'':r.input,input:edit.operation==='delete'?r.input:edit.input,expected:r.remove?null:{output:r.output,deep:r.deep},operation:edit.operation==='delete'?'delete':r.remove?'addMany':'save'});
+        });
+        return Object.assign({},request,{payload:Object.assign({},request.payload,{edits:edits})});
+      });
+    },
+    rootSaved(ack) {
+      if(ack.ok) this.rebaseRootRequests(ack.records);
+      let claimed=new Map(this.rootRows.map(r=>[r.identity,r.id])),records=new Map(ack.records.map(r=>[r.id,r]));
+      let drafts=Object.assign({},this.rootDrafts),removed=new Set(),renamed=new Map(),pendingIds=new Set(ack.pending);
+      for(let request of this.requests) if(request.op==='saveRecord'&&request.payload.kind==='roots') for(let edit of request.payload.edits) pendingIds.add(edit.row);
+      for(let sent of ack.snapshot) {
+        let d=drafts[sent.id]; if(!d) continue;
+        let current=this.rootValue(d),pending=pendingIds.has(d.id);
+        d=Object.assign({},d,{pending:pending,error:ack.ok?'':ack.error});
+        if(ack.ok) {
+          let record=records.get(d.id),same=JSON.stringify(current)===JSON.stringify(sent.value);
+          if(record.remove) {
+            removed.add(d.id);
+            if(!pending&&this.rootCell!==d.id&&same) { delete drafts[d.id]; continue; }
+            d.original=''; d.expected=null;
+          } else {
+            let previous=d.original;
+            if(d.identity!==record.identity&&claimed.get(d.identity)===d.id) claimed.delete(d.identity);
+            let duplicate=claimed.has(record.identity)&&claimed.get(record.identity)!==d.id;
+            if(duplicate&&!pending&&this.rootCell!==d.id&&same) { removed.add(d.id); delete drafts[d.id]; continue; }
+            claimed.set(record.identity,d.id);
+            d.original=record.input; d.identity=record.identity; d.expected={output:record.output,deep:record.deep};
+            renamed.set(d.id,{original:record.input,identity:record.identity});
+            if(this.taskRoot===previous&&previous!==record.input) { this.taskRoot=record.input; this.filterTasks(); }
+            if(this.passwordRoot===previous&&previous!==record.input) { this.passwordRoot=record.input; if(!this.passwordHistory) this.filterPasswords(); }
+            if(same&&this.rootCell!==d.id) Object.assign(d,{input:record.input,output:record.output,deep:record.deep});
+          }
+          d.baseline=JSON.stringify(same?this.rootValue(d):sent.value); d.submitted='';
+        }
+        drafts[d.id]=d;
+      }
+      this.rootDrafts=drafts;
+      this.rootNew=this.rootNew.filter(r=>!removed.has(r.id));
+      this.rootRows=this.rootRows.filter(r=>!removed.has(r.id)).map(r=>renamed.has(r.id)?Object.assign({},r,renamed.get(r.id)):r);
+    },
+    pruneRootDrafts() {
+      let ids=new Set(this.rootRows.map(r=>r.id)),drafts=Object.assign({},this.rootDrafts);
+      for(let d of Object.values(drafts)) if(d.original&&!d.pending&&!d.error&&this.rootCell!==d.id&&ids.has(d.id)&&JSON.stringify(this.rootValue(d))===d.baseline) delete drafts[d.id];
+      this.rootDrafts=drafts;
     },
     commitField(f) {
       let draft=this.drafts[f.id]||this.toggleDrafts[f.id];
@@ -386,10 +519,10 @@ export default {
         this.listField=Object.assign({},this.listField,{original:saved.original,text:saved.text});
     },
     openList(target,field) {
-      if(field) field=this.fields.find(current=>current.id===field.id)||field;
-      let values=target==='config'?(this.drafts[field.id]?JSON.parse(this.drafts[field.id].text):field.items):this[target];
-      this.listField=field?Object.assign({},field):null;
-      this.listTitle=field?field.label:target==='rootPaths'?this.texts.roots:this.texts.passwords;
+      field=this.fields.find(current=>current.id===field.id)||field;
+      let values=this.drafts[field.id]?JSON.parse(this.drafts[field.id].text):field.items;
+      this.listField=Object.assign({},field);
+      this.listTitle=field.label;
       this.listRows=values.map((value,id)=>({id:id,value:value})); this.listNext=values.length;
       this.listQuery=''; this.listEntry=''; this.listEditing=-1; this.listMultiline=false; this.listImport=false; this.listImportText=''; this.listPreview=[]; this.listError=''; this.listTarget=target;
     },
@@ -397,7 +530,6 @@ export default {
     editListRow(row) { this.listEditing=row.id; this.listEntry=row.value; this.listMultiline=/[\r\n]/.test(row.value); },
     putListEntry() {
       let value=this.listEntry;
-      if(this.listTarget==='rootPaths') { value=value.trim(); if(!value||/[\r\n]/.test(value)) {this.listError=this.texts.folderEntryRequired;return false;} }
       if(this.listEditing<0) this.listRows=this.listRows.concat([{id:this.listNext++,value:value}]);
       else this.listRows=this.listRows.map(r=>r.id===this.listEditing?{id:r.id,value:value}:r);
       this.listEntry=''; this.listEditing=-1; this.listMultiline=false; this.listError=''; return true;
@@ -406,18 +538,15 @@ export default {
     previewImport() {
       // Line parsing is confined to this explicit import boundary. Password
       // whitespace is significant; blank lines are intentionally skipped.
-      let paths=this.listTarget==='rootPaths';
-      this.listPreview=this.listImportText.split(/\r\n|\n|\r/).map(v=>paths?v.trim():v).filter(v=>v.length>0).map((value,id)=>({id:id,value:value}));
+      this.listPreview=this.listImportText.split(/\r\n|\n|\r/).filter(v=>v.length>0).map((value,id)=>({id:id,value:value}));
     },
     applyImport() { let next=this.listNext,rows=this.listPreview.map(r=>({id:next++,value:r.value})); this.listNext=next; this.listRows=this.listRows.concat(rows); this.listImport=false; this.listImportText=''; this.listPreview=[]; this.listError=''; },
     saveList() {
       if(this.listImportText.length) {this.listError=this.texts.finishImport;return;}
       if((this.listEntry.length||this.listEditing>=0)&&!this.putListEntry()) return;
       let values=this.listRows.map(r=>r.value);
-      if(this.listTarget==='config') {
-        let f=this.listField,draft={original:f.original,text:JSON.stringify(values),boolean:f.boolean,baselineText:f.text,baselineBoolean:f.boolean};
-        this.drafts=Object.assign({},this.drafts,{[f.id]:draft}); this.commitField(f);
-      } else this[this.listTarget]=values;
+      let f=this.listField,draft={original:f.original,text:JSON.stringify(values),boolean:f.boolean,baselineText:f.text,baselineBoolean:f.boolean};
+      this.drafts=Object.assign({},this.drafts,{[f.id]:draft}); this.commitField(f);
       this.closeList();
     }
 
@@ -442,9 +571,9 @@ export default {
   .dark .on { background:#363636; color:var(--fg); }
   .nav-icon { width:18px; height:18px; color:var(--fg); }
   .nav-mark { width:3px; height:16px; }
-  /* Three 40 px entries and two gaps; the overlaid selection indicator
+  /* Four 40 px entries and three gaps; the overlaid selection indicator
      must not reserve an additional row below the navigation. */
-  .nav-items { height:128px; gap:4px; flex-shrink:0; }
+  .nav-items { height:172px; gap:4px; flex-shrink:0; }
   .nav-indicator { position:absolute; left:4px; top:12px; width:3px; height:16px; border-radius:2px; background:var(--accent-text); }
   .light .nav-indicator { background:#0067c0; }
   .dark .nav-indicator { background:#60cdff; }
@@ -474,7 +603,6 @@ export default {
   .directory-item { min-height:52px; padding:8px 12px; flex-shrink:0; }
   .directory-item .column { gap:2px; }
   .directory-name, .directory-path { white-space:nowrap; }
-  .directory-actions button { flex:1; flex-shrink:0; }
   .selected-directory { font-size:12px; color:var(--fg-2); }
   .search-field { placeholder-color:var(--fg-2); }
   .task-filters { flex-wrap:wrap; }
@@ -508,14 +636,11 @@ export default {
   button { padding:6px 12px; border-radius:4px; min-height:32px; flex-shrink:0; cursor:pointer; }
   toggle { flex-shrink:0; }
   .action-row { flex-direction:row; flex-wrap:wrap; align-items:center; gap:8px; }
-  .input-row { flex-direction:row; flex-wrap:wrap; align-items:center; gap:8px; }
-  .input-row input { min-width:140px; }
-  .inline-form { flex-shrink:0; }
   .password-toolbar { flex-direction:row; flex-wrap:wrap; align-items:center; gap:16px; }
   .password-tabs { flex-direction:row; flex-wrap:wrap; align-items:center; gap:8px; }
   .password-search { width:220px; flex-shrink:0; }
   input, select { height:32px; }
-  .content > input, .sidebar > input, .inline-form textarea { display:block; width:100%; }
+  .content > input, .sidebar > input { display:block; width:100%; }
   textarea { min-height:90px; }
   /* Core UI scrollbars overlay the viewport (up to 9 px plus a 2 px
      inset). Reserve 18 px for the bar and shadows in every scroll pane. */
@@ -572,6 +697,21 @@ export default {
   .history-text { width:100%; white-space:pre-wrap; }
   .history-save { width:132px; flex-shrink:0; }
   .history-divider { height:1px; background:var(--card-border); }
+  .root-table { flex:1; gap:0px; }
+  .root-columns { flex-direction:row; align-items:center; gap:12px; }
+  .root-header { padding:7px 18px 7px 0px; flex-shrink:0; border-bottom:1px solid var(--card-border); }
+  .root-header .root-path-column { padding:0px 11px; white-space:nowrap; }
+  .root-header .root-deep-column { text-align:center; white-space:nowrap; }
+  .root-row { padding:10px 0px; min-height:52px; }
+  .root-path-column { flex:1; min-width:0px; gap:0px; }
+  .root-deep-column { width:104px; flex-shrink:0; align-items:center; }
+  .root-path-cell { width:100%; height:32px; gap:0px; }
+  .root-path-cell input { width:100%; height:32px; padding:0px 35px 0px 11px; }
+  .root-path-cell .password-text-value { padding:0px 35px 0px 11px; }
+  .root-browse { position:absolute; top:4px; right:4px; width:24px; height:24px; padding:3px; border:0px; background:#00000001; color:var(--fg); }
+  .light .root-browse:hover { background:#0000000d; }
+  .dark .root-browse:hover { background:#ffffff16; }
+  .root-browse svg { width:16px; height:16px; }
   .nav-item { transition:background-color 140ms ease-out; }
 </style>
 <template>
@@ -596,6 +736,10 @@ export default {
           <div class="nav-mark"/>
           <svg class="nav-icon" viewBox="0 0 24 24" fill="none"><path d="M4 7h16M4 17h16M8 4v6M16 14v6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg><label>{{ texts.config }}</label>
         </button>
+        <button id="tabRoots" :class="tab==='roots'?'nav-item on':'nav-item'" @click="go('roots')">
+          <div class="nav-mark"/>
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none"><path d="M3 6h7l2 2h9v11H3V6Z" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg><label>{{ texts.rootManagement }}</label>
+        </button>
         <button id="tabPasswords" :class="tab==='passwords'?'nav-item on':'nav-item'" @click="go('passwords')">
           <div class="nav-mark"/>
           <svg class="nav-icon" viewBox="0 0 24 24" fill="none"><path d="M14 5a5 5 0 1 1-2 8l-7 7H2v-3l7-7a5 5 0 0 1 5-5Z" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg><label>{{ texts.passwords }}</label>
@@ -609,7 +753,7 @@ export default {
       </div>
       <div id="directoryPane" v-show="tab==='tasks'||tab==='passwords'" class="directory-pane">
         <div class="directory-tools">
-        <div class="row"><label class="subheading fill">{{ texts.roots }}</label><button id="newRoot" v-show="tab==='tasks'" @click="editRoot(null)">{{ texts.addRoot }}</button></div>
+        <label class="subheading">{{ texts.roots }}</label>
         <input id="directorySearch" type="search" class="search-field" :placeholder="texts.searchDirectory" :value="directoryQuery" @input="searchDirectory"/>
         <button id="allRoots" :class="!directorySelection?'context-item on':'context-item'" @click="selectDirectory('')"><label>{{ texts.allDirectories }}</label></button>
         </div>
@@ -618,25 +762,16 @@ export default {
             <div class="column fill"><label :ellipsis-start="true" class="directory-name">{{ d.name||d.path }}</label><label :ellipsis-start="true" class="muted directory-path">{{ d.path }}</label></div>
           </button>
         </VirtualList></ScrollView>
-        <div v-show="tab==='tasks' &amp;&amp; chosenDirectory.path" class="row directory-actions"><button id="editSelectedRoot" @click="editRoot(chosenDirectory)">{{ texts.edit }}</button><button @click="send('openPath',{path:chosenDirectory.path})">{{ texts.open }}</button><button id="deleteSelectedRoot" :enabled="!recordSaving.roots" @click="deleteListedRoot(chosenDirectory)">{{ texts.delete }}</button></div>
       </div>
       </div>
       <div class="workspace">
       <div id="page-tasks" v-show="tab==='tasks' &amp;&amp; !listTarget" class="content">
         <div class="page-header"><label class="heading">{{ texts.tasks }}</label></div>
-        <label v-show="!rootEditor &amp;&amp; saveErrors['@roots']" class="error">{{ errorText(saveErrors['@roots']) }}</label>
-        <label v-show="chosenDirectory.path &amp;&amp; !rootEditor" class="selected-directory" :ellipsis-start="true">{{ chosenDirectory.path }}</label>
-        <div v-show="!rootEditor" class="row task-filters"><input id="taskSearch" type="search" class="fill search-field" :placeholder="texts.taskSearch" :value="taskQuery" @input="searchTasks"/>
+        <label v-show="chosenDirectory.path" class="selected-directory" :ellipsis-start="true">{{ chosenDirectory.path }}</label>
+        <div class="row task-filters"><input id="taskSearch" type="search" class="fill search-field" :placeholder="texts.taskSearch" :value="taskQuery" @input="searchTasks"/>
           <div id="taskStatusHost" style="width:180px;height:32px"/>
         </div>
         <ScrollView id="taskListScroll"><div id="taskBody" class="column">
-        <div id="rootForm" v-show="rootEditor" class="card inline-form" :enabled="!!rootOriginal||!recordSaving.roots">
-            <div class="row"><label class="subheading">{{ rootOriginal?texts.editRoot:texts.addRoot }}</label><div class="spacer"/><button id="closeRootEditor" @click="leaveRoot()">{{ texts.cancelEntries }}</button></div>
-          <label class="muted">{{ texts.inputDirectory }}</label><div class="input-row"><input id="rootInput" :ellipsis-start="true" class="fill" v-model="rootInput"/><button id="browseRoot" @click="send('browse',{target:'rootInput'})">{{ texts.chooseDirectory }}</button></div>
-          <div v-show="!rootOriginal" class="column"><div class="action-row"><label>{{ listCount(rootPaths) }}</label><button id="manageRoots" @click="openList('rootPaths')">{{ texts.manageEntries }}</button></div><label class="muted collection-preview" :ellipsis-start="true">{{ listSummary(rootPaths,true) }}</label><label class="muted">{{ texts.rootBatchHint }}</label></div>
-          <label class="muted">{{ texts.rootOutput }}</label><div class="input-row"><input id="rootOutput" :ellipsis-start="true" class="fill" v-model="rootOutput"/><button id="browseOutput" @click="send('browse',{target:'rootOutput'})">{{ texts.chooseOutput }}</button></div>
-          <label v-show="saveErrors['@roots']" class="error">{{ errorText(saveErrors['@roots']) }}</label><div class="action-row"><toggle id="rootDeepToggle" :checked="rootDeep" @change="v=>rootDeep=v"/><label>{{ texts.deep }}</label><button id="finishRoot" @click="rootAction('save',rootOriginal?{}:null)">{{ rootOriginal?texts.saveEntries:texts.addToList }}</button><button v-show="rootOriginal" @click="rootAction('delete')">{{ texts.deleteRoot }}</button></div>
-        </div>
           <VirtualList id="taskItems" class="column" estimated-height="68px" immutable-items="true"><div v-for="t in tasks.rows" :key="t.id" :id="'task-'+t.id" :class="'task '+appearance">
             <div class="row"><button :id="'taskName-'+t.id" class="taskname" @click="send('openTask',{task:t})">{{ t.name }}</button><div class="spacer"/><label class="status" :class="'status-'+t.statusTone">{{ t.statusText }}</label></div>
             <div class="row task-meta"><label :id="'taskRoot-'+t.id" class="muted fill" :ellipsis-start="true">{{ t.partCount ? texts.identifiedParts.replace('{count}',t.partCount)+' · ' : '' }}{{ texts.taskFolder }}{{ t.directory }}</label><label class="time">{{ t.time }}</label></div>
@@ -703,6 +838,31 @@ export default {
           </VirtualList>
         </div></ScrollView>
       </div>
+      <div id="page-roots" v-show="tab==='roots' &amp;&amp; !listTarget" class="content">
+        <div class="page-header"><label class="heading">{{ texts.rootManagement }}</label></div>
+        <div class="row"><input id="rootSearch" type="search" class="fill search-field" :placeholder="texts.searchDirectory" :value="rootQuery" @input="searchRoots"/><button id="addRoot" @click="addRoot()">{{ texts.addRoot }}</button></div>
+        <div :class="'root-table history-list '+appearance">
+          <div id="rootTableHeader" class="root-columns root-header"><label class="root-path-column">{{ texts.roots }}</label><label class="root-path-column">{{ texts.rootOutput }}</label><label class="root-deep-column">{{ texts.deep }}</label><div class="password-actions"/></div>
+          <ScrollView id="rootListScroll"><VirtualList id="rootItems" estimated-height="53px" style="gap:0px"><div v-for="r in shownRootRows" :key="r.id" :id="'root-row-'+r.id" class="history-entry">
+            <div class="root-columns root-row">
+              <div class="root-path-column"><div class="root-path-cell">
+                <button v-show="rootCell!==r.id||rootPart!=='input'" :id="'root-input-text-'+r.id" class="password-text" @click="beginRoot(r,'input')"><label :id="'root-input-value-'+r.id" :class="rootDraft(r).input?'password-text-value':'password-text-value muted'" :ellipsis-start="true">{{ rootDraft(r).input||texts.rootPasteHint }}</label><div class="password-hover-line"/></button>
+                <input v-show="rootCell===r.id &amp;&amp; rootPart==='input'" :id="'root-input-input-'+r.id" :value="rootDraft(r).input" :placeholder="texts.rootPasteHint" :ellipsis-start="true" @input="v=>changeRoot(r,'input',v)" @blur="blurRoot(r,'input')" @submit="finishRootCell()"/>
+                <button class="root-browse" :id="'browse-root-input-'+r.id" @click="browseRoot(r,'input')"><svg viewBox="0 0 24 24" fill="none"><path d="M3 6h7l2 2h9v11H3V6Z" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+              </div></div>
+              <div class="root-path-column"><div class="root-path-cell">
+                <button v-show="rootCell!==r.id||rootPart!=='output'" :id="'root-output-text-'+r.id" class="password-text" @click="beginRoot(r,'output')"><label :id="'root-output-value-'+r.id" :class="rootDraft(r).output?'password-text-value':'password-text-value muted'" :ellipsis-start="true">{{ rootDraft(r).output||texts.rootOutputHint }}</label><div class="password-hover-line"/></button>
+                <input v-show="rootCell===r.id &amp;&amp; rootPart==='output'" :id="'root-output-input-'+r.id" :value="rootDraft(r).output" :placeholder="texts.rootOutputHint" :ellipsis-start="true" @input="v=>changeRoot(r,'output',v)" @blur="blurRoot(r,'output')" @submit="finishRootCell()"/>
+                <button class="root-browse" :id="'browse-root-output-'+r.id" @click="browseRoot(r,'output')"><svg viewBox="0 0 24 24" fill="none"><path d="M3 6h7l2 2h9v11H3V6Z" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+              </div></div>
+              <div class="root-deep-column"><toggle :id="'root-deep-'+r.id" :checked="rootDraft(r).deep" @change="v=>toggleRoot(r,v)"/></div>
+              <button class="password-actions" :id="'delete-root-'+r.id" @click="deleteListedRoot(r)">{{ texts.delete }}</button>
+            </div>
+            <div v-show="rootDraft(r).error" class="action-row"><label class="error">{{ errorText(rootDraft(r).error) }}</label><button :enabled="!rootDraft(r).pending" @click="commitRoots([rootDraft(r)])">{{ texts.saveEntries }}</button><button :enabled="!rootDraft(r).pending" @click="discardRoot(r.id)">{{ texts.cancelEntries }}</button></div>
+            <div class="history-divider"/>
+          </div></VirtualList></ScrollView>
+        </div>
+      </div>
       <div id="page-passwords" v-show="tab==='passwords' &amp;&amp; !listTarget" class="content">
         <div class="page-header"><label class="heading">{{ texts.passwords }}</label></div>
         <label v-show="passwordRoot" class="selected-directory" :ellipsis-start="true">{{ passwordRoot }}</label>
@@ -734,11 +894,11 @@ export default {
         <div class="row"><label class="heading fill">{{ listTitle }}</label><button id="cancelList" @click="closeList()">{{ texts.cancelEntries }}</button><button id="saveList" @click="saveList()">{{ texts.saveEntries }}</button></div>
         <div v-show="!listImport" class="action-row"><label>{{ listCount(listRows) }}</label><input id="listSearch" type="search" class="fill" :value="listQuery" @input="searchList" :placeholder="texts.searchEntries"/></div>
         <label v-show="listError" class="error">{{ listError }}</label>
-        <ScrollView id="listScroll" v-show="!listImport"><VirtualList id="listItems" estimated-height="48px"><div v-for="r in matchingListRows" :key="r.id" :id="'list-row-'+r.id" class="list-row"><label class="list-value" :ellipsis-start="listTarget==='rootPaths'||isDirectoryValue(r.value)">{{ entryLabel(r.value) }}</label><button :id="'edit-list-'+r.id" @click="editListRow(r)">{{ texts.edit }}</button><button :id="'remove-list-'+r.id" @click="removeListRow(r.id)">{{ texts.delete }}</button></div></VirtualList></ScrollView>
-        <div v-show="!listImport" class="column"><label>{{ listEditing===-1?texts.newEntry:texts.edit }}</label><input :ellipsis-start="listTarget==='rootPaths'||isDirectoryValue(listEntry)" id="listEntry" v-show="!listMultiline" v-model="listEntry" @submit="putListEntry()"/><textarea id="listMultiline" v-show="listMultiline" v-model="listEntry" style="height:90px"/>
-          <div class="action-row"><button id="putListEntry" @click="putListEntry()">{{ listEditing===-1?texts.addToList:texts.updateEntry }}</button><button v-show="listTarget==='rootPaths'" id="browseListEntry" @click="send('browse',{target:'listEntry'})">{{ texts.chooseDirectory }}</button><button v-show="listTarget==='config'" id="toggleListMultiline" @click="listMultiline=!listMultiline">{{ texts.multilineEntry }}</button><button id="importList" @click="listImport=!listImport">{{ texts.importEntries }}</button></div>
+        <ScrollView id="listScroll" v-show="!listImport"><VirtualList id="listItems" estimated-height="48px"><div v-for="r in matchingListRows" :key="r.id" :id="'list-row-'+r.id" class="list-row"><label class="list-value" :ellipsis-start="isDirectoryValue(r.value)">{{ entryLabel(r.value) }}</label><button :id="'edit-list-'+r.id" @click="editListRow(r)">{{ texts.edit }}</button><button :id="'remove-list-'+r.id" @click="removeListRow(r.id)">{{ texts.delete }}</button></div></VirtualList></ScrollView>
+        <div v-show="!listImport" class="column"><label>{{ listEditing===-1?texts.newEntry:texts.edit }}</label><input :ellipsis-start="isDirectoryValue(listEntry)" id="listEntry" v-show="!listMultiline" v-model="listEntry" @submit="putListEntry()"/><textarea id="listMultiline" v-show="listMultiline" v-model="listEntry" style="height:90px"/>
+          <div class="action-row"><button id="putListEntry" @click="putListEntry()">{{ listEditing===-1?texts.addToList:texts.updateEntry }}</button><button v-show="listTarget==='config'" id="toggleListMultiline" @click="listMultiline=!listMultiline">{{ texts.multilineEntry }}</button><button id="importList" @click="listImport=!listImport">{{ texts.importEntries }}</button></div>
         </div>
-        <div v-show="listImport" class="list-import"><label class="muted">{{ texts.importHint }}</label><textarea id="listImportText" v-model="listImportText" @input="v=>{listImportText=v;listPreview=[];}" style="height:100px"/><div class="action-row"><button id="previewImport" @click="previewImport()">{{ texts.previewEntries }}</button><button id="applyImport" :enabled="listPreview.length>0" @click="applyImport()">{{ texts.importEntries }} · {{ listPreview.length }}</button><button id="cancelImport" @click="listImport=false;listImportText='';listPreview=[];listError=''">{{ texts.cancelEntries }}</button></div><ScrollView><VirtualList id="importPreviewItems" estimated-height="28px"><label v-for="r in listPreview" :key="r.id" :ellipsis-start="listTarget==='rootPaths'||isDirectoryValue(r.value)">{{ entryLabel(r.value) }}</label></VirtualList></ScrollView></div>
+        <div v-show="listImport" class="list-import"><label class="muted">{{ texts.importHint }}</label><textarea id="listImportText" v-model="listImportText" @input="v=>{listImportText=v;listPreview=[];}" style="height:100px"/><div class="action-row"><button id="previewImport" @click="previewImport()">{{ texts.previewEntries }}</button><button id="applyImport" :enabled="listPreview.length>0" @click="applyImport()">{{ texts.importEntries }} · {{ listPreview.length }}</button><button id="cancelImport" @click="listImport=false;listImportText='';listPreview=[];listError=''">{{ texts.cancelEntries }}</button></div><ScrollView><VirtualList id="importPreviewItems" estimated-height="28px"><label v-for="r in listPreview" :key="r.id" :ellipsis-start="isDirectoryValue(r.value)">{{ entryLabel(r.value) }}</label></VirtualList></ScrollView></div>
       </div>
       </div>
     </div>

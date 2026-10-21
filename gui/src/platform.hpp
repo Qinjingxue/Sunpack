@@ -53,7 +53,7 @@ public:
 };
 struct StartupInfo { bool enabled = false; std::string command; };
 StartupInfo read_startup();
-fs::path choose_directory(HWND owner);
+fs::path choose_directory(HWND owner, const fs::path& initial = {});
 std::wstring quote_arg(const std::wstring& arg);
 struct CliCommand { fs::path executable, cwd; std::vector<std::wstring> prefix; };
 struct CliResult { DWORD code; std::string output; };

@@ -395,7 +395,13 @@ void roots(Fixture& f) {
     assert(root_for(f.dir/"Data2"/"part.zip",prefix_roots)==utf8((f.dir/"Data2").wstring()));
     assert(root_for(f.dir/"Data20"/"part.zip",prefix_roots)==utf8(f.dir.wstring()));
     assert(root_for(f.dir.parent_path()/"untracked.zip",prefix_roots)=="@other");
-    fails([&]{edit_root(p,"save","",utf8(nested.wstring()),"",false);});
+    auto duplicate_before=read_file(p);
+    edit_root(p,"save","",utf8(nested.wstring()),"",false);
+    assert(read_file(p)==duplicate_before);
+    fails([&]{edit_root(p,"save","",utf8(nested.wstring()),"different-output",false);});
+    edit_root(p,"save",utf8(nested.wstring()),utf8(f.dir.wstring()),"末条",true);
+    auto merged_root=read_roots(p); assert(merged_root.entries.size()==1 && merged_root.entries[0].deep && merged_root.entries[0].output=="末条");
+    edit_root(p,"save","",utf8(nested.wstring()),"",false);
     edit_root(p,"delete",utf8(nested.wstring()),utf8(nested.wstring()),"",false);
     assert(read_file(p).find("# 保留注释")!=std::string::npos);
     assert(path_key(L"C:/İ/中文/../A")==path_key(L"c:\\İ\\a"));
