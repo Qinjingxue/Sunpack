@@ -775,8 +775,8 @@
       "en": "Recursive extraction"
     },
     "embedded_scan": {
-      "zh": "内嵌压缩包",
-      "en": "Embedded archives"
+      "zh": "扫描内嵌压缩包",
+      "en": "Scan embedded archives"
     },
     "post_extract": {
       "zh": "解压后处理",
@@ -1491,8 +1491,8 @@
     },
     "/embedded_scan/enabled": {
       "label": {
-        "zh": "内嵌压缩包",
-        "en": "Embedded archives"
+        "zh": "扫描内嵌压缩包",
+        "en": "Scan embedded archives"
       },
       "description": {
         "zh": "查找嵌入文件二进制中的压缩包，例如伪装成图片的压缩包",
