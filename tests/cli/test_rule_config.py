@@ -87,7 +87,7 @@ def test_effective_config_includes_native_worker_and_format_switch():
     config["filesystem"] = {
         "directory_scan_mode": "-",
         "scan_filters": [
-            {"name": "size_range", "enabled": True, "gte": 1048576}
+            {"name": "size_range", "enabled": True, "min_bytes": 1048576}
         ]
     }
     config["performance"] = {

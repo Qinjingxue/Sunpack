@@ -5,6 +5,7 @@
 #include <cassert>
 #include <fstream>
 #include <iostream>
+#include <limits>
 
 using namespace spg;
 void service_notifications();
@@ -287,37 +288,47 @@ void editing(Fixture& f) {
 // leaked message keys, frozen locales and lost Windows codes across the same
 // exception/string boundary used by background saves, without extra processes.
 void range_editing(Fixture& fixture) {
-    auto size=range_editor("10 GiB >= r > 0 B",false);
-    assert(size["supported"]==true && size["lowerOp"]==0 && size["upperOp"]==1);
-    assert(range_expression(size,false)=="0 < r <= 10737418240");
-    auto time=range_editor("20270101 00:00 > d >= 20240229 12:34",true);
-    assert(time["supported"]==true && time["lower"]=="2024-02-29 12:34" && time["upperOp"]==0);
-    assert(range_expression(time,true)=="20240229 12:34 <= d < 20270101 00:00");
-    time["lower"]="2023-02-29 00:00"; fails([&]{range_expression(time,true);});
-    time["lower"]="2028-01-01 00:00"; fails([&]{range_expression(time,true);});
-    size["lower"]="9007199254740993"; size["lowerUnit"]=0; size["upper"]="";
-    assert(range_expression(size,false)=="9007199254740993 < r");
-    assert(range_editor(range_expression(size,false),false)["lower"]==size["lower"]);
-    size["lower"]="18446744073709551615";
-    assert(range_expression(size,false)=="18446744073709551615 < r");
-    size["lowerUnit"]=1; fails([&]{range_expression(size,false);});
-    size["lower"]="-1"; fails([&]{range_expression(size,false);});
-    size["lower"]="2"; size["lowerUnit"]=0; size["upper"]="1"; size["upperUnit"]=0; fails([&]{range_expression(size,false);});
-    size["lower"]="1"; fails([&]{range_expression(size,false);});
-    size["lowerOp"]=1; assert(range_expression(size,false)=="1 <= r <= 1");
-    size["lower"]=""; size["upper"]=""; assert(range_expression(size,false).empty());
-    for(auto text:{"r == 20", "r > 1.5 MiB", "r >= 18446744073709551616", "r > nope"}) assert(range_editor(text,false)["supported"]==false);
-    assert(range_editor("d > 2024-01-01T00:00:01+08:00",true)["supported"]==false);
-    std::string source=R"({"filesystem":{"scan_filters":[{"name":"size_range","enabled":true,"range":"r > 0 B","gte":2,"eq":null},{"name":"mtime_range","enabled":false,"date":"d == 20240101"}]},"unknown":123456789012345678901234567890})";
-    auto config=parse_json(source);
-    auto path=fixture.dir/"ranges.json"; atomic_write(path,source);
-    auto rows=config_fields(config,read_file(path));
-    auto field=rows[1];
-    assert(field["editor"]=="size_range" && field["rangeExtra"].get<std::string>().find("gte = 2")!=std::string::npos);
-    save_config_field(path,field["id"],field["original"],"string",range_expression(field["range"],false),false);
-    auto updated=read_json(path);
-    assert(updated["filesystem"]["scan_filters"][0]["gte"]==2 && updated["filesystem"]["scan_filters"][1]["date"]=="d == 20240101");
+    Json sizeModule={{"name","size_range"},{"enabled",true},{"min_bytes",uint64_t(1)},{"max_bytes",Json()}};
+    auto size=range_editor(sizeModule); size["lower"]="1.5"; size["lowerUnit"]=2;
+    assert(range_configuration(size,false)["min_bytes"]==1572864);
+    size["lower"]="9007199254740993"; size["lowerUnit"]=0;
+    assert(range_configuration(size,false)["min_bytes"]==uint64_t(9007199254740993));
+    size["lower"]="18446744073709551615.0";
+    assert(range_configuration(size,false)["min_bytes"]==std::numeric_limits<uint64_t>::max());
+    size["lowerUnit"]=1; fails([&]{range_configuration(size,false);});
+    size["lower"]="-1"; fails([&]{range_configuration(size,false);});
+    size["lower"]="1.1"; size["lowerUnit"]=1; size["upper"]="2.1"; size["upperUnit"]=1;
+    auto rounded=range_configuration(size,false); assert(rounded["min_bytes"]==1127 && rounded["max_bytes"]==2150);
+    size["lower"]="1";size["upper"]="1";size["lowerUnit"]=size["upperUnit"]=0;
+    assert(range_configuration(size,false)["min_bytes"]==range_configuration(size,false)["max_bytes"]);
+    size["lower"]="2"; fails([&]{range_configuration(size,false);});
+    size["lower"]="";size["upper"]=""; assert(range_configuration(size,false)["min_bytes"].is_null());
+    DYNAMIC_TIME_ZONE_INFORMATION east{}; east.Bias=-480; wcscpy_s(east.TimeZoneKeyName,L"China Standard Time");
+    DYNAMIC_TIME_ZONE_INFORMATION utc{};wcscpy_s(utc.TimeZoneKeyName,L"UTC");
+    Json timeModule={{"name","mtime_range"},{"enabled",true},{"start_utc","2024-01-01T20:30Z"},{"end_utc","2027-01-01T00:00Z"}};
+    auto time=range_editor(timeModule,&east);
+    assert(time["lower"]=="2024-01-02 04:30");
+    assert(range_configuration(time,true,&utc)==timeModule); // Untouched UTC survives a timezone change.
+    time["lower"]="2024-02-29 12:34"; assert(range_configuration(time,true,&east)["start_utc"]=="2024-02-29T04:34Z");
+    time["lower"]="2023-02-29 00:00"; fails([&]{range_configuration(time,true,&east);});
+    time["lower"]="2028-01-01 00:00"; fails([&]{range_configuration(time,true,&east);});
+    DYNAMIC_TIME_ZONE_INFORMATION us{};wcscpy_s(us.TimeZoneKeyName,L"Eastern Standard Time"); us.Bias=300; us.DaylightBias=-60;
+    us.DaylightDate.wMonth=3;us.DaylightDate.wDay=2;us.DaylightDate.wHour=2;
+    us.StandardDate.wMonth=11;us.StandardDate.wDay=1;us.StandardDate.wHour=2;
+    auto foldModule=timeModule;foldModule["start_utc"]="2024-11-03T05:30Z";
+    auto fold=range_editor(foldModule,&us); assert(range_configuration(fold,true,&us)==foldModule);
+    fold["lower"]="2024-03-10 02:30";fails([&]{range_configuration(fold,true,&us);});
+    auto path=fixture.dir/"ranges.json";
+    std::string source="{\"filesystem\":{\"scan_filters\":["+sizeModule.dump()+","+timeModule.dump()+"]},\"unknown\":123456789012345678901234567890}";
+    atomic_write(path,source); auto rows=config_fields(parse_json(source),source); assert(rows.size()==3);
+    auto field=rows[0]; assert(field["type"]=="object" && field["range"]["lower"]=="1");
+    auto replacement=range_configuration(size,false);
+    save_config_field(path,field["id"],field["original"],"object",replacement.dump(),false);
+    assert(read_json(path)["filesystem"]["scan_filters"][0]==replacement);
+    fails([&]{save_config_field(path,field["id"],field["original"],"object",sizeModule.dump(),false);});
+    fails([&]{save_config_field(path,field["id"].get<std::string>()+"/enabled","true","boolean","",false);});
     assert(read_file(path).find("123456789012345678901234567890")!=std::string::npos);
+    sizeModule["range"]="r > 0"; fails([&]{range_editor(sizeModule);});
 }
 void localization(Fixture& fixture) {
     auto rejected=[&](const std::function<void()>& action,const char* expected) {
@@ -374,6 +385,31 @@ void installer_upgrade(Fixture& fixture) {
         if(config.contains("passwords")) assert(config["passwords"]["clipboard_passwords_enabled"]==true);
         upgrade_config_file(path); assert(read_file(path)==output);
     }
+    const std::vector<std::pair<std::string,Json>> ranges={
+        {R"({"name":"size_range","enabled":true,"range":"r > 0 B"})",Json{{"min_bytes",1},{"max_bytes",Json()}}},
+        {R"({"name":"size_range","range":"r >= 2 MiB","gt":2097152,"greater_than":99999999,"max":3000000})",Json{{"min_bytes",2097153},{"max_bytes",3000000}}},
+        {R"({"name":"size_range","range":"r == 1024","eq":2048,"min":2000})",Json{{"min_bytes",2048},{"max_bytes",2048}}},
+        {R"({"name":"size_range","range":"10 > r > 0 < r","gt":null,"greater_than":100})",Json{{"min_bytes",1},{"max_bytes",9}}},
+        {R"({"name":"size_range","range":"r < 100 B","lte":50,"less_than_or_equal":2})",Json{{"min_bytes",Json()},{"max_bytes",50}}},
+        {R"({"name":"size_range","range":"","gte":9007199254740993,"eq":18446744073709551615})",Json{{"min_bytes",std::numeric_limits<uint64_t>::max()},{"max_bytes",std::numeric_limits<uint64_t>::max()}}},
+        {R"({"name":"size_range","range":null})",Json{{"min_bytes",Json()},{"max_bytes",Json()}}},
+        {R"({"name":"size_range","range":"r > 18446744073709551615"})",Json{{"match_none",true}}},
+        {R"({"name":"mtime_range","date":"d > 2024-01-01T12:30:25Z"})",Json{{"start_utc","2024-01-01T12:30Z"},{"end_utc",Json()}}},
+        {R"({"name":"mtime_range","date":"d == 2024-01-01T00:00+08:00"})",Json{{"start_utc","2023-12-31T16:00Z"},{"end_utc","2023-12-31T16:01Z"}}},
+        {R"({"name":"mtime_range","date":"d >= 2024-01-01T12:30:00Z","before":1704112260000000000})",Json{{"start_utc","2024-01-01T12:30Z"},{"end_utc","2024-01-01T12:31Z"}}},
+        {R"({"name":"mtime_range","date":"20200101 > d > 20260101"})",Json{{"match_none",true}}},
+    };
+    for(auto& scenario:ranges) {
+        auto source="{\"filesystem\":{\"scan_filters\":["+scenario.first+"]},"+keep+"}";
+        atomic_write(path,source); upgrade_config_file(path); auto first=read_file(path);auto upgraded=read_json(path)["filesystem"]["scan_filters"][0];
+        for(auto it=scenario.second.begin();it!=scenario.second.end();++it) assert(upgraded[it.key()]==it.value());
+        auto datetime=upgraded["name"]=="mtime_range";
+        assert(upgraded.contains(datetime?"start_utc":"min_bytes") && upgraded.contains(datetime?"end_utc":"max_bytes"));
+        validate_range_module(upgraded,datetime);
+        assert(first.find(keep)!=std::string::npos); upgrade_config_file(path); assert(read_file(path)==first);
+    }
+    auto invalid=std::string(R"({"filesystem":{"scan_filters":[{"name":"size_range","range":"r > 0"},{"name":"mtime_range","date":"broken"}]}})");
+    atomic_write(path,invalid); fails([&]{upgrade_config_file(path);}); assert(read_file(path)==invalid);
     // Retained advanced values are not normalized or reformatted on upgrade.
     atomic_write(path,kDefaultsJson); upgrade_config_file(path); assert(read_file(path)==kDefaultsJson);
     atomic_write(path,"{invalid}"); fails([&]{upgrade_config_file(path);}); assert(read_file(path)=="{invalid}");
@@ -532,9 +568,12 @@ int wmain(int argc,wchar_t** argv) {
     if(argc>=2 && std::wstring(argv[1])==L"--echo") { Json args=Json::array(); for(int i=2;i<argc;++i) args.push_back(utf8(argv[i])); std::cout<<args.dump(); return 7; }
     if(argc==4 && std::wstring(argv[1])==L"--password-add") { edit_password(argv[2],"add",Json(),Json({{"value",utf8(argv[3])}})); return 0; }
     if(argc==2 && std::wstring(argv[1])==L"--ranges") {
-        auto size=range_editor("r > 0 B",false); size["lower"]="9007199254740993"; size["lowerOp"]=1;
-        auto time=range_editor("20270101 00:00 > d >= 20240229 12:34",true);
-        std::cout<<Json{{"size",range_expression(size,false)},{"time",range_expression(time,true)}}.dump(); return 0;
+        auto size=range_editor(Json{{"name","size_range"},{"enabled",true},{"min_bytes",1},{"max_bytes",Json()}});
+        size["lower"]="9007199254740993";
+        DYNAMIC_TIME_ZONE_INFORMATION east{};east.Bias=-480;wcscpy_s(east.TimeZoneKeyName,L"China Standard Time");
+        auto time=range_editor(Json{{"name","mtime_range"},{"enabled",true},{"start_utc",Json()},{"end_utc",Json()}},&east);
+        time["lower"]="2024-02-29 12:34";time["upper"]="2027-01-01 00:00";
+        std::cout<<Json{{"size",range_configuration(size,false)},{"time",range_configuration(time,true,&east)}}.dump(); return 0;
     }
     try { Fixture f; projection(f); logical_projection(f); editing(f); roots(f); range_editing(f); localization(f); installer_upgrade(f); batch_editing(f); service_notifications(); std::cout<<"GUI file contracts passed\n"; }
     catch(const std::exception& e) { std::cerr<<e.what()<<"\n"; return 1; }

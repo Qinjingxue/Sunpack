@@ -1,5 +1,6 @@
 #include "application.hpp"
 #include "presentation.hpp"
+#include "range_editor.hpp"
 #include "ui_defaults_json.h"
 #include <cassert>
 #include <iostream>
@@ -487,7 +488,7 @@ struct RangeDialogDriver {
     ~RangeDialogDriver() { UnhookWindowsHookEx(hook); active=nullptr; }
 };
 void range_config(Application& app,const fs::path& dir) {
-    auto field=[&](const std::string& module) { for(auto& f:state(app.page(),"fields")) if(f["module"]==module && f["type"]=="string") return f; return Json(); };
+    auto field=[&](const std::string& module) { for(auto& f:state(app.page(),"fields")) if(f["module"]==module && f["type"]=="object") return f; return Json(); };
     auto size=field("size_range"),time=field("mtime_range"); assert(!size.is_null() && !time.is_null());
     auto id=size["id"].get<std::string>(),tid=time["id"].get<std::string>();
     auto input=[&](const std::string& control,const wchar_t* value) {
@@ -501,13 +502,14 @@ void range_config(Application& app,const fs::path& dir) {
         assert(std::abs(lower.top-upper.top)<0.1f && upper.left>=lower.right);
         assert(!ui_widget_find_by_id(ui_page_root(app.page()),("range-mode-"+pointer).c_str()));
         assert(!ui_widget_find_by_id(ui_page_root(app.page()),("range-expression-"+pointer).c_str()));
-        auto op=rect(app,"range-lower-op-"+pointer),value=rect(app,"range-lower-"+pointer);
-        assert(op.right-op.left<65 && value.right-value.left<(datetime?180:130));
+        assert(!ui_widget_find_by_id(ui_page_root(app.page()),("range-lower-op-"+pointer).c_str()));
+        auto value=rect(app,"range-lower-"+pointer);
+        assert(value.right-value.left<(datetime?180:130));
         button_texts(app);
         screenshot(app,datetime?L"range-time-wide.png":L"range-size-wide.png");
         ui_window_set_size(app.window(),850,560); ui_window_relayout(app.window());
         lower=rect(app,lowerId); upper=rect(app,upperId);
-        assert(upper.top>=lower.bottom && std::abs(upper.left-lower.left)<0.1f);
+        assert(upper.top>=lower.bottom || (upper.left>=lower.right && std::abs(upper.top-lower.top)<0.1f));
         for(auto side:{"lower","upper"}) {
             auto group=rect(app,"range-"+std::string(side)+"-group-"+pointer);
             auto inputBounds=rect(app,"range-"+std::string(side)+"-"+pointer);
@@ -518,53 +520,51 @@ void range_config(Application& app,const fs::path& dir) {
     };
     search_config(app,L"size_range");
     layout(id,false);
-    assert(field("size_range")["range"]["lowerOp"]==0);
+    auto bound=[&](const std::string& module,const std::string& key) {return parse_json(field(module)["text"])[key];};
+    assert(field("size_range")["range"]["enabled"]==true);
     input("range-lower-"+id,L"9007199254740993"); finish_input(app);
-    pump([&]{return field("size_range")["text"]=="9007199254740993 < r";},"Exact size range save");
+    pump([&]{return bound("size_range","min_bytes")==uint64_t(9007199254740993);},"Exact size range save");
     input("range-upper-"+id,L"1"); ui_window_focus_widget(app.window(),0);
     pump([&]{return state(app.page(),"saveErrors").contains(id);},"Range ordering validation");
-    assert(read_json(dir/"sunpack_config.json")[Json::json_pointer(id)]=="9007199254740993 < r");
+    assert(read_json(dir/"sunpack_config.json")[Json::json_pointer(id)]["min_bytes"]==uint64_t(9007199254740993));
     input("range-upper-"+id,L""); finish_input(app);
     input("range-lower-"+id,L"2"); finish_input(app);
     auto unit=ui_widget_find_by_id(ui_page_root(app.page()),("range-lower-unit-"+id).c_str()); assert(unit);
     assert(ui_debug_combo_select(app.window(),unit,2)==0); ui_widget_destroy(unit); finish_input(app);
-    try { pump([&]{return field("size_range")["text"]=="2097152 < r";},"Size unit conversion"); }
+    try { pump([&]{return bound("size_range","min_bytes")==2097152;},"Size unit conversion"); }
     catch(...) { std::cerr<<"Range unit: field="<<field("size_range")<<" drafts="<<state(app.page(),"drafts")<<" errors="<<state(app.page(),"saveErrors")<<'\n'; throw; }
-    auto boundary=ui_widget_find_by_id(ui_page_root(app.page()),("range-lower-op-"+id).c_str()); assert(boundary);
-    assert(ui_debug_combo_select(app.window(),boundary,1)==0); ui_widget_destroy(boundary); finish_input(app);
-    pump([&]{return field("size_range")["text"]=="2097152 <= r";},"Inclusive boundary save");
+    click(app,("range-enabled-"+id).c_str()); finish_input(app);
+    pump([&]{return bound("size_range","enabled")==false;},"Range disable save");
+    click(app,("range-enabled-"+id).c_str()); finish_input(app);
+    pump([&]{return bound("size_range","enabled")==true;},"Range enable save");
     {
         FileMutex hold(dir/"sunpack_config.json");
         input("range-lower-"+id,L"3"); click(app,"configSearch"); ui_debug_pump();
         input("range-lower-"+id,L"4");
     }
-    pump([&]{return field("size_range")["text"]=="3145728 <= r" && !state(app.page(),"saving").get<bool>();},"Range acknowledgement during typing");
+    pump([&]{return bound("size_range","min_bytes")==3145728 && !state(app.page(),"saving").get<bool>();},"Range acknowledgement during typing");
     assert(state(app.page(),"drafts")[id]["range"]["lower"]=="4");
     finish_input(app);
-    pump([&]{return field("size_range")["text"]=="4194304 <= r";},"Continued range edit");
+    pump([&]{return bound("size_range","min_bytes")==4194304;},"Continued range edit");
     screenshot(app,L"range-size-small.png");
     input("range-lower-"+id,L"5");
-    // Structured edits retain their conflict recovery; unsupported legacy
-    // conditions remain read-only and are never silently replaced.
-    auto config=read_json(dir/"sunpack_config.json"); config[Json::json_pointer(id)]="r >= 8388608";
-    auto parent=id.substr(0,id.rfind('/')); config[Json::json_pointer(parent+"/gte")]=7;
+    auto config=read_json(dir/"sunpack_config.json"); config[Json::json_pointer(id)]["min_bytes"]=8388608;
     atomic_write(dir/"sunpack_config.json",config.dump());
-    pump([&]{return field("size_range")["text"]=="r >= 8388608";},"Range reload");
+    pump([&]{return bound("size_range","min_bytes")==8388608;},"Range reload");
     click(app,"configSearch");
     pump([&]{return state(app.page(),"saveErrors").contains(id);},"Range external conflict");
     assert(state(app.page(),"drafts")[id]["range"]["lower"]=="5");
-    assert(read_json(dir/"sunpack_config.json")[Json::json_pointer(id)]=="r >= 8388608");
+    assert(read_json(dir/"sunpack_config.json")[Json::json_pointer(id)]["min_bytes"]==8388608);
     input("range-lower-"+id,L"6"); finish_input(app);
-    assert(read_json(dir/"sunpack_config.json")[Json::json_pointer(parent+"/gte")]==7);
-    config=read_json(dir/"sunpack_config.json"); config[Json::json_pointer(id)]="r == 17";
+    assert(read_json(dir/"sunpack_config.json")[Json::json_pointer(id)]["min_bytes"]==6291456);
+    config=read_json(dir/"sunpack_config.json");
+    config[Json::json_pointer(id)]={{"name","size_range"},{"enabled",true},{"min_bytes",Json()},{"max_bytes",Json()},{"match_none",true}};
     atomic_write(dir/"sunpack_config.json",config.dump());
-    pump([&]{auto f=field("size_range"); return f["text"]=="r == 17" && f["range"]["supported"]==false;},"Legacy range preservation");
+    pump([&]{return field("size_range")["range"]["matchNone"]==true;},"Empty migrated range reload");
     ui_window_relayout(app.window());
-    assert(rendered_widget(app,"range-preserved-"+id)["text"]=="r == 17");
-    assert(!field("size_range")["rangeExtra"].get<std::string>().empty());
-    assert(!ui_widget_find_by_id(ui_page_root(app.page()),("range-expression-"+id).c_str()));
-    auto preserved=read_file(dir/"sunpack_config.json");
-    click(app,"configSearch"); ui_debug_pump(); assert(read_file(dir/"sunpack_config.json")==preserved);
+    click(app,("range-reset-"+id).c_str()); finish_input(app);
+    pump([&]{return field("size_range")["range"]["matchNone"]==false;},"Empty range reset");
+    assert(bound("size_range","min_bytes").is_null() && bound("size_range","max_bytes").is_null());
     search_config(app,L"mtime_range");
     input("range-lower-"+tid,L"2023-02-29 00:00"); ui_window_focus_widget(app.window(),0);
     pump([&]{return state(app.page(),"saveErrors").contains(tid);},"Leap date validation");
@@ -572,7 +572,7 @@ void range_config(Application& app,const fs::path& dir) {
         RangeDialogDriver driver;
         click(app,("range-lower-pick-"+tid).c_str()); finish_input(app); assert(driver.seen);
     }
-    pump([&]{return field("mtime_range")["text"].get<std::string>().find("20240229 12:34")!=std::string::npos;},"Native date selection");
+    pump([&]{return field("mtime_range")["range"]["lower"]=="2024-02-29 12:34";},"Native date selection");
     auto before=read_file(dir/"sunpack_config.json");
     {
         RangeDialogDriver driver(true);

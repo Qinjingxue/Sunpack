@@ -266,7 +266,7 @@ def test_worker_inventory_fused_snapshot_applies_mtime_after_directory_projectio
     new_file = new_dir / "new.zip"
     old_file.write_bytes(b"old")
     new_file.write_bytes(b"new")
-    cutoff_ns = 2_000_000_000
+    cutoff_ns = 60_000_000_000
     rows = [
         [0, "old/old.zip", "", 3, 3, 0, 0, 0, 0, 1, 1, 1, cutoff_ns - 1, b"old".hex()],
         [1, "new/new.zip", "", 3, 3, 0, 0, 0, 0, 1, 1, 1, cutoff_ns, b"new".hex()],
@@ -289,7 +289,7 @@ def test_worker_inventory_fused_snapshot_applies_mtime_after_directory_projectio
     config = make_config({
         "filesystem": {
             "scan_filters": [
-                {"name": "mtime_range", "enabled": True, "gte": cutoff_ns},
+                {"name": "mtime_range", "enabled": True, "start_utc": "1970-01-01T00:01Z"},
             ],
         },
     })

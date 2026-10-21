@@ -1,5 +1,6 @@
 #include "model.hpp"
 #include "range_editor.hpp"
+#include "range_migration.hpp"
 #include "presentation.hpp"
 #include <algorithm>
 #include <chrono>
@@ -225,7 +226,11 @@ static std::string patch_config(std::string source,const Json& edits) {
             const auto& owner=j.at(Json::json_pointer(parent));
             if(owner.is_object() && owner.contains("name") && owner["name"].is_string()) module=owner["name"].get<std::string>();
         }
-        validate_setting(pointer,replacement,module);
+        if(module=="size_range" || module=="mtime_range") throw std::runtime_error("rangeAtomic");
+        const auto& current=j.at(target);
+        if(current.is_object() && current.contains("name") && (current["name"]=="size_range" || current["name"]=="mtime_range"))
+            validate_range_module(replacement,current["name"]=="mtime_range");
+        else validate_setting(pointer,replacement,module);
         auto range=tokens.ranges.at(pointer);
         changes.push_back({range.first,range.second,type=="string" || type=="boolean"?replacement.dump():text});
         } catch(const std::exception& error) { throw ConfigEditError(pointer,error.what()); }
@@ -250,6 +255,24 @@ void upgrade_config_file(const fs::path& path) {
     auto document=parse_json(source);
     if(!document.is_object()) throw std::runtime_error("configObjectRequired");
     bool changed=false;
+    // Resolve every replacement before the single final write. Unknown JSON
+    // outside these module tokens retains its original text and precision.
+    const auto filters=Json::json_pointer("/filesystem/scan_filters");
+    if(document.contains(filters) && document.at(filters).is_array()) {
+        JsonTokens tokens(source);
+        struct Replacement {size_t at,length;std::string text;}; std::vector<Replacement> replacements;
+        const auto& modules=document.at(filters);
+        for(size_t i=0;i<modules.size();++i) {
+            const auto& old=modules[i];
+            if(!old.is_object() || !old.contains("name") || (old["name"]!="size_range" && old["name"]!="mtime_range")) continue;
+            const auto pointer="/filesystem/scan_filters/"+std::to_string(i); Json replacement;
+            if(migrate_range_module(old,replacement,[&](const std::string& key){return tokens.token(pointer+"/"+pointer_escape(key));})) {
+                auto span=tokens.ranges.at(pointer); replacements.push_back({span.first,span.second,replacement.dump()});
+            }
+        }
+        for(auto it=replacements.rbegin();it!=replacements.rend();++it) source.replace(it->at,it->length,it->text);
+        if(!replacements.empty()) {changed=true;document=parse_json(source);}
+    }
     auto erase_member=[&](const std::string& pointer) {
         JsonTokens tokens(source,true);
         auto range=tokens.members.at(pointer);
@@ -898,6 +921,14 @@ Json config_fields(const Json& config,const std::string& source,const std::strin
     walk=[&](const Json& item,std::string pointer,std::string module) {
         if(item.is_object() && !item.empty()) {
             if(item.contains("name") && item["name"].is_string()) module=item["name"].get<std::string>();
+            if(pointer.rfind("/filesystem/scan_filters/",0)==0 && pointer.find('/',25)==std::string::npos && (module=="size_range" || module=="mtime_range")) {
+                auto raw=tokens?tokens->token(pointer):item.dump();
+                auto field=describe_setting(pointer,module,language);
+                field.update(Json{{"id",pointer},{"key",pointer+"@"+language+"@"+module},{"type","object"},
+                    {"original",raw},{"text",raw},{"boolean",false},{"choice",-1},{"items",Json::array()},
+                    {"block",pointer},{"primary",true},{"editor",module=="mtime_range"?"datetime_range":"size_range"},{"range",range_editor(item)}});
+                rows.push_back(std::move(field)); return;
+            }
             for(auto it=item.begin();it!=item.end();++it) if(it.key()!="name" || module.empty()) walk(it.value(),pointer+"/"+pointer_escape(it.key()),module);
             return;
         }
@@ -915,18 +946,6 @@ Json config_fields(const Json& config,const std::string& source,const std::strin
         if(editor=="recursive" && choice<0) choice=2;
         field.update(Json{{"id",pointer},{"key",pointer+"@"+language},{"type",type},{"original",raw},{"text",text},{"boolean",item.is_boolean()?item.get<bool>():false},
             {"editor",editor},{"choice",choice},{"items",lines?item:Json::array()}});
-        if(editor=="size_range" || editor=="datetime_range") {
-            field["key"]=pointer+"@"+language+"@"+editor;
-            field["range"]=range_editor(text,editor=="datetime_range");
-            // Explicit aliases still intersect with the expression.
-            const auto& parent=config.at(Json::json_pointer(pointer.substr(0,pointer.rfind('/'))));
-            std::string extra;
-            for(auto it=parent.begin();it!=parent.end();++it) {
-                if(it.key()=="name"||it.key()=="enabled"||it.key()=="range"||it.key()=="date") continue;
-                if(!extra.empty()) extra+="; "; extra+=it.key()+" = "+(tokens?tokens->token(pointer.substr(0,pointer.rfind('/')+1)+pointer_escape(it.key())):it.value().dump());
-            }
-            field["rangeExtra"]=extra;
-        }
         rows.push_back(std::move(field));
     };
     walk(config,"",""); return rows;

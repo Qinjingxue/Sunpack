@@ -44,8 +44,8 @@ def test_directory_scanner_size_range_filters_files_outside_range(tmp_path):
     large.write_bytes(b"c" * 32)
 
     for bounds, expected in (
-        ({"gte": 10, "lt": 32}, {"medium.zip"}),
-        ({"gte": 10}, {"medium.zip", "large.zip"}),
+        ({"min_bytes": 10, "max_bytes": 31}, {"medium.zip"}),
+        ({"min_bytes": 10}, {"medium.zip", "large.zip"}),
     ):
         snapshot = DirectoryScanner(str(tmp_path), config=make_config({
             "filesystem": {
@@ -55,7 +55,7 @@ def test_directory_scanner_size_range_filters_files_outside_range(tmp_path):
         assert {entry.path.name for entry in _entries(snapshot)} == expected
 
 
-def test_directory_scanner_size_range_accepts_human_expression(tmp_path):
+def test_directory_scanner_size_range_accepts_integer_byte_bounds(tmp_path):
     small = tmp_path / "small.zip"
     keep = tmp_path / "keep.zip"
     large = tmp_path / "large.zip"
@@ -66,7 +66,7 @@ def test_directory_scanner_size_range_accepts_human_expression(tmp_path):
     snapshot = DirectoryScanner(str(tmp_path), config=make_config({
         "filesystem": {
             "scan_filters": [
-                {"name": "size_range", "enabled": True, "range": "1 MB < r < 10 MB"},
+                {"name": "size_range", "enabled": True, "min_bytes": 1048577, "max_bytes": 10485759},
             ]
         }
     })).scan()
@@ -91,7 +91,7 @@ def test_directory_scanner_promotes_small_split_member_with_accepted_family_anch
     snapshot = DirectoryScanner(str(tmp_path), config=make_config({
         "filesystem": {
             "scan_filters": [
-                {"name": "size_range", "enabled": True, "gte": 10},
+                {"name": "size_range", "enabled": True, "min_bytes": 10},
             ]
         }
     })).scan()
@@ -130,7 +130,7 @@ def test_directory_scanner_size_deferred_supports_all_split_naming_families(
     snapshot = DirectoryScanner(str(tmp_path), config=make_config({
         "filesystem": {
             "scan_filters": [
-                {"name": "size_range", "enabled": True, "gte": 10},
+                {"name": "size_range", "enabled": True, "min_bytes": 10},
             ]
         }
     })).scan()
@@ -149,7 +149,7 @@ def test_directory_scanner_never_promotes_hard_rejected_split_member(tmp_path):
         "filesystem": {
             "scan_filters": [
                 {"name": "blacklist", "enabled": True, "blocked_files": [blocked_tail.name]},
-                {"name": "size_range", "enabled": True, "gte": 10},
+                {"name": "size_range", "enabled": True, "min_bytes": 10},
             ]
         }
     })).scan()
@@ -169,7 +169,7 @@ def test_snapshot_from_entries_preserves_anchored_small_split_member(tmp_path):
     snapshot = DirectoryScanner.snapshot_from_entries(str(tmp_path), entries, config=make_config({
         "filesystem": {
             "scan_filters": [
-                {"name": "size_range", "enabled": True, "gte": 10},
+                {"name": "size_range", "enabled": True, "min_bytes": 10},
             ]
         }
     }))
@@ -185,9 +185,9 @@ def test_directory_scanner_mtime_range_filters_files_outside_range(tmp_path):
     old.write_bytes(b"old")
     keep.write_bytes(b"keep")
     new.write_bytes(b"new")
-    old_ns = 1_700_000_000_000_000_000
-    keep_ns = 1_800_000_000_000_000_000
-    new_ns = 1_900_000_000_000_000_000
+    old_ns = 1_704_067_200_000_000_000
+    keep_ns = 1_735_689_600_000_000_000
+    new_ns = 1_767_225_600_000_000_000
     import os
     os.utime(old, ns=(old_ns, old_ns))
     os.utime(keep, ns=(keep_ns, keep_ns))
@@ -196,7 +196,7 @@ def test_directory_scanner_mtime_range_filters_files_outside_range(tmp_path):
     snapshot = DirectoryScanner(str(tmp_path), config=make_config({
         "filesystem": {
             "scan_filters": [
-                {"name": "mtime_range", "enabled": True, "gte": keep_ns, "lt": new_ns},
+                {"name": "mtime_range", "enabled": True, "start_utc": "2025-01-01T00:00Z", "end_utc": "2026-01-01T00:00Z"},
             ]
         }
     })).scan()
@@ -207,7 +207,7 @@ def test_directory_scanner_mtime_range_filters_files_outside_range(tmp_path):
     assert "new.zip" not in names
 
 
-def test_directory_scanner_mtime_range_accepts_date_expression(tmp_path):
+def test_directory_scanner_mtime_range_uses_utc_minutes(tmp_path):
     old = tmp_path / "old.zip"
     keep = tmp_path / "keep.zip"
     new = tmp_path / "new.zip"
@@ -216,10 +216,10 @@ def test_directory_scanner_mtime_range_accepts_date_expression(tmp_path):
     new.write_bytes(b"new")
 
     import os
-    from datetime import datetime
+    from datetime import datetime, timezone
 
     def ns(value: str) -> int:
-        return int(datetime.strptime(value, "%Y%m%d %H:%M").timestamp() * 1_000_000_000)
+        return int(datetime.strptime(value, "%Y%m%d %H:%M").replace(tzinfo=timezone.utc).timestamp() * 1_000_000_000)
 
     os.utime(old, ns=(ns("20250101 00:00"), ns("20250101 00:00")))
     os.utime(keep, ns=(ns("20260101 00:00"), ns("20260101 00:00")))
@@ -228,7 +228,7 @@ def test_directory_scanner_mtime_range_accepts_date_expression(tmp_path):
     snapshot = DirectoryScanner(str(tmp_path), config=make_config({
         "filesystem": {
             "scan_filters": [
-                {"name": "mtime_range", "enabled": True, "date": "20260430 01:40 > d > 20250320 01:30"},
+                {"name": "mtime_range", "enabled": True, "start_utc": "2025-03-20T01:30Z", "end_utc": "2026-04-30T01:40Z"},
             ]
         }
     })).scan()

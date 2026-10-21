@@ -36,11 +36,18 @@ def normalize_scan_filters(value: Any) -> list[dict[str, Any]]:
         name = item.get("name")
         if not isinstance(name, str) or not name.strip():
             raise ValueError(f"filesystem.scan_filters[{index}].name must not be empty")
-        filters.append({
+        normalized = {
             **item,
             "name": name.strip(),
             "enabled": require_boolean(item.get("enabled", False), f"filesystem.scan_filters[{index}].enabled"),
-        })
+        }
+        if normalized["name"] == "size_range":
+            from sunpack.pipeline.discovery.filesystem.filters.modules.size_range import size_bounds
+            size_bounds(normalized)
+        elif normalized["name"] == "mtime_range":
+            from sunpack.pipeline.discovery.filesystem.filters.modules.mtime_range import time_bounds
+            time_bounds(normalized)
+        filters.append(normalized)
     return filters
 
 

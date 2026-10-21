@@ -16,12 +16,7 @@ from sunpack.core.passwords.internal.store import EMPTY_PASSWORD_SNAPSHOT
 
 def build_effective_config(config: dict) -> dict[str, Any]:
     size_rule = scan_filter_config(config, "size_range")
-    size_range_min_bytes = None
-    if isinstance(size_rule, dict):
-        if "gte" in size_rule:
-            size_range_min_bytes = size_rule["gte"]
-        elif "greater_than_or_equal" in size_rule:
-            size_range_min_bytes = size_rule["greater_than_or_equal"]
+    size_range_min_bytes = size_rule.get("min_bytes") if isinstance(size_rule, dict) else None
     return {
         "size_range_min_bytes": size_range_min_bytes,
         "worker": {

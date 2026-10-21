@@ -18,7 +18,7 @@ const Json& setting(const std::string& pointer,const std::string& module) {
     for(const std::string prefix:{"/filesystem/scan_filters/","/analysis/modules/","/verification/methods/"}) {
         if(pointer.rfind(prefix,0)!=0) continue;
         auto suffix=pointer.find('/',prefix.size());
-        if(suffix!=std::string::npos && !module.empty()) key=prefix+"@"+module+pointer.substr(suffix);
+        if(!module.empty()) key=prefix+"@"+module+(suffix==std::string::npos?std::string():pointer.substr(suffix));
         break;
     }
     if(fields.contains(key)) return fields[key];

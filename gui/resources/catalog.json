@@ -1,5 +1,30 @@
 {
   "ui": {
+    "rangeEnable": {
+      "zh": "启用此过滤器",
+      "en": "Enable this filter"
+    },
+    "rangeMatchNone": {
+      "zh": "当前条件不会匹配任何文件。",
+      "en": "This filter matches no files."
+    },
+    "rangeReset": {
+      "zh": "重置范围",
+      "en": "Reset range"
+    },
+    "rangeFormat": {
+      "zh": "范围配置格式已更新，请通过安装器升级旧配置。",
+      "en": "The range format has changed. Upgrade old configuration through the installer."
+    },
+    "rangeAtomic": {
+      "zh": "范围过滤器必须作为完整模块保存。",
+      "en": "Save the range filter as a complete module."
+    },
+    "rangeMigration": {
+      "zh": "无法迁移旧范围配置，原文件保持不变。",
+      "en": "Cannot migrate the legacy range. The original file was preserved."
+    },
+
     "opRangeDate": {
       "zh": "打开日期时间选择器",
       "en": "Open date/time picker"
@@ -13,20 +38,20 @@
       "en": "Maximum file size"
     },
     "rangeStart": {
-      "zh": "起始时间",
-      "en": "Start time"
+      "zh": "开始时间（包含）",
+      "en": "Start time (inclusive)"
     },
     "rangeEnd": {
-      "zh": "结束时间",
-      "en": "End time"
+      "zh": "结束时间（不包含）",
+      "en": "End time (exclusive)"
     },
     "rangeHint": {
-      "zh": "上下限可独立留空，留空表示不限制。大小单位按 1024 换算。",
-      "en": "Leave either bound empty for no limit. Size units use powers of 1024."
+      "zh": "上下限均包含；留空表示不限制。支持小数单位，最小值向上、最大值向下取整到字节。",
+      "en": "Both bounds are inclusive; blank means unlimited. Decimal units round the minimum up and maximum down to bytes."
     },
     "rangeTimeHint": {
-      "zh": "电脑本地时间，精确到分钟；留空表示不限制。",
-      "en": "Computer local time, to the minute; leave empty for no limit."
+      "zh": "显示电脑本地时间，精确到分钟，以 UTC 保存；留空表示不限制。",
+      "en": "Displays computer local time to the minute and stores UTC; blank means unlimited."
     },
     "rangeChoose": {
       "zh": "选择日期时间",
@@ -36,25 +61,17 @@
       "zh": "选择",
       "en": "Choose"
     },
-    "rangePreserved": {
-      "zh": "当前条件无法表示为上下限，已保留原配置。",
-      "en": "This condition cannot be shown as bounds. The existing setting is preserved."
-    },
-    "rangeExtra": {
-      "zh": "同时生效的额外配置：",
-      "en": "Additional settings also apply: "
-    },
     "rangeNumber": {
-      "zh": "请输入非负整数，换算后的字节数不能超过 18446744073709551615。",
-      "en": "Enter a nonnegative integer; bytes must not exceed 18446744073709551615."
+      "zh": "请输入非负数，换算后的整数字节不能超过 18446744073709551615。",
+      "en": "Enter a nonnegative value whose integer byte count does not exceed 18446744073709551615."
     },
     "rangeDate": {
       "zh": "请输入有效的本地日期和时间（YYYY-MM-DD HH:mm）。",
       "en": "Enter a valid local date and time (YYYY-MM-DD HH:mm)."
     },
     "rangeOrder": {
-      "zh": "下限不能大于上限；相同时两个边界必须都包含。",
-      "en": "The lower bound must precede the upper bound, or both must include the same value."
+      "zh": "最小大小不能超过最大大小；开始时间必须早于结束时间。",
+      "en": "Minimum size must not exceed maximum size; start time must precede end time."
     },
     "title": {
       "zh": "SunPack 管理面板",
@@ -805,6 +822,29 @@
     }
   },
   "fields": {
+    "/filesystem/scan_filters/@size_range": {
+      "label": {
+        "zh": "文件大小",
+        "en": "File size"
+      },
+      "description": {
+        "zh": "按包含上下限的整数字节范围筛选。",
+        "en": "Filter by an inclusive range of integer bytes."
+      },
+      "editor": "size_range"
+    },
+    "/filesystem/scan_filters/@mtime_range": {
+      "label": {
+        "zh": "修改时间",
+        "en": "Modification time"
+      },
+      "description": {
+        "zh": "开始时间包含，结束时间不包含；以 UTC 保存。",
+        "en": "Includes the start and excludes the end; stored in UTC."
+      },
+      "editor": "datetime_range"
+    },
+
     "/cli/language": {
       "label": {
         "zh": "语言",
@@ -1141,48 +1181,6 @@
       "description": {
         "zh": "扩展名如 .zip；也会影响伪装扩展名的压缩包。",
         "en": "Extensions such as .zip; also affects archives with disguised extensions."
-      }
-    },
-    "/filesystem/scan_filters/@size_range/enabled": {
-      "label": {
-        "zh": "文件大小",
-        "en": "File size"
-      },
-      "description": {
-        "zh": "按文件大小筛选。",
-        "en": "Filter by file size."
-      }
-    },
-    "/filesystem/scan_filters/@size_range/range": {
-      "editor": "size_range",
-      "label": {
-        "zh": "文件大小条件",
-        "en": "File size condition"
-      },
-      "description": {
-        "zh": "设置文件大小的上下限，并选择是否包含边界。",
-        "en": "Set lower and upper file sizes and choose whether to include each boundary."
-      }
-    },
-    "/filesystem/scan_filters/@mtime_range/enabled": {
-      "label": {
-        "zh": "修改时间",
-        "en": "Modification time"
-      },
-      "description": {
-        "zh": "按最后修改时间筛选。",
-        "en": "Filter by last modification time."
-      }
-    },
-    "/filesystem/scan_filters/@mtime_range/date": {
-      "editor": "datetime_range",
-      "label": {
-        "zh": "修改时间条件",
-        "en": "Modification time condition"
-      },
-      "description": {
-        "zh": "按电脑本地时间设置固定的起止日期和时间。",
-        "en": "Set fixed start and end dates and times in computer local time."
       }
     },
     "/performance/persistent_server_idle_seconds": {

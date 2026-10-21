@@ -358,21 +358,18 @@ export default {
       if(!index) { index=new Map(); for(let field of fields) if(this.isRange(field)) index.set(field.id,field); rangeIndexes.set(fields,index); }
       return index.get(f.id)||f;
     },
-    rangeValue(f) { return (this.drafts[f.id]&&this.drafts[f.id].range)||this.rangeField(f).range||{lower:'',upper:'',lowerOp:1,upperOp:0,lowerUnit:0,upperUnit:0}; },
-    rangeSupported(f) { let range=this.rangeField(f).range; return !!range&&range.supported; },
+    rangeValue(f) { return (this.drafts[f.id]&&this.drafts[f.id].range)||this.rangeField(f).range||{enabled:false,matchNone:false,lower:'',upper:'',lowerUnit:0,upperUnit:0}; },
     changeRange(f,key,value,commit) {
       f=this.rangeField(f);
-      let range=Object.assign({},this.rangeValue(f),{[key]:value}),units=['B','KiB','MiB','GiB','TiB'];
-      let lo=range.lower.trim(),hi=range.upper.trim(),variable=f.editor==='size_range'?'r':'d';
-      if(variable==='r') { if(lo) lo+=' '+units[range.lowerUnit]; if(hi) hi+=' '+units[range.upperUnit]; }
-      let text=lo?lo+(range.lowerOp?' <= ':' < ')+variable:'';
-      if(hi) text+=(text?'':variable)+(range.upperOp?' <= ':' < ')+hi;
+      let range=Object.assign({},this.rangeValue(f),key==='reset'?{matchNone:false,lower:'',upper:'',lowerUnit:0,upperUnit:0}:{[key]:value});
+      let text=JSON.stringify(range);
       this.changeField(f,text);
       // Preserve incomplete/invalid input and selected units until save succeeds.
       let d=this.drafts[f.id]||{original:f.original,text:text,boolean:f.boolean,baselineText:f.text,baselineBoolean:f.boolean};
       this.drafts=Object.assign({},this.drafts,{[f.id]:Object.assign({},d,{range:range})});
       if(commit) this.commitField(f);
     },
+    resetRange(f) { this.changeRange(f,'reset',null,true); },
     pickedRange(p) { let f=this.fields.find(f=>f.id===p.id); if(f) this.changeRange(f,p.side,p.value,true); },
     changeField(f,value) {
       f=this.fields.find(current=>current.id===f.id)||f;
@@ -647,8 +644,8 @@ export default {
   .setting-control { width:220px; gap:8px; }
   .range-editor { gap:8px; }
   .range-pair { flex-direction:row; flex-wrap:wrap; align-items:flex-start; gap:16px; }
-  .range-group { width:252px; flex-shrink:0; gap:6px; }
-  .range-group.range-time { width:304px; }
+  .range-group { width:194px; flex-shrink:0; gap:6px; }
+  .range-group.range-time { width:246px; }
   .range-bound { flex-direction:row; align-items:center; gap:6px; }
   .range-bound input { width:112px; flex-shrink:0; }
   .range-bound .range-date { width:168px; }
@@ -811,15 +808,16 @@ export default {
                 <div v-show="f.editor==='list'" class="action-row"><label>{{ listCount(drafts[f.id]?JSON.parse(drafts[f.id].text):f.items) }}</label><button :id="'list-'+f.id" @click="openList('config',f)">{{ texts.manageEntries }}</button></div>
               </div>
             </div>
-            <!-- Range kind is fixed by the row key; support changes use v-show. -->
+            <!-- Range modules have one draft and one atomic save target. -->
             <div v-if="isRange(f)" class="range-editor">
-              <div v-show="rangeSupported(f)" class="column">
+              <div class="action-row"><toggle :id="'range-enabled-'+f.id" :checked="rangeValue(f).enabled" @change="v=>changeRange(f,'enabled',v,true)"/><label>{{ texts.rangeEnable }}</label></div>
+              <div v-show="rangeValue(f).matchNone" class="action-row"><label>{{ texts.rangeMatchNone }}</label><button :id="'range-reset-'+f.id" @click="resetRange(f)">{{ texts.rangeReset }}</button></div>
+              <div :enabled="!rangeValue(f).matchNone" class="column">
                 <label class="muted">{{ f.editor==='datetime_range'?texts.rangeTimeHint:texts.rangeHint }}</label>
                 <div class="range-pair">
                   <div :id="'range-lower-group-'+f.id" :class="f.editor==='datetime_range'?'range-group range-time':'range-group'">
                     <label>{{ f.editor==='datetime_range'?texts.rangeStart:texts.rangeMin }}</label>
                     <div class="range-bound">
-                      <select :id="'range-lower-op-'+f.id" :value="rangeValue(f).lowerOp" @change="v=>changeRange(f,'lowerOp',v,true)"><option>&gt;</option><option>≥</option></select>
                       <input :id="'range-lower-'+f.id" :class="f.editor==='datetime_range'?'range-date':''" :value="rangeValue(f).lower" :placeholder="f.editor==='datetime_range'?'YYYY-MM-DD HH:mm':''" @input="v=>changeRange(f,'lower',v,false)" @blur="commitField(f)" @submit="commitField(f)"/>
                       <select v-show="f.editor==='size_range'" class="range-unit" :id="'range-lower-unit-'+f.id" :value="rangeValue(f).lowerUnit" @change="v=>changeRange(f,'lowerUnit',v,true)"><option>B</option><option>KiB</option><option>MiB</option><option>GiB</option><option>TiB</option></select>
                       <button v-show="f.editor==='datetime_range'" class="range-pick" :title="texts.rangeChoose" :id="'range-lower-pick-'+f.id" @click="send('pickRangeDate',{id:f.id,side:'lower',value:rangeValue(f).lower})">{{ texts.rangePick }}</button>
@@ -828,7 +826,6 @@ export default {
                   <div :id="'range-upper-group-'+f.id" :class="f.editor==='datetime_range'?'range-group range-time':'range-group'">
                     <label>{{ f.editor==='datetime_range'?texts.rangeEnd:texts.rangeMax }}</label>
                     <div class="range-bound">
-                      <select :id="'range-upper-op-'+f.id" :value="rangeValue(f).upperOp" @change="v=>changeRange(f,'upperOp',v,true)"><option>&lt;</option><option>≤</option></select>
                       <input :id="'range-upper-'+f.id" :class="f.editor==='datetime_range'?'range-date':''" :value="rangeValue(f).upper" :placeholder="f.editor==='datetime_range'?'YYYY-MM-DD HH:mm':''" @input="v=>changeRange(f,'upper',v,false)" @blur="commitField(f)" @submit="commitField(f)"/>
                       <select v-show="f.editor==='size_range'" class="range-unit" :id="'range-upper-unit-'+f.id" :value="rangeValue(f).upperUnit" @change="v=>changeRange(f,'upperUnit',v,true)"><option>B</option><option>KiB</option><option>MiB</option><option>GiB</option><option>TiB</option></select>
                       <button v-show="f.editor==='datetime_range'" class="range-pick" :title="texts.rangeChoose" :id="'range-upper-pick-'+f.id" @click="send('pickRangeDate',{id:f.id,side:'upper',value:rangeValue(f).upper})">{{ texts.rangePick }}</button>
@@ -836,8 +833,6 @@ export default {
                   </div>
                 </div>
               </div>
-              <div v-show="!rangeSupported(f)" class="column"><label class="muted">{{ texts.rangePreserved }}</label><label :id="'range-preserved-'+f.id" class="muted">{{ rangeField(f).text }}</label></div>
-              <label v-show="rangeField(f).rangeExtra" class="muted">{{ texts.rangeExtra }}{{ rangeField(f).rangeExtra }}</label>
             </div>
             <label v-show="f.editor==='list'" class="muted collection-preview" :ellipsis-start="(f.items||[]).some(v=>isDirectoryValue(v))">{{ listSummary(drafts[f.id]?JSON.parse(drafts[f.id].text):f.items) }}</label>
             <label v-show="saveErrors[f.id]" class="error">{{ errorText(saveErrors[f.id]) }}</label>

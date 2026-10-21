@@ -26,7 +26,7 @@ def test_zipx_split_alias_preserves_size_anchors_and_extracts_physical_parts(tmp
 
     config = make_config({
         "filesystem": {"scan_filters": [
-            {"name": "size_range", "enabled": True, "gte": first.stat().st_size},
+            {"name": "size_range", "enabled": True, "min_bytes": first.stat().st_size},
         ]},
         "verification": {"enabled": False},
     })

@@ -5,10 +5,7 @@ import pytest
 import sunpack.core.support.archive_sessions as archive_sessions
 import sunpack.core.support.output_paths as output_paths
 from sunpack.pipeline.discovery.detection.input_planning import ArchiveInputPlanningStage
-from sunpack.pipeline.discovery.filesystem.filters.modules.size_range import (
-    parse_range_expression,
-    parse_size_value,
-)
+
 from sunpack.pipeline.verification.pipeline import VerificationPipeline
 from sunpack.runtime.cli.cli import preprocess_sys_argv
 
@@ -43,18 +40,6 @@ def test_preprocess_sys_argv_preserves_literal_trailing_quote_and_backslash():
     ]
 
     assert preprocess_sys_argv(argv) == argv
-
-
-@pytest.mark.parametrize("expression", ["r >= 1,5 MB", "r != 0", "r >= nope"])
-def test_nonempty_invalid_range_expression_is_rejected(expression):
-    with pytest.raises(ValueError, match="Invalid range expression"):
-        parse_range_expression(expression, parse_size_value)
-
-
-def test_valid_range_expression_still_accepts_zero_boundary():
-    parsed = parse_range_expression("r >= 0 B", parse_size_value)
-
-    assert parsed.gte == 0
 
 
 def test_output_path_containment_uses_canonical_case(monkeypatch):

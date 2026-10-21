@@ -597,7 +597,7 @@ def test_mixed_directory_schedules_only_one_structural_head_per_format(mixed_rea
         with_detection_pipeline(
             {},
             precheck=[
-                {"name": "size_range", "enabled": True, "gte": 0},
+                {"name": "size_range", "enabled": True, "min_bytes": 0},
                 {"name": "relation_archive_accept", "enabled": True},
             ],
         )
@@ -632,7 +632,7 @@ def test_pipeline_uses_initial_structure_group_without_missing_volume_retry(
                 },
             },
             precheck=[
-                {"name": "size_range", "enabled": True, "gte": 0},
+                {"name": "size_range", "enabled": True, "min_bytes": 0},
                 {"name": "relation_archive_accept", "enabled": True},
             ],
         )
@@ -689,7 +689,7 @@ def test_pipeline_middle_volume_target_exposes_resolved_physical_family(mixed_re
                 },
             },
             precheck=[
-                {"name": "size_range", "enabled": True, "gte": 0},
+                {"name": "size_range", "enabled": True, "min_bytes": 0},
                 {"name": "relation_archive_accept", "enabled": True},
             ],
         )
@@ -892,11 +892,11 @@ def test_modern_split_zip_with_camouflaged_names_runs_full_pipeline(tmp_path, op
             {
                 "verification": {"enabled": False, "methods": []},
                 "filesystem": {"scan_filters": [
-                    {"name": "size_range", "enabled": True, "gte": MIB if zipx else 0},
+                    {"name": "size_range", "enabled": True, "min_bytes": MIB if zipx else 0},
                 ]},
             },
             precheck=[
-                {"name": "size_range", "enabled": True, "gte": 0},
+                {"name": "size_range", "enabled": True, "min_bytes": 0},
                 {"name": "relation_archive_accept", "enabled": True},
             ],
         )
@@ -1005,7 +1005,7 @@ def test_encrypted_plain_and_sfx_volume_matrix_with_shared_stem_and_noisy_suffix
                 "process": {},
             },
             precheck=[
-                {"name": "size_range", "enabled": True, "gte": 0},
+                {"name": "size_range", "enabled": True, "min_bytes": 0},
                 {"name": "relation_archive_accept", "enabled": True},
                 {"name": "embedded_payload_identity", "enabled": True},
             ],

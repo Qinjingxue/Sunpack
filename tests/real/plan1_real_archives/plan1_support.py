@@ -115,7 +115,7 @@ def plan1_config(passwords: list[str] | None = None) -> dict:
                 {"name": "compression_stream_structure", "enabled": True},
             ],
             precheck=[
-                {"name": "size_range", "enabled": True, "gte": 0},
+                {"name": "size_range", "enabled": True, "min_bytes": 0},
                 {"name": "relation_archive_accept", "enabled": True},
                 {"name": "tar_structure_accept", "enabled": True},
                 {"name": "compression_stream_accept", "enabled": True},

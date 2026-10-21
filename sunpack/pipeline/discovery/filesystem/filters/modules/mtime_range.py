@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
+import re
 from typing import Any
 
 from sunpack.pipeline.discovery.filesystem.filters.base import ScanCandidate, ScanDecision, keep, reject
-from sunpack.pipeline.discovery.filesystem.filters.modules.size_range import NumericRange, parse_range_expression
+from sunpack.pipeline.discovery.filesystem.filters.modules.size_range import NumericRange, UINT64_MAX, validate_range_fields
 
 
 class MtimeRangeScanFilter:
@@ -16,16 +17,7 @@ class MtimeRangeScanFilter:
 
     @classmethod
     def from_config(cls, config: dict[str, Any]):
-        expression = config.get("date")
-        parsed = parse_range_expression(expression, _mtime_or_none, variable="d") if expression is not None else NumericRange()
-        explicit = NumericRange(
-            gt=_mtime_or_none(_first(config, "gt", "greater_than", "after")),
-            gte=_mtime_or_none(_first(config, "gte", "greater_than_or_equal", "after_or_equal", "since")),
-            lt=_mtime_or_none(_first(config, "lt", "less_than", "before")),
-            lte=_mtime_or_none(_first(config, "lte", "less_than_or_equal", "before_or_equal", "until")),
-            eq=_mtime_or_none(_first(config, "eq", "equal", "equals")),
-        )
-        return cls(parsed.merge(explicit))
+        return cls(time_bounds(config))
 
     def evaluate(self, candidate: ScanCandidate) -> ScanDecision:
         if candidate.kind != "file":
@@ -37,38 +29,36 @@ class MtimeRangeScanFilter:
         return keep()
 
 
-def _first(config: dict[str, Any], *keys: str):
-    for key in keys:
-        if key in config:
-            return config.get(key)
-    return None
+
+_UTC_MINUTE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}Z")
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 
-def _mtime_or_none(value: Any) -> int | None:
+def utc_minute_ns(value: Any) -> int | None:
     if value is None:
         return None
-    if isinstance(value, (int, float)):
-        return int(value)
-    text = str(value).strip()
-    if not text:
-        return None
-    if len(text) == 8 and text.isdigit():
-        try:
-            return int(datetime.strptime(text, "%Y%m%d").timestamp() * 1_000_000_000)
-        except ValueError:
-            pass
+    if not isinstance(value, str) or _UTC_MINUTE.fullmatch(value) is None:
+        raise ValueError("Time bounds must be null or UTC minutes: YYYY-MM-DDTHH:mmZ")
     try:
-        return int(text)
-    except ValueError:
-        pass
-    try:
-        normalized = text[:-1] + "+00:00" if text.endswith("Z") else text
-        return int(datetime.fromisoformat(normalized).timestamp() * 1_000_000_000)
-    except ValueError:
-        pass
-    for fmt in ("%Y%m%d %H:%M:%S", "%Y%m%d %H:%M", "%Y%m%d"):
-        try:
-            return int(datetime.strptime(text, fmt).timestamp() * 1_000_000_000)
-        except ValueError:
-            continue
-    return None
+        parsed = datetime(int(value[:4]), int(value[5:7]), int(value[8:10]),
+                          int(value[11:13]), int(value[14:16]), tzinfo=timezone.utc)
+    except ValueError as error:
+        raise ValueError("Invalid UTC minute") from error
+    delta = parsed - _EPOCH
+    return (delta.days * 86400 + delta.seconds) * 1_000_000_000
+
+
+def time_bounds(config: dict[str, Any]) -> NumericRange:
+    if validate_range_fields(config, ("start_utc", "end_utc")):
+        return NumericRange(gt=0, lt=0)
+    start, end = (utc_minute_ns(config.get(key)) for key in ("start_utc", "end_utc"))
+    if start is not None and end is not None and start >= end:
+        raise ValueError("start_utc must precede end_utc")
+    # Keep the existing native uint64 metadata domain and comparison ABI.
+    if (start is not None and start > UINT64_MAX) or (end is not None and end <= 0):
+        return NumericRange(gt=0, lt=0)
+    lower = max(0, start) if start is not None else None
+    upper = end if end is not None and end <= UINT64_MAX else None
+    if end is not None and upper is None and lower is None:
+        lower = 0  # A configured time filter still rejects missing metadata.
+    return NumericRange(gte=lower, lt=upper)

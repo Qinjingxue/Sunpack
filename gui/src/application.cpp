@@ -201,7 +201,7 @@ void Application::save_field(const std::string& id,Json draft) {
         auto field=std::find_if(fields.begin(),fields.end(),[&](const Json& f){return f["id"]==id;});
         if(field==fields.end()) throw std::runtime_error("configConflict");
         auto text=draft.at("text").get<std::string>();
-        if(draft.contains("range")) text=range_expression(draft["range"],(*field)["editor"]=="datetime_range");
+        if(draft.contains("range")) text=range_configuration(draft["range"],(*field)["editor"]=="datetime_range").dump();
         Json edit={{"pointer",id},{"label",(*field)["label"]},{"original",draft["original"]},
             {"type",(*field)["editor"]=="recursive"?Json("string"):(*field)["type"]},
             {"text",text},{"boolean",draft["boolean"]},{"draft",draft}};
