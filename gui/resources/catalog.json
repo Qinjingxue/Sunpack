@@ -188,10 +188,6 @@
       "zh": "监控目录中的直接文件。",
       "en": "Monitors files directly inside each folder."
     },
-    "categories": {
-      "zh": "配置分类",
-      "en": "Categories"
-    },
     "allSettings": {
       "zh": "全部配置",
       "en": "All settings"

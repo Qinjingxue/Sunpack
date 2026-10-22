@@ -598,7 +598,6 @@ export default {
   .spacer { flex:1; }
   .body { flex:1; flex-direction:row; }
   .sidebar { flex:1; padding:20px 8px 0px; gap:8px; }
-  .sidebar-heading { font-size:12px; color:var(--fg-2); padding:0px 4px 4px; }
   .sidebar button { min-height:32px; }
   .context-item { display:flex; width:100%; flex-direction:row; align-items:center; padding:7px 12px; gap:10px; border:0px; background:#00000001; color:var(--fg); }
   .context-item:hover { background:var(--sidebar-hover); }
@@ -765,13 +764,11 @@ export default {
         <div id="navIndicator" class="nav-indicator"/>
       </div>
       <div id="configSidebar" v-show="tab==='config'" class="sidebar">
-        <label class="sidebar-heading">{{ texts.categories }}</label>
         <button id="category-all" :class="!configCategory?'context-item on':'context-item'" @click="selectCategory('')"><label>{{ texts.allSettings }}</label></button>
         <ScrollView id="categoryScroll"><div class="column"><button v-for="c in categories" :key="c.id" :id="'category-'+c.id" :class="configCategory===c.id?'context-item on':'context-item'" @click="selectCategory(c.id)"><label>{{ c.label }}</label></button></div></ScrollView>
       </div>
       <div id="directoryPane" v-show="tab==='tasks'||tab==='passwords'" class="directory-pane">
         <div class="directory-tools">
-        <label class="subheading">{{ texts.roots }}</label>
         <input id="directorySearch" type="search" class="search-field" :placeholder="texts.searchDirectory" :value="directoryQuery" @input="searchDirectory"/>
         <button id="allRoots" :class="!directorySelection?'context-item on':'context-item'" @click="selectDirectory('')"><label>{{ texts.allDirectories }}</label></button>
         </div>
