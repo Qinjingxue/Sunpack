@@ -1293,6 +1293,16 @@ int run_request(
         ",\"error\":" + std::to_string(sr.error) + "}" : "";
     const std::string input_trace_field = read_file_timing_enabled() ?
         ",\"input_trace\":" + input_trace_json(result.input_trace) : "";
+    const auto &output_trace = result.output_trace;
+    const std::string metadata_warning_field = (output_trace.metadata_failed_files || output_trace.metadata_failed_directories) ?
+        ",\"metadata_warning\":{\"file_count\":" + std::to_string(output_trace.metadata_failed_files) +
+        ",\"directory_count\":" + std::to_string(output_trace.metadata_failed_directories) +
+        ",\"time_failure_count\":" + std::to_string(output_trace.metadata_failed_times) +
+        ",\"attribute_failure_count\":" + std::to_string(output_trace.metadata_failed_attributes) +
+        ",\"operation\":\"" + (output_trace.metadata_first_is_attributes ? "attributes" : "time") + "\"" +
+        ",\"first_item_index\":" + std::to_string(output_trace.metadata_first_item_index) +
+        ",\"first_item\":\"" + json_escape(wide_to_utf8(output_trace.metadata_first_item)) +
+        "\",\"win32_error\":" + std::to_string(output_trace.metadata_first_win32_error) + "}" : "";
 #ifdef SUP7Z_ENABLE_PIPELINE_TIMING
     const std::string pipeline_timing_field = pipeline_timing_enabled() ?
         ",\"pipeline_timing\":" + pipeline_timing_json(result.pipeline_timing) : "";
@@ -1334,7 +1344,7 @@ int run_request(
         "\",\"filename_decoder\":\"" + json_escape(wide_to_utf8(result.filename_decoder)) +
         "\",\"verified_manifest\":" + manifest_summary +
         ",\"failed_item\":\"" + json_escape(wide_to_utf8(result.failed_item)) +
-        "\",\"message\":\"" + json_escape(result.message) + "\"" +
+        "\",\"message\":\"" + json_escape(result.message) + "\"" + metadata_warning_field +
         failure_fields + input_trace_field
 #ifdef SUP7Z_ENABLE_PIPELINE_TIMING
         + pipeline_timing_field

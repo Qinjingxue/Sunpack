@@ -1,10 +1,16 @@
 import asyncio
 import binascii
+import ctypes
+from ctypes import wintypes
+import gzip
+import io
 import json
+import lzma
 import os
 import subprocess
 import struct
 import tarfile
+import time
 import zipfile
 
 import pytest
@@ -42,6 +48,312 @@ def _require_7z_or_skip():
         pytest.skip("7z.exe is required to build worker extraction fixtures")
     _require_worker_or_skip()
     return seven_zip
+
+
+def _file_times_ns(path, values=None):
+    """Read/set all three Windows timestamps without opening the file's data."""
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                                  ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    kernel.CreateFileW.restype = wintypes.HANDLE
+    time_args = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 3
+    kernel.GetFileTime.argtypes = time_args
+    kernel.SetFileTime.argtypes = time_args
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    handle = kernel.CreateFileW(str(path), 0x180 if values else 0x80, 7, None, 3, 0x02000000, None)
+    if handle == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        stamps = [wintypes.FILETIME() for _ in range(3)]
+        if values is not None:
+            for stamp, ns in zip(stamps, values):
+                ticks = ns // 100 + 116444736000000000
+                stamp.dwLowDateTime = ticks & 0xFFFFFFFF
+                stamp.dwHighDateTime = ticks >> 32
+            if not kernel.SetFileTime(handle, *(ctypes.byref(stamp) for stamp in stamps)):
+                raise ctypes.WinError(ctypes.get_last_error())
+        if not kernel.GetFileTime(handle, *(ctypes.byref(stamp) for stamp in stamps)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return tuple((((stamp.dwHighDateTime << 32) | stamp.dwLowDateTime)
+                      - 116444736000000000) * 100 for stamp in stamps)
+    finally:
+        kernel.CloseHandle(handle)
+
+
+def _file_attributes(path, value=None):
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.GetFileAttributesW.argtypes = [wintypes.LPCWSTR]
+    kernel.GetFileAttributesW.restype = wintypes.DWORD
+    kernel.SetFileAttributesW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD]
+    if value is not None and not kernel.SetFileAttributesW(str(path), value or 0x80):
+        raise ctypes.WinError(ctypes.get_last_error())
+    attributes = kernel.GetFileAttributesW(str(path))
+    if attributes == 0xFFFFFFFF:
+        raise ctypes.WinError(ctypes.get_last_error())
+    return attributes
+
+
+@pytest.mark.parametrize("archive_type", ["7z", "zip", "rar4", "rar5"])
+def test_worker_preserves_archived_metadata_like_7z(tmp_path, archive_type):
+    # Real archive -> async writer -> inventory, compared with 7z.exe.
+    # Other tests miss directory finalization and writable attribute restoration.
+    # Empty/tiny/multi-buffer files and nested/empty directories share one job.
+    seven_zip = _require_7z_or_skip()
+    worker = _require_worker_or_skip()
+    rar = get_test_tools()["rar_exe"] if archive_type.startswith("rar") else None
+    if archive_type.startswith("rar") and (not rar or not rar.is_file()):
+        pytest.skip("Rar.exe is required to build metadata fixtures")
+    source = tmp_path / "source"
+    source.mkdir()
+    payloads = {"folder/deep/video.mp4": b"video" * (1 << 20),
+                "folder/photo.jpg": b"picture", "empty.bin": b""}
+    expected = {}
+    for index, (name, payload) in enumerate(payloads.items()):
+        path = source / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(payload)
+        expected[name] = _file_times_ns(path, (
+            1577836800123456700 + index * 1000000000,
+            1577923200234567800 + index * 1000000000,
+            1578009600345678900 + index * 1000000000,
+        ))
+    (source / "folder/empty").mkdir()
+    directories = ["folder", "folder/deep", "folder/empty"]
+    for index, name in enumerate(directories):
+        expected[name] = _file_times_ns(source / name, (
+            1546300800123456700 + index * 1000000000,
+            1546387200234567800 + index * 1000000000,
+            1546473600345678900 + index * 1000000000,
+        ))
+    attributes = dict(zip(payloads, [0x21, 0x26, 0]))
+    attributes.update(dict(zip(directories, [0x07, 0x02, 0x01])))
+    for name, value in attributes.items():
+        _file_attributes(source / name, value)
+    archive = tmp_path / "archive.disguised"
+    format_hint = "rar" if rar else archive_type
+    try:
+        if rar:
+            # RAR4/5 have different timestamp encodings and precision.
+            subprocess.run([str(rar), "a", f"-ma{archive_type[-1]}", "-m0", "-tsm3", "-tsc3", "-tsa3",
+                            "-r", "-y", str(archive), "folder", "empty.bin"],
+                           cwd=source, check=True, capture_output=True)
+        else:
+            subprocess.run([str(seven_zip), "a", f"-t{archive_type}", str(archive),
+                            "-mtc=on", "-mta=on", "-mtm=on", "-mx=0", "-y", "folder", "empty.bin"],
+                           cwd=source, check=True, capture_output=True)
+    finally:
+        for name in attributes:
+            _file_attributes(source / name, 0)
+    oracle = tmp_path / "oracle"
+    subprocess.run([str(seven_zip), "x", str(archive), f"-o{oracle}", "-y"],
+                   check=True, capture_output=True)
+    if rar:
+        expected = {name: _file_times_ns(oracle / name) for name in expected}
+    output = tmp_path / "output"
+    result = _invoke_worker(worker, {
+        "job_id": "file-times", "archive_path": str(archive),
+        "output_dir": str(output), "format_hint": format_hint,
+    })
+    final = _worker_result(result.stdout)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert final["status"] == "ok" and "metadata_warning" not in final
+    rows = final["verified_manifest"]["native_rows"].file_page(0, len(payloads))
+    rows = {row["path"].replace("\\", "/"): row for row in rows}
+    try:
+        for name in expected:
+            assert _file_times_ns(output / name) == _file_times_ns(oracle / name) == expected[name], name
+            assert _file_attributes(output / name) & 0x3127 == _file_attributes(oracle / name) & 0x3127, name
+        for name, payload in payloads.items():
+            assert rows[name]["mtime_ns"] == expected[name][2]
+            assert (output / name).read_bytes() == payload
+    finally:
+        for root in (output, oracle):
+            for name in expected:
+                _file_attributes(root / name, 0)
+
+
+@pytest.mark.parametrize(("archive_type", "layout"), [
+    ("zip", "file"), ("tar", "file"), ("tar-pre-epoch", "file"),
+    ("gzip", "file"), ("gzip-no-time", "file"),
+    ("xz", "file"), ("xz", "carrier"), ("xz", "split"),
+])
+def test_worker_preserves_partial_or_missing_file_times(tmp_path, archive_type, layout):
+    # Formats without CTime/ATime must not inherit MTime as a fabricated value.
+    # Also covers DOS local time, negative Unix time and streams with no time.
+    # Each distinct property layout needs only one tiny in-memory fixture.
+    worker = _require_worker_or_skip()
+    payload = b"historical payload"
+    archive = tmp_path / "payload.blob"
+    mtime_ns = 946684800000000000
+    if archive_type == "zip":
+        date = (2000, 1, 2, 12, 34, 56)
+        with zipfile.ZipFile(archive, "w") as handle:
+            handle.writestr(zipfile.ZipInfo("payload", date_time=date), payload)
+        mtime_ns = int(time.mktime((*date, 0, 0, -1))) * 1000000000
+    elif archive_type.startswith("tar"):
+        item = tarfile.TarInfo("payload")
+        item.size = len(payload)
+        item.mtime = -157766400 if archive_type == "tar-pre-epoch" else mtime_ns // 1000000000
+        item.mode = 0o444 if archive_type == "tar-pre-epoch" else 0o644
+        mtime_ns = item.mtime * 1000000000
+        archive_format = tarfile.GNU_FORMAT if item.mtime < 0 else tarfile.USTAR_FORMAT
+        with tarfile.open(archive, "w", format=archive_format) as handle:
+            handle.addfile(item, io.BytesIO(payload))
+            directory = tarfile.TarInfo("recorded")
+            directory.type = tarfile.DIRTYPE
+            directory.mode = 0o555
+            directory.mtime = item.mtime
+            handle.addfile(directory)
+    elif archive_type.startswith("gzip"):
+        stamp = 0 if archive_type == "gzip-no-time" else mtime_ns // 1000000000
+        archive.write_bytes(gzip.compress(payload, mtime=stamp))
+        if not stamp:
+            mtime_ns = None
+    else:
+        archive.write_bytes(lzma.compress(payload))
+        mtime_ns = None
+    archive_mtime_ns = 1514764800765432100
+    os.utime(archive, ns=(archive_mtime_ns, archive_mtime_ns))
+    input_path = archive
+    descriptor = {}
+    if layout != "file":
+        data = archive.read_bytes()
+        input_path = tmp_path / "payload.disguised"
+        descriptor = {"entry_path": str(input_path), "format_hint": "xz"}
+        if layout == "carrier":
+            prefix = b"carrier prefix"
+            input_path.write_bytes(prefix + data + b"carrier suffix")
+            descriptor.update(open_mode="file_range", parts=[{
+                "path": str(input_path), "start": len(prefix), "end": len(prefix) + len(data),
+            }])
+        else:
+            second = tmp_path / "second.disguised"
+            midpoint = len(data) // 2
+            input_path.write_bytes(data[:midpoint])
+            second.write_bytes(data[midpoint:])
+            os.utime(second, ns=(946684800000000000, 946684800000000000))
+            descriptor.update(open_mode="concat_ranges", ranges=[
+                {"path": str(input_path), "start": 0}, {"path": str(second), "start": 0},
+            ])
+        os.utime(input_path, ns=(archive_mtime_ns, archive_mtime_ns))
+    output = tmp_path / "output"
+    started = time.time_ns()
+    result = _invoke_worker(worker, {
+        "job_id": "partial-file-times", "archive_path": str(input_path),
+        "output_dir": str(output),
+        "archive_input": descriptor,
+        "format_hint": "gzip" if archive_type.startswith("gzip") else archive_type.split("-")[0],
+    })
+    finished = time.time_ns()
+    final = _worker_result(result.stdout)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert final["status"] == "ok" and "metadata_warning" not in final
+    created, accessed, modified = _file_times_ns(output / "payload")
+    assert started <= created <= finished
+    assert started <= accessed <= finished
+    if mtime_ns is None:
+        assert modified == archive_mtime_ns
+    else:
+        assert modified == mtime_ns
+    row = final["verified_manifest"]["native_rows"].file_page(0, 1)[0]
+    assert row.get("mtime_ns") == (modified if modified >= 0 else None)
+    assert (output / "payload").read_bytes() == payload
+    if mtime_ns is None or archive_type.startswith("tar"):
+        oracle = tmp_path / "oracle"
+        subprocess.run([str(_require_7z_or_skip()), "x", str(archive), f"-o{oracle}", "-y"],
+                       check=True, capture_output=True)
+        assert _file_times_ns(oracle / "payload")[2] == modified
+        if archive_type.startswith("tar"):
+            assert _file_times_ns(output / "recorded")[2] == _file_times_ns(oracle / "recorded")[2]
+            for name in ("payload", "recorded"):
+                assert _file_attributes(output / name) & 0x27 == _file_attributes(oracle / name) & 0x27
+                _file_attributes(output / name, 0)
+                _file_attributes(oracle / name, 0)
+
+
+def test_worker_directory_metadata_uses_allocated_paths_and_archive_order(tmp_path):
+    # Unlike fresh-output oracle cases, a file forces directory renaming here.
+    # Duplicate and late directory records must still affect the allocated path;
+    # one small ZIP also checks implicit parents and ignored root metadata.
+    seven_zip = _require_7z_or_skip()
+    worker = _require_worker_or_skip()
+    archive = tmp_path / "ordered.zip"
+    entries = [("./", 0), ("tree/", 1), ("tree/deep/payload", 2),
+               ("tree/deep/", 3), ("tree/empty/", 4), ("tree/", 5),
+               ("implicit/payload", 6)]
+    with zipfile.ZipFile(archive, "w") as handle:
+        for name, index in entries:
+            item = zipfile.ZipInfo(name)
+            item.create_system = 0
+            item.external_attr = 0x12 if name.endswith("/") else 0x20
+            stamps = tuple(132223104001234567 + index * 10000000 + delta
+                           for delta in (0, 100000000000, 200000000000))
+            item.extra = struct.pack("<HHIHHQQQ", 0x000A, 32, 0, 1, 24, *stamps)
+            if index == 5:
+                with pytest.warns(UserWarning, match="Duplicate name"):
+                    handle.writestr(item, b"")
+            else:
+                handle.writestr(item, b"" if name.endswith("/") else b"payload")
+    oracle = tmp_path / "oracle"
+    subprocess.run([str(seven_zip), "x", str(archive), f"-o{oracle}", "-y"],
+                   check=True, capture_output=True)
+    output = tmp_path / "output"
+    output.mkdir()
+    collision = output / "tree"
+    collision.write_bytes(b"existing file")
+    collision_time = _file_times_ns(collision)
+    started = time.time_ns()
+    result = _invoke_worker(worker, {"job_id": "directory-paths", "archive_path": str(archive),
+                                     "output_dir": str(output), "format_hint": "zip"})
+    finished = time.time_ns()
+    final = _worker_result(result.stdout)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "metadata_warning" not in final
+    rows = final["verified_manifest"]["native_rows"].file_page(0, 2)
+    child = next(output / row["output_path"] for row in rows if "deep" in row["path"])
+    tree = child.parent.parent
+    assert tree != collision and child.read_bytes() == b"payload"
+    assert collision.read_bytes() == b"existing file" and _file_times_ns(collision) == collision_time
+    for relative in ("", "deep", "empty"):
+        assert _file_times_ns(tree / relative) == _file_times_ns(oracle / "tree" / relative)
+        assert _file_attributes(tree / relative) & 0x27 == _file_attributes(oracle / "tree" / relative) & 0x27
+    assert started <= _file_times_ns(output)[2] <= finished
+    assert started <= _file_times_ns(output / "implicit")[2] <= finished
+
+
+def test_worker_reports_timestamp_failure_without_losing_content(tmp_path):
+    # A real invalid ZIP NTFS timestamp exercises SetFileTime and the complete
+    # warning transport, which successful archives and writer-only tests cannot.
+    # Two files and a directory verify aggregation across both output paths.
+    worker = _require_worker_or_skip()
+    archive = tmp_path / "invalid-times.zip"
+    with zipfile.ZipFile(archive, "w") as handle:
+        for name in ("one.txt", "two.txt"):
+            item = zipfile.ZipInfo(name)
+            item.extra = struct.pack("<HHIHHQQQ", 0x000A, 32, 0, 1, 24,
+                                     1 << 63, 132223104000000000, 132223104000000000)
+            handle.writestr(item, b"intact")
+        directory = zipfile.ZipInfo("directory/")
+        directory.extra = item.extra
+        handle.writestr(directory, b"")
+    output = tmp_path / "output"
+    result = _invoke_worker(worker, {
+        "job_id": "timestamp-warning", "archive_path": str(archive),
+        "output_dir": str(output), "format_hint": "zip",
+    })
+    final = _worker_result(result.stdout)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert final["status"] == "ok" and final["files_written"] == 2
+    warning = final["metadata_warning"]
+    assert warning["file_count"] == 2 and warning["win32_error"] != 0
+    assert warning["directory_count"] == 1 and warning["time_failure_count"] == 3
+    assert warning["attribute_failure_count"] == 0 and warning["operation"] == "time"
+    assert warning["first_item_index"] == 0 and warning["first_item"] == "one.txt"
+    rows = final["verified_manifest"]["native_rows"].file_page(0, 2)
+    for row in rows:
+        path = output / row["path"]
+        assert row["mtime_ns"] == _file_times_ns(path)[2]
+        assert path.read_bytes() == b"intact"
 
 
 def test_worker_duplicate_invalid_names_report_failure_without_spinning(tmp_path):
@@ -364,11 +676,15 @@ def test_worker_header_encrypted_7z_tries_candidates_with_disguised_names(tmp_pa
     worker = _require_worker_or_skip()
     source = tmp_path / "payload.txt"
     source.write_text("encrypted payload", encoding="utf-8")
+    original_mtime_ns = 1578009600345678900
+    os.utime(source, ns=(original_mtime_ns, original_mtime_ns))
+    _file_attributes(source, 0x27)
     archive = tmp_path / "encrypted.7z"
     subprocess.run(
         [str(seven_zip), "a", str(archive), str(source), "-psecret", "-mhe=on", "-mx=0", "-y"],
         check=True, capture_output=True,
     )
+    _file_attributes(source, 0)
     data = archive.read_bytes()
     disguised = tmp_path / "input.blob"
     descriptor = {"entry_path": str(disguised), "format_hint": "7z", "open_mode": "file"}
@@ -400,6 +716,9 @@ def test_worker_header_encrypted_7z_tries_candidates_with_disguised_names(tmp_pa
     assert final["matched_index"] == 1
     assert final["password_attempts"] == 2
     assert (out / source.name).read_text(encoding="utf-8") == "encrypted payload"
+    assert (out / source.name).stat().st_mtime_ns == original_mtime_ns
+    assert _file_attributes(out / source.name) & 0x27 == 0x27
+    _file_attributes(out / source.name, 0)
 
 
 def test_native_worker_starts_in_neutral_working_directory(tmp_path, monkeypatch):

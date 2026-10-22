@@ -16,6 +16,7 @@
 namespace {
 
 using sunpack::sevenzip::AsyncFileWriter;
+using sunpack::sevenzip::ArchiveItemMetadata;
 using sunpack::sevenzip::AsyncWriterConfig;
 using sunpack::sevenzip::make_volume_state;
 using sunpack::sevenzip::snapshot_counters;
@@ -28,6 +29,23 @@ std::filesystem::path make_test_directory() {
          L"-" + std::to_wstring(GetTickCount64()));
     std::filesystem::create_directories(directory);
     return directory;
+}
+
+ArchiveItemMetadata historical_times() {
+    const auto time = [](std::uint64_t ticks) {
+        return FILETIME{static_cast<DWORD>(ticks), static_cast<DWORD>(ticks >> 32)};
+    };
+    return {time(132223104001234567ULL), time(132224104007654321ULL),
+        time(132225104009876543ULL),
+        ArchiveItemMetadata::Creation | ArchiveItemMetadata::Access | ArchiveItemMetadata::Modification};
+}
+
+bool file_times_match(const std::filesystem::path& path, const ArchiveItemMetadata& times) {
+    WIN32_FILE_ATTRIBUTE_DATA data{};
+    return GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &data) &&
+        CompareFileTime(&data.ftCreationTime, &times.creation) == 0 &&
+        CompareFileTime(&data.ftLastAccessTime, &times.access) == 0 &&
+        CompareFileTime(&data.ftLastWriteTime, &times.modification) == 0;
 }
 
 bool write_same_file_concurrently(const std::filesystem::path& directory) {
@@ -45,8 +63,11 @@ bool write_same_file_concurrently(const std::filesystem::path& directory) {
     AsyncFileWriter writer(
         std::make_shared<WriterMeters>(), make_volume_state("test:parallel", false), config);
     const auto job = writer.make_job();
+    auto times = historical_times();
+    times.defined |= ArchiveItemMetadata::Attributes;
+    times.attributes = FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_ARCHIVE;
     const auto file = writer.make_file(
-        job, (directory / L"parallel.bin").wstring(), L"parallel.bin", 0, 0);
+        job, (directory / L"parallel.bin").wstring(), L"parallel.bin", 0, 0, times);
     std::uint32_t processed = 0;
     if (writer.write(file, expected.data(), static_cast<std::uint32_t>(expected.size()), &processed) != S_OK ||
         processed != expected.size()) {
@@ -60,6 +81,8 @@ bool write_same_file_concurrently(const std::filesystem::path& directory) {
 
     const auto snapshot = writer.snapshot_file(file);
     const auto metrics = writer.snapshot_metrics();
+    const DWORD attributes = GetFileAttributesW((directory / L"parallel.bin").c_str());
+    SetFileAttributesW((directory / L"parallel.bin").c_str(), FILE_ATTRIBUTE_NORMAL);
     if (snapshot.failed || !snapshot.closed || snapshot.accepted_bytes != expected.size() ||
         snapshot.written_bytes != expected.size() || snapshot.peak_active_data_writes < 2 ||
         metrics.accepted_bytes != expected.size() || metrics.written_bytes != expected.size() ||
@@ -70,6 +93,13 @@ bool write_same_file_concurrently(const std::filesystem::path& directory) {
         return false;
     }
 
+    if ((attributes & times.attributes) != times.attributes ||
+        !file_times_match(directory / L"parallel.bin", times) ||
+        snapshot.metadata_errors.first_error() || !snapshot.has_mtime_ns ||
+        snapshot.mtime_ns != 1578036800987654300ULL) {
+        std::cerr << "parallel output timestamps were not restored\n";
+        return false;
+    }
     std::ifstream input(directory / L"parallel.bin", std::ios::binary);
     std::vector<unsigned char> actual(
         (std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
@@ -79,17 +109,54 @@ bool write_same_file_concurrently(const std::filesystem::path& directory) {
 bool write_zero_length_file(const std::filesystem::path& directory) {
     AsyncFileWriter writer;
     const auto job = writer.make_job();
+    auto times = historical_times();
+    // 1965 is representable on disk but not by the unsigned Unix-ns inventory.
+    times.modification = FILETIME{0x4EF30000, 0x019816FE};
     const auto file = writer.make_file(
-        job, (directory / L"empty.bin").wstring(), L"empty.bin", 1, 1);
-    writer.record_operation_result(file, 0);
+        job, (directory / L"empty.bin").wstring(), L"empty.bin", 1, 1, times);
+    // Force close to finish before the decoder result, without a timing race
+    // or sleep. Other tests record the result before close and miss this case.
     writer.close_file(file, {});
     if (writer.finish_job(job) != S_OK) {
         return false;
     }
+    writer.record_operation_result(file, 0);
     const auto snapshot = writer.snapshot_file(file);
     std::error_code error;
     return !snapshot.failed && snapshot.closed && snapshot.written_bytes == 0 &&
+        !snapshot.metadata_errors.first_error() && !snapshot.has_mtime_ns &&
+        file_times_match(directory / L"empty.bin", times) &&
         std::filesystem::file_size(directory / L"empty.bin", error) == 0 && !error;
+}
+
+// Only this test reuses the same writer after an actual SetFileTime failure;
+// one-shot archive tests cannot cover that lifetime. Two tiny files suffice.
+bool timestamp_failure_does_not_fail_content(const std::filesystem::path& directory) {
+    AsyncFileWriter writer;
+    auto times = historical_times();
+    times.modification = FILETIME{0, 0x80000000}; // outside Windows' valid time range
+    const auto job = writer.make_job();
+    const auto path = directory / L"invalid-time.bin";
+    const auto file = writer.make_file(job, path.wstring(), L"invalid-time.bin", 0, 0, times);
+    const unsigned char payload[] = {1, 2, 3};
+    std::uint32_t processed = 0;
+    if (writer.write(file, payload, sizeof(payload), &processed) != S_OK || processed != sizeof(payload))
+        return false;
+    writer.record_operation_result(file, 0);
+    writer.close_file(file, {});
+    if (writer.finish_job(job) != S_OK) return false;
+    const auto snapshot = writer.snapshot_file(file);
+    if (snapshot.failed || !snapshot.closed || !snapshot.metadata_errors.first_error() ||
+        snapshot.written_bytes != sizeof(payload) || std::filesystem::file_size(path) != sizeof(payload))
+        return false;
+
+    const auto next_job = writer.make_job();
+    const auto next_path = directory / L"valid-time.bin";
+    const auto next = writer.make_file(next_job, next_path.wstring(), L"valid-time.bin", 1, 1, historical_times());
+    writer.record_operation_result(next, 0);
+    writer.close_file(next, {});
+    return writer.finish_job(next_job) == S_OK &&
+        !writer.snapshot_file(next).metadata_errors.first_error() && file_times_match(next_path, historical_times());
 }
 
 bool closes_after_delayed_open_failure(const std::filesystem::path& directory) {
@@ -549,6 +616,7 @@ int main() {
     const auto directory = make_test_directory();
     const bool passed = write_same_file_concurrently(directory) &&
         write_zero_length_file(directory) &&
+        timestamp_failure_does_not_fail_content(directory) &&
         closes_after_delayed_open_failure(directory) &&
         cancelled_job_returns_pending_to_zero(directory) &&
         successful_job_leaves_pending_at_zero(directory) &&

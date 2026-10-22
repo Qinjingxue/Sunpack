@@ -169,6 +169,14 @@ struct ExtractOutputTrace {
     int last_win32_error = 0;
     std::wstring current_item_path;
     std::vector<ExtractOutputItemTrace> items;
+    unsigned int metadata_failed_files = 0;
+    unsigned int metadata_failed_directories = 0;
+    unsigned int metadata_failed_times = 0;
+    unsigned int metadata_failed_attributes = 0;
+    bool metadata_first_is_attributes = false;
+    unsigned int metadata_first_item_index = 0;
+    unsigned long metadata_first_win32_error = 0;
+    std::wstring metadata_first_item;
 };
 
 struct StreamDecodeReceipt {

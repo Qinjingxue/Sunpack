@@ -713,9 +713,18 @@ namespace sunpack::sevenzip
 
         ~ExtractToDiskCallback() { finalize_output(); }
 
-        void set_default_input_name(const std::wstring &path)
+        void set_input_file(const std::wstring &path)
         {
             default_input_name_ = std::filesystem::path(path).stem().wstring();
+            // Same fallback as 7z.exe for disk input. The canonical entry path
+            // already comes from the input plan; do not inspect/reclassify parts.
+            WIN32_FILE_ATTRIBUTE_DATA data{};
+            if (!dry_run_ && GetFileAttributesExW(win32_extended_path(path).c_str(),
+                    GetFileExInfoStandard, &data))
+            {
+                archive_mtime_ = data.ftLastWriteTime;
+                has_archive_mtime_ = true;
+            }
         }
 
         Int32 operation_result() const { return operation_result_; }
@@ -790,6 +799,7 @@ namespace sunpack::sevenzip
                 if (decoder_ok && output_ok)
                 {
                     ++completed_files;
+                    record_metadata_errors(snapshot.metadata_errors, state->item_index, state->item_path, false);
                 }
 
                 if (output_trace_ && state->trace_index < output_trace_->items.size())
@@ -833,6 +843,7 @@ namespace sunpack::sevenzip
                     }
                 }
             }
+            restore_directory_metadata();
             files_written_ = completed_files;
             bytes_written_ = total_written;
             if (output_trace_)
@@ -1021,8 +1032,7 @@ namespace sunpack::sevenzip
                     has_source_crc32);
             }
 
-            // These directory entries denote the extraction root itself.
-            // Consume them without mapping a path or creating an output.
+            // Like 7z's normal x mode, ignore entries denoting the output root.
             if (is_dir && (name == L"." || name == L"./" || name == L".\\"))
             {
                 emit("item_start", index, name);
@@ -1066,6 +1076,17 @@ namespace sunpack::sevenzip
                         target = output_paths_.allocate(output_root_ / safe_path.value(), output_root_initially_empty_, true);
 
                         directory_ready = ensure_directory(target, &directory_error);
+                        if (directory_ready)
+                        {
+                            const auto metadata = read_item_metadata(index, true);
+                            if (metadata.defined)
+                            {
+                                const auto &text = target.native();
+                                const auto depth = static_cast<std::size_t>(std::count_if(
+                                    text.begin(), text.end(), [](wchar_t c) { return c == L'/' || c == L'\\'; }));
+                                directory_metadata_.push_back({target, metadata, depth, index, current_trace_index_});
+                            }
+                        }
 
                         if (directory_ready && output_trace_ && current_trace_index_ < output_trace_->items.size())
                         {
@@ -1151,8 +1172,9 @@ namespace sunpack::sevenzip
                 output_error_ = true;
                 return E_FAIL;
             }
+            const auto metadata = read_item_metadata(index, false);
             current_async_file_ = async_writer_->make_file(async_job_,
-                                                           target.wstring(), name, index, current_trace_index_
+                                                           target.wstring(), name, index, current_trace_index_, metadata
 #ifdef SUP7Z_ENABLE_WRITER_PROBE
                                                            , has_expected_size ? expected_size : 0
 #endif
@@ -1249,6 +1271,120 @@ namespace sunpack::sevenzip
         }
 
     private:
+        ArchiveItemMetadata read_item_metadata(UInt32 index, bool is_dir) const
+        {
+            ArchiveItemMetadata metadata;
+            PROPVARIANT value{};
+            const auto read_time = [&](UInt32 property, FILETIME &time, unsigned char flag)
+            {
+                if (get_item_property(archive_, index, property, value) && value.vt == VT_FILETIME)
+                {
+                    time = value.filetime;
+                    metadata.defined |= flag;
+                }
+                clear_prop(value);
+            };
+            read_time(kpidCTime, metadata.creation, ArchiveItemMetadata::Creation);
+            read_time(kpidATime, metadata.access, ArchiveItemMetadata::Access);
+            read_time(kpidMTime, metadata.modification, ArchiveItemMetadata::Modification);
+            if (!(metadata.defined & ArchiveItemMetadata::Modification) && has_archive_mtime_)
+            {
+                metadata.modification = archive_mtime_;
+                metadata.defined |= ArchiveItemMetadata::Modification;
+            }
+            if (get_item_property(archive_, index, kpidAttrib, value) && value.vt == VT_UI4)
+            {
+                metadata.attributes = value.ulVal;
+                metadata.defined |= ArchiveItemMetadata::Attributes;
+            }
+            clear_prop(value);
+            // Match 7z's small POSIX -> Windows attribute mapping, without
+            // implementing Unix permissions, owners, or link extraction.
+            if (!(metadata.defined & ArchiveItemMetadata::Attributes) &&
+                get_item_property(archive_, index, kpidPosixAttrib, value) && value.vt == VT_UI4)
+            {
+                metadata.attributes = is_dir ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_ARCHIVE;
+                if ((value.ulVal & 0222) == 0) metadata.attributes |= FILE_ATTRIBUTE_READONLY;
+                metadata.defined |= ArchiveItemMetadata::Attributes;
+            }
+            clear_prop(value);
+            return metadata;
+        }
+
+        void record_metadata_errors(const ArchiveMetadataErrors &errors, UInt32 index,
+                                    const std::wstring &name, bool is_dir)
+        {
+            if (!errors.first_error() || !output_trace_) return;
+            auto &trace = *output_trace_;
+            if (trace.metadata_failed_files == 0 && trace.metadata_failed_directories == 0)
+            {
+                trace.metadata_first_item_index = index;
+                trace.metadata_first_item = name;
+                trace.metadata_first_win32_error = errors.first_error();
+                trace.metadata_first_is_attributes = errors.time == 0;
+            }
+            if (is_dir) ++trace.metadata_failed_directories;
+            else ++trace.metadata_failed_files;
+            if (errors.time) ++trace.metadata_failed_times;
+            if (errors.attributes) ++trace.metadata_failed_attributes;
+        }
+
+        struct DirectoryMetadata
+        {
+            std::filesystem::path target;
+            ArchiveItemMetadata metadata;
+            std::size_t depth;
+            UInt32 item_index;
+            std::size_t trace_index;
+        };
+
+        void restore_directory_metadata() noexcept
+        {
+            // Like 7z: children before parents, original order at equal depth.
+            std::sort(directory_metadata_.begin(), directory_metadata_.end(),
+                [](const DirectoryMetadata &a, const DirectoryMetadata &b)
+                { return a.depth != b.depth ? a.depth > b.depth : a.item_index < b.item_index; });
+            for (const auto &directory : directory_metadata_)
+            {
+                ArchiveMetadataErrors errors;
+                try
+                {
+                    ensure_no_reparse_ancestors(directory.target);
+                    const HANDLE handle = CreateFileW(win32_extended_path(directory.target.native()).c_str(),
+                        FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                        nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+                    if (handle == INVALID_HANDLE_VALUE)
+                    {
+                        const DWORD error = GetLastError();
+                        if (directory.metadata.has_times()) errors.time = error;
+                        if (directory.metadata.defined & ArchiveItemMetadata::Attributes) errors.attributes = error;
+                    }
+                    else
+                    {
+                        errors.time = directory.metadata.set_times(handle);
+                        errors.attributes = directory.metadata.set_attributes(handle);
+                        if (!CloseHandle(handle) && !errors.first_error()) errors.time = GetLastError();
+                    }
+                }
+                catch (const std::filesystem::filesystem_error &error)
+                {
+                    if (directory.metadata.has_times()) errors.time = static_cast<DWORD>(error.code().value());
+                    if (directory.metadata.defined & ArchiveItemMetadata::Attributes)
+                        errors.attributes = static_cast<DWORD>(error.code().value());
+                }
+                catch (...)
+                {
+                    if (directory.metadata.has_times()) errors.time = ERROR_NOT_ENOUGH_MEMORY;
+                    if (directory.metadata.defined & ArchiveItemMetadata::Attributes)
+                        errors.attributes = ERROR_NOT_ENOUGH_MEMORY;
+                }
+                if (output_trace_ && directory.trace_index < output_trace_->items.size())
+                    record_metadata_errors(errors, directory.item_index,
+                        output_trace_->items[directory.trace_index].path, true);
+            }
+            std::vector<DirectoryMetadata>{}.swap(directory_metadata_);
+        }
+
         std::wstring default_item_name(UInt32 index) const
         {
             const std::wstring &leaf = default_input_name_;
@@ -1525,6 +1661,9 @@ namespace sunpack::sevenzip
 
         std::wstring output_dir_;
         std::wstring default_input_name_;
+        FILETIME archive_mtime_{};
+        bool has_archive_mtime_ = false;
+        std::vector<DirectoryMetadata> directory_metadata_;
 
         ExtractProgressCallback progress_;
 

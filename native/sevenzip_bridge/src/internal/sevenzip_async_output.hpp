@@ -30,6 +30,52 @@
 
 namespace sunpack::sevenzip
 {
+    struct ArchiveItemMetadata
+    {
+        enum : unsigned char { Creation = 1, Access = 2, Modification = 4, Attributes = 8 };
+        FILETIME creation{};
+        FILETIME access{};
+        FILETIME modification{};
+        unsigned char defined = 0;
+        DWORD attributes = 0;
+
+        bool has_times() const noexcept { return (defined & (Creation | Access | Modification)) != 0; }
+
+        DWORD set_times(HANDLE handle) const noexcept
+        {
+            if (!has_times() || SetFileTime(handle,
+                    (defined & Creation) ? &creation : nullptr,
+                    (defined & Access) ? &access : nullptr,
+                    (defined & Modification) ? &modification : nullptr))
+                return ERROR_SUCCESS;
+            return GetLastError();
+        }
+
+        DWORD set_attributes(HANDLE handle) const noexcept
+        {
+            if (!(defined & Attributes)) return ERROR_SUCCESS;
+            // Only basic writable attributes; never copy type,
+            // reparse, compression, encryption or POSIX mode bits into Windows.
+            constexpr DWORD mask = FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_HIDDEN |
+                FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_ARCHIVE | FILE_ATTRIBUTE_TEMPORARY |
+                FILE_ATTRIBUTE_OFFLINE | FILE_ATTRIBUTE_NOT_CONTENT_INDEXED;
+            const DWORD value = attributes & mask;
+            // Zero time fields leave the timestamps unchanged. NORMAL clears
+            // writable flags; zero attributes would instead leave them unchanged.
+            FILE_BASIC_INFO info{};
+            info.FileAttributes = value ? value : FILE_ATTRIBUTE_NORMAL;
+            if (SetFileInformationByHandle(handle, FileBasicInfo, &info, sizeof(info)))
+                return ERROR_SUCCESS;
+            return GetLastError();
+        }
+    };
+
+    struct ArchiveMetadataErrors
+    {
+        DWORD time = 0;
+        DWORD attributes = 0;
+        DWORD first_error() const noexcept { return time ? time : attributes; }
+    };
 
     class AsyncFileWriter final
     {
@@ -83,6 +129,7 @@ namespace sunpack::sevenzip
             Int32 operation_result = 0;
             HRESULT hresult = S_OK;
             int win32_error = 0;
+            ArchiveMetadataErrors metadata_errors;
             bool operation_result_set = false;
             bool has_mtime_ns = false;
             UInt64 mtime_ns = 0;
@@ -160,12 +207,14 @@ namespace sunpack::sevenzip
                 std::wstring file_path,
                 std::wstring archive_path,
                 UInt32 archive_index,
-                std::size_t trace)
+                std::size_t trace,
+                const ArchiveItemMetadata &file_metadata)
                 : item_path(std::move(archive_path)),
                   item_index(archive_index),
                   trace_index(trace),
                   job(std::move(state)),
-                  path(std::move(file_path)) {}
+                  path(std::move(file_path)),
+                  metadata(file_metadata) {}
 
             const std::wstring item_path;
             const UInt32 item_index = 0;
@@ -180,6 +229,7 @@ namespace sunpack::sevenzip
 
             JobStatePtr job;
             std::wstring path;
+            const ArchiveItemMetadata metadata;
             std::shared_ptr<VolumeSpaceGate> space_gate;
             std::atomic<UInt64> accepted_bytes{0};
             std::atomic<UInt64> next_write_offset{0};
@@ -193,6 +243,7 @@ namespace sunpack::sevenzip
             Int32 operation_result = 0;
             HRESULT hresult = S_OK;
             int win32_error = 0;
+            ArchiveMetadataErrors metadata_errors;
             bool operation_result_set = false;
             bool has_mtime_ns = false;
             UInt64 mtime_ns = 0;
@@ -296,7 +347,8 @@ namespace sunpack::sevenzip
             std::wstring path,
             std::wstring item_path,
             UInt32 item_index,
-            std::size_t trace_index
+            std::size_t trace_index,
+            const ArchiveItemMetadata &metadata = {}
 #ifdef SUP7Z_ENABLE_WRITER_PROBE
             , UInt64 expected_size = 0
 #endif
@@ -304,7 +356,7 @@ namespace sunpack::sevenzip
         {
             auto file = std::make_shared<FileState>(
                 job ? job : make_job(),
-                std::move(path), std::move(item_path), item_index, trace_index);
+                std::move(path), std::move(item_path), item_index, trace_index, metadata);
             std::lock_guard<std::mutex> lock(mutex_);
 #ifdef SUP7Z_ENABLE_WRITER_PROBE
             file->probe_expected_size = expected_size;
@@ -812,6 +864,7 @@ namespace sunpack::sevenzip
             snapshot.operation_result = file->operation_result;
             snapshot.hresult = file->hresult;
             snapshot.win32_error = file->win32_error;
+            snapshot.metadata_errors = file->metadata_errors;
             snapshot.operation_result_set = file->operation_result_set;
             snapshot.has_mtime_ns = file->has_mtime_ns;
             snapshot.mtime_ns = file->mtime_ns;
@@ -1717,12 +1770,24 @@ namespace sunpack::sevenzip
             }
             if (result.kind == AttemptResult::Kind::SpaceFailure || result.kind == AttemptResult::Kind::PermanentFailure)
                 record_failure(file, HRESULT_FROM_WIN32(result.win32_error), result.win32_error);
+            bool restore_times = false;
             {
                 std::lock_guard<std::mutex> lock(mutex_);
+                restore_times = !file->failed && result.kind == AttemptResult::Kind::Succeeded;
                 file->handle = INVALID_HANDLE_VALUE;
             }
+            ArchiveMetadataErrors metadata_errors;
             if (handle != INVALID_HANDLE_VALUE)
             {
+                // All data writes have drained. Stream release can precede
+                // SetOperationResult, so timestamp restoration must not depend on it.
+                if (restore_times)
+                {
+                    metadata_errors.time = file->metadata.set_times(handle);
+                    // Data is drained; restore read-only last, using the same
+                    // handle to avoid a pathname lookup and a second open/close.
+                    metadata_errors.attributes = file->metadata.set_attributes(handle);
+                }
                 FILETIME last_write{};
                 if (GetFileTime(handle, nullptr, nullptr, &last_write))
                 {
@@ -1730,7 +1795,8 @@ namespace sunpack::sevenzip
                     ticks.LowPart = last_write.dwLowDateTime;
                     ticks.HighPart = last_write.dwHighDateTime;
                     constexpr UInt64 unix_epoch_100ns = 116444736000000000ULL;
-                    if (ticks.QuadPart >= unix_epoch_100ns)
+                    if (ticks.QuadPart >= unix_epoch_100ns &&
+                        ticks.QuadPart - unix_epoch_100ns <= (std::numeric_limits<UInt64>::max)() / 100ULL)
                     {
                         std::lock_guard<std::mutex> lock(mutex_);
                         file->mtime_ns = (ticks.QuadPart - unix_epoch_100ns) * 100ULL;
@@ -1755,6 +1821,7 @@ namespace sunpack::sevenzip
             bool completed_successfully = false;
             {
                 std::lock_guard<std::mutex> lock(mutex_);
+                file->metadata_errors = metadata_errors;
                 file->closed = true;
                 completed_successfully = !file->failed;
                 if (job && job->pending_jobs != 0)
