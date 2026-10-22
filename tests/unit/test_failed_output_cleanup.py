@@ -18,12 +18,9 @@ from sunpack.pipeline.postprocess.failed_output_cleanup import (
 from tests.helpers.archive_tasks import make_archive_task
 
 
-@pytest.mark.parametrize("with_zero_file", [False, True])
-def test_cleanup_removes_failed_output_with_no_payload_bytes(tmp_path, with_zero_file):
+def test_cleanup_removes_failed_empty_output(tmp_path):
     output = tmp_path / "output"
     output.mkdir()
-    if with_zero_file:
-        (output / "empty.txt").write_bytes(b"")
 
     result = cleanup_failed_output_if_eligible(
         str(output),
@@ -98,12 +95,14 @@ def test_complete_embedded_children_are_not_policy_rejected_with_failed_siblings
     assert ArchiveJobOutcome(result=outer).policy_rejected_partial_output is False
 
 
-def test_collect_result_applies_main_pipeline_cleanup_after_diagnostics(tmp_path):
+@pytest.mark.parametrize("with_zero_file", [False, True])
+def test_collect_result_records_cleanup_and_preserves_zero_byte_files(tmp_path, with_zero_file):
     archive = tmp_path / "broken.zip"
     archive.write_bytes(b"broken")
     output = tmp_path / "broken"
     output.mkdir()
-    (output / "empty.txt").write_bytes(b"")
+    if with_zero_file:
+        (output / "empty.txt").write_bytes(b"")
     task = make_archive_task(
         archive,
         logical_name="broken",
@@ -127,8 +126,14 @@ def test_collect_result_applies_main_pipeline_cleanup_after_diagnostics(tmp_path
 
     assert returned.outcome_kind == OutcomeKind.FAILURE
     assert returned.output_dir == str(output)
-    assert not output.exists()
-    assert extraction.diagnostics["failed_output_cleanup"]["cleaned"] is True
+    cleanup = extraction.diagnostics["failed_output_cleanup"]
+    assert cleanup["cleaned"] is (not with_zero_file)
+    assert cleanup["reason"] == ("nonempty_payload" if with_zero_file else "cleaned")
+    assert output.exists() is with_zero_file
+    if with_zero_file:
+        assert (output / "empty.txt").read_bytes() == b""
+        assert cleanup["payload_file_count"] == 1
+        assert cleanup["payload_bytes"] == 0
     assert [item.failure_message for item in runner.context.target_results] == [
         "broken.zip [damaged]"
     ]
