@@ -1,126 +1,40 @@
-name: "🐛 Bug Report / 程序错误"
-description: "Report a GUI, Watch, installation, runtime or other software bug / 报告软件错误"
+name: "🐛 Bug 反馈 / Bug Report"
+description: "GUI、Watch、安装及其他程序错误"
 title: "[Bug] "
 labels: ["bug"]
 body:
-  - type: markdown
-    attributes:
-      value: |
-        感谢反馈！可用中文或英文填写。如果问题主要涉及压缩包识别、分卷、递归或解压结果，请优先选择 Archive Handling 模板。
-
-        **隐私提醒：Issue 和附件是公开的。请勿上传真实密码、密码文件、剪贴板内容、私人压缩包或未经脱敏的完整配置。**
-        日志可能包含文件名、绝对路径、用户名和错误细节。诊断材料均为可选项；请只提供与问题相关的信息。
-        Watch 日志会按容量限制覆盖旧记录，建议问题发生后及时复制留存。
-
   - type: input
-    id: version
+    id: environment
     attributes:
-      label: "SunPack 版本 / Version"
-      description: "可运行 sunpack.exe version，也可填写 Release 版本号。"
-      placeholder: "例如 v1.2.2"
-    validations:
-      required: true
-
-  - type: dropdown
-    id: windows
-    attributes:
-      label: "系统环境 / Windows"
-      options:
-        - "Windows 11 x64"
-        - "Windows 11 ARM64"
-        - "Windows 10 x64"
-        - "Windows 10 ARM64"
-        - "其他 / 不确定"
-    validations:
-      required: true
-
-  - type: dropdown
-    id: component
-    attributes:
-      label: "受影响的功能 / Component"
-      options:
-        - "GUI / 管理面板"
-        - "Watch / 后台监控"
-        - "CLI / 命令行"
-        - "安装、更新或卸载"
-        - "Windows 通知 / 托盘"
-        - "配置或密码管理"
-        - "后台 Runtime / 服务"
-        - "其他 / 不确定"
+      label: "版本与系统"
+      placeholder: "例如：SunPack v1.2.2 / Windows 11 x64"
     validations:
       required: true
 
   - type: textarea
-    id: actual
+    id: problem
     attributes:
-      label: "实际发生了什么？ / Actual behavior"
-      description: "描述异常现象、可见错误及大致发生时间。"
-      placeholder: "例如：新监控目录中的压缩包没有显示在任务页面……"
+      label: "问题描述"
+      description: "实际发生了什么？你期望怎样？"
     validations:
       required: true
 
   - type: textarea
-    id: expected
+    id: steps
     attributes:
-      label: "预期行为 / Expected behavior"
-      placeholder: "例如：新归档应被自动发现并显示处理状态。"
-    validations:
-      required: true
+      label: "复现步骤（选填）"
+      description: "出现问题前进行了哪些操作？"
 
   - type: textarea
-    id: reproduce
+    id: logs
     attributes:
-      label: "操作或复现步骤 / Steps to reproduce"
-      description: "不能稳定复现也没关系，请描述发生前的操作。"
-      placeholder: |
-        1. 打开……
-        2. 设置……
-        3. 出现……
+      label: "日志与截图（选填）"
+      description: |
+        安装版默认日志位置：
+        Watch：%ProgramData%\SunPack\.sunpack_watch\events.jsonl
+        解压失败：%ProgramData%\SunPack\.sunpack_watch\failures\failed-*.txt
+        Windows 通知：%ProgramData%\SunPack\.sunpack_watch\toast_host_events.jsonl
+        后台 Runtime：%ProgramData%\SunPack\runtime-*.state.events.jsonl
 
-  - type: dropdown
-    id: frequency
-    attributes:
-      label: "发生频率 / Frequency"
-      options:
-        - "每次都发生"
-        - "偶尔发生"
-        - "只出现过一次"
-        - "不确定"
-
-  - type: markdown
-    attributes:
-      value: |
-        ### 诊断信息（选填）
-        根据问题类型选择材料，**不需要全部执行**：
-
-        - 安装、更新、右键菜单、环境：`sunpack.exe doctor --json`
-        - Watch 启停：`sunpack.exe watch status`，以及对应时间附近的 `events.jsonl`
-        - GUI 任务列表：界面截图 + `events.jsonl`（GUI 从事件日志投影任务）
-        - Toast 通知：`toast_host_events.jsonl`
-        - 后台 Runtime：`runtime-<id>.state.events.jsonl`
-
-        安装版默认 Watch 状态目录为 `%ProgramData%\SunPack\.sunpack_watch\`，但 `watch.state_dir` 可更改它。
-        Runtime 事件日志位于程序数据目录 `%ProgramData%\SunPack\`。
-        `events.jsonl` 不是完整历史，请尽快保存故障发生时的记录。
-
-  - type: textarea
-    id: diagnostics
-    attributes:
-      label: "错误输出与诊断摘要 / Diagnostic details"
-      description: "可粘贴退出码、脱敏后的报错或说明已上传哪些日志；没有可以留空。"
-      placeholder: "例如：doctor 检查失败项、事件时间、相关错误行……"
-
-  - type: upload
-    id: attachments
-    attributes:
-      label: "日志和截图 / Logs & screenshots"
-      description: "上传脱敏后的相关日志、截图或 ZIP。JSONL 文件可压缩为 ZIP；勿上传密码文件或完整私有目录。"
-    validations:
-      required: false
-      accept: ".zip,.txt,.log,.json,.png,.jpg,.jpeg,.webp"
-
-  - type: textarea
-    id: context
-    attributes:
-      label: "其他说明 / Additional context"
-      description: "例如是否在更新后开始出现、是否改过设置，以及已知的临时解决方法。"
+        若修改过 watch.state_dir，前三项在自定义状态目录下。
+        可直接粘贴报错或拖入日志、截图；上传前请清除密码和私人信息。

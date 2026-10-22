@@ -1,6 +1,0 @@
-# Keep the blank issue entry available for feedback that does not fit these forms.
-blank_issues_enabled: true
-contact_links:
-  - name: "Documentation / 使用文档"
-    url: "https://github.com/Qinjingxue/Sunpack#使用指南"
-    about: "Read the usage guide and configuration documentation before reporting / 提交前可先查阅说明"

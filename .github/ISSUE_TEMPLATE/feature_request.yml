@@ -1,57 +1,26 @@
-name: "✨ Feature Request / 功能建议"
-description: "Suggest a useful workflow or usability improvement / 建议功能或使用体验改进"
+name: "✨ 功能建议 / Feature Request"
+description: "提出功能或使用体验改进建议"
 title: "[Feature] "
 labels: ["enhancement"]
 body:
-  - type: markdown
-    attributes:
-      value: |
-        欢迎提出功能建议！可以用中文或英文。
-        请优先描述 **实际使用场景与想解决的问题**，不要求设计底层实现方案。
-        功能建议无需提供日志；如果是当前行为错误，请选择 Bug Report 或 Archive Handling。
-        不要公开上传真实密码、私人文件或其他敏感数据。
-
-  - type: dropdown
-    id: area
-    attributes:
-      label: "使用场景 / Area"
-      options:
-        - "Watch / 自动监控及工作流"
-        - "识别、分卷、递归或解压"
-        - "GUI / 易用性"
-        - "配置与密码管理"
-        - "安装、更新和 Windows 集成"
-        - "性能与资源占用"
-        - "其他"
-    validations:
-      required: true
-
   - type: textarea
     id: problem
     attributes:
-      label: "目前遇到了什么不便？ / Problem"
-      description: "请描述真实的使用情境，而不是只写要增加什么按钮或技术。"
-      placeholder: "例如：监控多个下载目录后，很难查找某个目录的处理任务……"
+      label: "使用场景与问题"
+      description: "你在使用 SunPack 时遇到了什么不便？"
     validations:
       required: true
 
   - type: textarea
-    id: outcome
+    id: suggestion
     attributes:
-      label: "希望达到什么效果？ / Desired outcome"
-      description: "从用户角度描述期望的行为，具体实现可由维护者评估。"
-      placeholder: "例如：希望可以按目录快速筛选和定位任务……"
+      label: "希望如何改进？"
+      description: "描述期望的效果即可，不需要提供技术实现方案。"
     validations:
       required: true
 
   - type: textarea
-    id: workaround
+    id: extra
     attributes:
-      label: "目前如何解决？ / Current workaround"
-      description: "已有的手工步骤或替代工具；没有可以留空。"
-
-  - type: textarea
-    id: context
-    attributes:
-      label: "示例或补充信息 / Examples"
-      description: "可附截图、相关 Issue 链接。性能建议请尽量写明文件数量、体积、机器和耗时。"
+      label: "补充信息（选填）"
+      description: "例如截图、使用示例或目前的替代办法。"
