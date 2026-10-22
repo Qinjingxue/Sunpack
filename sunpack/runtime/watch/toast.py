@@ -263,6 +263,10 @@ class WatchToastCoordinator:
 
         task_progress = request.tasks.get(task_id)
         if task_progress is None and event == "space_blocked":
+            # Disk full may happen before the first extract_started progress event.
+            request.visible = True
+            self._ensure_batch_locked(request.source_path)
+            self._cancel_finalize_locked()
             task_progress = _TaskProgress(name=_task_name(task, request.source_path))
             request.tasks[task_id] = task_progress
 
@@ -446,7 +450,8 @@ class WatchToastCoordinator:
         else:
             value_text = self.i18n.t("toast.progress.indeterminate")
         # 空间不足并入既有进度快照，不另发 publish，否则 toast 会在"进度"与"暂停"之间来回抖动。
-        if any(task.disk_blocked for task in tasks):
+        disk_paused = any(task.disk_blocked for task in tasks)
+        if disk_paused:
             mode = ToastProgressMode.INDETERMINATE
             value = 0.0
             value_text = self.i18n.t("report.status.disk_paused")
@@ -454,13 +459,13 @@ class WatchToastCoordinator:
                 (task.space_detail for task in tasks if task.disk_blocked and task.space_detail),
                 "",
             )
-            progress_status = detail or self.i18n.t("report.status.disk_paused")
+            progress_status = detail or self.i18n.t("toast.progress.disk_paused")
         else:
             progress_status = self.i18n.t("toast.progress.status", completed=completed_requests, total=count)
         self.host.publish(ToastSnapshot(
             kind=ToastSnapshotKind.PROGRESS,
             batch_id=self._batch_id,
-            title=self.i18n.t("toast.progress.title"),
+            title=self.i18n.t("toast.progress.paused_title" if disk_paused else "toast.progress.title"),
             body=self.i18n.t("toast.progress.body", completed=completed_requests, total=count),
             progress_mode=mode,
             progress_value=value,
