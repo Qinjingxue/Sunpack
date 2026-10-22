@@ -27,6 +27,7 @@ def test_batched_jobs_finish_independent_work_and_nested_batches_before_raising(
         runtime.source_cleanup = NS(register=lambda tasks: None)
         runtime.reporter = NS(tasks_discovered=lambda *a, **k: None)
         runtime.job_executor = NS(password_scope_context=NS(annotate=lambda tasks: None))
+        runtime._consumer_budget = broker.max_pending_jobs
         seen = set()
         children_done = asyncio.Event()
 
@@ -112,6 +113,7 @@ def test_watch_claim_publishes_each_confirmed_task_and_updated_volume_members(tm
         second = ArchiveTask.from_archive_input(ArchiveInputDescriptor(
             str(tmp_path / "inner.zip"), logical_name="inner.zip",
         ), discovery_source="test")
+        broker = AsyncWorkBroker(thread_capacity=2, max_pending_jobs=4)
         runtime = object.__new__(_RequestRuntime)
         runtime.submission = NS(origin="watch", request_id="claim", detection_options=EmbeddedOptions())
         runtime.recursive_authorization = NS(authorize_batch=lambda tasks, *a, **k: NS(allowed_tasks=tasks, skipped=()))
@@ -121,6 +123,7 @@ def test_watch_claim_publishes_each_confirmed_task_and_updated_volume_members(tm
         runtime.source_cleanup = NS(register=lambda tasks: None)
         runtime.reporter = NS(tasks_discovered=lambda *a, **k: None)
         runtime.job_executor = NS(password_scope_context=NS(annotate=lambda tasks: None))
+        runtime._consumer_budget = broker.max_pending_jobs
         runtime.path_leases = _PathLeaseRegistry()
         claims = []
         runtime._report_progress = lambda task, event: claims.append(event)
@@ -129,7 +132,6 @@ def test_watch_claim_publishes_each_confirmed_task_and_updated_volume_members(tm
             return True
 
         runtime._execute_job = job
-        broker = AsyncWorkBroker(thread_capacity=2, max_pending_jobs=4)
         try:
             assert await runtime._run_discovery_batch(
                 [first, second], roots=[], scan_session=None, depth=1, direct=True,
