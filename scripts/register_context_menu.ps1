@@ -273,19 +273,31 @@ function New-ChineseText {
 }
 
 function Get-SubMenuTexts {
-    param([string]$Language)
+    param(
+        [string]$Language,
+        [ValidateSet("folder", "background", "file")][string]$Context
+    )
 
     if ($Language -eq "zh") {
+        $subject = switch ($Context) {
+            "folder" { New-ChineseText @(0x8BE5, 0x76EE, 0x5F55, 0x4E0B, 0x6587, 0x4EF6) }
+            "background" { New-ChineseText @(0x76EE, 0x5F55, 0x4E0B, 0x6587, 0x4EF6) }
+            "file" { New-ChineseText @(0x8BE5, 0x6587, 0x4EF6) }
+        }
+        $directVerb = New-ChineseText @(0x89E3, 0x538B)
+        $promptVerb = New-ChineseText @(0x8F93, 0x5165, 0x5BC6, 0x7801, 0x89E3, 0x538B)
         return @{
-            Prompt = New-ChineseText @(0x4EA4, 0x4E92, 0x8F93, 0x5165, 0x5BC6, 0x7801, 0x89E3, 0x538B)
-            Direct = New-ChineseText @(0x76F4, 0x63A5, 0x89E3, 0x538B)
+            Prompt = "$promptVerb$subject"
+            Direct = "$directVerb$subject"
             Watch = New-ChineseText @(0x76D1, 0x63A7, 0x6B64, 0x76EE, 0x5F55)
             Unwatch = New-ChineseText @(0x53D6, 0x6D88, 0x76D1, 0x63A7, 0x6B64, 0x76EE, 0x5F55)
         }
     }
+
+    $subject = if ($Context -eq "file") { "this file" } else { "files in this folder" }
     return @{
-        Prompt = "Extract with password prompt"
-        Direct = "Extract directly"
+        Prompt = "Enter password to extract $subject"
+        Direct = "Extract $subject"
         Watch = "Watch this folder"
         Unwatch = "Stop watching this folder"
     }
@@ -307,7 +319,9 @@ $fileSubCommandsName = "SunPack.FileContextMenu"
 $folderSubCommandsKey = "HKLM:\Software\Classes\$folderSubCommandsName"
 $backgroundSubCommandsKey = "HKLM:\Software\Classes\$backgroundSubCommandsName"
 $fileSubCommandsKey = "HKLM:\Software\Classes\$fileSubCommandsName"
-$subMenuTexts = Get-SubMenuTexts -Language $menuLanguage
+$folderMenuTexts = Get-SubMenuTexts -Language $menuLanguage -Context "folder"
+$backgroundMenuTexts = Get-SubMenuTexts -Language $menuLanguage -Context "background"
+$fileMenuTexts = Get-SubMenuTexts -Language $menuLanguage -Context "file"
 
 $folderToken = ConvertTo-RootSafeDirectoryToken -Token "%1"
 $backgroundToken = ConvertTo-RootSafeDirectoryToken -Token "%V"
@@ -335,23 +349,28 @@ if ($DryRun) {
         background_unwatch = $backgroundUnwatchCommand
         file_prompt = $filePromptCommand
         file_direct = $fileDirectCommand
-    } | ConvertTo-Json -Compress
+        menu_labels = @{
+            folder = @{ direct = $folderMenuTexts.Direct; prompt = $folderMenuTexts.Prompt }
+            background = @{ direct = $backgroundMenuTexts.Direct; prompt = $backgroundMenuTexts.Prompt }
+            file = @{ direct = $fileMenuTexts.Direct; prompt = $fileMenuTexts.Prompt }
+        }
+    } | ConvertTo-Json -Depth 5 -Compress
     return
 }
 
 Set-ContextMenuParent -KeyPath $folderKey -MenuLabel $resolvedMenuText -IconValue $resolvedIconPath -SubCommandsKey $folderSubCommandsName
-Set-ContextMenuCommand -ParentKeyPath $folderSubCommandsKey -CommandName "DirectExtract" -MenuLabel $subMenuTexts.Direct -CommandLine $folderDirectCommand -IconValue $resolvedIconPath
-Set-ContextMenuCommand -ParentKeyPath $folderSubCommandsKey -CommandName "PromptPassword" -MenuLabel $subMenuTexts.Prompt -CommandLine $folderPromptCommand -IconValue $resolvedIconPath
-Set-ContextMenuCommand -ParentKeyPath $folderSubCommandsKey -CommandName "WatchFolder" -MenuLabel $subMenuTexts.Watch -CommandLine $folderWatchCommand -IconValue $resolvedIconPath
-Set-ContextMenuCommand -ParentKeyPath $folderSubCommandsKey -CommandName "UnwatchFolder" -MenuLabel $subMenuTexts.Unwatch -CommandLine $folderUnwatchCommand -IconValue $resolvedIconPath
+Set-ContextMenuCommand -ParentKeyPath $folderSubCommandsKey -CommandName "DirectExtract" -MenuLabel $folderMenuTexts.Direct -CommandLine $folderDirectCommand -IconValue $resolvedIconPath
+Set-ContextMenuCommand -ParentKeyPath $folderSubCommandsKey -CommandName "PromptPassword" -MenuLabel $folderMenuTexts.Prompt -CommandLine $folderPromptCommand -IconValue $resolvedIconPath
+Set-ContextMenuCommand -ParentKeyPath $folderSubCommandsKey -CommandName "WatchFolder" -MenuLabel $folderMenuTexts.Watch -CommandLine $folderWatchCommand -IconValue $resolvedIconPath
+Set-ContextMenuCommand -ParentKeyPath $folderSubCommandsKey -CommandName "UnwatchFolder" -MenuLabel $folderMenuTexts.Unwatch -CommandLine $folderUnwatchCommand -IconValue $resolvedIconPath
 Set-ContextMenuParent -KeyPath $backgroundKey -MenuLabel $resolvedMenuText -IconValue $resolvedIconPath -SubCommandsKey $backgroundSubCommandsName
-Set-ContextMenuCommand -ParentKeyPath $backgroundSubCommandsKey -CommandName "DirectExtract" -MenuLabel $subMenuTexts.Direct -CommandLine $backgroundDirectCommand -IconValue $resolvedIconPath
-Set-ContextMenuCommand -ParentKeyPath $backgroundSubCommandsKey -CommandName "PromptPassword" -MenuLabel $subMenuTexts.Prompt -CommandLine $backgroundPromptCommand -IconValue $resolvedIconPath
-Set-ContextMenuCommand -ParentKeyPath $backgroundSubCommandsKey -CommandName "WatchFolder" -MenuLabel $subMenuTexts.Watch -CommandLine $backgroundWatchCommand -IconValue $resolvedIconPath
-Set-ContextMenuCommand -ParentKeyPath $backgroundSubCommandsKey -CommandName "UnwatchFolder" -MenuLabel $subMenuTexts.Unwatch -CommandLine $backgroundUnwatchCommand -IconValue $resolvedIconPath
+Set-ContextMenuCommand -ParentKeyPath $backgroundSubCommandsKey -CommandName "DirectExtract" -MenuLabel $backgroundMenuTexts.Direct -CommandLine $backgroundDirectCommand -IconValue $resolvedIconPath
+Set-ContextMenuCommand -ParentKeyPath $backgroundSubCommandsKey -CommandName "PromptPassword" -MenuLabel $backgroundMenuTexts.Prompt -CommandLine $backgroundPromptCommand -IconValue $resolvedIconPath
+Set-ContextMenuCommand -ParentKeyPath $backgroundSubCommandsKey -CommandName "WatchFolder" -MenuLabel $backgroundMenuTexts.Watch -CommandLine $backgroundWatchCommand -IconValue $resolvedIconPath
+Set-ContextMenuCommand -ParentKeyPath $backgroundSubCommandsKey -CommandName "UnwatchFolder" -MenuLabel $backgroundMenuTexts.Unwatch -CommandLine $backgroundUnwatchCommand -IconValue $resolvedIconPath
 Set-ContextMenuParent -KeyPath $fileKey -MenuLabel $resolvedMenuText -IconValue $resolvedIconPath -SubCommandsKey $fileSubCommandsName
-Set-ContextMenuCommand -ParentKeyPath $fileSubCommandsKey -CommandName "PromptPassword" -MenuLabel $subMenuTexts.Prompt -CommandLine $filePromptCommand -IconValue $resolvedIconPath
-Set-ContextMenuCommand -ParentKeyPath $fileSubCommandsKey -CommandName "DirectExtract" -MenuLabel $subMenuTexts.Direct -CommandLine $fileDirectCommand -IconValue $resolvedIconPath
+Set-ContextMenuCommand -ParentKeyPath $fileSubCommandsKey -CommandName "PromptPassword" -MenuLabel $fileMenuTexts.Prompt -CommandLine $filePromptCommand -IconValue $resolvedIconPath
+Set-ContextMenuCommand -ParentKeyPath $fileSubCommandsKey -CommandName "DirectExtract" -MenuLabel $fileMenuTexts.Direct -CommandLine $fileDirectCommand -IconValue $resolvedIconPath
 
 Write-Host "Context menu registration completed" -ForegroundColor Green
 Write-Host "Folder menu key:" $folderKey
@@ -366,4 +385,4 @@ if ($launcher.Mode -eq "app") {
     Write-Host "Script path:" $launcher.ScriptPath
 }
 Write-Host ""
-Write-Host ('You can now right-click a folder or directory background and choose "{0}" -> "{1}", "{2}", "{3}" or "{4}"' -f $resolvedMenuText, $subMenuTexts.Prompt, $subMenuTexts.Direct, $subMenuTexts.Watch, $subMenuTexts.Unwatch)
+Write-Host ('You can now right-click a folder or directory background and choose "{0}" -> "{1}", "{2}", "{3}" or "{4}"' -f $resolvedMenuText, $folderMenuTexts.Prompt, $folderMenuTexts.Direct, $folderMenuTexts.Watch, $folderMenuTexts.Unwatch)

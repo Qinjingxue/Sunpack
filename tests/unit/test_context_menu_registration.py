@@ -33,6 +33,36 @@ def test_context_menu_commands_are_safe_for_drive_roots_and_keep_password_flag()
     )
     commands = json.loads(completed.stdout.strip().splitlines()[-1])
     assert commands["menu_text"] == "sunpack"
+    english_labels = {
+        "folder": {
+            "direct": "Extract files in this folder",
+            "prompt": "Enter password to extract files in this folder",
+        },
+        "background": {
+            "direct": "Extract files in this folder",
+            "prompt": "Enter password to extract files in this folder",
+        },
+        "file": {
+            "direct": "Extract this file",
+            "prompt": "Enter password to extract this file",
+        },
+    }
+    chinese_labels = {
+        "folder": {
+            "direct": "解压该目录下文件",
+            "prompt": "输入密码解压该目录下文件",
+        },
+        "background": {
+            "direct": "解压目录下文件",
+            "prompt": "输入密码解压目录下文件",
+        },
+        "file": {
+            "direct": "解压该文件",
+            "prompt": "输入密码解压该文件",
+        },
+    }
+    # The registered language is taken from the local SunPack configuration.
+    assert commands["menu_labels"] in (english_labels, chinese_labels)
 
     for key in ("folder_prompt", "background_prompt"):
         expanded = commands[key].replace("%1", "D:\\").replace("%V", "D:\\")
