@@ -99,7 +99,6 @@ def test_watch_routes_each_root_to_its_output_root_without_input_tree_outputs(tm
                 output_roots=output_roots,
                 state_path=str(tmp_path / "state.json"),
                 cold_start_seconds=0,
-                initial_scan=False,
                 pipeline_engine=delegate,
             )
             destination = second_root / case.entry_path.name

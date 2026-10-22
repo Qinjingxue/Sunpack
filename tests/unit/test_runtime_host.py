@@ -92,7 +92,7 @@ def test_watch_configuration_survives_disconnect_and_finishes_before_stop(tmp_pa
                 config["watch"]["cold_start_seconds"] += 1
                 return await host.reload_watch()
             if action == "add":
-                return await host.add_watch_roots([str(roots[index])], initial_scan=False)
+                return await host.add_watch_roots([str(roots[index])])
             return await host.remove_watch_roots([str(roots[index])])
 
         async def execute(payload, _protocol):
@@ -198,6 +198,7 @@ def test_watch_start_disconnect_releases_request_and_keeps_host_ownership(tmp_pa
     engine = FakePipelineEngine(lambda _config: None)
     monkeypatch.setattr(host_module, "load_config", lambda: config)
     monkeypatch.setattr(service_module, "load_config", lambda: config)
+    monkeypatch.setattr(service_module, "watch_roots_path", lambda: tmp_path / "roots.txt")
     monkeypatch.setattr(service_module, "_read_watch_root_entries", lambda *_args, **_kwargs: [
         service_module.WatchRootEntry(str(tmp_path), str(tmp_path / "out")),
     ])
@@ -236,7 +237,7 @@ def test_watch_start_disconnect_releases_request_and_keeps_host_ownership(tmp_pa
         set_runtime_host(host)
 
         async def execute(_payload, _protocol):
-            await host.start_watch(tray_enabled=False, initial_scan=True)
+            await host.start_watch(tray_enabled=False)
             return 0
 
         monkeypatch.setattr(protocol_module, "_execute_streaming_request_async", execute)
@@ -425,8 +426,8 @@ def test_runtime_host_uses_cli_override_until_idle_expiry(monkeypatch):
             self._config_applied_callback = config_applied_callback
             self._stop = asyncio.Event()
 
-        async def run(self, *, initial_scan=False, initial_scan_roots=None):
-            events.append(("watch_started", initial_scan, initial_scan_roots))
+        async def run(self):
+            events.append(("watch_started",))
             await self._stop.wait()
             return 0
 
@@ -442,7 +443,7 @@ def test_runtime_host_uses_cli_override_until_idle_expiry(monkeypatch):
             await self._config_applied_callback(self.config)
             return True
 
-        async def add_roots(self, paths, *, output_dir=None, initial_scan=True):
+        async def add_roots(self, paths, *, output_dir=None):
             return {"roots_path": "roots.txt", "added": list(paths), "applied": True}
 
         async def remove_roots(self, paths):
@@ -634,7 +635,7 @@ def test_runtime_host_creates_toast_only_for_continuous_watch(monkeypatch, tmp_p
             self.stop = asyncio.Event()
             self.ready = asyncio.Event()
 
-        async def run(self, *, once=False, initial_scan=False, initial_scan_roots=None):
+        async def run(self, *, once=False):
             if once:
                 assert self.toast_factory is None
                 return 0
@@ -689,7 +690,7 @@ def test_runtime_host_hands_foreground_activity_to_later_watch_services(monkeypa
             self._stop = asyncio.Event()
             self._ready = asyncio.Event()
 
-        async def run(self, *, initial_scan=False, initial_scan_roots=None):
+        async def run(self):
             self._ready.set()
             await self._stop.wait()
             return 0

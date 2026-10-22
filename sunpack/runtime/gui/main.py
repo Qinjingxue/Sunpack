@@ -18,7 +18,6 @@ def main(argv: list[str] | None = None) -> int:
         return _run_watch_service(
             once=args.once,
             no_tray=args.no_tray,
-            initial_scan=args.initial_scan,
         )
     except Exception as exc:
         _write_bootstrap_error(exc)
@@ -29,11 +28,10 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--no-tray", action="store_true")
-    parser.add_argument("--initial-scan", action="store_true")
     return parser.parse_args(sys.argv[1:] if argv is None else argv)
 
 
-def _run_watch_service(*, once: bool, no_tray: bool, initial_scan: bool = False) -> int:
+def _run_watch_service(*, once: bool, no_tray: bool) -> int:
     from sunpack.runtime.cli.persistent_process import submit_request
 
     argv = ["watch", "start"]
@@ -41,8 +39,6 @@ def _run_watch_service(*, once: bool, no_tray: bool, initial_scan: bool = False)
         argv.append("--once")
     if no_tray:
         argv.append("--no-tray")
-    if initial_scan:
-        argv.append("--initial-scan")
     return submit_request(argv)
 def _write_bootstrap_error(exc: BaseException) -> None:
     try:

@@ -107,7 +107,6 @@ async def _run_once(
     config["watch"] = {
         **(config.get("watch") or {}),
         "clipboard_monitor_enabled": False,
-        "initial_scan": False,
         "runtime_cache_cleanup_enabled": False,
     }
     config["user_passwords"] = list(passwords)
@@ -130,7 +129,6 @@ async def _run_once(
             out_dir=".",
             state_path=str(state_path),
             cold_start_seconds=cold_start_seconds,
-            initial_scan=False,
             pipeline_engine=engine,
         )
         _wrap_scheduler_timers(watcher, destination, timings)

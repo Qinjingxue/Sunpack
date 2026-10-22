@@ -369,6 +369,14 @@ void roots(Fixture& f) {
     atomic_write(p,"# 保留注释\n"+utf8(f.dir.wstring())+" | relative | false\n"+utf8(f.dir.wstring())+" | 末条 | TRUE\n");
     auto roots=read_roots(p); assert(roots.entries.size()==1 && roots.entries[0].deep && roots.entries[0].output=="末条");
     auto nested=f.dir/"Data"; fs::create_directory(nested);
+    // A runtime-only fourth column must survive GUI edits of other settings;
+    // changing the input path must make the replacement eligible for scanning.
+    atomic_write(p,"# 保留注释\n"+utf8(f.dir.wstring())+" | 末条 | true | true\n");
+    edit_root(p,"save",utf8(f.dir.wstring()),utf8(f.dir.wstring()),"末条",true);
+    assert(read_roots(p).entries[0].initial_scanned);
+    edit_root(p,"save",utf8(f.dir.wstring()),utf8(nested.wstring()),"changed",false);
+    assert(!read_roots(p).entries[0].initial_scanned);
+    edit_root(p,"save",utf8(nested.wstring()),utf8(f.dir.wstring()),"末条",true);
     edit_root(p,"save","",utf8(nested.wstring()),"",false);
     auto all=read_roots(p); assert(all.entries.size()==2);
     assert(root_for(nested/"x.bin",all)==utf8(nested.wstring()));

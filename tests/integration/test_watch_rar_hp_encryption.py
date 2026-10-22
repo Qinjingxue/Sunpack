@@ -118,7 +118,7 @@ def test_watch_split_hp_rar_recovers_after_wrong_then_correct_password(tmp_path,
             watcher = WatchScheduler(
                 config, [str(watch_root)], out_dir=str(output_root),
                 state_path=str(tmp_path / "state.json"), cold_start_seconds=0,
-                initial_scan=False, pipeline_engine=delegate,
+                pipeline_engine=delegate,
             )
             for source in sorted(case.archive_dir.iterdir(), key=lambda path: path.name.lower()):
                 destination = watch_root / source.name

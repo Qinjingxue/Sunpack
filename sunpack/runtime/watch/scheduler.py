@@ -137,8 +137,6 @@ class WatchScheduler:
         out_dir: str = ".",
         state_path: str,
         cold_start_seconds: float | None = None,
-        initial_scan: bool | None = None,
-        initial_scan_roots: Iterable[str] | None = None,
         observer_stop_timeout_seconds: float | None = None,
         pipeline_engine=None,
         notification_sink=None,
@@ -183,12 +181,6 @@ class WatchScheduler:
             float(configured_cold_start if cold_start_seconds is None else cold_start_seconds),
         )
         self.recursive = False
-        self.initial_scan = bool(initial_scan)
-        self.initial_scan_roots = (
-            None
-            if initial_scan_roots is None
-            else dedupe_normalized_paths(initial_scan_roots)
-        )
         self.observer_stop_timeout_seconds = max(
             0.0,
             float(
@@ -361,35 +353,48 @@ class WatchScheduler:
         self._recover_persisted_work()
         self._reconcile_persisted_blockers()
         self._recover_usn_startup_gap()
-        if self.initial_scan or self.initial_scan_roots is not None:
-            scan_roots = self.watch_roots if self.initial_scan_roots is None else self.initial_scan_roots
-            for candidate in self._scan_candidates(scan_roots, recursive=self.recursive):
-                self.enqueue(candidate.path, event_type="initial_scan")
         self.log.write(
             "scheduler_started",
             roots=self.watch_roots,
             out_dir=self.out_dir,
             output_roots=self.output_roots,
             recursive=self.recursive,
-            initial_scan=bool(self.initial_scan or self.initial_scan_roots is not None),
-            initial_scan_roots=self.initial_scan_roots,
             pending=self.pending_count,
             cold_start_seconds=self.cold_start_seconds,
             quiet_min_seconds=self._quiet_policy.minimum_seconds,
             quiet_max_seconds=self._quiet_policy.maximum_seconds,
         )
 
+    async def scan_initial_roots(self, roots: list[str]) -> list[str]:
+        return await self.pipeline_engine.work_broker.run(
+            "watch_initial_scan", "watch", lambda: self._scan_initial_roots(roots), request_id="watch",
+        )
+
+    def _scan_initial_roots(self, roots: list[str]) -> list[str]:
+        completed = []
+        for root in roots:
+            candidates, errors = self._scan_candidates([root], recursive=self.recursive)
+            for candidate in candidates:
+                self.enqueue(candidate.path, event_type="initial_scan")
+            if not errors:
+                completed.append(root)
+        # Initial-scan admissions use the existing asynchronous WAL writer;
+        # flush once for the batch before the service marks roots scanned.
+        self.state.flush()
+        self.log.write("initial_scan_completed", roots=completed)
+        return completed
+
     def _watch_root_directory(self, root: str) -> str:
         root = os.path.abspath(root)
         return root if os.path.isdir(root) else os.path.dirname(root)
 
-    def _scan_candidates(self, roots: list[str], *, recursive: bool) -> list[WatchCandidate]:
+    def _scan_candidates(self, roots: list[str], *, recursive: bool) -> tuple[list[WatchCandidate], list[tuple[str, str, str]]]:
         candidates, errors = scan_watch_candidates(roots, recursive=recursive)
         if errors:
             self.log.write("filesystem_scan_failed", roots=roots, errors=[
                 filesystem_scan_failure(error, self.i18n.language).message for error in errors
             ])
-        return candidates
+        return candidates, errors
 
     def _prepare_usn_startup_baseline(self) -> None:
         """Durably establish first-run cursors before the observer can miss a gap."""
@@ -440,7 +445,8 @@ class WatchScheduler:
 
         for root in sorted(fallback_roots):
             try:
-                for candidate in self._scan_candidates([root], recursive=False):
+                candidates, _errors = self._scan_candidates([root], recursive=False)
+                for candidate in candidates:
                     changed_paths.setdefault(path_key(candidate.path), candidate.path)
             except OSError as exc:
                 self.log.write("usn_fallback_scan_failed", root=root, error=str(exc))
@@ -557,7 +563,7 @@ class WatchScheduler:
                 if not os.path.isdir(root):
                     continue
                 try:
-                    candidates = self._scan_candidates([root], recursive=True)
+                    candidates, _errors = self._scan_candidates([root], recursive=True)
                 except OSError as exc:
                     self.log.write(
                         "crash_resume_scan_failed",
@@ -1105,6 +1111,16 @@ class WatchScheduler:
             now = time.time()
             with self._lock:
                 previous = self._candidate_baseline_locked(candidate.path) or previous_hint
+                if event_type == "initial_scan" and candidate.path in self._active_states:
+                    # The observer may have admitted this file first. Promote
+                    # that live owner before an unchanged observation returns.
+                    pending = self.state.pending_work_for_path(candidate.path)
+                    if pending is not None:
+                        self.state.queue_active(
+                            candidate, force=pending.force,
+                            source_input_root=pending.source_input_root,
+                            durable_owner=True,
+                        )
                 change_kind = _candidate_change_kind(previous, candidate)
                 if not force and change_kind == _CandidateChangeKind.UNCHANGED:
                     return
@@ -1148,7 +1164,7 @@ class WatchScheduler:
                     # scheduler/event paths. If fsync fails there is no in-memory
                     # work that can proceed without a crash-recovery record.
                     if not _state_prequeued:
-                        durable_owner = bool(password_retry or internal_recovery)
+                        durable_owner = bool(password_retry or internal_recovery or event_type == "initial_scan")
                         self.state.queue_active(
                             candidate,
                             force=force,
@@ -1160,7 +1176,7 @@ class WatchScheduler:
                             internal_recovery=internal_recovery,
                             durable_owner=durable_owner,
                             persist=durable_owner,
-                            durable=durable_owner,
+                            durable=bool(password_retry or internal_recovery),
                         )
                     self._store_pending_locked(candidate.path, candidate)
                     self._remember_observation_locked(candidate)

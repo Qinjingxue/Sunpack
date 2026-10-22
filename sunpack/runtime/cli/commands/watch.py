@@ -36,13 +36,11 @@ def register(subparsers, ctx):
     start_parser = actions.add_parser("start", parents=[common], help=ctx.t("cli.watch.start"), formatter_class=CliHelpFormatter)
     start_parser.add_argument("--once", action="store_true", help=ctx.t("cli.watch.once"))
     start_parser.add_argument("--no-tray", action="store_true", help=ctx.t("cli.watch.no_tray"))
-    start_parser.add_argument("-i", "--initial-scan", dest="initial_scan", action="store_true", help=ctx.t("cli.watch.initial_scan"))
 
     add_parser = actions.add_parser("add", parents=[common], help=ctx.t("cli.watch.add"), formatter_class=CliHelpFormatter)
     add_parser.add_argument("paths", nargs="+", help=ctx.t("cli.watch.paths"))
     add_parser.add_argument("-o", "--out-dir", dest="output_dir", help=ctx.t("cli.watch.output_dir"))
     add_parser.add_argument("-s", "--start", dest="start", action="store_true", help=ctx.t("cli.watch.start_after_add"))
-    add_parser.add_argument("-i", "--initial-scan", dest="initial_scan", action="store_true", help=ctx.t("cli.watch.initial_scan"))
     add_parser.add_argument("-d", "--deep-detect", dest="deep_detect", action="store_true", default=None, help=ctx.t("cli.watch.deep_detect"))
 
     remove_parser = actions.add_parser("remove", aliases=["rm"], parents=[common], help=ctx.t("cli.watch.remove"), formatter_class=CliHelpFormatter)
@@ -89,11 +87,10 @@ async def _handle_start(args, ctx):
 
     host = require_runtime_host()
     if bool(getattr(args, "once", False)):
-        code = await host.run_watch_once(initial_scan=bool(getattr(args, "initial_scan", False)))
+        code = await host.run_watch_once()
         return code, CliCommandResult(command=COMMAND, inputs={"action": "start", "once": True}, summary={"exit_code": code})
     summary = await host.start_watch(
         tray_enabled=not bool(getattr(args, "no_tray", False)),
-        initial_scan=bool(getattr(args, "initial_scan", False)),
     )
     return 0, CliCommandResult(command=COMMAND, inputs={"action": "start"}, summary=summary)
 
@@ -111,7 +108,6 @@ async def _handle_add(args, ctx):
     from sunpack.runtime.cli.runtime_state import require_runtime_host
 
     start_requested = bool(getattr(args, "start", False))
-    initial_scan_requested = bool(getattr(args, "initial_scan", False))
     paths = _request_paths(args.paths, ctx)
     output_dir = getattr(args, "output_dir", None)
     deep_detect = getattr(args, "deep_detect", None)
@@ -129,7 +125,6 @@ async def _handle_add(args, ctx):
             paths,
             output_dir=output_dir,
             deep_detect=deep_detect,
-            initial_scan=initial_scan_requested,
         )
         roots_path = apply_summary["roots_path"]
         added = list(apply_summary["added"])
@@ -139,9 +134,7 @@ async def _handle_add(args, ctx):
         roots_path = str(roots_path_obj)
     start_summary = None
     if start_requested and not host.watch_enabled:
-        start_summary = await host.start_watch(
-            initial_scan_roots=added + updated if initial_scan_requested else None,
-        )
+        start_summary = await host.start_watch()
     return 0, CliCommandResult(
         command=COMMAND,
         inputs={"action": "add", "paths": paths, "output_dir": output_dir, "deep_detect": deep_detect},
@@ -152,7 +145,6 @@ async def _handle_add(args, ctx):
             "apply": apply_summary,
             "start": start_summary,
             "start_requested": start_requested,
-            "initial_scan_requested": initial_scan_requested,
         },
         items=added,
     )

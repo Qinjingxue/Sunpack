@@ -43,7 +43,6 @@ def _watcher(root: Path, *, cold_start_seconds: float = 0.05) -> WatchScheduler:
         out_dir=str(root / "out"),
         state_path=str(root / ".watch-state" / "state.json"),
         cold_start_seconds=cold_start_seconds,
-        initial_scan=False,
         pipeline_engine=FakePipelineEngine(lambda _config: None),
     )
 

@@ -10,8 +10,8 @@ def test_runtime_finds_launcher_for_both_package_layouts(tmp_path, monkeypatch, 
     cli_executable.touch()
     monkeypatch.setattr(launcher_module, "current_process_executable", lambda: runtime)
 
-    assert launcher_module.watch_launch_argv(initial_scan=True) == [
-        str(cli_executable), "watch", "start", "--initial-scan",
+    assert launcher_module.watch_launch_argv() == [
+        str(cli_executable), "watch", "start",
     ]
 
 
@@ -57,22 +57,4 @@ def test_source_startup_prefers_pythonw(tmp_path, monkeypatch):
         "sunpack",
         "watch",
         "start",
-    ]
-
-
-def test_watch_launcher_forwards_initial_scan(monkeypatch):
-    monkeypatch.setattr(launcher_module, "packaged_runtime_executable", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(
-        launcher_module,
-        "current_process_executable",
-        lambda: launcher_module.Path(r"C:\Python310\python.exe"),
-    )
-
-    assert launcher_module.watch_launch_argv(initial_scan=True) == [
-        r"C:\Python310\python.exe",
-        "-m",
-        "sunpack",
-        "watch",
-        "start",
-        "--initial-scan",
     ]

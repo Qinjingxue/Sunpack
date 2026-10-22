@@ -46,7 +46,6 @@ def test_plan7_existing_file_initial_scan_and_quiet_window(tmp_path):
         "initial_scan",
         passwords=[*wrong_password_list(), PASSWORD],
         cold_start_seconds=0.05,
-        initial_scan=True,
     )
     try:
         _finish(harness, case.marker_name, case.marker_text)
@@ -112,7 +111,6 @@ def test_plan7_stale_downloading_file_does_not_block_final_file(tmp_path):
         tmp_path,
         "stale",
         passwords=[*wrong_password_list(), PASSWORD],
-        initial_scan=True,
     )
     try:
         _finish(harness, case.marker_name, case.marker_text)

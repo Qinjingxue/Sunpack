@@ -46,7 +46,7 @@ def WatchScheduler(*args, pipeline_engine=None, **kwargs):
 
 
 def _watcher(tmp_path, *, config=None, roots=None, **overrides):
-    options = dict(out_dir=str(tmp_path / "out"), state_path=str(tmp_path / "state.json"), initial_scan=False)
+    options = dict(out_dir=str(tmp_path / "out"), state_path=str(tmp_path / "state.json"))
     options.update(overrides)
     return WatchScheduler(
         config if config is not None else make_config({"watch": {"clipboard_monitor_enabled": False}}),
@@ -252,7 +252,6 @@ def test_watch_scheduler_prunes_missing_state_before_start(tmp_path, monkeypatch
         out_dir=".",
         state_path=str(state_path),
         cold_start_seconds=0,
-        initial_scan=False,
     )
 
     watcher._start_blocking()
@@ -1300,10 +1299,10 @@ def test_watch_scheduler_uses_watchdog_observer_and_initial_scan(tmp_path, monke
         roots=[str(watch_root)],
         state_path=str(state_path),
         cold_start_seconds=0,
-        initial_scan=True,
     )
 
     _await(watcher.start())
+    _await(watcher.scan_initial_roots([str(watch_root)]))
 
     assert watcher.pending_count == 1
     assert FakeObserver.started_count == 1
@@ -1328,10 +1327,11 @@ def test_watch_scheduler_scans_only_requested_initial_scan_roots(tmp_path, monke
         tmp_path,
         roots=[str(first_root), str(second_root)],
         cold_start_seconds=0,
-        initial_scan_roots=[str(second_root)],
     )
 
     _await(watcher.start())
+    assert _await(watcher.scan_initial_roots([str(second_root)])) == [str(second_root)]
+    assert _await(watcher.scan_initial_roots([str(tmp_path / "missing")])) == []
 
     assert {Path(path).name for path in watcher._pending} == {"second.zip"}
     _await(watcher.stop())
@@ -1366,10 +1366,10 @@ def test_watch_scheduler_preserves_existing_directory_password_file(tmp_path, mo
         tmp_path,
         config=make_config({}),
         roots=[str(watch_root)],
-        initial_scan=True,
     )
 
     _await(watcher.start())
+    _await(watcher.scan_initial_roots([str(watch_root)]))
 
     assert password_file.read_text(encoding="utf-8") == "existing-secret\n"
 
@@ -1389,10 +1389,10 @@ def test_watch_scheduler_never_recurses_for_recursive_directory_scan_mode(tmp_pa
         config=make_config({"filesystem": {"directory_scan_mode": mode, "scan_filters": []}}),
         roots=[str(watch_root)],
         cold_start_seconds=0,
-        initial_scan=True,
     )
 
     _await(watcher.start())
+    _await(watcher.scan_initial_roots([str(watch_root)]))
 
     assert watcher._observer.scheduled[0][1:] == (str(watch_root.resolve()), False)
     pending_names = {Path(path).name for path in watcher._pending}
@@ -1841,7 +1841,6 @@ def test_relative_output_directory_is_resolved_per_matching_watch_root(tmp_path,
         out_dir=".",
         state_path=str(first_root / ".sunpack_watch" / "state.json"),
         cold_start_seconds=0,
-        initial_scan=False,
         pipeline_engine=FakePipelineEngine(FakePipelineRunner),
     )
     watcher.enqueue(str(archive_path))

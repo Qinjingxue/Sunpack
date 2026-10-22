@@ -498,7 +498,6 @@ def start_watch(
     cleanup_mode: str = "keep",
     cold_start_seconds: float = 0.0,
     state_path: Path | None = None,
-    initial_scan: bool = False,
     notification_sink: Any | None = None,
     flatten_single_directory: bool = False,
 ) -> WatchHarness:
@@ -533,7 +532,6 @@ def start_watch(
             out_dir=str(output_root),
             state_path=str(state_path or (tmp_path / label / "state.json")),
             cold_start_seconds=cold_start_seconds,
-            initial_scan=initial_scan,
             pipeline_engine=engine,
             notification_sink=notification_sink,
         )
@@ -549,9 +547,9 @@ def start_watch(
     watcher.start = lambda: loop.run_until_complete(async_start())
     watcher.stop = lambda: loop.run_until_complete(async_stop())
     watcher._plan7_timer = timer
-    if initial_scan:
-        with timer.measure("watch_initial_scan"):
-            watcher.start()
+    watcher.start()
+    with timer.measure("watch_initial_scan"):
+        loop.run_until_complete(watcher.scan_initial_roots([str(watch_root)]))
     return WatchHarness(
         watch_root=watch_root,
         output_root=output_root,

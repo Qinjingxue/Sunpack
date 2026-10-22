@@ -344,7 +344,6 @@ def run_scenario(base: Path, scenario: Scenario, payload: bytes, *, chunk_bytes:
         out_dir=str(base / scenario.name / "out"),
         state_path=str(state_path),
         cold_start_seconds=1.0,
-        initial_scan=False,
         observer_stop_timeout_seconds=2.0,
         pipeline_engine=object(),
     )

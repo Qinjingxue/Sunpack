@@ -71,7 +71,6 @@ def _watcher(tmp_path, monkeypatch, *, deep_detect=False):
         root_entries=[WatchRootEntry(str(root), str(output), deep_detect)],
         state_path=str(tmp_path / "state.json"),
         cold_start_seconds=0,
-        initial_scan=False,
         pipeline_engine=FakePipelineEngine(_Runner),
         notification_sink=sink,
     )

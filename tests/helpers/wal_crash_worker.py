@@ -104,7 +104,7 @@ async def watch_scenario(root, mode):
                 output_roots=output_roots,
                 root_entries=[WatchRootEntry(path, output_roots[path], True) for path in input_roots],
                 state_path=str(root / "state.json"), cold_start_seconds=0,
-                initial_scan=False, pipeline_engine=engine)
+                pipeline_engine=engine)
             original = watcher._handle_pipeline_progress
             target_event = "task_output_started" if mode == "started" else "task_output_finished"
             started = set()

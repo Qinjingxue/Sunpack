@@ -8,3 +8,4 @@ class WatchRootEntry:
     input_root: str
     output_root: str | None = None
     deep_detect: bool = False
+    initial_scanned: bool = False

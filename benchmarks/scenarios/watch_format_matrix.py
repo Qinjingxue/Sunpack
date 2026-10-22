@@ -416,7 +416,6 @@ async def _run_case(
     config["watch"] = {
         **(config.get("watch") or {}),
         "clipboard_monitor_enabled": False,
-        "initial_scan": False,
         "runtime_cache_cleanup_enabled": False,
     }
     config["user_passwords"] = list(feed.passwords)
@@ -445,7 +444,6 @@ async def _run_case(
             out_dir=".",
             state_path=str(state_path),
             cold_start_seconds=cold_start_seconds,
-            initial_scan=False,
             pipeline_engine=engine,
         )
         _install_watch_instrumentation(watcher, fed_keys, timings, attempts)

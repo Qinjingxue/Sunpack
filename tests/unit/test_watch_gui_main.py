@@ -10,10 +10,9 @@ def test_watch_gui_main_forwards_to_the_shared_runtime_host(monkeypatch, tmp_pat
     monkeypatch.setattr(
         gui_main,
         "_run_watch_service",
-        lambda *, once, no_tray, initial_scan: captured.update(
+        lambda *, once, no_tray: captured.update(
             once=once,
             no_tray=no_tray,
-            initial_scan=initial_scan,
         ) or 7,
     )
 
@@ -22,5 +21,4 @@ def test_watch_gui_main_forwards_to_the_shared_runtime_host(monkeypatch, tmp_pat
         "cwd": str(tmp_path),
         "once": True,
         "no_tray": True,
-        "initial_scan": False,
     }

@@ -398,12 +398,15 @@ WatchRoots parse_roots(const std::string& raw, const fs::path& base) {
             auto sep=value.find('|',at); parts.push_back(trim(value.substr(at,sep==std::string::npos?sep:sep-at)));
             if (sep==std::string::npos) break; at=sep+1;
         }
-        if (parts.size()>3) throw std::runtime_error("rootsLineInvalid");
+        if (parts.size()>4) throw std::runtime_error("rootsLineInvalid");
         if (parts[0].empty()) continue;
-        std::string deep = parts.size()==3 ? parts[2] : "";
+        std::string deep = parts.size()>=3 ? parts[2] : "";
         std::transform(deep.begin(),deep.end(),deep.begin(),[](unsigned char c){ return char(tolower(c)); });
         if (!deep.empty() && deep!="true" && deep!="false") throw std::runtime_error("deepDetectInvalid");
-        WatchRoot entry{resolve_path(wide(parts[0]),base), parts.size()>=2?parts[1]:"", deep=="true"};
+        std::string scanned = parts.size()==4 ? parts[3] : "";
+        std::transform(scanned.begin(),scanned.end(),scanned.begin(),[](unsigned char c){ return char(tolower(c)); });
+        if (!scanned.empty() && scanned!="true" && scanned!="false") throw std::runtime_error("rootsLineInvalid");
+        WatchRoot entry{resolve_path(wide(parts[0]),base), parts.size()>=2?parts[1]:"", deep=="true", scanned=="true"};
         auto key=path_key(entry.input); auto it=positions.find(key);
         if (it==positions.end()) { positions[key]=result.entries.size(); result.entries.push_back(entry); }
         else { entry.input=result.entries[it->second].input; result.entries[it->second]=entry; }
@@ -449,6 +452,8 @@ WatchRoots apply_root_changes(WatchRoots roots,const fs::path& base,const Json& 
                 throw std::runtime_error("rootDuplicate");
             }
             WatchRoot replacement{path,trim(output),deep};
+            if(index!=size_t(-1) && path_key(roots.entries[index].input)==key)
+                replacement.initial_scanned=roots.entries[index].initial_scanned;
             if(index==size_t(-1)) {
                 indices.emplace(std::move(key),roots.entries.size());
                 roots.entries.push_back(std::move(replacement)); removed.push_back(false);
@@ -479,7 +484,7 @@ static std::string roots_text(const WatchRoots& roots) {
     std::string content;
     for(auto& c:roots.comments) content+=c+"\n";
     for(auto& r:roots.entries) content+=utf8(r.input.wstring())+
-        (r.deep?" | "+r.output+" | true":r.output.empty()?"":" | "+r.output)+"\n";
+        " | "+r.output+" | "+(r.deep?"true":"false")+" | "+(r.initial_scanned?"true":"false")+"\n";
     return content;
 }
 void edit_root(const fs::path& p,const std::string& op,const std::string& original,const std::string& input,const std::string& output,bool deep) {

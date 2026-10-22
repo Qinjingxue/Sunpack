@@ -25,10 +25,10 @@ def parser():
     (["w", "rm", "D:\\Downloads"], ["watch", "remove", "D:\\Downloads"]),
     (["w", "ls"], ["watch", "list"]),
     (["w", "st"], ["watch", "status"]),
-    (["w", "start", "-i", "--once", "--no-tray"],
-     ["watch", "start", "--initial-scan", "--once", "--no-tray"]),
-    (["w", "add", ".", "-o", "out", "-s", "-i"],
-     ["watch", "add", ".", "--out-dir", "out", "--start", "--initial-scan"]),
+    (["w", "start", "--once", "--no-tray"],
+     ["watch", "start", "--once", "--no-tray"]),
+    (["w", "add", ".", "-o", "out", "-s"],
+     ["watch", "add", ".", "--out-dir", "out", "--start"]),
     (["w", "startup", "status"], ["watch", "startup", "status"]),
 ])
 def test_command_aliases_preserve_handler_inputs(parser, short, full):

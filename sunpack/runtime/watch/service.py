@@ -27,7 +27,7 @@ from sunpack.core.support.resource_lifecycle import (
 
 SERVICE_STATE = "state.json"
 WATCH_ROOTS_FILENAME = "sunpack_watch_roots.txt"
-# Optional columns: ``<input root> | <output root> | <deep_detect>``.
+# Optional columns: ``<input root> | <output root> | <deep_detect> | <initial_scanned>``.
 WATCH_ROOT_OUTPUT_SEPARATOR = "|"
 CONTROL_STOP = "stop"
 CONTROL_RELOAD = "reload"
@@ -42,7 +42,6 @@ class ReloadPlan:
     reconcile_tray: bool
     state_dir_changed: bool
     runtime_process_mode_changed: bool
-    initial_scan_roots: tuple[str, ...]
 
     @property
     def changed(self) -> bool:
@@ -138,7 +137,13 @@ def _config_without_tray(config: dict) -> dict:
 def _service_config_without_tray(service_config: dict) -> dict:
     result = dict(service_config)
     result.pop("tray_enabled", None)
+    result.pop("roots", None)
+    result["root_entries"] = dict(_root_policy(entry) for entry in result["root_entries"])
     return result
+
+
+def _root_policy(entry: WatchRootEntry):
+    return path_key(entry.input_root), (path_key(entry.output_root or entry.input_root), entry.deep_detect)
 
 
 def _tray_signature(config: dict, service_config: dict) -> tuple[bool, str]:
@@ -156,11 +161,9 @@ def _build_reload_plan(
     new_config: dict,
     new_service_config: dict,
     new_state_dir: str,
-    initial_scan_roots: list[str] | None,
 ) -> ReloadPlan:
-    scan_roots = tuple(_normalize_scan_roots(initial_scan_roots))
     state_dir_changed = new_state_dir != old_state_dir
-    restart_scheduler = bool(scan_roots) or state_dir_changed or (
+    restart_scheduler = state_dir_changed or (
         _config_without_tray(new_config) != _config_without_tray(old_config)
         or _service_config_without_tray(new_service_config)
         != _service_config_without_tray(old_service_config)
@@ -178,7 +181,6 @@ def _build_reload_plan(
             str(old_runtime.get("process_mode") or "normal")
             != str(new_runtime.get("process_mode") or "normal")
         ),
-        initial_scan_roots=scan_roots,
     )
 
 
@@ -194,7 +196,7 @@ def _resolve_watch_output_root(input_root: str, configured_output_root: str) -> 
 
 
 def _read_watch_root_entries(path: Path | None = None) -> list[WatchRootEntry]:
-    """Read optional output/deep columns; the last record for an input root wins."""
+    """Read root policy and scan state; the last record for an input root wins."""
     roots_path = path or watch_roots_path()
     try:
         lines = read_task_text(roots_path, encoding="utf-8").splitlines()
@@ -207,8 +209,8 @@ def _read_watch_root_entries(path: Path | None = None) -> list[WatchRootEntry]:
         if not value or value.startswith("#"):
             continue
         parts = [part.strip() for part in value.split(WATCH_ROOT_OUTPUT_SEPARATOR)]
-        if len(parts) > 3:
-            raise ValueError(f"{roots_path}:{line_number}: expected input | output | deep_detect")
+        if len(parts) > 4:
+            raise ValueError(f"{roots_path}:{line_number}: expected input | output | deep_detect | initial_scanned")
         input_root = parts[0]
         if not input_root:
             continue
@@ -216,10 +218,13 @@ def _read_watch_root_entries(path: Path | None = None) -> list[WatchRootEntry]:
         explicit_output = None
         if len(parts) >= 2 and parts[1]:
             explicit_output = _resolve_watch_output_root(input_root, parts[1])
-        deep_value = parts[2].casefold() if len(parts) == 3 else ""
+        deep_value = parts[2].casefold() if len(parts) >= 3 else ""
         if deep_value not in {"", "true", "false"}:
             raise ValueError(f"{roots_path}:{line_number}: deep_detect must be true or false")
-        entry = WatchRootEntry(input_root, explicit_output, deep_value == "true")
+        scanned_value = parts[3].casefold() if len(parts) == 4 else ""
+        if scanned_value not in {"", "true", "false"}:
+            raise ValueError(f"{roots_path}:{line_number}: initial_scanned must be true or false")
+        entry = WatchRootEntry(input_root, explicit_output, deep_value == "true", scanned_value == "true")
         key = path_key(input_root)
         position = positions.get(key)
         if position is None:
@@ -302,7 +307,7 @@ def _write_watch_root_entries_unlocked(entries: list[WatchRootEntry], roots_path
         prefix
         + "".join(
             entry.input_root
-            + (f" | {entry.output_root or ''} | true" if entry.deep_detect else f" | {entry.output_root}" if entry.output_root else "")
+            + f" | {entry.output_root or ''} | {str(entry.deep_detect).lower()} | {str(entry.initial_scanned).lower()}"
             + "\n"
             for entry in normalized_entries
         ),
@@ -425,8 +430,6 @@ class WatchService:
         self,
         *,
         once: bool = False,
-        initial_scan: bool = False,
-        initial_scan_roots: list[str] | None = None,
     ) -> int:
         self._loop = asyncio.get_running_loop()
         tray_shutdown_error: BaseException | None = None
@@ -440,16 +443,11 @@ class WatchService:
                 state_dir=self.state_dir,
                 roots=self.roots,
                 once=once,
-                initial_scan=bool(initial_scan),
-                initial_scan_roots=_normalize_scan_roots(initial_scan_roots),
             )
             if self._control_queue is None:
                 self._control_queue = asyncio.Queue()
             async with self._reload_lock:
-                await self._start_scheduler(
-                    initial_scan=bool(initial_scan),
-                    initial_scan_roots=initial_scan_roots,
-                )
+                await self._start_scheduler()
                 self._reconcile_tray()
             self._ready_event.set()
             if once:
@@ -566,13 +564,12 @@ class WatchService:
         *,
         output_dir: str | None = None,
         deep_detect: bool | None = None,
-        initial_scan: bool = True,
     ) -> dict:
         return await asyncio.shield(self._start_configuration_change(
-            lambda: self._add_roots_unlocked(paths, output_dir, deep_detect, initial_scan),
+            lambda: self._add_roots_unlocked(paths, output_dir, deep_detect),
         ))
 
-    async def _add_roots_unlocked(self, paths, output_dir, deep_detect, initial_scan) -> dict:
+    async def _add_roots_unlocked(self, paths, output_dir, deep_detect) -> dict:
         roots_path, added, updated = add_watch_roots(paths, output_dir=output_dir, deep_detect=deep_detect)
         if not added and not updated:
             self.log.write("watch_roots_add_skipped", requested=_normalize_scan_roots(paths))
@@ -587,7 +584,6 @@ class WatchService:
             self.config,
             new_service_config,
             service_state_dir(self.config),
-            initial_scan_roots=added + updated if initial_scan else None,
         )
         return {
             "roots_path": str(roots_path),
@@ -636,14 +632,8 @@ class WatchService:
         if self._loop is not None:
             self._loop.call_soon_threadsafe(self._start_configuration_change, self._reload_config_unlocked)
 
-    async def _start_scheduler(
-        self,
-        *,
-        initial_scan: bool = False,
-        initial_scan_roots: list[str] | None = None,
-    ) -> None:
+    async def _start_scheduler(self) -> None:
         await self._stop_scheduler()
-        requested_scan_roots = _normalize_scan_roots(initial_scan_roots)
         roots = self.roots
         if not roots:
             self._stop_toast_host()
@@ -684,8 +674,6 @@ class WatchService:
                         DEFAULT_WATCH_CONFIG["cold_start_seconds"],
                     )
                 ),
-                initial_scan=bool(initial_scan),
-                initial_scan_roots=requested_scan_roots or None,
                 observer_stop_timeout_seconds=float(watch_config.get("observer_stop_timeout_seconds", 5.0)),
                 pipeline_engine=pipeline_engine,
                 notification_sink=toast_coordinator,
@@ -711,6 +699,7 @@ class WatchService:
         self.toast_coordinator = toast_coordinator
         if self.external_activity_active is not None and self.external_activity_active():
             await scheduler.set_external_activity(True)
+        await self._scan_pending_roots()
         self.log.write(
             "scheduler_attached",
             roots=roots,
@@ -929,8 +918,6 @@ class WatchService:
         new_config: dict,
         new_service_config: dict,
         new_state_dir: str,
-        *,
-        initial_scan_roots: list[str] | None = None,
     ) -> bool:
         plan = _build_reload_plan(
             self.config,
@@ -939,9 +926,11 @@ class WatchService:
             new_config,
             new_service_config,
             new_state_dir,
-            initial_scan_roots,
         )
         if not plan.changed:
+            self.config = new_config
+            self.service_config = new_service_config
+            await self._scan_pending_roots()
             self.log.write("service_reload_skipped", reason="no_semantic_change")
             return False
 
@@ -953,9 +942,9 @@ class WatchService:
             self.log = WatchLogStore(os.path.join(new_state_dir, "events.jsonl"))
         try:
             if plan.restart_scheduler:
-                await self._start_scheduler(
-                    initial_scan_roots=list(plan.initial_scan_roots) or None,
-                )
+                await self._start_scheduler()
+            else:
+                await self._scan_pending_roots()
             if plan.reconcile_tray:
                 self._reconcile_tray()
             if plan.runtime_process_mode_changed and self.config_applied_callback is not None:
@@ -984,9 +973,46 @@ class WatchService:
             scheduler_restarted=plan.restart_scheduler,
             tray_reconciled=plan.reconcile_tray,
             runtime_process_mode_changed=plan.runtime_process_mode_changed,
-            initial_scan_roots=list(plan.initial_scan_roots),
         )
         return True
+
+    async def _scan_pending_roots(self) -> None:
+        if self.scheduler is None:
+            return
+        pending = {
+            path_key(entry.input_root): entry
+            for entry in self.service_config["root_entries"]
+            if not entry.initial_scanned
+        }
+        if not pending:
+            return
+        existing = {path_key(root) for root in self.roots}
+        pending = {key: entry for key, entry in pending.items() if key in existing}
+        if not pending:
+            return
+        completed = await self.scheduler.scan_initial_roots([entry.input_root for entry in pending.values()])
+        if not completed:
+            return
+        completed_keys = {path_key(root) for root in completed}
+        roots_path = watch_roots_path()
+        default_output = str(self.service_config.get("out_dir") or ".")
+        with _watch_roots_mutex(roots_path):
+            entries = _read_watch_root_entries(path=roots_path)
+            updated = []
+            marked = set()
+            for entry in entries:
+                key = path_key(entry.input_root)
+                effective = replace(entry, output_root=entry.output_root or _resolve_watch_output_root(entry.input_root, default_output))
+                if key in completed_keys and key in pending and _root_policy(effective) == _root_policy(pending[key]):
+                    marked.add(key)
+                    entry = replace(entry, initial_scanned=True)
+                updated.append(entry)
+            if entries != updated:
+                _write_watch_root_entries_unlocked(updated, roots_path)
+        self.service_config["root_entries"] = [
+            replace(entry, initial_scanned=True) if path_key(entry.input_root) in marked else entry
+            for entry in self.service_config["root_entries"]
+        ]
 
 
 def watch_roots_mutex_name(path: Path | None = None) -> str:

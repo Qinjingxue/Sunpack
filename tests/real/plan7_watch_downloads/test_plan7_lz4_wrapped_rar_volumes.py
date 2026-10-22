@@ -49,7 +49,7 @@ def test_plan7_four_lz4_wrapped_encrypted_rar_volumes_extract_automatically(
     # Only the four outer streams arrive. Inner volumes and their retries must
     # be discovered automatically, using the password supplied before arrival.
     harness = start_watch(
-        tmp_path, f"wrapped-rar-{write_mode}", passwords=[PASSWORD], initial_scan=True,
+        tmp_path, f"wrapped-rar-{write_mode}", passwords=[PASSWORD],
         cleanup_mode=cleanup_mode, flatten_single_directory=cleanup_mode == "delete",
     )
     try:

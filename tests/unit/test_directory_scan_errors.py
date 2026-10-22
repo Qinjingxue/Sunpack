@@ -92,7 +92,7 @@ def test_unreadable_subtree_is_reported_without_losing_readable_archives(tmp_pat
         nested = NestedOutputScanPolicy(config).prepare_scan([str(blocked)])
         assert not nested.roots and nested.session is not None
         assert len(nested.session.take_scan_errors()) == 1
-        candidates = scheduler._scan_candidates([str(root)], recursive=True)
+        candidates, _errors = scheduler._scan_candidates([str(root)], recursive=True)
         assert len(candidates) == 1 and candidates[0].path == str(root / "good.blob")
         assert not notifications
         assert log_events[-1][0] == "filesystem_scan_failed"

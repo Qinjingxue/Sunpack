@@ -173,7 +173,7 @@ python sunpack.py inspect D:\Downloads -v
 python sunpack.py watch <add|remove|list|start|stop|reload|status|startup> [options]
 ```
 
-监控根目录保存在程序资源目录下的 `sunpack_watch_roots.txt`。格式为 `输入目录 | 输出根 | deep_detect`，后两列可省略：
+监控根目录保存在程序资源目录下的 `sunpack_watch_roots.txt`。格式为 `输入目录 | 输出根 | deep_detect | initial_scanned`，后三列可省略：
 
 ```text
 C:\Downloads
@@ -186,16 +186,16 @@ G:\Incoming | | true
 
 `deep_detect` 接受 `true` 或 `false`，省略或留空时默认为 `false`。模式绑定输入目录；多个输入目录可共用输出根，并分别采用不同模式。嵌套解压、密码重试和崩溃恢复均保留原始输入目录，按该目录的配置执行。启用 deep 时，该目录请求的全部 filesystem 扫描过滤模块失效。修改此列会触发配置重载，也可执行 `watch reload` 应用修改。
 
+`initial_scanned` 表示是否完成首次候选扫描，省略或留空时为 `false`。启动和运行中重载会自动扫描值为 `false` 的目录，候选入队后回写 `true`；无需等待解压成功。新增目录或修改输入路径时重置为 `false`，仅修改输出根或 deep 模式时保留。已扫描目录的停机变化继续通过 USN 恢复。仅修改扫描标记、目录顺序、注释或等价路径写法不会重启调度器。
+
 子命令和参数：
 
 | 子命令 | 参数 | 说明 |
 | --- | --- | --- |
 | `start` | `--once` | 执行一次监控扫描后退出。 |
 | `start` | `--no-tray` | 持续运行时关闭托盘入口。 |
-| `start` | `-i`, `--initial-scan` | 启动时处理已有文件。 |
 | `add PATH...` | `-o/--out-dir DIR` | 添加监控根；只能同时添加一个路径。 |
 | `add PATH...` | `-s`, `--start` | 添加后启动持续监控。 |
-| `add PATH...` | `-i`, `--initial-scan` | 对新增根或 deep 模式发生变化的根执行初始扫描。 |
 | `add PATH...` | `-d`, `--deep-detect` | 将各输入目录的 `deep_detect` 写为 `true`；已登记目录也会更新。 |
 | `remove PATH...`, `rm PATH...` | — | 按输入目录移除监控根。 |
 | `list`, `ls` | — | 列出持久化的输入目录。 |
@@ -211,7 +211,7 @@ G:\Incoming | | true
 新增目录时不传 `--deep-detect`，默认不启用 deep。重复添加已登记目录时，不传该参数会保留已有模式；关闭 deep 可将第三列改为 `false` 或留空。
 
 ```powershell
-sunpack.exe watch add D:\Downloads --deep-detect --start --initial-scan
+sunpack.exe watch add D:\Downloads --deep-detect --start
 ```
 
 目录和目录背景右键菜单只保留“直接解压”“交互输入密码解压”“监控此目录”“取消监控此目录”四项，这些入口不附加 `--deep-detect`。文件对象的两个解压入口默认启用 `--deep-detect`。重新运行 `scripts/register_context_menu.ps1` 会重建菜单并移除过时入口。

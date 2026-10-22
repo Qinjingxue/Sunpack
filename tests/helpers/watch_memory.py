@@ -191,7 +191,6 @@ class WatchMemoryHarness:
             out_dir=str(output_root),
             state_path=str(state_path),
             cold_start_seconds=cold_start_seconds,
-            initial_scan=False,
             pipeline_engine=engine,
         )
         return cls(watch_root, output_root, state_path, config, engine, watcher)

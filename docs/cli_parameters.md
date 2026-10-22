@@ -173,7 +173,7 @@ Usage:
 python sunpack.py watch <add|remove|list|start|stop|reload|status|startup> [options]
 ```
 
-Monitored roots are stored in `sunpack_watch_roots.txt` inside the program resource directory. The format is `input directory | output root | deep_detect`; the last two columns are optional:
+Monitored roots are stored in `sunpack_watch_roots.txt` inside the program resource directory. The format is `input directory | output root | deep_detect | initial_scanned`; the last three columns are optional:
 
 ```text
 C:\Downloads
@@ -186,16 +186,16 @@ When only the input directory is given, `watch.out_dir` is used; a relative outp
 
 `deep_detect` accepts `true` or `false`; an omitted or empty value defaults to `false`. This mode belongs to the input directory. Different input roots may share an output root and use different modes. Nested extraction, password retries, and crash recovery retain the original input root and use its configured mode. Deep mode disables all filesystem scan filters for that root's requests. Editing the column triggers configuration reload; `watch reload` also applies it.
 
+`initial_scanned` records completion of the first candidate scan and defaults to `false` when omitted or empty. Startup and live reload automatically scan roots marked `false` and write `true` after queuing candidates, without waiting for extraction success. New roots and changed input paths start at `false`; output or deep-mode edits preserve the flag. Existing roots still recover offline changes through USN. Scan-state-only edits, reordered roots, comments, and equivalent path spellings do not restart the scheduler.
+
 Subcommands and options:
 
 | Subcommand | Option | Description |
 | --- | --- | --- |
 | `start` | `--once` | Run a single monitoring scan, then exit. |
 | `start` | `--no-tray` | Disable the tray entry point while running continuously. |
-| `start` | `-i`, `--initial-scan` | Process existing files at startup. |
 | `add PATH...` | `-o/--out-dir DIR` | Add a monitored root; only one path may be added at a time. |
 | `add PATH...` | `-s`, `--start` | Start continuous monitoring after adding. |
-| `add PATH...` | `-i`, `--initial-scan` | Run an initial scan for newly added roots or roots whose deep mode changed. |
 | `add PATH...` | `-d`, `--deep-detect` | Persist `deep_detect=true` for each input root; update already registered roots too. |
 | `remove PATH...`, `rm PATH...` | — | Remove a monitored root by input directory. |
 | `list`, `ls` | — | List the persisted input directories. |
@@ -211,7 +211,7 @@ Subcommands and options:
 Adding a new root without `--deep-detect` leaves deep mode disabled. Re-adding an existing root without the flag preserves its mode; set the third column to `false` or leave it empty to disable deep mode.
 
 ```powershell
-sunpack.exe watch add D:\Downloads --deep-detect --start --initial-scan
+sunpack.exe watch add D:\Downloads --deep-detect --start
 ```
 
 The directory and directory-background context menus contain four entries: extract directly, extract with a password prompt, watch this folder, and stop watching this folder. These entries do not add `--deep-detect`. The two file extraction entries enable `--deep-detect` by default. Re-run `scripts/register_context_menu.ps1` to rebuild the menus and remove obsolete entries.

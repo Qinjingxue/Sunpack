@@ -91,7 +91,7 @@ def test_context_menu_commands_are_safe_for_drive_roots_and_keep_password_flag()
         assert "D:" in command_text
         assert "\\." in command_text
         assert "'--start'" in command_text
-        assert "'--initial-scan'" in command_text
+        assert "'--start'" in command_text
         assert "--pause" not in command_text
         assert "--deep-detect" not in command_text
 
@@ -115,14 +115,14 @@ def test_context_menu_directory_token_is_stable_for_normal_paths():
     assert ntpath.normpath(argv[4]) == r"D:\Archives"
     assert argv[5:] == ["--ask-pw", "--pause"]
 
-    watch_command = '"powershell.exe" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command "Start-Process -WindowStyle Hidden -FilePath ''sunpack.exe'' -ArgumentList @(''watch'',''add'',''%V\\.'',''--start'',''--initial-scan'')"'
+    watch_command = '"powershell.exe" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command "Start-Process -WindowStyle Hidden -FilePath ''sunpack.exe'' -ArgumentList @(''watch'',''add'',''%V\\.'',''--start'')"'
     watch_argv = _windows_argv(watch_command.replace("%V", r"D:\Archives"))
     command_text = watch_argv[watch_argv.index("-Command") + 1]
     assert "watch" in command_text
     assert "add" in command_text
     assert r"D:\Archives\." in command_text
     assert "--start" in command_text
-    assert "--initial-scan" in command_text
+    assert "--start" in command_text
 
 
 def _windows_argv(command: str) -> list[str]:

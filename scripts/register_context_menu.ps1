@@ -151,7 +151,7 @@ function New-WatchCommandString {
         [string]$TargetToken
     )
 
-    $watchArguments = @("watch", "add", $TargetToken, "--start", "--initial-scan")
+    $watchArguments = @("watch", "add", $TargetToken, "--start")
     if ($Launcher.Mode -ne "app") { $watchArguments = @($Launcher.ScriptPath) + $watchArguments }
     return New-HiddenStartProcessCommand -FilePath $Launcher.AppPath -ArgumentList $watchArguments
 }
