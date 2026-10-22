@@ -430,12 +430,23 @@ void Application::navigate(const std::string& tab) {
     VisualBatch visual(window_);
     ui_window_focus_widget(window_,0);
     ui_page_set_json(page_,"tagInputs","{}");
-    motion::finish(window_,("page-"+page_value(page_,"tab").get<std::string>()).c_str());
+    const auto previous=page_value(page_,"tab").get<std::string>();
+    auto sidebar=[](const std::string& section)->const char* {
+        return section=="config"?"configSidebar":section=="tasks" || section=="passwords"?"directoryPane":nullptr;
+    };
+    motion::finish(window_,("page-"+previous).c_str());
+    if(auto* id=sidebar(previous)) motion::finish(window_,id);
+    // v-show retains these subviews. Stop their entrances before hiding them,
+    // so returning immediately cannot stack a stale child fade on a new page.
+    if(previous=="config") motion::finish(window_,"configBlocks");
+    else if(previous=="tasks") motion::finish(window_,"taskBody");
+    else if(previous=="passwords") motion::finish(window_,"passwordBody");
     set_text(page_,"tab",tab);
     set_text(page_,"actionError","");
     // Tab targets retain fixed sidebar geometry; reactive tab visibility already
     // schedules layout. Avoid forcing an extra full-tree layout on every switch.
     motion::enter(window_,("page-"+tab).c_str());
+    if(auto* id=sidebar(tab)) motion::enter(window_,id);
     motion::select(window_,"navIndicator",tab=="tasks"?"tabTasks":tab=="config"?"tabConfig":tab=="roots"?"tabRoots":"tabPasswords");
 }
 void Application::sync_toggles() {
@@ -595,7 +606,6 @@ void Application::handle_command(Json command) {
             // Commit category, viewport and entrance in the dispatch transaction.
             // Publishing from the click handler paints the new page once at
             // full opacity before this posted command can start its entrance.
-            motion::finish(window_,id.c_str());
             ui_page_set_json(page_,"tagInputs","{}");
             set_text(page_,"configCategory",p.at("category").get<std::string>());
         }
@@ -986,7 +996,7 @@ void Application::work() {
                         if(!edit_feedback.contains("resetScroll")) edit_feedback["resetScroll"]=Json::array();
                         edit_feedback["resetScroll"].push_back("passwordListScroll");
                         auto scope=p.value("scope",std::string("@all"));
-                        if(view.password_scope!=scope) edit_feedback["viewTransition"]={{"id","passwordBody"},{"x",scope=="@history"?20:-20}};
+                        if(view.password_scope!=scope) edit_feedback["viewTransition"]={{"id","passwordBody"},{"x",scope=="@history"?12:-12}};
                         view.password_query=p.value("query",std::string()); view.password_scope=p.value("scope",std::string("@all"));
                         passwords_changed=true;
                     } else if(op=="commit") {

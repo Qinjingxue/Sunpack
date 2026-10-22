@@ -764,7 +764,7 @@ export default {
         </button>
         <div id="navIndicator" class="nav-indicator"/>
       </div>
-      <div v-show="tab==='config'" class="sidebar">
+      <div id="configSidebar" v-show="tab==='config'" class="sidebar">
         <label class="sidebar-heading">{{ texts.categories }}</label>
         <button id="category-all" :class="!configCategory?'context-item on':'context-item'" @click="selectCategory('')"><label>{{ texts.allSettings }}</label></button>
         <ScrollView id="categoryScroll"><div class="column"><button v-for="c in categories" :key="c.id" :id="'category-'+c.id" :class="configCategory===c.id?'context-item on':'context-item'" @click="selectCategory(c.id)"><label>{{ c.label }}</label></button></div></ScrollView>

@@ -197,6 +197,15 @@ Core UI 的完整源代码在 `third_party/core-ui`，连同原始许可证一�
 [WinUI 开关模板](https://github.com/microsoft/microsoft-ui-xaml/blob/main/controls/dev/CommonStyles/ToggleSwitch_themeresources.xaml)、
 [Windows 动效](https://learn.microsoft.com/en-us/windows/apps/design/motion/)和
 [页面过渡](https://learn.microsoft.com/en-us/windows/apps/design/motion/page-transitions)调整。
+页面切换采用短距离上移与淡入：默认 12 DIP、200 ms cubic ease-out 位移，配合 83 ms
+线性淡入，让文字先清晰再完成减速，避免原先 167 ms 淡入配合陡峭初速造成弹出感。
+这是基于 Windows 动效原则针对本界面的调整，并非照搬 WinUI 控件的全部参数。
+连续分类或密码作用域更新沿用未完成过渡的进度与结束时间；父页入场时子视图不再叠加
+透明度和位移，离开页面会清理其内部过渡。复用同一有限帧时钟，动画结束即停止请求帧，
+不增加快照、常驻缓存或布局动画；系统关闭动画时直接显示最终状态。
+左栏下方的配置分类和目录列表与主页面在同一视觉事务内入场、离页时清理动画；
+上方品牌、监控操作和主导航保持原位。TAG 不再生成完整值 tooltip，避免滚动时在
+整个集合容器下方出现悬浮标签，同时省去鼠标移动时重复命中查找和提示文本复制。
 顶层命令信号不可见且采用绝对定位，不参与页面布局；
 原生句柄在卸载时释放。任务、配置块、密码/剪贴板历史及监控目录统一使用
 `VirtualList`：仅挂载视口附近的行，滚动后卸载离开的行；正在输入的编辑器保留至失焦。

@@ -16,7 +16,7 @@ bool TagCollection::SetItems(const std::string& source,const std::wstring& empty
     std::vector<Tag> next; next.reserve(values.size());
     for(const auto& value:values) next.push_back({wide(value.get_ref<const std::string&>())});
     tags_=std::move(next); source_=source; empty_=empty; none_=none; width_=-1;
-    hovered_=pressed_=-1; tooltip.clear();
+    hovered_=pressed_=-1;
     ui::RequestLayout();
     return true;
 }
@@ -42,11 +42,11 @@ D2D1_RECT_F TagCollection::bounds(size_t index) const {
     r.left+=rect.left; r.right+=rect.left; r.top+=rect.top; r.bottom+=rect.top;
     return r;
 }
-int TagCollection::tag_at(float x,float y,bool close_only) const {
+int TagCollection::tag_at(float x,float y) const {
     auto it=std::lower_bound(tags_.begin(),tags_.end(),y-rect.top,[](const Tag& tag,float y){return tag.bounds.bottom<y;});
     for(;it!=tags_.end() && it->bounds.top<=y-rect.top;++it) {
         auto r=bounds(size_t(it-tags_.begin()));
-        if(x>=r.left && x<=r.right && (!close_only || x>=r.right-closeWidth)) return int(it-tags_.begin());
+        if(x>=r.left && x<=r.right && x>=r.right-closeWidth) return int(it-tags_.begin());
     }
     return -1;
 }
@@ -72,14 +72,13 @@ void TagCollection::OnDraw(ui::Renderer& r) {
     }
 }
 bool TagCollection::OnMouseMove(const ui::MouseEvent& e) {
-    hovered_=tag_at(e.x,e.y,true); cursor=hovered_>=0?ui::CursorKind::Pointer:ui::CursorKind::Default;
-    int index=tag_at(e.x,e.y,false); tooltip=index>=0?tags_[index].value:std::wstring();
+    hovered_=tag_at(e.x,e.y); cursor=hovered_>=0?ui::CursorKind::Pointer:ui::CursorKind::Default;
     return Contains(e.x,e.y);
 }
-bool TagCollection::OnMouseDown(const ui::MouseEvent& e) { pressed_=tag_at(e.x,e.y,true); return pressed_>=0; }
+bool TagCollection::OnMouseDown(const ui::MouseEvent& e) { pressed_=tag_at(e.x,e.y); return pressed_>=0; }
 bool TagCollection::OnMouseUp(const ui::MouseEvent& e) {
     int pressed=pressed_; pressed_=-1;
-    if(pressed<0 || pressed!=tag_at(e.x,e.y,true) || !onRemove) return false;
+    if(pressed<0 || pressed!=tag_at(e.x,e.y) || !onRemove) return false;
     auto remove=onRemove; auto value=tags_[pressed].value;
     remove(size_t(pressed),value); return true;
 }

@@ -13,7 +13,7 @@ class TagCollection final : public ui::Widget {
     float width_=-1, height_=28;
     int hovered_=-1, pressed_=-1;
     std::wstring label(const Tag& tag) const;
-    int tag_at(float x,float y,bool close_only) const;
+    int tag_at(float x,float y) const;
     D2D1_RECT_F bounds(size_t index) const;
 public:
     std::function<void(size_t,const std::wstring&)> onRemove;

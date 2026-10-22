@@ -1,6 +1,7 @@
 #include "application.hpp"
 #include "presentation.hpp"
 #include "range_editor.hpp"
+#include "motion.hpp"
 #include "ui_defaults_json.h"
 #include <cassert>
 #include <iostream>
@@ -141,12 +142,14 @@ void settle_motion(Application& app) {
         std::function<bool(ui::Widget*)> settled=[&](ui::Widget* widget) {
             if(!widget->visible) return true;
             if(auto* scroll=dynamic_cast<ui::ScrollViewWidget*>(widget); scroll && scroll->ScrollAnimating()) return false;
-            if(widget->opacity<0.999f || std::abs(widget->animationX)>0.01f) { pending.push_back({widget->id,widget->opacity,widget->animationX}); return false; }
+            // A visual epsilon can return before the finite clock ends. The
+            // next update deliberately joins that clock instead of restarting.
+            if(widget->opacity!=1 || widget->animationX!=0) { pending.push_back({widget->id,widget->opacity,widget->animationX}); return false; }
             if(widget->id=="navIndicator") {
                 auto tab=state(app.page(),"tab").get<std::string>();
                 auto* target=root->FindById(tab=="tasks"?"tabTasks":tab=="config"?"tabConfig":tab=="roots"?"tabRoots":"tabPasswords");
                 if(std::abs(widget->rect.top+widget->animationY+(widget->rect.bottom-widget->rect.top)/2-(target->rect.top+target->rect.bottom)/2)>0.01f) { pending.push_back({widget->id,widget->rect.top,widget->animationY,target->rect.top,target->rect.bottom}); return false; }
-            } else if(std::abs(widget->animationY)>0.01f) { pending.push_back({widget->id,widget->animationY}); return false; }
+            } else if(widget->animationY!=0) { pending.push_back({widget->id,widget->animationY}); return false; }
             for(auto& child:widget->Children()) if(!settled(child.get())) return false;
             return true;
         };
@@ -583,6 +586,66 @@ void inline_cell_caret(Application& app) {
     click(app,"rootSearch"); finish_input(app);
     click(app,"tabConfig"); pump([&]{return state(app.page(),"tab")=="config";}); settle_motion(app);
 }
+void page_motion(Application& app) {
+    settle_motion(app);
+    auto* window=ui::GetContext().GetWindow(app.window());
+    auto* page=window->Root()->FindById("page-tasks");
+    auto* body=window->Root()->FindById("taskBody");
+    assert(page && body);
+    const auto bounds=body->rect;
+    BOOL animations=TRUE; SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION,0,&animations,0);
+    {
+        motion::VisualBatch visual(app.window());
+        // Seed an intermediate frame without depending on machine speed.
+        // A second content update must keep its current position and clock.
+        body->opacity=0.5f; body->animationY=6;
+        window->AnimateProperty(body,ui::AnimProperty::Opacity,0.5f,1,83,ui::EasingFunction::Linear);
+        window->AnimateProperty(body,ui::AnimProperty::TranslateY,6,0,200,ui::EasingFunction::EaseOutCubic);
+        motion::enter(app.window(),"taskBody");
+        if(animations) assert(body->opacity==0.5f && body->animationY==6);
+        else assert(body->opacity==1 && body->animationY==0);
+        // A late async subview update joins its page, never a second layer.
+        motion::enter(app.window(),"page-tasks");
+        motion::enter(app.window(),"taskBody");
+        assert(body->opacity==1 && body->animationX==0 && body->animationY==0);
+        motion::finish(app.window(),"page-tasks");
+        motion::enter(app.window(),"taskBody");
+    }
+    // Observe the real presentation frames: a moving page must bring its
+    // changing sidebar with it. The fixed navigation stays in place.
+    struct PairedEntrances {
+        ui::UiWindowImpl* window; bool mismatch=false;
+        explicit PairedEntrances(ui::UiWindowImpl* w):window(w) {
+            ui_trace_set_sink([](const UiTraceEvent* event,void* context) {
+                if(std::strcmp(event->name,"property_animation_frame")) return;
+                auto& self=*static_cast<PairedEntrances*>(context);
+                for(const char* tab:{"tasks","config","passwords"}) {
+                    auto* root=self.window->Root().get();
+                    auto* page=root->FindById(std::string("page-")+tab);
+                    if(!page || !page->visible || (page->opacity>=0.95f && page->animationY<=1)) continue;
+                    auto* sidebar=root->FindById(!std::strcmp(tab,"config")?"configSidebar":"directoryPane");
+                    if(!sidebar || !sidebar->visible || (sidebar->opacity==1 && sidebar->animationY==0)) self.mismatch=true;
+                }
+            },this);
+        }
+        ~PairedEntrances() { ui_trace_set_sink(nullptr,nullptr); }
+    } paired(window);
+    const auto navigation=rect(app,"navItems"),monitor=rect(app,"monitorControls");
+    // Leaving a retained page clears its child and sidebar entrance. Exercise
+    // both lower panes and rapid reversal in the same navigation transaction.
+    click(app,"tabConfig"); click(app,"tabPasswords"); click(app,"tabTasks");
+    pump([&]{return state(app.page(),"tab")=="tasks" && state(app.page(),"requests").empty() && state(app.page(),"dispatch")==false;},"Subview motion cancellation");
+    assert(body->opacity==1 && body->animationY==0);
+    settle_motion(app);
+    assert(!paired.mismatch);
+    for(const char* id:{"configSidebar","directoryPane"}) {
+        auto* sidebar=window->Root()->FindById(id); assert(sidebar);
+        assert(sidebar->opacity==1 && sidebar->animationY==0);
+    }
+    assert(rect(app,"navItems").top==navigation.top && rect(app,"monitorControls").top==monitor.top);
+    assert(body->rect.left==bounds.left && body->rect.top==bounds.top &&
+        body->rect.right==bounds.right && body->rect.bottom==bounds.bottom);
+}
 void config_categories(Application& app) {
     search_config(app,L"");
     auto categories=state(app.page(),"categories"); assert(categories.size()>2);
@@ -603,7 +666,12 @@ void config_categories(Application& app) {
         } trace(app);
         click(app,category.empty()?"category-all":("category-"+category).c_str());
         pump([&]{return state(app.page(),"configCategory")==category && state(app.page(),"requests").empty();},"Configuration category transaction");
-        if(animations) assert(trace.motion && !trace.flash);
+        if(animations && (!trace.motion || trace.flash)) {
+            std::cerr<<"Category motion: from="<<trace.before<<" to="<<category<<" started="<<trace.motion<<" flash="<<trace.flash<<'\n';
+            auto* target=ui::GetContext().GetWindow(app.window())->Root()->FindById("configBlocks");
+            for(auto* p=target;p;p=p->Parent()) std::cerr<<"  "<<p->id<<" opacity="<<p->opacity<<" x="<<p->animationX<<" y="<<p->animationY<<'\n';
+            assert(false);
+        }
         auto* scroll=dynamic_cast<ui::ScrollViewWidget*>(ui::GetContext().GetWindow(app.window())->Root()->FindById("configListScroll"));
         assert(scroll && scroll->ScrollY()==0);
         auto blocks=state(app.page(),"matchingBlocks"); assert(!blocks.empty());
@@ -855,8 +923,14 @@ void tag_config(Application& app,const fs::path& dir) {
     click(app,inputId.c_str()); assert(ui_debug_type_text(app.window(),L"unsubmitted")==0);
     click(app,"configSearch");
     assert(disk()==values && state(app.page(),"tagInputs")[pointer]=="unsubmitted");
+    // Hover the second, nonempty TAG's close button before the existing scroll.
+    // It must not publish an out-of-viewport tooltip on the collection surface.
+    float firstWidth=std::clamp(window->GetRenderer().MeasureTextWidth(wide(state(app.page(),"texts")["emptyEntry"].get<std::string>()),13)+33,38.0f,240.0f);
+    float closeX=cloud->rect.left+firstWidth+4+window->GetRenderer().MeasureTextWidth(L"a↵b",13)+25;
+    assert(ui_debug_mouse_move(app.window(),closeX,cloud->rect.top+13)==0);
+    assert(cloud->cursor==ui::CursorKind::Pointer && cloud->tooltip.empty());
     window->ScrollWithMeasureContext(scroll(),1000000); ui_window_relayout(app.window());
-    assert(scroll()->ScrollY()>0 && disk()==values);
+    assert(scroll()->ScrollY()>0 && disk()==values && cloud->tooltip.empty());
     screenshot(app,L"tag-config-tail.png");
     search_config(app,L"");
     virtual_tail(app,"configItems","configListScroll",state(app.page(),"matchingBlocks").size());
@@ -966,6 +1040,12 @@ void drag_after_wheel(Application& app) {
     auto move=[&](float x,float y) {
         SendMessageW(hwnd,WM_MOUSEMOVE,MK_LBUTTON,MAKELPARAM(int(std::lround(x*dpi)),int(std::lround(y*dpi))));
     };
+    auto wheel=[&](short delta) {
+        const auto bounds=active->rect;
+        POINT pt{int((bounds.left+20)*dpi),int((bounds.top+20)*dpi)};
+        ClientToScreen(hwnd,&pt);
+        SendMessageW(hwnd,WM_MOUSEWHEEL,MAKEWPARAM(0,delta),MAKELPARAM(pt.x,pt.y));
+    };
     {
         // Real wheel motion must advance and stop without a timer or global
         // layout; programmatic virtual-tail checks cannot cover its scheduler.
@@ -980,12 +1060,8 @@ void drag_after_wheel(Application& app) {
         // Multiple physical wheel packets before presentation must coalesce;
         // neither a view mutation nor synchronous rendering belongs in input.
         AnimationFrames animation;
-        const auto bounds=active->rect;
         const float before=active->ScrollY();
-        POINT pt{int((bounds.left+20)*dpi),int((bounds.top+20)*dpi)};
-        ClientToScreen(hwnd,&pt);
-        for(int delta:{-30,-30,-30,-30})
-            SendMessageW(hwnd,WM_MOUSEWHEEL,MAKEWPARAM(0,short(delta)),MAKELPARAM(pt.x,pt.y));
+        for(int delta:{-30,-30,-30,-30}) wheel(short(delta));
         assert(active->ScrollY()==before && animation.submitted==0);
         pump([&]{return !active->ScrollAnimating() && animation.finished;},"Coalesced wheel",false);
         assert(active->ScrollY()>before && hidden->ScrollY()==hidden_y);
@@ -1057,11 +1133,13 @@ void drag_after_wheel(Application& app) {
     UpdateWindow(hwnd);
     {
         AnimationFrames animation;
-        for(int i=0;i<20;++i) assert(ui_debug_wheel(app.window(),scroll,120)==0);
+        // The debug wheel helper unconditionally invalidates the window. Use
+        // real input here to observe the production no-op redraw behavior.
+        for(int i=0;i<20;++i) wheel(120);
         assert(!active->ScrollAnimating() && active->ScrollY()==0 && animation.submitted==0);
         assert(!GetUpdateRect(hwnd,nullptr,FALSE));
         // Ignoring the outward impulse must not strand the next inward one.
-        assert(ui_debug_wheel(app.window(),scroll,-120)==0);
+        wheel(-120);
         pump([&]{return !active->ScrollAnimating() && active->ScrollY()>0;},"Reverse at scroll boundary",false);
     }
     ui_widget_destroy(scroll);
@@ -1146,6 +1224,7 @@ int wmain(int argc,wchar_t** argv) {
             assert(IsWindowVisible(static_cast<HWND>(ui_window_hwnd(app.window()))));
             assert(state(app.page(),"errors").empty() && state(app.page(),"actionError")=="");
             screenshot(app,L"startup.png");
+            page_motion(app);
             if(rangesOnly || acceptance) {
                 pump_diagnostic(app,[&]{return state(app.page(),"fields").size()>100;},"Configuration fields loaded");
                 click(app,"tabConfig"); pump([&]{return state(app.page(),"tab")=="config";});
