@@ -1,0 +1,139 @@
+name: "🗜️ Archive Handling / 压缩包处理反馈"
+description: "Report detection, volume grouping, recursion or extraction issues / 反馈归档处理问题"
+title: "[Archive] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        本表单用于反馈 **无法识别、误识别、分卷归组、递归、解压、密码、验证和清理问题**。
+        既欢迎程序错误，也欢迎在真实归档中遇到的兼容性问题。无需了解内部算法。
+
+        **注意隐私：仅公开可以分享的样本；勿上传真实密码、付费或私人的压缩文件。**
+        文件树可以用虚构文件名代替；诊断记录中的用户名、路径及敏感名称应先脱敏。
+
+  - type: input
+    id: version
+    attributes:
+      label: "SunPack 版本 / Version"
+      description: "运行 sunpack.exe version 或填写 Release 版本号。"
+      placeholder: "例如 v1.2.2"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: problem
+    attributes:
+      label: "问题类型 / Problem type"
+      options:
+        - "压缩包未识别 / Not detected"
+        - "普通文件被误识别 / False positive"
+        - "分卷识别或归组错误 / Volumes"
+        - "漏掉递归或错误递归 / Recursion"
+        - "加密或密码处理错误 / Encryption"
+        - "解压失败、损坏或内容不全 / Extraction"
+        - "输出、压平或源文件清理异常 / Cleanup"
+        - "其他 / 不确定"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: entry
+    attributes:
+      label: "触发方式 / Entry point"
+      options:
+        - "Watch / 自动监控"
+        - "extract / 直接解压"
+        - "scan / 扫描"
+        - "inspect / 诊断"
+        - "资源管理器右键菜单"
+        - "其他 / 不确定"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: format
+    attributes:
+      label: "文件格式 / Format"
+      options:
+        - "ZIP / ZIPX"
+        - "RAR / RAR4 / RAR5"
+        - "7z"
+        - "TAR / GZ / TGZ / BZ2 / TBZ2 / XZ / TXZ"
+        - "ZSTD / ZST / LZ4"
+        - "ENC / ENCV4"
+        - "混合或多层嵌套"
+        - "未知 / 伪装扩展名"
+        - "其他"
+    validations:
+      required: true
+
+  - type: textarea
+    id: layout
+    attributes:
+      label: "文件结构 / File layout"
+      description: "分卷问题请说明文件名、大小、先后顺序以及是否缺卷；名称可以脱敏。"
+      placeholder: |
+        download/
+          sample.part1.rar (100 MiB)
+          sample.part2.rar (100 MiB)
+          sample.part3.rar (25 MiB)
+        是否重命名、嵌套、伪装或缺卷：
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: "期望怎么处理？ / Expected behavior"
+      placeholder: "例如：三个文件应被识别为同一组分卷，然后只解压一次。"
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: "实际上怎么处理？ / Actual behavior"
+      placeholder: "例如：第二卷被单独处理，其他分卷持续等待……"
+    validations:
+      required: true
+
+  - type: markdown
+    attributes:
+      value: |
+        ### 推荐诊断（只读、不解压或清理文件）
+
+        对于识别、误识别和递归问题：
+        ```powershell
+        sunpack.exe inspect "D:\Test\sample.rar" --analyze --json
+        ```
+
+        对于分卷及目录归组问题：
+        ```powershell
+        sunpack.exe scan "D:\Test" --json
+        ```
+
+        两个命令均为只读。若普通检测无法定位，再考虑加 `--deep-detect`，它会扩大检测范围。
+        对于 Watch 解压失败，优先提供状态目录下 `failures/failed-*.txt`（启用 Toast 且报告生成时）。
+        对于忽略、等待、重试、误清理等问题，提供故障时间附近的 `events.jsonl`。
+        Watch 默认状态目录：`%ProgramData%\SunPack\.sunpack_watch\`；如修改 `watch.state_dir` 请使用自定义目录。
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: "诊断结果 / Diagnostic output"
+      description: "粘贴已脱敏的 scan、inspect、错误摘要，或说明附件包含哪些日志。无需全部提供。"
+      placeholder: "识别结果、停止原因、分卷关系、故障时间等……"
+
+  - type: upload
+    id: attachments
+    attributes:
+      label: "诊断文件或可公开复现样本 / Attachments"
+      description: "可上传脱敏的日志、截图、失败报告或小型合法样本；JSONL 可压缩为 ZIP。不要上传隐私数据。"
+    validations:
+      required: false
+      accept: ".zip,.txt,.log,.json,.png,.jpg,.jpeg,.webp"
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: "补充信息 / Additional context"
+      description: "例如是否加密、是否缺卷、Watch 与 CLI 有无差异，以及其他解压工具是否成功（如已测试）。"
