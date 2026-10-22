@@ -1,0 +1,26 @@
+name: "✨ Feature Request (English)"
+description: "Suggest features or usability improvements"
+title: "[Feature] "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: "Use case and problem"
+      description: "What is inconvenient or difficult when using SunPack?"
+    validations:
+      required: true
+
+  - type: textarea
+    id: suggestion
+    attributes:
+      label: "Suggested improvement"
+      description: "Describe the desired result; a technical design is not required."
+    validations:
+      required: true
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: "Additional context (optional)"
+      description: "Screenshots, examples, or your current workaround."
