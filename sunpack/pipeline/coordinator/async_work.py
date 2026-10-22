@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import heapq
 import os
 import threading
-from collections import deque
+from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Callable, Generic, TypeVar
@@ -115,6 +116,57 @@ class _RequestQueue:
     origin: str = "foreground"
 
 
+class _RequestOrder:
+    """Ready requests only; normal admission/selection is constant time.
+
+    Promotions retain their original global FIFO position. A heap merges
+    just these out-of-order admissions with the regular foreground FIFO;
+    no stale entries or references to completed requests are retained.
+    """
+
+    __slots__ = ("_foreground", "_watch", "_promoted", "_sequence")
+
+    def __init__(self) -> None:
+        self._foreground: deque[tuple[int, str]] = deque()
+        self._watch: OrderedDict[str, int] = OrderedDict()
+        self._promoted: list[tuple[int, str]] = []
+        self._sequence = 0
+
+    def __bool__(self) -> bool:
+        return bool(self._foreground or self._watch or self._promoted)
+
+    def append(self, request_id: str, origin: str) -> None:
+        self._sequence += 1
+        if origin == "watch":
+            self._watch[request_id] = self._sequence
+        else:
+            self._foreground.append((self._sequence, request_id))
+
+    def promote(self, request_id: str) -> None:
+        position = self._watch.pop(request_id)
+        if not self._watch:
+            self._watch.clear()
+        heapq.heappush(self._promoted, (position, request_id))
+
+    def popleft(self) -> str:
+        if self._promoted and (
+            not self._foreground or self._promoted[0][0] < self._foreground[0][0]
+        ):
+            return heapq.heappop(self._promoted)[1]
+        if self._foreground:
+            return self._foreground.popleft()[1]
+        request_id, _ = self._watch.popitem(last=False)
+        if not self._watch:
+            self._watch.clear()
+        return request_id
+
+    def clear(self) -> None:
+        self._foreground.clear()
+        self._watch.clear()
+        self._promoted.clear()
+        self._sequence = 0
+
+
 class AsyncWorkBroker:
     """A bounded, request-fair gateway to all blocking Python work.
 
@@ -139,7 +191,8 @@ class AsyncWorkBroker:
             thread_name_prefix=thread_name_prefix,
         )
         self._queues: dict[str, _RequestQueue] = {}
-        self._request_order: deque[str] = deque()
+        self._request_order = _RequestOrder()
+        self._pending_jobs = 0
         self._pending_slots = asyncio.Semaphore(self.max_pending_jobs)
         self._active = 0
         self._sequence = 0
@@ -174,7 +227,7 @@ class AsyncWorkBroker:
 
     @property
     def pending_jobs(self) -> int:
-        return sum(len(queue.jobs) for queue in self._queues.values())
+        return self._pending_jobs
 
     def bind(self) -> None:
         loop = asyncio.get_running_loop()
@@ -234,10 +287,12 @@ class AsyncWorkBroker:
         queue = self._queues.get(request_key)
         if queue is None:
             queue = self._queues[request_key] = _RequestQueue(origin=effective_origin)
-            self._request_order.append(request_key)
-        elif effective_origin == "foreground":
+            self._request_order.append(request_key, effective_origin)
+        elif effective_origin == "foreground" and queue.origin == "watch":
+            self._request_order.promote(request_key)
             queue.origin = "foreground"
         queue.jobs.append(item)
+        self._pending_jobs += 1
         self._dispatch()
         try:
             return await future
@@ -262,6 +317,7 @@ class AsyncWorkBroker:
                     self._pending_slots.release()
             self._queues.clear()
             self._request_order.clear()
+            self._pending_jobs = 0
         if graceful and (self._active or self.pending_jobs):
             await self._idle_event.wait()
         self._executor.shutdown(wait=graceful, cancel_futures=not graceful)
@@ -274,10 +330,13 @@ class AsyncWorkBroker:
                 self._queues.pop(request_id, None)
                 continue
             item = self._take_prioritized(queue.jobs)
+            self._pending_jobs -= 1
             if queue.jobs:
-                self._request_order.append(request_id)
+                self._request_order.append(request_id, queue.origin)
             else:
                 self._queues.pop(request_id, None)
+                if not self._pending_jobs:
+                    self._queues.clear()
             if item.future.cancelled() or item.token.cancelled:
                 item.future.cancel()
                 self._pending_slots.release()
@@ -296,13 +355,6 @@ class AsyncWorkBroker:
     def _pop_next_request_id(self) -> str:
         """Choose foreground FIFO before watch FIFO without preemption or aging."""
 
-        for index, request_id in enumerate(self._request_order):
-            queue = self._queues.get(request_id)
-            if queue is not None and queue.origin != "watch":
-                self._request_order.rotate(-index)
-                selected = self._request_order.popleft()
-                self._request_order.rotate(index)
-                return selected
         return self._request_order.popleft()
 
     def _take_prioritized(self, jobs: _StageWorkQueue) -> _WorkItem[Any]:

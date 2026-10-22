@@ -2,11 +2,60 @@ import asyncio
 import random
 import threading
 import time
+from collections import deque
 from types import SimpleNamespace
 
 import pytest
 
-from sunpack.pipeline.coordinator.async_work import AsyncWorkBroker, CancellationToken, CURRENT_WORK, _StageWorkQueue
+from sunpack.pipeline.coordinator.async_work import AsyncWorkBroker, CancellationToken, CURRENT_WORK, _RequestOrder, _StageWorkQueue
+
+
+def test_request_order_matches_global_fifo_across_promotions_rotation_and_reuse():
+    # Existing broker examples cannot catch promotions being appended behind
+    # newer foreground requests, or stale memberships after ID reuse/clear.
+    # One cheap model run covers these independent lifecycle/order failures.
+    order = _RequestOrder()
+    reference = deque()
+    origins = {}
+    randomizer = random.Random(37)
+
+    def append(key, origin):
+        order.append(key, origin)
+        reference.append(key)
+        origins[key] = origin
+
+    def pop():
+        expected = next((key for key in reference if origins[key] != "watch"), reference[0])
+        assert order.popleft() == expected
+        reference.remove(expected)
+        return expected, origins.pop(expected)
+
+    for key, origin in (("a", "watch"), ("b", "foreground"), ("c", "watch"), ("d", "foreground")):
+        append(key, origin)
+    for key in ("c", "a"):
+        order.promote(key)
+        origins[key] = "foreground"
+    assert [pop()[0] for _ in range(4)] == ["a", "b", "c", "d"]
+    for index in range(3000):
+        key = str(randomizer.randrange(128))
+        if index in (1000, 2000):
+            order.clear()
+            reference.clear()
+            origins.clear()
+        elif key not in origins:
+            append(key, randomizer.choice(("watch", "foreground")))
+        elif origins[key] == "watch" and randomizer.random() < 0.5:
+            order.promote(key)
+            origins[key] = "foreground"
+        else:
+            selected, origin = pop()
+            if randomizer.random() < 0.5:
+                append(selected, origin)
+        assert bool(order) == bool(reference)
+    while reference:
+        pop()
+    assert not order._foreground and not order._watch and not order._promoted
+    assert order._watch.__sizeof__() == _RequestOrder()._watch.__sizeof__()
 
 
 @pytest.mark.parametrize("seed", [0, 31, 32, 63])
@@ -111,7 +160,7 @@ def test_broker_cancelled_queued_work_releases_slots_across_stage_buckets(cancel
 
 def test_broker_immediate_close_cancels_all_stage_buckets():
     async def scenario():
-        broker = AsyncWorkBroker(thread_capacity=1, max_pending_jobs=8)
+        broker = AsyncWorkBroker(thread_capacity=1, max_pending_jobs=16)
         entered = threading.Event()
         release = threading.Event()
 
@@ -123,14 +172,17 @@ def test_broker_immediate_close_cancels_all_stage_buckets():
         queued = []
         try:
             assert await asyncio.to_thread(entered.wait, 2)
-            queued = [asyncio.create_task(broker.run(stage, stage, lambda: None, request_id="r"))
+            queued = [asyncio.create_task(broker.run(stage, stage, lambda: None, request_id="r", origin="watch"))
                       for stage in ("background", "scan", "plan", "verify", "commit", "close")]
+            queued += [asyncio.create_task(broker.run("scan", key, lambda: None, request_id=key, origin=origin))
+                       for key, origin in (("f", "foreground"), ("w", "watch"), ("r", "foreground"))]
             await asyncio.sleep(0)
-            assert broker.pending_jobs == 6
+            assert broker.pending_jobs == 9
             await broker.close(graceful=False)
             results = await asyncio.gather(*queued, return_exceptions=True)
             assert all(isinstance(result, asyncio.CancelledError) for result in results)
             assert broker.pending_jobs == 0
+            assert not broker._request_order and not broker._queues
         finally:
             release.set()
             await asyncio.wait_for(active, timeout=3)
@@ -256,34 +308,64 @@ def test_graceful_close_waits_once_for_idle_notification():
     asyncio.run(scenario())
 
 
-def test_broker_dispatches_waiting_foreground_before_watch_without_preemption():
+def test_broker_dispatches_foreground_promotions_fifo_without_preemption_or_demotion():
+    # Adds real run()/dispatch coverage for upgrades, repeat admissions and
+    # cancelled requests across all ready queues. The model test does not
+    # exercise futures, counters or worker execution; this replaces the
+    # simpler foreground-before-Watch example rather than duplicating it.
     async def scenario():
-        broker = AsyncWorkBroker(thread_capacity=1, max_pending_jobs=8)
+        broker = AsyncWorkBroker(thread_capacity=1, max_pending_jobs=16)
         release = threading.Event()
+        entered = asyncio.Event()
+        loop = asyncio.get_running_loop()
         started = []
 
         def operation(label):
             started.append(label)
             if label == "active-watch":
-                release.wait(timeout=2)
+                loop.call_soon_threadsafe(entered.set)
+                assert release.wait(timeout=3)
             return label
 
         try:
             active = asyncio.create_task(
                 broker.run("extract", "active", operation, "active-watch", request_id="watch-1", origin="watch")
             )
-            while started != ["active-watch"]:
-                await asyncio.sleep(0)
-            waiting_watch = asyncio.create_task(
-                broker.run("extract", "watch", operation, "waiting-watch", request_id="watch-2", origin="watch")
+            await asyncio.wait_for(entered.wait(), timeout=2)
+            admissions = (
+                ("old-1", "old", "watch"), ("old-2", "old", "watch"),
+                ("foreground", "cli", "foreground"), ("middle", "middle", "watch"),
+                ("foreground-last", "cli-last", "foreground"), ("tail", "tail", "watch"),
+                ("middle-upgrade", "middle", "foreground"), ("old-upgrade", "old", "foreground"),
+                ("old-watch", "old", "watch"),
             )
-            foreground = asyncio.create_task(
-                broker.run("extract", "cli", operation, "foreground", request_id="cli-1", origin="foreground")
-            )
+            queued = [asyncio.create_task(broker.run(
+                "extract", label, operation, label, request_id=key, origin=origin,
+            )) for label, key, origin in admissions]
+            token = CancellationToken()
+            cancelled_watch = asyncio.create_task(broker.run(
+                "extract", "cancelled-watch", operation, "cancelled-watch",
+                request_id="cancelled-watch", origin="watch", cancellation=token,
+            ))
+            cancelled_foreground = asyncio.create_task(broker.run(
+                "extract", "cancelled-foreground", operation, "cancelled-foreground",
+                request_id="cancelled-foreground", origin="foreground",
+            ))
             await asyncio.sleep(0)
+            assert broker.pending_jobs == len(admissions) + 2
+            token.cancel()
+            cancelled_foreground.cancel()
             release.set()
-            await asyncio.gather(active, waiting_watch, foreground)
-            assert started == ["active-watch", "foreground", "waiting-watch"]
+            results = await asyncio.wait_for(asyncio.gather(
+                active, *queued, cancelled_watch, cancelled_foreground, return_exceptions=True,
+            ), timeout=3)
+            assert all(isinstance(result, asyncio.CancelledError) for result in results[-2:])
+            assert started == ["active-watch", "old-1", "foreground", "middle", "foreground-last",
+                               "old-2", "middle-upgrade", "old-upgrade", "old-watch", "tail"]
+            assert broker.pending_jobs == broker.active_jobs == 0
+            assert broker._pending_slots._value == broker.max_pending_jobs
+            assert not broker._queues and not broker._request_order
+            assert broker._queues.__sizeof__() == {}.__sizeof__()
         finally:
             release.set()
             await broker.close()

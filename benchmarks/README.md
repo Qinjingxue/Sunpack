@@ -61,6 +61,7 @@ uv run --locked python -m benchmarks extraction split-pressure --profile accepta
 uv run --locked python -m benchmarks memory residual-rss
 uv run --locked python -m benchmarks memory many-tasks --python-rounds 5 --worker-rounds 3 --json-out benchmarks/results/memory-growth.json
 uv run --no-sync python -m benchmarks scheduling broker-queue --baseline-ref <before-commit> --runs 5 --warmups 1
+uv run --no-sync python -m benchmarks scheduling broker-request-selection --baseline-ref <before-commit> --runs 7 --warmups 1
 uv run --no-sync python -m benchmarks scheduling watch-source-claims --baseline-ref <before-commit> --runs 7 --warmups 1
 uv run --no-sync python -m benchmarks memory watch-source-indexes --paths 4096 --batches 12 --warmups 2
 ```
@@ -102,8 +103,22 @@ selection order/results and reports single-selection latency, enqueue-plus-drain
 cost, and actual broker submit-to-completion time at the same thread capacity.
 The default queue sizes range from 1 to 4096, with homogeneous and mixed stages;
 broker workloads include one request and mixed watch/foreground requests. Reports
-record both source hashes and all raw wall/CPU samples. These are scheduling
+record the baseline revision and all raw wall/CPU samples. These are scheduling
 measurements without archive decoding or filesystem IO.
+
+`scheduling broker-request-selection` measures `_pop_next_request_id` against
+the number of distinct queued requests: all Watch, foreground at the tail, and
+foreground at the head. It also measures real broker bursts with 32 executor
+threads and the default 4096 pending-job bound, including a shared-request
+control. Event barriers admit the burst before releasing workers; no polling or
+fixed cooldown is used. Alternating A/B samples compare the exact production
+source at `--baseline-ref` with the working tree and verify identical dispatch
+order/results. Reports retain the baseline revision, candidate diff, raw wall/CPU
+samples and separate admission/drain timings. Empty operations isolate scheduling;
+the measured reductions do not predict end-to-end archive extraction speedups.
+Separate instrumented runs record selection and state-notification time.
+Tracemalloc separately measures ready-order metadata while populated, drained,
+and destroyed, including batches of Watch-to-foreground promotions.
 
 ## Run timeout
 

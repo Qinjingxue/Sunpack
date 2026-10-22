@@ -12,6 +12,7 @@ class Scenario:
 
 
 _ROWS = [
+    ("scheduling", "broker-request-selection", "benchmarks.scenarios.broker_request_selection", "Request-count scaling and fixed-order no-scan scheduling ceiling."),
     ("scheduling", "broker-queue", "benchmarks.scenarios.broker_queue", "Committed versus working-tree broker queue selection and throughput."),
     ("scheduling", "watch-source-claims", "benchmarks.scenarios.watch_source_claims", "Watch source claim/release indexes versus committed baseline, including maintenance cost."),
     ("reader", "password-fast-path", "benchmarks.scenarios.reader_password_fast_path", "Password candidate fast paths."),

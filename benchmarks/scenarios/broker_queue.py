@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import hashlib
 import os
 import statistics
 import subprocess
@@ -23,7 +22,7 @@ STAGES = ("background_source_cleanup", "discover_detect", "input_plan",
           "extract_continuation", "output_promotion", "extractor_close")
 
 
-def _baseline(ref: str) -> tuple[ModuleType, str, str]:
+def _baseline(ref: str) -> tuple[ModuleType, str]:
     revision = subprocess.check_output(
         ["git", "rev-parse", "--verify", f"{ref}^{{commit}}"], cwd=REPO_ROOT, text=True,
     ).strip()
@@ -34,7 +33,7 @@ def _baseline(ref: str) -> tuple[ModuleType, str, str]:
     module.__file__ = f"{revision}:{SOURCE_PATH}"
     sys.modules[module.__name__] = module
     exec(compile(source, module.__file__, "exec"), module.__dict__)
-    return module, revision, hashlib.sha256(source.encode("utf-8")).hexdigest()
+    return module, revision
 
 
 def _items(count: int, mixed: bool):
@@ -154,13 +153,11 @@ def main(argv: list[str] | None = None) -> int:
     if (not sizes or min(sizes) < 1 or args.runs < 1 or args.warmups < 0
             or min(args.selection_repeats, args.broker_jobs, args.thread_capacity) < 1):
         parser.error("sizes, runs, repeats, broker jobs and thread capacity must be positive; warmups nonnegative")
-    baseline, revision, source_hash = _baseline(args.baseline_ref)
-    candidate_source = (REPO_ROOT / SOURCE_PATH).read_text(encoding="utf-8")
+    baseline, revision = _baseline(args.baseline_ref)
     report = BenchmarkReport(
         scenario="scheduling.broker-queue",
         parameters={
-            "baseline_revision": revision, "baseline_source_sha256": source_hash,
-            "candidate_source_sha256": hashlib.sha256(candidate_source.encode("utf-8")).hexdigest(),
+            "baseline_revision": revision,
             "sizes": sizes, "runs": args.runs, "warmups": args.warmups,
             "selection_repeats": args.selection_repeats, "broker_jobs": args.broker_jobs,
             "thread_capacity": args.thread_capacity, "logical_processors": os.cpu_count(),
