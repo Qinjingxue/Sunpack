@@ -473,6 +473,17 @@ class WatchStateStore:
         with self._state_lock:
             return [WatchStateEntry(**item) for item in self._native.entry_items()]
 
+    def has_entry_status(self, status: str) -> bool:
+        with self._state_lock:
+            return bool(self._native.has_entry_status(status))
+
+    def failed_password_entries(self) -> list[WatchStateEntry]:
+        with self._state_lock:
+            return [
+                WatchStateEntry(**item)
+                for item in self._native.entry_items("failed_password")
+            ]
+
     def _pending_record(self, path: str) -> WatchPendingWork | None:
         raw = self._native.pending(path)
         return WatchPendingWork(**raw) if raw is not None else None

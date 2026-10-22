@@ -1703,9 +1703,8 @@ class WatchScheduler:
             if self._password_retry_at is None or now < self._password_retry_at:
                 return
             self._password_retry_at = None
-        for entry in self.state.entry_items():
-            if (entry.status == "failed_password"
-                    and entry.password_generation < self.state.password_generation
+        for entry in self.state.failed_password_entries():
+            if (entry.password_generation < self.state.password_generation
                     and os.path.exists(entry.path)):
                 self.log.write("retry_password_failure", path=entry.path)
                 self.enqueue(entry.path, force=True, event_type="password_retry", _password_retry_snapshot=entry)
@@ -2188,7 +2187,7 @@ class WatchScheduler:
         return _password_source_signature(self._configured_user_passwords, snapshot.signature)
 
     def _mark_all_password_failures_dirty(self) -> None:
-        if not any(entry.status == "failed_password" for entry in self.state.entry_items()):
+        if not self.state.has_entry_status("failed_password"):
             return
         with self._lock:
             self._password_retry_at = time.monotonic()

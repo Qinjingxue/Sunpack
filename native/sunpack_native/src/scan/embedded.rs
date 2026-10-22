@@ -512,10 +512,6 @@ fn validate_raw_hits(
         next_unchecked: 0,
         valid: BTreeMap::new(),
     };
-    let zip_eocd_hits = raw_hits
-        .iter()
-        .filter(|hit| hit.kind() == "zip_eocd")
-        .collect::<Vec<_>>();
     // ZIP64 records were found in the same full-stream pass. Index each once
     // by its declared physical end; fake locators never trigger reverse scans.
     let mut zip64_records = BTreeMap::new();
@@ -534,8 +530,9 @@ fn validate_raw_hits(
             }
         }
     }
-    let mut candidates = zip_eocd_hits
+    let mut candidates = raw_hits
         .par_iter()
+        .filter(|hit| hit.kind() == "zip_eocd")
         .map_init(DirectoryEvidence::default, |directories, hit| {
             validate_zip_eocd(reader, file_size, hit.offset, &zip64_records, directories)
         })
@@ -918,6 +915,9 @@ fn fixed_header_invalid(pattern: usize, bytes: &[u8]) -> bool {
         0 => bytes
             .get(..30)
             .is_some_and(|header| !zip_local_fixed_plausible(header)),
+        1 => bytes
+            .get(..22)
+            .is_some_and(|header| !zip_eocd_fixed_plausible(header)),
         2 => bytes
             .get(..32)
             .is_some_and(|header| !seven_zip_start_header_valid(header)),
@@ -935,6 +935,24 @@ fn fixed_header_invalid(pattern: usize, bytes: &[u8]) -> bool {
             .is_some_and(|header| crate::formats::lz4::parse_header(header).is_err()),
         _ => false,
     }
+}
+
+fn zip_eocd_fixed_plausible(header: &[u8]) -> bool {
+    if header.len() < 22 || &header[..4] != ZIP_EOCD {
+        return false;
+    }
+    let disk = u16::from_le_bytes([header[4], header[5]]);
+    let cd_disk = u16::from_le_bytes([header[6], header[7]]);
+    if disk != 0 || cd_disk != 0 {
+        return false;
+    }
+    let entries_on_disk = u16::from_le_bytes([header[8], header[9]]);
+    let entries_total = u16::from_le_bytes([header[10], header[11]]);
+    let needs_zip64 = u32::from_le_bytes(header[12..16].try_into().unwrap()) == u32::MAX
+        || u32::from_le_bytes(header[16..20].try_into().unwrap()) == u32::MAX
+        || entries_on_disk == u16::MAX
+        || entries_total == u16::MAX;
+    needs_zip64 || entries_on_disk == entries_total
 }
 
 fn validate_candidate(

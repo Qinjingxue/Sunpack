@@ -1113,6 +1113,7 @@ class _RequestRuntime:
         self._active_task_keys: set[str] = set()
         self._cleanup_tasks: dict[asyncio.Task, tuple[str, ...]] = {}
         self._prompt_gates: dict[int, asyncio.Task] = {}
+        self._consumer_budget: int | None = None
 
     def _report_progress(self, task: Any, event: dict[str, Any]) -> None:
         self.reporter.task_progress(task, event)
@@ -1173,6 +1174,7 @@ class _RequestRuntime:
         request_id = submission.request_id
         roots = list(dict.fromkeys(target.path for target in submission.targets))
         ownership = _RequestResults(submission, self.config)
+        self._consumer_budget = max(1, int(broker.max_pending_jobs or 1))
 
         try:
             if submission.direct:
@@ -1335,35 +1337,52 @@ class _RequestRuntime:
         if tasks:
             self.job_executor.password_scope_context.annotate(tasks)
 
-        # Bound waiting coroutine state by the existing stage queue budget.
-        # Each recursive batch owns its consumers, so a parent never holds a
-        # global admission slot while waiting for its children.
+        # Share one request-level consumer budget across recursive batches. If
+        # recursion consumes the remaining budget, the child batch runs in the
+        # current consumer instead of creating more waiting tasks.
         remaining = iter(enumerate(tasks))
         first_failure = None
 
-        async def consume():
+        async def run_one(index, task):
             nonlocal first_failure
+            try:
+                return bool(await self._execute_job(
+                    task, depth=depth, ownership=ownership,
+                    broker=broker, cancellation=cancellation,
+                ))
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if first_failure is None or index < first_failure[0]:
+                    first_failure = (index, exc)
+                return True
+
+        available = self._consumer_budget
+        workers = min(len(tasks), max(0, available if available is not None else broker.max_pending_jobs))
+        if workers == 0:
             complete = True
-            for index, task in remaining:
-                try:
-                    result = await self._execute_job(
-                        task, depth=depth, ownership=ownership,
-                        broker=broker, cancellation=cancellation,
-                    )
-                    complete = bool(result) and complete
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:
-                    # Match gather's original input-order error reporting while
-                    # allowing independent jobs to finish and release sources.
-                    if first_failure is None or index < first_failure[0]:
-                        first_failure = (index, exc)
+            for index, task in enumerate(tasks):
+                complete = (await run_one(index, task)) and complete
+            if first_failure is not None:
+                raise first_failure[1]
             return complete
 
-        results = await asyncio.gather(
-            *(consume() for _ in range(min(len(tasks), broker.max_pending_jobs))),
-            return_exceptions=True,
-        )
+        self._consumer_budget -= workers
+
+        async def consume():
+            complete = True
+            for index, task in remaining:
+                result = await run_one(index, task)
+                complete = result and complete
+            return complete
+
+        try:
+            results = await asyncio.gather(
+                *(consume() for _ in range(workers)),
+                return_exceptions=True,
+            )
+        finally:
+            self._consumer_budget += workers
         for result in results:
             if isinstance(result, BaseException):
                 raise result
