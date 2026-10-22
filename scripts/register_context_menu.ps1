@@ -337,7 +337,7 @@ $filePromptCommand = New-FileCommandString -Launcher $launcher -TargetToken "%1"
 $fileDirectCommand = New-FileCommandString -Launcher $launcher -TargetToken "%1" -PromptPasswords $false
 
 if ($DryRun) {
-    [pscustomobject]@{
+    $json = [pscustomobject]@{
         menu_text = $resolvedMenuText
         folder_prompt = $folderPromptCommand
         folder_direct = $folderDirectCommand
@@ -355,6 +355,13 @@ if ($DryRun) {
             file = @{ direct = $fileMenuTexts.Direct; prompt = $fileMenuTexts.Prompt }
         }
     } | ConvertTo-Json -Depth 5 -Compress
+    # Windows PowerShell 5.1 may write redirected stdout using a legacy code page.
+    # Emit ASCII-only JSON so localized menu labels survive without replacement.
+    $json = [regex]::Replace($json, '[^\x00-\x7F]', [System.Text.RegularExpressions.MatchEvaluator]{
+        param($match)
+        '\u{0:X4}' -f [int][char]$match.Value
+    })
+    Write-Output $json
     return
 }
 
