@@ -563,6 +563,30 @@ def _vhd_directory(tmp_path_factory) -> Path:
 
 
 @requires_vhd
+def test_full_disk_stale_monitor_snapshot_and_cancelled_probe_recover(tmp_path_factory):
+    """Real full-disk coverage for two state-machine races.
+
+    Worker E2E tests cannot deterministically overlap a stale empty snapshot
+    with a new failure or cancel the owner after it claims a recovered-space
+    permit. A single VHD checks both interleavings and same-handle recovery.
+    """
+    executable = _worker_path().with_name("sunpack_sevenzip_space_gate.exe")
+    assert executable.exists(), f"build sunpack_sevenzip_space_gate: {executable}"
+    with SpaceVhd(
+        _vhd_directory(tmp_path_factory), "V",
+        payload_bytes=8 * _MIB, blocked_free_bytes=64 << 10,
+    ) as disk:
+        disk.fill_until_free_below(64 << 10)
+        completed = subprocess.run(
+            [str(executable), "--vhd-recovery", str(disk.root), str(disk._filler)],
+            capture_output=True, text=True, timeout=20,
+        )
+        assert completed.returncode == 0, completed.stdout + completed.stderr
+        assert "vhd recovery passed" in completed.stdout
+        assert (disk.root / "probe.bin").stat().st_size >= _MIB
+
+
+@requires_vhd
 def test_win17_root_output_directory_on_full_volume(tmp_path_factory):
     """输出目录尚不存在且所在盘已满时，必须出现 space_blocked 而不是直接失败。
 

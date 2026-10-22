@@ -199,7 +199,7 @@ namespace sunpack::sevenzip
     // probe 许可的 RAII 结算句柄：
     //     report_success()           真实成功           → Probing -> Ready
     //     report_space_failure(...)  仍然空间不足        → Probing -> Blocked
-    //     report_inconclusive()      非空间错误/无法判定  → Probing -> Blocked
+    //     report_inconclusive()      非空间错误/无法判定  → 交还当前 probe 许可
     //     析构时未结算                等同 report_inconclusive()
     //
     // 非空间错误（ERROR_ACCESS_DENIED / FILE_EXISTS / PATH_NOT_FOUND / sharing violation）
@@ -234,7 +234,7 @@ namespace sunpack::sevenzip
         ProbeLease(const ProbeLease &) = delete;
         ProbeLease &operator=(const ProbeLease &) = delete;
 
-        // 未结算 → 等同 report_inconclusive()（→ Blocked，绝不 Ready）
+        // 未结算 → 等同 report_inconclusive()（交还许可，绝不 Ready）
         ~ProbeLease() { settle_unfinished(); }
 
         void report_success() noexcept;
@@ -781,7 +781,6 @@ namespace sunpack::sevenzip
                 // 首次成功观测 → 立即设为 baseline 并发放许可（不是先比较再决定）。
                 failed_free_watermark_ = free_bytes_now;
                 watermark_valid_ = true;
-                failed_free_watermark_ = free_bytes_now;
                 issued = true;
             }
             else if (free_bytes_now > failed_free_watermark_)
@@ -867,10 +866,11 @@ namespace sunpack::sevenzip
             {
                 return;
             }
-            phase_ = VolumeSpacePhase::Blocked;
             probe_owner_token_ = 0;
         }
-        wake_waiters(); // 若仍有 affected job，等待者会重新裁决并重选一个 probe
+        // No fresh space failure: the same sample still authorises one real
+        // attempt. Keep Probing so another live request can take the permit.
+        wake_waiters();
     }
 
     inline VolumeSpacePhase VolumeSpaceGate::phase() const noexcept

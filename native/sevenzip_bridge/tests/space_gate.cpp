@@ -1,7 +1,8 @@
-// VolumeSpaceGate 纯逻辑单测（无文件系统、无满盘）。
+// VolumeSpaceGate 逻辑测试；--vhd-recovery 使用调用方提供的隔离满盘。
 
 #include "internal/sevenzip_space_gate.hpp"
 #include "internal/sevenzip_space_monitor.hpp"
+#include "internal/sevenzip_space_retry.hpp"
 #include "internal/sevenzip_volume_registry.hpp"
 
 #include <algorithm>
@@ -9,6 +10,7 @@
 #include <chrono>
 #include <cwctype>
 #include <functional>
+#include <filesystem>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -236,7 +238,7 @@ void g3_no_probe_below_watermark() {
     {
         auto result = wait_bounded(gate);
         check(result.kind == VolumeSpaceGate::WaitResult::Kind::Probe, "G-3: 应拿到 probe 许可");
-        result.lease.report_inconclusive(); // → Blocked，watermark 保持 200 MiB
+        result.lease.report_space_failure(ERROR_DISK_FULL, unresolvable);
     }
     check(gate->failed_free_watermark() == 200 * kMib, "G-3: baseline 必须是 200 MiB");
 
@@ -256,7 +258,7 @@ void g4_improved_watermark_issues_single_probe() {
     {
         auto result = wait_bounded(gate);
         check(result.kind == VolumeSpaceGate::WaitResult::Kind::Probe, "G-4: 需先占住第一次许可");
-        result.lease.report_inconclusive();
+        result.lease.report_space_failure(ERROR_DISK_FULL, unresolvable);
     }
 
     check(!gate->poll(200 * kMib), "G-4: 水位没改善时不得发放许可");
@@ -390,7 +392,7 @@ void g7_no_second_permit_while_probing() {
     {
         auto result = wait_bounded(gate);
         check(result.kind == VolumeSpaceGate::WaitResult::Kind::Probe, "G-7: 拿到许可");
-        result.lease.report_inconclusive();
+        result.lease.report_space_failure(ERROR_DISK_FULL, unresolved_failed_path());
     }
     check(gate->poll(100 * kGiB), "G-7: 许可结算后必须能再次发放");
 }
@@ -486,11 +488,12 @@ void g11_lease_destructor_is_inconclusive() {
         check(result.kind == VolumeSpaceGate::WaitResult::Kind::Probe, "G-11: 必须拿到许可");
         // 什么都不做，直接析构。
     }
-    check(gate->phase() == VolumeSpacePhase::Blocked,
-          "G-11: 未结算的 lease 析构后必须是 Blocked（不是 Ready）");
+    check(gate->phase() == VolumeSpacePhase::Probing,
+          "G-11: 未结算的 lease 析构必须交还许可，不能宣布 Ready");
     check(log->count(VolumeSpaceTransition::Kind::Resumed) == 0,
           "G-11: 未结算的 lease 析构不得发出 space_resumed");
-    check(gate->poll(200 * kMib), "G-11: 许可必须已释放，下一个 poll 能再发放");
+    check(gate->try_wait({}).kind == VolumeSpaceGate::WaitResult::Kind::Probe,
+          "G-11: 下一个请求无需空间再次增加即可领取许可");
 }
 
 // waiter 全部离开 ≠ Ready
@@ -603,8 +606,8 @@ void g16_inconclusive_probe_never_resumes() {
         check(result.kind == VolumeSpaceGate::WaitResult::Kind::Probe, "G-16: 必须拿到许可");
         result.lease.report_inconclusive();
     }
-    check(gate->phase() == VolumeSpacePhase::Blocked,
-          "G-16: 非空间错误不能证明卷可写 → 必须回 Blocked");
+    check(gate->phase() == VolumeSpacePhase::Probing,
+          "G-16: 非空间错误必须交还许可，不能宣布 Ready");
     check(log->count(VolumeSpaceTransition::Kind::Resumed) == 0,
           "G-16: 绝不发 space_resumed");
     check(gate->episode_id() == 1, "G-16: episode_id 不得变化");
@@ -659,7 +662,7 @@ void g18_watermark_comes_only_from_the_monitor() {
     check(resolved->failed_free_watermark() == free_now, "G-18: baseline 必须是该观测值");
     {
         auto result = wait_bounded(resolved);
-        result.lease.report_inconclusive();
+        result.lease.report_space_failure(ERROR_DISK_FULL, unresolved_failed_path());
     }
     check(!resolved->poll(free_now), "G-18: 相同观测值不得再次发放许可");
 
@@ -761,7 +764,7 @@ void g20_only_real_success_resumes() {
     {
         auto result = wait_bounded(gate);
         check(result.kind == VolumeSpaceGate::WaitResult::Kind::Probe, "G-20: 必须拿到许可");
-        result.lease.report_inconclusive();
+        result.lease.report_space_failure(ERROR_DISK_FULL, unresolved_failed_path());
     }
     check(gate->failed_free_watermark() == free_now, "G-20: baseline 已被固定");
 
@@ -779,7 +782,12 @@ void g20_only_real_success_resumes() {
         check(result.kind == VolumeSpaceGate::WaitResult::Kind::Probe, "G-20: 必须拿到许可");
         result.lease.report_inconclusive();
     }
-    check(gate->phase() == VolumeSpacePhase::Blocked, "G-20: inconclusive 必须回 Blocked");
+    check(gate->phase() == VolumeSpacePhase::Probing, "G-20: inconclusive 必须交还许可");
+    {
+        auto next = gate->try_wait({});
+        check(next.kind == VolumeSpaceGate::WaitResult::Kind::Probe, "G-20: 活任务必须能接替许可");
+        next.lease.report_space_failure(ERROR_DISK_FULL, unresolved_failed_path());
+    }
 
     // 组合三：取消最后一个 waiter。
     auto stop = std::make_shared<std::atomic<bool>>(false);
@@ -1138,7 +1146,7 @@ void g27_only_real_transitions_advance_the_discontinuity_generation() {
     {
         auto result = wait_bounded(gate);
         check(result.kind == VolumeSpaceGate::WaitResult::Kind::Probe, "G-27: 拿到许可");
-        result.lease.report_inconclusive(); // Probing -> Blocked
+        result.lease.report_space_failure(ERROR_DISK_FULL, unresolved_failed_path());
     }
     check(log->total() == 0,
           "G-27: Probing→Blocked 不得产生任何事件（更不能推进 generation）");
@@ -1348,6 +1356,24 @@ void g31_monitor_drops_episode_history_after_recovery() {
     check(status_calls->load() >= 2,
           "G-31: ★ 恢复之后必须丢弃 episode 历史（新 episode 的第一拍必须立刻可诊断）");
     check(monitor.sampling(), "G-31: episode 2 必须重新开始采样");
+
+    // Force the stale-empty/new-Blocked race even on runs without a VHD.
+    VolumeSpaceMonitor *racing_ptr = nullptr;
+    bool inject_blocked = true;
+    VolumeSpaceMonitor racing({}, [&] {
+        if (inject_blocked) {
+            inject_blocked = false;
+            std::thread blocked_event([&] { racing_ptr->note_blocked(); });
+            blocked_event.join();
+        }
+        return std::vector<VolumeStatePtr>{};
+    }, {});
+    racing_ptr = &racing;
+    racing.note_blocked();
+    racing.tick(now);
+    check(racing.sampling(), "G-31: 旧的空快照不能覆盖新的 Blocked 事件");
+    racing.tick(now + 100ms);
+    check(!racing.sampling(), "G-31: 下一次空快照仍必须能停止空闲采样");
 }
 
 
@@ -1453,12 +1479,99 @@ void g34_iocp_admission_and_weak_wake_lifetime() {
     gate->wake_waiters(); // expired subscriber is pruned without accessing a retired port
 }
 
+// Existing recovery tests do not force an empty provider snapshot to overlap
+// a new real disk-full event, then abandon the recovered-space permit. One
+// isolated VHD checks both races with actual WriteFile/GetDiskFreeSpaceExW.
+void vhd_recovery(const std::filesystem::path &root, const std::filesystem::path &filler) {
+    using sunpack::sevenzip::AttemptResult;
+    const auto path = (root / L"probe.bin").wstring();
+    struct FileHandle {
+        HANDLE value = INVALID_HANDLE_VALUE;
+        ~FileHandle() { if (value != INVALID_HANDLE_VALUE) CloseHandle(value); }
+    } file{CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+                       CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr)};
+    if (!check(file.value != INVALID_HANDLE_VALUE, "VHD: create output")) return;
+    std::vector<char> payload(kMib, 'x');
+    auto write = [&] {
+        DWORD written = 0;
+        const auto ok = WriteFile(file.value, payload.data(), static_cast<DWORD>(payload.size()),
+                                  &written, nullptr);
+        if (!ok) return GetLastError();
+        return written == payload.size() ? DWORD{0} : DWORD{ERROR_WRITE_FAULT};
+    };
+    const auto error = write();
+    if (!check(sunpack::sevenzip::is_space_exhaustion_error(error), "VHD: real disk-full error")) return;
+
+    VolumeSpaceMonitor *monitor_ptr = nullptr;
+    int resumed = 0;
+    auto gate = std::make_shared<VolumeSpaceGate>("job:vhd-recovery", std::string{},
+        [&](const VolumeSpaceTransition &transition) {
+            if (transition.kind == VolumeSpaceTransition::Kind::Blocked) monitor_ptr->note_blocked();
+            else ++resumed;
+        });
+    gate->register_job("cancelled");
+    gate->register_job("survivor");
+    auto state = sunpack::sevenzip::make_volume_state("job:vhd-recovery", false);
+    state->space_gate = gate;
+    bool stale_empty_snapshot = true;
+    int provider_calls = 0;
+    VolumeSpaceMonitor monitor({1ms, 1ms}, [&] {
+        ++provider_calls;
+        if (stale_empty_snapshot) {
+            stale_empty_snapshot = false;
+            // The empty snapshot predates the new failure on another thread.
+            std::thread failure([&] { gate->report_space_failure(error, path); });
+            failure.join();
+            return std::vector<VolumeStatePtr>{};
+        }
+        return gate->phase() == VolumeSpacePhase::Ready ? std::vector<VolumeStatePtr>{}
+                                                       : std::vector<VolumeStatePtr>{state};
+    }, {});
+    monitor_ptr = &monitor;
+    const auto now = std::chrono::steady_clock::now();
+    monitor.note_blocked();
+    monitor.tick(now);
+    if (!check(monitor.sampling(), "VHD: stale empty snapshot must preserve new blocked event")) return;
+
+    monitor.tick(now + 1s);
+    auto initial = gate->try_wait({});
+    if (!check(initial.kind == VolumeSpaceGate::WaitResult::Kind::Probe, "VHD: baseline probe")) return;
+    const auto retry_error = write();
+    if (!check(sunpack::sevenzip::is_space_exhaustion_error(retry_error), "VHD: retry still full")) return;
+    initial.lease.report_space_failure(retry_error, path);
+    if (!check(DeleteFileW(filler.c_str()) != 0, "VHD: release filler")) return;
+
+    monitor.tick(now + 2s);
+    auto cancelled = gate->try_wait({});
+    if (!check(cancelled.kind == VolumeSpaceGate::WaitResult::Kind::Probe, "VHD: restored space probe")) return;
+    sunpack::sevenzip::settle_space_attempt(cancelled.lease, {AttemptResult::Kind::Terminal, 0}, path);
+    gate->unregister_job("cancelled");
+    check(resumed == 0, "VHD: cancellation cannot declare volume ready");
+    // No additional poll/free-space increase: the survivor must inherit this permit.
+    auto survivor = gate->try_wait({});
+    if (!check(survivor.kind == VolumeSpaceGate::WaitResult::Kind::Probe, "VHD: survivor inherits permit")) return;
+    if (!check(write() == 0, "VHD: same output handle writes after recovery")) return;
+    survivor.lease.report_success();
+    check(resumed == 1 && gate->phase() == VolumeSpacePhase::Ready, "VHD: only real success resumes");
+    gate->unregister_job("survivor");
+    monitor.tick(now + 3s);
+    check(!monitor.sampling(), "VHD: recovery stops sampling");
+    const auto calls = provider_calls;
+    monitor.tick(now + 4s);
+    check(provider_calls == calls, "VHD: no idle polling");
+    std::cout << "vhd recovery passed: disk_full=" << error << " recovered_bytes=" << payload.size() << '\n';
+}
+
 }  // namespace
 
 #endif
 
 int main(int argc, char **argv) {
 #ifdef _WIN32
+    if (argc == 4 && std::string(argv[1]) == "--vhd-recovery") {
+        vhd_recovery(std::filesystem::u8path(argv[2]), std::filesystem::u8path(argv[3]));
+        return g_failures.load() == 0 ? 0 : 1;
+    }
     struct Case {
         const char *name;
         void (*test)();

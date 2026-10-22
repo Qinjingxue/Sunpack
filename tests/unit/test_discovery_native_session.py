@@ -12,8 +12,68 @@ from pathlib import Path
 from sunpack_native import reader_cache_stats
 
 from sunpack.pipeline.coordinator.scan_session import DiscoveryScanSession
-from sunpack.pipeline.coordinator.target_scan import build_native_table_for_targets
+from sunpack.pipeline.coordinator.target_scan import (
+    build_candidates_for_targets,
+    build_native_table_for_targets,
+)
 from tests.helpers.config_factory import make_config
+
+
+def test_independent_file_requests_keep_full_context_and_observe_disguised_volume_changes(tmp_path):
+    """Guard the scope/freshness contract when optimizing repeated file requests.
+
+    Existing session tests reuse a static snapshot. They cannot catch an early
+    name/depth filter or a cross-request cache hiding late/moved/replaced parts.
+    One small real split ZIP covers these faults under concurrent requests.
+    """
+    packed = BytesIO()
+    with zipfile.ZipFile(packed, "w", compression=zipfile.ZIP_STORED) as archive:
+        archive.writestr("payload.txt", b"split payload" * 256)
+    data = packed.getvalue()
+    cut = len(data) // 2
+    first = tmp_path / "family.zip.001.photo"
+    second = tmp_path / "family.zip.002.opaque"
+    first.write_bytes(data[:cut])
+    unrelated = tmp_path / "unrelated" / "deeper" / "different-stem.photo"
+    unrelated.parent.mkdir(parents=True)
+    unrelated.write_bytes(data)
+    config = make_config({"filesystem": {"directory_scan_mode": "*"}})
+
+    def discover(_index=0):
+        session = DiscoveryScanSession(config=config)
+        candidates = build_candidates_for_targets([str(first)], session=session)
+        # Inspect the context actually used for this request. Asking for a new
+        # full snapshot here could hide a prematurely narrowed discovery scan.
+        snapshot = next(iter(session._snapshots.values()))
+        paths = {Path(path) for path, _size, _mtime in snapshot.iter_file_columns()}
+        assert unrelated in paths
+        assert candidates
+        return candidates[0], paths
+
+    missing, paths = discover()
+    assert second not in paths
+    assert missing.archive_input.part_paths() == [str(first)]
+    second.write_bytes(data[cut:])
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        rows = list(pool.map(discover, range(8)))
+    assert all(candidate.archive_input.part_paths() == [str(first), str(second)] for candidate, _ in rows)
+
+    renamed = second.with_name("family.zip.002.changed")
+    second.rename(renamed)
+    moved, paths = discover()
+    assert second not in paths and renamed in paths
+    assert moved.archive_input.part_paths() == [str(first), str(renamed)]
+
+    # Same path and length, restored mtime: a new request must read current heads.
+    metadata = unrelated.stat()
+    unrelated.write_bytes(b"x" * len(data))
+    os.utime(unrelated, ns=(metadata.st_atime_ns, metadata.st_mtime_ns))
+    renamed.unlink()
+    final_session = DiscoveryScanSession(config=config)
+    final = build_candidates_for_targets([str(first)], session=final_session)[0]
+    assert final.archive_input.part_paths() == [str(first)]
+    anchors = next(iter(final_session._snapshots.values())).iter_relation_anchor_rows()
+    assert all(Path(path) != unrelated for path, _size, _anchor in anchors)
 
 
 def test_static_noisy_carrier_extracts_nested_and_cross_chunk_xz_with_one_rayon_worker(tmp_path):

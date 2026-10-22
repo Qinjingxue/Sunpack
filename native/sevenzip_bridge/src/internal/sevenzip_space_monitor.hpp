@@ -57,13 +57,11 @@ namespace sunpack::sevenzip
 
         void tick(std::chrono::steady_clock::time_point now) noexcept
         {
-            // sampling_ 只在"有卷进入 Blocked"（ChangeSink → note_blocked()）时置位，并且
-            // 只在一次拉取返回空（确认当下没有任何 blocked 卷）时清零：从未满盘时每个 tick
-            // 只有一条 relaxed 原子读，恢复之后最多再拉一次就彻底停下。
-            //
-            // 清零条件只能挂在"拉取返回空"上：多卷下 A 恢复时这次拉取返回的是 [B]（非空），
-            // 采样必须继续、B 仍要被 poll。
-            if (!sampling_.load(std::memory_order_relaxed))
+            // Low bit: sampling active. Upper bits: blocked-event generation.
+            // An empty snapshot may stop only the generation it observed; a
+            // concurrent Blocked event must survive that stale snapshot.
+            auto generation = sampling_generation_.load(std::memory_order_relaxed);
+            if ((generation & 1) == 0)
             {
                 return;
             }
@@ -91,7 +89,8 @@ namespace sunpack::sevenzip
                     last_status_at_.clear();
                     next_poll_at_ = std::chrono::steady_clock::time_point{};
                 }
-                sampling_.store(false, std::memory_order_relaxed);
+                sampling_generation_.compare_exchange_strong(
+                    generation, generation & ~std::uint64_t{1}, std::memory_order_relaxed);
                 return;
             }
 
@@ -133,10 +132,18 @@ namespace sunpack::sevenzip
 
         // 采样是否处于"活跃"状态：note_blocked() 置位，一次拉取返回空则清零。
         // 用途只有 tick() 的常态早退与为 parked controller 提供异常路径 deadline。
-        bool sampling() const noexcept { return sampling_.load(std::memory_order_relaxed); }
+        bool sampling() const noexcept
+        {
+            return (sampling_generation_.load(std::memory_order_relaxed) & 1) != 0;
+        }
 
         // 由 ChangeSink 在收到 space_blocked transition 时调用（开始采样的唯一驱动点）。
-        void note_blocked() noexcept { sampling_.store(true, std::memory_order_relaxed); }
+        void note_blocked() noexcept
+        {
+            auto generation = sampling_generation_.load(std::memory_order_relaxed);
+            while (!sampling_generation_.compare_exchange_weak(
+                generation, (generation + 2) | std::uint64_t{1}, std::memory_order_relaxed)) {}
+        }
 
     private:
         void maybe_emit_status(const VolumeStatePtr &state,
@@ -175,7 +182,7 @@ namespace sunpack::sevenzip
         BlockedProvider provider_;
         StatusSink status_;
         mutable std::mutex mutex_; // 只保护 next_poll_at_ / 诊断节流表
-        std::atomic<bool> sampling_{false};
+        std::atomic<std::uint64_t> sampling_generation_{0};
         std::chrono::steady_clock::time_point next_poll_at_{};
         std::unordered_map<std::string, std::chrono::steady_clock::time_point> last_status_at_;
     };
