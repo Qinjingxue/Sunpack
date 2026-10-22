@@ -333,7 +333,6 @@ void Application::acknowledge_save(const Json& ack) {
 void Application::apply_pending() {
     Json patch;
     { std::lock_guard<std::mutex> lock(mutex_); patch=std::move(pending_); pending_=Json::object(); notified_=false; }
-    auto transition=patch.value("viewTransition",Json::object()); patch.erase("viewTransition");
     auto reset_scroll=patch.value("resetScroll",Json::array()); patch.erase("resetScroll");
     auto task_delta_patch=patch.value("taskDelta",Json()); patch.erase("taskDelta");
     auto password_delta_patch=patch.value("passwordDelta",Json()); patch.erase("passwordDelta");
@@ -402,11 +401,6 @@ void Application::apply_pending() {
     // must not rewrite recordSaving/pendingFields and rebind hidden editors.
     if(!ack.is_null()) start_save();
     if(closing_ && active_save_.is_null() && saves_.empty()) PostMessageW(hwnd_,WM_CLOSE,0,0);
-    if(!transition.empty() && (transition["id"]!="passwordBody" ||
-       (!password_snapshot.is_null() && password_snapshot["scope"]==page_value(page_,"passwordScope")))) {
-        ui_window_relayout(window_);
-        motion::enter(window_,transition.at("id").get<std::string>().c_str(),transition.value("x",0.0f),transition.value("y",0.0f));
-    }
     if(patch.contains("language")) {
         date_popup_.reset();
         auto language=patch["language"].get<std::string>();
@@ -434,19 +428,19 @@ void Application::navigate(const std::string& tab) {
     auto sidebar=[](const std::string& section)->const char* {
         return section=="config"?"configSidebar":section=="tasks" || section=="passwords"?"directoryPane":nullptr;
     };
+    const auto* previous_sidebar=sidebar(previous);
+    const auto* next_sidebar=sidebar(tab);
+    const bool sidebar_changed=previous_sidebar!=next_sidebar;
     motion::finish(window_,("page-"+previous).c_str());
-    if(auto* id=sidebar(previous)) motion::finish(window_,id);
-    // v-show retains these subviews. Stop their entrances before hiding them,
-    // so returning immediately cannot stack a stale child fade on a new page.
-    if(previous=="config") motion::finish(window_,"configBlocks");
-    else if(previous=="tasks") motion::finish(window_,"taskBody");
-    else if(previous=="passwords") motion::finish(window_,"passwordBody");
+    // Tasks and passwords share this retained directory pane. Preserve its
+    // current position and clock unless the lower content type changes.
+    if(sidebar_changed && previous_sidebar) motion::finish(window_,previous_sidebar);
     set_text(page_,"tab",tab);
     set_text(page_,"actionError","");
     // Tab targets retain fixed sidebar geometry; reactive tab visibility already
     // schedules layout. Avoid forcing an extra full-tree layout on every switch.
     motion::enter(window_,("page-"+tab).c_str());
-    if(auto* id=sidebar(tab)) motion::enter(window_,id);
+    if(sidebar_changed && next_sidebar) motion::enter(window_,next_sidebar);
     motion::select(window_,"navIndicator",tab=="tasks"?"tabTasks":tab=="config"?"tabConfig":tab=="roots"?"tabRoots":"tabPasswords");
 }
 void Application::sync_toggles() {
@@ -598,14 +592,13 @@ void Application::handle_command(Json command) {
     auto p=command.value("payload",Json::object());
     if(op=="navigate") { navigate(p.value("tab",std::string())); return; }
     if(op=="syncTags") { sync_tags(p.at("id").get<std::string>()); return; }
-    if(op=="scrollTop" || op=="animateView") {
+    if(op=="scrollTop") {
         if(p.contains("category") && page_value(page_,"configCategory")==p["category"]) return;
         if(p.value("id",std::string())=="configBlocks") date_popup_.reset();
         const auto id=p.value("id",std::string());
         if(id=="configBlocks" && p.contains("category")) {
-            // Commit category, viewport and entrance in the dispatch transaction.
-            // Publishing from the click handler paints the new page once at
-            // full opacity before this posted command can start its entrance.
+            // Commit category and viewport together. Filtering updates the
+            // contents directly, including while a main-page move is active.
             ui_page_set_json(page_,"tagInputs","{}");
             set_text(page_,"configCategory",p.at("category").get<std::string>());
         }
@@ -614,11 +607,6 @@ void Application::handle_command(Json command) {
             auto widget=ui_widget_find_by_id(ui_page_root(page_),scroll);
             if(widget) { ui_debug_scroll_set(widget,0); ui_widget_destroy(widget); }
         }
-        if(op=="scrollTop") return;
-    }
-    if(op=="animateView") {
-        auto id=p.value("id",std::string());
-        if(id=="configBlocks") { VisualBatch visual(window_); ui_window_relayout(window_); motion::enter(window_,id.c_str(),0,12); }
         return;
     }
     if(op=="clearRootError") { save_error("@root:"+p.at("id").get<std::string>(),""); return; }
@@ -985,18 +973,14 @@ void Application::work() {
                         if(view.task_query!=query || view.task_root!=root || view.task_status!=status) {
                             if(!edit_feedback.contains("resetScroll")) edit_feedback["resetScroll"]=Json::array();
                             edit_feedback["resetScroll"].push_back("taskListScroll");
-                            bool switch_root=view.task_root!=root;
                             view.task_query=std::move(query); view.task_root=std::move(root);
                             view.task_status=std::move(status);
                             tasks_changed=task_filter_requested=true;
-                            if(switch_root) edit_feedback["viewTransition"]={{"id","taskBody"},{"y",12}};
                         }
                     } else if(op=="filterPasswords") {
                         password_delta=Json(); // Filter changes require the whole result set.
                         if(!edit_feedback.contains("resetScroll")) edit_feedback["resetScroll"]=Json::array();
                         edit_feedback["resetScroll"].push_back("passwordListScroll");
-                        auto scope=p.value("scope",std::string("@all"));
-                        if(view.password_scope!=scope) edit_feedback["viewTransition"]={{"id","passwordBody"},{"x",scope=="@history"?12:-12}};
                         view.password_query=p.value("query",std::string()); view.password_scope=p.value("scope",std::string("@all"));
                         passwords_changed=true;
                     } else if(op=="commit") {

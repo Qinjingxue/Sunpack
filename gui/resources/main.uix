@@ -88,7 +88,7 @@ export default {
       this.requests=requests.concat([{op:op,payload:payload||{}}]); this.dispatch=true;
     },
     go(tab) { this.send('navigate',{tab:tab}); },
-    selectCategory(category) { this.send('animateView',{id:'configBlocks',category:category}); },
+    selectCategory(category) { this.send('scrollTop',{id:'configBlocks',category:category}); },
     searchDirectory(value) { this.directoryQuery=value; this.send('scrollTop',{id:'directoryItems'}); },
     searchConfig(value) { this.configQuery=value; this.send('scrollTop',{id:'configBlocks'}); },
     searchTasks(value) { this.taskQuery=value; this.filterTasks(); },

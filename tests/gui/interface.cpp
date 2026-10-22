@@ -596,48 +596,62 @@ void page_motion(Application& app) {
     BOOL animations=TRUE; SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION,0,&animations,0);
     {
         motion::VisualBatch visual(app.window());
-        // Seed an intermediate frame without depending on machine speed.
-        // A second content update must keep its current position and clock.
-        body->opacity=0.5f; body->animationY=6;
-        window->AnimateProperty(body,ui::AnimProperty::Opacity,0.5f,1,83,ui::EasingFunction::Linear);
-        window->AnimateProperty(body,ui::AnimProperty::TranslateY,6,0,200,ui::EasingFunction::EaseOutCubic);
-        motion::enter(app.window(),"taskBody");
-        if(animations) assert(body->opacity==0.5f && body->animationY==6);
-        else assert(body->opacity==1 && body->animationY==0);
-        // A late async subview update joins its page, never a second layer.
         motion::enter(app.window(),"page-tasks");
-        motion::enter(app.window(),"taskBody");
-        assert(body->opacity==1 && body->animationX==0 && body->animationY==0);
-        motion::finish(app.window(),"page-tasks");
-        motion::enter(app.window(),"taskBody");
+        assert(page->opacity==1 && page->animationX==0);
+        if(animations) {
+            assert(page->animationY>0 && page->animationY<=8);
+            // Seed an intermediate frame without a machine-speed assumption.
+            // A repeated entrance must keep its position and finite clock.
+            window->CancelPropertyAnimation(page,ui::AnimProperty::TranslateY);
+            page->animationY=3;
+            window->AnimateProperty(page,ui::AnimProperty::TranslateY,3,0,260,ui::EasingFunction::EaseOutCubic);
+            motion::enter(app.window(),"page-tasks");
+            assert(page->animationY==3 && page->opacity==1);
+        } else assert(page->animationY==0);
     }
-    // Observe the real presentation frames: a moving page must bring its
-    // changing sidebar with it. The fixed navigation stays in place.
+    settle_motion(app);
+    // Observe actual frames, not just final values: every page stays opaque,
+    // subview data never moves, and the shared directory pane stays put.
     struct PairedEntrances {
-        ui::UiWindowImpl* window; bool mismatch=false;
+        ui::UiWindowImpl* window; bool shared=true,mismatch=false; unsigned frames=0;
         explicit PairedEntrances(ui::UiWindowImpl* w):window(w) {
             ui_trace_set_sink([](const UiTraceEvent* event,void* context) {
                 if(std::strcmp(event->name,"property_animation_frame")) return;
                 auto& self=*static_cast<PairedEntrances*>(context);
-                for(const char* tab:{"tasks","config","passwords"}) {
-                    auto* root=self.window->Root().get();
+                ++self.frames;
+                auto* root=self.window->Root().get();
+                for(const char* tab:{"tasks","config","roots","passwords"}) {
                     auto* page=root->FindById(std::string("page-")+tab);
-                    if(!page || !page->visible || (page->opacity>=0.95f && page->animationY<=1)) continue;
-                    auto* sidebar=root->FindById(!std::strcmp(tab,"config")?"configSidebar":"directoryPane");
-                    if(!sidebar || !sidebar->visible || (sidebar->opacity==1 && sidebar->animationY==0)) self.mismatch=true;
+                    if(page && page->visible && (page->opacity!=1 || page->animationX!=0)) self.mismatch=true;
                 }
+                for(const char* id:{"taskBody","configBlocks","passwordBody"}) {
+                    auto* body=root->FindById(id);
+                    if(body && (body->opacity!=1 || body->animationX!=0 || body->animationY!=0)) self.mismatch=true;
+                }
+                for(const char* id:{"configSidebar","directoryPane"}) {
+                    auto* sidebar=root->FindById(id);
+                    if(sidebar && sidebar->opacity!=1) self.mismatch=true;
+                }
+                auto* directory=root->FindById("directoryPane");
+                if(self.shared && directory->animationY!=0) self.mismatch=true;
+                auto* config=root->FindById("page-config"),*sidebar=root->FindById("configSidebar");
+                if(config->visible && config->animationY>1 && sidebar->animationY==0) self.mismatch=true;
             },this);
         }
         ~PairedEntrances() { ui_trace_set_sink(nullptr,nullptr); }
     } paired(window);
     const auto navigation=rect(app,"navItems"),monitor=rect(app,"monitorControls");
-    // Leaving a retained page clears its child and sidebar entrance. Exercise
-    // both lower panes and rapid reversal in the same navigation transaction.
+    click(app,"tabPasswords"); pump([&]{return state(app.page(),"tab")=="passwords";});
+    settle_motion(app);
+    assert(!paired.mismatch);
+    paired.shared=false;
+    // Exercise both lower content types and rapid reversal in the same fixture.
     click(app,"tabConfig"); click(app,"tabPasswords"); click(app,"tabTasks");
     pump([&]{return state(app.page(),"tab")=="tasks" && state(app.page(),"requests").empty() && state(app.page(),"dispatch")==false;},"Subview motion cancellation");
     assert(body->opacity==1 && body->animationY==0);
     settle_motion(app);
     assert(!paired.mismatch);
+    if(animations) assert(paired.frames>0);
     for(const char* id:{"configSidebar","directoryPane"}) {
         auto* sidebar=window->Root()->FindById(id); assert(sidebar);
         assert(sidebar->opacity==1 && sidebar->animationY==0);
@@ -650,28 +664,22 @@ void config_categories(Application& app) {
     search_config(app,L"");
     auto categories=state(app.page(),"categories"); assert(categories.size()>2);
     const std::vector<std::string> choices={categories.front()["id"],categories.back()["id"],"",categories[1]["id"],""};
-    BOOL animations=TRUE; SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION,0,&animations,0);
     for(const auto& category:choices) {
         settle_motion(app);
         struct Trace {
-            Application& app; std::string before; bool motion=false,flash=false;
-            Trace(Application& a):app(a),before(state(a.page(),"configCategory")) {
+            ui::Widget* blocks; bool moved=false;
+            Trace(Application& a):blocks(ui::GetContext().GetWindow(a.window())->Root()->FindById("configBlocks")) {
                 ui_trace_set_sink([](const UiTraceEvent* event,void* data) {
                     auto& t=*static_cast<Trace*>(data);
-                    if(!std::strcmp(event->name,"motion_started")) t.motion=true;
-                    if(!std::strcmp(event->name,"frame_job_submitted") && !t.motion && state(t.app.page(),"configCategory")!=t.before) t.flash=true;
+                    if(!std::strcmp(event->name,"frame_job_submitted") &&
+                       (t.blocks->opacity!=1 || t.blocks->animationX!=0 || t.blocks->animationY!=0)) t.moved=true;
                 },this);
             }
             ~Trace() { ui_trace_set_sink(nullptr,nullptr); }
         } trace(app);
         click(app,category.empty()?"category-all":("category-"+category).c_str());
         pump([&]{return state(app.page(),"configCategory")==category && state(app.page(),"requests").empty();},"Configuration category transaction");
-        if(animations && (!trace.motion || trace.flash)) {
-            std::cerr<<"Category motion: from="<<trace.before<<" to="<<category<<" started="<<trace.motion<<" flash="<<trace.flash<<'\n';
-            auto* target=ui::GetContext().GetWindow(app.window())->Root()->FindById("configBlocks");
-            for(auto* p=target;p;p=p->Parent()) std::cerr<<"  "<<p->id<<" opacity="<<p->opacity<<" x="<<p->animationX<<" y="<<p->animationY<<'\n';
-            assert(false);
-        }
+        assert(!trace.moved && trace.blocks->opacity==1 && trace.blocks->animationX==0 && trace.blocks->animationY==0);
         auto* scroll=dynamic_cast<ui::ScrollViewWidget*>(ui::GetContext().GetWindow(app.window())->Root()->FindById("configListScroll"));
         assert(scroll && scroll->ScrollY()==0);
         auto blocks=state(app.page(),"matchingBlocks"); assert(!blocks.empty());

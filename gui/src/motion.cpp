@@ -37,15 +37,12 @@ void reset(ui::UiWindowImpl* window, ui::Widget* widget) {
         window->CancelPropertyAnimation(widget, property);
     widget->opacity = 1; widget->animationX = widget->animationY = 0;
 }
-bool entering(const ui::Widget* widget) {
-    return widget->opacity != 1 || widget->animationX != 0 || widget->animationY != 0;
-}
 }
 void finish(UiWindow handle, const char* id) {
     auto* window = ui::GetContext().GetWindow(handle);
     if(auto* widget = find(window, id)) reset(window, widget);
 }
-void enter(UiWindow handle, const char* id, float x, float y) {
+void enter(UiWindow handle, const char* id) {
     auto* window = ui::GetContext().GetWindow(handle);
     auto* widget = find(window, id);
     if(!widget) return;
@@ -53,21 +50,14 @@ void enter(UiWindow handle, const char* id, float x, float y) {
         reset(window, widget); return;
     }
     if(!enabled()) { reset(window, widget); window->Invalidate(); return; }
-    // A page owns its entrance: multiplying a child's fade/translation by the
-    // page's makes freshly updated content dimmer and doubles its travel.
-    for(auto* parent = widget->Parent(); parent; parent = parent->Parent()) if(entering(parent)) {
-        reset(window, widget); return;
-    }
-    // Replacement data joins the current entrance without resetting opacity,
-    // position or the finite clock on every rapid category/scope selection.
-    if(entering(widget)) return;
-    // Page-refresh motion, tuned for this short travel: reveal text before the
-    // movement ends. Cubic ease-out has finite initial speed (FluentEnter's
-    // zero-x control points have an abrupt initial slope). Paint only; no layout.
-    widget->opacity = 0; widget->animationX = x; widget->animationY = y;
-    window->AnimateProperty(widget, ui::AnimProperty::Opacity, 0, 1, 83, ui::EasingFunction::Linear);
-    if(x) window->AnimateProperty(widget, ui::AnimProperty::TranslateX, x, 0, 200, ui::EasingFunction::EaseOutCubic);
-    if(y) window->AnimateProperty(widget, ui::AnimProperty::TranslateY, y, 0, 200, ui::EasingFunction::EaseOutCubic);
+    // Repeated requests join the existing finite clock. Only navigation calls
+    // this adapter; filtering and snapshot updates never start an entrance.
+    if(widget->animationY!=0) return;
+    reset(window, widget);
+    // Keep text and surfaces opaque throughout. This short paint-only move
+    // needs neither an opacity layer nor an outgoing-page snapshot or layout.
+    widget->animationY=6;
+    window->AnimateProperty(widget,ui::AnimProperty::TranslateY,6,0,260,ui::EasingFunction::EaseOutCubic);
 }
 void select(UiWindow handle, const char* id, const char* targetId) {
     auto* window = ui::GetContext().GetWindow(handle);
