@@ -547,7 +547,10 @@ def start_watch(
     watcher.start = lambda: loop.run_until_complete(async_start())
     watcher.stop = lambda: loop.run_until_complete(async_stop())
     watcher._plan7_timer = timer
-    watcher.start()
+    # Arrival helpers inject filesystem events explicitly, including controlled
+    # rename/departure races. A live observer would inject a second event stream
+    # outside that ordering. Cases that depend on observed arrivals explicitly
+    # call watcher.start(); keep the initial snapshot for every harness.
     with timer.measure("watch_initial_scan"):
         loop.run_until_complete(watcher.scan_initial_roots([str(watch_root)]))
     return WatchHarness(

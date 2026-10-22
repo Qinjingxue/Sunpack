@@ -53,6 +53,9 @@ def test_plan7_four_lz4_wrapped_encrypted_rar_volumes_extract_automatically(
         cleanup_mode=cleanup_mode, flatten_single_directory=cleanup_mode == "delete",
     )
     try:
+        # Inner volumes are promoted by the pipeline, not by the arrival helper;
+        # this scenario explicitly needs the real filesystem observer.
+        harness.watcher.start()
         arrive_interleaved(harness, list(reversed(inputs)), write_mode=write_mode)
         drive_watch_until(
             harness.watcher,
