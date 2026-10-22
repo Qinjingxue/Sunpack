@@ -1,0 +1,41 @@
+name: "🗜️ Archive Handling (English)"
+description: "Report detection, volumes, recursion, extraction, or cleanup issues"
+title: "[Archive] "
+labels: ["bug"]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: "SunPack version"
+      placeholder: "e.g. v1.2.2"
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: "Describe the problem"
+      description: "What happened, and what should SunPack have done?"
+    validations:
+      required: true
+
+  - type: textarea
+    id: files
+    attributes:
+      label: "Related files (optional)"
+      description: "Format, names, sizes, volume parts or nesting. You do not need to upload the original files."
+      placeholder: |
+        sample.part1.rar (100 MiB)
+        sample.part2.rar (100 MiB)
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: "Logs or samples (optional)"
+      description: |
+        Default log locations for installed SunPack:
+        Processing events: %ProgramData%\SunPack\.sunpack_watch\events.jsonl
+        Extraction failure reports: %ProgramData%\SunPack\.sunpack_watch\failures\failed-*.txt
+
+        If you changed watch.state_dir, look in that custom directory.
+        Paste logs or drag and drop screenshots or publicly shareable samples. Remove passwords and private information first.

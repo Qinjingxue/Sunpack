@@ -1,0 +1,40 @@
+name: "🐛 Bug Report (English)"
+description: "Report GUI, Watch, installation, or other software bugs"
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: input
+    id: environment
+    attributes:
+      label: "Version and Windows environment"
+      placeholder: "e.g. SunPack v1.2.2 / Windows 11 x64"
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: "What happened?"
+      description: "Describe the actual behavior and what you expected instead."
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: "Steps to reproduce (optional)"
+      description: "What did you do before the problem occurred?"
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: "Logs and screenshots (optional)"
+      description: |
+        Default log locations for installed SunPack:
+        Watch: %ProgramData%\SunPack\.sunpack_watch\events.jsonl
+        Extraction failures: %ProgramData%\SunPack\.sunpack_watch\failures\failed-*.txt
+        Windows notifications: %ProgramData%\SunPack\.sunpack_watch\toast_host_events.jsonl
+        Background runtime: %ProgramData%\SunPack\runtime-*.state.events.jsonl
+
+        If you changed watch.state_dir, the first three are in that custom directory.
+        Paste error messages or drag and drop logs/screenshots here. Remove passwords and private information first.
