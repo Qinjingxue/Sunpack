@@ -25,7 +25,7 @@ export default {
     taskQuery:'',taskRoot:'',taskStatus:0,
     statusNames:['','taskProcessing','taskWaiting','taskSucceeded','taskFailed'],
     rootRows:[],rootDrafts:{},rootNew:[],rootCell:'',rootPart:'',rootNext:0,rootQuery:'',cellPointer:null,
-    configCategory:'',configQuery:'',drafts:{},toggleDrafts:{},saving:false,saveErrors:{},pendingFields:[],recordSaving:{passwords:false,roots:false},
+    configCategory:'',configQuery:'',drafts:{},rangeUnitDrafts:{},toggleDrafts:{},saving:false,saveErrors:{},pendingFields:[],recordSaving:{passwords:false,roots:false},
     passwordRoot:'',passwordHistory:false,passwordHistoryTarget:false,passwordQuery:'',passwordDrafts:{},passwordNew:[],passwordCell:'',passwordNext:0,
     tagInputs:{}
   }; },
@@ -384,7 +384,18 @@ export default {
     },
     commitField(f) {
       let draft=this.drafts[f.id]||this.toggleDrafts[f.id];
-      if(draft) this.send('saveField',{id:f.id,draft:Object.assign({},draft)});
+      if(!draft) return;
+      if(f.editor==='size_range' && draft.range) {
+        // Empty-bound units are presentation-only. A blur must not write an
+        // unchanged filter merely because its empty-side unit was selected.
+        let baseline=this.rangeField(f).range, current=draft.range;
+        if(baseline && !!current.enabled===!!baseline.enabled &&
+           ['lower','upper'].every(side=>{
+             let value=String(current[side]).trim(), previous=String(baseline[side]).trim();
+             return value===previous && (!value || Number(current[side+'Unit'])===Number(baseline[side+'Unit']));
+           })) return;
+      }
+      this.send('saveField',{id:f.id,draft:Object.assign({},draft)});
     },
     isRange(f) { return f.editor==='size_range'||f.editor==='datetime_range'; },
     rangeField(f) {
@@ -392,16 +403,36 @@ export default {
       if(!index) { index=new Map(); for(let field of fields) if(this.isRange(field)) index.set(field.id,field); rangeIndexes.set(fields,index); }
       return index.get(f.id)||f;
     },
-    rangeValue(f) { return (this.drafts[f.id]&&this.drafts[f.id].range)||this.rangeField(f).range||{enabled:false,lower:'',upper:'',lowerUnit:0,upperUnit:0}; },
+    rangeValue(f) {
+      let range=(this.drafts[f.id]&&this.drafts[f.id].range)||this.rangeField(f).range||{enabled:false,lower:'',upper:'',lowerUnit:0,upperUnit:0};
+      let units=f.editor==='size_range'&&this.rangeUnitDrafts[f.id];
+      if(!units) return range;
+      // Saves store only bytes, so a successful save/reload reconstitutes empty
+      // bounds with B. Retain the user's unit choice in the GUI until exit.
+      let lowerEmpty=String(range.lower).trim()==='', upperEmpty=String(range.upper).trim()==='';
+      if(!lowerEmpty && !upperEmpty) return range;
+      return Object.assign({},range,{
+        lowerUnit:lowerEmpty?units.lowerUnit:range.lowerUnit,
+        upperUnit:upperEmpty?units.upperUnit:range.upperUnit
+      });
+    },
     changeRange(f,key,value,commit) {
       f=this.rangeField(f);
       let range=Object.assign({},this.rangeValue(f),{[key]:value});
+      if(f.editor==='size_range') {
+        this.rangeUnitDrafts=Object.assign({},this.rangeUnitDrafts,{
+          [f.id]:{lowerUnit:range.lowerUnit,upperUnit:range.upperUnit}
+        });
+      }
       let text=JSON.stringify(range);
       this.changeField(f,text);
       // Preserve incomplete/invalid input and selected units until save succeeds.
       let d=this.drafts[f.id]||{original:f.original,text:text,boolean:f.boolean,baselineText:f.text,baselineBoolean:f.boolean};
       this.drafts=Object.assign({},this.drafts,{[f.id]:Object.assign({},d,{range:range})});
-      if(commit) this.commitField(f);
+      // Selecting a unit before typing a number changes only local editing state.
+      let emptyUnit=(key==='lowerUnit' && !String(range.lower).trim()) ||
+                    (key==='upperUnit' && !String(range.upper).trim());
+      if(commit && !emptyUnit) this.commitField(f);
     },
     pickedRange(p) {
       let f=this.fields.find(f=>f.id===p.id); if(!f) return;
