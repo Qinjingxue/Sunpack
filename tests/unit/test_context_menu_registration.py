@@ -33,6 +33,20 @@ def test_context_menu_commands_are_safe_for_drive_roots_and_keep_password_flag()
     )
     commands = json.loads(completed.stdout.strip().splitlines()[-1])
     assert commands["menu_text"] == "sunpack"
+    assert commands["menu_labels"] == {
+        "folder": {
+            "direct": "Extract files in this folder",
+            "prompt": "Enter password to extract files in this folder",
+        },
+        "background": {
+            "direct": "Extract files in this folder",
+            "prompt": "Enter password to extract files in this folder",
+        },
+        "file": {
+            "direct": "Extract this file",
+            "prompt": "Enter password to extract this file",
+        },
+    }
 
     for key in ("folder_prompt", "background_prompt"):
         expanded = commands[key].replace("%1", "D:\\").replace("%V", "D:\\")
