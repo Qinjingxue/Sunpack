@@ -214,7 +214,7 @@ G:\Incoming | | true
 sunpack.exe watch add D:\Downloads --deep-detect --start
 ```
 
-目录和目录背景右键菜单只保留“直接解压”“交互输入密码解压”“监控此目录”“取消监控此目录”四项，这些入口不附加 `--deep-detect`。文件对象的两个解压入口默认启用 `--deep-detect`。重新运行 `scripts/register_context_menu.ps1` 会重建菜单并移除过时入口。
+目录对象的解压菜单为“解压该目录下文件”“输入密码解压该目录下文件”；目录空白处的解压菜单为“解压目录下文件”“输入密码解压目录下文件”。两种目录菜单还提供“监控此目录”“取消监控此目录”，这些入口不附加 `--deep-detect`。文件对象的两个解压入口默认启用 `--deep-detect`。重新运行 `scripts/register_context_menu.ps1` 会重建菜单并移除过时入口。
 
 ## passwords
 
@@ -304,11 +304,11 @@ python sunpack.py version
 
 发行包内的注册脚本使用脚本父目录中的 `sunpack.exe`。从源码树运行时，脚本会识别唯一的 `dist/sunpack-*/sunpack.exe`；存在多个构建产物时使用 `-AppPath` 明确指定。找不到打包程序时使用 `python sunpack.py`。
 
-文件夹和目录空白处菜单提供解压、监控和取消监控动作；任意文件菜单提供直接解压和交互输入密码解压，分别相当于：
+文件夹对象菜单提供“解压该目录下文件”“输入密码解压该目录下文件”，目录空白处菜单提供“解压目录下文件”“输入密码解压目录下文件”；两者还提供监控和取消监控动作。任意文件的菜单提供“解压该文件”“输入密码解压该文件”，对应命令分别相当于：
 
 ```text
-extract "%1" --pause
-extract "%1" --ask-pw --pause
+extract "%1" --deep-detect --pause
+extract "%1" --ask-pw --deep-detect --pause
 ```
 
 输出默认落在归档旁边。
