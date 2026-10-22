@@ -7,6 +7,34 @@ from ctypes import wintypes
 from pathlib import Path
 
 
+def test_context_menu_dry_run_preserves_unicode_with_ascii_json():
+    repo = Path(__file__).resolve().parents[2]
+    script = repo / "scripts" / "register_context_menu.ps1"
+    menu_text = "中文菜单"
+
+    completed = subprocess.run(
+        [
+            "powershell",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(script),
+            "-AppPath",
+            os.environ.get("COMSPEC", r"C:\Windows\System32\cmd.exe"),
+            "-MenuText",
+            menu_text,
+            "-DryRun",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8-sig",
+    )
+    assert completed.stdout.isascii()
+    assert json.loads(completed.stdout.strip().splitlines()[-1])["menu_text"] == menu_text
+
+
 def test_context_menu_commands_are_safe_for_drive_roots_and_keep_password_flag():
     repo = Path(__file__).resolve().parents[2]
     script = repo / "scripts" / "register_context_menu.ps1"
