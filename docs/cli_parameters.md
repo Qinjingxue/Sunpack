@@ -214,7 +214,7 @@ Adding a new root without `--deep-detect` leaves deep mode disabled. Re-adding a
 sunpack.exe watch add D:\Downloads --deep-detect --start
 ```
 
-The directory and directory-background context menus contain four entries: extract directly, extract with a password prompt, watch this folder, and stop watching this folder. These entries do not add `--deep-detect`. The two file extraction entries enable `--deep-detect` by default. Re-run `scripts/register_context_menu.ps1` to rebuild the menus and remove obsolete entries.
+The directory and directory-background context menus contain four entries: "Extract files in this folder", "Enter password to extract files in this folder", "Watch this folder", and "Stop watching this folder". These entries do not add `--deep-detect`. The two file extraction entries enable `--deep-detect` by default. Re-run `scripts/register_context_menu.ps1` to rebuild the menus and remove obsolete entries.
 
 ## passwords
 
@@ -304,11 +304,11 @@ Machine-wide context menu scripts (they require an elevated shell):
 
 The registration script inside the distribution package uses the `sunpack.exe` in its own parent directory. When run from the source tree, the script detects the single unique `dist/sunpack-*/sunpack.exe`; when several build outputs exist, specify one explicitly with `-AppPath`. When no packaged program is found, `python sunpack.py` is used.
 
-The folder and folder-background menus offer extract, monitor, and unmonitor actions; the menu for any file offers direct extraction and interactive-password extraction, equivalent to:
+The folder and folder-background menus offer "Extract files in this folder" and "Enter password to extract files in this folder", plus watch and unwatch actions. The menu for any file offers "Extract this file" and "Enter password to extract this file", equivalent to:
 
 ```text
-extract "%1" --pause
-extract "%1" --ask-pw --pause
+extract "%1" --deep-detect --pause
+extract "%1" --ask-pw --deep-detect --pause
 ```
 
 Output lands next to the archive by default.
