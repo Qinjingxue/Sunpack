@@ -179,6 +179,38 @@ def test_interactive_row_accounts_for_wide_status_and_archive_characters(tmp_pat
     assert plain_row.endswith("…")
 
 
+@pytest.mark.parametrize("language,hint", [
+    ("zh", "释放空间后自动继续"),
+    ("en", "Free space to resume automatically"),
+])
+def test_disk_full_guidance_in_interactive_and_streamed_cli(tmp_path, monkeypatch, language, hint):
+    task = _task(tmp_path / "sample.zip")
+    blocked = {
+        "type": "progress", "event": "space_blocked",
+        "volume_key": "C:", "episode_id": 1, "job_id": "job-1",
+        "free_bytes": 0,
+    }
+
+    terminal = io.StringIO()
+    terminal.terminal_columns = 120
+    monkeypatch.setattr(reporting, "_terminal_supports_updates", lambda _stream: True)
+    interactive = RunReporter(language, stdout=terminal)
+    interactive.tasks_discovered(1, [task])
+    interactive.task_progress(task, blocked)
+    assert hint in terminal.getvalue()
+    assert reporting._display_width(
+        re.sub(r"\033\[[0-9;]*m", "", interactive._format_task_row(interactive._task_rows[id(task)]))
+    ) < terminal.terminal_columns
+
+    streamed = io.StringIO()
+    monkeypatch.setattr(reporting, "_terminal_supports_updates", lambda _stream: False)
+    noninteractive = RunReporter(language, stdout=streamed)
+    noninteractive.tasks_discovered(1, [task])
+    noninteractive.task_progress(task, blocked)
+    noninteractive.task_progress(task, {**blocked, "event": "space_status"})
+    assert streamed.getvalue().count(hint.lower() if language == "en" else hint) == 1
+
+
 def test_forwarded_terminal_capability_does_not_require_server_console():
     stream = io.StringIO()
     stream.isatty = lambda: True

@@ -468,7 +468,13 @@ class RunReporter:
                 max(1, terminal_columns - 1),
             )
         available = max(0, terminal_columns - fixed_width - 1)
-        suffix = _truncate_display(f"{_task_name(task)}{relation}{detail}", available)
+        if state == "disk_paused":
+            # Put the recovery hint before the filename so a long name cannot hide it.
+            hint = str(row.get("detail") or "") or self.i18n.t("report.status.disk_resume_hint")
+            suffix_text = f"{hint}  {_task_name(task)}{relation}"
+        else:
+            suffix_text = f"{_task_name(task)}{relation}{detail}"
+        suffix = _truncate_display(suffix_text, available)
         return f"{prefix}[{label}] [{bar}] {percent_text}  {suffix}"
 
     @staticmethod
