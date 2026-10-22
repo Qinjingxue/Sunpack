@@ -143,6 +143,37 @@ def test_busy_batch_releases_completed_requests_and_bounds_failure_details(tmp_p
     coordinator.stop()
 
 
+@pytest.mark.parametrize("language,title,hint", [
+    ("zh", "SunPack 解压已暂停", "磁盘空间不足，释放空间后自动继续"),
+    ("en", "SunPack extraction paused", "Disk full. Free space to resume automatically."),
+])
+def test_disk_full_toast_shows_recovery_hint_and_resumes(tmp_path, language, title, hint):
+    host = _Host()
+    coordinator = WatchToastCoordinator(host, _config(language=language), str(tmp_path / "state"))
+    task = _task(tmp_path / "first.zip")
+    coordinator.submitted("first", task.main_path)
+    # A full output volume can block before the first extract_started event.
+    coordinator.progress("first", task, {
+        "event": "space_blocked", "volume_key": "C:",
+        "episode_id": 1, "job_id": "job-1",
+    })
+    paused = host.snapshots[-1]
+    assert paused.kind == ToastSnapshotKind.PROGRESS
+    assert paused.title == title
+    assert paused.progress_status == hint
+    assert paused.progress_mode == ToastProgressMode.INDETERMINATE
+
+    coordinator.progress("first", task, {
+        "event": "space_resumed", "volume_key": "C:",
+        "episode_id": 1, "job_id": "job-1",
+    })
+    resumed = host.snapshots[-1]
+    assert resumed.kind == ToastSnapshotKind.PROGRESS
+    assert resumed.title != title
+    assert resumed.progress_status != hint
+    coordinator.stop()
+
+
 def test_space_waits_are_released_for_every_request_exit(tmp_path):
     # Suppression/abort and invisible failures bypass normal completion; two
     # concurrent jobs in one episode must retain only the surviving owner's job.
