@@ -12,10 +12,12 @@ from sunpack.pipeline.postprocess.output_cleanup import (
 )
 
 
-def test_terminal_failure_preserves_nonempty_canonical_output(tmp_path):
+@pytest.mark.parametrize("payload", [b"", b"payload"])
+def test_terminal_failure_preserves_canonical_output_files(tmp_path, payload):
     output = tmp_path / "output"
     output.mkdir()
-    (output / "payload.bin").write_bytes(b"payload")
+    payload_path = output / "payload.bin"
+    payload_path.write_bytes(payload)
 
     result = OutputCleanupManager().cleanup_canonical(
         str(output),
@@ -24,8 +26,9 @@ def test_terminal_failure_preserves_nonempty_canonical_output(tmp_path):
     )
 
     assert result.reason == "nonempty_payload"
-    assert result.payload_bytes == len(b"payload")
-    assert output.is_dir()
+    assert result.payload_file_count == 1
+    assert result.payload_bytes == len(payload)
+    assert payload_path.read_bytes() == payload
 
 
 def test_policy_rejected_partial_can_remove_nonempty_canonical_output(tmp_path):

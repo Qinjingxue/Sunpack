@@ -168,7 +168,7 @@ class OutputCleanupManager:
             if inventory is None:
                 return OutputCleanupResult(reason="output_inventory_failed", **base)
             payload_file_count, payload_bytes = inventory
-            if payload_bytes > 0:
+            if payload_file_count > 0:
                 return OutputCleanupResult(
                     reason="nonempty_payload",
                     payload_file_count=payload_file_count,
