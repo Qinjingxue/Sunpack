@@ -742,11 +742,6 @@ begin
 
   if HasExplicitTaskSelection then
     Exit;
-  if InstalledDataRequiresReset then
-  begin
-    WizardSelectTasks('addtopath,contextmenu,!autostart');
-    Exit;
-  end;
   if not FileExists(ExistingLauncherPath) then
     Exit;
   if not QueryOriginalUserStartupEnabled(Enabled) then
