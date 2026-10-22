@@ -300,6 +300,10 @@
       "zh": "取消",
       "en": "Cancel"
     },
+    "saveEntries": {
+      "zh": "保存",
+      "en": "Save"
+    },
     "emptyEntry": {
       "zh": "（空字符串）",
       "en": "(empty string)"

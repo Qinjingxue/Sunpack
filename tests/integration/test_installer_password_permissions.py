@@ -124,6 +124,19 @@ end;
         temp.write_text('{"passwords":[],"clipboard_history":["updated"]}', encoding="utf-8")
         temp.replace(directory / "builtin_passwords.json")
         assert json.loads((directory / "builtin_passwords.json").read_text(encoding="utf-8"))["clipboard_history"] == ["updated"]
+        # Python rename succeeds with Modify, while ReplaceFile without a
+        # backup requires DELETE_CHILD here. Exercise the actual GUI writer;
+        # ACL shape and runtime-only writes cannot detect this failure.
+        import platform
+        arch = "arm64" if platform.machine().lower() in {"arm64", "aarch64"} else "x64"
+        binary = repo_root / ".cache" / f"gui-{arch}" / "Release" / "sunpack_gui_tests.exe"
+        assert binary.is_file(), "Build the native GUI with scripts/build_gui.ps1"
+        result = subprocess.run([str(binary), "--password-add", str(directory / "builtin_passwords.json"), "GUI saved"],
+                                capture_output=True, text=True, timeout=10)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert json.loads((directory / "builtin_passwords.json").read_text(encoding="utf-8")) == {
+            "passwords": [{"value": "GUI saved"}], "clipboard_history": ["updated"],
+        }
     security = _powershell(f"""
 $ErrorActionPreference = 'Stop'
 $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
@@ -248,7 +261,9 @@ end;
     # or valid schema. The relocated case also resolves state from old defaults.
     cases = (("1.1.12", True, False), ("v1.1.99", True, False),
              ("1.2.0", False, False), ("1.10.0", False, False),
-             (None, True, False), ("1.1.12", True, True), ("invalid", True, False))
+             (None, True, False), ("1.1.12", True, True), ("invalid", True, False),
+             ("v1.2.2", False, False), ("v1.2.2-7-gabcdef0", False, False),
+             ("1.2.2-7-gabcdef0-dirty", False, False), ("v1.1.12-7-gabcdef0", True, False))
     try:
         for index, (version, reset, stop_failure) in enumerate(cases):
             fixture = tmp_path / f"case {index} ' [data]"

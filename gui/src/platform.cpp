@@ -113,10 +113,20 @@ void atomic_write(const fs::path& p, const std::string& content) {
             }
             if (!FlushFileBuffers(f)) win_error("opFlushFile");
         }
-        // ReplaceFile preserves target ACL; MoveFile covers a newly created file.
+        // ReplaceFile preserves target ACL, but it requires DELETE_CHILD on the
+        // parent directory. Installed data directories intentionally grant the
+        // user Modify, which is enough for MoveFileEx replacement but can still
+        // make ReplaceFileW fail with ERROR_UNABLE_TO_REMOVE_REPLACED (1175).
+        // Keep ReplaceFile as the first choice and fall back to the rename path
+        // so the same atomic writer works with the packaged ACLs.
         if (!ReplaceFileW(p.c_str(), temp.c_str(), nullptr, 0, nullptr, nullptr)) {
-            if (GetLastError() != ERROR_FILE_NOT_FOUND ||
-                !MoveFileExW(temp.c_str(), p.c_str(), MOVEFILE_WRITE_THROUGH)) win_error("opReplaceFile");
+            DWORD replace_error = GetLastError();
+            DWORD flags = MOVEFILE_WRITE_THROUGH;
+            if (replace_error != ERROR_FILE_NOT_FOUND) flags |= MOVEFILE_REPLACE_EXISTING;
+            if (!MoveFileExW(temp.c_str(), p.c_str(), flags)) {
+                SetLastError(replace_error);
+                win_error("opReplaceFile");
+            }
         }
     } catch (...) { std::error_code ec; fs::remove(temp, ec); throw; }
 }

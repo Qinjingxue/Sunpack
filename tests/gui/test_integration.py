@@ -5,6 +5,7 @@ from ctypes import wintypes
 import platform
 import subprocess
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -12,6 +13,17 @@ import pytest
 from sunpack.core.platform.windows.file_mutex import file_mutex, file_mutex_name
 from sunpack.runtime.watch.service import watch_roots_mutex_name
 from sunpack.runtime.gui import manager
+
+
+def test_gui_template_texts_exist_in_both_languages():
+    # Conditional error actions need not appear in ordinary UI runs. Checking
+    # the shipped template/catalog boundary catches missing labels cheaply.
+    resources = Path(__file__).resolve().parents[2] / "gui" / "resources"
+    catalog = json.loads((resources / "catalog.json").read_text(encoding="utf-8"))["ui"]
+    for template in resources.glob("*.uix"):
+        for key in set(re.findall(r"\btexts\.([A-Za-z_][A-Za-z0-9_]*)", template.read_text(encoding="utf-8"))):
+            assert key in catalog, (template.name, key)
+            assert all(catalog[key].get(language) for language in ("zh", "en")), (template.name, key)
 
 
 def test_native_mutex_matches_runtime_for_windows_paths(tmp_path):

@@ -449,10 +449,17 @@ function RequiresDataReset(const Version: string): Boolean;
 var
   Packed: Int64;
   Value: string;
+  Suffix: Integer;
 begin
-  Value := Version;
+  Value := Trim(Version);
   if Copy(Value, 1, 1) = 'v' then
     Delete(Value, 1, 1);
+  { Development builds use the git-describe form 1.2.2-7-gabcdef0.
+    Compare its numeric base version instead of treating the suffix as an
+    unknown version and deleting current data during an upgrade. }
+  Suffix := Pos('-', Value);
+  if Suffix > 0 then
+    Delete(Value, Suffix, Length(Value));
   { Missing or unversioned installations cannot provide current-format data. }
   Result := True;
   if StrToVersion(Value, Packed) then
