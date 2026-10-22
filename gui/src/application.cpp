@@ -126,7 +126,7 @@ void Application::refresh_error_texts() {
     auto errors=page_value(page_,"saveErrors");
     for(auto& error:errors) refresh(error);
     auto encoded=errors.dump(); ui_page_set_json(page_,"saveErrors",encoded.c_str());
-    for(auto field:{"actionError","closeError"}) {
+    for(auto field:{"actionError"}) {
         auto error=page_value(page_,field); refresh(error);
         encoded=error.dump(); ui_page_set_json(page_,field,encoded.c_str());
     }
@@ -158,7 +158,6 @@ void Application::queue_save(Json job) {
     const auto kind=job.at("kind").get<std::string>();
     if(kind!="config" && kind!="passwords" && kind!="roots") return;
     auto key=job.at("key");
-    set_text(page_,"closeError","");
     if(kind=="roots") for(auto& edit:job.at("edits")) save_error("@root:"+edit.at("row").get<std::string>(),"");
     else save_error(kind=="passwords"?"@password:"+key.get<std::string>():key.get<std::string>(),"");
     auto previous=std::find_if(saves_.begin(),saves_.end(),[&](const Json& queued){return queued["kind"]==kind && queued["key"]==key;});
@@ -400,7 +399,6 @@ void Application::apply_pending() {
     // Only an acknowledgement advances the save queue. Data/log publishes
     // must not rewrite recordSaving/pendingFields and rebind hidden editors.
     if(!ack.is_null()) start_save();
-    if(closing_ && active_save_.is_null() && saves_.empty()) PostMessageW(hwnd_,WM_CLOSE,0,0);
     if(patch.contains("language")) {
         date_popup_.reset();
         auto language=patch["language"].get<std::string>();
@@ -767,24 +765,6 @@ LRESULT CALLBACK Application::subclass(HWND hwnd,UINT message,WPARAM wparam,LPAR
             ui_window_focus_widget(self->window_,0);
             ui_page_call_json(self->page_,"finishRootCell","{}");
             self->dispatch();
-        }
-        if(message==WM_CLOSE && !self->stopping_) {
-            ui_window_focus_widget(self->window_,0);
-            ui_page_call_json(self->page_,"finishRootCell","{}");
-            self->dispatch();
-            if(page_value(self->page_,"rootDirty")==true) { self->set_error("closeError","unsavedEntries"); return 0; }
-            if(!self->closing_ || (self->active_save_.is_null() && self->saves_.empty() && page_value(self->page_,"saveErrors").empty())) {
-                self->closing_=true;
-                ui_window_focus_widget(self->window_,0); // Commit the focused input through its blur handler.
-                self->dispatch();
-                for(auto name:{"drafts","toggleDrafts"}) {
-                    auto drafts=page_value(self->page_,name);
-                    for(auto it=drafts.begin();it!=drafts.end();++it) self->save_field(it.key(),it.value());
-                }
-            }
-            if(!self->active_save_.is_null() || !self->saves_.empty()) return 0;
-            auto errors=page_value(self->page_,"saveErrors");
-            if(!errors.empty()) { self->closing_=false; auto encoded=errors.begin().value().dump(); ui_page_set_json(self->page_,"closeError",encoded.c_str()); return 0; }
         }
         if(message==Dispatch) { self->dispatch(); return 0; }
         if(message==Update) {

@@ -2278,23 +2278,10 @@ int wmain(int argc,wchar_t** argv) {
             click(app,("range-lower-pick-"+closingDate).c_str()); ui_debug_pump();
             auto* closingPopup=date_popup(app); assert(closingPopup);
             std::weak_ptr<ui::Widget> closingTree=closingPopup->Root();
-            PostMessageW(static_cast<HWND>(ui_window_hwnd(app.window())),WM_CLOSE,0,0);
-            pump([&]{return state(app.page(),"closeError")!="" && !state(app.page(),"saving").get<bool>();});
-            assert(!date_popup(app) && closingTree.expired());
-            assert(IsWindow(static_cast<HWND>(ui_window_hwnd(app.window()))));
-            search_setting(app,"/watch/max_folders");
-            invalid_input=ui_widget_find_by_id(ui_page_root(app.page()),"input-/watch/max_folders"); assert(invalid_input);
-            ui_text_input_set_text(invalid_input,L""); ui_widget_destroy(invalid_input);
-            click(app,"input-/watch/max_folders"); ui_debug_type_text(app.window(),L"17");
-            finish_input(app);
-            assert(read_json(dir/"sunpack_config.json")["watch"]["max_folders"]==17);
-            search_setting(app,"/watch/out_dir");
-            auto closing_input=ui_widget_find_by_id(ui_page_root(app.page()),"input-/watch/out_dir"); assert(closing_input);
-            ui_text_input_set_text(closing_input,L""); ui_widget_destroy(closing_input);
-            click(app,"input-/watch/out_dir"); ui_debug_type_text(app.window(),L"close-flush");
+            // Closing abandons drafts and must not be blocked by another field's save error.
             PostMessageW(static_cast<HWND>(ui_window_hwnd(app.window())),WM_CLOSE,0,0);
             pump([&]{return !IsWindow(static_cast<HWND>(ui_window_hwnd(app.window())));});
-            assert(read_json(dir/"sunpack_config.json")["watch"]["out_dir"]=="close-flush");
+            assert(!date_popup(app) && closingTree.expired());
             }
         }
         fs::remove_all(dir); std::cout<<"GUI interface and observation passed\n";

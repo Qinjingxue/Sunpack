@@ -47,7 +47,6 @@ class Application {
     // UI-thread queue: one write in flight, latest completed edit per key.
     std::deque<Json> saves_;
     Json active_save_;
-    bool closing_ = false;
     std::unique_ptr<DatePopup> date_popup_;
     UINT_PTR date_generation_ = 0;
     void finish_date_popup(UINT_PTR generation);

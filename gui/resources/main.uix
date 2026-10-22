@@ -25,14 +25,13 @@ export default {
     taskQuery:'',taskRoot:'',taskStatus:0,
     statusNames:['','taskProcessing','taskWaiting','taskSucceeded','taskFailed'],
     rootRows:[],rootDrafts:{},rootNew:[],rootCell:'',rootPart:'',rootNext:0,rootQuery:'',cellPointer:null,
-    configCategory:'',configQuery:'',drafts:{},toggleDrafts:{},saving:false,saveErrors:{},closeError:'',pendingFields:[],recordSaving:{passwords:false,roots:false},
+    configCategory:'',configQuery:'',drafts:{},toggleDrafts:{},saving:false,saveErrors:{},pendingFields:[],recordSaving:{passwords:false,roots:false},
     passwordRoot:'',passwordHistory:false,passwordHistoryTarget:false,passwordQuery:'',passwordDrafts:{},passwordNew:[],passwordCell:'',passwordNext:0,
     tagInputs:{}
   }; },
   computed: {
     passwordScope() { return this.passwordHistoryTarget?'@history':this.passwordRoot||'@all'; },
     directorySelection() { return this.tab==='passwords'?this.passwordRoot:this.taskRoot; },
-    rootDirty() { return Object.values(this.rootDrafts).some(d=>!d.original&&!d.pending&&(d.input.length||d.output.length)); },
     shownRootRows() {
       let q=this.rootQuery.toLowerCase(),rows=this.rootNew.concat(this.rootRows),ids=new Set(rows.map(r=>r.id));
       for(let d of Object.values(this.rootDrafts)) if(!ids.has(d.id)&&(d.pending||d.error||this.rootCell===d.id)) rows.push(d);
@@ -900,7 +899,6 @@ export default {
       </div>
       </div>
     </div>
-    <label v-show="closeError" class="error">{{ errorText(closeError) }}</label>
     <div v-show="errorList.length" class="card"><label class="error">{{ texts.fileProblems }}</label><label v-for="e in errorList" :key="e" class="error">{{ e }}</label></div>
     <div v-if="dispatch" id="dispatch" :visible="false" style="position:absolute;left:0px;top:0px;width:0px;height:0px"/>
   </div>

@@ -308,10 +308,6 @@
       "zh": "（空字符串）",
       "en": "(empty string)"
     },
-    "unsavedEntries": {
-      "zh": "请先保存或取消当前编辑。",
-      "en": "Save or cancel the current edit first."
-    },
     "operationFailed": {
       "zh": "操作未完成",
       "en": "Could not complete the action"
