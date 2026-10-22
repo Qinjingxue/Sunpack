@@ -548,7 +548,7 @@ void Application::rebuild_theme(const std::string& language) {
     if(theme_widget_) { ui_widget_remove_child(host,theme_widget_); ui_widget_destroy(theme_widget_); theme_widget_=0; }
     std::wstring labels[]={wide(tr("system",language)),wide(tr("light",language)),wide(tr("dark",language))};
     const wchar_t* texts[]={labels[0].c_str(),labels[1].c_str(),labels[2].c_str()};
-    theme_widget_=ui_combobox(texts,3); ui_widget_set_id(theme_widget_,"themeSelector"); ui_widget_set_width(theme_widget_,180); ui_widget_set_height(theme_widget_,32);
+    theme_widget_=ui_combobox(texts,3); ui_widget_set_id(theme_widget_,"themeSelector"); ui_widget_set_height(theme_widget_,32);
     ui_combobox_set_selected(theme_widget_,page_value(page_,"themeChoice").get<int>());
     ui_combobox_on_changed(theme_widget_,[](UiWidget,int index,void* context){
         auto* self=static_cast<Application*>(context);
@@ -564,7 +564,7 @@ void Application::rebuild_theme(const std::string& language) {
     for(auto& status:page_value(page_,"statusNames")) if(status!="") statuses.push_back(wide(tr(status.get<std::string>(),language)));
     std::vector<const wchar_t*> status_texts; for(auto& status:statuses) status_texts.push_back(status.c_str());
     status_widget_=ui_combobox(status_texts.data(),int(status_texts.size()));
-    ui_widget_set_id(status_widget_,"taskStatus"); ui_widget_set_expand(status_widget_,true); ui_widget_set_height(status_widget_,32);
+    ui_widget_set_id(status_widget_,"taskStatus"); ui_widget_set_height(status_widget_,32);
     ui_combobox_set_selected(status_widget_,page_value(page_,"taskStatus").get<int>());
     ui_combobox_on_changed(status_widget_,[](UiWidget,int index,void* context){
         auto* self=static_cast<Application*>(context);

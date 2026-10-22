@@ -2287,7 +2287,22 @@ bool ComboBoxWidget::OnMouseWheel(const MouseEvent& e) {
 }
 
 D2D1_SIZE_F ComboBoxWidget::SizeHint() const {
-    return {fixedW > 0 ? fixedW : 150.0f, fixedH > 0 ? fixedH : 32.0f};  // WinUI 3: MinHeight=32
+    const float height = fixedH > 0 ? fixedH : 32.0f;
+    if (fixedW > 0) return {fixedW, height};
+
+    // Measure every localized option, so selection changes never resize the
+    // control. Reuse the renderer's bounded text-width cache and font fallback.
+    const float fontSize = css.fontSize > 0 ? css.fontSize : theme::kFontSizeNormal;
+    float textWidth = 0;
+    for (const auto& item : items_) {
+        const float width = g_activeMeasureContext && g_activeMeasureContext->BoundRenderer()
+            ? g_activeMeasureContext->MeasureTextWidth(item, fontSize)
+            : fontSize * static_cast<float>(item.size());
+        textWidth = (std::max)(textWidth, width);
+    }
+    // The closed text area reserves 10 DIP on the left and 28 for the arrow;
+    // round up with 2 DIP of slack. The popup needs less horizontal space.
+    return {(std::max)(80.0f, std::ceil(textWidth + 40.0f)), height};
 }
 
 // ---- TabControl ----

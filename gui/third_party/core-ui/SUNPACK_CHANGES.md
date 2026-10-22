@@ -11,6 +11,9 @@ preserved.
 
 Local changes:
 
+- Size auto-width ComboBoxes to the widest localized item using the existing
+  bounded DirectWrite measurement cache, with room for padding and the arrow.
+  Explicit widths (including compact range operators/units) remain authoritative.
 - Compare consecutive display lists and replay/present a conservative dirty
   rectangle. Include both alternating swap-chain buffers' changes; resize,
   screenshots, prepared frames, backdrop sampling and SVG text runs retain full

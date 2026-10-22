@@ -691,7 +691,10 @@ export default {
   /* Core UI scrollbars overlay the viewport (up to 9 px plus a 2 px
      inset). Reserve 18 px for the bar and shadows in every scroll pane. */
   ScrollView { flex:1; padding:2px 18px 6px 2px; }
-  .setting-control { width:220px; gap:8px; justify-content:center; }
+  .setting-control { gap:8px; justify-content:center; }
+  .setting-control.wide-control { width:220px; }
+  .setting-control.choice-control { min-width:120px; flex-shrink:0; }
+  .selector-host { min-width:120px; height:32px; flex-shrink:0; }
   .range-editor { gap:8px; }
   .range-pair { flex-direction:row; flex-wrap:wrap; align-items:flex-start; gap:16px; }
   .range-group { width:194px; flex-shrink:0; gap:6px; }
@@ -813,7 +816,7 @@ export default {
       <div id="page-tasks" v-show="tab==='tasks'" class="content">
         <div class="page-header"><label class="heading">{{ texts.tasks }}</label></div>
         <div class="row task-filters"><input id="taskSearch" type="search" class="fill search-field" :placeholder="texts.taskSearch" :value="taskQuery" @input="searchTasks"/>
-          <div id="taskStatusHost" style="width:180px;height:32px"/>
+          <div id="taskStatusHost" class="selector-host"/>
         </div>
         <ScrollView id="taskListScroll"><div id="taskBody" class="column">
           <VirtualList id="taskItems" class="column" estimated-height="68px" immutable-items="true"><div v-for="t in tasks.rows" :key="t.id" :id="'task-'+t.id" :class="'task '+appearance">
@@ -832,7 +835,7 @@ export default {
             <div class="setting-copy"><label class="setting-title">{{ texts.startup }}</label></div>
             <button id="startupToggle" :enabled="cliAllowed" @click="send('cli',{action:startup.enabled?'startupDisable':'startupEnable'})">{{ startup.enabled?texts.startupOff:texts.startupOn }}</button>
           </div>
-          <div id="themeSetting" v-show="showThemeSetting" class="card settings-row"><div class="setting-copy"><label class="setting-title">{{ texts.theme }}</label></div><div id="themeHost" style="width:180px;height:32px"/></div>
+          <div id="themeSetting" v-show="showThemeSetting" class="card settings-row"><div class="setting-copy"><label class="setting-title">{{ texts.theme }}</label></div><div id="themeHost" class="selector-host"/></div>
           <VirtualList id="configItems" class="column" estimated-height="140px"><div v-for="g in matchingBlocks" :key="g.key" :id="'block-'+g.id" :class="'setting-card '+appearance">
             <label v-show="(g.fields.length>1||g.module) &amp;&amp; !g.primary" class="block-heading">{{ g.label }}</label>
             <!-- This Core UI version binds inner loops through a conditional
@@ -843,7 +846,7 @@ export default {
             <div class="settings-row" :class="f.editor==='list'?'tag-setting':''">
               <div class="setting-copy"><label :class="f.primary?'subheading':'setting-title'">{{ f.label }}</label><label v-show="f.description" class="setting-description">{{ f.description }}</label><input v-show="f.editor==='list'" :id="'tag-input-'+f.id" :value="tagInputs[f.id]||''" :placeholder="texts.tagInputPlaceholder" @input="v=>changeTagInput(f,v)" @submit="addTag(f)"/></div>
               <ScrollView v-if="f.editor==='list'" :id="'tag-scroll-'+f.id" class="tag-region"><div :id="'tags-host-'+f.id"/></ScrollView>
-              <div v-show="!isRange(f) &amp;&amp; f.editor!=='list'" class="setting-control">
+              <div v-show="!isRange(f) &amp;&amp; f.editor!=='list'" class="setting-control" :class="f.editor==='choice'||f.editor==='recursive'?'choice-control':'wide-control'">
                 <div v-show="f.editor==='toggle'" :id="'toggle-host-'+f.id" class="toggle-host"/>
                 <div v-show="f.editor==='choice'||f.editor==='recursive'" :id="'choice-'+f.id" class="choice-host"/>
                 <input v-show="f.editor==='text'" :ellipsis-start="isDirectoryValue(drafts[f.id]?drafts[f.id].text:f.text)" :id="'input-'+f.id" :value="drafts[f.id]?drafts[f.id].text:f.text" @input="v=>changeField(f,v)" @blur="commitField(f)" @submit="commitField(f)"/>

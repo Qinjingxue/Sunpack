@@ -178,7 +178,10 @@ void click(Application& app,const char* id) {
             ui_window_relayout(app.window());
         }
     }
-    auto widget=ui_widget_find_by_id(ui_page_root(app.page()),id); assert(widget);
+    // FindById can return Application's owned selector handle. Create our own
+    // temporary handle so the click helper never invalidates that ownership.
+    target=window->Root()->FindById(id); assert(target);
+    auto widget=ui::GetContext().handles.Insert(target->shared_from_this());
     if(ui_debug_widget_is_visible(widget)!=1) {
         char* info=ui_debug_dump_widget(widget); std::cerr<<id<<": "<<(info?info:"")<<"\n"; ui_debug_free(info);
     }
@@ -738,12 +741,13 @@ void range_config(Application& app,const fs::path& dir) {
     input("range-lower-"+id,L""); finish_input(app);
     assert(bound("size_range","min_bytes").is_null());
     auto chooseUnit=[&](const std::string& side,int index) {
-        auto* combo=ui_widget_find_by_id(ui_page_root(app.page()),("range-"+side+"-unit-"+id).c_str()); assert(combo);
+        auto combo=ui_widget_find_by_id(ui_page_root(app.page()),("range-"+side+"-unit-"+id).c_str()); assert(combo);
         assert(ui_debug_combo_select(app.window(),combo,index)==0);
         ui_widget_destroy(combo); finish_input(app);
     };
     auto configPath=dir/"sunpack_config.json";
-    auto unchanged=read_file(configPath),unchangedTime=fs::last_write_time(configPath);
+    auto unchanged=read_file(configPath);
+    auto unchangedTime=fs::last_write_time(configPath);
     chooseUnit("lower",3); // GiB, before typing a number.
     chooseUnit("upper",2); // MiB, before typing a number.
     assert(read_file(configPath)==unchanged && fs::last_write_time(configPath)==unchangedTime);
@@ -1701,6 +1705,7 @@ int wmain(int argc,wchar_t** argv) {
             assert(state(app.page(),"texts")["config"]=="Settings");
             assert(state(app.page(),"fields")[0]["label"]=="Language");
             search_hints(app);
+            search_config(app,L"");
             screenshot(app,L"configuration-english.png");
             button_texts(app);
             search_setting(app,"/cli/language");
