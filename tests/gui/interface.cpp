@@ -733,6 +733,34 @@ void range_config(Application& app,const fs::path& dir) {
     assert(ui_debug_combo_select(app.window(),unit,2)==0); ui_widget_destroy(unit); finish_input(app);
     try { pump([&]{return bound("size_range","min_bytes")==2097152;},"Size unit conversion"); }
     catch(...) { std::cerr<<"Range unit: field="<<field("size_range")<<" drafts="<<state(app.page(),"drafts")<<" errors="<<state(app.page(),"saveErrors")<<'\n'; throw; }
+    // Unit-first editing has no persistent effect while the corresponding
+    // bound is empty, including blur and an unrelated save acknowledgement.
+    input("range-lower-"+id,L""); finish_input(app);
+    assert(bound("size_range","min_bytes").is_null());
+    auto chooseUnit=[&](const std::string& side,int index) {
+        auto* combo=ui_widget_find_by_id(ui_page_root(app.page()),("range-"+side+"-unit-"+id).c_str()); assert(combo);
+        assert(ui_debug_combo_select(app.window(),combo,index)==0);
+        ui_widget_destroy(combo); finish_input(app);
+    };
+    auto configPath=dir/"sunpack_config.json";
+    auto unchanged=read_file(configPath),unchangedTime=fs::last_write_time(configPath);
+    chooseUnit("lower",3); // GiB, before typing a number.
+    chooseUnit("upper",2); // MiB, before typing a number.
+    assert(read_file(configPath)==unchanged && fs::last_write_time(configPath)==unchangedTime);
+    assert(state(app.page(),"rangeUnitDrafts")[id]["lowerUnit"]==3);
+    assert(state(app.page(),"rangeUnitDrafts")[id]["upperUnit"]==2);
+    click(app,("range-enabled-"+id).c_str()); finish_input(app);
+    pump([&]{return bound("size_range","enabled")==false;},"Empty size units after disable acknowledgement");
+    click(app,("range-enabled-"+id).c_str()); finish_input(app);
+    pump([&]{return bound("size_range","enabled")==true;},"Empty size units after enable acknowledgement");
+    input("range-lower-"+id,L"2"); finish_input(app);
+    pump([&]{return bound("size_range","min_bytes")==uint64_t(2)*1024*1024*1024;},"Preserved GiB unit after acknowledgement");
+    input("range-upper-"+id,L"3072"); finish_input(app);
+    pump([&]{return bound("size_range","max_bytes")==uint64_t(3)*1024*1024*1024;},"Preserved MiB unit after other bound saved");
+    chooseUnit("lower",2); // Restore the range used by the remaining tests.
+    pump([&]{return bound("size_range","min_bytes")==2097152;},"Restore MiB lower bound");
+    input("range-upper-"+id,L""); finish_input(app);
+    assert(bound("size_range","max_bytes").is_null());
     click(app,("range-enabled-"+id).c_str()); finish_input(app);
     pump([&]{return bound("size_range","enabled")==false;},"Range disable save");
     click(app,("range-enabled-"+id).c_str()); finish_input(app);
