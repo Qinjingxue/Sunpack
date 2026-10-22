@@ -269,6 +269,14 @@ followed by the same metrics for `7z.exe`. The raw full-matrix report is
 
 Contributions are welcome. Use [GitHub Issues](https://github.com/Qinjingxue/Sunpack/issues) to report bugs or suggest improvements, and submit a [Pull Request](https://github.com/Qinjingxue/Sunpack/pulls) to help improve the project.
 
+When reporting a problem, you can attach relevant logs. Default locations for installed SunPack:
+- Watch events: `%ProgramData%\SunPack\.sunpack_watch\events.jsonl`
+- Extraction failure reports: `%ProgramData%\SunPack\.sunpack_watch\failures\failed-*.txt`
+- Windows notifications: `%ProgramData%\SunPack\.sunpack_watch\toast_host_events.jsonl`
+- Background runtime: `%ProgramData%\SunPack\runtime-*.state.events.jsonl`
+
+If you changed `watch.state_dir`, the first three locations use that custom state directory. Remove passwords, private paths and other sensitive information before posting.
+
 ## Acknowledgements
 
 Thank you to everyone who contributes code, reports issues, or shares suggestions for SunPack. The project also benefits from many open-source projects. Special thanks to the maintainers and contributors of [Core UI](https://github.com/ghboke/core-ui) (SunPack's native UI framework), [7-Zip](https://www.7-zip.org/), [zlib-ng](https://github.com/zlib-ng/zlib-ng), [LZ4](https://github.com/lz4/lz4), and [RustCrypto](https://github.com/RustCrypto). See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for details about third-party components and their licenses.

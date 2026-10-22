@@ -256,6 +256,14 @@ uv run --locked pytest
 
 欢迎通过 [GitHub Issues](https://github.com/Qinjingxue/Sunpack/issues) 报告问题、提出建议，也欢迎提交 [Pull Request](https://github.com/Qinjingxue/Sunpack/pulls) 改进项目。
 
+报告问题时可附上相关日志。安装版默认位置：
+- Watch 事件：`%ProgramData%\SunPack\.sunpack_watch\events.jsonl`
+- 解压失败报告：`%ProgramData%\SunPack\.sunpack_watch\failures\failed-*.txt`
+- Windows 通知：`%ProgramData%\SunPack\.sunpack_watch\toast_host_events.jsonl`
+- 后台 Runtime：`%ProgramData%\SunPack\runtime-*.state.events.jsonl`
+
+若修改了 `watch.state_dir`，前三项位于自定义状态目录。提交前请删除日志中的密码、私人路径等敏感信息。
+
 ## 致谢
 
 感谢所有为 SunPack 提交代码、报告问题和提供建议的贡献者与用户。SunPack 也受益于众多开源项目，特别感谢 [Core UI](https://github.com/ghboke/core-ui)（SunPack 的原生 UI 技术栈）、[7-Zip](https://www.7-zip.org/)、[zlib-ng](https://github.com/zlib-ng/zlib-ng)、[LZ4](https://github.com/lz4/lz4) 和 [RustCrypto](https://github.com/RustCrypto) 项目及其维护者。相关第三方组件和许可证信息见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
