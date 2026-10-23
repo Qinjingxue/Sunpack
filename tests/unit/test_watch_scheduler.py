@@ -134,7 +134,7 @@ def test_scan_filesystem_errors_only_log_and_do_not_replace_archive_notification
     monkeypatch.setattr(watcher.log, "write", lambda event, **fields: events.append((event, fields)))
     enqueue = watcher.enqueue
     enqueue(str(source))
-    candidate, = watcher._pop_ready(time.time() + 1)
+    candidate, = watcher._pop_ready(time.monotonic() + 1)
     watcher.state.mark(candidate.path, candidate.size, candidate.mtime, file_id=candidate.file_id,
                        change_usn=candidate.change_usn, status="failed_password")
     monkeypatch.setattr(watcher, "enqueue", lambda *_args, **_kwargs: pytest.fail("scan error retried"))
@@ -476,6 +476,7 @@ class WatchClock:
 
     def install(self, monkeypatch):
         monkeypatch.setattr(scheduler_module.time, "time", lambda: self.value)
+        monkeypatch.setattr(scheduler_module.time, "monotonic", lambda: self.value)
 
     def advance(self, seconds: float):
         self.value += seconds
@@ -742,6 +743,8 @@ def test_watch_ready_index_lazily_discards_stale_generations_without_mapping_sca
     assert watcher.next_delay_seconds() == pytest.approx(15.0)
     assert len(watcher._ready_heap) == 1
     assert watcher._ready_heap[0][2] == state.generation
+    monkeypatch.setattr(scheduler_module.time, "time", lambda: -1_000_000.0)
+    assert watcher.next_delay_seconds() == pytest.approx(15.0)
 
 
 def test_watch_pop_ready_uses_heap_without_pending_mapping_scan(monkeypatch):
@@ -824,19 +827,19 @@ def test_watch_ready_batch_survives_one_candidate_error(tmp_path, monkeypatch, f
         probes.setattr(scheduler_module, "_candidate_for_event_path", observation)
         probes.setattr(watcher.state, "record_attempt", attempt)
         probes.setattr(watcher.log, "write", log)
-        ready = watcher._pop_ready(time.time() + 100)
+        ready = watcher._pop_ready(time.monotonic() + 100)
 
     assert {candidate.path for candidate in ready} == {
         str(paths[0]), str(paths[2]), *([middle] if failure_stage == "log" else []),
     }
     if failure_stage in {"observation", "attempt"}:
-        assert [candidate.path for candidate in watcher._pop_ready(time.time() + 200)] == [middle]
+        assert [candidate.path for candidate in watcher._pop_ready(time.monotonic() + 200)] == [middle]
     elif failure_stage == "rename":
         assert watcher.pending_count == 0
         scheduler_module._WatchEventHandler(watcher).on_moved(SimpleNamespace(
             src_path=middle, dest_path=str(root / "completed.zip"), is_directory=False,
         ))
-        assert [candidate.path for candidate in watcher._pop_ready(time.time() + 200)] == [str(root / "completed.zip")]
+        assert [candidate.path for candidate in watcher._pop_ready(time.monotonic() + 200)] == [str(root / "completed.zip")]
     assert watcher.pending_count == 0
 
 
@@ -1325,7 +1328,7 @@ def test_cancelled_harvest_and_close_wait_for_completion_callbacks(tmp_path):
         archive = tmp_path / "retained.zip"
         _write_zip(archive)
         watcher.enqueue(str(archive))
-        candidate = watcher._pop_ready(time.time())[0]
+        candidate = watcher._pop_ready(time.monotonic())[0]
         entered, release = asyncio.Event(), asyncio.Event()
 
         async def completed_pipeline():
@@ -1773,6 +1776,7 @@ def test_watch_scheduler_moved_file_uses_common_quiet_window(tmp_path, monkeypat
     monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
     now = [2000000000.0]
     monkeypatch.setattr(scheduler_module.time, "time", lambda: now[0])
+    monkeypatch.setattr(scheduler_module.time, "monotonic", lambda: now[0])
 
     class FakePipelineRunner:
         def __init__(self, config):
@@ -2908,7 +2912,7 @@ def test_claim_during_probe_replays_new_generation_without_blocking_publication(
         assert watcher._pending[str(source)].size == len(b"new generation")
         assert watcher.state.pending_work_for_path(str(source)).size == len(b"new generation")
         assert not watcher._source_probes
-        assert [item.size for item in watcher._pop_ready(time.time() + 200)] == [len(b"new generation")]
+        assert [item.size for item in watcher._pop_ready(time.monotonic() + 200)] == [len(b"new generation")]
     finally:
         watcher._close_blocking()
 
@@ -3138,12 +3142,14 @@ def test_watch_scheduler_retains_slow_interval_learning_across_active_epochs(tmp
     events.emit(archive_path)
 
     events.run_after(10.01, processed=1)
+    assert not watcher._latest_observations[str(archive_path)].quiet_calibrated
     clock.advance(9.99)
     archive_path.write_bytes(b"second")
     os.utime(archive_path, (clock.value, clock.value))
     events.emit(archive_path, event_type="modified")
 
     WatchState.assert_quiet_seconds(watcher, archive_path, minimum=20.0)
+    assert watcher._quiet_trackers[str(archive_path)].calibrated
     events.run_after(20.0, processed=0)
 
 

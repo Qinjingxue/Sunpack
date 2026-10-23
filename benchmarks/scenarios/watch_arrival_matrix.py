@@ -40,7 +40,7 @@ def _now() -> float:
 
 
 def _same_path(left: str | Path, right: str | Path) -> bool:
-    return Path(left).resolve() == Path(right).resolve()
+    return os.path.normcase(os.path.abspath(left)) == os.path.normcase(os.path.abspath(right))
 
 
 def _output_summary(root: Path, source_name: str) -> dict[str, Any]:

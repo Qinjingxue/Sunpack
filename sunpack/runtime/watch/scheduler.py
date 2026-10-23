@@ -94,6 +94,7 @@ class _CandidateObservation:
     change_usn: int
     quiet_seconds: float = 0.0
     last_content_event_at: float | None = None
+    quiet_calibrated: bool = False
 
 
 @dataclass(slots=True, eq=False)
@@ -927,7 +928,7 @@ class WatchScheduler:
             )
         self._process_password_retries(time.monotonic())
         result = await self._harvest_completed_requests()
-        ready = self._pop_ready(time.time())
+        ready = self._pop_ready(time.monotonic())
         active_requests = []
         for candidate in ready:
             request = await self._submit_candidate(candidate)
@@ -1122,8 +1123,7 @@ class WatchScheduler:
             return len(self._pending)
 
     def next_delay_seconds(self) -> float | None:
-        now = time.time()
-        monotonic_now = time.monotonic()
+        now = monotonic_now = time.monotonic()
         with self._lock:
             if self._directory_pending or self._watch_rearm:
                 return 0.0
@@ -1345,6 +1345,9 @@ class WatchScheduler:
             candidate = _candidate_for_event_path(
                 path, since_usn=previous_hint.change_usn if previous_hint is not None else 0,
             )
+            # Timestamp the observation before catalog/state work. Processing
+            # time is not evidence of a downloader's write interval.
+            now = time.monotonic()
             if candidate is None:
                 self._log_candidate_ignored(path, "not_a_file_or_unreadable")
                 return
@@ -1361,7 +1364,6 @@ class WatchScheduler:
             if self._is_under_metadata_dir(candidate.path):
                 self._log_candidate_ignored(candidate.path, "under_metadata_dir")
                 return
-            now = time.time()
             with self._claim_gate, self._lock:
                 if not admit():
                     return
@@ -1837,7 +1839,7 @@ class WatchScheduler:
                 return False
             self._store_pending_locked(path, candidate)
             self._remember_observation_locked(candidate)
-            self._observe_candidate_activity(candidate, time.time(), content_changed=False)
+            self._observe_candidate_activity(candidate, time.monotonic(), content_changed=False)
             return True
 
     def _remember_observation_locked(self, candidate: WatchCandidate) -> None:
@@ -1846,6 +1848,7 @@ class WatchScheduler:
             candidate.size, candidate.mtime, candidate.file_id, candidate.change_usn,
             previous.quiet_seconds if previous is not None else 0.0,
             previous.last_content_event_at if previous is not None else None,
+            previous.quiet_calibrated if previous is not None else False,
         )
 
     def _retire_quiet_tracker(self, path: str) -> None:
@@ -1861,6 +1864,7 @@ class WatchScheduler:
                 # its last interval boundary and floor, but release the model.
                 observation.quiet_seconds = tracker.quiet_seconds
                 observation.last_content_event_at = tracker.last_content_event_at
+                observation.quiet_calibrated = tracker.calibrated
             if not self._quiet_trackers:
                 self._quiet_trackers.clear()
 
@@ -1894,7 +1898,12 @@ class WatchScheduler:
             tracker = AdaptiveQuietTracker(self._quiet_policy)
             observation = self._latest_observations.get(candidate.path)
             if observation is not None:
-                tracker.quiet_seconds = max(tracker.quiet_seconds, observation.quiet_seconds)
+                if observation.quiet_seconds > 0.0:
+                    tracker.quiet_seconds = min(
+                        self._quiet_policy.maximum_seconds,
+                        max(self._quiet_policy.minimum_seconds, observation.quiet_seconds),
+                    )
+                tracker.calibrated = observation.quiet_calibrated
                 tracker.last_content_event_at = observation.last_content_event_at
                 tracker.last_size = observation.size
                 tracker.last_mtime = observation.mtime

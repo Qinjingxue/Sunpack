@@ -79,6 +79,30 @@ def test_explicit_metadata_only_change_updates_snapshot_without_resetting_quiet_
     assert tracker.last_change_usn == 11
 
 
+@pytest.mark.parametrize("observations", [10, 100])
+def test_fast_copy_calibrates_without_requiring_high_callback_throughput(observations):
+    """Existing profiles use a 1.25s floor and cannot expose the initial-seed tail."""
+    tracker = AdaptiveQuietTracker(AdaptiveQuietPolicy(minimum_seconds=0.0))
+    tracker.observe(0.0, size=1, mtime=0.0)
+    for index in range(1, observations + 1):
+        now = 0.1 * index / observations
+        tracker.observe(now, size=index + 1, mtime=now)
+    assert tracker.quiet_seconds < 0.02
+
+
+@pytest.mark.parametrize("observations", [10, 100])
+def test_short_fast_burst_preserves_learned_download_pause(observations):
+    """A burst with many callbacks must not erase a real, long inter-chunk pause."""
+    tracker = AdaptiveQuietTracker(AdaptiveQuietPolicy(minimum_seconds=0.0))
+    tracker.observe(0.0, size=1, mtime=0.0)
+    tracker.observe(20.0, size=2, mtime=20.0)
+    learned = tracker.quiet_seconds
+    for index in range(1, observations + 1):
+        now = 20.0 + 0.1 * index / observations
+        tracker.observe(now, size=index + 2, mtime=now)
+    assert tracker.quiet_seconds >= learned * 0.99
+
+
 @pytest.mark.parametrize("scenario", representative_write_scenarios())
 def test_representative_writes_avoid_repeated_premature_attempts(scenario: WriteScenario):
     result = simulate_writes(scenario, AdaptiveQuietPolicy())

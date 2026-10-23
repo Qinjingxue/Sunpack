@@ -395,7 +395,7 @@ def run_scenario(base: Path, scenario: Scenario, payload: bytes, *, chunk_bytes:
         completed = False
         while time.perf_counter() < deadline:
             peak_rss = max(peak_rss, process.memory_info().rss)
-            for candidate in watcher._pop_ready(time.time()):
+            for candidate in watcher._pop_ready(time.monotonic()):
                 result.total_ready_attempts += 1
                 candidate_path = Path(candidate.path)
                 valid = _zip_is_valid(candidate_path)

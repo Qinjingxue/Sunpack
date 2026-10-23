@@ -167,7 +167,7 @@ def test_slow_writes_busy_handle_move_and_event_storm_reach_ready(tmp_path):
         assert watcher._active_states[str(final)].generation == baseline_generation
 
         time.sleep(0.3)
-        ready = watcher._pop_ready(time.time())
+        ready = watcher._pop_ready(time.monotonic())
         assert [Path(candidate.path).name for candidate in ready] == ["slow.zip"]
       finally:
         await watcher.stop()

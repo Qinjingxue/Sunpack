@@ -18,7 +18,7 @@ class AdaptiveQuietPolicy:
     linear_factor: float = 1.0
     logarithmic_scale: float = 0.75
     logarithmic_pivot_seconds: float = 2.0
-    shrink_alpha: float = 0.05
+    shrink_time_constant_seconds: float = 2.0
 
     def __post_init__(self) -> None:
         minimum = max(0.0, float(self.minimum_seconds))
@@ -33,7 +33,7 @@ class AdaptiveQuietPolicy:
         object.__setattr__(self, "linear_factor", max(0.0, float(self.linear_factor)))
         object.__setattr__(self, "logarithmic_scale", max(0.0, float(self.logarithmic_scale)))
         object.__setattr__(self, "logarithmic_pivot_seconds", max(1e-6, float(self.logarithmic_pivot_seconds)))
-        object.__setattr__(self, "shrink_alpha", min(1.0, max(0.0, float(self.shrink_alpha))))
+        object.__setattr__(self, "shrink_time_constant_seconds", max(1e-6, float(self.shrink_time_constant_seconds)))
 
     def effective_interval(self, intervals: list[float] | tuple[float, ...]) -> float | None:
         values = sorted(float(value) for value in intervals if value > 0.0 and math.isfinite(value))
@@ -60,7 +60,13 @@ class AdaptiveQuietPolicy:
         )
         return min(self.maximum_seconds, max(self.minimum_seconds, target))
 
-    def adjusted_seconds(self, current: float, intervals: list[float] | tuple[float, ...]) -> float:
+    def adjusted_seconds(
+        self,
+        current: float,
+        intervals: list[float] | tuple[float, ...],
+        *,
+        calibrated: bool,
+    ) -> float:
         target = self.target_seconds(intervals)
         current = min(self.maximum_seconds, max(self.minimum_seconds, float(current)))
         # P90 ignores harmless isolated pauses, but once the newest interval
@@ -72,7 +78,18 @@ class AdaptiveQuietPolicy:
             return target
         if len(intervals) < self.minimum_shrink_samples:
             return current
-        return current + self.shrink_alpha * (target - current)
+        if not calibrated:
+            # The initial window is a guess, not evidence of a slow writer.
+            # Calibrate once instead of requiring dozens of write callbacks.
+            return target
+        # Only newly observed write intervals can shorten a learned window.
+        # Busy/metadata checks never call this path. Cap credit so a pause
+        # cannot count as sustained faster writing, and preserve long gaps
+        # across short bursts regardless of how many callbacks they produce.
+        elapsed = min(intervals[-1], target)
+        time_constant = max(current, self.shrink_time_constant_seconds)
+        alpha = -math.expm1(-elapsed / time_constant)
+        return current + alpha * (target - current)
 
 
 @dataclass(slots=True)
@@ -83,6 +100,7 @@ class AdaptiveQuietTracker:
     last_size: int | None = None
     last_mtime: float | None = None
     last_change_usn: int | None = None
+    calibrated: bool = False
     _intervals: deque[float] = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -122,7 +140,12 @@ class AdaptiveQuietTracker:
             interval = float(now) - self.last_content_event_at
             if interval > 0.0 and math.isfinite(interval):
                 self._intervals.append(interval)
-                self.quiet_seconds = self.policy.adjusted_seconds(self.quiet_seconds, self.intervals)
+                previous_quiet = self.quiet_seconds
+                self.quiet_seconds = self.policy.adjusted_seconds(
+                    previous_quiet, self.intervals, calibrated=self.calibrated,
+                )
+                if self.quiet_seconds > previous_quiet or len(self._intervals) >= self.policy.minimum_shrink_samples:
+                    self.calibrated = True
         self.last_content_event_at = float(now)
         self.last_size = size
         self.last_mtime = mtime
