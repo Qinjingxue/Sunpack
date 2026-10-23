@@ -44,8 +44,8 @@ class WatchOutputRoots:
                 return
             # Reservations already exclude this root before mkdir emits events.
             # Only Watch-relevant outputs incur identity IO and a WAL record.
-            if not os.path.isdir(path):
-                create_output_root(os.path.abspath(path))
+            # Exclusive creation must reject directories created by other processes.
+            create_output_root(os.path.abspath(path))
             self._put(path)
 
     def _put(self, path):

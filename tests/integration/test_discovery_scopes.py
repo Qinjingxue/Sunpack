@@ -213,6 +213,7 @@ def test_output_roots_persist_and_external_replacements_are_inputs(tmp_path):
     state = WatchStateStore(str(state_path))
     outputs = WatchOutputRoots(state, (scope,))
     outputs.register(str(output))
+    outputs.register(str(output))
     outputs.register(str(output / "nested"))
     assert outputs.protected(str(output / "child.zip"))
     assert len(state._native.runtime_keys("owned|")) == 1
@@ -227,6 +228,8 @@ def test_output_roots_persist_and_external_replacements_are_inputs(tmp_path):
         output.mkdir()
         assert not outputs.protected(str(output / "child.zip"))
         assert not outputs.protected(str(moved / "child.zip"))
+        with pytest.raises(FileExistsError):
+            outputs.register(str(output))
         options = DirectoryScanner.compile_scan_options({"filesystem": {"scan_filters_enabled": False}})
         (output / "same.001").write_bytes(b"new input")
         catalog = NativeWatchCatalog(state._native)
@@ -236,6 +239,37 @@ def test_output_roots_persist_and_external_replacements_are_inputs(tmp_path):
         outputs.reconcile(str(output), recursive=True)
         assert not state._native.runtime_keys("owned|")
     finally:
+        outputs.close()
+        state.close()
+
+
+def test_reserved_output_rejects_external_directory_before_registration(tmp_path):
+    """Internal collision tests never create an external directory after reservation.
+
+    This ordering must reject registration without claiming or changing its contents.
+    """
+    from sunpack.core.support.output_reservation import OutputReservationRegistry
+
+    root = tmp_path / "input"
+    root.mkdir()
+    state = WatchStateStore(str(tmp_path / "state.json"))
+    outputs = WatchOutputRoots(state, (DiscoveryScope(str(root), recursive=True),))
+    registry = OutputReservationRegistry()
+    registry.watch_outputs = outputs
+    try:
+        output = Path(registry.reserve(str(root / "result"), "request", set()))
+        # An external process wins the filesystem race after memory reservation.
+        output.mkdir()
+        sentinel = output / "external.txt"
+        sentinel.write_text("external content", encoding="utf-8")
+        with pytest.raises(FileExistsError):
+            registry.register_watch_output(str(output))
+        assert not outputs.protected(str(sentinel))
+        assert not state._native.runtime_keys("owned|")
+        assert list(output.iterdir()) == [sentinel]
+        assert sentinel.read_text(encoding="utf-8") == "external content"
+    finally:
+        registry.release("request")
         outputs.close()
         state.close()
 
