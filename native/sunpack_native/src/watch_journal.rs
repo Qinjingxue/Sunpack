@@ -1257,3 +1257,31 @@ mod tests {
         let _ = fs::remove_file(path);
     }
 }
+
+// Catalog cache uses the same ordered writer, on its own stream and files.
+pub(crate) fn open_cache(stream: String, seq: u64) -> Result<NativeJournalStream, String> {
+    let handle = runtime().open(stream.clone())?;
+    runtime().seed(stream, seq)?;
+    Ok(handle)
+}
+pub(crate) fn append_cache(
+    stream: &str,
+    path: &Path,
+    seq: u64,
+    value: JsonValue,
+) -> Result<(), String> {
+    runtime()
+        .submit_append(stream.to_owned(), path.to_owned(), 1, seq, value, false)?
+        .wait_for(TicketGoal::Written)
+}
+pub(crate) fn flush_cache(stream: &str, seq: u64) -> Result<(), String> {
+    runtime()
+        .request_flush(stream.to_owned(), seq)
+        .wait_for(TicketGoal::Durable)
+}
+pub(crate) fn close_cache(handle: &mut NativeJournalStream) -> Result<(), String> {
+    if let Some(stream) = handle.stream.take() {
+        handle.runtime.release(stream)?;
+    }
+    Ok(())
+}

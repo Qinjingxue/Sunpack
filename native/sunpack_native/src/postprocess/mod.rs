@@ -157,11 +157,17 @@ fn scan_watch_candidate_rows(
     let mut candidates = Vec::new();
     let mut messages = DirectoryReadErrors::report();
     for root in roots {
-        let scope=crate::scan::scope::NativeDiscoveryScope::new(root,if recursive {None} else {Some(0)},Vec::new());
-        let (paths,errors)=crate::scan::directory::scope_file_paths(&scope)?;
+        let scope = crate::scan::scope::NativeDiscoveryScope::new(
+            root,
+            if recursive { None } else { Some(0) },
+            Vec::new(),
+        );
+        let (paths, errors) = crate::scan::directory::scope_file_paths(&scope)?;
         messages.extend(errors);
         for path in paths {
-            if let Some(candidate)=watch_candidate_row(&path,None)? { candidates.push(candidate); }
+            if let Some(candidate) = watch_candidate_row(&path, None)? {
+                candidates.push(candidate);
+            }
         }
     }
     candidates.sort_by(|left, right| left.path.cmp(&right.path));
@@ -181,9 +187,11 @@ pub(crate) fn watch_candidate_for_path(
 }
 
 #[pyfunction]
+#[pyo3(signature = (base, work_path=None))]
 pub(crate) fn flatten_single_branch_directories(
     py: Python<'_>,
     base: &str,
+    work_path: Option<&str>,
 ) -> PyResult<Py<PyDict>> {
     let base_path = PathBuf::from(base);
     let result = PyDict::new(py);
@@ -201,7 +209,14 @@ pub(crate) fn flatten_single_branch_directories(
     // directory change the watch scheduler has to consume.  Release the GIL for
     // the loop (as delete_files_batch already does) so those two can overlap
     // instead of serializing on the interpreter lock.
-    py.detach(|| flatten_single_branch_chain(&base_path, &mut stats));
+    py.detach(|| {
+        flatten_single_branch_chain_with_publisher(
+            &base_path,
+            &mut stats,
+            work_path.map(Path::new),
+            rename_no_replace,
+        )
+    });
     result.set_item("moved", stats.moved)?;
     result.set_item("removed_dirs", stats.removed_dirs)?;
     result.set_item("errors", PyList::new(py, stats.errors)?)?;
@@ -303,13 +318,15 @@ struct FlattenStats {
     source_dir: Option<PathBuf>,
 }
 
+#[cfg(test)]
 fn flatten_single_branch_chain(root: &Path, stats: &mut FlattenStats) {
-    flatten_single_branch_chain_with_publisher(root, stats, rename_no_replace);
+    flatten_single_branch_chain_with_publisher(root, stats, None, rename_no_replace);
 }
 
 fn flatten_single_branch_chain_with_publisher(
     root: &Path,
     stats: &mut FlattenStats,
+    reserved_work: Option<&Path>,
     publish: impl FnOnce(&Path, &Path) -> io::Result<()>,
 ) {
     let chain = discover_flatten_chain(root);
@@ -327,8 +344,19 @@ fn flatten_single_branch_chain_with_publisher(
         }
     };
 
-    let Some(work) = rename_root_to_visible_work(root, stats) else {
-        return;
+    let work = if let Some(work) = reserved_work {
+        if let Err(error) = rename_no_replace(root, work) {
+            stats
+                .errors
+                .push(format!("{}: {error}", normalize_path(work)));
+            return;
+        }
+        work.to_path_buf()
+    } else {
+        let Some(work) = rename_root_to_visible_work(root, stats) else {
+            return;
+        };
+        work
     };
     stats.output_dir = Some(work.clone());
     stats.source_dir = Some(root.to_path_buf());
@@ -618,7 +646,7 @@ mod tests {
         fs::create_dir_all(output.join("outer/inner")).unwrap();
         fs::write(output.join("outer/inner/payload.txt"), b"payload").unwrap();
         let mut stats = FlattenStats::default();
-        flatten_single_branch_chain_with_publisher(&output, &mut stats, |leaf, root| {
+        flatten_single_branch_chain_with_publisher(&output, &mut stats, None, |leaf, root| {
             fs::create_dir(root)?;
             fs::write(root.join("unrelated.txt"), b"unrelated")?;
             rename_no_replace(leaf, root)

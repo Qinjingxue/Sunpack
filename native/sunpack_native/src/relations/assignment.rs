@@ -538,30 +538,52 @@ pub(super) fn resolve_buckets(
             } else {
                 vec![(stem.clone(), members.clone())]
             };
-            // Preserve independently complete local sets. Locality is never
-            // evidence for filling a gap: every partition must independently
-            // satisfy the same structural/name solver before using this rule.
+            // A complete local set is independent even when another directory
+            // has a gap. Only the remaining members may pair across directories.
             let mut local_assignments = HashMap::new();
             if competing_families {
                 let mut local: HashMap<String, Vec<usize>> = HashMap::new();
                 for &i in &members {
                     let parent = Path::new(&rows[i].path).parent().unwrap_or(Path::new(""));
-                    local.entry(path_key(&parent.to_string_lossy())).or_default().push(i);
+                    local
+                        .entry(path_key(&parent.to_string_lossy()))
+                        .or_default()
+                        .push(i);
                 }
                 if local.len() > 1 {
-                    for indexes in local.values() {
-                        let view = BucketView { rows, indexes: indexes.clone(), facts: &facts,
-                            features: &features, format, loose_numeric_allowed: true };
+                    let mut complete = HashSet::new();
+                    let mut local_families = Vec::new();
+                    for indexes in local.into_values() {
+                        let view = BucketView {
+                            rows,
+                            indexes: indexes.clone(),
+                            facts: &facts,
+                            features: &features,
+                            format,
+                            loose_numeric_allowed: true,
+                        };
                         let (assignment, reason) = view.solve();
-                        if reason.is_some() || !view.complete(&assignment) {
-                            local_assignments.clear();
-                            break;
+                        if reason.is_none() && view.complete(&assignment) {
+                            complete.extend(indexes.iter().copied());
+                            local_assignments.insert(indexes[0], assignment);
+                            local_families.push((stem.clone(), indexes));
                         }
-                        local_assignments.insert(indexes[0], assignment);
                     }
-                    if local_assignments.len() == local.len() {
-                        families = local.into_values().map(|indexes| (stem.clone(), indexes)).collect();
-                        competing_families = false;
+                    if !complete.is_empty() {
+                        let remaining: Vec<_> = members
+                            .iter()
+                            .copied()
+                            .filter(|i| !complete.contains(i))
+                            .collect();
+                        competing_families = remaining
+                            .iter()
+                            .filter(|i| head_indexes.contains(i))
+                            .count()
+                            > 1;
+                        if !remaining.is_empty() {
+                            local_families.push((stem.clone(), remaining));
+                        }
+                        families = local_families;
                     }
                 }
             }
@@ -607,19 +629,20 @@ pub(super) fn resolve_buckets(
                     features: &features,
                     format,
                 };
-                let (mut assignment, reason) = if let Some(assignment) = local_assignments.remove(&view.indexes[0]) {
-                    (assignment, None)
-                } else if competing_families {
-                    (
-                        VolumeAssignment {
-                            unresolved: view.indexes.clone(),
-                            ..Default::default()
-                        },
-                        Some(RelationFailureReason::AmbiguousVolumeMapping),
-                    )
-                } else {
-                    view.solve()
-                };
+                let (mut assignment, reason) =
+                    if let Some(assignment) = local_assignments.remove(&view.indexes[0]) {
+                        (assignment, None)
+                    } else if competing_families {
+                        (
+                            VolumeAssignment {
+                                unresolved: view.indexes.clone(),
+                                ..Default::default()
+                            },
+                            Some(RelationFailureReason::AmbiguousVolumeMapping),
+                        )
+                    } else {
+                        view.solve()
+                    };
                 let logical = if family == *stem {
                     assignment
                         .slots
@@ -635,9 +658,18 @@ pub(super) fn resolve_buckets(
                 };
                 if reason.is_none() {
                     if let Some(matching) = launchers.get(&case_key(&logical)) {
-                        let matching: Vec<_> = matching.iter().copied().filter(|i| !local_sets
-                            || Path::new(&rows[*i].path).parent() == Path::new(&rows[view.indexes[0]].path).parent()).collect();
-                        if matching.len() == 1 { assignment.companions = matching; }
+                        let matching: Vec<_> = matching
+                            .iter()
+                            .copied()
+                            .filter(|i| {
+                                !local_sets
+                                    || Path::new(&rows[*i].path).parent()
+                                        == Path::new(&rows[view.indexes[0]].path).parent()
+                            })
+                            .collect();
+                        if matching.len() == 1 {
+                            assignment.companions = matching;
+                        }
                     }
                 }
                 output.extend(materialize(&view, assignment, &logical, reason));

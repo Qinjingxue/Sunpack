@@ -40,15 +40,18 @@ class ArchiveDiscoveryPipeline:
                 )
             else:
                 entry_path, format_hint = table.summary(index)
+                blocked_reason = ""
                 if status == 2:
                     result.blocked_paths.update(table.path_keys(index))
+                    candidate = session.project_native_candidate(table, index)
+                    blocked_reason = str(candidate.relation_anchor.get("relation_failure_reason") or "")
                 result.traces.append(DiscoveryTrace(
                     entry_path=entry_path,
                     source="relations",
                     status="blocked" if status == 2 else "residual",
                     format=format_hint,
                     reason=(
-                        "Relations requires password or additional volume evidence"
+                        blocked_reason or "Relations requires password or additional volume evidence"
                         if status == 2 else ""
                     ),
                 ))

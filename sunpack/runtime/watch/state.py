@@ -111,6 +111,7 @@ class WatchPendingWork:
     active_outputs: dict[str, str] = field(default_factory=dict)
     committed_roots: list[str] = field(default_factory=list)
     completed_sources: list[str] = field(default_factory=list)
+    output_identities: dict[str, str] = field(default_factory=dict)
 
     @property
     def fingerprint(self) -> str:
@@ -871,6 +872,7 @@ class WatchStateStore:
                 ),
                 active_outputs=dict(previous.active_outputs if previous else {}),
                 committed_roots=list(previous.committed_roots if previous else []),
+                output_identities=dict(previous.output_identities if previous else {}),
                 completed_sources=list(previous.completed_sources if previous else []),
             )
             operations = [self._put_operation("pending_work", key, pending)]
@@ -912,6 +914,7 @@ class WatchStateStore:
                 durable_owner=bool(previous.durable_owner if previous else False),
                 active_outputs=dict(previous.active_outputs if previous else {}),
                 committed_roots=list(previous.committed_roots if previous else []),
+                output_identities=dict(previous.output_identities if previous else {}),
                 completed_sources=list(previous.completed_sources if previous else []),
             )
             operations = [self._put_operation("pending_work", key, pending)]
@@ -950,7 +953,13 @@ class WatchStateStore:
                 return False
             active = dict(pending.active_outputs)
             active[os.path.abspath(task_path)] = os.path.abspath(output_dir)
-            updated = replace(pending, active_outputs=active)
+            from sunpack_native import create_output_root, watch_path_identity
+            if not os.path.isdir(output_dir):
+                create_output_root(os.path.abspath(output_dir))
+            volume, identity, _ = watch_path_identity(output_dir)
+            identities = dict(pending.output_identities)
+            identities[os.path.abspath(output_dir)] = f"{volume}|{identity}"
+            updated = replace(pending, active_outputs=active, output_identities=identities)
             self._commit_operations_locked([
                 self._put_operation("pending_work", key, updated),
             ], durable=True)
@@ -975,8 +984,11 @@ class WatchStateStore:
             task_path = os.path.abspath(task_path)
             active = dict(pending.active_outputs)
             if task_path not in active:
-                return False
-            active.pop(task_path)
+                if not keep_output:
+                    return False
+                if output_dir not in pending.committed_roots:
+                    return any(_is_path_under(_path_key(output_dir), _path_key(root)) for root in pending.committed_roots)
+            active.pop(task_path, None)
             roots = list(pending.committed_roots)
             completed = list(pending.completed_sources)
             if keep_output:
@@ -999,8 +1011,16 @@ class WatchStateStore:
                     and not any(_path_key(existing) == task_key for existing in completed)
                 ):
                     completed.append(task_path)
+            identities = dict(pending.output_identities)
+            if keep_output and os.path.isdir(output_dir):
+                from sunpack_native import watch_path_identity
+                volume, identity, _ = watch_path_identity(output_dir)
+                identities[os.path.abspath(output_dir)] = f"{volume}|{identity}"
+            retained = set(active.values()) | set(roots)
+            identities = {path: identity for path, identity in identities.items() if path in retained}
             updated = replace(
                 pending,
+                output_identities=identities,
                 active_outputs=active,
                 committed_roots=roots,
                 completed_sources=completed,
@@ -1141,6 +1161,7 @@ class WatchStateStore:
                     durable_owner=True,
                     active_outputs=dict(previous.active_outputs if previous else {}),
                     committed_roots=list(previous.committed_roots if previous else []),
+                    output_identities=dict(previous.output_identities if previous else {}),
                     completed_sources=list(previous.completed_sources if previous else []),
                 )
                 operations.append(self._put_operation("pending_work", key, pending))

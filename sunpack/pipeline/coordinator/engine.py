@@ -1774,6 +1774,9 @@ class _RequestRuntime:
 
     async def _flatten_output(self, task, output_dir: str, *, broker, cancellation) -> DirectoryFlattenResult:
         def flatten():
+            registry = self.services.output_reservations
+            work_path = (registry.reserve(output_dir + ".__sunpack_flatten_work__",
+                self.submission.request_id, set()) if registry.watch_outputs is not None else None)
             with promotion_barrier(
                 [output_dir],
                 cache_releasers=(release_archive_sessions_under_roots,),
@@ -1782,10 +1785,13 @@ class _RequestRuntime:
                 result = _postprocess_actions_factory(
                     self.config,
                     stdout=self.submission.stdout,
-                ).flattener.flatten_dirs(output_dir)
+                ).flattener.flatten_dirs(output_dir, work_path=work_path)
             outputs = self.services.output_reservations.watch_outputs
             if outputs is not None:
                 outputs.replace(output_dir, result.output_dir)
+            if self.submission.origin == "watch" and result.source_dir and result.output_dir == output_dir:
+                self._report_progress(task, {"type": "semantic", "event": "task_output_finished",
+                    "task_path": task.main_path, "output_dir": result.output_dir, "keep_output": True})
             return result
 
         try:

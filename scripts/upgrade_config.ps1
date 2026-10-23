@@ -1,4 +1,4 @@
-param(
+﻿param(
     [Parameter(Mandatory=$true)][string]$OldAdvanced,
     [Parameter(Mandatory=$true)][string]$NewAdvanced,
     [Parameter(Mandatory=$true)][string]$Template,
@@ -69,6 +69,44 @@ for ($path = $target; $path; $path = [IO.Path]::GetDirectoryName($path)) {
     }
 }
 $acl = [IO.File]::GetAccessControl($target)
+$privilege = $null
+# A different elevated administrator must be able to retain the original owner.
+if ($acl.GetOwner([Security.Principal.SecurityIdentifier]) -ne [Security.Principal.WindowsIdentity]::GetCurrent().User) {
+    if (-not ('SunPackConfigRestorePrivilege' -as [type])) {
+        Add-Type @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+public sealed class SunPackConfigRestorePrivilege : IDisposable {
+    [StructLayout(LayoutKind.Sequential, Pack=4)] struct Privilege { public uint Count; public long Luid; public uint Attributes; }
+    [DllImport("advapi32.dll", SetLastError=true)] static extern bool OpenProcessToken(IntPtr process, uint access, out IntPtr token);
+    [DllImport("advapi32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern bool LookupPrivilegeValue(string system, string name, out long luid);
+    [DllImport("advapi32.dll", SetLastError=true)] static extern bool AdjustTokenPrivileges(IntPtr token, bool disable, ref Privilege value, uint size, out Privilege previous, out uint needed);
+    [DllImport("kernel32.dll")] static extern IntPtr GetCurrentProcess();
+    [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);
+    IntPtr token; Privilege previous;
+    public SunPackConfigRestorePrivilege() {
+        try {
+            if (!OpenProcessToken(GetCurrentProcess(), 0x28, out token)) throw new Win32Exception();
+            Privilege value = new Privilege { Count=1, Attributes=2 };
+            if (!LookupPrivilegeValue(null, "SeRestorePrivilege", out value.Luid)) throw new Win32Exception();
+            uint needed;
+            if (!AdjustTokenPrivileges(token, false, ref value, (uint)Marshal.SizeOf(typeof(Privilege)), out previous, out needed)) throw new Win32Exception();
+            int error = Marshal.GetLastWin32Error();
+            if (error != 0) throw new Win32Exception(error);
+        } catch { Dispose(); throw; }
+    }
+    public void Dispose() {
+        if (token == IntPtr.Zero) return;
+        Privilege ignored; uint needed;
+        if (previous.Count != 0) AdjustTokenPrivileges(token, false, ref previous, (uint)Marshal.SizeOf(typeof(Privilege)), out ignored, out needed);
+        CloseHandle(token); token = IntPtr.Zero;
+    }
+}
+'@
+    }
+    $privilege = New-Object SunPackConfigRestorePrivilege
+}
 $temporary = [IO.Path]::Combine($parent, '.sunpack-config-' + [Guid]::NewGuid().ToString('N') + '.tmp')
 try {
     $text = ($user | ConvertTo-Json -Depth 100) + [Environment]::NewLine
@@ -76,8 +114,12 @@ try {
     $bytes = (New-Object Text.UTF8Encoding($false)).GetBytes($text)
     $stream = New-Object IO.FileStream($temporary, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
     try { $stream.Write($bytes, 0, $bytes.Length); $stream.Flush($true) } finally { $stream.Dispose() }
-    [IO.File]::SetAccessControl($temporary, $acl)
+    $preserved = New-Object Security.AccessControl.FileSecurity
+    $preserved.SetSecurityDescriptorSddlForm($acl.Sddl, ([Security.AccessControl.AccessControlSections]::Access -bor
+        [Security.AccessControl.AccessControlSections]::Owner -bor [Security.AccessControl.AccessControlSections]::Group))
+    [IO.File]::SetAccessControl($temporary, $preserved)
     [IO.File]::Replace($temporary, $target, [System.Management.Automation.Language.NullString]::Value, $false)
 } finally {
-    if ([IO.File]::Exists($temporary)) { [IO.File]::Delete($temporary) }
+    try { if ([IO.File]::Exists($temporary)) { [IO.File]::Delete($temporary) } }
+    finally { if ($null -ne $privilege) { $privilege.Dispose() } }
 }

@@ -67,7 +67,6 @@ def test_watch_service_attaches_and_releases_toast_with_watch_lifecycle(tmp_path
     captured = {}
 
     class Engine:
-        output_ownership = None
         async def __aenter__(self):
             return self
 
@@ -1114,7 +1113,6 @@ def test_watch_service_new_scheduler_inherits_foreground_activity(tmp_path, monk
     activity = []
 
     class Engine:
-        output_ownership = None
         async def __aenter__(self):
             return self
 

@@ -36,9 +36,11 @@ def test_flatten_relocates_nested_outputs_and_reports_retained_work(tmp_path, mo
         state.add_target_result(result)
     state.add_cleanup_result(ArchiveCleanupResult(leaf + "/inner.001", "recycle", "failed", message="locked"))
     runtime = object.__new__(_RequestRuntime)
+    from sunpack.core.support.output_reservation import OutputReservationRegistry
+    runtime.services = SimpleNamespace(output_reservations=OutputReservationRegistry())
     runtime.config = {"post_extract": {"archive_cleanup_mode": "keep"}}
     runtime.context = state
-    runtime.submission = SimpleNamespace(request_id="request", stdout=io.StringIO(), targets=(PipelineTarget("outer.carrier"),))
+    runtime.submission = SimpleNamespace(request_id="request", origin="foreground", stdout=io.StringIO(), targets=(PipelineTarget("outer.carrier"),))
     runtime.reporter = RunReporter(stdout=runtime.submission.stdout)
     runtime.reporter._top_level_outputs[root] = root
     ownership = _RequestResults(runtime.submission, runtime.config)
@@ -72,9 +74,11 @@ def test_flatten_exception_is_a_postprocess_warning(tmp_path, monkeypatch):
 
     monkeypatch.setattr(module, "_native_flatten_single_branch_directories", fail)
     runtime = object.__new__(_RequestRuntime)
+    from sunpack.core.support.output_reservation import OutputReservationRegistry
+    runtime.services = SimpleNamespace(output_reservations=OutputReservationRegistry())
     runtime.config = {"post_extract": {"archive_cleanup_mode": "keep"}}
     runtime.context = RunState()
-    runtime.submission = SimpleNamespace(request_id="request", stdout=io.StringIO())
+    runtime.submission = SimpleNamespace(request_id="request", origin="foreground", stdout=io.StringIO())
     runtime.reporter = RunReporter(stdout=runtime.submission.stdout)
     result = asyncio.run(runtime._flatten_output(
         SimpleNamespace(key="task", main_path="source"), str(tmp_path),

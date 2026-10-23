@@ -201,7 +201,7 @@ class ArchiveJobExecutor:
             self._report_task_finished(task, terminal, depth)
             return task, terminal
 
-        if self.output_reservations is not None:
+        if self.output_reservations is not None and self.output_reservations.watch_outputs is not None:
             await broker.run("watch_output_root", file_id, self.output_reservations.register_watch_output,
                              planned_out_dir, request_id=self.request_id, cancellation=cancellation)
         if self.origin == "watch":

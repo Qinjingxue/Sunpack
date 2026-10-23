@@ -374,6 +374,8 @@ def test_shared_output_password_retry_keeps_original_input_detection_mode(tmp_pa
         ordinary_root = tmp_path / "ordinary"
         ordinary_root.mkdir()
         watcher.watch_roots.append(str(ordinary_root))
+        from sunpack.core.contracts.discovery_scope import DiscoveryScope
+        watcher.scopes[scheduler_module.path_key(str(ordinary_root))] = DiscoveryScope(str(ordinary_root))
         watcher.root_entries[scheduler_module.path_key(str(ordinary_root))] = WatchRootEntry(
             str(ordinary_root), str(output), False,
         )

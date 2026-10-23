@@ -82,3 +82,14 @@ def test_installer_field_upgrade_preserves_values_modules_and_acl(tmp_path, repo
     assert failed.returncode != 0
     assert paths["user"].read_bytes() == committed and acl() == original_acl
     assert not list(tmp_path.glob(".sunpack-config-*.tmp"))
+
+
+def test_upgrade_by_different_administrator_preserves_ordinary_users_owner_and_acl(tmp_path, repo_root):
+    # Same-account ACL checks cannot detect owner replacement during elevation.
+    completed = subprocess.run([
+        "powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+        "-File", str(repo_root / "tests/helpers/config_upgrade_permissions.ps1"),
+        "-RepoRoot", str(repo_root), "-Fixture", str(tmp_path / "ordinary-user"),
+    ], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60)
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert (tmp_path / "ordinary-user/verified").read_text() == "ok"

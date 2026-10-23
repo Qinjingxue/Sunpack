@@ -40,7 +40,7 @@ class WatchOutputRoots:
         if not self._relevant(path):
             return
         with self._lock:
-            if self._closed:
+            if self._closed or self.protected(path):
                 return
             # Reservations already exclude this root before mkdir emits events.
             # Only Watch-relevant outputs incur identity IO and a WAL record.
@@ -53,7 +53,9 @@ class WatchOutputRoots:
             "value": {"path": os.path.abspath(path), "identities": [self._identity(path)]}}], durable=True)
 
     def protected(self, path):
-        return self.state._native.owned_root(path) is not None
+        with self._lock:
+            root = self.state._native.owned_root(path)
+            return root is not None
 
     def reconcile(self, path, *, recursive=False):
         normalized = path_key(path)
@@ -75,26 +77,10 @@ class WatchOutputRoots:
             if self._closed:
                 return
             if self._relevant(destination) and os.path.isdir(destination):
-                self._put(destination)
+                ancestor = self.state._native.owned_root(destination)
+                if ancestor is None or ancestor == path_key(destination):
+                    self._put(destination)
             self.reconcile(source, recursive=True)
-
-    def relocate(self, source, destination):
-        source_key = path_key(source)
-        with self._lock:
-            if self._closed:
-                return
-            changes = []
-            for key in self.state._native.runtime_keys("owned|" + source_key):
-                record = self.state._native.runtime_record(key)
-                relative = os.path.relpath(record["path"], source)
-                if relative == os.pardir or relative.startswith(os.pardir + os.sep):
-                    continue
-                target = os.path.normpath(os.path.join(destination, relative))
-                moved = {**record, "path": target}
-                if self._relevant(target) and self._matches(moved):
-                    changes.append({"op": "runtime", "key": "owned|" + path_key(target), "value": moved})
-                changes.append({"op": "runtime", "key": key})
-            self.state.commit_runtime(changes, durable=True)
 
     def close(self):
         with self._lock:

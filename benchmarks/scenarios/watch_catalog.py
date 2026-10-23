@@ -12,6 +12,7 @@ from sunpack.core.support.path_keys import path_key
 from sunpack.pipeline.discovery.filesystem.directory_scanner import DirectoryScanner
 from sunpack.runtime.watch.state import WatchStateStore
 from sunpack_native import NativeWatchCatalog
+from sunpack.runtime.watch.output_roots import WatchOutputRoots
 
 
 def main(argv=None):
@@ -28,7 +29,7 @@ def main(argv=None):
     report = BenchmarkReport("scan.watch-catalog", parameters={
         "files": args.files, "protected_files": args.protected_files,
         "bucket_size": args.bucket_size, "rounds": args.rounds,
-        "method": "Real empty disguised files across 100 directories. Compare the current native bucket path with scope re-enumeration on identical authorized inputs; this is not a comparison with a previous release. File updates stay in memory; only output exclusions are persisted. No archive extraction or Broker is needed.",
+        "method": "Real empty disguised files across 100 directories. Compare the current native bucket path with scope re-enumeration on identical authorized inputs; this is not a comparison with a previous release. File updates use an independent index WAL and checkpoint; reload is measured without re-enumeration. No archive extraction or Broker is needed.",
     })
     sampler = ProcessSampler()
     with BenchmarkWorkspace(report.scenario, results_root=args.results_root) as workspace:
@@ -54,16 +55,15 @@ def main(argv=None):
         state_path = workspace.work / "state.json"
         state = WatchStateStore(str(state_path))
         try:
-            state.commit_runtime([{"op": "runtime", "key": "owned|" + path_key(str(generated)),
-                "value": {"path": str(generated), "owner": "", "identities": [], "state": "retained"}}])
-            catalog = NativeWatchCatalog(state._native)
+            outputs = WatchOutputRoots(state, (scope,))
+            outputs.register(str(generated))
+            catalog = NativeWatchCatalog(state._native, str(workspace.work))
             def update(path=None):
                 errors = options.catalog_update(catalog, scope.native, path)
                 if errors:
                     raise OSError(errors)
-                return 1
             cold = measure(update, runs=1)[0]
-            report.samples.append({"phase": "initial_catalog", **cold.to_dict(), "operations": cold.value})
+            report.samples.append({"phase": "initial_catalog", **cold.to_dict()})
             del cold
             gc.collect()
             resident_memory = sampler.take().to_dict()
@@ -87,16 +87,26 @@ def main(argv=None):
             updates = measure(event, runs=args.rounds)
             report.summary.update({
                 "bucket": timing_summary(lookup), "scope_reenumeration": timing_summary(enumeration),
-                "file_update_and_bucket": timing_summary(updates),
+                "file_update_wal_and_bucket": timing_summary(updates),
+                "index_wal_bytes": (workspace.work / "catalog.wal").stat().st_size,
                 "initial_memory": baseline_memory, "catalog_memory": resident_memory,
-                "update_operations_max": max(row.value for row in updates),
             })
-            state.save()
-            report.summary["checkpoint_bytes"] = state_path.stat().st_size
+            checkpoint = measure(catalog.close, runs=1)[0]
+            report.summary["index_checkpoint_ms"] = checkpoint.wall_ms
+            report.summary["index_checkpoint_bytes"] = (workspace.work / "catalog.snapshot").stat().st_size
+            catalog = None
+            def restore():
+                nonlocal catalog
+                catalog = NativeWatchCatalog(state._native, str(workspace.work))
+                return bucket()
+            restored = measure(restore, runs=1)[0]
+            if restored.value != args.bucket_size:
+                raise RuntimeError("Incomplete restored index")
+            report.summary["index_restore_ms"] = restored.wall_ms
+            catalog.close()
             catalog = None
             gc.collect()
             report.summary["after_removal_memory"] = sampler.take().to_dict()
-            report.summary["live_records_after_removal"] = 0
         finally:
             state.close()
             write_report(report, workspace.result_dir / "report.json")

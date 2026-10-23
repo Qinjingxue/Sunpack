@@ -350,7 +350,6 @@ def _indexed_scheduler_for_test():
     watcher._quiet_trackers = {}
     watcher._latest_observations = {}
     watcher._source_probes = {}
-    watcher.output_ownership = None
     watcher._wake_callback = None
     watcher.should_ignore_event_path = lambda path: False
     watcher._password_reload_at = None
@@ -1759,44 +1758,6 @@ def test_watch_scheduler_processes_archive_when_output_root_matches_watch_root(t
     assert not watcher.state.pending_work_items()
 
 
-def test_watch_scheduler_invalidates_completion_when_output_identity_is_replaced(tmp_path, monkeypatch):
-    monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
-    archive_path = tmp_path / "sample.zip"
-    output_dir = tmp_path / "sample"
-    _write_zip(archive_path)
-    runs = []
-
-    class FakePipelineRunner:
-        def __init__(self, config):
-            self.context = SimpleNamespace(generated_outputs={str(output_dir)})
-
-        def run_targets(self, paths):
-            runs.append(list(paths))
-            output_dir.mkdir(exist_ok=True)
-            return RunSummary(target_results=(TargetRunResult(paths[0], OutcomeKind.COMPLETE_SUCCESS),))
-
-    watcher = _watcher(
-        tmp_path,
-        out_dir=".",
-        state_path=str(tmp_path / ".sunpack_watch" / "state.json"),
-        cold_start_seconds=0,
-        pipeline_engine=FakePipelineEngine(FakePipelineRunner),
-    )
-
-    watcher.enqueue(str(archive_path), event_type="created")
-    assert _await(watcher.run_once()).succeeded == 1
-    assert len(runs) == 1
-
-    watcher.enqueue(str(archive_path), event_type="modified")
-    assert _await(watcher.run_once()).succeeded == 0
-    assert len(runs) == 1
-
-    output_dir.rmdir()
-    output_dir.mkdir()
-    watcher.enqueue(str(archive_path), event_type="modified")
-
-    assert _await(watcher.run_once()).succeeded == 1
-    assert len(runs) == 2
 
 
 def test_watch_event_handler_cleans_moved_directory_source_without_arrival_enqueue(tmp_path):

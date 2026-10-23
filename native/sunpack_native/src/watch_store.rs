@@ -46,11 +46,13 @@ struct PendingRecord {
     source_input_root: String,
     internal_recovery: bool,
     #[serde(default)]
-    discovery_scope: Map<String,Value>,
+    discovery_scope: Map<String, Value>,
     durable_owner: bool,
     active_outputs: BTreeMap<String, String>,
     committed_roots: Vec<String>,
     completed_sources: Vec<String>,
+    #[serde(default)]
+    output_identities: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -110,8 +112,11 @@ impl StateData {
             Operation::Runtime(key, value) => {
                 // Legacy catalog/completion transactions are read but discarded.
                 if key.starts_with("owned|") {
-                    if let Some(value) = value { self.runtime.insert(key.clone(), value.clone()); }
-                    else { self.runtime.remove(key); }
+                    if let Some(value) = value {
+                        self.runtime.insert(key.clone(), value.clone());
+                    } else {
+                        self.runtime.remove(key);
+                    }
                 }
             }
             Operation::PutPending(key, record) => {
@@ -164,7 +169,7 @@ struct SnapshotDocument<'a> {
     watch_cursors: &'a BTreeMap<String, Cursor>,
     pending_work: BTreeMap<&'a str, &'a PendingRecord>,
     entries: BTreeMap<&'a str, &'a EntryRecord>,
-    runtime: &'a BTreeMap<String,Value>,
+    runtime: &'a BTreeMap<String, Value>,
 }
 
 #[derive(Deserialize)]
@@ -177,7 +182,7 @@ struct SnapshotInput {
     pending_work: BTreeMap<String, PendingRecord>,
     entries: BTreeMap<String, EntryRecord>,
     #[serde(default)]
-    runtime: BTreeMap<String,Value>,
+    runtime: BTreeMap<String, Value>,
 }
 
 #[derive(Deserialize)]
@@ -260,17 +265,25 @@ impl NativeWatchState {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
-
 }
 
 #[pymethods]
 impl NativeWatchState {
     fn runtime_record(&self, py: Python<'_>, key: &str) -> PyResult<Option<Py<PyDict>>> {
-        self.lock().runtime.get(key).map(|v| to_py_dict(py, v)).transpose()
+        self.lock()
+            .runtime
+            .get(key)
+            .map(|v| to_py_dict(py, v))
+            .transpose()
     }
 
     fn runtime_keys(&self, prefix: &str) -> Vec<String> {
-        self.lock().runtime.range(prefix.to_owned()..).take_while(|(key,_)|key.starts_with(prefix)).map(|(key,_)|key.clone()).collect()
+        self.lock()
+            .runtime
+            .range(prefix.to_owned()..)
+            .take_while(|(key, _)| key.starts_with(prefix))
+            .map(|(key, _)| key.clone())
+            .collect()
     }
 
     fn owned_root(&self, path: &str) -> Option<String> {
@@ -278,8 +291,16 @@ impl NativeWatchState {
         let mut current = key.trim_end_matches('\\');
         let data = self.lock();
         loop {
-            if data.runtime.contains_key(&format!("owned|{current}")) { return Some(current.to_owned()); }
-            let Some((parent, _)) = current.rsplit_once('\\') else { return None; };
+            if data
+                .runtime
+                .get(&format!("owned|{current}"))
+                .is_some_and(output_identity_matches)
+            {
+                return Some(current.to_owned());
+            }
+            let Some((parent, _)) = current.rsplit_once('\\') else {
+                return None;
+            };
             current = parent;
         }
     }
@@ -600,8 +621,14 @@ fn decode_operation(operation: &Value) -> PyResult<Operation> {
         .ok_or_else(|| PyTypeError::new_err("journal operation op must be a string"))?;
     match action {
         "runtime" => {
-            let key = object.get("key").and_then(Value::as_str).ok_or_else(|| invalid("runtime key missing"))?;
-            return Ok(Operation::Runtime(key.to_owned(), object.get("value").filter(|v|!v.is_null()).cloned()));
+            let key = object
+                .get("key")
+                .and_then(Value::as_str)
+                .ok_or_else(|| invalid("runtime key missing"))?;
+            return Ok(Operation::Runtime(
+                key.to_owned(),
+                object.get("value").filter(|v| !v.is_null()).cloned(),
+            ));
         }
         "set_metadata" => {
             require_fields(object, &["op", "value"])?;
@@ -698,7 +725,11 @@ fn load_snapshot_file(path: &str) -> PyResult<(u64, StateData)> {
     let checkpoint_seq = snapshot.checkpoint_seq;
     let password_generation = snapshot.password_generation;
     let data = StateData {
-        runtime: snapshot.runtime.into_iter().filter(|(key,_)|key.starts_with("owned|")).collect(),
+        runtime: snapshot
+            .runtime
+            .into_iter()
+            .filter(|(key, _)| key.starts_with("owned|"))
+            .collect(),
         pending: snapshot
             .pending_work
             .into_values()
@@ -881,5 +912,19 @@ mod tests {
         assert!(!is_path_under("c:\\ab", "c:\\a"));
         assert!(!is_path_under("c:\\a", "c:\\a"));
         assert!(is_path_under("c:\\a", "c:\\"));
+    }
+}
+
+/// Ignore only the directory actually recorded; a reused path is ordinary input.
+pub(crate) fn output_identity_matches(record: &Value) -> bool {
+    let Some(path) = record["path"].as_str() else {
+        return false;
+    };
+    match crate::filesystem::watch_path_identity(path) {
+        Ok((volume, id, _)) => record["identities"].as_array().is_some_and(|ids| {
+            ids.iter()
+                .any(|value| value.as_str() == Some(&format!("{volume}|{id}")))
+        }),
+        Err(_) => false,
     }
 }

@@ -57,7 +57,11 @@ impl NativeDirectorySnapshot {
         table.scan_errors = errors.into_messages();
         let table = Arc::new(table);
         let rows = (0..table.paths.len()).collect();
-        Self { table, rows, buckets: OnceLock::new() }
+        Self {
+            table,
+            rows,
+            buckets: OnceLock::new(),
+        }
     }
 
     fn from_views(
@@ -761,19 +765,31 @@ fn output_file_dict(py: Python<'_>, item: &OutputFileRecord) -> PyResult<Py<PyDi
 impl NativeDirectorySnapshot {
     /// A lazy name index over this view; rows and existing Rust head facts stay shared.
     fn relation_bucket(&self, seed: &str) -> Self {
-        let stem = |path: &str| crate::path_keys::case_key(crate::relations::first_dot_stem(
-            Path::new(path).file_name().and_then(|name| name.to_str()).unwrap_or_default()));
+        let stem = |path: &str| {
+            crate::path_keys::case_key(crate::relations::first_dot_stem(
+                Path::new(path)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or_default(),
+            ))
+        };
         let buckets = self.buckets.get_or_init(|| {
             let mut buckets: HashMap<String, Vec<usize>> = HashMap::new();
             for &row in &self.rows {
                 if !self.table.is_dirs[row] {
-                    buckets.entry(stem(&self.table.paths[row])).or_default().push(row);
+                    buckets
+                        .entry(stem(&self.table.paths[row]))
+                        .or_default()
+                        .push(row);
                 }
             }
             buckets
         });
-        Self { table: Arc::clone(&self.table),
-            rows: buckets.get(&stem(seed)).cloned().unwrap_or_default(), buckets: OnceLock::new() }
+        Self {
+            table: Arc::clone(&self.table),
+            rows: buckets.get(&stem(seed)).cloned().unwrap_or_default(),
+            buckets: OnceLock::new(),
+        }
     }
 
     fn scan_errors(&self) -> Vec<DirectoryReadError> {
@@ -1206,107 +1222,135 @@ impl NativeDirectoryScanOptions {
     }
 
     #[pyo3(signature = (state, scope, changed=None, _subtree=false))]
-    fn catalog_update(&self, py: Python<'_>, state: &NativeWatchCatalog,
-        scope: &crate::scan::scope::NativeDiscoveryScope, changed: Option<&str>, _subtree: bool)
-        -> PyResult<Vec<DirectoryReadError>> {
-        py.detach(|| {
-            let target = changed.unwrap_or(&scope.root);
-            let mut effective = scope.clone();
-            effective.exclude_roots(state.output_roots().into_iter());
-            let mut options = self.options.clone(); options.scope = Some(effective.clone());
-            let records = if !effective.contains(target) || state.is_owned(target) {
-                DirectoryScanRecords { filtered: Vec::new(), raw: Vec::new(), errors: DirectoryReadErrors::report() }
-            } else {
-                match fs::metadata(target) {
-                    Ok(_) => scan_directory_views(target, scope.max_depth, &options)?,
-                    Err(error) => {
-                        let mut errors = DirectoryReadErrors::new(Path::new(target));
-                        if error.kind() != std::io::ErrorKind::NotFound { errors.push(Path::new(target),"metadata",error); }
-                        DirectoryScanRecords { filtered: Vec::new(), raw: Vec::new(), errors }
-                    }
-                }
-            };
-            let errors = records.errors.into_messages();
-            let scope_key = crate::path_keys::path_key(&scope.root);
-            let target_key = crate::path_keys::path_key(target);
-            let mut catalogs = state.catalogs.lock().unwrap_or_else(|e|e.into_inner());
-            let catalog = catalogs.entry(scope_key).or_default();
-            let mut present = HashSet::new();
-            for record in records.raw.into_iter().filter(|r| !r.is_dir && effective.contains(&r.path)) {
-                let key: Arc<str> = Arc::from(crate::path_keys::path_key(&record.path));
-                present.insert(Arc::clone(&key));
-                catalog.buckets.entry(catalog_stem(&record.path)).or_default().insert(Arc::clone(&key));
-                catalog.rows.insert(key, record);
-            }
-            if errors.is_empty() {
-                let removed: Vec<_> = catalog.rows.range::<str,_>((std::ops::Bound::Included(target_key.as_str()),std::ops::Bound::Unbounded))
-                    .take_while(|(key,_)|key.starts_with(&target_key))
-                    .filter(|(key,_)|(key.as_ref() == target_key || key[target_key.len()..].starts_with('\\')) && !present.contains(*key))
-                    .map(|(key,_)|Arc::clone(key)).collect();
-                for key in removed {
-                    if let Some(row) = catalog.rows.remove(&key) {
-                        let stem = catalog_stem(&row.path);
-                        if let Some(bucket) = catalog.buckets.get_mut(&stem) {
-                            bucket.remove(&key);
-                            if bucket.is_empty() { catalog.buckets.remove(&stem); }
-                        }
-                    }
-                }
-            }
-            Ok(errors)
-        })
+    fn catalog_update(
+        &self,
+        py: Python<'_>,
+        state: &NativeWatchCatalog,
+        scope: &crate::scan::scope::NativeDiscoveryScope,
+        changed: Option<&str>,
+        _subtree: bool,
+    ) -> PyResult<Vec<DirectoryReadError>> {
+        Ok(update_catalog(self, py, state, scope, changed, false)?.0)
+    }
+
+    #[pyo3(signature = (state, scope, changed=None))]
+    fn catalog_refresh(
+        &self,
+        py: Python<'_>,
+        state: &NativeWatchCatalog,
+        scope: &crate::scan::scope::NativeDiscoveryScope,
+        changed: Option<&str>,
+    ) -> PyResult<(Vec<DirectoryReadError>, Vec<String>)> {
+        update_catalog(self, py, state, scope, changed, true)
     }
 
     #[pyo3(signature = (state, scope, under=None))]
-    fn catalog_candidates(&self, py: Python<'_>, state: &NativeWatchCatalog,
-        scope: &crate::scan::scope::NativeDiscoveryScope, under: Option<&str>) -> PyResult<Py<PyList>> {
+    fn catalog_candidates(
+        &self,
+        py: Python<'_>,
+        state: &NativeWatchCatalog,
+        scope: &crate::scan::scope::NativeDiscoveryScope,
+        under: Option<&str>,
+    ) -> PyResult<Py<PyList>> {
         let target = crate::path_keys::path_key(under.unwrap_or(&scope.root));
-        let records: Vec<String> = state.catalogs.lock().unwrap_or_else(|e|e.into_inner()).get(&crate::path_keys::path_key(&scope.root))
-            .into_iter().flat_map(|catalog|catalog.rows.range::<str,_>((std::ops::Bound::Included(target.as_str()),std::ops::Bound::Unbounded))
-                .take_while(|(key,_)|key.starts_with(&target))
-                .filter(|(key,_)|key.as_ref() == target || key[target.len()..].starts_with('\\'))
-                .map(|(_,row)|row.path.clone())).collect();
+        let records: Vec<String> = state
+            .catalogs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&crate::path_keys::path_key(&scope.root))
+            .into_iter()
+            .flat_map(|catalog| {
+                catalog
+                    .rows
+                    .range::<str, _>((
+                        std::ops::Bound::Included(target.as_str()),
+                        std::ops::Bound::Unbounded,
+                    ))
+                    .take_while(|(key, _)| key.starts_with(&target))
+                    .filter(|(key, _)| {
+                        key.as_ref() == target || key[target.len()..].starts_with('\\')
+                    })
+                    .filter(|(_, row)| !row.is_dir)
+                    .map(|(_, row)| row.path.clone())
+            })
+            .collect();
         let values = PyList::empty(py);
         for path in &records {
             if scope.contains(path) && !state.is_owned(path) {
-                if let Some(value) = crate::postprocess::watch_candidate_for_path(py,path,None)? { values.append(value)?; }
+                if let Some(value) = crate::postprocess::watch_candidate_for_path(py, path, None)? {
+                    values.append(value)?;
+                }
             }
         }
         Ok(values.unbind())
     }
 
-    fn catalog_snapshot(&self, py: Python<'_>, state: &NativeWatchCatalog,
-        scope: &crate::scan::scope::NativeDiscoveryScope, seed: &str)
-        -> PyResult<(Py<NativeDirectorySnapshot>, Py<NativeDirectorySnapshot>)> {
+    fn catalog_snapshot(
+        &self,
+        py: Python<'_>,
+        state: &NativeWatchCatalog,
+        scope: &crate::scan::scope::NativeDiscoveryScope,
+        seed: &str,
+    ) -> PyResult<(Py<NativeDirectorySnapshot>, Py<NativeDirectorySnapshot>)> {
         let mut raw: Vec<DirectoryEntryRecord> = {
-            let data = state.catalogs.lock().unwrap_or_else(|e|e.into_inner());
-            data.get(&crate::path_keys::path_key(&scope.root)).into_iter()
-                .flat_map(|catalog|catalog.buckets.get(&catalog_stem(seed)).into_iter().flatten()
-                    .filter_map(|key|catalog.rows.get(key)))
-                .filter(|row|scope.contains(&row.path) && !state.is_owned(&row.path))
-                .cloned().collect()
+            let data = state.catalogs.lock().unwrap_or_else(|e| e.into_inner());
+            data.get(&crate::path_keys::path_key(&scope.root))
+                .into_iter()
+                .flat_map(|catalog| {
+                    catalog
+                        .buckets
+                        .get(&catalog_stem(seed))
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|key| catalog.rows.get(key))
+                })
+                .filter(|row| scope.contains(&row.path) && !state.is_owned(&row.path))
+                .cloned()
+                .collect()
         };
         let root = Path::new(&scope.root);
         let mut accepted = HashSet::new();
         let mut directory_cache = HashMap::new();
         for row in &mut raw {
             row.relation_member_eligible = scope.contains(&row.path)
-                && !file_under_rejected_directory(Path::new(&row.path),root,&self.options,&mut directory_cache)
+                && !file_under_rejected_directory(
+                    Path::new(&row.path),
+                    root,
+                    &self.options,
+                    &mut directory_cache,
+                )
                 && !file_rejected_by_path(Path::new(&row.path), root, &self.options)
                 && numeric_ranges_allow(&self.options.mtime_ranges, row.mtime_ns);
-            if row.relation_member_eligible && numeric_ranges_allow(&self.options.size_ranges, row.size) {
-                accepted.extend(crate::relations::relations_size_filter_split_family_keys(&row.path));
+            if row.relation_member_eligible
+                && numeric_ranges_allow(&self.options.size_ranges, row.size)
+            {
+                accepted.extend(crate::relations::relations_size_filter_split_family_keys(
+                    &row.path,
+                ));
             }
         }
-        let filtered = raw.iter().filter(|r| r.relation_member_eligible && (numeric_ranges_allow(&self.options.size_ranges,r.size)
-            || crate::relations::relations_size_filter_split_family_keys(&r.path).iter().any(|k| accepted.contains(k)))).cloned().collect();
+        let filtered = raw
+            .iter()
+            .filter(|r| {
+                r.relation_member_eligible
+                    && (numeric_ranges_allow(&self.options.size_ranges, r.size)
+                        || crate::relations::relations_size_filter_split_family_keys(&r.path)
+                            .iter()
+                            .any(|k| accepted.contains(k)))
+            })
+            .cloned()
+            .collect();
         py.detach(|| populate_relation_anchors(&mut raw));
-        let (filtered, raw) = NativeDirectorySnapshot::from_views(filtered,raw,DirectoryReadErrors::report());
-        Ok((Py::new(py,filtered)?,Py::new(py,raw)?))
+        let (filtered, raw) =
+            NativeDirectorySnapshot::from_views(filtered, raw, DirectoryReadErrors::report());
+        Ok((Py::new(py, filtered)?, Py::new(py, raw)?))
     }
 
-    fn scan_scope(&self, py: Python<'_>, scope: &crate::scan::scope::NativeDiscoveryScope)
-        -> PyResult<(Py<NativeDirectorySnapshot>, Py<NativeDirectorySnapshot>)> {
+    fn scan_scope(
+        &self,
+        py: Python<'_>,
+        scope: &crate::scan::scope::NativeDiscoveryScope,
+    ) -> PyResult<(Py<NativeDirectorySnapshot>, Py<NativeDirectorySnapshot>)> {
         let mut options = self.options.clone();
         options.scope = Some(scope.clone());
         scan_snapshots_with_options(py, &scope.root, scope.max_depth, &options)
@@ -2553,7 +2597,11 @@ fn scan_directory_impl<const PROFILE: bool>(
 ) -> PyResult<DirectoryScanRecords> {
     let scan_started = Instant::now();
     let root = PathBuf::from(root_path);
-    let filter_root = options.scope.as_ref().map(|s| Path::new(&s.root)).unwrap_or(&root);
+    let filter_root = options
+        .scope
+        .as_ref()
+        .map(|s| Path::new(&s.root))
+        .unwrap_or(&root);
     let mut errors = DirectoryReadErrors::new(&root);
     let metadata = match fs::metadata(&root) {
         Ok(metadata) => Some(metadata),
@@ -2574,18 +2622,35 @@ fn scan_directory_impl<const PROFILE: bool>(
             errors,
         });
     }
-    if options.scope.as_ref().is_some_and(|scope| !scope.contains(root_path)) {
-        return Ok(DirectoryScanRecords { filtered: Vec::new(), raw: Vec::new(), errors });
+    if options
+        .scope
+        .as_ref()
+        .is_some_and(|scope| !scope.contains(root_path))
+    {
+        return Ok(DirectoryScanRecords {
+            filtered: Vec::new(),
+            raw: Vec::new(),
+            errors,
+        });
     }
     let mut directory_cache = HashMap::new();
-    if root != filter_root && (dir_rejected(&root, filter_root, options)
-        && metadata.as_ref().is_some_and(|metadata| metadata.is_dir())
-        || file_under_rejected_directory(&root, filter_root, options, &mut directory_cache)) {
-        return Ok(DirectoryScanRecords { filtered: Vec::new(), raw: Vec::new(), errors });
+    if root != filter_root
+        && (dir_rejected(&root, filter_root, options)
+            && metadata.as_ref().is_some_and(|metadata| metadata.is_dir())
+            || file_under_rejected_directory(&root, filter_root, options, &mut directory_cache))
+    {
+        return Ok(DirectoryScanRecords {
+            filtered: Vec::new(),
+            raw: Vec::new(),
+            errors,
+        });
     }
     if metadata.as_ref().is_some_and(|metadata| metadata.is_file()) {
-        let match_root = if options.scope.is_some() { filter_root }
-            else { root.parent().unwrap_or_else(|| Path::new("")) };
+        let match_root = if options.scope.is_some() {
+            filter_root
+        } else {
+            root.parent().unwrap_or_else(|| Path::new(""))
+        };
         let raw = collect_raw
             .then(|| {
                 fs::metadata(&root)
@@ -2595,8 +2660,12 @@ fn scan_directory_impl<const PROFILE: bool>(
                         is_dir: false,
                         size: Some(metadata.len()),
                         mtime_ns: metadata_mtime_ns(&metadata),
-                        relation_member_eligible: !file_rejected_by_path(&root, match_root, options)
-                            && numeric_ranges_allow(&options.mtime_ranges, metadata_mtime_ns(&metadata)),
+                        relation_member_eligible: !file_rejected_by_path(
+                            &root, match_root, options,
+                        ) && numeric_ranges_allow(
+                            &options.mtime_ranges,
+                            metadata_mtime_ns(&metadata),
+                        ),
                         relation_anchor: None,
                     })
             })
@@ -2620,9 +2689,17 @@ fn scan_directory_impl<const PROFILE: bool>(
     let mut raw_records = Vec::new();
     let mut size_accepted_split_families = HashSet::new();
     let mut size_deferred_split_records = Vec::new();
-    let start_depth = options.scope.as_ref().and_then(|scope| scope.directory_depth(root_path)).unwrap_or(0);
+    let start_depth = options
+        .scope
+        .as_ref()
+        .and_then(|scope| scope.directory_depth(root_path))
+        .unwrap_or(0);
     if max_depth.is_some_and(|limit| start_depth > limit) {
-        return Ok(DirectoryScanRecords { filtered: Vec::new(), raw: Vec::new(), errors });
+        return Ok(DirectoryScanRecords {
+            filtered: Vec::new(),
+            raw: Vec::new(),
+            errors,
+        });
     }
     let mut stack = vec![(root.clone(), start_depth)];
     while let Some((dir, depth)) = stack.pop() {
@@ -2667,7 +2744,11 @@ fn scan_directory_impl<const PROFILE: bool>(
                 measure::<PROFILE, _>(&mut profile, ProfileBucket::DirectoryEnumeration, || {
                     entry.path()
                 });
-            if options.scope.as_ref().is_some_and(|scope| scope.excludes(&path.to_string_lossy())) {
+            if options
+                .scope
+                .as_ref()
+                .is_some_and(|scope| scope.excludes(&path.to_string_lossy()))
+            {
                 continue;
             }
             let metadata =
@@ -3024,53 +3105,435 @@ fn metadata_mtime_ns(metadata: &fs::Metadata) -> Option<u64> {
     u64::try_from(duration.as_nanos()).ok()
 }
 
-pub(crate) fn scope_file_paths(scope: &crate::scan::scope::NativeDiscoveryScope) -> PyResult<(Vec<PathBuf>,Vec<DirectoryReadError>)> {
-    let mut options = DirectoryScanOptions::new(Vec::new(),Vec::new(),Vec::new(),Vec::new(),Vec::new(),Vec::new(),Vec::new())?;
-    options.scope=Some(scope.clone());
-    let records = scan_directory_views(&scope.root,scope.max_depth,&options)?;
-    Ok((records.raw.into_iter().filter(|r| !r.is_dir).map(|r| PathBuf::from(r.path)).collect(),records.errors.into_messages()))
+pub(crate) fn scope_file_paths(
+    scope: &crate::scan::scope::NativeDiscoveryScope,
+) -> PyResult<(Vec<PathBuf>, Vec<DirectoryReadError>)> {
+    let mut options = DirectoryScanOptions::new(
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    )?;
+    options.scope = Some(scope.clone());
+    let records = scan_directory_views(&scope.root, scope.max_depth, &options)?;
+    Ok((
+        records
+            .raw
+            .into_iter()
+            .filter(|r| !r.is_dir)
+            .map(|r| PathBuf::from(r.path))
+            .collect(),
+        records.errors.into_messages(),
+    ))
 }
 
-
 #[derive(Default)]
-struct ScopeCatalog {
-    rows: std::collections::BTreeMap<Arc<str>, DirectoryEntryRecord>,
-    buckets: HashMap<String, HashSet<Arc<str>>>,
+pub(super) struct ScopeCatalog {
+    pub(super) rows: std::collections::BTreeMap<Arc<str>, DirectoryEntryRecord>,
+    buckets: HashMap<String, Vec<Arc<str>>>,
 }
 
 fn catalog_stem(path: &str) -> String {
     crate::path_keys::case_key(crate::relations::first_dot_stem(
-        Path::new(path).file_name().and_then(|name|name.to_str()).unwrap_or_default()))
+        Path::new(path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default(),
+    ))
 }
 
-/// Rebuilt once at Watch startup; file rows and bucket updates never enter the WAL.
+/// One native path table with derived filename buckets and a disposable cache WAL.
 #[pyclass(module = "sunpack_native")]
 pub(crate) struct NativeWatchCatalog {
     catalogs: Mutex<HashMap<String, ScopeCatalog>>,
     outputs: Arc<Mutex<crate::watch_store::StateData>>,
+    store: Mutex<Option<super::catalog_store::CatalogStore>>,
+    error: Mutex<Option<String>>,
 }
 
 #[pymethods]
 impl NativeWatchCatalog {
     #[new]
-    fn new(outputs: PyRef<'_, crate::watch_store::NativeWatchState>) -> Self {
-        Self { catalogs: Mutex::new(HashMap::new()), outputs: Arc::clone(&outputs.data) }
+    #[pyo3(signature = (outputs, folder=None))]
+    fn new(
+        py: Python<'_>,
+        outputs: PyRef<'_, crate::watch_store::NativeWatchState>,
+        folder: Option<String>,
+    ) -> Self {
+        let mut catalogs = HashMap::new();
+        let mut error = None;
+        let store = folder.and_then(|folder| {
+            match py.detach(|| {
+                super::catalog_store::CatalogStore::open(Path::new(&folder), &mut catalogs)
+            }) {
+                Ok(store) => Some(store),
+                Err(e) => {
+                    error = Some(e.to_string());
+                    None
+                }
+            }
+        });
+        Self {
+            catalogs: Mutex::new(catalogs),
+            outputs: Arc::clone(&outputs.data),
+            store: Mutex::new(store),
+            error: Mutex::new(error),
+        }
+    }
+    #[getter]
+    fn error(&self) -> Option<String> {
+        self.error.lock().unwrap().clone()
+    }
+
+    fn cursor(
+        &self,
+        py: Python<'_>,
+        scope: &crate::scan::scope::NativeDiscoveryScope,
+    ) -> Option<(String, u64, i64)> {
+        py.detach(|| {
+            let stamp = self.stamp(scope)?;
+            let store = self.store.lock().unwrap();
+            let saved = store
+                .as_ref()?
+                .stamps
+                .get(&crate::path_keys::path_key(&scope.root))?;
+            (saved.identity == stamp.identity
+                && saved.depth == stamp.depth
+                && saved.excluded == stamp.excluded)
+                .then(|| saved.cursor.clone())
+                .flatten()
+        })
+    }
+    fn bucket_paths(
+        &self,
+        scope: &crate::scan::scope::NativeDiscoveryScope,
+        seed: &str,
+    ) -> Vec<String> {
+        let tables = self.catalogs.lock().unwrap();
+        tables
+            .get(&crate::path_keys::path_key(&scope.root))
+            .into_iter()
+            .flat_map(|table| {
+                table
+                    .buckets
+                    .get(&catalog_stem(seed))
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|key| table.rows.get(key))
+            })
+            .map(|row| row.path.clone())
+            .collect()
+    }
+    fn retain_roots(&self, roots: Vec<String>) {
+        let keys: HashSet<_> = roots
+            .iter()
+            .map(|root| crate::path_keys::path_key(root))
+            .collect();
+        let mut tables = self.catalogs.lock().unwrap();
+        let previous = tables.len();
+        tables.retain(|key, _| keys.contains(key));
+        if previous != tables.len() {
+            if let Some(store) = self.store.lock().unwrap().as_mut() {
+                store.stamps.retain(|key, _| keys.contains(key));
+                store.mark_rebuilt();
+            }
+        }
+    }
+    fn directories(&self, scope: &crate::scan::scope::NativeDiscoveryScope) -> Vec<String> {
+        let tables = self.catalogs.lock().unwrap();
+        let mut directories = vec![scope.root.clone()];
+        if scope.max_depth != Some(0) {
+            if let Some(table) = tables.get(&crate::path_keys::path_key(&scope.root)) {
+                directories.extend(
+                    table
+                        .rows
+                        .values()
+                        .filter(|r| r.is_dir && scope.contains(&r.path) && !self.is_owned(&r.path))
+                        .map(|r| r.path.clone()),
+                );
+            }
+        }
+        directories
+    }
+    fn set_cursor(
+        &self,
+        py: Python<'_>,
+        scope: &crate::scan::scope::NativeDiscoveryScope,
+        volume: String,
+        journal: u64,
+        next_usn: i64,
+    ) {
+        py.detach(|| {
+            let Some(mut stamp) = self.stamp(scope) else {
+                return;
+            };
+            stamp.cursor = Some((volume, journal, next_usn));
+            let tables = self.catalogs.lock().unwrap();
+            self.persist(
+                &tables,
+                super::catalog_store::Delta {
+                    scope: crate::path_keys::path_key(&scope.root),
+                    removed: Vec::new(),
+                    rows: Vec::new(),
+                    stamp: Some(stamp),
+                },
+                false,
+            );
+        });
+    }
+    fn close(&self, py: Python<'_>) {
+        py.detach(|| {
+            let tables = self.catalogs.lock().unwrap();
+            let mut slot = self.store.lock().unwrap();
+            if let Some(mut store) = slot.take() {
+                if let Err(error) = store.checkpoint(&tables) {
+                    *self.error.lock().unwrap() = Some(error.to_string());
+                }
+            }
+        });
     }
 }
 
 impl NativeWatchCatalog {
     fn output_roots(&self) -> Vec<String> {
-        self.outputs.lock().unwrap_or_else(|e|e.into_inner()).runtime.values()
-            .filter_map(|value|value["path"].as_str().map(str::to_owned)).collect()
+        self.outputs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .runtime
+            .values()
+            .filter(|value| crate::watch_store::output_identity_matches(value))
+            .filter_map(|value| value["path"].as_str().map(str::to_owned))
+            .collect()
     }
     fn is_owned(&self, path: &str) -> bool {
         let key = crate::path_keys::path_key(path);
         let mut current = key.trim_end_matches('\\');
-        let data = self.outputs.lock().unwrap_or_else(|e|e.into_inner());
+        let data = self.outputs.lock().unwrap_or_else(|e| e.into_inner());
         loop {
-            if data.runtime.contains_key(&format!("owned|{current}")) { return true; }
-            let Some((parent,_)) = current.rsplit_once('\\') else { return false; };
+            if data
+                .runtime
+                .get(&format!("owned|{current}"))
+                .is_some_and(crate::watch_store::output_identity_matches)
+            {
+                return true;
+            }
+            let Some((parent, _)) = current.rsplit_once('\\') else {
+                return false;
+            };
             current = parent;
         }
     }
+}
+
+impl ScopeCatalog {
+    pub(super) fn insert(&mut self, row: DirectoryEntryRecord) {
+        let key: Arc<str> = Arc::from(crate::path_keys::path_key(&row.path));
+        if self
+            .rows
+            .get(&key)
+            .is_some_and(|old| old.is_dir != row.is_dir)
+        {
+            self.remove(&key);
+        }
+        if !row.is_dir && !self.rows.contains_key(&key) {
+            self.buckets
+                .entry(catalog_stem(&row.path))
+                .or_default()
+                .push(Arc::clone(&key));
+        }
+        self.rows.insert(key, row);
+    }
+    pub(super) fn remove(&mut self, key: &str) {
+        if let Some(row) = self.rows.remove(key) {
+            if !row.is_dir {
+                let stem = catalog_stem(&row.path);
+                if let Some(bucket) = self.buckets.get_mut(&stem) {
+                    bucket.retain(|path| path.as_ref() != key);
+                    if bucket.is_empty() {
+                        self.buckets.remove(&stem);
+                    }
+                }
+            }
+        }
+    }
+}
+impl NativeWatchCatalog {
+    fn stamp(
+        &self,
+        scope: &crate::scan::scope::NativeDiscoveryScope,
+    ) -> Option<super::catalog_store::Stamp> {
+        let (volume, id, _) = crate::filesystem::watch_path_identity(&scope.root).ok()?;
+        let mut excluded = scope.excluded_subtrees();
+        excluded.sort();
+        Some(super::catalog_store::Stamp {
+            identity: format!("{volume}|{id}"),
+            depth: scope.max_depth,
+            excluded,
+            cursor: None,
+        })
+    }
+    fn persist(
+        &self,
+        tables: &HashMap<String, ScopeCatalog>,
+        delta: super::catalog_store::Delta,
+        rebuilt: bool,
+    ) {
+        let mut slot = self.store.lock().unwrap();
+        let Some(store) = slot.as_mut() else {
+            return;
+        };
+        let result = if rebuilt {
+            store.mark_rebuilt();
+            store.checkpoint(tables)
+        } else {
+            store.append(delta).and_then(|_| {
+                if store.checkpoint_due() {
+                    store.checkpoint(tables)
+                } else {
+                    Ok(())
+                }
+            })
+        };
+        if let Err(error) = result {
+            *self.error.lock().unwrap() = Some(error.to_string());
+            *slot = None;
+        }
+    }
+}
+
+fn update_catalog(
+    options: &NativeDirectoryScanOptions,
+    py: Python<'_>,
+    state: &NativeWatchCatalog,
+    scope: &crate::scan::scope::NativeDiscoveryScope,
+    changed: Option<&str>,
+    report_changes: bool,
+) -> PyResult<(Vec<DirectoryReadError>, Vec<String>)> {
+    py.detach(|| {
+        // Enumeration and publication share the existing index write lock:
+        // a startup rebuild cannot overwrite a newer file-event update.
+        let mut catalogs = state.catalogs.lock().unwrap_or_else(|e| e.into_inner());
+        let target = changed.unwrap_or(&scope.root);
+        let mut effective = scope.clone();
+        let metadata = fs::metadata(target);
+        if !metadata.as_ref().is_ok_and(|m| m.is_file()) {
+            effective.exclude_roots(state.output_roots().into_iter());
+        }
+        let mut options = options.options.clone();
+        options.scope = Some(effective.clone());
+        let mut records = if !effective.contains(target) || state.is_owned(target) {
+            DirectoryScanRecords {
+                filtered: Vec::new(),
+                raw: Vec::new(),
+                errors: DirectoryReadErrors::report(),
+            }
+        } else {
+            match &metadata {
+                Ok(_) => scan_directory_views(target, scope.max_depth, &options)?,
+                Err(error) => {
+                    let mut errors = DirectoryReadErrors::new(Path::new(target));
+                    if error.kind() != std::io::ErrorKind::NotFound {
+                        errors.push(
+                            Path::new(target),
+                            "metadata",
+                            std::io::Error::new(error.kind(), error.to_string()),
+                        );
+                    }
+                    DirectoryScanRecords {
+                        filtered: Vec::new(),
+                        raw: Vec::new(),
+                        errors,
+                    }
+                }
+            }
+        };
+        if let Ok(meta) = &metadata {
+            if meta.is_dir()
+                && crate::path_keys::path_key(target) != crate::path_keys::path_key(&scope.root)
+                && effective.contains(target)
+                && !state.is_owned(target)
+            {
+                records.raw.push(DirectoryEntryRecord {
+                    path: target.to_owned(),
+                    is_dir: true,
+                    size: None,
+                    mtime_ns: metadata_mtime_ns(meta),
+                    relation_member_eligible: false,
+                    relation_anchor: None,
+                });
+            }
+        }
+        drop(records.filtered);
+        let errors = records.errors.into_messages();
+        let scope_key = crate::path_keys::path_key(&scope.root);
+        let target_key = crate::path_keys::path_key(target);
+        let catalog = catalogs.entry(scope_key.clone()).or_default();
+        let needs_removal = !catalog.rows.is_empty();
+        let mut present = HashSet::new();
+        let mut changed_paths = Vec::new();
+        let mut mutated = false;
+        let mut changed_rows = Vec::new();
+        for record in records
+            .raw
+            .into_iter()
+            .filter(|r| effective.contains(&r.path))
+        {
+            let key: Arc<str> = Arc::from(crate::path_keys::path_key(&record.path));
+            if needs_removal {
+                present.insert(Arc::clone(&key));
+            }
+            let unchanged = catalog.rows.get(&key).is_some_and(|old| {
+                old.path == record.path
+                    && old.size == record.size
+                    && old.mtime_ns == record.mtime_ns
+                    && old.is_dir == record.is_dir
+            });
+            if !unchanged {
+                mutated = true;
+                if report_changes && !record.is_dir {
+                    changed_paths.push(record.path.clone());
+                }
+                if changed.is_some() {
+                    changed_rows.push(record.clone());
+                }
+                catalog.insert(record);
+            }
+        }
+        let mut removed_keys = Vec::new();
+        if needs_removal && errors.is_empty() {
+            let removed: Vec<_> = catalog
+                .rows
+                .range::<str, _>((
+                    std::ops::Bound::Included(target_key.as_str()),
+                    std::ops::Bound::Unbounded,
+                ))
+                .take_while(|(key, _)| key.starts_with(&target_key))
+                .filter(|(key, _)| {
+                    (key.as_ref() == target_key || key[target_key.len()..].starts_with('\\'))
+                        && !present.contains(*key)
+                })
+                .map(|(key, _)| Arc::clone(key))
+                .collect();
+            for key in removed {
+                catalog.remove(&key);
+                removed_keys.push(key.to_string());
+            }
+        }
+        if mutated || !removed_keys.is_empty() {
+            state.persist(
+                &catalogs,
+                super::catalog_store::Delta {
+                    scope: scope_key,
+                    removed: removed_keys,
+                    rows: changed_rows,
+                    stamp: None,
+                },
+                changed.is_none(),
+            );
+        }
+        Ok((errors, changed_paths))
+    })
 }

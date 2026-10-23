@@ -78,7 +78,7 @@ class ArchiveTaskProvider:
             task.runtime["discovery_catalog"] = session.catalog
             if session.catalog is None:
                 task.runtime["discovery_snapshot"] = session.snapshot_for_directory(session.scope_for(task.main_path).root)
-        self._record_discovery_failures(result)
+        self._record_discovery_failures(result, session)
         return result
 
     def scan_targets(
@@ -110,7 +110,7 @@ class ArchiveTaskProvider:
         processed = processed_keys or set()
         return [task for task in tasks if task.key not in processed]
 
-    def _record_discovery_failures(self, result: StageResult) -> None:
+    def _record_discovery_failures(self, result: StageResult, session: DiscoveryScanSession) -> None:
         mapping = {
             "embedded_password_required": (
                 FailureKind.PASSWORD_REQUIRED,
@@ -132,6 +132,14 @@ class ArchiveTaskProvider:
             ),
         }
         for trace in result.traces:
+            if trace.source == "relations" and trace.reason in {"missing_volume", "ambiguous_volume_mapping", "structural_conflict"}:
+                info = FailureInfo(FailureKind.MISSING_VOLUME, "relations",
+                    "Volume set is incomplete or ambiguous", message_key="failure.possible_missing_volume",
+                    details={"path": trace.entry_path, "reason": trace.reason,
+                             "discovery_scope": session.scope_for(trace.entry_path).to_record()})
+                if info not in self.failed_candidate_failures:
+                    self.failed_candidate_failures.append(info)
+                continue
             failure = mapping.get(trace.reason)
             if failure is None:
                 continue

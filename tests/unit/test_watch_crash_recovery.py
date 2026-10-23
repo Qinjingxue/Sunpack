@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from sunpack.runtime.watch.scanner import WatchCandidate
 from sunpack.runtime.watch.state import WatchStateStore
 
@@ -14,6 +16,13 @@ def _watch_scheduler_shell(scheduler_module):
     import threading
 
     scheduler = object.__new__(scheduler_module.WatchScheduler)
+    scheduler._outputs = SimpleNamespace(protected=lambda path: False, reconcile=lambda *a, **k: None)
+    scheduler._reservations = None
+    scheduler._source_probes = {}
+    scheduler.watch_roots = []
+    scheduler.scopes = {}
+    scheduler._scan_options_for = lambda scope: SimpleNamespace(catalog_update=lambda *a, **k: [])
+    scheduler._catalog = SimpleNamespace(bucket_paths=lambda *a: [])
     scheduler._claim_gate = threading.RLock()
     scheduler._active_claims = {}
     scheduler._claims_by_owner = {}
@@ -120,6 +129,8 @@ def test_live_enqueue_keeps_owner_memory_only(tmp_path):
     scheduler.metadata_files = set()
     scheduler.metadata_dir = ""
     scheduler.watch_roots = [str(tmp_path)]
+    from sunpack.core.support.path_keys import path_key
+    scheduler.scopes[path_key(str(tmp_path))] = SimpleNamespace(native=None, contains=lambda path: True)
     scheduler._observe_candidate_activity = lambda *_args, **_kwargs: 0.0
     monkeypatch_target = scheduler_module._candidate_for_event_path
     scheduler_module._candidate_for_event_path = lambda *_args, **_kwargs: candidate
@@ -311,6 +322,8 @@ def test_enqueue_does_not_publish_memory_work_when_durable_queue_fails(tmp_path)
     scheduler.metadata_files = set()
     scheduler.metadata_dir = ""
     scheduler.watch_roots = [str(tmp_path)]
+    from sunpack.core.support.path_keys import path_key
+    scheduler.scopes[path_key(str(tmp_path))] = SimpleNamespace(native=None, contains=lambda path: True)
     scheduler._observe_candidate_activity = lambda *_args, **_kwargs: 0.0
     monkeypatch_target = scheduler_module._candidate_for_event_path
     scheduler_module._candidate_for_event_path = lambda *_args, **_kwargs: candidate
@@ -387,7 +400,8 @@ def test_watch_lifecycle_state_rejection_fails_closed():
         )
 
 
-def test_crash_recovery_removes_partial_direct_output_and_requeues_source(tmp_path, monkeypatch):
+@pytest.mark.parametrize("replaced", [False, True])
+def test_crash_recovery_checks_output_identity_and_requeues_source(tmp_path, monkeypatch, replaced):
     import sunpack.runtime.watch.scheduler as scheduler_module
 
     state_path = tmp_path / "state.json"
@@ -406,6 +420,10 @@ def test_crash_recovery_removes_partial_direct_output_and_requeues_source(tmp_pa
     )
     assert state.record_task_output_started(str(source), str(source), str(output))
 
+    if replaced:
+        output.rename(output.with_name("external"))
+        output.mkdir()
+        (output / "external.txt").write_text("keep")
     restarted = WatchStateStore(str(state_path))
     scheduler = _watch_scheduler_shell(scheduler_module)
     scheduler.state = restarted
@@ -421,7 +439,10 @@ def test_crash_recovery_removes_partial_direct_output_and_requeues_source(tmp_pa
 
     scheduler._recover_persisted_work()
 
-    assert not output.exists()
+    if replaced:
+        assert (output / "external.txt").read_text() == "keep"
+    else:
+        assert not output.exists()
     assert [item[0] for item in queued] == [str(source.resolve())]
     assert queued[0][1]["event_type"] == "crash_recovery"
     [pending] = restarted.pending_work_items()
@@ -453,6 +474,7 @@ def test_missing_committed_output_requeues_surviving_source(tmp_path, monkeypatc
         keep_output=True,
     )
 
+    output.rmdir()
     restarted = WatchStateStore(str(state_path))
     scheduler = _watch_scheduler_shell(scheduler_module)
     scheduler.state = restarted
@@ -499,6 +521,7 @@ def test_missing_committed_output_without_source_keeps_recovery_owner(tmp_path, 
     )
     source.unlink()
 
+    output.rmdir()
     restarted = WatchStateStore(str(state_path))
     scheduler = _watch_scheduler_shell(scheduler_module)
     scheduler.state = restarted

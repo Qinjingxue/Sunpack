@@ -204,7 +204,8 @@ class WatchScheduler:
             ),
         )
         self.state = WatchStateStore(state_path, retirement_callback=self._schedule_journal_retirement)
-        self._catalog = NativeWatchCatalog(self.state._native)
+        self._catalog = NativeWatchCatalog(self.state._native, str(Path(state_path).parent))
+        self._catalog.retain_roots(list(self.watch_roots))
         from sunpack.runtime.watch.output_roots import WatchOutputRoots
         self._outputs = WatchOutputRoots(self.state, tuple(self.scopes.values()))
         self._reservations = getattr(getattr(pipeline_engine, "_services", None), "output_reservations", None)
@@ -218,6 +219,8 @@ class WatchScheduler:
             os.path.abspath(str(Path(state_path))),
             os.path.abspath(str(self.state.journal_path)),
             os.path.abspath(str(log_path)),
+            *(os.path.abspath(str(Path(state_path).with_name(name))) for name in
+              ("catalog.snapshot", "catalog.snapshot.tmp", "catalog.wal")),
         }
         self._lock = threading.Lock()
         # Publish claims and observation generations under one short gate.
@@ -366,10 +369,6 @@ class WatchScheduler:
         self._started = True
         self._recover_persisted_work()
         self._reconcile_persisted_blockers()
-        for scope in self.scopes.values():
-            errors = self._scan_options_for(scope).catalog_update(self._catalog, scope.native)
-            if errors:
-                self.log.write("filesystem_scan_failed", roots=[scope.root], errors=errors)
         self._recover_usn_startup_gap()
         self.log.write(
             "scheduler_started",
@@ -481,74 +480,89 @@ class WatchScheduler:
             self.state.merge_watch_cursors(missing, durable=True)
 
     def _recover_usn_startup_gap(self) -> None:
-        """Replay only NTFS changes since the durable cursor; never poll."""
-        cursor_updates: dict[str, dict[str, int]] = {}
-        changed_paths: dict[str, str] = {}
-        fallback_roots: set[str] = set()
+        """Restore the disposable index; task admission still uses the Watch WAL."""
+        cursor_updates = {}
+        changed_paths = {}
+        rebuilt = []
         for root in self.watch_roots:
-            directory = self._watch_root_directory(root)
+            scope = self.scopes[path_key(root)]
+            options = self._scan_options_for(scope)
+            cached = self._catalog.cursor(scope.native)
+            saved = None
+            cursor = None
             try:
-                volume, journal_id, end_usn = watch_volume_cursor(directory)
+                volume, journal, end = watch_volume_cursor(self._watch_root_directory(root))
+                cursor = (volume, journal, end)
                 saved = self.state.watch_cursor(volume)
-                if self.root_entries[path_key(root)].recursive:
-                    fallback_roots.add(root)
-                elif (
-                    saved is None
-                    or int(saved.get("journal_id", 0) or 0) != journal_id
-                    or int(saved.get("next_usn", 0) or 0) > end_usn
-                ):
-                    fallback_roots.add(root)
-                else:
-                    start_usn = int(saved.get("next_usn", 0) or 0)
-                    if end_usn > start_usn:
-                        for path in watch_root_changes(directory, start_usn, end_usn):
-                            absolute = os.path.abspath(path)
-                            if os.path.isfile(root) and path_key(absolute) != path_key(root):
-                                continue
-                            changed_paths.setdefault(path_key(absolute), absolute)
-                cursor_updates[volume] = {
-                    "journal_id": journal_id,
-                    "next_usn": end_usn,
-                }
+                valid = (cached is not None and cached[0] == volume and cached[1] == journal
+                         and 0 < cached[2] <= end)
+                if not valid:
+                    raise ValueError("catalog requires enumeration")
+                watch_start = int((saved or {}).get("next_usn", 0))
+                if not saved or int(saved.get("journal_id", 0)) != journal or not 0 < watch_start <= end:
+                    watch_start = cached[2]
+                start = min(cached[2], watch_start)
+                # Reuse the existing shallow USN request for indexed directories.
+                # This also covers empty directories, without another broker protocol.
+                for directory in self._catalog.directories(scope.native):
+                    if not os.path.isdir(directory):
+                        options.catalog_update(self._catalog, scope.native, directory, True)
+                        continue
+                    if start == end:
+                        continue
+                    for path in watch_root_changes(directory, start, end):
+                        if path_key(path) == path_key(directory):
+                            continue
+                        if not scope.contains(path) or self.should_ignore_event_path(path):
+                            continue
+                        errors, arrivals = options.catalog_refresh(self._catalog, scope.native, path)
+                        if errors:
+                            raise OSError(str(errors))
+                        if os.path.isfile(path):
+                            changed_paths[path_key(path)] = path
+                        for arrival in arrivals:
+                            changed_paths[path_key(arrival)] = arrival
             except Exception as exc:
-                fallback_roots.add(root)
-                self.log.write("usn_recovery_fallback", root=root, error=str(exc))
-
-        for root in sorted(fallback_roots):
-            try:
-                from sunpack.runtime.watch.scanner import _candidate_from_native
-                scope = self.scopes[path_key(root)]
-                candidates = [_candidate_from_native(row) for row in self._scan_options_for(scope).catalog_candidates(
-                    self._catalog, scope.native, root)]
-                for candidate in candidates:
-                    changed_paths.setdefault(path_key(candidate.path), candidate.path)
-            except OSError as exc:
-                self.log.write("usn_fallback_scan_failed", root=root, error=str(exc))
-
+                if cached is None:
+                    errors = options.catalog_update(self._catalog, scope.native)
+                    arrivals = ()
+                else:
+                    errors, arrivals = options.catalog_refresh(self._catalog, scope.native)
+                rebuilt.append(root)
+                # An untrusted/missing index is never a reason to repeat initial scan.
+                if cached is not None:
+                    changed_paths.update((path_key(path), path) for path in arrivals)
+                self.log.write("catalog_rebuilt", root=root, reason=str(exc), errors=errors)
+                if errors:
+                    cursor = None
+            if cursor is not None:
+                volume, journal, end = cursor
+                self._catalog.set_cursor(scope.native, volume, journal, end)
+                cursor_updates[volume] = {"journal_id": journal, "next_usn": end}
         for path in changed_paths.values():
-            if _persisted_blocker_owns_retry(self.state, path):
-                continue
-            self.enqueue(path, force=True, event_type="startup_usn_recovery")
-
+            if not _persisted_blocker_owns_retry(self.state, path):
+                self.enqueue(path, force=True, event_type="startup_usn_recovery")
         with self._lock:
             recovered_candidates = list(self._pending.values())
-        # Candidate owners and cursor advancement are one durable transaction.
-        # A crash observes either the old cursor or every replay candidate.
         if cursor_updates:
-            self.state.queue_recovery_batch(
-                recovered_candidates,
-                cursor_updates,
-            )
-        self.log.write(
-            "usn_startup_recovered",
-            changed=len(changed_paths),
-            queued=len(recovered_candidates),
-            fallback_roots=sorted(fallback_roots),
-        )
+            self.state.queue_recovery_batch(recovered_candidates, cursor_updates)
+        if self._catalog.error:
+            self.log.write("catalog_persistence_failed", error=self._catalog.error)
+        self.log.write("usn_startup_recovered", changed=len(changed_paths),
+            queued=len(recovered_candidates), fallback_roots=rebuilt)
 
-
-
-
+    def _recovery_output_matches(self, pending, path):
+        # A recorded output root may have been replaced during our own flatten.
+        key = "owned|" + path_key(path)
+        record = self.state._native.runtime_record(key)
+        expected = record.get("identities", []) if record else []
+        if not expected:
+            expected = [pending.output_identities.get(os.path.abspath(path))]
+        try:
+            volume, identity, _ = watch_path_identity(path)
+            return f"{volume}|{identity}" in expected
+        except OSError:
+            return False
 
     def _recover_persisted_work(self) -> None:
         """Recover only durable in-flight work; never scan unrelated Watch roots."""
@@ -579,6 +593,9 @@ class WatchScheduler:
 
             cleanup_failed = False
             for output_dir in dict.fromkeys(active_outputs.values()):
+                if not self._recovery_output_matches(pending, output_dir):
+                    self.log.write("crash_output_identity_changed", owner_path=pending.path, output_dir=output_dir)
+                    continue
                 result = DEFAULT_OUTPUT_CLEANUP_MANAGER.cleanup_canonical(
                     output_dir,
                     event=OutputCleanupEvent.EXTRACTION_ABORT,
@@ -612,7 +629,7 @@ class WatchScheduler:
                     recovered.setdefault(path_key(candidate.path), candidate)
 
             missing_committed_roots = [
-                root for root in committed_roots if not os.path.isdir(root)
+                root for root in committed_roots if not self._recovery_output_matches(pending, root)
             ]
             if missing_committed_roots:
                 candidate = _candidate_for_event_path(pending.path)
@@ -638,10 +655,10 @@ class WatchScheduler:
 
             scan_failed = False
             for root in committed_roots:
-                if not os.path.isdir(root):
+                if not self._recovery_output_matches(pending, root):
                     continue
                 try:
-                    candidates, _errors = self._scan_candidates([root], recursive=True)
+                    candidates, _errors = scan_watch_candidates([root], recursive=True)
                 except OSError as exc:
                     self.log.write(
                         "crash_resume_scan_failed",
@@ -677,6 +694,8 @@ class WatchScheduler:
                 candidates,
                 password_scope_dir=scope_dir,
                 source_input_root=pending.source_input_root,
+                discovery_scopes={path_key(candidate.path): self._recovered_scope(pending, candidate.path).to_record()
+                                  for candidate in candidates},
             )
             for candidate in candidates:
                 self.enqueue(
@@ -687,6 +706,17 @@ class WatchScheduler:
                     _recovery_scope_dir=scope_dir,
                     _state_prequeued=True,
                 )
+
+    def _recovered_scope(self, pending, path):
+        for root in sorted(pending.committed_roots, key=len, reverse=True):
+            scope = DiscoveryScope(root, recursive=True)
+            if scope.contains(path) and self._recovery_output_matches(pending, root):
+                return scope
+        if pending.discovery_scope:
+            scope = DiscoveryScope.from_record(pending.discovery_scope)
+            if scope.contains(path):
+                return scope
+        return DiscoveryScope(os.path.dirname(path))
 
     def _reconcile_persisted_blockers(self) -> None:
         """Re-evaluate only persisted blockers once at startup; no polling."""
@@ -764,6 +794,9 @@ class WatchScheduler:
             if self._reservations is not None and self._reservations.watch_outputs is self._outputs:
                 self._reservations.watch_outputs = None
             self._outputs.close()
+            self._catalog.close()
+            if self._catalog.error:
+                self.log.write("catalog_persistence_failed", error=self._catalog.error)
             self.state.close()
             self._catalog = None
         finally:
@@ -1419,8 +1452,9 @@ class WatchScheduler:
     def should_ignore_event_path(self, path: str) -> bool:
         if not path:
             return True
-        return (self._is_under_metadata_dir(path) or self._outputs.protected(path)
-                or bool(self._reservations and self._reservations.contains(path)))
+        return (self._is_under_metadata_dir(path)
+                or bool(self._reservations and self._reservations.contains(path))
+                or self._outputs.protected(path))
 
     def _log_candidate_ignored(self, path: str, reason: str, **payload) -> None:
         normalized = case_key(os.path.abspath(str(path))) if path else ""
@@ -1473,6 +1507,20 @@ class WatchScheduler:
             else:
                 self._directory_pending.update(root for root in self.watch_roots if _paths_match(root, path, recursive=True))
         self._wake_service()
+
+    def retry_missing_volume_peers(self, path):
+        if self._closed:
+            return
+        root = _longest_matching_root(os.path.abspath(path), self.watch_roots)
+        if root is None:
+            return
+        scope = self.scopes[path_key(root)]
+        for peer in self._catalog.bucket_paths(scope.native, path):
+            if path_key(peer) == path_key(path):
+                continue
+            entry = self.state.latest_entry_for_path(peer)
+            if entry is not None and entry.status == "suspended_missing_volume":
+                self.enqueue(peer, force=True, event_type="volume_changed")
 
     def notify_path_departed(self, path: str, *, recursive: bool = False) -> None:
         normalized = os.path.abspath(path)
@@ -1527,6 +1575,8 @@ class WatchScheduler:
             forgotten=forgotten,
             pending_removed=len(pending_paths),
         )
+        if not recursive:
+            self.retry_missing_volume_peers(normalized)
         if pending_paths:
             self._wake_service()
 
@@ -2310,8 +2360,6 @@ class _WatchEventHandler(FileSystemEventHandler):
                 for path in (src_path, getattr(event, "dest_path", "")) if path
                 for scope in self.scheduler.scopes.values()):
             return
-        if is_directory and src_path and getattr(event,"dest_path",""):
-            self.scheduler._outputs.relocate(src_path, event.dest_path)
         if src_path:
             self._handle_departure_path(
                 src_path,
@@ -2336,6 +2384,8 @@ class _WatchEventHandler(FileSystemEventHandler):
     def _handle_departure_path(self, path: str, *, is_directory: bool) -> None:
         if self.scheduler.is_builtin_password_file(path):
             self.scheduler.notify_password_source_changed("builtin_password_file", path="")
+            return
+        if self.scheduler.should_ignore_event_path(path):
             return
         if is_directory:
             self.scheduler._queue_watch_rearm(path)
@@ -2363,6 +2413,7 @@ class _WatchEventHandler(FileSystemEventHandler):
             return
         try:
             self.scheduler.enqueue(path, event_type=event_type, src_path=src_path)
+            self.scheduler.retry_missing_volume_peers(path)
         except OSError as exc:
             # File observations race with renames, deletion, and the native
             # promotion gate.  A single transient miss must not escape the
