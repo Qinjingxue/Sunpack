@@ -488,9 +488,11 @@ def test_fast_job_recurses_before_slow_sibling_finishes(tmp_path, monkeypatch):
 
 
 def test_encrypted_comment_zip_in_nested_carriers_runs_for_both_origins(tmp_path):
-    # Verifier-only fixtures cannot catch discovery silently dropping a task.
-    # Combine nesting, a disguised carrier and both shared-engine origins.
+    # Verifier-only and unmapped nesting tests miss routing children back to
+    # the mapped root. Reuse this real encrypted carrier for three levels and
+    # both concurrent origins; exact paths add coverage without another fixture.
     import struct
+    from sunpack.core.contracts.pipeline import PipelineTarget
     from tests.unit.test_zip_password_encoding import _write_ansi_password_zip, PAYLOAD
     seed = tmp_path / "seed.zip"
     _write_ansi_password_zip(seed, password_bytes=b"comment-secret")
@@ -499,25 +501,40 @@ def test_encrypted_comment_zip_in_nested_carriers_runs_for_both_origins(tmp_path
     carrier = b"carrier prefix" + data[:-2] + struct.pack("<H", len(comment)) + comment + b"carrier suffix"
     sources = []
     for origin in ("foreground", "watch"):
-        source = tmp_path / f"{origin}.dat"
-        source.write_bytes(make_zip({"inner.jpg": carrier}))
-        sources.append((origin, source))
+        input_root = tmp_path / origin
+        source = input_root / "sub" / "outer.dat"
+        source.parent.mkdir(parents=True)
+        source.write_bytes(make_zip({"folder/middle.blob": make_zip({"child/inner.jpg": carrier})}))
+        mapping = {"root": str(tmp_path / "out" / origin), "common_root": str(input_root),
+                   "fixed_root": origin == "watch"}
+        sources.append((origin, source, mapping))
     config = normalize_config(with_detection_pipeline({
-        "recursive_extract": "2", "user_passwords": ["wrong", "comment-secret"],
-        "builtin_passwords": [], "output": {"root": str(tmp_path / "out")},
+        "recursive_extract": "3", "user_passwords": ["wrong", "comment-secret"],
+        "builtin_passwords": [],
         "post_extract": {"archive_cleanup_mode": "k", "flatten_single_directory": False},
     }))
     async def run():
         async with PipelineEngine(config) as engine:
             return await asyncio.gather(*(
-                engine.run([str(source)], origin=origin, stdout=io.StringIO(), stderr=io.StringIO())
-                for origin, source in sources
+                engine.run([PipelineTarget(str(source), mapping)], origin=origin,
+                           stdout=io.StringIO(), stderr=io.StringIO())
+                for origin, source, mapping in sources
             ))
-    for response in asyncio.run(run()):
+    for (origin, source, mapping), response in zip(sources, asyncio.run(run())):
         assert not response.summary.failed_tasks
-        assert response.summary.success_count == 2
-        leaf = next(item for item in response.summary.target_results if Path(item.input_path).name == "inner.jpg")
-        assert (Path(leaf.output_dir) / "secret.txt").read_bytes() == PAYLOAD
+        assert response.summary.success_count == 3
+        root = Path(mapping["root"])
+        outer_output = root / "outer" if origin == "watch" else root / "sub" / "outer"
+        middle_output = outer_output / "folder" / "middle"
+        leaf_output = middle_output / "child" / "inner"
+        assert {Path(item.input_path): Path(item.output_dir) for item in response.summary.target_results} == {
+            source: outer_output,
+            outer_output / "folder" / "middle.blob": middle_output,
+            middle_output / "child" / "inner.jpg": leaf_output,
+        }
+        assert list(root.rglob("secret.txt")) == [leaf_output / "secret.txt"]
+        assert (leaf_output / "secret.txt").read_bytes() == PAYLOAD
+        assert {path.name for path in root.iterdir()} == {"outer" if origin == "watch" else "sub"}
 
 
 def test_real_native_zip_progress_stays_complete_after_watch_semantic_finish(tmp_path):

@@ -16,11 +16,10 @@ def default_output_dir_for_task(task: ArchiveTask, output_config: dict | None = 
     if output_config.get("root"):
         output_root = os.path.abspath(os.path.normpath(str(output_config.get("root"))))
         common_root = output_config.get("common_root")
-        # Recursive archives are created below the configured output root.  In
-        # that case their output must stay beside the generated archive instead
-        # of being relativized against the original input root.
+        # Inputs already below the output root keep their parent there instead
+        # of being relativized against a separate input root.
         relative_root = output_root if _is_relative_to(os.path.dirname(path), output_root) else common_root
-        relative_parent = "" if output_config.get("fixed_root") and not task.runtime.get("nested_output") else _relative_parent(path, relative_root)
+        relative_parent = "" if output_config.get("fixed_root") else _relative_parent(path, relative_root)
         out_dir = os.path.join(output_root, relative_parent, os.path.basename(out_name))
     else:
         out_dir = os.path.join(os.path.dirname(path), os.path.basename(out_name))

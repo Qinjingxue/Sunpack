@@ -1488,7 +1488,7 @@ class _RequestRuntime:
                 task.runtime["source_generation"] = watch_version
             output_dir_resolver = build_output_dir_resolver(
                 [task],
-                ownership.output_dir_for_task,
+                lambda current: ownership.output_dir_for_task(current, depth=depth),
                 reservation_registry=self.services.output_reservations,
                 owner=self.submission.request_id,
             )
@@ -1845,7 +1845,6 @@ class _RequestRuntime:
         return result
 
     async def _ensure_task_lease(self, task, *, depth: int = 1) -> None:
-        task.runtime["nested_output"] = depth > 1
         self.source_cleanup.register([task])
         paths = task.all_parts or [task.main_path]
         if not task.runtime.get("missing_input_paths") and self.path_leases.holds_lease(
@@ -1981,7 +1980,11 @@ class _RequestResults:
         )
         self._output_targets.relocate(result)
 
-    def output_dir_for_task(self, task) -> str:
+    def output_dir_for_task(self, task, *, depth: int) -> str:
+        # Output mappings belong to submitted inputs. Recursive children stay
+        # beside their generated archive, regardless of the target's mapping.
+        if depth > 1:
+            return default_output_dir_for_task(task)
         target = self._target_for_path(task.main_path)
         output_config = {
             **(self.config.get("output", {}) if isinstance(self.config.get("output"), dict) else {}),
