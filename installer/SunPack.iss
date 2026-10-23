@@ -933,10 +933,7 @@ begin
   if (ResultCode <> 0) and (ResultCode <> 10) then
     RaiseException(CustomMessage('WalResetFailed'));
   if ResultCode = 10 then
-  begin
     Log(CustomMessage('WalResetNotice'));
-    if not WizardSilent then MsgBox(CustomMessage('WalResetNotice'), mbInformation, MB_OK);
-  end;
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
