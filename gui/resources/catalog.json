@@ -1092,14 +1092,6 @@
       "min": 0,
       "max": null
     },
-    "/performance/worker/watchdog_no_progress_timeout_seconds": {
-      "label": {
-        "zh": "无进展超时（秒）",
-        "en": "No-progress timeout (s)"
-      },
-      "min": 0,
-      "max": null
-    },
     "/performance/worker/thread_capacity": {
       "label": {
         "zh": "工作线程数",

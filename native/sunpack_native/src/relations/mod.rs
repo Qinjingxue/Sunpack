@@ -1904,10 +1904,8 @@ mod tests {
 
     #[test]
     fn zipx_aliases_share_only_the_standard_zip_spanned_size_family() {
-        let expected = vec![split_size_family_key(
-            "zip:spanned",
-            r"C:\downloads\payload",
-        )];
+        // Family keys span directories within the active discovery scope.
+        let expected = vec![split_size_family_key("zip:spanned", "payload")];
         for name in [
             "payload.zx01",
             "payload.ZX12",
