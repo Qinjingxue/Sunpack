@@ -570,8 +570,21 @@ def test_full_disk_stale_monitor_snapshot_and_cancelled_probe_recover(tmp_path_f
     with a new failure or cancel the owner after it claims a recovered-space
     permit. A single VHD checks both interleavings and same-handle recovery.
     """
-    executable = _worker_path().with_name("sunpack_sevenzip_space_gate.exe")
-    assert executable.exists(), f"build sunpack_sevenzip_space_gate: {executable}"
+    # CMake builds this test-only executable next to the native worker build,
+    # but setup_windows_dev.ps1 copies only the runtime worker into tools/.
+    _worker_path()  # Preserve the prerequisite check for the runtime worker.
+    arch = os.environ.get("SUNPACK_TEST_ARCH", "x64").lower()
+    profile = os.environ.get("SUNPACK_TEST_BUILD_PROFILE", "ci").lower()
+    build_suffix = "-ci" if profile == "ci" else ""
+    executable = (
+        Path(__file__).resolve().parents[2]
+        / "native"
+        / "sevenzip_bridge"
+        / f"build-{arch}{build_suffix}"
+        / "Release"
+        / "sunpack_sevenzip_space_gate.exe"
+    )
+    assert executable.is_file(), f"build sunpack_sevenzip_space_gate: {executable}"
     with SpaceVhd(
         _vhd_directory(tmp_path_factory), "V",
         payload_bytes=8 * _MIB, blocked_free_bytes=64 << 10,
