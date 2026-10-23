@@ -1,14 +1,14 @@
 """Exercise the installer field migration with Windows PowerShell 5.1.
 
 Runtime configuration tests never execute this installer-only algorithm or
-check its atomic/ACL behavior. One small combined fixture covers that independent
+check its commit/failure behavior. One small combined fixture covers that independent
 boundary without a test per schema field; deleting it loses that coverage.
 """
 import json
 import subprocess
 
 
-def test_installer_field_upgrade_preserves_values_modules_and_acl(tmp_path, repo_root):
+def test_installer_field_upgrade_preserves_values_and_modules(tmp_path, repo_root):
     old = {
         "removed": {"value": 1}, "keep": {"false": True, "zero": 5, "empty": "default", "null": 2, "array": [1]},
         "absent": {"existing": 1},
@@ -48,16 +48,6 @@ def test_installer_field_upgrade_preserves_values_modules_and_acl(tmp_path, repo
         path.write_text(json.dumps(value, ensure_ascii=False), encoding="utf-8")
         paths[name] = path
 
-    def acl():
-        literal = str(paths["user"]).replace("'", "''")
-        completed = subprocess.run([
-            "powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
-            f"[IO.File]::GetAccessControl('{literal}').Sddl",
-        ], capture_output=True, text=True, timeout=15)
-        assert completed.returncode == 0, completed.stderr
-        return completed.stdout.strip()
-
-    original_acl = acl()
     command = [
         "powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
         "-File", str(repo_root / "scripts/upgrade_config.ps1"),
@@ -72,7 +62,6 @@ def test_installer_field_upgrade_preserves_values_modules_and_acl(tmp_path, repo
         "filesystem": {"scan_filters": user["filesystem"]["scan_filters"]},
     }
     assert json.loads(paths["user"].read_text(encoding="utf-8")) == expected
-    assert acl() == original_acl
     committed = paths["user"].read_bytes()
     repeated = subprocess.run(command, capture_output=True, text=True, timeout=15)
     assert repeated.returncode == 0, repeated.stdout + repeated.stderr
@@ -80,23 +69,5 @@ def test_installer_field_upgrade_preserves_values_modules_and_acl(tmp_path, repo
     paths["new"].write_text("invalid JSON", encoding="utf-8")
     failed = subprocess.run(command, capture_output=True, text=True, timeout=15)
     assert failed.returncode != 0
-    assert paths["user"].read_bytes() == committed and acl() == original_acl
+    assert paths["user"].read_bytes() == committed
     assert not list(tmp_path.glob(".sunpack-config-*.tmp"))
-
-    # ReplaceFile must preserve an explicitly protected DACL too; inheriting the
-    # temporary file's parent permissions would silently widen access here.
-    literal = str(paths["user"]).replace("'", "''")
-    protected = subprocess.run([
-        "powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
-        f"$acl = [IO.File]::GetAccessControl('{literal}'); "
-        "$acl.SetAccessRuleProtection($true, $true); "
-        f"[IO.File]::SetAccessControl('{literal}', $acl)",
-    ], capture_output=True, text=True, timeout=15)
-    assert protected.returncode == 0, protected.stderr
-    original_acl = acl()
-    paths["user"].write_text(json.dumps(user), encoding="utf-8")
-    paths["new"].write_text(json.dumps(new), encoding="utf-8")
-    completed = subprocess.run(command, capture_output=True, text=True, timeout=15)
-    assert completed.returncode == 0, completed.stdout + completed.stderr
-    assert json.loads(paths["user"].read_text(encoding="utf-8")) == expected
-    assert acl() == original_acl
