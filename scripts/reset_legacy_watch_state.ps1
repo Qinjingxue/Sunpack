@@ -35,19 +35,10 @@ foreach ($directory in $directories) {
     $taskStateReset = $false
     foreach ($file in Get-ChildItem -LiteralPath $directory -File -Force) {
         if ($file.Name -notin @('state.json', 'catalog.snapshot', 'catalog.snapshot.tmp', 'catalog.wal') -and
-            $file.Name -notmatch '^state\.journal\.[0-9]+\.jsonl
-if ($removed) { exit 10 }
-exit 0
- -and
-            $file.Name -notmatch '^\.state\.json\.[0-9a-f]{32}\.tmp
-if ($removed) { exit 10 }
-exit 0
-) { continue }
+            $file.Name -notmatch '^state\.journal\.[0-9]+\.jsonl$' -and
+            $file.Name -notmatch '^\.state\.json\.[0-9a-f]{32}\.tmp$') { continue }
         $isTaskState = ($file.Name -eq 'state.json') -or
-            ($file.Name -match '^state\.journal\.[0-9]+\.jsonl
-if ($removed) { exit 10 }
-exit 0
-)
+            ($file.Name -match '^state\.journal\.[0-9]+\.jsonl$')
         Remove-Item -LiteralPath $file.FullName -Force
         $removed = $true
         if ($isTaskState) { $taskStateReset = $true }
