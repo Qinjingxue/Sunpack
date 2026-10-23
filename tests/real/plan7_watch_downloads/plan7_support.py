@@ -500,6 +500,7 @@ def start_watch(
     state_path: Path | None = None,
     notification_sink: Any | None = None,
     flatten_single_directory: bool = False,
+    recursive: bool = False,
 ) -> WatchHarness:
     watch_root = tmp_path / label / "watch"
     output_root = tmp_path / label / "out"
@@ -525,6 +526,8 @@ def start_watch(
     with timer.measure("watch_engine_start"):
         loop.run_until_complete(delegate.__aenter__())
     engine = _TimedPipelineEngine(delegate, submit_times, submission_events, run_durations, timer)
+    from sunpack.runtime.watch.roots import WatchRootEntry
+
     with timer.measure("watch_scheduler_init"):
         watcher = WatchScheduler(
             config,
@@ -534,6 +537,10 @@ def start_watch(
             cold_start_seconds=cold_start_seconds,
             pipeline_engine=engine,
             notification_sink=notification_sink,
+            root_entries=(
+                [WatchRootEntry(str(watch_root), str(output_root), recursive=True)]
+                if recursive else None
+            ),
         )
     async_run_once = watcher.run_once
     async_start = watcher.start
@@ -639,14 +646,23 @@ def arrive_interleaved(
     *,
     tick_latencies: list[float] | None = None,
     write_mode: str = "rename_commit",
+    destination_dirs: list[Path] | None = None,
 ) -> dict[str, float]:
-    """Write several downloads round-robin so their quiet windows overlap."""
+    """Write several downloads round-robin so their quiet windows overlap.
+
+    ``destination_dirs`` mirrors ``sources`` so a recursive Watch root can
+    observe the same logical inputs arriving in separate subdirectories.
+    """
     if write_mode not in {"rename_commit", "direct_final_path"}:
         raise ValueError(f"unknown write mode: {write_mode}")
+    if destination_dirs is not None and len(destination_dirs) != len(sources):
+        raise ValueError("destination_dirs must match sources")
     states = []
-    for source in sources:
-        tmp = harness.watch_root / f"{source.name}.downloading"
-        destination = harness.watch_root / source.name
+    for index, source in enumerate(sources):
+        directory = destination_dirs[index] if destination_dirs is not None else harness.watch_root
+        directory.mkdir(parents=True, exist_ok=True)
+        tmp = directory / f"{source.name}.downloading"
+        destination = directory / source.name
         states.append({
             "source": source,
             "reader": source.open("rb"),
