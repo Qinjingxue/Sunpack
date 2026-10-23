@@ -120,10 +120,12 @@ Name: "contextmenu"; Description: "{cm:TaskContextMenu}"; GroupDescription: "{cm
 Name: "autostart"; Description: "{cm:TaskAutostart}"; GroupDescription: "{cm:GroupBackgroundWatch}"; Flags: unchecked
 
 [Files]
-Source: "{#SourceDir}\*"; DestDir: "{app}"; Excludes: "sunpack.exe,sunpack_config.json,sunpack_watch_roots.txt,builtin_passwords.json"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#SourceDir}\*"; DestDir: "{app}"; Excludes: "sunpack.exe,sunpack_config.json,sunpack_watch_roots.txt,builtin_passwords.json,scripts\upgrade_config.ps1,scripts\reset_legacy_watch_state.ps1"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#SourceDir}\sunpack.exe"; DestDir: "{app}\bin"; Flags: ignoreversion
 Source: "{#SourceDir}\sunpack_config.json"; DestDir: "{commonappdata}\SunPack"; Flags: onlyifdoesntexist
 Source: "{#SourceDir}\sunpack_config.json"; DestDir: "{tmp}"; DestName: "sunpack-config-template.json"; Flags: deleteafterinstall
+Source: "{#SourceDir}\scripts\upgrade_config.ps1"; DestDir: "{tmp}\SunPackInstallScripts"; Flags: deleteafterinstall
+Source: "{#SourceDir}\scripts\reset_legacy_watch_state.ps1"; DestDir: "{tmp}\SunPackInstallScripts"; Flags: deleteafterinstall
 Source: "{#SourceDir}\builtin_passwords.json"; DestDir: "{commonappdata}\SunPack"; Flags: onlyifdoesntexist
 
 [Dirs]
@@ -830,7 +832,7 @@ var
 begin
   if not FileExists(ExpandConstant('{tmp}\sunpack-old-advanced.json')) then Exit;
   Parameters := '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ' +
-    AddQuotes(ExpandConstant('{app}\scripts\upgrade_config.ps1')) +
+    AddQuotes(ExpandConstant('{tmp}\SunPackInstallScripts\upgrade_config.ps1')) +
     ' -OldAdvanced ' + AddQuotes(ExpandConstant('{tmp}\sunpack-old-advanced.json')) +
     ' -NewAdvanced ' + AddQuotes(ExpandConstant('{app}\sunpack_advanced_config.json')) +
     ' -Template ' + AddQuotes(ExpandConstant('{tmp}\sunpack-config-template.json')) +
@@ -843,12 +845,23 @@ begin
   ConfigMigrationApplied := True;
 end;
 
+procedure CleanupInstallScripts;
+var
+  TempScripts: string;
+begin
+  TempScripts := ExpandConstant('{tmp}\SunPackInstallScripts');
+  if DirExists(TempScripts) then
+    if not DelTree(TempScripts, True, True, True) then
+      Log('Unable to remove temporary SunPack installation scripts.');
+end;
+
 procedure DeinitializeSetup;
 begin
   if ConfigMigrationApplied and not ConfigInstallCompleted then
     if not FileCopy(ExpandConstant('{tmp}\sunpack-user-backup.json'),
         ExpandConstant('{commonappdata}\SunPack\sunpack_config.json'), False) then
       Log('Unable to restore SunPack user configuration after installation failure.');
+  CleanupInstallScripts;
 end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;
@@ -909,7 +922,7 @@ var
   ResultCode: Integer;
 begin
   Parameters := '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ' +
-    AddQuotes(ExpandConstant('{app}\scripts\reset_legacy_watch_state.ps1')) +
+    AddQuotes(ExpandConstant('{tmp}\SunPackInstallScripts\reset_legacy_watch_state.ps1')) +
     ' -DataRoot ' + AddQuotes(ExpandConstant('{commonappdata}\SunPack')) +
     ' -AdvancedConfig ' + AddQuotes(ExpandConstant('{app}\sunpack_advanced_config.json')) +
     ' -OldAdvancedConfig ' + AddQuotes(ExpandConstant('{tmp}\sunpack-old-advanced.json')) +
@@ -962,6 +975,7 @@ begin
     end;
     ApplySelectedStartupState;
     RestoreWatchAfterUpgrade;
+    CleanupInstallScripts;
   end;
 end;
 
