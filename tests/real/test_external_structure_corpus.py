@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.helpers.native_fixture import assemble_carrier, assert_exact_tree, file_inventory
+from tests.helpers.native_fixture import assemble_carrier, assert_exact_tree, file_inventory, native_fixture
 from tests.helpers.tool_config import get_optional_rar, get_optional_winrar
 from sunpack.core.contracts.results import OutcomeKind
 from sunpack.pipeline.coordinator.engine import PipelineEngine
@@ -61,6 +61,30 @@ def empty_zip_sample(tmp_path_factory):
     sample = generate(corpus, cases=(("bsdtar-empty-zip", "zip", "zip-empty"),))[0]
     assert sample["expected_files"] == {}
     return corpus / sample["file"]
+
+
+def test_unicode_external_writer_preserves_names_under_cp1252(tmp_path):
+    # The normal corpus uses the host's locale and cannot catch CP1252-only
+    # regressions on Chinese development machines. Two tiny external archives
+    # cover both affected writers, including names and content, at low cost.
+    source = tmp_path / "原始目录"
+    names = ("日本語/说明.txt", "nested/" + "long-name-" * 16 + "/payload.txt", "empty.bin")
+    for name in names:
+        path = source / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("" if name == "empty.bin" else "Unicode payload\n", encoding="utf-8")
+    expected = file_inventory(source)
+    for archive_format in ("pax", "zip"):
+        archive = tmp_path / f"外部样本.{archive_format}"
+        native_fixture("libarchive", root=str(source), output=str(archive), paths=list(names),
+                       format=archive_format, locale="English_United States.1252")
+        summary = run_plan1_pipeline(archive)
+        assert not summary.failed_tasks, summary.failures
+        assert summary.partial_success_count == 0
+        assert summary.success_count == 1
+        result = next(item for item in summary.target_results if Path(item.input_path) == archive)
+        assert result.output_dir
+        assert_exact_tree(Path(result.output_dir), expected)
 
 
 @pytest.mark.parametrize("origin", ["foreground", "watch"])

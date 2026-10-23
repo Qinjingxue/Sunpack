@@ -85,11 +85,6 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-      - name: Diagnose system tar Unicode support
-        shell: pwsh
-        run: |
-          & .\.venv\Scripts\python.exe scripts/run_unelevated_process.py --cwd $PWD --timeout-seconds 300 -- .\.venv\Scripts\python.exe scripts/diagnose_windows_tar.py
-
       - name: Run acceptance tests
         shell: pwsh
         run: |

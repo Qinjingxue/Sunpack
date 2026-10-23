@@ -6,6 +6,9 @@ use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+#[path = "support/libarchive_writer.rs"]
+mod libarchive_writer;
+
 #[derive(Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case")]
 enum Request {
@@ -22,6 +25,14 @@ enum Request {
     },
     Inventory {
         root: PathBuf,
+    },
+    Libarchive {
+        root: PathBuf,
+        output: PathBuf,
+        paths: Vec<PathBuf>,
+        format: libarchive_writer::Format,
+        #[serde(default)]
+        locale: Option<String>,
     },
     Lz4 {
         output: PathBuf,
@@ -379,6 +390,13 @@ fn inventory(root: &Path, directory: &Path, entries: &mut Vec<Value>) -> io::Res
 
 fn run(request: Request) -> io::Result<Value> {
     match request {
+        Request::Libarchive {
+            root,
+            output,
+            paths,
+            format,
+            locale,
+        } => libarchive_writer::write(&root, &output, &paths, format, locale.as_deref()),
         Request::Copy { source, output } => Ok(json!({"bytes": fs::copy(source, output)?})),
         Request::ZipMethod { output, method } => zip_method(&output, method),
         Request::SevenZipLz4Header { source, output } => seven_zip_lz4_header(&source, &output),

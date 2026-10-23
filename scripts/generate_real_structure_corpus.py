@@ -12,7 +12,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from tests.helpers.native_fixture import file_inventory
+from tests.helpers.native_fixture import file_inventory, native_fixture
 from tests.helpers.tool_config import get_optional_rar, get_optional_winrar, require_7z
 
 
@@ -74,7 +74,22 @@ def generate(destination: Path = DESTINATION, cases: tuple = STRUCTURE_CASES) ->
             expected = file_inventory(source)
             archive = destination / f"{case_id}.{archive_format}"
             archive.unlink(missing_ok=True)
-            if variant.startswith("winrar"):
+            writer_request = None
+            if variant in {"pax", "zip"}:
+                # tar's edit_pathname dereferences a NULL ANSI name when a
+                # member cannot be represented by the active Windows code page.
+                # Use the same OS libarchive writer with explicit Unicode names.
+                result = native_fixture(
+                    "libarchive", root=str(source), output=str(archive),
+                    paths=sorted(members), format=variant,
+                )
+                creator = result["creator"]
+                command = ["real_fixture.exe"]
+                writer_request = {
+                    "operation": "libarchive", "root": ".", "output": archive.name,
+                    "paths": sorted(members), "format": variant,
+                }
+            elif variant.startswith("winrar"):
                 assert winrar, "WinRAR ZIP writer is required"
                 command = [str(winrar), "a", "-afzip", "-r", "-ep1", "-ibck", "-inul", "-y", str(archive), "*"]
                 quoted_winrar = str(winrar).replace("'", "''")
@@ -90,17 +105,9 @@ def generate(destination: Path = DESTINATION, cases: tuple = STRUCTURE_CASES) ->
             else:
                 writer_format = "ustar" if variant == "duplicate" else "zip" if variant.startswith("zip") else variant
                 command = [tar, "--format", writer_format, "-cf", str(archive)]
-                if variant == "zip":
-                    command.extend(["--options", "zip:hdrcharset=UTF-8"])
-                elif variant == "zip-cp437":
+                if variant == "zip-cp437":
                     command.extend(["--options", "zip:hdrcharset=CP437"])
-                if variant in {"pax", "zip"}:
-                    # Let bsdtar discover Unicode paths while walking the
-                    # source tree. Passing those paths as Windows argv can
-                    # lose characters in tar.exe's code-page conversion.
-                    command.append(".")
-                else:
-                    command.extend(sorted(members))
+                command.extend(sorted(members))
                 if variant == "zip-duplicate":
                     command.append("same.txt")
                     expected["same(1).txt"] = expected["same.txt"]
@@ -109,7 +116,8 @@ def generate(destination: Path = DESTINATION, cases: tuple = STRUCTURE_CASES) ->
                     file_list.write_text("", encoding="utf-8")
                     command.extend(["-T", file_list.name])
                 creator = run([tar, "--version"], source).strip()
-            run(command, source)
+            if variant not in {"pax", "zip"}:
+                run(command, source)
             if variant == "zip":
                 listing = run([str(require_7z()), "l", "-slt", "-sccUTF-8", str(archive)], source)
                 listed_paths = {
@@ -135,6 +143,7 @@ def generate(destination: Path = DESTINATION, cases: tuple = STRUCTURE_CASES) ->
                     [Path(arg).name if arg in {tar, str(rar), str(winrar), str(archive)} else arg for arg in command]
                     for command in commands
                 ], "expected_files": expected,
+                **({"writer_request": writer_request} if writer_request is not None else {}),
             })
     artifacts = file_inventory(destination)
     for sample in samples:
