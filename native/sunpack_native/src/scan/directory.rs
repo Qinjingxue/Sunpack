@@ -2822,6 +2822,15 @@ fn scan_directory_impl<const PROFILE: bool>(
             {
                 continue;
             }
+            let outside_relation = options.relation_stem.as_ref()
+                .is_some_and(|stem| catalog_stem(&path.to_string_lossy()) != *stem);
+            // Windows caches file_type in the directory entry. Skip unrelated
+            // files before building full metadata, but keep directories and
+            // unknown types on the existing traversal/reparse-point path.
+            // A failed type query also falls back to normal metadata handling.
+            if outside_relation && entry.file_type().is_ok_and(|kind| kind.is_file()) {
+                continue;
+            }
             let metadata =
                 match measure::<PROFILE, _>(&mut profile, ProfileBucket::MetadataReads, || {
                     entry.metadata()
@@ -2887,9 +2896,7 @@ fn scan_directory_impl<const PROFILE: bool>(
                 }
                 continue;
             }
-            if options.relation_stem.as_ref()
-                .is_some_and(|stem| catalog_stem(&path.to_string_lossy()) != *stem)
-            {
+            if outside_relation {
                 continue;
             }
 
