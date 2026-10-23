@@ -159,8 +159,9 @@ def _powershell(script: str):
     return json.loads(result.stdout)
 
 
-def test_installer_repairs_existing_and_new_password_data_permissions(tmp_path, repo_root):
-    # No runtime password test can detect leftover installer ACEs or blocked atomic writes.
+def test_installer_repairs_existing_and_new_data_permissions(tmp_path, repo_root):
+    # This real install hook also catches a skipped ACL repair after [Dirs]/[Files]
+    # create the data directory. Runtime tests cannot detect that install order.
     arch = "arm64" if platform.machine().lower() in {"arm64", "aarch64"} else "x64"
     binary = Path(os.environ.get("SUNPACK_GUI_TEST_BINARY", repo_root / ".cache" / f"gui-{arch}" / "Release" / "sunpack_gui_tests.exe"))
     assert binary.is_file(), "Build the native GUI with scripts/build_gui.ps1"
@@ -200,10 +201,11 @@ foreach ($path in @({_ps_string(password_file)}, {_ps_string(backup)})) {{
 
     source = (repo_root / "installer/SunPack.iss").read_text(encoding="utf-8-sig")
     routines = []
-    for name in ("PowerShellSingleQuotedString", "SecurePasswordDataDirectory"):
+    for name in ("PowerShellSingleQuotedString", "ConfigureDataDirectoryPermissions",
+                 "AppendTextLine", "SaveUTF8TextLines", "EnsureLocalizedEditableConfigFiles"):
         match = re.search(rf"^(?:function|procedure) {name}\b.*?^end;", source, re.M | re.S)
         assert match is not None, name
-        routines.append(match.group())
+        routines.append(match.group().replace(r"{commonappdata}\SunPack", "{param:Data}"))
     marker = tmp_path / "completed"
     harness = tmp_path / "permissions.iss"
     harness.write_text(f"""
@@ -214,34 +216,46 @@ DefaultDirName={{tmp}}\\SunPackPermissionRegression
 PrivilegesRequired=lowest
 Uninstallable=no
 CreateAppDir=no
+DisableWelcomePage=yes
+DisableFinishedPage=yes
 OutputDir={tmp_path}
 OutputBaseFilename=permissions
+[Dirs]
+Name: "{{param:Data}}"
 [CustomMessages]
 DataDirectoryPermissionsFailed=Cannot secure %s
+EditableConfigCreateFailed=Cannot create %s
+WatchRootsFileHeader=# Watched folders
+WatchRootsFileMapping=# Mapping
+WatchRootsFileDeepDetect=# Deep detect
+WatchRootsFileExample=# Example
 [Code]
 {chr(10).join(routines)}
-function InitializeSetup: Boolean;
+procedure CurStepChanged(CurStep: TSetupStep);
 begin
-  SecurePasswordDataDirectory({_ps_string(existing)});
-  SecurePasswordDataDirectory({_ps_string(fresh)});
-  SecurePasswordDataDirectory({_ps_string(existing)});
-  SaveStringToFile({_ps_string(marker)}, 'ok', False);
-  Result := False;
+  if CurStep = ssPostInstall then
+  begin
+    EnsureLocalizedEditableConfigFiles;
+    SaveStringToFile({_ps_string(marker)}, 'ok', False);
+  end;
 end;
 """, encoding="utf-8-sig")
     result = subprocess.run([compiler, "/Qp", str(harness)], capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, result.stdout + result.stderr
-    result = subprocess.run(
-        [str(harness.with_suffix(".exe")), "/VERYSILENT", "/SUPPRESSMSGBOXES", "/SP-",
-         "/NORESTART", f"/LOG={tmp_path / 'setup.log'}"],
-        capture_output=True, text=True, timeout=30,
-    )
-    assert marker.exists(), (tmp_path / "setup.log").read_text(encoding="utf-8-sig", errors="replace")
+    for directory in (existing, fresh, existing):
+        result = subprocess.run(
+            [str(harness.with_suffix(".exe")), "/VERYSILENT", "/SUPPRESSMSGBOXES", "/SP-",
+             "/NORESTART", f"/Data={directory}", f"/LOG={tmp_path / 'setup.log'}"],
+            capture_output=True, text=True, timeout=30,
+        )
+        assert result.returncode == 0 and marker.exists(), (tmp_path / "setup.log").read_text(encoding="utf-8-sig", errors="replace")
     assert password_file.read_bytes() == original
     assert backup.read_text(encoding="utf-8") == "preserved"
 
     # Verify effective non-elevated IO as well as exact root and inherited child grants.
     for directory in (existing, fresh):
+        roots_file = directory / "sunpack_watch_roots.txt"
+        roots_file.write_text("C:\\Downloads\n", encoding="utf-8")
         temp = directory / ".clipboard.tmp"
         temp.write_text('{"passwords":[],"clipboard_history":["updated"]}', encoding="utf-8")
         temp.replace(directory / "builtin_passwords.json")
@@ -275,8 +289,8 @@ $entries = @($items | ForEach-Object {{
 @{{ sid = $sid; entries = $entries }} | ConvertTo-Json -Depth 6 -Compress
 """)
     roots = {str(existing), str(fresh)}
-    expected = {security["sid"]: 0x1301BF, "S-1-5-18": 0x1F01FF, "S-1-5-32-544": 0x1F01FF}
-    assert len(security["entries"]) == 6
+    expected = {"S-1-5-32-545": 0x1301BF, "S-1-5-18": 0x1F01FF, "S-1-5-32-544": 0x1F01FF}
+    assert len(security["entries"]) == 8
     for entry in security["entries"]:
         is_root = entry["path"] in roots
         assert entry["protected"] is is_root

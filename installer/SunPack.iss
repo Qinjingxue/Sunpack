@@ -372,7 +372,7 @@ begin
   Result := '''' + Value + '''';
 end;
 
-procedure SecurePasswordDataDirectory(const DataPath: string);
+procedure ConfigureDataDirectoryPermissions(const DataPath: string);
 var
   Command, Parameters: string;
   ResultCode: Integer;
@@ -381,9 +381,8 @@ begin
     '$ErrorActionPreference = ''Stop''; ' +
     '$dataPath = ' + PowerShellSingleQuotedString(DataPath) + '; ' +
     'if ([IO.File]::GetAttributes($dataPath) -band [IO.FileAttributes]::ReparsePoint) { throw ''SunPack data directory is a reparse point'' }; ' +
-    '$sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value; ' +
     '$acl = [Security.AccessControl.DirectorySecurity]::new(); ' +
-    '$acl.SetSecurityDescriptorSddlForm(''D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1301bf;;;'' + $sid + '')'', [Security.AccessControl.AccessControlSections]::Access); ' +
+    '$acl.SetSecurityDescriptorSddlForm(''D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1301bf;;;BU)'', [Security.AccessControl.AccessControlSections]::Access); ' +
     '[IO.Directory]::SetAccessControl($dataPath, $acl); ' +
     'if ([IO.Directory]::GetFileSystemEntries($dataPath).Length -gt 0) { ' +
     '  & ' + PowerShellSingleQuotedString(ExpandConstant('{sys}\icacls.exe')) + ' ($dataPath + ''\*'') /reset /T /L /Q; ' +
@@ -698,14 +697,13 @@ var
   DataPath: string;
   FilePath: string;
   Contents: TArrayOfString;
-  DataAlreadyExists: Boolean;
 begin
   DataPath := ExpandConstant('{commonappdata}\SunPack');
-  DataAlreadyExists := DirExists(DataPath);
   if not ForceDirectories(DataPath) then
     RaiseException(Format(CustomMessage('EditableConfigCreateFailed'), [DataPath]));
-  if not DataAlreadyExists then
-    SecurePasswordDataDirectory(DataPath);
+  { [Dirs]/[Files] already created this directory before ssPostInstall.
+    Repair upgrades too, including children created by elevated installers. }
+  ConfigureDataDirectoryPermissions(DataPath);
 
   FilePath := AddBackslash(DataPath) + 'sunpack_watch_roots.txt';
   if not FileExists(FilePath) then
