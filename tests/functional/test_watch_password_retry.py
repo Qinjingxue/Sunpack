@@ -234,17 +234,17 @@ def test_watch_aggregates_all_zipcrypto_fast_matches(tmp_path, monkeypatch, incl
             )
             watcher.enqueue(str(archive))
             result = await _wait_for_completed_watch_run(watcher)
-            return result, watcher, list(output_root.rglob("payload.txt"))
-    result, watcher, extracted = asyncio.run(scenario())
+            entries = list(watcher.state.entries.values())
+            return result, entries, list(output_root.rglob("payload.txt"))
+    result, entries, extracted = asyncio.run(scenario())
 
     assert result.succeeded == (1 if include_real_password else 0), result
     assert result.failed == (0 if include_real_password else 1), result
     if include_real_password:
-        assert not watcher.state.entries
+        assert not entries
         assert len(extracted) == 1
         assert extracted[0].read_text(encoding="utf-8") == payload
     else:
-        entries = list(watcher.state.entries.values())
         assert len(entries) == 1, entries
         assert entries[0].status == "failed_password"
         assert entries[0].failure_payload["kind"] == "wrong_password"

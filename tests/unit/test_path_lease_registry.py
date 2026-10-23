@@ -1,3 +1,4 @@
+from sunpack.pipeline.coordinator.output_ownership import OutputOwnership
 import asyncio
 from types import SimpleNamespace
 
@@ -6,7 +7,7 @@ from sunpack.pipeline.coordinator.engine import _PathLeaseRegistry, _RequestRunt
 
 def test_conflicting_path_lease_is_woken_by_release(tmp_path):
     async def scenario() -> None:
-        registry = _PathLeaseRegistry()
+        registry = _PathLeaseRegistry(OutputOwnership({"watch": {}}))
         path = tmp_path / "shared.zip"
         await registry.acquire("first", (path,))
 
@@ -23,7 +24,7 @@ def test_conflicting_path_lease_is_woken_by_release(tmp_path):
 
 def test_replacing_path_lease_notifies_waiters_for_released_paths(tmp_path):
     async def scenario() -> None:
-        registry = _PathLeaseRegistry()
+        registry = _PathLeaseRegistry(OutputOwnership({"watch": {}}))
         first_path = tmp_path / "first.zip"
         second_path = tmp_path / "second.zip"
         await registry.acquire("first", (first_path,))
@@ -44,7 +45,7 @@ def test_replacing_path_lease_notifies_waiters_for_released_paths(tmp_path):
 
 def test_resolved_family_replace_cannot_deadlock_on_partial_owners(tmp_path):
     async def scenario() -> None:
-        registry = _PathLeaseRegistry()
+        registry = _PathLeaseRegistry(OutputOwnership({"watch": {}}))
         first_part = tmp_path / "archive.7z.001"
         second_part = tmp_path / "archive.7z.002"
         family = (first_part, second_part)
@@ -76,7 +77,7 @@ def test_resolved_family_replace_cannot_deadlock_on_partial_owners(tmp_path):
 
 def test_watch_can_coalesce_exact_resolved_family_without_waiting(tmp_path):
     async def scenario() -> None:
-        registry = _PathLeaseRegistry()
+        registry = _PathLeaseRegistry(OutputOwnership({"watch": {}}))
         first_part = tmp_path / "archive.7z.001"
         second_part = tmp_path / "archive.7z.002"
         family = (first_part, second_part)
@@ -100,7 +101,7 @@ def test_watch_can_coalesce_exact_resolved_family_without_waiting(tmp_path):
 
 def test_watch_does_not_coalesce_newer_resolved_family_version(tmp_path):
     async def scenario() -> None:
-        registry = _PathLeaseRegistry()
+        registry = _PathLeaseRegistry(OutputOwnership({"watch": {}}))
         first_part = tmp_path / "archive.7z.001"
         second_part = tmp_path / "archive.7z.002"
         family = (first_part, second_part)
@@ -130,7 +131,7 @@ def test_watch_does_not_coalesce_newer_resolved_family_version(tmp_path):
 
 def test_completed_watch_generation_reuses_only_the_exact_unchanged_family(tmp_path):
     async def scenario() -> None:
-        registry = _PathLeaseRegistry()
+        registry = _PathLeaseRegistry(OutputOwnership({"watch": {}}))
         first_part = tmp_path / "archive.7z.001"
         second_part = tmp_path / "archive.7z.002"
         output = tmp_path / "out" / "archive"
@@ -142,7 +143,7 @@ def test_completed_watch_generation_reuses_only_the_exact_unchanged_family(tmp_p
         assert await registry.replace("first", family, coalesce_exact=True) is None
         version = registry.ownership_version_for("first", family)
         assert version
-        registry.remember_completed_watch(version, str(output))
+        registry.output_ownership.remember_completed(version, str(output))
         assert registry.completed_watch_output(version) == str(output)
 
         await registry.release("first")
@@ -157,7 +158,7 @@ def test_completed_watch_generation_reuses_only_the_exact_unchanged_family(tmp_p
 
 def test_completed_watch_generation_is_not_reused_after_output_disappears(tmp_path):
     async def scenario() -> None:
-        registry = _PathLeaseRegistry()
+        registry = _PathLeaseRegistry(OutputOwnership({"watch": {}}))
         first_part = tmp_path / "archive.zip.001"
         second_part = tmp_path / "archive.zip.002"
         output = tmp_path / "out" / "archive"
@@ -168,7 +169,7 @@ def test_completed_watch_generation_is_not_reused_after_output_disappears(tmp_pa
 
         assert await registry.replace("first", family, coalesce_exact=True) is None
         version = registry.ownership_version_for("first", family)
-        registry.remember_completed_watch(version, str(output))
+        registry.output_ownership.remember_completed(version, str(output))
         output.rmdir()
 
         assert registry.completed_watch_output(version) == ""
@@ -179,7 +180,7 @@ def test_completed_watch_generation_is_not_reused_after_output_disappears(tmp_pa
 
 def test_directory_lease_blocks_descendants_and_descendant_blocks_parent(tmp_path):
     async def scenario() -> None:
-        registry = _PathLeaseRegistry()
+        registry = _PathLeaseRegistry(OutputOwnership({"watch": {}}))
         root = tmp_path / "tree"
         root.mkdir()
         child = root / "archive.zip"
@@ -208,7 +209,7 @@ def test_directory_lease_blocks_descendants_and_descendant_blocks_parent(tmp_pat
 
 def test_release_only_wakes_waiters_blocked_by_that_owner(tmp_path):
     async def scenario() -> None:
-        registry = _PathLeaseRegistry()
+        registry = _PathLeaseRegistry(OutputOwnership({"watch": {}}))
         first_path = tmp_path / "first.zip"
         second_path = tmp_path / "second.zip"
         first_path.write_bytes(b"first")
@@ -251,7 +252,7 @@ def test_release_only_wakes_waiters_blocked_by_that_owner(tmp_path):
 
 def test_release_clears_path_lease_indexes(tmp_path):
     async def scenario() -> None:
-        registry = _PathLeaseRegistry()
+        registry = _PathLeaseRegistry(OutputOwnership({"watch": {}}))
         root = tmp_path / "tree"
         root.mkdir()
         child = root / "part.001"
@@ -276,7 +277,7 @@ def test_release_clears_path_lease_indexes(tmp_path):
 
 def test_reacquiring_owned_path_reuses_snapshotted_path_facts(tmp_path):
     async def scenario() -> None:
-        registry = _PathLeaseRegistry()
+        registry = _PathLeaseRegistry(OutputOwnership({"watch": {}}))
         path = tmp_path / "archive.zip"
         path.write_bytes(b"payload")
 
@@ -293,7 +294,7 @@ def test_reacquiring_owned_path_reuses_snapshotted_path_facts(tmp_path):
 
 def test_watch_requests_with_different_detection_modes_do_not_coalesce(tmp_path):
     async def scenario():
-        registry = _PathLeaseRegistry()
+        registry = _PathLeaseRegistry(OutputOwnership({"watch": {}}))
         path = tmp_path / "archive.part1.rar"
         path.write_bytes(b"payload")
         await registry.replace("ordinary", (path,), coalesce_exact=True)
@@ -318,18 +319,18 @@ def test_watch_requests_with_different_detection_modes_do_not_coalesce(tmp_path)
 
 def test_completed_watch_outputs_are_isolated_by_detection_mode(tmp_path):
     async def scenario():
-        registry = _PathLeaseRegistry()
+        registry = _PathLeaseRegistry(OutputOwnership({"watch": {}}))
         path = tmp_path / "archive.bin"
         path.write_bytes(b"payload")
         output = tmp_path / "out"
         output.mkdir()
         await registry.replace("ordinary", (path,), coalesce_exact=True)
         version = registry.ownership_version_for("ordinary", (path,))
-        registry.remember_completed_watch(version, str(output))
+        registry.output_ownership.remember_completed(version, str(output))
         assert registry.completed_watch_output(version) == str(output)
         assert registry.completed_watch_output(version, deep_detect=True) == ""
 
-        registry.remember_completed_watch(version, str(output), deep_detect=True)
+        registry.output_ownership.remember_completed(version, str(output), deep_detect=True)
         assert registry.completed_watch_output(version, deep_detect=True) == str(output)
 
     asyncio.run(scenario())
@@ -337,7 +338,7 @@ def test_completed_watch_outputs_are_isolated_by_detection_mode(tmp_path):
 
 def test_retry_lease_upgrade_releases_idle_partial_families(tmp_path):
     async def scenario():
-        registry = _PathLeaseRegistry()
+        registry = _PathLeaseRegistry(OutputOwnership({"watch": {}}))
         family = [str(tmp_path / "first.001"), str(tmp_path / "second.002")]
         tasks = [SimpleNamespace(all_parts=[path], runtime={}) for path in family]
         runtimes = [SimpleNamespace(
@@ -365,7 +366,7 @@ def test_retry_lease_upgrade_releases_idle_partial_families(tmp_path):
 
 def test_upgrade_keeps_active_sibling_and_shared_prefix_protected(tmp_path):
     async def scenario():
-        registry = _PathLeaseRegistry()
+        registry = _PathLeaseRegistry(OutputOwnership({"watch": {}}))
         root = tmp_path / "family"
         root.mkdir()
         first, sibling, other = [str(root / name) for name in ("first", "sibling", "other")]
@@ -397,7 +398,7 @@ def test_upgrade_keeps_active_sibling_and_shared_prefix_protected(tmp_path):
 
 def test_shared_job_pin_survives_other_job_release(tmp_path):
     async def scenario():
-        registry = _PathLeaseRegistry()
+        registry = _PathLeaseRegistry(OutputOwnership({"watch": {}}))
         path = str(tmp_path / "carrier.bin")
         await registry.acquire("A", [path], lease_id=1)
         await registry.acquire("A", [path], lease_id=2)

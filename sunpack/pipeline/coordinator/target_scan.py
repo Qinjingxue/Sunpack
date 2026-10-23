@@ -4,7 +4,6 @@ import os
 
 from sunpack_native import NativeCandidateTable, classify_scan_targets
 from sunpack.core.contracts.discovery import DiscoveryCandidate
-from sunpack.core.contracts.discovery_scope import DiscoveryScope
 from sunpack.pipeline.coordinator.scan_session import DiscoveryScanSession
 from sunpack.pipeline.discovery.relations.scheduler import RelationsScheduler
 from sunpack.core.support.path_keys import normalized_path, safe_relative_path
@@ -50,14 +49,11 @@ def build_native_table_for_targets(
 
     if session.scope is not None:
         selected_files = [path for path in selected_files if session.scope.contains(path)]
-    if session.recursive:
-        selected_dirs = [directory for directory in selected_dirs if not any(
-            other != directory and safe_relative_path(directory, other) is not None for other in selected_dirs)]
-    scan_roots = list(selected_dirs)
-    for file_path in selected_files:
-        if not any(DiscoveryScope(directory, recursive=session.recursive).contains(file_path) for directory in selected_dirs):
-            scan_roots.append(_context_root_for_file(file_path))
-    session.set_scan_roots(scan_roots)
+    session.set_scan_roots([*selected_dirs, *(_context_root_for_file(path) for path in selected_files)])
+    selected_dirs = list(dict.fromkeys(session.scope_for(directory).root for directory in selected_dirs))
+    selected_dirs = [directory for directory in selected_dirs if not any(
+        other != directory and session.scope_for(other).max_depth is None
+        and safe_relative_path(directory, other) is not None for other in selected_dirs)]
 
     table = NativeCandidateTable()
 
@@ -67,9 +63,9 @@ def build_native_table_for_targets(
 
     by_parent: dict[str, list[tuple[str, str]]] = {}
     for file_path in selected_files:
-        if any(DiscoveryScope(directory, recursive=session.recursive).contains(file_path) for directory in selected_dirs):
+        if any(session.scope_for(directory).contains(file_path) for directory in selected_dirs):
             continue
-        parent = session.scope.root if session.scope is not None else _context_root_for_file(file_path)
+        parent = session.scope_for(_context_root_for_file(file_path)).root
         by_parent.setdefault(parent, []).append((
             file_path,
             session.logical_name_for_archive(os.path.basename(file_path)),

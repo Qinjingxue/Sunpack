@@ -71,8 +71,8 @@ def main(argv=None):
                 filtered, raw = options.catalog_snapshot(state._native, scope.native, str(members[0]))
                 return len(raw.file_columns()[0])
             def enumerate_scope():
-                filtered, raw = options.scan_scope(reference_scope.native, str(members[0]))
-                return len(raw.file_columns()[0])
+                filtered, raw = options.scan_scope(reference_scope.native)
+                return len(raw.relation_bucket(str(members[0])))
             lookup = measure(bucket, runs=args.rounds, warmups=1)
             enumeration = measure(enumerate_scope, runs=min(args.rounds, 3), warmups=1)
             for row in [*lookup, *enumeration]:

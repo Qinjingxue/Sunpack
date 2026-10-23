@@ -1,3 +1,4 @@
+from sunpack.core.contracts.discovery_scope import DiscoveryScope
 from pathlib import Path
 
 from sunpack.pipeline.coordinator.output_scan_policy import (
@@ -29,7 +30,7 @@ def scan_config(blocked_files=None, blocked_extensions=None):
 
 def decisions_for(root: Path, config: dict):
     result = ArchiveTaskProvider(config).discover_targets(
-        [str(root)], scan_session=DiscoveryScanSession(config=config, recursive=True),
+        [str(root)], scan_session=DiscoveryScanSession(config=config, scope=DiscoveryScope(str(root), recursive=True)),
     )
     return {
         Path(item.main_path).relative_to(root).as_posix(): item

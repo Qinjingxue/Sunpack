@@ -203,10 +203,11 @@ class WatchScheduler:
                 else observer_stop_timeout_seconds
             ),
         )
+        output_ownership = output_ownership or getattr(pipeline_engine, "output_ownership", None)
         self.output_ownership = output_ownership
         self._owns_state = output_ownership is None
         self.state = (WatchStateStore(state_path, retirement_callback=self._schedule_journal_retirement)
-                      if self._owns_state else output_ownership.state_for(state_path))
+                      if self._owns_state else output_ownership.acquire_watch(state_path))
         self._scope_policies = {}
         self._scope_epochs = {}
         for key, scope in self.scopes.items():
@@ -400,11 +401,13 @@ class WatchScheduler:
         for root in self.watch_roots:
             if os.path.isdir(root):
                 desired[(root, self.root_entries[path_key(root)].recursive)] = None
-            # Ancestor guards observe deletion/recreation without subtree scans.
+            # One nearest existing parent guards deletion/recreation. If it
+            # disappears, its own event re-arms the guard one level higher.
             parent = os.path.dirname(root)
             while parent:
                 if os.path.isdir(parent):
                     desired[(parent, False)] = None
+                    break
                 ancestor = os.path.dirname(parent)
                 if ancestor == parent:
                     break
@@ -639,6 +642,10 @@ class WatchScheduler:
             scope_dir = str(getattr(pending, "password_scope_dir", "") or "")
             internal = bool(getattr(pending, "internal_recovery", False))
             if not active_outputs and not committed_roots:
+                candidate = _candidate_for_event_path(pending.path)
+                if candidate is not None and self._has_valid_completion(candidate):
+                    self.state.complete_work([pending.path])
+                    continue
                 if os.path.exists(pending.path):
                     self.enqueue(
                         pending.path,
@@ -824,6 +831,8 @@ class WatchScheduler:
         try:
             if self._owns_state:
                 self.state.close()
+            else:
+                self.output_ownership.release_watch()
         finally:
             self.log.close()
             with self._claim_gate, self._lock:
@@ -1271,8 +1280,7 @@ class WatchScheduler:
         pending_recovery = self.state.pending_work_for_path(path)
         retry_scope = (_password_retry_snapshot.failure_payload.get("discovery_scope")
                        if _password_retry_snapshot is not None else None)
-        retry_internal = bool(retry_scope and _password_retry_snapshot.source_input_root
-            and path_key(retry_scope["root"]) != path_key(_password_retry_snapshot.source_input_root))
+        retry_internal = bool(retry_scope and _password_retry_snapshot.source_input_root)
         authorized_recovery = bool((pending_recovery and pending_recovery.internal_recovery) or retry_internal)
         if retry_scope and not DiscoveryScope.from_record(retry_scope).contains(path):
             raise ValueError("Retry input is outside its persisted discovery scope")
@@ -1896,6 +1904,8 @@ class WatchScheduler:
             run_config["password_scope_dir"] = scope_dir or os.path.dirname(candidate.path)
         output_root = self._output_root_for(candidate.path)
         run_config["watch_policy"] = self._policy_id(source_input_root)
+        run_config["watch_owner_path"] = candidate.path
+        run_config["watch_deep_detect"] = options.force_scan
         run_config["watch_internal_recovery"] = internal_scope is not None
         nested_recovery = internal_scope is not None and path_key(internal_scope.root) != path_key(source_input_root)
         run_config["output"] = {
@@ -1977,23 +1987,6 @@ class WatchScheduler:
             self._claim_pipeline_sources(
                 notification_id, source_paths, path=owner_path, groups=event.get("groups"),
             )
-            return
-        if name == "task_output_started":
-            if not self.state.record_task_output_started(
-                owner_path,
-                str(event.get("task_path") or getattr(archive_task, "main_path", "") or ""),
-                str(event.get("output_dir") or ""),
-            ):
-                raise RuntimeError("watch output start state transition rejected")
-            return
-        if name == "task_output_finished":
-            if not self.state.record_task_output_finished(
-                owner_path,
-                str(event.get("task_path") or getattr(archive_task, "main_path", "") or ""),
-                str(event.get("output_dir") or ""),
-                keep_output=bool(event.get("keep_output")),
-            ):
-                raise RuntimeError("watch output finish state transition rejected")
             return
         self._notify("progress", notification_id, archive_task, event)
 
@@ -2237,16 +2230,6 @@ class WatchScheduler:
             self._notify("failed", request.notification_id, [error], [])
             return WatchRunResult(processed=1, failed=1, errors=[error])
 
-        completed = []
-        output_identities = self._output_identities(generated_output_dirs)
-        for source in claimed_paths if output_identities is not None else ():
-            observed = _watch_candidate_for_path(source)
-            if observed is not None:
-                completed.append({"op":"runtime", "key":"done|"+path_key(source), "value":{
-                    "path":source,"size":observed.size,"mtime":observed.mtime,"file_id":observed.file_id,
-                    "change_usn":observed.change_usn,"outputs":generated_output_dirs,
-                    "output_identities":output_identities,"policy":request.policy}})
-        self.state.commit_runtime(completed, durable=True)
         self.log.write(
             "done",
             path=candidate.path,
@@ -2384,6 +2367,10 @@ class _WatchEventHandler(FileSystemEventHandler):
     def on_moved(self, event: FileSystemEvent):
         src_path = getattr(event, "src_path", "")
         is_directory = bool(getattr(event, "is_directory", False))
+        if is_directory and not any(scope.native.intersects_output(path)
+                for path in (src_path, getattr(event, "dest_path", "")) if path
+                for scope in self.scheduler.scopes.values()):
+            return
         if is_directory and src_path and getattr(event,"dest_path","") and self.scheduler.output_ownership is not None:
             self.scheduler.output_ownership.relocate(src_path,event.dest_path)
         if src_path:
@@ -2411,6 +2398,11 @@ class _WatchEventHandler(FileSystemEventHandler):
         if self.scheduler.is_builtin_password_file(path):
             self.scheduler.notify_password_source_changed("builtin_password_file", path="")
             return
+        if is_directory:
+            self.scheduler._queue_watch_rearm(path)
+        if not self.scheduler._is_under_watched_root(path) and not (
+                is_directory and any(scope.native.intersects_output(path) for scope in self.scheduler.scopes.values())):
+            return
         self.scheduler.notify_path_departed(path, recursive=is_directory)
 
     def _handle(self, event: FileSystemEvent, event_type: str):
@@ -2425,6 +2417,8 @@ class _WatchEventHandler(FileSystemEventHandler):
     def _handle_path(self, path: str, *, event_type: str = "unknown", src_path: str = ""):
         if self.scheduler.is_builtin_password_file(path):
             self.scheduler.notify_password_source_changed("builtin_password_file", path="")
+            return
+        if not self.scheduler._is_under_watched_root(path):
             return
         if self.scheduler.should_ignore_event_path(path):
             return

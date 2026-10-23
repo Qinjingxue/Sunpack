@@ -84,7 +84,7 @@ def test_unreadable_subtree_is_reported_without_losing_readable_archives(tmp_pat
         single = scan_directory_snapshot(str(blocked), None, [], [], [], [], [], [], [])
         assert not single and len(single.scan_errors()) == 1
         state = RunState()
-        tasks = ArchiveTaskScanner(config, state).scan_targets([str(root)], scan_session=DiscoveryScanSession(config=config,recursive=True))
+        tasks = ArchiveTaskScanner(config, state).scan_targets([str(root)], scan_session=DiscoveryScanSession(config=config,scope=DiscoveryScope(str(root),recursive=True)))
         assert len(tasks) == 1 and tasks[0].main_path == str(root / "good.blob")
         assert state.scan_failures[0].kind == FailureKind.FILESYSTEM_ERROR
         code, result = scan.handle(SimpleNamespace(recursive=True, paths=[str(root)], deep_detect=False, json=json_mode), context)

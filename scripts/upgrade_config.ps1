@@ -20,7 +20,7 @@ function Add-Key($Object, [string]$Name, $Value) {
     $Object | Add-Member -MemberType NoteProperty -Name $Name -Value $Value
     $script:Changed = $true
 }
-function Update-Fields($Old, $New, $User, $Defaults, [string]$Path) {
+function Update-Fields($Old, $New, $User, $Defaults) {
     if ($User -isnot [pscustomobject]) { return }
     foreach ($field in @($Old.PSObject.Properties)) {
         if (-not (Has-Key $New $field.Name) -and (Has-Key $User $field.Name)) {
@@ -30,7 +30,6 @@ function Update-Fields($Old, $New, $User, $Defaults, [string]$Path) {
     }
     foreach ($field in @($New.PSObject.Properties)) {
         $name = $field.Name
-        $location = "$Path/$name"
         if (-not (Has-Key $Old $name)) {
             if (-not (Has-Key $User $name) -and (Has-Key $Defaults $name)) {
                 Add-Key $User $name $Defaults.$name
@@ -44,41 +43,13 @@ function Update-Fields($Old, $New, $User, $Defaults, [string]$Path) {
                 # Materialize only added fields, not the old defaults of an
                 # object the user never wrote into the ordinary configuration.
                 $added = [pscustomobject]@{}
-                Update-Fields $Old.$name $field.Value $added $default $location
+                Update-Fields $Old.$name $field.Value $added $default
                 if (@($added.PSObject.Properties).Count -gt 0) { Add-Key $User $name $added }
             }
             continue
         }
-        if ($location -eq '/filesystem/scan_filters' -and $User.$name -is [array]) {
-            $oldModules = @{}; $newModules = @{}; $templates = @{}
-            foreach ($item in @($Old.$name)) { if (Has-Key $item 'name') { $oldModules[$item.name] = $item } }
-            foreach ($item in @($New.$name)) { if (Has-Key $item 'name') { $newModules[$item.name] = $item } }
-            foreach ($item in @($default)) { if (Has-Key $item 'name') { $templates[$item.name] = $item } }
-            $kept = New-Object 'System.Collections.Generic.List[object]'
-            $present = @{}
-            foreach ($item in @($User.$name)) {
-                if (-not (Has-Key $item 'name')) { $kept.Add($item); continue }
-                $identity = $item.name
-                if ($oldModules.ContainsKey($identity) -and -not $newModules.ContainsKey($identity)) {
-                    $script:Changed = $true
-                    continue
-                }
-                $present[$identity] = $true
-                if ($oldModules.ContainsKey($identity) -and $newModules.ContainsKey($identity)) {
-                    Update-Fields $oldModules[$identity] $newModules[$identity] $item $templates[$identity] "$location/$identity"
-                }
-                $kept.Add($item)
-            }
-            foreach ($item in @($default)) {
-                if ((Has-Key $item 'name') -and -not $oldModules.ContainsKey($item.name) -and
-                    $newModules.ContainsKey($item.name) -and -not $present.ContainsKey($item.name)) {
-                    $kept.Add($item)
-                    $script:Changed = $true
-                }
-            }
-            $User.$name = $kept.ToArray()
-        } elseif ($field.Value -is [pscustomobject] -and $Old.$name -is [pscustomobject]) {
-            Update-Fields $Old.$name $field.Value $User.$name $default $location
+        if ($field.Value -is [pscustomobject] -and $Old.$name -is [pscustomobject]) {
+            Update-Fields $Old.$name $field.Value $User.$name $default
         }
     }
 }
@@ -87,7 +58,7 @@ $old = Read-Object $OldAdvanced
 $new = Read-Object $NewAdvanced
 $defaults = Read-Object $Template
 $user = Read-Object $UserConfig
-Update-Fields $old $new $user $defaults ''
+Update-Fields $old $new $user $defaults
 if (-not $script:Changed) { exit 0 }
 
 $target = [IO.Path]::GetFullPath($UserConfig)

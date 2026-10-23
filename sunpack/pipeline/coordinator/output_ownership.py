@@ -4,8 +4,17 @@ from __future__ import annotations
 import os
 import threading
 
-from sunpack_native import watch_path_identity, watch_identity_path, create_output_root
+from sunpack_native import NativeWatchState, watch_path_identity, watch_identity_path, create_output_root
 from sunpack.core.support.path_keys import path_key
+
+
+class _MemoryOutputState:
+    """The same native ownership index without a journal or background writer."""
+    def __init__(self):
+        self._native = NativeWatchState()
+
+    def commit_runtime(self, operations, *, durable=False):
+        self._native.apply(self._native.decode_operations(operations))
 
 
 class OutputOwnership:
@@ -15,8 +24,34 @@ class OutputOwnership:
         self._init_lock = threading.Lock()
         self.input_leases = None
         self._state = None
+        self._state_path = None
+        self._memory = _MemoryOutputState()
         self._active_owners = set()
         self._scopes = None
+        self._watch_users = 0
+        self._watch_released = False
+
+    def acquire_watch(self, path):
+        state = self.state_for(path)
+        with self.gate:
+            self._watch_users += 1
+            self._watch_released = False
+        return state
+
+    def release_watch(self):
+        with self.gate:
+            if self._watch_users:
+                self._watch_users -= 1
+            self._watch_released = not self._watch_users
+        self._release_unused_state()
+
+    def _release_unused_state(self):
+        with self._init_lock:
+            with self.gate:
+                if not self._watch_released or self._active_owners or self._state is None:
+                    return
+                state, self._state = self._state, None
+            state.close()
 
     def _retention_scopes(self):
         if self._scopes is None:
@@ -28,15 +63,30 @@ class OutputOwnership:
     def _retained(self, path):
         return any(scope.native.intersects_output(path) for scope in self._retention_scopes())
 
+    def _store(self, path, *, watch_owner="", persistent=False):
+        if persistent or watch_owner or self._retained(path):
+            return self.state_for()
+        if self._state is not None and self._state._native.runtime_record("owned|" + path_key(path)) is not None:
+            return self._state
+        return self._memory
+
+    @staticmethod
+    def _commit_output(state, operations, path, watch_owner, task_path, keep_output=None):
+        if watch_owner:
+            state.commit_output(operations, watch_owner, task_path, os.path.abspath(path), keep_output=keep_output)
+        else:
+            state.commit_runtime(operations, durable=True)
+
     def state_for(self, path=None):
         with self._init_lock:
+            if path is not None and self._state_path is not None and path_key(path) != path_key(self._state_path):
+                raise ValueError("The runtime already owns a different state path")
             if self._state is None:
                 from sunpack.runtime.watch.state import WatchStateStore
                 from sunpack.runtime.watch.service import service_state_dir
-                self._state = WatchStateStore(path or os.path.join(service_state_dir(self.config), "state.json"))
+                self._state_path = path or self._state_path or os.path.join(service_state_dir(self.config), "state.json")
+                self._state = WatchStateStore(self._state_path)
                 self._recover_unfinished()
-            elif path is not None and path_key(str(self._state.path)) != path_key(path):
-                raise ValueError("The runtime already owns a different state path")
             return self._state
 
     def _recover_unfinished(self):
@@ -76,8 +126,8 @@ class OutputOwnership:
             changes.append({"op":"runtime", "key":key, "value":record})
         state.commit_runtime(changes, durable=True)
 
-    def begin(self, path, owner, *, identities=()):
-        state = self.state_for()
+    def begin(self, path, owner, *, identities=(), watch_owner="", task_path="", persistent=False):
+        state = self._store(path, watch_owner=watch_owner, persistent=persistent)
         lease_path = self.input_leases.output_path(path) if self.input_leases is not None else None
         record = {"path": os.path.abspath(path), "owner": owner, "identities": list(identities),
                   "state": "relocating" if identities else "writing"}
@@ -95,7 +145,7 @@ class OutputOwnership:
             if not identities:
                 create_output_root(os.path.abspath(path))
                 created = True
-                self.bind(path)
+                self.bind(path, watch_owner=watch_owner, task_path=task_path)
         except BaseException:
             # A failed bind may leave a directory that already received output
             # events. Keep its published protection until normal owner recovery.
@@ -108,16 +158,20 @@ class OutputOwnership:
                             self._active_owners.discard(owner)
             raise
 
-    def seal(self, path, *, succeeded):
-        state = self.state_for()
+    def seal(self, path, *, succeeded, watch_owner="", task_path="", sources=(), policy="", generation=(), deep_detect=False, completed=False):
+        state = self._store(path, watch_owner=watch_owner)
         key = "owned|" + path_key(path)
         record = state._native.runtime_record(key)
         if record is not None:
             record["state"] = "sealed" if succeeded else "quarantined"
-            state.commit_runtime([{"op":"runtime", "key":key, "value":record}], durable=True)
+            operations = state._native.decode_operations([{"op":"runtime", "key":key, "value":record}])
+            if completed and watch_owner:
+                operations = operations.extend(state._native.completion_operations(
+                    list(sources), os.path.abspath(path), policy, generation, deep_detect))
+            self._commit_output(state, operations, path, watch_owner, task_path, succeeded)
 
-    def bind(self, path):
-        state = self.state_for()
+    def bind(self, path, *, watch_owner="", task_path=""):
+        state = self._store(path, watch_owner=watch_owner)
         key = "owned|" + path_key(path)
         record = state._native.runtime_record(key)
         if record is None:
@@ -127,7 +181,7 @@ class OutputOwnership:
         except FileNotFoundError:
             return
         record["identities"] = [f"{volume}|{identity}"]
-        state.commit_runtime([{"op": "runtime", "key": key, "value": record}], durable=True)
+        self._commit_output(state, [{"op": "runtime", "key": key, "value": record}], path, watch_owner, task_path)
 
     def prepare_flatten(self, root, owner, reservations):
         from sunpack_native import flatten_leaf
@@ -137,7 +191,7 @@ class OutputOwnership:
         volume, identity, _ = watch_path_identity(root)
         _, leaf_identity, _ = watch_path_identity(leaf)
         root_key = "owned|" + path_key(root)
-        state = self.state_for()
+        state = self._store(root)
         record = state._native.runtime_record(root_key)
         if record is None:
             return None
@@ -145,12 +199,15 @@ class OutputOwnership:
         record["state"] = "relocating"
         state.commit_runtime([{"op":"runtime", "key":root_key, "value":record}], durable=True)
         work = reservations.reserve(root + ".__sunpack_flatten_work__",owner,set())
-        self.begin(work, owner, identities=[f"{volume}|{identity}"])
+        self.begin(work, owner, identities=[f"{volume}|{identity}"], persistent=state is self._state)
         return work
 
     def protected(self, path):
-        state = self._state or self.state_for()
-        return state._native.owned_root(path) is not None
+        if self._memory._native.owned_root(path) is not None:
+            return True
+        if self._state is None and not self._retention_scopes():
+            return False
+        return self.state_for()._native.owned_root(path) is not None
 
     def recoverable_output(self, path):
         """Authorize recovery only from a verified output's surviving identity."""
@@ -161,6 +218,46 @@ class OutputOwnership:
         self.reconcile(root)
         record = state._native.runtime_record("owned|" + root)
         return bool(record and record["state"] in {"sealed", "retained"})
+
+    def completion_for(self, path):
+        key = "done|" + path_key(path)
+        for state in (self._state, self._memory):
+            if state is not None:
+                record = state._native.runtime_record(key)
+                if record is not None:
+                    return (state._native.runtime_record("done|" + record["family"])
+                            if record.get("family") else record)
+        return None
+
+    def completed_output(self, generation, *, deep_detect=False, policy=""):
+        if not generation:
+            return ""
+        record = self.completion_for(generation[0][0])
+        if not record or record.get("generation") != [list(row) for row in generation]:
+            return ""
+        if record.get("policy") != policy or record.get("deep_detect") != deep_detect:
+            return ""
+        for path, volume, identity in record["output_identities"]:
+            try:
+                current_volume, current_identity, _ = watch_path_identity(path)
+            except OSError:
+                return ""
+            if (current_volume, current_identity) != (volume, identity):
+                return ""
+        return record["outputs"][0] if record["outputs"] else ""
+
+    def remember_completed(self, generation, output, *, deep_detect=False, policy=""):
+        if not generation or not output:
+            return
+        state = self._state or self._store(output)
+        state.commit_runtime(state._native.completion_operations(
+            [row[0] for row in generation], os.path.abspath(output), policy, generation, deep_detect), durable=True)
+
+    def consume_output(self, generation):
+        """Pipeline deliberately consumed this tree during recursive postprocessing."""
+        if self._state is None:
+            return
+        self._state.commit_runtime(self._state._native.consume_output(generation), durable=True)
 
     def reconcile(self, path, *, recursive=False):
         state = self.state_for()
@@ -229,9 +326,18 @@ class OutputOwnership:
         state.commit_runtime(changes, durable=True)
 
     def finish(self, owner):
+        try:
+            for key in self._memory._native.runtime_owner_keys(owner):
+                self._memory.commit_runtime([{"op":"runtime", "key":key}])
+            if self._state is not None:
+                self._finish_persistent(owner)
+        finally:
+            with self.gate:
+                self._active_owners.discard(owner)
+            self._release_unused_state()
+
+    def _finish_persistent(self, owner):
         state = self._state
-        if state is None:
-            return
         changes = []
         for key in state._native.runtime_owner_keys(owner):
             record = state._native.runtime_record(key)
@@ -251,16 +357,22 @@ class OutputOwnership:
                 record.update(owner="", state="retained" if record["state"] in {"sealed", "retained"} else "quarantined",
                               identities=[f"{volume}|{identity}"])
             changes.append({"op": "runtime", "key": key, "value": record})
-        try:
-            state.commit_runtime(state._native.fold_owned_outputs(changes), durable=True)
-        finally:
-            with self.gate:
-                self._active_owners.discard(owner)
+        state.commit_runtime(state._native.fold_owned_outputs(changes), durable=True)
 
     def retain_scopes(self, scopes):
         """Drop removed roots' catalogs and outputs in one existing WAL transaction."""
         self._scopes = tuple(scopes)
         state = self.state_for()
+        # Watch can be enabled while a foreground request is already writing.
+        # Transfer matching live intents so native catalog pruning shares them.
+        with self.gate:
+            promoted = []
+            for key in self._memory._native.runtime_keys("owned|"):
+                record = self._memory._native.runtime_record(key)
+                if self._retained(record["path"]):
+                    promoted.append({"op":"runtime", "key":key, "value":record})
+            state.commit_runtime(promoted, durable=True)
+            self._memory.commit_runtime([{"op":"runtime", "key":op["key"]} for op in promoted])
         state.commit_runtime(state._native.prune_runtime_scopes([scope.native for scope in self._scopes]), durable=True)
 
     def close(self):
@@ -269,6 +381,10 @@ class OutputOwnership:
                 self._state.close()
         finally:
             self._state = None
+            self._state_path = None
+            self._memory._native.reset()
             self.input_leases = None
             self._scopes = None
             self._active_owners.clear()
+            self._watch_users = 0
+            self._watch_released = False

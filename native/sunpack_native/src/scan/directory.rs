@@ -8,7 +8,7 @@ use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use crate::analysis_native::volume_anchor::{
@@ -48,6 +48,7 @@ const FORMAT_REJECT_TAR: u32 = 1 << 3;
 pub(crate) struct NativeDirectorySnapshot {
     pub(crate) table: Arc<DirectorySnapshotTable>,
     pub(crate) rows: Vec<usize>,
+    buckets: OnceLock<HashMap<String, Vec<usize>>>,
 }
 
 impl NativeDirectorySnapshot {
@@ -56,7 +57,7 @@ impl NativeDirectorySnapshot {
         table.scan_errors = errors.into_messages();
         let table = Arc::new(table);
         let rows = (0..table.paths.len()).collect();
-        Self { table, rows }
+        Self { table, rows, buckets: OnceLock::new() }
     }
 
     fn from_views(
@@ -80,10 +81,12 @@ impl NativeDirectorySnapshot {
         let raw_rows = (0..table.paths.len()).collect();
         (
             Self {
+                buckets: OnceLock::new(),
                 table: Arc::clone(&table),
                 rows: filtered_rows,
             },
             Self {
+                buckets: OnceLock::new(),
                 table,
                 rows: raw_rows,
             },
@@ -756,6 +759,23 @@ fn output_file_dict(py: Python<'_>, item: &OutputFileRecord) -> PyResult<Py<PyDi
 
 #[pymethods]
 impl NativeDirectorySnapshot {
+    /// A lazy name index over this view; rows and existing Rust head facts stay shared.
+    fn relation_bucket(&self, seed: &str) -> Self {
+        let stem = |path: &str| crate::path_keys::case_key(crate::relations::first_dot_stem(
+            Path::new(path).file_name().and_then(|name| name.to_str()).unwrap_or_default()));
+        let buckets = self.buckets.get_or_init(|| {
+            let mut buckets: HashMap<String, Vec<usize>> = HashMap::new();
+            for &row in &self.rows {
+                if !self.table.is_dirs[row] {
+                    buckets.entry(stem(&self.table.paths[row])).or_default().push(row);
+                }
+            }
+            buckets
+        });
+        Self { table: Arc::clone(&self.table),
+            rows: buckets.get(&stem(seed)).cloned().unwrap_or_default(), buckets: OnceLock::new() }
+    }
+
     fn scan_errors(&self) -> Vec<DirectoryReadError> {
         self.table.scan_errors.clone()
     }
@@ -850,6 +870,7 @@ impl NativeDirectorySnapshot {
 
     pub(crate) fn file_route_view(&self, route: u8) -> Self {
         Self {
+            buckets: OnceLock::new(),
             table: Arc::clone(&self.table),
             rows: self
                 .rows
@@ -1273,21 +1294,11 @@ impl NativeDirectoryScanOptions {
         Ok((Py::new(py,filtered)?,Py::new(py,raw)?))
     }
 
-    #[pyo3(signature=(scope, seed=None))]
-    fn scan_scope(&self, py: Python<'_>, scope: &crate::scan::scope::NativeDiscoveryScope, seed: Option<&str>)
+    fn scan_scope(&self, py: Python<'_>, scope: &crate::scan::scope::NativeDiscoveryScope)
         -> PyResult<(Py<NativeDirectorySnapshot>, Py<NativeDirectorySnapshot>)> {
         let mut options = self.options.clone();
         options.scope = Some(scope.clone());
-        let Some(seed)=seed else {return scan_snapshots_with_options(py, &scope.root, scope.max_depth, &options);};
-        let (filtered,raw)=py.detach(|| {
-            let stem=crate::relations::first_dot_stem(Path::new(seed).file_name().and_then(|n|n.to_str()).unwrap_or_default());
-            let mut records=scan_directory_views(&scope.root, scope.max_depth, &options)?;
-            let matches=|r:&DirectoryEntryRecord| !r.is_dir && crate::relations::first_dot_stem(Path::new(&r.path).file_name().and_then(|n|n.to_str()).unwrap_or_default()).eq_ignore_ascii_case(stem);
-            records.raw.retain(matches); records.filtered.retain(matches);
-            populate_relation_anchors(&mut records.raw);
-            Ok::<_,PyErr>(NativeDirectorySnapshot::from_views(records.filtered,records.raw,records.errors))
-        })?;
-        Ok((Py::new(py,filtered)?,Py::new(py,raw)?))
+        scan_snapshots_with_options(py, &scope.root, scope.max_depth, &options)
     }
 
     fn scan(

@@ -279,7 +279,7 @@ def test_directory_scanner_explicit_max_depth_overrides_scan_mode(tmp_path):
     nested.mkdir()
     (nested / "nested.zip").write_bytes(b"PK\x03\x04payload")
 
-    snapshot = DirectoryScanner(str(tmp_path), max_depth=1, config=make_config({
+    snapshot = DirectoryScanner(str(tmp_path), scope=DiscoveryScope(str(tmp_path), max_depth=1), config=make_config({
         "filesystem": {
             
             "scan_filters": [],

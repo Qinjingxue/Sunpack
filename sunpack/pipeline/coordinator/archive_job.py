@@ -134,13 +134,18 @@ class ArchiveJobExecutor:
         if self.output_ownership is not None and outcome.planned_out_dir:
             await broker.run("output_seal", task.key or task.main_path, self.output_ownership.seal,
                 outcome.planned_out_dir, succeeded=result.outcome_kind != OutcomeKind.FAILURE,
+                watch_owner=self.config.get("watch_owner_path", ""),
+                task_path=task.runtime.get("watch_active_output", (task.main_path, ""))[0],
+                sources=task.all_parts or [task.main_path], policy=self.config.get("watch_policy", ""),
+                generation=task.runtime.get("source_generation", ()),
+                deep_detect=bool(self.config.get("watch_deep_detect", False)),
+                completed=result.outcome_kind == OutcomeKind.COMPLETE_SUCCESS,
                 request_id=self.request_id)
         if self.origin == "watch":
             output_task_path, output_dir = task.runtime.pop("watch_active_output", (task.main_path, outcome.planned_out_dir))
             self.extractor.emit_semantic_event(
                 task,
                 "task_output_finished",
-                critical=True,
                 task_path=output_task_path,
                 output_dir=output_dir,
                 keep_output=bool(result.output_dir and result.outcome_kind != OutcomeKind.FAILURE),
@@ -208,13 +213,13 @@ class ArchiveJobExecutor:
         if self.output_ownership is not None:
             await broker.run("output_begin", file_id, self.output_ownership.begin,
                              planned_out_dir, self.request_id, request_id=self.request_id,
+                             watch_owner=self.config.get("watch_owner_path", ""), task_path=task.main_path,
                              cancellation=cancellation)
         if self.origin == "watch":
             task.runtime["watch_active_output"] = (task.main_path, planned_out_dir)
             self.extractor.emit_semantic_event(
                 task,
                 "task_output_started",
-                critical=True,
                 output_dir=planned_out_dir,
             )
         state = self._extract_verify_state_machine(

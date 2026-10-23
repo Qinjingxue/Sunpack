@@ -505,7 +505,7 @@ pub(super) fn resolve_buckets(
                 .chain(encrypted_heads)
                 .collect();
             let mut competing_families = false;
-            let families: Vec<(String, Vec<usize>)> = if head_indexes.len() > 1 {
+            let mut families: Vec<(String, Vec<usize>)> = if head_indexes.len() > 1 {
                 let head_families: HashSet<_> = head_indexes
                     .iter()
                     .filter_map(|i| features.get(i).and_then(|f| f.family(format)))
@@ -538,6 +538,34 @@ pub(super) fn resolve_buckets(
             } else {
                 vec![(stem.clone(), members.clone())]
             };
+            // Preserve independently complete local sets. Locality is never
+            // evidence for filling a gap: every partition must independently
+            // satisfy the same structural/name solver before using this rule.
+            let mut local_assignments = HashMap::new();
+            if competing_families {
+                let mut local: HashMap<String, Vec<usize>> = HashMap::new();
+                for &i in &members {
+                    let parent = Path::new(&rows[i].path).parent().unwrap_or(Path::new(""));
+                    local.entry(path_key(&parent.to_string_lossy())).or_default().push(i);
+                }
+                if local.len() > 1 {
+                    for indexes in local.values() {
+                        let view = BucketView { rows, indexes: indexes.clone(), facts: &facts,
+                            features: &features, format, loose_numeric_allowed: true };
+                        let (assignment, reason) = view.solve();
+                        if reason.is_some() || !view.complete(&assignment) {
+                            local_assignments.clear();
+                            break;
+                        }
+                        local_assignments.insert(indexes[0], assignment);
+                    }
+                    if local_assignments.len() == local.len() {
+                        families = local.into_values().map(|indexes| (stem.clone(), indexes)).collect();
+                        competing_families = false;
+                    }
+                }
+            }
+            let local_sets = !local_assignments.is_empty();
             let mut launchers: HashMap<String, Vec<usize>> = HashMap::new();
             for i in companions {
                 let a = rows[i].anchor.as_ref().unwrap();
@@ -579,7 +607,9 @@ pub(super) fn resolve_buckets(
                     features: &features,
                     format,
                 };
-                let (mut assignment, reason) = if competing_families {
+                let (mut assignment, reason) = if let Some(assignment) = local_assignments.remove(&view.indexes[0]) {
+                    (assignment, None)
+                } else if competing_families {
                     (
                         VolumeAssignment {
                             unresolved: view.indexes.clone(),
@@ -604,10 +634,10 @@ pub(super) fn resolve_buckets(
                     family.clone()
                 };
                 if reason.is_none() {
-                    if let Some(matching) =
-                        launchers.get(&case_key(&logical)).filter(|m| m.len() == 1)
-                    {
-                        assignment.companions = matching.clone();
+                    if let Some(matching) = launchers.get(&case_key(&logical)) {
+                        let matching: Vec<_> = matching.iter().copied().filter(|i| !local_sets
+                            || Path::new(&rows[*i].path).parent() == Path::new(&rows[view.indexes[0]].path).parent()).collect();
+                        if matching.len() == 1 { assignment.companions = matching; }
                     }
                 }
                 output.extend(materialize(&view, assignment, &logical, reason));

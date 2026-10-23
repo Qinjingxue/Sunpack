@@ -50,7 +50,7 @@ def test_pending_output_recovery_state_round_trips(tmp_path):
         persist=True,
         durable=True,
     )
-    assert state.record_task_output_started(str(source), str(inner), str(output))
+    state.commit_output([], str(source), str(inner), str(output))
 
     [live] = state.pending_work_items()
     assert live.active_outputs[str(inner.resolve())] == str(output.resolve())
@@ -60,7 +60,7 @@ def test_pending_output_recovery_state_round_trips(tmp_path):
     assert before_finish.password_scope_dir == str(tmp_path.resolve())
     assert before_finish.source_input_root == str(tmp_path)
 
-    assert state.record_task_output_finished(
+    state.commit_output([],
         str(source),
         str(inner),
         str(output),
@@ -274,10 +274,10 @@ def test_committed_roots_collapse_nested_outputs(tmp_path):
     child_source = root / "child.zip"
     child_output = root / "child"
 
-    state.record_task_output_started(str(outer), str(outer), str(root))
-    state.record_task_output_finished(str(outer), str(outer), str(root), keep_output=True)
-    state.record_task_output_started(str(outer), str(child_source), str(child_output))
-    state.record_task_output_finished(str(outer), str(child_source), str(child_output), keep_output=True)
+    state.commit_output([], str(outer), str(outer), str(root))
+    state.commit_output([], str(outer), str(outer), str(root), keep_output=True)
+    state.commit_output([], str(outer), str(child_source), str(child_output))
+    state.commit_output([], str(outer), str(child_source), str(child_output), keep_output=True)
 
     [pending] = state.pending_work_items()
     assert pending.committed_roots == [str(root.resolve())]
@@ -368,36 +368,15 @@ def test_persisted_blocker_wins_over_stale_pending_recovery(tmp_path):
 
 
 
-def test_watch_lifecycle_state_rejection_fails_closed():
-    import pytest
-    import sunpack.runtime.watch.scheduler as scheduler_module
-
-    scheduler = _watch_scheduler_shell(scheduler_module)
-    scheduler.state = SimpleNamespace(
-        record_task_output_started=lambda *_args, **_kwargs: False,
-        record_task_output_finished=lambda *_args, **_kwargs: False,
-    )
-    task = SimpleNamespace(main_path="archive.zip")
-
-    with pytest.raises(RuntimeError, match="start state transition rejected"):
-        scheduler._handle_pipeline_progress(
-            "archive.zip",
-            "notification",
-            task,
-            {"event": "task_output_started", "output_dir": "out"},
-        )
-
-    with pytest.raises(RuntimeError, match="finish state transition rejected"):
-        scheduler._handle_pipeline_progress(
-            "archive.zip",
-            "notification",
-            task,
-            {
-                "event": "task_output_finished",
-                "output_dir": "out",
-                "keep_output": True,
-            },
-        )
+def test_output_lifecycle_state_rejection_fails_before_commit(tmp_path):
+    # Progress observers no longer own correctness. The direct transaction must
+    # reject an absent request without publishing any output operation.
+    state = WatchStateStore(str(tmp_path / "state.json"))
+    with pytest.raises(ValueError, match="owner is no longer queued"):
+        state.commit_output([{"op": "runtime", "key": "owned|test", "value": {"path": "test"}}],
+                            "absent.zip", "absent.zip", "out")
+    assert state._native.runtime_record("owned|test") is None
+    state.close()
 
 
 @pytest.mark.parametrize("committed", [False, True])
@@ -418,9 +397,9 @@ def test_legacy_path_only_recovery_preserves_unknown_output_and_requeues_source(
         persist=True,
         durable=True,
     )
-    assert state.record_task_output_started(str(source), str(source), str(output))
+    state.commit_output([], str(source), str(source), str(output))
     if committed:
-        assert state.record_task_output_finished(str(source), str(source), str(output), keep_output=True)
+        state.commit_output([], str(source), str(source), str(output), keep_output=True)
 
     restarted = WatchStateStore(str(state_path))
     scheduler = _watch_scheduler_shell(scheduler_module)
@@ -462,8 +441,8 @@ def test_missing_committed_output_requeues_surviving_source(tmp_path, monkeypatc
         persist=True,
         durable=True,
     )
-    assert state.record_task_output_started(str(source), str(source), str(output))
-    assert state.record_task_output_finished(
+    state.commit_output([], str(source), str(source), str(output))
+    state.commit_output([],
         str(source),
         str(source),
         str(output),
@@ -507,8 +486,8 @@ def test_missing_committed_output_without_source_keeps_recovery_owner(tmp_path, 
         persist=True,
         durable=True,
     )
-    assert state.record_task_output_started(str(source), str(source), str(output))
-    assert state.record_task_output_finished(
+    state.commit_output([], str(source), str(source), str(output))
+    state.commit_output([],
         str(source),
         str(source),
         str(output),

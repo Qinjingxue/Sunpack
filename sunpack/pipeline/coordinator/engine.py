@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from sunpack.core.contracts.discovery_scope import DiscoveryScope
+
 import copy
 import asyncio
 import os
@@ -264,10 +266,6 @@ class PipelineEngine:
         if not self.is_idle():
             return {"skipped": "engine_busy"}
 
-        # This registry belongs to the asyncio loop, not the broker worker.
-        completed_watch = len(self._path_leases._completed_watch_generations)
-        self._path_leases._completed_watch_generations.clear()
-
         def clear() -> dict:
             from sunpack.core.support.runtime_cache_cleanup import (
                 clear_all_runtime_caches,
@@ -276,7 +274,6 @@ class PipelineEngine:
 
             before = runtime_cache_stats()
             cleared = clear_all_runtime_caches()
-            cleared["completed_watch_generations"] = completed_watch
             if self._services is not None:
                 cleared["output_reservations"] = self._services.output_reservations.clear_idle_cache()
             after = runtime_cache_stats()
@@ -396,8 +393,6 @@ def _lease_ownership_version(
 
 
 class _PathLeaseRegistry:
-    _COMPLETED_WATCH_LIMIT = 4096
-
     def __init__(self, output_ownership=None):
         self.output_ownership = output_ownership
         if output_ownership is not None:
@@ -415,10 +410,6 @@ class _PathLeaseRegistry:
         self._generation_owners: dict[
             tuple[tuple[tuple[str, int, int, int, int], ...], bool],
             str,
-        ] = {}
-        self._completed_watch_generations: dict[
-            tuple[tuple[str, ...], bool, str],
-            tuple[tuple[tuple[str, int, int, int, int], ...], str, tuple[int, int]],
         ] = {}
         self._waiters_by_blocker: dict[str, set[asyncio.Future[None]]] = {}
         self._waiter_blockers: dict[
@@ -628,71 +619,19 @@ class _PathLeaseRegistry:
             return departed_version
         return ()
 
-    def completed_watch_output(
-        self,
-        ownership_version: tuple[tuple[str, int, int, int, int], ...],
-        *,
-        deep_detect: bool = False,
-        policy: str = "",
-    ) -> str:
-        """Return the prior output only for the exact unchanged physical generation."""
-        if not ownership_version:
+    def completed_watch_output(self, ownership_version, *, deep_detect=False, policy="") -> str:
+        if self.output_ownership is None:
             return ""
-        key = (tuple(row[0] for row in ownership_version), deep_detect, policy)
-        record = self._completed_watch_generations.get(key)
-        if record is None:
-            return ""
-        recorded_version, output_dir, output_identity = record
-        if recorded_version != ownership_version:
-            return ""
-        try:
-            metadata = os.stat(output_dir)
-            current_identity = (metadata.st_dev, metadata.st_ino)
-        except OSError:
-            current_identity = None
-        if current_identity != output_identity:
-            self._completed_watch_generations.pop(key, None)
-            return ""
-        # Refresh insertion order so the bounded map behaves as a tiny LRU.
-        self._completed_watch_generations.pop(key, None)
-        self._completed_watch_generations[key] = record
-        return output_dir
+        return self.output_ownership.completed_output(ownership_version, deep_detect=deep_detect, policy=policy)
 
-    def completed_watch_family_output(self, path: str, *, deep_detect: bool = False, policy: str = "") -> str:
-        """Check a late failure against the complete successful physical family."""
-        member_key = path_key(os.path.abspath(os.path.normpath(path)))
-        for (members, mode, saved_policy), (recorded_version, _, _) in self._completed_watch_generations.items():
-            if mode != deep_detect or saved_policy != policy or member_key not in members:
-                continue
-            # Missing members invalidate this lookup, even when the failed
-            # request's individual member has not changed. Do not reuse a
-            # departed generation here: it could conceal a real missing part.
-            current_version = self.input_version_for(members)
-            if current_version == recorded_version:
-                return self.completed_watch_output(current_version, deep_detect=deep_detect, policy=policy)
-        return ""
-
-    def remember_completed_watch(
-        self,
-        ownership_version: tuple[tuple[str, int, int, int, int], ...],
-        output_dir: str,
-        *,
-        deep_detect: bool = False,
-        policy: str = "",
-    ) -> None:
-        if not ownership_version or not output_dir:
-            return
-        try:
-            metadata = os.stat(output_dir)
-        except OSError:
-            return
-        key = (tuple(row[0] for row in ownership_version), deep_detect, policy)
-        record = (ownership_version, os.path.abspath(os.path.normpath(output_dir)), (metadata.st_dev, metadata.st_ino))
-        self._completed_watch_generations.pop(key, None)
-        self._completed_watch_generations[key] = record
-        while len(self._completed_watch_generations) > self._COMPLETED_WATCH_LIMIT:
-            oldest = next(iter(self._completed_watch_generations))
-            self._completed_watch_generations.pop(oldest, None)
+    def completed_watch_family_output(self, path: str, *, deep_detect=False, policy="") -> str:
+        if self.output_ownership is None:
+            return ""
+        record = self.output_ownership.completion_for(path)
+        if record is None or not record.get("generation"):
+            return ""
+        version = self.input_version_for(row[0] for row in record["generation"])
+        return self.completed_watch_output(version, deep_detect=deep_detect, policy=policy)
 
     def _blocking_owners(
         self,
@@ -1184,12 +1123,9 @@ class _RequestRuntime:
             except Exception:
                 lifecycle_event = str(event.get("event") or "") in {
                     "task_sources_claimed",
-                    "task_output_started",
-                    "task_output_finished",
                 }
                 if getattr(self.submission, "origin", "") == "watch" and lifecycle_event:
-                    # A durable start protects direct output writes. The finish
-                    # event clears that record after verification.
+                    # Source claims still arbitrate concurrent Watch admission.
                     raise
                 # Ordinary progress observers remain best-effort UI/reporting.
                 pass
@@ -1205,6 +1141,7 @@ class _RequestRuntime:
             current_paths, scope,
             format_hint=format_hint,
             catalog=task.runtime.get("discovery_catalog"),
+            snapshot=task.runtime.get("discovery_snapshot"),
         )
         if group is None:
             return None
@@ -1219,6 +1156,7 @@ class _RequestRuntime:
         if replacement is not None:
             replacement.runtime["discovery_scope"] = scope
             replacement.runtime["discovery_catalog"] = task.runtime.get("discovery_catalog")
+            replacement.runtime["discovery_snapshot"] = task.runtime.get("discovery_snapshot")
             replacement.runtime["volume_retry_attempted"] = True
             replacement.runtime["volume_retry_basis"] = [
                 "confirmed_structure",
@@ -1311,7 +1249,7 @@ class _RequestRuntime:
         scanner = self.task_scanner if depth == 1 else self.recursive_scanner
         if scan_session is None and depth == 1:
             from sunpack.pipeline.coordinator.scan_session import DiscoveryScanSession
-            scan_session = DiscoveryScanSession(config=scanner.config, recursive=self.submission.recursive,
+            scan_session = DiscoveryScanSession(config=scanner.config, scopes=DiscoveryScope.for_targets(roots, recursive=self.submission.recursive),
                                                 scope=self.submission.discovery_scope, catalog=self.submission.catalog)
         self.reporter.scan_started(depth)
         discovered = await broker.run(
@@ -1591,6 +1529,9 @@ class _RequestRuntime:
                     except OSError:
                         pass
                 if not os.path.exists(output_dir):
+                    if watch_version:
+                        await broker.run("output_consumed", task_key, self.services.output_ownership.consume_output,
+                            watch_version, request_id=self.submission.request_id)
                     ownership.forget_output(output_dir)
                     cleared = replace(result, output_dir="")
                     self._replace_target_result(result, cleared)
@@ -1618,10 +1559,10 @@ class _RequestRuntime:
                 ownership.relocate_outputs(flattened)
 
             if watch_version and outcome.outcome_kind == OutcomeKind.COMPLETE_SUCCESS and output_dir:
-                self.path_leases.remember_completed_watch(
+                await broker.run("output_complete", task_key, self.services.output_ownership.remember_completed,
                     watch_version, output_dir,
                     deep_detect=self.submission.detection_options.force_scan,
-                    policy=self.config.get("watch_policy", ""),
+                    policy=self.config.get("watch_policy", ""), request_id=self.submission.request_id,
                 )
 
             if output_dir:
@@ -1642,8 +1583,12 @@ class _RequestRuntime:
             ownership.remember_results([result])
             active_output = task.runtime.pop("watch_active_output", None)
             if active_output is not None:
+                await broker.run("output_seal", task.key or task.main_path, self.services.output_ownership.seal,
+                    active_output[1], succeeded=False,
+                    watch_owner=self.config.get("watch_owner_path", ""), task_path=active_output[0],
+                    request_id=self.submission.request_id)
                 self.extractor.emit_semantic_event(
-                    task, "task_output_finished", critical=True,
+                    task, "task_output_finished",
                     task_path=active_output[0], output_dir=active_output[1], keep_output=False,
                 )
             return True
@@ -1707,8 +1652,6 @@ class _RequestRuntime:
         if self.submission.origin != "watch" or depth != 1:
             return ()
         part_paths = tuple(task.archive_input().part_paths())
-        if len(part_paths) < 2:
-            return ()
         return self.path_leases.ownership_version_for(
             self.submission.request_id,
             part_paths,
@@ -1795,7 +1738,8 @@ class _RequestRuntime:
             from sunpack_native import watch_path_identity
             for source, target in zip(sources, destinations):
                 volume, identity, _ = watch_path_identity(source)
-                output_ownership.begin(target, self.submission.request_id, identities=[f"{volume}|{identity}"])
+                output_ownership.begin(target, self.submission.request_id, identities=[f"{volume}|{identity}"],
+                    persistent=self.submission.origin == "watch")
             with promotion_barrier(
                 sources, cache_releasers=(release_archive_sessions_under_roots,), quiesce=False,
             ):

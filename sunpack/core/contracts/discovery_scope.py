@@ -1,6 +1,6 @@
 """A discovery boundary, independent of archive recursion and output routing."""
 import os
-from sunpack_native import NativeDiscoveryScope
+from sunpack_native import NativeDiscoveryScope, classify_scan_targets
 from sunpack.core.support.path_keys import normalized_path
 
 
@@ -35,3 +35,14 @@ class DiscoveryScope:
     def from_record(cls, value):
         return cls(value["root"], recursive=value["max_depth"] is None,
                    max_depth=value["max_depth"], excluded_subtrees=value.get("excluded_subtrees", ()))
+
+    @classmethod
+    def for_targets(cls, paths, *, recursive=False):
+        """Entry points translate CLI depth once; discovery consumes scopes."""
+        paths = [os.path.abspath(path) for path in paths]
+        kinds, _ = classify_scan_targets(paths)
+        scopes = {}
+        for path, kind in zip(paths, kinds):
+            root = path if kind == 2 else os.path.dirname(path)
+            scopes.setdefault(normalized_path(root), cls(root, recursive=recursive))
+        return tuple(scopes.values())

@@ -22,7 +22,7 @@ from tests.helpers.real_archives import ArchiveFixtureFactory
 
 
 @pytest.mark.parametrize("archive_format", ["7z", "zip", "rar"])
-def test_cross_directory_parts_share_one_scope_and_execute_beside_entry(tmp_path, archive_format):
+def test_cross_directory_parts_share_one_scope_and_execute_beside_entry(tmp_path, archive_format, monkeypatch):
     case = ArchiveFixtureFactory().create(tmp_path / "fixture", "scope", archive_format,
         split=True, payload_size=256 * 1024, split_volume_size=100 * 1024,
         compression_level=0)
@@ -40,12 +40,14 @@ def test_cross_directory_parts_share_one_scope_and_execute_beside_entry(tmp_path
     config = make_config({"recursive_extract": "1", "post_extract": {"archive_cleanup_mode": "k"}})
     provider = ArchiveTaskProvider(config)
     assert not provider.scan_targets([str(root)])
-    session = DiscoveryScanSession(config=config, recursive=True)
+    session = DiscoveryScanSession(config=config, scope=DiscoveryScope(str(root), recursive=True))
     tasks = provider.scan_targets([str(root)], scan_session=session)
     assert len(tasks) == 1 and set(tasks[0].all_parts) == set(paths)
     task = tasks[0]
     # The same range must survive the missing-volume retry boundary.
-    group = provider.resolve_volume_once([task.main_path], task.runtime["discovery_scope"], format_hint=archive_format)
+    with monkeypatch.context() as patch:
+        patch.setattr(DirectoryScanner, "compile_scan_options", lambda *_: pytest.fail("retry re-enumerated its scope"))
+        group = provider.resolve_volume_once([task.main_path], task.runtime["discovery_scope"], format_hint=archive_format, snapshot=task.runtime["discovery_snapshot"])
     assert group is not None and set(group.input_paths) == set(paths)
 
     async def execute():
@@ -258,3 +260,61 @@ def test_deep_watch_catalog_and_internal_recovery_share_effective_policy(tmp_pat
         assert request["request_config"]["output"] == {"root": "", "common_root": "", "fixed_root": False}
     finally:
         watcher._close_blocking()
+
+
+def test_foreground_outputs_outside_watch_scopes_never_write_watch_wal(tmp_path, monkeypatch):
+    """Real recursion/flatten catches persistence accidentally added to any output phase.
+
+    Scope/extraction tests check content, not journal cost. This one tiny nested
+    input adds the missing assertion with both absent and unrelated Watch state.
+    """
+    import sunpack.runtime.watch.service as service
+    from tests.helpers.fs_builder import make_zip
+    source = tmp_path / "source.bin"
+    source.write_bytes(make_zip({"wrapper/inner.bin": make_zip({"leaf/payload.txt": "complete"})}))
+    watched = tmp_path / "unrelated"
+    watched.mkdir()
+    monkeypatch.setattr(service, "_read_watch_root_entries", lambda: [])
+    config = make_config({"recursive_extract": "3", "watch": {"state_dir": str(tmp_path / "state")},
+                          "post_extract": {"archive_cleanup_mode": "keep"}})
+
+    async def run():
+        async with PipelineEngine(config) as engine:
+            for enabled in (False, True):
+                owner = engine.output_ownership
+                if enabled:
+                    owner.retain_scopes([DiscoveryScope(str(watched), recursive=True)])
+                store = owner._state
+                before = store.applied_seq if store is not None else None
+                result = await engine.run([str(source)], request_config={**config,
+                    "output": {"root": str(tmp_path / str(enabled))}})
+                assert result.summary.success_count == 2
+                [payload] = list((tmp_path / str(enabled)).rglob("payload.txt"))
+                assert payload.read_text() == "complete"
+                assert owner._state is store
+                assert (store.applied_seq if store is not None else None) == before
+                assert not owner._memory._native.runtime_keys("owned|")
+                assert not owner._active_owners
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("archive_format", ["7z", "zip", "rar"])
+def test_complete_same_named_local_volume_sets_remain_independent(tmp_path, archive_format):
+    """Cross-directory single-family tests cannot catch global collision regressions.
+
+    Two copies of one small real fixture are the strongest name/header collision;
+    deleting this case leaves independent complete local sets uncovered.
+    """
+    case = ArchiveFixtureFactory().create(tmp_path / "fixture", "same", archive_format,
+        split=True, payload_size=256 * 1024, split_volume_size=100 * 1024, compression_level=0)
+    root = tmp_path / "input"
+    expected = []
+    for name in ("first", "second"):
+        directory = root / name
+        shutil.copytree(case.archive_dir, directory)
+        expected.append({str(path) for path in directory.iterdir() if path.is_file()})
+    config = make_config({})
+    tasks = ArchiveTaskProvider(config).scan_targets([str(root)],
+        scan_session=DiscoveryScanSession(config=config, scope=DiscoveryScope(str(root), recursive=True)))
+    assert len(tasks) == 2
+    assert {frozenset(task.all_parts) for task in tasks} == {frozenset(paths) for paths in expected}

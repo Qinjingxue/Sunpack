@@ -69,11 +69,7 @@ def test_installer_field_upgrade_preserves_values_modules_and_acl(tmp_path, repo
     expected = {
         "unknown": {"value": 7}, "keep": {**user["keep"], "added": 80},
         "absent": {"added": 90}, "new_null": None,
-        "filesystem": {"scan_filters": [
-            {"name": "unknown", "rules": []},
-            {"name": "keep", "enabled": False, "rules": ["user"], "added": 40},
-            {"name": "new", "enabled": False},
-        ]},
+        "filesystem": {"scan_filters": user["filesystem"]["scan_filters"]},
     }
     assert json.loads(paths["user"].read_text(encoding="utf-8")) == expected
     assert acl() == original_acl

@@ -4,7 +4,7 @@ from collections.abc import Iterable
 from typing import Any
 
 from sunpack.core.contracts.discovery_scope import DiscoveryScope
-from sunpack.core.support.path_keys import normalized_path, path_key, safe_relative_path
+from sunpack.core.support.path_keys import normalized_path, path_key
 from sunpack_native import NativeCandidateTable, NativeHeadFactCache
 
 from sunpack.core.contracts.discovery import DiscoveryCandidate
@@ -16,7 +16,7 @@ from sunpack.core.support.filesystem_scan_errors import DirectoryErrorReport
 
 
 class DiscoveryScanSession:
-    """Directory-scoped cache for filesystem discovery and Relations."""
+    """One scope and one native snapshot per discovery boundary."""
 
     def __init__(
         self,
@@ -24,22 +24,22 @@ class DiscoveryScanSession:
         config: dict | None = None,
         *,
         include_raw_snapshots: bool = True,
-        recursive: bool = False,
         catalog=None,
         scope: DiscoveryScope | None = None,
+        scopes=(),
     ):
         self.config = config or {}
-        self.recursive = recursive
         self.scope = scope
         self.catalog = catalog
-        self._scopes: dict[str, DiscoveryScope] = {}
+        self._scopes = {path_key(item.root): item for item in scopes}
+        if scope is not None:
+            self._scopes[path_key(scope.root)] = scope
         self.relations = relations or RelationsScheduler(self.config)
         self.include_raw_snapshots = include_raw_snapshots
         self._snapshots: dict[str, DirectorySnapshot] = {}
         self._relation_groups: dict[str, list[CandidateGroup]] = {}
         self._relation_group_signatures: dict[str, str] = {}
         self._head_facts = NativeHeadFactCache()
-        self._scan_roots: list[str] = []
         self._scan_errors: DirectoryErrorReport | None = None
 
     def add_scan_errors(self, errors: Iterable[tuple[str, str, str]]) -> None:
@@ -57,22 +57,15 @@ class DiscoveryScanSession:
         return bool(self._scan_errors)
 
     def set_scan_roots(self, roots: list[str]) -> None:
-        self._scan_roots = []
-        seen: set[str] = set()
+        if self.scope is not None:
+            return
         for root in roots:
-            raw_root = str(root or "")
-            if not raw_root:
-                continue
-            normalized = normalized_path(raw_root)
-            key = path_key(normalized)
-            if not normalized or key in seen:
-                continue
-            seen.add(key)
-            self._scan_roots.append(normalized)
+            if not any(scope.max_depth is None and scope.contains(root) for scope in self._scopes.values()):
+                self._scopes.setdefault(path_key(root), DiscoveryScope(root))
 
     def prime_snapshot(self, directory: str, snapshot: DirectorySnapshot) -> None:
         self.add_scan_errors(snapshot.native_snapshot.scan_errors())
-        self._snapshots[self._snapshot_key(directory, max_depth=None)] = snapshot
+        self._snapshots[path_key(directory)] = snapshot
         self._scopes[path_key(directory)] = DiscoveryScope(directory, recursive=True)
 
     def prime_output_inventory(self, inventory: Any) -> None:
@@ -81,16 +74,7 @@ class DiscoveryScanSession:
         self._head_facts.prime_inventory(inventory._native)
 
     def is_within_scan_scope(self, path: str) -> bool:
-        if self.scope is not None:
-            return self.scope.contains(path)
-        if not self._scan_roots:
-            return True
-        path = normalized_path(path)
-        key = path_key(path)
-        return any(
-            key == path_key(root) or safe_relative_path(path, root) is not None
-            for root in self._scan_roots
-        )
+        return not self._scopes or any(scope.contains(path) for scope in self._scopes.values())
 
     def scope_for(self, path: str) -> DiscoveryScope:
         if self.scope is not None:
@@ -98,19 +82,11 @@ class DiscoveryScanSession:
         matches = [scope for scope in self._scopes.values() if scope.contains(path)]
         if matches:
             return max(matches, key=lambda scope: len(scope.root))
-        return DiscoveryScope(path, recursive=self.recursive)
+        return self._scopes.setdefault(path_key(path), DiscoveryScope(path))
 
     def snapshot_for_directory(self, directory: str) -> DirectorySnapshot:
-        return self._snapshot_for_directory(directory, max_depth=None)
-
-    def shallow_snapshot_for_directory(self, directory: str, max_depth: int) -> DirectorySnapshot:
-        full_key = self._snapshot_key(directory, max_depth=None)
-        if full_key in self._snapshots:
-            return self._snapshots[full_key]
-        return self._snapshot_for_directory(directory, max_depth=max_depth)
-
-    def _snapshot_for_directory(self, directory: str, max_depth: int | None) -> DirectorySnapshot:
-        key = self._snapshot_key(directory, max_depth)
+        scope = self.scope_for(directory)
+        key = path_key(scope.root)
         if key not in self._snapshots and self.catalog is not None:
             state, options, seed = self.catalog
             filtered, raw = options.catalog_snapshot(state, self.scope.native, seed)
@@ -118,11 +94,10 @@ class DiscoveryScanSession:
             self._snapshots[key] = DirectorySnapshot.from_native(Path(self.scope.root), filtered, raw)
         if key not in self._snapshots:
             self._snapshots[key] = DirectoryScanner(
-                directory,
-                max_depth=max_depth,
+                scope.root,
                 config=self.config,
                 include_raw_snapshot=self.include_raw_snapshots,
-                scope=self.scope or self._scopes.setdefault(path_key(directory), DiscoveryScope(directory, recursive=self.recursive, max_depth=max_depth)),
+                scope=scope,
             ).scan()
             self.add_scan_errors(self._snapshots[key].native_snapshot.scan_errors())
         return self._snapshots[key]
@@ -223,9 +198,6 @@ class DiscoveryScanSession:
 
     def _directory_key(self, directory: str) -> str:
         return path_key(directory)
-
-    def _snapshot_key(self, directory: str, max_depth: int | None) -> str:
-        return f"{self._directory_key(directory)}::{max_depth}"
 
 
 def _password_signature(path_passwords: dict[str, str] | None) -> str:

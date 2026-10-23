@@ -1,5 +1,5 @@
+from sunpack.core.contracts.discovery_scope import DiscoveryScope
 import os
-from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
@@ -63,7 +63,6 @@ class NestedOutputScanPolicy:
         scan_session = DiscoveryScanSession(
             config=self.config,
             include_raw_snapshots=True,
-            recursive=True,
         )
         for output_dir in scan_dirs:
             if not output_dir:
@@ -149,6 +148,6 @@ class NestedOutputScanPolicy:
             return self._scan_options
 
     def _scan_output(self, root: str) -> DirectorySnapshot:
-        filtered, raw = self._compiled_scan_options().scan(root, None)
+        filtered, raw = self._compiled_scan_options().scan_scope(DiscoveryScope(root, recursive=True).native)
         return DirectorySnapshot.from_native(Path(root), filtered, raw)
 

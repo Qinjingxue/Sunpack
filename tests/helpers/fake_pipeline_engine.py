@@ -88,6 +88,11 @@ class FakePipelineEngine:
             ),
             *(str(path) for path in (getattr(context, "generated_outputs", ()) or ()) if str(path)),
         ]
+        if summary.success_count and generated_outputs:
+            state = self.output_ownership.state_for()
+            state.commit_runtime(state._native.completion_operations(
+                paths, generated_outputs[-1], config.get("watch_policy", ""), (),
+                bool(config.get("watch_deep_detect", False))), durable=True)
         response = PipelineResponse(
             request_id=uuid.uuid4().hex,
             summary=summary,

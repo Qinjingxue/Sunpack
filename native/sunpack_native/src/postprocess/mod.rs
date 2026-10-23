@@ -122,11 +122,12 @@ fn move_input_no_replace(source: &Path, destination: &Path) -> io::Result<()> {
 
 use crate::filesystem::{watch_file_observation_known_kind, WatchFileObservation};
 
-struct WatchCandidateRow {
-    path: String,
-    size: u64,
-    mtime: f64,
-    observation: WatchFileObservation,
+pub(crate) struct WatchCandidateRow {
+    pub(crate) path: String,
+    pub(crate) size: u64,
+    pub(crate) mtime: f64,
+    pub(crate) mtime_ns: u64,
+    pub(crate) observation: WatchFileObservation,
 }
 
 #[cfg(windows)]
@@ -250,7 +251,7 @@ pub(crate) fn delete_files_batch(py: Python<'_>, paths: Vec<String>) -> PyResult
     Ok(results.unbind())
 }
 
-fn watch_candidate_row(path: &Path, since_usn: Option<i64>) -> PyResult<Option<WatchCandidateRow>> {
+pub(crate) fn watch_candidate_row(path: &Path, since_usn: Option<i64>) -> PyResult<Option<WatchCandidateRow>> {
     let metadata = match fs::metadata(path) {
         Ok(metadata) => metadata,
         Err(_) => return Ok(None),
@@ -274,6 +275,8 @@ fn watch_candidate_from_metadata(
         path: normalize_path(path),
         size: metadata.len(),
         mtime: mtime_seconds(metadata),
+        mtime_ns: metadata.modified().ok().and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .map_or(0, |duration| duration.as_nanos() as u64),
         observation,
     }))
 }

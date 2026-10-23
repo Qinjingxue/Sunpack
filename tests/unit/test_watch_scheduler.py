@@ -234,6 +234,37 @@ class FakeObserver:
         return None
 
 
+def test_watch_guards_follow_the_nearest_existing_parent_and_filter_siblings(tmp_path, monkeypatch):
+    """Root recovery tests do not bound subscriptions or reject guard-only file events.
+
+    One synthetic event sequence covers these missing behaviours without timing
+    waits or a live filesystem observer.
+    """
+    parent = tmp_path / "parent"
+    monkeypatch.setattr("sunpack.runtime.cli.runtime_state.server_runtime_active", lambda: True)
+    root = parent / "root"
+    root.mkdir(parents=True)
+    watcher = _watcher(tmp_path, roots=[str(root)])
+    watcher._observer = FakeObserver()
+    watcher._watch_handler = scheduler_module._WatchEventHandler(watcher)
+    try:
+        watcher._refresh_directory_watches()
+        assert set(watcher._observed_watches) == {(str(root), False), (str(parent), False)}
+        watcher.enqueue = lambda *_args, **_kwargs: pytest.fail("guard sibling admitted")
+        watcher._watch_handler._handle_path(str(parent / "unrelated.zip"), event_type="created")
+        root.rmdir()
+        parent.rmdir()
+        watcher._watch_handler._handle_departure_path(str(parent), is_directory=True)
+        assert str(parent) in watcher._watch_rearm
+        watcher._refresh_directory_watches([str(parent)])
+        assert set(watcher._observed_watches) == {(str(tmp_path), False)}
+        root.mkdir(parents=True)
+        watcher._refresh_directory_watches()
+        assert set(watcher._observed_watches) == {(str(root), False), (str(parent), False)}
+    finally:
+        watcher._close_blocking()
+
+
 def test_watch_scheduler_prunes_missing_state_before_start(tmp_path, monkeypatch):
     monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
     watch_root = tmp_path / "watch"
@@ -1157,6 +1188,7 @@ def test_cancelled_harvest_and_close_wait_for_completion_callbacks(tmp_path):
         assert not request.source_paths
         assert not watcher._quiet_trackers
         assert not watcher._latest_observations
+        # An idle owner releases the shared native catalogs and WAL on stop.
         assert not journal_stats(watcher.state._writer_stream)["registered"]
 
     asyncio.run(scenario())
@@ -2593,6 +2625,10 @@ def test_watch_event_handler_keeps_dispatcher_alive_when_native_observation_is_t
 
     class Scheduler:
         config = make_config({})
+
+        @staticmethod
+        def _is_under_watched_root(path):
+            return True
 
         @staticmethod
         def is_builtin_password_file(path):

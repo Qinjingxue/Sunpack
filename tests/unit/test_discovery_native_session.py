@@ -1,3 +1,4 @@
+from sunpack.core.contracts.discovery_scope import DiscoveryScope
 import tarfile
 import lzma
 import os
@@ -40,7 +41,7 @@ def test_independent_file_requests_keep_full_context_and_observe_disguised_volum
     config = make_config()
 
     def discover(_index=0):
-        session = DiscoveryScanSession(config=config, recursive=True)
+        session = DiscoveryScanSession(config=config, scope=DiscoveryScope(str(tmp_path), recursive=True))
         candidates = build_candidates_for_targets([str(first)], session=session)
         # Inspect the context actually used for this request. Asking for a new
         # full snapshot here could hide a prematurely narrowed discovery scan.
@@ -69,7 +70,7 @@ def test_independent_file_requests_keep_full_context_and_observe_disguised_volum
     unrelated.write_bytes(b"x" * len(data))
     os.utime(unrelated, ns=(metadata.st_atime_ns, metadata.st_mtime_ns))
     renamed.unlink()
-    final_session = DiscoveryScanSession(config=config, recursive=True)
+    final_session = DiscoveryScanSession(config=config, scope=DiscoveryScope(str(tmp_path), recursive=True))
     final = build_candidates_for_targets([str(first)], session=final_session)[0]
     assert final.archive_input.part_paths() == [str(first)]
     anchors = next(iter(final_session._snapshots.values())).iter_relation_anchor_rows()

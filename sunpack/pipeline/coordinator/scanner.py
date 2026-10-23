@@ -1,3 +1,4 @@
+from sunpack.core.contracts.discovery_scope import DiscoveryScope
 from dataclasses import dataclass
 from typing import Any, Dict, List
 
@@ -59,7 +60,7 @@ class ScanOrchestrator:
         """
 
         from sunpack.pipeline.coordinator.scan_session import DiscoveryScanSession
-        discovered = self.task_scanner.scan_stage_result(target_paths, scan_session=DiscoveryScanSession(config=self.task_scanner.config, recursive=recursive))
+        discovered = self.task_scanner.scan_stage_result(target_paths, scan_session=DiscoveryScanSession(config=self.task_scanner.config, scopes=DiscoveryScope.for_targets(target_paths, recursive=recursive)))
         tasks = self.task_scanner.filter_processed_tasks(discovered.resolved_tasks)
         findings = [
             finding

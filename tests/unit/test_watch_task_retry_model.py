@@ -1,3 +1,4 @@
+from sunpack.pipeline.coordinator.output_ownership import OutputOwnership
 import asyncio
 import os
 from dataclasses import replace
@@ -116,9 +117,9 @@ def test_departed_claimed_blocker_is_retired_without_losing_recovery(tmp_path, m
             watcher.state.queue_active(candidate, durable_owner=True, persist=True, durable=True)
             active = str(output / "active")
             committed = str(output / "committed")
-            watcher.state.record_task_output_started(str(temporary), str(temporary), committed)
-            watcher.state.record_task_output_finished(str(temporary), str(temporary), committed, keep_output=True)
-            watcher.state.record_task_output_started(str(temporary), str(head), active)
+            watcher.state.commit_output([], str(temporary), str(temporary), committed)
+            watcher.state.commit_output([], str(temporary), str(temporary), committed, keep_output=True)
+            watcher.state.commit_output([], str(temporary), str(head), active)
             recovery = watcher.state.pending_work_for_path(str(temporary))
             watcher._claim_pipeline_sources("owner", [str(head), str(temporary)])
 
@@ -214,7 +215,7 @@ def test_late_failure_cannot_overwrite_unchanged_success_but_new_failure_can(
         completed_output = output / "archive"
         completed_output.mkdir()
         engine = object.__new__(PipelineEngine)
-        engine._path_leases = _PathLeaseRegistry()
+        engine._path_leases = _PathLeaseRegistry(OutputOwnership({"watch": {}}))
         watcher.pipeline_engine.completed_watch_family_output = engine.completed_watch_family_output
         failure = FailureInfo(FailureKind.MISSING_VOLUME, "relations", "missing volume")
         failed_response = _response(TargetRunResult(str(second), OutcomeKind.FAILURE, failure=failure))
@@ -230,7 +231,7 @@ def test_late_failure_cannot_overwrite_unchanged_success_but_new_failure_can(
         )
         paths = [str(first), str(second)]
         registry = engine._path_leases
-        registry.remember_completed_watch(registry.input_version_for(paths), str(completed_output))
+        registry.output_ownership.remember_completed(registry.input_version_for(paths), str(completed_output))
         success_response = PipelineResponse(
             "success", RunSummary(target_results=(
                 TargetRunResult(str(first), OutcomeKind.COMPLETE_SUCCESS, output_dir=str(completed_output)),
@@ -462,14 +463,9 @@ def test_volume_retry_finishes_output_using_its_original_record_path(tmp_path, m
     tail.write_text("part")
     watcher.state.queue_active(_candidate(tail), persist=True, durable=True)
     task = type("Task", (), {"main_path": str(tail)})()
-    watcher._handle_pipeline_progress(str(tail), "request", task, {
-        "event": "task_output_started", "output_dir": str(output),
-    })
+    watcher.state.commit_output([], str(tail), task.main_path, str(output))
     task.main_path = str(head)
-    watcher._handle_pipeline_progress(str(tail), "request", task, {
-        "event": "task_output_finished", "task_path": str(tail),
-        "output_dir": str(output), "keep_output": True,
-    })
+    watcher.state.commit_output([], str(tail), str(tail), str(output), keep_output=True)
     assert not watcher.state.pending_work_for_path(str(tail)).active_outputs
 
 
@@ -497,7 +493,7 @@ def test_family_completion_preserves_another_inflight_output_record(tmp_path, mo
     other.write_text("part")
     candidate = replace(_candidate(archive), mtime=1791458483.9542453)
     watcher.state.queue_active(candidate, persist=True, durable=True)
-    assert watcher.state.record_task_output_started(str(archive), str(archive), str(output))
+    watcher.state.commit_output([], str(archive), str(archive), str(output))
     watcher.state.mark(candidate.path, candidate.size + int(changed), candidate.mtime,
         status="suspended_missing_volume", error="missing sibling")
     if storage != "memory":

@@ -1,3 +1,4 @@
+from sunpack.core.contracts.discovery_scope import DiscoveryScope
 """Read-only typed discovery diagnostics for the CLI inspect command."""
 
 from dataclasses import dataclass, field
@@ -43,7 +44,7 @@ class DetectionDiagnostics:
         return [failure.display_message for failure in self.context.scan_failures]
 
     def collect(self, paths: list[str], *, recursive: bool = False) -> list[DiscoveryDiagnostic]:
-        session = DiscoveryScanSession(config=self.provider.config, recursive=recursive)
+        session = DiscoveryScanSession(config=self.provider.config, scopes=DiscoveryScope.for_targets(paths, recursive=recursive))
         result = self.provider.discover_targets(paths, scan_session=session)
         self.context.record_scan_errors(
             session.take_scan_errors(), self.provider.config.get("cli", {}).get("language", "en"),

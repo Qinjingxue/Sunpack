@@ -76,6 +76,8 @@ class ArchiveTaskProvider:
         for task in result.resolved_tasks:
             task.runtime["discovery_scope"] = session.scope_for(task.main_path)
             task.runtime["discovery_catalog"] = session.catalog
+            if session.catalog is None:
+                task.runtime["discovery_snapshot"] = session.snapshot_for_directory(session.scope_for(task.main_path).root)
         self._record_discovery_failures(result)
         return result
 
@@ -148,16 +150,17 @@ class ArchiveTaskProvider:
             if info not in self.failed_candidate_failures:
                 self.failed_candidate_failures.append(info)
 
-    def resolve_volume_once(self, current_paths: list[str], scope, *, format_hint: str = "", catalog=None):
-        from sunpack.pipeline.discovery.filesystem.directory_scanner import DirectoryScanner
+    def resolve_volume_once(self, current_paths: list[str], scope, *, format_hint: str = "", catalog=None, snapshot=None):
         from sunpack.core.contracts.filesystem import DirectorySnapshot
         from pathlib import Path
         if catalog is not None:
             state, options, _ = catalog
             filtered, raw = options.catalog_snapshot(state, scope.native, current_paths[0])
         else:
-            options = DirectoryScanner.compile_scan_options(self.config)
-            filtered, raw = options.scan_scope(scope.native, current_paths[0])
+            if snapshot is None:
+                raise ValueError("Volume retry requires the original discovery snapshot")
+            filtered = snapshot.native_snapshot.relation_bucket(current_paths[0])
+            raw = snapshot.raw_native_snapshot.relation_bucket(current_paths[0])
         snapshot = DirectorySnapshot.from_native(Path(scope.root), filtered, raw)
         groups = self._relations.build_candidate_groups(snapshot)
         required = set(current_paths)

@@ -277,6 +277,13 @@ impl NativeWatchOperations {
 #[pymethods]
 impl NativeWatchOperations {
     fn __len__(&self) -> usize { self.operations.len() }
+
+    fn extend(&self, other: PyRef<'_, NativeWatchOperations>) -> PyResult<Self> {
+        let mut values: Vec<Value> = serde_json::from_slice(&self.payload).map_err(|e| invalid(e.to_string()))?;
+        let tail: Vec<Value> = serde_json::from_slice(&other.payload).map_err(|e| invalid(e.to_string()))?;
+        values.extend(tail);
+        Self::from_values(values)
+    }
 }
 
 /// Frozen checkpoint view; writing it never touches the live maps.
@@ -406,6 +413,114 @@ impl NativeWatchState {
 
 #[pymethods]
 impl NativeWatchState {
+    /// Recovery references and output ownership are published in the same WAL record.
+    #[pyo3(signature = (operations, owner_path, task_path, output_dir, keep_output=None))]
+    fn output_transition(&self, operations: &Bound<'_, PyAny>, owner_path: &str,
+        task_path: &str, output_dir: &str, keep_output: Option<bool>) -> PyResult<NativeWatchOperations> {
+        let decoded = self.decode_operations(operations)?;
+        let mut values: Vec<Value> = serde_json::from_slice(&decoded.payload).map_err(|e| invalid(e.to_string()))?;
+        let data = self.lock();
+        let key = path_key(owner_path);
+        let pending = data.pending.get(&key).ok_or_else(|| invalid("Watch output owner is no longer queued"))?;
+        let mut pending = (**pending).clone();
+        if let Some(keep) = keep_output {
+            if pending.active_outputs.remove(task_path).is_none() {
+                return Err(invalid("Watch output was never started"));
+            }
+            if keep {
+                let output_key = path_key(output_dir);
+                if !pending.committed_roots.iter().any(|root| {
+                    let root = path_key(root); output_key == root || is_path_under(&output_key, &root)
+                }) {
+                    pending.committed_roots.retain(|root| !is_path_under(&path_key(root), &output_key));
+                    pending.committed_roots.push(output_dir.to_owned());
+                }
+                if path_key(task_path) != path_key(&pending.path)
+                    && !pending.completed_sources.iter().any(|path| path_key(path) == path_key(task_path)) {
+                    pending.completed_sources.push(task_path.to_owned());
+                }
+            }
+        } else {
+            pending.active_outputs.insert(task_path.to_owned(), output_dir.to_owned());
+        }
+        values.push(serde_json::json!({"op":"put","collection":"pending_work","key":key,"value":pending}));
+        NativeWatchOperations::from_values(values)
+    }
+
+    fn completion_operations(&self, py: Python<'_>, sources: Vec<String>, output: String,
+        policy: String, generation: &Bound<'_, PyAny>, deep_detect: bool) -> PyResult<NativeWatchOperations> {
+        let generation = py_to_json(generation)?;
+        let leader = generation.get(0).and_then(|row| row.get(0)).and_then(Value::as_str)
+            .map(str::to_owned).or_else(|| sources.first().map(|path| path_key(path))).unwrap_or_default();
+        py.detach(|| {
+            let (volume, identity, _) = crate::filesystem::watch_path_identity(&output)?;
+            let expected: HashMap<_, _> = generation.as_array().into_iter().flatten()
+                .filter_map(|row| Some((row[0].as_str()?, row))).collect();
+            let mut observations = Vec::with_capacity(sources.len());
+            for source in sources {
+                let row = crate::postprocess::watch_candidate_row(Path::new(&source), None)?;
+                let source_key = path_key(&source);
+                if let (Some(row), Some(expected)) = (row.as_ref(), expected.get(source_key.as_str())) {
+                    if expected[2].as_u64().map(u128::from) != u128::from_str_radix(&row.observation.file_id, 16).ok()
+                        || expected[3].as_u64() != Some(row.size) || expected[4].as_u64() != Some(row.mtime_ns) {
+                        return NativeWatchOperations::from_values(Vec::new());
+                    }
+                }
+                observations.push((source, row));
+            }
+            let mut values = Vec::new();
+            for (source, row) in observations {
+                let key = format!("done|{}", path_key(&source));
+                let previous = self.lock().runtime.get(&key).cloned();
+                let mut value = if let Some(row) = row {
+                    serde_json::json!({"path":row.path,"size":row.size,"mtime":row.mtime,
+                        "file_id":row.observation.file_id,"change_usn":row.observation.change_usn})
+                } else if let Some(previous) = previous.as_ref() {
+                    // Cleanup may already have consumed a source. Only update
+                    // the output of the generation this request actually owns.
+                    let old = serde_json::to_value(previous.as_ref()).map_err(|e| invalid(e.to_string()))?;
+                    if old["generation"] != generation && old["family"].as_str() != Some(&leader) { continue; }
+                    old
+                } else { continue; };
+                value["outputs"] = serde_json::json!([output]);
+                value["output_identities"] = serde_json::json!([[output,volume,identity]]);
+                value["policy"] = serde_json::json!(policy);
+                value["deep_detect"] = serde_json::json!(deep_detect);
+                // Store a family generation once, rather than N copies of N members.
+                if path_key(&source) == leader {
+                    value["generation"] = generation.clone();
+                    value.as_object_mut().unwrap().remove("family");
+                } else {
+                    value["family"] = serde_json::json!(leader);
+                    value.as_object_mut().unwrap().remove("generation");
+                }
+                if previous.as_ref().is_some_and(|old| serde_json::to_value(old.as_ref()).ok().as_ref() == Some(&value)) { continue; }
+                values.push(serde_json::json!({"op":"runtime", "key":key,"value":value}));
+            }
+            NativeWatchOperations::from_values(values)
+        })
+    }
+
+    fn consume_output(&self, generation: &Bound<'_, PyAny>) -> PyResult<NativeWatchOperations> {
+        let generation = py_to_json(generation)?;
+        let Some(rows) = generation.as_array().filter(|rows| !rows.is_empty()) else {
+            return NativeWatchOperations::from_values(Vec::new());
+        };
+        let leader = rows[0][0].as_str().unwrap_or_default();
+        let data = self.lock();
+        let mut values = Vec::new();
+        for row in rows {
+            let key = format!("done|{}", path_key(row[0].as_str().unwrap_or_default()));
+            let Some(previous) = data.runtime.get(&key) else { continue; };
+            let mut value = serde_json::to_value(previous.as_ref()).map_err(|e| invalid(e.to_string()))?;
+            if value["generation"] != generation && value["family"].as_str() != Some(leader) { continue; }
+            value["outputs"] = serde_json::json!([]);
+            value["output_identities"] = serde_json::json!([]);
+            values.push(serde_json::json!({"op":"runtime","key":key,"value":value}));
+        }
+        NativeWatchOperations::from_values(values)
+    }
+
     #[new]
     fn new() -> Self {
         Self {

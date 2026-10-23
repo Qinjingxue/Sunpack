@@ -132,7 +132,8 @@ def test_password_cache_revalidates_real_encrypted_replacement(tmp_path):
 def test_dotdot_prefix_is_inside_nested_scan_scope(tmp_path, name, monkeypatch):
     path = tmp_path / name
     task = direct_file_task(str(path))
-    session = DiscoveryScanSession()
+    from sunpack.core.contracts.discovery_scope import DiscoveryScope
+    session = DiscoveryScanSession(scope=DiscoveryScope(str(tmp_path), recursive=True))
     session.set_scan_roots([str(tmp_path)])
     assert safe_relative_path(path, tmp_path) == os.path.normpath(name)
     assert session.is_within_scan_scope(str(path))

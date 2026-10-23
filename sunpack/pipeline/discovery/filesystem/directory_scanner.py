@@ -20,13 +20,12 @@ from sunpack.pipeline.discovery.filesystem.filters.modules.directory_prune impor
 
 
 class DirectoryScanner:
-    def __init__(self, root_path: str, max_depth: int | None = None, filters: list[ScanFilter] | None = None, config: dict | None = None, include_raw_snapshot: bool = False, scope: DiscoveryScope | None = None):
+    def __init__(self, root_path: str, filters: list[ScanFilter] | None = None, config: dict | None = None, include_raw_snapshot: bool = False, scope: DiscoveryScope | None = None):
         self.root_path = Path(root_path)
         self.config = config or {}
         self.include_raw_snapshot = include_raw_snapshot
         self._custom_filters = filters is not None
-        self.scope = scope or DiscoveryScope(str(self.root_path), max_depth=max_depth)
-        self.max_depth = self.scope.max_depth
+        self.scope = scope or DiscoveryScope(str(self.root_path))
         self.filters = list(filters) if filters is not None else build_filters(config)
 
     def scan(self) -> DirectorySnapshot:
