@@ -3470,6 +3470,11 @@ fn update_catalog(
         let target = changed.unwrap_or(&scope.root);
         let mut effective = scope.clone();
         let metadata = fs::metadata(target);
+        // A configured root going offline is not a deletion of its cached rows.
+        if metadata.is_err() && !Path::new(&scope.root).is_dir() {
+            return Ok((vec![(scope.root.clone(), "metadata".into(),
+                "watch root unavailable".into())], Vec::new()));
+        }
         if !metadata.as_ref().is_ok_and(|m| m.is_file()) {
             effective.exclude_roots(state.output_roots().into_iter());
         }
@@ -3568,6 +3573,10 @@ fn update_catalog(
                 })
                 .map(|(key, _)| Arc::clone(key))
                 .collect();
+            if !removed.is_empty() && !Path::new(&scope.root).is_dir() {
+                return Ok((vec![(scope.root.clone(), "metadata".into(),
+                    "watch root unavailable".into())], Vec::new()));
+            }
             for key in removed {
                 catalog.remove(&key);
                 removed_keys.push(key.to_string());

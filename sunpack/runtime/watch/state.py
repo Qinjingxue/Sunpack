@@ -169,6 +169,7 @@ class WatchStateStore:
         compact_bytes: int = DEFAULT_JOURNAL_COMPACT_BYTES,
         hard_compact_bytes: int = DEFAULT_JOURNAL_HARD_BYTES,
         retirement_callback: Callable[[], None] | None = None,
+        scopes=(),
     ):
         self.path = Path(path)
         self._path_coordinator = _state_path_coordinator(self.path)
@@ -183,6 +184,7 @@ class WatchStateStore:
         self._closed = False
         self._journal_waiters = 0
         self._native = NativeWatchState()
+        self.scopes = tuple(scopes)
 
         self._checkpoint_seq = 0
         self._applied_seq = 0
@@ -1139,6 +1141,9 @@ class WatchStateStore:
         Missing-only retirement preserves pending output recovery even when
         the event names an ancestor directory rather than its owner file.
         """
+        from sunpack.runtime.watch.roots import watch_path_available
+        if missing_only and not watch_path_available(path, self.scopes):
+            return False
         with self._state_lock:
             pending_keys, entry_keys = self._native.keys_matching(
                 os.path.abspath(path), recursive, missing_only=missing_only,
@@ -1157,7 +1162,8 @@ class WatchStateStore:
     def retain_scopes(self, scopes) -> None:
         """Retire unused blockers/cursors on configuration changes, keeping recovery."""
         with self._state_lock:
-            entry_keys, cursor_keys = self._native.unused_scope_keys([scope.native for scope in scopes])
+            self.scopes = tuple(scopes)
+            entry_keys, cursor_keys = self._native.unused_scope_keys([scope.native for scope in self.scopes])
             operations = [self._delete_operation("entries", key) for key in entry_keys]
             if cursor_keys:
                 cursors = dict(self._native.watch_cursors())
@@ -1263,13 +1269,20 @@ class WatchStateStore:
                 for key in sorted(keys)
             ])
 
+    def file_presence(self, path):
+        from sunpack.runtime.watch.roots import watch_path_available
+        presence = _recorded_file_presence(path)
+        if presence is False and not watch_path_available(path, self.scopes):
+            return None
+        return presence
+
     def prune_missing_records(self, path: str | None = None, *, recursive: bool = False) -> int:
         """Remove proven missing blockers in one scope, preserving recovery."""
         with self._state_lock:
             entry_keys = [
                 key
                 for key, recorded_path in self._native.entry_paths(path, recursive)
-                if _recorded_file_presence(recorded_path) is False
+                if self.file_presence(recorded_path) is False
             ]
             self._commit_operations_locked([
                 self._delete_operation("entries", key)
@@ -1342,7 +1355,7 @@ class WatchStateStore:
             blockers = {str(value) for value in payload.get("blockers") or []}
             if (
                 (status not in {"failed_password", "suspended_missing_volume"} and not blockers)
-                or _recorded_file_presence(path) is False
+                or self.file_presence(path) is False
             ):
                 if previous is not None:
                     self._commit_operations_locked([

@@ -44,7 +44,7 @@ from sunpack.runtime.watch.scanner import (
 from sunpack.runtime.watch.scanner import _candidate_for as _watch_candidate_for_path
 from sunpack.runtime.watch.state import WatchStateEntry, WatchStateStore, _recorded_file_presence
 from sunpack.pipeline.postprocess.output_cleanup import DEFAULT_OUTPUT_CLEANUP_MANAGER, OutputCleanupEvent
-from sunpack.runtime.watch.roots import WatchRootEntry
+from sunpack.runtime.watch.roots import WatchRootEntry, watch_path_available
 from sunpack.core.contracts.discovery_scope import DiscoveryScope
 from sunpack.pipeline.discovery.filesystem.directory_scanner import DirectoryScanner
 from sunpack.runtime.watch.toast import NullWatchNotificationSink
@@ -153,7 +153,8 @@ class WatchScheduler:
         self.i18n = I18nContext(config["cli"]["language"])
         watch_config = config["watch"]
         self.watch_roots = [os.path.abspath(path) for path in watch_roots]
-        validate_ntfs_watch_roots([_nearest_existing_directory(root) for root in self.watch_roots])
+        validate_ntfs_watch_roots([directory for root in self.watch_roots
+                                  if (directory := _nearest_existing_directory(root)) is not None])
         expanded_out_dir = os.path.expanduser(out_dir)
         self.out_dir = os.path.normpath(expanded_out_dir) if not os.path.isabs(expanded_out_dir) else os.path.abspath(expanded_out_dir)
         # Every watch root has exactly one absolute output root, resolved here so no request path
@@ -203,7 +204,8 @@ class WatchScheduler:
                 else observer_stop_timeout_seconds
             ),
         )
-        self.state = WatchStateStore(state_path, retirement_callback=self._schedule_journal_retirement)
+        self.state = WatchStateStore(state_path, retirement_callback=self._schedule_journal_retirement,
+                                     scopes=self.scopes.values())
         self._catalog = NativeWatchCatalog(self.state._native, str(Path(state_path).parent))
         self._catalog.retain_roots(list(self.watch_roots))
         from sunpack.runtime.watch.output_roots import WatchOutputRoots
@@ -442,7 +444,7 @@ class WatchScheduler:
         self.log.write("initial_scan_completed", roots=completed)
         return completed
 
-    def _watch_root_directory(self, root: str) -> str:
+    def _watch_root_directory(self, root: str) -> str | None:
         return _nearest_existing_directory(root)
 
     def _scan_options_for(self, scope):
@@ -469,8 +471,10 @@ class WatchScheduler:
         """Durably establish first-run cursors before the observer can miss a gap."""
         missing: dict[str, dict[str, int]] = {}
         for root in self.watch_roots:
-            directory = self._watch_root_directory(root)
             try:
+                directory = self._watch_root_directory(root)
+                if directory is None:
+                    continue
                 volume, journal_id, next_usn = watch_volume_cursor(directory)
             except Exception as exc:
                 self.log.write("usn_cursor_unavailable", root=root, error=str(exc))
@@ -489,6 +493,8 @@ class WatchScheduler:
         volumes = {}
         failed_volumes = set()
         for root in self.watch_roots:
+            if not os.path.isdir(root):
+                continue
             scope = self.scopes[path_key(root)]
             cached = self._catalog.cursor(scope.native)
             plan = {"root": root, "scope": scope, "cached": cached, "cursor": None, "error": None}
@@ -601,6 +607,8 @@ class WatchScheduler:
         """Recover only durable in-flight work; never scan unrelated Watch roots."""
 
         for pending in self.state.pending_work_items():
+            if not watch_path_available(pending.source_input_root or pending.path, self.scopes.values()):
+                continue
             active_outputs = dict(getattr(pending, "active_outputs", {}) or {})
             committed_roots = list(getattr(pending, "committed_roots", []) or [])
             completed_sources = {
@@ -620,7 +628,7 @@ class WatchScheduler:
                         _recovery_scope_dir=scope_dir,
                         _state_prequeued=True,
                     )
-                else:
+                elif self.state.file_presence(pending.path) is False:
                     self.state.forget_path(pending.path)
                 continue
 
@@ -1569,6 +1577,8 @@ class WatchScheduler:
         normalized = os.path.abspath(path)
         if recursive:
             self._queue_watch_rearm(normalized)
+        if not watch_path_available(normalized, self.scopes.values()):
+            return
         self._outputs.reconcile(normalized, recursive=recursive)
         matched = _longest_matching_root(normalized,self.watch_roots)
         if matched is not None:
@@ -2535,12 +2545,12 @@ def _candidate_from_state_entry(entry: WatchStateEntry | None) -> WatchCandidate
     )
 
 
-def _nearest_existing_directory(path: str) -> str:
+def _nearest_existing_directory(path: str) -> str | None:
     current = os.path.abspath(path)
     while not os.path.isdir(current):
         parent = os.path.dirname(current)
         if parent == current:
-            raise FileNotFoundError(current)
+            return None
         current = parent
     return current
 

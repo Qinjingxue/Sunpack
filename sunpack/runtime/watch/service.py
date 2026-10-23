@@ -729,6 +729,8 @@ class WatchService:
         state = WatchStateStore(os.path.join(self.state_dir, SERVICE_STATE))
         try:
             state.retain_scopes(())
+            from sunpack.runtime.watch.output_roots import WatchOutputRoots
+            WatchOutputRoots(state, ()).close()
             catalog = NativeWatchCatalog(state._native, self.state_dir)
             catalog.retain_roots([])
             catalog.close()

@@ -756,6 +756,7 @@ def test_removing_last_root_retires_state_without_a_successor_scheduler(tmp_path
     from sunpack.core.contracts.discovery_scope import DiscoveryScope
     from sunpack.pipeline.discovery.filesystem.directory_scanner import DirectoryScanner
     from sunpack.runtime.watch.state import WatchStateStore
+    from sunpack.runtime.watch.output_roots import WatchOutputRoots
     from sunpack_native import NativeWatchCatalog
 
     root, folder = tmp_path / "input", tmp_path / "state"
@@ -767,6 +768,10 @@ def test_removing_last_root_retires_state_without_a_successor_scheduler(tmp_path
     state = WatchStateStore(str(state_path))
     catalog = NativeWatchCatalog(state._native, str(folder))
     scope = DiscoveryScope(str(root), recursive=True)
+    outputs = WatchOutputRoots(state, (scope,))
+    output = root / "result"
+    outputs.register(str(output))
+    outputs.close()
     options = DirectoryScanner.compile_scan_options({"filesystem": {"scan_filters_enabled": False}})
     assert not options.catalog_update(catalog, scope.native)
     catalog.close()
@@ -785,6 +790,8 @@ def test_removing_last_root_retires_state_without_a_successor_scheduler(tmp_path
     state = WatchStateStore(str(state_path))
     try:
         assert state.entry_count == 0
+        assert not state._native.runtime_keys("owned|")
+        assert output.is_dir()
         assert not state.watch_cursor_snapshot()
         assert not state_path.exists()
         assert snapshot.stat().st_size < original_bytes // 4

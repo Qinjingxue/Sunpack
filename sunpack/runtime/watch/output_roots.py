@@ -14,13 +14,16 @@ class WatchOutputRoots:
         self.scopes = scopes
         self._lock = threading.RLock()
         self._closed = False
+        changes = []
         for key in state._native.runtime_keys("owned|"):
             record = state._native.runtime_record(key)
             if not self._relevant(record["path"]) or not self._matches(record):
-                state.commit_runtime([{"op": "runtime", "key": key}], durable=True)
+                changes.append({"op": "runtime", "key": key})
+        state.commit_runtime(changes, durable=True)
 
     def _relevant(self, path):
-        return any(scope.native.intersects_output(path) for scope in self.scopes)
+        return (any(scope.native.intersects_output(path) for scope in self.scopes)
+                or self.state._native.output_root_in_use(path))
 
     @staticmethod
     def _identity(path):
@@ -31,7 +34,9 @@ class WatchOutputRoots:
         try:
             identity = self._identity(record["path"])
         except FileNotFoundError:
-            return False
+            from sunpack.runtime.watch.roots import watch_path_available
+            return (not watch_path_available(record["path"], self.scopes)
+                    or self.state._native.output_root_in_use(record["path"]))
         except OSError:
             return True
         return identity in record.get("identities", ())

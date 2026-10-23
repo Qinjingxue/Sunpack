@@ -286,6 +286,20 @@ impl NativeWatchState {
             .collect()
     }
 
+    fn output_root_in_use(&self, path: &str) -> bool {
+        let root = path_key(path);
+        let intersects = |path: &str| {
+            let key = path_key(path);
+            key == root || is_path_under(&key, &root) || is_path_under(&root, &key)
+        };
+        self.lock().pending.values().any(|record| {
+            let source = path_key(&record.path);
+            source == root || is_path_under(&source, &root)
+                || record.active_outputs.values().any(|path| intersects(path))
+                || record.committed_roots.iter().any(|path| intersects(path))
+        })
+    }
+
     fn owned_root(&self, path: &str) -> Option<String> {
         let key = crate::path_keys::path_key(path);
         let mut current = key.trim_end_matches('\\');

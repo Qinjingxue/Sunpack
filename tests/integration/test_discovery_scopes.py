@@ -274,6 +274,39 @@ def test_reserved_output_rejects_external_directory_before_registration(tmp_path
         state.close()
 
 
+def test_output_retirement_keeps_only_unfinished_recovery_dependencies(tmp_path):
+    """Normal scope retirement has no pending output owner and misses premature retirement.
+
+    Without this, last-root cleanup could lose crash recovery protection. One WAL
+    reopen verifies dependency retention and subsequent retirement without deletion.
+    """
+    from sunpack.runtime.watch.scanner import WatchCandidate
+    root = tmp_path / "input"
+    root.mkdir()
+    source = root / "source.blob"
+    source.write_bytes(b"source")
+    output = root / "result"
+    state_path = str(tmp_path / "state.json")
+    state = WatchStateStore(state_path)
+    outputs = WatchOutputRoots(state, (DiscoveryScope(str(root), recursive=True),))
+    outputs.register(str(output))
+    state.queue_active(WatchCandidate(str(source), 6, 1.0), durable=True)
+    state.record_task_output_started(str(source), str(source), str(output))
+    outputs.close()
+    state.close()
+    state = WatchStateStore(state_path)
+    try:
+        WatchOutputRoots(state, ()).close()
+        assert state._native.runtime_keys("owned|")
+        assert output.is_dir()
+        state.forget_path(str(source))
+        WatchOutputRoots(state, ()).close()
+        assert not state._native.runtime_keys("owned|")
+        assert output.is_dir()
+    finally:
+        state.close()
+
+
 def test_catalog_checkpoint_wal_replay_and_damage_are_independent_of_task_wal(tmp_path):
     """One subprocess exit covers an uncheckpointed cache update and task independence."""
     import subprocess

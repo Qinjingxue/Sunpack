@@ -310,6 +310,81 @@ def test_watch_scheduler_prunes_missing_state_before_start(tmp_path, monkeypatch
         watcher._close_blocking()
 
 
+@pytest.mark.parametrize("volume_offline", [False, True])
+def test_unavailable_root_preserves_state_across_restart_and_event_recovery(tmp_path, monkeypatch, volume_offline):
+    """Existing deletion tests keep the root accessible and miss destructive outage cleanup.
+
+    Removing this leaves startup, live departure and restored admission untested as
+    one lifecycle. Two tiny files cover both missing-root and missing-volume startup.
+    """
+    from sunpack.core.contracts.discovery_scope import DiscoveryScope
+    from sunpack.runtime.watch.roots import WatchRootEntry
+
+    monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
+    monkeypatch.setattr(scheduler_module, "validate_ntfs_watch_roots", lambda roots: None)
+    monkeypatch.setattr(scheduler_module, "watch_volume_cursor", lambda path: ("volume", 1, 100))
+    root, hidden = tmp_path / "input", tmp_path / "offline"
+    root.mkdir()
+    sources = [root / name for name in ("password.blob", "missing.001", "queued.blob")]
+    for source in sources:
+        source.write_bytes(b"source")
+    state_path = str(tmp_path / "state" / "state.json")
+    scope = DiscoveryScope(str(root), recursive=True)
+
+    def create():
+        return _watcher(tmp_path, roots=[str(root)], state_path=state_path,
+                        root_entries=[WatchRootEntry(str(root), recursive=True)])
+
+    first = create()
+    output = root / "result"
+    first._outputs.register(str(output))
+    (output / "nested.blob").write_bytes(b"output")
+    for source, status in zip(sources, ("failed_password", "suspended_missing_volume")):
+        first.state.mark(str(source), 6, 1.0, status=status)
+    first.state.queue_active(WatchCandidate(str(sources[2]), 6, 1.0),
+                             source_input_root=str(root), discovery_scope=scope.to_record(), durable=True)
+    assert not first._scan_options.catalog_update(first._catalog, scope.native)
+    first._catalog.set_cursor(scope.native, "volume", 1, 20)
+    first._close_blocking()
+    root.rename(hidden)
+    if volume_offline:
+        nearest = scheduler_module._nearest_existing_directory
+        monkeypatch.setattr(scheduler_module, "_nearest_existing_directory",
+                            lambda path: None if not root.exists() else nearest(path))
+    watcher = create()
+    try:
+        watcher._start_blocking()
+        watcher.notify_path_departed(str(root), recursive=True)
+        assert watcher.state.entry_count == 2
+        assert watcher.state.pending_work_for_path(str(sources[2])) is not None
+        assert len(watcher.state._native.runtime_keys("owned|")) == 1
+        errors, _ = watcher._scan_options.catalog_refresh(watcher._catalog, scope.native)
+        assert errors
+        _, raw = watcher._scan_options.catalog_snapshot(watcher._catalog, scope.native, str(sources[1]))
+        assert str(sources[1]) in raw.file_columns()[0]
+        watcher.state.prune_missing_records()
+        assert not watcher.state.forget_path(str(root), recursive=True, missing_only=True)
+        assert watcher.state.entry_count == 2
+
+        hidden.rename(root)
+        assert watcher._catalog.cursor(scope.native) == ("volume", 1, 20)
+        watcher.notify_directory_arrived(str(root))
+        watcher._refresh_directory_watches([str(root)])
+        watcher._scan_initial_roots([str(root)])
+        assert (str(root), True) in watcher._observed_watches
+        assert watcher._outputs.protected(str(output / "nested.blob"))
+        assert str(output / "nested.blob") not in watcher._pending
+        assert str(sources[2]) in watcher._pending
+        assert watcher.state.entry_count == 2
+        sources[0].unlink()
+        watcher.notify_path_departed(str(sources[0]))
+        assert watcher.state.latest_entry_for_path(str(sources[0])) is None
+        assert watcher.state.latest_entry_for_path(str(sources[1])) is not None
+    finally:
+        watcher._stop_blocking()
+        watcher._close_blocking()
+
+
 class WatchClock:
     def __init__(self, value: float):
         self.value = value
