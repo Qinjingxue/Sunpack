@@ -198,7 +198,7 @@ def _run_batch(
 
         return on_line
 
-    def on_timeout(job_id: str) -> Any:
+    def on_error(job_id: str) -> Any:
         def record(message: str) -> None:
             with done:
                 failures[job_id] = message
@@ -244,7 +244,7 @@ def _run_batch(
                         else str(corpus.get("format_hint") or "zip")
                     ),
                 )
-                worker.submit_async(payload, job_id, on_line=make_callback(job_id), on_timeout=on_timeout(job_id))
+                worker.submit_async(payload, job_id, on_line=make_callback(job_id), on_error=on_error(job_id))
         submission_finished_at = time.perf_counter()
         deadline = submission_finished_at + timeout_seconds
         with done:

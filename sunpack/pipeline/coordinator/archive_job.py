@@ -15,6 +15,7 @@ from sunpack.core.contracts.extraction import ExtractionResult
 from sunpack.core.contracts.failures import FailureInfo, FailureKind
 from sunpack.pipeline.extraction.knowledge import write_extraction_result
 from sunpack.pipeline.extraction.scheduler import ExtractionScheduler
+from sunpack.pipeline.extraction.output_inventory import OutputInventory
 from sunpack.pipeline.postprocess.output_cleanup import OutputCleanupEvent, cleanup_output_for_retry
 from sunpack.core.contracts.verification import DECISION_ACCEPT, DECISION_ACCEPT_PARTIAL, DECISION_RETRY_EXTRACT
 
@@ -130,7 +131,15 @@ class ArchiveJobExecutor:
             missing_volume_retry=missing_volume_retry,
             ensure_input_lease=ensure_input_lease,
         )
-        result = self.collect_result(task, outcome)
+        result = await broker.run(
+            "collect_result_cleanup",
+            task.key or task.main_path,
+            self.collect_result,
+            task,
+            outcome,
+            request_id=self.request_id,
+            cancellation=cancellation,
+        )
         if self.origin == "watch":
             output_task_path, output_dir = task.runtime.pop("watch_active_output", (task.main_path, outcome.planned_out_dir))
             self.extractor.emit_semantic_event(
@@ -371,11 +380,13 @@ class ArchiveJobExecutor:
             outcome.content_requirement = content_policy.requirement
         res = outcome.result
         out_dir = res.out_dir
+        inventory = OutputInventory.from_value(res.output_inventory, expected_root=out_dir) if out_dir else None
         cleanup = cleanup_failed_output_if_eligible(
             out_dir,
             planned_output_dir=outcome.planned_out_dir,
             failed=outcome.outcome_kind == OutcomeKind.FAILURE,
             force_owned_output_cleanup=outcome.policy_rejected_partial_output,
+            payload_inventory=(inventory.stats.file_count, inventory.stats.total_size) if inventory is not None else None,
         )
         diagnostics = res.diagnostics
         res.diagnostics = {**diagnostics, "failed_output_cleanup": cleanup.to_dict()}

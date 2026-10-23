@@ -142,7 +142,7 @@ def test_shared_worker_interleaves_watch_cli_success_wrong_password_and_damage(t
                                       "output_dir": str(tmp_path / str(i)), "password_candidates": candidates})
                 await process.submit(request, str(i), parsed_events=True,
                                      on_line=lambda line, event: events.append(event) or event.get("event") == "job_finished",
-                                     on_timeout=lambda message: events.append({"error": message}))
+                                     on_error=lambda message: events.append({"error": message}))
                 finished.append(process._jobs[str(i)]["finished"])
             await asyncio.wait_for(asyncio.gather(*finished), 30)
         finally:

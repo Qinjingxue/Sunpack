@@ -49,6 +49,7 @@ class OutputCleanupRequest:
     path: str
     ownership: OutputOwnership
     allow_nonempty: bool | None = None
+    payload_inventory: tuple[int, int] | None = None
 
 
 @dataclass(frozen=True)
@@ -94,6 +95,7 @@ class OutputCleanupManager:
         event: OutputCleanupEvent,
         planned_output_dir: str | None = None,
         allow_nonempty: bool | None = None,
+        payload_inventory: tuple[int, int] | None = None,
     ) -> OutputCleanupResult:
         return self.handle(OutputCleanupRequest(
             event=event,
@@ -101,6 +103,7 @@ class OutputCleanupManager:
             path=path,
             ownership=OutputOwnership(planned_output_dir=planned_output_dir or path),
             allow_nonempty=allow_nonempty,
+            payload_inventory=payload_inventory,
         ))
 
     def cleanup_scoped_path(
@@ -164,7 +167,11 @@ class OutputCleanupManager:
         if allow_nonempty is None:
             allow_nonempty = request.event != OutputCleanupEvent.TERMINAL_FAILURE
         if is_directory and not allow_nonempty:
-            inventory = _payload_inventory(path)
+            # Positive native counts already prove this output must be kept.
+            # An empty manifest need not include untracked files or links.
+            inventory = request.payload_inventory
+            if inventory is None or inventory[0] <= 0:
+                inventory = _payload_inventory(path)
             if inventory is None:
                 return OutputCleanupResult(reason="output_inventory_failed", **base)
             payload_file_count, payload_bytes = inventory

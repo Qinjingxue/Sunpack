@@ -173,12 +173,12 @@ def _run_case(*, workspace: BenchmarkWorkspace, worker_path: Path, archives: lis
         return on_line
 
     def timeout(job_id: str):
-        def on_timeout(message: str) -> None:
+        def on_error(message: str) -> None:
             with done:
                 failures[job_id] = str(message)
                 completed.add(job_id)
                 done.notify_all()
-        return on_timeout
+        return on_error
 
     try:
         sampler.start()
@@ -188,7 +188,7 @@ def _run_case(*, workspace: BenchmarkWorkspace, worker_path: Path, archives: lis
                 _job_payload(
                     job_id=job_id, archive=archives[index], output=workspace.outputs / label / job_id,
                 ),
-                job_id, on_line=callback(job_id), on_timeout=timeout(job_id),
+                job_id, on_line=callback(job_id), on_error=timeout(job_id),
             )
         deadline = time.monotonic() + timeout_seconds
         with done:

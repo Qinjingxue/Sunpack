@@ -141,11 +141,11 @@ def _run_job(
             return True
         return False
 
-    def on_timeout(message: str) -> None:
+    def on_error(message: str) -> None:
         failure.append(str(message))
         completed.set()
 
-    worker.submit_async(payload, job_id, on_line=on_line, on_timeout=on_timeout)
+    worker.submit_async(payload, job_id, on_line=on_line, on_error=on_error)
     deadline = time.monotonic() + max(1.0, timeout_seconds)
     while not completed.is_set():
         remaining = deadline - time.monotonic()

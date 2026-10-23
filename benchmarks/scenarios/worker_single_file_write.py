@@ -181,7 +181,7 @@ def _run_worker(
             return True
         return False
 
-    def on_timeout(message: str) -> None:
+    def on_error(message: str) -> None:
         failure.append(str(message))
         completed.set()
 
@@ -191,7 +191,7 @@ def _run_worker(
     sampler.take()
     started = time.perf_counter_ns()
     try:
-        worker.submit_async(payload, job_id, on_line=on_line, on_timeout=on_timeout)
+        worker.submit_async(payload, job_id, on_line=on_line, on_error=on_error)
         deadline = time.monotonic() + timeout_seconds
         while not completed.is_set():
             remaining = deadline - time.monotonic()

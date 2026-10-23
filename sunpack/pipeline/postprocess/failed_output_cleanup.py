@@ -26,6 +26,7 @@ def cleanup_failed_output_if_eligible(
     planned_output_dir: str,
     failed: bool,
     force_owned_output_cleanup: bool = False,
+    payload_inventory: tuple[int, int] | None = None,
 ) -> FailedOutputCleanupResult:
     """Apply the postprocess cleanup policy to a terminal extraction output."""
     path = os.path.abspath(str(output_dir or "")) if output_dir else ""
@@ -43,6 +44,7 @@ def cleanup_failed_output_if_eligible(
         ),
         planned_output_dir=planned,
         allow_nonempty=force_owned_output_cleanup,
+        payload_inventory=payload_inventory,
     )
     reason = cleanup.reason
     if reason in {

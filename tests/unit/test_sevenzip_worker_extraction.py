@@ -476,7 +476,7 @@ def test_native_worker_result_escapes_control_characters(tmp_path):
         "archive_path": str(archive),
         "output_dir": str(tmp_path / "out"),
     }
-    runner = SevenZipRunner({"watchdog_no_progress_timeout_seconds": 2})
+    runner = SevenZipRunner({})
     runner.worker_path = worker_path
     try:
         completed = runner.submit_attempt(
@@ -508,12 +508,7 @@ def test_native_worker_asyncio_event_controller_completes_job(tmp_path):
     }
 
     async def run_attempt():
-        runner = SevenZipRunner(
-            {
-                "watchdog_no_progress_timeout_seconds": 2,
-                "cancel_grace_seconds": 0.5,
-            }
-        )
+        runner = SevenZipRunner({})
         runner.worker_path = worker_path
         try:
             return await asyncio.wait_for(
@@ -556,43 +551,7 @@ def test_native_worker_asyncio_process_exit_completes_pending_job(tmp_path):
     assert completed.worker_diagnostics["process_failure"]["failure_kind"] == "worker_lost"
 
 
-def test_native_worker_asyncio_no_progress_cancels_without_polling(tmp_path):
-    worker = tmp_path / "stalled_worker.cmd"
-    worker.write_text(
-        '@echo {"type":"worker_ready"}\r\n'
-        "@set /p request=\r\n"
-        "@set /p cancellation=\r\n"
-        "@set /p shutdown=\r\n",
-        encoding="utf-8",
-    )
-    runner = SevenZipRunner(
-        {
-            "watchdog_no_progress_timeout_seconds": 0.05,
-            "cancel_grace_seconds": 0.5,
-        }
-    )
-    runner.worker_path = str(worker)
-
-    async def run_attempt():
-        try:
-            return await asyncio.wait_for(
-                runner.submit_attempt_asyncio(
-                    {"job_id": "async-deadline"},
-                    task=_task(worker),
-                ),
-                timeout=2,
-            )
-        finally:
-            await runner.aclose()
-
-    completed = asyncio.run(run_attempt())
-
-    assert completed.returncode == -101
-    assert completed.worker_diagnostics["process_failure"]["failure_kind"] == "timeout"
-    assert "no observable progress" in completed.stderr
-
-
-@pytest.mark.parametrize("completion", ["job_finished", "worker_exit", "grace_expired"])
+@pytest.mark.parametrize("completion", ["job_finished", "worker_exit", "worker_closed"])
 def test_cancelled_request_retains_input_lease_until_native_work_stops(tmp_path, completion):
     from sunpack.pipeline.coordinator.engine import PipelineEngine
 
@@ -602,7 +561,7 @@ def test_cancelled_request_retains_input_lease_until_native_work_stops(tmp_path,
         '@echo {"type":"native_event","event":"job_finished","job_id":"cancel-job"}\r\n'
         '@set /p shutdown=\r\n'
         if completion == "job_finished"
-        else '@set /p ignored=\r\n' if completion == "grace_expired"
+        else '@set /p ignored=\r\n' if completion == "worker_closed"
         else '@exit /b 7\r\n'
     )
     worker.write_text(
@@ -617,7 +576,7 @@ def test_cancelled_request_retains_input_lease_until_native_work_stops(tmp_path,
     )
 
     async def scenario():
-        runner = SevenZipRunner({"cancel_grace_seconds": 0.5 if completion == "grace_expired" else 5})
+        runner = SevenZipRunner({})
         runner.worker_path = str(worker)
         started, cancelling = asyncio.Event(), asyncio.Event()
 
@@ -652,8 +611,10 @@ def test_cancelled_request_retains_input_lease_until_native_work_stops(tmp_path,
                 assert not request.done()
                 assert not waiting.done()
                 assert not engine.is_idle()
-                if completion != "grace_expired":
-                    native = await runner._async_worker_holder_or_create().get_or_start(None)
+                native = await runner._async_worker_holder_or_create().get_or_start(None)
+                if completion == "worker_closed":
+                    await native.close()
+                else:
                     await native.send('{"worker_command":"finish"}')
                 with pytest.raises(asyncio.CancelledError):
                     await asyncio.wait_for(request, 2)
@@ -1138,26 +1099,6 @@ def test_extraction_scheduler_classifies_malformed_worker_output_as_process_exit
     assert result.diagnostics["failure_stage"] == "worker_communication"
     assert result.diagnostics["failure_kind"] == "worker_lost"
     assert result.diagnostics["process_failure"]["message"]
-
-
-def test_sevenzip_runner_observed_no_progress_reports_process_timeout(tmp_path):
-    worker = tmp_path / "sleep_worker.cmd"
-    worker.write_text("@ping 127.0.0.1 -n 3 >nul\r\n", encoding="utf-8")
-    scheduler = ExtractionScheduler(
-        max_retries=1,
-        process_config={
-            "watchdog_no_progress_timeout_seconds": 0.1,
-            "cancel_grace_seconds": 0.5,
-        },
-    )
-    scheduler.sevenzip_runner.worker_path = str(worker)
-    try:
-        result = scheduler.extract(_task(worker), str(tmp_path / "out"))
-    finally:
-        scheduler.close()
-
-    assert result.success is False
-    assert result.diagnostics["process_failure"]["failure_kind"] == "timeout"
 
 
 def _task(path, archive_input=None):

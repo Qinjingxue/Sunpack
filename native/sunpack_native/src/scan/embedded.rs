@@ -555,6 +555,7 @@ fn validate_raw_hits(
 
     let mut range_index = 0usize;
     let mut covered_until = 0u64;
+    let mut previous_xz: Option<usize> = None;
     for hit in raw_hits
         .iter()
         .filter(|hit| !matches!(hit.kind(), "zip_eocd" | "zip64_eocd"))
@@ -593,9 +594,38 @@ fn validate_raw_hits(
                 covered_until = covered_until.max(end);
             }
         }
+        if candidate.format == "xz" {
+            if let Some(previous) = previous_xz {
+                if let Some(end) = candidates[previous].end_offset {
+                    if xz_stream_padding(reader, end, candidate.offset)? {
+                        // Both boundaries were already proved by the shared
+                        // footer/index evidence. Reuse them; do not analyze the
+                        // payload again or expose TAR fragments as peer inputs.
+                        candidates[previous].end_offset = candidate.end_offset;
+                        continue;
+                    }
+                }
+            }
+            previous_xz = Some(candidates.len());
+        }
         candidates.push(candidate);
     }
     Ok(candidates)
+}
+
+fn xz_stream_padding(reader: &ManagedReader, mut start: u64, end: u64) -> io::Result<bool> {
+    if end < start || (end - start) % 4 != 0 {
+        return Ok(false);
+    }
+    while start < end {
+        let size = (end - start).min(64 * 1024) as usize;
+        let padding = reader.read_cached_at(start, size)?;
+        if padding.len() != size || padding.iter().any(|byte| *byte != 0) {
+            return Ok(false);
+        }
+        start += size as u64;
+    }
+    Ok(true)
 }
 
 fn candidate_rank(candidate: &EmbeddedCandidate) -> u8 {
@@ -2300,6 +2330,9 @@ mod tests {
             data.extend_from_slice(&stream);
             data.extend_from_slice(gap);
         }
+        // Aligned zero padding joins the first two streams. The nonzero gap
+        // still leaves the third as an independent archive under the same budget.
+        let expected = vec![(expected[0].0, expected[1].1), expected[2]];
         let mut hits = scan_sample(&data, 0, 0);
         let mut ends = hits
             .iter()

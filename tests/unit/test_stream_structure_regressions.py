@@ -1,11 +1,13 @@
 import bz2
 import asyncio
 import io
+import lzma
 import os
 import tarfile
 import time
 
 import pytest
+import zstandard
 from sunpack_native import inspect_compression_stream_structure, inspect_tar_header_structure
 
 
@@ -56,6 +58,60 @@ def test_bzip2_real_trailing_junk_is_still_flagged(tmp_path):
     assert result["archive.trailing_data"] == 80
     assert "trailing_junk" in result["damage_flags"]
     assert result["integrity_status"] == "verified"
+
+
+def test_xz_multistream_checks_and_padding_share_one_structure(tmp_path):
+    # Single-stream cases cannot detect comparing the last footer with the
+    # first header, or validating only the first expanded stream.
+    path = tmp_path / "disguised.bin"
+    body = (lzma.compress(b"a" * 257, check=lzma.CHECK_CRC32) + b"\0" * 4
+            + lzma.compress(b"b" * 1536, check=lzma.CHECK_CRC64))
+    path.write_bytes(body + b"trailing carrier bytes")
+    result = inspect_compression_stream_structure(str(path))
+    assert result["plausible"] is True
+    assert result["structure.stream_count"] == 2
+    assert result["block.uncompressed_data"] == 1793
+    assert result["segment_end"] == len(body)
+    assert result["integrity_status"] == "verified"
+    assert result["damage_flags"] == ["trailing_junk"]
+
+
+@pytest.mark.parametrize("corrupt_second", [False, True])
+def test_zstd_second_frame_is_neither_junk_nor_covered_by_first_frame_checksum(tmp_path, corrupt_second):
+    # No single-frame test can expose extending first-frame evidence across
+    # a later frame. Both cases are small and use the eager analysis path.
+    compressor = zstandard.ZstdCompressor(write_checksum=True)
+    first = compressor.compress(b"first")
+    second = bytearray(compressor.compress(b"second"))
+    if corrupt_second:
+        second[-1] ^= 1
+    path = tmp_path / "multi.bin"
+    path.write_bytes(first + second)
+    result = inspect_compression_stream_structure(str(path))
+    assert result["plausible"] is True
+    assert result["structure.stream_count"] == 2
+    assert result["archive.trailing_data"] == 0
+    assert "trailing_junk" not in result["damage_flags"]
+    assert result["integrity_status"] != "verified"
+    assert result["integrity_validation_complete"] is False
+
+
+@pytest.mark.parametrize(("compress", "size_field"), [
+    (bz2.compress, "block.decoded_content"),
+    (lzma.compress, "block.uncompressed_data"),
+    (zstandard.ZstdCompressor(write_checksum=True).compress, "frame.decoded_content"),
+])
+def test_bounded_decode_probe_keeps_structure_without_claiming_integrity(tmp_path, compress, size_field):
+    # Ordinary small fixtures never exercise the shared probe output limit.
+    # One compressible input per codec covers the cap with little disk I/O.
+    limit = 8 * 1024 * 1024
+    path = tmp_path / "large-expanded.bin"
+    path.write_bytes(compress(b"x" * (limit + 100)))
+    result = inspect_compression_stream_structure(str(path))
+    assert result["plausible"] is True
+    assert result["structure_validation_complete"] is True
+    assert result[size_field] == limit + 1
+    assert result["integrity_status"] != "verified"
 
 
 @pytest.mark.performance

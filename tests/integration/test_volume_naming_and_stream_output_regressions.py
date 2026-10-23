@@ -1,6 +1,7 @@
 import asyncio
 import bz2
 import io
+import lzma
 import shutil
 import subprocess
 import tarfile
@@ -105,6 +106,42 @@ def test_tar_windows_name_collisions_keep_complete_output_in_both_origins(tmp_pa
                 assert {p.relative_to(output).as_posix() for p in output.rglob("*") if p.is_file()} == set(expected)
                 for name, payload in expected.items():
                     assert (output / name).read_bytes() == payload
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("embedded", [False, True])
+def test_concatenated_xz_recovers_one_nested_tar_in_both_origins(tmp_path, embedded):
+    # Structural tests cannot catch a valid stream becoming two extraction
+    # inputs. Split the first TAR header so sampling must cross the streams.
+    payload = b"complete nested payload"
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w") as archive:
+        info = tarfile.TarInfo("payload.txt")
+        info.size = len(payload)
+        archive.addfile(info, io.BytesIO(payload))
+    tar = buffer.getvalue()
+    streams = (lzma.compress(tar[:257], check=lzma.CHECK_CRC32) + b"\0" * 4
+               + lzma.compress(tar[257:], check=lzma.CHECK_CRC64))
+    config = normalize_config(with_detection_pipeline({
+        "recursive_extract": "3",
+        "output": {"root": str(tmp_path / "out")},
+        "post_extract": {"archive_cleanup_mode": "k", "flatten_single_directory": False},
+    }))
+
+    async def run():
+        async with PipelineEngine(config) as engine:
+            for origin in ("foreground", "watch"):
+                path = tmp_path / f"{origin}.bin"
+                path.write_bytes(b"prefix junk" + streams + b"suffix junk" if embedded else streams)
+                response = await engine.run([str(path)], direct=True, origin=origin,
+                    detection_options=EmbeddedOptions(force_scan=embedded))
+                assert not response.summary.failed_tasks, response.summary.failures
+                results = response.summary.target_results
+                assert results and all(r.outcome_kind == OutcomeKind.COMPLETE_SUCCESS for r in results)
+                recovered = list((tmp_path / "out").rglob("payload.txt"))
+                assert len(recovered) == (1 if origin == "foreground" else 2)
+                assert all(p.read_bytes() == payload for p in recovered)
 
     asyncio.run(run())
 

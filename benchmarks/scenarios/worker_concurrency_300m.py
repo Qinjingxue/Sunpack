@@ -146,7 +146,7 @@ def run_worker(worker, cases, outputs, concurrency, dll, timeout, dry_run=False)
             # must be free to acquire the condition and drain stdout meanwhile.
             for job, job_id, on_line, on_failure in submissions:
                 worker.submit_async(json.dumps(job, ensure_ascii=False), job_id, on_line=on_line,
-                                    on_timeout=on_failure, parsed_events=True)
+                                    on_error=on_failure, parsed_events=True)
             with condition:
                 if pending and (next_job == len(cases) or len(pending) >= concurrency):
                     remaining = timeout - (time.perf_counter() - started)

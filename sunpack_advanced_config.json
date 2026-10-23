@@ -98,7 +98,6 @@
   "performance": {
     "persistent_server_idle_seconds": 15,
     "worker": {
-      "watchdog_no_progress_timeout_seconds": 180,
       "thread_capacity": 0,
       "stage_thread_capacity": 0,
       "max_pending_stage_jobs": 4096,

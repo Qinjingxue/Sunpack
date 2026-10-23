@@ -12,7 +12,7 @@ fn decompress_sample<R: Read>(
         "bzip2" => BzDecoder::new(reader)
             .take(max_output as u64)
             .read_to_end(&mut output),
-        "xz" => XzDecoder::new(reader)
+        "xz" => XzDecoder::new_multi_decoder(reader)
             .take(max_output as u64)
             .read_to_end(&mut output),
         "zstd" => {

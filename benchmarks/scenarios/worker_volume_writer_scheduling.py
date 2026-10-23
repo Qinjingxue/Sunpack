@@ -187,7 +187,7 @@ class _Job:
             return True
         return False
 
-    def on_timeout(self, message: str) -> None:
+    def on_error(self, message: str) -> None:
         self.failure = str(message)
         self.done.set()
 
@@ -238,7 +238,7 @@ def _run_configuration(
                 ensure_ascii=False,
                 separators=(",", ":"),
             )
-            worker.submit_async(payload, job.job_id, on_line=job.on_line, on_timeout=job.on_timeout)
+            worker.submit_async(payload, job.job_id, on_line=job.on_line, on_error=job.on_error)
         deadline = time.monotonic() + timeout_seconds
         for job in jobs:
             while not job.done.is_set():

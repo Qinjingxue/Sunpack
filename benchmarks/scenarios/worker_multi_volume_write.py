@@ -174,7 +174,7 @@ class _JobRun:
             return True
         return False
 
-    def on_timeout(self, message: str) -> None:
+    def on_error(self, message: str) -> None:
         self.failure = str(message)
         self.done.set()
 
@@ -325,7 +325,7 @@ def _run_phase(
                 ),
                 run.job_id,
                 on_line=run.on_line,
-                on_timeout=run.on_timeout,
+                on_error=run.on_error,
             )
         _wait_for_jobs(runs, worker=worker, timeout_seconds=timeout_seconds)
         phase_finished = time.perf_counter_ns()

@@ -32,7 +32,7 @@ def _advanced_payload():
         "recursive_extract": "*",
         "post_extract": {"archive_cleanup_mode": "r", "flatten_single_directory": True},
         "filesystem": {"scan_filters_enabled": True, "scan_filters": []},
-        "performance": {"worker": {"minimum_available_memory_ratio": 0.1, "watchdog_no_progress_timeout_seconds": 180}},
+        "performance": {"worker": {"minimum_available_memory_ratio": 0.1, "max_queue_jobs": 256}},
         "verification": _verification_config(),
         "detection": {"enabled": True},
     }
@@ -58,7 +58,7 @@ def test_load_config_merges_simple_config_over_advanced_config(tmp_path, monkeyp
     assert config["recursive_extract"] == {"mode": "infinite"}
     assert config["filesystem"]["scan_filters"][0]["min_bytes"] == 2097152
     assert config["filesystem"]["scan_filters"][0]["max_bytes"] is None
-    assert config["performance"]["worker"]["watchdog_no_progress_timeout_seconds"] == 180
+    assert config["performance"]["worker"]["max_queue_jobs"] == 256
     assert config["performance"]["worker"]["minimum_available_memory_ratio"] == 0.2
 
 

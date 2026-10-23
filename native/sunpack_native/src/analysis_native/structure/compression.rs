@@ -7,6 +7,22 @@ use std::io::Cursor;
 const EAGER_STREAM_INTEGRITY_MAX_BYTES: u64 = 4 * 1024 * 1024;
 const STREAM_STRUCTURE_DECODE_MAX_BYTES: u64 = 8 * 1024 * 1024;
 
+// Integrity probes need a byte count, not the expanded payload. Retain only a
+// fixed buffer, including when many archives reach the decode limit together.
+fn count_decoded(reader: &mut impl Read) -> (u64, std::io::Result<()>) {
+    let mut limited = reader.take(STREAM_STRUCTURE_DECODE_MAX_BYTES + 1);
+    let mut buffer = [0u8; 8192];
+    let mut count = 0u64;
+    loop {
+        match limited.read(&mut buffer) {
+            Ok(0) => return (count, Ok(())),
+            Ok(size) => count += size as u64,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return (count, Err(error)),
+        }
+    }
+}
+
 const GZIP_FIELDS: &[&str] = &[
     "member.header.magic",
     "member.header.compression_method",
@@ -1221,19 +1237,16 @@ fn inspect_bzip2(
         };
         d.set_item("stream.combined_crc32", reader.read(32).unwrap_or(0) as u32)?;
     }
-    let decoder = bzip2::read::BzDecoder::new(Cursor::new(data.as_slice()));
-    let mut limited_decoder = decoder.take(STREAM_STRUCTURE_DECODE_MAX_BYTES + 1);
-    let mut decoded = Vec::new();
-    let decode_status = py.detach(|| limited_decoder.read_to_end(&mut decoded));
-    let decoder = limited_decoder.into_inner();
-    let decode_limited = decoded.len() as u64 > STREAM_STRUCTURE_DECODE_MAX_BYTES;
+    let mut decoder = bzip2::read::BzDecoder::new(Cursor::new(data.as_slice()));
+    let (decoded_size, decode_status) = py.detach(|| count_decoded(&mut decoder));
+    let decode_limited = decoded_size > STREAM_STRUCTURE_DECODE_MAX_BYTES;
     let decode_ok = decode_status.is_ok() && !decode_limited;
     let marker_boundary = ends
         .first()
         .map(|bit| (bit + 48 + 32 + 7) / 8)
         .unwrap_or(data.len());
     let consumed = decoder.get_ref().position() as usize;
-    d.set_item("block.decoded_content", decoded.len())?;
+    d.set_item("block.decoded_content", decoded_size)?;
     let trailing = if decode_limited {
         0
     } else {
@@ -1589,9 +1602,8 @@ fn inspect_xz(py: Python<'_>, path: &str, header: &[u8], file_size: u64) -> PyRe
     if footer_crc != crc32(&footer[4..10]) {
         damage_flags.push("xz_footer_crc_bad");
     }
-    if &footer[8..10] != flags {
-        damage_flags.push("xz_stream_flags_mismatch");
-    }
+    // Concatenated streams may use different checks. The canonical structural
+    // walk compares each footer to its own header.
     d.set_item("stream.footer.backward_size", backward_size)?;
     d.set_item("stream.footer.flags", hex_bytes(&footer[8..10]))?;
     d.set_item("stream.footer.magic", hex_bytes(&footer[10..12]))?;
@@ -1642,12 +1654,15 @@ fn inspect_xz(py: Python<'_>, path: &str, header: &[u8], file_size: u64) -> PyRe
         }
     }
 
-    let mut block_cursor = 12usize;
+    let padded_blocks = records.iter().fold(0u64, |total, (size, _)| {
+        total.saturating_add(*size).saturating_add((4 - size % 4) % 4)
+    });
+    let mut block_cursor = index_start.saturating_sub(padded_blocks as usize);
     let mut block_count = 0usize;
     let mut total_compressed = 0u64;
     let mut total_padding = 0usize;
     let mut first_filters = String::new();
-    let check_size = xz_check_size(flags[1] & 0x0f);
+    let check_size = xz_check_size(footer[9] & 0x0f);
     let mut first_header = None;
     py.detach(|| {
         for (unpadded, expected_uncompressed) in &records {
@@ -1712,18 +1727,17 @@ fn inspect_xz(py: Python<'_>, path: &str, header: &[u8], file_size: u64) -> PyRe
         format!("type={};size={check_size}", flags[1] & 0x0f),
     )?;
     d.set_item("block.sequence", block_count)?;
-    let decoder = xz2::read::XzDecoder::new(Cursor::new(data.as_slice()));
-    let mut limited_decoder = decoder.take(STREAM_STRUCTURE_DECODE_MAX_BYTES + 1);
-    let mut decoded = Vec::new();
-    let decode_status = py.detach(|| limited_decoder.read_to_end(&mut decoded));
-    let decode_limited = decoded.len() as u64 > STREAM_STRUCTURE_DECODE_MAX_BYTES;
-    let decode_ok = decode_status.is_ok() && !decode_limited;
-    d.set_item("block.uncompressed_data", decoded.len())?;
-    let stream_count = py.detach(|| data.windows(6).filter(|w| *w == XZ_MAGIC).count());
-    d.set_item("archive.stream_sequence", stream_count)?;
     let after_footer = footer_start + 12;
     let zero_padding = data[after_footer..].iter().take_while(|b| **b == 0).count();
     let aligned_padding = zero_padding - zero_padding % 4;
+    let stream_end = after_footer + aligned_padding;
+    let mut decoder = xz2::read::XzDecoder::new_multi_decoder(Cursor::new(&data[..stream_end]));
+    let (decoded_size, decode_status) = py.detach(|| count_decoded(&mut decoder));
+    let decode_limited = decoded_size > STREAM_STRUCTURE_DECODE_MAX_BYTES;
+    let decode_ok = decode_status.is_ok() && !decode_limited;
+    d.set_item("block.uncompressed_data", decoded_size)?;
+    let stream_count = py.detach(|| data.windows(6).filter(|w| *w == XZ_MAGIC).count());
+    d.set_item("archive.stream_sequence", stream_count)?;
     d.set_item("stream.padding", aligned_padding)?;
     let trailing = data.len().saturating_sub(after_footer + aligned_padding);
     d.set_item("archive.trailing_data", trailing)?;
@@ -1732,7 +1746,6 @@ fn inspect_xz(py: Python<'_>, path: &str, header: &[u8], file_size: u64) -> PyRe
     }
     let valid = (decode_ok || decode_limited)
         && &footer[10..12] == b"YZ"
-        && &footer[8..10] == flags
         && index_valid_start;
     d.set_item("plausible", valid)?;
     d.set_item("confidence", if valid { "strong" } else { "medium" })?;
@@ -1745,7 +1758,7 @@ fn inspect_xz(py: Python<'_>, path: &str, header: &[u8], file_size: u64) -> PyRe
         file_size,
         (after_footer + aligned_padding) as u64,
         StructuralStreamKind::Xz,
-        decode_ok.then_some(u64::MAX),
+        decode_ok.then_some(stream_end as u64),
         &mut damage_flags,
     )?;
     d.set_item("damage_flags", PyList::new(py, damage_flags)?)?;
@@ -1921,18 +1934,18 @@ fn inspect_zstd(py: Python<'_>, path: &str, header: &[u8], file_size: u64) -> Py
     } else {
         d.set_item("frame.content_checksum", "absent")?;
     }
-    let mut decoded = Vec::new();
+    let mut decoded_size = 0;
     let (decode_ok, decode_limited) =
         match zstd::stream::read::Decoder::new(Cursor::new(&data[..cursor])) {
-            Ok(decoder) => {
-                let mut limited_decoder = decoder.take(STREAM_STRUCTURE_DECODE_MAX_BYTES + 1);
-                let status = py.detach(|| limited_decoder.read_to_end(&mut decoded));
-                let limited = decoded.len() as u64 > STREAM_STRUCTURE_DECODE_MAX_BYTES;
+            Ok(mut decoder) => {
+                let (count, status) = py.detach(|| count_decoded(&mut decoder));
+                decoded_size = count;
+                let limited = decoded_size > STREAM_STRUCTURE_DECODE_MAX_BYTES;
                 (status.is_ok() && !limited, limited)
             }
             Err(_) => (false, false),
         };
-    d.set_item("frame.decoded_content", decoded.len())?;
+    d.set_item("frame.decoded_content", decoded_size)?;
     d.set_item(
         "frame.sequence",
         py.detach(|| data.windows(4).filter(|w| *w == ZSTD_MAGIC).count()),
@@ -1960,9 +1973,8 @@ fn inspect_zstd(py: Python<'_>, path: &str, header: &[u8], file_size: u64) -> Py
     d.set_item("skippable.user_data", skip_data)?;
     let trailing = data.len().saturating_sub(cursor);
     d.set_item("archive.trailing_data", trailing)?;
-    if trailing > 0 {
-        damage_flags.push("trailing_junk");
-    }
+    // The canonical walk below owns the tail: subsequent frames and skippable
+    // frames are part of this logical stream, not trailing junk.
     let valid = (decode_ok || decode_limited) && last && descriptor & 0x08 == 0;
     d.set_item("plausible", valid)?;
     d.set_item("confidence", if valid { "strong" } else { "medium" })?;
@@ -1983,7 +1995,7 @@ fn inspect_zstd(py: Python<'_>, path: &str, header: &[u8], file_size: u64) -> Py
         file_size,
         file_size,
         StructuralStreamKind::Zstd,
-        (decode_ok && checksum).then_some(u64::MAX),
+        (decode_ok && checksum).then_some(cursor as u64),
         &mut damage_flags,
     )?;
     d.set_item("damage_flags", PyList::new(py, damage_flags)?)?;

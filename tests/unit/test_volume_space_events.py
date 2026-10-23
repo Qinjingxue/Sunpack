@@ -11,7 +11,6 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
-import time
 from pathlib import Path
 
 import pytest
@@ -22,8 +21,6 @@ from sunpack.pipeline.extraction.internal.sevenzip.sevenzip_runner import (
     _apply_native_environment,
     _apply_native_event_to_job_state,
     _on_space_event,
-    _worker_job_deadline,
-    _worker_job_due_reason,
 )
 
 pytestmark = pytest.mark.skipif(
@@ -54,8 +51,6 @@ def _space_event(event: str, episode: int = 3, **extra) -> dict:
 def _running_state(**overrides) -> dict:
     state = {
         "state": "running",
-        "last_progress_at": time.monotonic(),
-        "no_progress_timeout": 180.0,
     }
     state.update(overrides)
     return state
@@ -63,20 +58,6 @@ def _running_state(**overrides) -> dict:
 
 def _task(archive: Path):
     return make_archive_task(archive, key=str(archive))
-
-
-def _write_script(path: Path, lines: list[str], job_id: str = "event-job") -> Path:
-    body = ['@echo {"type":"worker_ready"}', "@set /p request="]
-    body.extend(lines)
-    path.write_text("\r\n".join(body) + "\r\n", encoding="utf-8")
-    return path
-
-
-def _json_line(payload: dict) -> str:
-    # cmd 的 echo 不处理引号，JSON 必须单行且不含 & | < >
-    rendered = json.dumps(payload, ensure_ascii=True)
-    assert not any(char in rendered for char in "&|<>"), rendered
-    return "@echo " + rendered
 
 
 def _write_python_worker(tmp_path: Path, events: list[dict], name: str = "space_worker") -> Path:
@@ -141,29 +122,13 @@ def test_only_job_events_write_the_lifecycle_state():
     assert state["state"] == "result_received"
 
 
-def test_space_waiting_suspends_the_no_progress_deadline():
-    state = _running_state(last_progress_at=time.monotonic() - 3600.0)
-    assert _worker_job_deadline(state) is not None
-    _on_space_event(state, "space_blocked", _space_event("space_blocked"))
-    assert state["space_waiting"] is True
-    assert _worker_job_deadline(state) is None
-
-
-def test_deadline_is_independent_of_poll_interval():
-    # 看门狗配 0.05s 也不会误杀 space-blocked 的 job：暂停期间计时与 poll interval 解耦。
-    state = _running_state(no_progress_timeout=0.05, last_progress_at=time.monotonic() - 10.0)
-    _on_space_event(state, "space_blocked", _space_event("space_blocked"))
-    assert _worker_job_deadline(state) is None
-
-
 def test_multiple_jobs_on_the_same_volume_are_all_suspended():
-    states = [_running_state(last_progress_at=time.monotonic() - 3600.0) for _ in range(2)]
+    states = [_running_state() for _ in range(2)]
     for index, state in enumerate(states):
         _on_space_event(
             state, "space_blocked", _space_event("space_blocked", job_id=f"job-{index}")
         )
     assert all(state["space_waiting"] is True for state in states)
-    assert all(_worker_job_deadline(state) is None for state in states)
 
 
 def test_space_events_never_imply_a_result():
@@ -171,17 +136,6 @@ def test_space_events_never_imply_a_result():
     for event in ("space_blocked", "space_status", "space_resumed", "space_status"):
         _apply_native_event_to_job_state(state, _space_event(event))
         assert state["state"] != "result_received"
-
-
-def test_cancel_request_wins_over_space_waiting():
-    state = _running_state(
-        space_waiting=True,
-        cancel_requested=True,
-        cancel_deadline=time.monotonic() + 5.0,
-    )
-    deadline = _worker_job_deadline(state)
-    assert deadline is not None
-    assert deadline == pytest.approx(float(state["cancel_deadline"]))
 
 
 def test_volume_key_shape_is_lowercase_without_trailing_backslash():
@@ -235,24 +189,6 @@ def test_advanced_config_default_enables_the_space_gate():
     assert worker["space_gate_enabled"] is True
     assert int(worker["space_poll_interval_ms"]) >= 50
     assert int(worker["space_status_report_interval_ms"]) >= 1000
-
-
-def test_resume_restarts_the_no_progress_clock():
-    state = _running_state(last_progress_at=time.monotonic() - 3600.0)
-    _on_space_event(state, "space_blocked", _space_event("space_blocked"))
-    assert _worker_job_deadline(state) is None
-
-    time.sleep(0.01)
-    # 分发路径对每一行输出都刷新 last_progress_at，这里显式模拟它。
-    before = state["last_progress_at"]
-    state["last_progress_at"] = time.monotonic()
-    _apply_native_event_to_job_state(state, _space_event("space_resumed"))
-
-    assert state["space_waiting"] is False
-    assert state["last_progress_at"] > before
-    deadline = _worker_job_deadline(state)
-    assert deadline is not None
-    assert deadline > time.monotonic()
 
 
 def test_unknown_native_events_are_logged(caplog):
@@ -378,13 +314,7 @@ def test_stale_space_event_is_not_forwarded_to_the_ui(tmp_path):
         name="stale_worker",
     )
 
-    runner = SevenZipRunner(
-        {
-            # 足够长的看门狗：本用例要的是"事件被过滤"，不是看门狗行为。
-            "watchdog_no_progress_timeout_seconds": 30,
-            "cancel_grace_seconds": 0.5,
-        }
-    )
+    runner = SevenZipRunner({})
     runner.worker_path = str(worker)
     seen: list[dict] = []
     runner.progress_callback = lambda task, event: seen.append(event)
@@ -411,51 +341,3 @@ def test_stale_space_event_is_not_forwarded_to_the_ui(tmp_path):
         "迟到的 blocked(ep3)/status(ep3) 必须在 dispatcher 层被拦下，"
         f"绝不能进 UI；实际转发序列：{forwarded}"
     )
-
-
-# 端到端：假 worker 走完整 asyncio 分发路径（真进程 + 真分发线程）。
-def test_aggressive_watchdog_never_cancels_a_space_waiting_job():
-    now = time.monotonic()
-    plain = _running_state(no_progress_timeout=0.05, last_progress_at=now - 1.0)
-    blocked = _running_state(no_progress_timeout=0.05, last_progress_at=now - 1.0)
-    _on_space_event(blocked, "space_blocked", _space_event("space_blocked"))
-
-    # 对照组：没有任何空间事件的 job 在同一个 0.05s 看门狗下确实到期。
-    assert _worker_job_due_reason(plain, now) is not None
-    # 合法暂停：完全不计时。
-    assert _worker_job_due_reason(blocked, now) is None
-
-    # 恢复之后必须重新开始计时（否则 job 会永久逃过看门狗）。
-    _on_space_event(blocked, "space_resumed", _space_event("space_resumed"))
-    blocked["last_progress_at"] = now - 1.0
-    assert _worker_job_due_reason(blocked, now) is not None
-
-
-def test_control_job_without_events_is_still_cancelled_by_the_watchdog(tmp_path):
-    archive = tmp_path / "archive.zip"
-    archive.write_bytes(b"payload")
-    # 不发任何事件、也不回应取消 → 必须被看门狗杀掉。
-    worker = _write_script(
-        tmp_path / "silent_worker.cmd",
-        ["@set /p cancellation=", "@set /p shutdown="],
-    )
-    runner = SevenZipRunner(
-        {
-            "watchdog_no_progress_timeout_seconds": 0.05,
-            "cancel_grace_seconds": 0.2,
-        }
-    )
-    runner.worker_path = str(worker)
-
-    async def run_attempt():
-        try:
-            return await asyncio.wait_for(
-                runner.submit_attempt_asyncio({"job_id": "silent-job"}, task=_task(archive)),
-                timeout=10,
-            )
-        finally:
-            await runner.aclose()
-
-    completed = asyncio.run(run_attempt())
-    assert completed.returncode != 0
-    assert completed.worker_diagnostics["process_failure"]["failure_kind"] == "timeout"

@@ -75,7 +75,7 @@ def test_parallel_enc_releases_credits_after_mac_failure_for_watch_and_cli(tmp_p
                                "output_dir": str(tmp_path / job_id)}
                     await process.submit(json.dumps(request), job_id, parsed_events=True,
                                          on_line=lambda line, event: events.append(event) or event.get("event") == "job_finished",
-                                         on_timeout=lambda message: events.append({"error": message}))
+                                         on_error=lambda message: events.append({"error": message}))
                     finished.append(process._jobs[job_id]["finished"])
                 await asyncio.wait_for(asyncio.gather(*finished), 30)
         finally:

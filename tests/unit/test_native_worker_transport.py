@@ -120,13 +120,12 @@ def test_sync_bad_job_waits_for_native_finish_and_does_not_affect_other_jobs():
     worker._async_jobs = {}
     worker._job_states = {}
     worker._dispatch_lock = threading.Lock()
-    worker._deadline_changed = threading.Event()
     sent, callbacks, failures = [], [], []
     worker.send = sent.append
     for job_id in ["bad", "good"]:
         worker.submit_async("request", job_id, parsed_events=True,
                             on_line=lambda line, event: callbacks.append(event) or event.get("event") == "job_finished",
-                            on_timeout=lambda message: failures.append(message))
+                            on_error=lambda message: failures.append(message))
     payload = _event("manifest_chunk", "bad", seq=1, rows=[_row()])
     worker._dispatch_line("", payload, "bad")
     assert "bad" in worker._async_jobs and not failures and not callbacks
@@ -144,14 +143,93 @@ def test_sync_bad_job_waits_for_native_finish_and_does_not_affect_other_jobs():
 def test_sync_fatal_protocol_error_stops_process_before_failure_callback():
     worker = object.__new__(_NativeWorkerProcess)
     worker._dispatch_lock = threading.Lock()
-    worker._deadline_changed = threading.Event()
     worker.queue_capacity = _NativeQueueCapacity()
     worker._job_states = {"job": {}}
     order = []
-    worker._async_jobs = {"job": {"completion_lock": threading.Lock(), "on_timeout": lambda message: order.append("failed")}}
+    worker._async_jobs = {"job": {"completion_lock": threading.Lock(), "on_error": lambda message: order.append("failed")}}
     worker.close = lambda: order.append("stopped")
     worker._dispatch_stdout(io.StringIO("broken\n"))
     assert order == ["stopped", "failed"]
+
+
+@pytest.mark.parametrize("transport", ["sync", "async"])
+def test_queued_and_running_jobs_ignore_legacy_timeout_and_complete_on_native_events(tmp_path, transport):
+    # Existing transport tests finish promptly and cannot catch a watchdog
+    # cancelling a queued job. The short legacy setting keeps this inexpensive.
+    script = tmp_path / "queued_worker.cmd"
+    script.write_text(
+        '@echo {"type":"worker_ready"}\r\n'
+        '@set /p first=\r\n'
+        '@echo {"type":"native_event","event":"job_started","job_id":"active"}\r\n'
+        '@set /p second=\r\n'
+        '@echo {"type":"native_event","event":"job_queued","job_id":"queued"}\r\n'
+        '@set /p finish=\r\n'
+        '@echo {"type":"result","job_id":"active","status":"ok"}\r\n'
+        '@echo {"type":"native_event","event":"job_finished","job_id":"active"}\r\n'
+        '@echo {"type":"result","job_id":"queued","status":"ok"}\r\n'
+        '@echo {"type":"native_event","event":"job_finished","job_id":"queued"}\r\n'
+        '@set /p shutdown=\r\n', encoding="utf-8",
+    )
+
+    async def run():
+        loop = asyncio.get_running_loop()
+        started, queued, finished = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        events, failures, sent = [], [], []
+        config = {"watchdog_no_progress_timeout_seconds": 0.01, "cancel_grace_seconds": 0.01}
+
+        def callback(line, event):
+            events.append(event)
+            if event.get("event") == "job_started":
+                loop.call_soon_threadsafe(started.set)
+            if event.get("event") == "job_queued":
+                loop.call_soon_threadsafe(queued.set)
+            if event.get("event") == "job_finished" and event["job_id"] == "queued":
+                loop.call_soon_threadsafe(finished.set)
+            return event.get("event") == "job_finished"
+
+        if transport == "async":
+            worker = _AsyncNativeWorkerProcess(str(script), None, config)
+            await worker.start()
+            send = worker.send
+
+            async def send_recorded(payload):
+                sent.append(payload)
+                await send(payload)
+        else:
+            worker = _NativeWorkerProcess(str(script), None, config)
+            send = worker.send
+
+            def send_recorded(payload):
+                sent.append(payload)
+                send(payload)
+
+        worker.send = send_recorded
+        try:
+            for job_id in ("active", "queued"):
+                if transport == "async":
+                    await worker.submit("request", job_id, parsed_events=True, on_line=callback, on_error=failures.append)
+                else:
+                    worker.submit_async("request", job_id, parsed_events=True, on_line=callback, on_error=failures.append)
+                if job_id == "active":
+                    await asyncio.wait_for(started.wait(), 2)
+            await asyncio.wait_for(queued.wait(), 2)
+            await asyncio.sleep(0.08)
+            assert worker.is_alive() and not failures and not finished.is_set()
+            assert sent == ["request", "request"]
+            if transport == "async":
+                await worker.send("finish")
+            else:
+                worker.send("finish")
+            await asyncio.wait_for(finished.wait(), 2)
+            assert not failures
+            assert {e["job_id"] for e in events if e["type"] == "result"} == {"active", "queued"}
+        finally:
+            if transport == "async":
+                await worker.close()
+            else:
+                worker.close()
+
+    asyncio.run(run())
 
 
 def test_async_bad_chunk_cancels_only_its_job_and_retains_ownership_until_finish():
@@ -182,7 +260,7 @@ def test_async_bad_chunk_cancels_only_its_job_and_retains_ownership_until_finish
             return event.get("event") == "job_finished"
 
         for job_id in ["bad", "good"]:
-            await worker.submit("request", job_id, parsed_events=True, on_line=callback, on_timeout=failures.append)
+            await worker.submit("request", job_id, parsed_events=True, on_line=callback, on_error=failures.append)
         dispatch = asyncio.create_task(worker._dispatch_stdout())
 
         def feed(kind, job_id, **fields):
@@ -229,7 +307,7 @@ def test_async_fatal_stream_error_stops_process_before_failing_jobs(oversized):
         worker.send = send
         for job_id in ["first", "second"]:
             await worker.submit("request", job_id, on_line=lambda line: False,
-                                on_timeout=lambda message: order.append("failed"))
+                                on_error=lambda message: order.append("failed"))
         reader.feed_data(b"x" * (4 * 1024 * 1024 + 1) if oversized else b"broken\n")
         await asyncio.wait_for(worker._dispatch_stdout(), 2)
         assert order == ["stopped", "failed", "failed"]
@@ -325,7 +403,7 @@ def test_real_worker_large_results_are_assembled_in_both_transports(many_item_ar
         try:
             for job_id, origin in [("watch", "watch"), ("cli", "foreground")]:
                 worker.submit_async(_request(many_item_archive, job_id, origin), job_id, parsed_events=True,
-                                    on_line=sync_callback, on_timeout=lambda message: (events.append({"error": message}), finished.set()))
+                                    on_line=sync_callback, on_error=lambda message: (events.append({"error": message}), finished.set()))
             assert finished.wait(15)
         finally:
             worker.close()
@@ -338,7 +416,7 @@ def test_real_worker_large_results_are_assembled_in_both_transports(many_item_ar
                 finished = []
                 for job_id, origin in [("watch", "watch"), ("cli", "foreground")]:
                     await worker.submit(_request(many_item_archive, job_id, origin), job_id, parsed_events=True,
-                                        on_line=callback, on_timeout=lambda message: events.append({"error": message}))
+                                        on_line=callback, on_error=lambda message: events.append({"error": message}))
                     finished.append(worker._jobs[job_id]["finished"])
                 await asyncio.wait_for(asyncio.gather(*finished), 15)
             finally:
