@@ -749,6 +749,78 @@ def test_watch_service_scheduler_receives_root_outputs(tmp_path, monkeypatch):
     }
 
 
+def test_output_registration_and_state_admission_do_not_deadlock(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from sunpack.core.contracts.discovery_scope import DiscoveryScope
+    from sunpack.runtime.watch.output_roots import WatchOutputRoots
+    from sunpack.runtime.watch.state import WatchStateStore
+
+    root = tmp_path / "input"
+    root.mkdir()
+    source, output = root / "source.7z", root / "output"
+    source.touch()
+    state_path = tmp_path / "state.snapshot"
+    state = WatchStateStore(str(state_path))
+    outputs = WatchOutputRoots(state, (DiscoveryScope(str(root), recursive=True),))
+    admitting, registering = threading.Event(), threading.Event()
+    commit_runtime = state.commit_runtime
+
+    # Bound the original ABBA failure so a regression cannot hang pytest itself.
+    class BoundedRLock:
+        def __init__(self):
+            self.lock = threading.RLock()
+
+        def __enter__(self):
+            assert self.lock.acquire(timeout=5), "output lock blocked state admission"
+            return self
+
+        def __exit__(self, *_):
+            self.lock.release()
+
+    outputs._lock = BoundedRLock()
+
+    def commit(*args, **kwargs):
+        # register holds the real output lock and has already created the root.
+        registering.set()
+        return commit_runtime(*args, **kwargs)
+
+    monkeypatch.setattr(state, "commit_runtime", commit)
+
+    def admit():
+        # record_attempt owns the real state lock before register starts.
+        admitting.set()
+        assert registering.wait(5), "output registration did not start"
+        assert not outputs.protected(str(output / "child.7z"))
+        return True
+
+    def register():
+        assert admitting.wait(5), "state admission did not start"
+        outputs.register(str(output))
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            admission = pool.submit(state.record_attempt, str(source), 0, 1.0, admit=admit)
+            registration = pool.submit(register)
+            admission.result(timeout=15)
+            registration.result(timeout=15)
+        assert output.is_dir()
+        assert outputs.protected(str(output / "child.7z"))
+        assert state.pending_work_for_path(str(source)) is not None
+    finally:
+        outputs.close()
+        state.close()
+
+    # Check the real WAL/snapshot, not just the records in the running process.
+    reloaded = WatchStateStore(str(state_path))
+    restored_outputs = WatchOutputRoots(reloaded, (DiscoveryScope(str(root), recursive=True),))
+    try:
+        assert restored_outputs.protected(str(output / "child.7z"))
+        assert reloaded.pending_work_for_path(str(source)) is not None
+    finally:
+        restored_outputs.close()
+        reloaded.close()
+
+
 def test_removing_last_root_retires_state_without_a_successor_scheduler(tmp_path, monkeypatch):
     # Scheduler-only retention never runs when the last configured root is
     # removed. Exercise the service branch against real native state/cache files.

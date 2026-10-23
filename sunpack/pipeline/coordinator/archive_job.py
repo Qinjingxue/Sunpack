@@ -141,15 +141,19 @@ class ArchiveJobExecutor:
             cancellation=cancellation,
         )
         if self.origin == "watch":
-            output_task_path, output_dir = task.runtime.pop("watch_active_output", (task.main_path, outcome.planned_out_dir))
-            self.extractor.emit_semantic_event(
-                task,
-                "task_output_finished",
-                critical=True,
-                task_path=output_task_path,
-                output_dir=output_dir,
-                keep_output=bool(result.output_dir and result.outcome_kind != OutcomeKind.FAILURE),
-            )
+            # Preflight can finish without ever starting an output write.
+            # Only close a durable output record that this job actually opened.
+            active_output = task.runtime.pop("watch_active_output", None)
+            if active_output is not None:
+                output_task_path, output_dir = active_output
+                self.extractor.emit_semantic_event(
+                    task,
+                    "task_output_finished",
+                    critical=True,
+                    task_path=output_task_path,
+                    output_dir=output_dir,
+                    keep_output=bool(result.output_dir and result.outcome_kind != OutcomeKind.FAILURE),
+                )
         if result.output_dir and result.outcome_kind != OutcomeKind.FAILURE:
             self.password_scope_context.remember(result.output_dir, task)
         return task, outcome, result
@@ -176,6 +180,8 @@ class ArchiveJobExecutor:
 
         retried_missing_volume = False
         while True:
+            if callable(ensure_input_lease):
+                await ensure_input_lease(task)
             planned_out_dir, terminal = await broker.run(
                 "preflight",
                 file_id,

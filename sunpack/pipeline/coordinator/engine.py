@@ -336,13 +336,18 @@ class _LeasePath:
     ancestor_keys: tuple[str, ...]
     is_dir: bool
     version_row: tuple[str, int, int, int, int] | None
+    missing: bool = False
 
 
 def _snapshot_lease_path(path: str) -> _LeasePath:
     normalized = os.path.abspath(os.path.normpath(path))
     key = path_key(normalized)
+    missing = False
     try:
         stat_result = os.stat(normalized)
+    except FileNotFoundError:
+        stat_result = None
+        missing = True
     except OSError:
         stat_result = None
 
@@ -375,6 +380,7 @@ def _snapshot_lease_path(path: str) -> _LeasePath:
         ancestor_keys=ancestor_keys,
         is_dir=is_dir,
         version_row=version_row,
+        missing=missing,
     )
 
 
@@ -434,7 +440,9 @@ class _PathLeaseRegistry:
             if key in prepared:
                 continue
             existing = self._entries_by_key.get(key)
-            if existing is not None and not refresh:
+            # A missing member may arrive while volume recovery is resolving
+            # the family. Only existing physical inputs have a pinned lifetime.
+            if existing is not None and not refresh and not existing.missing:
                 if existing.path == normalized:
                     prepared[key] = existing
                 else:
@@ -445,12 +453,14 @@ class _PathLeaseRegistry:
                         ancestor_keys=existing.ancestor_keys,
                         is_dir=existing.is_dir,
                         version_row=existing.version_row,
+                        missing=existing.missing,
                     )
                 continue
             prepared[key] = _snapshot_lease_path(normalized)
         return tuple(prepared.values())
 
-    async def acquire(self, owner: str, paths: Iterable[str], *, lease_id: object = None) -> None:
+    async def acquire(self, owner: str, paths: Iterable[str], *, lease_id: object = None) -> tuple[_LeasePath, ...]:
+        paths = tuple(paths)
         prepared = self._snapshot_paths(paths, refresh=False)
         # The caller has finished its previous extraction/verification attempt.
         # Other jobs in this request keep their pins throughout an upgrade.
@@ -468,7 +478,7 @@ class _PathLeaseRegistry:
                     counts = self._pin_counts.setdefault(owner, {})
                     for key in keys:
                         counts[key] = counts.get(key, 0) + 1
-                    return
+                    return prepared
                 # Never wait while retaining an idle partial family. Only paths
                 # still used by sibling jobs or their cleanup remain protected.
                 counts = self._pin_counts.get(owner, {})
@@ -482,6 +492,8 @@ class _PathLeaseRegistry:
                 async with self._lock:
                     self._unregister_waiter(waiter)
                 raise
+            # The prior owner may have consumed these inputs while we waited.
+            prepared = self._snapshot_paths(paths, refresh=True)
 
     def _unpin(self, owner: str, lease_id: object) -> list[str]:
         pins = self._pins.get(owner, {})
@@ -504,6 +516,11 @@ class _PathLeaseRegistry:
             if self._remove_paths(owner, self._unpin(owner, lease_id)):
                 self._wake_waiters_for(owner)
 
+    def holds_lease(self, owner: str, paths: Iterable[str], *, lease_id: object) -> bool:
+        return self._pins.get(owner, {}).get(lease_id) == frozenset(
+            path_key(os.path.abspath(os.path.normpath(path))) for path in paths if path
+        )
+
     async def replace(
         self,
         owner: str,
@@ -524,6 +541,7 @@ class _PathLeaseRegistry:
         physical ownership, the later request can coalesce with the active one
         instead of waiting and extracting the same logical archive twice.
         """
+        paths = tuple(paths)
         prepared = self._snapshot_paths(paths, refresh=coalesce_exact)
         ownership_version = _lease_ownership_version(prepared) if coalesce_exact else ()
         release_previous = True
@@ -556,6 +574,8 @@ class _PathLeaseRegistry:
                 async with self._lock:
                     self._unregister_waiter(waiter)
                 raise
+            prepared = self._snapshot_paths(paths, refresh=True)
+            ownership_version = _lease_ownership_version(prepared) if coalesce_exact else ()
 
     async def release(self, owner: str) -> None:
         async with self._lock:
@@ -1146,7 +1166,12 @@ class _RequestRuntime:
                 pass
 
     def _resolve_missing_volume_once(self, task, _outcome):
-        current_paths = list(task.all_parts or [task.main_path])
+        # A producer may publish a temporary member under its final name.
+        # The live survivors constrain recovery; obsolete names cannot do so.
+        departed = set(task.runtime.get("missing_input_paths") or ())
+        current_paths = [path for path in (task.all_parts or [task.main_path]) if path not in departed]
+        if not current_paths:
+            return None
         format_hint = task.archive_input().format_hint
         scope = task.runtime.get("discovery_scope")
         if scope is None:
@@ -1439,6 +1464,10 @@ class _RequestRuntime:
         retain_watch_lease = False
         task_key = str(task.key or task.main_path)
         try:
+            # Planning and password/metadata probes use the same physical input
+            # lifetime as extraction. A queued old snapshot is checked only
+            # after the previous owner's cleanup has relinquished its lease.
+            await self._ensure_task_lease(task, depth=depth)
             if self.input_planning_stage.requires_analysis(task):
                 planned = await broker.run(
                     "plan", task_key, self._plan_task_isolated, task,
@@ -1570,17 +1599,18 @@ class _RequestRuntime:
             if output_dir:
                 self._shell_updates.add([output_dir])
             return subtree_complete
-        except _CompletedWatchOutput as reused:
-            result = TargetRunResult(
-                input_path=task.main_path, outcome_kind=OutcomeKind.COMPLETE_SUCCESS,
-                task_key=task.key, output_dir=reused.output_dir,
-                verification={"reused_completed_generation": True},
-            )
-            with self.context.lock:
-                self.context.add_target_result(result)
-                self.context.processed_keys.add(task.key)
-            ownership.remember_tasks([task])
-            ownership.remember_results([result])
+        except (_CompletedWatchOutput, _DepartedInput) as reused:
+            if isinstance(reused, _CompletedWatchOutput):
+                result = TargetRunResult(
+                    input_path=task.main_path, outcome_kind=OutcomeKind.COMPLETE_SUCCESS,
+                    task_key=task.key, output_dir=reused.output_dir,
+                    verification={"reused_completed_generation": True},
+                )
+                with self.context.lock:
+                    self.context.add_target_result(result)
+                    self.context.processed_keys.add(task.key)
+                ownership.remember_tasks([task])
+                ownership.remember_results([result])
             active_output = task.runtime.pop("watch_active_output", None)
             if active_output is not None:
                 self.extractor.emit_semantic_event(
@@ -1818,11 +1848,23 @@ class _RequestRuntime:
         task.runtime["nested_output"] = depth > 1
         self.source_cleanup.register([task])
         paths = task.all_parts or [task.main_path]
+        if not task.runtime.get("missing_input_paths") and self.path_leases.holds_lease(
+            self.submission.request_id, paths, lease_id=id(task),
+        ):
+            return
         requested_version = (
             self.path_leases.input_version_for(paths)
             if self.submission.origin == "watch" and depth == 1 and len(paths) > 1 else ()
         )
-        await self.path_leases.acquire(self.submission.request_id, paths, lease_id=id(task))
+        inputs = await self.path_leases.acquire(self.submission.request_id, paths, lease_id=id(task))
+        if task.runtime.get("discovery_scope") is not None:
+            missing = tuple(item.path for item in inputs if item.missing)
+            if missing and len(missing) == len(inputs):
+                raise _DepartedInput
+            if missing:
+                task.runtime["missing_input_paths"] = missing
+            else:
+                task.runtime.pop("missing_input_paths", None)
         if self.submission.origin == "watch" and depth == 1 and len(paths) > 1:
             # A missing-volume retry can replace its input set while awaiting
             # this lease. Check the final physical generation after acquisition.
@@ -1860,6 +1902,10 @@ class _RequestRuntime:
 class _CompletedWatchOutput(Exception):
     def __init__(self, output_dir: str):
         self.output_dir = output_dir
+
+
+class _DepartedInput(Exception):
+    """A discovery proposal was entirely consumed before input admission."""
 
 
 

@@ -12,6 +12,7 @@ from sunpack.pipeline.coordinator.scan_session import DiscoveryScanSession
 from sunpack.pipeline.coordinator.target_scan import build_native_table_for_targets
 from sunpack.pipeline.discovery.embedded.options import EmbeddedOptions
 from sunpack.pipeline.discovery.relations.scheduler import RelationsScheduler
+from sunpack.pipeline.discovery.filesystem.directory_scanner import DirectoryScanner
 
 
 class ArchiveTaskProvider:
@@ -28,6 +29,7 @@ class ArchiveTaskProvider:
             options,
         )
         self._relations = RelationsScheduler(config)
+        self._retry_scan_options = None
         self.failed_candidate_failures: list[FailureInfo] = []
 
     def discover_targets(
@@ -76,8 +78,7 @@ class ArchiveTaskProvider:
         for task in result.resolved_tasks:
             task.runtime["discovery_scope"] = session.scope_for(task.main_path)
             task.runtime["discovery_catalog"] = session.catalog
-            if session.catalog is None:
-                task.runtime["discovery_snapshot"] = session.snapshot_for_directory(session.scope_for(task.main_path).root)
+            task.runtime["discovery_snapshot"] = session.snapshot_for_directory(session.scope_for(task.main_path).root)
         self._record_discovery_failures(result, session)
         return result
 
@@ -161,14 +162,23 @@ class ArchiveTaskProvider:
     def resolve_volume_once(self, current_paths: list[str], scope, *, format_hint: str = "", catalog=None, snapshot=None):
         from sunpack.core.contracts.filesystem import DirectorySnapshot
         from pathlib import Path
+        if not current_paths:
+            return None
+        state = None
         if catalog is not None:
             state, options, _ = catalog
-            filtered, raw = options.catalog_snapshot(state, scope.native, current_paths[0])
-        else:
             if snapshot is None:
-                raise ValueError("Volume retry requires the original discovery snapshot")
-            filtered = snapshot.native_snapshot.relation_bucket(current_paths[0])
-            raw = snapshot.raw_native_snapshot.relation_bucket(current_paths[0])
+                filtered, raw = options.catalog_snapshot(state, scope.native, current_paths[0])
+                snapshot = DirectorySnapshot.from_native(Path(scope.root), filtered, raw)
+        else:
+            if self._retry_scan_options is None:
+                self._retry_scan_options = DirectoryScanner.compile_scan_options(self.config)
+            options = self._retry_scan_options
+        if snapshot is None:
+            raise ValueError("Volume retry requires the original discovery snapshot")
+        filtered, raw = options.refresh_relation_bucket(
+            scope.native, current_paths[0], snapshot.raw_native_snapshot, state,
+        )
         snapshot = DirectorySnapshot.from_native(Path(scope.root), filtered, raw)
         groups = self._relations.build_candidate_groups(snapshot)
         required = set(current_paths)

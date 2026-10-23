@@ -990,6 +990,7 @@ impl NativeDirectorySnapshot {
 #[derive(Clone)]
 struct DirectoryScanOptions {
     scope: Option<crate::scan::scope::NativeDiscoveryScope>,
+    relation_stem: Option<String>,
     patterns: RegexSet,
     prune_dir_names: HashSet<String>,
     prune_dir_patterns: RegexSet,
@@ -1169,6 +1170,7 @@ impl DirectoryScanOptions {
         let (prune_dir_names, prune_dir_patterns) = compile_prune_dirs(prune_dir_globs)?;
         Ok(Self {
             scope: None,
+            relation_stem: None,
             patterns: compile_case_insensitive_regex_set(patterns)?,
             prune_dir_names,
             prune_dir_patterns,
@@ -1357,6 +1359,62 @@ impl NativeDirectoryScanOptions {
         py.detach(|| populate_relation_anchors(&mut raw));
         let (filtered, raw) =
             NativeDirectorySnapshot::from_views(filtered, raw, DirectoryReadErrors::report());
+        Ok((Py::new(py, filtered)?, Py::new(py, raw)?))
+    }
+
+    /// Missing-volume recovery needs a live name inventory, even when Watch
+    /// has not received the arrival event yet. Reuse unchanged native heads.
+    #[pyo3(signature = (scope, seed, previous, state=None))]
+    fn refresh_relation_bucket(
+        &self,
+        py: Python<'_>,
+        scope: &crate::scan::scope::NativeDiscoveryScope,
+        seed: &str,
+        previous: PyRef<'_, NativeDirectorySnapshot>,
+        state: Option<&NativeWatchCatalog>,
+    ) -> PyResult<(Py<NativeDirectorySnapshot>, Py<NativeDirectorySnapshot>)> {
+        let previous = &*previous;
+        let (filtered, raw) = py.detach(|| {
+            let mut scope = scope.clone();
+            if let Some(state) = state {
+                scope.exclude_roots(state.output_roots().into_iter());
+            }
+            let mut options = self.options.clone();
+            options.scope = Some(scope.clone());
+            options.relation_stem = Some(catalog_stem(seed));
+            let mut records = scan_directory_views(&scope.root, scope.max_depth, &options)?;
+            if let Some(state) = state {
+                records.raw.retain(|row| !state.is_owned(&row.path));
+                records.filtered.retain(|row| !state.is_owned(&row.path));
+            }
+            let live_paths: HashSet<&str> = records.raw.iter()
+                .filter(|record| record.relation_member_eligible)
+                .map(|record| record.path.as_str())
+                .collect();
+            let old: HashMap<&str, usize> = previous.rows.iter()
+                .filter(|&&row| live_paths.contains(previous.table.paths[row].as_str()))
+                .map(|&row| (previous.table.paths[row].as_str(), row))
+                .collect();
+            drop(live_paths);
+            for record in &mut records.raw {
+                if !record.relation_member_eligible {
+                    continue;
+                }
+                if let Some(&row) = old.get(record.path.as_str()) {
+                    if record.size.is_some() && record.mtime_ns.is_some()
+                        && record.size == previous.table.sizes[row]
+                        && record.mtime_ns == previous.table.mtimes_ns[row]
+                    {
+                        record.relation_anchor = previous.table.relation_anchors[row]
+                            .as_ref().filter(|anchor| anchor.error.is_empty()).cloned();
+                    }
+                }
+            }
+            populate_relation_anchors(&mut records.raw);
+            Ok::<_, PyErr>(NativeDirectorySnapshot::from_views(
+                records.filtered, records.raw, records.errors,
+            ))
+        })?;
         Ok((Py::new(py, filtered)?, Py::new(py, raw)?))
     }
 
@@ -2827,6 +2885,11 @@ fn scan_directory_impl<const PROFILE: bool>(
                         profile.accepted_entries += 1;
                     }
                 }
+                continue;
+            }
+            if options.relation_stem.as_ref()
+                .is_some_and(|stem| catalog_stem(&path.to_string_lossy()) != *stem)
+            {
                 continue;
             }
 

@@ -58,9 +58,10 @@ class WatchOutputRoots:
             "value": {"path": os.path.abspath(path), "identities": [self._identity(path)]}}], durable=True)
 
     def protected(self, path):
-        with self._lock:
-            root = self.state._native.owned_root(path)
-            return root is not None
+        # NativeWatchState serializes this read with record publication. Admission
+        # already holds the state lock; taking the writer lock here would invert
+        # register/reconcile's lock order. Reservations cover unpublished roots.
+        return self.state._native.owned_root(path) is not None
 
     def reconcile(self, path, *, recursive=False):
         normalized = path_key(path)

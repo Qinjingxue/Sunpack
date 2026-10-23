@@ -151,8 +151,8 @@ def test_collect_result_records_cleanup_and_preserves_zero_byte_files(tmp_path, 
     ]
 
 
-@pytest.mark.parametrize("origin", ["foreground", "watch"])
-def test_async_terminal_cleanup_yields_to_loop_and_finishes_before_watch_event(tmp_path, monkeypatch, origin):
+@pytest.mark.parametrize("origin,output_started", [("foreground", False), ("watch", False), ("watch", True)])
+def test_async_terminal_cleanup_yields_to_loop_and_finishes_before_watch_event(tmp_path, monkeypatch, origin, output_started):
     # Synchronous cleanup tests cannot detect blocking the shared event loop.
     # An event handshake checks responsiveness without a timing benchmark.
     output = tmp_path / "owned-output"
@@ -169,6 +169,8 @@ def test_async_terminal_cleanup_yields_to_loop_and_finishes_before_watch_event(t
     runner.extractor = SimpleNamespace(emit_semantic_event=lambda *a, **kw: semantic.append(kw))
 
     async def extract(*args, **kwargs):
+        if output_started:
+            task.runtime["watch_active_output"] = (task.main_path, str(output))
         return task, outcome
 
     runner._execute_one_async = extract
@@ -198,7 +200,7 @@ def test_async_terminal_cleanup_yields_to_loop_and_finishes_before_watch_event(t
             assert result.outcome_kind == OutcomeKind.FAILURE
             assert not output.exists()
             assert extraction.diagnostics["failed_output_cleanup"]["cleaned"] is True
-            assert len(semantic) == (1 if origin == "watch" else 0)
+            assert len(semantic) == (1 if output_started else 0)
         finally:
             release.set()
             await asyncio.gather(work, return_exceptions=True)

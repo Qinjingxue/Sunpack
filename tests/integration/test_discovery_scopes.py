@@ -24,7 +24,7 @@ from tests.helpers.real_archives import ArchiveFixtureFactory
 
 
 @pytest.mark.parametrize("archive_format", ["7z", "zip", "rar"])
-def test_cross_directory_parts_share_one_scope_and_execute_beside_entry(tmp_path, archive_format, monkeypatch):
+def test_cross_directory_parts_share_one_scope_and_execute_beside_entry(tmp_path, archive_format):
     case = ArchiveFixtureFactory().create(tmp_path / "fixture", "scope", archive_format,
         split=True, payload_size=256 * 1024, split_volume_size=100 * 1024,
         compression_level=0)
@@ -46,10 +46,8 @@ def test_cross_directory_parts_share_one_scope_and_execute_beside_entry(tmp_path
     tasks = provider.scan_targets([str(root)], scan_session=session)
     assert len(tasks) == 1 and set(tasks[0].all_parts) == set(paths)
     task = tasks[0]
-    # The same range must survive the missing-volume retry boundary.
-    with monkeypatch.context() as patch:
-        patch.setattr(DirectoryScanner, "compile_scan_options", lambda *_: pytest.fail("retry re-enumerated its scope"))
-        group = provider.resolve_volume_once([task.main_path], task.runtime["discovery_scope"], format_hint=archive_format, snapshot=task.runtime["discovery_snapshot"])
+    # The live retry must preserve the original recursive discovery range.
+    group = provider.resolve_volume_once([task.main_path], task.runtime["discovery_scope"], format_hint=archive_format, snapshot=task.runtime["discovery_snapshot"])
     assert group is not None and set(group.input_paths) == set(paths)
 
     async def execute():
