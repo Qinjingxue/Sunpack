@@ -311,6 +311,7 @@ class WatchScheduler:
         if self.state.record_password_source_signature(self._password_source_signature):
             self._mark_all_password_failures_dirty()
         self._clipboard_monitor = ClipboardPasswordMonitor(
+            volume_changed=self._notify_watch_volumes,
             enabled=bool(watch_config["clipboard_monitor_enabled"]),
             max_entries=int(watch_config["clipboard_builtin_max_entries"]),
         )
@@ -412,9 +413,36 @@ class WatchScheduler:
         for key in desired:
             if key not in self._observed_watches:
                 try:
+                    if path_key(key[0]) in self.root_entries:
+                        validate_ntfs_watch_roots([key[0]])
                     self._observed_watches[key] = self._observer.schedule(self._watch_handler, key[0], recursive=key[1])
                 except FileNotFoundError:
                     continue  # Its ancestor guard re-arms when it reappears.
+                except (OSError, RuntimeError) as exc:
+                    self.log.write("watch_root_unavailable", root=key[0], error=str(exc))
+
+    def _notify_watch_volumes(self, unitmask, arrived):
+        # The Windows callback only queues existing work; no filesystem IO here.
+        with self._lock:
+            if self._closed:
+                return
+            roots = []
+            for root in self.watch_roots:
+                drive = os.path.splitdrive(root)[0]
+                if unitmask:
+                    letter = drive[-2:-1].upper()
+                    if not drive.endswith(":") or not ("A" <= letter <= "Z"):
+                        continue
+                    if not (unitmask & (1 << (ord(letter) - ord("A")))):
+                        continue
+                elif (root, self.root_entries[path_key(root)].recursive) in self._observed_watches:
+                    continue
+                roots.append(root)
+            self._watch_rearm.update(roots)
+            if arrived:
+                self._directory_pending.update(roots)
+        if roots:
+            self._wake_service()
 
     def _queue_watch_rearm(self, path):
         if any(_paths_match(root, path, recursive=True) for root in self.watch_roots):

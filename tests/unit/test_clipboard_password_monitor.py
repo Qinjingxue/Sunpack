@@ -46,6 +46,8 @@ def test_windows_clipboard_loop_reads_current_clipboard_after_listener_registrat
             return False
 
     class FakeMonitor:
+        enabled = True
+        volume_changed = None
         _stop_event = FakeStopEvent()
         _hwnd = None
 
@@ -101,7 +103,7 @@ def test_windows_clipboard_loop_does_not_create_window_after_class_registration_
             return 123
 
     loop = object.__new__(_WindowsClipboardLoop)
-    loop.monitor = object()
+    loop.monitor = ClipboardPasswordMonitor()
     loop.user32 = FakeUser32()
     loop.kernel32 = FakeKernel32()
     loop.class_name = "test-class"

@@ -1278,12 +1278,20 @@ class WatchStateStore:
 
     def prune_missing_records(self, path: str | None = None, *, recursive: bool = False) -> int:
         """Remove proven missing blockers in one scope, preserving recovery."""
+        from sunpack.runtime.watch.roots import watch_path_available
         with self._state_lock:
-            entry_keys = [
-                key
+            availability = {}
+            missing = [
+                (key, recorded_path)
                 for key, recorded_path in self._native.entry_paths(path, recursive)
-                if self.file_presence(recorded_path) is False
+                if watch_path_available(recorded_path, self.scopes, availability=availability)
+                and _recorded_file_presence(recorded_path) is False
             ]
+            # Share observations only within each pass. A root can disappear
+            # during the file checks; never publish deletes using the old pass.
+            availability.clear()
+            entry_keys = [key for key, recorded_path in missing
+                          if watch_path_available(recorded_path, self.scopes, availability=availability)]
             self._commit_operations_locked([
                 self._delete_operation("entries", key)
                 for key in entry_keys

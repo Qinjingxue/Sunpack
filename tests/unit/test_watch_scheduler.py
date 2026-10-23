@@ -265,6 +265,91 @@ def test_watch_guards_follow_the_nearest_existing_parent_and_filter_siblings(tmp
         watcher._close_blocking()
 
 
+def test_volume_arrival_attaches_real_directory_watch_without_an_existing_parent(tmp_path):
+    """Manual directory callbacks cannot prove recovery of a completely absent drive.
+
+    Without this, volume dispatch could silently miss reattachment or leak its window.
+    A temporary DOS drive exercises the real window and ReadDirectoryChangesW without
+    physical media, admin rights, polling, or extra archive fixtures.
+    """
+    import ctypes
+    from ctypes import wintypes
+    from sunpack.core.passwords.internal.clipboard_monitor import DEV_BROADCAST_VOLUME, _WindowsClipboardLoop
+    kernel, user32 = ctypes.windll.kernel32, ctypes.windll.user32
+    kernel.GetLogicalDrives.restype = wintypes.DWORD
+    kernel.DefineDosDeviceW.argtypes = [wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR]
+    kernel.DefineDosDeviceW.restype = wintypes.BOOL
+    user32.SendMessageW.argtypes = [wintypes.HWND, wintypes.UINT, ctypes.c_size_t, ctypes.c_void_p]
+    user32.SendMessageW.restype = ctypes.c_ssize_t
+    user32.IsWindow.argtypes = [wintypes.HWND]
+    drive_index = next((index for index in range(25, 15, -1) if not kernel.GetLogicalDrives() & (1 << index)), None)
+    if drive_index is None:
+        pytest.skip("no unused temporary drive letter")
+    drive = chr(ord("A") + drive_index) + ":"
+    backing = tmp_path / "volume"
+    target = "\\??\\" + str(backing)
+    if not kernel.DefineDosDeviceW(0x1 | 0x8, drive, target):
+        pytest.skip("temporary DOS drive mapping is unavailable")
+    mapped = True
+    watcher = None
+    try:
+        root = drive + "\\input"
+        assert not os.path.isdir(drive + "\\")
+        watcher = _watcher(tmp_path, roots=[root])
+        ready, seen = threading.Event(), threading.Event()
+        callback = watcher._clipboard_monitor.volume_changed
+
+        def volume_changed(mask, arrived):
+            callback(mask, arrived)
+            ready.set()
+
+        watcher._clipboard_monitor.volume_changed = volume_changed
+        _await(watcher.start())
+        assert ready.wait(5), "volume listener did not start with clipboard disabled"
+        hwnd = watcher._clipboard_monitor._hwnd
+        _await(watcher.run_once())  # Consume the one-time startup recheck while offline.
+        assert not any(os.path.splitdrive(path)[0] == drive for path, _ in watcher._observed_watches)
+        Path(root).mkdir(parents=True)
+        volume = DEV_BROADCAST_VOLUME()
+        volume.dbch_size = ctypes.sizeof(volume)
+        volume.dbch_devicetype = _WindowsClipboardLoop.DBT_DEVTYP_VOLUME
+        volume.dbcv_unitmask = 1 << ((drive_index + 1) % 26)
+        user32.SendMessageW(hwnd, _WindowsClipboardLoop.WM_DEVICECHANGE,
+                            _WindowsClipboardLoop.DBT_DEVICEARRIVAL, ctypes.addressof(volume))
+        assert not watcher._watch_rearm  # Unrelated drives cannot trigger a rescan.
+        volume.dbcv_unitmask = 1 << drive_index
+        user32.SendMessageW(hwnd, _WindowsClipboardLoop.WM_DEVICECHANGE,
+                            _WindowsClipboardLoop.DBT_DEVICEARRIVAL, ctypes.addressof(volume))
+        assert watcher._watch_rearm == {root}
+        _await(watcher.run_once())
+        assert (root, False) in watcher._observed_watches
+        assert any(emitter.watch.path == root and emitter.is_alive() for emitter in watcher._observer.emitters)
+        source = str(Path(root) / "arrived.blob")
+        watcher.enqueue = lambda path, **kwargs: seen.set() if path == source else None
+        Path(source).write_bytes(b"source")
+        assert seen.wait(5), "the reattached observer did not receive filesystem events"
+        assert kernel.DefineDosDeviceW(0x1 | 0x2 | 0x4 | 0x8, drive, target)
+        mapped = False
+        user32.SendMessageW(hwnd, _WindowsClipboardLoop.WM_DEVICECHANGE,
+                            _WindowsClipboardLoop.DBT_DEVICEREMOVECOMPLETE, ctypes.addressof(volume))
+        _await(watcher.run_once())
+        assert (root, False) not in watcher._observed_watches
+        assert kernel.DefineDosDeviceW(0x1 | 0x8, drive, target)
+        mapped = True
+        user32.SendMessageW(hwnd, _WindowsClipboardLoop.WM_DEVICECHANGE,
+                            _WindowsClipboardLoop.DBT_DEVICEARRIVAL, ctypes.addressof(volume))
+        _await(watcher.run_once())
+        assert (root, False) in watcher._observed_watches
+        _await(watcher.aclose())
+        watcher = None
+        assert not user32.IsWindow(hwnd)
+    finally:
+        if watcher is not None:
+            _await(watcher.aclose())
+        if mapped:
+            assert kernel.DefineDosDeviceW(0x1 | 0x2 | 0x4 | 0x8, drive, target)
+
+
 def test_watch_scheduler_prunes_missing_state_before_start(tmp_path, monkeypatch):
     monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
     watch_root = tmp_path / "watch"

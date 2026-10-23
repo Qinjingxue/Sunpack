@@ -19,15 +19,17 @@ class ClipboardPasswordMonitor:
         *,
         max_entries: int = 30,
         enabled: bool = True,
+        volume_changed=None,
     ):
         self.max_entries = max(1, int(max_entries))
         self.enabled = bool(enabled)
+        self.volume_changed = volume_changed
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
         self._hwnd = None
 
     def start(self) -> None:
-        if not self.enabled or self._thread is not None:
+        if (not self.enabled and self.volume_changed is None) or self._thread is not None:
             return
         self._stop_event.clear()
         self._thread = threading.Thread(target=self._run_windows_loop, name="sunpack-clipboard-monitor", daemon=True)
@@ -64,6 +66,10 @@ class _WindowsClipboardLoop:
     WM_CLIPBOARDUPDATE = 0x031D
     WM_CLOSE = 0x0010
     WM_DESTROY = 0x0002
+    WM_DEVICECHANGE = 0x0219
+    DBT_DEVICEARRIVAL = 0x8000
+    DBT_DEVICEREMOVECOMPLETE = 0x8004
+    DBT_DEVTYP_VOLUME = 2
     HWND_MESSAGE = ctypes.c_void_p(-3)
 
     def __init__(self, monitor: ClipboardPasswordMonitor):
@@ -93,6 +99,8 @@ class _WindowsClipboardLoop:
         self.user32.CreateWindowExW.restype = wintypes.HWND
         self.user32.DefWindowProcW.argtypes = [wintypes.HWND, wintypes.UINT, WPARAM, LPARAM]
         self.user32.DefWindowProcW.restype = LRESULT
+        self.user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, WPARAM, LPARAM]
+        self.user32.PostMessageW.restype = wintypes.BOOL
         self.class_name = f"SunpackClipboardPasswordMonitor_{id(self):x}"
         self._wndproc_ref = None
         self._hinstance = None
@@ -105,14 +113,21 @@ class _WindowsClipboardLoop:
         self.monitor._hwnd = hwnd
         listener_registered = False
         try:
-            listener_registered = bool(self.user32.AddClipboardFormatListener(hwnd))
-            if not listener_registered:
+            if self.monitor._stop_event.is_set():
                 return
+            if self.monitor.enabled:
+                listener_registered = bool(self.user32.AddClipboardFormatListener(hwnd))
+                if not listener_registered and self.monitor.volume_changed is None:
+                    return
             # Close the startup race between launching the watch service and
             # registering for clipboard notifications.  A copy made during that
             # window does not produce another WM_CLIPBOARDUPDATE, so read the
             # current clipboard once after the listener is active.
-            self.monitor._handle_clipboard_update()
+            if listener_registered:
+                self.monitor._handle_clipboard_update()
+            if self.monitor.volume_changed is not None:
+                # Recheck roots missed before this window began receiving broadcasts.
+                self.monitor.volume_changed(0, True)
             msg = wintypes.MSG()
             while not self.monitor._stop_event.is_set():
                 result = self.user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
@@ -151,7 +166,7 @@ class _WindowsClipboardLoop:
             0,
             0,
             0,
-            self.HWND_MESSAGE,
+            None if self.monitor.volume_changed is not None else self.HWND_MESSAGE,
             None,
             self._hinstance,
             None,
@@ -169,9 +184,18 @@ class _WindowsClipboardLoop:
             self._wndproc_ref = None
 
     def _wndproc(self, hwnd, msg, wparam, lparam):
-        if msg == self.WM_CLIPBOARDUPDATE:
+        if msg == self.WM_CLIPBOARDUPDATE and self.monitor.enabled:
             self.monitor._handle_clipboard_update()
             return 0
+        if (msg == self.WM_DEVICECHANGE and self.monitor.volume_changed is not None and lparam
+                and wparam in {self.DBT_DEVICEARRIVAL, self.DBT_DEVICEREMOVECOMPLETE}):
+            header = ctypes.cast(lparam, ctypes.POINTER(DEV_BROADCAST_HDR)).contents
+            if (header.dbch_devicetype == self.DBT_DEVTYP_VOLUME
+                    and header.dbch_size >= ctypes.sizeof(DEV_BROADCAST_VOLUME)):
+                volume = ctypes.cast(lparam, ctypes.POINTER(DEV_BROADCAST_VOLUME)).contents
+                if volume.dbcv_unitmask:
+                    self.monitor.volume_changed(volume.dbcv_unitmask, wparam == self.DBT_DEVICEARRIVAL)
+            return 1
         if msg in {self.WM_CLOSE, self.WM_DESTROY}:
             self.user32.PostQuitMessage(0)
             return 0
@@ -191,3 +215,13 @@ class WNDCLASS(ctypes.Structure):
         ("lpszMenuName", wintypes.LPCWSTR),
         ("lpszClassName", wintypes.LPCWSTR),
     ]
+
+
+class DEV_BROADCAST_HDR(ctypes.Structure):
+    _fields_ = [("dbch_size", wintypes.DWORD), ("dbch_devicetype", wintypes.DWORD),
+                ("dbch_reserved", wintypes.DWORD)]
+
+
+class DEV_BROADCAST_VOLUME(ctypes.Structure):
+    _fields_ = DEV_BROADCAST_HDR._fields_ + [
+        ("dbcv_unitmask", wintypes.DWORD), ("dbcv_flags", wintypes.WORD)]

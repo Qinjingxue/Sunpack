@@ -1,4 +1,5 @@
 import json
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from pathlib import Path
@@ -700,6 +701,57 @@ def test_prune_missing_records_retains_records_when_presence_is_unknown(tmp_path
     assert state.prune_missing_records() == 0
     assert state.latest_entry_for_path(str(archive)) is not None
     assert state.mark(str(archive), 1, 1.0, status="failed_password")
+
+
+def test_pruning_shares_root_checks_but_revalidates_each_batch_before_deleting(tmp_path, monkeypatch):
+    """Single-entry outage tests miss repeated IO and loss during a batch.
+
+    Removing this leaves both faults uncovered. One small batch verifies offline
+    skipping, mid-batch outage, and a later successful cleanup without timing waits.
+    """
+    from sunpack.core.contracts.discovery_scope import DiscoveryScope
+    root, hidden = tmp_path / "input", tmp_path / "offline"
+    root.mkdir()
+    state = WatchStateStore(str(tmp_path / "state.json"), scopes=(DiscoveryScope(str(root)),))
+    for index in range(64):
+        source = root / f"part.{index:03d}"
+        source.touch()
+        state.mark(str(source), 0, 1.0, status="suspended_missing_volume")
+        source.unlink()
+    presence, isdir = watch_state_module._recorded_file_presence, os.path.isdir
+    checked_files, checked_roots = [], []
+    interrupt = False
+
+    def file_presence(path):
+        nonlocal interrupt
+        checked_files.append(path)
+        if interrupt:
+            interrupt = False
+            root.rename(hidden)
+        return presence(path)
+
+    def root_available(path):
+        if path == str(root):
+            checked_roots.append(path)
+        return isdir(path)
+
+    monkeypatch.setattr(watch_state_module, "_recorded_file_presence", file_presence)
+    monkeypatch.setattr(os.path, "isdir", root_available)
+    try:
+        root.rename(hidden)
+        assert state.prune_missing_records() == 0
+        assert not checked_files and len(checked_roots) == 1
+        hidden.rename(root)
+        checked_roots.clear()
+        interrupt = True
+        assert state.prune_missing_records() == 0
+        assert state.entry_count == 64 and len(checked_roots) == 2
+        hidden.rename(root)
+        checked_roots.clear()
+        assert state.prune_missing_records() == 64
+        assert len(checked_roots) == 2
+    finally:
+        state.close()
 
 
 def test_scope_retirement_persists_without_losing_pending_output_recovery(tmp_path):

@@ -6,12 +6,22 @@ from sunpack.core.contracts.discovery_scope import DiscoveryScope
 from sunpack.core.support.path_keys import path_key, path_key_is_under
 
 
-def watch_path_available(path, scopes):
+def watch_path_available(path, scopes, *, availability=None):
     """A missing path is conclusive only while its configured roots are accessible."""
     key = path_key(path)
-    return all(os.path.isdir(scope.root) for scope in scopes
-               if path_key_is_under(key, path_key(scope.root))
-               or path_key_is_under(path_key(scope.root), key))
+    for scope in scopes:
+        root_key = path_key(scope.root)
+        if not (path_key_is_under(key, root_key) or path_key_is_under(root_key, key)):
+            continue
+        if availability is None:
+            available = os.path.isdir(scope.root)
+        else:
+            if root_key not in availability:
+                availability[root_key] = os.path.isdir(scope.root)
+            available = availability[root_key]
+        if not available:
+            return False
+    return True
 
 
 @dataclass(frozen=True)
