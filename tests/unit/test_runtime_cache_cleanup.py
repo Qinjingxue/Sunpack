@@ -223,17 +223,22 @@ def test_failed_wal_retirement_schedules_one_idle_retry(tmp_path, monkeypatch, s
         try:
             watcher.state.queue_active(WatchCandidate(str(tmp_path / "archive.bin"), 1, 1.0), durable=True)
             covered = watcher.state.journal_path
+            orphan = tmp_path / (".state.json." + "c" * 32 + ".tmp")
+            orphan.write_text("interrupted snapshot", encoding="utf-8")
             real_unlink = Path.unlink
             blocked = True
             def unlink(path, *args, **kwargs):
-                if path == covered and blocked:
+                if path in (covered, orphan) and blocked:
                     raise PermissionError("simulated sharing violation")
                 return real_unlink(path, *args, **kwargs)
             monkeypatch.setattr(Path, "unlink", unlink)
             watcher.state.save()
             assert wake.wait(2)
+            assert orphan.exists()
             assert watcher.next_delay_seconds() == 10.0
             blocked = still_blocked
+            monkeypatch.setattr(watcher.state, "_write_snapshot_view",
+                lambda _view: pytest.fail("idle retirement must not rewrite the snapshot"))
             wake.clear()
             now[0] = 110.0
             await watcher.run_once()
@@ -242,6 +247,7 @@ def test_failed_wal_retirement_schedules_one_idle_retry(tmp_path, monkeypatch, s
                     lambda: not watcher.state._checkpoint_running, timeout=2,
                 )
             assert covered.exists() is still_blocked
+            assert orphan.exists() is still_blocked
             assert watcher.next_delay_seconds() is None
             assert not wake.is_set()
         finally:
@@ -372,6 +378,7 @@ def test_external_activity_resets_and_rearms_idle_cleanup(tmp_path):
 
 def test_idle_maintenance_expires_cli_mode_when_cache_cleanup_is_disabled(tmp_path):
     from sunpack.runtime.cli.runtime_state import set_runtime_host
+    from sunpack.runtime.watch.scanner import WatchCandidate
 
     async def scenario():
         engine = _CleanupOnlyEngine()
@@ -392,6 +399,11 @@ def test_idle_maintenance_expires_cli_mode_when_cache_cleanup_is_disabled(tmp_pa
         host = RuntimeHost()
         set_runtime_host(host)
         try:
+            recovering = tmp_path / "old-scope" / "archive.bin"
+            recovering.parent.mkdir()
+            recovering.touch()
+            watcher.state.mark(str(recovering), 1, 1.0, status="failed_password")
+            watcher.state.queue_active(WatchCandidate(str(recovering), 1, 1.0), durable=True)
             await host._set_configured_process_mode({"runtime": {"process_mode": "background"}})
             await host.set_cli_process_mode_override("high")
             assert host.process_mode == "high"
@@ -403,8 +415,16 @@ def test_idle_maintenance_expires_cli_mode_when_cache_cleanup_is_disabled(tmp_pa
             assert host.process_mode == "background"
             assert host._cli_process_mode_override is None
             assert engine.clear_calls == 0
+            assert watcher.state.latest_entry_for_path(str(recovering)) is not None
+            watcher.state.complete_work([str(recovering)])
+            watcher._cache_cleanup_deadline = 0
+            await watcher._maybe_clear_idle_caches()
+            assert watcher.state.latest_entry_for_path(str(recovering)) is None
+            assert recovering.exists()
+            assert engine.clear_calls == 0
         finally:
             set_runtime_host(None)
+            watcher._close_blocking()
 
     asyncio.run(scenario())
 

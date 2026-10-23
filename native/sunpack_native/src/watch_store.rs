@@ -11,7 +11,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -399,6 +399,77 @@ impl NativeWatchState {
 
     fn has_entry(&self, path: &str) -> bool {
         self.lock().entries.contains_key(&path_key(path))
+    }
+
+    /// Configuration retirement only visits resident state, never file-index rows.
+    fn unused_scope_keys(
+        &self,
+        py: Python<'_>,
+        scopes: Vec<Py<crate::scan::scope::NativeDiscoveryScope>>,
+    ) -> (Vec<String>, Vec<String>) {
+        let scopes: Vec<_> = scopes
+            .iter()
+            .map(|scope| scope.borrow(py).clone())
+            .collect();
+        py.detach(|| {
+            let data = self.lock();
+            let recovery_paths: Vec<_> = data
+                .pending
+                .values()
+                .flat_map(|record| {
+                    record
+                        .active_outputs
+                        .keys()
+                        .chain(record.active_outputs.values())
+                        .chain(record.committed_roots.iter())
+                        .map(|path| path_key(path))
+                })
+                .collect();
+            let entries = data
+                .entries
+                .iter()
+                .filter(|(key, record)| {
+                    !scopes.iter().any(|scope| scope.contains(&record.path))
+                        && !data.pending.contains_key(*key)
+                        && !recovery_paths
+                            .iter()
+                            .any(|root| *key == root || is_path_under(key, root))
+                })
+                .map(|(key, _)| key.clone())
+                .collect();
+            if data.cursors.is_empty() {
+                return (entries, Vec::new());
+            }
+
+            // Resolve each root/recovery directory once using the existing
+            // volume resolver. An inaccessible volume is not proof of disuse.
+            let directories: HashSet<_> = scopes
+                .iter()
+                .map(|scope| scope.root.as_str())
+                .chain(data.pending.values().map(|record| {
+                    Path::new(&record.path)
+                        .parent()
+                        .and_then(Path::to_str)
+                        .unwrap_or(&record.path)
+                }))
+                .collect();
+            let mut volumes = HashSet::new();
+            for directory in directories {
+                match crate::filesystem::resolve_output_volume_key(directory) {
+                    Ok(Some(volume)) => {
+                        volumes.insert(volume.to_lowercase());
+                    }
+                    _ => return (entries, Vec::new()),
+                }
+            }
+            let cursors = data
+                .cursors
+                .keys()
+                .filter(|key| !volumes.contains(*key))
+                .cloned()
+                .collect();
+            (entries, cursors)
+        })
     }
 
     /// Missing-only retirement keeps durable output recovery, even under a removed directory.

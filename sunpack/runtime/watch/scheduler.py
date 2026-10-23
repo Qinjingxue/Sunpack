@@ -220,7 +220,7 @@ class WatchScheduler:
             os.path.abspath(str(self.state.journal_path)),
             os.path.abspath(str(log_path)),
             *(os.path.abspath(str(Path(state_path).with_name(name))) for name in
-              ("catalog.snapshot", "catalog.snapshot.tmp", "catalog.wal")),
+              ("catalog.snapshot", "catalog.snapshot.tmp", "catalog.wal", "catalog.lock")),
         }
         self._lock = threading.Lock()
         # Publish claims and observation generations under one short gate.
@@ -341,6 +341,7 @@ class WatchScheduler:
             raise RuntimeError("Watch scheduler is closed")
         if self._started:
             return
+        self.state.retain_scopes(self.scopes.values())
         self._prepare_usn_startup_baseline()
         removed_entries = self.state.prune_missing_records()
         if removed_entries:
@@ -1166,6 +1167,12 @@ class WatchScheduler:
                 self._external_activity_gate_held = False
                 self._runtime_cache_gate.release()
 
+    def _maintain_persistent_state(self) -> None:
+        self._catalog.commit(True)
+        # Recovery preserved during a root change may have completed since
+        # startup. Retire only resident state, not the file index.
+        self.state.retain_scopes(self.scopes.values())
+
     async def _maybe_clear_idle_caches(self) -> None:
         # Log expiry is independent of pipeline/foreground activity. Its exact
         # deadline also wakes Watch when all events were ignored.
@@ -1203,7 +1210,7 @@ class WatchScheduler:
             for path in tuple(self._quiet_trackers):
                 self._retire_quiet_tracker(path)
             await self.pipeline_engine.work_broker.run(
-                "catalog_maintenance", "watch", self._catalog.commit, True, request_id="watch", origin="watch",
+                "catalog_maintenance", "watch", self._maintain_persistent_state, request_id="watch", origin="watch",
             )
             if not self.runtime_cache_cleanup_enabled:
                 return

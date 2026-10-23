@@ -64,10 +64,24 @@ pub(super) struct CatalogStore {
     pending: Vec<u8>,
     pending_deltas: usize,
     pub stamps: HashMap<String, Stamp>,
+    // Drop after the writer handle. Windows also removes this file on a crash.
+    _ownership: File,
 }
 impl CatalogStore {
     pub fn open(folder: &Path, catalogs: &mut HashMap<String, ScopeCatalog>) -> io::Result<Self> {
         fs::create_dir_all(folder)?;
+        let mut options = fs::OpenOptions::new();
+        options.read(true).write(true).create(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            options.share_mode(0).custom_flags(0x04000000); // FILE_FLAG_DELETE_ON_CLOSE
+        }
+        let ownership = options.open(folder.join("catalog.lock"))?;
+        #[cfg(not(windows))]
+        ownership.try_lock()?;
+        // Only the owner may touch a checkpoint interrupted before publication.
+        let _ = fs::remove_file(folder.join("catalog.snapshot.tmp"));
         let mut store = Self {
             folder: folder.to_owned(),
             stream: folder.join("catalog.wal").to_string_lossy().into_owned(),
@@ -79,6 +93,7 @@ impl CatalogStore {
             pending: Vec::new(),
             pending_deltas: 0,
             stamps: HashMap::new(),
+            _ownership: ownership,
         };
         let load = (|| -> io::Result<()> {
             let snapshot = folder.join("catalog.snapshot");
@@ -144,6 +159,12 @@ impl CatalogStore {
                 if path.exists() {
                     fs::remove_file(path)?;
                 }
+            }
+        } else if store.snapshot_bytes != 0 && store.edits == 0 {
+            // Successful replay proved that every complete transaction was
+            // already covered. Do not rewrite an unchanged snapshot to retire it.
+            if fs::remove_file(folder.join("catalog.wal")).is_ok() {
+                store.wal_bytes = 0;
             }
         }
         store.handle = Some(
@@ -245,6 +266,16 @@ impl CatalogStore {
             || (idle
                 && self.edits >= 1024
                 && self.wal_bytes >= self.snapshot_bytes.max(MIN_CHECKPOINT_BYTES))
+    }
+}
+
+impl Drop for CatalogStore {
+    fn drop(&mut self) {
+        if let Some(mut handle) = self.handle.take() {
+            // The writer must release its stream before another owner loads
+            // and retires the WAL. Drop of a bare stream queues this asynchronously.
+            let _ = watch_journal::close_cache(&mut handle);
+        }
     }
 }
 

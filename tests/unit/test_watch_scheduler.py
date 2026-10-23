@@ -271,6 +271,9 @@ def test_watch_scheduler_prunes_missing_state_before_start(tmp_path, monkeypatch
     watch_root.mkdir()
     state_path = tmp_path / ".sunpack_watch" / "state.json"
     stale_path = tmp_path / "gone.zip"
+    stale_path.touch()
+    unwatched_path = tmp_path / "still-present.zip"
+    unwatched_path.touch()
 
     persisted = WatchStateStore(str(state_path))
     persisted.mark(
@@ -280,7 +283,10 @@ def test_watch_scheduler_prunes_missing_state_before_start(tmp_path, monkeypatch
         status="failed_password",
         failure_payload={"blockers": ["password"]},
     )
+    persisted.mark(str(unwatched_path), 1, 1.0, status="failed_password")
+    stale_path.unlink()
     persisted.save()
+    persisted.close()
 
     watcher = WatchScheduler(
         make_config({"watch": {"clipboard_monitor_enabled": False}}),
@@ -294,9 +300,14 @@ def test_watch_scheduler_prunes_missing_state_before_start(tmp_path, monkeypatch
     try:
         assert not watcher.state.entries
         reloaded = WatchStateStore(str(state_path))
-        assert not reloaded.entries
+        try:
+            assert not reloaded.entries
+            assert unwatched_path.exists()
+        finally:
+            reloaded.close()
     finally:
         watcher._stop_blocking()
+        watcher._close_blocking()
 
 
 class WatchClock:

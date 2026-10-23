@@ -645,6 +645,7 @@ class WatchService:
         await self._stop_scheduler()
         roots = self.roots
         if not roots:
+            await asyncio.to_thread(self._retire_unwatched_state)
             self._stop_toast_host()
             self.log.write("scheduler_not_started", reason="no_existing_roots", configured_roots=[entry.input_root for entry in self.service_config["root_entries"]])
             return
@@ -716,6 +717,23 @@ class WatchService:
             root_outputs=self.root_outputs,
             state_path=state_path,
         )
+
+    def _retire_unwatched_state(self) -> None:
+        # Removing the last root has no successor scheduler to retire state.
+        # Reuse its stores without starting observers or forcing task snapshots.
+        if not Path(self.state_dir).is_dir():
+            return
+        from sunpack_native import NativeWatchCatalog
+        from sunpack.runtime.watch.state import WatchStateStore
+
+        state = WatchStateStore(os.path.join(self.state_dir, SERVICE_STATE))
+        try:
+            state.retain_scopes(())
+            catalog = NativeWatchCatalog(state._native, self.state_dir)
+            catalog.retain_roots([])
+            catalog.close()
+        finally:
+            state.close()
 
     async def _stop_scheduler(self) -> None:
         try:

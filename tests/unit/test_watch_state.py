@@ -702,6 +702,66 @@ def test_prune_missing_records_retains_records_when_presence_is_unknown(tmp_path
     assert state.mark(str(archive), 1, 1.0, status="failed_password")
 
 
+def test_scope_retirement_persists_without_losing_pending_output_recovery(tmp_path):
+    # Missing-file pruning cannot retire still-present inputs removed from
+    # configuration, and must not erase the recovery queue or its output blockers.
+    from sunpack.core.contracts.discovery_scope import DiscoveryScope
+    from sunpack_native import resolve_output_volume_key
+
+    retained, removed = tmp_path / "retained", tmp_path / "removed"
+    retained.mkdir()
+    removed.mkdir()
+    output = tmp_path / "partial-output"
+    output.mkdir()
+    kept = retained / "kept.bin"
+    abandoned = removed / "abandoned.001"
+    owner = removed / "recover.bin"
+    nested = output / "nested.bin"
+    for path in (kept, abandoned, owner, nested):
+        path.touch()
+    state_path = tmp_path / "state.json"
+    state = WatchStateStore(str(state_path))
+    volume = resolve_output_volume_key(str(retained)).lower()
+    for path in (kept, abandoned, owner, nested):
+        state.mark(str(path), 1, 1.0, status="suspended_missing_volume")
+    state.queue_active(_candidate(owner), durable_owner=True, durable=True)
+    state.record_task_output_started(str(owner), str(owner), str(output))
+    state.merge_watch_cursors({volume: {"journal_id": 1, "next_usn": 2},
+        "unused-volume": {"journal_id": 3, "next_usn": 4}})
+    try:
+        unavailable = DiscoveryScope(r"\\?\Volume{00000000-0000-0000-0000-000000000000}\input")
+        state.retain_scopes([DiscoveryScope(str(retained)), unavailable])
+        assert set(state.watch_cursor_snapshot()) == {volume, "unused-volume"}
+        state.retain_scopes([DiscoveryScope(str(retained))])
+        assert {entry.path for entry in state.entry_items()} == set(map(str, (kept, owner, nested)))
+        assert set(state.watch_cursor_snapshot()) == {volume}
+        seq = state.applied_seq
+        state.retain_scopes([DiscoveryScope(str(retained))])
+        assert state.applied_seq == seq
+        assert not state_path.exists()
+    finally:
+        state.close()
+    state = WatchStateStore(str(state_path))
+    try:
+        assert state.latest_entry_for_path(str(abandoned)) is None
+        assert state.pending_work_for_path(str(owner)).active_outputs == {str(owner): str(output)}
+        state.retain_scopes(())
+        assert {entry.path for entry in state.entry_items()} == {str(owner), str(nested)}
+        assert set(state.watch_cursor_snapshot()) == {volume}
+        state.complete_work([str(owner)], durable=True)
+        state.retain_scopes(())
+        assert state.entry_count == state.pending_work_count == 0
+        assert not state.watch_cursor_snapshot()
+    finally:
+        state.close()
+    state = WatchStateStore(str(state_path))
+    try:
+        assert state.entry_count == state.pending_work_count == 0
+        assert not state.watch_cursor_snapshot()
+    finally:
+        state.close()
+
+
 def test_native_checkpoint_round_trips_nested_unicode_payload(tmp_path):
     state_path = tmp_path / "state.json"
     archive = tmp_path / "雪-special.zip"

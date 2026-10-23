@@ -749,6 +749,54 @@ def test_watch_service_scheduler_receives_root_outputs(tmp_path, monkeypatch):
     }
 
 
+def test_removing_last_root_retires_state_without_a_successor_scheduler(tmp_path, monkeypatch):
+    # Scheduler-only retention never runs when the last configured root is
+    # removed. Exercise the service branch against real native state/cache files.
+    import json
+    from sunpack.core.contracts.discovery_scope import DiscoveryScope
+    from sunpack.pipeline.discovery.filesystem.directory_scanner import DirectoryScanner
+    from sunpack.runtime.watch.state import WatchStateStore
+    from sunpack_native import NativeWatchCatalog
+
+    root, folder = tmp_path / "input", tmp_path / "state"
+    root.mkdir()
+    folder.mkdir()
+    for index in range(128):
+        (root / f"part.{index:03d}").touch()
+    state_path = folder / "state.json"
+    state = WatchStateStore(str(state_path))
+    catalog = NativeWatchCatalog(state._native, str(folder))
+    scope = DiscoveryScope(str(root), recursive=True)
+    options = DirectoryScanner.compile_scan_options({"filesystem": {"scan_filters_enabled": False}})
+    assert not options.catalog_update(catalog, scope.native)
+    catalog.close()
+    state.mark(str(root / "part.000"), 1, 1.0, status="failed_password")
+    state.merge_watch_cursors({"old-volume": {"journal_id": 1, "next_usn": 2}})
+    state.close()
+    snapshot = folder / "catalog.snapshot"
+    original_bytes = snapshot.stat().st_size
+    monkeypatch.setattr(service_module, "watch_roots_path", lambda: tmp_path / "roots.txt")
+    monkeypatch.setattr(service_module, "load_config", lambda: make_config({
+        "watch": {"roots": [], "state_dir": str(folder), "tray_enabled": False},
+    }))
+    service = WatchService(engine_factory=lambda _config: pytest.fail("no scheduler is needed"))
+    _await(service._start_scheduler())
+    assert service.scheduler is None
+    state = WatchStateStore(str(state_path))
+    try:
+        assert state.entry_count == 0
+        assert not state.watch_cursor_snapshot()
+        assert not state_path.exists()
+        assert snapshot.stat().st_size < original_bytes // 4
+        payload = json.loads(snapshot.read_text(encoding="utf-8"))
+        assert payload["rows"] == payload["stamps"] == {}
+    finally:
+        state.close()
+    mtime = snapshot.stat().st_mtime_ns
+    _await(service._start_scheduler())
+    assert snapshot.stat().st_mtime_ns == mtime
+
+
 def test_default_watch_state_uses_program_directory_and_output_stays_relative(tmp_path, monkeypatch):
     program_dir = tmp_path / "program"
     working_dir = tmp_path / "windows-system-directory"

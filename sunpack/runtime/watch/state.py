@@ -10,6 +10,7 @@ from typing import Any, Callable, Iterable
 
 from sunpack.core.support.path_keys import case_key, absolute_path_key, path_key_is_under
 from sunpack_native import NativeWatchState, watch_path_key
+from sunpack.core.platform.windows.file_mutex import file_mutex
 
 from sunpack.runtime.watch.journal_commit import (
     JournalTicket,
@@ -519,6 +520,12 @@ class WatchStateStore:
         return self._native.capture(self._applied_seq)
 
     def _write_snapshot_view(self, view) -> None:
+        # A loader in another process must not mistake the closed tempfile
+        # between creation and native writing for an abandoned checkpoint.
+        with file_mutex(self.path, prefix="SunPack.WatchSnapshot"):
+            self._write_snapshot_under_gate(view)
+
+    def _write_snapshot_under_gate(self, view) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temp_path: Path | None = None
         try:
@@ -686,13 +693,13 @@ class WatchStateStore:
         }
 
     def _retire_segments_through(self, boundary: int, *, protected_starts: set[int] | None = None) -> bool:
+        pending = self._retire_snapshot_temps()
         if boundary < 1:
-            return False
+            return pending
         try:
             paths = self._journal_paths()
         except OSError:
             return True
-        pending = False
         for path in paths:
             start = self._segment_start_from_path(path)
             if start is None or start > boundary or (protected_starts is not None and start in protected_starts):
@@ -706,6 +713,34 @@ class WatchStateStore:
                 # Retry on the next idle maintenance, checkpoint or load,
                 # without retaining historical paths or polling an idle store.
                 pending = True
+        return pending
+
+    def _retire_snapshot_temps(self) -> bool:
+        prefix = f".{self.path.name}."
+        pending = False
+        try:
+            with file_mutex(self.path, prefix="SunPack.WatchSnapshot"), task_scandir(self.path.parent) as entries:
+                for entry in entries:
+                    name = entry.name
+                    if not name.startswith(prefix) or not name.endswith(".tmp"):
+                        continue
+                    token = name[len(prefix):-4]
+                    # ResourceLifecycle uses exactly uuid4().hex. Never sweep
+                    # similarly named user files, directories or symlinks.
+                    if len(token) != 32 or any(char not in "0123456789abcdef" for char in token):
+                        continue
+                    if not entry.is_file(follow_symlinks=False):
+                        continue
+                    try:
+                        Path(entry.path).unlink()
+                    except FileNotFoundError:
+                        pass
+                    except OSError:
+                        pending = True
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pending = True
         return pending
 
     def _on_journal_written(self, segment_start: int, byte_count: int) -> None:
@@ -1118,6 +1153,18 @@ class WatchStateStore:
     def watch_cursor_snapshot(self) -> dict[str, dict[str, int]]:
         with self._state_lock:
             return dict(self._native.watch_cursors())
+
+    def retain_scopes(self, scopes) -> None:
+        """Retire unused blockers/cursors on configuration changes, keeping recovery."""
+        with self._state_lock:
+            entry_keys, cursor_keys = self._native.unused_scope_keys([scope.native for scope in scopes])
+            operations = [self._delete_operation("entries", key) for key in entry_keys]
+            if cursor_keys:
+                cursors = dict(self._native.watch_cursors())
+                for key in cursor_keys:
+                    cursors.pop(key, None)
+                operations.append({"op": "set_watch_cursors", "value": cursors})
+            self._commit_operations_locked(operations, durable=True)
 
     def merge_watch_cursors(self, cursors: dict[str, dict[str, int]], *, durable: bool = True) -> None:
         with self._state_lock:

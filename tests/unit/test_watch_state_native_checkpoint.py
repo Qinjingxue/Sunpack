@@ -7,6 +7,81 @@ from sunpack.runtime.watch.scanner import WatchCandidate
 from sunpack.runtime.watch.state import WatchStateStore
 
 
+def test_restart_reclaims_crashed_snapshot_without_deleting_another_writers_temp(tmp_path, monkeypatch):
+    # A normal finally-path test cannot expose a killed writer, nor the gap
+    # between closing the created tempfile and publishing the native snapshot.
+    import subprocess
+    import sys
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    from contextlib import contextmanager
+    import sunpack.runtime.watch.state as module
+
+    state_path = tmp_path / "state.json"
+    unrelated = [tmp_path / ".state.json.notes.tmp", tmp_path / (".other.json." + "a" * 32 + ".tmp")]
+    for path in unrelated:
+        path.write_text("keep", encoding="utf-8")
+    directory = tmp_path / (".state.json." + "b" * 32 + ".tmp")
+    directory.mkdir()
+    script = r'''
+import os, sys
+from sunpack.runtime.watch.state import WatchStateStore
+from sunpack.runtime.watch.scanner import WatchCandidate
+state = WatchStateStore(sys.argv[1])
+state.queue_active(WatchCandidate(sys.argv[2], 3, 1.0), durable=True)
+view = state._native.capture(state.applied_seq)
+class PausedView:
+    def write(self, path):
+        view.write(path)
+        print(path, flush=True)
+        sys.stdin.readline()
+        os._exit(0)
+state._write_snapshot_view(PausedView())
+'''
+    process = subprocess.Popen([sys.executable, "-c", script, str(state_path), str(tmp_path / "archive.bin")],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    attempted = threading.Event()
+    real_mutex = module.file_mutex
+
+    @contextmanager
+    def observed_mutex(*args, **kwargs):
+        attempted.set()
+        with real_mutex(*args, **kwargs):
+            yield
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            temp = Path(pool.submit(process.stdout.readline).result(timeout=10).strip())
+            assert temp.is_file()
+            monkeypatch.setattr(module, "file_mutex", observed_mutex)
+            loading = pool.submit(WatchStateStore, str(state_path))
+            try:
+                assert attempted.wait(5)
+                assert not loading.done()
+                assert temp.exists()
+            finally:
+                process.stdin.write("exit\n")
+                process.stdin.flush()
+            state = loading.result(timeout=10)
+            try:
+                assert state.pending_work_count == 1
+                assert not temp.exists()
+                assert all(path.exists() for path in unrelated)
+                assert directory.is_dir()
+                # Loading and idle retirement must not publish a new snapshot.
+                assert not state.compact_if_needed()
+                assert not state_path.exists()
+            finally:
+                state.close()
+        assert process.wait(timeout=10) == 0, process.stderr.read()
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=10)
+        for stream in (process.stdin, process.stdout, process.stderr):
+            stream.close()
+
+
 def test_native_checkpoint_persists_only_declared_dataclass_fields(tmp_path):
     state_path = tmp_path / "state.json"
     state = WatchStateStore(str(state_path))

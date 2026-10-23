@@ -332,6 +332,73 @@ os._exit(0)
         state.close()
 
 
+@pytest.mark.parametrize("published", [False, True])
+def test_catalog_restart_retires_only_published_checkpoint_artifacts(tmp_path, published):
+    # Real sharing violations distinguish an unpublished snapshot from a
+    # published one whose old WAL could not be deleted before process exit.
+    import subprocess
+    import sys
+
+    root = tmp_path / "input"
+    root.mkdir()
+    script = r'''
+import os, sys
+from pathlib import Path
+from sunpack_native import NativeWatchState, NativeWatchCatalog, NativeDiscoveryScope, NativeDirectoryScanOptions
+folder = Path(sys.argv[1])
+root = folder / 'input'
+first, second = root / 'part.001', root / 'part.002'
+first.write_bytes(b'one')
+options = NativeDirectoryScanOptions([], [], [], [], [], [], [])
+scope = NativeDiscoveryScope(str(root), None)
+catalog = NativeWatchCatalog(NativeWatchState(), str(folder))
+assert not catalog.error, catalog.error
+assert not options.catalog_update(catalog, scope)
+second.write_bytes(b'two')
+assert not options.catalog_update(catalog, scope, str(second))
+catalog.set_cursor(scope, 'volume', 1, 30)
+blocked = open(folder / ('catalog.wal' if sys.argv[2] == 'True' else 'catalog.snapshot'), 'rb')
+catalog.close()
+assert catalog.error
+os._exit(0)
+'''
+    subprocess.run([sys.executable, "-c", script, str(tmp_path), str(published)], check=True, timeout=20)
+    snapshot = tmp_path / "catalog.snapshot"
+    before = snapshot.read_bytes()
+    before_mtime = snapshot.stat().st_mtime_ns
+    wal = tmp_path / "catalog.wal"
+    temp = tmp_path / "catalog.snapshot.tmp"
+    assert wal.exists()
+    assert temp.exists() is not published
+    assert not (tmp_path / "catalog.lock").exists()
+    from sunpack_native import NativeWatchState
+    catalog = NativeWatchCatalog(NativeWatchState(), str(tmp_path))
+    try:
+        assert not catalog.error
+        assert not temp.exists()
+        assert wal.exists() is not published
+        scope = DiscoveryScope(str(root), recursive=True)
+        assert catalog.cursor(scope.native) == ("volume", 1, 30)
+        options = DirectoryScanner.compile_scan_options({"filesystem": {"scan_filters_enabled": False}})
+        _, rows = options.catalog_snapshot(catalog, scope.native, str(root / "part.001"))
+        assert set(rows.file_columns()[0]) == {str(root / "part.001"), str(root / "part.002")}
+        # A competing cache instance must not delete the owner's working file.
+        temp.write_text("in progress", encoding="utf-8")
+        contender = NativeWatchCatalog(NativeWatchState(), str(tmp_path))
+        assert contender.error
+        contender.close()
+        assert temp.exists()
+        temp.unlink()
+        catalog.commit(True)
+        assert snapshot.read_bytes() == before
+        assert snapshot.stat().st_mtime_ns == before_mtime
+    finally:
+        catalog.close()
+    assert not wal.exists()
+    if published:
+        assert snapshot.stat().st_mtime_ns == before_mtime
+
+
 def test_catalog_event_batches_checkpoint_at_idle_and_preserve_case(tmp_path):
     """Crash replay does not cover hot-burst checkpoint policy or batch rollover.
 
