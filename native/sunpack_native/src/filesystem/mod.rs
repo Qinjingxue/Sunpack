@@ -188,6 +188,77 @@ pub(crate) fn watch_root_changes(
     }
 }
 
+/// Resolve directory identities once, then dispatch one journal pass using parent IDs.
+#[pyfunction]
+pub(crate) fn watch_directories_changes(
+    py: Python<'_>,
+    directories: Vec<String>,
+    volume: String,
+    journal: u64,
+    start_usn: i64,
+    end_usn: i64,
+) -> PyResult<Vec<String>> {
+    py.detach(|| {
+        watch_directories_changes_impl(directories, &volume, journal, start_usn, end_usn)
+            .map_err(os_error)
+    })
+}
+
+pub(crate) fn watch_directories_changes_impl(
+    directories: Vec<String>,
+    volume: &str,
+    journal: u64,
+    start_usn: i64,
+    end_usn: i64,
+) -> std::io::Result<Vec<String>> {
+    #[cfg(windows)]
+    {
+        if directories.len() > (sunpack_usn_core::protocol::MAX_DIRECTORY_QUERY_BYTES - 8) / 16 {
+            return Err(std::io::Error::other(
+                "directory recovery exceeds payload budget",
+            ));
+        }
+        let mut live = Vec::with_capacity(directories.len());
+        let mut ids = Vec::with_capacity(directories.len());
+        let mut paths = std::collections::BTreeSet::new();
+        for directory in directories {
+            match windows::watch_path_identity(Path::new(&directory)) {
+                Ok((actual, id, _)) if actual.eq_ignore_ascii_case(volume) => {
+                    let (id, _) = sunpack_usn_core::protocol::parse_file_id(&id)?;
+                    live.push(directory);
+                    ids.push(id);
+                }
+                Ok(_) => return Err(std::io::Error::other("directory changed volume")),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    paths.insert(directory);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if start_usn < end_usn && !ids.is_empty() {
+            let changes = sunpack_usn_core::broker_read_directories_changes(
+                volume, journal, &ids, start_usn, end_usn,
+            )?;
+            for (index, name) in changes {
+                paths.insert(if name.is_empty() {
+                    live[index as usize].clone()
+                } else {
+                    Path::new(&live[index as usize])
+                        .join(name)
+                        .to_string_lossy()
+                        .into_owned()
+                });
+            }
+        }
+        Ok(paths.into_iter().collect())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (directories, volume, journal, start_usn, end_usn);
+        Err(std::io::Error::other("watch mode requires Windows NTFS"))
+    }
+}
+
 #[pyfunction]
 pub(crate) fn watch_volume_cursor(path: &str) -> PyResult<(String, u64, i64)> {
     #[cfg(windows)]

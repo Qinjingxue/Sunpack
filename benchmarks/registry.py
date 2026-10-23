@@ -29,6 +29,7 @@ _ROWS = [
     ("scan", "watch-catalog", "benchmarks.scenarios.watch_catalog", "Native Watch catalog, bucket lookup, protected output pruning and state lifetime."),
     ("scan", "hotspots", "benchmarks.scenarios.scan_hotspots", "Full scan hotspot instrumentation."),
     ("scan", "synthetic-pressure", "benchmarks.scenarios.scan_synthetic_pressure", "Synthetic mixed-corpus scan."),
+    ("watch", "catalog-recovery", "benchmarks.scenarios.watch_catalog_recovery", "Per-directory versus batched USN catalog recovery on one journal interval."),
     ("watch", "real-file", "benchmarks.scenarios.watch_real_file", "End-to-end watch arrival, extraction, and completion for one supplied file."),
     ("watch", "format-matrix", "benchmarks.scenarios.watch_format_matrix", "Per-format watch internal stage timings across formats and input shapes."),
     ("watch", "cli-format-matrix", "benchmarks.scenarios.watch_cli_format_matrix", "End-to-end watch matrix for ZIPX, LZ4 and ENC on the fixed 300 MiB corpus."),

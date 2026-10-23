@@ -39,7 +39,7 @@ from sunpack.runtime.watch.scanner import (
     watch_file_is_ready,
     watch_volume_cursor,
     watch_path_identity,
-    watch_root_changes,
+    watch_catalog_changes,
 )
 from sunpack.runtime.watch.scanner import _candidate_for as _watch_candidate_for_path
 from sunpack.runtime.watch.state import WatchStateEntry, WatchStateStore, _recorded_file_presence
@@ -484,44 +484,71 @@ class WatchScheduler:
         cursor_updates = {}
         changed_paths = {}
         rebuilt = []
+        plans = []
+        volumes = {}
+        failed_volumes = set()
         for root in self.watch_roots:
             scope = self.scopes[path_key(root)]
-            options = self._scan_options_for(scope)
             cached = self._catalog.cursor(scope.native)
-            saved = None
-            cursor = None
+            plan = {"root": root, "scope": scope, "cached": cached, "cursor": None, "error": None}
+            plans.append(plan)
             try:
                 volume, journal, end = watch_volume_cursor(self._watch_root_directory(root))
-                cursor = (volume, journal, end)
+                plan["cursor"] = (volume, journal, end)
                 saved = self.state.watch_cursor(volume)
-                valid = (cached is not None and cached[0] == volume and cached[1] == journal
-                         and 0 < cached[2] <= end)
-                if not valid:
+                if not (cached is not None and cached[0] == volume and cached[1] == journal
+                        and 0 < cached[2] <= end):
                     raise ValueError("catalog requires enumeration")
                 watch_start = int((saved or {}).get("next_usn", 0))
                 if not saved or int(saved.get("journal_id", 0)) != journal or not 0 < watch_start <= end:
                     watch_start = cached[2]
                 start = min(cached[2], watch_start)
-                # Reuse the existing shallow USN request for indexed directories.
-                # This also covers empty directories, without another broker protocol.
-                for directory in self._catalog.directories(scope.native):
-                    if not os.path.isdir(directory):
-                        options.catalog_update(self._catalog, scope.native, directory, True)
+                group = volumes.setdefault((volume, journal), {
+                    "start": start, "end": end, "scopes": [], "paths": (), "error": None,
+                })
+                group["start"] = min(group["start"], start)
+                group["end"] = max(group["end"], end)
+                group["scopes"].append(scope.native)
+                plan["group"] = group
+            except Exception as exc:
+                plan["error"] = str(exc)
+        for (volume, journal), group in volumes.items():
+            try:
+                group["paths"] = sorted(watch_catalog_changes(
+                    self._catalog, group["scopes"], volume, journal, group["start"], group["end"],
+                ), key=len)
+            except Exception as exc:
+                group["error"] = str(exc)
+            group["scopes"].clear()
+        for plan in plans:
+            root, scope, cached = plan["root"], plan["scope"], plan["cached"]
+            options = self._scan_options_for(scope)
+            cursor = plan["cursor"]
+            try:
+                if plan["error"] is not None:
+                    raise OSError(plan["error"])
+                group = plan["group"]
+                if group["error"] is not None:
+                    raise OSError(group["error"])
+                cursor = (cursor[0], cursor[1], group["end"])
+                covered = set()
+                for path in group["paths"]:
+                    key = path_key(path)
+                    ancestor = key
+                    while ancestor and ancestor not in covered:
+                        ancestor = ancestor.rpartition("\\")[0]
+                    if ancestor:
                         continue
-                    if start == end:
+                    if not scope.contains(path) or self.should_ignore_event_path(path):
                         continue
-                    for path in watch_root_changes(directory, start, end):
-                        if path_key(path) == path_key(directory):
-                            continue
-                        if not scope.contains(path) or self.should_ignore_event_path(path):
-                            continue
-                        errors, arrivals = options.catalog_refresh(self._catalog, scope.native, path)
-                        if errors:
-                            raise OSError(str(errors))
-                        if os.path.isfile(path):
-                            changed_paths[path_key(path)] = path
-                        for arrival in arrivals:
-                            changed_paths[path_key(arrival)] = arrival
+                    errors, arrivals = options.catalog_refresh(self._catalog, scope.native, path)
+                    if errors:
+                        raise OSError(str(errors))
+                    covered.add(key)
+                    if os.path.isfile(path):
+                        changed_paths[path_key(path)] = path
+                    for arrival in arrivals:
+                        changed_paths[path_key(arrival)] = arrival
             except Exception as exc:
                 if cached is None:
                     errors = options.catalog_update(self._catalog, scope.native)
@@ -529,16 +556,21 @@ class WatchScheduler:
                 else:
                     errors, arrivals = options.catalog_refresh(self._catalog, scope.native)
                 rebuilt.append(root)
-                # An untrusted/missing index is never a reason to repeat initial scan.
                 if cached is not None:
                     changed_paths.update((path_key(path), path) for path in arrivals)
                 self.log.write("catalog_rebuilt", root=root, reason=str(exc), errors=errors)
                 if errors:
+                    if cursor is not None:
+                        failed_volumes.add(cursor[0])
                     cursor = None
             if cursor is not None:
                 volume, journal, end = cursor
                 self._catalog.set_cursor(scope.native, volume, journal, end)
-                cursor_updates[volume] = {"journal_id": journal, "next_usn": end}
+                previous = cursor_updates.get(volume)
+                if previous is None or end < previous["next_usn"]:
+                    cursor_updates[volume] = {"journal_id": journal, "next_usn": end}
+        for volume in failed_volumes:
+            cursor_updates.pop(volume, None)
         for path in changed_paths.values():
             if not _persisted_blocker_owns_retry(self.state, path):
                 self.enqueue(path, force=True, event_type="startup_usn_recovery")
@@ -873,6 +905,7 @@ class WatchScheduler:
             await asyncio.sleep(0)
         self._merge_run_result(result, await self._harvest_completed_requests())
         result.pending = self.pending_count
+        self._catalog.commit()
         await self._maybe_clear_idle_caches()
         with self._lock:
             state_is_idle = not self._pending and not self._inflight_requests
@@ -1169,6 +1202,9 @@ class WatchScheduler:
             # Their trackers are released here without a per-family index.
             for path in tuple(self._quiet_trackers):
                 self._retire_quiet_tracker(path)
+            await self.pipeline_engine.work_broker.run(
+                "catalog_maintenance", "watch", self._catalog.commit, True, request_id="watch", origin="watch",
+            )
             if not self.runtime_cache_cleanup_enabled:
                 return
             self.state.trim_idle_storage()

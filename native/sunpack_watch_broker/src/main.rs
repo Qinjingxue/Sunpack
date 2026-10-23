@@ -303,15 +303,48 @@ fn serve_client(
         let response = if !request_shape_is_valid(&request)
             || (request.opcode != Opcode::Hello && !lease.active)
         {
-            (Response {
-                status: Status::InvalidRequest,
-                ..Response::ok(request.request_id)
-            }, Vec::new())
+            (
+                Response {
+                    status: Status::InvalidRequest,
+                    ..Response::ok(request.request_id)
+                },
+                Vec::new(),
+            )
         } else {
             if request.opcode == Opcode::Hello {
                 lease.acquire();
             }
-            handle_request(&journals, request)
+            let mut query = Vec::new();
+            if request.opcode == Opcode::ReadDirectoriesChanges {
+                let mut length = [0u8; 4];
+                match read_overlapped(
+                    pipe.raw(),
+                    stop_event,
+                    &mut length,
+                    CLIENT_CONNECT_TIMEOUT_MS,
+                )? {
+                    IoResult::Completed(4) => {}
+                    _ => break,
+                }
+                let length = u32::from_le_bytes(length) as usize;
+                if length < 24
+                    || length > sunpack_usn_core::protocol::MAX_DIRECTORY_QUERY_BYTES
+                    || (length - 8) % 16 != 0
+                {
+                    break;
+                }
+                query.resize(length, 0);
+                match read_overlapped(
+                    pipe.raw(),
+                    stop_event,
+                    &mut query,
+                    CLIENT_CONNECT_TIMEOUT_MS,
+                )? {
+                    IoResult::Completed(size) if size == length => {}
+                    _ => break,
+                }
+            }
+            handle_request(&journals, request, &query)
         };
         let (response, payload) = response;
         match write_overlapped(pipe.raw(), stop_event, &response.encode())? {
@@ -324,7 +357,10 @@ fn serve_client(
         if !payload.is_empty() {
             match write_overlapped(pipe.raw(), stop_event, &payload)? {
                 IoResult::Completed(size) if size == payload.len() => {}
-                IoResult::Completed(_) | IoResult::Disconnected | IoResult::Stopped | IoResult::TimedOut => break,
+                IoResult::Completed(_)
+                | IoResult::Disconnected
+                | IoResult::Stopped
+                | IoResult::TimedOut => break,
             }
         }
         if release {
@@ -354,6 +390,12 @@ fn request_shape_is_valid(request: &Request) -> bool {
         Opcode::ReadChangeReasons => {
             !request.volume_guid.is_empty()
                 && matches!(request.file_id_len, 8 | 16)
+                && request.previous_usn > 0
+                && request.current_usn > request.previous_usn
+        }
+        Opcode::ReadDirectoriesChanges => {
+            !request.volume_guid.is_empty()
+                && request.file_id_len == 0
                 && request.previous_usn > 0
                 && request.current_usn > request.previous_usn
         }
@@ -454,18 +496,25 @@ fn encode_path_payload(paths: &[String]) -> io::Result<Vec<u8>> {
     let mut payload = Vec::new();
     for path in paths {
         let bytes = path.as_bytes();
-        let length = u32::try_from(bytes.len())
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "root recovery path is too long"))?;
+        let length = u32::try_from(bytes.len()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "root recovery path is too long")
+        })?;
         payload.extend_from_slice(&length.to_le_bytes());
         payload.extend_from_slice(bytes);
     }
     if payload.len() > 64 * 1024 {
-        return Err(io::Error::other("USN root recovery exceeded payload budget"));
+        return Err(io::Error::other(
+            "USN root recovery exceeded payload budget",
+        ));
     }
     Ok(payload)
 }
 
-fn handle_request(journals: &JournalDispatcher, request: Request) -> (Response, Vec<u8>) {
+fn handle_request(
+    journals: &JournalDispatcher,
+    request: Request,
+    query: &[u8],
+) -> (Response, Vec<u8>) {
     let mut response = Response::ok(request.request_id);
     let mut payload = Vec::new();
     let result: io::Result<(u64, i64, sunpack_usn_core::ChangeReasons)> = match request.opcode {
@@ -473,14 +522,18 @@ fn handle_request(journals: &JournalDispatcher, request: Request) -> (Response, 
         Opcode::ProbeVolume => journals
             .reader_for(&request.volume_guid)
             .and_then(|journal| {
-                journal.lock().map_err(|_| io::Error::other("journal state poisoned"))?
+                journal
+                    .lock()
+                    .map_err(|_| io::Error::other("journal state poisoned"))?
                     .probe_volume(&request.volume_guid)
             })
             .map(|(journal_id, next_usn)| (journal_id, next_usn, Default::default())),
         Opcode::ReadChangeReasons => journals
             .reader_for(&request.volume_guid)
             .and_then(|journal| {
-                journal.lock().map_err(|_| io::Error::other("journal state poisoned"))?
+                journal
+                    .lock()
+                    .map_err(|_| io::Error::other("journal state poisoned"))?
                     .read_change_reasons(
                         &request.volume_guid,
                         &request.file_id,
@@ -490,10 +543,55 @@ fn handle_request(journals: &JournalDispatcher, request: Request) -> (Response, 
                     )
             })
             .map(|(journal_id, reasons)| (journal_id, 0, reasons)),
+        Opcode::ReadDirectoriesChanges => journals
+            .reader_for(&request.volume_guid)
+            .and_then(|journal| {
+                if query.len() < 24 || (query.len() - 8) % 16 != 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "invalid directory query",
+                    ));
+                }
+                let expected = u64::from_le_bytes(query[..8].try_into().unwrap());
+                let ids: Vec<[u8; 16]> = query[8..]
+                    .chunks_exact(16)
+                    .map(|id| id.try_into().unwrap())
+                    .collect();
+                journal
+                    .lock()
+                    .map_err(|_| io::Error::other("journal state poisoned"))?
+                    .read_directories_changes(
+                        &request.volume_guid,
+                        Some(expected),
+                        &ids,
+                        request.previous_usn,
+                        request.current_usn,
+                    )
+            })
+            .and_then(|changes| {
+                for (index, name) in &changes {
+                    payload.extend_from_slice(&index.to_le_bytes());
+                    payload.extend_from_slice(&(name.len() as u32).to_le_bytes());
+                    payload.extend_from_slice(name.as_bytes());
+                }
+                if payload.len() > 64 * 1024 {
+                    return Err(io::Error::other("USN recovery exceeded payload budget"));
+                }
+                Ok((
+                    0,
+                    0,
+                    sunpack_usn_core::ChangeReasons {
+                        all: payload.len() as u32,
+                        without_close: changes.len() as u32,
+                    },
+                ))
+            }),
         Opcode::ReadRootChanges => journals
             .reader_for(&request.volume_guid)
             .and_then(|journal| {
-                journal.lock().map_err(|_| io::Error::other("journal state poisoned"))?
+                journal
+                    .lock()
+                    .map_err(|_| io::Error::other("journal state poisoned"))?
                     .read_root_changes(
                         &request.volume_guid,
                         &request.file_id,
@@ -508,7 +606,14 @@ fn handle_request(journals: &JournalDispatcher, request: Request) -> (Response, 
                     .map_err(|_| io::Error::other("USN root recovery payload is too large"))?;
                 let count = u32::try_from(paths.len())
                     .map_err(|_| io::Error::other("too many USN root changes"))?;
-                Ok((0, 0, sunpack_usn_core::ChangeReasons { all: bytes, without_close: count }))
+                Ok((
+                    0,
+                    0,
+                    sunpack_usn_core::ChangeReasons {
+                        all: bytes,
+                        without_close: count,
+                    },
+                ))
             }),
     };
     match result {
@@ -521,22 +626,23 @@ fn handle_request(journals: &JournalDispatcher, request: Request) -> (Response, 
         Err(error) => {
             payload.clear();
             response.win32_error = error.raw_os_error().unwrap_or(0) as u32;
-            response.status = if matches!(error.raw_os_error(), Some(1178) | Some(1179) | Some(1181)) {
-                Status::JournalReset
-            } else if error.kind() == io::ErrorKind::InvalidInput {
-                Status::InvalidRequest
-            } else if error.kind() == io::ErrorKind::NotFound {
-                Status::NotFound
-            } else if error.to_string().contains("scan budget")
-                || error.to_string().contains("payload budget")
-                || error.to_string().contains("fallback scan")
-            {
-                Status::ScanLimit
-            } else if error.raw_os_error().is_some() {
-                Status::JournalUnavailable
-            } else {
-                Status::InternalError
-            };
+            response.status =
+                if matches!(error.raw_os_error(), Some(1178) | Some(1179) | Some(1181)) {
+                    Status::JournalReset
+                } else if error.kind() == io::ErrorKind::InvalidInput {
+                    Status::InvalidRequest
+                } else if error.kind() == io::ErrorKind::NotFound {
+                    Status::NotFound
+                } else if error.to_string().contains("scan budget")
+                    || error.to_string().contains("payload budget")
+                    || error.to_string().contains("fallback scan")
+                {
+                    Status::ScanLimit
+                } else if error.raw_os_error().is_some() {
+                    Status::JournalUnavailable
+                } else {
+                    Status::InternalError
+                };
         }
     }
     (response, payload)

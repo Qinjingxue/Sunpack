@@ -1269,10 +1269,11 @@ pub(crate) fn append_cache(
     path: &Path,
     seq: u64,
     value: JsonValue,
-) -> Result<(), String> {
-    runtime()
-        .submit_append(stream.to_owned(), path.to_owned(), 1, seq, value, false)?
-        .wait_for(TicketGoal::Written)
+) -> Result<u64, String> {
+    let ticket =
+        runtime().submit_append(stream.to_owned(), path.to_owned(), 1, seq, value, false)?;
+    ticket.wait_for(TicketGoal::Written)?;
+    Ok(ticket.bytes_written.load(Ordering::Acquire))
 }
 pub(crate) fn flush_cache(stream: &str, seq: u64) -> Result<(), String> {
     runtime()

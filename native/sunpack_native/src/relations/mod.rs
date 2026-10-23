@@ -1158,10 +1158,7 @@ pub(crate) fn relations_resolve_volume_once(
             anchor: anchor_by_path.get(&path_key(path)).cloned(),
         })
         .collect();
-    let filtered_keys: HashSet<String> = current_paths
-        .iter()
-        .map(|path| path_key(path))
-        .collect();
+    let filtered_keys: HashSet<String> = current_paths.iter().map(|path| path_key(path)).collect();
     let groups = build_candidate_groups_from_source(
         py,
         RelationSource::Physical(&rows),

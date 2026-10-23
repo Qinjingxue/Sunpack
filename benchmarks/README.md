@@ -26,7 +26,8 @@ uv run --locked python -m benchmarks reader embedded-scan --generate-plan5-mib 5
   --baseline-report benchmarks/results/reader.embedded-scan/<baseline-run>/report.json `
   --max-regression-percent 5
 uv run --locked python -m benchmarks scan hotspots . --mode full --json-out benchmarks/results/scan-hotspots.json
-uv run --no-sync python -m benchmarks scan watch-catalog --files 30000 --protected-files 100000 --bucket-size 8 --rounds 20
+uv run --no-sync python -m benchmarks scan watch-catalog --files 30000 --protected-files 100000 --bucket-size 8 --rounds 20 --event-batch-size 64
+uv run --no-sync python -m benchmarks watch catalog-recovery --directories 500 --changes 3000 --rounds 3
 uv run --locked python -m benchmarks extraction format-matrix --runs 5 --json-out benchmarks/results/extraction-benchmark.json
 uv run --locked python -m benchmarks extraction cli-format-matrix --runs 3 --prefetch on --json-out benchmarks/results/cli-format-matrix-prefetch-on.json
 uv run --locked python -m benchmarks extraction cli-format-matrix --format zipx --format lz4 --format enc --runs 3 --prefetch on --json-out benchmarks/results/cli-zipx-lz4-enc-prefetch-on.json
@@ -66,6 +67,20 @@ uv run --no-sync python -m benchmarks scheduling broker-request-selection --base
 uv run --no-sync python -m benchmarks scheduling watch-source-claims --baseline-ref <before-commit> --runs 7 --warmups 1
 uv run --no-sync python -m benchmarks memory watch-source-indexes --paths 4096 --batches 12 --warmups 2
 ```
+
+The catalog scenario includes the final Written barrier in each event batch;
+--event-batch-size 1 measures isolated events and 64 measures bursts. It also
+reports snapshot/WAL bytes and process memory before indexing, while resident,
+and after release. The recovery scenario compares both APIs on the same fixed
+NTFS journal interval and checks that they return identical paths. The watch
+runner supplies its existing temporary Broker service.
+
+The catalog commits at existing Watch processing boundaries, cursor publication,
+checkpoint, and close, with a 64-delta/256 KiB batch ceiling. Checkpoint normally
+runs at existing idle maintenance when the WAL exceeds both 4 MiB and the previous
+snapshot size (and at least 1024 edits); 64 MiB forces synchronous reclamation.
+These measurements include filesystem metadata and file updates and do not predict
+archive extraction throughput.
 
 ## GUI benchmark
 

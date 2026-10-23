@@ -83,3 +83,7 @@ def watch_root_changes(path: str, start_usn: int, end_usn: int) -> list[str]:
     names = _native_watch_root_changes(str(path), int(start_usn), int(end_usn))
     root = Path(path)
     return [str(root if name == "" else root / str(name)) for name in names]
+
+
+def watch_catalog_changes(catalog, scopes, volume: str, journal: int, start_usn: int, end_usn: int) -> list[str]:
+    return catalog.recover_changes(scopes, volume, journal, start_usn, end_usn)

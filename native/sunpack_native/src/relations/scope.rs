@@ -111,12 +111,26 @@ pub(super) struct RelationScopeIndex {
 impl RelationScopeIndex {
     pub fn build(source: &RelationSource<'_>, filtered_keys: &HashSet<String>) -> Self {
         let selected: HashSet<_> = filtered_keys.iter().map(|key| CaseKey::new(key)).collect();
-        let stems: HashSet<_> = source.indices().filter(|&row| selected.contains(&CaseKey::new(source.path(row))))
-            .map(|row| CaseKey::new(first_dot_stem(source.name(row)))).collect();
-        let active: HashSet<_> = source.indices().filter(|&row| source.anchor(row).is_some_and(BucketIndex::has_seed))
-            .map(|row| CaseKey::new(first_dot_stem(source.name(row)))).filter(|stem| stems.contains(stem)).collect();
-        Self { rows: source.indices().filter(|&row| selected.contains(&CaseKey::new(source.path(row)))
-            || active.contains(&CaseKey::new(first_dot_stem(source.name(row))))).collect() }
+        let stems: HashSet<_> = source
+            .indices()
+            .filter(|&row| selected.contains(&CaseKey::new(source.path(row))))
+            .map(|row| CaseKey::new(first_dot_stem(source.name(row))))
+            .collect();
+        let active: HashSet<_> = source
+            .indices()
+            .filter(|&row| source.anchor(row).is_some_and(BucketIndex::has_seed))
+            .map(|row| CaseKey::new(first_dot_stem(source.name(row))))
+            .filter(|stem| stems.contains(stem))
+            .collect();
+        Self {
+            rows: source
+                .indices()
+                .filter(|&row| {
+                    selected.contains(&CaseKey::new(source.path(row)))
+                        || active.contains(&CaseKey::new(first_dot_stem(source.name(row))))
+                })
+                .collect(),
+        }
     }
 }
 

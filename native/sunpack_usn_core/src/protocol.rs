@@ -5,6 +5,8 @@ pub const MAX_VOLUME_GUID_BYTES: usize = 64;
 pub const FILE_ID_BYTES: usize = 16;
 pub const REQUEST_BYTES: usize = 112;
 pub const RESPONSE_BYTES: usize = 42;
+// A batch query is framed separately after the fixed request: journal ID + 16-byte IDs.
+pub const MAX_DIRECTORY_QUERY_BYTES: usize = 1024 * 1024;
 const _: () = assert!(REQUEST_BYTES <= 4096);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -16,6 +18,7 @@ pub enum Opcode {
     Ping = 4,
     Release = 5,
     ReadRootChanges = 6,
+    ReadDirectoriesChanges = 7,
 }
 
 impl TryFrom<u16> for Opcode {
@@ -29,6 +32,7 @@ impl TryFrom<u16> for Opcode {
             4 => Ok(Self::Ping),
             5 => Ok(Self::Release),
             6 => Ok(Self::ReadRootChanges),
+            7 => Ok(Self::ReadDirectoriesChanges),
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "unknown broker opcode",

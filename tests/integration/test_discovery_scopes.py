@@ -300,13 +300,17 @@ second=os.path.join(root,'same.002')
 with open(second,'wb') as stream: stream.write(b'two')
 catalog=NativeWatchCatalog(NativeWatchState(),folder)
 options=NativeDirectoryScanOptions([],[],[],[],[],[],[])
-assert not options.catalog_update(catalog,NativeDiscoveryScope(root,None),second)
+scope=NativeDiscoveryScope(root,None)
+assert not options.catalog_update(catalog,scope,second)
+# Cursor publication must include all pending changes, even without normal close.
+catalog.set_cursor(scope,"volume",1,30)
 os._exit(0)
 """
     subprocess.run([sys.executable, "-c", script, str(root), str(tmp_path)], check=True, timeout=20)
     state = WatchStateStore(str(tmp_path / "state.json"))
     try:
         catalog = NativeWatchCatalog(state._native, str(tmp_path))
+        assert catalog.cursor(scope.native) == ("volume", 1, 30)
         _, raw = options.catalog_snapshot(catalog, scope.native, str(first))
         assert set(raw.file_columns()[0]) == {str(first), str(root / "same.002")}
         catalog.close()
@@ -328,6 +332,56 @@ os._exit(0)
         state.close()
 
 
+def test_catalog_event_batches_checkpoint_at_idle_and_preserve_case(tmp_path):
+    """Crash replay does not cover hot-burst checkpoint policy or batch rollover.
+
+    Removing this case leaves premature full snapshots during large bursts and
+    loss across merged insert/delete/reinsert operations uncovered. One small
+    file under a long path crosses the byte threshold without a large corpus.
+    """
+    import json
+    root = tmp_path / "input"
+    directory = root
+    for _ in range(4):
+        directory /= "MixedCase" * 8
+    directory.mkdir(parents=True)
+    path = directory / "OriginalCase.001"
+    path.write_bytes(b"initial")
+    scope = DiscoveryScope(str(root), recursive=True)
+    state = WatchStateStore(str(tmp_path / "state.json"))
+    options = DirectoryScanner.compile_scan_options({"filesystem": {"scan_filters_enabled": False}})
+    catalog = NativeWatchCatalog(state._native, str(tmp_path))
+    try:
+        assert not options.catalog_update(catalog, scope.native)
+        snapshot = tmp_path / "catalog.snapshot"
+        initial = snapshot.read_bytes()
+        for index in range(9000):
+            path.write_bytes(b"x" * (index % 128 + 1))
+            assert not options.catalog_update(catalog, scope.native, str(path))
+        path.unlink()
+        assert not options.catalog_update(catalog, scope.native, str(path))
+        path.write_bytes(b"final")
+        assert not options.catalog_update(catalog, scope.native, str(path))
+        catalog.commit()
+        assert snapshot.read_bytes() == initial
+        wal = tmp_path / "catalog.wal"
+        assert wal.stat().st_size > 4 * 1024 * 1024
+        transactions = [json.loads(line) for line in wal.read_text().splitlines()]
+        assert len(transactions) < 150
+        assert any(len(tx["operations"]) > 1 for tx in transactions)
+        catalog.commit(True)
+        assert snapshot.read_bytes() != initial
+        assert not wal.exists()
+        catalog.close()
+        catalog = NativeWatchCatalog(state._native, str(tmp_path))
+        _, raw = options.catalog_snapshot(catalog, scope.native, str(path))
+        assert raw.file_columns()[0] == [str(path)]
+        assert not catalog.error
+    finally:
+        catalog.close()
+        state.close()
+
+
 @pytest.mark.requires_watch_broker
 def test_recursive_restart_replays_indexed_directories_without_initial_scan(tmp_path, monkeypatch):
     """A flat native cache test cannot catch restart admission or empty-subdirectory gaps."""
@@ -339,13 +393,21 @@ def test_recursive_restart_replays_indexed_directories_without_initial_scan(tmp_
     monkeypatch.setattr(module, "Observer", FakeObserver)
     root = tmp_path / "input"
     (root / "empty").mkdir(parents=True)
+    (root / "before").mkdir()
+    moved = root / "before/same.004"
+    moved.write_bytes(b"moved")
+    (root / "departed").mkdir()
+    gone = root / "departed/same.005"
+    gone.write_bytes(b"gone")
+    other = tmp_path / "other"
+    other.mkdir()
     unchanged, modified, removed = (root / name for name in ("old.001", "same.001", "same.002"))
     for path in (unchanged, modified, removed):
         path.write_bytes(b"old")
     config = make_config({"watch": {"clipboard_monitor_enabled": False}})
     def watcher():
-        return module.WatchScheduler(config, [str(root)], state_path=str(tmp_path / "state.json"),
-            root_entries=[WatchRootEntry(str(root), initial_scanned=True, recursive=True)],
+        return module.WatchScheduler(config, [str(root), str(other)], state_path=str(tmp_path / "state.json"),
+            root_entries=[WatchRootEntry(str(path), initial_scanned=True, recursive=True) for path in (root, other)],
             pipeline_engine=FakePipelineEngine(lambda config: None))
     async def cycle():
         first = watcher()
@@ -357,6 +419,11 @@ def test_recursive_restart_replays_indexed_directories_without_initial_scan(tmp_
         modified.write_bytes(b"new")
         os.utime(modified, ns=(stamp, stamp))
         removed.unlink()
+        (root / "before").rename(root / "after")
+        gone.unlink()
+        gone.parent.rmdir()
+        other_file = other / "AnotherCase.opaque"
+        other_file.write_bytes(b"other")
         arrived = root / "empty/same.003"
         arrived.write_bytes(b"tail")
         second = watcher()
@@ -371,12 +438,19 @@ def test_recursive_restart_replays_indexed_directories_without_initial_scan(tmp_
                 assert changed is not None, "normal restart enumerated the complete Scope"
                 return compiled.catalog_refresh(catalog, scope, changed)
         second._scan_options = OnlyIncremental()
+        calls = []
+        original_changes = module.watch_catalog_changes
+        def changes(*args):
+            calls.append(args)
+            return original_changes(*args)
+        monkeypatch.setattr(module, "watch_catalog_changes", changes)
         try:
             await second.start()
-            assert set(second._pending) == {str(modified), str(arrived)}
+            assert set(second._pending) == {str(modified), str(arrived), str(root / "after/same.004"), str(other_file)}
+            assert len(calls) == 1, "same-volume roots reread the journal"
             scope = next(iter(second.scopes.values()))
             _, raw = compiled.catalog_snapshot(second._catalog, scope.native, str(modified))
-            assert set(raw.file_columns()[0]) == {str(modified), str(arrived)}
+            assert set(raw.file_columns()[0]) == {str(modified), str(arrived), str(root / "after/same.004")}
         finally:
             await second.stop()
             second._close_blocking()

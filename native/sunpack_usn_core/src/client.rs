@@ -53,21 +53,41 @@ impl BrokerConnection {
     fn transact(&mut self, request: Request) -> io::Result<Response> {
         let (response, payload) = self.transact_payload(request)?;
         if !payload.is_empty() {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "unexpected broker payload"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unexpected broker payload",
+            ));
         }
         Ok(response)
     }
 
     fn transact_payload(&mut self, request: Request) -> io::Result<(Response, Vec<u8>)> {
+        self.transact_query(request, &[])
+    }
+    fn transact_query(
+        &mut self,
+        request: Request,
+        query: &[u8],
+    ) -> io::Result<(Response, Vec<u8>)> {
         let request_id = request.request_id;
-        let payload_response = request.opcode == Opcode::ReadRootChanges;
+        let payload_response = matches!(
+            request.opcode,
+            Opcode::ReadRootChanges | Opcode::ReadDirectoriesChanges
+        );
         let request = request.encode()?;
         write_exact(self.0, &request)?;
+        if !query.is_empty() {
+            write_exact(self.0, &(query.len() as u32).to_le_bytes())?;
+            write_exact(self.0, query)?;
+        }
         let mut response_bytes = [0u8; RESPONSE_BYTES];
         read_exact(self.0, &mut response_bytes)?;
         let response = Response::decode(&response_bytes)?;
         if response.request_id != request_id {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "broker response request ID mismatch"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "broker response request ID mismatch",
+            ));
         }
         let payload_len = if payload_response && response.status == Status::Ok {
             response.reasons_all as usize
@@ -75,7 +95,10 @@ impl BrokerConnection {
             0
         };
         if payload_len > MAX_BROKER_PAYLOAD_BYTES {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "broker payload exceeds limit"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "broker payload exceeds limit",
+            ));
         }
         let mut payload = vec![0u8; payload_len];
         if payload_len > 0 {
@@ -188,16 +211,92 @@ pub fn broker_read_root_changes(
     request.previous_usn = start_usn;
     request.current_usn = end_usn;
     let state = STATE.get_or_init(|| Mutex::new(ClientState::default()));
-    let mut state = state.lock().map_err(|_| io::Error::other("broker client state poisoned"))?;
+    let mut state = state
+        .lock()
+        .map_err(|_| io::Error::other("broker client state poisoned"))?;
     if state.leases == 0 {
-        return Err(io::Error::new(io::ErrorKind::NotConnected, "SunPack Watch Broker has not been acquired"));
+        return Err(io::Error::new(
+            io::ErrorKind::NotConnected,
+            "SunPack Watch Broker has not been acquired",
+        ));
     }
     if state.connection.is_none() {
         state.connection = Some(connect_and_hello()?);
     }
-    let (response, payload) = state.connection.as_mut().unwrap().transact_payload(request)?;
+    let (response, payload) = state
+        .connection
+        .as_mut()
+        .unwrap()
+        .transact_payload(request)?;
     ensure_ok(response)?;
     decode_path_payload(&payload)
+}
+
+pub fn broker_read_directories_changes(
+    volume: &str,
+    journal: u64,
+    directories: &[[u8; 16]],
+    start: i64,
+    end: i64,
+) -> io::Result<Vec<(u32, String)>> {
+    let bytes = 8usize.saturating_add(directories.len().saturating_mul(16));
+    if directories.is_empty() || bytes > crate::protocol::MAX_DIRECTORY_QUERY_BYTES {
+        return Err(io::Error::other(
+            "directory recovery query exceeds payload budget",
+        ));
+    }
+    let mut query = Vec::with_capacity(bytes);
+    query.extend_from_slice(&journal.to_le_bytes());
+    for id in directories {
+        query.extend_from_slice(id);
+    }
+    let mut request = Request::simple(Opcode::ReadDirectoriesChanges, next_request_id());
+    request.volume_guid = volume.to_owned();
+    request.previous_usn = start;
+    request.current_usn = end;
+    let state = STATE.get_or_init(|| Mutex::new(ClientState::default()));
+    let mut state = state
+        .lock()
+        .map_err(|_| io::Error::other("broker client state poisoned"))?;
+    if state.leases == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::NotConnected,
+            "Watch Broker has not been acquired",
+        ));
+    }
+    if state.connection.is_none() {
+        state.connection = Some(connect_and_hello()?);
+    }
+    let result = state
+        .connection
+        .as_mut()
+        .unwrap()
+        .transact_query(request, &query);
+    // A truncated exchange must never leave unread payload on the next request.
+    if result.is_err() {
+        state.connection.take();
+    }
+    let (response, payload) = result?;
+    ensure_ok(response)?;
+    let mut input = payload.as_slice();
+    let mut result = Vec::new();
+    while !input.is_empty() {
+        if input.len() < 8 {
+            return Err(io::Error::other("truncated directory change"));
+        }
+        let index = u32::from_le_bytes(input[..4].try_into().unwrap());
+        let length = u32::from_le_bytes(input[4..8].try_into().unwrap()) as usize;
+        input = &input[8..];
+        if index as usize >= directories.len() || length > input.len() {
+            return Err(io::Error::other("invalid directory change"));
+        }
+        let name = std::str::from_utf8(&input[..length])
+            .map_err(|_| io::Error::other("invalid directory change UTF-8"))?
+            .to_owned();
+        result.push((index, name));
+        input = &input[length..];
+    }
+    Ok(result)
 }
 
 fn decode_path_payload(payload: &[u8]) -> io::Result<Vec<String>> {
@@ -205,16 +304,26 @@ fn decode_path_payload(payload: &[u8]) -> io::Result<Vec<String>> {
     let mut result = Vec::new();
     while offset < payload.len() {
         if offset + 4 > payload.len() {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "truncated path payload"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "truncated path payload",
+            ));
         }
-        let length = u32::from_le_bytes(payload[offset..offset+4].try_into().unwrap()) as usize;
+        let length = u32::from_le_bytes(payload[offset..offset + 4].try_into().unwrap()) as usize;
         offset += 4;
         if offset + length > payload.len() {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "truncated path payload item"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "truncated path payload item",
+            ));
         }
-        result.push(std::str::from_utf8(&payload[offset..offset+length])
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "path payload is not UTF-8"))?
-            .to_owned());
+        result.push(
+            std::str::from_utf8(&payload[offset..offset + length])
+                .map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "path payload is not UTF-8")
+                })?
+                .to_owned(),
+        );
         offset += length;
     }
     Ok(result)

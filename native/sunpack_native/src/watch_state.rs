@@ -7,6 +7,8 @@ const HEX: &[u8; 16] = b"0123456789abcdef";
 
 #[derive(Debug)]
 pub(crate) enum JsonValue {
+    // Trusted JSON serialized inside Rust, never accepted from Python.
+    Encoded(Vec<u8>),
     Null,
     Bool(bool),
     Signed(i128),
@@ -158,6 +160,7 @@ fn write_json_string<W: Write>(writer: &mut W, value: &str) -> io::Result<()> {
 
 pub(crate) fn write_json_value<W: Write>(writer: &mut W, value: &JsonValue) -> io::Result<()> {
     match value {
+        JsonValue::Encoded(bytes) => writer.write_all(bytes),
         JsonValue::Null => writer.write_all(b"null"),
         JsonValue::Bool(true) => writer.write_all(b"true"),
         JsonValue::Bool(false) => writer.write_all(b"false"),

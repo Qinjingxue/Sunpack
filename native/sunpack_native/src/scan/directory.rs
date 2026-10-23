@@ -22,6 +22,7 @@ pub(crate) struct DirectoryEntryRecord {
     is_dir: bool,
     size: Option<u64>,
     mtime_ns: Option<u64>,
+    #[serde(skip)]
     relation_member_eligible: bool,
     #[serde(skip)]
     relation_anchor: Option<VolumeAnchor>,
@@ -3242,21 +3243,33 @@ impl NativeWatchCatalog {
             }
         }
     }
-    fn directories(&self, scope: &crate::scan::scope::NativeDiscoveryScope) -> Vec<String> {
-        let tables = self.catalogs.lock().unwrap();
-        let mut directories = vec![scope.root.clone()];
-        if scope.max_depth != Some(0) {
-            if let Some(table) = tables.get(&crate::path_keys::path_key(&scope.root)) {
-                directories.extend(
-                    table
-                        .rows
-                        .values()
-                        .filter(|r| r.is_dir && scope.contains(&r.path) && !self.is_owned(&r.path))
-                        .map(|r| r.path.clone()),
-                );
-            }
-        }
-        directories
+    fn recover_changes(
+        &self,
+        py: Python<'_>,
+        scopes: Vec<Py<crate::scan::scope::NativeDiscoveryScope>>,
+        volume: &str,
+        journal: u64,
+        start_usn: i64,
+        end_usn: i64,
+    ) -> PyResult<Vec<String>> {
+        let scopes: Vec<_> = scopes
+            .iter()
+            .map(|scope| scope.borrow(py).clone())
+            .collect();
+        py.detach(|| {
+            let directories: HashSet<_> = scopes
+                .iter()
+                .flat_map(|scope| self.directory_paths(scope))
+                .collect();
+            crate::filesystem::watch_directories_changes_impl(
+                directories.into_iter().collect(),
+                volume,
+                journal,
+                start_usn,
+                end_usn,
+            )
+            .map_err(|error| pyo3::exceptions::PyOSError::new_err(error.to_string()))
+        })
     }
     fn set_cursor(
         &self,
@@ -3274,14 +3287,33 @@ impl NativeWatchCatalog {
             let tables = self.catalogs.lock().unwrap();
             self.persist(
                 &tables,
-                super::catalog_store::Delta {
-                    scope: crate::path_keys::path_key(&scope.root),
-                    removed: Vec::new(),
+                super::catalog_store::DeltaView {
+                    scope: &crate::path_keys::path_key(&scope.root),
+                    removed: &[],
                     rows: Vec::new(),
                     stamp: Some(stamp),
                 },
                 false,
             );
+        });
+    }
+    #[pyo3(signature = (idle=false))]
+    fn commit(&self, py: Python<'_>, idle: bool) {
+        py.detach(|| {
+            let tables = self.catalogs.lock().unwrap();
+            let mut slot = self.store.lock().unwrap();
+            if let Some(store) = slot.as_mut() {
+                if let Err(error) = store.commit().and_then(|_| {
+                    if store.checkpoint_due(idle) {
+                        store.checkpoint(&tables)
+                    } else {
+                        Ok(())
+                    }
+                }) {
+                    *self.error.lock().unwrap() = Some(error.to_string());
+                    *slot = None;
+                }
+            }
         });
     }
     fn close(&self, py: Python<'_>) {
@@ -3298,6 +3330,22 @@ impl NativeWatchCatalog {
 }
 
 impl NativeWatchCatalog {
+    fn directory_paths(&self, scope: &crate::scan::scope::NativeDiscoveryScope) -> Vec<String> {
+        let tables = self.catalogs.lock().unwrap();
+        let mut directories = vec![scope.root.clone()];
+        if scope.max_depth != Some(0) {
+            if let Some(table) = tables.get(&crate::path_keys::path_key(&scope.root)) {
+                directories.extend(
+                    table
+                        .rows
+                        .values()
+                        .filter(|r| r.is_dir && scope.contains(&r.path) && !self.is_owned(&r.path))
+                        .map(|r| r.path.clone()),
+                );
+            }
+        }
+        directories
+    }
     fn output_roots(&self) -> Vec<String> {
         self.outputs
             .lock()
@@ -3331,6 +3379,9 @@ impl NativeWatchCatalog {
 impl ScopeCatalog {
     pub(super) fn insert(&mut self, row: DirectoryEntryRecord) {
         let key: Arc<str> = Arc::from(crate::path_keys::path_key(&row.path));
+        self.insert_key(key, row);
+    }
+    fn insert_key(&mut self, key: Arc<str>, row: DirectoryEntryRecord) {
         if self
             .rows
             .get(&key)
@@ -3378,7 +3429,7 @@ impl NativeWatchCatalog {
     fn persist(
         &self,
         tables: &HashMap<String, ScopeCatalog>,
-        delta: super::catalog_store::Delta,
+        delta: super::catalog_store::DeltaView<'_>,
         rebuilt: bool,
     ) {
         let mut slot = self.store.lock().unwrap();
@@ -3390,7 +3441,7 @@ impl NativeWatchCatalog {
             store.checkpoint(tables)
         } else {
             store.append(delta).and_then(|_| {
-                if store.checkpoint_due() {
+                if store.checkpoint_due(false) {
                     store.checkpoint(tables)
                 } else {
                     Ok(())
@@ -3475,7 +3526,7 @@ fn update_catalog(
         let mut present = HashSet::new();
         let mut changed_paths = Vec::new();
         let mut mutated = false;
-        let mut changed_rows = Vec::new();
+        let mut changed_keys = Vec::new();
         for record in records
             .raw
             .into_iter()
@@ -3497,9 +3548,9 @@ fn update_catalog(
                     changed_paths.push(record.path.clone());
                 }
                 if changed.is_some() {
-                    changed_rows.push(record.clone());
+                    changed_keys.push(Arc::clone(&key));
                 }
-                catalog.insert(record);
+                catalog.insert_key(key, record);
             }
         }
         let mut removed_keys = Vec::new();
@@ -3525,10 +3576,13 @@ fn update_catalog(
         if mutated || !removed_keys.is_empty() {
             state.persist(
                 &catalogs,
-                super::catalog_store::Delta {
-                    scope: scope_key,
-                    removed: removed_keys,
-                    rows: changed_rows,
+                super::catalog_store::DeltaView {
+                    scope: &scope_key,
+                    removed: &removed_keys,
+                    rows: changed_keys
+                        .iter()
+                        .filter_map(|key| catalogs[&scope_key].rows.get(key))
+                        .collect(),
                     stamp: None,
                 },
                 changed.is_none(),

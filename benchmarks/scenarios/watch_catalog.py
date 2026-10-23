@@ -21,14 +21,15 @@ def main(argv=None):
     parser.add_argument("--protected-files", type=int, default=100000)
     parser.add_argument("--bucket-size", type=int, default=8)
     parser.add_argument("--rounds", type=int, default=20)
+    parser.add_argument("--event-batch-size", type=int, default=64)
     parser.add_argument("--results-root", type=Path)
     parser.add_argument("--json-out", type=Path)
     args = parser.parse_args(argv)
-    if min(args.files, args.bucket_size, args.rounds) < 1 or args.protected_files < 0:
+    if min(args.files, args.bucket_size, args.rounds, args.event_batch_size) < 1 or args.protected_files < 0:
         parser.error("files, bucket-size and rounds must be positive; protected-files nonnegative")
     report = BenchmarkReport("scan.watch-catalog", parameters={
         "files": args.files, "protected_files": args.protected_files,
-        "bucket_size": args.bucket_size, "rounds": args.rounds,
+        "bucket_size": args.bucket_size, "rounds": args.rounds, "event_batch_size": args.event_batch_size,
         "method": "Real empty disguised files across 100 directories. Compare the current native bucket path with scope re-enumeration on identical authorized inputs; this is not a comparison with a previous release. File updates use an independent index WAL and checkpoint; reload is measured without re-enumeration. No archive extraction or Broker is needed.",
     })
     sampler = ProcessSampler()
@@ -45,9 +46,6 @@ def main(argv=None):
             path.touch()
             members.append(path)
         generated = root / "generated"
-        generated.mkdir()
-        for index in range(args.protected_files):
-            (generated / f"output{index}.txt").touch()
         options = DirectoryScanner.compile_scan_options({"filesystem": {"scan_filters_enabled": False}})
         scope = DiscoveryScope(str(root), recursive=True)
         reference_scope = DiscoveryScope(str(root), recursive=True, excluded_subtrees=[str(generated)])
@@ -57,6 +55,8 @@ def main(argv=None):
         try:
             outputs = WatchOutputRoots(state, (scope,))
             outputs.register(str(generated))
+            for index in range(args.protected_files):
+                (generated / f"output{index}.txt").touch()
             catalog = NativeWatchCatalog(state._native, str(workspace.work))
             def update(path=None):
                 errors = options.catalog_update(catalog, scope.native, path)
@@ -78,12 +78,16 @@ def main(argv=None):
             for row in [*lookup, *enumeration]:
                 if row.value != args.bucket_size:
                     raise RuntimeError(f"Different authorized bucket: {row.value}")
-            sequence = iter(range(args.rounds + 1))
+            sequence = iter(range(args.rounds * args.event_batch_size + 1))
             def event():
-                members[-1].write_bytes(b"x" * (next(sequence) + 1))
-                count = update(str(members[-1]))
-                bucket()
-                return count
+                for _ in range(args.event_batch_size):
+                    members[-1].write_bytes(b"x" * (next(sequence) % 128 + 1))
+                    update(str(members[-1]))
+                # Include Written completion in both implementations' timings.
+                commit = getattr(catalog, "commit", None)
+                if commit is not None:
+                    commit()
+                return bucket()
             updates = measure(event, runs=args.rounds)
             report.summary.update({
                 "bucket": timing_summary(lookup), "scope_reenumeration": timing_summary(enumeration),
