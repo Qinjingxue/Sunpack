@@ -181,7 +181,7 @@ class WatchMemoryHarness:
         base = root / label
         watch_root = base / "watch"
         output_root = base / "out"
-        state_path = base / "state.json"
+        state_path = base / "state.snapshot"
         watch_root.mkdir(parents=True, exist_ok=True)
         output_root.mkdir(parents=True, exist_ok=True)
         engine = PipelineEngine(config).start()
@@ -437,7 +437,7 @@ class WatchMemorySampler:
             handles = 0
         state = {}
         if self.watcher is not None:
-            state = _state_stats(self.watcher, self.state_path or Path("state.json"))
+            state = _state_stats(self.watcher, self.state_path or Path("state.snapshot"))
         sample = WatchMemorySample(
             label=label,
             files_seen=files_seen,

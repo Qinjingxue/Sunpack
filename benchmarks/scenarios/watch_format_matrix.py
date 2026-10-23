@@ -353,7 +353,7 @@ def _attempt_outcome(response: Any) -> dict[str, Any]:
 
 
 def _output_summary(root: Path, fed_names: set[str]) -> dict[str, Any]:
-    excluded = fed_names | {"state.json", "events.jsonl"}
+    excluded = fed_names | {"state.snapshot", "events.jsonl"}
     files = [
         path for path in root.rglob("*")
         if path.is_file() and path.name not in excluded
@@ -403,7 +403,7 @@ async def _run_case(
 ) -> dict[str, Any]:
     root = workspace.work / label / "watch"
     root.mkdir(parents=True, exist_ok=True)
-    state_path = workspace.work / label / "state.json"
+    state_path = workspace.work / label / "state.snapshot"
 
     config = load_config()
     config["cli"] = {**(config.get("cli") or {}), "quiet": True, "verbose": False}

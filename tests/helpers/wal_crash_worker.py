@@ -28,7 +28,7 @@ def crash_gate(**payload):
 def state_scenario(root, mode):
     from sunpack.runtime.watch.state import WatchStateStore
 
-    state = WatchStateStore(str(root / "state.json"))
+    state = WatchStateStore(str(root / "state.snapshot"))
     if mode == "inspect":
         emit(kind="state", seq=state.applied_seq, checkpoint=state.checkpoint_seq,
              pending=[asdict(item) for item in state.pending_work_items()])
@@ -103,7 +103,7 @@ async def watch_scenario(root, mode):
             watcher = WatchScheduler(config, input_roots,
                 output_roots=output_roots,
                 root_entries=[WatchRootEntry(path, output_roots[path], True) for path in input_roots],
-                state_path=str(root / "state.json"), cold_start_seconds=0,
+                state_path=str(root / "state.snapshot"), cold_start_seconds=0,
                 pipeline_engine=engine)
             original = watcher._handle_pipeline_progress
             target_event = "task_output_started" if mode == "started" else "task_output_finished"

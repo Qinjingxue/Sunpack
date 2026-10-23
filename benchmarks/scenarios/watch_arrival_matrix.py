@@ -44,7 +44,7 @@ def _same_path(left: str | Path, right: str | Path) -> bool:
 
 
 def _output_summary(root: Path, source_name: str) -> dict[str, Any]:
-    excluded = {source_name, "state.json", "events.jsonl"}
+    excluded = {source_name, "state.snapshot", "events.jsonl"}
     files = [
         path for path in root.rglob("*")
         if path.is_file()
@@ -253,7 +253,7 @@ async def _run_case(
     root = workspace.work / label / "watch"
     root.mkdir(parents=True, exist_ok=True)
     destination = root / source.name
-    state_path = workspace.work / label / "state.json"
+    state_path = workspace.work / label / "state.snapshot"
     config = load_config()
     config["cli"] = {**(config.get("cli") or {}), "quiet": True, "verbose": False}
     config["watch"] = {

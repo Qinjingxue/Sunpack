@@ -4,6 +4,7 @@ import atexit
 from typing import Any, Callable
 
 from sunpack_native import (
+    NativeWatchOperations,
     watch_journal_flush_all as _native_flush_all,
     watch_journal_request_flush as _native_request_flush,
     watch_journal_seed as _native_seed,
@@ -65,7 +66,7 @@ def submit_state_transaction(
     path: str,
     segment_start: int,
     seq: int,
-    operations: list[dict[str, Any]],
+    operations: NativeWatchOperations,
     durable: bool,
     on_written: Callable[[int, int], None] | None = None,
     on_error: Callable[[BaseException], None] | None = None,

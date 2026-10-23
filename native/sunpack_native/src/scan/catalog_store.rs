@@ -1,12 +1,12 @@
 //! Disposable filename cache. Reuses the Watch journal writer on a separate stream.
 use super::directory::{DirectoryEntryRecord, ScopeCatalog};
+use crate::wal::{self, Kind};
 use crate::watch_journal::{self, NativeJournalStream};
-use crate::watch_state::JsonValue;
 use serde::ser::{SerializeMap, SerializeSeq};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader, BufWriter, Write};
+use std::io;
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -30,27 +30,38 @@ pub(super) struct DeltaView<'a> {
     pub rows: Vec<&'a DirectoryEntryRecord>,
     pub stamp: Option<Stamp>,
 }
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum Operations {
-    Single(Delta),
-    Batch(Vec<Delta>),
-}
-#[derive(Deserialize)]
-struct Transaction {
-    seq: u64,
-    operations: Operations,
-}
 const BATCH_BYTES: usize = 256 * 1024;
 const BATCH_DELTAS: usize = 64;
 const MIN_CHECKPOINT_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_WAL_BYTES: u64 = 64 * 1024 * 1024;
 #[derive(Deserialize)]
 struct Snapshot {
-    format: u32,
-    seq: u64,
     stamps: HashMap<String, Stamp>,
-    rows: HashMap<String, Vec<DirectoryEntryRecord>>,
+    rows: HashMap<String, ScopeInput>,
+}
+
+struct ScopeInput(ScopeCatalog);
+impl<'de> Deserialize<'de> for ScopeInput {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = ScopeInput;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("catalog rows")
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut catalog = ScopeCatalog::default();
+                while let Some(row) = seq.next_element::<DirectoryEntryRecord>()? {
+                    catalog.insert(row);
+                }
+                Ok(ScopeInput(catalog))
+            }
+        }
+        deserializer.deserialize_seq(Visitor)
+    }
 }
 
 pub(super) struct CatalogStore {
@@ -81,10 +92,13 @@ impl CatalogStore {
         #[cfg(not(windows))]
         ownership.try_lock()?;
         // Only the owner may touch a checkpoint interrupted before publication.
-        let _ = fs::remove_file(folder.join("catalog.snapshot.tmp"));
+        let _ = fs::remove_file(folder.join("catalog.snapshot.bin.tmp"));
         let mut store = Self {
             folder: folder.to_owned(),
-            stream: folder.join("catalog.wal").to_string_lossy().into_owned(),
+            stream: folder
+                .join("catalog.wal.bin")
+                .to_string_lossy()
+                .into_owned(),
             handle: None,
             seq: 0,
             edits: 0,
@@ -96,38 +110,35 @@ impl CatalogStore {
             _ownership: ownership,
         };
         let load = (|| -> io::Result<()> {
-            let snapshot = folder.join("catalog.snapshot");
+            let snapshot = folder.join("catalog.snapshot.bin");
             if snapshot.exists() {
                 store.snapshot_bytes = fs::metadata(&snapshot)?.len();
-                let snapshot: Snapshot =
-                    serde_json::from_reader(BufReader::new(File::open(snapshot)?))?;
-                if snapshot.format != 1 {
-                    return Err(io::Error::other("unsupported catalog format"));
-                }
-                store.seq = snapshot.seq;
+                let (seq, snapshot): (_, Snapshot) =
+                    wal::read_snapshot(File::open(snapshot)?, Kind::CatalogSnapshot)?;
+                store.seq = seq;
                 store.stamps = snapshot.stamps;
-                for (scope, rows) in snapshot.rows {
-                    let catalog = catalogs.entry(scope).or_default();
-                    for row in rows {
-                        catalog.insert(row);
-                    }
-                }
+                catalogs.extend(
+                    snapshot
+                        .rows
+                        .into_iter()
+                        .map(|(scope, rows)| (scope, rows.0)),
+                );
             }
-            let wal = folder.join("catalog.wal");
+            let wal = folder.join("catalog.wal.bin");
             if wal.exists() {
                 store.wal_bytes = fs::metadata(&wal)?.len();
-                for line in BufReader::new(File::open(wal)?).lines() {
-                    let tx: Transaction = serde_json::from_str(&line?)?;
-                    if tx.seq <= store.seq {
+                let mut reader = wal::Reader::new(File::open(wal)?, Kind::CatalogWal)?;
+                while let Some(seq) = reader.next()? {
+                    let deltas: Vec<Delta> = wal::decode(&reader.payload)?;
+                    if deltas.is_empty() {
+                        return Err(wal::invalid("empty catalog transaction"));
+                    }
+                    if seq <= store.seq {
                         continue;
                     }
-                    if tx.seq != store.seq + 1 {
-                        return Err(io::Error::other("catalog WAL gap"));
+                    if store.seq.checked_add(1) != Some(seq) {
+                        return Err(wal::invalid("catalog WAL gap"));
                     }
-                    let deltas = match tx.operations {
-                        Operations::Single(delta) => vec![delta],
-                        Operations::Batch(deltas) => deltas,
-                    };
                     for delta in deltas {
                         store.edits += delta.rows.len() + delta.removed.len() + 1;
                         let catalog = catalogs.entry(delta.scope.clone()).or_default();
@@ -141,7 +152,10 @@ impl CatalogStore {
                             store.stamps.insert(delta.scope, stamp);
                         }
                     }
-                    store.seq = tx.seq;
+                    store.seq = seq;
+                }
+                if reader.torn {
+                    return Err(wal::invalid("torn catalog WAL"));
                 }
             }
             Ok(())
@@ -154,7 +168,7 @@ impl CatalogStore {
             store.edits = 0;
             store.wal_bytes = 0;
             store.snapshot_bytes = 0;
-            for name in ["catalog.snapshot", "catalog.wal"] {
+            for name in ["catalog.snapshot.bin", "catalog.wal.bin"] {
                 let path = folder.join(name);
                 if path.exists() {
                     fs::remove_file(path)?;
@@ -163,7 +177,7 @@ impl CatalogStore {
         } else if store.snapshot_bytes != 0 && store.edits == 0 {
             // Successful replay proved that every complete transaction was
             // already covered. Do not rewrite an unchanged snapshot to retire it.
-            if fs::remove_file(folder.join("catalog.wal")).is_ok() {
+            if fs::remove_file(folder.join("catalog.wal.bin")).is_ok() {
                 store.wal_bytes = 0;
             }
         }
@@ -174,12 +188,14 @@ impl CatalogStore {
     }
     pub fn append(&mut self, delta: DeltaView<'_>) -> io::Result<()> {
         if self.pending_deltas == 0 {
-            self.pending.push(b'[');
-        } else {
-            self.pending.push(b',');
+            // One array32 header allows borrowed deltas to be encoded in place.
+            self.pending.extend_from_slice(&[0xdd, 0, 0, 0, 0]);
         }
-        // Serialize borrowed rows directly; do not clone records or build a JSON tree.
-        serde_json::to_writer(&mut self.pending, &delta)?;
+        rmp_serde::encode::write(
+            &mut wal::Bounded(&mut self.pending, wal::MAX_FRAME_BYTES),
+            &delta,
+        )
+        .map_err(wal::invalid)?;
         self.edits += delta.rows.len() + delta.removed.len() + 1;
         let cursor_barrier = delta
             .stamp
@@ -201,14 +217,14 @@ impl CatalogStore {
         if self.pending_deltas == 0 {
             return Ok(());
         }
-        self.pending.push(b']');
+        self.pending[1..5].copy_from_slice(&(self.pending_deltas as u32).to_be_bytes());
         let bytes = std::mem::take(&mut self.pending);
         let next = self.seq + 1;
         let written = watch_journal::append_cache(
             &self.stream,
-            &self.folder.join("catalog.wal"),
+            &self.folder.join("catalog.wal.bin"),
             next,
-            JsonValue::Encoded(bytes),
+            bytes,
         )
         .map_err(io::Error::other)?;
         self.wal_bytes = self.wal_bytes.saturating_add(written);
@@ -224,29 +240,24 @@ impl CatalogStore {
         watch_journal::flush_cache(&self.stream, self.seq).map_err(io::Error::other)?;
         #[derive(Serialize)]
         struct View<'a> {
-            format: u32,
-            seq: u64,
             stamps: &'a HashMap<String, Stamp>,
             rows: CatalogRows<'a>,
         }
         let view = View {
-            format: 1,
-            seq: self.seq,
             stamps: &self.stamps,
             rows: CatalogRows(catalogs),
         };
-        let temp = self.folder.join("catalog.snapshot.tmp");
-        let mut writer = BufWriter::with_capacity(1024 * 1024, File::create(&temp)?);
-        serde_json::to_writer(&mut writer, &view)?;
-        writer.flush()?;
-        writer.get_ref().sync_all()?;
-        let snapshot_bytes = writer.get_ref().metadata()?.len();
-        drop(writer);
-        replace(&temp, &self.folder.join("catalog.snapshot"))?;
+        let temp = self.folder.join("catalog.snapshot.bin.tmp");
+        let mut file = File::create(&temp)?;
+        let snapshot_bytes =
+            wal::write_snapshot(&mut file, Kind::CatalogSnapshot, self.seq, &view)?;
+        file.sync_all()?;
+        drop(file);
+        replace(&temp, &self.folder.join("catalog.snapshot.bin"))?;
         if let Some(mut handle) = self.handle.take() {
             watch_journal::close_cache(&mut handle).map_err(io::Error::other)?;
         }
-        let wal = self.folder.join("catalog.wal");
+        let wal = self.folder.join("catalog.wal.bin");
         if wal.exists() {
             fs::remove_file(wal)?;
         }

@@ -69,7 +69,7 @@ def _watcher(tmp_path, monkeypatch, *, deep_detect=False):
         [str(root)],
         output_roots={str(root): str(output)},
         root_entries=[WatchRootEntry(str(root), str(output), deep_detect)],
-        state_path=str(tmp_path / "state.json"),
+        state_path=str(tmp_path / "state.snapshot"),
         cold_start_seconds=0,
         pipeline_engine=FakePipelineEngine(_Runner),
         notification_sink=sink,

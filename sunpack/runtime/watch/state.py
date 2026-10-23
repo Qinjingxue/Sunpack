@@ -248,12 +248,12 @@ class WatchStateStore:
 
     def _segment_path(self, start_seq: int) -> Path:
         return self.path.with_name(
-            f"{self.path.stem}.journal.{int(start_seq):020d}.jsonl"
+            f"{self.path.stem}.journal.{int(start_seq):020d}.wal"
         )
 
     def _journal_paths(self) -> list[Path]:
         prefix = f"{self.path.stem}.journal."
-        suffix = ".jsonl"
+        suffix = ".wal"
         paths: list[tuple[int, Path]] = []
 
         try:
@@ -273,7 +273,7 @@ class WatchStateStore:
 
     def _segment_start_from_path(self, path: Path) -> int | None:
         prefix = f"{self.path.stem}.journal."
-        suffix = ".jsonl"
+        suffix = ".wal"
         name = path.name
         if not name.startswith(prefix) or not name.endswith(suffix):
             return None
@@ -292,6 +292,18 @@ class WatchStateStore:
             coordinator = self._path_coordinator
         with coordinator.checkpoint_lock, self._state_lock:
             self._ensure_open_locked()
+            if self.path.suffix == ".snapshot" and (
+                self.path.with_suffix(".json").exists()
+                or any(
+                    path.name[len(f"{self.path.stem}.journal."):-len(".jsonl")].isdecimal()
+                    for path in self.path.parent.glob(f"{self.path.stem}.journal.*.jsonl")
+                )
+            ):
+                raise WatchStateJournalError(
+                    "Old Watch persistence must be reset before using binary WAL. "
+                    "Run the installer to remove old state files; unfinished tasks and "
+                    "existing output-folder exclusions will be reset."
+                )
             self._reset_memory_locked()
             if self.path.exists():
                 try:
@@ -318,7 +330,7 @@ class WatchStateStore:
 
     def _load_journal_segments_locked(self) -> int | None:
         expected_seq = self._checkpoint_seq + 1
-        last_segment: tuple[Path, int, bool] | None = None
+        last_segment: tuple[Path, int, bool, int] | None = None
         for path in self._journal_paths():
             segment_start = self._segment_start_from_path(path)
             if segment_start is None:
@@ -333,7 +345,7 @@ class WatchStateStore:
                 continue
             except ValueError as exc:
                 raise WatchStateJournalError(str(exc)) from exc
-            last_segment = (path, segment_start, bool(replay.records))
+            last_segment = (path, segment_start, bool(replay.records), int(replay.valid_bytes))
             if replay.records:
                 self._applied_seq = int(replay.applied_seq)
                 expected_seq = int(replay.expected_seq)
@@ -347,35 +359,11 @@ class WatchStateStore:
         # than creating one WAL file per watch restart.
         if self._path_coordinator.segment_start is not None or last_segment is None:
             return None
-        path, start, has_records = last_segment
+        path, start, has_records, valid_bytes = last_segment
         if not has_records and start != self._applied_seq + 1:
             return None  # An obsolete segment fully covered by the snapshot.
-        self._truncate_incomplete_journal_tail(path)
+        self._native.truncate_journal_tail(str(path), valid_bytes)
         return start
-
-    @staticmethod
-    def _truncate_incomplete_journal_tail(path: Path) -> None:
-        """Discard only a torn final WAL record before appending to its segment."""
-        with open_service_file(path, "rb+") as handle:
-            handle.seek(0, os.SEEK_END)
-            end = handle.tell()
-            if not end:
-                return
-            handle.seek(end - 1)
-            if handle.read(1) == b"\n":
-                return
-            cursor = end
-            valid_end = 0
-            while cursor:
-                start = max(0, cursor - 8192)
-                handle.seek(start)
-                newline = handle.read(cursor - start).rfind(b"\n")
-                if newline >= 0:
-                    valid_end = start + newline + 1
-                    break
-                cursor = start
-            handle.truncate(valid_end)
-            os.fsync(handle.fileno())
 
     def save(self) -> None:
         """Force one checkpoint and wait until it covers the current sequence."""
@@ -803,7 +791,7 @@ class WatchStateStore:
             path=str(self._segment_path(segment_start)),
             segment_start=segment_start,
             seq=seq,
-            operations=operations,
+            operations=decoded,
             durable=durable,
             on_written=self._on_journal_written,
             on_error=self._on_journal_error,

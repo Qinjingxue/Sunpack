@@ -11,8 +11,8 @@ mod postprocess;
 mod relations;
 mod scan;
 mod verification;
+mod wal;
 mod watch_journal;
-mod watch_state;
 mod watch_store;
 
 #[cfg(test)]

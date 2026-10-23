@@ -25,7 +25,7 @@ from sunpack.core.support.resource_lifecycle import (
 )
 
 
-SERVICE_STATE = "state.json"
+SERVICE_STATE = "state.snapshot"
 WATCH_ROOTS_FILENAME = "sunpack_watch_roots.txt"
 # Optional columns: ``<input root> | <output root> | <deep_detect> | <initial_scanned>``.
 WATCH_ROOT_OUTPUT_SEPARATOR = "|"

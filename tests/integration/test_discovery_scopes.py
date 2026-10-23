@@ -77,7 +77,7 @@ def test_targeted_catalog_updates_preserve_original_depth_pruning_and_conflicts(
         path.write_bytes(b"opaque")
     options = NativeDirectoryScanOptions([], ["skip"], [], ["same.blocked"], [], [], [])
     scope = DiscoveryScope(str(root), max_depth=1)
-    state = WatchStateStore(str(tmp_path / "state.json"))
+    state = WatchStateStore(str(tmp_path / "state.snapshot"))
     catalog = NativeWatchCatalog(state._native)
     try:
         for target in (str(root / "child"), str(root / "skip"), str(paths[-1])):
@@ -120,7 +120,7 @@ def test_deep_watch_catalog_and_internal_recovery_share_effective_policy(tmp_pat
     config = make_config({"filesystem": {"scan_filters": [
         {"name": "blacklist", "enabled": True, "blocked_extensions": [".bin"]}]},
         "watch": {"clipboard_monitor_enabled": False}})
-    watcher = module.WatchScheduler(config, [str(root)], state_path=str(tmp_path / "state.json"),
+    watcher = module.WatchScheduler(config, [str(root)], state_path=str(tmp_path / "state.snapshot"),
         root_entries=[WatchRootEntry(str(root), str(output), deep_detect=True)], pipeline_engine=Engine())
     try:
         candidates, errors = watcher._scan_candidates([str(root)], recursive=False)
@@ -208,7 +208,7 @@ def test_output_roots_persist_and_external_replacements_are_inputs(tmp_path):
     root = tmp_path / "input"
     root.mkdir()
     output = root / "result"
-    state_path = tmp_path / "state.json"
+    state_path = tmp_path / "state.snapshot"
     scope = DiscoveryScope(str(root), recursive=True)
     state = WatchStateStore(str(state_path))
     outputs = WatchOutputRoots(state, (scope,))
@@ -252,7 +252,7 @@ def test_reserved_output_rejects_external_directory_before_registration(tmp_path
 
     root = tmp_path / "input"
     root.mkdir()
-    state = WatchStateStore(str(tmp_path / "state.json"))
+    state = WatchStateStore(str(tmp_path / "state.snapshot"))
     outputs = WatchOutputRoots(state, (DiscoveryScope(str(root), recursive=True),))
     registry = OutputReservationRegistry()
     registry.watch_outputs = outputs
@@ -286,7 +286,7 @@ def test_output_retirement_keeps_only_unfinished_recovery_dependencies(tmp_path)
     source = root / "source.blob"
     source.write_bytes(b"source")
     output = root / "result"
-    state_path = str(tmp_path / "state.json")
+    state_path = str(tmp_path / "state.snapshot")
     state = WatchStateStore(state_path)
     outputs = WatchOutputRoots(state, (DiscoveryScope(str(root), recursive=True),))
     outputs.register(str(output))
@@ -317,7 +317,7 @@ def test_catalog_checkpoint_wal_replay_and_damage_are_independent_of_task_wal(tm
     first = root / "same.001"
     first.write_bytes(b"one")
     scope = DiscoveryScope(str(root), recursive=True)
-    state = WatchStateStore(str(tmp_path / "state.json"))
+    state = WatchStateStore(str(tmp_path / "state.snapshot"))
     state.queue_active(WatchCandidate(str(first), 3, first.stat().st_mtime), persist=True, durable=True)
     options = DirectoryScanner.compile_scan_options({"filesystem": {"scan_filters_enabled": False}})
     catalog = NativeWatchCatalog(state._native, str(tmp_path))
@@ -340,14 +340,14 @@ catalog.set_cursor(scope,"volume",1,30)
 os._exit(0)
 """
     subprocess.run([sys.executable, "-c", script, str(root), str(tmp_path)], check=True, timeout=20)
-    state = WatchStateStore(str(tmp_path / "state.json"))
+    state = WatchStateStore(str(tmp_path / "state.snapshot"))
     try:
         catalog = NativeWatchCatalog(state._native, str(tmp_path))
         assert catalog.cursor(scope.native) == ("volume", 1, 30)
         _, raw = options.catalog_snapshot(catalog, scope.native, str(first))
         assert set(raw.file_columns()[0]) == {str(first), str(root / "same.002")}
         catalog.close()
-        (tmp_path / "catalog.wal").write_bytes(b"broken tail")
+        (tmp_path / "catalog.wal.bin").write_bytes(b"broken tail")
         catalog = NativeWatchCatalog(state._native, str(tmp_path))
         assert catalog.cursor(scope.native) is None
         assert len(state.pending_work_items()) == 1
@@ -355,7 +355,7 @@ os._exit(0)
         _, raw = options.catalog_snapshot(catalog, scope.native, str(first))
         assert len(raw.file_columns()[0]) == 2
         catalog.close()
-        (tmp_path / "catalog.wal").mkdir()
+        (tmp_path / "catalog.wal.bin").mkdir()
         catalog = NativeWatchCatalog(state._native, str(tmp_path))
         assert catalog.error
         assert not options.catalog_update(catalog, scope.native)
@@ -390,17 +390,17 @@ assert not options.catalog_update(catalog, scope)
 second.write_bytes(b'two')
 assert not options.catalog_update(catalog, scope, str(second))
 catalog.set_cursor(scope, 'volume', 1, 30)
-blocked = open(folder / ('catalog.wal' if sys.argv[2] == 'True' else 'catalog.snapshot'), 'rb')
+blocked = open(folder / ('catalog.wal.bin' if sys.argv[2] == 'True' else 'catalog.snapshot.bin'), 'rb')
 catalog.close()
 assert catalog.error
 os._exit(0)
 '''
     subprocess.run([sys.executable, "-c", script, str(tmp_path), str(published)], check=True, timeout=20)
-    snapshot = tmp_path / "catalog.snapshot"
+    snapshot = tmp_path / "catalog.snapshot.bin"
     before = snapshot.read_bytes()
     before_mtime = snapshot.stat().st_mtime_ns
-    wal = tmp_path / "catalog.wal"
-    temp = tmp_path / "catalog.snapshot.tmp"
+    wal = tmp_path / "catalog.wal.bin"
+    temp = tmp_path / "catalog.snapshot.bin.tmp"
     assert wal.exists()
     assert temp.exists() is not published
     assert not (tmp_path / "catalog.lock").exists()
@@ -448,12 +448,12 @@ def test_catalog_event_batches_checkpoint_at_idle_and_preserve_case(tmp_path):
     path = directory / "OriginalCase.001"
     path.write_bytes(b"initial")
     scope = DiscoveryScope(str(root), recursive=True)
-    state = WatchStateStore(str(tmp_path / "state.json"))
+    state = WatchStateStore(str(tmp_path / "state.snapshot"))
     options = DirectoryScanner.compile_scan_options({"filesystem": {"scan_filters_enabled": False}})
     catalog = NativeWatchCatalog(state._native, str(tmp_path))
     try:
         assert not options.catalog_update(catalog, scope.native)
-        snapshot = tmp_path / "catalog.snapshot"
+        snapshot = tmp_path / "catalog.snapshot.bin"
         initial = snapshot.read_bytes()
         for index in range(9000):
             path.write_bytes(b"x" * (index % 128 + 1))
@@ -464,11 +464,12 @@ def test_catalog_event_batches_checkpoint_at_idle_and_preserve_case(tmp_path):
         assert not options.catalog_update(catalog, scope.native, str(path))
         catalog.commit()
         assert snapshot.read_bytes() == initial
-        wal = tmp_path / "catalog.wal"
+        wal = tmp_path / "catalog.wal.bin"
         assert wal.stat().st_size > 4 * 1024 * 1024
-        transactions = [json.loads(line) for line in wal.read_text().splitlines()]
+        from tests.helpers.binary_wal import frames
+        transactions = frames(wal)
         assert len(transactions) < 150
-        assert any(len(tx["operations"]) > 1 for tx in transactions)
+        assert any(int.from_bytes(payload[1:5], "big") > 1 for _, payload, _ in transactions)
         catalog.commit(True)
         assert snapshot.read_bytes() != initial
         assert not wal.exists()
@@ -506,7 +507,7 @@ def test_recursive_restart_replays_indexed_directories_without_initial_scan(tmp_
         path.write_bytes(b"old")
     config = make_config({"watch": {"clipboard_monitor_enabled": False}})
     def watcher():
-        return module.WatchScheduler(config, [str(root), str(other)], state_path=str(tmp_path / "state.json"),
+        return module.WatchScheduler(config, [str(root), str(other)], state_path=str(tmp_path / "state.snapshot"),
             root_entries=[WatchRootEntry(str(path), initial_scanned=True, recursive=True) for path in (root, other)],
             pipeline_engine=FakePipelineEngine(lambda config: None))
     async def cycle():
@@ -555,7 +556,7 @@ def test_recursive_restart_replays_indexed_directories_without_initial_scan(tmp_
             await second.stop()
             second._close_blocking()
         # Corrupt cache + unavailable journal rebuilds metadata, without re-admitting old input.
-        (tmp_path / "catalog.snapshot").write_bytes(b"broken")
+        (tmp_path / "catalog.snapshot.bin").write_bytes(b"broken")
         monkeypatch.setattr(module, "watch_volume_cursor", lambda path: (_ for _ in ()).throw(OSError("unavailable")))
         third = watcher()
         try:
@@ -589,7 +590,7 @@ def test_watch_filters_reserved_flatten_work_and_persists_final_identity(tmp_pat
     checked = []
     async def execute():
         async with PipelineEngine(config) as engine:
-            watcher = module.WatchScheduler(config, [str(root)], state_path=str(tmp_path / "state.json"),
+            watcher = module.WatchScheduler(config, [str(root)], state_path=str(tmp_path / "state.snapshot"),
                 root_entries=[WatchRootEntry(str(root), recursive=True)], pipeline_engine=engine)
             def protected_flatten(path, *, work_path=None):
                 assert work_path is not None
@@ -627,7 +628,7 @@ def test_watch_volume_deletion_and_arrival_retry_the_existing_blocker(tmp_path, 
         "watch": {"clipboard_monitor_enabled": False, "quiet_min_seconds": 0.01, "quiet_max_seconds": 0.01}})
     async def execute():
         async with PipelineEngine(config) as engine:
-            watcher = module.WatchScheduler(config, [str(root)], state_path=str(tmp_path / "state.json"),
+            watcher = module.WatchScheduler(config, [str(root)], state_path=str(tmp_path / "state.snapshot"),
                 root_entries=[WatchRootEntry(str(root), recursive=True)], pipeline_engine=engine, cold_start_seconds=0)
             try:
                 scope = next(iter(watcher.scopes.values()))

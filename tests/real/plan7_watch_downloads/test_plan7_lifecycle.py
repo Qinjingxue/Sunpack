@@ -62,7 +62,7 @@ def test_plan7_deleted_partial_download_can_restart_from_scratch(tmp_path):
         password=PASSWORD,
         payload_size=128 * 1024,
     )
-    state_path = tmp_path / "redownload" / "state.json"
+    state_path = tmp_path / "redownload" / "state.snapshot"
     first = start_watch(
         tmp_path,
         "redownload",
@@ -165,7 +165,7 @@ def test_plan7_incomplete_split_recovers_after_watcher_restart(tmp_path):
     assert len(parts) >= 3
     head = next(path for path in parts if path.name.casefold().endswith(".zip.001"))
     ordered = [head, *[path for path in parts if path != head]]
-    state_path = tmp_path / "restart_split" / "state.json"
+    state_path = tmp_path / "restart_split" / "state.snapshot"
 
     first = start_watch(
         tmp_path,

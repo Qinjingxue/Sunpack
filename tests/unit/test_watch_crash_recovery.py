@@ -38,7 +38,7 @@ def _watch_scheduler_shell(scheduler_module):
 
 
 def test_pending_output_recovery_state_round_trips(tmp_path):
-    state_path = tmp_path / "state.json"
+    state_path = tmp_path / "state.snapshot"
     source = tmp_path / "outer.zip"
     source.write_bytes(b"x")
     inner = tmp_path / "out" / "inner.zip"
@@ -76,7 +76,7 @@ def test_pending_output_recovery_state_round_trips(tmp_path):
 
 
 def test_rebase_pending_work_atomically_moves_recovery_anchor(tmp_path):
-    state_path = tmp_path / "state.json"
+    state_path = tmp_path / "state.snapshot"
     outer = tmp_path / "outer.zip"
     first = tmp_path / "out" / "first.zip"
     second = tmp_path / "out" / "second.zip"
@@ -149,7 +149,7 @@ def test_live_enqueue_keeps_owner_memory_only(tmp_path):
 def test_noncritical_attempt_refresh_does_not_force_an_extra_fsync(tmp_path, monkeypatch):
     import sunpack.runtime.watch.state as state_module
 
-    state = WatchStateStore(str(tmp_path / "state.json"))
+    state = WatchStateStore(str(tmp_path / "state.snapshot"))
     source = tmp_path / "queued.zip"
     source.write_bytes(b"x")
     state.queue_active(_candidate(source))
@@ -206,7 +206,7 @@ def test_departed_inflight_owner_does_not_delete_durable_pending(tmp_path):
 
     source = tmp_path / "outer.zip"
     source.write_bytes(b"x")
-    state = WatchStateStore(str(tmp_path / "state.json"))
+    state = WatchStateStore(str(tmp_path / "state.snapshot"))
     state.queue_active(_candidate(source))
 
     scheduler = _watch_scheduler_shell(scheduler_module)
@@ -231,7 +231,7 @@ def test_departed_unowned_path_is_still_forgotten(tmp_path):
 
     source = tmp_path / "gone.zip"
     source.write_bytes(b"x")
-    state = WatchStateStore(str(tmp_path / "state.json"))
+    state = WatchStateStore(str(tmp_path / "state.snapshot"))
     state.queue_active(_candidate(source))
 
     scheduler = _watch_scheduler_shell(scheduler_module)
@@ -267,7 +267,7 @@ def test_critical_semantic_event_propagates_callback_failure():
 
 
 def test_committed_roots_collapse_nested_outputs(tmp_path):
-    state = WatchStateStore(str(tmp_path / "state.json"))
+    state = WatchStateStore(str(tmp_path / "state.snapshot"))
     outer = tmp_path / "outer.zip"
     outer.write_bytes(b"x")
     state.queue_active(_candidate(outer))
@@ -346,7 +346,7 @@ def test_enqueue_does_not_publish_memory_work_when_durable_queue_fails(tmp_path)
 def test_persisted_blocker_wins_over_stale_pending_recovery(tmp_path):
     import sunpack.runtime.watch.scheduler as scheduler_module
 
-    state = WatchStateStore(str(tmp_path / "state.json"))
+    state = WatchStateStore(str(tmp_path / "state.snapshot"))
     archive = tmp_path / "inner.zip"
     archive.write_bytes(b"x")
     state.mark(
@@ -404,7 +404,7 @@ def test_watch_lifecycle_state_rejection_fails_closed():
 def test_crash_recovery_checks_output_identity_and_requeues_source(tmp_path, monkeypatch, replaced):
     import sunpack.runtime.watch.scheduler as scheduler_module
 
-    state_path = tmp_path / "state.json"
+    state_path = tmp_path / "state.snapshot"
     source = tmp_path / "outer.zip"
     source.write_bytes(b"source")
     output = tmp_path / "out" / "outer"
@@ -454,7 +454,7 @@ def test_crash_recovery_checks_output_identity_and_requeues_source(tmp_path, mon
 def test_missing_committed_output_requeues_surviving_source(tmp_path, monkeypatch):
     import sunpack.runtime.watch.scheduler as scheduler_module
 
-    state_path = tmp_path / "state.json"
+    state_path = tmp_path / "state.snapshot"
     source = tmp_path / "outer.zip"
     source.write_bytes(b"source")
     output = tmp_path / "out" / "outer"
@@ -500,7 +500,7 @@ def test_missing_committed_output_requeues_surviving_source(tmp_path, monkeypatc
 def test_missing_committed_output_without_source_keeps_recovery_owner(tmp_path, monkeypatch):
     import sunpack.runtime.watch.scheduler as scheduler_module
 
-    state_path = tmp_path / "state.json"
+    state_path = tmp_path / "state.snapshot"
     source = tmp_path / "outer.zip"
     source.write_bytes(b"source")
     output = tmp_path / "out" / "outer"

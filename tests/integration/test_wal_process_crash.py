@@ -101,9 +101,10 @@ def test_concurrent_durable_wal_survives_process_death(tmp_path, boundary):
 
 def test_torn_final_wal_append_can_recover_and_continue(tmp_path):
     _run_child(tmp_path, "state", "wal", kill=True)
-    [segment] = list(tmp_path.glob("state.journal.*.jsonl"))
-    with segment.open("a", encoding="utf-8", newline="") as stream:
-        stream.write('{"version":18,"seq":121,"operations":[')
+    [segment] = list(tmp_path.glob("state.journal.*.wal"))
+    with segment.open("ab") as stream:
+        from tests.helpers.binary_wal import frame
+        stream.write(frame(121, b"\x91\x92\x00")[:-1])
         stream.flush()
         os.fsync(stream.fileno())
     assert _run_child(tmp_path, "state", "inspect")["seq"] == 120

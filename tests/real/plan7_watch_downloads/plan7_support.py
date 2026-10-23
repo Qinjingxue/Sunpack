@@ -533,7 +533,7 @@ def start_watch(
             config,
             [str(watch_root)],
             out_dir=str(output_root),
-            state_path=str(state_path or (tmp_path / label / "state.json")),
+            state_path=str(state_path or (tmp_path / label / "state.snapshot")),
             cold_start_seconds=cold_start_seconds,
             pipeline_engine=engine,
             notification_sink=notification_sink,

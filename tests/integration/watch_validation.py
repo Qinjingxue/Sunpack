@@ -309,7 +309,7 @@ def run_scenario(base: Path, scenario: Scenario, payload: bytes, *, chunk_bytes:
     scenario_root = base / scenario.name / "in"
     scenario_root.mkdir(parents=True, exist_ok=True)
     final_path = scenario_root / "download.zip"
-    state_path = base / scenario.name / ".sunpack_watch" / "state.json"
+    state_path = base / scenario.name / ".sunpack_watch" / "state.snapshot"
     result = ScenarioResult(
         name=scenario.name,
         description=scenario.description,

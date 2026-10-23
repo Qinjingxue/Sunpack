@@ -24,7 +24,7 @@ pbkdf2 = "0.12"
 pyo3 = { version = "0.29", features = ["extension-module"] }
 regex = "1.11"
 rayon = "1.10"
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 sevenz-rust2 = { version = "0.21", default-features = false, features = ["aes256", "compress"] }
 sha1 = "0.10"
@@ -34,6 +34,7 @@ sunpack-usn-core = { path = "../sunpack_usn_core", default-features = false, fea
 xz2 = "0.1"
 zstd = "0.13"
 unicode-normalization = "0.1"
+rmp-serde = "1"
 
 [build-dependencies]
 cc = "1"

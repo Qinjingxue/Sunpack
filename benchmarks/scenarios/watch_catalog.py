@@ -50,7 +50,7 @@ def main(argv=None):
         scope = DiscoveryScope(str(root), recursive=True)
         reference_scope = DiscoveryScope(str(root), recursive=True, excluded_subtrees=[str(generated)])
         baseline_memory = sampler.take().to_dict()
-        state_path = workspace.work / "state.json"
+        state_path = workspace.work / "state.snapshot"
         state = WatchStateStore(str(state_path))
         try:
             outputs = WatchOutputRoots(state, (scope,))
@@ -92,12 +92,12 @@ def main(argv=None):
             report.summary.update({
                 "bucket": timing_summary(lookup), "scope_reenumeration": timing_summary(enumeration),
                 "file_update_wal_and_bucket": timing_summary(updates),
-                "index_wal_bytes": (workspace.work / "catalog.wal").stat().st_size,
+                "index_wal_bytes": (workspace.work / "catalog.wal.bin").stat().st_size,
                 "initial_memory": baseline_memory, "catalog_memory": resident_memory,
             })
             checkpoint = measure(catalog.close, runs=1)[0]
             report.summary["index_checkpoint_ms"] = checkpoint.wall_ms
-            report.summary["index_checkpoint_bytes"] = (workspace.work / "catalog.snapshot").stat().st_size
+            report.summary["index_checkpoint_bytes"] = (workspace.work / "catalog.snapshot.bin").stat().st_size
             catalog = None
             def restore():
                 nonlocal catalog

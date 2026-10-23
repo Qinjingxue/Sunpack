@@ -108,7 +108,7 @@ def test_watch_retries_real_encrypted_zip_after_password_source_update(tmp_path,
                 monkeypatch.setattr(engine, "run", delayed_result)
             watcher = WatchScheduler(
                 config, [str(watch_root)], out_dir=str(output_root),
-                state_path=str(tmp_path / "state.json"), cold_start_seconds=0,
+                state_path=str(tmp_path / "state.snapshot"), cold_start_seconds=0,
                 pipeline_engine=engine,
             )
             watcher.enqueue(str(archive))
@@ -143,7 +143,7 @@ def test_watch_retries_real_encrypted_zip_after_password_source_update(tmp_path,
                 watcher.state.flush()
                 watcher = WatchScheduler(
                     config, [str(watch_root)], out_dir=str(output_root),
-                    state_path=str(tmp_path / "state.json"), cold_start_seconds=0,
+                    state_path=str(tmp_path / "state.snapshot"), cold_start_seconds=0,
                     pipeline_engine=engine,
                 )
                 # Exercise startup reconciliation without starting a real
@@ -229,7 +229,7 @@ def test_watch_aggregates_all_zipcrypto_fast_matches(tmp_path, monkeypatch, incl
         async with PipelineEngine(config) as engine:
             watcher = WatchScheduler(
                 config, [str(watch_root)], out_dir=str(output_root),
-                state_path=str(tmp_path / "state.json"), cold_start_seconds=0,
+                state_path=str(tmp_path / "state.snapshot"), cold_start_seconds=0,
                 pipeline_engine=engine,
             )
             watcher.enqueue(str(archive))

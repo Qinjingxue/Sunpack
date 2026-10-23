@@ -1,4 +1,3 @@
-import json
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
@@ -8,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.helpers.binary_wal import header, frame, frames
 import sunpack.runtime.watch.state as watch_state_module
 from sunpack.runtime.watch.state import (
     WatchStateJournalError,
@@ -26,7 +26,7 @@ def _candidate(path: Path, index: int = 1):
 
 
 def test_checkpoint_uses_unique_atomic_snapshot_writer(tmp_path, monkeypatch):
-    state_path = tmp_path / "state.json"
+    state_path = tmp_path / "state.snapshot"
     state = WatchStateStore(str(state_path))
     state.queue_active(_candidate(tmp_path / "queued.7z"), durable=True)
     temporary_paths = []
@@ -42,16 +42,16 @@ def test_checkpoint_uses_unique_atomic_snapshot_writer(tmp_path, monkeypatch):
     assert len(temporary_paths) == 1
     assert temporary_paths[0].parent == tmp_path
     assert temporary_paths[0].name.endswith(".tmp")
-    payload = json.loads(state_path.read_text(encoding="utf-8"))
-    assert payload["checkpoint_seq"] == state.applied_seq
-    assert not list(tmp_path.glob(".state.json.*.tmp"))
+    from sunpack_native import NativeWatchState
+    assert NativeWatchState().load_snapshot(str(state_path)) == state.applied_seq
+    assert not list(tmp_path.glob(".state.snapshot.*.tmp"))
 
 
 def test_incremental_update_appends_segment_without_replacing_snapshot(tmp_path, monkeypatch):
-    state_path = tmp_path / "state.json"
+    state_path = tmp_path / "state.snapshot"
     state = WatchStateStore(str(state_path))
     state.save()
-    snapshot_before = state_path.read_text(encoding="utf-8")
+    snapshot_before = state_path.read_bytes()
     replacements = []
     real_replace = watch_state_module.os.replace
 
@@ -63,11 +63,9 @@ def test_incremental_update_appends_segment_without_replacing_snapshot(tmp_path,
     state.queue_active(_candidate(tmp_path / "queued.7z"), durable=True)
 
     assert not replacements
-    assert state_path.read_text(encoding="utf-8") == snapshot_before
-    journal_text = state.journal_path.read_text(encoding="utf-8")
-    assert journal_text.endswith("\n")
-    transaction = json.loads(journal_text)
-    assert transaction["seq"] == state.applied_seq
+    assert state_path.read_bytes() == snapshot_before
+    [transaction] = frames(state.journal_path)
+    assert transaction[0] == state.applied_seq
     [reloaded] = WatchStateStore(str(state_path)).pending_work_items()
     assert reloaded.path == str((tmp_path / "queued.7z").resolve())
 
@@ -76,7 +74,7 @@ def test_failed_journal_append_faults_store(tmp_path):
     from sunpack_native import watch_journal_request_flush
     from sunpack.runtime.watch.journal_commit import journal_stats
 
-    state = WatchStateStore(str(tmp_path / "state.json"))
+    state = WatchStateStore(str(tmp_path / "state.snapshot"))
     state.save()
     # Force native OpenOptions(file) to fail without relying on Python internals.
     journal_path = state.journal_path
@@ -102,13 +100,13 @@ def test_failed_journal_append_faults_store(tmp_path):
 
 
 def test_truncated_segment_tail_is_ignored_and_recovered(tmp_path):
-    state_path = tmp_path / "state.json"
+    state_path = tmp_path / "state.snapshot"
     first = _candidate(tmp_path / "first.7z", 1)
     state = WatchStateStore(str(state_path))
     state.queue_active(first, durable=True)
     damaged_segment = state.journal_path
     with open(damaged_segment, "ab") as handle:
-        handle.write(b'{"seq":2,"operations":[')
+        handle.write(frame(2, b"\x91\x92\x00")[:-1])
 
     recovered = WatchStateStore(str(state_path))
     assert [item.path for item in recovered.pending_work_items()] == [first.path]
@@ -116,7 +114,7 @@ def test_truncated_segment_tail_is_ignored_and_recovered(tmp_path):
 
 
 def test_repeated_store_reopen_reuses_one_wal_segment(tmp_path):
-    state_path = tmp_path / "state.json"
+    state_path = tmp_path / "state.snapshot"
     segments = set()
     for index in range(16):
         store = WatchStateStore(str(state_path))
@@ -125,7 +123,7 @@ def test_repeated_store_reopen_reuses_one_wal_segment(tmp_path):
         store.close()
 
     assert len(segments) == 1
-    assert len(list(tmp_path.glob("state.journal.*.jsonl"))) == 1
+    assert len(list(tmp_path.glob("state.journal.*.wal"))) == 1
     recovered = WatchStateStore(str(state_path))
     assert recovered.applied_seq == 16
     assert recovered.pending_work_count == 16
@@ -133,7 +131,7 @@ def test_repeated_store_reopen_reuses_one_wal_segment(tmp_path):
 
 
 def test_checkpoint_rotation_still_starts_a_new_wal_segment(tmp_path):
-    state_path = tmp_path / "state.json"
+    state_path = tmp_path / "state.snapshot"
     first = WatchStateStore(str(state_path))
     first.queue_active(_candidate(tmp_path / "first.7z"), durable=True)
     original_segment = first.journal_path
@@ -157,7 +155,7 @@ def test_covered_wal_retirement_retries_without_rewriting_snapshot(tmp_path, mon
     # Normal checkpoint tests never fail unlink: this catches lost retry state,
     # needless snapshot rewrites, and deletion of a concurrently appended WAL.
     # Three durable records keep this independent failure coverage inexpensive.
-    state_path = tmp_path / "state.json"
+    state_path = tmp_path / "state.snapshot"
     state = WatchStateStore(str(state_path))
     candidates = [_candidate(tmp_path / f"{index}.bin", index + 1) for index in range(3)]
     state.queue_active(candidates[0], durable=True)
@@ -210,7 +208,7 @@ def test_startup_retirement_preserves_sealed_segment_with_uncovered_suffix(tmp_p
     # A filename's starting USN cannot prove its whole segment is redundant.
     # Existing recovery tests lack a segment straddling the snapshot boundary.
     # One three-record recovery fixture covers that data-loss risk cheaply.
-    state_path = tmp_path / "state.json"
+    state_path = tmp_path / "state.snapshot"
     state = WatchStateStore(str(state_path))
     candidates = [_candidate(tmp_path / f"{index}.bin", index + 1) for index in range(3)]
     state.queue_active(candidates[0], durable=True)
@@ -227,10 +225,10 @@ def test_startup_retirement_preserves_sealed_segment_with_uncovered_suffix(tmp_p
         state.queue_active(candidates[2], durable=True)
         newer = state.journal_path
         state.close()
-    second, third = newer.read_bytes().splitlines(keepends=True)
+    (_, _, second), (_, _, third) = frames(newer)
     older.write_bytes(older.read_bytes() + second)
     newest = state._segment_path(3)
-    newest.write_bytes(third)
+    newest.write_bytes(header() + third)
     newer.unlink()
     recovered = WatchStateStore(str(state_path))
     try:
@@ -243,22 +241,22 @@ def test_startup_retirement_preserves_sealed_segment_with_uncovered_suffix(tmp_p
 
 @pytest.mark.parametrize("has_valid_record", [False, True])
 def test_reopen_repairs_torn_tail_before_appending(tmp_path, has_valid_record):
-    state_path = tmp_path / "state.json"
+    state_path = tmp_path / "state.snapshot"
     first = WatchStateStore(str(state_path))
     if has_valid_record:
         first.queue_active(_candidate(tmp_path / "first.7z"), durable=True)
     segment = first.journal_path
     first.close()
     with open(segment, "ab") as handle:
-        handle.write(b'{"seq":999,"operations":[')
+        handle.write(frame(999, b"\x91\x92\x00")[:-1] if has_valid_record else header()[:7])
 
     reopened = WatchStateStore(str(state_path))
     assert reopened.journal_path == segment
     reopened.queue_active(_candidate(tmp_path / "second.7z", 2), durable=True)
     reopened.close()
 
-    assert b'{"seq":999' not in segment.read_bytes()
-    assert len(list(tmp_path.glob("state.journal.*.jsonl"))) == 1
+    assert [seq for seq, _, _ in frames(segment)] == ([1, 2] if has_valid_record else [1])
+    assert len(list(tmp_path.glob("state.journal.*.wal"))) == 1
     recovered = WatchStateStore(str(state_path))
     assert recovered.applied_seq == (2 if has_valid_record else 1)
     assert {item.path for item in recovered.pending_work_items()} == {
@@ -269,10 +267,10 @@ def test_reopen_repairs_torn_tail_before_appending(tmp_path, has_valid_record):
 
 
 def test_corrupt_complete_journal_record_is_reported(tmp_path):
-    state = WatchStateStore(str(tmp_path / "state.json"))
+    state = WatchStateStore(str(tmp_path / "state.snapshot"))
     state.queue_active(_candidate(tmp_path / "queued.7z"), durable=True)
     with open(state.journal_path, "ab") as handle:
-        handle.write(b"{not-json}\n")
+        handle.write(frame(2, b"\x91")[:-1] + b"\x90")
 
     with pytest.raises(WatchStateJournalError, match="corrupt watch state journal"):
         WatchStateStore(str(state.path))
@@ -281,8 +279,8 @@ def test_corrupt_complete_journal_record_is_reported(tmp_path):
 def test_snapshot_missing_required_field_is_rejected(tmp_path):
     from sunpack.runtime.watch.journal_commit import journal_stats
 
-    state_path = tmp_path / "state.json"
-    state_path.write_text(json.dumps({"checkpoint_seq": 0}), encoding="utf-8")
+    state_path = tmp_path / "state.snapshot"
+    state_path.write_bytes(header(3))
 
     with pytest.raises(WatchStateJournalError, match="corrupt watch state snapshot") as error:
         WatchStateStore(str(state_path))
@@ -292,28 +290,18 @@ def test_snapshot_missing_required_field_is_rejected(tmp_path):
 
 
 def test_journal_operation_with_unexpected_field_is_rejected(tmp_path):
-    state_path = tmp_path / "state.json"
+    state_path = tmp_path / "state.snapshot"
     state = WatchStateStore(str(state_path))
     state.save()
-    state.journal_path.write_text(
-        json.dumps({
-            "seq": 1,
-            "operations": [{
-                "op": "delete",
-                "collection": "entries",
-                "key": "entry",
-                "unexpected": True,
-            }],
-        }) + "\n",
-        encoding="utf-8",
-    )
+    # Valid envelope + invalid typed opcode, so CRC validation alone cannot pass it.
+    state.journal_path.write_bytes(header() + frame(1, b"\x91\x92\xcc\xff\xa1x"))
 
     with pytest.raises(WatchStateJournalError, match="invalid watch state operation"):
         WatchStateStore(str(state_path))
 
 
 def test_duplicate_sequence_is_rejected(tmp_path):
-    state_path = tmp_path / "state.json"
+    state_path = tmp_path / "state.snapshot"
     archive = tmp_path / "failed.7z"
     archive.touch()
     state = WatchStateStore(str(state_path))
@@ -326,14 +314,14 @@ def test_duplicate_sequence_is_rejected(tmp_path):
     )
     journal = state.journal_path.read_bytes()
     with open(state.journal_path, "ab") as handle:
-        handle.write(journal)
+        handle.write(journal[16:])
 
     with pytest.raises(WatchStateJournalError, match="non-contiguous watch state sequence"):
         WatchStateStore(str(state_path))
 
 
 def test_failed_snapshot_publish_keeps_sealed_journal_recoverable(tmp_path, monkeypatch):
-    state_path = tmp_path / "state.json"
+    state_path = tmp_path / "state.snapshot"
     candidate = _candidate(tmp_path / "queued.7z")
     state = WatchStateStore(str(state_path))
     state.queue_active(candidate, durable=True)
@@ -358,7 +346,7 @@ def test_failed_snapshot_publish_keeps_sealed_journal_recoverable(tmp_path, monk
 
 def test_checkpoint_does_not_block_state_progress(tmp_path, monkeypatch):
     state = WatchStateStore(
-        str(tmp_path / "state.json"),
+        str(tmp_path / "state.snapshot"),
         compact_records=1,
         compact_bytes=1024 * 1024 * 1024,
     )
@@ -394,7 +382,7 @@ def test_checkpoint_does_not_block_state_progress(tmp_path, monkeypatch):
 def test_close_waits_for_existing_checkpoint_before_releasing_stream(tmp_path, monkeypatch):
     from sunpack.runtime.watch.journal_commit import journal_stats
 
-    state = WatchStateStore(str(tmp_path / "state.json"), compact_records=1)
+    state = WatchStateStore(str(tmp_path / "state.snapshot"), compact_records=1)
     entered, release = Event(), Event()
     real_write = state._write_snapshot_view
 
@@ -426,7 +414,7 @@ def test_close_waits_for_existing_checkpoint_before_releasing_stream(tmp_path, m
 
 def test_hard_limit_never_runs_snapshot_on_mutation_thread(tmp_path, monkeypatch):
     state = WatchStateStore(
-        str(tmp_path / "state.json"),
+        str(tmp_path / "state.snapshot"),
         compact_records=1_000_000,
         compact_bytes=1,
         hard_compact_bytes=1,
@@ -450,7 +438,7 @@ def test_hard_limit_never_runs_snapshot_on_mutation_thread(tmp_path, monkeypatch
 
 @pytest.mark.parametrize("reload_during_checkpoint", [False, True])
 def test_state_handoff_preserves_newer_checkpoint(tmp_path, monkeypatch, reload_during_checkpoint):
-    state_path = tmp_path / "state.json"
+    state_path = tmp_path / "state.snapshot"
     first = _candidate(tmp_path / "first.7z", 1)
     second = _candidate(tmp_path / "second.7z", 2)
     old = WatchStateStore(str(state_path))
@@ -495,7 +483,7 @@ def test_state_handoff_preserves_newer_checkpoint(tmp_path, monkeypatch, reload_
 
 
 def test_concurrent_updates_share_one_ordered_sequence(tmp_path):
-    state_path = tmp_path / "state.json"
+    state_path = tmp_path / "state.snapshot"
     state = WatchStateStore(str(state_path))
     candidates = [_candidate(tmp_path / f"queued-{index}.7z", index) for index in range(100)]
 
@@ -511,7 +499,7 @@ def test_concurrent_updates_share_one_ordered_sequence(tmp_path):
 
 
 def test_independent_state_stores_append_without_losing_transactions(tmp_path):
-    state_path = tmp_path / "state.json"
+    state_path = tmp_path / "state.snapshot"
     stores = [WatchStateStore(str(state_path)), WatchStateStore(str(state_path))]
     candidates = [
         _candidate(tmp_path / "first.7z", 1),
@@ -528,7 +516,7 @@ def test_independent_state_stores_append_without_losing_transactions(tmp_path):
 
 
 def test_completed_work_is_not_retained_as_processed_history(tmp_path):
-    state_path = tmp_path / "state.json"
+    state_path = tmp_path / "state.snapshot"
     archive = tmp_path / "sample.zip"
     archive.write_bytes(b"archive")
     stat = archive.stat()
@@ -539,14 +527,13 @@ def test_completed_work_is_not_retained_as_processed_history(tmp_path):
     state.complete_work([str(archive)])
     state.save()
 
-    payload = json.loads(state_path.read_text(encoding="utf-8"))
-    assert not WatchStateStore(str(state_path)).pending_work_items()
-    assert "snapshots" not in payload
-    assert "pending_work" in payload
+    restored = WatchStateStore(str(state_path))
+    assert not restored.pending_work_items()
+    assert restored.entry_count == 0
 
 
 def test_pending_work_survives_restart_until_completed(tmp_path):
-    state_path = tmp_path / "state.json"
+    state_path = tmp_path / "state.snapshot"
     archive = tmp_path / "sample.zip"
     archive.write_bytes(b"archive")
     stat = archive.stat()
@@ -563,7 +550,7 @@ def test_pending_work_survives_restart_until_completed(tmp_path):
 
 
 def test_only_retry_blocking_failures_are_kept_as_entries(tmp_path):
-    state = WatchStateStore(str(tmp_path / "state.json"))
+    state = WatchStateStore(str(tmp_path / "state.snapshot"))
     archive = tmp_path / "sample.zip"
     archive.write_bytes(b"archive")
     stat = archive.stat()
@@ -581,7 +568,7 @@ def test_only_retry_blocking_failures_are_kept_as_entries(tmp_path):
 
 
 def test_metadata_observation_advances_retry_entry_without_changing_failure(tmp_path):
-    state_path = tmp_path / "state.json"
+    state_path = tmp_path / "state.snapshot"
     archive = tmp_path / "sample.zip"
     archive.write_bytes(b"archive")
     state = WatchStateStore(str(state_path))
@@ -616,7 +603,7 @@ def test_metadata_observation_advances_retry_entry_without_changing_failure(tmp_
 
 
 def test_active_work_persists_force_cause_for_restart(tmp_path):
-    state_path = tmp_path / "state.json"
+    state_path = tmp_path / "state.snapshot"
     archive = tmp_path / "sample.zip"
     archive.write_bytes(b"active")
     state = WatchStateStore(str(state_path))
@@ -634,7 +621,7 @@ def test_active_work_persists_force_cause_for_restart(tmp_path):
 
 
 def test_prune_missing_records_scopes_stale_entries_without_removing_recovery(tmp_path):
-    state = WatchStateStore(str(tmp_path / "state.json"))
+    state = WatchStateStore(str(tmp_path / "state.snapshot"))
     directory = tmp_path / "group"
     directory.mkdir()
     present = directory / "present.zip"
@@ -685,7 +672,7 @@ def test_prune_missing_records_scopes_stale_entries_without_removing_recovery(tm
 
 
 def test_prune_missing_records_retains_records_when_presence_is_unknown(tmp_path, monkeypatch):
-    state = WatchStateStore(str(tmp_path / "state.json"))
+    state = WatchStateStore(str(tmp_path / "state.snapshot"))
     archive = tmp_path / "protected.zip"
     archive.write_bytes(b"archive")
     state.mark(
@@ -712,7 +699,7 @@ def test_pruning_shares_root_checks_but_revalidates_each_batch_before_deleting(t
     from sunpack.core.contracts.discovery_scope import DiscoveryScope
     root, hidden = tmp_path / "input", tmp_path / "offline"
     root.mkdir()
-    state = WatchStateStore(str(tmp_path / "state.json"), scopes=(DiscoveryScope(str(root)),))
+    state = WatchStateStore(str(tmp_path / "state.snapshot"), scopes=(DiscoveryScope(str(root)),))
     for index in range(64):
         source = root / f"part.{index:03d}"
         source.touch()
@@ -771,7 +758,7 @@ def test_scope_retirement_persists_without_losing_pending_output_recovery(tmp_pa
     nested = output / "nested.bin"
     for path in (kept, abandoned, owner, nested):
         path.touch()
-    state_path = tmp_path / "state.json"
+    state_path = tmp_path / "state.snapshot"
     state = WatchStateStore(str(state_path))
     volume = resolve_output_volume_key(str(retained)).lower()
     for path in (kept, abandoned, owner, nested):
@@ -815,7 +802,7 @@ def test_scope_retirement_persists_without_losing_pending_output_recovery(tmp_pa
 
 
 def test_native_checkpoint_round_trips_nested_unicode_payload(tmp_path):
-    state_path = tmp_path / "state.json"
+    state_path = tmp_path / "state.snapshot"
     archive = tmp_path / "雪-special.zip"
     archive.touch()
     state = WatchStateStore(str(state_path))
@@ -843,9 +830,11 @@ def test_native_checkpoint_round_trips_nested_unicode_payload(tmp_path):
     })
     state.save()
 
-    payload = json.loads(state_path.read_text(encoding="utf-8"))
-    entry = next(iter(payload["entries"].values()))
-    assert payload["watch_cursors"]["volume:雪"]["journal_id"] == 2**63 + 17
+    from sunpack_native import NativeWatchState
+    restored = NativeWatchState()
+    restored.load_snapshot(str(state_path))
+    entry = restored.entry(str(archive))
+    assert restored.watch_cursors()["volume:雪"]["journal_id"] == 2**63 + 17
     assert entry["last_error"] == "bad\n\"password\\雪"
     assert entry["failure_payload"]["nested"]["unicode"] == "雪☃"
     assert entry["failure_payload"]["nested"]["tuple"] == ["a", "b"]

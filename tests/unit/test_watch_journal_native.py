@@ -19,7 +19,7 @@ def _candidate(path, index):
 
 
 def test_durable_frontier_covers_prior_nondurable_writes(tmp_path):
-    state_path = tmp_path / "state.json"
+    state_path = tmp_path / "state.snapshot"
     state = WatchStateStore(str(state_path))
     first = _candidate(tmp_path / "first.zip", 1)
     second = _candidate(tmp_path / "second.zip", 2)
@@ -37,7 +37,7 @@ def test_durable_frontier_covers_prior_nondurable_writes(tmp_path):
 
 
 def test_clean_explicit_flush_does_not_repeat_physical_sync(tmp_path):
-    state = WatchStateStore(str(tmp_path / "state.json"))
+    state = WatchStateStore(str(tmp_path / "state.snapshot"))
     state.queue_active(_candidate(tmp_path / "queued.zip", 1), durable=False)
     state.flush()
     first = journal_stats(state._writer_stream)

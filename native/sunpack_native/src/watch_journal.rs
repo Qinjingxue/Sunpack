@@ -1,11 +1,13 @@
 use crate::io::resource_lifecycle::TrackedFile;
-use crate::watch_state::{extract_json, write_json_value, JsonValue};
+use crate::wal::{self, Kind};
+use crate::watch_store::{NativeWatchOperations, Operations};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyDict};
+use pyo3::types::PyDict;
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard, OnceLock};
@@ -224,7 +226,7 @@ enum WriterCommand {
         path: PathBuf,
         segment_start: u64,
         seq: u64,
-        operations: JsonValue,
+        operations: JournalPayload,
         durable: bool,
         bytes_written: Arc<AtomicU64>,
     },
@@ -316,7 +318,7 @@ impl JournalRuntime {
         path: PathBuf,
         segment_start: u64,
         seq: u64,
-        operations: JsonValue,
+        operations: JournalPayload,
         durable: bool,
     ) -> Result<NativeJournalTicket, String> {
         let goal = if durable {
@@ -498,11 +500,11 @@ fn retire_closed_stream(state: &mut RuntimeState, key: &str) {
     }
 }
 
-fn open_segment(path: &Path) -> io::Result<TrackedFile> {
+fn open_segment(path: &Path, kind: Kind) -> io::Result<TrackedFile> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    TrackedFile::open_with(path, "watch_journal_segment", |options| {
+    let mut file = TrackedFile::open_with(path, "watch_journal_segment", |options| {
         options.create(true).append(true).read(true);
         #[cfg(windows)]
         {
@@ -512,7 +514,18 @@ fn open_segment(path: &Path) -> io::Result<TrackedFile> {
             const FILE_SHARE_DELETE: u32 = 0x0000_0004;
             options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
         }
-    })
+    })?;
+    let length = file.metadata()?.len();
+    if length == 0 {
+        file.write_all(&wal::file_header(kind))?;
+    } else {
+        let mut header = [0; 16];
+        file.read_exact(&mut header)?;
+        if header != wal::file_header(kind) {
+            return Err(wal::invalid("unsupported binary WAL header"));
+        }
+    }
+    Ok(file)
 }
 
 fn segment_file(
@@ -520,6 +533,7 @@ fn segment_file(
     stream: &str,
     segment_start: u64,
     path: &Path,
+    kind: Kind,
 ) -> io::Result<Arc<TrackedFile>> {
     {
         let state = lock_state(shared);
@@ -538,7 +552,7 @@ fn segment_file(
         }
     }
 
-    let file = Arc::new(open_segment(path)?);
+    let file = Arc::new(open_segment(path, kind)?);
     let mut state = lock_state(shared);
     let stream_state = state.streams.entry(stream.to_string()).or_default();
     if let Some(existing) = stream_state.segments.get(&segment_start) {
@@ -558,14 +572,23 @@ fn segment_file(
     Ok(file)
 }
 
-fn encode_transaction(seq: u64, operations: &JsonValue) -> io::Result<Vec<u8>> {
-    let mut payload = Vec::with_capacity(512);
-    payload.extend_from_slice(b"{\"seq\":");
-    payload.extend_from_slice(seq.to_string().as_bytes());
-    payload.extend_from_slice(b",\"operations\":");
-    write_json_value(&mut payload, operations)?;
-    payload.extend_from_slice(b"}\n");
-    Ok(payload)
+enum JournalPayload {
+    Task(Arc<Operations>),
+    Catalog(Vec<u8>),
+}
+impl JournalPayload {
+    fn kind(&self) -> Kind {
+        match self {
+            Self::Task(_) => Kind::TaskWal,
+            Self::Catalog(_) => Kind::CatalogWal,
+        }
+    }
+    fn encode(&self, output: &mut wal::Bounded<'_>) -> io::Result<()> {
+        match self {
+            Self::Task(ops) => rmp_serde::encode::write(output, ops.as_ref()).map_err(wal::invalid),
+            Self::Catalog(bytes) => output.write_all(bytes),
+        }
+    }
 }
 
 fn write_file(file: &TrackedFile, payload: &[u8]) -> io::Result<()> {
@@ -577,7 +600,7 @@ struct AppendWorkItem {
     path: PathBuf,
     segment_start: u64,
     seq: u64,
-    operations: JsonValue,
+    operations: JournalPayload,
     durable: bool,
     bytes_written: Arc<AtomicU64>,
 }
@@ -587,7 +610,7 @@ fn append_work_item(
     path: PathBuf,
     segment_start: u64,
     seq: u64,
-    operations: JsonValue,
+    operations: JournalPayload,
     durable: bool,
     bytes_written: Arc<AtomicU64>,
 ) -> AppendWorkItem {
@@ -609,9 +632,12 @@ fn write_append_batch(shared: &Shared, batch: &[AppendWorkItem]) -> io::Result<(
     let mut payload = Vec::with_capacity(batch.len().saturating_mul(512));
     let mut record_sizes = Vec::with_capacity(batch.len());
     for item in batch {
-        let encoded = encode_transaction(item.seq, &item.operations)?;
-        record_sizes.push(encoded.len());
-        payload.extend_from_slice(&encoded);
+        if item.operations.kind() != first.operations.kind() {
+            return Err(wal::invalid("mixed WAL types"));
+        }
+        let start = payload.len();
+        wal::append_frame(&mut payload, item.seq, |out| item.operations.encode(out))?;
+        record_sizes.push(payload.len() - start);
     }
 
     // The writer is the only component that can advance written_seq, so this
@@ -626,7 +652,7 @@ fn write_append_batch(shared: &Shared, batch: &[AppendWorkItem]) -> io::Result<(
             .unwrap_or(0);
         let mut previous = written;
         for item in batch {
-            if item.seq <= previous {
+            if previous.checked_add(1) != Some(item.seq) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
@@ -639,7 +665,13 @@ fn write_append_batch(shared: &Shared, batch: &[AppendWorkItem]) -> io::Result<(
         }
     }
 
-    let file = segment_file(shared, &first.stream, first.segment_start, &first.path)?;
+    let file = segment_file(
+        shared,
+        &first.stream,
+        first.segment_start,
+        &first.path,
+        first.operations.kind(),
+    )?;
     write_file(&file, &payload)?;
 
     let mut state = lock_state(shared);
@@ -1046,10 +1078,10 @@ pub(crate) fn watch_journal_submit_append(
     path: String,
     segment_start: u64,
     seq: u64,
-    operations: &Bound<'_, PyAny>,
+    operations: PyRef<'_, NativeWatchOperations>,
     durable: bool,
 ) -> PyResult<NativeJournalTicket> {
-    let operations = extract_json(operations)?;
+    let operations = JournalPayload::Task(Arc::clone(&operations.operations));
     runtime()
         .submit_append(
             stream,
@@ -1137,11 +1169,11 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!("sunpack_watch_journal_{label}_{nonce}.jsonl"))
+        std::env::temp_dir().join(format!("sunpack_watch_journal_{label}_{nonce}.wal"))
     }
 
-    fn empty_operations() -> JsonValue {
-        JsonValue::Array(Vec::new())
+    fn empty_operations() -> JournalPayload {
+        JournalPayload::Task(Arc::new(Operations::default()))
     }
 
     #[test]
@@ -1268,10 +1300,16 @@ pub(crate) fn append_cache(
     stream: &str,
     path: &Path,
     seq: u64,
-    value: JsonValue,
+    value: Vec<u8>,
 ) -> Result<u64, String> {
-    let ticket =
-        runtime().submit_append(stream.to_owned(), path.to_owned(), 1, seq, value, false)?;
+    let ticket = runtime().submit_append(
+        stream.to_owned(),
+        path.to_owned(),
+        1,
+        seq,
+        JournalPayload::Catalog(value),
+        false,
+    )?;
     ticket.wait_for(TicketGoal::Written)?;
     Ok(ticket.bytes_written.load(Ordering::Acquire))
 }

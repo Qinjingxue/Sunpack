@@ -72,7 +72,7 @@ def _phase_seconds(profiler: RequestRuntimeProfiler) -> dict[str, float]:
 
 
 def _output_summary(root: Path, source_name: str) -> dict[str, Any]:
-    excluded = {source_name, "state.json", "events.jsonl"}
+    excluded = {source_name, "state.snapshot", "events.jsonl"}
     files = [
         path
         for path in root.rglob("*")
@@ -100,7 +100,7 @@ async def _run_once(
         root = root / case_key
     root.mkdir(parents=True, exist_ok=True)
     destination = root / source.name
-    state_path = workspace.work / (f"{case_key}.state.json" if case_key else "state.json")
+    state_path = workspace.work / (f"{case_key}.state.snapshot" if case_key else "state.snapshot")
 
     config = load_config()
     config["cli"] = {**(config.get("cli") or {}), "quiet": True, "verbose": False}

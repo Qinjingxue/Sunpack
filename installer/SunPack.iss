@@ -81,6 +81,8 @@ english.WatchRootsFileMapping=# Optional columns: input folder | output folder |
 english.WatchRootsFileDeepDetect=# deep_detect accepts true or false; blank defaults to false.
 english.WatchRootsFileExample=# Example: C:\Downloads | D:\Extracted | true
 english.EditableConfigCreateFailed=Failed to create the initial editable configuration file: %s
+english.WalResetFailed=Unable to remove old Watch persistence files. Close sunpack and run the installer again.
+english.WalResetNotice=Watch persistence now uses a binary format. Unfinished tasks and automatic exclusions for existing output folders have been reset. Check leftover output folders before resuming recursive Watch.
 chinesesimplified.TaskAddToPath=将 sunpack 添加到系统 PATH
 chinesesimplified.TaskContextMenu=注册 sunpack 文件夹右键菜单
 chinesesimplified.TaskAutostart=Windows 启动时运行 sunpack 监控
@@ -109,6 +111,8 @@ chinesesimplified.WatchRootsFileMapping=# 可选字段格式：输入目录 | �
 chinesesimplified.WatchRootsFileDeepDetect=# deep_detect 可填写 true 或 false；留空时默认为 false。
 chinesesimplified.WatchRootsFileExample=# 示例：C:\Downloads | D:\Extracted | true
 chinesesimplified.EditableConfigCreateFailed=无法创建初始可编辑配置文件：%s
+chinesesimplified.WalResetFailed=无法删除旧版监控持久化文件。请关闭 sunpack 后重新运行安装程序。
+chinesesimplified.WalResetNotice=监控持久化已改为二进制格式。未完成任务和既有输出目录的自动排除记录已重置。恢复递归监控前请检查残留输出目录。
 
 [Tasks]
 Name: "addtopath"; Description: "{cm:TaskAddToPath}"; GroupDescription: "{cm:GroupShellIntegration}"
@@ -899,6 +903,29 @@ begin
     MsgBox(CustomMessage('UninstallStopFailed'), mbError, MB_OK);
 end;
 
+procedure ResetLegacyWatchState;
+var
+  Parameters: string;
+  ResultCode: Integer;
+begin
+  Parameters := '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ' +
+    AddQuotes(ExpandConstant('{app}\scripts\reset_legacy_watch_state.ps1')) +
+    ' -DataRoot ' + AddQuotes(ExpandConstant('{commonappdata}\SunPack')) +
+    ' -AdvancedConfig ' + AddQuotes(ExpandConstant('{app}\sunpack_advanced_config.json')) +
+    ' -OldAdvancedConfig ' + AddQuotes(ExpandConstant('{tmp}\sunpack-old-advanced.json')) +
+    ' -UserConfig ' + AddQuotes(ExpandConstant('{commonappdata}\SunPack\sunpack_config.json'));
+  if not Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+              Parameters, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+    RaiseException(CustomMessage('WalResetFailed'));
+  if (ResultCode <> 0) and (ResultCode <> 10) then
+    RaiseException(CustomMessage('WalResetFailed'));
+  if ResultCode = 10 then
+  begin
+    Log(CustomMessage('WalResetNotice'));
+    if not WizardSilent then MsgBox(CustomMessage('WalResetNotice'), mbInformation, MB_OK);
+  end;
+end;
+
 procedure CurStepChanged(CurStep: TSetupStep);
 var
   ResultCode: Integer;
@@ -908,6 +935,7 @@ begin
   begin
     EnsureLocalizedEditableConfigFiles;
     UpgradeConfigurationFields;
+    ResetLegacyWatchState;
     InstallBrokerService;
     if not Exec(
       ExpandConstant('{app}\sunpack-runtime.exe'),

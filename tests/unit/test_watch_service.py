@@ -764,7 +764,7 @@ def test_removing_last_root_retires_state_without_a_successor_scheduler(tmp_path
     folder.mkdir()
     for index in range(128):
         (root / f"part.{index:03d}").touch()
-    state_path = folder / "state.json"
+    state_path = folder / "state.snapshot"
     state = WatchStateStore(str(state_path))
     catalog = NativeWatchCatalog(state._native, str(folder))
     scope = DiscoveryScope(str(root), recursive=True)
@@ -778,7 +778,7 @@ def test_removing_last_root_retires_state_without_a_successor_scheduler(tmp_path
     state.mark(str(root / "part.000"), 1, 1.0, status="failed_password")
     state.merge_watch_cursors({"old-volume": {"journal_id": 1, "next_usn": 2}})
     state.close()
-    snapshot = folder / "catalog.snapshot"
+    snapshot = folder / "catalog.snapshot.bin"
     original_bytes = snapshot.stat().st_size
     monkeypatch.setattr(service_module, "watch_roots_path", lambda: tmp_path / "roots.txt")
     monkeypatch.setattr(service_module, "load_config", lambda: make_config({
@@ -795,8 +795,10 @@ def test_removing_last_root_retires_state_without_a_successor_scheduler(tmp_path
         assert not state.watch_cursor_snapshot()
         assert not state_path.exists()
         assert snapshot.stat().st_size < original_bytes // 4
-        payload = json.loads(snapshot.read_text(encoding="utf-8"))
-        assert payload["rows"] == payload["stamps"] == {}
+        empty_catalog = NativeWatchCatalog(state._native, str(folder))
+        assert empty_catalog.cursor(scope.native) is None
+        assert not empty_catalog.error
+        empty_catalog.close()
     finally:
         state.close()
     mtime = snapshot.stat().st_mtime_ns
@@ -834,7 +836,7 @@ def test_default_watch_state_uses_program_directory_and_output_stays_relative(tm
 
     assert service.state_dir == str((program_dir / ".sunpack_watch").resolve())
     assert captured["out_dir"] == "."
-    assert captured["state_path"] == str((program_dir / ".sunpack_watch" / "state.json").resolve())
+    assert captured["state_path"] == str((program_dir / ".sunpack_watch" / "state.snapshot").resolve())
 
 
     roots_path.unlink()

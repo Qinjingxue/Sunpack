@@ -1,0 +1,312 @@
+//! Shared binary persistence envelope. No text formats or format migration.
+use crc32fast::Hasher;
+use serde::{de::DeserializeOwned, Serialize};
+use std::io::{self, BufRead, BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
+
+pub(crate) const FILE_HEADER_BYTES: u64 = 16;
+pub(crate) const FRAME_HEADER_BYTES: usize = 16;
+pub(crate) const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
+const BUFFER_BYTES: usize = 1024 * 1024;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u16)]
+pub(crate) enum Kind {
+    TaskWal = 1,
+    CatalogWal = 2,
+    TaskSnapshot = 3,
+    CatalogSnapshot = 4,
+}
+
+pub(crate) fn invalid(error: impl std::fmt::Display) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+}
+
+pub(crate) fn file_header(kind: Kind) -> [u8; 16] {
+    let mut header = [0; 16];
+    header[..4].copy_from_slice(b"SPWL");
+    header[4..6].copy_from_slice(&1u16.to_le_bytes());
+    header[6..8].copy_from_slice(&(kind as u16).to_le_bytes());
+    header
+}
+
+/// Bound serialization as it runs, before a transaction can grow without limit.
+pub(crate) struct Bounded<'a>(pub &'a mut Vec<u8>, pub usize);
+impl Write for Bounded<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.len() > self.1.saturating_sub(self.0.len()) {
+            return Err(invalid("WAL transaction exceeds 64 MiB"));
+        }
+        self.0.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+pub(crate) fn append_frame(
+    output: &mut Vec<u8>,
+    seq: u64,
+    encode: impl FnOnce(&mut Bounded<'_>) -> io::Result<()>,
+) -> io::Result<()> {
+    let start = output.len();
+    output.resize(start + FRAME_HEADER_BYTES, 0);
+    if let Err(error) = encode(&mut Bounded(
+        output,
+        start + FRAME_HEADER_BYTES + MAX_FRAME_BYTES,
+    )) {
+        output.truncate(start);
+        return Err(error);
+    }
+    let len = output.len() - start - FRAME_HEADER_BYTES;
+    output[start..start + 4].copy_from_slice(&(len as u32).to_le_bytes());
+    output[start + 4..start + 12].copy_from_slice(&seq.to_le_bytes());
+    let mut hash = Hasher::new();
+    hash.update(&output[start..start + 12]);
+    hash.update(&output[start + FRAME_HEADER_BYTES..]);
+    output[start + 12..start + 16].copy_from_slice(&hash.finalize().to_le_bytes());
+    Ok(())
+}
+
+pub(crate) fn decode<T: DeserializeOwned>(bytes: &[u8]) -> io::Result<T> {
+    let mut cursor = Cursor::new(bytes);
+    let value = T::deserialize(&mut rmp_serde::Deserializer::new(&mut cursor)).map_err(invalid)?;
+    if cursor.position() != bytes.len() as u64 {
+        return Err(invalid("trailing WAL payload"));
+    }
+    Ok(value)
+}
+
+/// Reuses one payload buffer. Only an incomplete final frame may be discarded.
+pub(crate) struct Reader<R> {
+    input: BufReader<R>,
+    end: u64,
+    pub valid_end: u64,
+    pub torn: bool,
+    pub payload: Vec<u8>,
+}
+impl<R: Read + Seek> Reader<R> {
+    pub fn new(mut input: R, kind: Kind) -> io::Result<Self> {
+        let end = input.seek(SeekFrom::End(0))?;
+        input.rewind()?;
+        let mut input = BufReader::new(input);
+        let mut header = [0; 16];
+        let available = end.min(FILE_HEADER_BYTES) as usize;
+        input.read_exact(&mut header[..available])?;
+        if header[..available] != file_header(kind)[..available] {
+            return Err(invalid("unsupported binary WAL header"));
+        }
+        Ok(Self {
+            input,
+            end,
+            valid_end: if available == 16 { 16 } else { 0 },
+            torn: available != 16,
+            payload: Vec::new(),
+        })
+    }
+    pub fn next(&mut self) -> io::Result<Option<u64>> {
+        if self.torn || self.valid_end == self.end {
+            return Ok(None);
+        }
+        if self.end - self.valid_end < FRAME_HEADER_BYTES as u64 {
+            self.torn = true;
+            return Ok(None);
+        }
+        let mut header = [0; FRAME_HEADER_BYTES];
+        self.input.read_exact(&mut header)?;
+        let len = u32::from_le_bytes(header[..4].try_into().unwrap()) as usize;
+        if len == 0 || len > MAX_FRAME_BYTES {
+            return Err(invalid("invalid WAL frame length"));
+        }
+        if self.end - self.valid_end - (FRAME_HEADER_BYTES as u64) < len as u64 {
+            self.torn = true;
+            return Ok(None);
+        }
+        self.payload.resize(len, 0);
+        self.input.read_exact(&mut self.payload)?;
+        let mut hash = Hasher::new();
+        hash.update(&header[..12]);
+        hash.update(&self.payload);
+        if hash.finalize() != u32::from_le_bytes(header[12..].try_into().unwrap()) {
+            return Err(invalid("WAL checksum mismatch"));
+        }
+        self.valid_end += (FRAME_HEADER_BYTES + len) as u64;
+        Ok(Some(u64::from_le_bytes(header[4..12].try_into().unwrap())))
+    }
+}
+
+struct Checked<T> {
+    inner: T,
+    hash: Hasher,
+    bytes: u64,
+}
+impl<W: Write> Write for Checked<W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let n = self.inner.write(bytes)?;
+        self.hash.update(&bytes[..n]);
+        self.bytes += n as u64;
+        Ok(n)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+impl<R: Read> Read for Checked<R> {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(bytes)?;
+        self.hash.update(&bytes[..n]);
+        self.bytes += n as u64;
+        Ok(n)
+    }
+}
+
+/// Snapshot payload streams directly from/to native state; no whole-file byte copy.
+pub(crate) fn write_snapshot<W: Write + Seek, T: Serialize>(
+    file: &mut W,
+    kind: Kind,
+    seq: u64,
+    value: &T,
+) -> io::Result<u64> {
+    file.write_all(&file_header(kind))?;
+    file.write_all(&[0; 24])?;
+    let mut checked = Checked {
+        inner: file,
+        hash: Hasher::new(),
+        bytes: 0,
+    };
+    {
+        // Hash buffer-sized writes, not every MessagePack scalar.
+        let mut output = BufWriter::with_capacity(BUFFER_BYTES, &mut checked);
+        rmp_serde::encode::write(&mut output, value).map_err(invalid)?;
+        output.flush()?;
+    }
+    let len = checked.bytes;
+    let mut header = [0; 24];
+    header[..8].copy_from_slice(&seq.to_le_bytes());
+    header[8..16].copy_from_slice(&len.to_le_bytes());
+    checked.hash.update(&header[..16]);
+    header[16..20].copy_from_slice(&checked.hash.finalize().to_le_bytes());
+    checked.inner.seek(SeekFrom::Start(FILE_HEADER_BYTES))?;
+    checked.inner.write_all(&header)?;
+    checked.inner.flush()?;
+    Ok(FILE_HEADER_BYTES + 24 + len)
+}
+
+pub(crate) fn read_snapshot<R: Read + Seek, T: DeserializeOwned>(
+    mut file: R,
+    kind: Kind,
+) -> io::Result<(u64, T)> {
+    let end = file.seek(SeekFrom::End(0))?;
+    file.rewind()?;
+    let mut header = [0; 16];
+    file.read_exact(&mut header)?;
+    if header != file_header(kind) {
+        return Err(invalid("unsupported binary snapshot header"));
+    }
+    let mut header = [0; 24];
+    file.read_exact(&mut header)?;
+    let seq = u64::from_le_bytes(header[..8].try_into().unwrap());
+    let len = u64::from_le_bytes(header[8..16].try_into().unwrap());
+    if end.checked_sub(40) != Some(len) || header[20..] != [0; 4] {
+        return Err(invalid("invalid snapshot length"));
+    }
+    let checked = Checked {
+        inner: file.take(len),
+        hash: Hasher::new(),
+        bytes: 0,
+    };
+    let mut input = BufReader::with_capacity(BUFFER_BYTES, checked);
+    let value = T::deserialize(&mut rmp_serde::Deserializer::new(&mut input)).map_err(invalid)?;
+    if !input.fill_buf()?.is_empty() {
+        return Err(invalid("trailing snapshot payload"));
+    }
+    let mut checked = input.into_inner();
+    if checked.bytes != len {
+        return Err(invalid("trailing snapshot payload"));
+    }
+    checked.hash.update(&header[..16]);
+    if checked.hash.finalize() != u32::from_le_bytes(header[16..20].try_into().unwrap()) {
+        return Err(invalid("snapshot checksum mismatch"));
+    }
+    Ok((seq, value))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // New physical-format failures are independent of orchestration tests.
+    // Removing this loses header/length/CRC and byte-level tear coverage;
+    // all fixtures stay in memory and cost no fsync or process startup.
+    #[test]
+    fn frames_reject_corruption_and_recover_only_incomplete_tails() {
+        let mut bytes = file_header(Kind::TaskWal).to_vec();
+        append_frame(&mut bytes, 7, |out| {
+            rmp_serde::encode::write(out, &vec!["雪", "payload"]).map_err(invalid)
+        })
+        .unwrap();
+        let mut reader = Reader::new(Cursor::new(&bytes), Kind::TaskWal).unwrap();
+        assert_eq!(reader.next().unwrap(), Some(7));
+        assert_eq!(
+            decode::<Vec<String>>(&reader.payload).unwrap(),
+            ["雪", "payload"]
+        );
+        assert!(reader.next().unwrap().is_none());
+        assert!(!reader.torn);
+        for offset in [0, 4, 6, 8, 20, 28, bytes.len() - 1] {
+            let mut damaged = bytes.clone();
+            damaged[offset] ^= 1;
+            let result =
+                Reader::new(Cursor::new(damaged), Kind::TaskWal).and_then(|mut r| r.next());
+            assert!(result.is_err(), "undetected corruption at {offset}");
+        }
+        assert!(Reader::new(Cursor::new(&bytes), Kind::CatalogWal).is_err());
+        for end in 0..bytes.len() {
+            let mut reader = Reader::new(Cursor::new(&bytes[..end]), Kind::TaskWal).unwrap();
+            assert!(reader.next().unwrap().is_none());
+            assert!(reader.torn || end == 16);
+            assert_eq!(reader.valid_end, if end < 16 { 0 } else { 16 });
+        }
+        let mut oversized = bytes.clone();
+        oversized[16..20].copy_from_slice(&((MAX_FRAME_BYTES as u32) + 1).to_le_bytes());
+        assert!(Reader::new(Cursor::new(oversized), Kind::TaskWal)
+            .unwrap()
+            .next()
+            .is_err());
+        let mut bounded = Vec::new();
+        assert!(Bounded(&mut bounded, 2).write_all(b"123").is_err());
+        assert!(bounded.is_empty());
+    }
+
+    // No existing test checks checksum coverage of snapshot sequence metadata,
+    // trailing bytes and wrong file type together. Removing it loses that
+    // independent binary envelope coverage at negligible in-memory cost.
+    #[test]
+    fn snapshots_stream_and_validate_the_entire_envelope() {
+        type Payload = (Vec<String>, serde_json::Value);
+        let value: Payload = (
+            vec!["雪".repeat(BUFFER_BYTES)],
+            serde_json::json!({"values": [true, null, 3.25]}),
+        );
+        let mut file = Cursor::new(Vec::new());
+        let len = write_snapshot(&mut file, Kind::TaskSnapshot, 19, &value).unwrap();
+        assert_eq!(len, file.get_ref().len() as u64);
+        let (seq, restored): (_, Payload) =
+            read_snapshot(file.clone(), Kind::TaskSnapshot).unwrap();
+        assert_eq!(seq, 19);
+        assert_eq!(restored, value);
+        assert!(read_snapshot::<_, Payload>(file.clone(), Kind::CatalogSnapshot).is_err());
+        for offset in [0, 4, 6, 8, 16, 24, 32, 36, 40, len as usize - 1] {
+            let mut damaged = file.clone();
+            damaged.get_mut()[offset] ^= 1;
+            assert!(read_snapshot::<_, Payload>(damaged, Kind::TaskSnapshot).is_err());
+        }
+        for end in [0, 15, 39, len as usize - 1] {
+            let mut damaged = file.clone();
+            damaged.get_mut().truncate(end);
+            assert!(read_snapshot::<_, Payload>(damaged, Kind::TaskSnapshot).is_err());
+        }
+        file.get_mut().push(0);
+        assert!(read_snapshot::<_, Payload>(file, Kind::TaskSnapshot).is_err());
+    }
+}

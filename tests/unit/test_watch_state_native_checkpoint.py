@@ -1,4 +1,3 @@
-import json
 from pathlib import Path
 
 import pytest
@@ -17,11 +16,11 @@ def test_restart_reclaims_crashed_snapshot_without_deleting_another_writers_temp
     from contextlib import contextmanager
     import sunpack.runtime.watch.state as module
 
-    state_path = tmp_path / "state.json"
-    unrelated = [tmp_path / ".state.json.notes.tmp", tmp_path / (".other.json." + "a" * 32 + ".tmp")]
+    state_path = tmp_path / "state.snapshot"
+    unrelated = [tmp_path / ".state.snapshot.notes.tmp", tmp_path / (".other.json." + "a" * 32 + ".tmp")]
     for path in unrelated:
         path.write_text("keep", encoding="utf-8")
-    directory = tmp_path / (".state.json." + "b" * 32 + ".tmp")
+    directory = tmp_path / (".state.snapshot." + "b" * 32 + ".tmp")
     directory.mkdir()
     script = r'''
 import os, sys
@@ -83,7 +82,7 @@ state._write_snapshot_view(PausedView())
 
 
 def test_native_checkpoint_persists_only_declared_dataclass_fields(tmp_path):
-    state_path = tmp_path / "state.json"
+    state_path = tmp_path / "state.snapshot"
     state = WatchStateStore(str(state_path))
     archive = tmp_path / "archive.7z"
     archive.touch()
@@ -100,8 +99,10 @@ def test_native_checkpoint_persists_only_declared_dataclass_fields(tmp_path):
 
     state.save()
 
-    payload = json.loads(state_path.read_text(encoding="utf-8"))
-    [persisted] = payload["entries"].values()
+    from sunpack_native import NativeWatchState
+    restored = NativeWatchState()
+    restored.load_snapshot(str(state_path))
+    persisted = restored.entry(str(archive))
     assert "runtime_only_probe" not in persisted
     assert persisted["path"] == str(archive)
     assert WatchStateStore(str(state_path)).latest_entry_for_path(str(archive)) is not None
@@ -109,7 +110,7 @@ def test_native_checkpoint_persists_only_declared_dataclass_fields(tmp_path):
 
 @pytest.mark.parametrize("storage", ["journal", "checkpoint"])
 def test_native_state_replay_preserves_fractional_mtime_identity(tmp_path, storage):
-    state_path = tmp_path / "state.json"
+    state_path = tmp_path / "state.snapshot"
     state = WatchStateStore(str(state_path))
     # Real timestamp from the split-volume recovery failure: default JSON
     # float decoding changed this value by one binary64 precision unit.
@@ -146,7 +147,7 @@ def test_native_state_replay_preserves_fractional_mtime_identity(tmp_path, stora
 def test_idle_trim_releases_peak_capacity_without_losing_live_or_frozen_state(tmp_path):
     from sunpack_native import NativeWatchState
 
-    state = WatchStateStore(str(tmp_path / "state.json"))
+    state = WatchStateStore(str(tmp_path / "state.snapshot"))
     candidates = [WatchCandidate(str(tmp_path / f"{index}.bin"), index, 1.0) for index in range(512)]
     for candidate in candidates:
         state.queue_active(candidate, persist=False)

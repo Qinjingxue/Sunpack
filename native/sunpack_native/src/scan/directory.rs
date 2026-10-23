@@ -3471,8 +3471,14 @@ fn update_catalog(
         let mut effective = scope.clone();
         let metadata = fs::metadata(target);
         if metadata.is_err() && !Path::new(&scope.root).is_dir() {
-            return Ok((vec![(scope.root.clone(), "metadata".into(),
-                "watch root unavailable".into())], Vec::new()));
+            return Ok((
+                vec![(
+                    scope.root.clone(),
+                    "metadata".into(),
+                    "watch root unavailable".into(),
+                )],
+                Vec::new(),
+            ));
         }
         if !metadata.as_ref().is_ok_and(|m| m.is_file()) {
             effective.exclude_roots(state.output_roots().into_iter());
@@ -3526,8 +3532,14 @@ fn update_catalog(
         if (!metadata.as_ref().is_ok_and(|m| m.is_file()) || records.raw.is_empty())
             && !Path::new(&scope.root).is_dir()
         {
-            return Ok((vec![(scope.root.clone(), "metadata".into(),
-                "watch root unavailable".into())], Vec::new()));
+            return Ok((
+                vec![(
+                    scope.root.clone(),
+                    "metadata".into(),
+                    "watch root unavailable".into(),
+                )],
+                Vec::new(),
+            ));
         }
         drop(records.filtered);
         let errors = records.errors.into_messages();

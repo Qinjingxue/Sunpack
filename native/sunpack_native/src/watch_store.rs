@@ -6,17 +6,16 @@
 //! process never keeps every pending item and retry entry as Python objects.
 
 use crate::io::resource_lifecycle::TrackedFile;
+use crate::wal::{self, Kind};
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple};
+use serde::ser::SerializeSeq;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
-
-const SNAPSHOT_BUFFER_BYTES: usize = 1024 * 1024;
 
 fn recorded_file_presence(path: &str) -> Option<bool> {
     match std::fs::metadata(path) {
@@ -45,13 +44,11 @@ struct PendingRecord {
     password_scope_dir: String,
     source_input_root: String,
     internal_recovery: bool,
-    #[serde(default)]
     discovery_scope: Map<String, Value>,
     durable_owner: bool,
     active_outputs: BTreeMap<String, String>,
     committed_roots: Vec<String>,
     completed_sources: Vec<String>,
-    #[serde(default)]
     output_identities: BTreeMap<String, String>,
 }
 
@@ -96,6 +93,92 @@ enum Operation {
     Runtime(String, Option<Value>),
 }
 
+// Fixed numeric opcodes and tuple fields; put records persist their path once.
+impl Serialize for Operation {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::PutPending(_, record) => (0u8, record).serialize(serializer),
+            Self::PutEntry(_, record) => (1u8, record).serialize(serializer),
+            Self::Delete(Collection::Pending, key) => (2u8, key).serialize(serializer),
+            Self::Delete(Collection::Entries, key) => (3u8, key).serialize(serializer),
+            Self::SetMetadata(generation, signature) => {
+                (4u8, generation, signature).serialize(serializer)
+            }
+            Self::SetCursors(cursors) => (5u8, cursors).serialize(serializer),
+            Self::Runtime(key, value) => (6u8, key, value).serialize(serializer),
+        }
+    }
+}
+impl<'de> Deserialize<'de> for Operation {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = Operation;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a typed Watch operation")
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Operation, A::Error> {
+                use serde::de::Error;
+                fn field<'de, A: serde::de::SeqAccess<'de>, T: Deserialize<'de>>(
+                    seq: &mut A,
+                ) -> Result<T, A::Error> {
+                    seq.next_element()?
+                        .ok_or_else(|| A::Error::custom("missing operation field"))
+                }
+                let tag: u8 = field(&mut seq)?;
+                let op = match tag {
+                    0 => {
+                        let record: Arc<PendingRecord> = field(&mut seq)?;
+                        Operation::PutPending(path_key(&record.path), record)
+                    }
+                    1 => {
+                        let record: Arc<EntryRecord> = field(&mut seq)?;
+                        Operation::PutEntry(path_key(&record.path), record)
+                    }
+                    2 | 3 => {
+                        let key: String = field(&mut seq)?;
+                        if key.is_empty() {
+                            return Err(A::Error::custom("empty record key"));
+                        }
+                        Operation::Delete(
+                            if tag == 2 {
+                                Collection::Pending
+                            } else {
+                                Collection::Entries
+                            },
+                            key,
+                        )
+                    }
+                    4 => {
+                        let generation = field(&mut seq)?;
+                        if generation < 0 {
+                            return Err(A::Error::custom("negative password generation"));
+                        }
+                        Operation::SetMetadata(generation, field(&mut seq)?)
+                    }
+                    5 => Operation::SetCursors(field(&mut seq)?),
+                    6 => {
+                        let key: String = field(&mut seq)?;
+                        if !key.starts_with("owned|") {
+                            return Err(A::Error::custom("unknown runtime record"));
+                        }
+                        Operation::Runtime(key, field(&mut seq)?)
+                    }
+                    _ => return Err(A::Error::custom("unknown operation opcode")),
+                };
+                if seq.next_element::<serde::de::IgnoredAny>()?.is_some() {
+                    return Err(A::Error::custom("unexpected operation field"));
+                }
+                Ok(op)
+            }
+        }
+        deserializer.deserialize_seq(Visitor)
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct StateData {
     pending: HashMap<String, Arc<PendingRecord>>,
@@ -110,13 +193,10 @@ impl StateData {
     fn apply(&mut self, operation: &Operation) {
         match operation {
             Operation::Runtime(key, value) => {
-                // Legacy catalog/completion transactions are read but discarded.
-                if key.starts_with("owned|") {
-                    if let Some(value) = value {
-                        self.runtime.insert(key.clone(), value.clone());
-                    } else {
-                        self.runtime.remove(key);
-                    }
+                if let Some(value) = value {
+                    self.runtime.insert(key.clone(), value.clone());
+                } else {
+                    self.runtime.remove(key);
                 }
             }
             Operation::PutPending(key, record) => {
@@ -148,10 +228,14 @@ fn trim_map<K: Eq + std::hash::Hash, V>(map: &mut HashMap<K, V>) {
     }
 }
 
+#[derive(Default, Serialize)]
+#[serde(transparent)]
+pub(crate) struct Operations(Vec<Operation>);
+
 /// Decoded journal operations, validated before their WAL record is submitted.
 #[pyclass(module = "sunpack_native", frozen)]
 pub(crate) struct NativeWatchOperations {
-    operations: Vec<Operation>,
+    pub(crate) operations: Arc<Operations>,
 }
 
 /// Frozen checkpoint view; writing it never touches the live maps.
@@ -161,35 +245,83 @@ pub(crate) struct NativeWatchSnapshot {
     data: StateData,
 }
 
+// Serialize map values directly: derived path keys never reach disk, and no
+// sorted pointer map is allocated for a checkpoint.
+struct Records<'a, T>(&'a HashMap<String, Arc<T>>);
+impl<T: Serialize> Serialize for Records<'_, T> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut seq = serializer.serialize_seq(Some(self.0.len()))?;
+        for record in self.0.values() {
+            seq.serialize_element(record)?;
+        }
+        seq.end()
+    }
+}
+
+trait RecordPath {
+    fn path(&self) -> &str;
+}
+impl RecordPath for PendingRecord {
+    fn path(&self) -> &str {
+        &self.path
+    }
+}
+impl RecordPath for EntryRecord {
+    fn path(&self) -> &str {
+        &self.path
+    }
+}
+
+fn read_records<'de, D, T>(deserializer: D) -> Result<HashMap<String, Arc<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de> + RecordPath,
+{
+    struct Visitor<T>(std::marker::PhantomData<T>);
+    impl<'de, T: Deserialize<'de> + RecordPath> serde::de::Visitor<'de> for Visitor<T> {
+        type Value = HashMap<String, Arc<T>>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("state records")
+        }
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut records = HashMap::with_capacity(seq.size_hint().unwrap_or(0).min(4096));
+            while let Some(record) = seq.next_element::<T>()? {
+                if records
+                    .insert(path_key(record.path()), Arc::new(record))
+                    .is_some()
+                {
+                    return Err(serde::de::Error::custom("duplicate state record"));
+                }
+            }
+            Ok(records)
+        }
+    }
+    deserializer.deserialize_seq(Visitor(std::marker::PhantomData))
+}
+
 #[derive(Serialize)]
 struct SnapshotDocument<'a> {
-    checkpoint_seq: u64,
     password_generation: i64,
     password_source_signature: &'a str,
     watch_cursors: &'a BTreeMap<String, Cursor>,
-    pending_work: BTreeMap<&'a str, &'a PendingRecord>,
-    entries: BTreeMap<&'a str, &'a EntryRecord>,
+    pending_work: Records<'a, PendingRecord>,
+    entries: Records<'a, EntryRecord>,
     runtime: &'a BTreeMap<String, Value>,
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct SnapshotInput {
-    checkpoint_seq: u64,
     password_generation: i64,
     password_source_signature: String,
     watch_cursors: BTreeMap<String, Cursor>,
-    pending_work: BTreeMap<String, PendingRecord>,
-    entries: BTreeMap<String, EntryRecord>,
-    #[serde(default)]
+    #[serde(deserialize_with = "read_records")]
+    pending_work: HashMap<String, Arc<PendingRecord>>,
+    #[serde(deserialize_with = "read_records")]
+    entries: HashMap<String, Arc<EntryRecord>>,
     runtime: BTreeMap<String, Value>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct JournalTransaction {
-    seq: u64,
-    operations: Vec<Value>,
 }
 
 #[pymethods]
@@ -203,25 +335,14 @@ impl NativeWatchSnapshot {
     fn write(&self, py: Python<'_>, path: String) -> PyResult<u64> {
         py.detach(|| -> PyResult<u64> {
             let document = SnapshotDocument {
-                checkpoint_seq: self.checkpoint_seq,
                 password_generation: self.data.password_generation,
                 password_source_signature: &self.data.password_source_signature,
                 watch_cursors: &self.data.cursors,
-                pending_work: self
-                    .data
-                    .pending
-                    .iter()
-                    .map(|(key, value)| (key.as_str(), value.as_ref()))
-                    .collect(),
+                pending_work: Records(&self.data.pending),
+                entries: Records(&self.data.entries),
                 runtime: &self.data.runtime,
-                entries: self
-                    .data
-                    .entries
-                    .iter()
-                    .map(|(key, value)| (key.as_str(), value.as_ref()))
-                    .collect(),
             };
-            let file = TrackedFile::open_with(&path, "watch_state_snapshot", |options| {
+            let mut file = TrackedFile::open_with(&path, "watch_state_snapshot", |options| {
                 options.write(true).truncate(true);
                 #[cfg(windows)]
                 {
@@ -230,13 +351,14 @@ impl NativeWatchSnapshot {
                     options.custom_flags(FILE_FLAG_SEQUENTIAL_SCAN);
                 }
             })?;
-            let mut writer = BufWriter::with_capacity(SNAPSHOT_BUFFER_BYTES, file);
-            serde_json::to_writer(&mut writer, &document).map_err(|error| {
-                PyValueError::new_err(format!("Watch snapshot encoding failed: {error}"))
-            })?;
-            writer.flush()?;
-            writer.get_ref().sync_all()?;
-            Ok(writer.get_ref().metadata()?.len())
+            let bytes = wal::write_snapshot(
+                &mut file,
+                Kind::TaskSnapshot,
+                self.checkpoint_seq,
+                &document,
+            )?;
+            file.sync_all()?;
+            Ok(bytes)
         })
     }
 }
@@ -252,6 +374,8 @@ pub(crate) struct NativeWatchReplay {
     records: u64,
     #[pyo3(get)]
     bytes: u64,
+    #[pyo3(get)]
+    valid_bytes: u64,
 }
 
 #[pyclass(module = "sunpack_native", frozen)]
@@ -294,7 +418,8 @@ impl NativeWatchState {
         };
         self.lock().pending.values().any(|record| {
             let source = path_key(&record.path);
-            source == root || is_path_under(&source, &root)
+            source == root
+                || is_path_under(&source, &root)
                 || record.active_outputs.values().any(|path| intersects(path))
                 || record.committed_roots.iter().any(|path| intersects(path))
         })
@@ -608,13 +733,13 @@ impl NativeWatchState {
             decoded.push(decode_operation(&py_to_json(&operation?)?)?);
         }
         Ok(NativeWatchOperations {
-            operations: decoded,
+            operations: Arc::new(Operations(decoded)),
         })
     }
 
     fn apply(&self, operations: PyRef<'_, NativeWatchOperations>) {
         let mut data = self.lock();
-        for operation in &operations.operations {
+        for operation in operations.operations.0.iter() {
             data.apply(operation);
         }
     }
@@ -631,6 +756,21 @@ impl NativeWatchState {
         let (checkpoint_seq, data) = py.detach(|| load_snapshot_file(&path))?;
         *self.lock() = data;
         Ok(checkpoint_seq)
+    }
+
+    /// Replay already established this boundary while holding the path gate.
+    #[staticmethod]
+    fn truncate_journal_tail(py: Python<'_>, path: String, valid_bytes: u64) -> PyResult<()> {
+        py.detach(|| -> PyResult<()> {
+            let file = TrackedFile::open_with(&path, "watch_journal_repair", |options| {
+                options.read(true).write(true);
+            })?;
+            if file.metadata()?.len() != valid_bytes {
+                file.set_len(valid_bytes)?;
+                file.sync_all()?;
+            }
+            Ok(())
+        })
     }
 
     /// Apply one journal segment after ``checkpoint_seq``; errors carry the WAL diagnosis.
@@ -706,10 +846,21 @@ fn decode_operation(operation: &Value) -> PyResult<Operation> {
         .ok_or_else(|| PyTypeError::new_err("journal operation op must be a string"))?;
     match action {
         "runtime" => {
+            require_fields(
+                object,
+                if object.contains_key("value") {
+                    &["op", "key", "value"]
+                } else {
+                    &["op", "key"]
+                },
+            )?;
             let key = object
                 .get("key")
                 .and_then(Value::as_str)
                 .ok_or_else(|| invalid("runtime key missing"))?;
+            if !key.starts_with("owned|") {
+                return Err(invalid("unknown runtime record"));
+            }
             return Ok(Operation::Runtime(
                 key.to_owned(),
                 object.get("value").filter(|v| !v.is_null()).cloned(),
@@ -797,34 +948,20 @@ fn decode_operation(operation: &Value) -> PyResult<Operation> {
 }
 
 fn load_snapshot_file(path: &str) -> PyResult<(u64, StateData)> {
-    let mut file = TrackedFile::open(path, "watch_state_snapshot_input")?;
-    let mut raw = Vec::new();
-    std::io::Read::read_to_end(&mut file, &mut raw)?;
-    let snapshot: SnapshotInput = serde_json::from_slice(&raw)
-        .map_err(|error| invalid(format!("corrupt watch state snapshot at {path}: {error}")))?;
+    let file = TrackedFile::open(path, "watch_state_snapshot_input")?;
+    let (checkpoint_seq, snapshot): (_, SnapshotInput) =
+        wal::read_snapshot(file, Kind::TaskSnapshot)
+            .map_err(|error| invalid(format!("corrupt watch state snapshot at {path}: {error}")))?;
     if snapshot.password_generation < 0 {
         return Err(invalid(format!(
             "corrupt watch state snapshot at {path}: negative password_generation"
         )));
     }
-    let checkpoint_seq = snapshot.checkpoint_seq;
     let password_generation = snapshot.password_generation;
     let data = StateData {
-        runtime: snapshot
-            .runtime
-            .into_iter()
-            .filter(|(key, _)| key.starts_with("owned|"))
-            .collect(),
-        pending: snapshot
-            .pending_work
-            .into_values()
-            .map(|record| (path_key(&record.path), Arc::new(record)))
-            .collect(),
-        entries: snapshot
-            .entries
-            .into_values()
-            .map(|record| (path_key(&record.path), Arc::new(record)))
-            .collect(),
+        runtime: snapshot.runtime,
+        pending: snapshot.pending_work,
+        entries: snapshot.entries,
         password_generation,
         password_source_signature: snapshot.password_source_signature,
         cursors: snapshot
@@ -842,60 +979,42 @@ fn replay_segment_file(
     checkpoint_seq: u64,
     mut expected_seq: u64,
 ) -> PyResult<NativeWatchReplay> {
+    let diagnose = |error| invalid(format!("corrupt watch state journal at {path}: {error}"));
     let file = TrackedFile::open(path, "watch_state_journal_input")?;
-    let mut reader = BufReader::new(file);
+    let mut reader = wal::Reader::new(file, Kind::TaskWal).map_err(diagnose)?;
     let mut replay = NativeWatchReplay {
         applied_seq: 0,
         expected_seq,
         records: 0,
         bytes: 0,
+        valid_bytes: 0,
     };
-    let mut line = Vec::new();
-    let mut line_number = 0usize;
-    loop {
-        line.clear();
-        if reader.read_until(b'\n', &mut line)? == 0 {
-            break;
-        }
-        line_number += 1;
-        // A torn final append is harmless in a sealed segment; a
-        // lost transaction is still caught by the next sequence gap.
-        if line.last() != Some(&b'\n') {
-            break;
-        }
-        let at = || format!("{path}:{line_number}");
-        let transaction: JournalTransaction = serde_json::from_slice(&line)
-            .map_err(|_| invalid(format!("corrupt watch state journal at {}", at())))?;
-        let seq = transaction.seq;
-        if transaction.operations.is_empty() {
-            return Err(invalid(format!(
-                "invalid watch state operations at {}",
-                at()
-            )));
+    while let Some(seq) = reader.next().map_err(diagnose)? {
+        let decoded: Vec<Operation> = wal::decode(&reader.payload).map_err(|error| {
+            invalid(format!("invalid watch state operation at {path}: {error}"))
+        })?;
+        if decoded.is_empty() {
+            return Err(invalid(format!("invalid watch state operations at {path}")));
         }
         if seq <= checkpoint_seq {
             continue;
         }
         if seq != expected_seq {
             return Err(invalid(format!(
-                "non-contiguous watch state sequence at {}: expected {expected_seq}, got {seq}",
-                at()
+                "non-contiguous watch state sequence at {path}: expected {expected_seq}, got {seq}"
             )));
         }
-        let decoded = transaction
-            .operations
-            .iter()
-            .map(decode_operation)
-            .collect::<PyResult<Vec<_>>>()
-            .map_err(|_| invalid(format!("invalid watch state operation at {}", at())))?;
         for operation in &decoded {
             data.apply(operation);
         }
         replay.applied_seq = seq;
-        expected_seq = seq + 1;
+        expected_seq = seq
+            .checked_add(1)
+            .ok_or_else(|| invalid("watch state sequence overflow"))?;
         replay.records += 1;
-        replay.bytes += line.len() as u64;
+        replay.bytes += (wal::FRAME_HEADER_BYTES + reader.payload.len()) as u64;
     }
+    replay.valid_bytes = reader.valid_end;
     replay.expected_seq = expected_seq;
     Ok(replay)
 }

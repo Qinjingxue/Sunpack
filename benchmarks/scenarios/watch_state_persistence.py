@@ -102,7 +102,7 @@ def benchmark_case(root: Path, total_records: int, rounds: int) -> dict:
     case_root = root / str(total_records)
     case_root.mkdir()
     state = WatchStateStore(
-        str(case_root / "state.json"),
+        str(case_root / "state.snapshot"),
         compact_records=1_000_000,
         compact_bytes=1024 * 1024 * 1024,
         hard_compact_bytes=1024 * 1024 * 1024,

@@ -66,7 +66,7 @@ def _arrival_order(sources: list[Path], policy: str) -> list[Path]:
 
 
 def _manifest(root: Path, source_names: set[str]) -> list[dict[str, Any]]:
-    excluded = source_names | {"state.json", "events.jsonl"}
+    excluded = source_names | {"state.snapshot", "events.jsonl"}
     rows: list[dict[str, Any]] = []
     for path in sorted(root.rglob("*")):
         if not path.is_file() or path.name in excluded:
@@ -341,7 +341,7 @@ async def _run_case(
     root = workspace.work / label / "watch"
     root.mkdir(parents=True, exist_ok=True)
     source_names = {path.name for path in sources}
-    state_path = workspace.work / label / "state.json"
+    state_path = workspace.work / label / "state.snapshot"
     config = load_config()
     config["cli"] = {**(config.get("cli") or {}), "quiet": True, "verbose": False}
     config["watch"] = {

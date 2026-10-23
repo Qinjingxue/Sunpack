@@ -162,7 +162,7 @@ def test_plan7_interrupted_download_resumes_after_watch_restart(tmp_path):
             payload_size=128 * 1024,
         )
     )
-    state_path = tmp_path / "restart" / "state.json"
+    state_path = tmp_path / "restart" / "state.snapshot"
     first = start_watch(
         tmp_path,
         "restart",

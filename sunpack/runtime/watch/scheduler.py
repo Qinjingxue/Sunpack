@@ -222,7 +222,7 @@ class WatchScheduler:
             os.path.abspath(str(self.state.journal_path)),
             os.path.abspath(str(log_path)),
             *(os.path.abspath(str(Path(state_path).with_name(name))) for name in
-              ("catalog.snapshot", "catalog.snapshot.tmp", "catalog.wal", "catalog.lock")),
+              ("catalog.snapshot.bin", "catalog.snapshot.bin.tmp", "catalog.wal.bin", "catalog.lock")),
         }
         self._lock = threading.Lock()
         # Publish claims and observation generations under one short gate.

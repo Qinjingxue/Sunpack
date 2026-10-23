@@ -67,7 +67,7 @@ def test_unreadable_subtree_is_reported_without_losing_readable_archives(tmp_pat
     scheduler.scopes = {path_key(root): DiscoveryScope(str(root), recursive=True)}
     scheduler.root_entries = {path_key(root): WatchRootEntry(str(root), recursive=True)}
     scheduler._scan_options = DirectoryScanner.compile_scan_options(config)
-    scheduler.state = WatchStateStore(str(tmp_path / "scan-state.json"))
+    scheduler.state = WatchStateStore(str(tmp_path / "scan-state.snapshot"))
     from sunpack_native import NativeWatchCatalog
     scheduler._catalog = NativeWatchCatalog(scheduler.state._native)
     request.addfinalizer(scheduler.state.close)

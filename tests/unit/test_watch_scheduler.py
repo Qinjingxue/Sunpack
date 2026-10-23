@@ -46,7 +46,7 @@ def WatchScheduler(*args, pipeline_engine=None, **kwargs):
 
 
 def _watcher(tmp_path, *, config=None, roots=None, **overrides):
-    options = dict(out_dir=str(tmp_path / "out"), state_path=str(tmp_path / "state.json"))
+    options = dict(out_dir=str(tmp_path / "out"), state_path=str(tmp_path / "state.snapshot"))
     options.update(overrides)
     return WatchScheduler(
         config if config is not None else make_config({"watch": {"clipboard_monitor_enabled": False}}),
@@ -354,7 +354,7 @@ def test_watch_scheduler_prunes_missing_state_before_start(tmp_path, monkeypatch
     monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
     watch_root = tmp_path / "watch"
     watch_root.mkdir()
-    state_path = tmp_path / ".sunpack_watch" / "state.json"
+    state_path = tmp_path / ".sunpack_watch" / "state.snapshot"
     stale_path = tmp_path / "gone.zip"
     stale_path.touch()
     unwatched_path = tmp_path / "still-present.zip"
@@ -413,7 +413,7 @@ def test_unavailable_root_preserves_state_across_restart_and_event_recovery(tmp_
     sources = [root / name for name in ("password.blob", "missing.001", "queued.blob")]
     for source in sources:
         source.write_bytes(b"source")
-    state_path = str(tmp_path / "state" / "state.json")
+    state_path = str(tmp_path / "state" / "state.snapshot")
     scope = DiscoveryScope(str(root), recursive=True)
 
     def create():
@@ -1508,7 +1508,7 @@ def test_watch_scheduler_uses_watchdog_observer_and_initial_scan(tmp_path, monke
     watch_root = tmp_path / "in"
     watch_root.mkdir()
     _write_zip(watch_root / "sample.zip")
-    state_path = tmp_path / "state.json"
+    state_path = tmp_path / "state.snapshot"
 
     watcher = _watcher(
         tmp_path,
@@ -1789,7 +1789,7 @@ def test_watch_scheduler_moved_file_uses_common_quiet_window(tmp_path, monkeypat
     watcher = _watcher(
         tmp_path,
         roots=[str(watch_root)],
-        state_path=str(tmp_path / ".sunpack_watch" / "state.json"),
+        state_path=str(tmp_path / ".sunpack_watch" / "state.snapshot"),
         cold_start_seconds=10,
         pipeline_engine=FakePipelineEngine(FakePipelineRunner),
     )
@@ -1873,7 +1873,7 @@ def test_watch_scheduler_ignores_unchanged_event_after_no_tasks_result(tmp_path,
     watcher = _watcher(
         tmp_path,
         roots=[str(watch_root)],
-        state_path=str(tmp_path / ".sunpack_watch" / "state.json"),
+        state_path=str(tmp_path / ".sunpack_watch" / "state.snapshot"),
         cold_start_seconds=0,
         pipeline_engine=FakePipelineEngine(NoTasksRunner),
     )
@@ -1914,7 +1914,7 @@ def test_watch_scheduler_processes_archive_when_output_root_matches_watch_root(t
     watcher = _watcher(
         tmp_path,
         out_dir=str(tmp_path),
-        state_path=str(tmp_path / ".sunpack_watch" / "state.json"),
+        state_path=str(tmp_path / ".sunpack_watch" / "state.snapshot"),
         cold_start_seconds=0,
         pipeline_engine=FakePipelineEngine(FakePipelineRunner),
     )
@@ -1960,7 +1960,7 @@ def test_watch_scheduler_recovers_persisted_pending_input_after_restart(tmp_path
     monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
     archive_path = tmp_path / "sample.zip"
     _write_zip(archive_path)
-    state_path = tmp_path / ".sunpack_watch" / "state.json"
+    state_path = tmp_path / ".sunpack_watch" / "state.snapshot"
     first = _watcher(
         tmp_path,
         out_dir=".",
@@ -2020,7 +2020,7 @@ def test_relative_output_directory_is_resolved_per_matching_watch_root(tmp_path,
         make_config({"watch": {"clipboard_monitor_enabled": False}}),
         [str(first_root), str(second_root)],
         out_dir=".",
-        state_path=str(first_root / ".sunpack_watch" / "state.json"),
+        state_path=str(first_root / ".sunpack_watch" / "state.snapshot"),
         cold_start_seconds=0,
         pipeline_engine=FakePipelineEngine(FakePipelineRunner),
     )
@@ -2067,7 +2067,7 @@ def test_watch_scheduler_routes_each_watch_root_to_its_configured_output_root(tm
             str(first_root): str(first_out),
             str(second_root): str(second_out),
         },
-        state_path=str(first_root / ".sunpack_watch" / "state.json"),
+        state_path=str(first_root / ".sunpack_watch" / "state.snapshot"),
         cold_start_seconds=0,
         pipeline_engine=FakePipelineEngine(SuccessRunner),
     )
@@ -2457,7 +2457,7 @@ def test_watch_scheduler_defaults_to_user_and_builtin_password_sources(tmp_path,
     watch_root.mkdir()
     archive_path = watch_root / "sample.zip"
     archive_path.write_bytes(b"PK\x03\x04payload")
-    state_path = tmp_path / "state.json"
+    state_path = tmp_path / "state.snapshot"
     watcher = _watcher(
         tmp_path,
         config=make_config({"user_passwords": ["user-secret"], "watch": {"clipboard_monitor_enabled": False}}),
@@ -2472,13 +2472,13 @@ def test_watch_scheduler_defaults_to_user_and_builtin_password_sources(tmp_path,
 
     assert captured[0]["user_passwords"] == ["user-secret"]
     assert captured[0]["password_snapshot"].global_passwords == ("builtin-secret",)
-    state_text = "\n".join(
-        path.read_text(encoding="utf-8")
+    state_bytes = b"\n".join(
+        path.read_bytes()
         for path in (state_path, watcher.state.journal_path)
         if path.exists()
     )
-    assert "user-secret" not in state_text
-    assert "builtin-secret" not in state_text
+    assert b"user-secret" not in state_bytes
+    assert b"builtin-secret" not in state_bytes
 
 
 def test_watch_scheduler_clipboard_persistence_refreshes_candidates_and_retries(tmp_path, monkeypatch):
@@ -2615,7 +2615,7 @@ def test_watch_scheduler_retries_persisted_password_failure_when_config_password
     watch_root.mkdir()
     archive_path = watch_root / "sample.zip"
     archive_path.write_bytes(b"PK\x03\x04payload")
-    state_path = tmp_path / "state.json"
+    state_path = tmp_path / "state.snapshot"
     first_watcher = _watcher(
         tmp_path,
         config=make_config({"user_passwords": ["wrong"], "watch": {"clipboard_monitor_enabled": False, "password_retry_debounce_seconds": 0}}),
@@ -2712,7 +2712,7 @@ def test_watch_scheduler_writes_jsonl_log_for_failures(tmp_path, monkeypatch):
     watcher = _watcher(
         tmp_path,
         roots=[str(watch_root)],
-        state_path=str(tmp_path / ".sunpack_watch" / "state.json"),
+        state_path=str(tmp_path / ".sunpack_watch" / "state.snapshot"),
         cold_start_seconds=0,
         pipeline_engine=FakePipelineEngine(FailingRunner),
     )
@@ -2738,7 +2738,7 @@ def test_watch_scheduler_silently_ignores_metadata_events(tmp_path, monkeypatch)
         tmp_path,
         config=make_config({}),
         roots=[str(watch_root)],
-        state_path=str(metadata_dir / "state.json"),
+        state_path=str(metadata_dir / "state.snapshot"),
         cold_start_seconds=0,
     )
 

@@ -219,7 +219,7 @@ def test_watch_nested_split_groups_persist_distinct_blockers(tmp_path, monkeypat
         async with PipelineEngine(config) as engine:
             watcher = WatchScheduler(
                 config, [str(outer.parent)], out_dir=str(output),
-                state_path=str(tmp_path / "state.json"), cold_start_seconds=0,
+                state_path=str(tmp_path / "state.snapshot"), cold_start_seconds=0,
                 pipeline_engine=engine,
             )
             try:
@@ -295,7 +295,7 @@ def test_watch_dual_faults_resume_after_each_blocker_is_resolved(
         async with PipelineEngine(config) as engine:
             watcher = WatchScheduler(
                 config, [str(case.archive_dir)], out_dir=str(output),
-                state_path=str(tmp_path / "state.json"), cold_start_seconds=0,
+                state_path=str(tmp_path / "state.snapshot"), cold_start_seconds=0,
                 pipeline_engine=engine,
             )
             async def settle():
