@@ -115,7 +115,11 @@ try {
     $stream = New-Object IO.FileStream($temporary, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
     try { $stream.Write($bytes, 0, $bytes.Length); $stream.Flush($true) } finally { $stream.Dispose() }
     $preserved = New-Object Security.AccessControl.FileSecurity
-    $preserved.SetSecurityDescriptorSddlForm($acl.Sddl, ([Security.AccessControl.AccessControlSections]::Access -bor
+    # ReplaceFile preserves the target DACL. Applying it to the temporary file
+    # first can materialize inherited ACEs as explicit entries on Windows Server,
+    # which ReplaceFile then retains alongside the original inherited entries.
+    # Only owner/group need to be carried by the replacement file itself.
+    $preserved.SetSecurityDescriptorSddlForm($acl.Sddl, (
         [Security.AccessControl.AccessControlSections]::Owner -bor [Security.AccessControl.AccessControlSections]::Group))
     [IO.File]::SetAccessControl($temporary, $preserved)
     [IO.File]::Replace($temporary, $target, [System.Management.Automation.Language.NullString]::Value, $false)

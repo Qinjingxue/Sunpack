@@ -83,13 +83,20 @@ def test_installer_field_upgrade_preserves_values_modules_and_acl(tmp_path, repo
     assert paths["user"].read_bytes() == committed and acl() == original_acl
     assert not list(tmp_path.glob(".sunpack-config-*.tmp"))
 
-
-def test_upgrade_by_different_administrator_preserves_ordinary_users_owner_and_acl(tmp_path, repo_root):
-    # Same-account ACL checks cannot detect owner replacement during elevation.
-    completed = subprocess.run([
-        "powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
-        "-File", str(repo_root / "tests/helpers/config_upgrade_permissions.ps1"),
-        "-RepoRoot", str(repo_root), "-Fixture", str(tmp_path / "ordinary-user"),
-    ], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60)
+    # ReplaceFile must preserve an explicitly protected DACL too; inheriting the
+    # temporary file's parent permissions would silently widen access here.
+    literal = str(paths["user"]).replace("'", "''")
+    protected = subprocess.run([
+        "powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+        f"$acl = [IO.File]::GetAccessControl('{literal}'); "
+        "$acl.SetAccessRuleProtection($true, $true); "
+        f"[IO.File]::SetAccessControl('{literal}', $acl)",
+    ], capture_output=True, text=True, timeout=15)
+    assert protected.returncode == 0, protected.stderr
+    original_acl = acl()
+    paths["user"].write_text(json.dumps(user), encoding="utf-8")
+    paths["new"].write_text(json.dumps(new), encoding="utf-8")
+    completed = subprocess.run(command, capture_output=True, text=True, timeout=15)
     assert completed.returncode == 0, completed.stdout + completed.stderr
-    assert (tmp_path / "ordinary-user/verified").read_text() == "ok"
+    assert json.loads(paths["user"].read_text(encoding="utf-8")) == expected
+    assert acl() == original_acl

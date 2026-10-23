@@ -34,7 +34,10 @@ STRUCTURE_CASES = (
 
 def run(command: list[str], cwd: Path) -> str:
     result = subprocess.run(command, cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace")
-    assert result.returncode == 0, (command, result.stdout, result.stderr)
+    assert result.returncode == 0, (
+        result.returncode, f"0x{result.returncode & 0xFFFFFFFF:08X}",
+        command, result.stdout, result.stderr,
+    )
     return result.stdout
 
 
