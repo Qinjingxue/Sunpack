@@ -374,10 +374,14 @@ def test_shared_output_password_retry_keeps_original_input_detection_mode(tmp_pa
         ordinary_root = tmp_path / "ordinary"
         ordinary_root.mkdir()
         watcher.watch_roots.append(str(ordinary_root))
+        watcher.scopes[scheduler_module.path_key(str(ordinary_root))] = scheduler_module.DiscoveryScope(str(ordinary_root))
         watcher.root_entries[scheduler_module.path_key(str(ordinary_root))] = WatchRootEntry(
             str(ordinary_root), str(output), False,
         )
         watcher.output_roots[scheduler_module.path_key(str(ordinary_root))] = str(output)
+        key = scheduler_module.path_key(str(ordinary_root))
+        watcher._scope_policies[key] = watcher._scope_policy(watcher.scopes[key])
+        watcher._scope_epochs[key] = 1
         outer = root / "outer.bin"
         ordinary = ordinary_root / "ordinary.bin"
         inner = root / "inner.bin"

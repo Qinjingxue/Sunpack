@@ -849,6 +849,9 @@ class WatchService:
             )
 
     def _start_config_observer(self) -> None:
+        from sunpack.runtime.cli.runtime_state import server_runtime_active
+        if server_runtime_active():
+            return
         if self.config_observer is not None:
             return
         directory = watch_roots_path().resolve().parent

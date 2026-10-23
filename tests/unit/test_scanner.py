@@ -467,23 +467,16 @@ def test_directory_scanner_whitelist_keeps_only_allowed_path_globs(tmp_path):
 def test_directory_scanner_pushes_whitelist_directory_rules_to_native(tmp_path, monkeypatch):
     captured = {}
 
-    def fake_scan(
-        root_path,
-        max_depth,
-        patterns,
-        prune_dirs,
-        blocked_extensions,
-        blocked_file_names,
-        size_ranges,
-        mtime_ranges,
-        whitelist_rules,
-    ):
-        captured["whitelist_rules"] = whitelist_rules
-        return object(), object()
+    class FakeOptions:
+        def __init__(self, **options):
+            captured.update(options)
+
+        def scan_scope(self, scope):
+            return object(), object()
 
     monkeypatch.setattr(
-        "sunpack.pipeline.discovery.filesystem.directory_scanner._NATIVE_SCAN_DIRECTORY_SNAPSHOTS",
-        fake_scan,
+        "sunpack.pipeline.discovery.filesystem.directory_scanner.NativeDirectoryScanOptions",
+        FakeOptions,
     )
 
     DirectoryScanner(str(tmp_path), include_raw_snapshot=True, config=make_config({

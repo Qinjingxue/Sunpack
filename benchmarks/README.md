@@ -26,6 +26,7 @@ uv run --locked python -m benchmarks reader embedded-scan --generate-plan5-mib 5
   --baseline-report benchmarks/results/reader.embedded-scan/<baseline-run>/report.json `
   --max-regression-percent 5
 uv run --locked python -m benchmarks scan hotspots . --mode full --json-out benchmarks/results/scan-hotspots.json
+uv run --no-sync python -m benchmarks scan watch-catalog --files 30000 --protected-files 100000 --bucket-size 8 --rounds 20
 uv run --locked python -m benchmarks extraction format-matrix --runs 5 --json-out benchmarks/results/extraction-benchmark.json
 uv run --locked python -m benchmarks extraction cli-format-matrix --runs 3 --prefetch on --json-out benchmarks/results/cli-format-matrix-prefetch-on.json
 uv run --locked python -m benchmarks extraction cli-format-matrix --format zipx --format lz4 --format enc --runs 3 --prefetch on --json-out benchmarks/results/cli-zipx-lz4-enc-prefetch-on.json

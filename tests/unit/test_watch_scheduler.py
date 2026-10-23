@@ -318,6 +318,10 @@ def _indexed_scheduler_for_test():
     watcher._completion_batches = set()
     watcher._quiet_trackers = {}
     watcher._latest_observations = {}
+    watcher._source_probes = {}
+    watcher.output_ownership = None
+    watcher._wake_callback = None
+    watcher.should_ignore_event_path = lambda path: False
     watcher._password_reload_at = None
     watcher._password_retry_at = None
     watcher._cache_cleanup_deadline = None
@@ -501,6 +505,7 @@ def test_retire_claimed_paths_preserves_pending_alias_without_pending_scan():
     watcher._pending = _NoScanDict(watcher._pending)
     completed, cleared, matched = [], [], []
     watcher.state = SimpleNamespace(
+        pending_work_for_path=lambda path: None,
         complete_work=completed.extend, clear_entries=cleared.extend,
         complete_work_if_matches=matched.append,
     )
@@ -556,6 +561,7 @@ def test_watch_pop_ready_uses_heap_without_pending_mapping_scan(monkeypatch):
     watcher._active_claims = {}
     watcher.state = SimpleNamespace(
         record_attempt=lambda *args, **kwargs: None,
+        pending_work_for_path=lambda path: None,
         forget_path=lambda *args, **kwargs: None,
     )
     watcher.log = SimpleNamespace(
@@ -602,10 +608,10 @@ def test_watch_ready_batch_survives_one_candidate_error(tmp_path, monkeypatch, f
             raise OSError("transient observation failure")
         return observe(path, since_usn=since_usn)
 
-    def attempt(path, *args):
+    def attempt(path, *args, **kwargs):
         if path == middle and failure_stage == "attempt":
             raise OSError("state write failure")
-        return record_attempt(path, *args)
+        return record_attempt(path, *args, **kwargs)
 
     def log(event, **fields):
         if fields.get("path") == middle and event == "candidate_quiet" and failure_stage == "log":
@@ -1721,7 +1727,7 @@ def test_watch_scheduler_processes_archive_when_output_root_matches_watch_root(t
     assert not watcher.state.pending_work_items()
 
 
-def test_watch_scheduler_does_not_reprocess_unchanged_input_when_output_is_deleted(tmp_path, monkeypatch):
+def test_watch_scheduler_invalidates_completion_when_output_identity_is_replaced(tmp_path, monkeypatch):
     monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
     archive_path = tmp_path / "sample.zip"
     output_dir = tmp_path / "sample"
@@ -1754,10 +1760,11 @@ def test_watch_scheduler_does_not_reprocess_unchanged_input_when_output_is_delet
     assert len(runs) == 1
 
     output_dir.rmdir()
+    output_dir.mkdir()
     watcher.enqueue(str(archive_path), event_type="modified")
 
-    assert _await(watcher.run_once()).succeeded == 0
-    assert len(runs) == 1
+    assert _await(watcher.run_once()).succeeded == 1
+    assert len(runs) == 2
 
 
 def test_watch_event_handler_cleans_moved_directory_source_without_arrival_enqueue(tmp_path):
@@ -2679,6 +2686,63 @@ def test_watch_scheduler_claim_removes_pending_sibling_before_source_cleanup_pro
     # Reconciliation happens once after the pipeline lease/promotion lifetime.
     assert observed == [os.path.abspath(str(sibling_volume))]
     assert watcher.pending_count == 0
+
+
+@pytest.mark.parametrize("stage", ["observation", "attempt"])
+def test_claim_during_probe_replays_new_generation_without_blocking_publication(tmp_path, monkeypatch, stage):
+    """Cover publication during filesystem/WAL work; serial claim tests cannot.
+
+    One barrier scenario per I/O boundary catches stale overwrite and a gate
+    held across I/O, without a timing race or a production concurrency change.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    source = tmp_path / "split.7z.002"
+    source.write_bytes(b"old")
+    watcher = _watcher(tmp_path, cold_start_seconds=0)
+    if stage == "attempt":
+        watcher.enqueue(str(source))
+    entered, resume = threading.Event(), threading.Event()
+    original = (scheduler_module._candidate_for_event_path if stage == "observation"
+                else watcher.state.record_attempt)
+    first = True
+
+    def blocked(path, *args, **kwargs):
+        nonlocal first
+        if first and path == str(source):
+            first = False
+            observed = original(path, *args, **kwargs) if stage == "observation" else None
+            entered.set()
+            assert resume.wait(10), "test did not release the probe"
+            if stage == "observation":
+                return observed
+        return original(path, *args, **kwargs)
+
+    if stage == "observation":
+        monkeypatch.setattr(scheduler_module, "_candidate_for_event_path", blocked)
+    else:
+        monkeypatch.setattr(watcher.state, "record_attempt", blocked)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            probe = pool.submit(watcher.enqueue, str(source)) if stage == "observation" else pool.submit(
+                watcher._pop_ready, time.time() + 100)
+            try:
+                assert entered.wait(10)
+                claim = pool.submit(watcher._claim_pipeline_sources, "owner", [str(source)])
+                claim.result(timeout=5)
+                source.write_bytes(b"new generation")
+                watcher._release_pipeline_source_claims("owner")
+            finally:
+                resume.set()
+            result = probe.result(timeout=10)
+            if stage == "attempt":
+                assert result == []
+        assert watcher._pending[str(source)].size == len(b"new generation")
+        assert watcher.state.pending_work_for_path(str(source)).size == len(b"new generation")
+        assert not watcher._source_probes
+        assert [item.size for item in watcher._pop_ready(time.time() + 200)] == [len(b"new generation")]
+    finally:
+        watcher._close_blocking()
 
 
 def test_watch_scheduler_claim_hands_off_only_new_generation_after_release(

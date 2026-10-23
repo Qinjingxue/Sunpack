@@ -1196,7 +1196,7 @@ impl NativeDirectoryScanOptions {
                     .filter_map(|(_,v)| v.path().map(str::to_owned)));
             }
             let mut options = self.options.clone(); options.scope = Some(effective.clone());
-            let records = if effective.excludes(target) {
+            let records = if !effective.contains(target) || state.lock().is_owned(target) {
                 DirectoryScanRecords { filtered: Vec::new(), raw: Vec::new(), errors: DirectoryReadErrors::report() }
             } else {
                 match fs::metadata(target) {
@@ -1217,7 +1217,7 @@ impl NativeDirectoryScanOptions {
                 let key = format!("{base_prefix}{stem}|{}", crate::path_keys::path_key(&record.path));
                 present.insert(key.clone());
                 let value = serde_json::to_value(&record).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
-                if data.runtime.get(&key).and_then(|old|old.file()).is_none_or(|old|old.size!=record.size || old.mtime_ns!=record.mtime_ns || old.relation_member_eligible!=record.relation_member_eligible) {
+                if data.catalog_file(&scope.root, &record.path).is_none_or(|old|old.size!=record.size || old.mtime_ns!=record.mtime_ns || old.relation_member_eligible!=record.relation_member_eligible) {
                     values.push(serde_json::json!({"op":"runtime", "key":key,"value":value}));
                 }
             }
@@ -1247,11 +1247,13 @@ impl NativeDirectoryScanOptions {
     fn catalog_snapshot(&self, py: Python<'_>, state: &crate::watch_store::NativeWatchState,
         scope: &crate::scan::scope::NativeDiscoveryScope, seed: &str)
         -> PyResult<(Py<NativeDirectorySnapshot>, Py<NativeDirectorySnapshot>)> {
-        let stem = crate::path_keys::case_key(crate::relations::first_dot_stem(Path::new(seed).file_name().unwrap().to_str().unwrap_or_default()));
-        let prefix = format!("file|{}|{stem}|", crate::path_keys::path_key(&scope.root));
-        let mut raw: Vec<DirectoryEntryRecord> = state.lock().runtime.range(prefix.clone()..)
-            .take_while(|(k,_)| k.starts_with(&prefix)).filter_map(|(_,v)| v.file().cloned()).collect();
-        { let data=state.lock(); raw.retain(|row| !data.is_owned(&row.path)); }
+        let mut raw: Vec<DirectoryEntryRecord> = {
+            let data = state.lock();
+            data.catalog_bucket(&scope.root, seed).iter()
+                .filter_map(|value| value.file())
+                .filter(|row| scope.contains(&row.path) && !data.is_owned(&row.path))
+                .cloned().collect()
+        };
         let root = Path::new(&scope.root);
         let mut accepted = HashSet::new();
         let mut directory_cache = HashMap::new();
@@ -2550,8 +2552,18 @@ fn scan_directory_impl<const PROFILE: bool>(
             errors,
         });
     }
+    if options.scope.as_ref().is_some_and(|scope| !scope.contains(root_path)) {
+        return Ok(DirectoryScanRecords { filtered: Vec::new(), raw: Vec::new(), errors });
+    }
+    let mut directory_cache = HashMap::new();
+    if root != filter_root && (dir_rejected(&root, filter_root, options)
+        && metadata.as_ref().is_some_and(|metadata| metadata.is_dir())
+        || file_under_rejected_directory(&root, filter_root, options, &mut directory_cache)) {
+        return Ok(DirectoryScanRecords { filtered: Vec::new(), raw: Vec::new(), errors });
+    }
     if metadata.as_ref().is_some_and(|metadata| metadata.is_file()) {
-        let match_root = root.parent().unwrap_or_else(|| Path::new(""));
+        let match_root = if options.scope.is_some() { filter_root }
+            else { root.parent().unwrap_or_else(|| Path::new("")) };
         let raw = collect_raw
             .then(|| {
                 fs::metadata(&root)
@@ -2561,7 +2573,8 @@ fn scan_directory_impl<const PROFILE: bool>(
                         is_dir: false,
                         size: Some(metadata.len()),
                         mtime_ns: metadata_mtime_ns(&metadata),
-                        relation_member_eligible: true,
+                        relation_member_eligible: !file_rejected_by_path(&root, match_root, options)
+                            && numeric_ranges_allow(&options.mtime_ranges, metadata_mtime_ns(&metadata)),
                         relation_anchor: None,
                     })
             })
@@ -2585,7 +2598,11 @@ fn scan_directory_impl<const PROFILE: bool>(
     let mut raw_records = Vec::new();
     let mut size_accepted_split_families = HashSet::new();
     let mut size_deferred_split_records = Vec::new();
-    let mut stack = vec![(root.clone(), 0usize)];
+    let start_depth = options.scope.as_ref().and_then(|scope| scope.directory_depth(root_path)).unwrap_or(0);
+    if max_depth.is_some_and(|limit| start_depth > limit) {
+        return Ok(DirectoryScanRecords { filtered: Vec::new(), raw: Vec::new(), errors });
+    }
+    let mut stack = vec![(root.clone(), start_depth)];
     while let Some((dir, depth)) = stack.pop() {
         let read_dir =
             match measure::<PROFILE, _>(&mut profile, ProfileBucket::DirectoryEnumeration, || {

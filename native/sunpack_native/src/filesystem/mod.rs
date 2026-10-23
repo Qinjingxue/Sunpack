@@ -176,22 +176,48 @@ pub(crate) fn watch_identity_path(py: Python<'_>, volume: &str, identity: &str) 
     { let _=(py,volume,identity); Err(PyRuntimeError::new_err("watch mode requires Windows NTFS")) }
 }
 
+#[pyclass(module = "sunpack_native", frozen)]
+pub(crate) struct NativeWatchChangeBatch {
+    #[pyo3(get)]
+    journal_id: u64,
+    #[pyo3(get)]
+    next_usn: i64,
+    #[pyo3(get)]
+    dirty: bool,
+    #[cfg(windows)]
+    changes: Vec<sunpack_usn_core::protocol::JournalChange>,
+}
+
+#[pymethods]
+impl NativeWatchChangeBatch {
+    fn paths_for_scopes(&self, scopes: Vec<PyRef<'_, crate::scan::scope::NativeDiscoveryScope>>) -> Vec<(String, bool)> {
+        #[cfg(windows)]
+        {
+            let mut paths = std::collections::BTreeMap::new();
+            for change in &self.changes {
+                if let Some(path) = change.path.as_ref().filter(|path| scopes.iter().any(|scope| scope.contains(path))) {
+                    paths.entry(crate::path_keys::path_key(path))
+                        .and_modify(|entry: &mut (String, bool)| entry.1 |= change.is_directory)
+                        .or_insert_with(|| (path.clone(), change.is_directory));
+                }
+            }
+            paths.into_values().collect()
+        }
+        #[cfg(not(windows))]
+        { let _ = scopes; Vec::new() }
+    }
+}
+
 #[pyfunction]
-pub(crate) fn watch_root_changes(
-    path: &str,
-    start_usn: i64,
-    end_usn: i64,
-) -> PyResult<Vec<String>> {
+pub(crate) fn watch_volume_changes(py: Python<'_>, volume: &str, start_usn: i64, end_usn: i64) -> PyResult<NativeWatchChangeBatch> {
     #[cfg(windows)]
     {
-        let path = Path::new(path);
-        let (volume, file_id, _) = windows::watch_path_identity(path).map_err(os_error)?;
-        return sunpack_usn_core::broker_read_root_changes(&volume, &file_id, start_usn, end_usn)
-            .map_err(os_error);
+        let batch = py.detach(|| sunpack_usn_core::broker_read_volume_changes(volume, start_usn, end_usn)).map_err(os_error)?;
+        Ok(NativeWatchChangeBatch {journal_id: batch.journal_id, next_usn: batch.next_usn, dirty: batch.dirty, changes: batch.changes})
     }
     #[cfg(not(windows))]
     {
-        let _ = (path, start_usn, end_usn);
+        let _ = (py, volume, start_usn, end_usn);
         Err(PyRuntimeError::new_err("watch mode requires Windows NTFS"))
     }
 }
@@ -229,5 +255,12 @@ pub(crate) fn watch_file_is_ready(path: &str) -> PyResult<bool> {
 }
 
 fn os_error(error: std::io::Error) -> PyErr {
-    PyOSError::new_err(error.to_string())
+    // Ownership recovery distinguishes a vanished identity from an unreadable
+    // one. A string-only OSError loses that distinction at the Python boundary.
+    match error.kind() {
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory => {
+            PyFileNotFoundError::new_err(error.to_string())
+        }
+        _ => PyOSError::new_err(error.to_string()),
+    }
 }

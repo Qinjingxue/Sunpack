@@ -19,12 +19,18 @@ def _watch_scheduler_shell(scheduler_module):
     scheduler._claims_by_owner = {}
     scheduler._pending_by_key = {}
     scheduler._dirty_during_claim = {}
+    scheduler._source_probes = {}
     scheduler._inflight_requests = []
     scheduler._inflight_path_counts = {}
     scheduler._active_epoch = 0
     scheduler._ready_heap = []
     scheduler._closed = False
     scheduler._completion_batches = set()
+    scheduler.output_ownership = None
+    scheduler.watch_roots = []
+    scheduler.scopes = {}
+    scheduler.root_entries = {}
+    scheduler._scan_options = SimpleNamespace(catalog_update=lambda *_args: ([], []))
     return scheduler
 
 
@@ -107,6 +113,8 @@ def test_live_enqueue_keeps_owner_memory_only(tmp_path):
     scheduler.cold_start_seconds = 0.0
     scheduler._quiet_policy = SimpleNamespace()
     scheduler.state = SimpleNamespace(
+        _native=SimpleNamespace(runtime_record=lambda _key: None),
+        commit_runtime=lambda *_args, **_kwargs: None,
         latest_entry_for_path=lambda _path: None,
         pending_work_for_path=lambda _path: None,
         queue_active=lambda *_args, **kwargs: calls.append(kwargs),
@@ -120,6 +128,7 @@ def test_live_enqueue_keeps_owner_memory_only(tmp_path):
     scheduler.metadata_files = set()
     scheduler.metadata_dir = ""
     scheduler.watch_roots = [str(tmp_path)]
+    scheduler.scopes = {scheduler_module.path_key(str(tmp_path)): scheduler_module.DiscoveryScope(str(tmp_path))}
     scheduler._observe_candidate_activity = lambda *_args, **_kwargs: 0.0
     monkeypatch_target = scheduler_module._candidate_for_event_path
     scheduler_module._candidate_for_event_path = lambda *_args, **_kwargs: candidate
@@ -298,6 +307,8 @@ def test_enqueue_does_not_publish_memory_work_when_durable_queue_fails(tmp_path)
         raise OSError("disk failed")
 
     scheduler.state = SimpleNamespace(
+        _native=SimpleNamespace(runtime_record=lambda _key: None),
+        commit_runtime=lambda *_args, **_kwargs: None,
         latest_entry_for_path=lambda _path: None,
         pending_work_for_path=lambda _path: None,
         queue_active=fail_queue,
@@ -311,6 +322,7 @@ def test_enqueue_does_not_publish_memory_work_when_durable_queue_fails(tmp_path)
     scheduler.metadata_files = set()
     scheduler.metadata_dir = ""
     scheduler.watch_roots = [str(tmp_path)]
+    scheduler.scopes = {scheduler_module.path_key(str(tmp_path)): scheduler_module.DiscoveryScope(str(tmp_path))}
     scheduler._observe_candidate_activity = lambda *_args, **_kwargs: 0.0
     monkeypatch_target = scheduler_module._candidate_for_event_path
     scheduler_module._candidate_for_event_path = lambda *_args, **_kwargs: candidate

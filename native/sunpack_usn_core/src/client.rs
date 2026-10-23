@@ -60,7 +60,7 @@ impl BrokerConnection {
 
     fn transact_payload(&mut self, request: Request) -> io::Result<(Response, Vec<u8>)> {
         let request_id = request.request_id;
-        let payload_response = request.opcode == Opcode::ReadRootChanges;
+        let payload_response = request.opcode == Opcode::ReadVolumeChanges;
         let request = request.encode()?;
         write_exact(self.0, &request)?;
         let mut response_bytes = [0u8; RESPONSE_BYTES];
@@ -174,17 +174,11 @@ pub fn broker_read_change_reasons(
     })
 }
 
-pub fn broker_read_root_changes(
-    volume_guid: &str,
-    root_file_id: &str,
-    start_usn: i64,
-    end_usn: i64,
-) -> io::Result<Vec<String>> {
-    let (file_id, file_id_len) = parse_file_id(root_file_id)?;
-    let mut request = Request::simple(Opcode::ReadRootChanges, next_request_id());
+pub fn broker_read_volume_changes(
+    volume_guid: &str, start_usn: i64, end_usn: i64,
+) -> io::Result<crate::protocol::VolumeChangeBatch> {
+    let mut request = Request::simple(Opcode::ReadVolumeChanges, next_request_id());
     request.volume_guid = volume_guid.to_owned();
-    request.file_id = file_id;
-    request.file_id_len = file_id_len;
     request.previous_usn = start_usn;
     request.current_usn = end_usn;
     let state = STATE.get_or_init(|| Mutex::new(ClientState::default()));
@@ -192,32 +186,12 @@ pub fn broker_read_root_changes(
     if state.leases == 0 {
         return Err(io::Error::new(io::ErrorKind::NotConnected, "SunPack Watch Broker has not been acquired"));
     }
-    if state.connection.is_none() {
-        state.connection = Some(connect_and_hello()?);
-    }
-    let (response, payload) = state.connection.as_mut().unwrap().transact_payload(request)?;
-    ensure_ok(response)?;
-    decode_path_payload(&payload)
-}
-
-fn decode_path_payload(payload: &[u8]) -> io::Result<Vec<String>> {
-    let mut offset = 0usize;
-    let mut result = Vec::new();
-    while offset < payload.len() {
-        if offset + 4 > payload.len() {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "truncated path payload"));
-        }
-        let length = u32::from_le_bytes(payload[offset..offset+4].try_into().unwrap()) as usize;
-        offset += 4;
-        if offset + length > payload.len() {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "truncated path payload item"));
-        }
-        result.push(std::str::from_utf8(&payload[offset..offset+length])
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "path payload is not UTF-8"))?
-            .to_owned());
-        offset += length;
-    }
-    Ok(result)
+    if state.connection.is_none() { state.connection = Some(connect_and_hello()?); }
+    let result = state.connection.as_mut().unwrap().transact_payload(request);
+    if result.is_err() { state.connection.take(); }
+    let (response, payload) = result?;
+    let response = ensure_ok(response)?;
+    crate::protocol::VolumeChangeBatch::decode(response.journal_id, response.next_usn, &payload)
 }
 
 fn transact_request(request: Request) -> io::Result<Response> {

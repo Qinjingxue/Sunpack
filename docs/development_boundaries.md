@@ -101,7 +101,7 @@ Publicly allowed relation capabilities include:
 - `find_standard_split_siblings(archive)`
 - `parse_numbered_volume(path)`
 - `resolve_volume_once(current_paths, candidate_paths, format_hint=...)`
-- `resolve_volume_once_in_directory(current_paths, directory, format_hint=...)`
+- `ArchiveTaskProvider.resolve_volume_once(current_paths, scope, format_hint=..., catalog=...)`
 
 ### pipeline.discovery.detection
 

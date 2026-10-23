@@ -28,6 +28,7 @@ def _scheduler():
     watcher._active_claims = {}
     watcher._claims_by_owner = {}
     watcher._dirty_during_claim = {}
+    watcher._source_probes = {}
     watcher.log = SimpleNamespace(write=lambda *args, **kwargs: None)
     watcher.enqueue = lambda *args, **kwargs: None
     return watcher

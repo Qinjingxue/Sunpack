@@ -37,7 +37,7 @@ def test_flatten_relocates_nested_outputs_and_reports_retained_work(tmp_path, mo
     state.add_cleanup_result(ArchiveCleanupResult(leaf + "/inner.001", "recycle", "failed", message="locked"))
     runtime = object.__new__(_RequestRuntime)
     runtime.config = {"post_extract": {"archive_cleanup_mode": "keep"}}
-    runtime.services = SimpleNamespace(output_ownership=SimpleNamespace(prepare_flatten=lambda *args: None), output_reservations=None)
+    runtime.services = SimpleNamespace(output_ownership=SimpleNamespace(prepare_flatten=lambda *args: None, seal=lambda *args, **kwargs: None), output_reservations=None)
     runtime.context = state
     runtime.submission = SimpleNamespace(request_id="request", stdout=io.StringIO(), targets=(PipelineTarget("outer.carrier"),))
     runtime.reporter = RunReporter(stdout=runtime.submission.stdout)
@@ -74,7 +74,7 @@ def test_flatten_exception_is_a_postprocess_warning(tmp_path, monkeypatch):
     monkeypatch.setattr(module, "_native_flatten_single_branch_directories", fail)
     runtime = object.__new__(_RequestRuntime)
     runtime.config = {"post_extract": {"archive_cleanup_mode": "keep"}}
-    runtime.services = SimpleNamespace(output_ownership=SimpleNamespace(prepare_flatten=lambda *args: None), output_reservations=None)
+    runtime.services = SimpleNamespace(output_ownership=SimpleNamespace(prepare_flatten=lambda *args: None, seal=lambda *args, **kwargs: None), output_reservations=None)
     runtime.context = RunState()
     runtime.submission = SimpleNamespace(request_id="request", stdout=io.StringIO())
     runtime.reporter = RunReporter(stdout=runtime.submission.stdout)

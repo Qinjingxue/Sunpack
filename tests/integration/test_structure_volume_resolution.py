@@ -639,21 +639,22 @@ def test_pipeline_uses_initial_structure_group_without_missing_volume_retry(
     )
 
     engine = PipelineEngine(config)
-    original_resolver = RelationsScheduler.resolve_volume_once_in_directory
+    from sunpack.pipeline.coordinator.task_provider import ArchiveTaskProvider
+    original_resolver = ArchiveTaskProvider.resolve_volume_once
     resolution_attempts = 0
 
-    def counting_resolver(scheduler, current_paths, *, format_hint=""):
+    def counting_resolver(provider, current_paths, scope, *, format_hint="", catalog=None):
         nonlocal resolution_attempts
         resolution_attempts += 1
         return original_resolver(
-            scheduler,
-            current_paths,
+            provider, current_paths, scope,
             format_hint=format_hint,
+            catalog=catalog,
         )
 
     monkeypatch.setattr(
-        RelationsScheduler,
-        "resolve_volume_once_in_directory",
+        ArchiveTaskProvider,
+        "resolve_volume_once",
         counting_resolver,
     )
     async def run():
@@ -763,10 +764,10 @@ def test_structure_resolution_recomputes_a_residual_middle_gap(tmp_path):
     assert group.input_paths == [str(path) for path in renamed]
 
 
-def test_structure_resolution_stays_within_the_head_parent_directory(
+def test_structure_resolution_rejects_ambiguous_cross_directory_heads(
     mixed_real_volumes, tmp_path
 ):
-    """A same-stem first volume in another directory cannot affect resolution."""
+    """Duplicate heads in one scope must never be paired by physical proximity."""
     _fixture_root, _common, _cases, paths_by_format = mixed_real_volumes
     scan_root = tmp_path / "directory_scope"
     first_directory = scan_root / "first"
@@ -795,9 +796,7 @@ def test_structure_resolution_stays_within_the_head_parent_directory(
         all_paths,
         format_hint="7z",
     )
-    assert direct_group is not None
-    assert direct_group.head_metadata["volume_set_incomplete"] is True
-    assert str(foreign_first) not in direct_group.input_paths
+    assert direct_group is None
 
     entries = [
         FileEntry(path=path, is_dir=False, size=path.stat().st_size, mtime_ns=path.stat().st_mtime_ns)
@@ -806,12 +805,13 @@ def test_structure_resolution_stays_within_the_head_parent_directory(
     snapshot = DirectorySnapshot.from_entries(scan_root, entries)
     groups = scheduler.build_candidate_groups(snapshot)
     assert {path for group in groups for path in group.input_paths} == set(all_paths)
-    assert all(group.head_metadata.get("volume_set_incomplete") is True for group in groups)
-    assert not any(
-        str(foreign_first) in group.input_paths
-        and any(str(path) in group.input_paths for path in first_parts)
-        for group in groups
-    )
+    ambiguous = [group for group in groups
+                 if str(foreign_first) in group.input_paths]
+    assert len(ambiguous) == 1
+    assert ambiguous[0].head_metadata["relation_failure_reason"] == "ambiguous_volume_mapping"
+    assert ambiguous[0].head_metadata["relation_confirmed"] is False
+    assert not ambiguous[0].split_volumes
+    assert all(not (group.head_metadata or {}).get("relation_confirmed") for group in groups)
 
 
 def test_structure_resolution_rejects_current_paths_from_different_directories(

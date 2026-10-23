@@ -5,8 +5,6 @@ from sunpack.core.support.path_keys import case_key
 from sunpack_native import (
     NativeDirectoryScanOptions,
     filter_inventory_file_indices as _NATIVE_FILTER_INVENTORY_FILE_INDICES,
-    scan_directory_snapshot as _NATIVE_SCAN_DIRECTORY_SNAPSHOT,
-    scan_directory_snapshots as _NATIVE_SCAN_DIRECTORY_SNAPSHOTS,
     relations_apply_split_size_anchors as _NATIVE_APPLY_SPLIT_SIZE_ANCHORS,
     relations_size_filter_split_family_keys as _NATIVE_SPLIT_SIZE_FAMILY_KEYS,
 )

@@ -81,6 +81,7 @@ def _fork(module, template):
         watcher._pending_by_key = template._pending_by_key.copy()
         watcher._claims_by_owner = template._claims_by_owner.copy()
     watcher._dirty_during_claim = {}
+    watcher._source_probes = {}
     watcher.replayed = []
     watcher.completed = []
     watcher.cleared = []

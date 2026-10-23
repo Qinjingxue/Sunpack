@@ -9,9 +9,11 @@ use crate::io::resource_lifecycle::TrackedFile;
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
+use serde::ser::SerializeMap;
 use serde_json::{Map, Value};
-use std::collections::{BTreeMap, HashMap};
+use std::borrow::Cow;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -115,6 +117,24 @@ impl RuntimeRecord {
 }
 
 #[derive(Debug, Clone, Default)]
+struct ScopeCatalog {
+    // The bucket index shares each normalized path allocation with the path
+    // index. Scope and stem occur once per scope/bucket, not in every row key.
+    rows: BTreeMap<Arc<str>, Arc<RuntimeRecord>>,
+    buckets: BTreeMap<String, BTreeSet<Arc<str>>>,
+}
+
+fn catalog_stem(path: &str) -> String {
+    crate::path_keys::case_key(crate::relations::first_dot_stem(
+        Path::new(path).file_name().and_then(|name| name.to_str()).unwrap_or_default(),
+    ))
+}
+
+fn catalog_key(scope: &str, path: &str) -> String {
+    format!("file|{scope}|{}|{}", catalog_stem(path), path_key(path))
+}
+
+#[derive(Debug, Clone, Default)]
 pub(crate) struct StateData {
     pending: HashMap<String, Arc<PendingRecord>>,
     entries: HashMap<String, Arc<EntryRecord>>,
@@ -122,7 +142,7 @@ pub(crate) struct StateData {
     password_source_signature: String,
     cursors: BTreeMap<String, Cursor>,
     pub(crate) runtime: BTreeMap<String, Arc<RuntimeRecord>>,
-    catalog_paths: BTreeMap<String, String>,
+    catalogs: BTreeMap<String, ScopeCatalog>,
     owners: HashMap<String, std::collections::HashSet<String>>,
 }
 
@@ -138,26 +158,63 @@ impl StateData {
     }
 
     pub(crate) fn catalog_records(&self, scope: &str, target: &str) -> Vec<(String, Arc<RuntimeRecord>)> {
-        let scope_prefix = format!("{}|", path_key(scope));
+        let scope = path_key(scope);
         let target_key = path_key(target);
-        let prefix = format!("{scope_prefix}{target_key}");
-        self.catalog_paths.range(prefix.clone()..).take_while(|(key,_)| key.starts_with(&prefix))
-            .filter(|(key,_)| key.as_str() == prefix || key[prefix.len()..].starts_with('\\'))
-            .filter_map(|(_,key)| self.runtime.get(key).map(|v| (key.clone(),Arc::clone(v)))).collect()
+        let Some(catalog) = self.catalogs.get(&scope) else { return Vec::new(); };
+        catalog.rows.range::<str, _>((std::ops::Bound::Included(target_key.as_str()), std::ops::Bound::Unbounded))
+            .take_while(|(key, _)| key.starts_with(&target_key))
+            .filter(|(key, _)| key.as_ref() == target_key || key[target_key.len()..].starts_with('\\') || target_key.ends_with('\\'))
+            .map(|(_, value)| (catalog_key(&scope, value.path().unwrap()), Arc::clone(value))).collect()
+    }
+
+    pub(crate) fn catalog_file(&self, scope: &str, path: &str) -> Option<&crate::scan::directory::DirectoryEntryRecord> {
+        self.catalogs.get(&path_key(scope))?.rows.get(path_key(path).as_str())?.file()
+    }
+
+    pub(crate) fn catalog_bucket(&self, scope: &str, seed: &str) -> Vec<Arc<RuntimeRecord>> {
+        let Some(catalog) = self.catalogs.get(&path_key(scope)) else { return Vec::new(); };
+        catalog.buckets.get(&catalog_stem(seed)).into_iter().flatten()
+            .filter_map(|path| catalog.rows.get(path).cloned()).collect()
+    }
+
+    fn runtime_records(&self) -> impl Iterator<Item=(Cow<'_, str>, &Arc<RuntimeRecord>)> {
+        self.runtime.iter().map(|(key, value)| (Cow::Borrowed(key.as_str()), value)).chain(
+            self.catalogs.iter().flat_map(|(scope, catalog)| catalog.rows.values()
+                .map(move |value| (Cow::Owned(catalog_key(scope, value.path().unwrap())), value)))
+        )
+    }
+
+    fn apply_catalog(&mut self, key: &str, value: &Option<Arc<RuntimeRecord>>) {
+        let Some((scope, rest)) = key.strip_prefix("file|").and_then(|rest| rest.split_once('|')) else { return; };
+        let Some((stem, path)) = rest.split_once('|') else { return; };
+        if let Some(catalog) = self.catalogs.get_mut(scope) {
+            if catalog.rows.remove(path).is_some() {
+                if let Some(bucket) = catalog.buckets.get_mut(stem) {
+                    bucket.remove(path);
+                    if bucket.is_empty() { catalog.buckets.remove(stem); }
+                }
+            }
+            if catalog.rows.is_empty() { self.catalogs.remove(scope); }
+        }
+        if let Some(value) = value {
+            let catalog = self.catalogs.entry(scope.to_owned()).or_default();
+            let path: Arc<str> = Arc::from(path);
+            catalog.buckets.entry(stem.to_owned()).or_default().insert(Arc::clone(&path));
+            catalog.rows.insert(path, Arc::clone(value));
+        }
     }
 
     fn apply(&mut self, operation: &Operation) {
         match operation {
             Operation::Runtime(key, value) => {
+                if key.starts_with("file|") {
+                    self.apply_catalog(key, value);
+                    return;
+                }
                 if let Some(old) = self.runtime.remove(key) {
                     if key.starts_with("owned|") {
                         if let Some(owner) = old.owner() {
                             if let Some(keys) = self.owners.get_mut(owner) { keys.remove(key); if keys.is_empty() { self.owners.remove(owner); } }
-                        }
-                    }
-                    if let Some(rest) = key.strip_prefix("file|") {
-                        if let Some((scope,_)) = rest.split_once('|') {
-                            if let Some(path) = old.path() { self.catalog_paths.remove(&format!("{scope}|{}",path_key(path))); }
                         }
                     }
                 }
@@ -165,11 +222,6 @@ impl StateData {
                     if key.starts_with("owned|") {
                         if let Some(owner) = value.owner().filter(|v| !v.is_empty()) {
                             self.owners.entry(owner.to_owned()).or_default().insert(key.clone());
-                        }
-                    }
-                    if let Some(rest) = key.strip_prefix("file|") {
-                        if let Some((scope,_)) = rest.split_once('|') {
-                            if let Some(path) = value.path() { self.catalog_paths.insert(format!("{scope}|{}",path_key(path)),key.clone()); }
                         }
                     }
                     self.runtime.insert(key.clone(),Arc::clone(value));
@@ -242,7 +294,19 @@ struct SnapshotDocument<'a> {
     watch_cursors: &'a BTreeMap<String, Cursor>,
     pending_work: BTreeMap<&'a str, &'a PendingRecord>,
     entries: BTreeMap<&'a str, &'a EntryRecord>,
-    runtime: BTreeMap<&'a str, &'a RuntimeRecord>,
+    runtime: RuntimeRecords<'a>,
+}
+
+struct RuntimeRecords<'a>(&'a StateData);
+
+impl Serialize for RuntimeRecords<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        for (key, value) in self.0.runtime_records() {
+            map.serialize_entry(key.as_ref(), value.as_ref())?;
+        }
+        map.end()
+    }
 }
 
 #[derive(Deserialize)]
@@ -286,7 +350,7 @@ impl NativeWatchSnapshot {
                     .iter()
                     .map(|(key, value)| (key.as_str(), value.as_ref()))
                     .collect(),
-                runtime: self.data.runtime.iter().map(|(k,v)| (k.as_str(),v.as_ref())).collect(),
+                runtime: RuntimeRecords(&self.data),
                 entries: self
                     .data
                     .entries
@@ -350,7 +414,11 @@ impl NativeWatchState {
     }
 
     fn runtime_record(&self, py: Python<'_>, key: &str) -> PyResult<Option<Py<PyDict>>> {
-        self.lock().runtime.get(key).map(|v| to_py_dict(py, v.as_ref())).transpose()
+        let data = self.lock();
+        let record = if let Some((scope, rest)) = key.strip_prefix("file|").and_then(|rest| rest.split_once('|')) {
+            rest.split_once('|').and_then(|(_, path)| data.catalogs.get(scope)?.rows.get(path))
+        } else { data.runtime.get(key) };
+        record.map(|v| to_py_dict(py, v.as_ref())).transpose()
     }
 
     fn runtime_owner_keys(&self, owner: &str) -> Vec<String> {
@@ -358,23 +426,29 @@ impl NativeWatchState {
     }
 
     fn runtime_keys(&self, prefix: &str) -> Vec<String> {
-        self.lock().runtime.range(prefix.to_owned()..).take_while(|(k,_)| k.starts_with(prefix)).map(|(k,_)| k.clone()).collect()
+        let data = self.lock();
+        let mut keys: Vec<_> = data.runtime.range(prefix.to_owned()..).take_while(|(k,_)| k.starts_with(prefix)).map(|(k,_)| k.clone()).collect();
+        if prefix.starts_with("file|") || "file|".starts_with(prefix) {
+            keys.extend(data.catalogs.iter().flat_map(|(scope, catalog)| catalog.rows.values()
+                .map(move |value| catalog_key(scope, value.path().unwrap()))).filter(|key| key.starts_with(prefix)));
+            keys.sort();
+        }
+        keys
     }
 
     fn prune_runtime_scopes(&self, scopes: Vec<PyRef<'_, crate::scan::scope::NativeDiscoveryScope>>) -> PyResult<NativeWatchOperations> {
         let data=self.lock();
         let roots: std::collections::HashSet<_>=scopes.iter().map(|s|path_key(&s.root)).collect();
         let mut operations=Vec::new();
-        for (key,value) in &data.runtime {
+        for (key,value) in data.runtime_records() {
             let keep=if let Some(rest)=key.strip_prefix("file|") {
                 rest.split_once('|').is_some_and(|(root,_)| roots.contains(root)
                     && value.path().is_some_and(|p|scopes.iter().any(|s|path_key(&s.root)==root && s.contains(p))))
             } else if let Some(root)=key.strip_prefix("catalog|") { roots.contains(root) }
             else if key.starts_with("done|") {value.path().is_some_and(|p|scopes.iter().any(|s|s.contains(p)))}
             else if key.starts_with("owned|") {
-                value.owner().is_some_and(|owner|!owner.is_empty()) || value.path().is_some_and(|p| {
-                    let p=path_key(p); roots.iter().any(|r|p==*r || p.strip_prefix(r).is_some_and(|rest|rest.starts_with('\\')))
-                })
+                value.owner().is_some_and(|owner|!owner.is_empty())
+                    || value.path().is_some_and(|p|scopes.iter().any(|scope|scope.intersects_output(p)))
             } else {true};
             if !keep { operations.push(serde_json::json!({"op":"runtime","key":key})); }
         }
@@ -605,6 +679,28 @@ impl NativeWatchState {
         NativeWatchOperations::from_values(values)
     }
 
+    fn fold_owned_outputs(&self, operations: &Bound<'_, PyAny>) -> PyResult<NativeWatchOperations> {
+        let mut values = operations.try_iter()?.map(|v| py_to_json(&v?)).collect::<PyResult<Vec<_>>>()?;
+        let retained: std::collections::HashSet<String> = values.iter()
+            .filter(|op| op["value"]["owner"].as_str() == Some("")
+                && op["value"]["state"].as_str() == Some("retained"))
+            .filter_map(|op| op["key"].as_str().map(str::to_owned)).collect();
+        for operation in &mut values {
+            let Some(key) = operation["key"].as_str() else { continue; };
+            if !retained.contains(key) { continue; }
+            let key = key.to_owned();
+            let mut parent = key.as_str();
+            while let Some((ancestor, _)) = parent.rsplit_once('\\') {
+                if retained.contains(ancestor) {
+                    *operation = serde_json::json!({"op":"runtime","key":key});
+                    break;
+                }
+                parent = ancestor;
+            }
+        }
+        NativeWatchOperations::from_values(values)
+    }
+
     fn apply(&self, operations: PyRef<'_, NativeWatchOperations>) {
         let mut data = self.lock();
         for operation in operations.operations.iter() {
@@ -802,7 +898,7 @@ fn load_snapshot_file(path: &str) -> PyResult<(u64, StateData)> {
     let checkpoint_seq = snapshot.checkpoint_seq;
     let password_generation = snapshot.password_generation;
     let mut data = StateData {
-        catalog_paths: BTreeMap::new(),
+        catalogs: BTreeMap::new(),
         owners: HashMap::new(),
         runtime: BTreeMap::new(),
         pending: snapshot

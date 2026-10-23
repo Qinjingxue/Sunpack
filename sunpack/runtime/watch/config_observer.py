@@ -21,10 +21,20 @@ class ConfigFileObserver:
         debounce_seconds: float = 0.5,
         observer_factory=Observer,
         loop: asyncio.AbstractEventLoop,
+        additional_files=(),
     ) -> None:
         self.directory = Path(directory).resolve()
         self.filenames = {str(name).casefold() for name in filenames}
         self.callback = callback
+        self._files = {}
+        self._directories = {self.directory}
+        for directory, names, notify in [(self.directory, self.filenames, callback), *additional_files]:
+            directory = Path(directory).resolve()
+            self._directories.add(directory)
+            for name in names:
+                key = str(directory / str(name)).casefold()
+                self._files.setdefault(key, set()).add(notify)
+        self._pending_callbacks = set()
         self.debounce_seconds = max(0.0, float(debounce_seconds))
         self._observer = observer_factory()
         self._handler = _ConfigEventHandler(self)
@@ -40,7 +50,8 @@ class ConfigFileObserver:
                 return
             self._started = True
         try:
-            self._observer.schedule(self._handler, str(self.directory), recursive=False)
+            for directory in self._directories:
+                self._observer.schedule(self._handler, str(directory), recursive=False)
             self._observer.start()
         except Exception:
             with self._lock:
@@ -55,6 +66,7 @@ class ConfigFileObserver:
             self._stopped = True
             timer = self._timer
             self._timer = None
+            self._pending_callbacks.clear()
         if timer is not None:
             timer.cancel()
         if not self._started:
@@ -64,11 +76,13 @@ class ConfigFileObserver:
         self._started = False
 
     def notify_path_changed(self, path: str) -> None:
-        if not path or Path(path).name.casefold() not in self.filenames:
+        callbacks = self._files.get(str(Path(path).absolute()).casefold()) if path else None
+        if not callbacks:
             return
         with self._lock:
             if self._stopped:
                 return
+            self._pending_callbacks.update(callbacks)
             self._loop.call_soon_threadsafe(self._schedule_emit)
 
     def _schedule_emit(self) -> None:
@@ -84,7 +98,10 @@ class ConfigFileObserver:
             if self._stopped:
                 return
             self._timer = None
-        self.callback()
+            callbacks = tuple(self._pending_callbacks)
+            self._pending_callbacks.clear()
+        for callback in callbacks:
+            callback()
 
 
 class _ConfigEventHandler(FileSystemEventHandler):

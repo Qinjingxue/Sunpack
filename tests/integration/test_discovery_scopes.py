@@ -82,7 +82,11 @@ def test_catalog_and_output_identity_survive_restart_and_do_not_inherit_names(tm
     store.commit_runtime(operations, durable=True)
     _, raw = options.catalog_snapshot(store._native, scope.native, str(root / "sample.part1.fake"))
     assert raw.file_columns()[0] == [str(root / "sample.part1.fake")]
+    owner.begin(str(generated / "inner"), "request")
+    owner.seal(str(generated / "inner"), succeeded=True)
+    owner.seal(str(generated), succeeded=True)
     owner.finish("request")
+    assert len(store._native.runtime_keys("owned|")) == 1
     relocated = root / "moved"
     generated.rename(relocated)
     owner.relocate(str(generated), str(relocated))
@@ -99,3 +103,117 @@ def test_catalog_and_output_identity_survive_restart_and_do_not_inherit_names(tm
         assert not restarted.protected(str(relocated / "new.zip"))
     finally:
         restarted.close()
+
+
+def test_targeted_catalog_updates_preserve_original_depth_pruning_and_conflicts(tmp_path):
+    """Full-root scans cannot detect incremental scope widening or stale conflict rows."""
+    from sunpack_native import NativeDirectoryScanOptions
+    from sunpack.runtime.watch.state import WatchStateStore
+    root = tmp_path / "input"
+    paths = [root / "same.part1.fake", root / "child" / "same.part2.fake",
+             root / "child" / "deeper" / "same.part3.fake",
+             root / "skip" / "same.part4.fake", root / "same.blocked"]
+    for path in paths:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"opaque")
+    options = NativeDirectoryScanOptions([], ["skip"], [], ["same.blocked"], [], [], [])
+    scope = DiscoveryScope(str(root), max_depth=1)
+    state = WatchStateStore(str(tmp_path / "state.json"))
+    try:
+        for target in (str(root / "child"), str(root / "skip"), str(paths[-1])):
+            operations, errors = options.catalog_update(state._native, scope.native, target, True)
+            assert not errors
+            state.commit_runtime(operations)
+        operations, errors = options.catalog_update(state._native, scope.native, str(paths[0]))
+        assert not errors
+        state.commit_runtime(operations)
+        filtered, raw = options.catalog_snapshot(state._native, scope.native, str(paths[0]))
+        assert set(raw.file_columns()[0]) == {str(paths[i]) for i in (0, 1, 4)}
+        assert set(filtered.file_columns()[0]) == {str(paths[i]) for i in (0, 1)}
+        narrower = DiscoveryScope(str(root), recursive=True, excluded_subtrees=[str(root / "child")])
+        _, raw = options.catalog_snapshot(state._native, narrower.native, str(paths[0]))
+        assert set(raw.file_columns()[0]) == {str(paths[0]), str(paths[-1])}
+        operations, errors = options.catalog_update(state._native, scope.native, str(paths[3]))
+        assert not errors
+        state.commit_runtime(operations)
+        _, raw = options.catalog_snapshot(state._native, scope.native, str(paths[0]))
+        assert str(paths[3]) not in raw.file_columns()[0]
+    finally:
+        state.close()
+
+
+def test_flatten_crash_retains_payload_at_each_rename_boundary(tmp_path, monkeypatch):
+    """Extraction-abort tests do not cover completed data between flatten renames."""
+    import sunpack.runtime.watch.service as service
+    from sunpack.core.support.output_reservation import OutputReservationRegistry
+    for phase in range(3):
+        watch = tmp_path / str(phase)
+        watch.mkdir()
+        monkeypatch.setattr(service, "_read_watch_root_entries", lambda: [WatchRootEntry(str(watch), recursive=True)])
+        config = make_config({"watch": {"state_dir": str(tmp_path / f"state-{phase}")}})
+        owner = OutputOwnership(config)
+        root = watch / "generated"
+        owner.begin(str(root), "request")
+        leaf = root / "wrapper" / "payload"
+        leaf.mkdir(parents=True)
+        (leaf / "marker.txt").write_text("complete", encoding="utf-8")
+        owner.seal(str(root), succeeded=True)
+        work = Path(owner.prepare_flatten(str(root), "request", OutputReservationRegistry()))
+        if phase >= 1:
+            root.rename(work)
+        if phase == 2:
+            (work / "wrapper" / "payload").rename(root)
+        owner.close()  # Simulate process loss without request.finish().
+        restarted = OutputOwnership(config)
+        try:
+            restarted.state_for()
+            [marker] = list(watch.rglob("marker.txt"))
+            assert marker.read_text(encoding="utf-8") == "complete"
+            assert restarted.protected(str(marker))
+        finally:
+            restarted.close()
+
+
+def test_deep_watch_catalog_and_internal_recovery_share_effective_policy(tmp_path, monkeypatch):
+    """Watch's catalog bypasses the CLI scanner; nested recovery bypasses normal routing."""
+    import sunpack.runtime.watch.scheduler as module
+    from sunpack.runtime.watch.scanner import WatchCandidate
+    root, output = tmp_path / "input", tmp_path / "output"
+    root.mkdir()
+    output.mkdir()
+    archive = root / "sample.bin"
+    archive.write_bytes(b"opaque")
+    nested_root = output / "outer"
+    nested_root.mkdir()
+    nested = nested_root / "inner.bin"
+    nested.write_bytes(b"opaque")
+    calls = []
+    class Engine:
+        async def run(self, targets, **kwargs):
+            calls.append((targets, kwargs))
+    monkeypatch.setattr(module, "validate_ntfs_watch_roots", lambda roots: None)
+    config = make_config({"filesystem": {"scan_filters": [
+        {"name": "blacklist", "enabled": True, "blocked_extensions": [".bin"]}]},
+        "watch": {"clipboard_monitor_enabled": False}})
+    watcher = module.WatchScheduler(config, [str(root)], state_path=str(tmp_path / "state.json"),
+        root_entries=[WatchRootEntry(str(root), str(output), deep_detect=True)], pipeline_engine=Engine())
+    try:
+        candidates, errors = watcher._scan_candidates([str(root)], recursive=False)
+        assert not errors and [candidate.path for candidate in candidates] == [str(archive)]
+        scope = watcher.scopes[next(iter(watcher.scopes))]
+        filtered, _ = watcher._scan_options_for(scope).catalog_snapshot(watcher.state._native, scope.native, str(archive))
+        assert filtered.file_columns()[0] == [str(archive)]
+        candidate = WatchCandidate(str(nested), nested.stat().st_size, nested.stat().st_mtime)
+        watcher.state.queue_active(candidate, source_input_root=str(root), internal_recovery=True,
+            discovery_scope=DiscoveryScope(str(nested_root), recursive=True).to_record(),
+            durable_owner=True, persist=True, durable=True)
+        async def submit():
+            request = await watcher._submit_candidate(candidate)
+            assert request is not None
+            await request.task
+        asyncio.run(submit())
+        [(_, request)] = calls
+        assert request["discovery_scope"].root == str(nested_root)
+        assert request["request_config"]["output"] == {"root": "", "common_root": "", "fixed_root": False}
+    finally:
+        watcher._close_blocking()

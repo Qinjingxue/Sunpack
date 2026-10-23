@@ -1,4 +1,5 @@
 """A discovery boundary, independent of archive recursion and output routing."""
+import os
 from sunpack_native import NativeDiscoveryScope
 from sunpack.core.support.path_keys import normalized_path
 
@@ -8,7 +9,7 @@ class DiscoveryScope:
 
     def __init__(self, root: str, *, recursive: bool = False,
                  excluded_subtrees=(), max_depth: int | None = None):
-        self.native = NativeDiscoveryScope(normalized_path(root),
+        self.native = NativeDiscoveryScope(os.path.abspath(root),
             max_depth if max_depth is not None else (None if recursive else 0),
             [normalized_path(path) for path in excluded_subtrees])
 
@@ -28,7 +29,7 @@ class DiscoveryScope:
 
     def to_record(self):
         return {"root": self.root, "max_depth": self.max_depth,
-                "excluded_subtrees": self.native.excluded_subtrees}
+                "excluded_subtrees": sorted(self.native.excluded_subtrees)}
 
     @classmethod
     def from_record(cls, value):

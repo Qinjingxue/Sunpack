@@ -138,7 +138,8 @@ fn sunpack_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(filesystem::watch_volume_cursor, m)?)?;
     m.add_function(wrap_pyfunction!(filesystem::watch_path_identity, m)?)?;
     m.add_function(wrap_pyfunction!(filesystem::watch_identity_path, m)?)?;
-    m.add_function(wrap_pyfunction!(filesystem::watch_root_changes, m)?)?;
+    m.add_class::<filesystem::NativeWatchChangeBatch>()?;
+    m.add_function(wrap_pyfunction!(filesystem::watch_volume_changes, m)?)?;
     m.add_function(wrap_pyfunction!(scan::magic::scan_magics_anywhere, m)?)?;
     m.add_function(wrap_pyfunction!(analysis_native::probe_volume_anchors, m)?)?;
     m.add_function(wrap_pyfunction!(scan::embedded::scan_embedded_archives, m)?)?;

@@ -26,6 +26,7 @@ _ROWS = [
     ("memory", "worker-manifest", "benchmarks.scenarios.memory_worker_manifest", "Native manifest materialization."),
     ("memory", "many-tasks", "benchmarks.scenarios.memory_many_tasks", "Python and native worker memory growth across formats."),
     ("scan", "directory", "benchmarks.scenarios.scan_directory", "Directory scanner comparison."),
+    ("scan", "watch-catalog", "benchmarks.scenarios.watch_catalog", "Native Watch catalog, bucket lookup, protected output pruning and state lifetime."),
     ("scan", "hotspots", "benchmarks.scenarios.scan_hotspots", "Full scan hotspot instrumentation."),
     ("scan", "synthetic-pressure", "benchmarks.scenarios.scan_synthetic_pressure", "Synthetic mixed-corpus scan."),
     ("watch", "real-file", "benchmarks.scenarios.watch_real_file", "End-to-end watch arrival, extraction, and completion for one supplied file."),

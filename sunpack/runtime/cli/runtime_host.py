@@ -232,6 +232,12 @@ class RuntimeHost:
             "last_error": self._last_watch_error,
         }
 
+    def password_source_changed(self) -> None:
+        service = self._watch_service
+        scheduler = service.scheduler if service is not None else None
+        if scheduler is not None:
+            scheduler.notify_password_source_changed("runtime_configuration")
+
     async def close(self, *, exit_reason: str = "shutdown") -> None:
         self.log_event(
             "host_stopping",

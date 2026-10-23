@@ -1,6 +1,6 @@
-use crate::protocol::FILE_ID_BYTES;
+use crate::protocol::{FILE_ID_BYTES, JournalChange, VolumeChangeBatch, CHANGE_FIXED_BYTES, CHANGE_HEADER_BYTES, MAX_CHANGE_PAYLOAD_BYTES};
 use crate::ChangeReasons;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::io;
 use std::ptr::{null, null_mut};
@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_READ, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, OpenFileById, GetFinalPathNameByHandleW, FILE_ID_DESCRIPTOR, FileIdType, ExtendedFileIdType,
-    FILE_FLAG_BACKUP_SEMANTICS, VOLUME_NAME_GUID, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
 use windows_sys::Win32::System::IO::DeviceIoControl;
 
@@ -19,8 +19,7 @@ const ALL_USN_REASONS: u32 = 0xffff_ffff;
 const USN_REASON_CLOSE: u32 = 0x8000_0000;
 const JOURNAL_BUFFER_BYTES: usize = 64 * 1024;
 const MAX_JOURNAL_BYTES_PER_OBSERVATION: usize = 1024 * 1024;
-const MAX_ROOT_RECOVERY_JOURNAL_BYTES: usize = 8 * 1024 * 1024;
-const MAX_ROOT_RECOVERY_PATH_BYTES: usize = 64 * 1024;
+const MAX_RECOVERY_JOURNAL_BYTES: usize = 256 * 1024;
 const MAX_CACHED_VOLUME_CONTEXTS: usize = 64;
 const VOLUME_CONTEXT_IDLE_TTL: Duration = Duration::from_secs(15 * 60);
 const ERROR_INVALID_HANDLE: i32 = 6;
@@ -141,30 +140,18 @@ impl JournalReader {
         })
     }
 
-    pub fn read_root_changes(
-        &mut self,
-        volume_guid: &str,
-        root_file_id: &[u8; FILE_ID_BYTES],
-        root_file_id_len: u8,
-        start_usn: i64,
-        end_usn: i64,
-    ) -> io::Result<Vec<String>> {
-        if start_usn <= 0 || end_usn <= start_usn || !matches!(root_file_id_len, 8 | 16) {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid root recovery query"));
+    pub fn read_volume_changes(
+        &mut self, volume_guid: &str, start_usn: i64, end_usn: i64,
+    ) -> io::Result<VolumeChangeBatch> {
+        if start_usn <= 0 || end_usn <= start_usn {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid volume recovery query"));
         }
         self.with_volume(volume_guid, |volume| {
             let (journal_id, next_usn) = query_journal(volume)?;
             if end_usn > next_usn {
-                return Err(io::Error::new(io::ErrorKind::InvalidInput, "root recovery end USN is beyond journal head"));
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "recovery end USN is beyond journal head"));
             }
-            read_root_changes_from_volume(
-                volume,
-                journal_id,
-                root_file_id,
-                root_file_id_len as usize,
-                start_usn,
-                end_usn,
-            )
+            read_volume_changes_from_volume(volume, journal_id, start_usn, end_usn)
         })
     }
 
@@ -274,69 +261,109 @@ fn query_journal(volume: HANDLE) -> io::Result<(u64, i64)> {
     ))
 }
 
-fn read_root_changes_from_volume(
-    volume: HANDLE,
-    journal_id: u64,
-    root_file_id: &[u8; FILE_ID_BYTES],
-    root_file_id_len: usize,
-    start_usn: i64,
-    end_usn: i64,
-) -> io::Result<Vec<String>> {
-    let root_path = path_for_id(volume, &root_file_id[..root_file_id_len])?;
-    let mut parents: HashMap<Vec<u8>, Option<String>> = HashMap::new();
-    let mut cursor = start_usn;
+fn read_volume_changes_from_volume(
+    volume: HANDLE, journal_id: u64, start_usn: i64, end_usn: i64,
+) -> io::Result<VolumeChangeBatch> {
+    let mut batch = VolumeChangeBatch { journal_id, next_usn: start_usn, dirty: false, changes: Vec::new() };
+    let mut parents: HashMap<[u8; FILE_ID_BYTES], Option<String>> = HashMap::new();
+    let mut merged: HashMap<([u8; FILE_ID_BYTES], Option<String>), usize> = HashMap::new();
     let mut scanned_bytes = 0usize;
-    let mut payload_bytes = 0usize;
-    let mut changed = BTreeSet::new();
-    while cursor < end_usn {
-        let request = read_usn_journal_request(cursor, journal_id);
-        let mut output = vec![0u8; JOURNAL_BUFFER_BYTES];
-        let bytes_returned = device_io_control(
-            volume,
-            FSCTL_READ_USN_JOURNAL,
-            &request as *const _ as *const c_void,
-            std::mem::size_of::<ReadUsnJournalData>() as u32,
-            &mut output,
-        )?;
-        if bytes_returned < 8 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "truncated USN journal reply"));
-        }
-        scanned_bytes = scanned_bytes.saturating_add(bytes_returned);
-        if scanned_bytes > MAX_ROOT_RECOVERY_JOURNAL_BYTES {
-            return Err(io::Error::other("USN root recovery exceeded scan budget"));
-        }
+    let mut payload_bytes = CHANGE_HEADER_BYTES;
+    let mut output = vec![0u8; JOURNAL_BUFFER_BYTES];
+    while batch.next_usn < end_usn && scanned_bytes < MAX_RECOVERY_JOURNAL_BYTES {
+        let request = read_usn_journal_request(batch.next_usn, journal_id);
+        let bytes_returned = device_io_control(volume, FSCTL_READ_USN_JOURNAL,
+            &request as *const _ as *const c_void, std::mem::size_of::<ReadUsnJournalData>() as u32, &mut output)?;
+        if bytes_returned < 8 { return Err(io::Error::new(io::ErrorKind::InvalidData, "truncated USN journal reply")); }
+        scanned_bytes += bytes_returned;
         let returned_next = i64::from_le_bytes(output[0..8].try_into().unwrap());
+        if returned_next <= batch.next_usn { return Err(io::Error::other("USN recovery made no progress")); }
         let mut offset = 8usize;
-        while offset + 8 <= bytes_returned {
-            let record_length = u32::from_le_bytes(output[offset..offset+4].try_into().unwrap()) as usize;
-            if record_length < 8 || offset + record_length > bytes_returned {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid USN journal record"));
+        while offset < bytes_returned {
+            if bytes_returned - offset < 8 { return Err(io::Error::new(io::ErrorKind::InvalidData, "truncated USN record")); }
+            let length = u32::from_le_bytes(output[offset..offset+4].try_into().unwrap()) as usize;
+            if length < 8 || length > bytes_returned - offset { return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid USN record length")); }
+            let record = &output[offset..offset+length];
+            let Some((mut change, name)) = decode_volume_change(record)? else {
+                // An unknown record layout cannot be mapped safely. Consume the
+                // returned prefix only after reconciliation has been persisted.
+                batch.dirty = true;
+                offset += length;
+                continue;
+            };
+            if change.usn >= end_usn { batch.next_usn = end_usn; return Ok(batch); }
+            if change.usn < start_usn { offset += length; continue; }
+            if let Some(name) = name {
+                let parent = parents.entry(change.parent_id).or_insert_with(|| path_for_id(volume, &change.parent_id).ok());
+                change.path = parent.as_ref().map(|parent| format!("{}\\{name}", parent.trim_end_matches('\\')));
             }
-            if let Some(name) = record_recursive_change_name(
-                volume, &root_path, &mut parents, &output[offset..offset+record_length],
-                root_file_id,
-                root_file_id_len,
-                start_usn,
-                end_usn,
-            )? {
-                if changed.insert(name.clone()) {
-                    payload_bytes = payload_bytes.saturating_add(4 + name.as_bytes().len());
-                    if payload_bytes > MAX_ROOT_RECOVERY_PATH_BYTES {
-                        return Err(io::Error::other("USN root recovery exceeded payload budget"));
+            let key = (change.file_id, change.path.clone());
+            if let Some(index) = merged.get(&key) {
+                let previous = &mut batch.changes[*index];
+                previous.reason |= change.reason;
+                previous.usn = previous.usn.max(change.usn);
+            } else {
+                let bytes = CHANGE_FIXED_BYTES + change.path.as_ref().map_or(0, String::len);
+                if payload_bytes + bytes > MAX_CHANGE_PAYLOAD_BYTES {
+                    if !batch.changes.is_empty() {
+                        // The current record is not consumed. Its USN is the
+                        // next request's inclusive lower bound.
+                        batch.next_usn = change.usn;
+                        return Ok(batch);
                     }
+                    change.path = None;
                 }
+                payload_bytes += CHANGE_FIXED_BYTES + change.path.as_ref().map_or(0, String::len);
+                batch.dirty |= change.path.is_none();
+                merged.insert(key, batch.changes.len());
+                batch.changes.push(change);
             }
-            offset += record_length;
+            offset += length;
         }
-        if returned_next <= cursor || returned_next >= end_usn {
-            break;
-        }
-        cursor = returned_next;
+        batch.next_usn = returned_next.min(end_usn);
     }
-    Ok(changed.into_iter().collect())
+    Ok(batch)
+}
+
+// V2/V3 names and parent identities share one parser for all roots. V4 has
+// identities/reasons but no name, so the consumed prefix requires reconciliation.
+fn decode_volume_change(record: &[u8]) -> io::Result<Option<(JournalChange, Option<String>)>> {
+    let invalid = || io::Error::new(io::ErrorKind::InvalidData, "invalid USN change record");
+    if record.len() < 8 { return Err(invalid()); }
+    let major = u16::from_le_bytes(record[4..6].try_into().unwrap());
+    let (width, parent_offset, usn_offset, reason_offset, attributes_offset, name_offsets) = match major {
+        2 => (8, 16, 24, 40, Some(52), Some((56, 58))),
+        3 => (16, 24, 40, 56, Some(68), Some((72, 74))),
+        4 => (16, 24, 40, 48, None, None),
+        _ => return Ok(None),
+    };
+    if record.len() < reason_offset + 4 || record.len() < parent_offset + width { return Err(invalid()); }
+    let mut file_id = [0u8; FILE_ID_BYTES];
+    let mut parent_id = [0u8; FILE_ID_BYTES];
+    file_id[..width].copy_from_slice(&record[8..8+width]);
+    parent_id[..width].copy_from_slice(&record[parent_offset..parent_offset+width]);
+    let is_directory = if let Some(offset) = attributes_offset {
+        if record.len() < offset + 4 { return Err(invalid()); }
+        u32::from_le_bytes(record[offset..offset+4].try_into().unwrap()) & 0x10 != 0
+    } else { false };
+    let name = if let Some((length_offset, offset_offset)) = name_offsets {
+        if record.len() < offset_offset + 2 { return Err(invalid()); }
+        let length = u16::from_le_bytes(record[length_offset..length_offset+2].try_into().unwrap()) as usize;
+        let offset = u16::from_le_bytes(record[offset_offset..offset_offset+2].try_into().unwrap()) as usize;
+        if length == 0 || length % 2 != 0 || offset < offset_offset + 2 || offset + length > record.len() { return Err(invalid()); }
+        let name = String::from_utf16(&record[offset..offset+length].chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0],pair[1]])).collect::<Vec<_>>()).map_err(|_| invalid())?;
+        if name.contains(['\\', '/', '\0']) { return Err(invalid()); }
+        Some(name)
+    } else { None };
+    Ok(Some((JournalChange {file_id, parent_id,
+        usn: i64::from_le_bytes(record[usn_offset..usn_offset+8].try_into().unwrap()),
+        reason: u32::from_le_bytes(record[reason_offset..reason_offset+4].try_into().unwrap()),
+        is_directory, path: None}, name)))
 }
 
 fn path_for_id(volume: HANDLE, id: &[u8]) -> io::Result<String> {
+    let id = if id.len() == 16 && id[8..].iter().all(|byte| *byte == 0) { &id[..8] } else { id };
     let mut descriptor = FILE_ID_DESCRIPTOR::default();
     descriptor.dwSize = std::mem::size_of::<FILE_ID_DESCRIPTOR>() as u32;
     if id.len() == 8 {
@@ -352,95 +379,12 @@ fn path_for_id(volume: HANDLE, id: &[u8]) -> io::Result<String> {
     let handle = OwnedHandle(handle);
     let mut buffer = vec![0u16; 512];
     loop {
-        let length = unsafe { GetFinalPathNameByHandleW(handle.raw(),buffer.as_mut_ptr(),buffer.len() as u32,VOLUME_NAME_GUID) } as usize;
+        let length = unsafe { GetFinalPathNameByHandleW(handle.raw(),buffer.as_mut_ptr(),buffer.len() as u32,0) } as usize;
         if length == 0 { return Err(io::Error::last_os_error()); }
-        if length < buffer.len() { return String::from_utf16(&buffer[..length]).map_err(|e| io::Error::new(io::ErrorKind::InvalidData,e)); }
+        if length < buffer.len() { return String::from_utf16(&buffer[..length]).map(|path| path.strip_prefix(r"\\?\").unwrap_or(&path).to_owned()).map_err(|e| io::Error::new(io::ErrorKind::InvalidData,e)); }
         if length > 32768 { return Err(io::Error::new(io::ErrorKind::InvalidData,"USN path exceeds Windows path limit")); }
         buffer.resize(length+1,0);
     }
-}
-
-fn record_recursive_change_name(volume: HANDLE, root_path: &str, parents: &mut HashMap<Vec<u8>,Option<String>>,
-    record: &[u8], root_file_id: &[u8; FILE_ID_BYTES], root_file_id_len: usize,
-    start_usn: i64, end_usn: i64) -> io::Result<Option<String>> {
-    if let Some(name) = record_root_change_name(record,root_file_id,root_file_id_len,start_usn,end_usn)? {
-        return Ok(Some(name));
-    }
-    if record.len() < 8 { return Err(io::Error::new(io::ErrorKind::InvalidData,"truncated USN record")); }
-    let major = u16::from_le_bytes(record[4..6].try_into().unwrap());
-    let (parent,usn,length,offset) = match major {
-        2 => (16..24,24,56,58), 3 => (24..40,40,72,74),
-        _ => return Ok(Some(String::new())), // Unknown/no-name records require reconciliation.
-    };
-    if record.len() < offset+2 { return Err(io::Error::new(io::ErrorKind::InvalidData,"truncated USN record")); }
-    let usn = i64::from_le_bytes(record[usn..usn+8].try_into().unwrap());
-    if usn < start_usn || usn >= end_usn { return Ok(None); }
-    let id = record[parent].to_vec();
-    let path = parents.entry(id.clone()).or_insert_with(|| path_for_id(volume,&id).ok());
-    let Some(path) = path else { return Ok(Some(String::new())); };
-    let root = root_path.trim_end_matches('\\');
-    if path.len() <= root.len() || !path.get(..root.len()).is_some_and(|prefix| prefix.eq_ignore_ascii_case(root)) || !path[root.len()..].starts_with('\\') { return Ok(None); }
-    let length = u16::from_le_bytes(record[length..length+2].try_into().unwrap()) as usize;
-    let offset = u16::from_le_bytes(record[offset..offset+2].try_into().unwrap()) as usize;
-    if length%2 != 0 || offset+length > record.len() { return Err(io::Error::new(io::ErrorKind::InvalidData,"invalid USN name")); }
-    let name = String::from_utf16(&record[offset..offset+length].chunks_exact(2).map(|v| u16::from_le_bytes([v[0],v[1]])).collect::<Vec<_>>())
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData,e))?;
-    Ok(Some(format!("{}\\{name}",&path[root.len()+1..])))
-}
-
-fn record_root_change_name(
-    record: &[u8],
-    root_file_id: &[u8; FILE_ID_BYTES],
-    root_file_id_len: usize,
-    start_usn: i64,
-    end_usn: i64,
-) -> io::Result<Option<String>> {
-    if record.len() < 8 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "truncated USN record"));
-    }
-    let major = u16::from_le_bytes(record[4..6].try_into().unwrap());
-    let (file_id_range, parent_id_range, usn_offset, name_length_offset, name_offset_offset) = match major {
-        2 => (8usize..16usize, 16usize..24usize, 24usize, Some(56usize), Some(58usize)),
-        3 => (8usize..24usize, 24usize..40usize, 40usize, Some(72usize), Some(74usize)),
-        4 => (8usize..24usize, 24usize..40usize, 40usize, None, None),
-        _ => return Ok(None),
-    };
-    if record.len() < usn_offset + 8 || record.len() < parent_id_range.end {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "truncated USN root record"));
-    }
-    let usn = i64::from_le_bytes(record[usn_offset..usn_offset+8].try_into().unwrap());
-    if usn < start_usn || usn >= end_usn {
-        return Ok(None);
-    }
-    let exact_root = file_ids_equal(&record[file_id_range], root_file_id, root_file_id_len);
-    let direct_child = file_ids_equal(&record[parent_id_range], root_file_id, root_file_id_len);
-    if !exact_root && !direct_child {
-        return Ok(None);
-    }
-    if exact_root {
-        // Empty is a compact sentinel meaning the watched root path itself.
-        return Ok(Some(String::new()));
-    }
-    let (Some(length_offset), Some(offset_offset)) = (name_length_offset, name_offset_offset) else {
-        // V4 range-tracking records have no file name.  Falling back to one
-        // shallow root scan is safer than guessing a path.
-        return Err(io::Error::other("USN root recovery requires fallback scan for V4 record"));
-    };
-    if record.len() < offset_offset + 2 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "truncated USN file name metadata"));
-    }
-    let byte_len = u16::from_le_bytes(record[length_offset..length_offset+2].try_into().unwrap()) as usize;
-    let byte_offset = u16::from_le_bytes(record[offset_offset..offset_offset+2].try_into().unwrap()) as usize;
-    if byte_len % 2 != 0 || byte_offset.saturating_add(byte_len) > record.len() {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid USN file name range"));
-    }
-    let units = record[byte_offset..byte_offset+byte_len]
-        .chunks_exact(2)
-        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
-        .collect::<Vec<_>>();
-    String::from_utf16(&units)
-        .map(Some)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "USN file name is invalid UTF-16"))
 }
 
 fn read_change_reasons_from_volume(
@@ -673,5 +617,39 @@ mod tests {
         let request = read_usn_journal_request(8_192, 42);
         assert_eq!(request.start_usn, 8_192);
         assert_eq!(request.usn_journal_id, 42);
+    }
+
+    #[test]
+    fn recovery_layouts_preserve_identity_names_and_reject_broken_payloads() {
+        // Live NTFS exercises V2. This inexpensive combined contract additionally
+        // catches V3/V4 offsets and wire truncation that the live corpus cannot.
+        for major in [2, 3, 4] {
+            let mut raw = record(major, 0x1234, 101, 0x2000);
+            let parent_offset = if major == 2 {16} else {24};
+            raw[parent_offset] = 42;
+            if major != 4 {
+                let (attributes, length, offset, header) = if major == 2 {(52,56,58,60)} else {(68,72,74,76)};
+                let name: Vec<u8> = "归档.part1".encode_utf16().flat_map(u16::to_le_bytes).collect();
+                raw.resize(header, 0);
+                raw[attributes] = 0x10;
+                raw[length..length+2].copy_from_slice(&(name.len() as u16).to_le_bytes());
+                raw[offset..offset+2].copy_from_slice(&(header as u16).to_le_bytes());
+                raw.extend_from_slice(&name);
+            }
+            let (mut change, name) = decode_volume_change(&raw).unwrap().unwrap();
+            assert_eq!(change.file_id, 0x1234u128.to_le_bytes());
+            assert_eq!(change.parent_id[0], 42);
+            assert_eq!(change.usn, 101);
+            assert_eq!(change.reason, 0x2000);
+            assert_eq!(name.as_deref(), if major == 4 {None} else {Some("归档.part1")});
+            change.path = name;
+            let batch = VolumeChangeBatch {journal_id: 7, next_usn: 200, dirty: major == 4, changes: vec![change]};
+            let bytes = batch.encode().unwrap();
+            let decoded = VolumeChangeBatch::decode(7, 200, &bytes).unwrap();
+            assert_eq!(decoded.changes, batch.changes);
+            assert_eq!(decoded.dirty, batch.dirty);
+            assert!(VolumeChangeBatch::decode(7,200,&bytes[..bytes.len()-1]).is_err());
+            assert!(decode_volume_change(&raw[..12]).is_err());
+        }
     }
 }

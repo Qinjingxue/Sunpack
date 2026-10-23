@@ -18,6 +18,16 @@ impl NativeDiscoveryScope {
     pub(crate) fn exclude_roots(&mut self, roots: impl Iterator<Item=String>) {
         self.excluded.extend(roots.map(|p| path_key(&p).trim_end_matches('\\').to_owned()));
     }
+
+    pub(crate) fn directory_depth(&self, path: &str) -> Option<usize> {
+        let key = path_key(path);
+        let key = key.trim_end_matches('\\');
+        if key == self.key {
+            return Some(0);
+        }
+        let relative = key.strip_prefix(&self.key)?.strip_prefix('\\')?;
+        Some(relative.bytes().filter(|byte| *byte == b'\\').count() + 1)
+    }
 }
 
 #[pymethods]
@@ -39,6 +49,12 @@ impl NativeDiscoveryScope {
         let Some(relative) = key.strip_prefix(&self.key).and_then(|p| p.strip_prefix('\\')) else { return false; };
         !self.max_depth.is_some_and(|depth| relative.bytes().filter(|c| *c == b'\\').count() > depth)
             && !self.excludes(path)
+    }
+
+    pub fn intersects_output(&self, path: &str) -> bool {
+        let key = path_key(path);
+        self.contains(path) || self.key.strip_prefix(key.trim_end_matches('\\'))
+            .is_some_and(|relative| relative.starts_with('\\'))
     }
 
     pub fn excludes(&self, path: &str) -> bool {

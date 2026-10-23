@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Callable, Iterable
 
 from sunpack.core.support.path_keys import case_key, path_key, absolute_path_key, path_key_is_under
-from sunpack_native import fast_hash128
+from sunpack_native import fast_hash128, watch_volume_changes
 
 from sunpack.core.config.fields.watch import DEFAULT_WATCH_CONFIG
 from sunpack.pipeline.discovery.embedded.options import EmbeddedOptions
@@ -37,8 +37,8 @@ from sunpack.runtime.watch.scanner import (
     scan_watch_candidates,
     validate_ntfs_watch_roots,
     watch_file_is_ready,
-    watch_root_changes,
     watch_volume_cursor,
+    watch_path_identity,
 )
 from sunpack.runtime.watch.scanner import _candidate_for as _watch_candidate_for_path
 from sunpack.runtime.watch.state import WatchStateEntry, WatchStateStore, _recorded_file_presence
@@ -98,6 +98,13 @@ class _CandidateObservation:
     last_content_event_at: float | None = None
 
 
+@dataclass(slots=True, eq=False)
+class _SourceProbe:
+    path: str
+    allow_owned: bool = False
+    recheck: bool = False
+
+
 @dataclass
 class WatchRunResult:
     processed: int = 0
@@ -126,6 +133,7 @@ class _ActivePipelineRequest:
     deep_detect: bool = False
     source_paths: tuple[str, ...] = ()
     password_scope_dir: str = ""
+    policy: str = ""
 
 
 class WatchScheduler:
@@ -185,9 +193,12 @@ class WatchScheduler:
             float(configured_cold_start if cold_start_seconds is None else cold_start_seconds),
         )
         self._scan_options = DirectoryScanner.compile_scan_options(config)
-        self.scopes = {path_key(root): DiscoveryScope(root, recursive=self.root_entries[path_key(root)].recursive,
-            excluded_subtrees=[other for other in self.watch_roots if other != root and _is_relative_to(other, root)])
-            for root in self.watch_roots}
+        from sunpack.core.config.detection_view import discovery_run_config
+        self._deep_scan_options = (DirectoryScanner.compile_scan_options(
+            discovery_run_config(config, deep_detect=True))
+            if any(entry.deep_detect for entry in self.root_entries.values()) else None)
+        from sunpack.runtime.watch.roots import discovery_scopes
+        self.scopes = discovery_scopes(self.root_entries.values())
         self.observer_stop_timeout_seconds = max(
             0.0,
             float(
@@ -200,6 +211,13 @@ class WatchScheduler:
         self._owns_state = output_ownership is None
         self.state = (WatchStateStore(state_path, retirement_callback=self._schedule_journal_retirement)
                       if self._owns_state else output_ownership.state_for(state_path))
+        self._scope_policies = {}
+        self._scope_epochs = {}
+        for key, scope in self.scopes.items():
+            marker = self.state._native.runtime_record("catalog|" + key) or {}
+            policy = self._scope_policy(scope)
+            self._scope_policies[key] = policy
+            self._scope_epochs[key] = int(marker.get("epoch", 0)) + (marker.get("policy") != policy)
         log_path = Path(state_path).with_name("events.jsonl")
         self.log = WatchLogStore(str(log_path), wake_callback=self._wake_service)
         state_parent = Path(state_path).parent
@@ -210,14 +228,13 @@ class WatchScheduler:
             os.path.abspath(str(log_path)),
         }
         self._lock = threading.Lock()
-        # Serializes Watch file-observation admission with pipeline source-claim
-        # publication. The lock is held only across short candidate/readiness
-        # probes, so a claim is a true linearization point: an observation is
-        # either fully admitted before the claim or cannot touch the source.
+        # Publish claims and observation generations under one short gate.
+        # Probes and WAL waits run outside; claims cancel probes before publish.
         self._claim_gate = output_ownership.gate if output_ownership is not None else threading.RLock()
         self._active_claims: dict[str, str] = {}
         self._claims_by_owner: dict[str, set[str]] = {}
         self._dirty_during_claim: dict[str, dict[str, str]] = {}
+        self._source_probes: dict[str, _SourceProbe] = {}
         self._password_source_lock = threading.RLock()
         self._directory_pending: set[str] = set()
         self._watch_rearm: set[str] = set()
@@ -364,8 +381,11 @@ class WatchScheduler:
         for root in self.watch_roots:
             scope = self.scopes[path_key(root)]
             marker = self.state._native.runtime_record("catalog|" + path_key(root))
-            if marker is None or marker["recursive"] != self.root_entries[path_key(root)].recursive:
-                self._scan_candidates([root],recursive=self.root_entries[path_key(root)].recursive)
+            if marker is None or marker.get("policy") != self._scope_policies[path_key(root)]:
+                candidates, errors = self._scan_candidates([root],recursive=self.root_entries[path_key(root)].recursive)
+                if marker is not None:
+                    for candidate in candidates:
+                        self.enqueue(candidate.path, force=True, event_type="scope_reconciliation")
         self._recover_usn_startup_gap()
         self.log.write(
             "scheduler_started",
@@ -394,7 +414,8 @@ class WatchScheduler:
                     break
                 parent = ancestor
         password_dir = os.path.dirname(self.builtin_password_file)
-        if os.path.isdir(password_dir):
+        from sunpack.runtime.cli.runtime_state import server_runtime_active
+        if not server_runtime_active() and os.path.isdir(password_dir):
             desired[(password_dir, False)] = None
         for key, watch in list(self._observed_watches.items()):
             if key not in desired or any(_paths_match(key[0], path, recursive=True) for path in changed):
@@ -438,19 +459,60 @@ class WatchScheduler:
     def _watch_root_directory(self, root: str) -> str:
         return _nearest_existing_directory(root)
 
+    def _scan_options_for(self, scope):
+        entry = self.root_entries.get(path_key(scope.root))
+        return self._deep_scan_options if entry and entry.deep_detect else self._scan_options
+
+    def _scope_policy(self, scope):
+        from sunpack.core.config.detection_view import discovery_run_config
+        entry = self.root_entries[path_key(scope.root)]
+        effective = discovery_run_config(self.config, deep_detect=entry.deep_detect)
+        filesystem = effective["filesystem"]
+        try:
+            volume, identity, _ = watch_path_identity(scope.root)
+            root_identity = [volume, identity]
+        except OSError:
+            root_identity = None
+        return {"scope": scope.to_record(), "identity": root_identity,
+            "output": self.output_roots[path_key(scope.root)], "deep_detect": entry.deep_detect,
+            "filters": filesystem["scan_filters"] if filesystem["scan_filters_enabled"] else [],
+            "detection": effective["detection"], "embedded_scan": effective["embedded_scan"],
+            "recursive_extract": effective["recursive_extract"], "post_extract": effective["post_extract"]}
+
+    def _policy_id(self, root):
+        key = path_key(root)
+        return f"{key}|{self._scope_epochs[key]}"
+
+    @staticmethod
+    def _output_identities(paths):
+        identities = []
+        for path in paths:
+            try:
+                volume, identity, _ = watch_path_identity(path)
+            except OSError:
+                return None
+            identities.append([path, volume, identity])
+        return identities
+
     def _scan_candidates(self, roots: list[str], *, recursive: bool) -> tuple[list[WatchCandidate], list[tuple[str, str, str]]]:
         from sunpack.runtime.watch.scanner import _candidate_from_native
         candidates, errors = [], []
         for root in roots:
             matched = _longest_matching_root(root, self.watch_roots)
             scope = self.scopes[path_key(matched)] if matched else DiscoveryScope(root, recursive=recursive)
-            operations, failures = self._scan_options.catalog_update(self.state._native, scope.native, root, True)
+            options = self._scan_options_for(scope)
+            operations, failures = options.catalog_update(self.state._native, scope.native, root, True)
             self.state.commit_runtime(operations)
             errors.extend(failures)
             if not failures and path_key(root) == path_key(scope.root):
+                key = path_key(scope.root)
+                policy = self._scope_policy(scope)
+                if self._scope_policies[key] != policy:
+                    self._scope_epochs[key] += 1
+                    self._scope_policies[key] = policy
                 self.state.commit_runtime([{"op":"runtime", "key":"catalog|"+path_key(root),
-                    "value":{"recursive":self.root_entries[path_key(root)].recursive}}])
-            candidates.extend(_candidate_from_native(row) for row in self._scan_options.catalog_candidates(self.state._native, scope.native, root))
+                    "value":{"policy": policy, "epoch": self._scope_epochs[key]}}])
+            candidates.extend(_candidate_from_native(row) for row in options.catalog_candidates(self.state._native, scope.native, root))
         if errors:
             self.log.write("filesystem_scan_failed", roots=roots, errors=[
                 filesystem_scan_failure(error, self.i18n.language).message for error in errors
@@ -473,76 +535,99 @@ class WatchScheduler:
             self.state.merge_watch_cursors(missing, durable=True)
 
     def _recover_usn_startup_gap(self) -> None:
-        """Replay only NTFS changes since the durable cursor; never poll."""
-        cursor_updates: dict[str, dict[str, int]] = {}
-        changed_paths: dict[str, str] = {}
-        fallback_roots: set[str] = set()
+        """Consume bounded Journal prefixes once per volume, without polling."""
+        volumes = {}
+        unavailable = []
         for root in self.watch_roots:
             directory = self._watch_root_directory(root)
             try:
-                volume, journal_id, end_usn = watch_volume_cursor(directory)
-                saved = self.state.watch_cursor(volume)
-                if (
-                    saved is None
-                    or int(saved.get("journal_id", 0) or 0) != journal_id
-                    or int(saved.get("next_usn", 0) or 0) > end_usn
-                ):
-                    fallback_roots.add(root)
-                else:
-                    start_usn = int(saved.get("next_usn", 0) or 0)
-                    if end_usn > start_usn:
-                        for path in watch_root_changes(directory, start_usn, end_usn):
-                            absolute = os.path.abspath(path)
-                            if os.path.isfile(root) and path_key(absolute) != path_key(root):
-                                continue
-                            changed_paths.setdefault(path_key(absolute), absolute)
-                cursor_updates[volume] = {
-                    "journal_id": journal_id,
-                    "next_usn": end_usn,
-                }
-            except Exception as exc:
-                fallback_roots.add(root)
-                self.log.write("usn_recovery_fallback", root=root, error=str(exc))
-
-        for root in sorted(fallback_roots):
-            try:
-                candidates, scan_errors = self._scan_candidates([root], recursive=self.root_entries[path_key(root)].recursive)
-                if scan_errors:
-                    cursor_updates.clear()
-                for candidate in candidates:
-                    changed_paths.setdefault(path_key(candidate.path), candidate.path)
+                volume, _, _ = watch_path_identity(directory)
+                if volume not in volumes:
+                    _, journal_id, end_usn = watch_volume_cursor(directory)
+                    volumes[volume] = (journal_id, end_usn, [])
+                volumes[volume][2].append(root)
             except OSError as exc:
-                self.log.write("usn_fallback_scan_failed", root=root, error=str(exc))
+                unavailable.append(root)
+                self.log.write("usn_recovery_fallback", root=root, error=str(exc))
+        if unavailable:
+            self._commit_usn_recovery_paths([], unavailable, {})
+        for volume, (journal_id, end_usn, roots) in volumes.items():
+            saved = self.state.watch_cursor(volume)
+            start_usn = int(saved.get("next_usn", 0) or 0) if saved else 0
+            fallback = (not saved or int(saved.get("journal_id", 0) or 0) != journal_id
+                        or start_usn <= 0 or start_usn > end_usn)
+            scopes = [self.scopes[path_key(root)].native for root in roots]
+            while fallback or start_usn < end_usn:
+                paths = []
+                next_usn = end_usn
+                if not fallback:
+                    try:
+                        batch = watch_volume_changes(volume, start_usn, end_usn)
+                        if batch.journal_id != journal_id or not start_usn < batch.next_usn <= end_usn:
+                            raise OSError("Journal changed or recovery prefix made no progress")
+                        fallback = batch.dirty
+                        next_usn = end_usn if fallback else batch.next_usn
+                        paths = batch.paths_for_scopes(scopes)
+                    except OSError as exc:
+                        fallback = True
+                        self.log.write("usn_recovery_fallback", roots=roots, error=str(exc))
+                cursors = {volume: {"journal_id": journal_id, "next_usn": next_usn}}
+                # A full scope reconciliation covers the captured head. A clean
+                # batch commits only its consumed prefix, then reads the rest.
+                if not self._commit_usn_recovery_paths(paths, roots if fallback else [], cursors):
+                    break
+                start_usn = next_usn
+                fallback = False
 
-        for path in list(changed_paths.values()):
-            if os.path.isdir(path):
-                candidates, failures = self._scan_candidates([path], recursive=True)
-                for candidate in candidates:
-                    changed_paths.setdefault(path_key(candidate.path), candidate.path)
-                if failures:
-                    cursor_updates.clear()
-            elif not os.path.exists(path):
-                self.notify_path_departed(path, recursive=True)
-        for path in changed_paths.values():
-            if _persisted_blocker_owns_retry(self.state, path):
-                continue
-            self.enqueue(path, force=True, event_type="startup_usn_recovery")
+    def _commit_usn_recovery_paths(self, paths, fallback_roots, cursors):
+        candidates = {}
+        changed = {path_key(path): (path, directory) for path, directory in paths}
+        for root in fallback_roots:
+            changed[path_key(root)] = (root, True)
+        try:
+            for path, directory in changed.values():
+                if directory or os.path.isdir(path):
+                    rows, errors = self._scan_candidates([path], recursive=True)
+                    if errors:
+                        return False
+                    for candidate in rows:
+                        candidates[path_key(candidate.path)] = candidate
+                    if not os.path.exists(path):
+                        self.notify_path_departed(path, recursive=True)
+                elif os.path.exists(path):
+                    candidate = _candidate_for_event_path(path)
+                    if candidate is not None:
+                        candidates[path_key(candidate.path)] = candidate
+                else:
+                    self.notify_path_departed(path)
+            recovered = [candidate for candidate in candidates.values()
+                if not self.should_ignore_event_path(candidate.path)
+                and not _persisted_blocker_owns_retry(self.state, candidate.path)
+                and not self._has_valid_completion(candidate)]
+            # The existing single WAL writer orders catalog/ownership changes
+            # before this durable candidate+cursor transaction. A crash prefix
+            # can never advance the cursor without retaining the recovered work.
+            self.state.queue_recovery_batch(recovered, cursors)
+            for candidate in recovered:
+                self.enqueue(candidate.path, force=True, event_type="startup_usn_recovery", _state_prequeued=True)
+        except OSError as exc:
+            self.log.write("usn_fallback_scan_failed", roots=list(fallback_roots), error=str(exc))
+            return False
+        self.log.write("usn_startup_recovered", changed=len(changed), queued=len(recovered),
+                       fallback_roots=list(fallback_roots))
+        return True
 
-        with self._lock:
-            recovered_candidates = list(self._pending.values())
-        # Candidate owners and cursor advancement are one durable transaction.
-        # A crash observes either the old cursor or every replay candidate.
-        if cursor_updates:
-            self.state.queue_recovery_batch(
-                recovered_candidates,
-                cursor_updates,
-            )
-        self.log.write(
-            "usn_startup_recovered",
-            changed=len(changed_paths),
-            queued=len(recovered_candidates),
-            fallback_roots=sorted(fallback_roots),
-        )
+    def _has_valid_completion(self, candidate):
+        done = self.state._native.runtime_record("done|" + path_key(candidate.path))
+        if done is None:
+            return False
+        root = _longest_matching_root(candidate.path, self.watch_roots)
+        if root is None or done.get("policy") != self._policy_id(root):
+            return False
+        previous = _CandidateObservation(done["size"], done["mtime"], done["file_id"], done["change_usn"])
+        return (_candidate_change_kind(previous, candidate) != _CandidateChangeKind.CONTENT_CHANGED
+                and done.get("output_identities") is not None
+                and done["output_identities"] == self._output_identities(done["outputs"]))
 
     def _recover_persisted_work(self) -> None:
         """Recover only durable in-flight work; never scan unrelated Watch roots."""
@@ -776,6 +861,7 @@ class WatchScheduler:
                 self._active_claims.clear()
                 self._claims_by_owner.clear()
                 self._dirty_during_claim.clear()
+                self._source_probes.clear()
                 self._password_reload_at = None
                 self._password_retry_at = None
 
@@ -1155,6 +1241,46 @@ class WatchScheduler:
                 report=report,
             )
 
+    def _start_source_probe(self, path: str, *, allow_owned=False, replace_active=True):
+        probe = _SourceProbe(os.path.abspath(path), allow_owned, not replace_active)
+        with self._claim_gate:
+            if self._closed or (self.should_ignore_event_path(path) and not allow_owned):
+                return None
+            if self._defer_claimed_path_locked(probe.path):
+                return None
+            key = path_key(probe.path)
+            previous = self._source_probes.get(key)
+            if previous is not None:
+                if not replace_active:
+                    previous.recheck = True
+                    return None
+                probe.recheck = probe.recheck or previous.recheck
+            self._source_probes[key] = probe
+        return probe
+
+    def _source_probe_valid(self, probe) -> bool:
+        with self._claim_gate:
+            return (not self._closed
+                    and self._source_probes.get(path_key(probe.path)) is probe
+                    and (probe.allow_owned or not self.should_ignore_event_path(probe.path)))
+
+    def _end_source_probe(self, probe) -> None:
+        recheck = False
+        with self._claim_gate:
+            key = path_key(probe.path)
+            if self._source_probes.get(key) is probe:
+                del self._source_probes[key]
+                if not self._source_probes:
+                    self._source_probes.clear()
+                if probe.recheck:
+                    with self._lock:
+                        state = self._active_states.get(probe.path)
+                        if state is not None:
+                            self._schedule_active_locked(probe.path, state)
+                            recheck = True
+        if recheck:
+            self._wake_service()
+
     def enqueue(
         self,
         path: str,
@@ -1170,28 +1296,26 @@ class WatchScheduler:
         pending_recovery = self.state.pending_work_for_path(path)
         retry_scope = (_password_retry_snapshot.failure_payload.get("discovery_scope")
                        if _password_retry_snapshot is not None else None)
-        authorized_recovery = bool((pending_recovery and pending_recovery.internal_recovery) or retry_scope)
-        if self.should_ignore_event_path(path) and not authorized_recovery:
+        retry_internal = bool(retry_scope and _password_retry_snapshot.source_input_root
+            and path_key(retry_scope["root"]) != path_key(_password_retry_snapshot.source_input_root))
+        authorized_recovery = bool((pending_recovery and pending_recovery.internal_recovery) or retry_internal)
+        if retry_scope and not DiscoveryScope.from_record(retry_scope).contains(path):
+            raise ValueError("Retry input is outside its persisted discovery scope")
+        probe = self._start_source_probe(path, allow_owned=authorized_recovery)
+        if probe is None:
             return
-        lookup_path = os.path.abspath(path)
-        with self._claim_gate:
-            if self._closed or (self.should_ignore_event_path(path) and not authorized_recovery):
-                return
-            if self._defer_claimed_path_locked(lookup_path):
-                return
+        admit = lambda: self._source_probe_valid(probe)
+        became_active = False
+        try:
             with self._lock:
-                previous_hint = self._candidate_baseline_locked(lookup_path)
+                previous_hint = self._candidate_baseline_locked(probe.path)
             if previous_hint is None:
-                previous_hint = _candidate_from_state_entry(self.state.latest_entry_for_path(lookup_path))
+                previous_hint = _candidate_from_state_entry(self.state.latest_entry_for_path(probe.path))
             if event_type == "pipeline_claim_released":
-                entry = self.state.latest_entry_for_path(lookup_path)
-                # A deferred arrival may change split-family membership without
-                # changing the failed anchor's bytes. Do not discard that event
-                # when completion just recorded the anchor as missing a volume.
+                entry = self.state.latest_entry_for_path(probe.path)
                 force = force or (entry is not None and entry.status == "suspended_missing_volume")
             candidate = _candidate_for_event_path(
-                path,
-                since_usn=previous_hint.change_usn if previous_hint is not None else 0,
+                path, since_usn=previous_hint.change_usn if previous_hint is not None else 0,
             )
             if candidate is None:
                 self._log_candidate_ignored(path, "not_a_file_or_unreadable")
@@ -1199,21 +1323,17 @@ class WatchScheduler:
             matched_root = _longest_matching_root(candidate.path, self.watch_roots)
             if matched_root:
                 scope = self.scopes[path_key(matched_root)]
-                operations, _ = self._scan_options.catalog_update(self.state._native, scope.native, candidate.path)
-                self.state.commit_runtime(operations)
+                operations, _ = self._scan_options_for(scope).catalog_update(self.state._native, scope.native, candidate.path)
+                self.state.commit_runtime(operations, admit=admit)
             done = self.state._native.runtime_record("done|" + path_key(candidate.path))
             if done and _password_retry_snapshot is None and not _crash_recovery:
-                previous_done = _CandidateObservation(done["size"], done["mtime"], done["file_id"], done["change_usn"])
-                same = _candidate_change_kind(previous_done, candidate) != _CandidateChangeKind.CONTENT_CHANGED
-                entry = self.root_entries.get(path_key(matched_root)) if matched_root else None
-                if same and entry and entry.deep_detect == done["deep_detect"] and all(os.path.isdir(p) for p in done["outputs"]):
+                if self._has_valid_completion(candidate):
                     return
-                self.state.commit_runtime([{"op":"runtime","key":"done|"+path_key(candidate.path)}])
-            password_retry = (
-                _password_retry_snapshot is not None
-                and _candidate_matches_password_failure(candidate, _password_retry_snapshot)
-            )
-            internal_recovery = bool(_crash_recovery or retry_scope)
+                self.state.commit_runtime([{"op":"runtime","key":"done|"+path_key(candidate.path)}], admit=admit)
+                force = True
+            password_retry = (_password_retry_snapshot is not None
+                              and _candidate_matches_password_failure(candidate, _password_retry_snapshot))
+            internal_recovery = bool(_crash_recovery or retry_internal)
             if not self._is_under_watched_root(candidate.path) and not password_retry and not internal_recovery:
                 self._log_candidate_ignored(candidate.path, "outside_watched_roots")
                 return
@@ -1221,112 +1341,62 @@ class WatchScheduler:
                 self._log_candidate_ignored(candidate.path, "under_metadata_dir")
                 return
             now = time.time()
-            with self._lock:
+            with self._claim_gate, self._lock:
+                if not admit():
+                    return
                 previous = self._candidate_baseline_locked(candidate.path) or previous_hint
-                if event_type == "initial_scan" and candidate.path in self._active_states:
-                    # The observer may have admitted this file first. Promote
-                    # that live owner before an unchanged observation returns.
-                    pending = self.state.pending_work_for_path(candidate.path)
-                    if pending is not None:
-                        self.state.queue_active(
-                            candidate, force=pending.force,
-                            source_input_root=pending.source_input_root,
-                            durable_owner=True,
-                        )
                 change_kind = _candidate_change_kind(previous, candidate)
-                if not force and change_kind == _CandidateChangeKind.UNCHANGED:
+                active = self._active_states.get(candidate.path)
+                promote = event_type == "initial_scan" and active is not None
+                needs_queue = active is None or promote
+            unchanged = not force and change_kind == _CandidateChangeKind.UNCHANGED
+            metadata_only = not force and change_kind == _CandidateChangeKind.METADATA_ONLY
+            if not _state_prequeued and (promote or (needs_queue and not unchanged and not metadata_only)):
+                durable_owner = bool(password_retry or internal_recovery or event_type == "initial_scan")
+                self.state.queue_active(
+                    candidate, force=force, password_scope_dir=_recovery_scope_dir,
+                    source_input_root=(_password_retry_snapshot.source_input_root if password_retry or retry_internal
+                                       else self._source_input_root_for(candidate.path)),
+                    internal_recovery=internal_recovery,
+                    discovery_scope=retry_scope or (pending_recovery.discovery_scope if pending_recovery else {}),
+                    durable_owner=durable_owner, persist=durable_owner,
+                    durable=bool(password_retry or internal_recovery), admit=admit,
+                )
+            if unchanged:
+                return
+            if metadata_only:
+                self.state.advance_entry_observation(candidate, admit=admit)
+            with self._claim_gate, self._lock:
+                if not admit():
                     return
-                if not force and change_kind == _CandidateChangeKind.METADATA_ONLY:
+                if metadata_only:
                     self._accept_metadata_observation_locked(candidate, now)
                     return
                 state = self._active_states.get(candidate.path)
-                if state is not None:
-                    self._store_pending_locked(candidate.path, candidate)
-                    self._remember_observation_locked(candidate)
-                    quiet_seconds = self._observe_candidate_activity(
-                        candidate,
-                        now,
-                        content_changed=True,
-                    )
-                    state.last_event_at = now
-                    state.quiet_seconds = quiet_seconds
-                    state.generation += 1
-                    self._schedule_active_locked(candidate.path, state)
-                    self._wake_service()
-                    return
-            became_active = False
-            active_quiet_seconds = self.cold_start_seconds
-            with self._lock:
-                previous = self._candidate_baseline_locked(candidate.path)
-                change_kind = _candidate_change_kind(previous, candidate)
-                if not force and change_kind == _CandidateChangeKind.UNCHANGED:
-                    return
-                if not force and change_kind == _CandidateChangeKind.METADATA_ONLY:
-                    self._accept_metadata_observation_locked(candidate, now)
-                    return
-                state = self._active_states.get(candidate.path)
+                self._store_pending_locked(candidate.path, candidate)
                 if state is None:
-                    retry_is_unchanged = password_retry or internal_recovery
-                    active_quiet_seconds = (
-                        0.0
-                        if retry_is_unchanged
-                        else self._observe_candidate_activity(candidate, now)
-                    )
-                    # Persist before making the candidate visible to concurrent
-                    # scheduler/event paths. If fsync fails there is no in-memory
-                    # work that can proceed without a crash-recovery record.
-                    if not _state_prequeued:
-                        durable_owner = bool(password_retry or internal_recovery or event_type == "initial_scan")
-                        self.state.queue_active(
-                            candidate,
-                            force=force,
-                            password_scope_dir=_recovery_scope_dir,
-                            source_input_root=(
-                                _password_retry_snapshot.source_input_root if password_retry
-                                else self._source_input_root_for(candidate.path)
-                            ),
-                            internal_recovery=internal_recovery,
-                            discovery_scope=retry_scope or (pending_recovery.discovery_scope if pending_recovery else {}),
-                            durable_owner=durable_owner,
-                            persist=durable_owner,
-                            durable=bool(password_retry or internal_recovery),
-                        )
-                    self._store_pending_locked(candidate.path, candidate)
-                    self._remember_observation_locked(candidate)
+                    retry_is_unchanged = password_retry or (
+                        _crash_recovery and change_kind != _CandidateChangeKind.CONTENT_CHANGED)
+                    active_quiet_seconds = 0.0 if retry_is_unchanged else self._observe_candidate_activity(candidate, now)
+                    state = self._new_active_state_locked(last_event_at=now, quiet_seconds=active_quiet_seconds)
+                    self._active_states[candidate.path] = state
                     became_active = True
-                    self._active_states[candidate.path] = self._new_active_state_locked(
-                        last_event_at=now,
-                        quiet_seconds=active_quiet_seconds,
-                    )
-                    self._schedule_active_locked(
-                        candidate.path,
-                        self._active_states[candidate.path],
-                    )
                 else:
-                    self._store_pending_locked(candidate.path, candidate)
-                    self._remember_observation_locked(candidate)
-                    active_quiet_seconds = self._observe_candidate_activity(
-                        candidate,
-                        now,
-                        content_changed=True,
-                    )
+                    active_quiet_seconds = self._observe_candidate_activity(candidate, now, content_changed=True)
                     state.last_event_at = now
                     state.quiet_seconds = active_quiet_seconds
                     state.generation += 1
-                    self._schedule_active_locked(candidate.path, state)
+                self._remember_observation_locked(candidate)
+                self._schedule_active_locked(candidate.path, state)
+        finally:
+            self._end_source_probe(probe)
         if became_active:
             self.log.write(
-                "candidate_active",
-                path=candidate.path,
-                force=force,
-                event_type=event_type,
-                src_path=src_path,
-                size=candidate.size,
-                mtime=candidate.mtime,
-                quiet_seconds=active_quiet_seconds,
-                pending=self.pending_count,
+                "candidate_active", path=candidate.path, force=force, event_type=event_type,
+                src_path=src_path, size=candidate.size, mtime=candidate.mtime,
+                quiet_seconds=active_quiet_seconds, pending=self.pending_count,
             )
-            self._wake_service()
+        self._wake_service()
 
     def _store_pending_locked(self, path: str, candidate: WatchCandidate) -> None:
         if path not in self._pending:
@@ -1373,6 +1443,9 @@ class WatchScheduler:
             claimed_keys = [path_key(path) for path in normalized]
             owned_keys = self._claims_by_owner.setdefault(owner, set())
             for key in claimed_keys:
+                probe = self._source_probes.pop(key, None)
+                if probe is not None:
+                    self._dirty_during_claim.setdefault(owner, {})[key] = probe.path
                 previous_owner = self._active_claims.get(key)
                 if previous_owner and previous_owner != owner:
                     previous_keys = self._claims_by_owner[previous_owner]
@@ -1386,6 +1459,8 @@ class WatchScheduler:
                             self._dirty_during_claim.pop(previous_owner, None)
                 self._active_claims[key] = owner
                 owned_keys.add(key)
+            if not self._source_probes:
+                self._source_probes.clear()
             with self._lock:
                 retired_pending = [
                     (key, candidate_path)
@@ -1498,73 +1573,46 @@ class WatchScheduler:
             self.output_ownership.reconcile(normalized, recursive=recursive)
         matched = _longest_matching_root(normalized,self.watch_roots)
         if matched is not None:
-            operations, _ = self._scan_options.catalog_update(self.state._native,self.scopes[path_key(matched)].native,normalized,recursive)
+            scope = self.scopes[path_key(matched)]
+            operations, _ = self._scan_options_for(scope).catalog_update(self.state._native,scope.native,normalized,recursive)
             self.state.commit_runtime(operations)
-        with self._claim_gate:
-            # Delete/move notifications may arrive after the path was recreated,
-            # or while it is temporarily unqueryable. Neither proves departure.
-            if _recorded_file_presence(normalized) is not False and not recursive:
-                return
-            missing_paths: dict[str, bool] = {}
-
-            def departed(candidate_path: str) -> bool:
-                if not _paths_match(candidate_path, normalized, recursive=recursive):
-                    return False
-                if candidate_path not in missing_paths:
-                    missing_paths[candidate_path] = _recorded_file_presence(candidate_path) is False
-                return missing_paths[candidate_path]
-
-            claimed = [
-                (claim_path, owner)
-                for claim_path, owner in self._active_claims.items()
-                if _paths_match(claim_path, normalized, recursive=recursive)
-            ]
-            with self._lock:
-                # The submitted seed is only the initial Watch ownership. Once
-                # pipeline discovery publishes its physical source claim, every
-                # claimed sibling belongs to that in-flight request as well.
-                inflight_owned = bool(claimed) or any(
-                    _paths_match(request.candidate.path, normalized, recursive=recursive)
-                    for request in self._inflight_requests
-                )
-                pending_paths = [
-                    candidate_path
-                    for candidate_path in self._pending
-                    if departed(candidate_path)
-                ]
-                for candidate_path in pending_paths:
-                    self._remove_pending_locked(candidate_path)
-                    self._active_states.pop(candidate_path, None)
-                tracker_paths = [
-                    candidate_path
-                    for candidate_path in self._quiet_trackers
-                    if departed(candidate_path)
-                ]
-                for candidate_path in tracker_paths:
-                    self._quiet_trackers.pop(candidate_path, None)
-                observation_paths = [
-                    candidate_path
-                    for candidate_path in self._latest_observations
-                    if departed(candidate_path)
-                ]
-                for candidate_path in observation_paths:
-                    self._latest_observations.pop(candidate_path, None)
-                if not self._latest_observations:
-                    self._latest_observations.clear()
-                if not self._quiet_trackers:
-                    self._quiet_trackers.clear()
-            pending_record = self.state.pending_work_for_path(normalized)
-            recovery_armed = bool(
-                pending_record is not None
-                and (pending_record.active_outputs or pending_record.committed_roots)
-            )
-            if inflight_owned or recovery_armed:
-                # Only output recovery needs ownership protection. A blocker
-                # for a vanished source is already invalid, including siblings.
-                self.state.prune_missing_records(normalized, recursive=recursive)
-                forgotten = False
-            else:
-                forgotten = self.state.forget_path(normalized, recursive=recursive, missing_only=True)
+        # Observe presence outside the publication gate. The snapshot objects
+        # are rechecked before retirement so late deletes cannot erase arrivals.
+        if _recorded_file_presence(normalized) is not False and not recursive:
+            return
+        with self._claim_gate, self._lock:
+            claimed = any(_paths_match(claim_path, normalized, recursive=recursive)
+                          for claim_path in self._active_claims)
+            inflight_owned = claimed or any(
+                _paths_match(request.candidate.path, normalized, recursive=recursive)
+                for request in self._inflight_requests)
+            snapshots = [(mapping, [(key, value) for key, value in mapping.items()
+                                    if _paths_match(key, normalized, recursive=recursive)])
+                         for mapping in (self._pending, self._quiet_trackers, self._latest_observations)]
+        missing = {key for _, rows in snapshots for key, _ in rows
+                   if _recorded_file_presence(key) is False}
+        pending_paths = []
+        with self._claim_gate, self._lock:
+            for mapping, rows in snapshots:
+                for key, value in rows:
+                    if (key not in missing or mapping.get(key) is not value
+                            or path_key(os.path.abspath(key)) in self._source_probes):
+                        continue
+                    if mapping is self._pending:
+                        self._remove_pending_locked(key)
+                        self._active_states.pop(key, None)
+                        pending_paths.append(key)
+                    else:
+                        mapping.pop(key, None)
+                if not mapping:
+                    mapping.clear()
+        pending_record = self.state.pending_work_for_path(normalized)
+        recovery_armed = bool(pending_record and (pending_record.active_outputs or pending_record.committed_roots))
+        if inflight_owned or recovery_armed:
+            self.state.prune_missing_records(normalized, recursive=recursive)
+            forgotten = False
+        else:
+            forgotten = self.state.forget_path(normalized, recursive=recursive, missing_only=True)
         self.log.write(
             "candidate_departed",
             path=normalized,
@@ -1610,90 +1658,79 @@ class WatchScheduler:
                 ))
 
         for path, candidate, epoch, generation, quiet_seconds in due:
-            # Claim publication and source observation share this admission
-            # gate. Therefore cleanup can never publish a claim in the middle
-            # of a candidate/readiness probe and later reject that same probe.
-            with self._claim_gate:
-                try:
-                    if path_key(os.path.abspath(path)) in self._active_claims:
-                        self._reschedule_generation(path, epoch, generation)
-                        continue
-                    refreshed = _candidate_for_event_path(path, since_usn=candidate.change_usn)
-                    if refreshed is None:
-                        self._drop_active(path, epoch, generation)
-                        self.state.forget_path(path)
-                        continue
-                    if _candidate_observation_changed(candidate, refreshed):
+            recovery = self.state.pending_work_for_path(path)
+            probe = self._start_source_probe(path, allow_owned=bool(recovery and recovery.internal_recovery),
+                                             replace_active=False)
+            if probe is None:
+                if self.should_ignore_event_path(path) and not (recovery and recovery.internal_recovery):
+                    self._drop_active(path, epoch, generation)
+                    self.state.complete_work_if_matches(candidate)
+                continue
+
+            def admit():
+                with self._claim_gate:
+                    if not self._source_probe_valid(probe):
+                        return False
+                    with self._lock:
+                        state = self._active_states.get(path)
+                        return state is not None and state.epoch == epoch and state.generation == generation
+
+            try:
+                refreshed = _candidate_for_event_path(path, since_usn=candidate.change_usn)
+                if refreshed is None:
+                    with self._claim_gate:
+                        if admit():
+                            self._drop_active(path, epoch, generation)
+                    self.state.forget_path(path, missing_only=True)
+                    continue
+                if _candidate_observation_changed(candidate, refreshed):
+                    with self._claim_gate:
+                        if not admit():
+                            continue
                         if _candidate_content_changed(candidate, refreshed):
                             self._record_boundary_activity(path, epoch, generation, refreshed, now)
                             continue
                         if not self._update_boundary_metadata(path, epoch, generation, refreshed):
                             continue
-                        candidate = refreshed
-                    try:
-                        file_ready = watch_file_is_ready(path)
-                    except FileNotFoundError:
-                        # The source may disappear after its metadata probe.
-                        # Only this candidate departs; the rest of due survives.
-                        self._drop_active(path, epoch, generation)
-                        self.state.forget_path(path)
+                    candidate = refreshed
+                try:
+                    file_ready = watch_file_is_ready(path)
+                except FileNotFoundError:
+                    with self._claim_gate:
+                        if admit():
+                            self._drop_active(path, epoch, generation)
+                    self.state.forget_path(path, missing_only=True)
+                    continue
+                if not file_ready:
+                    with self._claim_gate:
+                        if admit():
+                            self._record_boundary_activity(path, epoch, generation, refreshed, now, content_changed=False)
+                    self.log.write_throttled("candidate_busy", throttle_key=case_key(os.path.abspath(path)),
+                                             interval_seconds=30.0, path=path)
+                    continue
+                self.state.record_attempt(refreshed.path, refreshed.size, refreshed.mtime,
+                                          refreshed.file_id, refreshed.change_usn, admit=admit)
+                with self._claim_gate:
+                    if not admit():
                         continue
-                    if not file_ready:
-                        self._record_boundary_activity(
-                            path,
-                            epoch,
-                            generation,
-                            refreshed,
-                            now,
-                            content_changed=False,
-                        )
-                        self.log.write_throttled(
-                            "candidate_busy",
-                            throttle_key=case_key(os.path.abspath(path)),
-                            interval_seconds=30.0,
-                            path=path,
-                        )
-                        continue
-                    identified = refreshed
                     with self._lock:
-                        state = self._active_states.get(path)
-                        if (
-                            state is None
-                            or state.epoch != epoch
-                            or state.generation != generation
-                        ):
-                            continue
-                    # Keep the active generation recoverable until the attempt
-                    # is recorded. The admission gate excludes source events;
-                    # persistence does not need to hold the scheduler lock.
-                    self.state.record_attempt(
-                        identified.path,
-                        identified.size,
-                        identified.mtime,
-                        identified.file_id,
-                        identified.change_usn,
-                    )
-                    with self._lock:
-                        ready.append(identified)
+                        ready.append(refreshed)
                         self._remove_pending_locked(path)
                         self._active_states.pop(path, None)
-                    self.log.write("candidate_quiet", path=path, generation=generation, quiet_seconds=quiet_seconds)
-                except Exception as exc:
-                    # Reuse the existing boundary policy for a failed probe or
-                    # state write. Generation checks preserve newer events, and
-                    # a candidate already handed to ready cannot be requeued.
-                    self._record_boundary_activity(
-                        path, epoch, generation, candidate, now, content_changed=False,
+                self.log.write("candidate_quiet", path=path, generation=generation, quiet_seconds=quiet_seconds)
+            except Exception as exc:
+                with self._claim_gate:
+                    if admit():
+                        self._record_boundary_activity(path, epoch, generation, candidate, now, content_changed=False)
+                try:
+                    self.log.write_throttled(
+                        "candidate_error", throttle_key=self._scheduler_path_key(path), interval_seconds=30.0,
+                        path=path, error=str(exc), error_type=type(exc).__name__,
                     )
-                    try:
-                        self.log.write_throttled(
-                            "candidate_error", throttle_key=self._scheduler_path_key(path),
-                            interval_seconds=30.0, path=path,
-                            error=str(exc), error_type=type(exc).__name__,
-                        )
-                    except Exception:
-                        # A diagnostic failure must not discard the batch.
-                        pass
+                except Exception:
+                    pass
+            finally:
+                self._end_source_probe(probe)
         return ready
 
     def _drop_active(self, path: str, epoch: int, generation: int) -> None:
@@ -1800,7 +1837,6 @@ class WatchScheduler:
 
     def _accept_metadata_observation_locked(self, candidate: WatchCandidate, now: float) -> None:
         self._remember_observation_locked(candidate)
-        self.state.advance_entry_observation(candidate)
         state = self._active_states.get(candidate.path)
         if state is not None:
             self._store_pending_locked(candidate.path, candidate)
@@ -1884,11 +1920,14 @@ class WatchScheduler:
                 scope_dir = str(pending.password_scope_dir or "")
             run_config["password_scope_dir"] = scope_dir or os.path.dirname(candidate.path)
         output_root = self._output_root_for(candidate.path)
+        run_config["watch_policy"] = self._policy_id(source_input_root)
+        run_config["watch_internal_recovery"] = internal_scope is not None
+        nested_recovery = internal_scope is not None and path_key(internal_scope.root) != path_key(source_input_root)
         run_config["output"] = {
             **(run_config.get("output", {}) if isinstance(run_config.get("output"), dict) else {}),
-            "root": output_root,
-            "common_root": self._common_root_for(candidate.path),
-            "fixed_root": True,
+            "root": "" if nested_recovery else output_root,
+            "common_root": "" if nested_recovery else self._common_root_for(candidate.path),
+            "fixed_root": not nested_recovery,
         }
         from sunpack.runtime.cli.runtime_state import runtime_host
 
@@ -1920,7 +1959,7 @@ class WatchScheduler:
                 request_config=run_config,
                 origin="watch",
                 discovery_scope=internal_scope or self.scopes[path_key(source_input_root)],
-                catalog=None if internal_scope else (self.state._native, self._scan_options, candidate.path),
+                catalog=None if internal_scope else (self.state._native, self._scan_options_for(scope), candidate.path),
                 detection_options=options,
             ))
         except BaseException:
@@ -1940,6 +1979,7 @@ class WatchScheduler:
             source_input_root=source_input_root,
             deep_detect=options.force_scan,
             password_scope_dir=run_config["password_scope_dir"],
+            policy=run_config["watch_policy"],
         )
         return request
 
@@ -2088,7 +2128,7 @@ class WatchScheduler:
                 retired_failures.append(failure)
                 continue
             if self.pipeline_engine.completed_watch_family_output(
-                retry_path, deep_detect=request.deep_detect,
+                retry_path, deep_detect=request.deep_detect, policy=request.policy,
             ):
                 # A newer successful family still owns these exact bytes.
                 # This synchronous check and state update cannot be interleaved
@@ -2223,12 +2263,14 @@ class WatchScheduler:
             return WatchRunResult(processed=1, failed=1, errors=[error])
 
         completed = []
-        for source in claimed_paths:
+        output_identities = self._output_identities(generated_output_dirs)
+        for source in claimed_paths if output_identities is not None else ():
             observed = _watch_candidate_for_path(source)
             if observed is not None:
                 completed.append({"op":"runtime", "key":"done|"+path_key(source), "value":{
                     "path":source,"size":observed.size,"mtime":observed.mtime,"file_id":observed.file_id,
-                    "change_usn":observed.change_usn,"outputs":generated_output_dirs,"deep_detect":request.deep_detect}})
+                    "change_usn":observed.change_usn,"outputs":generated_output_dirs,
+                    "output_identities":output_identities,"policy":request.policy}})
         self.state.commit_runtime(completed, durable=True)
         self.log.write(
             "done",

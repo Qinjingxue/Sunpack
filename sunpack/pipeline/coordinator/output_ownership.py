@@ -12,11 +12,24 @@ class OutputOwnership:
     def __init__(self, config):
         self.config = config
         self.gate = threading.RLock()
+        self._init_lock = threading.Lock()
+        self.input_leases = None
         self._state = None
         self._active_owners = set()
+        self._scopes = None
+
+    def _retention_scopes(self):
+        if self._scopes is None:
+            from sunpack.runtime.watch.service import _read_watch_root_entries
+            from sunpack.runtime.watch.roots import discovery_scopes
+            self._scopes = tuple(discovery_scopes(_read_watch_root_entries()).values())
+        return self._scopes
+
+    def _retained(self, path):
+        return any(scope.native.intersects_output(path) for scope in self._retention_scopes())
 
     def state_for(self, path=None):
-        with self.gate:
+        with self._init_lock:
             if self._state is None:
                 from sunpack.runtime.watch.state import WatchStateStore
                 from sunpack.runtime.watch.service import service_state_dir
@@ -55,26 +68,44 @@ class OutputOwnership:
                         changes.append({"op":"runtime", "key":key})
                         continue
                     record["state"] = "quarantined"
+                elif record["state"] == "relocating":
+                    # A completed payload can be on either side of the rename.
+                    # Never apply extraction-abort deletion to this transaction.
+                    record["state"] = "quarantined"
                 record["owner"] = ""
             changes.append({"op":"runtime", "key":key, "value":record})
         state.commit_runtime(changes, durable=True)
 
     def begin(self, path, owner, *, identities=()):
         state = self.state_for()
-        record = {"path": os.path.abspath(path), "owner": owner, "identities": list(identities), "state": "writing"}
+        lease_path = self.input_leases.output_path(path) if self.input_leases is not None else None
+        record = {"path": os.path.abspath(path), "owner": owner, "identities": list(identities),
+                  "state": "relocating" if identities else "writing"}
         operation = {"op": "runtime", "key": "owned|" + path_key(path), "value": record}
         with self.gate:
+            if lease_path is not None and self.input_leases.output_conflicts(owner, lease_path):
+                raise FileExistsError(f"Output conflicts with an active input: {path}")
             if state._native.runtime_record(operation["key"]) is not None:
                 raise FileExistsError(f"Output is already owned: {path}")
             self._active_owners.add(owner)
             state._native.apply(state._native.decode_operations([operation]))
+        created = False
         try:
             state.commit_runtime([operation], durable=True)
             if not identities:
                 create_output_root(os.path.abspath(path))
+                created = True
                 self.bind(path)
         except BaseException:
-            state.commit_runtime([{"op": "runtime", "key": operation["key"]}], durable=True)
+            # A failed bind may leave a directory that already received output
+            # events. Keep its published protection until normal owner recovery.
+            if not created:
+                try:
+                    state.commit_runtime([{"op": "runtime", "key": operation["key"]}], durable=True)
+                finally:
+                    with self.gate:
+                        if not state._native.runtime_owner_keys(owner):
+                            self._active_owners.discard(owner)
             raise
 
     def seal(self, path, *, succeeded):
@@ -111,13 +142,15 @@ class OutputOwnership:
         if record is None:
             return None
         record["identities"] = [f"{volume}|{identity}", f"{volume}|{leaf_identity}"]
+        record["state"] = "relocating"
         state.commit_runtime([{"op":"runtime", "key":root_key, "value":record}], durable=True)
         work = reservations.reserve(root + ".__sunpack_flatten_work__",owner,set())
         self.begin(work, owner, identities=[f"{volume}|{identity}"])
         return work
 
     def protected(self, path):
-        return self.state_for()._native.owned_root(path) is not None
+        state = self._state or self.state_for()
+        return state._native.owned_root(path) is not None
 
     def reconcile(self, path, *, recursive=False):
         state = self.state_for()
@@ -147,9 +180,6 @@ class OutputOwnership:
         state.commit_runtime(operations, durable=True)
 
     def _recover_location(self, key, record):
-        from sunpack.runtime.watch.service import _read_watch_root_entries
-        from sunpack.core.contracts.discovery_scope import DiscoveryScope
-        scopes = [DiscoveryScope(entry.input_root, recursive=True) for entry in _read_watch_root_entries()]
         for identity in record["identities"]:
             volume, file_id = identity.rsplit("|", 1)
             try:
@@ -159,8 +189,10 @@ class OutputOwnership:
             except OSError:
                 # Keep unresolved ownership until a later structural event.
                 return []
-            if target and any(scope.contains(target) for scope in scopes):
-                record.update(path=target, owner="", state="retained", identities=[identity])
+            if target and self._retained(target):
+                record.update(path=target, owner="",
+                              state="retained" if record["state"] in {"sealed", "retained"} else "quarantined",
+                              identities=[identity])
                 return [{"op":"runtime", "key":key},
                     {"op":"runtime", "key":"owned|"+path_key(target), "value":record}]
         return [{"op":"runtime", "key":key}]
@@ -190,9 +222,6 @@ class OutputOwnership:
         state = self._state
         if state is None:
             return
-        from sunpack.runtime.watch.service import _read_watch_root_entries
-        from sunpack.core.contracts.discovery_scope import DiscoveryScope
-        scopes = [DiscoveryScope(entry.input_root, recursive=True) for entry in _read_watch_root_entries()]
         changes = []
         for key in state._native.runtime_owner_keys(owner):
             record = state._native.runtime_record(key)
@@ -206,19 +235,20 @@ class OutputOwnership:
             except OSError:
                 record.update(owner="", state="quarantined")
             else:
-                if not record["identities"] or f"{volume}|{identity}" not in record["identities"] or not any(scope.contains(record["path"]) for scope in scopes):
+                if not record["identities"] or f"{volume}|{identity}" not in record["identities"] or not self._retained(record["path"]):
                     changes.append({"op": "runtime", "key": key})
                     continue
-                record.update(owner="", state="quarantined" if record["state"] == "writing" else "retained",
+                record.update(owner="", state="retained" if record["state"] in {"sealed", "retained"} else "quarantined",
                               identities=[f"{volume}|{identity}"])
             changes.append({"op": "runtime", "key": key, "value": record})
-        state.commit_runtime(changes, durable=True)
+        state.commit_runtime(state._native.fold_owned_outputs(changes), durable=True)
         self._active_owners.discard(owner)
 
     def retain_scopes(self, scopes):
         """Drop removed roots' catalogs and outputs in one existing WAL transaction."""
+        self._scopes = tuple(scopes)
         state = self.state_for()
-        state.commit_runtime(state._native.prune_runtime_scopes([scope.native for scope in scopes]), durable=True)
+        state.commit_runtime(state._native.prune_runtime_scopes([scope.native for scope in self._scopes]), durable=True)
 
     def close(self):
         if self._state is not None:

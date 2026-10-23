@@ -736,8 +736,10 @@ class WatchStateStore:
         if self._persistence_fault is not None:
             raise RuntimeError("Watch state persistence is unavailable") from self._persistence_fault
 
-    def commit_runtime(self, operations, *, durable=False):
+    def commit_runtime(self, operations, *, durable=False, admit=None):
         with self._state_lock:
+            if admit is not None and not admit():
+                return
             self._commit_operations_locked(operations, durable=durable)
 
     def _commit_operations_locked(
@@ -838,9 +840,12 @@ class WatchStateStore:
         durable_owner: bool = False,
         persist: bool = True,
         durable: bool = False,
+        admit=None,
     ) -> None:
         key = _path_key(candidate.path)
         with self._state_lock:
+            if admit is not None and not admit():
+                return
             previous = self._pending_record(key)
             pending = WatchPendingWork(
                 path=os.path.abspath(candidate.path),
@@ -879,8 +884,12 @@ class WatchStateStore:
         mtime: float,
         file_id: str = "",
         change_usn: int = 0,
+        *,
+        admit=None,
     ) -> None:
         with self._state_lock:
+            if admit is not None and not admit():
+                return
             key = _path_key(path)
             previous = self._pending_record(key)
             pending = WatchPendingWork(
@@ -1152,8 +1161,10 @@ class WatchStateStore:
         with self._state_lock:
             return self._entry_record(path)
 
-    def advance_entry_observation(self, candidate) -> bool:
+    def advance_entry_observation(self, candidate, *, admit=None) -> bool:
         with self._state_lock:
+            if admit is not None and not admit():
+                return False
             key = _path_key(candidate.path)
             entry = self._entry_record(key)
             if entry is None:

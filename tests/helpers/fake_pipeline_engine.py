@@ -35,7 +35,7 @@ class FakePipelineEngine:
     def is_idle(self):
         return True
 
-    def completed_watch_family_output(self, path, *, deep_detect=False):
+    def completed_watch_family_output(self, path, *, deep_detect=False, policy=""):
         return ""
 
     def reconfigure_request(self, config):

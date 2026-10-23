@@ -37,9 +37,18 @@ function Update-Fields($Old, $New, $User, $Defaults, [string]$Path) {
             }
             continue
         }
-        if (-not (Has-Key $User $name)) { continue }
         $default = $null
         if (Has-Key $Defaults $name) { $default = $Defaults.$name }
+        if (-not (Has-Key $User $name)) {
+            if ($field.Value -is [pscustomobject] -and $Old.$name -is [pscustomobject]) {
+                # Materialize only added fields, not the old defaults of an
+                # object the user never wrote into the ordinary configuration.
+                $added = [pscustomobject]@{}
+                Update-Fields $Old.$name $field.Value $added $default $location
+                if (@($added.PSObject.Properties).Count -gt 0) { Add-Key $User $name $added }
+            }
+            continue
+        }
         if ($location -eq '/filesystem/scan_filters' -and $User.$name -is [array]) {
             $oldModules = @{}; $newModules = @{}; $templates = @{}
             foreach ($item in @($Old.$name)) { if (Has-Key $item 'name') { $oldModules[$item.name] = $item } }
@@ -97,7 +106,7 @@ try {
     $stream = New-Object IO.FileStream($temporary, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
     try { $stream.Write($bytes, 0, $bytes.Length); $stream.Flush($true) } finally { $stream.Dispose() }
     [IO.File]::SetAccessControl($temporary, $acl)
-    [IO.File]::Replace($temporary, $target, $null, $false)
+    [IO.File]::Replace($temporary, $target, [System.Management.Automation.Language.NullString]::Value, $false)
 } finally {
     if ([IO.File]::Exists($temporary)) { [IO.File]::Delete($temporary) }
 }

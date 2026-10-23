@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 import asyncio
 import copy
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable
@@ -14,6 +15,7 @@ from sunpack.runtime.cli.runtime_state import server_runtime_active, set_server_
 
 
 ConfigSourceKey = tuple[str | None, str | None, str | None]
+_LOG = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -24,7 +26,9 @@ class _ConfigSnapshot:
     normalized_config: dict[str, Any]
 
 
-_PASSWORD_OBSERVER = None
+_CONFIG_OBSERVER = None
+_CONFIG_RELOAD_TASK: asyncio.Task | None = None
+_CONFIG_RELOAD_PENDING = False
 _PASSWORD_RELOAD_TASK: asyncio.Task | None = None
 _PASSWORD_RELOAD_PENDING = False
 
@@ -36,20 +40,54 @@ _STATE_CHANGED_CALLBACK: Callable[[], None] | None = None
 
 
 def enable_persistent_runtime(*, state_changed: Callable[[], None] | None = None) -> None:
-    global _ENGINE_LOCK, _STATE_CHANGED_CALLBACK, _PASSWORD_OBSERVER
+    global _ENGINE_LOCK, _STATE_CHANGED_CALLBACK, _CONFIG_OBSERVER
     if not server_runtime_active():
         _ENGINE_LOCK = asyncio.Lock()
     _STATE_CHANGED_CALLBACK = state_changed
     set_server_runtime_active(True)
-    if _PASSWORD_OBSERVER is None:
+    if _CONFIG_OBSERVER is None:
         from sunpack.core.passwords.internal.builtin import password_file_source
         from sunpack.runtime.watch.config_observer import ConfigFileObserver
+        from sunpack.core.config.loader import SIMPLE_CONFIG_FILENAME, ADVANCED_CONFIG_FILENAME
+        from sunpack.runtime.watch.service import watch_roots_path, WATCH_ROOTS_FILENAME
         source = password_file_source()
         observer = ConfigFileObserver(source.path.parent, [source.path.name], _password_file_changed,
-                                      loop=asyncio.get_running_loop())
+            loop=asyncio.get_running_loop(), additional_files=[(watch_roots_path().resolve().parent,
+                [SIMPLE_CONFIG_FILENAME, ADVANCED_CONFIG_FILENAME, WATCH_ROOTS_FILENAME], _configuration_files_changed)])
         observer.start()
-        _PASSWORD_OBSERVER = observer
+        _CONFIG_OBSERVER = observer
         source.reload()
+
+
+def _configuration_files_changed() -> None:
+    global _CONFIG_RELOAD_TASK, _CONFIG_RELOAD_PENDING
+    _CONFIG_SNAPSHOTS.clear()
+    _CONFIG_RELOAD_PENDING = True
+    if _CONFIG_RELOAD_TASK is None:
+        _CONFIG_RELOAD_TASK = asyncio.create_task(_reload_configuration())
+
+
+async def _reload_configuration() -> None:
+    global _CONFIG_RELOAD_TASK, _CONFIG_RELOAD_PENDING
+    try:
+        while _CONFIG_RELOAD_PENDING:
+            _CONFIG_RELOAD_PENDING = False
+            from sunpack.runtime.cli.runtime_state import runtime_host
+            from sunpack.runtime.watch.service import service_config_from
+            from sunpack.runtime.watch.roots import discovery_scopes
+            try:
+                config = await asyncio.to_thread(load_config)
+                entries = await asyncio.to_thread(service_config_from, config)
+                if _ENGINE is not None:
+                    await asyncio.to_thread(_ENGINE.output_ownership.retain_scopes,
+                        list(discovery_scopes(entries["root_entries"]).values()))
+                host = runtime_host()
+                if host is not None:
+                    await host.reload_watch()
+            except Exception:
+                _LOG.exception("failed to apply runtime configuration change")
+    finally:
+        _CONFIG_RELOAD_TASK = None
 
 
 def _password_file_changed() -> None:
@@ -66,16 +104,22 @@ async def _reload_password_file(source) -> None:
         while _PASSWORD_RELOAD_PENDING:
             _PASSWORD_RELOAD_PENDING = False
             await asyncio.to_thread(source.reload)
+            from sunpack.runtime.cli.runtime_state import runtime_host
+            host = runtime_host()
+            if host is not None:
+                host.password_source_changed()
     finally:
         _PASSWORD_RELOAD_TASK = None
 
 
 async def close_persistent_runtime() -> None:
-    global _ENGINE, _LATEST_IDLE_SECONDS, _STATE_CHANGED_CALLBACK, _PASSWORD_OBSERVER
+    global _ENGINE, _LATEST_IDLE_SECONDS, _STATE_CHANGED_CALLBACK, _CONFIG_OBSERVER
     set_server_runtime_active(False)
-    if _PASSWORD_OBSERVER is not None:
-        _PASSWORD_OBSERVER.stop()
-        _PASSWORD_OBSERVER = None
+    if _CONFIG_OBSERVER is not None:
+        _CONFIG_OBSERVER.stop()
+        _CONFIG_OBSERVER = None
+    if _CONFIG_RELOAD_TASK is not None:
+        await _CONFIG_RELOAD_TASK
     if _PASSWORD_RELOAD_TASK is not None:
         await _PASSWORD_RELOAD_TASK
     from sunpack.core.passwords.internal.builtin import clear_password_file_source
