@@ -1,6 +1,5 @@
 import asyncio
 import gzip
-import threading
 from types import SimpleNamespace
 
 import pytest
@@ -43,7 +42,6 @@ def test_one_engine_keeps_watch_and_cli_detection_modes_per_request(tmp_path, mo
 
     class Services:
         def __init__(self, _config, _broker):
-            self.output_ownership = SimpleNamespace(gate=threading.RLock(), finish=lambda _owner: None)
             self.output_reservations = SimpleNamespace(release=lambda _request_id: None)
 
         async def start(self):

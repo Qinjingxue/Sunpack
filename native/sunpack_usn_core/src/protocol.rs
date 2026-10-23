@@ -5,81 +5,7 @@ pub const MAX_VOLUME_GUID_BYTES: usize = 64;
 pub const FILE_ID_BYTES: usize = 16;
 pub const REQUEST_BYTES: usize = 112;
 pub const RESPONSE_BYTES: usize = 42;
-pub const MAX_CHANGE_PAYLOAD_BYTES: usize = 64 * 1024;
-pub const CHANGE_HEADER_BYTES: usize = 5;
-pub const CHANGE_FIXED_BYTES: usize = 49;
 const _: () = assert!(REQUEST_BYTES <= 4096);
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct JournalChange {
-    pub file_id: [u8; FILE_ID_BYTES],
-    pub parent_id: [u8; FILE_ID_BYTES],
-    pub usn: i64,
-    pub reason: u32,
-    pub is_directory: bool,
-    // None requires scope reconciliation; an empty filename is never a path.
-    pub path: Option<String>,
-}
-
-#[derive(Debug)]
-pub struct VolumeChangeBatch {
-    pub journal_id: u64,
-    pub next_usn: i64,
-    pub dirty: bool,
-    pub changes: Vec<JournalChange>,
-}
-
-impl VolumeChangeBatch {
-    pub fn encode(&self) -> io::Result<Vec<u8>> {
-        let mut bytes = Vec::new();
-        bytes.push(u8::from(self.dirty));
-        bytes.extend_from_slice(&(self.changes.len() as u32).to_le_bytes());
-        for change in &self.changes {
-            bytes.extend_from_slice(&change.file_id);
-            bytes.extend_from_slice(&change.parent_id);
-            bytes.extend_from_slice(&change.usn.to_le_bytes());
-            bytes.extend_from_slice(&change.reason.to_le_bytes());
-            bytes.push(u8::from(change.is_directory));
-            let path = change.path.as_deref().unwrap_or_default().as_bytes();
-            bytes.extend_from_slice(&(path.len() as u32).to_le_bytes());
-            bytes.extend_from_slice(path);
-        }
-        if bytes.len() > MAX_CHANGE_PAYLOAD_BYTES {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "USN change payload exceeds budget"));
-        }
-        Ok(bytes)
-    }
-
-    pub fn decode(journal_id: u64, next_usn: i64, bytes: &[u8]) -> io::Result<Self> {
-        let invalid = || io::Error::new(io::ErrorKind::InvalidData, "invalid USN change batch");
-        if bytes.len() < CHANGE_HEADER_BYTES || bytes.len() > MAX_CHANGE_PAYLOAD_BYTES || bytes[0] > 1 {
-            return Err(invalid());
-        }
-        let count = u32::from_le_bytes(bytes[1..5].try_into().unwrap()) as usize;
-        if count > (bytes.len() - CHANGE_HEADER_BYTES) / CHANGE_FIXED_BYTES { return Err(invalid()); }
-        let mut changes = Vec::with_capacity(count);
-        let mut offset = CHANGE_HEADER_BYTES;
-        for _ in 0..count {
-            if bytes.len() - offset < CHANGE_FIXED_BYTES { return Err(invalid()); }
-            let row = &bytes[offset..offset + CHANGE_FIXED_BYTES];
-            let length = u32::from_le_bytes(row[45..49].try_into().unwrap()) as usize;
-            offset += CHANGE_FIXED_BYTES;
-            if length > bytes.len() - offset || row[44] > 1 { return Err(invalid()); }
-            let path = if length == 0 { None } else {
-                Some(std::str::from_utf8(&bytes[offset..offset + length]).map_err(|_| invalid())?.to_owned())
-            };
-            changes.push(JournalChange {
-                file_id: row[0..16].try_into().unwrap(), parent_id: row[16..32].try_into().unwrap(),
-                usn: i64::from_le_bytes(row[32..40].try_into().unwrap()),
-                reason: u32::from_le_bytes(row[40..44].try_into().unwrap()),
-                is_directory: row[44] != 0, path,
-            });
-            offset += length;
-        }
-        if offset != bytes.len() { return Err(invalid()); }
-        Ok(Self {journal_id, next_usn, dirty: bytes[0] != 0, changes})
-    }
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u16)]
@@ -89,7 +15,7 @@ pub enum Opcode {
     ReadChangeReasons = 3,
     Ping = 4,
     Release = 5,
-    ReadVolumeChanges = 6,
+    ReadRootChanges = 6,
 }
 
 impl TryFrom<u16> for Opcode {
@@ -102,7 +28,7 @@ impl TryFrom<u16> for Opcode {
             3 => Ok(Self::ReadChangeReasons),
             4 => Ok(Self::Ping),
             5 => Ok(Self::Release),
-            6 => Ok(Self::ReadVolumeChanges),
+            6 => Ok(Self::ReadRootChanges),
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "unknown broker opcode",

@@ -26,16 +26,8 @@ struct ReadFileUsnData {
     max_major_version: u16,
 }
 
-#[repr(C)]
-union IdentityValue { file_id: i64, extended: [u8; 16] }
-#[repr(C)]
-struct IdentityDescriptor { size: u32, kind: i32, value: IdentityValue }
-
 #[link(name = "Kernel32")]
 extern "system" {
-    fn OpenFileById(volume: Handle, descriptor: *const IdentityDescriptor, access: u32,
-        share: u32, security: *const c_void, flags: u32) -> Handle;
-    fn GetFinalPathNameByHandleW(handle: Handle, path: *mut u16, length: u32, flags: u32) -> u32;
     fn CreateFileW(
         file_name: *const u16,
         desired_access: u32,
@@ -176,43 +168,6 @@ pub(super) fn watch_path_identity(path: &Path) -> io::Result<(String, String, i6
         observation.file_id,
         observation.change_usn,
     ))
-}
-
-pub(super) fn watch_identity_path(volume: &str, identity: &str) -> io::Result<String> {
-    if !volume.to_ascii_lowercase().starts_with(r"\\?\volume{") || !volume.ends_with('}')
-        || !matches!(identity.len(),16|32) || !identity.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput,"invalid directory identity"));
-    }
-    // A directory handle to the volume root needs no privileged journal access.
-    let root = format!("{volume}\\");
-    let volume_handle = open_path(Path::new(&root),0,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,true)?;
-    let mut bytes=[0u8;16];
-    for (index,pair) in identity.as_bytes().rchunks_exact(2).enumerate() {
-        bytes[index]=u8::from_str_radix(std::str::from_utf8(pair).unwrap(),16).unwrap();
-    }
-    let descriptor=IdentityDescriptor { size: std::mem::size_of::<IdentityDescriptor>() as u32,
-        kind: if identity.len()==16 {0} else {2}, value: IdentityValue {extended:bytes} };
-    let raw=unsafe { OpenFileById(volume_handle.raw(),&descriptor,0,
-        FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,null(),FILE_FLAG_BACKUP_SEMANTICS) };
-    if raw==INVALID_HANDLE_VALUE {
-        let error=io::Error::last_os_error();
-        // NTFS reports a deleted/reused file reference as INVALID_PARAMETER.
-        return Err(if matches!(error.raw_os_error(),Some(87)|Some(1168)) {
-            io::Error::new(io::ErrorKind::NotFound,error)
-        } else {error});
-    }
-    let handle=OwnedHandle {raw:raw as isize,_resource:crate::io::resource_lifecycle::NativeResourceGuard::register("directory_identity_handle",[PathBuf::from(&root)])?};
-    let mut path=vec![0u16;512];
-    loop {
-        let size=unsafe {GetFinalPathNameByHandleW(handle.raw(),path.as_mut_ptr(),path.len() as u32,0)} as usize;
-        if size==0 {return Err(io::Error::last_os_error());}
-        if size<path.len() {
-            let path=String::from_utf16_lossy(&path[..size]);
-            return Ok(path.strip_prefix(r"\\?\").unwrap_or(&path).to_owned());
-        }
-        if size>32768 {return Err(io::Error::new(io::ErrorKind::InvalidData,"directory path too long"));}
-        path.resize(size+1,0);
-    }
 }
 
 pub(super) fn watch_file_is_ready(path: &Path) -> io::Result<bool> {

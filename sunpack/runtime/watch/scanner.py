@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 
 from sunpack_native import (
     validate_ntfs_watch_root as _native_validate_ntfs_watch_root,
@@ -8,6 +9,7 @@ from sunpack_native import (
     watch_file_is_ready as _native_watch_file_is_ready,
     watch_volume_cursor as _native_watch_volume_cursor,
     watch_path_identity as _native_watch_path_identity,
+    watch_root_changes as _native_watch_root_changes,
 )
 
 
@@ -77,3 +79,7 @@ def watch_path_identity(path: str) -> tuple[str, str, int]:
     return str(volume).lower(), str(file_id), int(change_usn)
 
 
+def watch_root_changes(path: str, start_usn: int, end_usn: int) -> list[str]:
+    names = _native_watch_root_changes(str(path), int(start_usn), int(end_usn))
+    root = Path(path)
+    return [str(root if name == "" else root / str(name)) for name in names]

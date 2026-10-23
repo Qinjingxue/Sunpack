@@ -685,7 +685,6 @@ class WatchService:
                 ),
                 observer_stop_timeout_seconds=float(watch_config.get("observer_stop_timeout_seconds", 5.0)),
                 pipeline_engine=pipeline_engine,
-                output_ownership=pipeline_engine.output_ownership,
                 notification_sink=toast_coordinator,
                 wake_callback=self._wake_scheduler,
             )

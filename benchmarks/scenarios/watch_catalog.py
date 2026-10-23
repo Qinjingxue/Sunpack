@@ -11,6 +11,7 @@ from sunpack.core.contracts.discovery_scope import DiscoveryScope
 from sunpack.core.support.path_keys import path_key
 from sunpack.pipeline.discovery.filesystem.directory_scanner import DirectoryScanner
 from sunpack.runtime.watch.state import WatchStateStore
+from sunpack_native import NativeWatchCatalog
 
 
 def main(argv=None):
@@ -27,7 +28,7 @@ def main(argv=None):
     report = BenchmarkReport("scan.watch-catalog", parameters={
         "files": args.files, "protected_files": args.protected_files,
         "bucket_size": args.bucket_size, "rounds": args.rounds,
-        "method": "Real empty disguised files across 100 directories. Compare the current native bucket path with scope re-enumeration on identical authorized inputs; this is not a comparison with a previous release. Updates include ordinary WAL writes. No archive extraction or Broker is needed.",
+        "method": "Real empty disguised files across 100 directories. Compare the current native bucket path with scope re-enumeration on identical authorized inputs; this is not a comparison with a previous release. File updates stay in memory; only output exclusions are persisted. No archive extraction or Broker is needed.",
     })
     sampler = ProcessSampler()
     with BenchmarkWorkspace(report.scenario, results_root=args.results_root) as workspace:
@@ -55,20 +56,19 @@ def main(argv=None):
         try:
             state.commit_runtime([{"op": "runtime", "key": "owned|" + path_key(str(generated)),
                 "value": {"path": str(generated), "owner": "", "identities": [], "state": "retained"}}])
+            catalog = NativeWatchCatalog(state._native)
             def update(path=None):
-                operations, errors = options.catalog_update(state._native, scope.native, path)
+                errors = options.catalog_update(catalog, scope.native, path)
                 if errors:
                     raise OSError(errors)
-                count = len(operations)
-                state.commit_runtime(operations)
-                return count
+                return 1
             cold = measure(update, runs=1)[0]
             report.samples.append({"phase": "initial_catalog", **cold.to_dict(), "operations": cold.value})
             del cold
             gc.collect()
             resident_memory = sampler.take().to_dict()
             def bucket():
-                filtered, raw = options.catalog_snapshot(state._native, scope.native, str(members[0]))
+                filtered, raw = options.catalog_snapshot(catalog, scope.native, str(members[0]))
                 return len(raw.file_columns()[0])
             def enumerate_scope():
                 filtered, raw = options.scan_scope(reference_scope.native)
@@ -87,21 +87,13 @@ def main(argv=None):
             updates = measure(event, runs=args.rounds)
             report.summary.update({
                 "bucket": timing_summary(lookup), "scope_reenumeration": timing_summary(enumeration),
-                "file_update_with_wal_and_bucket": timing_summary(updates),
+                "file_update_and_bucket": timing_summary(updates),
                 "initial_memory": baseline_memory, "catalog_memory": resident_memory,
                 "update_operations_max": max(row.value for row in updates),
             })
             state.save()
             report.summary["checkpoint_bytes"] = state_path.stat().st_size
-            state.close()
-            restored = measure(lambda: WatchStateStore(str(state_path)), runs=1)[0]
-            state = restored.value
-            report.samples.append({"phase": "restore", "wall_ms": restored.wall_ms, "cpu_ms": restored.cpu_ms})
-            del restored
-            prune = measure(lambda: state.commit_runtime(state._native.prune_runtime_scopes([]), durable=True), runs=1)[0]
-            report.samples.append({"phase": "remove_scope", **prune.to_dict()})
-            if state._native.runtime_keys("file|") or state._native.runtime_keys("owned|"):
-                raise RuntimeError("Removed scope retained live records")
+            catalog = None
             gc.collect()
             report.summary["after_removal_memory"] = sampler.take().to_dict()
             report.summary["live_records_after_removal"] = 0

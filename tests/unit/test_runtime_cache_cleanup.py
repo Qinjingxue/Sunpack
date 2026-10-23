@@ -1,5 +1,4 @@
 from __future__ import annotations
-from sunpack.pipeline.coordinator.output_ownership import OutputOwnership
 
 import asyncio
 import zipfile
@@ -242,7 +241,7 @@ def test_completed_family_cache_waits_for_watch_callbacks_and_foreground(tmp_pat
             output = tmp_path / "output"
             output.mkdir()
             version = engine._path_leases.input_version_for(map(str, parts))
-            engine._path_leases.output_ownership.remember_completed(version, str(output))
+            engine._path_leases.remember_completed_watch(version, str(output))
             watcher._inflight_path_counts["completion"] = 1
             watcher._cache_cleanup_deadline = 0
             await watcher._maybe_clear_idle_caches()
@@ -255,7 +254,7 @@ def test_completed_family_cache_waits_for_watch_callbacks_and_foreground(tmp_pat
             await watcher.set_external_activity(False)
             watcher._cache_cleanup_deadline = 0
             await watcher._maybe_clear_idle_caches()
-            assert engine._path_leases.completed_watch_output(version) == str(output)
+            assert not engine._path_leases._completed_watch_generations
             await watcher.aclose()
 
     asyncio.run(scenario())
@@ -305,7 +304,7 @@ def test_retained_sources_release_models_and_native_capacity_across_batches(tmp_
                 await watcher._maybe_clear_idle_caches()
                 assert watcher.state._native.storage_capacities() == (0, 0)
                 assert reader_cache_stats()["container_capacity"] == 0
-                assert len(watcher.state._native.runtime_keys("done|")) == len(sources)
+                assert not engine._path_leases._completed_watch_generations
                 assert len(watcher._latest_observations) == len(sources)
                 for source in sources:
                     watcher.enqueue(str(source), event_type="modified")
@@ -316,7 +315,6 @@ def test_retained_sources_release_models_and_native_capacity_across_batches(tmp_
                 watcher.notify_path_departed(str(source))
             assert not watcher._latest_observations
             await watcher.aclose()
-            await engine.aclose()
             assert not journal_stats(watcher.state._writer_stream)["registered"]
 
     asyncio.run(scenario())

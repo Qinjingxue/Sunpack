@@ -116,7 +116,6 @@ def test_watch_claim_publishes_each_confirmed_task_and_updated_volume_members(tm
         broker = AsyncWorkBroker(thread_capacity=2, max_pending_jobs=4)
         runtime = object.__new__(_RequestRuntime)
         runtime.submission = NS(origin="watch", request_id="claim", detection_options=EmbeddedOptions())
-        runtime.config = {}
         runtime.recursive_authorization = NS(authorize_batch=lambda tasks, *a, **k: NS(allowed_tasks=tasks, skipped=()))
         runtime.task_scanner = NS(last_scan_session=None)
         runtime.context = NS(lock=threading.Lock(), policy_skips=[])

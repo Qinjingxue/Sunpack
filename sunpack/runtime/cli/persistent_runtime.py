@@ -74,13 +74,9 @@ async def _reload_configuration() -> None:
             _CONFIG_RELOAD_PENDING = False
             from sunpack.runtime.cli.runtime_state import runtime_host
             from sunpack.runtime.watch.service import service_config_from
-            from sunpack.runtime.watch.roots import discovery_scopes
             try:
                 config = await asyncio.to_thread(load_config)
                 entries = await asyncio.to_thread(service_config_from, config)
-                if _ENGINE is not None:
-                    await asyncio.to_thread(_ENGINE.output_ownership.retain_scopes,
-                        list(discovery_scopes(entries["root_entries"]).values()))
                 host = runtime_host()
                 if host is not None:
                     await host.reload_watch()

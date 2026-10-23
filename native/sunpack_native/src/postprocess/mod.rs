@@ -122,12 +122,11 @@ fn move_input_no_replace(source: &Path, destination: &Path) -> io::Result<()> {
 
 use crate::filesystem::{watch_file_observation_known_kind, WatchFileObservation};
 
-pub(crate) struct WatchCandidateRow {
-    pub(crate) path: String,
-    pub(crate) size: u64,
-    pub(crate) mtime: f64,
-    pub(crate) mtime_ns: u64,
-    pub(crate) observation: WatchFileObservation,
+struct WatchCandidateRow {
+    path: String,
+    size: u64,
+    mtime: f64,
+    observation: WatchFileObservation,
 }
 
 #[cfg(windows)]
@@ -182,11 +181,9 @@ pub(crate) fn watch_candidate_for_path(
 }
 
 #[pyfunction]
-#[pyo3(signature = (base, work_path=None))]
 pub(crate) fn flatten_single_branch_directories(
     py: Python<'_>,
     base: &str,
-    work_path: Option<&str>,
 ) -> PyResult<Py<PyDict>> {
     let base_path = PathBuf::from(base);
     let result = PyDict::new(py);
@@ -204,7 +201,7 @@ pub(crate) fn flatten_single_branch_directories(
     // directory change the watch scheduler has to consume.  Release the GIL for
     // the loop (as delete_files_batch already does) so those two can overlap
     // instead of serializing on the interpreter lock.
-    py.detach(|| flatten_single_branch_chain_with_publisher(&base_path, &mut stats, rename_no_replace, work_path.map(Path::new)));
+    py.detach(|| flatten_single_branch_chain(&base_path, &mut stats));
     result.set_item("moved", stats.moved)?;
     result.set_item("removed_dirs", stats.removed_dirs)?;
     result.set_item("errors", PyList::new(py, stats.errors)?)?;
@@ -251,7 +248,7 @@ pub(crate) fn delete_files_batch(py: Python<'_>, paths: Vec<String>) -> PyResult
     Ok(results.unbind())
 }
 
-pub(crate) fn watch_candidate_row(path: &Path, since_usn: Option<i64>) -> PyResult<Option<WatchCandidateRow>> {
+fn watch_candidate_row(path: &Path, since_usn: Option<i64>) -> PyResult<Option<WatchCandidateRow>> {
     let metadata = match fs::metadata(path) {
         Ok(metadata) => metadata,
         Err(_) => return Ok(None),
@@ -275,8 +272,6 @@ fn watch_candidate_from_metadata(
         path: normalize_path(path),
         size: metadata.len(),
         mtime: mtime_seconds(metadata),
-        mtime_ns: metadata.modified().ok().and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-            .map_or(0, |duration| duration.as_nanos() as u64),
         observation,
     }))
 }
@@ -308,16 +303,14 @@ struct FlattenStats {
     source_dir: Option<PathBuf>,
 }
 
-#[cfg(test)]
 fn flatten_single_branch_chain(root: &Path, stats: &mut FlattenStats) {
-    flatten_single_branch_chain_with_publisher(root, stats, rename_no_replace, None);
+    flatten_single_branch_chain_with_publisher(root, stats, rename_no_replace);
 }
 
 fn flatten_single_branch_chain_with_publisher(
     root: &Path,
     stats: &mut FlattenStats,
     publish: impl FnOnce(&Path, &Path) -> io::Result<()>,
-    reserved_work: Option<&Path>,
 ) {
     let chain = discover_flatten_chain(root);
     let Some(leaf) = chain.last() else {
@@ -334,13 +327,7 @@ fn flatten_single_branch_chain_with_publisher(
         }
     };
 
-    let selected_work = if let Some(work) = reserved_work {
-        match rename_no_replace(root,work) {
-            Ok(()) => Some(work.to_path_buf()),
-            Err(error) => { stats.errors.push(error.to_string()); None }
-        }
-    } else { rename_root_to_visible_work(root, stats) };
-    let Some(work) = selected_work else {
+    let Some(work) = rename_root_to_visible_work(root, stats) else {
         return;
     };
     stats.output_dir = Some(work.clone());
@@ -635,7 +622,7 @@ mod tests {
             fs::create_dir(root)?;
             fs::write(root.join("unrelated.txt"), b"unrelated")?;
             rename_no_replace(leaf, root)
-        }, None);
+        });
         let retained = stats.output_dir.as_ref().unwrap();
         assert_ne!(retained, &output);
         assert_eq!(stats.source_dir.as_ref(), Some(&output));
@@ -651,9 +638,4 @@ mod tests {
         assert_eq!(stats.removed_dirs, 0);
         assert_eq!(stats.errors.len(), 1);
     }
-}
-
-#[pyfunction]
-pub(crate) fn flatten_leaf(py: Python<'_>, base: &str) -> Option<String> {
-    py.detach(|| discover_flatten_chain(Path::new(base)).last().map(|p| normalize_path(p)))
 }

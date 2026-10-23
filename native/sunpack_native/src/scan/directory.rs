@@ -1206,18 +1206,15 @@ impl NativeDirectoryScanOptions {
     }
 
     #[pyo3(signature = (state, scope, changed=None, _subtree=false))]
-    fn catalog_update(&self, py: Python<'_>, state: &crate::watch_store::NativeWatchState,
+    fn catalog_update(&self, py: Python<'_>, state: &NativeWatchCatalog,
         scope: &crate::scan::scope::NativeDiscoveryScope, changed: Option<&str>, _subtree: bool)
-        -> PyResult<(crate::watch_store::NativeWatchOperations, Vec<DirectoryReadError>)> {
+        -> PyResult<Vec<DirectoryReadError>> {
         py.detach(|| {
             let target = changed.unwrap_or(&scope.root);
             let mut effective = scope.clone();
-            if changed.is_none() || _subtree {
-                effective.exclude_roots(state.lock().runtime.range("owned|".to_owned()..).take_while(|(k,_)| k.starts_with("owned|"))
-                    .filter_map(|(_,v)| v.path().map(str::to_owned)));
-            }
+            effective.exclude_roots(state.output_roots().into_iter());
             let mut options = self.options.clone(); options.scope = Some(effective.clone());
-            let records = if !effective.contains(target) || state.lock().is_owned(target) {
+            let records = if !effective.contains(target) || state.is_owned(target) {
                 DirectoryScanRecords { filtered: Vec::new(), raw: Vec::new(), errors: DirectoryReadErrors::report() }
             } else {
                 match fs::metadata(target) {
@@ -1230,49 +1227,63 @@ impl NativeDirectoryScanOptions {
                 }
             };
             let errors = records.errors.into_messages();
-            let base_prefix = format!("file|{}|", crate::path_keys::path_key(&scope.root));
-            let mut values = Vec::new(); let mut present = HashSet::new();
-            let data = state.lock();
-            for record in records.raw.into_iter().filter(|r| !r.is_dir && scope.contains(&r.path)) {
-                let stem = crate::path_keys::case_key(crate::relations::first_dot_stem(Path::new(&record.path).file_name().unwrap().to_str().unwrap_or_default()));
-                let key = format!("{base_prefix}{stem}|{}", crate::path_keys::path_key(&record.path));
-                present.insert(key.clone());
-                let value = serde_json::to_value(&record).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
-                if data.catalog_file(&scope.root, &record.path).is_none_or(|old|old.size!=record.size || old.mtime_ns!=record.mtime_ns || old.relation_member_eligible!=record.relation_member_eligible) {
-                    values.push(serde_json::json!({"op":"runtime", "key":key,"value":value}));
+            let scope_key = crate::path_keys::path_key(&scope.root);
+            let target_key = crate::path_keys::path_key(target);
+            let mut catalogs = state.catalogs.lock().unwrap_or_else(|e|e.into_inner());
+            let catalog = catalogs.entry(scope_key).or_default();
+            let mut present = HashSet::new();
+            for record in records.raw.into_iter().filter(|r| !r.is_dir && effective.contains(&r.path)) {
+                let key: Arc<str> = Arc::from(crate::path_keys::path_key(&record.path));
+                present.insert(Arc::clone(&key));
+                catalog.buckets.entry(catalog_stem(&record.path)).or_default().insert(Arc::clone(&key));
+                catalog.rows.insert(key, record);
+            }
+            if errors.is_empty() {
+                let removed: Vec<_> = catalog.rows.range::<str,_>((std::ops::Bound::Included(target_key.as_str()),std::ops::Bound::Unbounded))
+                    .take_while(|(key,_)|key.starts_with(&target_key))
+                    .filter(|(key,_)|(key.as_ref() == target_key || key[target_key.len()..].starts_with('\\')) && !present.contains(*key))
+                    .map(|(key,_)|Arc::clone(key)).collect();
+                for key in removed {
+                    if let Some(row) = catalog.rows.remove(&key) {
+                        let stem = catalog_stem(&row.path);
+                        if let Some(bucket) = catalog.buckets.get_mut(&stem) {
+                            bucket.remove(&key);
+                            if bucket.is_empty() { catalog.buckets.remove(&stem); }
+                        }
+                    }
                 }
             }
-            for (key,old) in data.catalog_records(&scope.root,target) {
-                if !present.contains(&key) && errors.is_empty() {
-                    values.push(serde_json::json!({"op":"runtime","key":key}));
-                    if let Some(path)=old.path() { values.push(serde_json::json!({"op":"runtime","key":format!("done|{}",crate::path_keys::path_key(path))})); }
-                }
-            }
-            Ok((crate::watch_store::NativeWatchOperations::from_values(values)?, errors))
+            Ok(errors)
         })
     }
 
     #[pyo3(signature = (state, scope, under=None))]
-    fn catalog_candidates(&self, py: Python<'_>, state: &crate::watch_store::NativeWatchState,
+    fn catalog_candidates(&self, py: Python<'_>, state: &NativeWatchCatalog,
         scope: &crate::scan::scope::NativeDiscoveryScope, under: Option<&str>) -> PyResult<Py<PyList>> {
-        let records = state.lock().catalog_records(&scope.root,under.unwrap_or(&scope.root));
+        let target = crate::path_keys::path_key(under.unwrap_or(&scope.root));
+        let records: Vec<String> = state.catalogs.lock().unwrap_or_else(|e|e.into_inner()).get(&crate::path_keys::path_key(&scope.root))
+            .into_iter().flat_map(|catalog|catalog.rows.range::<str,_>((std::ops::Bound::Included(target.as_str()),std::ops::Bound::Unbounded))
+                .take_while(|(key,_)|key.starts_with(&target))
+                .filter(|(key,_)|key.as_ref() == target || key[target.len()..].starts_with('\\'))
+                .map(|(_,row)|row.path.clone())).collect();
         let values = PyList::empty(py);
-        for (_,record) in records {
-            if let Some(path) = record.path().filter(|p| scope.contains(p)) {
+        for path in &records {
+            if scope.contains(path) && !state.is_owned(path) {
                 if let Some(value) = crate::postprocess::watch_candidate_for_path(py,path,None)? { values.append(value)?; }
             }
         }
         Ok(values.unbind())
     }
 
-    fn catalog_snapshot(&self, py: Python<'_>, state: &crate::watch_store::NativeWatchState,
+    fn catalog_snapshot(&self, py: Python<'_>, state: &NativeWatchCatalog,
         scope: &crate::scan::scope::NativeDiscoveryScope, seed: &str)
         -> PyResult<(Py<NativeDirectorySnapshot>, Py<NativeDirectorySnapshot>)> {
         let mut raw: Vec<DirectoryEntryRecord> = {
-            let data = state.lock();
-            data.catalog_bucket(&scope.root, seed).iter()
-                .filter_map(|value| value.file())
-                .filter(|row| scope.contains(&row.path) && !data.is_owned(&row.path))
+            let data = state.catalogs.lock().unwrap_or_else(|e|e.into_inner());
+            data.get(&crate::path_keys::path_key(&scope.root)).into_iter()
+                .flat_map(|catalog|catalog.buckets.get(&catalog_stem(seed)).into_iter().flatten()
+                    .filter_map(|key|catalog.rows.get(key)))
+                .filter(|row|scope.contains(&row.path) && !state.is_owned(&row.path))
                 .cloned().collect()
         };
         let root = Path::new(&scope.root);
@@ -3018,4 +3029,48 @@ pub(crate) fn scope_file_paths(scope: &crate::scan::scope::NativeDiscoveryScope)
     options.scope=Some(scope.clone());
     let records = scan_directory_views(&scope.root,scope.max_depth,&options)?;
     Ok((records.raw.into_iter().filter(|r| !r.is_dir).map(|r| PathBuf::from(r.path)).collect(),records.errors.into_messages()))
+}
+
+
+#[derive(Default)]
+struct ScopeCatalog {
+    rows: std::collections::BTreeMap<Arc<str>, DirectoryEntryRecord>,
+    buckets: HashMap<String, HashSet<Arc<str>>>,
+}
+
+fn catalog_stem(path: &str) -> String {
+    crate::path_keys::case_key(crate::relations::first_dot_stem(
+        Path::new(path).file_name().and_then(|name|name.to_str()).unwrap_or_default()))
+}
+
+/// Rebuilt once at Watch startup; file rows and bucket updates never enter the WAL.
+#[pyclass(module = "sunpack_native")]
+pub(crate) struct NativeWatchCatalog {
+    catalogs: Mutex<HashMap<String, ScopeCatalog>>,
+    outputs: Arc<Mutex<crate::watch_store::StateData>>,
+}
+
+#[pymethods]
+impl NativeWatchCatalog {
+    #[new]
+    fn new(outputs: PyRef<'_, crate::watch_store::NativeWatchState>) -> Self {
+        Self { catalogs: Mutex::new(HashMap::new()), outputs: Arc::clone(&outputs.data) }
+    }
+}
+
+impl NativeWatchCatalog {
+    fn output_roots(&self) -> Vec<String> {
+        self.outputs.lock().unwrap_or_else(|e|e.into_inner()).runtime.values()
+            .filter_map(|value|value["path"].as_str().map(str::to_owned)).collect()
+    }
+    fn is_owned(&self, path: &str) -> bool {
+        let key = crate::path_keys::path_key(path);
+        let mut current = key.trim_end_matches('\\');
+        let data = self.outputs.lock().unwrap_or_else(|e|e.into_inner());
+        loop {
+            if data.runtime.contains_key(&format!("owned|{current}")) { return true; }
+            let Some((parent,_)) = current.rsplit_once('\\') else { return false; };
+            current = parent;
+        }
+    }
 }

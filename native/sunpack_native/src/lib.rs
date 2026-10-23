@@ -116,10 +116,10 @@ fn sunpack_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m
     )?)?;
     m.add_class::<io::reader::NativeArchiveSession>()?;
-    m.add_function(wrap_pyfunction!(postprocess::flatten_leaf, m)?)?;
     m.add_class::<scan::scope::NativeDiscoveryScope>()?;
     m.add_function(wrap_pyfunction!(scan::scope::create_output_root, m)?)?;
     m.add_class::<scan::directory::NativeDirectorySnapshot>()?;
+    m.add_class::<scan::directory::NativeWatchCatalog>()?;
     m.add_class::<scan::directory::NativeDirectoryScanOptions>()?;
     m.add_class::<scan::discovery::NativeCandidateTable>()?;
     m.add_class::<scan::discovery::NativeDiscoveryRoutes>()?;
@@ -137,9 +137,7 @@ fn sunpack_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(filesystem::watch_broker_release, m)?)?;
     m.add_function(wrap_pyfunction!(filesystem::watch_volume_cursor, m)?)?;
     m.add_function(wrap_pyfunction!(filesystem::watch_path_identity, m)?)?;
-    m.add_function(wrap_pyfunction!(filesystem::watch_identity_path, m)?)?;
-    m.add_class::<filesystem::NativeWatchChangeBatch>()?;
-    m.add_function(wrap_pyfunction!(filesystem::watch_volume_changes, m)?)?;
+    m.add_function(wrap_pyfunction!(filesystem::watch_root_changes, m)?)?;
     m.add_function(wrap_pyfunction!(scan::magic::scan_magics_anywhere, m)?)?;
     m.add_function(wrap_pyfunction!(analysis_native::probe_volume_anchors, m)?)?;
     m.add_function(wrap_pyfunction!(scan::embedded::scan_embedded_archives, m)?)?;

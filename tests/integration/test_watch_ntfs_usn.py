@@ -94,78 +94,7 @@ def test_exclusive_readiness_waits_for_open_writer(tmp_path):
     assert sunpack_native.watch_file_is_ready(str(archive))
 
 
-def test_volume_recovery_pages_scopes_moves_and_replays_failed_commit(tmp_path, monkeypatch):
-    """Catch lost Journal prefixes and per-root rereads with one real volume.
 
-    File observation tests cannot detect either recovery fault. One batch corpus
-    also covers deep moves, shallow exclusion and replay after a WAL failure.
-    """
-    from sunpack.runtime.watch.roots import WatchRootEntry
-    from sunpack.core.support.path_keys import path_key
-
-    first, second = tmp_path / "recursive", tmp_path / "shallow"
-    first.mkdir()
-    second.mkdir()
-    incoming = tmp_path / "incoming"
-    incoming.mkdir()
-    carried = incoming / "already-present.opaque"
-    carried.write_bytes(b"x")
-    vanished = first / "deleted.opaque"
-    vanished.write_bytes(b"x")
-    watcher = WatchScheduler(make_config({"filesystem": {"scan_filters_enabled": False}}),
-        [str(first), str(second)], root_entries=[
-            WatchRootEntry(str(first), str(first), recursive=True),
-            WatchRootEntry(str(second), str(second), recursive=False)],
-        state_path=str(tmp_path / "state" / "state.json"),
-        pipeline_engine=FakePipelineEngine(lambda _config: None))
-    try:
-        watcher._scan_candidates([str(first), str(second)], recursive=True)
-        watcher._prepare_usn_startup_baseline()
-        volume, journal_id, start = sunpack_native.watch_volume_cursor(str(first))
-        deep = first / ("deep-" + "x" * 80)
-        deep.mkdir()
-        expected = set()
-        for index in range(600):
-            path = deep / f"part{index:04d}.disguised"
-            path.write_bytes(b"x")
-            expected.add(path_key(str(path)))
-        moved = first / "moved"
-        incoming.rename(moved)
-        expected.add(path_key(str(moved / carried.name)))
-        allowed = second / "allowed.opaque"
-        allowed.write_bytes(b"x")
-        expected.add(path_key(str(allowed)))
-        excluded = second / "deeper"
-        excluded.mkdir()
-        (excluded / "outside-scope.opaque").write_bytes(b"x")
-        vanished.unlink()
-        _, _, end = sunpack_native.watch_volume_cursor(str(first))
-        scopes = [scope.native for scope in watcher.scopes.values()]
-        cursor, pages, seen = start, 0, set()
-        while cursor < end:
-            batch = sunpack_native.watch_volume_changes(volume, cursor, end)
-            assert batch.journal_id == journal_id
-            assert cursor < batch.next_usn <= end
-            seen.update(path_key(path) for path, _ in batch.paths_for_scopes(scopes))
-            cursor = batch.next_usn
-            pages += 1
-        assert pages > 1
-        assert expected - {path_key(str(moved / carried.name))} <= seen
-        assert path_key(str(vanished)) in seen
-        assert path_key(str(excluded / "outside-scope.opaque")) not in seen
-
-        saved = watcher.state.watch_cursor(volume)
-        with monkeypatch.context() as patch:
-            patch.setattr(watcher.state, "queue_recovery_batch", lambda *a, **k: (_ for _ in ()).throw(OSError("WAL unavailable")))
-            watcher._recover_usn_startup_gap()
-        assert watcher.state.watch_cursor(volume) == saved
-        watcher._recover_usn_startup_gap()
-        queued = {path_key(item.path) for item in watcher.state.pending_work_items()}
-        assert queued == expected
-        assert watcher.state.watch_cursor(volume)["next_usn"] >= end
-        assert not watcher.state._native.runtime_keys("file|" + path_key(str(first)) + "|deleted|")
-    finally:
-        watcher.state.close()
 
 
 def test_duplicate_noise_does_not_restart_generation_but_overwrite_does(tmp_path):

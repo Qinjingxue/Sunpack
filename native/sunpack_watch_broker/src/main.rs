@@ -357,9 +357,9 @@ fn request_shape_is_valid(request: &Request) -> bool {
                 && request.previous_usn > 0
                 && request.current_usn > request.previous_usn
         }
-        Opcode::ReadVolumeChanges => {
+        Opcode::ReadRootChanges => {
             !request.volume_guid.is_empty()
-                && request.file_id_len == 0
+                && matches!(request.file_id_len, 8 | 16)
                 && request.previous_usn > 0
                 && request.current_usn > request.previous_usn
         }
@@ -450,6 +450,21 @@ impl JournalDispatcher {
     }
 }
 
+fn encode_path_payload(paths: &[String]) -> io::Result<Vec<u8>> {
+    let mut payload = Vec::new();
+    for path in paths {
+        let bytes = path.as_bytes();
+        let length = u32::try_from(bytes.len())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "root recovery path is too long"))?;
+        payload.extend_from_slice(&length.to_le_bytes());
+        payload.extend_from_slice(bytes);
+    }
+    if payload.len() > 64 * 1024 {
+        return Err(io::Error::other("USN root recovery exceeded payload budget"));
+    }
+    Ok(payload)
+}
+
 fn handle_request(journals: &JournalDispatcher, request: Request) -> (Response, Vec<u8>) {
     let mut response = Response::ok(request.request_id);
     let mut payload = Vec::new();
@@ -475,17 +490,25 @@ fn handle_request(journals: &JournalDispatcher, request: Request) -> (Response, 
                     )
             })
             .map(|(journal_id, reasons)| (journal_id, 0, reasons)),
-        Opcode::ReadVolumeChanges => journals
+        Opcode::ReadRootChanges => journals
             .reader_for(&request.volume_guid)
             .and_then(|journal| {
                 journal.lock().map_err(|_| io::Error::other("journal state poisoned"))?
-                    .read_volume_changes(&request.volume_guid, request.previous_usn, request.current_usn)
+                    .read_root_changes(
+                        &request.volume_guid,
+                        &request.file_id,
+                        request.file_id_len,
+                        request.previous_usn,
+                        request.current_usn,
+                    )
             })
-            .and_then(|batch| {
-                payload = batch.encode()?;
-                Ok((batch.journal_id, batch.next_usn, sunpack_usn_core::ChangeReasons {
-                    all: payload.len() as u32, without_close: batch.changes.len() as u32,
-                }))
+            .and_then(|paths| {
+                payload = encode_path_payload(&paths)?;
+                let bytes = u32::try_from(payload.len())
+                    .map_err(|_| io::Error::other("USN root recovery payload is too large"))?;
+                let count = u32::try_from(paths.len())
+                    .map_err(|_| io::Error::other("too many USN root changes"))?;
+                Ok((0, 0, sunpack_usn_core::ChangeReasons { all: bytes, without_close: count }))
             }),
     };
     match result {

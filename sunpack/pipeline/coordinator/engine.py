@@ -6,7 +6,6 @@ import copy
 import asyncio
 import os
 import stat
-import threading
 import time
 import uuid
 from dataclasses import dataclass, replace
@@ -90,7 +89,7 @@ class PipelineEngine:
         self._runtime = self._services
         self._active_requests: dict[str, asyncio.Task] = {}
         self._request_runtime_factory = _RequestRuntime
-        self._path_leases = _PathLeaseRegistry(self.output_ownership)
+        self._path_leases = _PathLeaseRegistry()
         self._recent_passwords: list[str] = []
         self._user_passwords = tuple(config.get("user_passwords", []) or [])
         self._password_snapshot = config.get("password_snapshot")
@@ -102,9 +101,7 @@ class PipelineEngine:
         self._state_changed_callback: Callable[[], None] | None = None
         self._broker.set_state_changed_callback(self._notify_state_changed)
 
-    @property
-    def output_ownership(self):
-        return self._services.output_ownership
+
 
     @property
     def recent_passwords(self) -> list[str]:
@@ -117,8 +114,8 @@ class PipelineEngine:
     def is_idle(self) -> bool:
         return not self._active_requests and self._broker.pending_jobs == 0 and self._broker.active_jobs == 0
 
-    def completed_watch_family_output(self, path: str, *, deep_detect: bool = False, policy: str = "") -> str:
-        return self._path_leases.completed_watch_family_output(path, deep_detect=deep_detect, policy=policy)
+    def completed_watch_family_output(self, path: str, *, deep_detect: bool = False) -> str:
+        return self._path_leases.completed_watch_family_output(path, deep_detect=deep_detect)
 
     def set_state_changed_callback(self, callback: Callable[[], None] | None) -> None:
         self._state_changed_callback = callback
@@ -250,21 +247,21 @@ class PipelineEngine:
             try:
                 await resource_scope.aclose()
             finally:
-                try:
-                    await self._broker.run("output_commit", submission.request_id,
-                        self._services.output_ownership.finish, submission.request_id, request_id=submission.request_id)
-                finally:
-                    self._services.output_reservations.release(submission.request_id)
-                    await self._path_leases.release(submission.request_id)
-                    self._active_requests.pop(submission.request_id, None)
-                    CURRENT_ORIGIN.reset(origin_marker)
-                    self._notify_state_changed()
+                self._services.output_reservations.release(submission.request_id)
+                await self._path_leases.release(submission.request_id)
+                self._active_requests.pop(submission.request_id, None)
+                CURRENT_ORIGIN.reset(origin_marker)
+                self._notify_state_changed()
 
     async def clear_runtime_caches(self) -> dict:
         """Clear process-wide runtime caches only while this engine is idle."""
 
         if not self.is_idle():
             return {"skipped": "engine_busy"}
+
+        # This registry belongs to the asyncio loop, not the broker worker.
+        completed_watch = len(self._path_leases._completed_watch_generations)
+        self._path_leases._completed_watch_generations.clear()
 
         def clear() -> dict:
             from sunpack.core.support.runtime_cache_cleanup import (
@@ -274,6 +271,7 @@ class PipelineEngine:
 
             before = runtime_cache_stats()
             cleared = clear_all_runtime_caches()
+            cleared["completed_watch_generations"] = completed_watch
             if self._services is not None:
                 cleared["output_reservations"] = self._services.output_reservations.clear_idle_cache()
             after = runtime_cache_stats()
@@ -393,10 +391,9 @@ def _lease_ownership_version(
 
 
 class _PathLeaseRegistry:
-    def __init__(self, output_ownership=None):
-        self.output_ownership = output_ownership
-        if output_ownership is not None:
-            output_ownership.input_leases = self
+    _COMPLETED_WATCH_LIMIT = 4096
+
+    def __init__(self):
         self._owned: dict[str, set[str]] = {}
         self._lease_paths: dict[str, dict[str, _LeasePath]] = {}
         self._exact_owners: dict[str, str] = {}
@@ -411,28 +408,16 @@ class _PathLeaseRegistry:
             tuple[tuple[tuple[str, int, int, int, int], ...], bool],
             str,
         ] = {}
+        self._completed_watch_generations: dict[
+            tuple[tuple[str, ...], bool],
+            tuple[tuple[tuple[str, int, int, int, int], ...], str],
+        ] = {}
         self._waiters_by_blocker: dict[str, set[asyncio.Future[None]]] = {}
         self._waiter_blockers: dict[
             asyncio.Future[None],
             frozenset[str],
         ] = {}
-        # Publication shares a short gate with worker-thread output intents.
-        # Filesystem snapshots and waiter suspension always happen outside it.
-        self._lock = output_ownership.gate if output_ownership is not None else threading.RLock()
-
-    @staticmethod
-    def output_path(path: str) -> _LeasePath:
-        return replace(_snapshot_lease_path(path), is_dir=True)
-
-    def output_conflicts(self, owner: str, path: _LeasePath) -> bool:
-        # Caller holds the shared publication gate; reuse the lease indexes.
-        return bool(self._blocking_owners(owner, (path,)))
-
-    def _check_watch_inputs(self, paths, external_watch: bool) -> None:
-        if external_watch and self.output_ownership is not None:
-            for path in paths:
-                if self.output_ownership.protected(path.path):
-                    raise _ProtectedWatchInput(path.path)
+        self._lock = asyncio.Lock()
 
     def _snapshot_paths(
         self,
@@ -465,17 +450,13 @@ class _PathLeaseRegistry:
             prepared[key] = _snapshot_lease_path(normalized)
         return tuple(prepared.values())
 
-    async def acquire(self, owner: str, paths: Iterable[str], *, lease_id: object = None,
-                      external_watch: bool = False) -> None:
-        if external_watch and self.output_ownership is not None:
-            self.output_ownership.state_for()
+    async def acquire(self, owner: str, paths: Iterable[str], *, lease_id: object = None) -> None:
         prepared = self._snapshot_paths(paths, refresh=False)
         # The caller has finished its previous extraction/verification attempt.
         # Other jobs in this request keep their pins throughout an upgrade.
         first = True
         while True:
-            with self._lock:
-                self._check_watch_inputs(prepared, external_watch)
+            async with self._lock:
                 if first:
                     self._unpin(owner, lease_id)
                     first = False
@@ -498,7 +479,7 @@ class _PathLeaseRegistry:
             try:
                 await waiter
             except BaseException:
-                with self._lock:
+                async with self._lock:
                     self._unregister_waiter(waiter)
                 raise
 
@@ -519,7 +500,7 @@ class _PathLeaseRegistry:
         return idle
 
     async def release_lease(self, owner: str, lease_id: object) -> None:
-        with self._lock:
+        async with self._lock:
             if self._remove_paths(owner, self._unpin(owner, lease_id)):
                 self._wake_waiters_for(owner)
 
@@ -530,7 +511,6 @@ class _PathLeaseRegistry:
         *,
         coalesce_exact: bool = False,
         deep_detect: bool = False,
-        external_watch: bool = False,
     ) -> str | None:
         """Atomically claim a fully resolved physical input set.
 
@@ -544,15 +524,12 @@ class _PathLeaseRegistry:
         physical ownership, the later request can coalesce with the active one
         instead of waiting and extracting the same logical archive twice.
         """
-        if external_watch and self.output_ownership is not None:
-            self.output_ownership.state_for()
         prepared = self._snapshot_paths(paths, refresh=coalesce_exact)
         ownership_version = _lease_ownership_version(prepared) if coalesce_exact else ()
         release_previous = True
 
         while True:
-            with self._lock:
-                self._check_watch_inputs(prepared, external_watch)
+            async with self._lock:
                 if release_previous:
                     release_previous = False
                     if self._remove_owner(owner):
@@ -576,12 +553,12 @@ class _PathLeaseRegistry:
             try:
                 await waiter
             except BaseException:
-                with self._lock:
+                async with self._lock:
                     self._unregister_waiter(waiter)
                 raise
 
     async def release(self, owner: str) -> None:
-        with self._lock:
+        async with self._lock:
             if self._remove_owner(owner):
                 self._wake_waiters_for(owner)
 
@@ -619,19 +596,60 @@ class _PathLeaseRegistry:
             return departed_version
         return ()
 
-    def completed_watch_output(self, ownership_version, *, deep_detect=False, policy="") -> str:
-        if self.output_ownership is None:
+    def completed_watch_output(
+        self,
+        ownership_version: tuple[tuple[str, int, int, int, int], ...],
+        *,
+        deep_detect: bool = False,
+    ) -> str:
+        """Return the prior output only for the exact unchanged physical generation."""
+        if not ownership_version:
             return ""
-        return self.output_ownership.completed_output(ownership_version, deep_detect=deep_detect, policy=policy)
+        key = (tuple(row[0] for row in ownership_version), deep_detect)
+        record = self._completed_watch_generations.get(key)
+        if record is None:
+            return ""
+        recorded_version, output_dir = record
+        if recorded_version != ownership_version:
+            return ""
+        if not output_dir or not os.path.isdir(output_dir):
+            self._completed_watch_generations.pop(key, None)
+            return ""
+        # Refresh insertion order so the bounded map behaves as a tiny LRU.
+        self._completed_watch_generations.pop(key, None)
+        self._completed_watch_generations[key] = record
+        return output_dir
 
-    def completed_watch_family_output(self, path: str, *, deep_detect=False, policy="") -> str:
-        if self.output_ownership is None:
-            return ""
-        record = self.output_ownership.completion_for(path)
-        if record is None or not record.get("generation"):
-            return ""
-        version = self.input_version_for(row[0] for row in record["generation"])
-        return self.completed_watch_output(version, deep_detect=deep_detect, policy=policy)
+    def completed_watch_family_output(self, path: str, *, deep_detect: bool = False) -> str:
+        """Check a late failure against the complete successful physical family."""
+        member_key = path_key(os.path.abspath(os.path.normpath(path)))
+        for (members, mode), (recorded_version, _) in self._completed_watch_generations.items():
+            if mode != deep_detect or member_key not in members:
+                continue
+            # Missing members invalidate this lookup, even when the failed
+            # request's individual member has not changed. Do not reuse a
+            # departed generation here: it could conceal a real missing part.
+            current_version = self.input_version_for(members)
+            if current_version == recorded_version:
+                return self.completed_watch_output(current_version, deep_detect=deep_detect)
+        return ""
+
+    def remember_completed_watch(
+        self,
+        ownership_version: tuple[tuple[str, int, int, int, int], ...],
+        output_dir: str,
+        *,
+        deep_detect: bool = False,
+    ) -> None:
+        if not ownership_version or not output_dir:
+            return
+        key = (tuple(row[0] for row in ownership_version), deep_detect)
+        record = (ownership_version, os.path.abspath(os.path.normpath(output_dir)))
+        self._completed_watch_generations.pop(key, None)
+        self._completed_watch_generations[key] = record
+        while len(self._completed_watch_generations) > self._COMPLETED_WATCH_LIMIT:
+            oldest = next(iter(self._completed_watch_generations))
+            self._completed_watch_generations.pop(oldest, None)
 
     def _blocking_owners(
         self,
@@ -799,8 +817,6 @@ class _PipelineServices:
         self.config = config
         self.broker = broker
         self.output_reservations = OutputReservationRegistry()
-        from sunpack.pipeline.coordinator.output_ownership import OutputOwnership
-        self.output_ownership = OutputOwnership(config)
         worker_config = _worker_config(config)
         self.sevenzip_runner = SevenZipRunner(worker_config)
         self._automatic_stage_capacity = int(worker_config.get("stage_thread_capacity", 0) or 0) == 0
@@ -814,7 +830,6 @@ class _PipelineServices:
 
     async def close(self, broker: AsyncWorkBroker) -> None:
         await self.sevenzip_runner.aclose()
-        await broker.run("runtime_state_close", "engine", self.output_ownership.close, request_id="engine")
 
         def close_services() -> None:
             from sunpack.core.support.runtime_cache_cleanup import clear_all_runtime_caches
@@ -1106,7 +1121,7 @@ class _RequestRuntime:
             progress_reporter=self.reporter,
             request_id=submission.request_id,
             origin=submission.origin,
-            output_ownership=services.output_ownership,
+            output_reservations=services.output_reservations,
         )
         self.recursion = self._new_recursion()
         self._active_task_keys: set[str] = set()
@@ -1122,7 +1137,7 @@ class _RequestRuntime:
                 callback(task, dict(event))
             except Exception:
                 lifecycle_event = str(event.get("event") or "") in {
-                    "task_sources_claimed",
+                    "task_sources_claimed", "task_output_started", "task_output_finished",
                 }
                 if getattr(self.submission, "origin", "") == "watch" and lifecycle_event:
                     # Source claims still arbitrate concurrent Watch admission.
@@ -1305,29 +1320,20 @@ class _RequestRuntime:
             self.context.policy_skips.extend(authorization.skipped)
         tasks = self._claim_tasks(candidates)
 
-        if self.submission.origin == "watch" and depth == 1:
-            while tasks:
-                member_paths = [path for task in tasks for path in (task.all_parts or [task.main_path])]
-                try:
-                    coalesced_owner = await self.path_leases.replace(
-                        self.submission.request_id, member_paths, coalesce_exact=True,
-                        deep_detect=self.submission.detection_options.force_scan,
-                        external_watch=not self.config.get("watch_internal_recovery", False),
-                    )
-                except _ProtectedWatchInput as protected:
-                    admitted = []
-                    for task in tasks:
-                        if any(path_key(path) == path_key(protected.path)
-                               for path in (task.all_parts or [task.main_path])):
-                            with self.context.lock:
-                                self._active_task_keys.discard(str(task.key or task.main_path))
-                        else:
-                            admitted.append(task)
-                    tasks = admitted
-                    continue
-                if coalesced_owner:
-                    raise _CoalescedWatchRequest(coalesced_owner)
-                break
+        if self.submission.origin == "watch" and depth == 1 and tasks:
+            member_paths = [
+                path
+                for task in tasks
+                for path in (task.all_parts or [task.main_path])
+            ]
+            coalesced_owner = await self.path_leases.replace(
+                self.submission.request_id,
+                member_paths,
+                coalesce_exact=True,
+                deep_detect=self.submission.detection_options.force_scan,
+            )
+            if coalesced_owner:
+                raise _CoalescedWatchRequest(coalesced_owner)
 
         # This registration is deliberately only a source-cleanup lifetime
         # guard. It never gates planning, extraction, verification or recursion.
@@ -1529,9 +1535,6 @@ class _RequestRuntime:
                     except OSError:
                         pass
                 if not os.path.exists(output_dir):
-                    if watch_version:
-                        await broker.run("output_consumed", task_key, self.services.output_ownership.consume_output,
-                            watch_version, request_id=self.submission.request_id)
                     ownership.forget_output(output_dir)
                     cleared = replace(result, output_dir="")
                     self._replace_target_result(result, cleared)
@@ -1559,17 +1562,14 @@ class _RequestRuntime:
                 ownership.relocate_outputs(flattened)
 
             if watch_version and outcome.outcome_kind == OutcomeKind.COMPLETE_SUCCESS and output_dir:
-                await broker.run("output_complete", task_key, self.services.output_ownership.remember_completed,
+                self.path_leases.remember_completed_watch(
                     watch_version, output_dir,
                     deep_detect=self.submission.detection_options.force_scan,
-                    policy=self.config.get("watch_policy", ""), request_id=self.submission.request_id,
                 )
 
             if output_dir:
                 self._shell_updates.add([output_dir])
             return subtree_complete
-        except _ProtectedWatchInput:
-            return True
         except _CompletedWatchOutput as reused:
             result = TargetRunResult(
                 input_path=task.main_path, outcome_kind=OutcomeKind.COMPLETE_SUCCESS,
@@ -1583,12 +1583,8 @@ class _RequestRuntime:
             ownership.remember_results([result])
             active_output = task.runtime.pop("watch_active_output", None)
             if active_output is not None:
-                await broker.run("output_seal", task.key or task.main_path, self.services.output_ownership.seal,
-                    active_output[1], succeeded=False,
-                    watch_owner=self.config.get("watch_owner_path", ""), task_path=active_output[0],
-                    request_id=self.submission.request_id)
                 self.extractor.emit_semantic_event(
-                    task, "task_output_finished",
+                    task, "task_output_finished", critical=True,
                     task_path=active_output[0], output_dir=active_output[1], keep_output=False,
                 )
             return True
@@ -1652,6 +1648,8 @@ class _RequestRuntime:
         if self.submission.origin != "watch" or depth != 1:
             return ()
         part_paths = tuple(task.archive_input().part_paths())
+        if len(part_paths) < 2:
+            return ()
         return self.path_leases.ownership_version_for(
             self.submission.request_id,
             part_paths,
@@ -1734,12 +1732,6 @@ class _RequestRuntime:
             })
 
         def promote():
-            output_ownership = self.services.output_ownership
-            from sunpack_native import watch_path_identity
-            for source, target in zip(sources, destinations):
-                volume, identity, _ = watch_path_identity(source)
-                output_ownership.begin(target, self.submission.request_id, identities=[f"{volume}|{identity}"],
-                    persistent=self.submission.origin == "watch")
             with promotion_barrier(
                 sources, cache_releasers=(release_archive_sessions_under_roots,), quiesce=False,
             ):
@@ -1782,8 +1774,6 @@ class _RequestRuntime:
 
     async def _flatten_output(self, task, output_dir: str, *, broker, cancellation) -> DirectoryFlattenResult:
         def flatten():
-            work_path = self.services.output_ownership.prepare_flatten(output_dir, self.submission.request_id,
-                                                                        self.services.output_reservations)
             with promotion_barrier(
                 [output_dir],
                 cache_releasers=(release_archive_sessions_under_roots,),
@@ -1792,8 +1782,10 @@ class _RequestRuntime:
                 result = _postprocess_actions_factory(
                     self.config,
                     stdout=self.submission.stdout,
-                ).flattener.flatten_dirs(output_dir, work_path=work_path)
-            self.services.output_ownership.seal(result.output_dir, succeeded=not result.errors)
+                ).flattener.flatten_dirs(output_dir)
+            outputs = self.services.output_reservations.watch_outputs
+            if outputs is not None:
+                outputs.replace(output_dir, result.output_dir)
             return result
 
         try:
@@ -1824,11 +1816,7 @@ class _RequestRuntime:
             self.path_leases.input_version_for(paths)
             if self.submission.origin == "watch" and depth == 1 and len(paths) > 1 else ()
         )
-        await self.path_leases.acquire(
-            self.submission.request_id, paths, lease_id=id(task),
-            external_watch=(self.submission.origin == "watch" and depth == 1
-                            and not self.config.get("watch_internal_recovery", False)),
-        )
+        await self.path_leases.acquire(self.submission.request_id, paths, lease_id=id(task))
         if self.submission.origin == "watch" and depth == 1 and len(paths) > 1:
             # A missing-volume retry can replace its input set while awaiting
             # this lease. Check the final physical generation after acquisition.
@@ -1836,7 +1824,6 @@ class _RequestRuntime:
             task.runtime["source_generation"] = version
             completed = self.path_leases.completed_watch_output(
                 version, deep_detect=self.submission.detection_options.force_scan,
-                policy=self.config.get("watch_policy", ""),
             )
             if completed:
                 raise _CompletedWatchOutput(completed)
@@ -1869,9 +1856,7 @@ class _CompletedWatchOutput(Exception):
         self.output_dir = output_dir
 
 
-class _ProtectedWatchInput(Exception):
-    def __init__(self, path: str):
-        self.path = path
+
 
 
 def _should_promote_blocked_input(depth: int, outcome: OutcomeKind, failure: FailureInfo | None) -> bool:

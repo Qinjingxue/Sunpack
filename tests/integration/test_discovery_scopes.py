@@ -14,7 +14,9 @@ from sunpack.core.contracts.discovery_scope import DiscoveryScope
 from sunpack.pipeline.coordinator.engine import PipelineEngine
 from sunpack.pipeline.coordinator.scan_session import DiscoveryScanSession
 from sunpack.pipeline.coordinator.task_provider import ArchiveTaskProvider
-from sunpack.pipeline.coordinator.output_ownership import OutputOwnership
+from sunpack.runtime.watch.output_roots import WatchOutputRoots
+from sunpack.runtime.watch.state import WatchStateStore
+from sunpack_native import NativeWatchCatalog
 from sunpack.pipeline.discovery.filesystem.directory_scanner import DirectoryScanner
 from sunpack.runtime.watch.roots import WatchRootEntry
 from tests.helpers.config_factory import make_config
@@ -62,90 +64,10 @@ def test_cross_directory_parts_share_one_scope_and_execute_beside_entry(tmp_path
     assert marker.read_text(encoding="utf-8") == case.marker_text
 
 
-def test_catalog_and_output_identity_survive_restart_and_do_not_inherit_names(tmp_path, monkeypatch):
-    import sunpack.runtime.watch.service as service
-    root = tmp_path / "input"
-    root.mkdir()
-    (root / "sample.part1.fake").write_bytes(b"external")
-    monkeypatch.setattr(service, "_read_watch_root_entries", lambda: [WatchRootEntry(str(root), recursive=True)])
-    config = make_config({"watch": {"state_dir": str(tmp_path / "state")}})
-    owner = OutputOwnership(config)
-    store = owner.state_for()
-    scope = DiscoveryScope(str(root), recursive=True)
-    options = DirectoryScanner.compile_scan_options(config)
-    operations, errors = options.catalog_update(store._native, scope.native)
-    assert not errors
-    store.commit_runtime(operations, durable=True)
-    generated = root / "generated"
-    owner.begin(str(generated), "request")
-    (generated / "sample.part2.fake").write_bytes(b"generated")
-    operations, errors = options.catalog_update(store._native, scope.native)
-    assert not errors
-    store.commit_runtime(operations, durable=True)
-    _, raw = options.catalog_snapshot(store._native, scope.native, str(root / "sample.part1.fake"))
-    assert raw.file_columns()[0] == [str(root / "sample.part1.fake")]
-    owner.begin(str(generated / "inner"), "request")
-    owner.seal(str(generated / "inner"), succeeded=True)
-    owner.seal(str(generated), succeeded=True)
-    owner.finish("request")
-    assert len(store._native.runtime_keys("owned|")) == 1
-    relocated = root / "moved"
-    generated.rename(relocated)
-    owner.relocate(str(generated), str(relocated))
-    generated.mkdir()
-    assert not owner.protected(str(generated / "new.zip"))
-    assert owner.protected(str(relocated / "sample.part2.fake"))
-    owner.close()
-    restarted = OutputOwnership(config)
-    try:
-        assert restarted.protected(str(relocated / "sample.part2.fake"))
-        shutil.rmtree(relocated)
-        relocated.mkdir()
-        restarted.reconcile(str(relocated))
-        assert not restarted.protected(str(relocated / "new.zip"))
-    finally:
-        restarted.close()
 
 
-def test_interrupted_output_recovery_is_identity_safe_and_releases_failed_owner(tmp_path, monkeypatch):
-    """Path-only Watch recovery cannot catch replaced directories or failed WAL finish."""
-    import sunpack.runtime.watch.service as service
-    from sunpack.pipeline.coordinator.engine import _PathLeaseRegistry
-    root = tmp_path / "input"
-    root.mkdir()
-    monkeypatch.setattr(service, "_read_watch_root_entries", lambda: [WatchRootEntry(str(root), recursive=True)])
-    config = make_config({"watch": {"state_dir": str(tmp_path / "state")}})
-    owner = OutputOwnership(config)
-    partial, replaced, complete = (root / name for name in ("partial", "replaced", "complete"))
-    owner.begin(str(partial), "crashed")
-    owner.begin(str(replaced), "crashed")
-    (partial / "payload").write_bytes(b"partial")
-    replaced.rename(root / "moved-partial")
-    replaced.mkdir()
-    (replaced / "user-file").write_bytes(b"keep")
-    owner.begin(str(complete), "crashed")
-    owner.seal(str(complete), succeeded=True)
-    owner.close()
-    owner = OutputOwnership(config)
-    registry = _PathLeaseRegistry(owner)
-    try:
-        store = owner.state_for()
-        assert not partial.exists()
-        assert (replaced / "user-file").read_bytes() == b"keep"
-        assert not owner.recoverable_output(str(replaced))
-        assert owner.recoverable_output(str(complete))
-        owner.begin(str(root / "failed-finish"), "finished")
-        with monkeypatch.context() as patch:
-            def fail_commit(*_args, **_kwargs):
-                raise OSError("WAL unavailable")
-            patch.setattr(store, "commit_runtime", fail_commit)
-            with pytest.raises(OSError, match="WAL unavailable"):
-                owner.finish("finished")
-        assert "finished" not in owner._active_owners
-    finally:
-        owner.close()
-    assert owner.input_leases is None and owner._state is None
-    assert registry.output_ownership is owner
+
+
 
 
 def test_targeted_catalog_updates_preserve_original_depth_pruning_and_conflicts(tmp_path):
@@ -162,59 +84,28 @@ def test_targeted_catalog_updates_preserve_original_depth_pruning_and_conflicts(
     options = NativeDirectoryScanOptions([], ["skip"], [], ["same.blocked"], [], [], [])
     scope = DiscoveryScope(str(root), max_depth=1)
     state = WatchStateStore(str(tmp_path / "state.json"))
+    catalog = NativeWatchCatalog(state._native)
     try:
         for target in (str(root / "child"), str(root / "skip"), str(paths[-1])):
-            operations, errors = options.catalog_update(state._native, scope.native, target, True)
+            errors = options.catalog_update(catalog, scope.native, target, True)
             assert not errors
-            state.commit_runtime(operations)
-        operations, errors = options.catalog_update(state._native, scope.native, str(paths[0]))
+        errors = options.catalog_update(catalog, scope.native, str(paths[0]))
         assert not errors
-        state.commit_runtime(operations)
-        filtered, raw = options.catalog_snapshot(state._native, scope.native, str(paths[0]))
+        filtered, raw = options.catalog_snapshot(catalog, scope.native, str(paths[0]))
         assert set(raw.file_columns()[0]) == {str(paths[i]) for i in (0, 1, 4)}
         assert set(filtered.file_columns()[0]) == {str(paths[i]) for i in (0, 1)}
         narrower = DiscoveryScope(str(root), recursive=True, excluded_subtrees=[str(root / "child")])
-        _, raw = options.catalog_snapshot(state._native, narrower.native, str(paths[0]))
+        _, raw = options.catalog_snapshot(catalog, narrower.native, str(paths[0]))
         assert set(raw.file_columns()[0]) == {str(paths[0]), str(paths[-1])}
-        operations, errors = options.catalog_update(state._native, scope.native, str(paths[3]))
+        errors = options.catalog_update(catalog, scope.native, str(paths[3]))
         assert not errors
-        state.commit_runtime(operations)
-        _, raw = options.catalog_snapshot(state._native, scope.native, str(paths[0]))
+        _, raw = options.catalog_snapshot(catalog, scope.native, str(paths[0]))
         assert str(paths[3]) not in raw.file_columns()[0]
     finally:
         state.close()
 
 
-def test_flatten_crash_retains_payload_at_each_rename_boundary(tmp_path, monkeypatch):
-    """Extraction-abort tests do not cover completed data between flatten renames."""
-    import sunpack.runtime.watch.service as service
-    from sunpack.core.support.output_reservation import OutputReservationRegistry
-    for phase in range(3):
-        watch = tmp_path / str(phase)
-        watch.mkdir()
-        monkeypatch.setattr(service, "_read_watch_root_entries", lambda: [WatchRootEntry(str(watch), recursive=True)])
-        config = make_config({"watch": {"state_dir": str(tmp_path / f"state-{phase}")}})
-        owner = OutputOwnership(config)
-        root = watch / "generated"
-        owner.begin(str(root), "request")
-        leaf = root / "wrapper" / "payload"
-        leaf.mkdir(parents=True)
-        (leaf / "marker.txt").write_text("complete", encoding="utf-8")
-        owner.seal(str(root), succeeded=True)
-        work = Path(owner.prepare_flatten(str(root), "request", OutputReservationRegistry()))
-        if phase >= 1:
-            root.rename(work)
-        if phase == 2:
-            (work / "wrapper" / "payload").rename(root)
-        owner.close()  # Simulate process loss without request.finish().
-        restarted = OutputOwnership(config)
-        try:
-            restarted.state_for()
-            [marker] = list(watch.rglob("marker.txt"))
-            assert marker.read_text(encoding="utf-8") == "complete"
-            assert restarted.protected(str(marker))
-        finally:
-            restarted.close()
+
 
 
 def test_deep_watch_catalog_and_internal_recovery_share_effective_policy(tmp_path, monkeypatch):
@@ -244,7 +135,7 @@ def test_deep_watch_catalog_and_internal_recovery_share_effective_policy(tmp_pat
         candidates, errors = watcher._scan_candidates([str(root)], recursive=False)
         assert not errors and [candidate.path for candidate in candidates] == [str(archive)]
         scope = watcher.scopes[next(iter(watcher.scopes))]
-        filtered, _ = watcher._scan_options_for(scope).catalog_snapshot(watcher.state._native, scope.native, str(archive))
+        filtered, _ = watcher._scan_options_for(scope).catalog_snapshot(watcher._catalog, scope.native, str(archive))
         assert filtered.file_columns()[0] == [str(archive)]
         candidate = WatchCandidate(str(nested), nested.stat().st_size, nested.stat().st_mtime)
         watcher.state.queue_active(candidate, source_input_root=str(root), internal_recovery=True,
@@ -262,40 +153,7 @@ def test_deep_watch_catalog_and_internal_recovery_share_effective_policy(tmp_pat
         watcher._close_blocking()
 
 
-def test_foreground_outputs_outside_watch_scopes_never_write_watch_wal(tmp_path, monkeypatch):
-    """Real recursion/flatten catches persistence accidentally added to any output phase.
 
-    Scope/extraction tests check content, not journal cost. This one tiny nested
-    input adds the missing assertion with both absent and unrelated Watch state.
-    """
-    import sunpack.runtime.watch.service as service
-    from tests.helpers.fs_builder import make_zip
-    source = tmp_path / "source.bin"
-    source.write_bytes(make_zip({"wrapper/inner.bin": make_zip({"leaf/payload.txt": "complete"})}))
-    watched = tmp_path / "unrelated"
-    watched.mkdir()
-    monkeypatch.setattr(service, "_read_watch_root_entries", lambda: [])
-    config = make_config({"recursive_extract": "3", "watch": {"state_dir": str(tmp_path / "state")},
-                          "post_extract": {"archive_cleanup_mode": "keep"}})
-
-    async def run():
-        async with PipelineEngine(config) as engine:
-            for enabled in (False, True):
-                owner = engine.output_ownership
-                if enabled:
-                    owner.retain_scopes([DiscoveryScope(str(watched), recursive=True)])
-                store = owner._state
-                before = store.applied_seq if store is not None else None
-                result = await engine.run([str(source)], request_config={**config,
-                    "output": {"root": str(tmp_path / str(enabled))}})
-                assert result.summary.success_count == 2
-                [payload] = list((tmp_path / str(enabled)).rglob("payload.txt"))
-                assert payload.read_text() == "complete"
-                assert owner._state is store
-                assert (store.applied_seq if store is not None else None) == before
-                assert not owner._memory._native.runtime_keys("owned|")
-                assert not owner._active_owners
-    asyncio.run(run())
 
 
 @pytest.mark.parametrize("archive_format", ["7z", "zip", "rar"])

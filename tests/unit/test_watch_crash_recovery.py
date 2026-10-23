@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-import pytest
 
 from sunpack.runtime.watch.scanner import WatchCandidate
 from sunpack.runtime.watch.state import WatchStateStore
@@ -20,18 +19,12 @@ def _watch_scheduler_shell(scheduler_module):
     scheduler._claims_by_owner = {}
     scheduler._pending_by_key = {}
     scheduler._dirty_during_claim = {}
-    scheduler._source_probes = {}
     scheduler._inflight_requests = []
     scheduler._inflight_path_counts = {}
     scheduler._active_epoch = 0
     scheduler._ready_heap = []
     scheduler._closed = False
     scheduler._completion_batches = set()
-    scheduler.output_ownership = None
-    scheduler.watch_roots = []
-    scheduler.scopes = {}
-    scheduler.root_entries = {}
-    scheduler._scan_options = SimpleNamespace(catalog_update=lambda *_args: ([], []))
     return scheduler
 
 
@@ -50,7 +43,7 @@ def test_pending_output_recovery_state_round_trips(tmp_path):
         persist=True,
         durable=True,
     )
-    state.commit_output([], str(source), str(inner), str(output))
+    assert state.record_task_output_started(str(source), str(inner), str(output))
 
     [live] = state.pending_work_items()
     assert live.active_outputs[str(inner.resolve())] == str(output.resolve())
@@ -60,7 +53,7 @@ def test_pending_output_recovery_state_round_trips(tmp_path):
     assert before_finish.password_scope_dir == str(tmp_path.resolve())
     assert before_finish.source_input_root == str(tmp_path)
 
-    state.commit_output([],
+    assert state.record_task_output_finished(
         str(source),
         str(inner),
         str(output),
@@ -114,8 +107,6 @@ def test_live_enqueue_keeps_owner_memory_only(tmp_path):
     scheduler.cold_start_seconds = 0.0
     scheduler._quiet_policy = SimpleNamespace()
     scheduler.state = SimpleNamespace(
-        _native=SimpleNamespace(runtime_record=lambda _key: None),
-        commit_runtime=lambda *_args, **_kwargs: None,
         latest_entry_for_path=lambda _path: None,
         pending_work_for_path=lambda _path: None,
         queue_active=lambda *_args, **kwargs: calls.append(kwargs),
@@ -129,7 +120,6 @@ def test_live_enqueue_keeps_owner_memory_only(tmp_path):
     scheduler.metadata_files = set()
     scheduler.metadata_dir = ""
     scheduler.watch_roots = [str(tmp_path)]
-    scheduler.scopes = {scheduler_module.path_key(str(tmp_path)): scheduler_module.DiscoveryScope(str(tmp_path))}
     scheduler._observe_candidate_activity = lambda *_args, **_kwargs: 0.0
     monkeypatch_target = scheduler_module._candidate_for_event_path
     scheduler_module._candidate_for_event_path = lambda *_args, **_kwargs: candidate
@@ -274,10 +264,10 @@ def test_committed_roots_collapse_nested_outputs(tmp_path):
     child_source = root / "child.zip"
     child_output = root / "child"
 
-    state.commit_output([], str(outer), str(outer), str(root))
-    state.commit_output([], str(outer), str(outer), str(root), keep_output=True)
-    state.commit_output([], str(outer), str(child_source), str(child_output))
-    state.commit_output([], str(outer), str(child_source), str(child_output), keep_output=True)
+    state.record_task_output_started(str(outer), str(outer), str(root))
+    state.record_task_output_finished(str(outer), str(outer), str(root), keep_output=True)
+    state.record_task_output_started(str(outer), str(child_source), str(child_output))
+    state.record_task_output_finished(str(outer), str(child_source), str(child_output), keep_output=True)
 
     [pending] = state.pending_work_items()
     assert pending.committed_roots == [str(root.resolve())]
@@ -308,8 +298,6 @@ def test_enqueue_does_not_publish_memory_work_when_durable_queue_fails(tmp_path)
         raise OSError("disk failed")
 
     scheduler.state = SimpleNamespace(
-        _native=SimpleNamespace(runtime_record=lambda _key: None),
-        commit_runtime=lambda *_args, **_kwargs: None,
         latest_entry_for_path=lambda _path: None,
         pending_work_for_path=lambda _path: None,
         queue_active=fail_queue,
@@ -323,7 +311,6 @@ def test_enqueue_does_not_publish_memory_work_when_durable_queue_fails(tmp_path)
     scheduler.metadata_files = set()
     scheduler.metadata_dir = ""
     scheduler.watch_roots = [str(tmp_path)]
-    scheduler.scopes = {scheduler_module.path_key(str(tmp_path)): scheduler_module.DiscoveryScope(str(tmp_path))}
     scheduler._observe_candidate_activity = lambda *_args, **_kwargs: 0.0
     monkeypatch_target = scheduler_module._candidate_for_event_path
     scheduler_module._candidate_for_event_path = lambda *_args, **_kwargs: candidate
@@ -368,19 +355,39 @@ def test_persisted_blocker_wins_over_stale_pending_recovery(tmp_path):
 
 
 
-def test_output_lifecycle_state_rejection_fails_before_commit(tmp_path):
-    # Progress observers no longer own correctness. The direct transaction must
-    # reject an absent request without publishing any output operation.
-    state = WatchStateStore(str(tmp_path / "state.json"))
-    with pytest.raises(ValueError, match="owner is no longer queued"):
-        state.commit_output([{"op": "runtime", "key": "owned|test", "value": {"path": "test"}}],
-                            "absent.zip", "absent.zip", "out")
-    assert state._native.runtime_record("owned|test") is None
-    state.close()
+def test_watch_lifecycle_state_rejection_fails_closed():
+    import pytest
+    import sunpack.runtime.watch.scheduler as scheduler_module
+
+    scheduler = _watch_scheduler_shell(scheduler_module)
+    scheduler.state = SimpleNamespace(
+        record_task_output_started=lambda *_args, **_kwargs: False,
+        record_task_output_finished=lambda *_args, **_kwargs: False,
+    )
+    task = SimpleNamespace(main_path="archive.zip")
+
+    with pytest.raises(RuntimeError, match="start state transition rejected"):
+        scheduler._handle_pipeline_progress(
+            "archive.zip",
+            "notification",
+            task,
+            {"event": "task_output_started", "output_dir": "out"},
+        )
+
+    with pytest.raises(RuntimeError, match="finish state transition rejected"):
+        scheduler._handle_pipeline_progress(
+            "archive.zip",
+            "notification",
+            task,
+            {
+                "event": "task_output_finished",
+                "output_dir": "out",
+                "keep_output": True,
+            },
+        )
 
 
-@pytest.mark.parametrize("committed", [False, True])
-def test_legacy_path_only_recovery_preserves_unknown_output_and_requeues_source(tmp_path, monkeypatch, committed):
+def test_crash_recovery_removes_partial_direct_output_and_requeues_source(tmp_path, monkeypatch):
     import sunpack.runtime.watch.scheduler as scheduler_module
 
     state_path = tmp_path / "state.json"
@@ -397,9 +404,7 @@ def test_legacy_path_only_recovery_preserves_unknown_output_and_requeues_source(
         persist=True,
         durable=True,
     )
-    state.commit_output([], str(source), str(source), str(output))
-    if committed:
-        state.commit_output([], str(source), str(source), str(output), keep_output=True)
+    assert state.record_task_output_started(str(source), str(source), str(output))
 
     restarted = WatchStateStore(str(state_path))
     scheduler = _watch_scheduler_shell(scheduler_module)
@@ -408,7 +413,6 @@ def test_legacy_path_only_recovery_preserves_unknown_output_and_requeues_source(
     scheduler.log = SimpleNamespace(write=lambda *_args, **_kwargs: None)
     queued = []
     scheduler.enqueue = lambda path, **kwargs: queued.append((path, kwargs))
-    monkeypatch.setattr(scheduler_module, "scan_watch_candidates", lambda *_args, **_kwargs: pytest.fail("Unknown output identity must not authorize internal discovery"))
     monkeypatch.setattr(
         scheduler_module,
         "_candidate_for_event_path",
@@ -417,7 +421,7 @@ def test_legacy_path_only_recovery_preserves_unknown_output_and_requeues_source(
 
     scheduler._recover_persisted_work()
 
-    assert (output / "partial.bin").read_bytes() == b"partial"
+    assert not output.exists()
     assert [item[0] for item in queued] == [str(source.resolve())]
     assert queued[0][1]["event_type"] == "crash_recovery"
     [pending] = restarted.pending_work_items()
@@ -441,8 +445,8 @@ def test_missing_committed_output_requeues_surviving_source(tmp_path, monkeypatc
         persist=True,
         durable=True,
     )
-    state.commit_output([], str(source), str(source), str(output))
-    state.commit_output([],
+    assert state.record_task_output_started(str(source), str(source), str(output))
+    assert state.record_task_output_finished(
         str(source),
         str(source),
         str(output),
@@ -486,8 +490,8 @@ def test_missing_committed_output_without_source_keeps_recovery_owner(tmp_path, 
         persist=True,
         durable=True,
     )
-    state.commit_output([], str(source), str(source), str(output))
-    state.commit_output([],
+    assert state.record_task_output_started(str(source), str(source), str(output))
+    assert state.record_task_output_finished(
         str(source),
         str(source),
         str(output),

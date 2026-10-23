@@ -742,10 +742,7 @@ class WatchStateStore:
                 return
             self._commit_operations_locked(operations, durable=durable)
 
-    def commit_output(self, operations, owner_path, task_path, output_dir, *, keep_output=None):
-        with self._state_lock:
-            operations = self._native.output_transition(operations, owner_path, task_path, output_dir, keep_output)
-            self._commit_operations_locked(operations, durable=True)
+
 
     def _commit_operations_locked(
         self,
@@ -942,6 +939,76 @@ class WatchStateStore:
     def pending_work_for_path(self, path: str) -> WatchPendingWork | None:
         with self._state_lock:
             return self._pending_record(path)
+
+    def record_task_output_started(self, owner_path: str, task_path: str, output_dir: str) -> bool:
+        if not task_path or not output_dir:
+            return False
+        with self._state_lock:
+            key = _path_key(owner_path)
+            pending = self._pending_record(key)
+            if pending is None:
+                return False
+            active = dict(pending.active_outputs)
+            active[os.path.abspath(task_path)] = os.path.abspath(output_dir)
+            updated = replace(pending, active_outputs=active)
+            self._commit_operations_locked([
+                self._put_operation("pending_work", key, updated),
+            ], durable=True)
+            return True
+
+    def record_task_output_finished(
+        self,
+        owner_path: str,
+        task_path: str,
+        output_dir: str,
+        *,
+        keep_output: bool,
+    ) -> bool:
+        """End the task's durable write record after verification."""
+        if not task_path or not output_dir:
+            return False
+        with self._state_lock:
+            key = _path_key(owner_path)
+            pending = self._pending_record(key)
+            if pending is None:
+                return False
+            task_path = os.path.abspath(task_path)
+            active = dict(pending.active_outputs)
+            if task_path not in active:
+                return False
+            active.pop(task_path)
+            roots = list(pending.committed_roots)
+            completed = list(pending.completed_sources)
+            if keep_output:
+                output_dir = os.path.abspath(output_dir)
+                root_key = _path_key(output_dir)
+                if not any(
+                    root_key == _path_key(existing)
+                    or _is_path_under(root_key, _path_key(existing))
+                    for existing in roots
+                ):
+                    roots = [
+                        existing
+                        for existing in roots
+                        if not _is_path_under(_path_key(existing), root_key)
+                    ]
+                    roots.append(output_dir)
+                task_key = _path_key(task_path)
+                if (
+                    task_key != _path_key(pending.path)
+                    and not any(_path_key(existing) == task_key for existing in completed)
+                ):
+                    completed.append(task_path)
+            updated = replace(
+                pending,
+                active_outputs=active,
+                committed_roots=roots,
+                completed_sources=completed,
+            )
+            self._commit_operations_locked([
+                self._put_operation("pending_work", key, updated),
+            ], durable=True)
+            return True
 
     def rebase_pending_work(
         self,

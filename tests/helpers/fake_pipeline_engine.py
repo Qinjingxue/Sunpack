@@ -11,8 +11,6 @@ class FakePipelineEngine:
     """Async engine test double backed by a lightweight runner factory."""
 
     def __init__(self, runner_factory):
-        from sunpack.pipeline.coordinator.output_ownership import OutputOwnership
-        self.output_ownership = OutputOwnership({"watch": {}})
         self.runner_factory = runner_factory
         self.user_passwords = []
         self.builtin_passwords = []
@@ -23,7 +21,7 @@ class FakePipelineEngine:
         return self
 
     async def aclose(self, *, graceful=True):
-        self.output_ownership.close()
+        return None
 
     async def __aexit__(self, exc_type, exc, traceback):
         await self.aclose()
@@ -35,7 +33,7 @@ class FakePipelineEngine:
     def is_idle(self):
         return True
 
-    def completed_watch_family_output(self, path, *, deep_detect=False, policy=""):
+    def completed_watch_family_output(self, path, *, deep_detect=False):
         return ""
 
     def reconfigure_request(self, config):
@@ -88,11 +86,6 @@ class FakePipelineEngine:
             ),
             *(str(path) for path in (getattr(context, "generated_outputs", ()) or ()) if str(path)),
         ]
-        if summary.success_count and generated_outputs:
-            state = self.output_ownership.state_for()
-            state.commit_runtime(state._native.completion_operations(
-                paths, generated_outputs[-1], config.get("watch_policy", ""), (),
-                bool(config.get("watch_deep_detect", False))), durable=True)
         response = PipelineResponse(
             request_id=uuid.uuid4().hex,
             summary=summary,

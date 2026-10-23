@@ -1,3 +1,4 @@
+import os
 import threading
 from collections.abc import Callable
 
@@ -14,6 +15,7 @@ class OutputReservationRegistry:
         self._reserved: set[str] = set()
         self._owner_paths: dict[str, set[str]] = {}
         self._allocator = OutputPathAllocator()
+        self.watch_outputs = None
 
     def reserve(self, default_path: str, owner: str, local_reserved: set[str]) -> str:
         with self._lock:
@@ -23,6 +25,23 @@ class OutputReservationRegistry:
             self._owner_paths.setdefault(owner, set()).add(key)
             local_reserved.add(key)
             return path
+
+    def register_watch_output(self, path: str) -> None:
+        outputs = self.watch_outputs
+        if outputs is not None:
+            outputs.register(path)
+
+    def contains(self, path: str) -> bool:
+        key = absolute_path_key(path)
+        with self._lock:
+            while key:
+                if key in self._reserved:
+                    return True
+                parent = os.path.dirname(key)
+                if parent == key:
+                    break
+                key = parent
+        return False
 
     def release(self, owner: str) -> None:
         with self._lock:

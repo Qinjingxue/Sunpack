@@ -88,7 +88,6 @@ def test_coordinator_rewrites_recorded_result_and_cleanup_input(tmp_path, collis
         original = TargetRunResult(str(inner), OutcomeKind.FAILURE,
             failure=FailureInfo(FailureKind.WRONG_PASSWORD, "extraction", "wrong password"))
         runtime = object.__new__(_RequestRuntime)
-        runtime.services = SimpleNamespace(output_ownership=SimpleNamespace(begin=lambda *args, **kwargs: None))
         runtime.context = RunState()
         runtime.context.add_target_result(original)
         runtime.submission = submission
