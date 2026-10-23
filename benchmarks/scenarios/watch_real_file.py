@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import shutil
 import statistics
 import sys
@@ -34,10 +35,16 @@ def _now() -> float:
 
 
 def _wrap_scheduler_timers(watcher: WatchScheduler, destination: Path, timings: dict[str, float]) -> None:
+    # Filesystem queries in this hook slow event admission and distort the
+    # adaptive quiet window that the benchmark is trying to measure.
+    destination_key = os.path.normcase(os.path.abspath(destination))
     original_enqueue = watcher.enqueue
 
     def enqueue(self, path: str, *args: Any, **kwargs: Any):
-        if Path(path).resolve() == destination.resolve() and "watchdog_first_enqueue" not in timings:
+        if (
+            "watchdog_first_enqueue" not in timings
+            and os.path.normcase(os.path.abspath(path)) == destination_key
+        ):
             timings["watchdog_first_enqueue"] = _now()
         return original_enqueue(path, *args, **kwargs)
 
@@ -46,7 +53,7 @@ def _wrap_scheduler_timers(watcher: WatchScheduler, destination: Path, timings: 
     original_submit = watcher._submit_candidate
 
     async def submit(self, candidate):
-        if Path(candidate.path).resolve() == destination.resolve():
+        if os.path.normcase(os.path.abspath(candidate.path)) == destination_key:
             timings.setdefault("processing_started", _now())
         return await original_submit(candidate)
 

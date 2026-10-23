@@ -1410,7 +1410,7 @@ pub(crate) fn scan_directory_snapshot(
     )?;
     let snapshot = py.detach(|| {
         let mut records =
-            scan_directory_impl::<false>(root_path, max_depth, &options, false, None)?;
+            scan_directory_impl::<false>(root_path, max_depth, &options, false, None, None)?;
         populate_relation_anchors(&mut records.filtered);
         Ok::<_, PyErr>(NativeDirectorySnapshot::from_records(
             records.filtered,
@@ -1557,6 +1557,7 @@ pub(crate) fn profile_directory_scan(
             &options,
             include_relation_anchors,
             Some(&mut profile),
+            None,
         )?;
         if include_relation_anchors {
             let started = Instant::now();
@@ -2558,12 +2559,12 @@ fn populate_relation_anchors(records: &mut [DirectoryEntryRecord]) {
         return;
     }
 
-    let mut known_size_inputs = Vec::new();
+    let mut known_size_inputs = Vec::with_capacity(eligible_indices.len());
     let mut unknown_size_inputs = Vec::new();
     for &index in &eligible_indices {
         let record = &records[index];
         if let Some(size) = record.size {
-            known_size_inputs.push((record.path.clone(), size));
+            known_size_inputs.push((record.path.as_str(), size));
         } else {
             unknown_size_inputs.push(record.path.clone());
         }
@@ -2586,7 +2587,7 @@ fn scan_directory_views(
     max_depth: Option<usize>,
     options: &DirectoryScanOptions,
 ) -> PyResult<DirectoryScanRecords> {
-    scan_directory_impl::<false>(root_path, max_depth, options, true, None)
+    scan_directory_impl::<false>(root_path, max_depth, options, true, None, None)
 }
 
 fn scan_directory_impl<const PROFILE: bool>(
@@ -2595,6 +2596,7 @@ fn scan_directory_impl<const PROFILE: bool>(
     options: &DirectoryScanOptions,
     collect_raw: bool,
     mut profile: Option<&mut DirectoryScanProfile>,
+    known_metadata: Option<fs::Metadata>,
 ) -> PyResult<DirectoryScanRecords> {
     let scan_started = Instant::now();
     let root = PathBuf::from(root_path);
@@ -2604,7 +2606,7 @@ fn scan_directory_impl<const PROFILE: bool>(
         .map(|s| Path::new(&s.root))
         .unwrap_or(&root);
     let mut errors = DirectoryReadErrors::new(&root);
-    let metadata = match fs::metadata(&root) {
+    let metadata = match known_metadata.map(Ok).unwrap_or_else(|| fs::metadata(&root)) {
         Ok(metadata) => Some(metadata),
         Err(error) => {
             errors.push(&root, "metadata", error);
@@ -2647,33 +2649,30 @@ fn scan_directory_impl<const PROFILE: bool>(
         });
     }
     if metadata.as_ref().is_some_and(|metadata| metadata.is_file()) {
+        let metadata = metadata.as_ref().unwrap();
         let match_root = if options.scope.is_some() {
             filter_root
         } else {
             root.parent().unwrap_or_else(|| Path::new(""))
         };
-        let raw = collect_raw
-            .then(|| {
-                fs::metadata(&root)
-                    .ok()
-                    .map(|metadata| DirectoryEntryRecord {
-                        path: path_to_string(&root),
-                        is_dir: false,
-                        size: Some(metadata.len()),
-                        mtime_ns: metadata_mtime_ns(&metadata),
-                        relation_member_eligible: !file_rejected_by_path(
-                            &root, match_root, options,
-                        ) && numeric_ranges_allow(
-                            &options.mtime_ranges,
-                            metadata_mtime_ns(&metadata),
-                        ),
-                        relation_anchor: None,
-                    })
-            })
-            .flatten();
-        let filtered = file_record_if_accepted(&root, match_root, options)
-            .into_iter()
-            .collect();
+        let size = metadata.len();
+        let mtime_ns = metadata_mtime_ns(metadata);
+        let eligible = !file_rejected_by_path(&root, match_root, options)
+            && numeric_ranges_allow(&options.mtime_ranges, mtime_ns);
+        // Raw and filtered views describe the same observation. File events
+        // already supplied metadata; repeated queries can also split the views
+        // across two different writes during a download.
+        let record = DirectoryEntryRecord {
+            path: path_to_string(&root),
+            is_dir: false,
+            size: Some(size),
+            mtime_ns,
+            relation_member_eligible: eligible,
+            relation_anchor: None,
+        };
+        let accepted = eligible && numeric_ranges_allow(&options.size_ranges, Some(size));
+        let filtered = if accepted { vec![record.clone()] } else { Vec::new() };
+        let raw = if collect_raw { vec![record] } else { Vec::new() };
         if PROFILE {
             if let Some(profile) = profile.as_deref_mut() {
                 profile.scan_total = scan_started.elapsed();
@@ -2681,7 +2680,7 @@ fn scan_directory_impl<const PROFILE: bool>(
         }
         return Ok(DirectoryScanRecords {
             filtered,
-            raw: raw.into_iter().collect(),
+            raw,
             errors,
         });
     }
@@ -2933,32 +2932,6 @@ fn scan_directory_impl<const PROFILE: bool>(
         filtered: records,
         raw: raw_records,
         errors,
-    })
-}
-
-fn file_record_if_accepted(
-    path: &Path,
-    root: &Path,
-    options: &DirectoryScanOptions,
-) -> Option<DirectoryEntryRecord> {
-    if file_rejected_by_path(path, root, options) {
-        return None;
-    }
-    let metadata = fs::metadata(path).ok()?;
-    let size = metadata.len();
-    let mtime_ns = metadata_mtime_ns(&metadata);
-    if !numeric_ranges_allow(&options.size_ranges, Some(size))
-        || !numeric_ranges_allow(&options.mtime_ranges, mtime_ns)
-    {
-        return None;
-    }
-    Some(DirectoryEntryRecord {
-        path: path_to_string(path),
-        is_dir: false,
-        size: Some(size),
-        mtime_ns,
-        relation_member_eligible: true,
-        relation_anchor: None,
     })
 }
 
@@ -3493,7 +3466,9 @@ fn update_catalog(
             }
         } else {
             match &metadata {
-                Ok(_) => scan_directory_views(target, scope.max_depth, &options)?,
+                Ok(metadata) => scan_directory_impl::<false>(
+                    target, scope.max_depth, &options, true, None, Some(metadata.clone()),
+                )?,
                 Err(error) => {
                     let mut errors = DirectoryReadErrors::new(Path::new(target));
                     if error.kind() != std::io::ErrorKind::NotFound {

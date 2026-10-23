@@ -138,7 +138,7 @@ pub(crate) fn probe_volume_anchor_paths_cheap(
     )
 }
 
-pub(crate) fn probe_volume_anchor_records_cheap(records: &[(String, u64)]) -> Vec<VolumeAnchor> {
+pub(crate) fn probe_volume_anchor_records_cheap(records: &[(&str, u64)]) -> Vec<VolumeAnchor> {
     cheap_fast_probe_pool().install(|| {
         records
             .par_iter()

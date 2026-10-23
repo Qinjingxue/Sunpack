@@ -13,8 +13,10 @@ use std::time::Duration;
 struct NativeResourceRecord {
     kind: &'static str,
     paths: Vec<PathBuf>,
-    thread: String,
-    created_from: String,
+    // Keep diagnostics cheap while the registry lock is held. Formatting is
+    // only needed when a resource snapshot is requested.
+    thread: std::thread::ThreadId,
+    created_from: &'static std::panic::Location<'static>,
 }
 
 #[derive(Default)]
@@ -204,8 +206,8 @@ impl NativeResourceGuard {
             NativeResourceRecord {
                 kind,
                 paths,
-                thread: format!("{:?}", std::thread::current().id()),
-                created_from: format!("{}:{}", caller.file(), caller.line()),
+                thread: std::thread::current().id(),
+                created_from: caller,
             },
         );
         Ok(Self { id })
@@ -393,8 +395,11 @@ fn resource_snapshot_to_python(
                 .map(|path| path.to_string_lossy().into_owned())
                 .collect::<Vec<_>>(),
         )?;
-        item.set_item("thread", &record.thread)?;
-        item.set_item("created_from", &record.created_from)?;
+        item.set_item("thread", format!("{:?}", record.thread))?;
+        item.set_item(
+            "created_from",
+            format!("{}:{}", record.created_from.file(), record.created_from.line()),
+        )?;
         output.append(item)?;
     }
     Ok(output.unbind())
