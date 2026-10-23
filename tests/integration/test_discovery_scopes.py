@@ -105,6 +105,47 @@ def test_catalog_and_output_identity_survive_restart_and_do_not_inherit_names(tm
         restarted.close()
 
 
+def test_interrupted_output_recovery_is_identity_safe_and_releases_failed_owner(tmp_path, monkeypatch):
+    """Path-only Watch recovery cannot catch replaced directories or failed WAL finish."""
+    import sunpack.runtime.watch.service as service
+    from sunpack.pipeline.coordinator.engine import _PathLeaseRegistry
+    root = tmp_path / "input"
+    root.mkdir()
+    monkeypatch.setattr(service, "_read_watch_root_entries", lambda: [WatchRootEntry(str(root), recursive=True)])
+    config = make_config({"watch": {"state_dir": str(tmp_path / "state")}})
+    owner = OutputOwnership(config)
+    partial, replaced, complete = (root / name for name in ("partial", "replaced", "complete"))
+    owner.begin(str(partial), "crashed")
+    owner.begin(str(replaced), "crashed")
+    (partial / "payload").write_bytes(b"partial")
+    replaced.rename(root / "moved-partial")
+    replaced.mkdir()
+    (replaced / "user-file").write_bytes(b"keep")
+    owner.begin(str(complete), "crashed")
+    owner.seal(str(complete), succeeded=True)
+    owner.close()
+    owner = OutputOwnership(config)
+    registry = _PathLeaseRegistry(owner)
+    try:
+        store = owner.state_for()
+        assert not partial.exists()
+        assert (replaced / "user-file").read_bytes() == b"keep"
+        assert not owner.recoverable_output(str(replaced))
+        assert owner.recoverable_output(str(complete))
+        owner.begin(str(root / "failed-finish"), "finished")
+        with monkeypatch.context() as patch:
+            def fail_commit(*_args, **_kwargs):
+                raise OSError("WAL unavailable")
+            patch.setattr(store, "commit_runtime", fail_commit)
+            with pytest.raises(OSError, match="WAL unavailable"):
+                owner.finish("finished")
+        assert "finished" not in owner._active_owners
+    finally:
+        owner.close()
+    assert owner.input_leases is None and owner._state is None
+    assert registry.output_ownership is owner
+
+
 def test_targeted_catalog_updates_preserve_original_depth_pruning_and_conflicts(tmp_path):
     """Full-root scans cannot detect incremental scope widening or stale conflict rows."""
     from sunpack_native import NativeDirectoryScanOptions

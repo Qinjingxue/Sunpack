@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+import pytest
 
 from sunpack.runtime.watch.scanner import WatchCandidate
 from sunpack.runtime.watch.state import WatchStateStore
@@ -399,7 +400,8 @@ def test_watch_lifecycle_state_rejection_fails_closed():
         )
 
 
-def test_crash_recovery_removes_partial_direct_output_and_requeues_source(tmp_path, monkeypatch):
+@pytest.mark.parametrize("committed", [False, True])
+def test_legacy_path_only_recovery_preserves_unknown_output_and_requeues_source(tmp_path, monkeypatch, committed):
     import sunpack.runtime.watch.scheduler as scheduler_module
 
     state_path = tmp_path / "state.json"
@@ -417,6 +419,8 @@ def test_crash_recovery_removes_partial_direct_output_and_requeues_source(tmp_pa
         durable=True,
     )
     assert state.record_task_output_started(str(source), str(source), str(output))
+    if committed:
+        assert state.record_task_output_finished(str(source), str(source), str(output), keep_output=True)
 
     restarted = WatchStateStore(str(state_path))
     scheduler = _watch_scheduler_shell(scheduler_module)
@@ -425,6 +429,7 @@ def test_crash_recovery_removes_partial_direct_output_and_requeues_source(tmp_pa
     scheduler.log = SimpleNamespace(write=lambda *_args, **_kwargs: None)
     queued = []
     scheduler.enqueue = lambda path, **kwargs: queued.append((path, kwargs))
+    monkeypatch.setattr(scheduler_module, "scan_watch_candidates", lambda *_args, **_kwargs: pytest.fail("Unknown output identity must not authorize internal discovery"))
     monkeypatch.setattr(
         scheduler_module,
         "_candidate_for_event_path",
@@ -433,7 +438,7 @@ def test_crash_recovery_removes_partial_direct_output_and_requeues_source(tmp_pa
 
     scheduler._recover_persisted_work()
 
-    assert not output.exists()
+    assert (output / "partial.bin").read_bytes() == b"partial"
     assert [item[0] for item in queued] == [str(source.resolve())]
     assert queued[0][1]["event_type"] == "crash_recovery"
     [pending] = restarted.pending_work_items()

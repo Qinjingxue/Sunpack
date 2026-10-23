@@ -6,6 +6,7 @@ import subprocess
 import sys
 import time
 import zipfile
+from pathlib import Path
 
 import pytest
 
@@ -29,6 +30,7 @@ def test_installed_broker_lifecycle_usn_roundtrip_and_hot_ipc(tmp_path):
             str(tmp_path),
         ],
         capture_output=True,
+        cwd=Path(__file__).resolve().parents[2],
         text=True,
         check=False,
         timeout=30.0,

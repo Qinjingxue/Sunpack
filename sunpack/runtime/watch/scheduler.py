@@ -58,10 +58,6 @@ from sunpack.core.support.resource_lifecycle import (
     lifecycle_registration,
     register_service_resource,
 )
-from sunpack.pipeline.postprocess.output_cleanup import (
-    DEFAULT_OUTPUT_CLEANUP_MANAGER,
-    OutputCleanupEvent,
-)
 
 from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
@@ -656,28 +652,8 @@ class WatchScheduler:
                     self.state.forget_path(pending.path)
                 continue
 
-            cleanup_failed = False
-            for output_dir in dict.fromkeys(active_outputs.values()):
-                result = DEFAULT_OUTPUT_CLEANUP_MANAGER.cleanup_canonical(
-                    output_dir,
-                    event=OutputCleanupEvent.EXTRACTION_ABORT,
-                    planned_output_dir=output_dir,
-                )
-                self.log.write(
-                    "crash_output_cleanup",
-                    owner_path=pending.path,
-                    output_dir=output_dir,
-                    cleaned=result.cleaned,
-                    already_absent=result.already_absent,
-                    reason=result.reason,
-                    error=result.error,
-                )
-                if not (result.cleaned or result.already_absent):
-                    cleanup_failed = True
-            if cleanup_failed:
-                # Keep the durable owner record. A later process start can retry
-                # cleanup without ever writing into an unknown half-output.
-                continue
+            # OutputOwnership alone cleans interrupted writes after checking
+            # identity. Legacy path-only progress records authorize no deletion.
 
             recovered: dict[str, WatchCandidate] = {}
             recovery_scopes = {}
@@ -693,9 +669,10 @@ class WatchScheduler:
                     source_scope = self.scopes.get(path_key(pending.source_input_root)) or DiscoveryScope(os.path.dirname(candidate.path))
                     recovery_scopes[path_key(candidate.path)] = pending.discovery_scope or source_scope.to_record()
 
-            missing_committed_roots = [
-                root for root in committed_roots if not os.path.isdir(root)
-            ]
+            recoverable_roots = [root for root in committed_roots
+                if self.output_ownership is not None
+                and self.output_ownership.recoverable_output(root)]
+            missing_committed_roots = [root for root in committed_roots if root not in recoverable_roots]
             if missing_committed_roots:
                 candidate = _candidate_for_event_path(pending.path)
                 if (
@@ -719,9 +696,7 @@ class WatchScheduler:
                 )
 
             scan_failed = False
-            for root in committed_roots:
-                if not os.path.isdir(root):
-                    continue
+            for root in recoverable_roots:
                 try:
                     candidates, _errors = scan_watch_candidates([root], recursive=True)
                     if _errors:

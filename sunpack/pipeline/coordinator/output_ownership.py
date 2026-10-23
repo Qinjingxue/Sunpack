@@ -152,6 +152,16 @@ class OutputOwnership:
         state = self._state or self.state_for()
         return state._native.owned_root(path) is not None
 
+    def recoverable_output(self, path):
+        """Authorize recovery only from a verified output's surviving identity."""
+        state = self.state_for()
+        root = state._native.owned_root(path)
+        if root is None:
+            return False
+        self.reconcile(root)
+        record = state._native.runtime_record("owned|" + root)
+        return bool(record and record["state"] in {"sealed", "retained"})
+
     def reconcile(self, path, *, recursive=False):
         state = self.state_for()
         normalized = path_key(path)
@@ -241,8 +251,11 @@ class OutputOwnership:
                 record.update(owner="", state="retained" if record["state"] in {"sealed", "retained"} else "quarantined",
                               identities=[f"{volume}|{identity}"])
             changes.append({"op": "runtime", "key": key, "value": record})
-        state.commit_runtime(state._native.fold_owned_outputs(changes), durable=True)
-        self._active_owners.discard(owner)
+        try:
+            state.commit_runtime(state._native.fold_owned_outputs(changes), durable=True)
+        finally:
+            with self.gate:
+                self._active_owners.discard(owner)
 
     def retain_scopes(self, scopes):
         """Drop removed roots' catalogs and outputs in one existing WAL transaction."""
@@ -251,7 +264,11 @@ class OutputOwnership:
         state.commit_runtime(state._native.prune_runtime_scopes([scope.native for scope in self._scopes]), durable=True)
 
     def close(self):
-        if self._state is not None:
-            self._state.close()
+        try:
+            if self._state is not None:
+                self._state.close()
+        finally:
             self._state = None
-        self._active_owners.clear()
+            self.input_leases = None
+            self._scopes = None
+            self._active_owners.clear()
