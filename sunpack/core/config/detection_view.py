@@ -1,10 +1,5 @@
 from typing import Any
 
-from sunpack.core.config.fields.filesystem import (
-    DIRECTORY_SCAN_CURRENT_DIR_ONLY,
-)
-
-
 def detection_config(config: dict[str, Any]) -> dict[str, Any]:
     return config["detection"]
 
@@ -21,14 +16,6 @@ def discovery_run_config(config: dict[str, Any], *, deep_detect: bool) -> dict[s
         **config,
         "filesystem": {**filesystem_config(config), "scan_filters_enabled": False},
     }
-
-
-def directory_scan_mode(config: dict[str, Any]) -> str:
-    return filesystem_config(config)["directory_scan_mode"]
-
-
-def directory_scan_is_recursive(config: dict[str, Any]) -> bool:
-    return directory_scan_mode(config) != DIRECTORY_SCAN_CURRENT_DIR_ONLY
 
 
 def scan_filters_config(config: dict[str, Any]) -> list[dict[str, Any]]:

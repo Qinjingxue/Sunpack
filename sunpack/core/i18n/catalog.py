@@ -17,6 +17,7 @@ CATALOG = {
         "cli.password_input_prompt": "password> ",
         "cli.password_retry_prompt": "[CLI] Wrong password failure detected. Enter new passwords and run another extraction round? (y/n): ",
         "cli.no_builtin_passwords": "Disable built-in passwords",
+        "cli.recursive_scan": "Discover files recursively in input directories",
         "cli.recursive_extract": "Extraction rounds: positive integer, * unlimited, ? prompt",
         "cli.archive_cleanup_mode": "Source archives: d delete, r recycle, k keep",
         "cli.output_dir": "Output root; defaults to the current directory",
@@ -333,6 +334,7 @@ CATALOG = {
         "metadata.latin_noise_count": "Detected {count} suspicious Latin symbol noise character(s)",
     },
     "zh": {
+        "cli.recursive_scan": "递归发现输入目录中的文件",
         "cleanup.incomplete": "解压完成，{count} 项后处理操作失败",
         "cli.description": "压缩包解压与目录监控",
         "cli.usage": "sunpack [-h] <command> [command options] [paths...]",

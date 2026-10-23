@@ -119,7 +119,6 @@ def test_output_scan_policy_reuses_extraction_inventory(tmp_path, monkeypatch, h
     if has_inventory:
         inventories[str(tmp_path.resolve()).lower()] = collect_output_inventory(str(tmp_path))
     config = _config()
-    config["filesystem"]["directory_scan_mode"] = "current_dir_only"
     policy = OutputScanPolicy(config)
     if has_inventory:
         monkeypatch.setattr(

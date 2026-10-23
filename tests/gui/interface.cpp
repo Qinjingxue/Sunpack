@@ -544,6 +544,7 @@ void localized_config_search(Application& app) {
 // Real pointer clicks plus reversible typing distinguish a positioned caret
 // from focus-only behavior; tail paths cover the display's ellipsis transform.
 void inline_cell_caret(Application& app) {
+    
     ui_window_set_size(app.window(),850,560);
     auto* window=ui::GetContext().GetWindow(app.window());
     auto check=[&](const std::string& display,const std::string& labelId,const std::string& editor,bool tail) {
@@ -1231,6 +1232,8 @@ void bound_style_updates() {
 }
 }
 int wmain(int argc,wchar_t** argv) {
+    _set_error_mode(_OUT_TO_STDERR);
+    _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
     if(argc>1 && std::wstring(argv[1])==L"--fake-cli") {
         Json args=Json::array(); for(int i=3;i<argc;++i) args.push_back(utf8(argv[i])); atomic_write(fs::current_path()/"cli-arguments.json",args.dump());
         Handle gate(OpenEventW(SYNCHRONIZE,FALSE,argv[2])); assert(gate.value);
@@ -1264,7 +1267,7 @@ int wmain(int argc,wchar_t** argv) {
             assert(IsWindowVisible(static_cast<HWND>(ui_window_hwnd(app.window()))));
             assert(state(app.page(),"errors").empty() && state(app.page(),"actionError")=="");
             screenshot(app,L"startup.png");
-            page_motion(app);
+                page_motion(app);
             if(rangesOnly || acceptance) {
                 pump_diagnostic(app,[&]{return state(app.page(),"fields").size()>100;},"Configuration fields loaded");
                 click(app,"tabConfig"); pump([&]{return state(app.page(),"tab")=="config";});
@@ -1287,12 +1290,12 @@ int wmain(int argc,wchar_t** argv) {
                         assert(!GetUpdateRect(native->Handle(),nullptr,FALSE));
                         assert(unchanged.submitted==0);
                     }
-                    localized_config_search(app);
-                    inline_cell_caret(app);
+                localized_config_search(app);
+                inline_cell_caret(app);
                     virtual_tail(app,"configItems","configListScroll",state(app.page(),"matchingBlocks").size());
-                    scrolled_config_edits(app);
-                    tag_config(app,dir);
-                    resize_tasks(app);
+                scrolled_config_edits(app);
+                tag_config(app,dir);
+                resize_tasks(app);
                     popup_motion(app,"themeSelector");
                 }
                 range_config(app,dir);
@@ -1412,7 +1415,7 @@ int wmain(int argc,wchar_t** argv) {
             virtual_tail(app,"taskItems","taskListScroll",virtualTaskCount);
             auto task=state(app.page(),"tasks")["rows"][0];
             assert(task["time"].get<std::string>().size()==19);
-            resize_tasks(app);
+                resize_tasks(app);
             auto task_id=task["id"].get<std::string>();
             auto card_bounds=rect(app,"task-"+task_id), name_bounds=rect(app,"taskName-"+task_id);
             assert(card_bounds.bottom-card_bounds.top<=80);
@@ -2074,7 +2077,7 @@ int wmain(int argc,wchar_t** argv) {
             std::cerr<<"Validating configuration viewport\n";
             virtual_tail(app,"configItems","configListScroll",state(app.page(),"matchingBlocks").size());
             std::cerr<<"Configuration viewport validated\n";
-            scrolled_config_edits(app);
+                scrolled_config_edits(app);
             std::cerr<<"Scrolled configuration edits validated\n";
             ui_window_relayout(app.window()); button_texts(app);
             auto startup_after=rect(app,"startupToggle");
@@ -2120,8 +2123,8 @@ int wmain(int argc,wchar_t** argv) {
             }
             ui_widget_destroy(block);
             screenshot(app,L"whitelist-block-small.png");
-            range_config(app,dir);
-            tag_config(app,dir);
+                range_config(app,dir);
+                tag_config(app,dir);
             // Dense views must remain usable with many folders/history items,
             // including after the directory scrollbar becomes active.
             std::string many_roots=utf8(dir.wstring())+"\n";

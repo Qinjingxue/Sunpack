@@ -1049,7 +1049,9 @@ pub(crate) fn watch_journal_submit_append(
     operations: &Bound<'_, PyAny>,
     durable: bool,
 ) -> PyResult<NativeJournalTicket> {
-    let operations = extract_json(operations)?;
+    let operations = if let Ok(native) = operations.extract::<PyRef<crate::watch_store::NativeWatchOperations>>() {
+        native.journal_value()
+    } else { extract_json(operations)? };
     runtime()
         .submit_append(
             stream,

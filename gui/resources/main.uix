@@ -218,15 +218,15 @@ export default {
     errorText(error) { return error && typeof error==='object' ? error.text : (this.texts[error]||error); },
     setSaveError(key,message) { let errors=Object.assign({},this.saveErrors); if(message) errors[key]=message; else delete errors[key]; this.saveErrors=errors; },
     rootDraft(r) { return this.rootDrafts[r.id]||r; },
-    rootValue(d) { return {input:d.input,output:d.output,deep:d.deep}; },
-    rootDraftState(r) { return Object.assign({},r,{expected:r.original?{output:r.output,deep:r.deep}:null,baseline:JSON.stringify(this.rootValue(r)),pending:false,error:'',submitted:''}); },
+    rootValue(d) { return {input:d.input,output:d.output,deep:d.deep,recursive:d.recursive}; },
+    rootDraftState(r) { return Object.assign({},r,{expected:r.original?{output:r.output,deep:r.deep,recursive:r.recursive}:null,baseline:JSON.stringify(this.rootValue(r)),pending:false,error:'',submitted:''}); },
     putRootDraft(d) { this.rootDrafts=Object.assign({},this.rootDrafts,{[d.id]:d}); },
     ensureRootDraft(r) {
       let d=this.rootDrafts[r.id];
       if(!d) { r=this.rootRows.find(current=>current.id===r.id)||this.rootNew.find(current=>current.id===r.id)||r; d=this.rootDraftState(r); this.putRootDraft(d); }
       return d;
     },
-    makeRoot(input,output,deep) { return {id:'root-'+(++this.rootNext),original:'',input:input,output:output,deep:deep}; },
+    makeRoot(input,output,deep,recursive=false) { return {id:'root-'+(++this.rootNext),original:'',input:input,output:output,deep:deep,recursive:recursive}; },
     addRoot() {
       this.finishRootCell(); this.rootQuery='';
       let r=this.makeRoot('','',false); this.rootNew=[r].concat(this.rootNew); this.ensureRootDraft(r);
@@ -237,7 +237,7 @@ export default {
       let previous=this.rootNew.concat(this.rootRows),identities=new Map();
       for(let r of previous) if(r.original) identities.set(r.identity,r.id);
       for(let d of Object.values(this.rootDrafts)) if(d.original) identities.set(d.identity,d.id);
-      let rows=snapshot.filter(d=>d.watch).map(d=>({id:identities.get(d.id)||'root-'+(++this.rootNext),identity:d.id,original:d.path,input:d.path,output:d.output,deep:d.deep}));
+      let rows=snapshot.filter(d=>d.watch).map(d=>({id:identities.get(d.id)||'root-'+(++this.rootNext),identity:d.id,original:d.path,input:d.path,output:d.output,deep:d.deep,recursive:d.recursive}));
       let order=new Map(previous.map((r,i)=>[r.id,i]));
       rows.sort((a,b)=>(order.has(a.id)?order.get(a.id):previous.length)-(order.has(b.id)?order.get(b.id):previous.length));
       let ids=new Set(rows.map(r=>r.id)); this.rootNew=this.rootNew.filter(r=>!ids.has(r.id)); this.rootRows=rows; this.directories=snapshot;
@@ -260,7 +260,7 @@ export default {
       if(part==='input') {
         if(!d.original&&(!d.output||d.output===this.rootDraft(r).input)) d.output=lines[0];
         d.input=lines[0]; rows.push(d);
-        let extra=lines.slice(1).map(input=>this.makeRoot(input,input,d.deep)); this.rootNew=this.rootNew.concat(extra); rows=rows.concat(extra);
+        let extra=lines.slice(1).map(input=>this.makeRoot(input,input,d.deep,d.recursive)); this.rootNew=this.rootNew.concat(extra); rows=rows.concat(extra);
       } else {
         let current=this.shownRootRows,start=current.findIndex(p=>p.id===r.id),extra=[];
         for(let i=0;i<lines.length;i++) {
@@ -290,7 +290,7 @@ export default {
         if(!deleting&&d.original&&!d.pending&&!d.error&&JSON.stringify(value)===d.baseline) { drafts[d.id]=d; continue; }
         drafts[d.id]=Object.assign({},d,{pending:true,error:'',submitted:sent});
         snapshot.push({id:d.id,value:value,remove:deleting});
-        edits.push({row:d.id,operation:deleting?'delete':d.original?'save':'addMany',original:d.original,input:d.input||d.original,inputs:[d.input],output:d.output,deep:d.deep,expected:d.expected});
+        edits.push({row:d.id,operation:deleting?'delete':d.original?'save':'addMany',original:d.original,input:d.input||d.original,inputs:[d.input],output:d.output,deep:d.deep,recursive:d.recursive,expected:d.expected});
       }
       this.rootDrafts=drafts;
       for(let id of discard) this.discardRoot(id);
@@ -309,6 +309,7 @@ export default {
       if(p.value) { this.changeRoot(d,p.part,p.value); if(this.rootCell===p.id) this.finishRootCell(); else this.commitRoots([this.rootDraft(d)]); }
       else { this.rootCell=d.id; this.rootPart=p.part; this.send('focusRoot',{id:d.id,part:p.part}); }
     },
+    toggleRootRecursive(r,value) { this.finishRootCell(); let d=Object.assign({},this.ensureRootDraft(r),{recursive:value,error:''}); this.putRootDraft(d); this.commitRoots([d]); },
     toggleRoot(r,value) { this.finishRootCell(); let d=Object.assign({},this.ensureRootDraft(r),{deep:value,error:''}); this.putRootDraft(d); this.commitRoots([d]); },
     deleteListedRoot(r) { if(this.rootCell===r.id) { this.rootCell=''; this.rootPart=''; } this.commitRoots([this.ensureRootDraft(r)],true); },
     discardRoot(id) {
@@ -322,7 +323,7 @@ export default {
         if(request.op!=='saveRecord'||request.payload.kind!=='roots') return request;
         let edits=request.payload.edits.map(edit=>{
           let r=index.get(edit.row); if(!r) return edit;
-          return Object.assign({},edit,{original:r.remove?'':r.input,input:edit.operation==='delete'?r.input:edit.input,expected:r.remove?null:{output:r.output,deep:r.deep},operation:edit.operation==='delete'?'delete':r.remove?'addMany':'save'});
+          return Object.assign({},edit,{original:r.remove?'':r.input,input:edit.operation==='delete'?r.input:edit.input,expected:r.remove?null:{output:r.output,deep:r.deep,recursive:r.recursive},operation:edit.operation==='delete'?'delete':r.remove?'addMany':'save'});
         });
         return Object.assign({},request,{payload:Object.assign({},request.payload,{edits:edits})});
       });
@@ -363,11 +364,11 @@ export default {
             let duplicate=claimed.has(record.identity)&&claimed.get(record.identity)!==d.id;
             if(duplicate&&!pending&&this.rootCell!==d.id&&same) { removed.add(d.id); delete drafts[d.id]; continue; }
             claimed.set(record.identity,d.id);
-            d.original=record.input; d.identity=record.identity; d.expected={output:record.output,deep:record.deep};
+            d.original=record.input; d.identity=record.identity; d.expected={output:record.output,deep:record.deep,recursive:record.recursive};
             renamed.set(d.id,{original:record.input,identity:record.identity});
             if(this.taskRoot===previous&&previous!==record.input) { this.taskRoot=record.input; this.filterTasks(); }
             if(this.passwordRoot===previous&&previous!==record.input) { this.passwordRoot=record.input; if(!this.passwordHistoryTarget) this.filterPasswords(); }
-            if(same&&this.rootCell!==d.id) Object.assign(d,{input:record.input,output:record.output,deep:record.deep});
+            if(same&&this.rootCell!==d.id) Object.assign(d,{input:record.input,output:record.output,deep:record.deep,recursive:record.recursive});
           }
           d.baseline=JSON.stringify(same?this.rootValue(d):sent.value); d.submitted='';
         }
@@ -748,13 +749,14 @@ export default {
   .history-text { width:100%; white-space:pre-wrap; }
   .history-save { width:132px; flex-shrink:0; }
   .root-table { flex:1; gap:6px; }
-  .root-columns { flex-direction:row; align-items:center; gap:12px; }
+  .root-columns { flex-direction:row; align-items:center; gap:8px; }
   .root-header { padding:10px 12px; margin:2px 18px 0px 2px; flex-shrink:0; border:1px solid var(--card-border); border-radius:8px; }
   .root-header .root-path-column { padding:0px 11px; white-space:nowrap; }
   .root-header .root-deep-column { text-align:center; white-space:nowrap; }
   .root-row { padding:10px 0px; min-height:52px; }
-  .root-path-column { flex:1; min-width:0px; gap:0px; }
-  .root-deep-column { width:104px; flex-shrink:0; align-items:center; }
+  .root-path-column { flex:1; min-width:84px; gap:0px; }
+  .root-deep-column { width:80px; flex-shrink:0; align-items:center; }
+  .root-columns .password-actions { width:60px; margin-left:0px; }
   .root-path-cell { width:100%; height:32px; gap:0px; }
   .root-path-cell input { width:100%; height:32px; padding:0px 35px 0px 11px; }
   .root-path-cell .password-text-value { padding:0px 35px 0px 11px; }
@@ -889,7 +891,7 @@ export default {
         <div class="page-header"><label class="heading">{{ texts.rootManagement }}</label></div>
         <div class="password-toolbar"><input id="rootSearch" type="search" class="management-search search-field" :placeholder="texts.searchDirectory" :value="rootQuery" @input="searchRoots"/><button id="addRoot" @click="addRoot()">{{ texts.addRoot }}</button></div>
         <div class="root-table">
-          <div id="rootTableHeader" class="root-columns root-header"><label class="root-path-column">{{ texts.roots }}</label><label class="root-path-column">{{ texts.rootOutput }}</label><label class="root-deep-column">{{ texts.deep }}</label><div class="password-actions"/></div>
+          <div id="rootTableHeader" class="root-columns root-header"><label class="root-path-column">{{ texts.roots }}</label><label class="root-path-column">{{ texts.rootOutput }}</label><label class="root-deep-column">{{ texts.deep }}</label><label class="root-deep-column">{{ texts.recursiveScan }}</label><div class="password-actions"/></div>
           <ScrollView id="rootListScroll"><VirtualList id="rootItems" estimated-height="62px" style="gap:8px"><div v-for="r in shownRootRows" :key="r.id" :id="'root-row-'+r.id" class="history-entry">
             <div class="root-columns root-row">
               <div class="root-path-column"><div class="root-path-cell">
@@ -902,7 +904,7 @@ export default {
                 <input v-show="rootCell===r.id &amp;&amp; rootPart==='output'" :id="'root-output-input-'+r.id" :value="rootDraft(r).output" :placeholder="texts.rootOutputHint" :ellipsis-start="true" @input="v=>changeRoot(r,'output',v)" @blur="blurRoot(r,'output')" @submit="finishRootCell()"/>
                 <button class="root-browse" :id="'browse-root-output-'+r.id" @click="browseRoot(r,'output')"><svg viewBox="0 0 24 24" fill="none"><path d="M3 6h7l2 2h9v11H3V6Z" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
               </div></div>
-              <div class="root-deep-column"><toggle :id="'root-deep-'+r.id" :checked="rootDraft(r).deep" @change="v=>toggleRoot(r,v)"/></div>
+              <div class="root-deep-column"><toggle :id="'root-deep-'+r.id" :checked="rootDraft(r).deep" @change="v=>toggleRoot(r,v)"/></div><div class="root-deep-column"><toggle :id="'root-recursive-'+r.id" :checked="rootDraft(r).recursive" @change="v=>toggleRootRecursive(r,v)"/></div>
               <button class="password-actions" :id="'delete-root-'+r.id" @click="deleteListedRoot(r)">{{ texts.delete }}</button>
             </div>
             <div v-show="rootDraft(r).error" class="action-row"><label class="error">{{ errorText(rootDraft(r).error) }}</label><button :enabled="!rootDraft(r).pending" @click="commitRoots([rootDraft(r)])">{{ texts.saveEntries }}</button><button :enabled="!rootDraft(r).pending" @click="discardRoot(r.id)">{{ texts.cancelEntries }}</button></div>

@@ -17,7 +17,6 @@
     "flatten_single_directory": true
   },
   "filesystem": {
-    "directory_scan_mode": "-",
     "scan_filters_enabled": true,
     "scan_filters": [
       {

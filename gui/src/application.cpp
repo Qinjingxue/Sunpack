@@ -226,10 +226,10 @@ void Application::acknowledge_save(const Json& ack) {
             auto input=remove?std::string():utf8(resolve_path(wide(edit.at("input").get<std::string>()),options_.data_dir).wstring());
             auto output=edit.at("output").get<std::string>(); auto first=output.find_first_not_of(" \t\r\n");
             output=first==std::string::npos?"":output.substr(first,output.find_last_not_of(" \t\r\n")-first+1);
-            records.push_back({{"id",id},{"input",input},{"identity",remove?std::string():utf8(path_key(wide(input)))},{"output",output},{"deep",edit.at("deep")},{"remove",remove}});
+            records.push_back({{"id",id},{"input",input},{"identity",remove?std::string():utf8(path_key(wide(input)))},{"output",output},{"deep",edit.at("deep")},{"recursive",edit.value("recursive",false)},{"remove",remove}});
             for(auto& queued:saves_) if(queued["kind"]==kind) for(auto& next:queued["edits"]) if(next["row"]==id) {
                 next["original"]=input;
-                next["expected"]=remove?Json():Json{{"output",output},{"deep",edit["deep"]}};
+                next["expected"]=remove?Json():Json{{"output",output},{"deep",edit["deep"]},{"recursive",edit.value("recursive",false)}};
                 if(next["operation"]=="delete") next["input"]=input;
                 else next["operation"]=remove?"addMany":"save";
             }

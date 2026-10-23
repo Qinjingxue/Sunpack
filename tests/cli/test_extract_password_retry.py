@@ -48,7 +48,7 @@ def test_existing_cli_json_includes_postprocess_failure(tmp_path, monkeypatch, m
     monkeypatch.setattr(extract, "collect_clipboard_passwords", lambda config: [])
     args = SimpleNamespace(
         paths=[str(source)], password=[], password_file=None, prompt_passwords=False,
-        no_builtin_passwords=True, recursive_extract=None, archive_cleanup_mode=None,
+        no_builtin_passwords=True, recursive_extract=None, recursive=False, archive_cleanup_mode=None,
         flatten_single_directory=None, json=True, quiet=False, verbose=False,
     )
     output = io.StringIO()
@@ -103,7 +103,7 @@ def test_extract_preserves_scan_failure_when_target_succeeds(tmp_path, monkeypat
         password_file=None,
         prompt_passwords=False,
         no_builtin_passwords=True,
-        recursive_extract=None,
+        recursive_extract=None, recursive=False,
         archive_cleanup_mode=None,
         flatten_single_directory=None,
         json=False,
@@ -139,7 +139,7 @@ def test_extract_counts_do_not_classify_or_dedupe_by_display_text(tmp_path, monk
 
     monkeypatch.setattr(extract, "pipeline_engine", lambda config: FakePipelineEngine(Runner))
     monkeypatch.setattr(extract, "collect_clipboard_passwords", lambda config: [])
-    args = SimpleNamespace(paths=[str(tmp_path / "archive")], password=[], password_file=None, prompt_passwords=False,
+    args = SimpleNamespace(recursive=False, paths=[str(tmp_path / "archive")], password=[], password_file=None, prompt_passwords=False,
                            no_builtin_passwords=True, json=True, quiet=False, verbose=False)
     code, result = asyncio.run(extract.handle(args, CliContext(language="en", reporter=CliReporter(json_mode=True))))
     assert code != 0
@@ -180,7 +180,7 @@ def test_scan_diagnostic_budget_is_shared_across_password_retry_rounds(tmp_path,
     monkeypatch.setattr(extract, "collect_clipboard_passwords", lambda config: [])
     monkeypatch.setattr(extract, "_confirm_password_retry", confirm)
     monkeypatch.setattr(extract, "prompt_for_passwords_async", password)
-    args = SimpleNamespace(paths=[str(target)], password=[], password_file=None, prompt_passwords=False,
+    args = SimpleNamespace(recursive=False, paths=[str(target)], password=[], password_file=None, prompt_passwords=False,
                            no_builtin_passwords=True, json=False, quiet=False, verbose=False)
     code, result = asyncio.run(extract.handle(args, CliContext(language="en", reporter=CliReporter(quiet=True))))
     assert code != 0 and result.summary["success_count"] == 1
@@ -226,7 +226,7 @@ def test_extract_prompts_for_password_retry_after_wrong_password(tmp_path, monke
         password_file=None,
         prompt_passwords=False,
         no_builtin_passwords=True,
-        recursive_extract=None,
+        recursive_extract=None, recursive=False,
         archive_cleanup_mode=None,
         flatten_single_directory=None,
         json=False,

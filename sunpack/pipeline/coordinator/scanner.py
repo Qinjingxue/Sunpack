@@ -49,7 +49,7 @@ class ScanOrchestrator:
             for task in self.task_scanner.scan_targets(target_paths)
         ]
 
-    def scan_report(self, target_paths: List[str]) -> ScanReport:
+    def scan_report(self, target_paths: List[str], *, recursive: bool = False) -> ScanReport:
         """Return executable tasks plus archive identities observed during discovery.
 
         Resolved findings are projected lazily from ArchiveTask state so normal
@@ -58,7 +58,8 @@ class ScanOrchestrator:
         represent the observation, such as a password-blocked embedded archive.
         """
 
-        discovered = self.task_scanner.scan_stage_result(target_paths)
+        from sunpack.pipeline.coordinator.scan_session import DiscoveryScanSession
+        discovered = self.task_scanner.scan_stage_result(target_paths, scan_session=DiscoveryScanSession(config=self.task_scanner.config, recursive=recursive))
         tasks = self.task_scanner.filter_processed_tasks(discovered.resolved_tasks)
         findings = [
             finding

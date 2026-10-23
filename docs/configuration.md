@@ -26,20 +26,21 @@ For an installed copy, replace `python sunpack.py` with `sunpack.exe`.
 | `recursive_authorization.enabled` | `true` to apply the nested archive selection policy; `false` to skip this policy. |
 | `post_extract.archive_cleanup_mode` | `"r"` to recycle the original archive after success, `"k"` to keep it, or `"d"` to delete it. |
 | `post_extract.flatten_single_directory` | `true` to lift the contents of a single top-level output folder. |
-| `filesystem.directory_scan_mode` | `"-"` for files directly in the selected directory, or `"*"` to scan its subdirectories too. |
 | `extraction.content_requirement` | `"complete"` to require a complete result, or `"allow_partial"` to accept partial recovery. |
 | `watch.out_dir` | Default output directory for Watch roots without their own output path; `"."` means beside the input. |
 
-For example, add these fields to the main configuration to keep original archives and scan subdirectories:
+For example, add these fields to the main configuration to keep original archives:
 
 ```json
 {
-  "post_extract": {"archive_cleanup_mode": "k"},
-  "filesystem": {"directory_scan_mode": "*"}
+  "post_extract": {"archive_cleanup_mode": "k"}
 }
 ```
 
 CLI options such as `--recur`, `--cleanup`, and `--out-dir` let you set extraction behavior for one command. See the [CLI parameter reference](cli_parameters.md).
+
+
+Directory discovery is shallow by default. Use `--recursive` with `scan`, `inspect`, or `extract`; nested extraction continues to use `--recur`. On upgrades from 1.2.0 or newer, the installer compares old and new advanced fields: it removes retired fields and adds new fields declared by the ordinary template, preserving existing user values and permissions.
 
 ## Scan filters
 

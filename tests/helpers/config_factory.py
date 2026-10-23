@@ -1,4 +1,5 @@
 from copy import deepcopy
+import os
 from typing import Any
 
 from sunpack.core.config.schema import normalize_config
@@ -14,6 +15,8 @@ def make_config(payload: dict[str, Any] | None = None) -> dict[str, Any]:
     config.setdefault("cli", {}).setdefault("language", "en")
     config.setdefault("verification", {})
     config.setdefault("filesystem", {}).setdefault("scan_filters", [])
+    if os.environ.get("SUNPACK_TEST_STATE_DIR"):
+        config.setdefault("watch", {}).setdefault("state_dir", os.environ["SUNPACK_TEST_STATE_DIR"])
     return normalize_config(config)
 
 

@@ -77,7 +77,7 @@ english.PrepareOldFilesRemoveFailed=Some old sunpack files could not be removed.
 english.UninstallStopFailed=sunpack runtime processes or the Watch Broker service could not be stopped. Please restart Windows and run the uninstaller again.
 english.DataDirectoryPermissionsFailed=Failed to secure the SunPack data directory: %s
 english.WatchRootsFileHeader=# Watched folders. Add one folder per line.
-english.WatchRootsFileMapping=# Optional columns: input folder | output folder | deep_detect
+english.WatchRootsFileMapping=# Optional columns: input folder | output folder | deep_detect | initial_scanned | recursive
 english.WatchRootsFileDeepDetect=# deep_detect accepts true or false; blank defaults to false.
 english.WatchRootsFileExample=# Example: C:\Downloads | D:\Extracted | true
 english.EditableConfigCreateFailed=Failed to create the initial editable configuration file: %s
@@ -105,7 +105,7 @@ chinesesimplified.PrepareOldFilesRemoveFailed=无法删除部分旧版 sunpack �
 chinesesimplified.UninstallStopFailed=无法停止 sunpack 运行时进程或 Watch Broker 服务。请重启 Windows，然后重新运行卸载程序。
 chinesesimplified.DataDirectoryPermissionsFailed=无法设置 SunPack 数据目录权限：%s
 chinesesimplified.WatchRootsFileHeader=# 监控文件夹配置，每行填写一个监控目录。
-chinesesimplified.WatchRootsFileMapping=# 可选字段格式：输入目录 | 输出目录 | deep_detect
+chinesesimplified.WatchRootsFileMapping=# 可选字段格式：输入目录 | 输出目录 | deep_detect | initial_scanned | recursive
 chinesesimplified.WatchRootsFileDeepDetect=# deep_detect 可填写 true 或 false；留空时默认为 false。
 chinesesimplified.WatchRootsFileExample=# 示例：C:\Downloads | D:\Extracted | true
 chinesesimplified.EditableConfigCreateFailed=无法创建初始可编辑配置文件：%s
@@ -119,6 +119,7 @@ Name: "autostart"; Description: "{cm:TaskAutostart}"; GroupDescription: "{cm:Gro
 Source: "{#SourceDir}\*"; DestDir: "{app}"; Excludes: "sunpack.exe,sunpack_config.json,sunpack_watch_roots.txt,builtin_passwords.json"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#SourceDir}\sunpack.exe"; DestDir: "{app}\bin"; Flags: ignoreversion
 Source: "{#SourceDir}\sunpack_config.json"; DestDir: "{commonappdata}\SunPack"; Flags: onlyifdoesntexist
+Source: "{#SourceDir}\sunpack_config.json"; DestDir: "{tmp}"; DestName: "sunpack-config-template.json"; Flags: deleteafterinstall
 Source: "{#SourceDir}\builtin_passwords.json"; DestDir: "{commonappdata}\SunPack"; Flags: onlyifdoesntexist
 
 [Dirs]
@@ -691,11 +692,14 @@ var
   DataPath: string;
   FilePath: string;
   Contents: TArrayOfString;
+  DataAlreadyExists: Boolean;
 begin
   DataPath := ExpandConstant('{commonappdata}\SunPack');
+  DataAlreadyExists := DirExists(DataPath);
   if not ForceDirectories(DataPath) then
     RaiseException(Format(CustomMessage('EditableConfigCreateFailed'), [DataPath]));
-  SecurePasswordDataDirectory(DataPath);
+  if not DataAlreadyExists then
+    SecurePasswordDataDirectory(DataPath);
 
   FilePath := AddBackslash(DataPath) + 'sunpack_watch_roots.txt';
   if not FileExists(FilePath) then
@@ -713,6 +717,9 @@ var
   StartupTaskDefaultApplied: Boolean;
   ExistingWatchStateCaptured: Boolean;
   RestartWatchAfterUpgrade: Boolean;
+  ConfigBackupCaptured: Boolean;
+  ConfigMigrationApplied: Boolean;
+  ConfigInstallCompleted: Boolean;
 
 procedure RestoreWatchAfterUpgrade;
 var
@@ -795,6 +802,51 @@ begin
     ApplyStartupTaskDefault;
 end;
 
+procedure CaptureConfigurationForUpgrade;
+var
+  OldAdvanced, UserConfig: string;
+begin
+  if ConfigBackupCaptured then Exit;
+  if InstalledDataRequiresReset then begin ConfigBackupCaptured := True; Exit; end;
+  OldAdvanced := AddBackslash(ExistingApplicationDirectory) + 'sunpack_advanced_config.json';
+  UserConfig := ExpandConstant('{commonappdata}\SunPack\sunpack_config.json');
+  if FileExists(OldAdvanced) and FileExists(UserConfig) then
+  begin
+    if not FileCopy(OldAdvanced, ExpandConstant('{tmp}\sunpack-old-advanced.json'), False) or
+       not FileCopy(UserConfig, ExpandConstant('{tmp}\sunpack-user-backup.json'), False) then
+      RaiseException('Unable to capture SunPack configuration before upgrade.');
+  end;
+  ConfigBackupCaptured := True;
+end;
+
+procedure UpgradeConfigurationFields;
+var
+  Parameters: string;
+  ResultCode: Integer;
+begin
+  if not FileExists(ExpandConstant('{tmp}\sunpack-old-advanced.json')) then Exit;
+  Parameters := '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ' +
+    AddQuotes(ExpandConstant('{app}\scripts\upgrade_config.ps1')) +
+    ' -OldAdvanced ' + AddQuotes(ExpandConstant('{tmp}\sunpack-old-advanced.json')) +
+    ' -NewAdvanced ' + AddQuotes(ExpandConstant('{app}\sunpack_advanced_config.json')) +
+    ' -Template ' + AddQuotes(ExpandConstant('{tmp}\sunpack-config-template.json')) +
+    ' -UserConfig ' + AddQuotes(ExpandConstant('{commonappdata}\SunPack\sunpack_config.json'));
+  if not Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+              Parameters, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+    RaiseException('Unable to start SunPack configuration field upgrade.')
+  else if ResultCode <> 0 then
+    RaiseException(Format('SunPack configuration field upgrade failed (%d).', [ResultCode]));
+  ConfigMigrationApplied := True;
+end;
+
+procedure DeinitializeSetup;
+begin
+  if ConfigMigrationApplied and not ConfigInstallCompleted then
+    if not FileCopy(ExpandConstant('{tmp}\sunpack-user-backup.json'),
+        ExpandConstant('{commonappdata}\SunPack\sunpack_config.json'), False) then
+      Log('Unable to restore SunPack user configuration after installation failure.');
+end;
+
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
   ApplyStartupTaskDefault;
@@ -819,6 +871,7 @@ begin
     Result := CustomMessage('TaskAddToPathFailed');
     Exit;
   end;
+  CaptureConfigurationForUpgrade;
   if InstalledDataRequiresReset then
   begin
     Log('Removing pre-1.2.0 or unversioned SunPack data for a fresh installation.');
@@ -850,9 +903,11 @@ procedure CurStepChanged(CurStep: TSetupStep);
 var
   ResultCode: Integer;
 begin
+  if CurStep = ssDone then ConfigInstallCompleted := True;
   if CurStep = ssPostInstall then
   begin
     EnsureLocalizedEditableConfigFiles;
+    UpgradeConfigurationFields;
     InstallBrokerService;
     if not Exec(
       ExpandConstant('{app}\sunpack-runtime.exe'),

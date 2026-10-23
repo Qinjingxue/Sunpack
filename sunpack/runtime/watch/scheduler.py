@@ -12,7 +12,7 @@ from enum import Enum, auto
 from pathlib import Path
 from typing import Callable, Iterable
 
-from sunpack.core.support.path_keys import case_key, path_key
+from sunpack.core.support.path_keys import case_key, path_key, absolute_path_key, path_key_is_under
 from sunpack_native import fast_hash128
 
 from sunpack.core.config.fields.watch import DEFAULT_WATCH_CONFIG
@@ -43,6 +43,8 @@ from sunpack.runtime.watch.scanner import (
 from sunpack.runtime.watch.scanner import _candidate_for as _watch_candidate_for_path
 from sunpack.runtime.watch.state import WatchStateEntry, WatchStateStore, _recorded_file_presence
 from sunpack.runtime.watch.roots import WatchRootEntry
+from sunpack.core.contracts.discovery_scope import DiscoveryScope
+from sunpack.pipeline.discovery.filesystem.directory_scanner import DirectoryScanner
 from sunpack.runtime.watch.toast import NullWatchNotificationSink
 from sunpack.core.i18n import I18nContext
 from sunpack.core.passwords.internal import builtin as builtin_passwords_module
@@ -140,13 +142,14 @@ class WatchScheduler:
         observer_stop_timeout_seconds: float | None = None,
         pipeline_engine=None,
         notification_sink=None,
+        output_ownership=None,
         wake_callback: Callable[[], None] | None = None,
     ):
         self.config = config
         self.i18n = I18nContext(config["cli"]["language"])
         watch_config = config["watch"]
         self.watch_roots = [os.path.abspath(path) for path in watch_roots]
-        validate_ntfs_watch_roots(self.watch_roots)
+        validate_ntfs_watch_roots([_nearest_existing_directory(root) for root in self.watch_roots])
         expanded_out_dir = os.path.expanduser(out_dir)
         self.out_dir = os.path.normpath(expanded_out_dir) if not os.path.isabs(expanded_out_dir) else os.path.abspath(expanded_out_dir)
         # Every watch root has exactly one absolute output root, resolved here so no request path
@@ -169,6 +172,7 @@ class WatchScheduler:
                 root,
                 self.output_roots[path_key(root)],
                 configured_entries[path_key(root)].deep_detect if path_key(root) in configured_entries else False,
+                recursive=configured_entries[path_key(root)].recursive if path_key(root) in configured_entries else False,
             )
             for root in self.watch_roots
         }
@@ -180,7 +184,10 @@ class WatchScheduler:
             0.0,
             float(configured_cold_start if cold_start_seconds is None else cold_start_seconds),
         )
-        self.recursive = False
+        self._scan_options = DirectoryScanner.compile_scan_options(config)
+        self.scopes = {path_key(root): DiscoveryScope(root, recursive=self.root_entries[path_key(root)].recursive,
+            excluded_subtrees=[other for other in self.watch_roots if other != root and _is_relative_to(other, root)])
+            for root in self.watch_roots}
         self.observer_stop_timeout_seconds = max(
             0.0,
             float(
@@ -189,7 +196,10 @@ class WatchScheduler:
                 else observer_stop_timeout_seconds
             ),
         )
-        self.state = WatchStateStore(state_path, retirement_callback=self._schedule_journal_retirement)
+        self.output_ownership = output_ownership
+        self._owns_state = output_ownership is None
+        self.state = (WatchStateStore(state_path, retirement_callback=self._schedule_journal_retirement)
+                      if self._owns_state else output_ownership.state_for(state_path))
         log_path = Path(state_path).with_name("events.jsonl")
         self.log = WatchLogStore(str(log_path), wake_callback=self._wake_service)
         state_parent = Path(state_path).parent
@@ -204,11 +214,14 @@ class WatchScheduler:
         # publication. The lock is held only across short candidate/readiness
         # probes, so a claim is a true linearization point: an observation is
         # either fully admitted before the claim or cannot touch the source.
-        self._claim_gate = threading.RLock()
+        self._claim_gate = output_ownership.gate if output_ownership is not None else threading.RLock()
         self._active_claims: dict[str, str] = {}
         self._claims_by_owner: dict[str, set[str]] = {}
         self._dirty_during_claim: dict[str, dict[str, str]] = {}
         self._password_source_lock = threading.RLock()
+        self._directory_pending: set[str] = set()
+        self._watch_rearm: set[str] = set()
+        self._observed_watches = {}
         self._pending: dict[str, WatchCandidate] = {}
         # All pending mutations use the helpers below under _lock. Keep every
         # spelling of a path so a normalized source claim retires all aliases.
@@ -323,16 +336,8 @@ class WatchScheduler:
                 "state_pruned_on_start",
                 entries=removed_entries,
             )
-        handler = _WatchEventHandler(self)
-        scheduled_paths: set[str] = set()
-        for root in self.watch_roots:
-            watch_path = root if os.path.isdir(root) else os.path.dirname(root)
-            self._observer.schedule(handler, watch_path, recursive=self.recursive and os.path.isdir(root))
-            scheduled_paths.add(case_key(os.path.abspath(watch_path)))
-        builtin_password_dir = os.path.dirname(self.builtin_password_file)
-        builtin_password_dir_key = case_key(os.path.abspath(builtin_password_dir))
-        if os.path.isdir(builtin_password_dir) and builtin_password_dir_key not in scheduled_paths:
-            self._observer.schedule(handler, builtin_password_dir, recursive=False)
+        self._watch_handler = _WatchEventHandler(self)
+        self._refresh_directory_watches()
         with lifecycle_registration(self.watch_roots):
             self._observer.start()
             try:
@@ -352,18 +357,61 @@ class WatchScheduler:
         self._started = True
         self._recover_persisted_work()
         self._reconcile_persisted_blockers()
+        if self.output_ownership is not None:
+            self.output_ownership.retain_scopes(list(self.scopes.values()))
+            for root in self.watch_roots:
+                self.output_ownership.reconcile(root, recursive=True)
+        for root in self.watch_roots:
+            scope = self.scopes[path_key(root)]
+            marker = self.state._native.runtime_record("catalog|" + path_key(root))
+            if marker is None or marker["recursive"] != self.root_entries[path_key(root)].recursive:
+                self._scan_candidates([root],recursive=self.root_entries[path_key(root)].recursive)
         self._recover_usn_startup_gap()
         self.log.write(
             "scheduler_started",
             roots=self.watch_roots,
             out_dir=self.out_dir,
             output_roots=self.output_roots,
-            recursive=self.recursive,
+            recursive=any(entry.recursive for entry in self.root_entries.values()),
             pending=self.pending_count,
             cold_start_seconds=self.cold_start_seconds,
             quiet_min_seconds=self._quiet_policy.minimum_seconds,
             quiet_max_seconds=self._quiet_policy.maximum_seconds,
         )
+
+    def _refresh_directory_watches(self, changed=()):
+        desired = {}
+        for root in self.watch_roots:
+            if os.path.isdir(root):
+                desired[(root, self.root_entries[path_key(root)].recursive)] = None
+            # Ancestor guards observe deletion/recreation without subtree scans.
+            parent = os.path.dirname(root)
+            while parent:
+                if os.path.isdir(parent):
+                    desired[(parent, False)] = None
+                ancestor = os.path.dirname(parent)
+                if ancestor == parent:
+                    break
+                parent = ancestor
+        password_dir = os.path.dirname(self.builtin_password_file)
+        if os.path.isdir(password_dir):
+            desired[(password_dir, False)] = None
+        for key, watch in list(self._observed_watches.items()):
+            if key not in desired or any(_paths_match(key[0], path, recursive=True) for path in changed):
+                self._observer.unschedule(watch)
+                del self._observed_watches[key]
+        for key in desired:
+            if key not in self._observed_watches:
+                try:
+                    self._observed_watches[key] = self._observer.schedule(self._watch_handler, key[0], recursive=key[1])
+                except FileNotFoundError:
+                    continue  # Its ancestor guard re-arms when it reappears.
+
+    def _queue_watch_rearm(self, path):
+        if any(_paths_match(root, path, recursive=True) for root in self.watch_roots):
+            with self._lock:
+                self._watch_rearm.add(os.path.abspath(path))
+            self._wake_service()
 
     async def scan_initial_roots(self, roots: list[str]) -> list[str]:
         return await self.pipeline_engine.work_broker.run(
@@ -373,7 +421,10 @@ class WatchScheduler:
     def _scan_initial_roots(self, roots: list[str]) -> list[str]:
         completed = []
         for root in roots:
-            candidates, errors = self._scan_candidates([root], recursive=self.recursive)
+            matched = _longest_matching_root(root,self.watch_roots)
+            if matched is None or not os.path.exists(root):
+                continue
+            candidates, errors = self._scan_candidates([root], recursive=self.root_entries[path_key(matched)].recursive)
             for candidate in candidates:
                 self.enqueue(candidate.path, event_type="initial_scan")
             if not errors:
@@ -385,11 +436,21 @@ class WatchScheduler:
         return completed
 
     def _watch_root_directory(self, root: str) -> str:
-        root = os.path.abspath(root)
-        return root if os.path.isdir(root) else os.path.dirname(root)
+        return _nearest_existing_directory(root)
 
     def _scan_candidates(self, roots: list[str], *, recursive: bool) -> tuple[list[WatchCandidate], list[tuple[str, str, str]]]:
-        candidates, errors = scan_watch_candidates(roots, recursive=recursive)
+        from sunpack.runtime.watch.scanner import _candidate_from_native
+        candidates, errors = [], []
+        for root in roots:
+            matched = _longest_matching_root(root, self.watch_roots)
+            scope = self.scopes[path_key(matched)] if matched else DiscoveryScope(root, recursive=recursive)
+            operations, failures = self._scan_options.catalog_update(self.state._native, scope.native, root, True)
+            self.state.commit_runtime(operations)
+            errors.extend(failures)
+            if not failures and path_key(root) == path_key(scope.root):
+                self.state.commit_runtime([{"op":"runtime", "key":"catalog|"+path_key(root),
+                    "value":{"recursive":self.root_entries[path_key(root)].recursive}}])
+            candidates.extend(_candidate_from_native(row) for row in self._scan_options.catalog_candidates(self.state._native, scope.native, root))
         if errors:
             self.log.write("filesystem_scan_failed", roots=roots, errors=[
                 filesystem_scan_failure(error, self.i18n.language).message for error in errors
@@ -445,12 +506,23 @@ class WatchScheduler:
 
         for root in sorted(fallback_roots):
             try:
-                candidates, _errors = self._scan_candidates([root], recursive=False)
+                candidates, scan_errors = self._scan_candidates([root], recursive=self.root_entries[path_key(root)].recursive)
+                if scan_errors:
+                    cursor_updates.clear()
                 for candidate in candidates:
                     changed_paths.setdefault(path_key(candidate.path), candidate.path)
             except OSError as exc:
                 self.log.write("usn_fallback_scan_failed", root=root, error=str(exc))
 
+        for path in list(changed_paths.values()):
+            if os.path.isdir(path):
+                candidates, failures = self._scan_candidates([path], recursive=True)
+                for candidate in candidates:
+                    changed_paths.setdefault(path_key(candidate.path), candidate.path)
+                if failures:
+                    cursor_updates.clear()
+            elif not os.path.exists(path):
+                self.notify_path_departed(path, recursive=True)
         for path in changed_paths.values():
             if _persisted_blocker_owns_retry(self.state, path):
                 continue
@@ -523,6 +595,7 @@ class WatchScheduler:
                 continue
 
             recovered: dict[str, WatchCandidate] = {}
+            recovery_scopes = {}
             for task_path in active_outputs:
                 if path_key(task_path) in completed_sources:
                     continue
@@ -532,6 +605,8 @@ class WatchScheduler:
                     and not _persisted_blocker_owns_retry(self.state, candidate.path)
                 ):
                     recovered.setdefault(path_key(candidate.path), candidate)
+                    source_scope = self.scopes.get(path_key(pending.source_input_root)) or DiscoveryScope(os.path.dirname(candidate.path))
+                    recovery_scopes[path_key(candidate.path)] = pending.discovery_scope or source_scope.to_record()
 
             missing_committed_roots = [
                 root for root in committed_roots if not os.path.isdir(root)
@@ -563,7 +638,9 @@ class WatchScheduler:
                 if not os.path.isdir(root):
                     continue
                 try:
-                    candidates, _errors = self._scan_candidates([root], recursive=True)
+                    candidates, _errors = scan_watch_candidates([root], recursive=True)
+                    if _errors:
+                        scan_failed = True
                 except OSError as exc:
                     self.log.write(
                         "crash_resume_scan_failed",
@@ -579,6 +656,7 @@ class WatchScheduler:
                     if _persisted_blocker_owns_retry(self.state, candidate.path):
                         continue
                     recovered.setdefault(path_key(candidate.path), candidate)
+                    recovery_scopes[path_key(candidate.path)] = DiscoveryScope(root, recursive=True).to_record()
             if scan_failed:
                 continue
 
@@ -599,6 +677,7 @@ class WatchScheduler:
                 candidates,
                 password_scope_dir=scope_dir,
                 source_input_root=pending.source_input_root,
+                discovery_scopes=recovery_scopes,
             )
             for candidate in candidates:
                 self.enqueue(
@@ -683,7 +762,8 @@ class WatchScheduler:
         with self._claim_gate, self._lock:
             self._closed = True
         try:
-            self.state.close()
+            if self._owns_state:
+                self.state.close()
         finally:
             self.log.close()
             with self._claim_gate, self._lock:
@@ -718,6 +798,19 @@ class WatchScheduler:
         self._observer.join(timeout=self.observer_stop_timeout_seconds)
 
     async def run_once(self) -> WatchRunResult:
+        with self._lock:
+            rearm = tuple(self._watch_rearm)
+            self._watch_rearm.clear()
+            directories = sorted(self._directory_pending, key=len)
+            self._directory_pending.clear()
+        if rearm and self._started:
+            await self.pipeline_engine.work_broker.run("watch_rearm", "watch", self._refresh_directory_watches, rearm, request_id="watch")
+        covered = []
+        for directory in directories:
+            if not any(_is_relative_to(directory,parent) for parent in covered):
+                await self.pipeline_engine.work_broker.run("watch_directory", directory,
+                    self._scan_initial_roots, [directory], request_id="watch", origin="watch")
+                covered.append(directory)
         now = time.monotonic()
         with self._lock:
             reload_due = self._password_reload_at is not None and self._password_reload_at <= now
@@ -926,6 +1019,8 @@ class WatchScheduler:
         now = time.time()
         monotonic_now = time.monotonic()
         with self._lock:
+            if self._directory_pending or self._watch_rearm:
+                return 0.0
             next_ready = self._next_ready_entry_locked()
             delay = (
                 None
@@ -1072,11 +1167,15 @@ class WatchScheduler:
         _recovery_scope_dir: str = "",
         _state_prequeued: bool = False,
     ):
-        if self.should_ignore_event_path(path):
+        pending_recovery = self.state.pending_work_for_path(path)
+        retry_scope = (_password_retry_snapshot.failure_payload.get("discovery_scope")
+                       if _password_retry_snapshot is not None else None)
+        authorized_recovery = bool((pending_recovery and pending_recovery.internal_recovery) or retry_scope)
+        if self.should_ignore_event_path(path) and not authorized_recovery:
             return
         lookup_path = os.path.abspath(path)
         with self._claim_gate:
-            if self._closed:
+            if self._closed or (self.should_ignore_event_path(path) and not authorized_recovery):
                 return
             if self._defer_claimed_path_locked(lookup_path):
                 return
@@ -1097,11 +1196,24 @@ class WatchScheduler:
             if candidate is None:
                 self._log_candidate_ignored(path, "not_a_file_or_unreadable")
                 return
+            matched_root = _longest_matching_root(candidate.path, self.watch_roots)
+            if matched_root:
+                scope = self.scopes[path_key(matched_root)]
+                operations, _ = self._scan_options.catalog_update(self.state._native, scope.native, candidate.path)
+                self.state.commit_runtime(operations)
+            done = self.state._native.runtime_record("done|" + path_key(candidate.path))
+            if done and _password_retry_snapshot is None and not _crash_recovery:
+                previous_done = _CandidateObservation(done["size"], done["mtime"], done["file_id"], done["change_usn"])
+                same = _candidate_change_kind(previous_done, candidate) != _CandidateChangeKind.CONTENT_CHANGED
+                entry = self.root_entries.get(path_key(matched_root)) if matched_root else None
+                if same and entry and entry.deep_detect == done["deep_detect"] and all(os.path.isdir(p) for p in done["outputs"]):
+                    return
+                self.state.commit_runtime([{"op":"runtime","key":"done|"+path_key(candidate.path)}])
             password_retry = (
                 _password_retry_snapshot is not None
                 and _candidate_matches_password_failure(candidate, _password_retry_snapshot)
             )
-            internal_recovery = bool(_crash_recovery)
+            internal_recovery = bool(_crash_recovery or retry_scope)
             if not self._is_under_watched_root(candidate.path) and not password_retry and not internal_recovery:
                 self._log_candidate_ignored(candidate.path, "outside_watched_roots")
                 return
@@ -1174,6 +1286,7 @@ class WatchScheduler:
                                 else self._source_input_root_for(candidate.path)
                             ),
                             internal_recovery=internal_recovery,
+                            discovery_scope=retry_scope or (pending_recovery.discovery_scope if pending_recovery else {}),
                             durable_owner=durable_owner,
                             persist=durable_owner,
                             durable=bool(password_retry or internal_recovery),
@@ -1322,7 +1435,7 @@ class WatchScheduler:
     def should_ignore_event_path(self, path: str) -> bool:
         if not path:
             return True
-        return self._is_under_metadata_dir(path)
+        return self._is_under_metadata_dir(path) or bool(self.output_ownership and self.output_ownership.protected(path))
 
     def _log_candidate_ignored(self, path: str, reason: str, **payload) -> None:
         normalized = case_key(os.path.abspath(str(path))) if path else ""
@@ -1361,8 +1474,32 @@ class WatchScheduler:
             self.log.write("password_source_changed", password_generation=generation)
             self._mark_all_password_failures_dirty()
 
+    def notify_directory_arrived(self, path: str):
+        if not path:
+            return
+        self._queue_watch_rearm(path)
+        if self.output_ownership is not None:
+            self.output_ownership.reconcile(path)
+        if self.should_ignore_event_path(path):
+            return
+        root = _longest_matching_root(os.path.abspath(path), self.watch_roots)
+        with self._lock:
+            if root is not None and (self.root_entries[path_key(root)].recursive or path_key(path) == path_key(root)):
+                self._directory_pending.add(os.path.abspath(path))
+            else:
+                self._directory_pending.update(root for root in self.watch_roots if _paths_match(root, path, recursive=True))
+        self._wake_service()
+
     def notify_path_departed(self, path: str, *, recursive: bool = False) -> None:
         normalized = os.path.abspath(path)
+        if recursive:
+            self._queue_watch_rearm(normalized)
+        if self.output_ownership is not None:
+            self.output_ownership.reconcile(normalized, recursive=recursive)
+        matched = _longest_matching_root(normalized,self.watch_roots)
+        if matched is not None:
+            operations, _ = self._scan_options.catalog_update(self.state._native,self.scopes[path_key(matched)].native,normalized,recursive)
+            self.state.commit_runtime(operations)
         with self._claim_gate:
             # Delete/move notifications may arrive after the path was recreated,
             # or while it is temporarily unqueryable. Neither proves departure.
@@ -1713,6 +1850,18 @@ class WatchScheduler:
         self,
         candidate: WatchCandidate,
     ) -> _ActivePipelineRequest | None:
+        pending_recovery = self.state.pending_work_for_path(candidate.path)
+        internal_scope = (DiscoveryScope.from_record(pending_recovery.discovery_scope)
+            if pending_recovery and pending_recovery.internal_recovery and pending_recovery.discovery_scope else None)
+        if pending_recovery and pending_recovery.internal_recovery and internal_scope is None:
+            # Legacy records had no scope: a shallow boundary is the only
+            # evidence they authorize. New records always carry their scope.
+            internal_scope = DiscoveryScope(os.path.dirname(candidate.path))
+        if internal_scope is not None and not internal_scope.contains(candidate.path):
+            raise ValueError("Recovery input is outside its persisted discovery scope")
+        if self.should_ignore_event_path(candidate.path) and internal_scope is None:
+            self.state.complete_work([candidate.path])
+            return None
         source_input_root = self._source_input_root_for(candidate.path)
         root_entry = self.root_entries.get(path_key(source_input_root))
         if root_entry is None:
@@ -1720,6 +1869,8 @@ class WatchScheduler:
             return None
         options = EmbeddedOptions(force_scan=root_entry.deep_detect)
         self.state.bind_input_root(candidate.path, source_input_root)
+        scope = internal_scope or self.scopes[path_key(source_input_root)]
+        self.state.queue_active(candidate, discovery_scope=scope.to_record(), durable=True)
         notification_id = uuid.uuid4().hex
         with self._password_source_lock:
             run_config = dict(self.config)
@@ -1737,6 +1888,7 @@ class WatchScheduler:
             **(run_config.get("output", {}) if isinstance(run_config.get("output"), dict) else {}),
             "root": output_root,
             "common_root": self._common_root_for(candidate.path),
+            "fixed_root": True,
         }
         from sunpack.runtime.cli.runtime_state import runtime_host
 
@@ -1767,6 +1919,8 @@ class WatchScheduler:
                 ),
                 request_config=run_config,
                 origin="watch",
+                discovery_scope=internal_scope or self.scopes[path_key(source_input_root)],
+                catalog=None if internal_scope else (self.state._native, self._scan_options, candidate.path),
                 detection_options=options,
             ))
         except BaseException:
@@ -1949,6 +2103,9 @@ class WatchScheduler:
                 password_scope_dir=scope_dir if password else "",
                 source_input_root=self._source_input_root_for(retry_path),
             )
+            payload["discovery_scope"] = failure.details.get("discovery_scope") or (
+                self.scopes[path_key(request.source_input_root)].to_record()
+                if path_key(request.source_input_root) in self.scopes else DiscoveryScope(os.path.dirname(retry_path)).to_record())
             error = _failure_message(failure, self.i18n.t("watch.failure.extraction_failed"))
             status = "suspended_missing_volume" if missing else "failed_password"
             with self._password_source_lock:
@@ -2065,6 +2222,14 @@ class WatchScheduler:
             self._notify("failed", request.notification_id, [error], [])
             return WatchRunResult(processed=1, failed=1, errors=[error])
 
+        completed = []
+        for source in claimed_paths:
+            observed = _watch_candidate_for_path(source)
+            if observed is not None:
+                completed.append({"op":"runtime", "key":"done|"+path_key(source), "value":{
+                    "path":source,"size":observed.size,"mtime":observed.mtime,"file_id":observed.file_id,
+                    "change_usn":observed.change_usn,"outputs":generated_output_dirs,"deep_detect":request.deep_detect}})
+        self.state.commit_runtime(completed, durable=True)
         self.log.write(
             "done",
             path=candidate.path,
@@ -2163,15 +2328,7 @@ class WatchScheduler:
         return self._common_root_for(path)
 
     def _is_under_watched_root(self, path: str) -> bool:
-        normalized = case_key(os.path.abspath(path))
-        for root in self.watch_roots:
-            normalized_root = case_key(os.path.abspath(root))
-            if os.path.isdir(root):
-                if case_key(os.path.dirname(normalized)) == normalized_root:
-                    return True
-            elif normalized == normalized_root:
-                return True
-        return False
+        return any(scope.contains(path) for scope in self.scopes.values())
 
     def _is_under_metadata_dir(self, path: str) -> bool:
         normalized = os.path.abspath(path)
@@ -2210,14 +2367,18 @@ class _WatchEventHandler(FileSystemEventHandler):
     def on_moved(self, event: FileSystemEvent):
         src_path = getattr(event, "src_path", "")
         is_directory = bool(getattr(event, "is_directory", False))
+        if is_directory and src_path and getattr(event,"dest_path","") and self.scheduler.output_ownership is not None:
+            self.scheduler.output_ownership.relocate(src_path,event.dest_path)
         if src_path:
             self._handle_departure_path(
                 src_path,
                 is_directory=is_directory,
             )
-        if is_directory:
-            return
         dest_path = getattr(event, "dest_path", "")
+        if is_directory:
+            if dest_path:
+                self.scheduler.notify_directory_arrived(dest_path)
+            return
         if dest_path:
             self._handle_path(dest_path, event_type="moved", src_path=src_path)
 
@@ -2237,6 +2398,8 @@ class _WatchEventHandler(FileSystemEventHandler):
 
     def _handle(self, event: FileSystemEvent, event_type: str):
         if getattr(event, "is_directory", False):
+            if event_type == "created":
+                self.scheduler.notify_directory_arrived(getattr(event, "src_path", ""))
             return
         src_path = getattr(event, "src_path", "")
         if src_path:
@@ -2328,6 +2491,16 @@ def _candidate_from_state_entry(entry: WatchStateEntry | None) -> WatchCandidate
     )
 
 
+def _nearest_existing_directory(path: str) -> str:
+    current = os.path.abspath(path)
+    while not os.path.isdir(current):
+        parent = os.path.dirname(current)
+        if parent == current:
+            raise FileNotFoundError(current)
+        current = parent
+    return current
+
+
 def _longest_matching_root(path: str, roots: list[str]) -> str | None:
     matches = [root for root in roots if _is_relative_to(path, root)]
     if not matches:
@@ -2336,11 +2509,7 @@ def _longest_matching_root(path: str, roots: list[str]) -> str | None:
 
 
 def _is_relative_to(path: str, root: str) -> bool:
-    try:
-        Path(path).resolve().relative_to(Path(root).resolve())
-        return True
-    except ValueError:
-        return False
+    return path_key_is_under(absolute_path_key(path), absolute_path_key(root))
 
 
 def _paths_match(path: str, expected: str, *, recursive: bool) -> bool:

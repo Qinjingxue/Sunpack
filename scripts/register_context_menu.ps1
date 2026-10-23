@@ -148,10 +148,12 @@ function New-FileCommandString {
 function New-WatchCommandString {
     param(
         [hashtable]$Launcher,
-        [string]$TargetToken
+        [string]$TargetToken,
+        [switch]$Recursive
     )
 
     $watchArguments = @("watch", "add", $TargetToken, "--start")
+    if ($Recursive) { $watchArguments += "--recursive" }
     if ($Launcher.Mode -ne "app") { $watchArguments = @($Launcher.ScriptPath) + $watchArguments }
     return New-HiddenStartProcessCommand -FilePath $Launcher.AppPath -ArgumentList $watchArguments
 }
@@ -289,6 +291,7 @@ function Get-SubMenuTexts {
         return @{
             Prompt = "$promptVerb$subject"
             Direct = "$directVerb$subject"
+            RecursiveWatch = New-ChineseText @(0x9012, 0x5F52, 0x76D1, 0x63A7, 0x6B64, 0x76EE, 0x5F55)
             Watch = New-ChineseText @(0x76D1, 0x63A7, 0x6B64, 0x76EE, 0x5F55)
             Unwatch = New-ChineseText @(0x53D6, 0x6D88, 0x76D1, 0x63A7, 0x6B64, 0x76EE, 0x5F55)
         }
@@ -298,6 +301,7 @@ function Get-SubMenuTexts {
     return @{
         Prompt = "Enter password to extract $subject"
         Direct = "Extract $subject"
+        RecursiveWatch = "Watch this folder recursively"
         Watch = "Watch this folder"
         Unwatch = "Stop watching this folder"
     }
@@ -368,6 +372,8 @@ if ($DryRun) {
 Set-ContextMenuParent -KeyPath $folderKey -MenuLabel $resolvedMenuText -IconValue $resolvedIconPath -SubCommandsKey $folderSubCommandsName
 Set-ContextMenuCommand -ParentKeyPath $folderSubCommandsKey -CommandName "DirectExtract" -MenuLabel $folderMenuTexts.Direct -CommandLine $folderDirectCommand -IconValue $resolvedIconPath
 Set-ContextMenuCommand -ParentKeyPath $folderSubCommandsKey -CommandName "PromptPassword" -MenuLabel $folderMenuTexts.Prompt -CommandLine $folderPromptCommand -IconValue $resolvedIconPath
+Set-ContextMenuCommand -ParentKeyPath $folderSubCommandsKey -CommandName "WatchFolderRecursive" -MenuLabel $folderMenuTexts.RecursiveWatch -CommandLine (New-WatchCommandString -Launcher $launcher -TargetToken $folderToken -Recursive) -IconValue $resolvedIconPath
+Set-ContextMenuCommand -ParentKeyPath $backgroundSubCommandsKey -CommandName "WatchFolderRecursive" -MenuLabel $folderMenuTexts.RecursiveWatch -CommandLine (New-WatchCommandString -Launcher $launcher -TargetToken $backgroundToken -Recursive) -IconValue $resolvedIconPath
 Set-ContextMenuCommand -ParentKeyPath $folderSubCommandsKey -CommandName "WatchFolder" -MenuLabel $folderMenuTexts.Watch -CommandLine $folderWatchCommand -IconValue $resolvedIconPath
 Set-ContextMenuCommand -ParentKeyPath $folderSubCommandsKey -CommandName "UnwatchFolder" -MenuLabel $folderMenuTexts.Unwatch -CommandLine $folderUnwatchCommand -IconValue $resolvedIconPath
 Set-ContextMenuParent -KeyPath $backgroundKey -MenuLabel $resolvedMenuText -IconValue $resolvedIconPath -SubCommandsKey $backgroundSubCommandsName

@@ -14,16 +14,21 @@ from sunpack_native import NativeDirectoryScanOptions, scan_directory_snapshot, 
 from sunpack.core.config.schema import normalize_config
 from sunpack.core.contracts.failures import FailureKind
 from sunpack.core.contracts.run_state import RunState
+from sunpack.core.contracts.discovery_scope import DiscoveryScope
 from sunpack.core.i18n import I18nContext
 from sunpack.core.i18n.context import validate_catalog
 from sunpack.core.support.filesystem_scan_errors import filesystem_scan_error_count
 from sunpack.pipeline.coordinator.output_scan_policy import NestedOutputScanPolicy
 from sunpack.pipeline.coordinator.task_scan import ArchiveTaskScanner
 from sunpack.pipeline.coordinator.scan_session import DiscoveryScanSession
+from sunpack.pipeline.discovery.filesystem.directory_scanner import DirectoryScanner
 from sunpack.runtime.cli.cli_context import CliContext
 from sunpack.runtime.cli.cli_reporter import CliReporter
 from sunpack.runtime.cli.commands import inspect_command, scan
 from sunpack.runtime.watch.scheduler import WatchScheduler
+from sunpack.runtime.watch.roots import WatchRootEntry
+from sunpack.runtime.watch.state import WatchStateStore
+from sunpack.core.support.path_keys import path_key
 
 
 @contextmanager
@@ -38,7 +43,7 @@ def deny_directory_listing(path):
 
 @pytest.mark.parametrize("json_mode", [False, True])
 @pytest.mark.parametrize("language", ["en", "zh"])
-def test_unreadable_subtree_is_reported_without_losing_readable_archives(tmp_path, monkeypatch, json_mode, language):
+def test_unreadable_subtree_is_reported_without_losing_readable_archives(tmp_path, monkeypatch, request, json_mode, language):
     # Covers real native I/O failures through discovery, CLI and Watch reporting;
     # existing tests inject provider failures and cannot catch swallowed OS errors.
     root = tmp_path / "inputs"
@@ -49,7 +54,6 @@ def test_unreadable_subtree_is_reported_without_losing_readable_archives(tmp_pat
             output.writestr("payload.txt", "payload")
     config = normalize_config({"verification": {}, "cli": {"language": language}, "filesystem": {
         "scan_filters": [{"name": "size_range", "enabled": False}],
-        "directory_scan_mode": "*",
     }})
     monkeypatch.setattr(scan, "load_request_config", lambda _cwd: config)
     stderr = io.StringIO()
@@ -59,6 +63,12 @@ def test_unreadable_subtree_is_reported_without_losing_readable_archives(tmp_pat
     notifications = []
     log_events = []
     scheduler = object.__new__(WatchScheduler)
+    scheduler.watch_roots = [str(root)]
+    scheduler.scopes = {path_key(root): DiscoveryScope(str(root), recursive=True)}
+    scheduler.root_entries = {path_key(root): WatchRootEntry(str(root), recursive=True)}
+    scheduler._scan_options = DirectoryScanner.compile_scan_options(config)
+    scheduler.state = WatchStateStore(str(tmp_path / "scan-state.json"))
+    request.addfinalizer(scheduler.state.close)
     scheduler.i18n = I18nContext(language)
     scheduler.log = SimpleNamespace(write=lambda event, **fields: log_events.append((event, fields)))
     scheduler._notify = lambda *args: notifications.append(args)
@@ -74,10 +84,10 @@ def test_unreadable_subtree_is_reported_without_losing_readable_archives(tmp_pat
         single = scan_directory_snapshot(str(blocked), None, [], [], [], [], [], [], [])
         assert not single and len(single.scan_errors()) == 1
         state = RunState()
-        tasks = ArchiveTaskScanner(config, state).scan_targets([str(root)])
+        tasks = ArchiveTaskScanner(config, state).scan_targets([str(root)], scan_session=DiscoveryScanSession(config=config,recursive=True))
         assert len(tasks) == 1 and tasks[0].main_path == str(root / "good.blob")
         assert state.scan_failures[0].kind == FailureKind.FILESYSTEM_ERROR
-        code, result = scan.handle(SimpleNamespace(paths=[str(root)], deep_detect=False, json=json_mode), context)
+        code, result = scan.handle(SimpleNamespace(recursive=True, paths=[str(root)], deep_detect=False, json=json_mode), context)
         assert code != 0 and result.summary["task_count"] == 1
         assert result.summary["scan_error_count"] == 1
         assert len(result.errors) == 1 and str(blocked) in result.errors[0]
@@ -97,6 +107,7 @@ def test_unreadable_subtree_is_reported_without_losing_readable_archives(tmp_pat
         assert not notifications
         assert log_events[-1][0] == "filesystem_scan_failed"
         assert str(blocked) in log_events[-1][1]["errors"][0]
+    scheduler.state.close()
 
 
 @pytest.mark.parametrize("command, count_key", [(scan, "task_count"), (inspect_command, "resolved_items")])
@@ -112,7 +123,7 @@ def test_explicit_missing_target_keeps_valid_input_and_reports_metadata_failure(
     context = CliContext(language="zh", cwd=str(tmp_path), reporter=CliReporter(
         json_mode=True, stdout=io.StringIO(), stderr=io.StringIO(),
     ))
-    code, result = command.handle(SimpleNamespace(paths=[str(missing), str(good)], deep_detect=False, json=True,
+    code, result = command.handle(SimpleNamespace(recursive=True, paths=[str(missing), str(good)], deep_detect=False, json=True,
                                                 analyze=False, archives_only=False), context)
     assert code != 0 and result.summary[count_key] == 1
     assert len(result.errors) == 1 and str(missing) in result.errors[0]

@@ -15,7 +15,7 @@ void save_config_field(const fs::path& path, const std::string& pointer, const s
 // original is the exact selected record, not an index that external edits can move.
 void edit_password(const fs::path& path, const std::string& operation, const Json& original,
     const Json& replacement, const std::string& scope = {});
-struct WatchRoot { fs::path input; std::string output; bool deep = false; bool initial_scanned = false; };
+struct WatchRoot { fs::path input; std::string output; bool deep = false; bool initial_scanned = false; bool recursive = false; };
 struct WatchRoots { std::vector<WatchRoot> entries; std::vector<std::string> comments; };
 WatchRoots parse_roots(const std::string& text, const fs::path& base);
 WatchRoots read_roots(const fs::path& path);

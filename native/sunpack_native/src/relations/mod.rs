@@ -416,7 +416,7 @@ fn build_candidate_groups_from_source(
 ) -> PyResult<Vec<NativeRelationGroup>> {
     let scope = RelationScopeIndex::build(&source, filtered_keys);
     let mut output = Vec::new();
-    for indices in scope.directories {
+    for indices in [scope.rows] {
         let mut directory_rows: Vec<_> = indices
             .into_iter()
             .map(|row| source.materialize(row))
@@ -1134,17 +1134,9 @@ pub(crate) fn relations_resolve_volume_once(
     if current_paths.is_empty() || candidate_paths.is_empty() {
         return Ok(None);
     }
-    let Some(directory) = single_directory_scope(&current_paths) else {
-        return Ok(None);
-    };
     let mut visible_paths = current_paths.clone();
     visible_paths.extend(candidate_paths);
-    let visible_paths = sorted_unique_paths(
-        visible_paths
-            .into_iter()
-            .filter(|path| parent_directory_key(path) == directory)
-            .collect(),
-    );
+    let visible_paths = sorted_unique_paths(visible_paths);
     if visible_paths.is_empty() {
         return Ok(None);
     }
@@ -1168,7 +1160,6 @@ pub(crate) fn relations_resolve_volume_once(
         .collect();
     let filtered_keys: HashSet<String> = current_paths
         .iter()
-        .filter(|path| parent_directory_key(path) == directory)
         .map(|path| path_key(path))
         .collect();
     let groups = build_candidate_groups_from_source(
@@ -1202,23 +1193,6 @@ fn sorted_unique_paths(mut paths: Vec<String>) -> Vec<String> {
     paths.sort_by_cached_key(|path| path_key(path));
     paths.dedup_by(|left, right| path_key(left) == path_key(right));
     paths
-}
-
-fn parent_directory_key(path: &str) -> String {
-    path_key(
-        &Path::new(path)
-            .parent()
-            .map(|value| value.to_string_lossy().to_string())
-            .unwrap_or_default(),
-    )
-}
-
-fn single_directory_scope(paths: &[String]) -> Option<String> {
-    let directory = parent_directory_key(paths.first()?);
-    paths
-        .iter()
-        .all(|path| parent_directory_key(path) == directory)
-        .then_some(directory)
 }
 
 fn normalize_retry_format(format_hint: &str) -> &str {
@@ -1360,8 +1334,8 @@ fn logical_name_from_parsed(parsed: &ParsedVolume) -> String {
 }
 
 fn parse_relation_numbered_volume(path: &str) -> Option<ParsedVolume> {
-    let (directory, filename) = split_relation_path(path);
-    let mut parsed = parse_volume_candidates(filename)
+    let (_, filename) = split_relation_path(path);
+    let parsed = parse_volume_candidates(filename)
         .into_iter()
         .find(|candidate| {
             !candidate.decorated
@@ -1369,9 +1343,6 @@ fn parse_relation_numbered_volume(path: &str) -> Option<ParsedVolume> {
                     && matches!(candidate.style, "rar_part" | "rar_sfx_part")
                     && parse_marker_numbered_re().is_match(filename))
         })?;
-    if !directory.is_empty() {
-        parsed.prefix = format!("{directory}{}", parsed.prefix);
-    }
     Some(parsed)
 }
 
@@ -1402,6 +1373,7 @@ pub(crate) fn relations_size_filter_split_family_keys(path: &str) -> Vec<String>
 
     // Canonical heads/tails do not themselves carry a numeric suffix, but
     // they can anchor these exact filename families.
+    let path = basename(path);
     let (base, ext) = split_ext(path);
     match ext.to_ascii_lowercase().as_str() {
         ".7z" => keys.push(split_size_family_key("archive:numeric", path)),
@@ -1778,7 +1750,7 @@ fn archive_family_hint(value: &str) -> Option<&'static str> {
     (families.len() == 1).then(|| *families.iter().next().expect("one family"))
 }
 
-fn first_dot_stem(name: &str) -> &str {
+pub(crate) fn first_dot_stem(name: &str) -> &str {
     name.split_once('.').map(|(stem, _)| stem).unwrap_or(name)
 }
 

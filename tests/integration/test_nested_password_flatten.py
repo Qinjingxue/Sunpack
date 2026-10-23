@@ -111,7 +111,7 @@ def test_cli_password_prompt_retries_promoted_input_with_real_pipeline(tmp_path,
         paths=[str(outer)], password=["wrong-fixture-password"], password_file=None,
         prompt_passwords=False, no_builtin_passwords=True, recursive_extract=None,
         archive_cleanup_mode=None, flatten_single_directory=None,
-        json=False, quiet=False, verbose=False,
+        json=False, quiet=False, verbose=False, recursive=False,
     )
     code, result = asyncio.run(extract.handle(args, ctx))
     assert code == 0 and result.errors == []

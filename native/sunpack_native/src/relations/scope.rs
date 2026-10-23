@@ -104,81 +104,19 @@ impl Hash for CaseKey<'_> {
     }
 }
 
-fn directory_key(path: &str) -> CaseKey<'_> {
-    CaseKey::new(
-        Path::new(path)
-            .parent()
-            .and_then(|parent| parent.to_str())
-            .unwrap_or_default(),
-    )
-}
-
-#[derive(Default)]
-struct DirectoryRows<'a> {
-    selected_stems: HashSet<CaseKey<'a>>,
-    active_stems: HashSet<CaseKey<'a>>,
-    rows: Vec<usize>,
-}
-
 pub(super) struct RelationScopeIndex {
-    pub directories: Vec<Vec<usize>>,
+    pub rows: Vec<usize>,
 }
 
 impl RelationScopeIndex {
     pub fn build(source: &RelationSource<'_>, filtered_keys: &HashSet<String>) -> Self {
         let selected: HashSet<_> = filtered_keys.iter().map(|key| CaseKey::new(key)).collect();
-        let mut selected_rows = HashSet::new();
-        let mut directories: HashMap<CaseKey<'_>, DirectoryRows<'_>> = HashMap::new();
-        for row in source.indices() {
-            let path = source.path(row);
-            if selected.contains(&CaseKey::new(path)) {
-                selected_rows.insert(row);
-                directories
-                    .entry(directory_key(path))
-                    .or_default()
-                    .selected_stems
-                    .insert(CaseKey::new(first_dot_stem(source.name(row))));
-            }
-        }
-
-        let mut order = Vec::with_capacity(directories.len());
-        for row in source.indices() {
-            let key = directory_key(source.path(row));
-            let Some(directory) = directories.get_mut(&key) else {
-                continue;
-            };
-            // Preserve first physical appearance, even if that first row was
-            // not selected. Filtering before recording order would reorder roots.
-            if directory.rows.is_empty() {
-                order.push(key.clone());
-            }
-            directory.rows.push(row);
-            let stem = CaseKey::new(first_dot_stem(source.name(row)));
-            if directory.selected_stems.contains(&stem)
-                && source.anchor(row).is_some_and(BucketIndex::has_seed)
-            {
-                directory.active_stems.insert(stem);
-            }
-        }
-
-        Self {
-            directories: order
-                .into_iter()
-                .filter_map(|key| directories.remove(&key))
-                .map(|directory| {
-                    directory
-                        .rows
-                        .into_iter()
-                        .filter(|row| {
-                            selected_rows.contains(row)
-                                || directory
-                                    .active_stems
-                                    .contains(&CaseKey::new(first_dot_stem(source.name(*row))))
-                        })
-                        .collect()
-                })
-                .collect(),
-        }
+        let stems: HashSet<_> = source.indices().filter(|&row| selected.contains(&CaseKey::new(source.path(row))))
+            .map(|row| CaseKey::new(first_dot_stem(source.name(row)))).collect();
+        let active: HashSet<_> = source.indices().filter(|&row| source.anchor(row).is_some_and(BucketIndex::has_seed))
+            .map(|row| CaseKey::new(first_dot_stem(source.name(row)))).filter(|stem| stems.contains(stem)).collect();
+        Self { rows: source.indices().filter(|&row| selected.contains(&CaseKey::new(source.path(row)))
+            || active.contains(&CaseKey::new(first_dot_stem(source.name(row))))).collect() }
     }
 }
 
@@ -215,7 +153,7 @@ mod tests {
             row(r"C:\game\other.part1.fake", true, true),
         ];
         let index = scope(&rows, &[0]);
-        assert_eq!(index.directories, vec![vec![0, 1, 2, 3]]);
+        assert_eq!(index.rows, vec![0, 1, 2, 3]);
         let member = RelationSource::Physical(&rows).materialize(3);
         assert!(!member.relation_member_eligible);
         assert_eq!(member.size, Some(17));
@@ -225,23 +163,23 @@ mod tests {
     fn selecting_a_member_or_launcher_can_activate_an_unselected_head() {
         let rows = vec![
             row(r"C:\game\payload.part1.disguised", true, true),
-            row(r"C:\game\payload.part2.fake", false, true),
+            row(r"C:\other\payload.part2.fake", false, true),
             row(r"C:\game\payload.exe", false, true),
         ];
         for selected in [1, 2] {
-            assert_eq!(scope(&rows, &[selected]).directories, vec![vec![0, 1, 2]]);
+            assert_eq!(scope(&rows, &[selected]).rows, vec![0, 1, 2]);
         }
     }
 
     #[test]
-    fn directory_order_follows_first_raw_row_even_when_it_is_unselected() {
+    fn selected_rows_preserve_source_order_across_directories() {
         let rows = vec![
             row(r"C:\first\ignored.txt", false, true),
             row(r"C:\second\selected.zip", false, true),
             row(r"C:\first\selected.zip", false, true),
             row(r"C:\unselected\payload.part1.rar", true, true),
         ];
-        assert_eq!(scope(&rows, &[1, 2]).directories, vec![vec![2], vec![1]]);
+        assert_eq!(scope(&rows, &[1, 2]).rows, vec![1, 2]);
     }
 
     #[test]
@@ -251,8 +189,8 @@ mod tests {
             row(r"C:\game\payload.001", false, true),
         ];
         rows[0].anchor.as_mut().unwrap().standalone = true;
-        assert_eq!(scope(&rows, &[0]).directories, vec![vec![0]]);
-        assert!(scope(&rows, &[]).directories.is_empty());
+        assert_eq!(scope(&rows, &[0]).rows, vec![0]);
+        assert!(scope(&rows, &[]).rows.is_empty());
     }
 
     #[test]

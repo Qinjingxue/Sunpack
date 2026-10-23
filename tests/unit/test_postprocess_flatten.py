@@ -15,7 +15,7 @@ def test_flatten_reports_native_errors(monkeypatch, capsys):
     monkeypatch.setattr(
         flatten_module,
         "_native_flatten_single_branch_directories",
-        lambda _base: native_result,
+        lambda _base, _work=None: native_result,
     )
 
     result = DirectoryFlattener("en").flatten_dirs(r"C:\target")
@@ -53,7 +53,7 @@ def test_postprocess_uses_config_language_and_prints_flatten_once(tmp_path, monk
     monkeypatch.setattr(
         flatten_module,
         "_native_flatten_single_branch_directories",
-        lambda base: calls.append(base) or {
+        lambda base, _work=None: calls.append(base) or {
             "moved": 0, "removed_dirs": 0, "errors": [], "output_dir": base, "source_dir": "",
         },
     )

@@ -23,7 +23,6 @@ def test_config_validate_checks_embedded_ratio_type():
 @pytest.mark.parametrize(("override", "field"), [
     ({"recursive_extract": {"mode": "infinite"}}, "recursive_extract"),
     ({"post_extract": {"archive_cleanup_mode": "recycle"}}, "archive_cleanup_mode"),
-    ({"filesystem": {"directory_scan_mode": "recursive"}}, "directory_scan_mode"),
 ])
 def test_normalization_rejects_internal_values_in_external_shorthand_fields(override, field):
     with pytest.raises(ConfigSchemaError, match=field):
@@ -79,7 +78,6 @@ def test_omitted_output_dir_keeps_default_beside_archive_behavior(tmp_path):
 def test_effective_config_includes_native_worker_and_format_switch():
     config = _payload()
     config["filesystem"] = {
-        "directory_scan_mode": "-",
         "scan_filters": [
             {"name": "size_range", "enabled": True, "min_bytes": 1048576}
         ]
@@ -94,7 +92,7 @@ def test_effective_config_includes_native_worker_and_format_switch():
     effective = build_effective_config(make_config(config))
 
     assert effective["size_range_min_bytes"] == 1048576
-    assert effective["filesystem"]["directory_scan_mode"] == "current_dir_only"
+    assert "directory_scan_mode" not in effective["filesystem"]
     assert effective["worker"]["controller"] == "native_worker"
     assert effective["worker"]["sizing"] == "selected_by_worker"
     assert effective["detection"] == {"enabled": True}

@@ -16,13 +16,14 @@ use crate::analysis_native::volume_anchor::{
     probe_volume_anchor_records_cheap, VolumeAnchor,
 };
 
-#[derive(Debug, Clone)]
-struct DirectoryEntryRecord {
-    path: String,
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct DirectoryEntryRecord {
+    pub(crate) path: String,
     is_dir: bool,
     size: Option<u64>,
     mtime_ns: Option<u64>,
     relation_member_eligible: bool,
+    #[serde(skip)]
     relation_anchor: Option<VolumeAnchor>,
 }
 
@@ -935,7 +936,9 @@ impl NativeDirectorySnapshot {
     }
 }
 
+#[derive(Clone)]
 struct DirectoryScanOptions {
+    scope: Option<crate::scan::scope::NativeDiscoveryScope>,
     patterns: RegexSet,
     prune_dir_names: HashSet<String>,
     prune_dir_patterns: RegexSet,
@@ -946,6 +949,7 @@ struct DirectoryScanOptions {
     mtime_ranges: Vec<NativeNumericRange>,
 }
 
+#[derive(Clone)]
 struct WhitelistRule {
     path_patterns: RegexSet,
     prune_dir_patterns: RegexSet,
@@ -1113,6 +1117,7 @@ impl DirectoryScanOptions {
     ) -> PyResult<Self> {
         let (prune_dir_names, prune_dir_patterns) = compile_prune_dirs(prune_dir_globs)?;
         Ok(Self {
+            scope: None,
             patterns: compile_case_insensitive_regex_set(patterns)?,
             prune_dir_names,
             prune_dir_patterns,
@@ -1177,6 +1182,110 @@ impl NativeDirectoryScanOptions {
                 whitelist_rules,
             )?,
         })
+    }
+
+    #[pyo3(signature = (state, scope, changed=None, _subtree=false))]
+    fn catalog_update(&self, py: Python<'_>, state: &crate::watch_store::NativeWatchState,
+        scope: &crate::scan::scope::NativeDiscoveryScope, changed: Option<&str>, _subtree: bool)
+        -> PyResult<(crate::watch_store::NativeWatchOperations, Vec<DirectoryReadError>)> {
+        py.detach(|| {
+            let target = changed.unwrap_or(&scope.root);
+            let mut effective = scope.clone();
+            if changed.is_none() || _subtree {
+                effective.exclude_roots(state.lock().runtime.range("owned|".to_owned()..).take_while(|(k,_)| k.starts_with("owned|"))
+                    .filter_map(|(_,v)| v.path().map(str::to_owned)));
+            }
+            let mut options = self.options.clone(); options.scope = Some(effective.clone());
+            let records = if effective.excludes(target) {
+                DirectoryScanRecords { filtered: Vec::new(), raw: Vec::new(), errors: DirectoryReadErrors::report() }
+            } else {
+                match fs::metadata(target) {
+                    Ok(_) => scan_directory_views(target, scope.max_depth, &options)?,
+                    Err(error) => {
+                        let mut errors = DirectoryReadErrors::new(Path::new(target));
+                        if error.kind() != std::io::ErrorKind::NotFound { errors.push(Path::new(target),"metadata",error); }
+                        DirectoryScanRecords { filtered: Vec::new(), raw: Vec::new(), errors }
+                    }
+                }
+            };
+            let errors = records.errors.into_messages();
+            let base_prefix = format!("file|{}|", crate::path_keys::path_key(&scope.root));
+            let mut values = Vec::new(); let mut present = HashSet::new();
+            let data = state.lock();
+            for record in records.raw.into_iter().filter(|r| !r.is_dir && scope.contains(&r.path)) {
+                let stem = crate::path_keys::case_key(crate::relations::first_dot_stem(Path::new(&record.path).file_name().unwrap().to_str().unwrap_or_default()));
+                let key = format!("{base_prefix}{stem}|{}", crate::path_keys::path_key(&record.path));
+                present.insert(key.clone());
+                let value = serde_json::to_value(&record).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+                if data.runtime.get(&key).and_then(|old|old.file()).is_none_or(|old|old.size!=record.size || old.mtime_ns!=record.mtime_ns || old.relation_member_eligible!=record.relation_member_eligible) {
+                    values.push(serde_json::json!({"op":"runtime", "key":key,"value":value}));
+                }
+            }
+            for (key,old) in data.catalog_records(&scope.root,target) {
+                if !present.contains(&key) && errors.is_empty() {
+                    values.push(serde_json::json!({"op":"runtime","key":key}));
+                    if let Some(path)=old.path() { values.push(serde_json::json!({"op":"runtime","key":format!("done|{}",crate::path_keys::path_key(path))})); }
+                }
+            }
+            Ok((crate::watch_store::NativeWatchOperations::from_values(values)?, errors))
+        })
+    }
+
+    #[pyo3(signature = (state, scope, under=None))]
+    fn catalog_candidates(&self, py: Python<'_>, state: &crate::watch_store::NativeWatchState,
+        scope: &crate::scan::scope::NativeDiscoveryScope, under: Option<&str>) -> PyResult<Py<PyList>> {
+        let records = state.lock().catalog_records(&scope.root,under.unwrap_or(&scope.root));
+        let values = PyList::empty(py);
+        for (_,record) in records {
+            if let Some(path) = record.path().filter(|p| scope.contains(p)) {
+                if let Some(value) = crate::postprocess::watch_candidate_for_path(py,path,None)? { values.append(value)?; }
+            }
+        }
+        Ok(values.unbind())
+    }
+
+    fn catalog_snapshot(&self, py: Python<'_>, state: &crate::watch_store::NativeWatchState,
+        scope: &crate::scan::scope::NativeDiscoveryScope, seed: &str)
+        -> PyResult<(Py<NativeDirectorySnapshot>, Py<NativeDirectorySnapshot>)> {
+        let stem = crate::path_keys::case_key(crate::relations::first_dot_stem(Path::new(seed).file_name().unwrap().to_str().unwrap_or_default()));
+        let prefix = format!("file|{}|{stem}|", crate::path_keys::path_key(&scope.root));
+        let mut raw: Vec<DirectoryEntryRecord> = state.lock().runtime.range(prefix.clone()..)
+            .take_while(|(k,_)| k.starts_with(&prefix)).filter_map(|(_,v)| v.file().cloned()).collect();
+        { let data=state.lock(); raw.retain(|row| !data.is_owned(&row.path)); }
+        let root = Path::new(&scope.root);
+        let mut accepted = HashSet::new();
+        let mut directory_cache = HashMap::new();
+        for row in &mut raw {
+            row.relation_member_eligible = scope.contains(&row.path)
+                && !file_under_rejected_directory(Path::new(&row.path),root,&self.options,&mut directory_cache)
+                && !file_rejected_by_path(Path::new(&row.path), root, &self.options)
+                && numeric_ranges_allow(&self.options.mtime_ranges, row.mtime_ns);
+            if row.relation_member_eligible && numeric_ranges_allow(&self.options.size_ranges, row.size) {
+                accepted.extend(crate::relations::relations_size_filter_split_family_keys(&row.path));
+            }
+        }
+        let filtered = raw.iter().filter(|r| r.relation_member_eligible && (numeric_ranges_allow(&self.options.size_ranges,r.size)
+            || crate::relations::relations_size_filter_split_family_keys(&r.path).iter().any(|k| accepted.contains(k)))).cloned().collect();
+        py.detach(|| populate_relation_anchors(&mut raw));
+        let (filtered, raw) = NativeDirectorySnapshot::from_views(filtered,raw,DirectoryReadErrors::report());
+        Ok((Py::new(py,filtered)?,Py::new(py,raw)?))
+    }
+
+    #[pyo3(signature=(scope, seed=None))]
+    fn scan_scope(&self, py: Python<'_>, scope: &crate::scan::scope::NativeDiscoveryScope, seed: Option<&str>)
+        -> PyResult<(Py<NativeDirectorySnapshot>, Py<NativeDirectorySnapshot>)> {
+        let mut options = self.options.clone();
+        options.scope = Some(scope.clone());
+        let Some(seed)=seed else {return scan_snapshots_with_options(py, &scope.root, scope.max_depth, &options);};
+        let (filtered,raw)=py.detach(|| {
+            let stem=crate::relations::first_dot_stem(Path::new(seed).file_name().and_then(|n|n.to_str()).unwrap_or_default());
+            let mut records=scan_directory_views(&scope.root, scope.max_depth, &options)?;
+            let matches=|r:&DirectoryEntryRecord| !r.is_dir && crate::relations::first_dot_stem(Path::new(&r.path).file_name().and_then(|n|n.to_str()).unwrap_or_default()).eq_ignore_ascii_case(stem);
+            records.raw.retain(matches); records.filtered.retain(matches);
+            populate_relation_anchors(&mut records.raw);
+            Ok::<_,PyErr>(NativeDirectorySnapshot::from_views(records.filtered,records.raw,records.errors))
+        })?;
+        Ok((Py::new(py,filtered)?,Py::new(py,raw)?))
     }
 
     fn scan(
@@ -2420,6 +2529,7 @@ fn scan_directory_impl<const PROFILE: bool>(
 ) -> PyResult<DirectoryScanRecords> {
     let scan_started = Instant::now();
     let root = PathBuf::from(root_path);
+    let filter_root = options.scope.as_ref().map(|s| Path::new(&s.root)).unwrap_or(&root);
     let mut errors = DirectoryReadErrors::new(&root);
     let metadata = match fs::metadata(&root) {
         Ok(metadata) => Some(metadata),
@@ -2518,6 +2628,9 @@ fn scan_directory_impl<const PROFILE: bool>(
                 measure::<PROFILE, _>(&mut profile, ProfileBucket::DirectoryEnumeration, || {
                     entry.path()
                 });
+            if options.scope.as_ref().is_some_and(|scope| scope.excludes(&path.to_string_lossy())) {
+                continue;
+            }
             let metadata =
                 match measure::<PROFILE, _>(&mut profile, ProfileBucket::MetadataReads, || {
                     entry.metadata()
@@ -2528,6 +2641,13 @@ fn scan_directory_impl<const PROFILE: bool>(
                         continue;
                     }
                 };
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::MetadataExt;
+                if metadata.file_attributes() & 0x400 != 0 {
+                    continue;
+                }
+            }
             if PROFILE {
                 if let Some(profile) = profile.as_deref_mut() {
                     profile.metadata_read_count += 1;
@@ -2548,7 +2668,7 @@ fn scan_directory_impl<const PROFILE: bool>(
                 let rejected =
                     measure::<PROFILE, _>(&mut profile, ProfileBucket::PathMatching, || {
                         max_depth.is_some_and(|limit| depth >= limit)
-                            || dir_rejected(&path, &root, options)
+                            || dir_rejected(&path, filter_root, options)
                     });
                 if rejected {
                     if PROFILE {
@@ -2595,7 +2715,7 @@ fn scan_directory_impl<const PROFILE: bool>(
             let hard_rejected =
                 measure::<PROFILE, _>(&mut profile, ProfileBucket::PathMatching, || {
                     !metadata.is_file()
-                        || file_rejected_by_path(&path, &root, options)
+                        || file_rejected_by_path(&path, filter_root, options)
                         || !numeric_ranges_allow(&options.mtime_ranges, mtime_ns)
                 });
             if hard_rejected {
@@ -2863,4 +2983,11 @@ fn metadata_mtime_ns(metadata: &fs::Metadata) -> Option<u64> {
     let modified = metadata.modified().ok()?;
     let duration = modified.duration_since(UNIX_EPOCH).ok()?;
     u64::try_from(duration.as_nanos()).ok()
+}
+
+pub(crate) fn scope_file_paths(scope: &crate::scan::scope::NativeDiscoveryScope) -> PyResult<(Vec<PathBuf>,Vec<DirectoryReadError>)> {
+    let mut options = DirectoryScanOptions::new(Vec::new(),Vec::new(),Vec::new(),Vec::new(),Vec::new(),Vec::new(),Vec::new())?;
+    options.scope=Some(scope.clone());
+    let records = scan_directory_views(&scope.root,scope.max_depth,&options)?;
+    Ok((records.raw.into_iter().filter(|r| !r.is_dir).map(|r| PathBuf::from(r.path)).collect(),records.errors.into_messages()))
 }

@@ -48,6 +48,9 @@ class _Submission:
     request_id: str
     targets: tuple[PipelineTarget, ...]
     direct: bool
+    recursive: bool
+    discovery_scope: Any
+    catalog: Any
     password_store: PasswordStore
     config: dict
     origin: str = "foreground"
@@ -97,6 +100,10 @@ class PipelineEngine:
         self._broker.set_state_changed_callback(self._notify_state_changed)
 
     @property
+    def output_ownership(self):
+        return self._services.output_ownership
+
+    @property
     def recent_passwords(self) -> list[str]:
         return list(self._recent_passwords)
 
@@ -138,6 +145,9 @@ class PipelineEngine:
         targets: Iterable[str | PipelineTarget],
         *,
         direct: bool = False,
+        recursive: bool = False,
+        discovery_scope=None,
+        catalog=None,
         request_config: dict | None = None,
         stdout: TextIO | None = None,
         stderr: TextIO | None = None,
@@ -171,6 +181,9 @@ class PipelineEngine:
             request_id=uuid.uuid4().hex,
             targets=normalized,
             direct=bool(direct),
+            recursive=recursive,
+            discovery_scope=discovery_scope,
+            catalog=catalog,
             password_store=password_store,
             config=request_config,
             origin="watch" if str(origin).lower() == "watch" else "foreground",
@@ -234,11 +247,15 @@ class PipelineEngine:
             try:
                 await resource_scope.aclose()
             finally:
-                self._services.output_reservations.release(submission.request_id)
-                await self._path_leases.release(submission.request_id)
-                self._active_requests.pop(submission.request_id, None)
-                CURRENT_ORIGIN.reset(origin_marker)
-                self._notify_state_changed()
+                try:
+                    await self._broker.run("output_commit", submission.request_id,
+                        self._services.output_ownership.finish, submission.request_id, request_id=submission.request_id)
+                finally:
+                    self._services.output_reservations.release(submission.request_id)
+                    await self._path_leases.release(submission.request_id)
+                    self._active_requests.pop(submission.request_id, None)
+                    CURRENT_ORIGIN.reset(origin_marker)
+                    self._notify_state_changed()
 
     async def clear_runtime_caches(self) -> dict:
         """Clear process-wide runtime caches only while this engine is idle."""
@@ -804,6 +821,8 @@ class _PipelineServices:
         self.config = config
         self.broker = broker
         self.output_reservations = OutputReservationRegistry()
+        from sunpack.pipeline.coordinator.output_ownership import OutputOwnership
+        self.output_ownership = OutputOwnership(config)
         worker_config = _worker_config(config)
         self.sevenzip_runner = SevenZipRunner(worker_config)
         self._automatic_stage_capacity = int(worker_config.get("stage_thread_capacity", 0) or 0) == 0
@@ -817,6 +836,7 @@ class _PipelineServices:
 
     async def close(self, broker: AsyncWorkBroker) -> None:
         await self.sevenzip_runner.aclose()
+        await broker.run("runtime_state_close", "engine", self.output_ownership.close, request_id="engine")
 
         def close_services() -> None:
             from sunpack.core.support.runtime_cache_cleanup import clear_all_runtime_caches
@@ -1108,6 +1128,7 @@ class _RequestRuntime:
             progress_reporter=self.reporter,
             request_id=submission.request_id,
             origin=submission.origin,
+            output_ownership=services.output_ownership,
         )
         self.recursion = self._new_recursion()
         self._active_task_keys: set[str] = set()
@@ -1137,9 +1158,14 @@ class _RequestRuntime:
     def _resolve_missing_volume_once(self, task, _outcome):
         current_paths = list(task.all_parts or [task.main_path])
         format_hint = task.archive_input().format_hint
-        group = self.task_scanner.provider.resolve_volume_once_in_directory(
-            current_paths,
+        scope = task.runtime.get("discovery_scope")
+        if scope is None:
+            from sunpack.core.contracts.discovery_scope import DiscoveryScope
+            scope = DiscoveryScope(os.path.dirname(task.main_path))
+        group = self.task_scanner.provider.resolve_volume_once(
+            current_paths, scope,
             format_hint=format_hint,
+            catalog=task.runtime.get("discovery_catalog"),
         )
         if group is None:
             return None
@@ -1152,6 +1178,8 @@ class _RequestRuntime:
             discovery_evidence=dict(candidate.relation_anchor),
         )
         if replacement is not None:
+            replacement.runtime["discovery_scope"] = scope
+            replacement.runtime["discovery_catalog"] = task.runtime.get("discovery_catalog")
             replacement.runtime["volume_retry_attempted"] = True
             replacement.runtime["volume_retry_basis"] = [
                 "confirmed_structure",
@@ -1241,6 +1269,10 @@ class _RequestRuntime:
     ) -> bool:
         if not roots:
             return True
+        if scan_session is None and depth == 1:
+            from sunpack.pipeline.coordinator.scan_session import DiscoveryScanSession
+            scan_session = DiscoveryScanSession(config=self.config, recursive=self.submission.recursive,
+                                                scope=self.submission.discovery_scope, catalog=self.submission.catalog)
         self.reporter.scan_started(depth)
         scanner = self.task_scanner if depth == 1 else self.recursive_scanner
         discovered = await broker.run(
@@ -1451,6 +1483,8 @@ class _RequestRuntime:
             watch_version = task.runtime.get("source_generation", watch_version)
             retain_watch_lease = bool(watch_version and outcome.outcome_kind == OutcomeKind.COMPLETE_SUCCESS)
             ownership.remember_tasks([task])  # Missing-volume retry may adopt a complete family.
+            if result.failure is not None and task.runtime.get("discovery_scope") is not None:
+                result.failure.details["discovery_scope"] = task.runtime["discovery_scope"].to_record()
             promoted = False
             if _should_promote_blocked_input(depth, outcome.outcome_kind, result.failure):
                 result, promoted = await self._promote_blocked_input(
@@ -1706,6 +1740,11 @@ class _RequestRuntime:
             })
 
         def promote():
+            output_ownership = self.services.output_ownership
+            from sunpack_native import watch_path_identity
+            for source, target in zip(sources, destinations):
+                volume, identity, _ = watch_path_identity(source)
+                output_ownership.begin(target, self.submission.request_id, identities=[f"{volume}|{identity}"])
             with promotion_barrier(
                 sources, cache_releasers=(release_archive_sessions_under_roots,), quiesce=False,
             ):
@@ -1718,6 +1757,9 @@ class _RequestRuntime:
                 request_id=self.submission.request_id, cancellation=cancellation,
             )
             task.apply_path_mapping(moved.path_map)
+            from sunpack.core.contracts.discovery_scope import DiscoveryScope
+            task.runtime["discovery_scope"] = DiscoveryScope(destination)
+            result.failure.details["discovery_scope"] = task.runtime["discovery_scope"].to_record()
             if self.submission.origin == "watch":
                 self._report_progress(task, {
                     "type": "semantic", "event": "task_sources_claimed",
@@ -1745,6 +1787,8 @@ class _RequestRuntime:
 
     async def _flatten_output(self, task, output_dir: str, *, broker, cancellation) -> DirectoryFlattenResult:
         def flatten():
+            work_path = self.services.output_ownership.prepare_flatten(output_dir, self.submission.request_id,
+                                                                        self.services.output_reservations)
             with promotion_barrier(
                 [output_dir],
                 cache_releasers=(release_archive_sessions_under_roots,),
@@ -1753,7 +1797,7 @@ class _RequestRuntime:
                 return _postprocess_actions_factory(
                     self.config,
                     stdout=self.submission.stdout,
-                ).flattener.flatten_dirs(output_dir)
+                ).flattener.flatten_dirs(output_dir, work_path=work_path)
 
         try:
             result = await broker.run(
@@ -1776,6 +1820,7 @@ class _RequestRuntime:
         return result
 
     async def _ensure_task_lease(self, task, *, depth: int = 1) -> None:
+        task.runtime["nested_output"] = depth > 1
         self.source_cleanup.register([task])
         paths = task.all_parts or [task.main_path]
         requested_version = (

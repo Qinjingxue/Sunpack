@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from typing import Any
 
+from sunpack.core.contracts.discovery_scope import DiscoveryScope
 from sunpack.core.support.path_keys import normalized_path, path_key, safe_relative_path
 from sunpack_native import NativeCandidateTable, NativeHeadFactCache
 
@@ -23,8 +24,15 @@ class DiscoveryScanSession:
         config: dict | None = None,
         *,
         include_raw_snapshots: bool = True,
+        recursive: bool = False,
+        catalog=None,
+        scope: DiscoveryScope | None = None,
     ):
         self.config = config or {}
+        self.recursive = recursive
+        self.scope = scope
+        self.catalog = catalog
+        self._scopes: dict[str, DiscoveryScope] = {}
         self.relations = relations or RelationsScheduler(self.config)
         self.include_raw_snapshots = include_raw_snapshots
         self._snapshots: dict[str, DirectorySnapshot] = {}
@@ -65,6 +73,7 @@ class DiscoveryScanSession:
     def prime_snapshot(self, directory: str, snapshot: DirectorySnapshot) -> None:
         self.add_scan_errors(snapshot.native_snapshot.scan_errors())
         self._snapshots[self._snapshot_key(directory, max_depth=None)] = snapshot
+        self._scopes[path_key(directory)] = DiscoveryScope(directory, recursive=True)
 
     def prime_output_inventory(self, inventory: Any) -> None:
         if inventory is None:
@@ -72,6 +81,8 @@ class DiscoveryScanSession:
         self._head_facts.prime_inventory(inventory._native)
 
     def is_within_scan_scope(self, path: str) -> bool:
+        if self.scope is not None:
+            return self.scope.contains(path)
         if not self._scan_roots:
             return True
         path = normalized_path(path)
@@ -80,6 +91,14 @@ class DiscoveryScanSession:
             key == path_key(root) or safe_relative_path(path, root) is not None
             for root in self._scan_roots
         )
+
+    def scope_for(self, path: str) -> DiscoveryScope:
+        if self.scope is not None:
+            return self.scope
+        matches = [scope for scope in self._scopes.values() if scope.contains(path)]
+        if matches:
+            return max(matches, key=lambda scope: len(scope.root))
+        return DiscoveryScope(path, recursive=self.recursive)
 
     def snapshot_for_directory(self, directory: str) -> DirectorySnapshot:
         return self._snapshot_for_directory(directory, max_depth=None)
@@ -92,12 +111,18 @@ class DiscoveryScanSession:
 
     def _snapshot_for_directory(self, directory: str, max_depth: int | None) -> DirectorySnapshot:
         key = self._snapshot_key(directory, max_depth)
+        if key not in self._snapshots and self.catalog is not None:
+            state, options, seed = self.catalog
+            filtered, raw = options.catalog_snapshot(state, self.scope.native, seed)
+            from pathlib import Path
+            self._snapshots[key] = DirectorySnapshot.from_native(Path(self.scope.root), filtered, raw)
         if key not in self._snapshots:
             self._snapshots[key] = DirectoryScanner(
                 directory,
                 max_depth=max_depth,
                 config=self.config,
                 include_raw_snapshot=self.include_raw_snapshots,
+                scope=self.scope or self._scopes.setdefault(path_key(directory), DiscoveryScope(directory, recursive=self.recursive, max_depth=max_depth)),
             ).scan()
             self.add_scan_errors(self._snapshots[key].native_snapshot.scan_errors())
         return self._snapshots[key]

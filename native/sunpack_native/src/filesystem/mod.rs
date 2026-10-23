@@ -169,6 +169,14 @@ pub(crate) fn watch_path_identity(path: &str) -> PyResult<(String, String, i64)>
 }
 
 #[pyfunction]
+pub(crate) fn watch_identity_path(py: Python<'_>, volume: &str, identity: &str) -> PyResult<String> {
+    #[cfg(windows)]
+    { py.detach(|| windows::watch_identity_path(volume, identity)).map_err(os_error) }
+    #[cfg(not(windows))]
+    { let _=(py,volume,identity); Err(PyRuntimeError::new_err("watch mode requires Windows NTFS")) }
+}
+
+#[pyfunction]
 pub(crate) fn watch_root_changes(
     path: &str,
     start_usn: i64,

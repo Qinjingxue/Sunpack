@@ -151,27 +151,6 @@ class RelationsGroupBuilder:
         )
         return self._candidate_group_from_native(raw) if isinstance(raw, dict) else None
 
-    def resolve_volume_once_in_directory(
-        self,
-        current_paths: list[str],
-        *,
-        format_hint: str = "",
-    ) -> CandidateGroup | None:
-        directories = {
-            case_key(os.path.abspath(os.path.dirname(path) or os.getcwd()))
-            for path in current_paths
-            if path
-        }
-        if len(directories) != 1:
-            return None
-        rows = _native_list_regular_files_in_directory(next(iter(directories)))
-        candidates = [
-            str(row.get("path"))
-            for row in rows
-            if isinstance(row, dict) and row.get("path")
-        ]
-        return self.resolve_volume_once(current_paths, candidates, format_hint=format_hint)
-
     def detect_split_role(self, filename: str) -> Optional[str]:
         return _native_detect_split_role(filename)
 

@@ -73,6 +73,9 @@ class ArchiveTaskProvider:
                 is_recursive_scan=is_recursive_scan,
                 include_details=include_details,
             )
+        for task in result.resolved_tasks:
+            task.runtime["discovery_scope"] = session.scope_for(task.main_path)
+            task.runtime["discovery_catalog"] = session.catalog
         self._record_discovery_failures(result)
         return result
 
@@ -145,13 +148,20 @@ class ArchiveTaskProvider:
             if info not in self.failed_candidate_failures:
                 self.failed_candidate_failures.append(info)
 
-    def resolve_volume_once_in_directory(
-        self,
-        current_paths: list[str],
-        *,
-        format_hint: str = "",
-    ):
-        return self._relations.resolve_volume_once_in_directory(
-            current_paths,
-            format_hint=format_hint,
-        )
+    def resolve_volume_once(self, current_paths: list[str], scope, *, format_hint: str = "", catalog=None):
+        from sunpack.pipeline.discovery.filesystem.directory_scanner import DirectoryScanner
+        from sunpack.core.contracts.filesystem import DirectorySnapshot
+        from pathlib import Path
+        if catalog is not None:
+            state, options, _ = catalog
+            filtered, raw = options.catalog_snapshot(state, scope.native, current_paths[0])
+        else:
+            options = DirectoryScanner.compile_scan_options(self.config)
+            filtered, raw = options.scan_scope(scope.native, current_paths[0])
+        snapshot = DirectorySnapshot.from_native(Path(scope.root), filtered, raw)
+        groups = self._relations.build_candidate_groups(snapshot)
+        required = set(current_paths)
+        for group in groups:
+            if required.issubset(set(group.input_paths)) and group.is_split_candidate:
+                return group
+        return None

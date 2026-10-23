@@ -45,6 +45,7 @@ sunpack w st
 
 | 参数 | 说明 |
 | --- | --- |
+| `--recursive` | 递归发现输入子目录；与嵌套解压的 `--recur` 独立。 |
 | `-j`, `--json` | 以 JSON 格式输出结果，适合脚本调用。 |
 | `-q`, `--quiet` | 减少终端输出。 |
 | `-v`, `--verbose` | 输出更多检测和诊断细节。 |
@@ -126,7 +127,7 @@ python sunpack.py scan [options] <paths...>
 
 `scan` 输出识别到的解压任务、分卷关系、检测扩展名、判定和命中规则，不会解压或清理文件。
 
-`--deep-detect` 会对普通检测未解决的候选执行完整嵌入扫描，并关闭本次请求的全部 filesystem 扫描过滤模块，包括嵌套输出扫描。目录范围仍由 `filesystem.directory_scan_mode` 决定。每次 CLI 请求只按自身参数决定是否启用 deep；即使共享 runtime 正在深度监控同一输入目录，也不会影响 CLI 请求。
+`--deep-detect` 会对普通检测未解决的候选执行完整嵌入扫描，并关闭本次请求的全部 filesystem 扫描过滤模块，包括嵌套输出扫描。目录范围由 `--recursive` 决定。每次 CLI 请求只按自身参数决定是否启用 deep；即使共享 runtime 正在深度监控同一输入目录，也不会影响 CLI 请求。
 
 示例：
 
@@ -173,7 +174,7 @@ python sunpack.py inspect D:\Downloads -v
 python sunpack.py watch <add|remove|list|start|stop|reload|status|startup> [options]
 ```
 
-监控根目录保存在程序资源目录下的 `sunpack_watch_roots.txt`。格式为 `输入目录 | 输出根 | deep_detect | initial_scanned`，后三列可省略：
+监控根目录保存在程序资源目录下的 `sunpack_watch_roots.txt`。格式为 `输入目录 | 输出根 | deep_detect | initial_scanned | recursive`，后四列可省略：
 
 ```text
 C:\Downloads
@@ -182,7 +183,7 @@ F:\Incoming | . | true
 G:\Incoming | | true
 ```
 
-只写输入目录时使用 `watch.out_dir`；相对输出路径按该输入目录解析并持久化为绝对路径。输出根可以跨盘。`watch` 只观察每个根目录的直接文件，不递归监听子目录；输入根需要位于 NTFS 卷且有可读取的 USN Journal。
+只写输入目录时使用 `watch.out_dir`；相对输出路径按该输入目录解析并持久化为绝对路径。输出根可以跨盘。每个根使用独立的 `recursive` 标志，默认 `false`；输入根需要位于 NTFS 卷且有可读取的 USN Journal。
 
 `deep_detect` 接受 `true` 或 `false`，省略或留空时默认为 `false`。模式绑定输入目录；多个输入目录可共用输出根，并分别采用不同模式。嵌套解压、密码重试和崩溃恢复均保留原始输入目录，按该目录的配置执行。启用 deep 时，该目录请求的全部 filesystem 扫描过滤模块失效。修改此列会触发配置重载，也可执行 `watch reload` 应用修改。
 
@@ -312,3 +313,5 @@ extract "%1" --ask-pw --deep-detect --pause
 ```
 
 输出默认落在归档旁边。
+
+`watch add 目录 --recursive` 启用该根的递归发现；旧的四列或更少列仍为非递归。同一范围内的分卷可分布在不同子目录，独立根之间不组合。Watch 首轮输出直接放在该根映射的输出目录下；CLI 默认放在归档旁，分卷以锚点卷位置为准。Pipeline 输出子树由 Watch 排除，用户后来放入其中的文件也会忽略。

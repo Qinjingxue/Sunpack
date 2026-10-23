@@ -42,17 +42,6 @@ class RelationsScheduler:
             path_passwords=path_passwords,
         )
 
-    def resolve_volume_once_in_directory(
-        self,
-        current_paths: list[str],
-        *,
-        format_hint: str = "",
-    ) -> CandidateGroup | None:
-        return self._builder.resolve_volume_once_in_directory(
-            current_paths,
-            format_hint=format_hint,
-        )
-
     def detect_split_role(self, filename: str) -> str | None:
         return self._builder.detect_split_role(filename)
 

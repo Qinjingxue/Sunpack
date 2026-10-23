@@ -339,7 +339,7 @@ def test_retry_lease_upgrade_releases_idle_partial_families(tmp_path):
     async def scenario():
         registry = _PathLeaseRegistry()
         family = [str(tmp_path / "first.001"), str(tmp_path / "second.002")]
-        tasks = [SimpleNamespace(all_parts=[path]) for path in family]
+        tasks = [SimpleNamespace(all_parts=[path], runtime={}) for path in family]
         runtimes = [SimpleNamespace(
             path_leases=registry,
             submission=SimpleNamespace(request_id=owner, origin="foreground"),

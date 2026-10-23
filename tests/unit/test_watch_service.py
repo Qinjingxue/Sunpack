@@ -67,6 +67,7 @@ def test_watch_service_attaches_and_releases_toast_with_watch_lifecycle(tmp_path
     captured = {}
 
     class Engine:
+        output_ownership = None
         async def __aenter__(self):
             return self
 
@@ -162,7 +163,7 @@ def test_watch_runtime_delegates_start_to_runtime_host(monkeypatch):
 
 
 def test_watch_add_reports_start_request_without_creating_watch_process(tmp_path, monkeypatch):
-    monkeypatch.setattr(watch_command, "add_watch_roots", lambda paths, output_dir=None, deep_detect=None: (tmp_path / "roots.txt", paths, []))
+    monkeypatch.setattr(watch_command, "add_watch_roots", lambda paths, output_dir=None, deep_detect=None, recursive=None: (tmp_path / "roots.txt", paths, []))
 
     class FakeHost:
         watch_enabled = False
@@ -216,8 +217,8 @@ def test_running_watch_service_applies_added_roots_once(tmp_path, monkeypatch):
         "applied": True,
     }
     assert roots_path.read_text(encoding="utf-8").splitlines() == [
-        f"{first_root.resolve()} |  | false | false",
-        f"{normalized_second} |  | false | false",
+        f"{first_root.resolve()} |  | false | false | false",
+        f"{normalized_second} |  | false | false | false",
     ]
     assert starts == [[str(first_root.resolve()), normalized_second]]
     assert observer_reload_applied is False
@@ -230,7 +231,7 @@ def test_running_watch_service_applies_added_roots_once(tmp_path, monkeypatch):
     removed = _await(service.remove_roots([normalized_second]))
     assert removed["removed"] == [normalized_second] and removed["applied"] is True
     assert starts[-1] == [str(first_root.resolve())] and len(starts) == 2
-    assert roots_path.read_text(encoding="utf-8").splitlines() == [f"{first_root.resolve()} |  | false | false"]
+    assert roots_path.read_text(encoding="utf-8").splitlines() == [f"{first_root.resolve()} |  | false | false | false"]
 
 
 def test_scan_completion_merges_concurrent_root_edits(tmp_path, monkeypatch):
@@ -535,7 +536,7 @@ def test_watch_roots_are_stored_in_program_txt(tmp_path, monkeypatch):
     assert added == [str(first.resolve()), str(second.resolve())]
     assert roots == [str(first.resolve()), str(second.resolve())]
     assert removed == [str(first.resolve())]
-    assert roots_path.read_text(encoding="utf-8").splitlines() == [f"{second.resolve()} |  | false | false"]
+    assert roots_path.read_text(encoding="utf-8").splitlines() == [f"{second.resolve()} |  | false | false | false"]
 
 
 def test_remove_watch_root_cleans_service_owned_artifacts(tmp_path, monkeypatch):
@@ -608,16 +609,16 @@ def test_adding_and_removing_root_preserves_other_output_mappings(tmp_path, monk
     _, added, _updated = service_module.add_watch_roots([str(added_root)], output_dir="unpacked")
     assert added == [str(added_root.resolve())]
     assert roots_path.read_text(encoding="utf-8").splitlines() == [
-        f"{first.resolve()} | D:\\FirstOut | false | false",
-        f"{second.resolve()} | E:\\SecondOut | false | false",
-        f"{added_root.resolve()} | {(added_root / 'unpacked').resolve()} | false | false",
+        f"{first.resolve()} | D:\\FirstOut | false | false | false",
+        f"{second.resolve()} | E:\\SecondOut | false | false | false",
+        f"{added_root.resolve()} | {(added_root / 'unpacked').resolve()} | false | false | false",
     ]
 
     _, removed = service_module.remove_watch_roots([str(added_root)])
     assert removed == [str(added_root.resolve())]
     assert roots_path.read_text(encoding="utf-8").splitlines() == [
-        f"{first.resolve()} | D:\\FirstOut | false | false",
-        f"{second.resolve()} | E:\\SecondOut | false | false",
+        f"{first.resolve()} | D:\\FirstOut | false | false | false",
+        f"{second.resolve()} | E:\\SecondOut | false | false | false",
     ]
 
 
@@ -675,7 +676,7 @@ def test_watch_add_deep_updates_existing_root_and_preserves_output(tmp_path, mon
     assert added == [] and updated == [str(root)]
     [entry] = service_module._read_watch_root_entries()
     assert entry == service_module.WatchRootEntry(str(root), str(output), True)
-    assert roots_path.read_text(encoding="utf-8").splitlines()[-1].endswith(" | true | false")
+    assert roots_path.read_text(encoding="utf-8").splitlines()[-1].endswith(" | true | false | false")
 
     _, added, updated = service_module.add_watch_roots([str(root)])
     assert added == updated == []
@@ -875,7 +876,7 @@ def test_watch_add_writes_a_plain_root_and_list_shows_it(tmp_path, monkeypatch):
 
     assert code == 0
     assert result.summary["added"] == [str(watch_root.resolve())]
-    assert roots_path.read_text(encoding="utf-8").splitlines() == [f"{watch_root.resolve()} |  | false | false"]
+    assert roots_path.read_text(encoding="utf-8").splitlines() == [f"{watch_root.resolve()} |  | false | false | false"]
 
     list_code, listed = watch_command._handle_list()
 
@@ -944,7 +945,7 @@ def test_watch_add_accepts_one_output_dir_and_persists_absolute_mapping(tmp_path
     assert code == 0
     assert result.inputs["output_dir"] == "unpacked"
     assert roots_path.read_text(encoding="utf-8").splitlines() == [
-        f"{watch_root.resolve()} | {(watch_root / 'unpacked').resolve()} | {str(deep_detect).lower()} | false"
+        f"{watch_root.resolve()} | {(watch_root / 'unpacked').resolve()} | {str(deep_detect).lower()} | false | false"
     ]
 
 
@@ -974,7 +975,7 @@ def test_running_watch_add_forwards_output_dir_and_deep_mode(tmp_path, monkeypat
     class FakeHost:
         watch_enabled = True
 
-        async def add_watch_roots(self, paths, *, output_dir=None, deep_detect=None):
+        async def add_watch_roots(self, paths, *, output_dir=None, deep_detect=None, recursive=None):
             calls.append((list(paths), output_dir, deep_detect))
             return {
                 "roots_path": str(tmp_path / "roots.txt"),
@@ -1113,6 +1114,7 @@ def test_watch_service_new_scheduler_inherits_foreground_activity(tmp_path, monk
     activity = []
 
     class Engine:
+        output_ownership = None
         async def __aenter__(self):
             return self
 

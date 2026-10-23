@@ -9,3 +9,4 @@ class WatchRootEntry:
     output_root: str | None = None
     deep_detect: bool = False
     initial_scanned: bool = False
+    recursive: bool = False

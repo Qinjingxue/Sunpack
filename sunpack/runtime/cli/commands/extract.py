@@ -145,6 +145,7 @@ async def handle(args, ctx):
             response = await engine.run(
                 current_targets,
                 direct=bool(getattr(args, "direct_file", False)),
+                recursive=args.recursive,
                 request_config=run_config,
                 stdout=ctx.stderr if args.json else ctx.stdout,
                 stderr=ctx.stderr,

@@ -93,6 +93,7 @@ class ArchiveJobExecutor:
         progress_reporter: Any | None = None,
         request_id: str = "",
         origin: str = "",
+        output_ownership=None,
     ):
         self.context = context
         self.extractor = extractor
@@ -103,6 +104,7 @@ class ArchiveJobExecutor:
         self.progress_reporter = progress_reporter
         self.request_id = str(request_id or "")
         self.origin = str(origin or "")
+        self.output_ownership = output_ownership
         self.verifier = VerificationScheduler(self.config, password_session=self.extractor.password_session)
         self.password_scope_context = self.config.get("password_scope_context") or PasswordScopeContext(self.config.get("password_scope_dir", ""))
 
@@ -129,6 +131,10 @@ class ArchiveJobExecutor:
             ensure_input_lease=ensure_input_lease,
         )
         result = self.collect_result(task, outcome)
+        if self.output_ownership is not None and outcome.planned_out_dir:
+            await broker.run("output_seal", task.key or task.main_path, self.output_ownership.seal,
+                outcome.planned_out_dir, succeeded=result.outcome_kind != OutcomeKind.FAILURE,
+                request_id=self.request_id)
         if self.origin == "watch":
             output_task_path, output_dir = task.runtime.pop("watch_active_output", (task.main_path, outcome.planned_out_dir))
             self.extractor.emit_semantic_event(
@@ -199,6 +205,10 @@ class ArchiveJobExecutor:
             self._report_task_finished(task, terminal, depth)
             return task, terminal
 
+        if self.output_ownership is not None:
+            await broker.run("output_begin", file_id, self.output_ownership.begin,
+                             planned_out_dir, self.request_id, request_id=self.request_id,
+                             cancellation=cancellation)
         if self.origin == "watch":
             task.runtime["watch_active_output"] = (task.main_path, planned_out_dir)
             self.extractor.emit_semantic_event(

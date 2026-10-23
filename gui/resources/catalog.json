@@ -216,6 +216,7 @@
       "zh": "输出目录",
       "en": "Output folder"
     },
+    "recursiveScan": {"zh": "递归发现", "en": "Recursive discovery"},
     "deep": {
       "zh": "深度检测",
       "en": "Deep detection"
@@ -982,28 +983,7 @@
         "en": "Flatten single subfolder"
       }
     },
-    "/filesystem/directory_scan_mode": {
-      "label": {
-        "zh": "扫描范围",
-        "en": "Scan scope"
-      },
-      "options": [
-        {
-          "value": "-",
-          "label": {
-            "zh": "仅当前目录",
-            "en": "This folder only"
-          }
-        },
-        {
-          "value": "*",
-          "label": {
-            "zh": "包含子目录",
-            "en": "Include subfolders"
-          }
-        }
-      ]
-    },
+
     "/filesystem/scan_filters_enabled": {
       "label": {
         "zh": "扫描筛选器整体开关",

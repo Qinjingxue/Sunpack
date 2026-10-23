@@ -14,7 +14,7 @@ def scan_config(blocked_files=None, blocked_extensions=None):
     return make_config(with_detection_pipeline({
         "thresholds": {"archive_score_threshold": 5, "maybe_archive_threshold": 3},
         "filesystem": {
-            "directory_scan_mode": "*",
+            
         },
     }, precheck=[
         {"name": "size_range", "enabled": True, "min_bytes": 0},

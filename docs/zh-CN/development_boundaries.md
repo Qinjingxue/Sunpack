@@ -77,7 +77,7 @@ sunpack.runtime.watch
 
 ### core.config
 
-`sunpack.core.config` 负责外部配置读取、字段声明和归一化。将配置与 Detection、Verification 注册能力对照的应用校验放在 `sunpack.runtime.config_validation`。配置别名如 `recursive_extract: "*" / "?"`、`filesystem.directory_scan_mode: "*" / "-"`、`archive_cleanup_mode: "d/r/k"` 是用户接口的一部分。Pipeline 代码消费归一化后的值。
+`sunpack.core.config` 负责外部配置读取、字段声明和归一化。将配置与 Detection、Verification 注册能力对照的应用校验放在 `sunpack.runtime.config_validation`。配置别名如 `recursive_extract: "*" / "?"`、`archive_cleanup_mode: "d/r/k"` 是用户接口的一部分。Pipeline 代码消费归一化后的值。
 
 ### core.contracts
 

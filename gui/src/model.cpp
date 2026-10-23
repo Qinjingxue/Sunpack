@@ -398,15 +398,18 @@ WatchRoots parse_roots(const std::string& raw, const fs::path& base) {
             auto sep=value.find('|',at); parts.push_back(trim(value.substr(at,sep==std::string::npos?sep:sep-at)));
             if (sep==std::string::npos) break; at=sep+1;
         }
-        if (parts.size()>4) throw std::runtime_error("rootsLineInvalid");
+        if (parts.size()>5) throw std::runtime_error("rootsLineInvalid");
         if (parts[0].empty()) continue;
         std::string deep = parts.size()>=3 ? parts[2] : "";
         std::transform(deep.begin(),deep.end(),deep.begin(),[](unsigned char c){ return char(tolower(c)); });
         if (!deep.empty() && deep!="true" && deep!="false") throw std::runtime_error("deepDetectInvalid");
-        std::string scanned = parts.size()==4 ? parts[3] : "";
+        std::string scanned = parts.size()>=4 ? parts[3] : "";
         std::transform(scanned.begin(),scanned.end(),scanned.begin(),[](unsigned char c){ return char(tolower(c)); });
         if (!scanned.empty() && scanned!="true" && scanned!="false") throw std::runtime_error("rootsLineInvalid");
-        WatchRoot entry{resolve_path(wide(parts[0]),base), parts.size()>=2?parts[1]:"", deep=="true", scanned=="true"};
+        std::string recursive=parts.size()>=5?parts[4]:"";
+        std::transform(recursive.begin(),recursive.end(),recursive.begin(),[](unsigned char c){return char(tolower(c));});
+        if(!recursive.empty() && recursive!="true" && recursive!="false") throw std::runtime_error("rootsLineInvalid");
+        WatchRoot entry{resolve_path(wide(parts[0]),base), parts.size()>=2?parts[1]:"", deep=="true", scanned=="true", recursive=="true"};
         auto key=path_key(entry.input); auto it=positions.find(key);
         if (it==positions.end()) { positions[key]=result.entries.size(); result.entries.push_back(entry); }
         else { entry.input=result.entries[it->second].input; result.entries[it->second]=entry; }
@@ -427,7 +430,7 @@ WatchRoots apply_root_changes(WatchRoots roots,const fs::path& base,const Json& 
     bool compact=false;
     auto apply=[&](const Json& edit,const std::string& input) {
         std::string op=edit.at("operation"), original=edit.value("original",std::string()), output=edit.at("output");
-        bool deep=edit.at("deep");
+        bool deep=edit.at("deep"), recursive=edit.value("recursive",false);
         auto path = resolve_path(wide(input),base);
         if (input.empty() || input.find_first_of("|\r\n") != std::string::npos || output.find_first_of("|\r\n") != std::string::npos)
             throw std::runtime_error("rootInvalid");
@@ -437,7 +440,7 @@ WatchRoots apply_root_changes(WatchRoots roots,const fs::path& base,const Json& 
         auto index=found==indices.end()?size_t(-1):found->second;
         if (!original.empty() && index==size_t(-1)) throw std::runtime_error("rootRemoved");
         if(!original.empty() && edit.contains("expected") && !edit["expected"].is_null() &&
-            (roots.entries[index].output!=edit["expected"].value("output",std::string()) || roots.entries[index].deep!=edit["expected"].value("deep",false)))
+            (roots.entries[index].output!=edit["expected"].value("output",std::string()) || roots.entries[index].deep!=edit["expected"].value("deep",false) || roots.entries[index].recursive!=edit["expected"].value("recursive",false)))
             throw std::runtime_error("rootConflict");
         auto remove=[&] {
             if(index!=size_t(-1)) { removed[index]=true; indices.erase(previous); compact=true; }
@@ -448,12 +451,12 @@ WatchRoots apply_root_changes(WatchRoots roots,const fs::path& base,const Json& 
             auto duplicate=indices.find(key);
             if (duplicate!=indices.end() && duplicate->second!=index) {
                 const auto& record=roots.entries[duplicate->second];
-                if(record.output==trim(output) && record.deep==deep) { remove(); return; }
+                if(record.output==trim(output) && record.deep==deep && record.recursive==recursive) { remove(); return; }
                 throw std::runtime_error("rootDuplicate");
             }
-            WatchRoot replacement{path,trim(output),deep};
+            WatchRoot replacement{path,trim(output),deep,false,recursive};
             if(index!=size_t(-1) && path_key(roots.entries[index].input)==key)
-                replacement.initial_scanned=roots.entries[index].initial_scanned;
+                replacement.initial_scanned=roots.entries[index].initial_scanned && !(recursive && !roots.entries[index].recursive);
             if(index==size_t(-1)) {
                 indices.emplace(std::move(key),roots.entries.size());
                 roots.entries.push_back(std::move(replacement)); removed.push_back(false);
@@ -484,7 +487,7 @@ static std::string roots_text(const WatchRoots& roots) {
     std::string content;
     for(auto& c:roots.comments) content+=c+"\n";
     for(auto& r:roots.entries) content+=utf8(r.input.wstring())+
-        " | "+r.output+" | "+(r.deep?"true":"false")+" | "+(r.initial_scanned?"true":"false")+"\n";
+        " | "+r.output+" | "+(r.deep?"true":"false")+" | "+(r.initial_scanned?"true":"false")+" | "+(r.recursive?"true":"false")+"\n";
     return content;
 }
 void edit_root(const fs::path& p,const std::string& op,const std::string& original,const std::string& input,const std::string& output,bool deep) {
@@ -952,7 +955,7 @@ Json directory_rows(const WatchRoots& roots,const Json& config) {
     for(auto& r:roots.entries) {
         auto key=path_key(r.input);
         rows.push_back({{"id",utf8(key)},{"path",utf8(r.input.wstring())},{"name",utf8(r.input.filename().wstring())},
-            {"watch",true},{"output",r.output},{"effectiveOutput",utf8(resolve_path(wide(r.output.empty()?default_out:r.output),r.input).wstring())},{"deep",r.deep}});
+            {"watch",true},{"output",r.output},{"effectiveOutput",utf8(resolve_path(wide(r.output.empty()?default_out:r.output),r.input).wstring())},{"deep",r.deep},{"recursive",r.recursive}});
     }
     return rows;
 }

@@ -53,7 +53,7 @@ def _native_options(scenario: str, config_path: Path) -> dict[str, Any]:
     scan_filters = [] if scenario == "filters_off" else [_prune_filter(config_path)]
     config = {
         "filesystem": {
-            "directory_scan_mode": "*",
+            
             "scan_filters_enabled": bool(scan_filters),
             "scan_filters": scan_filters,
         }

@@ -5,7 +5,7 @@ from typing import Any
 from sunpack.runtime.cli.cli_types import CliPasswordSummary
 from sunpack.core.config.loader import apply_config_overrides
 from sunpack.core.config.schema import normalize_config_value
-from sunpack.core.config.detection_view import directory_scan_mode, scan_filter_config, scan_filters_enabled
+from sunpack.core.config.detection_view import scan_filter_config, scan_filters_enabled
 from sunpack.core.config.cli_settings import load_cli_language_from_config
 from sunpack.core.i18n import I18nContext
 from sunpack.core.passwords import dedupe_passwords, PasswordStore, read_password_file
@@ -28,7 +28,6 @@ def build_effective_config(config: dict) -> dict[str, Any]:
         },
         "embedded_scan": dict(config.get("embedded_scan") or {}),
         "filesystem": {
-            "directory_scan_mode": directory_scan_mode(config),
             "scan_filters_enabled": scan_filters_enabled(config),
             "scan_filters": [
                 {"name": item.get("name"), "enabled": item.get("enabled", False)}

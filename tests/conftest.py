@@ -1,4 +1,5 @@
 import os
+import json
 from pathlib import Path
 
 import pytest
@@ -43,6 +44,24 @@ def isolate_builtin_password_file(tmp_path):
     monkeypatch.undo()
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+@pytest.fixture(autouse=True)
+def isolate_pipeline_state(tmp_path, monkeypatch, request):
+    """A test pipeline must never open the developer's persistent Watch state."""
+    from sunpack.pipeline.coordinator.output_ownership import OutputOwnership
+    original = OutputOwnership.state_for
+
+    def state_for(owner, path=None):
+        if path is None and owner._state is None and not owner.config["watch"].get("state_dir"):
+            path = str(tmp_path / "runtime-state" / "state.json")
+        return original(owner, path)
+
+    monkeypatch.setattr(OutputOwnership, "state_for", state_for)
+    overrides = json.loads(os.environ.get("SUNPACK_CONFIG_OVERRIDES", "{}"))
+    overrides.setdefault("watch", {})["state_dir"] = str(tmp_path / "runtime-state")
+    monkeypatch.setenv("SUNPACK_CONFIG_OVERRIDES", json.dumps(overrides))
+    monkeypatch.setenv("SUNPACK_TEST_STATE_DIR", str(tmp_path / "runtime-state"))
 
 
 @pytest.fixture

@@ -214,7 +214,12 @@ class FakeObserver:
         self.stopped = False
 
     def schedule(self, handler, path, recursive=True):
-        self.scheduled.append((handler, path, recursive))
+        watch = (handler, path, recursive)
+        self.scheduled.append(watch)
+        return watch
+
+    def unschedule(self, watch):
+        self.scheduled.remove(watch)
 
     def start(self):
         self.started = True
@@ -299,6 +304,8 @@ class _NoItemsDict(dict):
 def _indexed_scheduler_for_test():
     watcher = object.__new__(RuntimeWatchScheduler)
     watcher._lock = threading.Lock()
+    watcher._directory_pending = set()
+    watcher._watch_rearm = set()
     watcher._pending = {}
     watcher._pending_by_key = {}
     watcher._claims_by_owner = {}
@@ -904,6 +911,8 @@ class _DeferredPipelineEngine:
         progress_callback=None,
         origin="foreground",
         detection_options=None,
+        discovery_scope=None,
+        catalog=None,
     ):
         handle = _DeferredHandle(targets[0].path)
         self.handles.append(handle)
@@ -1374,8 +1383,8 @@ def test_watch_scheduler_preserves_existing_directory_password_file(tmp_path, mo
     assert password_file.read_text(encoding="utf-8") == "existing-secret\n"
 
 
-@pytest.mark.parametrize("mode", ["-", "*"])
-def test_watch_scheduler_never_recurses_for_recursive_directory_scan_mode(tmp_path, monkeypatch, mode):
+@pytest.mark.parametrize("recursive", [False, True])
+def test_watch_scheduler_uses_each_roots_recursive_flag(tmp_path, monkeypatch, recursive):
     monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
 
     watch_root = tmp_path / "in"
@@ -1386,7 +1395,8 @@ def test_watch_scheduler_never_recurses_for_recursive_directory_scan_mode(tmp_pa
 
     watcher = _watcher(
         tmp_path,
-        config=make_config({"filesystem": {"directory_scan_mode": mode, "scan_filters": []}}),
+        config=make_config({"filesystem": {"scan_filters": []}}),
+        root_entries=[scheduler_module.WatchRootEntry(str(watch_root), recursive=recursive)],
         roots=[str(watch_root)],
         cold_start_seconds=0,
     )
@@ -1394,11 +1404,11 @@ def test_watch_scheduler_never_recurses_for_recursive_directory_scan_mode(tmp_pa
     _await(watcher.start())
     _await(watcher.scan_initial_roots([str(watch_root)]))
 
-    assert watcher._observer.scheduled[0][1:] == (str(watch_root.resolve()), False)
+    assert watcher._observer.scheduled[0][1:] == (str(watch_root.resolve()), recursive)
     pending_names = {Path(path).name for path in watcher._pending}
-    assert pending_names == {"root.zip"}
+    assert pending_names == ({"root.zip", "nested.zip"} if recursive else {"root.zip"})
     watcher.enqueue(str(nested / "nested.zip"))
-    assert {Path(path).name for path in watcher._pending} == {"root.zip"}
+    assert {Path(path).name for path in watcher._pending} == ({"root.zip", "nested.zip"} if recursive else {"root.zip"})
     _await(watcher.stop())
 
 
@@ -1416,7 +1426,7 @@ def test_watch_scheduler_does_not_apply_pipeline_filesystem_filters(tmp_path, mo
         config=make_config({
             "filesystem": {
                 "scan_filters": [
-                    {"name": "path_pattern", "enabled": True, "exclude": ["*.zip"]},
+                    {"name": "blacklist", "enabled": True, "blocked_extensions": [".zip"]},
                 ],
             },
             "watch": {"clipboard_monitor_enabled": False},

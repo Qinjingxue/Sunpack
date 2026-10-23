@@ -22,7 +22,7 @@ def test_installer_resets_pre_120_data_and_preserves_current_data(tmp_path, repo
         "PathWithoutEntry", "AddMachinePath", "RemoveMachinePath",
         "PowerShellSingleQuotedString", "RequiresDataReset", "InstalledDataRequiresReset",
         "RemoveDataDirectory", "ExistingApplicationDirectory", "RemoveInstalledData",
-        "ExistingLauncherPath", "PrepareToInstall",
+        "ExistingLauncherPath", "CaptureConfigurationForUpgrade", "PrepareToInstall",
     ):
         match = re.search(rf"^(?:function|procedure) {name}\b.*?^end;", source, re.M | re.S)
         assert match is not None, name
@@ -31,6 +31,7 @@ def test_installer_resets_pre_120_data_and_preserves_current_data(tmp_path, repo
     default_files = [line.replace("{#SourceDir}", str(repo_root))
                      .replace(r"{commonappdata}\SunPack", r"{param:Fixture}\data")
                      for line in source.splitlines() if line.startswith('Source: "{#SourceDir}\\')
+                     and 'DestDir: "{commonappdata}' in line
                      and ('\\sunpack_config.json";' in line or '\\builtin_passwords.json";' in line)]
     assert len(default_files) == 2
     harness = tmp_path / "reset.iss"
@@ -63,6 +64,7 @@ const
 var
   StopStage: Integer;
   ExistingWatchStateCaptured, RestartWatchAfterUpgrade: Boolean;
+  ConfigBackupCaptured: Boolean;
 procedure ApplyStartupTaskDefault;
 begin
 end;

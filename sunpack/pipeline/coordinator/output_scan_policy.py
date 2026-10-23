@@ -23,7 +23,7 @@ class NestedOutputScanPolicy:
 
     def __init__(self, config: dict[str, Any]):
         self.config = config
-        self._output_scan_config = self._build_recursive_output_scan_config()
+        self._output_scan_config = self.config
         self._scan_options = None
         self._scan_options_lock = Lock()
 
@@ -63,6 +63,7 @@ class NestedOutputScanPolicy:
         scan_session = DiscoveryScanSession(
             config=self.config,
             include_raw_snapshots=True,
+            recursive=True,
         )
         for output_dir in scan_dirs:
             if not output_dir:
@@ -151,11 +152,3 @@ class NestedOutputScanPolicy:
         filtered, raw = self._compiled_scan_options().scan(root, None)
         return DirectorySnapshot.from_native(Path(root), filtered, raw)
 
-    def _build_recursive_output_scan_config(self) -> dict[str, Any]:
-        config = deepcopy(self.config)
-        filesystem = config.get("filesystem")
-        if not isinstance(filesystem, dict):
-            filesystem = {}
-            config["filesystem"] = filesystem
-        filesystem["directory_scan_mode"] = "recursive"
-        return config

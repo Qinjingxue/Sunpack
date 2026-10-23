@@ -143,7 +143,7 @@ def _service_config_without_tray(service_config: dict) -> dict:
 
 
 def _root_policy(entry: WatchRootEntry):
-    return path_key(entry.input_root), (path_key(entry.output_root or entry.input_root), entry.deep_detect)
+    return path_key(entry.input_root), (path_key(entry.output_root or entry.input_root), entry.deep_detect, entry.recursive)
 
 
 def _tray_signature(config: dict, service_config: dict) -> tuple[bool, str]:
@@ -209,8 +209,8 @@ def _read_watch_root_entries(path: Path | None = None) -> list[WatchRootEntry]:
         if not value or value.startswith("#"):
             continue
         parts = [part.strip() for part in value.split(WATCH_ROOT_OUTPUT_SEPARATOR)]
-        if len(parts) > 4:
-            raise ValueError(f"{roots_path}:{line_number}: expected input | output | deep_detect | initial_scanned")
+        if len(parts) > 5:
+            raise ValueError(f"{roots_path}:{line_number}: expected input | output | deep_detect | initial_scanned | recursive")
         input_root = parts[0]
         if not input_root:
             continue
@@ -221,10 +221,13 @@ def _read_watch_root_entries(path: Path | None = None) -> list[WatchRootEntry]:
         deep_value = parts[2].casefold() if len(parts) >= 3 else ""
         if deep_value not in {"", "true", "false"}:
             raise ValueError(f"{roots_path}:{line_number}: deep_detect must be true or false")
-        scanned_value = parts[3].casefold() if len(parts) == 4 else ""
+        scanned_value = parts[3].casefold() if len(parts) >= 4 else ""
         if scanned_value not in {"", "true", "false"}:
             raise ValueError(f"{roots_path}:{line_number}: initial_scanned must be true or false")
-        entry = WatchRootEntry(input_root, explicit_output, deep_value == "true", scanned_value == "true")
+        recursive_value = parts[4].casefold() if len(parts) >= 5 else ""
+        if recursive_value not in {"", "true", "false"}:
+            raise ValueError(f"{roots_path}:{line_number}: recursive must be true or false")
+        entry = WatchRootEntry(input_root, explicit_output, deep_value == "true", scanned_value == "true", recursive_value == "true")
         key = path_key(input_root)
         position = positions.get(key)
         if position is None:
@@ -307,7 +310,7 @@ def _write_watch_root_entries_unlocked(entries: list[WatchRootEntry], roots_path
         prefix
         + "".join(
             entry.input_root
-            + f" | {entry.output_root or ''} | {str(entry.deep_detect).lower()} | {str(entry.initial_scanned).lower()}"
+            + f" | {entry.output_root or ''} | {str(entry.deep_detect).lower()} | {str(entry.initial_scanned).lower()} | {str(entry.recursive).lower()}"
             + "\n"
             for entry in normalized_entries
         ),
@@ -321,6 +324,7 @@ def add_watch_roots(
     *,
     output_dir: str | None = None,
     deep_detect: bool | None = None,
+    recursive: bool | None = None,
 ) -> tuple[Path, list[str], list[str]]:
     roots_path = watch_roots_path()
     with _watch_roots_mutex(roots_path):
@@ -334,8 +338,12 @@ def add_watch_roots(
             if key in positions:
                 index = positions[key]
                 entry = entries[index]
-                if deep_detect is not None and entry.deep_detect != deep_detect:
-                    entries[index] = replace(entry, deep_detect=deep_detect)
+                replacement = replace(entry,
+                    deep_detect=entry.deep_detect if deep_detect is None else deep_detect,
+                    recursive=entry.recursive if recursive is None else recursive,
+                    initial_scanned=entry.initial_scanned and not (recursive is True and not entry.recursive))
+                if replacement != entry:
+                    entries[index] = replacement
                     updated.append(entry.input_root)
                 continue
             explicit_output = (
@@ -344,7 +352,7 @@ def add_watch_roots(
                 else _resolve_watch_output_root(normalized, output_dir)
             )
             positions[key] = len(entries)
-            entries.append(WatchRootEntry(normalized, explicit_output, bool(deep_detect)))
+            entries.append(WatchRootEntry(normalized, explicit_output, bool(deep_detect), recursive=bool(recursive)))
             added.append(normalized)
         if added or updated:
             _write_watch_root_entries_unlocked(entries, roots_path)
@@ -418,7 +426,7 @@ class WatchService:
 
     @property
     def roots(self) -> list[str]:
-        return existing_roots([entry.input_root for entry in self.service_config["root_entries"]])
+        return _normalize_scan_roots([entry.input_root for entry in self.service_config["root_entries"]])
 
     @property
     def root_outputs(self) -> dict[str, str]:
@@ -564,13 +572,14 @@ class WatchService:
         *,
         output_dir: str | None = None,
         deep_detect: bool | None = None,
+        recursive: bool | None = None,
     ) -> dict:
         return await asyncio.shield(self._start_configuration_change(
-            lambda: self._add_roots_unlocked(paths, output_dir, deep_detect),
+            lambda: self._add_roots_unlocked(paths, output_dir, deep_detect, recursive),
         ))
 
-    async def _add_roots_unlocked(self, paths, output_dir, deep_detect) -> dict:
-        roots_path, added, updated = add_watch_roots(paths, output_dir=output_dir, deep_detect=deep_detect)
+    async def _add_roots_unlocked(self, paths, output_dir, deep_detect, recursive) -> dict:
+        roots_path, added, updated = add_watch_roots(paths, output_dir=output_dir, deep_detect=deep_detect, recursive=recursive)
         if not added and not updated:
             self.log.write("watch_roots_add_skipped", requested=_normalize_scan_roots(paths))
             return {
@@ -676,6 +685,7 @@ class WatchService:
                 ),
                 observer_stop_timeout_seconds=float(watch_config.get("observer_stop_timeout_seconds", 5.0)),
                 pipeline_engine=pipeline_engine,
+                output_ownership=pipeline_engine.output_ownership,
                 notification_sink=toast_coordinator,
                 wake_callback=self._wake_scheduler,
             )

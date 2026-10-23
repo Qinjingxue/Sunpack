@@ -47,7 +47,7 @@ def handle(args, ctx):
     detection_options = EmbeddedOptions(force_scan=bool(args.deep_detect))
     diagnostics = DetectionDiagnostics(config, detection_options)
     effective_config = build_effective_config(diagnostics.provider.config)
-    results = diagnostics.collect(target_paths)
+    results = diagnostics.collect(target_paths, recursive=args.recursive)
     all_items = [inspect_result_to_item(res) for res in results]
     if args.analyze:
         analyses = _analysis_preview_by_path(results, config)

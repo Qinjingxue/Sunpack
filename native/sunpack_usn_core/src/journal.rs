@@ -7,7 +7,8 @@ use std::ptr::{null, null_mut};
 use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_READ, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    CreateFileW, OpenFileById, GetFinalPathNameByHandleW, FILE_ID_DESCRIPTOR, FileIdType, ExtendedFileIdType,
+    FILE_FLAG_BACKUP_SEMANTICS, VOLUME_NAME_GUID, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
 use windows_sys::Win32::System::IO::DeviceIoControl;
 
@@ -281,6 +282,8 @@ fn read_root_changes_from_volume(
     start_usn: i64,
     end_usn: i64,
 ) -> io::Result<Vec<String>> {
+    let root_path = path_for_id(volume, &root_file_id[..root_file_id_len])?;
+    let mut parents: HashMap<Vec<u8>, Option<String>> = HashMap::new();
     let mut cursor = start_usn;
     let mut scanned_bytes = 0usize;
     let mut payload_bytes = 0usize;
@@ -309,8 +312,8 @@ fn read_root_changes_from_volume(
             if record_length < 8 || offset + record_length > bytes_returned {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid USN journal record"));
             }
-            if let Some(name) = record_root_change_name(
-                &output[offset..offset+record_length],
+            if let Some(name) = record_recursive_change_name(
+                volume, &root_path, &mut parents, &output[offset..offset+record_length],
                 root_file_id,
                 root_file_id_len,
                 start_usn,
@@ -331,6 +334,58 @@ fn read_root_changes_from_volume(
         cursor = returned_next;
     }
     Ok(changed.into_iter().collect())
+}
+
+fn path_for_id(volume: HANDLE, id: &[u8]) -> io::Result<String> {
+    let mut descriptor = FILE_ID_DESCRIPTOR::default();
+    descriptor.dwSize = std::mem::size_of::<FILE_ID_DESCRIPTOR>() as u32;
+    if id.len() == 8 {
+        descriptor.Type = FileIdType;
+        descriptor.Anonymous.FileId = i64::from_le_bytes(id.try_into().unwrap());
+    } else {
+        descriptor.Type = ExtendedFileIdType;
+        unsafe { descriptor.Anonymous.ExtendedFileId.Identifier.copy_from_slice(id); }
+    }
+    let handle = unsafe { OpenFileById(volume, &descriptor, 0, FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
+                                      null(), FILE_FLAG_BACKUP_SEMANTICS) };
+    if handle == INVALID_HANDLE_VALUE { return Err(io::Error::last_os_error()); }
+    let handle = OwnedHandle(handle);
+    let mut buffer = vec![0u16; 512];
+    loop {
+        let length = unsafe { GetFinalPathNameByHandleW(handle.raw(),buffer.as_mut_ptr(),buffer.len() as u32,VOLUME_NAME_GUID) } as usize;
+        if length == 0 { return Err(io::Error::last_os_error()); }
+        if length < buffer.len() { return String::from_utf16(&buffer[..length]).map_err(|e| io::Error::new(io::ErrorKind::InvalidData,e)); }
+        if length > 32768 { return Err(io::Error::new(io::ErrorKind::InvalidData,"USN path exceeds Windows path limit")); }
+        buffer.resize(length+1,0);
+    }
+}
+
+fn record_recursive_change_name(volume: HANDLE, root_path: &str, parents: &mut HashMap<Vec<u8>,Option<String>>,
+    record: &[u8], root_file_id: &[u8; FILE_ID_BYTES], root_file_id_len: usize,
+    start_usn: i64, end_usn: i64) -> io::Result<Option<String>> {
+    if let Some(name) = record_root_change_name(record,root_file_id,root_file_id_len,start_usn,end_usn)? {
+        return Ok(Some(name));
+    }
+    if record.len() < 8 { return Err(io::Error::new(io::ErrorKind::InvalidData,"truncated USN record")); }
+    let major = u16::from_le_bytes(record[4..6].try_into().unwrap());
+    let (parent,usn,length,offset) = match major {
+        2 => (16..24,24,56,58), 3 => (24..40,40,72,74),
+        _ => return Ok(Some(String::new())), // Unknown/no-name records require reconciliation.
+    };
+    if record.len() < offset+2 { return Err(io::Error::new(io::ErrorKind::InvalidData,"truncated USN record")); }
+    let usn = i64::from_le_bytes(record[usn..usn+8].try_into().unwrap());
+    if usn < start_usn || usn >= end_usn { return Ok(None); }
+    let id = record[parent].to_vec();
+    let path = parents.entry(id.clone()).or_insert_with(|| path_for_id(volume,&id).ok());
+    let Some(path) = path else { return Ok(Some(String::new())); };
+    let root = root_path.trim_end_matches('\\');
+    if path.len() <= root.len() || !path.get(..root.len()).is_some_and(|prefix| prefix.eq_ignore_ascii_case(root)) || !path[root.len()..].starts_with('\\') { return Ok(None); }
+    let length = u16::from_le_bytes(record[length..length+2].try_into().unwrap()) as usize;
+    let offset = u16::from_le_bytes(record[offset..offset+2].try_into().unwrap()) as usize;
+    if length%2 != 0 || offset+length > record.len() { return Err(io::Error::new(io::ErrorKind::InvalidData,"invalid USN name")); }
+    let name = String::from_utf16(&record[offset..offset+length].chunks_exact(2).map(|v| u16::from_le_bytes([v[0],v[1]])).collect::<Vec<_>>())
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData,e))?;
+    Ok(Some(format!("{}\\{name}",&path[root.len()+1..])))
 }
 
 fn record_root_change_name(

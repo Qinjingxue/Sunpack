@@ -54,7 +54,7 @@ def handle(args, ctx):
 
     config = load_request_config(ctx.cwd)
     orchestrator = ScanOrchestrator(config, EmbeddedOptions(force_scan=bool(args.deep_detect)))
-    report = orchestrator.scan_report(target_paths)
+    report = orchestrator.scan_report(target_paths, recursive=args.recursive)
 
     task_items = [scan_result_to_item(res) for res in report.tasks]
     task_items.sort(key=lambda item: item["main_path"].lower())

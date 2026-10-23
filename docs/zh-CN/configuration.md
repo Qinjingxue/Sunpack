@@ -26,7 +26,6 @@ python sunpack.py config show
 | `recursive_authorization.enabled` | `true` 启用嵌套归档筛选策略；`false` 跳过该策略。 |
 | `post_extract.archive_cleanup_mode` | 成功后 `"r"` 移入回收站、`"k"` 保留、`"d"` 删除原归档。 |
 | `post_extract.flatten_single_directory` | `true` 时提升唯一顶层输出目录中的内容。 |
-| `filesystem.directory_scan_mode` | `"-"` 只扫描所选目录下的文件；`"*"` 连同子目录扫描。 |
 | `extraction.content_requirement` | `"complete"` 要求完整结果；`"allow_partial"` 接受部分恢复结果。 |
 | `watch.out_dir` | 未单独指定输出路径的 Watch 根目录所用的默认输出目录；`"."` 表示输入目录旁。 |
 
@@ -34,12 +33,14 @@ python sunpack.py config show
 
 ```json
 {
-  "post_extract": {"archive_cleanup_mode": "k"},
-  "filesystem": {"directory_scan_mode": "*"}
+  "post_extract": {"archive_cleanup_mode": "k"}
 }
 ```
 
 CLI 的 `--recur`、`--cleanup` 和 `--out-dir` 等参数可为单次命令指定解压行为，详见 [CLI 参数说明](cli_parameters.md)。
+
+
+目录发现默认只扫描当前层；`scan`、`inspect`、`extract` 使用 `--recursive` 发现子目录，嵌套解压仍由 `--recur` 控制。升级 1.2.0 及更新版本时，安装器比较新旧高级配置字段，删除废弃字段，并按普通模板补充新增字段；已有用户值和权限保持原样。
 
 ## 扫描过滤
 
@@ -74,7 +75,7 @@ GUI 按 Windows 本地时区编辑时间，保存时转成 UTC。大小单位支
 
 ## Watch 与密码
 
-使用 `python sunpack.py watch add C:\Downloads` 添加监控目录，附加 `-o E:\Output` 可指定输出目录；未指定时使用 `watch.out_dir`。`watch list` 可查看目录。Watch 只监控每个根目录下的直接文件，不递归监控子目录。
+使用 `python sunpack.py watch add C:\Downloads` 添加监控目录，附加 `-o E:\Output` 可指定输出目录；未指定时使用 `watch.out_dir`。`watch list` 可查看目录。加 `--recursive` 可递归监控子目录，每个监控根独立保存该标志。
 
 持久化密码只来自 `builtin_passwords.json`，包括其中的 `clipboard_history`。在 `passwords` 中填写 `value`，可用 `scopes` 指定一个或多个绝对目录，对其子目录也生效；省略 `scopes` 即全局生效。运行时来源包括显式输入（`-p`、`--pw-file` 或密码提示框）与当前剪贴板。
 

@@ -11,6 +11,8 @@ class FakePipelineEngine:
     """Async engine test double backed by a lightweight runner factory."""
 
     def __init__(self, runner_factory):
+        from sunpack.pipeline.coordinator.output_ownership import OutputOwnership
+        self.output_ownership = OutputOwnership({"watch": {}})
         self.runner_factory = runner_factory
         self.user_passwords = []
         self.builtin_passwords = []
@@ -21,7 +23,7 @@ class FakePipelineEngine:
         return self
 
     async def aclose(self, *, graceful=True):
-        return None
+        self.output_ownership.close()
 
     async def __aexit__(self, exc_type, exc, traceback):
         await self.aclose()
@@ -57,6 +59,9 @@ class FakePipelineEngine:
         progress_callback=None,
         origin="foreground",
         detection_options=None,
+        recursive=False,
+        discovery_scope=None,
+        catalog=None,
     ):
         paths = [target.path if hasattr(target, "path") else str(target) for target in targets]
         output = dict(targets[0].output) if targets and hasattr(targets[0], "output") else {}

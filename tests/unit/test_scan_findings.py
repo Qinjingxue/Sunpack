@@ -49,7 +49,7 @@ def test_scan_report_preserves_blocked_findings_without_creating_tasks(monkeypat
     monkeypatch.setattr(
         orchestrator.task_scanner,
         "scan_stage_result",
-        lambda _paths: StageResult(findings=[finding]),
+        lambda _paths, **kwargs: StageResult(findings=[finding]),
     )
 
     report = orchestrator.scan_report(["carrier.bin"])
@@ -71,7 +71,7 @@ def test_scan_report_projects_multiple_embedded_findings_from_one_task(monkeypat
     monkeypatch.setattr(
         orchestrator.task_scanner,
         "scan_stage_result",
-        lambda _paths: StageResult(resolved_tasks=[task]),
+        lambda _paths, **kwargs: StageResult(resolved_tasks=[task]),
     )
 
     report = orchestrator.scan_report([path])

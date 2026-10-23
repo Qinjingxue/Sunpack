@@ -26,7 +26,7 @@ def test_cli_disguised_split_carrier_multilevel_passwords(tmp_path, plan_error, 
     passwords = case.passwords if leaf_password_known else case.passwords[:2]
     root = Path(__file__).resolve().parents[2]
     overrides = {
-        "filesystem": {"directory_scan_mode": "-",
+        "filesystem": {
                        "scan_filters": [{"name": "size_range", "enabled": False}]},
         "embedded_scan": {"enabled": True},
         "verification": {"enabled": True},

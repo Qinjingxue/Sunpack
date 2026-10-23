@@ -41,6 +41,7 @@ def register(subparsers, ctx):
     add_parser.add_argument("paths", nargs="+", help=ctx.t("cli.watch.paths"))
     add_parser.add_argument("-o", "--out-dir", dest="output_dir", help=ctx.t("cli.watch.output_dir"))
     add_parser.add_argument("-s", "--start", dest="start", action="store_true", help=ctx.t("cli.watch.start_after_add"))
+    add_parser.add_argument("--recursive", action="store_true", default=None, help=ctx.t("cli.recursive_scan"))
     add_parser.add_argument("-d", "--deep-detect", dest="deep_detect", action="store_true", default=None, help=ctx.t("cli.watch.deep_detect"))
 
     remove_parser = actions.add_parser("remove", aliases=["rm"], parents=[common], help=ctx.t("cli.watch.remove"), formatter_class=CliHelpFormatter)
@@ -111,6 +112,7 @@ async def _handle_add(args, ctx):
     paths = _request_paths(args.paths, ctx)
     output_dir = getattr(args, "output_dir", None)
     deep_detect = getattr(args, "deep_detect", None)
+    recursive = getattr(args, "recursive", None)
     if output_dir is not None and len(paths) != 1:
         return EXIT_USAGE, CliCommandResult(
             command=COMMAND,
@@ -125,12 +127,13 @@ async def _handle_add(args, ctx):
             paths,
             output_dir=output_dir,
             deep_detect=deep_detect,
+            recursive=recursive,
         )
         roots_path = apply_summary["roots_path"]
         added = list(apply_summary["added"])
         updated = list(apply_summary["updated"])
     else:
-        roots_path_obj, added, updated = add_watch_roots(paths, output_dir=output_dir, deep_detect=deep_detect)
+        roots_path_obj, added, updated = add_watch_roots(paths, output_dir=output_dir, deep_detect=deep_detect, recursive=recursive)
         roots_path = str(roots_path_obj)
     start_summary = None
     if start_requested and not host.watch_enabled:

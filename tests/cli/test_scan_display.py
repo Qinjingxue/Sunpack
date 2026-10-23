@@ -34,7 +34,7 @@ def test_scan_localizes_discovery_without_changing_machine_results(monkeypatch, 
     ]
     calls = []
 
-    def scan_report(paths):
+    def scan_report(paths, *, recursive=False):
         calls.append(paths)
         return SimpleNamespace(tasks=[], findings=findings, errors=[], scan_error_count=0)
 
@@ -43,7 +43,7 @@ def test_scan_localizes_discovery_without_changing_machine_results(monkeypatch, 
     output = io.StringIO()
     reporter = CliReporter(json_mode=json_mode, stdout=output)
     ctx = CliContext(language=language, cwd=str(tmp_path), reporter=reporter)
-    args = SimpleNamespace(paths=[str(tmp_path)], deep_detect=False, json=json_mode)
+    args = SimpleNamespace(recursive=False, paths=[str(tmp_path)], deep_detect=False, json=json_mode)
 
     code, result = scan.handle(args, ctx)
 

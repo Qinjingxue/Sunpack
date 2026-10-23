@@ -31,7 +31,7 @@ def _advanced_payload():
         "thresholds": {"archive_score_threshold": 6, "maybe_archive_threshold": 3},
         "recursive_extract": "*",
         "post_extract": {"archive_cleanup_mode": "r", "flatten_single_directory": True},
-        "filesystem": {"directory_scan_mode": "*", "scan_filters_enabled": True, "scan_filters": []},
+        "filesystem": {"scan_filters_enabled": True, "scan_filters": []},
         "performance": {"worker": {"minimum_available_memory_ratio": 0.1, "watchdog_no_progress_timeout_seconds": 180}},
         "verification": _verification_config(),
         "detection": {"enabled": True},
@@ -55,7 +55,7 @@ def test_load_config_merges_simple_config_over_advanced_config(tmp_path, monkeyp
     config = loader.load_config()
     assert config["cli"]["language"] == "zh"
     assert config["runtime"]["process_mode"] == "high"
-    assert config["filesystem"]["directory_scan_mode"] == "recursive"
+    assert config["recursive_extract"] == {"mode": "infinite"}
     assert config["filesystem"]["scan_filters"][0]["min_bytes"] == 2097152
     assert config["filesystem"]["scan_filters"][0]["max_bytes"] is None
     assert config["performance"]["worker"]["watchdog_no_progress_timeout_seconds"] == 180
@@ -182,10 +182,10 @@ def test_config_loader_normalizes_external_schema_once(tmp_path, monkeypatch):
         assert calls == []
         config = loader.load_config()
         assert len(calls) == 1
-        assert config["filesystem"]["directory_scan_mode"] == "recursive"
+        assert config["recursive_extract"] == {"mode": "infinite"}
         assert loader.load_config() == config
         assert len(calls) == 1
-        assert loader.load_raw_config_payload()[1]["filesystem"]["directory_scan_mode"] == "*"
+        assert loader.load_raw_config_payload()[1]["recursive_extract"] == "*"
     finally:
         loader.clear_config_cache()
 
@@ -199,7 +199,7 @@ def test_raw_config_payload_returns_merged_external_config(tmp_path, monkeypatch
     path, payload = loader.load_raw_config_payload()
     assert path == simple
     assert payload["recursive_extract"] == "2"
-    assert payload["filesystem"]["directory_scan_mode"] == "*"
+    assert payload["post_extract"]["archive_cleanup_mode"] == "r"
 
 
 def test_embedded_candidate_ratio_simple_config_overrides_advanced(tmp_path, monkeypatch):

@@ -106,6 +106,7 @@ class WatchPendingWork:
     password_scope_dir: str = ""
     source_input_root: str = ""
     internal_recovery: bool = False
+    discovery_scope: dict = field(default_factory=dict)
     durable_owner: bool = False
     active_outputs: dict[str, str] = field(default_factory=dict)
     committed_roots: list[str] = field(default_factory=list)
@@ -735,6 +736,10 @@ class WatchStateStore:
         if self._persistence_fault is not None:
             raise RuntimeError("Watch state persistence is unavailable") from self._persistence_fault
 
+    def commit_runtime(self, operations, *, durable=False):
+        with self._state_lock:
+            self._commit_operations_locked(operations, durable=durable)
+
     def _commit_operations_locked(
         self,
         operations: list[dict[str, Any]],
@@ -829,6 +834,7 @@ class WatchStateStore:
         password_scope_dir: str = "",
         source_input_root: str = "",
         internal_recovery: bool = False,
+        discovery_scope: dict | None = None,
         durable_owner: bool = False,
         persist: bool = True,
         durable: bool = False,
@@ -852,6 +858,7 @@ class WatchStateStore:
                 internal_recovery=bool(
                     internal_recovery or (previous.internal_recovery if previous else False)
                 ),
+                discovery_scope=dict(discovery_scope or (previous.discovery_scope if previous else {})),
                 durable_owner=bool(
                     durable_owner or (previous.durable_owner if previous else False)
                 ),
@@ -890,6 +897,7 @@ class WatchStateStore:
                     else os.path.dirname(os.path.abspath(path))
                 ),
                 internal_recovery=bool(previous.internal_recovery if previous else False),
+                discovery_scope=dict(previous.discovery_scope if previous else {}),
                 durable_owner=bool(previous.durable_owner if previous else False),
                 active_outputs=dict(previous.active_outputs if previous else {}),
                 committed_roots=list(previous.committed_roots if previous else []),
@@ -998,6 +1006,7 @@ class WatchStateStore:
         *,
         password_scope_dir: str = "",
         source_input_root: str = "",
+        discovery_scopes: dict | None = None,
     ) -> None:
         with self._state_lock:
             owner_key = _path_key(owner_path)
@@ -1022,6 +1031,7 @@ class WatchStateStore:
                     source_input_root=source_input_root or (previous.source_input_root if previous else ""),
                     password_scope_dir=scope,
                     internal_recovery=True,
+                    discovery_scope=dict((discovery_scopes or {}).get(_path_key(candidate.path), previous.discovery_scope if previous else {})),
                     durable_owner=True,
                 )
                 operations.append(self._put_operation("pending_work", key, pending))
@@ -1116,6 +1126,7 @@ class WatchStateStore:
                         or os.path.dirname(os.path.abspath(candidate.path))
                     ),
                     internal_recovery=bool(previous.internal_recovery if previous else False),
+                    discovery_scope=dict(previous.discovery_scope if previous else {}),
                     durable_owner=True,
                     active_outputs=dict(previous.active_outputs if previous else {}),
                     committed_roots=list(previous.committed_roots if previous else []),

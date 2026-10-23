@@ -45,6 +45,7 @@ These options apply to `extract`, `scan`, and `inspect`:
 
 | Option | Description |
 | --- | --- |
+| `--recursive` | Discover input subdirectories; independent of nested extraction with `--recur`. |
 | `-j`, `--json` | Output results as JSON; suitable for scripting. |
 | `-q`, `--quiet` | Reduce terminal output. |
 | `-v`, `--verbose` | Output more detection and diagnostic detail. |
@@ -70,7 +71,7 @@ Usage:
 python sunpack.py extract [options] <paths...>
 ```
 
-`paths` may be one or more files or directories. Directories are scanned according to the configuration and turned into extraction tasks.
+`paths` may be one or more files or directories. Directories are scanned shallowly by default; `--recursive` includes their subdirectories.
 
 Options:
 
@@ -126,7 +127,7 @@ python sunpack.py scan [options] <paths...>
 
 `scan` outputs the identified extraction tasks, volume relationships, detected extensions, verdicts, and matched rules. It does not extract or clean up files.
 
-`--deep-detect` performs a full embedded scan on candidates not resolved by normal detection and disables all filesystem scan filters for this request, including nested output scans. `filesystem.directory_scan_mode` still determines the directory scope. Each CLI request uses its own arguments, even when it shares a runtime with deep monitoring of the same input directory.
+`--deep-detect` performs a full embedded scan on candidates not resolved by normal detection and disables all filesystem scan filters for this request, including nested output scans. `--recursive` determines the directory scope. Each CLI request uses its own arguments, even when it shares a runtime with deep monitoring of the same input directory.
 
 Examples:
 
@@ -173,7 +174,7 @@ Usage:
 python sunpack.py watch <add|remove|list|start|stop|reload|status|startup> [options]
 ```
 
-Monitored roots are stored in `sunpack_watch_roots.txt` inside the program resource directory. The format is `input directory | output root | deep_detect | initial_scanned`; the last three columns are optional:
+Monitored roots are stored in `sunpack_watch_roots.txt` inside the program resource directory. The format is `input directory | output root | deep_detect | initial_scanned | recursive`; the last four columns are optional:
 
 ```text
 C:\Downloads
@@ -312,3 +313,5 @@ extract "%1" --ask-pw --deep-detect --pause
 ```
 
 Output lands next to the archive by default.
+
+`watch add DIR --recursive` enables recursive discovery for that root. Legacy roots with four or fewer columns remain shallow. Split volumes may span subdirectories within one scope; separate roots remain independent. Watch outputs go directly to the root’s mapped output directory. CLI outputs default beside each archive, or beside the entry volume for a split archive. Pipeline output subtrees are protected from Watch, including later files added there.

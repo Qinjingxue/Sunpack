@@ -1,3 +1,4 @@
+from sunpack.core.contracts.discovery_scope import DiscoveryScope
 from pathlib import Path
 
 from sunpack.core.contracts.filesystem import FileEntry
@@ -15,7 +16,7 @@ def _entries(snapshot):
 def _config(*, prune_dir_globs=None, path_globs=None):
     return make_config({
         "filesystem": {
-            "directory_scan_mode": "*",
+            
             "scan_filters": [
                 {
                     "name": "directory_prune",
@@ -35,7 +36,7 @@ def test_directory_prune_exact_name_stops_descending(tmp_path):
     keep = tmp_path / "keep.zip"
     keep.write_bytes(b"PK\x03\x04payload")
 
-    snapshot = DirectoryScanner(str(tmp_path), config=_config(prune_dir_globs=["ignored"])).scan()
+    snapshot = DirectoryScanner(str(tmp_path), scope=DiscoveryScope(str(tmp_path), recursive=True), config=_config(prune_dir_globs=["ignored"])).scan()
     paths = {entry.path for entry in _entries(snapshot)}
 
     assert archive not in paths
@@ -48,7 +49,7 @@ def test_directory_prune_wildcard_matches_directory_name_case_insensitively(tmp_
     archive.parent.mkdir()
     archive.write_bytes(b"PK\x03\x04payload")
 
-    snapshot = DirectoryScanner(str(tmp_path), config=_config(prune_dir_globs=["node_*"])).scan()
+    snapshot = DirectoryScanner(str(tmp_path), scope=DiscoveryScope(str(tmp_path), recursive=True), config=_config(prune_dir_globs=["node_*"])).scan()
 
     assert not snapshot
 
@@ -64,7 +65,7 @@ def test_directory_prune_path_glob_is_relative_to_scan_root(tmp_path):
     recycled.parent.mkdir()
     recycled.write_bytes(b"PK\x03\x04payload")
 
-    snapshot = DirectoryScanner(str(tmp_path), config=_config(
+    snapshot = DirectoryScanner(str(tmp_path), scope=DiscoveryScope(str(tmp_path), recursive=True), config=_config(
         path_globs=["cache/private/**", "$RECYCLE.BIN/**"]
     )).scan()
     paths = {entry.path for entry in _entries(snapshot)}
@@ -82,6 +83,6 @@ def test_game_like_tree_is_not_implicitly_protected(tmp_path):
     (tmp_path / "game" / "game.exe").write_bytes(b"MZ")
     (tmp_path / "game" / "www" / "data").mkdir()
 
-    snapshot = DirectoryScanner(str(tmp_path), config=_config()).scan()
+    snapshot = DirectoryScanner(str(tmp_path), scope=DiscoveryScope(str(tmp_path), recursive=True), config=_config()).scan()
 
     assert archive in {entry.path for entry in _entries(snapshot)}

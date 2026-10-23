@@ -9,10 +9,10 @@ class DirectoryFlattener:
         self.stdout = stdout if stdout is not None else sys.stdout
         self.quiet = quiet
 
-    def flatten_dirs(self, base: str, *, announce: bool = True):
+    def flatten_dirs(self, base: str, *, announce: bool = True, work_path=None):
         if announce and not self.quiet:
             print(self.i18n.t("cleanup.flatten"), file=self.stdout, flush=True)
-        result = _native_flatten_single_branch_directories(str(base))
+        result = _native_flatten_single_branch_directories(str(base), work_path)
         errors = tuple(str(error) for error in result["errors"])
         return DirectoryFlattenResult(
             path=str(base),

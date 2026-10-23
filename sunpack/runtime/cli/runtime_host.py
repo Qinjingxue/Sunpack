@@ -194,12 +194,13 @@ class RuntimeHost:
         *,
         output_dir: str | None = None,
         deep_detect: bool | None = None,
+        recursive: bool | None = None,
     ) -> dict:
         service = self._watch_service
         if service is None or not self.watch_enabled:
             self.log_event("watch_roots_add_ignored", paths=list(paths))
             return {"added": [], "updated": [], "applied": False, "running": False}
-        result = await service.add_roots(paths, output_dir=output_dir, deep_detect=deep_detect)
+        result = await service.add_roots(paths, output_dir=output_dir, deep_detect=deep_detect, recursive=recursive)
         self.log_event(
             "watch_roots_added",
             added=list(result["added"]),

@@ -77,7 +77,7 @@ sunpack.runtime.watch
 
 ### core.config
 
-`sunpack.core.config` owns external configuration loading, field declarations, and normalization. Application checks that compare config with registered Detection or Verification capabilities live in `sunpack.runtime.config_validation`. Configuration aliases such as `recursive_extract: "*" / "?"`, `filesystem.directory_scan_mode: "*" / "-"`, and `archive_cleanup_mode: "d/r/k"` are part of the user interface. Pipeline code consumes normalized values.
+`sunpack.core.config` owns external configuration loading, field declarations, and normalization. Application checks that compare config with registered Detection or Verification capabilities live in `sunpack.runtime.config_validation`. Configuration aliases such as `recursive_extract: "*" / "?"`, and `archive_cleanup_mode: "d/r/k"` are part of the user interface. Pipeline code consumes normalized values.
 
 ### core.contracts
 
