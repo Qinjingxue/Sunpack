@@ -138,17 +138,9 @@ class DiscoveryScanSession:
         snapshot = self.snapshot_for_directory(directory)
         table = NativeCandidateTable()
         table.append_directory(snapshot.raw_native_snapshot, snapshot.native_snapshot)
-        encrypted = table.encrypted_rar_groups()
-        if encrypted:
-            builder = self.relations._builder
-            groups = [builder._candidate_group_from_native(raw) for raw in encrypted]
-            discovered = builder._discover_passwords([group for group in groups if group is not None])
-            if discovered:
-                table.retry_relations(
-                    snapshot.raw_native_snapshot,
-                    snapshot.file_route_view(FILESYSTEM_ROUTE_RELATIONS).native_snapshot,
-                    [(str(path), str(password)) for path, password in discovered.items()],
-                )
+        self.relations._builder.probe_encrypted_groups(
+            table, snapshot, filesystem_routed=True,
+        )
         return table
 
     def project_native_candidate(self, table: NativeCandidateTable, index: int) -> DiscoveryCandidate:

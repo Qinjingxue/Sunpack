@@ -243,12 +243,14 @@ impl NativeCandidateTable {
     }
 
     /// Replace the relation evidence for one table after a password is found.
+    #[pyo3(signature = (raw_snapshot, filtered_snapshot, path_passwords, refresh_paths=None))]
     fn retry_relations(
         &mut self,
         py: Python<'_>,
         raw_snapshot: PyRef<'_, NativeDirectorySnapshot>,
         filtered_snapshot: PyRef<'_, NativeDirectorySnapshot>,
         path_passwords: Vec<(String, String)>,
+        refresh_paths: Option<Vec<String>>,
     ) -> PyResult<()> {
         let mut cached = RelationCache::default();
         for row in &self.rows {
@@ -256,10 +258,35 @@ impl NativeCandidateTable {
                 relation_group_cached_anchors(group, &mut cached);
             }
         }
+        // A short password probe may start after another request consumed its
+        // inputs. Drop only proven departures from that proposal, sharing the
+        // original snapshot and surviving anchors instead of scanning again.
+        let departed: HashSet<String> = refresh_paths
+            .filter(|paths| !paths.is_empty())
+            .map(|paths| py.detach(|| {
+                paths.into_iter()
+                    .filter(|path| {
+                        std::fs::metadata(path)
+                            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                    })
+                    .map(|path| path_key(&path))
+                    .collect()
+            }))
+            .unwrap_or_default();
+        let current_snapshots = (!departed.is_empty()).then(|| {
+            (
+                raw_snapshot.without_path_keys(&departed),
+                filtered_snapshot.without_path_keys(&departed),
+            )
+        });
+        let (raw, filtered) = current_snapshots
+            .as_ref()
+            .map(|(raw, filtered)| (raw, filtered))
+            .unwrap_or((&raw_snapshot, &filtered_snapshot));
         let groups = build_native_candidate_groups_from_snapshot_cached(
             py,
-            &raw_snapshot,
-            &filtered_snapshot,
+            raw,
+            filtered,
             Some(&path_passwords),
             Some(&cached),
         )?;

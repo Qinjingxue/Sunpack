@@ -13,7 +13,7 @@ from sunpack_native import (
     relations_resolve_volume_once as _native_resolve_volume_once,
 )
 
-from sunpack.core.contracts.filesystem import DirectorySnapshot
+from sunpack.core.contracts.filesystem import DirectorySnapshot, FILESYSTEM_ROUTE_RELATIONS
 from sunpack.core.contracts.archive_input import ArchiveInputDescriptor, ArchiveInputPart, InputExtent
 from sunpack.core.passwords.directory_context import password_scope_for_path
 from sunpack.core.passwords.internal.store import PasswordStore
@@ -46,19 +46,27 @@ class RelationsGroupBuilder:
             _native_password_pairs(path_passwords),
         )
         if path_passwords is None:
-            encrypted_groups = self._groups_from_native(table.encrypted_rar_groups())
-            discovered = self._discover_passwords(encrypted_groups)
-            if discovered:
-                table.retry_relations(
-                    snapshot.raw_native_snapshot,
-                    snapshot.native_snapshot,
-                    _native_password_pairs(discovered),
-                )
+            self.probe_encrypted_groups(table, snapshot)
         return self._groups_from_native(table.project(index)[1] for index in range(len(table)))
+
+    def probe_encrypted_groups(self, table, snapshot: DirectorySnapshot, *, filesystem_routed=False) -> None:
+        groups = self._groups_from_native(table.encrypted_rar_groups())
+        if not groups:
+            return
+        refresh_paths: set[str] = set()
+        discovered = self._discover_passwords(groups, refresh_paths)
+        if discovered or refresh_paths:
+            if filesystem_routed:
+                snapshot = snapshot.file_route_view(FILESYSTEM_ROUTE_RELATIONS)
+            table.retry_relations(
+                snapshot.raw_native_snapshot, snapshot.native_snapshot,
+                _native_password_pairs(discovered) or [], list(refresh_paths),
+            )
 
     def _discover_passwords(
         self,
         groups: List[CandidateGroup],
+        refresh_paths: set[str],
     ) -> dict[str, str] | None:
         """Second-pass password discovery for header-encrypted RAR5 files.
 
@@ -110,12 +118,24 @@ class RelationsGroupBuilder:
         found: dict[str, str] = {}
         for proposal_paths, part_paths, archive_input in encrypted_groups:
             probe_path = next((path for path in part_paths if path in proposal_paths), proposal_paths[0])
-            password = self.password_prober.resolve_file(
-                probe_path,
-                scope_path=password_scope_for_path(self.config, probe_path),
-                part_paths=part_paths or proposal_paths,
-                archive_input=archive_input,
-            )
+            try:
+                password = self.password_prober.resolve_file(
+                    probe_path,
+                    scope_path=password_scope_for_path(self.config, probe_path),
+                    part_paths=part_paths or proposal_paths,
+                    archive_input=archive_input,
+                )
+            except FileNotFoundError as exc:
+                if exc.filename is None or path_key(os.path.abspath(exc.filename)) not in {
+                    path_key(path) for path in (*proposal_paths, *part_paths)
+                }:
+                    raise
+                # Tentative discovery inputs may be consumed before borrowing.
+                # Refresh only this proposal in Rust; never leave its stale
+                # anchors available for a later extraction or password verdict.
+                refresh_paths.update(proposal_paths)
+                refresh_paths.update(part_paths)
+                continue
             if not password:
                 continue
             # Upgrade encrypted facts for the proposal's physical paths. Native

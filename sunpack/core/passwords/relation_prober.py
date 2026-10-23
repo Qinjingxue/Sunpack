@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import stat
 from threading import RLock
 
 from sunpack.core.passwords.candidates import PasswordCandidatePipeline
@@ -86,7 +87,9 @@ class RelationsPasswordProber:
         archive_input: dict | None = None,
     ) -> str | None:
         path = os.path.abspath(path)
-        if not path or not os.path.isfile(path):
+        # Preserve NotFound so the Relations caller can invalidate the old
+        # snapshot, including departures before the first native borrow.
+        if not path or not stat.S_ISREG(os.stat(path).st_mode):
             return None
         probe_parts = list(part_paths) if part_paths is not None else [path]
         fingerprint = build_archive_fingerprint(path, probe_parts, archive_input)

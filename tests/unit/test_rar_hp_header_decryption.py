@@ -121,7 +121,7 @@ def test_password_retry_keeps_unencrypted_structure_facts_native(tmp_path, monke
     snapshot = _snapshot(tmp_path, ["encrypted.rar", *[path.name for path in parts]])
     scheduler = RelationsScheduler()
 
-    def discover(encrypted_groups):
+    def discover(encrypted_groups, refresh_paths):
         # Only password-blocked data crosses Python before the final projection.
         assert len(encrypted_groups) == 1
         assert encrypted_groups[0].head_path == rar_path

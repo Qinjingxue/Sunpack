@@ -134,6 +134,19 @@ impl NativeDirectorySnapshot {
             )
         })
     }
+
+    pub(crate) fn without_path_keys(&self, excluded: &HashSet<String>) -> Self {
+        Self {
+            table: Arc::clone(&self.table),
+            rows: self
+                .rows
+                .iter()
+                .copied()
+                .filter(|&row| !excluded.contains(&crate::path_keys::path_key(&self.table.paths[row])))
+                .collect(),
+            buckets: OnceLock::new(),
+        }
+    }
 }
 
 fn filesystem_file_route(is_dir: bool, anchor: Option<&VolumeAnchor>) -> u8 {
