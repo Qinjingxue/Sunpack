@@ -23,6 +23,7 @@ from sunpack.runtime.cli.runtime_host import RuntimeHost
 from sunpack.runtime.watch.scheduler import WatchScheduler
 from tests.helpers.archive_tasks import make_archive_task
 from tests.helpers.config_factory import make_config
+from tests.helpers.fake_pipeline_engine import FakePipelineEngine
 
 _TEST_LOOP = asyncio.new_event_loop()
 
@@ -69,6 +70,7 @@ class _CleanupOnlyEngine:
 
     def __init__(self):
         self.clear_calls = 0
+        self.work_broker = FakePipelineEngine(lambda _config: None).work_broker
 
     def is_idle(self):
         return True
@@ -83,6 +85,27 @@ class _BlockingCleanupEngine(_CleanupOnlyEngine):
         super().__init__()
         self.cleanup_started = asyncio.Event()
         self.release_cleanup = asyncio.Event()
+
+    async def start_cleanup(self, watcher):
+        cleanup = asyncio.create_task(watcher._maybe_clear_idle_caches())
+        started = asyncio.create_task(self.cleanup_started.wait())
+        try:
+            # Surface an early cleanup failure instead of waiting forever for
+            # an event that the failed task can no longer publish.
+            await asyncio.wait_for(
+                asyncio.wait((cleanup, started), return_when=asyncio.FIRST_COMPLETED), 5,
+            )
+            if cleanup.done():
+                await cleanup
+            assert self.cleanup_started.is_set()
+            return cleanup
+        except BaseException:
+            cleanup.cancel()
+            await asyncio.gather(cleanup, return_exceptions=True)
+            raise
+        finally:
+            started.cancel()
+            await asyncio.gather(started, return_exceptions=True)
 
     async def clear_runtime_caches(self):
         self.clear_calls += 1
@@ -437,8 +460,7 @@ def test_external_activity_waits_for_cleanup_already_in_progress(tmp_path):
         )
 
         watcher._cache_cleanup_deadline = 0
-        cleanup = asyncio.create_task(watcher._maybe_clear_idle_caches())
-        await engine.cleanup_started.wait()
+        cleanup = await engine.start_cleanup(watcher)
 
         foreground = asyncio.create_task(watcher.set_external_activity(True))
         await asyncio.sleep(0)
@@ -514,8 +536,7 @@ def test_disconnect_during_foreground_admission_restores_idle_cleanup(tmp_path, 
         host._watch_task = SimpleNamespace(done=lambda: False)
         set_runtime_host(host)
         watcher._cache_cleanup_deadline = 0
-        cleanup = asyncio.create_task(watcher._maybe_clear_idle_caches())
-        await engine.cleanup_started.wait()
+        cleanup = await engine.start_cleanup(watcher)
         protocol = _PipeRequestProtocol(
             b"t" * 32, on_connected=lambda: None, on_closed=lambda: None,
             on_completed=lambda: None, on_shutdown=lambda: None,
@@ -588,8 +609,7 @@ def test_external_activity_release_during_pending_acquire_leaves_gate_free(tmp_p
         )
 
         watcher._cache_cleanup_deadline = 0
-        cleanup = asyncio.create_task(watcher._maybe_clear_idle_caches())
-        await engine.cleanup_started.wait()
+        cleanup = await engine.start_cleanup(watcher)
 
         foreground = asyncio.create_task(watcher.set_external_activity(True))
         await asyncio.sleep(0)

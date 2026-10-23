@@ -371,6 +371,9 @@ def test_stale_space_event_is_not_forwarded_to_the_ui(tmp_path):
             # native 在 gate 锁外发送，这条 blocked(ep3) 晚到是合法的。
             _space_event("space_blocked", episode=3),
             _space_event("space_status", episode=3),
+            # 正常收尾，避免用固定 5s 超时等待一个永不完结的假 job。
+            {"type": "result", "status": "ok"},
+            {"type": "native_event", "event": "job_finished"},
         ],
         name="stale_worker",
     )
