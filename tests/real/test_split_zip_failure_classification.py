@@ -334,6 +334,9 @@ def test_watch_dual_faults_resume_after_each_blocker_is_resolved(
                     watcher.notify_password_source_changed("builtin_password_file")
 
             try:
+                # This fixture bypasses Watch startup; index the existing parts
+                # before submitting the single seed, as startup enumeration does.
+                watcher._scan_candidates([str(case.archive_dir)], recursive=False)
                 watcher.enqueue(str(case.entry_path))
                 assert await settle() == 0
                 remaining = {FailureKind.WRONG_PASSWORD, FailureKind.MISSING_VOLUME}

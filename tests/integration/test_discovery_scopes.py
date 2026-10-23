@@ -176,7 +176,8 @@ def test_complete_same_named_local_volume_sets_remain_independent(tmp_path, arch
         else:
             expected = expected[:1]
     config = make_config({})
-    tasks = ArchiveTaskProvider(config).scan_targets([str(root)],
+    provider = ArchiveTaskProvider(config)
+    tasks = provider.scan_targets([str(root)],
         scan_session=DiscoveryScanSession(config=config, scope=DiscoveryScope(str(root), recursive=True)))
     actual = {frozenset(task.all_parts) for task in tasks}
     assert all(frozenset(paths) in actual for paths in expected)
@@ -188,6 +189,16 @@ def test_complete_same_named_local_volume_sets_remain_independent(tmp_path, arch
         summary = asyncio.run(execute())
         assert summary.success_count == len(expected)
         assert bool(summary.failures) == (layout != "unique")
+        if layout == "missing":
+            # Force the ordering where another task has cleaned up its complete
+            # local set before the incomplete task retries from the old snapshot.
+            for path in expected[0]:
+                Path(path).unlink(missing_ok=True)
+            incomplete = next(task for task in tasks if Path(task.main_path).parent.name == "second")
+            assert provider.resolve_volume_once(
+                incomplete.all_parts, incomplete.runtime["discovery_scope"],
+                format_hint=archive_format, snapshot=incomplete.runtime["discovery_snapshot"],
+            ) is None
 
 
 

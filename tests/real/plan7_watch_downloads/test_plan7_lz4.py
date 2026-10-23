@@ -45,6 +45,9 @@ def test_watch_sibling_trigger_survives_encrypted_head_rename(tmp_path, monkeypa
 
         monkeypatch.setattr(ArchiveJobExecutor, "_execute_one_async", hold_old_head)
         try:
+            # The copies bypass arrival events. Index them without submitting
+            # the head so the sibling remains the sole trigger for this race.
+            harness.watcher._scan_candidates([str(harness.watch_root)], recursive=False)
             harness.watcher.enqueue(str(seed))
             await WatchScheduler.run_once(harness.watcher)
             await asyncio.wait_for(entered.wait(), 15)

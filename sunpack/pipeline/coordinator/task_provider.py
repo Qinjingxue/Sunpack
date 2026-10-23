@@ -173,6 +173,15 @@ class ArchiveTaskProvider:
         groups = self._relations.build_candidate_groups(snapshot)
         required = set(current_paths)
         for group in groups:
-            if required.issubset(set(group.input_paths)) and group.is_split_candidate:
+            metadata = group.head_metadata or {}
+            # Blocked groups also own unresolved paths; containment alone does
+            # not prove that their head and volumes form a usable replacement.
+            if (
+                group.is_split_candidate
+                and metadata.get("relation_confirmed")
+                and not metadata.get("relation_failure_reason")
+                and (not format_hint or metadata.get("format") == format_hint)
+                and required.issubset(set(group.input_paths))
+            ):
                 return group
         return None
