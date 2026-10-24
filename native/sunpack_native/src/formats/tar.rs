@@ -18,7 +18,7 @@ pub(crate) struct TarState {
     global: HashMap<String, String>,
     local: HashMap<String, String>,
     long_name: Option<String>,
-    long_link_size: Option<u64>,
+    long_link: Option<String>,
 }
 
 pub(crate) struct TarRecord {
@@ -33,6 +33,7 @@ pub(crate) struct TarMember {
     pub(crate) is_directory: bool,
     pub(crate) is_file: bool,
     pub(crate) size: u64,
+    pub(crate) hard_link: Option<String>,
 }
 
 fn invalid(message: &'static str) -> io::Error {
@@ -202,10 +203,11 @@ impl TarState {
                 }
                 self.long_name = Some(name);
             } else {
+                let link = text(&payload);
                 if let Some(observe) = observe {
-                    observe(TarMetadata::LongLink(&text(&payload)));
+                    observe(TarMetadata::LongLink(&link));
                 }
-                self.long_link_size = Some(text_bytes(&payload).len() as u64);
+                self.long_link = Some(link);
             }
             return Ok(TarRecord {
                 next,
@@ -240,7 +242,7 @@ impl TarState {
         let size = if kind == b'2' {
             effective("linkpath")
                 .map(|s| s.len() as u64)
-                .or(self.long_link_size)
+                .or_else(|| self.long_link.as_ref().map(|s| s.len() as u64))
                 .unwrap_or_else(|| text_bytes(&header[157..257]).len() as u64)
         } else if kind == b'S' {
             let size = number(&header[483..495])
@@ -252,9 +254,15 @@ impl TarState {
         } else {
             physical_size
         };
+        let hard_link = (kind == b'1').then(|| {
+            effective("linkpath")
+                .or(self.long_link.as_ref())
+                .cloned()
+                .unwrap_or_else(|| text(&header[157..257]))
+        });
         self.local.clear();
         self.long_name = None;
-        self.long_link_size = None;
+        self.long_link = None;
         Ok(TarRecord {
             next,
             payload_start: start,
@@ -264,6 +272,7 @@ impl TarState {
                 is_directory,
                 is_file,
                 size,
+                hard_link,
             }),
         })
     }

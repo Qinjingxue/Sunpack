@@ -687,7 +687,7 @@ namespace sunpack::sevenzip
 
                 dry_run_(dry_run),
 
-                output_trace_(output_trace)
+                output_trace_(output_trace ? output_trace : &owned_output_trace_)
 #ifdef SUP7Z_ENABLE_PIPELINE_TIMING
                 , pipeline_timing_(pipeline_timing)
 #endif
@@ -709,6 +709,19 @@ namespace sunpack::sevenzip
         {
             output_paths_.reserve(static_cast<std::size_t>(estimated_items) * 2U + 1U);
             created_directories_.reserve(static_cast<std::size_t>(estimated_items) + 1U);
+            // Query the handler's property schema once. ZIP/7z/stream hot paths
+            // need neither a per-file link query nor a link index.
+            UInt32 count = 0;
+            if (archive_ && archive_->GetNumberOfProperties(&count) == S_OK)
+                for (UInt32 i = 0; i < count; ++i)
+                {
+                    BSTR name = nullptr;
+                    PROPID property = 0;
+                    VARTYPE type = VT_EMPTY;
+                    const HRESULT hr = archive_->GetPropertyInfo(i, &name, &property, &type);
+                    SysFreeString(name);
+                    if (hr == S_OK && property == kpidHardLink) { supports_hard_links_ = true; break; }
+                }
         }
 
         ~ExtractToDiskCallback() { finalize_output(); }
@@ -775,6 +788,7 @@ namespace sunpack::sevenzip
             std::unordered_set<std::wstring>{}.swap(created_directories_);
             if (!async_writer_)
             {
+                finalize_hard_links();
                 return;
             }
 
@@ -843,7 +857,6 @@ namespace sunpack::sevenzip
                     }
                 }
             }
-            restore_directory_metadata();
             files_written_ = completed_files;
             bytes_written_ = total_written;
             if (output_trace_)
@@ -873,6 +886,8 @@ namespace sunpack::sevenzip
             {
                 operation_result_ = kOpDataError;
             }
+            finalize_hard_links();
+            restore_directory_metadata();
         }
 
 
@@ -998,6 +1013,16 @@ namespace sunpack::sevenzip
                 name = prop_text(value);
             }
             clear_prop(value);
+
+            std::wstring hard_link;
+            const bool is_hard_link = !is_dir && supports_hard_links_ && get_item_property(archive_, index, kpidHardLink, value);
+            if (is_hard_link)
+                hard_link = prop_text(value);
+            clear_prop(value);
+            // RAR5 exposes a zero CRC for its payload-less link record. It is
+            // not a checksum of the referenced file; finalization inherits the
+            // verified target receipt instead of comparing against that zero.
+            if (is_hard_link) has_source_crc32 = false;
 
             if (name.empty())
             {
@@ -1157,6 +1182,8 @@ namespace sunpack::sevenzip
             if (dry_run_)
             {
 
+                if (is_hard_link) return defer_hard_link(std::move(hard_link));
+
                 // Objects start at refcount 0, so the CMyComPtr constructor
                 // performs the first AddRef and Detach hands that single owned
                 // reference to 7-Zip, which will Release it.
@@ -1172,6 +1199,9 @@ namespace sunpack::sevenzip
                 output_error_ = true;
                 return E_FAIL;
             }
+            // Link entries contain no decoder payload. In particular RAR5 must
+            // receive a null stream, otherwise it tries to decode an empty body.
+            if (is_hard_link) return defer_hard_link(std::move(hard_link));
             const auto metadata = read_item_metadata(index, false);
             current_async_file_ = async_writer_->make_file(async_job_,
                                                            target.wstring(), name, index, current_trace_index_, metadata
@@ -1271,6 +1301,164 @@ namespace sunpack::sevenzip
         }
 
     private:
+        struct HardLink
+        {
+            std::size_t trace;
+            std::wstring target;
+            std::size_t source = static_cast<std::size_t>(-1);
+            unsigned char state = 0;
+        };
+
+        static std::wstring archive_path_key(const std::wstring &name)
+        {
+            // Archive identity is case sensitive; Windows output collisions
+            // have already been resolved by OutputPathAllocator.
+            return std::filesystem::path(name).lexically_normal().generic_wstring();
+        }
+
+        HRESULT defer_hard_link(std::wstring target)
+        {
+            if (!safe_relative_item_path(target))
+            {
+                output_error_ = true;
+                mark_current_item_failure(E_INVALIDARG, ERROR_INVALID_NAME);
+                return E_INVALIDARG;
+            }
+            hard_links_.push_back({current_trace_index_, archive_path_key(target)});
+            // Some SDK handlers skip SetOperationResult for a null stream.
+            // Only finalization may publish success for these entries.
+            output_trace_->items[current_trace_index_].done = false;
+            return S_OK;
+        }
+
+        void finalize_hard_links() noexcept
+        {
+            if (hard_links_.empty()) return;
+            auto &items = output_trace_->items;
+            const auto fail = [&](HardLink &link, DWORD error, bool output_failure)
+            {
+                auto &item = items[link.trace];
+                item.done = false;
+                item.failed = true;
+                item.crc_verified = false;
+                item.operation_result = kOpDataError;
+                // A missing/cyclic/unverified target is archive damage, not a
+                // failed filesystem operation. Preserve the decoder's error.
+                item.win32_error = output_failure ? error : 0;
+                item.hresult = output_failure ? static_cast<int>(HRESULT_FROM_WIN32(error)) : S_OK;
+                output_error_ = output_error_ || output_failure;
+                if (operation_result_ == kOpOk) operation_result_ = kOpDataError;
+                if (failed_item_.empty())
+                {
+                    failed_item_ = item.path;
+                    failed_item_index_ = item.index;
+                }
+                if (output_failure)
+                {
+                    output_trace_->last_win32_error = error;
+                    output_trace_->last_hresult = item.hresult;
+                }
+            };
+            try
+            {
+                // Allocate only for names actually referenced by hard links.
+                std::unordered_map<std::wstring, std::vector<std::size_t>> targets;
+                std::unordered_map<std::size_t, std::size_t> links;
+                for (std::size_t i = 0; i < hard_links_.size(); ++i)
+                {
+                    targets.try_emplace(hard_links_[i].target);
+                    links.emplace(hard_links_[i].trace, i);
+                    items[hard_links_[i].trace].done = false;
+                }
+                for (std::size_t i = 0; i < items.size(); ++i)
+                    if (!items[i].is_dir)
+                    {
+                        const auto found = targets.find(archive_path_key(items[i].path));
+                        if (found != targets.end()) found->second.push_back(i);
+                    }
+                for (auto &link : hard_links_)
+                {
+                    const auto &candidates = targets.at(link.target);
+                    const auto next = std::lower_bound(candidates.begin(), candidates.end(), link.trace);
+                    // Repeated archive names refer to their latest preceding
+                    // version; otherwise allow a forward reference.
+                    if (next != candidates.begin()) link.source = *std::prev(next);
+                    else if (next != candidates.end()) link.source = *next;
+                }
+                std::vector<std::size_t> chain;
+                for (std::size_t start = 0; start < hard_links_.size(); ++start)
+                {
+                    chain.clear();
+                    auto cursor = start;
+                    while (hard_links_[cursor].state == 0)
+                    {
+                        auto &link = hard_links_[cursor];
+                        link.state = 1;
+                        chain.push_back(cursor);
+                        const auto next = links.find(link.source);
+                        if (next == links.end()) break;
+                        cursor = next->second;
+                    }
+                    for (auto it = chain.rbegin(); it != chain.rend(); ++it)
+                    {
+                        auto &link = hard_links_[*it];
+                        auto &item = items[link.trace];
+                        DWORD error = ERROR_INVALID_DATA;
+                        bool output_failure = false;
+                        if (link.source < items.size())
+                        {
+                            const auto &source = items[link.source];
+                            if (!item.failed && source.done && !source.failed && source.crc_verified &&
+                                (!item.has_expected_size || item.expected_size == 0 || item.expected_size == source.bytes_written))
+                            {
+                                const auto path = (output_root_ / item.output_path).make_preferred();
+                                const auto target = (output_root_ / source.output_path).make_preferred();
+                                const auto result = dry_run_ ? AttemptResult{} : retry_with_space_gate(
+                                    volume_space_gate(), [&] { return space_terminal_predicate(); }, path.native(),
+                                    [&]() noexcept -> AttemptResult
+                                    {
+                                        if (is_cancelled()) return {AttemptResult::Kind::Terminal, 0};
+                                        if (CreateHardLinkW(path.c_str(), target.c_str(), nullptr)) return {};
+                                        const DWORD code = GetLastError();
+                                        return {is_space_exhaustion_error(code) ? AttemptResult::Kind::SpaceFailure : AttemptResult::Kind::PermanentFailure, code};
+                                    });
+                                if (result.kind == AttemptResult::Kind::Succeeded)
+                                {
+                                    item.bytes_written = source.bytes_written;
+                                    item.expected_size = source.bytes_written;
+                                    item.has_expected_size = true;
+                                    item.magic = source.magic;
+                                    item.has_mtime_ns = source.has_mtime_ns;
+                                    item.mtime_ns = source.mtime_ns;
+                                    item.has_output_crc32 = source.has_output_crc32;
+                                    item.output_crc32 = source.output_crc32;
+                                    item.crc_verified = true;
+                                    item.done = true;
+                                    item.operation_result = kOpOk;
+                                    ++files_written_;
+                                    bytes_written_ += item.bytes_written;
+                                    output_trace_->total_bytes_written += item.bytes_written;
+                                    error = 0;
+                                }
+                                else
+                                {
+                                    error = result.win32_error ? result.win32_error : ERROR_CANCELLED;
+                                    output_failure = true;
+                                }
+                            }
+                        }
+                        if (error) fail(link, error, output_failure);
+                        link.state = 2;
+                    }
+                }
+            }
+            catch (...)
+            {
+                for (auto &link : hard_links_) if (link.state != 2) fail(link, ERROR_NOT_ENOUGH_MEMORY, true);
+            }
+            std::vector<HardLink>{}.swap(hard_links_);
+        }
+
         ArchiveItemMetadata read_item_metadata(UInt32 index, bool is_dir) const
         {
             ArchiveItemMetadata metadata;
@@ -1299,7 +1487,7 @@ namespace sunpack::sevenzip
             }
             clear_prop(value);
             // Match 7z's small POSIX -> Windows attribute mapping, without
-            // implementing Unix permissions, owners, or link extraction.
+            // implementing Unix permissions or owners.
             if (!(metadata.defined & ArchiveItemMetadata::Attributes) &&
                 get_item_property(archive_, index, kpidPosixAttrib, value) && value.vt == VT_UI4)
             {
@@ -1669,7 +1857,10 @@ namespace sunpack::sevenzip
 
         bool dry_run_ = false;
 
+        ExtractOutputTrace owned_output_trace_;
         ExtractOutputTrace *output_trace_ = nullptr;
+        std::vector<HardLink> hard_links_;
+        bool supports_hard_links_ = false;
 
 #ifdef SUP7Z_ENABLE_PIPELINE_TIMING
         PipelineTiming *pipeline_timing_ = nullptr;

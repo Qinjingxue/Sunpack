@@ -3,10 +3,13 @@ use crate::formats::zip::zip64;
 use crate::io::resource_lifecycle::TrackedFile;
 use crate::password::zip::{zip_password_bytes, ZipCryptoDecryptor};
 use crate::verification::archive_manifest::{ManifestEntry, NativeArchiveManifest};
-use crate::verification::paths::OutputPathAllocator;
+use crate::verification::paths::{
+    clean_relative_archive_path, unsafe_archive_path, OutputPathAllocator,
+};
 use encoding_rs::{BIG5, GBK, SHIFT_JIS, UTF_8};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
+use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::sync::Arc;
@@ -181,6 +184,7 @@ fn tar_manifest_from_reader(
     let mut state = TarState::default();
     let mut error = None::<String>;
     let mut checksum_error = false;
+    let mut hard_links = Vec::new();
 
     while offset.saturating_add(BLOCK) <= reader.total {
         let mut header = [0u8; 512];
@@ -215,6 +219,7 @@ fn tar_manifest_from_reader(
             }
         };
         item_count += 1;
+        let member_offset = offset;
         offset = record.next;
         if let Some(member) = record.member {
             // Once retention is full, only aggregate; no later entry uses names.
@@ -224,7 +229,15 @@ fn tar_manifest_from_reader(
                 .map(|path| output_paths.project(path, member.is_directory));
             if member.is_file {
                 file_count += 1;
-                total_unpacked_size = total_unpacked_size.saturating_add(member.size);
+                if let Some(target) = member.hard_link {
+                    hard_links.push(TarHardLink {
+                        offset: member_offset,
+                        target,
+                        entry: projected.as_ref().map(|_| entries.len()),
+                    });
+                } else {
+                    total_unpacked_size = total_unpacked_size.saturating_add(member.size);
+                }
                 if let (Some(path), Some(projected)) = (member.path, projected) {
                     let raw_path = (projected != path).then_some(path);
                     entries.push(ManifestEntry {
@@ -244,6 +257,20 @@ fn tar_manifest_from_reader(
         && reader.has_nonzero_at(offset)?
     {
         error = Some("TAR ends with a partial header or non-zero trailing data".to_string());
+    }
+    if error.is_none() && !hard_links.is_empty() {
+        match tar_hard_link_sizes(reader, offset, &hard_links, &mut entries) {
+            Ok(size) => total_unpacked_size = total_unpacked_size.saturating_add(size),
+            Err(fault) => {
+                if !matches!(
+                    fault.kind(),
+                    std::io::ErrorKind::InvalidData | std::io::ErrorKind::UnexpectedEof
+                ) {
+                    return Err(fault.into());
+                }
+                error = Some(fault.to_string());
+            }
+        }
     }
     let damaged = error.is_some();
     let status = if damaged { 2 } else { 0 };
@@ -270,6 +297,108 @@ fn tar_manifest_from_reader(
         failure_kind: if damaged { "corrupted_data" } else { "" }.to_string(),
         entries: Arc::new(entries),
     })
+}
+
+struct TarHardLink {
+    offset: u64,
+    target: String,
+    entry: Option<usize>,
+}
+
+/// A second header-only walk is needed only for archives containing hard links.
+/// Retain targets requested by links, never an unbounded index of ordinary names
+/// after max_items. Reuse TarState for PAX/GNU names and physical boundaries.
+fn tar_hard_link_sizes(
+    reader: &mut SegmentReader,
+    end: u64,
+    links: &[TarHardLink],
+    entries: &mut [ManifestEntry],
+) -> std::io::Result<u64> {
+    let invalid = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid TAR hard-link target or cycle",
+        )
+    };
+    // (header offset, logical size, hard-link index)
+    type Target = (u64, u64, Option<usize>);
+    let mut targets = HashMap::<String, Vec<Target>>::new();
+    let mut link_offsets = HashMap::new();
+    for (index, link) in links.iter().enumerate() {
+        if unsafe_archive_path(&link.target) || link.target.is_empty() {
+            return Err(invalid());
+        }
+        targets
+            .entry(clean_relative_archive_path(&link.target).into_owned())
+            .or_default();
+        link_offsets.insert(link.offset, index);
+    }
+    let mut state = TarState::default();
+    let mut offset = 0;
+    while offset + 512 <= end {
+        let mut header = [0u8; 512];
+        reader.read_exact_at(offset, &mut header)?;
+        if header.iter().all(|b| *b == 0) {
+            offset += 512;
+            continue;
+        }
+        let total = reader.total;
+        let record = state.advance(&header, offset, total, true, &mut |start, size| {
+            reader.read_vec_at(start, size)
+        })?;
+        if let Some(member) = record.member.filter(|m| m.is_file) {
+            if let Some(path) = member.path {
+                if let Some(candidates) =
+                    targets.get_mut(clean_relative_archive_path(&path).as_ref())
+                {
+                    candidates.push((offset, member.size, link_offsets.get(&offset).copied()));
+                }
+            }
+        }
+        offset = record.next;
+    }
+    let sources: Vec<_> = links
+        .iter()
+        .map(|link| {
+            let candidates = &targets[clean_relative_archive_path(&link.target).as_ref()];
+            let next = candidates.partition_point(|candidate| candidate.0 < link.offset);
+            candidates
+                .get(if next > 0 { next - 1 } else { 0 })
+                .copied()
+                .ok_or_else(invalid)
+        })
+        .collect::<Result<_, _>>()?;
+    let mut sizes = vec![None; links.len()];
+    let mut visiting = vec![false; links.len()];
+    let mut chain = Vec::new();
+    let mut total = 0u64;
+    for start in 0..links.len() {
+        chain.clear();
+        let mut cursor = start;
+        let size = loop {
+            if let Some(size) = sizes[cursor] {
+                break size;
+            }
+            if visiting[cursor] {
+                return Err(invalid());
+            }
+            visiting[cursor] = true;
+            chain.push(cursor);
+            if let Some(next) = sources[cursor].2 {
+                cursor = next;
+            } else {
+                break sources[cursor].1;
+            }
+        };
+        for index in chain.drain(..) {
+            sizes[index] = Some(size);
+        }
+        total = total.saturating_add(size);
+        if let Some(entry) = links[start].entry {
+            entries[entry].size = size;
+        }
+    }
+    Ok(total)
 }
 
 pub(crate) fn build_segments(source: &Bound<'_, PyDict>) -> PyResult<Vec<Segment>> {

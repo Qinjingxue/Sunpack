@@ -50,6 +50,150 @@ def _require_7z_or_skip():
     return seven_zip
 
 
+@pytest.mark.parametrize("tar_format", [tarfile.GNU_FORMAT, tarfile.PAX_FORMAT])
+def test_worker_resolves_hard_link_graph_and_rejects_invalid_targets(tmp_path, tar_format):
+    # Other extraction tests only exercise payload-bearing members. This one
+    # catches empty successful links, forward chains, collision misbinding and
+    # invalid references, including beyond a source-manifest retention cap.
+    from sunpack_native import archive_state_tar_manifest_native
+
+    worker = _require_worker_or_skip()
+    archive = tmp_path / "links.blob"
+    long_name = "nested/" + "目标" * 65 + "/target.txt"
+    members = [("bad:name", b"first"), ("bad_name", b"collision"),
+               ("old", "dup"), ("dup", b"before"), ("prior", "dup"),
+               ("dup", b"after"), ("latest", "dup"),
+               ("chain", "forward"), ("forward", long_name),
+               (long_name, b"forward payload"), ("empty", b""), ("empty-link", "empty"),
+               ("collision-link", "bad:name")]
+    with tarfile.open(archive, "w", format=tar_format) as handle:
+        for name, value in members:
+            item = tarfile.TarInfo(name)
+            if isinstance(value, str):
+                item.type, item.linkname = tarfile.LNKTYPE, value
+                handle.addfile(item)
+            else:
+                item.size = len(value)
+                handle.addfile(item, io.BytesIO(value))
+    # Exercise the same link model on carrier and cross-part byte views.
+    data = archive.read_bytes()
+    source = {"entry_path": str(archive), "format_hint": "tar"}
+    if tar_format == tarfile.GNU_FORMAT:
+        prefix = b"carrier prefix"
+        archive.write_bytes(prefix + data + b"carrier suffix")
+        source.update(open_mode="file_range", parts=[{
+            "path": str(archive), "start": len(prefix), "end": len(prefix) + len(data)}])
+    else:
+        second = tmp_path / "second.blob"
+        archive.write_bytes(data[:4099])
+        second.write_bytes(data[4099:])
+        source.update(open_mode="concat_ranges", ranges=[
+            {"path": str(archive), "start": 0}, {"path": str(second), "start": 0}])
+    output = tmp_path / "out"
+    result = _invoke_worker(worker, {"job_id": "links", "archive_path": str(archive), "archive_input": source,
+                                    "output_dir": str(output), "format_hint": "tar"})
+    final = _worker_result(result.stdout)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert final["status"] == "ok" and final["verified_manifest"]["validated"]
+    pairs = [("old", "dup"), ("prior", "dup"), ("latest", "dup(1)"),
+             ("chain", long_name), ("forward", long_name),
+             ("empty-link", "empty"), ("collision-link", "bad_name")]
+    for alias, target in pairs:
+        assert (output / alias).read_bytes() == (output / target).read_bytes()
+        assert os.path.samefile(output / alias, output / target)
+    manifest = archive_state_tar_manifest_native(source)
+    expected = sum(path.stat().st_size for path in output.rglob("*") if path.is_file())
+    assert manifest.archive_walk_complete and manifest.total_unpacked_size == expected
+    assert manifest.file_count == len(members)
+    sizes = {row["path"]: row["size"] for row in manifest.entry_page(0, 100)}
+    assert all((output / name).stat().st_size == size for name, size in sizes.items())
+    capped = archive_state_tar_manifest_native(source, max_items=2)
+    assert len(capped) == 2 and capped.total_unpacked_size == expected
+
+    for index, bad in enumerate([[("missing", "absent")], [("empty-target", "")], [("self", "self")],
+                                 [("a", "b"), ("b", "a")], [("escape", "../outside")]]):
+        broken = tmp_path / f"broken-{index}.tar"
+        with tarfile.open(broken, "w") as handle:
+            for name, target in bad:
+                item = tarfile.TarInfo(name)
+                item.type, item.linkname = tarfile.LNKTYPE, target
+                handle.addfile(item)
+        result = _invoke_worker(worker, {"job_id": "bad-link", "archive_path": str(broken),
+                                        "output_dir": str(tmp_path / f"bad-{index}"), "format_hint": "tar"})
+        final = _worker_result(result.stdout)
+        assert result.returncode != 0 and not final["verified_manifest"]["validated"]
+        assert not archive_state_tar_manifest_native({"entry_path": str(broken)}, max_items=0).archive_walk_complete
+
+
+@pytest.mark.parametrize("origin", ["foreground", "watch"])
+@pytest.mark.parametrize("layout", ["tar", "tar.gz", "rar5", "rar5-encrypted", "rar5-split", "rar5-corrupted"])
+def test_hard_links_survive_pipeline_verification(tmp_path, origin, layout):
+    # The worker graph test cannot catch TAR source-size disagreement, nested
+    # scheduling, password selection, volume planning or cleanup after success.
+    from sunpack.pipeline.coordinator.engine import PipelineEngine
+    from tests.helpers.config_factory import make_config
+
+    _require_worker_or_skip()
+    payload = b"hard-link content\n" * 1024
+    archive = tmp_path / "archive.blob"
+    if layout.startswith("tar"):
+        stream = io.BytesIO()
+        with tarfile.open(fileobj=stream, mode="w") as handle:
+            item = tarfile.TarInfo("target.txt")
+            item.size = len(payload)
+            handle.addfile(item, io.BytesIO(payload))
+            item = tarfile.TarInfo("alias.txt")
+            item.type, item.linkname = tarfile.LNKTYPE, "target.txt"
+            handle.addfile(item)
+        archive.write_bytes(gzip.compress(stream.getvalue()) if layout.endswith("gz") else stream.getvalue())
+    else:
+        rar = get_test_tools()["rar_exe"]
+        if not rar or not rar.is_file():
+            pytest.skip("Rar.exe is required to build real hard-link fixtures")
+        source = tmp_path / "source"
+        source.mkdir()
+        (source / "target.txt").write_bytes(payload)
+        os.link(source / "target.txt", source / "alias.txt")
+        archive = tmp_path / "archive.rar"
+        switches = ["-paudit-secret"] if layout.endswith("encrypted") else []
+        if layout.endswith("split"):
+            switches += ["-v5k"]
+        subprocess.run([str(rar), "a", "-ma5", "-oh", "-m0", "-s-", "-ds", "-idq", "-ep1",
+                        *switches, str(archive), "target.txt", "alias.txt"], cwd=source, check=True, capture_output=True)
+        if layout.endswith("corrupted"):
+            # A link may inherit only a successfully verified target, even if
+            # the decoder accepted the payload and its later CRC check fails.
+            data = bytearray(archive.read_bytes())
+            offset = data.index(payload)
+            data[offset] ^= 1
+            archive.write_bytes(data)
+        if switches == ["-v5k"]:
+            archive = tmp_path / "archive.part1.rar"
+        elif not switches:
+            disguised = tmp_path / "archive.blob"
+            archive.rename(disguised)
+            archive = disguised
+    config = make_config({"cli": {"quiet": True}, "recursive_extract": 3,
+                          "user_passwords": ["audit-secret"],
+                          "post_extract": {"archive_cleanup_mode": "k", "flatten_single_directory": False}})
+
+    async def run():
+        async with PipelineEngine(config) as engine:
+            return (await engine.run([str(archive)], direct=True, origin=origin)).summary
+
+    summary = asyncio.run(run())
+    if layout.endswith("corrupted"):
+        assert summary.success_count == 0 and summary.failed_count == 1
+        assert summary.target_results[0].verification["content_integrity"] != "verified_complete"
+        assert archive.exists()
+        return
+    assert summary.success_count >= 1 and summary.failed_count == 0
+    aliases = [path for path in tmp_path.rglob("alias.txt") if path.parent.name != "source"]
+    assert len(aliases) == 1
+    alias = aliases[0]
+    assert alias.read_bytes() == payload and os.path.samefile(alias, alias.with_name("target.txt"))
+
+
 def _file_times_ns(path, values=None):
     """Read/set all three Windows timestamps without opening the file's data."""
     kernel = ctypes.WinDLL("kernel32", use_last_error=True)

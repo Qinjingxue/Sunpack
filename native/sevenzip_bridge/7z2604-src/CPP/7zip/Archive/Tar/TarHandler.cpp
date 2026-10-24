@@ -625,8 +625,9 @@ Z7_COM7F_IMF(CHandler::GetProperty(UInt32 index, PROPID propID, PROPVARIANT *val
       break;
     case kpidHardLink:
       if (item->Is_HardLink())
-        if (!item->LinkName.IsEmpty())
-          TarStringToUnicode(item->LinkName, prop);
+        // Preserve the entry kind even for a malformed empty target, so the
+        // shared extraction callback can reject it instead of writing a file.
+        TarStringToUnicode(item->LinkName, prop);
       break;
 
     case kpidCharacts:
