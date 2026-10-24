@@ -20,6 +20,7 @@ class CliContext:
     stdout: TextIO = field(default_factory=lambda: sys.stdout)
     stderr: TextIO = field(default_factory=lambda: sys.stderr)
     input_reader: Callable[[str], Any] | None = None
+    work_broker: Any = None
     i18n: I18nContext = field(init=False)
 
     def __post_init__(self) -> None:

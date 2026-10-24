@@ -1,3 +1,5 @@
+use std::io::{self, Seek, SeekFrom};
+
 const TAR_FIELDS: &[&str] = &[
     "member.header.name",
     "member.header.mode",
@@ -24,41 +26,6 @@ const TAR_FIELDS: &[&str] = &[
     "archive.trailing_data",
 ];
 
-fn parse_pax_records(payload: &[u8]) -> Result<Vec<(String, String, usize)>, &'static str> {
-    let mut records = Vec::new();
-    let mut cursor = 0usize;
-    while cursor < payload.len() {
-        let Some(space_rel) = payload[cursor..].iter().position(|byte| *byte == b' ') else {
-            return Err("pax_record_length_missing");
-        };
-        let space = cursor + space_rel;
-        let length_text = std::str::from_utf8(&payload[cursor..space])
-            .map_err(|_| "pax_record_length_not_ascii")?;
-        if length_text.is_empty() || !length_text.bytes().all(|byte| byte.is_ascii_digit()) {
-            return Err("pax_record_length_invalid");
-        }
-        let length = length_text.parse::<usize>().map_err(|_| "pax_record_length_overflow")?;
-        if length == 0 || cursor.checked_add(length).map_or(true, |end| end > payload.len()) {
-            return Err("pax_record_out_of_range");
-        }
-        let end = cursor + length;
-        if payload[end - 1] != b'\n' || space + 1 >= end - 1 {
-            return Err("pax_record_terminator_invalid");
-        }
-        let record = std::str::from_utf8(&payload[space + 1..end - 1])
-            .map_err(|_| "pax_record_not_utf8")?;
-        let Some((key, value)) = record.split_once('=') else {
-            return Err("pax_record_assignment_missing");
-        };
-        if key.is_empty() {
-            return Err("pax_record_keyword_empty");
-        }
-        records.push((key.to_string(), value.to_string(), length));
-        cursor = end;
-    }
-    Ok(records)
-}
-
 fn validate_sparse_map(value: &str) -> bool {
     let fields = value.split(',').collect::<Vec<_>>();
     if fields.is_empty() || fields.len() % 2 != 0 {
@@ -66,35 +33,19 @@ fn validate_sparse_map(value: &str) -> bool {
     }
     let mut previous_end = 0u64;
     for pair in fields.chunks_exact(2) {
-        let Ok(offset) = pair[0].parse::<u64>() else { return false; };
-        let Ok(length) = pair[1].parse::<u64>() else { return false; };
-        let Some(end) = offset.checked_add(length) else { return false; };
+        let Ok(offset) = pair[0].parse::<u64>() else {
+            return false;
+        };
+        let Ok(length) = pair[1].parse::<u64>() else {
+            return false;
+        };
+        let Some(end) = offset.checked_add(length) else {
+            return false;
+        };
         if offset < previous_end {
             return false;
         }
         previous_end = end;
-    }
-    true
-}
-
-fn validate_oldgnu_sparse_block(
-    block: &[u8],
-    start: usize,
-    count: usize,
-    previous_end: &mut u64,
-) -> bool {
-    for index in 0..count {
-        let base = start + index * 24;
-        let Some(offset) = parse_octal(&block[base..base + 12]) else { return false; };
-        let Some(length) = parse_octal(&block[base + 12..base + 24]) else { return false; };
-        if offset == 0 && length == 0 {
-            continue;
-        }
-        let Some(end) = offset.checked_add(length) else { return false; };
-        if offset < *previous_end {
-            return false;
-        }
-        *previous_end = end;
     }
     true
 }
@@ -121,6 +72,8 @@ fn enrich_tar_semantics(
     let mut sparse = Vec::new();
     let mut semantic_flags = Vec::new();
     let limit = max_entries.max(1);
+    let mut state = crate::formats::tar::TarState::default();
+    let mut walk_error = "";
     while entries < limit && offset + TAR_BLOCK_SIZE as u64 <= archive_end {
         let mut header = [0u8; TAR_BLOCK_SIZE];
         if let Err(fault) = seek_field(
@@ -151,57 +104,61 @@ fn enrich_tar_semantics(
             continue;
         }
         zeros = 0;
-        let size = parse_octal(&header[124..136]).unwrap_or(0);
-        let padding = padding_for_size(size);
         let typeflag = header[156];
-        let mut sparse_extension_span = 0u64;
-        if typeflag == b'S' {
-            let mut previous_end = 0u64;
-            let mut extended = header[482] != 0 && header[482] != b'0';
-            let mut sparse_invalid = false;
-            if !validate_oldgnu_sparse_block(&header, 386, 4, &mut previous_end) {
-                semantic_flags.push("sparse_header_bad");
+        let record = state.advance_observed(
+            &header,
+            offset,
+            archive_end,
+            false,
+            &mut |start, length| {
+                file.seek(SeekFrom::Start(start))?;
+                let mut data = vec![0; length];
+                file.read_exact(&mut data)?;
+                Ok(data)
+            },
+            Some(&mut |metadata| {
+                use crate::formats::tar::TarMetadata;
+                match metadata {
+                    TarMetadata::Pax(key, value, length) => {
+                        pax_lengths.push(length as u64);
+                        pax_records.push(format!("{}:{}={}", typeflag as char, key, value));
+                        if key.starts_with("GNU.sparse.") {
+                            if key == "GNU.sparse.map" && !validate_sparse_map(value) {
+                                semantic_flags.push("sparse_header_bad");
+                            }
+                            sparse.push(format!("{key}={value}"));
+                        }
+                    }
+                    TarMetadata::LongName(value) => gnu_longname = Some(value.to_string()),
+                    TarMetadata::LongLink(value) => gnu_longlink = Some(value.to_string()),
+                }
+            }),
+        );
+        let record = match record {
+            Ok(record) => record,
+            Err(error) => {
+                walk_error = if error.kind() == io::ErrorKind::UnexpectedEof {
+                    "member_payload_out_of_range"
+                } else {
+                    "tar_metadata_invalid"
+                };
+                let flag = match typeflag {
+                    b'x' | b'g' => {
+                        pax_records.push(format!("invalid:{error}"));
+                        "pax_header_bad"
+                    }
+                    b'S' => "sparse_header_bad",
+                    b'L' | b'K' => "gnu_longname_bad",
+                    _ => "tar_metadata_bad",
+                };
+                semantic_flags.push(flag);
                 break;
             }
-            while extended {
-                let extension_offset = offset + TAR_BLOCK_SIZE as u64 + sparse_extension_span;
-                let mut extension = [0u8; TAR_BLOCK_SIZE];
-                if let Err(fault) = seek_field(
-                    file,
-                    extension_offset,
-                    archive_end,
-                    "tar.gnu_sparse.extension",
-                    FieldLocation::Body,
-                ).and_then(|_| read_exact_field(
-                    file,
-                    &mut extension,
-                    archive_end,
-                    "tar.gnu_sparse.extension",
-                    FieldLocation::Body,
-                )) {
-                    set_read_fault(d, &fault, "invalid_oldgnu_sparse_extension")?;
-                    semantic_flags.push("sparse_header_bad");
-                    sparse_invalid = true;
-                    break;
-                }
-                if !validate_oldgnu_sparse_block(&extension, 0, 21, &mut previous_end) {
-                    semantic_flags.push("sparse_header_bad");
-                    sparse_invalid = true;
-                    break;
-                }
-                sparse_extension_span += TAR_BLOCK_SIZE as u64;
-                extended = extension[504] != 0 && extension[504] != b'0';
-            }
-            if parse_octal(&header[483..495]).is_some_and(|real_size| previous_end > real_size) {
-                semantic_flags.push("sparse_header_bad");
-                sparse_invalid = true;
-            }
-            if sparse_invalid {
-                break;
-            }
-        }
-        let payload_start = offset + TAR_BLOCK_SIZE as u64 + sparse_extension_span;
-        let next = payload_start.saturating_add(size).saturating_add(padding);
+        };
+        let size = record.physical_size;
+        let padding = padding_for_size(size);
+        let payload_start = record.payload_start;
+        let next = record.next;
         if entries == 0 {
             let stored = parse_octal(&header[148..156]).unwrap_or(0);
             d.set_item("member.header.name", tar_text(&header[0..100]))?;
@@ -252,57 +209,18 @@ fn enrich_tar_semantics(
             d.set_item("member.padding", padding)?;
             d.set_item("member.next_header", next <= archive_end)?;
         }
-        if next > archive_end {
-            break;
-        }
-        if matches!(typeflag, b'x' | b'g' | b'L' | b'K' | b'S') && size <= 4 * 1024 * 1024 {
-            let mut payload = vec![0u8; size as usize];
-            if let Err(fault) = seek_field(
-                file,
-                payload_start,
-                archive_end,
-                "tar.member.payload",
-                FieldLocation::Body,
-            )
-            .and_then(|_| {
-                read_exact_field(
-                    file,
-                    &mut payload,
-                    archive_end,
-                    "tar.member.payload",
-                    FieldLocation::Body,
-                )
-            }) {
-                set_read_fault(d, &fault, "member_payload_read_failed")?;
-                return Ok(());
-            }
-            if matches!(typeflag, b'x' | b'g') {
-                match parse_pax_records(&payload) {
-                    Ok(records) => for (key, value, length) in records {
-                        pax_lengths.push(length as u64);
-                        pax_records.push(format!("{}:{}={}", typeflag as char, key, value));
-                        if key.starts_with("GNU.sparse.") {
-                            if key == "GNU.sparse.map" && !validate_sparse_map(&value) {
-                                semantic_flags.push("sparse_header_bad");
-                            }
-                            sparse.push(format!("{key}={value}"));
-                        }
-                    },
-                    Err(error) => {
-                        pax_records.push(format!("invalid:{error}"));
-                        semantic_flags.push("pax_header_bad");
-                    }
-                }
-            } else if typeflag == b'L' {
-                gnu_longname = Some(tar_text(&payload));
-            } else if typeflag == b'K' {
-                gnu_longlink = Some(tar_text(&payload));
-            } else if typeflag == b'S' {
-                sparse.push(format!("gnu_sparse_header_at={offset}"));
-            }
+        if typeflag == b'S' {
+            sparse.push(format!("gnu_sparse_header_at={offset}"));
         }
         entries += 1;
         offset = next;
+    }
+    d.set_item("entries_checked", entries)?;
+    d.set_item("entry_walk_ok", entries > 0 && walk_error.is_empty())?;
+    d.set_item("end_zero_blocks", zeros >= 2)?;
+    if !walk_error.is_empty() {
+        d.set_item("error", walk_error)?;
+        d.set_item("plausible", false)?;
     }
     d.set_item(
         "pax.header.length",
@@ -370,10 +288,13 @@ fn enrich_tar_semantics(
         },
     )?;
     d.set_item("archive.end_zero_blocks", zeros)?;
-    let walk_budget_exhausted = entries >= limit
-        && zeros < 2
-        && offset + TAR_BLOCK_SIZE as u64 <= archive_end;
-    let zero_fill = if walk_budget_exhausted { 0 } else { archive_end.saturating_sub(offset) };
+    let walk_budget_exhausted =
+        entries >= limit && zeros < 2 && offset + TAR_BLOCK_SIZE as u64 <= archive_end;
+    let zero_fill = if walk_budget_exhausted {
+        0
+    } else {
+        archive_end.saturating_sub(offset)
+    };
     let mut remaining = zero_fill;
     let mut scan_offset = offset;
     let mut nonzero_tail = false;
@@ -417,15 +338,23 @@ fn enrich_tar_semantics(
         if let Some(candidate_offset) = concatenated_offset {
             if candidate_offset + TAR_BLOCK_SIZE as u64 <= archive_end {
                 let mut candidate = [0u8; TAR_BLOCK_SIZE];
-                seek_field(file, candidate_offset, archive_end, "tar.concatenated.header", FieldLocation::Tail)
-                    .and_then(|_| read_exact_field(
+                seek_field(
+                    file,
+                    candidate_offset,
+                    archive_end,
+                    "tar.concatenated.header",
+                    FieldLocation::Tail,
+                )
+                .and_then(|_| {
+                    read_exact_field(
                         file,
                         &mut candidate,
                         archive_end,
                         "tar.concatenated.header",
                         FieldLocation::Tail,
-                    ))
-                    .is_ok()
+                    )
+                })
+                .is_ok()
                     && tar_header_plausible(&candidate).0
             } else {
                 false
@@ -436,11 +365,19 @@ fn enrich_tar_semantics(
     } else {
         false
     };
-    let trailing = if nonzero_tail && !concatenated_archive { zero_fill } else { 0 };
+    let trailing = if nonzero_tail && !concatenated_archive {
+        zero_fill
+    } else {
+        0
+    };
     d.set_item("archive.concatenated", concatenated_archive)?;
     d.set_item(
         "archive.concatenated_offset",
-        if concatenated_archive { concatenated_offset } else { None },
+        if concatenated_archive {
+            concatenated_offset
+        } else {
+            None
+        },
     )?;
     d.set_item(
         "archive.zero_fill_after_end",
@@ -487,97 +424,6 @@ fn tar_empty<'py>(py: Python<'py>, error: &str) -> PyResult<Bound<'py, PyDict>> 
         d.set_item(key, false)?;
     }
     Ok(d)
-}
-
-fn walk_tar(
-    file: &mut SourceCursor,
-    archive_start: u64,
-    archive_end: u64,
-    max_entries: usize,
-) -> Result<(usize, bool, bool, &'static str), ReadFault> {
-    if max_entries == 0 {
-        return Ok((0, false, false, ""));
-    }
-    let mut offset = archive_start;
-    let mut zero_blocks = 0usize;
-    let mut checked = 0usize;
-    while checked < max_entries && offset + TAR_BLOCK_SIZE as u64 <= archive_end {
-        let mut header = vec![0; TAR_BLOCK_SIZE];
-        seek_field(
-            file,
-            offset,
-            archive_end,
-            "tar.member.header",
-            FieldLocation::Body,
-        )?;
-        read_exact_field(
-            file,
-            &mut header,
-            archive_end,
-            "tar.member.header",
-            FieldLocation::Body,
-        )?;
-        if header.iter().all(|b| *b == 0) {
-            zero_blocks += 1;
-            offset += TAR_BLOCK_SIZE as u64;
-            if zero_blocks >= 2 {
-                return Ok((checked, checked > 0, true, ""));
-            }
-            continue;
-        }
-        zero_blocks = 0;
-        let (ok, error, member_size, _) = tar_header_plausible(&header);
-        if !ok {
-            return Ok((checked, false, false, error));
-        }
-        let mut sparse_extension_span = 0u64;
-        if header[156] == b'S' {
-            let mut previous_end = 0u64;
-            let mut extended = header[482] != 0 && header[482] != b'0';
-            if !validate_oldgnu_sparse_block(&header, 386, 4, &mut previous_end) {
-                return Ok((checked, false, false, "invalid_oldgnu_sparse_map"));
-            }
-            while extended {
-                let extension_offset = offset + TAR_BLOCK_SIZE as u64 + sparse_extension_span;
-                let mut extension = [0u8; TAR_BLOCK_SIZE];
-                seek_field(
-                    file,
-                    extension_offset,
-                    archive_end,
-                    "tar.gnu_sparse.extension",
-                    FieldLocation::Body,
-                )?;
-                read_exact_field(
-                    file,
-                    &mut extension,
-                    archive_end,
-                    "tar.gnu_sparse.extension",
-                    FieldLocation::Body,
-                )?;
-                if !validate_oldgnu_sparse_block(&extension, 0, 21, &mut previous_end) {
-                    return Ok((checked, false, false, "invalid_oldgnu_sparse_extension"));
-                }
-                sparse_extension_span += TAR_BLOCK_SIZE as u64;
-                extended = extension[504] != 0 && extension[504] != b'0';
-            }
-            if parse_octal(&header[483..495]).is_some_and(|real_size| previous_end > real_size) {
-                return Ok((checked, false, false, "oldgnu_sparse_extent_out_of_range"));
-            }
-        }
-        // Base-256 size fields can encode values near u64::MAX; saturate so a
-        // crafted size lands out of range instead of wrapping back into the file.
-        let next_offset = offset
-            .saturating_add(TAR_BLOCK_SIZE as u64)
-            .saturating_add(sparse_extension_span)
-            .saturating_add(member_size)
-            .saturating_add(padding_for_size(member_size));
-        if next_offset > archive_end {
-            return Ok((checked, false, false, "member_payload_out_of_range"));
-        }
-        checked += 1;
-        offset = next_offset;
-    }
-    Ok((checked, checked > 0, false, ""))
 }
 
 fn tar_header_plausible(header: &[u8]) -> (bool, &'static str, u64, bool) {
@@ -632,10 +478,16 @@ mod tar_walk_tests {
         let reader = ManagedReader::from_bytes(data, ReaderConfig::default());
         let mut cursor = reader.cursor();
 
-        let (checked, walk_ok, _, error) = walk_tar(&mut cursor, 0, archive_end, 8).unwrap();
-
-        assert_eq!(checked, 0);
-        assert!(!walk_ok);
-        assert_eq!(error, "member_payload_out_of_range");
+        let header = header_with_base256_size(u64::MAX - 511);
+        let error = crate::formats::tar::TarState::default()
+            .advance(&header, 0, archive_end, false, &mut |start, size| {
+                cursor.seek(SeekFrom::Start(start))?;
+                let mut data = vec![0; size];
+                cursor.read_exact(&mut data)?;
+                Ok(data)
+            })
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
     }
 }

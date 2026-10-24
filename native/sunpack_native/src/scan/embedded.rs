@@ -3,9 +3,9 @@ use crate::io::iocp;
 use crate::io::reader::{CachedBytes, ManagedReader};
 use crate::io::ScanBatch;
 use crate::scan::compression_stream::{
-    bzip2_header_block_limit, gzip_fixed_header_flags, parse_xz_footer, resolve_xz_stream_start,
-    validate_bzip2_structure_observed, validate_gzip_structure_observed, validate_xz_header,
-    validate_zstd_structure_observed, ValidationError, ValidationResult,
+    bzip2_header_block_limit, bzip2_prefix_valid, gzip_fixed_header_flags, parse_xz_footer,
+    resolve_xz_stream_start, validate_bzip2_structure_observed, validate_gzip_structure_observed,
+    validate_xz_header, validate_zstd_structure_observed, ValidationError, ValidationResult,
 };
 use aho_corasick::{packed, AhoCorasick};
 use crc32fast::hash as crc32;
@@ -125,11 +125,24 @@ struct EmbeddedCandidate {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RawHit {
-    offset: u64,
+    // Byte alignment keeps all formats' retained hits at 9 bytes instead of
+    // 16, without narrowing file offsets or requiring unaligned references.
+    location: [u8; 8],
     pattern: u8,
 }
 
 impl RawHit {
+    fn new(offset: u64, pattern: u8) -> Self {
+        Self {
+            location: offset.to_ne_bytes(),
+            pattern,
+        }
+    }
+
+    fn offset(&self) -> u64 {
+        u64::from_ne_bytes(self.location)
+    }
+
     fn hit_name(&self) -> &'static str {
         PATTERNS
             .get(self.pattern as usize)
@@ -217,9 +230,9 @@ impl NativeScanResult {
             row.set_item(
                 "offset",
                 if hit.kind() == "tar" {
-                    hit.offset + 257
+                    hit.offset() + 257
                 } else {
-                    hit.offset
+                    hit.offset()
                 },
             )?;
             row.set_item("source", "detection_embedded_scan")?;
@@ -421,7 +434,7 @@ fn scan_native(
     let mut xz_footer_ends = raw_hits
         .iter()
         .filter(|hit| hit.kind() == "xz_footer")
-        .map(|hit| hit.offset + XZ_FOOTER_MAGIC.len() as u64)
+        .map(|hit| hit.offset() + XZ_FOOTER_MAGIC.len() as u64)
         .collect::<Vec<_>>();
     xz_footer_ends.sort_unstable();
     let raw_hit_count = raw_hits
@@ -432,7 +445,7 @@ fn scan_native(
     raw_hits.retain(|hit| hit.kind() != "xz_footer");
     // Release noisy scan storage before walking structures or retaining a page.
     raw_hits.shrink_to_fit();
-    raw_hits.sort_unstable_by_key(|hit| (hit.offset, hit.hit_name()));
+    raw_hits.sort_unstable_by_key(|hit| (hit.offset(), hit.hit_name()));
 
     // Identity alone may dispatch a stream only when this same signature pass
     // proves that no supported peer can be hidden in it. This avoids decoding
@@ -441,7 +454,7 @@ fn scan_native(
         format != "lz4"
             && !raw_hits
                 .iter()
-                .any(|hit| hit.offset != 0 && !matches!(hit.kind(), "zip64_eocd"))
+                .any(|hit| hit.offset() != 0 && !matches!(hit.kind(), "zip64_eocd"))
     });
 
     // Structural facts survive in the result; transient validation windows
@@ -466,7 +479,7 @@ fn scan_native(
     raw_hits.retain(|hit| {
         !matches!(hit.kind(), "zip64_eocd")
             && candidates
-                .binary_search_by_key(&(hit.offset, hit.format()), |candidate| {
+                .binary_search_by_key(&(hit.offset(), hit.format()), |candidate| {
                     (candidate.offset, candidate.format)
                 })
                 .is_ok()
@@ -516,17 +529,17 @@ fn validate_raw_hits(
     // by its declared physical end; fake locators never trigger reverse scans.
     let mut zip64_records = BTreeMap::new();
     for hit in raw_hits.iter().filter(|hit| hit.kind() == "zip64_eocd") {
-        let fixed = read_at(reader, hit.offset, 56)?;
+        let fixed = read_at(reader, hit.offset(), 56)?;
         if let Ok(record) = crate::formats::zip::zip64::parse_record(&fixed) {
             if let Some(end) = hit
-                .offset
+                .offset()
                 .checked_add(12 + record.record_size)
                 .filter(|end| *end <= file_size)
             {
                 zip64_records
                     .entry(end)
                     .or_insert_with(Vec::new)
-                    .push((hit.offset, record));
+                    .push((hit.offset(), record));
             }
         }
     }
@@ -534,7 +547,7 @@ fn validate_raw_hits(
         .par_iter()
         .filter(|hit| hit.kind() == "zip_eocd")
         .map_init(DirectoryEvidence::default, |directories, hit| {
-            validate_zip_eocd(reader, file_size, hit.offset, &zip64_records, directories)
+            validate_zip_eocd(reader, file_size, hit.offset(), &zip64_records, directories)
         })
         .collect::<io::Result<Vec<_>>>()?
         .into_iter()
@@ -560,16 +573,16 @@ fn validate_raw_hits(
         .iter()
         .filter(|hit| !matches!(hit.kind(), "zip_eocd" | "zip64_eocd"))
     {
-        while range_index < seeded_ranges.len() && seeded_ranges[range_index].0 <= hit.offset {
+        while range_index < seeded_ranges.len() && seeded_ranges[range_index].0 <= hit.offset() {
             covered_until = covered_until.max(seeded_ranges[range_index].1);
             range_index += 1;
         }
-        if hit.offset < covered_until {
+        if hit.offset() < covered_until {
             continue;
         }
 
         let resolved = if hit.kind() == "xz" {
-            validate_xz(reader, file_size, hit.offset, &mut xz_footers)?
+            validate_xz(reader, file_size, hit.offset(), &mut xz_footers)?
         } else {
             let suffix_index = match hit.kind() {
                 "gzip" => 0,
@@ -582,7 +595,7 @@ fn validate_raw_hits(
                 reader,
                 file_size,
                 hit.kind(),
-                hit.offset,
+                hit.offset(),
                 &mut suffixes[suffix_index],
             )?
         };
@@ -889,10 +902,10 @@ fn record_xz_footer(
     // Reuse the canonical footer parser against the bytes already in the IOCP
     // buffer. Invalid two-byte markers require neither storage nor later I/O.
     if parse_xz_footer(footer, base_offset + end as u64).is_ok() {
-        hits.results.push(RawHit {
-            offset: base_offset + start as u64,
-            pattern: PATTERNS.len() as u8,
-        });
+        hits.results.push(RawHit::new(
+            base_offset + start as u64,
+            PATTERNS.len() as u8,
+        ));
     }
 }
 
@@ -932,10 +945,17 @@ fn record_raw_hit(
         hits.discarded_results += 1;
         return;
     }
-    hits.results.push(RawHit {
-        offset: candidate_offset,
-        pattern: pattern as u8,
-    });
+    if kind == "tar" && start >= 257 {
+        if sample
+            .get(start - 257..start - 257 + 512)
+            .is_some_and(|header| !crate::formats::tar::valid_header(header))
+        {
+            hits.discarded_results += 1;
+            return;
+        }
+    }
+    hits.results
+        .push(RawHit::new(candidate_offset, pattern as u8));
 }
 
 fn fixed_header_invalid(pattern: usize, bytes: &[u8]) -> bool {
@@ -954,9 +974,14 @@ fn fixed_header_invalid(pattern: usize, bytes: &[u8]) -> bool {
         5 => bytes
             .get(..10)
             .is_some_and(|header| gzip_fixed_header_flags(header.try_into().unwrap()).is_err()),
-        6 => bytes
-            .get(..4)
-            .is_some_and(|header| bzip2_header_block_limit(header.try_into().unwrap()).is_err()),
+        6 => bytes.get(..10).map_or_else(
+            || {
+                bytes.get(..4).is_some_and(|header| {
+                    bzip2_header_block_limit(header.try_into().unwrap()).is_err()
+                })
+            },
+            |prefix| !bzip2_prefix_valid(prefix.try_into().unwrap()),
+        ),
         7 => bytes
             .get(..12)
             .is_some_and(|header| validate_xz_header(header).is_err()),
@@ -2013,12 +2038,14 @@ fn walk_tar_candidate(
     if header.len() < 512 || &header[257..262] != TAR_USTAR {
         return Err(ValidationError::Invalid("tar_header_invalid"));
     }
-    if !valid_tar_header(&header) {
-        return Err(ValidationError::Invalid("tar_header_invalid"));
-    }
     let mut cursor = offset;
+    let mut state = crate::formats::tar::TarState::default();
     for _ in 0..MAX_ARCHIVE_METADATA_RECORDS {
-        visit(cursor)?;
+        // A PAX size inherited from an earlier header cannot disprove a TAR
+        // rooted at this cursor with its own fresh metadata context.
+        if state.boundary_context_free() {
+            visit(cursor)?;
+        }
         let current = read_at(file, cursor, 512)?;
         if current.len() != 512 {
             return Err(ValidationError::Invalid("tar_header_missing"));
@@ -2036,25 +2063,17 @@ fn walk_tar_candidate(
                 "member_walk_checksums_and_end_blocks",
             ));
         }
-        if !valid_tar_header(&current) {
-            return Err(ValidationError::Invalid("tar_header_invalid"));
-        }
-        let Some(payload_size) = parse_tar_number(&current[124..136]) else {
-            return Err(ValidationError::Invalid("tar_member_size_invalid"));
-        };
-        let Some(padded) = payload_size.checked_add(511).map(|value| value & !511) else {
-            return Err(ValidationError::Invalid("tar_member_size_invalid"));
-        };
-        let Some(next) = cursor
-            .checked_add(512)
-            .and_then(|value| value.checked_add(padded))
-        else {
-            return Err(ValidationError::Invalid("tar_member_size_invalid"));
-        };
-        if next > size {
-            return Err(ValidationError::Invalid("tar_member_size_invalid"));
-        }
-        cursor = next;
+        let record = state
+            .advance(&current, cursor, size, false, &mut |start, size| {
+                Ok(read_at(file, start, size)?.to_vec())
+            })
+            .map_err(|error| match error.kind() {
+                io::ErrorKind::InvalidData | io::ErrorKind::UnexpectedEof => {
+                    ValidationError::Invalid("tar_metadata_invalid")
+                }
+                _ => ValidationError::Io(error),
+            })?;
+        cursor = record.next;
     }
     Ok(logical_candidate(
         "tar",
@@ -2078,42 +2097,6 @@ fn tar_padding_end(file: &ManagedReader, mut end: u64, size: u64) -> io::Result<
         }
     }
     Ok(end)
-}
-
-fn valid_tar_header(header: &[u8]) -> bool {
-    if header.len() != 512 {
-        return false;
-    }
-    let Some(stored) = parse_tar_number(&header[148..156]) else {
-        return false;
-    };
-    let unsigned = header
-        .iter()
-        .enumerate()
-        .map(|(index, byte)| {
-            if (148..156).contains(&index) {
-                u64::from(b' ')
-            } else {
-                u64::from(*byte)
-            }
-        })
-        .sum::<u64>();
-    stored == unsigned
-}
-
-fn parse_tar_number(data: &[u8]) -> Option<u64> {
-    if data.first().is_some_and(|byte| byte & 0x80 != 0) {
-        if data.first()? & 0x40 != 0 {
-            return None;
-        }
-        let mut value = u64::from(data.first()? & 0x7f);
-        for byte in &data[1..] {
-            value = value.checked_mul(256)?.checked_add(u64::from(*byte))?;
-        }
-        Some(value)
-    } else {
-        parse_octal(data)
-    }
 }
 
 fn candidate(
@@ -2159,16 +2142,6 @@ fn read_vint(data: &[u8]) -> Option<(u64, usize)> {
         }
     }
     None
-}
-
-fn parse_octal(data: &[u8]) -> Option<u64> {
-    let text = std::str::from_utf8(data)
-        .ok()?
-        .trim_matches(|c| c == '\0' || c == ' ');
-    if text.is_empty() {
-        return None;
-    }
-    u64::from_str_radix(text, 8).ok()
 }
 
 #[cfg(test)]
@@ -2219,11 +2192,11 @@ mod tests {
         let mut ends = hits
             .iter()
             .filter(|hit| hit.kind() == "xz_footer")
-            .map(|hit| hit.offset + 2)
+            .map(|hit| hit.offset() + 2)
             .collect::<Vec<_>>();
         ends.sort_unstable();
         hits.retain(|hit| hit.kind() != "xz_footer");
-        hits.sort_unstable_by_key(|hit| hit.offset);
+        hits.sort_unstable_by_key(|hit| hit.offset());
         let source = ManagedReader::from_bytes(data, ReaderConfig::default());
         let candidates = validate_raw_hits(&source, source.len(), &hits, &ends).unwrap();
         assert_eq!(
@@ -2244,7 +2217,7 @@ mod tests {
         let mut ends = hits
             .iter()
             .filter(|hit| hit.kind() == "xz_footer")
-            .map(|hit| hit.offset + 2)
+            .map(|hit| hit.offset() + 2)
             .collect::<Vec<_>>();
         ends.sort_unstable();
         let source = ManagedReader::from_bytes(
@@ -2288,7 +2261,7 @@ mod tests {
             (budget_data, 0, empty.len() as u64, budget_end),
         ] {
             let mut hits = scan_sample(&data, 0, 0);
-            hits.sort_unstable_by_key(|hit| hit.offset);
+            hits.sort_unstable_by_key(|hit| hit.offset());
             let source = ManagedReader::from_bytes(
                 data.clone(),
                 ReaderConfig {
@@ -2337,11 +2310,11 @@ mod tests {
         let mut ends = hits
             .iter()
             .filter(|hit| hit.kind() == "xz_footer")
-            .map(|hit| hit.offset + 2)
+            .map(|hit| hit.offset() + 2)
             .collect::<Vec<_>>();
         ends.sort_unstable();
         hits.retain(|hit| hit.kind() != "xz_footer");
-        hits.sort_unstable_by_key(|hit| hit.offset);
+        hits.sort_unstable_by_key(|hit| hit.offset());
         let source = ManagedReader::from_bytes(
             data,
             ReaderConfig {
@@ -2423,14 +2396,14 @@ mod tests {
             );
         }
         hits.results
-            .sort_unstable_by_key(|hit| (hit.offset, hit.hit_name()));
+            .sort_unstable_by_key(|hit| (hit.offset(), hit.hit_name()));
         hits.results
     }
 
     fn optimized_raw_hits(data: &[u8]) -> Vec<RawHit> {
         let mut hits = scan_sample(data, 0, 0);
         hits.retain(|hit| hit.kind() != "xz_footer");
-        hits.sort_unstable_by_key(|hit| (hit.offset, hit.hit_name()));
+        hits.sort_unstable_by_key(|hit| (hit.offset(), hit.hit_name()));
         hits
     }
 
@@ -2470,17 +2443,16 @@ mod tests {
                         && parse_xz_footer(&sample[start - 10..start + 2], 4096 + start as u64 + 2)
                             .is_ok()
                     {
-                        expected.results.push(RawHit {
-                            pattern: PATTERNS.len() as u8,
-                            offset: 4096 + start as u64,
-                        });
+                        expected
+                            .results
+                            .push(RawHit::new(4096 + start as u64, PATTERNS.len() as u8));
                     }
                 }
                 let mut actual = scan_sample(sample, carry_len, 4096);
                 expected
                     .results
-                    .sort_unstable_by_key(|hit| (hit.offset, hit.hit_name()));
-                actual.sort_unstable_by_key(|hit| (hit.offset, hit.hit_name()));
+                    .sort_unstable_by_key(|hit| (hit.offset(), hit.hit_name()));
+                actual.sort_unstable_by_key(|hit| (hit.offset(), hit.hit_name()));
                 assert_eq!(
                     actual, expected.results,
                     "length={length} carry={carry_len}"
@@ -2506,17 +2478,16 @@ mod tests {
                 if start >= 10
                     && parse_xz_footer(&dense[start - 10..start + 2], start as u64 + 2).is_ok()
                 {
-                    expected.results.push(RawHit {
-                        pattern: PATTERNS.len() as u8,
-                        offset: start as u64,
-                    });
+                    expected
+                        .results
+                        .push(RawHit::new(start as u64, PATTERNS.len() as u8));
                 }
             }
             let mut actual = scan_sample(&dense, 0, 0);
             expected
                 .results
-                .sort_unstable_by_key(|hit| (hit.offset, hit.hit_name()));
-            actual.sort_unstable_by_key(|hit| (hit.offset, hit.hit_name()));
+                .sort_unstable_by_key(|hit| (hit.offset(), hit.hit_name()));
+            actual.sort_unstable_by_key(|hit| (hit.offset(), hit.hit_name()));
             assert_eq!(actual, expected.results, "dense prefix {prefix:?}");
         }
     }
@@ -2604,7 +2575,7 @@ mod tests {
         ] {
             let mut hits = scan_sample(&data, 0, 0);
             hits.retain(|hit| hit.kind() == kind);
-            hits.sort_unstable_by_key(|hit| hit.offset);
+            hits.sort_unstable_by_key(|hit| hit.offset());
             let reference = ManagedReader::from_bytes(data.clone(), ReaderConfig::default());
             let mut expected = Vec::new();
             for hit in &hits {
@@ -2612,7 +2583,7 @@ mod tests {
                     &reference,
                     reference.len(),
                     kind,
-                    hit.offset,
+                    hit.offset(),
                     &mut Default::default(),
                 )
                 .unwrap()
@@ -2658,7 +2629,7 @@ mod tests {
         frame.extend_from_slice(&[1, 0, 0]);
         let second = frame.len() as u64;
         let source = ManagedReader::from_bytes(frame.repeat(2), ReaderConfig::default());
-        let hits = [0, second].map(|offset| RawHit { pattern: 8, offset });
+        let hits = [0, second].map(|offset| RawHit::new(offset, 8));
         let candidates = validate_raw_hits(&source, source.len(), &hits, &[]).unwrap();
         assert_eq!(candidates.len(), 1);
         assert_eq!(
@@ -3204,7 +3175,7 @@ mod tests {
         data[second..second + SEVEN_ZIP.len()].copy_from_slice(SEVEN_ZIP);
         let path = temp_file("embedded_iocp", &data);
         let mut expected = reference_raw_hits(&data);
-        expected.sort_unstable_by_key(|hit| (hit.offset, hit.hit_name()));
+        expected.sort_unstable_by_key(|hit| (hit.offset(), hit.hit_name()));
         let mut output = iocp::scan_file(
             &path,
             data.len() as u64,
@@ -3217,7 +3188,7 @@ mod tests {
         .unwrap();
         output
             .results
-            .sort_unstable_by_key(|hit| (hit.offset, hit.hit_name()));
+            .sort_unstable_by_key(|hit| (hit.offset(), hit.hit_name()));
         assert_eq!(output.results, expected);
         let _ = fs::remove_file(path);
     }

@@ -101,13 +101,19 @@ async def handle(args, ctx):
     common_root = resolve_common_root(target_paths)
     config.setdefault("output", {})["common_root"] = common_root
 
-    if len(target_paths) == 1:
-        reporter.info(ctx.t("cli.extract.single_target", path=target_paths[0]))
-    else:
-        reporter.info(ctx.t("cli.extract.target_paths", count=len(target_paths)))
-        for path in target_paths:
-            reporter.detail(ctx.t("cli.detail_item_path", path=path))
-    reporter.detail(ctx.t("cli.extract.common_root", root=common_root))
+    def report_targets():
+        if len(target_paths) == 1:
+            reporter.info(ctx.t("cli.extract.single_target", path=target_paths[0]))
+        else:
+            reporter.info(ctx.t("cli.extract.target_paths", count=len(target_paths)))
+            for path in target_paths:
+                reporter.detail(ctx.t("cli.detail_item_path", path=path))
+        reporter.detail(ctx.t("cli.extract.common_root", root=common_root))
+
+    from sunpack.runtime.cli.cli import command_work_broker
+
+    async with command_work_broker(ctx) as broker:
+        await broker.run("cli_output", "", report_targets)
 
     attempts = []
     retry_count = 0

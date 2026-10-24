@@ -10,7 +10,7 @@ from typing import Any, AsyncIterator, Callable
 
 from sunpack.core.config.loader import config_source_key, load_config, load_raw_config_payload
 from sunpack.core.config.advanced_defaults import advanced_config_value
-from sunpack.pipeline.coordinator.engine import PipelineEngine
+from sunpack.pipeline.coordinator.engine import PipelineEngine, new_work_broker
 from sunpack.runtime.cli.runtime_state import server_runtime_active, set_server_runtime_active
 
 
@@ -33,6 +33,7 @@ _PASSWORD_RELOAD_TASK: asyncio.Task | None = None
 _PASSWORD_RELOAD_PENDING = False
 
 _ENGINE: PipelineEngine | None = None
+_WORK_BROKER = None
 _ENGINE_LOCK = asyncio.Lock()
 _CONFIG_SNAPSHOTS: dict[ConfigSourceKey, _ConfigSnapshot] = {}
 _LATEST_IDLE_SECONDS: float | None = None
@@ -109,7 +110,7 @@ async def _reload_password_file(source) -> None:
 
 
 async def close_persistent_runtime() -> None:
-    global _ENGINE, _LATEST_IDLE_SECONDS, _STATE_CHANGED_CALLBACK, _CONFIG_OBSERVER
+    global _ENGINE, _WORK_BROKER, _LATEST_IDLE_SECONDS, _STATE_CHANGED_CALLBACK, _CONFIG_OBSERVER
     set_server_runtime_active(False)
     if _CONFIG_OBSERVER is not None:
         _CONFIG_OBSERVER.stop()
@@ -122,11 +123,14 @@ async def close_persistent_runtime() -> None:
     clear_password_file_source()
     async with _ENGINE_LOCK:
         engine, _ENGINE = _ENGINE, None
+        broker, _WORK_BROKER = _WORK_BROKER, None
         _CONFIG_SNAPSHOTS.clear()
         _LATEST_IDLE_SECONDS = None
         try:
             if engine is not None:
                 await engine.aclose(graceful=True)
+            if broker is not None and (engine is None or broker is not engine.work_broker):
+                await broker.close(graceful=True)
         finally:
             if engine is not None:
                 setter = getattr(engine, "set_state_changed_callback", None)
@@ -136,7 +140,19 @@ async def close_persistent_runtime() -> None:
 
 
 def persistent_runtime_is_idle() -> bool:
-    return _ENGINE is None or _ENGINE.is_idle()
+    return (_ENGINE is None or _ENGINE.is_idle()) and (
+        _WORK_BROKER is None or (_WORK_BROKER.active_jobs == 0 and _WORK_BROKER.pending_jobs == 0)
+    )
+
+
+def shared_command_work_broker(request_cwd=None):
+    global _WORK_BROKER
+    if _ENGINE is not None:
+        return _ENGINE.work_broker
+    if _WORK_BROKER is None:
+        _WORK_BROKER = new_work_broker(load_request_config(request_cwd))
+        _WORK_BROKER.set_state_changed_callback(_STATE_CHANGED_CALLBACK)
+    return _WORK_BROKER
 
 
 def current_pipeline_engine() -> PipelineEngine | None:
@@ -194,7 +210,7 @@ async def pipeline_engine(
     if not server_runtime_active():
         raise RuntimeError("extract pipeline is only available inside the persistent server")
 
-    global _ENGINE, _LATEST_IDLE_SECONDS
+    global _ENGINE, _WORK_BROKER, _LATEST_IDLE_SECONDS
     performance = config.get("performance") if isinstance(config.get("performance"), dict) else {}
     try:
         _LATEST_IDLE_SECONDS = max(
@@ -211,7 +227,10 @@ async def pipeline_engine(
                 raise RuntimeError("persistent runtime is closing")
             engine = _ENGINE
             if engine is None:
-                created = PipelineEngine(copy.deepcopy(config))
+                if _WORK_BROKER is None:
+                    created = PipelineEngine(copy.deepcopy(config))
+                else:
+                    created = PipelineEngine(copy.deepcopy(config), work_broker=_WORK_BROKER)
                 setter = getattr(created, "set_state_changed_callback", None)
                 if setter is not None:
                     setter(_STATE_CHANGED_CALLBACK)
@@ -225,6 +244,8 @@ async def pipeline_engine(
                     if not server_runtime_active():
                         raise RuntimeError("persistent runtime is closing")
                 except BaseException:
+                    if _WORK_BROKER is created.work_broker:
+                        _WORK_BROKER = None
                     try:
                         await created.aclose(graceful=False)
                     finally:
@@ -232,6 +253,8 @@ async def pipeline_engine(
                             setter(None)
                     raise
                 _ENGINE = engine
+                if _WORK_BROKER is engine.work_broker:
+                    _WORK_BROKER = None
             else:
                 engine.reconfigure_request(copy.deepcopy(config))
     else:

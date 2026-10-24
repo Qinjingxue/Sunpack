@@ -4,6 +4,7 @@ import contextvars
 import inspect
 import os
 import sys
+from contextlib import asynccontextmanager
 
 from sunpack.runtime.cli.cli_aliases import canonical_command
 from sunpack.runtime.cli.cli_commands import command_map, discover_command_modules
@@ -108,8 +109,35 @@ async def dispatch_command(args, ctx: CliContext) -> tuple[int, CliCommandResult
             summary={},
             errors=[ctx.t("cli.unknown_command", command=command)],
         )
-    result = module.handle(args, ctx)
+    if inspect.iscoroutinefunction(module.handle):
+        return await module.handle(args, ctx)
+    async with command_work_broker(ctx) as broker:
+        result = await broker.run("cli", getattr(args, "command", ""), module.handle, args, ctx)
     return await result if inspect.isawaitable(result) else result
+
+
+@asynccontextmanager
+async def command_work_broker(ctx: CliContext):
+    """Reuse pipeline admission; own a broker only for standalone CLI work."""
+    from sunpack.runtime.cli.persistent_runtime import (
+        current_pipeline_engine, shared_command_work_broker, server_runtime_active,
+    )
+    from sunpack.pipeline.coordinator.async_work import AsyncWorkBroker
+
+    engine = current_pipeline_engine()
+    broker = ctx.work_broker or (engine.work_broker if engine is not None else None)
+    if broker is None and server_runtime_active():
+        broker = shared_command_work_broker(ctx.cwd)
+    owned = broker is None
+    if owned:
+        broker = AsyncWorkBroker()
+    previous, ctx.work_broker = ctx.work_broker, broker
+    try:
+        yield broker
+    finally:
+        ctx.work_broker = previous
+        if owned:
+            await broker.close(graceful=True)
 
 
 async def maybe_pause(args, ctx: CliContext, exit_code: int, result: CliCommandResult):
@@ -212,27 +240,29 @@ async def async_main(
                 summary={},
                 errors=[ctx.t("cli.json_password_prompt_unavailable")],
             )
-            reporter.emit_result(result)
+            async with command_work_broker(ctx) as broker:
+                await broker.run("cli_output", "", reporter.emit_result, result)
             return EXIT_USAGE
         if args.json:
             args.pause_on_exit = False
-        try:
-            exit_code, result = await dispatch_command(args, ctx)
-        except Exception as exc:
-            reporter.error(ctx.t("cli.runtime_failure", error=exc))
-            result = CliCommandResult(
-                command=getattr(args, "command", ""),
-                inputs={"argv": argv},
-                summary={},
-                errors=[ctx.t("cli.runtime_failure", error=exc)],
-            )
-            reporter.emit_result(result)
-            await maybe_pause(args, ctx, EXIT_RUNTIME, result)
-            return EXIT_RUNTIME
+        async with command_work_broker(ctx) as broker:
+            try:
+                exit_code, result = await dispatch_command(args, ctx)
+            except Exception as exc:
+                await broker.run("cli_output", "", reporter.error, ctx.t("cli.runtime_failure", error=exc))
+                result = CliCommandResult(
+                    command=getattr(args, "command", ""),
+                    inputs={"argv": argv},
+                    summary={},
+                    errors=[ctx.t("cli.runtime_failure", error=exc)],
+                )
+                await broker.run("cli_output", "", reporter.emit_result, result)
+                await maybe_pause(args, ctx, EXIT_RUNTIME, result)
+                return EXIT_RUNTIME
 
-        reporter.emit_result(result)
-        await maybe_pause(args, ctx, exit_code, result)
-        return exit_code
+            await broker.run("cli_output", "", reporter.emit_result, result)
+            await maybe_pause(args, ctx, exit_code, result)
+            return exit_code
 
 
 def _should_submit_to_persistent_server(argv: list[str]) -> bool:

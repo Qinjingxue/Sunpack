@@ -11,6 +11,53 @@ from sunpack.runtime.cli.runtime_host import RuntimeHost
 from tests.helpers.config_factory import make_config
 
 
+def test_cold_cli_broker_transfers_to_the_engine_and_closes_once(monkeypatch):
+    # CLI requests before/during engine startup must share admission and worker
+    # lifetime. Existing host tests start with an engine and cannot find a cold
+    # pool retained forever or replaced while concurrent startup is suspended.
+    from sunpack.runtime.cli import persistent_runtime as runtime
+    from sunpack.runtime.cli import runtime_state
+    from sunpack.pipeline.coordinator.engine import PipelineEngine
+
+    async def scenario():
+        config = make_config({"cli": {"quiet": True}})
+        monkeypatch.setattr(runtime, "_ENGINE", None)
+        monkeypatch.setattr(runtime, "_WORK_BROKER", None)
+        monkeypatch.setattr(runtime, "_ENGINE_LOCK", asyncio.Lock())
+        monkeypatch.setattr(runtime, "load_request_config", lambda _cwd: config)
+        monkeypatch.setattr(runtime_state, "runtime_host", lambda: None)
+        entered, release = asyncio.Event(), asyncio.Event()
+        enter = PipelineEngine.__aenter__
+
+        async def opening(engine):
+            entered.set()
+            await release.wait()
+            return await enter(engine)
+
+        monkeypatch.setattr(PipelineEngine, "__aenter__", opening)
+        runtime_state.set_server_runtime_active(True)
+        broker = runtime.shared_command_work_broker()
+        context = runtime.pipeline_engine(config)
+        task = asyncio.create_task(context.__aenter__())
+        try:
+            await entered.wait()
+            assert runtime.shared_command_work_broker() is broker
+            release.set()
+            engine = await task
+            assert engine.work_broker is broker
+            assert runtime.shared_command_work_broker() is broker
+            assert runtime._WORK_BROKER is None
+            assert await broker.run("cli", "test", lambda: 7) == 7
+            await context.__aexit__(None, None, None)
+        finally:
+            release.set()
+            await asyncio.gather(task, return_exceptions=True)
+            await runtime.close_persistent_runtime()
+        assert broker._closed
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("action", ["reload", "add", "remove"])
 def test_watch_configuration_survives_disconnect_and_finishes_before_stop(tmp_path, monkeypatch, action):
     from copy import deepcopy

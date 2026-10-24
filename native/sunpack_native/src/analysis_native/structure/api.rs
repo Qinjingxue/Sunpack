@@ -788,22 +788,6 @@ pub(crate) fn inspect_tar_header_structure(
         finish_fields(&result, TAR_FIELDS)?;
         return Ok(result.unbind());
     }
-    let walk = match walk_tar(&mut file, start_offset, archive_end, max_entries_to_walk) {
-        Ok(walk) => walk,
-        Err(fault) => {
-            set_read_fault(&result, &fault, "member_header_read_failed")?;
-            result.set_item("plausible", false)?;
-            finish_fields(&result, TAR_FIELDS)?;
-            return Ok(result.unbind());
-        }
-    };
-    result.set_item("entries_checked", walk.0)?;
-    result.set_item("entry_walk_ok", walk.1)?;
-    result.set_item("end_zero_blocks", walk.2)?;
-    if !walk.3.is_empty() {
-        result.set_item("error", walk.3)?;
-        result.set_item("plausible", false)?;
-    }
     enrich_tar_semantics(
         &result,
         &mut file,
@@ -896,12 +880,15 @@ pub(crate) fn inspect_compression_stream_structure(
         return inspect_zstd(py, path, &header, file_size);
     }
     if crate::formats::lz4::leading(&header) {
-        let index = py.detach(|| {
-            ManagedReader::open(path).map(|reader| crate::formats::lz4::walk(&reader, 0, file_size))
-          }).map_err(|e| pyo3::exceptions::PyOSError::new_err(e.to_string()))?;
-          if index.frames == 0 && matches!(index.error, "" | "lz4_magic_not_found") {
-              return compression_empty(py, "ambiguous_skippable_stream", "", "", false);
-          }
+        let index = py
+            .detach(|| {
+                ManagedReader::open(path)
+                    .map(|reader| crate::formats::lz4::walk(&reader, 0, file_size))
+            })
+            .map_err(|e| pyo3::exceptions::PyOSError::new_err(e.to_string()))?;
+        if index.frames == 0 && matches!(index.error, "" | "lz4_magic_not_found") {
+            return compression_empty(py, "ambiguous_skippable_stream", "", "", false);
+        }
         return Ok(index.to_dict(py, file_size)?.unbind());
     }
     compression_empty(py, "compression_stream_magic_not_found", "", "", false)

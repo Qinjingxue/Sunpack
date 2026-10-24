@@ -394,18 +394,73 @@ def _try_send(payload: dict[str, Any]) -> dict[str, Any] | None:
 
 
 class _ConnectionOutputQueue(asyncio.Queue[bytes | None]):
-    """Loop-owned output: closing retires queued frames and rejects late writes."""
+    """Byte-bounded output; producers wait on capacity, never poll for it."""
 
-    def __init__(self) -> None:
+    def __init__(self, max_bytes: int = 1024 * 1024) -> None:
         super().__init__()
+        self.max_bytes = max_bytes
+        self.buffered_bytes = 0
+        self._capacity = threading.Condition()
+        self._space_ready = asyncio.Event()
+        self._space_ready.set()
         self.closed = False
 
     def put_nowait(self, frame: bytes | None) -> None:
-        if not self.closed:
+        size = len(frame) if frame else 0
+        if size > self.max_bytes:
+            raise ValueError("persistent output frame exceeds queue capacity")
+        with self._capacity:
+            if self.closed:
+                return
+            if self.buffered_bytes + size > self.max_bytes:
+                raise asyncio.QueueFull
+            self.buffered_bytes += size
+        self._enqueue_reserved(frame)
+
+    def _enqueue_reserved(self, frame: bytes | None) -> None:
+        if self.closed:
+            self._release(frame)
+        else:
             super().put_nowait(frame)
 
+    def _release(self, frame: bytes | None) -> None:
+        with self._capacity:
+            self.buffered_bytes -= len(frame) if frame else 0
+            self._capacity.notify_all()
+        self._space_ready.set()
+
+    async def put(self, frame: bytes | None) -> None:
+        while not self.closed:
+            try:
+                self.put_nowait(frame)
+                return
+            except asyncio.QueueFull:
+                self._space_ready.clear()
+                await self._space_ready.wait()
+
+    def put_from_thread(self, loop, frame: bytes) -> None:
+        # Reserve before scheduling, bounding both frames and loop callbacks.
+        # Most writes need no round-trip; only a full queue parks the producer.
+        size = len(frame)
+        if size > self.max_bytes:
+            raise ValueError("persistent output frame exceeds queue capacity")
+        with self._capacity:
+            self._capacity.wait_for(lambda: self.closed or self.buffered_bytes + size <= self.max_bytes)
+            if self.closed:
+                return
+            self.buffered_bytes += size
+        loop.call_soon_threadsafe(self._enqueue_reserved, frame)
+
+    def get_nowait(self) -> bytes | None:
+        frame = super().get_nowait()
+        self._release(frame)
+        return frame
+
     def close(self) -> None:
-        self.closed = True
+        with self._capacity:
+            self.closed = True
+            self._capacity.notify_all()
+        self._space_ready.set()
         while not self.empty():
             self.get_nowait()
             self.task_done()
@@ -659,7 +714,7 @@ class _PipeRequestProtocol(asyncio.Protocol):
 
     async def read_input(self, prompt: str, stdout: "_AsyncConnectionTextStream") -> str:
         if prompt:
-            stdout.write(prompt)
+            await stdout.awrite(prompt)
         await self.flush_output()
         loop = asyncio.get_running_loop()
         waiter: asyncio.Future[str] = loop.create_future()
@@ -972,14 +1027,30 @@ class _AsyncConnectionTextStream:
         value = str(text)
         if self.queue.closed:
             return len(value)
-        data = value.encode("utf-8", "surrogatepass")
-        if data:
-            frame = struct.pack("!BI", self.kind, len(data)) + data
+        # A slice ends between Unicode characters; each frame independently
+        # decodes correctly even for four-byte UTF-8 or surrogatepass data.
+        for frame in self._frames(value):
+            if self.queue.closed:
+                break
             if threading.get_ident() == self._loop_thread_id:
-                self.queue.put_nowait(frame)
+                try:
+                    self.queue.put_nowait(frame)
+                except asyncio.QueueFull as exc:
+                    raise BlockingIOError("persistent output buffer is full") from exc
             else:
-                self.loop.call_soon_threadsafe(self.queue.put_nowait, frame)
+                self.queue.put_from_thread(self.loop, frame)
         return len(value)
+
+    def _frames(self, value: str):
+        for offset in range(0, len(value), 64 * 1024):
+            data = value[offset:offset + 64 * 1024].encode("utf-8", "surrogatepass")
+            yield struct.pack("!BI", self.kind, len(data)) + data
+
+    async def awrite(self, value: str) -> None:
+        for frame in self._frames(value):
+            if self.queue.closed:
+                break
+            await self.queue.put(frame)
 
     def flush(self) -> None:
         return None
@@ -1027,7 +1098,7 @@ class _StreamRequestConnection:
 
     async def read_input(self, prompt: str, stdout: _AsyncConnectionTextStream) -> str:
         if prompt:
-            stdout.write(prompt)
+            await stdout.awrite(prompt)
         await self.flush_output()
         await self.send_frame(struct.pack("!BI", 3, 0))
         await self.flush_output()
@@ -1085,10 +1156,9 @@ async def _execute_streaming_request_async(
         raise
     except BaseException as exc:
         request_cwd = str(payload.get("cwd") or runtime_working_directory())
-        print(I18nContext(load_cli_language_from_config(request_cwd)).t("cli.persistent_request_failed", error=exc), file=stderr)
+        await stderr.awrite(I18nContext(load_cli_language_from_config(request_cwd)).t("cli.persistent_request_failed", error=exc) + "\n")
         return 1
     finally:
-        await asyncio.sleep(0)
         await connection.flush_output()
         if owns_connection:
             await connection.close()

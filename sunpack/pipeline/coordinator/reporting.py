@@ -45,7 +45,7 @@ class RunReporter:
         self.emit_errors = bool(emit_errors)
         self.stdout = stdout if stdout is not None else sys.stdout
         self.stderr = stderr if stderr is not None else sys.stderr
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._total_tasks = 0
         self._completed_tasks = 0
         self._nested_tasks = 0
@@ -130,6 +130,19 @@ class RunReporter:
                 return
 
     def task_progress(self, task: Any, event: dict[str, Any]) -> None:
+        # Native progress is best-effort. Never park the runtime loop behind a
+        # report thread holding this lock while waiting for client capacity.
+        if not self._lock.acquire(blocking=False):
+            return
+        try:
+            self._task_progress(task, event)
+        except BlockingIOError:
+            # The final report is lossless and uses the blocking broker path.
+            pass
+        finally:
+            self._lock.release()
+
+    def _task_progress(self, task: Any, event: dict[str, Any]) -> None:
         if self.quiet:
             return
         name = str(event.get("event") or "")

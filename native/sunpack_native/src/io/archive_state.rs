@@ -1,3 +1,4 @@
+use crate::formats::tar::{self, TarState};
 use crate::io::resource_lifecycle::TrackedFile;
 use crate::password::zip::{zip_password_bytes, ZipCryptoDecryptor};
 use crate::verification::archive_manifest::{ManifestEntry, NativeArchiveManifest};
@@ -5,7 +6,6 @@ use crate::verification::paths::OutputPathAllocator;
 use encoding_rs::{BIG5, GBK, SHIFT_JIS, UTF_8};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
-use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::sync::Arc;
@@ -15,10 +15,6 @@ const EOCD_SIG: &[u8] = b"PK\x05\x06";
 const CD_SIG: &[u8] = b"PK\x01\x02";
 const LFH_SIG: &[u8] = b"PK\x03\x04";
 const ZIP_UNICODE_PATH_EXTRA_FIELD: u16 = 0x7075;
-// Names and numeric metadata have small useful bounds even in very large TARs.
-// Unknown PAX values are skipped without allocating or reading their payload.
-const MAX_TAR_METADATA_VALUE: usize = 1024 * 1024;
-
 #[pyfunction]
 #[pyo3(signature = (source, max_items=200000, password=None, codepage=None))]
 pub(crate) fn archive_state_zip_manifest_native(
@@ -108,12 +104,12 @@ impl SegmentReader {
         }
     }
 
-    fn read_exact_at(&mut self, offset: u64, output: &mut [u8]) -> PyResult<()> {
-        let end = offset.checked_add(output.len() as u64).ok_or_else(|| {
-            pyo3::exceptions::PyValueError::new_err("archive state logical read offset overflow")
-        })?;
+    fn read_exact_at(&mut self, offset: u64, output: &mut [u8]) -> std::io::Result<()> {
+        let end = offset
+            .checked_add(output.len() as u64)
+            .ok_or_else(|| std::io::Error::other("archive state logical read offset overflow"))?;
         if end > self.total {
-            return Err(pyo3::exceptions::PyValueError::new_err(
+            return Err(std::io::Error::other(
                 "archive state logical read exceeds input",
             ));
         }
@@ -121,9 +117,7 @@ impl SegmentReader {
         let mut written = 0usize;
         while written < output.len() {
             let (index, within) = self.locate(cursor).ok_or_else(|| {
-                pyo3::exceptions::PyValueError::new_err(
-                    "archive state logical read segment is missing",
-                )
+                std::io::Error::other("archive state logical read segment is missing")
             })?;
             let available = (self.segments[index].len() - within) as usize;
             let take = available.min(output.len() - written);
@@ -135,9 +129,7 @@ impl SegmentReader {
                         self.file_index = Some(index);
                     }
                     let file = self.file.as_mut().ok_or_else(|| {
-                        pyo3::exceptions::PyRuntimeError::new_err(
-                            "archive state source file is unavailable",
-                        )
+                        std::io::Error::other("archive state source file is unavailable")
                     })?;
                     file.seek(SeekFrom::Start(start.saturating_add(within)))?;
                     file.read_exact(&mut output[written..written + take])?;
@@ -149,7 +141,7 @@ impl SegmentReader {
         Ok(())
     }
 
-    fn read_vec_at(&mut self, offset: u64, len: usize) -> PyResult<Vec<u8>> {
+    fn read_vec_at(&mut self, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
         let mut output = vec![0u8; len];
         self.read_exact_at(offset, &mut output)?;
         Ok(output)
@@ -185,10 +177,7 @@ fn tar_manifest_from_reader(
     let mut zero_blocks = 0usize;
     let mut entries = Vec::<ManifestEntry>::new();
     let mut output_paths = OutputPathAllocator::default();
-    let mut global_pax = HashMap::<String, String>::new();
-    let mut next_pax = HashMap::<String, String>::new();
-    let mut long_name = None::<String>;
-    let mut long_link_size = None::<u64>;
+    let mut state = TarState::default();
     let mut error = None::<String>;
     let mut checksum_error = false;
 
@@ -205,193 +194,46 @@ fn tar_manifest_from_reader(
         }
         zero_blocks = 0;
 
-        let stored = tar_number(&header[148..156]);
-        let raw_size = tar_number(&header[124..136]);
-        let checksum = tar_checksum(&header);
-        if stored.is_none() || raw_size.is_none() || stored != Some(checksum) {
-            checksum_error = stored.is_some() && stored != Some(checksum);
-            error = Some("invalid TAR member header".to_string());
-            break;
-        }
-        let raw_size = raw_size.unwrap_or(0);
-        let typeflag = header[156];
-        let (sparse_extension_span, oldgnu_sparse_extent_end) = if typeflag == b'S' {
-            match tar_sparse_extension_span(reader, &header, offset)? {
-                Some(value) => value,
-                None => {
-                    error = Some("invalid old GNU sparse extension map".to_string());
-                    break;
+        let retain = entries.len() < max_items;
+        let total = reader.total;
+        let record = match state.advance(&header, offset, total, retain, &mut |start, size| {
+            reader.read_vec_at(start, size)
+        }) {
+            Ok(record) => record,
+            Err(fault) => {
+                if !matches!(
+                    fault.kind(),
+                    std::io::ErrorKind::InvalidData | std::io::ErrorKind::UnexpectedEof
+                ) {
+                    return Err(fault.into());
                 }
-            }
-        } else {
-            (0, 0)
-        };
-        let raw_end = offset
-            .checked_add(BLOCK)
-            .and_then(|value| value.checked_add(sparse_extension_span))
-            .and_then(|value| value.checked_add(raw_size));
-        let Some(raw_end) = raw_end else {
-            error = Some("TAR member payload is truncated".to_string());
-            break;
-        };
-        let raw_next = raw_end.checked_add(tar_padding(raw_size));
-        let Some(raw_next) = raw_next else {
-            error = Some("TAR member payload is truncated".to_string());
-            break;
-        };
-        let raw_payload_truncated = raw_next > reader.total;
-        let payload_start = offset
-            .checked_add(BLOCK)
-            .and_then(|value| value.checked_add(sparse_extension_span))
-            .unwrap_or(reader.total);
-
-        if matches!(typeflag, b'x' | b'g') {
-            if raw_payload_truncated {
-                error = Some("TAR metadata member payload is truncated".to_string());
+                checksum_error =
+                    tar::number(&header[148..156]).is_some_and(|n| n != tar::checksum(&header));
+                error = Some(fault.to_string());
                 break;
             }
-            let Some(parsed) = tar_pax(reader, payload_start, raw_size)? else {
-                error = Some("invalid PAX extended header".to_string());
-                break;
-            };
-            if typeflag == b'g' {
-                for (key, value) in parsed {
-                    if value.is_empty() {
-                        global_pax.remove(&key);
-                    } else {
-                        global_pax.insert(key, value);
-                    }
-                }
-            } else {
-                next_pax = parsed;
-            }
-            item_count += 1;
-            offset = raw_next;
-            continue;
-        }
-        if typeflag == b'L' || typeflag == b'K' {
-            if raw_payload_truncated {
-                error = Some(
-                    if typeflag == b'L' {
-                        "GNU longname payload is truncated"
-                    } else {
-                        "GNU longlink payload is truncated"
-                    }
-                    .to_string(),
-                );
-                break;
-            }
-            if raw_size > MAX_TAR_METADATA_VALUE as u64 {
-                error = Some("GNU name metadata exceeds metadata budget".to_string());
-                break;
-            }
-            let payload = reader.read_vec_at(payload_start, raw_size as usize)?;
-            if typeflag == b'L' {
-                long_name = Some(tar_text(&payload));
-            } else {
-                long_link_size = Some(
-                    payload
-                        .iter()
-                        .position(|byte| *byte == 0)
-                        .unwrap_or(payload.len()) as u64,
-                );
-            }
-            item_count += 1;
-            offset = raw_next;
-            continue;
-        }
-
-        // Local empty values mask globals for this member. Borrow rather than
-        // cloning the entire global header once per file.
-        let effective = |key: &str| {
-            next_pax
-                .get(key)
-                .or_else(|| global_pax.get(key))
-                .filter(|v| !v.is_empty())
         };
-        let mut physical_size = raw_size;
-        if let Some(value) = effective("size") {
-            match tar_extended_size(value) {
-                Some(size) => physical_size = size,
-                None => error = Some("invalid TAR extended size: size".to_string()),
-            }
-        }
-        let member_next = offset
-            .checked_add(BLOCK)
-            .and_then(|value| value.checked_add(sparse_extension_span))
-            .and_then(|value| value.checked_add(physical_size))
-            .and_then(|value| value.checked_add(tar_padding(physical_size)));
-        let Some(member_next) = member_next else {
-            error = Some("TAR extended member payload is truncated".to_string());
-            break;
-        };
-        let member_payload_truncated = member_next > reader.total;
-        if member_payload_truncated {
-            error = Some("TAR extended member payload is truncated".to_string());
-        }
-
-        let prefix = tar_text(&header[345..500]);
-        let raw_name = tar_text(&header[0..100]);
-        let path = effective("path")
-            .cloned()
-            .or_else(|| long_name.take())
-            .unwrap_or_else(|| {
-                if prefix.is_empty() {
-                    raw_name.clone()
-                } else {
-                    format!("{prefix}/{raw_name}")
-                }
-            });
-        let mut logical_size = physical_size;
-        if typeflag == b'S' {
-            if let Some(oldgnu_size) = tar_number(&header[483..495]) {
-                logical_size = oldgnu_size;
-            }
-            if oldgnu_sparse_extent_end > logical_size {
-                error = Some("old GNU sparse extent exceeds logical size".to_string());
-            }
-        }
         item_count += 1;
-        let projected = output_paths.project(&path, typeflag == b'5');
-        if !matches!(typeflag, b'5' | b'3' | b'4' | b'6') && !path.is_empty() {
-            file_count += 1;
-            let archive_path = path.clone();
-            let size = if typeflag == b'2' {
-                // The existing worker materializes symbolic-link target bytes
-                // as a regular output. Match its actual stream size, not the
-                // TAR member's usually-zero physical payload size.
-                effective("linkpath")
-                    .map(|value| value.len() as u64)
-                    .or(long_link_size)
-                    .unwrap_or_else(|| {
-                        header[157..257]
-                            .iter()
-                            .position(|byte| *byte == 0)
-                            .unwrap_or(100) as u64
-                    })
-            } else {
-                logical_size
-            };
-            total_unpacked_size = total_unpacked_size.saturating_add(size);
-            if entries.len() < max_items {
-                let raw_path = (projected != archive_path).then_some(archive_path);
-                entries.push(ManifestEntry {
-                    path: projected,
-                    raw_path,
-                    size,
-                    crc32: None,
-                });
+        offset = record.next;
+        if let Some(member) = record.member {
+            // Once retention is full, only aggregate; no later entry uses names.
+            let projected = member
+                .path
+                .as_deref()
+                .map(|path| output_paths.project(path, member.is_directory));
+            if member.is_file {
+                file_count += 1;
+                total_unpacked_size = total_unpacked_size.saturating_add(member.size);
+                if let (Some(path), Some(projected)) = (member.path, projected) {
+                    let raw_path = (projected != path).then_some(path);
+                    entries.push(ManifestEntry {
+                        path: projected,
+                        raw_path,
+                        size: member.size,
+                        crc32: None,
+                    });
+                }
             }
-        }
-        next_pax.clear();
-        long_name = None;
-        long_link_size = None;
-        offset = member_next;
-        if error.is_some() || raw_payload_truncated || member_payload_truncated {
-            if error.is_none() {
-                error = Some("TAR member payload is truncated".to_string());
-            }
-            break;
         }
     }
 
@@ -427,192 +269,6 @@ fn tar_manifest_from_reader(
         failure_kind: if damaged { "corrupted_data" } else { "" }.to_string(),
         entries: Arc::new(entries),
     })
-}
-
-fn tar_number(field: &[u8]) -> Option<u64> {
-    if field.is_empty() {
-        return None;
-    }
-    if field[0] & 0x80 != 0 {
-        let mut value = (field[0] & 0x7f) as u64;
-        for byte in &field[1..] {
-            value = value.checked_mul(256)?.checked_add(*byte as u64)?;
-        }
-        return Some(value);
-    }
-    let mut end = field.len();
-    while end > 0 && matches!(field[end - 1], 0 | b' ') {
-        end -= 1;
-    }
-    let mut start = 0usize;
-    while start < end && field[start] == b' ' {
-        start += 1;
-    }
-    if start == end {
-        return Some(0);
-    }
-    let mut value = 0u64;
-    for byte in &field[start..end] {
-        if !(b'0'..=b'7').contains(byte) {
-            return None;
-        }
-        value = value.checked_mul(8)?.checked_add((byte - b'0') as u64)?;
-    }
-    Some(value)
-}
-
-fn tar_checksum(header: &[u8; 512]) -> u64 {
-    let mut sum = header[..148].iter().map(|byte| *byte as u64).sum::<u64>();
-    sum += 32 * 8;
-    sum + header[156..].iter().map(|byte| *byte as u64).sum::<u64>()
-}
-
-fn tar_padding(size: u64) -> u64 {
-    (BLOCK_SIZE_TAR - (size % BLOCK_SIZE_TAR)) % BLOCK_SIZE_TAR
-}
-
-const BLOCK_SIZE_TAR: u64 = 512;
-
-fn tar_text(field: &[u8]) -> String {
-    let end = field
-        .iter()
-        .position(|byte| *byte == 0)
-        .unwrap_or(field.len());
-    String::from_utf8_lossy(&field[..end]).into_owned()
-}
-
-fn tar_extended_size(value: &str) -> Option<u64> {
-    let parsed = value.parse::<i128>().ok()?;
-    if parsed <= 0 {
-        Some(0)
-    } else {
-        u64::try_from(parsed).ok()
-    }
-}
-
-fn tar_pax(
-    reader: &mut SegmentReader,
-    start: u64,
-    size: u64,
-) -> PyResult<Option<HashMap<String, String>>> {
-    let mut records = HashMap::new();
-    let mut retained = 0usize;
-    let mut cursor = 0u64;
-    while cursor < size {
-        let prefix = reader.read_vec_at(start + cursor, (size - cursor).min(256) as usize)?;
-        let Some(space) = prefix.iter().position(|byte| *byte == b' ') else {
-            return Ok(None);
-        };
-        let length = std::str::from_utf8(&prefix[..space])
-            .ok()
-            .filter(|text| !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit()))
-            .and_then(|text| text.parse::<u64>().ok());
-        let Some(length) = length.filter(|&n| n > space as u64 + 2 && n <= size - cursor) else {
-            return Ok(None);
-        };
-        let end = cursor + length;
-        let mut terminator = [0u8; 1];
-        reader.read_exact_at(start + end - 1, &mut terminator)?;
-        if terminator[0] != b'\n' {
-            return Ok(None);
-        }
-        // A relevant keyword fits in this prefix. Overlong unknown keywords
-        // cannot affect names or sizes.
-        let body = &prefix[space + 1..prefix.len().min(length as usize - 1)];
-        if let Some(equal) = body.iter().position(|byte| *byte == b'=') {
-            let key = std::str::from_utf8(&body[..equal]).ok();
-            if let Some(key) = key.filter(|key| matches!(*key, "path" | "linkpath" | "size")) {
-                let value_start = cursor + space as u64 + 1 + equal as u64 + 1;
-                let value_len = (end - 1 - value_start) as usize;
-                // Bound retained metadata independently of the member count.
-                let old = records.get(key).map_or(0, String::len);
-                if key.len() + value_len > MAX_TAR_METADATA_VALUE
-                    || retained.saturating_sub(old) + value_len > MAX_TAR_METADATA_VALUE
-                {
-                    return Ok(None);
-                }
-                let value = reader.read_vec_at(start + value_start, value_len)?;
-                let Ok(value) = String::from_utf8(value) else {
-                    return Ok(None);
-                };
-                retained = retained.saturating_sub(old) + value.len();
-                records.insert(key.to_string(), value);
-            }
-        } else if length <= prefix.len() as u64 {
-            return Ok(None);
-        }
-        cursor = end;
-    }
-    Ok(Some(records))
-}
-
-fn tar_sparse_extension_span(
-    reader: &mut SegmentReader,
-    header: &[u8; 512],
-    header_offset: u64,
-) -> PyResult<Option<(u64, u64)>> {
-    let mut previous_end = 0u64;
-    if !tar_validate_sparse_block(header, 386, 4, &mut previous_end) {
-        return Ok(None);
-    }
-    let mut span = 0u64;
-    let mut extended = header[482] != 0 && header[482] != b'0';
-    while extended {
-        if span >= 512 * 65536 {
-            return Ok(None);
-        }
-        let extension_offset = header_offset
-            .checked_add(512)
-            .and_then(|value| value.checked_add(span))
-            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("TAR sparse offset overflow"))?;
-        let mut extension = [0u8; 512];
-        if reader
-            .read_exact_at(extension_offset, &mut extension)
-            .is_err()
-        {
-            return Ok(None);
-        }
-        if !tar_validate_sparse_block(&extension, 0, 21, &mut previous_end) {
-            return Ok(None);
-        }
-        span += 512;
-        extended = extension[504] != 0 && extension[504] != b'0';
-    }
-    Ok(Some((span, previous_end)))
-}
-
-fn tar_validate_sparse_block(
-    block: &[u8],
-    start: usize,
-    count: usize,
-    previous_end: &mut u64,
-) -> bool {
-    for index in 0..count {
-        let base = start + index * 24;
-        let Some(offset_field) = block.get(base..base + 12) else {
-            return false;
-        };
-        let Some(sparse_offset) = tar_number(offset_field) else {
-            return false;
-        };
-        let Some(length_field) = block.get(base + 12..base + 24) else {
-            return false;
-        };
-        let Some(sparse_length) = tar_number(length_field) else {
-            return false;
-        };
-        if sparse_offset == 0 && sparse_length == 0 {
-            continue;
-        }
-        let Some(end) = sparse_offset.checked_add(sparse_length) else {
-            return false;
-        };
-        if sparse_offset < *previous_end {
-            return false;
-        }
-        *previous_end = end;
-    }
-    true
 }
 
 pub(crate) fn build_segments(source: &Bound<'_, PyDict>) -> PyResult<Vec<Segment>> {

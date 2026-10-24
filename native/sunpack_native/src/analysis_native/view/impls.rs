@@ -736,6 +736,7 @@ impl AnalysisBinaryView {
         let mut cursor = start_offset;
         let mut checked = 0usize;
         let mut zero_blocks = 0usize;
+        let mut tar_state = crate::formats::tar::TarState::default();
         if start_offset.saturating_add(TAR_BLOCK_SIZE as u64) > size {
             let fault = ReadFault::short_read(
                 "read_record",
@@ -861,94 +862,44 @@ impl AnalysisBinaryView {
                 result.set_item("damage_flags", PyList::empty(py))?;
                 return Ok(result);
             }
-            let mut sparse_extension_span = 0u64;
-            if header[156] == b'S' {
-                let mut previous_end = 0u64;
-                let mut extended = header[482] != 0 && header[482] != b'0';
-                if !tar_sparse_map_valid(&header, 386, 4, &mut previous_end) {
-                    result.set_item("error", "invalid_oldgnu_sparse_map")?;
-                    result.set_item("damage_flags", PyList::new(py, ["sparse_header_bad"])?)?;
+            let record = py.detach(|| {
+                tar_state.advance(&header, cursor, size, false, &mut |start, length| {
+                    self.reader
+                        .read_cached_at(start, length)
+                        .map(|data| data.to_vec())
+                })
+            });
+            let next_cursor = match record {
+                Ok(record) => record.next,
+                Err(error) => {
+                    result.set_item("entries_checked", checked)?;
                     result.set_item("plausible", checked > 0)?;
                     result.set_item("entry_walk_ok", checked > 0)?;
+                    if error.kind() == io::ErrorKind::UnexpectedEof {
+                        let payload_start = cursor.saturating_add(TAR_BLOCK_SIZE as u64);
+                        let fault = ReadFault::short_read(
+                            "read_declared_range",
+                            payload_start,
+                            usize::try_from(member_size.saturating_add(tar_padding(member_size)))
+                                .unwrap_or(usize::MAX),
+                            size.saturating_sub(payload_start) as usize,
+                            size,
+                        )
+                        .with_field("tar.member.payload", FieldLocation::Tail);
+                        set_view_read_fault(&result, &fault, "member_payload_out_of_range")?;
+                    } else {
+                        result.set_item("error", error.to_string())?;
+                        let flag = match header[156] {
+                            b'x' | b'g' => "pax_header_bad",
+                            b'L' | b'K' => "gnu_longname_bad",
+                            b'S' => "sparse_header_bad",
+                            _ => "tar_metadata_bad",
+                        };
+                        result.set_item("damage_flags", PyList::new(py, [flag])?)?;
+                    }
                     return Ok(result);
                 }
-                while extended {
-                    if sparse_extension_span >= (TAR_BLOCK_SIZE as u64) * 65536 {
-                        result.set_item("error", "oldgnu_sparse_extension_limit")?;
-                        result.set_item("damage_flags", PyList::new(py, ["sparse_header_bad"])?)?;
-                        result.set_item("plausible", checked > 0)?;
-                        result.set_item("entry_walk_ok", checked > 0)?;
-                        return Ok(result);
-                    }
-                    let extension_offset = cursor
-                        .saturating_add(TAR_BLOCK_SIZE as u64)
-                        .saturating_add(sparse_extension_span);
-                    let extension = match self.read_field_at_bytes_detached(
-                        py,
-                        extension_offset,
-                        TAR_BLOCK_SIZE,
-                        "tar.gnu_sparse.extension",
-                        FieldLocation::Body,
-                    ) {
-                        Ok(data) => data,
-                        Err(fault) => {
-                            set_view_read_fault(
-                                &result,
-                                &fault,
-                                "invalid_oldgnu_sparse_extension",
-                            )?;
-                            result.set_item(
-                                "damage_flags",
-                                PyList::new(py, ["sparse_header_bad"])?,
-                            )?;
-                            return Ok(result);
-                        }
-                    };
-                    if !tar_sparse_map_valid(&extension, 0, 21, &mut previous_end) {
-                        result.set_item("error", "invalid_oldgnu_sparse_extension")?;
-                        result.set_item("damage_flags", PyList::new(py, ["sparse_header_bad"])?)?;
-                        result.set_item("plausible", checked > 0)?;
-                        result.set_item("entry_walk_ok", checked > 0)?;
-                        return Ok(result);
-                    }
-                    sparse_extension_span += TAR_BLOCK_SIZE as u64;
-                    extended = extension[504] != 0 && extension[504] != b'0';
-                }
-                if parse_octal(&header[483..495]).is_some_and(|real_size| previous_end > real_size)
-                {
-                    result.set_item("error", "oldgnu_sparse_extent_out_of_range")?;
-                    result.set_item("damage_flags", PyList::new(py, ["sparse_header_bad"])?)?;
-                    result.set_item("plausible", checked > 0)?;
-                    result.set_item("entry_walk_ok", checked > 0)?;
-                    return Ok(result);
-                }
-            }
-            let payload_start = cursor
-                .saturating_add(TAR_BLOCK_SIZE as u64)
-                .saturating_add(sparse_extension_span);
-            let next_cursor = payload_start
-                .saturating_add(member_size)
-                .saturating_add(tar_padding(member_size));
-            if next_cursor > size {
-                result.set_item("entries_checked", checked)?;
-                let requested = member_size.saturating_add(tar_padding(member_size));
-                let fault = ReadFault::short_read(
-                    "read_declared_range",
-                    payload_start,
-                    usize::try_from(requested).unwrap_or(usize::MAX),
-                    size.saturating_sub(payload_start) as usize,
-                    size,
-                )
-                .with_field("tar.member.payload", FieldLocation::Tail);
-                set_view_read_fault(&result, &fault, "member_payload_out_of_range")?;
-                if checked > 0 {
-                    result.set_item("plausible", true)?;
-                    result.set_item("entry_walk_ok", true)?;
-                    result.set_item("segment_end", py.None())?;
-                    result.set_item("boundary_confidence", "none")?;
-                }
-                return Ok(result);
-            }
+            };
             checked += 1;
             cursor = next_cursor;
             result.set_item(

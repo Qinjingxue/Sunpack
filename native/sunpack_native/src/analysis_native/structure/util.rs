@@ -18,44 +18,13 @@ fn read_vint(data: &[u8], offset: usize) -> Option<(u64, usize)> {
 }
 
 fn parse_octal(field: &[u8]) -> Option<u64> {
-    if field.is_empty() {
-        return None;
-    }
-    if field[0] & 0x80 != 0 {
-        let mut value = (field[0] & 0x7f) as u64;
-        for byte in &field[1..] {
-            value = value.checked_mul(256)?.checked_add(*byte as u64)?;
-        }
-        return Some(value);
-    }
-    let mut value = 0u64;
-    let mut seen_digit = false;
-    for byte in field {
-        match *byte {
-            b'0'..=b'7' => {
-                seen_digit = true;
-                value = value.checked_mul(8)?.checked_add((*byte - b'0') as u64)?;
-            }
-            b'\0' | b' ' => {}
-            _ => return None,
-        }
-    }
-    Some(if seen_digit { value } else { 0 })
+    crate::formats::tar::number(field)
 }
-
 fn tar_checksum(header: &[u8]) -> u64 {
-    header[..148].iter().map(|b| *b as u64).sum::<u64>()
-        + 32 * 8
-        + header[156..].iter().map(|b| *b as u64).sum::<u64>()
+    crate::formats::tar::checksum(header)
 }
-
 fn padding_for_size(size: u64) -> u64 {
-    let remainder = size % TAR_BLOCK_SIZE as u64;
-    if remainder == 0 {
-        0
-    } else {
-        TAR_BLOCK_SIZE as u64 - remainder
-    }
+    crate::formats::tar::padding(size)
 }
 
 fn u16_le(bytes: &[u8], offset: usize) -> u16 {

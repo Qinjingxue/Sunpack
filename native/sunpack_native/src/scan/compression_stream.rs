@@ -1061,6 +1061,19 @@ pub(crate) fn bzip2_header_block_limit(header: &[u8; 4]) -> ValidationResult<usi
     Ok(usize::from(header[3] - b'0') * 100_000)
 }
 
+pub(crate) fn bzip2_marker_is_end(marker: u64) -> ValidationResult<bool> {
+    match marker {
+        0x1772_4538_5090 => Ok(true),
+        0x3141_5926_5359 => Ok(false),
+        _ => invalid("bzip2_block_marker_invalid"),
+    }
+}
+
+pub(crate) fn bzip2_prefix_valid(prefix: &[u8; 10]) -> bool {
+    bzip2_header_block_limit(prefix[..4].try_into().unwrap()).is_ok()
+        && bzip2_marker_is_end(prefix[4..].iter().fold(0, |n, b| (n << 8) | u64::from(*b))).is_ok()
+}
+
 pub(crate) fn validate_bzip2_structure_observed(
     reader: &ManagedReader,
     offset: u64,
@@ -1078,16 +1091,13 @@ pub(crate) fn validate_bzip2_structure_observed(
         let mut combined_crc = 0u32;
         loop {
             let marker = (u64::from(bits.read(24)?) << 24) | u64::from(bits.read(24)?);
-            if marker == 0x1772_4538_5090 {
+            if bzip2_marker_is_end(marker)? {
                 let stored_combined = bits.read(32)?;
                 if stored_combined != combined_crc {
                     return invalid("bzip2_combined_crc_mismatch");
                 }
                 bits.align_zero()?;
                 break;
-            }
-            if marker != 0x3141_5926_5359 {
-                return invalid("bzip2_block_marker_invalid");
             }
             let block_crc = bits.read(32)?;
             combined_crc = combined_crc.rotate_left(1) ^ block_crc;

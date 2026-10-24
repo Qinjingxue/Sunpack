@@ -73,18 +73,21 @@ def _task_source_group(task: ArchiveTask) -> dict[str, Any]:
     }
 
 
+def new_work_broker(config: dict) -> AsyncWorkBroker:
+    worker = _worker_config(config)
+    return AsyncWorkBroker(
+        thread_capacity=int(worker.get("stage_thread_capacity", 0) or 0),
+        max_pending_jobs=int(worker.get("max_pending_stage_jobs", worker.get("max_queue_jobs", 4096)) or 4096),
+    )
+
+
 class PipelineEngine:
     """Single-event-loop owner for independently completing requests."""
 
-    def __init__(self, config: dict):
+    def __init__(self, config: dict, *, work_broker: AsyncWorkBroker | None = None):
         self.config = config
-        worker_config = _worker_config(config)
-        self._broker = AsyncWorkBroker(
-            thread_capacity=int(worker_config.get("stage_thread_capacity", 0) or 0),
-            max_pending_jobs=int(
-                worker_config.get("max_pending_stage_jobs", worker_config.get("max_queue_jobs", 4096)) or 4096
-            ),
-        )
+        # A supplied broker transfers ownership from the cold CLI runtime.
+        self._broker = work_broker or new_work_broker(config)
         self._services = _PipelineServices(config, self._broker)
         self._runtime = self._services
         self._active_requests: dict[str, asyncio.Task] = {}
@@ -1291,7 +1294,8 @@ class _RequestRuntime:
             from sunpack.pipeline.coordinator.scan_session import DiscoveryScanSession
             scan_session = DiscoveryScanSession(config=scanner.config, scopes=DiscoveryScope.for_targets(roots, recursive=self.submission.recursive),
                                                 scope=self.submission.discovery_scope, catalog=self.submission.catalog)
-        self.reporter.scan_started(depth)
+        await broker.run("report", "", self.reporter.scan_started, depth,
+                         request_id=self.submission.request_id, cancellation=cancellation)
         discovered = await broker.run(
             "discover_detect",
             self.submission.request_id,
@@ -1363,7 +1367,8 @@ class _RequestRuntime:
         # This registration is deliberately only a source-cleanup lifetime
         # guard. It never gates planning, extraction, verification or recursion.
         self.source_cleanup.register(tasks)
-        self.reporter.tasks_discovered(depth, tasks, direct=direct)
+        await broker.run("report", "", self.reporter.tasks_discovered, depth, tasks, direct=direct,
+                         request_id=self.submission.request_id, cancellation=cancellation)
 
         if self.submission.origin == "watch" and tasks:
             claimed_sources = tuple(dict.fromkeys(
@@ -1841,7 +1846,8 @@ class _RequestRuntime:
                     result.output_dir, "flatten", "failed", message="; ".join(result.errors),
                 ))
         if result.source_dir:
-            self.reporter.relocate_outputs(result)
+            await broker.run("report", "", self.reporter.relocate_outputs, result,
+                             request_id=self.submission.request_id, cancellation=cancellation)
         return result
 
     async def _ensure_task_lease(self, task, *, depth: int = 1) -> None:

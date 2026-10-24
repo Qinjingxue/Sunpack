@@ -11,6 +11,26 @@ import zstandard
 from sunpack_native import inspect_compression_stream_structure, inspect_tar_header_structure
 
 
+def test_dense_false_headers_preserve_empty_and_nonempty_bzip2_peers(tmp_path):
+    # This is discovery correctness, not a speed assertion: filtering noisy
+    # prefixes must retain both legal first-marker kinds and later real peers.
+    # Ordinary bzip2 fixtures contain no noise or empty streams to catch that.
+    from sunpack_native import scan_embedded_archives
+
+    data = bytearray(b"BZh1" * 20000)
+    expected = []
+    for payload in (b"", b"real payload"):
+        expected.append(len(data))
+        data.extend(bz2.compress(payload))
+        data.extend(b"invalid gap")
+    path = tmp_path / "disguised.bin"
+    path.write_bytes(data)
+    result = scan_embedded_archives(str(path))
+    assert result["complete"]
+    assert [candidate["offset"] for candidate in result["candidates"]
+            if candidate["format"] == "bzip2"] == expected
+
+
 def _tar(name: str) -> bytes:
     buffer = io.BytesIO()
     with tarfile.open(fileobj=buffer, mode="w", format=tarfile.USTAR_FORMAT) as archive:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import functools
 import heapq
 import os
@@ -40,6 +41,7 @@ class _WorkItem(Generic[T]):
     future: asyncio.Future[T]
     token: CancellationToken
     sequence: int
+    execution_context: contextvars.Context = field(default_factory=contextvars.copy_context)
 
 
 class _StageWorkQueue:
@@ -362,6 +364,10 @@ class AsyncWorkBroker:
 
     @staticmethod
     def _execute(item: _WorkItem[T]) -> T:
+        return item.execution_context.run(AsyncWorkBroker._execute_in_context, item)
+
+    @staticmethod
+    def _execute_in_context(item: _WorkItem[T]) -> T:
         item.token.raise_if_cancelled()
         marker = CURRENT_WORK.set(item.context)
         try:

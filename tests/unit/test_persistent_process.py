@@ -185,6 +185,100 @@ def test_connection_stream_preserves_client_tty_capability():
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("disconnect", [False, True])
+def test_large_unicode_stream_backpressure_and_disconnect(monkeypatch, disconnect):
+    # Small frame tests miss oversized writes, split UTF-8 and producers parked
+    # behind a slow/disconnected client. One real stream covers all three;
+    # disconnect must release its producer without polling or leaked callbacks.
+    from sunpack.pipeline.coordinator.async_work import AsyncWorkBroker
+
+    text = "压缩😀" * 1_800_000  # One legal write exceeds the 16 MiB frame limit.
+
+    async def scenario():
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        class SlowWriter(_AsyncWriter):
+            async def drain(self):
+                entered.set()
+                await release.wait()
+
+        writer = SlowWriter()
+        connection = persistent_process._StreamRequestConnection(asyncio.StreamReader(), writer)
+        await connection.start()
+        queue = connection.output_queue
+        stream = persistent_process._AsyncConnectionTextStream(asyncio.get_running_loop(), queue, 1)
+        broker = AsyncWorkBroker()
+        producer = asyncio.create_task(broker.run("cli_output", "", stream.write, text))
+        try:
+            await asyncio.wait_for(entered.wait(), 2)
+            assert not producer.done()
+            assert queue.buffered_bytes <= queue.max_bytes
+            if disconnect:
+                queue.close()
+                connection._output_task.cancel()
+                await asyncio.gather(connection._output_task, return_exceptions=True)
+            else:
+                release.set()
+            assert await asyncio.wait_for(producer, 4) == len(text)
+            if not disconnect:
+                await connection.flush_output()
+                await connection.send_frame(struct.pack("!BIi", 0, 4, 0))
+                await connection.close()
+            assert queue.empty()
+            assert queue.buffered_bytes == 0
+            return bytes(writer.wire)
+        finally:
+            release.set()
+            queue.close()
+            await broker.close()
+
+    wire = asyncio.run(scenario())
+    if not disconnect:
+        class Connection:
+            def __init__(self):
+                self.data = io.BytesIO(wire)
+
+            def recv(self, size):
+                return self.data.read(size)
+
+        output = io.StringIO()
+        monkeypatch.setattr(persistent_process.sys, "stdout", output)
+        assert persistent_process._recv_stream(Connection())["exit_code"] == 0
+        assert output.getvalue() == text
+
+
+def test_progress_never_waits_for_a_reporter_parked_on_output():
+    # A bounded queue alone deadlocks if native progress on the loop acquires a
+    # lock held by a blocked report writer. Ordinary stream tests use no shared
+    # reporter, so this is independent lifecycle coverage at negligible cost.
+    from types import SimpleNamespace
+    from sunpack.pipeline.coordinator.reporting import RunReporter
+
+    async def scenario():
+        held = asyncio.Event()
+        release = threading.Event()
+        reporter = RunReporter(stdout=io.StringIO())
+        task = SimpleNamespace(main_path="archive.bin", logical_name="archive.bin")
+        reporter.tasks_discovered(1, [task])
+        loop = asyncio.get_running_loop()
+
+        def report_thread():
+            with reporter._lock:
+                loop.call_soon_threadsafe(held.set)
+                assert release.wait(2), "progress blocked the loop behind the report lock"
+
+        writer = asyncio.create_task(asyncio.to_thread(report_thread))
+        try:
+            await held.wait()
+            reporter.task_progress(task, {"type": "progress", "completed_bytes": 1, "total_bytes": 2})
+        finally:
+            release.set()
+            await writer
+
+    asyncio.run(scenario())
+
+
 def test_streaming_request_strips_terminal_columns_metadata(monkeypatch):
     from sunpack.runtime.cli import cli
 
@@ -778,6 +872,7 @@ def test_persistent_runtime_reuses_engine_for_request_only_config(monkeypatch):
     callbacks = []
 
     class FakeEngine:
+        work_broker = None
         def __init__(self, config):
             self.config = config
             events.append(("init", config["output"]["root"]))
@@ -879,6 +974,7 @@ def test_persistent_runtime_interrupted_initialization_releases_owner(monkeypatc
         created = []
 
         class FakeEngine:
+            work_broker = None
             def __init__(self, config):
                 self.closed = False
                 self.callback = None

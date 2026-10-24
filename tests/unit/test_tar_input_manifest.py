@@ -154,12 +154,19 @@ def test_truncated_manifest_view_keeps_full_unpacked_size(tmp_path):
 
 
 def test_tar_manifest_counts_all_files_beyond_retained_entry_limit(tmp_path):
+    # This cap test also exercises metadata after retention and PAX records
+    # split across physical parts; ordinary member-count tests miss both.
+    from sunpack_native import archive_state_tar_manifest_native
+
     path = tmp_path / "capped.tar"
-    with tarfile.open(path, "w", format=tarfile.USTAR_FORMAT) as archive:
-        for index in range(12):
-            info = tarfile.TarInfo(f"item-{index:03d}.bin")
-            info.size = 2
-            archive.addfile(info, io.BytesIO(b"ab"))
+    body = bytearray()
+    for index in range(12):
+        info = tarfile.TarInfo(f"item-{index:03d}.bin")
+        info.size = 4096 if index % 2 else 0
+        info.pax_headers = {"size": "2"}
+        body.extend(info.tobuf(format=tarfile.PAX_FORMAT) + b"ab" + bytes(510))
+    body.extend(bytes(1024))
+    path.write_bytes(body)
 
     manifest = archive_input_manifest(_input(path), max_items=5)
 
@@ -167,3 +174,14 @@ def test_tar_manifest_counts_all_files_beyond_retained_entry_limit(tmp_path):
     assert manifest.retained_file_count == 5
     assert manifest.entries_truncated is True
     assert manifest.total_unpacked_size == 24
+
+    first, second = tmp_path / "part.001", tmp_path / "part.002"
+    first.write_bytes(body[:517])
+    second.write_bytes(body[517:])
+    source = {"entry_path": str(first), "parts": [{"path": str(first)}, {"path": str(second)}]}
+    joined = archive_state_tar_manifest_native(source, max_items=5)
+    assert joined.archive_walk_complete
+    assert (joined.file_count, joined.total_unpacked_size) == (12, 24)
+    assert joined.entry_page(0, 10) == manifest.entries.entry_page(0, 10)
+    incomplete = archive_state_tar_manifest_native({"entry_path": str(first)}, max_items=5)
+    assert not incomplete.archive_walk_complete

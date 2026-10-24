@@ -4,6 +4,49 @@ from sunpack.core.i18n.context import validate_catalog
 import pytest
 
 
+def test_sync_command_and_json_output_leave_the_runtime_loop_available(monkeypatch):
+    # Existing command tests check values, not shared-loop liveness. Both the
+    # blocking handler and serialization must admit callbacks; one tiny request
+    # catches the whole class without a timing-sensitive scan benchmark.
+    import asyncio
+    import io
+    import threading
+    import contextvars
+    from sunpack.runtime.cli import cli
+    from sunpack.runtime.cli.commands import scan
+    from sunpack.runtime.cli.cli_types import CliCommandResult
+    request_context = contextvars.ContextVar("cli_test_request")
+
+    async def scenario():
+        request_context.set("this request")
+        loop = asyncio.get_running_loop()
+        loop_thread = threading.get_ident()
+
+        def check_loop():
+            assert threading.get_ident() != loop_thread
+            ready = threading.Event()
+            loop.call_soon_threadsafe(ready.set)
+            assert ready.wait(2), "CLI work blocked the runtime loop"
+
+        def handle(_args, _ctx):
+            check_loop()
+            assert request_context.get() == "this request"
+            return 0, CliCommandResult("scan", {}, {}, items=[{"all_parts": ["路径😀"] * 300}])
+
+        class Output(io.StringIO):
+            def write(self, text):
+                check_loop()
+                return super().write(text)
+
+        monkeypatch.setattr(scan, "handle", handle)
+        monkeypatch.setattr(cli, "_should_submit_to_persistent_server", lambda _: False)
+        output = Output()
+        assert await cli.async_main(["scan", ".", "--json"], stdout=output, stderr=io.StringIO()) == 0
+        assert '"all_parts"' in output.getvalue()
+
+    asyncio.run(scenario())
+
+
 def test_i18n_catalogs_have_matching_keys_and_placeholders():
     validate_catalog()
 

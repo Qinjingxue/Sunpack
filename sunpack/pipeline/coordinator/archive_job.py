@@ -213,7 +213,8 @@ class ArchiveJobExecutor:
             task.runtime["volume_retry_attempted"] = True
         if terminal is not None:
             terminal.planned_out_dir = planned_out_dir
-            self._report_task_finished(task, terminal, depth)
+            await broker.run("report", file_id, self._report_task_finished, task, terminal, depth,
+                             request_id=self.request_id, cancellation=cancellation)
             return task, terminal
 
         if self.output_reservations is not None and self.output_reservations.watch_outputs is not None:
@@ -248,7 +249,8 @@ class ArchiveJobExecutor:
             if done:
                 outcome = value
                 outcome.planned_out_dir = planned_out_dir
-                self._report_task_finished(task, outcome, depth)
+                await broker.run("report", file_id, self._report_task_finished, task, outcome, depth,
+                                 request_id=self.request_id, cancellation=cancellation)
                 return task, outcome
             request = value
             first = False
