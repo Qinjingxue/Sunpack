@@ -272,37 +272,35 @@ impl AnalysisBinaryView {
         let mut zip64_locator_present = false;
         let mut zip64_eocd_offset = 0u64;
         let mut zip64_declared_total_disks = 1u32;
-        if eocd_offset >= (ZIP64_EOCD_RECORD_SIZE + ZIP64_EOCD_LOCATOR_SIZE) as u64 {
-            let block_offset =
-                eocd_offset - (ZIP64_EOCD_RECORD_SIZE + ZIP64_EOCD_LOCATOR_SIZE) as u64;
-            if let Ok(block) = self.read_field_at_bytes_detached(
-                py,
-                block_offset,
-                ZIP64_EOCD_RECORD_SIZE + ZIP64_EOCD_LOCATOR_SIZE,
-                "zip.zip64_eocd_tail",
-                FieldLocation::Tail,
-            ) {
-                let parsed = match crate::formats::zip::zip64::parse_fixed_tail(block.as_slice()) {
-                    Ok(parsed) => parsed,
-                    Err(error) => {
-                        result.set_item("zip64", true)?;
-                        result.set_item("error", error)?;
-                        return Ok(result.unbind());
-                    }
-                };
-                if let Some((record, locator)) = parsed {
-                    zip64_present = true;
-                    zip64_locator_present = true;
-                    zip64_eocd_offset = block_offset;
-                    zip64_declared_total_disks = locator.total_disks;
-                    effective_disk_number = u64::from(record.disk);
-                    effective_central_directory_disk = u64::from(record.cd_disk);
-                    effective_disk_entries = record.disk_entries;
-                    effective_total_entries = record.total_entries;
-                    effective_central_directory_size = record.cd_size;
-                    effective_central_directory_offset = record.cd_offset;
-                    directory_end = block_offset;
-                }
+        let zip64 = py.detach(|| {
+            crate::formats::zip::zip64::locate_end_record(
+                eocd_offset,
+                disk_starts,
+                |offset, size| self.reader.read_at(offset, size),
+            )
+        });
+        match zip64 {
+            Ok(Some(found)) => {
+                zip64_present = true;
+                zip64_locator_present = true;
+                zip64_eocd_offset = found.offset;
+                zip64_declared_total_disks = found.locator.total_disks;
+                effective_disk_number = u64::from(found.record.disk);
+                effective_central_directory_disk = u64::from(found.record.cd_disk);
+                effective_disk_entries = found.record.disk_entries;
+                effective_total_entries = found.record.total_entries;
+                effective_central_directory_size = found.record.cd_size;
+                effective_central_directory_offset = found.record.cd_offset;
+                directory_end = found.offset;
+            }
+            Ok(None) => {}
+            Err(crate::formats::zip::zip64::LocateError::Invalid(error)) => {
+                result.set_item("zip64", true)?;
+                result.set_item("error", error)?;
+                return Ok(result.unbind());
+            }
+            Err(crate::formats::zip::zip64::LocateError::Read(error)) => {
+                return Err(reader_error_to_py(error));
             }
         }
         result.set_item("segment_end", segment_end)?;
@@ -467,17 +465,25 @@ impl AnalysisBinaryView {
             return Ok(result.unbind());
         }
         result.set_item("central_directory_present", true)?;
-        let (entries_checked, cd_ok, links_checked, links_ok, encrypted_entries, error) = py
-            .detach(|| {
-                self.walk_zip_central_directory(
-                    archive_offset,
-                    physical_central_offset,
-                    effective_central_directory_size,
-                    effective_total_entries as usize,
-                    max_cd_entries_to_walk,
-                    disk_starts.filter(|_| is_multi_disk),
-                )
-            })?;
+        let walk = py.detach(|| {
+            self.walk_zip_central_directory(
+                archive_offset,
+                physical_central_offset,
+                effective_central_directory_size,
+                effective_total_entries as usize,
+                max_cd_entries_to_walk,
+                disk_starts.filter(|_| is_multi_disk),
+            )
+        })?;
+        let ZipDirectoryWalk {
+            entries_checked,
+            directory_ok: cd_ok,
+            links_checked,
+            links_ok,
+            encrypted_entries,
+            error,
+            content_warning,
+        } = walk;
         result.set_item("central_directory_entries_checked", entries_checked)?;
         result.set_item("central_directory_encrypted_entries", encrypted_entries)?;
         result.set_item("central_directory_walk_ok", cd_ok)?;
@@ -499,18 +505,7 @@ impl AnalysisBinaryView {
         )?;
         if error.is_empty() {
             result.set_item("plausible", true)?;
-            result.set_item(
-                "content_integrity_warning",
-                py.detach(|| {
-                    self.zip_content_integrity_warning(
-                        archive_offset,
-                        physical_central_offset,
-                        effective_total_entries as usize,
-                        max_cd_entries_to_walk,
-                        disk_starts.filter(|_| is_multi_disk),
-                    )
-                })?,
-            )?;
+            result.set_item("content_integrity_warning", content_warning)?;
             let evidence = PyList::empty(py);
             evidence.append("zip:eocd")?;
             evidence.append("zip:central_directory")?;
@@ -554,150 +549,73 @@ impl AnalysisBinaryView {
         total_entries: usize,
         max_entries: usize,
         disk_starts: Option<&[u64]>,
-    ) -> PyResult<(usize, bool, usize, bool, usize, &'static str)> {
+    ) -> PyResult<ZipDirectoryWalk> {
         let mut cursor = physical_central_offset;
         let end = physical_central_offset + central_directory_size;
         let limit = total_entries.min(max_entries);
-        let mut links_checked = 0usize;
-        let mut encrypted_entries = 0usize;
+        let mut walk = ZipDirectoryWalk::default();
         for index in 0..limit {
-            if cursor + 46 > end {
-                return Ok((
-                    index,
-                    false,
-                    links_checked,
-                    false,
-                    encrypted_entries,
-                    "central_directory_entry_out_of_range",
-                ));
+            if cursor.saturating_add(46) > end {
+                return Ok(walk.failed(index, false, "central_directory_entry_out_of_range"));
             }
             let header = self.read_at_bytes(cursor, 46)?;
             if header.len() < 46 || &header[0..4] != ZIP_CENTRAL {
-                return Ok((
-                    index,
-                    false,
-                    links_checked,
-                    false,
-                    encrypted_entries,
-                    "bad_central_directory_entry_signature",
-                ));
+                return Ok(walk.failed(index, false, "bad_central_directory_entry_signature"));
             }
             if u16_le(&header, 8) & 0x0001 != 0 {
-                encrypted_entries += 1;
+                walk.encrypted_entries += 1;
             }
             let filename_len = u16_le(&header, 28) as u64;
-            let extra_len = u16_le(&header, 30) as u64;
+            let extra_len = u16_le(&header, 30) as usize;
             let comment_len = u16_le(&header, 32) as u64;
-            let entry_size = 46 + filename_len + extra_len + comment_len;
-            if cursor + entry_size > end {
-                return Ok((
+            let entry_size = 46 + filename_len + extra_len as u64 + comment_len;
+            if cursor.saturating_add(entry_size) > end {
+                return Ok(walk.failed(
                     index,
                     false,
-                    links_checked,
-                    false,
-                    encrypted_entries,
                     "central_directory_variable_fields_out_of_range",
                 ));
             }
-            let extra = self.read_at_bytes(
-                cursor + 46 + filename_len,
-                usize::try_from(extra_len).unwrap_or(usize::MAX),
-            )?;
-            let Some((local_header_offset, disk_start)) =
-                resolve_zip64_central_location(&header, &extra)
+            let extra = if extra_len == 0 {
+                Vec::new()
+            } else {
+                self.read_at_bytes(cursor + 46 + filename_len, extra_len)?
+            };
+            let Some(location) = crate::formats::zip::zip64::central_entry_values(&header, &extra)
             else {
-                return Ok((
-                    index + 1,
-                    true,
-                    links_checked,
-                    false,
-                    encrypted_entries,
-                    "zip64_extra_missing_or_invalid",
-                ));
+                return Ok(walk.failed(index + 1, true, "zip64_extra_missing_or_invalid"));
             };
             let local_logical = if let Some(starts) = disk_starts {
-                self.zip_logical_offset_for_disk(starts, disk_start, local_header_offset)
+                self.zip_logical_offset_for_disk(starts, location.disk, location.local_offset)
             } else {
-                archive_offset.checked_add(local_header_offset)
+                archive_offset.checked_add(location.local_offset)
             };
             let Some(local_logical) = local_logical else {
-                return Ok((
-                    index + 1,
-                    true,
-                    links_checked,
-                    false,
-                    encrypted_entries,
-                    "local_header_link_mismatch",
-                ));
+                return Ok(walk.failed(index + 1, true, "local_header_link_mismatch"));
             };
-            if links_checked < max_entries {
-                let local_sig = self.read_at_bytes(local_logical, 4)?;
-                if local_sig.len() < 4 || local_sig.as_slice() != ZIP_LOCAL {
-                    return Ok((
-                        index + 1,
-                        true,
-                        links_checked,
-                        false,
-                        encrypted_entries,
-                        "local_header_link_mismatch",
-                    ));
-                }
-                links_checked += 1;
+            // Fetch once for both link validation and the existing bounded CRC
+            // consistency hint. Later entries only need their four-byte signature.
+            let check_crc = index < 8 && walk.content_warning.is_empty();
+            let local = self.read_at_bytes(local_logical, if check_crc { 30 } else { 4 })?;
+            if local.len() < 4 || &local[..4] != ZIP_LOCAL {
+                return Ok(walk.failed(index + 1, true, "local_header_link_mismatch"));
+            }
+            walk.links_checked += 1;
+            if check_crc && local.len() >= 30 {
+                walk.content_warning = if u16_le(&local, 6) & 0x0008 != 0 {
+                    "data_descriptor_or_deferred_crc"
+                } else if u32_le(&local, 14) != u32_le(&header, 16) {
+                    "local_header_crc_mismatch"
+                } else {
+                    ""
+                };
             }
             cursor += entry_size;
         }
-        Ok((limit, true, links_checked, true, encrypted_entries, ""))
-    }
-
-    fn zip_content_integrity_warning(
-        &self,
-        archive_offset: u64,
-        physical_central_offset: u64,
-        total_entries: usize,
-        max_entries: usize,
-        disk_starts: Option<&[u64]>,
-    ) -> PyResult<&'static str> {
-        let mut cursor = physical_central_offset;
-        for _ in 0..total_entries.min(max_entries).min(8) {
-            let header = self.read_at_bytes(cursor, 46)?;
-            if header.len() < 46 || &header[0..4] != ZIP_CENTRAL {
-                return Ok("");
-            }
-            let cd_crc = u32_le(&header, 16);
-            let filename_len = u16_le(&header, 28) as u64;
-            let extra_len = u16_le(&header, 30) as u64;
-            let comment_len = u16_le(&header, 32) as u64;
-            let extra = self.read_at_bytes(
-                cursor + 46 + filename_len,
-                usize::try_from(extra_len).unwrap_or(usize::MAX),
-            )?;
-            let Some((local_header_offset, disk_start)) =
-                resolve_zip64_central_location(&header, &extra)
-            else {
-                return Ok("");
-            };
-            let local_logical = if let Some(starts) = disk_starts {
-                self.zip_logical_offset_for_disk(starts, disk_start, local_header_offset)
-            } else {
-                archive_offset.checked_add(local_header_offset)
-            };
-            let Some(local_logical) = local_logical else {
-                return Ok("");
-            };
-            let local = self.read_at_bytes(local_logical, 30)?;
-            if local.len() >= 30 && &local[0..4] == ZIP_LOCAL {
-                let flags = u16_le(&local, 6);
-                let local_crc = u32_le(&local, 14);
-                if flags & 0x0008 != 0 {
-                    return Ok("data_descriptor_or_deferred_crc");
-                }
-                if local_crc != cd_crc {
-                    return Ok("local_header_crc_mismatch");
-                }
-            }
-            cursor += 46 + filename_len + extra_len + comment_len;
-        }
-        Ok("")
+        walk.entries_checked = limit;
+        walk.directory_ok = true;
+        walk.links_ok = true;
+        Ok(walk)
     }
 
     fn walk_tar<'py>(
@@ -1195,55 +1113,23 @@ fn set_zip_eocd_candidate(
     Ok(())
 }
 
-fn resolve_zip64_central_location(header: &[u8], extra: &[u8]) -> Option<(u64, u64)> {
-    if header.len() < 46 {
-        return None;
-    }
-    let uncompressed_sentinel = u32_le(header, 24) == u32::MAX;
-    let compressed_sentinel = u32_le(header, 20) == u32::MAX;
-    let local_sentinel = u32_le(header, 42) == u32::MAX;
-    let disk_sentinel = u16_le(header, 34) == u16::MAX;
-    let mut local_header_offset = u32_le(header, 42) as u64;
-    let mut disk_start = u16_le(header, 34) as u64;
-    if !local_sentinel && !disk_sentinel {
-        return Some((local_header_offset, disk_start));
-    }
+/// Results of the single bounded directory walk, shared by all ZIP projections.
+#[derive(Default)]
+struct ZipDirectoryWalk {
+    entries_checked: usize,
+    directory_ok: bool,
+    links_checked: usize,
+    links_ok: bool,
+    encrypted_entries: usize,
+    error: &'static str,
+    content_warning: &'static str,
+}
 
-    let mut cursor = 0usize;
-    let mut payload = None;
-    while cursor.checked_add(4)? <= extra.len() {
-        let field_id = u16_le(extra, cursor);
-        let field_size = u16_le(extra, cursor + 2) as usize;
-        cursor += 4;
-        let end = cursor.checked_add(field_size)?;
-        if end > extra.len() {
-            return None;
-        }
-        if field_id == 0x0001 {
-            payload = Some(&extra[cursor..end]);
-            break;
-        }
-        cursor = end;
+impl ZipDirectoryWalk {
+    fn failed(mut self, checked: usize, directory_ok: bool, error: &'static str) -> Self {
+        self.entries_checked = checked;
+        self.directory_ok = directory_ok;
+        self.error = error;
+        self
     }
-    let payload = payload?;
-    let mut pos = 0usize;
-    for (needed, width, target) in [
-        (uncompressed_sentinel, 8usize, 0u8),
-        (compressed_sentinel, 8usize, 1u8),
-        (local_sentinel, 8usize, 2u8),
-        (disk_sentinel, 4usize, 3u8),
-    ] {
-        if !needed {
-            continue;
-        }
-        let end = pos.checked_add(width)?;
-        let bytes = payload.get(pos..end)?;
-        match target {
-            2 => local_header_offset = u64::from_le_bytes(bytes.try_into().ok()?),
-            3 => disk_start = u32::from_le_bytes(bytes.try_into().ok()?) as u64,
-            _ => {}
-        }
-        pos = end;
-    }
-    Some((local_header_offset, disk_start))
 }

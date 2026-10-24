@@ -40,19 +40,13 @@ struct ResolvedCentralDirectory {
     declared_size: usize,
     total_entries: u64,
     disk_entries: u64,
+    zip64: Option<zip64::LocatedEndRecord>,
 }
 
 /// Resolve the central-directory location from the EOCD, honouring ZIP64.
 ///
-/// Per APPNOTE 4.3.14/4.3.15 a ZIP64 archive places the Zip64 end of central
-/// directory record (56 bytes, size field 44) and its 20-byte locator between
-/// the central directory and the plain EOCD.  When that 76-byte block is
-/// present, the 8-byte fields in the Zip64 record are authoritative and the
-/// central directory ends where the Zip64 record starts, not at the EOCD.
-/// Otherwise the plain EOCD fields are used and the directory ends at the
-/// EOCD.  When the naive `directory_end - cd_size` position does not carry a
-/// central-directory signature but the declared offset does, the declared
-/// offset wins (SFX/junk tolerance), mirroring inspect.rs.
+/// ZIP64 record geometry is resolved by the shared locator used by file and
+/// multi-volume analysis. Prefix shifts are inferred from the physical directory.
 fn resolve_central_directory(
     data: &[u8],
     eocd: &EocdInfo,
@@ -62,16 +56,20 @@ fn resolve_central_directory(
     let mut total_entries = u64::from(eocd.total_entries);
     let mut disk_entries = u64::from(eocd.disk_entries);
     let mut directory_end = eocd.offset as u64;
-    if eocd.offset >= 76 {
-        let block_start = eocd.offset - 76;
-        let block = &data[block_start..eocd.offset];
-        if let Some((record, _)) = zip64::parse_fixed_tail(block)? {
-            declared_offset = record.cd_offset;
-            declared_size = record.cd_size;
-            total_entries = record.total_entries;
-            disk_entries = record.disk_entries;
-            directory_end = block_start as u64;
-        }
+    let zip64 = zip64::locate_end_record(eocd.offset as u64, None, |offset, size| {
+        let start = usize::try_from(offset).unwrap_or(usize::MAX);
+        Ok(data
+            .get(start..start.saturating_add(size))
+            .unwrap_or_default()
+            .to_vec())
+    })
+    .map_err(|error| error.code())?;
+    if let Some(found) = zip64 {
+        declared_offset = found.record.cd_offset;
+        declared_size = found.record.cd_size;
+        total_entries = found.record.total_entries;
+        disk_entries = found.record.disk_entries;
+        directory_end = found.offset;
     }
     let naive = usize::try_from(directory_end.saturating_sub(declared_size))
         .map_err(|_| "central_directory_size_out_of_range")?;
@@ -98,6 +96,7 @@ fn resolve_central_directory(
         declared_size,
         total_entries,
         disk_entries,
+        zip64,
     })
 }
 

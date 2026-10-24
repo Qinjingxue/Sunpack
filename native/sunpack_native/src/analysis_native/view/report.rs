@@ -332,7 +332,7 @@ struct ReportContext<'a, 'py> {
     // validation; a logical multi-volume stream is header-validated.
     stream_path: Option<&'a str>,
     prepass: Bound<'py, PyDict>,
-    hits: Vec<ReportSignatureHit>,
+    hits: Arc<[SignatureHit]>,
     embedded: HashMap<String, Vec<Bound<'py, PyDict>>>,
     stream_structure: Option<Option<Bound<'py, PyDict>>>,
 }
@@ -352,15 +352,7 @@ impl AnalysisBinaryView {
         self.ensure_open()?;
         let (prepass, hits) = match initial_prepass {
             Some(prepass) if !prepass.is_empty() => {
-                let mut hits = Vec::new();
-                for hit in prepass_dicts(prepass, "hits")? {
-                    if let Some(kind) = ReportHitKind::from_name(&str_of(&hit, "name")?) {
-                        hits.push(ReportSignatureHit {
-                            kind,
-                            offset: u64_of(&hit, "offset")?,
-                        });
-                    }
-                }
+                let hits = signature_hits_from_prepass(prepass)?;
                 (prepass.copy()?, hits)
             }
             _ if (signature_prepass || format_structure) && config.prepass_enabled => {
@@ -369,17 +361,10 @@ impl AnalysisBinaryView {
                         signature_prepass_native(&self.reader, config.head_bytes, config.tail_bytes)
                     })
                     .map_err(reader_error_to_py)?;
-                let hits = data
-                    .hits
-                    .iter()
-                    .filter_map(|&(name, offset)| {
-                        ReportHitKind::from_name(name)
-                            .map(|kind| ReportSignatureHit { kind, offset })
-                    })
-                    .collect();
+                let hits = Arc::clone(&data.hits);
                 (signature_prepass_to_python(py, data)?.into_bound(py), hits)
             }
-            _ => (PyDict::new(py), Vec::new()),
+            _ => (PyDict::new(py), Arc::from([])),
         };
         let mut embedded: HashMap<String, Vec<Bound<'py, PyDict>>> = HashMap::new();
         for item in prepass_dicts(&prepass, "embedded_candidates")? {
@@ -497,8 +482,17 @@ impl<'a, 'py> ReportContext<'a, 'py> {
         }
     }
 
-    fn hits(&self, matches: impl Fn(ReportHitKind) -> bool) -> Vec<&ReportSignatureHit> {
-        self.hits.iter().filter(|hit| matches(hit.kind)).collect()
+    fn hits(&self, matches: impl Fn(ReportHitKind) -> bool) -> Vec<ReportSignatureHit> {
+        self.hits
+            .iter()
+            .filter_map(|hit| {
+                let kind = ReportHitKind::from_name(hit.name())?;
+                matches(kind).then(|| ReportSignatureHit {
+                    kind,
+                    offset: hit.offset(),
+                })
+            })
+            .collect()
     }
 
     fn embedded(&self, format: &str, logical_only: bool) -> PyResult<Vec<Bound<'py, PyDict>>> {
@@ -1521,7 +1515,7 @@ fn zip_from_embedded<'py>(py: Python<'py>, item: &Bound<'py, PyDict>) -> PyResul
 
 fn zip_from_native<'py>(
     native: Bound<'py, PyDict>,
-    hits: &[&ReportSignatureHit],
+    hits: &[ReportSignatureHit],
     view_size: u64,
 ) -> PyResult<Evidence<'py>> {
     let magic_matched = truthy(&native, "magic_matched")?;
@@ -1601,7 +1595,7 @@ fn zip_from_native<'py>(
 
 fn zip_local_header_recovery<'py>(
     native: &Bound<'py, PyDict>,
-    hits: &[&ReportSignatureHit],
+    hits: &[ReportSignatureHit],
     earliest_local: &mut Option<Option<u64>>,
 ) -> PyResult<Option<Evidence<'py>>> {
     if !ZIP_LOCAL_RECOVERY_ERRORS.contains(&str_of(native, "error")?.as_str()) {

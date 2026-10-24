@@ -128,33 +128,28 @@ pub(crate) fn inspect_zip_eocd_structure(
     let mut zip64_eocd_present = false;
     let mut zip64_eocd_offset = 0u64;
     let mut zip64_declared_total_disks = 1u32;
-    let tail_offset = file_size - read_size;
-    if eocd_offset >= (ZIP64_EOCD_RECORD_SIZE + ZIP64_EOCD_LOCATOR_SIZE) as u64 {
-        let tail_index = eocd_offset.saturating_sub(tail_offset) as usize;
-        let block_len = ZIP64_EOCD_RECORD_SIZE + ZIP64_EOCD_LOCATOR_SIZE;
-        if tail_index >= block_len && tail_index + ZIP_EOCD_MIN_SIZE <= tail.len() {
-            let block = &tail[tail_index - block_len..tail_index];
-            let parsed = match crate::formats::zip::zip64::parse_fixed_tail(block) {
-                Ok(parsed) => parsed,
-                Err(error) => {
-                    result.set_item("magic_matched", true)?;
-                    result.set_item("zip64_eocd_present", true)?;
-                    result.set_item("error", error)?;
-                    return Ok(result.unbind());
-                }
-            };
-            if let Some((record, locator)) = parsed {
-                zip64_eocd_present = true;
-                zip64_eocd_offset = eocd_offset - block_len as u64;
-                zip64_declared_total_disks = locator.total_disks;
-                effective_disk_number = u64::from(record.disk);
-                effective_central_directory_disk = u64::from(record.cd_disk);
-                effective_disk_entries = record.disk_entries;
-                effective_total_entries = record.total_entries;
-                effective_central_directory_size = record.cd_size;
-                effective_central_directory_offset = record.cd_offset;
-                directory_end = eocd_offset - block_len as u64;
-            }
+    match py.detach(|| {
+        crate::formats::zip::zip64::locate_end_record(eocd_offset, None, |offset, size| {
+            reader.read_at(offset, size)
+        })
+    }) {
+        Ok(Some(found)) => {
+            zip64_eocd_present = true;
+            zip64_eocd_offset = found.offset;
+            zip64_declared_total_disks = found.locator.total_disks;
+            effective_disk_number = u64::from(found.record.disk);
+            effective_central_directory_disk = u64::from(found.record.cd_disk);
+            effective_disk_entries = found.record.disk_entries;
+            effective_total_entries = found.record.total_entries;
+            effective_central_directory_size = found.record.cd_size;
+            effective_central_directory_offset = found.record.cd_offset;
+            directory_end = found.offset;
+        }
+        Ok(None) => {}
+        Err(error) => {
+            result.set_item("zip64_eocd_present", true)?;
+            result.set_item("error", error.code())?;
+            return Ok(result.unbind());
         }
     }
 

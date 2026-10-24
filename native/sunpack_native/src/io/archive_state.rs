@@ -1,4 +1,5 @@
 use crate::formats::tar::{self, TarState};
+use crate::formats::zip::zip64;
 use crate::io::resource_lifecycle::TrackedFile;
 use crate::password::zip::{zip_password_bytes, ZipCryptoDecryptor};
 use crate::verification::archive_manifest::{ManifestEntry, NativeArchiveManifest};
@@ -356,6 +357,47 @@ fn range_segment(path: &str, start: u64, end: Option<u64>) -> PyResult<Segment> 
     })
 }
 
+/// A fixed directory window survives payload seeks, including reads crossing
+/// physical volumes. Only one record's name/extra fields need separate storage.
+#[derive(Default)]
+struct DirectoryWindow {
+    start: u64,
+    bytes: Vec<u8>,
+}
+
+impl DirectoryWindow {
+    fn read_exact_at(
+        &mut self,
+        reader: &mut SegmentReader,
+        mut offset: u64,
+        mut output: &mut [u8],
+        end: u64,
+    ) -> std::io::Result<()> {
+        if offset
+            .checked_add(output.len() as u64)
+            .is_none_or(|stop| stop > end)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "ZIP directory range exceeds its boundary",
+            ));
+        }
+        while !output.is_empty() {
+            if offset < self.start || offset >= self.start + self.bytes.len() as u64 {
+                self.start = offset;
+                self.bytes.resize((end - offset).min(64 * 1024) as usize, 0);
+                reader.read_exact_at(offset, &mut self.bytes)?;
+            }
+            let at = (offset - self.start) as usize;
+            let take = output.len().min(self.bytes.len() - at);
+            output[..take].copy_from_slice(&self.bytes[at..at + take]);
+            offset += take as u64;
+            output = &mut output[take..];
+        }
+        Ok(())
+    }
+}
+
 fn zip_manifest_from_reader(
     reader: &mut SegmentReader,
     max_items: usize,
@@ -383,19 +425,15 @@ fn zip_manifest_from_reader(
         manifest.is_archive = looks_like_zip(reader)?;
         return Ok(manifest);
     };
+    if !eocd.error.is_empty() {
+        manifest.message = eocd.error.to_string();
+        return Ok(manifest);
+    }
     let total = reader.total;
-    let cd_start = eocd.cd_offset as u64;
-    let expected_end = cd_start.saturating_add(eocd.cd_size as u64);
-    // Every header read below stays inside [cd_start, expected_end + 46) and
-    // inside the input, so one bounded buffer holds the whole directory walk.
-    let directory = if cd_start < total {
-        reader.read_vec_at(
-            cd_start,
-            (expected_end.saturating_add(46).min(total) - cd_start) as usize,
-        )?
-    } else {
-        Vec::new()
-    };
+    let cd_start = eocd.cd_offset;
+    let expected_end = cd_start.saturating_add(eocd.cd_size);
+    let mut directory = DirectoryWindow::default();
+    let mut metadata = Vec::new();
     let mut entries = Vec::new();
     let mut cursor = cd_start;
     let mut item_count = 0usize;
@@ -407,35 +445,52 @@ fn zip_manifest_from_reader(
     let mut message = "Archive-state ZIP manifest loaded by native parser".to_string();
     let mut payload = ZipPayloadVerifier::new();
     let mut output_paths = OutputPathAllocator::default();
-    while cursor + 46 <= total && cursor < expected_end {
-        let at = (cursor - cd_start) as usize;
-        if &directory[at..at + 4] != CD_SIG {
+    while cursor.saturating_add(46) <= total.min(expected_end) && cursor < expected_end {
+        let mut header = [0u8; 46];
+        directory.read_exact_at(reader, cursor, &mut header, total.min(expected_end))?;
+        if &header[..4] != CD_SIG {
             damaged = true;
             message = "Archive state ZIP central directory stopped before expected end".to_string();
             break;
         }
-        let flags = u16_le(&directory, at + 8);
-        let method = u16_le(&directory, at + 10);
-        let crc32 = u32_le(&directory, at + 16);
-        let compressed_size = u32_le(&directory, at + 20) as u64;
-        let uncompressed_size = u32_le(&directory, at + 24) as u64;
-        let name_len = u16_le(&directory, at + 28) as usize;
-        let extra_len = u16_le(&directory, at + 30) as usize;
-        let comment_len = u16_le(&directory, at + 32) as usize;
-        let local_offset = u32_le(&directory, at + 42) as u64;
-        let name_start = at + 46;
-        let name_end = name_start + name_len;
-        let extra_end = name_end + extra_len;
+        let flags = u16_le(&header, 8);
+        let method = u16_le(&header, 10);
+        let crc32 = u32_le(&header, 16);
+        let name_len = u16_le(&header, 28) as usize;
+        let extra_len = u16_le(&header, 30) as usize;
+        let comment_len = u16_le(&header, 32) as usize;
         let record_end = cursor + 46 + (name_len + extra_len + comment_len) as u64;
         if record_end > total || record_end > expected_end {
             damaged = true;
             message = "Archive state ZIP central directory entry is truncated".to_string();
             break;
         }
+        metadata.resize(name_len + extra_len, 0);
+        directory.read_exact_at(reader, cursor + 46, &mut metadata, total.min(expected_end))?;
+        let Some(location) = zip64::central_entry_values(&header, &metadata[name_len..]) else {
+            damaged = true;
+            message = "Archive state ZIP64 entry fields are invalid".to_string();
+            break;
+        };
+        let local_offset = if eocd.multi_disk {
+            reader
+                .starts
+                .get(location.disk as usize)
+                .copied()
+                .and_then(|start| start.checked_add(location.local_offset))
+        } else {
+            eocd.archive_offset.checked_add(location.local_offset)
+        };
+        let Some(local_offset) = local_offset else {
+            damaged = true;
+            message = "Archive state ZIP member disk is unavailable".to_string();
+            break;
+        };
+        let (compressed_size, uncompressed_size) = (location.compressed, location.uncompressed);
         item_count += 1;
         let name = decode_zip_filename(
-            &directory[name_start..name_end],
-            &directory[name_end..extra_end],
+            &metadata[..name_len],
+            &metadata[name_len..],
             flags,
             codepage,
         )?;
@@ -670,10 +725,13 @@ mod tests {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct EocdRecord {
-    cd_size: u32,
-    cd_offset: u32,
+    cd_size: u64,
+    cd_offset: u64,
+    archive_offset: u64,
+    multi_disk: bool,
+    error: &'static str,
 }
 
 /// Search the logical input backwards for the last EOCD record whose comment
@@ -706,9 +764,63 @@ fn find_eocd(reader: &mut SegmentReader) -> PyResult<Option<EocdRecord>> {
             reader.read_exact_at(pos, &mut record)?;
             let comment_len = u16_le(&record, 20) as u64;
             if pos + 22 + comment_len <= total {
+                let mut cd_size = u32_le(&record, 12) as u64;
+                let mut cd_offset = u32_le(&record, 16) as u64;
+                let mut cd_disk = u16_le(&record, 6) as u64;
+                let multi_disk = u16_le(&record, 4) != 0 || cd_disk != 0;
+                let mut directory_end = pos;
+                let starts = multi_disk.then(|| reader.starts.clone());
+                let zip64 = zip64::locate_end_record(pos, starts.as_deref(), |offset, size| {
+                    reader.read_vec_at(offset, size)
+                });
+                match zip64 {
+                    Ok(Some(found)) => {
+                        cd_size = found.record.cd_size;
+                        cd_offset = found.record.cd_offset;
+                        cd_disk = found.record.cd_disk as u64;
+                        directory_end = found.offset;
+                    }
+                    Ok(None) => {}
+                    Err(zip64::LocateError::Read(error)) => return Err(error.into()),
+                    Err(error) => {
+                        return Ok(Some(EocdRecord {
+                            error: error.code(),
+                            ..EocdRecord::default()
+                        }))
+                    }
+                }
+                let archive_offset;
+                if multi_disk {
+                    let Some(start) = reader.starts.get(cd_disk as usize) else {
+                        return Ok(None);
+                    };
+                    cd_offset = start.checked_add(cd_offset).ok_or_else(|| {
+                        pyo3::exceptions::PyValueError::new_err(
+                            "ZIP central directory offset overflow",
+                        )
+                    })?;
+                    archive_offset = 0;
+                } else {
+                    let inferred = directory_end.saturating_sub(cd_size);
+                    let mut signature = [0u8; 4];
+                    if inferred != cd_offset && inferred.saturating_add(4) <= total {
+                        reader.read_exact_at(inferred, &mut signature)?;
+                        if &signature == CD_SIG || cd_size == 0 {
+                            archive_offset = inferred.saturating_sub(cd_offset);
+                            cd_offset = inferred;
+                        } else {
+                            archive_offset = 0;
+                        }
+                    } else {
+                        archive_offset = 0;
+                    }
+                }
                 return Ok(Some(EocdRecord {
-                    cd_size: u32_le(&record, 12),
-                    cd_offset: u32_le(&record, 16),
+                    cd_size,
+                    cd_offset,
+                    archive_offset,
+                    multi_disk,
+                    error: "",
                 }));
             }
         }

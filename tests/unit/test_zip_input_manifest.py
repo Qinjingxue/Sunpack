@@ -67,6 +67,32 @@ def test_zip_manifest_counts_all_files_beyond_retained_entry_limit(tmp_path):
     assert manifest.total_unpacked_size == 80
 
 
+def test_zip_manifest_record_fields_cross_directory_windows_and_volumes(tmp_path):
+    # Independent coverage: metadata larger than one directory window must
+    # survive both buffer refills and physical-volume crossings. Small split
+    # archives and payload CRC tests never exercise a split metadata record.
+    buffer = io.BytesIO()
+    long_name = "n" * 12000
+    info = zipfile.ZipInfo(long_name)
+    info.extra = struct.pack("<HH", 0xCAFE, 60000) + b"x" * 60000
+    info.comment = b"comment" * 8000
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr(info, b"first")
+        archive.writestr("last.txt", b"last")
+    data = buffer.getvalue()
+    central = data.index(b"PK\x01\x02")
+    first, last = tmp_path / "first.jpg", tmp_path / "last.jpg"
+    split = central + 65520
+    first.write_bytes(data[:split])
+    last.write_bytes(data[split:])
+    descriptor = _input(first, open_mode="concat_ranges",
+                        extents=[InputExtent(str(first)), InputExtent(str(last))])
+    manifest = archive_input_manifest(descriptor, max_items=1)
+    assert manifest.ok
+    assert manifest.file_count == 2 and manifest.total_unpacked_size == 9
+    assert manifest.entries_truncated and manifest.expected_names == [long_name]
+
+
 def test_zip_manifest_finds_eocd_before_trailing_data_larger_than_search_window(tmp_path):
     path = tmp_path / "trailing.zip"
     path.write_bytes(_zip_bytes({"a.txt": b"payload"}) + b"\0" * (3 * 1024 * 1024 + 1))

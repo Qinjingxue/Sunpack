@@ -2,8 +2,6 @@ const ZIP_LOCAL: &[u8] = b"PK\x03\x04";
 const ZIP_CENTRAL: &[u8] = b"PK\x01\x02";
 const ZIP_EOCD: &[u8] = b"PK\x05\x06";
 const ZIP64_EOCD: &[u8] = b"PK\x06\x06";
-const ZIP64_EOCD_RECORD_SIZE: usize = 56;
-const ZIP64_EOCD_LOCATOR_SIZE: usize = 20;
 const RAR4: &[u8] = b"Rar!\x1a\x07\x00";
 const RAR5: &[u8] = b"Rar!\x1a\x07\x01\x00";
 const SEVEN_ZIP: &[u8] = b"7z\xbc\xaf\x27\x1c";
@@ -15,12 +13,20 @@ const LZ4: &[u8] = crate::formats::lz4::MAGIC;
 const TAR_USTAR: &[u8] = b"ustar";
 const TAR_BLOCK_SIZE: usize = 512;
 
-const ANALYSIS_SIGNATURES_P: &[(&str, &[u8])] = &[("zip_local", ZIP_LOCAL), ("zip_eocd", ZIP_EOCD)];
-const ANALYSIS_SIGNATURES_R: &[(&str, &[u8])] = &[("rar4", RAR4), ("rar5", RAR5)];
-const ANALYSIS_SIGNATURES_7: &[(&str, &[u8])] = &[("7z", SEVEN_ZIP)];
-const ANALYSIS_SIGNATURES_GZIP: &[(&str, &[u8])] = &[("gzip", GZIP)];
-const ANALYSIS_SIGNATURES_BZIP2: &[(&str, &[u8])] = &[("bzip2", BZIP2)];
-const ANALYSIS_SIGNATURES_XZ: &[(&str, &[u8])] = &[("xz", XZ)];
-const ANALYSIS_SIGNATURES_ZSTD: &[(&str, &[u8])] = &[("zstd", ZSTD)];
-const ANALYSIS_SIGNATURES_LZ4: &[(&str, &[u8])] = &[("lz4", LZ4)];
-const ANALYSIS_SIGNATURES_TAR: &[(&str, &[u8])] = &[("tar_ustar", TAR_USTAR)];
+// The same IDs name retained native hits and drive the window scanner.
+// Embedded-only markers have no pattern in the window prepass.
+const ANALYSIS_SIGNATURES: &[(&str, Option<&[u8]>)] = &[
+    ("zip_local", Some(ZIP_LOCAL)),
+    ("zip_eocd", Some(ZIP_EOCD)),
+    ("rar4", Some(RAR4)),
+    ("rar5", Some(RAR5)),
+    ("7z", Some(SEVEN_ZIP)),
+    ("gzip", Some(GZIP)),
+    ("bzip2", Some(BZIP2)),
+    ("xz", Some(XZ)),
+    ("zstd", Some(ZSTD)),
+    ("lz4", Some(LZ4)),
+    ("tar_ustar", Some(TAR_USTAR)),
+    ("lz4_skippable", None),
+    ("zip_central", None),
+];

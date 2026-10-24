@@ -40,7 +40,10 @@ fn parse_zip64_extra_tolerant(extra: &[u8], absolute_extra_offset: usize) -> Opt
                 cursor += 8;
             }
             let (disk_start, disk_start_offset) = if cursor + 4 == value_end {
-                (Some(u32_le(extra, cursor)), Some(absolute_extra_offset + cursor))
+                (
+                    Some(u32_le(extra, cursor)),
+                    Some(absolute_extra_offset + cursor),
+                )
             } else {
                 (None, None)
             };
@@ -60,50 +63,50 @@ fn parse_zip64_extra_tolerant(extra: &[u8], absolute_extra_offset: usize) -> Opt
     None
 }
 
-fn find_zip64_eocd(data: &[u8], before: usize) -> Option<Zip64Eocd> {
-    let pos = memmem::rfind(&data[..before.min(data.len())], ZIP64_EOCD_SIG)?;
-    if pos + 56 > data.len() {
-        return None;
-    }
-    let record = zip64::parse_record(&data[pos..]).ok()?;
-    let end = pos
-        .checked_add(12)?
-        .checked_add(usize::try_from(record.record_size).ok()?)?;
-    if end > data.len() || end < pos + 56 {
-        return None;
-    }
-    Some(Zip64Eocd {
-        offset: pos,
-        end,
-        total_entries: record.total_entries,
-        cd_size: record.cd_size,
-        cd_offset: record.cd_offset,
-        disk: record.disk,
-        cd_disk: record.cd_disk,
+/// Relation probes read a tail window rather than a whole-file slice. Keep
+/// the same validated extent and check its physical locator before using IDs.
+pub(crate) fn zip64_relation_disk_numbers(
+    data: &[u8],
+    eocd: usize,
+    tail_start: u64,
+) -> Option<(u32, u32)> {
+    let found = zip64::locate_end_record(eocd as u64, None, |offset, size| {
+        let start = usize::try_from(offset).unwrap_or(usize::MAX);
+        Ok(data
+            .get(start..start.saturating_add(size))
+            .unwrap_or_default()
+            .to_vec())
     })
+    .ok()??;
+    if found.locator.record_offset != tail_start.checked_add(found.offset)?
+        || found.locator.record_disk != found.record.disk
+        || found.locator.total_disks != found.record.disk.checked_add(1)?
+    {
+        return None;
+    }
+    Some((found.record.disk, found.record.cd_disk))
 }
 
-/// Bounded relation identity reuses the directory inspector's ZIP64 parsers.
-pub(crate) fn zip64_relation_disk_numbers(data: &[u8], eocd: usize, tail_start: u64) -> Option<(u32, u32)> {
-    let record = find_zip64_eocd(data, eocd)?;
-    let locator = find_zip64_locator(data, eocd)?;
-    if record.end != locator.offset || locator.end != eocd
-        || locator.zip64_eocd_offset != tail_start.checked_add(record.offset as u64)?
-        || u32_le(data, locator.offset + 4) != record.disk
-        || locator.total_disks != record.disk.checked_add(1)? { return None; }
-    Some((record.disk, record.cd_disk))
+impl From<zip64::LocatedEndRecord> for Zip64Eocd {
+    fn from(found: zip64::LocatedEndRecord) -> Self {
+        Self {
+            offset: found.offset as usize,
+            end: (found.offset + 12 + found.record.record_size) as usize,
+            total_entries: found.record.total_entries,
+            cd_size: found.record.cd_size,
+            cd_offset: found.record.cd_offset,
+        }
+    }
 }
 
-fn find_zip64_locator(data: &[u8], eocd_offset: usize) -> Option<Zip64Locator> {
-    let pos = memmem::rfind(&data[..eocd_offset.min(data.len())], ZIP64_LOCATOR_SIG)?;
-    if pos + 20 > data.len() {
-        return None;
+impl From<zip64::LocatedEndRecord> for Zip64Locator {
+    fn from(found: zip64::LocatedEndRecord) -> Self {
+        let offset = (found.offset + 12 + found.record.record_size) as usize;
+        Self {
+            offset,
+            end: offset + 20,
+            zip64_eocd_offset: found.locator.record_offset,
+            total_disks: found.locator.total_disks,
+        }
     }
-    let locator = zip64::parse_locator(&data[pos..]).ok()?;
-    Some(Zip64Locator {
-        offset: pos,
-        end: pos + 20,
-        zip64_eocd_offset: locator.record_offset,
-        total_disks: locator.total_disks,
-    })
 }

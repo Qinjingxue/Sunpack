@@ -9,6 +9,8 @@ from sunpack_native import (
 )
 
 from sunpack.core.analysis import ArchiveAnalyzer
+from sunpack.core.contracts.archive_input import ArchiveInputDescriptor, InputExtent
+from sunpack.pipeline.verification.archive_input_manifest import archive_input_manifest
 
 
 def _zip_details(volumes) -> dict:
@@ -28,13 +30,20 @@ def _central(name=b"a", *, local_offset=0, disk_start=0, extra=b""):
     ) + name + extra
 
 
-def test_zip_probe_maps_spanned_disk_relative_offsets(tmp_path):
+@pytest.mark.parametrize("zip64", [False, True])
+def test_zip_probe_maps_spanned_disk_relative_offsets(tmp_path, zip64):
     first = tmp_path / "archive.z01"
     last = tmp_path / "archive.zip"
     first.write_bytes(_local())
     central = _central(disk_start=0)
+    tail = b""
+    if zip64:
+        extension = b"extended" * 9000
+        tail = struct.pack("<4sQHHIIQQQQ", b"PK\x06\x06", 44 + len(extension),
+                           45, 45, 1, 1, 1, 1, len(central), 0) + extension
+        tail += struct.pack("<4sIQI", b"PK\x06\x07", 1, len(central), 2)
     eocd = struct.pack("<4sHHHHIIH", b"PK\x05\x06", 1, 1, 1, 1, len(central), 0, 0)
-    last.write_bytes(central + eocd)
+    last.write_bytes(central + tail + eocd)
     result = _zip_details([
         {"path": str(first), "number": 1, "style": "zip_spanned"},
         {"path": str(last), "number": 2, "style": "zip_spanned"},
@@ -47,6 +56,12 @@ def test_zip_probe_maps_spanned_disk_relative_offsets(tmp_path):
     assert result["declared_total_disks"] == 2
     assert result["local_header_links_ok"] is True
     assert "zip:multi_disk_offsets" in result["evidence"]
+    descriptor = ArchiveInputDescriptor(
+        entry_path=str(first), open_mode="concat_ranges", format_hint="zip",
+        extents=[InputExtent(str(first)), InputExtent(str(last))],
+    )
+    manifest = archive_input_manifest(descriptor)
+    assert manifest.ok and manifest.expected_names == ["a"]
 
 
 @pytest.mark.parametrize("layout", ["plain", "carrier", "split_carrier"])
@@ -69,10 +84,13 @@ def test_zip64_bounds_are_shared_by_analysis_and_inspectors(tmp_path, layout, in
         cd_offset = 1 << 63
     elif invalid_field == "sum":
         cd_offset = (1 << 63) - cd_size
+    # A variable extension crosses the locator's reverse-read window and
+    # contains decoy signatures. Fixed-tail and last-signature parsing both fail.
+    extension = (b"extension-PK\x06\x06" + b"\0" * 56) * 1100
     zip64 = struct.pack(
         "<4sQHHIIQQQQ",
-        b"PK\x06\x06", 44, 45, 45, 0, 0, 1, 1, cd_size, cd_offset,
-    )
+        b"PK\x06\x06", 44 + len(extension), 45, 45, 0, 0, 1, 1, cd_size, cd_offset,
+    ) + extension
     locator = struct.pack("<4sIQI", b"PK\x06\x07", 0, locator_offset, 1)
     eocd = struct.pack(
         # Non-sentinel classic fields must not mask an invalid ZIP64 record.
@@ -103,6 +121,9 @@ def test_zip64_bounds_are_shared_by_analysis_and_inspectors(tmp_path, layout, in
             inspect_zip_structure_graph,
         ):
             assert dict(inspect(str(path), 16))["error"] == expected_error
+        if invalid_field is None:
+            assert inspect_zip_directory_consistency(str(path), 16)["zip64_consistency"]["zip64_eocd_present"]
+            assert inspect_zip_structure_graph(str(path), 16)["summary"]["zip64_eocd_present"]
     if layout == "split_carrier":
         # The ZIP64 fields themselves straddle a raw split boundary.
         split = len(prefix) + zip64_offset + 43
@@ -122,6 +143,18 @@ def test_zip64_bounds_are_shared_by_analysis_and_inspectors(tmp_path, layout, in
         assert any(item.get("plausible") is True for item in details)
     else:
         assert not any(item.get("plausible") is True for item in details)
+    descriptor = ArchiveInputDescriptor(
+        entry_path=str(first) if layout == "split_carrier" else str(path),
+        open_mode="concat_ranges" if layout == "split_carrier" else "file",
+        extents=[InputExtent(str(first)), InputExtent(str(last))] if layout == "split_carrier" else [],
+        format_hint="zip",
+    )
+    manifest = archive_input_manifest(descriptor)
+    assert manifest.ok is (invalid_field is None)
+    if manifest.ok:
+        assert manifest.expected_names == ["a"]
+    else:
+        assert manifest.damaged
 
 
 def test_zip_probe_resolves_zip64_tail_and_central_extra_across_raw_splits(tmp_path):
