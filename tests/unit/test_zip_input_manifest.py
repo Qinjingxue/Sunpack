@@ -55,16 +55,28 @@ def test_zip_manifest_detects_corrupted_stored_and_deflated_payloads(tmp_path):
 
 
 def test_zip_manifest_counts_all_files_beyond_retained_entry_limit(tmp_path):
+    # The cap must preserve collision allocation for the retained prefix while
+    # still validating later payloads. Uncapped/corrupt-first-entry tests cannot
+    # catch either regression; a small archive is sufficient for both.
     path = tmp_path / "many.zip"
-    path.write_bytes(_zip_bytes({f"item-{index:03d}.txt": b"xy" for index in range(40)}))
-
-    manifest = archive_input_manifest(_input(path), max_items=7)
-
-    assert manifest.ok is True
-    assert manifest.file_count == 40
-    assert manifest.retained_file_count == 7
-    assert manifest.entries_truncated is True
-    assert manifest.total_unpacked_size == 80
+    entries = {"a?.txt": b"xy", "a*.txt": b"xy", "folder": b"xy", "folder/child.txt": b"xy"}
+    entries.update({f"item-{index:03d}.txt": b"xy" for index in range(36)})
+    path.write_bytes(_zip_bytes(entries, compression=zipfile.ZIP_STORED))
+    for limit in (0, 7):
+        manifest = archive_input_manifest(_input(path), max_items=limit)
+        assert manifest.ok is True
+        assert manifest.file_count == 40
+        assert manifest.retained_file_count == limit
+        assert manifest.entries_truncated is True
+        assert manifest.total_unpacked_size == 80
+        if limit:
+            assert manifest.expected_names[:4] == ["a_.txt", "a_(1).txt", "folder", "folder(1)/child.txt"]
+    with zipfile.ZipFile(path) as archive:
+        last = archive.infolist()[-1]
+    damaged = bytearray(path.read_bytes())
+    damaged[last.header_offset + 30 + len(last.filename.encode())] ^= 1
+    path.write_bytes(damaged)
+    assert archive_input_manifest(_input(path), max_items=7).checksum_error
 
 
 def test_zip_manifest_record_fields_cross_directory_windows_and_volumes(tmp_path):

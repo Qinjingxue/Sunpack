@@ -11,6 +11,76 @@ import zstandard
 from sunpack_native import inspect_compression_stream_structure, inspect_tar_header_structure
 
 
+def test_gzip_optional_header_contract_is_shared_by_analysis_identity_and_carving(tmp_path):
+    # The streaming parser's optional-header tests cannot detect a separate
+    # analysis/identity parser misplacing FHCRC. One small matrix covers all
+    # optional-field combinations, split headers, invalid CRC and truncation.
+    import struct
+    import zlib
+    from sunpack_native import (
+        AnalysisBinaryView, AnalysisMultiVolumeView, NativeAnalysisConfig,
+        inspect_compression_stream_identity, scan_embedded_archives,
+    )
+
+    raw = _tar("payload.txt")
+    cfg = NativeAnalysisConfig({"modules": [{"name": "tar_gz", "enabled": True}]})
+    for optional in range(8):
+        for crc in (False, True):
+            flags = (optional << 2) | (2 if crc else 0)
+            head = bytearray(b"\x1f\x8b\x08" + bytes([flags]) + bytes(6))
+            if flags & 4:
+                head.extend(struct.pack("<H", 513) + b"x" * 513)
+            if flags & 8:
+                head.extend(b"payload-" + b"n" * 300 + b".tar\0")
+            if flags & 16:
+                head.extend(b"comment" * 50 + b"\0")
+            if crc:
+                head.extend(struct.pack("<H", zlib.crc32(head) & 0xFFFF))
+            encoder = zlib.compressobj(wbits=-15)
+            body = bytes(head) + encoder.compress(raw) + encoder.flush()
+            body += struct.pack("<II", zlib.crc32(raw), len(raw))
+            path = tmp_path / f"{optional}-{crc}.bin"
+            path.write_bytes(body)
+            assert inspect_compression_stream_identity(str(path))["plausible"]
+            assert inspect_compression_stream_structure(str(path))["plausible"]
+            split = len(head) - 1
+            parts = [tmp_path / f"first-{optional}-{crc}.jpg", tmp_path / f"second-{optional}-{crc}.jpg"]
+            parts[0].write_bytes(body[:split])
+            parts[1].write_bytes(body[split:])
+            for view in (AnalysisBinaryView(str(path)), AnalysisMultiVolumeView(list(map(str, parts)))):
+                try:
+                    assert view.probe_compression_stream("gzip")["plausible"]
+                    report = view.analyze(cfg)
+                    assert report["evidences"][0][1:3] == (0.93, "extractable")
+                finally:
+                    view.close()
+            if crc:
+                damaged = bytearray(body)
+                damaged[len(head) - 1] ^= 1
+                bad = tmp_path / f"bad-{optional}.bin"
+                bad.write_bytes(damaged)
+                view = AnalysisBinaryView(str(bad))
+                try:
+                    assert not view.probe_compression_stream("gzip")["plausible"]
+                finally:
+                    view.close()
+                assert not inspect_compression_stream_identity(str(bad))["plausible"]
+                assert not inspect_compression_stream_structure(str(bad))["plausible"]
+                truncated = tmp_path / f"short-{optional}.bin"
+                truncated.write_bytes(body[:len(head) - 1])
+                view = AnalysisBinaryView(str(truncated))
+                try:
+                    assert not view.probe_compression_stream("gzip")["plausible"]
+                finally:
+                    view.close()
+    carrier = tmp_path / "carrier.bin"
+    carrier.write_bytes(b"carrier prefix" + body + b"carrier suffix")
+    carved = scan_embedded_archives(str(carrier))
+    assert any(row["format"] == "gzip" and row["offset"] == len(b"carrier prefix")
+               and row["end_offset"] == len(b"carrier prefix") + len(body)
+               for row in carved["candidates"])
+
+
 def test_dense_false_headers_preserve_empty_and_nonempty_bzip2_peers(tmp_path):
     # This is discovery correctness, not a speed assertion: filtering noisy
     # prefixes must retain both legal first-marker kinds and later real peers.

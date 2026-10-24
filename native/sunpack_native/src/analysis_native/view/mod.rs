@@ -15,6 +15,7 @@ include!("binary.rs");
 include!("multivolume.rs");
 include!("impls.rs");
 include!("rar.rs");
+include!("seven_zip.rs");
 include!("signatures.rs");
 include!("tar.rs");
 include!("compression.rs");

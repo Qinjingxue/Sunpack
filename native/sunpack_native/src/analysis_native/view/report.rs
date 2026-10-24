@@ -240,13 +240,58 @@ impl Segment {
     }
 }
 
+// Keep typed observations native until the report is exported. External
+// embedded facts already arrive as Python mappings and stay borrowed.
+enum EvidenceDetails<'py> {
+    Empty,
+    Python(Bound<'py, PyDict>),
+    Rar(Box<RarReportDetails>),
+    SevenZip(Box<SevenZipReportDetails>),
+}
+
+impl<'py> From<Bound<'py, PyDict>> for EvidenceDetails<'py> {
+    fn from(value: Bound<'py, PyDict>) -> Self {
+        Self::Python(value)
+    }
+}
+
+impl<'py> EvidenceDetails<'py> {
+    fn to_python(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        match self {
+            Self::Empty => Ok(PyDict::new(py)),
+            Self::Python(value) => Ok(value.clone()),
+            Self::Rar(value) => value.to_python(py),
+            Self::SevenZip(value) => value.to_python(py),
+        }
+    }
+
+    fn password_required(&self) -> PyResult<bool> {
+        match self {
+            Self::Rar(value) => Ok(value.raw.password_required.unwrap_or(false)),
+            Self::SevenZip(value) => Ok(value.raw.password_required),
+            Self::Python(value) => truthy(value, "password_required"),
+            Self::Empty => Ok(false),
+        }
+    }
+
+    fn embedded_anchor(&self) -> PyResult<bool> {
+        match self {
+            Self::Python(value) if str_of(value, "source")? == "embedded_scan" => {
+                let kind = str_of(value, "candidate_kind")?;
+                Ok(!kind.is_empty() && kind != "logical_archive")
+            }
+            _ => Ok(false),
+        }
+    }
+}
+
 struct Evidence<'py> {
     format: String,
     confidence: f64,
     status: &'static str,
     segments: Vec<Segment>,
     warnings: Vec<String>,
-    details: Bound<'py, PyDict>,
+    details: EvidenceDetails<'py>,
 }
 
 impl<'py> Evidence<'py> {
@@ -255,7 +300,7 @@ impl<'py> Evidence<'py> {
         confidence: f64,
         status: &'static str,
         segments: Vec<Segment>,
-        details: Bound<'py, PyDict>,
+        details: impl Into<EvidenceDetails<'py>>,
     ) -> Self {
         Self {
             format: format.to_string(),
@@ -263,12 +308,12 @@ impl<'py> Evidence<'py> {
             status,
             segments,
             warnings: Vec::new(),
-            details,
+            details: details.into(),
         }
     }
 
-    fn not_found(py: Python<'py>, format: &str) -> Self {
-        Self::new(format, 0.0, "not_found", Vec::new(), PyDict::new(py))
+    fn not_found(_py: Python<'py>, format: &str) -> Self {
+        Self::new(format, 0.0, "not_found", Vec::new(), EvidenceDetails::Empty)
     }
 
     fn with_warnings(mut self, warnings: Vec<String>) -> Self {
@@ -563,80 +608,10 @@ impl<'a, 'py> ReportContext<'a, 'py> {
             .into_iter()
             .filter(|start| !exact_starts.contains(start))
         {
-            let native = self.rar_observation(start, max_blocks)?;
+            let native = py.detach(|| self.view.probe_rar_native(start, max_blocks))?;
             candidates.push(rar_from_native(native, start)?);
         }
         combine_candidates(py, "rar", candidates, self.preserve_multiple()?)
-    }
-
-    fn rar_observation(&self, start: u64, max_blocks: usize) -> PyResult<Bound<'py, PyDict>> {
-        let raw = self
-            .view
-            .probe_rar(self.py, start, max_blocks)?
-            .into_bound(self.py);
-        let magic_matched = truthy(&raw, "magic_matched")?;
-        let checked = i64_of(&raw, "blocks_checked")?;
-        let header_crc_checked =
-            bool_or(&raw, "header_crc_checked", magic_matched && checked >= 1)?;
-        let first_header_ok = bool_or(&raw, "header_crc_ok", magic_matched && checked >= 1)?;
-        let second_block_checked = bool_or(&raw, "second_block_checked", checked >= 2)?;
-        let second_block_ok = bool_or(&raw, "second_block_ok", checked >= 2)?;
-        let validated_prefix = second_block_checked && second_block_ok;
-        let error = str_of(&raw, "error")?;
-        let walk_limit = RAR_WALK_LIMIT_ERRORS.contains(&error.as_str());
-        let archive_offset = match u64_of(&raw, "archive_offset")? {
-            0 => start,
-            value => value,
-        };
-        raw.set_item("format", if magic_matched { "rar" } else { "" })?;
-        raw.set_item("detected_ext", if magic_matched { ".rar" } else { "" })?;
-        raw.set_item("archive_offset", archive_offset)?;
-        raw.set_item("plausible", truthy(&raw, "plausible")? || first_header_ok)?;
-        raw.set_item("header_crc_checked", header_crc_checked)?;
-        raw.set_item("header_crc_ok", first_header_ok)?;
-        raw.set_item("second_block_checked", second_block_checked)?;
-        raw.set_item("second_block_ok", second_block_ok)?;
-        raw.set_item(
-            "block_walk_ok",
-            truthy(&raw, "block_walk_ok")? || truthy(&raw, "end_block_found")?,
-        )?;
-        raw.set_item("validated_prefix", validated_prefix)?;
-        raw.set_item("strong_accept", truthy(&raw, "strong_accept")?)?;
-        raw.set_item(
-            "confidence",
-            if first_header_ok { "strong" } else { "none" },
-        )?;
-
-        let mut damage_flags = str_list(&raw, "damage_flags")?;
-        if !error.is_empty() && !walk_limit {
-            damage_flags.push(error.clone());
-        }
-        if checked > 0 && RAR_TRUNCATION_ERRORS.contains(&error.as_str()) {
-            damage_flags.push("probably_truncated".to_string());
-        }
-        let damage_flags = sorted_unique(damage_flags);
-        let boundary = if truthy(&raw, "end_block_found")? {
-            "high"
-        } else if truthy(&raw, "header_encrypted")? {
-            "none"
-        } else if !error.is_empty() {
-            "low"
-        } else if validated_prefix {
-            "medium"
-        } else {
-            "unknown"
-        };
-        let integrity = if first_header_ok {
-            "high"
-        } else if magic_matched {
-            "low"
-        } else {
-            "unknown"
-        };
-        set_default(&raw, "boundary_confidence", boundary)?;
-        set_default(&raw, "integrity_confidence", integrity)?;
-        raw.set_item("damage_flags", damage_flags)?;
-        Ok(raw)
     }
 
     // ---- 7z -------------------------------------------------------------
@@ -669,79 +644,10 @@ impl<'a, 'py> ReportContext<'a, 'py> {
         starts.dedup();
         let mut candidates = Vec::new();
         for start in starts {
-            let native = self.seven_zip_observation(start, max_next_header)?;
+            let native = py.detach(|| self.view.probe_seven_zip_native(start, max_next_header))?;
             candidates.push(seven_zip_from_native(native, start)?);
         }
         combine_candidates(py, "7z", candidates, self.preserve_multiple()?)
-    }
-
-    fn seven_zip_observation(
-        &self,
-        start: u64,
-        max_next_header: u64,
-    ) -> PyResult<Bound<'py, PyDict>> {
-        let raw = self
-            .view
-            .probe_seven_zip(self.py, start, max_next_header)?
-            .into_bound(self.py);
-        let magic_matched = truthy(&raw, "magic_matched")?;
-        let version_major = i64_of(&raw, "version_major")?;
-        let version_minor = i64_of(&raw, "version_minor")?;
-        let format = if magic_matched {
-            "7z".to_string()
-        } else {
-            str_or(&raw, "format", "7z")?
-        };
-        let archive_offset = match u64_of(&raw, "archive_offset")? {
-            0 => start,
-            value => value,
-        };
-        let semantic_ok =
-            truthy(&raw, "next_header_crc_ok")? && truthy(&raw, "next_header_nid_valid")?;
-        let plausible = truthy(&raw, "plausible")?;
-        raw.set_item("format", format)?;
-        raw.set_item("detected_ext", if magic_matched { ".7z" } else { "" })?;
-        raw.set_item("archive_offset", archive_offset)?;
-        raw.set_item("version_major", version_major)?;
-        raw.set_item("version_minor", version_minor)?;
-        raw.set_item("next_header_semantic_ok", semantic_ok)?;
-        raw.set_item("confidence", if plausible { "strong" } else { "none" })?;
-        if magic_matched && version_major != 0 {
-            raw.set_item("plausible", false)?;
-            raw.set_item("strong_accept", false)?;
-            raw.set_item("error", "unsupported_version")?;
-            raw.set_item("confidence", "none")?;
-        }
-        let error = str_of(&raw, "error")?;
-        let mut damage_flags = str_list(&raw, "damage_flags")?;
-        if !error.is_empty() {
-            damage_flags.push(error.clone());
-        }
-        let damage_flags = sorted_unique(damage_flags);
-        let boundary = if SEVEN_ZIP_BOUNDARY_ERRORS.contains(&error.as_str()) {
-            "none"
-        } else if truthy(&raw, "segment_end")? {
-            if truthy(&raw, "strong_accept")? {
-                "high"
-            } else {
-                "medium"
-            }
-        } else {
-            "unknown"
-        };
-        let integrity = if truthy(&raw, "next_header_crc_checked")? {
-            if truthy(&raw, "next_header_crc_ok")? {
-                "high"
-            } else {
-                "low"
-            }
-        } else {
-            "unknown"
-        };
-        set_default(&raw, "boundary_confidence", boundary)?;
-        set_default(&raw, "integrity_confidence", integrity)?;
-        set_default(&raw, "damage_flags", damage_flags)?;
-        Ok(raw)
     }
 
     // ---- TAR ------------------------------------------------------------
@@ -1262,59 +1168,150 @@ impl<'a, 'py> ReportContext<'a, 'py> {
     }
 }
 
-fn rar_from_native<'py>(native: Bound<'py, PyDict>, start: u64) -> PyResult<Evidence<'py>> {
-    if !truthy(&native, "magic_matched")? {
-        return Ok(Evidence::new("rar", 0.0, "not_found", Vec::new(), native));
+fn native_read_fault_flags(fault: &ReadFault) -> Vec<String> {
+    let mut flags = vec!["read_error".into()];
+    if fault.code == "unexpected_eof" {
+        flags.extend(["input_truncated".into(), "probably_truncated".into()]);
     }
-    let evidence = non_empty_or(str_list(&native, "evidence")?, "rar:signature");
-    let strong = truthy(&native, "strong_accept")?;
-    let plausible = truthy(&native, "plausible")?;
-    let error = str_of(&native, "error")?;
-    let blocks_checked = i64_of(&native, "blocks_checked")?;
-    let taxonomy = if str_list(&native, "damage_flags")?
+    if fault.possible_missing_volume() {
+        flags.push("missing_volume".into());
+    }
+    flags
+}
+
+fn append_native_field_flag(flags: &mut Vec<String>, fault: Option<&(ReadFault, &'static str)>) {
+    if let Some((fault, _)) = fault {
+        let field = fault.field.trim();
+        if !field.is_empty() {
+            flags.push(format!("field_read_error:{field}"));
+        }
+    }
+}
+
+struct RarReportDetails {
+    raw: RarObservation,
+    damage_flags: Vec<String>,
+    boundary: &'static str,
+    integrity: &'static str,
+}
+
+impl RarReportDetails {
+    fn to_python<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let raw = &self.raw;
+        let result = raw.to_python(py)?.into_bound(py);
+        result.set_item("format", if raw.magic_matched { "rar" } else { "" })?;
+        result.set_item("detected_ext", if raw.magic_matched { ".rar" } else { "" })?;
+        result.set_item(
+            "validated_prefix",
+            raw.second_block_checked && raw.second_block_ok,
+        )?;
+        result.set_item(
+            "confidence",
+            if raw.header_crc_ok { "strong" } else { "none" },
+        )?;
+        result.set_item("boundary_confidence", self.boundary)?;
+        result.set_item("integrity_confidence", self.integrity)?;
+        result.set_item("damage_flags", &self.damage_flags)?;
+        Ok(result)
+    }
+}
+
+fn rar_from_native<'py>(mut raw: RarObservation, start: u64) -> PyResult<Evidence<'py>> {
+    let mut damage_flags = raw
+        .damage_flags
         .iter()
-        .any(|flag| flag == "probably_truncated")
-        && blocks_checked > 0
-    {
-        "probably_truncated"
-    } else if error == "rar5_main_header_missing" || error == "rar4_main_header_missing" {
-        "valid_encrypted_but_unwalkable"
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>();
+    if let Some((fault, legacy)) = &raw.read_fault {
+        raw.error = legacy;
+        damage_flags.extend(native_read_fault_flags(fault));
+    }
+    raw.archive_offset = if raw.archive_offset == 0 {
+        start
     } else {
-        ""
+        raw.archive_offset
     };
-    let segment_end = opt_nonzero_u64_of(&native, "segment_end")?;
-    let (status, confidence, segment_end) = if strong && segment_end.is_some() {
+    raw.plausible |= raw.header_crc_ok;
+    raw.block_walk_ok |= raw.end_block_found;
+    let error = raw.error;
+    if !error.is_empty() && !RAR_WALK_LIMIT_ERRORS.contains(&error) {
+        damage_flags.push(error.into());
+    }
+    if raw.blocks_checked > 0 && RAR_TRUNCATION_ERRORS.contains(&error) {
+        damage_flags.push("probably_truncated".into());
+    }
+    damage_flags = sorted_unique(damage_flags);
+    let boundary = if raw.end_block_found {
+        "high"
+    } else if raw.header_encrypted == Some(true) {
+        "none"
+    } else if !error.is_empty() {
+        "low"
+    } else if raw.second_block_checked && raw.second_block_ok {
+        "medium"
+    } else {
+        "unknown"
+    };
+    let integrity = if raw.header_crc_ok {
+        "high"
+    } else if raw.magic_matched {
+        "low"
+    } else {
+        "unknown"
+    };
+    if !raw.magic_matched {
+        return Ok(Evidence::new(
+            "rar",
+            0.0,
+            "not_found",
+            Vec::new(),
+            EvidenceDetails::Rar(Box::new(RarReportDetails {
+                raw,
+                damage_flags,
+                boundary,
+                integrity,
+            })),
+        ));
+    }
+    let taxonomy =
+        if damage_flags.iter().any(|flag| flag == "probably_truncated") && raw.blocks_checked > 0 {
+            "probably_truncated"
+        } else if matches!(
+            error,
+            "rar5_main_header_missing" | "rar4_main_header_missing"
+        ) {
+            "valid_encrypted_but_unwalkable"
+        } else {
+            ""
+        };
+    let segment_end = Some(raw.segment_end).filter(|end| *end != 0);
+    let (status, confidence, end) = if raw.strong_accept && segment_end.is_some() {
         ("extractable", 0.97, segment_end)
     } else if taxonomy == "probably_truncated" {
         ("damaged", 0.82, None)
     } else if taxonomy == "valid_encrypted_but_unwalkable" {
         ("damaged", 0.72, None)
-    } else if plausible {
+    } else if raw.plausible {
         ("damaged", 0.65, None)
     } else {
         ("weak", 0.35, None)
     };
-    let mut damage_flags = read_fault_damage_flags(&native)?;
+    let mut segment_flags = damage_flags.clone();
+    append_native_field_flag(&mut segment_flags, raw.read_fault.as_ref());
     if !error.is_empty() {
-        damage_flags.push(error);
+        segment_flags.push(error.into());
     }
     if !taxonomy.is_empty() {
-        damage_flags.push(taxonomy.to_string());
+        segment_flags.push(taxonomy.into());
     }
-    set_default(
-        &native,
-        "boundary_confidence",
-        if strong && segment_end.is_some() {
-            "high"
-        } else {
-            "none"
-        },
-    )?;
-    set_default(&native, "integrity_confidence", "unknown")?;
     if taxonomy == "valid_encrypted_but_unwalkable" {
-        native.set_item("password_required", true)?;
-        native.set_item("header_encrypted", true)?;
+        raw.password_required = Some(true);
+        raw.header_encrypted = Some(true);
     }
+    let evidence = non_empty_or(
+        raw.evidence.iter().map(|s| s.to_string()).collect(),
+        "rar:signature",
+    );
     let warnings = if status == "extractable" {
         Vec::new()
     } else {
@@ -1333,12 +1330,17 @@ fn rar_from_native<'py>(native: Bound<'py, PyDict>, start: u64) -> PyResult<Evid
         status,
         vec![Segment::new(
             start,
-            segment_end,
+            end,
             confidence,
-            damage_flags,
+            segment_flags,
             evidence,
         )],
-        native,
+        EvidenceDetails::Rar(Box::new(RarReportDetails {
+            raw,
+            damage_flags,
+            boundary,
+            integrity,
+        })),
     )
     .with_warnings(warnings))
 }
@@ -1376,65 +1378,123 @@ fn seven_zip_from_embedded<'py>(
     ))
 }
 
-fn seven_zip_from_native<'py>(native: Bound<'py, PyDict>, start: u64) -> PyResult<Evidence<'py>> {
-    if !truthy(&native, "magic_matched")? {
-        return Ok(Evidence::new("7z", 0.0, "not_found", Vec::new(), native));
+struct SevenZipReportDetails {
+    raw: SevenZipObservation,
+    damage_flags: Vec<String>,
+    boundary: &'static str,
+    integrity: &'static str,
+}
+
+impl SevenZipReportDetails {
+    fn to_python<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let raw = &self.raw;
+        let result = raw.to_python(py)?.into_bound(py);
+        result.set_item("detected_ext", if raw.magic_matched { ".7z" } else { "" })?;
+        result.set_item(
+            "next_header_semantic_ok",
+            raw.next_header_crc_ok && raw.next_header_nid_valid,
+        )?;
+        result.set_item("confidence", if raw.plausible { "strong" } else { "none" })?;
+        result.set_item("boundary_confidence", self.boundary)?;
+        result.set_item("integrity_confidence", self.integrity)?;
+        result.set_item("damage_flags", &self.damage_flags)?;
+        Ok(result)
     }
-    let evidence = non_empty_or(str_list(&native, "evidence")?, "7z:signature");
-    let strong = truthy(&native, "strong_accept")?;
-    let plausible = truthy(&native, "plausible")?;
-    let (status, confidence) = if strong {
+}
+
+fn seven_zip_from_native<'py>(mut raw: SevenZipObservation, start: u64) -> PyResult<Evidence<'py>> {
+    let mut damage_flags = Vec::new();
+    if let Some((fault, legacy)) = &raw.read_fault {
+        raw.error = legacy;
+        damage_flags.extend(native_read_fault_flags(fault));
+    }
+    if raw.read_fault.is_none() && !raw.error.is_empty() {
+        damage_flags.push(raw.error.into());
+    }
+    let detail_flags = damage_flags;
+    let mut damage_flags = detail_flags.clone();
+    append_native_field_flag(&mut damage_flags, raw.read_fault.as_ref());
+    if !raw.error.is_empty() {
+        damage_flags.push(raw.error.into());
+    }
+    let unreliable = SEVEN_ZIP_BOUNDARY_ERRORS.contains(&raw.error);
+    let mut boundary = if unreliable {
+        "none"
+    } else if raw.segment_end != 0 {
+        if raw.strong_accept {
+            "high"
+        } else {
+            "medium"
+        }
+    } else {
+        "unknown"
+    };
+    let mut integrity = if raw.next_header_crc_checked {
+        if raw.next_header_crc_ok {
+            "high"
+        } else {
+            "low"
+        }
+    } else {
+        "unknown"
+    };
+    if unreliable {
+        damage_flags.push("boundary_unreliable".into());
+    } else if raw.next_header_crc_checked && !raw.next_header_crc_ok {
+        damage_flags.push("directory_integrity_bad_or_unknown".into());
+        boundary = "medium";
+        integrity = "low";
+    }
+    let details = SevenZipReportDetails {
+        raw,
+        damage_flags: detail_flags,
+        boundary,
+        integrity,
+    };
+    let raw = &details.raw;
+    if !raw.magic_matched {
+        return Ok(Evidence::new(
+            "7z",
+            0.0,
+            "not_found",
+            Vec::new(),
+            EvidenceDetails::SevenZip(Box::new(details)),
+        ));
+    }
+    let (status, confidence) = if raw.strong_accept {
         ("extractable", 0.97)
-    } else if plausible {
+    } else if raw.plausible {
         ("damaged", 0.65)
     } else {
         ("weak", 0.35)
     };
-    let mut damage_flags = read_fault_damage_flags(&native)?;
-    let error = str_of(&native, "error")?;
-    if !error.is_empty() {
-        damage_flags.push(error.clone());
-    }
-    let boundary_unreliable = SEVEN_ZIP_BOUNDARY_ERRORS.contains(&error.as_str());
-    if boundary_unreliable {
-        damage_flags.push("boundary_unreliable".to_string());
-        native.set_item("boundary_confidence", "none")?;
-    } else if truthy(&native, "next_header_crc_checked")? && !truthy(&native, "next_header_crc_ok")?
-    {
-        damage_flags.push("directory_integrity_bad_or_unknown".to_string());
-        native.set_item("boundary_confidence", "medium")?;
-        native.set_item("integrity_confidence", "low")?;
+    let end = if unreliable {
+        None
     } else {
-        set_default(
-            &native,
-            "boundary_confidence",
-            if strong { "high" } else { "medium" },
-        )?;
-        set_default(
-            &native,
-            "integrity_confidence",
-            if strong { "medium" } else { "unknown" },
-        )?;
-    }
-    let next_header_offset = u64_of(&native, "next_header_offset")?;
-    let next_header_size = u64_of(&native, "next_header_size")?;
-    let mut end = opt_nonzero_u64_of(&native, "segment_end")?.or_else(|| {
-        (next_header_size != 0).then(|| start + 32 + next_header_offset + next_header_size)
-    });
-    if boundary_unreliable {
-        end = None;
-    }
+        Some(raw.segment_end).filter(|end| *end != 0).or_else(|| {
+            (raw.next_header_size != 0).then(|| {
+                start
+                    .saturating_add(32)
+                    .saturating_add(raw.next_header_offset)
+                    .saturating_add(raw.next_header_size)
+            })
+        })
+    };
+    let evidence = non_empty_or(
+        raw.evidence.iter().map(|s| s.to_string()).collect(),
+        "7z:signature",
+    );
     let warnings = if end.is_some_and(|end| end != 0) {
         Vec::new()
     } else {
-        vec!["7z archive structure does not prove an exact end for this segment".to_string()]
+        vec!["7z archive structure does not prove an exact end for this segment".into()]
     };
     Ok(Evidence::new(
         "7z",
         confidence,
         status,
         vec![Segment::new(start, end, confidence, damage_flags, evidence)],
-        native,
+        EvidenceDetails::SevenZip(Box::new(details)),
     )
     .with_warnings(warnings))
 }
@@ -1766,15 +1826,22 @@ fn combine_candidates<'py>(
     let mut segments = Vec::new();
     let mut warnings = Vec::new();
     let candidate_details = PyList::empty(py);
-    for item in &usable {
-        candidate_details.append(&item.details)?;
+    let mut best_details = None;
+    for (index, item) in usable.iter().enumerate() {
+        let projected = item.details.to_python(py)?;
+        if index == best {
+            best_details = Some(projected.clone());
+        }
+        candidate_details.append(projected)?;
         for warning in &item.warnings {
             if !warnings.contains(warning) {
                 warnings.push(warning.clone());
             }
         }
     }
-    let details = usable[best].details.copy()?;
+    let details = best_details
+        .expect("best candidate was projected once")
+        .copy()?;
     details.set_item("candidate_count", usable.len())?;
     details.set_item("candidate_details", candidate_details)?;
     let (confidence, status) = (usable[best].confidence, usable[best].status);
@@ -1799,7 +1866,7 @@ fn combine_candidates<'py>(
         status,
         segments,
         warnings,
-        details,
+        details: details.into(),
     })
 }
 
@@ -1833,12 +1900,8 @@ impl SegmentPlan {
         let mut candidates = Vec::new();
         for evidence_index in by_confidence {
             let evidence = &evidences[evidence_index];
-            if str_of(&evidence.details, "source")? == "embedded_scan" {
-                if let Some(kind) = evidence.details.get_item("candidate_kind")? {
-                    if kind.is_truthy()? && kind.str()?.to_string() != "logical_archive" {
-                        continue;
-                    }
-                }
+            if evidence.details.embedded_anchor()? {
+                continue;
             }
             for (segment_index, segment) in evidence.segments.iter().enumerate() {
                 if !strict_subrange(segment.start, segment.end, size) {
@@ -1906,7 +1969,7 @@ impl SegmentPlan {
 
         let mut password_segment = None::<(usize, usize)>;
         for (evidence_index, evidence) in evidences.iter().enumerate() {
-            if !truthy(&evidence.details, "password_required")? {
+            if !evidence.details.password_required()? {
                 continue;
             }
             for (segment_index, segment) in evidence.segments.iter().enumerate() {
@@ -1932,15 +1995,25 @@ impl SegmentPlan {
         // analyzed logical bytes proves a missing later volume.
         let mut missing_volume_evidence = "";
         for evidence in evidences {
-            if !evidence.format.eq_ignore_ascii_case("7z")
-                || !truthy(&evidence.details, "start_header_crc_ok")?
-            {
+            if !evidence.format.eq_ignore_ascii_case("7z") {
                 continue;
             }
-            let expected_end = u64_of(&evidence.details, "archive_offset")?
-                .saturating_add(32)
-                .saturating_add(u64_of(&evidence.details, "next_header_offset")?)
-                .saturating_add(u64_of(&evidence.details, "next_header_size")?);
+            let expected_end = match &evidence.details {
+                EvidenceDetails::SevenZip(details) if details.raw.start_header_crc_ok => {
+                    let raw = &details.raw;
+                    raw.archive_offset
+                        .saturating_add(32)
+                        .saturating_add(raw.next_header_offset)
+                        .saturating_add(raw.next_header_size)
+                }
+                EvidenceDetails::Python(details) if truthy(details, "start_header_crc_ok")? => {
+                    u64_of(details, "archive_offset")?
+                        .saturating_add(32)
+                        .saturating_add(u64_of(details, "next_header_offset")?)
+                        .saturating_add(u64_of(details, "next_header_size")?)
+                }
+                _ => continue,
+            };
             if expected_end > size {
                 missing_volume_evidence = "seven_zip_start_header_length";
                 break;
@@ -1980,7 +2053,7 @@ fn evidence_to_python<'py>(
             evidence.status.into_pyobject(py)?.into_any(),
             segments.into_any(),
             evidence.warnings.clone().into_pyobject(py)?.into_any(),
-            evidence.details.clone().into_any(),
+            evidence.details.to_python(py)?.into_any(),
         ],
     )
 }
@@ -2174,13 +2247,6 @@ fn truthy(dict: &Bound<'_, PyDict>, key: &str) -> PyResult<bool> {
     }
 }
 
-fn bool_or(dict: &Bound<'_, PyDict>, key: &str, default: bool) -> PyResult<bool> {
-    match dict.get_item(key)? {
-        Some(value) => value.is_truthy(),
-        None => Ok(default),
-    }
-}
-
 fn present<'py>(dict: &Bound<'py, PyDict>, key: &str) -> PyResult<Option<Bound<'py, PyAny>>> {
     Ok(match dict.get_item(key)? {
         Some(value) if value.is_truthy()? => Some(value),
@@ -2204,10 +2270,6 @@ fn opt_u64_of(dict: &Bound<'_, PyDict>, key: &str) -> PyResult<Option<u64>> {
         Some(value) if !value.is_none() => Ok(Some(value.extract::<i64>()?.max(0) as u64)),
         _ => Ok(None),
     }
-}
-
-fn opt_nonzero_u64_of(dict: &Bound<'_, PyDict>, key: &str) -> PyResult<Option<u64>> {
-    Ok(Some(u64_of(dict, key)?).filter(|value| *value != 0))
 }
 
 fn f64_of(dict: &Bound<'_, PyDict>, key: &str) -> PyResult<f64> {
@@ -2439,10 +2501,30 @@ mod report_tests {
         Python::initialize();
         Python::attach(|py| {
             let seven = evidence(py, "7z", 0.65, "damaged", &[(0, None)], &[]);
-            seven.details.set_item("start_header_crc_ok", true).unwrap();
-            seven.details.set_item("archive_offset", 0).unwrap();
-            seven.details.set_item("next_header_offset", 100).unwrap();
-            seven.details.set_item("next_header_size", 10).unwrap();
+            seven
+                .details
+                .to_python(py)
+                .unwrap()
+                .set_item("start_header_crc_ok", true)
+                .unwrap();
+            seven
+                .details
+                .to_python(py)
+                .unwrap()
+                .set_item("archive_offset", 0)
+                .unwrap();
+            seven
+                .details
+                .to_python(py)
+                .unwrap()
+                .set_item("next_header_offset", 100)
+                .unwrap();
+            seven
+                .details
+                .to_python(py)
+                .unwrap()
+                .set_item("next_header_size", 10)
+                .unwrap();
             let evidences = vec![seven];
             assert_eq!(
                 SegmentPlan::build(&evidences, &[], 50)
@@ -2484,8 +2566,14 @@ mod report_tests {
             ];
             let combined = combine_candidates(py, "rar", candidates, true).unwrap();
             assert_eq!(combined.status, "extractable");
-            assert_eq!(str_of(&combined.details, "id").unwrap(), "first");
-            assert_eq!(i64_of(&combined.details, "candidate_count").unwrap(), 2);
+            assert_eq!(
+                str_of(&combined.details.to_python(py).unwrap(), "id").unwrap(),
+                "first"
+            );
+            assert_eq!(
+                i64_of(&combined.details.to_python(py).unwrap(), "candidate_count").unwrap(),
+                2
+            );
             let spans = combined
                 .segments
                 .iter()

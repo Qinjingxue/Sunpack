@@ -526,11 +526,15 @@ fn zip_manifest_from_reader(
             }
         }
         let is_directory = name.ends_with('/');
-        let projected = output_paths.project(&name, is_directory);
+        // No subsequent retained entry depends on collision allocation once
+        // the cap is reached. Keep walking/validating and aggregating sizes,
+        // but stop retaining names, like the TAR manifest walker.
+        let projected =
+            (entries.len() < max_items).then(|| output_paths.project(&name, is_directory));
         if !is_directory {
             file_count += 1;
             total_unpacked_size = total_unpacked_size.saturating_add(uncompressed_size);
-            if entries.len() < max_items {
+            if let Some(projected) = projected {
                 entries.push(ManifestEntry {
                     raw_path: (projected != name).then_some(name),
                     path: projected,

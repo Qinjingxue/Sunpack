@@ -60,12 +60,6 @@ impl InputKey {
             vec![InputMember::new(reader, 0, None, 0)?],
         ))
     }
-
-    fn is_current(&self) -> bool {
-        self.members
-            .iter()
-            .all(|member| member.generation.is_current())
-    }
 }
 
 pub(crate) enum PasswordContext {
@@ -147,10 +141,10 @@ pub(crate) fn verify_prepared(
     candidates: &[String],
     prepare: impl FnOnce() -> Prepared + Send,
 ) -> PyResult<Py<PyAny>> {
-    if !py.detach(|| key.is_current()) {
-        retire(&key);
-        return Err(input_changed());
-    }
+    // The key comes from the already opened physical readers. Their generation
+    // is validated when the input is acquired, and the caller's lifecycle borrow
+    // covers this probe. Reopening every path here would repeat that admission
+    // three times per password batch, including immutable prepared-cache hits.
     let slot = {
         let mut entries = cache().lock().unwrap_or_else(|error| error.into_inner());
         let entry = if let Some(index) = entries.iter().position(|(old, _)| *old == key) {
@@ -183,7 +177,7 @@ pub(crate) fn verify_prepared(
         slot
     };
     let prepared = py.detach(|| slot.value.get_or_init(prepare));
-    if slot.retired.load(Ordering::Acquire) || !py.detach(|| key.is_current()) {
+    if slot.retired.load(Ordering::Acquire) {
         retire_slot(&key, &slot);
         return Err(input_changed());
     }
@@ -191,7 +185,7 @@ pub(crate) fn verify_prepared(
         Ok(context) => context.verify(py, candidates),
         Err(status) => status.to_python(py),
     };
-    if slot.retired.load(Ordering::Acquire) || !py.detach(|| key.is_current()) {
+    if slot.retired.load(Ordering::Acquire) {
         retire_slot(&key, &slot);
         return Err(input_changed());
     }
@@ -231,13 +225,6 @@ fn input_changed() -> PyErr {
     pyo3::exceptions::PyOSError::new_err(
         "password verification input changed; Rust archive analysis must be refreshed",
     )
-}
-
-fn retire(key: &InputKey) {
-    retain(
-        &mut cache().lock().unwrap_or_else(|error| error.into_inner()),
-        |old, _| old != key,
-    );
 }
 
 pub(crate) fn clear() {

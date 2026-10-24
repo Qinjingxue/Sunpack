@@ -216,17 +216,32 @@ fn inspect_compression_stream_identity_impl(path: &str) -> CompressionIdentityRe
     }
     let base_bytes_read = data.len() as u64;
     if crate::formats::lz4::leading(&data) {
-        let identity=crate::formats::lz4::identity(&reader,0);
+        let identity = crate::formats::lz4::identity(&reader, 0);
         // Skippable magic is shared with Zstandard and does not establish LZ4.
         if identity != Ok(false) {
-            let (valid,error)=match identity {Ok(valid)=>(valid,""),Err(e)=>(false,e)};
-            let bytes_read=reader.stats().map(|s| s.read_bytes).unwrap_or(base_bytes_read);
-            return compression_identity_result("lz4",".lz4",true,file_size,bytes_read,valid,error,&["lz4:header"]);
+            let (valid, error) = match identity {
+                Ok(valid) => (valid, ""),
+                Err(e) => (false, e),
+            };
+            let bytes_read = reader
+                .stats()
+                .map(|s| s.read_bytes)
+                .unwrap_or(base_bytes_read);
+            return compression_identity_result(
+                "lz4",
+                ".lz4",
+                true,
+                file_size,
+                bytes_read,
+                valid,
+                error,
+                &["lz4:header"],
+            );
         }
     }
 
     if data.starts_with(b"\x1f\x8b") {
-        let (payload_start, flags) = match parse_gzip_header(&data, 0) {
+        let parsed = match crate::scan::compression_stream::gzip_header_from_slice(&data, 0) {
             Ok(value) => value,
             Err(error) => {
                 return compression_identity_result(
@@ -236,51 +251,14 @@ fn inspect_compression_stream_identity_impl(path: &str) -> CompressionIdentityRe
                     file_size,
                     base_bytes_read,
                     false,
-                    error,
+                    error.code(),
                     &["gzip:magic"],
                 )
             }
         };
+        let payload_start = parsed.payload_start as usize;
         let mut evidence = vec!["gzip:magic", "gzip:header"];
-        if flags & 0x02 != 0 {
-            let Some(crc_offset) = payload_start.checked_sub(2) else {
-                return compression_identity_result(
-                    "gzip",
-                    ".gz",
-                    true,
-                    file_size,
-                    base_bytes_read,
-                    false,
-                    "gzip_header_crc_missing",
-                    &["gzip:magic"],
-                );
-            };
-            let Some(stored_bytes) = data.get(crc_offset..crc_offset + 2) else {
-                return compression_identity_result(
-                    "gzip",
-                    ".gz",
-                    true,
-                    file_size,
-                    base_bytes_read,
-                    false,
-                    "gzip_header_crc_missing",
-                    &["gzip:magic"],
-                );
-            };
-            let stored = u16::from_le_bytes([stored_bytes[0], stored_bytes[1]]);
-            let computed = (crc32(&data[..crc_offset]) & 0xffff) as u16;
-            if stored != computed {
-                return compression_identity_result(
-                    "gzip",
-                    ".gz",
-                    true,
-                    file_size,
-                    base_bytes_read,
-                    false,
-                    "gzip_header_crc_bad",
-                    &["gzip:magic", "gzip:header"],
-                );
-            }
+        if parsed.crc16.is_some() {
             evidence.push("gzip:header_crc16");
         }
         if payload_start as u64 >= file_size {
@@ -862,51 +840,6 @@ fn hex_bytes(value: &[u8]) -> String {
     value.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn c_string(data: &[u8], cursor: &mut usize) -> Option<String> {
-    let start = *cursor;
-    let rel = data.get(start..)?.iter().position(|b| *b == 0)?;
-    *cursor = start + rel + 1;
-    Some(String::from_utf8_lossy(&data[start..start + rel]).into_owned())
-}
-
-fn parse_gzip_header(data: &[u8], start: usize) -> Result<(usize, u8), &'static str> {
-    if data.len() < start + 10 {
-        return Err("short_gzip_header");
-    }
-    if &data[start..start + 3] != b"\x1f\x8b\x08" {
-        return Err("gzip_magic_not_found");
-    }
-    let flags = data[start + 3];
-    if flags & 0xe0 != 0 {
-        return Err("gzip_reserved_flags_set");
-    }
-    let mut cursor = start + 10;
-    if flags & 0x04 != 0 {
-        if data.len() < cursor + 2 {
-            return Err("gzip_extra_length_missing");
-        }
-        let length = u16::from_le_bytes([data[cursor], data[cursor + 1]]) as usize;
-        cursor += 2;
-        if data.len() < cursor + length {
-            return Err("gzip_extra_out_of_range");
-        }
-        cursor += length;
-    }
-    if flags & 0x08 != 0 {
-        c_string(data, &mut cursor).ok_or("gzip_name_unterminated")?;
-    }
-    if flags & 0x10 != 0 {
-        c_string(data, &mut cursor).ok_or("gzip_comment_unterminated")?;
-    }
-    if flags & 0x02 != 0 {
-        if data.len() < cursor + 2 {
-            return Err("gzip_header_crc_missing");
-        }
-        cursor += 2;
-    }
-    Ok((cursor, flags))
-}
-
 fn inspect_gzip(py: Python<'_>, path: &str, header: &[u8], file_size: u64) -> PyResult<Py<PyDict>> {
     if file_size > EAGER_STREAM_INTEGRITY_MAX_BYTES {
         return inspect_large_structural_stream(py, path, file_size, StructuralStreamKind::Gzip);
@@ -929,64 +862,46 @@ fn inspect_gzip(py: Python<'_>, path: &str, header: &[u8], file_size: u64) -> Py
         "member.header.magic",
         hex_bytes(data.get(0..2).unwrap_or(&[])),
     )?;
-    let (_payload_start, flags) = match parse_gzip_header(&data, 0) {
+    let parsed = match crate::scan::compression_stream::gzip_header_from_slice(&data, 0) {
         Ok(value) => value,
         Err(error) => {
-            d.set_item("error", error)?;
+            d.set_item("error", error.code())?;
+            d.set_item("damage_flags", PyList::new(py, [error.code()])?)?;
             finish_fields(&d, GZIP_FIELDS)?;
             return Ok(d.unbind());
         }
     };
     d.set_item("member.header.compression_method", data[2])?;
-    d.set_item("member.header.flags", flags)?;
+    d.set_item("member.header.flags", parsed.flags)?;
     d.set_item(
         "member.header.mtime_xfl_os",
         format!("mtime={};xfl={};os={}", u32_le(&data, 4), data[8], data[9]),
     )?;
-    let mut cursor = 10usize;
-    if flags & 0x04 != 0 {
-        let length = u16_le(&data, cursor) as usize;
-        d.set_item("member.header.extra_length", length)?;
-        cursor += 2;
-        d.set_item(
-            "member.header.extra",
-            hex_bytes(&data[cursor..cursor + length]),
-        )?;
-        cursor += length;
+    if let Some(range) = parsed.extra {
+        d.set_item("member.header.extra_length", range.len())?;
+        d.set_item("member.header.extra", hex_bytes(&data[range]))?;
     } else {
         d.set_item("member.header.extra_length", 0)?;
         d.set_item("member.header.extra", "absent")?;
     }
-    if flags & 0x08 != 0 {
+    for (key, range) in [
+        ("member.header.name", parsed.name),
+        ("member.header.comment", parsed.comment),
+    ] {
         d.set_item(
-            "member.header.name",
-            c_string(&data, &mut cursor).unwrap_or_default(),
+            key,
+            range
+                .map(|range| String::from_utf8_lossy(&data[range]).into_owned())
+                .unwrap_or_else(|| "absent".to_string()),
         )?;
-    } else {
-        d.set_item("member.header.name", "absent")?;
     }
-    if flags & 0x10 != 0 {
-        d.set_item(
-            "member.header.comment",
-            c_string(&data, &mut cursor).unwrap_or_default(),
-        )?;
-    } else {
-        d.set_item("member.header.comment", "absent")?;
-    }
-    if flags & 0x02 != 0 {
-        let stored = u16_le(&data, cursor);
-        let computed = (crc32(&data[..cursor]) & 0xffff) as u16;
-        let ok = stored == computed;
-        d.set_item(
-            "member.header.crc16",
-            format!("stored={stored};computed={computed};ok={ok}"),
-        )?;
-        if !ok {
-            damage_flags.push("gzip_header_crc_bad");
-        }
-    } else {
-        d.set_item("member.header.crc16", "absent")?;
-    }
+    d.set_item(
+        "member.header.crc16",
+        parsed
+            .crc16
+            .map(|crc| format!("stored={crc};computed={crc};ok=true"))
+            .unwrap_or_else(|| "absent".to_string()),
+    )?;
 
     // Move the bounded compressed input into the canonical reader so the structural
     // walk and integrity observer share one byte source without cloning the file.
@@ -1364,7 +1279,9 @@ mod xz_bounds_tests {
 
     #[test]
     fn bzip_markers_preserve_bit_alignments_and_truncated_edges() {
-        let mut data = (0..65544usize).map(|i| (i * 73 + 19) as u8).collect::<Vec<_>>();
+        let mut data = (0..65544usize)
+            .map(|i| (i * 73 + 19) as u8)
+            .collect::<Vec<_>>();
         for (marker, base) in [(0x314159265359u64, 32), (0x177245385090, 1024)] {
             for shift in 0..8 {
                 let start = base + shift * 128 + shift;
@@ -1388,8 +1305,7 @@ mod xz_bounds_tests {
                 let mut expected = Vec::new();
                 let mut window = 0u64;
                 for bit in 0..sample.len() * 8 {
-                    window = ((window << 1)
-                        | u64::from((sample[bit / 8] >> (7 - bit % 8)) & 1))
+                    window = ((window << 1) | u64::from((sample[bit / 8] >> (7 - bit % 8)) & 1))
                         & 0xffff_ffff_ffff;
                     if bit >= 47 && window == marker {
                         expected.push(bit + 1 - 48);
@@ -1655,7 +1571,9 @@ fn inspect_xz(py: Python<'_>, path: &str, header: &[u8], file_size: u64) -> PyRe
     }
 
     let padded_blocks = records.iter().fold(0u64, |total, (size, _)| {
-        total.saturating_add(*size).saturating_add((4 - size % 4) % 4)
+        total
+            .saturating_add(*size)
+            .saturating_add((4 - size % 4) % 4)
     });
     let mut block_cursor = index_start.saturating_sub(padded_blocks as usize);
     let mut block_count = 0usize;
@@ -1744,9 +1662,7 @@ fn inspect_xz(py: Python<'_>, path: &str, header: &[u8], file_size: u64) -> PyRe
     if trailing > 0 {
         damage_flags.push("trailing_junk");
     }
-    let valid = (decode_ok || decode_limited)
-        && &footer[10..12] == b"YZ"
-        && index_valid_start;
+    let valid = (decode_ok || decode_limited) && &footer[10..12] == b"YZ" && index_valid_start;
     d.set_item("plausible", valid)?;
     d.set_item("confidence", if valid { "strong" } else { "medium" })?;
     if !valid {

@@ -918,22 +918,16 @@ impl AnalysisBinaryView {
                     return Ok(result);
                 }
                 result.set_item("magic_matched", true)?;
-                if header.len() < 10 || header[3] & 0xE0 != 0 {
-                    result.set_item("error", "gzip_reserved_flags_set")?;
-                    result.set_item(
-                        "damage_flags",
-                        PyList::new(py, ["gzip_reserved_flags_set"])?,
-                    )?;
+                if let Err(error) = py.detach(|| {
+                    crate::scan::compression_stream::inspect_gzip_header(
+                        &self.reader,
+                        0,
+                        self.reader.len(),
+                    )
+                }) {
+                    result.set_item("error", error.code())?;
+                    result.set_item("damage_flags", PyList::new(py, [error.code()])?)?;
                     return Ok(result);
-                }
-                if header[3] & 0x02 != 0 && header.len() >= 12 {
-                    let stored_header_crc = u16_le(&header, 10) as u32;
-                    if crc32(&header[..10]) & 0xFFFF != stored_header_crc {
-                        result.set_item("error", "gzip_header_crc_mismatch")?;
-                        result
-                            .set_item("damage_flags", PyList::new(py, ["gzip_header_crc_bad"])?)?;
-                        return Ok(result);
-                    }
                 }
                 result.set_item("plausible", true)?;
                 result.set_item("confidence", 0.90f64)?;

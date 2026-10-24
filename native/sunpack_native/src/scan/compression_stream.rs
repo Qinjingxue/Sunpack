@@ -840,37 +840,152 @@ pub(crate) fn gzip_fixed_header_flags(fixed: &[u8; 10]) -> ValidationResult<u8> 
     Ok(flags)
 }
 
-fn gzip_header(cursor: &mut ByteCursor<'_>) -> ValidationResult<()> {
-    let fixed = cursor.read_array::<10>()?;
+// One optional-header grammar serves streaming validation, identity probes and
+// analysis views, including logical multi-volume readers. Strings and extra
+// fields are consumed in bulk and do not need to be retained.
+#[derive(Debug)]
+pub(crate) struct GzipHeader {
+    pub(crate) flags: u8,
+    pub(crate) payload_start: u64,
+    pub(crate) extra: Option<std::ops::Range<usize>>,
+    pub(crate) name: Option<std::ops::Range<usize>>,
+    pub(crate) comment: Option<std::ops::Range<usize>>,
+    pub(crate) crc16: Option<u16>,
+}
+
+trait GzipHeaderInput {
+    fn position(&self) -> u64;
+    fn array<const N: usize>(&mut self) -> ValidationResult<[u8; N]>;
+    fn consume(&mut self, count: usize, crc: Option<&mut Hasher>) -> ValidationResult<()>;
+    fn string(&mut self, crc: Option<&mut Hasher>) -> ValidationResult<()>;
+}
+
+impl GzipHeaderInput for ByteCursor<'_> {
+    fn position(&self) -> u64 {
+        self.pos
+    }
+    fn array<const N: usize>(&mut self) -> ValidationResult<[u8; N]> {
+        self.read_array()
+    }
+    fn consume(&mut self, count: usize, crc: Option<&mut Hasher>) -> ValidationResult<()> {
+        match crc {
+            Some(crc) => self.read_chunks(count, |bytes| crc.update(bytes)),
+            None => self.skip(count as u64),
+        }
+    }
+    fn string(&mut self, crc: Option<&mut Hasher>) -> ValidationResult<()> {
+        self.skip_header_string(crc)
+    }
+}
+
+impl GzipHeaderInput for std::io::Cursor<&[u8]> {
+    fn position(&self) -> u64 {
+        std::io::Cursor::position(self)
+    }
+    fn array<const N: usize>(&mut self) -> ValidationResult<[u8; N]> {
+        let mut bytes = [0; N];
+        std::io::Read::read_exact(self, &mut bytes)
+            .map_err(|_| ValidationError::Invalid("unexpected_end_of_stream"))?;
+        Ok(bytes)
+    }
+    fn consume(&mut self, count: usize, crc: Option<&mut Hasher>) -> ValidationResult<()> {
+        let start = self.position() as usize;
+        let bytes = self
+            .get_ref()
+            .get(start..start.saturating_add(count))
+            .ok_or(ValidationError::Invalid("unexpected_end_of_stream"))?;
+        if let Some(crc) = crc {
+            crc.update(bytes);
+        }
+        self.set_position((start + count) as u64);
+        Ok(())
+    }
+    fn string(&mut self, crc: Option<&mut Hasher>) -> ValidationResult<()> {
+        let start = self.position() as usize;
+        let tail = self
+            .get_ref()
+            .get(start..)
+            .ok_or(ValidationError::Invalid("unexpected_end_of_stream"))?;
+        let len = memchr::memchr(0, tail)
+            .ok_or(ValidationError::Invalid("unexpected_end_of_stream"))?
+            + 1;
+        self.consume(len, crc)
+    }
+}
+
+fn gzip_field<T>(result: ValidationResult<T>, field: &'static str) -> ValidationResult<T> {
+    result.map_err(|error| match error {
+        ValidationError::Invalid(_) => ValidationError::Invalid(field),
+        error => error,
+    })
+}
+
+fn read_gzip_header(input: &mut impl GzipHeaderInput) -> ValidationResult<GzipHeader> {
+    let fixed = gzip_field(input.array::<10>(), "short_gzip_header")?;
     let flags = gzip_fixed_header_flags(&fixed)?;
     let has_crc = flags & 0x02 != 0;
     let mut hasher = Hasher::new();
     if has_crc {
         hasher.update(&fixed);
     }
+    let mut header = GzipHeader {
+        flags,
+        payload_start: 0,
+        extra: None,
+        name: None,
+        comment: None,
+        crc16: None,
+    };
     if flags & 0x04 != 0 {
-        let length_bytes = cursor.read_array::<2>()?;
+        let bytes = gzip_field(input.array::<2>(), "gzip_extra_length_missing")?;
         if has_crc {
-            hasher.update(&length_bytes);
+            hasher.update(&bytes);
         }
-        let length = u16::from_le_bytes([length_bytes[0], length_bytes[1]]) as usize;
-        let extra = cursor.read_exact(length)?;
-        if has_crc {
-            hasher.update(&extra);
-        }
+        let start = input.position() as usize;
+        let length = u16::from_le_bytes(bytes) as usize;
+        gzip_field(
+            input.consume(length, has_crc.then_some(&mut hasher)),
+            "gzip_extra_out_of_range",
+        )?;
+        header.extra = Some(start..start + length);
     }
-    for flag in [0x08, 0x10] {
+    for (flag, range, error) in [
+        (0x08, &mut header.name, "gzip_name_unterminated"),
+        (0x10, &mut header.comment, "gzip_comment_unterminated"),
+    ] {
         if flags & flag != 0 {
-            cursor.skip_header_string(has_crc.then_some(&mut hasher))?;
+            let start = input.position() as usize;
+            gzip_field(input.string(has_crc.then_some(&mut hasher)), error)?;
+            *range = Some(start..input.position() as usize - 1);
         }
     }
     if has_crc {
-        let stored = cursor.read_array::<2>()?;
-        if u16::from_le_bytes([stored[0], stored[1]]) != (hasher.finalize() & 0xffff) as u16 {
+        let stored = u16::from_le_bytes(gzip_field(input.array::<2>(), "gzip_header_crc_missing")?);
+        if stored != (hasher.finalize() & 0xffff) as u16 {
             return invalid("gzip_header_crc_bad");
         }
+        header.crc16 = Some(stored);
     }
-    Ok(())
+    header.payload_start = input.position();
+    Ok(header)
+}
+
+pub(crate) fn gzip_header_from_slice(data: &[u8], start: usize) -> ValidationResult<GzipHeader> {
+    let mut input = std::io::Cursor::new(data);
+    input.set_position(start as u64);
+    read_gzip_header(&mut input)
+}
+
+pub(crate) fn inspect_gzip_header(
+    reader: &ManagedReader,
+    start: u64,
+    limit: u64,
+) -> ValidationResult<GzipHeader> {
+    read_gzip_header(&mut ByteCursor::new(reader, start, limit.min(reader.len())))
+}
+
+fn gzip_header(cursor: &mut ByteCursor<'_>) -> ValidationResult<()> {
+    read_gzip_header(cursor).map(|_| ())
 }
 
 #[derive(Clone, Debug)]
@@ -1842,12 +1957,7 @@ mod tests {
                         member.len() - 1,
                     ] {
                         let source = reader(member[..end].to_vec());
-                        assert_eq!(
-                            validate_gzip_structure(&source, 0, source.len())
-                                .unwrap_err()
-                                .code(),
-                            "unexpected_end_of_stream"
-                        );
+                        assert!(validate_gzip_structure(&source, 0, source.len()).is_err());
                     }
                 }
             }

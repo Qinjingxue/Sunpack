@@ -988,13 +988,6 @@ impl FileIdentity {
         #[cfg(not(windows))]
         format!("{:?}", (self.len, self.modified, self.created))
     }
-
-    pub(crate) fn is_current(&self) -> bool {
-        open_reader_file(&self.path)
-            .and_then(|file| file_identity(self.path.clone(), &file))
-            .map(|identity| identity == *self)
-            .unwrap_or(false)
-    }
 }
 
 struct FileSource {
@@ -3278,7 +3271,6 @@ mod tests {
             first.file_identity().unwrap(),
             second.file_identity().unwrap()
         );
-        assert!(!first.file_identity().unwrap().is_current());
         assert_eq!(second.read_all().unwrap(), b"new!");
         assert_eq!(first.read_all().unwrap(), b"old!");
         std::fs::remove_file(path).unwrap();
@@ -3314,7 +3306,6 @@ mod tests {
             first.file_identity().unwrap(),
             second.file_identity().unwrap()
         );
-        assert!(!first.file_identity().unwrap().is_current());
         assert_eq!(second.read_all().unwrap(), b"new!");
         let third = ManagedReader::open(&path).unwrap();
         assert_eq!(
