@@ -65,6 +65,7 @@ uv run --locked python -m benchmarks memory many-tasks --python-rounds 5 --worke
 uv run --no-sync python -m benchmarks scheduling broker-queue --baseline-ref <before-commit> --runs 5 --warmups 1
 uv run --no-sync python -m benchmarks scheduling broker-request-selection --baseline-ref <before-commit> --runs 7 --warmups 1
 uv run --no-sync python -m benchmarks scheduling watch-source-claims --baseline-ref <before-commit> --runs 7 --warmups 1
+uv run --no-sync python -m benchmarks scheduling event-log --tasks 5000 --rounds 5 --cold-starts 40
 uv run --no-sync python -m benchmarks memory watch-source-indexes --paths 4096 --batches 12 --warmups 2
 ```
 

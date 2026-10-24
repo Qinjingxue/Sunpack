@@ -378,6 +378,11 @@ pub(crate) struct NativeWatchReplay {
     valid_bytes: u64,
 }
 
+fn entry_event(record: &EntryRecord) -> Value {
+    serde_json::json!({"event":record.status,"path":record.path,"ts":record.last_attempt_at,
+        "error":crate::event_log::diagnostic_text(&record.last_error)})
+}
+
 #[pyclass(module = "sunpack_native", frozen)]
 pub(crate) struct NativeWatchState {
     pub(crate) data: Arc<Mutex<StateData>>,
@@ -389,9 +394,6 @@ impl NativeWatchState {
         let data = self.lock();
         let mut rows = Vec::new();
         let mut member_presence = HashMap::new();
-        for record in data.pending.values() {
-            rows.push(serde_json::json!({"event":"task_queued","path":record.path}));
-        }
         let mut entries: Vec<_> = data.entries.values().collect();
         entries.sort_by(|a, b| {
             a.last_attempt_at
@@ -405,7 +407,11 @@ impl NativeWatchState {
             ) {
                 continue;
             }
-            if let Some(group) = record.failure_payload.get("ui_group") {
+            if let Some(group) = record
+                .failure_payload
+                .get("source_group")
+                .or_else(|| record.failure_payload.get("ui_group"))
+            {
                 // A member can disappear after its blocker WAL commit (even
                 // while offline). Verify only recorded member presence; never
                 // probe or rediscover an archive for the GUI projection.
@@ -424,9 +430,9 @@ impl NativeWatchState {
                     }
                 }
             }
-            rows.push(serde_json::json!({"event":record.status,"path":record.path,
-                "ts":record.last_attempt_at,"error":record.last_error}));
+            rows.push(entry_event(record));
         }
+        drop(data);
         publish(rows)
     }
     pub(crate) fn lock(&self) -> MutexGuard<'_, StateData> {
@@ -793,22 +799,7 @@ impl NativeWatchState {
     fn decode_operations(&self, operations: &Bound<'_, PyAny>) -> PyResult<NativeWatchOperations> {
         let mut decoded = Vec::new();
         for operation in operations.try_iter()? {
-            let mut operation = decode_operation(&py_to_json(&operation?)?)?;
-            if let Operation::PutEntry(_, record) = &mut operation {
-                if let Some(events) = self
-                    .events
-                    .lock()
-                    .unwrap()
-                    .as_ref()
-                    .and_then(std::sync::Weak::upgrade)
-                {
-                    if let Some(group) = events.group(&record.path) {
-                        Arc::make_mut(record)
-                            .failure_payload
-                            .insert("ui_group".into(), group);
-                    }
-                }
-            }
+            let operation = decode_operation(&py_to_json(&operation?)?)?;
             decoded.push(operation);
         }
         Ok(NativeWatchOperations {
@@ -817,50 +808,58 @@ impl NativeWatchState {
     }
 
     fn apply(&self, operations: PyRef<'_, NativeWatchOperations>) {
-        let mut data = self.lock();
-        for operation in operations.operations.0.iter() {
-            data.apply(operation);
-            if let Operation::Delete(Collection::Entries, path) = operation {
-                if let Some(events) = self
-                    .events
-                    .lock()
-                    .unwrap()
-                    .as_ref()
-                    .and_then(std::sync::Weak::upgrade)
-                {
-                    let group = events.group(path);
+        let events = self
+            .events
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade);
+        let mut notifications = Vec::new();
+        {
+            let mut data = self.lock();
+            for operation in operations.operations.0.iter() {
+                let removed = if let Operation::Delete(Collection::Entries, path) = operation {
+                    data.entries.get(path).cloned()
+                } else {
+                    None
+                };
+                data.apply(operation);
+                if events.is_none() {
+                    continue;
+                }
+                if let Some(record) = removed {
+                    let group = record
+                        .failure_payload
+                        .get("source_group")
+                        .or_else(|| record.failure_payload.get("ui_group"));
                     let remaining = group
-                        .as_ref()
-                        .and_then(|group| group["members"].as_array())
+                        .and_then(|g| g["members"].as_array())
                         .into_iter()
                         .flatten()
                         .filter_map(Value::as_str)
                         .filter_map(|member| data.entries.get(&path_key(member)))
                         .max_by(|a, b| a.last_attempt_at.total_cmp(&b.last_attempt_at));
                     if let Some(record) = remaining {
-                        events.submit(serde_json::json!({"event":record.status,"path":record.path,
-                            "ts":record.last_attempt_at,"error":record.last_error,"failures":[record.failure_payload]}));
+                        notifications.push(entry_event(record));
                     } else {
-                        events.submit(serde_json::json!({"event":"blocker_cleared","path":path}));
+                        notifications.push(serde_json::json!({"event":"blocker_cleared","path":record.path,
+                        "task_path":group.and_then(|g| g["path"].as_str()).unwrap_or(&record.path)}));
+                    }
+                }
+                if let Operation::PutEntry(_, record) = operation {
+                    if matches!(
+                        record.status.as_str(),
+                        "failed_password" | "suspended_missing_volume"
+                    ) {
+                        notifications.push(entry_event(record));
                     }
                 }
             }
-            if let Operation::PutEntry(_, record) = operation {
-                if matches!(
-                    record.status.as_str(),
-                    "failed_password" | "suspended_missing_volume"
-                ) {
-                    if let Some(events) = self
-                        .events
-                        .lock()
-                        .unwrap()
-                        .as_ref()
-                        .and_then(std::sync::Weak::upgrade)
-                    {
-                        events.submit(serde_json::json!({"event":record.status,"path":record.path,
-                            "ts":record.last_attempt_at,"error":record.last_error,"failures":[record.failure_payload]}));
-                    }
-                }
+        }
+        // The authoritative map lock never covers log projection/serialization.
+        if let Some(events) = events {
+            for notification in notifications {
+                events.submit(notification);
             }
         }
     }

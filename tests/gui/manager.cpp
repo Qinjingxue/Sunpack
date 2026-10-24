@@ -75,24 +75,25 @@ void projection(Fixture& f) {
     fs::remove(p); fails([&]{log.refresh();}); assert(!log.tasks.empty()); log.refresh(true); assert(log.tasks.empty());
     // Equivalent ISO offsets and numeric epochs must display the same local
     // wall time. TZ is process-only.
+    EventLog timestamps;
     char* previous=nullptr; size_t count=0; _dupenv_s(&previous,&count,"TZ");
     std::string old_zone=previous?previous:""; std::free(previous);
     _putenv_s("TZ","UTC-8"); _tzset();
     for(auto value:{"2026-10-19T09:15:42.731112+00:00","2026-10-19T17:15:42.731112+08:00","2026-10-19T04:15:42-05:00","2026-10-19T09:15:42Z"}) {
-        log.accept(Json{{"event","done"},{"path",utf8(source.wstring())},{"time",value}});
-        auto row=task_rows(log,{},{}).at("rows").at(0);
+        timestamps.accept(Json{{"event","done"},{"path",utf8(source.wstring())},{"time",value}});
+        auto row=task_rows(timestamps,{},{}).at("rows").at(0);
         assert(row["time"]=="2026-10-19 17:15:42");
         assert(!row.contains("details"));
-        auto stamp=log.tasks.begin()->second.timestamp;
-        log.accept(Json{{"event","done"},{"path",utf8(source.wstring())},{"ts",stamp}});
-        assert(task_rows(log,{},{}).at("rows").at(0).at("time")==row["time"]);
+        auto stamp=timestamps.tasks.begin()->second.timestamp;
+        timestamps.accept(Json{{"event","done"},{"path",utf8(source.wstring())},{"ts",stamp}});
+        assert(task_rows(timestamps,{},{}).at("rows").at(0).at("time")==row["time"]);
     }
     for(auto value:{"","invalid"}) {
-        log.accept(Json{{"event","done"},{"path",utf8(source.wstring())},{"time",value}});
-        assert(task_rows(log,{},{}).at("rows").at(0).at("time")=="");
+        timestamps.accept(Json{{"event","done"},{"path",utf8(source.wstring())},{"time",value}});
+        assert(task_rows(timestamps,{},{}).at("rows").at(0).at("time")=="");
     }
-    log.accept(Json{{"event","done"},{"path",utf8(source.wstring())},{"ts",0}});
-    assert(task_rows(log,{},{}).at("rows").at(0).at("time")=="1970-01-01 08:00:00");
+    timestamps.accept(Json{{"event","done"},{"path",utf8(source.wstring())},{"ts",0}});
+    assert(task_rows(timestamps,{},{}).at("rows").at(0).at("time")=="1970-01-01 08:00:00");
     _putenv_s("TZ",old_zone.c_str()); _tzset();
 
     // Resolve navigation from the same projected row at activation, including
@@ -117,30 +118,26 @@ void projection(Fixture& f) {
     fs::remove(nested); fs::remove(monitor);
     fails([&]{task_directory(row);});
 }
-// File fixtures with a permanently healthy publisher cannot expose stale
-// revision acceptance or retry spins. One real event/mapping owner covers both.
+// No card/status is fabricated for recovery or faults. This scenario also
+// catches accidentally restoring per-update health invalidation/full refreshes.
 void publication_integrity(Fixture& f) {
     EventPublicationFixture owner;
     auto file=f.dir/"health.jsonl", source=f.dir/"opaque.carrier";
     Handle notification(CreateEventW(nullptr,FALSE,FALSE,nullptr));
     EventLog log([&]{SetEvent(notification);}); log.set_path(file);
     atomic_write(file,owner.prefix+event("done",source,1));
-    log.refresh(); assert(log.verified());
-    ResetEvent(owner.published); SetEvent(owner.dirty);
+    log.refresh(); assert(log.available());
+    overwrite(file,event("processing_started",f.dir/"other",2),true);
+    log.refresh(); assert(log.available() && log.changed_keys.size()==1);
+    assert(WaitForSingleObject(notification,0)==WAIT_TIMEOUT);
+    SetEvent(owner.fault);
     assert(WaitForSingleObject(notification,5000)==WAIT_OBJECT_0);
-    log.refresh(); assert(!log.verified() && task_rows(log,{},{}).at("rows").at(0).at("status")=="taskUnverified");
-    auto revision=static_cast<LONG64*>(MapViewOfFile(owner.mapping,FILE_MAP_WRITE,0,0,8));
-    assert(revision); *revision=1; UnmapViewOfFile(revision);
-    atomic_write(file,owner.prefix+event("done",source,2)+Json{{"event","state_commit"},{"revision",1}}.dump()+"\n");
-    ResetEvent(owner.dirty); SetEvent(owner.published);
-    assert(WaitForSingleObject(notification,5000)==WAIT_OBJECT_0);
-    log.refresh(); assert(log.verified());
-    atomic_write(file,owner.prefix+event("done",source,2));
-    log.refresh(); assert(!log.verified() && log.retry_required);
-    log.refresh(); assert(!log.verified() && !log.retry_required);
-    log.refresh(); assert(!log.retry_required);
-    atomic_write(file,event("processing_started",source,3));
-    log.refresh(); assert(!log.verified()); // Pre-protocol logs are never trusted.
+    log.refresh(); assert(!log.available() && task_rows(log,{},{}).at("total")==0);
+    EventPublicationFixture repaired;
+    atomic_write(file,repaired.prefix+event("done",source,3));
+    log.refresh(); assert(log.available() && task_rows(log,{},{}).at("total")==1);
+    atomic_write(file,event("processing_started",source,4));
+    log.refresh(); assert(!log.available() && task_rows(log,{},{}).at("total")==0);
 }
 // One real JSONL replay covers logical ownership, removal and delta delivery.
 // The original projection scenario cannot expose cross-path aliasing failures;
@@ -581,7 +578,7 @@ int wmain(int argc,wchar_t** argv) {
     CoInitializeEx(nullptr,COINIT_MULTITHREADED);
     if(argc==3 && std::wstring(argv[1])==L"--project") {
         EventLog log; log.set_path(argv[2]); log.refresh();
-        std::cout<<Json{{"verified",log.verified()},{"tasks",task_rows(log,{}, {})}}.dump(); return 0;
+        std::cout<<Json{{"available",log.available()},{"tasks",task_rows(log,{}, {})}}.dump(); return 0;
     }
     if(argc==3 && std::wstring(argv[1])==L"--mutex") { std::cout<<utf8(mutex_name(argv[2]))<<"\n"<<utf8(mutex_name(argv[2],L"SunPackWatchRoots"))<<"\n"; return 0; }
     if(argc>=2 && std::wstring(argv[1])==L"--echo") { Json args=Json::array(); for(int i=2;i<argc;++i) args.push_back(utf8(argv[i])); std::cout<<args.dump(); return 7; }

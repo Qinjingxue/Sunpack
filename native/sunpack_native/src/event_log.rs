@@ -3,6 +3,7 @@ use crate::io::resource_lifecycle::{NativeResourceGuard, TrackedFile};
 use crate::watch_store::{py_to_json, NativeWatchState};
 use pyo3::exceptions::{PyOSError, PyRuntimeError};
 use pyo3::prelude::*;
+use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyList, PySlice, PyString, PyTuple};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -24,6 +25,172 @@ fn field<'a>(v: &'a Value, name: &str) -> &'a str {
     v[name].as_str().unwrap_or("")
 }
 
+const DIAGNOSTIC_TEXT_BYTES: usize = 4096;
+pub(crate) fn diagnostic_text(text: &str) -> &str {
+    let mut end = text.len().min(DIAGNOSTIC_TEXT_BYTES);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+fn short_string<'py>(
+    text: &Bound<'py, PyString>,
+    chars: usize,
+    truncated: &mut bool,
+) -> PyResult<Bound<'py, PyString>> {
+    if text.len()? <= chars {
+        return Ok(text.clone());
+    }
+    *truncated = true;
+    // Slice before requesting UTF-8: PyUnicode's UTF-8 cache would otherwise
+    // convert/copy the entire huge original string just to retain its prefix.
+    Ok(text
+        .get_item(PySlice::new(text.py(), 0, chars as isize, 1))?
+        .cast_into::<PyString>()?)
+}
+fn bounded_value(
+    value: &Bound<'_, PyAny>,
+    budget: &mut usize,
+    depth: usize,
+    truncated: &mut bool,
+) -> PyResult<Value> {
+    if *budget == 0 || depth == 8 {
+        *truncated = true;
+        return Ok(Value::Null);
+    }
+    *budget = budget.saturating_sub(8);
+    if let Ok(text) = value.cast::<PyString>() {
+        let text = short_string(text, *budget, truncated)?;
+        let text = text.to_str()?;
+        let mut end = text.len().min(*budget);
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        *truncated |= end != text.len();
+        *budget -= end;
+        return Ok(Value::String(text[..end].to_owned()));
+    }
+    if let Ok(dict) = value.cast::<PyDict>() {
+        let mut result = serde_json::Map::new();
+        for (i, (key, item)) in dict.iter().enumerate() {
+            if i == 64 || *budget == 0 {
+                *truncated = true;
+                break;
+            }
+            let key = short_string(key.cast::<PyString>()?, (*budget).min(64), truncated)?;
+            let key = key.to_str()?;
+            *budget = budget.saturating_sub(key.len());
+            result.insert(
+                key.to_owned(),
+                bounded_value(&item, budget, depth + 1, truncated)?,
+            );
+        }
+        return Ok(Value::Object(result));
+    }
+    if value.is_instance_of::<PyList>() || value.is_instance_of::<PyTuple>() {
+        let mut items = Vec::new();
+        for (i, item) in value.try_iter()?.enumerate() {
+            if i == 64 || *budget == 0 {
+                *truncated = true;
+                break;
+            }
+            items.push(bounded_value(&item?, budget, depth + 1, truncated)?);
+        }
+        return Ok(Value::Array(items));
+    }
+    if value.is_none()
+        || value.is_instance_of::<PyBool>()
+        || value.is_instance_of::<PyInt>()
+        || value.is_instance_of::<PyFloat>()
+    {
+        return py_to_json(value);
+    }
+    Ok(Value::Null)
+}
+fn event_value(value: &Bound<'_, PyAny>) -> PyResult<Value> {
+    let dict = value.cast::<PyDict>()?;
+    let mut truncated = false;
+    let event = dict.get_item("event")?;
+    let event = event
+        .as_ref()
+        .map(|v| short_string(v.cast::<PyString>()?, 64, &mut truncated))
+        .transpose()?;
+    let event = event
+        .as_ref()
+        .map(|v| v.to_str())
+        .transpose()?
+        .unwrap_or("");
+    let state = matches!(
+        event,
+        "pipeline_sources_claimed"
+            | "processing_started"
+            | "failed_password"
+            | "suspended_missing_volume"
+            | "done"
+            | "failed_terminal"
+            | "partial_rejected"
+            | "task_retired"
+            | "blocker_cleared"
+            | "candidate_departed"
+            | "no_tasks_found"
+            | "pipeline_request_coalesced"
+            | "pipeline_sources_released"
+    );
+    let mut budget = DIAGNOSTIC_TEXT_BYTES;
+    let mut result = serde_json::Map::new();
+    // Preserve identity/relations regardless of diagnostic field order/size.
+    result.insert("event".into(), json!(diagnostic_text(event)));
+    for name in [
+        "ts",
+        "time",
+        "path",
+        "task_path",
+        "groups",
+        "paths",
+        "processing",
+        "output_dirs",
+        "recursive",
+        "scope",
+        "retire_group",
+        "owner",
+    ] {
+        if state || matches!(name, "ts" | "time") {
+            if let Some(item) = dict.get_item(name)? {
+                result.insert(name.to_owned(), py_to_json(&item)?);
+            }
+        }
+    }
+    for (i, (key, item)) in dict.iter().enumerate() {
+        if i == 64 {
+            truncated = true;
+            break;
+        }
+        let key = short_string(key.cast::<PyString>()?, 64, &mut truncated)?;
+        let key = key.to_str()?;
+        if result.contains_key(key) {
+            continue;
+        }
+        if budget == 0 {
+            truncated = true;
+            continue;
+        }
+        let mut end = key.len().min(budget);
+        while !key.is_char_boundary(end) {
+            end -= 1;
+        }
+        truncated |= end != key.len();
+        budget -= end;
+        result.insert(
+            key[..end].to_owned(),
+            bounded_value(&item, &mut budget, 0, &mut truncated)?,
+        );
+    }
+    if truncated {
+        result.insert("truncated".into(), json!(true));
+    }
+    Ok(Value::Object(result))
+}
+
 #[derive(Default)]
 struct Task {
     group: Option<Value>,
@@ -31,6 +198,8 @@ struct Task {
     members: HashSet<String>,
     status: Option<Record>,
     terminal: bool,
+    blocked: bool,
+    owner: String,
     order: u64,
 }
 impl Task {
@@ -92,11 +261,17 @@ impl Projection {
             let oldest = oldest.clone();
             self.remove(&oldest);
         }
-        // Release burst capacities in a long-running service.
-        if self.tasks.capacity() > 256.max(self.tasks.len() * 4) {
+    }
+    fn trim(&mut self) {
+        // Run after the whole transition, not during remove/reinsert updates.
+        if (self.tasks.is_empty() && self.tasks.capacity() != 0)
+            || self.tasks.capacity() > 256.max(self.tasks.len() * 4)
+        {
             self.tasks.shrink_to_fit();
         }
-        if self.aliases.capacity() > 256.max(self.aliases.len() * 4) {
+        if (self.aliases.is_empty() && self.aliases.capacity() != 0)
+            || self.aliases.capacity() > 256.max(self.aliases.len() * 4)
+        {
             self.aliases.shrink_to_fit();
         }
     }
@@ -142,23 +317,36 @@ impl Projection {
                             .is_some_and(|g| g["multipart"].as_bool().unwrap_or(false));
                     let mut group = group.clone();
                     group["multipart"] = json!(multipart);
-                    if let Some(status) = &task.status {
-                        let mut value: Value =
-                            serde_json::from_slice(status).expect("encoded status");
-                        value["path"] = group["path"].clone();
-                        task.status = Some(encode(&value));
+                    if task
+                        .group
+                        .as_ref()
+                        .is_none_or(|old| old["path"] != group["path"])
+                    {
+                        // The first group can absorb a provisional member card.
+                        // Its status must address the canonical path before that
+                        // member retires, otherwise a snapshot resurrects it.
+                        if let Some(status) = &task.status {
+                            let mut value: Value =
+                                serde_json::from_slice(status).expect("encoded status");
+                            value["path"] = group["path"].clone();
+                            task.status = Some(encode(&value));
+                        }
+                    }
+                    if !field(value, "owner").is_empty() {
+                        task.owner = field(value, "owner").to_owned();
                     }
                     task.group_row = Some(encode(
-                        &json!({"event":"pipeline_sources_claimed","path":group["path"],"groups":[group]}),
+                        &json!({"event":"pipeline_sources_claimed","path":group["path"],"groups":[group],"owner":task.owner}),
                     ));
                     task.members = members;
                     task.group = Some(group);
                     if value["processing"].as_bool().unwrap_or(false) {
                         task.status =
                             Some(encode(&json!({"event":"processing_started","path":path,
-                        "ts":value["ts"],"time":value["time"]})));
+                        "ts":value["ts"],"time":value["time"],"owner":task.owner})));
                         task.order = self.order;
                         task.terminal = false;
+                        task.blocked = false;
                     }
                     self.insert(id, task);
                 }
@@ -168,43 +356,69 @@ impl Projection {
         let path = field(value, "path");
         let physical = key(path);
         let id = self.aliases.get(&physical).unwrap_or(&physical).clone();
-        if event == "task_retired" {
+        if event == "pipeline_sources_released" {
+            let ids: HashSet<_> = value["paths"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .chain((!path.is_empty()).then_some(path))
+                .map(key)
+                .map(|p| self.aliases.get(&p).unwrap_or(&p).clone())
+                .collect();
+            for id in ids {
+                if self
+                    .tasks
+                    .get(&id)
+                    .is_some_and(|t| !t.terminal && !t.blocked && t.owner == field(value, "owner"))
+                {
+                    self.remove(&id);
+                }
+            }
+            return;
+        }
+        if event == "task_retired" && field(value, "scope") == "task" {
             self.remove(&id);
             return;
         }
         if event == "blocker_cleared" {
-            if let Some(mut task) = self.remove(&id) {
-                if !task.terminal {
-                    let path = task
-                        .group
-                        .as_ref()
-                        .map_or(value["path"].clone(), |g| g["path"].clone());
-                    task.status = Some(encode(&json!({"event":"task_queued","path":path})));
-                }
-                self.insert(id, task);
+            let path = if field(value, "task_path").is_empty() {
+                path
+            } else {
+                field(value, "task_path")
+            };
+            let physical = key(path);
+            let id = self.aliases.get(&physical).unwrap_or(&physical).clone();
+            if self.tasks.get(&id).is_some_and(|t| t.blocked) {
+                self.remove(&id);
             }
             return;
         }
-        if event == "candidate_departed" {
+        if event == "candidate_departed" || event == "task_retired" {
             let recursive = value["recursive"].as_bool().unwrap_or(false);
-            let affected: Vec<_> = self
-                .tasks
-                .iter()
-                .filter(|(id, t)| {
-                    !t.terminal
-                        && (if t.members.is_empty() {
-                            **id == physical
-                                || (recursive && crate::watch_store::is_path_under(id, &physical))
-                        } else {
-                            t.members.iter().any(|m| {
-                                *m == physical
-                                    || (recursive
-                                        && crate::watch_store::is_path_under(m, &physical))
+            let affected: Vec<_> = if recursive {
+                self.tasks
+                    .iter()
+                    .filter(|(id, t)| {
+                        !t.terminal
+                            && (if t.members.is_empty() {
+                                **id == physical || crate::watch_store::is_path_under(id, &physical)
+                            } else {
+                                t.members.iter().any(|m| {
+                                    *m == physical
+                                        || crate::watch_store::is_path_under(m, &physical)
+                                })
                             })
-                        })
-                })
-                .map(|(id, _)| id.clone())
-                .collect();
+                    })
+                    .map(|(id, _)| id.clone())
+                    .collect()
+            } else {
+                self.tasks
+                    .get(&id)
+                    .filter(|t| !t.terminal)
+                    .map(|_| vec![id])
+                    .unwrap_or_default()
+            };
             for id in affected {
                 let mut task = self.remove(&id).unwrap();
                 task.members.retain(|m| {
@@ -219,11 +433,8 @@ impl Projection {
                         members
                             .retain(|m| m.as_str().is_some_and(|m| task.members.contains(&key(m))));
                     }
-                    task.status = Some(encode(
-                        &json!({"event":"suspended_missing_volume","path":g["path"],"ts":value["ts"]}),
-                    ));
                     task.group_row = Some(encode(
-                        &json!({"event":"pipeline_sources_claimed","path":g["path"],"groups":[g]}),
+                        &json!({"event":"pipeline_sources_claimed","path":g["path"],"groups":[g],"owner":task.owner}),
                     ));
                 }
                 self.insert(id, task);
@@ -246,7 +457,6 @@ impl Projection {
             && matches!(
                 event,
                 "processing_started"
-                    | "task_queued"
                     | "failed_password"
                     | "suspended_missing_volume"
                     | "done"
@@ -257,16 +467,29 @@ impl Projection {
             let mut task = self.remove(&id).unwrap_or_default();
             // Snapshot status always addresses its canonical group, even when
             // the original event named a member retired by a later regrouping.
-            let mut status = value.clone();
-            if let Some(group) = &task.group {
-                status["path"] = group["path"].clone();
+            task.status = if task
+                .group
+                .as_ref()
+                .is_some_and(|group| group["path"] != value["path"])
+            {
+                let mut status = value.clone();
+                status["path"] = task.group.as_ref().unwrap()["path"].clone();
+                Some(encode(&status))
+            } else {
+                Some(record.clone())
+            };
+            task.blocked = matches!(event, "failed_password" | "suspended_missing_volume");
+            if !field(value, "owner").is_empty() {
+                task.owner = field(value, "owner").to_owned();
             }
-            task.status = Some(encode(&status));
             task.order = self.order;
             task.terminal = matches!(event, "done" | "failed_terminal" | "partial_rejected");
             self.insert(id, task);
             return;
         }
+        self.diagnostic(record);
+    }
+    fn diagnostic(&mut self, record: &Record) {
         self.diagnostic_bytes += record.len();
         self.diagnostics.push_back(record.clone());
         while self.diagnostic_bytes > self.budget {
@@ -292,17 +515,17 @@ impl Projection {
     }
 }
 
-// Manual-reset kernel events are volatile. A persisted state_ready alone can
-// never authenticate an old process. GUI waits on transitions and process exit.
+// One fault notification per writer lifetime. Ordinary task updates perform no
+// cross-process signalling. A repaired snapshot gets a new generation/lease.
 mod win {
     use super::*;
     use std::ffi::c_void;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     type Handle = *mut c_void;
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn CreateEventW(a: *const c_void, manual: i32, initial: i32, name: *const u16) -> Handle;
         fn SetEvent(h: Handle) -> i32;
-        fn ResetEvent(h: Handle) -> i32;
         fn CloseHandle(h: Handle) -> i32;
         fn GetCurrentProcess() -> Handle;
         fn GetProcessTimes(
@@ -313,70 +536,21 @@ mod win {
             user: *mut u64,
         ) -> i32;
         fn MoveFileExW(from: *const u16, to: *const u16, flags: u32) -> i32;
-        fn CreateFileMappingW(
-            file: Handle,
-            attributes: *const c_void,
-            protect: u32,
-            high: u32,
-            low: u32,
-            name: *const u16,
-        ) -> Handle;
-        fn MapViewOfFile(
-            mapping: Handle,
-            access: u32,
-            high: u32,
-            low: u32,
-            bytes: usize,
-        ) -> *mut c_void;
-        fn UnmapViewOfFile(address: *const c_void) -> i32;
-    }
-    pub(super) struct Signal(pub(super) Handle);
-    unsafe impl Send for Signal {}
-    unsafe impl Sync for Signal {}
-    impl Drop for Signal {
-        fn drop(&mut self) {
-            unsafe {
-                CloseHandle(self.0);
-            }
-        }
-    }
-    impl Signal {
-        fn new(name: &str, initial: bool) -> io::Result<Self> {
-            let name: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
-            let h = unsafe { CreateEventW(std::ptr::null(), 1, initial as i32, name.as_ptr()) };
-            if h.is_null() {
-                Err(io::Error::last_os_error())
-            } else {
-                Ok(Self(h))
-            }
-        }
-        fn set(&self, value: bool) {
-            unsafe {
-                if value {
-                    SetEvent(self.0);
-                } else {
-                    ResetEvent(self.0);
-                }
-            }
-        }
     }
     pub(super) struct Publication {
         pub header: Value,
-        dirty: Signal,
-        published: Signal,
-        _mapping: Signal,
-        revision: usize,
+        fault: usize,
+        failed: AtomicBool,
     }
     impl Drop for Publication {
         fn drop(&mut self) {
             unsafe {
-                UnmapViewOfFile(self.revision as *const c_void);
+                CloseHandle(self.fault as Handle);
             }
         }
     }
     impl Publication {
         pub fn new() -> io::Result<Self> {
-            use std::sync::atomic::{AtomicU64, Ordering};
             static NEXT: AtomicU64 = AtomicU64::new(1);
             let (mut created, mut exit, mut kernel, mut user) = (0, 0, 0, 0);
             if unsafe {
@@ -392,53 +566,32 @@ mod win {
                 return Err(io::Error::last_os_error());
             }
             let name = format!(
-                "Local\\SunPack.State.{}.{}.{}",
+                "Local\\SunPack.Log.{}.{}.{}",
                 std::process::id(),
                 created,
                 NEXT.fetch_add(1, Ordering::Relaxed)
             );
-            let dirty = Signal::new(&(name.clone() + ".dirty"), true)?;
-            let published = Signal::new(&(name.clone() + ".published"), false)?;
-            let mapping_name: Vec<u16> = (name.clone() + ".revision")
-                .encode_utf16()
-                .chain(Some(0))
-                .collect();
-            let mapping = unsafe {
-                CreateFileMappingW(
-                    -1isize as Handle,
-                    std::ptr::null(),
-                    4,
-                    0,
-                    8,
-                    mapping_name.as_ptr(),
-                )
-            };
-            if mapping.is_null() {
-                return Err(io::Error::last_os_error());
-            }
-            let mapping = Signal(mapping);
-            let revision = unsafe { MapViewOfFile(mapping.0, 2, 0, 0, 8) };
-            if revision.is_null() {
+            let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+            let fault = unsafe { CreateEventW(std::ptr::null(), 1, 0, wide.as_ptr()) };
+            if fault.is_null() {
                 return Err(io::Error::last_os_error());
             }
             Ok(Self {
                 header: json!({"event":"state_begin","schema":1,"generation":name,
-                "owner_pid":std::process::id(),"owner_started":created.to_string()}),
-                dirty,
-                published,
-                _mapping: mapping,
-                revision: revision as usize,
+                "fault_event":name,"owner_pid":std::process::id(),"owner_started":created.to_string()}),
+                fault: fault as usize,
+                failed: AtomicBool::new(false),
             })
         }
-        pub fn dirty(&self) {
-            self.published.set(false);
-            self.dirty.set(true);
+        pub fn invalidate(&self) {
+            if !self.failed.swap(true, Ordering::AcqRel) {
+                unsafe {
+                    SetEvent(self.fault as Handle);
+                }
+            }
         }
-        pub fn published(&self, revision: u64) {
-            unsafe { &*(self.revision as *const std::sync::atomic::AtomicU64) }
-                .store(revision, std::sync::atomic::Ordering::Release);
-            self.dirty.set(false);
-            self.published.set(true);
+        pub fn failed(&self) -> bool {
+            self.failed.load(Ordering::Acquire)
         }
     }
     pub(super) fn replace(from: &std::path::Path, to: &std::path::Path) -> io::Result<()> {
@@ -458,7 +611,6 @@ struct State {
     queue_bytes: usize,
     rewrite: bool,
     revision: u64,
-    state_revision: u64,
     ready: bool,
     stopping: bool,
     working: bool,
@@ -467,51 +619,30 @@ struct State {
 pub(crate) struct Shared {
     state: Mutex<State>,
     wake: Condvar,
-    publication: Option<win::Publication>,
+    publication: Mutex<Option<Arc<win::Publication>>>,
     stateful: bool,
 }
 impl Shared {
-    fn dirty(&self) {
-        if let Some(publication) = &self.publication {
-            publication.dirty();
+    fn fault(&self) {
+        if let Some(publication) = self.publication.lock().unwrap().as_ref() {
+            publication.invalidate();
         }
     }
     pub(crate) fn invalidate(&self) {
         let mut state = self.state.lock().unwrap();
-        self.dirty();
+        self.fault();
         state.ready = false;
         state.revision += 1;
-        state.state_revision += 1;
-    }
-    pub(crate) fn group(&self, path: &str) -> Option<Value> {
-        let state = self.state.lock().unwrap();
-        let physical = key(path);
-        let id = state.projection.aliases.get(&physical).unwrap_or(&physical);
-        state.projection.tasks.get(id).and_then(|t| t.group.clone())
     }
     pub(crate) fn submit(&self, value: Value) {
         let row = encode(&value);
         let mut state = self.state.lock().unwrap();
-        if matches!(
-            field(&value, "event"),
-            "pipeline_sources_claimed"
-                | "processing_started"
-                | "task_queued"
-                | "failed_password"
-                | "suspended_missing_volume"
-                | "done"
-                | "failed_terminal"
-                | "partial_rejected"
-                | "task_retired"
-                | "blocker_cleared"
-                | "candidate_departed"
-                | "no_tasks_found"
-                | "pipeline_request_coalesced"
-        ) {
-            self.dirty();
-            state.state_revision += 1;
+        if self.stateful {
+            state.projection.apply(&value, &row);
+        } else {
+            state.projection.diagnostic(&row);
         }
-        state.projection.apply(&value, &row);
+        state.projection.trim();
         if state.revision == 0
             || state.error.is_some()
             || state.queue_bytes + row.len() > QUEUE_BYTES
@@ -580,6 +711,9 @@ fn write_batch(path: &PathBuf, rows: &[Record], rewrite: bool) -> io::Result<()>
             } else {
                 o.append(true);
             }
+        })
+        .map_err(|error| {
+            io::Error::new(error.kind(), format!("open event log {target:?}: {error}"))
         })?;
         // Buffer at most 64 KiB; avoid one syscall per short event.
         let mut buffer = std::io::BufWriter::with_capacity(64 * 1024, &mut file);
@@ -593,7 +727,12 @@ fn write_batch(path: &PathBuf, rows: &[Record], rewrite: bool) -> io::Result<()>
         }
         drop(file);
         if rewrite {
-            win::replace(&temporary, path)?;
+            win::replace(&temporary, path).map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("replace event log {temporary:?} -> {path:?}: {error}"),
+                )
+            })?;
         }
         Ok(())
     })();
@@ -640,9 +779,9 @@ fn writer(shared: Arc<Shared>, path: PathBuf) {
             }
         }
     }
-    let mut file_bytes = 0usize;
+    let mut file_bytes = std::fs::metadata(&path).map_or(0, |m| m.len() as usize);
     loop {
-        let (rows, rewrite, revision, state_revision) = {
+        let (mut rows, rewrite, revision, ready) = {
             let mut state = shared.state.lock().unwrap();
             while state.queue.is_empty() && !state.rewrite && !state.stopping {
                 state = shared.wake.wait(state).unwrap();
@@ -658,45 +797,51 @@ fn writer(shared: Arc<Shared>, path: PathBuf) {
                     >= state.projection.budget.max(live / 2);
             state.rewrite = false;
             state.working = true;
-            let mut rows = if rewrite {
+            let rows = if rewrite {
                 state.queue.clear();
-                let mut rows = state.projection.snapshot();
-                if shared.stateful {
-                    let publication = shared.publication.as_ref().unwrap();
-                    rows.insert(0, encode(&publication.header));
-                    if state.ready {
-                        rows.push(encode(&json!({"event":"state_ready","generation":publication.header["generation"]})));
-                    }
-                }
-                rows
+                state.projection.snapshot()
             } else {
                 std::mem::take(&mut state.queue)
             };
-            if shared.stateful {
-                rows.push(encode(
-                    &json!({"event":"state_commit","revision":state.state_revision}),
-                ));
-            }
             state.queue_bytes = 0;
-            (rows, rewrite, state.revision, state.state_revision)
+            (rows, rewrite, state.revision, state.ready)
         };
-        let result = write_batch(&path, &rows, rewrite);
+        let result = (|| -> io::Result<Option<Arc<win::Publication>>> {
+            let publication = if rewrite && shared.stateful {
+                let previous = shared.publication.lock().unwrap().clone().unwrap();
+                let publication = if ready && previous.failed() {
+                    Arc::new(win::Publication::new()?)
+                } else {
+                    previous
+                };
+                rows.insert(0, encode(&publication.header));
+                if ready {
+                    rows.push(encode(&json!({"event":"state_ready","generation":publication.header["generation"]})));
+                }
+                Some(publication)
+            } else {
+                None
+            };
+            write_batch(&path, &rows, rewrite)?;
+            Ok(publication)
+        })();
         let mut state = shared.state.lock().unwrap();
         state.working = false;
         match result {
-            Ok(()) => {
+            Ok(publication) => {
                 let bytes: usize = rows.iter().map(|r| r.len()).sum();
                 file_bytes = if rewrite { bytes } else { file_bytes + bytes };
                 state.error = None;
-                if state.state_revision == state_revision && state.ready {
-                    if let Some(publication) = &shared.publication {
-                        publication.published(state_revision);
+                if let Some(publication) = publication {
+                    if !state.ready {
+                        publication.invalidate();
                     }
+                    *shared.publication.lock().unwrap() = Some(publication);
                 }
             }
             Err(error) => {
                 state.error = Some(error.to_string());
-                shared.dirty();
+                shared.fault();
                 // A partial append must be replaced, never continued. Retry on
                 // the next real submission, without an idle retry timer.
             }
@@ -748,18 +893,17 @@ impl NativeEventLog {
                 queue_bytes: 0,
                 rewrite: false,
                 revision: 0,
-                state_revision: 0,
                 ready: !stateful,
                 stopping: false,
                 working: false,
                 error: None,
             }),
             wake: Condvar::new(),
-            publication: if stateful {
-                Some(win::Publication::new()?)
+            publication: Mutex::new(if stateful {
+                Some(Arc::new(win::Publication::new()?))
             } else {
                 None
-            },
+            }),
             stateful,
         });
         let worker = Arc::clone(&shared);
@@ -775,7 +919,7 @@ impl NativeEventLog {
         Ok(Self { owner: Some(owner) })
     }
     fn write(&self, value: &Bound<'_, PyAny>) -> PyResult<()> {
-        self.submit(py_to_json(value)?)
+        self.submit(event_value(value)?)
     }
     fn begin_recovery(&self) -> PyResult<()> {
         self.reset(Vec::new(), false)
@@ -817,7 +961,9 @@ impl NativeEventLog {
     fn reset(&self, rows: Vec<Value>, ready: bool) -> PyResult<()> {
         let shared = self.shared()?;
         let mut state = shared.state.lock().unwrap();
-        shared.dirty();
+        if !ready {
+            shared.fault();
+        }
         let diagnostics = std::mem::take(&mut state.projection.diagnostics);
         let diagnostic_bytes = state.projection.diagnostic_bytes;
         state.projection = Projection::new(state.projection.budget);
@@ -832,7 +978,6 @@ impl NativeEventLog {
         state.ready = ready;
         state.rewrite = true;
         state.revision += 1;
-        state.state_revision += 1;
         shared.wake.notify_one();
         Ok(())
     }

@@ -1343,6 +1343,7 @@ class WatchStateStore:
         status: str,
         error: str = "",
         failure_payload: dict[str, Any] | None = None,
+        source_group: dict | None = None,
         password_generation: int | None = None,
     ) -> bool:
         """Publish a live blocker, or retire it when its source is already gone."""
@@ -1350,6 +1351,8 @@ class WatchStateStore:
             key = _path_key(path)
             previous = self._entry_record(key)
             payload = dict(failure_payload or {})
+            if source_group is not None:
+                payload["source_group"] = source_group
             blockers = {str(value) for value in payload.get("blockers") or []}
             if (
                 (status not in {"failed_password", "suspended_missing_volume"} and not blockers)

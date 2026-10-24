@@ -23,7 +23,7 @@ export default {
     tasks:{rows:[],total:0,malformed:0},passwords:{rows:[],total:0},fields:[],directories:[],
     startup:{enabled:false,command:''},directoryQuery:'',
     taskQuery:'',taskRoot:'',taskStatus:0,
-    statusNames:['','taskProcessing','taskWaiting','taskSucceeded','taskFailed','taskUnverified'],
+    statusNames:['','taskProcessing','taskWaiting','taskSucceeded','taskFailed'],
     rootRows:[],rootDrafts:{},rootNew:[],rootCell:'',rootPart:'',rootNext:0,rootQuery:'',cellPointer:null,
     configCategory:'',configQuery:'',drafts:{},rangeUnitDrafts:{},toggleDrafts:{},saving:false,saveErrors:{},pendingFields:[],recordSaving:{passwords:false,roots:false},
     passwordRoot:'',passwordHistory:false,passwordHistoryTarget:false,passwordQuery:'',passwordDrafts:{},passwordNew:[],passwordCell:'',passwordNext:0,

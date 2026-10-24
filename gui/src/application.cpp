@@ -1083,11 +1083,14 @@ void Application::work() {
                     bool refreshed=log.refresh(retries.count(Log) && retries.at(Log).attempts>=3);
                     tasks_changed|=refreshed; task_source_changed|=refreshed;
                     if(log.retry_required) changed(Log);
-                    if(!log.verified() && !log.tasks.empty()) errors["events.jsonl"]="taskUnverified";
-                    else errors.erase("events.jsonl");
+                    errors.erase("events.jsonl");
                     retries.erase(Log);
                 }
-                catch(const WinError& e){ errors["events.jsonl"]=e.what(); tasks_changed=task_source_changed=true; retry_io(Log,e); }
+                catch(const WinError& e){
+                    const bool transient=e.code==ERROR_SHARING_VIOLATION || e.code==ERROR_LOCK_VIOLATION || e.code==ERROR_FILE_NOT_FOUND || e.code==ERROR_PATH_NOT_FOUND;
+                    if(transient) errors.erase("events.jsonl"); else errors["events.jsonl"]=e.what();
+                    tasks_changed=task_source_changed=true; retry_io(Log,e);
+                }
                 catch(const std::exception& e){ errors["events.jsonl"]=e.what(); tasks_changed=task_source_changed=true; }
             }
             Json patch=Json::object();

@@ -45,7 +45,7 @@ def test_shared_async_log_compacts_history_without_losing_active_groups(tmp_path
     store.close()  # A second owner must remain usable.
     other.write("done", path=b)
     other.flush()
-    assert _records(path)[-2]["event"] == "done"
+    assert _records(path)[-1]["event"] == "done"
     other.write("processing_started", path=b)
     other.write("no_tasks_found", path=b, retire_group=True)
     other.write("scheduler_tick", padding="x" * (1024 * 1024 + 1))
@@ -80,7 +80,7 @@ def test_recovery_rebuilds_from_wal_with_groups_and_silent_blocker_retirement(tm
     store.recover()
     group = {"path": a, "members": [a, b, str(departed)], "name": "inside.rar"}
     store.write("pipeline_sources_claimed", groups=[group])
-    assert state.mark(a, 10, 1.0, status="suspended_missing_volume", failure_payload={})
+    assert state.mark(a, 10, 1.0, status="suspended_missing_volume", failure_payload={}, source_group=group)
     store.write("done", path=a)  # Represents a stale/uncommitted GUI result.
     state.close()
     departed.unlink()  # Simulate a deletion before its JSONL notification.
@@ -96,17 +96,70 @@ def test_recovery_rebuilds_from_wal_with_groups_and_silent_blocker_retirement(tm
     assert set(restored_group["members"]) == {a, b}
     assert any(r["event"] == "suspended_missing_volume" for r in rows)
     assert any(r["event"] == "state_ready" for r in rows)
-    assert state.mark(b, 10, 1.0, status="failed_password", failure_payload={})
+    assert state.mark(b, 10, 1.0, status="failed_password", failure_payload={}, source_group=group)
     state.clear_entries([a])
     store.flush()
     statuses = [r for r in _records(path) if r["event"] in {"failed_password", "blocker_cleared"}]
     assert statuses[-1]["event"] == "failed_password" and statuses[-1]["path"] in {a, b}
     state.clear_entries([b])
+    store.write("diagnostic", message="x" * 4096)
     store.flush()
-    assert any(r["event"] == "blocker_cleared" for r in _records(path))
+    assert not any(r["event"] in {"task_queued", "processing_started", "failed_password", "suspended_missing_volume"} for r in _records(path) if r["event"] != "blocker_cleared")
     state.close()
     store.close()
 
+
+
+def test_diagnostic_restarts_and_large_payloads_stay_bounded(tmp_path):
+    # One-run rotation cannot find a size reset between lifetimes or an event
+    # name accidentally turning a diagnostic log into unlimited active state.
+    path = tmp_path / "runtime.state.events.jsonl"
+    for index in range(40):
+        store = WatchLogStore(str(path), max_bytes=8192)
+        try:
+            store.write("processing_started", path=f"diagnostic-{index}", message="x" * 1024)
+            store.flush()
+        finally:
+            store.close()
+        assert path.stat().st_size < 20000
+    store = WatchLogStore(str(path), max_bytes=128 * 1024)
+    try:
+        for index in range(3000):
+            store.write("processing_started", path=f"diagnostic-only-{index}", message="x" * 100)
+        store.flush()
+        assert path.stat().st_size < 256 * 1024
+        store.write("huge_error", error="错" * 2_000_000, nested=["y" * 10000] * 1000)
+        store.flush()
+        row = _records(path)[-1]
+        assert row["event"] == "huge_error" and row["truncated"]
+        assert len(json.dumps(row, ensure_ascii=False).encode("utf-8")) < 32768
+    finally:
+        store.close()
+
+
+def test_blocker_group_is_durable_without_an_event_log(tmp_path):
+    # A log-attached WAL cannot expose a reverse dependency on the projection.
+    # Persist confirmed pipeline metadata with no logger and recover it later.
+    path = str(tmp_path / "disguised.001")
+    (tmp_path / "disguised.001").touch()
+    state = WatchStateStore(str(tmp_path / "state.snapshot"))
+    group = {"path": path, "name": "archive.rar", "members": [path]}
+    try:
+        assert state.mark(path, 0, 1.0, status="failed_password", source_group=group)
+    finally:
+        state.close()
+    state = WatchStateStore(str(tmp_path / "state.snapshot"))
+    log = WatchLogStore(str(tmp_path / "events.jsonl"))
+    try:
+        log.recover(state._native)
+        log.flush()
+        rows = _records(log.path)
+        assert next(r for r in rows if r["event"] == "pipeline_sources_claimed")["groups"][0]["members"] == [path]
+        assert any(r["event"] == "failed_password" for r in rows)
+        assert not any(r["event"] == "task_queued" for r in rows)
+    finally:
+        state.close()
+        log.close()
 
 def test_throttle_expiry_preserves_live_limits_and_releases_bounded_history(tmp_path, monkeypatch):
     # Rotation tests cannot catch early unthrottling or retained expired paths.

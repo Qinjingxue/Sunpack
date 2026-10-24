@@ -636,7 +636,7 @@ def test_source_indexes_release_buckets_and_peak_tables_after_each_batch():
 def test_request_completion_always_releases_source_index(completion):
     watcher = _claim_scheduler_for_test()
     path = os.path.abspath("completion.disguised")
-    request = SimpleNamespace(
+    request = SimpleNamespace(source_groups={"group": object()},
         notification_id="owner", candidate=WatchCandidate(path, 10, 1.0, "file", 1),
         registry_owner="",
     )
@@ -663,6 +663,7 @@ def test_request_completion_always_releases_source_index(completion):
         assert result.failed == (completion == "error")
     assert watcher._active_claims == watcher._claims_by_owner == watcher._dirty_during_claim == {}
     assert owner_ref() is None
+    assert request.source_groups == {}
     assert sys.getsizeof(watcher._claims_by_owner) == sys.getsizeof({})
 
 
@@ -2257,10 +2258,6 @@ def test_nested_waiting_completion_retires_all_processing_cards(tmp_path):
     ))
     watcher = _watcher(tmp_path)
     watcher.log.recover()
-    watcher._claim_pipeline_sources("nested", [str(path) for path in (outer, locked, leaf)], path=str(outer), groups=[
-        {"path": str(path), "name": path.name, "members": [str(path)]}
-        for path in (outer, locked, leaf)
-    ])
 
     async def scenario():
         async def complete():
@@ -2269,9 +2266,17 @@ def test_nested_waiting_completion_retires_all_processing_cards(tmp_path):
             "nested", WatchCandidate(str(outer), 7, 1.0), asyncio.create_task(complete()),
             password_generation=watcher.state.password_generation,
         )
+        watcher._handle_pipeline_progress(str(outer), "nested", SimpleNamespace(), {
+            "event": "task_sources_claimed", "depth": 1,
+            "source_paths": [str(path) for path in (outer, locked, leaf)],
+            "groups": [{"path": str(path), "name": path.name, "members": [str(path)]}
+                       for path in (outer, locked, leaf)],
+        }, request=request)
         try:
             result = await watcher._complete_candidate(request)
             assert result.failed == 1
+            group = watcher.state.latest_entry_for_path(str(locked)).failure_payload["source_group"]
+            assert group["members"] == [str(locked)] and group["name"] == locked.name
             watcher.log.flush()
             records = [json.loads(line) for line in watcher.log.path.read_text(encoding="utf-8").splitlines()]
             latest = {r["path"]: r["event"] for r in records

@@ -132,6 +132,7 @@ class _ActivePipelineRequest:
     deep_detect: bool = False
     source_paths: tuple[str, ...] = ()
     password_scope_dir: str = ""
+    source_groups: dict[str, dict] = field(default_factory=dict)
 
 
 class WatchScheduler:
@@ -378,11 +379,6 @@ class WatchScheduler:
         self._reconcile_persisted_blockers()
         self._recover_usn_startup_gap()
         self.log.recover(self.state._native)
-        with self._lock:
-            pending_paths = tuple(self._pending)
-        for path in pending_paths:
-            if self.state.latest_entry_for_path(path) is None:
-                self.log.write("task_queued", path=path)
         self.log.write(
             "scheduler_started",
             roots=self.watch_roots,
@@ -1020,7 +1016,8 @@ class WatchScheduler:
             # source cleanup promotion have already ended. Hand off only paths
             # that actually changed while this request owned them.
             request.source_paths = ()
-            self._release_pipeline_source_claims(request.notification_id)
+            request.source_groups.clear()
+            self._release_pipeline_source_claims(request.notification_id, request_path=request.candidate.path)
             if request.registry_owner:
                 from sunpack.runtime.cli.runtime_state import runtime_host
 
@@ -1513,7 +1510,7 @@ class WatchScheduler:
             retired_pending=len(retired_pending),
         )
 
-    def _release_pipeline_source_claims(self, owner: str) -> None:
+    def _release_pipeline_source_claims(self, owner: str, *, request_path: str = "") -> None:
         if not owner:
             return
         reconcile: list[str] = []
@@ -1531,10 +1528,12 @@ class WatchScheduler:
                 for key, path in dirty.items()
                 if key not in self._active_claims
             ]
-        if released or reconcile:
+        if released or reconcile or request_path:
             self.log.write(
                 "pipeline_sources_released",
                 owner=owner,
+                path=request_path,
+                paths=list(owned_keys),
                 released=released,
                 dirty=len(reconcile),
             )
@@ -2008,7 +2007,7 @@ class WatchScheduler:
                 self.enqueue(candidate.path, force=True, event_type="active_owner_deferred")
                 return None
         self._notify("submitted", notification_id, candidate.path)
-        self.log.write("processing_started", path=candidate.path, size=candidate.size, mtime=candidate.mtime)
+        self.log.write("processing_started", path=candidate.path, owner=notification_id, size=candidate.size, mtime=candidate.mtime)
         try:
             task = asyncio.create_task(self.pipeline_engine.run(
                 [PipelineTarget(candidate.path, output=run_config["output"])],
@@ -2061,8 +2060,12 @@ class WatchScheduler:
                 # Reuse the published tuple. Keep this request's input evidence
                 # even if live source claims transfer to a newer family owner.
                 request.source_paths = tuple(source_paths)
+            groups = event.get("groups") or ()
+            if request is not None:
+                for group in groups:
+                    request.source_groups[path_key(group["path"])] = group
             self._claim_pipeline_sources(
-                notification_id, source_paths, path=owner_path, groups=event.get("groups"),
+                notification_id, source_paths, path=owner_path, groups=groups,
             )
             return
         if name == "task_output_started":
@@ -2219,6 +2222,7 @@ class WatchScheduler:
                     retry_candidate.path, retry_candidate.size, retry_candidate.mtime,
                     file_id=retry_candidate.file_id, change_usn=retry_candidate.change_usn,
                     status=status, error=error, failure_payload=payload,
+                    source_group=request.source_groups.get(path_key(retry_path)),
                     password_generation=request.password_generation,
                 )
                 retry_password = (

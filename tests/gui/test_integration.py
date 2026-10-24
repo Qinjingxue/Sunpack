@@ -308,10 +308,10 @@ def _state_projection(path):
     return json.loads(subprocess.check_output([str(binary), "--project", str(path)], text=True, encoding="utf-8"))
 
 
-def test_gui_live_publication_rejects_failed_writes_and_stale_revisions(tmp_path):
+def test_gui_hides_failed_publications_until_repaired(tmp_path):
     # Pure model fixtures cannot detect disagreements with the real Rust writer.
     # One kernel sharing failure covers async fault reporting, atomic replacement,
-    # volatile trust, healing, and a syntactically valid truncated publication.
+    # fault notification, healing, and a snapshot missing its ready marker.
     from sunpack.runtime.watch.log import WatchLogStore
     path = tmp_path / "events.jsonl"
     source = str(tmp_path / "carrier.fake.001")
@@ -321,7 +321,7 @@ def test_gui_live_publication_rejects_failed_writes_and_stale_revisions(tmp_path
         log.write("processing_started", path=source)
         log.flush()
         live = _state_projection(path)
-        assert live["verified"] and live["tasks"]["rows"][0]["status"] == "taskProcessing"
+        assert live["available"] and live["tasks"]["rows"][0]["status"] == "taskProcessing"
         kernel = ctypes.WinDLL("kernel32", use_last_error=True)
         kernel.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
         kernel.CreateFileW.restype = wintypes.HANDLE
@@ -336,20 +336,20 @@ def test_gui_live_publication_rejects_failed_writes_and_stale_revisions(tmp_path
             assert log.error
             assert path.read_bytes() == before  # Failed replacement preserves old file.
             stale = _state_projection(path)
-            assert not stale["verified"] and stale["tasks"]["rows"][0]["status"] == "taskUnverified"
+            assert not stale["available"] and stale["tasks"]["total"] == 0
         finally:
             kernel.CloseHandle(held)
         log.write("diagnostic", message="disk available again")
         log.flush()
         healed = _state_projection(path)
-        assert healed["verified"] and healed["tasks"]["rows"][0]["statusText"] == "等待密码"
+        assert healed["available"] and healed["tasks"]["rows"][0]["statusText"] == "等待密码"
         rows = path.read_text(encoding="utf-8").splitlines()
-        assert json.loads(rows[-1])["event"] == "state_commit"
+        assert json.loads(rows[-1])["event"] == "state_ready"
         path.write_text("\n".join(rows[:-1]) + "\n", encoding="utf-8")
-        assert not _state_projection(path)["verified"]
+        assert not _state_projection(path)["available"]
     finally:
         log.close()
-    assert not _state_projection(path)["verified"]
+    assert not _state_projection(path)["available"]
     assert not list(tmp_path.glob("events.jsonl.*"))
 
 
@@ -381,8 +381,8 @@ sys.stdin.readline()
         child.kill()
         child.wait(timeout=10)
         dead = _state_projection(path)
-        assert not dead["verified"]
-        assert all(r["status"] == "taskUnverified" for r in dead["tasks"]["rows"])
+        assert not dead["available"]
+        assert dead["tasks"]["total"] == 0
     finally:
         if child.poll() is None: child.kill(); child.wait(timeout=10)
         child.stdin.close(); child.stdout.close()
@@ -393,11 +393,55 @@ sys.stdin.readline()
     try:
         log.begin_recovery()
         log.flush()
-        assert not _state_projection(path)["verified"]
+        assert not _state_projection(path)["available"]
         log.recover(state._native)
         log.flush()
         restored = _state_projection(path)
-        assert restored["verified"] and restored["tasks"]["total"] == 1
+        assert restored["available"] and restored["tasks"]["total"] == 1
         assert restored["tasks"]["rows"][0]["statusText"] == "等待分卷"
     finally:
         state.close(); log.close()
+
+
+def test_native_and_gui_share_member_retirement_and_real_request_lifetimes(tmp_path):
+    # Scalar status/GUI-only fixtures miss compaction resurrecting a removed
+    # sibling, and a completed request leaving invisible active groups resident.
+    from sunpack.runtime.watch.log import WatchLogStore
+    log = WatchLogStore(str(tmp_path / "events.jsonl"), max_bytes=4096)
+    a, b, c = (str(tmp_path / name) for name in ("carrier.001", "other.bin", "last.part"))
+    def compact():
+        log.write("diagnostic", message="x" * 4096)
+        log.flush()
+        return _state_projection(log.path)["tasks"]
+    try:
+        log.recover()
+        log.write("processing_started", path=c, owner="request")
+        log.write("pipeline_sources_claimed", owner="request",
+                  groups=[{"path": a, "name": "nested.rar", "members": [a,b,c]}])
+        # Absorbing a provisional member must canonicalize its saved status;
+        # retiring it before compaction must not resurrect a second card.
+        log.write("task_retired", path=c)
+        rows = compact()["rows"]
+        assert len(rows)==1 and rows[0]["partCount"]==2 and rows[0]["path"]==a
+        log.write("task_retired", path=a)
+        rows = compact()["rows"]
+        assert len(rows)==1 and rows[0]["partCount"]==1 and rows[0]["status"]=="taskProcessing"
+        log.write("blocker_cleared", path=a, task_path=a)
+        assert compact()["total"]==1  # A real running task survives old blocker retirement.
+        log.write("failed_password", path=b)
+        log.write("blocker_cleared", path=b, task_path=a)
+        assert compact()["total"]==0  # Clearing a blocker alone never fabricates a queue.
+        log.write("pipeline_sources_claimed", owner="old", processing=True,
+                  groups=[{"path": a, "members": [a,b]}])
+        log.write("pipeline_sources_claimed", owner="new", processing=True,
+                  groups=[{"path": a, "members": [a,b]}])
+        log.write("pipeline_sources_released", owner="old", paths=[a,b])
+        assert compact()["total"]==1
+        log.write("pipeline_sources_released", owner="new", paths=[a,b])
+        assert compact()["total"]==0
+        log.write("pipeline_sources_claimed", owner="end", processing=True,
+                  groups=[{"path": a, "members": [a,b]}])
+        log.write("task_retired", path=a, scope="task")
+        assert compact()["total"]==0
+    finally:
+        log.close()
