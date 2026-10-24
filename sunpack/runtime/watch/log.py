@@ -13,7 +13,7 @@ from sunpack.core.support.path_keys import case_key
 from sunpack.core.support.resource_lifecycle import open_service_file
 
 
-DEFAULT_EVENTS_MAX_BYTES = 1 * 1024 * 1024
+DEFAULT_EVENTS_MAX_BYTES = 512 * 1024
 
 _PATH_LOCKS_GUARD = threading.Lock()
 _PATH_LOCKS: weakref.WeakValueDictionary[str, threading.Lock] = weakref.WeakValueDictionary()
