@@ -30,6 +30,7 @@
 #include <thread>
 #include <utility>
 #include <vector>
+#include <deque>
 
 namespace {
 
@@ -332,10 +333,11 @@ std::string_view dismissal_reason_name(ToastDismissalReason reason) noexcept {
     }
 }
 
-void append_dismissal_event(
+void write_dismissal_event(
     const std::wstring& log_path,
     std::string_view kind,
-    ToastDismissalReason reason
+    ToastDismissalReason reason,
+    const SYSTEMTIME& now
 ) noexcept {
     if (log_path.empty()) return;
     HANDLE file = CreateFileW(
@@ -362,8 +364,6 @@ void append_dismissal_event(
         );
         if (file == INVALID_HANDLE_VALUE) return;
     }
-    SYSTEMTIME now{};
-    GetSystemTime(&now);
     char timestamp[32]{};
     const int timestamp_length = std::snprintf(
         timestamp,
@@ -390,6 +390,42 @@ void append_dismissal_event(
     WriteFile(file, line.data(), static_cast<DWORD>(line.size()), &written, nullptr);
     CloseHandle(file);
 }
+
+// Dismissal callbacks run on Windows notification threads. They only enqueue;
+// one owner drains on teardown, and late callbacks hold a weak reference.
+class DiagnosticLog {
+    struct Event { std::string kind; ToastDismissalReason reason; SYSTEMTIME time; };
+    std::wstring path_;
+    std::mutex mutex_;
+    std::condition_variable wake_;
+    std::deque<Event> queue_;
+    bool stopping_ = false;
+    std::thread thread_;
+public:
+    explicit DiagnosticLog(std::wstring path):path_(std::move(path)),thread_([this]{
+        for(;;) {
+            std::deque<Event> batch;
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                wake_.wait(lock,[this]{return stopping_ || !queue_.empty();});
+                if(queue_.empty() && stopping_) return;
+                batch.swap(queue_);
+            }
+            for(auto& event:batch) write_dismissal_event(path_,event.kind,event.reason,event.time);
+        }
+    }) {}
+    void submit(std::string kind,ToastDismissalReason reason) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if(stopping_) return;
+        if(queue_.size()==1024) queue_.pop_front();
+        SYSTEMTIME now{}; GetSystemTime(&now);
+        queue_.push_back({std::move(kind),reason,now}); wake_.notify_one();
+    }
+    ~DiagnosticLog() {
+        { std::lock_guard<std::mutex> lock(mutex_); stopping_=true; wake_.notify_one(); }
+        thread_.join();
+    }
+};
 
 std::wstring hex_encode(std::wstring_view value) {
     constexpr wchar_t digits[] = L"0123456789ABCDEF";
@@ -663,9 +699,9 @@ std::wstring action_arguments(const Action& action) {
 
 class ToastPresenter {
 public:
-    explicit ToastPresenter(std::wstring diagnostic_log_path)
+    explicit ToastPresenter(std::shared_ptr<DiagnosticLog> diagnostic_log)
         : notifier_(ToastNotificationManager::CreateToastNotifier(kAppId)),
-          diagnostic_log_path_(std::move(diagnostic_log_path)) {}
+          diagnostic_log_(std::move(diagnostic_log)) {}
 
     ~ToastPresenter() {
         clear();
@@ -705,14 +741,14 @@ private:
     }
 
     void observe_dismissal(const ToastNotification& toast, std::string_view kind) {
-        if (diagnostic_log_path_.empty()) return;
-        const auto log_path = diagnostic_log_path_;
+        if (!diagnostic_log_) return;
+        const std::weak_ptr<DiagnosticLog> log = diagnostic_log_;
         const std::string kind_name(kind);
-        toast.Dismissed([log_path, kind_name](
+        toast.Dismissed([log, kind_name](
             const ToastNotification&,
             const ToastDismissedEventArgs& args
         ) noexcept {
-            append_dismissal_event(log_path, kind_name, args.Reason());
+            try { if(auto writer=log.lock()) writer->submit(kind_name,args.Reason()); } catch(...) {}
         });
     }
 
@@ -800,7 +836,7 @@ private:
     }
 
     winrt::Windows::UI::Notifications::ToastNotifier notifier_{nullptr};
-    std::wstring diagnostic_log_path_;
+    std::shared_ptr<DiagnosticLog> diagnostic_log_;
     std::wstring progress_tag_;
 };
 
@@ -809,6 +845,7 @@ struct ToastContext {
     WinrtApartmentScope apartment;
     ActivationRegistration activation;
     std::wstring diagnostic_log_path;
+    std::shared_ptr<DiagnosticLog> diagnostic_log;
     std::unique_ptr<ToastPresenter> presenter;
     DWORD owner_thread = GetCurrentThreadId();
 };
@@ -872,6 +909,30 @@ int self_test() {
         winrt::check_hresult(factory->CreateInstance(nullptr, IID_PPV_ARGS(callback.put())));
         winrt::check_hresult(callback->Activate(kAppId, L"noop", nullptr, 0));
     }
+    // Rust log tests cannot cover this separate C++ callback writer. One tiny
+    // file verifies queued diagnostics survive owner teardown without waits.
+    {
+        wchar_t directory[MAX_PATH]{};
+        struct TemporaryLog {
+            wchar_t path[MAX_PATH]{};
+            ~TemporaryLog() { if(path[0]) DeleteFileW(path); }
+        } temporary;
+        if(!GetTempPathW(MAX_PATH,directory) || !GetTempFileNameW(directory,L"spt",0,temporary.path)) return 7;
+        {
+            DiagnosticLog log(temporary.path);
+            log.submit("progress",ToastDismissalReason::UserCanceled);
+            log.submit("success",ToastDismissalReason::TimedOut);
+        }
+        HANDLE file=CreateFileW(temporary.path,GENERIC_READ,FILE_SHARE_READ,nullptr,OPEN_EXISTING,0,nullptr);
+        if(file==INVALID_HANDLE_VALUE) return 8;
+        char bytes[2048]{}; DWORD count=0;
+        const bool read=ReadFile(file,bytes,sizeof(bytes),&count,nullptr)!=FALSE;
+        CloseHandle(file);
+        const std::string text(bytes,count);
+        if(!read || text.find("\"kind\":\"progress\"")==std::string::npos ||
+           text.find("\"reason\":\"TimedOut\"")==std::string::npos ||
+           std::count(text.begin(),text.end(),'\n')!=2) return 9;
+    }
     return 0;
 }
 
@@ -888,6 +949,7 @@ HRESULT sunpack_toast_create(const wchar_t* executable, const wchar_t* arguments
             register_toast_app_identity(executable);
         }
         context->diagnostic_log_path = log_path ? log_path : L"";
+        if(!context->diagnostic_log_path.empty()) context->diagnostic_log = std::make_shared<DiagnosticLog>(context->diagnostic_log_path);
         *output = context.release();
     });
 }
@@ -899,7 +961,7 @@ HRESULT sunpack_toast_show(void* raw, const std::uint8_t* data,
         if (!data || size > kMaximumSnapshotBytes) winrt::throw_hresult(E_INVALIDARG);
         const auto snapshot = parse_snapshot(std::vector<std::uint8_t>(data, data + size));
         if (!context.presenter) {
-            context.presenter = std::make_unique<ToastPresenter>(context.diagnostic_log_path);
+            context.presenter = std::make_unique<ToastPresenter>(context.diagnostic_log);
         }
         context.presenter->show(snapshot, sequence);
     });

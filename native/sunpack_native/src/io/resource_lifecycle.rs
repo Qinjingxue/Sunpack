@@ -398,7 +398,11 @@ fn resource_snapshot_to_python(
         item.set_item("thread", format!("{:?}", record.thread))?;
         item.set_item(
             "created_from",
-            format!("{}:{}", record.created_from.file(), record.created_from.line()),
+            format!(
+                "{}:{}",
+                record.created_from.file(),
+                record.created_from.line()
+            ),
         )?;
         output.append(item)?;
     }

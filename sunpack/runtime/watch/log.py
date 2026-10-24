@@ -1,54 +1,15 @@
 from __future__ import annotations
 
-import json
-import os
 import threading
 import time
-import weakref
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from sunpack.core.support.path_keys import case_key
-from sunpack.core.support.resource_lifecycle import open_service_file
+from sunpack_native import NativeEventLog
 
 
 DEFAULT_EVENTS_MAX_BYTES = 512 * 1024
-
-_PATH_LOCKS_GUARD = threading.Lock()
-_PATH_LOCKS: weakref.WeakValueDictionary[str, threading.Lock] = weakref.WeakValueDictionary()
-
-
-def append_jsonl_record(
-    path: str | Path,
-    record: dict[str, Any],
-    *,
-    max_bytes: int = DEFAULT_EVENTS_MAX_BYTES,
-) -> None:
-    """Append a JSONL record, resetting the log if the next record exceeds its limit."""
-    target = Path(path)
-    encoded = (json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
-    limit = max(1, int(max_bytes))
-    lock = _path_lock(target)
-    with lock:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            current_size = target.stat().st_size
-        except FileNotFoundError:
-            current_size = 0
-        mode = "wb" if current_size > 0 and current_size + len(encoded) > limit else "ab"
-        with open_service_file(target, mode) as handle:
-            handle.write(encoded)
-
-
-def _path_lock(path: Path) -> threading.Lock:
-    key = case_key(os.path.abspath(str(path)))
-    with _PATH_LOCKS_GUARD:
-        lock = _PATH_LOCKS.get(key)
-        if lock is None:
-            lock = threading.Lock()
-            _PATH_LOCKS[key] = lock
-        return lock
 
 
 class WatchLogStore:
@@ -60,8 +21,9 @@ class WatchLogStore:
         wake_callback: Callable[[], None] | None = None,
     ):
         self.path = Path(path)
-        self._path_lock = _path_lock(self.path)
         self.max_bytes = max(1, int(max_bytes))
+        # The limit budgets recent results/diagnostics; live state has no cap.
+        self._native = NativeEventLog(str(self.path), max(1, self.max_bytes // 2), self.path.name.lower() == "events.jsonl")
         self._throttle_lock = threading.Lock()
         self._last_throttled_write: dict[tuple[str, str], tuple[float, float]] = {}
         self._next_throttle_expiry: float | None = None
@@ -88,11 +50,29 @@ class WatchLogStore:
             (expiry for _, expiry in self._last_throttled_write.values()), default=None,
         )
 
+    def begin_recovery(self) -> None:
+        self._native.begin_recovery()
+
+    def recover(self, state=None) -> None:
+        self._native.recover(state)
+
+    def invalidate(self) -> None:
+        self._native.invalidate()
+
+    def flush(self) -> None:
+        """Explicit drain for shutdown/tests; ordinary write never waits for I/O."""
+        self._native.flush()
+
+    @property
+    def error(self) -> str | None:
+        return self._native.error
+
     def close(self) -> None:
         with self._throttle_lock:
             self._wake_callback = None
             self._last_throttled_write.clear()
             self._next_throttle_expiry = None
+        self._native.close()
 
     def write(self, event: str, **payload: Any) -> None:
         record = {
@@ -101,14 +81,7 @@ class WatchLogStore:
             "event": event,
             **payload,
         }
-        try:
-            append_jsonl_record(
-                self.path,
-                record,
-                max_bytes=self.max_bytes,
-            )
-        except Exception:
-            return
+        self._native.write(record)
 
     def write_throttled(
         self,

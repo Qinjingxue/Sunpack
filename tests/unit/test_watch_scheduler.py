@@ -1892,6 +1892,7 @@ def test_watch_scheduler_ignores_unchanged_event_after_no_tasks_result(tmp_path,
     assert unchanged.processed == 0
     assert watcher.pending_count == 0
     assert not watcher.state.entries
+    watcher.log.flush()
     log_text = (tmp_path / ".sunpack_watch" / "events.jsonl").read_text(encoding="utf-8")
     assert '"event":"no_tasks_found"' in log_text
     assert '"event":"done"' not in log_text
@@ -2239,6 +2240,46 @@ def test_unstructured_nested_password_failure_is_terminal_without_retry_anchor(t
     assert _await(watcher.run_once()).processed == 0
     assert watcher.pending_count == 0
     assert [event[0] for event in notifications.events] == ["submitted", "failed"]
+
+
+def test_nested_waiting_completion_retires_all_processing_cards(tmp_path):
+    # Scalar request outcomes cannot catch a successful parent/child remaining
+    # "processing" when another nested child blocks. No extraction is needed.
+    import json
+    outer, locked, leaf = (tmp_path / name for name in ("carrier.fake", "nested.001", "leaf.bin"))
+    for path in (outer, locked, leaf):
+        path.write_bytes(b"fixture")
+    failure = FailureInfo(FailureKind.WRONG_PASSWORD, "extraction", "locked nested input")
+    summary = RunSummary(target_results=(
+        TargetRunResult(str(outer), OutcomeKind.COMPLETE_SUCCESS),
+        TargetRunResult(str(locked), OutcomeKind.FAILURE, failure=failure, error=failure.message),
+        TargetRunResult(str(leaf), OutcomeKind.COMPLETE_SUCCESS),
+    ))
+    watcher = _watcher(tmp_path)
+    watcher.log.recover()
+    watcher._claim_pipeline_sources("nested", [str(path) for path in (outer, locked, leaf)], path=str(outer), groups=[
+        {"path": str(path), "name": path.name, "members": [str(path)]}
+        for path in (outer, locked, leaf)
+    ])
+
+    async def scenario():
+        async def complete():
+            return PipelineResponse("nested", summary)
+        request = scheduler_module._ActivePipelineRequest(
+            "nested", WatchCandidate(str(outer), 7, 1.0), asyncio.create_task(complete()),
+            password_generation=watcher.state.password_generation,
+        )
+        try:
+            result = await watcher._complete_candidate(request)
+            assert result.failed == 1
+            watcher.log.flush()
+            records = [json.loads(line) for line in watcher.log.path.read_text(encoding="utf-8").splitlines()]
+            latest = {r["path"]: r["event"] for r in records
+                      if r["event"] in {"processing_started", "done", "failed_password"}}
+            assert latest == {str(outer): "done", str(locked): "failed_password", str(leaf): "done"}
+        finally:
+            await watcher.aclose()
+    _await(scenario())
 
 
 def test_watch_scheduler_does_not_retry_password_inconclusive_after_password_source_change(tmp_path, monkeypatch):
@@ -2724,6 +2765,7 @@ def test_watch_scheduler_writes_jsonl_log_for_failures(tmp_path, monkeypatch):
     _await(watcher.run_once())
 
     log_path = tmp_path / ".sunpack_watch" / "events.jsonl"
+    watcher.log.flush()
     text = log_path.read_text(encoding="utf-8")
     assert '"event":"failed_password"' in text
     assert "wrong password" in text
@@ -2840,9 +2882,13 @@ def test_watch_scheduler_claim_removes_pending_sibling_before_source_cleanup_pro
     )
 
     import json
+    watcher.log.flush()
     records = [json.loads(line) for line in watcher.log.path.read_text(encoding="utf-8").splitlines()]
     claim = next(record for record in records if record["event"] == "pipeline_sources_claimed")
-    assert claim["path"] == str(first_volume) and claim["groups"] == groups
+    assert claim["path"] == str(first_volume)
+    assert len(claim["groups"]) == len(groups)
+    assert all(all(actual[k] == value for k, value in expected.items())
+               for actual, expected in zip(claim["groups"], groups))
 
     # The pipeline claim consumes the old sibling event. During cleanup, even
     # a new watchdog event becomes only a dirty bit; no native file observation

@@ -6,7 +6,7 @@ import sys
 import traceback
 from datetime import datetime, timezone
 
-from sunpack.runtime.watch.log import append_jsonl_record
+from sunpack.runtime.watch.log import WatchLogStore
 from sunpack.core.support.resources import get_resource_path
 from sunpack.core.support.runtime_cwd import runtime_working_directory
 
@@ -51,6 +51,12 @@ def _write_bootstrap_error(exc: BaseException) -> None:
             "error": str(exc),
             "traceback": traceback.format_exc(),
         }
-        append_jsonl_record(state_dir / "events.jsonl", payload)
+        # A launcher may fail while the actual Watch owner is still healthy.
+        # Never let that second process replace the owner's state projection.
+        log = WatchLogStore(str(state_dir / "bootstrap.events.jsonl"))
+        try:
+            log.write(payload.pop("event"), **payload)
+        finally:
+            log.close()  # This process is exiting: drain its diagnostic writer.
     except Exception:
         pass

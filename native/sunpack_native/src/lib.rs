@@ -1,6 +1,7 @@
 use pyo3::prelude::*;
 
 mod analysis_native;
+mod event_log;
 mod fast_hash;
 mod filesystem;
 mod formats;
@@ -55,6 +56,7 @@ fn sunpack_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
         )?)?;
     }
     m.add_class::<watch_store::NativeWatchState>()?;
+    m.add_class::<event_log::NativeEventLog>()?;
     m.add_class::<watch_journal::NativeJournalStream>()?;
     m.add_function(wrap_pyfunction!(watch_journal::watch_journal_open, m)?)?;
     m.add_class::<watch_store::NativeWatchOperations>()?;

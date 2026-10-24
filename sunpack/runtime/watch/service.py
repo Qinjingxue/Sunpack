@@ -445,6 +445,7 @@ class WatchService:
         try:
             _acquire_watch_broker()
             self._broker_acquired = True
+            self.log.begin_recovery()
             self.log.write("watch_broker_acquired")
             self.log.write(
                 "service_started",
@@ -555,6 +556,8 @@ class WatchService:
                         self._broker_acquired = False
                 self._stop_toast_host()
             self.log.write("service_stopped", state_dir=self.state_dir)
+            self.log.invalidate()
+            await asyncio.to_thread(self.log.close)
             if tray_shutdown_error is not None:
                 raise tray_shutdown_error
 
@@ -646,6 +649,7 @@ class WatchService:
         roots = self.roots
         if not roots:
             await asyncio.to_thread(self._retire_unwatched_state)
+            self.log.recover()
             self._stop_toast_host()
             self.log.write("scheduler_not_started", reason="no_existing_roots", configured_roots=[entry.input_root for entry in self.service_config["root_entries"]])
             return
@@ -985,6 +989,9 @@ class WatchService:
             failed_log = self.log
             self.config, self.service_config, self.state_dir, self.log = previous
             failed_log.write("config_reload_failed", error=str(exc), error_type=type(exc).__name__, phase="apply")
+            if failed_log is not self.log:
+                failed_log.invalidate()
+                await asyncio.to_thread(failed_log.close)
             try:
                 if plan.restart_scheduler:
                     await self._start_scheduler()
@@ -1006,6 +1013,9 @@ class WatchService:
             tray_reconciled=plan.reconcile_tray,
             runtime_process_mode_changed=plan.runtime_process_mode_changed,
         )
+        if previous[3] is not self.log:
+            previous[3].invalidate()
+            await asyncio.to_thread(previous[3].close)
         return True
 
     async def _scan_pending_roots(self) -> None:

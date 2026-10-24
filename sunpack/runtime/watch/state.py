@@ -753,6 +753,7 @@ class WatchStateStore:
                 self._checkpoint_condition.notify_all()
 
     def _on_journal_error(self, error: BaseException) -> None:
+        self._native.invalidate_events()
         with self._checkpoint_condition:
             if self._persistence_fault is None:
                 self._persistence_fault = error
@@ -760,6 +761,7 @@ class WatchStateStore:
 
     def _raise_persistence_fault_locked(self) -> None:
         if self._persistence_fault is not None:
+            self._native.invalidate_events()
             raise RuntimeError("Watch state persistence is unavailable") from self._persistence_fault
 
     def commit_runtime(self, operations, *, durable=False, admit=None):

@@ -381,9 +381,54 @@ pub(crate) struct NativeWatchReplay {
 #[pyclass(module = "sunpack_native", frozen)]
 pub(crate) struct NativeWatchState {
     pub(crate) data: Arc<Mutex<StateData>>,
+    events: Mutex<Option<std::sync::Weak<crate::event_log::Shared>>>,
 }
 
 impl NativeWatchState {
+    pub(crate) fn with_event_projection<T>(&self, publish: impl FnOnce(Vec<Value>) -> T) -> T {
+        let data = self.lock();
+        let mut rows = Vec::new();
+        let mut member_presence = HashMap::new();
+        for record in data.pending.values() {
+            rows.push(serde_json::json!({"event":"task_queued","path":record.path}));
+        }
+        let mut entries: Vec<_> = data.entries.values().collect();
+        entries.sort_by(|a, b| {
+            a.last_attempt_at
+                .total_cmp(&b.last_attempt_at)
+                .then_with(|| a.path.cmp(&b.path))
+        });
+        for record in entries {
+            if !matches!(
+                record.status.as_str(),
+                "failed_password" | "suspended_missing_volume"
+            ) {
+                continue;
+            }
+            if let Some(group) = record.failure_payload.get("ui_group") {
+                // A member can disappear after its blocker WAL commit (even
+                // while offline). Verify only recorded member presence; never
+                // probe or rediscover an archive for the GUI projection.
+                let mut group = group.clone();
+                if let Some(members) = group["members"].as_array_mut() {
+                    members.retain(|member| {
+                        member.as_str().is_some_and(|member| {
+                            *member_presence
+                                .entry(path_key(member))
+                                .or_insert_with(|| recorded_file_presence(member))
+                                != Some(false)
+                        })
+                    });
+                    if !members.is_empty() {
+                        rows.push(serde_json::json!({"event":"pipeline_sources_claimed","groups":[group]}));
+                    }
+                }
+            }
+            rows.push(serde_json::json!({"event":record.status,"path":record.path,
+                "ts":record.last_attempt_at,"error":record.last_error}));
+        }
+        publish(rows)
+    }
     pub(crate) fn lock(&self) -> MutexGuard<'_, StateData> {
         self.data
             .lock()
@@ -448,6 +493,24 @@ impl NativeWatchState {
     fn new() -> Self {
         Self {
             data: Arc::new(Mutex::new(StateData::default())),
+            events: Mutex::new(None),
+        }
+    }
+
+    fn attach_events(&self, log: PyRef<'_, crate::event_log::NativeEventLog>) -> PyResult<()> {
+        *self.events.lock().unwrap() = Some(Arc::downgrade(log.shared()?));
+        Ok(())
+    }
+
+    fn invalidate_events(&self) {
+        if let Some(events) = self
+            .events
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+        {
+            events.invalidate();
         }
     }
 
@@ -730,7 +793,23 @@ impl NativeWatchState {
     fn decode_operations(&self, operations: &Bound<'_, PyAny>) -> PyResult<NativeWatchOperations> {
         let mut decoded = Vec::new();
         for operation in operations.try_iter()? {
-            decoded.push(decode_operation(&py_to_json(&operation?)?)?);
+            let mut operation = decode_operation(&py_to_json(&operation?)?)?;
+            if let Operation::PutEntry(_, record) = &mut operation {
+                if let Some(events) = self
+                    .events
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .and_then(std::sync::Weak::upgrade)
+                {
+                    if let Some(group) = events.group(&record.path) {
+                        Arc::make_mut(record)
+                            .failure_payload
+                            .insert("ui_group".into(), group);
+                    }
+                }
+            }
+            decoded.push(operation);
         }
         Ok(NativeWatchOperations {
             operations: Arc::new(Operations(decoded)),
@@ -741,6 +820,48 @@ impl NativeWatchState {
         let mut data = self.lock();
         for operation in operations.operations.0.iter() {
             data.apply(operation);
+            if let Operation::Delete(Collection::Entries, path) = operation {
+                if let Some(events) = self
+                    .events
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .and_then(std::sync::Weak::upgrade)
+                {
+                    let group = events.group(path);
+                    let remaining = group
+                        .as_ref()
+                        .and_then(|group| group["members"].as_array())
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .filter_map(|member| data.entries.get(&path_key(member)))
+                        .max_by(|a, b| a.last_attempt_at.total_cmp(&b.last_attempt_at));
+                    if let Some(record) = remaining {
+                        events.submit(serde_json::json!({"event":record.status,"path":record.path,
+                            "ts":record.last_attempt_at,"error":record.last_error,"failures":[record.failure_payload]}));
+                    } else {
+                        events.submit(serde_json::json!({"event":"blocker_cleared","path":path}));
+                    }
+                }
+            }
+            if let Operation::PutEntry(_, record) = operation {
+                if matches!(
+                    record.status.as_str(),
+                    "failed_password" | "suspended_missing_volume"
+                ) {
+                    if let Some(events) = self
+                        .events
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .and_then(std::sync::Weak::upgrade)
+                    {
+                        events.submit(serde_json::json!({"event":record.status,"path":record.path,
+                            "ts":record.last_attempt_at,"error":record.last_error,"failures":[record.failure_payload]}));
+                    }
+                }
+            }
         }
     }
 
@@ -804,7 +925,7 @@ fn path_key(path: &str) -> String {
     crate::path_keys::path_key(&absolute.to_string_lossy())
 }
 
-fn is_path_under(path: &str, root: &str) -> bool {
+pub(crate) fn is_path_under(path: &str, root: &str) -> bool {
     let root = root.trim_end_matches('\\');
     path.len() > root.len() && path.starts_with(root) && path.as_bytes()[root.len()] == b'\\'
 }
@@ -1060,7 +1181,7 @@ fn json_to_py(py: Python<'_>, value: &Value) -> PyResult<Py<PyAny>> {
     })
 }
 
-fn py_to_json(value: &Bound<'_, PyAny>) -> PyResult<Value> {
+pub(crate) fn py_to_json(value: &Bound<'_, PyAny>) -> PyResult<Value> {
     if value.is_none() {
         return Ok(Value::Null);
     }

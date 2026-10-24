@@ -23,7 +23,7 @@ def test_gui_main_logs_bootstrap_failure(tmp_path, monkeypatch):
     monkeypatch.setattr(gui_main, "get_resource_path", lambda _name: tmp_path / ".sunpack_watch")
 
     assert gui_main.main([]) == 1
-    record = json.loads((tmp_path / ".sunpack_watch" / "events.jsonl").read_text(encoding="utf-8"))
+    record = json.loads((tmp_path / ".sunpack_watch" / "bootstrap.events.jsonl").read_text(encoding="utf-8"))
     assert record["event"] == "gui_bootstrap_error"
     assert record["error_type"] == "RuntimeError"
     assert record["error"] == "startup failed"

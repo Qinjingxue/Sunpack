@@ -1,3 +1,4 @@
+#include "event_publication.hpp"
 #include "application.hpp"
 #include "presentation.hpp"
 #include "range_editor.hpp"
@@ -1256,7 +1257,7 @@ int wmain(int argc,wchar_t** argv) {
         }
         atomic_write(dir/"builtin_passwords.json",R"({"passwords":[{"value":"  #中文  "}],"clipboard_history":["history"]})");
         atomic_write(dir/"sunpack_watch_roots.txt",utf8(dir.wstring())+"\n");
-        atomic_write(dir/".sunpack_watch"/"events.jsonl",Json({{"event","done"},{"path",utf8((dir/"carrier.001").wstring())}}).dump()+"\n");
+        atomic_write(dir/".sunpack_watch"/"events.jsonl",published_events(Json({{"event","done"},{"path",utf8((dir/"carrier.001").wstring())}}).dump()+"\n"));
         {
             Options options; options.data_dir=dir; options.allow_cli=true;
             options.cli={executable_path(),dir,{L"--fake-cli",gate_name}};
@@ -1352,7 +1353,7 @@ int wmain(int argc,wchar_t** argv) {
             std::string many;
             const char* phases[]={"processing_started","failed_terminal","suspended_missing_volume","done"};
             for(int i=0;i<virtualTaskCount;++i) many+=Json({{"event",phases[i%4]},{"path",utf8((dir/"history"/("task-"+std::to_string(i)+".001")).wstring())},{"time","2026-10-19T09:15:42.731112+00:00"},{"output_dirs",{utf8(dir.wstring())}}}).dump()+"\n";
-            atomic_write(dir/".sunpack_watch"/"events.jsonl",many);
+            atomic_write(dir/".sunpack_watch"/"events.jsonl",published_events(many));
             pump_diagnostic(app,[&]{return state(app.page(),"tasks")["total"]==virtualTaskCount;},"Load virtual tasks");
             virtual_tail(app,"taskItems","taskListScroll",virtualTaskCount);
             auto tail=state(app.page(),"tasks")["rows"][virtualTaskCount-1];
@@ -1436,7 +1437,7 @@ int wmain(int argc,wchar_t** argv) {
             ui_page_set_json(app.page(),"requests","[]");
             ui_debug_pump();
             drag_after_wheel(app);
-            atomic_write(dir/".sunpack_watch"/"events.jsonl",Json({{"event","done"},{"path",utf8((dir/"carrier.001").wstring())}}).dump()+"\n");
+            atomic_write(dir/".sunpack_watch"/"events.jsonl",published_events(Json({{"event","done"},{"path",utf8((dir/"carrier.001").wstring())}}).dump()+"\n"));
             pump_diagnostic(app,[&]{return state(app.page(),"tasks")["total"]==1;},"Log replacement");
             assert(!state(app.page(),"texts").contains("otherTasks"));
             assert(rect(app,"allRoots").top>=rect(app,"directorySearch").bottom);
@@ -2041,10 +2042,10 @@ int wmain(int argc,wchar_t** argv) {
 
             click(app,"tabTasks"); pump([&]{return state(app.page(),"tab")=="tasks";});
             auto main=utf8((dir/"carrier.001").wstring()), sibling=utf8((dir/"disguised.blob").wstring());
-            atomic_write(dir/".sunpack_watch"/"events.jsonl",
+            atomic_write(dir/".sunpack_watch"/"events.jsonl",published_events(
                 Json{{"event","pipeline_sources_claimed"},{"path",sibling},{"groups",Json::array({
                     Json{{"path",main},{"name","movie.7z"},{"members",{main,sibling}}}})}}.dump()+"\n"+
-                Json{{"event","failed_password"},{"path",sibling}}.dump()+"\n");
+                Json{{"event","failed_password"},{"path",sibling}}.dump()+"\n"));
             try { pump([&]{return state(app.page(),"tasks")["rows"][0]["status"]=="taskWaiting";}); }
             catch(...) { std::cerr<<"Log model: "<<state(app.page(),"tasks")<<" errors="<<state(app.page(),"errors")<<"\n"; throw; }
             auto grouped=state(app.page(),"tasks")["rows"][0];
@@ -2058,7 +2059,7 @@ int wmain(int argc,wchar_t** argv) {
             pump([&]{return state(app.page(),"errors").contains("sunpack_config.json");});
             std::cerr<<"Invalid configuration retained\n";
             assert(!state(app.page(),"fields").empty());
-            atomic_write(dir/"elsewhere"/"events.jsonl",Json({{"event","done"},{"path",utf8((dir/"other.fake").wstring())}}).dump()+"\n");
+            atomic_write(dir/"elsewhere"/"events.jsonl",published_events(Json({{"event","done"},{"path",utf8((dir/"other.fake").wstring())}}).dump()+"\n"));
             atomic_write(dir/"sunpack_config.json",R"({"watch":{"state_dir":"elsewhere"}})");
             try { pump([&]{return state(app.page(),"tasks")["rows"][0]["name"]=="other.fake";}); }
             catch(...) { std::cerr<<"Rebound log: "<<state(app.page(),"tasks")<<" errors="<<state(app.page(),"errors")<<" log="<<state(app.page(),"logPath")<<" fields="<<state(app.page(),"fields")<<"\n"; throw; }

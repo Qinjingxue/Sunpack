@@ -263,15 +263,18 @@ impl NativeCandidateTable {
         // original snapshot and surviving anchors instead of scanning again.
         let departed: HashSet<String> = refresh_paths
             .filter(|paths| !paths.is_empty())
-            .map(|paths| py.detach(|| {
-                paths.into_iter()
-                    .filter(|path| {
-                        std::fs::metadata(path)
-                            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
-                    })
-                    .map(|path| path_key(&path))
-                    .collect()
-            }))
+            .map(|paths| {
+                py.detach(|| {
+                    paths
+                        .into_iter()
+                        .filter(|path| {
+                            std::fs::metadata(path)
+                                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                        })
+                        .map(|path| path_key(&path))
+                        .collect()
+                })
+            })
             .unwrap_or_default();
         let current_snapshots = (!departed.is_empty()).then(|| {
             (

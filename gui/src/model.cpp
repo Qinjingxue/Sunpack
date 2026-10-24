@@ -610,10 +610,56 @@ Json save_changes(const fs::path& dir,const Json& fields,const Json& passwords,c
 std::string root_for(const fs::path& path,const WatchRoots& roots) {
     return indexed_root(path_key(path),index_roots(roots));
 }
+struct EventLog::Publication {
+    Handle process, dirty, published, mapping, stop{CreateEventW(nullptr,TRUE,FALSE,nullptr)};
+    const volatile LONG64* revision = nullptr;
+    std::thread thread;
+    explicit Publication(const Json& header,const std::function<void()>& changed) {
+        auto name=wide(header.value("generation",std::string()));
+        if(name.rfind(L"Local\\SunPack.State.",0)!=0 || name.size()>200) return;
+        process.value=OpenProcess(SYNCHRONIZE|PROCESS_QUERY_LIMITED_INFORMATION,FALSE,header.value("owner_pid",DWORD(0)));
+        FILETIME created{},exit{},kernel{},user{};
+        if(!process.value || !GetProcessTimes(process,&created,&exit,&kernel,&user)) return;
+        auto started=(uint64_t(created.dwHighDateTime)<<32)|created.dwLowDateTime;
+        if(std::to_string(started)!=header.value("owner_started",std::string())) return;
+        dirty.value=OpenEventW(SYNCHRONIZE,FALSE,(name+L".dirty").c_str());
+        published.value=OpenEventW(SYNCHRONIZE,FALSE,(name+L".published").c_str());
+        mapping.value=OpenFileMappingW(FILE_MAP_READ,FALSE,(name+L".revision").c_str());
+        if(mapping.value) revision=static_cast<const volatile LONG64*>(MapViewOfFile(mapping,FILE_MAP_READ,0,0,8));
+        if(!dirty.value || !published.value || !revision) return;
+        const bool initial_health=valid();
+        if(changed) thread=std::thread([this,changed,initial_health]{
+            bool healthy=initial_health;
+            for(;;) {
+                HANDLE waits[]={stop,process,healthy?dirty.value:published.value};
+                auto signal=WaitForMultipleObjects(3,waits,FALSE,INFINITE);
+                if(signal==WAIT_OBJECT_0 || signal==WAIT_FAILED) return;
+                changed();
+                if(signal==WAIT_OBJECT_0+1) return;
+                healthy=valid();
+            }
+        });
+    }
+    bool valid() const {
+        return process.value && dirty.value && published.value && revision &&
+            WaitForSingleObject(process,0)==WAIT_TIMEOUT &&
+            WaitForSingleObject(dirty,0)==WAIT_TIMEOUT && WaitForSingleObject(published,0)==WAIT_OBJECT_0;
+    }
+    bool matches(uint64_t expected) const { return valid() && uint64_t(*revision)==expected && valid(); }
+    uint64_t current_revision() const { return valid()?uint64_t(*revision):0; }
+    ~Publication() { SetEvent(stop); if(thread.joinable()) thread.join(); if(revision) UnmapViewOfFile(const_cast<const LONG64*>(revision)); }
+};
+EventLog::EventLog(std::function<void()> changed):publication_changed_(std::move(changed)) {}
+EventLog::~EventLog() = default;
+bool EventLog::unverify() {
+    if(!verified_) return false;
+    verified_=false; for(auto& pair:tasks) mark_changed(pair.first); return true;
+}
 void EventLog::set_path(const fs::path& p) {
     if (path_==p) return;
     path_=p; offset_=identity_=sequence_=volume_=0; prefix_.clear(); anchor_.clear(); pending_.clear(); tasks.clear(); aliases_.clear(); malformed=0;
     changed_keys.clear(); rebuilt=true;
+    publication_.reset(); generation_.clear(); publication_revision_=retried_revision_=0; state_ready_=verified_=false;
 }
 void EventLog::mark_changed(const std::wstring& key) {
     ++sequence_;
@@ -655,7 +701,7 @@ void EventLog::accept_group(const Json& group) {
     task.path=path;
     task.name=group.value("name",std::string());
     if(task.name.empty()) task.name=utf8(fs::path(wide(path)).filename().wstring());
-    task.multipart=task.multipart || members.size()>1;
+    task.multipart=task.multipart || members.size()>1 || group.value("multipart",false);
     task.members=std::move(members);
     for(auto& member:task.members) aliases_[member]=key;
     tasks[key]=std::move(task); mark_changed(key);
@@ -663,8 +709,25 @@ void EventLog::accept_group(const Json& group) {
 void EventLog::accept(const Json& j) {
     if(!j.is_object() || !j.contains("event") || !j["event"].is_string()) return;
     auto event=j["event"].get<std::string>();
+    if(event=="state_begin") {
+        publication_.reset(); state_ready_=false; verified_=false;
+        publication_revision_=0;
+        for(auto& pair:tasks) mark_changed(pair.first);
+        tasks.clear(); aliases_.clear();
+        auto generation=j.value("generation",std::string());
+        if(generation_!=generation) retried_revision_=0;
+        generation_=std::move(generation);
+        if(j.value("schema",0)==1) publication_=std::make_unique<Publication>(j,publication_changed_);
+        return;
+    }
+    if(event=="state_ready") { state_ready_=!generation_.empty() && j.value("generation",std::string())==generation_; return; }
+    if(event=="state_commit") { publication_revision_=j.value("revision",uint64_t(0)); return; }
     if(event=="pipeline_sources_claimed") {
-        if(j.contains("groups") && j["groups"].is_array()) for(auto& group:j["groups"]) accept_group(group);
+        if(j.contains("groups") && j["groups"].is_array()) for(auto& group:j["groups"]) {
+            accept_group(group);
+            if(j.value("processing",false) && group.is_object()) accept(Json{{"event","processing_started"},
+                {"path",group.value("path",std::string())},{"ts",j.value("ts",Json())},{"time",j.value("time",Json())}});
+        }
         return;
     }
     if(!j.contains("path") || !j["path"].is_string()) return;
@@ -673,6 +736,14 @@ void EventLog::accept(const Json& j) {
     auto physical=path_key(wide(path));
     auto alias=aliases_.find(physical);
     auto key=alias==aliases_.end()?physical:alias->second;
+    if(event=="task_retired") { erase_task(key); return; }
+    if(event=="blocker_cleared") {
+        auto found=tasks.find(key);
+        if(found!=tasks.end() && !terminal(found->second)) {
+            found->second.status="taskWaiting"; found->second.waiting_reason="taskWaitingQueued"; mark_changed(key);
+        }
+        return;
+    }
     if(event=="candidate_departed") {
         bool recursive=j.value("recursive",false);
         std::vector<std::wstring> affected;
@@ -705,11 +776,12 @@ void EventLog::accept(const Json& j) {
         // A sibling request ending says nothing about its confirmed owner's
         // outcome. Never erase the shared card (or completed history).
         if(it!=tasks.end() && !terminal(it->second) &&
-            (it->second.name.empty() || (event=="no_tasks_found" && it->second.members.size()==1))) erase_task(key);
+            (it->second.name.empty() || (event=="no_tasks_found" && (it->second.members.size()==1 || j.value("retire_group",false))))) erase_task(key);
         return;
     }
     std::string status, reason;
     if(event=="processing_started") status="taskProcessing";
+    else if(event=="task_queued") { status="taskWaiting"; reason="taskWaitingQueued"; }
     else if(event=="failed_password" || event=="suspended_missing_volume") {
         status="taskWaiting"; reason=event=="failed_password"?"taskWaitingPassword":"taskWaitingVolumes";
     } else if(event=="done") status="taskSucceeded";
@@ -734,12 +806,15 @@ void EventLog::accept(const Json& j) {
     mark_changed(key); task.sequence=sequence_;
 }
 bool EventLog::refresh(bool missing_is_final) {
+    try {
+    const bool was_verified=verified_;
     retry_required=false; changed_keys.clear(); rebuilt=false;
     Handle f(CreateFileW(path_.c_str(),GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,OPEN_EXISTING,FILE_FLAG_SEQUENTIAL_SCAN,nullptr));
     if(f.value==INVALID_HANDLE_VALUE) {
         if(GetLastError()==ERROR_FILE_NOT_FOUND || GetLastError()==ERROR_PATH_NOT_FOUND) {
             if(!missing_is_final) { SetLastError(ERROR_FILE_NOT_FOUND); win_error("opReadEventLog"); }
-            bool changed=!tasks.empty(); rebuilt=changed; offset_=identity_=volume_=0; prefix_.clear(); anchor_.clear(); pending_.clear(); tasks.clear(); aliases_.clear(); malformed=0; return changed;
+            bool changed=!tasks.empty(); rebuilt=changed; offset_=identity_=volume_=0; prefix_.clear(); anchor_.clear(); pending_.clear(); tasks.clear(); aliases_.clear(); malformed=0;
+            publication_.reset(); generation_.clear(); publication_revision_=0; state_ready_=verified_=false; return changed;
         }
         win_error("opReadEventLog");
     }
@@ -751,7 +826,8 @@ bool EventLog::refresh(bool missing_is_final) {
     if(!reset && !prefix_.empty()) reset=text_at(f,0,prefix_.size())!=prefix_;
     if(!reset && !anchor_.empty()) reset=text_at(f,offset_-anchor_.size(),anchor_.size())!=anchor_;
     bool changed=reset; rebuilt=reset;
-    if(reset) { offset_=sequence_=0; prefix_.clear(); anchor_.clear(); pending_.clear(); tasks.clear(); aliases_.clear(); malformed=0; }
+    if(reset) { offset_=sequence_=0; prefix_.clear(); anchor_.clear(); pending_.clear(); tasks.clear(); aliases_.clear(); malformed=0;
+        publication_.reset(); generation_.clear(); publication_revision_=0; state_ready_=false; }
     identity_=id; volume_=info.dwVolumeSerialNumber;
     // Parse bounded chunks, retaining only the unfinished record and logical task projections.
     while(offset_<size) {
@@ -789,12 +865,22 @@ bool EventLog::refresh(bool missing_is_final) {
         if(!appended) identity_=0;
         retry_required=true;
     }
+    verified_=state_ready_ && publication_ && publication_->matches(publication_revision_) && pending_.empty() && malformed==0 && !retry_required;
+    const auto published=publication_?publication_->current_revision():0;
+    // A reader can have opened the old file just before atomic replacement.
+    // Retry that revision once. A persistently truncated/corrupt log must stay
+    // unverified and wait for an actual publication/file event, never spin.
+    if(state_ready_ && published && published!=publication_revision_ && published!=retried_revision_) {
+        retried_revision_=published; retry_required=true;
+    }
+    if(verified_!=was_verified) { changed=true; for(auto& pair:tasks) mark_changed(pair.first); }
     return changed;
+    } catch(...) { unverify(); throw; }
 }
 namespace {
 // Both snapshot and incremental updates project a task identically.
 Json project_task(const std::wstring& key,const Task& t,const RootIndex& roots,
-    const std::string& language,std::unordered_map<std::string,std::string>& translated_statuses) {
+    const std::string& language,std::unordered_map<std::string,std::string>& translated_statuses,bool verified) {
     auto& cache=t.display;
     if(cache.path!=t.path) {
         const fs::path path=wide(t.path);
@@ -808,18 +894,19 @@ Json project_task(const std::wstring& key,const Task& t,const RootIndex& roots,
         cache.has_timestamp=t.has_timestamp;
         cache.time_valid=true;
     }
-    const char* tone=t.status=="taskSucceeded"?"success":t.status=="taskFailed"?"failure":
-        t.status=="taskWaiting"?"waiting":"info";
-    const auto& label=t.waiting_reason.empty()?t.status:t.waiting_reason;
+    const auto status=verified?t.status:std::string("taskUnverified");
+    const char* tone=status=="taskSucceeded"?"success":status=="taskFailed"?"failure":
+        status=="taskWaiting"?"waiting":"info";
+    const auto label=verified?(t.waiting_reason.empty()?t.status:t.waiting_reason):std::string("taskUnverified");
     auto found=translated_statuses.find(label);
     if(found==translated_statuses.end()) found=translated_statuses.emplace(label,tr(label,language)).first;
     return {{"id",utf8(key)},{"name",t.name.empty()?cache.filename:t.name},{"directory",cache.directory},
-        {"path",t.path},{"root",indexed_root(key,roots)},{"status",t.status},{"statusText",found->second},{"partCount",t.multipart?t.members.size():0},{"time",cache.time},
-        {"statusTone",tone},{"outputs",t.outputs},{"sortTimestamp",t.timestamp},{"sortSequence",t.sequence}};
+        {"path",t.path},{"root",indexed_root(key,roots)},{"status",status},{"statusText",found->second},{"partCount",t.multipart?t.members.size():0},{"time",cache.time},
+        {"statusTone",tone},{"outputs",verified?t.outputs:std::vector<std::string>{}},{"sortTimestamp",t.timestamp},{"sortSequence",t.sequence}};
 }
 bool task_matches(const Task& t,const std::wstring& key,const RootIndex& roots,const View& v,
-    const std::wstring& folded_query) {
-    if(t.status.empty() || (!v.task_status.empty() && t.status!=v.task_status) ||
+    const std::wstring& folded_query,bool verified) {
+    if(t.status.empty() || (!v.task_status.empty() && (verified?t.status:std::string("taskUnverified"))!=v.task_status) ||
         (!v.task_root.empty() && indexed_root(key,roots)!=v.task_root)) return false;
     if(contains_folded(t.path,folded_query) || contains_folded(t.name,folded_query)) return true;
     return std::any_of(t.members.begin(),t.members.end(),[&](const auto& member){return contains_folded(utf8(member),folded_query);});
@@ -835,7 +922,7 @@ Json task_rows(const EventLog& log,const WatchRoots& roots,const View& v,const s
     using TaskEntry=decltype(log.tasks)::value_type;
     std::vector<const TaskEntry*> rows;
     rows.reserve(log.tasks.size());
-    for(auto& pair:log.tasks) if(task_matches(pair.second,pair.first,root_index,v,query)) rows.push_back(&pair);
+    for(auto& pair:log.tasks) if(task_matches(pair.second,pair.first,root_index,v,query,log.verified())) rows.push_back(&pair);
     const auto filtered=stats?Clock::now():Clock::time_point{};
     std::sort(rows.begin(),rows.end(),[](const auto& a,const auto& b){
         if(a->second.timestamp!=b->second.timestamp) return a->second.timestamp>b->second.timestamp;
@@ -853,7 +940,7 @@ Json task_rows(const EventLog& log,const WatchRoots& roots,const View& v,const s
         result={{"rows",Json::array()},{"total",rows.size()},{"malformed",log.malformed}};
         auto& projected=result["rows"];
         std::unordered_map<std::string,std::string> labels;
-        for(auto* task:rows) projected.push_back(project_task(task->first,task->second,root_index,language,labels));
+        for(auto* task:rows) projected.push_back(project_task(task->first,task->second,root_index,language,labels,log.verified()));
     }
     if(stats) {
         const auto finished=Clock::now();
@@ -874,8 +961,8 @@ Json task_delta(const EventLog& log,const WatchRoots& roots,const View& v,const 
     for(const auto& key:log.changed_keys) {
         Json change={{"id",utf8(key)}};
         auto it=log.tasks.find(key);
-        if(it!=log.tasks.end() && task_matches(it->second,key,root_index,v,query))
-            change["row"]=project_task(key,it->second,root_index,language,labels);
+        if(it!=log.tasks.end() && task_matches(it->second,key,root_index,v,query,log.verified()))
+            change["row"]=project_task(key,it->second,root_index,language,labels,log.verified());
         changes.push_back(std::move(change));
     }
     return {{"changes",std::move(changes)},{"malformed",log.malformed}};

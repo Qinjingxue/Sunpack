@@ -142,7 +142,9 @@ impl NativeDirectorySnapshot {
                 .rows
                 .iter()
                 .copied()
-                .filter(|&row| !excluded.contains(&crate::path_keys::path_key(&self.table.paths[row])))
+                .filter(|&row| {
+                    !excluded.contains(&crate::path_keys::path_key(&self.table.paths[row]))
+                })
                 .collect(),
             buckets: OnceLock::new(),
         }
@@ -1387,11 +1389,15 @@ impl NativeDirectoryScanOptions {
                 records.raw.retain(|row| !state.is_owned(&row.path));
                 records.filtered.retain(|row| !state.is_owned(&row.path));
             }
-            let live_paths: HashSet<&str> = records.raw.iter()
+            let live_paths: HashSet<&str> = records
+                .raw
+                .iter()
                 .filter(|record| record.relation_member_eligible)
                 .map(|record| record.path.as_str())
                 .collect();
-            let old: HashMap<&str, usize> = previous.rows.iter()
+            let old: HashMap<&str, usize> = previous
+                .rows
+                .iter()
                 .filter(|&&row| live_paths.contains(previous.table.paths[row].as_str()))
                 .map(|&row| (previous.table.paths[row].as_str(), row))
                 .collect();
@@ -1401,18 +1407,23 @@ impl NativeDirectoryScanOptions {
                     continue;
                 }
                 if let Some(&row) = old.get(record.path.as_str()) {
-                    if record.size.is_some() && record.mtime_ns.is_some()
+                    if record.size.is_some()
+                        && record.mtime_ns.is_some()
                         && record.size == previous.table.sizes[row]
                         && record.mtime_ns == previous.table.mtimes_ns[row]
                     {
                         record.relation_anchor = previous.table.relation_anchors[row]
-                            .as_ref().filter(|anchor| anchor.error.is_empty()).cloned();
+                            .as_ref()
+                            .filter(|anchor| anchor.error.is_empty())
+                            .cloned();
                     }
                 }
             }
             populate_relation_anchors(&mut records.raw);
             Ok::<_, PyErr>(NativeDirectorySnapshot::from_views(
-                records.filtered, records.raw, records.errors,
+                records.filtered,
+                records.raw,
+                records.errors,
             ))
         })?;
         Ok((Py::new(py, filtered)?, Py::new(py, raw)?))
@@ -2677,7 +2688,10 @@ fn scan_directory_impl<const PROFILE: bool>(
         .map(|s| Path::new(&s.root))
         .unwrap_or(&root);
     let mut errors = DirectoryReadErrors::new(&root);
-    let metadata = match known_metadata.map(Ok).unwrap_or_else(|| fs::metadata(&root)) {
+    let metadata = match known_metadata
+        .map(Ok)
+        .unwrap_or_else(|| fs::metadata(&root))
+    {
         Ok(metadata) => Some(metadata),
         Err(error) => {
             errors.push(&root, "metadata", error);
@@ -2742,8 +2756,16 @@ fn scan_directory_impl<const PROFILE: bool>(
             relation_anchor: None,
         };
         let accepted = eligible && numeric_ranges_allow(&options.size_ranges, Some(size));
-        let filtered = if accepted { vec![record.clone()] } else { Vec::new() };
-        let raw = if collect_raw { vec![record] } else { Vec::new() };
+        let filtered = if accepted {
+            vec![record.clone()]
+        } else {
+            Vec::new()
+        };
+        let raw = if collect_raw {
+            vec![record]
+        } else {
+            Vec::new()
+        };
         if PROFILE {
             if let Some(profile) = profile.as_deref_mut() {
                 profile.scan_total = scan_started.elapsed();
@@ -2822,7 +2844,9 @@ fn scan_directory_impl<const PROFILE: bool>(
             {
                 continue;
             }
-            let outside_relation = options.relation_stem.as_ref()
+            let outside_relation = options
+                .relation_stem
+                .as_ref()
                 .is_some_and(|stem| catalog_stem(&path.to_string_lossy()) != *stem);
             // Windows caches file_type in the directory entry. Skip unrelated
             // files before building full metadata, but keep directories and
@@ -3550,7 +3574,12 @@ fn update_catalog(
         } else {
             match &metadata {
                 Ok(metadata) => scan_directory_impl::<false>(
-                    target, scope.max_depth, &options, true, None, Some(metadata.clone()),
+                    target,
+                    scope.max_depth,
+                    &options,
+                    true,
+                    None,
+                    Some(metadata.clone()),
                 )?,
                 Err(error) => {
                     let mut errors = DirectoryReadErrors::new(Path::new(target));

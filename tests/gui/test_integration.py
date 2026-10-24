@@ -299,3 +299,105 @@ $entries = @($items | ForEach-Object {{
         assert all(rule["type"] == "Allow" and rule["inherited"] is not is_root for rule in entry["rules"])
         if is_root:
             assert all(rule["inheritance"] == 3 and rule["propagation"] == 0 for rule in entry["rules"])
+
+
+def _state_projection(path):
+    binary = Path(os.environ.get("SUNPACK_GUI_TEST_BINARY", Path(__file__).resolve().parents[2] / ".cache" / "gui-x64" / "Release" / "sunpack_gui_tests.exe"))
+    if not binary.is_file():
+        pytest.skip("Build the native GUI with scripts/build_gui.ps1")
+    return json.loads(subprocess.check_output([str(binary), "--project", str(path)], text=True, encoding="utf-8"))
+
+
+def test_gui_live_publication_rejects_failed_writes_and_stale_revisions(tmp_path):
+    # Pure model fixtures cannot detect disagreements with the real Rust writer.
+    # One kernel sharing failure covers async fault reporting, atomic replacement,
+    # volatile trust, healing, and a syntactically valid truncated publication.
+    from sunpack.runtime.watch.log import WatchLogStore
+    path = tmp_path / "events.jsonl"
+    source = str(tmp_path / "carrier.fake.001")
+    log = WatchLogStore(str(path), max_bytes=2048)
+    try:
+        log.recover()
+        log.write("processing_started", path=source)
+        log.flush()
+        live = _state_projection(path)
+        assert live["verified"] and live["tasks"]["rows"][0]["status"] == "taskProcessing"
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+        kernel.CreateFileW.restype = wintypes.HANDLE
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        held = kernel.CreateFileW(str(path), 0x80000000, 1, None, 3, 0, None)
+        assert held != wintypes.HANDLE(-1).value
+        before = path.read_bytes()
+        try:
+            log.write("failed_password", path=source)
+            log.write("diagnostic", padding="x" * 4096)
+            with pytest.raises(OSError): log.flush()
+            assert log.error
+            assert path.read_bytes() == before  # Failed replacement preserves old file.
+            stale = _state_projection(path)
+            assert not stale["verified"] and stale["tasks"]["rows"][0]["status"] == "taskUnverified"
+        finally:
+            kernel.CloseHandle(held)
+        log.write("diagnostic", message="disk available again")
+        log.flush()
+        healed = _state_projection(path)
+        assert healed["verified"] and healed["tasks"]["rows"][0]["statusText"] == "等待密码"
+        rows = path.read_text(encoding="utf-8").splitlines()
+        assert json.loads(rows[-1])["event"] == "state_commit"
+        path.write_text("\n".join(rows[:-1]) + "\n", encoding="utf-8")
+        assert not _state_projection(path)["verified"]
+    finally:
+        log.close()
+    assert not _state_projection(path)["verified"]
+    assert not list(tmp_path.glob("events.jsonl.*"))
+
+
+def test_gui_process_death_and_wal_gap_recover_without_old_success(tmp_path):
+    # The live-writer test cannot catch an old state_ready surviving process
+    # death. A child exits without destructors after committing only its WAL.
+    import sys
+    source = tmp_path / "disguised.bin"
+    source.write_bytes(b"not inspected by this projection test")
+    path = tmp_path / "events.jsonl"
+    script = """
+import sys
+from sunpack.runtime.watch.log import WatchLogStore
+from sunpack.runtime.watch.state import WatchStateStore
+log = WatchLogStore(sys.argv[1])
+state = WatchStateStore(sys.argv[2])
+log.recover()
+log.write('done', path=sys.argv[3])
+log.flush()
+# Leave the durable blocker ahead of the old GUI success, then crash without
+# publishing a recovery snapshot or running either store's close method.
+state.mark(sys.argv[3], 1, 1.0, status='suspended_missing_volume')
+print('ready', flush=True)
+sys.stdin.readline()
+"""
+    child = subprocess.Popen([sys.executable, "-c", script, str(path), str(tmp_path / "state.snapshot"), str(source)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    try:
+        assert child.stdout.readline().strip() == "ready"
+        child.kill()
+        child.wait(timeout=10)
+        dead = _state_projection(path)
+        assert not dead["verified"]
+        assert all(r["status"] == "taskUnverified" for r in dead["tasks"]["rows"])
+    finally:
+        if child.poll() is None: child.kill(); child.wait(timeout=10)
+        child.stdin.close(); child.stdout.close()
+    from sunpack.runtime.watch.log import WatchLogStore
+    from sunpack.runtime.watch.state import WatchStateStore
+    state = WatchStateStore(str(tmp_path / "state.snapshot"))
+    log = WatchLogStore(str(path))
+    try:
+        log.begin_recovery()
+        log.flush()
+        assert not _state_projection(path)["verified"]
+        log.recover(state._native)
+        log.flush()
+        restored = _state_projection(path)
+        assert restored["verified"] and restored["tasks"]["total"] == 1
+        assert restored["tasks"]["rows"][0]["statusText"] == "等待分卷"
+    finally:
+        state.close(); log.close()

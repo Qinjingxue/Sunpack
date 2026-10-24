@@ -216,6 +216,7 @@ class WatchScheduler:
             self._reservations.watch_outputs = self._outputs
         log_path = Path(state_path).with_name("events.jsonl")
         self.log = WatchLogStore(str(log_path), wake_callback=self._wake_service)
+        self.state._native.attach_events(self.log._native)
         state_parent = Path(state_path).parent
         self.metadata_dir = os.path.abspath(str(state_parent)) if state_parent.name == ".sunpack_watch" else ""
         self.metadata_files = {
@@ -345,6 +346,7 @@ class WatchScheduler:
             raise RuntimeError("Watch scheduler is closed")
         if self._started:
             return
+        self.log.begin_recovery()
         self.state.retain_scopes(self.scopes.values())
         self._prepare_usn_startup_baseline()
         removed_entries = self.state.prune_missing_records()
@@ -375,6 +377,12 @@ class WatchScheduler:
         self._recover_persisted_work()
         self._reconcile_persisted_blockers()
         self._recover_usn_startup_gap()
+        self.log.recover(self.state._native)
+        with self._lock:
+            pending_paths = tuple(self._pending)
+        for path in pending_paths:
+            if self.state.latest_entry_for_path(path) is None:
+                self.log.write("task_queued", path=path)
         self.log.write(
             "scheduler_started",
             roots=self.watch_roots,
@@ -886,6 +894,7 @@ class WatchScheduler:
                 self._password_retry_at = None
 
     def _stop_blocking(self):
+        self.log.invalidate()
         if not self._started:
             return
         if self._observer_resource is not None:
@@ -996,6 +1005,7 @@ class WatchScheduler:
                     error_type=type(exc).__name__,
                     phase="pipeline_completion",
                 )
+                self.log.write("failed_terminal", path=request.candidate.path, error=str(exc))
                 self.enqueue(
                     request.candidate.path,
                     force=True,
@@ -1497,6 +1507,7 @@ class WatchScheduler:
             "pipeline_sources_claimed",
             path=path,
             groups=groups or (),
+            processing=True,
             owner=owner,
             path_count=len(normalized),
             retired_pending=len(retired_pending),
@@ -1705,6 +1716,7 @@ class WatchScheduler:
                 if self.should_ignore_event_path(path) and not (recovery and recovery.internal_recovery):
                     self._drop_active(path, epoch, generation)
                     self.state.complete_work_if_matches(candidate)
+                    self.log.write("task_retired", path=path)
                 continue
 
             def admit():
@@ -1722,6 +1734,7 @@ class WatchScheduler:
                         if admit():
                             self._drop_active(path, epoch, generation)
                     self.state.forget_path(path, missing_only=True)
+                    self.log.write("candidate_departed", path=path)
                     continue
                 if _candidate_observation_changed(candidate, refreshed):
                     with self._claim_gate:
@@ -1740,6 +1753,7 @@ class WatchScheduler:
                         if admit():
                             self._drop_active(path, epoch, generation)
                     self.state.forget_path(path, missing_only=True)
+                    self.log.write("candidate_departed", path=path)
                     continue
                 if not file_ready:
                     with self._claim_gate:
@@ -1944,6 +1958,7 @@ class WatchScheduler:
             raise ValueError("Recovery input is outside its persisted discovery scope")
         if self.should_ignore_event_path(candidate.path) and internal_scope is None:
             self.state.complete_work([candidate.path])
+            self.log.write("task_retired", path=candidate.path)
             return None
         source_input_root = self._source_input_root_for(candidate.path)
         root_entry = self.root_entries.get(path_key(source_input_root))
@@ -2087,6 +2102,7 @@ class WatchScheduler:
             # A submitted sibling can survive while the actual input is renamed.
             # Retire only that stale input, preserving newly queued generations.
             self._retire_claimed_paths([missing_path], candidate)
+            self.log.write("task_retired", path=missing_path)
             self._notify("suppressed", request.notification_id)
             return WatchRunResult(processed=1)
         summary = response.summary
@@ -2172,6 +2188,7 @@ class WatchScheduler:
                 # while an earlier incomplete request was still finishing.
                 # Never resurrect a blocker for a deleted physical input.
                 self.state.prune_missing_records(retry_path)
+                self.log.write("task_retired", path=retry_path)
                 retired_failures.append(failure)
                 continue
             if self.pipeline_engine.completed_watch_family_output(
@@ -2213,7 +2230,6 @@ class WatchScheduler:
                 continue
             if retry_password:
                 self._mark_all_password_failures_dirty()
-            self.log.write(status, path=retry_candidate.path, error=error, failures=[payload])
             # Nuitka 4.1.3 loses list mutation tracking through a conditional receiver.
             if missing:
                 waiting_failures.append(failure)
@@ -2228,6 +2244,24 @@ class WatchScheduler:
             and failure not in retired_failures
         ]
         failed = summary.failed_tasks
+
+        # Every backend-confirmed group needs its own outcome, including nested
+        # archives. The request's main input alone cannot retire child cards.
+        for item in results:
+            task_path = result_path(item)
+            if not task_path:
+                continue
+            if (path_key(task_path) == path_key(candidate.path)
+                    and not (waiting_failures or recorded_password_failures or retired_failures)):
+                continue
+            failure = result_failure(item)
+            if failure in waiting_failures or failure in recorded_password_failures or failure in retired_failures:
+                continue
+            outcome = result_outcome(item)
+            if outcome == OutcomeKind.COMPLETE_SUCCESS:
+                self.log.write("done", path=task_path, output_dirs=[item.output_dir] if item.output_dir else [])
+            elif outcome in {OutcomeKind.FAILURE, OutcomeKind.PARTIAL_SUCCESS}:
+                self.log.write("failed_terminal", path=task_path, error=result_error(item))
 
         if terminal_failures:
             payloads = [_failure_to_dict(failure) for failure in terminal_failures]
@@ -2293,7 +2327,10 @@ class WatchScheduler:
                 change_usn=candidate.change_usn,
                 status="ignored_no_tasks",
             )
-            self.log.write("no_tasks_found", path=candidate.path)
+            with self._claim_gate:
+                owner = self._active_claims.get(path_key(candidate.path))
+                retire_group = owner is None or owner == request.notification_id
+            self.log.write("no_tasks_found", path=candidate.path, retire_group=retire_group)
             self._notify("suppressed", request.notification_id)
             return WatchRunResult(processed=1)
 

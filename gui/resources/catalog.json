@@ -377,6 +377,14 @@
       "zh": "等待密码",
       "en": "Waiting for password"
     },
+    "taskUnverified": {
+      "zh": "状态未验证",
+      "en": "State unverified"
+    },
+    "taskWaitingQueued": {
+      "zh": "等待处理",
+      "en": "Queued"
+    },
     "taskWaitingVolumes": {
       "zh": "等待分卷",
       "en": "Waiting for volumes"

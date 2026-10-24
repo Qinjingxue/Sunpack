@@ -884,7 +884,7 @@ void Application::work() {
     std::string language="en";
     try {
         Json config=Json::object(), passwords={{"passwords",Json::array()}};
-        WatchRoots roots; EventLog log; View view;
+        WatchRoots roots; EventLog log([this]{ changed(Log); }); View view;
         Json errors=Json::object();
         auto dir=options_.data_dir;
         auto dir_key=path_key(dir);
@@ -1083,10 +1083,12 @@ void Application::work() {
                     bool refreshed=log.refresh(retries.count(Log) && retries.at(Log).attempts>=3);
                     tasks_changed|=refreshed; task_source_changed|=refreshed;
                     if(log.retry_required) changed(Log);
-                    errors.erase("events.jsonl"); retries.erase(Log);
+                    if(!log.verified() && !log.tasks.empty()) errors["events.jsonl"]="taskUnverified";
+                    else errors.erase("events.jsonl");
+                    retries.erase(Log);
                 }
-                catch(const WinError& e){ errors["events.jsonl"]=e.what(); retry_io(Log,e); }
-                catch(const std::exception& e){ errors["events.jsonl"]=e.what(); }
+                catch(const WinError& e){ errors["events.jsonl"]=e.what(); tasks_changed=task_source_changed=true; retry_io(Log,e); }
+                catch(const std::exception& e){ errors["events.jsonl"]=e.what(); tasks_changed=task_source_changed=true; }
             }
             Json patch=Json::object();
             auto next_language=gui_language(config);

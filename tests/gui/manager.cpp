@@ -2,6 +2,7 @@
 #include "presentation.hpp"
 #include "range_editor.hpp"
 #include "defaults_json.h"
+#include "event_publication.hpp"
 #include <cassert>
 #include <fstream>
 #include <iostream>
@@ -17,7 +18,7 @@ struct Fixture {
     ~Fixture() { std::error_code ec; fs::remove_all(dir,ec); }
 };
 void overwrite(const fs::path& p,const std::string& text,bool append=false) {
-    std::ofstream out(p,std::ios::binary|(append?std::ios::app:std::ios::trunc)); out<<text;
+    std::ofstream out(p,std::ios::binary|(append?std::ios::app:std::ios::trunc)); out<<(append?text:published_events(text));
 }
 std::string event(const std::string& type,const fs::path& p,int ts) {
     return Json({{"event",type},{"path",utf8(p.wstring())},{"ts",ts}}).dump()+"\n";
@@ -99,22 +100,47 @@ void projection(Fixture& f) {
     auto monitor=f.dir/L"监控", nested=monitor/L"子目录", output=f.dir/L"输出";
     fs::create_directories(nested); fs::create_directory(output);
     auto file=nested/L"已删除的载体.001";
+    EventLog navigation; // Direct model events exercise navigation separately from file trust.
     WatchRoots roots; roots.entries={{f.dir,"",false},{monitor,"",false}};
-    log.tasks.clear();
-    log.accept(Json{{"event","done"},{"path",utf8(file.wstring())},{"output_dirs",{utf8((f.dir/L"missing").wstring()),utf8(output.wstring())}}});
-    auto row=task_rows(log,roots,{}).at("rows").at(0);
+    navigation.accept(Json{{"event","done"},{"path",utf8(file.wstring())},{"output_dirs",{utf8((f.dir/L"missing").wstring()),utf8(output.wstring())}}});
+    auto row=task_rows(navigation,roots,{}).at("rows").at(0);
     assert(row["root"]==utf8(monitor.wstring()));
     assert(row["directory"]==utf8(nested.wstring()));
     assert(task_directory(row)==output);
     fs::remove(output);
     assert(task_directory(row)==monitor);
-    auto old_root=task_rows(log,{},{}).at("rows").at(0);
+    auto old_root=task_rows(navigation,{},{}).at("rows").at(0);
     assert(old_root["directory"]==row["directory"]);
     assert(task_directory(old_root)==nested);
-    log.accept(Json{{"event","failed_password"},{"path",utf8(file.wstring())}});
-    assert(task_directory(task_rows(log,roots,{}).at("rows").at(0))==monitor);
+    navigation.accept(Json{{"event","failed_password"},{"path",utf8(file.wstring())}});
+    assert(task_directory(task_rows(navigation,roots,{}).at("rows").at(0))==monitor);
     fs::remove(nested); fs::remove(monitor);
     fails([&]{task_directory(row);});
+}
+// File fixtures with a permanently healthy publisher cannot expose stale
+// revision acceptance or retry spins. One real event/mapping owner covers both.
+void publication_integrity(Fixture& f) {
+    EventPublicationFixture owner;
+    auto file=f.dir/"health.jsonl", source=f.dir/"opaque.carrier";
+    Handle notification(CreateEventW(nullptr,FALSE,FALSE,nullptr));
+    EventLog log([&]{SetEvent(notification);}); log.set_path(file);
+    atomic_write(file,owner.prefix+event("done",source,1));
+    log.refresh(); assert(log.verified());
+    ResetEvent(owner.published); SetEvent(owner.dirty);
+    assert(WaitForSingleObject(notification,5000)==WAIT_OBJECT_0);
+    log.refresh(); assert(!log.verified() && task_rows(log,{},{}).at("rows").at(0).at("status")=="taskUnverified");
+    auto revision=static_cast<LONG64*>(MapViewOfFile(owner.mapping,FILE_MAP_WRITE,0,0,8));
+    assert(revision); *revision=1; UnmapViewOfFile(revision);
+    atomic_write(file,owner.prefix+event("done",source,2)+Json{{"event","state_commit"},{"revision",1}}.dump()+"\n");
+    ResetEvent(owner.dirty); SetEvent(owner.published);
+    assert(WaitForSingleObject(notification,5000)==WAIT_OBJECT_0);
+    log.refresh(); assert(log.verified());
+    atomic_write(file,owner.prefix+event("done",source,2));
+    log.refresh(); assert(!log.verified() && log.retry_required);
+    log.refresh(); assert(!log.verified() && !log.retry_required);
+    log.refresh(); assert(!log.retry_required);
+    atomic_write(file,event("processing_started",source,3));
+    log.refresh(); assert(!log.verified()); // Pre-protocol logs are never trusted.
 }
 // One real JSONL replay covers logical ownership, removal and delta delivery.
 // The original projection scenario cannot expose cross-path aliasing failures;
@@ -189,6 +215,9 @@ void logical_projection(Fixture& f) {
     send("candidate_departed",a); send("candidate_departed",b);
     assert(displayed.size()==2); // Terminal history remains and aliases retain the result.
     send("candidate_departed",other); assert(displayed.size()==1 && row()["status"]=="taskSucceeded");
+    send("processing_started",a);
+    replay(Json{{"event","no_tasks_found"},{"path",a},{"retire_group",true}});
+    assert(displayed.empty()); // The confirmed owner can explicitly retire a stale group.
     // Reset must release aliases as well as visible history.
     overwrite(file,event("processing_started",wide(b),100)); assert(log.refresh() && log.rebuilt);
     assert(row()["name"]=="unrelated.bin" && row()["partCount"]==0);
@@ -550,6 +579,10 @@ void batch_editing(Fixture& fixture) {
 }
 int wmain(int argc,wchar_t** argv) {
     CoInitializeEx(nullptr,COINIT_MULTITHREADED);
+    if(argc==3 && std::wstring(argv[1])==L"--project") {
+        EventLog log; log.set_path(argv[2]); log.refresh();
+        std::cout<<Json{{"verified",log.verified()},{"tasks",task_rows(log,{}, {})}}.dump(); return 0;
+    }
     if(argc==3 && std::wstring(argv[1])==L"--mutex") { std::cout<<utf8(mutex_name(argv[2]))<<"\n"<<utf8(mutex_name(argv[2],L"SunPackWatchRoots"))<<"\n"; return 0; }
     if(argc>=2 && std::wstring(argv[1])==L"--echo") { Json args=Json::array(); for(int i=2;i<argc;++i) args.push_back(utf8(argv[i])); std::cout<<args.dump(); return 7; }
     if(argc==4 && std::wstring(argv[1])==L"--password-add") { edit_password(argv[2],"add",Json(),Json({{"value",utf8(argv[3])}})); return 0; }
@@ -561,7 +594,7 @@ int wmain(int argc,wchar_t** argv) {
         time["lower"]="2024-02-29 12:34";time["upper"]="2027-01-01 00:00";
         std::cout<<Json{{"size",range_configuration(size,false)},{"time",range_configuration(time,true,&east)}}.dump(); return 0;
     }
-    try { Fixture f; projection(f); logical_projection(f); editing(f); roots(f); range_editing(f); localization(f); batch_editing(f); service_notifications(); std::cout<<"GUI file contracts passed\n"; }
+    try { Fixture f; projection(f); publication_integrity(f); logical_projection(f); editing(f); roots(f); range_editing(f); localization(f); batch_editing(f); service_notifications(); std::cout<<"GUI file contracts passed\n"; }
     catch(const std::exception& e) { std::cerr<<e.what()<<"\n"; return 1; }
     CliCommand cli{executable_path(),fs::temp_directory_path(),{L"--echo"}};
     Handle stop(CreateEventW(nullptr,TRUE,FALSE,nullptr));

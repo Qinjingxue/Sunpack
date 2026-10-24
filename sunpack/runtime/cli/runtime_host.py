@@ -247,6 +247,8 @@ class RuntimeHost:
         if self.watch_enabled:
             await self.stop_watch()
         self.log_event("host_stopped", exit_reason=str(exit_reason))
+        if self._event_log is not None:
+            await asyncio.to_thread(self._event_log.close)
 
     async def foreground_started(self) -> None:
         async with self._foreground_state_lock:
