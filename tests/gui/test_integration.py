@@ -326,6 +326,22 @@ def test_gui_hides_failed_publications_until_repaired(tmp_path):
         kernel.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
         kernel.CreateFileW.restype = wintypes.HANDLE
         kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel.ReadFile.argtypes = [wintypes.HANDLE, wintypes.LPVOID, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD), wintypes.LPVOID]
+        # A normal GUI reader allows deletion and must not prevent compaction.
+        # MoveFileExW alone fails with error 5 even with this sharing mode.
+        held = kernel.CreateFileW(str(path), 0x80000000, 7, None, 3, 0, None)
+        assert held != wintypes.HANDLE(-1).value
+        try:
+            log.write("failed_password", path=source)
+            log.write("diagnostic", padding="x" * 4096)
+            log.flush()
+            published = _state_projection(path)
+            assert published["available"] and published["tasks"]["rows"][0]["statusText"] == "等待密码"
+            old_bytes, count = ctypes.create_string_buffer(4096), wintypes.DWORD()
+            assert kernel.ReadFile(held, old_bytes, len(old_bytes), ctypes.byref(count), None)
+            assert b"processing_started" in old_bytes.raw[:count.value]
+        finally:
+            kernel.CloseHandle(held)
         held = kernel.CreateFileW(str(path), 0x80000000, 1, None, 3, 0, None)
         assert held != wintypes.HANDLE(-1).value
         before = path.read_bytes()

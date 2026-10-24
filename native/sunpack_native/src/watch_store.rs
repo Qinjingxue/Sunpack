@@ -391,6 +391,10 @@ pub(crate) struct NativeWatchState {
 
 impl NativeWatchState {
     pub(crate) fn with_event_projection<T>(&self, publish: impl FnOnce(Vec<Value>) -> T) -> T {
+        // Use the existing sink mutex to order snapshot publication with apply's
+        // state mutation + notifications. The data-map lock still ends before
+        // projection serialization, and no disk I/O is covered by this gate.
+        let _publication = self.events.lock().unwrap();
         let data = self.lock();
         let mut rows = Vec::new();
         let mut member_presence = HashMap::new();
@@ -439,6 +443,58 @@ impl NativeWatchState {
         self.data
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+    fn apply_operations(&self, operations: &Operations) {
+        let publication = self.events.lock().unwrap();
+        let events = publication.as_ref().and_then(std::sync::Weak::upgrade);
+        let mut notifications = Vec::new();
+        {
+            let mut data = self.lock();
+            for operation in operations.0.iter() {
+                let removed = if let Operation::Delete(Collection::Entries, path) = operation {
+                    data.entries.get(path).cloned()
+                } else {
+                    None
+                };
+                data.apply(operation);
+                if events.is_none() {
+                    continue;
+                }
+                if let Some(record) = removed {
+                    let group = record
+                        .failure_payload
+                        .get("source_group")
+                        .or_else(|| record.failure_payload.get("ui_group"));
+                    let remaining = group
+                        .and_then(|g| g["members"].as_array())
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .filter_map(|member| data.entries.get(&path_key(member)))
+                        .max_by(|a, b| a.last_attempt_at.total_cmp(&b.last_attempt_at));
+                    if let Some(record) = remaining {
+                        notifications.push(entry_event(record));
+                    } else {
+                        notifications.push(serde_json::json!({"event":"blocker_cleared","path":record.path,
+                        "task_path":group.and_then(|g| g["path"].as_str()).unwrap_or(&record.path)}));
+                    }
+                }
+                if let Operation::PutEntry(_, record) = operation {
+                    if matches!(
+                        record.status.as_str(),
+                        "failed_password" | "suspended_missing_volume"
+                    ) {
+                        notifications.push(entry_event(record));
+                    }
+                }
+            }
+        }
+        // The authoritative map lock never covers log projection/serialization.
+        if let Some(events) = events {
+            for notification in notifications {
+                events.submit(notification);
+            }
+        }
     }
 }
 
@@ -808,60 +864,7 @@ impl NativeWatchState {
     }
 
     fn apply(&self, operations: PyRef<'_, NativeWatchOperations>) {
-        let events = self
-            .events
-            .lock()
-            .unwrap()
-            .as_ref()
-            .and_then(std::sync::Weak::upgrade);
-        let mut notifications = Vec::new();
-        {
-            let mut data = self.lock();
-            for operation in operations.operations.0.iter() {
-                let removed = if let Operation::Delete(Collection::Entries, path) = operation {
-                    data.entries.get(path).cloned()
-                } else {
-                    None
-                };
-                data.apply(operation);
-                if events.is_none() {
-                    continue;
-                }
-                if let Some(record) = removed {
-                    let group = record
-                        .failure_payload
-                        .get("source_group")
-                        .or_else(|| record.failure_payload.get("ui_group"));
-                    let remaining = group
-                        .and_then(|g| g["members"].as_array())
-                        .into_iter()
-                        .flatten()
-                        .filter_map(Value::as_str)
-                        .filter_map(|member| data.entries.get(&path_key(member)))
-                        .max_by(|a, b| a.last_attempt_at.total_cmp(&b.last_attempt_at));
-                    if let Some(record) = remaining {
-                        notifications.push(entry_event(record));
-                    } else {
-                        notifications.push(serde_json::json!({"event":"blocker_cleared","path":record.path,
-                        "task_path":group.and_then(|g| g["path"].as_str()).unwrap_or(&record.path)}));
-                    }
-                }
-                if let Operation::PutEntry(_, record) = operation {
-                    if matches!(
-                        record.status.as_str(),
-                        "failed_password" | "suspended_missing_volume"
-                    ) {
-                        notifications.push(entry_event(record));
-                    }
-                }
-            }
-        }
-        // The authoritative map lock never covers log projection/serialization.
-        if let Some(events) = events {
-            for notification in notifications {
-                events.submit(notification);
-            }
-        }
+        self.apply_operations(&operations.operations);
     }
 
     fn capture(&self, checkpoint_seq: u64) -> NativeWatchSnapshot {
@@ -1227,7 +1230,63 @@ pub(crate) fn py_to_json(value: &Bound<'_, PyAny>) -> PyResult<Value> {
 
 #[cfg(test)]
 mod tests {
-    use super::is_path_under;
+    use super::*;
+
+    #[test]
+    fn recovery_publication_orders_concurrent_blocker_changes() {
+        // Python-thread tests retain the GIL across native recover, masking the
+        // actual native publication gap. Exercise deletion and status change
+        // from a real native thread while the snapshot callback is paused.
+        for delete in [true, false] {
+            let state = Arc::new(NativeWatchState::new());
+            let record: EntryRecord = serde_json::from_value(serde_json::json!({
+                "path":"c:\\input\\opaque.001", "size":1, "mtime":1.0,
+                "file_id":"", "change_usn":0, "status":"failed_password",
+                "last_error":"locked", "attempt_count":1, "failure_kind":"",
+                "failure_stage":"", "failure_payload":{}, "last_attempt_at":1.0,
+                "password_generation":0
+            }))
+            .unwrap();
+            let key = path_key(&record.path);
+            state.apply_operations(&Operations(vec![Operation::PutEntry(
+                key.clone(),
+                Arc::new(record.clone()),
+            )]));
+            let (captured, start) = std::sync::mpsc::channel();
+            let (finished, done) = std::sync::mpsc::channel();
+            let worker_state = state.clone();
+            let worker = std::thread::spawn(move || {
+                start.recv().unwrap();
+                let operation = if delete {
+                    Operation::Delete(Collection::Entries, key)
+                } else {
+                    let mut record = record;
+                    record.status = "suspended_missing_volume".into();
+                    Operation::PutEntry(key, Arc::new(record))
+                };
+                worker_state.apply_operations(&Operations(vec![operation]));
+                finished.send(()).unwrap();
+            });
+            state.with_event_projection(|rows| {
+                assert_eq!(rows[0]["event"], "failed_password");
+                captured.send(()).unwrap();
+                assert_eq!(
+                    done.recv_timeout(std::time::Duration::from_millis(100)),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                );
+            });
+            done.recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            worker.join().unwrap();
+            state.with_event_projection(|rows| {
+                if delete {
+                    assert!(rows.is_empty());
+                } else {
+                    assert_eq!(rows[0]["event"], "suspended_missing_volume");
+                }
+            });
+        }
+    }
 
     #[test]
     fn path_under_requires_a_component_boundary() {

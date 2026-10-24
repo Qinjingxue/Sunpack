@@ -17,19 +17,57 @@ def main(argv=None):
     parser.add_argument("--rounds", type=int, default=5)
     parser.add_argument("--cold-starts", type=int, default=40)
     parser.add_argument("--lifetime-batches", type=int, default=12)
+    parser.add_argument("--compaction-tasks", type=int, nargs="+", default=[])
     parser.add_argument("--results-root", type=Path)
     parser.add_argument("--json-out", type=Path)
     args = parser.parse_args(argv)
     if min(args.tasks, args.rounds, args.cold_starts, args.lifetime_batches) < 1:
         parser.error("tasks, rounds, cold-starts and lifetime-batches must be positive")
+    if any(count < 1 for count in args.compaction_tasks):
+        parser.error("compaction-tasks must be positive")
     report = BenchmarkReport("scheduling.event-log", parameters={
         "tasks": args.tasks, "rounds": args.rounds, "cold_starts": args.cold_starts,
         "lifetime_batches": args.lifetime_batches,
-        "method": "Installed native extension; rebuild it after changing Rust sources. Submission and final drain timed separately. No extraction, Broker, sleeps or GUI process. OS I/O faults are reported, never retried or excluded silently.",
+        "compaction_tasks": args.compaction_tasks,
+        "method": "Installed native extension; rebuild it after changing Rust sources. Submission and final drain timed separately. No extraction, Broker, sleeps or GUI process. The benchmark never retries or excludes OS I/O faults; the native writer may retry one sharing conflict.",
     })
     sampler = ProcessSampler()
     with BenchmarkWorkspace(report.scenario, results_root=args.results_root) as workspace:
         report.summary["initial_memory"] = sampler.take().to_dict()
+        for count in args.compaction_tasks:
+            path = workspace.work / f"compaction-{count}" / "events.jsonl"
+            log = NativeEventLog(str(path))
+            latencies = []
+            try:
+                log.recover()
+                for index in range(count):
+                    log.write({"event": "failed_password", "path": str(path.parent / f"task-{index}.opaque")})
+                log.flush()
+                initial_bytes = path.stat().st_size
+                # Exceed the obsolete-byte threshold with actual diagnostic
+                # submissions. Each call's latency includes projection lock
+                # contention; it is an upper bound, not pure lock-wait time.
+                events = (initial_bytes // 2 + 262144) // 3800 + 64
+                started = time.perf_counter()
+                for index in range(events):
+                    before = time.perf_counter()
+                    log.write({"event": "diagnostic", "padding": "x" * 4096})
+                    latencies.append((time.perf_counter() - before) * 1000)
+                submitted = time.perf_counter()
+                log.flush()
+                ordered = sorted(latencies)
+                report.samples.append({
+                    "phase": "compaction_contention", "active_tasks": count,
+                    "events": events, "max_submit_ms": max(ordered),
+                    "p99_submit_ms": ordered[min(len(ordered)-1, int(len(ordered)*0.99))],
+                    "median_submit_ms": statistics.median(ordered),
+                    "submit_ms": (submitted-started)*1000,
+                    "drain_total_ms": (time.perf_counter()-started)*1000,
+                    "initial_file_bytes": initial_bytes, "file_bytes": path.stat().st_size,
+                    "memory": sampler.take().to_dict(),
+                })
+            finally:
+                log.close()
         for index in range(args.rounds):
             path = workspace.work / str(index) / "events.jsonl"
             log = NativeEventLog(str(path))

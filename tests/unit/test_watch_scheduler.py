@@ -2287,6 +2287,53 @@ def test_nested_waiting_completion_retires_all_processing_cards(tmp_path):
     _await(scenario())
 
 
+def test_member_failure_persists_confirmed_group_across_recovery(tmp_path):
+    # Main-path failures cannot expose a missing member -> group association.
+    # One nested request covers publication, WAL persistence and startup replay.
+    import json
+    from sunpack.runtime.watch.log import WatchLogStore
+    outer, main, member = (tmp_path / name for name in ("carrier.fake", "nested.001", "nested.other"))
+    for path in (outer, main, member):
+        path.write_bytes(b"fixture")
+    failure = FailureInfo(FailureKind.MISSING_VOLUME, "extraction", "missing nested volume")
+    summary = RunSummary(target_results=(
+        TargetRunResult(str(outer), OutcomeKind.COMPLETE_SUCCESS),
+        TargetRunResult(str(member), OutcomeKind.FAILURE, failure=failure, error=failure.message),
+    ))
+    watcher = _watcher(tmp_path)
+    confirmed = {"path": str(main), "name": "nested.rar", "members": [str(main), str(member)]}
+
+    async def scenario():
+        async def complete():
+            return PipelineResponse("nested", summary)
+        request = scheduler_module._ActivePipelineRequest(
+            "nested", WatchCandidate(str(outer), 7, 1.0), asyncio.create_task(complete()),
+            password_generation=watcher.state.password_generation,
+        )
+        watcher._handle_pipeline_progress(str(outer), "nested", SimpleNamespace(), {
+            "event": "task_sources_claimed", "depth": 1,
+            "source_paths": [str(path) for path in (outer, main, member)], "groups": [confirmed],
+        }, request=request)
+        try:
+            assert (await watcher._complete_candidate(request)).failed == 1
+            assert watcher.state.latest_entry_for_path(str(member)).failure_payload["source_group"] == confirmed
+        finally:
+            await watcher.aclose()
+    _await(scenario())
+    state = WatchStateStore(str(tmp_path / "state.snapshot"))
+    log = WatchLogStore(str(tmp_path / "recovery" / "events.jsonl"))
+    try:
+        log.recover(state._native)
+        log.flush()
+        records = [json.loads(line) for line in log.path.read_text(encoding="utf8").splitlines()]
+        group = next(r["groups"][0] for r in records if r["event"] == "pipeline_sources_claimed")
+        assert group["path"] == str(main) and group["members"] == confirmed["members"]
+        assert next(r for r in records if r["event"] == "suspended_missing_volume")["path"] == str(main)
+    finally:
+        state.close()
+        log.close()
+
+
 def test_watch_scheduler_does_not_retry_password_inconclusive_after_password_source_change(tmp_path, monkeypatch):
     monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
     attempts = {"count": 0}

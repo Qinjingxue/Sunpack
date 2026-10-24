@@ -2064,6 +2064,8 @@ class WatchScheduler:
             if request is not None:
                 for group in groups:
                     request.source_groups[path_key(group["path"])] = group
+                    for member in group["members"]:
+                        request.source_groups[path_key(member)] = group
             self._claim_pipeline_sources(
                 notification_id, source_paths, path=owner_path, groups=groups,
             )
