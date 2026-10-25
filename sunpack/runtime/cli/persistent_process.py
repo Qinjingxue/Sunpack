@@ -64,7 +64,6 @@ _MAX_REQUEST_BYTES = 64 * 1024 * 1024
 _MAX_ARGC = 4096
 _TERMINAL_COLUMNS_ARG = "--_sunpack-terminal-columns="
 _PIPE_PREFIX = r"\\.\pipe\SunPack-"
-_SERVER_STARTUP_TIMEOUT_SECONDS = 10.0
 
 
 def handle_early_argv(argv: list[str]) -> int | None:
@@ -186,21 +185,21 @@ def _send_or_start(payload: dict[str, Any]) -> dict[str, Any]:
             "stderr": i18n.t("cli.persistent_launch_failed", error=exc) + "\n",
         }
 
-    deadline = time.monotonic() + _SERVER_STARTUP_TIMEOUT_SECONDS
     runtime_exit_code: int | None = None
-    while time.monotonic() < deadline:
+    while True:
         response = _try_send(payload)
         if response is not None:
             return response
-        poll = getattr(process, "poll", None)
-        if poll is not None:
-            runtime_exit_code = poll()
-            if runtime_exit_code not in (None, 0):
-                break
+        runtime_exit_code = process.poll()
+        if runtime_exit_code is not None:
+            break
+        # A running server that has not yet published its pipe is not a failure.
         time.sleep(0.025)
-    error = i18n.t("cli.persistent_start_timeout")
-    if runtime_exit_code not in (None, 0):
-        error += "\n" + i18n.t("cli.persistent_runtime_exited", code=runtime_exit_code)
+    # A different instance may have won the startup race as this one exited.
+    response = _try_send(payload)
+    if response is not None:
+        return response
+    error = i18n.t("cli.persistent_runtime_exited", code=runtime_exit_code)
     return {
         "exit_code": 1,
         "stdout": "",
@@ -301,7 +300,6 @@ def _open_pipe(name: str) -> _PipeConnection | None:
     from ctypes import wintypes
 
     kernel32 = _kernel32()
-    deadline = time.monotonic() + 2.0
     invalid_handle = ctypes.c_void_p(-1).value
     while True:
         handle = kernel32.CreateFileW(name, 0xC0000000, 0, None, 3, 0, None)
@@ -314,8 +312,8 @@ def _open_pipe(name: str) -> _PipeConnection | None:
         error = ctypes.get_last_error()
         if error != 231:
             return None
-        remaining = int(max(0.0, deadline - time.monotonic()) * 1000)
-        if remaining <= 0 or not kernel32.WaitNamedPipeW(name, remaining):
+        # Wait for an actual pipe transition, not an arbitrary busy-pipe deadline.
+        if not kernel32.WaitNamedPipeW(name, 0xFFFFFFFF):
             return None
 
 
