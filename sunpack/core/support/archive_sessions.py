@@ -4,7 +4,6 @@ import contextlib
 import contextvars
 import os
 import threading
-import time
 import uuid
 import weakref
 from collections import OrderedDict
@@ -16,7 +15,6 @@ from sunpack.core.support.path_keys import absolute_path_key, path_key_is_under
 from sunpack_native import NativeArchiveSession, clear_reader_resources
 
 from sunpack.core.support.resource_lifecycle import (
-    ResourceBusyError,
     ResourceKind,
     ResourceLease,
     current_task_resource_scope,
