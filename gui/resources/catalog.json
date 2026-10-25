@@ -1759,21 +1759,6 @@
         "en": "Result verification"
       }
     },
-    "/verification/max_retries": {
-      "label": {
-        "zh": "失败重试上限",
-        "en": "Failure retry limit"
-      },
-      "min": 0,
-      "max": null,
-      "integer": true
-    },
-    "/verification/cleanup_failed_output": {
-      "label": {
-        "zh": "清理失败输出",
-        "en": "Clean up failed output"
-      }
-    },
     "/verification/complete_accept_threshold": {
       "label": {
         "zh": "完整结果最低评分",
@@ -1789,16 +1774,6 @@
       },
       "min": 0,
       "max": 1
-    },
-    "/verification/retry_on_verification_failure": {
-      "label": {
-        "zh": "验证失败后重试",
-        "en": "Retry failed verification"
-      },
-      "description": {
-        "zh": "受上方重试次数限制",
-        "en": "Limited by the retry count above"
-      }
     },
     "/verification/methods/@extraction_exit_signal/enabled": {
       "label": {
