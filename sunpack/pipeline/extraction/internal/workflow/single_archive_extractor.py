@@ -194,18 +194,6 @@ class SingleArchiveExtractor:
 
         with _phase(phase_timer, f"{phase_prefix}_startupinfo"):
             startupinfo = self._startupinfo()
-        try:
-            with _phase(phase_timer, f"{phase_prefix}_mkdir"):
-                os.makedirs(out_dir, exist_ok=True)
-        except Exception as exc:
-            failure = self._failure_info(FailureKind.FILESYSTEM_ERROR, "preflight", "extract.dir_create_failed", error=str(exc))
-            return self._failed(
-                out_dir,
-                self._localized_failure(failure),
-                failure=failure,
-                diagnostics={"failure_stage": "preflight", "failure_kind": "output_filesystem", "message": str(exc)},
-            )
-
         descriptor = task.archive_input()
         run_archive = descriptor.entry_path
         run_parts = descriptor.part_paths()
