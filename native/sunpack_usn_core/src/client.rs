@@ -339,68 +339,64 @@ fn transact_request(request: Request) -> io::Result<Response> {
             "SunPack Watch Broker has not been acquired",
         ));
     }
-    let mut last_error = None;
-    for _ in 0..2 {
+    // Only these read-only requests are safe to replay after the pipe dies:
+    // a request may have reached the broker before the connection was lost.
+    let replay_safe = matches!(
+        request.opcode,
+        Opcode::Ping | Opcode::ProbeVolume | Opcode::ReadChangeReasons
+    );
+    loop {
         if state.connection.is_none() {
-            match connect_and_hello() {
-                Ok(connection) => state.connection = Some(connection),
-                Err(error) => {
-                    last_error = Some(error);
-                    continue;
-                }
-            }
+            state.connection = Some(connect_and_hello()?);
         }
         match state.connection.as_mut().unwrap().transact(request.clone()) {
             Ok(response) => return Ok(response),
             Err(error) => {
                 state.connection.take();
-                last_error = Some(error);
+                if !replay_safe || !is_transient_broker_io(&error) {
+                    return Err(error);
+                }
+                thread::sleep(Duration::from_millis(50));
             }
         }
     }
-    Err(last_error.unwrap_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotConnected,
-            "SunPack Watch Broker is disconnected",
-        )
-    }))
+}
+
+fn is_transient_broker_io(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::WouldBlock
+            | io::ErrorKind::Interrupted
+            | io::ErrorKind::TimedOut
+            | io::ErrorKind::NotConnected
+    ) || matches!(
+        error.raw_os_error(),
+        Some(109 | 232 | 233 | 231) // BROKEN_PIPE, NO_DATA, PIPE_NOT_CONNECTED, PIPE_BUSY
+    )
 }
 
 fn connect_and_hello() -> io::Result<BrokerConnection> {
-    let mut last_error = None;
-    for attempt in 0..2 {
-        if attempt > 0 {
-            thread::sleep(Duration::from_millis(50));
-        }
-        if let Err(error) = start_service() {
-            last_error = Some(error);
-            continue;
-        }
-        let mut connection = match connect_pipe() {
-            Ok(connection) => connection,
-            Err(error) => {
-                last_error = Some(error);
-                continue;
+    loop {
+        // Service manager/start failures are real OS errors. Never hide them
+        // behind an unlimited retry loop (e.g. missing service or no access).
+        start_service()?;
+        let mut connection = connect_pipe()?;
+        match connection.transact(Request::simple(Opcode::Hello, next_request_id())) {
+            Ok(response) => {
+                // Protocol errors and explicit broker rejection are terminal.
+                ensure_ok(response)?;
+                return Ok(connection);
             }
-        };
-        let hello = match connection.transact(Request::simple(Opcode::Hello, next_request_id())) {
-            Ok(response) => response,
-            Err(error) => {
-                last_error = Some(error);
-                continue;
+            Err(error) if is_transient_broker_io(&error) => {
+                thread::sleep(Duration::from_millis(50));
             }
-        };
-        match ensure_ok(hello) {
-            Ok(_) => return Ok(connection),
-            Err(error) => last_error = Some(error),
+            Err(error) => return Err(error),
         }
     }
-    Err(last_error.unwrap_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotConnected,
-            "SunPack Watch Broker could not establish a lease",
-        )
-    }))
 }
 
 fn next_request_id() -> u64 {
