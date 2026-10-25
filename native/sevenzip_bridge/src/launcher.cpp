@@ -288,8 +288,7 @@ bool parse_state(const InstallContext& context, std::wstring& pipe_name,
 }
 
 HANDLE connect_pipe(const std::wstring& pipe_name) {
-    if (!WaitNamedPipeW(pipe_name.c_str(), 2000)) return INVALID_HANDLE_VALUE;
-    for (int attempt = 0; attempt < 4; ++attempt) {
+    for (;;) {
         HANDLE pipe = CreateFileW(pipe_name.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING,
                                   FILE_ATTRIBUTE_NORMAL, nullptr);
         if (pipe != INVALID_HANDLE_VALUE) {
@@ -298,9 +297,11 @@ HANDLE connect_pipe(const std::wstring& pipe_name) {
             CloseHandle(pipe);
             return INVALID_HANDLE_VALUE;
         }
-        if (GetLastError() != ERROR_PIPE_BUSY || !WaitNamedPipeW(pipe_name.c_str(), 500)) break;
+        if (GetLastError() != ERROR_PIPE_BUSY ||
+            !WaitNamedPipeW(pipe_name.c_str(), NMPWAIT_WAIT_FOREVER)) {
+            return INVALID_HANDLE_VALUE;
+        }
     }
-    return INVALID_HANDLE_VALUE;
 }
 
 bool write_all(HANDLE pipe, const char* data, std::size_t size) {
@@ -519,8 +520,8 @@ void write_stream(DWORD handle_id, const std::string& text) {
 // cli.persistent_delivery_uncertain.
 constexpr wchar_t kPressEnterEn[] = L"Press Enter to continue...";
 constexpr wchar_t kPressEnterZh[] = L"按回车键继续...";
-constexpr wchar_t kPersistentTimeoutEn[] = L"SunPack persistent process did not start in time";
-constexpr wchar_t kPersistentTimeoutZh[] = L"SunPack 持久进程未能及时启动";
+constexpr wchar_t kPersistentUnavailableEn[] = L"SunPack persistent process is unavailable";
+constexpr wchar_t kPersistentUnavailableZh[] = L"SunPack 持久进程不可用";
 constexpr wchar_t kRuntimeLaunchFailedEn[] = L"sunpack runtime failed to launch (Win32 error {error})";
 constexpr wchar_t kRuntimeLaunchFailedZh[] = L"sunpack 运行时启动失败（Win32 错误 {error}）";
 constexpr wchar_t kRuntimeExitedEn[] = L"sunpack runtime exited before becoming ready, exit code {code}";
@@ -576,7 +577,7 @@ int wmain(int argc, wchar_t** argv) {
         DWORD runtime_exit_code = STILL_ACTIVE;
         bool runtime_failed = false;
         if (spawn_runtime(context, {L"--persistent-server"}, true, nullptr, &spawn_error, &runtime_process)) {
-            for (int attempt = 0; attempt < 400 && outcome == RequestOutcome::NotDelivered; ++attempt) {
+            while (outcome == RequestOutcome::NotDelivered) {
                 if (runtime_process != nullptr && WaitForSingleObject(runtime_process, 0) == WAIT_OBJECT_0) {
                     GetExitCodeProcess(runtime_process, &runtime_exit_code);
                     runtime_failed = true;
@@ -616,7 +617,7 @@ int wmain(int argc, wchar_t** argv) {
         language = cli_language_from_config(launcher_cwd);
     }
     if (outcome == RequestOutcome::NotDelivered && !shutdown) {
-        write_stream(STD_ERROR_HANDLE, localized(language, kPersistentTimeoutEn, kPersistentTimeoutZh) + "\n");
+        write_stream(STD_ERROR_HANDLE, localized(language, kPersistentUnavailableEn, kPersistentUnavailableZh) + "\n");
     } else if (outcome == RequestOutcome::DeliveryUncertain && !shutdown) {
         write_stream(STD_ERROR_HANDLE, localized(language, kDeliveryUncertainEn, kDeliveryUncertainZh) + "\n");
     }
