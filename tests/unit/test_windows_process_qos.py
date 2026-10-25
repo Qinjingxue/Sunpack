@@ -101,7 +101,6 @@ def test_background_mode_falls_back_to_below_normal(monkeypatch):
     assert calls == [
         (123, process_qos.PROCESS_MODE_BACKGROUND_BEGIN),
         (123, process_qos.BELOW_NORMAL_PRIORITY_CLASS),
-        (123, process_qos.PROCESS_MODE_BACKGROUND_END),
         (123, process_qos.NORMAL_PRIORITY_CLASS),
     ]
 
@@ -109,6 +108,37 @@ def test_background_mode_falls_back_to_below_normal(monkeypatch):
 def test_processing_mode_rejects_unknown_mode():
     with pytest.raises(ValueError, match="unsupported process mode"):
         process_qos.set_processing_mode(mode="realtime")
+
+
+@pytest.mark.parametrize(("initial", "requested", "failed_priorities"), [
+    ("normal", "high", {process_qos.HIGH_PRIORITY_CLASS}),
+    ("high", "background", {process_qos.NORMAL_PRIORITY_CLASS}),
+    ("normal", "background", {process_qos.PROCESS_MODE_BACKGROUND_BEGIN, process_qos.BELOW_NORMAL_PRIORITY_CLASS}),
+    ("background", "high", {process_qos.PROCESS_MODE_BACKGROUND_END}),
+    ("background", "high", {process_qos.HIGH_PRIORITY_CLASS}),
+    ("below_normal", "normal", {process_qos.NORMAL_PRIORITY_CLASS}),
+])
+def test_failed_priority_transitions_keep_retries_and_restoration_valid(monkeypatch, initial, requested, failed_priorities):
+    # Partial transitions (especially leaving background before a failed High)
+    # need actual state, or restoration and retries incorrectly become no-ops.
+    calls, accepted = [], set()
+    kernel = _kernel32(calls, accepted={-1})
+    kernel.SetPriorityClass.callback = lambda _process, priority: calls.append(priority) or priority in accepted
+    monkeypatch.setattr(process_qos.ctypes, "WinDLL", lambda *_a, **_k: kernel)
+    monkeypatch.setattr(process_qos, "_MODE", initial)
+    all_priorities = {
+        process_qos.NORMAL_PRIORITY_CLASS, process_qos.HIGH_PRIORITY_CLASS,
+        process_qos.PROCESS_MODE_BACKGROUND_BEGIN, process_qos.PROCESS_MODE_BACKGROUND_END,
+        process_qos.BELOW_NORMAL_PRIORITY_CLASS,
+    }
+    accepted.update(all_priorities - failed_priorities)
+    assert process_qos.set_processing_mode(mode=requested) == "unavailable"
+    accepted.update(all_priorities)
+    assert process_qos.set_processing_mode(mode=requested) == requested
+    count = len(calls)
+    assert process_qos.set_processing_mode(mode=requested) == requested
+    assert len(calls) == count
+    assert process_qos.set_processing_mode(mode="normal") == "normal"
 
 
 def test_processing_mode_is_noop_off_windows(monkeypatch):

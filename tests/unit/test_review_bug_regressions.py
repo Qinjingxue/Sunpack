@@ -18,12 +18,15 @@ class _InlineBroker:
 
 
 class _FailingRunner:
+    def _build_job(self, **request):
+        return {"archive": request["archive"]}
+
     async def submit_attempt_asyncio(self, **_request):
         raise RuntimeError("worker disconnected")
 
     def failed_process_for_exception(self, exc, request):
         assert isinstance(exc, RuntimeError)
-        assert request == {"archive": "sample.zip"}
+        assert request == {"job": {"archive": "sample.zip"}, "startupinfo": None, "task": "task"}
         return "failed-process"
 
 
@@ -38,7 +41,7 @@ def test_async_worker_failure_reaches_failed_process_fallback():
     )
 
     def state():
-        sent = yield {"archive": "sample.zip"}
+        sent = yield {"archive": "sample.zip", "task": "task"}
         return sent
 
     extractor._extract_state_machine = lambda *_args, **_kwargs: state()
@@ -78,7 +81,7 @@ def test_async_retry_resubmits_without_timed_backoff(monkeypatch):
             events.append(("broker", stage))
             return await super().run(stage, file_id, func, *args, **kwargs)
 
-    class _Runner:
+    class _Runner(_FailingRunner):
         async def submit_attempt_asyncio(self, **request):
             events.append(("submit", request))
             return "done"
@@ -96,7 +99,7 @@ def test_async_retry_resubmits_without_timed_backoff(monkeypatch):
     )
 
     def state():
-        sent = yield {"archive": "sample.zip"}
+        sent = yield {"archive": "sample.zip", "task": "task"}
         return sent
 
     extractor._extract_state_machine = lambda *_args, **_kwargs: state()
@@ -115,6 +118,6 @@ def test_async_retry_resubmits_without_timed_backoff(monkeypatch):
     assert result == "done"
     assert events == [
         ("broker", "extract_prepare"),
-        ("submit", {"archive": "sample.zip"}),
+        ("submit", {"job": {"archive": "sample.zip"}, "startupinfo": None, "task": "task"}),
         ("broker", "extract_continue"),
     ]

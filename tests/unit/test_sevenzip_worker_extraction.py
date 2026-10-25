@@ -671,7 +671,7 @@ def test_native_worker_asyncio_event_controller_completes_job(tmp_path):
 def test_native_worker_asyncio_process_exit_completes_pending_job(tmp_path):
     worker = tmp_path / "exit_worker.cmd"
     worker.write_text(
-        '@echo {"type":"worker_ready"}\r\n@set /p request=\r\n@exit /b 7\r\n',
+        '@echo {"type":"worker_ready","process_mode":"normal","process_mode_applied":true}\r\n@set /p request=\r\n@exit /b 7\r\n',
         encoding="utf-8",
     )
     runner = SevenZipRunner({})
@@ -709,7 +709,7 @@ def test_cancelled_request_retains_input_lease_until_native_work_stops(tmp_path,
         else '@exit /b 7\r\n'
     )
     worker.write_text(
-        '@echo {"type":"worker_ready"}\r\n'
+        '@echo {"type":"worker_ready","process_mode":"normal","process_mode_applied":true}\r\n'
         '@set /p request=\r\n'
         '@echo {"type":"native_event","event":"job_started","job_id":"cancel-job"}\r\n'
         '@set /p cancellation=\r\n'

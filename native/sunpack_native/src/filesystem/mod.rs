@@ -88,20 +88,21 @@ pub(crate) fn validate_ntfs_watch_root(path: &str) -> PyResult<()> {
     }
 }
 
-#[pyfunction]
-pub(crate) fn resolve_output_volume_key(path: &str) -> PyResult<Option<String>> {
+#[pyfunction(name = "resolve_output_volume_key")]
+pub(crate) fn resolve_output_volume_key_python(py: Python<'_>, path: &str) -> Option<String> {
+    py.detach(|| resolve_output_volume_key(path))
+}
+
+pub(crate) fn resolve_output_volume_key(path: &str) -> Option<String> {
     #[cfg(windows)]
     {
-        return match windows::resolve_output_volume(Path::new(path)) {
-            Ok(key) => Ok(Some(key)),
-            // Unresolvable volume: the caller falls back to a synthetic per-job key.
-            Err(_) => Ok(None),
-        };
+        // Unresolvable volume: the caller falls back to a synthetic per-job key.
+        windows::resolve_output_volume(Path::new(path)).ok()
     }
     #[cfg(not(windows))]
     {
         let _ = path;
-        Ok(None)
+        None
     }
 }
 

@@ -28,11 +28,24 @@ from sunpack.core.i18n import I18nContext
 from sunpack.pipeline.postprocess.output_cleanup import DEFAULT_OUTPUT_CLEANUP_MANAGER, OutputCleanupEvent
 
 
-def _advance_state(state, sent, *, first: bool):
-    try:
-        return False, next(state) if first else state.send(sent)
-    except StopIteration as completed:
-        return True, completed.value
+def _advance_state(state, sent, *, first: bool, runner: SevenZipRunner, cancellation_token):
+    # Run planning, filesystem preparation and failure continuations in the
+    # same admitted broker job. Only native transport returns to the loop.
+    while True:
+        if cancellation_token is not None:
+            cancellation_token.raise_if_cancelled()
+        try:
+            request = next(state) if first else state.send(sent)
+        except StopIteration as completed:
+            return True, completed.value
+        first = False
+        startupinfo = request.pop("startupinfo", None)
+        try:
+            job = runner._build_job(**request)
+        except Exception as exc:
+            sent = runner.failed_process_for_exception(exc, request)
+        else:
+            return False, {"job": job, "startupinfo": startupinfo, "task": request["task"]}
 
 
 class SingleArchiveExtractor:
@@ -119,6 +132,8 @@ class SingleArchiveExtractor:
                 state,
                 sent,
                 first=first,
+                runner=self.sevenzip_runner,
+                cancellation_token=cancellation,
                 request_id=request_id,
                 cancellation=cancellation,
             )

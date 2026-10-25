@@ -42,7 +42,6 @@ class RuntimeHost:
         self._foreground_gate_requested = False
         self._configured_process_mode = "normal"
         self._cli_process_mode_override: str | None = None
-        self._process_mode = "normal"
         self._state_changed = state_changed
         self.archive_registry = ActiveArchiveRegistry()
         self._event_log = None
@@ -282,9 +281,9 @@ class RuntimeHost:
             self._foreground_requests = max(0, self._foreground_requests - 1)
             if self._foreground_requests == 0:
                 self._foreground_gate_requested = False
-            last = self._foreground_requests == 0 and self.watch_enabled
+            last = self._foreground_requests == 0
             if last:
-                service = self._watch_service
+                service = self._watch_service if self.watch_enabled else None
                 scheduler = service.scheduler if service is not None else None
                 if scheduler is not None:
                     await scheduler.set_external_activity(False)
@@ -294,7 +293,7 @@ class RuntimeHost:
 
     @property
     def process_mode(self) -> str:
-        return self._process_mode
+        return self._cli_process_mode_override or self._configured_process_mode
 
     async def set_cli_process_mode_override(self, mode: str) -> None:
         normalized = str(mode or "high").strip().lower()
@@ -317,12 +316,7 @@ class RuntimeHost:
         return True
 
     async def sync_process_mode_to_engine(self, engine) -> None:
-        if self._process_mode == "normal":
-            return
-        try:
-            await engine.set_process_mode(mode=self._process_mode)
-        except Exception:
-            _LOG.exception("failed to synchronize native worker process mode")
+        await self._apply_effective_process_mode(engine=engine)
 
     async def _watch_config_applied(self, config: dict) -> None:
         await self._set_configured_process_mode(config)
@@ -331,19 +325,16 @@ class RuntimeHost:
         self._configured_process_mode = _configured_runtime_process_mode(config)
         await self._apply_effective_process_mode()
 
-    async def _apply_effective_process_mode(self) -> None:
-        await self._set_process_mode(
-            mode=self._cli_process_mode_override or self._configured_process_mode
-        )
-
-    async def _set_process_mode(self, *, mode: str) -> None:
+    async def _apply_effective_process_mode(self, *, engine=None) -> None:
         async with self._qos_lock:
-            if self._process_mode == mode:
-                return
             from sunpack.runtime.cli.persistent_runtime import current_pipeline_engine
             from sunpack.core.platform.windows.process_qos import set_processing_mode
 
-            engine = current_pipeline_engine()
+            # This is desired policy. Each process owns its applied-state cache,
+            # so failed applications remain retryable, including after restart.
+            mode = self.process_mode
+            if engine is None:
+                engine = current_pipeline_engine()
             worker_result = {}
             if engine is not None:
                 try:
@@ -351,15 +342,16 @@ class RuntimeHost:
                 except Exception:
                     _LOG.exception("failed to change native worker process mode")
             try:
-                set_processing_mode(mode=mode)
+                host_result = set_processing_mode(mode=mode)
             except Exception:
+                host_result = "unavailable"
                 _LOG.exception("failed to change RuntimeHost process mode")
-            self._process_mode = mode
             self.log_event(
                 "qos_changed",
                 mode=mode,
                 worker_pid=int(worker_result.get("worker_pid", 0) or 0),
                 worker_applied=bool(worker_result.get("applied", False)),
+                host_applied=host_result == mode or (mode == "background" and host_result == "below_normal"),
             )
 
     async def _watch_done(self, task: asyncio.Task[int], generation: int) -> None:

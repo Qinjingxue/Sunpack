@@ -549,15 +549,18 @@ def test_runtime_host_uses_cli_override_until_idle_expiry(monkeypatch):
     assert [event for event in events if event[0] == "worker_mode"] == [
         ("worker_mode", "background"),
         ("worker_mode", "high"),
+        ("worker_mode", "high"),
         ("worker_mode", "normal"),
     ]
     assert [event for event in events if event[0] == "host_mode"] == [
         ("host_mode", "background"),
         ("host_mode", "high"),
+        ("host_mode", "high"),
         ("host_mode", "normal"),
     ]
 
-def test_runtime_host_without_watch_scheduler_expires_cli_override_on_foreground_finish(monkeypatch):
+@pytest.mark.parametrize("watch_state", ["disabled", "stopped", "starting"])
+def test_runtime_host_without_watch_scheduler_expires_cli_override_on_foreground_finish(monkeypatch, watch_state):
     import sunpack.core.platform.windows.process_qos as process_qos
     import sunpack.runtime.cli.persistent_runtime as persistent_runtime
 
@@ -578,13 +581,17 @@ def test_runtime_host_without_watch_scheduler_expires_cli_override_on_foreground
 
     async def scenario():
         host = RuntimeHost()
-        host._watch_service = SimpleNamespace(scheduler=None)
-        host._watch_task = SimpleNamespace(done=lambda: False)
+        if watch_state != "disabled":
+            host._watch_service = SimpleNamespace(scheduler=None)
+            host._watch_task = SimpleNamespace(done=lambda: watch_state == "stopped")
         await host._set_configured_process_mode({"runtime": {"process_mode": "normal"}})
         await host.set_cli_process_mode_override("high")
         assert host.process_mode == "high"
 
         await host.foreground_started()
+        await host.foreground_started()
+        await host.foreground_finished()
+        assert host.process_mode == "high"
         await host.foreground_finished()
 
         assert host._cli_process_mode_override is None
@@ -592,11 +599,58 @@ def test_runtime_host_without_watch_scheduler_expires_cli_override_on_foreground
 
     asyncio.run(scenario())
     assert modes == [
+        ("worker", "normal"),
+        ("host", "normal"),
         ("worker", "high"),
         ("host", "high"),
         ("worker", "normal"),
         ("host", "normal"),
     ]
+
+
+@pytest.mark.parametrize("failure", ["worker_exception", "worker_rejected", "host_exception", "host_rejected"])
+def test_process_mode_policy_retries_unapplied_changes_and_syncs_replacement_engine(monkeypatch, failure):
+    # Successful transitions cannot expose a policy cache hiding a failed
+    # application. Cover both owners and cold worker replacement in one cycle.
+    import sunpack.core.platform.windows.process_qos as process_qos
+    import sunpack.runtime.cli.persistent_runtime as persistent_runtime
+
+    worker_calls, host_calls = [], []
+
+    class Engine:
+        async def set_process_mode(self, *, mode):
+            worker_calls.append(mode)
+            if len(worker_calls) == 1:
+                if failure == "worker_exception":
+                    raise OSError("worker transport interrupted")
+                if failure == "worker_rejected":
+                    return {"applied": False}
+            return {"applied": True}
+
+    def apply_host(*, mode):
+        host_calls.append(mode)
+        if len(host_calls) == 1:
+            if failure == "host_exception":
+                raise OSError("priority change failed")
+            if failure == "host_rejected":
+                return "unavailable"
+        return mode
+
+    engine = Engine()
+    monkeypatch.setattr(persistent_runtime, "current_pipeline_engine", lambda: engine)
+    monkeypatch.setattr(process_qos, "set_processing_mode", apply_host)
+
+    async def scenario():
+        host = RuntimeHost()
+        await host.set_cli_process_mode_override("high")
+        await host.set_cli_process_mode_override("high")
+        assert worker_calls == host_calls == ["high", "high"]
+        await host.sync_process_mode_to_engine(Engine())
+        assert worker_calls[-1] == host_calls[-1] == "high"
+        await host.expire_cli_process_mode_override()
+        assert worker_calls[-1] == host_calls[-1] == host.process_mode == "normal"
+
+    asyncio.run(scenario())
 
 
 def test_runtime_host_brackets_overlapping_foreground_activity():

@@ -511,6 +511,7 @@ class _AsyncNativeWorkerProcess:
         self.handshake: dict[str, Any] = {}
         self._ready: asyncio.Future | None = None
         self._process_mode_waiter: asyncio.Future | None = None
+        self._process_mode_lock = asyncio.Lock()
 
     async def start(self) -> None:
         if self.is_alive():
@@ -604,19 +605,28 @@ class _AsyncNativeWorkerProcess:
         await asyncio.shield(state["finished"])
 
     async def set_process_mode(self, *, mode: str) -> dict[str, Any]:
-        current = self._process_mode_waiter
-        if current is not None and not current.done():
-            await current
-        waiter = asyncio.get_running_loop().create_future()
-        self._process_mode_waiter = waiter
-        await self.send(json.dumps({"worker_command": "set_process_mode", "mode": mode}, separators=(",", ":")))
-        try:
-            result = dict(await asyncio.wait_for(asyncio.shield(waiter), timeout=2.0))
-            result["worker_pid"] = int(getattr(self.process, "pid", 0) or 0)
-            return result
-        finally:
-            if self._process_mode_waiter is waiter:
+        async with self._process_mode_lock:
+            if not self.is_alive():
+                raise RuntimeError("sevenzip_worker is not running")
+            pid = int(getattr(self.process, "pid", 0) or 0)
+            if self.handshake.get("process_mode_applied") and self.handshake.get("process_mode") == mode:
+                return {"type": "process_mode_ack", "mode": mode, "applied": True, "worker_pid": pid}
+            # A request, failed acknowledgement or interrupted transition is
+            # not proof of the process's applied mode.
+            self.handshake["process_mode_applied"] = False
+            waiter = asyncio.get_running_loop().create_future()
+            self._process_mode_waiter = waiter
+            try:
+                await self.send(json.dumps({"worker_command": "set_process_mode", "mode": mode}, separators=(",", ":")))
+                result = dict(await asyncio.wait_for(asyncio.shield(waiter), timeout=2.0))
+                if result.get("mode") != mode:
+                    raise RuntimeError("sevenzip_worker acknowledged a different process mode")
+                result["worker_pid"] = pid
+                return result
+            finally:
                 self._process_mode_waiter = None
+                if not waiter.done():
+                    waiter.cancel()
 
     def take_stderr(self) -> list[str]:
         lines = self._stderr_lines
@@ -649,6 +659,7 @@ class _AsyncNativeWorkerProcess:
                     continue
                 if isinstance(payload, dict) and payload.get("type") == "process_mode_ack":
                     self.handshake["process_mode"] = str(payload.get("mode") or "normal")
+                    self.handshake["process_mode_applied"] = bool(payload.get("applied"))
                     waiter = self._process_mode_waiter
                     if waiter is not None and not waiter.done():
                         waiter.set_result(dict(payload))
@@ -789,7 +800,7 @@ class _AsyncNativeWorkerHolder:
         self._lock = asyncio.Lock()
         self._worker: _AsyncNativeWorkerProcess | None = None
         self._closed = False
-        self._process_mode = "normal"
+        self._desired_process_mode = "normal"
 
     async def get_or_start(self, startupinfo) -> _AsyncNativeWorkerProcess:
         async with self._lock:
@@ -802,15 +813,14 @@ class _AsyncNativeWorkerHolder:
                     self.worker_path_callback(), startupinfo, self.process_config
                 )
                 await self._worker.start()
-                if str(self._worker.handshake.get("process_mode") or "normal") != self._process_mode:
-                    await self._worker.set_process_mode(mode=self._process_mode)
+                await self._worker.set_process_mode(mode=self._desired_process_mode)
             return self._worker
 
     def set_desired_process_mode(self, mode: str) -> None:
         normalized = str(mode or "normal").strip().lower()
         if normalized not in {"background", "normal", "high"}:
             raise ValueError(f"unsupported process mode: {mode}")
-        self._process_mode = normalized
+        self._desired_process_mode = normalized
 
     async def close(self) -> None:
         async with self._lock:
@@ -870,59 +880,10 @@ class SevenZipRunner:
         holder = self._async_worker_holder_or_create()
         holder.set_desired_process_mode(mode)
         worker = await holder.get_or_start(None)
-        if str(worker.handshake.get("process_mode") or "normal") == mode:
-            return {
-                "type": "process_mode_ack",
-                "mode": mode,
-                "applied": True,
-                "worker_pid": int(getattr(worker.process, "pid", 0) or 0),
-            }
         return await worker.set_process_mode(mode=mode)
 
-    def extract_attempt(
-        self,
-        *,
-        archive_path: str,
-        part_paths: list[str],
-        out_dir: str,
-        password: str | None,
-        password_candidates: list[str] | tuple[str, ...] | None = None,
-        selected_codepage: str | None,
-        startupinfo,
-        task: ArchiveTask,
-        phase_timer: Any | None = None,
-        phase_prefix: str = "sevenzip",
-    ) -> subprocess.CompletedProcess:
-        try:
-            with _phase(phase_timer, f"{phase_prefix}_build_job"):
-                job = self._build_job(
-                    archive_path=archive_path,
-                    part_paths=part_paths,
-                    out_dir=out_dir,
-                    password=password,
-                    password_candidates=password_candidates,
-                    selected_codepage=selected_codepage,
-                    task=task,
-                    phase_timer=phase_timer,
-                    phase_prefix=f"{phase_prefix}_build_job",
-                )
-        except (OSError, FileNotFoundError) as exc:
-            return self._completed_process(
-                ["sunpack_sevenzip_worker.exe"],
-                -100,
-                "",
-                f"sevenzip_worker setup failed: {exc}",
-                process_failure={
-                    "failure_stage": "worker_setup",
-                    "failure_kind": "process_start",
-                    "message": str(exc),
-                },
-            )
-        return self.submit_attempt(
-            job,
-            startupinfo=startupinfo,
-            task=task,
-        ).result()
+    def extract_attempt(self, **kwargs) -> subprocess.CompletedProcess:
+        return self.submit_attempt(**kwargs).result()
 
     def submit_attempt(self, job: dict | None = None, **kwargs) -> Future:
         """Submit an extraction attempt to native scheduling.
@@ -963,27 +924,14 @@ class SevenZipRunner:
             on_complete=kwargs.get("on_complete"),
         )
 
-    async def submit_attempt_asyncio(self, job: dict | None = None, **kwargs) -> subprocess.CompletedProcess:
-        """Submit and await one native attempt without pipe or continuation threads."""
-        try:
-            if job is None:
-                job = self._build_job(
-                    archive_path=kwargs["archive_path"],
-                    part_paths=kwargs.get("part_paths") or [],
-                    out_dir=kwargs["out_dir"],
-                    password=kwargs.get("password"),
-                    password_candidates=kwargs.get("password_candidates"),
-                    selected_codepage=kwargs.get("selected_codepage"),
-                    task=kwargs["task"],
-                    phase_timer=kwargs.get("phase_timer"),
-                    phase_prefix=kwargs.get("phase_prefix", "sevenzip"),
-                )
-        except Exception as exc:
-            return self.failed_process_for_exception(exc, job)
+    async def submit_attempt_asyncio(
+        self, job: dict, *, startupinfo=None, task: ArchiveTask | None = None,
+    ) -> subprocess.CompletedProcess:
+        """Transport a prepared attempt; filesystem preparation belongs to the broker."""
         return await self._submit_native_job_asyncio(
             job,
-            startupinfo=kwargs.get("startupinfo"),
-            task=kwargs.get("task"),
+            startupinfo=startupinfo,
+            task=task,
         )
 
     async def _submit_native_job_asyncio(

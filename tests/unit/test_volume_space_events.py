@@ -71,7 +71,7 @@ def _write_python_worker(tmp_path: Path, events: list[dict], name: str = "space_
     script.write_text(
         "import json, sys\n"
         f"EVENTS = {events!r}\n"
-        "print(json.dumps({'type': 'worker_ready'}), flush=True)\n"
+        "print(json.dumps({'type': 'worker_ready', 'process_mode': 'normal', 'process_mode_applied': True}), flush=True)\n"
         "for line in sys.stdin:\n"
         "    line = line.strip()\n"
         "    if not line:\n"

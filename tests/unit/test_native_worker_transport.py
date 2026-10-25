@@ -21,6 +21,47 @@ def _event(kind, job_id="job", **fields):
     return parse_worker_transport_event(json.dumps({"type": kind, "job_id": job_id, **fields}))
 
 
+def test_shared_worker_process_mode_retries_failed_ack_and_serializes_transitions():
+    # The transport needs successful acknowledgements, not requested labels.
+    # Concurrent callers must also retain independent acknowledgement ownership.
+    async def scenario():
+        worker = _AsyncNativeWorkerProcess("unused", None)
+        stdout = asyncio.StreamReader()
+        worker.process = SimpleNamespace(pid=123, returncode=None, stdout=stdout)
+        worker.handshake = {"process_mode": "high", "process_mode_applied": False}
+        sent = []
+        dispatcher = asyncio.create_task(worker._dispatch_stdout())
+
+        async def send(payload):
+            mode = json.loads(payload)["mode"]
+            sent.append(mode)
+            await asyncio.sleep(0)
+            if len(sent) == 1:
+                raise OSError("interrupted send")
+            stdout.feed_data(json.dumps({
+                "type": "process_mode_ack", "mode": mode, "applied": len(sent) != 2,
+            }).encode() + b"\n")
+
+        worker.send = send
+        try:
+            with pytest.raises(OSError):
+                await worker.set_process_mode(mode="high")
+            assert not (await worker.set_process_mode(mode="high"))["applied"]
+            results = await asyncio.gather(*(worker.set_process_mode(mode=mode)
+                                            for mode in ["high", "high", "normal", "background"]))
+            assert all(result["applied"] for result in results)
+            assert [result["mode"] for result in results] == ["high", "high", "normal", "background"]
+            assert sent == ["high", "high", "high", "normal", "background"]
+            assert (await worker.set_process_mode(mode="background"))["applied"]
+            assert len(sent) == 5
+        finally:
+            worker._closing = True
+            stdout.feed_eof()
+            await dispatcher
+
+    asyncio.run(scenario())
+
+
 def _row(path="目录/a.txt"):
     return [0, path, "renamed.txt", 3, 3, 1, 7, 1, 7, 1, 1, 1, 123, "616263"]
 

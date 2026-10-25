@@ -720,7 +720,7 @@ impl NativeWatchState {
             let mut volumes = HashSet::new();
             for directory in directories {
                 match crate::filesystem::resolve_output_volume_key(directory) {
-                    Ok(Some(volume)) => {
+                    Some(volume) => {
                         volumes.insert(volume.to_lowercase());
                     }
                     _ => return (entries, Vec::new()),
