@@ -97,9 +97,8 @@ async def _complete(watcher, candidate, response):
 
 
 @pytest.mark.parametrize("promoted", [False, True])
-@pytest.mark.parametrize("replaced", [False, True])
 def test_promoted_cleanup_provenance_is_request_local_and_cleared_after_success(
-    tmp_path, monkeypatch, promoted, replaced,
+    tmp_path, monkeypatch, promoted,
 ):
     async def scenario():
         watcher, root, _output, _sink = _watcher(tmp_path, monkeypatch)
@@ -117,10 +116,10 @@ def test_promoted_cleanup_provenance_is_request_local_and_cleared_after_success(
             watcher.pipeline_engine.run = run
             source = root / "promoted-inner.zip"
             source.write_text("archive")
-            candidate = replace(_candidate(source), file_id="replacement" if replaced else "original")
+            candidate = _candidate(source)
             watcher.state.mark(
                 candidate.path, candidate.size, candidate.mtime,
-                file_id="original", status="failed_password",
+                status="failed_password",
                 failure_payload={
                     "kind": FailureKind.WRONG_PASSWORD.value,
                     "blockers": ["password"],
@@ -138,7 +137,7 @@ def test_promoted_cleanup_provenance_is_request_local_and_cleared_after_success(
             request = await watcher._submit_candidate(_candidate(new_source))
             assert request is not None
             await watcher._complete_candidate(request)
-            assert observed_modes == [promoted and not replaced, False]
+            assert observed_modes == [promoted, False]
         finally:
             await watcher.aclose()
 

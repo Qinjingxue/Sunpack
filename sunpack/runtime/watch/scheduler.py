@@ -1962,11 +1962,6 @@ class WatchScheduler:
             run_config["watch_promoted_nested_input"] = (
                 isinstance(retry_details, dict)
                 and retry_details.get("promoted_nested_input") is True
-                # Do not apply an old blocker to a replacement file at its path.
-                and (
-                    not retry_entry.file_id or not candidate.file_id
-                    or retry_entry.file_id == candidate.file_id
-                )
             )
             pending = self.state.pending_work_for_path(candidate.path)
             scope_dir = ""
