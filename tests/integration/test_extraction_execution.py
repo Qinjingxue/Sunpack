@@ -123,58 +123,39 @@ class ExtractionExecutionTests(unittest.TestCase):
             self.assertTrue(result.success)
             self.assertEqual(task.cleanup_parts, [str(archive_path), str(launcher_path)])
 
-    def test_extractor_retries_unclassified_process_failure(self):
+    def test_extractor_reports_transient_process_failure_once(self):
         with tempfile.TemporaryDirectory() as tmp:
             archive_path = Path(tmp) / "sample.zip"
             archive_path.write_bytes(b"zip")
-            out_dir = Path(tmp) / "sample"
-
             extractor = ExtractionScheduler(max_retries=2)
             extractor.password_resolver = FakePasswordResolver()
             extractor.metadata_scanner = FakeMetadataScanner()
-
             failed = _completed(returncode=8, stdout="", stderr="write error")
-            succeeded = _completed(returncode=0, stdout="", stderr="")
+            calls = []
+            extractor.sevenzip_runner.extract_attempt = lambda **kwargs: (
+                calls.append(kwargs) or failed
+            )
+            result = extractor.extract(make_archive_task(archive_path), str(Path(tmp) / "out"))
+            self.assertFalse(result.success)
+            self.assertEqual(len(calls), 1)
 
-            task = make_archive_task(archive_path)
 
-            attempts = iter([failed, succeeded])
-            extractor.sevenzip_runner.extract_attempt = lambda **_kwargs: next(attempts)
-            result = extractor.extract(task, str(out_dir))
-
-            self.assertTrue(result.success)
-
-    def test_extractor_retries_transient_failure_and_cleans_partial_output(self):
+    def test_transient_failure_does_not_trigger_a_second_extraction(self):
         with tempfile.TemporaryDirectory() as tmp:
             archive_path = Path(tmp) / "sample.zip"
             archive_path.write_bytes(b"zip")
-            out_dir = Path(tmp) / "sample"
-            partial_path = out_dir / "partial.bin"
-
             extractor = ExtractionScheduler(max_retries=2)
             extractor.password_resolver = FakePasswordResolver()
             extractor.metadata_scanner = FakeMetadataScanner()
+            failed = _completed(returncode=-102, stdout="", stderr="worker connection lost")
+            calls = []
+            extractor.sevenzip_runner.extract_attempt = lambda **kwargs: (
+                calls.append(kwargs) or failed
+            )
+            result = extractor.extract(make_archive_task(archive_path), str(Path(tmp) / "out"))
+            self.assertFalse(result.success)
+            self.assertEqual(len(calls), 1)
 
-            failed = _completed(returncode=-102, stdout="", stderr="7z process made no observable progress")
-            succeeded = _completed(returncode=0, stdout="", stderr="")
-            calls = 0
-
-            def fake_run(*_args, **_kwargs):
-                nonlocal calls
-                calls += 1
-                if calls == 1:
-                    partial_path.parent.mkdir(parents=True, exist_ok=True)
-                    partial_path.write_text("partial", encoding="utf-8")
-                    return failed
-                return succeeded
-
-            task = make_archive_task(archive_path)
-
-            extractor.sevenzip_runner.extract_attempt = lambda **_kwargs: fake_run()
-            result = extractor.extract(task, str(out_dir))
-
-            self.assertTrue(result.success)
-            self.assertFalse(partial_path.exists())
 
     def test_extractor_does_not_retry_damaged_archive(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -279,24 +260,23 @@ class ExtractionExecutionTests(unittest.TestCase):
             self.assertEqual(by_archive_path["bad.bin"]["status"], "partial")
             self.assertEqual(manifest.summary["partial"], 1)
 
-    def test_extractor_reports_retry_count_after_transient_failures_are_exhausted(self):
+    def test_transient_failure_preserves_original_error_without_retry_count(self):
         with tempfile.TemporaryDirectory() as tmp:
             archive_path = Path(tmp) / "busy.zip"
             archive_path.write_bytes(b"zip")
-            out_dir = Path(tmp) / "busy"
-
             extractor = ExtractionScheduler(max_retries=2)
             extractor.password_resolver = FakePasswordResolver()
             extractor.metadata_scanner = FakeMetadataScanner()
-
             failed = _completed(returncode=-100, stdout="", stderr="7z process failed to start")
-            task = make_archive_task(archive_path)
-
-            extractor.sevenzip_runner.extract_attempt = lambda **_kwargs: failed
-            result = extractor.extract(task, str(out_dir))
-
+            calls = []
+            extractor.sevenzip_runner.extract_attempt = lambda **kwargs: (
+                calls.append(kwargs) or failed
+            )
+            result = extractor.extract(make_archive_task(archive_path), str(Path(tmp) / "busy"))
             self.assertFalse(result.success)
-            self.assertIn("retried 1 time(s)", result.error)
+            self.assertEqual(len(calls), 1)
+            self.assertNotIn("retried", result.error.lower())
+
 
     def test_runner_scans_game_like_output_directory_for_recursion(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -318,25 +298,19 @@ if __name__ == "__main__":
 
 
 class ExtractionRetryTests(unittest.TestCase):
-    def test_retry_resubmits_immediately_without_timed_backoff(self):
+    def test_a_failed_attempt_is_not_resubmitted(self):
         with tempfile.TemporaryDirectory() as tmp:
             archive_path = Path(tmp) / "sample.zip"
             archive_path.write_bytes(b"zip")
-            out_dir = Path(tmp) / "sample"
-
             extractor = ExtractionScheduler(max_retries=2)
             extractor.password_resolver = FakePasswordResolver()
             extractor.metadata_scanner = FakeMetadataScanner()
-            attempts = iter([
-                _completed(returncode=8, stdout="", stderr="write error"),
-                _completed(returncode=0, stdout="", stderr=""),
-            ])
             calls = []
+            failed = _completed(returncode=8, stdout="", stderr="write error")
             extractor.sevenzip_runner.extract_attempt = lambda **kwargs: (
-                calls.append(kwargs) or next(attempts)
+                calls.append(kwargs) or failed
             )
-            result = extractor.extract(make_archive_task(archive_path), str(out_dir))
+            result = extractor.extract(make_archive_task(archive_path), str(Path(tmp) / "sample"))
+            self.assertFalse(result.success)
+            self.assertEqual(len(calls), 1)
 
-            self.assertTrue(result.success)
-            self.assertEqual(len(calls), 2)
-            self.assertTrue(all("retry_delay_seconds" not in call for call in calls))
