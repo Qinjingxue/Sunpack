@@ -33,7 +33,7 @@ class ExtractionScheduler:
         self.password_resolver = PasswordResolver(self.password_tester, self.password_session)
         extraction_config = extraction_config if isinstance(extraction_config, dict) else {}
         self.metadata_scanner = ArchiveMetadataScanner(language=str(extraction_config.get("language") or "en"))
-        self.max_retries = max(1, max_retries)
+        self.max_retries = max_retries  # Legacy argument; not an attempt ceiling.
         self.output_config = output_config if isinstance(output_config, dict) else None
         self.extraction_config = extraction_config
         self.process_config = {
