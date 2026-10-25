@@ -1130,3 +1130,25 @@ def test_cli_password_snapshot_hot_updates_without_watch_or_request_io(tmp_path,
 
 
 
+
+
+def test_runtime_startup_does_not_fail_because_elapsed_time_passes(monkeypatch, tmp_path):
+    """Only process exit or transport failure, not an old 10s clock, decides startup."""
+    _enable_test_runtime_identity(monkeypatch)
+
+    class FakeProcess:
+        def poll(self):
+            return None
+
+    replies = iter([None, None, None, {"exit_code": 0, "stdout": "", "stderr": ""}])
+    ticks = iter([0.0, 1000.0, 2000.0, 3000.0])
+    monkeypatch.setattr(persistent_process, "_try_send", lambda _payload: next(replies))
+    monkeypatch.setattr(persistent_process, "server_command", lambda: ["unused"])
+    monkeypatch.setattr(persistent_process, "runtime_working_directory", lambda: str(tmp_path))
+    monkeypatch.setattr("subprocess.Popen", lambda *args, **kwargs: FakeProcess())
+    # Simulate a clock advancing well beyond the removed 10s deadline.
+    monkeypatch.setattr(persistent_process, "time", type("Clock", (), {
+        "monotonic": staticmethod(lambda: next(ticks)),
+        "sleep": staticmethod(lambda _seconds: None),
+    })())
+    assert persistent_process._send_or_start({"argv": ["extract", "test.zip"]})["exit_code"] == 0
