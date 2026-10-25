@@ -121,7 +121,6 @@
     "quiet_max_seconds": 180,
     "boundary_confirmation_seconds": 0.5,
     "max_folders": 16,
-    "observer_stop_timeout_seconds": 5,
     "runtime_cache_cleanup_enabled": true,
     "runtime_cache_cleanup_idle_seconds": 10,
     "password_retry_debounce_seconds": 0.5,
