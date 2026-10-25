@@ -168,17 +168,13 @@ def _infer_process_failure(returncode: int | None, result: dict[str, Any], stder
             "failure_kind": "process_start",
             "message": message or "sevenzip_worker failed to start",
         }
-    if returncode == -101:
+    if returncode in (-101, -102):
+        # Legacy negative codes are also used for actual transport failures.
+        # They do not prove a deadline expired or that the worker stalled.
         return {
-            "failure_stage": "worker_timeout",
-            "failure_kind": "process_timeout",
-            "message": message or "sevenzip_worker timed out",
-        }
-    if returncode == -102:
-        return {
-            "failure_stage": "worker_no_progress",
-            "failure_kind": "process_stall",
-            "message": message or "sevenzip_worker made no observable progress",
+            "failure_stage": "worker_communication",
+            "failure_kind": "process_io",
+            "message": message or f"sevenzip_worker failed without a result (code {returncode})",
         }
     if returncode is not None and returncode < 0:
         return {
