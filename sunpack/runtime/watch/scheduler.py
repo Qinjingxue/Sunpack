@@ -142,7 +142,6 @@ class WatchScheduler:
         out_dir: str = ".",
         state_path: str,
         cold_start_seconds: float | None = None,
-        observer_stop_timeout_seconds: float | None = None,
         pipeline_engine=None,
         notification_sink=None,
         wake_callback: Callable[[], None] | None = None,
@@ -194,14 +193,6 @@ class WatchScheduler:
             if any(entry.deep_detect for entry in self.root_entries.values()) else None)
         from sunpack.runtime.watch.roots import discovery_scopes
         self.scopes = discovery_scopes(self.root_entries.values())
-        self.observer_stop_timeout_seconds = max(
-            0.0,
-            float(
-                DEFAULT_WATCH_CONFIG["observer_stop_timeout_seconds"]
-                if observer_stop_timeout_seconds is None
-                else observer_stop_timeout_seconds
-            ),
-        )
         self.state = WatchStateStore(state_path, retirement_callback=self._schedule_journal_retirement,
                                      scopes=self.scopes.values())
         self._catalog = NativeWatchCatalog(self.state._native, str(Path(state_path).parent))
