@@ -44,7 +44,7 @@ impl<'a> RelationSource<'a> {
         match self {
             Self::Snapshot(snapshot, cached) => cached
                 .and_then(|cache| cache.anchors.get(&path_key(self.path(row))))
-                .or(snapshot.table.relation_anchors[row].as_ref()),
+                .or(snapshot.table.relation_anchors[row].as_deref()),
             Self::Physical(rows) => rows[row].anchor.as_ref(),
         }
     }

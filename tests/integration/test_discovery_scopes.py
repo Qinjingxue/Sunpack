@@ -23,6 +23,128 @@ from tests.helpers.config_factory import make_config
 from tests.helpers.real_archives import ArchiveFixtureFactory
 
 
+def test_catalog_observations_share_rows_without_changing_scan_versions_or_persistence(tmp_path):
+    """Existing cache and restart cases do not combine the two metadata versions.
+
+    One lifecycle covers accepted observations, quiet history, an independent
+    rescan, snapshot restoration and temporary recovery outside watched roots.
+    """
+    root = tmp_path / "Input"
+    child = root / "Nested"
+    child.mkdir(parents=True)
+    first, second = root / "家庭.part1.disguised", child / "家庭.part2.opaque"
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+    folder = tmp_path / "state"
+    state = WatchStateStore(str(folder / "state.snapshot"))
+    scope = DiscoveryScope(str(root), recursive=True)
+    options = DirectoryScanner.compile_scan_options({"filesystem": {"scan_filters_enabled": False}})
+    catalog = NativeWatchCatalog(state._native, str(folder))
+    catalog.retain_roots([str(root)])
+    try:
+        assert not options.catalog_update(catalog, scope.native)
+        before = catalog.memory_stats()
+        catalog.commit()
+        def persisted_files():
+            return {path.name: (path.stat().st_size, path.stat().st_mtime_ns)
+                    for path in folder.glob("catalog.*.bin")}
+        written = persisted_files()
+        identity = "0000000000000012"
+        catalog.remember_observation(str(first), 5, 10.25, identity, 7)
+        catalog.remember_observation(str(second), 6, 10.5, "0123456789abcdef" * 2, 8)
+        catalog.retire_observation(str(first), 30.0, 12.0, True)
+        accepted = catalog.observation(str(first).upper())
+        assert accepted.file_id == identity and accepted.quiet_seconds == 30.0
+        assert catalog.observation(str(second)).file_id == "0123456789abcdef" * 2
+        assert catalog.memory_stats()["rows"] == before["rows"]
+        catalog.commit()
+        assert persisted_files() == written
+
+        first.write_bytes(b"newer scanning metadata")
+        errors, changed = options.catalog_refresh(catalog, scope.native, str(root))
+        assert not errors and str(first) in changed
+        assert catalog.observation(str(first)).size == accepted.size == 5
+        catalog.remember_observation(str(first), 23, 20.0, "replacement-id", 100)
+        current = catalog.observation(str(first))
+        assert current.size == 23 and current.file_id == "replacement-id" and current.change_usn == 100
+        assert current.quiet_seconds == 30.0 and current.last_content_event_at == 12.0 and current.quiet_calibrated
+        assert accepted.size == 5  # the admission snapshot remains immutable
+        assert set(catalog.bucket_paths(scope.native, str(first))) == {str(first), str(second)}
+
+        recovery = str(tmp_path / "generated" / "inner.bin")
+        catalog.remember_observation(recovery, 3, 1.0, "recovery", 0)
+        assert catalog.memory_stats()["transient_rows"] == 1
+        catalog.retire_observation(recovery, 2.0, None, False)
+        assert catalog.observation(recovery) is None and catalog.memory_stats()["transient_rows"] == 0
+        drive_catalog = NativeWatchCatalog(state._native)
+        drive_catalog.retain_roots([root.anchor])
+        drive_catalog.remember_observation(str(first), 23, 20.0, identity, 100)
+        drive_catalog.retain_roots([root.anchor])
+        assert drive_catalog.observation(str(first)) is not None
+        drive_catalog.forget_observation(root.anchor, recursive=True)
+        assert drive_catalog.observation(str(first)) is None
+        catalog.close()
+        catalog = NativeWatchCatalog(state._native, str(folder))
+        assert catalog.error is None and catalog.memory_stats()["observations"] == 0
+        assert set(catalog.bucket_paths(scope.native, str(first))) == {str(first), str(second)}
+        catalog.remember_observation(str(second), 6, 20.0, "new", 101)
+        second.unlink()
+        assert not options.catalog_update(catalog, scope.native, str(second))
+        assert catalog.observation(str(second)) is None
+        assert catalog.bucket_paths(scope.native, str(first)) == [str(first)]
+    finally:
+        catalog.close()
+        state.close()
+
+
+def test_catalog_bulk_retirement_releases_observations_parents_and_bucket_capacity(tmp_path):
+    """Small sibling families cannot expose retained per-name allocations or
+    hash-table high water. The same lifecycle covers index reuse on a case-only
+    rename and root replacement without adding another filesystem fixture.
+    """
+    root = tmp_path / "inputs"
+    root.mkdir()
+    paths = [root / (f"file{index}.disguised" if index < 256 else f"shared.part{index}.opaque")
+             for index in range(512)]
+    for path in paths:
+        path.write_bytes(b"x")
+    scope = DiscoveryScope(str(root), recursive=True)
+    options = DirectoryScanner.compile_scan_options({"filesystem": {"scan_filters_enabled": False}})
+    state = WatchStateStore(str(tmp_path / "state.snapshot"))
+    catalog = NativeWatchCatalog(state._native, str(tmp_path))
+    try:
+        assert not options.catalog_update(catalog, scope.native)
+        for path in [*paths[:8], paths[-1]]:
+            catalog.remember_observation(str(path), 1, 1.0, "id", 1)
+        assert catalog.memory_stats()["observations"] == 9
+        catalog.retire_observation(str(paths[-1]), 30.0, 12.0, True)
+        paths[-1] = paths[-1].rename(paths[-1].with_name(paths[-1].name.upper()))
+        assert not options.catalog_update(catalog, scope.native, str(paths[-1]))
+        assert len(catalog.bucket_paths(scope.native, str(paths[-1]))) == 256
+        assert catalog.memory_stats()["rows"] == len(paths)
+        assert catalog.observation(str(paths[-1])).quiet_seconds == 30.0
+        for path in paths[:-1]:
+            path.unlink()
+        assert not options.catalog_update(catalog, scope.native)
+        assert catalog.bucket_paths(scope.native, str(paths[-1])) == [str(paths[-1])]
+        paths[-1].unlink()
+        assert not options.catalog_update(catalog, scope.native)
+        catalog.commit()
+        stats = catalog.memory_stats()
+        assert all(stats[field] == 0 for field in ["rows", "observations", "parents", "buckets", "bucket_capacity"])
+        paths[0].write_bytes(b"x")
+        assert not options.catalog_update(catalog, scope.native)
+        replacement = tmp_path / "replacement"
+        replacement.mkdir()
+        catalog.retain_roots([str(replacement)])
+        catalog.close()
+        catalog = NativeWatchCatalog(state._native, str(tmp_path))
+        assert catalog.memory_stats()["rows"] == 0
+    finally:
+        catalog.close()
+        state.close()
+
+
 @pytest.mark.parametrize("archive_format", ["7z", "zip", "rar"])
 def test_cross_directory_parts_share_one_scope_and_execute_beside_entry(tmp_path, archive_format):
     case = ArchiveFixtureFactory().create(tmp_path / "fixture", "scope", archive_format,

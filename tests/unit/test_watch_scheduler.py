@@ -520,7 +520,8 @@ def _indexed_scheduler_for_test():
     watcher._closed = False
     watcher._completion_batches = set()
     watcher._quiet_trackers = {}
-    watcher._latest_observations = {}
+    from sunpack_native import NativeWatchCatalog, NativeWatchState
+    watcher._catalog = NativeWatchCatalog(NativeWatchState())
     watcher._source_probes = {}
     watcher._wake_callback = None
     watcher.should_ignore_event_path = lambda path: False
@@ -1361,7 +1362,7 @@ def test_cancelled_harvest_and_close_wait_for_completion_callbacks(tmp_path):
         assert not watcher._completion_batches
         assert not request.source_paths
         assert not watcher._quiet_trackers
-        assert not watcher._latest_observations
+        assert watcher._catalog is None
         # An idle owner releases the shared native catalogs and WAL on stop.
         assert not journal_stats(watcher.state._writer_stream)["registered"]
 
@@ -1384,7 +1385,7 @@ def test_metadata_event_during_and_after_processing_does_not_start_new_epoch(tmp
     assert _await(watcher.run_once()).processed == 0
     assert len(engine.handles) == 1
 
-    baseline = watcher._latest_observations[str(archive)]
+    baseline = watcher._catalog.observation(str(archive))
     tracker = watcher._quiet_trackers[str(archive)]
     model_before = (
         tracker.last_content_event_at,
@@ -1411,7 +1412,7 @@ def test_metadata_event_during_and_after_processing_does_not_start_new_epoch(tmp
     watcher.enqueue(str(archive), event_type="modified")
 
     assert watcher.pending_count == 0
-    assert _observation_version(watcher._latest_observations[str(archive)]) == _observation_version(metadata)
+    assert _observation_version(watcher._catalog.observation(str(archive))) == _observation_version(metadata)
     assert len(wakeups) == wakeups_before
     assert (
         tracker.last_content_event_at,
@@ -1440,7 +1441,7 @@ def test_metadata_event_during_and_after_processing_does_not_start_new_epoch(tmp
     )
     watcher.enqueue(str(archive), event_type="modified")
     assert watcher.pending_count == 0
-    assert _observation_version(watcher._latest_observations[str(archive)]) == _observation_version(metadata_after)
+    assert _observation_version(watcher._catalog.observation(str(archive))) == _observation_version(metadata_after)
     assert _await(watcher.run_once()).processed == 0
 
 
@@ -1457,7 +1458,7 @@ def test_content_event_during_processing_still_starts_new_epoch_from_latest_meta
     watcher.enqueue(str(archive), event_type="created")
     assert _await(watcher.run_once()).processed == 0
 
-    baseline = watcher._latest_observations[str(archive)]
+    baseline = watcher._catalog.observation(str(archive))
     metadata = WatchCandidate(
         str(archive),
         baseline.size,
@@ -1495,7 +1496,7 @@ def test_content_event_during_processing_still_starts_new_epoch_from_latest_meta
     watcher.enqueue(str(archive), event_type="modified")
 
     assert watcher.pending_count == 1
-    assert _observation_version(watcher._latest_observations[str(archive)]) == _observation_version(content)
+    assert _observation_version(watcher._catalog.observation(str(archive))) == _observation_version(content)
     engine.handles[0].complete_no_tasks()
     assert _await(watcher.run_once()).processed == 1
     assert len(engine.handles) == 2
@@ -1847,7 +1848,7 @@ def test_pending_metadata_event_advances_snapshot_without_generation_or_wakeup(t
     watcher.enqueue(str(archive), event_type="modified")
 
     assert watcher._pending[str(archive)] == metadata
-    assert _observation_version(watcher._latest_observations[str(archive)]) == _observation_version(metadata)
+    assert _observation_version(watcher._catalog.observation(str(archive))) == _observation_version(metadata)
     assert state.generation == generation
     assert state.last_event_at == last_event_at
     assert len(wakeups) == wakeups_before
@@ -2414,7 +2415,7 @@ def test_password_retry_bypasses_learned_quiet_for_unchanged_failed_archive(tmp_
     watcher._quiet_trackers[str(archive_path)].quiet_seconds = 30.0
     assert _await(watcher.run_once()).failed == 1
     assert str(archive_path) not in watcher._quiet_trackers
-    assert watcher._latest_observations[str(archive_path)].quiet_seconds == 30.0
+    assert watcher._catalog.observation(str(archive_path)).quiet_seconds == 30.0
 
     _change_password_source(watcher)
     retried = _await(watcher.run_once())
@@ -2422,7 +2423,7 @@ def test_password_retry_bypasses_learned_quiet_for_unchanged_failed_archive(tmp_
     assert retried.succeeded == 1
     assert attempts["count"] == 2
     assert str(archive_path) not in watcher._quiet_trackers
-    assert watcher._latest_observations[str(archive_path)].quiet_seconds == 30.0
+    assert watcher._catalog.observation(str(archive_path)).quiet_seconds == 30.0
 
 
     assert not watcher.state.entries
@@ -2463,7 +2464,7 @@ def test_password_retry_preserves_quiet_when_failed_archive_changed(tmp_path, mo
     watcher._quiet_trackers[str(archive_path)].quiet_seconds = 30.0
     assert _await(watcher.run_once()).failed == 1
     assert str(archive_path) not in watcher._quiet_trackers
-    assert watcher._latest_observations[str(archive_path)].quiet_seconds == 30.0
+    assert watcher._catalog.observation(str(archive_path)).quiet_seconds == 30.0
     archive_path.write_bytes(b"PK\x03\x04changed-payload")
 
     _change_password_source(watcher)
@@ -3240,7 +3241,7 @@ def test_watch_scheduler_retains_slow_interval_learning_across_active_epochs(tmp
     events.emit(archive_path)
 
     events.run_after(10.01, processed=1)
-    assert not watcher._latest_observations[str(archive_path)].quiet_calibrated
+    assert not watcher._catalog.observation(str(archive_path)).quiet_calibrated
     clock.advance(9.99)
     archive_path.write_bytes(b"second")
     os.utime(archive_path, (clock.value, clock.value))

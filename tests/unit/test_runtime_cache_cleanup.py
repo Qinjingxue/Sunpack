@@ -334,7 +334,7 @@ def test_retained_sources_release_models_and_native_capacity_across_batches(tmp_
                 assert watcher.state._native.storage_capacities() == (0, 0)
                 assert reader_cache_stats()["container_capacity"] == 0
                 assert not engine._path_leases._completed_watch_generations
-                assert len(watcher._latest_observations) == len(sources)
+                assert watcher._catalog.memory_stats()["observations"] == len(sources)
                 for source in sources:
                     watcher.enqueue(str(source), event_type="modified")
                 assert (await watcher.run_once()).processed == 0
@@ -342,7 +342,7 @@ def test_retained_sources_release_models_and_native_capacity_across_batches(tmp_
             for source in sources:
                 source.unlink()
                 watcher.notify_path_departed(str(source))
-            assert not watcher._latest_observations
+            assert watcher._catalog.memory_stats()["observations"] == 0
             await watcher.aclose()
             assert not journal_stats(watcher.state._writer_stream)["registered"]
 

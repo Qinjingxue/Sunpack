@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
+use super::catalog::{catalog_stem, CatalogRow, NativeWatchObservation, ScopeCatalog};
 use crate::analysis_native::volume_anchor::{
     probe_volume_anchor_from_head, probe_volume_anchor_paths_cheap,
     probe_volume_anchor_records_cheap, VolumeAnchor,
@@ -19,13 +20,13 @@ use crate::analysis_native::volume_anchor::{
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct DirectoryEntryRecord {
     pub(crate) path: String,
-    is_dir: bool,
-    size: Option<u64>,
-    mtime_ns: Option<u64>,
+    pub(super) is_dir: bool,
+    pub(super) size: Option<u64>,
+    pub(super) mtime_ns: Option<u64>,
     #[serde(skip)]
-    relation_member_eligible: bool,
+    pub(super) relation_member_eligible: bool,
     #[serde(skip)]
-    relation_anchor: Option<VolumeAnchor>,
+    pub(super) relation_anchor: Option<Box<VolumeAnchor>>,
 }
 
 #[derive(Debug)]
@@ -36,7 +37,7 @@ pub(crate) struct DirectorySnapshotTable {
     pub(crate) sizes: Vec<Option<u64>>,
     mtimes_ns: Vec<Option<u64>>,
     pub(crate) relation_member_eligible: Vec<bool>,
-    pub(crate) relation_anchors: Vec<Option<VolumeAnchor>>,
+    pub(crate) relation_anchors: Vec<Option<Box<VolumeAnchor>>>,
     pub(crate) file_routes: Vec<u8>,
 }
 
@@ -110,7 +111,7 @@ impl NativeDirectorySnapshot {
             file_routes: Vec::with_capacity(records.len()),
         };
         for record in records {
-            let route = filesystem_file_route(record.is_dir, record.relation_anchor.as_ref());
+            let route = filesystem_file_route(record.is_dir, record.relation_anchor.as_deref());
             table.paths.push(record.path);
             table.is_dirs.push(record.is_dir);
             table.sizes.push(record.size);
@@ -921,7 +922,7 @@ impl NativeDirectorySnapshot {
             .iter()
             .filter_map(|&row| {
                 (!self.table.is_dirs[row] && self.table.file_routes[row] == FILE_ROUTE_RELATIONS)
-                    .then(|| (row, self.table.relation_anchors[row].as_ref()))
+                    .then(|| (row, self.table.relation_anchors[row].as_deref()))
             })
             .filter_map(|(row, anchor)| anchor.map(|anchor| (row, anchor)))
             .map(|(row, anchor)| {
@@ -944,7 +945,7 @@ impl NativeDirectorySnapshot {
                 continue;
             }
             let path = &self.table.paths[row];
-            let anchor = self.table.relation_anchors[row].as_ref();
+            let anchor = self.table.relation_anchors[row].as_deref();
             specs.push((
                 path.clone(),
                 self.table.sizes[row],
@@ -978,7 +979,7 @@ impl NativeDirectorySnapshot {
             if self.table.is_dirs[row] || self.table.file_routes[row] == FILE_ROUTE_RELATIONS {
                 continue;
             }
-            let anchor = self.table.relation_anchors[row].as_ref();
+            let anchor = self.table.relation_anchors[row].as_deref();
             paths.push(self.table.paths[row].clone());
             sizes.push(self.table.sizes[row]);
             routes.push(self.table.file_routes[row]);
@@ -1270,7 +1271,8 @@ impl NativeDirectoryScanOptions {
         scope: &crate::scan::scope::NativeDiscoveryScope,
         under: Option<&str>,
     ) -> PyResult<Py<PyList>> {
-        let target = crate::path_keys::path_key(under.unwrap_or(&scope.root));
+        let mut target = crate::path_keys::path_key(under.unwrap_or(&scope.root));
+        target.truncate(target.trim_end_matches('\\').len());
         let records: Vec<String> = state
             .catalogs
             .lock()
@@ -1288,8 +1290,8 @@ impl NativeDirectoryScanOptions {
                     .filter(|(key, _)| {
                         key.as_ref() == target || key[target.len()..].starts_with('\\')
                     })
-                    .filter(|(_, row)| !row.is_dir)
-                    .map(|(_, row)| row.path.clone())
+                    .filter(|(_, row)| row.persistent() && !row.is_dir())
+                    .map(|(_, row)| row.path())
             })
             .collect();
         let values = PyList::empty(py);
@@ -1317,13 +1319,13 @@ impl NativeDirectoryScanOptions {
                 .flat_map(|catalog| {
                     catalog
                         .buckets
-                        .get(&catalog_stem(seed))
+                        .get(catalog_stem(seed).as_str())
                         .into_iter()
-                        .flatten()
+                        .flat_map(|bucket| bucket.iter())
                         .filter_map(|key| catalog.rows.get(key))
                 })
+                .map(|row| row.record())
                 .filter(|row| scope.contains(&row.path) && !state.is_owned(&row.path))
-                .cloned()
                 .collect()
         };
         let root = Path::new(&scope.root);
@@ -1793,11 +1795,11 @@ fn build_inventory_snapshot_views(
         }
         let item = &files[item_index];
         if item.magic.len() >= item.size.min(512) as usize {
-            record.relation_anchor = Some(probe_volume_anchor_from_head(
+            record.relation_anchor = Some(Box::new(probe_volume_anchor_from_head(
                 &record.path,
                 item.size,
                 &item.magic,
-            ));
+            )));
         }
     }
 
@@ -2660,7 +2662,7 @@ fn populate_relation_anchors(records: &mut [DirectoryEntryRecord]) {
         } else {
             unknown_anchors.next()
         };
-        records[index].relation_anchor = anchor;
+        records[index].relation_anchor = anchor.map(Box::new);
     }
 }
 
@@ -3211,21 +3213,6 @@ pub(crate) fn scope_file_paths(
     ))
 }
 
-#[derive(Default)]
-pub(super) struct ScopeCatalog {
-    pub(super) rows: std::collections::BTreeMap<Arc<str>, DirectoryEntryRecord>,
-    buckets: HashMap<String, Vec<Arc<str>>>,
-}
-
-fn catalog_stem(path: &str) -> String {
-    crate::path_keys::case_key(crate::relations::first_dot_stem(
-        Path::new(path)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or_default(),
-    ))
-}
-
 /// One native path table with derived filename buckets and a disposable cache WAL.
 #[pyclass(module = "sunpack_native")]
 pub(crate) struct NativeWatchCatalog {
@@ -3269,6 +3256,179 @@ impl NativeWatchCatalog {
         self.error.lock().unwrap().clone()
     }
 
+    fn observation(&self, py: Python<'_>, path: &str) -> Option<NativeWatchObservation> {
+        py.detach(|| {
+            let key = crate::path_keys::path_key(path);
+            self.catalogs.lock().unwrap().values().find_map(|table| {
+                table
+                    .rows
+                    .get(key.as_str())?
+                    .observation
+                    .as_deref()
+                    .cloned()
+            })
+        })
+    }
+
+    fn remember_observation(
+        &self,
+        py: Python<'_>,
+        path: &str,
+        size: u64,
+        mtime: f64,
+        file_id: &str,
+        change_usn: i64,
+    ) {
+        py.detach(|| {
+            let key = crate::path_keys::path_key(path);
+            let mut tables = self.catalogs.lock().unwrap();
+            let scope = tables
+                .keys()
+                .filter(|scope| {
+                    !scope.is_empty()
+                        && (key == scope.trim_end_matches('\\')
+                            || key
+                                .strip_prefix(scope.trim_end_matches('\\'))
+                                .is_some_and(|tail| tail.starts_with('\\')))
+                })
+                .max_by_key(|scope| scope.len())
+                .cloned()
+                .unwrap_or_default();
+            let table = tables.entry(scope).or_default();
+            if let Some(row) = table.rows.get_mut(key.as_str()) {
+                row.remember_observation(size, mtime, file_id, change_usn);
+                return;
+            }
+            table.insert_transient(
+                Arc::from(key.as_str()),
+                DirectoryEntryRecord {
+                    path: path.to_owned(),
+                    is_dir: false,
+                    size: Some(size),
+                    mtime_ns: Some((mtime * 1e9) as u64),
+                    relation_member_eligible: false,
+                    relation_anchor: None,
+                },
+            );
+            table
+                .rows
+                .get_mut(key.as_str())
+                .unwrap()
+                .remember_observation(size, mtime, file_id, change_usn);
+        })
+    }
+
+    #[pyo3(signature = (path, quiet_seconds=None, last_content_event_at=None, quiet_calibrated=false))]
+    fn retire_observation(
+        &self,
+        py: Python<'_>,
+        path: &str,
+        quiet_seconds: Option<f64>,
+        last_content_event_at: Option<f64>,
+        quiet_calibrated: bool,
+    ) {
+        py.detach(|| {
+            let key = crate::path_keys::path_key(path);
+            let mut tables = self.catalogs.lock().unwrap();
+            for table in tables.values_mut() {
+                if let Some(row) = table.rows.get_mut(key.as_str()) {
+                    if !row.persistent() {
+                        table.remove(&key);
+                        continue;
+                    }
+                    if let (Some(observation), Some(seconds)) =
+                        (row.observation.as_mut(), quiet_seconds)
+                    {
+                        observation.quiet_seconds = seconds;
+                        observation.last_content_event_at = last_content_event_at;
+                        observation.quiet_calibrated = quiet_calibrated;
+                    }
+                }
+            }
+        })
+    }
+
+    #[pyo3(signature = (path, recursive=false, missing_only=false))]
+    fn forget_observation(&self, py: Python<'_>, path: &str, recursive: bool, missing_only: bool) {
+        let mut key = crate::path_keys::path_key(path);
+        key.truncate(key.trim_end_matches('\\').len());
+        py.detach(|| {
+            let mut tables = self.catalogs.lock().unwrap();
+            for table in tables.values_mut() {
+                let keys: Vec<_> = table
+                    .rows
+                    .range::<str, _>((
+                        std::ops::Bound::Included(key.as_str()),
+                        std::ops::Bound::Unbounded,
+                    ))
+                    .take_while(|(candidate, _)| candidate.starts_with(&key))
+                    .filter(|(candidate, row)| {
+                        row.observation.is_some()
+                            && (candidate.as_ref() == key
+                                || (recursive && candidate[key.len()..].starts_with('\\')))
+                            && (!missing_only
+                                || match fs::metadata(row.path()) {
+                                    Ok(metadata) => !metadata.is_file(),
+                                    Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+                                })
+                    })
+                    .map(|(key, _)| Arc::clone(key))
+                    .collect();
+                for key in keys {
+                    if table.rows[key.as_ref()].persistent() {
+                        table.rows.get_mut(key.as_ref()).unwrap().observation = None;
+                    } else {
+                        table.remove(&key);
+                    }
+                }
+            }
+        });
+    }
+
+    fn memory_stats(&self, py: Python<'_>) -> HashMap<&'static str, usize> {
+        py.detach(|| {
+            let tables = self.catalogs.lock().unwrap();
+            let mut stats = HashMap::from([
+                ("rows", 0),
+                ("observations", 0),
+                ("transient_rows", 0),
+                ("buckets", 0),
+                ("bucket_capacity", 0),
+                ("parents", 0),
+                ("row_bytes", std::mem::size_of::<CatalogRow>()),
+                (
+                    "observation_bytes",
+                    std::mem::size_of::<NativeWatchObservation>(),
+                ),
+            ]);
+            for table in tables.values() {
+                stats
+                    .entry("rows")
+                    .and_modify(|count| *count += table.rows.len());
+                stats.entry("observations").and_modify(|count| {
+                    *count += table
+                        .rows
+                        .values()
+                        .filter(|row| row.observation.is_some())
+                        .count()
+                });
+                stats
+                    .entry("transient_rows")
+                    .and_modify(|count| *count += table.rows.len() - table.persistent_len);
+                stats
+                    .entry("buckets")
+                    .and_modify(|count| *count += table.buckets.len());
+                stats
+                    .entry("bucket_capacity")
+                    .and_modify(|count| *count += table.buckets.capacity());
+                stats
+                    .entry("parents")
+                    .and_modify(|count| *count += table.parent_count());
+            }
+            stats
+        })
+    }
+
     fn cursor(
         &self,
         py: Python<'_>,
@@ -3300,12 +3460,12 @@ impl NativeWatchCatalog {
             .flat_map(|table| {
                 table
                     .buckets
-                    .get(&catalog_stem(seed))
+                    .get(catalog_stem(seed).as_str())
                     .into_iter()
-                    .flatten()
+                    .flat_map(|bucket| bucket.iter())
                     .filter_map(|key| table.rows.get(key))
             })
-            .map(|row| row.path.clone())
+            .map(|row| row.path())
             .collect()
     }
     fn retain_roots(&self, roots: Vec<String>) {
@@ -3316,7 +3476,11 @@ impl NativeWatchCatalog {
         let mut tables = self.catalogs.lock().unwrap();
         let previous = tables.len();
         tables.retain(|key, _| keys.contains(key));
-        if previous != tables.len() {
+        let removed_roots = previous != tables.len();
+        for key in &keys {
+            tables.entry(key.clone()).or_default();
+        }
+        if removed_roots {
             if let Some(store) = self.store.lock().unwrap().as_mut() {
                 store.stamps.retain(|key, _| keys.contains(key));
                 store.mark_rebuilt();
@@ -3380,7 +3544,12 @@ impl NativeWatchCatalog {
     #[pyo3(signature = (idle=false))]
     fn commit(&self, py: Python<'_>, idle: bool) {
         py.detach(|| {
-            let tables = self.catalogs.lock().unwrap();
+            let mut tables = self.catalogs.lock().unwrap();
+            // Commit is already event-driven. Reclaim deletion high water even
+            // when no pipeline completion has armed Watch's idle-maintenance timer.
+            for table in tables.values_mut() {
+                table.trim_capacity();
+            }
             let mut slot = self.store.lock().unwrap();
             if let Some(store) = slot.as_mut() {
                 if let Err(error) = store.commit().and_then(|_| {
@@ -3419,8 +3588,9 @@ impl NativeWatchCatalog {
                     table
                         .rows
                         .values()
-                        .filter(|r| r.is_dir && scope.contains(&r.path) && !self.is_owned(&r.path))
-                        .map(|r| r.path.clone()),
+                        .filter(|r| r.persistent() && r.is_dir())
+                        .map(|r| r.path())
+                        .filter(|path| scope.contains(path) && !self.is_owned(path)),
                 );
             }
         }
@@ -3456,41 +3626,6 @@ impl NativeWatchCatalog {
     }
 }
 
-impl ScopeCatalog {
-    pub(super) fn insert(&mut self, row: DirectoryEntryRecord) {
-        let key: Arc<str> = Arc::from(crate::path_keys::path_key(&row.path));
-        self.insert_key(key, row);
-    }
-    fn insert_key(&mut self, key: Arc<str>, row: DirectoryEntryRecord) {
-        if self
-            .rows
-            .get(&key)
-            .is_some_and(|old| old.is_dir != row.is_dir)
-        {
-            self.remove(&key);
-        }
-        if !row.is_dir && !self.rows.contains_key(&key) {
-            self.buckets
-                .entry(catalog_stem(&row.path))
-                .or_default()
-                .push(Arc::clone(&key));
-        }
-        self.rows.insert(key, row);
-    }
-    pub(super) fn remove(&mut self, key: &str) {
-        if let Some(row) = self.rows.remove(key) {
-            if !row.is_dir {
-                let stem = catalog_stem(&row.path);
-                if let Some(bucket) = self.buckets.get_mut(&stem) {
-                    bucket.retain(|path| path.as_ref() != key);
-                    if bucket.is_empty() {
-                        self.buckets.remove(&stem);
-                    }
-                }
-            }
-        }
-    }
-}
 impl NativeWatchCatalog {
     fn stamp(
         &self,
@@ -3631,7 +3766,8 @@ fn update_catalog(
         drop(records.filtered);
         let errors = records.errors.into_messages();
         let scope_key = crate::path_keys::path_key(&scope.root);
-        let target_key = crate::path_keys::path_key(target);
+        let mut target_key = crate::path_keys::path_key(target);
+        target_key.truncate(target_key.trim_end_matches('\\').len());
         let catalog = catalogs.entry(scope_key.clone()).or_default();
         let needs_removal = !catalog.rows.is_empty();
         let mut present = HashSet::new();
@@ -3647,12 +3783,10 @@ fn update_catalog(
             if needs_removal {
                 present.insert(Arc::clone(&key));
             }
-            let unchanged = catalog.rows.get(&key).is_some_and(|old| {
-                old.path == record.path
-                    && old.size == record.size
-                    && old.mtime_ns == record.mtime_ns
-                    && old.is_dir == record.is_dir
-            });
+            let unchanged = catalog
+                .rows
+                .get(&key)
+                .is_some_and(|old| old.matches(&record));
             if !unchanged {
                 mutated = true;
                 if report_changes && !record.is_dir {
@@ -3673,16 +3807,15 @@ fn update_catalog(
                     std::ops::Bound::Unbounded,
                 ))
                 .take_while(|(key, _)| key.starts_with(&target_key))
-                .filter(|(key, _)| {
-                    (key.as_ref() == target_key || key[target_key.len()..].starts_with('\\'))
+                .filter(|(key, row)| {
+                    row.persistent()
+                        && (key.as_ref() == target_key || key[target_key.len()..].starts_with('\\'))
                         && !present.contains(*key)
                 })
                 .map(|(key, _)| Arc::clone(key))
                 .collect();
-            for key in removed {
-                catalog.remove(&key);
-                removed_keys.push(key.to_string());
-            }
+            catalog.remove_many(removed.iter().map(|key| key.as_ref()));
+            removed_keys.extend(removed.iter().map(|key| key.to_string()));
         }
         if mutated || !removed_keys.is_empty() {
             state.persist(

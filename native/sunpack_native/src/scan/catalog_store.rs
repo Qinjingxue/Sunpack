@@ -1,5 +1,6 @@
 //! Disposable filename cache. Reuses the Watch journal writer on a separate stream.
-use super::directory::{DirectoryEntryRecord, ScopeCatalog};
+use super::catalog::{CatalogRow, ScopeCatalog};
+use super::directory::DirectoryEntryRecord;
 use crate::wal::{self, Kind};
 use crate::watch_journal::{self, NativeJournalStream};
 use serde::ser::{SerializeMap, SerializeSeq};
@@ -27,7 +28,7 @@ struct Delta {
 pub(super) struct DeltaView<'a> {
     pub scope: &'a str,
     pub removed: &'a [String],
-    pub rows: Vec<&'a DirectoryEntryRecord>,
+    pub rows: Vec<&'a CatalogRow>,
     pub stamp: Option<Stamp>,
 }
 const BATCH_BYTES: usize = 256 * 1024;
@@ -142,9 +143,7 @@ impl CatalogStore {
                     for delta in deltas {
                         store.edits += delta.rows.len() + delta.removed.len() + 1;
                         let catalog = catalogs.entry(delta.scope.clone()).or_default();
-                        for key in delta.removed {
-                            catalog.remove(&key);
-                        }
+                        catalog.remove_many(delta.removed.iter().map(String::as_str));
                         for row in delta.rows {
                             catalog.insert(row);
                         }
@@ -294,8 +293,9 @@ impl Drop for CatalogStore {
 struct CatalogRows<'a>(&'a HashMap<String, ScopeCatalog>);
 impl Serialize for CatalogRows<'_> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut map = serializer.serialize_map(Some(self.0.len()))?;
-        for (scope, table) in self.0 {
+        let mut map =
+            serializer.serialize_map(Some(self.0.keys().filter(|key| !key.is_empty()).count()))?;
+        for (scope, table) in self.0.iter().filter(|(key, _)| !key.is_empty()) {
             map.serialize_entry(scope, &ScopeRows(table))?;
         }
         map.end()
@@ -304,8 +304,8 @@ impl Serialize for CatalogRows<'_> {
 struct ScopeRows<'a>(&'a ScopeCatalog);
 impl Serialize for ScopeRows<'_> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut rows = serializer.serialize_seq(Some(self.0.rows.len()))?;
-        for row in self.0.rows.values() {
+        let mut rows = serializer.serialize_seq(Some(self.0.persistent_len))?;
+        for row in self.0.rows.values().filter(|row| row.persistent()) {
             rows.serialize_element(row)?;
         }
         rows.end()

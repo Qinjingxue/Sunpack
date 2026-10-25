@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from sunpack_native import NativeWatchObservation
+
 import asyncio
 import heapq
 import json
@@ -82,19 +84,6 @@ class _CandidateChangeKind(Enum):
     UNCHANGED = auto()
     METADATA_ONLY = auto()
     CONTENT_CHANGED = auto()
-
-
-@dataclass(slots=True)
-class _CandidateObservation:
-    """Only the facts needed to reject delayed events for a retained source."""
-
-    size: int
-    mtime: float
-    file_id: str
-    change_usn: int
-    quiet_seconds: float = 0.0
-    last_content_event_at: float | None = None
-    quiet_calibrated: bool = False
 
 
 @dataclass(slots=True, eq=False)
@@ -251,7 +240,6 @@ class WatchScheduler:
         # Incremental ready index. Entries are invalidated lazily by active
         # lifecycle epoch + generation, avoiding heap delete/search.
         self._ready_heap: list[tuple[float, int, int, str, str]] = []
-        self._latest_observations: dict[str, _CandidateObservation] = {}
         self._quiet_trackers: dict[str, AdaptiveQuietTracker] = {}
         self._closed = False
         self._password_reload_at: float | None = None
@@ -881,7 +869,6 @@ class WatchScheduler:
                 self._active_states.clear()
                 self._ready_heap.clear()
                 self._quiet_trackers.clear()
-                self._latest_observations.clear()
                 self._active_claims.clear()
                 self._claims_by_owner.clear()
                 self._dirty_during_claim.clear()
@@ -1636,7 +1623,7 @@ class WatchScheduler:
                 for request in self._inflight_requests)
             snapshots = [(mapping, [(key, value) for key, value in mapping.items()
                                     if _paths_match(key, normalized, recursive=recursive)])
-                         for mapping in (self._pending, self._quiet_trackers, self._latest_observations)]
+                         for mapping in (self._pending, self._quiet_trackers)]
         missing = {key for _, rows in snapshots for key, _ in rows
                    if _recorded_file_presence(key) is False}
         pending_paths = []
@@ -1654,6 +1641,8 @@ class WatchScheduler:
                         mapping.pop(key, None)
                 if not mapping:
                     mapping.clear()
+        with self._claim_gate, self._lock:
+            self._catalog.forget_observation(normalized, recursive=recursive, missing_only=True)
         pending_record = self.state.pending_work_for_path(normalized)
         recovery_armed = bool(pending_record and (pending_record.active_outputs or pending_record.committed_roots))
         if inflight_owned or recovery_armed:
@@ -1798,11 +1787,9 @@ class WatchScheduler:
             self._remove_pending_locked(path)
             self._active_states.pop(path, None)
             self._quiet_trackers.pop(path, None)
-            self._latest_observations.pop(path, None)
+            self._catalog.forget_observation(path)
             if not self._quiet_trackers:
                 self._quiet_trackers.clear()
-            if not self._latest_observations:
-                self._latest_observations.clear()
 
     def _record_boundary_activity(
         self,
@@ -1856,12 +1843,8 @@ class WatchScheduler:
             return True
 
     def _remember_observation_locked(self, candidate: WatchCandidate) -> None:
-        previous = self._latest_observations.get(candidate.path)
-        self._latest_observations[candidate.path] = _CandidateObservation(
-            candidate.size, candidate.mtime, candidate.file_id, candidate.change_usn,
-            previous.quiet_seconds if previous is not None else 0.0,
-            previous.last_content_event_at if previous is not None else None,
-            previous.quiet_calibrated if previous is not None else False,
+        self._catalog.remember_observation(
+            candidate.path, candidate.size, candidate.mtime, candidate.file_id, candidate.change_usn,
         )
 
     def _retire_quiet_tracker(self, path: str) -> None:
@@ -1871,23 +1854,21 @@ class WatchScheduler:
                     or key in self._active_claims):
                 return
             tracker = self._quiet_trackers.pop(path, None)
-            observation = self._latest_observations.get(path)
-            if observation is not None and tracker is not None:
-                # A later write may be the next chunk of a slow download. Keep
-                # its last interval boundary and floor, but release the model.
-                observation.quiet_seconds = tracker.quiet_seconds
-                observation.last_content_event_at = tracker.last_content_event_at
-                observation.quiet_calibrated = tracker.calibrated
+            self._catalog.retire_observation(
+                path,
+                quiet_seconds=tracker.quiet_seconds if tracker is not None else None,
+                last_content_event_at=tracker.last_content_event_at if tracker is not None else None,
+                quiet_calibrated=tracker.calibrated if tracker is not None else False,
+            )
             if not self._quiet_trackers:
                 self._quiet_trackers.clear()
 
-    def _candidate_baseline_locked(self, path: str) -> WatchCandidate | _CandidateObservation | None:
+    def _candidate_baseline_locked(self, path: str) -> WatchCandidate | NativeWatchObservation | None:
         normalized = os.path.abspath(path)
         return (
             self._pending.get(normalized)
             or self._pending.get(path)
-            or self._latest_observations.get(normalized)
-            or self._latest_observations.get(path)
+            or self._catalog.observation(normalized)
         )
 
     def _accept_metadata_observation_locked(self, candidate: WatchCandidate, now: float) -> None:
@@ -1909,7 +1890,7 @@ class WatchScheduler:
         tracker = self._quiet_trackers.get(candidate.path)
         if tracker is None:
             tracker = AdaptiveQuietTracker(self._quiet_policy)
-            observation = self._latest_observations.get(candidate.path)
+            observation = self._catalog.observation(candidate.path)
             if observation is not None:
                 if observation.quiet_seconds > 0.0:
                     tracker.quiet_seconds = min(
@@ -2567,7 +2548,7 @@ def _candidate_for_event_path(path: str, *, since_usn: int = 0) -> WatchCandidat
     return _watch_candidate_for_path(path, since_usn=since_usn)
 
 
-def _candidate_observation_changed(previous: WatchCandidate | _CandidateObservation, current: WatchCandidate) -> bool:
+def _candidate_observation_changed(previous: WatchCandidate | NativeWatchObservation, current: WatchCandidate) -> bool:
     return (
         previous.size != current.size
         or previous.mtime != current.mtime
@@ -2585,7 +2566,7 @@ def _candidate_matches_password_failure(candidate: WatchCandidate, entry: WatchS
 
 
 def _candidate_change_kind(
-    previous: WatchCandidate | _CandidateObservation | None,
+    previous: WatchCandidate | NativeWatchObservation | None,
     current: WatchCandidate,
 ) -> _CandidateChangeKind:
     if previous is None:

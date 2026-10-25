@@ -22,7 +22,8 @@ def _watch_scheduler_shell(scheduler_module):
     scheduler.watch_roots = []
     scheduler.scopes = {}
     scheduler._scan_options_for = lambda scope: SimpleNamespace(catalog_update=lambda *a, **k: [])
-    scheduler._catalog = SimpleNamespace(bucket_paths=lambda *a: [])
+    from sunpack_native import NativeWatchCatalog, NativeWatchState
+    scheduler._catalog = NativeWatchCatalog(NativeWatchState())
     scheduler._claim_gate = threading.RLock()
     scheduler._active_claims = {}
     scheduler._claims_by_owner = {}
@@ -111,7 +112,6 @@ def test_live_enqueue_keeps_owner_memory_only(tmp_path):
     scheduler._lock = threading.Lock()
     scheduler._pending = {}
     scheduler._active_states = {}
-    scheduler._latest_observations = {}
     scheduler._quiet_trackers = {}
     scheduler.cold_start_seconds = 0.0
     scheduler._quiet_policy = SimpleNamespace()
@@ -214,7 +214,6 @@ def test_departed_inflight_owner_does_not_delete_durable_pending(tmp_path):
     scheduler._pending = {}
     scheduler._active_states = {}
     scheduler._quiet_trackers = {}
-    scheduler._latest_observations = {}
     scheduler._inflight_requests = [SimpleNamespace(candidate=_candidate(source))]
     scheduler.state = state
     scheduler.log = SimpleNamespace(write=lambda *_args, **_kwargs: None)
@@ -239,7 +238,6 @@ def test_departed_unowned_path_is_still_forgotten(tmp_path):
     scheduler._pending = {}
     scheduler._active_states = {}
     scheduler._quiet_trackers = {}
-    scheduler._latest_observations = {}
     scheduler._inflight_requests = []
     scheduler.state = state
     scheduler.log = SimpleNamespace(write=lambda *_args, **_kwargs: None)
@@ -297,7 +295,6 @@ def test_enqueue_does_not_publish_memory_work_when_durable_queue_fails(tmp_path)
     scheduler._lock = threading.Lock()
     scheduler._pending = {}
     scheduler._active_states = {}
-    scheduler._latest_observations = {}
     scheduler._quiet_trackers = {}
     scheduler.cold_start_seconds = 0.0
     scheduler._quiet_policy = SimpleNamespace()

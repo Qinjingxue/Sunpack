@@ -10,4 +10,5 @@ pub(crate) mod progress_manifest;
 pub(crate) mod scope;
 pub(crate) mod worker_event;
 
+pub(crate) mod catalog;
 pub(crate) mod catalog_store;
