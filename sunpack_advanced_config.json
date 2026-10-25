@@ -103,7 +103,6 @@
       "max_pending_stage_jobs": 4096,
       "max_queue_jobs": 4096,
       "priority_aging_quantum": 32,
-      "backpressure_retries": 120,
       "writer_threads": 4,
       "job_buffer_budget_bytes": 33554432,
       "space_gate_enabled": true,
