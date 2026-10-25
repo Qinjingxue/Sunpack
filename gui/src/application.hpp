@@ -27,6 +27,7 @@ class Application {
     Json pending_ = Json::object();
     bool notified_ = false, stopping_ = false, choosing_directory_ = false, shown_ = false;
     unsigned dirty_ = 15;
+    std::atomic<uint64_t> task_query_generation_{0};
     std::thread worker_, registry_;
     struct ControlBinding { Application* owner; Json field; };
     std::map<std::string,std::unique_ptr<ControlBinding>> controls_;

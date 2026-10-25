@@ -53,7 +53,7 @@ def _write_bootstrap_error(exc: BaseException) -> None:
         }
         # A launcher may fail while the actual Watch owner is still healthy.
         # Never let that second process replace the owner's state projection.
-        log = WatchLogStore(str(state_dir / "bootstrap.events.jsonl"))
+        log = WatchLogStore(str(state_dir / "bootstrap.events.json"))
         try:
             log.write(payload.pop("event"), **payload)
         finally:

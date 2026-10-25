@@ -48,7 +48,7 @@ class RuntimeHost:
         if log_path:
             from sunpack.runtime.watch.log import WatchLogStore
 
-            self._event_log = WatchLogStore(log_path)
+            self._event_log = WatchLogStore(log_path, retention_days=load_config()["watch"]["event_log_retention_days"])
         self.log_event("host_started", host_pid=os.getpid())
 
     def _notify_state_changed(self) -> None:
@@ -322,6 +322,8 @@ class RuntimeHost:
         await self._set_configured_process_mode(config)
 
     async def _set_configured_process_mode(self, config: dict) -> None:
+        if self._event_log is not None:
+            self._event_log.configure_retention(config["watch"]["event_log_retention_days"])
         self._configured_process_mode = _configured_runtime_process_mode(config)
         await self._apply_effective_process_mode()
 

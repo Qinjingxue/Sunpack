@@ -1,17 +1,18 @@
-//! Bounded, asynchronous GUI projection. The task WAL remains authoritative.
-use crate::io::resource_lifecycle::{NativeResourceGuard, TrackedFile};
+//! Best-effort display history. Business state remains in the existing task store.
+use crate::io::display_store::{utc_us, Store, DAY_US};
+use crate::io::display_wake::Wake;
 use crate::watch_store::{py_to_json, NativeWatchState};
 use pyo3::exceptions::{PyOSError, PyRuntimeError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyList, PySlice, PyString, PyTuple};
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::io::{self, BufRead, Read, Seek, SeekFrom, Write};
+use std::collections::{HashMap, HashSet};
+
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::thread::JoinHandle;
 
-const QUEUE_BYTES: usize = 1024 * 1024;
+const QUEUE_BYTES: usize = 4 * 1024 * 1024;
 type Record = Arc<Vec<u8>>;
 fn encode(value: &Value) -> Record {
     let mut bytes = serde_json::to_vec(value).expect("JSON value");
@@ -199,50 +200,108 @@ struct Task {
     members: HashSet<String>,
     status: Option<Record>,
     terminal: bool,
+    stamp: i64,
+    expired: bool,
     blocked: bool,
     owner: String,
+    owners: HashSet<String>,
     order: u64,
 }
 impl Task {
     fn processing(&self) -> bool {
         self.status.is_some() && !self.terminal && !self.blocked
     }
-    fn bytes(&self) -> usize {
-        self.status.as_ref().map_or(0, |r| r.len()) + self.group_row.as_ref().map_or(0, |r| r.len())
-    }
 }
+struct Retiring {
+    members: HashSet<String>,
+    owners: HashSet<String>,
+}
+#[derive(Default)]
 struct Projection {
     tasks: HashMap<String, Task>,
+    retiring: HashMap<String, Retiring>,
+    owner_tasks: HashMap<String, HashSet<String>>,
     aliases: HashMap<String, String>,
-    recent: BTreeMap<u64, String>,
-    diagnostics: VecDeque<Record>,
-    bytes: usize,
-    recent_bytes: usize,
-    diagnostic_bytes: usize,
     order: u64,
-    budget: usize,
+    dirty: HashSet<String>,
+    dirty_bytes: usize,
+    full_dirty: bool,
 }
 impl Projection {
-    fn new(budget: usize) -> Self {
-        Self {
-            tasks: HashMap::new(),
-            aliases: HashMap::new(),
-            recent: BTreeMap::new(),
-            diagnostics: VecDeque::new(),
-            bytes: 0,
-            recent_bytes: 0,
-            diagnostic_bytes: 0,
-            order: 0,
-            budget,
+    fn mark(&mut self, id: &str) {
+        if self.full_dirty {
+            return;
         }
+        if self.dirty.insert(id.to_owned()) {
+            self.dirty_bytes += id.len();
+        }
+        if self.dirty_bytes > 1024 * 1024 {
+            self.dirty = HashSet::new();
+            self.dirty_bytes = 0;
+            self.full_dirty = true;
+        }
+    }
+    fn unbind(&mut self, id: &str, owners: &HashSet<String>) {
+        for owner in owners {
+            if let Some(ids) = self.owner_tasks.get_mut(owner) {
+                ids.remove(id);
+                if ids.is_empty() {
+                    self.owner_tasks.remove(owner);
+                }
+            }
+        }
+    }
+    fn release_owner(&mut self, owner: &str) {
+        if let Some(ids) = self.owner_tasks.remove(owner) {
+            for id in ids {
+                if let Some(task) = self.tasks.get_mut(&id) {
+                    task.owners.remove(owner);
+                }
+                if self
+                    .tasks
+                    .get(&id)
+                    .is_some_and(|task| task.expired && task.owners.is_empty())
+                {
+                    self.drop_expired(&id);
+                }
+                if let Some(retiring) = self.retiring.get_mut(&id) {
+                    retiring.owners.remove(owner);
+                    if retiring.owners.is_empty() {
+                        let retiring = self.retiring.remove(&id).unwrap();
+                        for member in retiring.members {
+                            if self.aliases.get(&member).is_some_and(|value| value == &id) {
+                                self.aliases.remove(&member);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    fn drop_expired(&mut self, id: &str) {
+        self.remove(id);
+        if self.dirty.remove(id) {
+            self.dirty_bytes = self.dirty_bytes.saturating_sub(id.len());
+        }
+    }
+    fn expire_live(&mut self, ids: Vec<String>, cutoff: i64) {
+        for id in ids {
+            if let Some(task) = self.tasks.get_mut(&id) {
+                if task.stamp > cutoff {
+                    continue;
+                }
+                task.expired = true;
+                if task.owners.is_empty() {
+                    self.drop_expired(&id);
+                }
+            }
+        }
+        self.trim();
     }
     fn remove(&mut self, id: &str) -> Option<Task> {
         let task = self.tasks.remove(id)?;
-        self.bytes -= task.bytes();
-        if task.terminal {
-            self.recent.remove(&task.order);
-            self.recent_bytes -= task.bytes();
-        }
+        self.mark(id);
+        self.unbind(id, &task.owners);
         for member in &task.members {
             if self
                 .aliases
@@ -261,10 +320,12 @@ impl Projection {
         Some(task)
     }
     fn insert(&mut self, id: String, task: Task) {
-        self.bytes += task.bytes();
-        if task.terminal {
-            self.recent_bytes += task.bytes();
-            self.recent.insert(task.order, id.clone());
+        self.mark(&id);
+        for owner in &task.owners {
+            self.owner_tasks
+                .entry(owner.clone())
+                .or_default()
+                .insert(id.clone());
         }
         for member in &task.members {
             self.aliases.insert(member.clone(), id.clone());
@@ -273,38 +334,12 @@ impl Projection {
             self.aliases.insert(key(field(group, "path")), id.clone());
         }
         self.tasks.insert(id, task);
-        while self.recent_bytes > self.budget {
-            let Some((_, oldest)) = self.recent.first_key_value() else {
-                break;
-            };
-            let oldest = oldest.clone();
-            self.remove(&oldest);
-        }
     }
     fn trim(&mut self) {
-        // Run after the whole transition, not during remove/reinsert updates.
-        if (self.tasks.is_empty() && self.tasks.capacity() != 0)
-            || self.tasks.capacity() > 256.max(self.tasks.len() * 4)
-        {
-            self.tasks.shrink_to_fit();
-        }
-        if (self.aliases.is_empty() && self.aliases.capacity() != 0)
-            || self.aliases.capacity() > 256.max(self.aliases.len() * 4)
-        {
-            self.aliases.shrink_to_fit();
-        }
-    }
-    fn retain_history(&mut self) {
-        let active: Vec<_> = self
-            .tasks
-            .iter()
-            .filter(|(_, task)| !task.terminal)
-            .map(|(id, _)| id.clone())
-            .collect();
-        for id in active {
-            self.remove(&id);
-        }
-        self.trim();
+        crate::collections::trim_map(&mut self.tasks);
+        crate::collections::trim_map(&mut self.aliases);
+        crate::collections::trim_map(&mut self.retiring);
+        crate::collections::trim_map(&mut self.owner_tasks);
     }
     fn resolve(&self, value: &Value, physical: &str) -> String {
         let explicit = field(value, "task_id");
@@ -381,13 +416,16 @@ impl Projection {
                             .unwrap_or_else(|| self.instance_id(&owner, &key(&path)))
                     };
                     let mut task = Task::default();
+                    let mut owners = HashSet::new();
                     for old in previous {
-                        if let Some(candidate) = self.remove(&old) {
+                        if let Some(mut candidate) = self.remove(&old) {
+                            owners.extend(candidate.owners.drain());
                             if candidate.order > task.order {
                                 task = candidate;
                             }
                         }
                     }
+                    task.owners = owners;
                     group["task_id"] = json!(id);
                     if task
                         .group
@@ -406,6 +444,7 @@ impl Projection {
                         }
                     }
                     if !owner.is_empty() {
+                        task.owners.insert(owner.clone());
                         task.owner = owner.clone();
                     }
                     task.group_row = Some(encode(
@@ -414,6 +453,8 @@ impl Projection {
                     task.members = members;
                     task.group = Some(group.clone());
                     if processing {
+                        task.stamp = (ts.as_f64().unwrap_or(0.0) * 1_000_000.0) as i64;
+                        task.expired = false;
                         task.status =
                             Some(encode(&json!({"event":"processing_started","path":path,
                         "ts":ts,"time":time,"owner":task.owner,"task_id":id})));
@@ -430,6 +471,7 @@ impl Projection {
         let physical = key(&path);
         let mut id = self.resolve(value, &physical);
         if event == "pipeline_sources_released" {
+            self.release_owner(field(value, "owner"));
             let ids: HashSet<_> = value["paths"]
                 .as_array()
                 .into_iter()
@@ -540,10 +582,43 @@ impl Projection {
                     | "partial_rejected"
             )
         {
+            if matches!(
+                event.as_str(),
+                "done" | "failed_terminal" | "partial_rejected"
+            ) && self
+                .owner_tasks
+                .get(field(value, "owner"))
+                .is_some_and(|ids| {
+                    ids.iter().any(|id| {
+                        self.retiring
+                            .get(id)
+                            .is_some_and(|task| task.members.contains(&physical))
+                    })
+                })
+            {
+                return None;
+            }
+            if matches!(
+                event.as_str(),
+                "done" | "failed_terminal" | "partial_rejected"
+            ) && self
+                .retiring
+                .get(&id)
+                .is_some_and(|task| task.owners.contains(field(value, "owner")))
+            {
+                // A transferred request can finish after the real owner. Keep
+                // only routing metadata until those in-flight owners release.
+                return None;
+            }
             if field(value, "task_id").is_empty()
                 && matches!(
                     event.as_str(),
-                    "processing_started" | "failed_password" | "suspended_missing_volume"
+                    "processing_started"
+                        | "failed_password"
+                        | "suspended_missing_volume"
+                        | "done"
+                        | "failed_terminal"
+                        | "partial_rejected"
                 )
                 && self.tasks.get(&id).is_none_or(|t| t.terminal)
             {
@@ -575,11 +650,14 @@ impl Projection {
             }
             let record = encode(value);
             task.status = Some(record.clone());
+            task.stamp = timestamp(value);
+            task.expired = false;
             task.blocked = matches!(
                 event.as_str(),
                 "failed_password" | "suspended_missing_volume"
             );
             if !field(value, "owner").is_empty() {
+                task.owners.insert(field(value, "owner").to_owned());
                 task.owner = field(value, "owner").to_owned();
             }
             task.order = self.order;
@@ -587,141 +665,119 @@ impl Projection {
                 event.as_str(),
                 "done" | "failed_terminal" | "partial_rejected"
             );
+            if task.terminal {
+                if !task.owners.is_empty() {
+                    let mut members = std::mem::take(&mut task.members);
+                    if let Some(group) = &task.group {
+                        members.insert(key(field(group, "path")));
+                    }
+                    for member in &members {
+                        self.aliases.insert(member.clone(), id.clone());
+                    }
+                    for owner in &task.owners {
+                        self.owner_tasks
+                            .entry(owner.clone())
+                            .or_default()
+                            .insert(id.clone());
+                    }
+                    self.retiring.insert(
+                        id.clone(),
+                        Retiring {
+                            members,
+                            owners: std::mem::take(&mut task.owners),
+                        },
+                    );
+                }
+                if let Some(group) = task.group {
+                    value["group"] = group;
+                }
+                return Some(encode(value));
+            }
             self.insert(id, task);
-            return Some(record);
+            return None;
         }
-        let record = encode(value);
-        self.diagnostic(&record);
-        Some(record)
+        Some(encode(value))
     }
-    fn diagnostic(&mut self, record: &Record) {
-        self.diagnostic_bytes += record.len();
-        self.diagnostics.push_back(record.clone());
-        while self.diagnostic_bytes > self.budget {
-            if let Some(old) = self.diagnostics.pop_front() {
-                self.diagnostic_bytes -= old.len();
-            }
-        }
-    }
-    fn snapshot(&self) -> Vec<Record> {
-        let mut rows = Vec::new();
-        rows.extend(self.diagnostics.iter().cloned());
-        let mut tasks: Vec<_> = self.tasks.values().collect();
-        tasks.sort_by_key(|t| t.order);
-        for task in tasks {
-            if let Some(group) = &task.group_row {
-                rows.push(group.clone());
-            }
-            if let Some(status) = &task.status {
-                rows.push(status.clone());
-            }
-        }
-        rows
+    fn updates(
+        &mut self,
+        mut reset: bool,
+    ) -> (Vec<(String, Option<(Record, Option<Record>)>)>, bool) {
+        reset |= std::mem::take(&mut self.full_dirty);
+        self.dirty_bytes = 0;
+        let ids = if reset {
+            self.dirty.clear();
+            self.tasks.keys().cloned().collect::<Vec<_>>()
+        } else {
+            std::mem::take(&mut self.dirty).into_iter().collect()
+        };
+        (
+            ids.into_iter()
+                .map(|id| {
+                    let row = self.tasks.get(&id).and_then(|task| {
+                        task.status
+                            .as_ref()
+                            .map(|status| (status.clone(), task.group_row.clone()))
+                    });
+                    (id, row)
+                })
+                .collect(),
+            reset,
+        )
     }
 }
 
-// Atomic snapshot replacement shares the existing Windows reader contract.
-mod win {
-    use super::*;
-    use std::ffi::c_void;
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn MoveFileExW(from: *const u16, to: *const u16, flags: u32) -> i32;
-        fn ReplaceFileW(
-            target: *const u16,
-            replacement: *const u16,
-            backup: *const u16,
-            flags: u32,
-            exclude: *const c_void,
-            reserved: *const c_void,
-        ) -> i32;
-    }
-    pub(super) fn replace(from: &std::path::Path, to: &std::path::Path) -> io::Result<()> {
-        use std::os::windows::ffi::OsStrExt;
-        let from: Vec<u16> = from.as_os_str().encode_wide().chain(Some(0)).collect();
-        let to: Vec<u16> = to.as_os_str().encode_wide().chain(Some(0)).collect();
-        // Match the existing GUI atomic writer: ReplaceFile allows a reader
-        // with FILE_SHARE_DELETE to retain the old file. MoveFileEx replacement
-        // can return ACCESS_DENIED while that perfectly valid reader is open.
-        for attempt in 0..2 {
-            if unsafe {
-                ReplaceFileW(
-                    to.as_ptr(),
-                    from.as_ptr(),
-                    std::ptr::null(),
-                    0,
-                    std::ptr::null(),
-                    std::ptr::null(),
-                )
-            } != 0
-            {
-                return Ok(());
-            }
-            let replace_error = io::Error::last_os_error();
-            // A new log has no target. Installed Modify-only directories can
-            // also reject ReplaceFile with UNABLE_TO_REMOVE_REPLACED (1175).
-            // Preserve that existing fallback without masking sharing errors.
-            let error = if matches!(replace_error.raw_os_error(), Some(2 | 1175)) {
-                if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), 1 | 8) } != 0 {
-                    return Ok(());
-                }
-                io::Error::last_os_error()
-            } else {
-                replace_error
-            };
-            if attempt == 1 || !super::sharing_conflict(&error) {
-                return Err(error);
-            }
-        }
-        unreachable!()
-    }
-}
-fn sharing_conflict(error: &io::Error) -> bool {
-    matches!(error.raw_os_error(), Some(32 | 33))
-}
 struct State {
     projection: Projection,
     queue: Vec<Record>,
     queue_bytes: usize,
-    rewrite: bool,
+    live_dirty: bool,
+    reset_live: bool,
     revision: u64,
+    published: u64,
     stopping: bool,
     working: bool,
     error: Option<String>,
+    retention_days: u32,
+    dropped: u64,
 }
 pub(crate) struct Shared {
     state: Mutex<State>,
-    wake: Condvar,
+    wake: Wake,
+    drained: Condvar,
     stateful: bool,
 }
 impl Shared {
     pub(crate) fn submit(&self, mut value: Value) {
         let mut state = self.state.lock().unwrap();
+        if state.stopping {
+            return;
+        }
+        if !value["ts"].as_f64().is_some_and(|ts| ts.is_finite()) {
+            value["ts"] = json!(utc_us() as f64 / 1_000_000.0);
+        }
         let row = if self.stateful {
-            state
-                .projection
-                .apply(&mut value)
-                .unwrap_or_else(|| encode(&value))
+            state.projection.apply(&mut value)
         } else {
-            let row = encode(&value);
-            state.projection.diagnostic(&row);
-            row
+            Some(encode(&value))
         };
+        let changed = !state.projection.dirty.is_empty() || state.projection.full_dirty;
+        state.live_dirty |= changed;
         state.projection.trim();
-        if state.revision == 0
-            || state.error.is_some()
-            || state.queue_bytes + row.len() > QUEUE_BYTES
-        {
-            state.rewrite = true;
-            state.queue.clear();
-            state.queue_bytes = 0;
+        if row.is_none() && !changed {
+            return;
+        }
+        if let Some(row) = row {
+            // Display logging must never stall extraction or grow without bound
+            // when storage stops making progress. Report overload in the manifest.
+            if state.queue.is_empty() || state.queue_bytes + row.len() <= QUEUE_BYTES {
+                state.queue_bytes += row.len();
+                state.queue.push(row);
+            } else {
+                state.dropped += 1;
+            }
         }
         state.revision += 1;
-        if !state.rewrite {
-            state.queue_bytes += row.len();
-            state.queue.push(row);
-        }
-        self.wake.notify_one();
+        self.wake.notify();
     }
 }
 struct Owner {
@@ -734,7 +790,7 @@ impl Drop for Owner {
         {
             let mut state = self.shared.state.lock().unwrap();
             state.stopping = true;
-            self.shared.wake.notify_one();
+            self.shared.wake.notify();
         }
         if let Some(thread) = self.thread.lock().unwrap().take() {
             let _ = thread.join();
@@ -748,230 +804,111 @@ fn owners() -> &'static (Mutex<HashMap<String, Weak<Owner>>>, Condvar) {
     static OWNERS: OnceLock<(Mutex<HashMap<String, Weak<Owner>>>, Condvar)> = OnceLock::new();
     OWNERS.get_or_init(|| (Mutex::new(HashMap::new()), Condvar::new()))
 }
-fn write_batch(path: &PathBuf, rows: &[Record], rewrite: bool) -> io::Result<()> {
-    let temporary = path.with_file_name(format!(
-        "{}.tmp",
-        path.file_name().unwrap().to_string_lossy()
-    ));
-    // Closing the temporary handle must not open a promotion window before
-    // atomic replacement publishes it. Reuse the native resource lifecycle gate.
-    let _publication = if rewrite {
-        Some(NativeResourceGuard::register(
-            "event_log_publish",
-            [path.clone(), temporary.clone()],
-        )?)
-    } else {
-        None
-    };
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let target = if rewrite { &temporary } else { path };
-    let result = (|| {
-        let open = || {
-            TrackedFile::open_with(target, "event_log", |o| {
-                o.write(true).create(true);
-                if rewrite {
-                    o.truncate(true);
-                } else {
-                    o.append(true);
-                }
-            })
-        };
-        // Retry only an open that wrote no bytes. Retrying a partial append
-        // would duplicate records; all write/flush failures require a snapshot.
-        let mut file = open()
-            .or_else(|error| {
-                if sharing_conflict(&error) {
-                    open()
-                } else {
-                    Err(error)
-                }
-            })
-            .map_err(|error| {
-                io::Error::new(error.kind(), format!("open event log {target:?}: {error}"))
-            })?;
-        // Buffer at most 64 KiB; avoid one syscall per short event.
-        let mut buffer = std::io::BufWriter::with_capacity(64 * 1024, &mut file);
-        for row in rows {
-            buffer.write_all(row)?;
-        }
-        buffer.flush()?;
-        drop(buffer);
-        if rewrite {
-            file.sync_all()?;
-        }
-        drop(file);
-        if rewrite {
-            win::replace(&temporary, path).map_err(|error| {
-                io::Error::new(
-                    error.kind(),
-                    format!("replace event log {temporary:?} -> {path:?}: {error}"),
-                )
-            })?;
-        }
-        Ok(())
-    })();
-    if result.is_err() && rewrite {
-        let _ = std::fs::remove_file(temporary);
-    }
-    result
-}
-// Replay complete records with the same reducer used for live events. Both
-// retained results and diagnostics obey their existing budgets; parsing uses
-// one bounded record buffer, regardless of the total log size.
-fn read_history(path: &PathBuf, budget: usize) -> io::Result<Projection> {
-    let mut history = Projection::new(budget);
-    let file = match TrackedFile::open_reader(path, "event_log") {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(history),
-        Err(error) => return Err(error),
-    };
-    let mut reader = std::io::BufReader::with_capacity(64 * 1024, file);
-    let mut line = Vec::new();
-    const MAX_RECORD: u64 = 16 * 1024 * 1024;
-    while (&mut reader)
-        .take(MAX_RECORD + 1)
-        .read_until(b'\n', &mut line)?
-        != 0
-    {
-        if line.last() != Some(&b'\n') {
-            reader.skip_until(b'\n')?;
-        } else if line.len() as u64 <= MAX_RECORD {
-            if let Ok(mut value) = serde_json::from_slice::<Value>(&line) {
-                match field(&value, "event") {
-                    "state_begin" => history = Projection::new(budget),
-                    "state_ready" => {} // Older logs carried a live-writer lease.
-                    _ => {
-                        history.apply(&mut value);
-                    }
-                }
-            }
-        }
-        line.clear();
-    }
-    history.retain_history();
-    Ok(history)
+fn timestamp(value: &Value) -> i64 {
+    (value["ts"].as_f64().unwrap_or(0.0) * 1_000_000.0) as i64
 }
 fn writer(shared: Arc<Shared>, path: PathBuf) {
-    if !shared.stateful {
-        // Diagnostics keep their recent tail across host restarts. Read only
-        // the byte budget on the writer, never on the submitting thread.
-        let budget = shared.state.lock().unwrap().projection.budget;
-        let previous = (|| -> io::Result<Vec<u8>> {
-            let mut file = TrackedFile::open_reader(&path, "event_log")?;
-            let start = file.metadata()?.len().saturating_sub(budget as u64);
-            file.seek(SeekFrom::Start(start))?;
-            let mut bytes = Vec::new();
-            file.take(budget as u64).read_to_end(&mut bytes)?;
-            if start != 0 {
-                let end = bytes
-                    .iter()
-                    .position(|b| *b == b'\n')
-                    .map_or(bytes.len(), |i| i + 1);
-                bytes.drain(..end);
-            }
-            Ok(bytes)
-        })()
-        .unwrap_or_default();
-        let mut state = shared.state.lock().unwrap();
-        let p = &mut state.projection;
-        let mut history = VecDeque::new();
-        for line in previous.split_inclusive(|b| *b == b'\n') {
-            if line.last() == Some(&b'\n') && serde_json::from_slice::<Value>(line).is_ok() {
-                p.diagnostic_bytes += line.len();
-                history.push_back(Arc::new(line.to_vec()));
-            }
-        }
-        history.append(&mut p.diagnostics);
-        p.diagnostics = history;
-        while p.diagnostic_bytes > budget {
-            if let Some(old) = p.diagnostics.pop_front() {
-                p.diagnostic_bytes -= old.len();
-            }
-        }
-    }
-    let mut history_loaded = !shared.stateful;
-    let mut file_bytes = std::fs::metadata(&path).map_or(0, |m| m.len() as usize);
+    let mut store = None;
+    let mut deadline = None;
+    let mut completed = 0;
     loop {
-        let (mut rows, rewrite, revision) = {
+        let now = utc_us();
+        let (rows, live, days, dropped, revision) = {
             let mut state = shared.state.lock().unwrap();
-            while state.queue.is_empty() && !state.rewrite && !state.stopping {
-                state = shared.wake.wait(state).unwrap();
-            }
-            if state.stopping && state.queue.is_empty() && !state.rewrite {
-                break;
+            let due = deadline.is_some_and(|time| time <= now);
+            if completed == state.revision && !due {
+                state.working = false;
+                shared.drained.notify_all();
+                if state.stopping {
+                    break;
+                }
+                drop(state);
+                if let Err(error) = shared.wake.wait(deadline) {
+                    let mut state = shared.state.lock().unwrap();
+                    state.error = Some(error.to_string());
+                    // A broken OS wait is terminal; never turn it into polling.
+                    state.stopping = true;
+                    state.published = state.revision;
+                    shared.drained.notify_all();
+                    break;
+                }
+                continue;
             }
             state.working = true;
-            if !history_loaded {
-                let budget = state.projection.budget;
-                let revision = state.revision;
-                drop(state);
-                let previous = read_history(&path, budget);
-                state = shared.state.lock().unwrap();
-                match previous {
-                    Ok(mut history) => {
-                        // Submissions and WAL recovery remain in memory while
-                        // the writer reads. Replay only their current projection
-                        // after older results, never read disk on a producer.
-                        for row in state.projection.snapshot() {
-                            let mut value = serde_json::from_slice(&row).expect("encoded event");
-                            history.apply(&mut value);
-                        }
-                        state.projection = history;
-                        state.rewrite = true;
-                        history_loaded = true;
-                    }
-                    Err(error) => {
-                        state.error = Some(error.to_string());
-                        state.working = false;
-                        state.queue.clear();
-                        state.queue_bytes = 0;
-                        // Retry only for an actual concurrent/new submission.
-                        state.rewrite = state.revision != revision;
-                        shared.wake.notify_all();
-                        continue;
-                    }
-                }
-            }
-            let live = state.projection.bytes + state.projection.diagnostic_bytes;
-            let rewrite = state.rewrite
-                || file_bytes
-                    .saturating_add(state.queue_bytes)
-                    .saturating_sub(live)
-                    >= state.projection.budget.max(live / 2);
-            state.rewrite = false;
-            let rows = if rewrite {
-                state.queue.clear();
-                state.projection.snapshot()
+            let live = if state.live_dirty {
+                state.live_dirty = false;
+                let reset = std::mem::take(&mut state.reset_live);
+                Some(state.projection.updates(reset))
             } else {
-                std::mem::take(&mut state.queue)
+                None
             };
             state.queue_bytes = 0;
-            (rows, rewrite, state.revision)
+            (
+                std::mem::take(&mut state.queue),
+                live,
+                state.retention_days,
+                state.dropped,
+                state.revision,
+            )
         };
-        if rewrite && shared.stateful {
-            rows.insert(0, encode(&json!({"event":"state_begin","schema":1})));
-        }
-        let result = write_batch(&path, &rows, rewrite);
+        let result = (|| -> std::io::Result<()> {
+            if store.is_none() {
+                store = Some(Store::open(path.clone())?);
+            }
+            let store = store.as_mut().unwrap();
+            let retention = i64::from(days).saturating_mul(DAY_US);
+            let cutoff = now.saturating_sub(retention);
+            for row in rows {
+                let value: Value = serde_json::from_slice(&row)?;
+                let ts = timestamp(&value);
+                if ts > cutoff {
+                    store.append(&value, ts)?;
+                }
+            }
+            if let Some((live, reset)) = live {
+                let mut values = Vec::with_capacity(live.len());
+                for (id, row) in live {
+                    let value = if let Some((status, group)) = row {
+                        let mut value: Value = serde_json::from_slice(&status)?;
+                        if let Some(group) = group {
+                            let mut group: Value = serde_json::from_slice(&group)?;
+                            value["group"] = group["groups"][0].take();
+                        }
+                        Some((timestamp(&value), value))
+                    } else {
+                        None
+                    };
+                    values.push((id, value));
+                }
+                store.update_live(values, reset, cutoff)?;
+            }
+            deadline = store.expire(cutoff)?.map(|ts| ts.saturating_add(retention));
+            store.manifest.dropped += dropped;
+            store.publish()
+        })();
+        let expired = store
+            .as_mut()
+            .map(|store| std::mem::take(&mut store.expired_live))
+            .unwrap_or_default();
         let mut state = shared.state.lock().unwrap();
+        if result.is_ok() && !expired.is_empty() {
+            state.projection.expire_live(
+                expired,
+                now.saturating_sub(i64::from(days).saturating_mul(DAY_US)),
+            );
+        }
         state.working = false;
-        match result {
-            Ok(()) => {
-                let bytes: usize = rows.iter().map(|r| r.len()).sum();
-                file_bytes = if rewrite { bytes } else { file_bytes + bytes };
-                state.error = None;
-            }
-            Err(error) => {
-                state.error = Some(error.to_string());
-                // A partial append must be replaced, never continued. Retry on
-                // the next real submission, without an idle retry timer.
-            }
-        }
-        shared.wake.notify_all();
+        state.error = result.err().map(|error| error.to_string());
         if state.error.is_some() {
-            state.rewrite = state.revision != revision;
+            deadline = None;
+            store = None;
+            state.live_dirty = true;
+            state.reset_live = true;
         }
+        state.dropped = state.dropped.saturating_sub(dropped);
+        completed = revision;
+        state.published = revision;
+        shared.drained.notify_all();
     }
 }
 
@@ -986,45 +923,53 @@ impl NativeEventLog {
             .map(|o| &o.shared)
             .ok_or_else(|| PyRuntimeError::new_err("event log is closed"))
     }
-    fn submit(&self, value: Value) -> PyResult<()> {
-        self.shared()?.submit(value);
-        Ok(())
-    }
 }
 #[pymethods]
 impl NativeEventLog {
     #[new]
-    #[pyo3(signature=(path, budget=262144, stateful=true))]
-    fn new(path: PathBuf, budget: usize, stateful: bool) -> PyResult<Self> {
+    #[pyo3(signature=(path, retention_days=7, stateful=true))]
+    fn new(path: PathBuf, retention_days: u32, stateful: bool) -> PyResult<Self> {
         let path = std::path::absolute(path)?;
         let (registry, retired) = owners();
         let mut owners = registry.lock().unwrap();
         let id = key(&path.to_string_lossy());
         while let Some(owner) = owners.get(&id) {
             if let Some(owner) = owner.upgrade() {
+                {
+                    let mut state = owner.shared.state.lock().unwrap();
+                    if state.retention_days != retention_days.max(1) {
+                        state.retention_days = retention_days.max(1);
+                        state.live_dirty = stateful;
+                        state.revision += 1;
+                        owner.shared.wake.notify();
+                    }
+                }
                 return Ok(Self { owner: Some(owner) });
             }
-            // The last owner is draining. A replacement cannot overlap its
-            // final write; Drop signals this gate after joining the worker.
             owners = retired.wait(owners).unwrap();
         }
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
-                projection: Projection::new(budget.max(1)),
+                projection: Projection::default(),
                 queue: Vec::new(),
                 queue_bytes: 0,
-                rewrite: false,
-                revision: 0,
+                live_dirty: stateful,
+                reset_live: stateful,
+                revision: 1,
+                published: 0,
                 stopping: false,
-                working: false,
+                working: true,
                 error: None,
+                retention_days: retention_days.max(1),
+                dropped: 0,
             }),
-            wake: Condvar::new(),
+            wake: Wake::new()?,
+            drained: Condvar::new(),
             stateful,
         });
         let worker = Arc::clone(&shared);
         let thread = std::thread::Builder::new()
-            .name("sunpack-events".into())
+            .name("sunpack-display".into())
             .spawn(move || writer(worker, path))?;
         let owner = Arc::new(Owner {
             key: id.clone(),
@@ -1034,8 +979,20 @@ impl NativeEventLog {
         owners.insert(id, Arc::downgrade(&owner));
         Ok(Self { owner: Some(owner) })
     }
+    fn configure_retention(&self, retention_days: u32) -> PyResult<()> {
+        let shared = self.shared()?;
+        let mut state = shared.state.lock().unwrap();
+        if state.retention_days != retention_days.max(1) {
+            state.retention_days = retention_days.max(1);
+            state.live_dirty = shared.stateful;
+            state.revision += 1;
+            shared.wake.notify();
+        }
+        Ok(())
+    }
     fn write(&self, value: &Bound<'_, PyAny>) -> PyResult<()> {
-        self.submit(event_value(value)?)
+        self.shared()?.submit(event_value(value)?);
+        Ok(())
     }
     #[pyo3(signature=(state=None))]
     fn recover(&self, state: Option<PyRef<'_, NativeWatchState>>) -> PyResult<()> {
@@ -1048,8 +1005,8 @@ impl NativeEventLog {
         let shared = Arc::clone(self.shared()?);
         py.detach(move || {
             let mut state = shared.state.lock().unwrap();
-            while state.working || !state.queue.is_empty() || state.rewrite {
-                state = shared.wake.wait(state).unwrap();
+            while state.working || state.published != state.revision {
+                state = shared.drained.wait(state).unwrap();
             }
             match &state.error {
                 Some(e) => Err(PyOSError::new_err(e.clone())),
@@ -1070,17 +1027,53 @@ impl NativeEventLog {
     fn reset(&self, rows: Vec<Value>) -> PyResult<()> {
         let shared = self.shared()?;
         let mut state = shared.state.lock().unwrap();
-        // Completed executions are history; only live state is rebuilt from
-        // the WAL. Keep the existing bounded results and diagnostic buffers.
-        state.projection.retain_history();
+        state.reset_live = true;
+        state.projection = Projection::default();
         for mut value in rows {
             let _ = state.projection.apply(&mut value);
         }
-        state.queue.clear();
-        state.queue_bytes = 0;
-        state.rewrite = true;
+        state.live_dirty = true;
         state.revision += 1;
-        shared.wake.notify_one();
+        shared.wake.notify();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn completed_families_leave_no_resident_history_or_aliases() {
+        // Disk/GUI checks cannot see producer references. Removing this test
+        // loses detection of retained completed families; no disk I/O is needed.
+        let mut projection = Projection::default();
+        for index in 0..2000 {
+            let path = format!("C:/carrier-{index}.fake");
+            let sibling = format!("C:/opaque-{index}.002");
+            let mut claim = json!({"event":"pipeline_sources_claimed","owner":index.to_string(),
+                "processing":true,"ts":1,"groups":[{"path":path,"members":[path,sibling]}]});
+            projection.apply(&mut claim);
+            let mut completion =
+                json!({"event":"done","path":sibling,"owner":index.to_string(),"ts":2});
+            let row = projection.apply(&mut completion).unwrap();
+            let row: Value = serde_json::from_slice(&row).unwrap();
+            assert_eq!(row["group"]["members"].as_array().unwrap().len(), 2);
+            assert!(projection.tasks.is_empty());
+            assert!(projection
+                .apply(&mut json!({"event":"done","path":path,"owner":index.to_string(),"ts":2}))
+                .is_none());
+            projection.apply(&mut json!({"event":"pipeline_sources_released","owner":index.to_string(),"path":path}));
+            assert!(
+                projection.aliases.is_empty()
+                    && projection.retiring.is_empty()
+                    && projection.owner_tasks.is_empty()
+            );
+        }
+        let mut waiting =
+            json!({"event":"suspended_missing_volume","path":"C:/abandoned.002","ts":1});
+        projection.apply(&mut waiting);
+        let id = projection.tasks.keys().next().unwrap().clone();
+        projection.expire_live(vec![id], 2_000_000);
+        assert!(projection.tasks.is_empty() && projection.aliases.is_empty());
     }
 }

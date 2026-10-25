@@ -24,9 +24,9 @@ set(JSON_Install OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(json URL https://codeload.github.com/nlohmann/json/tar.gz/65ee68451d8eb2b5f3a30b410476ab83deb3289b
   DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
 FetchContent_MakeAvailable(json)
-add_library(sunpack_gui_data STATIC src/platform.cpp src/model.cpp src/presentation.cpp src/range_editor.cpp
-  ../native/third_party/lz4/xxhash.c)
-target_include_directories(sunpack_gui_data PUBLIC src PRIVATE ../native/third_party/lz4)
+add_library(sunpack_gui_data STATIC src/platform.cpp src/model.cpp src/presentation.cpp src/range_editor.cpp src/display_history.cpp
+  ../native/third_party/lz4/xxhash.c ../native/third_party/lz4/lz4.c)
+target_include_directories(sunpack_gui_data PUBLIC src ../native/third_party/lz4)
 # Enable MSVC /GL for the GUI data library in Release builds only.
 set_property(TARGET sunpack_gui_data PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
 target_link_libraries(sunpack_gui_data PUBLIC nlohmann_json::nlohmann_json

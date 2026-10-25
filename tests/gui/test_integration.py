@@ -301,21 +301,64 @@ $entries = @($items | ForEach-Object {{
             assert all(rule["inheritance"] == 3 and rule["propagation"] == 0 for rule in entry["rules"])
 
 
-def _state_projection(path):
+def _state_projection(path, query="", cursor="", root="", status=""):
     binary = Path(os.environ.get("SUNPACK_GUI_TEST_BINARY", Path(__file__).resolve().parents[2] / ".cache" / "gui-x64" / "Release" / "sunpack_gui_tests.exe"))
     if not binary.is_file():
         pytest.skip("Build the native GUI with scripts/build_gui.ps1")
-    return json.loads(subprocess.check_output([str(binary), "--project", str(path)], text=True, encoding="utf-8"))
+    return json.loads(subprocess.check_output([str(binary), "--project", str(path), query, cursor, root, status], text=True, encoding="utf-8"))
 
 
-def test_gui_keeps_published_state_across_write_faults_and_close(tmp_path):
+def test_indexed_history_pages_and_literal_member_search_work_without_a_producer(tmp_path):
+    # Projection-only fixtures cannot detect Rust/C++ index/filter disagreement,
+    # cursor omissions across UTC runs, or a GUI accidentally writing the store.
+    # One closed real producer covers all three without loading all history in UI.
+    import time
+    from sunpack.runtime.watch.log import WatchLogStore
+    path = tmp_path / "events.json"
+    store = WatchLogStore(str(path))
+    base = time.time() - 2 * 86400
+    for index in range(250):
+        source = str(tmp_path / ("one" if index < 100 else "two") / f"载体-{index}.fake")
+        member = str(tmp_path / f"密钥_{index}%.002")
+        timestamp = base + (index // 100) * 86400 + index / 1000
+        store.write("pipeline_sources_claimed", owner=str(index), processing=True, ts=timestamp,
+                    groups=[{"path": source, "name": "payload.rar", "members": [source, member]}])
+        store.write("done", path=member, owner=str(index), ts=timestamp)
+    store.flush()
+    store.close()
+    manifest = path.read_bytes()
+    files = {p: p.stat().st_mtime_ns for p in path.with_name(path.name + ".store").iterdir()}
+    cursor, ids = "", set()
+    while True:
+        page = _state_projection(path, cursor=cursor)["tasks"]
+        assert 0 < len(page["rows"]) <= 100
+        for row in page["rows"]:
+            assert row["id"] not in ids
+            ids.add(row["id"])
+        if not page["hasMore"]:
+            break
+        cursor = page["next"]
+    assert len(ids) == 250
+    for query in ("密", "密钥", "100%", "PAYLOAD.RAR"):
+        page = _state_projection(path, query=query)["tasks"]
+        assert page["rows"]
+        if query == "100%":
+            assert len(page["rows"]) == 1 and page["rows"][0]["name"] == "载体-100.fake"
+    assert not _state_projection(path, query="密匙")["tasks"]["rows"]
+    assert len(_state_projection(path, root=str(tmp_path / "one"))["tasks"]["rows"]) == 100
+    assert not _state_projection(path, status="taskFailed")["tasks"]["rows"]
+    assert path.read_bytes() == manifest
+    assert {p: p.stat().st_mtime_ns for p in files} == files
+
+
+def test_gui_reads_display_state_across_publication_faults_and_close(tmp_path):
     # Pure model fixtures cannot detect disagreements with the real Rust writer.
     # One kernel sharing failure covers async fault reporting, atomic replacement,
     # retained last-known state, healing, and independent offline replay.
     from sunpack.runtime.watch.log import WatchLogStore
-    path = tmp_path / "events.jsonl"
+    path = tmp_path / "events.json"
     source = str(tmp_path / "carrier.fake.001")
-    log = WatchLogStore(str(path), max_bytes=2048)
+    log = WatchLogStore(str(path))
     try:
         log.recover()
         log.write("processing_started", path=source)
@@ -339,7 +382,7 @@ def test_gui_keeps_published_state_across_write_faults_and_close(tmp_path):
             assert published["tasks"]["rows"][0]["statusText"] == "等待密码"
             old_bytes, count = ctypes.create_string_buffer(4096), wintypes.DWORD()
             assert kernel.ReadFile(held, old_bytes, len(old_bytes), ctypes.byref(count), None)
-            assert b"processing_started" in old_bytes.raw[:count.value]
+            assert json.loads(old_bytes.raw[:count.value])["format"] == 1
         finally:
             kernel.CloseHandle(held)
         held = kernel.CreateFileW(str(path), 0x80000000, 1, None, 3, 0, None)
@@ -352,7 +395,10 @@ def test_gui_keeps_published_state_across_write_faults_and_close(tmp_path):
             assert log.error
             assert path.read_bytes() == before  # Failed replacement preserves old file.
             stale = _state_projection(path)
-            assert stale == published  # The last published state remains readable.
+            # Live slots are best effort, not transactional snapshots. A failed
+            # manifest replacement may expose a newer live timestamp; identity
+            # and the valid current status must remain independently readable.
+            assert [(r["id"], r["status"]) for r in stale["tasks"]["rows"]] == [(r["id"], r["status"]) for r in published["tasks"]["rows"]]
         finally:
             kernel.CloseHandle(held)
         log.write("diagnostic", message="disk available again")
@@ -370,7 +416,7 @@ def test_gui_keeps_published_state_across_write_faults_and_close(tmp_path):
     before = path.read_bytes()
     held = kernel.CreateFileW(str(path), 0x80000000, 0, None, 3, 0, None)
     assert held != wintypes.HANDLE(-1).value
-    log = WatchLogStore(str(path), max_bytes=2048)
+    log = WatchLogStore(str(path))
     try:
         log.recover()
         try:
@@ -385,7 +431,7 @@ def test_gui_keeps_published_state_across_write_faults_and_close(tmp_path):
         assert len(restored) == 1 and restored[0]["outputs"] == ["retained-output"]
     finally:
         log.close()
-    assert not list(tmp_path.glob("events.jsonl.*"))
+    assert not list(tmp_path.glob("*.tmp"))
 
 
 def test_gui_history_survives_process_death_and_wal_recovery(tmp_path):
@@ -395,7 +441,7 @@ def test_gui_history_survives_process_death_and_wal_recovery(tmp_path):
     import sys
     source = tmp_path / "disguised.bin"
     source.write_bytes(b"not inspected by this projection test")
-    path = tmp_path / "events.jsonl"
+    path = tmp_path / "events.json"
     script = """
 import sys
 from sunpack.runtime.watch.log import WatchLogStore
@@ -431,8 +477,11 @@ sys.stdin.readline()
     from sunpack.runtime.watch.state import WatchStateStore
     state = WatchStateStore(str(tmp_path / "state.snapshot"))
     # A crash can leave one incomplete append after all committed records.
-    with path.open("ab") as tail:
-        tail.write(b'{"event":"done","path":"unfinished')
+    manifest = json.loads(path.read_text())
+    run = manifest["runs"][-1]
+    data = path.with_name(path.name + ".store") / (run["name"] + ".data")
+    with data.open("ab") as tail:
+        tail.write(b"unpublished incomplete compressed display record")
     log = WatchLogStore(str(path))
     try:
         log.recover(state._native)
@@ -467,14 +516,15 @@ def test_native_and_gui_share_member_retirement_and_real_request_lifetimes(tmp_p
     from sunpack.core.contracts.archive_input import ArchiveInputDescriptor, ArchiveInputPart, InputExtent
     from sunpack.core.contracts.tasks import ArchiveTask
     from sunpack.pipeline.coordinator.engine import _task_source_group
-    log = WatchLogStore(str(tmp_path / "events.jsonl"), max_bytes=4096)
+    log = WatchLogStore(str(tmp_path / "events.json"))
     a, b, c = (str(tmp_path / name) for name in ("carrier.001", "other.bin", "last.part"))
     def compact():
         log.write("diagnostic", message="x" * 4096)
         log.flush()
         return _state_projection(log.path)["tasks"]
     def members():
-        records = [json.loads(line) for line in log.path.read_text(encoding="utf-8").splitlines()]
+        from tests.display_history import records as read_records
+        records = read_records(log.path)
         return next(g for r in reversed(records) if r["event"] == "pipeline_sources_claimed"
                     for g in r["groups"] if g["path"] == a)["members"]
     try:
@@ -536,7 +586,9 @@ def test_execution_history_survives_regroup_retry_and_compaction(tmp_path):
     # or an old eviction unlinking a live alias. One real writer/GUI scenario
     # covers both, including snapshot replay and the existing byte budget.
     from sunpack.runtime.watch.log import WatchLogStore
-    log = WatchLogStore(str(tmp_path / "events.jsonl"), max_bytes=32768)
+    import time
+    base = time.time() - 100
+    log = WatchLogStore(str(tmp_path / "events.json"))
     a, b = (str(tmp_path / name) for name in ("carrier.fake", "unrelated.bin"))
     group = {"path": a, "name": "payload.rar", "members": [a, b]}
 
@@ -557,32 +609,32 @@ def test_execution_history_survives_regroup_retry_and_compaction(tmp_path):
 
     try:
         log.recover()
-        log.write("processing_started", path=b, owner="first", ts=1)
+        log.write("processing_started", path=b, owner="first", ts=base+1)
         log.write("pipeline_sources_claimed", owner="first", processing=True,
-                  groups=[group], ts=2)
-        log.write("done", path=b, owner="first", output_dirs=["old-output"], ts=3)
+                  groups=[group], ts=base+2)
+        log.write("done", path=b, owner="first", output_dirs=["old-output"], ts=base+3)
         old, = rows()
         assert old["path"] == a and old["status"] == "taskSucceeded"
-        log.write("processing_started", path=b, owner="second", ts=4)
+        log.write("processing_started", path=b, owner="second", ts=base+4)
         current = rows()
         assert len(current) == 2 and old in current
         retry_id = next(r["id"] for r in current if r["status"] == "taskProcessing")
         log.write("pipeline_sources_claimed", owner="second", processing=True,
-                  groups=[{"path": b, "name": "payload.rar", "members": [b]}], ts=5)
-        log.write("suspended_missing_volume", path=b, ts=6)
-        log.write("processing_started", path=a, owner="third", ts=7)
-        log.write("pipeline_sources_claimed", owner="third", processing=True, groups=[group], ts=8)
+                  groups=[{"path": b, "name": "payload.rar", "members": [b]}], ts=base+5)
+        log.write("suspended_missing_volume", path=b, ts=base+6)
+        log.write("processing_started", path=a, owner="third", ts=base+7)
+        log.write("pipeline_sources_claimed", owner="third", processing=True, groups=[group], ts=base+8)
         log.write("pipeline_sources_released", owner="second", paths=[a, b])
-        log.write("failed_terminal", owner="second", path=b, ts=8)
-        log.write("failed_password", path=b, ts=9)
+        log.write("failed_terminal", owner="second", path=b, ts=base+8)
+        log.write("failed_password", path=b, ts=base+9)
         current = rows()
         assert len(current) == 2 and old in current
         waiting, = [r for r in current if r["status"] == "taskWaiting"]
         assert waiting["id"] == retry_id
         assert waiting["statusText"] == "等待密码"
         assert compact() == current
-        log.write("processing_started", path=b, owner="fourth", ts=10)
-        log.write("done", path=a, owner="fourth", output_dirs=["new-output"], ts=11)
+        log.write("processing_started", path=b, owner="fourth", ts=base+10)
+        log.write("done", path=a, owner="fourth", output_dirs=["new-output"], ts=base+11)
         current = rows()
         assert len(current) == 2 and old in current
         assert {r["id"] for r in current} == {old["id"], retry_id}
@@ -599,7 +651,7 @@ def test_execution_history_survives_regroup_retry_and_compaction(tmp_path):
         log.write("pipeline_sources_claimed", owner="active", processing=True, groups=[group])
         log.write("failed_password", path=b)
         current = compact()
-        assert 1 < len(current) < 82
+        assert len(current) == 83
         assert len([r for r in current if r["status"] == "taskWaiting"]) == 1
         assert log.path.stat().st_size < 65536
         log.write("blocker_cleared", path=b, task_path=a)
@@ -609,7 +661,7 @@ def test_execution_history_survives_regroup_retry_and_compaction(tmp_path):
         log.close()
     # Reopening must retain exactly the already bounded results, including
     # confirmed names for physical inputs that are no longer present.
-    log = WatchLogStore(str(tmp_path / "events.jsonl"), max_bytes=32768)
+    log = WatchLogStore(str(tmp_path / "events.json"))
     try:
         log.recover()
         assert rows() == retained
@@ -668,7 +720,7 @@ def test_split_arrivals_publish_only_confirmed_cards(tmp_path, monkeypatch):
                     assert result.failed == int(index < 2)
                     watcher.log.flush()
                     rows = _state_projection(watcher.log.path)["tasks"]["rows"]
-                    assert len(rows) == 1
+                    assert len(rows) == 1, [(r["id"],r["status"],r["path"]) for r in rows]
                     assert rows[0]["parts"] == [part.name for part in parts[:index + 1]]
                     assert rows[0]["status"] == ("taskWaiting" if index < 2 else "taskSucceeded")
                     if previous:
@@ -746,5 +798,5 @@ def test_real_recursive_watch_executions_keep_two_outer_rows(tmp_path, monkeypat
                 offline = rows
             finally:
                 await watcher.aclose()
-            assert _state_projection(tmp_path / "events.jsonl")["tasks"]["rows"] == offline
+            assert _state_projection(tmp_path / "events.json")["tasks"]["rows"] == offline
     asyncio.run(scenario())

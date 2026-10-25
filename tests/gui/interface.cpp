@@ -17,7 +17,7 @@
 using namespace spg;
 void rendering_contracts();
 namespace {
-constexpr int virtualTaskCount=96, virtualPasswordCount=80, virtualHistoryCount=96;
+constexpr int virtualTaskCount=196, virtualPasswordCount=80, virtualHistoryCount=96;
 struct AnimationFrames {
     bool finished=false, layout=false, started=false, stopped=false;
     unsigned frames=0, submitted=0, rootLayouts=0;
@@ -1047,8 +1047,9 @@ void task_card_details(Application& app) {
     auto id=row["id"].get<std::string>();
     auto* window=ui::GetContext().GetWindow(app.window());
     auto update=[&] {
-        auto delta=Json{{"changes",Json::array({Json{{"id",id},{"row",row}}})},{"malformed",0}}.dump();
-        assert(ui_page_call_json(app.page(),"applyTaskDelta",delta.c_str())==0);
+        auto snapshot=state(app.page(),"tasks");
+        for(auto& current:snapshot["rows"]) if(current["id"]==id) current=row;
+        assert(ui_page_set_json(app.page(),"tasks",snapshot.dump().c_str())==0);
         ui_window_relayout(app.window());
     };
     auto label=[&](const std::string& prefix) {
@@ -1352,7 +1353,7 @@ int wmain(int argc,wchar_t** argv) {
         }
         atomic_write(dir/"builtin_passwords.json",R"({"passwords":[{"value":"  #中文  "}],"clipboard_history":["history"]})");
         atomic_write(dir/"sunpack_watch_roots.txt",utf8(dir.wstring())+"\n");
-        atomic_write(dir/".sunpack_watch"/"events.jsonl",published_events(Json({{"event","done"},{"path",utf8((dir/"carrier.001").wstring())}}).dump()+"\n"));
+        publish_events(dir/".sunpack_watch"/"events.json",Json({{"event","done"},{"path",utf8((dir/"carrier.001").wstring())}}).dump()+"\n");
         {
             Options options; options.data_dir=dir; options.allow_cli=true;
             options.cli={executable_path(),dir,{L"--fake-cli",gate_name}};
@@ -1449,67 +1450,17 @@ int wmain(int argc,wchar_t** argv) {
             std::string many;
             const char* phases[]={"processing_started","failed_terminal","suspended_missing_volume","done"};
             for(int i=0;i<virtualTaskCount;++i) many+=Json({{"event",phases[i%4]},{"path",utf8((dir/"history"/("task-"+std::to_string(i)+".001")).wstring())},{"time","2026-10-19T09:15:42.731112+00:00"},{"output_dirs",{utf8(dir.wstring())}}}).dump()+"\n";
-            atomic_write(dir/".sunpack_watch"/"events.jsonl",published_events(many));
-            pump_diagnostic(app,[&]{return state(app.page(),"tasks")["total"]==virtualTaskCount;},"Load virtual tasks");
-            virtual_tail(app,"taskItems","taskListScroll",virtualTaskCount);
-            auto tail=state(app.page(),"tasks")["rows"][virtualTaskCount-1];
-            tail["sortTimestamp"]=1e12;
-            auto delta_json=Json{{"changes",Json::array({Json{{"id",tail["id"]},{"row",tail}}})},{"malformed",0}}.dump();
-            assert(ui_page_call_json(app.page(),"applyTaskDelta",delta_json.c_str())==0);
-            assert(state(app.page(),"tasks")["rows"][0]["id"]==tail["id"]);
-            // Reordering alone misses stale ID indexes, removals and coalesced
-            // changes. Exercise those together in the existing mounted list;
-            // compare against an independent full snapshot after each batch.
-            auto saved_tasks=state(app.page(),"tasks");
-            auto expected=saved_tasks;
-            auto apply_changes=[&](const Json& changes) {
-                std::map<std::string,Json> by_id;
-                for(auto& row:expected["rows"]) by_id[row["id"].get<std::string>()]=row;
-                for(auto& change:changes) {
-                    auto id=change["id"].get<std::string>();
-                    if(change.contains("row")) by_id[id]=change["row"]; else by_id.erase(id);
-                }
-                std::vector<Json> rows;
-                for(auto& pair:by_id) rows.push_back(pair.second);
-                std::sort(rows.begin(),rows.end(),[](const Json& a,const Json& b) {
-                    if(a["sortTimestamp"]!=b["sortTimestamp"]) return a["sortTimestamp"]>b["sortTimestamp"];
-                    return a["sortSequence"]>b["sortSequence"];
-                });
-                expected={{"rows",rows},{"total",rows.size()},{"malformed",7}};
-                auto patch=Json{{"changes",changes},{"malformed",7}}.dump();
-                assert(ui_page_call_json(app.page(),"applyTaskDelta",patch.c_str())==0);
-                auto actual=state(app.page(),"tasks");
-                if(!Json::diff(expected,actual).empty()) {
-                    std::cerr<<"Task delta mismatch ("<<changes.size()<<" changes): "<<Json::diff(expected,actual).dump()<<'\n';
-                }
-                assert(Json::diff(expected,actual).empty());
-            };
-            apply_changes(Json::array()); // malformed count with no changed rows
-            // Retained item bindings must still observe global text changes.
-            auto saved_texts=state(app.page(),"texts"),changed_texts=saved_texts;
-            changed_texts["taskFolder"]="folder-after-delta: ";
-            assert(ui_page_set_json(app.page(),"texts",changed_texts.dump().c_str())==0);
-            assert(rendered_widget(app,"taskRoot-"+tail["id"].get<std::string>())["text"]==
-                "folder-after-delta: "+tail["directory"].get<std::string>());
-            assert(ui_page_set_json(app.page(),"texts",saved_texts.dump().c_str())==0);
-            auto moved=tail; moved["sortTimestamp"]=2e12; moved["statusText"]="updated";
-            apply_changes(Json::array({Json{{"id",moved["id"]},{"row",moved}}}));
-            assert(rendered_widget(app,"task-"+moved["id"].get<std::string>()).dump().find("updated")!=std::string::npos);
-            auto newcomer=moved; newcomer["id"]="delta-new"; newcomer["sortTimestamp"]=3e12;
-            apply_changes(Json::array({Json{{"id",moved["id"]}},Json{{"id",newcomer["id"]},{"row",newcomer}},
-                Json{{"id",newcomer["id"]}},Json{{"id",moved["id"]},{"row",tail}}}));
-            Json bulk=Json::array();
-            for(size_t i=0;i<70;++i) {
-                auto row=expected["rows"][i]; row["sortTimestamp"]=4e12+double(i);
-                bulk.push_back(Json{{"id",row["id"]},{"row",row}});
-            }
-            bulk.push_back(Json{{"id",tail["id"]}}); apply_changes(bulk);
-            apply_changes(Json::array({Json{{"id",newcomer["id"]},{"row",newcomer}}}));
-            assert(ui_page_set_json(app.page(),"tasks",saved_tasks.dump().c_str())==0);
-            expected=saved_tasks;
-            apply_changes(Json::array({Json{{"id",tail["id"]},{"row",moved}}}));
-            assert(ui_page_set_json(app.page(),"tasks",saved_tasks.dump().c_str())==0);
-            virtual_tail(app,"taskItems","taskListScroll",virtualTaskCount);
+            publish_events(dir/".sunpack_watch"/"events.json",many);
+            pump_diagnostic(app,[&]{return state(app.page(),"tasks")["total"]==std::min(100,virtualTaskCount);},"Load virtual tasks");
+            virtual_tail(app,"taskItems","taskListScroll",std::min(100,virtualTaskCount));
+            auto first_page=state(app.page(),"tasks");
+            assert(first_page["hasMore"]==true);
+            assert(ui_page_call_json(app.page(),"nextTaskPage","{}")==0);
+            pump_diagnostic(app,[&]{return state(app.page(),"tasks")["rows"][0]["id"]!=first_page["rows"][0]["id"];},"Next history page");
+            assert(state(app.page(),"tasks")["rows"].size()<=100);
+            assert(ui_page_call_json(app.page(),"previousTaskPage","{}")==0);
+            pump_diagnostic(app,[&]{return state(app.page(),"tasks")["rows"][0]["id"]==first_page["rows"][0]["id"];},"Previous history page");
+            virtual_tail(app,"taskItems","taskListScroll",std::min(100,virtualTaskCount));
             auto task=state(app.page(),"tasks")["rows"][0];
             assert(task["time"].get<std::string>().size()==19);
                 resize_tasks(app);
@@ -1533,7 +1484,7 @@ int wmain(int argc,wchar_t** argv) {
             ui_page_set_json(app.page(),"requests","[]");
             ui_debug_pump();
             drag_after_wheel(app);
-            atomic_write(dir/".sunpack_watch"/"events.jsonl",published_events(Json({{"event","done"},{"path",utf8((dir/"carrier.001").wstring())}}).dump()+"\n"));
+            publish_events(dir/".sunpack_watch"/"events.json",Json({{"event","done"},{"path",utf8((dir/"carrier.001").wstring())}}).dump()+"\n");
             pump_diagnostic(app,[&]{return state(app.page(),"tasks")["total"]==1;},"Log replacement");
             assert(!state(app.page(),"texts").contains("otherTasks"));
             assert(rect(app,"allRoots").top>=rect(app,"directorySearch").bottom);
@@ -2138,10 +2089,10 @@ int wmain(int argc,wchar_t** argv) {
 
             click(app,"tabTasks"); pump([&]{return state(app.page(),"tab")=="tasks";});
             auto main=utf8((dir/"carrier.001").wstring()), sibling=utf8((dir/"disguised.blob").wstring());
-            atomic_write(dir/".sunpack_watch"/"events.jsonl",published_events(
+            publish_events(dir/".sunpack_watch"/"events.json",
                 Json{{"event","pipeline_sources_claimed"},{"path",sibling},{"groups",Json::array({
                     Json{{"path",main},{"name","movie.7z"},{"members",{main,sibling}}}})}}.dump()+"\n"+
-                Json{{"event","failed_password"},{"path",sibling}}.dump()+"\n"));
+                Json{{"event","failed_password"},{"path",sibling}}.dump()+"\n");
             try { pump([&]{return state(app.page(),"tasks")["rows"][0]["status"]=="taskWaiting";}); }
             catch(...) { std::cerr<<"Log model: "<<state(app.page(),"tasks")<<" errors="<<state(app.page(),"errors")<<"\n"; throw; }
             auto grouped=state(app.page(),"tasks")["rows"][0];
@@ -2155,7 +2106,7 @@ int wmain(int argc,wchar_t** argv) {
             pump([&]{return state(app.page(),"errors").contains("sunpack_config.json");});
             std::cerr<<"Invalid configuration retained\n";
             assert(!state(app.page(),"fields").empty());
-            atomic_write(dir/"elsewhere"/"events.jsonl",published_events(Json({{"event","done"},{"path",utf8((dir/"other.fake").wstring())}}).dump()+"\n"));
+            publish_events(dir/"elsewhere"/"events.json",Json({{"event","done"},{"path",utf8((dir/"other.fake").wstring())}}).dump()+"\n");
             atomic_write(dir/"sunpack_config.json",R"({"watch":{"state_dir":"elsewhere"}})");
             try { pump([&]{return state(app.page(),"tasks")["rows"][0]["name"]=="other.fake";}); }
             catch(...) { std::cerr<<"Rebound log: "<<state(app.page(),"tasks")<<" errors="<<state(app.page(),"errors")<<" log="<<state(app.page(),"logPath")<<" fields="<<state(app.page(),"fields")<<"\n"; throw; }

@@ -165,7 +165,7 @@ DirectoryWatcher::DirectoryWatcher(const fs::path& directory, std::function<void
                 CharLowerBuffW(name.data(),DWORD(name.size()));
                 // Missing target directories are observed through their existing ancestor.
                 if (subtree || name == L"sunpack_config.json" || name == L"builtin_passwords.json" ||
-                    name == L"sunpack_watch_roots.txt" || name == L"events.jsonl") changed(path);
+                    name == L"sunpack_watch_roots.txt" || name == L"events.json") changed(path);
                 if (!item->NextEntryOffset) break;
                 offset += item->NextEntryOffset;
             }

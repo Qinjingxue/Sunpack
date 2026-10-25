@@ -135,6 +135,7 @@
     "toast_update_interval_ms": 50,
     "toast_completion_debounce_ms": 800,
     "toast_report_retention_days": 30,
+    "event_log_retention_days": 7,
     "toast_report_max_files": 16,
     "toast_report_max_bytes": 2097152,
     "state_dir": ""

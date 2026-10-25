@@ -95,15 +95,8 @@ void Application::publish(Json patch) {
     if(stopping_) return;
     // Preserve all deltas while an earlier UI update is still pending.
     // A later full snapshot supersedes previous incremental updates.
-    if(patch.contains("tasks")) pending_.erase("taskDelta");
     if(patch.contains("passwords")) pending_.erase("passwordDelta");
     if(patch.contains("passwordDelta") && pending_.contains("passwords")) patch.erase("passwordDelta");
-    if(patch.contains("taskDelta") && pending_.contains("taskDelta")) {
-        for(auto& change:patch["taskDelta"]["changes"])
-            pending_["taskDelta"]["changes"].push_back(std::move(change));
-        pending_["taskDelta"]["malformed"]=patch["taskDelta"]["malformed"];
-        patch.erase("taskDelta");
-    }
     for(auto it=patch.begin();it!=patch.end();++it) pending_[it.key()]=std::move(it.value());
     if(!notified_) { notified_=true; PostMessageW(hwnd_,Update,0,0); }
 }
@@ -333,7 +326,6 @@ void Application::apply_pending() {
     Json patch;
     { std::lock_guard<std::mutex> lock(mutex_); patch=std::move(pending_); pending_=Json::object(); notified_=false; }
     auto reset_scroll=patch.value("resetScroll",Json::array()); patch.erase("resetScroll");
-    auto task_delta_patch=patch.value("taskDelta",Json()); patch.erase("taskDelta");
     auto password_delta_patch=patch.value("passwordDelta",Json()); patch.erase("passwordDelta");
     VisualBatch visual(window_);
     auto ack=patch.value("saveAck",Json()); patch.erase("saveAck");
@@ -356,11 +348,6 @@ void Application::apply_pending() {
     if(!password_snapshot.is_null()) {
         auto encoded=password_snapshot.dump();
         if(ui_page_call_json(page_,"applyPasswords",encoded.c_str())!=0) throw std::runtime_error("passwordBindingFailed");
-    }
-    if(!task_delta_patch.is_null()) {
-        auto encoded=task_delta_patch.dump();
-        if(ui_page_call_json(page_,"applyTaskDelta",encoded.c_str())!=0)
-            throw std::runtime_error("taskBindingFailed");
     }
     if(!password_delta_patch.is_null()) {
         auto encoded=password_delta_patch.dump();
@@ -725,7 +712,13 @@ void Application::handle_command(Json command) {
         } else throw std::runtime_error("pathMissing");
         return;
     }
-    { std::lock_guard<std::mutex> lock(mutex_); commands_.push_back(std::move(command)); }
+    if(op=="filterTasks") ui_page_call_json(page_,"resetTaskPages","{}");
+    if(op=="filterTasks" || op=="taskPage") ++task_query_generation_;
+    { std::lock_guard<std::mutex> lock(mutex_);
+      if(op=="filterTasks" || op=="taskPage") commands_.erase(std::remove_if(commands_.begin(),commands_.end(),[](const auto& pending){
+          auto op=pending.value("op",std::string()); return op=="filterTasks" || op=="taskPage";
+      }),commands_.end());
+      commands_.push_back(std::move(command)); }
     cv_.notify_one();
 }
 void Application::finish_date_popup(UINT_PTR generation) {
@@ -902,10 +895,8 @@ void Application::work() {
         std::string last_config,last_passwords,last_roots;
         bool config_read=false,passwords_read=false,roots_read=false;
         Json previous_patch=Json::object();
-        // Only store sorted task IDs, never a second 5000-row JSON snapshot.
-        // A source change or incremental task patch invalidates this shortcut.
-        std::vector<std::wstring> last_visible_tasks;
-        bool task_selection_known=false;
+        // Retry only after an observed publication race; no history cache.
+        bool task_query_pending=true;
         std::map<unsigned,ReadRetry> retries;
         bool initial_load_complete=false;
         auto retry_io=[&](unsigned bit,const WinError& error) {
@@ -917,7 +908,7 @@ void Application::work() {
             if(retry.attempts<3) retry.due=Clock::now()+std::chrono::milliseconds(delays[retry.attempts++]);
         };
         for(;;) {
-            unsigned flags; std::deque<Json> commands;
+            unsigned flags; std::deque<Json> commands; uint64_t query_generation;
             {
                 std::unique_lock<std::mutex> lock(mutex_);
                 auto deadline=Clock::time_point::max();
@@ -926,15 +917,13 @@ void Application::work() {
                 if(deadline==Clock::time_point::max()) cv_.wait(lock,awake);
                 else cv_.wait_until(lock,deadline,awake);
                 if(stopping_) break;
-                flags=dirty_; dirty_=0; commands.swap(commands_);
+                flags=dirty_; dirty_=0; commands.swap(commands_); query_generation=task_query_generation_.load();
             }
             for(auto& retry:retries) {
                 if(flags&retry.first) { retry.second=ReadRetry{}; }
                 else if(retry.second.due<=Clock::now()) { flags|=retry.first; retry.second.due=Clock::time_point::max(); }
             }
             bool tasks_changed=false,passwords_changed=false,dirs_changed=false,config_changed=false;
-            bool task_delta_eligible=true;
-            bool task_filter_requested=false, task_source_changed=false;
             Json password_delta;
             Json edit_feedback=Json::object();
             if(!data_watcher || !data_watcher->alive() || (!data_watcher->direct() && fs::is_directory(dir))) {
@@ -946,16 +935,20 @@ void Application::work() {
             for(auto& command:commands) {
                 auto op=command.value("op",std::string()); auto p=command.value("payload",Json::object());
                 try {
-                    if(op=="filterTasks") {
-                        task_delta_eligible=false;
+                    if(op=="taskPage") {
+                        view.task_cursor=p.value("cursor",std::string()); tasks_changed=true;
+                        if(!edit_feedback.contains("resetScroll")) edit_feedback["resetScroll"]=Json::array();
+                        edit_feedback["resetScroll"].push_back("taskListScroll");
+                    } else if(op=="filterTasks") {
                         auto query=p.value("query",std::string()), root=p.value("root",std::string());
                         auto status=p.value("status",std::string());
                         if(view.task_query!=query || view.task_root!=root || view.task_status!=status) {
                             if(!edit_feedback.contains("resetScroll")) edit_feedback["resetScroll"]=Json::array();
                             edit_feedback["resetScroll"].push_back("taskListScroll");
+                            view.task_cursor.clear();
                             view.task_query=std::move(query); view.task_root=std::move(root);
                             view.task_status=std::move(status);
-                            tasks_changed=task_filter_requested=true;
+                            tasks_changed=true;
                         }
                     } else if(op=="filterPasswords") {
                         password_delta=Json(); // Filter changes require the whole result set.
@@ -1008,7 +1001,7 @@ void Application::work() {
                                 } else password_delta=Json();
                                 passwords_changed=true;
                             }
-                            if(section=="roots") { flags|=Roots; tasks_changed=dirs_changed=true; task_delta_eligible=false; }
+                            if(section=="roots") { flags|=Roots; tasks_changed=dirs_changed=true; }
                         }
                         auto message=result["error"].get<std::string>();
                         edit_feedback["saveAck"]={{"job",p},{"ok",message.empty()},{"error",message}};
@@ -1064,34 +1057,34 @@ void Application::work() {
                 auto value=parse_json(text); validate_passwords(value); passwords=std::move(value); passwords_changed=dirs_changed=true;
             });
             if(flags&Roots) {
-                read(Roots,"sunpack_watch_roots.txt",last_roots,roots_read,[&](const std::string& text){roots=parse_roots(text,dir); tasks_changed=dirs_changed=true; task_delta_eligible=false; task_source_changed=true;});
+                read(Roots,"sunpack_watch_roots.txt",last_roots,roots_read,[&](const std::string& text){roots=parse_roots(text,dir); tasks_changed=dirs_changed=true;});
             }
             auto log_dir=log_directory(dir,config);
-            if(log.path()!=log_dir/"events.jsonl" || !log_watcher || !log_watcher->alive() || (!log_watcher->direct() && fs::is_directory(log_dir))) {
+            if(log.path()!=log_dir/"events.json" || !log_watcher || !log_watcher->alive() || (!log_watcher->direct() && fs::is_directory(log_dir))) {
                 log_watcher.reset();
                 try {
                     log_watcher=std::make_unique<DirectoryWatcher>(log_dir,[this](const fs::path& path){
                         auto name=path.filename().wstring(); CharLowerBuffW(name.data(),DWORD(name.size()));
                         std::error_code ec;
-                        if(path.empty() || name==L"events.jsonl" || fs::is_directory(path,ec)) changed(Log);
+                        if(path.empty() || name==L"events.json" || fs::is_directory(path,ec)) changed(Log);
                     }); errors.erase("logObserver");
                 } catch(const std::exception& e) { errors["logObserver"]=e.what(); }
-                log.set_path(log_dir/"events.jsonl"); flags|=Log; tasks_changed=true; task_delta_eligible=false; task_source_changed=true;
+                log.set_path(log_dir/"events.json"); flags|=Log; tasks_changed=true;
             }
             if(flags&Log) {
                 try {
                     bool refreshed=log.refresh(retries.count(Log) && retries.at(Log).attempts>=3);
-                    tasks_changed|=refreshed; task_source_changed|=refreshed;
+                    tasks_changed|=refreshed || task_query_pending;
                     if(log.retry_required) changed(Log);
-                    errors.erase("events.jsonl");
-                    retries.erase(Log);
+                    errors.erase("events.json");
+                    if(!task_query_pending) retries.erase(Log);
                 }
                 catch(const WinError& e){
                     const bool transient=e.code==ERROR_SHARING_VIOLATION || e.code==ERROR_LOCK_VIOLATION || e.code==ERROR_FILE_NOT_FOUND || e.code==ERROR_PATH_NOT_FOUND;
-                    if(transient) errors.erase("events.jsonl"); else errors["events.jsonl"]=e.what();
-                    tasks_changed=task_source_changed=true; retry_io(Log,e);
+                    if(transient) errors.erase("events.json"); else errors["events.json"]=e.what();
+                    tasks_changed=true; retry_io(Log,e);
                 }
-                catch(const std::exception& e){ errors["events.jsonl"]=e.what(); tasks_changed=task_source_changed=true; }
+                catch(const std::exception& e){ errors["events.json"]=e.what(); tasks_changed=true; }
             }
             Json patch=Json::object();
             auto next_language=gui_language(config);
@@ -1099,22 +1092,19 @@ void Application::work() {
             language=std::move(next_language);
             if(language_changed) { patch["language"]=language; patch["texts"]=interface_texts(language); }
             if(tasks_changed || language_changed || !previous_patch.contains("tasks")) {
-                if(task_delta_eligible && !language_changed && previous_patch.contains("tasks") &&
-                   !log.rebuilt) {
-                    patch["taskDelta"]=task_delta(log,roots,view,language);
-                    task_selection_known=false;
-                } else {
-                    std::vector<std::wstring> selected;
-                    const auto* previous=(task_filter_requested && !task_source_changed &&
-                        !language_changed && task_selection_known)?&last_visible_tasks:nullptr;
-                    auto projected=task_rows(log,roots,view,language,&selected,previous);
-                    last_visible_tasks=std::move(selected);
-                    task_selection_known=true;
-                    if(!projected.is_null()) patch["tasks"]=std::move(projected);
+                log.cancelled=[this,query_generation]{return task_query_generation_.load()!=query_generation || WaitForSingleObject(stop_,0)==WAIT_OBJECT_0;};
+                try {
+                    auto projected=task_rows(log,roots,view,language);
+                    if(!projected.is_null()) { patch["tasks"]=std::move(projected); task_query_pending=false; retries.erase(Log); }
+                    errors.erase("events.json");
+                } catch(const WinError& e) {
+                    task_query_pending=true;
+                    const bool transient=e.code==ERROR_SHARING_VIOLATION || e.code==ERROR_LOCK_VIOLATION || e.code==ERROR_FILE_NOT_FOUND || e.code==ERROR_PATH_NOT_FOUND;
+                    if(transient) errors.erase("events.json"); else errors["events.json"]=e.what();
+                    retry_io(Log,e);
                 }
-                // The projection owns the changes now. Release copied path
-                // keys even when the log goes idle after a large burst/rebuild.
-                log.changed_keys.clear();
+                  catch(const std::exception& e) { task_query_pending=true; errors["events.json"]=e.what(); }
+                log.cancelled={}; log.changed_keys.clear();
             }
             if(passwords_changed || language_changed || !previous_patch.contains("passwords")) {
                 if(!password_delta.is_null() && !language_changed && previous_patch.contains("passwords"))
@@ -1134,11 +1124,11 @@ void Application::work() {
             initial_load_complete|=std::none_of(retries.begin(),retries.end(),[](const auto& retry){return retry.second.due!=Clock::time_point::max();});
             patch["errors"]=std::move(displayed_errors); patch["logPath"]=utf8(log.path().wstring()); patch["ready"]=initial_load_complete;
             Json changed_patch=Json::object();
-            for(auto it=patch.begin();it!=patch.end();++it) if(!previous_patch.contains(it.key()) || it.key()=="tasks" || it.key()=="passwords" || it.key()=="taskDelta" || it.key()=="passwordDelta" || previous_patch[it.key()]!=it.value()) {
+            for(auto it=patch.begin();it!=patch.end();++it) if(!previous_patch.contains(it.key()) || it.key()=="tasks" || it.key()=="passwords" || it.key()=="passwordDelta" || previous_patch[it.key()]!=it.value()) {
                 // These projections are generated only after source/filter
                 // changes. Keep an initialization marker, not a second full
                 // resident copy of the task/password list.
-                previous_patch[it.key()]=(it.key()=="tasks" || it.key()=="passwords" || it.key()=="taskDelta" || it.key()=="passwordDelta")?Json():it.value();
+                previous_patch[it.key()]=(it.key()=="tasks" || it.key()=="passwords" || it.key()=="passwordDelta")?Json():it.value();
                 changed_patch[it.key()]=std::move(it.value());
             }
             changed_patch.update(edit_feedback);

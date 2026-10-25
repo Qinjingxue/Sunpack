@@ -776,7 +776,7 @@ async def run_server() -> int:
 
     enable_persistent_runtime(state_changed=notify_state_changed)
     runtime_host = RuntimeHost(
-        log_path=state_path() + ".events.jsonl",
+        log_path=state_path() + ".events.json",
         state_changed=notify_state_changed,
     )
     set_runtime_host(runtime_host)

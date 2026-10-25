@@ -1,6 +1,11 @@
 from __future__ import annotations
 
 import json
+import time
+import ctypes
+from ctypes import wintypes
+
+from tests.display_history import records as _records
 from concurrent.futures import ThreadPoolExecutor
 
 import sunpack.runtime.watch.log as log_module
@@ -8,77 +13,64 @@ from sunpack.runtime.watch.log import WatchLogStore
 from sunpack.runtime.watch.state import WatchStateStore
 
 
-def _records(path):
-    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
-
-
-def test_shared_async_log_compacts_history_without_losing_active_groups(tmp_path):
-    # Old rollover tests cannot catch lost live tasks or disagreeing producers.
-    # One concurrent burst covers grouping, history budgets and both log modes.
-    path = tmp_path / "events.jsonl"
-    store = WatchLogStore(str(path), max_bytes=4096)
-    other = WatchLogStore(str(path), max_bytes=4096)
-    store.recover()
+def test_shared_display_history_keeps_results_on_disk_and_releases_live_groups(tmp_path):
+    # Covers concurrent owners, complete history and live-family routing together.
+    # Recovery tests cannot detect premature history eviction under a busy writer.
+    path = tmp_path / "events.json"
+    store = WatchLogStore(str(path))
+    other = WatchLogStore(str(path))
     a, b = str(tmp_path / "carrier.fake"), str(tmp_path / "unrelated.002")
+    store.recover()
     other.write("pipeline_sources_claimed", groups=[{"path": a, "name": "nested.rar", "members": [a, b]}])
     store.write("suspended_missing_volume", path=b)
     def produce(index):
-        owner = store if index % 2 else other
-        owner.write("processing_started", path=str(tmp_path / f"long-{index}.bin"))
+        writer = store if index % 2 else other
+        writer.write("processing_started", path=str(tmp_path / f"active-{index}.bin"))
         for n in range(12):
-            owner.write("done", path=str(tmp_path / f"finished-{index}-{n}"))
-            owner.write("scheduler_tick", padding="x" * 120)
+            writer.write("done", path=str(tmp_path / f"finished-{index}-{n}"))
+            writer.write("scheduler_tick", padding="x" * 120)
     with ThreadPoolExecutor(max_workers=4) as pool:
         list(pool.map(produce, range(40)))
-    # Force one more compaction after the concurrent burst has drained.
-    for n in range(80):
-        store.write("scheduler_tick", padding="x" * 120)
-    for _ in range(16):
-        store.write("scheduler_tick", padding="x" * 4096)
     store.flush()
     rows = _records(path)
-    assert len({r["path"] for r in rows if r["event"] == "processing_started"}) == 40
-    groups = [g for r in rows if r["event"] == "pipeline_sources_claimed" for g in r["groups"]]
-    assert {a, b} == set(groups[0]["members"])
-    assert any(r["event"] == "suspended_missing_volume" and r["path"] in {a, b} for r in rows)
-    assert path.stat().st_size < 40 * 500 + 16000
-    assert not list(tmp_path.glob("events.jsonl.*"))
-    store.close()  # A second owner must remain usable.
+    assert len([r for r in rows if r["event"] == "done"]) == 480
+    assert len([r for r in rows if r["event"] == "processing_started"]) == 40
+    assert {a, b} == set(next(r["groups"][0]["members"] for r in rows if r["event"] == "pipeline_sources_claimed"))
+    # Retire a large temporary live set while unrelated live families survive.
+    # This also exercises sparse-slot compaction without a separate micro-test.
+    for index in range(320):
+        store.write("processing_started", path=str(tmp_path / f"temporary-{index}"))
+    store.flush()
+    for index in range(320):
+        store.write("task_retired", path=str(tmp_path / f"temporary-{index}"), scope="task")
+    store.flush()
+    rows = _records(path)
+    assert len([r for r in rows if r["event"] == "processing_started"]) == 40
+    assert any(r["event"] == "suspended_missing_volume" for r in rows)
+    store.close()
     other.write("done", path=b)
     other.flush()
-    assert _records(path)[-1]["event"] == "done"
-    other.write("processing_started", path=b)
-    other.write("no_tasks_found", path=b, retire_group=True)
-    for _ in range(16):
-        other.write("scheduler_tick", padding="x" * 4096)
-    other.flush()
-    # Retiring a fresh empty request must preserve the previous execution.
-    assert any(r["event"] == "done" and r["path"] in {a, b} for r in _records(path))
-    assert not any(r["event"] == "processing_started" and r["path"] == b for r in _records(path))
     other.close()
-    diagnostic = WatchLogStore(str(tmp_path / "runtime-test.state.events.jsonl"), max_bytes=2048)
-    for n in range(100): diagnostic.write("host_event", index=n, padding="x" * 120)
-    diagnostic.flush()
-    assert diagnostic.path.stat().st_size < 8192
-    assert _records(diagnostic.path)[-1]["index"] == 99
-    diagnostic.close()
-    diagnostic = WatchLogStore(str(tmp_path / "runtime-test.state.events.jsonl"), max_bytes=2048)
-    diagnostic.write("host_restarted")
-    diagnostic.flush()
-    assert any(r.get("index") == 99 for r in _records(diagnostic.path))
-    diagnostic.close()
+    reopened = WatchLogStore(str(path))
+    reopened.recover()
+    reopened.flush()
+    rows = _records(path)
+    assert len([r for r in rows if r["event"] == "done"]) == 481
+    assert not any(r["event"] == "processing_started" for r in rows)
+    reopened.close()
+    assert not list(tmp_path.rglob("*.wal*"))
 
 
 def test_recovery_rebuilds_from_wal_with_groups_and_silent_blocker_retirement(tmp_path):
     # Replaying the JSONL cannot expose the WAL/event commit gap. Reopen the
     # actual state store: replace stale live state without losing results.
-    path = tmp_path / "events.jsonl"
+    path = tmp_path / "events.json"
     a, b = str(tmp_path / "opaque.001"), str(tmp_path / "opaque.002")
     (tmp_path / "opaque.001").write_bytes(b"0123456789")
     (tmp_path / "opaque.002").write_bytes(b"0123456789")
     departed = tmp_path / "opaque.003"
     departed.write_bytes(b"0123456789")
-    store = WatchLogStore(str(path), max_bytes=8192)
+    store = WatchLogStore(str(path))
     state = WatchStateStore(str(tmp_path / "state.snapshot"))
     state._native.attach_events(store._native)
     store.recover()
@@ -113,31 +105,65 @@ def test_recovery_rebuilds_from_wal_with_groups_and_silent_blocker_retirement(tm
 
 
 
-def test_diagnostic_restarts_and_large_payloads_stay_bounded(tmp_path):
-    # One-run rotation cannot find a size reset between lifetimes or an event
-    # name accidentally turning a diagnostic log into unlimited active state.
-    path = tmp_path / "runtime.state.events.jsonl"
-    for index in range(40):
-        store = WatchLogStore(str(path), max_bytes=8192)
-        try:
-            store.write("processing_started", path=f"diagnostic-{index}", message="x" * 1024)
-            store.flush()
-        finally:
-            store.close()
-        assert path.stat().st_size < 20000
-    store = WatchLogStore(str(path), max_bytes=128 * 1024)
-    try:
-        for index in range(3000):
-            store.write("processing_started", path=f"diagnostic-only-{index}", message="x" * 100)
+def test_diagnostic_history_is_not_capacity_evicted_and_payloads_are_bounded(tmp_path):
+    # The task-mode test misses diagnostics-only restart handling and oversized
+    # Python payload conversion. This one scenario adds those distinct failures.
+    path = tmp_path / "runtime.state.events.json"
+    for index in range(4):
+        store = WatchLogStore(str(path))
+        for n in range(500):
+            store.write("host_event", index=index * 500 + n, padding="x" * 100)
         store.flush()
-        assert path.stat().st_size < 256 * 1024
-        store.write("huge_error", error="错" * 2_000_000, nested=["y" * 10000] * 1000)
-        store.flush()
-        row = _records(path)[-1]
-        assert row["event"] == "huge_error" and row["truncated"]
-        assert len(json.dumps(row, ensure_ascii=False).encode("utf-8")) < 32768
-    finally:
         store.close()
+    store = WatchLogStore(str(path))
+    store.write("huge_error", error="错" * 2_000_000, nested=["y" * 10000] * 1000)
+    store.flush()
+    store.close()
+    rows = _records(path)
+    assert len(rows) == 2001
+    assert rows[-1]["event"] == "huge_error" and rows[-1]["truncated"]
+    assert len(json.dumps(rows[-1], ensure_ascii=False).encode()) < 32768
+
+
+def test_utc_deadline_reclaims_disk_without_a_new_write_and_reloads_retention(tmp_path):
+    # Other scenarios always submit new work. This catches a missing timer and
+    # boundary-prefix reclamation; one real OS notification replaces polling.
+    path = tmp_path / "events.json"
+    store = WatchLogStore(str(path))
+    expires = time.time() - 7 * 86400 + 2.0
+    store.write("done", path="expired-carrier.001", ts=expires)
+    store.write("pipeline_sources_claimed", processing=True, ts=expires,
+                groups=[{"path":"waiting.fake", "members":["waiting.fake", "opaque.002"]}])
+    store.write("suspended_missing_volume", path="opaque.002", ts=expires)
+    store.write("done", path="retained-nested.bin", ts=expires + 60)
+    store.flush()
+    before = json.loads(path.read_text())
+    run = before["runs"][0]
+    folder = path.with_name(path.name + ".store")
+    old_data = folder / (run["name"] + ".data")
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.FindFirstChangeNotificationW.argtypes = [wintypes.LPCWSTR, wintypes.BOOL, wintypes.DWORD]
+    kernel.FindFirstChangeNotificationW.restype = wintypes.HANDLE
+    kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel.FindCloseChangeNotification.argtypes = [wintypes.HANDLE]
+    change = kernel.FindFirstChangeNotificationW(str(tmp_path), False, 0x11)
+    assert change != wintypes.HANDLE(-1).value
+    try:
+        assert kernel.WaitForSingleObject(change, 5000) == 0
+        store.flush()
+    finally:
+        kernel.FindCloseChangeNotification(change)
+    assert [r["path"] for r in _records(path) if r["event"] == "done"] == ["retained-nested.bin"]
+    assert not any(r["event"] == "suspended_missing_volume" for r in _records(path))
+    # The first record was the oldest run's prefix; its old compressed bytes
+    # must be zeroed, or the whole old run removed, rather than just hidden.
+    if old_data.exists():
+        assert old_data.read_bytes().startswith(b"\0")
+    shorter = WatchLogStore(str(path), retention_days=1)
+    shorter.flush()
+    assert not [r for r in _records(path) if r["event"] == "done"]
+    shorter.close()
+    store.close()
 
 
 def test_blocker_group_is_durable_without_an_event_log(tmp_path):
@@ -152,7 +178,7 @@ def test_blocker_group_is_durable_without_an_event_log(tmp_path):
     finally:
         state.close()
     state = WatchStateStore(str(tmp_path / "state.snapshot"))
-    log = WatchLogStore(str(tmp_path / "events.jsonl"))
+    log = WatchLogStore(str(tmp_path / "events.json"))
     try:
         log.recover(state._native)
         log.flush()
@@ -169,7 +195,7 @@ def test_throttle_expiry_preserves_live_limits_and_releases_bounded_history(tmp_
     # Cover both limits and expiry cheaply without producing thousands of logs.
     now = [100.0]
     monkeypatch.setattr(log_module.time, "monotonic", lambda: now[0])
-    store = WatchLogStore(str(tmp_path / "events.jsonl"))
+    store = WatchLogStore(str(tmp_path / "events.json"))
     written = []
     monkeypatch.setattr(store, "write", lambda event, **payload: written.append(event))
     store.write_throttled("ignored", throttle_key="source", interval_seconds=300)

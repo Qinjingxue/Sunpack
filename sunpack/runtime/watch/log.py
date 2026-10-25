@@ -2,14 +2,13 @@ from __future__ import annotations
 
 import threading
 import time
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
 from sunpack_native import NativeEventLog
 
 
-DEFAULT_EVENTS_MAX_BYTES = 512 * 1024
+DEFAULT_EVENT_LOG_RETENTION_DAYS = 7
 
 
 class WatchLogStore:
@@ -17,13 +16,11 @@ class WatchLogStore:
         self,
         path: str,
         *,
-        max_bytes: int = DEFAULT_EVENTS_MAX_BYTES,
+        retention_days: int = DEFAULT_EVENT_LOG_RETENTION_DAYS,
         wake_callback: Callable[[], None] | None = None,
     ):
         self.path = Path(path)
-        self.max_bytes = max(1, int(max_bytes))
-        # The limit budgets recent results/diagnostics; live state has no cap.
-        self._native = NativeEventLog(str(self.path), max(1, self.max_bytes // 2), self.path.name.lower() == "events.jsonl")
+        self._native = NativeEventLog(str(self.path), max(1, int(retention_days)), self.path.name.lower() == "events.json")
         self._throttle_lock = threading.Lock()
         self._last_throttled_write: dict[tuple[str, str], tuple[float, float]] = {}
         self._next_throttle_expiry: float | None = None
@@ -50,6 +47,9 @@ class WatchLogStore:
             (expiry for _, expiry in self._last_throttled_write.values()), default=None,
         )
 
+    def configure_retention(self, days: int) -> None:
+        self._native.configure_retention(max(1, int(days)))
+
     def recover(self, state=None) -> None:
         self._native.recover(state)
 
@@ -70,8 +70,6 @@ class WatchLogStore:
 
     def write(self, event: str, **payload: Any) -> None:
         record = {
-            "ts": time.time(),
-            "time": datetime.now(timezone.utc).isoformat(),
             "event": event,
             **payload,
         }

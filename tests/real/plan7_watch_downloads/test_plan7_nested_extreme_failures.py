@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tests.display_history import records as display_records
+
 import time
 import zipfile
 from pathlib import Path
@@ -213,7 +215,7 @@ def test_plan7_nested_inner_missing_volume_watch_suspends_promoted_input(
         arrive_slowly(harness, outer)
         result = _settle_watch(harness)
         terminal = _terminal_toast(toast_host)
-        events = (tmp_path / label / "events.jsonl").read_text(encoding="utf-8")
+        events = {row["event"] for row in display_records((tmp_path / label / "events.json"))}
         missing_volume_reported = result.failed == 1 and any(
             entry.status == "suspended_missing_volume"
             and Path(entry.path).name == "nested-inner-split.7z.001"
@@ -223,8 +225,8 @@ def test_plan7_nested_inner_missing_volume_watch_suspends_promoted_input(
             "case": "nested_outer_plain_inner_missing_volume_watch",
             "result": result.__dict__,
             "state_entries": list(harness.watcher.state.entries),
-            "failed_terminal_logged": '"event":"failed_terminal"' in events,
-            "suspended_missing_volume_logged": '"event":"suspended_missing_volume"' in events,
+            "failed_terminal_logged": "failed_terminal" in events,
+            "suspended_missing_volume_logged": "suspended_missing_volume" in events,
             "missing_volume_reported": missing_volume_reported,
             "toast_kind": terminal.kind.value if terminal is not None else "",
         })
@@ -235,8 +237,8 @@ def test_plan7_nested_inner_missing_volume_watch_suspends_promoted_input(
         assert entries[0].failure_kind == FailureKind.MISSING_VOLUME.value
         assert (entries[0].failure_payload or {}).get("blockers") == ["missing_volume"]
         assert Path(entries[0].path).parent == harness.watch_root
-        assert '"event":"suspended_missing_volume"' in events
-        assert '"event":"failed_terminal"' not in events
+        assert "suspended_missing_volume" in events
+        assert "failed_terminal" not in events
         assert terminal is None
     finally:
         toast.stop()

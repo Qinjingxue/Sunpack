@@ -197,7 +197,7 @@ def test_cli_nested_disguised_split_groups_keep_failure_classifications(tmp_path
         assert closed.returncode == 0, closed.stdout + closed.stderr
         if server is not None:
             server.wait(timeout=15)
-        for suffix in (".state", ".state.events.jsonl", ".state.lock"):
+        for suffix in (".state", ".state.events.json", ".state.lock"):
             (root / f"runtime-{runtime_id}{suffix}").unlink(missing_ok=True)
     plan_error.update(stdout=result.stdout, stderr=result.stderr)
     assert result.returncode == 1, result.stdout + result.stderr

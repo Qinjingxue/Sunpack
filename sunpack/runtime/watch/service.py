@@ -422,7 +422,7 @@ class WatchService:
         self._reload_lock = asyncio.Lock()
         self._configuration_tasks: set[asyncio.Task] = set()
         self._startup_error: BaseException | None = None
-        self.log = WatchLogStore(os.path.join(self.state_dir, "events.jsonl"))
+        self.log = WatchLogStore(os.path.join(self.state_dir, "events.json"), retention_days=self.config["watch"]["event_log_retention_days"])
 
     @property
     def roots(self) -> list[str]:
@@ -973,7 +973,7 @@ class WatchService:
         self.service_config = new_service_config
         self.state_dir = new_state_dir
         if plan.state_dir_changed:
-            self.log = WatchLogStore(os.path.join(new_state_dir, "events.jsonl"))
+            self.log = WatchLogStore(os.path.join(new_state_dir, "events.json"), retention_days=new_config["watch"]["event_log_retention_days"])
         try:
             if plan.restart_scheduler:
                 await self._start_scheduler()
@@ -981,7 +981,7 @@ class WatchService:
                 await self._scan_pending_roots()
             if plan.reconcile_tray:
                 self._reconcile_tray()
-            if plan.runtime_process_mode_changed and self.config_applied_callback is not None:
+            if self.config_applied_callback is not None:
                 await self.config_applied_callback(self.config)
         except Exception as exc:
             failed_log = self.log

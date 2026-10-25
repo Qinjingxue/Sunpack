@@ -1,6 +1,7 @@
 use pyo3::prelude::*;
 
 mod analysis_native;
+mod collections;
 mod event_log;
 mod fast_hash;
 mod filesystem;

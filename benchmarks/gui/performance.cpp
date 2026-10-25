@@ -1,5 +1,7 @@
 #include "application.hpp"
 #include "presentation.hpp"
+#include "lz4.h"
+#include <array>
 #include "gui_perf_defaults.h"
 #include <ui/ui_context.h>
 #include <ui/ui_window.h>
@@ -265,14 +267,36 @@ std::wstring row_status_text(Application& app,const std::string& row_id) {
     walk(row);
     return found?*found:std::wstring{};
 }
+// Fixture producer only; the shipping GUI exposes no log-writing API.
 void append_log_lines(const fs::path& path,const std::string& text) {
-    Handle file(CreateFileW(path.c_str(),FILE_APPEND_DATA,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
-        nullptr,OPEN_ALWAYS,FILE_ATTRIBUTE_NORMAL,nullptr));
-    if(file.value==INVALID_HANDLE_VALUE) win_error("opAppendLog");
-    DWORD written=0;
-    if(!WriteFile(file,text.data(),DWORD(text.size()),&written,nullptr) || written!=text.size())
-        win_error("opAppendLog");
+    auto folder=path.parent_path()/(path.filename().wstring()+L".store"); fs::create_directories(folder);
+    Json manifest=fs::exists(path)?read_json(path):Json{{"format",1},{"revision",0},{"task_revision",0},{"runs",Json::array()},{"live",nullptr},{"dropped",0}};
+    if(manifest["runs"].empty()) manifest["runs"].push_back({{"name","fixture-1"},{"head",0},{"count",0},{"unordered",false}});
+    auto& run=manifest["runs"].back(); auto name=run["name"].get<std::string>();
+    std::ofstream data(folder/(name+".data"),std::ios::binary|std::ios::app),index(folder/(name+".index"),std::ios::binary|std::ios::app);
+    size_t at=0;
+    while(at<text.size()) {
+        auto end=text.find('\n',at); if(end==std::string::npos) end=text.size();
+        if(end==at) { at=end+1; continue; }
+        auto row=Json::parse(text.substr(at,end-at)); at=end+1;
+        if(!row.contains("task_id")) row["task_id"]=utf8(path_key(wide(row.value("path",std::string()))));
+        auto raw=Json::to_msgpack(row); std::vector<char> compressed(size_t(LZ4_compressBound(int(raw.size()))));
+        auto size=LZ4_compress_default(reinterpret_cast<const char*>(raw.data()),compressed.data(),int(raw.size()),int(compressed.size()));
+        std::array<char,64> entry{}; auto time=int64_t(row.value("ts",0.0)*1000000); auto offset=uint64_t(data.tellp());
+        uint32_t length=uint32_t(size),raw_size=uint32_t(raw.size()),kind=1;
+        auto event=row.value("event",std::string());
+        if(event=="done") kind=4; else if(event=="failed_terminal") kind=5;
+        else if(event=="failed_password") kind=2; else if(event=="suspended_missing_volume") kind=3;
+        memcpy(entry.data(),&time,8); memcpy(entry.data()+8,&offset,8); memcpy(entry.data()+16,&length,4);
+        memcpy(entry.data()+20,&raw_size,4); memcpy(entry.data()+24,&kind,4); memset(entry.data()+32,255,32);
+        data.write(compressed.data(),size); index.write(entry.data(),64);
+        run["count"]=run["count"].get<uint64_t>()+1;
+    }
+    data.close(); index.close();
+    manifest["revision"]=manifest["revision"].get<uint64_t>()+1; manifest["task_revision"]=manifest["revision"];
+    atomic_write(path,manifest.dump());
 }
+
 void click(Application& app,const char* id) {
     auto* w=widget(app,id); if(!w) throw std::runtime_error(std::string("Missing widget: ")+id);
     const auto r=w->rect;
@@ -424,18 +448,14 @@ void seed(const fs::path& dir,const RunOptions& o) {
             {"output_dirs",Json::array({"."})}};
         log+=row.dump()+"\n";
     }
-    write_utf8(dir/".sunpack_watch"/"events.jsonl",log);
-    // Grow event history independently of the number of distinct task cards.
-    // Stream latency after startup should depend on the appended tail, not
-    // on how many old events already occupy the file.
+    append_log_lines(dir/".sunpack_watch"/"events.json",log);
+    // Retained executions are independent disk rows; the GUI loads one page.
     if(o.log_history_events && o.tasks) {
-        const auto line=Json{{"event","done"},{"path",utf8((monitored/"task-00000000.zip").wstring())},{"ts",1}}.dump()+"\n";
         std::string chunk;
         for(size_t i=0;i<o.log_history_events;++i) {
-            chunk+=line;
-            if(chunk.size()>=65536 || i+1==o.log_history_events) {
-                append_log_lines(dir/".sunpack_watch"/"events.jsonl",chunk); chunk.clear();
-            }
+            chunk+=Json{{"event","done"},{"path",utf8((monitored/("history-"+std::to_string(i)+".zip")).wstring())},
+                {"ts",double(o.tasks+i+1)}}.dump()+"\n";
+            if(chunk.size()>=65536 || i+1==o.log_history_events) { append_log_lines(dir/".sunpack_watch"/"events.json",chunk); chunk.clear(); }
         }
     }
     Json passwords=Json::array(),history=Json::array();
@@ -475,7 +495,7 @@ int wmain(int argc,wchar_t** argv) {
             });
             report["open_to_ready_ms"]=now_ms()-open_start;
             report["memory_mib_after_data"]=double(working_set())/1048576.0;
-            ensure(page_state(app.page(),"tasks").value("total",0)==options.tasks,"initial task count");
+            ensure(page_state(app.page(),"tasks").value("total",0)==std::min<size_t>(100,options.tasks+(options.tasks?options.log_history_events:0)),"initial task count");
             ensure(page_state(app.page(),"passwords").value("total",0)==options.passwords,"initial password count");
             report["widgets_after_load"]=widget_count(app);
             ui_window_set_size(app.window(),1120,720); ui_window_relayout(app.window());
@@ -504,7 +524,7 @@ int wmain(int argc,wchar_t** argv) {
                 std::string text(raw); ui_page_free(raw); return text;
             };
             auto tasks_text=state_text("tasks"), passwords_text=state_text("passwords");
-            measure("state_query_tasks",[&]{ensure(page_state(app.page(),"tasks").value("total",0)==options.tasks,"task state query");});
+            measure("state_query_tasks",[&]{ensure(page_state(app.page(),"tasks").value("total",0)==std::min<size_t>(100,options.tasks+(options.tasks?options.log_history_events:0)),"task state query");});
             measure("state_apply_tasks",[&]{ensure(ui_page_set_json(app.page(),"tasks",tasks_text.c_str())==0,"task state apply");});
             measure("state_apply_tasks_commit",[&]{pump_messages();});
             measure("state_query_passwords",[&]{ensure(page_state(app.page(),"passwords").value("total",0)==options.passwords,"password state query");});
@@ -680,14 +700,14 @@ int wmain(int argc,wchar_t** argv) {
             if(task_scroll_top) { ui_debug_scroll_set(task_scroll_top,0); ui_widget_destroy(task_scroll_top); ui_window_relayout(app.window()); }
             pump_messages(); wait_settled(app);
             auto task_snapshot=page_state(app.page(),"tasks");
-            ensure(task_snapshot["rows"].size()==options.tasks,"task rows before log updates");
+            ensure(task_snapshot["rows"].size()==std::min<size_t>(100,options.tasks+(options.tasks?options.log_history_events:0)),"task rows before log updates");
             std::vector<std::string> log_paths,log_ids;
             for(size_t i=0;i<std::min<size_t>(40,task_snapshot["rows"].size());++i) {
                 log_paths.push_back(task_snapshot["rows"][i]["path"].get<std::string>());
                 log_ids.push_back(task_snapshot["rows"][i]["id"].get<std::string>());
             }
             ensure(widget(app,("task-"+log_ids[0]).c_str()),"target task row not mounted");
-            const auto benchmark_log=dir/".sunpack_watch"/"events.jsonl";
+            const auto benchmark_log=dir/".sunpack_watch"/"events.json";
             report["log_history_events"]=options.log_history_events;
             report["log_bytes_before_updates"]=fs::file_size(benchmark_log);
             double log_stamp=1e7;
@@ -697,7 +717,7 @@ int wmain(int argc,wchar_t** argv) {
                 return event.dump()+"\n";
             };
             auto status_text=[](const char* key){return wide(tr(key,"en"));};
-            // One event: worker refresh + one-row delta + one mounted row rebind.
+            // One event: index refresh + bounded page read + mounted row rebind.
             measure("log_update_single",[&]{
                 append_log_lines(benchmark_log,log_line("processing_started",log_paths[0],log_stamp+=1));
                 wait_for([&]{return row_status_text(app,log_ids[0])==status_text("taskProcessing");},
@@ -762,7 +782,7 @@ int wmain(int argc,wchar_t** argv) {
                 wait_for([&]{return page_state(app.page(),"tasks").value("total",0)==1;},"task search result");
             });
             ui_debug_key_mod(app.window(),'A',1,0,0); ui_debug_type_char(app.window(),8);
-            wait_for([&]{return page_state(app.page(),"tasks").value("total",0)==options.tasks;},"clear task search");
+            wait_for([&]{return page_state(app.page(),"tasks").value("total",0)==std::min<size_t>(100,options.tasks+(options.tasks?options.log_history_events:0));},"clear task search");
             wait_settled(app);
             report["widgets_after_ui"]=widget_count(app);
             for(size_t i=0;i<5;i++) { nav("tabConfig","config","page_switch_end"); nav("tabTasks","tasks","page_switch_end"); }
@@ -794,37 +814,21 @@ int wmain(int argc,wchar_t** argv) {
         auto backend_config_text=read_file(dir/"sunpack_config.json");
         auto backend_roots=read_roots(dir/"sunpack_watch_roots.txt");
         auto backend_passwords=read_json(dir/"builtin_passwords.json");
-        EventLog backend_log; backend_log.set_path(dir/".sunpack_watch"/"events.jsonl");
+        EventLog backend_log; backend_log.set_path(dir/".sunpack_watch"/"events.json");
         measure("model_log_refresh",[&]{
             ensure(backend_log.refresh(true),"event log refresh failed");
-            ensure(backend_log.tasks.size()==options.tasks,"event log task count");
+            ensure(backend_log.tasks.empty(),"history must stay on disk");
         });
         View backend_view;
-        TaskProjectionStats cold_phases, warm_phases, reused_phases;
-        std::vector<std::wstring> baseline_ids, repeated_ids;
-        measure("model_task_rows",[&]{
-            ensure(task_rows(backend_log,backend_roots,backend_view,"en",&baseline_ids,nullptr,&cold_phases).value("total",0)==options.tasks,"task projection count");
-        });
-        measure("model_task_rows_warm",[&]{
-            ensure(task_rows(backend_log,backend_roots,backend_view,"en",nullptr,nullptr,&warm_phases).value("total",0)==options.tasks,"warm task projection count");
-        });
-        measure("model_task_rows_unchanged",[&]{
-            ensure(task_rows(backend_log,backend_roots,backend_view,"en",&repeated_ids,&baseline_ids,&reused_phases).is_null(),"same selection must reuse UI state");
-        });
-        report["model_task_rows_phases"]={
-            {"cold",{{"filter_ms",cold_phases.filter_ms},{"sort_ms",cold_phases.sort_ms},{"project_ms",cold_phases.project_ms}}},
-            {"warm",{{"filter_ms",warm_phases.filter_ms},{"sort_ms",warm_phases.sort_ms},{"project_ms",warm_phases.project_ms}}},
-            {"unchanged",{{"filter_ms",reused_phases.filter_ms},{"sort_ms",reused_phases.sort_ms},{"project_ms",reused_phases.project_ms}}}
-        };
-        // Live bytes held by the per-task lazy display cache, so a projection
-        // speedup can be weighed against the memory it retains.
-        size_t display_cache_bytes=0;
-        for(auto& entry:backend_log.tasks) {
-            const auto& cache=entry.second.display;
-            display_cache_bytes+=cache.path.capacity()+cache.directory.capacity()+
-                cache.filename.capacity()+cache.time.capacity();
+        Json first_page;
+        measure("model_task_rows",[&]{ first_page=task_rows(backend_log,backend_roots,backend_view,"en"); });
+        measure("model_task_rows_warm",[&]{ (void)task_rows(backend_log,backend_roots,backend_view,"en"); });
+        if(first_page.value("hasMore",false)) {
+            backend_view.task_cursor=first_page["next"].get<std::string>();
+            measure("model_task_rows_next_page",[&]{ (void)task_rows(backend_log,backend_roots,backend_view,"en"); });
+            backend_view.task_cursor.clear();
         }
-        report["task_display_cache_bytes"]=display_cache_bytes;
+        report["task_display_cache_bytes"]=0; // No resident all-history model.
         measure("model_password_rows",[&]{
             ensure(password_rows(backend_passwords,backend_view,"en").value("total",0)==options.passwords,"password projection count");
         });

@@ -21,7 +21,13 @@ build = [
     "maturin>=1.8,<2",
     "cmake>=3.25",
 ]
-test = ["pytest>=9", "pytest-xdist>=3.8", "zstandard>=0.22.0"]
+test = [
+    "lz4>=4.4.5",
+    "msgpack>=1.2.3",
+    "pytest>=9",
+    "pytest-xdist>=3.8",
+    "zstandard>=0.22.0",
+]
 dev = [
     "nuitka>=2",
     "maturin>=1.8,<2",
@@ -29,6 +35,8 @@ dev = [
     "pytest>=9",
     "pytest-xdist>=3.8",
     "zstandard>=0.22.0",
+    "lz4>=4.4.5",
+    "msgpack>=1.2.3",
 ]
 
 [project.scripts]

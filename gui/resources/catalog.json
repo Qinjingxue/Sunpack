@@ -762,6 +762,22 @@
     "noTags": {
       "zh": "暂无条目",
       "en": "No tags yet"
+    },
+    "taskNext": {
+      "zh": "下一页",
+      "en": "Next"
+    },
+    "taskPrevious": {
+      "zh": "上一页",
+      "en": "Previous"
+    },
+    "taskLatest": {
+      "zh": "最新",
+      "en": "Latest"
+    },
+    "droppedLogs": {
+      "zh": "条日志因写入积压未保存",
+      "en": "log entries dropped during write overload"
     }
   },
   "groups": {
@@ -993,7 +1009,6 @@
         "en": "Flatten single subfolder"
       }
     },
-
     "/filesystem/scan_filters_enabled": {
       "label": {
         "zh": "扫描筛选器整体开关",
@@ -1901,6 +1916,14 @@
         "zh": "按内容识别格式，支持伪装扩展名和分卷",
         "en": "Identify formats by content, including disguised extensions and split volumes"
       }
+    },
+    "/watch/event_log_retention_days": {
+      "label": {
+        "zh": "日志保留天数",
+        "en": "Log retention (days)"
+      },
+      "min": 1,
+      "integer": true
     }
   },
   "modules": {

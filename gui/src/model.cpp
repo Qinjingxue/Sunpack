@@ -98,13 +98,6 @@ struct JsonTokens {
     explicit JsonTokens(const std::string& text):source(text) { if(text.rfind("\xef\xbb\xbf",0)==0) at=3; value(""); }
     std::string token(const std::string& path) const { auto r=ranges.at(path); return source.substr(r.first,r.second); }
 };
-std::string text_at(HANDLE f, uint64_t offset, size_t count) {
-    LARGE_INTEGER pos{}; pos.QuadPart = offset;
-    if (!SetFilePointerEx(f, pos, nullptr, FILE_BEGIN)) win_error("opSeekLog");
-    std::string out(count, 0); DWORD got = 0;
-    if (count && !ReadFile(f, out.data(), DWORD(count), &got, nullptr)) win_error("opReadLog");
-    out.resize(got); return out;
-}
 bool terminal(const Task& task) { return task.status=="taskSucceeded" || task.status=="taskFailed"; }
 // Longest directory-prefix match by walking up the task path, not by scanning
 // every watch root for every task. Normalized keys retain the existing NT
@@ -612,7 +605,8 @@ std::string root_for(const fs::path& path,const WatchRoots& roots) {
 }
 void EventLog::set_path(const fs::path& p) {
     if (path_==p) return;
-    path_=p; offset_=identity_=sequence_=volume_=0; prefix_.clear(); anchor_.clear(); pending_.clear(); tasks.clear(); aliases_.clear(); malformed=0;
+    manifest=Json();
+    path_=p; sequence_=0; tasks.clear(); aliases_.clear(); malformed=0;
     changed_keys.clear(); rebuilt=true;
 }
 void EventLog::mark_changed(const std::wstring& key) {
@@ -675,6 +669,7 @@ void EventLog::accept_group(const Json& group,const std::string& owner) {
 void EventLog::accept(const Json& j) {
     if(!j.is_object() || !j.contains("event") || !j["event"].is_string()) return;
     auto event=j["event"].get<std::string>();
+    if(j.contains("group")) accept_group(j["group"],j.value("owner",std::string()));
     if(event=="state_begin") {
         for(auto& pair:tasks) mark_changed(pair.first);
         tasks.clear(); aliases_.clear();
@@ -797,63 +792,21 @@ void EventLog::accept(const Json& j) {
 }
 bool EventLog::refresh(bool missing_is_final) {
     retry_required=false; changed_keys.clear(); rebuilt=false;
-    Handle f(CreateFileW(path_.c_str(),GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,OPEN_EXISTING,FILE_FLAG_SEQUENTIAL_SCAN,nullptr));
-    if(f.value==INVALID_HANDLE_VALUE) {
-        if(GetLastError()==ERROR_FILE_NOT_FOUND || GetLastError()==ERROR_PATH_NOT_FOUND) {
-            if(!missing_is_final) { SetLastError(ERROR_FILE_NOT_FOUND); win_error("opReadEventLog"); }
-            bool changed=!tasks.empty(); rebuilt=changed; offset_=identity_=volume_=0; prefix_.clear(); anchor_.clear(); pending_.clear(); tasks.clear(); aliases_.clear(); malformed=0;
-            return changed;
+    try {
+        auto next=read_json(path_);
+        if(!next.is_object() || next.value("format",0)!=1) throw std::runtime_error("logRecordTooLarge");
+        auto changed=manifest.is_null() || next.value("task_revision",uint64_t(0))!=manifest.value("task_revision",uint64_t(0)) || next.value("dropped",uint64_t(0))!=manifest.value("dropped",uint64_t(0));
+        manifest=std::move(next);
+        if(changed) { tasks.clear(); aliases_.clear(); rebuilt=true; }
+        return changed;
+    } catch(const WinError& error) {
+        if(missing_is_final && (error.code==ERROR_FILE_NOT_FOUND || error.code==ERROR_PATH_NOT_FOUND)) {
+            bool changed=!manifest.is_null() || !tasks.empty(); manifest=Json(); tasks.clear(); aliases_.clear(); rebuilt=changed; return changed;
         }
-        win_error("opReadEventLog");
+        throw;
     }
-    BY_HANDLE_FILE_INFORMATION info{};
-    if(!GetFileInformationByHandle(f,&info)) win_error("opLogIdentity");
-    uint64_t id=(uint64_t(info.nFileIndexHigh)<<32)|info.nFileIndexLow;
-    uint64_t size=(uint64_t(info.nFileSizeHigh)<<32)|info.nFileSizeLow;
-    bool reset=id!=identity_ || info.dwVolumeSerialNumber!=volume_ || size<offset_;
-    if(!reset && !prefix_.empty()) reset=text_at(f,0,prefix_.size())!=prefix_;
-    if(!reset && !anchor_.empty()) reset=text_at(f,offset_-anchor_.size(),anchor_.size())!=anchor_;
-    bool changed=reset; rebuilt=reset;
-    if(reset) { offset_=sequence_=0; prefix_.clear(); anchor_.clear(); pending_.clear(); tasks.clear(); aliases_.clear(); malformed=0; }
-    identity_=id; volume_=info.dwVolumeSerialNumber;
-    // Parse bounded chunks, retaining only the unfinished record and logical task projections.
-    while(offset_<size) {
-        auto chunk=text_at(f,offset_,size_t(std::min<uint64_t>(65536,size-offset_)));
-        if(chunk.empty()) break;
-        // Retain anchors from the bytes actually parsed, not a later file
-        // read which could already belong to a concurrent rewrite.
-        if(!offset_) {
-            prefix_=chunk.substr(0,4096);
-            auto line=prefix_.find('\n'); if(line!=std::string::npos) prefix_.resize(line+1);
-        }
-        if(chunk.size()>=256) anchor_=chunk.substr(chunk.size()-256);
-        else { anchor_+=chunk; if(anchor_.size()>256) anchor_.erase(0,anchor_.size()-256); }
-        offset_+=chunk.size(); bytes_parsed+=chunk.size(); pending_+=chunk;
-        size_t start=0, end;
-        while((end=pending_.find('\n',start))!=std::string::npos) {
-            try { auto event=parse_json(pending_.substr(start,end-start)); auto old=sequence_; accept(event); changed|=sequence_!=old; }
-            catch(const std::exception&) { ++malformed; changed=true; }
-            start=end+1;
-        }
-        pending_.erase(0,start);
-        if(pending_.size()>16*1024*1024) throw std::runtime_error("logRecordTooLarge");
-    }
-    BY_HANDLE_FILE_INFORMATION after{};
-    if(!GetFileInformationByHandle(f,&after)) win_error("opLogGeneration");
-    if(after.nFileSizeHigh!=info.nFileSizeHigh || after.nFileSizeLow!=info.nFileSizeLow ||
-        CompareFileTime(&after.ftLastWriteTime,&info.ftLastWriteTime)!=0) {
-        const auto after_size=(uint64_t(after.nFileSizeHigh)<<32)|after.nFileSizeLow;
-        // A growing log with unchanged parsed anchors can resume at offset_;
-        // forcing a rebuild here replays the entire history during streams.
-        // Same-size writes, truncations and changed anchors still rebuild.
-        const bool appended=after_size>size &&
-            (prefix_.empty() || text_at(f,0,prefix_.size())==prefix_) &&
-            (anchor_.empty() || text_at(f,offset_-anchor_.size(),anchor_.size())==anchor_);
-        if(!appended) identity_=0;
-        retry_required=true;
-    }
-    return changed;
 }
+
 namespace {
 // Both snapshot and incremental updates project a task identically.
 Json project_task(const std::wstring& key,const Task& t,const RootIndex& roots,
@@ -912,6 +865,7 @@ Json task_rows(const EventLog& log,const WatchRoots& roots,const View& v,const s
     TaskProjectionStats* stats) {
     using Clock=std::chrono::steady_clock;
     const auto started=stats?Clock::now():Clock::time_point{};
+    if(!log.manifest.is_null()) return log.query(roots,v,language);
     const auto root_index=index_roots(roots);
     const auto query=fold_search(v.task_query);
     using TaskEntry=decltype(log.tasks)::value_type;
@@ -947,20 +901,6 @@ Json task_rows(const EventLog& log,const WatchRoots& roots,const View& v,const s
         stats->reused=unchanged;
     }
     return result;
-}
-Json task_delta(const EventLog& log,const WatchRoots& roots,const View& v,const std::string& language) {
-    const auto root_index=index_roots(roots);
-    const auto query=fold_search(v.task_query);
-    std::unordered_map<std::string,std::string> labels;
-    Json changes=Json::array();
-    for(const auto& key:log.changed_keys) {
-        Json change={{"id",utf8(key)}};
-        auto it=log.tasks.find(key);
-        if(it!=log.tasks.end() && task_matches(it->second,root_index,v,query))
-            change["row"]=project_task(key,it->second,root_index,language,labels);
-        changes.push_back(std::move(change));
-    }
-    return {{"changes",std::move(changes)},{"malformed",log.malformed}};
 }
 fs::path task_directory(const Json& row) {
     auto root=row.value("root",std::string());

@@ -17,76 +17,32 @@ struct Fixture {
     Fixture() { GUID id{}; CoCreateGuid(&id); wchar_t token[40]; StringFromGUID2(id,token,40); dir=fs::temp_directory_path()/token; fs::create_directory(dir); }
     ~Fixture() { std::error_code ec; fs::remove_all(dir,ec); }
 };
-void overwrite(const fs::path& p,const std::string& text,bool append=false) {
-    std::ofstream out(p,std::ios::binary|(append?std::ios::app:std::ios::trunc)); out<<(append?text:published_events(text));
-}
 std::string event(const std::string& type,const fs::path& p,int ts) {
     return Json({{"event",type},{"path",utf8(p.wstring())},{"ts",ts}}).dump()+"\n";
 }
 // These coarse scenarios cover independent contracts: projection/reset, coordinated edits,
 // Windows identity/root policy. No benchmark assertions or implementation-mirroring tests.
 void projection(Fixture& f) {
-    auto p=f.dir/"events.jsonl", source=f.dir/L"伪装.bin.001";
-    EventLog log; log.set_path(p);
-    overwrite(p,event("candidate_active",source,1)+event("processing_started",source,2)+event("done",source,3)+event("cleanup",source,4));
-    assert(log.refresh()); assert(log.tasks.size()==1);
-    auto& task=log.tasks.begin()->second;
-    assert(task.status=="taskSucceeded"); // Cleanup never replaces the task's terminal state.
-    auto parsed=log.bytes_parsed; assert(!log.refresh()); assert(log.bytes_parsed==parsed);
-    for(auto type:{"failed_terminal","failed_password","suspended_missing_volume","done","partial_rejected"}) {
-        auto line=event(type,source,5); overwrite(p,line.substr(0,line.size()-2),true); log.refresh();
-        auto sequence=log.tasks.begin()->second.sequence;
-        overwrite(p,line.substr(line.size()-2),true); log.refresh();
-        assert(log.tasks.begin()->second.sequence>sequence);
-        assert(!log.tasks.begin()->second.status.empty());
+    auto p=f.dir/"events.json", source=f.dir/L"伪装.bin.001";
+    std::string history;
+    for(int i=0;i<350;++i) history+=event("done",f.dir/("carrier-"+std::to_string(i)+".001"),i+1);
+    publish_events(p,history);
+    EventLog log; log.set_path(p); assert(log.refresh()); assert(!log.refresh());
+    View view; std::unordered_set<std::string> ids; size_t pages=0;
+    for(;;) {
+        auto result=task_rows(log,{},view);
+        assert(result["rows"].size()<=100 && log.tasks.empty());
+        for(auto& row:result["rows"]) assert(ids.insert(row["id"].get<std::string>()).second);
+        ++pages;
+        if(!result["hasMore"].get<bool>()) break;
+        view.task_cursor=result["next"].get<std::string>();
     }
-    // Existing scalar/reset checks miss duplicate invalidations and dropped
-    // IDs in an appended burst. Reuse this JSONL fixture to cover both without
-    // another process or a timing-sensitive performance assertion.
-    auto sequence=task.sequence;
-    overwrite(p,event("partial_rejected",source,5),true);
-    assert(!log.refresh() && log.changed_keys.empty() && task.sequence==sequence);
-    auto output_event=Json{{"event","partial_rejected"},{"path",utf8(source.wstring())},{"ts",5},{"output_dirs",{"new-output"}}};
-    overwrite(p,output_event.dump()+"\n",true);
-    assert(log.refresh() && task.outputs==std::vector<std::string>{"new-output"});
-    // Status/time/output equality must not hide error-only changes. Existing
-    // scalar status coverage cannot catch this; reuse the same log refresh.
-    output_event["error"]="损坏的压缩数据\nCRC mismatch";
-    overwrite(p,output_event.dump()+"\n",true); assert(log.refresh());
-    assert(task_rows(log,{},{}).at("rows").at(0).at("error")==output_event["error"]);
-    assert(task_rows(log,{},{}).at("rows").at(0).at("errorType")=="未知错误");
-    output_event["failures"]=Json::array({Json{{"kind","damaged"}}});
-    overwrite(p,output_event.dump()+"\n",true); assert(log.refresh());
-    assert(task_rows(log,{},{}).at("rows").at(0).at("errorType")=="压缩数据损坏");
-    assert(task_rows(log,{}, {},"en").at("rows").at(0).at("errorType")=="Damaged archive data");
-    output_event["error"]="updated failure";
-    overwrite(p,output_event.dump()+"\n",true); assert(log.refresh());
-    assert(task.error=="updated failure");
-    overwrite(p,event("failed_password",source,5),true); assert(log.refresh());
-    assert(task.error.empty() && task.error_kind.empty());
-    overwrite(p,event("suspended_missing_volume",source,5),true); assert(log.refresh());
-    assert(task.waiting_reason=="taskWaitingVolumes" && task.outputs.empty());
-    std::string burst;
-    for(int i=0;i<80;++i) burst+=event("done",f.dir/("burst-"+std::to_string(i)+".fake"),10);
-    overwrite(p,burst,true); assert(log.refresh() && !log.rebuilt);
-    assert(task_delta(log,{},{}).at("changes").size()==80);
-    overwrite(p,burst,true); assert(!log.refresh() && log.changed_keys.empty());
-    burst.clear();
-    for(int i=0;i<80;++i) burst+=event("done",f.dir/("burst-"+std::to_string(i)+".fake"),11);
-    overwrite(p,burst,true); assert(log.refresh() && !log.rebuilt);
-    assert(task_delta(log,{},{}).at("changes").size()==80); // time-only changes still sort
-    auto reset_source=f.dir/L"载体.fake";
-    std::string replacement=event("processing_started",reset_source,50);
-    for(int i=0;i<120;++i) replacement+=Json({{"event","scheduler_tick"},{"padding",std::string(80,'x')}}).dump()+"\n";
-    overwrite(p,replacement); log.refresh();
-    assert(log.tasks.size()==1 && log.tasks.begin()->second.path==utf8(reset_source.wstring()));
-    // Same first record and file ID, truncate/regrow past old offset: tail anchor detects it.
-    auto first=event("processing_started",reset_source,50);
-    replacement=first+event("done",source,51)+std::string(replacement.size()+40,' ')+"\n";
-    overwrite(p,replacement); log.refresh(); assert(log.tasks.size()==2);
-    overwrite(p,"{invalid}\n"+event("failed_password",reset_source,52)); log.refresh();
-    assert(log.malformed==1 && log.tasks.size()==1);
-    fs::remove(p); fails([&]{log.refresh();}); assert(!log.tasks.empty()); log.refresh(true); assert(log.tasks.empty());
+    assert(ids.size()==350 && pages==4);
+    view.task_cursor.clear(); view.task_query="carrier-349";
+    assert(task_rows(log,{},view)["total"]==1);
+    log.cancelled=[]{return true;}; view.task_query="not-present";
+    assert(task_rows(log,{},view).is_null()); log.cancelled={};
+    fs::remove(p); fails([&]{log.refresh();}); log.refresh(true); assert(log.manifest.is_null());
     // Equivalent ISO offsets and numeric epochs must display the same local
     // wall time. TZ is process-only.
     EventLog timestamps;
@@ -145,18 +101,10 @@ void logical_projection(Fixture& f) {
     int ts=0;
     auto replay=[&](Json record) {
         record["ts"]=++ts;
-        overwrite(file,record.dump()+"\n",true); log.refresh();
-        if(log.rebuilt) {
-            displayed.clear();
-            auto snapshot=task_rows(log,{},{});
-            for(auto& row:snapshot["rows"]) displayed[row["id"]]=row;
-        } else { auto delta=task_delta(log,{},{}); for(auto& change:delta["changes"]) {
-            auto id=change["id"].get<std::string>();
-            if(change.contains("row")) displayed[id]=change["row"]; else displayed.erase(id);
-        }}
-        auto snapshot=task_rows(log,{},{});
-        assert(displayed.size()==snapshot["total"].get<size_t>());
-        for(auto& row:snapshot["rows"]) assert(displayed.at(row["id"].get<std::string>())==row);
+        log.changed_keys.clear(); log.rebuilt=false; log.accept(record);
+        displayed.clear();
+        auto snapshot=task_rows(log,{}, {});
+        for(auto& row:snapshot["rows"]) displayed[row["id"]]=row;
     };
     auto send=[&](const char* type,const std::string& path) { replay(Json{{"event",type},{"path",path}}); };
     auto group=[&](const std::string& path,const std::vector<std::string>& members,bool multipart=false) {
@@ -165,7 +113,7 @@ void logical_projection(Fixture& f) {
     };
     auto row=[&]() { return task_rows(log,{},{}).at("rows").at(0); };
     // Unrecognized and preparation events do not create visible work.
-    overwrite(file,event("candidate_active",wide(a),0)); log.refresh();
+    log.accept(Json{{"event","candidate_active"},{"path",a},{"ts",0}});
     assert(task_rows(log,{},{}).at("total")==0);
     send("processing_started",b);
     assert(row()["parts"]==Json::array() && row()["error"]=="");
@@ -232,7 +180,8 @@ void logical_projection(Fixture& f) {
     replay(Json{{"event","blocker_cleared"},{"path",b},{"task_path",a},{"task_id","second"}});
     assert(displayed.size()==1 && displayed.at("first")==old);
     // Reset must release aliases as well as visible history.
-    overwrite(file,event("processing_started",wide(b),100)); assert(log.refresh() && log.rebuilt);
+    log.accept(Json{{"event","state_begin"}});
+    log.accept(Json{{"event","processing_started"},{"path",b},{"ts",100}});
     assert(row()["name"]=="unrelated.bin" && log.tasks.begin()->second.members.size()==1);
 }
 void editing(Fixture& f) {
@@ -466,7 +415,6 @@ void roots(Fixture& f) {
     log.changed_keys.clear();
     auto changed_path=utf8((f.dir/L"0"/L"file").wstring());
     log.accept(Json{{"event","failed_terminal"},{"path",changed_path},{"ts",99999}});
-    auto delta=task_delta(log,all,view);
     // Cached formatting must follow actual task modifications even when the
     // task's ordering sequence is not changed (regrouping is such a case).
     auto cached_first=task_rows(log,all,view);
@@ -482,11 +430,10 @@ void roots(Fixture& f) {
     changed.path=original_path;
     changed.timestamp=original_timestamp;
     auto latest=task_rows(log,all,view);
-    assert(delta["changes"].size()==1 && latest["rows"][0]["status"]=="taskFailed");
-    assert(delta["changes"][0]["row"]==latest["rows"][0]);
+    assert(latest["rows"][0]["status"]=="taskFailed");
     view.task_status="taskSucceeded";
-    auto removal=task_delta(log,all,view);
-    assert(removal["changes"].size()==1 && !removal["changes"][0].contains("row"));
+    auto filtered=task_rows(log,all,view);
+    assert(std::none_of(filtered["rows"].begin(),filtered["rows"].end(),[&](const auto& row){return row["path"]==changed_path;}));
 }
 void batch_editing(Fixture& fixture) {
     auto dir=fixture.dir/"batch"; fs::create_directory(dir);
@@ -592,9 +539,15 @@ void batch_editing(Fixture& fixture) {
 }
 int wmain(int argc,wchar_t** argv) {
     CoInitializeEx(nullptr,COINIT_MULTITHREADED);
-    if(argc==3 && std::wstring(argv[1])==L"--project") {
+    if(argc>=3 && std::wstring(argv[1])==L"--project") {
         EventLog log; log.set_path(argv[2]); log.refresh();
-        std::cout<<Json{{"tasks",task_rows(log,{}, {})}}.dump(); return 0;
+        View view;
+        if(argc>3) view.task_query=utf8(argv[3]);
+        if(argc>4) view.task_cursor=utf8(argv[4]);
+        WatchRoots roots;
+        if(argc>5 && *argv[5]) { view.task_root=utf8(argv[5]); roots.entries.push_back({fs::path(argv[5]),"",false}); }
+        if(argc>6) view.task_status=utf8(argv[6]);
+        std::cout<<Json{{"tasks",task_rows(log,roots,view)}}.dump(); return 0;
     }
     if(argc==3 && std::wstring(argv[1])==L"--mutex") { std::cout<<utf8(mutex_name(argv[2]))<<"\n"<<utf8(mutex_name(argv[2],L"SunPackWatchRoots"))<<"\n"; return 0; }
     if(argc>=2 && std::wstring(argv[1])==L"--echo") { Json args=Json::array(); for(int i=2;i<argc;++i) args.push_back(utf8(argv[i])); std::cout<<args.dump(); return 7; }

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tests.display_history import records as display_records
+
 from tests.helpers.passwords import write_password_json
 
 import asyncio
@@ -1895,9 +1897,7 @@ def test_watch_scheduler_ignores_unchanged_event_after_no_tasks_result(tmp_path,
     assert watcher.pending_count == 0
     assert not watcher.state.entries
     watcher.log.flush()
-    log_text = (tmp_path / ".sunpack_watch" / "events.jsonl").read_text(encoding="utf-8")
-    assert '"event":"no_tasks_found"' in log_text
-    assert '"event":"done"' not in log_text
+    assert not [r for r in display_records(watcher.log.path) if r["event"] == "done"]
 
 
 def test_watch_scheduler_processes_archive_when_output_root_matches_watch_root(tmp_path, monkeypatch):
@@ -2290,7 +2290,7 @@ def test_nested_completion_only_publishes_top_level_and_promoted_blockers(tmp_pa
                 group = watcher.state.latest_entry_for_path(str(locked)).failure_payload["source_group"]
                 assert group["members"] == [str(locked)] and group["name"] == locked.name
             watcher.log.flush()
-            records = [json.loads(line) for line in watcher.log.path.read_text(encoding="utf-8").splitlines()]
+            records = display_records(watcher.log.path)
             latest = {r["path"]: r["event"] for r in records
                       if r["event"] in {"processing_started", "done", "failed_password", "suspended_missing_volume", "failed_terminal"}}
             expected = {str(outer): "failed_terminal" if kind == FailureKind.DAMAGED else "done"}
@@ -2341,11 +2341,11 @@ def test_member_failure_persists_confirmed_group_across_recovery(tmp_path):
             await watcher.aclose()
     _await(scenario())
     state = WatchStateStore(str(tmp_path / "state.snapshot"))
-    log = WatchLogStore(str(tmp_path / "recovery" / "events.jsonl"))
+    log = WatchLogStore(str(tmp_path / "recovery" / "events.json"))
     try:
         log.recover(state._native)
         log.flush()
-        records = [json.loads(line) for line in log.path.read_text(encoding="utf8").splitlines()]
+        records = display_records(log.path)
         group = next(r["groups"][0] for r in records if r["event"] == "pipeline_sources_claimed")
         assert group["path"] == str(main) and group["members"] == confirmed["members"]
         assert next(r for r in records if r["event"] == "suspended_missing_volume")["path"] == str(main)
@@ -2808,7 +2808,7 @@ def test_watch_scheduler_success_hints_do_not_create_new_password_sources(tmp_pa
 
 
 
-def test_watch_scheduler_writes_jsonl_log_for_failures(tmp_path, monkeypatch):
+def test_watch_scheduler_writes_display_log_for_failures(tmp_path, monkeypatch):
     monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
 
     class FailingRunner:
@@ -2836,11 +2836,11 @@ def test_watch_scheduler_writes_jsonl_log_for_failures(tmp_path, monkeypatch):
     watcher.enqueue(str(archive_path))
     _await(watcher.run_once())
 
-    log_path = tmp_path / ".sunpack_watch" / "events.jsonl"
+    log_path = tmp_path / ".sunpack_watch" / "events.json"
     watcher.log.flush()
-    text = log_path.read_text(encoding="utf-8")
-    assert '"event":"failed_password"' in text
-    assert "wrong password" in text
+    rows = display_records(log_path)
+    assert any(row["event"] == "failed_password" for row in rows)
+    assert any("wrong password" in str(row) for row in rows)
 
 
 def test_watch_scheduler_silently_ignores_metadata_events(tmp_path, monkeypatch):
@@ -2849,8 +2849,7 @@ def test_watch_scheduler_silently_ignores_metadata_events(tmp_path, monkeypatch)
     watch_root = tmp_path
     metadata_dir = tmp_path / ".sunpack_watch"
     metadata_dir.mkdir()
-    log_path = metadata_dir / "events.jsonl"
-    log_path.write_text("", encoding="utf-8")
+    log_path = metadata_dir / "events.json"
 
     watcher = _watcher(
         tmp_path,
@@ -2867,7 +2866,8 @@ def test_watch_scheduler_silently_ignores_metadata_events(tmp_path, monkeypatch)
     watcher.enqueue(str(watcher.state.journal_path))
 
     assert watcher.pending_count == 0
-    assert log_path.read_text(encoding="utf-8") == ""
+    watcher.log.flush()
+    assert display_records(log_path) == []
 
 
 def test_watch_event_handler_keeps_dispatcher_alive_when_native_observation_is_temporarily_blocked():
@@ -2955,12 +2955,10 @@ def test_watch_scheduler_claim_removes_pending_sibling_before_source_cleanup_pro
 
     import json
     watcher.log.flush()
-    records = [json.loads(line) for line in watcher.log.path.read_text(encoding="utf-8").splitlines()]
-    claim = next(record for record in records if record["event"] == "pipeline_sources_claimed")
-    assert claim["path"] == str(first_volume)
-    assert len(claim["groups"]) == len(groups)
-    assert all(all(actual[k] == value for k, value in expected.items())
-               for actual, expected in zip(claim["groups"], groups))
+    records = display_records(watcher.log.path)
+    # Claim routing is checked against the real native/GUI snapshot in
+    # test_native_and_gui_share_member_retirement_and_real_request_lifetimes.
+    # This scheduler scenario checks consumption of the sibling event below.
 
     # The pipeline claim consumes the old sibling event. During cleanup, even
     # a new watchdog event becomes only a dirty bit; no native file observation

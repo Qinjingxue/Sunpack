@@ -211,8 +211,8 @@ class WatchScheduler:
         self._reservations = getattr(getattr(pipeline_engine, "_services", None), "output_reservations", None)
         if self._reservations is not None:
             self._reservations.watch_outputs = self._outputs
-        log_path = Path(state_path).with_name("events.jsonl")
-        self.log = WatchLogStore(str(log_path), wake_callback=self._wake_service)
+        log_path = Path(state_path).with_name("events.json")
+        self.log = WatchLogStore(str(log_path), retention_days=watch_config["event_log_retention_days"], wake_callback=self._wake_service)
         self.state._native.attach_events(self.log._native)
         state_parent = Path(state_path).parent
         self.metadata_dir = os.path.abspath(str(state_parent)) if state_parent.name == ".sunpack_watch" else ""
@@ -2515,7 +2515,8 @@ class WatchScheduler:
         normalized = os.path.abspath(path)
         if normalized in self.metadata_files:
             return True
-        return bool(self.metadata_dir and _is_relative_to(normalized, self.metadata_dir))
+        return (_is_relative_to(normalized, os.path.abspath(str(self.log.path) + ".store"))
+                or bool(self.metadata_dir and _is_relative_to(normalized, self.metadata_dir)))
 
     def _refresh_password_sources(self) -> str:
         snapshot = self._password_file_source.reload()

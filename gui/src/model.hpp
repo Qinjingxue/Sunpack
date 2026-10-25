@@ -55,15 +55,16 @@ struct Task {
 };
 class EventLog {
     fs::path path_;
-    uint64_t offset_ = 0, identity_ = 0, sequence_ = 0;
-    DWORD volume_ = 0;
-    std::string prefix_, anchor_, pending_;
+    uint64_t sequence_ = 0;
     // Only backend-confirmed members are aliases; filenames are never inferred.
     std::unordered_map<std::wstring, std::wstring> aliases_;
     void mark_changed(const std::wstring& key);
     void erase_task(const std::wstring& key);
     void accept_group(const Json& group, const std::string& owner = {});
 public:
+    Json manifest;
+    std::function<bool()> cancelled;
+    Json query(const WatchRoots& roots, const struct View& view, const std::string& language) const;
     std::unordered_map<std::wstring, Task> tasks;
     size_t malformed = 0;
     uint64_t bytes_parsed = 0; // Diagnostic counter, never persisted.
@@ -78,6 +79,7 @@ public:
 };
 struct View {
     std::string task_query, task_root, task_status, password_query, password_scope = "@all";
+    std::string task_cursor;
 };
 struct TaskProjectionStats {
     double filter_ms = 0, sort_ms = 0, project_ms = 0;
@@ -92,7 +94,6 @@ Json task_rows(const EventLog& log, const WatchRoots& roots, const View& view,
     std::vector<std::wstring>* selected_ids = nullptr,
     const std::vector<std::wstring>* previous_ids = nullptr,
     TaskProjectionStats* stats = nullptr);
-Json task_delta(const EventLog& log, const WatchRoots& roots, const View& view, const std::string& language = "zh");
 // Resolve only on activation so removed/moved output directories fall back then.
 fs::path task_directory(const Json& row);
 Json password_rows(const Json& passwords, const View& view, const std::string& language = "zh");
