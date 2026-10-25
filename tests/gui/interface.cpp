@@ -1057,6 +1057,21 @@ void task_card_details(Application& app) {
     };
     row["parts"]=Json::array(); row["error"]=""; row["errorType"]=""; update();
     auto compact=rect(app,"task-"+id);
+    // Mount once with a missing family, then update the same card. Empty ->
+    // complete only tests initial mounting and misses stale nested loops.
+    row["parts"]=Json::array({"disguised.001"}); update();
+    auto* card=window->Root()->FindById("task-"+id);
+    auto* first=window->Root()->FindById("taskPart-"+id+"-0"); assert(first);
+    row["parts"]=Json::array({"disguised.001","unrelated.bin","late.blob"}); update();
+    assert(window->Root()->FindById("task-"+id)==card);
+    assert(window->Root()->FindById("taskPart-"+id+"-0")==first);
+    for(size_t i=0;i<row["parts"].size();++i) {
+        auto* part=dynamic_cast<ui::LabelWidget*>(window->Root()->FindById("taskPart-"+id+"-"+std::to_string(i)));
+        assert(part && part->Text()==wide(row["parts"][i].get<std::string>()));
+    }
+    row["parts"]=Json::array({"renamed.bin"}); update();
+    assert(!window->Root()->FindById("taskPart-"+id+"-1"));
+    assert(dynamic_cast<ui::LabelWidget*>(first)->Text()==L"renamed.bin");
     Json parts=Json::array();
     for(int i=1;i<=18;++i) parts.push_back("伪装-Volume-"+std::to_string(i)+".blob");
     parts[7]=std::string(220,'W')+".blob"; // Only this chip needs tail ellipsis.

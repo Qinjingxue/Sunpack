@@ -2273,6 +2273,17 @@ void PageState::RewireIterationBindings(JsLoopRuntime& rt, JsLoopIteration& iter
                     if (cr->innerEffects[k]) jsRt_->DisposeEffect(cr->innerEffects[k]);
                     cr->innerEffects[k] = jsRt_->WatchEffect(cr->innerEvalFns[k]);
                 }
+                // Reused outer rows also replace the object supplying nested
+                // lists. Recollect those dependencies while retaining keyed
+                // child widgets; their old watcher still reads the old row.
+                for (auto& loop : cr->innerLoops) {
+                    if (!loop) continue;
+                    if (loop->watcherId) jsRt_->DisposeEffect(loop->watcherId);
+                    auto* nested = loop.get();
+                    loop->watcherId = jsRt_->WatchEffect([this, nested]() {
+                        RebuildJsLoop(*nested);
+                    });
+                }
                 if (!cr->innerConditionals.empty()) rewireConds(cr->innerConditionals);
             }
         };

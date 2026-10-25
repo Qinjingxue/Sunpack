@@ -2034,7 +2034,9 @@ class WatchScheduler:
                 self.enqueue(candidate.path, force=True, event_type="active_owner_deferred")
                 return None
         self._notify("submitted", notification_id, candidate.path)
-        self.log.write("processing_started", path=candidate.path, owner=notification_id, size=candidate.size, mtime=candidate.mtime)
+        # Admission is only a physical candidate, possibly another volume of
+        # an existing task. Confirmed source groups publish processing cards.
+        self.log.write("pipeline_request_started", path=candidate.path, owner=notification_id, size=candidate.size, mtime=candidate.mtime)
         try:
             task = asyncio.create_task(self.pipeline_engine.run(
                 [PipelineTarget(candidate.path, output=run_config["output"])],

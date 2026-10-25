@@ -618,6 +618,68 @@ def test_execution_history_survives_regroup_retry_and_compaction(tmp_path):
         log.close()
 
 
+def test_split_arrivals_publish_only_confirmed_cards(tmp_path, monkeypatch):
+    # Final snapshots cannot expose a sibling card appearing before discovery.
+    # Three tiny real arrivals cover that boundary, stable IDs and growing
+    # membership together; per-format extraction is covered elsewhere.
+    import asyncio
+    import shutil
+    from sunpack.pipeline.coordinator.engine import PipelineEngine
+    from sunpack.runtime.watch.scheduler import WatchScheduler
+    from sunpack.runtime.watch.scanner import watch_candidate_for_path
+    from sunpack.runtime.watch.roots import WatchRootEntry
+    from tests.helpers.config_factory import make_config
+
+    monkeypatch.setattr("sunpack.runtime.watch.scheduler.validate_ntfs_watch_roots", lambda _roots: None)
+    root = tmp_path / "input"
+    root.mkdir()
+    payload = tmp_path / "payload.txt"
+    payload.write_text("split arrival payload\n" * 110, encoding="utf-8")
+    subprocess.run([str(Path(__file__).resolve().parents[2] / "tools" / "7z.exe"),
+                    "a", "-t7z", "-mx=0", "-v1k", str(tmp_path / "split.7z"), str(payload)],
+                   check=True, capture_output=True)
+    parts = sorted(tmp_path.glob("split.7z.*"))
+    assert len(parts) == 3
+    config = make_config({"recursive_extract": "1", "detection": {"enabled": True},
+                          "watch": {"clipboard_monitor_enabled": False},
+                          "post_extract": {"archive_cleanup_mode": "k", "flatten_single_directory": False}})
+
+    async def scenario():
+        async with PipelineEngine(config) as engine:
+            watcher = WatchScheduler(config, [str(root)], pipeline_engine=engine,
+                state_path=str(tmp_path / "state.snapshot"), root_entries=[
+                    WatchRootEntry(str(root), str(tmp_path / "output"))])
+            try:
+                watcher.log.recover()
+                previous = []
+                for index, source in enumerate(parts):
+                    arrived = root / source.name
+                    shutil.copyfile(source, arrived)
+                    scope, = watcher.scopes.values()
+                    watcher._scan_options.catalog_update(watcher._catalog, scope.native)
+                    request = await watcher._submit_candidate(watch_candidate_for_path(str(arrived)))
+                    assert request is not None
+                    # Admission has no confirmed descriptor yet. It must neither
+                    # add a provisional card nor change the waiting card.
+                    watcher.log.flush()
+                    assert _state_projection(watcher.log.path)["tasks"]["rows"] == previous
+                    await request.task
+                    result = await watcher._finish_active_request(request)
+                    assert result.failed == int(index < 2)
+                    watcher.log.flush()
+                    rows = _state_projection(watcher.log.path)["tasks"]["rows"]
+                    assert len(rows) == 1
+                    assert rows[0]["parts"] == [part.name for part in parts[:index + 1]]
+                    assert rows[0]["status"] == ("taskWaiting" if index < 2 else "taskSucceeded")
+                    if previous:
+                        assert rows[0]["id"] == previous[0]["id"]
+                    previous = rows
+                assert (Path(rows[0]["outputs"][0]) / payload.name).read_text(encoding="utf-8") == payload.read_text(encoding="utf-8")
+            finally:
+                await watcher.aclose()
+    asyncio.run(scenario())
+
+
 def test_real_recursive_watch_executions_keep_two_outer_rows(tmp_path, monkeypatch):
     # Synthetic events cannot detect the real pipeline dropping depth on a
     # lease/promotion update. Two tiny carrier executions cover all three
