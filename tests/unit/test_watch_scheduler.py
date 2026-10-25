@@ -592,7 +592,7 @@ def test_source_claim_transfer_releases_only_current_owner_without_claim_scan():
     watcher._release_pipeline_source_claims("a")
     watcher._release_pipeline_source_claims("unknown")
     assert replayed == [(first, {"event_type": "pipeline_claim_released"})]
-    assert watcher._active_claims.get(second_key) == "b"
+    assert watcher._active_claims.get(second_key).owner == "b"
     assert watcher._claims_by_owner == {"b": {second_key}}
     watcher._release_pipeline_source_claims("b")
     assert replayed == [(path, {"event_type": "pipeline_claim_released"}) for path in (first, second)]

@@ -1521,12 +1521,11 @@ class _RequestRuntime:
             )
             watch_version = task.runtime.get("source_generation", watch_version)
             retain_watch_lease = bool(watch_version and outcome.outcome_kind == OutcomeKind.COMPLETE_SUCCESS)
-            # A promoted child re-enters the pipeline at depth 1 after a
-            # password retry. Match the CLI retry's input paths individually,
-            # rather than changing the cleanup mode of an entire batch.
+            # Watch annotates the leased physical group; CLI retries carry the
+            # promoted input paths. Neither depends on the triggering member.
             cli_promoted_paths = self.config.get("promoted_nested_retry_paths", ())
             promoted_retry = depth == 1 and (
-                bool(self.config.get("watch_promoted_nested_input"))
+                bool(task.runtime.get("promoted_nested_input"))
                 or bool(cli_promoted_paths) and any(
                     case_key(os.path.abspath(path)) in cli_promoted_paths
                     for path in (task.cleanup_parts or task.all_parts or [task.main_path])
@@ -1826,6 +1825,7 @@ class _RequestRuntime:
                     "type": "semantic", "event": "task_sources_claimed",
                     "source_paths": tuple(task.cleanup_parts or task.all_parts or [task.main_path]),
                     "groups": [_task_source_group(task)],
+                    "promoted_nested_input": True,
                 })
             ownership.remap_task(task, result.input_path)
             updated = replace(result, input_path=task.main_path,
@@ -1920,6 +1920,7 @@ class _RequestRuntime:
             )
             if completed:
                 raise _CompletedWatchOutput(completed)
+        if self.submission.origin == "watch" and depth == 1:
             self._report_progress(task, {
                 "type": "semantic", "event": "task_sources_claimed",
                 "source_paths": tuple(task.cleanup_parts or paths),

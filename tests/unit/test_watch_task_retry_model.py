@@ -105,8 +105,12 @@ def test_promoted_cleanup_provenance_is_request_local_and_cleared_after_success(
         try:
             observed_modes = []
 
-            async def run(targets, *, request_config, **_kwargs):
-                observed_modes.append(request_config["watch_promoted_nested_input"])
+            async def run(targets, *, progress_callback, **_kwargs):
+                task = SimpleNamespace(main_path=targets[0].path, runtime={})
+                progress_callback(task, {
+                    "event": "task_sources_claimed", "source_paths": (task.main_path,),
+                })
+                observed_modes.append(bool(task.runtime.get("promoted_nested_input")))
                 return PipelineResponse(
                     "test", RunSummary(target_results=(
                         TargetRunResult(targets[0].path, OutcomeKind.COMPLETE_SUCCESS),
@@ -128,7 +132,7 @@ def test_promoted_cleanup_provenance_is_request_local_and_cleared_after_success(
             )
             request = await watcher._submit_candidate(candidate)
             assert request is not None
-            await watcher._complete_candidate(request)
+            await watcher._finish_active_request(request)
             assert watcher.state.latest_entry_for_path(str(source)) is None
             assert watcher.state.pending_work_for_path(str(source)) is None
 
@@ -136,7 +140,7 @@ def test_promoted_cleanup_provenance_is_request_local_and_cleared_after_success(
             new_source.write_text("archive")
             request = await watcher._submit_candidate(_candidate(new_source))
             assert request is not None
-            await watcher._complete_candidate(request)
+            await watcher._finish_active_request(request)
             assert observed_modes == [promoted, False]
         finally:
             await watcher.aclose()

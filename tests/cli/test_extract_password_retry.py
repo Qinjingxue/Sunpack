@@ -233,7 +233,7 @@ def test_password_retry_provenance_is_scoped_to_promoted_inputs(tmp_path, monkey
     args = SimpleNamespace(
         recursive=False, paths=[str(promoted), str(ordinary)], password=[],
         password_file=None, prompt_passwords=False, no_builtin_passwords=True,
-        json=False, quiet=True, verbose=False,
+        json=False, quiet=False, verbose=False,
     )
     code, result = asyncio.run(extract.handle(
         args, CliContext(language="en", reporter=CliReporter(quiet=True)),

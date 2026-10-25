@@ -626,6 +626,24 @@ impl NativeWatchState {
             .transpose()
     }
 
+    /// Project provenance without converting complete failure/group payloads.
+    fn promoted_nested_input_paths(&self, paths: Vec<String>) -> Vec<String> {
+        let data = self.lock();
+        paths
+            .into_iter()
+            .filter(|path| {
+                data.entries.get(&path_key(path)).is_some_and(|entry| {
+                    entry
+                        .failure_payload
+                        .get("details")
+                        .and_then(|details| details.get("promoted_nested_input"))
+                        .and_then(Value::as_bool)
+                        == Some(true)
+                })
+            })
+            .collect()
+    }
+
     fn pending_items(&self, py: Python<'_>) -> PyResult<Vec<Py<PyDict>>> {
         let records: Vec<_> = self.lock().pending.values().cloned().collect();
         records

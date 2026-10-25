@@ -1227,6 +1227,10 @@ class WatchStateStore:
         with self._state_lock:
             return self._entry_record(path)
 
+    def promoted_nested_input_paths(self, paths: Iterable[str]) -> list[str]:
+        with self._state_lock:
+            return self._native.promoted_nested_input_paths(paths)
+
     def advance_entry_observation(self, candidate, *, admit=None) -> bool:
         with self._state_lock:
             if admit is not None and not admit():

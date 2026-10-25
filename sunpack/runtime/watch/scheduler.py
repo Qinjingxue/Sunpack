@@ -93,6 +93,12 @@ class _SourceProbe:
     recheck: bool = False
 
 
+@dataclass(frozen=True, slots=True)
+class _SourceClaim:
+    owner: str
+    promoted_nested_input: bool = False
+
+
 @dataclass
 class WatchRunResult:
     processed: int = 0
@@ -220,7 +226,7 @@ class WatchScheduler:
         # Publish claims and observation generations under one short gate.
         # Probes and WAL waits run outside; claims cancel probes before publish.
         self._claim_gate = threading.RLock()
-        self._active_claims: dict[str, str] = {}
+        self._active_claims: dict[str, _SourceClaim] = {}
         self._claims_by_owner: dict[str, set[str]] = {}
         self._dirty_during_claim: dict[str, dict[str, str]] = {}
         self._source_probes: dict[str, _SourceProbe] = {}
@@ -1439,22 +1445,27 @@ class WatchScheduler:
     def _defer_claimed_path_locked(self, path: str) -> bool:
         normalized = os.path.abspath(path)
         key = path_key(normalized)
-        owner = self._active_claims.get(key)
-        if not owner:
+        claim = self._active_claims.get(key)
+        if claim is None:
             return False
-        self._dirty_during_claim.setdefault(owner, {})[key] = normalized
+        self._dirty_during_claim.setdefault(claim.owner, {})[key] = normalized
         return True
 
     def _claim_pipeline_sources(
         self, owner: str, paths: Iterable[str], *, path: str = "", groups: list[dict] | None = None,
-    ) -> None:
+        promoted_paths: Iterable[str] = (),
+    ) -> bool:
         normalized = dedupe_normalized_paths(
             os.path.abspath(str(path))
             for path in paths
             if str(path or "")
         )
         if not owner or not normalized:
-            return
+            return False
+        promoted_keys = {path_key(source) for source in promoted_paths}
+        ordinary_claim = _SourceClaim(owner)
+        promoted_claim = None
+        promoted = False
         retired_pending: list[tuple[str, str]] = []
         with self._claim_gate:
             claimed_keys = [path_key(path) for path in normalized]
@@ -1463,7 +1474,8 @@ class WatchScheduler:
                 probe = self._source_probes.pop(key, None)
                 if probe is not None:
                     self._dirty_during_claim.setdefault(owner, {})[key] = probe.path
-                previous_owner = self._active_claims.get(key)
+                previous_claim = self._active_claims.get(key)
+                previous_owner = previous_claim.owner if previous_claim else ""
                 if previous_owner and previous_owner != owner:
                     previous_keys = self._claims_by_owner[previous_owner]
                     previous_keys.remove(key)
@@ -1474,7 +1486,13 @@ class WatchScheduler:
                         self._dirty_during_claim.setdefault(owner, {})[key] = previous_dirty.pop(key)
                         if not previous_dirty:
                             self._dirty_during_claim.pop(previous_owner, None)
-                self._active_claims[key] = owner
+                source_promoted = key in promoted_keys or bool(
+                    previous_claim and previous_claim.promoted_nested_input
+                )
+                if source_promoted and promoted_claim is None:
+                    promoted_claim = _SourceClaim(owner, True)
+                self._active_claims[key] = promoted_claim if source_promoted else ordinary_claim
+                promoted |= source_promoted
                 owned_keys.add(key)
             if not self._source_probes:
                 self._source_probes.clear()
@@ -1496,6 +1514,7 @@ class WatchScheduler:
             path_count=len(normalized),
             retired_pending=len(retired_pending),
         )
+        return promoted
 
     def _release_pipeline_source_claims(self, owner: str, *, request_path: str = "") -> None:
         if not owner:
@@ -1954,15 +1973,6 @@ class WatchScheduler:
             run_config = dict(self.config)
             password_generation = self.state.password_generation
             retry_entry = self.state.latest_entry_for_path(candidate.path)
-            # Reuse the durable blocker payload; no new Watch cache or WAL field.
-            retry_details = (
-                (retry_entry.failure_payload.get("details") or {})
-                if retry_entry is not None else {}
-            )
-            run_config["watch_promoted_nested_input"] = (
-                isinstance(retry_details, dict)
-                and retry_details.get("promoted_nested_input") is True
-            )
             pending = self.state.pending_work_for_path(candidate.path)
             scope_dir = ""
             if retry_entry is not None and retry_entry.status == "failed_password":
@@ -2056,9 +2066,21 @@ class WatchScheduler:
                     request.source_groups[path_key(group["path"])] = group
                     for member in group["members"]:
                         request.source_groups[path_key(member)] = group
-            self._claim_pipeline_sources(
+            promoted_paths = []
+            if event.get("promoted_nested_input") is True:
+                promoted_paths = source_paths
+            elif "depth" not in event:
+                # Per-task claims follow lease acquisition, including a family
+                # adopted during missing-volume recovery. Read only its parts.
+                promoted_paths = self.state.promoted_nested_input_paths(source_paths)
+            promoted = self._claim_pipeline_sources(
                 notification_id, source_paths, path=owner_path, groups=groups,
+                promoted_paths=promoted_paths,
             )
+            if promoted and "depth" not in event:
+                # Live publication claims cover the gap before failure state
+                # is persisted; ownership transfer preserves their provenance.
+                archive_task.runtime["promoted_nested_input"] = True
             return
         if name == "task_output_started":
             if not self.state.record_task_output_started(
@@ -2324,8 +2346,8 @@ class WatchScheduler:
                 status="ignored_no_tasks",
             )
             with self._claim_gate:
-                owner = self._active_claims.get(path_key(candidate.path))
-                retire_group = owner is None or owner == request.notification_id
+                claim = self._active_claims.get(path_key(candidate.path))
+                retire_group = claim is None or claim.owner == request.notification_id
             self.log.write("no_tasks_found", path=candidate.path, retire_group=retire_group)
             self._notify("suppressed", request.notification_id)
             return WatchRunResult(processed=1)
