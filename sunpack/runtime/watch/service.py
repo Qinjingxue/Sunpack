@@ -686,7 +686,6 @@ class WatchService:
                         DEFAULT_WATCH_CONFIG["cold_start_seconds"],
                     )
                 ),
-                observer_stop_timeout_seconds=float(watch_config.get("observer_stop_timeout_seconds", 5.0)),
                 pipeline_engine=pipeline_engine,
                 notification_sink=toast_coordinator,
                 wake_callback=self._wake_scheduler,
