@@ -16,47 +16,6 @@ _norm = normalize_error_text
 _EN = I18nContext("en")
 
 
-def should_retry_extract_failure(
-    run_result: Optional[subprocess.CompletedProcess],
-    err_text: str,
-    archive: str = None,
-    is_split_archive: bool = False,
-) -> bool:
-    err_lower = _norm(err_text)
-    worker_result = worker_result_payload(run_result)
-    if worker_result:
-        if worker_result.get("wrong_password") or worker_result.get("damaged") or worker_result.get("missing_volume"):
-            return False
-        if worker_result.get("native_status") in {"wrong_password", "damaged", "unsupported"}:
-            return False
-
-    if has_archive_damage_signals(err_lower):
-        return False
-
-    if not run_result:
-        return False
-
-    # Access denied, malformed requests and generic negative exit codes are
-    # not proof of a temporary condition. Retrying those indefinitely would
-    # conceal the real failure behind a perpetual worker restart loop.
-    recoverable_signals = (
-        "sharing violation", "being used by another process",
-        "process cannot access the file", "resource temporarily unavailable",
-        "too many open files", "device is not ready", "disk full",
-        "no space", "not enough space", "write error",
-    )
-    if any(signal in err_lower for signal in recoverable_signals):
-        return True
-
-    diagnostics = getattr(run_result, "worker_diagnostics", None)
-    process_failure = diagnostics.get("process_failure") if isinstance(diagnostics, dict) else None
-    kind = str(process_failure.get("failure_kind") or "") if isinstance(process_failure, dict) else ""
-    if kind in {"process_io", "worker_lost", "process_signal"}:
-        return True
-    # Legacy synthetic transport failures have no finer structured metadata.
-    return run_result.returncode in {-101, -102}
-
-
 def classify_extract_failure(
     run_result: Optional[subprocess.CompletedProcess],
     err_text: str,
