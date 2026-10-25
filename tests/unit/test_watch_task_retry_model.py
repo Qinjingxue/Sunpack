@@ -96,6 +96,54 @@ async def _complete(watcher, candidate, response):
     return await watcher._complete_candidate(request)
 
 
+@pytest.mark.parametrize("promoted", [False, True])
+def test_promoted_cleanup_provenance_is_request_local_and_cleared_after_success(
+    tmp_path, monkeypatch, promoted,
+):
+    async def scenario():
+        watcher, root, _output, _sink = _watcher(tmp_path, monkeypatch)
+        try:
+            observed_modes = []
+
+            async def run(targets, *, request_config, **_kwargs):
+                observed_modes.append(request_config["watch_promoted_nested_input"])
+                return PipelineResponse(
+                    "test", RunSummary(target_results=(
+                        TargetRunResult(targets[0].path, OutcomeKind.COMPLETE_SUCCESS),
+                    )),
+                )
+
+            watcher.pipeline_engine.run = run
+            source = root / "promoted-inner.zip"
+            source.write_text("archive")
+            candidate = _candidate(source)
+            watcher.state.mark(
+                candidate.path, candidate.size, candidate.mtime,
+                status="failed_password",
+                failure_payload={
+                    "kind": FailureKind.WRONG_PASSWORD.value,
+                    "blockers": ["password"],
+                    "details": {"promoted_nested_input": promoted},
+                },
+            )
+            request = await watcher._submit_candidate(candidate)
+            assert request is not None
+            await watcher._complete_candidate(request)
+            assert watcher.state.latest_entry_for_path(str(source)) is None
+            assert watcher.state.pending_work_for_path(str(source)) is None
+
+            new_source = root / "fresh.zip"
+            new_source.write_text("archive")
+            request = await watcher._submit_candidate(_candidate(new_source))
+            assert request is not None
+            await watcher._complete_candidate(request)
+            assert observed_modes == [promoted, False]
+        finally:
+            await watcher.aclose()
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("failure_kind", [FailureKind.MISSING_VOLUME, FailureKind.WRONG_PASSWORD])
 def test_departed_claimed_blocker_is_retired_without_losing_recovery(tmp_path, monkeypatch, failure_kind):
     # Covers the missing hand-off between departure and source-claim release;

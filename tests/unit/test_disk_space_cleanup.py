@@ -272,6 +272,23 @@ def test_source_cleanup_reports_access_denied_once(tmp_path, monkeypatch):
     assert outcome.failed[0].error_code == 5
 
 
+def test_nested_delete_override_reuses_cleanup_and_leaves_request_mode_unchanged(tmp_path):
+    source = tmp_path / "generated-inner.zip"
+    source.write_text("generated payload")
+    scope = _scope("keep")
+    task = _Task("nested", [source])
+    scope.register([task])
+
+    request = scope.release_task(task, outcome_kind=OutcomeKind.COMPLETE_SUCCESS)
+    outcome = asyncio.run(scope.apply(
+        request, broker=_InlineBroker(), mode_override="delete",
+    ))
+
+    assert outcome.deleted == (str(source),)
+    assert not source.exists()
+    assert scope._mode() == "keep"
+
+
 def test_keep_mode_never_enters_source_promotion_barrier(tmp_path, monkeypatch):
     source = tmp_path / "kept.zip"
     source.write_text("payload")

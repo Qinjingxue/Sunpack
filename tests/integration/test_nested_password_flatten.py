@@ -41,14 +41,15 @@ def _nested_fixture(tmp_path, encrypted):
 
 @pytest.mark.parametrize("origin", ["foreground", "watch"])
 @pytest.mark.parametrize("encrypted", [False, True])
-def test_nested_failure_keeps_retry_path_while_success_still_flattens(tmp_path, origin, encrypted):
+@pytest.mark.parametrize("cleanup_mode", ["d", "k"])
+def test_nested_failure_keeps_retry_path_while_success_still_flattens(tmp_path, origin, encrypted, cleanup_mode):
     outer = _nested_fixture(tmp_path, encrypted)
     config = normalize_config(with_detection_pipeline({
         "recursive_extract": "3",
         "user_passwords": ["wrong-fixture-password"],
         "builtin_passwords": [],
         "output": {"root": str(tmp_path / "out")},
-        "post_extract": {"archive_cleanup_mode": "d", "flatten_single_directory": True},
+        "post_extract": {"archive_cleanup_mode": cleanup_mode, "flatten_single_directory": True},
     }))
 
     async def run():
@@ -70,7 +71,7 @@ def test_nested_failure_keeps_retry_path_while_success_still_flattens(tmp_path, 
         assert not (tmp_path / "out" / "outer" / "wrapper").exists()
         assert not (tmp_path / "out" / "outer").exists()
         assert outer_result.output_dir == ""
-        assert not outer.exists(), "promotion must not block successful outer cleanup"
+        assert outer.exists() == (cleanup_mode == "k"), "promoted failure must not alter outer cleanup"
     else:
         assert response.summary.failed_tasks == []
         assert response.summary.success_count == 2
@@ -80,6 +81,7 @@ def test_nested_failure_keeps_retry_path_while_success_still_flattens(tmp_path, 
         assert (output / "payload.txt").stat().st_mtime_ns == PAYLOAD_MTIME_NS
         assert (output / "payload.txt").stat().st_file_attributes & 1
         assert not (output / "wrapper").exists()
+        assert outer.exists() == (cleanup_mode == "k")
 
 
 def test_cli_password_prompt_retries_promoted_input_with_real_pipeline(tmp_path, monkeypatch):

@@ -13,15 +13,17 @@ from tests.real.plan7_watch_downloads.plan7_support import (
 )
 
 
-@pytest.mark.parametrize("outer_format", ["7z", "zip", "rar"])
+@pytest.mark.parametrize(("outer_format", "cleanup_mode"), [
+    ("7z", "delete"), ("zip", "delete"), ("rar", "delete"), ("zip", "keep"),
+])
 def test_plan7_disguised_split_nested_carrier_survives_two_restarts_and_password_update(
-    tmp_path, plan7_error, outer_format,
+    tmp_path, plan7_error, outer_format, cleanup_mode,
 ):
     if outer_format == "rar" and get_optional_rar() is None:
         pytest.skip("RAR writer is required")
     case = build_nested_case(tmp_path / "fixtures", f"watch-{outer_format}", outer_format)
     label = f"nested-lifecycle-{outer_format}"
-    options = dict(passwords=list(case.passwords[:2]), cleanup_mode="delete", flatten_single_directory=True)
+    options = dict(passwords=list(case.passwords[:2]), cleanup_mode=cleanup_mode, flatten_single_directory=True)
     first = start_watch(tmp_path, label, **options)
     try:
         # Reverse the data-volume arrival order, leave the tail absent, and
@@ -69,6 +71,8 @@ def test_plan7_disguised_split_nested_carrier_survives_two_restarts_and_password
         assert result.succeeded == 1
         assert not third.watcher.state.entries
         assert not retry_input.exists(), "successful retry must clean the retained inner archive"
+        if cleanup_mode == "keep":
+            assert all((third.watch_root / part.name).exists() for part in case.parts)
         assert_nested_outputs(third.output_root, case, leaf_success=True)
     finally:
         third.close()

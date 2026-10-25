@@ -16,12 +16,16 @@ class PostProcessActions:
         language: str | None = None,
         *,
         stdout=None,
+        cleanup_mode_override: str | None = None,
     ):
         self.config = config
         cli_config = config.get("cli") if isinstance(config.get("cli"), dict) else {}
         self.i18n = I18nContext(language if language is not None else cli_config.get("language"))
         self.language = self.i18n.language
-        self.cleanup_mode = config.get("post_extract", {}).get("archive_cleanup_mode", "recycle")
+        self.cleanup_mode = (
+            cleanup_mode_override if cleanup_mode_override is not None
+            else config.get("post_extract", {}).get("archive_cleanup_mode", "recycle")
+        )
         if self.cleanup_mode not in {"keep", "recycle", "delete"}:
             raise ValueError("archive_cleanup_mode must be normalized before PostProcessActions starts")
         self.stdout = stdout if stdout is not None else sys.stdout
