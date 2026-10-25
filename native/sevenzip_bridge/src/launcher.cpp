@@ -517,7 +517,7 @@ void write_stream(DWORD handle_id, const std::string& text) {
 // Localized strings printed directly by this launcher. Keep in sync with the
 // sunpack/core/i18n/catalog.py keys cli.press_enter, cli.persistent_start_timeout,
 // cli.native_runtime_launch_failed, cli.native_runtime_exited, and
-// cli.persistent_delivery_uncertain.
+// cli.persistent_delivery_uncertain. Readiness waits now terminate on real exits.
 constexpr wchar_t kPressEnterEn[] = L"Press Enter to continue...";
 constexpr wchar_t kPressEnterZh[] = L"按回车键继续...";
 constexpr wchar_t kPersistentUnavailableEn[] = L"SunPack persistent process is unavailable";
