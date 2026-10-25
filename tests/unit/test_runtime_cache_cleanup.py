@@ -38,6 +38,10 @@ def _reset_process_caches():
 
 
 def test_clear_all_runtime_caches_clears_python_owned_caches(tmp_path):
+    from sunpack_native import relations_logical_name
+
+    # Existing cleanup checks miss process-wide native regex search pools.
+    assert relations_logical_name("中文.part2.rar", True) == "中文"
     GLOBAL_CACHE.set("runtime-cache-test", ("key",), {"payload": "value"})
     archive_path = tmp_path / "archive.zip"
     archive_path.write_bytes(b"PK\x05\x06" + b"\0" * 18)
@@ -54,6 +58,7 @@ def test_clear_all_runtime_caches_clears_python_owned_caches(tmp_path):
     assert stats["global_cache"]["entries"] >= 1
     assert stats["relation_probe_cache"] == {"successes": 1, "negative": 1}
     assert "inspection" not in stats
+    assert stats["reader"]["relation_regex_cache_entries"] > 0
 
     report = clear_all_runtime_caches()
 
@@ -63,6 +68,9 @@ def test_clear_all_runtime_caches_clears_python_owned_caches(tmp_path):
     assert GLOBAL_CACHE.stats()["entries"] == 0
     assert source_fingerprint(task)
     assert report["errors"] == []
+    assert report["archive_sessions"]["reader"]["relation_regexes"] > 0
+    assert runtime_cache_stats()["reader"]["relation_regex_cache_entries"] == 0
+    assert relations_logical_name("中文.part2.rar", True) == "中文"
 
 
 class _CleanupOnlyEngine:
@@ -329,10 +337,12 @@ def test_retained_sources_release_models_and_native_capacity_across_batches(tmp_
 
                 assert await asyncio.wait_for(settle(), 15) == 8
                 assert not watcher._quiet_trackers
+                assert reader_cache_stats()["relation_regex_cache_entries"] > 0
                 watcher._cache_cleanup_deadline = 0
                 await watcher._maybe_clear_idle_caches()
                 assert watcher.state._native.storage_capacities() == (0, 0)
                 assert reader_cache_stats()["container_capacity"] == 0
+                assert reader_cache_stats()["relation_regex_cache_entries"] == 0
                 assert not engine._path_leases._completed_watch_generations
                 assert watcher._catalog.memory_stats()["observations"] == len(sources)
                 for source in sources:

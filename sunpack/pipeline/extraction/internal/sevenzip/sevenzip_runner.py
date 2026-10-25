@@ -646,68 +646,10 @@ class _AsyncNativeWorkerProcess:
         failure = "sevenzip_worker exited before job completion"
         try:
             while line_bytes := await self.process.stdout.readline():
-                payload = parse_worker_transport_event(line_bytes)
-                # Chunk data stays in Rust and never reaches job callbacks.
-                line = "" if payload.get("type") in {"result", "manifest_chunk", "trace_chunk"} else line_bytes.decode("utf-8", "replace")
-                del line_bytes
-                job_id = str(payload.get("job_id") or "") if isinstance(payload, dict) else ""
-                if isinstance(payload, dict) and payload.get("type") == "worker_ready":
-                    self.handshake = dict(payload)
-                    self.handshake["worker_pid"] = int(getattr(self.process, "pid", 0) or 0)
-                    if self._ready is not None and not self._ready.done():
-                        self._ready.set_result(self.handshake)
-                    continue
-                if isinstance(payload, dict) and payload.get("type") == "process_mode_ack":
-                    self.handshake["process_mode"] = str(payload.get("mode") or "normal")
-                    self.handshake["process_mode_applied"] = bool(payload.get("applied"))
-                    waiter = self._process_mode_waiter
-                    if waiter is not None and not waiter.done():
-                        waiter.set_result(dict(payload))
-                    continue
-                state = self._jobs.get(job_id)
-                if state is None:
-                    if job_id and _is_job_finished(payload):
-                        self.queue_capacity.release(job_id)
-                    continue
-                # 空间事件必须在写 state["state"] = event.removeprefix("job_") 之前识别，否则 job 生命周期状态会被污染。
-                if (
-                    _apply_native_event_to_job_state(state, payload, _LOGGER)
-                    == _SPACE_STALE
-                ):
-                    continue
-                if state.get("callback_error"):
-                    if _is_job_finished(payload):
-                        self._fail_job(job_id, state, state["callback_error"])
-                        self.queue_capacity.release(job_id)
-                    continue
                 try:
-                    if payload.get("type") == "protocol_error":
-                        raise ValueError(payload["message"])
-                    if state["accumulator"].accept(payload):
-                        continue
-                    callback = state["on_line"]
-                    completed = bool(
-                        callback(line, payload)
-                        if state.get("parsed_events")
-                        else callback(line)
-                    )
-                except Exception as exc:
-                    state["callback_error"] = f"sevenzip_worker job protocol/callback failed: {exc}"
-                    state.pop("accumulator", None)
-                    if _is_job_finished(payload):
-                        self._fail_job(job_id, state, state["callback_error"])
-                    else:
-                        try:
-                            await self.cancel(job_id)
-                        except Exception:
-                            await self.close()
-                    completed = False
-                if completed and _is_job_finished(payload):
-                    self._finish_job(job_id, state)
-                elif _is_job_finished(payload) and not state.get("callback_error"):
-                    self._fail_job(job_id, state, "sevenzip_worker finished without a result")
-                if _is_job_finished(payload):
-                    self.queue_capacity.release(job_id)
+                    await self._dispatch_line(line_bytes)
+                finally:
+                    del line_bytes
         except Exception as exc:
             failure = f"sevenzip_worker transport/protocol failed: {exc}"
         finally:
@@ -723,10 +665,75 @@ class _AsyncNativeWorkerProcess:
                 self._fail_all_jobs(failure)
             self.queue_capacity.flush()
 
+    async def _dispatch_line(self, line_bytes: bytes) -> None:
+        # No job callback/result may stay in the long-lived stdout reader frame.
+        payload = parse_worker_transport_event(line_bytes)
+        # Chunk data stays in Rust and never reaches job callbacks.
+        line = "" if payload.get("type") in {"result", "manifest_chunk", "trace_chunk"} else line_bytes.decode("utf-8", "replace")
+        job_id = str(payload.get("job_id") or "") if isinstance(payload, dict) else ""
+        if isinstance(payload, dict) and payload.get("type") == "worker_ready":
+            self.handshake = dict(payload)
+            self.handshake["worker_pid"] = int(getattr(self.process, "pid", 0) or 0)
+            if self._ready is not None and not self._ready.done():
+                self._ready.set_result(self.handshake)
+            return
+        if isinstance(payload, dict) and payload.get("type") == "process_mode_ack":
+            self.handshake["process_mode"] = str(payload.get("mode") or "normal")
+            self.handshake["process_mode_applied"] = bool(payload.get("applied"))
+            waiter = self._process_mode_waiter
+            if waiter is not None and not waiter.done():
+                waiter.set_result(dict(payload))
+            return
+        state = self._jobs.get(job_id)
+        if state is None:
+            if job_id and _is_job_finished(payload):
+                self.queue_capacity.release(job_id)
+            return
+        # 空间事件必须在写 state["state"] = event.removeprefix("job_") 之前识别，否则 job 生命周期状态会被污染。
+        if (
+            _apply_native_event_to_job_state(state, payload, _LOGGER)
+            == _SPACE_STALE
+        ):
+            return
+        if state.get("callback_error"):
+            if _is_job_finished(payload):
+                self._fail_job(job_id, state, state["callback_error"])
+                self.queue_capacity.release(job_id)
+            return
+        try:
+            if payload.get("type") == "protocol_error":
+                raise ValueError(payload["message"])
+            if state["accumulator"].accept(payload):
+                return
+            callback = state["on_line"]
+            completed = bool(
+                callback(line, payload)
+                if state.get("parsed_events")
+                else callback(line)
+            )
+        except Exception as exc:
+            state["callback_error"] = f"sevenzip_worker job protocol/callback failed: {exc}"
+            state.pop("accumulator", None)
+            if _is_job_finished(payload):
+                self._fail_job(job_id, state, state["callback_error"])
+            else:
+                try:
+                    await self.cancel(job_id)
+                except Exception:
+                    await self.close()
+            completed = False
+        if completed and _is_job_finished(payload):
+            self._finish_job(job_id, state)
+        elif _is_job_finished(payload) and not state.get("callback_error"):
+            self._fail_job(job_id, state, "sevenzip_worker finished without a result")
+        if _is_job_finished(payload):
+            self.queue_capacity.release(job_id)
+
     async def _pump_stderr(self) -> None:
         assert self.process is not None and self.process.stderr is not None
         while line := await self.process.stderr.readline():
             self._stderr_lines.append(line.decode("utf-8", "replace"))
+            del line
 
     def _finish_job(self, job_id: str, expected: dict[str, Any]) -> dict[str, Any] | None:
         state = self._jobs.get(job_id)

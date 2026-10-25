@@ -1,8 +1,10 @@
 import asyncio
+import gc
 import io
 import json
 import subprocess
 import threading
+import weakref
 from types import SimpleNamespace
 
 import pytest
@@ -324,6 +326,75 @@ def test_async_bad_chunk_cancels_only_its_job_and_retains_ownership_until_finish
         result = next(event for event in callbacks if event["type"] == "result")
         assert result["verified_manifest"]["native_rows"].file_page(0, 1)[0]["path"] == "good.txt"
         assert not any(event["type"] == "manifest_chunk" for event in callbacks)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("outcome", ["success", "callback_error", "malformed_chunk"])
+def test_idle_async_reader_releases_finished_callbacks_but_keeps_active_jobs(outcome):
+    # Outcome tests stop at EOF and cannot detect idle tail-held callbacks.
+    # Without this, collection while another job stays live is unverified.
+    # Three tiny in-memory streams cover normal/error ownership without workers.
+    async def run():
+        waiting = asyncio.Event()
+
+        class Reader(asyncio.StreamReader):
+            async def readline(self):
+                if not self._buffer:
+                    waiting.set()
+                return await super().readline()
+
+        class Job:
+            def on_line(self, line, event):
+                if outcome == "callback_error":
+                    raise ValueError("callback failed")
+                return event.get("event") == "job_finished"
+
+            def on_error(self, message):
+                failures.append(message)
+
+        reader = Reader()
+        worker = _AsyncNativeWorkerProcess("unused", None)
+        worker.process = SimpleNamespace(stdout=reader, returncode=None)
+        failures, sent = [], []
+
+        async def send(payload):
+            sent.append(payload)
+
+        async def register(job_id):
+            owner = Job()
+            reference = weakref.ref(owner)
+            await worker.submit("request", job_id, parsed_events=True,
+                                on_line=owner.on_line, on_error=owner.on_error)
+            return reference
+
+        async def feed_and_wait(line):
+            waiting.clear()
+            reader.feed_data(line)
+            await asyncio.wait_for(waiting.wait(), 2)
+
+        worker.send = send
+        finished = await register("finished")
+        active = await register("active")
+        dispatch = asyncio.create_task(worker._dispatch_stdout())
+        try:
+            await asyncio.wait_for(waiting.wait(), 2)
+            if outcome == "malformed_chunk":
+                await feed_and_wait(b'{"type":"manifest_chunk","job_id":"finished","seq":0,"rows":[[broken]}\n')
+                gc.collect()
+                assert finished() is not None and not failures
+                assert json.loads(sent[-1])["worker_command"] == "cancel"
+            await feed_and_wait(b'{"type":"native_event","job_id":"finished","event":"job_finished"}\n')
+            gc.collect()
+            assert finished() is None
+            assert active() is not None and set(worker._jobs) == {"active"}
+            assert len(failures) == (outcome != "success")
+            assert not dispatch.done()
+        finally:
+            worker._closing = True
+            reader.feed_eof()
+            await asyncio.wait_for(dispatch, 2)
+            worker._fail_all_jobs("closed")
 
     asyncio.run(run())
 

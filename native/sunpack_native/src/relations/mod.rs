@@ -13,7 +13,7 @@ use regex::{Regex, RegexBuilder};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock, RwLock};
 
 mod assignment;
 mod bucket;
@@ -1294,21 +1294,27 @@ fn get_logical_name(filename: &str, is_archive: bool) -> String {
     if let Some(parsed) = parse_relation_numbered_volume(filename) {
         return logical_name_from_parsed(&parsed);
     }
-    let zero_zip = zip_zero_numbered_suffix_re()
+    let regexes = regex_cache().acquire();
+    let zero_zip = regexes
+        .zip_zero_numbered_suffix_re()
         .replace(filename, "")
         .to_string();
     if zero_zip != filename {
         return clean_logical_name(&zero_zip);
     }
 
-    let second = archive_numbered_suffix_re()
+    let second = regexes
+        .archive_numbered_suffix_re()
         .replace(&zero_zip, "")
         .to_string();
     if second != zero_zip {
         return clean_logical_name(&second);
     }
 
-    let third = plain_numeric_suffix_re().replace(&second, "").to_string();
+    let third = regexes
+        .plain_numeric_suffix_re()
+        .replace(&second, "")
+        .to_string();
     if third != second {
         return clean_logical_name(&third);
     }
@@ -1332,13 +1338,14 @@ fn logical_name_from_parsed(parsed: &ParsedVolume) -> String {
 
 fn parse_relation_numbered_volume(path: &str) -> Option<ParsedVolume> {
     let (_, filename) = split_relation_path(path);
-    let parsed = parse_volume_candidates(filename)
+    let regexes = regex_cache().acquire();
+    let parsed = parse_volume_candidates_with_regexes(filename, &regexes)
         .into_iter()
         .find(|candidate| {
             !candidate.decorated
                 || (candidate.family == "rar"
                     && matches!(candidate.style, "rar_part" | "rar_sfx_part")
-                    && parse_marker_numbered_re().is_match(filename))
+                    && regexes.parse_marker_numbered_re().is_match(filename))
         })?;
     Some(parsed)
 }
@@ -1481,16 +1488,23 @@ fn parse_numbered_volume_name(filename: &str) -> Option<ParsedVolume> {
 /// decoration; the naked-number interpretation remains available only as a
 /// weak fallback candidate.
 fn parse_volume_candidates(filename: &str) -> Vec<ParsedVolume> {
+    parse_volume_candidates_with_regexes(filename, &regex_cache().acquire())
+}
+
+fn parse_volume_candidates_with_regexes(
+    filename: &str,
+    regexes: &RelationRegexes,
+) -> Vec<ParsedVolume> {
     let mut candidates = Vec::new();
 
-    if let Some(parsed) = parse_zip_split_volume(filename) {
+    if let Some(parsed) = parse_zip_split_volume(filename, regexes) {
         push_unique_volume_candidate(&mut candidates, parsed);
     }
-    if let Some(parsed) = parse_marker_numbered_volume(filename) {
+    if let Some(parsed) = parse_marker_numbered_volume(filename, regexes) {
         push_unique_volume_candidate(&mut candidates, parsed);
     }
     let _ = (|| -> Option<()> {
-        if let Some(captures) = parse_zip_zero_numbered_re().captures(filename) {
+        if let Some(captures) = regexes.parse_zip_zero_numbered_re().captures(filename) {
             if let Some(raw_number) = captures
                 .name("number")
                 .and_then(|value| value.as_str().parse::<u32>().ok())
@@ -1510,7 +1524,7 @@ fn parse_volume_candidates(filename: &str) -> Vec<ParsedVolume> {
                 );
             }
         }
-        if let Some(captures) = parse_archive_numbered_re().captures(filename) {
+        if let Some(captures) = regexes.parse_archive_numbered_re().captures(filename) {
             if let (Some(family), Some(raw_number)) = (
                 captures
                     .name("format")
@@ -1539,7 +1553,7 @@ fn parse_volume_candidates(filename: &str) -> Vec<ParsedVolume> {
                 }
             }
         }
-        if let Some(captures) = parse_rar_part_re().captures(filename) {
+        if let Some(captures) = regexes.parse_rar_part_re().captures(filename) {
             let number = captures.name("number")?.as_str();
             let format = captures.name("format")?.as_str();
             if let Some(number) = number.parse::<u32>().ok().filter(|value| *value > 0) {
@@ -1560,7 +1574,7 @@ fn parse_volume_candidates(filename: &str) -> Vec<ParsedVolume> {
                 );
             }
         }
-        if let Some(captures) = parse_old_rar_re().captures(filename) {
+        if let Some(captures) = regexes.parse_old_rar_re().captures(filename) {
             let number = captures.name("number")?.as_str();
             if let Some(number) = number.parse::<u32>().ok() {
                 push_unique_volume_candidate(
@@ -1581,7 +1595,7 @@ fn parse_volume_candidates(filename: &str) -> Vec<ParsedVolume> {
 
         // A final all-numeric token is intentionally last.  It is a discovery
         // hint, not stronger evidence than a marker or an embedded archive token.
-        if let Some(captures) = parse_plain_numbered_re().captures(filename) {
+        if let Some(captures) = regexes.parse_plain_numbered_re().captures(filename) {
             if let Some(raw_number) = captures.name("number") {
                 if let Some(number) = raw_number
                     .as_str()
@@ -1608,8 +1622,8 @@ fn parse_volume_candidates(filename: &str) -> Vec<ParsedVolume> {
     candidates
 }
 
-fn parse_zip_split_volume(filename: &str) -> Option<ParsedVolume> {
-    let captures = parse_zip_split_re().captures(filename)?;
+fn parse_zip_split_volume(filename: &str, regexes: &RelationRegexes) -> Option<ParsedVolume> {
+    let captures = regexes.parse_zip_split_re().captures(filename)?;
     let raw_number = captures.name("number")?.as_str();
     let number = raw_number.parse::<u32>().ok().filter(|value| *value > 0)?;
     let tail = captures
@@ -1638,8 +1652,8 @@ fn push_unique_volume_candidate(candidates: &mut Vec<ParsedVolume>, candidate: P
     candidates.push(candidate);
 }
 
-fn parse_marker_numbered_volume(path: &str) -> Option<ParsedVolume> {
-    let captures = parse_marker_numbered_re().captures(path)?;
+fn parse_marker_numbered_volume(path: &str, regexes: &RelationRegexes) -> Option<ParsedVolume> {
+    let captures = regexes.parse_marker_numbered_re().captures(path)?;
     let raw_number = captures.name("number")?.as_str();
     let number = raw_number.parse::<u32>().ok()?;
     if number == 0 {
@@ -1799,63 +1813,186 @@ fn re(pattern: &str) -> Regex {
         .expect("relation regex should compile")
 }
 
-fn archive_numbered_suffix_re() -> &'static Regex {
-    static VALUE: OnceLock<Regex> = OnceLock::new();
-    VALUE.get_or_init(|| re(r"\.(7z|zip|rar)\.\d{3}(?:\.[^.]+)?$"))
+// Each parse owns one generation. Idle cleanup can retire it without waiting
+// for active readers; their last Arc drops the search pools when they finish.
+#[derive(Default)]
+struct RelationRegexCache(RwLock<Option<Arc<RelationRegexes>>>);
+
+impl RelationRegexCache {
+    fn acquire(&self) -> Arc<RelationRegexes> {
+        {
+            let current = self.0.read().unwrap_or_else(|error| error.into_inner());
+            if let Some(regexes) = current.as_ref() {
+                return Arc::clone(regexes);
+            }
+        }
+        let mut current = self.0.write().unwrap_or_else(|error| error.into_inner());
+        Arc::clone(current.get_or_insert_with(|| Arc::new(RelationRegexes::default())))
+    }
+
+    fn clear(&self) -> usize {
+        let retired = self
+            .0
+            .write()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        // Destruction of the potentially large search pools stays outside the lock.
+        retired
+            .as_ref()
+            .map_or(0, |regexes| regexes.initialized_count())
+    }
+
+    fn initialized_count(&self) -> usize {
+        self.0
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .map_or(0, |regexes| regexes.initialized_count())
+    }
 }
 
-fn zip_zero_numbered_suffix_re() -> &'static Regex {
-    static VALUE: OnceLock<Regex> = OnceLock::new();
-    VALUE.get_or_init(|| re(r"\.zip\.\d{4}(?:\.[^.]+)?$"))
+fn regex_cache() -> &'static RelationRegexCache {
+    static CACHE: OnceLock<RelationRegexCache> = OnceLock::new();
+    CACHE.get_or_init(RelationRegexCache::default)
 }
 
-fn plain_numeric_suffix_re() -> &'static Regex {
-    static VALUE: OnceLock<Regex> = OnceLock::new();
-    VALUE.get_or_init(|| re(r"\.\d{3}$"))
+pub(crate) fn clear_regex_caches() -> usize {
+    regex_cache().clear()
 }
 
-fn parse_archive_numbered_re() -> &'static Regex {
-    static VALUE: OnceLock<Regex> = OnceLock::new();
-    VALUE.get_or_init(|| {
-        re(r"^(?P<prefix>.+)\.(?P<format>7z|zip|rar)\.(?P<number>\d+)(?P<tail>(?:\.[^.]+)*)$")
-    })
+pub(crate) fn regex_cache_entries() -> usize {
+    regex_cache().initialized_count()
 }
 
-fn parse_zip_zero_numbered_re() -> &'static Regex {
-    static VALUE: OnceLock<Regex> = OnceLock::new();
-    VALUE.get_or_init(|| re(r"^(?P<prefix>.+\.zip)\.(?P<number>\d{4})(?P<tail>(?:\.[^.]+)*)$"))
+#[derive(Default)]
+struct RelationRegexes {
+    archive_numbered_suffix_re: OnceLock<Regex>,
+    zip_zero_numbered_suffix_re: OnceLock<Regex>,
+    plain_numeric_suffix_re: OnceLock<Regex>,
+    parse_archive_numbered_re: OnceLock<Regex>,
+    parse_zip_zero_numbered_re: OnceLock<Regex>,
+    parse_zip_split_re: OnceLock<Regex>,
+    parse_rar_part_re: OnceLock<Regex>,
+    parse_old_rar_re: OnceLock<Regex>,
+    parse_plain_numbered_re: OnceLock<Regex>,
+    parse_marker_numbered_re: OnceLock<Regex>,
 }
 
-fn parse_zip_split_re() -> &'static Regex {
-    static VALUE: OnceLock<Regex> = OnceLock::new();
-    VALUE.get_or_init(|| re(r"^(?P<prefix>.+)\.zx?(?P<number>\d{2,})(?P<tail>(?:\..+)?)$"))
-}
+impl RelationRegexes {
+    fn initialized_count(&self) -> usize {
+        [
+            &self.archive_numbered_suffix_re,
+            &self.zip_zero_numbered_suffix_re,
+            &self.plain_numeric_suffix_re,
+            &self.parse_archive_numbered_re,
+            &self.parse_zip_zero_numbered_re,
+            &self.parse_zip_split_re,
+            &self.parse_rar_part_re,
+            &self.parse_old_rar_re,
+            &self.parse_plain_numbered_re,
+            &self.parse_marker_numbered_re,
+        ]
+        .iter()
+        .filter(|value| value.get().is_some())
+        .count()
+    }
 
-fn parse_rar_part_re() -> &'static Regex {
-    static VALUE: OnceLock<Regex> = OnceLock::new();
-    VALUE.get_or_init(|| re(r"^(?P<prefix>.+)\.part(?P<number>\d+)\.(?P<format>rar|exe)$"))
-}
+    fn archive_numbered_suffix_re(&self) -> &Regex {
+        self.archive_numbered_suffix_re
+            .get_or_init(|| re(r"\.(7z|zip|rar)\.\d{3}(?:\.[^.]+)?$"))
+    }
 
-fn parse_old_rar_re() -> &'static Regex {
-    static VALUE: OnceLock<Regex> = OnceLock::new();
-    VALUE.get_or_init(|| re(r"^(?P<prefix>.+)\.r(?P<number>\d{2,})(?P<tail>(?:\.[^.]+)*)$"))
-}
+    fn zip_zero_numbered_suffix_re(&self) -> &Regex {
+        self.zip_zero_numbered_suffix_re
+            .get_or_init(|| re(r"\.zip\.\d{4}(?:\.[^.]+)?$"))
+    }
 
-fn parse_plain_numbered_re() -> &'static Regex {
-    static VALUE: OnceLock<Regex> = OnceLock::new();
-    VALUE.get_or_init(|| re(r"^(?P<prefix>.+)\.(?P<number>\d+)$"))
-}
+    fn plain_numeric_suffix_re(&self) -> &Regex {
+        self.plain_numeric_suffix_re.get_or_init(|| re(r"\.\d{3}$"))
+    }
 
-fn parse_marker_numbered_re() -> &'static Regex {
-    static VALUE: OnceLock<Regex> = OnceLock::new();
-    VALUE.get_or_init(|| {
-        re(r"^(?P<prefix>.+)\.(?:part|vol(?:ume)?)[-_ ]*(?P<number>\d+)(?:[-_ ][^.]*)?(?P<tail>(?:\.[^.]+)*)$")
-    })
+    fn parse_archive_numbered_re(&self) -> &Regex {
+        self.parse_archive_numbered_re.get_or_init(|| {
+            re(r"^(?P<prefix>.+)\.(?P<format>7z|zip|rar)\.(?P<number>\d+)(?P<tail>(?:\.[^.]+)*)$")
+        })
+    }
+
+    fn parse_zip_zero_numbered_re(&self) -> &Regex {
+        self.parse_zip_zero_numbered_re
+            .get_or_init(|| re(r"^(?P<prefix>.+\.zip)\.(?P<number>\d{4})(?P<tail>(?:\.[^.]+)*)$"))
+    }
+
+    fn parse_zip_split_re(&self) -> &Regex {
+        self.parse_zip_split_re
+            .get_or_init(|| re(r"^(?P<prefix>.+)\.zx?(?P<number>\d{2,})(?P<tail>(?:\..+)?)$"))
+    }
+
+    fn parse_rar_part_re(&self) -> &Regex {
+        self.parse_rar_part_re
+            .get_or_init(|| re(r"^(?P<prefix>.+)\.part(?P<number>\d+)\.(?P<format>rar|exe)$"))
+    }
+
+    fn parse_old_rar_re(&self) -> &Regex {
+        self.parse_old_rar_re
+            .get_or_init(|| re(r"^(?P<prefix>.+)\.r(?P<number>\d{2,})(?P<tail>(?:\.[^.]+)*)$"))
+    }
+
+    fn parse_plain_numbered_re(&self) -> &Regex {
+        self.parse_plain_numbered_re
+            .get_or_init(|| re(r"^(?P<prefix>.+)\.(?P<number>\d+)$"))
+    }
+
+    fn parse_marker_numbered_re(&self) -> &Regex {
+        self.parse_marker_numbered_re.get_or_init(|| {
+            re(r"^(?P<prefix>.+)\.(?:part|vol(?:ume)?)[-_ ]*(?P<number>\d+)(?:[-_ ][^.]*)?(?P<tail>(?:\.[^.]+)*)$")
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retired_regex_generation_lives_only_until_concurrent_parse_finishes() {
+        // Filename outcome tests miss retained pools and concurrent retirement.
+        // Without this test, old-generation ownership remains unverified.
+        // One synchronized worker covers retirement/reuse without corpus I/O.
+        let cache = RelationRegexCache::default();
+        let first = cache.acquire();
+        let weak = Arc::downgrade(&first);
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let parsing = std::thread::spawn(move || {
+            assert_eq!(
+                parse_volume_candidates_with_regexes("中文.part2.rar.jpg", &first)[0].number,
+                2
+            );
+            ready_tx.send(()).unwrap();
+            resume_rx.recv().unwrap();
+            assert_eq!(
+                parse_volume_candidates_with_regexes("中文.7z.003", &first)[0].number,
+                3
+            );
+        });
+        ready_rx.recv().unwrap();
+        assert!(cache.clear() > 0);
+        assert_eq!(cache.initialized_count(), 0);
+        let second = cache.acquire();
+        assert!(!Arc::ptr_eq(&weak.upgrade().unwrap(), &second));
+        assert_eq!(
+            parse_volume_candidates_with_regexes("中文.z02.jpg", &second)[0].number,
+            2
+        );
+        resume_tx.send(()).unwrap();
+        parsing.join().unwrap();
+        assert!(weak.upgrade().is_none());
+        let second_weak = Arc::downgrade(&second);
+        drop(second);
+        assert!(cache.clear() > 0);
+        assert!(second_weak.upgrade().is_none());
+        assert_eq!(cache.clear(), 0);
+    }
 
     #[test]
     fn ordinary_words_and_invalid_part_numbers_are_not_volumes() {

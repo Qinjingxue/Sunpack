@@ -2187,11 +2187,16 @@ pub(crate) fn reader_cache_stats(py: Python<'_>) -> PyResult<Py<PyDict>> {
     dict.set_item("open_handles", handles)?;
     dict.set_item("cache_shards", CACHE_SHARDS)?;
     dict.set_item("container_capacity", capacity)?;
+    dict.set_item(
+        "relation_regex_cache_entries",
+        crate::relations::regex_cache_entries(),
+    )?;
     Ok(dict.unbind())
 }
 
 #[pyfunction]
 pub(crate) fn clear_reader_resources(py: Python<'_>) -> PyResult<Py<PyDict>> {
+    let relation_regexes = crate::relations::clear_regex_caches();
     crate::password::context::clear();
     crate::analysis_native::clear_stream_structure_cache();
     let (handles, cache_entries, cache_bytes) = manager().clear_resources()?;
@@ -2199,6 +2204,7 @@ pub(crate) fn clear_reader_resources(py: Python<'_>) -> PyResult<Py<PyDict>> {
     dict.set_item("handles", handles)?;
     dict.set_item("cache_entries", cache_entries)?;
     dict.set_item("cache_bytes", cache_bytes)?;
+    dict.set_item("relation_regexes", relation_regexes)?;
     Ok(dict.unbind())
 }
 
