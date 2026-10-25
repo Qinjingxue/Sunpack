@@ -121,7 +121,12 @@ def test_coordinator_rewrites_recorded_result_and_cleanup_input(tmp_path, collis
             assert result.failure.details["blocked_input_failure"]["kind"] == "wrong_password"
         else:
             assert promoted and result.input_path == str(top / inner.name)
-            assert result.failure is original.failure
+            assert result.failure is not original.failure
+            assert result.failure.kind == original.failure.kind
+            assert result.failure.message == original.failure.message
+            assert result.failure.details["promoted_nested_input"] is True
+            assert result.failure.details["discovery_scope"]
+            assert original.failure.details == {}
             assert task.cleanup_parts == [str(top / inner.name)]
             if origin == "watch":
                 assert claims[-1]["groups"] == [{

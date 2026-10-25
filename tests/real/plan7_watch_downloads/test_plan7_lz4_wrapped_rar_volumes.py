@@ -64,25 +64,19 @@ def test_plan7_four_lz4_wrapped_encrypted_rar_volumes_extract_automatically(
         assert not harness.watcher.state.entries
         assert_expected_files_extracted(case, harness.output_root)
 
-        # Blocked inputs are promoted to the input root, where Relations groups
-        # them again. Keep-source mode retains this complete physical retry set.
+        # All verified inner RAR volumes are temporary, even in keep mode.
+        # The user supplied the LZ4 wrappers, and only those follow keep/delete.
         inventory = file_inventory(harness.output_root)
         volume_inventory = file_inventory(harness.watch_root)
-        recovered = {}
         for name, expected in expected_volumes.items():
             matches = [
                 path for path, actual in volume_inventory.items()
                 if Path(path).name == name and actual == expected
             ]
-            if cleanup_mode == "keep":
-                assert len(matches) == 1, f"missing, corrupt or duplicate volume {name}: {matches}"
-                recovered[name] = str(Path(matches[0]).parent)
-            else:
-                assert not matches, f"successful RAR cleanup retained {name}"
-        if cleanup_mode == "keep":
-            assert len(set(recovered.values())) == 1, recovered
-        else:
-            assert not list(harness.watch_root.glob("*.rar*")), "successful cleanup must remove all sources"
+            assert not matches, f"successful nested RAR cleanup retained {name}: {matches}"
+        for source in inputs:
+            preserved = harness.watch_root / source.name
+            assert preserved.exists() == (cleanup_mode == "keep"), preserved
 
         # Each expected member is extracted exactly once, including payload.bin
         # which requires the complete volume set rather than just the head.
@@ -170,20 +164,17 @@ def test_plan7_lz4_wrapped_rar_volumes_arriving_in_separate_directories_extract_
         }
         assert_expected_files_extracted(case, harness.output_root)
 
-        # Each inner volume must be regrouped exactly once and the final data
-        # must exist exactly once, even though every volume arrived separately.
+        # Cross-directory regrouping is established by the single verified
+        # payload below, not by retaining successfully consumed inner volumes.
         volume_inventory = file_inventory(harness.watch_root)
-        volume_dirs = set()
         for name in expected_volumes:
             matches = [
                 path for path, actual in volume_inventory.items()
                 if Path(path).name == name and actual == expected_volumes[name]
             ]
-            assert len(matches) == 1, f"missing, corrupt or duplicate volume {name}: {matches}"
-            volume_dirs.add(Path(matches[0]).parent)
-        assert len(volume_dirs) == len(expected_volumes), (
-            f"volumes must stay split across directories: {volume_dirs}"
-        )
+            assert not matches, f"successful nested RAR volume remained: {matches}"
+        for index, source in enumerate(arrival_sources):
+            assert (harness.watch_root / f"download_{index}" / source.name).is_file()
         inventory = file_inventory(harness.output_root)
         for name in case.metadata["expected_files"]:
             matches = [path for path in inventory if Path(path).name == name]

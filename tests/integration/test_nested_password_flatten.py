@@ -84,7 +84,8 @@ def test_nested_failure_keeps_retry_path_while_success_still_flattens(tmp_path, 
         assert outer.exists() == (cleanup_mode == "k")
 
 
-def test_cli_password_prompt_retries_promoted_input_with_real_pipeline(tmp_path, monkeypatch):
+@pytest.mark.parametrize("cleanup_mode", ["d", "k"])
+def test_cli_password_prompt_retries_promoted_input_with_real_pipeline(tmp_path, monkeypatch, cleanup_mode):
     from types import SimpleNamespace
     from sunpack.runtime.cli.cli_context import CliContext
     from sunpack.runtime.cli.cli_reporter import CliReporter
@@ -94,7 +95,7 @@ def test_cli_password_prompt_retries_promoted_input_with_real_pipeline(tmp_path,
     config = normalize_config(with_detection_pipeline({
         "recursive_extract": "3",
         "output": {"root": str(tmp_path / "out")},
-        "post_extract": {"archive_cleanup_mode": "d", "flatten_single_directory": True},
+        "post_extract": {"archive_cleanup_mode": cleanup_mode, "flatten_single_directory": True},
     }))
     requested = []
 
@@ -123,4 +124,5 @@ def test_cli_password_prompt_retries_promoted_input_with_real_pipeline(tmp_path,
     assert len(payloads) == 1
     assert payloads[0].stat().st_mtime_ns == PAYLOAD_MTIME_NS
     assert payloads[0].stat().st_file_attributes & 1
-    assert not outer.exists() and not (tmp_path / "inner.7z").exists()
+    assert outer.exists() == (cleanup_mode == "k")
+    assert not (tmp_path / "inner.7z").exists()
