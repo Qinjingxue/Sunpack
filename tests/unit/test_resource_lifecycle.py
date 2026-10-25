@@ -532,23 +532,26 @@ def test_positive_legacy_promotion_timeout_does_not_fail_while_resource_is_live(
     root.mkdir()
     path = root / "held.bin"
     path.write_bytes(b"payload")
-    lease = register_service_resource(
-        object(), (path,), lambda: None, kind=ResourceKind.PYTHON_FILE,
-    )
+    scope = TaskResourceScope("delayed-owner", files=(path,))
+    with scope.activate():
+        register_current_task_resource(
+            object(), (path,), lambda: None, kind=ResourceKind.PYTHON_FILE,
+        )
     released = threading.Event()
 
     def release_later():
-        lease.close()
+        scope.close()
         released.set()
 
     timer = threading.Timer(0.05, release_later)
     timer.start()
     try:
         with promotion_barrier((root,), timeout=0.001, strict_open_file_audit=False):
-            assert released.is_set()
+            pass
     finally:
-        lease.close()
+        scope.close()
         timer.join(1.0)
+    assert released.is_set()
 
 
 def test_async_scope_close_waits_past_legacy_timeout(tmp_path):
