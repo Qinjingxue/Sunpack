@@ -1174,15 +1174,6 @@
       "max": null,
       "integer": true
     },
-    "/performance/worker/backpressure_retries": {
-      "label": {
-        "zh": "队列拥堵重试次数",
-        "en": "Queue congestion retries"
-      },
-      "min": 0,
-      "max": null,
-      "integer": true
-    },
     "/performance/worker/writer_threads": {
       "label": {
         "zh": "写入线程数",
