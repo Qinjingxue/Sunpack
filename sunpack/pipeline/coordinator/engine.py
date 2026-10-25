@@ -1521,9 +1521,18 @@ class _RequestRuntime:
             )
             watch_version = task.runtime.get("source_generation", watch_version)
             retain_watch_lease = bool(watch_version and outcome.outcome_kind == OutcomeKind.COMPLETE_SUCCESS)
-            # A promoted child can fail more than once after re-entering Watch as
-            # a depth-1 input. Keep its provenance in the existing failure record.
-            if depth == 1 and self.config.get("watch_promoted_nested_input") and result.failure is not None:
+            # A promoted child re-enters the pipeline at depth 1 after a
+            # password retry. Match the CLI retry's input paths individually,
+            # rather than changing the cleanup mode of an entire batch.
+            cli_promoted_paths = self.config.get("promoted_nested_retry_paths", ())
+            promoted_retry = depth == 1 and (
+                bool(self.config.get("watch_promoted_nested_input"))
+                or bool(cli_promoted_paths) and any(
+                    case_key(os.path.abspath(path)) in cli_promoted_paths
+                    for path in (task.cleanup_parts or task.all_parts or [task.main_path])
+                )
+            )
+            if promoted_retry and result.failure is not None:
                 result = replace(result, failure=replace(
                     result.failure,
                     details={**result.failure.details, "promoted_nested_input": True},
@@ -1555,7 +1564,7 @@ class _RequestRuntime:
                 lease_id=None if retain_watch_lease else id(task),
                 mode_override=(
                     "delete"
-                    if depth > 1 or self.config.get("watch_promoted_nested_input") else None
+                    if depth > 1 or promoted_retry else None
                 ),
             )
 

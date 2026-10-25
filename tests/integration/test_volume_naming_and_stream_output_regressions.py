@@ -251,8 +251,8 @@ def test_unnamed_xz_stream_keeps_input_name_under_output_collision(tmp_path, emb
     assert Path(outer.output_dir) != collision
     assert Path(outer.output_dir).name == "inner(1)"
     recovered = Path(outer.output_dir) / inner.name
-    assert recovered.is_file(), file_inventory(output_root)
-    assert file_inventory(Path(outer.output_dir))[inner.name] == file_inventory(tmp_path)[inner.name]
+    # The XZ's nested 7z is now an intermediate, not a retained user input.
+    assert not recovered.exists(), file_inventory(output_root)
     nested = next(result for result in results if result.input_path != str(stream))
     assert Path(nested.input_path) == recovered
     assert file_inventory(Path(nested.output_dir)) == file_inventory(payload_root)

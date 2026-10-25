@@ -13,17 +13,15 @@ from tests.real.plan7_watch_downloads.plan7_support import (
 )
 
 
-@pytest.mark.parametrize(("outer_format", "cleanup_mode"), [
-    ("7z", "delete"), ("zip", "delete"), ("rar", "delete"), ("zip", "keep"),
-])
+@pytest.mark.parametrize("outer_format", ["7z", "zip", "rar"])
 def test_plan7_disguised_split_nested_carrier_survives_two_restarts_and_password_update(
-    tmp_path, plan7_error, outer_format, cleanup_mode,
+    tmp_path, plan7_error, outer_format,
 ):
     if outer_format == "rar" and get_optional_rar() is None:
         pytest.skip("RAR writer is required")
     case = build_nested_case(tmp_path / "fixtures", f"watch-{outer_format}", outer_format)
     label = f"nested-lifecycle-{outer_format}"
-    options = dict(passwords=list(case.passwords[:2]), cleanup_mode=cleanup_mode, flatten_single_directory=True)
+    options = dict(passwords=list(case.passwords[:2]), cleanup_mode="delete", flatten_single_directory=True)
     first = start_watch(tmp_path, label, **options)
     try:
         # Reverse the data-volume arrival order, leave the tail absent, and
@@ -71,11 +69,56 @@ def test_plan7_disguised_split_nested_carrier_survives_two_restarts_and_password
         assert result.succeeded == 1
         assert not third.watcher.state.entries
         assert not retry_input.exists(), "successful retry must clean the retained inner archive"
-        if cleanup_mode == "keep":
-            assert all((third.watch_root / part.name).exists() for part in case.parts)
         assert_nested_outputs(third.output_root, case, leaf_success=True)
     finally:
         third.close()
+
+
+def test_plan7_keep_nested_password_retry_deletes_inner_without_restarting(tmp_path, plan7_error):
+    """Keep-mode password recovery is independent of cold-start rescanning."""
+    case = build_nested_case(tmp_path / "fixtures", "watch-zip-keep", "zip")
+    harness = start_watch(
+        tmp_path, "nested-keep-password", passwords=list(case.passwords[:2]),
+        cleanup_mode="keep", flatten_single_directory=True,
+    )
+    try:
+        # Last volume arrives last, after all earlier parts were observed.
+        for part in reversed(case.parts[:-1]):
+            arrive_slowly(harness, part)
+        assert not marker_present(harness.output_root, case.ready_marker)
+        arrive_slowly(harness, case.parts[-1])
+        drive_watch_until(harness.watcher, lambda: any(
+            Path(entry.path).name == case.blocked_name and entry.status == "failed_password"
+            for entry in harness.watcher.state.entries.values()
+        ))
+        entries = list(harness.watcher.state.entries.values())
+        assert len(entries) == 1
+        entry = entries[0]
+        assert entry.failure_kind == FailureKind.WRONG_PASSWORD.value
+        assert entry.failure_payload["details"]["promoted_nested_input"] is True
+        retry_input = Path(entry.path)
+        assert retry_input.is_file()
+        assert_nested_outputs(harness.output_root, case, leaf_success=False)
+
+        # Retry in the same Watch lifetime, so preserved outer volumes do not
+        # enter a new initial scan and mask the password-cleanup contract.
+        from tests.helpers.passwords import write_password_json
+        password_file = harness.watcher._password_file_source.path
+        write_password_json(
+            password_file, scopes=[(password, [str(harness.watch_root)])
+                                   for password in ["wrong-again", *case.passwords]],
+        )
+        harness.watcher.notify_password_source_changed("builtin_password_file")
+        result = drive_watch_until(harness.watcher, lambda: marker_present(
+            harness.output_root, case.blocked.marker_name,
+        ))
+        assert result.failed == 0
+        assert not harness.watcher.state.entries
+        assert not retry_input.exists()
+        assert all((harness.watch_root / part.name).is_file() for part in case.parts)
+        assert_nested_outputs(harness.output_root, case, leaf_success=True)
+    finally:
+        harness.close()
 
 
 def test_plan7_cp437_names_inside_encrypted_disguised_split_carrier(tmp_path, plan7_error):

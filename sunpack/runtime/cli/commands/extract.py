@@ -26,6 +26,7 @@ from sunpack.core.contracts.failures import FailureInfo
 from sunpack.core.contracts.retry_targets import (
     merge_latest_results,
     password_retry_paths,
+    password_retry_results,
 )
 from sunpack.core.contracts.results import RunSummary
 from sunpack.core.contracts.run_state import RunState
@@ -198,6 +199,13 @@ async def handle(args, ctx):
                 reporter.info(ctx.t("cli.extract.retry_no_passwords"))
                 break
             passwords = _dedupe([*passwords, *new_passwords])
+            # Only promoted nested retries should be deleted under keep mode.
+            # This immutable, request-local set is replaced on each retry round.
+            run_config["promoted_nested_retry_paths"] = frozenset(
+                case_key(os.path.abspath(item.input_path))
+                for item in password_retry_results(summary)
+                if item.failure.details.get("promoted_nested_input") is True
+            )
             current_targets = retry_targets
             retry_count += 1
             reporter.info(ctx.t("cli.extract.retry_round"))
