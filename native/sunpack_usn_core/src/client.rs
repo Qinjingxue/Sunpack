@@ -27,7 +27,6 @@ use windows_sys::Win32::System::Services::{
     SERVICE_START, SERVICE_STATUS_PROCESS, SERVICE_STOPPED, SERVICE_STOP_PENDING,
 };
 
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 static REQUEST_IDS: AtomicU64 = AtomicU64::new(1);
 static STATE: OnceLock<Mutex<ClientState>> = OnceLock::new();
 
@@ -447,7 +446,6 @@ fn start_service() -> io::Result<()> {
         unsafe { CloseServiceHandle(manager) };
         return Err(io::Error::last_os_error());
     }
-    let stop_deadline = Instant::now() + CONNECT_TIMEOUT;
     loop {
         let status = match query_service_status(service) {
             Ok(status) => status,
@@ -461,16 +459,6 @@ fn start_service() -> io::Result<()> {
         };
         if status.dwCurrentState != SERVICE_STOP_PENDING {
             break;
-        }
-        if Instant::now() >= stop_deadline {
-            unsafe {
-                CloseServiceHandle(service);
-                CloseServiceHandle(manager);
-            }
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "SunPack Watch Broker did not finish stopping",
-            ));
         }
         thread::sleep(Duration::from_millis(25));
     }
@@ -486,7 +474,6 @@ fn start_service() -> io::Result<()> {
             return Err(io::Error::from_raw_os_error(error as i32));
         }
     }
-    let deadline = Instant::now() + CONNECT_TIMEOUT;
     loop {
         let status = match query_service_status(service) {
             Ok(status) => status,
@@ -501,14 +488,14 @@ fn start_service() -> io::Result<()> {
         if status.dwCurrentState == SERVICE_RUNNING {
             break;
         }
-        if status.dwCurrentState == SERVICE_STOPPED || Instant::now() >= deadline {
+        if status.dwCurrentState == SERVICE_STOPPED {
             unsafe {
                 CloseServiceHandle(service);
                 CloseServiceHandle(manager);
             }
             return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "SunPack Watch Broker did not reach RUNNING",
+                io::ErrorKind::Other,
+                format!("SunPack Watch Broker stopped before RUNNING (Win32 exit {})", status.dwWin32ExitCode),
             ));
         }
         thread::sleep(Duration::from_millis(25));
@@ -547,7 +534,6 @@ fn connect_pipe() -> io::Result<BrokerConnection> {
         PIPE_NAME,
         TEST_PIPE_NAME_PREFIX,
     ));
-    let deadline = Instant::now() + CONNECT_TIMEOUT;
     loop {
         let handle = unsafe {
             CreateFileW(
@@ -572,12 +558,6 @@ fn connect_pipe() -> io::Result<BrokerConnection> {
         let error = unsafe { GetLastError() };
         if error != ERROR_FILE_NOT_FOUND && error != ERROR_PIPE_BUSY {
             return Err(io::Error::from_raw_os_error(error as i32));
-        }
-        if Instant::now() >= deadline {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "SunPack Watch Broker pipe was not ready",
-            ));
         }
         unsafe {
             WaitNamedPipeW(pipe_name.as_ptr(), 50);
