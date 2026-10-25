@@ -637,7 +637,7 @@ def test_source_indexes_release_buckets_and_peak_tables_after_each_batch():
 def test_request_completion_always_releases_source_index(completion):
     watcher = _claim_scheduler_for_test()
     path = os.path.abspath("completion.disguised")
-    request = SimpleNamespace(source_groups={"group": object()},
+    request = SimpleNamespace(source_groups={"group": object()}, top_level_keys=set(),
         notification_id="owner", candidate=WatchCandidate(path, 10, 1.0, "file", 1),
         registry_owner="",
     )
@@ -2244,17 +2244,21 @@ def test_unstructured_nested_password_failure_is_terminal_without_retry_anchor(t
     assert [event[0] for event in notifications.events] == ["submitted", "failed"]
 
 
-def test_nested_waiting_completion_retires_all_processing_cards(tmp_path):
-    # Scalar request outcomes cannot catch a successful parent/child remaining
-    # "processing" when another nested child blocks. No extraction is needed.
+@pytest.mark.parametrize("kind", [None, FailureKind.WRONG_PASSWORD, FailureKind.MISSING_VOLUME, FailureKind.DAMAGED])
+def test_nested_completion_only_publishes_top_level_and_promoted_blockers(tmp_path, kind):
+    # Projection-only tests cannot catch recursive progress becoming visible
+    # again, or suppressing nested failures together with their cards. Reuse
+    # one three-level request to cover success, terminal failure and both waits.
     import json
     outer, locked, leaf = (tmp_path / name for name in ("carrier.fake", "nested.001", "leaf.bin"))
     for path in (outer, locked, leaf):
         path.write_bytes(b"fixture")
-    failure = FailureInfo(FailureKind.WRONG_PASSWORD, "extraction", "locked nested input")
+    failure = FailureInfo(kind, "extraction", "locked nested input") if kind else None
+    blocked = kind in {FailureKind.WRONG_PASSWORD, FailureKind.MISSING_VOLUME}
     summary = RunSummary(target_results=(
         TargetRunResult(str(outer), OutcomeKind.COMPLETE_SUCCESS),
-        TargetRunResult(str(locked), OutcomeKind.FAILURE, failure=failure, error=failure.message),
+        TargetRunResult(str(locked), OutcomeKind.FAILURE if failure else OutcomeKind.COMPLETE_SUCCESS,
+                        failure=failure, error=failure.message if failure else ""),
         TargetRunResult(str(leaf), OutcomeKind.COMPLETE_SUCCESS),
     ))
     watcher = _watcher(tmp_path)
@@ -2267,22 +2271,35 @@ def test_nested_waiting_completion_retires_all_processing_cards(tmp_path):
             "nested", WatchCandidate(str(outer), 7, 1.0), asyncio.create_task(complete()),
             password_generation=watcher.state.password_generation,
         )
-        watcher._handle_pipeline_progress(str(outer), "nested", SimpleNamespace(), {
-            "event": "task_sources_claimed", "depth": 1,
-            "source_paths": [str(path) for path in (outer, locked, leaf)],
-            "groups": [{"path": str(path), "name": path.name, "members": [str(path)]}
-                       for path in (outer, locked, leaf)],
-        }, request=request)
+        for depth, path in enumerate((outer, locked, leaf), 1):
+            watcher._handle_pipeline_progress(str(outer), "nested", SimpleNamespace(runtime={}), {
+                "event": "task_sources_claimed", "depth": depth,
+                "source_paths": [str(path)],
+                "groups": [{"path": str(path), "name": path.name, "members": [str(path)]}],
+            }, request=request)
+        if blocked:
+            watcher._handle_pipeline_progress(str(outer), "nested", SimpleNamespace(runtime={}), {
+                "event": "task_sources_claimed", "promoted_nested_input": True,
+                "source_paths": [str(locked)],
+                "groups": [{"path": str(locked), "name": locked.name, "members": [str(locked)]}],
+            }, request=request)
         try:
             result = await watcher._complete_candidate(request)
-            assert result.failed == 1
-            group = watcher.state.latest_entry_for_path(str(locked)).failure_payload["source_group"]
-            assert group["members"] == [str(locked)] and group["name"] == locked.name
+            assert result.failed == int(failure is not None)
+            if blocked:
+                group = watcher.state.latest_entry_for_path(str(locked)).failure_payload["source_group"]
+                assert group["members"] == [str(locked)] and group["name"] == locked.name
             watcher.log.flush()
             records = [json.loads(line) for line in watcher.log.path.read_text(encoding="utf-8").splitlines()]
             latest = {r["path"]: r["event"] for r in records
-                      if r["event"] in {"processing_started", "done", "failed_password"}}
-            assert latest == {str(outer): "done", str(locked): "failed_password", str(leaf): "done"}
+                      if r["event"] in {"processing_started", "done", "failed_password", "suspended_missing_volume", "failed_terminal"}}
+            expected = {str(outer): "failed_terminal" if kind == FailureKind.DAMAGED else "done"}
+            if blocked:
+                expected[str(locked)] = "failed_password" if kind == FailureKind.WRONG_PASSWORD else "suspended_missing_volume"
+            assert latest == expected
+            visible_groups = [g["path"] for r in records if r["event"] == "pipeline_sources_claimed"
+                              and r.get("processing") for g in r["groups"]]
+            assert visible_groups == [str(outer)]
         finally:
             await watcher.aclose()
     _await(scenario())

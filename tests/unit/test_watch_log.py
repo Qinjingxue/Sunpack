@@ -33,7 +33,8 @@ def test_shared_async_log_compacts_history_without_losing_active_groups(tmp_path
     # Force one more compaction after the concurrent burst has drained.
     for n in range(80):
         store.write("scheduler_tick", padding="x" * 120)
-    store.write("scheduler_tick", padding="x" * (1024 * 1024 + 1))
+    for _ in range(16):
+        store.write("scheduler_tick", padding="x" * 4096)
     store.flush()
     rows = _records(path)
     assert len({r["path"] for r in rows if r["event"] == "processing_started"}) == 40
@@ -48,9 +49,12 @@ def test_shared_async_log_compacts_history_without_losing_active_groups(tmp_path
     assert _records(path)[-1]["event"] == "done"
     other.write("processing_started", path=b)
     other.write("no_tasks_found", path=b, retire_group=True)
-    other.write("scheduler_tick", padding="x" * (1024 * 1024 + 1))
+    for _ in range(16):
+        other.write("scheduler_tick", padding="x" * 4096)
     other.flush()
-    assert not any(r["event"] == "pipeline_sources_claimed" for r in _records(path))
+    # Retiring a fresh empty request must preserve the previous execution.
+    assert any(r["event"] == "done" and r["path"] in {a, b} for r in _records(path))
+    assert not any(r["event"] == "processing_started" and r["path"] == b for r in _records(path))
     other.close()
     diagnostic = WatchLogStore(str(tmp_path / "runtime-test.state.events.jsonl"), max_bytes=2048)
     for n in range(100): diagnostic.write("host_event", index=n, padding="x" * 120)

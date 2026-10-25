@@ -126,6 +126,7 @@ class _ActivePipelineRequest:
     source_input_root: str = ""
     deep_detect: bool = False
     source_paths: tuple[str, ...] = ()
+    top_level_keys: set[str] = field(default_factory=set)
     password_scope_dir: str = ""
     source_groups: dict[str, dict] = field(default_factory=dict)
 
@@ -1021,7 +1022,7 @@ class WatchScheduler:
                     error_type=type(exc).__name__,
                     phase="pipeline_completion",
                 )
-                self.log.write("failed_terminal", path=request.candidate.path, error=str(exc))
+                self.log.write("failed_terminal", path=request.candidate.path, owner=request.notification_id, error=str(exc))
                 self.enqueue(
                     request.candidate.path,
                     force=True,
@@ -1036,6 +1037,7 @@ class WatchScheduler:
             # source cleanup promotion have already ended. Hand off only paths
             # that actually changed while this request owned them.
             request.source_paths = ()
+            request.top_level_keys.clear()
             request.source_groups.clear()
             self._release_pipeline_source_claims(request.notification_id, request_path=request.candidate.path)
             if request.registry_owner:
@@ -1480,7 +1482,7 @@ class WatchScheduler:
 
     def _claim_pipeline_sources(
         self, owner: str, paths: Iterable[str], *, path: str = "", groups: list[dict] | None = None,
-        promoted_paths: Iterable[str] = (),
+        promoted_paths: Iterable[str] = (), processing: bool = True,
     ) -> bool:
         normalized = dedupe_normalized_paths(
             os.path.abspath(str(path))
@@ -1536,7 +1538,7 @@ class WatchScheduler:
             "pipeline_sources_claimed",
             path=path,
             groups=groups or (),
-            processing=True,
+            processing=processing,
             owner=owner,
             path_count=len(normalized),
             retired_pending=len(retired_pending),
@@ -2087,6 +2089,7 @@ class WatchScheduler:
                 # Reuse the published tuple. Keep this request's input evidence
                 # even if live source claims transfer to a newer family owner.
                 request.source_paths = tuple(source_paths)
+                request.top_level_keys.update(path_key(path) for path in source_paths)
             groups = event.get("groups") or ()
             if request is not None:
                 for group in groups:
@@ -2101,8 +2104,15 @@ class WatchScheduler:
                 # adopted during missing-volume recovery. Read only its parts.
                 promoted_paths = self.state.promoted_nested_input_paths(source_paths)
             promoted = self._claim_pipeline_sources(
-                notification_id, source_paths, path=owner_path, groups=groups,
+                notification_id, source_paths, path=owner_path,
+                # Source ownership includes recursion and promotion; GUI work
+                # only includes the request's top-level groups. Durable nested
+                # blockers publish their own waiting state through the WAL.
+                # Depthless groups are top-level lease updates or explicitly
+                # promoted blockers; the latter carry no processing status.
+                groups=groups if event.get("depth", 1) == 1 else (),
                 promoted_paths=promoted_paths,
+                processing=event.get("promoted_nested_input") is not True,
             )
             if promoted and "depth" not in event:
                 # Live publication claims cover the gap before failure state
@@ -2165,6 +2175,7 @@ class WatchScheduler:
             self.log.write(
                 "pipeline_request_coalesced",
                 path=candidate.path,
+                owner=request.notification_id,
                 owner_request_id=coalesced_from,
                 claimed_paths=claimed_paths,
             )
@@ -2295,11 +2306,11 @@ class WatchScheduler:
         ]
         failed = summary.failed_tasks
 
-        # Every backend-confirmed group needs its own outcome, including nested
-        # archives. The request's main input alone cannot retire child cards.
+        # Only top-level groups have processing cards. Nested outcomes still
+        # contribute to the request result and durable recovery blockers above.
         for item in results:
             task_path = result_path(item)
-            if not task_path:
+            if not task_path or path_key(task_path) not in request.top_level_keys:
                 continue
             if (path_key(task_path) == path_key(candidate.path)
                     and not (waiting_failures or recorded_password_failures or retired_failures)):
@@ -2309,9 +2320,10 @@ class WatchScheduler:
                 continue
             outcome = result_outcome(item)
             if outcome == OutcomeKind.COMPLETE_SUCCESS:
-                self.log.write("done", path=task_path, output_dirs=[item.output_dir] if item.output_dir else [])
+                self.log.write("done", path=task_path, owner=request.notification_id,
+                               output_dirs=[item.output_dir] if item.output_dir else [])
             elif outcome in {OutcomeKind.FAILURE, OutcomeKind.PARTIAL_SUCCESS}:
-                self.log.write("failed_terminal", path=task_path, error=result_error(item))
+                self.log.write("failed_terminal", path=task_path, owner=request.notification_id, error=result_error(item))
 
         if terminal_failures:
             payloads = [_failure_to_dict(failure) for failure in terminal_failures]
@@ -2336,6 +2348,7 @@ class WatchScheduler:
             self.log.write(
                 "failed_terminal",
                 path=candidate.path,
+                owner=request.notification_id,
                 error=error,
                 failures=payloads,
             )
@@ -2364,7 +2377,7 @@ class WatchScheduler:
         if failed:
             # Unstructured failures cannot participate in an automatic wait.
             error = failed[0]
-            self.log.write("failed_terminal", path=candidate.path, error=error, failures=[])
+            self.log.write("failed_terminal", path=candidate.path, owner=request.notification_id, error=error, failures=[])
             self._notify("failed", request.notification_id, failed, [])
             return WatchRunResult(processed=1, failed=1, errors=failed)
 
@@ -2380,25 +2393,26 @@ class WatchScheduler:
             with self._claim_gate:
                 claim = self._active_claims.get(path_key(candidate.path))
                 retire_group = claim is None or claim.owner == request.notification_id
-            self.log.write("no_tasks_found", path=candidate.path, retire_group=retire_group)
+            self.log.write("no_tasks_found", path=candidate.path, owner=request.notification_id, retire_group=retire_group)
             self._notify("suppressed", request.notification_id)
             return WatchRunResult(processed=1)
 
         if direct_outcome == OutcomeKind.PARTIAL_SUCCESS:
             error = self.i18n.t("watch.failure.partial_rejected")
-            self.log.write("partial_rejected", path=candidate.path, error=error)
+            self.log.write("partial_rejected", path=candidate.path, owner=request.notification_id, error=error)
             self._notify("failed", request.notification_id, [error], [])
             return WatchRunResult(processed=1, failed=1, errors=[error])
 
         if direct_outcome != OutcomeKind.COMPLETE_SUCCESS:
             error = self.i18n.t("watch.failure.no_complete_outcome")
-            self.log.write("failed_terminal", path=candidate.path, error=error, failures=[])
+            self.log.write("failed_terminal", path=candidate.path, owner=request.notification_id, error=error, failures=[])
             self._notify("failed", request.notification_id, [error], [])
             return WatchRunResult(processed=1, failed=1, errors=[error])
 
         self.log.write(
             "done",
             path=candidate.path,
+            owner=request.notification_id,
             success_count=summary.success_count,
             output_dirs=generated_output_dirs,
         )

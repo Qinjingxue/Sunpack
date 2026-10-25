@@ -461,3 +461,141 @@ def test_native_and_gui_share_member_retirement_and_real_request_lifetimes(tmp_p
         assert compact()["total"]==0
     finally:
         log.close()
+
+
+def test_execution_history_survives_regroup_retry_and_compaction(tmp_path):
+    # Existing distinct-path tests cannot detect overwriting same-path history
+    # or an old eviction unlinking a live alias. One real writer/GUI scenario
+    # covers both, including snapshot replay and the existing byte budget.
+    from sunpack.runtime.watch.log import WatchLogStore
+    log = WatchLogStore(str(tmp_path / "events.jsonl"), max_bytes=32768)
+    a, b = (str(tmp_path / name) for name in ("carrier.fake", "unrelated.bin"))
+    group = {"path": a, "name": "payload.rar", "members": [a, b]}
+
+    def rows():
+        log.flush()
+        result = _state_projection(log.path)["tasks"]["rows"]
+        for row in result:
+            row.pop("sortSequence")  # Replay-local tie breaker, not identity.
+        return result
+
+    def compact():
+        # Drain first, then exceed the obsolete-byte threshold in a single
+        # writer batch. The next read must come from a rewritten snapshot.
+        log.flush()
+        for _ in range(32):
+            log.write("diagnostic", message="x" * 4096)
+        return rows()
+
+    try:
+        log.recover()
+        log.write("processing_started", path=b, owner="first", ts=1)
+        log.write("pipeline_sources_claimed", owner="first", processing=True,
+                  groups=[group], ts=2)
+        log.write("done", path=b, owner="first", output_dirs=["old-output"], ts=3)
+        old, = rows()
+        assert old["path"] == a and old["status"] == "taskSucceeded"
+        log.write("processing_started", path=b, owner="second", ts=4)
+        current = rows()
+        assert len(current) == 2 and old in current
+        retry_id = next(r["id"] for r in current if r["status"] == "taskProcessing")
+        log.write("pipeline_sources_claimed", owner="second", processing=True,
+                  groups=[{"path": b, "name": "payload.rar", "members": [b]}], ts=5)
+        log.write("suspended_missing_volume", path=b, ts=6)
+        log.write("processing_started", path=a, owner="third", ts=7)
+        log.write("pipeline_sources_claimed", owner="third", processing=True, groups=[group], ts=8)
+        log.write("pipeline_sources_released", owner="second", paths=[a, b])
+        log.write("failed_terminal", owner="second", path=b, ts=8)
+        log.write("failed_password", path=b, ts=9)
+        current = rows()
+        assert len(current) == 2 and old in current
+        waiting, = [r for r in current if r["status"] == "taskWaiting"]
+        assert waiting["id"] == retry_id and waiting["partCount"] == 2
+        assert waiting["statusText"] == "等待密码"
+        assert compact() == current
+        log.write("processing_started", path=b, owner="fourth", ts=10)
+        log.write("done", path=a, owner="fourth", output_dirs=["new-output"], ts=11)
+        current = rows()
+        assert len(current) == 2 and old in current
+        assert {r["id"] for r in current} == {old["id"], retry_id}
+        assert all(r["status"] == "taskSucceeded" for r in current)
+        assert compact() == current
+        # Evict old executions at the same physical paths. Their cleanup must
+        # not remove the aliases of the new waiting task.
+        for index in range(80):
+            owner = f"burst-{index}"
+            log.write("processing_started", path=a, owner=owner)
+            log.write("pipeline_sources_claimed", owner=owner, processing=True, groups=[group])
+            log.write("done", path=b, owner=owner)
+        log.write("processing_started", path=a, owner="active")
+        log.write("pipeline_sources_claimed", owner="active", processing=True, groups=[group])
+        log.write("failed_password", path=b)
+        current = compact()
+        assert 1 < len(current) < 82
+        assert len([r for r in current if r["status"] == "taskWaiting"]) == 1
+        assert log.path.stat().st_size < 65536
+        log.write("blocker_cleared", path=b, task_path=a)
+        assert all(r["status"] == "taskSucceeded" for r in compact())
+    finally:
+        log.close()
+
+
+def test_real_recursive_watch_executions_keep_two_outer_rows(tmp_path, monkeypatch):
+    # Synthetic events cannot detect the real pipeline dropping depth on a
+    # lease/promotion update. Two tiny carrier executions cover all three
+    # language boundaries without a format matrix or extra monitor process.
+    import asyncio
+    import io
+    import zipfile
+    from sunpack.pipeline.coordinator.engine import PipelineEngine
+    from sunpack.runtime.watch.scheduler import WatchScheduler
+    from sunpack.runtime.watch.scanner import watch_candidate_for_path
+    from sunpack.runtime.watch.roots import WatchRootEntry
+    from tests.helpers.config_factory import make_config
+    # Submit directly without a filesystem observer or USN service.
+    monkeypatch.setattr("sunpack.runtime.watch.scheduler.validate_ntfs_watch_roots", lambda _roots: None)
+
+    root = tmp_path / "input"
+    root.mkdir()
+    source = root / "A.disguised"
+    config = make_config({
+        "recursive_extract": "3", "detection": {"enabled": True},
+        "watch": {"clipboard_monitor_enabled": False},
+        "post_extract": {"archive_cleanup_mode": "d"},
+    })
+
+    def archive(name, payload):
+        stream = io.BytesIO()
+        with zipfile.ZipFile(stream, "w") as package:
+            package.writestr(name, payload)
+        return stream.getvalue()
+
+    async def scenario():
+        async with PipelineEngine(config) as engine:
+            watcher = WatchScheduler(config, [str(root)], pipeline_engine=engine,
+                state_path=str(tmp_path / "state.snapshot"), root_entries=[
+                    WatchRootEntry(str(root), str(tmp_path / "output"), deep_detect=True)])
+            try:
+                watcher.log.recover()
+                first_id = None
+                for index in range(2):
+                    payload = archive("B.other", archive("C.blob", archive("payload.txt", f"payload-{index}")))
+                    source.write_bytes(b"carrier-prefix" + payload + b"carrier-tail")
+                    scope, = watcher.scopes.values()
+                    watcher._scan_options.catalog_update(watcher._catalog, scope.native)
+                    request = await watcher._submit_candidate(watch_candidate_for_path(str(source)))
+                    assert request is not None
+                    result = await watcher._finish_active_request(request)
+                    assert result.failed == 0 and result.succeeded == 3
+                    watcher.log.flush()
+                    rows = _state_projection(watcher.log.path)["tasks"]["rows"]
+                    assert len(rows) == index + 1
+                    assert all(row["path"] == str(source) and row["status"] == "taskSucceeded" for row in rows)
+                    if first_id is None:
+                        first_id = rows[0]["id"]
+                    else:
+                        assert len({row["id"] for row in rows}) == 2
+                        assert first_id in {row["id"] for row in rows}
+            finally:
+                await watcher.aclose()
+    asyncio.run(scenario())

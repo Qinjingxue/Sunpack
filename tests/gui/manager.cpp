@@ -215,6 +215,23 @@ void logical_projection(Fixture& f) {
     send("processing_started",a);
     replay(Json{{"event","no_tasks_found"},{"path",a},{"retire_group",true}});
     assert(displayed.empty()); // The confirmed owner can explicitly retire a stale group.
+    // Rust publishes execution IDs on both live events and compacted groups.
+    // Replaying those IDs must preserve history in the existing delta stream.
+    auto claim_execution=[&](const std::string& id) {
+        replay(Json{{"event","pipeline_sources_claimed"},{"processing",true},{"groups",Json::array({
+            Json{{"path",a},{"name","movie.rar"},{"members",{a,b}},{"task_id",id}}})}});
+    };
+    claim_execution("first");
+    replay(Json{{"event","done"},{"path",a},{"task_id","first"},{"output_dirs",{"old-output"}}});
+    auto old=row();
+    claim_execution("second");
+    assert(displayed.size()==2 && displayed.at("first")==old);
+    replay(Json{{"event","failed_password"},{"path",b},{"task_id","second"}});
+    View selected_root; selected_root.task_root=utf8((f.dir/"parts").wstring());
+    WatchRoots roots; roots.entries={{f.dir/"parts","",false}};
+    assert(task_rows(log,roots,selected_root).at("total")==2);
+    replay(Json{{"event","blocker_cleared"},{"path",b},{"task_path",a},{"task_id","second"}});
+    assert(displayed.size()==1 && displayed.at("first")==old);
     // Reset must release aliases as well as visible history.
     overwrite(file,event("processing_started",wide(b),100)); assert(log.refresh() && log.rebuilt);
     assert(row()["name"]=="unrelated.bin" && row()["partCount"]==0);

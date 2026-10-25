@@ -651,8 +651,12 @@ void EventLog::mark_changed(const std::wstring& key) {
 void EventLog::erase_task(const std::wstring& key) {
     auto it=tasks.find(key);
     if(it==tasks.end()) return;
-    for(auto& member:it->second.members) aliases_.erase(member);
-    aliases_.erase(path_key(wide(it->second.path)));
+    auto unalias=[&](const std::wstring& member) {
+        auto alias=aliases_.find(member);
+        if(alias!=aliases_.end() && alias->second==key) aliases_.erase(alias);
+    };
+    for(auto& member:it->second.members) unalias(member);
+    unalias(path_key(wide(it->second.path)));
     tasks.erase(it); mark_changed(key);
 }
 void EventLog::accept_group(const Json& group,const std::string& owner) {
@@ -665,17 +669,18 @@ void EventLog::accept_group(const Json& group,const std::string& owner) {
         members.insert(path_key(wide(member.get_ref<const std::string&>())));
     }
     if(members.empty()) return;
-    auto key=path_key(wide(path));
+    auto explicit_id=group.value("task_id",std::string());
+    auto key=explicit_id.empty()?path_key(wide(path)):wide(explicit_id);
     std::unordered_set<std::wstring> previous;
     for(auto& member:members) {
         auto alias=aliases_.find(member);
         auto old=alias==aliases_.end()?member:alias->second;
-        if(tasks.count(old)) previous.insert(old);
+        if(tasks.count(old) && (!terminal(tasks.at(old)) || old==key)) previous.insert(old);
     }
     if(tasks.count(key)) previous.insert(key);
     // Keep the established card ID even when a newly arrived first volume
     // changes the descriptor's main path. Provisional request cards retire.
-    for(auto& old:previous) if(!tasks.at(old).name.empty()) { key=old; break; }
+    if(explicit_id.empty()) for(auto& old:previous) if(!tasks.at(old).name.empty()) { key=old; break; }
     Task task;
     for(auto& old:previous) {
         auto& candidate=tasks.at(old);
@@ -712,7 +717,8 @@ void EventLog::accept(const Json& j) {
         if(j.contains("groups") && j["groups"].is_array()) for(auto& group:j["groups"]) {
             accept_group(group,j.value("owner",std::string()));
             if(j.value("processing",false) && group.is_object()) accept(Json{{"event","processing_started"},
-                {"path",group.value("path",std::string())},{"owner",j.value("owner",std::string())},{"ts",j.value("ts",Json())},{"time",j.value("time",Json())}});
+                {"path",group.value("path",std::string())},{"task_id",group.value("task_id",std::string())},
+                {"owner",j.value("owner",std::string())},{"ts",j.value("ts",Json())},{"time",j.value("time",Json())}});
         }
         return;
     }
@@ -731,11 +737,15 @@ void EventLog::accept(const Json& j) {
     if(path.empty()) return;
     auto physical=path_key(wide(path));
     auto alias=aliases_.find(physical);
-    auto key=alias==aliases_.end()?physical:alias->second;
-    if(event=="task_retired" && j.value("scope",std::string())=="task") { erase_task(key); return; }
+    auto explicit_id=j.value("task_id",std::string());
+    auto key=explicit_id.empty()?(alias==aliases_.end()?physical:alias->second):wide(explicit_id);
+    if(event=="task_retired" && j.value("scope",std::string())=="task") {
+        if(tasks.count(key) && !terminal(tasks.at(key))) erase_task(key); return;
+    }
     if(event=="blocker_cleared") {
         auto physical=path_key(wide(j.value("task_path",path)));
-        auto alias=aliases_.find(physical); auto key=alias==aliases_.end()?physical:alias->second;
+        auto alias=aliases_.find(physical);
+        auto key=explicit_id.empty()?(alias==aliases_.end()?physical:alias->second):wide(explicit_id);
         auto found=tasks.find(key);
         if(found!=tasks.end() && found->second.status=="taskWaiting") erase_task(key);
         return;
@@ -746,7 +756,8 @@ void EventLog::accept(const Json& j) {
         if(recursive) {
             for(auto& pair:tasks) if(!terminal(pair.second)) {
                 if(pair.second.members.empty()) {
-                    if(pair.first==physical || is_under(pair.first,physical)) affected.push_back(pair.first);
+                    auto task_path=path_key(wide(pair.second.path));
+                    if(task_path==physical || is_under(task_path,physical)) affected.push_back(pair.first);
                 } else for(auto& member:pair.second.members) if(member==physical || is_under(member,physical)) {
                     affected.push_back(pair.first); break;
                 }
@@ -769,6 +780,7 @@ void EventLog::accept(const Json& j) {
         // A sibling request ending says nothing about its confirmed owner's
         // outcome. Never erase the shared card (or completed history).
         if(it!=tasks.end() && !terminal(it->second) &&
+            (j.value("owner",std::string()).empty() || it->second.owner==j.value("owner",std::string())) &&
             (it->second.name.empty() || (event=="no_tasks_found" && (it->second.members.size()==1 || j.value("retire_group",false))))) erase_task(key);
         return;
     }
@@ -789,6 +801,10 @@ void EventLog::accept(const Json& j) {
         if(auto parsed=iso_timestamp(j["time"].get<std::string>())) { timestamp=*parsed; has_timestamp=true; }
     }
     auto& task=tasks[key];
+    if(task.name.empty()) {
+        task.members.insert(physical);
+        aliases_[physical]=key;
+    }
     if(j.contains("owner") && j["owner"].is_string() && !j["owner"].get_ref<const std::string&>().empty()) task.owner=j["owner"].get<std::string>();
     const auto& next_path=task.name.empty()?path:task.path;
     if(task.path==next_path && task.status==status && task.waiting_reason==reason &&
@@ -895,13 +911,13 @@ Json project_task(const std::wstring& key,const Task& t,const RootIndex& roots,
     auto found=translated_statuses.find(label);
     if(found==translated_statuses.end()) found=translated_statuses.emplace(label,tr(label,language)).first;
     return {{"id",utf8(key)},{"name",t.name.empty()?cache.filename:t.name},{"directory",cache.directory},
-        {"path",t.path},{"root",indexed_root(key,roots)},{"status",status},{"statusText",found->second},{"partCount",t.multipart?t.members.size():0},{"time",cache.time},
+        {"path",t.path},{"root",indexed_root(path_key(wide(t.path)),roots)},{"status",status},{"statusText",found->second},{"partCount",t.multipart?t.members.size():0},{"time",cache.time},
         {"statusTone",tone},{"outputs",t.outputs},{"sortTimestamp",t.timestamp},{"sortSequence",t.sequence}};
 }
-bool task_matches(const Task& t,const std::wstring& key,const RootIndex& roots,const View& v,
+bool task_matches(const Task& t,const RootIndex& roots,const View& v,
     const std::wstring& folded_query,bool available) {
     if(!available || t.status.empty() || (!v.task_status.empty() && t.status!=v.task_status) ||
-        (!v.task_root.empty() && indexed_root(key,roots)!=v.task_root)) return false;
+        (!v.task_root.empty() && indexed_root(path_key(wide(t.path)),roots)!=v.task_root)) return false;
     if(contains_folded(t.path,folded_query) || contains_folded(t.name,folded_query)) return true;
     return std::any_of(t.members.begin(),t.members.end(),[&](const auto& member){return contains_folded(utf8(member),folded_query);});
 }
@@ -916,7 +932,7 @@ Json task_rows(const EventLog& log,const WatchRoots& roots,const View& v,const s
     using TaskEntry=decltype(log.tasks)::value_type;
     std::vector<const TaskEntry*> rows;
     rows.reserve(log.tasks.size());
-    for(auto& pair:log.tasks) if(task_matches(pair.second,pair.first,root_index,v,query,log.available())) rows.push_back(&pair);
+    for(auto& pair:log.tasks) if(task_matches(pair.second,root_index,v,query,log.available())) rows.push_back(&pair);
     const auto filtered=stats?Clock::now():Clock::time_point{};
     std::sort(rows.begin(),rows.end(),[](const auto& a,const auto& b){
         if(a->second.timestamp!=b->second.timestamp) return a->second.timestamp>b->second.timestamp;
@@ -955,7 +971,7 @@ Json task_delta(const EventLog& log,const WatchRoots& roots,const View& v,const 
     for(const auto& key:log.changed_keys) {
         Json change={{"id",utf8(key)}};
         auto it=log.tasks.find(key);
-        if(it!=log.tasks.end() && task_matches(it->second,key,root_index,v,query,log.available()))
+        if(it!=log.tasks.end() && task_matches(it->second,root_index,v,query,log.available()))
             change["row"]=project_task(key,it->second,root_index,language,labels);
         changes.push_back(std::move(change));
     }

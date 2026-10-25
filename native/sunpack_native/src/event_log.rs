@@ -153,6 +153,7 @@ fn event_value(value: &Bound<'_, PyAny>) -> PyResult<Value> {
         "scope",
         "retire_group",
         "owner",
+        "task_id",
     ] {
         if state || matches!(name, "ts" | "time") {
             if let Some(item) = dict.get_item(name)? {
@@ -240,7 +241,19 @@ impl Projection {
             self.recent_bytes -= task.bytes();
         }
         for member in &task.members {
-            self.aliases.remove(member);
+            if self
+                .aliases
+                .get(member)
+                .is_some_and(|current| current == id)
+            {
+                self.aliases.remove(member);
+            }
+        }
+        if let Some(group) = &task.group {
+            let path = key(field(group, "path"));
+            if self.aliases.get(&path).is_some_and(|current| current == id) {
+                self.aliases.remove(&path);
+            }
         }
         Some(task)
     }
@@ -252,6 +265,9 @@ impl Projection {
         }
         for member in &task.members {
             self.aliases.insert(member.clone(), id.clone());
+        }
+        if let Some(group) = &task.group {
+            self.aliases.insert(key(field(group, "path")), id.clone());
         }
         self.tasks.insert(id, task);
         while self.recent_bytes > self.budget {
@@ -275,13 +291,37 @@ impl Projection {
             self.aliases.shrink_to_fit();
         }
     }
-    fn apply(&mut self, value: &Value, record: &Record) {
+    fn resolve(&self, value: &Value, physical: &str) -> String {
+        let explicit = field(value, "task_id");
+        if !explicit.is_empty() {
+            return explicit.to_owned();
+        }
+        self.aliases
+            .get(physical)
+            .cloned()
+            .unwrap_or_else(|| physical.to_owned())
+    }
+    fn instance_id(&self, owner: &str, physical: &str) -> String {
+        // Watch already supplies a UUID per submission. The sequence fallback
+        // also supports ownerless recovered/legacy events without file I/O.
+        let owner = if owner.is_empty() {
+            format!("@{}", self.order)
+        } else {
+            owner.to_owned()
+        };
+        format!("{}|{}", owner, physical)
+    }
+    fn apply(&mut self, value: &mut Value) -> Option<Record> {
         self.order += 1;
-        let event = field(value, "event");
+        let event = field(value, "event").to_owned();
         if event == "pipeline_sources_claimed" {
-            if let Some(groups) = value["groups"].as_array() {
+            let owner = field(value, "owner").to_owned();
+            let processing = value["processing"].as_bool().unwrap_or(false);
+            let ts = value["ts"].clone();
+            let time = value["time"].clone();
+            if let Some(groups) = value["groups"].as_array_mut() {
                 for group in groups {
-                    let path = field(group, "path");
+                    let path = field(group, "path").to_owned();
                     if path.is_empty() {
                         continue;
                     }
@@ -296,12 +336,31 @@ impl Projection {
                     if members.is_empty() {
                         continue;
                     }
-                    let id = key(path);
+                    let explicit = field(group, "task_id").to_owned();
                     let mut previous: HashSet<_> = members
                         .iter()
                         .map(|m| self.aliases.get(m).unwrap_or(m).clone())
+                        .filter(|id| {
+                            self.tasks.get(id).is_some_and(|t| !t.terminal)
+                                && (explicit.is_empty() || *id == explicit)
+                        })
                         .collect();
-                    previous.insert(id.clone());
+                    if !explicit.is_empty() && self.tasks.contains_key(&explicit) {
+                        previous.insert(explicit.clone());
+                    }
+                    // Keep an established group's ID across first-volume
+                    // arrival; a provisional request card can be absorbed.
+                    let id = if !explicit.is_empty() {
+                        explicit
+                    } else {
+                        previous
+                            .iter()
+                            .filter(|id| self.tasks[*id].group.is_some())
+                            .min()
+                            .cloned()
+                            .or_else(|| previous.iter().min().cloned())
+                            .unwrap_or_else(|| self.instance_id(&owner, &key(&path)))
+                    };
                     let mut task = Task::default();
                     for old in previous {
                         if let Some(candidate) = self.remove(&old) {
@@ -315,8 +374,8 @@ impl Projection {
                             .group
                             .as_ref()
                             .is_some_and(|g| g["multipart"].as_bool().unwrap_or(false));
-                    let mut group = group.clone();
                     group["multipart"] = json!(multipart);
+                    group["task_id"] = json!(id);
                     if task
                         .group
                         .as_ref()
@@ -329,21 +388,22 @@ impl Projection {
                             let mut value: Value =
                                 serde_json::from_slice(status).expect("encoded status");
                             value["path"] = group["path"].clone();
+                            value["task_id"] = json!(id);
                             task.status = Some(encode(&value));
                         }
                     }
-                    if !field(value, "owner").is_empty() {
-                        task.owner = field(value, "owner").to_owned();
+                    if !owner.is_empty() {
+                        task.owner = owner.clone();
                     }
                     task.group_row = Some(encode(
                         &json!({"event":"pipeline_sources_claimed","path":group["path"],"groups":[group],"owner":task.owner}),
                     ));
                     task.members = members;
-                    task.group = Some(group);
-                    if value["processing"].as_bool().unwrap_or(false) {
+                    task.group = Some(group.clone());
+                    if processing {
                         task.status =
                             Some(encode(&json!({"event":"processing_started","path":path,
-                        "ts":value["ts"],"time":value["time"],"owner":task.owner})));
+                        "ts":ts,"time":time,"owner":task.owner,"task_id":id})));
                         task.order = self.order;
                         task.terminal = false;
                         task.blocked = false;
@@ -351,18 +411,18 @@ impl Projection {
                     self.insert(id, task);
                 }
             }
-            return;
+            return None;
         }
-        let path = field(value, "path");
-        let physical = key(path);
-        let id = self.aliases.get(&physical).unwrap_or(&physical).clone();
+        let path = field(value, "path").to_owned();
+        let physical = key(&path);
+        let mut id = self.resolve(value, &physical);
         if event == "pipeline_sources_released" {
             let ids: HashSet<_> = value["paths"]
                 .as_array()
                 .into_iter()
                 .flatten()
                 .filter_map(Value::as_str)
-                .chain((!path.is_empty()).then_some(path))
+                .chain((!path.is_empty()).then_some(path.as_str()))
                 .map(key)
                 .map(|p| self.aliases.get(&p).unwrap_or(&p).clone())
                 .collect();
@@ -375,39 +435,37 @@ impl Projection {
                     self.remove(&id);
                 }
             }
-            return;
+            return None;
         }
         if event == "task_retired" && field(value, "scope") == "task" {
-            self.remove(&id);
-            return;
+            value["task_id"] = json!(id);
+            if self.tasks.get(&id).is_some_and(|t| !t.terminal) {
+                self.remove(&id);
+            }
+            return None;
         }
         if event == "blocker_cleared" {
             let path = if field(value, "task_path").is_empty() {
-                path
+                path.as_str()
             } else {
                 field(value, "task_path")
             };
-            let physical = key(path);
-            let id = self.aliases.get(&physical).unwrap_or(&physical).clone();
+            let id = self.resolve(value, &key(path));
+            value["task_id"] = json!(id);
             if self.tasks.get(&id).is_some_and(|t| t.blocked) {
                 self.remove(&id);
             }
-            return;
+            return None;
         }
         if event == "candidate_departed" || event == "task_retired" {
             let recursive = value["recursive"].as_bool().unwrap_or(false);
             let affected: Vec<_> = if recursive {
                 self.tasks
                     .iter()
-                    .filter(|(id, t)| {
+                    .filter(|(_, t)| {
                         !t.terminal
-                            && (if t.members.is_empty() {
-                                **id == physical || crate::watch_store::is_path_under(id, &physical)
-                            } else {
-                                t.members.iter().any(|m| {
-                                    *m == physical
-                                        || crate::watch_store::is_path_under(m, &physical)
-                                })
+                            && t.members.iter().any(|m| {
+                                *m == physical || crate::watch_store::is_path_under(m, &physical)
                             })
                     })
                     .map(|(id, _)| id.clone())
@@ -439,11 +497,13 @@ impl Projection {
                 }
                 self.insert(id, task);
             }
-            return;
+            return None;
         }
         if event == "no_tasks_found" || event == "pipeline_request_coalesced" {
+            value["task_id"] = json!(id);
             if self.tasks.get(&id).is_some_and(|t| {
                 !t.terminal
+                    && (field(value, "owner").is_empty() || t.owner == field(value, "owner"))
                     && (t.group.is_none()
                         || (event == "no_tasks_found"
                             && (t.members.len() == 1
@@ -451,11 +511,11 @@ impl Projection {
             }) {
                 self.remove(&id);
             }
-            return;
+            return None;
         }
         if !path.is_empty()
             && matches!(
-                event,
+                event.as_str(),
                 "processing_started"
                     | "failed_password"
                     | "suspended_missing_volume"
@@ -464,30 +524,56 @@ impl Projection {
                     | "partial_rejected"
             )
         {
+            if field(value, "task_id").is_empty()
+                && event == "processing_started"
+                && self.tasks.get(&id).is_none_or(|t| t.terminal)
+            {
+                id = self.instance_id(field(value, "owner"), &physical);
+            }
+            // A transferred family may still receive an older request's
+            // completion. It cannot overwrite the current owner's result.
+            if event != "processing_started"
+                && !field(value, "owner").is_empty()
+                && self
+                    .tasks
+                    .get(&id)
+                    .is_some_and(|t| !t.owner.is_empty() && t.owner != field(value, "owner"))
+            {
+                value["task_id"] = json!(self.instance_id(field(value, "owner"), &physical));
+                value["event"] = json!("stale_task_completion");
+                return None;
+            }
+            value["task_id"] = json!(id);
             let mut task = self.remove(&id).unwrap_or_default();
+            if task.group.is_none() {
+                task.members.insert(physical);
+            }
             // Snapshot status always addresses its canonical group, even when
             // the original event named a member retired by a later regrouping.
-            task.status = if task
-                .group
-                .as_ref()
-                .is_some_and(|group| group["path"] != value["path"])
-            {
-                let mut status = value.clone();
-                status["path"] = task.group.as_ref().unwrap()["path"].clone();
-                Some(encode(&status))
-            } else {
-                Some(record.clone())
-            };
-            task.blocked = matches!(event, "failed_password" | "suspended_missing_volume");
+            if let Some(group) = &task.group {
+                // Publish the same canonical path that the snapshot retains.
+                value["path"] = group["path"].clone();
+            }
+            let record = encode(value);
+            task.status = Some(record.clone());
+            task.blocked = matches!(
+                event.as_str(),
+                "failed_password" | "suspended_missing_volume"
+            );
             if !field(value, "owner").is_empty() {
                 task.owner = field(value, "owner").to_owned();
             }
             task.order = self.order;
-            task.terminal = matches!(event, "done" | "failed_terminal" | "partial_rejected");
+            task.terminal = matches!(
+                event.as_str(),
+                "done" | "failed_terminal" | "partial_rejected"
+            );
             self.insert(id, task);
-            return;
+            return Some(record);
         }
-        self.diagnostic(record);
+        let record = encode(value);
+        self.diagnostic(&record);
+        Some(record)
     }
     fn diagnostic(&mut self, record: &Record) {
         self.diagnostic_bytes += record.len();
@@ -674,14 +760,18 @@ impl Shared {
         state.ready = false;
         state.revision += 1;
     }
-    pub(crate) fn submit(&self, value: Value) {
-        let row = encode(&value);
+    pub(crate) fn submit(&self, mut value: Value) {
         let mut state = self.state.lock().unwrap();
-        if self.stateful {
-            state.projection.apply(&value, &row);
+        let row = if self.stateful {
+            state
+                .projection
+                .apply(&mut value)
+                .unwrap_or_else(|| encode(&value))
         } else {
+            let row = encode(&value);
             state.projection.diagnostic(&row);
-        }
+            row
+        };
         state.projection.trim();
         if state.revision == 0
             || state.error.is_some()
@@ -1021,9 +1111,8 @@ impl NativeEventLog {
         state.projection = Projection::new(state.projection.budget);
         state.projection.diagnostics = diagnostics;
         state.projection.diagnostic_bytes = diagnostic_bytes;
-        for value in rows {
-            let row = encode(&value);
-            state.projection.apply(&value, &row);
+        for mut value in rows {
+            let _ = state.projection.apply(&mut value);
         }
         state.queue.clear();
         state.queue_bytes = 0;
