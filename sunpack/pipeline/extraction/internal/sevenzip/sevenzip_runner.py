@@ -541,10 +541,9 @@ class _AsyncNativeWorkerProcess:
             asyncio.create_task(self._pump_stderr(), name="sunpack-native-stderr"),
         ]
         try:
-            await asyncio.wait_for(asyncio.shield(self._ready), timeout=2.0)
-        except asyncio.TimeoutError as exc:
-            await self.close()
-            raise RuntimeError("sevenzip_worker did not emit worker_ready during startup") from exc
+            # Startup is complete only after the handshake or a confirmed pipe/worker failure.
+            # CPU starvation is not evidence that the worker failed.
+            await asyncio.shield(self._ready)
         except BaseException:
             await self.close()
             raise
@@ -618,7 +617,8 @@ class _AsyncNativeWorkerProcess:
             self._process_mode_waiter = waiter
             try:
                 await self.send(json.dumps({"worker_command": "set_process_mode", "mode": mode}, separators=(",", ":")))
-                result = dict(await asyncio.wait_for(asyncio.shield(waiter), timeout=2.0))
+                # The stdout dispatcher fails this waiter if the worker/pipe exits.
+                result = dict(await asyncio.shield(waiter))
                 if result.get("mode") != mode:
                     raise RuntimeError("sevenzip_worker acknowledged a different process mode")
                 result["worker_pid"] = pid
