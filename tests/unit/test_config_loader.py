@@ -12,9 +12,8 @@ def _write_json(path, payload):
 
 def _verification_config():
     return {
-        "enabled": True, "max_retries": 2, "cleanup_failed_output": True,
+        "enabled": True,
         "complete_accept_threshold": 0.999, "partial_accept_threshold": 0.2,
-        "retry_on_verification_failure": True,
         "methods": [{"name": "extraction_exit_signal", "enabled": True}, {"name": "output_presence", "enabled": True}],
     }
 
