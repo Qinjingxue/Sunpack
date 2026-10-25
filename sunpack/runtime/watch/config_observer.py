@@ -80,10 +80,10 @@ class ConfigFileObserver:
                 self._started = False
             if bool(getattr(self._observer, "is_alive", lambda: False)()):
                 self._observer.stop()
-                self._observer.join(timeout=1.0)
+                self._observer.join()
             raise
 
-    def stop(self, *, timeout_seconds: float = 5.0) -> None:
+    def stop(self) -> None:
         with self._lock:
             self._stopped = True
             timer = self._timer
@@ -94,7 +94,7 @@ class ConfigFileObserver:
         if not self._started:
             return
         self._observer.stop()
-        self._observer.join(timeout=max(0.0, float(timeout_seconds)))
+        self._observer.join()
         self._started = False
         self._watches.clear()
 

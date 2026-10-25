@@ -119,6 +119,26 @@ def classify_extract_failure(
         if worker_result.get("native_status") == "unsupported":
             return _failure(FailureKind.UNSUPPORTED, "failure.unsupported")
 
+    diagnostics = getattr(run_result, "worker_diagnostics", None)
+    process_failure = diagnostics.get("process_failure") if isinstance(diagnostics, dict) else None
+    if isinstance(process_failure, dict) and process_failure:
+        # The worker's explicit transport/startup diagnosis is more reliable
+        # than legacy synthetic return codes or archive-error text heuristics.
+        failure_kind = str(process_failure.get("failure_kind") or "process_error")
+        failure_stage = str(process_failure.get("failure_stage") or "worker_process")
+        message = str(process_failure.get("message") or "").strip() or "worker failed without a result"
+        return _failure(
+            FailureKind.PROCESS_ERROR,
+            "failure.worker_process_failed",
+            details={
+                "failure_kind": failure_kind,
+                "failure_stage": failure_stage,
+                "message": message,
+            },
+            kind=failure_kind,
+            message=message,
+        )
+
     if _has_explicit_missing_volume_line(err_text):
         return _failure(
             FailureKind.MISSING_VOLUME,
@@ -144,10 +164,6 @@ def classify_extract_failure(
         code = run_result.returncode
         if code == -100:
             return _failure(FailureKind.PROCESS_ERROR, "failure.process_start_failed")
-        if code == -101:
-            return _failure(FailureKind.PROCESS_ERROR, "failure.process_timeout")
-        if code == -102:
-            return _failure(FailureKind.PROCESS_ERROR, "failure.process_no_progress")
         if code is not None and code < 0:
             return _failure(FailureKind.PROCESS_ERROR, "failure.process_exited")
         if code == 1:

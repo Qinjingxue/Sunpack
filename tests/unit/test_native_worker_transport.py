@@ -541,3 +541,41 @@ def test_real_worker_large_results_are_assembled_in_both_transports(many_item_ar
     assert {result["job_id"] for result in results} == {"watch", "cli"}
     for result in results:
         _assert_many_item_result(result)
+
+
+@pytest.mark.parametrize("returncode", [-101, -102])
+def test_legacy_negative_worker_codes_do_not_infer_timeout_or_stall(returncode):
+    from sunpack.core.contracts.failures import FailureKind
+    from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import attach_worker_diagnostics
+    from sunpack.pipeline.extraction.internal.workflow.errors import classify_extract_failure
+
+    completed = attach_worker_diagnostics(
+        subprocess.CompletedProcess(["worker"], returncode, "", "broken worker connection")
+    )
+    assert completed.worker_diagnostics["process_failure"]["failure_kind"] == "process_io"
+    failure = classify_extract_failure(completed, completed.stderr)
+    assert failure.kind == FailureKind.PROCESS_ERROR
+    assert failure.details["failure_kind"] == "process_io"
+    assert "broken worker connection" in failure.message
+    assert "timed out" not in failure.message.lower()
+    assert "no progress" not in failure.message.lower()
+
+
+def test_worker_transport_failure_detail_outweighs_legacy_code_and_archive_text():
+    from sunpack.core.contracts.failures import FailureKind
+    from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import attach_worker_diagnostics
+    from sunpack.pipeline.extraction.internal.workflow.errors import classify_extract_failure
+
+    completed = attach_worker_diagnostics(
+        subprocess.CompletedProcess(["worker"], -101, "", "data error"),
+        process_failure={
+            "failure_stage": "worker_communication",
+            "failure_kind": "worker_lost",
+            "message": "named pipe disconnected unexpectedly",
+        },
+    )
+    failure = classify_extract_failure(completed, completed.stderr)
+    assert failure.kind == FailureKind.PROCESS_ERROR
+    assert failure.details["failure_stage"] == "worker_communication"
+    assert failure.details["failure_kind"] == "worker_lost"
+    assert "named pipe disconnected unexpectedly" in failure.message

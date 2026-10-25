@@ -1174,15 +1174,6 @@
       "max": null,
       "integer": true
     },
-    "/performance/worker/backpressure_retries": {
-      "label": {
-        "zh": "队列拥堵重试次数",
-        "en": "Queue congestion retries"
-      },
-      "min": 0,
-      "max": null,
-      "integer": true
-    },
     "/performance/worker/writer_threads": {
       "label": {
         "zh": "写入线程数",
@@ -1321,14 +1312,6 @@
       },
       "min": 1,
       "integer": true
-    },
-    "/watch/observer_stop_timeout_seconds": {
-      "label": {
-        "zh": "停止等待上限（秒）",
-        "en": "Stop timeout (s)"
-      },
-      "min": 0,
-      "integer": false
     },
     "/watch/runtime_cache_cleanup_enabled": {
       "label": {

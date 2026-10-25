@@ -270,12 +270,10 @@ fn serve_client(
     let mut lease = LeaseGuard::new(active_leases, ever_had_lease, state_changed);
     loop {
         let mut request_bytes = [0u8; REQUEST_BYTES];
-        let read_timeout = if lease.active {
-            INFINITE
-        } else {
-            CLIENT_CONNECT_TIMEOUT_MS
-        };
-        match read_overlapped(pipe.raw(), stop_event, &mut request_bytes, read_timeout)? {
+        // A connected client may be descheduled between writes under load.
+        // A clock is not evidence of disconnection; service stop and broken
+        // pipes still end the pending overlapped read.
+        match read_overlapped(pipe.raw(), stop_event, &mut request_bytes, INFINITE)? {
             IoResult::Stopped | IoResult::Disconnected | IoResult::TimedOut => break,
             IoResult::Completed(size) if size == REQUEST_BYTES => {}
             IoResult::Completed(_) => {
@@ -321,7 +319,7 @@ fn serve_client(
                     pipe.raw(),
                     stop_event,
                     &mut length,
-                    CLIENT_CONNECT_TIMEOUT_MS,
+                    INFINITE,
                 )? {
                     IoResult::Completed(4) => {}
                     _ => break,
@@ -338,7 +336,7 @@ fn serve_client(
                     pipe.raw(),
                     stop_event,
                     &mut query,
-                    CLIENT_CONNECT_TIMEOUT_MS,
+                    INFINITE,
                 )? {
                     IoResult::Completed(size) if size == length => {}
                     _ => break,

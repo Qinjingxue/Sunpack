@@ -27,7 +27,7 @@ class FakeObserver:
     def stop(self):
         self.stopped = True
 
-    def join(self, timeout):
+    def join(self, timeout=None):
         self.join_timeout = timeout
 
 
@@ -38,7 +38,7 @@ def test_config_observer_watches_program_directory_non_recursively(tmp_path):
             observer_factory=FakeObserver, loop=asyncio.get_running_loop(),
         )
         observer.start()
-        observer.stop(timeout_seconds=1.25)
+        observer.stop()
         return observer
     observer = asyncio.run(scenario())
 
@@ -46,7 +46,7 @@ def test_config_observer_watches_program_directory_non_recursively(tmp_path):
     assert observer._observer.recursive is False
     assert observer._observer.started is True
     assert observer._observer.stopped is True
-    assert observer._observer.join_timeout == 1.25
+    assert observer._observer.join_timeout is None
 
 
 def test_config_observer_filters_files_and_debounces_event_burst(tmp_path):

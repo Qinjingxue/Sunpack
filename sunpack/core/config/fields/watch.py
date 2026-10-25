@@ -27,7 +27,6 @@ def normalize_watch_config(value: Any) -> dict[str, Any]:
         _float_field(config, "boundary_confirmation_seconds"),
     )
     config["max_folders"] = max(1, _int_field(config, "max_folders"))
-    config["observer_stop_timeout_seconds"] = max(0.0, _float_field(config, "observer_stop_timeout_seconds"))
     config["runtime_cache_cleanup_enabled"] = require_boolean(
         config["runtime_cache_cleanup_enabled"],
         "watch.runtime_cache_cleanup_enabled",

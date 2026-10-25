@@ -152,3 +152,77 @@ def test_cancelled_backpressure_request_does_not_strand_other_requests(transport
             worker.queue_capacity.flush()
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("transport", ["async", "sync"])
+def test_backpressure_can_retry_past_legacy_limit_without_failing(transport):
+    """An admitted slot (or cancellation), not a retry counter, ends backpressure."""
+
+    async def scenario():
+        class Worker:
+            worker_path = "backpressure-worker"
+            worker_epoch = "test"
+
+            def __init__(self):
+                self.queue_capacity = _NativeQueueCapacity()
+                self.jobs = {}
+                self.submitted = asyncio.Queue()
+                self.stderr_queue = queue.Queue()
+
+            def is_alive(self):
+                return True
+
+            def submit_async(self, payload, job_id, **callbacks):
+                assert job_id not in self.jobs
+                self.jobs[job_id] = callbacks
+                self.submitted.put_nowait(job_id)
+
+            async def submit(self, *args, **kwargs):
+                self.submit_async(*args, **kwargs)
+
+            def has_other_jobs(self, job_id):
+                return any(other != job_id for other in self.jobs)
+
+            def take_stderr(self):
+                return []
+
+            def spawn_resubmission(self, coroutine):
+                asyncio.get_running_loop().create_task(coroutine)
+
+            def finish(self, job_id, **result):
+                callback = self.jobs[job_id]["on_line"]
+                callback("", {"type": "result", "job_id": job_id, **result})
+                assert callback("", {"type": "native_event", "event": "job_finished", "job_id": job_id})
+                self.jobs.pop(job_id)
+                self.queue_capacity.release(job_id)
+
+        worker = Worker()
+
+        async def get_async(_):
+            return worker
+
+        runner = SevenZipRunner(
+            {}, shared_worker_holder=SimpleNamespace(get_or_start=lambda _: worker),
+            shared_async_worker_holder=SimpleNamespace(get_or_start=get_async),
+            event_loop=asyncio.get_running_loop(),
+        )
+        task = (
+            asyncio.create_task(runner._submit_native_job_asyncio({"job_id": "repeated"}))
+            if transport == "async"
+            else asyncio.wrap_future(runner._submit_native_job({"job_id": "repeated"}))
+        )
+        try:
+            for _ in range(125):
+                assert await asyncio.wait_for(worker.submitted.get(), 2) == "repeated"
+                worker.finish("repeated", status="failed", retryable=True, native_status="backpressure")
+            assert await asyncio.wait_for(worker.submitted.get(), 2) == "repeated"
+            worker.finish("repeated", status="ok")
+            result = await asyncio.wait_for(task, 2)
+            assert result.returncode == 0
+            assert not worker.jobs
+            assert not worker.queue_capacity._waiters
+        finally:
+            task.cancel()
+            worker.queue_capacity.flush()
+
+    asyncio.run(scenario())
