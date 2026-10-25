@@ -897,7 +897,7 @@ class _SourceCleanup:
     def sweep_requests(self):
         return self._table.sweep()
 
-    async def apply(self, request, *, broker, cancellation=None):
+    async def apply(self, request, *, broker, cancellation=None, mode_override: str | None = None):
         from sunpack.pipeline.coordinator.cleanup_refs import ReleaseOutcome, ReleaseRequest
 
         if not (request.paths and request.should_clean):
@@ -916,6 +916,7 @@ class _SourceCleanup:
             ),
             broker=broker,
             cancellation=cancellation,
+            mode_override=mode_override,
         )
         if outcome.failed:
             with self._context.lock:
@@ -937,6 +938,7 @@ class _SourceCleanup:
         *,
         broker,
         cancellation=None,
+        mode_override: str | None = None,
     ):
         from sunpack.pipeline.coordinator.cleanup_refs import ReleaseOutcome
         from sunpack.core.support.archive_sessions import release_archive_sessions_under_roots
@@ -945,6 +947,7 @@ class _SourceCleanup:
             ResourceLifecycleError,
             promotion_barrier,
         )
+        mode = mode_override or self._mode()
 
         def run_cleanup():
             existing = [path for path in request.paths if os.path.exists(path)]
@@ -952,14 +955,14 @@ class _SourceCleanup:
             error = ""
             if existing:
                 try:
-                    if self._mode() == "keep":
+                    if mode == "keep":
                         cli = self._config.get("cli", {})
                         cleanup = ArchiveCleanup("keep", cli.get("language", "en"), quiet=bool(cli.get("quiet", False)))
                         results.extend(cleanup.cleanup_success_archives(
                             [[path] for path in existing],
                         ))
                     else:
-                        actions = self._factory(self._config, stdout=None)
+                        actions = self._factory(self._config, stdout=None, cleanup_mode_override=mode)
                         with promotion_barrier(
                             existing,
                             cache_releasers=(release_archive_sessions_under_roots,),
@@ -975,7 +978,7 @@ class _SourceCleanup:
                     results.extend(
                         ArchiveCleanupResult(
                             path,
-                            self._mode(),
+                            mode,
                             "failed",
                             code or 32,
                             f"cleanup barrier unavailable: {exc}",
@@ -986,7 +989,7 @@ class _SourceCleanup:
             results.extend(
                 ArchiveCleanupResult(
                     path,
-                    self._mode(),
+                    mode,
                     "missing",
                 )
                 for path in request.paths
@@ -1017,7 +1020,7 @@ class _SourceCleanup:
             return ReleaseOutcome(
                 task_key=request.task_key, released=request.paths, error=str(exc),
                 failed=tuple(ArchiveCleanupResult(
-                    path, self._mode(), "failed",
+                    path, mode, "failed",
                     int(getattr(exc, "winerror", 0) or 0), str(exc),
                 ) for path in request.paths),
             )
@@ -1518,6 +1521,13 @@ class _RequestRuntime:
             )
             watch_version = task.runtime.get("source_generation", watch_version)
             retain_watch_lease = bool(watch_version and outcome.outcome_kind == OutcomeKind.COMPLETE_SUCCESS)
+            # A promoted child can fail more than once after re-entering Watch as
+            # a depth-1 input. Keep its provenance in the existing failure record.
+            if depth == 1 and self.config.get("watch_promoted_nested_input") and result.failure is not None:
+                result = replace(result, failure=replace(
+                    result.failure,
+                    details={**result.failure.details, "promoted_nested_input": True},
+                ))
             ownership.remember_tasks([task])  # Missing-volume retry may adopt a complete family.
             if result.failure is not None and task.runtime.get("discovery_scope") is not None:
                 result.failure.details["discovery_scope"] = task.runtime["discovery_scope"].to_record()
@@ -1543,6 +1553,10 @@ class _RequestRuntime:
                 broker=broker,
                 cancellation=cancellation,
                 lease_id=None if retain_watch_lease else id(task),
+                mode_override=(
+                    "delete"
+                    if depth > 1 or self.config.get("watch_promoted_nested_input") else None
+                ),
             )
 
             # Retryable nested inputs leave recursive ownership, but remain failed.
@@ -1700,7 +1714,8 @@ class _RequestRuntime:
             part_paths,
         )
 
-    def _schedule_cleanup(self, request, *, broker, cancellation, lease_id=None) -> None:
+    def _schedule_cleanup(self, request, *, broker, cancellation, lease_id=None,
+                          mode_override: str | None = None) -> None:
         if not request.should_clean and lease_id is None:
             return
 
@@ -1711,6 +1726,7 @@ class _RequestRuntime:
                         request,
                         broker=broker,
                         cancellation=cancellation,
+                        mode_override=mode_override,
                     )
             finally:
                 if lease_id is not None:
@@ -1791,7 +1807,11 @@ class _RequestRuntime:
             task.apply_path_mapping(moved.path_map)
             from sunpack.core.contracts.discovery_scope import DiscoveryScope
             task.runtime["discovery_scope"] = DiscoveryScope(destination)
-            result.failure.details["discovery_scope"] = task.runtime["discovery_scope"].to_record()
+            promoted_failure = replace(result.failure, details={
+                **result.failure.details,
+                "discovery_scope": task.runtime["discovery_scope"].to_record(),
+                "promoted_nested_input": True,
+            })
             if self.submission.origin == "watch":
                 self._report_progress(task, {
                     "type": "semantic", "event": "task_sources_claimed",
@@ -1799,7 +1819,8 @@ class _RequestRuntime:
                     "groups": [_task_source_group(task)],
                 })
             ownership.remap_task(task, result.input_path)
-            updated = replace(result, input_path=task.main_path, failure_message="")
+            updated = replace(result, input_path=task.main_path,
+                              failure=promoted_failure, failure_message="")
             self._shell_updates.add(moved.touched_dirs)
             promoted = True
         except asyncio.CancelledError:

@@ -1954,6 +1954,13 @@ class WatchScheduler:
             run_config = dict(self.config)
             password_generation = self.state.password_generation
             retry_entry = self.state.latest_entry_for_path(candidate.path)
+            # Reuse the durable blocker payload; no new Watch cache or WAL field.
+            retry_details = (retry_entry.failure_payload.get("details") or {})
+                if retry_entry is not None else {}
+            run_config["watch_promoted_nested_input"] = (
+                isinstance(retry_details, dict)
+                and retry_details.get("promoted_nested_input") is True
+            )
             pending = self.state.pending_work_for_path(candidate.path)
             scope_dir = ""
             if retry_entry is not None and retry_entry.status == "failed_password":

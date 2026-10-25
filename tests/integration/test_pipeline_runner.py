@@ -101,6 +101,33 @@ def test_sunpack_payload_recurses_across_concurrent_origins(tmp_path):
         assert not (Path(leaf.output_dir) / ".sunpack").exists()
 
 
+
+@pytest.mark.parametrize("origin", ["foreground", "watch"])
+def test_nested_keep_only_preserves_original_archive(tmp_path, origin):
+    payload = b"final payload"
+    inner = make_zip({"payload.txt": payload})
+    middle = make_zip({"inner.zip": inner})
+    original = tmp_path / "outer.zip"
+    original.write_bytes(make_zip({"middle.zip": middle}))
+    config = normalize_config(with_detection_pipeline({
+        "recursive_extract": "*",
+        "output": {"root": str(tmp_path / "out")},
+        "post_extract": {"archive_cleanup_mode": "k", "flatten_single_directory": True},
+    }))
+
+    async def run():
+        async with PipelineEngine(config) as engine:
+            return await engine.run([str(original)], origin=origin,
+                                    stdout=io.StringIO(), stderr=io.StringIO())
+
+    response = asyncio.run(run())
+    assert response.summary.failed_tasks == []
+    assert response.summary.success_count == 3
+    assert original.is_file()
+    assert [path.read_bytes() for path in (tmp_path / "out").rglob("payload.txt")] == [payload]
+    assert not list((tmp_path / "out").rglob("*.zip"))
+
+
 def test_deep_detect_only_applies_to_initial_round_in_real_pipeline(tmp_path):
     """Deep must find the initial carrier without unpacking its APK/PE outputs."""
     from sunpack.pipeline.discovery.embedded.options import EmbeddedOptions
