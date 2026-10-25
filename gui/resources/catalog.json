@@ -1322,14 +1322,6 @@
       "min": 1,
       "integer": true
     },
-    "/watch/observer_stop_timeout_seconds": {
-      "label": {
-        "zh": "停止等待上限（秒）",
-        "en": "Stop timeout (s)"
-      },
-      "min": 0,
-      "integer": false
-    },
     "/watch/runtime_cache_cleanup_enabled": {
       "label": {
         "zh": "清理空闲缓存",
