@@ -1657,7 +1657,7 @@ def test_watch_scheduler_does_not_apply_pipeline_filesystem_filters(tmp_path, mo
     assert set(watcher._pending) == {str(keep.resolve()), str(blocked.resolve())}
 
 
-def test_watch_scheduler_uses_stop_timeout_without_suffix_prefilter(tmp_path, monkeypatch):
+def test_watch_scheduler_joins_observer_without_deadline_or_suffix_prefilter(tmp_path, monkeypatch):
     FakeObserver.started_count = 0
     FakeObserver.stopped_count = 0
     FakeObserver.join_timeouts = []
@@ -1673,7 +1673,6 @@ def test_watch_scheduler_uses_stop_timeout_without_suffix_prefilter(tmp_path, mo
         config=make_config({}),
         roots=[str(watch_root)],
         cold_start_seconds=0,
-        observer_stop_timeout_seconds=1.25,
     )
 
     _await(watcher.start())
@@ -1685,7 +1684,7 @@ def test_watch_scheduler_uses_stop_timeout_without_suffix_prefilter(tmp_path, mo
     assert any(path.endswith("sample.zip") for path in pending_paths)
 
     _await(watcher.stop())
-    assert FakeObserver.join_timeouts == [1.25]
+    assert FakeObserver.join_timeouts == [None]
 
 
 def test_event_burst_with_unchanged_usn_does_not_restart_quiet_window(tmp_path, monkeypatch):
