@@ -2049,10 +2049,10 @@ int wmain(int argc,wchar_t** argv) {
             try { pump([&]{return state(app.page(),"tasks")["rows"][0]["status"]=="taskWaiting";}); }
             catch(...) { std::cerr<<"Log model: "<<state(app.page(),"tasks")<<" errors="<<state(app.page(),"errors")<<"\n"; throw; }
             auto grouped=state(app.page(),"tasks")["rows"][0];
-            assert(grouped["name"]=="movie.7z" && grouped["partCount"]==2);
+            assert(grouped["name"]=="movie.7z");
             assert(state(app.page(),"statusNames")==Json::array({"","taskProcessing","taskWaiting","taskSucceeded","taskFailed"}));
             assert(rendered_widget(app,"taskRoot-"+grouped["id"].get<std::string>())["text"]==
-                "已识别 2 个分卷 · 监控目录："+utf8(dir.wstring()));
+                "监控目录："+utf8(dir.wstring()));
             screenshot(app,L"grouped-waiting.png");
             std::cerr<<"Log replacement observed\n";
             atomic_write(dir/"sunpack_config.json","{");

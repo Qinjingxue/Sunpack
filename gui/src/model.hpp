@@ -34,7 +34,6 @@ std::string root_for(const fs::path& path, const WatchRoots& roots);
 struct Task {
     std::string path, name, status, waiting_reason, owner;
     std::unordered_set<std::wstring> members;
-    bool multipart = false;
     double timestamp = 0;
     bool has_timestamp = false;
     uint64_t sequence = 0;

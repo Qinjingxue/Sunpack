@@ -388,12 +388,6 @@ impl Projection {
                             }
                         }
                     }
-                    let multipart = members.len() > 1
-                        || task
-                            .group
-                            .as_ref()
-                            .is_some_and(|g| g["multipart"].as_bool().unwrap_or(false));
-                    group["multipart"] = json!(multipart);
                     group["task_id"] = json!(id);
                     if task
                         .group

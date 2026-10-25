@@ -823,7 +823,7 @@ export default {
         <ScrollView id="taskListScroll"><div id="taskBody" class="column">
           <VirtualList id="taskItems" class="column" estimated-height="68px" immutable-items="true"><div v-for="t in tasks.rows" :key="t.id" :id="'task-'+t.id" :class="'task '+appearance">
             <div class="row"><button :id="'taskName-'+t.id" class="taskname" @click="send('openTask',{task:t})">{{ t.name }}</button><div class="spacer"/><label class="status" :class="'status-'+t.statusTone">{{ t.statusText }}</label></div>
-            <div class="row task-meta"><label :id="'taskRoot-'+t.id" class="muted fill" :ellipsis-start="true">{{ t.partCount ? texts.identifiedParts.replace('{count}',t.partCount)+' · ' : '' }}{{ texts.taskFolder }}{{ t.directory }}</label><label class="time">{{ t.time }}</label></div>
+            <div class="row task-meta"><label :id="'taskRoot-'+t.id" class="muted fill" :ellipsis-start="true">{{ texts.taskFolder }}{{ t.directory }}</label><label class="time">{{ t.time }}</label></div>
           </div>
           </VirtualList>
         </div></ScrollView>

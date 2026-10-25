@@ -662,7 +662,6 @@ void EventLog::accept_group(const Json& group,const std::string& owner) {
     if(!owner.empty()) task.owner=owner;
     task.name=group.value("name",std::string());
     if(task.name.empty()) task.name=utf8(fs::path(wide(path)).filename().wstring());
-    task.multipart=task.multipart || members.size()>1 || group.value("multipart",false);
     task.members=std::move(members);
     for(auto& member:task.members) aliases_[member]=key;
     aliases_[path_key(wide(path))]=key;
@@ -861,7 +860,7 @@ Json project_task(const std::wstring& key,const Task& t,const RootIndex& roots,
     auto found=translated_statuses.find(label);
     if(found==translated_statuses.end()) found=translated_statuses.emplace(label,tr(label,language)).first;
     return {{"id",utf8(key)},{"name",t.name.empty()?cache.filename:t.name},{"directory",cache.directory},
-        {"path",t.path},{"root",indexed_root(path_key(wide(t.path)),roots)},{"status",status},{"statusText",found->second},{"partCount",t.multipart?t.members.size():0},{"time",cache.time},
+        {"path",t.path},{"root",indexed_root(path_key(wide(t.path)),roots)},{"status",status},{"statusText",found->second},{"time",cache.time},
         {"statusTone",tone},{"outputs",t.outputs},{"sortTimestamp",t.timestamp},{"sortSequence",t.sequence}};
 }
 bool task_matches(const Task& t,const RootIndex& roots,const View& v,

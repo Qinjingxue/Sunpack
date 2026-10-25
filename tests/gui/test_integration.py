@@ -443,7 +443,6 @@ sys.stdin.readline()
         assert next(r for r in restored["tasks"]["rows"] if r["status"] == "taskWaiting")["statusText"] == "等待分卷"
         assert next(r for r in restored["tasks"]["rows"] if r["status"] == "taskSucceeded")["outputs"] == ["previous-output"]
         assert next(r for r in restored["tasks"]["rows"] if r["status"] == "taskSucceeded")["name"] == "retained.rar"
-        assert next(r for r in restored["tasks"]["rows"] if r["status"] == "taskSucceeded")["partCount"] == 2
         # WAL blockers without a group must get a new identity even when their
         # path currently aliases a completed execution in the same host.
         log.write("processing_started", path=str(source), owner="retried")
@@ -471,6 +470,10 @@ def test_native_and_gui_share_member_retirement_and_real_request_lifetimes(tmp_p
         log.write("diagnostic", message="x" * 4096)
         log.flush()
         return _state_projection(log.path)["tasks"]
+    def members():
+        records = [json.loads(line) for line in log.path.read_text(encoding="utf-8").splitlines()]
+        return set(next(g for r in reversed(records) if r["event"] == "pipeline_sources_claimed"
+                        for g in r["groups"] if g["path"] == a)["members"])
     try:
         log.recover()
         log.write("processing_started", path=c, owner="request")
@@ -480,14 +483,14 @@ def test_native_and_gui_share_member_retirement_and_real_request_lifetimes(tmp_p
         # retiring it before compaction must not resurrect a second card.
         log.write("task_retired", path=c)
         rows = compact()["rows"]
-        assert len(rows)==1 and rows[0]["partCount"]==3
+        assert len(rows)==1 and members()=={a,b,c}
         log.write("suspended_missing_volume", path=a)
         log.write("task_retired", path=c)
         rows = compact()["rows"]
-        assert len(rows)==1 and rows[0]["partCount"]==2 and rows[0]["path"]==a
+        assert len(rows)==1 and members()=={a,b} and rows[0]["path"]==a
         log.write("task_retired", path=a)
         rows = compact()["rows"]
-        assert len(rows)==1 and rows[0]["partCount"]==1 and rows[0]["status"]=="taskWaiting"
+        assert len(rows)==1 and members()=={b} and rows[0]["status"]=="taskWaiting"
         log.write("processing_started", path=a, owner="request")
         log.write("blocker_cleared", path=a, task_path=a)
         assert compact()["total"]==1  # A real running task survives old blocker retirement.
@@ -557,7 +560,7 @@ def test_execution_history_survives_regroup_retry_and_compaction(tmp_path):
         current = rows()
         assert len(current) == 2 and old in current
         waiting, = [r for r in current if r["status"] == "taskWaiting"]
-        assert waiting["id"] == retry_id and waiting["partCount"] == 2
+        assert waiting["id"] == retry_id
         assert waiting["statusText"] == "等待密码"
         assert compact() == current
         log.write("processing_started", path=b, owner="fourth", ts=10)
@@ -587,7 +590,7 @@ def test_execution_history_survives_regroup_retry_and_compaction(tmp_path):
     finally:
         log.close()
     # Reopening must retain exactly the already bounded results, including
-    # confirmed names/parts for physical inputs that are no longer present.
+    # confirmed names for physical inputs that are no longer present.
     log = WatchLogStore(str(tmp_path / "events.jsonl"), max_bytes=32768)
     try:
         log.recover()

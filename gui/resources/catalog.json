@@ -381,10 +381,6 @@
       "zh": "等待分卷",
       "en": "Waiting for volumes"
     },
-    "identifiedParts": {
-      "zh": "已识别 {count} 个分卷",
-      "en": "Identified {count} volumes"
-    },
     "fileObserver": {
       "zh": "文件观察器",
       "en": "File observer"

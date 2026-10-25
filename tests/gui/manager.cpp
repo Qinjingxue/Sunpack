@@ -159,7 +159,7 @@ void logical_projection(Fixture& f) {
     send("processing_started",a);
     group(a,{a,b,c}); // Main path changes; the existing logical card survives.
     assert(displayed.size()==1 && row()["id"]==id && row()["name"]=="movie.rar");
-    assert(row()["partCount"]==3 && row()["status"]=="taskProcessing");
+    assert(log.tasks.begin()->second.members.size()==3 && row()["status"]=="taskProcessing");
     View member_search; member_search.task_query="unrelated.bin";
     assert(task_rows(log,{},member_search).at("total")==1);
     send("suspended_missing_volume",a);
@@ -168,7 +168,7 @@ void logical_projection(Fixture& f) {
     send("pipeline_request_coalesced",a);
     assert(displayed.size()==1);
     replay(Json{{"event","candidate_departed"},{"path",b},{"forgotten",false}});
-    assert(row()["partCount"]==2 && row()["statusText"]=="等待分卷");
+    assert(log.tasks.begin()->second.members.size()==2 && row()["statusText"]=="等待分卷");
     send("processing_started",c); send("failed_password",a);
     View waiting; waiting.task_status="taskWaiting";
     assert(task_rows(log,{},waiting).at("total")==1);
@@ -213,7 +213,7 @@ void logical_projection(Fixture& f) {
     assert(displayed.size()==1 && displayed.at("first")==old);
     // Reset must release aliases as well as visible history.
     overwrite(file,event("processing_started",wide(b),100)); assert(log.refresh() && log.rebuilt);
-    assert(row()["name"]=="unrelated.bin" && row()["partCount"]==0);
+    assert(row()["name"]=="unrelated.bin" && log.tasks.begin()->second.members.size()==1);
 }
 void editing(Fixture& f) {
     auto p=f.dir/"builtin_passwords.json";
