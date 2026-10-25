@@ -330,22 +330,21 @@ def _promotion_conflict(identities: Sequence[FileIdentity]) -> tuple[str, tuple[
 def lifecycle_registration(
     files: Iterable[os.PathLike[str] | str | FileIdentity],
     *,
-    timeout: float = 30.0,
+    timeout: float | None = None,
 ) -> Iterator[tuple[FileIdentity, ...]]:
     """Hold the shared coordination lock across handle creation + registry insert."""
 
     identities = file_identities(files)
-    deadline = time.monotonic() + max(0.0, float(timeout))
     with _CHANGED:
         while True:
             conflict = _promotion_conflict(identities)
             if conflict is None:
                 break
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
+            if timeout == 0:
                 roots = ", ".join(item.path for item in conflict[1])
                 raise ResourceBusyError(f"resource registration blocked by promotion roots: {roots}")
-            _CHANGED.wait(remaining)
+            # A live promotion owns the conflicting resources until it releases them.
+            _CHANGED.wait()
         yield identities
 
 
@@ -613,8 +612,7 @@ class TaskResourceScope:
                 except RuntimeError:
                     pass
 
-    def begin_promotion(self, *, timeout: float) -> None:
-        deadline = time.monotonic() + max(0.0, float(timeout))
+    def begin_promotion(self, *, timeout: float | None = None) -> None:
         own_operations = _CURRENT_OPERATION_STACK.get().count(self.task_id)
         with _CHANGED:
             if self.state is not ScopeState.ACTIVE:
@@ -623,15 +621,14 @@ class TaskResourceScope:
                 )
             self.state = ScopeState.QUIESCING
             while self._active_operations > own_operations:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
+                if timeout == 0:
                     self.state = ScopeState.ACTIVE
                     _CHANGED.notify_all()
                     raise ResourceBusyError(
                         f"task {self.task_id} still has "
                         f"{self._active_operations - own_operations} concurrent operations"
                     )
-                _CHANGED.wait(remaining)
+                _CHANGED.wait()
 
     def end_promotion(self) -> None:
         with _CHANGED:
@@ -651,19 +648,17 @@ class TaskResourceScope:
             ]
         return _release_records(records)
 
-    def close(self, *, timeout: float = 30.0) -> ReleaseReport:
-        deadline = time.monotonic() + max(0.0, float(timeout))
+    def close(self, *, timeout: float | None = None) -> ReleaseReport:
         with _CHANGED:
             if self.state is ScopeState.CLOSED:
                 return ReleaseReport(0, 0)
             self.state = ScopeState.QUIESCING
             while self._active_operations:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
+                if timeout == 0:
                     raise ResourceBusyError(
                         f"task {self.task_id} still has {self._active_operations} active operations"
                     )
-                _CHANGED.wait(remaining)
+                _CHANGED.wait()
             records = [
                 _RESOURCES[resource_id]
                 for resource_id in self._resource_ids
@@ -681,8 +676,7 @@ class TaskResourceScope:
             )
         return report
 
-    async def aclose(self, *, timeout: float = 30.0) -> ReleaseReport:
-        deadline = time.monotonic() + max(0.0, float(timeout))
+    async def aclose(self, *, timeout: float | None = None) -> ReleaseReport:
         waiter: tuple[asyncio.AbstractEventLoop, asyncio.Event] | None = None
         with _CHANGED:
             if self.state is ScopeState.CLOSED:
@@ -693,18 +687,16 @@ class TaskResourceScope:
                 self._async_idle_waiters.append(waiter)
         if waiter is not None:
             event = waiter[1]
-            remaining = deadline - time.monotonic()
             try:
-                if remaining <= 0:
-                    raise asyncio.TimeoutError
-                await asyncio.wait_for(event.wait(), timeout=remaining)
-            except asyncio.TimeoutError:
-                with _CHANGED:
-                    active_operations = self._active_operations
-                if active_operations:
-                    raise ResourceBusyError(
-                        f"task {self.task_id} still has {active_operations} active operations"
-                    ) from None
+                if timeout == 0:
+                    with _CHANGED:
+                        active_operations = self._active_operations
+                    if active_operations:
+                        raise ResourceBusyError(
+                            f"task {self.task_id} still has {active_operations} active operations"
+                        )
+                else:
+                    await event.wait()
             finally:
                 with _CHANGED:
                     if waiter in self._async_idle_waiters:
@@ -992,7 +984,7 @@ def _end_native_promotion(token: int | None) -> None:
 def _wait_for_native_resources(
     roots: Sequence[FileIdentity],
     *,
-    deadline: float,
+    nonblocking: bool = False,
 ) -> tuple[dict[str, Any], ...]:
     try:
         import sunpack_native
@@ -1001,7 +993,7 @@ def _wait_for_native_resources(
             dict(item)
             for item in sunpack_native.native_wait_for_resources(
                 [item.path for item in roots],
-                max(0.0, deadline - time.monotonic()),
+                0.0 if nonblocking else 1.0,
             )
         )
     except Exception as exc:
@@ -1018,7 +1010,7 @@ def promotion_barrier(
     roots: Iterable[os.PathLike[str] | str | FileIdentity],
     *,
     cache_releasers: Iterable[Callable[[tuple[str, ...]], Any]] = (),
-    timeout: float = 30.0,
+    timeout: float | None = None,
     strict_open_file_audit: bool = False,
     quiesce: bool = True,
 ) -> Iterator[PromotionBarrierReport]:
@@ -1034,12 +1026,11 @@ def promotion_barrier(
         yield PromotionBarrierReport(roots=tuple(item.path for item in root_identities))
         return
     started = time.monotonic()
-    deadline = started + max(0.0, float(timeout))
     token = uuid.uuid4().hex
     current = current_task_resource_scope()
     promotion_started = False
     if quiesce and current is not None:
-        current.begin_promotion(timeout=max(0.0, deadline - time.monotonic()))
+        current.begin_promotion(timeout=timeout)
         promotion_started = True
 
     released_resources = 0
@@ -1078,17 +1069,16 @@ def promotion_barrier(
                     _ACTIVE_PROMOTIONS[token] = root_identities
                     _CHANGED.notify_all()
                     break
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
+                if timeout == 0:
                     if conflict is not None and not busy and not active_operations:
-                        raise ResourceBusyError("timed out waiting for an overlapping promotion barrier")
+                        raise ResourceBusyError("overlapping promotion barrier is active")
                     raise ResourceBusyError(
                         "promotion blocked by active task resources: "
                         + _format_busy(busy)
                         + "; active operations: "
                         + _format_active_file_operations(active_operations)
                     )
-                _CHANGED.wait(remaining)
+                _CHANGED.wait()
         except BaseException:
             if promotion_started:
                 current.end_promotion()
@@ -1119,7 +1109,7 @@ def promotion_barrier(
 
         report.native_resource_audit = _wait_for_native_resources(
             root_identities,
-            deadline=deadline,
+            nonblocking=timeout == 0,
         )
         if strict_open_file_audit:
             report.open_file_audit = _own_open_files_under(root_identities)
