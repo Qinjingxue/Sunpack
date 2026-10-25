@@ -190,6 +190,64 @@ def test_scan_diagnostic_budget_is_shared_across_password_retry_rounds(tmp_path,
     assert [len(attempt["failures"]) for attempt in result.tasks] == [1, 0]
 
 
+def test_password_retry_provenance_is_scoped_to_promoted_inputs(tmp_path, monkeypatch):
+    promoted = tmp_path / "nested.7z"
+    ordinary = tmp_path / "original.7z"
+    for path in (promoted, ordinary):
+        path.write_bytes(b"test fixture")
+    seen_configs = []
+
+    class Runner:
+        recent_passwords = []
+
+        def __init__(self, config):
+            self.config = config
+            seen_configs.append(config)
+
+        def run_targets(self, paths):
+            if len(seen_configs) == 1:
+                return RunSummary(target_results=tuple(
+                    TargetRunResult(
+                        path, OutcomeKind.FAILURE,
+                        failure=FailureInfo(
+                            FailureKind.WRONG_PASSWORD, "extract", "wrong password",
+                            details={"promoted_nested_input": path == str(promoted)},
+                        ),
+                    )
+                    for path in paths
+                ))
+            return RunSummary(target_results=tuple(
+                TargetRunResult(path, OutcomeKind.COMPLETE_SUCCESS) for path in paths
+            ))
+
+    async def confirm(*args):
+        return True
+
+    async def password(*args, **kwargs):
+        return ["secret"]
+
+    monkeypatch.setattr(extract, "pipeline_engine", lambda _config: FakePipelineEngine(Runner))
+    monkeypatch.setattr(extract, "collect_clipboard_passwords", lambda _config: [])
+    monkeypatch.setattr(extract, "_confirm_password_retry", confirm)
+    monkeypatch.setattr(extract, "prompt_for_passwords_async", password)
+    args = SimpleNamespace(
+        recursive=False, paths=[str(promoted), str(ordinary)], password=[],
+        password_file=None, prompt_passwords=False, no_builtin_passwords=True,
+        json=False, quiet=True, verbose=False,
+    )
+    code, result = asyncio.run(extract.handle(
+        args, CliContext(language="en", reporter=CliReporter(quiet=True)),
+    ))
+    from sunpack.core.support.path_keys import case_key
+
+    assert code == 0
+    assert result.summary["password_retry_count"] == 1
+    assert not seen_configs[0].get("promoted_nested_retry_paths")
+    assert seen_configs[1]["promoted_nested_retry_paths"] == frozenset({
+        case_key(str(promoted)),
+    })
+
+
 def test_extract_prompts_for_password_retry_after_wrong_password(tmp_path, monkeypatch):
     target = tmp_path / "archives"
     target.mkdir()
