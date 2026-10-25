@@ -1495,3 +1495,30 @@ def test_worker_password_candidates(tmp_path, subtests):
                 assert final["password_candidates_all_rejected"] and final["matched_index"] == -1
                 if len(candidates) > 1:
                     assert not (out / filename).exists()
+
+
+def test_native_qos_ack_can_arrive_after_old_two_second_deadline():
+    """A live worker's delayed ACK is not proof of failure."""
+    from types import SimpleNamespace
+    from sunpack.pipeline.extraction.internal.sevenzip.sevenzip_runner import _AsyncNativeWorkerProcess
+
+    async def scenario():
+        worker = _AsyncNativeWorkerProcess("unused.exe", None)
+        worker.process = SimpleNamespace(pid=1234, returncode=None)
+
+        async def send(_payload):
+            pass
+
+        worker.send = send
+        pending = asyncio.create_task(worker.set_process_mode(mode="high"))
+        await asyncio.sleep(0)
+        assert worker._process_mode_waiter is not None
+        await asyncio.sleep(2.1)
+        worker._process_mode_waiter.set_result(
+            {"type": "process_mode_ack", "mode": "high", "applied": True}
+        )
+        result = await pending
+        assert result["applied"] is True
+        assert result["worker_pid"] == 1234
+
+    asyncio.run(scenario())
