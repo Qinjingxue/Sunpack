@@ -28,8 +28,9 @@ def dry_run_archive(
     *,
     format_hint: str = "",
     password: str = "",
-    timeout: float = 30.0,
+    timeout: float | None = None,
 ) -> SevenZipDryRunResult:
+    # Retained for callers; execution ends on result, pipe closure, or explicit cancellation.
     worker_path = get_sevenzip_bridge_worker_path()
     job_id = f"dry-run-{uuid.uuid4().hex}"
     payload = {
@@ -47,25 +48,7 @@ def dry_run_archive(
             capture_output=True,
             text=True,
             encoding="utf-8",
-            timeout=max(1.0, float(timeout or 30.0)),
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
-    except subprocess.TimeoutExpired as exc:
-        stdout = _coerce_text(exc.stdout)
-        stderr = _coerce_text(exc.stderr)
-        return SevenZipDryRunResult(
-            ok=False,
-            returncode=-101,
-            result={
-                "type": "result",
-                "job_id": job_id,
-                "status": "failed",
-                "failure_stage": "worker_timeout",
-                "failure_kind": "process_timeout",
-            },
-            stdout=stdout,
-            stderr=stderr,
-            message="sevenzip_worker dry-run timed out",
         )
     except OSError as exc:
         return SevenZipDryRunResult(
