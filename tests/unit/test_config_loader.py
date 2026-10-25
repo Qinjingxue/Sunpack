@@ -332,3 +332,15 @@ def test_packaged_config_layers_program_data_simple_over_program_advanced(tmp_pa
         assert loader.load_config()["cli"]["language"] == "zh"
     finally:
         loader.clear_config_cache()
+
+
+def test_retired_verification_retry_config_is_accepted_but_discarded():
+    from sunpack.core.config.fields.verification import normalize_verification_config
+
+    old = {**_verification_config(), "max_retries": 99,
+           "cleanup_failed_output": False,
+           "retry_on_verification_failure": True}
+    normalized = normalize_verification_config(old)
+    assert "max_retries" not in normalized
+    assert "cleanup_failed_output" not in normalized
+    assert "retry_on_verification_failure" not in normalized
