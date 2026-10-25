@@ -925,7 +925,7 @@ class WatchScheduler:
 
     def _release_observer(self) -> None:
         self._observer.stop()
-        self._observer.join(timeout=self.observer_stop_timeout_seconds)
+        self._observer.join()
 
     async def run_once(self) -> WatchRunResult:
         with self._lock:
