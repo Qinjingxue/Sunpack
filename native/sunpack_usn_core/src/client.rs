@@ -383,7 +383,16 @@ fn connect_and_hello() -> io::Result<BrokerConnection> {
     loop {
         // Service manager/start failures are real OS errors. Never hide them
         // behind an unlimited retry loop (e.g. missing service or no access).
-        start_service()?;
+        if let Err(error) = start_service() {
+            // SCM can reject concurrent starts while the service is stopping
+            // or its database is locked. Those are transient service states,
+            // unlike access denied / missing-service errors.
+            if matches!(error.raw_os_error(), Some(1053 | 1055 | 1061)) {
+                thread::sleep(Duration::from_millis(50));
+                continue;
+            }
+            return Err(error);
+        }
         let mut connection = connect_pipe()?;
         match connection.transact(Request::simple(Opcode::Hello, next_request_id())) {
             Ok(response) => {
