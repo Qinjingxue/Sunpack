@@ -627,6 +627,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn replay_only_transport_failures_not_permission_or_protocol_failures() {
+        assert!(is_transient_broker_io(&io::Error::from_raw_os_error(109)));
+        assert!(is_transient_broker_io(&io::Error::new(
+            io::ErrorKind::ConnectionReset,
+            "disconnected",
+        )));
+        assert!(!is_transient_broker_io(&io::Error::from_raw_os_error(5)));
+        assert!(!is_transient_broker_io(&io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid reply",
+        )));
+    }
+
+    #[test]
     fn disconnected_client_is_not_reported_as_connected() {
         assert!(!broker_is_connected());
     }
