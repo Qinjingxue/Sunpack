@@ -158,7 +158,7 @@ void logical_projection(Fixture& f) {
     assert(row()["status"]=="taskWaiting" && row()["statusText"]=="等待分卷");
     send("processing_started",a);
     group(a,{a,b,c}); // Main path changes; the existing logical card survives.
-    assert(displayed.size()==1 && row()["id"]==id && row()["name"]=="movie.rar");
+    assert(displayed.size()==1 && row()["id"]==id && row()["name"]=="disguised.a");
     assert(log.tasks.begin()->second.members.size()==3 && row()["status"]=="taskProcessing");
     View member_search; member_search.task_query="unrelated.bin";
     assert(task_rows(log,{},member_search).at("total")==1);

@@ -442,7 +442,7 @@ sys.stdin.readline()
         assert {r["status"] for r in restored["tasks"]["rows"]} == {"taskSucceeded", "taskFailed", "taskWaiting"}
         assert next(r for r in restored["tasks"]["rows"] if r["status"] == "taskWaiting")["statusText"] == "等待分卷"
         assert next(r for r in restored["tasks"]["rows"] if r["status"] == "taskSucceeded")["outputs"] == ["previous-output"]
-        assert next(r for r in restored["tasks"]["rows"] if r["status"] == "taskSucceeded")["name"] == "retained.rar"
+        assert next(r for r in restored["tasks"]["rows"] if r["status"] == "taskSucceeded")["name"] == source.name
         # WAL blockers without a group must get a new identity even when their
         # path currently aliases a completed execution in the same host.
         log.write("processing_started", path=str(source), owner="retried")
@@ -655,7 +655,8 @@ def test_real_recursive_watch_executions_keep_two_outer_rows(tmp_path, monkeypat
                     watcher.log.flush()
                     rows = _state_projection(watcher.log.path)["tasks"]["rows"]
                     assert len(rows) == index + 1
-                    assert all(row["path"] == str(source) and row["status"] == "taskSucceeded" for row in rows)
+                    assert all(row["path"] == str(source) and row["name"] == source.name
+                               and row["status"] == "taskSucceeded" for row in rows)
                     if first_id is None:
                         first_id = rows[0]["id"]
                     else:

@@ -859,7 +859,8 @@ Json project_task(const std::wstring& key,const Task& t,const RootIndex& roots,
     const auto& label=t.waiting_reason.empty()?t.status:t.waiting_reason;
     auto found=translated_statuses.find(label);
     if(found==translated_statuses.end()) found=translated_statuses.emplace(label,tr(label,language)).first;
-    return {{"id",utf8(key)},{"name",t.name.empty()?cache.filename:t.name},{"directory",cache.directory},
+    // The logical archive name can omit suffixes; display the original filename.
+    return {{"id",utf8(key)},{"name",cache.filename},{"directory",cache.directory},
         {"path",t.path},{"root",indexed_root(path_key(wide(t.path)),roots)},{"status",status},{"statusText",found->second},{"time",cache.time},
         {"statusTone",tone},{"outputs",t.outputs},{"sortTimestamp",t.timestamp},{"sortSequence",t.sequence}};
 }
