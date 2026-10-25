@@ -11,7 +11,7 @@ import threading
 
 import pytest
 
-import sunpack.core.passwords.verifier.rar_fast as rar_fast
+from sunpack.core.passwords.verifier.input import PasswordProbeInput
 from sunpack.core.contracts.discovery_scope import DiscoveryScope
 from sunpack.core.contracts.failures import FailureKind
 from sunpack.core.passwords.relation_prober import RelationsPasswordProber
@@ -51,16 +51,15 @@ def _pause_first_probe(monkeypatch, phase="borrow"):
 
         monkeypatch.setattr(RelationsPasswordProber, "resolve_file", probe_after_cleanup)
     else:
-        borrow = rar_fast.borrow_archive_sessions
+        borrow = PasswordProbeInput.borrow_sessions
 
         @contextlib.contextmanager
-        def borrow_after_cleanup(paths):
-            paths = tuple(paths)
+        def borrow_after_cleanup(prepared):
             pause_once()
-            with borrow(paths) as sessions:
+            with borrow(prepared) as sessions:
                 yield sessions
 
-        monkeypatch.setattr(rar_fast, "borrow_archive_sessions", borrow_after_cleanup)
+        monkeypatch.setattr(PasswordProbeInput, "borrow_sessions", borrow_after_cleanup)
     return paused, resume
 
 

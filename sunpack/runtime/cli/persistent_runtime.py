@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from collections import OrderedDict
 import asyncio
 import copy
 import logging
@@ -8,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable
 
-from sunpack.core.config.loader import config_source_key, load_config, load_raw_config_payload
+from sunpack.core.config.loader import config_source_key, load_config, load_raw_config_payload, clear_config_cache
 from sunpack.core.config.advanced_defaults import advanced_config_value
 from sunpack.pipeline.coordinator.engine import PipelineEngine, new_work_broker
 from sunpack.runtime.cli.runtime_state import server_runtime_active, set_server_runtime_active
@@ -35,7 +36,8 @@ _PASSWORD_RELOAD_PENDING = False
 _ENGINE: PipelineEngine | None = None
 _WORK_BROKER = None
 _ENGINE_LOCK = asyncio.Lock()
-_CONFIG_SNAPSHOTS: dict[ConfigSourceKey, _ConfigSnapshot] = {}
+_CONFIG_SNAPSHOT_LIMIT = 64
+_CONFIG_SNAPSHOTS: OrderedDict[ConfigSourceKey, _ConfigSnapshot] = OrderedDict()
 _LATEST_IDLE_SECONDS: float | None = None
 _STATE_CHANGED_CALLBACK: Callable[[], None] | None = None
 
@@ -63,6 +65,7 @@ def enable_persistent_runtime(*, state_changed: Callable[[], None] | None = None
 def _configuration_files_changed() -> None:
     global _CONFIG_RELOAD_TASK, _CONFIG_RELOAD_PENDING
     _CONFIG_SNAPSHOTS.clear()
+    clear_config_cache()
     _CONFIG_RELOAD_PENDING = True
     if _CONFIG_RELOAD_TASK is None:
         _CONFIG_RELOAD_TASK = asyncio.create_task(_reload_configuration())
@@ -176,6 +179,9 @@ def _snapshot_for(request_cwd: str | Path | None) -> _ConfigSnapshot:
     source_key = config_source_key(request_cwd)
     snapshot = _CONFIG_SNAPSHOTS.get(source_key)
     if snapshot is None:
+        # Subscribe before reading, including external overrides and per-request
+        # configuration directories. Existing requests retain their own snapshot.
+        _observe_config_sources((*_CONFIG_SNAPSHOTS, source_key))
         config_path, raw_payload = load_raw_config_payload(request_cwd)
         snapshot = _ConfigSnapshot(
             source_key=source_key,
@@ -184,7 +190,26 @@ def _snapshot_for(request_cwd: str | Path | None) -> _ConfigSnapshot:
             normalized_config=copy.deepcopy(load_config(request_cwd)),
         )
         _CONFIG_SNAPSHOTS[source_key] = snapshot
+        if len(_CONFIG_SNAPSHOTS) > _CONFIG_SNAPSHOT_LIMIT:
+            _CONFIG_SNAPSHOTS.popitem(last=False)
+            _observe_config_sources(_CONFIG_SNAPSHOTS)
+    else:
+        _CONFIG_SNAPSHOTS.move_to_end(source_key)
     return snapshot
+
+
+def _observe_config_sources(sources) -> None:
+    if _CONFIG_OBSERVER is None:
+        return
+    files = set()
+    for simple, advanced, override in sources:
+        files.update(path for path in (simple, advanced) if path)
+        if override and override.startswith("file:"):
+            files.add(override[len("file:"):])
+    _CONFIG_OBSERVER.set_additional_files([
+        (Path(path).parent, [Path(path).name], _configuration_files_changed)
+        for path in sorted(files)
+    ])
 
 
 def load_request_config(request_cwd: str | Path | None = None) -> dict[str, Any]:

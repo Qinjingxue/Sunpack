@@ -1210,7 +1210,7 @@ int run_request(
         result = extract_with_password(password_candidates.front());
         const bool direct_ok = result.status == PasswordTestStatus::Ok && result.command_ok;
         result.password_attempts = direct_ok ? 0 : 1;
-        if (!direct_ok && !(result.status == PasswordTestStatus::WrongPassword && result.operation_result == kOpWrongPassword)) {
+        if (!direct_ok && result.encrypted && !(result.status == PasswordTestStatus::WrongPassword && result.operation_result == kOpWrongPassword)) {
             const auto probe = run_password_candidate_probe(archive_input, password_candidates);
             result.password_attempts = probe.attempts;
             if (probe.status == PasswordTestStatus::WrongPassword) {

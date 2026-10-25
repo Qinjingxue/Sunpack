@@ -26,14 +26,9 @@ class ConfigFileObserver:
         self.directory = Path(directory).resolve()
         self.filenames = {str(name).casefold() for name in filenames}
         self.callback = callback
+        self._base_files = [(self.directory, self.filenames, callback), *additional_files]
         self._files = {}
-        self._directories = {self.directory}
-        for directory, names, notify in [(self.directory, self.filenames, callback), *additional_files]:
-            directory = Path(directory).resolve()
-            self._directories.add(directory)
-            for name in names:
-                key = str(directory / str(name)).casefold()
-                self._files.setdefault(key, set()).add(notify)
+        self._directories = set()
         self._pending_callbacks = set()
         self.debounce_seconds = max(0.0, float(debounce_seconds))
         self._observer = observer_factory()
@@ -43,6 +38,33 @@ class ConfigFileObserver:
         self._lock = threading.Lock()
         self._started = False
         self._stopped = False
+        self._watches = {}
+        self.set_additional_files(())
+
+    def set_additional_files(self, files) -> None:
+        """Replace request-source subscriptions; evicted sources release watches."""
+        selected = {}
+        directories = set()
+        for directory, names, notify in [*self._base_files, *files]:
+            directory = Path(directory).resolve()
+            directories.add(directory)
+            for name in names:
+                selected.setdefault(str(directory / str(name)).casefold(), set()).add(notify)
+        with self._lock:
+            if self._stopped:
+                return
+            started = self._started
+            previous = self._directories
+        # Watchdog dispatch holds its own lock before calling our handler.
+        # Never take that lock while holding the callback/timer lock.
+        if started:
+            for directory in directories - previous:
+                self._watches[directory] = self._observer.schedule(self._handler, str(directory), recursive=False)
+            for directory in previous - directories:
+                self._observer.unschedule(self._watches.pop(directory))
+        with self._lock:
+            self._files = selected
+            self._directories = directories
 
     def start(self) -> None:
         with self._lock:
@@ -51,7 +73,7 @@ class ConfigFileObserver:
             self._started = True
         try:
             for directory in self._directories:
-                self._observer.schedule(self._handler, str(directory), recursive=False)
+                self._watches[directory] = self._observer.schedule(self._handler, str(directory), recursive=False)
             self._observer.start()
         except Exception:
             with self._lock:
@@ -74,6 +96,7 @@ class ConfigFileObserver:
         self._observer.stop()
         self._observer.join(timeout=max(0.0, float(timeout_seconds)))
         self._started = False
+        self._watches.clear()
 
     def notify_path_changed(self, path: str) -> None:
         callbacks = self._files.get(str(Path(path).absolute()).casefold()) if path else None

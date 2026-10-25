@@ -4,7 +4,7 @@ import re
 from collections import OrderedDict
 from collections.abc import Container, MutableSet
 
-from sunpack.core.support.path_keys import absolute_path_key, path_key_is_under
+from sunpack.core.support.path_keys import absolute_path_key, path_key_is_under, resolved_path_key, case_key
 from sunpack.core.contracts.tasks import ArchiveTask
 
 
@@ -124,17 +124,20 @@ class OutputPathAllocator:
         is_directory: bool = False,
     ) -> str:
         candidate = os.path.normpath(path)
-        key = absolute_path_key(candidate)
+        parent = os.path.dirname(candidate)
+        name = os.path.basename(candidate)
+        # Resolve the existing parent once, then compare all numbered choices
+        # in that namespace while preserving the caller's displayed path.
+        physical_parent = resolved_path_key(parent or os.curdir)
+        key = os.path.join(physical_parent, case_key(name))
         if key not in reserved and key not in local_reserved and not os.path.exists(candidate):
             return candidate
 
-        parent = os.path.dirname(candidate)
-        name = os.path.basename(candidate)
         stem, extension = (name, "") if is_directory else os.path.splitext(name)
         match = re.fullmatch(r"(.*)\((\d+)\)", stem)
         base_stem = stem if match is None else match.group(1)
         start = 1 if match is None else int(match.group(2)) + 1
-        family = (absolute_path_key(os.path.join(parent, base_stem + extension)), start)
+        family = (os.path.join(physical_parent, case_key(base_stem + extension)), start)
         numbers = self._numbers.get(family)
         if numbers is None:
             numbers = self._numbers[family] = _NumberedPaths(start)
@@ -156,7 +159,7 @@ class OutputPathAllocator:
             while True:
                 index = numbers.take()
                 candidate = os.path.join(parent, f"{base_stem}({index}){extension}")
-                key = absolute_path_key(candidate)
+                key = os.path.join(physical_parent, case_key(os.path.basename(candidate)))
                 # Cache shared and on-disk occupancy, but keep local exclusions
                 # available to other requests. Always check a selected slot live.
                 if key not in reserved and key in local_reserved:
@@ -188,5 +191,5 @@ def next_available_path(path: str, reserved: MutableSet[str] | None = None) -> s
     """Return and optionally reserve an available browser-style alternative."""
     candidate = OutputPathAllocator().next_available(path, reserved if reserved is not None else ())
     if reserved is not None:
-        reserved.add(absolute_path_key(candidate))
+        reserved.add(resolved_path_key(candidate))
     return candidate

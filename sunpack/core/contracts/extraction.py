@@ -30,3 +30,10 @@ class ExtractionResult:
     # These retain native output inventories for the normal verifier without
     # expanding per-file tables into the persisted outer diagnostics.
     embedded_results: list[tuple[dict[str, Any], "ExtractionResult"]] = field(default_factory=list)
+
+    def complete_embedded_results(self):
+        """Independent payloads safe to retain and recursively discover."""
+        return (
+            (segment, result) for segment, result in self.embedded_results
+            if result.success and segment.get("verified_complete", True)
+        )

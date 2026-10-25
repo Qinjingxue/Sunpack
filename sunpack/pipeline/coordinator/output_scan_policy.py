@@ -106,7 +106,7 @@ class NestedOutputScanPolicy:
         """
         embedded_results = list(getattr(extraction_result, "embedded_results", None) or [])
         projected: list[tuple[str, OutputInventory | dict[str, Any] | None]] = []
-        for segment, child_result in embedded_results:
+        for segment, child_result in extraction_result.complete_embedded_results() if embedded_results else ():
             segment = segment if isinstance(segment, dict) else {}
             segment_dir = str(
                 getattr(child_result, "out_dir", "")
@@ -118,7 +118,7 @@ class NestedOutputScanPolicy:
             child_inventory = getattr(child_result, "output_inventory", None)
             projected.append((segment_dir, child_inventory))
 
-        if projected:
+        if embedded_results:
             return projected
 
         return [(output_dir, getattr(extraction_result, "output_inventory", None))]

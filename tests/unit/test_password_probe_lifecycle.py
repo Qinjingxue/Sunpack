@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -63,13 +64,14 @@ def test_password_probe_releases_only_its_own_borrows(tmp_path, monkeypatch, mod
 
     setattr(FakeSession, method + '_verify_passwords', probe)
     monkeypatch.setattr(sessions, 'NativeArchiveSession', FakeSession)
-    monkeypatch.setattr(module, 'requires_volume_aware_verifier', lambda *a, **k: False)
+    from sunpack.core.passwords.verifier.input import PasswordProbeInput
     ranges = [{'path': path, 'start': 13} for path in physical] if mode == 'ranges' else None
-    monkeypatch.setattr(module, 'verifier_input', lambda *a, **k: (physical[0], ranges))
-    if module is not seven_zip_fast:
-        style = 'rar_part' if module is rar_fast else 'zip_spanned'
-        volumes = (style, [{'path': path, 'volume_number': i} for i, path in enumerate(physical, 1)])
-        monkeypatch.setattr(module, 'structured_volume_input', lambda *a, **k: volumes if mode == 'volumes' else None)
+    style = 'rar_part' if module is rar_fast else 'zip_spanned'
+    volumes = [{'path': path, 'volume_number': i} for i, path in enumerate(physical, 1)] if mode == 'volumes' else None
+    prepared = PasswordProbeInput(None, physical[0], ranges=ranges, volumes=volumes,
+        volume_style=style if volumes else '', volume_aware=bool(volumes),
+        session_paths=tuple(physical if mode != 'file' else physical[:1]))
+    monkeypatch.setattr(module, 'prepare_password_input', lambda *a, **k: prepared)
     if mode != 'file':
         monkeypatch.setattr(module, method + '_verify_passwords_from_' + mode, probe)
     scope = TaskResourceScope('existing-analysis-owner', files=physical)
@@ -162,5 +164,49 @@ def test_partial_volume_acquisition_releases_completed_borrows(tmp_path):
                     pytest.fail('missing volume was acquired')
             assert not borrows((path,))
             assert not scope._resource_ids
+    finally:
+        scope.close()
+
+
+@pytest.mark.parametrize("interrupt", [False, True])
+def test_multibatch_password_job_releases_its_input_before_task_exit(tmp_path, monkeypatch, interrupt):
+    """Catch job-wide borrow leaks that the single-probe cases cannot detect.
+
+    A few fake batches exercise normal and exceptional completion; promotion
+    while the surrounding task remains alive proves independent cleanup safety.
+    """
+    from sunpack.core.passwords.job import PasswordJob
+    from sunpack.core.passwords.scheduler import PasswordScheduler
+    from sunpack.core.passwords.verifier.registry import PasswordVerifierChain
+    physical = [str(tmp_path / name) for name in ("first.bin", "second.bin")]
+    for path in physical:
+        Path(path).write_bytes(b"input")
+    monkeypatch.setattr(zip_fast, "zip_fast_verify_passwords_from_ranges",
+        lambda ranges, passwords, *a, **k: {"status": "no_match", "attempts": len(passwords)})
+
+    def candidates():
+        for index in range(600):
+            if interrupt and index == 257:
+                raise RuntimeError("candidate source failed after a batch")
+            yield str(index)
+
+    job = PasswordJob(physical[0], archive_input={
+        "kind": "archive_input", "open_mode": "concat_ranges", "format_hint": "zip",
+        "entry_path": physical[0], "ranges": [{"path": path, "start": 0, "end": 5} for path in physical],
+    }, candidates=candidates())
+    scope = TaskResourceScope("multibatch-password-job", files=physical)
+    try:
+        with scope.activate():
+            scheduler = PasswordScheduler(PasswordVerifierChain([zip_fast.ZipFastVerifier()]))
+            if interrupt:
+                with pytest.raises(RuntimeError, match="candidate source failed"):
+                    scheduler.plan_for_extraction(job)
+            else:
+                assert scheduler.plan_for_extraction(job).exhausted
+            assert not borrows(physical)
+            with promotion_barrier(physical, timeout=0,
+                    cache_releasers=(sessions.release_archive_sessions_under_roots,)):
+                for path in physical:
+                    Path(path).unlink()
     finally:
         scope.close()

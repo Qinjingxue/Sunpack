@@ -29,6 +29,9 @@ class _FakePasswordStore:
 class _FakePasswordResolver:
     password_tester = SimpleNamespace(passwords=[])
 
+    def confirm_extraction(self, resolution, password=None):
+        pass
+
 
 class _CandidatePasswordStore:
     def has_candidates(self, **_kwargs):
@@ -122,10 +125,11 @@ def _task(path):
     return make_archive_task(path, logical_name="case")
 
 
-def test_unknown_zip_without_passwords_uses_direct_empty_worker_candidate(tmp_path):
+@pytest.mark.parametrize("format_hint", ["zip", "rar", "7z", ""])
+def test_unknown_input_without_passwords_uses_unconfirmed_empty_candidate(tmp_path, format_hint):
     archive = tmp_path / "carrier.zip"
     archive.write_bytes(b"unknown-password-state")
-    task = make_archive_task(archive, format_hint="zip")
+    task = make_archive_task(archive, format_hint=format_hint)
 
     class Resolver:
         password_tester = SimpleNamespace(passwords=[])
@@ -146,7 +150,8 @@ def test_unknown_zip_without_passwords_uses_direct_empty_worker_candidate(tmp_pa
 
     assert resolution.password == ""
     assert resolution.candidate_passwords == ("",)
-    assert resolution.candidate_evidence == "zip_empty_password_direct"
+    assert resolution.candidate_evidence == "empty_password_direct"
+    assert resolution.requires_extraction_confirmation and resolution.encrypted is None
 
 
 def test_embedded_password_probe_and_session_key_follow_active_segment(tmp_path):

@@ -114,9 +114,9 @@ def _worker_completed(payload: dict) -> subprocess.CompletedProcess:
 
 def test_zipcrypto_proof_contract(subtests):
     cases = [
-        ("zip_empty_password_direct", "data_error", False, False, FailureKind.WRONG_PASSWORD),
-        ("zip_empty_password_direct", "crc_error", False, False, FailureKind.WRONG_PASSWORD),
-        ("zip_empty_password_direct", "crc_error", True, False, FailureKind.DAMAGED),
+        ("empty_password_direct", "data_error", False, False, FailureKind.WRONG_PASSWORD),
+        ("empty_password_direct", "crc_error", False, False, FailureKind.WRONG_PASSWORD),
+        ("empty_password_direct", "crc_error", True, False, FailureKind.DAMAGED),
         ("zipcrypto_header_byte", "data_error", False, False, FailureKind.PASSWORD_INCONCLUSIVE),
         ("zipcrypto_header_byte", "crc_error", False, False, FailureKind.PASSWORD_INCONCLUSIVE),
         ("zipcrypto_header_byte", "wrong_password", False, False, FailureKind.PASSWORD_INCONCLUSIVE),
@@ -137,7 +137,7 @@ def test_zipcrypto_proof_contract(subtests):
             assert failure.kind is expected
             assert failure.is_password_failure is (expected is FailureKind.WRONG_PASSWORD)
             if proven:
-                assert failure.details["evidence"] == "zipcrypto_entry_crc_proven_before_failure"
+                assert failure.details["evidence"] == "entry_crc_proven_before_failure"
 
 
 def test_failure_evidence_contract(subtests):

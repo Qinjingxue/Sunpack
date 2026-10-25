@@ -3,7 +3,8 @@ from __future__ import annotations
 from sunpack.core.passwords.candidates import PasswordCandidatePipeline, PasswordCandidate
 
 import time
-from dataclasses import dataclass
+from contextlib import contextmanager
+from dataclasses import dataclass, replace
 from enum import Enum
 from itertools import chain, islice
 from typing import Literal
@@ -16,6 +17,7 @@ from sunpack.core.passwords.verifier.rar_fast import RarFastVerifier
 from sunpack.core.passwords.verifier.seven_zip_fast import SevenZipFastVerifier
 from sunpack.core.passwords.verifier.zip_fast import ZipFastVerifier
 from sunpack.core.passwords.verifier.enc_fast import EncFastVerifier
+from sunpack.core.passwords.verifier.input import PasswordProbeInput
 from sunpack.core.support.archive_sessions import archive_session_scope
 
 
@@ -109,29 +111,44 @@ class PasswordScheduler:
             self._emit_finished(job, result, started_at, candidates_seen=0, skipped=0)
             return result
 
-        attempts = 0
-        candidates_seen = 0
-        skipped = 0
-        last_result = None
-        last_error = ""
-        batch_size = max(1, int(job.batch_size or self.default_batch_size))
-        batch: list[str] = []
+        with _prepare_job(self.verifier, job) as job:
+            attempts = 0
+            candidates_seen = 0
+            skipped = 0
+            last_result = None
+            last_error = ""
+            batch_size = max(1, int(job.batch_size or self.default_batch_size))
+            batch: list[str] = []
 
-        for candidate in job.candidate_pipeline():
-            password = _candidate_value(candidate)
-            candidates_seen += 1
-            if self.cache.has_negative(fingerprint.key, password):
-                skipped += 1
-                self._emit_progress(job, PasswordProgressEvent(
-                    stage="skipped_cached_negative",
-                    attempts=attempts,
-                    candidates_seen=candidates_seen,
-                    skipped=skipped,
-                    elapsed_seconds=time.monotonic() - started_at,
-                ))
-                continue
-            batch.append(password)
-            if len(batch) >= batch_size:
+            for candidate in job.candidate_pipeline():
+                password = _candidate_value(candidate)
+                candidates_seen += 1
+                if self.cache.has_negative(fingerprint.key, password):
+                    skipped += 1
+                    self._emit_progress(job, PasswordProgressEvent(
+                        stage="skipped_cached_negative",
+                        attempts=attempts,
+                        candidates_seen=candidates_seen,
+                        skipped=skipped,
+                        elapsed_seconds=time.monotonic() - started_at,
+                    ))
+                    continue
+                batch.append(password)
+                if len(batch) >= batch_size:
+                    outcome = self._verify_batch(job, fingerprint.key, batch, attempts, started_at, candidates_seen, skipped)
+                    attempts = outcome.attempts
+                    last_result = outcome.test_result
+                    last_error = outcome.error_text
+                    if (
+                        outcome.password is not None
+                        or outcome.stopped_reason
+                        or outcome.status in _ARCHIVE_LEVEL_STATUSES
+                    ):
+                        self._emit_finished(job, outcome, started_at, candidates_seen, skipped)
+                        return outcome
+                    batch = []
+
+            if batch:
                 outcome = self._verify_batch(job, fingerprint.key, batch, attempts, started_at, candidates_seen, skipped)
                 attempts = outcome.attempts
                 last_result = outcome.test_result
@@ -143,31 +160,17 @@ class PasswordScheduler:
                 ):
                     self._emit_finished(job, outcome, started_at, candidates_seen, skipped)
                     return outcome
-                batch = []
 
-        if batch:
-            outcome = self._verify_batch(job, fingerprint.key, batch, attempts, started_at, candidates_seen, skipped)
-            attempts = outcome.attempts
-            last_result = outcome.test_result
-            last_error = outcome.error_text
-            if (
-                outcome.password is not None
-                or outcome.stopped_reason
-                or outcome.status in _ARCHIVE_LEVEL_STATUSES
-            ):
-                self._emit_finished(job, outcome, started_at, candidates_seen, skipped)
-                return outcome
-
-        result = PasswordSearchResult(
-            password=None,
-            status=PasswordSearchStatus.EXHAUSTED,
-            test_result=last_result,
-            error_text=last_error,
-            attempts=attempts,
-            exhausted=True,
-        )
-        self._emit_finished(job, result, started_at, candidates_seen, skipped)
-        return result
+            result = PasswordSearchResult(
+                password=None,
+                status=PasswordSearchStatus.EXHAUSTED,
+                test_result=last_result,
+                error_text=last_error,
+                attempts=attempts,
+                exhausted=True,
+            )
+            self._emit_finished(job, result, started_at, candidates_seen, skipped)
+            return result
 
     @archive_session_scope()
     def plan_for_extraction(self, job: PasswordJob) -> PasswordSearchResult:
@@ -200,155 +203,156 @@ class PasswordScheduler:
             self._emit_finished(job, result, started_at, candidates_seen=0, skipped=0)
             return result
 
-        pipeline = job.candidate_pipeline()
-        seen: set[str] | None = None if isinstance(pipeline, PasswordCandidatePipeline) else set()
-        skipped = 0
-        candidates_seen = 0
+        with _prepare_job(self.verifier, job) as job:
+            pipeline = job.candidate_pipeline()
+            seen: set[str] | None = None if isinstance(pipeline, PasswordCandidatePipeline) else set()
+            skipped = 0
+            candidates_seen = 0
 
-        def available_candidates():
-            nonlocal skipped, candidates_seen
-            for candidate in pipeline:
-                password = _candidate_value(candidate)
-                if seen is not None:
-                    if password in seen:
+            def available_candidates():
+                nonlocal skipped, candidates_seen
+                for candidate in pipeline:
+                    password = _candidate_value(candidate)
+                    if seen is not None:
+                        if password in seen:
+                            continue
+                        seen.add(password)
+                    if self.cache.has_negative(fingerprint.key, password):
+                        skipped += 1
                         continue
-                    seen.add(password)
-                if self.cache.has_negative(fingerprint.key, password):
-                    skipped += 1
-                    continue
-                candidates_seen += 1
-                yield password
+                    candidates_seen += 1
+                    yield password
 
-        candidates = iter(available_candidates())
+            candidates = iter(available_candidates())
 
-        # The authoritative Rust descriptor identifies ENC independently of its
-        # physical name. One remaining candidate needs only the worker's Open;
-        # the ordinary extraction-confirmation path commits success/rejection.
-        if str((job.archive_input or {}).get("format_hint") or "").strip().lower() == "enc":
-            first = list(islice(candidates, 2))
-            if len(first) == 1:
-                result = PasswordSearchResult(
-                    password=None,
-                    status=PasswordSearchStatus.INCONCLUSIVE,
-                    attempts=0,
-                    stopped_reason="extraction_confirmation_required",
-                    extraction_candidates=tuple(first),
-                )
-                self._emit_finished(job, result, started_at, candidates_seen, skipped)
-                return result
-            candidates = chain(first, candidates)
-
-        batch_size = max(1, int(job.batch_size or self.default_batch_size))
-        inconclusive: list[str] = []
-        inconclusive_evidence = ""
-        attempts = 0
-        while batch := list(islice(candidates, batch_size)):
-            verification = _call_fast_verifier(
-                self.verifier,
-                job.archive_path,
-                batch,
-                part_paths=job.part_paths,
-                archive_input=job.archive_input,
-            )
-            attempts += max(0, min(int(verification.attempts or 0), len(batch)))
-            if verification.status == "not_required":
-                self.cache.remember_success(fingerprint.key, "")
-                result = PasswordSearchResult(
-                    password="",
-                    status=PasswordSearchStatus.UNENCRYPTED,
-                    test_result=verification.test_result,
-                    attempts=attempts,
-                    stopped_reason="fast_not_required",
-                )
-                self._emit_finished(job, result, started_at, candidates_seen, skipped)
-                return result
-            matched_indices = _valid_matched_indices(verification, len(batch))
-            tested_count = max(0, min(int(verification.attempts or 0), len(batch)))
-            if verification.status == "match" and matched_indices:
-                matched = batch[matched_indices[0]]
-                if not verification.final_confirmation_required:
-                    self.cache.remember_success(fingerprint.key, matched)
+            # The authoritative Rust descriptor identifies ENC independently of its
+            # physical name. One remaining candidate needs only the worker's Open;
+            # the ordinary extraction-confirmation path commits success/rejection.
+            if str((job.archive_input or {}).get("format_hint") or "").strip().lower() == "enc":
+                first = list(islice(candidates, 2))
+                if len(first) == 1:
                     result = PasswordSearchResult(
-                        password=matched,
-                        status=PasswordSearchStatus.FOUND,
-                        test_result=verification.test_result,
-                        attempts=attempts,
-                        stopped_reason="fast_proof",
+                        password=None,
+                        status=PasswordSearchStatus.INCONCLUSIVE,
+                        attempts=0,
+                        stopped_reason="extraction_confirmation_required",
+                        extraction_candidates=tuple(first),
                     )
                     self._emit_finished(job, result, started_at, candidates_seen, skipped)
                     return result
-                matched_set = set(matched_indices)
-                inconclusive.extend(batch[index] for index in matched_indices)
-                self.cache.remember_negative_batch(
-                    fingerprint.key,
-                    [
-                        batch[index]
-                        for index in range(tested_count)
-                        if index not in matched_set
-                    ],
-                )
-                inconclusive.extend(
-                    batch[index]
-                    for index in range(tested_count, len(batch))
-                    if index not in matched_set
-                )
-                if not inconclusive_evidence:
-                    inconclusive_evidence = verification.match_evidence
-                elif verification.match_evidence != inconclusive_evidence:
-                    inconclusive_evidence = ""
-                continue
-            if verification.status == "no_match":
-                self.cache.remember_negative_batch(fingerprint.key, batch[:tested_count])
-                if tested_count < len(batch):
-                    inconclusive.extend(batch[tested_count:])
-                continue
-            if verification.status == "damaged":
-                result = PasswordSearchResult(
-                    password=None,
-                    status=PasswordSearchStatus.DAMAGED,
-                    test_result=verification.test_result,
-                    error_text=verification.error_text,
-                    attempts=attempts,
-                    stopped_reason="terminal",
-                )
-                self._emit_finished(job, result, started_at, candidates_seen, skipped)
-                return result
-            if verification.status == "needs_volume_or_tail_damaged":
-                result = PasswordSearchResult(
-                    password=None,
-                    status=PasswordSearchStatus.NEEDS_VOLUME_OR_TAIL_DAMAGED,
-                    test_result=verification.test_result,
-                    error_text=verification.error_text,
-                    attempts=attempts,
-                    stopped_reason="terminal",
-                )
-                self._emit_finished(job, result, started_at, candidates_seen, skipped)
-                return result
-            if verification.status == "backend_unavailable":
-                # Extraction may still have a usable worker/backend. Preserve the
-                # candidates instead of misclassifying an infrastructure failure.
-                inconclusive.extend(batch)
-                continue
-            inconclusive.extend(batch)
+                candidates = chain(first, candidates)
 
-        if inconclusive:
-            result = PasswordSearchResult(
-                password=None,
-                status=PasswordSearchStatus.INCONCLUSIVE,
-                attempts=attempts,
-                stopped_reason="extraction_confirmation_required",
-                extraction_candidates=tuple(inconclusive),
-                extraction_candidate_evidence=inconclusive_evidence,
-            )
-        else:
-            result = PasswordSearchResult(
-                password=None,
-                status=PasswordSearchStatus.EXHAUSTED,
-                attempts=attempts,
-                exhausted=True,
-            )
-        self._emit_finished(job, result, started_at, candidates_seen, skipped)
-        return result
+            batch_size = max(1, int(job.batch_size or self.default_batch_size))
+            inconclusive: list[str] = []
+            inconclusive_evidence = ""
+            attempts = 0
+            while batch := list(islice(candidates, batch_size)):
+                verification = _call_fast_verifier(
+                    self.verifier,
+                    job.archive_path,
+                    batch,
+                    part_paths=job.part_paths,
+                    archive_input=job.probe_input or job.archive_input,
+                )
+                attempts += max(0, min(int(verification.attempts or 0), len(batch)))
+                if verification.status == "not_required":
+                    self.cache.remember_success(fingerprint.key, "")
+                    result = PasswordSearchResult(
+                        password="",
+                        status=PasswordSearchStatus.UNENCRYPTED,
+                        test_result=verification.test_result,
+                        attempts=attempts,
+                        stopped_reason="fast_not_required",
+                    )
+                    self._emit_finished(job, result, started_at, candidates_seen, skipped)
+                    return result
+                matched_indices = _valid_matched_indices(verification, len(batch))
+                tested_count = max(0, min(int(verification.attempts or 0), len(batch)))
+                if verification.status == "match" and matched_indices:
+                    matched = batch[matched_indices[0]]
+                    if not verification.final_confirmation_required:
+                        self.cache.remember_success(fingerprint.key, matched)
+                        result = PasswordSearchResult(
+                            password=matched,
+                            status=PasswordSearchStatus.FOUND,
+                            test_result=verification.test_result,
+                            attempts=attempts,
+                            stopped_reason="fast_proof",
+                        )
+                        self._emit_finished(job, result, started_at, candidates_seen, skipped)
+                        return result
+                    matched_set = set(matched_indices)
+                    inconclusive.extend(batch[index] for index in matched_indices)
+                    self.cache.remember_negative_batch(
+                        fingerprint.key,
+                        [
+                            batch[index]
+                            for index in range(tested_count)
+                            if index not in matched_set
+                        ],
+                    )
+                    inconclusive.extend(
+                        batch[index]
+                        for index in range(tested_count, len(batch))
+                        if index not in matched_set
+                    )
+                    if not inconclusive_evidence:
+                        inconclusive_evidence = verification.match_evidence
+                    elif verification.match_evidence != inconclusive_evidence:
+                        inconclusive_evidence = ""
+                    continue
+                if verification.status == "no_match":
+                    self.cache.remember_negative_batch(fingerprint.key, batch[:tested_count])
+                    if tested_count < len(batch):
+                        inconclusive.extend(batch[tested_count:])
+                    continue
+                if verification.status == "damaged":
+                    result = PasswordSearchResult(
+                        password=None,
+                        status=PasswordSearchStatus.DAMAGED,
+                        test_result=verification.test_result,
+                        error_text=verification.error_text,
+                        attempts=attempts,
+                        stopped_reason="terminal",
+                    )
+                    self._emit_finished(job, result, started_at, candidates_seen, skipped)
+                    return result
+                if verification.status == "needs_volume_or_tail_damaged":
+                    result = PasswordSearchResult(
+                        password=None,
+                        status=PasswordSearchStatus.NEEDS_VOLUME_OR_TAIL_DAMAGED,
+                        test_result=verification.test_result,
+                        error_text=verification.error_text,
+                        attempts=attempts,
+                        stopped_reason="terminal",
+                    )
+                    self._emit_finished(job, result, started_at, candidates_seen, skipped)
+                    return result
+                if verification.status == "backend_unavailable":
+                    # Extraction may still have a usable worker/backend. Preserve the
+                    # candidates instead of misclassifying an infrastructure failure.
+                    inconclusive.extend(batch)
+                    continue
+                inconclusive.extend(batch)
+
+            if inconclusive:
+                result = PasswordSearchResult(
+                    password=None,
+                    status=PasswordSearchStatus.INCONCLUSIVE,
+                    attempts=attempts,
+                    stopped_reason="extraction_confirmation_required",
+                    extraction_candidates=tuple(inconclusive),
+                    extraction_candidate_evidence=inconclusive_evidence,
+                )
+            else:
+                result = PasswordSearchResult(
+                    password=None,
+                    status=PasswordSearchStatus.EXHAUSTED,
+                    attempts=attempts,
+                    exhausted=True,
+                )
+            self._emit_finished(job, result, started_at, candidates_seen, skipped)
+            return result
 
     def remember_extraction_success(self, fingerprint_key: str, password: str) -> None:
         if fingerprint_key:
@@ -380,7 +384,7 @@ class PasswordScheduler:
             job.archive_path,
             batch,
             part_paths=job.part_paths,
-            archive_input=job.archive_input,
+            archive_input=job.probe_input or job.archive_input,
         )
         attempted_in_batch = max(0, min(max(verification.attempts, 0), len(batch)))
         if (
@@ -483,6 +487,17 @@ def _candidate_value(candidate: PasswordCandidate | str) -> str:
     return str(candidate)
 
 
+@contextmanager
+def _prepare_job(verifier, job: PasswordJob):
+    prepare = getattr(verifier, "prepare_input", None)
+    if prepare is None:
+        yield job
+        return
+    prepared = prepare(job.archive_path, part_paths=job.part_paths, archive_input=job.archive_input)
+    with prepared.scope() as bound:
+        yield replace(job, probe_input=bound)
+
+
 def _valid_matched_indices(verification: PasswordBatchVerification, batch_size: int) -> tuple[int, ...]:
     raw = verification.matched_indices or (
         (verification.matched_index,) if verification.matched_index >= 0 else ()
@@ -502,7 +517,7 @@ def _call_fast_verifier(
     passwords: list[str],
     *,
     part_paths: list[str] | None = None,
-    archive_input: dict | None = None,
+    archive_input: dict | PasswordProbeInput | None = None,
 ):
     fast = getattr(verifier, "verify_fast_batch", None)
     if not callable(fast):

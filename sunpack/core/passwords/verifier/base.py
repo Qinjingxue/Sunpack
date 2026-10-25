@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal, Protocol, cast
 
+from sunpack.core.passwords.verifier.input import PasswordProbeInput
+
 
 VerifierStatus = Literal[
     "match",
@@ -56,6 +58,6 @@ class PasswordVerifier(Protocol):
         passwords: list[str],
         *,
         part_paths: list[str] | None = None,
-        archive_input: dict | None = None,
+        archive_input: dict | PasswordProbeInput | None = None,
     ) -> PasswordBatchVerification:
         ...

@@ -4,7 +4,7 @@ from collections.abc import Callable
 
 from sunpack.core.contracts.tasks import ArchiveTask
 from sunpack.core.support.output_paths import OutputPathAllocator
-from sunpack.core.support.path_keys import absolute_path_key
+from sunpack.core.support.path_keys import resolved_path_key
 
 
 class OutputReservationRegistry:
@@ -20,7 +20,7 @@ class OutputReservationRegistry:
     def reserve(self, default_path: str, owner: str, local_reserved: set[str]) -> str:
         with self._lock:
             path = self._allocator.next_available(default_path, self._reserved, local_reserved, is_directory=True)
-            key = absolute_path_key(path)
+            key = resolved_path_key(path)
             self._reserved.add(key)
             self._owner_paths.setdefault(owner, set()).add(key)
             local_reserved.add(key)
@@ -32,7 +32,7 @@ class OutputReservationRegistry:
             outputs.register(path)
 
     def contains(self, path: str) -> bool:
-        key = absolute_path_key(path)
+        key = resolved_path_key(path)
         with self._lock:
             while key:
                 if key in self._reserved:
@@ -72,7 +72,7 @@ def build_output_dir_resolver(
         default_dir = default_output_dir_for_task(task)
         if reservation_registry is None:
             path = allocator.next_available(default_dir, reserved, is_directory=True)
-            reserved.add(absolute_path_key(path))
+            reserved.add(resolved_path_key(path))
             resolved_dirs[id(task)] = path
         else:
             resolved_dirs[id(task)] = reservation_registry.reserve(default_dir, owner, reserved)

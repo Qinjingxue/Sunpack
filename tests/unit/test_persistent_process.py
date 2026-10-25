@@ -850,6 +850,44 @@ def test_persistent_config_snapshot_reuses_a_source_without_mtime_checks(tmp_pat
     assert calls == ["first", "second"]
 
 
+def test_external_config_sources_reload_between_requests_and_evict_watches(tmp_path, monkeypatch):
+    """Cover real request-source events and bounded watch lifetime together.
+
+    Fixed-directory/fake-snapshot tests miss external override updates. This
+    single event-driven case also catches observer retention after LRU eviction.
+    """
+    import json
+    from sunpack.runtime.cli import persistent_runtime as runtime
+
+    async def scenario():
+        await runtime.close_persistent_runtime()
+        reloaded = asyncio.Event()
+        changed = runtime._configuration_files_changed
+        monkeypatch.setattr(runtime, "_configuration_files_changed", lambda: (changed(), reloaded.set()))
+        monkeypatch.setattr(runtime, "_CONFIG_SNAPSHOT_LIMIT", 1)
+        first_dir, second_dir = tmp_path / "external-one", tmp_path / "external-two"
+        first_dir.mkdir(); second_dir.mkdir()
+        first, second = first_dir / "override.json", second_dir / "override.json"
+        first.write_text(json.dumps({"post_extract": {"archive_cleanup_mode": "k"}}), encoding="utf-8")
+        second.write_text(json.dumps({"post_extract": {"archive_cleanup_mode": "r"}}), encoding="utf-8")
+        monkeypatch.setenv("SUNPACK_CONFIG_OVERRIDES", str(first))
+        runtime.enable_persistent_runtime()
+        runtime._CONFIG_OBSERVER.debounce_seconds = 0
+        try:
+            assert runtime.load_request_config()["post_extract"]["archive_cleanup_mode"] == "keep"
+            replacement = first_dir / "replacement.json"
+            replacement.write_text(json.dumps({"post_extract": {"archive_cleanup_mode": "d"}}), encoding="utf-8")
+            replacement.replace(first)
+            await asyncio.wait_for(reloaded.wait(), 3)
+            assert runtime.load_request_config()["post_extract"]["archive_cleanup_mode"] == "delete"
+            monkeypatch.setenv("SUNPACK_CONFIG_OVERRIDES", str(second))
+            assert runtime.load_request_config()["post_extract"]["archive_cleanup_mode"] == "recycle"
+            assert first_dir.resolve() not in runtime._CONFIG_OBSERVER._directories
+        finally:
+            await runtime.close_persistent_runtime()
+    asyncio.run(scenario())
+
+
 def test_server_process_starts_in_neutral_working_directory(tmp_path, monkeypatch):
     _enable_test_runtime_identity(monkeypatch)
     captured = {}

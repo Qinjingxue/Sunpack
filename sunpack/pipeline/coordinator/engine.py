@@ -12,7 +12,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Iterable, TextIO
 
-from sunpack.core.support.path_keys import case_key, path_key_is_under, path_key
+from sunpack.core.support.path_keys import case_key, path_key_is_under, path_key, resolved_path_key
 from sunpack.core.support.path_map import PathMap
 from sunpack.pipeline.discovery.detection.input_planning import ArchiveInputPlanningStage
 from sunpack.core.contracts.pipeline import PipelineArtifacts, PipelineDiscovery, PipelineResponse, PipelineTarget
@@ -367,14 +367,8 @@ def _snapshot_lease_path(path: str) -> _LeasePath:
         else None
     )
 
-    try:
-        resolved = Path(normalized).resolve()
-    except (OSError, ValueError):
-        resolved_key = ""
-        ancestor_keys = ()
-    else:
-        resolved_key = path_key(str(resolved))
-        ancestor_keys = tuple(path_key(str(parent)) for parent in resolved.parents)
+    resolved_key = resolved_path_key(normalized)
+    ancestor_keys = tuple(path_key(parent) for parent in Path(resolved_key).parents)
 
     return _LeasePath(
         path=normalized,
@@ -691,8 +685,9 @@ class _PathLeaseRegistry:
             for prefix in (candidate.resolved_key, *candidate.ancestor_keys):
                 blockers.update(self._directory_owners.get(prefix, ()))
 
-            if candidate.is_dir:
-                blockers.update(self._prefix_owners.get(candidate.resolved_key, ()))
+            # This index also contains exact file owners. A file reached via a
+            # different namespace spelling must conflict just like a directory.
+            blockers.update(self._prefix_owners.get(candidate.resolved_key, ()))
 
         blockers.discard(owner)
         return blockers
@@ -1148,6 +1143,7 @@ class _RequestRuntime:
         )
         self.recursion = self._new_recursion()
         self._active_task_keys: set[str] = set()
+        self._claimed_input_plans: set[tuple] = set()
         self._cleanup_tasks: dict[asyncio.Task, tuple[str, ...]] = {}
         self._prompt_gates: dict[int, asyncio.Task] = {}
         self._consumer_budget: int | None = None
@@ -1446,12 +1442,26 @@ class _RequestRuntime:
 
     def _claim_tasks(self, tasks):
         claimed = []
+        resolved_paths = {}
         with self.context.lock:
             processed = set(self.context.processed_keys)
             for task in tasks:
                 key = str(task.key or task.main_path)
                 if key in processed or key in self._active_task_keys:
                     continue
+                descriptor = task.archive_input()
+                extents = descriptor.extents or [part.extent for part in descriptor.parts]
+                ranges = []
+                for extent in extents:
+                    if extent.path not in resolved_paths:
+                        resolved_paths[extent.path] = resolved_path_key(extent.path)
+                    ranges.append((resolved_paths[extent.path], extent.start, extent.end))
+                if not ranges:
+                    ranges.append((resolved_path_key(descriptor.entry_path), 0, None))
+                plan = (descriptor.open_mode, descriptor.format_hint, tuple(ranges))
+                if plan in self._claimed_input_plans:
+                    continue
+                self._claimed_input_plans.add(plan)
                 self._active_task_keys.add(key)
                 claimed.append(task)
         return claimed
@@ -1519,7 +1529,7 @@ class _RequestRuntime:
             ownership.remember_results([result])
             output_dir = (
                 result.output_dir
-                if result.outcome_kind != OutcomeKind.FAILURE
+                if result.outcome_kind != OutcomeKind.FAILURE or any(outcome.result.complete_embedded_results())
                 else ""
             )
 
@@ -1942,7 +1952,7 @@ class _RequestResults:
         for target in submission.targets:
             self._exact_targets.setdefault(path_key(target.path), target)
             if os.path.isdir(target.path):
-                key = _resolved_path_key(target.path)
+                key = resolved_path_key(target.path)
                 previous = self._directory_targets.get(key)
                 if previous is None or len(target.path) > len(previous.path):
                     self._directory_targets[key] = target
@@ -1951,7 +1961,7 @@ class _RequestResults:
         return self._target_input_dirs[path_key(self._target_for_path(task.main_path).path)]
 
     def forget_output(self, output_dir: str) -> None:
-        self._output_targets.pop(_resolved_path_key(output_dir), None)
+        self._output_targets.pop(resolved_path_key(output_dir), None)
 
     def remap_task(self, task, old_path: str) -> None:
         target = self._target_for_path(old_path)
@@ -1972,7 +1982,7 @@ class _RequestResults:
             if not result.output_dir:
                 continue
             target = self._target_for_path(result.input_path)
-            self._output_targets[_resolved_path_key(result.output_dir)] = target
+            self._output_targets[resolved_path_key(result.output_dir)] = target
 
     def relocate_outputs(self, result: DirectoryFlattenResult) -> None:
         if not result.source_dir:
@@ -1980,9 +1990,9 @@ class _RequestResults:
         # The index uses resolved roots, including outputs reached through a
         # junction. Project those same coordinates through the directory move.
         result = replace(
-            result, path=_resolved_path_key(result.path),
-            source_dir=_resolved_path_key(result.source_dir),
-            output_dir=_resolved_path_key(result.output_dir),
+            result, path=resolved_path_key(result.path),
+            source_dir=resolved_path_key(result.source_dir),
+            output_dir=resolved_path_key(result.output_dir),
         )
         self._output_targets.relocate(result)
 
@@ -2055,7 +2065,7 @@ class _RequestResults:
         if exact is not None:
             return exact
 
-        resolved = _resolved_path_key(normalized)
+        resolved = resolved_path_key(normalized)
         for roots in (self._output_targets, self._directory_targets):
             ancestor = resolved
             while True:
@@ -2067,10 +2077,3 @@ class _RequestResults:
                     break
                 ancestor = parent
         return self.submission.targets[0]
-
-
-def _resolved_path_key(path: str) -> str:
-    try:
-        return path_key(Path(path).resolve())
-    except (OSError, ValueError):
-        return path_key(os.path.abspath(path))

@@ -239,6 +239,8 @@ class PasswordResolver:
                 "",
                 fingerprint.key,
                 task,
+                candidate_passwords=("",),
+                candidate_evidence="empty_password_direct",
             )
 
         search = self._plan_password_search(

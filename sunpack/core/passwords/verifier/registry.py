@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from sunpack.core.passwords.verifier.base import PasswordBatchVerification, PasswordVerifier
+from sunpack.core.passwords.verifier.input import PasswordProbeInput, prepare_password_input
 
 
 @dataclass
@@ -29,13 +30,15 @@ class PasswordVerifierChain:
     def __init__(self, fast_verifiers: list[PasswordVerifier]):
         self.fast_verifiers = list(fast_verifiers)
 
+    prepare_input = staticmethod(prepare_password_input)
+
     def verify_batch(
         self,
         archive_path: str,
         passwords: list[str],
         *,
         part_paths: list[str] | None = None,
-        archive_input: dict | None = None,
+        archive_input: dict | PasswordProbeInput | None = None,
     ) -> PasswordBatchVerification:
         return self._run_fast_verifiers(
             archive_path,
@@ -50,7 +53,7 @@ class PasswordVerifierChain:
         passwords: list[str],
         *,
         part_paths: list[str] | None = None,
-        archive_input: dict | None = None,
+        archive_input: dict | PasswordProbeInput | None = None,
     ) -> PasswordBatchVerification:
         return self.verify_batch(
             archive_path,
@@ -65,7 +68,7 @@ class PasswordVerifierChain:
         passwords: list[str],
         *,
         part_paths: list[str] | None = None,
-        archive_input: dict | None = None,
+        archive_input: dict | PasswordProbeInput | None = None,
     ) -> PasswordBatchVerification:
         for verifier in self._ordered_fast_verifiers(archive_path, archive_input):
             outcome = verifier.verify_batch(
@@ -87,7 +90,7 @@ class PasswordVerifierChain:
     def _ordered_fast_verifiers(
         self,
         archive_path: str,
-        archive_input: dict | None = None,
+        archive_input: dict | PasswordProbeInput | None = None,
     ) -> list[PasswordVerifier]:
         preferred = _preferred_archive_format(archive_input)
         if not preferred:
@@ -105,8 +108,8 @@ class PasswordVerifierChain:
         return matching + [verifier for verifier in generic if verifier not in matching]
 
 
-def _preferred_archive_format(archive_input: dict | None = None) -> str:
-    if isinstance(archive_input, dict):
+def _preferred_archive_format(archive_input: dict | PasswordProbeInput | None = None) -> str:
+    if archive_input is not None:
         hinted = _normalize_archive_format(
             str(archive_input.get("format_hint") or archive_input.get("format") or "")
         )

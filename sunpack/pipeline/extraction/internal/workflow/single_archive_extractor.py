@@ -7,7 +7,7 @@ from typing import Any, Callable
 
 from sunpack.core.support.resource_lifecycle import task_walk
 from sunpack.core.support.output_paths import OutputPathAllocator
-from sunpack.core.support.path_keys import absolute_path_key
+from sunpack.core.support.path_keys import resolved_path_key
 
 from sunpack.core.contracts.failures import FailureInfo, FailureKind
 from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
@@ -20,7 +20,7 @@ from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import com
 from sunpack.pipeline.extraction.progress import build_extraction_progress_manifest, has_recoverable_partial_outputs
 from sunpack.core.contracts.extraction import ExtractionResult
 from sunpack.core.passwords.result import PasswordResolution, PasswordResolutionStatus
-from sunpack.core.passwords.resolver import archive_structure_requires_password
+from sunpack.core.passwords.resolver import archive_structure_requires_password, archive_structure_password_state
 from sunpack.core.support import archive_knowledge_projection as knowledge_view
 from sunpack.core.support.archive_input_projection import write_source_password_probe_input
 from sunpack.pipeline.extraction.output_inventory import OutputInventory, collect_output_inventory
@@ -325,7 +325,7 @@ class SingleArchiveExtractor:
                 selected_password = self._worker_selected_password(resolution, run_result)
                 if selected_password is not None:
                     correct_pwd = selected_password
-                if failure.details.get("evidence") == "zipcrypto_entry_crc_proven_before_failure":
+                if failure.details.get("evidence") == "entry_crc_proven_before_failure":
                     self.password_resolver.confirm_extraction(resolution, password=correct_pwd)
                 elif failure.kind == FailureKind.WRONG_PASSWORD and worker_result.get("password_candidates_all_rejected"):
                     self.password_resolver.reject_extraction_candidates(resolution)
@@ -408,15 +408,15 @@ class SingleArchiveExtractor:
                 archive_key=archive_key,
             )
         if not self.password_store.has_candidates(scope_path=scope_path) and not self._task_requires_password(task):
-            format_hint = str(task.archive_input().format_hint or "").strip().lower().lstrip(".")
-            direct_zip_candidate = format_hint in {"zip", "jar", "docx", "xlsx", "apk"}
+            unknown = archive_structure_password_state(task) == "unknown"
             return PasswordResolution(
                 password="",
-                status=PasswordResolutionStatus.UNENCRYPTED,
+                status=PasswordResolutionStatus.RESOLVED if unknown else PasswordResolutionStatus.UNENCRYPTED,
                 archive_key=archive_key,
-                encrypted=False,
-                candidate_passwords=("",) if direct_zip_candidate else (),
-                candidate_evidence="zip_empty_password_direct" if direct_zip_candidate else "",
+                encrypted=None if unknown else False,
+                requires_extraction_confirmation=unknown,
+                candidate_passwords=("",) if unknown else (),
+                candidate_evidence="empty_password_direct" if unknown else "",
             )
         return self.password_resolver.resolve(
             archive_path,
@@ -642,9 +642,6 @@ class SingleArchiveExtractor:
                 diagnostics={"failure_stage": "preflight", "failure_kind": "output_filesystem", "message": str(exc)},
             )
 
-        with _phase(phase_timer, f"{phase_prefix}_save_archive_input"):
-            saved_archive_input = task.archive_input()
-            saved_knowledge = task.knowledge().to_dict()
         segment_results: list[dict[str, Any]] = []
         embedded_results: list[tuple[dict[str, Any], ExtractionResult]] = []
         segment_inventories: list[OutputInventory] = []
@@ -679,45 +676,40 @@ class SingleArchiveExtractor:
                     is_directory=True,
                 )
             )
-            segment_paths.add(absolute_path_key(segment_dir))
-            try:
-                with _phase(phase_timer, f"{phase_prefix}_segment_set_archive_input"):
-                    # Carrier archive knowledge is not valid for each
-                    # independent logical archive. Runtime-only context such as
-                    # the original password scope lives outside ArchiveKnowledge.
-                    task.set_knowledge({})
-                    task.set_archive_input(descriptor)
-                    # Embedded boundary resolution may already have proven the
-                    # password for this exact logical range. Keep that proof in
-                    # runtime-only state so it is not serialized into manifests.
-                    segment_passwords = task.runtime.get("embedded_segment_passwords")
-                    if isinstance(segment_passwords, dict):
-                        known_password = segment_passwords.get(str(segment.get("start_offset")))
-                        if isinstance(known_password, str):
-                            task.knowledge().set(
-                                "archive.password",
-                                known_password,
-                                source_layer="embedded",
-                                source_module="boundary_resolver",
-                            )
-                    # Password verification must bind to the currently active
-                    # logical segment.
-                    write_source_password_probe_input(task, descriptor.to_dict())
-                result = yield from self._extract_state_machine(
-                    task,
-                    segment_dir,
-                            allow_embedded_segments=False,
-                    phase_timer=phase_timer,
-                    phase_prefix=f"{phase_prefix}_segment_extract",
+            segment_paths.add(resolved_path_key(segment_dir))
+            with _phase(phase_timer, f"{phase_prefix}_segment_set_archive_input"):
+                # Each logical payload owns its knowledge. The carrier stays
+                # unchanged, including when a payload fails or is cancelled.
+                child_task = ArchiveTask.from_archive_input(
+                    descriptor, discovery_source=task.discovery_source,
+                    carrier_path=task.carrier_path,
                 )
-                result.diagnostics = {
-                    **dict(result.diagnostics or {}),
-                    "verification_archive_input": dict(segment.get("archive_input") or {}),
-                }
-            finally:
-                with _phase(phase_timer, f"{phase_prefix}_segment_restore_archive_input"):
-                    task.set_knowledge(saved_knowledge)
-                    task.set_archive_input(saved_archive_input)
+                child_task.key = task.key
+                child_task.runtime = dict(task.runtime)
+                # Embedded boundary resolution may already have proven the
+                # password for this exact logical range. Keep that proof in
+                # runtime-only state so it is not serialized into manifests.
+                segment_passwords = child_task.runtime.pop("embedded_segment_passwords", None)
+                if isinstance(segment_passwords, dict):
+                    known_password = segment_passwords.get(str(segment.get("start_offset")))
+                    if isinstance(known_password, str):
+                        child_task.knowledge().set(
+                            "archive.password",
+                            known_password,
+                            source_layer="embedded",
+                            source_module="boundary_resolver",
+                        )
+                # Password verification must bind to the currently active
+                # logical segment.
+                write_source_password_probe_input(child_task, descriptor.to_dict())
+            result = yield from self._extract_state_machine(
+                child_task, segment_dir, allow_embedded_segments=False,
+                phase_timer=phase_timer, phase_prefix=f"{phase_prefix}_segment_extract",
+            )
+            result.diagnostics = {
+                **dict(result.diagnostics or {}),
+                "verification_archive_input": dict(segment.get("archive_input") or {}),
+            }
 
             if result.password_used is not None and password_used is None:
                 password_used = result.password_used

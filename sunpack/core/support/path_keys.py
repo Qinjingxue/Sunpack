@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 from typing import Any
 
 from sunpack_native import windows_path_key
@@ -18,6 +19,19 @@ def case_key(value: Any) -> str:
 
 def absolute_path_key(path: Any) -> str:
     return windows_path_key(os.path.abspath(str(path or "")))
+
+
+def resolved_path_key(path: Any) -> str:
+    """Namespace identity, including an absent leaf below a junction/symlink."""
+    try:
+        resolved = str(Path(path).resolve())
+    except (OSError, ValueError):
+        resolved = os.path.abspath(path)
+    if resolved.startswith("\\\\?\\UNC\\"):
+        resolved = "\\\\" + resolved[8:]
+    elif resolved.startswith("\\\\?\\"):
+        resolved = resolved[4:]
+    return path_key(resolved)
 
 
 def path_key_is_under(candidate: str, root: str) -> bool:

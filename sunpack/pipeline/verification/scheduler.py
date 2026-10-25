@@ -29,15 +29,12 @@ class VerificationScheduler:
         if embedded_results:
             payloads = []
             for index, (segment, segment_result) in enumerate(embedded_results, start=1):
-                payloads.append((
-                    segment,
-                    self._verify_one(
-                        task,
-                        segment_result,
-                        phase_timer=phase_timer,
-                        phase_prefix=f"{phase_prefix}_embedded_{index}",
-                    ),
-                ))
+                verification = self._verify_one(
+                    task, segment_result, phase_timer=phase_timer,
+                    phase_prefix=f"{phase_prefix}_embedded_{index}",
+                )
+                segment["verified_complete"] = bool(segment_result.success and verification.decision_hint == DECISION_ACCEPT)
+                payloads.append((segment, verification))
             result = aggregate_payload_verifications(payloads)
         else:
             result = self._verify_one(

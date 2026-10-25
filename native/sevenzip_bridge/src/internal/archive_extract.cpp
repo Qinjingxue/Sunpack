@@ -623,7 +623,10 @@ namespace sunpack::sevenzip
 
             result.password_crc_proven = result.password_crc_proven_items > 0;
 
-            result.encrypted = result.encrypted || std::any_of(
+            // Some solid/encrypted handlers ask for a password before GetStream
+            // and can fail before an item trace exists. Keep that runtime proof
+            // just like an encrypted property observed on a streamed item.
+            result.encrypted = result.encrypted || raw_extract_callback->password_requested() || std::any_of(
                                                        result.output_trace.items.begin(),
                                                        result.output_trace.items.end(),
                                                        [](const ExtractOutputItemTrace &item)

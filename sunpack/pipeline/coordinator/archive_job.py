@@ -67,10 +67,7 @@ class ArchiveJobOutcome:
         if (
             self.result.failure is not None
             and self.result.failure.contains(FailureKind.EMBEDDED_SEGMENTS_FAILED)
-            and any(
-                bool(child.success)
-                for _segment, child in (self.result.embedded_results or [])
-            )
+            and any(self.result.complete_embedded_results())
         ):
             return False
         if self.content_requirement != CONTENT_REQUIREMENT_COMPLETE:
@@ -140,6 +137,9 @@ class ArchiveJobExecutor:
             request_id=self.request_id,
             cancellation=cancellation,
         )
+        preserve_output = bool(result.output_dir and (
+            result.outcome_kind != OutcomeKind.FAILURE or any(outcome.result.complete_embedded_results())
+        ))
         if self.origin == "watch":
             # Preflight can finish without ever starting an output write.
             # Only close a durable output record that this job actually opened.
@@ -152,9 +152,9 @@ class ArchiveJobExecutor:
                     critical=True,
                     task_path=output_task_path,
                     output_dir=output_dir,
-                    keep_output=bool(result.output_dir and result.outcome_kind != OutcomeKind.FAILURE),
+                    keep_output=preserve_output,
                 )
-        if result.output_dir and result.outcome_kind != OutcomeKind.FAILURE:
+        if preserve_output:
             self.password_scope_context.remember(result.output_dir, task)
         return task, outcome, result
 

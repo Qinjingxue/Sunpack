@@ -340,7 +340,7 @@ def test_extraction_plan_accepts_not_required_fast_result(tmp_path):
     scheduler = PasswordScheduler(PasswordVerifierChain([fast]))
     job = PasswordJob(
         archive_path=str(archive),
-        archive_input={"open_mode": "file_range", "format_hint": "zip"},
+        archive_input={"open_mode": "file_range", "format_hint": "zip", "parts": [{"path": str(archive), "start": 0, "end": 7}]},
         candidates=PasswordCandidatePipeline.from_values(["", "secret"]),
     )
 

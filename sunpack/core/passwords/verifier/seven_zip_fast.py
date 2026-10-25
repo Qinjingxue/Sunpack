@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 from sunpack.core.passwords.verifier.base import PasswordBatchVerification, normalize_verifier_status
-from sunpack.core.passwords.verifier.input import requires_volume_aware_verifier, verifier_input
-from sunpack.core.support.archive_sessions import borrow_archive_sessions
+from sunpack.core.passwords.verifier.input import PasswordProbeInput, prepare_password_input
 from sunpack_native import seven_zip_fast_verify_passwords_from_ranges
 
 
 class SevenZipFastVerifier:
     format_hint = "7z"
+    prepare_input = staticmethod(prepare_password_input)
 
     def verify_batch(
         self,
@@ -15,28 +15,19 @@ class SevenZipFastVerifier:
         passwords: list[str],
         *,
         part_paths: list[str] | None = None,
-        archive_input: dict | None = None,
+        archive_input: dict | PasswordProbeInput | None = None,
     ) -> PasswordBatchVerification:
-        if requires_volume_aware_verifier(
-            archive_path,
-            part_paths=part_paths,
-            archive_input=archive_input,
-        ):
+        prepared = prepare_password_input(archive_path, part_paths=part_paths, archive_input=archive_input)
+        if prepared.volume_aware:
             return PasswordBatchVerification(
                 ok=False,
                 status="unknown_needs_final_verifier",
                 attempts=0,
                 error_text="7z volume set requires the volume-aware bounded verifier",
             )
-        verifier_path, ranges = verifier_input(
-            archive_path,
-            part_paths=part_paths,
-            archive_input=archive_input,
-        )
+        ranges = prepared.ranges
         normalized_passwords = list(passwords or [""])
-        with borrow_archive_sessions(
-            [item.get("path") for item in ranges] if ranges else [verifier_path]
-        ) as sessions:
+        with prepared.borrow_sessions() as sessions:
             outcome = (
                 seven_zip_fast_verify_passwords_from_ranges(ranges, normalized_passwords, sessions=sessions)
                 if ranges

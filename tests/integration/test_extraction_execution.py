@@ -50,6 +50,9 @@ def runner_config():
 class FakePasswordResolver:
     password_tester = SimpleNamespace(passwords=[])
 
+    def confirm_extraction(self, resolution, password=None):
+        pass
+
     def resolve(self, archive_path, task, part_paths=None, **_kwargs):
         return SimpleNamespace(password="", test_result=None, error_text="")
 
