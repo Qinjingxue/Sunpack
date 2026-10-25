@@ -54,17 +54,8 @@ def _unregister_toast() -> None:
     argv = _runtime_argv("--unregister-toast-current-user")
     process = launch_unelevated(argv, cwd=str(current_process_executable().parent))
     try:
-        try:
-            exit_code = process.wait(timeout=30.0)
-        except subprocess.TimeoutExpired:
-            exit_code = None
-        if exit_code is None:
-            try:
-                process.terminate()
-                process.wait(timeout=5.0)
-            except Exception:
-                pass
-            raise OSError("current-user Toast cleanup timed out")
+        # Wait for the helper's real exit status; slow startup is not failure.
+        exit_code = process.wait()
         if int(exit_code) != 0:
             raise OSError(f"current-user Toast cleanup failed with exit code {int(exit_code)}")
     finally:

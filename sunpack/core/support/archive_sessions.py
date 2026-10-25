@@ -4,7 +4,6 @@ import contextlib
 import contextvars
 import os
 import threading
-import time
 import uuid
 import weakref
 from collections import OrderedDict
@@ -16,7 +15,6 @@ from sunpack.core.support.path_keys import absolute_path_key, path_key_is_under
 from sunpack_native import NativeArchiveSession, clear_reader_resources
 
 from sunpack.core.support.resource_lifecycle import (
-    ResourceBusyError,
     ResourceKind,
     ResourceLease,
     current_task_resource_scope,
@@ -27,7 +25,6 @@ from sunpack.core.support.resource_lifecycle import (
 
 
 _MAX_SESSIONS = 128
-_BORROW_RELEASE_TIMEOUT_SECONDS = 30.0
 _LOCK = threading.RLock()
 _CHANGED = threading.Condition(_LOCK)
 
@@ -97,17 +94,11 @@ def _attach_task_borrow_locked(entry: _SessionEntry) -> None:
 
 
 def _close_entry(entry: _SessionEntry) -> None:
-    deadline = time.monotonic() + _BORROW_RELEASE_TIMEOUT_SECONDS
     with _CHANGED:
         entry.retired = True
+        # The borrower owns release; elapsed time alone cannot invalidate its lease.
         while entry.borrowers:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise ResourceBusyError(
-                    f"archive session {entry.key[0]} is still borrowed by tasks "
-                    f"{sorted(entry.borrowers)}"
-                )
-            _CHANGED.wait(remaining)
+            _CHANGED.wait()
         if entry.closed:
             return
     _native_close(entry.session)

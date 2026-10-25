@@ -1,4 +1,3 @@
-import subprocess
 import sys
 
 
@@ -16,18 +15,8 @@ def _launch_unelevated_launcher(arguments: list[str]) -> int:
         cwd=str(executable.parent),
     )
     try:
-        try:
-            exit_code = process.wait(timeout=30.0)
-        except subprocess.TimeoutExpired:
-            exit_code = None
-        if exit_code is None:
-            try:
-                process.terminate()
-                process.wait(timeout=5.0)
-            except Exception:
-                pass
-            return 1
-        return int(exit_code)
+        # A slow unelevated launcher must not be mistaken for a failed launch.
+        return int(process.wait())
     finally:
         close = getattr(process, "close", None)
         if callable(close):

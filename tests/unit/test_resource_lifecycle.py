@@ -168,7 +168,7 @@ def test_promotion_fails_closed_for_another_tasks_live_resource(tmp_path):
         )
 
     with pytest.raises(ResourceBusyError, match="other-task"):
-        with promotion_barrier((root,), timeout=0.01, strict_open_file_audit=False):
+        with promotion_barrier((root,), timeout=0, strict_open_file_audit=False):
             pass
 
     assert not released.is_set()
@@ -326,7 +326,7 @@ def test_service_owned_file_resource_blocks_promotion(tmp_path):
     )
 
     with pytest.raises(ResourceBusyError, match="service_owned"):
-        with promotion_barrier((root,), timeout=0.01):
+        with promotion_barrier((root,), timeout=0):
             pass
 
     assert not released.is_set()
@@ -524,3 +524,58 @@ def test_async_scope_close_waits_for_cancelled_worker_without_blocking_loop(tmp_
         await broker.close()
 
     asyncio.run(scenario())
+
+
+def test_positive_legacy_promotion_timeout_does_not_fail_while_resource_is_live(tmp_path):
+    """Slow ownership release must not be mistaken for a failed promotion."""
+    root = tmp_path / "output"
+    root.mkdir()
+    path = root / "held.bin"
+    path.write_bytes(b"payload")
+    scope = TaskResourceScope("delayed-owner", files=(path,))
+    with scope.activate():
+        register_current_task_resource(
+            object(), (path,), lambda: None, kind=ResourceKind.PYTHON_FILE,
+        )
+    released = threading.Event()
+
+    def release_later():
+        scope.close()
+        released.set()
+
+    timer = threading.Timer(0.05, release_later)
+    timer.start()
+    try:
+        with promotion_barrier((root,), timeout=0.001, strict_open_file_audit=False):
+            pass
+    finally:
+        scope.close()
+        timer.join(1.0)
+    assert released.is_set()
+
+
+def test_async_scope_close_waits_past_legacy_timeout(tmp_path):
+    """An active operation must be allowed to finish even after a small legacy timeout."""
+    path = tmp_path / "held.bin"
+    path.write_bytes(b"payload")
+    scope = TaskResourceScope("delayed-operation", files=(path,))
+    running = threading.Event()
+    release = threading.Event()
+
+    def operation():
+        with scope.activate(), scope.operation():
+            running.set()
+            assert release.wait(2)
+
+    worker = threading.Thread(target=operation)
+    worker.start()
+    try:
+        assert running.wait(1)
+        async def finish():
+            asyncio.get_running_loop().call_later(0.05, release.set)
+            await scope.aclose(timeout=0.001)
+        asyncio.run(finish())
+    finally:
+        release.set()
+        worker.join(1.0)
+    assert scope.state is lifecycle.ScopeState.CLOSED

@@ -7,7 +7,6 @@ use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
-use std::time::Duration;
 
 #[derive(Clone)]
 struct NativeResourceRecord {
@@ -333,17 +332,11 @@ pub(crate) fn native_wait_for_resources(
     roots: Vec<String>,
     timeout_seconds: f64,
 ) -> PyResult<Py<PyList>> {
-    if !timeout_seconds.is_finite() {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "native resource wait timeout must be finite",
-        ));
-    }
     let roots = roots
         .into_iter()
         .map(PathBuf::from)
         .map(normalized_path)
         .collect::<Vec<_>>();
-    let timeout = Duration::from_secs_f64(timeout_seconds.clamp(0.0, u32::MAX as f64));
     let records = py
         .detach(move || {
             let state = registry();
@@ -351,9 +344,14 @@ pub(crate) fn native_wait_for_resources(
                 .registry
                 .lock()
                 .map_err(|_| io::Error::other("native resource registry poisoned"))?;
-            let (registry, _) = state
+            // Zero is an explicit non-blocking probe, not an elapsed-time failure.
+            // Positive values are accepted for API compatibility, but wait for release.
+            if timeout_seconds <= 0.0 {
+                return Ok::<_, io::Error>(matching_resources(&registry, &roots));
+            }
+            let registry = state
                 .changed
-                .wait_timeout_while(registry, timeout, |registry| {
+                .wait_while(registry, |registry| {
                     registry
                         .resources
                         .values()
