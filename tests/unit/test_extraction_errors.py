@@ -19,7 +19,6 @@ from sunpack.pipeline.extraction.internal.workflow.errors import (
 from sunpack.pipeline.extraction.internal.workflow.single_archive_extractor import (
     SingleArchiveExtractor,
 )
-from sunpack.pipeline.extraction.internal.workflow.retry_policy import ExtractRetryPolicy
 
 
 @pytest.mark.parametrize("encrypted", [None, True])
@@ -45,7 +44,7 @@ def test_split_empty_password_worker_rejection_is_not_downgraded(tmp_path, encry
         password_store=None,
         password_resolver=SimpleNamespace(reject_extraction_candidates=rejected.append),
         metadata_scanner=SimpleNamespace(scan_for_task=lambda *a, **k: SimpleNamespace(selected_codepage=None, error="")),
-        retry_policy=ExtractRetryPolicy(1),
+        retry_policy=None,
         sevenzip_runner=SimpleNamespace(
             emit_semantic_event=lambda *a, **k: None,
             extract_attempt=lambda **k: _worker_completed({
