@@ -342,7 +342,6 @@ class WatchScheduler:
             raise RuntimeError("Watch scheduler is closed")
         if self._started:
             return
-        self.log.begin_recovery()
         self.state.retain_scopes(self.scopes.values())
         self._prepare_usn_startup_baseline()
         removed_entries = self.state.prune_missing_records()
@@ -911,7 +910,6 @@ class WatchScheduler:
                 self._password_retry_at = None
 
     def _stop_blocking(self):
-        self.log.invalidate()
         if not self._started:
             return
         if self._observer_resource is not None:

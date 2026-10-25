@@ -884,7 +884,7 @@ void Application::work() {
     std::string language="en";
     try {
         Json config=Json::object(), passwords={{"passwords",Json::array()}};
-        WatchRoots roots; EventLog log([this]{ changed(Log); }); View view;
+        WatchRoots roots; EventLog log; View view;
         Json errors=Json::object();
         auto dir=options_.data_dir;
         auto dir_key=path_key(dir);

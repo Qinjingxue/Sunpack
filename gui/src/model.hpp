@@ -3,7 +3,6 @@
 #include <nlohmann/json.hpp>
 #include <unordered_map>
 #include <unordered_set>
-#include <memory>
 
 namespace spg {
 using Json = nlohmann::ordered_json;
@@ -51,11 +50,6 @@ struct Task {
     mutable DisplayCache display;
 };
 class EventLog {
-    struct Publication;
-    std::unique_ptr<Publication> publication_;
-    std::function<void()> publication_changed_;
-    std::string generation_;
-    bool state_ready_ = false, available_ = true;
     fs::path path_;
     uint64_t offset_ = 0, identity_ = 0, sequence_ = 0;
     DWORD volume_ = 0;
@@ -66,9 +60,6 @@ class EventLog {
     void erase_task(const std::wstring& key);
     void accept_group(const Json& group, const std::string& owner = {});
 public:
-    explicit EventLog(std::function<void()> changed = {});
-    ~EventLog();
-    bool available() const { return available_; }
     std::unordered_map<std::wstring, Task> tasks;
     size_t malformed = 0;
     uint64_t bytes_parsed = 0; // Diagnostic counter, never persisted.

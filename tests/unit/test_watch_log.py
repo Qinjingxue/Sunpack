@@ -71,35 +71,34 @@ def test_shared_async_log_compacts_history_without_losing_active_groups(tmp_path
 
 def test_recovery_rebuilds_from_wal_with_groups_and_silent_blocker_retirement(tmp_path):
     # Replaying the JSONL cannot expose the WAL/event commit gap. Reopen the
-    # actual state store and deliberately discard a conflicting old success.
+    # actual state store: replace stale live state without losing results.
     path = tmp_path / "events.jsonl"
     a, b = str(tmp_path / "opaque.001"), str(tmp_path / "opaque.002")
     (tmp_path / "opaque.001").write_bytes(b"0123456789")
     (tmp_path / "opaque.002").write_bytes(b"0123456789")
     departed = tmp_path / "opaque.003"
     departed.write_bytes(b"0123456789")
-    store = WatchLogStore(str(path), max_bytes=2048)
+    store = WatchLogStore(str(path), max_bytes=8192)
     state = WatchStateStore(str(tmp_path / "state.snapshot"))
     state._native.attach_events(store._native)
     store.recover()
     group = {"path": a, "members": [a, b, str(departed)], "name": "inside.rar"}
     store.write("pipeline_sources_claimed", groups=[group])
     assert state.mark(a, 10, 1.0, status="suspended_missing_volume", failure_payload={}, source_group=group)
-    store.write("done", path=a)  # Represents a stale/uncommitted GUI result.
+    store.write("done", path=a)  # A completed execution is independent history.
     state.close()
     departed.unlink()  # Simulate a deletion before its JSONL notification.
-    store.begin_recovery()
     state = WatchStateStore(str(tmp_path / "state.snapshot"))
     state._native.attach_events(store._native)
     store.recover(state._native)
     store.flush()
     rows = _records(path)
-    assert not any(r["event"] in {"done", "processing_started"} for r in rows)
-    restored_group = next(r for r in rows if r["event"] == "pipeline_sources_claimed")["groups"][0]
+    assert any(r["event"] == "done" for r in rows)
+    assert not any(r["event"] == "processing_started" for r in rows)
+    restored_group = [r for r in rows if r["event"] == "pipeline_sources_claimed"][-1]["groups"][0]
     assert restored_group["path"] == a and restored_group["name"] == group["name"]
     assert set(restored_group["members"]) == {a, b}
     assert any(r["event"] == "suspended_missing_volume" for r in rows)
-    assert any(r["event"] == "state_ready" for r in rows)
     assert state.mark(b, 10, 1.0, status="failed_password", failure_payload={}, source_group=group)
     state.clear_entries([a])
     store.flush()

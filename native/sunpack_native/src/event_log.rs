@@ -6,7 +6,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyList, PySlice, PyString, PyTuple};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufRead, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::thread::JoinHandle;
@@ -204,6 +204,9 @@ struct Task {
     order: u64,
 }
 impl Task {
+    fn processing(&self) -> bool {
+        self.status.is_some() && !self.terminal && !self.blocked
+    }
     fn bytes(&self) -> usize {
         self.status.as_ref().map_or(0, |r| r.len()) + self.group_row.as_ref().map_or(0, |r| r.len())
     }
@@ -291,6 +294,18 @@ impl Projection {
             self.aliases.shrink_to_fit();
         }
     }
+    fn retain_history(&mut self) {
+        let active: Vec<_> = self
+            .tasks
+            .iter()
+            .filter(|(_, task)| !task.terminal)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in active {
+            self.remove(&id);
+        }
+        self.trim();
+    }
     fn resolve(&self, value: &Value, physical: &str) -> String {
         let explicit = field(value, "task_id");
         if !explicit.is_empty() {
@@ -302,10 +317,14 @@ impl Projection {
             .unwrap_or_else(|| physical.to_owned())
     }
     fn instance_id(&self, owner: &str, physical: &str) -> String {
-        // Watch already supplies a UUID per submission. The sequence fallback
-        // also supports ownerless recovered/legacy events without file I/O.
+        // Watch supplies a UUID per submission. Ownerless recovery must also
+        // avoid IDs already present in history from an earlier writer.
         let owner = if owner.is_empty() {
-            format!("@{}", self.order)
+            let epoch = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            format!("@{epoch}:{}", self.order)
         } else {
             owner.to_owned()
         };
@@ -458,12 +477,15 @@ impl Projection {
             return None;
         }
         if event == "candidate_departed" || event == "task_retired" {
+            // Source cleanup does not end an in-flight execution. Its original
+            // members still route completion until the request releases them.
             let recursive = value["recursive"].as_bool().unwrap_or(false);
             let affected: Vec<_> = if recursive {
                 self.tasks
                     .iter()
                     .filter(|(_, t)| {
                         !t.terminal
+                            && !t.processing()
                             && t.members.iter().any(|m| {
                                 *m == physical || crate::watch_store::is_path_under(m, &physical)
                             })
@@ -473,7 +495,7 @@ impl Projection {
             } else {
                 self.tasks
                     .get(&id)
-                    .filter(|t| !t.terminal)
+                    .filter(|t| !t.terminal && !t.processing())
                     .map(|_| vec![id])
                     .unwrap_or_default()
             };
@@ -525,7 +547,10 @@ impl Projection {
             )
         {
             if field(value, "task_id").is_empty()
-                && event == "processing_started"
+                && matches!(
+                    event.as_str(),
+                    "processing_started" | "failed_password" | "suspended_missing_volume"
+                )
                 && self.tasks.get(&id).is_none_or(|t| t.terminal)
             {
                 id = self.instance_id(field(value, "owner"), &physical);
@@ -601,26 +626,12 @@ impl Projection {
     }
 }
 
-// One fault notification per writer lifetime. Ordinary task updates perform no
-// cross-process signalling. A repaired snapshot gets a new generation/lease.
+// Atomic snapshot replacement shares the existing Windows reader contract.
 mod win {
     use super::*;
     use std::ffi::c_void;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-    type Handle = *mut c_void;
     #[link(name = "kernel32")]
     unsafe extern "system" {
-        fn CreateEventW(a: *const c_void, manual: i32, initial: i32, name: *const u16) -> Handle;
-        fn SetEvent(h: Handle) -> i32;
-        fn CloseHandle(h: Handle) -> i32;
-        fn GetCurrentProcess() -> Handle;
-        fn GetProcessTimes(
-            h: Handle,
-            created: *mut u64,
-            exit: *mut u64,
-            kernel: *mut u64,
-            user: *mut u64,
-        ) -> i32;
         fn MoveFileExW(from: *const u16, to: *const u16, flags: u32) -> i32;
         fn ReplaceFileW(
             target: *const u16,
@@ -630,63 +641,6 @@ mod win {
             exclude: *const c_void,
             reserved: *const c_void,
         ) -> i32;
-    }
-    pub(super) struct Publication {
-        pub header: Value,
-        fault: usize,
-        failed: AtomicBool,
-    }
-    impl Drop for Publication {
-        fn drop(&mut self) {
-            unsafe {
-                CloseHandle(self.fault as Handle);
-            }
-        }
-    }
-    impl Publication {
-        pub fn new() -> io::Result<Self> {
-            static NEXT: AtomicU64 = AtomicU64::new(1);
-            let (mut created, mut exit, mut kernel, mut user) = (0, 0, 0, 0);
-            if unsafe {
-                GetProcessTimes(
-                    GetCurrentProcess(),
-                    &mut created,
-                    &mut exit,
-                    &mut kernel,
-                    &mut user,
-                )
-            } == 0
-            {
-                return Err(io::Error::last_os_error());
-            }
-            let name = format!(
-                "Local\\SunPack.Log.{}.{}.{}",
-                std::process::id(),
-                created,
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            );
-            let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
-            let fault = unsafe { CreateEventW(std::ptr::null(), 1, 0, wide.as_ptr()) };
-            if fault.is_null() {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(Self {
-                header: json!({"event":"state_begin","schema":1,"generation":name,
-                "fault_event":name,"owner_pid":std::process::id(),"owner_started":created.to_string()}),
-                fault: fault as usize,
-                failed: AtomicBool::new(false),
-            })
-        }
-        pub fn invalidate(&self) {
-            if !self.failed.swap(true, Ordering::AcqRel) {
-                unsafe {
-                    SetEvent(self.fault as Handle);
-                }
-            }
-        }
-        pub fn failed(&self) -> bool {
-            self.failed.load(Ordering::Acquire)
-        }
     }
     pub(super) fn replace(from: &std::path::Path, to: &std::path::Path) -> io::Result<()> {
         use std::os::windows::ffi::OsStrExt;
@@ -737,7 +691,6 @@ struct State {
     queue_bytes: usize,
     rewrite: bool,
     revision: u64,
-    ready: bool,
     stopping: bool,
     working: bool,
     error: Option<String>,
@@ -745,21 +698,9 @@ struct State {
 pub(crate) struct Shared {
     state: Mutex<State>,
     wake: Condvar,
-    publication: Mutex<Option<Arc<win::Publication>>>,
     stateful: bool,
 }
 impl Shared {
-    fn fault(&self) {
-        if let Some(publication) = self.publication.lock().unwrap().as_ref() {
-            publication.invalidate();
-        }
-    }
-    pub(crate) fn invalidate(&self) {
-        let mut state = self.state.lock().unwrap();
-        self.fault();
-        state.ready = false;
-        state.revision += 1;
-    }
     pub(crate) fn submit(&self, mut value: Value) {
         let mut state = self.state.lock().unwrap();
         let row = if self.stateful {
@@ -796,7 +737,6 @@ struct Owner {
 }
 impl Drop for Owner {
     fn drop(&mut self) {
-        self.shared.invalidate();
         {
             let mut state = self.shared.state.lock().unwrap();
             state.stopping = true;
@@ -883,6 +823,42 @@ fn write_batch(path: &PathBuf, rows: &[Record], rewrite: bool) -> io::Result<()>
     }
     result
 }
+// Replay complete records with the same reducer used for live events. Both
+// retained results and diagnostics obey their existing budgets; parsing uses
+// one bounded record buffer, regardless of the total log size.
+fn read_history(path: &PathBuf, budget: usize) -> io::Result<Projection> {
+    let mut history = Projection::new(budget);
+    let file = match TrackedFile::open_reader(path, "event_log") {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(history),
+        Err(error) => return Err(error),
+    };
+    let mut reader = std::io::BufReader::with_capacity(64 * 1024, file);
+    let mut line = Vec::new();
+    const MAX_RECORD: u64 = 16 * 1024 * 1024;
+    while (&mut reader)
+        .take(MAX_RECORD + 1)
+        .read_until(b'\n', &mut line)?
+        != 0
+    {
+        if line.last() != Some(&b'\n') {
+            reader.skip_until(b'\n')?;
+        } else if line.len() as u64 <= MAX_RECORD {
+            if let Ok(mut value) = serde_json::from_slice::<Value>(&line) {
+                match field(&value, "event") {
+                    "state_begin" => history = Projection::new(budget),
+                    "state_ready" => {} // Older logs carried a live-writer lease.
+                    _ => {
+                        history.apply(&mut value);
+                    }
+                }
+            }
+        }
+        line.clear();
+    }
+    history.retain_history();
+    Ok(history)
+}
 fn writer(shared: Arc<Shared>, path: PathBuf) {
     if !shared.stateful {
         // Diagnostics keep their recent tail across host restarts. Read only
@@ -921,15 +897,48 @@ fn writer(shared: Arc<Shared>, path: PathBuf) {
             }
         }
     }
+    let mut history_loaded = !shared.stateful;
     let mut file_bytes = std::fs::metadata(&path).map_or(0, |m| m.len() as usize);
     loop {
-        let (mut rows, rewrite, revision, ready) = {
+        let (mut rows, rewrite, revision) = {
             let mut state = shared.state.lock().unwrap();
             while state.queue.is_empty() && !state.rewrite && !state.stopping {
                 state = shared.wake.wait(state).unwrap();
             }
             if state.stopping && state.queue.is_empty() && !state.rewrite {
                 break;
+            }
+            state.working = true;
+            if !history_loaded {
+                let budget = state.projection.budget;
+                let revision = state.revision;
+                drop(state);
+                let previous = read_history(&path, budget);
+                state = shared.state.lock().unwrap();
+                match previous {
+                    Ok(mut history) => {
+                        // Submissions and WAL recovery remain in memory while
+                        // the writer reads. Replay only their current projection
+                        // after older results, never read disk on a producer.
+                        for row in state.projection.snapshot() {
+                            let mut value = serde_json::from_slice(&row).expect("encoded event");
+                            history.apply(&mut value);
+                        }
+                        state.projection = history;
+                        state.rewrite = true;
+                        history_loaded = true;
+                    }
+                    Err(error) => {
+                        state.error = Some(error.to_string());
+                        state.working = false;
+                        state.queue.clear();
+                        state.queue_bytes = 0;
+                        // Retry only for an actual concurrent/new submission.
+                        state.rewrite = state.revision != revision;
+                        shared.wake.notify_all();
+                        continue;
+                    }
+                }
             }
             let live = state.projection.bytes + state.projection.diagnostic_bytes;
             let rewrite = state.rewrite
@@ -938,7 +947,6 @@ fn writer(shared: Arc<Shared>, path: PathBuf) {
                     .saturating_sub(live)
                     >= state.projection.budget.max(live / 2);
             state.rewrite = false;
-            state.working = true;
             let rows = if rewrite {
                 state.queue.clear();
                 state.projection.snapshot()
@@ -946,44 +954,22 @@ fn writer(shared: Arc<Shared>, path: PathBuf) {
                 std::mem::take(&mut state.queue)
             };
             state.queue_bytes = 0;
-            (rows, rewrite, state.revision, state.ready)
+            (rows, rewrite, state.revision)
         };
-        let result = (|| -> io::Result<Option<Arc<win::Publication>>> {
-            let publication = if rewrite && shared.stateful {
-                let previous = shared.publication.lock().unwrap().clone().unwrap();
-                let publication = if ready && previous.failed() {
-                    Arc::new(win::Publication::new()?)
-                } else {
-                    previous
-                };
-                rows.insert(0, encode(&publication.header));
-                if ready {
-                    rows.push(encode(&json!({"event":"state_ready","generation":publication.header["generation"]})));
-                }
-                Some(publication)
-            } else {
-                None
-            };
-            write_batch(&path, &rows, rewrite)?;
-            Ok(publication)
-        })();
+        if rewrite && shared.stateful {
+            rows.insert(0, encode(&json!({"event":"state_begin","schema":1})));
+        }
+        let result = write_batch(&path, &rows, rewrite);
         let mut state = shared.state.lock().unwrap();
         state.working = false;
         match result {
-            Ok(publication) => {
+            Ok(()) => {
                 let bytes: usize = rows.iter().map(|r| r.len()).sum();
                 file_bytes = if rewrite { bytes } else { file_bytes + bytes };
                 state.error = None;
-                if let Some(publication) = publication {
-                    if !state.ready {
-                        publication.invalidate();
-                    }
-                    *shared.publication.lock().unwrap() = Some(publication);
-                }
             }
             Err(error) => {
                 state.error = Some(error.to_string());
-                shared.fault();
                 // A partial append must be replaced, never continued. Retry on
                 // the next real submission, without an idle retry timer.
             }
@@ -1035,17 +1021,11 @@ impl NativeEventLog {
                 queue_bytes: 0,
                 rewrite: false,
                 revision: 0,
-                ready: !stateful,
                 stopping: false,
                 working: false,
                 error: None,
             }),
             wake: Condvar::new(),
-            publication: Mutex::new(if stateful {
-                Some(Arc::new(win::Publication::new()?))
-            } else {
-                None
-            }),
             stateful,
         });
         let worker = Arc::clone(&shared);
@@ -1063,19 +1043,12 @@ impl NativeEventLog {
     fn write(&self, value: &Bound<'_, PyAny>) -> PyResult<()> {
         self.submit(event_value(value)?)
     }
-    fn begin_recovery(&self) -> PyResult<()> {
-        self.reset(Vec::new(), false)
-    }
     #[pyo3(signature=(state=None))]
     fn recover(&self, state: Option<PyRef<'_, NativeWatchState>>) -> PyResult<()> {
         match state {
-            Some(state) => state.with_event_projection(|rows| self.reset(rows, true)),
-            None => self.reset(Vec::new(), true),
+            Some(state) => state.with_event_projection(|rows| self.reset(rows)),
+            None => self.reset(Vec::new()),
         }
-    }
-    fn invalidate(&self) -> PyResult<()> {
-        self.shared()?.invalidate();
-        Ok(())
     }
     fn flush(&self, py: Python<'_>) -> PyResult<()> {
         let shared = Arc::clone(self.shared()?);
@@ -1100,23 +1073,17 @@ impl NativeEventLog {
     }
 }
 impl NativeEventLog {
-    fn reset(&self, rows: Vec<Value>, ready: bool) -> PyResult<()> {
+    fn reset(&self, rows: Vec<Value>) -> PyResult<()> {
         let shared = self.shared()?;
         let mut state = shared.state.lock().unwrap();
-        if !ready {
-            shared.fault();
-        }
-        let diagnostics = std::mem::take(&mut state.projection.diagnostics);
-        let diagnostic_bytes = state.projection.diagnostic_bytes;
-        state.projection = Projection::new(state.projection.budget);
-        state.projection.diagnostics = diagnostics;
-        state.projection.diagnostic_bytes = diagnostic_bytes;
+        // Completed executions are history; only live state is rebuilt from
+        // the WAL. Keep the existing bounded results and diagnostic buffers.
+        state.projection.retain_history();
         for mut value in rows {
             let _ = state.projection.apply(&mut value);
         }
         state.queue.clear();
         state.queue_bytes = 0;
-        state.ready = ready;
         state.rewrite = true;
         state.revision += 1;
         shared.wake.notify_one();

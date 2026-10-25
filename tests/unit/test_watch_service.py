@@ -1150,8 +1150,6 @@ def test_watch_service_deduplicates_unchanged_pending_ticks(tmp_path, monkeypatc
     written = []
 
     class FakeLog:
-        def begin_recovery(self): pass
-        def invalidate(self): pass
         def close(self): pass
         def write(self, event, **payload):
             written.append((event, payload))

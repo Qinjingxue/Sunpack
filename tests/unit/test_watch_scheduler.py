@@ -2297,9 +2297,11 @@ def test_nested_completion_only_publishes_top_level_and_promoted_blockers(tmp_pa
             if blocked:
                 expected[str(locked)] = "failed_password" if kind == FailureKind.WRONG_PASSWORD else "suspended_missing_volume"
             assert latest == expected
-            visible_groups = [g["path"] for r in records if r["event"] == "pipeline_sources_claimed"
-                              and r.get("processing") for g in r["groups"]]
-            assert visible_groups == [str(outer)]
+            # Compaction retains group descriptors plus their latest status;
+            # the original processing flag need not survive the writer batch.
+            visible_groups = {g["path"] for r in records if r["event"] == "pipeline_sources_claimed"
+                              for g in r["groups"]}
+            assert visible_groups == {str(outer)} | ({str(locked)} if blocked else set())
         finally:
             await watcher.aclose()
     _await(scenario())

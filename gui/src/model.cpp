@@ -610,39 +610,10 @@ Json save_changes(const fs::path& dir,const Json& fields,const Json& passwords,c
 std::string root_for(const fs::path& path,const WatchRoots& roots) {
     return indexed_root(path_key(path),index_roots(roots));
 }
-// Identity is checked once per generation. One blocking wait reports process
-// exit or a real publication fault; ordinary log updates need no health checks.
-struct EventLog::Publication {
-    Handle process, fault, stop{CreateEventW(nullptr,TRUE,FALSE,nullptr)};
-    std::atomic<bool> alive{false};
-    std::thread thread;
-    explicit Publication(const Json& header,const std::function<void()>& changed) {
-        process.value=OpenProcess(SYNCHRONIZE|PROCESS_QUERY_LIMITED_INFORMATION,FALSE,header.value("owner_pid",DWORD(0)));
-        FILETIME created{},exit{},kernel{},user{};
-        if(!process.value || !GetProcessTimes(process,&created,&exit,&kernel,&user)) return;
-        auto started=(uint64_t(created.dwHighDateTime)<<32)|created.dwLowDateTime;
-        if(std::to_string(started)!=header.value("owner_started",std::string()) || WaitForSingleObject(process,0)!=WAIT_TIMEOUT) return;
-        auto name=wide(header.value("fault_event",std::string()));
-        if(name.rfind(L"Local\\SunPack.Log.",0)!=0 || name.size()>200) return;
-        fault.value=OpenEventW(SYNCHRONIZE,FALSE,name.c_str());
-        if(!fault.value || WaitForSingleObject(fault,0)!=WAIT_TIMEOUT) return;
-        alive=true;
-        if(changed) thread=std::thread([this,changed]{
-            HANDLE waits[]={stop,process,fault};
-            auto signal=WaitForMultipleObjects(3,waits,FALSE,INFINITE);
-            if(signal==WAIT_OBJECT_0 || signal==WAIT_FAILED) return;
-            alive=false; changed();
-        });
-    }
-    ~Publication() { SetEvent(stop); if(thread.joinable()) thread.join(); }
-};
-EventLog::EventLog(std::function<void()> changed):publication_changed_(std::move(changed)) {}
-EventLog::~EventLog() = default;
 void EventLog::set_path(const fs::path& p) {
     if (path_==p) return;
     path_=p; offset_=identity_=sequence_=volume_=0; prefix_.clear(); anchor_.clear(); pending_.clear(); tasks.clear(); aliases_.clear(); malformed=0;
     changed_keys.clear(); rebuilt=true;
-    publication_.reset(); generation_.clear(); state_ready_=available_=false;
 }
 void EventLog::mark_changed(const std::wstring& key) {
     ++sequence_;
@@ -701,18 +672,10 @@ void EventLog::accept(const Json& j) {
     if(!j.is_object() || !j.contains("event") || !j["event"].is_string()) return;
     auto event=j["event"].get<std::string>();
     if(event=="state_begin") {
-        state_ready_=available_=false;
         for(auto& pair:tasks) mark_changed(pair.first);
         tasks.clear(); aliases_.clear();
-        auto generation=j.value("generation",std::string());
-        if(generation_!=generation || !publication_) {
-            publication_.reset();
-            if(j.value("schema",0)==1) publication_=std::make_unique<Publication>(j,publication_changed_);
-        }
-        generation_=std::move(generation);
         return;
     }
-    if(event=="state_ready") { state_ready_=!generation_.empty() && j.value("generation",std::string())==generation_; return; }
     if(event=="pipeline_sources_claimed") {
         if(j.contains("groups") && j["groups"].is_array()) for(auto& group:j["groups"]) {
             accept_group(group,j.value("owner",std::string()));
@@ -751,10 +714,11 @@ void EventLog::accept(const Json& j) {
         return;
     }
     if(event=="candidate_departed" || event=="task_retired") {
+        // A physical departure does not retire the execution that owns it.
         bool recursive=j.value("recursive",false);
         std::vector<std::wstring> affected;
         if(recursive) {
-            for(auto& pair:tasks) if(!terminal(pair.second)) {
+            for(auto& pair:tasks) if(!terminal(pair.second) && pair.second.status!="taskProcessing") {
                 if(pair.second.members.empty()) {
                     auto task_path=path_key(wide(pair.second.path));
                     if(task_path==physical || is_under(task_path,physical)) affected.push_back(pair.first);
@@ -762,7 +726,7 @@ void EventLog::accept(const Json& j) {
                     affected.push_back(pair.first); break;
                 }
             }
-        } else if(tasks.count(key) && !terminal(tasks.at(key))) affected.push_back(key);
+        } else if(tasks.count(key) && !terminal(tasks.at(key)) && tasks.at(key).status!="taskProcessing") affected.push_back(key);
         for(auto& id:affected) {
             auto& task=tasks.at(id);
             for(auto it=task.members.begin();it!=task.members.end();) {
@@ -815,20 +779,13 @@ void EventLog::accept(const Json& j) {
     mark_changed(key); task.sequence=sequence_;
 }
 bool EventLog::refresh(bool missing_is_final) {
-    const bool was_available=available_;
     retry_required=false; changed_keys.clear(); rebuilt=false;
-    const bool ended=publication_ && !publication_->alive.load();
-    if(ended) {
-        available_=false;
-        for(auto& pair:tasks) mark_changed(pair.first);
-        tasks.clear(); aliases_.clear();
-    }
     Handle f(CreateFileW(path_.c_str(),GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,OPEN_EXISTING,FILE_FLAG_SEQUENTIAL_SCAN,nullptr));
     if(f.value==INVALID_HANDLE_VALUE) {
         if(GetLastError()==ERROR_FILE_NOT_FOUND || GetLastError()==ERROR_PATH_NOT_FOUND) {
             if(!missing_is_final) { SetLastError(ERROR_FILE_NOT_FOUND); win_error("opReadEventLog"); }
-            bool changed=!tasks.empty() || (ended && was_available); rebuilt=changed; offset_=identity_=volume_=0; prefix_.clear(); anchor_.clear(); pending_.clear(); tasks.clear(); aliases_.clear(); malformed=0;
-            publication_.reset(); generation_.clear(); state_ready_=available_=false; return changed;
+            bool changed=!tasks.empty(); rebuilt=changed; offset_=identity_=volume_=0; prefix_.clear(); anchor_.clear(); pending_.clear(); tasks.clear(); aliases_.clear(); malformed=0;
+            return changed;
         }
         win_error("opReadEventLog");
     }
@@ -839,9 +796,8 @@ bool EventLog::refresh(bool missing_is_final) {
     bool reset=id!=identity_ || info.dwVolumeSerialNumber!=volume_ || size<offset_;
     if(!reset && !prefix_.empty()) reset=text_at(f,0,prefix_.size())!=prefix_;
     if(!reset && !anchor_.empty()) reset=text_at(f,offset_-anchor_.size(),anchor_.size())!=anchor_;
-    bool changed=reset || (ended && was_available); rebuilt=reset;
-    if(reset) { offset_=sequence_=0; prefix_.clear(); anchor_.clear(); pending_.clear(); tasks.clear(); aliases_.clear(); malformed=0;
-        state_ready_=false; }
+    bool changed=reset; rebuilt=reset;
+    if(reset) { offset_=sequence_=0; prefix_.clear(); anchor_.clear(); pending_.clear(); tasks.clear(); aliases_.clear(); malformed=0; }
     identity_=id; volume_=info.dwVolumeSerialNumber;
     // Parse bounded chunks, retaining only the unfinished record and logical task projections.
     while(offset_<size) {
@@ -879,12 +835,6 @@ bool EventLog::refresh(bool missing_is_final) {
         if(!appended) identity_=0;
         retry_required=true;
     }
-    available_=state_ready_ && publication_ && publication_->alive.load() && malformed==0;
-    if(publication_ && !publication_->alive.load() && !tasks.empty()) {
-        for(auto& pair:tasks) mark_changed(pair.first);
-        tasks.clear(); aliases_.clear(); changed=true;
-    }
-    if(available_!=was_available) { changed=true; for(auto& pair:tasks) mark_changed(pair.first); }
     return changed;
 }
 namespace {
@@ -915,8 +865,8 @@ Json project_task(const std::wstring& key,const Task& t,const RootIndex& roots,
         {"statusTone",tone},{"outputs",t.outputs},{"sortTimestamp",t.timestamp},{"sortSequence",t.sequence}};
 }
 bool task_matches(const Task& t,const RootIndex& roots,const View& v,
-    const std::wstring& folded_query,bool available) {
-    if(!available || t.status.empty() || (!v.task_status.empty() && t.status!=v.task_status) ||
+    const std::wstring& folded_query) {
+    if(t.status.empty() || (!v.task_status.empty() && t.status!=v.task_status) ||
         (!v.task_root.empty() && indexed_root(path_key(wide(t.path)),roots)!=v.task_root)) return false;
     if(contains_folded(t.path,folded_query) || contains_folded(t.name,folded_query)) return true;
     return std::any_of(t.members.begin(),t.members.end(),[&](const auto& member){return contains_folded(utf8(member),folded_query);});
@@ -932,7 +882,7 @@ Json task_rows(const EventLog& log,const WatchRoots& roots,const View& v,const s
     using TaskEntry=decltype(log.tasks)::value_type;
     std::vector<const TaskEntry*> rows;
     rows.reserve(log.tasks.size());
-    for(auto& pair:log.tasks) if(task_matches(pair.second,root_index,v,query,log.available())) rows.push_back(&pair);
+    for(auto& pair:log.tasks) if(task_matches(pair.second,root_index,v,query)) rows.push_back(&pair);
     const auto filtered=stats?Clock::now():Clock::time_point{};
     std::sort(rows.begin(),rows.end(),[](const auto& a,const auto& b){
         if(a->second.timestamp!=b->second.timestamp) return a->second.timestamp>b->second.timestamp;
@@ -971,7 +921,7 @@ Json task_delta(const EventLog& log,const WatchRoots& roots,const View& v,const 
     for(const auto& key:log.changed_keys) {
         Json change={{"id",utf8(key)}};
         auto it=log.tasks.find(key);
-        if(it!=log.tasks.end() && task_matches(it->second,root_index,v,query,log.available()))
+        if(it!=log.tasks.end() && task_matches(it->second,root_index,v,query))
             change["row"]=project_task(key,it->second,root_index,language,labels);
         changes.push_back(std::move(change));
     }

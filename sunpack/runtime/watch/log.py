@@ -50,14 +50,8 @@ class WatchLogStore:
             (expiry for _, expiry in self._last_throttled_write.values()), default=None,
         )
 
-    def begin_recovery(self) -> None:
-        self._native.begin_recovery()
-
     def recover(self, state=None) -> None:
         self._native.recover(state)
-
-    def invalidate(self) -> None:
-        self._native.invalidate()
 
     def flush(self) -> None:
         """Explicit drain for shutdown/tests; ordinary write never waits for I/O."""

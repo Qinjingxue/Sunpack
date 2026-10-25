@@ -565,18 +565,6 @@ impl NativeWatchState {
         Ok(())
     }
 
-    fn invalidate_events(&self) {
-        if let Some(events) = self
-            .events
-            .lock()
-            .unwrap()
-            .as_ref()
-            .and_then(std::sync::Weak::upgrade)
-        {
-            events.invalidate();
-        }
-    }
-
     fn reset(&self) {
         *self.lock() = StateData::default();
     }
@@ -635,7 +623,10 @@ impl NativeWatchState {
             .filter(|path| {
                 let key = path_key(path);
                 data.pending.get(&key).is_some_and(|pending| {
-                    pending.promoted_destinations.iter().any(|target| path_key(target) == key)
+                    pending
+                        .promoted_destinations
+                        .iter()
+                        .any(|target| path_key(target) == key)
                 }) || data.entries.get(&key).is_some_and(|entry| {
                     entry
                         .failure_payload

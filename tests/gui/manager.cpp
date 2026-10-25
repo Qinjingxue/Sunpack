@@ -118,27 +118,6 @@ void projection(Fixture& f) {
     fs::remove(nested); fs::remove(monitor);
     fails([&]{task_directory(row);});
 }
-// No card/status is fabricated for recovery or faults. This scenario also
-// catches accidentally restoring per-update health invalidation/full refreshes.
-void publication_integrity(Fixture& f) {
-    EventPublicationFixture owner;
-    auto file=f.dir/"health.jsonl", source=f.dir/"opaque.carrier";
-    Handle notification(CreateEventW(nullptr,FALSE,FALSE,nullptr));
-    EventLog log([&]{SetEvent(notification);}); log.set_path(file);
-    atomic_write(file,owner.prefix+event("done",source,1));
-    log.refresh(); assert(log.available());
-    overwrite(file,event("processing_started",f.dir/"other",2),true);
-    log.refresh(); assert(log.available() && log.changed_keys.size()==1);
-    assert(WaitForSingleObject(notification,0)==WAIT_TIMEOUT);
-    SetEvent(owner.fault);
-    assert(WaitForSingleObject(notification,5000)==WAIT_OBJECT_0);
-    log.refresh(); assert(!log.available() && task_rows(log,{},{}).at("total")==0);
-    EventPublicationFixture repaired;
-    atomic_write(file,repaired.prefix+event("done",source,3));
-    log.refresh(); assert(log.available() && task_rows(log,{},{}).at("total")==1);
-    atomic_write(file,event("processing_started",source,4));
-    log.refresh(); assert(!log.available() && task_rows(log,{},{}).at("total")==0);
-}
 // One real JSONL replay covers logical ownership, removal and delta delivery.
 // The original projection scenario cannot expose cross-path aliasing failures;
 // without this scenario duplicate/stale cards can pass all scalar status checks.
@@ -595,7 +574,7 @@ int wmain(int argc,wchar_t** argv) {
     CoInitializeEx(nullptr,COINIT_MULTITHREADED);
     if(argc==3 && std::wstring(argv[1])==L"--project") {
         EventLog log; log.set_path(argv[2]); log.refresh();
-        std::cout<<Json{{"available",log.available()},{"tasks",task_rows(log,{}, {})}}.dump(); return 0;
+        std::cout<<Json{{"tasks",task_rows(log,{}, {})}}.dump(); return 0;
     }
     if(argc==3 && std::wstring(argv[1])==L"--mutex") { std::cout<<utf8(mutex_name(argv[2]))<<"\n"<<utf8(mutex_name(argv[2],L"SunPackWatchRoots"))<<"\n"; return 0; }
     if(argc>=2 && std::wstring(argv[1])==L"--echo") { Json args=Json::array(); for(int i=2;i<argc;++i) args.push_back(utf8(argv[i])); std::cout<<args.dump(); return 7; }
@@ -608,7 +587,7 @@ int wmain(int argc,wchar_t** argv) {
         time["lower"]="2024-02-29 12:34";time["upper"]="2027-01-01 00:00";
         std::cout<<Json{{"size",range_configuration(size,false)},{"time",range_configuration(time,true,&east)}}.dump(); return 0;
     }
-    try { Fixture f; projection(f); publication_integrity(f); logical_projection(f); editing(f); roots(f); range_editing(f); localization(f); batch_editing(f); service_notifications(); std::cout<<"GUI file contracts passed\n"; }
+    try { Fixture f; projection(f); logical_projection(f); editing(f); roots(f); range_editing(f); localization(f); batch_editing(f); service_notifications(); std::cout<<"GUI file contracts passed\n"; }
     catch(const std::exception& e) { std::cerr<<e.what()<<"\n"; return 1; }
     CliCommand cli{executable_path(),fs::temp_directory_path(),{L"--echo"}};
     Handle stop(CreateEventW(nullptr,TRUE,FALSE,nullptr));

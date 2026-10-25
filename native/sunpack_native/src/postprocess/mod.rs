@@ -17,17 +17,20 @@ pub(crate) fn promote_blocked_input_files(
     destination_dir: String,
     before_move: Option<Py<PyAny>>,
 ) -> PyResult<PromotionResult> {
-    Ok(py.detach(|| promote_input_files_with_move(
-        paths, Path::new(&destination_dir),
-        || {
-            if let Some(callback) = before_move {
-                Python::attach(|py| callback.call0(py))
-                    .map_err(|error| io::Error::other(error.to_string()))?;
-            }
-            Ok(())
-        },
-        move_input_no_replace,
-    )))
+    Ok(py.detach(|| {
+        promote_input_files_with_move(
+            paths,
+            Path::new(&destination_dir),
+            || {
+                if let Some(callback) = before_move {
+                    Python::attach(|py| callback.call0(py))
+                        .map_err(|error| io::Error::other(error.to_string()))?;
+                }
+                Ok(())
+            },
+            move_input_no_replace,
+        )
+    }))
 }
 
 fn promote_input_files_with_move(

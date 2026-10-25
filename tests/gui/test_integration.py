@@ -308,10 +308,10 @@ def _state_projection(path):
     return json.loads(subprocess.check_output([str(binary), "--project", str(path)], text=True, encoding="utf-8"))
 
 
-def test_gui_hides_failed_publications_until_repaired(tmp_path):
+def test_gui_keeps_published_state_across_write_faults_and_close(tmp_path):
     # Pure model fixtures cannot detect disagreements with the real Rust writer.
     # One kernel sharing failure covers async fault reporting, atomic replacement,
-    # fault notification, healing, and a snapshot missing its ready marker.
+    # retained last-known state, healing, and independent offline replay.
     from sunpack.runtime.watch.log import WatchLogStore
     path = tmp_path / "events.jsonl"
     source = str(tmp_path / "carrier.fake.001")
@@ -321,7 +321,7 @@ def test_gui_hides_failed_publications_until_repaired(tmp_path):
         log.write("processing_started", path=source)
         log.flush()
         live = _state_projection(path)
-        assert live["available"] and live["tasks"]["rows"][0]["status"] == "taskProcessing"
+        assert live["tasks"]["rows"][0]["status"] == "taskProcessing"
         kernel = ctypes.WinDLL("kernel32", use_last_error=True)
         kernel.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
         kernel.CreateFileW.restype = wintypes.HANDLE
@@ -336,7 +336,7 @@ def test_gui_hides_failed_publications_until_repaired(tmp_path):
             log.write("diagnostic", padding="x" * 4096)
             log.flush()
             published = _state_projection(path)
-            assert published["available"] and published["tasks"]["rows"][0]["statusText"] == "等待密码"
+            assert published["tasks"]["rows"][0]["statusText"] == "等待密码"
             old_bytes, count = ctypes.create_string_buffer(4096), wintypes.DWORD()
             assert kernel.ReadFile(held, old_bytes, len(old_bytes), ctypes.byref(count), None)
             assert b"processing_started" in old_bytes.raw[:count.value]
@@ -352,26 +352,46 @@ def test_gui_hides_failed_publications_until_repaired(tmp_path):
             assert log.error
             assert path.read_bytes() == before  # Failed replacement preserves old file.
             stale = _state_projection(path)
-            assert not stale["available"] and stale["tasks"]["total"] == 0
+            assert stale == published  # The last published state remains readable.
         finally:
             kernel.CloseHandle(held)
         log.write("diagnostic", message="disk available again")
         log.flush()
         healed = _state_projection(path)
-        assert healed["available"] and healed["tasks"]["rows"][0]["statusText"] == "等待密码"
-        rows = path.read_text(encoding="utf-8").splitlines()
-        assert json.loads(rows[-1])["event"] == "state_ready"
-        path.write_text("\n".join(rows[:-1]) + "\n", encoding="utf-8")
-        assert not _state_projection(path)["available"]
+        assert healed["tasks"]["rows"][0]["statusText"] == "等待密码"
+        log.write("done", path=source, output_dirs=["retained-output"])
+        log.flush()
+        completed = _state_projection(path)
     finally:
         log.close()
-    assert not _state_projection(path)["available"]
+    assert _state_projection(path) == completed
+    # A failed initial history read must not overwrite the previous file, and
+    # a real new submission must retry it without an idle retry loop.
+    before = path.read_bytes()
+    held = kernel.CreateFileW(str(path), 0x80000000, 0, None, 3, 0, None)
+    assert held != wintypes.HANDLE(-1).value
+    log = WatchLogStore(str(path), max_bytes=2048)
+    try:
+        log.recover()
+        try:
+            with pytest.raises(OSError): log.flush()
+            assert log.error
+        finally:
+            kernel.CloseHandle(held)
+        assert path.read_bytes() == before
+        log.write("diagnostic", message="history readable again")
+        log.flush()
+        restored = _state_projection(path)["tasks"]["rows"]
+        assert len(restored) == 1 and restored[0]["outputs"] == ["retained-output"]
+    finally:
+        log.close()
     assert not list(tmp_path.glob("events.jsonl.*"))
 
 
-def test_gui_process_death_and_wal_gap_recover_without_old_success(tmp_path):
-    # The live-writer test cannot catch an old state_ready surviving process
-    # death. A child exits without destructors after committing only its WAL.
+def test_gui_history_survives_process_death_and_wal_recovery(tmp_path):
+    # A live writer cannot expose history lost across process lifetimes or
+    # the WAL/log gap. Crash a real producer, then recover its current blocker
+    # while preserving previous executions and all offline task statuses.
     import sys
     source = tmp_path / "disguised.bin"
     source.write_bytes(b"not inspected by this projection test")
@@ -383,9 +403,15 @@ from sunpack.runtime.watch.state import WatchStateStore
 log = WatchLogStore(sys.argv[1])
 state = WatchStateStore(sys.argv[2])
 log.recover()
-log.write('done', path=sys.argv[3])
+log.write('processing_started', path=sys.argv[3], owner='completed')
+log.write('pipeline_sources_claimed', owner='completed', processing=True,
+          groups=[{'path':sys.argv[3], 'name':'retained.rar', 'members':[sys.argv[3], sys.argv[3]+'.002']}])
+log.write('done', path=sys.argv[3], owner='completed', output_dirs=['previous-output'])
+log.write('failed_terminal', path=sys.argv[3] + '.failed', owner='failed')
+log.write('processing_started', path=sys.argv[3] + '.inflight', owner='inflight')
+log.write('failed_password', path=sys.argv[3] + '.waiting')
 log.flush()
-# Leave the durable blocker ahead of the old GUI success, then crash without
+# Leave the durable blocker ahead of the published state, then crash without
 # publishing a recovery snapshot or running either store's close method.
 state.mark(sys.argv[3], 1, 1.0, status='suspended_missing_volume')
 print('ready', flush=True)
@@ -397,24 +423,40 @@ sys.stdin.readline()
         child.kill()
         child.wait(timeout=10)
         dead = _state_projection(path)
-        assert not dead["available"]
-        assert dead["tasks"]["total"] == 0
+        assert {r["status"] for r in dead["tasks"]["rows"]} == {"taskSucceeded", "taskFailed", "taskWaiting", "taskProcessing"}
     finally:
         if child.poll() is None: child.kill(); child.wait(timeout=10)
         child.stdin.close(); child.stdout.close()
     from sunpack.runtime.watch.log import WatchLogStore
     from sunpack.runtime.watch.state import WatchStateStore
     state = WatchStateStore(str(tmp_path / "state.snapshot"))
+    # A crash can leave one incomplete append after all committed records.
+    with path.open("ab") as tail:
+        tail.write(b'{"event":"done","path":"unfinished')
     log = WatchLogStore(str(path))
     try:
-        log.begin_recovery()
-        log.flush()
-        assert not _state_projection(path)["available"]
         log.recover(state._native)
         log.flush()
         restored = _state_projection(path)
-        assert restored["available"] and restored["tasks"]["total"] == 1
-        assert restored["tasks"]["rows"][0]["statusText"] == "等待分卷"
+        assert restored["tasks"]["total"] == 3
+        assert {r["status"] for r in restored["tasks"]["rows"]} == {"taskSucceeded", "taskFailed", "taskWaiting"}
+        assert next(r for r in restored["tasks"]["rows"] if r["status"] == "taskWaiting")["statusText"] == "等待分卷"
+        assert next(r for r in restored["tasks"]["rows"] if r["status"] == "taskSucceeded")["outputs"] == ["previous-output"]
+        assert next(r for r in restored["tasks"]["rows"] if r["status"] == "taskSucceeded")["name"] == "retained.rar"
+        assert next(r for r in restored["tasks"]["rows"] if r["status"] == "taskSucceeded")["partCount"] == 2
+        # WAL blockers without a group must get a new identity even when their
+        # path currently aliases a completed execution in the same host.
+        log.write("processing_started", path=str(source), owner="retried")
+        log.write("done", path=str(source), owner="retried", output_dirs=["retry-output"])
+        log.recover(state._native)
+        log.flush()
+        restored = _state_projection(path)
+        assert restored["tasks"]["total"] == 4
+        assert {tuple(r["outputs"]) for r in restored["tasks"]["rows"] if r["status"] == "taskSucceeded"} == {("previous-output",), ("retry-output",)}
+        # Rebuilding again in the same host must preserve the same historical ID.
+        log.recover(state._native)
+        log.flush()
+        assert {r["id"] for r in _state_projection(path)["tasks"]["rows"] if r["status"] != "taskWaiting"} == {r["id"] for r in restored["tasks"]["rows"] if r["status"] != "taskWaiting"}
     finally:
         state.close(); log.close()
 
@@ -438,10 +480,15 @@ def test_native_and_gui_share_member_retirement_and_real_request_lifetimes(tmp_p
         # retiring it before compaction must not resurrect a second card.
         log.write("task_retired", path=c)
         rows = compact()["rows"]
+        assert len(rows)==1 and rows[0]["partCount"]==3
+        log.write("suspended_missing_volume", path=a)
+        log.write("task_retired", path=c)
+        rows = compact()["rows"]
         assert len(rows)==1 and rows[0]["partCount"]==2 and rows[0]["path"]==a
         log.write("task_retired", path=a)
         rows = compact()["rows"]
-        assert len(rows)==1 and rows[0]["partCount"]==1 and rows[0]["status"]=="taskProcessing"
+        assert len(rows)==1 and rows[0]["partCount"]==1 and rows[0]["status"]=="taskWaiting"
+        log.write("processing_started", path=a, owner="request")
         log.write("blocker_cleared", path=a, task_path=a)
         assert compact()["total"]==1  # A real running task survives old blocker retirement.
         log.write("failed_password", path=b)
@@ -535,7 +582,17 @@ def test_execution_history_survives_regroup_retry_and_compaction(tmp_path):
         assert len([r for r in current if r["status"] == "taskWaiting"]) == 1
         assert log.path.stat().st_size < 65536
         log.write("blocker_cleared", path=b, task_path=a)
-        assert all(r["status"] == "taskSucceeded" for r in compact())
+        retained = compact()
+        assert all(r["status"] == "taskSucceeded" for r in retained)
+    finally:
+        log.close()
+    # Reopening must retain exactly the already bounded results, including
+    # confirmed names/parts for physical inputs that are no longer present.
+    log = WatchLogStore(str(tmp_path / "events.jsonl"), max_bytes=32768)
+    try:
+        log.recover()
+        assert rows() == retained
+        assert log.path.stat().st_size < 65536
     finally:
         log.close()
 
@@ -544,6 +601,8 @@ def test_real_recursive_watch_executions_keep_two_outer_rows(tmp_path, monkeypat
     # Synthetic events cannot detect the real pipeline dropping depth on a
     # lease/promotion update. Two tiny carrier executions cover all three
     # language boundaries without a format matrix or extra monitor process.
+    # Deliver actual source-departure notifications before harvesting results;
+    # direct completion alone misses the cleanup/observer race.
     import asyncio
     import io
     import zipfile
@@ -578,13 +637,16 @@ def test_real_recursive_watch_executions_keep_two_outer_rows(tmp_path, monkeypat
             try:
                 watcher.log.recover()
                 first_id = None
+                payload = archive("B.other", archive("C.blob", archive("payload.txt", "same-payload")))
                 for index in range(2):
-                    payload = archive("B.other", archive("C.blob", archive("payload.txt", f"payload-{index}")))
                     source.write_bytes(b"carrier-prefix" + payload + b"carrier-tail")
                     scope, = watcher.scopes.values()
                     watcher._scan_options.catalog_update(watcher._catalog, scope.native)
                     request = await watcher._submit_candidate(watch_candidate_for_path(str(source)))
                     assert request is not None
+                    await request.task
+                    assert not source.exists()  # Real pipeline cleanup already ran.
+                    watcher.notify_path_departed(str(source) if index == 0 else str(root), recursive=index == 1)
                     result = await watcher._finish_active_request(request)
                     assert result.failed == 0 and result.succeeded == 3
                     watcher.log.flush()
@@ -596,6 +658,9 @@ def test_real_recursive_watch_executions_keep_two_outer_rows(tmp_path, monkeypat
                     else:
                         assert len({row["id"] for row in rows}) == 2
                         assert first_id in {row["id"] for row in rows}
+                        assert len({tuple(row["outputs"]) for row in rows}) == 2
+                offline = rows
             finally:
                 await watcher.aclose()
+            assert _state_projection(tmp_path / "events.jsonl")["tasks"]["rows"] == offline
     asyncio.run(scenario())
