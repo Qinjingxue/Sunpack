@@ -56,10 +56,30 @@ def test_collision_preflights_entire_group(tmp_path):
     second.write_text("second")
     (destination / second.name).write_text("existing")
     with pytest.raises(OSError):
-        promote_blocked_input([str(first), str(second)], str(destination))
+        promote_blocked_input([str(first), str(second)], str(destination),
+                              before_move=lambda: pytest.fail("collision must precede WAL intent"))
     assert first.exists() and second.exists()
     assert not (destination / first.name).exists()
     assert (destination / second.name).read_text() == "existing"
+
+
+def test_failed_promotion_precommit_leaves_all_sources_untouched(tmp_path):
+    # Collision and rollback tests do not catch movement after a rejected WAL
+    # barrier; that would recreate the original crash window on disk errors.
+    source, destination = tmp_path / "out", tmp_path / "input"
+    source.mkdir()
+    destination.mkdir()
+    parts = [source / name for name in ("inner.data.001", "inner.data.002")]
+    for path in parts:
+        path.write_text(path.name)
+
+    def reject():
+        raise OSError("injected WAL failure")
+
+    with pytest.raises(OSError, match="injected WAL failure"):
+        promote_blocked_input(map(str, parts), str(destination), before_move=reject)
+    assert all(path.read_text() == path.name for path in parts)
+    assert not list(destination.iterdir())
 
 
 @pytest.mark.parametrize("collision", [False, True])

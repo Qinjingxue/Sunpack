@@ -100,6 +100,37 @@ def test_rebase_pending_work_atomically_moves_recovery_anchor(tmp_path):
     assert all(not item.active_outputs and not item.committed_roots for item in recovered)
 
 
+def test_promotion_intent_survives_queue_refresh_and_missing_owner(tmp_path):
+    # Crash extraction tests do not exercise USN queue replacement or a snapshot
+    # taken after the outer input disappears. Both must retain the same intent.
+    source = tmp_path / "outer.zip"
+    source.write_text("outer")
+    destination = tmp_path / "inner.data"
+    state_path = str(tmp_path / "state.snapshot")
+    state = WatchStateStore(state_path)
+    try:
+        candidate = _candidate(source)
+        state.queue_active(candidate)
+        assert state.prepare_input_promotion(str(source), [str(destination)])
+        state.queue_active(candidate)
+        state.record_attempt(candidate.path, candidate.size, candidate.mtime)
+        state.queue_recovery_batch([candidate], {})
+        source.unlink()
+        state.forget_path(str(source), missing_only=True)
+        state.save()
+    finally:
+        state.close()
+    reopened = WatchStateStore(state_path)
+    try:
+        [pending] = reopened.pending_work_items()
+        assert pending.promoted_destinations == [str(destination)]
+        assert pending.durable_owner
+        reopened.complete_work([str(source)], durable=True)
+        assert reopened.pending_work_count == 0
+    finally:
+        reopened.close()
+
+
 def test_live_enqueue_keeps_owner_memory_only(tmp_path):
     import threading
     import sunpack.runtime.watch.scheduler as scheduler_module

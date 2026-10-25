@@ -10,21 +10,30 @@ use std::time::UNIX_EPOCH;
 type PromotionResult = (HashMap<String, String>, Vec<String>, Vec<String>, String);
 
 #[pyfunction]
+#[pyo3(signature = (paths, destination_dir, before_move=None))]
 pub(crate) fn promote_blocked_input_files(
     py: Python<'_>,
     paths: Vec<String>,
     destination_dir: String,
+    before_move: Option<Py<PyAny>>,
 ) -> PyResult<PromotionResult> {
-    Ok(py.detach(|| promote_input_files(paths, Path::new(&destination_dir))))
-}
-
-fn promote_input_files(paths: Vec<String>, destination: &Path) -> PromotionResult {
-    promote_input_files_with_move(paths, destination, move_input_no_replace)
+    Ok(py.detach(|| promote_input_files_with_move(
+        paths, Path::new(&destination_dir),
+        || {
+            if let Some(callback) = before_move {
+                Python::attach(|py| callback.call0(py))
+                    .map_err(|error| io::Error::other(error.to_string()))?;
+            }
+            Ok(())
+        },
+        move_input_no_replace,
+    )))
 }
 
 fn promote_input_files_with_move(
     paths: Vec<String>,
     destination: &Path,
+    before_move: impl FnOnce() -> io::Result<()>,
     mut move_file: impl FnMut(&Path, &Path) -> io::Result<()>,
 ) -> PromotionResult {
     let mut mapping = HashMap::new();
@@ -61,6 +70,11 @@ fn promote_input_files_with_move(
             parents.insert(parent.to_path_buf());
         }
         moves.push((source, target));
+    }
+    // Preflight rejects existing user files before publishing a durable intent.
+    // The caller runs this barrier on its existing postprocess broker worker.
+    if let Err(error) = before_move() {
+        return (mapping, removed, Vec::new(), error.to_string());
     }
     for (source, target) in &moves {
         if let Err(error) = move_file(source, target) {
@@ -553,6 +567,7 @@ mod tests {
         let result = promote_input_files_with_move(
             vec![normalize_path(&first), normalize_path(&second)],
             &destination,
+            || Ok(()),
             |old, new| {
                 if old == second {
                     return Err(io::Error::new(io::ErrorKind::PermissionDenied, "injected"));

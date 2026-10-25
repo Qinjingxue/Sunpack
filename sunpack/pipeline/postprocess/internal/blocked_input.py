@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable
+from typing import Callable, Iterable
 
 from sunpack_native import promote_blocked_input_files
 
@@ -19,8 +19,10 @@ class BlockedInputPromotionError(OSError):
         self.path_map = path_map
 
 
-def promote_blocked_input(paths: Iterable[str], destination_dir: str) -> BlockedInputPromotionResult:
-    mapping, removed, touched, error = promote_blocked_input_files(list(paths), destination_dir)
+def promote_blocked_input(
+    paths: Iterable[str], destination_dir: str, *, before_move: Callable[[], None] | None = None,
+) -> BlockedInputPromotionResult:
+    mapping, removed, touched, error = promote_blocked_input_files(list(paths), destination_dir, before_move)
     if error:
         raise BlockedInputPromotionError(error, mapping)
     return BlockedInputPromotionResult(mapping, tuple(removed), tuple(touched))

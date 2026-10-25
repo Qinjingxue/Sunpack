@@ -20,9 +20,11 @@ def test_installer_resets_pre_120_data_and_preserves_current_data(tmp_path, repo
     for name in (
         "NormalizePathEntry", "PopPathEntry", "PathContains", "InstallerOwnsMachinePath",
         "PathWithoutEntry", "AddMachinePath", "RemoveMachinePath",
-        "PowerShellSingleQuotedString", "RequiresDataReset", "InstalledDataRequiresReset",
+        "PowerShellSingleQuotedString", "VersionBefore", "RequiresDataReset",
+        "InstalledVersion", "InstalledDataRequiresReset",
         "RemoveDataDirectory", "ExistingApplicationDirectory", "RemoveInstalledData",
         "ExistingLauncherPath", "CaptureConfigurationForUpgrade", "PrepareToInstall",
+        "ResetLegacyWatchState",
     ):
         match = re.search(rf"^(?:function|procedure) {name}\b.*?^end;", source, re.M | re.S)
         assert match is not None, name
@@ -51,11 +53,14 @@ OutputBaseFilename=reset
 [Files]
 {chr(10).join(default_files)}
 Source: "{repo_root / 'sunpack_advanced_config.json'}"; DestDir: "{{app}}"; Flags: ignoreversion
+Source: "{repo_root / 'scripts/reset_legacy_watch_state.ps1'}"; DestDir: "{{tmp}}\\SunPackInstallScripts"; Flags: deleteafterinstall
 [CustomMessages]
 PrepareRuntimeRunning=Runtime still running
 PrepareBrokerRemoveFailed=Broker still running
 PrepareOldFilesRemoveFailed=Cannot remove old files
 TaskAddToPathFailed=Cannot update PATH
+WalResetFailed=Cannot reset Watch state
+WalResetNotice=Watch state reset
 [Code]
 const
   SunPackRegistryKey = '{registry_key}\\integration';
@@ -63,7 +68,7 @@ const
   PathMarkerName = 'PathAddedByInstaller';
 var
   StopStage: Integer;
-  ExistingWatchStateCaptured, RestartWatchAfterUpgrade: Boolean;
+  ExistingWatchStateCaptured, RestartWatchAfterUpgrade, TaskWalResetRequired: Boolean;
   ConfigBackupCaptured: Boolean;
 procedure ApplyStartupTaskDefault;
 begin
@@ -89,6 +94,7 @@ begin
   if CurStep = ssPostInstall then
   begin
     if StopStage <> 2 then RaiseException('Installed before runtime/broker stop');
+    ResetLegacyWatchState;
     if ExpandConstant('{{param:AddPath|1}}') = '1' then
       if not AddMachinePath then RaiseException('Cannot add PATH');
     SaveStringToFile(ExpandConstant('{{param:Fixture}}\\completed'), 'ok', False);
@@ -101,19 +107,29 @@ end;
                 for name in ("sunpack_config.json", "builtin_passwords.json")}
     # The malformed-config case proves deletion needs no functioning old runtime
     # or valid schema. The relocated case also resolves state from old defaults.
-    cases = (("1.1.12", True, False), ("v1.1.99", True, False),
-             ("1.2.0", False, False), ("1.10.0", False, False),
-             (None, True, False), ("1.1.12", True, True), ("invalid", True, False),
-             ("v1.2.2", False, False), ("v1.2.2-7-gabcdef0", False, False),
-             ("1.2.2-7-gabcdef0-dirty", False, False), ("v1.1.12-7-gabcdef0", True, False))
+    cases = (("1.1.12", True, False, True), ("v1.1.99", True, False, True),
+             ("1.2.0", False, False, True), ("1.10.0", False, False, False),
+             (None, True, False, True), ("1.1.12", True, True, True), ("invalid", True, False, True),
+             ("v1.2.2", False, False, True), ("v1.2.2-7-gabcdef0", False, False, True),
+             ("1.2.2-7-gabcdef0-dirty", False, False, True), ("v1.1.12-7-gabcdef0", True, False, True),
+             ("v1.2.7", False, False, True), ("v1.2.8", False, False, False),
+             ("1.2.8-3-gabcdef0", False, False, False), ("v1.2.9", False, False, False))
     try:
-        for index, (version, reset, stop_failure) in enumerate(cases):
+        for index, (version, reset, stop_failure, wal_reset) in enumerate(cases):
             fixture = tmp_path / f"case {index} ' [data]"
             app, data, custom = (fixture / name for name in ("app", "data", "custom ' [watch]"))
             installed = fixture / "previous app" if index in (1, 3) else app
             for directory in {app, data, custom, installed}:
                 (directory / "unknown" / "nested").mkdir(parents=True)
                 (directory / "unknown" / "nested" / "backup.bak").write_text("old", encoding="utf-8")
+            task_files = ["state.snapshot", "state.journal.00000000000000000001.wal",
+                          "state.journal.00000000000000000142.wal", "events.jsonl"]
+            preserved_files = ["catalog.snapshot.bin", "catalog.wal.bin", "initial_scanned",
+                               "state.journal.not-a-sequence.wal"]
+            for directory in (data / ".sunpack_watch", custom):
+                directory.mkdir(exist_ok=True)
+                for name in task_files + preserved_files:
+                    (directory / name).write_text(name, encoding="utf-8")
             (installed / "bin").mkdir()
             (installed / "bin" / "sunpack.exe").write_text("stub", encoding="utf-8")
             config = {"watch": {"state_dir": str(custom)}, "unknown": "keep current data"}
@@ -162,6 +178,11 @@ end;
                 assert custom.exists() is not reset
                 assert (data / "unknown").exists() is not reset
                 assert (data / "sunpack_watch_roots.txt").exists() is not reset
+                if not reset:
+                    for directory in (data / ".sunpack_watch", custom):
+                        assert all((directory / name).exists() is not wal_reset for name in task_files)
+                        assert all((directory / name).read_text(encoding="utf-8") == name
+                                   for name in preserved_files)
             for name in defaults:
                 assert (data / name).read_bytes() == (defaults[name] if reset and not stop_failure else originals[name])
             with winreg.OpenKey(winreg.HKEY_CURRENT_USER, registry_key + r"\environment") as key:

@@ -451,7 +451,7 @@ begin
   end;
 end;
 
-function RequiresDataReset(const Version: string): Boolean;
+function VersionBefore(const Version: string; const Minimum: Int64): Boolean;
 var
   Packed: Int64;
   Value: string;
@@ -469,17 +469,24 @@ begin
   { Missing or unversioned installations cannot provide current-format data. }
   Result := True;
   if StrToVersion(Value, Packed) then
-    Result := Packed < PackVersionComponents(1, 2, 0, 0);
+    Result := Packed < Minimum;
 end;
 
-function InstalledDataRequiresReset: Boolean;
-var
-  Version: string;
+function RequiresDataReset(const Version: string): Boolean;
+begin
+  Result := VersionBefore(Version, PackVersionComponents(1, 2, 0, 0));
+end;
+
+function InstalledVersion: string;
 begin
   RegQueryStringValue(HKLM64,
     'Software\Microsoft\Windows\CurrentVersion\Uninstall\{9E8C73E5-C540-4E68-93E0-1FBAAFB89713}_is1',
-    'DisplayVersion', Version);
-  Result := RequiresDataReset(Version);
+    'DisplayVersion', Result);
+end;
+
+function InstalledDataRequiresReset: Boolean;
+begin
+  Result := RequiresDataReset(InstalledVersion);
 end;
 
 function RemoveDataDirectory(const Path: string): Boolean;
@@ -720,6 +727,7 @@ end;
 var
   StartupTaskDefaultApplied: Boolean;
   ExistingWatchStateCaptured: Boolean;
+  TaskWalResetRequired: Boolean;
   RestartWatchAfterUpgrade: Boolean;
   ConfigBackupCaptured: Boolean;
   ConfigMigrationApplied: Boolean;
@@ -869,6 +877,9 @@ begin
   if not ExistingWatchStateCaptured then
   begin
     RestartWatchAfterUpgrade := QueryExistingWatchRunning;
+    { Capture the old version before deployment changes DisplayVersion.
+      1.2.8 is the first release with durable promotion destinations. }
+    TaskWalResetRequired := VersionBefore(InstalledVersion, PackVersionComponents(1, 2, 8, 0));
     ExistingWatchStateCaptured := True;
   end;
   if not StopExistingProcessesAndWait then
@@ -925,6 +936,8 @@ begin
     ' -AdvancedConfig ' + AddQuotes(ExpandConstant('{app}\sunpack_advanced_config.json')) +
     ' -OldAdvancedConfig ' + AddQuotes(ExpandConstant('{tmp}\sunpack-old-advanced.json')) +
     ' -UserConfig ' + AddQuotes(ExpandConstant('{commonappdata}\SunPack\sunpack_config.json'));
+  if TaskWalResetRequired then
+    Parameters := Parameters + ' -ResetTaskWal';
   if not Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
               Parameters, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
     RaiseException(CustomMessage('WalResetFailed'));

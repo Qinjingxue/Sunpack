@@ -359,7 +359,18 @@ def test_promoted_password_failure_uses_ordinary_input_path(tmp_path, monkeypatc
     inner = root / "inner.zip"
     outer.write_bytes(b"outer")
     inner.write_bytes(b"inner")
-    failure = FailureInfo(FailureKind.WRONG_PASSWORD, "password_resolution", "wrong password")
+    failure = FailureInfo(FailureKind.WRONG_PASSWORD, "password_resolution", "wrong password",
+                          details={"promoted_nested_input": True})
+    watcher.state.queue_active(_candidate(outer))
+    assert watcher.state.prepare_input_promotion(str(outer), [str(inner)])
+    original_mark = watcher.state.mark
+
+    def mark_before_retirement(*args, **kwargs):
+        pending = watcher.state.pending_work_for_path(str(outer))
+        assert pending is not None and pending.promoted_destinations == [str(inner)]
+        return original_mark(*args, **kwargs)
+
+    monkeypatch.setattr(watcher.state, "mark", mark_before_retirement)
     response = _response(
         TargetRunResult(str(outer), OutcomeKind.COMPLETE_SUCCESS, output_dir=str(inner_dir)),
         TargetRunResult(str(inner), OutcomeKind.FAILURE, error="wrong password", failure=failure),
@@ -370,6 +381,8 @@ def test_promoted_password_failure_uses_ordinary_input_path(tmp_path, monkeypatc
     assert watcher.state.latest_entry_for_path(str(outer)) is None
     entry = watcher.state.latest_entry_for_path(str(inner))
     assert entry is not None and entry.status == "failed_password"
+    assert entry.failure_payload["details"]["promoted_nested_input"] is True
+    assert watcher.state.pending_work_for_path(str(outer)) is None
     assert entry.password_scope_dir == str(root.resolve())
     assert [action for action, _ in sink.actions] == ["suppressed"]
 

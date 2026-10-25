@@ -1801,10 +1801,20 @@ class _RequestRuntime:
             })
 
         def promote():
+            def prepare():
+                self._report_progress(task, {
+                    "type": "semantic", "event": "task_sources_claimed",
+                    "source_paths": (*sources, *destinations),
+                    "promoted_destinations": destinations,
+                })
+
             with promotion_barrier(
                 sources, cache_releasers=(release_archive_sessions_under_roots,), quiesce=False,
             ):
-                return promote_blocked_input(sources, destination)
+                return promote_blocked_input(
+                    sources, destination,
+                    before_move=prepare if self.submission.origin == "watch" else None,
+                )
 
         promoted = False
         try:

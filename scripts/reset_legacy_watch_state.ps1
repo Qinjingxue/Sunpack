@@ -3,7 +3,8 @@ param(
     [Parameter(Mandatory = $true)][string]$DataRoot,
     [Parameter(Mandatory = $true)][string]$AdvancedConfig,
     [string]$OldAdvancedConfig,
-    [string]$UserConfig
+    [string]$UserConfig,
+    [switch]$ResetTaskWal
 )
 
 Set-StrictMode -Version Latest
@@ -32,11 +33,15 @@ foreach ($configPath in @($AdvancedConfig, $OldAdvancedConfig, $UserConfig)) {
 $removed = $false
 foreach ($directory in $directories) {
     if (-not (Test-Path -LiteralPath $directory -PathType Container)) { continue }
-    $taskStateReset = $false
+    $taskStateReset = [bool]$ResetTaskWal
     foreach ($file in Get-ChildItem -LiteralPath $directory -File -Force) {
+        $isBinaryTaskState = $ResetTaskWal -and (
+            ($file.Name -eq 'state.snapshot') -or
+            ($file.Name -match '^state\.journal\.[0-9]+\.wal$'))
         if ($file.Name -notin @('state.json', 'catalog.snapshot', 'catalog.snapshot.tmp', 'catalog.wal') -and
             $file.Name -notmatch '^state\.journal\.[0-9]+\.jsonl$' -and
-            $file.Name -notmatch '^\.state\.json\.[0-9a-f]{32}\.tmp$') { continue }
+            $file.Name -notmatch '^\.state\.json\.[0-9a-f]{32}\.tmp$' -and
+            -not $isBinaryTaskState) { continue }
         $isTaskState = ($file.Name -eq 'state.json') -or
             ($file.Name -match '^state\.journal\.[0-9]+\.jsonl$')
         Remove-Item -LiteralPath $file.FullName -Force

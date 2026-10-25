@@ -645,7 +645,8 @@ class WatchScheduler:
             }
             scope_dir = str(getattr(pending, "password_scope_dir", "") or "")
             internal = bool(getattr(pending, "internal_recovery", False))
-            if not active_outputs and not committed_roots:
+            promoted_destinations = pending.promoted_destinations
+            if not active_outputs and not committed_roots and not promoted_destinations:
                 if os.path.exists(pending.path):
                     self.enqueue(
                         pending.path,
@@ -658,6 +659,30 @@ class WatchScheduler:
                 elif self.state.file_presence(pending.path) is False:
                     self.state.forget_path(pending.path)
                 continue
+
+            recovered: dict[str, WatchCandidate] = {}
+            unavailable = False
+            promoted_input_present = False
+            for target in promoted_destinations:
+                if not watch_path_available(target, self.scopes.values()):
+                    unavailable = True
+                    break
+                candidate = _candidate_for_event_path(target)
+                if candidate is None:
+                    if self.state.file_presence(target) is not False:
+                        unavailable = True
+                        break
+                    continue
+                promoted_input_present = True
+                if not _persisted_blocker_owns_retry(self.state, candidate.path):
+                    recovered.setdefault(path_key(candidate.path), candidate)
+            if unavailable:
+                # An offline destination is not evidence that the move failed.
+                continue
+            if not active_outputs and not committed_roots:
+                candidate = _candidate_for_event_path(pending.path)
+                if candidate is not None and not _persisted_blocker_owns_retry(self.state, candidate.path):
+                    recovered.setdefault(path_key(candidate.path), candidate)
 
             cleanup_failed = False
             for output_dir in dict.fromkeys(active_outputs.values()):
@@ -685,7 +710,6 @@ class WatchScheduler:
                 # cleanup without ever writing into an unknown half-output.
                 continue
 
-            recovered: dict[str, WatchCandidate] = {}
             for task_path in active_outputs:
                 if path_key(task_path) in completed_sources:
                     continue
@@ -699,7 +723,10 @@ class WatchScheduler:
             missing_committed_roots = [
                 root for root in committed_roots if not self._recovery_output_matches(pending, root)
             ]
-            if missing_committed_roots:
+            # Promotion removes empty source directories. A surviving promoted
+            # input resumes that work even when its former output root is gone;
+            # re-extracting the retained outer archive would duplicate it.
+            if missing_committed_roots and not promoted_input_present:
                 candidate = _candidate_for_event_path(pending.path)
                 if (
                     candidate is None
@@ -2081,6 +2108,9 @@ class WatchScheduler:
                 # Live publication claims cover the gap before failure state
                 # is persisted; ownership transfer preserves their provenance.
                 archive_task.runtime["promoted_nested_input"] = True
+            destinations = event.get("promoted_destinations")
+            if destinations and not self.state.prepare_input_promotion(owner_path, destinations):
+                raise RuntimeError("watch input promotion state transition rejected")
             return
         if name == "task_output_started":
             if not self.state.record_task_output_started(
@@ -2183,9 +2213,6 @@ class WatchScheduler:
         if direct_failure is None and target_result is None and len(failures) == 1:
             direct_failure = failures[0]
 
-        if direct_outcome == OutcomeKind.COMPLETE_SUCCESS:
-            self._retire_claimed_paths(claimed_paths, request.candidate)
-
         waiting_failures: list = []
         recorded_password_failures: list = []
         retired_failures: list = []
@@ -2253,6 +2280,11 @@ class WatchScheduler:
                 waiting_failures.append(failure)
             else:
                 recorded_password_failures.append(failure)
+
+        # A successful outer input may own unpublished nested promotion intents.
+        # Hand them off to durable blockers before retiring any source record.
+        if direct_outcome == OutcomeKind.COMPLETE_SUCCESS:
+            self._retire_claimed_paths(claimed_paths, request.candidate)
 
         terminal_failures = [
             failure

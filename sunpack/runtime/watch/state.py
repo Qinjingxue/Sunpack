@@ -113,6 +113,7 @@ class WatchPendingWork:
     committed_roots: list[str] = field(default_factory=list)
     completed_sources: list[str] = field(default_factory=list)
     output_identities: dict[str, str] = field(default_factory=dict)
+    promoted_destinations: list[str] = field(default_factory=list)
 
     @property
     def fingerprint(self) -> str:
@@ -901,6 +902,7 @@ class WatchStateStore:
                 committed_roots=list(previous.committed_roots if previous else []),
                 output_identities=dict(previous.output_identities if previous else {}),
                 completed_sources=list(previous.completed_sources if previous else []),
+                promoted_destinations=list(previous.promoted_destinations if previous else []),
             )
             operations = [self._put_operation("pending_work", key, pending)]
             if persist:
@@ -943,6 +945,7 @@ class WatchStateStore:
                 committed_roots=list(previous.committed_roots if previous else []),
                 output_identities=dict(previous.output_identities if previous else {}),
                 completed_sources=list(previous.completed_sources if previous else []),
+                promoted_destinations=list(previous.promoted_destinations if previous else []),
             )
             operations = [self._put_operation("pending_work", key, pending)]
             if previous is not None and not previous.durable_owner:
@@ -969,6 +972,21 @@ class WatchStateStore:
     def pending_work_for_path(self, path: str) -> WatchPendingWork | None:
         with self._state_lock:
             return self._pending_record(path)
+
+    def prepare_input_promotion(self, owner_path: str, destinations: Iterable[str]) -> bool:
+        """Durably retain nested provenance before the first physical move."""
+        with self._state_lock:
+            key = _path_key(owner_path)
+            pending = self._pending_record(key)
+            if pending is None:
+                return False
+            paths = {_path_key(path): path for path in pending.promoted_destinations}
+            paths.update((_path_key(path), os.path.abspath(path)) for path in destinations)
+            updated = replace(pending, durable_owner=True, promoted_destinations=list(paths.values()))
+            self._commit_operations_locked([
+                self._put_operation("pending_work", key, updated),
+            ], durable=True)
+            return True
 
     def record_task_output_started(self, owner_path: str, task_path: str, output_dir: str) -> bool:
         if not task_path or not output_dir:
@@ -1077,6 +1095,7 @@ class WatchStateStore:
             unique = {}
             for candidate in candidates:
                 unique.setdefault(_path_key(candidate.path), candidate)
+            promoted = {_path_key(path) for path in previous.promoted_destinations} if previous else set()
             operations = [self._delete_operation("pending_work", owner_key)]
             for key, candidate in sorted(unique.items()):
                 pending = WatchPendingWork(
@@ -1091,6 +1110,7 @@ class WatchStateStore:
                     internal_recovery=True,
                     discovery_scope=dict((discovery_scopes or {}).get(_path_key(candidate.path), previous.discovery_scope if previous else {})),
                     durable_owner=True,
+                    promoted_destinations=[os.path.abspath(candidate.path)] if key in promoted else [],
                 )
                 operations.append(self._put_operation("pending_work", key, pending))
             self._commit_operations_locked(operations, durable=True)
@@ -1206,6 +1226,7 @@ class WatchStateStore:
                     committed_roots=list(previous.committed_roots if previous else []),
                     output_identities=dict(previous.output_identities if previous else {}),
                     completed_sources=list(previous.completed_sources if previous else []),
+                    promoted_destinations=list(previous.promoted_destinations if previous else []),
                 )
                 operations.append(self._put_operation("pending_work", key, pending))
             merged = dict(self._native.watch_cursors())

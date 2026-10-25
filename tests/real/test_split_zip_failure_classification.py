@@ -11,6 +11,7 @@ import zipfile
 from pathlib import Path
 
 import pytest
+import psutil
 
 from sunpack.core.contracts.failures import FailureInfo, FailureKind
 from tests.helpers.passwords import write_password_json
@@ -181,11 +182,21 @@ def test_cli_nested_disguised_split_groups_keep_failure_classifications(tmp_path
             capture_output=True, text=True, encoding="utf-8", timeout=30,
         )
     finally:
+        # Shutdown acknowledges before teardown releases the Windows state lock.
+        # Capture this isolated server before shutdown removes its state file,
+        # then wait on process exit rather than racing cleanup against teardown.
+        try:
+            server = psutil.Process(int((root / f"runtime-{runtime_id}.state")
+                                        .read_text(encoding="ascii").splitlines()[3]))
+        except (FileNotFoundError, psutil.NoSuchProcess):
+            server = None
         closed = subprocess.run(
             [*bootstrap, "--persistent-shutdown", identity], cwd=root, env=environment,
             capture_output=True, text=True, encoding="utf-8", timeout=15,
         )
         assert closed.returncode == 0, closed.stdout + closed.stderr
+        if server is not None:
+            server.wait(timeout=15)
         for suffix in (".state", ".state.events.jsonl", ".state.lock"):
             (root / f"runtime-{runtime_id}{suffix}").unlink(missing_ok=True)
     plan_error.update(stdout=result.stdout, stderr=result.stderr)

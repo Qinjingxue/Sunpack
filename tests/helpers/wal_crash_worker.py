@@ -106,12 +106,42 @@ async def watch_scenario(root, mode):
                 state_path=str(root / "state.snapshot"), cold_start_seconds=0,
                 pipeline_engine=engine)
             original = watcher._handle_pipeline_progress
+            if mode == "promotion_prepared":
+                prepare = watcher.state.prepare_input_promotion
+
+                def prepare_and_crash(owner, destinations):
+                    assert prepare(owner, destinations)
+                    crash_gate(destinations=list(destinations),
+                               pending=[asdict(item) for item in watcher.state.pending_work_items()])
+
+                watcher.state.prepare_input_promotion = prepare_and_crash
+            if mode == "promotion_partial":
+                import sunpack.pipeline.coordinator.engine as engine_module
+                promote = engine_module.promote_blocked_input
+
+                def promote_first(paths, destination, *, before_move=None):
+                    result = promote(paths[:1], destination, before_move=before_move)
+                    crash_gate(moved=list(result.path_map.values()),
+                               pending=[asdict(item) for item in watcher.state.pending_work_items()])
+
+                engine_module.promote_blocked_input = promote_first
+            if mode == "promotion_rebased":
+                rebase = watcher.state.rebase_pending_work
+
+                def rebase_and_crash(*args, **kwargs):
+                    rebase(*args, **kwargs)
+                    crash_gate(pending=[asdict(item) for item in watcher.state.pending_work_items()])
+
+                watcher.state.rebase_pending_work = rebase_and_crash
             target_event = "task_output_started" if mode == "started" else "task_output_finished"
             started = set()
             progress_lock = threading.Lock()
 
             def progress(owner, notification, task, event, **kwargs):
                 original(owner, notification, task, event, **kwargs)
+                if mode == "promotion_moved" and event.get("promoted_nested_input") is True:
+                    crash_gate(moved=list(event["source_paths"]),
+                               pending=[asdict(item) for item in watcher.state.pending_work_items()])
                 if mode == "concurrent" and event.get("event") == "task_output_started":
                     with progress_lock:
                         started.add(owner)
@@ -132,15 +162,17 @@ async def watch_scenario(root, mode):
             original_mark = watcher.state.mark
 
             def mark(*args, **kwargs):
-                original_mark(*args, **kwargs)
-                if mode == "blocked" and kwargs["status"] in {"failed_password", "suspended_missing_volume"}:
+                published = original_mark(*args, **kwargs)
+                if mode in {"blocked", "promotion_blocked"} and kwargs["status"] in {"failed_password", "suspended_missing_volume"}:
                     crash_gate(status=kwargs["status"],
                                entries=[asdict(item) for item in watcher.state.entry_items()])
+                return published
 
             watcher.state.mark = mark
             await watcher.start()
             try:
-                if mode in {"started", "finished", "concurrent", "blocked"}:
+                if mode in {"started", "finished", "concurrent", "blocked",
+                            "promotion_prepared", "promotion_partial", "promotion_moved", "promotion_blocked"}:
                     for source in manifest["sources"]:
                         watcher.enqueue(source, force=True)
                 deadline = time.monotonic() + 60

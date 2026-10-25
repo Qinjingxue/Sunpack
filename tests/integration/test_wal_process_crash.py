@@ -128,9 +128,12 @@ def _archive(root, kind):
                        check=True, capture_output=True, text=True)
 
     source = input_root / "disguised.video"
-    if kind in {"nested", "nested_encrypted"}:
+    if kind in {"nested", "nested_encrypted", "nested_encrypted_split"}:
         inner = payload / "inner.data"
-        if kind == "nested_encrypted":
+        if kind == "nested_encrypted_split":
+            pack(inner, marker, "-t7z", "-pwal-test-secret", "-mhe=on", "-v64k")
+            inner = payload / "inner.data.*"
+        elif kind == "nested_encrypted":
             pack(inner, marker, "-t7z", "-pwal-test-secret", "-mhe=on")
         else:
             pack(inner, marker, "-tzip")
@@ -253,3 +256,41 @@ def test_waiting_input_survives_death_and_retries_when_resolved(tmp_path, kind):
     assert recovered["entries"] == []
     [marker] = list((tmp_path / "output").rglob("wal-marker.txt"))
     assert marker.read_text(encoding="utf-8") == expected
+
+
+@pytest.mark.requires_watch_broker
+@pytest.mark.parametrize("boundary", ["prepared", "partial", "moved", "blocked"])
+def test_promoted_split_provenance_survives_process_death(tmp_path, boundary):
+    # Existing output/WAL tests never kill between promotion and blocker commit.
+    # One small encrypted, disguised group covers all four handoff boundaries
+    # and checks the user-visible keep policy after an actual process restart.
+    expected = _archive(tmp_path, "nested_encrypted_split")
+    manifest_path = tmp_path / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["unknown_password"] = True
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    killed = _run_child(tmp_path, "watch", "promotion_" + boundary, kill=True)
+    if boundary == "prepared":
+        assert all(not Path(path).exists() for path in killed["destinations"])
+    if boundary == "partial":
+        assert len(killed["moved"]) == 1
+        # Finish the interrupted arrival just as later volumes would arrive.
+        # Only the moved head carries provenance in the original WAL.
+        for part in (tmp_path / "output").rglob("inner.data.*"):
+            part.rename(tmp_path / "input" / part.name)
+    if boundary == "moved":
+        # Kill again after atomic rebase but before enqueue/lease acquisition.
+        rebased = _run_child(tmp_path, "watch", "promotion_rebased", kill=True)
+        promoted = [item for item in rebased["pending"] if item["promoted_destinations"]]
+        assert promoted
+        assert all(item["promoted_destinations"] == [item["path"]] for item in promoted)
+    from tests.helpers.passwords import write_password_json
+    write_password_json(tmp_path / "builtin_passwords.json",
+                        scopes=[("wal-test-secret", [str(tmp_path / "input")])])
+    recovered = _run_child(tmp_path, "watch", "recover")
+    assert recovered["pending"] == 0 and recovered["entries"] == []
+    assert Path(manifest["sources"][0]).is_file()  # keep applies to the user's outer archive.
+    assert not list((tmp_path / "input").glob("inner.data.*"))
+    [marker] = list((tmp_path / "output").rglob("wal-marker.txt"))
+    assert marker.read_text(encoding="utf-8") == expected
+    assert _run_child(tmp_path, "watch", "recover")["pending"] == 0

@@ -50,6 +50,7 @@ struct PendingRecord {
     committed_roots: Vec<String>,
     completed_sources: Vec<String>,
     output_identities: BTreeMap<String, String>,
+    promoted_destinations: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -632,7 +633,10 @@ impl NativeWatchState {
         paths
             .into_iter()
             .filter(|path| {
-                data.entries.get(&path_key(path)).is_some_and(|entry| {
+                let key = path_key(path);
+                data.pending.get(&key).is_some_and(|pending| {
+                    pending.promoted_destinations.iter().any(|target| path_key(target) == key)
+                }) || data.entries.get(&key).is_some_and(|entry| {
                     entry
                         .failure_payload
                         .get("details")
@@ -704,6 +708,7 @@ impl NativeWatchState {
                         .keys()
                         .chain(record.active_outputs.values())
                         .chain(record.committed_roots.iter())
+                        .chain(record.promoted_destinations.iter())
                         .map(|path| path_key(path))
                 })
                 .collect();
@@ -803,6 +808,7 @@ impl NativeWatchState {
                     !missing_only
                         || (record.active_outputs.is_empty()
                             && record.committed_roots.is_empty()
+                            && record.promoted_destinations.is_empty()
                             && recorded_file_presence(&record.path) == Some(false))
                 })
                 .map(|(key, _)| key)
