@@ -66,11 +66,16 @@ class _Submission:
 def _task_source_group(task: ArchiveTask) -> dict[str, Any]:
     # Presentation reuses the confirmed descriptor; cleanup/publication claims
     # can also contain carriers and destinations that are not archive members.
-    return {
+    group: dict[str, Any] = {
         "path": task.main_path,
         "name": os.path.basename(task.logical_name),
         "members": task.all_parts or [task.main_path],
     }
+    descriptor = task.archive_input()
+    # One known volume still needs the multipart presentation before blocking.
+    if descriptor.volume_style or descriptor.open_mode in {"concat_ranges", "native_volumes", "sfx_with_volumes"}:
+        group["multipart"] = True
+    return group
 
 
 def new_work_broker(config: dict) -> AsyncWorkBroker:

@@ -464,6 +464,9 @@ def test_native_and_gui_share_member_retirement_and_real_request_lifetimes(tmp_p
     # Scalar status/GUI-only fixtures miss compaction resurrecting a removed
     # sibling, and a completed request leaving invisible active groups resident.
     from sunpack.runtime.watch.log import WatchLogStore
+    from sunpack.core.contracts.archive_input import ArchiveInputDescriptor, ArchiveInputPart, InputExtent
+    from sunpack.core.contracts.tasks import ArchiveTask
+    from sunpack.pipeline.coordinator.engine import _task_source_group
     log = WatchLogStore(str(tmp_path / "events.jsonl"), max_bytes=4096)
     a, b, c = (str(tmp_path / name) for name in ("carrier.001", "other.bin", "last.part"))
     def compact():
@@ -472,25 +475,34 @@ def test_native_and_gui_share_member_retirement_and_real_request_lifetimes(tmp_p
         return _state_projection(log.path)["tasks"]
     def members():
         records = [json.loads(line) for line in log.path.read_text(encoding="utf-8").splitlines()]
-        return set(next(g for r in reversed(records) if r["event"] == "pipeline_sources_claimed"
-                        for g in r["groups"] if g["path"] == a)["members"])
+        return next(g for r in reversed(records) if r["event"] == "pipeline_sources_claimed"
+                    for g in r["groups"] if g["path"] == a)["members"]
     try:
         log.recover()
         log.write("processing_started", path=c, owner="request")
-        log.write("pipeline_sources_claimed", owner="request",
-                  groups=[{"path": a, "name": "nested.rar", "members": [a,b,c]}])
+        # Real descriptor -> producer -> Rust compaction -> C++ display. This
+        # also covers the otherwise invisible one-volume multipart marker.
+        descriptor = ArchiveInputDescriptor(entry_path=a, open_mode="native_volumes", volume_style="rar",
+            parts=[ArchiveInputPart(InputExtent(p), volume_number=n, canonical_name=f"nested.part{n}.rar")
+                   for p, n in ((c, 10), (a, 1), (b, 2))])
+        group = _task_source_group(ArchiveTask.from_archive_input(descriptor, discovery_source="test"))
+        log.write("pipeline_sources_claimed", owner="request", groups=[group])
         # Absorbing a provisional member must canonicalize its saved status;
         # retiring it before compaction must not resurrect a second card.
         log.write("task_retired", path=c)
         rows = compact()["rows"]
-        assert len(rows)==1 and members()=={a,b,c}
+        assert len(rows)==1 and members()==[a,b,c]
+        assert rows[0]["parts"]==["carrier.001", "other.bin", "last.part"]
         log.write("suspended_missing_volume", path=a)
         log.write("task_retired", path=c)
         rows = compact()["rows"]
-        assert len(rows)==1 and members()=={a,b} and rows[0]["path"]==a
+        assert len(rows)==1 and members()==[a,b] and rows[0]["path"]==a
+        assert rows[0]["parts"]==["carrier.001", "other.bin"]
         log.write("task_retired", path=a)
         rows = compact()["rows"]
-        assert len(rows)==1 and members()=={b} and rows[0]["status"]=="taskWaiting"
+        assert len(rows)==1 and members()==[b] and rows[0]["status"]=="taskWaiting"
+        log.write("failed_password", path=a)
+        assert compact()["rows"][0]["parts"]==["other.bin"]
         log.write("processing_started", path=a, owner="request")
         log.write("blocker_cleared", path=a, task_path=a)
         assert compact()["total"]==1  # A real running task survives old blocker retirement.
@@ -509,6 +521,12 @@ def test_native_and_gui_share_member_retirement_and_real_request_lifetimes(tmp_p
                   groups=[{"path": a, "members": [a,b]}])
         log.write("task_retired", path=a, scope="task")
         assert compact()["total"]==0
+        log.write("pipeline_sources_claimed", owner="failure", processing=True, groups=[group])
+        log.write("failed_terminal", path=a, error="CRC mismatch\n嵌套压缩包损坏", error_kind="damaged")
+        rows = compact()["rows"]
+        assert rows[0]["parts"]==["carrier.001", "other.bin", "last.part"]
+        assert rows[0]["error"]=="CRC mismatch\n嵌套压缩包损坏"
+        assert rows[0]["errorType"]=="压缩数据损坏"
     finally:
         log.close()
 

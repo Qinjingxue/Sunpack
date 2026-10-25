@@ -1036,6 +1036,86 @@ void tag_config(Application& app,const fs::path& dir) {
     add(L"retry"); finish_input(app);values.push_back("retry");assert(disk()==values);
     search_config(app,L"");
 }
+// Existing scalar delta checks cannot catch stale conditional text or virtual
+// row heights. Reuse this host and snapshot in both acceptance and full runs.
+void task_card_details(Application& app) {
+    auto saved=state(app.page(),"tasks"), fixture=saved, saved_texts=state(app.page(),"texts");
+    auto row=fixture["rows"][0], sibling=row;
+    sibling["id"]="details-sibling"; sibling["sortTimestamp"]=0; sibling["sortSequence"]=0;
+    fixture["rows"].push_back(sibling); fixture["total"]=fixture["rows"].size();
+    assert(ui_page_set_json(app.page(),"tasks",fixture.dump().c_str())==0);
+    auto id=row["id"].get<std::string>();
+    auto* window=ui::GetContext().GetWindow(app.window());
+    auto update=[&] {
+        auto delta=Json{{"changes",Json::array({Json{{"id",id},{"row",row}}})},{"malformed",0}}.dump();
+        assert(ui_page_call_json(app.page(),"applyTaskDelta",delta.c_str())==0);
+        ui_window_relayout(app.window());
+    };
+    auto label=[&](const std::string& prefix) {
+        auto* result=dynamic_cast<ui::LabelWidget*>(window->Root()->FindById(prefix+id));
+        assert(result && result->selectable); return result;
+    };
+    row["parts"]=Json::array(); row["error"]=""; row["errorType"]=""; update();
+    auto compact=rect(app,"task-"+id);
+    Json parts=Json::array();
+    for(int i=1;i<=18;++i) parts.push_back("伪装-Volume-"+std::to_string(i)+".blob");
+    parts[7]=std::string(220,'W')+".blob"; // Only this chip needs tail ellipsis.
+    row["parts"]=parts; row["error"]="CRC mismatch";
+    row["status"]="taskFailed"; row["statusText"]="失败"; row["statusTone"]="failure";
+    row["time"]="2026-10-25 18:04:00";
+    auto choice=state(app.page(),"themeChoice").get<int>();
+    auto theme=ui_widget_find_by_id(ui_page_root(app.page()),"themeSelector"); assert(theme);
+    for(int selected:{1,2}) {
+        auto language=selected==1?"zh":"en";
+        auto texts=interface_texts(language);
+        assert(ui_page_set_json(app.page(),"texts",texts.dump().c_str())==0);
+        row["errorType"]=tr("taskError_damaged",language); update();
+        assert(ui_debug_combo_select(app.window(),theme,selected)==0);
+        for(int width:{850,1120}) {
+            ui_window_set_size(app.window(),width,720); ui_window_relayout(app.window());
+            auto flow=rect(app,"taskParts-"+id);
+            ui::LabelWidget* previous=nullptr;
+            for(size_t i=0;i<parts.size();++i) {
+                auto* part=dynamic_cast<ui::LabelWidget*>(window->Root()->FindById("taskPart-"+id+"-"+std::to_string(i)));
+                assert(part && part->selectable && part->Text()==wide(parts[i].get<std::string>()));
+                auto bounds=part->rect;
+                assert(bounds.left>=flow.left-0.5f && bounds.right<=flow.right+0.5f);
+                assert(bounds.top>=flow.top-0.5f && bounds.bottom<=flow.bottom+0.5f);
+                auto natural=window->GetRenderer().MeasureTextWidth(part->Text(),12)+16;
+                if(i!=7) assert(bounds.right-bounds.left>=natural-1.5f); // No premature shrink/trimming.
+                else assert(natural>bounds.right-bounds.left+100);
+                if(previous) {
+                    if(std::abs(previous->rect.top-bounds.top)<1) assert(bounds.left>=previous->rect.right+3);
+                    else assert(bounds.top>=previous->rect.bottom+3); // Whole chips wrap.
+                }
+                previous=part;
+            }
+            auto* type=label("taskErrorType-"), *message=label("taskErrorMessage-");
+            assert(type->Text()==wide(texts["taskErrorType"].get<std::string>()+row["errorType"].get<std::string>()));
+            assert(message->Text()==wide(texts["taskErrorMessage"].get<std::string>()+"CRC mismatch"));
+            if(width==1120) assert(std::abs(type->rect.top-message->rect.top)<1); // No forced error newline.
+            auto errors=rect(app,"taskErrors-"+id);
+            assert(errors.top>=flow.bottom-0.5f);
+            assert(rect(app,"taskRoot-"+id).top>=errors.bottom-0.5f);
+            auto card=rect(app,"task-"+id);
+            assert(card.bottom-card.top>compact.bottom-compact.top+40);
+            assert(rect(app,"task-details-sibling").top>=card.bottom-0.5f);
+        }
+        screenshot(app,selected==1?L"task-details-light.png":L"task-details-dark.png");
+    }
+    row["parts"]=Json::array(); row["error"]="CRC mismatch\n"+std::string(500,'W'); update();
+    assert(!window->Root()->FindById("taskParts-"+id)->visible);
+    auto* message=label("taskErrorMessage-");
+    assert(message->Text().find(L'\n')==std::wstring::npos);
+    assert(message->rect.right<=rect(app,"taskErrors-"+id).right+0.5f);
+    row["error"]=""; row["errorType"]=""; update();
+    assert(!window->Root()->FindById("taskErrors-"+id));
+    auto collapsed=rect(app,"task-"+id);
+    assert(std::abs((collapsed.bottom-collapsed.top)-(compact.bottom-compact.top))<1);
+    assert(ui_debug_combo_select(app.window(),theme,choice)==0);
+    assert(ui_page_set_json(app.page(),"texts",saved_texts.dump().c_str())==0);
+    assert(ui_page_set_json(app.page(),"tasks",saved.dump().c_str())==0);
+}
 void resize_tasks(Application& app) {
     settle_motion(app);
     std::vector<double> layouts;
@@ -1269,6 +1349,7 @@ int wmain(int argc,wchar_t** argv) {
             assert(state(app.page(),"errors").empty() && state(app.page(),"actionError")=="");
             screenshot(app,L"startup.png");
                 page_motion(app);
+            if(!rangesOnly) task_card_details(app);
             if(rangesOnly || acceptance) {
                 pump_diagnostic(app,[&]{return state(app.page(),"fields").size()>100;},"Configuration fields loaded");
                 click(app,"tabConfig"); pump([&]{return state(app.page(),"tab")=="config";});

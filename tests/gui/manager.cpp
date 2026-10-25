@@ -49,7 +49,21 @@ void projection(Fixture& f) {
     auto output_event=Json{{"event","partial_rejected"},{"path",utf8(source.wstring())},{"ts",5},{"output_dirs",{"new-output"}}};
     overwrite(p,output_event.dump()+"\n",true);
     assert(log.refresh() && task.outputs==std::vector<std::string>{"new-output"});
+    // Status/time/output equality must not hide error-only changes. Existing
+    // scalar status coverage cannot catch this; reuse the same log refresh.
+    output_event["error"]="损坏的压缩数据\nCRC mismatch";
+    overwrite(p,output_event.dump()+"\n",true); assert(log.refresh());
+    assert(task_rows(log,{},{}).at("rows").at(0).at("error")==output_event["error"]);
+    assert(task_rows(log,{},{}).at("rows").at(0).at("errorType")=="未知错误");
+    output_event["failures"]=Json::array({Json{{"kind","damaged"}}});
+    overwrite(p,output_event.dump()+"\n",true); assert(log.refresh());
+    assert(task_rows(log,{},{}).at("rows").at(0).at("errorType")=="压缩数据损坏");
+    assert(task_rows(log,{}, {},"en").at("rows").at(0).at("errorType")=="Damaged archive data");
+    output_event["error"]="updated failure";
+    overwrite(p,output_event.dump()+"\n",true); assert(log.refresh());
+    assert(task.error=="updated failure");
     overwrite(p,event("failed_password",source,5),true); assert(log.refresh());
+    assert(task.error.empty() && task.error_kind.empty());
     overwrite(p,event("suspended_missing_volume",source,5),true); assert(log.refresh());
     assert(task.waiting_reason=="taskWaitingVolumes" && task.outputs.empty());
     std::string burst;
@@ -145,21 +159,26 @@ void logical_projection(Fixture& f) {
         for(auto& row:snapshot["rows"]) assert(displayed.at(row["id"].get<std::string>())==row);
     };
     auto send=[&](const char* type,const std::string& path) { replay(Json{{"event",type},{"path",path}}); };
-    auto group=[&](const std::string& path,const std::vector<std::string>& members) {
+    auto group=[&](const std::string& path,const std::vector<std::string>& members,bool multipart=false) {
         replay(Json{{"event","pipeline_sources_claimed"},{"path",path},
-            {"groups",Json::array({Json{{"path",path},{"name","movie.rar"},{"members",members}}})}});
+            {"groups",Json::array({Json{{"path",path},{"name","movie.rar"},{"members",members},{"multipart",multipart}}})}});
     };
     auto row=[&]() { return task_rows(log,{},{}).at("rows").at(0); };
     // Unrecognized and preparation events do not create visible work.
     overwrite(file,event("candidate_active",wide(a),0)); log.refresh();
     assert(task_rows(log,{},{}).at("total")==0);
-    send("processing_started",b); group(b,{b}); send("suspended_missing_volume",b);
+    send("processing_started",b);
+    assert(row()["parts"]==Json::array() && row()["error"]=="");
+    group(b,{b},true);
+    assert(row()["parts"]==Json::array({"unrelated.bin"})); // One confirmed volume, before any missing-volume status.
+    send("suspended_missing_volume",b);
     auto id=row()["id"];
     assert(row()["status"]=="taskWaiting" && row()["statusText"]=="等待分卷");
     send("processing_started",a);
-    group(a,{a,b,c}); // Main path changes; the existing logical card survives.
+    group(a,{c,a,b,b}); // Backend order wins over filenames/main path; duplicates are aliases.
     assert(displayed.size()==1 && row()["id"]==id && row()["name"]=="disguised.a");
     assert(log.tasks.begin()->second.members.size()==3 && row()["status"]=="taskProcessing");
+    assert(row()["parts"]==Json::array({"third.blob","disguised.a","unrelated.bin"}));
     View member_search; member_search.task_query="unrelated.bin";
     assert(task_rows(log,{},member_search).at("total")==1);
     send("suspended_missing_volume",a);
@@ -169,6 +188,7 @@ void logical_projection(Fixture& f) {
     assert(displayed.size()==1);
     replay(Json{{"event","candidate_departed"},{"path",b},{"forgotten",false}});
     assert(log.tasks.begin()->second.members.size()==2 && row()["statusText"]=="等待分卷");
+    assert(row()["parts"]==Json::array({"third.blob","disguised.a"}));
     send("processing_started",c); send("failed_password",a);
     View waiting; waiting.task_status="taskWaiting";
     assert(task_rows(log,{},waiting).at("total")==1);

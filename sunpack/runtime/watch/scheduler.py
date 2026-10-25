@@ -2321,7 +2321,8 @@ class WatchScheduler:
                 self.log.write("done", path=task_path, owner=request.notification_id,
                                output_dirs=[item.output_dir] if item.output_dir else [])
             elif outcome in {OutcomeKind.FAILURE, OutcomeKind.PARTIAL_SUCCESS}:
-                self.log.write("failed_terminal", path=task_path, owner=request.notification_id, error=result_error(item))
+                self.log.write("failed_terminal", path=task_path, owner=request.notification_id,
+                               error_kind=failure.kind.value if failure is not None else "", error=result_error(item))
 
         if terminal_failures:
             payloads = [_failure_to_dict(failure) for failure in terminal_failures]

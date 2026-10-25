@@ -373,6 +373,20 @@
       "zh": "失败",
       "en": "Failed"
     },
+    "taskErrorType": { "zh": "错误类型：", "en": "Error type: " },
+    "taskErrorMessage": { "zh": "错误信息：", "en": "Error message: " },
+    "taskError_invalid_input": { "zh": "无效输入", "en": "Invalid input" },
+    "taskError_password_required": { "zh": "需要密码", "en": "Password required" },
+    "taskError_wrong_password": { "zh": "密码错误", "en": "Wrong password" },
+    "taskError_password_inconclusive": { "zh": "密码无法确认", "en": "Password inconclusive" },
+    "taskError_damaged": { "zh": "压缩数据损坏", "en": "Damaged archive data" },
+    "taskError_missing_volume": { "zh": "缺少分卷", "en": "Missing volume" },
+    "taskError_unsupported": { "zh": "不支持的格式", "en": "Unsupported format" },
+    "taskError_backend_unavailable": { "zh": "解压后端不可用", "en": "Extraction backend unavailable" },
+    "taskError_filesystem_error": { "zh": "文件系统错误", "en": "Filesystem error" },
+    "taskError_process_error": { "zh": "解压进程错误", "en": "Extraction process error" },
+    "taskError_embedded_segments_failed": { "zh": "内嵌压缩包处理失败", "en": "Embedded archive processing failed" },
+    "taskError_unknown": { "zh": "未知错误", "en": "Unknown error" },
     "taskWaitingPassword": {
       "zh": "等待密码",
       "en": "Waiting for password"

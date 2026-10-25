@@ -33,7 +33,12 @@ Json save_changes(const fs::path& directory, const Json& fields, const Json& pas
 std::string root_for(const fs::path& path, const WatchRoots& roots);
 struct Task {
     std::string path, name, status, waiting_reason, owner;
-    std::unordered_set<std::wstring> members;
+    // Backend order and original filename spelling; one contiguous collection
+    // serves alias retirement, search and display (no resident duplicate set).
+    struct Member { std::wstring key; std::string filename; };
+    std::vector<Member> members;
+    std::string error, error_kind;
+    bool multipart = false;
     double timestamp = 0;
     bool has_timestamp = false;
     uint64_t sequence = 0;

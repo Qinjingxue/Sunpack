@@ -626,7 +626,7 @@ void EventLog::erase_task(const std::wstring& key) {
         auto alias=aliases_.find(member);
         if(alias!=aliases_.end() && alias->second==key) aliases_.erase(alias);
     };
-    for(auto& member:it->second.members) unalias(member);
+    for(auto& member:it->second.members) unalias(member.key);
     unalias(path_key(wide(it->second.path)));
     tasks.erase(it); mark_changed(key);
 }
@@ -635,17 +635,21 @@ void EventLog::accept_group(const Json& group,const std::string& owner) {
         !group.contains("members") || !group["members"].is_array()) return;
     auto path=group["path"].get<std::string>();
     if(path.empty()) return;
-    std::unordered_set<std::wstring> members;
+    std::vector<Task::Member> members;
+    members.reserve(group["members"].size());
+    std::unordered_set<std::wstring> seen;
     for(auto& member:group["members"]) if(member.is_string() && !member.get_ref<const std::string&>().empty()) {
-        members.insert(path_key(wide(member.get_ref<const std::string&>())));
+        fs::path source=wide(member.get_ref<const std::string&>());
+        auto key=path_key(source);
+        if(seen.insert(key).second) members.push_back({std::move(key),utf8(source.filename().wstring())});
     }
     if(members.empty()) return;
     auto explicit_id=group.value("task_id",std::string());
     auto key=explicit_id.empty()?path_key(wide(path)):wide(explicit_id);
     std::unordered_set<std::wstring> previous;
     for(auto& member:members) {
-        auto alias=aliases_.find(member);
-        auto old=alias==aliases_.end()?member:alias->second;
+        auto alias=aliases_.find(member.key);
+        auto old=alias==aliases_.end()?member.key:alias->second;
         if(tasks.count(old) && (!terminal(tasks.at(old)) || old==key)) previous.insert(old);
     }
     if(tasks.count(key)) previous.insert(key);
@@ -663,7 +667,8 @@ void EventLog::accept_group(const Json& group,const std::string& owner) {
     task.name=group.value("name",std::string());
     if(task.name.empty()) task.name=utf8(fs::path(wide(path)).filename().wstring());
     task.members=std::move(members);
-    for(auto& member:task.members) aliases_[member]=key;
+    task.multipart=group.value("multipart",false) || task.members.size()>1 || task.multipart;
+    for(auto& member:task.members) aliases_[member.key]=key;
     aliases_[path_key(wide(path))]=key;
     tasks[key]=std::move(task); mark_changed(key);
 }
@@ -721,18 +726,17 @@ void EventLog::accept(const Json& j) {
                 if(pair.second.members.empty()) {
                     auto task_path=path_key(wide(pair.second.path));
                     if(task_path==physical || is_under(task_path,physical)) affected.push_back(pair.first);
-                } else for(auto& member:pair.second.members) if(member==physical || is_under(member,physical)) {
+                } else for(auto& member:pair.second.members) if(member.key==physical || is_under(member.key,physical)) {
                     affected.push_back(pair.first); break;
                 }
             }
         } else if(tasks.count(key) && !terminal(tasks.at(key)) && tasks.at(key).status!="taskProcessing") affected.push_back(key);
         for(auto& id:affected) {
             auto& task=tasks.at(id);
-            for(auto it=task.members.begin();it!=task.members.end();) {
-                if(*it==physical || (recursive && is_under(*it,physical))) {
-                    aliases_.erase(*it); it=task.members.erase(it);
-                } else ++it;
-            }
+            task.members.erase(std::remove_if(task.members.begin(),task.members.end(),[&](const auto& member) {
+                if(member.key!=physical && !(recursive && is_under(member.key,physical))) return false;
+                aliases_.erase(member.key); return true;
+            }),task.members.end());
             if(task.members.empty()) erase_task(id);
             else { aliases_[path_key(wide(task.path))]=id; mark_changed(id); }
         }
@@ -754,6 +758,17 @@ void EventLog::accept(const Json& j) {
     } else if(event=="done") status="taskSucceeded";
     else if(event=="failed_terminal" || event=="partial_rejected") status="taskFailed";
     else return;
+    std::string error, error_kind;
+    if(status=="taskFailed") {
+        if(j.contains("error") && j["error"].is_string()) error=j["error"].get<std::string>();
+        if(j.contains("error_kind") && j["error_kind"].is_string()) error_kind=j["error_kind"].get<std::string>();
+        // Old and compacted records already carry structured failures. Reuse
+        // that category; diagnostic prose is never reclassified by the GUI.
+        if(error_kind.empty() && j.contains("failures") && j["failures"].is_array())
+            for(auto& failure:j["failures"]) if(failure.is_object() && failure.contains("kind") && failure["kind"].is_string()) {
+                error_kind=failure["kind"].get<std::string>(); break;
+            }
+    }
     std::vector<std::string> outputs;
     double timestamp=0;
     bool has_timestamp=false;
@@ -765,15 +780,18 @@ void EventLog::accept(const Json& j) {
     }
     auto& task=tasks[key];
     if(task.name.empty()) {
-        task.members.insert(physical);
+        if(std::none_of(task.members.begin(),task.members.end(),[&](const auto& member){return member.key==physical;}))
+            task.members.push_back({physical,utf8(fs::path(wide(path)).filename().wstring())});
         aliases_[physical]=key;
     }
+    if(event=="suspended_missing_volume") task.multipart=true;
     if(j.contains("owner") && j["owner"].is_string() && !j["owner"].get_ref<const std::string&>().empty()) task.owner=j["owner"].get<std::string>();
     const auto& next_path=task.name.empty()?path:task.path;
-    if(task.path==next_path && task.status==status && task.waiting_reason==reason &&
+    if(task.path==next_path && task.status==status && task.waiting_reason==reason && task.error==error && task.error_kind==error_kind &&
        task.outputs==outputs && task.timestamp==timestamp && task.has_timestamp==has_timestamp) return;
     task.path=next_path;
     task.status=std::move(status); task.waiting_reason=std::move(reason);
+    task.error=std::move(error); task.error_kind=std::move(error_kind);
     task.outputs=std::move(outputs); task.timestamp=timestamp; task.has_timestamp=has_timestamp;
     mark_changed(key); task.sequence=sequence_;
 }
@@ -859,17 +877,34 @@ Json project_task(const std::wstring& key,const Task& t,const RootIndex& roots,
     const auto& label=t.waiting_reason.empty()?t.status:t.waiting_reason;
     auto found=translated_statuses.find(label);
     if(found==translated_statuses.end()) found=translated_statuses.emplace(label,tr(label,language)).first;
+    const auto& status_text=found->second; // References survive error-type cache rehashes below.
+    Json parts=Json::array();
+    if(t.multipart) {
+        parts.get_ref<Json::array_t&>().reserve(t.members.size());
+        for(auto& member:t.members) parts.push_back(member.filename);
+    }
+    std::string error_type;
+    if(!t.error.empty() || !t.error_kind.empty()) {
+        auto key="taskError_"+(t.error_kind.empty()?std::string("unknown"):t.error_kind);
+        auto type=translated_statuses.find(key);
+        if(type==translated_statuses.end()) {
+            auto text=tr(key,language);
+            type=translated_statuses.emplace(key,text==key?tr("taskError_unknown",language):std::move(text)).first;
+        }
+        error_type=type->second;
+    }
     // The logical archive name can omit suffixes; display the original filename.
     return {{"id",utf8(key)},{"name",cache.filename},{"directory",cache.directory},
-        {"path",t.path},{"root",indexed_root(path_key(wide(t.path)),roots)},{"status",status},{"statusText",found->second},{"time",cache.time},
-        {"statusTone",tone},{"outputs",t.outputs},{"sortTimestamp",t.timestamp},{"sortSequence",t.sequence}};
+        {"path",t.path},{"root",indexed_root(path_key(wide(t.path)),roots)},{"status",status},{"statusText",status_text},{"time",cache.time},
+        {"statusTone",tone},{"parts",std::move(parts)},{"error",t.error},{"errorType",std::move(error_type)},
+        {"outputs",t.outputs},{"sortTimestamp",t.timestamp},{"sortSequence",t.sequence}};
 }
 bool task_matches(const Task& t,const RootIndex& roots,const View& v,
     const std::wstring& folded_query) {
     if(t.status.empty() || (!v.task_status.empty() && t.status!=v.task_status) ||
         (!v.task_root.empty() && indexed_root(path_key(wide(t.path)),roots)!=v.task_root)) return false;
     if(contains_folded(t.path,folded_query) || contains_folded(t.name,folded_query)) return true;
-    return std::any_of(t.members.begin(),t.members.end(),[&](const auto& member){return contains_folded(utf8(member),folded_query);});
+    return std::any_of(t.members.begin(),t.members.end(),[&](const auto& member){return contains_folded(utf8(member.key),folded_query);});
 }
 }
 Json task_rows(const EventLog& log,const WatchRoots& roots,const View& v,const std::string& language,

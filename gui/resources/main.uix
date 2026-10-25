@@ -65,6 +65,7 @@ export default {
     showThemeSetting() { return !this.configCategory&&this.matchesConfig([this.texts.theme,this.texts.system,this.texts.light,this.texts.dark].join(' ')); },
   },
   methods: {
+    inlineTaskError(error) { return error.replace(/[\r\n]+/g,' '); },
     matchesConfig(text) { return !this.configQuery.trim()||text.toLowerCase().includes(this.configQuery.trim().toLowerCase()); },
     configText(f) {
       let t=this.texts,d=this.drafts[f.id]||f,parts=[f.label,f.description,f.categoryLabel,...f.options.map(o=>o.label)];
@@ -665,6 +666,13 @@ export default {
   .dark .taskname:hover { color:#60cdff; }
   .task-meta { align-items:flex-end; }
   .task-meta .time { flex-shrink:0; white-space:nowrap; }
+  .task-details { gap:4px; }
+  .task-chips { flex-wrap:wrap; gap:4px; align-items:flex-start; }
+  .task-chip { max-width:100%; flex-shrink:0; padding:3px 8px; border-radius:4px; font-size:12px; white-space:nowrap; user-select:text; }
+  .light .volume-chip { color:#005a9e; background:#e5f1fb; }
+  .dark .volume-chip { color:#75b6e7; background:#243b50; }
+  .light .error-chip { color:#a4262c; background:#fde7e9; }
+  .dark .error-chip { color:#ff99a4; background:#442726; }
   .status { font-size:14px; font-weight:600; padding:4px 10px; border-radius:4px; flex-shrink:0; white-space:nowrap; }
   .light .status-success { color:#0f6b35; background:#dff6dd; }
   .dark .status-success { color:#6ccb5f; background:#263c28; }
@@ -823,6 +831,15 @@ export default {
         <ScrollView id="taskListScroll"><div id="taskBody" class="column">
           <VirtualList id="taskItems" class="column" estimated-height="68px" immutable-items="true"><div v-for="t in tasks.rows" :key="t.id" :id="'task-'+t.id" :class="'task '+appearance">
             <div class="row"><button :id="'taskName-'+t.id" class="taskname" @click="send('openTask',{task:t})">{{ t.name }}</button><div class="spacer"/><label class="status" :class="'status-'+t.statusTone">{{ t.statusText }}</label></div>
+            <div v-if="t.parts.length||t.errorType||t.error" class="column task-details">
+              <div v-show="t.parts.length" :id="'taskParts-'+t.id" class="row task-chips">
+                <label v-for="(part,i) in t.parts" :key="i" :id="'taskPart-'+t.id+'-'+i" class="task-chip volume-chip">{{ part }}</label>
+              </div>
+              <div v-show="t.errorType||t.error" :id="'taskErrors-'+t.id" class="row task-chips">
+                <label v-show="t.errorType" :id="'taskErrorType-'+t.id" class="task-chip error-chip">{{ texts.taskErrorType }}{{ t.errorType }}</label>
+                <label v-show="t.error" :id="'taskErrorMessage-'+t.id" class="task-chip error-chip">{{ texts.taskErrorMessage }}{{ inlineTaskError(t.error) }}</label>
+              </div>
+            </div>
             <div class="row task-meta"><label :id="'taskRoot-'+t.id" class="muted fill" :ellipsis-start="true">{{ texts.taskFolder }}{{ t.directory }}</label><label class="time">{{ t.time }}</label></div>
           </div>
           </VirtualList>
