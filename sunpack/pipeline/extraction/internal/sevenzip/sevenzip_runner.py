@@ -964,8 +964,6 @@ class SevenZipRunner:
             pending_result: subprocess.CompletedProcess | None = None
             pending_payload: dict[str, Any] | None = None
             cancelled = False
-            retries = 0
-            max_retries = max(1, int(self.process_config.get("backpressure_retries", 120) or 120))
             payload_text = json.dumps(prepared_job, ensure_ascii=False, separators=(",", ":"))
 
             def complete(value: subprocess.CompletedProcess) -> None:
@@ -993,7 +991,7 @@ class SevenZipRunner:
                     on_error(f"native worker retry failed: {exc}")
 
             def on_line(line: str, value: dict[str, Any]) -> bool:
-                nonlocal pending_result, pending_payload, retries
+                nonlocal pending_result, pending_payload
                 if value:
                     value.setdefault("worker_epoch", worker.worker_epoch)
                 if value and value.get("type") == "progress":
@@ -1012,9 +1010,7 @@ class SevenZipRunner:
                         and isinstance(pending_payload, dict)
                         and pending_payload.get("retryable")
                         and pending_payload.get("native_status") == "backpressure"
-                        and retries < max_retries
                     ):
-                        retries += 1
                         pending_result = None
                         pending_payload = None
                         worker.queue_capacity.park(
@@ -1158,15 +1154,10 @@ class SevenZipRunner:
             progress_events = ProgressHistory()
             pending_result: subprocess.CompletedProcess | None = None
             pending_result_payload: dict[str, Any] | None = None
-            backpressure_retries = 0
-            max_backpressure_retries = max(
-                1,
-                int(self.process_config.get("backpressure_retries", 120) or 120),
-            )
             payload = json.dumps(prepared_job, ensure_ascii=False, separators=(",", ":"))
 
             def on_line(line: str, payload_value: dict[str, Any]) -> bool:
-                nonlocal pending_result, pending_result_payload, backpressure_retries
+                nonlocal pending_result, pending_result_payload
                 if payload_value:
                     payload_value.setdefault("worker_epoch", worker.worker_epoch)
                 if payload_value and payload_value.get("type") == "progress":
@@ -1183,9 +1174,7 @@ class SevenZipRunner:
                             isinstance(pending_result_payload, dict)
                             and pending_result_payload.get("retryable")
                             and pending_result_payload.get("native_status") == "backpressure"
-                            and backpressure_retries < max_backpressure_retries
                         ):
-                            backpressure_retries += 1
                             pending_result = None
                             pending_result_payload = None
 
