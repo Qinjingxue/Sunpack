@@ -8,7 +8,6 @@ from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import wor
 from sunpack.core.i18n import I18nContext
 from sunpack.core.support.archive_error_signals import (
     has_archive_damage_signals,
-    has_transient_system_signals,
     looks_like_split_archive_name,
     normalize_error_text,
 )
@@ -34,19 +33,28 @@ def should_retry_extract_failure(
     if has_archive_damage_signals(err_lower):
         return False
 
-    if has_transient_system_signals(err_lower):
-        return True
-
     if not run_result:
         return False
 
-    code = run_result.returncode
-    if code in (-100, -101, -102, 8):
-        return True
-    if code is not None and code < 0:
+    # Access denied, malformed requests and generic negative exit codes are
+    # not proof of a temporary condition. Retrying those indefinitely would
+    # conceal the real failure behind a perpetual worker restart loop.
+    recoverable_signals = (
+        "sharing violation", "being used by another process",
+        "process cannot access the file", "resource temporarily unavailable",
+        "too many open files", "device is not ready", "disk full",
+        "no space", "not enough space", "write error",
+    )
+    if any(signal in err_lower for signal in recoverable_signals):
         return True
 
-    return False
+    diagnostics = getattr(run_result, "worker_diagnostics", None)
+    process_failure = diagnostics.get("process_failure") if isinstance(diagnostics, dict) else None
+    kind = str(process_failure.get("failure_kind") or "") if isinstance(process_failure, dict) else ""
+    if kind in {"process_io", "worker_lost", "process_signal"}:
+        return True
+    # Legacy synthetic transport failures have no finer structured metadata.
+    return run_result.returncode in {-101, -102}
 
 
 def classify_extract_failure(
