@@ -2,6 +2,8 @@ from pathlib import Path
 import asyncio
 import io
 
+import pytest
+
 import sunpack.pipeline.coordinator.engine as engine_module
 from sunpack.pipeline.coordinator.engine import PipelineEngine
 from sunpack.core.config.schema import normalize_config
@@ -99,7 +101,6 @@ def test_sunpack_payload_recurses_across_concurrent_origins(tmp_path):
         leaf = next(item for item in response.summary.target_results if item is not outer)
         assert (Path(leaf.output_dir) / "payload.bin").read_bytes() == payload
         assert not (Path(leaf.output_dir) / ".sunpack").exists()
-
 
 
 @pytest.mark.parametrize("origin", ["foreground", "watch"])
