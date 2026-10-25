@@ -495,7 +495,10 @@ fn start_service() -> io::Result<()> {
             }
             return Err(io::Error::new(
                 io::ErrorKind::Other,
-                format!("SunPack Watch Broker stopped before RUNNING (Win32 exit {})", status.dwWin32ExitCode),
+                format!(
+                    "SunPack Watch Broker stopped before RUNNING (Win32 exit {})",
+                    status.dwWin32ExitCode
+                ),
             ));
         }
         thread::sleep(Duration::from_millis(25));
