@@ -10,6 +10,7 @@ from sunpack.core.contracts.extraction import ExtractionResult
 from sunpack.core.contracts.verification import (
     DECISION_ACCEPT_PARTIAL,
     DECISION_FAIL,
+    DECISION_RETRY_EXTRACT,
     VerificationResult,
 )
 from sunpack.core.i18n import I18nContext
@@ -106,3 +107,21 @@ def test_container_structure_extraction_failure_is_not_proven_content_loss():
     verification = VerificationResult(decision_hint=DECISION_FAIL)
 
     assert archive_job._proves_content_loss(result, verification) is False
+
+
+def test_verification_retry_hint_is_a_failure_not_a_second_extraction(monkeypatch, tmp_path):
+    verification = VerificationResult(decision_hint=DECISION_RETRY_EXTRACT)
+    monkeypatch.setattr(archive_job, "write_extraction_result", lambda *_args: None)
+    monkeypatch.setattr(archive_job, "verify_and_project", lambda *_args: verification)
+    cleanup_calls = []
+    monkeypatch.setattr(archive_job, "cleanup_output_for_retry", lambda *a, **k: cleanup_calls.append((a, k)))
+
+    executor = _executor(allow_partial=False, retry_on_failure=True)
+    task = SimpleNamespace(runtime={})
+    result = ExtractionResult(success=True, out_dir=str(tmp_path / "out"))
+    outcome = _finish_first_attempt(executor, task, result)
+
+    assert outcome.verification is verification
+    assert outcome.attempts == 1
+    assert outcome.outcome_kind.value == "failure"
+    assert cleanup_calls == []
