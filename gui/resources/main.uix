@@ -666,7 +666,7 @@ export default {
   .dark .taskname:hover { color:#60cdff; }
   .task-meta { align-items:flex-end; }
   .task-meta .time { flex-shrink:0; white-space:nowrap; }
-  .task-details { gap:4px; }
+  .task-details { gap:4px; padding-bottom:4px; }
   .task-chips { flex-wrap:wrap; gap:4px; align-items:flex-start; }
   .task-chip { max-width:100%; flex-shrink:0; padding:3px 8px; border-radius:4px; font-size:12px; white-space:nowrap; user-select:text; }
   .light .volume-chip { color:#005a9e; background:#e5f1fb; }
