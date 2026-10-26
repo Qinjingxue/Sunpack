@@ -168,3 +168,24 @@ def test_failure_evidence_contract(subtests):
                 assert failure.details["missing_volume_name"] == "payload.7z.003"
             if payload and payload.get("missing_volume_suspected") and payload.get("damaged"):
                 assert failure.details["missing_volume_confirmed"] is False
+
+
+def test_generic_worker_exit_does_not_hide_archive_header_damage():
+    completed = attach_worker_diagnostics(
+        subprocess.CompletedProcess(["worker"], 2, "", "Headers Error")
+    )
+    assert completed.worker_diagnostics["process_failure"]["failure_kind"] == "process_exit"
+    failure = classify_extract_failure(completed, completed.stderr, archive="broken.zip")
+    assert failure.kind is FailureKind.DAMAGED
+    assert failure.message == "Archive is damaged"
+
+
+def test_generic_worker_exit_retains_process_details_without_archive_evidence():
+    completed = attach_worker_diagnostics(
+        subprocess.CompletedProcess(["worker"], 8, "", "operation failed")
+    )
+    failure = classify_extract_failure(completed, completed.stderr, archive="unknown.zip")
+    assert failure.kind is FailureKind.PROCESS_ERROR
+    assert failure.details["failure_kind"] == "process_exit"
+    assert failure.details["failure_stage"] == "worker_exit"
+    assert failure.details["message"] == "operation failed"
