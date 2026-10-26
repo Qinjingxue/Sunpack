@@ -85,6 +85,17 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+      - name: Upload GUI integration runtime
+        uses: actions/upload-artifact@v7
+        with:
+          name: sunpack-gui-runtime-ci-x64
+          path: |
+            tools/7z.exe
+            tools/7z.dll
+            tools/sunpack_sevenzip_worker.exe
+          if-no-files-found: error
+          retention-days: 1
+
       - name: Run acceptance tests
         shell: pwsh
         run: |
@@ -195,6 +206,21 @@ jobs:
         with:
           name: sunpack-gui-test-ci-x64
           path: .cache/gui-x64/Release
+
+      - name: Download GUI integration runtime
+        uses: actions/download-artifact@v8
+        with:
+          name: sunpack-gui-runtime-ci-x64
+          path: tools
+
+      - name: Verify GUI integration runtime
+        shell: pwsh
+        run: |
+          foreach ($file in @('tools/7z.exe', 'tools/7z.dll', 'tools/sunpack_sevenzip_worker.exe')) {
+            if (-not (Test-Path -LiteralPath $file -PathType Leaf)) {
+              throw "Missing GUI integration runtime: $file"
+            }
+          }
 
       - name: Run cross-language GUI integration tests
         shell: pwsh

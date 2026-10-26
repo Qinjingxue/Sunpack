@@ -18,7 +18,7 @@
 namespace sunpack::sevenzip
 {
     // 纯采样器：每次 tick 直接从 registry 拉仍有 affected job 的 blocked volumes，不维护自己的 membership，
-    // 不缓存、不 re-arm；全部水位规则在 gate.poll() 里（monitor 不做任何比较）。
+    // 不缓存、不 re-arm；只采样可用空间，发放试探许可由 gate.poll() 决定。
     //
     // tick() 必须由 controller_loop 在 executor mutex_ 之外调用：它会取 registry mutex_ 并
     // 可能执行一次很慢的 GetDiskFreeSpaceExW（离线 UNC / 坏盘可能卡几秒），放在 mutex_ 内
@@ -117,8 +117,8 @@ namespace sunpack::sevenzip
                 if (!gate.query_free_bytes(&free_bytes, &total_bytes))
                 {
                     // 卷暂时不可查询（拔盘 / UNC 断开 / 权限变化 / query_root 未解析）：
-                    // query_free_bytes 已撤销任何在途 probe；这里保留诊断并等待下一次成功采样
-                    // 重新建立 watermark，绝不直接转 Ready。
+                    // query_free_bytes 已撤销任何在途 probe；保留诊断并等待下一次
+                    // 成功且可用空间大于 0 的采样，绝不直接转 Ready。
                     const unsigned long error = gate.last_query_error();
                     gate.note_query_failure(error);
                     maybe_emit_status(state, 0, false, error, now);
