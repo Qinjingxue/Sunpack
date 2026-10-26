@@ -137,6 +137,21 @@ fn enrich_tar_semantics(
         let record = match record {
             Ok(record) => record,
             Err(error) => {
+                if error.kind() == io::ErrorKind::OutOfMemory {
+                    d.set_item("error", "analysis_resource_limit")?;
+                    d.set_item("structure_status", "incomplete")?;
+                    d.set_item("structure_validation_complete", false)?;
+                    d.set_item("walk_complete", false)?;
+                    d.set_item("entry_walk_ok", false)?;
+                    d.set_item("boundary_exact", false)?;
+                    d.set_item("segment_end", d.py().None())?;
+                    d.set_item("boundary_confidence", "none")?;
+                    d.set_item("integrity_validation_complete", false)?;
+                    d.set_item("integrity_status", "deferred")?;
+                    // A retained-metadata budget cannot prove corruption.
+                    finish_fields(d, TAR_FIELDS)?;
+                    return Ok(());
+                }
                 walk_error = if error.kind() == io::ErrorKind::UnexpectedEof {
                     "member_payload_out_of_range"
                 } else {

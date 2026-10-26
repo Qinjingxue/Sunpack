@@ -1200,36 +1200,59 @@ fn inspect_bzip2(
 }
 
 fn read_vli(data: &[u8], cursor: &mut usize) -> Option<u64> {
-    let mut value = 0u64;
-    let mut shift = 0usize;
-    loop {
-        let byte = *data.get(*cursor)?;
-        *cursor += 1;
-        if shift >= 63 || (shift > 0 && byte == 0) {
-            return None;
-        }
-        value |= ((byte & 0x7f) as u64) << shift;
-        if byte & 0x80 == 0 {
-            return Some(value);
-        }
-        shift += 7;
+    crate::scan::compression_stream::read_vli_slice(data, cursor).ok()
+}
+
+struct XzIndexRecords<'a> {
+    data: &'a [u8],
+    start: usize,
+    count: u64,
+    unpadded: u64,
+    uncompressed: u64,
+    padded: u64,
+}
+
+impl XzIndexRecords<'_> {
+    fn iter(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
+        let mut cursor = self.start;
+        (0..self.count).map(move |_| {
+            // The immutable record slice was validated when building totals.
+            (
+                read_vli(self.data, &mut cursor).unwrap(),
+                read_vli(self.data, &mut cursor).unwrap(),
+            )
+        })
     }
 }
 
-fn xz_index_records(data: &[u8], cursor: &mut usize, count: u64) -> Option<Vec<(u64, u64)>> {
-    // Each record needs at least two VLIs. Never allocate or iterate according
-    // to an untrusted count that cannot fit before the Index CRC.
+fn xz_index_records<'a>(
+    data: &'a [u8],
+    cursor: &mut usize,
+    count: u64,
+) -> Option<XzIndexRecords<'a>> {
     if count > (data.len().saturating_sub(*cursor) / 2) as u64 {
         return None;
     }
-    let mut records = Vec::new();
+    let mut records = XzIndexRecords {
+        data,
+        start: *cursor,
+        count,
+        unpadded: 0,
+        uncompressed: 0,
+        padded: 0,
+    };
     for _ in 0..count {
         let unpadded = read_vli(data, cursor)?;
         let uncompressed = read_vli(data, cursor)?;
         if unpadded == 0 {
             return None;
         }
-        records.push((unpadded, uncompressed));
+        records.unpadded = records.unpadded.checked_add(unpadded)?;
+        records.uncompressed = records.uncompressed.checked_add(uncompressed)?;
+        records.padded = records
+            .padded
+            .checked_add(unpadded)?
+            .checked_add((4 - unpadded % 4) % 4)?;
     }
     Some(records)
 }
@@ -1319,12 +1342,16 @@ mod xz_bounds_tests {
 
     #[test]
     fn index_count_and_records_are_bounded_by_available_bytes() {
+        let mut largest_vli = [0xff; 9];
+        largest_vli[8] = 0x7f;
+        assert_eq!(read_vli(&largest_vli, &mut 0), Some((1 << 63) - 1));
+        assert_eq!(read_vli(&[0xff; 9], &mut 0), None);
         assert!(xz_index_records(&[1, 1], &mut 0, 1 << 56).is_none());
         assert!(xz_index_records(&[1, 0x80], &mut 0, 1).is_none());
         assert!(xz_index_records(&[0, 0], &mut 0, 1).is_none());
         assert!(xz_index_records(&[1, 1], &mut 3, 1).is_none());
         assert_eq!(
-            xz_index_records(&[12, 3, 16, 5], &mut 0, 2),
+            xz_index_records(&[12, 3, 16, 5], &mut 0, 2).map(|r| r.iter().collect::<Vec<_>>()),
             Some(vec![(12, 3), (16, 5)])
         );
     }
@@ -1542,20 +1569,17 @@ fn inspect_xz(py: Python<'_>, path: &str, header: &[u8], file_size: u64) -> PyRe
         .and_then(|count| py.detach(|| xz_index_records(index_data, &mut index_cursor, count)))
         .unwrap_or_else(|| {
             damage_flags.push("xz_index_bad");
-            Vec::new()
+            XzIndexRecords {
+                data: &[],
+                start: 0,
+                count: 0,
+                unpadded: 0,
+                uncompressed: 0,
+                padded: 0,
+            }
         });
-    let (unpadded_total, uncompressed_total) = py.detach(|| {
-        records
-            .iter()
-            .fold((0u64, 0u64), |(unpadded, uncompressed), r| {
-                (
-                    unpadded.saturating_add(r.0),
-                    uncompressed.saturating_add(r.1),
-                )
-            })
-    });
-    d.set_item("index.records.unpadded_size", unpadded_total)?;
-    d.set_item("index.records.uncompressed_size", uncompressed_total)?;
+    d.set_item("index.records.unpadded_size", records.unpadded)?;
+    d.set_item("index.records.uncompressed_size", records.uncompressed)?;
     d.set_item("index.padding", index_crc_pos.saturating_sub(index_cursor))?;
     if index_crc_pos + 4 <= data.len() && index_start <= index_crc_pos {
         let stored = u32_le(&data, index_crc_pos);
@@ -1570,12 +1594,7 @@ fn inspect_xz(py: Python<'_>, path: &str, header: &[u8], file_size: u64) -> PyRe
         }
     }
 
-    let padded_blocks = records.iter().fold(0u64, |total, (size, _)| {
-        total
-            .saturating_add(*size)
-            .saturating_add((4 - size % 4) % 4)
-    });
-    let mut block_cursor = index_start.saturating_sub(padded_blocks as usize);
+    let mut block_cursor = index_start.saturating_sub(records.padded as usize);
     let mut block_count = 0usize;
     let mut total_compressed = 0u64;
     let mut total_padding = 0usize;
@@ -1583,7 +1602,7 @@ fn inspect_xz(py: Python<'_>, path: &str, header: &[u8], file_size: u64) -> PyRe
     let check_size = xz_check_size(footer[9] & 0x0f);
     let mut first_header = None;
     py.detach(|| {
-        for (unpadded, expected_uncompressed) in &records {
+        for (unpadded, expected_uncompressed) in records.iter() {
             if block_cursor >= index_start {
                 break;
             }
@@ -1609,7 +1628,7 @@ fn inspect_xz(py: Python<'_>, path: &str, header: &[u8], file_size: u64) -> PyRe
                     block_flags,
                     declared_compressed
                         .unwrap_or(unpadded.saturating_sub(header_size as u64 + check_size as u64)),
-                    declared_uncompressed.unwrap_or(*expected_uncompressed),
+                    declared_uncompressed.unwrap_or(expected_uncompressed),
                     stored_header_crc,
                     crc32(&data[block_cursor..block_cursor + header_size - 4]),
                 ));

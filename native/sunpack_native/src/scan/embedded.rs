@@ -105,7 +105,6 @@ static EMBEDDED_PACKED_MATCHER: OnceLock<Option<packed::Searcher>> = OnceLock::n
 const DEFAULT_IOCP_CHUNK_SIZE: usize = 2 * 1024 * 1024;
 const DEFAULT_IOCP_BUFFERS: usize = 2;
 const DEFAULT_IOCP_WORKERS: usize = 4;
-const MAX_ARCHIVE_METADATA_RECORDS: usize = 1_000_000;
 #[cfg(test)]
 const TEST_IOCP_CHUNK_SIZE: usize = 1024 * 1024;
 
@@ -1129,14 +1128,16 @@ impl DirectoryEvidence {
                         entries: 0,
                     };
                 };
-                if path.len() >= MAX_ARCHIVE_METADATA_RECORDS {
-                    return Ok(false);
-                }
+                path.try_reserve(1)
+                    .map_err(|error| io::Error::new(io::ErrorKind::OutOfMemory, error))?;
                 path.push(cursor);
                 source.seek_relative((next - cursor - 46) as i64)?;
                 cursor = next;
             };
             let first_new = self.suffixes.len();
+            self.suffixes
+                .try_reserve(path.len())
+                .map_err(|error| io::Error::new(io::ErrorKind::OutOfMemory, error))?;
             for start in path.into_iter().rev() {
                 suffix = DirectorySuffix {
                     start,
@@ -1233,7 +1234,8 @@ fn validate_zip_eocd(
                 None,
             )
         };
-    if entries_total > MAX_ARCHIVE_METADATA_RECORDS as u64 {
+    // Even an empty central-directory entry occupies 46 bytes.
+    if entries_total > cd_size / 46 {
         return Ok(None);
     }
     if cd_size > directory_end {
@@ -1572,7 +1574,7 @@ fn validate_rar4(
     offset: u64,
 ) -> std::io::Result<Option<EmbeddedCandidate>> {
     let mut cursor = offset + RAR4.len() as u64;
-    for index in 0..MAX_ARCHIVE_METADATA_RECORDS {
+    loop {
         let fixed = read_at(file, cursor, 7)?;
         if fixed.len() != 7 {
             return Ok(None);
@@ -1594,10 +1596,10 @@ fn validate_rar4(
         if header.len() != header_size as usize || crc32(&header[2..]) & 0xffff != stored {
             return Ok(None);
         }
-        if index == 0 && header_type != 0x73 {
+        if cursor == offset + RAR4.len() as u64 && header_type != 0x73 {
             return Ok(None);
         }
-        if index == 0 && flags & 0x0080 != 0 {
+        if cursor == offset + RAR4.len() as u64 && flags & 0x0080 != 0 {
             return Ok(Some(logical_candidate(
                 "rar",
                 offset,
@@ -1626,13 +1628,6 @@ fn validate_rar4(
         }
         cursor = next;
     }
-    Ok(Some(logical_candidate(
-        "rar",
-        offset,
-        None,
-        0.90,
-        "rar4_block_walk_limit_reached",
-    )))
 }
 
 fn validate_rar5(
@@ -1641,7 +1636,7 @@ fn validate_rar5(
     offset: u64,
 ) -> std::io::Result<Option<EmbeddedCandidate>> {
     let mut cursor = offset + RAR5.len() as u64;
-    for index in 0..MAX_ARCHIVE_METADATA_RECORDS {
+    loop {
         let prefix = read_at(file, cursor, 16)?;
         if prefix.len() < 6 {
             return Ok(None);
@@ -1701,7 +1696,7 @@ fn validate_rar5(
         if next > size {
             return Ok(None);
         }
-        if index == 0 && header_type == 4 {
+        if cursor == offset + RAR5.len() as u64 && header_type == 4 {
             return Ok(Some(logical_candidate(
                 "rar",
                 offset,
@@ -1710,7 +1705,7 @@ fn validate_rar5(
                 "rar5_encryption_header_crc",
             )));
         }
-        if index == 0 && header_type != 1 {
+        if cursor == offset + RAR5.len() as u64 && header_type != 1 {
             return Ok(None);
         }
         if header_type == 5 {
@@ -1724,13 +1719,6 @@ fn validate_rar5(
         }
         cursor = next;
     }
-    Ok(Some(logical_candidate(
-        "rar",
-        offset,
-        None,
-        0.90,
-        "rar5_block_walk_limit_reached",
-    )))
 }
 
 // Owned only by this physical-order scan. Facts refer to exact parser-visited
@@ -1771,11 +1759,8 @@ impl FailedSuffixEvidence {
                 // root. A shorter suffix may stay within its own limit.
                 if !matches!(
                     code,
-                    "bzip2_block_count_exceeded"
-                        | "zstd_block_count_exceeded"
-                        | "decoded_size_overflow"
+                    "decoded_size_overflow"
                         | "deflate_block_count_overflow"
-                        | "lz4_walk_budget_exhausted"
                         | "lz4_size_overflow"
                         | "os_error"
                 ) {
@@ -2040,7 +2025,7 @@ fn walk_tar_candidate(
     }
     let mut cursor = offset;
     let mut state = crate::formats::tar::TarState::default();
-    for _ in 0..MAX_ARCHIVE_METADATA_RECORDS {
+    loop {
         // A PAX size inherited from an earlier header cannot disprove a TAR
         // rooted at this cursor with its own fresh metadata context.
         if state.boundary_context_free() {
@@ -2063,25 +2048,31 @@ fn walk_tar_candidate(
                 "member_walk_checksums_and_end_blocks",
             ));
         }
-        let record = state
-            .advance(&current, cursor, size, false, &mut |start, size| {
-                Ok(read_at(file, start, size)?.to_vec())
-            })
-            .map_err(|error| match error.kind() {
-                io::ErrorKind::InvalidData | io::ErrorKind::UnexpectedEof => {
-                    ValidationError::Invalid("tar_metadata_invalid")
-                }
-                _ => ValidationError::Io(error),
-            })?;
+        let record = state.advance(&current, cursor, size, false, &mut |start, size| {
+            Ok(read_at(file, start, size)?.to_vec())
+        });
+        let record = match record {
+            Ok(record) => record,
+            Err(error) if error.kind() == io::ErrorKind::OutOfMemory => {
+                return Ok(logical_candidate(
+                    "tar",
+                    offset,
+                    None,
+                    0.90,
+                    "tar_analysis_resource_limit",
+                ));
+            }
+            Err(error) => {
+                return Err(match error.kind() {
+                    io::ErrorKind::InvalidData | io::ErrorKind::UnexpectedEof => {
+                        ValidationError::Invalid("tar_metadata_invalid")
+                    }
+                    _ => ValidationError::Io(error),
+                })
+            }
+        };
         cursor = record.next;
     }
-    Ok(logical_candidate(
-        "tar",
-        offset,
-        None,
-        0.90,
-        "tar_member_walk_limit_reached",
-    ))
 }
 
 fn tar_padding_end(file: &ManagedReader, mut end: u64, size: u64) -> io::Result<u64> {
@@ -2239,9 +2230,9 @@ mod tests {
     }
 
     // Ordinary LZ4 fixtures cannot catch failed-suffix ownership hiding a real
-    // archive in skipped payload, or a root's frame budget poisoning its peers.
+    // archive in skipped payload, or carving a valid long concatenation twice.
     #[test]
-    fn lz4_failed_suffixes_keep_payload_roots_and_independent_budgets() {
+    fn lz4_suffixes_keep_payload_roots_and_own_long_concatenations() {
         use crate::io::reader::ReaderConfig;
         let empty = b"\x04\x22\x4d\x18\x60\x40\x82\0\0\0\0";
         let mut data = b"carrier".to_vec();
@@ -2270,11 +2261,16 @@ mod tests {
                 },
             );
             let candidates = validate_raw_hits(&source, source.len(), &hits, &[]).unwrap();
-            assert_eq!(candidates.len(), 2);
             assert_eq!(candidates[0].offset, root);
-            assert_eq!(candidates[0].end_offset, None);
-            assert_eq!(candidates[1].offset, inner);
-            assert_eq!(candidates[1].end_offset, Some(inner_end));
+            if root == 0 {
+                assert_eq!(candidates.len(), 1);
+                assert_eq!(candidates[0].end_offset, Some(inner_end));
+            } else {
+                assert_eq!(candidates.len(), 2);
+                assert_eq!(candidates[0].end_offset, None);
+                assert_eq!(candidates[1].offset, inner);
+                assert_eq!(candidates[1].end_offset, Some(inner_end));
+            }
             assert!(source.stats().unwrap().read_bytes <= data.len() as u64 * 3);
         }
     }
@@ -2620,10 +2616,10 @@ mod tests {
     }
 
     #[test]
-    fn failed_suffixes_do_not_share_accumulated_zstd_block_limits() {
+    fn long_zstd_concatenations_keep_their_original_root() {
         use crate::io::reader::ReaderConfig;
-        // Each frame is within the real production limit. The concatenation
-        // exceeds it, but its second root must still survive.
+        // Crossing the old aggregate quota must preserve the complete range
+        // rooted at the first frame, rather than carving only its suffix.
         let mut frame = vec![0x28, 0xb5, 0x2f, 0xfd, 0x20, 0];
         frame.extend(std::iter::repeat([0, 0, 0]).take(500_000).flatten());
         frame.extend_from_slice(&[1, 0, 0]);
@@ -2634,7 +2630,7 @@ mod tests {
         assert_eq!(candidates.len(), 1);
         assert_eq!(
             (candidates[0].offset, candidates[0].end_offset),
-            (second, Some(source.len()))
+            (0, Some(source.len()))
         );
     }
 

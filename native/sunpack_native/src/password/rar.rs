@@ -36,7 +36,6 @@ const RAR4_LONG_BLOCK: u16 = 0x8000;
 const RAR4_FILE_DIRECTORY_MASK: u16 = 0x00e0;
 const RAR4_END_NEXT_VOLUME: u16 = 0x0001;
 /// Plaintext headers walked before deferring to the final verifier.
-const RAR4_MAX_WALK_BLOCKS: usize = 65_536;
 /// One read normally covers a whole RAR4 block header.
 const RAR4_HEADER_READ_HINT: usize = 512;
 
@@ -196,7 +195,7 @@ fn scan_rar4_file_encryption(
 ) -> Result<Rar4EncryptionScan, ReadFault> {
     let mut offset = main.next_offset as u64;
     let mut saw_unprovable_encrypted = false;
-    for _ in 0..RAR4_MAX_WALK_BLOCKS {
+    loop {
         let Some(header) = read_rar4_header_at(prefix, offset, read_at)? else {
             return Ok(Rar4EncryptionScan::Unknown);
         };
@@ -241,7 +240,6 @@ fn scan_rar4_file_encryption(
         };
         offset = next;
     }
-    Ok(Rar4EncryptionScan::Unknown)
 }
 
 /// Return exactly one declared RAR4 block header, or `None` at end of input.
@@ -1070,8 +1068,6 @@ pub(crate) fn resolve_embedded_rar_boundaries(
     offsets: Vec<u64>,
     passwords: Vec<String>,
 ) -> PyResult<Py<PyDict>> {
-    const MAX_EMBEDDED_RAR_BLOCKS: usize = 1_000_000;
-
     let outcome = py.detach(
         move || -> io::Result<(String, Vec<(u64, u64, String)>, Option<u64>)> {
             let reader = ManagedReader::open(&archive_path)?;
@@ -1095,7 +1091,10 @@ pub(crate) fn resolve_embedded_rar_boundaries(
                         &reader,
                         offset,
                         password,
-                        MAX_EMBEDDED_RAR_BLOCKS,
+                        // Every encrypted header consumes at least an IV/salt
+                        // and a cipher block; bound by input, never a quota.
+                        usize::try_from(reader.len().saturating_sub(offset) / 8)
+                            .unwrap_or(usize::MAX),
                     )?
                     else {
                         continue;

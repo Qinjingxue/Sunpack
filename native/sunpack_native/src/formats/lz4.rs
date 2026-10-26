@@ -7,8 +7,6 @@ use std::ffi::c_void;
 use std::io::{Read, Seek, SeekFrom};
 
 pub(crate) const MAGIC: &[u8] = b"\x04\x22\x4d\x18";
-pub(crate) const MAX_RECORDS: usize = 1_000_000;
-const MAX_FRAMES: usize = 65_536;
 
 unsafe extern "C" {
     fn SUNPACK_LZ4_XXH32(input: *const c_void, size: usize, seed: u32) -> u32;
@@ -39,7 +37,7 @@ pub(crate) fn identity(reader: &ManagedReader, offset: u64) -> Result<bool, &'st
     let limit = reader.len();
     let mut input = StructureReader::new(reader, limit, 32);
     let mut cursor = offset;
-    for _ in 0..MAX_FRAMES {
+    loop {
         let magic = input.word(cursor)?;
         if skippable(magic) {
             let size = input.word(cursor + 4)?;
@@ -53,7 +51,6 @@ pub(crate) fn identity(reader: &ManagedReader, offset: u64) -> Result<bool, &'st
         let block = input.word(cursor + header.len as u64)?;
         return Ok(block & 0x7fffffff <= header.block_max);
     }
-    Err("lz4_walk_budget_exhausted")
 }
 
 #[derive(Clone, Debug)]
@@ -205,9 +202,6 @@ fn walk_inner(
             index.end = cursor;
             return Ok(());
         }
-        if index.frames + index.skips >= MAX_FRAMES {
-            return Err("lz4_walk_budget_exhausted");
-        }
         // Share only actual frame nodes. Bytes skipped as payload can contain
         // independent archives and must never inherit this suffix's failure.
         visit(cursor)?;
@@ -237,9 +231,6 @@ fn walk_inner(
             let header = parse_header(input.field(cursor, ((limit - cursor).min(19)) as usize)?)?;
             advance(&mut cursor, header.len as u64, limit)?;
             loop {
-                if index.blocks >= MAX_RECORDS {
-                    return Err("lz4_walk_budget_exhausted");
-                }
                 let value = input.word(cursor)?;
                 advance(&mut cursor, 4, limit)?;
                 if value == 0 {
@@ -511,6 +502,32 @@ mod tests {
         let reader = ManagedReader::from_bytes(data, ReaderConfig::default());
         walk(&reader, start, reader.len())
     }
+    // Small codec fixtures cannot expose archive-wide count quotas. These
+    // compact empty records cross both former quotas without decoding data.
+    #[test]
+    fn long_streams_end_on_structure_instead_of_record_quotas() {
+        let count = 1_000_001;
+        let empty = frame(b"", 0x60, 0x40, None, None);
+        let mut bytes = empty[..empty.len() - 4].to_vec();
+        bytes.extend([0, 0, 0, 0x80].repeat(count));
+        bytes.extend([0; 4]);
+        let end = bytes.len();
+        bytes.extend(b"carrier tail");
+        let parsed = index(bytes, 0);
+        assert!(parsed.complete, "{parsed:?}");
+        assert_eq!((parsed.blocks, parsed.end), (count, end as u64));
+
+        let skip = [0x50, 0x2a, 0x4d, 0x18, 0, 0, 0, 0];
+        let mut bytes = skip.repeat(65_537);
+        bytes.extend(empty.repeat(65_537));
+        let source = ManagedReader::from_bytes(bytes, ReaderConfig::default());
+        assert_eq!(identity(&source, 0), Ok(true));
+        let parsed = walk(&source, 0, source.len());
+        assert!(parsed.complete);
+        assert_eq!((parsed.skips, parsed.frames), (65_537, 65_537));
+        assert!(!walk(&source, 0, source.len() - 1).complete);
+    }
+
     #[test]
     fn empty_raw_block_and_partial_next_skippable_are_distinct() {
         let mut bytes = frame(b"", 0x5c, 0x40, Some(0), None);

@@ -321,26 +321,6 @@ def test_ffi_tray_callback_never_leaks_even_default_handler_failure(monkeypatch)
     assert tray_module._ffi_window_proc(123, 456, 0, 0) == 0
 
 
-def test_tray_stop_timeout_keeps_thread_reference():
-    class Thread:
-        def is_alive(self):
-            return True
-
-    tray = object.__new__(WindowsTrayIcon)
-    tray._thread = Thread()
-    tray._hwnd = None
-    tray._closed = SimpleNamespace(wait=lambda timeout: False)
-
-    try:
-        tray.stop()
-    except RuntimeError as exc:
-        assert "did not close" in str(exc)
-    else:
-        raise AssertionError("stop must report a tray lifecycle timeout")
-
-    assert isinstance(tray._thread, Thread)
-
-
 def test_tray_window_can_be_recreated_without_stale_callback_crash():
     script = textwrap.dedent(
         """

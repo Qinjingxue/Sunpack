@@ -32,7 +32,11 @@ const SEVEN_ZIP_BOUNDARY_ERRORS: &[&str] = &[
     "next_header_out_of_range",
     "invalid_next_header_range",
 ];
-const TAR_BENIGN_ERRORS: &[&str] = &["tar_end_zero_blocks_not_found", "tar_walk_budget_exhausted"];
+const TAR_BENIGN_ERRORS: &[&str] = &[
+    "tar_end_zero_blocks_not_found",
+    "tar_walk_budget_exhausted",
+    "analysis_resource_limit",
+];
 const ZIP_LOCAL_RECOVERY_ERRORS: &[&str] = &[
     "bad_central_directory_signature",
     "archive_offset_underflow",

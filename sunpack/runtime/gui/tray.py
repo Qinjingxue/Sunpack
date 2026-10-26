@@ -218,8 +218,8 @@ class WindowsTrayIcon:
         self.shell32.Shell_NotifyIconW.argtypes = [wintypes.DWORD, ctypes.POINTER(NOTIFYICONDATA)]
         self.shell32.Shell_NotifyIconW.restype = wintypes.BOOL
         self._thread: threading.Thread | None = None
+        self._lifecycle_lock = threading.Lock()
         self._ready = threading.Event()
-        self._closed = threading.Event()
         self._startup_error: BaseException | None = None
         self._hwnd = None
         self._icon_registered = False
@@ -230,35 +230,44 @@ class WindowsTrayIcon:
             raise ctypes.WinError()
 
     def start(self) -> None:
-        if self._thread is not None and self._thread.is_alive():
+        if self._thread is threading.current_thread():
             return
-        self._thread = None
-        self._ready.clear()
-        self._closed.clear()
-        self._startup_error = None
-        self._thread = threading.Thread(target=self._run, name="sunpack-tray", daemon=True)
-        self._thread.start()
-        if not self._ready.wait(timeout=2.0):
-            raise RuntimeError("Tray window did not become ready within 2 seconds.")
-        if self._startup_error is not None:
-            raise RuntimeError("Tray window failed to start.") from self._startup_error
-        if not self._hwnd:
-            raise RuntimeError("Tray window exited before startup completed.")
+        with self._lifecycle_lock:
+            if self._thread is not None and self._thread.is_alive():
+                return
+            self._thread = None
+            self._ready.clear()
+            self._startup_error = None
+            self._thread = threading.Thread(target=self._run, name="sunpack-tray", daemon=True)
+            try:
+                self._thread.start()
+            except BaseException:
+                self._thread = None
+                raise
+            self._ready.wait()
+            if self._startup_error is not None:
+                self._thread.join()
+                raise self._startup_error
+            if not self._hwnd:
+                raise RuntimeError("Tray window exited before startup completed.")
 
     def stop(self) -> None:
-        thread = self._thread
-        if thread is None:
-            return
-        hwnd = self._hwnd
-        if hwnd:
-            if not self.user32.PostMessageW(hwnd, WM_CLOSE, 0, 0):
-                raise ctypes.WinError(ctypes.GetLastError())
-        if not self._closed.wait(timeout=2.0):
-            raise RuntimeError("Tray thread did not close within 2 seconds.")
-        thread.join(timeout=0.1)
-        if thread.is_alive():
-            raise RuntimeError("Tray thread remained alive after its window closed.")
-        self._thread = None
+        # A window callback must never wait on a caller that is joining it.
+        if self._thread is threading.current_thread():
+            raise RuntimeError("Tray thread cannot join itself.")
+        with self._lifecycle_lock:
+            thread = self._thread
+            if thread is None:
+                return
+            # _run always publishes readiness or startup failure. Wait before
+            # reading HWND, including stop racing the creation of the window.
+            self._ready.wait()
+            hwnd = self._hwnd
+            if hwnd:
+                if not self.user32.PostMessageW(hwnd, WM_CLOSE, 0, 0):
+                    raise ctypes.WinError(ctypes.GetLastError())
+            thread.join()
+            self._thread = None
 
     def _run(self) -> None:
         hwnd = None
@@ -298,7 +307,6 @@ class WindowsTrayIcon:
                     with _TRAY_INSTANCES_LOCK:
                         _TRAY_INSTANCES.pop(int(hwnd), None)
             self._hwnd = None
-            self._closed.set()
 
     def _create_window(self):
         hinstance = self.kernel32.GetModuleHandleW(None)

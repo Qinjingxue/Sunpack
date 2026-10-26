@@ -25,29 +25,48 @@ class ClipboardPasswordMonitor:
         self.enabled = bool(enabled)
         self.volume_changed = volume_changed
         self._thread: threading.Thread | None = None
+        self._lifecycle_lock = threading.Lock()
+        self._ready = threading.Event()
+        self._error: BaseException | None = None
         self._stop_event = threading.Event()
         self._hwnd = None
 
     def start(self) -> None:
-        if (not self.enabled and self.volume_changed is None) or self._thread is not None:
+        if self._thread is threading.current_thread():
             return
-        self._stop_event.clear()
-        self._thread = threading.Thread(target=self._run_windows_loop, name="sunpack-clipboard-monitor", daemon=True)
-        self._thread.start()
+        with self._lifecycle_lock:
+            if (not self.enabled and self.volume_changed is None) or self._thread is not None:
+                return
+            self._stop_event.clear()
+            self._ready.clear()
+            self._error = None
+            self._thread = threading.Thread(target=self._run_windows_loop, name="sunpack-clipboard-monitor", daemon=True)
+            try:
+                self._thread.start()
+            except BaseException:
+                self._thread = None
+                raise
 
     def stop(self) -> None:
-        self._stop_event.set()
-        hwnd = self._hwnd
-        if hwnd:
-            try:
-                ctypes.windll.user32.PostMessageW(hwnd, 0x0010, 0, 0)
-            except Exception:
-                pass
-        thread = self._thread
-        if thread is not None:
-            thread.join(timeout=2.0)
-        self._thread = None
-        self._hwnd = None
+        # The owner can be inside a callback while another caller joins it.
+        if self._thread is threading.current_thread():
+            raise RuntimeError("Clipboard thread cannot join itself.")
+        with self._lifecycle_lock:
+            thread = self._thread
+            if thread is None:
+                return
+            self._stop_event.set()
+            self._ready.wait()
+            hwnd = self._hwnd
+            if hwnd:
+                if not ctypes.windll.user32.PostMessageW(hwnd, 0x0010, 0, 0):
+                    error = ctypes.WinError(ctypes.GetLastError())
+                    raise error
+            thread.join()
+            self._thread = None
+            self._hwnd = None
+            if self._error is not None:
+                raise self._error
 
     def _handle_clipboard_update(self) -> None:
         passwords = read_clipboard_passwords()
@@ -58,8 +77,10 @@ class ClipboardPasswordMonitor:
     def _run_windows_loop(self) -> None:
         try:
             _WindowsClipboardLoop(self).run()
-        except Exception:
-            return
+        except BaseException as exc:
+            self._error = exc
+        finally:
+            self._ready.set()
 
 
 class _WindowsClipboardLoop:
@@ -109,7 +130,7 @@ class _WindowsClipboardLoop:
     def run(self) -> None:
         hwnd = self._create_window()
         if not hwnd:
-            return
+            raise ctypes.WinError(ctypes.GetLastError())
         self.monitor._hwnd = hwnd
         listener_registered = False
         try:
@@ -118,7 +139,8 @@ class _WindowsClipboardLoop:
             if self.monitor.enabled:
                 listener_registered = bool(self.user32.AddClipboardFormatListener(hwnd))
                 if not listener_registered and self.monitor.volume_changed is None:
-                    return
+                    raise ctypes.WinError(ctypes.GetLastError())
+            self.monitor._ready.set()
             # Close the startup race between launching the watch service and
             # registering for clipboard notifications.  A copy made during that
             # window does not produce another WM_CLIPBOARDUPDATE, so read the
@@ -131,7 +153,9 @@ class _WindowsClipboardLoop:
             msg = wintypes.MSG()
             while not self.monitor._stop_event.is_set():
                 result = self.user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
-                if result <= 0:
+                if result == -1:
+                    raise ctypes.WinError(ctypes.GetLastError())
+                if result == 0:
                     break
                 self.user32.TranslateMessage(ctypes.byref(msg))
                 self.user32.DispatchMessageW(ctypes.byref(msg))

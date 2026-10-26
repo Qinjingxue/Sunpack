@@ -4,7 +4,6 @@ use std::io;
 
 const BUFFER_SIZE: usize = 64 * 1024;
 const INITIAL_PROBE_BYTES: usize = 256;
-const MAX_RECORDS: usize = 1_000_000;
 const GZIP_MAGIC: &[u8] = b"\x1f\x8b\x08";
 const BZIP2_MAGIC: &[u8] = b"BZh";
 const XZ_MAGIC: &[u8] = b"\xfd7zXZ\x00";
@@ -1329,9 +1328,6 @@ pub(crate) fn validate_bzip2_structure_observed(
                 return invalid("bzip2_orig_ptr_out_of_range");
             }
             total_blocks += 1;
-            if total_blocks > MAX_RECORDS {
-                return invalid("bzip2_block_count_exceeded");
-            }
         }
         streams += 1;
         if cursor.position() + 4 > limit {
@@ -1352,35 +1348,28 @@ pub(crate) fn validate_bzip2_structure_observed(
     })
 }
 
-fn read_vli_slice(data: &[u8], cursor: &mut usize) -> ValidationResult<u64> {
-    let mut value = 0u64;
-    for index in 0..9 {
+pub(crate) fn read_vli_slice(data: &[u8], cursor: &mut usize) -> ValidationResult<u64> {
+    read_vli(|| {
         let byte = *data
             .get(*cursor)
             .ok_or(ValidationError::Invalid("xz_vli_truncated"))?;
         *cursor += 1;
-        if index == 8 && byte > 1 {
-            return invalid("xz_vli_overflow");
-        }
-        value |= u64::from(byte & 0x7f) << (index * 7);
-        if byte & 0x80 == 0 {
-            if index > 0 && byte == 0 {
-                return invalid("xz_vli_noncanonical");
-            }
-            return Ok(value);
-        }
-    }
-    invalid("xz_vli_overflow")
+        Ok(byte)
+    })
 }
 
 fn read_vli_index(cursor: &mut ByteCursor<'_>, hasher: &mut Hasher) -> ValidationResult<u64> {
-    let mut value = 0u64;
-    for index in 0..9 {
+    read_vli(|| {
         let byte = cursor.read_byte()?;
         hasher.update(&[byte]);
-        if index == 8 && byte > 1 {
-            return invalid("xz_vli_overflow");
-        }
+        Ok(byte)
+    })
+}
+
+fn read_vli(mut byte: impl FnMut() -> ValidationResult<u8>) -> ValidationResult<u64> {
+    let mut value = 0u64;
+    for index in 0..9 {
+        let byte = byte()?;
         value |= u64::from(byte & 0x7f) << (index * 7);
         if byte & 0x80 == 0 {
             if index > 0 && byte == 0 {
@@ -1445,22 +1434,23 @@ pub(crate) fn resolve_xz_stream_start(
     if end < minimum_offset.saturating_add(24) {
         return invalid("xz_header_or_footer_missing");
     }
-    read_xz_index_boundary(
-        reader,
-        read_xz_footer(reader, end)?,
-        minimum_offset,
-        |_, _| {},
-    )
+    read_xz_index_boundary(reader, read_xz_footer(reader, end)?, minimum_offset)
+        .map(|index| index.stream_start)
 }
 
-// Both carrier boundary resolution and full block validation use this one
-// index parser. Boundary-only callers retain no per-block records.
-fn read_xz_index_boundary(
-    reader: &ManagedReader,
+struct XzIndex<'a> {
+    stream_start: u64,
+    record_count: u64,
+    records: ByteCursor<'a>,
+}
+
+// Validate the Index once to locate the stream. Full validation replays only
+// the record fields through a bounded cursor; it never retains a record Vec.
+fn read_xz_index_boundary<'a>(
+    reader: &'a ManagedReader,
     footer: XzFooter,
     minimum_offset: u64,
-    mut record: impl FnMut(u64, u64),
-) -> ValidationResult<u64> {
+) -> ValidationResult<XzIndex<'a>> {
     let footer_start = footer.end - 12;
     let index_start = footer_start
         .checked_sub(footer.index_size)
@@ -1469,7 +1459,7 @@ fn read_xz_index_boundary(
         return invalid("xz_backward_size_out_of_range");
     }
     let index_crc_pos = footer_start - 4;
-    let mut index_cursor = ByteCursor::new(reader, index_start, footer_start);
+    let mut index_cursor = ByteCursor::new(reader, index_start, index_crc_pos);
     let mut index_hasher = Hasher::new();
     let indicator = index_cursor.read_byte()?;
     index_hasher.update(&[indicator]);
@@ -1477,13 +1467,16 @@ fn read_xz_index_boundary(
         return invalid("xz_index_indicator_invalid");
     }
     let record_count = read_vli_index(&mut index_cursor, &mut index_hasher)?;
-    if record_count > MAX_RECORDS as u64 {
-        return invalid("xz_index_record_count_exceeded");
+    // Each record needs at least two VLI bytes. This is a physical bound,
+    // checked before walking an untrusted count, rather than a record quota.
+    if record_count > (index_crc_pos - index_cursor.position()) / 2 {
+        return invalid("xz_index_size_mismatch");
     }
+    let records_start = index_cursor.position();
     let mut padded_blocks_size = 0u64;
     for _ in 0..record_count {
         let unpadded = read_vli_index(&mut index_cursor, &mut index_hasher)?;
-        let uncompressed = read_vli_index(&mut index_cursor, &mut index_hasher)?;
+        let _uncompressed = read_vli_index(&mut index_cursor, &mut index_hasher)?;
         if unpadded == 0 {
             return invalid("xz_index_record_invalid");
         }
@@ -1493,7 +1486,9 @@ fn read_xz_index_boundary(
         padded_blocks_size = padded_blocks_size
             .checked_add(padded)
             .ok_or(ValidationError::Invalid("xz_block_size_overflow"))?;
-        record(unpadded, uncompressed);
+    }
+    if index_crc_pos - index_cursor.position() > 3 {
+        return invalid("xz_index_padding_invalid");
     }
     while index_cursor.position() < index_crc_pos {
         let byte = index_cursor.read_byte()?;
@@ -1505,8 +1500,13 @@ fn read_xz_index_boundary(
     if index_cursor.position() != index_crc_pos {
         return invalid("xz_index_size_mismatch");
     }
-    let stored_index_crc = index_cursor.read_array::<4>()?;
-    if u32::from_le_bytes(stored_index_crc.try_into().unwrap()) != index_hasher.finalize() {
+    let stored_index_crc = reader.read_cached_at(index_crc_pos, 4)?;
+    if stored_index_crc.len() != 4 {
+        return invalid("unexpected_end_of_stream");
+    }
+    if u32::from_le_bytes(stored_index_crc.as_slice().try_into().unwrap())
+        != index_hasher.finalize()
+    {
         return invalid("xz_index_crc_bad");
     }
     let stream_span = padded_blocks_size
@@ -1523,7 +1523,11 @@ fn read_xz_index_boundary(
     if header[6..8] != footer.flags {
         return invalid("xz_stream_flags_mismatch");
     }
-    Ok(stream_start)
+    Ok(XzIndex {
+        stream_start,
+        record_count,
+        records: ByteCursor::new(reader, records_start, index_crc_pos),
+    })
 }
 
 pub(crate) fn validate_xz_header(header: &[u8]) -> ValidationResult<()> {
@@ -1570,14 +1574,13 @@ pub(crate) fn validate_xz_structure_exact(
         let index_start = (reverse_end - 12)
             .checked_sub(footer.index_size)
             .ok_or(ValidationError::Invalid("xz_backward_size_out_of_range"))?;
-        let mut records = Vec::new();
-        let stream_start =
-            read_xz_index_boundary(reader, footer, offset, |unpadded, uncompressed| {
-                records.push((unpadded, uncompressed));
-            })?;
+        let mut index = read_xz_index_boundary(reader, footer, offset)?;
+        let stream_start = index.stream_start;
 
         let mut block_cursor = stream_start + 12;
-        for (unpadded, uncompressed) in records {
+        for _ in 0..index.record_count {
+            let unpadded = read_vli(|| index.records.read_byte())?;
+            let uncompressed = read_vli(|| index.records.read_byte())?;
             let size_byte = reader.read_cached_at(block_cursor, 1)?;
             if size_byte.len() != 1 || size_byte[0] == 0 {
                 return invalid("xz_block_header_missing");
@@ -1787,9 +1790,6 @@ pub(crate) fn validate_zstd_structure_observed(
                 }
                 bytes.skip(if block_type == 1 { 1 } else { block_size })?;
                 blocks += 1;
-                if blocks > MAX_RECORDS {
-                    return invalid("zstd_block_count_exceeded");
-                }
                 if last {
                     break;
                 }
@@ -2259,6 +2259,91 @@ mod tests {
         let data = zstd::stream::encode_all(&vec![b'Z'; 1024 * 1024][..], 3).unwrap();
         let source = reader(data[..data.len() - 1].to_vec());
         assert!(validate_zstd_structure(&source, 0, (data.len() - 1) as u64).is_err());
+    }
+
+    // One coarse regression covers the former million-block quotas and the
+    // XZ Index allocation path. Existing codec samples have only a few blocks.
+    #[test]
+    fn long_streams_validate_without_archive_wide_quotas() {
+        const COUNT: usize = 1_000_064; // divisible by 64 for repeated BZip2 CRCs
+        let mut zstd = vec![0x28, 0xb5, 0x2f, 0xfd, 0, 0];
+        zstd.extend([0u8; 3].repeat(COUNT - 1));
+        zstd.extend([1, 0, 0]);
+        let end = zstd.len() as u64;
+        zstd.extend(b"carrier tail");
+        let source = reader(zstd);
+        let result = validate_zstd_structure(&source, 0, source.len()).unwrap();
+        assert_eq!((result.block_count, result.end_offset), (COUNT, end));
+        assert!(validate_zstd_structure(&source, 0, end - 1).is_err());
+
+        // Repeat the actual encoder's block bits. Eight copies are byte
+        // aligned; 64 identical CRCs fold to zero in the combined CRC.
+        let encoded = bzip2::read::BzEncoder::new(&b"B"[..], bzip2::Compression::best())
+            .bytes()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let bits: Vec<u8> = encoded
+            .iter()
+            .flat_map(|b| (0..8).rev().map(move |n| (b >> n) & 1))
+            .collect();
+        let end_magic: Vec<u8> = [0x17u8, 0x72, 0x45, 0x38, 0x50, 0x90]
+            .iter()
+            .flat_map(|b| (0..8).rev().map(move |n| (b >> n) & 1))
+            .collect();
+        let block_end = bits.windows(48).position(|w| w == end_magic).unwrap();
+        let repeated_bits = bits[32..block_end].repeat(8);
+        let group: Vec<u8> = repeated_bits
+            .chunks_exact(8)
+            .map(|b| b.iter().fold(0, |n, b| n * 2 + b))
+            .collect();
+        let mut bzip = b"BZh9".to_vec();
+        bzip.extend(group.repeat(COUNT / 8));
+        bzip.extend([0x17, 0x72, 0x45, 0x38, 0x50, 0x90, 0, 0, 0, 0]);
+        let source = reader(bzip);
+        let result = validate_bzip2_structure(&source, 0, source.len()).unwrap();
+        assert_eq!(
+            (result.block_count, result.end_offset),
+            (COUNT, source.len())
+        );
+
+        let mut xz = vec![0xfd, b'7', b'z', b'X', b'Z', 0, 0, 0];
+        xz.extend(crc32(&xz[6..8]).to_le_bytes());
+        let mut block = vec![2, 0, 0x21, 1, 0, 0, 0, 0];
+        block.extend(crc32(&block).to_le_bytes());
+        block.extend([0; 4]); // LZMA2 end marker followed by three padding bytes
+        xz.extend(block.repeat(COUNT));
+        let index_start = xz.len();
+        xz.push(0);
+        let mut count = COUNT as u64;
+        while count >= 128 {
+            xz.push(count as u8 | 0x80);
+            count >>= 7;
+        }
+        xz.push(count as u8);
+        xz.extend([13, 0].repeat(COUNT));
+        while (xz.len() - index_start) % 4 != 0 {
+            xz.push(0);
+        }
+        xz.extend(crc32(&xz[index_start..]).to_le_bytes());
+        let backward = ((xz.len() - index_start) / 4 - 1) as u32;
+        let mut footer = backward.to_le_bytes().to_vec();
+        footer.extend([0, 0]);
+        xz.extend(crc32(&footer).to_le_bytes());
+        xz.extend(footer);
+        xz.extend(b"YZ");
+        let mut carrier = b"carrier prefix".to_vec();
+        let offset = carrier.len() as u64;
+        carrier.extend(xz);
+        let end = carrier.len() as u64;
+        carrier.extend(b"carrier suffix");
+        let source = reader(carrier);
+        assert_eq!(
+            resolve_xz_stream_start(&source, offset, end).unwrap(),
+            offset
+        );
+        let result = validate_xz_structure_exact(&source, offset, end).unwrap();
+        assert_eq!((result.block_count, result.end_offset), (COUNT, end));
+        assert!(validate_xz_structure_exact(&source, offset, end - 1).is_err());
     }
 
     #[test]

@@ -193,7 +193,10 @@ impl TarState {
         }
         if matches!(kind, b'L' | b'K') {
             if raw_size > MAX_METADATA as u64 {
-                return Err(invalid("GNU name metadata exceeds metadata budget"));
+                return Err(io::Error::new(
+                    io::ErrorKind::OutOfMemory,
+                    "GNU name metadata exceeds metadata budget",
+                ));
             }
             let payload = read_exact(read, start, raw_size as usize)?;
             if kind == b'L' {
@@ -319,7 +322,10 @@ fn pax(
                     && (key.len() + value_len > MAX_METADATA
                         || retained.saturating_sub(old) + value_len > MAX_METADATA)
                 {
-                    return Err(invalid("PAX metadata exceeds metadata budget"));
+                    return Err(io::Error::new(
+                        io::ErrorKind::OutOfMemory,
+                        "PAX metadata exceeds metadata budget",
+                    ));
                 }
                 let value = String::from_utf8(read_exact(read, start + value_start, value_len)?)
                     .map_err(|_| invalid("invalid PAX extended header"))?;
@@ -354,13 +360,10 @@ fn sparse_span(
     let mut span = 0u64;
     let mut extended = header[482] != 0 && header[482] != b'0';
     while extended {
-        if span >= BLOCK * 65536 {
-            return Err(invalid("old GNU sparse extension limit"));
-        }
         let start = offset
             .checked_add(BLOCK)
             .and_then(|n| n.checked_add(span))
-            .filter(|n| n.saturating_add(BLOCK) <= total)
+            .filter(|n| n.checked_add(BLOCK).is_some_and(|end| end <= total))
             .ok_or_else(truncated)?;
         let extension = read_exact(read, start, BLOCK as usize)?;
         if !sparse_map_valid(&extension, 0, 21, &mut previous_end) {
@@ -393,4 +396,49 @@ fn sparse_map_valid(block: &[u8], start: usize, count: usize, previous_end: &mut
         *previous_end = end;
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Generate fixed sparse records on demand: ordinary TAR samples never
+    // cross the old extension quota; no 32 MiB fixture is retained here.
+    #[test]
+    fn sparse_extensions_follow_flags_and_physical_boundaries() {
+        let count = 65_537;
+        let total = (count + 1) * BLOCK;
+        let mut header = [0u8; 512];
+        header[482] = 1;
+        let mut reads = 0;
+        let mut read = |start, size| {
+            assert_eq!(size, 512);
+            reads += 1;
+            let mut block = vec![0u8; size];
+            block[504] = u8::from(start + BLOCK < total);
+            Ok(block)
+        };
+        assert_eq!(
+            sparse_span(&header, 0, total, &mut read).unwrap(),
+            (count * BLOCK, 0)
+        );
+        assert_eq!(reads, count);
+        assert_eq!(
+            sparse_span(&header, 0, BLOCK, &mut |_, _| unreachable!())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+        assert_eq!(
+            sparse_span(
+                &header,
+                u64::MAX - BLOCK,
+                u64::MAX,
+                &mut |_, _| unreachable!()
+            )
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+    }
 }

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import threading
+
 from tests.helpers.passwords import write_password_json
 
 import sunpack.core.passwords.internal.builtin as builtin_module
@@ -49,6 +51,7 @@ def test_windows_clipboard_loop_reads_current_clipboard_after_listener_registrat
         enabled = True
         volume_changed = None
         _stop_event = FakeStopEvent()
+        _ready = threading.Event()
         _hwnd = None
 
         def _handle_clipboard_update(self):

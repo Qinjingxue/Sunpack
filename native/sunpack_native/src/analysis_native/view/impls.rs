@@ -793,7 +793,14 @@ impl AnalysisBinaryView {
                     result.set_item("entries_checked", checked)?;
                     result.set_item("plausible", checked > 0)?;
                     result.set_item("entry_walk_ok", checked > 0)?;
-                    if error.kind() == io::ErrorKind::UnexpectedEof {
+                    if error.kind() == io::ErrorKind::OutOfMemory {
+                        result.set_item("plausible", true)?;
+                        result.set_item("entry_walk_ok", false)?;
+                        result.set_item("error", "analysis_resource_limit")?;
+                        result.set_item("structure_status", "incomplete")?;
+                        result.set_item("structure_validation_complete", false)?;
+                        result.set_item("evidence", PyList::new(py, ["tar:header_checksum"])?)?;
+                    } else if error.kind() == io::ErrorKind::UnexpectedEof {
                         let payload_start = cursor.saturating_add(TAR_BLOCK_SIZE as u64);
                         let fault = ReadFault::short_read(
                             "read_declared_range",

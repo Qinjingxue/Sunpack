@@ -196,6 +196,14 @@ fn parse_seven_zip_streams_info(data: &[u8], pos: &mut usize) -> SevenZipStreams
     }
 }
 
+fn seven_zip_vec<T>(count: usize) -> Result<Vec<T>, String> {
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(count)
+        .map_err(|_| "7z_analysis_resource_limit".to_string())?;
+    Ok(values)
+}
+
 fn parse_seven_zip_pack_info(data: &[u8], pos: &mut usize) -> Result<SevenZipPackInfoAst, String> {
     let pack_pos =
         read_sz_vint(data, pos).ok_or_else(|| "7z PackInfo PackPos is truncated".to_string())?;
@@ -203,9 +211,6 @@ fn parse_seven_zip_pack_info(data: &[u8], pos: &mut usize) -> Result<SevenZipPac
         .ok_or_else(|| "7z PackInfo NumPackStreams is truncated".to_string())?;
     let num_streams = usize::try_from(num_streams_raw.value)
         .map_err(|_| "7z PackInfo stream count is too large".to_string())?;
-    if num_streams > SEVEN_Z_MAX_HEADER_STREAMS {
-        return Err("7z PackInfo stream count exceeds parser limit".to_string());
-    }
     let mut sizes = Vec::new();
     loop {
         let Some(nid) = data.get(*pos).copied() else {
@@ -215,7 +220,10 @@ fn parse_seven_zip_pack_info(data: &[u8], pos: &mut usize) -> Result<SevenZipPac
         match nid {
             SZ_END => break,
             SZ_SIZE => {
-                sizes.clear();
+                if num_streams > data.len().saturating_sub(*pos) {
+                    return Err("7z PackInfo PackSizes is truncated".to_string());
+                }
+                sizes = seven_zip_vec(num_streams)?;
                 for _ in 0..num_streams {
                     let span = read_sz_vint(data, pos)
                         .ok_or_else(|| "7z PackInfo PackSizes is truncated".to_string())?;
@@ -257,7 +265,7 @@ fn parse_seven_zip_unpack_info(
             .value,
     )
     .map_err(|_| "unpack_info_folder_count_too_large".to_string())?;
-    if num_folders == 0 || num_folders > SEVEN_Z_MAX_HEADER_STREAMS {
+    if num_folders == 0 {
         return Err("unpack_info_folder_count_invalid".to_string());
     }
     let external = *data
@@ -267,7 +275,11 @@ fn parse_seven_zip_unpack_info(
     if external != 0 {
         return Err("unpack_info_external_folders_unsupported".to_string());
     }
-    let mut folders = Vec::with_capacity(num_folders);
+    // Each inline Folder needs at least a coder count, flags and method ID.
+    if num_folders > data.len().saturating_sub(*pos) / 3 {
+        return Err("unpack_info_folders_truncated".to_string());
+    }
+    let mut folders = seven_zip_vec(num_folders)?;
     for _ in 0..num_folders {
         folders.push(parse_seven_zip_folder(data, pos)?);
     }
@@ -324,7 +336,7 @@ fn parse_seven_zip_folder(data: &[u8], pos: &mut usize) -> Result<SevenZipFolder
             .value,
     )
     .map_err(|_| "folder_coder_count_too_large".to_string())?;
-    if num_coders == 0 || num_coders > 64 {
+    if num_coders == 0 || num_coders > SEVEN_Z_MAX_FOLDER_CODERS {
         return Err("folder_coder_count_invalid".to_string());
     }
     let mut coders = Vec::with_capacity(num_coders);
@@ -365,9 +377,7 @@ fn parse_seven_zip_folder(data: &[u8], pos: &mut usize) -> Result<SevenZipFolder
         total_out = total_out
             .checked_add(num_out_streams)
             .ok_or_else(|| "folder_output_stream_count_overflow".to_string())?;
-        if total_in > SEVEN_Z_MAX_HEADER_STREAMS as u64
-            || total_out > SEVEN_Z_MAX_HEADER_STREAMS as u64
-        {
+        if total_in > SEVEN_Z_MAX_FOLDER_STREAMS || total_out > SEVEN_Z_MAX_FOLDER_STREAMS {
             return Err("folder_stream_count_exceeds_limit".to_string());
         }
         let properties = if flags & 0x20 != 0 {
@@ -385,7 +395,9 @@ fn parse_seven_zip_folder(data: &[u8], pos: &mut usize) -> Result<SevenZipFolder
                 return Err("folder_coder_properties_truncated".to_string());
             }
             *pos = end;
-            data[start..end].to_vec()
+            let mut properties = seven_zip_vec(size)?;
+            properties.extend_from_slice(&data[start..end]);
+            properties
         } else {
             Vec::new()
         };
@@ -524,9 +536,8 @@ fn parse_seven_zip_substreams_info(
     pos: &mut usize,
     unpack: &SevenZipUnpackInfoAst,
 ) -> Result<SevenZipSubStreamsInfoAst, String> {
-    let mut counts = vec![1usize; unpack.folders.len()];
-    let mut size_values = Vec::new();
-    let mut crc_values = Vec::new();
+    let mut counts = seven_zip_vec(unpack.folders.len())?;
+    counts.resize(unpack.folders.len(), 1usize);
     let mut nid = *data
         .get(*pos)
         .ok_or_else(|| "substreams_info_truncated".to_string())?;
@@ -548,9 +559,19 @@ fn parse_seven_zip_substreams_info(
         .iter()
         .try_fold(0usize, |sum, value| sum.checked_add(*value))
         .ok_or_else(|| "substreams_info_total_count_overflow".to_string())?;
-    if total_streams > SEVEN_Z_MAX_HEADER_FILES as usize {
-        return Err("substreams_info_total_count_exceeds_limit".to_string());
+    let explicit_sizes = counts
+        .iter()
+        .map(|count| count.saturating_sub(1))
+        .sum::<usize>();
+    if nid == SZ_SIZE {
+        if explicit_sizes > data.len().saturating_sub(*pos + 1) {
+            return Err("substreams_info_size_truncated".to_string());
+        }
+    } else if explicit_sizes != 0 {
+        return Err("substreams_info_sizes_missing_for_multiple_streams".to_string());
     }
+    let mut size_values = seven_zip_vec(total_streams)?;
+    let mut crc_values = seven_zip_vec(total_streams)?;
     if nid == SZ_SIZE {
         *pos += 1;
         for (folder, count) in unpack.folders.iter().zip(&counts) {
@@ -656,13 +677,18 @@ fn parse_seven_zip_bool_vector(
         .ok_or_else(|| "7z boolean vector is truncated".to_string())?;
     *pos += 1;
     if all_defined != 0 {
-        return Ok(vec![true; count]);
+        if count > data.len().saturating_sub(*pos) / 4 {
+            return Err("7z CRC values are truncated".to_string());
+        }
+        let mut output = seven_zip_vec(count)?;
+        output.resize(count, true);
+        return Ok(output);
     }
-    let byte_count = (count + 7) / 8;
-    if *pos + byte_count > data.len() {
+    let byte_count = count.div_ceil(8);
+    if byte_count > data.len().saturating_sub(*pos) {
         return Err("7z boolean bitset is truncated".to_string());
     }
-    let mut output = Vec::with_capacity(count);
+    let mut output = seven_zip_vec(count)?;
     for index in 0..count {
         let byte = data[*pos + index / 8];
         output.push((byte & (0x80 >> (index % 8))) != 0);
@@ -672,11 +698,8 @@ fn parse_seven_zip_bool_vector(
 }
 
 fn parse_seven_zip_files_info(data: &[u8], pos: &mut usize) -> Result<(), String> {
-    let num_files = read_sz_vint(data, pos)
+    let _num_files = read_sz_vint(data, pos)
         .ok_or_else(|| "7z FilesInfo file count is truncated".to_string())?;
-    if num_files.value > SEVEN_Z_MAX_HEADER_FILES {
-        return Err("7z FilesInfo file count exceeds parser limit".to_string());
-    }
     loop {
         let Some(nid) = data.get(*pos).copied() else {
             return Err("7z FilesInfo ended before End NID".to_string());
@@ -722,6 +745,72 @@ mod seven_zip_streams_info_tests {
         }
         bytes.push(SZ_END);
         bytes
+    }
+
+    fn number(value: u64) -> Vec<u8> {
+        let mut out = vec![0xff];
+        out.extend(value.to_le_bytes());
+        out
+    }
+
+    // The small graph samples cannot expose whole-archive count quotas or
+    // count-driven allocation from tiny malformed headers. Keep both in one test.
+    #[test]
+    fn archive_counts_follow_header_bytes_while_folder_graphs_stay_bounded() {
+        let folders = 4_097;
+        let mut raw = vec![SZ_UNPACK_INFO, SZ_FOLDER];
+        raw.extend(number(folders));
+        raw.push(0);
+        raw.extend([1, 1, 0].repeat(folders as usize));
+        raw.push(SZ_CODERS_UNPACK_SIZE);
+        raw.extend(vec![0; folders as usize]);
+        raw.extend([SZ_END, SZ_END]);
+        let ast = parse_seven_zip_streams_info(&raw, &mut 0);
+        assert!(ast.diagnostics.is_empty(), "{:?}", ast.diagnostics);
+        assert_eq!(ast.unpack_info.unwrap().folders.len(), folders as usize);
+
+        let mut pack = vec![0];
+        pack.extend(number(folders));
+        pack.push(SZ_SIZE);
+        pack.extend(vec![0; folders as usize]);
+        pack.push(SZ_END);
+        assert_eq!(
+            parse_seven_zip_pack_info(&pack, &mut 0)
+                .unwrap()
+                .sizes
+                .len(),
+            folders as usize
+        );
+
+        let unpack = parse_seven_zip_unpack_info(&one_copy_folder(0, None), &mut 0).unwrap();
+        let mut substreams = vec![SZ_NUM_UNPACK_STREAM];
+        substreams.extend(number(100_001));
+        substreams.push(SZ_SIZE);
+        substreams.extend(vec![0; 100_000]);
+        substreams.push(SZ_END);
+        assert_eq!(
+            parse_seven_zip_substreams_info(&substreams, &mut 0, &unpack)
+                .unwrap()
+                .unpack_size_values
+                .len(),
+            100_001
+        );
+        let mut files = number(100_001);
+        files.push(SZ_END);
+        assert!(parse_seven_zip_files_info(&files, &mut 0).is_ok());
+
+        let mut impossible = vec![SZ_FOLDER];
+        impossible.extend(number(u64::MAX));
+        impossible.push(0);
+        assert!(parse_seven_zip_unpack_info(&impossible, &mut 0).is_err());
+        assert!(parse_seven_zip_bool_vector(&[0], &mut 0, usize::MAX).is_err());
+        assert_eq!(
+            seven_zip_vec::<u64>(usize::MAX).unwrap_err(),
+            "7z_analysis_resource_limit"
+        );
+        assert!(parse_seven_zip_folder(&[65], &mut 0).is_err());
+        // One coder with 65 inputs used to pass the archive-wide 4096 quota.
+        assert!(parse_seven_zip_folder(&[1, 0x11, 0, 65, 1], &mut 0).is_err());
     }
 
     #[test]

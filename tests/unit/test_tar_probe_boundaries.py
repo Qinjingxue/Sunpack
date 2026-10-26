@@ -139,3 +139,35 @@ def test_native_semantics_validate_exact_pax_record_lengths(tmp_path):
 
     assert "pax_header_bad" in raw["damage_flags"]
     assert "invalid:" in raw["pax.header.records"]
+
+
+def test_tar_metadata_budget_preserves_incomplete_analysis_instead_of_damage(tmp_path):
+    # Malformed-PAX tests cannot distinguish a valid oversized metadata value
+    # from corrupt structure. This also checks the shared carrier scan fallback.
+    info = tarfile.TarInfo("././@LongLink")
+    info.type = tarfile.GNUTYPE_LONGNAME
+    info.size = 1024 * 1024 + 1
+    data = info.tobuf(format=tarfile.GNU_FORMAT) + b"x" * info.size
+    data += bytes(-len(data) % 512) + bytes(1024)
+    path = tmp_path / "disguised.bin"
+    path.write_bytes(data)
+    raw = dict(sunpack_native.inspect_tar_header_structure(str(path), 8))
+    assert raw["plausible"] is True
+    assert raw["error"] == "analysis_resource_limit"
+    assert raw["structure_status"] == "incomplete"
+    assert raw["walk_complete"] is False
+    assert raw["segment_end"] is None
+    assert not raw.get("damage_flags")
+    view = AnalysisBinaryView(str(path))
+    try:
+        raw = view.probe_tar(0, 8)
+        assert raw["plausible"] and raw["error"] == "analysis_resource_limit"
+        assert not raw["walk_complete"] and not raw["damage_flags"]
+    finally:
+        view.close()
+    report = ArchiveAnalyzer().analyze(str(path))
+    evidence = next(row for row in report.evidences if row.format == "tar")
+    assert evidence.status == "extractable" and not evidence.details["damage_flags"]
+    result = sunpack_native.scan_embedded_archives(str(path))
+    candidate = next(row for row in result["candidates"] if row["format"] == "tar")
+    assert candidate["offset"] == 0 and candidate["end_offset"] is None
