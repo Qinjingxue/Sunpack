@@ -1,7 +1,8 @@
 //! Output-name projection shared by source manifests and verification.
 //! Keep the Windows mapping and numbered collisions aligned with the worker.
+use crate::io::scratch::SpillMap;
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::io;
 
 /// The worker rejects rooted/drive paths and traversal, but accepts ./ and
 /// repeated separators. Test the raw name before normalizing its components.
@@ -13,15 +14,15 @@ pub(crate) fn unsafe_archive_path(raw: &str) -> bool {
 
 #[derive(Default)]
 pub(crate) struct OutputPathAllocator {
-    used: HashSet<String>,
-    next_numbers: HashMap<String, usize>,
-    directories: HashMap<String, String>,
+    used: SpillMap<()>,
+    next_numbers: SpillMap<usize>,
+    directories: SpillMap<String>,
 }
 
 impl OutputPathAllocator {
-    pub(crate) fn project(&mut self, raw: &str, is_directory: bool) -> String {
+    pub(crate) fn project(&mut self, raw: &str, is_directory: bool) -> io::Result<String> {
         if unsafe_archive_path(raw) {
-            return raw.to_string();
+            return Ok(raw.to_string());
         }
         let clean = windows_output_relative_path(clean_relative_archive_path(raw));
         if is_directory {
@@ -31,9 +32,9 @@ impl OutputPathAllocator {
         }
     }
 
-    pub(crate) fn allocate(&mut self, requested: String) -> String {
+    pub(crate) fn allocate(&mut self, requested: String) -> io::Result<String> {
         let (parent, name) = requested.rsplit_once('/').unwrap_or(("", &requested));
-        let parent = self.allocate_directory(parent);
+        let parent = self.allocate_directory(parent)?;
         let requested = if parent.is_empty() {
             name.to_string()
         } else {
@@ -42,15 +43,15 @@ impl OutputPathAllocator {
         self.allocate_name(requested, false)
     }
 
-    pub(crate) fn allocate_directory(&mut self, requested: &str) -> String {
+    pub(crate) fn allocate_directory(&mut self, requested: &str) -> io::Result<String> {
         let mut missing = Vec::new();
         let mut cursor = requested.trim_end_matches('/');
         let mut parent = loop {
             if cursor.is_empty() {
                 break String::new();
             }
-            if let Some(mapped) = self.directories.get(&crate::path_keys::case_key(cursor)) {
-                break mapped.clone();
+            if let Some(mapped) = self.directories.get(&crate::path_keys::case_key(cursor))? {
+                break mapped;
             }
             let (above, name) = cursor.rsplit_once('/').unwrap_or(("", cursor));
             missing.push((cursor, name));
@@ -62,29 +63,33 @@ impl OutputPathAllocator {
             } else {
                 format!("{parent}/{name}")
             };
-            parent = self.allocate_name(path, true);
+            parent = self.allocate_name(path, true)?;
             self.directories
-                .insert(crate::path_keys::case_key(original), parent.clone());
+                .put(crate::path_keys::case_key(original), parent.clone())?;
         }
-        parent
+        Ok(parent)
     }
 
-    fn allocate_name(&mut self, requested: String, is_directory: bool) -> String {
+    fn allocate_name(&mut self, requested: String, is_directory: bool) -> io::Result<String> {
         let key = crate::path_keys::case_key(&requested);
-        if self.used.insert(key.clone()) {
-            return requested;
+        if self.used.insert_new(key.clone(), ())? {
+            return Ok(requested);
         }
-        let next = self.next_numbers.entry(key).or_insert(1);
+        let mut next = self.next_numbers.get(&key)?.unwrap_or(1);
         let slash = requested.rfind('/').map_or(0, |position| position + 1);
         let dot = requested[slash..]
             .rfind('.')
             .filter(|&position| position > 0 && !is_directory);
         let split = dot.map_or(requested.len(), |position| slash + position);
         loop {
-            let candidate = format!("{}({}){}", &requested[..split], *next, &requested[split..]);
-            *next += 1;
-            if self.used.insert(crate::path_keys::case_key(&candidate)) {
-                return candidate;
+            let candidate = format!("{}({}){}", &requested[..split], next, &requested[split..]);
+            next += 1;
+            if self
+                .used
+                .insert_new(crate::path_keys::case_key(&candidate), ())?
+            {
+                self.next_numbers.put(key, next)?;
+                return Ok(candidate);
             }
         }
     }

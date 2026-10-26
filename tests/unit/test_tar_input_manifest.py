@@ -26,7 +26,7 @@ def test_tar_source_manifest_walks_beyond_probe_budget(tmp_path):
             info.size = 1
             archive.addfile(info, io.BytesIO(payload))
 
-    manifest = archive_input_manifest(_input(path), max_items=1000)
+    manifest = archive_input_manifest(_input(path))
 
     assert manifest.ok is True
     assert manifest.archive_walk_complete is True
@@ -42,7 +42,7 @@ def test_tar_duplicate_members_preserve_history_and_worker_output_names(tmp_path
             info.size = len(payload)
             archive.addfile(info, io.BytesIO(payload))
 
-    manifest = archive_input_manifest(_input(path), max_items=100)
+    manifest = archive_input_manifest(_input(path))
 
     assert manifest.ok is True
     assert manifest.item_count >= 2
@@ -81,7 +81,7 @@ def test_tar_pax_long_path_is_applied_to_target_member(tmp_path):
         second.size = 1
         archive.addfile(second, io.BytesIO(b"2"))
 
-    manifest = archive_input_manifest(_input(path), max_items=100)
+    manifest = archive_input_manifest(_input(path))
 
     assert manifest.ok is True
     assert manifest.expected_names == [long_path, "second.txt"]
@@ -102,7 +102,7 @@ def test_tar_manifest_applies_long_metadata_and_link_output_sizes(tmp_path, tar_
         info.linkname = long_link
         archive.addfile(info)
 
-    manifest = archive_input_manifest(_input(path), max_items=100)
+    manifest = archive_input_manifest(_input(path))
 
     assert manifest.ok is True
     assert manifest.expected_names == [long_name]
@@ -118,11 +118,10 @@ def test_tar_manifest_applies_long_metadata_and_link_output_sizes(tmp_path, tar_
     assert (tmp_path / "gnu-long" / long_name).read_bytes() == long_link.encode("utf-8")
 
 
-def test_truncated_manifest_view_keeps_full_unpacked_size(tmp_path):
+def test_manifest_views_share_full_native_entries_and_unpacked_size(tmp_path):
     from sunpack.core.contracts.extraction import ExtractionResult
     from sunpack.pipeline.verification.archive_input_manifest import (
         archive_input_manifest_for_evidence,
-        configure_archive_input_manifest_cache,
     )
     from sunpack.pipeline.verification.evidence import build_verification_evidence
     from tests.helpers.archive_tasks import make_task_from_descriptor
@@ -137,28 +136,26 @@ def test_truncated_manifest_view_keeps_full_unpacked_size(tmp_path):
         make_task_from_descriptor(_input(path)),
         ExtractionResult(success=True, out_dir=str(tmp_path / "out")),
     )
-    configure_archive_input_manifest_cache(evidence, max_items=1000)
 
-    view = archive_input_manifest_for_evidence(evidence, max_items=10)
+    view = archive_input_manifest_for_evidence(evidence)
 
-    assert view.retained_file_count == 10
-    assert len(view.expected_names) == 10
-    assert view.entries_truncated is True
+    assert view.retained_file_count == 30
+    assert len(view.expected_names) == 30
     assert view.file_count == 30
     assert view.total_unpacked_size == 90
-    full = archive_input_manifest_for_evidence(evidence, max_items=1000)
+    full = archive_input_manifest_for_evidence(evidence)
     assert full.total_unpacked_size == 90
     # Views share the cached Rust entry table instead of copying entries.
     assert full.entries is view.entries
     assert full.retained_file_count == 30
 
 
-def test_tar_manifest_counts_all_files_beyond_retained_entry_limit(tmp_path):
-    # This cap test also exercises metadata after retention and PAX records
-    # split across physical parts; ordinary member-count tests miss both.
+def test_tar_manifest_preserves_all_pax_members_across_parts(tmp_path):
+    # Later metadata and PAX records split across physical parts must both
+    # survive the walk; ordinary member-count tests miss either boundary.
     from sunpack_native import archive_state_tar_manifest_native
 
-    path = tmp_path / "capped.tar"
+    path = tmp_path / "members.tar"
     body = bytearray()
     for index in range(12):
         info = tarfile.TarInfo(f"item-{index:03d}.bin")
@@ -168,20 +165,19 @@ def test_tar_manifest_counts_all_files_beyond_retained_entry_limit(tmp_path):
     body.extend(bytes(1024))
     path.write_bytes(body)
 
-    manifest = archive_input_manifest(_input(path), max_items=5)
+    manifest = archive_input_manifest(_input(path))
 
     assert manifest.file_count == 12
-    assert manifest.retained_file_count == 5
-    assert manifest.entries_truncated is True
+    assert manifest.retained_file_count == 12
     assert manifest.total_unpacked_size == 24
 
     first, second = tmp_path / "part.001", tmp_path / "part.002"
     first.write_bytes(body[:517])
     second.write_bytes(body[517:])
     source = {"entry_path": str(first), "parts": [{"path": str(first)}, {"path": str(second)}]}
-    joined = archive_state_tar_manifest_native(source, max_items=5)
+    joined = archive_state_tar_manifest_native(source)
     assert joined.archive_walk_complete
     assert (joined.file_count, joined.total_unpacked_size) == (12, 24)
     assert joined.entry_page(0, 10) == manifest.entries.entry_page(0, 10)
-    incomplete = archive_state_tar_manifest_native({"entry_path": str(first)}, max_items=5)
+    incomplete = archive_state_tar_manifest_native({'entry_path': str(first)})
     assert not incomplete.archive_walk_complete

@@ -43,11 +43,6 @@ def normalize_recursive_authorization(value: Any) -> dict[str, Any]:
         minimum_ratio = float(config["minimum_archive_byte_ratio"])
     except (TypeError, ValueError) as exc:
         raise ValueError("recursive_authorization thresholds must be numeric") from exc
-    hard_maximum = config["hard_maximum_other_projects"]
-    if isinstance(hard_maximum, bool) or not isinstance(hard_maximum, int):
-        raise ValueError(
-            "recursive_authorization.hard_maximum_other_projects must be an integer"
-        )
     if not math.isfinite(byte_ratio_exponent) or byte_ratio_exponent <= 0.0:
         raise ValueError(
             "recursive_authorization.byte_ratio_exponent must be positive"
@@ -66,16 +61,11 @@ def normalize_recursive_authorization(value: Any) -> dict[str, Any]:
         raise ValueError(
             "recursive_authorization.minimum_archive_byte_ratio must be between 0 and 1"
         )
-    if hard_maximum < 0:
-        raise ValueError(
-            "recursive_authorization.hard_maximum_other_projects must be non-negative"
-        )
     config["byte_ratio_exponent"] = byte_ratio_exponent
     config["project_ratio_exponent"] = project_ratio_exponent
     config["authorization_bias"] = authorization_bias
     config["minimum_authorization_score"] = minimum_score
     config["minimum_archive_byte_ratio"] = minimum_ratio
-    config["hard_maximum_other_projects"] = hard_maximum
     return config
 
 

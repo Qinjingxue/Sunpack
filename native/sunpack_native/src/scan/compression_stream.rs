@@ -1874,17 +1874,6 @@ mod tests {
             cursor.read_exact(usize::MAX).unwrap_err().code(),
             "unexpected_end_of_stream"
         );
-        let source = ManagedReader::from_bytes(
-            vec![0; INITIAL_PROBE_BYTES],
-            ReaderConfig {
-                max_read_bytes: Some(1),
-                ..Default::default()
-            },
-        );
-        assert!(matches!(
-            ByteCursor::new(&source, 0, source.len()).read_array::<3>(),
-            Err(ValidationError::Io(_))
-        ));
     }
 
     // Encoders normally omit optional headers. Exercise CRC byte coverage,
@@ -2032,7 +2021,6 @@ mod tests {
         let source = ManagedReader::from_bytes(
             data,
             ReaderConfig {
-                max_read_bytes: Some(512),
                 ..ReaderConfig::default()
             },
         );

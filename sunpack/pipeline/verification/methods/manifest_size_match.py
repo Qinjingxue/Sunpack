@@ -2,7 +2,6 @@ from sunpack.pipeline.verification.archive_input_manifest import ArchiveInputMan
 from sunpack.pipeline.verification.evidence import VerificationEvidence
 from sunpack.pipeline.verification.methods._archive_output_match import (
     ArchiveOutputCoverage,
-    archive_files_from_names,
     coverage_details,
     coverage_from_native_inventory,
 )
@@ -31,11 +30,10 @@ class ManifestSizeMatchMethod:
     def verify(self, evidence: VerificationEvidence, config: dict) -> VerificationStep:
         input_manifest = archive_input_manifest_for_evidence(
             evidence,
-            max_items=config["max_expected_names"],
         )
         expected_files = _expected_file_count(input_manifest)
         expected_size = _expected_total_size(input_manifest)
-        expected_names = _expected_names(input_manifest)
+        named_count = input_manifest.retained_file_count if input_manifest.ok else 0
         if expected_files <= 0 and expected_size <= 0:
             return VerificationStep(method=self.name, status="skipped")
 
@@ -46,10 +44,10 @@ class ManifestSizeMatchMethod:
         issues: list[VerificationIssue] = []
         content_integrity = _content_integrity_hint(input_manifest)
         name_coverage = None
-        if expected_names:
+        if named_count:
             emit_observations = should_emit_file_observations(evidence, self.name)
             if _identity_worker_inventory(evidence) is not None and not emit_observations:
-                count = len(expected_names)
+                count = named_count
                 name_coverage = ArchiveOutputCoverage(
                     completeness=1.0, file_coverage=1.0, byte_coverage=1.0,
                     expected_files=count, matched_files=count, complete_files=count,
@@ -58,12 +56,12 @@ class ManifestSizeMatchMethod:
                 )
             else:
                 detail_limit = (
-                    min(len(expected_names), 128)
+                    min(named_count, 128)
                     if emit_observations
                     else 0
                 )
                 name_coverage, _ = coverage_from_native_inventory(
-                    archive_files_from_names(expected_names),
+                    input_manifest,
                     output_inventory_for_evidence(evidence),
                     method=self.name,
                     basename_mode="unique",
@@ -77,7 +75,7 @@ class ManifestSizeMatchMethod:
                     code="fail.manifest_named_files_missing",
                     message="Some manifest-named files were not found in extraction output",
                     path=evidence.output_dir,
-                    expected=len(expected_names),
+                    expected=named_count,
                     actual=_coverage_actual(name_coverage, input_manifest),
                 ))
 
@@ -203,11 +201,6 @@ def _content_integrity_hint(input_manifest: ArchiveInputManifest | None = None) 
         return CONTENT_INTEGRITY_VERIFIED_COMPLETE
     return CONTENT_INTEGRITY_UNKNOWN
 
-
-def _expected_names(input_manifest: ArchiveInputManifest | None = None) -> list[str]:
-    if input_manifest is None or not input_manifest.ok:
-        return []
-    return list(input_manifest.expected_names)[:2000]
 
 
 def _expected_file_count(input_manifest: ArchiveInputManifest) -> int:

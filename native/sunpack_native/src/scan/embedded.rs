@@ -1157,14 +1157,9 @@ impl DirectoryEvidence {
         if observed.entries != entries || observed.end > end {
             return Ok(false);
         }
-        if observed.end == end {
-            return Ok(true);
-        }
-        // One optional ZIP directory digital signature belongs to the range.
-        let signature = read_at(file, observed.end, 6)?;
-        Ok(signature.len() == 6
-            && signature.starts_with(b"PK\x05\x05")
-            && observed.end + 6 + u16::from_le_bytes([signature[4], signature[5]]) as u64 == end)
+        crate::formats::zip::central_directory_complete(observed.end, end, |offset, length| {
+            read_at(file, offset, length)
+        })
     }
 }
 
@@ -2214,7 +2209,6 @@ mod tests {
         let source = ManagedReader::from_bytes(
             data,
             ReaderConfig {
-                max_read_bytes: Some(512),
                 ..ReaderConfig::default()
             },
         );
@@ -2256,7 +2250,6 @@ mod tests {
             let source = ManagedReader::from_bytes(
                 data.clone(),
                 ReaderConfig {
-                    max_read_bytes: Some(data.len() as u64 * 3),
                     ..Default::default()
                 },
             );
@@ -2314,7 +2307,6 @@ mod tests {
         let source = ManagedReader::from_bytes(
             data,
             ReaderConfig {
-                max_read_bytes: Some(8192),
                 ..ReaderConfig::default()
             },
         );
@@ -2326,20 +2318,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             expected
         );
-
-        let source = ManagedReader::from_bytes(
-            stream.clone(),
-            ReaderConfig {
-                max_read_bytes: Some(12),
-                ..ReaderConfig::default()
-            },
-        );
-        let mut facts = XzFooterEvidence {
-            ends: &[stream.len() as u64],
-            next_unchecked: 0,
-            valid: BTreeMap::new(),
-        };
-        assert!(validate_xz(&source, source.len(), 0, &mut facts).is_err());
     }
 
     // Equal starts, crossing/removed ranges, anchors and zero-width endpoints
@@ -2591,7 +2569,6 @@ mod tests {
             let source = ManagedReader::from_bytes(
                 data.clone(),
                 ReaderConfig {
-                    max_read_bytes: Some((data.len() as u64 * 3).max(8192)),
                     ..Default::default()
                 },
             );
@@ -2599,17 +2576,6 @@ mod tests {
                 validate_raw_hits(&source, source.len(), &hits, &[])
                     .unwrap_or_else(|error| panic!("{kind}: {error}")),
                 expected,
-                "{kind}"
-            );
-            let source = ManagedReader::from_bytes(
-                data,
-                ReaderConfig {
-                    max_read_bytes: Some(1),
-                    ..Default::default()
-                },
-            );
-            assert!(
-                validate_raw_hits(&source, source.len(), &hits, &[]).is_err(),
                 "{kind}"
             );
         }

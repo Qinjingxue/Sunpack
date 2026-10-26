@@ -165,7 +165,6 @@ pub(crate) trait ByteSource: Send + Sync {
 #[derive(Clone, Debug)]
 pub(crate) struct ReaderConfig {
     pub(crate) cache_bytes: usize,
-    pub(crate) max_read_bytes: Option<u64>,
     pub(crate) max_concurrent_reads: usize,
 }
 
@@ -173,7 +172,6 @@ impl Default for ReaderConfig {
     fn default() -> Self {
         Self {
             cache_bytes: 0,
-            max_read_bytes: None,
             max_concurrent_reads: usize::MAX,
         }
     }
@@ -495,19 +493,10 @@ impl ManagedReader {
         offset: u64,
         read_len: usize,
     ) -> io::Result<Vec<CachedSlice>> {
-        // Check and reserve the budget in one critical section so concurrent
-        // requests sharing this reader cannot all pass the check and overshoot.
+        // Account concurrent reads atomically; IO volume never limits correctness.
         let reserved = read_len as u64;
         {
             let mut inner = self.lock_inner()?;
-            if self
-                .state
-                .config
-                .max_read_bytes
-                .is_some_and(|limit| inner.stats.read_bytes.saturating_add(reserved) > limit)
-            {
-                return Err(io::Error::other("archive analysis read budget exceeded"));
-            }
             inner.stats.read_bytes += reserved;
         }
 
@@ -609,7 +598,7 @@ impl ManagedReader {
     }
 
     fn uses_request_state(&self) -> bool {
-        self.state.config.cache_bytes > 0 || self.state.config.max_read_bytes.is_some()
+        self.state.config.cache_bytes > 0
     }
 }
 
@@ -707,11 +696,10 @@ impl NativeArchiveSession {
         Ok(())
     }
 
-    #[pyo3(signature = (cache_bytes=67108864, max_read_bytes=None, max_concurrent_reads=1))]
+    #[pyo3(signature = (cache_bytes=67108864, max_concurrent_reads=1))]
     fn analysis_view(
         &self,
         cache_bytes: usize,
-        max_read_bytes: Option<u64>,
         max_concurrent_reads: usize,
     ) -> PyResult<crate::analysis_native::AnalysisBinaryView> {
         if self.closed {
@@ -723,7 +711,6 @@ impl NativeArchiveSession {
             path: self.path.clone(),
             reader: self.reader.with_config(ReaderConfig {
                 cache_bytes,
-                max_read_bytes,
                 max_concurrent_reads,
             }),
             closed: false,
@@ -2472,20 +2459,18 @@ mod tests {
     }
 
     #[test]
-    fn request_cache_preserves_budget_and_hit_stats() {
+    fn request_cache_preserves_hit_stats() {
         let path = temp_file("managed_reader_stats", b"abcdefgh");
         let reader = ManagedReader::open_with_config(
             &path,
             ReaderConfig {
                 cache_bytes: 8,
-                max_read_bytes: Some(4),
                 max_concurrent_reads: 1,
             },
         )
         .unwrap();
         assert_eq!(reader.read_at(0, 4).unwrap(), b"abcd");
         assert_eq!(reader.read_at(0, 4).unwrap(), b"abcd");
-        assert!(reader.read_at(4, 1).is_err());
         let stats = reader.stats().unwrap();
         assert_eq!(stats.read_bytes, 4);
         assert_eq!(stats.cache_hits, 1);
@@ -2542,13 +2527,12 @@ mod tests {
     }
 
     #[test]
-    fn probe_reuses_existing_request_window_and_the_same_read_budget() {
+    fn probe_reuses_existing_request_window() {
         let path = temp_file("managed_reader_probe_request", b"abcdefgh");
         let reader = ManagedReader::open_with_config(
             &path,
             ReaderConfig {
                 cache_bytes: BLOCK_SIZE,
-                max_read_bytes: Some(4),
                 max_concurrent_reads: 1,
             },
         )
@@ -2560,7 +2544,6 @@ mod tests {
             panic!("request windows must remain shared");
         };
         assert!(first.shares_backing(&second));
-        assert!(probe.read_at(4, 1).is_err());
         assert_eq!(reader.stats().unwrap().read_bytes, 4);
         assert_eq!(reader.stats().unwrap().cache_hits, 1);
         let _ = std::fs::remove_file(path);
@@ -2573,7 +2556,6 @@ mod tests {
             &path,
             ReaderConfig {
                 cache_bytes: 8,
-                max_read_bytes: Some(4),
                 max_concurrent_reads: 1,
             },
         )
@@ -2588,47 +2570,16 @@ mod tests {
             .unwrap();
         assert_eq!((blocks, retained), (0, 0));
         assert_eq!(&*first, b"abcd");
-        // Resource release must not reset the request's accumulated budget.
-        let error = probe.read_at(4, 1).unwrap_err();
-        assert!(error.to_string().contains("budget"));
         let _ = std::fs::remove_file(path);
     }
 
     #[test]
-    fn probe_reads_reserve_a_shared_budget_atomically() {
-        let reader = ManagedReader::from_bytes(
-            vec![0; 128],
-            ReaderConfig {
-                cache_bytes: 0,
-                max_read_bytes: Some(32),
-                max_concurrent_reads: 4,
-            },
-        );
-        std::thread::scope(|scope| {
-            let jobs: Vec<_> = (0..16)
-                .map(|i| {
-                    let probe = reader.probe_reader();
-                    scope.spawn(move || probe.read_at(i * 4, 4))
-                })
-                .collect();
-            let success = jobs
-                .into_iter()
-                .map(|job| job.join().unwrap())
-                .filter(Result::is_ok)
-                .count();
-            assert_eq!(success, 8);
-        });
-        assert_eq!(reader.stats().unwrap().read_bytes, 32);
-    }
-
-    #[test]
-    fn read_into_preserves_request_cache_and_budget_semantics() {
+    fn read_into_preserves_request_cache_semantics() {
         let path = temp_file("managed_reader_into_stats", b"abcdefgh");
         let reader = ManagedReader::open_with_config(
             &path,
             ReaderConfig {
                 cache_bytes: 8,
-                max_read_bytes: Some(4),
                 max_concurrent_reads: 1,
             },
         )
@@ -2639,7 +2590,6 @@ mod tests {
         buffer.fill(0);
         assert_eq!(reader.read_into_at(0, &mut buffer).unwrap(), 4);
         assert_eq!(&buffer, b"abcd");
-        assert!(reader.read_into_at(4, &mut buffer[..1]).is_err());
         let stats = reader.stats().unwrap();
         assert_eq!(stats.read_bytes, 4);
         assert_eq!(stats.cache_hits, 1);
@@ -2655,7 +2605,6 @@ mod tests {
             &path,
             ReaderConfig {
                 cache_bytes: BLOCK_SIZE,
-                max_read_bytes: Some(8),
                 max_concurrent_reads: 1,
             },
         )
@@ -2689,7 +2638,6 @@ mod tests {
             &path,
             ReaderConfig {
                 cache_bytes: BLOCK_SIZE - 1,
-                max_read_bytes: Some(8),
                 max_concurrent_reads: 1,
             },
         )
@@ -2714,7 +2662,6 @@ mod tests {
             &path,
             ReaderConfig {
                 cache_bytes: BLOCK_SIZE,
-                max_read_bytes: Some(8),
                 max_concurrent_reads: 1,
             },
         )
@@ -2739,7 +2686,6 @@ mod tests {
             &path,
             ReaderConfig {
                 cache_bytes: BLOCK_SIZE,
-                max_read_bytes: Some(8),
                 max_concurrent_reads: 1,
             },
         )
@@ -2822,7 +2768,6 @@ mod tests {
             &paths,
             ReaderConfig {
                 cache_bytes: 16,
-                max_read_bytes: Some(16),
                 max_concurrent_reads: 1,
             },
         )

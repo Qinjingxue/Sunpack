@@ -107,7 +107,7 @@ impl AnalysisBinaryView {
             0 | 1 | 6 | 8 | 9 | 12 | 14 | 93 | 95 | 96 | 98 | 99
         ) {
             result.set_item("error", "unknown_compression_method")?;
-        } else if filename_len == 0 || filename_len > 4096 {
+        } else if filename_len == 0 {
             result.set_item("error", "invalid_filename_length")?;
         } else {
             let header_end = offset
@@ -195,7 +195,6 @@ impl AnalysisBinaryView {
         &self,
         py: Python<'_>,
         eocd_offset: u64,
-        max_cd_entries_to_walk: usize,
         disk_starts: Option<&[u64]>,
     ) -> PyResult<Py<PyDict>> {
         let result = PyDict::new(py);
@@ -471,7 +470,6 @@ impl AnalysisBinaryView {
                 physical_central_offset,
                 effective_central_directory_size,
                 effective_total_entries as usize,
-                max_cd_entries_to_walk,
                 disk_starts.filter(|_| is_multi_disk),
             )
         })?;
@@ -547,14 +545,12 @@ impl AnalysisBinaryView {
         physical_central_offset: u64,
         central_directory_size: u64,
         total_entries: usize,
-        max_entries: usize,
         disk_starts: Option<&[u64]>,
     ) -> PyResult<ZipDirectoryWalk> {
         let mut cursor = physical_central_offset;
         let end = physical_central_offset + central_directory_size;
-        let limit = total_entries.min(max_entries);
         let mut walk = ZipDirectoryWalk::default();
-        for index in 0..limit {
+        for index in 0..total_entries {
             if cursor.saturating_add(46) > end {
                 return Ok(walk.failed(index, false, "central_directory_entry_out_of_range"));
             }
@@ -612,18 +608,19 @@ impl AnalysisBinaryView {
             }
             cursor += entry_size;
         }
-        walk.entries_checked = limit;
-        walk.directory_ok = true;
-        walk.links_ok = true;
+        walk.entries_checked = total_entries;
+        walk.directory_ok =
+            crate::formats::zip::central_directory_complete(cursor, end, |offset, length| {
+                self.read_at_bytes(offset, length)
+            })?;
+        walk.links_ok = walk.directory_ok;
+        if !walk.directory_ok {
+            return Ok(walk.failed(total_entries, false, "central_directory_size_mismatch"));
+        }
         Ok(walk)
     }
 
-    fn walk_tar<'py>(
-        &self,
-        py: Python<'py>,
-        start_offset: u64,
-        max_entries: usize,
-    ) -> PyResult<Bound<'py, PyDict>> {
+    fn walk_tar<'py>(&self, py: Python<'py>, start_offset: u64) -> PyResult<Bound<'py, PyDict>> {
         let result = PyDict::new(py);
         result.set_item("format", "tar")?;
         result.set_item("magic_matched", false)?;
@@ -642,7 +639,6 @@ impl AnalysisBinaryView {
         result.set_item("entries_checked", 0usize)?;
         result.set_item("entry_walk_ok", false)?;
         result.set_item("walk_complete", false)?;
-        result.set_item("walk_budget_exhausted", false)?;
         result.set_item("end_zero_blocks", false)?;
         result.set_item("segment_end", py.None())?;
         result.set_item("boundary_confidence", "none")?;
@@ -667,9 +663,7 @@ impl AnalysisBinaryView {
             set_view_read_fault(&result, &fault, "short_tar_header")?;
             return Ok(result);
         }
-        while (checked < max_entries || (max_entries == 0 && checked == 0))
-            && cursor.saturating_add(TAR_BLOCK_SIZE as u64) <= size
-        {
+        while cursor.saturating_add(TAR_BLOCK_SIZE as u64) <= size {
             let location = if checked == 0 {
                 FieldLocation::Head
             } else {
@@ -770,16 +764,6 @@ impl AnalysisBinaryView {
                 }
                 return Ok(result);
             }
-            if max_entries == 0 {
-                result.set_item("plausible", true)?;
-                result.set_item("validation_scope", "format_identity")?;
-                result.set_item("identity_strong", true)?;
-                result.set_item("entries_checked", 0usize)?;
-                result.set_item("entry_walk_ok", false)?;
-                result.set_item("end_zero_blocks", false)?;
-                result.set_item("damage_flags", PyList::empty(py))?;
-                return Ok(result);
-            }
             let record = py.detach(|| {
                 tar_state.advance(&header, cursor, size, false, &mut |start, length| {
                     self.reader
@@ -842,23 +826,7 @@ impl AnalysisBinaryView {
                 )?,
             )?;
         }
-        if checked > 0
-            && checked >= max_entries
-            && cursor.saturating_add(TAR_BLOCK_SIZE as u64) <= size
-        {
-            result.set_item("plausible", true)?;
-            result.set_item("entries_checked", checked)?;
-            result.set_item("entry_walk_ok", true)?;
-            result.set_item("walk_budget_exhausted", true)?;
-            result.set_item("segment_end", py.None())?;
-            result.set_item("boundary_confidence", "none")?;
-            result.set_item("error", "tar_walk_budget_exhausted")?;
-            result.set_item("damage_flags", PyList::empty(py))?;
-            result.set_item(
-                "evidence",
-                PyList::new(py, ["tar:header_checksum", "tar:block_walk_sample"])?,
-            )?;
-        } else if checked > 0 && cursor == size {
+        if checked > 0 && cursor == size {
             result.set_item("plausible", true)?;
             result.set_item("entries_checked", checked)?;
             result.set_item("entry_walk_ok", true)?;

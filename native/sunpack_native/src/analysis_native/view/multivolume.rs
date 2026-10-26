@@ -1,11 +1,10 @@
 #[pymethods]
 impl AnalysisMultiVolumeView {
     #[new]
-    #[pyo3(signature = (paths, cache_bytes=67108864, max_read_bytes=None, max_concurrent_reads=1))]
+    #[pyo3(signature = (paths, cache_bytes=67108864, max_concurrent_reads=1))]
     fn new(
         paths: Vec<String>,
         cache_bytes: usize,
-        max_read_bytes: Option<u64>,
         max_concurrent_reads: usize,
     ) -> PyResult<Self> {
         let paths = paths
@@ -36,7 +35,6 @@ impl AnalysisMultiVolumeView {
             &paths,
             ReaderConfig {
                 cache_bytes,
-                max_read_bytes,
                 max_concurrent_reads,
             },
         )?;
@@ -108,12 +106,11 @@ impl AnalysisMultiVolumeView {
         .locate_zip_eocd_native(py, eocd_offset)
     }
 
-    #[pyo3(signature = (eocd_offset, max_cd_entries_to_walk=64))]
+    #[pyo3(signature = (eocd_offset))]
     fn probe_zip(
         &self,
         py: Python<'_>,
         eocd_offset: u64,
-        max_cd_entries_to_walk: usize,
     ) -> PyResult<Py<PyDict>> {
         AnalysisBinaryView {
             path: self.path.clone(),
@@ -123,54 +120,50 @@ impl AnalysisMultiVolumeView {
         .probe_zip_with_disk_starts(
             py,
             eocd_offset,
-            max_cd_entries_to_walk,
             Some(&self.volume_starts),
         )
     }
 
-    #[pyo3(signature = (start_offset, max_blocks_to_walk=4096))]
+    #[pyo3(signature = (start_offset))]
     fn probe_rar(
         &self,
         py: Python<'_>,
         start_offset: u64,
-        max_blocks_to_walk: usize,
     ) -> PyResult<Py<PyDict>> {
         AnalysisBinaryView {
             path: self.path.clone(),
             reader: self.reader.clone(),
             closed: self.closed,
         }
-        .probe_rar(py, start_offset, max_blocks_to_walk)
+        .probe_rar(py, start_offset)
     }
 
-    #[pyo3(signature = (start_offset, max_next_header_check_bytes=1048576))]
+    #[pyo3(signature = (start_offset))]
     fn probe_seven_zip(
         &self,
         py: Python<'_>,
         start_offset: u64,
-        max_next_header_check_bytes: u64,
     ) -> PyResult<Py<PyDict>> {
         AnalysisBinaryView {
             path: self.path.clone(),
             reader: self.reader.clone(),
             closed: self.closed,
         }
-        .probe_seven_zip(py, start_offset, max_next_header_check_bytes)
+        .probe_seven_zip(py, start_offset)
     }
 
-    #[pyo3(signature = (start_offset=0, max_entries_to_walk=64))]
+    #[pyo3(signature = (start_offset=0))]
     fn probe_tar(
         &self,
         py: Python<'_>,
         start_offset: u64,
-        max_entries_to_walk: usize,
     ) -> PyResult<Py<PyDict>> {
         AnalysisBinaryView {
             path: self.path.clone(),
             reader: self.reader.clone(),
             closed: self.closed,
         }
-        .probe_tar(py, start_offset, max_entries_to_walk)
+        .probe_tar(py, start_offset)
     }
 
     fn probe_compression_stream(&self, py: Python<'_>, format: &str) -> PyResult<Py<PyDict>> {

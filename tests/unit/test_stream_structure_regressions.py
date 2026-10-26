@@ -117,7 +117,7 @@ def test_concatenated_tar_is_aligned_to_the_archive_start_inside_a_carrier(tmp_p
     path = tmp_path / "carrier.bin"
     path.write_bytes(body)
 
-    result = inspect_tar_header_structure(str(path), 8, prefix, len(body))
+    result = inspect_tar_header_structure(str(path), prefix, len(body))
 
     assert result["archive.concatenated"] is True
     assert result["archive.concatenated_offset"] == prefix + 2048

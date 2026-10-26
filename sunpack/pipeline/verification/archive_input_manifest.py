@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from dataclasses import replace
 
 from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
 STATUS_OK = 0
@@ -21,8 +20,8 @@ from sunpack_native import (
 class ArchiveInputManifest:
     """Archive-input manifest summary over a Rust-owned entry table.
 
-    ``entries`` holds the retained regular-file entries in Rust; a view only
-    narrows ``entry_limit`` and never copies entries into Python objects.
+    ``entries`` holds every regular-file entry in Rust, spilling large tables
+    to disk. Verification never materializes the entry table in Python.
     """
 
     status: int
@@ -32,13 +31,11 @@ class ArchiveInputManifest:
     item_count: int
     file_count: int
     entries: NativeArchiveManifest | None = None
-    entry_limit: int | None = None
     message: str = ""
     archive_type: str = ""
     source: str = "archive_input"
     archive_walk_complete: bool = False
     verified_item_count: int = 0
-    entries_truncated: bool = False
     # Aggregate over every regular file the walk saw, independent of how many
     # entries are retained or exposed by a view.
     total_unpacked_size: int = 0
@@ -53,7 +50,7 @@ class ArchiveInputManifest:
         if self.entries is None:
             return 0
         retained = len(self.entries)
-        return retained if self.entry_limit is None else min(retained, self.entry_limit)
+        return retained
 
     @property
     def expected_names(self) -> list[str]:
@@ -63,24 +60,11 @@ class ArchiveInputManifest:
 
 
 _EVIDENCE_CACHE_ATTRIBUTE = "_archive_input_manifest_full_cache"
-_EVIDENCE_LIMIT_ATTRIBUTE = "_archive_input_manifest_full_max_items"
-
-
-def configure_archive_input_manifest_cache(evidence, *, max_items: int) -> None:
-    """Declare the largest manifest view needed during this verification run."""
-    requested = max(0, int(max_items or 0))
-    current = evidence._archive_input_manifest_full_max_items
-    object.__setattr__(evidence, _EVIDENCE_LIMIT_ATTRIBUTE, max(current, requested))
-
-
-def archive_input_manifest_for_evidence(evidence, *, max_items: int = 200000) -> ArchiveInputManifest:
-    requested = max(0, int(max_items or 0))
+def archive_input_manifest_for_evidence(evidence) -> ArchiveInputManifest:
     codepage = str(evidence.selected_codepage or "")
     identity = _evidence_manifest_identity(evidence, codepage)
-    configured_limit = evidence._archive_input_manifest_full_max_items
-    full_limit = max(requested, configured_limit)
     cached = evidence._archive_input_manifest_full_cache
-    if cached is None or cached["identity"] != identity or cached["max_items"] < full_limit:
+    if cached is None or cached["identity"] != identity:
         hint = _format_hint(evidence.archive_input)
         # TAR needs a source-side walk.  A worker manifest only proves that the
         # range it was handed extracted successfully; it cannot prove that an
@@ -89,17 +73,15 @@ def archive_input_manifest_for_evidence(evidence, *, max_items: int = 200000) ->
         if full_manifest is None:
             full_manifest = archive_input_manifest(
                 evidence.archive_input,
-                max_items=full_limit,
                 password=evidence.password,
                 codepage=codepage or None,
             )
         cached = {
             "identity": identity,
-            "max_items": full_limit,
             "manifest": full_manifest,
         }
         object.__setattr__(evidence, _EVIDENCE_CACHE_ATTRIBUTE, cached)
-    return _manifest_view(cached, requested)
+    return cached["manifest"]
 
 
 def _worker_verified_manifest(evidence) -> ArchiveInputManifest | None:
@@ -145,24 +127,15 @@ def _evidence_manifest_identity(evidence, codepage: str) -> tuple:
     )
 
 
-def _manifest_view(cached: dict, max_items: int) -> ArchiveInputManifest:
-    manifest: ArchiveInputManifest = cached["manifest"]
-    limit = max(0, int(max_items or 0))
-    if manifest.retained_file_count <= limit:
-        return manifest
-    return replace(manifest, entry_limit=limit, entries_truncated=True)
-
-
 def archive_input_manifest(
     archive_input: ArchiveInputDescriptor,
     *,
-    max_items: int = 200000,
     password: str | None = None,
     codepage: str | None = None,
 ) -> ArchiveInputManifest:
     hint = _format_hint(archive_input)
     if hint == "tar":
-        return _tar_archive_input_manifest(archive_input, max_items=max_items)
+        return _tar_archive_input_manifest(archive_input)
     if hint and hint != "zip":
         return ArchiveInputManifest(
             status=STATUS_UNSUPPORTED,
@@ -178,7 +151,6 @@ def archive_input_manifest(
     try:
         native = _native_archive_state_zip_manifest(
             archive_input.to_dict(),
-            max_items,
             password,
             codepage,
         )
@@ -211,13 +183,10 @@ def _format_hint(archive_input: ArchiveInputDescriptor) -> str:
 
 def _tar_archive_input_manifest(
     archive_input: ArchiveInputDescriptor,
-    *,
-    max_items: int,
 ) -> ArchiveInputManifest:
     try:
         native = _native_archive_state_tar_manifest(
             archive_input.to_dict(),
-            max_items,
         )
     except (OSError, ValueError) as exc:
         return ArchiveInputManifest(
@@ -243,7 +212,6 @@ def _manifest_from_native(native: NativeArchiveManifest) -> ArchiveInputManifest
         source=str(native.source),
         archive_walk_complete=bool(native.archive_walk_complete),
         verified_item_count=int(native.verified_item_count),
-        entries_truncated=len(native) < file_count,
         total_unpacked_size=int(native.total_unpacked_size),
         failure_kind=str(native.failure_kind),
     )

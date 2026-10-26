@@ -17,9 +17,13 @@ const ALL_USN_REASONS: u32 = 0xffff_ffff;
 #[cfg(test)]
 const USN_REASON_CLOSE: u32 = 0x8000_0000;
 const JOURNAL_BUFFER_BYTES: usize = 64 * 1024;
-const MAX_JOURNAL_BYTES_PER_OBSERVATION: usize = 1024 * 1024;
-const MAX_ROOT_RECOVERY_JOURNAL_BYTES: usize = 8 * 1024 * 1024;
-const MAX_ROOT_RECOVERY_PATH_BYTES: usize = 64 * 1024;
+const RECOVERY_PAGE_BYTES: usize = 64 * 1024;
+
+pub struct DirectoryChangesPage {
+    pub changes: Vec<(u32, String)>,
+    pub next_usn: i64,
+    pub journal_id: u64,
+}
 const MAX_CACHED_VOLUME_CONTEXTS: usize = 64;
 const VOLUME_CONTEXT_IDLE_TTL: Duration = Duration::from_secs(15 * 60);
 const ERROR_INVALID_HANDLE: i32 = 6;
@@ -147,7 +151,7 @@ impl JournalReader {
         root_file_id_len: u8,
         start_usn: i64,
         end_usn: i64,
-    ) -> io::Result<Vec<String>> {
+    ) -> io::Result<DirectoryChangesPage> {
         if start_usn <= 0 || end_usn <= start_usn || !matches!(root_file_id_len, 8 | 16) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -157,7 +161,6 @@ impl JournalReader {
         let mut id = *root_file_id;
         id[root_file_id_len as usize..].fill(0);
         self.read_directories_changes(volume_guid, None, &[id], start_usn, end_usn)
-            .map(|changes| changes.into_iter().map(|(_, name)| name).collect())
     }
 
     pub fn read_directories_changes(
@@ -167,7 +170,7 @@ impl JournalReader {
         directories: &[[u8; FILE_ID_BYTES]],
         start_usn: i64,
         end_usn: i64,
-    ) -> io::Result<Vec<(u32, String)>> {
+    ) -> io::Result<DirectoryChangesPage> {
         if start_usn <= 0 || end_usn <= start_usn || directories.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -314,38 +317,53 @@ fn read_directories_changes_from_volume(
     directories: &[[u8; FILE_ID_BYTES]],
     start_usn: i64,
     end_usn: i64,
-) -> io::Result<Vec<(u32, String)>> {
+) -> io::Result<DirectoryChangesPage> {
+    scan_directories_page(
+        journal_id,
+        directories,
+        start_usn,
+        end_usn,
+        |cursor, output| {
+            let request = read_usn_journal_request(cursor, journal_id);
+            device_io_control(
+                volume,
+                FSCTL_READ_USN_JOURNAL,
+                &request as *const _ as *const c_void,
+                std::mem::size_of::<ReadUsnJournalData>() as u32,
+                output,
+            )
+        },
+    )
+}
+
+// Resume at the USN of an entire unconsumed record, never at the next buffer.
+// A record may yield both a directory change and a child name; keep it atomic.
+fn scan_directories_page(
+    journal_id: u64,
+    directories: &[[u8; FILE_ID_BYTES]],
+    start_usn: i64,
+    end_usn: i64,
+    mut read: impl FnMut(i64, &mut [u8]) -> io::Result<usize>,
+) -> io::Result<DirectoryChangesPage> {
     let parents: HashMap<_, _> = directories
         .iter()
         .enumerate()
         .map(|(index, id)| (*id, index as u32))
         .collect();
     let mut cursor = start_usn;
-    let mut scanned_bytes = 0usize;
     let mut payload_bytes = 0usize;
     let mut changed = BTreeSet::new();
     let mut output = vec![0u8; JOURNAL_BUFFER_BYTES];
     while cursor < end_usn {
-        let request = read_usn_journal_request(cursor, journal_id);
-        let bytes_returned = device_io_control(
-            volume,
-            FSCTL_READ_USN_JOURNAL,
-            &request as *const _ as *const c_void,
-            std::mem::size_of::<ReadUsnJournalData>() as u32,
-            &mut output,
-        )?;
-        if bytes_returned < 8 {
+        let bytes_returned = read(cursor, &mut output)?;
+        if bytes_returned < 8 || bytes_returned > output.len() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "truncated USN journal reply",
             ));
         }
-        scanned_bytes = scanned_bytes.saturating_add(bytes_returned);
-        if scanned_bytes > MAX_ROOT_RECOVERY_JOURNAL_BYTES {
-            return Err(io::Error::other("USN recovery exceeded scan budget"));
-        }
-        let returned_next = i64::from_le_bytes(output[0..8].try_into().unwrap());
-        let mut offset = 8usize;
+        let returned_next = i64::from_le_bytes(output[..8].try_into().unwrap());
+        let mut offset = 8;
         while offset < bytes_returned {
             if offset + 8 > bytes_returned {
                 return Err(io::Error::new(
@@ -355,26 +373,44 @@ fn read_directories_changes_from_volume(
             }
             let length =
                 u32::from_le_bytes(output[offset..offset + 4].try_into().unwrap()) as usize;
-            if length < 8 || offset + length > bytes_returned {
+            if length < 8 || length > bytes_returned - offset {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "invalid USN journal record",
                 ));
             }
-            for change in record_directory_changes(
-                &output[offset..offset + length],
-                &parents,
-                start_usn,
-                end_usn,
-            )? {
-                if !changed.contains(&change) {
-                    payload_bytes = payload_bytes.saturating_add(8 + change.1.len());
-                    if payload_bytes > MAX_ROOT_RECOVERY_PATH_BYTES {
-                        return Err(io::Error::other("USN recovery exceeded payload budget"));
-                    }
-                    changed.insert(change);
-                }
+            let record = &output[offset..offset + length];
+            let changes = record_directory_changes(record, &parents, cursor, end_usn)?;
+            let added: usize = changes
+                .iter()
+                .filter(|change| !changed.contains(*change))
+                .map(|change| 8 + change.1.len())
+                .sum();
+            if added > RECOVERY_PAGE_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "USN name exceeds response frame",
+                ));
             }
+            if payload_bytes + added > RECOVERY_PAGE_BYTES {
+                let major = u16::from_le_bytes(record[4..6].try_into().unwrap());
+                let usn_offset = if major == 2 { 24 } else { 40 };
+                let next_usn =
+                    i64::from_le_bytes(record[usn_offset..usn_offset + 8].try_into().unwrap());
+                if next_usn <= start_usn {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "non-progressing USN page",
+                    ));
+                }
+                return Ok(DirectoryChangesPage {
+                    changes: changed.into_iter().collect(),
+                    next_usn,
+                    journal_id,
+                });
+            }
+            payload_bytes += added;
+            changed.extend(changes);
             offset += length;
         }
         if returned_next <= cursor {
@@ -384,7 +420,11 @@ fn read_directories_changes_from_volume(
         }
         cursor = returned_next;
     }
-    Ok(changed.into_iter().collect())
+    Ok(DirectoryChangesPage {
+        changes: changed.into_iter().collect(),
+        next_usn: end_usn,
+        journal_id,
+    })
 }
 
 fn record_directory_changes(
@@ -480,12 +520,11 @@ fn read_change_reasons_from_volume(
     current_usn: i64,
 ) -> io::Result<ChangeReasons> {
     let mut next_usn = previous_usn;
-    let mut scanned_bytes = 0usize;
     let mut reasons = ChangeReasons::default();
     let mut found = false;
+    let mut output = vec![0u8; JOURNAL_BUFFER_BYTES];
     while next_usn <= current_usn {
         let request = read_usn_journal_request(next_usn, journal_id);
-        let mut output = vec![0u8; JOURNAL_BUFFER_BYTES];
         let bytes_returned = device_io_control(
             volume,
             FSCTL_READ_USN_JOURNAL,
@@ -497,12 +536,6 @@ fn read_change_reasons_from_volume(
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "truncated USN journal reply",
-            ));
-        }
-        scanned_bytes = scanned_bytes.saturating_add(bytes_returned);
-        if scanned_bytes > MAX_JOURNAL_BYTES_PER_OBSERVATION {
-            return Err(io::Error::other(
-                "USN journal observation exceeded scan budget",
             ));
         }
         let returned_next = i64::from_le_bytes(output[0..8].try_into().unwrap());
@@ -528,7 +561,10 @@ fn read_change_reasons_from_volume(
             }
             offset += record_length;
         }
-        if returned_next <= next_usn || returned_next > current_usn {
+        if returned_next <= next_usn {
+            return Err(io::Error::other("USN observation made no progress"));
+        }
+        if returned_next > current_usn {
             break;
         }
         next_usn = returned_next;

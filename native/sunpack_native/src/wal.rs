@@ -1,4 +1,5 @@
 //! Shared binary persistence envelope. No text formats or format migration.
+use crate::io::scratch::{Blob, Spool};
 use crc32fast::Hasher;
 use serde::{de::DeserializeOwned, Serialize};
 use std::io::{self, BufRead, BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
@@ -29,43 +30,62 @@ pub(crate) fn file_header(kind: Kind) -> [u8; 16] {
     header
 }
 
-/// Bound serialization as it runs, before a transaction can grow without limit.
-pub(crate) struct Bounded<'a>(pub &'a mut Vec<u8>, pub usize);
-impl Write for Bounded<'_> {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        if bytes.len() > self.1.saturating_sub(self.0.len()) {
-            return Err(invalid("WAL transaction exceeds 64 MiB"));
+// MORE fragments share one sequence. Only the final CRC commits the transaction.
+const MORE: u32 = 1 << 31;
+const WRITE_FRAME_BYTES: usize = 1024 * 1024;
+struct Fragments<'a, W> {
+    output: &'a mut W,
+    seq: u64,
+    buffer: Vec<u8>,
+}
+impl<W: Write> Fragments<'_, W> {
+    fn emit(&mut self, more: bool) -> io::Result<()> {
+        if self.buffer.is_empty() {
+            return Err(invalid("empty WAL transaction"));
         }
-        self.0.extend_from_slice(bytes);
-        Ok(bytes.len())
+        let mut header = [0; FRAME_HEADER_BYTES];
+        let len = self.buffer.len() as u32 | if more { MORE } else { 0 };
+        header[..4].copy_from_slice(&len.to_le_bytes());
+        header[4..12].copy_from_slice(&self.seq.to_le_bytes());
+        let mut hash = Hasher::new();
+        hash.update(&header[..12]);
+        hash.update(&self.buffer);
+        header[12..].copy_from_slice(&hash.finalize().to_le_bytes());
+        self.output.write_all(&header)?;
+        self.output.write_all(&self.buffer)?;
+        self.buffer.clear();
+        Ok(())
+    }
+}
+impl<W: Write> Write for Fragments<'_, W> {
+    fn write(&mut self, mut bytes: &[u8]) -> io::Result<usize> {
+        let length = bytes.len();
+        while !bytes.is_empty() {
+            if self.buffer.len() == WRITE_FRAME_BYTES {
+                self.emit(true)?;
+            }
+            let take = bytes.len().min(WRITE_FRAME_BYTES - self.buffer.len());
+            self.buffer.extend_from_slice(&bytes[..take]);
+            bytes = &bytes[take..];
+        }
+        Ok(length)
     }
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
 }
-
-pub(crate) fn append_frame(
-    output: &mut Vec<u8>,
+pub(crate) fn append_frame<W: Write>(
+    output: &mut W,
     seq: u64,
-    encode: impl FnOnce(&mut Bounded<'_>) -> io::Result<()>,
+    encode: impl FnOnce(&mut dyn Write) -> io::Result<()>,
 ) -> io::Result<()> {
-    let start = output.len();
-    output.resize(start + FRAME_HEADER_BYTES, 0);
-    if let Err(error) = encode(&mut Bounded(
+    let mut writer = Fragments {
         output,
-        start + FRAME_HEADER_BYTES + MAX_FRAME_BYTES,
-    )) {
-        output.truncate(start);
-        return Err(error);
-    }
-    let len = output.len() - start - FRAME_HEADER_BYTES;
-    output[start..start + 4].copy_from_slice(&(len as u32).to_le_bytes());
-    output[start + 4..start + 12].copy_from_slice(&seq.to_le_bytes());
-    let mut hash = Hasher::new();
-    hash.update(&output[start..start + 12]);
-    hash.update(&output[start + FRAME_HEADER_BYTES..]);
-    output[start + 12..start + 16].copy_from_slice(&hash.finalize().to_le_bytes());
-    Ok(())
+        seq,
+        buffer: Vec::new(),
+    };
+    encode(&mut writer)?;
+    writer.emit(false)
 }
 
 pub(crate) fn decode<T: DeserializeOwned>(bytes: &[u8]) -> io::Result<T> {
@@ -83,7 +103,7 @@ pub(crate) struct Reader<R> {
     end: u64,
     pub valid_end: u64,
     pub torn: bool,
-    pub payload: Vec<u8>,
+    pub payload: Blob,
 }
 impl<R: Read + Seek> Reader<R> {
     pub fn new(mut input: R, kind: Kind) -> io::Result<Self> {
@@ -101,37 +121,56 @@ impl<R: Read + Seek> Reader<R> {
             end,
             valid_end: if available == 16 { 16 } else { 0 },
             torn: available != 16,
-            payload: Vec::new(),
+            payload: Vec::new().into(),
         })
     }
     pub fn next(&mut self) -> io::Result<Option<u64>> {
         if self.torn || self.valid_end == self.end {
             return Ok(None);
         }
-        if self.end - self.valid_end < FRAME_HEADER_BYTES as u64 {
-            self.torn = true;
-            return Ok(None);
+        let mut cursor = self.valid_end;
+        let mut payload = Spool::default();
+        let mut sequence = None;
+        let mut buffer = vec![0; BUFFER_BYTES];
+        loop {
+            if self.end - cursor < FRAME_HEADER_BYTES as u64 {
+                self.torn = true;
+                return Ok(None);
+            }
+            let mut header = [0; FRAME_HEADER_BYTES];
+            self.input.read_exact(&mut header)?;
+            let framed_len = u32::from_le_bytes(header[..4].try_into().unwrap());
+            let len = (framed_len & !MORE) as usize;
+            let seq = u64::from_le_bytes(header[4..12].try_into().unwrap());
+            if len == 0 || len > MAX_FRAME_BYTES || sequence.is_some_and(|previous| previous != seq)
+            {
+                return Err(invalid("invalid WAL fragment"));
+            }
+            sequence = Some(seq);
+            if self.end - cursor - (FRAME_HEADER_BYTES as u64) < len as u64 {
+                self.torn = true;
+                return Ok(None);
+            }
+            let mut hash = Hasher::new();
+            hash.update(&header[..12]);
+            let mut remaining = len;
+            while remaining > 0 {
+                let take = remaining.min(buffer.len());
+                self.input.read_exact(&mut buffer[..take])?;
+                hash.update(&buffer[..take]);
+                payload.write_all(&buffer[..take])?;
+                remaining -= take;
+            }
+            if hash.finalize() != u32::from_le_bytes(header[12..].try_into().unwrap()) {
+                return Err(invalid("WAL checksum mismatch"));
+            }
+            cursor += (FRAME_HEADER_BYTES + len) as u64;
+            if framed_len & MORE == 0 {
+                self.payload = payload.finish()?;
+                self.valid_end = cursor;
+                return Ok(sequence);
+            }
         }
-        let mut header = [0; FRAME_HEADER_BYTES];
-        self.input.read_exact(&mut header)?;
-        let len = u32::from_le_bytes(header[..4].try_into().unwrap()) as usize;
-        if len == 0 || len > MAX_FRAME_BYTES {
-            return Err(invalid("invalid WAL frame length"));
-        }
-        if self.end - self.valid_end - (FRAME_HEADER_BYTES as u64) < len as u64 {
-            self.torn = true;
-            return Ok(None);
-        }
-        self.payload.resize(len, 0);
-        self.input.read_exact(&mut self.payload)?;
-        let mut hash = Hasher::new();
-        hash.update(&header[..12]);
-        hash.update(&self.payload);
-        if hash.finalize() != u32::from_le_bytes(header[12..].try_into().unwrap()) {
-            return Err(invalid("WAL checksum mismatch"));
-        }
-        self.valid_end += (FRAME_HEADER_BYTES + len) as u64;
-        Ok(Some(u64::from_le_bytes(header[4..12].try_into().unwrap())))
     }
 }
 
@@ -273,9 +312,6 @@ mod tests {
             .unwrap()
             .next()
             .is_err());
-        let mut bounded = Vec::new();
-        assert!(Bounded(&mut bounded, 2).write_all(b"123").is_err());
-        assert!(bounded.is_empty());
     }
 
     // No existing test checks checksum coverage of snapshot sequence metadata,

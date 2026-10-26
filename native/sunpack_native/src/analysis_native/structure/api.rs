@@ -24,11 +24,10 @@ pub(crate) fn inspect_zip_local_header(
 }
 
 #[pyfunction]
-#[pyo3(signature = (path, max_cd_entries_to_walk=16))]
+#[pyo3(signature = (path))]
 pub(crate) fn inspect_zip_eocd_structure(
     py: Python<'_>,
     path: &str,
-    max_cd_entries_to_walk: usize,
 ) -> PyResult<Py<PyDict>> {
     let mut result = zip_eocd_empty(py, "")?;
     let Ok(reader) = ManagedReader::open(path) else {
@@ -332,7 +331,6 @@ pub(crate) fn inspect_zip_eocd_structure(
         physical_central_offset,
         effective_central_directory_size,
         effective_total_entries as usize,
-        max_cd_entries_to_walk,
     ) {
         Ok(walk) => walk,
         Err(fault) => {
@@ -382,175 +380,21 @@ pub(crate) fn inspect_zip_structure_graph(
 }
 
 #[pyfunction]
-#[pyo3(signature = (path, magic_bytes=None, max_next_header_check_bytes=1048576))]
-pub(crate) fn inspect_seven_zip_structure(
-    py: Python<'_>,
-    path: &str,
-    magic_bytes: Option<&[u8]>,
-    max_next_header_check_bytes: u64,
-) -> PyResult<Py<PyDict>> {
-    let Ok(reader) = ManagedReader::open(path) else {
-        return Ok(seven_empty(py, "os_error")?.unbind());
-    };
-    let mut file = reader.cursor();
-    let file_size = reader.len();
-    let mut header = magic_bytes.unwrap_or(&[]).to_vec();
-    if header.len() < SEVEN_Z_HEADER_SIZE {
-        header.resize(SEVEN_Z_HEADER_SIZE, 0);
-        if let Err(fault) = seek_field(
-            &mut file,
-            0,
-            file_size,
-            "7z.start_header",
-            FieldLocation::Head,
-        )
-        .and_then(|_| {
-            read_exact_field(
-                &mut file,
-                &mut header,
-                file_size,
-                "7z.start_header",
-                FieldLocation::Head,
-            )
-        }) {
-            let out = seven_empty(py, "start_header_read_failed")?;
-            set_read_fault(&out, &fault, "start_header_read_failed")?;
-            return Ok(out.unbind());
-        }
-    }
-    if file_size < SEVEN_Z_HEADER_SIZE as u64 {
-        let out = seven_empty(py, "file_too_small")?;
-        if header.starts_with(SEVEN_Z_SIGNATURE) {
-            out.set_item("magic_matched", true)?;
-            out.set_item("format", "7z")?;
-            out.set_item("detected_ext", ".7z")?;
-            out.set_item("evidence", PyList::new(py, ["7z:signature"])?)?;
-        }
-        return Ok(out.unbind());
-    }
-    if !header.starts_with(SEVEN_Z_SIGNATURE) {
-        return Ok(seven_empty(py, "7z_signature_not_found")?.unbind());
-    }
-    let stored_start_crc = u32_le(&header, 8);
-    let start_header = &header[12..32];
-    let computed_start_crc = crc32(start_header);
-    let next_header_offset = u64_le(start_header, 0);
-    let next_header_size = u64_le(start_header, 8);
-    let next_header_crc = u32_le(start_header, 16);
-    let result = dict(py)?;
-    result.set_item("plausible", false)?;
-    result.set_item("error", "")?;
-    result.set_item("magic_matched", true)?;
-    result.set_item("format", "7z")?;
-    result.set_item("detected_ext", ".7z")?;
-    result.set_item("version_major", header[6])?;
-    result.set_item("version_minor", header[7])?;
-    result.set_item("next_header_offset", next_header_offset)?;
-    result.set_item("next_header_size", next_header_size)?;
-    result.set_item("next_header_crc", next_header_crc)?;
-    result.set_item(
-        "start_header_crc_ok",
-        stored_start_crc == computed_start_crc,
-    )?;
-    result.set_item("next_header_crc_checked", false)?;
-    result.set_item("next_header_crc_ok", false)?;
-    result.set_item("next_header_nid", 0)?;
-    result.set_item("next_header_nid_valid", false)?;
-    result.set_item("next_header_semantic_ok", false)?;
-    result.set_item("strong_accept", false)?;
-    result.set_item("confidence", "none")?;
-    let evidence = PyList::new(py, ["7z:signature"])?;
-    result.set_item("evidence", &evidence)?;
-    if header[6] != 0 {
-        result.set_item("error", "unsupported_version")?;
-        return Ok(result.unbind());
-    }
-    if stored_start_crc != computed_start_crc {
-        result.set_item("error", "start_header_crc_mismatch")?;
-        return Ok(result.unbind());
-    }
-    let Some(next_header_start) = (SEVEN_Z_HEADER_SIZE as u64).checked_add(next_header_offset)
-    else {
-        result.set_item("error", "next_header_out_of_range")?;
-        return Ok(result.unbind());
-    };
-    if next_header_size == 0 || next_header_start < SEVEN_Z_HEADER_SIZE as u64 {
-        result.set_item("error", "invalid_next_header_range")?;
-        return Ok(result.unbind());
-    }
-    let Some(next_header_end) = next_header_start.checked_add(next_header_size) else {
-        result.set_item("error", "next_header_out_of_range")?;
-        return Ok(result.unbind());
-    };
-    if next_header_end > file_size {
-        result.set_item("error", "next_header_out_of_range")?;
-        let fault = ReadFault::short_read(
-            "read_declared_range",
-            next_header_start,
-            next_header_size.min(usize::MAX as u64) as usize,
-            file_size.saturating_sub(next_header_start) as usize,
-            file_size,
-        )
-        .with_field("7z.next_header", FieldLocation::Tail);
-        set_read_fault(&result, &fault, "next_header_out_of_range")?;
-        return Ok(result.unbind());
-    }
-    result.set_item("plausible", true)?;
-    result.set_item("confidence", "strong")?;
-    evidence.append("7z:start_header_crc")?;
-    evidence.append("7z:next_header_range")?;
-    if next_header_size <= max_next_header_check_bytes {
-        let mut next_header = vec![0; next_header_size as usize];
-        if let Err(fault) = seek_field(
-            &mut file,
-            next_header_start,
-            file_size,
-            "7z.next_header",
-            FieldLocation::Tail,
-        )
-        .and_then(|_| {
-            read_exact_field(
-                &mut file,
-                &mut next_header,
-                file_size,
-                "7z.next_header",
-                FieldLocation::Tail,
-            )
-        }) {
-            set_read_fault(&result, &fault, "next_header_read_failed")?;
-            result.set_item("plausible", false)?;
-            return Ok(result.unbind());
-        }
-        let crc_ok = crc32(&next_header) == next_header_crc;
-        let nid = next_header.first().copied().unwrap_or(0);
-        let nid_valid = nid == 0x01 || nid == 0x17;
-        result.set_item("next_header_crc_checked", true)?;
-        result.set_item("next_header_crc_ok", crc_ok)?;
-        result.set_item("next_header_nid", nid)?;
-        result.set_item("next_header_nid_valid", nid_valid)?;
-        result.set_item("next_header_semantic_ok", crc_ok && nid_valid)?;
-        if crc_ok {
-            evidence.append("7z:next_header_crc")?;
-            if nid_valid {
-                result.set_item("strong_accept", true)?;
-                evidence.append("7z:next_header_nid")?;
-            } else {
-                result.set_item("error", "next_header_nid_unrecognized")?;
-            }
-        } else {
-            result.set_item("error", "next_header_crc_mismatch")?;
-        }
-    }
+pub(crate) fn inspect_seven_zip_structure(py:Python<'_>,path:&str)->PyResult<Py<PyDict>> {
+    let reader=match ManagedReader::open(path) {Ok(reader)=>reader,Err(_)=>return Ok(seven_empty(py,"os_error")?.unbind())};
+    let view=crate::analysis_native::AnalysisBinaryView{path:path.to_owned(),reader,closed:false};
+    let result=view.probe_seven_zip(py,0)?.into_bound(py);
+    let valid=result.get_item("magic_matched")?.is_some_and(|value|value.is_truthy().unwrap_or(false));
+    result.set_item("detected_ext",if valid {".7z"} else {""})?;
     Ok(result.unbind())
 }
 
 #[pyfunction]
-#[pyo3(signature = (path, magic_bytes=None, max_first_header_check_bytes=1048576))]
+#[pyo3(signature = (path, magic_bytes=None))]
 pub(crate) fn inspect_rar_structure(
     py: Python<'_>,
     path: &str,
     magic_bytes: Option<&[u8]>,
-    max_first_header_check_bytes: u64,
 ) -> PyResult<Py<PyDict>> {
     let reader = match ManagedReader::open(path) {
         Ok(reader) => reader,
@@ -590,7 +434,7 @@ pub(crate) fn inspect_rar_structure(
         }
     }
     if data.starts_with(RAR4_SIGNATURE) && data.len() >= RAR4_SIGNATURE.len() + 7 {
-        let read_size = file_size.min(max_first_header_check_bytes);
+        let read_size = file_size.min((u16::MAX as u64)*2+RAR4_SIGNATURE.len() as u64);
         if data.len() < read_size as usize {
             data.resize(read_size as usize, 0);
             if let Err(fault) = seek_field(
@@ -616,7 +460,7 @@ pub(crate) fn inspect_rar_structure(
         }
     } else if data.starts_with(RAR5_SIGNATURE) {
         if read_vint(&data, RAR5_SIGNATURE.len() + 4).is_some() {
-            let read_size = file_size.min(max_first_header_check_bytes);
+            let read_size = file_size.min((1u64<<21)*2+RAR5_SIGNATURE.len() as u64+16);
             if data.len() < read_size as usize {
                 data.resize(read_size as usize, 0);
                 if let Err(fault) = seek_field(
@@ -665,11 +509,10 @@ pub(crate) fn inspect_rar_structure(
 }
 
 #[pyfunction]
-#[pyo3(signature = (path, max_entries_to_walk=8, start_offset=0, end_offset=None))]
+#[pyo3(signature = (path, start_offset=0, end_offset=None))]
 pub(crate) fn inspect_tar_header_structure(
     py: Python<'_>,
     path: &str,
-    max_entries_to_walk: usize,
     start_offset: u64,
     end_offset: Option<u64>,
 ) -> PyResult<Py<PyDict>> {
@@ -773,22 +616,11 @@ pub(crate) fn inspect_tar_header_structure(
             "tar"
         },
     )?;
-    if max_entries_to_walk == 0 {
-        result.set_item("validation_scope", "format_identity")?;
-        result.set_item("identity_strong", true)?;
-        result.set_item("entries_checked", 0usize)?;
-        result.set_item("entry_walk_ok", false)?;
-        result.set_item("end_zero_blocks", false)?;
-        result.set_item("damage_flags", PyList::empty(py))?;
-        finish_fields(&result, TAR_FIELDS)?;
-        return Ok(result.unbind());
-    }
     enrich_tar_semantics(
         &result,
         &mut file,
         start_offset,
         archive_end,
-        max_entries_to_walk,
     )?;
     Ok(result.unbind())
 }

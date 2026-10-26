@@ -1,13 +1,14 @@
 //! Disposable filename cache. Reuses the Watch journal writer on a separate stream.
 use super::catalog::{CatalogRow, ScopeCatalog};
 use super::directory::DirectoryEntryRecord;
+use crate::io::scratch::Spool;
 use crate::wal::{self, Kind};
 use crate::watch_journal::{self, NativeJournalStream};
 use serde::ser::{SerializeMap, SerializeSeq};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io;
+use std::io::{self, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -73,7 +74,7 @@ pub(super) struct CatalogStore {
     edits: usize,
     wal_bytes: u64,
     snapshot_bytes: u64,
-    pending: Vec<u8>,
+    pending: Spool,
     pending_deltas: usize,
     pub stamps: HashMap<String, Stamp>,
     // Drop after the writer handle. Windows also removes this file on a crash.
@@ -105,7 +106,7 @@ impl CatalogStore {
             edits: 0,
             wal_bytes: 0,
             snapshot_bytes: 0,
-            pending: Vec::new(),
+            pending: Spool::default(),
             pending_deltas: 0,
             stamps: HashMap::new(),
             _ownership: ownership,
@@ -186,15 +187,15 @@ impl CatalogStore {
         Ok(store)
     }
     pub fn append(&mut self, delta: DeltaView<'_>) -> io::Result<()> {
+        let previous_end = self.pending.len()?;
         if self.pending_deltas == 0 {
             // One array32 header allows borrowed deltas to be encoded in place.
-            self.pending.extend_from_slice(&[0xdd, 0, 0, 0, 0]);
+            self.pending.write_all(&[0xdd, 0, 0, 0, 0])?;
         }
-        rmp_serde::encode::write(
-            &mut wal::Bounded(&mut self.pending, wal::MAX_FRAME_BYTES),
-            &delta,
-        )
-        .map_err(wal::invalid)?;
+        if let Err(error) = rmp_serde::encode::write(&mut self.pending, &delta) {
+            self.pending.truncate(previous_end)?;
+            return Err(wal::invalid(error));
+        }
         self.edits += delta.rows.len() + delta.removed.len() + 1;
         let cursor_barrier = delta
             .stamp
@@ -206,7 +207,7 @@ impl CatalogStore {
         self.pending_deltas += 1;
         if cursor_barrier
             || self.pending_deltas >= BATCH_DELTAS
-            || self.pending.len() >= BATCH_BYTES
+            || self.pending.len()? >= BATCH_BYTES as u64
         {
             self.commit()?;
         }
@@ -216,8 +217,10 @@ impl CatalogStore {
         if self.pending_deltas == 0 {
             return Ok(());
         }
-        self.pending[1..5].copy_from_slice(&(self.pending_deltas as u32).to_be_bytes());
-        let bytes = std::mem::take(&mut self.pending);
+        self.pending.seek(SeekFrom::Start(1))?;
+        self.pending
+            .write_all(&(self.pending_deltas as u32).to_be_bytes())?;
+        let bytes = std::mem::take(&mut self.pending).finish()?;
         let next = self.seq + 1;
         let written = watch_journal::append_cache(
             &self.stream,

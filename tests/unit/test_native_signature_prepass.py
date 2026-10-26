@@ -43,12 +43,11 @@ def test_single_and_split_prepass_agree_on_ranges_and_cross_volume_signatures(si
 
 
 @pytest.mark.parametrize("multivolume", [False, True])
-def test_prepass_preserves_read_budget_errors_and_closed_view_contract(signature_paths, multivolume):
-    view = (AnalysisMultiVolumeView(signature_paths[1:], cache_bytes=0, max_read_bytes=16)
-            if multivolume else AnalysisBinaryView(signature_paths[0], cache_bytes=0, max_read_bytes=16))
+def test_prepass_preserves_closed_view_contract(signature_paths, multivolume):
+    view = (AnalysisMultiVolumeView(signature_paths[1:], cache_bytes=0)
+            if multivolume else AnalysisBinaryView(signature_paths[0], cache_bytes=0))
     try:
-        with pytest.raises(RuntimeError, match="read budget exceeded"):
-            view.signature_prepass(32, 16)
+        view.signature_prepass(32, 16)
     finally:
         view.close()
     with pytest.raises(RuntimeError, match="closed"):

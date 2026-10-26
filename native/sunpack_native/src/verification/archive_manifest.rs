@@ -1,12 +1,14 @@
+use crate::io::scratch::Rows;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 /// One regular-file entry of a source-side archive walk.
 ///
 /// `path` is the projected output name; `raw_path` is only stored when the
 /// projection differs from the name recorded in the archive (TAR duplicates).
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct ManifestEntry {
     pub(crate) path: String,
     pub(crate) raw_path: Option<String>,
@@ -33,13 +35,12 @@ pub(crate) struct NativeArchiveManifest {
     pub(crate) archive_walk_complete: bool,
     pub(crate) verified_item_count: usize,
     pub(crate) failure_kind: String,
-    pub(crate) entries: Arc<Vec<ManifestEntry>>,
+    pub(crate) entries: Arc<Rows<ManifestEntry>>,
 }
 
 impl NativeArchiveManifest {
-    pub(crate) fn entries_view(&self, limit: Option<usize>) -> &[ManifestEntry] {
-        let end = limit.unwrap_or(self.entries.len()).min(self.entries.len());
-        &self.entries[..end]
+    pub(crate) fn entry_count(&self, limit: Option<usize>) -> usize {
+        limit.unwrap_or(self.entries.len()).min(self.entries.len())
     }
 }
 
@@ -104,11 +105,9 @@ impl NativeArchiveManifest {
 
     /// Projected entry names among the first `limit` retained entries.
     #[pyo3(signature = (limit=None))]
-    fn expected_names(&self, limit: Option<usize>) -> Vec<String> {
-        self.entries_view(limit)
-            .iter()
-            .filter(|item| !item.path.is_empty())
-            .map(|item| item.path.clone())
+    fn expected_names(&self, limit: Option<usize>) -> PyResult<Vec<String>> {
+        (0..self.entry_count(limit))
+            .map(|index| Ok(self.entries.get(index)?.path.clone()))
             .collect()
     }
 
@@ -118,9 +117,9 @@ impl NativeArchiveManifest {
             return Ok(Vec::new());
         }
         let end = offset.saturating_add(limit).min(self.entries.len());
-        self.entries[offset..end]
-            .iter()
-            .map(|item| {
+        (offset..end)
+            .map(|index| {
+                let item = self.entries.get(index)?;
                 let row = PyDict::new(py);
                 row.set_item("path", &item.path)?;
                 row.set_item("archive_path", item.raw_path.as_ref().unwrap_or(&item.path))?;

@@ -89,8 +89,7 @@ struct Evaluation {
     project_ratio_exponent,
     authorization_bias,
     minimum_authorization_score,
-    minimum_archive_byte_ratio,
-    hard_maximum_other_projects
+    minimum_archive_byte_ratio
 ))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn authorize_nested_candidates(
@@ -103,7 +102,6 @@ pub(crate) fn authorize_nested_candidates(
     authorization_bias: f64,
     minimum_authorization_score: f64,
     minimum_archive_byte_ratio: f64,
-    hard_maximum_other_projects: usize,
 ) -> PyResult<Vec<Py<PyDict>>> {
     let root = PathBuf::from(root_path);
     let root_key = path_key(&root);
@@ -253,16 +251,10 @@ pub(crate) fn authorize_nested_candidates(
                 (local.score, "local")
             };
             let minimum_byte_ratio = local.byte_ratio.min(root_evaluation.byte_ratio);
-            let observed_other_projects = local_stats
-                .other_project_count()
-                .max(root_stats.other_project_count());
-
             let (allowed, reason) = if context.scope_key.is_empty() {
                 (false, "outside_scan_root")
             } else if minimum_byte_ratio < minimum_archive_byte_ratio {
                 (false, "archive_byte_ratio_below_floor")
-            } else if observed_other_projects > hard_maximum_other_projects {
-                (false, "too_many_other_projects")
             } else if authorization_score < minimum_authorization_score {
                 (false, "authorization_score_below_threshold")
             } else {

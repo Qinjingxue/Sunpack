@@ -353,7 +353,7 @@ def test_indexed_history_pages_and_literal_member_search_work_without_a_producer
 
 def test_gui_reads_display_state_across_publication_faults_and_close(tmp_path):
     # Pure model fixtures cannot detect disagreements with the real Rust writer.
-    # One kernel sharing failure covers async fault reporting, atomic replacement,
+    # Kernel sharing conflicts and read failures cover publication, fault reporting,
     # retained last-known state, healing, and independent offline replay.
     from sunpack.runtime.watch.log import WatchLogStore
     path = tmp_path / "events.json"
@@ -388,19 +388,21 @@ def test_gui_reads_display_state_across_publication_faults_and_close(tmp_path):
         held = kernel.CreateFileW(str(path), 0x80000000, 1, None, 3, 0, None)
         assert held != wintypes.HANDLE(-1).value
         before = path.read_bytes()
-        try:
-            log.write("failed_password", path=source)
-            log.write("diagnostic", padding="x" * 4096)
-            with pytest.raises(OSError): log.flush()
-            assert log.error
-            assert path.read_bytes() == before  # Failed replacement preserves old file.
-            stale = _state_projection(path)
-            # Live slots are best effort, not transactional snapshots. A failed
-            # manifest replacement may expose a newer live timestamp; identity
-            # and the valid current status must remain independently readable.
-            assert [(r["id"], r["status"]) for r in stale["tasks"]["rows"]] == [(r["id"], r["status"]) for r in published["tasks"]["rows"]]
-        finally:
-            kernel.CloseHandle(held)
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            try:
+                log.write("failed_password", path=source)
+                log.write("diagnostic", padding="x" * 4096)
+                publication = executor.submit(log.flush)
+                # A reader that denies deletion delays replacement until it
+                # releases its handle. The previously published file stays valid.
+                assert path.read_bytes() == before
+                stale = _state_projection(path)
+                assert [(r["id"], r["status"]) for r in stale["tasks"]["rows"]] == [(r["id"], r["status"]) for r in published["tasks"]["rows"]]
+            finally:
+                kernel.CloseHandle(held)
+            publication.result()
+        assert not log.error
         log.write("diagnostic", message="disk available again")
         log.flush()
         healed = _state_projection(path)

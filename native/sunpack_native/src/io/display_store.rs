@@ -9,7 +9,7 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 pub(crate) const ENTRY_BYTES: usize = 64;
-const MAX_RECORD: usize = 64 * 1024 * 1024;
+const RECORD_BLOCK_BYTES: usize = 1024 * 1024;
 pub(crate) const DAY_US: i64 = 86_400_000_000;
 unsafe extern "C" {
     fn LZ4_compressBound(size: i32) -> i32;
@@ -59,7 +59,7 @@ impl Live {
     fn remove(&mut self, id: &str) -> io::Result<()> {
         if let Some((slot, bytes)) = self.rows.remove(id) {
             self.time.remove(&(stamp(&bytes), slot));
-            let size = u32::from_le_bytes(bytes[16..20].try_into().unwrap()) as u64;
+            let size = record_size(&mut self.data, &bytes)?;
             zero(
                 &mut self.index,
                 slot * ENTRY_BYTES as u64,
@@ -77,7 +77,6 @@ pub(crate) struct Store {
     folder: PathBuf,
     pub manifest: Manifest,
     current: Option<(String, TrackedFile, TrackedFile)>,
-    raw: Vec<u8>,
     compressed: Vec<u8>,
     obsolete: Vec<String>,
     live: Option<Live>,
@@ -164,6 +163,44 @@ fn zero(file: &mut TrackedFile, start: u64, end: u64) -> io::Result<()> {
         }
         Ok(())
     }
+}
+fn compress_block(raw: &[u8], compressed: &mut Vec<u8>) -> io::Result<usize> {
+    let bound = unsafe { LZ4_compressBound(raw.len() as i32) };
+    if bound <= 0 {
+        return Err(invalid("display block cannot be compressed"));
+    }
+    compressed.resize(bound as usize, 0);
+    let len = unsafe {
+        LZ4_compress_default(
+            raw.as_ptr(),
+            compressed.as_mut_ptr(),
+            raw.len() as i32,
+            bound,
+        )
+    };
+    if len <= 0 {
+        return Err(invalid("display compression failed"));
+    }
+    Ok(len as usize)
+}
+fn record_size(data: &mut TrackedFile, entry: &[u8]) -> io::Result<u64> {
+    let size = u32::from_le_bytes(entry[16..20].try_into().unwrap());
+    if size != 0 {
+        return Ok(size as u64);
+    }
+    data.seek(SeekFrom::Start(offset(entry)))?;
+    let mut header = [0; 24];
+    data.read_exact(&mut header)?;
+    let size = u64::from_le_bytes(header[8..16].try_into().unwrap());
+    if &header[..4] != b"SPDC"
+        || size < 24
+        || offset(entry)
+            .checked_add(size)
+            .is_none_or(|end| end > data.metadata().map(|meta| meta.len()).unwrap_or(0))
+    {
+        return Err(invalid("invalid chunked display record"));
+    }
+    Ok(size)
 }
 fn entry(file: &mut TrackedFile, index: u64) -> io::Result<[u8; ENTRY_BYTES]> {
     file.seek(SeekFrom::Start(index * ENTRY_BYTES as u64))?;
@@ -263,7 +300,6 @@ impl Store {
             folder,
             manifest,
             current: None,
-            raw: Vec::new(),
             compressed: Vec::new(),
             obsolete: Vec::new(),
             live: None,
@@ -290,11 +326,11 @@ impl Store {
         }
         if let Some(run) = store.manifest.runs.last() {
             let (data, index) = files(&store.folder, &run.name);
-            let data = open_sparse(&data)?;
+            let mut data = open_sparse(&data)?;
             let mut index = open_sparse(&index)?;
             if run.count > 0 {
                 let last = entry(&mut index, run.count - 1)?;
-                let length = u32::from_le_bytes(last[16..20].try_into().unwrap()) as u64;
+                let length = record_size(&mut data, &last)?;
                 data.set_len(offset(&last).saturating_add(length))?;
             }
             index.set_len(run.count * ENTRY_BYTES as u64)?;
@@ -317,7 +353,6 @@ impl Store {
     }
 
     fn write_record(
-        raw: &mut Vec<u8>,
         compressed: &mut Vec<u8>,
         data: &mut TrackedFile,
         index: &mut TrackedFile,
@@ -325,31 +360,39 @@ impl Store {
         value: &Value,
         ts: i64,
     ) -> io::Result<[u8; ENTRY_BYTES]> {
-        raw.clear();
-        rmp_serde::encode::write(&mut *raw, value).map_err(|e| invalid(&e.to_string()))?;
-        if raw.len() > MAX_RECORD {
-            return Err(invalid("display record exceeds 64 MiB"));
-        }
-        let bound = unsafe { LZ4_compressBound(raw.len() as i32) } as usize;
-        compressed.resize(bound, 0);
-        let len = unsafe {
-            LZ4_compress_default(
-                raw.as_ptr(),
-                compressed.as_mut_ptr(),
-                raw.len() as i32,
-                bound as i32,
-            )
-        };
-        if len <= 0 {
-            return Err(invalid("display compression failed"));
-        }
+        let mut raw = super::scratch::Spool::default();
+        rmp_serde::encode::write(&mut raw, value).map_err(|e| invalid(&e.to_string()))?;
+        let raw = raw.finish()?;
         let position = data.seek(SeekFrom::End(0))?;
-        data.write_all(&compressed[..len as usize])?;
+        let (packed_length, raw_length) = if raw.len() <= super::scratch::MEMORY_BYTES {
+            let len = compress_block(&raw, compressed)?;
+            data.write_all(&compressed[..len])?;
+            (len as u32, raw.len() as u32)
+        } else {
+            // Zero sizes in the fixed index select a u64 envelope of bounded
+            // LZ4 blocks. Publish the index only after the complete record.
+            let mut header = [0u8; 24];
+            header[..4].copy_from_slice(b"SPDC");
+            header[16..24].copy_from_slice(&(raw.len() as u64).to_le_bytes());
+            data.write_all(&header)?;
+            for block in raw.chunks(RECORD_BLOCK_BYTES) {
+                let len = compress_block(block, compressed)?;
+                data.write_all(&(len as u32).to_le_bytes())?;
+                data.write_all(&(block.len() as u32).to_le_bytes())?;
+                data.write_all(&compressed[..len])?;
+            }
+            let end = data.stream_position()?;
+            header[8..16].copy_from_slice(&(end - position).to_le_bytes());
+            data.seek(SeekFrom::Start(position))?;
+            data.write_all(&header)?;
+            data.seek(SeekFrom::Start(end))?;
+            (0, 0)
+        };
         let mut bytes = [0; ENTRY_BYTES];
         bytes[..8].copy_from_slice(&ts.to_le_bytes());
         bytes[8..16].copy_from_slice(&position.to_le_bytes());
-        bytes[16..20].copy_from_slice(&(len as u32).to_le_bytes());
-        bytes[20..24].copy_from_slice(&(raw.len() as u32).to_le_bytes());
+        bytes[16..20].copy_from_slice(&packed_length.to_le_bytes());
+        bytes[20..24].copy_from_slice(&raw_length.to_le_bytes());
         bytes[24..28].copy_from_slice(&kind(value).to_le_bytes());
         bytes[28..32].copy_from_slice(&(run.count as u32).to_le_bytes());
         for (i, bits) in filter(value).iter().enumerate() {
@@ -381,7 +424,6 @@ impl Store {
         }
         let (_, data, index) = self.current.as_mut().unwrap();
         Self::write_record(
-            &mut self.raw,
             &mut self.compressed,
             data,
             index,
@@ -436,7 +478,6 @@ impl Store {
                 let count = live.run.count.max(slot + 1);
                 live.run.count = slot;
                 let bytes = Self::write_record(
-                    &mut self.raw,
                     &mut self.compressed,
                     &mut live.data,
                     &mut live.index,
@@ -445,7 +486,7 @@ impl Store {
                     ts,
                 )?;
                 live.run.count = count;
-                live.bytes += u32::from_le_bytes(bytes[16..20].try_into().unwrap()) as u64;
+                live.bytes += record_size(&mut live.data, &bytes)?;
                 live.time.insert((ts, slot), id.clone());
                 live.rows.insert(id, (slot, bytes));
             }
@@ -481,7 +522,7 @@ impl Store {
         for ((ts, _), id) in &old.time {
             let (_, bytes) = old.rows[id];
             let mut bytes = bytes;
-            let size = u32::from_le_bytes(bytes[16..20].try_into().unwrap()) as u64;
+            let size = record_size(&mut old.data, &bytes)?;
             let position = new.data.stream_position()?;
             old.data.seek(SeekFrom::Start(offset(&bytes)))?;
             let mut remaining = size;
@@ -597,8 +638,7 @@ impl Store {
             fs::remove_file(index)?;
         }
         // A single unusually large group must not leave large scratch buffers resident.
-        if self.raw.capacity() > 1024 * 1024 {
-            self.raw = Vec::new();
+        if self.compressed.capacity() > 2 * RECORD_BLOCK_BYTES {
             self.compressed = Vec::new();
         }
         Ok(())

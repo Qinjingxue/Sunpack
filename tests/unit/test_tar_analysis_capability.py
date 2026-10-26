@@ -15,9 +15,9 @@ def _tar_bytes(payload: bytes = b"payload") -> bytes:
     return output.getvalue()
 
 
-def _tar_details(source, max_entries_to_walk: int = 64) -> dict:
+def _tar_details(source) -> dict:
     config = {"analysis": {"modules": [
-        {"name": "tar", "enabled": True, "max_entries_to_walk": max_entries_to_walk},
+        {"name": "tar", "enabled": True},
     ]}}
     report = ArchiveAnalyzer(config).analyze(source)
     return next(item for item in report.evidences if item.format == "tar").details
@@ -31,7 +31,7 @@ def test_tar_analysis_preserves_detection_fields(tmp_path):
     path = tmp_path / "archive.bin"
     path.write_bytes(_tar_bytes())
 
-    raw = _tar_details(str(path), max_entries_to_walk=8)
+    raw = _tar_details(str(path))
 
     assert raw["plausible"] is True
     assert raw["format"] == "ustar"
@@ -146,15 +146,9 @@ def test_tar_detection_uses_first_header_only_and_keeps_deep_analysis_separate(t
     path = tmp_path / "later-damaged.tar"
     path.write_bytes(data)
 
-    identity = dict(AnalysisBinaryView(str(path)).probe_tar(0, 0))
-
-    assert identity["plausible"] is True
-    assert identity["validation_scope"] == "format_identity"
-    assert identity["identity_strong"] is True
-    assert identity["entries_checked"] == 0
     assert confirm_tar(str(path)) is True
 
-    deep = _tar_details(str(path), max_entries_to_walk=8)
+    deep = _tar_details(str(path))
     assert deep["entry_walk_ok"] is True
     assert deep["walk_complete"] is False
     assert deep["error"]

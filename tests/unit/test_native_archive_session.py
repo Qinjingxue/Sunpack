@@ -91,14 +91,12 @@ def test_session_analysis_view_preserves_cache_budget_and_eof_semantics(tmp_path
     path = tmp_path / "analysis-view.bin"
     path.write_bytes(b"abcdefgh")
     session = get_archive_session(os.fspath(path))
-    view = session.analysis_view(cache_bytes=8, max_read_bytes=4, max_concurrent_reads=1)
+    view = session.analysis_view(cache_bytes=8, max_concurrent_reads=1)
 
     assert bytes(view.read_at(0, 4)) == b"abcd"
     assert bytes(view.read_at(0, 4)) == b"abcd"
     stats = dict(view.stats())
     assert stats == {"read_bytes": 4, "cache_hits": 1}
-    with pytest.raises(RuntimeError, match="read budget exceeded"):
-        view.read_at(4, 1)
 
     eof_view = session.analysis_view(cache_bytes=0)
     assert bytes(eof_view.read_at(6, 8)) == b"gh"

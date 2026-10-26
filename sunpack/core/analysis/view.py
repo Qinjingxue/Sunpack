@@ -25,18 +25,15 @@ class SharedBinaryView:
         path: str,
         *,
         cache_bytes: int = 64 * 1024 * 1024,
-        max_read_bytes: int | None = None,
         max_concurrent_reads: int = 1,
     ):
         self.path = path
         self.size = os.path.getsize(path)
         self.cache_bytes = max(0, int(cache_bytes or 0))
-        self.max_read_bytes = max_read_bytes if max_read_bytes is None else max(0, int(max_read_bytes))
         with lifecycle_registration((path,)):
             self._session = get_archive_session(path)
             self._native = self._session.analysis_view(
                 cache_bytes=self.cache_bytes,
-                max_read_bytes=self.max_read_bytes,
                 max_concurrent_reads=max_concurrent_reads,
             )
             native = self._native
@@ -101,7 +98,6 @@ class MultiVolumeBinaryView:
         paths,
         *,
         cache_bytes: int = 64 * 1024 * 1024,
-        max_read_bytes: int | None = None,
         max_concurrent_reads: int = 1,
     ):
         entries = _normalize_volume_entries(paths)
@@ -112,12 +108,10 @@ class MultiVolumeBinaryView:
         self.volume_style = next(iter(styles)) if len(styles) == 1 else ""
         self.path = self.volumes[0]
         self.cache_bytes = max(0, int(cache_bytes or 0))
-        self.max_read_bytes = max_read_bytes if max_read_bytes is None else max(0, int(max_read_bytes))
         with lifecycle_registration(self.volumes):
             self._native = _NativeAnalysisMultiVolumeView(
                 self.volumes,
                 cache_bytes=self.cache_bytes,
-                max_read_bytes=self.max_read_bytes,
                 max_concurrent_reads=max_concurrent_reads,
             )
             native = self._native

@@ -202,33 +202,10 @@ pub fn broker_read_root_changes(
     start_usn: i64,
     end_usn: i64,
 ) -> io::Result<Vec<String>> {
-    let (file_id, file_id_len) = parse_file_id(root_file_id)?;
-    let mut request = Request::simple(Opcode::ReadRootChanges, next_request_id());
-    request.volume_guid = volume_guid.to_owned();
-    request.file_id = file_id;
-    request.file_id_len = file_id_len;
-    request.previous_usn = start_usn;
-    request.current_usn = end_usn;
-    let state = STATE.get_or_init(|| Mutex::new(ClientState::default()));
-    let mut state = state
-        .lock()
-        .map_err(|_| io::Error::other("broker client state poisoned"))?;
-    if state.leases == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::NotConnected,
-            "SunPack Watch Broker has not been acquired",
-        ));
-    }
-    if state.connection.is_none() {
-        state.connection = Some(connect_and_hello()?);
-    }
-    let (response, payload) = state
-        .connection
-        .as_mut()
-        .unwrap()
-        .transact_payload(request)?;
-    ensure_ok(response)?;
-    decode_path_payload(&payload)
+    let (file_id, _) = parse_file_id(root_file_id)?;
+    let (journal, _) = broker_volume_cursor(volume_guid)?;
+    broker_read_directories_changes(volume_guid, journal, &[file_id], start_usn, end_usn)
+        .map(|changes| changes.into_iter().map(|(_, name)| name).collect())
 }
 
 pub fn broker_read_directories_changes(
@@ -237,22 +214,29 @@ pub fn broker_read_directories_changes(
     directories: &[[u8; 16]],
     start: i64,
     end: i64,
-) -> io::Result<Vec<(u32, String)>> {
-    let bytes = 8usize.saturating_add(directories.len().saturating_mul(16));
-    if directories.is_empty() || bytes > crate::protocol::MAX_DIRECTORY_QUERY_BYTES {
-        return Err(io::Error::other(
-            "directory recovery query exceeds payload budget",
+) -> io::Result<Vec<(usize, String)>> {
+    let mut changes = std::collections::BTreeSet::new();
+    broker_for_each_directory_change(volume, journal, directories, start, end, |index, name| {
+        changes.insert((index, name.to_owned()));
+        Ok(())
+    })?;
+    Ok(changes.into_iter().collect())
+}
+
+pub fn broker_for_each_directory_change(
+    volume: &str,
+    journal: u64,
+    directories: &[[u8; 16]],
+    start: i64,
+    end: i64,
+    mut observe: impl FnMut(usize, &str) -> io::Result<()>,
+) -> io::Result<()> {
+    if directories.is_empty() || start <= 0 || end <= start {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid directory recovery query",
         ));
     }
-    let mut query = Vec::with_capacity(bytes);
-    query.extend_from_slice(&journal.to_le_bytes());
-    for id in directories {
-        query.extend_from_slice(id);
-    }
-    let mut request = Request::simple(Opcode::ReadDirectoriesChanges, next_request_id());
-    request.volume_guid = volume.to_owned();
-    request.previous_usn = start;
-    request.current_usn = end;
     let state = STATE.get_or_init(|| Mutex::new(ClientState::default()));
     let mut state = state
         .lock()
@@ -266,66 +250,64 @@ pub fn broker_read_directories_changes(
     if state.connection.is_none() {
         state.connection = Some(connect_and_hello()?);
     }
-    let result = state
-        .connection
-        .as_mut()
-        .unwrap()
-        .transact_query(request, &query);
-    // A truncated exchange must never leave unread payload on the next request.
+    let result = (|| {
+        let connection = state.connection.as_mut().unwrap();
+        let batch_ids = (crate::protocol::MAX_DIRECTORY_QUERY_BYTES - 8) / 16;
+        for (batch, ids) in directories.chunks(batch_ids).enumerate() {
+            let mut query = Vec::with_capacity(8 + ids.len() * 16);
+            query.extend_from_slice(&journal.to_le_bytes());
+            for id in ids {
+                query.extend_from_slice(id);
+            }
+            let mut cursor = start;
+            while cursor < end {
+                let mut request =
+                    Request::simple(Opcode::ReadDirectoriesChanges, next_request_id());
+                request.volume_guid = volume.to_owned();
+                request.previous_usn = cursor;
+                request.current_usn = end;
+                let (response, payload) = connection.transact_query(request, &query)?;
+                ensure_ok(response)?;
+                if response.journal_id != journal
+                    || response.next_usn <= cursor
+                    || response.next_usn > end
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "invalid directory recovery cursor",
+                    ));
+                }
+                let mut input = payload.as_slice();
+                let mut count = 0usize;
+                while !input.is_empty() {
+                    if input.len() < 8 {
+                        return Err(io::Error::other("truncated directory change"));
+                    }
+                    let index = u32::from_le_bytes(input[..4].try_into().unwrap()) as usize;
+                    let length = u32::from_le_bytes(input[4..8].try_into().unwrap()) as usize;
+                    input = &input[8..];
+                    if index >= ids.len() || length > input.len() {
+                        return Err(io::Error::other("invalid directory change"));
+                    }
+                    let name = std::str::from_utf8(&input[..length])
+                        .map_err(|_| io::Error::other("invalid directory change UTF-8"))?;
+                    observe(batch * batch_ids + index, name)?;
+                    input = &input[length..];
+                    count += 1;
+                }
+                if count != response.reasons_without_close as usize {
+                    return Err(io::Error::other("directory recovery count mismatch"));
+                }
+                cursor = response.next_usn;
+            }
+        }
+        Ok(())
+    })();
+    // A truncated exchange must never poison the framing of the next request.
     if result.is_err() {
         state.connection.take();
     }
-    let (response, payload) = result?;
-    ensure_ok(response)?;
-    let mut input = payload.as_slice();
-    let mut result = Vec::new();
-    while !input.is_empty() {
-        if input.len() < 8 {
-            return Err(io::Error::other("truncated directory change"));
-        }
-        let index = u32::from_le_bytes(input[..4].try_into().unwrap());
-        let length = u32::from_le_bytes(input[4..8].try_into().unwrap()) as usize;
-        input = &input[8..];
-        if index as usize >= directories.len() || length > input.len() {
-            return Err(io::Error::other("invalid directory change"));
-        }
-        let name = std::str::from_utf8(&input[..length])
-            .map_err(|_| io::Error::other("invalid directory change UTF-8"))?
-            .to_owned();
-        result.push((index, name));
-        input = &input[length..];
-    }
-    Ok(result)
-}
-
-fn decode_path_payload(payload: &[u8]) -> io::Result<Vec<String>> {
-    let mut offset = 0usize;
-    let mut result = Vec::new();
-    while offset < payload.len() {
-        if offset + 4 > payload.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "truncated path payload",
-            ));
-        }
-        let length = u32::from_le_bytes(payload[offset..offset + 4].try_into().unwrap()) as usize;
-        offset += 4;
-        if offset + length > payload.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "truncated path payload item",
-            ));
-        }
-        result.push(
-            std::str::from_utf8(&payload[offset..offset + length])
-                .map_err(|_| {
-                    io::Error::new(io::ErrorKind::InvalidData, "path payload is not UTF-8")
-                })?
-                .to_owned(),
-        );
-        offset += length;
-    }
-    Ok(result)
+    result
 }
 
 fn transact_request(request: Request) -> io::Result<Response> {

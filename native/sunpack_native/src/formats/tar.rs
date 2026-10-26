@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::io;
 
 const BLOCK: u64 = 512;
-const MAX_METADATA: usize = 1024 * 1024;
+pub(crate) const MAX_METADATA: usize = 1024 * 1024;
 type ReadAt<'a> = dyn FnMut(u64, usize) -> io::Result<Vec<u8>> + 'a;
 
 pub(crate) enum TarMetadata<'a> {

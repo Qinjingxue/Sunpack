@@ -58,7 +58,6 @@ class OutputInventory:
         self,
         archive_files,
         *,
-        archive_limit: int | None = None,
         verify_crc: bool = False,
         basename_mode: str = "unique",
         include_observations: bool = False,
@@ -75,7 +74,6 @@ class OutputInventory:
             max(0, int(detail_offset or 0)),
             max(0, int(detail_limit or 0)),
             max(0, int(max_issue_items or 0)),
-            None if archive_limit is None else max(0, int(archive_limit)),
         ))
 
     def parent_directories(self) -> tuple[str, ...]:

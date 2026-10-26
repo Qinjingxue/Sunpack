@@ -23,20 +23,12 @@ const RAR_TRUNCATION_ERRORS: &[&str] = &[
     "rar5_header_size_out_of_range",
     "rar5_block_payload_out_of_range",
 ];
-const RAR_WALK_LIMIT_ERRORS: &[&str] = &[
-    "rar4_block_walk_limit_reached",
-    "rar5_block_walk_limit_reached",
-];
 const SEVEN_ZIP_BOUNDARY_ERRORS: &[&str] = &[
     "start_header_crc_mismatch",
     "next_header_out_of_range",
     "invalid_next_header_range",
 ];
-const TAR_BENIGN_ERRORS: &[&str] = &[
-    "tar_end_zero_blocks_not_found",
-    "tar_walk_budget_exhausted",
-    "analysis_resource_limit",
-];
+const TAR_BENIGN_ERRORS: &[&str] = &["tar_end_zero_blocks_not_found", "analysis_resource_limit"];
 const ZIP_LOCAL_RECOVERY_ERRORS: &[&str] = &[
     "bad_central_directory_signature",
     "archive_offset_underflow",
@@ -64,47 +56,26 @@ enum ModuleKind {
     SevenZip,
     Tar,
     Stream(&'static str),
-    CompressedTar(&'static str, &'static str),
+    CompressedTar(&'static str, &'static str, u64),
 }
 
 impl ModuleKind {
-    fn from_name(name: &str) -> Option<(Self, &'static str, u64)> {
-        // (kind, config parameter, default budget)
+    fn from_name(name: &str) -> Option<Self> {
         Some(match name {
-            "zip" => (Self::Zip, "max_cd_entries_to_walk", 64),
-            "rar" => (Self::Rar, "max_blocks_to_walk", 4096),
-            "seven_zip" => (Self::SevenZip, "max_next_header_check_bytes", 1024 * 1024),
-            "tar" => (Self::Tar, "max_entries_to_walk", 64),
-            "gzip" => (Self::Stream("gzip"), "", 0),
-            "bzip2" => (Self::Stream("bzip2"), "", 0),
-            "xz" => (Self::Stream("xz"), "", 0),
-            "zstd" => (Self::Stream("zstd"), "", 0),
-            "lz4" => (Self::Stream("lz4"), "", 0),
-            "tar_gz" => (
-                Self::CompressedTar("tar.gz", "gzip"),
-                "max_probe_bytes",
-                4 * 1024 * 1024,
-            ),
-            "tar_bz2" => (
-                Self::CompressedTar("tar.bz2", "bzip2"),
-                "max_probe_bytes",
-                4 * 1024 * 1024,
-            ),
-            "tar_xz" => (
-                Self::CompressedTar("tar.xz", "xz"),
-                "max_probe_bytes",
-                4 * 1024 * 1024,
-            ),
-            "tar_zst" => (
-                Self::CompressedTar("tar.zst", "zstd"),
-                "max_probe_bytes",
-                4 * 1024 * 1024,
-            ),
-            "tar_lz4" => (
-                Self::CompressedTar("tar.lz4", "lz4"),
-                "max_probe_bytes",
-                4 * 1024 * 1024,
-            ),
+            "zip" => Self::Zip,
+            "rar" => Self::Rar,
+            "seven_zip" => Self::SevenZip,
+            "tar" => Self::Tar,
+            "gzip" => Self::Stream("gzip"),
+            "bzip2" => Self::Stream("bzip2"),
+            "xz" => Self::Stream("xz"),
+            "zstd" => Self::Stream("zstd"),
+            "lz4" => Self::Stream("lz4"),
+            "tar_gz" => Self::CompressedTar("tar.gz", "gzip", 4 * 1024 * 1024),
+            "tar_bz2" => Self::CompressedTar("tar.bz2", "bzip2", 4 * 1024 * 1024),
+            "tar_xz" => Self::CompressedTar("tar.xz", "xz", 4 * 1024 * 1024),
+            "tar_zst" => Self::CompressedTar("tar.zst", "zstd", 4 * 1024 * 1024),
+            "tar_lz4" => Self::CompressedTar("tar.lz4", "lz4", 4 * 1024 * 1024),
             _ => return None,
         })
     }
@@ -116,7 +87,7 @@ impl ModuleKind {
             Self::SevenZip => "7z",
             Self::Tar => "tar",
             Self::Stream(format) => format,
-            Self::CompressedTar(format, _) => format,
+            Self::CompressedTar(format, _, _) => format,
         }
     }
 }
@@ -125,7 +96,6 @@ impl ModuleKind {
 struct ModuleConfig {
     name: String,
     kind: ModuleKind,
-    budget: u64,
 }
 
 /// Parsed analysis configuration, built once per engine and shared by calls.
@@ -176,15 +146,20 @@ impl NativeAnalysisConfig {
                     if !enabled || name.is_empty() {
                         continue;
                     }
-                    let Some((kind, parameter, default)) = ModuleKind::from_name(&name) else {
+                    let Some(kind) = ModuleKind::from_name(&name) else {
                         continue;
                     };
-                    let budget = if parameter.is_empty() {
-                        0
-                    } else {
-                        positive_int_or(item, parameter, default)?
+                    let kind = match kind {
+                        ModuleKind::CompressedTar(format, stream, default) => {
+                            ModuleKind::CompressedTar(
+                                format,
+                                stream,
+                                positive_int_or(item, "max_probe_bytes", default)?,
+                            )
+                        }
+                        other => other,
                     };
-                    let module = ModuleConfig { name, kind, budget };
+                    let module = ModuleConfig { name, kind };
                     // A repeated name keeps its first position and last settings.
                     match modules
                         .iter_mut()
@@ -518,15 +493,17 @@ impl AnalysisBinaryView {
 impl<'a, 'py> ReportContext<'a, 'py> {
     fn run_module(&mut self, module: &ModuleConfig) -> PyResult<Evidence<'py>> {
         match module.kind {
-            ModuleKind::Zip => self.zip_module(module.budget as usize),
-            ModuleKind::Rar => self.rar_module(module.budget as usize),
-            ModuleKind::SevenZip => self.seven_zip_module(module.budget),
-            ModuleKind::Tar => self.tar_module(module.budget as usize),
+            ModuleKind::Zip => self.zip_module(),
+            ModuleKind::Rar => self.rar_module(),
+            ModuleKind::SevenZip => self.seven_zip_module(),
+            ModuleKind::Tar => self.tar_module(),
             ModuleKind::Stream("lz4") => self.lz4_module(false, 0),
             ModuleKind::Stream(format) => self.stream_module(format),
-            ModuleKind::CompressedTar("tar.lz4", "lz4") => self.lz4_module(true, module.budget),
-            ModuleKind::CompressedTar(format, stream) => {
-                self.compressed_tar_module(format, stream, module.budget as usize)
+            ModuleKind::CompressedTar("tar.lz4", "lz4", probe_bytes) => {
+                self.lz4_module(true, probe_bytes)
+            }
+            ModuleKind::CompressedTar(format, stream, probe_bytes) => {
+                self.compressed_tar_module(format, stream, probe_bytes as usize)
             }
         }
     }
@@ -560,7 +537,7 @@ impl<'a, 'py> ReportContext<'a, 'py> {
 
     // ---- RAR ------------------------------------------------------------
 
-    fn rar_module(&mut self, max_blocks: usize) -> PyResult<Evidence<'py>> {
+    fn rar_module(&mut self) -> PyResult<Evidence<'py>> {
         let py = self.py;
         let hits = self.hits(|kind| kind == ReportHitKind::Rar);
         let embedded = self.embedded("rar", true)?;
@@ -612,7 +589,7 @@ impl<'a, 'py> ReportContext<'a, 'py> {
             .into_iter()
             .filter(|start| !exact_starts.contains(start))
         {
-            let native = py.detach(|| self.view.probe_rar_native(start, max_blocks))?;
+            let native = py.detach(|| self.view.probe_rar_native(start))?;
             candidates.push(rar_from_native(native, start)?);
         }
         combine_candidates(py, "rar", candidates, self.preserve_multiple()?)
@@ -620,7 +597,7 @@ impl<'a, 'py> ReportContext<'a, 'py> {
 
     // ---- 7z -------------------------------------------------------------
 
-    fn seven_zip_module(&mut self, max_next_header: u64) -> PyResult<Evidence<'py>> {
+    fn seven_zip_module(&mut self) -> PyResult<Evidence<'py>> {
         let py = self.py;
         let embedded = self.embedded("7z", true)?;
         let mut exact = Vec::new();
@@ -648,7 +625,7 @@ impl<'a, 'py> ReportContext<'a, 'py> {
         starts.dedup();
         let mut candidates = Vec::new();
         for start in starts {
-            let native = py.detach(|| self.view.probe_seven_zip_native(start, max_next_header))?;
+            let native = py.detach(|| self.view.probe_seven_zip_native(start))?;
             candidates.push(seven_zip_from_native(native, start)?);
         }
         combine_candidates(py, "7z", candidates, self.preserve_multiple()?)
@@ -656,7 +633,7 @@ impl<'a, 'py> ReportContext<'a, 'py> {
 
     // ---- TAR ------------------------------------------------------------
 
-    fn tar_module(&mut self, max_entries: usize) -> PyResult<Evidence<'py>> {
+    fn tar_module(&mut self) -> PyResult<Evidence<'py>> {
         let py = self.py;
         let embedded = self.embedded("tar", true)?;
         if !embedded.is_empty() {
@@ -710,7 +687,7 @@ impl<'a, 'py> ReportContext<'a, 'py> {
         // A valid archive at offset zero owns its member headers. Treating
         // every member's ustar marker as another embedded archive would turn a
         // large archive into suffix-only extraction.
-        let primary = self.tar_candidate(0, max_entries)?;
+        let primary = self.tar_candidate(0)?;
         let mut evidences = Vec::new();
         if let Some(primary) = primary {
             if primary.status == "extractable" {
@@ -723,7 +700,7 @@ impl<'a, 'py> ReportContext<'a, 'py> {
             if start == 0 || start < covered_until {
                 continue;
             }
-            let Some(candidate) = self.tar_candidate(start, max_entries)? else {
+            let Some(candidate) = self.tar_candidate(start)? else {
                 continue;
             };
             let end = candidate.segments.first().and_then(|segment| segment.end);
@@ -740,8 +717,8 @@ impl<'a, 'py> ReportContext<'a, 'py> {
         combine_candidates(py, "tar", evidences, self.preserve_multiple()?)
     }
 
-    fn tar_observation(&self, start: u64, max_entries: usize) -> PyResult<Bound<'py, PyDict>> {
-        let raw = self.view.walk_tar(self.py, start, max_entries)?;
+    fn tar_observation(&self, start: u64) -> PyResult<Bound<'py, PyDict>> {
+        let raw = self.view.walk_tar(self.py, start)?;
         set_default(&raw, "archive_offset", start)?;
         let detected = if truthy(&raw, "plausible")? {
             ".tar"
@@ -766,8 +743,8 @@ impl<'a, 'py> ReportContext<'a, 'py> {
         Ok(raw)
     }
 
-    fn tar_candidate(&self, start: u64, max_entries: usize) -> PyResult<Option<Evidence<'py>>> {
-        let result = self.tar_observation(start, max_entries)?;
+    fn tar_candidate(&self, start: u64) -> PyResult<Option<Evidence<'py>>> {
+        let result = self.tar_observation(start)?;
         if truthy(&result, "plausible")? {
             let confidence = if truthy(&result, "end_zero_blocks")? {
                 0.94
@@ -812,7 +789,7 @@ impl<'a, 'py> ReportContext<'a, 'py> {
 
     // ---- ZIP ------------------------------------------------------------
 
-    fn zip_module(&mut self, max_entries: usize) -> PyResult<Evidence<'py>> {
+    fn zip_module(&mut self) -> PyResult<Evidence<'py>> {
         let py = self.py;
         let hits = self.hits(|kind| {
             matches!(
@@ -844,7 +821,7 @@ impl<'a, 'py> ReportContext<'a, 'py> {
         eocd_hits.sort_unstable_by(|left, right| right.cmp(left));
         let mut evidences = Vec::new();
         for eocd_offset in eocd_hits {
-            let native = self.zip_eocd_observation(eocd_offset, max_entries)?;
+            let native = self.zip_eocd_observation(eocd_offset)?;
             if native.is_empty()
                 || !(truthy(&native, "magic_matched")? || truthy(&native, "plausible")?)
             {
@@ -888,11 +865,7 @@ impl<'a, 'py> ReportContext<'a, 'py> {
         combine_candidates(py, "zip", evidences, self.preserve_multiple()?)
     }
 
-    fn zip_eocd_observation(
-        &self,
-        requested: u64,
-        max_entries: usize,
-    ) -> PyResult<Bound<'py, PyDict>> {
+    fn zip_eocd_observation(&self, requested: u64) -> PyResult<Bound<'py, PyDict>> {
         let py = self.py;
         let candidate = self
             .view
@@ -910,7 +883,7 @@ impl<'a, 'py> ReportContext<'a, 'py> {
         let eocd_offset = u64_of(&candidate, "eocd_candidate_offset")?;
         let raw = self
             .view
-            .probe_zip_with_disk_starts(py, eocd_offset, max_entries.min(256), self.disk_starts)?
+            .probe_zip_with_disk_starts(py, eocd_offset, self.disk_starts)?
             .into_bound(py);
         raw.update(candidate.as_mapping())?;
         set_default(
@@ -1238,7 +1211,7 @@ fn rar_from_native<'py>(mut raw: RarObservation, start: u64) -> PyResult<Evidenc
     raw.plausible |= raw.header_crc_ok;
     raw.block_walk_ok |= raw.end_block_found;
     let error = raw.error;
-    if !error.is_empty() && !RAR_WALK_LIMIT_ERRORS.contains(&error) {
+    if !error.is_empty() {
         damage_flags.push(error.into());
     }
     if raw.blocks_checked > 0 && RAR_TRUNCATION_ERRORS.contains(&error) {
@@ -2049,6 +2022,50 @@ fn evidence_to_python<'py>(
             segment.evidence.clone(),
         ))?;
     }
+    let details = evidence.details.to_python(py)?;
+    // Completion is independent of extraction feasibility and content CRC.
+    // Encrypted headers can authorize extraction with only partial structure.
+    let resource_unavailable = evidence.status == "error"
+        || str_of(&details, "error")? == "analysis_resource_limit"
+        || dict_item(&details, "read_error")?
+            .is_some_and(|fault| str_of(&fault, "code").is_ok_and(|code| code == "io_error"));
+    let complete = match &evidence.details {
+        EvidenceDetails::Rar(value) => {
+            value.raw.end_block_found
+                && value.raw.error.is_empty()
+                && value.raw.read_fault.is_none()
+        }
+        EvidenceDetails::SevenZip(value) => {
+            value.raw.next_header_crc_ok
+                && value.raw.next_header_nid_valid
+                && value.raw.error.is_empty()
+        }
+        _ if evidence.format == "zip" => {
+            truthy(&details, "central_directory_walk_ok")?
+                && truthy(&details, "local_header_links_ok")?
+        }
+        _ if evidence.format == "tar" => {
+            truthy(&details, "walk_complete")? && str_of(&details, "error")?.is_empty()
+        }
+        _ => truthy(&details, "structure_validation_complete")?,
+    };
+    let invalid = !str_of(&details, "error")?.is_empty()
+        && !resource_unavailable
+        && !truthy(&details, "encrypted_header")?
+        && !truthy(&details, "header_encrypted")?
+        && evidence.status != "not_found";
+    details.set_item(
+        "analysis_state",
+        if resource_unavailable {
+            "resource_unavailable"
+        } else if invalid {
+            "invalid"
+        } else if complete {
+            "complete"
+        } else {
+            "partial"
+        },
+    )?;
     PyTuple::new(
         py,
         [
@@ -2057,7 +2074,7 @@ fn evidence_to_python<'py>(
             evidence.status.into_pyobject(py)?.into_any(),
             segments.into_any(),
             evidence.warnings.clone().into_pyobject(py)?.into_any(),
-            evidence.details.to_python(py)?.into_any(),
+            details.into_any(),
         ],
     )
 }

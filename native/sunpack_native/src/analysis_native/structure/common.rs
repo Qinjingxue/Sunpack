@@ -27,11 +27,7 @@ fn read_at(path: &str, offset: u64, max_len: usize) -> std::io::Result<(u64, Vec
     Ok((file_size, reader.read_exact_at(offset, len)?))
 }
 
-fn has_central_directory_signature(
-    file: &mut SourceCursor,
-    offset: u64,
-    file_size: u64,
-) -> bool {
+fn has_central_directory_signature(file: &mut SourceCursor, offset: u64, file_size: u64) -> bool {
     let mut sig = [0u8; 4];
     seek_field(
         file,
@@ -96,7 +92,6 @@ fn walk_zip_central_directory(
     central_directory_offset: u64,
     central_directory_size: u64,
     total_entries: usize,
-    max_entries: usize,
 ) -> Result<(usize, bool, usize, bool, &'static str), ReadFault> {
     if total_entries == 0 || central_directory_size == 0 {
         return Ok((
@@ -107,14 +102,10 @@ fn walk_zip_central_directory(
             "",
         ));
     }
-    let limit = total_entries.min(max_entries);
-    if limit == 0 {
-        return Ok((0, false, 0, false, ""));
-    }
     let mut cursor = central_directory_offset;
     let central_end = central_directory_offset + central_directory_size;
     let mut checked = 0;
-    for _ in 0..limit {
+    for _ in 0..total_entries {
         if cursor + ZIP_CENTRAL_DIRECTORY_HEADER_SIZE as u64 > central_end
             || cursor + ZIP_CENTRAL_DIRECTORY_HEADER_SIZE as u64 > file_size
         {
@@ -154,7 +145,7 @@ fn walk_zip_central_directory(
         if disk_start != 0 {
             return Ok((checked, false, checked, false, "central_entry_multi_disk"));
         }
-        if filename_len == 0 || filename_len > 4096 {
+        if filename_len == 0 {
             return Ok((
                 checked,
                 false,
@@ -213,7 +204,36 @@ fn walk_zip_central_directory(
         checked += 1;
         cursor += entry_size;
     }
-    Ok((checked, checked > 0, checked, true, ""))
+    let complete =
+        crate::formats::zip::central_directory_complete(cursor, central_end, |offset, length| {
+            seek_field(
+                file,
+                offset,
+                file_size,
+                "zip.central_directory.signature",
+                FieldLocation::Tail,
+            )?;
+            let mut header = vec![0; length];
+            read_exact_field(
+                file,
+                &mut header,
+                file_size,
+                "zip.central_directory.signature",
+                FieldLocation::Tail,
+            )?;
+            Ok::<_, ReadFault>(header)
+        })?;
+    Ok((
+        checked,
+        complete,
+        checked,
+        complete,
+        if complete {
+            ""
+        } else {
+            "central_directory_size_mismatch"
+        },
+    ))
 }
 
 fn zip_eocd_empty<'py>(py: Python<'py>, error: &str) -> PyResult<Bound<'py, PyDict>> {

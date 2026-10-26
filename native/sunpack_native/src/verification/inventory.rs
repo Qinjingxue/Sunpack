@@ -2,16 +2,18 @@ use super::paths::{
     clean_relative_archive_path, unsafe_archive_path, windows_output_relative_path,
 };
 use crate::io::reader::ManagedReader;
+use crate::io::scratch::{Slots, SpillMap};
 use crate::scan::directory::{
     NativeOutputInventory, OutputFileRecord, OutputInventoryVerificationSnapshot,
 };
-use crate::verification::archive_manifest::{ManifestEntry, NativeArchiveManifest};
+#[cfg(test)]
+use crate::verification::archive_manifest::ManifestEntry;
+use crate::verification::archive_manifest::NativeArchiveManifest;
 use crc32fast::Hasher as Crc32Hasher;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyList};
 use std::borrow::Cow;
-use std::collections::HashMap;
-use std::io::Read;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::Arc;
@@ -27,8 +29,7 @@ const CRC_BUFFER_SIZE: usize = 1024 * 1024;
     include_observations=false,
     detail_offset=0,
     detail_limit=128,
-    max_issue_items=20,
-    archive_limit=None
+    max_issue_items=20
 ))]
 pub(crate) fn match_output_inventory_coverage(
     py: Python<'_>,
@@ -40,7 +41,6 @@ pub(crate) fn match_output_inventory_coverage(
     detail_offset: usize,
     detail_limit: usize,
     max_issue_items: usize,
-    archive_limit: Option<usize>,
 ) -> PyResult<Py<PyDict>> {
     // A native archive manifest is matched straight from its Rust entry table;
     // plain dict iterables remain for configured / name-only expectations.
@@ -56,10 +56,10 @@ pub(crate) fn match_output_inventory_coverage(
     let basename_mode = BasenameMode::parse(basename_mode)?;
     let matched = py.detach(|| {
         let expected = match manifest {
-            Some(manifest) => archive_items_from_manifest(manifest.entries_view(archive_limit)),
-            None => expected,
+            Some(manifest) => Expected::Manifest(manifest, manifest.entry_count(None)),
+            None => Expected::Items(expected),
         };
-        match_inventory(
+        match_inventory_source(
             expected,
             snapshot,
             verify_crc,
@@ -70,7 +70,7 @@ pub(crate) fn match_output_inventory_coverage(
             max_issue_items,
         )
     });
-    match_result_to_py(py, matched)
+    match_result_to_py(py, matched?)
 }
 
 #[derive(Clone, Copy)]
@@ -101,6 +101,58 @@ struct ArchiveFile<'a> {
     size: Option<u64>,
     has_crc: bool,
     crc32: Option<u32>,
+}
+
+enum Expected<'a> {
+    Items(Vec<ArchiveFile<'a>>),
+    Manifest(&'a NativeArchiveManifest, usize),
+}
+impl Expected<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Items(items) => items.len(),
+            Self::Manifest(_, len) => *len,
+        }
+    }
+    fn get(&self, index: usize) -> io::Result<ArchiveFile<'_>> {
+        match self {
+            Self::Items(items) => Ok(items[index].clone()),
+            Self::Manifest(manifest, _) => {
+                let item = manifest.entries.get(index)?;
+                match item {
+                    Cow::Borrowed(item) => Ok(archive_file(
+                        &item.path,
+                        Cow::Borrowed(item.raw_path.as_deref().unwrap_or(&item.path)),
+                        Some(item.size),
+                        item.crc32.is_some(),
+                        item.crc32,
+                    )
+                    .unwrap_or_else(|| ArchiveFile {
+                        path: Cow::Borrowed(""),
+                        raw_path: Cow::Borrowed(item.raw_path.as_deref().unwrap_or(&item.path)),
+                        unsafe_path: true,
+                        size: Some(item.size),
+                        has_crc: item.crc32.is_some(),
+                        crc32: item.crc32,
+                    })),
+                    Cow::Owned(item) => {
+                        let raw = item.raw_path.as_deref().unwrap_or(&item.path);
+                        let path =
+                            windows_output_relative_path(clean_relative_archive_path(&item.path))
+                                .into_owned();
+                        Ok(ArchiveFile {
+                            unsafe_path: path.is_empty() || unsafe_archive_path(raw),
+                            path: Cow::Owned(path),
+                            raw_path: Cow::Owned(raw.to_owned()),
+                            size: Some(item.size),
+                            has_crc: item.crc32.is_some(),
+                            crc32: item.crc32,
+                        })
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -169,51 +221,43 @@ struct MatchResult {
 struct OutputIndex<'a> {
     files: &'a [OutputFileRecord],
     root: &'a Path,
-    by_path: HashMap<Cow<'a, str>, usize>,
-    by_folded_path: HashMap<String, usize>,
-    by_basename: HashMap<String, usize>,
+    by_path: SpillMap<usize>,
+    by_folded_path: SpillMap<usize>,
+    by_basename: SpillMap<usize>,
 }
 
 const AMBIGUOUS_OUTPUT: usize = usize::MAX;
 
-fn insert_unique_output<K: Eq + std::hash::Hash>(
-    index: &mut HashMap<K, usize>,
-    key: K,
-    value: usize,
-) {
-    index
-        .entry(key)
-        .and_modify(|entry| *entry = AMBIGUOUS_OUTPUT)
-        .or_insert(value);
+fn insert_unique_output(index: &mut SpillMap<usize>, key: String, value: usize) -> io::Result<()> {
+    if !index.insert_new(key.clone(), value)? {
+        index.put(key, AMBIGUOUS_OUTPUT)?;
+    }
+    Ok(())
 }
 
 impl<'a> OutputIndex<'a> {
-    fn new(snapshot: &'a OutputInventoryVerificationSnapshot) -> Self {
-        let mut by_path = HashMap::with_capacity(snapshot.files.len());
+    fn new(snapshot: &'a OutputInventoryVerificationSnapshot) -> io::Result<Self> {
+        let mut by_path = SpillMap::default();
         for (index, item) in snapshot.files.iter().enumerate() {
             let path = output_relative_path(item);
             if path.is_empty() {
                 continue;
             }
-            insert_unique_output(&mut by_path, path, index);
+            insert_unique_output(&mut by_path, path.into_owned(), index)?;
         }
-        Self {
+        Ok(Self {
             files: &snapshot.files,
             root: Path::new(&snapshot.root),
             by_path,
-            by_folded_path: HashMap::new(),
-            by_basename: HashMap::new(),
-        }
+            by_folded_path: SpillMap::default(),
+            by_basename: SpillMap::default(),
+        })
     }
 
-    fn match_expected(
-        &mut self,
-        expected: &[ArchiveFile<'_>],
-        mode: BasenameMode,
-    ) -> Vec<Option<(usize, &'static str)>> {
-        let mut matched = vec![None; expected.len()];
+    fn match_expected(&mut self, expected: &Expected<'_>, mode: BasenameMode) -> io::Result<Slots> {
+        let mut matched = Slots::new(expected.len())?;
         let mut used = vec![false; self.files.len()];
-        let mut remaining = expected.iter().filter(|item| !item.unsafe_path).count();
+        let mut remaining = expected.len();
         // Reserve exact matches for the entire manifest before any fallback
         // can steal another entry's output. Every output contributes once.
         for pass in 0..3 {
@@ -228,42 +272,47 @@ impl<'a> OutputIndex<'a> {
                         continue;
                     }
                     let folded = normalize_match_path(&path);
-                    insert_unique_output(&mut self.by_folded_path, folded.clone(), output);
+                    insert_unique_output(&mut self.by_folded_path, folded.clone(), output)?;
                     if !matches!(mode, BasenameMode::None) {
                         insert_unique_output(
                             &mut self.by_basename,
                             normalize_match_name(basename(&folded)),
                             output,
-                        );
+                        )?;
                     }
                 }
             }
-            for (position, item) in expected.iter().enumerate() {
-                if item.unsafe_path || matched[position].is_some() {
+            for position in 0..expected.len() {
+                if matched.get(position) != 0 {
+                    continue;
+                }
+                let item = expected.get(position)?;
+                if item.unsafe_path {
                     continue;
                 }
                 let (output, by) = match pass {
-                    0 => (self.by_path.get(item.path.as_ref()), "path"),
+                    0 => (self.by_path.get(item.path.as_ref())?, "path"),
                     1 => (
-                        self.by_folded_path.get(&normalize_match_path(&item.path)),
+                        self.by_folded_path.get(&normalize_match_path(&item.path))?,
                         "path",
                     ),
                     _ => (
                         self.by_basename
-                            .get(&normalize_match_name(basename(&item.path))),
+                            .get(&normalize_match_name(basename(&item.path)))?,
                         "basename",
                     ),
                 };
-                if let Some(&output) = output {
+                if let Some(output) = output {
                     if output != AMBIGUOUS_OUTPUT && !used[output] {
                         used[output] = true;
-                        matched[position] = Some((output, by));
+                        let _ = by;
+                        matched.set(position, output as u64 * 4 + pass + 1);
                         remaining -= 1;
                     }
                 }
             }
         }
-        matched
+        Ok(matched)
     }
 
     fn crc_for(
@@ -285,6 +334,7 @@ impl<'a> OutputIndex<'a> {
     }
 }
 
+#[cfg(test)]
 fn match_inventory(
     expected: Vec<ArchiveFile<'_>>,
     snapshot: OutputInventoryVerificationSnapshot,
@@ -295,15 +345,46 @@ fn match_inventory(
     detail_limit: usize,
     max_issue_items: usize,
 ) -> MatchResult {
+    match_inventory_source(
+        Expected::Items(expected),
+        snapshot,
+        verify_crc,
+        basename_mode,
+        include_observations,
+        detail_offset,
+        detail_limit,
+        max_issue_items,
+    )
+    .unwrap()
+}
+
+fn match_inventory_source(
+    expected: Expected<'_>,
+    snapshot: OutputInventoryVerificationSnapshot,
+    verify_crc: bool,
+    basename_mode: BasenameMode,
+    include_observations: bool,
+    detail_offset: usize,
+    detail_limit: usize,
+    max_issue_items: usize,
+) -> io::Result<MatchResult> {
     if !snapshot.exists {
-        return empty_status_result("missing", expected.len(), detail_offset);
+        return Ok(empty_status_result(
+            "missing",
+            expected.len(),
+            detail_offset,
+        ));
     }
     if !snapshot.is_dir {
-        return empty_status_result("not_directory", expected.len(), detail_offset);
+        return Ok(empty_status_result(
+            "not_directory",
+            expected.len(),
+            detail_offset,
+        ));
     }
 
-    let mut index = OutputIndex::new(&snapshot);
-    let matches = index.match_expected(&expected, basename_mode);
+    let mut index = OutputIndex::new(&snapshot)?;
+    let matches = index.match_expected(&expected, basename_mode)?;
     let mut coverage = Coverage::default();
     coverage.expected_files = expected.len();
 
@@ -322,7 +403,8 @@ fn match_inventory(
     let mut used_worker_crc = false;
     let mut crc_files_read = 0usize;
 
-    for (expected_index, item) in expected.iter().enumerate() {
+    for expected_index in 0..expected.len() {
+        let item = expected.get(expected_index)?;
         if let Some(expected_size) = item.size {
             coverage.expected_bytes = coverage.expected_bytes.saturating_add(expected_size);
         }
@@ -352,7 +434,18 @@ fn match_inventory(
             continue;
         }
 
-        let Some((output_index, matched_by)) = matches[expected_index] else {
+        let slot = matches.get(expected_index);
+        let matched = (slot != 0).then(|| {
+            (
+                ((slot - 1) / 4) as usize,
+                if (slot - 1) % 4 == 2 {
+                    "basename"
+                } else {
+                    "path"
+                },
+            )
+        });
+        let Some((output_index, matched_by)) = matched else {
             coverage.missing_files += 1;
             missing_count += 1;
             if missing.len() < max_issue_items {
@@ -406,7 +499,9 @@ fn match_inventory(
                         }
                     }
                     Err(error) => {
-                        errors.push(error);
+                        if errors.len() < max_issue_items {
+                            errors.push(error);
+                        }
                         coverage.missing_files += 1;
                         missing_count += 1;
                         if missing.len() < max_issue_items {
@@ -523,7 +618,7 @@ fn match_inventory(
 
     let detail_count = observations.len();
     let detail_total = expected.len();
-    MatchResult {
+    Ok(MatchResult {
         status: "ok",
         coverage,
         mismatch_count,
@@ -541,7 +636,7 @@ fn match_inventory(
             && detail_offset.saturating_add(detail_count) < detail_total,
         used_worker_crc,
         crc_files_read,
-    }
+    })
 }
 
 fn empty_status_result(
@@ -716,6 +811,7 @@ fn archive_items_from_py(archive_files: &Bound<'_, PyAny>) -> PyResult<Vec<Archi
     Ok(items)
 }
 
+#[cfg(test)]
 fn archive_items_from_manifest(entries: &[ManifestEntry]) -> Vec<ArchiveFile<'_>> {
     entries
         .iter()

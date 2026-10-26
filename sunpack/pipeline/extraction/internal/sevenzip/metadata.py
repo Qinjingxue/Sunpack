@@ -22,8 +22,6 @@ class ArchiveMetadataScanResult:
 
 class ArchiveMetadataScanner:
     TASK_CACHE_KEY = "filename_metadata"
-    MAX_ZIP_SAMPLES = 200000
-    MAX_FILENAME_BYTES = 64 * 1024 * 1024
 
     def __init__(self, language: str = "en"):
         self.i18n = I18nContext(language)
@@ -115,8 +113,6 @@ class ArchiveMetadataScanner:
         try:
             native = _NATIVE_ANALYZE_ZIP_ENCODING(
                 descriptor.to_dict(),
-                self.MAX_ZIP_SAMPLES,
-                self.MAX_FILENAME_BYTES,
             )
             status = str(native.get("status") or "")
             warning = self._zip_native_status_warning(status)
@@ -127,10 +123,6 @@ class ArchiveMetadataScanner:
                 raise RuntimeError(f"Native ZIP filename analyzer returned unsupported status: {status}")
 
             result.sample_count = int(native.get("sample_count", 0) or 0)
-            if bool(native.get("truncated")):
-                result.error = self.i18n.t("metadata.too_many_names")
-                result.warnings.append(result.error)
-                return result
             if result.sample_count == 0:
                 result.reasons.append(self.i18n.t("metadata.no_names"))
                 return result

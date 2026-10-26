@@ -4,10 +4,7 @@ use aes::{
     Aes256,
 };
 use crc32fast::hash as crc32;
-use lzma_rust2::{
-    filter::{bcj::BcjReader, bcj2::Bcj2Reader, delta::DeltaReader},
-    Lzma2Reader, LzmaReader,
-};
+use lzma_rust2::filter::{bcj::BcjReader, bcj2::Bcj2Reader, delta::DeltaReader};
 use sevenz_rust2::{EncoderMethod, Password};
 use std::io::{Cursor, Read, Seek};
 

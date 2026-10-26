@@ -77,28 +77,24 @@ class AnalysisEngine:
         return _report_from_native(report_path or view.path, native)
 
     def _build_single_view(self, path: str) -> SharedBinaryView:
-        cache_bytes, max_read_bytes, max_concurrent_reads = self._view_limits()
+        cache_bytes, max_concurrent_reads = self._view_limits()
         return SharedBinaryView(
             path,
             cache_bytes=cache_bytes,
-            max_read_bytes=max_read_bytes,
             max_concurrent_reads=max_concurrent_reads,
         )
 
     def _build_multi_volume_view(self, paths) -> MultiVolumeBinaryView:
-        cache_bytes, max_read_bytes, max_concurrent_reads = self._view_limits()
+        cache_bytes, max_concurrent_reads = self._view_limits()
         return MultiVolumeBinaryView(
             paths,
             cache_bytes=cache_bytes,
-            max_read_bytes=max_read_bytes,
             max_concurrent_reads=max_concurrent_reads,
         )
 
-    def _view_limits(self) -> tuple[int, int | None, int]:
+    def _view_limits(self) -> tuple[int, int]:
         cache_bytes = int(self.config.get("shared_cache_mb", 64) or 0) * 1024 * 1024
-        max_read_mb = self.config.get("max_read_mb_per_archive", 256)
-        max_read_bytes = None if max_read_mb is None else int(max_read_mb) * 1024 * 1024
-        return cache_bytes, max_read_bytes, int(self.config.get("max_concurrent_reads", 1) or 1)
+        return cache_bytes, int(self.config.get("max_concurrent_reads", 1) or 1)
 
 
 def _report_from_native(path: str, native: dict) -> ArchiveAnalysisReport:

@@ -107,8 +107,6 @@ def test_worker_resolves_hard_link_graph_and_rejects_invalid_targets(tmp_path, t
     assert manifest.file_count == len(members)
     sizes = {row["path"]: row["size"] for row in manifest.entry_page(0, 100)}
     assert all((output / name).stat().st_size == size for name, size in sizes.items())
-    capped = archive_state_tar_manifest_native(source, max_items=2)
-    assert len(capped) == 2 and capped.total_unpacked_size == expected
 
     for index, bad in enumerate([[("missing", "absent")], [("empty-target", "")], [("self", "self")],
                                  [("a", "b"), ("b", "a")], [("escape", "../outside")]]):
@@ -122,7 +120,7 @@ def test_worker_resolves_hard_link_graph_and_rejects_invalid_targets(tmp_path, t
                                         "output_dir": str(tmp_path / f"bad-{index}"), "format_hint": "tar"})
         final = _worker_result(result.stdout)
         assert result.returncode != 0 and not final["verified_manifest"]["validated"]
-        assert not archive_state_tar_manifest_native({"entry_path": str(broken)}, max_items=0).archive_walk_complete
+        assert not archive_state_tar_manifest_native({'entry_path': str(broken)}).archive_walk_complete
 
 
 @pytest.mark.parametrize("origin", ["foreground", "watch"])

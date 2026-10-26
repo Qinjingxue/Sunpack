@@ -193,9 +193,9 @@ def test_zip_verification_methods_share_one_full_archive_manifest(tmp_path, monk
     calls = []
     native_manifest = archive_input_manifest_module._native_archive_state_zip_manifest
 
-    def counted_manifest(source, max_items, password, codepage):
-        calls.append(max_items)
-        return native_manifest(source, max_items, password, codepage)
+    def counted_manifest(source, password, codepage):
+        calls.append(source)
+        return native_manifest(source, password, codepage)
 
     monkeypatch.setattr(archive_input_manifest_module, "_native_archive_state_zip_manifest", counted_manifest)
 
@@ -204,12 +204,12 @@ def test_zip_verification_methods_share_one_full_archive_manifest(tmp_path, monk
 
     monkeypatch.setattr(OutputInventory, "file_page", reject_materialization)
     verification = _scheduler([
-        {"name": "manifest_size_match", "max_expected_names": 2},
-        {"name": "archive_test_crc", "max_items": 3},
+        {"name": "manifest_size_match"},
+        {"name": "archive_test_crc"},
     ]).verify(task, result)
 
     assert verification.decision_hint == "accept"
-    assert calls == [3]
+    assert len(calls) == 1
 
 
 def test_archive_test_crc_unsupported_empty_failed_extraction_is_not_complete(tmp_path):

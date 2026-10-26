@@ -62,7 +62,7 @@ def test_tar_metadata_sizes_and_directory_types_survive_carriers(tmp_path, origi
         assert [entry["path"] for entry in manifest.entry_page(0, 10)] == names, case
         view = AnalysisBinaryView(str(plain))
         try:
-            assert view.probe_tar(0, 32)["walk_complete"], case
+            assert view.probe_tar(0)["walk_complete"], case
         finally:
             view.close()
 

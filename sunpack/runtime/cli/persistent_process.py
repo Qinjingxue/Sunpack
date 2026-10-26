@@ -60,8 +60,6 @@ def _runtime_binary_stamp() -> str:
 
 _RUNTIME_BINARY_STAMP = _runtime_binary_stamp()
 _MAX_FIELD_BYTES = 16 * 1024 * 1024
-_MAX_REQUEST_BYTES = 64 * 1024 * 1024
-_MAX_ARGC = 4096
 _TERMINAL_COLUMNS_ARG = "--_sunpack-terminal-columns="
 _PIPE_PREFIX = r"\\.\pipe\SunPack-"
 
@@ -368,18 +366,19 @@ def _try_send(payload: dict[str, Any]) -> dict[str, Any] | None:
             stdout_columns = 0
         if stdout_columns > 0:
             argv_values.append(f"{_TERMINAL_COLUMNS_ARG}{max(20, min(1000, stdout_columns))}")
-        argv = [item.encode("utf-8", "surrogatepass") for item in argv_values]
-        if len(cwd) > _MAX_FIELD_BYTES or len(argv) > _MAX_ARGC or any(len(item) > _MAX_FIELD_BYTES for item in argv):
+        if len(cwd) > _MAX_FIELD_BYTES or any(len(item.encode("utf-8", "surrogatepass")) > _MAX_FIELD_BYTES for item in argv_values):
             return None
         flags = ((1 if payload.get("shutdown") else 0)
                  | (2 if payload.get("stdout_tty") else 0)
                  | (4 if payload.get("stdin_tty") else 0))
         build_id = _runtime_binary_build_id()
-        body = [build_id, token, struct.pack("!III", flags, len(cwd), len(argv)), cwd]
-        for item in argv:
-            body.extend((struct.pack("!I", len(item)), item))
         request_started = True
-        connection.sendall(_REQUEST_MAGIC + b"".join(body))
+        connection.sendall(_REQUEST_MAGIC + build_id + token + struct.pack("!III", flags, len(cwd), len(argv_values)))
+        connection.sendall(cwd)
+        for value in argv_values:
+            item = value.encode("utf-8", "surrogatepass")
+            connection.sendall(struct.pack("!I", len(item)))
+            connection.sendall(item)
         if _recv_exact(connection, 4) != _STREAM_MAGIC or _recv_exact(connection, len(build_id)) != build_id:
             return _delivery_uncertain_response(payload, "invalid response handshake")
         return _recv_stream(connection)
@@ -489,7 +488,6 @@ class _PipeRequestProtocol(asyncio.Protocol):
         self._payload: dict[str, Any] | None = None
         self._argv_remaining = 0
         self._next_arg_size: int | None = None
-        self._request_bytes = 0
         self._input_size: int | None = None
         self._input_waiter: asyncio.Future[str] | None = None
         self._request_task: asyncio.Task[None] | None = None
@@ -515,17 +513,17 @@ class _PipeRequestProtocol(asyncio.Protocol):
     def data_received(self, data: bytes) -> None:
         if self._closed:
             return
-        self._buffer.extend(data)
-        if len(self._buffer) > _MAX_REQUEST_BYTES:
-            self._abort()
-            return
         try:
-            if self._request_task is None:
-                payload = self._parse_request()
-                if payload is not None:
-                    self._request_task = asyncio.create_task(self._run_request(payload), name="persistent-pipe-request")
-            if self._request_task is not None:
-                self._parse_input()
+            for offset in range(0, len(data), 64 * 1024):
+                self._buffer.extend(data[offset:offset + 64 * 1024])
+                if self._request_task is None:
+                    payload = self._parse_request()
+                    if payload is not None:
+                        self._request_task = asyncio.create_task(self._run_request(payload), name="persistent-pipe-request")
+                if self._request_task is not None:
+                    self._parse_input()
+                if len(self._buffer) > _MAX_FIELD_BYTES:
+                    raise ValueError("persistent field buffer exceeds frame limit")
         except (UnicodeDecodeError, ValueError):
             self._abort()
 
@@ -566,7 +564,7 @@ class _PipeRequestProtocol(asyncio.Protocol):
                 raise ValueError("invalid persistent request token")
             flags, cwd_size, argc = struct.unpack("!III", self._buffer[token_end:header_size])
             del self._buffer[:header_size]
-            if cwd_size > _MAX_FIELD_BYTES or argc > _MAX_ARGC:
+            if cwd_size > _MAX_FIELD_BYTES:
                 raise ValueError("persistent request header exceeds limits")
             self._payload = {
                 "argv": [],
@@ -574,7 +572,6 @@ class _PipeRequestProtocol(asyncio.Protocol):
                 "stdout_tty": bool(flags & 2),
                 "stdin_tty": bool(flags & 4),
             }
-            self._request_bytes = int(cwd_size)
             self._argv_remaining = int(argc)
             self._next_arg_size = int(cwd_size)
             self._stage = "cwd"
@@ -597,9 +594,6 @@ class _PipeRequestProtocol(asyncio.Protocol):
                 del self._buffer[:4]
                 if self._next_arg_size > _MAX_FIELD_BYTES:
                     raise ValueError("persistent argument exceeds limit")
-                self._request_bytes += self._next_arg_size
-                if self._request_bytes > _MAX_REQUEST_BYTES:
-                    raise ValueError("persistent request exceeds total limit")
             if len(self._buffer) < self._next_arg_size:
                 return None
             self._payload["argv"].append(
@@ -961,7 +955,7 @@ def _recv_request(connection, token: bytes) -> dict[str, Any] | None:
     ):
         return None
     flags, cwd_size, argc = struct.unpack("!III", _recv_exact(connection, 12))
-    if cwd_size > _MAX_FIELD_BYTES or argc > _MAX_ARGC:
+    if cwd_size > _MAX_FIELD_BYTES:
         return None
     cwd = _recv_exact(connection, cwd_size).decode("utf-8", "surrogatepass")
     argv = []

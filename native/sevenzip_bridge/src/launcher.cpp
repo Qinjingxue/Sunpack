@@ -372,7 +372,7 @@ RequestOutcome request(const InstallContext& context, const std::vector<std::wst
     if (pipe == INVALID_HANDLE_VALUE) return RequestOutcome::NotDelivered;
 
     const std::string cwd = utf8(request_cwd);
-    if (cwd.size() > kMaxFieldBytes || arguments.size() > 4096) {
+    if (cwd.size() > kMaxFieldBytes) {
         CloseHandle(pipe);
         return RequestOutcome::NotDelivered;
     }
@@ -386,19 +386,22 @@ RequestOutcome request(const InstallContext& context, const std::vector<std::wst
     append_u32(wire, (shutdown ? 1u : 0u) | (stdout_tty ? 2u : 0u) | (stdin_tty ? 4u : 0u));
     append_u32(wire, static_cast<std::uint32_t>(cwd.size()));
     append_u32(wire, static_cast<std::uint32_t>(arguments.size()));
-    wire.append(cwd);
+    if (!write_all(pipe, wire.data(), wire.size()) || !write_all(pipe, cwd.data(), cwd.size())) {
+        CloseHandle(pipe);
+        return RequestOutcome::NotDelivered;
+    }
     for (const auto& argument : arguments) {
         const std::string encoded = utf8(argument);
         if (encoded.size() > kMaxFieldBytes) {
             CloseHandle(pipe);
             return RequestOutcome::NotDelivered;
         }
+        wire.clear();
         append_u32(wire, static_cast<std::uint32_t>(encoded.size()));
-        wire.append(encoded);
-    }
-    if (!write_all(pipe, wire.data(), wire.size())) {
-        CloseHandle(pipe);
-        return RequestOutcome::NotDelivered;
+        if (!write_all(pipe, wire.data(), wire.size()) || !write_all(pipe, encoded.data(), encoded.size())) {
+            CloseHandle(pipe);
+            return RequestOutcome::NotDelivered;
+        }
     }
     std::array<char, 4> magic{};
     if (!read_all(pipe, magic.data(), magic.size()) || memcmp(magic.data(), kStreamMagic, 4) != 0) {

@@ -574,7 +574,7 @@ fn segment_file(
 
 enum JournalPayload {
     Task(Arc<Operations>),
-    Catalog(Vec<u8>),
+    Catalog(crate::io::scratch::Blob),
 }
 impl JournalPayload {
     fn kind(&self) -> Kind {
@@ -583,7 +583,7 @@ impl JournalPayload {
             Self::Catalog(_) => Kind::CatalogWal,
         }
     }
-    fn encode(&self, output: &mut wal::Bounded<'_>) -> io::Result<()> {
+    fn encode(&self, output: &mut dyn Write) -> io::Result<()> {
         match self {
             Self::Task(ops) => rmp_serde::encode::write(output, ops.as_ref()).map_err(wal::invalid),
             Self::Catalog(bytes) => output.write_all(bytes),
@@ -629,15 +629,15 @@ fn write_append_batch(shared: &Shared, batch: &[AppendWorkItem]) -> io::Result<(
     let first = batch
         .first()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "empty journal batch"))?;
-    let mut payload = Vec::with_capacity(batch.len().saturating_mul(512));
+    let mut payload = crate::io::scratch::Spool::default();
     let mut record_sizes = Vec::with_capacity(batch.len());
     for item in batch {
         if item.operations.kind() != first.operations.kind() {
             return Err(wal::invalid("mixed WAL types"));
         }
-        let start = payload.len();
+        let start = payload.len()?;
         wal::append_frame(&mut payload, item.seq, |out| item.operations.encode(out))?;
-        record_sizes.push(payload.len() - start);
+        record_sizes.push(payload.len()? - start);
     }
 
     // The writer is the only component that can advance written_seq, so this
@@ -672,7 +672,7 @@ fn write_append_batch(shared: &Shared, batch: &[AppendWorkItem]) -> io::Result<(
         &first.path,
         first.operations.kind(),
     )?;
-    write_file(&file, &payload)?;
+    write_file(&file, &payload.finish()?)?;
 
     let mut state = lock_state(shared);
     let stream_state = state.streams.entry(first.stream.clone()).or_default();
@@ -1300,7 +1300,7 @@ pub(crate) fn append_cache(
     stream: &str,
     path: &Path,
     seq: u64,
-    value: Vec<u8>,
+    value: crate::io::scratch::Blob,
 ) -> Result<u64, String> {
     let ticket = runtime().submit_append(
         stream.to_owned(),

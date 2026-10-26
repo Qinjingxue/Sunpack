@@ -104,7 +104,7 @@ def test_zip64_bounds_are_shared_by_analysis_and_inspectors(tmp_path, layout, in
     path.write_bytes(payload)
     view = AnalysisBinaryView(str(path))
     try:
-        probe = dict(view.probe_zip(len(payload) - len(suffix) - len(eocd), 16))
+        probe = dict(view.probe_zip(len(payload) - len(suffix) - len(eocd)))
     finally:
         view.close()
     expected_error = (
@@ -120,7 +120,7 @@ def test_zip64_bounds_are_shared_by_analysis_and_inspectors(tmp_path, layout, in
             inspect_zip_directory_consistency,
             inspect_zip_structure_graph,
         ):
-            assert dict(inspect(str(path), 16))["error"] == expected_error
+            assert dict(inspect(str(path)) if inspect is inspect_zip_eocd_structure else inspect(str(path), 16))["error"] == expected_error
         if invalid_field is None:
             assert inspect_zip_directory_consistency(str(path), 16)["zip64_consistency"]["zip64_eocd_present"]
             assert inspect_zip_structure_graph(str(path), 16)["summary"]["zip64_eocd_present"]

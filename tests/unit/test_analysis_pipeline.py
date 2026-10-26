@@ -145,7 +145,7 @@ def test_rar4_large_packed_sizes_agree_across_native_analysis_paths(tmp_path):
         data = (b"Rar!\x1a\x07\x00" + block(0x73, 0, bytes(6))
                 + block(0x74, flags, fixed + high + b"a") + block(0x7b, 0))
         path = _write_bytes(tmp_path / f"{name}.opaque", data)
-        observation = probe_rar_bytes(data, 0, 4096)
+        observation = probe_rar_bytes(data, 0)
         assert observation["end_block_found"] == complete, name
         report = AnalysisEngine().analyze_path(str(path))
         assert any(item.format == "rar" for item in report.selected) == complete, name
@@ -516,16 +516,3 @@ def test_shared_binary_view_reuses_cached_reads(tmp_path):
     stats = view.stats()
     assert stats.read_bytes == 3
     assert stats.cache_hits == 1
-
-
-def test_shared_binary_view_enforces_read_budget(tmp_path):
-    path = tmp_path / "data.bin"
-    path.write_bytes(b"abcdef")
-    view = SharedBinaryView(str(path), cache_bytes=0, max_read_bytes=2)
-
-    try:
-        view.read_at(0, 3)
-    except RuntimeError as exc:
-        assert "read budget" in str(exc)
-    else:
-        raise AssertionError("read budget should be enforced")

@@ -33,8 +33,7 @@ class ArchiveTestCrcMethod:
     def verify(self, evidence: VerificationEvidence, config: dict) -> VerificationStep:
         if evidence.archive_input.analysis.get("stream_plan") and evidence.worker_result.get("stream_receipt"):
             return _stream_receipt_result(self.name, evidence)
-        max_items = config["max_items"]
-        archive_manifest = archive_input_manifest_for_evidence(evidence, max_items=max_items)
+        archive_manifest = archive_input_manifest_for_evidence(evidence)
 
         archive_status_result = self._archive_status_result(archive_manifest, evidence)
         if archive_status_result is not None:
@@ -149,7 +148,6 @@ class ArchiveTestCrcMethod:
             "verified_item_count": int(archive_manifest.verified_item_count or 0),
             "archive_walk_complete": bool(archive_manifest.archive_walk_complete),
             "manifest_entries_retained": retained,
-            "manifest_entries_truncated": bool(archive_manifest.entries_truncated),
             "detail_total": int(match_result.get("detail_total", retained) or 0),
             "detail_count": int(match_result.get("detail_count", len(observations)) or 0),
             "detail_truncated": bool(match_result.get("detail_truncated", False)),
@@ -321,7 +319,6 @@ def _verified_manifest_result(method: str, archive_manifest, inventory) -> Verif
                 "total_item_count": total_items,
                 "verified_item_count": int(archive_manifest.verified_item_count or total_items),
                 "manifest_entries_retained": 0,
-                "manifest_entries_truncated": bool(archive_manifest.entries_truncated),
             },
         )],
     )

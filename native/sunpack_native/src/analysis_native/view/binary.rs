@@ -1,18 +1,16 @@
 #[pymethods]
 impl AnalysisBinaryView {
     #[new]
-    #[pyo3(signature = (path, cache_bytes=67108864, max_read_bytes=None, max_concurrent_reads=1))]
+    #[pyo3(signature = (path, cache_bytes=67108864, max_concurrent_reads=1))]
     fn new(
         path: String,
         cache_bytes: usize,
-        max_read_bytes: Option<u64>,
         max_concurrent_reads: usize,
     ) -> PyResult<Self> {
         let reader = ManagedReader::open_with_config(
             &path,
             ReaderConfig {
                 cache_bytes,
-                max_read_bytes,
                 max_concurrent_reads,
             },
         )?;
@@ -82,46 +80,42 @@ impl AnalysisBinaryView {
         Ok(dict.unbind())
     }
 
-    #[pyo3(signature = (eocd_offset, max_cd_entries_to_walk=64))]
+    #[pyo3(signature = (eocd_offset))]
     fn probe_zip(
         &self,
         py: Python<'_>,
         eocd_offset: u64,
-        max_cd_entries_to_walk: usize,
     ) -> PyResult<Py<PyDict>> {
-        self.probe_zip_with_disk_starts(py, eocd_offset, max_cd_entries_to_walk, None)
+        self.probe_zip_with_disk_starts(py, eocd_offset, None)
     }
 
-    #[pyo3(signature = (start_offset, max_blocks_to_walk=4096))]
+    #[pyo3(signature = (start_offset))]
     fn probe_rar(
         &self,
         py: Python<'_>,
         start_offset: u64,
-        max_blocks_to_walk: usize,
     ) -> PyResult<Py<PyDict>> {
-        py.detach(|| self.probe_rar_native(start_offset, max_blocks_to_walk))?
+        py.detach(|| self.probe_rar_native(start_offset))?
             .to_python(py)
     }
 
-    #[pyo3(signature = (start_offset, max_next_header_check_bytes=1048576))]
-    fn probe_seven_zip(
+    #[pyo3(signature = (start_offset))]
+    pub(crate) fn probe_seven_zip(
         &self,
         py: Python<'_>,
         start_offset: u64,
-        max_next_header_check_bytes: u64,
     ) -> PyResult<Py<PyDict>> {
-        py.detach(|| self.probe_seven_zip_native(start_offset, max_next_header_check_bytes))?
+        py.detach(|| self.probe_seven_zip_native(start_offset))?
             .to_python(py)
     }
 
-    #[pyo3(signature = (start_offset=0, max_entries_to_walk=64))]
+    #[pyo3(signature = (start_offset=0))]
     fn probe_tar(
         &self,
         py: Python<'_>,
         start_offset: u64,
-        max_entries_to_walk: usize,
     ) -> PyResult<Py<PyDict>> {
-        let result = self.walk_tar(py, start_offset, max_entries_to_walk)?;
+        let result = self.walk_tar(py, start_offset)?;
         Ok(result.unbind())
     }
 

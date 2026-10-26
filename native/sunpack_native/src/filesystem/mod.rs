@@ -214,11 +214,6 @@ pub(crate) fn watch_directories_changes_impl(
 ) -> std::io::Result<Vec<String>> {
     #[cfg(windows)]
     {
-        if directories.len() > (sunpack_usn_core::protocol::MAX_DIRECTORY_QUERY_BYTES - 8) / 16 {
-            return Err(std::io::Error::other(
-                "directory recovery exceeds payload budget",
-            ));
-        }
         let mut live = Vec::with_capacity(directories.len());
         let mut ids = Vec::with_capacity(directories.len());
         let mut paths = std::collections::BTreeSet::new();
@@ -237,19 +232,24 @@ pub(crate) fn watch_directories_changes_impl(
             }
         }
         if start_usn < end_usn && !ids.is_empty() {
-            let changes = sunpack_usn_core::broker_read_directories_changes(
-                volume, journal, &ids, start_usn, end_usn,
+            sunpack_usn_core::broker_for_each_directory_change(
+                volume,
+                journal,
+                &ids,
+                start_usn,
+                end_usn,
+                |index, name| {
+                    paths.insert(if name.is_empty() {
+                        live[index as usize].clone()
+                    } else {
+                        Path::new(&live[index as usize])
+                            .join(name)
+                            .to_string_lossy()
+                            .into_owned()
+                    });
+                    Ok(())
+                },
             )?;
-            for (index, name) in changes {
-                paths.insert(if name.is_empty() {
-                    live[index as usize].clone()
-                } else {
-                    Path::new(&live[index as usize])
-                        .join(name)
-                        .to_string_lossy()
-                        .into_owned()
-                });
-            }
         }
         Ok(paths.into_iter().collect())
     }

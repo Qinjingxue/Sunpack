@@ -6,7 +6,7 @@ unsafe extern "C" {
     fn SUNPACK_LZ4_XXH64(input: *const c_void, size: usize, seed: u64) -> u64;
 }
 
-fn xxh64(data: &[u8], seed: u64) -> u64 {
+pub(crate) fn xxh64(data: &[u8], seed: u64) -> u64 {
     // XXH64 reads this live slice synchronously and retains no pointers.
     unsafe { SUNPACK_LZ4_XXH64(data.as_ptr().cast(), data.len(), seed) }
 }

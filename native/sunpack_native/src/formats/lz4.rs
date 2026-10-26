@@ -407,6 +407,69 @@ pub(crate) fn sample<R: Read>(reader: R, limit: usize) -> Result<Vec<u8>, &'stat
     };
     run_sample(state, None)
 }
+
+pub(crate) fn decode_into<R: Read, W: std::io::Write>(reader: R, writer: W) -> std::io::Result<()> {
+    struct State<R, W> {
+        reader: R,
+        writer: W,
+        error: Option<std::io::Error>,
+    }
+    unsafe extern "C" fn read<R: Read, W>(state: *mut c_void, dst: *mut c_void, n: usize) -> isize {
+        let state = &mut *state.cast::<State<R, W>>();
+        match state
+            .reader
+            .read(std::slice::from_raw_parts_mut(dst.cast(), n))
+        {
+            Ok(n) => n as isize,
+            Err(error) => {
+                state.error = Some(error);
+                -1
+            }
+        }
+    }
+    unsafe extern "C" fn write<R, W: std::io::Write>(
+        state: *mut c_void,
+        src: *const c_void,
+        n: usize,
+    ) -> i32 {
+        let state = &mut *state.cast::<State<R, W>>();
+        match state
+            .writer
+            .write_all(std::slice::from_raw_parts(src.cast(), n))
+        {
+            Ok(()) => 0,
+            Err(error) => {
+                state.error = Some(error);
+                -1
+            }
+        }
+    }
+    let mut state = State {
+        reader,
+        writer,
+        error: None,
+    };
+    let rc = unsafe {
+        sup_lz4_decode(
+            (&mut state as *mut State<R, W>).cast(),
+            read::<R, W>,
+            None,
+            write::<R, W>,
+            None,
+            &mut DecodeResult::default(),
+        )
+    };
+    if let Some(error) = state.error {
+        return Err(error);
+    }
+    if rc != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "LZ4 frame validation failed",
+        ));
+    }
+    Ok(())
+}
 unsafe extern "C" fn sample_skip<R: Read + Seek>(opaque: *mut c_void, n: u64) -> i32 {
     let state = &mut *opaque.cast::<Sample<R>>();
     if n > state.input_remaining {

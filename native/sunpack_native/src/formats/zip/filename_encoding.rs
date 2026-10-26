@@ -1,5 +1,6 @@
 use crate::io::archive_state::{build_segments, Segment};
 use crate::io::reader::ManagedReader;
+use crate::io::scratch::SpillMap;
 use crate::scan::magic::rfind_subslice;
 use encoding_rs::{BIG5, GBK, SHIFT_JIS};
 use pyo3::prelude::*;
@@ -15,6 +16,7 @@ const ZIP_UTF8_FLAG: u16 = 0x800;
 const ZIP_UNICODE_PATH_EXTRA_FIELD: u16 = 0x7075;
 const ZIP64_MARKER: u32 = 0xFFFF_FFFF;
 const ZIP_EOCD_LENGTH: usize = 22;
+#[cfg(test)]
 const ZIP_CENTRAL_HEADER_LENGTH: usize = 46;
 const MAX_ZIP_COMMENT_BYTES: u64 = 65_535;
 
@@ -27,33 +29,6 @@ const JAPANESE_COMMON_KANJI: &str =
 const CP437_HIGH: &str =
     "ÇüéâäàåçêëèïîìÄÅÉæÆôöòûùÿÖÜ¢£¥₧ƒáíóúñÑªº¿⌐¬½¼¡«»░▒▓│┤╡╢╖╕╣║╗╝╜╛┐└┴┬├─┼╞╟╚╔╩╦╠═╬╧╨╤╥╙╘╒╓╫╪┘┌█▄▌▐▀αßΓπΣσµτΦΘΩδ∞φε∩≡±≥≤⌠⌡÷≈°∙·√ⁿ²■ ";
 static CP437_TABLE: OnceLock<Vec<char>> = OnceLock::new();
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ZipNameEntry {
-    name_start: usize,
-    name_end: usize,
-    utf8_flag: bool,
-    unicode_path: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ZipNameScan {
-    status: &'static str,
-    central: Vec<u8>,
-    entries: Vec<ZipNameEntry>,
-    truncated: bool,
-}
-
-impl ZipNameScan {
-    fn status(status: &'static str) -> Self {
-        Self {
-            status,
-            central: Vec::new(),
-            entries: Vec::new(),
-            truncated: false,
-        }
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EncodingKind {
@@ -115,7 +90,6 @@ struct SelectionEvidence {
 #[derive(Debug, Clone)]
 struct ZipFilenameAnalysis {
     status: &'static str,
-    truncated: bool,
     sample_count: usize,
     selected_codepage: Option<&'static str>,
     selected_label: &'static str,
@@ -130,7 +104,6 @@ impl ZipFilenameAnalysis {
     fn status(status: &'static str) -> Self {
         Self {
             status,
-            truncated: false,
             sample_count: 0,
             selected_codepage: None,
             selected_label: "",
@@ -145,7 +118,6 @@ impl ZipFilenameAnalysis {
     fn into_py_dict(self, py: Python<'_>) -> PyResult<Py<PyDict>> {
         let dict = PyDict::new(py);
         dict.set_item("status", self.status)?;
-        dict.set_item("truncated", self.truncated)?;
         dict.set_item("sample_count", self.sample_count)?;
         dict.set_item("selected_codepage", self.selected_codepage)?;
         dict.set_item("selected_label", self.selected_label)?;
@@ -277,12 +249,10 @@ impl ZipLogicalReader {
 }
 
 #[pyfunction]
-#[pyo3(signature = (archive_input, max_samples, max_filename_bytes))]
+
 pub(crate) fn analyze_zip_filename_encoding(
     py: Python<'_>,
     archive_input: &Bound<'_, PyDict>,
-    max_samples: usize,
-    max_filename_bytes: usize,
 ) -> PyResult<Py<PyDict>> {
     let segments = build_segments(archive_input)?;
     let disk_aware = archive_input
@@ -290,78 +260,34 @@ pub(crate) fn analyze_zip_filename_encoding(
         .map(|value| value.extract::<String>())
         .transpose()?
         .is_some_and(|style| style == "zip_spanned");
-    let analysis = py
-        .detach(move || analyze_zip_input(segments, disk_aware, max_samples, max_filename_bytes))?;
+    let analysis = py.detach(move || analyze_zip_input(segments, disk_aware))?;
     analysis.into_py_dict(py)
 }
 
-fn analyze_zip_input(
-    segments: Vec<Segment>,
-    disk_aware: bool,
-    max_samples: usize,
-    max_filename_bytes: usize,
-) -> io::Result<ZipFilenameAnalysis> {
+fn analyze_zip_input(segments: Vec<Segment>, disk_aware: bool) -> io::Result<ZipFilenameAnalysis> {
     let reader = ZipLogicalReader::open(segments, disk_aware)?;
-    let scan = scan_zip_names(&reader, max_samples, max_filename_bytes)?;
-    if scan.status != "ok" {
-        return Ok(ZipFilenameAnalysis::status(scan.status));
+    scan_zip_names(&reader)
+}
+
+fn finish_analysis(
+    mut result: ZipFilenameAnalysis,
+    accumulators: [EncodingAccumulator; 5],
+) -> ZipFilenameAnalysis {
+    if result.sample_count == 0 {
+        return result;
     }
-
-    let sample_count = scan.entries.len();
-    let unicode_count = scan
-        .entries
-        .iter()
-        .filter(|entry| entry.unicode_path)
-        .count();
-    let authoritative_all = !scan.entries.is_empty()
-        && scan
-            .entries
-            .iter()
-            .all(|entry| has_authoritative_name(entry, &scan.central));
-    let ascii_only = !scan.entries.is_empty()
-        && scan.entries.iter().all(|entry| {
-            scan.central[entry.name_start..entry.name_end]
-                .iter()
-                .all(|byte| *byte < 128)
-        });
-
-    let mut result = ZipFilenameAnalysis {
-        status: "ok",
-        truncated: scan.truncated,
-        sample_count,
-        selected_codepage: None,
-        selected_label: "",
-        confidence: 0.0,
-        unicode_count,
-        authoritative_all,
-        ascii_only,
-        evidence: None,
-    };
-
-    if scan.truncated || scan.entries.is_empty() {
-        return Ok(result);
-    }
-    if authoritative_all {
+    if result.authoritative_all {
         result.confidence = 1.0;
-        return Ok(result);
+        return result;
     }
-    if ascii_only {
-        return Ok(result);
+    if result.ascii_only {
+        return result;
     }
-
-    let unresolved = scan
-        .entries
-        .iter()
-        .filter(|entry| !has_authoritative_name(entry, &scan.central))
-        .map(|entry| &scan.central[entry.name_start..entry.name_end])
-        .collect::<Vec<_>>();
-    let (selection, evidence, confidence) = select_codepage(&unresolved);
+    let scores = accumulators.map(EncodingAccumulator::finish);
+    let (selection, evidence, confidence) = select_scores(scores);
     result.selected_label = selection.kind.label();
     result.confidence = confidence;
     result.evidence = Some(evidence);
-
-    // CP437 is the ZIP default, not a heuristic override. Pass it explicitly:
-    // the native handler's default depends on HostOS and the system locale.
     if matches!(selection.kind, EncodingKind::Cp437)
         || (selection.score >= 12
             && result
@@ -372,17 +298,13 @@ fn analyze_zip_input(
     {
         result.selected_codepage = Some(selection.kind.codepage());
     }
-    Ok(result)
+    result
 }
 
-fn scan_zip_names(
-    reader: &ZipLogicalReader,
-    max_samples: usize,
-    max_filename_bytes: usize,
-) -> io::Result<ZipNameScan> {
+fn scan_zip_names(reader: &ZipLogicalReader) -> io::Result<ZipFilenameAnalysis> {
     let file_size = reader.len();
     if file_size < ZIP_EOCD_LENGTH as u64 {
-        return Ok(ZipNameScan::status("file_too_small"));
+        return Ok(ZipFilenameAnalysis::status("file_too_small"));
     }
 
     let search_size = file_size.min(MAX_ZIP_COMMENT_BYTES + ZIP_EOCD_LENGTH as u64);
@@ -393,29 +315,39 @@ fn scan_zip_names(
             .filter(|offset| offset.saturating_add(ZIP_EOCD_LENGTH) > tail.len())
             .map(|_| "eocd_incomplete")
             .unwrap_or("eocd_not_found");
-        return Ok(ZipNameScan::status(status));
+        return Ok(ZipFilenameAnalysis::status(status));
     };
 
-    let central_disk = super::u16_le(&tail, eocd.offset + 6) as usize;
-    let total_entries = eocd.total_entries as usize;
-    let central_size = eocd.cd_size;
-    let central_offset = eocd.cd_offset;
-    if central_offset == ZIP64_MARKER || central_size == ZIP64_MARKER {
-        return Ok(ZipNameScan::status("zip64"));
+    let mut central_disk = super::u16_le(&tail, eocd.offset + 6) as usize;
+    let mut total_entries = eocd.total_entries as u64;
+    let mut central_size_u64 = eocd.cd_size as u64;
+    let mut central_offset = eocd.cd_offset as u64;
+    let eocd_logical_offset = tail_start + eocd.offset as u64;
+    let mut directory_end = eocd_logical_offset;
+    match super::zip64::locate_end_record(
+        eocd_logical_offset,
+        reader.disk_starts.as_deref(),
+        |at, size| reader.read_at(at, size),
+    ) {
+        Ok(Some(found)) => {
+            central_disk = found.record.cd_disk as usize;
+            total_entries = found.record.total_entries;
+            central_size_u64 = found.record.cd_size;
+            central_offset = found.record.cd_offset;
+            directory_end = found.offset;
+        }
+        Ok(None) => {
+            if eocd.cd_offset == ZIP64_MARKER || eocd.cd_size == ZIP64_MARKER {
+                return Ok(ZipFilenameAnalysis::status("central_range_invalid"));
+            }
+        }
+        Err(_) => return Ok(ZipFilenameAnalysis::status("central_range_invalid")),
     }
-    if central_size == 0 && total_entries == 0 {
-        return Ok(ZipNameScan {
-            status: "ok",
-            central: Vec::new(),
-            entries: Vec::new(),
-            truncated: false,
-        });
+    if central_size_u64 == 0 && total_entries == 0 {
+        return Ok(ZipFilenameAnalysis::status("ok"));
     }
-
-    let central_size_u64 = central_size as u64;
-    let eocd_logical_offset = tail_start.saturating_add(eocd.offset as u64);
-    let physical_candidate = eocd_logical_offset.checked_sub(central_size_u64);
-    let declared_candidate = reader.central_logical_offset(central_disk, central_offset as u64);
+    let physical_candidate = directory_end.checked_sub(central_size_u64);
+    let declared_candidate = reader.central_logical_offset(central_disk, central_offset);
     let mut central_logical_offset = None;
     for candidate in [physical_candidate, declared_candidate]
         .into_iter()
@@ -433,104 +365,199 @@ fn scan_zip_names(
         }
     }
     let Some(central_logical_offset) = central_logical_offset else {
-        return Ok(ZipNameScan::status("central_range_invalid"));
+        return Ok(ZipFilenameAnalysis::status("central_range_invalid"));
     };
 
-    let metadata_budget = (ZIP_CENTRAL_HEADER_LENGTH as u64)
-        .saturating_mul(max_samples as u64)
-        .saturating_add(max_filename_bytes as u64);
-    let read_size = central_size_u64.min(metadata_budget);
-    let read_size = usize::try_from(read_size).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "ZIP central directory range too large",
-        )
-    })?;
-    let central = reader.read_at(central_logical_offset, read_size)?;
-    Ok(collect_zip_names(
-        central,
-        total_entries,
-        max_samples,
-        max_filename_bytes,
-    ))
-}
-
-fn collect_zip_names(
-    central: Vec<u8>,
-    total_entries: usize,
-    max_samples: usize,
-    max_filename_bytes: usize,
-) -> ZipNameScan {
-    let mut entries = Vec::new();
-    let mut filename_bytes = 0usize;
-    let mut offset = 0usize;
-    let expected_entries = if total_entries == 0 {
-        max_samples
-    } else {
-        total_entries.min(max_samples)
-    };
-    let mut truncated = total_entries > max_samples;
-
-    while entries.len() < expected_entries {
-        let Some(record) = super::parse_central_directory_record(&central, offset, central.len())
-        else {
-            if offset
-                .checked_add(ZIP_CENTRAL_HEADER_LENGTH)
-                .is_some_and(|end| end <= central.len())
-                && central.get(offset..offset + 4) == Some(super::CD_SIG)
-            {
-                truncated = true;
-            }
-            break;
+    let end = central_logical_offset
+        .checked_add(central_size_u64)
+        .ok_or_else(|| io::Error::other("ZIP central range overflow"))?;
+    let mut cursor = central_logical_offset;
+    let mut accumulators = [
+        EncodingKind::Cp437,
+        EncodingKind::Utf8,
+        EncodingKind::Cp936,
+        EncodingKind::Cp950,
+        EncodingKind::Cp932,
+    ]
+    .map(EncodingAccumulator::new);
+    let mut result = ZipFilenameAnalysis::status("ok");
+    result.authoritative_all = true;
+    result.ascii_only = true;
+    let mut window_start = 0u64;
+    let mut window = Vec::new();
+    let mut checked = 0u64;
+    while checked < total_entries {
+        if cursor < window_start || cursor + 46 > window_start + window.len() as u64 {
+            window_start = cursor;
+            window = reader.read_at(cursor, (end - cursor).min(64 * 1024) as usize)?;
+        }
+        let offset = (cursor - window_start) as usize;
+        let Some(fixed) = window.get(offset..offset + 46) else {
+            return Ok(ZipFilenameAnalysis::status("central_range_invalid"));
         };
-
+        if &fixed[..4] != super::CD_SIG {
+            return Ok(ZipFilenameAnalysis::status("central_range_invalid"));
+        }
+        let length = 46
+            + super::u16_le(fixed, 28) as usize
+            + super::u16_le(fixed, 30) as usize
+            + super::u16_le(fixed, 32) as usize;
+        if cursor + length as u64 > end {
+            return Ok(ZipFilenameAnalysis::status("central_range_invalid"));
+        }
+        if offset + length > window.len() {
+            window_start = cursor;
+            window = reader.read_at(
+                cursor,
+                (end - cursor).min((64 * 1024).max(length) as u64) as usize,
+            )?;
+        }
+        let offset = (cursor - window_start) as usize;
+        let Some(record) = super::parse_central_directory_record(&window, offset, window.len())
+        else {
+            return Ok(ZipFilenameAnalysis::status("central_range_invalid"));
+        };
         if !record.name.is_empty() {
-            entries.push(ZipNameEntry {
-                name_start: record.offset + 46,
-                name_end: record.offset + 46 + record.name.len(),
-                utf8_flag: record.flags & ZIP_UTF8_FLAG != 0,
-                unicode_path: valid_unicode_path_name(record.name, record.extra),
-            });
-            filename_bytes = filename_bytes.saturating_add(record.name.len());
+            result.sample_count += 1;
+            let unicode = valid_unicode_path_name(record.name, record.extra);
+            result.unicode_count += usize::from(unicode);
+            let authoritative = if record.flags & ZIP_UTF8_FLAG != 0 {
+                std::str::from_utf8(record.name).is_ok()
+            } else {
+                unicode
+            };
+            result.authoritative_all &= authoritative;
+            result.ascii_only &= record.name.is_ascii();
+            if !authoritative {
+                for accumulator in &mut accumulators {
+                    accumulator.observe(record.name)?;
+                }
+            }
         }
-        offset = record.end;
-        if filename_bytes >= max_filename_bytes {
-            truncated = true;
-            break;
+        checked += 1;
+        cursor += length as u64;
+    }
+    if !super::central_directory_complete(cursor, end, |offset, length| {
+        reader.read_at(offset, length)
+    })? {
+        return Ok(ZipFilenameAnalysis::status("central_range_invalid"));
+    }
+    Ok(finish_analysis(result, accumulators))
+}
+
+struct EncodingAccumulator {
+    kind: EncodingKind,
+    score: i64,
+    decoded_count: usize,
+    count: usize,
+    components: SpillMap<()>,
+    units: HashSet<(u8, u8)>,
+    stats: NameStats,
+}
+impl EncodingAccumulator {
+    fn new(kind: EncodingKind) -> Self {
+        Self {
+            kind,
+            score: 0,
+            decoded_count: 0,
+            count: 0,
+            components: SpillMap::default(),
+            units: HashSet::new(),
+            stats: NameStats::default(),
         }
     }
-
-    if total_entries == 0
-        && entries.len() == max_samples
-        && super::parse_central_directory_record(&central, offset, central.len()).is_some()
-    {
-        truncated = true;
+    fn observe(&mut self, raw: &[u8]) -> io::Result<()> {
+        self.count += 1;
+        if raw.is_ascii() {
+            self.decoded_count += 1;
+            return self.observe_components(std::str::from_utf8(raw).unwrap());
+        }
+        if let Some(decoded) = decode_bytes(self.kind, raw) {
+            self.decoded_count += 1;
+            self.observe_components(&decoded)?;
+        } else {
+            self.score = self.score.saturating_sub(12);
+        }
+        observe_legacy_units(raw, self.kind, &mut self.units);
+        Ok(())
     }
-
-    ZipNameScan {
-        status: "ok",
-        central,
-        entries,
-        truncated,
+    fn observe_components(&mut self, decoded: &str) -> io::Result<()> {
+        for part in decoded.split(['/', '\\']).filter(|part| !part.is_empty()) {
+            let (score, stats) = if part.is_ascii() {
+                let mut score = 0;
+                if part
+                    .bytes()
+                    .any(|byte| byte < 32 && !matches!(byte, b'\t' | b'\n' | b'\r'))
+                {
+                    score -= 20;
+                }
+                if part
+                    .bytes()
+                    .any(|byte| matches!(byte, b'<' | b'>' | b':' | b'"' | b'|' | b'?' | b'*'))
+                {
+                    score -= 10;
+                }
+                if matches!(part, "." | "..") {
+                    score -= 3;
+                }
+                (score, NameStats::default())
+            } else {
+                score_decoded_name(part, self.kind)
+            };
+            if score == 0
+                && stats.cjk == 0
+                && stats.kana == 0
+                && stats.halfwidth_kana == 0
+                && stats.latin_symbols == 0
+            {
+                continue;
+            }
+            if self.components.insert_new(part.to_owned(), ())? {
+                self.score = self.score.saturating_add(score);
+                self.stats.cjk += stats.cjk;
+                self.stats.kana += stats.kana;
+                self.stats.halfwidth_kana += stats.halfwidth_kana;
+                self.stats.latin_symbols += stats.latin_symbols;
+            }
+        }
+        Ok(())
+    }
+    fn finish(self) -> EncodingScore {
+        EncodingScore {
+            kind: self.kind,
+            score: self
+                .score
+                .saturating_add(legacy_units_score(self.units, self.kind))
+                .saturating_add(if self.decoded_count == self.count {
+                    4
+                } else {
+                    0
+                }),
+            decoded_count: self.decoded_count,
+            stats: self.stats,
+        }
     }
 }
 
-fn has_authoritative_name(entry: &ZipNameEntry, central: &[u8]) -> bool {
-    if entry.utf8_flag {
-        std::str::from_utf8(&central[entry.name_start..entry.name_end]).is_ok()
-    } else {
-        entry.unicode_path
-    }
-}
-
+#[cfg(test)]
 fn select_codepage(raw_names: &[&[u8]]) -> (EncodingScore, SelectionEvidence, f64) {
-    let mut scores = [
-        score_encoding(raw_names, EncodingKind::Cp437),
-        score_encoding(raw_names, EncodingKind::Utf8),
-        score_encoding(raw_names, EncodingKind::Cp936),
-        score_encoding(raw_names, EncodingKind::Cp950),
-        score_encoding(raw_names, EncodingKind::Cp932),
-    ];
+    let scores = [
+        EncodingKind::Cp437,
+        EncodingKind::Utf8,
+        EncodingKind::Cp936,
+        EncodingKind::Cp950,
+        EncodingKind::Cp932,
+    ]
+    .map(|kind| {
+        let mut accumulator = EncodingAccumulator::new(kind);
+        for name in raw_names {
+            accumulator.observe(name).unwrap();
+        }
+        accumulator.finish()
+    });
+    select_scores(scores)
+}
+fn select_scores(mut scores: [EncodingScore; 5]) -> (EncodingScore, SelectionEvidence, f64) {
     scores.sort_by(|left, right| right.score.cmp(&left.score));
     let best = scores[0].clone();
     let second = scores[1].clone();
@@ -547,47 +574,6 @@ fn select_codepage(raw_names: &[&[u8]]) -> (EncodingScore, SelectionEvidence, f6
         stats: best.stats.clone(),
     };
     (best, evidence, confidence)
-}
-
-fn score_encoding(raw_names: &[&[u8]], encoding: EncodingKind) -> EncodingScore {
-    let mut score = 0i64;
-    let mut decoded_count = 0usize;
-    let mut components = HashSet::<String>::new();
-
-    for raw_name in raw_names {
-        let Some(decoded) = decode_bytes(encoding, raw_name) else {
-            score -= 12;
-            continue;
-        };
-        decoded_count += 1;
-        for component in decoded.split(|ch| ch == '\\' || ch == '/') {
-            if !component.is_empty() {
-                components.insert(component.to_string());
-            }
-        }
-    }
-
-    let mut total_stats = NameStats::default();
-    for component in components {
-        let (component_score, stats) = score_decoded_name(&component, encoding);
-        score += component_score;
-        total_stats.cjk += stats.cjk;
-        total_stats.kana += stats.kana;
-        total_stats.halfwidth_kana += stats.halfwidth_kana;
-        total_stats.latin_symbols += stats.latin_symbols;
-    }
-
-    score += score_legacy_code_units(raw_names, encoding);
-    if decoded_count == raw_names.len() {
-        score += 4;
-    }
-
-    EncodingScore {
-        kind: encoding,
-        score,
-        decoded_count,
-        stats: total_stats,
-    }
 }
 
 fn decode_bytes(encoding: EncodingKind, raw: &[u8]) -> Option<String> {
@@ -619,34 +605,29 @@ fn decode_cp437(raw: &[u8]) -> String {
         .collect()
 }
 
-fn score_legacy_code_units(raw_names: &[&[u8]], encoding: EncodingKind) -> i64 {
+fn observe_legacy_units(raw_name: &[u8], encoding: EncodingKind, units: &mut HashSet<(u8, u8)>) {
     if !matches!(
         encoding,
         EncodingKind::Cp932 | EncodingKind::Cp936 | EncodingKind::Cp950
     ) {
-        return 0;
+        return;
     }
-
-    let mut units = HashSet::<(u8, u8)>::new();
-    for raw_name in raw_names {
-        let mut index = 0usize;
-        while index + 1 < raw_name.len() {
-            let lead = raw_name[index];
-            let is_lead = match encoding {
-                EncodingKind::Cp932 => {
-                    (0x81..=0x9f).contains(&lead) || (0xe0..=0xfc).contains(&lead)
-                }
-                _ => (0x81..=0xfe).contains(&lead),
-            };
-            if is_lead {
-                units.insert((lead, raw_name[index + 1]));
-                index += 2;
-            } else {
-                index += 1;
-            }
+    let mut index = 0;
+    while index + 1 < raw_name.len() {
+        let lead = raw_name[index];
+        let is_lead = match encoding {
+            EncodingKind::Cp932 => (0x81..=0x9f).contains(&lead) || (0xe0..=0xfc).contains(&lead),
+            _ => (0x81..=0xfe).contains(&lead),
+        };
+        if is_lead {
+            units.insert((lead, raw_name[index + 1]));
+            index += 2;
+        } else {
+            index += 1;
         }
     }
-
+}
+fn legacy_units_score(units: HashSet<(u8, u8)>, encoding: EncodingKind) -> i64 {
     units
         .into_iter()
         .map(|(lead, trail)| match encoding {
@@ -866,35 +847,12 @@ mod tests {
         )
         .unwrap();
 
-        let scan = scan_zip_names(&reader, 2000, 1024 * 1024).unwrap();
+        let scan = scan_zip_names(&reader).unwrap();
 
         assert_eq!(scan.status, "ok");
-        assert_eq!(scan.entries.len(), 1);
-        assert_eq!(
-            &scan.central[scan.entries[0].name_start..scan.entries[0].name_end],
-            raw_name
-        );
-        assert!(scan.entries[0].utf8_flag);
-        assert!(!scan.entries[0].unicode_path);
-        assert!(!scan.truncated);
+        assert_eq!(scan.sample_count, 1);
+        assert!(scan.authoritative_all);
         let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn zip_name_sample_limit_is_reported_as_truncated() {
-        let mut central = Vec::new();
-        for raw_name in [b"a.txt".as_slice(), b"b.txt".as_slice()] {
-            let mut record = vec![0; ZIP_CENTRAL_HEADER_LENGTH];
-            record[0..4].copy_from_slice(ZIP_CENTRAL_DIRECTORY_SIGNATURE);
-            record[28..30].copy_from_slice(&(raw_name.len() as u16).to_le_bytes());
-            record.extend_from_slice(raw_name);
-            central.extend_from_slice(&record);
-        }
-
-        let scan = collect_zip_names(central, 2, 1, 1024);
-
-        assert_eq!(scan.entries.len(), 1);
-        assert!(scan.truncated);
     }
 
     #[test]

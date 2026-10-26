@@ -197,6 +197,13 @@ pub(crate) fn verify_prepared(
     if matches!(prepared, Err(PreparedStatus::ReadFault(fault)) if fault.code == "io_error") {
         entries.retain(|(old, current)| *old != key || !Arc::ptr_eq(current, &slot));
     }
+    // Oversized material is valid for this request but must not remain in the
+    // background cache after its last active borrower returns.
+    if matches!(prepared, Ok(context) if context.retained_bytes()>MAX_CONTEXT_BYTES)
+        || matches!(prepared, Err(PreparedStatus::Status(_,message)) if message.starts_with("resource_unavailable:"))
+    {
+        entries.retain(|(old, current)| *old != key || !Arc::ptr_eq(current, &slot));
+    }
     let mut bytes: usize = entries
         .iter()
         .filter_map(|(_, slot)| slot.value.get())

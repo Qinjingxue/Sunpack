@@ -61,7 +61,6 @@ impl AnalysisBinaryView {
     fn probe_seven_zip_native(
         &self,
         start_offset: u64,
-        max_next_header_check_bytes: u64,
     ) -> PyResult<SevenZipObservation> {
         self.ensure_open()?;
         let mut result = SevenZipObservation {
@@ -139,21 +138,31 @@ impl AnalysisBinaryView {
         evidence.push("7z:signature");
         evidence.push("7z:start_header_crc");
         evidence.push("7z:next_header_range");
-        if next_header_size <= max_next_header_check_bytes {
-            let next_header = match self.read_field_at_bytes(
-                next_header_start,
-                next_header_size as usize,
-                "7z.next_header",
-                FieldLocation::Tail,
-            ) {
-                Ok(data) => data,
-                Err(fault) => {
-                    result.read_fault = Some((fault, "next_header_read_failed"));
-                    result.plausible = false;
-                    return Ok(result);
-                }
-            };
-            let crc_ok = crc32(&next_header) == next_header_crc;
+        {
+            // CRC covers the complete declared range with a fixed working buffer.
+            // Spill large headers for shared encryption-fact parsing without
+            // allocating the whole declared range on the heap.
+            let mut next_header = crate::io::scratch::Spool::default();
+            use std::io::Write;
+            let mut hash = crc32fast::Hasher::new();
+            let mut offset = next_header_start;
+            while offset < segment_end {
+                let length = (segment_end - offset).min(64 * 1024) as usize;
+                let bytes = match self.read_field_at_bytes(
+                    offset, length, "7z.next_header", FieldLocation::Tail,
+                ) {
+                    Ok(bytes) => bytes,
+                    Err(fault) => {
+                        result.read_fault = Some((fault, "next_header_read_failed"));
+                        return Ok(result);
+                    }
+                };
+                hash.update(&bytes);
+                next_header.write_all(&bytes)?;
+                offset += length as u64;
+            }
+            let next_header = next_header.finish()?;
+            let crc_ok = hash.finalize() == next_header_crc;
             let nid = next_header.first().copied().unwrap_or(0);
             let nid_valid = next_header.is_empty() || nid == 0x01 || nid == 0x17;
             result.next_header_crc_checked = true;

@@ -7,10 +7,10 @@ from sunpack_native import AnalysisBinaryView
 from sunpack.core.analysis import AnalysisRequest, ArchiveAnalyzer
 
 
-def _probe_tar(tmp_path, data: bytes, max_entries_to_walk: int, name: str = "probe.tar") -> dict:
+def _probe_tar(tmp_path, data: bytes, name: str = "probe.tar") -> dict:
     path = tmp_path / name
     path.write_bytes(data)
-    return dict(AnalysisBinaryView(str(path)).probe_tar(0, max_entries_to_walk))
+    return dict(AnalysisBinaryView(str(path)).probe_tar(0))
 
 
 def _many_member_tar(count: int, *, fmt=tarfile.USTAR_FORMAT) -> bytes:
@@ -37,15 +37,14 @@ def _header_offsets(data: bytes) -> list[int]:
     return offsets
 
 
-def test_tar_walk_budget_is_not_an_archive_boundary(tmp_path):
-    raw = _probe_tar(tmp_path, _many_member_tar(1100), 64)
+def test_tar_walk_resolves_the_actual_archive_boundary(tmp_path):
+    raw = _probe_tar(tmp_path, _many_member_tar(1100))
 
     assert raw["plausible"] is True
-    assert raw["entries_checked"] == 64
-    assert raw["walk_budget_exhausted"] is True
-    assert raw["walk_complete"] is False
-    assert raw["segment_end"] is None
-    assert raw["boundary_confidence"] == "none"
+    assert raw["entries_checked"] == 1100
+    assert raw["walk_complete"] is True
+    assert raw["segment_end"] == 1100 * 1024 + 1024
+    assert raw["boundary_confidence"] == "high"
     assert raw["damage_flags"] == []
 
 
@@ -63,8 +62,8 @@ def test_primary_tar_owns_internal_ustar_hits(tmp_path):
 
     assert len(evidence.segments) == 1
     assert evidence.segments[0].start_offset == 0
-    assert evidence.segments[0].end_offset is None
-    assert evidence.details["walk_budget_exhausted"] is True
+    assert evidence.segments[0].end_offset == 100 * 1024 + 1024
+    assert evidence.details["walk_complete"] is True
 
 
 def test_v7_tar_is_recognized_without_ustar_magic(tmp_path):
@@ -73,7 +72,7 @@ def test_v7_tar_is_recognized_without_ustar_magic(tmp_path):
     data[148:156] = b" " * 8
     checksum = sum(data[:512])
     data[148:156] = f"{checksum:06o}\0 ".encode("ascii")
-    raw = _probe_tar(tmp_path, bytes(data), 8)
+    raw = _probe_tar(tmp_path, bytes(data))
 
     assert raw["plausible"] is True
     assert raw["entry_walk_ok"] is True
@@ -87,7 +86,7 @@ def test_gnu_base256_size_is_accepted(tmp_path):
     checksum = sum(data[:512])
     data[148:156] = f"{checksum:06o}\0 ".encode("ascii")
 
-    raw = _probe_tar(tmp_path, bytes(data), 8)
+    raw = _probe_tar(tmp_path, bytes(data))
 
     assert raw["plausible"] is True
     assert raw["member_size"] == 1
@@ -100,7 +99,7 @@ def test_native_tar_semantics_honor_embedded_archive_offset(tmp_path):
     start = len(b"carrier!" * 128)
 
     raw = dict(sunpack_native.inspect_tar_header_structure(
-        str(carrier), 8, start, start + len(tar_data)
+        str(carrier), start, start + len(tar_data)
     ))
 
     assert raw["plausible"] is True
@@ -109,14 +108,14 @@ def test_native_tar_semantics_honor_embedded_archive_offset(tmp_path):
     assert f"offset={start + 512}" in raw["member.payload.span"]
 
 
-def test_native_semantics_do_not_call_budget_remainder_trailing_junk(tmp_path):
+def test_native_semantics_do_not_call_later_members_trailing_junk(tmp_path):
     path = tmp_path / "many.tar"
     path.write_bytes(_many_member_tar(65))
 
-    raw = dict(sunpack_native.inspect_tar_header_structure(str(path), 8))
+    raw = dict(sunpack_native.inspect_tar_header_structure(str(path)))
 
     assert raw["plausible"] is True
-    assert raw["walk_budget_exhausted"] is True
+    assert raw["entries_checked"] == 65
     assert "missing_end_block" not in raw["damage_flags"]
     assert "trailing_junk" not in raw["damage_flags"]
     assert raw["archive.trailing_data"] == 0
@@ -135,7 +134,7 @@ def test_native_semantics_validate_exact_pax_record_lengths(tmp_path):
     path = tmp_path / "bad-pax.tar"
     path.write_bytes(data)
 
-    raw = dict(sunpack_native.inspect_tar_header_structure(str(path), 8))
+    raw = dict(sunpack_native.inspect_tar_header_structure(str(path)))
 
     assert "pax_header_bad" in raw["damage_flags"]
     assert "invalid:" in raw["pax.header.records"]
@@ -151,7 +150,7 @@ def test_tar_metadata_budget_preserves_incomplete_analysis_instead_of_damage(tmp
     data += bytes(-len(data) % 512) + bytes(1024)
     path = tmp_path / "disguised.bin"
     path.write_bytes(data)
-    raw = dict(sunpack_native.inspect_tar_header_structure(str(path), 8))
+    raw = dict(sunpack_native.inspect_tar_header_structure(str(path)))
     assert raw["plausible"] is True
     assert raw["error"] == "analysis_resource_limit"
     assert raw["structure_status"] == "incomplete"
@@ -160,7 +159,7 @@ def test_tar_metadata_budget_preserves_incomplete_analysis_instead_of_damage(tmp
     assert not raw.get("damage_flags")
     view = AnalysisBinaryView(str(path))
     try:
-        raw = view.probe_tar(0, 8)
+        raw = view.probe_tar(0)
         assert raw["plausible"] and raw["error"] == "analysis_resource_limit"
         assert not raw["walk_complete"] and not raw["damage_flags"]
     finally:

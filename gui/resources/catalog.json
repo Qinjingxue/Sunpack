@@ -964,16 +964,6 @@
       "max": 1,
       "exclusive": false
     },
-    "/recursive_authorization/hard_maximum_other_projects": {
-      "label": {
-        "zh": "其他项目上限",
-        "en": "Other item limit"
-      },
-      "min": 0,
-      "max": null,
-      "exclusive": false,
-      "integer": true
-    },
     "/post_extract/archive_cleanup_mode": {
       "label": {
         "zh": "解压文件后的处理方式",
@@ -1524,15 +1514,6 @@
       "max": null,
       "integer": true
     },
-    "/analysis/max_read_mb_per_archive": {
-      "label": {
-        "zh": "单包读取上限（MiB）",
-        "en": "Per-archive read limit (MiB)"
-      },
-      "min": 0,
-      "max": null,
-      "integer": true
-    },
     "/analysis/prepass/enabled": {
       "label": {
         "zh": "文件头尾预读",
@@ -1571,27 +1552,11 @@
         "en": "ZIP"
       }
     },
-    "/analysis/modules/@zip/max_cd_entries_to_walk": {
-      "label": {
-        "zh": "目录项检查上限",
-        "en": "Directory entry limit"
-      },
-      "min": 0,
-      "integer": true
-    },
     "/analysis/modules/@rar/enabled": {
       "label": {
         "zh": "RAR",
         "en": "RAR"
       }
-    },
-    "/analysis/modules/@rar/max_blocks_to_walk": {
-      "label": {
-        "zh": "数据块检查上限",
-        "en": "Block check limit"
-      },
-      "min": 0,
-      "integer": true
     },
     "/analysis/modules/@seven_zip/enabled": {
       "label": {
@@ -1599,27 +1564,11 @@
         "en": "7z"
       }
     },
-    "/analysis/modules/@seven_zip/max_next_header_check_bytes": {
-      "label": {
-        "zh": "文件头读取上限（字节）",
-        "en": "Header read limit (bytes)"
-      },
-      "min": 0,
-      "integer": true
-    },
     "/analysis/modules/@tar/enabled": {
       "label": {
         "zh": "TAR",
         "en": "TAR"
       }
-    },
-    "/analysis/modules/@tar/max_entries_to_walk": {
-      "label": {
-        "zh": "归档项检查上限",
-        "en": "Archive entry limit"
-      },
-      "min": 0,
-      "integer": true
     },
     "/analysis/modules/@gzip/enabled": {
       "label": {
@@ -1793,14 +1742,6 @@
         "en": "File count and size"
       }
     },
-    "/verification/methods/@manifest_size_match/max_expected_names": {
-      "label": {
-        "zh": "比对文件数上限",
-        "en": "Compared file limit"
-      },
-      "min": 0,
-      "integer": true
-    },
     "/verification/methods/@manifest_size_match/file_count_abs_tolerance": {
       "label": {
         "zh": "允许的文件数量差",
@@ -1848,14 +1789,6 @@
         "zh": "使用压缩包校验信息检查完整性",
         "en": "Check integrity using archive checksums"
       }
-    },
-    "/verification/methods/@archive_test_crc/max_items": {
-      "label": {
-        "zh": "校验项目上限",
-        "en": "Checked item limit"
-      },
-      "min": 0,
-      "integer": true
     },
     "/verification/methods/@archive_test_crc/max_reported_items": {
       "label": {

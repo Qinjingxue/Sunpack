@@ -75,7 +75,7 @@ impl RarObservation {
 }
 
 impl AnalysisBinaryView {
-    fn probe_rar_native(&self, start_offset: u64, max_blocks: usize) -> PyResult<RarObservation> {
+    fn probe_rar_native(&self, start_offset: u64) -> PyResult<RarObservation> {
         self.ensure_open()?;
         let mut result = RarObservation {
             archive_offset: start_offset,
@@ -96,11 +96,11 @@ impl AnalysisBinaryView {
         if header.starts_with(RAR5) {
             result.magic_matched = true;
             result.version = 5;
-            self.probe_rar5(&mut result, start_offset, max_blocks)?;
+            self.probe_rar5(&mut result, start_offset)?;
         } else if header.starts_with(RAR4) {
             result.magic_matched = true;
             result.version = 4;
-            self.probe_rar4(&mut result, start_offset, max_blocks)?;
+            self.probe_rar4(&mut result, start_offset)?;
         } else if header.starts_with(b"Rar!") {
             result.magic_matched = true;
             result.error = "rar_signature_incomplete_or_unknown";
@@ -114,13 +114,13 @@ impl AnalysisBinaryView {
         &self,
         result: &mut RarObservation,
         start_offset: u64,
-        max_blocks: usize,
     ) -> PyResult<()> {
         let mut cursor = start_offset + RAR4.len() as u64;
         let size = self.reader.len();
         let mut evidence = Vec::new();
         evidence.push("rar4:signature");
-        for index in 0..max_blocks {
+        let mut index = 0;
+        loop {
             if cursor.saturating_add(7) > size {
                 result.blocks_checked = index;
                 let location = if index == 0 {
@@ -261,26 +261,21 @@ impl AnalysisBinaryView {
                 return Ok(());
             }
             cursor = next_cursor;
+            index += 1;
         }
-        result.blocks_checked = max_blocks;
-        result.segment_end = cursor;
-        result.plausible = true;
-        result.error = "rar4_block_walk_limit_reached";
-        result.evidence = evidence;
-        Ok(())
     }
 
     fn probe_rar5(
         &self,
         result: &mut RarObservation,
         start_offset: u64,
-        max_blocks: usize,
     ) -> PyResult<()> {
         let mut cursor = start_offset + RAR5.len() as u64;
         let size = self.reader.len();
         let mut evidence = Vec::new();
         evidence.push("rar5:signature");
-        for index in 0..max_blocks {
+        let mut index = 0;
+        loop {
             if cursor.saturating_add(6) > size {
                 result.blocks_checked = index;
                 let location = if index == 0 {
@@ -469,12 +464,7 @@ impl AnalysisBinaryView {
                 return Ok(());
             }
             cursor = next_cursor;
+            index += 1;
         }
-        result.blocks_checked = max_blocks;
-        result.segment_end = cursor;
-        result.plausible = true;
-        result.error = "rar5_block_walk_limit_reached";
-        result.evidence = evidence;
-        Ok(())
     }
 }

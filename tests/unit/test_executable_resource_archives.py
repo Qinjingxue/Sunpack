@@ -65,7 +65,6 @@ def _config() -> dict:
             "authorization_bias": 0.0,
             "minimum_authorization_score": 0.85,
             "minimum_archive_byte_ratio": 0.1,
-            "hard_maximum_other_projects": 1000,
         },
         "filesystem": {
             "scan_filters": [

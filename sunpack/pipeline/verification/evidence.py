@@ -31,7 +31,6 @@ class VerificationEvidence:
     _output_inventory_cache: OutputInventory | None = field(default=None, init=False, repr=False, compare=False)
     _file_observation_owner: str = field(default="", init=False, repr=False, compare=False)
     _archive_input_manifest_full_cache: dict[str, Any] | None = field(default=None, init=False, repr=False, compare=False)
-    _archive_input_manifest_full_max_items: int = field(default=0, init=False, repr=False, compare=False)
 
     @property
     def archive_path(self) -> str:

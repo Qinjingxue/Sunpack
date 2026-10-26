@@ -135,6 +135,12 @@ fn prepare_seven_zip<R: Read + Seek>(
     } else {
         "7z password probe is disabled".to_string()
     };
+    if probe_error.starts_with("resource_unavailable:") {
+        return Err(PreparedStatus::new(
+            "unknown_needs_final_verifier",
+            probe_error,
+        ));
+    }
     reader.seek(SeekFrom::Start(0)).map_err(|error| {
         ReadFault::from_io(error, "seek", 0, 0, 0, total_len)
             .with_field("7z.start_header", FieldLocation::Head)
@@ -228,9 +234,11 @@ fn find_first_conclusive_header_with_probe(
                     .par_iter()
                     .enumerate()
                     .filter_map(|(relative, password)| {
-                        probe
-                            .decoded_header_if_password_matches(password)
-                            .map(|decoded| (relative, decoded))
+                        match probe.decoded_header_if_password_matches(password) {
+                            Ok(Some(decoded)) => Some((relative, Ok(decoded))),
+                            Ok(None) => None,
+                            Err(error) => Some((relative, Err(error))),
+                        }
                     })
                     .find_first(|_| true)
             };
@@ -243,13 +251,18 @@ fn find_first_conclusive_header_with_probe(
                 .iter()
                 .enumerate()
                 .find_map(|(relative, password)| {
-                    probe
-                        .decoded_header_if_password_matches(password)
-                        .map(|decoded| (relative, decoded))
+                    match probe.decoded_header_if_password_matches(password) {
+                        Ok(Some(decoded)) => Some((relative, Ok(decoded))),
+                        Ok(None) => None,
+                        Err(error) => Some((relative, Err(error))),
+                    }
                 })
         }?;
         let index = start + possible.0;
-        let outcome = read_predecoded_header_with_original_parser(&possible.1);
+        let outcome = match possible.1 {
+            Ok(decoded) => read_predecoded_header_with_original_parser(&decoded),
+            Err(error) => HeaderRead::Unsupported(error),
+        };
         if !matches!(outcome, HeaderRead::WrongPasswordOrPasswordRequired) {
             return Some((index, outcome));
         }
@@ -263,17 +276,25 @@ fn read_predecoded_header_with_original_parser(decoded_header: &[u8]) -> HeaderR
     let Ok(next_header_size) = u64::try_from(decoded_header.len()) else {
         return HeaderRead::Unsupported("7z decoded header is too large".to_string());
     };
-    let mut synthetic = Vec::with_capacity(32 + decoded_header.len());
-    synthetic.extend_from_slice(SEVEN_Z_SIGNATURE);
-    synthetic.extend_from_slice(&[0, 4]);
-    synthetic.extend_from_slice(&[0; 4]);
-    let mut start_header = [0u8; 20];
-    start_header[8..16].copy_from_slice(&next_header_size.to_le_bytes());
-    start_header[16..20].copy_from_slice(&crc32fast::hash(decoded_header).to_le_bytes());
-    synthetic[8..12].copy_from_slice(&crc32fast::hash(&start_header).to_le_bytes());
-    synthetic.extend_from_slice(&start_header);
-    synthetic.extend_from_slice(decoded_header);
-    read_archive_header_from_reader(std::io::Cursor::new(synthetic), "")
+    use std::io::Write;
+    let mut header = [0u8; 32];
+    header[..6].copy_from_slice(SEVEN_Z_SIGNATURE);
+    header[7] = 4;
+    header[20..28].copy_from_slice(&next_header_size.to_le_bytes());
+    header[28..32].copy_from_slice(&crc32fast::hash(decoded_header).to_le_bytes());
+    let crc = crc32fast::hash(&header[12..32]);
+    header[8..12].copy_from_slice(&crc.to_le_bytes());
+    let mut synthetic = crate::io::scratch::Spool::default();
+    if let Err(error) = synthetic
+        .write_all(&header)
+        .and_then(|_| synthetic.write_all(decoded_header))
+    {
+        return HeaderRead::Unsupported(format!("resource_unavailable:{error}"));
+    }
+    match synthetic.finish() {
+        Ok(blob) => read_archive_header_from_reader(std::io::Cursor::new(blob), ""),
+        Err(error) => HeaderRead::Unsupported(format!("resource_unavailable:{error}")),
+    }
 }
 
 fn conclusive_status(py: Python<'_>, index: usize, outcome: HeaderRead) -> PyResult<Py<PyAny>> {

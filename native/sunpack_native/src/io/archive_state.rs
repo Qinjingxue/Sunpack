@@ -1,6 +1,7 @@
 use crate::formats::tar::{self, TarState};
 use crate::formats::zip::zip64;
 use crate::io::resource_lifecycle::TrackedFile;
+use crate::io::scratch::RowBuilder;
 use crate::password::zip::{zip_password_bytes, ZipCryptoDecryptor};
 use crate::verification::archive_manifest::{ManifestEntry, NativeArchiveManifest};
 use crate::verification::paths::{
@@ -20,37 +21,30 @@ const CD_SIG: &[u8] = b"PK\x01\x02";
 const LFH_SIG: &[u8] = b"PK\x03\x04";
 const ZIP_UNICODE_PATH_EXTRA_FIELD: u16 = 0x7075;
 #[pyfunction]
-#[pyo3(signature = (source, max_items=200000, password=None, codepage=None))]
+#[pyo3(signature = (source, password=None, codepage=None))]
 pub(crate) fn archive_state_zip_manifest_native(
     py: Python<'_>,
     source: &Bound<'_, PyDict>,
-    max_items: usize,
     password: Option<String>,
     codepage: Option<String>,
 ) -> PyResult<NativeArchiveManifest> {
     let segments = build_segments(source)?;
     py.detach(move || {
         let mut reader = SegmentReader::new(segments);
-        zip_manifest_from_reader(
-            &mut reader,
-            max_items,
-            password.as_deref(),
-            codepage.as_deref(),
-        )
+        zip_manifest_from_reader(&mut reader, password.as_deref(), codepage.as_deref())
     })
 }
 
 #[pyfunction]
-#[pyo3(signature = (source, max_items=200000))]
+#[pyo3(signature = (source))]
 pub(crate) fn archive_state_tar_manifest_native(
     py: Python<'_>,
     source: &Bound<'_, PyDict>,
-    max_items: usize,
 ) -> PyResult<NativeArchiveManifest> {
     let segments = build_segments(source)?;
     py.detach(move || {
         let mut reader = SegmentReader::new(segments);
-        tar_manifest_from_reader(&mut reader, max_items)
+        tar_manifest_from_reader(&mut reader)
     })
 }
 
@@ -169,21 +163,19 @@ impl SegmentReader {
     }
 }
 
-fn tar_manifest_from_reader(
-    reader: &mut SegmentReader,
-    max_items: usize,
-) -> PyResult<NativeArchiveManifest> {
+fn tar_manifest_from_reader(reader: &mut SegmentReader) -> PyResult<NativeArchiveManifest> {
     const BLOCK: u64 = 512;
     let mut offset = 0u64;
     let mut item_count = 0usize;
     let mut file_count = 0usize;
     let mut total_unpacked_size = 0u64;
     let mut zero_blocks = 0usize;
-    let mut entries = Vec::<ManifestEntry>::new();
+    let mut entries = RowBuilder::<ManifestEntry>::default();
     let mut output_paths = OutputPathAllocator::default();
     let mut state = TarState::default();
     let mut error = None::<String>;
     let mut checksum_error = false;
+    let mut resource_unavailable = false;
     let mut hard_links = Vec::new();
 
     while offset.saturating_add(BLOCK) <= reader.total {
@@ -199,13 +191,18 @@ fn tar_manifest_from_reader(
         }
         zero_blocks = 0;
 
-        let retain = entries.len() < max_items;
+        let retain = true;
         let total = reader.total;
         let record = match state.advance(&header, offset, total, retain, &mut |start, size| {
             reader.read_vec_at(start, size)
         }) {
             Ok(record) => record,
             Err(fault) => {
+                if fault.kind() == std::io::ErrorKind::OutOfMemory {
+                    resource_unavailable = true;
+                    error = Some(fault.to_string());
+                    break;
+                }
                 if !matches!(
                     fault.kind(),
                     std::io::ErrorKind::InvalidData | std::io::ErrorKind::UnexpectedEof
@@ -222,11 +219,12 @@ fn tar_manifest_from_reader(
         let member_offset = offset;
         offset = record.next;
         if let Some(member) = record.member {
-            // Once retention is full, only aggregate; no later entry uses names.
+            // Project names during the one source walk; large entry tables spill to disk.
             let projected = member
                 .path
                 .as_deref()
-                .map(|path| output_paths.project(path, member.is_directory));
+                .map(|path| output_paths.project(path, member.is_directory))
+                .transpose()?;
             if member.is_file {
                 file_count += 1;
                 if let Some(target) = member.hard_link {
@@ -240,12 +238,16 @@ fn tar_manifest_from_reader(
                 }
                 if let (Some(path), Some(projected)) = (member.path, projected) {
                     let raw_path = (projected != path).then_some(path);
-                    entries.push(ManifestEntry {
-                        path: projected,
-                        raw_path,
-                        size: member.size,
-                        crc32: None,
-                    });
+                    let bytes = projected.len() + raw_path.as_ref().map_or(0, String::len) + 64;
+                    entries.push(
+                        ManifestEntry {
+                            path: projected,
+                            raw_path,
+                            size: member.size,
+                            crc32: None,
+                        },
+                        bytes,
+                    )?;
                 }
             }
         }
@@ -272,8 +274,14 @@ fn tar_manifest_from_reader(
             }
         }
     }
-    let damaged = error.is_some();
-    let status = if damaged { 2 } else { 0 };
+    let damaged = error.is_some() && !resource_unavailable;
+    let status = if resource_unavailable {
+        4
+    } else if damaged {
+        2
+    } else {
+        0
+    };
     let message = error.unwrap_or_else(|| {
         if zero_blocks >= 2 {
             "TAR source manifest walked to canonical end".to_string()
@@ -292,10 +300,21 @@ fn tar_manifest_from_reader(
         message,
         archive_type: "tar".to_string(),
         source: "archive_state_tar_native".to_string(),
-        archive_walk_complete: !damaged,
-        verified_item_count: if !damaged { item_count } else { 0 },
-        failure_kind: if damaged { "corrupted_data" } else { "" }.to_string(),
-        entries: Arc::new(entries),
+        archive_walk_complete: !damaged && !resource_unavailable,
+        verified_item_count: if !damaged && !resource_unavailable {
+            item_count
+        } else {
+            0
+        },
+        failure_kind: if resource_unavailable {
+            "resource_unavailable"
+        } else if damaged {
+            "corrupted_data"
+        } else {
+            ""
+        }
+        .to_string(),
+        entries: Arc::new(entries.finish()?),
     })
 }
 
@@ -307,12 +326,12 @@ struct TarHardLink {
 
 /// A second header-only walk is needed only for archives containing hard links.
 /// Retain targets requested by links, never an unbounded index of ordinary names
-/// after max_items. Reuse TarState for PAX/GNU names and physical boundaries.
+/// for unrelated names. Reuse TarState for PAX/GNU names and physical boundaries.
 fn tar_hard_link_sizes(
     reader: &mut SegmentReader,
     end: u64,
     links: &[TarHardLink],
-    entries: &mut [ManifestEntry],
+    entries: &mut RowBuilder<ManifestEntry>,
 ) -> std::io::Result<u64> {
     let invalid = || {
         std::io::Error::new(
@@ -395,7 +414,7 @@ fn tar_hard_link_sizes(
         }
         total = total.saturating_add(size);
         if let Some(entry) = links[start].entry {
-            entries[entry].size = size;
+            entries.update(entry, |entry| entry.size = size)?;
         }
     }
     Ok(total)
@@ -529,7 +548,6 @@ impl DirectoryWindow {
 
 fn zip_manifest_from_reader(
     reader: &mut SegmentReader,
-    max_items: usize,
     password: Option<&str>,
     codepage: Option<&str>,
 ) -> PyResult<NativeArchiveManifest> {
@@ -548,7 +566,7 @@ fn zip_manifest_from_reader(
         archive_walk_complete: false,
         verified_item_count: 0,
         failure_kind: String::new(),
-        entries: Arc::new(Vec::new()),
+        entries: Arc::new(Vec::new().into()),
     };
     let Some(eocd) = find_eocd(reader)? else {
         manifest.is_archive = looks_like_zip(reader)?;
@@ -563,7 +581,7 @@ fn zip_manifest_from_reader(
     let expected_end = cd_start.saturating_add(eocd.cd_size);
     let mut directory = DirectoryWindow::default();
     let mut metadata = Vec::new();
-    let mut entries = Vec::new();
+    let mut entries = RowBuilder::<ManifestEntry>::default();
     let mut cursor = cd_start;
     let mut item_count = 0usize;
     let mut file_count = 0usize;
@@ -655,26 +673,30 @@ fn zip_manifest_from_reader(
             }
         }
         let is_directory = name.ends_with('/');
-        // No subsequent retained entry depends on collision allocation once
-        // the cap is reached. Keep walking/validating and aggregating sizes,
-        // but stop retaining names, like the TAR manifest walker.
-        let projected =
-            (entries.len() < max_items).then(|| output_paths.project(&name, is_directory));
+        // Every member participates in projection and matching; the table and
+        // collision allocator independently spill when their caches fill.
+        let projected = Some(output_paths.project(&name, is_directory)?);
         if !is_directory {
             file_count += 1;
             total_unpacked_size = total_unpacked_size.saturating_add(uncompressed_size);
             if let Some(projected) = projected {
-                entries.push(ManifestEntry {
-                    raw_path: (projected != name).then_some(name),
-                    path: projected,
-                    size: uncompressed_size,
-                    crc32: Some(crc32),
-                });
+                let bytes = projected.len() + name.len() + 64;
+                entries.push(
+                    ManifestEntry {
+                        raw_path: (projected != name).then_some(name),
+                        path: projected,
+                        size: uncompressed_size,
+                        crc32: Some(crc32),
+                    },
+                    bytes,
+                )?;
             }
         }
         cursor = record_end;
     }
-    if cursor != expected_end {
+    if !crate::formats::zip::central_directory_complete(cursor, expected_end, |offset, length| {
+        reader.read_vec_at(offset, length)
+    })? {
         damaged = true;
     }
     let walk_complete = !damaged && !wrong_password;
@@ -693,7 +715,7 @@ fn zip_manifest_from_reader(
     manifest.message = message;
     manifest.archive_walk_complete = walk_complete;
     manifest.verified_item_count = if walk_complete { item_count } else { 0 };
-    manifest.entries = Arc::new(entries);
+    manifest.entries = Arc::new(entries.finish()?);
     Ok(manifest)
 }
 

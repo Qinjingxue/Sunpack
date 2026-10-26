@@ -60,21 +60,21 @@ fn enrich_tar_semantics(
     file: &mut SourceCursor,
     archive_start: u64,
     archive_end: u64,
-    max_entries: usize,
 ) -> PyResult<()> {
     let mut offset = archive_start;
     let mut entries = 0usize;
     let mut zeros = 0usize;
-    let mut pax_lengths = Vec::new();
+    let mut pax_lengths = 0u64;
+    let mut detail_bytes=0usize;
+    let mut details_truncated=false;
     let mut pax_records = Vec::new();
     let mut gnu_longname = None::<String>;
     let mut gnu_longlink = None::<String>;
     let mut sparse = Vec::new();
     let mut semantic_flags = Vec::new();
-    let limit = max_entries.max(1);
     let mut state = crate::formats::tar::TarState::default();
     let mut walk_error = "";
-    while entries < limit && offset + TAR_BLOCK_SIZE as u64 <= archive_end {
+    while offset + TAR_BLOCK_SIZE as u64 <= archive_end {
         let mut header = [0u8; TAR_BLOCK_SIZE];
         if let Err(fault) = seek_field(
             file,
@@ -118,9 +118,12 @@ fn enrich_tar_semantics(
             },
             Some(&mut |metadata| {
                 use crate::formats::tar::TarMetadata;
+                let bytes=match &metadata {TarMetadata::Pax(key,value,_)=>key.len()+value.len()+32,TarMetadata::LongName(value)|TarMetadata::LongLink(value)=>value.len()};
+                if detail_bytes.saturating_add(bytes)>crate::formats::tar::MAX_METADATA {details_truncated=true;return;}
+                detail_bytes+=bytes;
                 match metadata {
                     TarMetadata::Pax(key, value, length) => {
-                        pax_lengths.push(length as u64);
+                        pax_lengths=pax_lengths.saturating_add(length as u64);
                         pax_records.push(format!("{}:{}={}", typeflag as char, key, value));
                         if key.starts_with("GNU.sparse.") {
                             if key == "GNU.sparse.map" && !validate_sparse_map(value) {
@@ -239,10 +242,10 @@ fn enrich_tar_semantics(
     }
     d.set_item(
         "pax.header.length",
-        if pax_lengths.is_empty() {
+        if pax_lengths==0 {
             "absent".into()
         } else {
-            pax_lengths.iter().sum::<u64>().to_string()
+            pax_lengths.to_string()
         },
     )?;
     d.set_item(
@@ -303,13 +306,7 @@ fn enrich_tar_semantics(
         },
     )?;
     d.set_item("archive.end_zero_blocks", zeros)?;
-    let walk_budget_exhausted =
-        entries >= limit && zeros < 2 && offset + TAR_BLOCK_SIZE as u64 <= archive_end;
-    let zero_fill = if walk_budget_exhausted {
-        0
-    } else {
-        archive_end.saturating_sub(offset)
-    };
+    let zero_fill=archive_end.saturating_sub(offset);
     let mut remaining = zero_fill;
     let mut scan_offset = offset;
     let mut nonzero_tail = false;
@@ -400,14 +397,14 @@ fn enrich_tar_semantics(
     )?;
     d.set_item("archive.trailing_data", trailing)?;
     let mut flags = semantic_flags;
-    if zeros < 2 && !walk_budget_exhausted {
+    if zeros < 2 {
         flags.push("missing_end_block");
     }
     if zeros >= 2 && trailing > 0 {
         flags.push("trailing_junk");
     }
     d.set_item("damage_flags", PyList::new(d.py(), flags)?)?;
-    d.set_item("walk_budget_exhausted", walk_budget_exhausted)?;
+    d.set_item("diagnostic_details_truncated",details_truncated)?;
     finish_fields(d, TAR_FIELDS)?;
     Ok(())
 }

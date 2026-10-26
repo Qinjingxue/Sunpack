@@ -4,7 +4,6 @@ from dataclasses import replace
 from typing import Any, Callable
 
 from sunpack.pipeline.verification.evidence import VerificationEvidence
-from sunpack.pipeline.verification.archive_input_manifest import configure_archive_input_manifest_cache
 from sunpack.pipeline.verification.output_quality import compute_output_quality
 from sunpack.pipeline.verification.registry import get_verification_method
 from sunpack.core.contracts.verification import (
@@ -67,10 +66,6 @@ class VerificationPipeline:
         observation_owner = _configured_observation_owner(self.methods, evidence)
         if observation_owner:
             object.__setattr__(evidence, "_file_observation_owner", observation_owner)
-
-        manifest_limit = _configured_archive_manifest_limit(self.methods)
-        if manifest_limit is not None:
-            configure_archive_input_manifest_cache(evidence, max_items=manifest_limit)
 
         if not self.methods:
             return VerificationResult(
@@ -380,15 +375,6 @@ def _aggregate_payload_coverage(
             for segment, verification in payloads
         ],
     )
-
-
-def _configured_archive_manifest_limit(methods: list[dict[str, Any]]) -> int | None:
-    limits = [
-        config["max_items"] if config["name"] == "archive_test_crc" else config["max_expected_names"]
-        for config in methods
-        if config["name"] in {"archive_test_crc", "manifest_size_match"}
-    ]
-    return max(limits) if limits else None
 
 
 def _configured_observation_owner(methods: list[dict[str, Any]], evidence: VerificationEvidence) -> str:

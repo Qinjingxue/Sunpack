@@ -17,10 +17,21 @@ def records(path):
             index.seek(run["head"] * 64)
             for _ in range(run["head"], run["count"]):
                 timestamp, offset, size, raw_size = struct.unpack_from("<qQII", index.read(64))
-                if not size or not raw_size:
+                if not timestamp and not offset and not size and not raw_size:
                     continue
                 data.seek(offset)
-                row = msgpack.unpackb(lz4.block.decompress(data.read(size), uncompressed_size=raw_size), raw=False)
+                if size:
+                    raw = lz4.block.decompress(data.read(size), uncompressed_size=raw_size)
+                else:
+                    magic, reserved, total, raw_size = struct.unpack("<4sIQQ", data.read(24))
+                    assert magic == b"SPDC" and reserved == 0
+                    end = offset + total
+                    raw = bytearray()
+                    while data.tell() < end:
+                        packed, unpacked = struct.unpack("<II", data.read(8))
+                        raw.extend(lz4.block.decompress(data.read(packed), uncompressed_size=unpacked))
+                    assert data.tell() == end and len(raw) == raw_size
+                row = msgpack.unpackb(raw, raw=False)
                 if "group" in row:
                     group = row.pop("group")
                     rows.append({"event": "pipeline_sources_claimed", "groups": [group]})

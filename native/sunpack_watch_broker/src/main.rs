@@ -446,9 +446,12 @@ impl JournalDispatcher {
                 .iter()
                 .filter(|(_, (reader, _))| Arc::strong_count(reader) == 1)
                 .min_by_key(|(_, (_, last_used))| *last_used)
-                .map(|(key, _)| key.clone())
-                .ok_or_else(|| io::Error::other("all broker volume contexts are currently busy"))?;
-            entries.remove(&lru);
+                .map(|(key, _)| key.clone());
+            if let Some(lru) = lru {
+                entries.remove(&lru);
+            } else {
+                return Ok(Arc::new(Mutex::new(JournalReader::new())));
+            }
         }
         let reader = Arc::new(Mutex::new(JournalReader::new()));
         entries.insert(key, (Arc::clone(&reader), now));
@@ -532,8 +535,8 @@ fn handle_request(
                         request.current_usn,
                     )
             })
-            .and_then(|changes| {
-                for (index, name) in &changes {
+            .and_then(|page| {
+                for (index, name) in &page.changes {
                     payload.extend_from_slice(&index.to_le_bytes());
                     payload.extend_from_slice(&(name.len() as u32).to_le_bytes());
                     payload.extend_from_slice(name.as_bytes());
@@ -542,11 +545,11 @@ fn handle_request(
                     return Err(io::Error::other("USN recovery exceeded payload budget"));
                 }
                 Ok((
-                    0,
-                    0,
+                    page.journal_id,
+                    page.next_usn,
                     sunpack_usn_core::ChangeReasons {
                         all: payload.len() as u32,
-                        without_close: changes.len() as u32,
+                        without_close: page.changes.len() as u32,
                     },
                 ))
             }),
@@ -564,15 +567,20 @@ fn handle_request(
                         request.current_usn,
                     )
             })
-            .and_then(|paths| {
+            .and_then(|page| {
+                let paths = page
+                    .changes
+                    .into_iter()
+                    .map(|(_, name)| name)
+                    .collect::<Vec<_>>();
                 payload = encode_path_payload(&paths)?;
                 let bytes = u32::try_from(payload.len())
                     .map_err(|_| io::Error::other("USN root recovery payload is too large"))?;
                 let count = u32::try_from(paths.len())
                     .map_err(|_| io::Error::other("too many USN root changes"))?;
                 Ok((
-                    0,
-                    0,
+                    page.journal_id,
+                    page.next_usn,
                     sunpack_usn_core::ChangeReasons {
                         all: bytes,
                         without_close: count,

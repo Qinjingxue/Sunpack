@@ -54,29 +54,25 @@ def test_zip_manifest_detects_corrupted_stored_and_deflated_payloads(tmp_path):
         assert "a.txt" in manifest.message
 
 
-def test_zip_manifest_counts_all_files_beyond_retained_entry_limit(tmp_path):
-    # The cap must preserve collision allocation for the retained prefix while
-    # still validating later payloads. Uncapped/corrupt-first-entry tests cannot
-    # catch either regression; a small archive is sufficient for both.
+def test_zip_manifest_preserves_collision_names_and_validates_later_payloads(tmp_path):
+    # Later entries must retain collision allocation and payload validation.
+    # Corrupt-first-entry tests miss regressions in either later operation.
     path = tmp_path / "many.zip"
     entries = {"a?.txt": b"xy", "a*.txt": b"xy", "folder": b"xy", "folder/child.txt": b"xy"}
     entries.update({f"item-{index:03d}.txt": b"xy" for index in range(36)})
     path.write_bytes(_zip_bytes(entries, compression=zipfile.ZIP_STORED))
-    for limit in (0, 7):
-        manifest = archive_input_manifest(_input(path), max_items=limit)
-        assert manifest.ok is True
-        assert manifest.file_count == 40
-        assert manifest.retained_file_count == limit
-        assert manifest.entries_truncated is True
-        assert manifest.total_unpacked_size == 80
-        if limit:
-            assert manifest.expected_names[:4] == ["a_.txt", "a_(1).txt", "folder", "folder(1)/child.txt"]
+    manifest = archive_input_manifest(_input(path))
+    assert manifest.ok is True
+    assert manifest.file_count == 40
+    assert manifest.retained_file_count == 40
+    assert manifest.total_unpacked_size == 80
+    assert manifest.expected_names[:4] == ["a_.txt", "a_(1).txt", "folder", "folder(1)/child.txt"]
     with zipfile.ZipFile(path) as archive:
         last = archive.infolist()[-1]
     damaged = bytearray(path.read_bytes())
     damaged[last.header_offset + 30 + len(last.filename.encode())] ^= 1
     path.write_bytes(damaged)
-    assert archive_input_manifest(_input(path), max_items=7).checksum_error
+    assert archive_input_manifest(_input(path)).checksum_error
 
 
 def test_zip_manifest_record_fields_cross_directory_windows_and_volumes(tmp_path):
@@ -99,10 +95,10 @@ def test_zip_manifest_record_fields_cross_directory_windows_and_volumes(tmp_path
     last.write_bytes(data[split:])
     descriptor = _input(first, open_mode="concat_ranges",
                         extents=[InputExtent(str(first)), InputExtent(str(last))])
-    manifest = archive_input_manifest(descriptor, max_items=1)
+    manifest = archive_input_manifest(descriptor)
     assert manifest.ok
     assert manifest.file_count == 2 and manifest.total_unpacked_size == 9
-    assert manifest.entries_truncated and manifest.expected_names == [long_name]
+    assert manifest.expected_names == [long_name, "last.txt"]
 
 
 def test_zip_manifest_finds_eocd_before_trailing_data_larger_than_search_window(tmp_path):
