@@ -639,9 +639,9 @@ def test_source_indexes_release_buckets_and_peak_tables_after_each_batch():
 def test_request_completion_always_releases_source_index(completion):
     watcher = _claim_scheduler_for_test()
     path = os.path.abspath("completion.disguised")
-    request = SimpleNamespace(source_groups={"group": object()}, top_level_keys=set(),
+    request = SimpleNamespace(source_groups={"group": object()}, source_observations={}, top_level_keys=set(),
         notification_id="owner", candidate=WatchCandidate(path, 10, 1.0, "file", 1),
-        registry_owner="",
+        registry_owner="", interruption_cleanup_failed=False,
     )
     watcher.enqueue = lambda *args, **kwargs: None
     watcher._notify = lambda *args, **kwargs: None
@@ -1127,10 +1127,42 @@ class _DeferredPipelineEngine:
         detection_options=None,
         discovery_scope=None,
         catalog=None,
+        cancellation=None,
     ):
         handle = _DeferredHandle(targets[0].path)
         self.handles.append(handle)
         return await handle.future
+
+
+def test_cancelled_input_generation_survives_restart_until_content_changes(tmp_path):
+    # Existing same-process observation tests cannot catch initial-scan or
+    # recovery resurrecting user-cancelled work after the catalog is rebuilt.
+    archive = tmp_path / "cancelled.blob"
+    _write_zip(archive)
+    engine = _DeferredPipelineEngine()
+    watcher = _watcher(tmp_path, cold_start_seconds=0, pipeline_engine=engine)
+    try:
+        watcher.enqueue(str(archive))
+        _await(watcher.run_once())
+        request = watcher._inflight_requests[0]
+        watcher.cancel_requests([request.notification_id])
+        assert request.cancellation.cancelled
+        engine.handles[0].future.set_result(PipelineResponse("cancelled", RunSummary(), interrupted=True))
+        _await(watcher.run_once())
+        assert watcher.state.latest_entry_for_path(str(archive)).status == "interrupted"
+    finally:
+        _await(watcher.aclose())
+
+    restarted = _watcher(tmp_path, cold_start_seconds=0, pipeline_engine=_DeferredPipelineEngine())
+    try:
+        restarted._recover_persisted_work()
+        restarted.enqueue(str(archive), force=True, event_type="initial_scan")
+        assert restarted.pending_count == 0
+        archive.write_bytes(archive.read_bytes() + b"new content")
+        restarted.enqueue(str(archive), event_type="modified")
+        assert restarted.pending_count == 1
+    finally:
+        _await(restarted.aclose())
 
 
 def test_watch_run_once_harvests_futures_without_waiting_for_slow_batch(tmp_path, monkeypatch):

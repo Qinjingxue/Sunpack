@@ -13,6 +13,9 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include <atomic>
+#include <mutex>
+#include <thread>
 
 namespace {
 
@@ -290,7 +293,7 @@ bool parse_state(const InstallContext& context, std::wstring& pipe_name,
 HANDLE connect_pipe(const std::wstring& pipe_name) {
     for (;;) {
         HANDLE pipe = CreateFileW(pipe_name.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING,
-                                  FILE_ATTRIBUTE_NORMAL, nullptr);
+                                  FILE_FLAG_OVERLAPPED, nullptr);
         if (pipe != INVALID_HANDLE_VALUE) {
             DWORD mode = PIPE_READMODE_BYTE;
             if (SetNamedPipeHandleState(pipe, &mode, nullptr, nullptr)) return pipe;
@@ -304,11 +307,22 @@ HANDLE connect_pipe(const std::wstring& pipe_name) {
     }
 }
 
+struct PipeIoEvent {
+    HANDLE handle = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    ~PipeIoEvent() { if (handle) CloseHandle(handle); }
+};
+
 bool write_all(HANDLE pipe, const char* data, std::size_t size) {
+    thread_local PipeIoEvent event;
+    if (!event.handle) return false;
     while (size != 0) {
+        OVERLAPPED operation{};
+        operation.hEvent = event.handle;
+        ResetEvent(event.handle);
         DWORD written = 0;
         const DWORD chunk = static_cast<DWORD>(std::min<std::size_t>(size, 0x7fffffff));
-        if (!WriteFile(pipe, data, chunk, &written, nullptr) || written == 0) return false;
+        if (!WriteFile(pipe, data, chunk, &written, &operation) && GetLastError() != ERROR_IO_PENDING) return false;
+        if (!GetOverlappedResult(pipe, &operation, &written, TRUE) || written == 0) return false;
         data += written;
         size -= written;
     }
@@ -316,10 +330,16 @@ bool write_all(HANDLE pipe, const char* data, std::size_t size) {
 }
 
 bool read_all(HANDLE pipe, char* data, std::size_t size) {
+    thread_local PipeIoEvent event;
+    if (!event.handle) return false;
     while (size != 0) {
+        OVERLAPPED operation{};
+        operation.hEvent = event.handle;
+        ResetEvent(event.handle);
         DWORD read = 0;
         const DWORD chunk = static_cast<DWORD>(std::min<std::size_t>(size, 0x7fffffff));
-        if (!ReadFile(pipe, data, chunk, &read, nullptr) || read == 0) return false;
+        if (!ReadFile(pipe, data, chunk, &read, &operation) && GetLastError() != ERROR_IO_PENDING) return false;
+        if (!GetOverlappedResult(pipe, &operation, &read, TRUE) || read == 0) return false;
         data += read;
         size -= read;
     }
@@ -361,6 +381,89 @@ std::string read_input_line() {
 // Only NotDelivered may be retried: once the whole request reached the runtime
 // it may already be executing, and resending it could run the command twice.
 enum class RequestOutcome { NotDelivered, Completed, DeliveryUncertain };
+
+class ConsoleCancellation {
+    inline static std::mutex active_mutex_;
+    inline static ConsoleCancellation* active_ = nullptr;
+    HANDLE pipe_, input_ = INVALID_HANDLE_VALUE, stop_ = nullptr, main_thread_ = nullptr;
+    std::thread listener_;
+    std::mutex write_mutex_;
+    std::atomic<bool> sent_{false}, prompt_{false};
+
+    static BOOL WINAPI control(DWORD kind) {
+        if (kind != CTRL_C_EVENT && kind != CTRL_BREAK_EVENT) return FALSE;
+        std::lock_guard lock(active_mutex_);
+        if (!active_) return FALSE;
+        active_->cancel();
+        if (active_->prompt_ && active_->main_thread_) CancelSynchronousIo(active_->main_thread_);
+        return TRUE;
+    }
+    void listen() {
+        const HANDLE handles[] = {stop_, input_};
+        while (WaitForMultipleObjects(2, handles, FALSE, INFINITE) == WAIT_OBJECT_0 + 1) {
+            INPUT_RECORD record{};
+            DWORD count = 0;
+            if (!ReadConsoleInputW(input_, &record, 1, &count)) return;
+            if (count && record.EventType == KEY_EVENT && record.Event.KeyEvent.bKeyDown) {
+                const wchar_t key = record.Event.KeyEvent.uChar.UnicodeChar;
+                if (key == L'q' || key == L'Q') cancel();
+            }
+        }
+    }
+    void start() {
+        if (stop_) {
+            ResetEvent(stop_);
+            listener_ = std::thread([this] { listen(); });
+        }
+    }
+    void join() {
+        if (listener_.joinable()) {
+            SetEvent(stop_);
+            listener_.join();
+        }
+    }
+public:
+    ConsoleCancellation(HANDLE pipe, bool enabled) : pipe_(pipe) {
+        if (!enabled) return;
+        input_ = GetStdHandle(STD_INPUT_HANDLE);
+        DWORD mode = 0;
+        if (!GetConsoleMode(input_, &mode)) return;
+        stop_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (!stop_) return;
+        main_thread_ = OpenThread(THREAD_TERMINATE, FALSE, GetCurrentThreadId());
+        {
+            std::lock_guard lock(active_mutex_);
+            active_ = this;
+            SetConsoleCtrlHandler(control, TRUE);
+        }
+        start();
+    }
+    void cancel() {
+        if (!sent_.exchange(true)) {
+            const char frame[] = {'\xff', '\xff', '\xff', '\xff'};
+            send(frame, sizeof(frame));
+        }
+    }
+    bool send(const char* data, std::size_t size) {
+        std::lock_guard lock(write_mutex_);
+        return write_all(pipe_, data, size);
+    }
+    void pause() { join(); prompt_ = true; }
+    void resume() { prompt_ = false; start(); }
+    void close() {
+        join();
+        {
+            std::lock_guard lock(active_mutex_);
+            if (active_ == this) {
+                active_ = nullptr;
+                SetConsoleCtrlHandler(control, FALSE);
+            }
+        }
+        if (stop_) { CloseHandle(stop_); stop_ = nullptr; }
+        if (main_thread_) { CloseHandle(main_thread_); main_thread_ = nullptr; }
+    }
+    ~ConsoleCancellation() { close(); }
+};
 
 RequestOutcome request(const InstallContext& context, const std::vector<std::wstring>& arguments, bool shutdown,
                        int& exit_code, const std::wstring& request_cwd) {
@@ -414,6 +517,7 @@ RequestOutcome request(const InstallContext& context, const std::vector<std::wst
         CloseHandle(pipe);
         return RequestOutcome::DeliveryUncertain;
     }
+    ConsoleCancellation controls(pipe, !arguments.empty() && (arguments[0] == L"extract" || arguments[0] == L"x"));
     while (true) {
         std::array<char, 5> header{};
         if (!read_all(pipe, header.data(), header.size())) break;
@@ -425,19 +529,23 @@ RequestOutcome request(const InstallContext& context, const std::vector<std::wst
         if (kind == 0) {
             if (size != 4) break;
             exit_code = static_cast<std::int32_t>(read_u32(payload.data()));
+            controls.close();
             CloseHandle(pipe);
             return RequestOutcome::Completed;
         }
         if (kind == 1) write_stream(STD_OUTPUT_HANDLE, payload);
         else if (kind == 2) write_stream(STD_ERROR_HANDLE, payload);
         else if (kind == 3) {
+            controls.pause();
             const std::string input = read_input_line();
+            controls.resume();
             std::string response;
             append_u32(response, static_cast<std::uint32_t>(input.size()));
             response.append(input);
-            if (!write_all(pipe, response.data(), response.size())) break;
+            if (!controls.send(response.data(), response.size())) break;
         }
     }
+    controls.close();
     CloseHandle(pipe);
     return RequestOutcome::DeliveryUncertain;
 }

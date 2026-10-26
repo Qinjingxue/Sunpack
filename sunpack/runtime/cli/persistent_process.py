@@ -8,6 +8,8 @@ import threading
 import time
 from typing import Any, Callable
 
+from sunpack.pipeline.coordinator.async_work import CancellationToken, CURRENT_CANCELLATION
+
 from sunpack.core.config.cli_settings import load_cli_language_from_config
 from sunpack.core.i18n import I18nContext
 from sunpack.core.support.process_executable import current_process_executable, is_packaged_process
@@ -206,44 +208,43 @@ def _send_or_start(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 class _PipeConnection:
-    """Small synchronous byte-stream adapter around a Windows named-pipe HANDLE."""
+    """Blocking adapter with independent overlapped reads and control writes."""
 
     def __init__(self, handle) -> None:
         self._handle = handle
 
     def sendall(self, data: bytes) -> None:
-        import ctypes
-        from ctypes import wintypes
+        import _winapi
 
         if not data:
             return
-        kernel32 = _kernel32()
-        buffer = ctypes.create_string_buffer(data)
         offset = 0
         while offset < len(data):
-            written = wintypes.DWORD()
             size = min(len(data) - offset, 0x7FFFFFFF)
-            if not kernel32.WriteFile(self._handle, ctypes.byref(buffer, offset), size, ctypes.byref(written), None):
-                raise OSError(ctypes.get_last_error(), "WriteFile failed")
-            if written.value == 0:
+            operation, _ = _winapi.WriteFile(self._handle, memoryview(data)[offset:offset + size], overlapped=True)
+            written, error = operation.GetOverlappedResult(True)
+            if error:
+                raise OSError(error, "WriteFile failed")
+            if written == 0:
                 raise OSError("named pipe closed while writing")
-            offset += int(written.value)
+            offset += written
 
     def recv(self, size: int) -> bytes:
-        import ctypes
-        from ctypes import wintypes
+        import _winapi
 
         if size <= 0:
             return b""
-        kernel32 = _kernel32()
-        buffer = ctypes.create_string_buffer(size)
-        read = wintypes.DWORD()
-        if not kernel32.ReadFile(self._handle, buffer, size, ctypes.byref(read), None):
-            error = ctypes.get_last_error()
+        try:
+            operation, _ = _winapi.ReadFile(self._handle, size, overlapped=True)
+            read, error = operation.GetOverlappedResult(True)
+            if error:
+                raise OSError(error, "ReadFile failed")
+            return operation.getbuffer()[:read]
+        except OSError as exc:
+            error = exc.winerror if exc.winerror is not None else exc.errno
             if error in {109, 232, 233}:
                 return b""
-            raise OSError(error, "ReadFile failed")
-        return buffer.raw[: read.value]
+            raise
 
     def close(self) -> None:
 
@@ -300,7 +301,7 @@ def _open_pipe(name: str) -> _PipeConnection | None:
     kernel32 = _kernel32()
     invalid_handle = ctypes.c_void_p(-1).value
     while True:
-        handle = kernel32.CreateFileW(name, 0xC0000000, 0, None, 3, 0, None)
+        handle = kernel32.CreateFileW(name, 0xC0000000, 0, None, 3, 0x40000000, None)
         if handle != invalid_handle:
             mode = wintypes.DWORD(0)
             if not kernel32.SetNamedPipeHandleState(handle, ctypes.byref(mode), None, None):
@@ -381,7 +382,7 @@ def _try_send(payload: dict[str, Any]) -> dict[str, Any] | None:
             connection.sendall(item)
         if _recv_exact(connection, 4) != _STREAM_MAGIC or _recv_exact(connection, len(build_id)) != build_id:
             return _delivery_uncertain_response(payload, "invalid response handshake")
-        return _recv_stream(connection)
+        return _recv_stream(connection, enable_cancel=bool(argv_values and argv_values[0] in {"extract", "x"}))
     except (EOFError, OSError, ValueError) as exc:
         if request_started:
             return _delivery_uncertain_response(payload, exc)
@@ -489,6 +490,7 @@ class _PipeRequestProtocol(asyncio.Protocol):
         self._argv_remaining = 0
         self._next_arg_size: int | None = None
         self._input_size: int | None = None
+        self._cancellation = CancellationToken()
         self._input_waiter: asyncio.Future[str] | None = None
         self._request_task: asyncio.Task[None] | None = None
         self._request_finishing = False
@@ -608,6 +610,18 @@ class _PipeRequestProtocol(asyncio.Protocol):
         return payload
 
     def _parse_input(self) -> None:
+        # Reserved length is an out-of-band stop control, valid even while a
+        # password prompt owns stdin. It never becomes prompt text.
+        while self._input_size is None and len(self._buffer) >= 4 and self._buffer[:4] == b"\xff" * 4:
+            del self._buffer[:4]
+            first = not self._cancellation.cancelled
+            self._cancellation.cancel()
+            if first:
+                language = load_cli_language_from_config(str((self._payload or {}).get("cwd") or runtime_working_directory()))
+                message = I18nContext(language).t("interrupt.stopping").encode("utf-8") + b"\n"
+                self.output_queue.put_nowait(struct.pack("!BI", 2, len(message)) + message)
+        if self._input_size is None and len(self._buffer) < 4:
+            return
         waiter = self._input_waiter
         if waiter is None or waiter.done():
             if self._buffer:
@@ -627,16 +641,20 @@ class _PipeRequestProtocol(asyncio.Protocol):
         self._input_size = None
         self._input_waiter = None
         waiter.set_result(text)
+        if self._buffer:
+            self._parse_input()
 
     async def _run_request(self, payload: dict[str, Any]) -> None:
         from sunpack.runtime.cli.runtime_state import runtime_host
 
         host = runtime_host()
         foreground_active = False
+        marker = CURRENT_CANCELLATION.set(self._cancellation)
         exit_code: int | None = None
         started_at = time.monotonic()
         try:
-            if host is not None and not payload.get("shutdown"):
+            control = (payload.get("argv") or [""])[0] == "--cancel-watch-batch"
+            if host is not None and not payload.get("shutdown") and not control:
                 await host.foreground_started()
                 foreground_active = True
                 argv = list(payload.get("argv") or [])
@@ -661,6 +679,7 @@ class _PipeRequestProtocol(asyncio.Protocol):
         except Exception:
             pass
         finally:
+            CURRENT_CANCELLATION.reset(marker)
             # Disconnect cancels execution, but must not interrupt host release
             # after the request has already entered its cleanup phase.
             self._request_finishing = True
@@ -973,7 +992,18 @@ def _recv_request(connection, token: bytes) -> dict[str, Any] | None:
     }
 
 
-def _recv_stream(connection, input_stream=None) -> dict[str, Any]:
+def _recv_stream(connection, input_stream=None, *, enable_cancel=True) -> dict[str, Any]:
+    from sunpack.core.platform.windows.console_cancel import ConsoleCancellation
+
+    lock = threading.Lock()
+    def send(data):
+        with lock:
+            connection.sendall(data)
+    with ConsoleCancellation(lambda: send(b"\xff" * 4), enabled=enable_cancel) as controls:
+        return _recv_stream_frames(connection, input_stream, controls=controls, send=send)
+
+
+def _recv_stream_frames(connection, input_stream=None, *, controls, send) -> dict[str, Any]:
     input_stream = sys.stdin if input_stream is None else input_stream
     while True:
         kind, size = struct.unpack("!BI", _recv_exact(connection, 5))
@@ -985,9 +1015,14 @@ def _recv_stream(connection, input_stream=None) -> dict[str, Any]:
                 raise ValueError("invalid persistent final frame")
             return {"exit_code": struct.unpack("!i", payload)[0], "stdout": "", "stderr": ""}
         if kind == 3:
-            line = input_stream.readline() if input_stream is not None else ""
+            with controls.prompt():
+                try:
+                    line = input_stream.readline() if input_stream is not None else ""
+                except (KeyboardInterrupt, OSError):
+                    controls.request_cancel()
+                    line = ""
             encoded = line.encode("utf-8", "surrogatepass")
-            connection.sendall(struct.pack("!I", len(encoded)) + encoded)
+            send(struct.pack("!I", len(encoded)) + encoded)
         else:
             stream = sys.stdout if kind == 1 else sys.stderr
             stream.write(payload.decode("utf-8", "replace"))
@@ -1124,6 +1159,13 @@ async def _execute_streaming_request_async(
                 terminal_columns = None
             continue
         argv.append(value)
+
+    if argv and argv[0] == "--cancel-watch-batch":
+        from sunpack.runtime.cli.runtime_state import runtime_host
+        host = runtime_host()
+        if host is not None and len(argv) == 2:
+            host.cancel_watch_batch(argv[1])
+        return 0
 
     stdout = _AsyncConnectionTextStream(
         loop,

@@ -283,14 +283,15 @@ def test_main_runtime_handles_toast_bootstrap_without_starting_engine(monkeypatc
     calls = []
     library = SimpleNamespace(**{
         'sunpack_toast_' + name: (lambda *args, name=name: calls.append((name, args)) or 0)
-        for name in ('register', 'unregister', 'activate')
+        for name in ('register', 'unregister', 'activate', 'cancel_batch')
     })
     monkeypatch.setattr(module, '_load_library', lambda: library)
     monkeypatch.setattr(module, '_activation_command', lambda: ('main.exe', '--toast-activated'))
     monkeypatch.setattr(sys, 'argv', ['sunpack-runtime.exe', argument])
     monkeypatch.setattr(runtime_identity, 'consume_runtime_id', lambda _argv: pytest.fail('entered normal runtime'))
     assert entrypoint.main() == 0
-    assert calls == [(native_method, ('main.exe', '--toast-activated') if native_method == 'register' else ())]
+    assert calls[0] == (native_method, ('main.exe', '--toast-activated') if native_method == 'register' else ())
+    assert [call[0] for call in calls[1:]] == (['cancel_batch'] if native_method == 'activate' else [])
 
 
 def test_unregister_toast_unelevated_removes_current_user_identity_without_native(monkeypatch):

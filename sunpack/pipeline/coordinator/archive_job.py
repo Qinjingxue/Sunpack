@@ -16,7 +16,7 @@ from sunpack.core.contracts.failures import FailureInfo, FailureKind
 from sunpack.pipeline.extraction.knowledge import write_extraction_result
 from sunpack.pipeline.extraction.scheduler import ExtractionScheduler
 from sunpack.pipeline.extraction.output_inventory import OutputInventory
-from sunpack.pipeline.postprocess.output_cleanup import OutputCleanupEvent, cleanup_output_for_retry
+from sunpack.pipeline.postprocess.output_cleanup import DEFAULT_OUTPUT_CLEANUP_MANAGER, OutputCleanupEvent, cleanup_output_for_retry
 from sunpack.core.contracts.verification import DECISION_ACCEPT, DECISION_ACCEPT_PARTIAL
 
 from sunpack.core.passwords.directory_context import PasswordScopeContext
@@ -103,8 +103,60 @@ class ArchiveJobExecutor:
         self.request_id = str(request_id or "")
         self.origin = str(origin or "")
         self.output_reservations = output_reservations
+        self._uncommitted_outputs: dict[str, ArchiveTask] = {}
         self.verifier = VerificationScheduler(self.config, password_session=self.extractor.password_session)
         self.password_scope_context = self.config.get("password_scope_context") or PasswordScopeContext(self.config.get("password_scope_dir", ""))
+
+    def _finish_output(self, task, output_dir: str, *, keep: bool) -> None:
+        active = task.runtime.pop("watch_active_output", None)
+        if self.origin == "watch":
+            self.extractor.emit_semantic_event(
+                task, "task_output_finished", critical=True,
+                task_path=active[0] if active is not None else task.main_path,
+                output_dir=output_dir, keep_output=keep,
+            )
+
+    def rollback_interrupted_outputs(self) -> tuple[str, ...]:
+        errors = []
+        for output_dir, task in self._uncommitted_outputs.items():
+            result = DEFAULT_OUTPUT_CLEANUP_MANAGER.cleanup_canonical(
+                output_dir, event=OutputCleanupEvent.USER_CANCELLED,
+                planned_output_dir=output_dir, allow_nonempty=True,
+            )
+            if not (result.cleaned or result.already_absent):
+                errors.append(f"{output_dir}: {result.error or result.reason}")
+                continue
+            self._finish_output(task, output_dir, keep=False)
+        self._uncommitted_outputs.clear()
+        return tuple(errors)
+
+    def relocate_output(self, result) -> bool:
+        if not result.source_dir:
+            return False
+        task = self._uncommitted_outputs.pop(result.path, None)
+        if task is None:
+            return False
+        self._uncommitted_outputs[result.output_dir] = task
+        if self.origin == "watch":
+            active = task.runtime.get("watch_active_output")
+            task_path = active[0] if active is not None else task.main_path
+            task.runtime["watch_active_output"] = (task_path, result.output_dir)
+            self.extractor.emit_semantic_event(
+                task, "task_output_started", critical=True, task_path=task_path, output_dir=result.output_dir,
+            )
+        return True
+
+    def commit_output(self, task, output_dir, cancellation) -> None:
+        cancellation.raise_if_cancelled()
+        if output_dir not in self._uncommitted_outputs:
+            return
+        self._finish_output(task, output_dir, keep=True)
+        self._uncommitted_outputs.pop(output_dir, None)
+
+    def finish_outputs(self) -> None:
+        for output_dir, task in self._uncommitted_outputs.items():
+            self._finish_output(task, output_dir, keep=bool(task.runtime.pop("watch_keep_output", False)))
+        self._uncommitted_outputs.clear()
 
     async def execute_async(
         self,
@@ -140,19 +192,18 @@ class ArchiveJobExecutor:
         preserve_output = bool(result.output_dir and (
             result.outcome_kind != OutcomeKind.FAILURE or any(outcome.result.complete_embedded_results())
         ))
-        if self.origin == "watch":
-            # Preflight can finish without ever starting an output write.
-            # Only close a durable output record that this job actually opened.
+        path = outcome.planned_out_dir
+        if path in self._uncommitted_outputs and not os.path.lexists(path):
+            self._uncommitted_outputs.pop(path)
+            self._finish_output(task, path, keep=False)
+        if self.origin == "watch" and depth == 1:
+            task.runtime["watch_keep_output"] = preserve_output
+        elif self.origin == "watch":
             active_output = task.runtime.pop("watch_active_output", None)
             if active_output is not None:
-                output_task_path, output_dir = active_output
                 self.extractor.emit_semantic_event(
-                    task,
-                    "task_output_finished",
-                    critical=True,
-                    task_path=output_task_path,
-                    output_dir=output_dir,
-                    keep_output=preserve_output,
+                    task, "task_output_finished", critical=True,
+                    task_path=active_output[0], output_dir=active_output[1], keep_output=preserve_output,
                 )
         if preserve_output:
             self.password_scope_context.remember(result.output_dir, task)
@@ -220,6 +271,8 @@ class ArchiveJobExecutor:
         if self.output_reservations is not None and self.output_reservations.watch_outputs is not None:
             await broker.run("watch_output_root", file_id, self.output_reservations.register_watch_output,
                              planned_out_dir, request_id=self.request_id, cancellation=cancellation)
+        if depth == 1:
+            self._uncommitted_outputs[planned_out_dir] = task
         if self.origin == "watch":
             task.runtime["watch_active_output"] = (task.main_path, planned_out_dir)
             self.extractor.emit_semantic_event(

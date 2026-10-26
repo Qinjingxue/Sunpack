@@ -45,8 +45,13 @@ class WatchNotificationSink(Protocol):
 
     def aborted(self, request_id: str) -> None: ...
 
+    def interrupted(self, request_id: str, errors: list[str]) -> None: ...
+
 
 class NullWatchNotificationSink:
+    def interrupted(self, request_id: str, errors: list[str]) -> None:
+        pass
+
     def submitted(self, request_id: str, source_path: str) -> None:
         pass
 
@@ -100,10 +105,13 @@ class _BatchProgress:
     warnings: str = ""
     failure_details: list[str] = field(default_factory=list)
     failure_chars: int = 0
+    interrupted: int = 0
+    cleanup_failed: bool = False
+    stopping: bool = False
 
     @property
     def completed(self) -> int:
-        return self.succeeded + self.failed
+        return self.succeeded + self.failed + self.interrupted
 
 
 class WatchFailureReportStore:
@@ -215,6 +223,18 @@ class WatchToastCoordinator:
                 if previous is not None:
                     self._release_space_jobs_for_request_locked(previous)
                 self._requests[str(request_id)] = _RequestProgress(source_path=os.path.abspath(source_path))
+
+    def cancel_batch(self, batch_id: str) -> tuple[str, ...]:
+        with self._lock:
+            if self._closed or not batch_id or batch_id != self._batch_id or not self._requests:
+                return ()
+            if not self._batch.stopping:
+                self._batch.stopping = True
+                self._publish_progress_locked()
+            return tuple(self._requests)
+
+    def interrupted(self, request_id: str, errors: list[str]) -> None:
+        self._terminal(request_id, "interrupted", errors=errors)
 
     def progress(self, request_id: str, task: Any, event: dict[str, Any]) -> None:
         space_event = str(event.get("event") or "")
@@ -370,13 +390,17 @@ class WatchToastCoordinator:
             if request is None or self._closed:
                 return
             self._release_space_jobs_for_request_locked(request)
-            if not request.visible:
+            if not request.visible and outcome != "interrupted":
                 return
+            self._ensure_batch_locked(request.source_path)
             batch = self._batch
             if not batch.completed:
                 batch.source_path = request.source_path
             batch.total_bytes += sum(max(0, task.total_bytes) for task in request.tasks.values())
-            if outcome == "success":
+            if outcome == "interrupted":
+                batch.interrupted += 1
+                batch.cleanup_failed = batch.cleanup_failed or bool(errors)
+            elif outcome == "success":
                 batch.succeeded += 1
                 batch.output_target = _common_output_target([batch.output_target, *(output_dirs or [])])
                 batch.warnings = _bounded_text(
@@ -466,16 +490,17 @@ class WatchToastCoordinator:
             kind=ToastSnapshotKind.PROGRESS,
             batch_id=self._batch_id,
             title=self.i18n.t("toast.progress.paused_title" if disk_paused else "toast.progress.title"),
-            body=self.i18n.t("toast.progress.body", completed=completed_requests, total=count),
+            body=self.i18n.t("interrupt.stopping") if batch.stopping else self.i18n.t("toast.progress.body", completed=completed_requests, total=count),
             progress_mode=mode,
             progress_value=value,
             progress_title=progress_title,
             progress_status=progress_status,
             progress_value_text=value_text,
+            actions=(ToastAction(ToastActionKind.CANCEL_BATCH, self.i18n.t("interrupt.stop"), self._batch_id),),
         ))
 
     def _schedule_finalize_if_drained_locked(self) -> None:
-        if not self._batch.completed or self._visible_requests_locked():
+        if not self._batch.completed or (self._requests if self._batch.stopping else self._visible_requests_locked()):
             return
         self._cancel_finalize_locked()
         self._finalize_generation += 1
@@ -495,9 +520,17 @@ class WatchToastCoordinator:
         with self._lock:
             if self._closed or generation != self._finalize_generation:
                 return
-            if not self._batch.completed or self._visible_requests_locked():
+            if not self._batch.completed or (self._requests if self._batch.stopping else self._visible_requests_locked()):
                 return
             batch = self._batch
+            if batch.interrupted:
+                self.host.publish(ToastSnapshot(
+                    kind=ToastSnapshotKind.FAILURE if batch.cleanup_failed else ToastSnapshotKind.SUCCESS,
+                    batch_id=self._batch_id, title=self.i18n.t("interrupt.finished"),
+                    body=self.i18n.t("interrupt.cleanup_failed" if batch.cleanup_failed else "interrupt.cleaned"),
+                ))
+                self._reset_batch_locked(clear=False)
+                return
             succeeded, failed = batch.succeeded, batch.failed
             duration = self.i18n.format_duration(time.monotonic() - self._batch_started_at)
             actions: list[ToastAction] = []

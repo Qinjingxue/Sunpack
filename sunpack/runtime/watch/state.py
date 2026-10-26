@@ -1378,7 +1378,7 @@ class WatchStateStore:
                 payload["source_group"] = source_group
             blockers = {str(value) for value in payload.get("blockers") or []}
             if (
-                (status not in {"failed_password", "suspended_missing_volume"} and not blockers)
+                (status not in {"failed_password", "suspended_missing_volume", "interrupted"} and not blockers)
                 or self.file_presence(path) is False
             ):
                 if previous is not None:

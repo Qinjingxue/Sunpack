@@ -26,6 +26,7 @@ class ToastProgressMode(IntEnum):
 class ToastActionKind(IntEnum):
     OPEN_DIRECTORY = 1
     OPEN_LOG = 2
+    CANCEL_BATCH = 3
 
 
 @dataclass(frozen=True)

@@ -16,18 +16,53 @@ from sunpack.core.support.work_context import CURRENT_ORIGIN, CURRENT_WORK, Work
 
 T = TypeVar("T")
 
+CURRENT_CANCELLATION: contextvars.ContextVar[CancellationToken | None] = contextvars.ContextVar(
+    "sunpack_cancellation", default=None,
+)
+
 class CancellationToken:
     """Cooperative cancellation shared by one request and its worker jobs."""
 
     def __init__(self) -> None:
         self._cancelled = threading.Event()
+        self._lock = threading.Lock()
+        self._callbacks: set[Callable[[], None]] = set()
 
     @property
     def cancelled(self) -> bool:
         return self._cancelled.is_set()
 
     def cancel(self) -> None:
-        self._cancelled.set()
+        with self._lock:
+            if self.cancelled:
+                return
+            self._cancelled.set()
+            callbacks = tuple(self._callbacks)
+            self._callbacks.clear()
+        for callback in callbacks:
+            callback()
+
+    def subscribe(self, callback: Callable[[], None]) -> Callable[[], None]:
+        with self._lock:
+            cancelled = self.cancelled
+            if not cancelled:
+                self._callbacks.add(callback)
+        if cancelled:
+            callback()
+        def unsubscribe():
+            with self._lock:
+                self._callbacks.discard(callback)
+        return unsubscribe
+
+    async def run_native(self, operation):
+        """Cancel only the native await; its existing handler drains the job."""
+        loop = asyncio.get_running_loop()
+        task = asyncio.create_task(operation)
+        remove = self.subscribe(lambda: loop.call_soon_threadsafe(task.cancel))
+        try:
+            return await task
+        finally:
+            remove()
 
     def raise_if_cancelled(self) -> None:
         if self.cancelled:
@@ -297,11 +332,20 @@ class AsyncWorkBroker:
         self._pending_jobs += 1
         self._dispatch()
         try:
-            return await future
+            return await asyncio.shield(future)
         except asyncio.CancelledError:
             token.cancel()
-            if not future.done():
-                future.cancel()
+            # A cancelled asyncio waiter does not stop executor work. Join it
+            # before allowing resource release or output rollback.
+            while not future.done():
+                try:
+                    await asyncio.shield(future)
+                except asyncio.CancelledError:
+                    continue
+                except BaseException:
+                    break
+            if not future.cancelled():
+                future.exception()
             raise
 
     async def close(self, *, graceful: bool = True) -> None:
@@ -402,10 +446,9 @@ class AsyncWorkBroker:
             except BaseException as exc:
                 item.future.set_exception(exc)
             else:
-                if item.token.cancelled:
-                    item.future.cancel()
-                else:
-                    item.future.set_result(result)
+                # Completed mutations must project their final paths/results.
+                # Cancellation stops the next admission, not that projection.
+                item.future.set_result(result)
         self._dispatch()
 
 

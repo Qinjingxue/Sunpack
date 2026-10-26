@@ -60,6 +60,7 @@ class FakePipelineEngine:
         recursive=False,
         discovery_scope=None,
         catalog=None,
+        cancellation=None,
     ):
         paths = [target.path if hasattr(target, "path") else str(target) for target in targets]
         output = dict(targets[0].output) if targets and hasattr(targets[0], "output") else {}

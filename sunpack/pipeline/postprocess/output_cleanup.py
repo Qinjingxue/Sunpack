@@ -19,6 +19,7 @@ class OutputCleanupEvent(str, Enum):
     """A finite set of reasons for removing extraction-owned output."""
 
     EXTRACTION_ABORT = "extraction_abort"
+    USER_CANCELLED = "user_cancelled"
     EXTRACT_RETRY = "extract_retry"
     VERIFICATION_RETRY = "verification_retry"
     UNRECOVERABLE_FAILURE = "unrecoverable_failure"

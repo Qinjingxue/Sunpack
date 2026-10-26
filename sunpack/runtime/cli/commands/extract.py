@@ -138,6 +138,8 @@ async def handle(args, ctx):
     )
     deep_detect = bool(getattr(args, "deep_detect", False))
     engine_context = pipeline_engine(run_config)
+    if not args.json and getattr(ctx.stdout, "isatty", lambda: False)():
+        reporter.info(ctx.t("interrupt.hint"))
     async with engine_context as engine:
         while True:
             password_summary = build_password_summary(
@@ -161,6 +163,15 @@ async def handle(args, ctx):
                 detection_options=EmbeddedOptions(force_scan=deep_detect),
             )
             summary = response.summary
+            if response.interrupted:
+                ctx.stderr.write(ctx.t("interrupt.finished") + "\n")
+                key = "interrupt.cleanup_failed" if response.interruption_cleanup_errors else "interrupt.cleaned"
+                ctx.stderr.write(ctx.t(key) + "\n")
+                for error in response.interruption_cleanup_errors:
+                    ctx.stderr.write(error + "\n")
+                return 130, CliCommandResult(command=COMMAND, inputs={"paths": target_paths},
+                    summary={"interrupted": True, "cleanup_complete": not response.interruption_cleanup_errors},
+                    errors=list(response.interruption_cleanup_errors))
             failures = list(summary.failures)
             scan_report.record_failures(summary.scan_failures, ctx.language)
             processed_keys = list(summary.processed_keys)

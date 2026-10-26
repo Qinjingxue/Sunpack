@@ -81,6 +81,34 @@ def _terminal_snapshots(host):
     return [snapshot for snapshot in host.snapshots if snapshot.kind != ToastSnapshotKind.PROGRESS]
 
 
+@pytest.mark.parametrize("errors", [[], ["output is in use"]])
+def test_stop_targets_only_current_batch_and_reports_cleanup_truthfully(tmp_path, errors):
+    # Normal success/failure aggregation cannot cover stale activation, repeated
+    # stop, or falsely claiming rollback succeeded. One batch covers all three.
+    host = _Host()
+    coordinator = WatchToastCoordinator(host, _config(), str(tmp_path / "state"))
+    try:
+        coordinator.submitted("active", str(tmp_path / "active.zip"))
+        coordinator.submitted("scanning", str(tmp_path / "scanning.zip"))
+        _ready(coordinator, "active", _task(tmp_path / "active.zip"))
+        snapshot = host.snapshots[-1]
+        assert snapshot.actions[0].kind == ToastActionKind.CANCEL_BATCH
+        assert coordinator.cancel_batch("obsolete") == ()
+        assert coordinator.cancel_batch(snapshot.batch_id) == ("active", "scanning")
+        assert coordinator.cancel_batch(snapshot.batch_id) == ("active", "scanning")
+        assert "Stopping" in host.snapshots[-1].body
+        coordinator.interrupted("active", errors)
+        coordinator._finalize(coordinator._finalize_generation)
+        assert not _terminal_snapshots(host)
+        coordinator.interrupted("scanning", [])
+        final = host.wait_for_terminal_snapshots()[-1]
+        assert "preserved" in final.body
+        assert ("could not be cleaned" in final.body) == bool(errors)
+        assert coordinator.cancel_batch(snapshot.batch_id) == ()
+    finally:
+        coordinator.stop()
+
+
 def test_aggregate_progress_regresses_when_a_new_archive_joins(tmp_path):
     host = _Host()
     coordinator = WatchToastCoordinator(host, _config(), str(tmp_path / "state"))

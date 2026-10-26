@@ -17,6 +17,142 @@ def _enable_test_runtime_identity(monkeypatch):
     monkeypatch.setattr(runtime_identity, "_runtime_id", "v2-0123456789abcdef")
 
 
+def test_stop_frame_is_fragment_safe_idempotent_and_separate_from_password(tmp_path):
+    # Request framing tests do not cover controls arriving between prompt
+    # bytes. This catches stream corruption without starting another process.
+    async def scenario():
+        protocol = persistent_process._PipeRequestProtocol(
+            b"t" * 32, on_connected=lambda: None, on_closed=lambda: None,
+            on_completed=lambda: None, on_shutdown=lambda: None,
+        )
+        protocol._payload = {"cwd": str(tmp_path)}
+        for chunk in (b"\xff", b"\xff\xff", b"\xff", b"\xff" * 8):
+            protocol._buffer.extend(chunk)
+            protocol._parse_input()
+        assert protocol._cancellation.cancelled
+        assert protocol.output_queue.qsize() == 1
+        waiter = asyncio.get_running_loop().create_future()
+        protocol._input_waiter = waiter
+        password = b"quietQpassword\n"
+        protocol._buffer.extend(struct.pack("!I", len(password)) + password)
+        protocol._parse_input()
+        assert await waiter == password.decode()
+        assert not protocol._buffer
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("mode", ["q", "password", "ctrl_prompt"])
+def test_console_controls_are_duplex_and_yield_stdin_to_prompts(tmp_path, mode):
+    # Mock transports cannot catch synchronous Windows pipe IO serializing a
+    # concurrent control write. A hidden real console also verifies the input
+    # listener wakes on Q and joins without an input event at shutdown.
+    import subprocess
+    import sys
+    from sunpack.core.platform.windows.secure_pipe import start_serving_current_user_pipe
+
+    script = tmp_path / "console_client.py"
+    script.write_text(r'''
+import ctypes, sys, threading
+from contextlib import contextmanager
+from ctypes import wintypes as w
+from sunpack.runtime.cli.persistent_process import _open_pipe, _recv_stream
+from sunpack.core.platform.windows.console_cancel import ConsoleCancellation
+k = ctypes.WinDLL("kernel32", use_last_error=True)
+k.CreateFileW.argtypes = [w.LPCWSTR, w.DWORD, w.DWORD, ctypes.c_void_p, w.DWORD, w.DWORD, w.HANDLE]
+k.CreateFileW.restype = w.HANDLE
+k.SetStdHandle.argtypes = [w.DWORD, w.HANDLE]
+handle = k.CreateFileW("CONIN$", 0xC0000000, 3, None, 3, 0, None)
+assert handle not in (None, -1)
+k.SetStdHandle(-10 & 0xffffffff, handle)
+class Key(ctypes.Structure):
+    _fields_ = [("down", w.BOOL), ("repeat", w.WORD), ("virtual", w.WORD), ("scan", w.WORD), ("char", w.WCHAR), ("modifiers", w.DWORD)]
+class Event(ctypes.Union):
+    _fields_ = [("key", Key), ("padding", w.DWORD * 4)]
+class Record(ctypes.Structure):
+    _fields_ = [("kind", w.WORD), ("event", Event)]
+k.WriteConsoleInputW.argtypes = [w.HANDLE, ctypes.c_void_p, w.DWORD, ctypes.POINTER(w.DWORD)]
+def inject():
+    assert sys.stdin.readline().strip() == "inject"
+    if sys.argv[2] == "ctrl_prompt":
+        assert k.GenerateConsoleCtrlEvent(1, 0)
+        return
+    text = "q" if sys.argv[2] == "q" else "quietQpassword\r"
+    record, count = Record(), w.DWORD()
+    record.kind = 1
+    for char in text:
+        record.event.key = Key(True, 1, ord(char.upper()), 0, char, 0)
+        assert k.WriteConsoleInputW(handle, ctypes.byref(record), 1, ctypes.byref(count))
+base_prompt = ConsoleCancellation.prompt
+@contextmanager
+def prompt(self):
+    with base_prompt(self):
+        print("prompt_ready", flush=True)
+        yield
+ConsoleCancellation.prompt = prompt
+connection = _open_pipe(sys.argv[1])
+assert connection is not None
+thread = threading.Thread(target=inject)
+thread.start()
+print("ready", flush=True)
+console = open("CONIN$", encoding="utf-8") if sys.argv[2] != "q" else None
+response = _recv_stream(connection, input_stream=console)
+thread.join()
+connection.close()
+print("exit", response["exit_code"], flush=True)
+''', encoding="utf-8")
+
+    async def scenario():
+        name = persistent_process._PIPE_PREFIX + "cancel-test-" + secrets.token_hex(8)
+        stop_received = asyncio.Event()
+        class Protocol(asyncio.Protocol):
+            def connection_made(self, transport):
+                self.transport, self.data = transport, bytearray()
+                if mode != "q":
+                    self.transport.write(struct.pack("!BI", 3, 0))
+            def data_received(self, data):
+                self.data.extend(data)
+                if mode == "q" and len(self.data) == 4:
+                    assert self.data == b"\xff" * 4
+                elif mode == "password" and len(self.data) >= 4 + len(b"quietQpassword\n"):
+                    assert self.data[4:] == b"quietQpassword\n"
+                elif mode == "ctrl_prompt" and len(self.data) == 8:
+                    assert self.data == b"\xff" * 4 + b"\0" * 4
+                else:
+                    return
+                if not stop_received.is_set():
+                    stop_received.set()
+                    self.transport.write(struct.pack("!BIi", 0, 4, 0 if mode == "password" else 130))
+                    self.transport.close()
+        servers = await start_serving_current_user_pipe(asyncio.get_running_loop(), Protocol, name)
+        startup = subprocess.STARTUPINFO()
+        startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startup.wShowWindow = 0
+        env = dict(os.environ, PYTHONPATH=os.getcwd())
+        process = await asyncio.create_subprocess_exec(
+            sys.executable, str(script), name, mode, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, creationflags=subprocess.CREATE_NEW_CONSOLE,
+            startupinfo=startup, env=env,
+        )
+        try:
+            ready = await asyncio.wait_for(process.stdout.readline(), 5)
+            assert ready.strip() == b"ready", (await process.stderr.read()).decode(errors="replace") if not ready else ready
+            if mode != "q":
+                assert (await asyncio.wait_for(process.stdout.readline(), 5)).strip() == b"prompt_ready"
+            process.stdin.write(b"inject\n")
+            await process.stdin.drain()
+            await asyncio.wait_for(stop_received.wait(), 5)
+            stdout, stderr = await asyncio.wait_for(process.communicate(), 5)
+            assert process.returncode == 0, stderr.decode(errors="replace")
+            assert (b"exit 0" if mode == "password" else b"exit 130") in stdout
+        finally:
+            if process.returncode is None:
+                process.kill()
+                await process.wait()
+            for server in servers:
+                server.close()
+    asyncio.run(scenario())
+
+
 class _AsyncWriter:
     def __init__(self, reader=None, input_line: bytes = b""):
         self.wire = bytearray()

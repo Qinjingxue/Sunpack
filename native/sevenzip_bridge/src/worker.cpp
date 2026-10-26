@@ -1585,6 +1585,34 @@ public:
             return false;
         }
         token->store(true, std::memory_order_release);
+        // Cancellation is rare: withdraw queued jobs here rather than making
+        // them wait for a CPU credit just to acknowledge their terminal state.
+        std::optional<Job> withdrawn;
+        bool drained = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            for (auto* queue : {&foreground_queue_, &background_queue_}) {
+                const auto found = std::find_if(queue->begin(), queue->end(), [&](const Job& job) {
+                    return job.cancel_token == token;
+                });
+                if (found == queue->end()) continue;
+                withdrawn.emplace(std::move(*found));
+                queue->erase(found);
+                drained = queues_empty_locked() && active_jobs_ == 0;
+                break;
+            }
+        }
+        if (withdrawn) {
+            {
+                std::lock_guard<std::mutex> lock(cancel_mutex_);
+                cancel_tokens_.erase(job_id);
+            }
+            print_json_line("{\"type\":\"result\",\"job_id\":\"" + json_escape(job_id) +
+                "\",\"status\":\"cancelled\",\"native_status\":\"cancelled\",\"hresult\":-2147467260}");
+            print_worker_event(job_id, "job_finished", withdrawn->metadata);
+            if (drained) drain_condition_.notify_all();
+            return true;
+        }
 #ifdef _WIN32
         // Wake only the facility this job writes to, whose producer may be parked in that backpressure wait; a reclaimed facility leaves an expired weak_ptr.
         if (writer_to_wake) {

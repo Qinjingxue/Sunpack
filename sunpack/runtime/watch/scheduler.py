@@ -129,9 +129,35 @@ class _ActivePipelineRequest:
     top_level_keys: set[str] = field(default_factory=set)
     password_scope_dir: str = ""
     source_groups: dict[str, dict] = field(default_factory=dict)
+    source_observations: dict = field(default_factory=dict)
+    cancellation: object = None
+    interruption_cleanup_failed: bool = False
 
 
 class WatchScheduler:
+    def cancel_requests(self, request_ids) -> None:
+        wanted = set(request_ids)
+        with self._lock:
+            requests = [request for request in self._inflight_requests
+                        if request.notification_id in wanted and request.cancellation is not None
+                        and not request.cancellation.cancelled]
+        try:
+            for request in requests:
+                # Persist user intent before signalling; restart recovery cleans
+                # active output but must never resume this input generation.
+                for path in dedupe_normalized_paths((request.candidate.path, *request.source_paths, *request.source_observations)):
+                    observed = (request.candidate if path_key(path) == path_key(request.candidate.path)
+                                else request.source_observations.get(path_key(path)))
+                    if observed is None:
+                        observed = _candidate_for_event_path(path)
+                    if observed is not None:
+                        self.state.mark(path, observed.size, observed.mtime, file_id=observed.file_id,
+                                        change_usn=observed.change_usn, status="interrupted")
+        finally:
+            # A full state volume must not prevent native writers being stopped.
+            for request in requests:
+                request.cancellation.cancel()
+
     def __init__(
         self,
         config: dict,
@@ -628,6 +654,11 @@ class WatchScheduler:
             if not watch_path_available(pending.source_input_root or pending.path, self.scopes.values()):
                 continue
             active_outputs = dict(getattr(pending, "active_outputs", {}) or {})
+            entry = self.state.latest_entry_for_path(pending.path)
+            interrupted = (entry is not None and entry.status == "interrupted"
+                and _candidate_change_kind(_candidate_from_state_entry(entry), WatchCandidate(
+                    pending.path, pending.size, pending.mtime, pending.file_id, pending.change_usn,
+                )) != _CandidateChangeKind.CONTENT_CHANGED)
             committed_roots = list(getattr(pending, "committed_roots", []) or [])
             completed_sources = {
                 path_key(path)
@@ -638,6 +669,9 @@ class WatchScheduler:
             internal = bool(getattr(pending, "internal_recovery", False))
             promoted_destinations = pending.promoted_destinations
             if not active_outputs and not committed_roots and not promoted_destinations:
+                if interrupted:
+                    self.state.complete_work([pending.path], durable=True)
+                    continue
                 if os.path.exists(pending.path):
                     self.enqueue(
                         pending.path,
@@ -699,6 +733,10 @@ class WatchScheduler:
             if cleanup_failed:
                 # Keep the durable owner record. A later process start can retry
                 # cleanup without ever writing into an unknown half-output.
+                continue
+
+            if interrupted:
+                self.state.complete_work([pending.path], durable=True)
                 continue
 
             for task_path in active_outputs:
@@ -1018,7 +1056,8 @@ class WatchScheduler:
                     event_type="pipeline_completion_error",
                 )
             else:
-                self.state.complete_work_if_matches(request.candidate)
+                if not request.interruption_cleanup_failed:
+                    self.state.complete_work_if_matches(request.candidate)
             self._arm_idle_cache_cleanup()
             return single
         finally:
@@ -1028,6 +1067,7 @@ class WatchScheduler:
             request.source_paths = ()
             request.top_level_keys.clear()
             request.source_groups.clear()
+            request.source_observations.clear()
             self._release_pipeline_source_claims(request.notification_id, request_path=request.candidate.path)
             if request.registry_owner:
                 from sunpack.runtime.cli.runtime_state import runtime_host
@@ -1369,6 +1409,13 @@ class WatchScheduler:
             if candidate is None:
                 self._log_candidate_ignored(path, "not_a_file_or_unreadable")
                 return
+            interrupted_entry = self.state.latest_entry_for_path(candidate.path)
+            if interrupted_entry is not None and interrupted_entry.status == "interrupted":
+                changed = _candidate_change_kind(_candidate_from_state_entry(interrupted_entry), candidate)
+                explicit = force and event_type not in {"initial_scan", "recovery", "pipeline_claim_released", "password_retry", "active_owner_deferred"}
+                if changed != _CandidateChangeKind.CONTENT_CHANGED and not explicit:
+                    return
+                self.state.clear_entries([candidate.path])
             matched_root = _longest_matching_root(candidate.path, self.watch_roots)
             if matched_root:
                 scope = self.scopes[path_key(matched_root)]
@@ -2029,6 +2076,8 @@ class WatchScheduler:
         # an existing task. Confirmed source groups publish processing cards.
         self.log.write("pipeline_request_started", path=candidate.path, owner=notification_id, size=candidate.size, mtime=candidate.mtime)
         try:
+            from sunpack.pipeline.coordinator.async_work import CancellationToken
+            cancellation = CancellationToken()
             task = asyncio.create_task(self.pipeline_engine.run(
                 [PipelineTarget(candidate.path, output=run_config["output"])],
                 progress_callback=lambda archive_task, event: self._handle_pipeline_progress(
@@ -2043,6 +2092,7 @@ class WatchScheduler:
                 discovery_scope=internal_scope or self.scopes[path_key(source_input_root)],
                 catalog=None if internal_scope else (self._catalog, self._scan_options_for(scope), candidate.path),
                 detection_options=options,
+                cancellation=cancellation,
             ))
         except BaseException:
             if host is not None:
@@ -2061,6 +2111,7 @@ class WatchScheduler:
             source_input_root=source_input_root,
             deep_detect=options.force_scan,
             password_scope_dir=run_config["password_scope_dir"],
+            cancellation=cancellation,
         )
         return request
 
@@ -2076,6 +2127,14 @@ class WatchScheduler:
         name = str(event.get("event") or "")
         if name == "task_sources_claimed":
             source_paths = event.get("source_paths") or getattr(archive_task, "cleanup_parts", ()) or ()
+            if request is not None:
+                with self._lock:
+                    for path in source_paths:
+                        key = path_key(path)
+                        if key not in request.source_observations:
+                            observed = self._candidate_baseline_locked(path)
+                            if observed is not None:
+                                request.source_observations[key] = observed
             if request is not None and event.get("depth") == 1:
                 # Reuse the published tuple. Keep this request's input evidence
                 # even if live source claims transfer to a newer family owner.
@@ -2155,6 +2214,14 @@ class WatchScheduler:
             return WatchRunResult(processed=1)
         summary = response.summary
         claimed_paths = _response_claimed_paths(response, candidate.path)
+        if response.interrupted:
+            request.interruption_cleanup_failed = bool(response.interruption_cleanup_errors)
+            if not response.interruption_cleanup_errors:
+                self.state.complete_work_if_matches(candidate, durable=True)
+            self.log.write("pipeline_request_interrupted", path=candidate.path,
+                           cleanup_errors=list(response.interruption_cleanup_errors))
+            self._notify("interrupted", request.notification_id, list(response.interruption_cleanup_errors))
+            return WatchRunResult(processed=1)
         coalesced_from = response.discovery.coalesced_from_request_id
         if coalesced_from:
             # Coalescing transfers execution ownership to another pipeline

@@ -165,12 +165,14 @@ def test_async_terminal_cleanup_yields_to_loop_and_finishes_before_watch_event(t
     runner.context, runner.i18n, runner.config = RunState(), I18nContext("en"), {}
     runner.content_policy = ContentRecoveryPolicy.from_config({})
     runner.origin, runner.request_id = origin, "cleanup-request"
+    runner._uncommitted_outputs = {}
     semantic = []
     runner.extractor = SimpleNamespace(emit_semantic_event=lambda *a, **kw: semantic.append(kw))
 
     async def extract(*args, **kwargs):
         if output_started:
             task.runtime["watch_active_output"] = (task.main_path, str(output))
+            runner._uncommitted_outputs[str(output)] = task
         return task, outcome
 
     runner._execute_one_async = extract
@@ -200,6 +202,7 @@ def test_async_terminal_cleanup_yields_to_loop_and_finishes_before_watch_event(t
             assert result.outcome_kind == OutcomeKind.FAILURE
             assert not output.exists()
             assert extraction.diagnostics["failed_output_cleanup"]["cleaned"] is True
+            runner.finish_outputs()
             assert len(semantic) == (1 if output_started else 0)
         finally:
             release.set()

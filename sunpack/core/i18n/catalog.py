@@ -1,5 +1,11 @@
 CATALOG = {
     "en": {
+        "interrupt.stop": "Stop",
+        "interrupt.hint": "[SunPack] Press Q or Ctrl+C to stop processing.",
+        "interrupt.stopping": "Stopping and cleaning unfinished output…",
+        "interrupt.finished": "Processing interrupted",
+        "interrupt.cleaned": "Unfinished output has been cleaned. Completed, fully verified results have been preserved.",
+        "interrupt.cleanup_failed": "Completed, fully verified results have been preserved. Some unfinished output could not be cleaned; see the log.",
         "cleanup.incomplete": "Extraction completed; {count} post-processing operations failed",
         "cli.description": "Archive extraction and monitoring",
         "cli.usage": "sunpack [-h] <command> [command options] [paths...]",
@@ -331,6 +337,12 @@ CATALOG = {
         "metadata.latin_noise_count": "Detected {count} suspicious Latin symbol noise character(s)",
     },
     "zh": {
+        "interrupt.stop": "停止",
+        "interrupt.hint": "[SunPack] 按 Q 或 Ctrl+C 停止处理。",
+        "interrupt.stopping": "正在停止并清理未完成输出…",
+        "interrupt.finished": "处理已中断",
+        "interrupt.cleaned": "未完成任务的输出已清理，已完成处理并通过完整校验的结果已保留。",
+        "interrupt.cleanup_failed": "已完成处理并通过完整校验的结果已保留。部分未完成输出清理失败，请查看日志。",
         "cli.recursive_scan": "递归发现输入目录中的文件",
         "cleanup.incomplete": "解压完成，{count} 项后处理操作失败",
         "cli.description": "压缩包解压与目录监控",

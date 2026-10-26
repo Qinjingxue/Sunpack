@@ -34,3 +34,5 @@ class PipelineResponse:
     artifacts: PipelineArtifacts = field(default_factory=PipelineArtifacts)
     discovery: PipelineDiscovery = field(default_factory=PipelineDiscovery)
     recent_passwords: tuple[str, ...] = ()
+    interrupted: bool = False
+    interruption_cleanup_errors: tuple[str, ...] = ()

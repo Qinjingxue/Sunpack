@@ -56,6 +56,7 @@ constexpr std::uint32_t kMaximumSnapshotBytes = 64 * 1024 - 20;
 std::mutex g_activation_mutex;
 std::condition_variable g_activation_condition;
 bool g_activated = false;
+std::wstring g_cancel_batch;
 
 class WinrtApartmentScope {
 public:
@@ -88,6 +89,7 @@ enum class ProgressMode : std::uint8_t {
 enum class ActionKind : std::uint8_t {
     open_directory = 1,
     open_log = 2,
+    cancel_batch = 3,
 };
 
 struct Action {
@@ -490,7 +492,12 @@ void activate_action(std::wstring_view arguments) noexcept {
             return;
         }
         bool directory = false;
-        if (kind == L"dir") {
+        if (kind == L"cancel") {
+            if (decoded->size() != 32 || decoded->find_first_not_of(L"0123456789abcdef") != std::wstring::npos) return;
+            std::lock_guard lock(g_activation_mutex);
+            g_cancel_batch = *decoded;
+            return;
+        } else if (kind == L"dir") {
             directory = true;
         } else if (kind == L"log") {
             const std::filesystem::path path(*decoded);
@@ -679,7 +686,7 @@ Snapshot parse_snapshot(const std::vector<std::uint8_t>& payload) {
         action.kind = static_cast<ActionKind>(reader.byte());
         action.label = reader.string();
         action.target = reader.string();
-        if (action.kind != ActionKind::open_directory && action.kind != ActionKind::open_log) {
+        if (action.kind != ActionKind::open_directory && action.kind != ActionKind::open_log && action.kind != ActionKind::cancel_batch) {
             throw std::runtime_error("invalid Toast action kind");
         }
         result.actions.push_back(std::move(action));
@@ -694,7 +701,7 @@ Snapshot parse_snapshot(const std::vector<std::uint8_t>& payload) {
 }
 
 std::wstring action_arguments(const Action& action) {
-    return std::wstring(action.kind == ActionKind::open_directory ? L"dir|" : L"log|") + hex_encode(action.target);
+    return std::wstring(action.kind == ActionKind::cancel_batch ? L"cancel|" : action.kind == ActionKind::open_directory ? L"dir|" : L"log|") + hex_encode(action.target);
 }
 
 class ToastPresenter {
@@ -779,9 +786,17 @@ private:
         }
 
         XmlDocument document;
-        document.LoadXml(
-            LR"(<toast launch="noop"><visual><binding template="ToastGeneric"><text>{title}</text><text>{body}</text><progress title="{progressTitle}" value="{progressValue}" valueStringOverride="{progressValueString}" status="{progressStatus}"/></binding></visual></toast>)"
-        );
+        std::wstring xml = LR"(<toast launch="noop"><visual><binding template="ToastGeneric"><text>{title}</text><text>{body}</text><progress title="{progressTitle}" value="{progressValue}" valueStringOverride="{progressValueString}" status="{progressStatus}"/></binding></visual>)";
+        if (!snapshot.actions.empty()) {
+            xml += L"<actions>";
+            for (const auto& action : snapshot.actions) {
+                if (action.kind != ActionKind::cancel_batch) continue;
+                xml += L"<action placement=\"contextMenu\" activationType=\"background\" content=\"";
+                xml += xml_escape(action.label) + L"\" arguments=\"" + xml_escape(action_arguments(action)) + L"\"/>";
+            }
+            xml += L"</actions>";
+        }
+        document.LoadXml(xml + L"</toast>");
         ToastNotification toast(document);
         toast.Tag(tag);
         toast.Group(kToastGroup);
@@ -998,6 +1013,7 @@ HRESULT sunpack_toast_activate() noexcept {
         {
             std::lock_guard lock(g_activation_mutex);
             g_activated = false;
+            g_cancel_batch.clear();
         }
         ActivationRegistration activation;
         std::unique_lock lock(g_activation_mutex);
@@ -1008,5 +1024,15 @@ HRESULT sunpack_toast_activate() noexcept {
 HRESULT sunpack_toast_self_test() noexcept {
     return protect([] {
         if (self_test() != 0) winrt::throw_hresult(E_FAIL);
+    });
+}
+
+HRESULT sunpack_toast_cancel_batch(wchar_t* target, std::uint32_t capacity) noexcept {
+    return protect([&] {
+        std::lock_guard lock(g_activation_mutex);
+        if (!target || capacity <= g_cancel_batch.size()) winrt::throw_hresult(E_INVALIDARG);
+        std::copy(g_cancel_batch.begin(), g_cancel_batch.end(), target);
+        target[g_cancel_batch.size()] = L'\0';
+        g_cancel_batch.clear();
     });
 }

@@ -42,7 +42,7 @@ from sunpack.core.support.output_paths import default_output_dir_for_task
 from sunpack.core.support.archive_sessions import release_archive_sessions_under_roots
 from sunpack.core.support.resource_lifecycle import TaskResourceScope, promotion_barrier
 from sunpack.pipeline.discovery.embedded.options import EmbeddedOptions
-from sunpack.pipeline.coordinator.async_work import AsyncWorkBroker, CancellationToken, CURRENT_ORIGIN
+from sunpack.pipeline.coordinator.async_work import AsyncWorkBroker, CancellationToken, CURRENT_ORIGIN, CURRENT_CANCELLATION
 
 
 @dataclass
@@ -163,6 +163,7 @@ class PipelineEngine:
         progress_callback: Callable[[Any, dict[str, Any]], None] | None = None,
         origin: str = "foreground",
         detection_options: EmbeddedOptions | None = None,
+        cancellation: CancellationToken | None = None,
     ) -> PipelineResponse:
         if not self._started or self._closed:
             raise RuntimeError("PipelineEngine must be entered before run")
@@ -201,7 +202,7 @@ class PipelineEngine:
             input_reader=input_reader,
             progress_callback=progress_callback,
         )
-        cancellation = CancellationToken()
+        cancellation = cancellation or CURRENT_CANCELLATION.get() or CancellationToken()
         resource_scope = TaskResourceScope(
             submission.request_id,
             files=(target.path for target in submission.targets),
@@ -213,7 +214,6 @@ class PipelineEngine:
         origin_marker = CURRENT_ORIGIN.set(submission.origin)
         try:
             with resource_scope.activate():
-                cancellation.raise_if_cancelled()
                 runtime = self._request_runtime_factory(
                     self._services,
                     submission,
@@ -237,7 +237,7 @@ class PipelineEngine:
                         ),
                     )
                 self._remember_recent_passwords(response.recent_passwords)
-                if response.summary.postprocess_completed:
+                if response.summary.postprocess_completed and not response.interrupted:
                     await self._broker.run(
                         "report",
                         submission.request_id,
@@ -245,7 +245,6 @@ class PipelineEngine:
                         start_time,
                         response.summary,
                         request_id=submission.request_id,
-                        cancellation=cancellation,
                     )
                 return response
         except asyncio.CancelledError:
@@ -1258,6 +1257,8 @@ class _RequestRuntime:
                 )
 
             await self._drain_cleanup_tasks()
+            cancellation.raise_if_cancelled()
+            self.job_executor.finish_outputs()
             response = ownership.response(
                 self.context,
                 recent_passwords=self.extractor.recent_passwords,
@@ -1266,6 +1267,20 @@ class _RequestRuntime:
                 response,
                 summary=replace(response.summary, postprocess_completed=True),
             )
+        except asyncio.CancelledError:
+            cancellation.cancel()
+            # Consumer gathering and native cancel_and_wait have joined all
+            # writers. Rollback uses an uncancelled broker operation.
+            await self._drain_cleanup_tasks()
+            errors = await broker.run(
+                "cancel_output_cleanup", request_id,
+                self.job_executor.rollback_interrupted_outputs,
+                request_id=request_id,
+            )
+            response = ownership.response(
+                self.context, recent_passwords=self.extractor.recent_passwords,
+            )
+            return replace(response, interrupted=True, interruption_cleanup_errors=errors)
         finally:
             for request in self.source_cleanup.sweep_requests():
                 self._schedule_cleanup(request, broker=broker, cancellation=cancellation)
@@ -1486,6 +1501,7 @@ class _RequestRuntime:
         retain_watch_lease = False
         task_key = str(task.key or task.main_path)
         try:
+            cancellation.raise_if_cancelled()
             # Planning and password/metadata probes use the same physical input
             # lifetime as extraction. A queued old snapshot is checked only
             # after the previous owner's cleanup has relinquished its lease.
@@ -1555,22 +1571,6 @@ class _RequestRuntime:
                 else ""
             )
 
-            cleanup_request = self.source_cleanup.release_task(
-                task,
-                outcome_kind=outcome.outcome_kind,
-            )
-            released_source_ref = True
-            self._schedule_cleanup(
-                cleanup_request,
-                broker=broker,
-                cancellation=cancellation,
-                lease_id=None if retain_watch_lease else id(task),
-                mode_override=(
-                    "delete"
-                    if depth > 1 or promoted_retry else None
-                ),
-            )
-
             # Retryable nested inputs leave recursive ownership, but remain failed.
             subtree_complete = outcome.outcome_kind == OutcomeKind.COMPLETE_SUCCESS or promoted
             ran_recursive_children = False
@@ -1630,6 +1630,21 @@ class _RequestRuntime:
                 output_dir = flattened.output_dir
                 subtree_complete = subtree_complete and not flattened.errors
                 ownership.relocate_outputs(flattened)
+
+            if depth == 1 and outcome.outcome_kind == OutcomeKind.COMPLETE_SUCCESS:
+                self.job_executor.commit_output(task, output_dir, cancellation)
+
+            # Keep source archives until their recursive subtree has settled.
+            # An interrupted root can then discard its whole output safely.
+            cleanup_request = self.source_cleanup.release_task(
+                task, outcome_kind=outcome.outcome_kind,
+            )
+            released_source_ref = True
+            self._schedule_cleanup(
+                cleanup_request, broker=broker, cancellation=cancellation,
+                lease_id=None if retain_watch_lease else id(task),
+                mode_override="delete" if depth > 1 or promoted_retry else None,
+            )
 
             if watch_version and outcome.outcome_kind == OutcomeKind.COMPLETE_SUCCESS and output_dir:
                 self.path_leases.remember_completed_watch(
@@ -1875,10 +1890,11 @@ class _RequestRuntime:
                     self.config,
                     stdout=self.submission.stdout,
                 ).flattener.flatten_dirs(output_dir, work_path=work_path)
+            root_output = self.job_executor.relocate_output(result)
             outputs = self.services.output_reservations.watch_outputs
             if outputs is not None:
                 outputs.replace(output_dir, result.output_dir)
-            if self.submission.origin == "watch" and result.source_dir and result.output_dir == output_dir:
+            if self.submission.origin == "watch" and not root_output and result.source_dir and result.output_dir == output_dir:
                 self._report_progress(task, {"type": "semantic", "event": "task_output_finished",
                     "task_path": task.main_path, "output_dir": result.output_dir, "keep_output": True})
             return result

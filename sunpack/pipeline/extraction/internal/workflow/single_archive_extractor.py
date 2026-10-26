@@ -140,7 +140,9 @@ class SingleArchiveExtractor:
             request = value
             first = False
             try:
-                sent = await self.sevenzip_runner.submit_attempt_asyncio(**request)
+                sent = await cancellation.run_native(
+                    self.sevenzip_runner.submit_attempt_asyncio(**request)
+                )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:

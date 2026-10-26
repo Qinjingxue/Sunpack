@@ -22,6 +22,13 @@ def _configured_runtime_process_mode(config: dict) -> str:
 class RuntimeHost:
     """Own the one engine and optional watch lifecycle for one installed executable."""
 
+    def cancel_watch_batch(self, batch_id: str) -> None:
+        service = self._watch_service
+        if service is None or service.scheduler is None or service.toast_coordinator is None:
+            return
+        requests = service.toast_coordinator.cancel_batch(batch_id)
+        service.scheduler.cancel_requests(requests)
+
     def __init__(
         self,
         *,

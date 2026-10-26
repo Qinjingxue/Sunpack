@@ -85,6 +85,7 @@ def _load_library(path: str | None = None):
         "register": [ctypes.c_wchar_p, ctypes.c_wchar_p],
         "unregister": [],
         "activate": [],
+        "cancel_batch": [ctypes.c_wchar_p, ctypes.c_uint32],
         "self_test": [],
     }
     for name, arguments in signatures.items():
@@ -141,6 +142,13 @@ def handle_toast_argv(argv: list[str]) -> int | None:
     else:
         result = library.sunpack_toast_activate()
     _check_hresult(result)
+    if argv[0] == "--toast-activated":
+        batch = ctypes.create_unicode_buffer(33)
+        _check_hresult(library.sunpack_toast_cancel_batch(batch, len(batch)))
+        if batch.value:
+            from sunpack.runtime.cli.persistent_process import _try_send
+            response = _try_send({"argv": ["--cancel-watch-batch", batch.value], "cwd": os.getcwd()})
+            return int(response.get("exit_code", 0)) if response else 0
     return 0
 
 
