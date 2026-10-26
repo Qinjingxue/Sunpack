@@ -308,7 +308,7 @@ namespace sunpack::sevenzip
         // failed_path：引致失败的实际路径；synthetic 卷首次用它就地解析查询根，必须传。
         //
         // 按当前 phase 分派：
-        //     Ready   → 开启新 episode（episode_id++、重置水位、发 space_blocked）
+        //     Ready   → 开启新 episode（episode_id++、发 space_blocked）
         //     Blocked → 只更新失败证据（不改 phase、不发事件）
         //     Probing → 只更新失败证据，绝不夺走现有 probe ownership
         // 返回 true 表示本次调用开启了新 episode。
