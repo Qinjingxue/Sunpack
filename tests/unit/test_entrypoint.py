@@ -62,7 +62,7 @@ def test_entrypoint_launches_watch_unelevated_for_installer(tmp_path, monkeypatc
     assert captured == {
         "argv": [str(launcher), "watch", "start"],
         "cwd": str(tmp_path),
-        "timeout": 30.0,
+        "timeout": None,
         "closed": True,
     }
 
