@@ -150,7 +150,7 @@ def classify_extract_failure(
 
 
 def _failure(
-    kind: FailureKind,
+    failure_kind: FailureKind,
     message_key: str,
     *,
     user_action: str = "",
@@ -158,7 +158,7 @@ def _failure(
     **params,
 ) -> FailureInfo:
     return FailureInfo(
-        kind=kind,
+        kind=failure_kind,
         stage="extraction",
         message=_EN.t(message_key, **params),
         message_key=message_key,
