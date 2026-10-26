@@ -257,7 +257,7 @@ namespace sunpack::sevenzip
         bool settled_ = true;
     };
 
-    // 卷级空间 gate：Ready/Blocked/Probing + episode + watermark + probe 许可 + query root。
+    // 卷级空间 gate：Ready/Blocked/Probing + episode + probe 许可 + query root。
     //
     // 生命周期：gate 的存活期 = VolumeState 的存活期，长于 writer facility，因此 gate 里
     // 绝不能保存任何指向 writer 成员的指针/引用。本类必须由 shared_ptr 持有（wait() 需要
@@ -353,10 +353,9 @@ namespace sunpack::sevenzip
         // 到达的旧 probe success 不能错误产生 space_resumed。
         void note_query_failure(unsigned long win32_error) noexcept;
 
-        // 空间改善则发放一个 probe 许可并进入 Probing；全部水位规则在这里，monitor 只采样：
-        //     !watermark_valid_          → 首次成功观测，设为 baseline 并立即发放许可
-        //     free > failed_watermark_   → 发放许可
-        //     否则                        → 无新证据，保持 Blocked
+        // 成功采样且可用空间大于 0 时，Blocked → Probing 并发放唯一试探许可。
+        // 只允许 monitor 调用；空间为 0 或现有许可未结算时保持原状态。
+        // 失败后下次正数空间采样可再次试探，不受历史空间读数限制。
         bool poll(std::uint64_t free_bytes_now) noexcept;
 
         // 唤醒目录等待者并通知 IOCP 重新裁决排队请求；不改变状态。
@@ -364,9 +363,7 @@ namespace sunpack::sevenzip
 
         VolumeSpacePhase phase() const noexcept;
         bool blocked() const noexcept; // Blocked || Probing
-        std::uint64_t failed_free_watermark() const noexcept;
         std::uint64_t episode_id() const noexcept;
-        bool watermark_valid() const noexcept;
         std::vector<std::string> affected_job_ids() const;
         bool has_affected_jobs() const noexcept;
         std::size_t waiter_count() const noexcept;
@@ -423,7 +420,6 @@ namespace sunpack::sevenzip
             // later I/O completion cannot resurrect an unavailable volume.
             phase_ = VolumeSpacePhase::Blocked;
             probe_owner_token_ = 0;
-            watermark_valid_ = false;
             return true;
         }
 
@@ -469,11 +465,9 @@ namespace sunpack::sevenzip
 
         VolumeSpacePhase phase_ = VolumeSpacePhase::Ready;
         std::uint64_t episode_id_ = 0; // 每次 Ready→Blocked 递增
-        bool watermark_valid_ = false; // 初期查询失败则不猜
         // 当前 episode 的 space_blocked 是否已经生成（transition 已发给 sink）：把
         // register_job() 的补发限制在初始事件发出之后，避免同 episode 重复投递 blocked。
         bool blocked_event_emitted_ = false;
-        std::uint64_t failed_free_watermark_ = 0; // 仅在当前 episode 内单调
         std::uint64_t probe_owner_token_ = 0;     // 0 = 许可待领取
         std::uint64_t next_token_ = 1;
         unsigned long last_win32_error_ = 0;
@@ -598,9 +592,6 @@ namespace sunpack::sevenzip
             {
                 ++episode_id_;
                 phase_ = VolumeSpacePhase::Blocked;
-                // 水位按 episode 重新建立，由 monitor 的第一次成功采样确立 baseline。
-                watermark_valid_ = false;
-                failed_free_watermark_ = 0;
                 probe_owner_token_ = 0;
                 blocked_event_emitted_ = false;
                 blocked_since_ = std::chrono::steady_clock::now();
@@ -766,43 +757,20 @@ namespace sunpack::sevenzip
 
     inline bool VolumeSpaceGate::poll(std::uint64_t free_bytes_now) noexcept
     {
-        bool issued = false;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             last_free_bytes_ = free_bytes_now;
-            if (phase_ == VolumeSpacePhase::Ready || phase_ == VolumeSpacePhase::Probing)
+            // 0 字节不可用于验证普通写入；只有 Blocked 且可用空间为正时发放许可。
+            // Probing 期间无论空间读数如何，都不能并发发放第二个许可。
+            if (phase_ != VolumeSpacePhase::Blocked || free_bytes_now == 0)
             {
-                // Probing：许可已发出但尚未结算 → 绝不再发放第二个。
                 return false;
             }
-
-            if (!watermark_valid_)
-            {
-                // 首次成功观测 → 立即设为 baseline 并发放许可（不是先比较再决定）。
-                failed_free_watermark_ = free_bytes_now;
-                watermark_valid_ = true;
-                issued = true;
-            }
-            else if (free_bytes_now > failed_free_watermark_)
-            {
-
-                // 授权 probe 的这次采样立即成为新的 failure watermark：否则 probe 失败后
-                // 水位不变，会每个 poll 周期重复一次真实 probe。
-                failed_free_watermark_ = free_bytes_now;
-                issued = true;
-            }
-
-            if (issued)
-            {
-                phase_ = VolumeSpacePhase::Probing;
-                probe_owner_token_ = 0; // 许可"待领取"
-            }
+            phase_ = VolumeSpacePhase::Probing;
+            probe_owner_token_ = 0; // 许可待领取，只有一个 waiter / IOCP request 可以取得
         }
-        if (issued)
-        {
-            wake_waiters(); // 唤醒等待者；只有一个能拿到许可
-        }
-        return issued;
+        wake_waiters();
+        return true;
     }
 
     inline void VolumeSpaceGate::wake_waiters() noexcept
@@ -852,8 +820,7 @@ namespace sunpack::sevenzip
             phase_ = VolumeSpacePhase::Blocked;
             probe_owner_token_ = 0;
             last_win32_error_ = win32_error;
-            // 不做新鲜查询：水位已由 poll() 在发放许可时推进，下一次许可要求一次严格更高的
-            // monitor 采样。
+            // 不做新鲜查询或立即重试：下次成功的正数空间采样才可发放新许可。
         }
         wake_waiters();
     }
@@ -885,11 +852,7 @@ namespace sunpack::sevenzip
         return phase_ != VolumeSpacePhase::Ready;
     }
 
-    inline std::uint64_t VolumeSpaceGate::failed_free_watermark() const noexcept
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return failed_free_watermark_;
-    }
+    
 
     inline std::uint64_t VolumeSpaceGate::episode_id() const noexcept
     {
@@ -897,11 +860,7 @@ namespace sunpack::sevenzip
         return episode_id_;
     }
 
-    inline bool VolumeSpaceGate::watermark_valid() const noexcept
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return watermark_valid_;
-    }
+    
 
     inline std::vector<std::string> VolumeSpaceGate::affected_job_ids() const
     {
