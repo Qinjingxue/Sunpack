@@ -154,7 +154,9 @@ def test_bad_snapshot_is_rejected_without_killing_thread():
         manager.stop()
 
 
-def test_native_start_failure_retries_latest_snapshot(monkeypatch):
+def test_native_start_failure_stays_unavailable_until_lifecycle_restart():
+    # Other lifecycle tests never fail initialization. This catches retries on
+    # new snapshots and verifies restart recovery with two cheap thread runs.
     recorder = Recorder()
     attempts = []
 
@@ -166,27 +168,22 @@ def test_native_start_failure_retries_latest_snapshot(monkeypatch):
 
     manager = ToastManager(presenter_factory=factory)
     manager.publish(snapshot(title='old'))
-    monkeypatch.setattr(manager, '_wait_for_stop', lambda _seconds: manager.publish(snapshot(title='latest')))
+    manager.start()
+    manager._thread.join(3)
+    assert not manager._thread.is_alive()
+    manager.publish(snapshot(title='ignored'))
+    manager.clear()
+    manager.start()
+    assert attempts == [1] and manager._snapshot is None
+    manager.stop()
     try:
         manager.start()
+        manager.publish(snapshot(title='fresh'))
         recorder.wait('show')
-        assert b'latest' in [e for e in recorder.events if e[0] == 'show'][0][3]
+        assert len(attempts) == 2
+        assert b'fresh' in [e for e in recorder.events if e[0] == 'show'][0][3]
     finally:
         manager.stop()
-
-
-def test_stop_interrupts_native_retry_backoff():
-    entered = threading.Event()
-
-    def factory(**_kwargs):
-        entered.set()
-        raise OSError('unavailable')
-
-    manager = ToastManager(presenter_factory=factory)
-    manager.start()
-    assert entered.wait(3)
-    manager.stop()
-    assert manager._thread is None
 
 
 def test_restart_does_not_replay_previous_watch_snapshot():
@@ -237,7 +234,7 @@ def test_native_wrapper_passes_snapshot_and_closes_once(monkeypatch):
                      ('show', 123, b'a\0b', 3, 7), ('destroy', 123)]
 
 
-def test_show_failure_recreates_presenter_on_owner_thread(monkeypatch):
+def test_show_failure_discards_snapshot_and_only_new_publish_recreates_presenter(monkeypatch):
     recorder = Recorder()
     attempts = []
 
@@ -252,13 +249,25 @@ def test_show_failure_recreates_presenter_on_owner_thread(monkeypatch):
 
     manager = ToastManager(presenter_factory=factory)
     manager.publish(snapshot())
-    monkeypatch.setattr(manager, '_wait_for_stop', lambda _seconds: None)
+    waits = []
+    original_wait = manager._condition.wait_for
+
+    def wait_for(predicate, timeout=None):
+        waits.append(timeout)
+        recorder.record('waiting')
+        return original_wait(predicate, timeout)
+
+    monkeypatch.setattr(manager._condition, 'wait_for', wait_for)
     try:
         manager.start()
+        recorder.wait('waiting')
+        assert waits == [None] and len(attempts) == 1
+        manager.publish(snapshot(title='fresh'))
         recorder.wait('show')
     finally:
         manager.stop()
-    assert [e[0] for e in recorder.events] == ['create', 'close', 'create', 'show', 'close']
+    assert [e[0] for e in recorder.events if e[0] != 'waiting'] == ['create', 'close', 'create', 'show', 'close']
+    assert b'fresh' in [e for e in recorder.events if e[0] == 'show'][0][3]
     assert len({e[1] for e in recorder.events}) == 1
 
 

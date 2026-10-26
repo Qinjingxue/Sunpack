@@ -87,6 +87,14 @@ def _broker_lifecycle_roundtrip(tmp_path):
         sunpack_native.watch_broker_release()
 
     assert not sunpack_native.watch_broker_is_connected()
+    # Unlike overlapping leases, short consecutive uses race service teardown
+    # against the next SCM start/pipe connect. Keep this in the isolated process.
+    for _ in range(16):
+        sunpack_native.watch_broker_acquire()
+        try:
+            sunpack_native.watch_broker_ping_seconds()
+        finally:
+            sunpack_native.watch_broker_release()
 
 
 def test_service_stays_alive_until_the_last_process_lease_is_released():

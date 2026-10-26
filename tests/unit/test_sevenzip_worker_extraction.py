@@ -757,7 +757,7 @@ def test_cancelled_request_retains_input_lease_until_native_work_stops(tmp_path,
                 assert not engine.is_idle()
                 native = await runner._async_worker_holder_or_create().get_or_start(None)
                 if completion == "worker_closed":
-                    await native.close()
+                    await native.abort()
                 else:
                     await native.send('{"worker_command":"finish"}')
                 with pytest.raises(asyncio.CancelledError):

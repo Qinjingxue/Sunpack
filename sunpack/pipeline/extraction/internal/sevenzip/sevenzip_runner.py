@@ -241,6 +241,11 @@ class _NativeWorkerProcess:
         self._async_jobs: dict[str, dict[str, Any]] = {}
         self._dispatch_lock = threading.Lock()
         self._stdin_lock = threading.Lock()
+        self._idle = threading.Condition(self._dispatch_lock)
+        self._close_lock = threading.Lock()
+        self._closing = False
+        self._aborted = False
+        self._shutdown_sent = False
         self.queue_capacity = _NativeQueueCapacity()
         self._start()
 
@@ -264,17 +269,12 @@ class _NativeWorkerProcess:
         from sunpack.core.platform.windows.process_job import assign_child_process
 
         assign_child_process(getattr(self.process, "pid", 0))
-        threading.Thread(target=self._dispatch_stdout, args=(self.process.stdout,), daemon=True).start()
-        threading.Thread(target=self._pump, args=(self.process.stderr, self.stderr_queue), daemon=True).start()
-
-    def register_job(self, job_id: str) -> None:
-        with self._dispatch_lock:
-            if job_id in self._job_states:
-                raise RuntimeError(f"sevenzip_worker job id is already active: {job_id}")
-            self._job_states[job_id] = {
-                "state": "submitted",
-                "worker_epoch": self.worker_epoch,
-            }
+        self._reader_threads = [
+            threading.Thread(target=self._dispatch_stdout, args=(self.process.stdout,), daemon=True),
+            threading.Thread(target=self._pump, args=(self.process.stderr, self.stderr_queue), daemon=True),
+        ]
+        for thread in self._reader_threads:
+            thread.start()
 
     def submit_async(
         self,
@@ -289,7 +289,6 @@ class _NativeWorkerProcess:
 
         The stdout dispatcher is the only reader of the worker's pipe; the native process owns extraction concurrency.
         """
-        self.register_job(job_id)
         state = {
             "on_line": on_line,
             "on_error": on_error,
@@ -300,10 +299,17 @@ class _NativeWorkerProcess:
             "worker_epoch": self.worker_epoch,
         }
         with self._dispatch_lock:
+            if self._closing:
+                raise RuntimeError("sevenzip_worker is closing")
+            if job_id in self._job_states:
+                raise RuntimeError(f"sevenzip_worker job id is already active: {job_id}")
+            self._job_states[job_id] = {"state": "submitted", "worker_epoch": self.worker_epoch}
             self._async_jobs[job_id] = state
         try:
             self.send(payload)
         except Exception:
+            # A failed write may have delivered a partial or complete request.
+            self.abort()
             self._finish_async_job(job_id)
             raise
 
@@ -319,6 +325,7 @@ class _NativeWorkerProcess:
                 return None
             self._async_jobs.pop(job_id, None)
             self._job_states.pop(job_id, None)
+            self._idle.notify_all()
         return state
 
     def _fail_async_job(self, job_id: str, state: dict[str, Any], message: str) -> bool:
@@ -338,6 +345,7 @@ class _NativeWorkerProcess:
 
     def _dispatch_stdout(self, stream) -> None:
         failure = "sevenzip_worker exited before job completion"
+        broken = False
         try:
             for line in stream:
                 payload = parse_worker_transport_event(line)
@@ -348,10 +356,12 @@ class _NativeWorkerProcess:
                     if job_id and _is_job_finished(payload):
                         self.queue_capacity.release(job_id)
         except Exception as exc:
+            broken = True
             failure = f"sevenzip_worker transport/protocol failed: {exc}"
         finally:
-            # A broken stream does not prove that native IO has stopped.
-            self.close()
+            # EOF before shutdown or a broken protocol requires confirmed exit.
+            if broken or not self._shutdown_sent:
+                self.abort()
             with self._dispatch_lock:
                 async_jobs = list(self._async_jobs.items())
             for job_id, state in async_jobs:
@@ -406,7 +416,7 @@ class _NativeWorkerProcess:
                 try:
                     self.cancel(job_id)
                 except Exception:
-                    self.close()
+                    self.abort()
             if completed and callback_error:
                 try:
                     async_state["on_error"](callback_error)
@@ -436,29 +446,42 @@ class _NativeWorkerProcess:
     def cancel(self, job_id: str) -> None:
         self.send(json.dumps({"worker_command": "cancel", "job_id": job_id}, separators=(",", ":")))
 
+    def abort(self) -> None:
+        """Stop native IO after confirmed transport failure or an explicit abort."""
+        with self._idle:
+            self._closing = True
+            self._aborted = True
+            self._idle.notify_all()
+        if self.process is not None:
+            if self.is_alive():
+                try:
+                    self.process.terminate()
+                except OSError:
+                    if self.is_alive():
+                        raise
+            self.process.wait()
+
     def close(self) -> None:
         if self.process is None:
             return
-        if self.is_alive() and self.process.stdin is not None:
-            try:
-                self.process.stdin.write('{"worker_command":"shutdown","job_id":"shutdown"}\n')
-                self.process.stdin.flush()
-            except Exception:
-                pass
-        try:
-            self.process.wait(timeout=0.1)
-        except subprocess.TimeoutExpired:
-            try:
-                self.process.terminate()
-                self.process.wait(timeout=0.5)
-            except Exception:
+        with self._close_lock:
+            with self._idle:
+                self._closing = True
+                self._idle.wait_for(lambda: not self._async_jobs or self._aborted)
+            if self.is_alive() and not self._aborted:
                 try:
-                    self.process.kill()
-                    self.process.wait()
+                    # Publish intent before the write: EOF may arrive immediately.
+                    self._shutdown_sent = True
+                    self.send('{"worker_command":"shutdown","job_id":"shutdown"}')
                 except Exception:
-                    pass
-        except Exception:
-            pass
+                    self.abort()
+            self.process.wait()
+            for thread in self._reader_threads:
+                if thread is not threading.current_thread():
+                    thread.join()
+            for stream in (self.process.stdin, self.process.stdout, self.process.stderr):
+                if stream is not None:
+                    stream.close()
 
 
 class _NativeWorkerHolder:
@@ -508,6 +531,8 @@ class _AsyncNativeWorkerProcess:
         self._tasks: list[asyncio.Task] = []
         self._stdout_task: asyncio.Task | None = None
         self._closing = False
+        self._shutdown_sent = False
+        self._close_task: asyncio.Task | None = None
         self.handshake: dict[str, Any] = {}
         self._ready: asyncio.Future | None = None
         self._process_mode_waiter: asyncio.Future | None = None
@@ -545,6 +570,7 @@ class _AsyncNativeWorkerProcess:
             # CPU starvation is not evidence that the worker failed.
             await asyncio.shield(self._ready)
         except BaseException:
+            await self.abort()
             await self.close()
             raise
 
@@ -560,6 +586,8 @@ class _AsyncNativeWorkerProcess:
         on_error,
         parsed_events: bool = False,
     ) -> None:
+        if self._closing:
+            raise RuntimeError("sevenzip_worker is closing")
         if job_id in self._jobs:
             raise RuntimeError(f"sevenzip_worker job id is already active: {job_id}")
         self._jobs[job_id] = {
@@ -575,7 +603,7 @@ class _AsyncNativeWorkerProcess:
             await self.send(payload)
         except BaseException:
             # A failed drain does not prove that the worker never received the job.
-            await self.close()
+            await self.abort()
             raise
 
     async def send(self, payload: str) -> None:
@@ -600,7 +628,7 @@ class _AsyncNativeWorkerProcess:
         try:
             await self.cancel(job_id)
         except Exception:
-            await self.close()
+            await self.abort()
         await asyncio.shield(state["finished"])
 
     async def set_process_mode(self, *, mode: str) -> dict[str, Any]:
@@ -644,6 +672,7 @@ class _AsyncNativeWorkerProcess:
     async def _dispatch_stdout(self) -> None:
         assert self.process is not None and self.process.stdout is not None
         failure = "sevenzip_worker exited before job completion"
+        broken = False
         try:
             while line_bytes := await self.process.stdout.readline():
                 try:
@@ -651,18 +680,16 @@ class _AsyncNativeWorkerProcess:
                 finally:
                     del line_bytes
         except Exception as exc:
+            broken = True
             failure = f"sevenzip_worker transport/protocol failed: {exc}"
         finally:
             if self._ready is not None and not self._ready.done():
                 self._ready.set_exception(RuntimeError("sevenzip_worker exited before startup completed"))
             if self._process_mode_waiter is not None and not self._process_mode_waiter.done():
                 self._process_mode_waiter.set_exception(RuntimeError("sevenzip_worker exited during QoS transition"))
-            if not self._closing:
-                # EOF is not proof of process exit: retain ownership until it stops.
-                if self.is_alive():
-                    self.process.terminate()
-                await self.process.wait()
-                self._fail_all_jobs(failure)
+            if broken or not self._shutdown_sent or self._jobs:
+                # Also abort if EOF interrupts a graceful drain.
+                await self.abort(failure)
             self.queue_capacity.flush()
 
     async def _dispatch_line(self, line_bytes: bytes) -> None:
@@ -720,7 +747,7 @@ class _AsyncNativeWorkerProcess:
                 try:
                     await self.cancel(job_id)
                 except Exception:
-                    await self.close()
+                    await self.abort()
             completed = False
         if completed and _is_job_finished(payload):
             self._finish_job(job_id, state)
@@ -757,47 +784,56 @@ class _AsyncNativeWorkerProcess:
         for job_id, state in tuple(self._jobs.items()):
             self._fail_job(job_id, state, message)
 
+    async def abort(self, message: str = "sevenzip_worker transport failed") -> None:
+        self._closing = True
+        if self.process is not None:
+            if self.is_alive():
+                try:
+                    self.process.terminate()
+                except ProcessLookupError:
+                    pass
+            if asyncio.current_task() is self._stdout_task:
+                # A protocol error can leave StreamReader paused above its
+                # limit. Consume the dead worker's tail so wait() can see EOF.
+                while await self.process.stdout.read(64 * 1024):
+                    pass
+            await self.process.wait()
+        self._fail_all_jobs(message)
+        self.queue_capacity.flush()
+
     async def close(self) -> None:
         if self.process is None:
             return
-        if self._closing:
-            await self.process.wait()
-            return
-        self._closing = True
+        if self._close_task is None:
+            # Close admission before yielding; all callers share full cleanup.
+            self._closing = True
+            self._close_task = asyncio.create_task(self._close(), name="sunpack-native-close")
+        await asyncio.shield(self._close_task)
+
+    async def _close(self) -> None:
+        if self._jobs:
+            await asyncio.gather(*(asyncio.shield(state["finished"]) for state in self._jobs.values()))
         if self.is_alive():
             try:
+                self._shutdown_sent = True
                 await self.send('{"worker_command":"shutdown","job_id":"shutdown"}')
-                await asyncio.wait_for(self.process.wait(), timeout=0.5)
-            except (Exception, asyncio.CancelledError):
-                if self.is_alive():
-                    self.process.terminate()
-                    try:
-                        await asyncio.wait_for(self.process.wait(), timeout=0.5)
-                    except Exception:
-                        self.process.kill()
-                        await self.process.wait()
+            except Exception:
+                await self.abort()
+        await self.process.wait()
         stdin = self.process.stdin
         if stdin is not None:
             stdin.close()
             try:
                 await stdin.wait_closed()
-            except Exception:
+            except (BrokenPipeError, ConnectionResetError):
                 pass
-        current = asyncio.current_task()
-        remaining = [task for task in self._tasks if task is not current]
-        if remaining:
-            _done, pending = await asyncio.wait(remaining, timeout=1.0)
-            for task in pending:
-                task.cancel()
-            await asyncio.gather(*remaining, return_exceptions=True)
+        # Readers own the pipe EOF and must finish, however long native teardown takes.
+        await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks.clear()
         self._stdout_task = None
-        for job_id, state in tuple(self._jobs.items()):
-            self._fail_job(
-                job_id, state,
-                str(state.get("callback_error") or "sevenzip_worker closed before job completion"),
-            )
         self.queue_capacity.flush()
+        if self._resubmissions:
+            await asyncio.gather(*tuple(self._resubmissions), return_exceptions=True)
 
 
 class _AsyncNativeWorkerHolder:

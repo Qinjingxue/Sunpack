@@ -45,8 +45,6 @@ use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED
 
 const PIPE_BUFFER_BYTES: u32 = 4096;
 const MAX_CONNECTED_CLIENTS: u32 = 64;
-const CLIENT_CONNECT_TIMEOUT_MS: u32 = 5_000;
-const LAST_CLIENT_DEBOUNCE: Duration = Duration::from_secs(1);
 const MAX_VOLUME_CONTEXTS: usize = 64;
 const VOLUME_CONTEXT_IDLE_TTL: Duration = Duration::from_secs(60);
 const PIPE_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)";
@@ -139,7 +137,6 @@ fn run_service() -> windows_service::Result<()> {
 }
 
 fn serve_watch_lifetimes(stop_event: HANDLE) -> io::Result<()> {
-    let started = Instant::now();
     let journals = Arc::new(JournalDispatcher::default());
     let active_leases = Arc::new(AtomicUsize::new(0));
     let connected_clients = Arc::new(AtomicUsize::new(0));
@@ -147,24 +144,14 @@ fn serve_watch_lifetimes(stop_event: HANDLE) -> io::Result<()> {
     let state_changed = OwnedHandle::auto_reset_event()?;
     let mut workers = Vec::new();
     let mut first_instance = true;
-    let mut idle_since = None;
     let mut pending_accept: Option<PendingPipeAccept> = None;
     loop {
         workers.retain(|worker: &thread::JoinHandle<()>| !worker.is_finished());
         let leases = active_leases.load(Ordering::Acquire);
         let clients = connected_clients.load(Ordering::Acquire);
         let had_lease = ever_had_lease.load(Ordering::Acquire);
-        if leases > 0 {
-            idle_since = None;
-        } else if had_lease && clients == 0 {
-            let since = idle_since.get_or_insert_with(Instant::now);
-            if since.elapsed() >= LAST_CLIENT_DEBOUNCE {
-                break;
-            }
-        } else if !had_lease
-            && clients == 0
-            && started.elapsed() >= Duration::from_millis(CLIENT_CONNECT_TIMEOUT_MS as u64)
-        {
+        // Before the first lease, only an explicit stop proves nobody will use us.
+        if had_lease && leases == 0 && clients == 0 {
             break;
         }
 
@@ -199,29 +186,18 @@ fn serve_watch_lifetimes(stop_event: HANDLE) -> io::Result<()> {
             continue;
         }
 
-        let idle_deadline = if clients != 0 || leases != 0 {
-            None
-        } else if had_lease {
-            idle_since.map(|since| since + LAST_CLIENT_DEBOUNCE)
-        } else {
-            Some(started + Duration::from_millis(CLIENT_CONNECT_TIMEOUT_MS as u64))
-        };
-        let timeout_ms = deadline_timeout_ms(idle_deadline);
         let wait = if let Some(accept) = pending_accept.as_ref() {
             let handles = [stop_event, accept.event(), state_changed.raw()];
-            unsafe { WaitForMultipleObjects(handles.len() as u32, handles.as_ptr(), 0, timeout_ms) }
+            unsafe { WaitForMultipleObjects(handles.len() as u32, handles.as_ptr(), 0, INFINITE) }
         } else {
             let handles = [stop_event, state_changed.raw()];
-            unsafe { WaitForMultipleObjects(handles.len() as u32, handles.as_ptr(), 0, timeout_ms) }
+            unsafe { WaitForMultipleObjects(handles.len() as u32, handles.as_ptr(), 0, INFINITE) }
         };
         if wait == WAIT_OBJECT_0 {
             break;
         }
         if wait == WAIT_FAILED {
             return Err(io::Error::last_os_error());
-        }
-        if wait == WAIT_TIMEOUT {
-            continue;
         }
         if pending_accept.is_some() && wait == WAIT_OBJECT_0 + 1 {
             let pipe = pending_accept.take().unwrap().finish()?;
@@ -315,12 +291,7 @@ fn serve_client(
             let mut query = Vec::new();
             if request.opcode == Opcode::ReadDirectoriesChanges {
                 let mut length = [0u8; 4];
-                match read_overlapped(
-                    pipe.raw(),
-                    stop_event,
-                    &mut length,
-                    INFINITE,
-                )? {
+                match read_overlapped(pipe.raw(), stop_event, &mut length, INFINITE)? {
                     IoResult::Completed(4) => {}
                     _ => break,
                 }
@@ -332,12 +303,7 @@ fn serve_client(
                     break;
                 }
                 query.resize(length, 0);
-                match read_overlapped(
-                    pipe.raw(),
-                    stop_event,
-                    &mut query,
-                    INFINITE,
-                )? {
+                match read_overlapped(pipe.raw(), stop_event, &mut query, INFINITE)? {
                     IoResult::Completed(size) if size == length => {}
                     _ => break,
                 }
@@ -778,18 +744,6 @@ impl Drop for PendingPipeAccept {
     }
 }
 
-fn deadline_timeout_ms(deadline: Option<Instant>) -> u32 {
-    let Some(deadline) = deadline else {
-        return INFINITE;
-    };
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    if remaining.is_zero() {
-        return 0;
-    }
-    let milliseconds = remaining.as_millis().saturating_add(1);
-    milliseconds.min((INFINITE - 1) as u128) as u32
-}
-
 fn read_overlapped(
     pipe: HANDLE,
     stop_event: HANDLE,
@@ -971,6 +925,124 @@ fn wide(value: &str) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lifetime_waits_for_first_lease_and_exits_on_stop_or_last_client() {
+        // The shape/dispatcher tests never run the accept loop. This single
+        // real-pipe test covers initial standby, stop, overlapping short leases
+        // and a connected client without a lease, including the old 5s/1s exits.
+        use std::io::{Read, Write};
+        use std::sync::mpsc::{self, RecvTimeoutError};
+
+        let name = format!(
+            r"\\.\pipe\SunPack.WatchBroker.Test.lifetime.{}",
+            std::process::id()
+        );
+        CONFIG
+            .set(BrokerConfig {
+                service_name: "SunPackWatchBrokerTest_lifetime".to_owned(),
+                pipe_name: name.clone(),
+            })
+            .unwrap();
+
+        struct Server {
+            stop: Arc<OwnedHandle>,
+            thread: Option<thread::JoinHandle<io::Result<()>>>,
+            done: mpsc::Receiver<()>,
+        }
+        impl Server {
+            fn start() -> Self {
+                let stop = Arc::new(OwnedHandle::event().unwrap());
+                let worker_stop = Arc::clone(&stop);
+                let (tx, done) = mpsc::channel();
+                let thread = thread::spawn(move || {
+                    let result = serve_watch_lifetimes(worker_stop.raw());
+                    let _ = tx.send(());
+                    result
+                });
+                Self {
+                    stop,
+                    thread: Some(thread),
+                    done,
+                }
+            }
+        }
+        impl Drop for Server {
+            fn drop(&mut self) {
+                self.stop.signal();
+                assert!(self.thread.take().unwrap().join().unwrap().is_ok());
+            }
+        }
+        fn connect(name: &str) -> std::fs::File {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                match std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(name)
+                {
+                    Ok(pipe) => return pipe,
+                    Err(error)
+                        if matches!(error.raw_os_error(), Some(2 | 231))
+                            && Instant::now() < deadline =>
+                    {
+                        thread::yield_now()
+                    }
+                    Err(error) => panic!("test pipe connection failed: {error}"),
+                }
+            }
+        }
+        fn request(pipe: &mut std::fs::File, opcode: Opcode) {
+            pipe.write_all(&Request::simple(opcode, 1).encode().unwrap())
+                .unwrap();
+            let mut response = [0; RESPONSE_BYTES];
+            pipe.read_exact(&mut response).unwrap();
+            assert_eq!(Response::decode(&response).unwrap().status, Status::Ok);
+        }
+
+        {
+            let server = Server::start();
+            assert_eq!(
+                server.done.recv_timeout(Duration::from_millis(5_100)),
+                Err(RecvTimeoutError::Timeout)
+            );
+            server.stop.signal();
+            server.done.recv_timeout(Duration::from_secs(3)).unwrap();
+        }
+        let server = Server::start();
+        let mut owner = connect(&name);
+        request(&mut owner, Opcode::Hello);
+        for _ in 0..16 {
+            let mut next = connect(&name);
+            request(&mut next, Opcode::Hello);
+            request(&mut owner, Opcode::Release);
+            owner = next;
+        }
+        let mut unleased = connect(&name);
+        // An invalid pre-Hello ping confirms this connection is accepted.
+        unleased
+            .write_all(&Request::simple(Opcode::Ping, 2).encode().unwrap())
+            .unwrap();
+        let mut response = [0; RESPONSE_BYTES];
+        unleased.read_exact(&mut response).unwrap();
+        assert_eq!(
+            Response::decode(&response).unwrap().status,
+            Status::InvalidRequest
+        );
+        request(&mut owner, Opcode::Release);
+        drop(owner);
+        assert_eq!(
+            server.done.recv_timeout(Duration::from_millis(20)),
+            Err(RecvTimeoutError::Timeout)
+        );
+        request(&mut unleased, Opcode::Hello);
+        request(&mut unleased, Opcode::Release);
+        drop(unleased);
+        server
+            .done
+            .recv_timeout(Duration::from_millis(500))
+            .unwrap();
+    }
 
     #[test]
     fn broker_identity_defaults_to_production_names() {

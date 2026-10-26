@@ -57,7 +57,7 @@ def test_shared_worker_process_mode_retries_failed_ack_and_serializes_transition
             assert (await worker.set_process_mode(mode="background"))["applied"]
             assert len(sent) == 5
         finally:
-            worker._closing = True
+            worker._shutdown_sent = True
             stdout.feed_eof()
             await dispatcher
 
@@ -163,6 +163,9 @@ def test_sync_bad_job_waits_for_native_finish_and_does_not_affect_other_jobs():
     worker._async_jobs = {}
     worker._job_states = {}
     worker._dispatch_lock = threading.Lock()
+    worker._idle = threading.Condition(worker._dispatch_lock)
+    worker._closing = False
+    worker._shutdown_sent = False
     sent, callbacks, failures = [], [], []
     worker.send = sent.append
     for job_id in ["bad", "good"]:
@@ -186,11 +189,14 @@ def test_sync_bad_job_waits_for_native_finish_and_does_not_affect_other_jobs():
 def test_sync_fatal_protocol_error_stops_process_before_failure_callback():
     worker = object.__new__(_NativeWorkerProcess)
     worker._dispatch_lock = threading.Lock()
+    worker._idle = threading.Condition(worker._dispatch_lock)
+    worker._closing = False
+    worker._shutdown_sent = False
     worker.queue_capacity = _NativeQueueCapacity()
     worker._job_states = {"job": {}}
     order = []
     worker._async_jobs = {"job": {"completion_lock": threading.Lock(), "on_error": lambda message: order.append("failed")}}
-    worker.close = lambda: order.append("stopped")
+    worker.abort = lambda: order.append("stopped")
     worker._dispatch_stdout(io.StringIO("broken\n"))
     assert order == ["stopped", "failed"]
 
@@ -355,7 +361,7 @@ def test_idle_async_reader_releases_finished_callbacks_but_keeps_active_jobs(out
 
         reader = Reader()
         worker = _AsyncNativeWorkerProcess("unused", None)
-        worker.process = SimpleNamespace(stdout=reader, returncode=None)
+        worker.process = SimpleNamespace(stdout=reader, returncode=0, wait=lambda: asyncio.sleep(0))
         failures, sent = [], []
 
         async def send(payload):
@@ -391,7 +397,7 @@ def test_idle_async_reader_releases_finished_callbacks_but_keeps_active_jobs(out
             assert len(failures) == (outcome != "success")
             assert not dispatch.done()
         finally:
-            worker._closing = True
+            worker._shutdown_sent = True
             reader.feed_eof()
             await asyncio.wait_for(dispatch, 2)
             worker._fail_all_jobs("closed")
@@ -459,7 +465,10 @@ def _assert_many_item_result(result):
 
 
 def test_real_worker_chunks_are_bounded_by_serialized_bytes(many_item_archive):
-    completed = subprocess.run([get_sevenzip_bridge_worker_path()], input=_request(many_item_archive),
+    # Explicit shutdown must drain admitted work, just like the EOF path used
+    # by standalone dry-run. Sending it immediately exposes native cancellation.
+    completed = subprocess.run([get_sevenzip_bridge_worker_path()],
+                               input=_request(many_item_archive) + '\n{"worker_command":"shutdown"}\n',
                                capture_output=True, text=True, encoding="utf-8", timeout=15,
                                creationflags=subprocess.CREATE_NO_WINDOW)
     assert completed.returncode == 0, completed.stderr
@@ -579,3 +588,202 @@ def test_worker_transport_failure_detail_outweighs_legacy_code_and_archive_text(
     assert failure.details["failure_stage"] == "worker_communication"
     assert failure.details["failure_kind"] == "worker_lost"
     assert "named pipe disconnected unexpectedly" in failure.message
+
+
+@pytest.mark.parametrize("broken", [False, True])
+def test_async_close_drains_before_shutdown_and_joins_all_readers(broken):
+    # Existing completion tests close only after jobs finish. This exercises
+    # close with an active job, concurrent callers, EOF failure and pipe teardown.
+    # Event gates make the ordering deterministic without timer sleeps.
+    async def scenario():
+        worker = _AsyncNativeWorkerProcess("unused", None)
+        reader = asyncio.StreamReader()
+        exit_gate, reader_gate = asyncio.Event(), asyncio.Event()
+        stopping = asyncio.Event()
+        sent, errors = [], []
+
+        class Input:
+            def close(self):
+                pass
+
+            async def wait_closed(self):
+                pass
+
+        async def wait():
+            await exit_gate.wait()
+            worker.process.returncode = 0
+
+        def terminate():
+            worker.process.returncode = -1
+            exit_gate.set()
+
+        async def send(payload):
+            sent.append(payload)
+            if json.loads(payload).get("worker_command") == "shutdown":
+                stopping.set()
+
+        async def tail_reader():
+            await reader_gate.wait()
+
+        worker.process = SimpleNamespace(stdout=reader, stdin=Input(), returncode=None,
+                                         terminate=terminate, wait=wait)
+        worker.send = send
+        await worker.submit('{"job_id":"active"}', "active", parsed_events=True,
+                            on_line=lambda line, event: event.get("event") == "job_finished",
+                            on_error=errors.append)
+        worker._stdout_task = asyncio.create_task(worker._dispatch_stdout())
+        worker._tasks = [worker._stdout_task, asyncio.create_task(tail_reader())]
+        closing = asyncio.create_task(worker.close())
+        await asyncio.sleep(0)
+        second = asyncio.create_task(worker.close())
+        with pytest.raises(RuntimeError, match="closing"):
+            await worker.submit('{}', "late", on_line=lambda _: False, on_error=errors.append)
+        assert len(sent) == 1 and not closing.done()
+        if broken:
+            reader.feed_eof()
+        else:
+            reader.feed_data(b'{"type":"native_event","job_id":"active","event":"job_finished"}\n')
+            await asyncio.wait_for(stopping.wait(), 2)
+            assert not closing.done() and not second.done() and not errors
+            exit_gate.set()
+            reader.feed_eof()
+        await worker._stdout_task
+        await asyncio.sleep(0)
+        assert not closing.done() and not second.done()
+        reader_gate.set()
+        await asyncio.wait_for(asyncio.gather(closing, second), 2)
+        assert bool(errors) == broken
+        assert not worker._jobs and not worker._tasks
+        assert sum('shutdown' in payload for payload in sent) == (not broken)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("broken", [False, True])
+def test_sync_close_drains_before_shutdown_and_joins_all_readers(monkeypatch, broken):
+    # Sync transports have separate admission and reader threads; the async
+    # regression cannot catch their locking or an early return before EOF.
+    # A fake pipe and event gates cover this without launching a child process.
+    import queue
+    from sunpack.pipeline.extraction.internal.sevenzip import sevenzip_runner as module
+
+    lines = queue.Queue()
+    exited, shutdown, close_waiting = threading.Event(), threading.Event(), threading.Event()
+    reader_gate = threading.Event()
+    sent, errors = [], []
+
+    class Output:
+        def __iter__(self):
+            while True:
+                line = lines.get()
+                if line is None:
+                    return
+                yield line
+
+        def close(self):
+            pass
+
+    class Input:
+        def write(self, payload):
+            sent.append(payload)
+            if 'shutdown' in payload:
+                shutdown.set()
+
+        def flush(self):
+            pass
+
+        def close(self):
+            pass
+
+    class Process:
+        pid = 0
+        stdin, stdout = Input(), Output()
+
+        class Stderr:
+            def __iter__(self):
+                assert reader_gate.wait(3)
+                return iter(())
+
+            def close(self):
+                pass
+
+        stderr = Stderr()
+
+        def poll(self):
+            return 0 if exited.is_set() else None
+
+        def terminate(self):
+            exited.set()
+
+        def wait(self):
+            assert exited.wait(3)
+            return 0
+
+    monkeypatch.setattr(module.subprocess, 'Popen', lambda *args, **kwargs: Process())
+    worker = _NativeWorkerProcess("unused", None)
+    original_wait = worker._idle.wait_for
+
+    def wait_for(predicate):
+        close_waiting.set()
+        return original_wait(predicate)
+
+    monkeypatch.setattr(worker._idle, 'wait_for', wait_for)
+    worker.submit_async('{}', "active", parsed_events=True,
+                        on_line=lambda line, event: event.get('event') == 'job_finished',
+                        on_error=errors.append)
+    closing = threading.Thread(target=worker.close)
+    closing.start()
+    try:
+        assert close_waiting.wait(3)
+        with pytest.raises(RuntimeError, match="closing"):
+            worker.submit_async('{}', "late", on_line=lambda _: False, on_error=errors.append)
+        assert not shutdown.is_set() and closing.is_alive()
+        if broken:
+            lines.put('broken stream\n')
+        else:
+            lines.put('{"type":"native_event","job_id":"active","event":"job_finished"}\n')
+            assert shutdown.wait(3)
+            assert closing.is_alive() and not errors
+        exited.set()
+        lines.put(None)
+        worker._reader_threads[0].join(3)
+        assert not worker._reader_threads[0].is_alive() and closing.is_alive()
+    finally:
+        exited.set()
+        lines.put(None)
+        reader_gate.set()
+        closing.join(3)
+    assert not closing.is_alive() and bool(errors) == broken
+    assert not worker._async_jobs
+    assert shutdown.is_set() != broken
+
+
+def test_async_broken_pipe_above_reader_limit_reaches_process_exit():
+    # In-memory fatal-stream tests cannot reproduce asyncio transport wait()
+    # waiting on a paused OS pipe. One small child covers that independent hang.
+    import sys
+
+    async def scenario():
+        worker = _AsyncNativeWorkerProcess("unused", None)
+        worker.process = await asyncio.create_subprocess_exec(
+            sys.executable, '-c', 'import os; os.write(1, b"x" * (512 * 1024))',
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE, limit=4096,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        worker._stdout_task = asyncio.create_task(worker._dispatch_stdout())
+        worker._tasks = [worker._stdout_task, asyncio.create_task(worker._pump_stderr())]
+        try:
+            await asyncio.wait_for(asyncio.shield(worker._stdout_task), 3)
+            assert worker.process.returncode is not None
+            await worker.close()
+        finally:
+            if worker.is_alive():
+                worker.process.kill()
+            if worker._stdout_task is not None and not worker._stdout_task.done():
+                # Release a paused pipe even when testing a broken implementation.
+                while await worker.process.stdout.read(64 * 1024):
+                    pass
+            await worker.process.wait()
+
+    asyncio.run(scenario())

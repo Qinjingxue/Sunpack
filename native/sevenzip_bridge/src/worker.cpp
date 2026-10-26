@@ -1598,7 +1598,7 @@ public:
 
     bool had_job_failure() const noexcept { return any_job_failed_; }
 
-    // Waits for the queue and all active jobs to finish; only used on the stdin EOF drain path, where the monitor and space gate must still be alive.
+    // Waits for the queue and all active jobs to finish while the monitor and space gate remain alive.
     void wait_for_pending_jobs_to_drain() noexcept {
         std::unique_lock<std::mutex> lock(mutex_);
         drain_condition_.wait(
@@ -1606,7 +1606,7 @@ public:
             [this] { return queues_empty_locked() && active_jobs_ == 0; });
     }
 
-    // cancel_pending_jobs: true (explicit shutdown) cancels every unfinished job, false (stdin EOF) drains first.
+    // Normal shutdown and stdin EOF drain first; destructor fallback cancels.
     // Terminal conditions must be set before waking, otherwise a worker parked on a volume space gate never sees the stop and join blocks forever.
     void stop(bool cancel_pending_jobs = true) noexcept {
         if (!cancel_pending_jobs) {
@@ -2290,7 +2290,7 @@ int main() {
         const bool shutdown = request.worker_command == "shutdown";
         const int code = run_message(std::move(request), executor);
         if (shutdown) {
-            executor.stop();
+            executor.stop(/*cancel_pending_jobs=*/false);
             return code;
         }
     }

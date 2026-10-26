@@ -158,6 +158,7 @@ class ToastManager:
         self._snapshot: ToastSnapshot | None = None
         self._revision = 0
         self._stopping = False
+        self._unavailable = False
         self._thread: threading.Thread | None = None
 
     def start(self) -> None:
@@ -165,12 +166,13 @@ class ToastManager:
             if self._thread is not None:
                 return
             self._stopping = False
+            self._unavailable = False
             self._thread = threading.Thread(target=self._run, name="sunpack-toast", daemon=True)
             self._thread.start()
 
     def publish(self, snapshot: ToastSnapshot) -> None:
         with self._condition:
-            if self._stopping:
+            if self._stopping or self._unavailable:
                 return
             self._snapshot = snapshot
             self._revision += 1
@@ -178,7 +180,7 @@ class ToastManager:
 
     def clear(self) -> None:
         with self._condition:
-            if self._stopping:
+            if self._stopping or self._unavailable:
                 return
             self._snapshot = None
             self._revision += 1
@@ -203,7 +205,6 @@ class ToastManager:
         sent_revision = -1
         next_progress_send = 0.0
         sequence = 0
-        failures = 0
         active_progress = False
         try:
             while True:
@@ -217,7 +218,7 @@ class ToastManager:
                         snapshot is None or snapshot.kind != ToastSnapshotKind.PROGRESS
                         or now >= next_progress_send
                     )
-                    if not due and presenter is not None:
+                    if not due:
                         timeout = max(0.0, next_progress_send - now) if changed else None
                         self._condition.wait_for(
                             lambda: self._stopping or self._revision != revision, timeout=timeout,
@@ -225,50 +226,60 @@ class ToastManager:
                         continue
                 try:
                     if presenter is None:
-                        presenter = self._presenter_factory(
-                            library_path=self._library_path,
-                            diagnostic_log_path=self._diagnostic_log_path,
-                        )
-                        sent_revision = -1
+                        try:
+                            presenter = self._presenter_factory(
+                                library_path=self._library_path,
+                                diagnostic_log_path=self._diagnostic_log_path,
+                            )
+                        except Exception as exc:
+                            # A new snapshot cannot repair component initialization.
+                            with self._condition:
+                                self._unavailable = True
+                                self._snapshot = None
+                            self._log("toast_unavailable", error=str(exc))
+                            return
                         self._log("toast_started", pid=os.getpid())
                     if due:
                         if snapshot is None:
                             presenter.clear()
                             active_progress = False
                         else:
-                            payload = encode_snapshot(snapshot)
+                            try:
+                                payload = encode_snapshot(snapshot)
+                            except ValueError as exc:
+                                self._log("toast_snapshot_rejected", error=str(exc))
+                                with self._condition:
+                                    if revision == self._revision:
+                                        self._snapshot = None
+                                        self._revision += 1
+                                continue
                             sequence += 1
                             presenter.show(payload, sequence)
                             active_progress = snapshot.kind == ToastSnapshotKind.PROGRESS
                         sent_revision = revision
                         if snapshot is None or snapshot.kind == ToastSnapshotKind.PROGRESS:
                             next_progress_send = time.monotonic() + self._update_interval
-                    failures = 0
-                except ValueError as exc:
-                    self._log("toast_snapshot_rejected", error=str(exc))
-                    with self._condition:
-                        if revision == self._revision:
-                            self._snapshot = None
-                            self._revision += 1
                 except Exception as exc:
-                    failures += 1
-                    self._log("toast_error", error=str(exc), attempt=failures)
+                    self._log("toast_error", error=str(exc))
+                    sent_revision = revision
+                    active_progress = False
                     if presenter is not None:
-                        presenter.close()
+                        self._close_presenter(presenter)
                         presenter = None
-                    self._wait_for_stop(min(30.0, 0.25 * (2 ** min(failures - 1, 7))))
         finally:
             if presenter is not None:
                 if active_progress:
                     try:
                         presenter.clear()
                     except Exception as exc:
-                        self._log("toast_error", error=str(exc), attempt=failures + 1)
-                presenter.close()
+                        self._log("toast_error", error=str(exc))
+                self._close_presenter(presenter)
 
-    def _wait_for_stop(self, seconds: float) -> None:
-        with self._condition:
-            self._condition.wait_for(lambda: self._stopping, timeout=seconds)
+    def _close_presenter(self, presenter) -> None:
+        try:
+            presenter.close()
+        except Exception as exc:
+            self._log("toast_error", error=str(exc))
 
     def _log(self, event: str, **payload) -> None:
         try:
