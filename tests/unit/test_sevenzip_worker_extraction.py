@@ -1226,7 +1226,13 @@ def test_extraction_scheduler_saves_process_failure_diagnostics(tmp_path):
 
 def test_extraction_scheduler_classifies_malformed_worker_output_as_process_exit(tmp_path):
     worker = tmp_path / "malformed_worker.cmd"
-    worker.write_text("@echo not-json\r\n@exit /b 2\r\n", encoding="utf-8")
+    # Emit malformed output after accepting a request. Exiting before the
+    # handshake races with submission and legitimately reports process_io.
+    worker.write_text(
+        '@echo {"type":"worker_ready","process_mode":"normal","process_mode_applied":true}\r\n'
+        '@set /p request=\r\n@echo not-json\r\n@exit /b 2\r\n',
+        encoding="utf-8",
+    )
     archive = tmp_path / "sample.7z"
     archive.write_bytes(b"not used")
     scheduler = ExtractionScheduler(max_retries=1)

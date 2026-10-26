@@ -483,27 +483,7 @@ impl EncodingAccumulator {
     }
     fn observe_components(&mut self, decoded: &str) -> io::Result<()> {
         for part in decoded.split(['/', '\\']).filter(|part| !part.is_empty()) {
-            let (score, stats) = if part.is_ascii() {
-                let mut score = 0;
-                if part
-                    .bytes()
-                    .any(|byte| byte < 32 && !matches!(byte, b'\t' | b'\n' | b'\r'))
-                {
-                    score -= 20;
-                }
-                if part
-                    .bytes()
-                    .any(|byte| matches!(byte, b'<' | b'>' | b':' | b'"' | b'|' | b'?' | b'*'))
-                {
-                    score -= 10;
-                }
-                if matches!(part, "." | "..") {
-                    score -= 3;
-                }
-                (score, NameStats::default())
-            } else {
-                score_decoded_name(part, self.kind)
-            };
+            let (score, stats) = score_decoded_name(part, self.kind);
             if score == 0
                 && stats.cjk == 0
                 && stats.kana == 0

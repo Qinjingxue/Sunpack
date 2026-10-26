@@ -29,7 +29,8 @@ const CRC_BUFFER_SIZE: usize = 1024 * 1024;
     include_observations=false,
     detail_offset=0,
     detail_limit=128,
-    max_issue_items=20
+    max_issue_items=20,
+    names_only=false
 ))]
 pub(crate) fn match_output_inventory_coverage(
     py: Python<'_>,
@@ -41,6 +42,7 @@ pub(crate) fn match_output_inventory_coverage(
     detail_offset: usize,
     detail_limit: usize,
     max_issue_items: usize,
+    names_only: bool,
 ) -> PyResult<Py<PyDict>> {
     // A native archive manifest is matched straight from its Rust entry table;
     // plain dict iterables remain for configured / name-only expectations.
@@ -56,7 +58,7 @@ pub(crate) fn match_output_inventory_coverage(
     let basename_mode = BasenameMode::parse(basename_mode)?;
     let matched = py.detach(|| {
         let expected = match manifest {
-            Some(manifest) => Expected::Manifest(manifest, manifest.entry_count(None)),
+            Some(manifest) => Expected::Manifest(manifest, manifest.entry_count(None), names_only),
             None => Expected::Items(expected),
         };
         match_inventory_source(
@@ -105,22 +107,22 @@ struct ArchiveFile<'a> {
 
 enum Expected<'a> {
     Items(Vec<ArchiveFile<'a>>),
-    Manifest(&'a NativeArchiveManifest, usize),
+    Manifest(&'a NativeArchiveManifest, usize, bool),
 }
 impl Expected<'_> {
     fn len(&self) -> usize {
         match self {
             Self::Items(items) => items.len(),
-            Self::Manifest(_, len) => *len,
+            Self::Manifest(_, len, _) => *len,
         }
     }
     fn get(&self, index: usize) -> io::Result<ArchiveFile<'_>> {
         match self {
             Self::Items(items) => Ok(items[index].clone()),
-            Self::Manifest(manifest, _) => {
+            Self::Manifest(manifest, _, names_only) => {
                 let item = manifest.entries.get(index)?;
-                match item {
-                    Cow::Borrowed(item) => Ok(archive_file(
+                let mut file = match item {
+                    Cow::Borrowed(item) => archive_file(
                         &item.path,
                         Cow::Borrowed(item.raw_path.as_deref().unwrap_or(&item.path)),
                         Some(item.size),
@@ -134,22 +136,32 @@ impl Expected<'_> {
                         size: Some(item.size),
                         has_crc: item.crc32.is_some(),
                         crc32: item.crc32,
-                    })),
+                    }),
                     Cow::Owned(item) => {
                         let raw = item.raw_path.as_deref().unwrap_or(&item.path);
                         let path =
                             windows_output_relative_path(clean_relative_archive_path(&item.path))
                                 .into_owned();
-                        Ok(ArchiveFile {
+                        ArchiveFile {
                             unsafe_path: path.is_empty() || unsafe_archive_path(raw),
                             path: Cow::Owned(path),
                             raw_path: Cow::Owned(raw.to_owned()),
                             size: Some(item.size),
                             has_crc: item.crc32.is_some(),
                             crc32: item.crc32,
-                        })
+                        }
                     }
+                };
+                // Name coverage retains its original semantics. Size/CRC methods
+                // consume the same table without this projection.
+                if *names_only {
+                    file.raw_path = file.path.clone();
+                    file.unsafe_path = unsafe_archive_path(&file.raw_path);
+                    file.size = None;
+                    file.has_crc = false;
+                    file.crc32 = None;
                 }
+                Ok(file)
             }
         }
     }

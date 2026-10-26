@@ -471,12 +471,9 @@ class WorkerSession:
 
 
 def _worker_path() -> Path:
-    from sunpack.core.support.resources import get_sevenzip_bridge_worker_path
+    from tests.helpers.native_build import sevenzip_artifact
 
-    path = Path(get_sevenzip_bridge_worker_path())
-    if not path.exists():
-        pytest.skip(f"native worker not built: {path}")
-    return path
+    return sevenzip_artifact("sunpack_sevenzip_worker.exe")
 
 
 def _seven_zip_dll() -> Path:
@@ -573,18 +570,8 @@ def test_full_disk_stale_monitor_snapshot_and_cancelled_probe_recover(tmp_path_f
     # CMake builds this test-only executable next to the native worker build,
     # but setup_windows_dev.ps1 copies only the runtime worker into tools/.
     _worker_path()  # Preserve the prerequisite check for the runtime worker.
-    arch = os.environ.get("SUNPACK_TEST_ARCH", "x64").lower()
-    profile = os.environ.get("SUNPACK_TEST_BUILD_PROFILE", "ci").lower()
-    build_suffix = "-ci" if profile == "ci" else ""
-    executable = (
-        Path(__file__).resolve().parents[2]
-        / "native"
-        / "sevenzip_bridge"
-        / f"build-{arch}{build_suffix}"
-        / "Release"
-        / "sunpack_sevenzip_space_gate.exe"
-    )
-    assert executable.is_file(), f"build sunpack_sevenzip_space_gate: {executable}"
+    from tests.helpers.native_build import sevenzip_artifact
+    executable = sevenzip_artifact("sunpack_sevenzip_space_gate.exe")
     with SpaceVhd(
         _vhd_directory(tmp_path_factory), "V",
         payload_bytes=8 * _MIB, blocked_free_bytes=64 << 10,
@@ -737,11 +724,13 @@ def test_win13_cancelling_last_waiter_is_not_resume(tmp_path_factory):
 
 
 @requires_vhd
-def test_win20_shutdown_pierces_a_paused_gate(tmp_path_factory):
+def test_win20_shutdown_drains_a_paused_job_after_space_recovers(tmp_path_factory):
+    # EOF tests do not exercise the shutdown command. This real blocked job
+    # proves shutdown preserves the monitor and drains work before exiting.
     vhd_directory = _vhd_directory(tmp_path_factory)
     work = Path(tmp_path_factory.mktemp("space-work"))
     archive = work / "shutdown.zip"
-    _make_archive(archive, 8 * _MIB)
+    payload = _make_archive(archive, 8 * _MIB)
 
     with SpaceVhd(
         vhd_directory,
@@ -761,14 +750,17 @@ def test_win20_shutdown_pierces_a_paused_gate(tmp_path_factory):
                 lambda event: event.get("event") == "space_blocked", timeout=90.0
             ) is not None
 
-            # 这里不事先显式取消任何 job：专测"只 wake 不改 terminal 条件"。
-            started = time.monotonic()
             session.send({"worker_command": "shutdown"})
-            session.wait_exit(timeout=15.0)
-            elapsed = time.monotonic() - started
-            assert elapsed < 10.0, f"暂停期间 shutdown 用了 {elapsed:.1f}s（预期 1s 量级）"
+            vhd.release()
+            result = session.wait_for(
+                lambda event: event.get("type") == "result", timeout=180.0
+            )
+            assert result is not None and result.get("status") == "ok", result
+            assert session.wait_exit(timeout=15.0) == 0
         finally:
             session.close()
+
+        assert (output_dir / "payload.bin").read_bytes() == payload
 
 
 @requires_vhd

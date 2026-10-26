@@ -96,10 +96,10 @@ pub(crate) fn zip_fast_verify_passwords_from_volumes(
 
 fn prepare_zip_volumes(
     volumes: &VolumeSet,
-    eocd_offset_param: Option<u64>,
+    eocd_offset: Option<u64>,
 ) -> Result<ZipPasswordContext, PreparedStatus> {
     volumes.require_contiguous()?;
-    let (tail, eocd_offset) = if let Some(offset) = eocd_offset_param {
+    let (tail, eocd_offset) = if let Some(offset) = eocd_offset {
         let (disk, local) = volumes.advance_disk_offset(0, 0, offset).ok_or_else(|| {
             PreparedStatus::new(
                 "needs_volume_or_tail_damaged",
@@ -139,64 +139,39 @@ fn prepare_zip_volumes(
             })?;
         (tail, offset)
     };
-    let mut starts = Vec::with_capacity(volumes.len());
-    let mut total = 0u64;
-    for disk in 0..volumes.len() {
-        starts.push(total);
-        total = total
-            .checked_add(volumes.volume_len(disk).unwrap())
-            .ok_or_else(|| PreparedStatus::new("damaged", "ZIP volume size overflow"))?;
-    }
-    let logical_eocd = eocd_offset_param
-        .or_else(|| {
-            Some(
-                starts.last().copied()? + volumes.volume_len(volumes.len() - 1)?
-                    - tail.len() as u64
-                    + eocd_offset as u64,
-            )
-        })
-        .unwrap();
-    let mut disk_number = le_u16(&tail, eocd_offset + 4).unwrap_or(u16::MAX) as usize;
-    let mut central_disk = le_u16(&tail, eocd_offset + 6).unwrap_or(u16::MAX) as usize;
-    let mut total_entries = le_u16(&tail, eocd_offset + 10).unwrap_or(u16::MAX) as u64;
-    let mut central_size = le_u32(&tail, eocd_offset + 12).unwrap_or(u32::MAX) as u64;
-    let mut central_offset = le_u32(&tail, eocd_offset + 16).unwrap_or(u32::MAX) as u64;
-    let zip64 =
-        crate::formats::zip::zip64::locate_end_record(logical_eocd, Some(&starts), |at, length| {
-            let Some((disk, local)) = volumes.advance_disk_offset(0, 0, at) else {
-                return Ok(Vec::new());
-            };
-            volumes.read_disk_spanning(disk, local, length)
-        })
-        .map_err(|error| PreparedStatus::new("needs_volume_or_tail_damaged", error.code()))?;
-    if let Some(found) = zip64 {
-        disk_number = found.record.disk as usize;
-        central_disk = found.record.cd_disk as usize;
-        total_entries = found.record.total_entries;
-        central_size = found.record.cd_size;
-        central_offset = found.record.cd_offset;
-    } else if central_size == u32::MAX as u64 || central_offset == u32::MAX as u64 {
-        return Err(PreparedStatus::new(
-            "needs_volume_or_tail_damaged",
-            "ZIP64 end record is unavailable",
-        ));
-    }
+    let disk_number = le_u16(&tail, eocd_offset + 4).unwrap_or(u16::MAX) as usize;
+    let central_disk = le_u16(&tail, eocd_offset + 6).unwrap_or(u16::MAX) as usize;
+    let total_entries = le_u16(&tail, eocd_offset + 10).unwrap_or(u16::MAX) as usize;
+    let central_size = le_u32(&tail, eocd_offset + 12).unwrap_or(u32::MAX) as u64;
+    let central_offset = le_u32(&tail, eocd_offset + 16).unwrap_or(u32::MAX) as u64;
     if disk_number + 1 != volumes.len() {
+        let fault = ReadFault::invalid_field(
+            "validate_field",
+            eocd_offset as u64 + 4,
+            2,
+            tail.len() as u64,
+            format!(
+                "declared disk count {} does not match available volume count {}",
+                disk_number + 1,
+                volumes.len()
+            ),
+        )
+        .with_field("zip.eocd.disk_number", FieldLocation::Tail);
+        return Err(fault.into());
+    }
+    if total_entries == u16::MAX as usize
+        || central_size == u32::MAX as u64
+        || central_offset == u32::MAX as u64
+    {
         return Err(PreparedStatus::new(
-            "needs_volume_or_tail_damaged",
-            "ZIP declared volume count differs from available volumes",
+            "unknown_needs_final_verifier",
+            "zip64 spanned password probing is not supported",
         ));
     }
+
     let mut disk = central_disk;
     let mut offset = central_offset;
-    let mut remaining = central_size;
     for _ in 0..total_entries {
-        if remaining < 46 {
-            return Err(PreparedStatus::new(
-                "damaged",
-                "ZIP central entry exceeds directory size",
-            ));
-        }
         let fixed = match volumes.read_disk_spanning_field(
             disk,
             offset,
@@ -222,30 +197,18 @@ fn prepare_zip_volumes(
         let name_len = le_u16(&fixed, 28).unwrap_or(0) as u64;
         let extra_len = le_u16(&fixed, 30).unwrap_or(0) as u64;
         let comment_len = le_u16(&fixed, 32).unwrap_or(0) as u64;
+        let entry_disk = le_u16(&fixed, 34).unwrap_or(u16::MAX) as usize;
+        let local_offset = le_u32(&fixed, 42).unwrap_or(u32::MAX) as u64;
         if flags & 0x0001 != 0 {
-            let (extra_disk, extra_offset) = volumes
-                .advance_disk_offset(disk, offset, 46 + name_len)
-                .ok_or_else(|| {
-                    PreparedStatus::new(
-                        "needs_volume_or_tail_damaged",
-                        "ZIP extra field crosses missing volumes",
-                    )
-                })?;
-            let extra = volumes.read_disk_spanning_field(
-                extra_disk,
-                extra_offset,
-                extra_len as usize,
-                "zip.central_directory.extra",
-                FieldLocation::Tail,
-            )?;
-            let values = crate::formats::zip::zip64::central_entry_values(&fixed, &extra)
-                .ok_or_else(|| PreparedStatus::new("damaged", "invalid ZIP64 central entry"))?;
-            return prepare_zip_volume_entry(volumes, values.disk as usize, values.local_offset);
+            if entry_disk == u16::MAX as usize || local_offset == u32::MAX as u64 {
+                return Err(PreparedStatus::new(
+                    "unknown_needs_final_verifier",
+                    "zip64 encrypted entry location requires fallback",
+                ));
+            }
+            return prepare_zip_volume_entry(volumes, entry_disk, local_offset);
         }
         let record_len = 46u64 + name_len + extra_len + comment_len;
-        remaining = remaining.checked_sub(record_len).ok_or_else(|| {
-            PreparedStatus::new("damaged", "ZIP central entry exceeds directory size")
-        })?;
         let Some(next) = volumes.advance_disk_offset(disk, offset, record_len) else {
             return Err(PreparedStatus::new("needs_volume_or_tail_damaged", "zip central directory crosses unavailable data; missing volume or damaged tail field"));
         };
@@ -606,57 +569,22 @@ fn locate_encrypted_entry_from_central_directory<R: Read + Seek>(
     }
     let tail = record;
     let eocd = 0;
-    let mut total_entries = le_u16(&tail, eocd + 10).unwrap() as u64;
-    let mut central_size = le_u32(&tail, eocd + 12).unwrap() as u64;
-    let mut central_offset = le_u32(&tail, eocd + 16).unwrap() as u64;
-    let mut directory_end = offset;
-    let zip64 = crate::formats::zip::zip64::locate_end_record(offset, None, |at, length| {
-        seek_field(file, at, total_len, "zip.zip64", FieldLocation::Tail)
-            .map_err(|fault| fault.into_io_error())?;
-        let available = total_len.saturating_sub(at).min(length as u64) as usize;
-        let mut bytes = vec![0; available];
-        read_exact_field(
-            file,
-            &mut bytes,
-            total_len,
-            "zip.zip64",
-            FieldLocation::Tail,
-        )
-        .map_err(|fault| fault.into_io_error())?;
-        Ok(bytes)
-    })
-    .map_err(|error| PreparedStatus::new("needs_volume_or_tail_damaged", error.code()))?;
-    if let Some(found) = zip64 {
-        if found.record.disk != 0 || found.record.cd_disk != 0 {
-            return Err(PreparedStatus::new(
-                "needs_volume_or_tail_damaged",
-                "ZIP64 requires additional volumes",
-            ));
-        }
-        total_entries = found.record.total_entries;
-        central_size = found.record.cd_size;
-        central_offset = found.record.cd_offset;
-        directory_end = found.offset;
-    } else if central_size == u32::MAX as u64 || central_offset == u32::MAX as u64 {
+    let total_entries = le_u16(&tail, eocd + 10).unwrap() as usize;
+    let central_size = le_u32(&tail, eocd + 12).unwrap() as u64;
+    let central_offset = le_u32(&tail, eocd + 16).unwrap() as u64;
+    if total_entries == u16::MAX as usize
+        || central_size == u32::MAX as u64
+        || central_offset == u32::MAX as u64
+    {
+        // Unsupported ZIP64 metadata goes through the original final verifier;
+        // its presence alone does not prove a missing volume or damaged tail.
         return Err(PreparedStatus::new(
-            "needs_volume_or_tail_damaged",
-            "ZIP64 end record is unavailable",
+            "unknown_needs_final_verifier",
+            "ZIP central-directory location requires ZIP64",
         ));
     }
-    let physical = directory_end
-        .checked_sub(central_size)
-        .ok_or_else(|| PreparedStatus::new("damaged", "ZIP central directory is out of range"))?;
-    let base = physical
-        .checked_sub(central_offset)
-        .ok_or_else(|| PreparedStatus::new("damaged", "ZIP archive offset underflow"))?;
-    let mut cursor = physical;
+    let mut cursor = central_offset;
     for _ in 0..total_entries {
-        if cursor.checked_add(46).is_none_or(|end| end > directory_end) {
-            return Err(PreparedStatus::new(
-                "damaged",
-                "ZIP central entry is out of range",
-            ));
-        }
         let mut fixed = [0u8; 46];
         seek_field(
             file,
@@ -688,26 +616,13 @@ fn locate_encrypted_entry_from_central_directory<R: Read + Seek>(
         let extra_len = le_u16(&fixed, 30).unwrap() as u64;
         let comment_len = le_u16(&fixed, 32).unwrap() as u64;
         if flags & 0x0001 != 0 {
-            let mut extra = vec![0; extra_len as usize];
-            seek_field(
-                file,
-                cursor + 46 + name_len,
-                total_len,
-                "zip.central_directory.extra",
-                FieldLocation::Tail,
-            )?;
-            read_exact_field(
-                file,
-                &mut extra,
-                total_len,
-                "zip.central_directory.extra",
-                FieldLocation::Tail,
-            )?;
-            let values = crate::formats::zip::zip64::central_entry_values(&fixed, &extra)
-                .ok_or_else(|| PreparedStatus::new("damaged", "invalid ZIP64 central entry"))?;
-            let local_offset = base
-                .checked_add(values.local_offset)
-                .ok_or_else(|| PreparedStatus::new("damaged", "ZIP local offset overflow"))?;
+            let local_offset = le_u32(&fixed, 42).unwrap() as u64;
+            if local_offset == u32::MAX as u64 {
+                return Err(PreparedStatus::new(
+                    "unknown_needs_final_verifier",
+                    "ZIP64 local-header offset requires fallback",
+                ));
+            }
             let mut local_fixed = [0u8; 30];
             seek_field(
                 file,
@@ -1229,11 +1144,11 @@ mod zip64_bounded_probe_tests {
     }
 
     #[test]
-    fn missing_zip64_end_record_reports_an_unavailable_tail() {
+    fn zip64_directory_location_defers_instead_of_reporting_missing_volume() {
         let data = stored_zip_with_eocd_offset(u32::MAX);
         let len = data.len() as u64;
         let result = prepare_zip_stream(&mut std::io::Cursor::new(data), len, None);
-        assert_eq!(status_of(result), "needs_volume_or_tail_damaged");
+        assert_eq!(status_of(result), "unknown_needs_final_verifier");
     }
 
     #[test]

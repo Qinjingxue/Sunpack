@@ -64,6 +64,7 @@ class OutputInventory:
         detail_offset: int = 0,
         detail_limit: int = 128,
         max_issue_items: int = 20,
+        names_only: bool = False,
     ) -> dict[str, Any]:
         return dict(_native_match_output_inventory_coverage(
             archive_files,
@@ -74,6 +75,7 @@ class OutputInventory:
             max(0, int(detail_offset or 0)),
             max(0, int(detail_limit or 0)),
             max(0, int(max_issue_items or 0)),
+            bool(names_only),
         ))
 
     def parent_directories(self) -> tuple[str, ...]:
