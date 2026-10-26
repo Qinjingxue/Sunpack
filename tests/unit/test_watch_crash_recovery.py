@@ -153,6 +153,7 @@ def test_live_enqueue_keeps_owner_memory_only(tmp_path):
     )
     scheduler.config = {}
     scheduler.log = SimpleNamespace(
+        path=tmp_path / "events.jsonl",
         write=lambda *_args, **_kwargs: None,
         write_throttled=lambda *_args, **_kwargs: None,
     )
@@ -343,6 +344,7 @@ def test_enqueue_does_not_publish_memory_work_when_durable_queue_fails(tmp_path)
     )
     scheduler.config = {}
     scheduler.log = SimpleNamespace(
+        path=tmp_path / "events.jsonl",
         write=lambda *_args, **_kwargs: None,
         write_throttled=lambda *_args, **_kwargs: None,
     )
