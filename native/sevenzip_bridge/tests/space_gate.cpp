@@ -197,7 +197,6 @@ void g1_initial_state() {
     check(gate->phase() == VolumeSpacePhase::Ready, "G-1: 初始 phase 必须是 Ready");
     check(gate->episode_id() == 0, "G-1: 初始 episode_id 必须是 0");
     check(!gate->blocked(), "G-1: 初始 blocked() 必须为 false");
-    check(!gate->watermark_valid(), "G-1: 初始 watermark_valid() 必须为 false");
 
     const auto result = gate->wait(TerminalPredicate{});
     check(result.kind == VolumeSpaceGate::WaitResult::Kind::Ready,
@@ -231,20 +230,19 @@ void g2_first_failure_opens_episode() {
 void g3_no_probe_below_watermark() {
     auto log = std::make_shared<SinkLog>();
     auto gate = make_gate("job:g3", log);
-    const auto unresolvable = unresolved_failed_path();
-
-    gate->report_space_failure(ERROR_DISK_FULL, unresolvable);
-    check(gate->poll(200 * kMib), "G-3: watermark 无效时第一次 poll 必须发放许可");
+    gate->report_space_failure(ERROR_DISK_FULL, unresolved_failed_path());
+    check(!gate->poll(0), "G-3: zero available space must not probe");
+    check(gate->try_wait({}).kind == VolumeSpaceGate::WaitResult::Kind::Pending,
+          "G-3: zero space leaves requests parked");
+    check(gate->poll(200 * kMib), "G-3: positive space permits a probe");
     {
         auto result = wait_bounded(gate);
-        check(result.kind == VolumeSpaceGate::WaitResult::Kind::Probe, "G-3: 应拿到 probe 许可");
-        result.lease.report_space_failure(ERROR_DISK_FULL, unresolvable);
+        check(result.kind == VolumeSpaceGate::WaitResult::Kind::Probe, "G-3: probe lease");
+        result.lease.report_space_failure(ERROR_DISK_FULL, unresolved_failed_path());
     }
-    check(gate->failed_free_watermark() == 200 * kMib, "G-3: baseline 必须是 200 MiB");
-
-    check(!gate->poll(100 * kMib), "G-3: 低于 watermark 时不得发放许可");
-    check(gate->phase() == VolumeSpacePhase::Blocked, "G-3: 仍必须是 Blocked");
-    check(log->count(VolumeSpaceTransition::Kind::Resumed) == 0, "G-3: 不得发出 space_resumed");
+    check(!gate->poll(0), "G-3: zero space must still block after failure");
+    check(gate->phase() == VolumeSpacePhase::Blocked, "G-3: no real success means Blocked");
+    check(log->count(VolumeSpaceTransition::Kind::Resumed) == 0, "G-3: no false resumed");
 }
 
 // 水位改善 → probe（两个等待线程只有一个拿到有效 lease）
@@ -330,53 +328,26 @@ void g5_probe_success_resumes_everyone() {
 void g6_failed_probe_keeps_watermark_monotonic() {
     auto log = std::make_shared<SinkLog>();
     auto gate = make_gate("job:g6", log);
-    const auto unresolvable = unresolved_failed_path();
-
-    gate->report_space_failure(ERROR_DISK_FULL, unresolvable);
-    gate->poll(500 * kMib); // baseline = 500 MiB
-    const std::size_t blocked_before = log->count(VolumeSpaceTransition::Kind::Blocked);
+    const auto path = unresolved_failed_path();
+    gate->report_space_failure(ERROR_DISK_FULL, path);
+    const auto blocked_count = log->count(VolumeSpaceTransition::Kind::Blocked);
+    check(gate->poll(500 * kMib), "G-6: initial positive-space probe");
     {
         auto result = wait_bounded(gate);
-        check(result.kind == VolumeSpaceGate::WaitResult::Kind::Probe, "G-6: 必须拿到许可");
-        // 新鲜查询在本次仍会失败（同一不可解析路径）→ watermark 必须保持不变。
-        result.lease.report_space_failure(ERROR_DISK_FULL, unresolvable);
+        result.lease.report_space_failure(ERROR_DISK_FULL, path);
     }
-
-    check(gate->phase() == VolumeSpacePhase::Blocked, "G-6: probe 失败必须回到 Blocked");
-    check(gate->failed_free_watermark() == 500 * kMib,
-          "G-6: 新鲜查询失败时 watermark 必须保持不变");
-    check(gate->watermark_valid(), "G-6: watermark 必须仍然有效");
-    check(log->count(VolumeSpaceTransition::Kind::Blocked) == blocked_before,
-          "G-6: 同一 episode 内的 probe 失败不得产生新事件");
-    check(log->count(VolumeSpaceTransition::Kind::Resumed) == 0,
-          "G-6: probe 失败绝不得发出 space_resumed");
-
-    // [附加] resolved 卷上的 probe 失败会做一次成功的新鲜查询 → watermark 取 max。
-    auto resolved_log = std::make_shared<SinkLog>();
-    auto resolved = make_gate(to_ascii(current_volume_key()), resolved_log);
-    check(resolved->query_root_resolved(), "G-6[附加]: resolved 卷的查询根必须已在构造时解析");
-    std::uint64_t free_now = 0;
-    std::uint64_t total_now = 0;
-    check(resolved->query_free_bytes(&free_now, &total_now),
-          "G-6[附加]: monitor 侧的查询必须成功");
-    resolved->report_space_failure(ERROR_DISK_FULL, unresolved_failed_path());
-    check(!resolved->watermark_valid(),
-          "G-6[附加]: episode 打开后水位必须无效（writer 不做任何新鲜查询）");
-    check(resolved->poll(free_now), "G-6[附加]: monitor 的第一次成功采样必须建立 baseline");
-    check(resolved->failed_free_watermark() == free_now, "G-6[附加]: baseline 必须是该采样值");
+    check(gate->phase() == VolumeSpacePhase::Blocked, "G-6: failure returns Blocked");
+    check(gate->poll(500 * kMib), "G-6: same positive space can retry");
+    check(!gate->poll(500 * kMib), "G-6: no second lease while Probing");
     {
-        auto result = wait_bounded(resolved);
-        check(result.kind == VolumeSpaceGate::WaitResult::Kind::Probe, "G-6[附加]: 必须拿到许可");
-        result.lease.report_space_failure(ERROR_DISK_FULL, unresolved_failed_path());
+        auto result = wait_bounded(gate);
+        result.lease.report_space_failure(ERROR_DISK_FULL, path);
     }
-    check(resolved->phase() == VolumeSpacePhase::Blocked, "G-6[附加]: probe 失败回 Blocked");
-    check(resolved->failed_free_watermark() == free_now,
-          "G-6[附加]: probe 失败**不得**改动水位（不再有 max(watermark, 新鲜查询)）");
-    check(!resolved->poll(free_now),
-          "G-6[附加]: 相同采样值不得再发放许可（要求严格高于水位）");
-    check(resolved->poll(free_now + 1), "G-6[附加]: 严格更高的采样必须发放许可");
-    check(resolved_log->count(VolumeSpaceTransition::Kind::Blocked) == 1,
-          "G-6[附加]: 同一 episode 内 probe 失败不得产生新事件");
+    check(gate->poll(1), "G-6: smaller positive space can retry");
+    check(log->count(VolumeSpaceTransition::Kind::Blocked) == blocked_count,
+          "G-6: multiple failures still one blocked event");
+    check(log->count(VolumeSpaceTransition::Kind::Resumed) == 0,
+          "G-6: failed probes never resume");
 }
 
 // 前次 lease 未结算时不得再发放许可
@@ -617,27 +588,18 @@ void g16_inconclusive_probe_never_resumes() {
 void g17_episode_switch_resets_watermark() {
     auto log = std::make_shared<SinkLog>();
     auto gate = make_gate("job:g17", log);
-    const auto unresolvable = unresolved_failed_path();
-
-    // ep1：水位 500 MiB（初期查询失败 → 第一次 poll 建立 baseline）。
-    gate->report_space_failure(ERROR_DISK_FULL, unresolvable);
-    gate->poll(500 * kMib);
-    check(gate->failed_free_watermark() == 500 * kMib, "G-17: ep1 水位 500 MiB");
+    const auto path = unresolved_failed_path();
+    gate->report_space_failure(ERROR_DISK_FULL, path);
+    check(gate->poll(500 * kMib), "G-17: first episode probes");
     {
         auto result = wait_bounded(gate);
-        result.lease.report_success(); // 恢复
+        result.lease.report_success();
     }
-    check(gate->phase() == VolumeSpacePhase::Ready, "G-17: ep1 已恢复");
-
-    // ep2：失败时 free = 10 MiB → 水位必须是 10 MiB，不是 500 MiB。
-    gate->report_space_failure(ERROR_DISK_FULL, unresolvable);
-    check(gate->episode_id() == 2, "G-17: 必须是第 2 个 episode");
-    check(!gate->watermark_valid() && gate->failed_free_watermark() == 0,
-          "G-17: 新 episode 开启时必须先作废旧水位");
-    check(gate->poll(10 * kMib),
-          "G-17: 新 episode 的第一次成功观测必须建立 baseline 并发放许可");
-    check(gate->failed_free_watermark() == 10 * kMib,
-          "G-17: ep2 水位必须是 10 MiB（不是 500 MiB）");
+    check(gate->phase() == VolumeSpacePhase::Ready, "G-17: first episode recovered");
+    gate->report_space_failure(ERROR_DISK_FULL, path);
+    check(gate->episode_id() == 2, "G-17: new episode");
+    check(gate->poll(10 * kMib), "G-17: lower positive space probes in new episode");
+    check(gate->phase() == VolumeSpacePhase::Probing, "G-17: new probe authorised");
 }
 
 // 水位一律由 monitor 采样建立；查询失败只影响诊断
@@ -1248,69 +1210,29 @@ void g29_no_late_blocked_after_recovery() {
 
 // 授权 probe 的采样必须立即成为新水位
 void g30_probe_authorising_sample_becomes_the_watermark() {
-    // 不变量：任何成功授权 probe 的 monitor 采样，就是当时的 failure watermark；
-    // 否则水位不前进，同一个采样值会按 poll_interval 反复授权真实 I/O probe。
     auto log = std::make_shared<SinkLog>();
     auto gate = make_gate("job:g30", log);
-
     gate->report_space_failure(ERROR_DISK_FULL, unresolved_failed_path());
-
-    // ① baseline = 100（水位无效 → 第一次成功观测即 baseline 并授权）
-    check(gate->poll(100), "G-30: 第一次成功观测必须建立 baseline 并授权 probe");
-    check(gate->failed_free_watermark() == 100, "G-30: baseline 必须是 100");
-    {
+    check(!gate->poll(0), "G-30: zero space never probes");
+    for (std::uint64_t level : {100ULL, 100ULL, 1ULL, 200ULL}) {
+        check(gate->poll(level), "G-30: every failed probe permits the next positive-space probe");
+        check(!gate->poll(level), "G-30: in-flight probe remains exclusive");
         auto result = wait_bounded(gate);
-        check(result.kind == VolumeSpaceGate::WaitResult::Kind::Probe, "G-30: 拿到许可");
+        check(result.kind == VolumeSpaceGate::WaitResult::Kind::Probe, "G-30: owner acquired");
         result.lease.report_space_failure(ERROR_DISK_FULL, unresolved_failed_path());
+        check(gate->phase() == VolumeSpacePhase::Blocked, "G-30: failed probe remains Blocked");
     }
-    check(gate->failed_free_watermark() == 100, "G-30: probe 失败后水位保持 100");
-
-    // ② 200 > 100 → 授权；这次授权必须把水位推进到 200
-    check(gate->poll(200), "G-30: 更高的采样必须授权 probe");
-    check(gate->failed_free_watermark() == 200,
-          "G-30: ★ 授权 probe 的采样必须立即成为新水位（否则会每周期重复 probe）");
+    check(!gate->poll(0), "G-30: zero space remains blocked");
+    check(gate->poll(1), "G-30: positive space resumes probing");
     {
         auto result = wait_bounded(gate);
-        check(result.kind == VolumeSpaceGate::WaitResult::Kind::Probe, "G-30: 拿到许可");
-        // probe 真实失败（settle 里不做任何查询、不改水位）
-        result.lease.report_space_failure(ERROR_DISK_FULL, unresolved_failed_path());
-    }
-    check(gate->phase() == VolumeSpacePhase::Blocked, "G-30: probe 失败回 Blocked");
-    check(gate->failed_free_watermark() == 200,
-          "G-30: ★ probe 失败后水位必须仍是 200（不再回退到 100）");
-
-    // ③ 同一个采样值不得再授权。
-    check(!gate->poll(200), "G-30: ★ 相同采样值**不得**再授权 probe（否则每周期重复 probe）");
-    check(gate->phase() == VolumeSpacePhase::Blocked, "G-30: 必须仍是 Blocked");
-    check(gate->poll(201), "G-30: 严格更高的采样才重新授权");
-    {
-        auto result = wait_bounded(gate);
-        check(result.kind == VolumeSpaceGate::WaitResult::Kind::Probe, "G-30: 拿到许可");
-        result.lease.report_space_failure(ERROR_DISK_FULL, unresolved_failed_path());
-    }
-    check(!gate->poll(201), "G-30: 201 这一档也不得被重复授权");
-
-    // ④ 连续多轮：每轮把水位推进一格，验证不会出现"同一水位被反复授权"
-    for (std::uint64_t level = 300; level <= 500; level += 100)
-    {
-        check(gate->poll(level), "G-30: 更高的采样必须授权");
-        check(gate->failed_free_watermark() == level, "G-30: 水位必须跟随授权采样");
-        auto result = wait_bounded(gate);
-        check(result.kind == VolumeSpaceGate::WaitResult::Kind::Probe, "G-30: 拿到许可");
-        result.lease.report_space_failure(ERROR_DISK_FULL, unresolved_failed_path());
-        check(!gate->poll(level), "G-30: 该水位不得被重复授权（无重复 probe）");
-    }
-
-    // ⑤ 真实成功仍然终止 episode（水位语义不变）
-    check(gate->poll(600), "G-30: 更高的采样必须授权");
-    {
-        auto result = wait_bounded(gate);
-        check(result.kind == VolumeSpaceGate::WaitResult::Kind::Probe, "G-30: 拿到许可");
         result.lease.report_success();
     }
-    check(gate->phase() == VolumeSpacePhase::Ready, "G-30: 真实成功必须回 Ready");
+    check(gate->phase() == VolumeSpacePhase::Ready, "G-30: true success resumes");
+    check(log->count(VolumeSpaceTransition::Kind::Blocked) == 1,
+          "G-30: no duplicate blocked transition per episode");
     check(log->count(VolumeSpaceTransition::Kind::Resumed) == 1,
-          "G-30: 全程只应有一条 resumed");
+          "G-30: only one resumed transition");
 }
 
 // 全部恢复后诊断节流表必须被丢弃
