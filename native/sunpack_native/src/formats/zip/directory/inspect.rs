@@ -1,13 +1,30 @@
+fn zip_inspection_bytes(
+    py: Python<'_>,
+    path: &str,
+    result: &Bound<'_, PyDict>,
+) -> PyResult<Option<crate::io::scratch::Blob>> {
+    match py.detach(|| crate::io::scratch::Blob::open_read_only(path)) {
+        Ok(data) => Ok(Some(data)),
+        Err(error) => {
+            let memory = crate::io::resource_error::is_memory_error(&error);
+            result.set_item("error", if memory { "out_of_memory" } else { "os_error" })?;
+            if memory {
+                result.set_item("failure_kind", "resource_unavailable")?;
+            }
+            result.set_item("message", error.to_string())?;
+            result.set_item("os_error", error.raw_os_error())?;
+            Ok(None)
+        }
+    }
+}
+
 pub(crate) fn inspect_zip_directory_consistency(
     py: Python<'_>,
     path: &str,
     max_entries: usize,
 ) -> PyResult<Py<PyDict>> {
     let result = zip_directory_consistency_empty(py)?;
-    let Ok(data) =
-        crate::io::reader::ManagedReader::open(path).and_then(|reader| reader.read_all())
-    else {
-        result.set_item("error", "os_error")?;
+    let Some(data) = zip_inspection_bytes(py, path, &result)? else {
         return Ok(result.unbind());
     };
     result.set_item("file_size", data.len())?;
@@ -50,20 +67,20 @@ pub(crate) fn inspect_zip_directory_consistency(
         return Ok(result.unbind());
     }
 
-    let all_entries = parse_central_directory_entries(&data, physical_cd_offset, cd_end);
-    let checked_entries = all_entries.iter().take(max_entries).collect::<Vec<_>>();
-    result.set_item("cd_parseable", !all_entries.is_empty())?;
+    let (entry_count, checked_entries) =
+        parse_central_directory_entries(&data, physical_cd_offset, cd_end, max_entries);
+    result.set_item("cd_parseable", entry_count != 0)?;
     result.set_item("cd_entries_checked", checked_entries.len())?;
-    result.set_item("cd_entries_parseable", all_entries.len())?;
+    result.set_item("cd_entries_parseable", entry_count)?;
     result.set_item(
         "cd_entries_truncated_by_limit",
-        all_entries.len() > checked_entries.len(),
+        entry_count > checked_entries.len(),
     )?;
     result.set_item(
         "entry_count_delta",
-        all_entries.len() as i64 - resolved.total_entries as i64,
+        entry_count as i64 - resolved.total_entries as i64,
     )?;
-    if all_entries.is_empty() {
+    if entry_count == 0 {
         result.set_item("error", "no_central_directory_entries_parseable")?;
         return Ok(result.unbind());
     }
@@ -613,12 +630,7 @@ pub(crate) fn inspect_zip_directory_consistency(
     )?;
     zip64.set_item(
         "zip64_eocd_field_mismatch_count",
-        zip_inspect_zip64_eocd_mismatch_count(
-            zip64_eocd,
-            physical_cd_offset,
-            cd_end,
-            all_entries.len(),
-        ),
+        zip_inspect_zip64_eocd_mismatch_count(zip64_eocd, physical_cd_offset, cd_end, entry_count),
     )?;
     zip64.set_item("zip64_extra_present_count", zip64_extra_present)?;
     zip64.set_item("zip64_extra_size_mismatch_count", zip64_extra_size_mismatch)?;
@@ -652,10 +664,7 @@ pub(crate) fn inspect_zip_structure_graph(
     result.set_item("explanations", &explanations)?;
     result.set_item("summary", &summary)?;
 
-    let Ok(data) =
-        crate::io::reader::ManagedReader::open(path).and_then(|reader| reader.read_all())
-    else {
-        result.set_item("error", "os_error")?;
+    let Some(data) = zip_inspection_bytes(py, path, &result)? else {
         summary.set_item("archive_readable", false)?;
         return Ok(result.unbind());
     };
@@ -822,17 +831,17 @@ pub(crate) fn inspect_zip_structure_graph(
         )?;
     }
 
-    let all_entries = parse_central_directory_entries(&data, physical_cd_offset, cd_end);
-    let checked_entries = all_entries.iter().take(max_entries).collect::<Vec<_>>();
-    result.set_item("truncated", all_entries.len() > checked_entries.len())?;
-    summary.set_item("cd_entry_count", all_entries.len())?;
+    let (entry_count, checked_entries) =
+        parse_central_directory_entries(&data, physical_cd_offset, cd_end, max_entries);
+    result.set_item("truncated", entry_count > checked_entries.len())?;
+    summary.set_item("cd_entry_count", entry_count)?;
     summary.set_item("cd_entries_checked", checked_entries.len())?;
     summary.set_item(
         "entry_count_delta",
-        all_entries.len() as i64 - resolved.total_entries as i64,
+        entry_count as i64 - resolved.total_entries as i64,
     )?;
     let mut eocd_entry_count_mismatch = 0usize;
-    if all_entries.len() as u64 != resolved.total_entries {
+    if entry_count as u64 != resolved.total_entries {
         eocd_entry_count_mismatch = 1;
         zip_graph_violation(
             py,
@@ -842,12 +851,12 @@ pub(crate) fn inspect_zip_structure_graph(
             cd_id,
             "eocd.entry_count",
             &resolved.total_entries.to_string(),
-            &all_entries.len().to_string(),
-            all_entries.len() as i64 - resolved.total_entries as i64,
+            &entry_count.to_string(),
+            entry_count as i64 - resolved.total_entries as i64,
             "medium",
         )?;
         let declared_entries = resolved.total_entries.to_string();
-        let parsed_entries = all_entries.len().to_string();
+        let parsed_entries = entry_count.to_string();
         let disk_entries = resolved.disk_entries.to_string();
         zip_graph_relation_violation(
             py,
@@ -860,7 +869,7 @@ pub(crate) fn inspect_zip_structure_graph(
             "counts_entries",
             0,
             resolved.total_entries,
-            all_entries.len() as u64,
+            entry_count as u64,
             "eocd.entry_count",
             0.95,
             "high",
@@ -2114,12 +2123,8 @@ pub(crate) fn inspect_zip_structure_graph(
             locator.zip64_eocd_offset == tail.offset as u64 && locator.total_disks >= 1
         })
     });
-    let zip64_eocd_mismatch = zip_inspect_zip64_eocd_mismatch_count(
-        zip64_eocd,
-        physical_cd_offset,
-        cd_end,
-        all_entries.len(),
-    );
+    let zip64_eocd_mismatch =
+        zip_inspect_zip64_eocd_mismatch_count(zip64_eocd, physical_cd_offset, cd_end, entry_count);
     summary.set_item(
         "zip64_locator_mismatch_count",
         if zip64_locator_mismatch { 1 } else { 0 },

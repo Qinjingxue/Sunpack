@@ -18,6 +18,17 @@ pub(crate) enum Blob {
     Memory(Vec<u8>),
     Mapped(Mapping),
 }
+impl Blob {
+    /// Diagnostic slice-based parsers can borrow a file mapping rather than
+    /// copying the entire archive (including payload) into committed heap.
+    pub(crate) fn open_read_only(path: &str) -> io::Result<Self> {
+        let file = TrackedFile::open_reader(path, "analysis_mapping")?;
+        if file.metadata()?.len() == 0 {
+            return Ok(Self::Memory(Vec::new()));
+        }
+        Ok(Self::Mapped(Mapping::new(&file, false)?))
+    }
+}
 impl Deref for Blob {
     type Target = [u8];
     fn deref(&self) -> &[u8] {
@@ -103,7 +114,14 @@ impl Write for Spool {
         }
         let written = match self.file.as_mut() {
             Some(file) => file.write(bytes),
-            None => self.memory.write(bytes),
+            None => {
+                let end = self.memory.position() as usize + bytes.len();
+                let additional = end.saturating_sub(self.memory.get_ref().len());
+                self.memory.get_mut().try_reserve(additional).map_err(|_| {
+                    io::Error::new(io::ErrorKind::OutOfMemory, "scratch buffer allocation failed")
+                })?;
+                self.memory.write(bytes)
+            }
         }?;
         self.position += written as u64;
         self.length = self.length.max(self.position);

@@ -2,10 +2,10 @@ fn decompress_sample<R: Read>(
     format: &str,
     reader: R,
     max_output: usize,
-) -> Result<Vec<u8>, &'static str> {
+) -> io::Result<Vec<u8>> {
     let mut output = Vec::new();
     let result = match format {
-        "lz4" => return crate::formats::lz4::sample(reader, max_output),
+        "lz4" => return crate::formats::lz4::sample(reader, max_output).map_err(io::Error::other),
         "gzip" => GzDecoder::new(reader)
             .take(max_output as u64)
             .read_to_end(&mut output),
@@ -16,12 +16,12 @@ fn decompress_sample<R: Read>(
             .take(max_output as u64)
             .read_to_end(&mut output),
         "zstd" => {
-            let decoder = ZstdDecoder::new(reader).map_err(|_| "zstd_decoder_init_failed")?;
+            let decoder = ZstdDecoder::new(reader)?;
             decoder.take(max_output as u64).read_to_end(&mut output)
         }
-        _ => return Err("unsupported_compression_format"),
+        _ => return Err(io::Error::other("unsupported_compression_format")),
     };
-    result.map_err(|_| "decompression_probe_failed")?;
+    result?;
     Ok(output)
 }
 

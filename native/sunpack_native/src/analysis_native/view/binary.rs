@@ -161,7 +161,11 @@ impl AnalysisBinaryView {
                 stream.set_item("inner_tar_ustar", ustar)?;
             }
             Err(error) => {
-                stream.set_item("tar_probe_error", error)?;
+                stream.set_item("tar_probe_error", if crate::io::resource_error::is_memory_error(&error) {
+                    "out_of_memory"
+                } else { "decompression_probe_failed" })?;
+                stream.set_item("tar_probe_message", error.to_string())?;
+                stream.set_item("tar_probe_os_error", error.raw_os_error())?;
             }
         }
         Ok(stream.unbind())

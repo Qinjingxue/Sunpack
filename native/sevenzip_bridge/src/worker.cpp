@@ -15,6 +15,7 @@
 #include <iomanip>
 #include <iostream>
 #include <memory>
+#include <new>
 #include <mutex>
 #include <deque>
 #include <limits>
@@ -2153,6 +2154,16 @@ private:
                 } else {
                     code = run_request(job.request, nullptr, job.cancel_token);
                 }
+                } catch (const std::bad_alloc&) {
+                    // Best effort at the task boundary; no per-allocation
+                    // handlers or reserve-memory recovery machinery.
+                    code = 2;
+                    print_json_line(
+                        "{\"type\":\"result\",\"job_id\":\"" + json_escape(job_id) +
+                        "\",\"status\":\"failed\",\"native_status\":\"error\","
+                        "\"failure_kind\":\"resource_unavailable\",\"failure_stage\":\"worker_job\","
+                        "\"hresult\":-2147024882,\"hresult_hex\":\"0x8007000e\","
+                        "\"message\":\"insufficient memory to process archive\"}");
                 } catch (...) {
                     code = -100;
                 }

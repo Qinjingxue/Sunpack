@@ -451,11 +451,18 @@ fn decode_lzma(
         let dict_size = u32::from_le_bytes(coder.properties[1..5].try_into().unwrap());
         let reader = LzmaReader::new_with_props(
             compressed, unpack_size, coder.properties[0], dict_size, None,
-        ).map_err(|error| format!("encoded_header_decoder_unsupported_method:{error}"))?;
+        ).map_err(|error| {
+            if crate::io::resource_error::is_memory_error(&error) { resource_error(error) }
+            else { format!("encoded_header_decoder_unsupported_method:{error}") }
+        })?;
         return collect_decoded(reader, unpack_size);
     }
     let dict_size = coder.properties.first().and_then(|value| lzma2_dict_size(*value))
         .ok_or_else(|| "encoded_header_decoder_unsupported_method".to_string())?;
+    // This folder's complete output size is known, and there is no preset
+    // dictionary. No valid backward reference can exceed the bytes produced.
+    // Keep the decoder's alignment/minimum; this is not a format size limit.
+    let dict_size = u64::from(dict_size).min(unpack_size.max(4096)) as u32;
     collect_decoded(Lzma2Reader::new(compressed, dict_size, None), unpack_size)
 }
 
@@ -722,6 +729,14 @@ mod encoded_folder_graph_tests {
             assert!(decode(&packed, wrong_size).is_err());
         }
         assert!(decode(&packed[..packed.len() - 1], 512).is_err());
+        // A large advertised dictionary does not imply a large history for a
+        // known, complete 512-byte folder. This also covers the maximum prop.
+        let mut large_dictionary = coder;
+        large_dictionary.properties[0] = 40;
+        assert_eq!(
+            decode_seven_zip_encoded_coder(Cow::Borrowed(packed.as_slice()), &large_dictionary, None, 512).unwrap(),
+            b"test".repeat(128)
+        );
     }
 
     #[test]

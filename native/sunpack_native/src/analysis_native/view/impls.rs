@@ -547,6 +547,11 @@ impl AnalysisBinaryView {
         total_entries: usize,
         disk_starts: Option<&[u64]>,
     ) -> PyResult<ZipDirectoryWalk> {
+        // Independent bounded windows retain directory and local-header locality
+        // without making a one-pass validation occupy the global block cache.
+        let mut directory =
+            std::io::BufReader::with_capacity(64 * 1024, self.reader.stream_cursor());
+        let mut locals = std::io::BufReader::with_capacity(64 * 1024, self.reader.stream_cursor());
         let mut cursor = physical_central_offset;
         let end = physical_central_offset + central_directory_size;
         let mut walk = ZipDirectoryWalk::default();
@@ -554,7 +559,7 @@ impl AnalysisBinaryView {
             if cursor.saturating_add(46) > end {
                 return Ok(walk.failed(index, false, "central_directory_entry_out_of_range"));
             }
-            let header = self.read_at_bytes(cursor, 46)?;
+            let header = zip_window_read(&mut directory, cursor, 46)?;
             if header.len() < 46 || &header[0..4] != ZIP_CENTRAL {
                 return Ok(walk.failed(index, false, "bad_central_directory_entry_signature"));
             }
@@ -575,7 +580,7 @@ impl AnalysisBinaryView {
             let extra = if extra_len == 0 {
                 Vec::new()
             } else {
-                self.read_at_bytes(cursor + 46 + filename_len, extra_len)?
+                zip_window_read(&mut directory, cursor + 46 + filename_len, extra_len)?
             };
             let Some(location) = crate::formats::zip::zip64::central_entry_values(&header, &extra)
             else {
@@ -592,7 +597,8 @@ impl AnalysisBinaryView {
             // Fetch once for both link validation and the existing bounded CRC
             // consistency hint. Later entries only need their four-byte signature.
             let check_crc = index < 8 && walk.content_warning.is_empty();
-            let local = self.read_at_bytes(local_logical, if check_crc { 30 } else { 4 })?;
+            let local =
+                zip_window_read(&mut locals, local_logical, if check_crc { 30 } else { 4 })?;
             if local.len() < 4 || &local[..4] != ZIP_LOCAL {
                 return Ok(walk.failed(index + 1, true, "local_header_link_mismatch"));
             }
@@ -611,7 +617,7 @@ impl AnalysisBinaryView {
         walk.entries_checked = total_entries;
         walk.directory_ok =
             crate::formats::zip::central_directory_complete(cursor, end, |offset, length| {
-                self.read_at_bytes(offset, length)
+                zip_window_read(&mut directory, offset, length)
             })?;
         walk.links_ok = walk.directory_ok;
         if !walk.directory_ok {
@@ -1101,4 +1107,31 @@ impl ZipDirectoryWalk {
         self.error = error;
         self
     }
+}
+
+// seek_relative preserves bytes already buffered when ZIP records are nearby.
+fn zip_window_read(
+    reader: &mut std::io::BufReader<crate::io::reader::SourceCursor>,
+    offset: u64,
+    length: usize,
+) -> PyResult<Vec<u8>> {
+    use std::io::{Seek, SeekFrom};
+    let current = reader.stream_position()?;
+    if let Ok(delta) = i64::try_from(i128::from(offset) - i128::from(current)) {
+        reader.seek_relative(delta)?;
+    } else {
+        reader.seek(SeekFrom::Start(offset))?;
+    }
+    let mut bytes = crate::io::resource_error::zeroed_bytes(length)?;
+    let mut used = 0;
+    while used < length {
+        match reader.read(&mut bytes[used..]) {
+            Ok(0) => break,
+            Ok(count) => used += count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(reader_error_to_py(error)),
+        }
+    }
+    bytes.truncate(used);
+    Ok(bytes)
 }

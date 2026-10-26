@@ -29,6 +29,20 @@ def classify_extract_failure(
     err_lower = _norm(err_text)
     worker_result = worker_result_payload(run_result)
     if worker_result:
+        # Resource failures take precedence over handler guesses about damage,
+        # encryption or unsupported methods. Preserve the native evidence.
+        diagnostics = worker_result.get("diagnostics") or {}
+        hresult = worker_result.get("hresult", diagnostics.get("hresult"))
+        memory_hresult = isinstance(hresult, int) and (hresult & 0xFFFFFFFF) in {
+            0x80070008, 0x8007000E, 0x800705AF,
+        }
+        if worker_result.get("failure_kind") == "resource_unavailable" or memory_hresult:
+            return _failure(FailureKind.RESOURCE_UNAVAILABLE, "failure.out_of_memory", details={
+                "failure_kind": "resource_unavailable",
+                "failure_stage": worker_result.get("failure_stage", diagnostics.get("failure_stage", "")),
+                "hresult": hresult,
+                "message": worker_result.get("message", ""),
+            })
         if worker_result.get("missing_volume"):
             return _failure(
                 FailureKind.MISSING_VOLUME,
@@ -88,6 +102,13 @@ def classify_extract_failure(
 
     diagnostics = getattr(run_result, "worker_diagnostics", None)
     process_failure = diagnostics.get("process_failure") if isinstance(diagnostics, dict) else None
+    code = getattr(run_result, "returncode", None)
+    if isinstance(code, int) and (code & 0xFFFFFFFF) in {0xC0000017, 0xC000012D}:
+        return _failure(FailureKind.RESOURCE_UNAVAILABLE, "failure.out_of_memory", details={
+            "failure_stage": "worker_process",
+            "exit_code": code,
+            "exit_code_hex": f"0x{code & 0xFFFFFFFF:08X}",
+        })
     if isinstance(process_failure, dict) and process_failure:
         # A worker that exited without a structured result has not supplied
         # evidence of archive damage. Its stderr is diagnostic text, not a

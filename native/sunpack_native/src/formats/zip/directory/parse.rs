@@ -183,26 +183,31 @@ fn parse_central_directory_entries(
     data: &[u8],
     offset: usize,
     expected_end: usize,
-) -> Vec<CentralEntry> {
+    max_entries: usize,
+) -> (usize, Vec<CentralEntry>) {
     let mut entries = Vec::new();
     let mut pos = offset;
+    let mut count = 0;
     while let Some(record) = parse_central_directory_record(data, pos, expected_end) {
-        entries.push(CentralEntry {
-            offset: record.offset,
-            flags: record.flags,
-            method: record.method,
-            crc32: record.crc32,
-            compressed_size: record.compressed_size,
-            uncompressed_size: record.uncompressed_size,
-            name_len: record.name_len,
-            extra_len: record.extra_len,
-            name: record.name.to_vec(),
-            extra: record.extra.to_vec(),
-            extra_offset: record.extra_offset,
-            disk_number_start: record.disk_number_start,
-            local_header_offset: record.local_header_offset,
-        });
+        if count < max_entries {
+            entries.push(CentralEntry {
+                offset: record.offset,
+                flags: record.flags,
+                method: record.method,
+                crc32: record.crc32,
+                compressed_size: record.compressed_size,
+                uncompressed_size: record.uncompressed_size,
+                name_len: record.name_len,
+                extra_len: record.extra_len,
+                name: record.name.to_vec(),
+                extra: record.extra.to_vec(),
+                extra_offset: record.extra_offset,
+                disk_number_start: record.disk_number_start,
+                local_header_offset: record.local_header_offset,
+            });
+        }
+        count += 1;
         pos = record.end;
     }
-    entries
+    (count, entries)
 }

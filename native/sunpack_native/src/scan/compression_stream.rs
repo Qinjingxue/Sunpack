@@ -1554,6 +1554,7 @@ pub(crate) fn validate_xz_structure_exact(
     let mut reverse_end = limit;
     let mut streams_reversed = 0usize;
     let mut total_blocks = 0usize;
+    let mut decoded_size = Some(0u64);
     let mut checksum_present = false;
     while reverse_end > offset {
         let mut padding = 0u64;
@@ -1581,6 +1582,7 @@ pub(crate) fn validate_xz_structure_exact(
         for _ in 0..index.record_count {
             let unpadded = read_vli(|| index.records.read_byte())?;
             let uncompressed = read_vli(|| index.records.read_byte())?;
+            decoded_size = decoded_size.and_then(|total| total.checked_add(uncompressed));
             let size_byte = reader.read_cached_at(block_cursor, 1)?;
             if size_byte.len() != 1 || size_byte[0] == 0 {
                 return invalid("xz_block_header_missing");
@@ -1676,7 +1678,7 @@ pub(crate) fn validate_xz_structure_exact(
         end_offset: limit,
         stream_count: streams_reversed,
         block_count: total_blocks,
-        decoded_size: None,
+        decoded_size,
         integrity: if checksum_present {
             IntegrityStatus::Deferred
         } else {

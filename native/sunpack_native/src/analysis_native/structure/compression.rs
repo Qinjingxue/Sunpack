@@ -612,7 +612,7 @@ fn inspect_compression_stream_identity_impl(path: &str) -> CompressionIdentityRe
     )
 }
 
-fn inspect_large_structural_stream(
+fn inspect_structural_stream(
     py: Python<'_>,
     path: &str,
     file_size: u64,
@@ -650,11 +650,9 @@ fn inspect_large_structural_stream(
     };
     let reader = match py.detach(|| ManagedReader::open(path)) {
         Ok(value) => value,
-        Err(_) => return compression_empty(py, "os_error", format, ext, false),
+        Err(error) => return Err(crate::io::resource_error::to_py_error(error)),
     };
-    let head = py
-        .detach(|| reader.read_cached_at(0, magic.len()))
-        .unwrap_or_default();
+    let head = py.detach(|| reader.read_cached_at(0, magic.len()))?;
     let magic_matched = head.starts_with(magic);
     let d = compression_base(py, format, ext, magic_matched)?;
     for field in fields {
@@ -672,6 +670,9 @@ fn inspect_large_structural_stream(
     let structure = match validation {
         Ok(value) => value,
         Err(error) => {
+            if let crate::scan::compression_stream::ValidationError::Io(error) = error {
+                return Err(crate::io::resource_error::to_py_error(error));
+            }
             let code = error.code();
             d.set_item("structure_status", "invalid")?;
             d.set_item("structure_validation_complete", false)?;
@@ -737,12 +738,7 @@ fn apply_structural_contract(
 ) -> PyResult<()> {
     let reader = match d.py().detach(|| ManagedReader::open(path)) {
         Ok(value) => value,
-        Err(_) => {
-            d.set_item("structure_status", "invalid")?;
-            d.set_item("structure_validation_complete", false)?;
-            d.set_item("boundary_exact", false)?;
-            return Ok(());
-        }
+        Err(error) => return Err(crate::io::resource_error::to_py_error(error)),
     };
     let validation = d.py().detach(|| match kind {
         StructuralStreamKind::Gzip => validate_gzip_structure(&reader, 0, validation_limit),
@@ -776,6 +772,9 @@ fn apply_structural_contract(
             project_structural_validation(d, &structure, file_size)?;
         }
         Err(error) => {
+            if let crate::scan::compression_stream::ValidationError::Io(error) = error {
+                return Err(crate::io::resource_error::to_py_error(error));
+            }
             let code = error.code();
             if !damage_flags.contains(&code) {
                 damage_flags.push(code);
@@ -840,22 +839,18 @@ fn hex_bytes(value: &[u8]) -> String {
     value.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn inspect_gzip(py: Python<'_>, path: &str, header: &[u8], file_size: u64) -> PyResult<Py<PyDict>> {
+fn inspect_gzip(
+    py: Python<'_>,
+    path: &str,
+    _header: &[u8],
+    file_size: u64,
+) -> PyResult<Py<PyDict>> {
     if file_size > EAGER_STREAM_INTEGRITY_MAX_BYTES {
-        return inspect_large_structural_stream(py, path, file_size, StructuralStreamKind::Gzip);
+        return inspect_structural_stream(py, path, file_size, StructuralStreamKind::Gzip);
     }
-    let data = match py.detach(|| ManagedReader::open(path).and_then(|reader| reader.read_all())) {
-        Ok(data) => data,
-        Err(_) => {
-            return compression_empty(
-                py,
-                "os_error",
-                "gzip",
-                ".gz",
-                header.starts_with(b"\x1f\x8b"),
-            )
-        }
-    };
+    let data = py
+        .detach(|| ManagedReader::open(path).and_then(|reader| reader.read_all()))
+        .map_err(crate::io::resource_error::to_py_error)?;
     let d = compression_base(py, "gzip", ".gz", data.starts_with(b"\x1f\x8b"))?;
     let mut damage_flags = Vec::new();
     d.set_item(
@@ -1083,18 +1078,15 @@ fn bzip_huffman_summary(data: &[u8], start_bit: usize) -> String {
 fn inspect_bzip2(
     py: Python<'_>,
     path: &str,
-    header: &[u8],
+    _header: &[u8],
     file_size: u64,
 ) -> PyResult<Py<PyDict>> {
     if file_size > EAGER_STREAM_INTEGRITY_MAX_BYTES {
-        return inspect_large_structural_stream(py, path, file_size, StructuralStreamKind::Bzip2);
+        return inspect_structural_stream(py, path, file_size, StructuralStreamKind::Bzip2);
     }
-    let data = match py.detach(|| ManagedReader::open(path).and_then(|reader| reader.read_all())) {
-        Ok(data) => data,
-        Err(_) => {
-            return compression_empty(py, "os_error", "bzip2", ".bz2", header.starts_with(b"BZh"))
-        }
-    };
+    let data = py
+        .detach(|| ManagedReader::open(path).and_then(|reader| reader.read_all()))
+        .map_err(crate::io::resource_error::to_py_error)?;
     let magic = data.starts_with(b"BZh") && data.get(3).is_some_and(|v| b"123456789".contains(v));
     let d = compression_base(py, "bzip2", ".bz2", magic)?;
     let mut damage_flags = Vec::new();
@@ -1480,16 +1472,13 @@ mod xz_bounds_tests {
     }
 }
 
-fn inspect_xz(py: Python<'_>, path: &str, header: &[u8], file_size: u64) -> PyResult<Py<PyDict>> {
+fn inspect_xz(py: Python<'_>, path: &str, _header: &[u8], file_size: u64) -> PyResult<Py<PyDict>> {
     if file_size > EAGER_STREAM_INTEGRITY_MAX_BYTES {
-        return inspect_large_structural_stream(py, path, file_size, StructuralStreamKind::Xz);
+        return inspect_structural_stream(py, path, file_size, StructuralStreamKind::Xz);
     }
-    let data = match py.detach(|| ManagedReader::open(path).and_then(|reader| reader.read_all())) {
-        Ok(data) => data,
-        Err(_) => {
-            return compression_empty(py, "os_error", "xz", ".xz", header.starts_with(XZ_MAGIC))
-        }
-    };
+    let data = py
+        .detach(|| ManagedReader::open(path).and_then(|reader| reader.read_all()))
+        .map_err(crate::io::resource_error::to_py_error)?;
     let d = compression_base(py, "xz", ".xz", data.starts_with(XZ_MAGIC))?;
     let mut damage_flags = Vec::new();
     d.set_item(
@@ -1667,12 +1656,9 @@ fn inspect_xz(py: Python<'_>, path: &str, header: &[u8], file_size: u64) -> PyRe
     let after_footer = footer_start + 12;
     let zero_padding = data[after_footer..].iter().take_while(|b| **b == 0).count();
     let aligned_padding = zero_padding - zero_padding % 4;
-    let stream_end = after_footer + aligned_padding;
-    let mut decoder = xz2::read::XzDecoder::new_multi_decoder(Cursor::new(&data[..stream_end]));
-    let (decoded_size, decode_status) = py.detach(|| count_decoded(&mut decoder));
-    let decode_limited = decoded_size > STREAM_STRUCTURE_DECODE_MAX_BYTES;
-    let decode_ok = decode_status.is_ok() && !decode_limited;
-    d.set_item("block.uncompressed_data", decoded_size)?;
+    // Structure analysis does not need an LZMA dictionary. The Index already
+    // provides decoded sizes; payload checks remain deferred until extraction.
+    d.set_item("block.uncompressed_data", records.uncompressed)?;
     let stream_count = py.detach(|| data.windows(6).filter(|w| *w == XZ_MAGIC).count());
     d.set_item("archive.stream_sequence", stream_count)?;
     d.set_item("stream.padding", aligned_padding)?;
@@ -1681,7 +1667,7 @@ fn inspect_xz(py: Python<'_>, path: &str, header: &[u8], file_size: u64) -> PyRe
     if trailing > 0 {
         damage_flags.push("trailing_junk");
     }
-    let valid = (decode_ok || decode_limited) && &footer[10..12] == b"YZ" && index_valid_start;
+    let valid = &footer[10..12] == b"YZ" && index_valid_start;
     d.set_item("plausible", valid)?;
     d.set_item("confidence", if valid { "strong" } else { "medium" })?;
     if !valid {
@@ -1693,9 +1679,12 @@ fn inspect_xz(py: Python<'_>, path: &str, header: &[u8], file_size: u64) -> PyRe
         file_size,
         (after_footer + aligned_padding) as u64,
         StructuralStreamKind::Xz,
-        decode_ok.then_some(stream_end as u64),
+        None,
         &mut damage_flags,
     )?;
+    if let Some(size) = d.get_item("structure.decoded_size")? {
+        d.set_item("block.uncompressed_data", size)?;
+    }
     d.set_item("damage_flags", PyList::new(py, damage_flags)?)?;
     d.set_item("file_size", file_size)?;
     finish_fields(&d, XZ_FIELDS)?;
@@ -1721,22 +1710,18 @@ fn little_uint(data: &[u8]) -> u64 {
         .fold(0u64, |v, (i, b)| v | ((*b as u64) << (8 * i)))
 }
 
-fn inspect_zstd(py: Python<'_>, path: &str, header: &[u8], file_size: u64) -> PyResult<Py<PyDict>> {
+fn inspect_zstd(
+    py: Python<'_>,
+    path: &str,
+    _header: &[u8],
+    file_size: u64,
+) -> PyResult<Py<PyDict>> {
     if file_size > EAGER_STREAM_INTEGRITY_MAX_BYTES {
-        return inspect_large_structural_stream(py, path, file_size, StructuralStreamKind::Zstd);
+        return inspect_structural_stream(py, path, file_size, StructuralStreamKind::Zstd);
     }
-    let data = match py.detach(|| ManagedReader::open(path).and_then(|reader| reader.read_all())) {
-        Ok(data) => data,
-        Err(_) => {
-            return compression_empty(
-                py,
-                "os_error",
-                "zstd",
-                ".zst",
-                header.starts_with(ZSTD_MAGIC),
-            )
-        }
-    };
+    let data = py
+        .detach(|| ManagedReader::open(path).and_then(|reader| reader.read_all()))
+        .map_err(crate::io::resource_error::to_py_error)?;
     let d = compression_base(py, "zstd", ".zst", data.starts_with(ZSTD_MAGIC))?;
     let mut damage_flags = Vec::new();
     d.set_item("frame.magic", hex_bytes(data.get(..4).unwrap_or(&[])))?;
@@ -1869,18 +1854,8 @@ fn inspect_zstd(py: Python<'_>, path: &str, header: &[u8], file_size: u64) -> Py
     } else {
         d.set_item("frame.content_checksum", "absent")?;
     }
-    let mut decoded_size = 0;
-    let (decode_ok, decode_limited) =
-        match zstd::stream::read::Decoder::new(Cursor::new(&data[..cursor])) {
-            Ok(mut decoder) => {
-                let (count, status) = py.detach(|| count_decoded(&mut decoder));
-                decoded_size = count;
-                let limited = decoded_size > STREAM_STRUCTURE_DECODE_MAX_BYTES;
-                (status.is_ok() && !limited, limited)
-            }
-            Err(_) => (false, false),
-        };
-    d.set_item("frame.decoded_content", decoded_size)?;
+    // Inspect frame/block headers without allocating the advertised window.
+    d.set_item("frame.decoded_content", "not_decoded")?;
     d.set_item(
         "frame.sequence",
         py.detach(|| data.windows(4).filter(|w| *w == ZSTD_MAGIC).count()),
@@ -1910,7 +1885,7 @@ fn inspect_zstd(py: Python<'_>, path: &str, header: &[u8], file_size: u64) -> Py
     d.set_item("archive.trailing_data", trailing)?;
     // The canonical walk below owns the tail: subsequent frames and skippable
     // frames are part of this logical stream, not trailing junk.
-    let valid = (decode_ok || decode_limited) && last && descriptor & 0x08 == 0;
+    let valid = last && descriptor & 0x08 == 0;
     d.set_item("plausible", valid)?;
     d.set_item("confidence", if valid { "strong" } else { "medium" })?;
     if descriptor & 0x08 != 0 {
@@ -1930,7 +1905,7 @@ fn inspect_zstd(py: Python<'_>, path: &str, header: &[u8], file_size: u64) -> Py
         file_size,
         file_size,
         StructuralStreamKind::Zstd,
-        (decode_ok && checksum).then_some(cursor as u64),
+        None,
         &mut damage_flags,
     )?;
     d.set_item("damage_flags", PyList::new(py, damage_flags)?)?;

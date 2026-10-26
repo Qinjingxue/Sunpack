@@ -317,7 +317,10 @@ impl ManagedReader {
                 .fetch_add(data.len() as u64, Ordering::Relaxed);
             return Ok(data);
         }
-        Ok(self.read_cached_at(offset, read_len)?.as_slice().to_vec())
+        let cached = self.read_cached_at(offset, read_len)?;
+        let mut data = crate::io::resource_error::bytes_with_capacity(cached.len())?;
+        data.extend_from_slice(cached.as_slice());
+        Ok(data)
     }
 
     /// One-shot bounded probes bypass the shared block cache while retaining
@@ -460,7 +463,7 @@ impl ManagedReader {
             return Ok(CachedBytes::Slice(slices.remove(0)));
         }
         let total = slices.iter().map(|slice| slice.len()).sum();
-        let mut data = Vec::with_capacity(total);
+        let mut data = crate::io::resource_error::bytes_with_capacity(total)?;
         for slice in slices {
             data.extend_from_slice(&slice);
         }
@@ -482,7 +485,7 @@ impl ManagedReader {
         }
 
         let slices = self.read_request_source_slices_at(offset, read_len)?;
-        let data = coalesce_cached_slices(slices);
+        let data = coalesce_cached_slices(slices)?;
         self.lock_inner()?
             .store_cache_entry(key, data.clone(), self.state.config.cache_bytes);
         Ok(data)
@@ -792,9 +795,9 @@ impl NativeArchiveSession {
     }
 }
 
-fn coalesce_cached_slices(mut slices: Vec<CachedSlice>) -> CachedSlice {
+fn coalesce_cached_slices(mut slices: Vec<CachedSlice>) -> io::Result<CachedSlice> {
     if slices.len() == 1 {
-        return slices.remove(0);
+        return Ok(slices.remove(0));
     }
 
     #[cfg(test)]
@@ -803,11 +806,11 @@ fn coalesce_cached_slices(mut slices: Vec<CachedSlice>) -> CachedSlice {
     }
 
     let total = slices.iter().map(|slice| slice.len()).sum();
-    let mut data = Vec::with_capacity(total);
+    let mut data = crate::io::resource_error::bytes_with_capacity(total)?;
     for slice in slices {
         data.extend_from_slice(&slice);
     }
-    CachedSlice::from_vec(data)
+    Ok(CachedSlice::from_vec(data))
 }
 
 impl ReaderInner {
@@ -1092,7 +1095,7 @@ impl ByteSource for FileSource {
 
         let first = offset / BLOCK_SIZE as u64;
         let last = (offset + len as u64 - 1) / BLOCK_SIZE as u64;
-        let mut output = Vec::with_capacity(len);
+        let mut output = crate::io::resource_error::bytes_with_capacity(len)?;
         for index in first..=last {
             let block = manager().read_block(self, index)?;
             let block_start = index * BLOCK_SIZE as u64;
@@ -1267,6 +1270,31 @@ struct MultiVolumeSource {
 }
 
 impl MultiVolumeSource {
+    fn read_into_mode(&self, offset: u64, buffer: &mut [u8], direct: bool) -> io::Result<usize> {
+        if offset >= self.len || buffer.is_empty() {
+            return Ok(0);
+        }
+        let len = buffer.len().min((self.len - offset) as usize);
+        let end = offset + len as u64;
+        let mut written = 0usize;
+        for volume in &self.volumes[self.overlapping(offset, end)] {
+            let logical_start = offset.max(volume.start);
+            let logical_end = end.min(volume.end);
+            let chunk_len = (logical_end - logical_start) as usize;
+            let target = &mut buffer[written..written + chunk_len];
+            let count = if direct {
+                volume.source.read_direct_into_at(logical_start - volume.start, target)?
+            } else {
+                volume.source.read_into_at(logical_start - volume.start, target)?
+            };
+            written += count;
+            if count != chunk_len {
+                break;
+            }
+        }
+        Ok(written)
+    }
+
     /// Ordered physical extents share this lookup across every read mode.
     fn overlapping(&self, offset: u64, end: u64) -> std::ops::Range<usize> {
         if offset >= end {
@@ -1312,50 +1340,19 @@ impl ByteSource for MultiVolumeSource {
     }
 
     fn read_at(&self, offset: u64, len: usize) -> io::Result<Vec<u8>> {
-        if offset >= self.len || len == 0 {
-            return Ok(Vec::new());
-        }
-        let len = len.min((self.len - offset) as usize);
-        let end = offset + len as u64;
-        let mut output = Vec::with_capacity(len);
-        for volume in &self.volumes[self.overlapping(offset, end)] {
-            let logical_start = offset.max(volume.start);
-            let logical_end = end.min(volume.end);
-            let chunk_len = (logical_end - logical_start) as usize;
-            let chunk = volume
-                .source
-                .read_at(logical_start - volume.start, chunk_len)?;
-            output.extend_from_slice(&chunk);
-            // A volume that shrank after open ends the logical stream here;
-            // appending the next volume would shift every later byte.
-            if chunk.len() != chunk_len {
-                break;
-            }
-        }
+        let len = len.min(self.len.saturating_sub(offset) as usize);
+        let mut output = crate::io::resource_error::zeroed_bytes(len)?;
+        let count = self.read_into_mode(offset, &mut output, false)?;
+        output.truncate(count);
         Ok(output)
     }
 
     fn read_into_at(&self, offset: u64, buffer: &mut [u8]) -> io::Result<usize> {
-        if offset >= self.len || buffer.is_empty() {
-            return Ok(0);
-        }
-        let len = buffer.len().min((self.len - offset) as usize);
-        let end = offset + len as u64;
-        let mut written = 0usize;
-        for volume in &self.volumes[self.overlapping(offset, end)] {
-            let logical_start = offset.max(volume.start);
-            let logical_end = end.min(volume.end);
-            let chunk_len = (logical_end - logical_start) as usize;
-            let count = volume.source.read_into_at(
-                logical_start - volume.start,
-                &mut buffer[written..written + chunk_len],
-            )?;
-            written += count;
-            if count != chunk_len {
-                break;
-            }
-        }
-        Ok(written)
+        self.read_into_mode(offset, buffer, false)
+    }
+
+    fn read_direct_into_at(&self, offset: u64, buffer: &mut [u8]) -> io::Result<usize> {
+        self.read_into_mode(offset, buffer, true)
     }
 
     fn read_slices_at(&self, offset: u64, len: usize) -> io::Result<Vec<CachedSlice>> {
@@ -1406,26 +1403,10 @@ impl ByteSource for MultiVolumeSource {
     }
 
     fn read_direct_at(&self, offset: u64, len: usize) -> io::Result<Vec<u8>> {
-        if offset >= self.len || len == 0 {
-            return Ok(Vec::new());
-        }
-        let len = len.min((self.len - offset) as usize);
-        let end = offset + len as u64;
-        let mut output = Vec::with_capacity(len);
-        for volume in &self.volumes[self.overlapping(offset, end)] {
-            let logical_start = offset.max(volume.start);
-            let logical_end = end.min(volume.end);
-            let chunk_len = (logical_end - logical_start) as usize;
-            let chunk = volume
-                .source
-                .read_direct_at(logical_start - volume.start, chunk_len)?;
-            output.extend_from_slice(&chunk);
-            // A volume that shrank after open ends the logical stream here;
-            // appending the next volume would shift every later byte.
-            if chunk.len() != chunk_len {
-                break;
-            }
-        }
+        let len = len.min(self.len.saturating_sub(offset) as usize);
+        let mut output = crate::io::resource_error::zeroed_bytes(len)?;
+        let count = self.read_into_mode(offset, &mut output, true)?;
+        output.truncate(count);
         Ok(output)
     }
 }
@@ -2388,7 +2369,7 @@ fn read_file_at(
     len: usize,
     metrics: &ManagerMetrics,
 ) -> io::Result<Vec<u8>> {
-    let mut data = vec![0u8; len];
+    let mut data = crate::io::resource_error::zeroed_bytes(len)?;
     let mut read = 0usize;
     while read < len {
         metrics.physical_reads.fetch_add(1, Ordering::Relaxed);

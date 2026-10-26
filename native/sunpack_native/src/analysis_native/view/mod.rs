@@ -37,7 +37,7 @@ pub(crate) fn probe_rar_bytes(
 }
 
 fn reader_error_to_py(error: std::io::Error) -> PyErr {
-    error.into()
+    crate::io::resource_error::to_py_error(error)
 }
 
 fn set_view_read_fault(

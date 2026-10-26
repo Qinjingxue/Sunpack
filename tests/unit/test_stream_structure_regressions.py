@@ -162,14 +162,15 @@ def test_xz_multistream_checks_and_padding_share_one_structure(tmp_path):
     assert result["structure.stream_count"] == 2
     assert result["block.uncompressed_data"] == 1793
     assert result["segment_end"] == len(body)
-    assert result["integrity_status"] == "verified"
+    assert result["integrity_status"] == "deferred"
+    assert result["integrity_validation_complete"] is False
     assert result["damage_flags"] == ["trailing_junk"]
 
 
 @pytest.mark.parametrize("corrupt_second", [False, True])
 def test_zstd_second_frame_is_neither_junk_nor_covered_by_first_frame_checksum(tmp_path, corrupt_second):
     # No single-frame test can expose extending first-frame evidence across
-    # a later frame. Both cases are small and use the eager analysis path.
+    # a later frame. Both cases are small and keep content integrity deferred.
     compressor = zstandard.ZstdCompressor(write_checksum=True)
     first = compressor.compress(b"first")
     second = bytearray(compressor.compress(b"second"))
@@ -183,6 +184,19 @@ def test_zstd_second_frame_is_neither_junk_nor_covered_by_first_frame_checksum(t
     assert result["archive.trailing_data"] == 0
     assert "trailing_junk" not in result["damage_flags"]
     assert result["integrity_status"] != "verified"
+    assert result["integrity_validation_complete"] is False
+
+
+def test_zstd_structure_accepts_the_format_maximum_window_without_decoding(tmp_path):
+    # Ordinary compressor output never exercises the full Window_Descriptor
+    # range. A legal empty frame needs no actual huge allocation or host load.
+    path = tmp_path / "maximum-window.bin"
+    path.write_bytes(b"\x28\xb5\x2f\xfd\x00\xff\x01\x00\x00")
+    result = inspect_compression_stream_structure(str(path))
+    assert result["plausible"] is True
+    assert result["structure_validation_complete"] is True
+    assert result["frame.header.window_descriptor"] == "raw=255;window=4123168604160"
+    assert result["frame.decoded_content"] == "not_decoded"
     assert result["integrity_validation_complete"] is False
 
 
@@ -200,7 +214,12 @@ def test_bounded_decode_probe_keeps_structure_without_claiming_integrity(tmp_pat
     result = inspect_compression_stream_structure(str(path))
     assert result["plausible"] is True
     assert result["structure_validation_complete"] is True
-    assert result[size_field] == limit + 1
+    if size_field == "block.decoded_content":
+        assert result[size_field] == limit + 1
+    elif size_field == "block.uncompressed_data":
+        assert result[size_field] == limit + 100  # XZ Index, no payload decode
+    else:
+        assert result[size_field] == "not_decoded"
     assert result["integrity_status"] != "verified"
 
 

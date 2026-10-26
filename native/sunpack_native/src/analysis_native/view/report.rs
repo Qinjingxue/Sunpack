@@ -414,12 +414,18 @@ impl AnalysisBinaryView {
                     Ok(evidence) => evidence,
                     Err(error) => {
                         let message = error.value(py).str()?.to_string();
+                        let details = PyDict::new(py);
+                        details.set_item("message", &message)?;
+                        if error.is_instance_of::<pyo3::exceptions::PyMemoryError>(py) {
+                            details.set_item("error", "out_of_memory")?;
+                            details.set_item("failure_kind", "resource_unavailable")?;
+                        }
                         Evidence::new(
                             module.kind.format(),
                             0.0,
                             "error",
                             Vec::new(),
-                            PyDict::new(py),
+                            details,
                         )
                         .with_warnings(vec![message])
                     }
@@ -1082,7 +1088,7 @@ impl<'a, 'py> ReportContext<'a, 'py> {
         stream_observation(py, raw, format)
     }
 
-    /// Full-stream validation decodes the whole file, so it runs at most once
+    /// Full-stream validation walks the complete structure, so it runs at most once
     /// per analysis and once per physical file generation across analyses.
     fn full_stream_structure(&mut self, path: &str) -> PyResult<Option<Bound<'py, PyDict>>> {
         if let Some(structure) = &self.stream_structure {
@@ -1117,6 +1123,11 @@ impl<'a, 'py> ReportContext<'a, 'py> {
             .view
             .probe_compressed_tar(py, stream, max_probe_bytes)?
             .into_bound(py);
+        if str_of(&result, "tar_probe_error")? == "out_of_memory" {
+            result.set_item("error", "out_of_memory")?;
+            result.set_item("failure_kind", "resource_unavailable")?;
+            return Ok(Evidence::new(format, 0.0, "error", Vec::new(), result));
+        }
         if !truthy(&result, "magic_matched")? || !truthy(&result, "tar_plausible")? {
             return Ok(Evidence::new(format, 0.0, "not_found", Vec::new(), result));
         }

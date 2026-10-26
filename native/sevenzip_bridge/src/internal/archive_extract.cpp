@@ -33,6 +33,17 @@ namespace sunpack::sevenzip
     namespace
     {
 
+        bool set_memory_failure(ExtractArchiveResult &result, const char *stage, HRESULT hr)
+        {
+            if (!is_memory_hresult(hr)) return false;
+            result.status = PasswordTestStatus::Error;
+            result.failure_stage = stage;
+            result.failure_kind = "resource_unavailable";
+            result.hresult = static_cast<int>(hr);
+            result.message = "insufficient memory to process archive";
+            return true;
+        }
+
         void set_failure(ExtractArchiveResult &result, const std::string &stage, const std::string &kind, HRESULT hr = S_OK)
         {
 
@@ -367,6 +378,11 @@ namespace sunpack::sevenzip
 
             attempt.create_hresult = static_cast<int>(hr);
 
+            if (set_memory_failure(result, "handler_create", hr)) {
+                result.handler_attempts.push_back(attempt);
+                return result;
+            }
+
             if (hr != S_OK || !archive)
             {
 
@@ -453,6 +469,9 @@ namespace sunpack::sevenzip
             if (!stream_opened)
             {
 
+                if (set_memory_failure(result, "input_open", static_cast<HRESULT>(result.input_trace.last_hresult)))
+                    return result;
+
                 result.status = PasswordTestStatus::Error;
 
                 set_failure(result, "input_open", "input_stream", static_cast<HRESULT>(result.input_trace.last_hresult));
@@ -490,6 +509,12 @@ namespace sunpack::sevenzip
             hr = archive->Open(stream.Interface(), search_limit, open_callback.Interface());
 #endif
             last_encryption_evidence = raw_open_callback->password_requested();
+
+            if (set_memory_failure(result, "archive_open", hr)) {
+                attempt.open_hresult = static_cast<int>(hr);
+                result.handler_attempts.push_back(attempt);
+                return result;
+            }
 
             if (raw_open_callback->missing_volume_requested())
             {
@@ -635,6 +660,11 @@ namespace sunpack::sevenzip
                                        raw_extract_callback->password_requested() || result.encrypted;
 
             result.hresult = static_cast<int>(hr);
+
+            if (set_memory_failure(result, "item_extract", hr)) return result;
+            if (raw_extract_callback->output_error() &&
+                set_memory_failure(result, "output_write", static_cast<HRESULT>(result.output_trace.last_hresult)))
+                return result;
 
 #ifdef SUP7Z_ENABLE_PIPELINE_TIMING
             {

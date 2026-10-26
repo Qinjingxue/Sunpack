@@ -14,6 +14,7 @@ class FailureKind(str, Enum):
     MISSING_VOLUME = "missing_volume"
     UNSUPPORTED = "unsupported"
     BACKEND_UNAVAILABLE = "backend_unavailable"
+    RESOURCE_UNAVAILABLE = "resource_unavailable"
     FILESYSTEM_ERROR = "filesystem_error"
     PROCESS_ERROR = "process_error"
     EMBEDDED_SEGMENTS_FAILED = "embedded_segments_failed"

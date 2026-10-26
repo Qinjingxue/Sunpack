@@ -111,6 +111,27 @@ def _worker_completed(payload: dict) -> subprocess.CompletedProcess:
     ))
 
 
+def test_memory_evidence_survives_damage_and_password_guesses():
+    # Other classification tests don't exercise allocation failures masquerading
+    # as archive outcomes. Keep positive and negative evidence in one matrix.
+    for hresult in (0x80070008, 0x8007000E, 0x800705AF, -2147024882):
+        failure = classify_extract_failure(_worker_completed({
+            "native_status": "unsupported", "damaged": True,
+            "password_candidates_all_rejected": True,
+            "failure_stage": "archive_open", "hresult": hresult,
+            "message": "insufficient memory",
+        }), "Headers Error", archive="archive.7z.001")
+        assert failure.kind == FailureKind.RESOURCE_UNAVAILABLE
+        assert failure.details["hresult"] == hresult
+        assert failure.details["failure_stage"] == "archive_open"
+        assert not failure.is_password_failure
+    for code in (0xC0000017, 0xC000012D, 0xC0000409, 0xC0000005):
+        result = attach_worker_diagnostics(subprocess.CompletedProcess(["worker"], code, "", ""))
+        failure = classify_extract_failure(result, "")
+        expected = FailureKind.RESOURCE_UNAVAILABLE if code in {0xC0000017, 0xC000012D} else FailureKind.PROCESS_ERROR
+        assert failure.kind == expected
+
+
 def test_zipcrypto_proof_contract(subtests):
     cases = [
         ("empty_password_direct", "data_error", False, False, FailureKind.WRONG_PASSWORD),
