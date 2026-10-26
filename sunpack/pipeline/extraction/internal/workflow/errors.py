@@ -89,22 +89,15 @@ def classify_extract_failure(
     diagnostics = getattr(run_result, "worker_diagnostics", None)
     process_failure = diagnostics.get("process_failure") if isinstance(diagnostics, dict) else None
     if isinstance(process_failure, dict) and process_failure:
-        # The worker's explicit transport/startup diagnosis is more reliable
-        # than legacy synthetic return codes or archive-error text heuristics.
-        failure_kind = str(process_failure.get("failure_kind") or "process_error")
-        failure_stage = str(process_failure.get("failure_stage") or "worker_process")
-        message = str(process_failure.get("message") or "").strip() or "worker failed without a result"
-        return _failure(
-            FailureKind.PROCESS_ERROR,
-            "failure.worker_process_failed",
-            details={
-                "failure_kind": failure_kind,
-                "failure_stage": failure_stage,
-                "message": message,
-            },
-            kind=failure_kind,
-            message=message,
+        # A confirmed transport/startup fault takes precedence over stderr.
+        # A generic worker_exit/process_exit, however, is only a consequence
+        # of a nonzero exit and must not conceal archive-specific evidence.
+        is_generic_exit = (
+            process_failure.get("failure_kind") == "process_exit"
+            and process_failure.get("failure_stage") == "worker_exit"
         )
+        if not is_generic_exit:
+            return _worker_process_failure_info(process_failure)
 
     if _has_explicit_missing_volume_line(err_text):
         return _failure(
@@ -127,6 +120,11 @@ def classify_extract_failure(
     if "unsupported compression method" in err_lower or "unsupported method" in err_lower:
         return _failure(FailureKind.UNSUPPORTED, "failure.unsupported")
 
+    # Keep the generic worker exit as the fallback when there is no stronger
+    # archive-specific evidence, preserving the original exit diagnostics.
+    if isinstance(process_failure, dict) and process_failure:
+        return _worker_process_failure_info(process_failure)
+
     if run_result:
         code = run_result.returncode
         if code == -100:
@@ -147,6 +145,23 @@ def classify_extract_failure(
             return _failure(FailureKind.PROCESS_ERROR, "failure.process_exit_code", code=code)
 
     return _failure(FailureKind.UNKNOWN, "failure.unknown")
+
+
+def _worker_process_failure_info(process_failure: dict) -> FailureInfo:
+    failure_kind = str(process_failure.get("failure_kind") or "process_error")
+    failure_stage = str(process_failure.get("failure_stage") or "worker_process")
+    message = str(process_failure.get("message") or "").strip() or "worker failed without a result"
+    return _failure(
+        FailureKind.PROCESS_ERROR,
+        "failure.worker_process_failed",
+        details={
+            "failure_kind": failure_kind,
+            "failure_stage": failure_stage,
+            "message": message,
+        },
+        kind=failure_kind,
+        message=message,
+    )
 
 
 def _failure(
