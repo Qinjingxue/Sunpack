@@ -106,13 +106,10 @@ struct SinkLog {
     }
 };
 
-// 模拟"用户释放了足够空间"：用真实可用空间 + 1 GiB 明确越过水位；小的常量采样值
-// 不会越过水位，许可就永远发不出来。
+// 测试使用人工正数空间样本，不依赖宿主机磁盘容量。
+// 生产环境由 monitor 成功查询真实可用空间后调用 gate.poll()。
 bool release_permit(const std::shared_ptr<VolumeSpaceGate> &gate) {
-    std::uint64_t free_now = 0;
-    std::uint64_t total = 0;
-    const bool queried = gate->query_free_bytes(&free_now, &total);
-    return gate->poll((queried ? free_now : 0) + (1ULL << 30));
+    return gate->poll(1);
 }
 // 把 std::string 里的 ASCII 还原成宽字符（测试路径都是 ASCII）。
 std::string to_ascii(const std::wstring &text) {
@@ -152,7 +149,7 @@ struct Harness {
     }
 
     bool release_probe_and_wait_ready(std::chrono::milliseconds timeout = 5s) {
-        // 模拟"用户释放了足够空间"：明确高于当前水位。
+        // 模拟一次成功的正数空间采样，授权唯一 probe。
         const bool issued = release_permit(gate);
         const bool ready =
             wait_until([this] { return gate->phase() == VolumeSpacePhase::Ready; }, timeout);
@@ -163,8 +160,6 @@ struct Harness {
             const bool queried = gate->query_free_bytes(&free_now, &total);
             std::cerr << "  [diag] queried=" << queried << " poll_issued=" << issued
                       << " phase=" << static_cast<int>(gate->phase())
-                      << " watermark_valid=" << gate->watermark_valid()
-                      << " watermark=" << gate->failed_free_watermark()
                       << " free_now=" << free_now
                       << " episode=" << gate->episode_id()
                       << " waiters=" << gate->waiter_count()
