@@ -22,10 +22,10 @@ from tests.helpers.detection_config import with_detection_pipeline
 from tests.helpers.worker_events import worker_trace_item
 
 
-def _completed(*, returncode, stdout, stderr, worker_diagnostics=None):
+def _completed(*, returncode, stdout, stderr, worker_diagnostics=None, result_payload=None):
     completed = attach_worker_diagnostics(subprocess.CompletedProcess(
         args=[], returncode=returncode, stdout=stdout, stderr=stderr,
-    ))
+    ), result_payload=result_payload)
     if worker_diagnostics is not None:
         completed.worker_diagnostics = worker_diagnostics
     return completed
@@ -167,7 +167,21 @@ class ExtractionExecutionTests(unittest.TestCase):
             extractor.password_resolver = FakePasswordResolver()
             extractor.metadata_scanner = FakeMetadataScanner()
 
-            failed = _completed(returncode=2, stdout="", stderr="Headers Error")
+            # A genuine archive error has a structured native result. A bare
+            # exit code and stderr with no result means the worker disappeared.
+            failed = _completed(
+                returncode=2,
+                stdout="",
+                stderr="Headers Error",
+                result_payload={
+                    "type": "result",
+                    "status": "failed",
+                    "native_status": "damaged",
+                    "damaged": True,
+                    "failure_stage": "archive_open",
+                    "failure_kind": "headers_error",
+                },
+            )
             task = make_archive_task(archive_path)
 
             calls = 0
@@ -183,6 +197,17 @@ class ExtractionExecutionTests(unittest.TestCase):
             self.assertFalse(result.success)
             self.assertEqual(result.error, "Archive is damaged")
             self.assertEqual(calls, 1)
+
+    def test_missing_worker_result_preserves_process_exit_despite_archive_error_text(self):
+        from sunpack.core.contracts.failures import FailureKind
+        from sunpack.pipeline.extraction.internal.workflow.errors import classify_extract_failure
+
+        failed = _completed(returncode=2, stdout="", stderr="Headers Error")
+        classification = classify_extract_failure(failed, failed.stderr, archive="broken.zip")
+
+        self.assertEqual(classification.kind, FailureKind.PROCESS_ERROR)
+        self.assertEqual(classification.details["failure_kind"], "process_exit")
+        self.assertIn("Headers Error", classification.message)
 
     def test_extractor_preserves_best_effort_outputs_for_item_payload_failure(self):
         with tempfile.TemporaryDirectory() as tmp:
