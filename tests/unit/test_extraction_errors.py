@@ -170,14 +170,19 @@ def test_failure_evidence_contract(subtests):
                 assert failure.details["missing_volume_confirmed"] is False
 
 
-def test_generic_worker_exit_does_not_hide_archive_header_damage():
+def test_generic_worker_exit_does_not_infer_archive_damage_from_stderr():
+    # With no structured result, "Headers Error" is unverified diagnostic
+    # text. A generic worker exit must retain the actual process failure.
     completed = attach_worker_diagnostics(
         subprocess.CompletedProcess(["worker"], 2, "", "Headers Error")
     )
     assert completed.worker_diagnostics["process_failure"]["failure_kind"] == "process_exit"
     failure = classify_extract_failure(completed, completed.stderr, archive="broken.zip")
-    assert failure.kind is FailureKind.DAMAGED
-    assert failure.message == "Archive is damaged"
+    assert failure.kind is FailureKind.PROCESS_ERROR
+    assert failure.details["failure_kind"] == "process_exit"
+    assert failure.details["failure_stage"] == "worker_exit"
+    assert failure.details["message"] == "Headers Error"
+    assert "Headers Error" in failure.message
 
 
 def test_generic_worker_exit_retains_process_details_without_archive_evidence():
