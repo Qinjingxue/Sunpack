@@ -933,7 +933,6 @@ dependencies = [
  "flate2",
  "hmac",
  "lzma-rust2 0.16.5",
- "lzma-sys",
  "memchr",
  "pbkdf2",
  "pyo3",

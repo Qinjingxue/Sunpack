@@ -438,40 +438,25 @@ fn decrypt_seven_zip_aes256_sha256(data:&[u8], properties:&[u8], password:Option
     }
     output.finish().map_err(resource_error)
 }
-fn decode_lzma(data:&[u8], coder:&SevenZipEncodedHeaderCoder, size:u64)->Result<Blob,String> {
-    use lzma_sys::*;
-    let lzma2=coder.method_id.as_slice()==EncoderMethod::ID_LZMA2;
-    let mut options:lzma_options_lzma=unsafe {std::mem::zeroed()};
-    unsafe { lzma_lzma_preset(&mut options,6); }
-    if lzma2 {
-        options.dict_size=coder.properties.first().and_then(|value|lzma2_dict_size(*value)).ok_or("encoded_header_decoder_unsupported_method")?;
-    } else {
-        if coder.properties.len()!=5 || coder.properties[0]>=225 {return Err("encoded_header_decoder_unsupported_method".into());}
-        let prop=coder.properties[0] as u32;
-        options.lc=prop%9;options.lp=(prop/9)%5;options.pb=prop/45;
-        options.dict_size=u32::from_le_bytes(coder.properties[1..5].try_into().unwrap());
+fn decode_lzma(
+    data: &[u8],
+    coder: &SevenZipEncodedHeaderCoder,
+    unpack_size: u64,
+) -> Result<Blob, String> {
+    let compressed = Cursor::new(data);
+    if coder.method_id.as_slice() == EncoderMethod::ID_LZMA {
+        if coder.properties.len() < 5 {
+            return Err("encoded_header_decoder_unsupported_method".to_string());
+        }
+        let dict_size = u32::from_le_bytes(coder.properties[1..5].try_into().unwrap());
+        let reader = LzmaReader::new_with_props(
+            compressed, unpack_size, coder.properties[0], dict_size, None,
+        ).map_err(|error| format!("encoded_header_decoder_unsupported_method:{error}"))?;
+        return collect_decoded(reader, unpack_size);
     }
-    let filters=[lzma_filter{id:if lzma2 {LZMA_FILTER_LZMA2}else{LZMA_FILTER_LZMA1},options:(&mut options as *mut lzma_options_lzma).cast()},lzma_filter{id:LZMA_VLI_UNKNOWN,options:std::ptr::null_mut()}];
-    struct Decoder(lzma_stream);
-    impl Drop for Decoder {fn drop(&mut self){unsafe{lzma_end(&mut self.0)}}}
-    let mut decoder=Decoder(unsafe {std::mem::zeroed()});
-    let initialized=unsafe{lzma_raw_decoder(&mut decoder.0,filters.as_ptr())};
-    if initialized!=LZMA_OK {return Err(if initialized==LZMA_MEM_ERROR {resource_error("LZMA dictionary allocation")} else {"encoded_header_decoder_unsupported_method".into()});}
-    decoder.0.next_in=data.as_ptr();decoder.0.avail_in=data.len();
-    let mut output=Spool::default();let mut buffer=vec![0;64*1024];let mut produced=0u64;
-    loop {
-        decoder.0.next_out=buffer.as_mut_ptr();decoder.0.avail_out=buffer.len();
-        let status=unsafe{lzma_code(&mut decoder.0,LZMA_FINISH)};
-        let count=buffer.len()-decoder.0.avail_out;
-        produced=produced.checked_add(count as u64).ok_or("encoded_header_payload_crc_bad:unpack_size")?;
-        if produced>size {return Err("encoded_header_payload_crc_bad:unpack_size".into());}
-        output.write_all(&buffer[..count]).map_err(resource_error)?;
-        if status==LZMA_STREAM_END || (!lzma2 && produced==size) {break;}
-        if status==LZMA_MEM_ERROR {return Err(resource_error("LZMA dictionary allocation"));}
-        if status!=LZMA_OK || count==0 {return Err("encoded_header_payload_crc_bad:lzma".into());}
-    }
-    if produced!=size {return Err("encoded_header_payload_crc_bad:unpack_size".into());}
-    output.finish().map_err(resource_error)
+    let dict_size = coder.properties.first().and_then(|value| lzma2_dict_size(*value))
+        .ok_or_else(|| "encoded_header_decoder_unsupported_method".to_string())?;
+    collect_decoded(Lzma2Reader::new(compressed, dict_size, None), unpack_size)
 }
 
 fn seven_zip_aes_key_iv(

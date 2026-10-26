@@ -31,6 +31,7 @@ def coverage_from_native_inventory(
     *,
     method: str,
     verify_crc: bool = False,
+    names_only: bool = False,
     basename_mode: str = "unique",
     include_observations: bool = False,
     detail_offset: int = 0,
@@ -39,11 +40,12 @@ def coverage_from_native_inventory(
     issues_by_path: dict[str, list[VerificationIssue]] | None = None,
 ) -> tuple[ArchiveOutputCoverage, dict[str, Any]]:
     if isinstance(archive_files, ArchiveInputManifest):
-        # Match straight from the Rust entry table, bounded by the view.
+        # Match straight from the complete Rust entry table.
         archive_files = archive_files.entries if archive_files.entries is not None else []
     raw = inventory.verification_match(
         archive_files,
         verify_crc=verify_crc,
+        names_only=names_only,
         basename_mode=basename_mode,
         include_observations=include_observations,
         detail_offset=detail_offset,

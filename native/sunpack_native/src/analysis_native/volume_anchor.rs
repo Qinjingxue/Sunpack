@@ -1127,19 +1127,23 @@ fn probe_standalone_stream(prefix: &[u8], out: &mut VolumeAnchor) {
         "xz"
     } else if prefix.starts_with(b"\x28\xb5\x2f\xfd") {
         "zstd"
-    } else if prefix.starts_with(b"\x1f\x9d") {
-        "compress"
     } else if prefix.get(257..262) == Some(b"ustar") {
         "tar"
     } else {
         return;
     };
+    // A continuation volume may start with arbitrary compressed/encrypted
+    // bytes. Magic alone must not remove it from its archive's cohort.
+    // Keep the canonical identity fact on the anchor for Detection to reuse.
+    if !crate::analysis_native::confirm_format_identity_native(&out.path, format) {
+        return;
+    }
     out.format = format.to_string();
     out.confidence = "strong".to_string();
     out.standalone = true;
     out.anchor_roles.push("standalone");
     out.anchor_roles.push("first");
-    out.evidence.push("stream:leading_structure");
+    out.evidence.push("stream:format_identity");
 }
 
 fn find_signature(data: &[u8], signature: &[u8]) -> Option<usize> {

@@ -385,12 +385,6 @@ fn prepare_rar4_file_data(
             ))
         }
     };
-    if parse_rar4_block(&header, 0).is_some_and(|block| block.flags & 3 != 0) {
-        return Err(PreparedStatus::new(
-            "unknown_needs_final_verifier",
-            "split encrypted RAR4 file requires the full decoder",
-        ));
-    }
     let probe = parse_rar4_block(&header, 0)
         .and_then(|block| parse_rar4_file_probe(&header, 0, block))
         .ok_or_else(|| {
@@ -399,12 +393,6 @@ fn prepare_rar4_file_data(
                 "rar3/rar4 encrypted file header is not supported by the fast verifier",
             )
         })?;
-    if probe.unpacked_size == 0 {
-        return Err(PreparedStatus::new(
-            "unknown_needs_final_verifier",
-            "empty RAR4 file cannot prove a password by CRC",
-        ));
-    }
     if probe.method != 0 {
         return Err(PreparedStatus::new(
             "unknown_needs_final_verifier",

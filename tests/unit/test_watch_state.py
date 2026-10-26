@@ -445,12 +445,15 @@ def test_state_handoff_preserves_newer_checkpoint(tmp_path, monkeypatch, reload_
     old.queue_active(first, durable=True)
     successor = None if reload_during_checkpoint else WatchStateStore(str(state_path))
     entered, release, handoff = Event(), Event(), Event()
-    real_write = old._write_snapshot_view
+    # Patching the instance restores a bound method on undo, keeping the store
+    # and its path coordinator alive after pytest removes/reuses the directory.
+    real_write = WatchStateStore._write_snapshot_view
 
-    def paused_snapshot(view):
-        entered.set()
-        assert release.wait(5)
-        real_write(view)
+    def paused_snapshot(store, view):
+        if store is old:
+            entered.set()
+            assert release.wait(5)
+        real_write(store, view)
 
     def replace_store():
         handoff.set()
@@ -459,7 +462,7 @@ def test_state_handoff_preserves_newer_checkpoint(tmp_path, monkeypatch, reload_
         current.save()
         return current.applied_seq
 
-    monkeypatch.setattr(old, "_write_snapshot_view", paused_snapshot)
+    monkeypatch.setattr(WatchStateStore, "_write_snapshot_view", paused_snapshot)
     old.compact_if_needed(force=True)
     assert entered.wait(2)
     with ThreadPoolExecutor(max_workers=1) as executor:

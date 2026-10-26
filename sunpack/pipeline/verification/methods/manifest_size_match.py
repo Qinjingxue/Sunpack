@@ -64,6 +64,7 @@ class ManifestSizeMatchMethod:
                     input_manifest,
                     output_inventory_for_evidence(evidence),
                     method=self.name,
+                    names_only=True,
                     basename_mode="unique",
                     include_observations=emit_observations,
                     detail_limit=detail_limit,

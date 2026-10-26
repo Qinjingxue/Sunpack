@@ -1,3 +1,4 @@
+import bz2
 import struct
 import zipfile
 from binascii import crc32
@@ -384,7 +385,7 @@ def _split_zip_terminal_bytes(*, disk: int, cd_disk: int) -> bytes:
 
 
 def test_standalone_tbz2_cannot_become_zip_volume_two(tmp_path):
-    (tmp_path / "payload.tbz2").write_bytes(b"BZh9" + b"standalone")
+    (tmp_path / "payload.tbz2").write_bytes(bz2.compress(b"standalone"))
     (tmp_path / "payload.zip").write_bytes(b"PK\x05\x06" + b"\0" * 18)
 
     groups = _groups(tmp_path)
