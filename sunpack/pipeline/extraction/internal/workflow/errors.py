@@ -89,15 +89,10 @@ def classify_extract_failure(
     diagnostics = getattr(run_result, "worker_diagnostics", None)
     process_failure = diagnostics.get("process_failure") if isinstance(diagnostics, dict) else None
     if isinstance(process_failure, dict) and process_failure:
-        # A confirmed transport/startup fault takes precedence over stderr.
-        # A generic worker_exit/process_exit, however, is only a consequence
-        # of a nonzero exit and must not conceal archive-specific evidence.
-        is_generic_exit = (
-            process_failure.get("failure_kind") == "process_exit"
-            and process_failure.get("failure_stage") == "worker_exit"
-        )
-        if not is_generic_exit:
-            return _worker_process_failure_info(process_failure)
+        # A worker that exited without a structured result has not supplied
+        # evidence of archive damage. Its stderr is diagnostic text, not a
+        # verified archive outcome (even when it says "Headers Error").
+        return _worker_process_failure_info(process_failure)
 
     if _has_explicit_missing_volume_line(err_text):
         return _failure(
@@ -119,11 +114,6 @@ def classify_extract_failure(
         return _failure(FailureKind.DAMAGED, "failure.damaged")
     if "unsupported compression method" in err_lower or "unsupported method" in err_lower:
         return _failure(FailureKind.UNSUPPORTED, "failure.unsupported")
-
-    # Keep the generic worker exit as the fallback when there is no stronger
-    # archive-specific evidence, preserving the original exit diagnostics.
-    if isinstance(process_failure, dict) and process_failure:
-        return _worker_process_failure_info(process_failure)
 
     if run_result:
         code = run_result.returncode
