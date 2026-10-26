@@ -17,7 +17,7 @@ from sunpack.pipeline.extraction.knowledge import write_extraction_result
 from sunpack.pipeline.extraction.scheduler import ExtractionScheduler
 from sunpack.pipeline.extraction.output_inventory import OutputInventory
 from sunpack.pipeline.postprocess.output_cleanup import OutputCleanupEvent, cleanup_output_for_retry
-from sunpack.core.contracts.verification import DECISION_ACCEPT, DECISION_ACCEPT_PARTIAL, DECISION_RETRY_EXTRACT
+from sunpack.core.contracts.verification import DECISION_ACCEPT, DECISION_ACCEPT_PARTIAL
 
 from sunpack.core.passwords.directory_context import PasswordScopeContext
 from sunpack.pipeline.verification import VerificationResult, VerificationScheduler
@@ -298,12 +298,7 @@ class ArchiveJobExecutor:
         *,
         missing_volume_retry=None,
     ):
-        verification_config = self.verifier.config
-        max_verification_retries = max(0, int(verification_config.get("max_retries", 0) or 0))
-        cleanup_failed_output = bool(verification_config.get("cleanup_failed_output", True))
         volume_retry_attempted = bool(task.runtime.get("volume_retry_attempted"))
-
-        attempt_index = 0
         while True:
             self._report_task_status(task, "extracting")
             result = yield {
@@ -317,7 +312,7 @@ class ArchiveJobExecutor:
                 current_outcome = ArchiveJobOutcome(
                     result=result,
                     verification=verification,
-                    attempts=attempt_index + 1,
+                    attempts=1,
                 )
                 if (
                     not volume_retry_attempted
@@ -341,31 +336,12 @@ class ArchiveJobExecutor:
                         ]
                         self.password_scope_context.annotate([task])
                         continue
-                if self._must_stop_for_proven_content_loss(task, result, verification):
-                    return current_outcome
-                if _verification_accepts_complete(verification):
-                    return current_outcome
                 return current_outcome
 
+            # Verification observes this extraction once. Failed verification
+            # is a result, not a reason to run the same extraction again.
             verification = verify_and_project(self.verifier, task, result)
-            outcome = ArchiveJobOutcome(result=result, verification=verification, attempts=attempt_index + 1)
-            if self._must_stop_for_proven_content_loss(task, result, verification):
-                return outcome
-            if _verification_accepts_complete(verification):
-                return outcome
-            if _verification_accepts_partial(verification) and self.content_policy.allows_partial:
-                return outcome
-            if attempt_index >= max_verification_retries:
-                return outcome
-            if verification.decision_hint != DECISION_RETRY_EXTRACT and not self._retry_on_verification_failure():
-                return outcome
-            if cleanup_failed_output:
-                cleanup_output_for_retry(
-                    result.out_dir,
-                    event=OutputCleanupEvent.VERIFICATION_RETRY,
-                    planned_output_dir=out_dir,
-                )
-            attempt_index += 1
+            return ArchiveJobOutcome(result=result, verification=verification, attempts=1)
 
     def _must_stop_for_proven_content_loss(
         self,
@@ -376,9 +352,6 @@ class ArchiveJobExecutor:
         if self.content_policy.allows_partial:
             return False
         return _proves_content_loss(result, verification)
-
-    def _retry_on_verification_failure(self) -> bool:
-        return bool(self.verifier.config.get("retry_on_verification_failure", True))
 
     def collect_result(self, task: ArchiveTask, outcome: ArchiveJobOutcome | ExtractionResult) -> TargetRunResult:
         content_policy = self.content_policy

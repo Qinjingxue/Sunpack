@@ -1129,7 +1129,6 @@ class _RequestRuntime:
         request_runner.origin = submission.origin
         self.extractor = ExtractionScheduler(
             password_store=submission.password_store,
-            max_retries=self.config.get("max_retries", 3),
             process_config=worker_config,
             output_config=self.config.get("output", {}),
             extraction_config={

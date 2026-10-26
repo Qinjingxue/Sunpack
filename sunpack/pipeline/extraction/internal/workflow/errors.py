@@ -8,45 +8,12 @@ from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import wor
 from sunpack.core.i18n import I18nContext
 from sunpack.core.support.archive_error_signals import (
     has_archive_damage_signals,
-    has_transient_system_signals,
     looks_like_split_archive_name,
     normalize_error_text,
 )
 
 _norm = normalize_error_text
 _EN = I18nContext("en")
-
-
-def should_retry_extract_failure(
-    run_result: Optional[subprocess.CompletedProcess],
-    err_text: str,
-    archive: str = None,
-    is_split_archive: bool = False,
-) -> bool:
-    err_lower = _norm(err_text)
-    worker_result = worker_result_payload(run_result)
-    if worker_result:
-        if worker_result.get("wrong_password") or worker_result.get("damaged") or worker_result.get("missing_volume"):
-            return False
-        if worker_result.get("native_status") in {"wrong_password", "damaged", "unsupported"}:
-            return False
-
-    if has_archive_damage_signals(err_lower):
-        return False
-
-    if has_transient_system_signals(err_lower):
-        return True
-
-    if not run_result:
-        return False
-
-    code = run_result.returncode
-    if code in (-100, -101, -102, 8):
-        return True
-    if code is not None and code < 0:
-        return True
-
-    return False
 
 
 def classify_extract_failure(
@@ -122,22 +89,10 @@ def classify_extract_failure(
     diagnostics = getattr(run_result, "worker_diagnostics", None)
     process_failure = diagnostics.get("process_failure") if isinstance(diagnostics, dict) else None
     if isinstance(process_failure, dict) and process_failure:
-        # The worker's explicit transport/startup diagnosis is more reliable
-        # than legacy synthetic return codes or archive-error text heuristics.
-        failure_kind = str(process_failure.get("failure_kind") or "process_error")
-        failure_stage = str(process_failure.get("failure_stage") or "worker_process")
-        message = str(process_failure.get("message") or "").strip() or "worker failed without a result"
-        return _failure(
-            FailureKind.PROCESS_ERROR,
-            "failure.worker_process_failed",
-            details={
-                "failure_kind": failure_kind,
-                "failure_stage": failure_stage,
-                "message": message,
-            },
-            kind=failure_kind,
-            message=message,
-        )
+        # A worker that exited without a structured result has not supplied
+        # evidence of archive damage. Its stderr is diagnostic text, not a
+        # verified archive outcome (even when it says "Headers Error").
+        return _worker_process_failure_info(process_failure)
 
     if _has_explicit_missing_volume_line(err_text):
         return _failure(
@@ -182,8 +137,25 @@ def classify_extract_failure(
     return _failure(FailureKind.UNKNOWN, "failure.unknown")
 
 
+def _worker_process_failure_info(process_failure: dict) -> FailureInfo:
+    failure_kind = str(process_failure.get("failure_kind") or "process_error")
+    failure_stage = str(process_failure.get("failure_stage") or "worker_process")
+    message = str(process_failure.get("message") or "").strip() or "worker failed without a result"
+    return _failure(
+        FailureKind.PROCESS_ERROR,
+        "failure.worker_process_failed",
+        details={
+            "failure_kind": failure_kind,
+            "failure_stage": failure_stage,
+            "message": message,
+        },
+        kind=failure_kind,
+        message=message,
+    )
+
+
 def _failure(
-    kind: FailureKind,
+    failure_kind: FailureKind,
     message_key: str,
     *,
     user_action: str = "",
@@ -191,7 +163,7 @@ def _failure(
     **params,
 ) -> FailureInfo:
     return FailureInfo(
-        kind=kind,
+        kind=failure_kind,
         stage="extraction",
         message=_EN.t(message_key, **params),
         message_key=message_key,

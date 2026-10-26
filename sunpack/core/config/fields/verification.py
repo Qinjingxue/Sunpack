@@ -13,24 +13,17 @@ def normalize_verification_config(value: Any) -> dict[str, Any]:
         raise ValueError("Missing required config object: verification")
     if not isinstance(value, dict):
         raise ValueError("verification must be an object")
-    unknown = set(value) - set(VERIFICATION_DEFAULTS)
+    # Accept old settings harmlessly; they no longer affect execution.
+    retired = {"max_retries", "cleanup_failed_output", "retry_on_verification_failure"}
+    unknown = set(value) - set(VERIFICATION_DEFAULTS) - retired
     if unknown:
         raise ValueError(
             f"verification has unknown fields: {', '.join(sorted(unknown))}"
         )
-    config = {**VERIFICATION_DEFAULTS, **dict(value)}
+    config = {**VERIFICATION_DEFAULTS, **{key: item for key, item in value.items() if key not in retired}}
     config["enabled"] = require_boolean(config["enabled"], "verification.enabled")
-    config["max_retries"] = max(0, _int_field(config, "max_retries"))
-    config["cleanup_failed_output"] = require_boolean(
-        config["cleanup_failed_output"],
-        "verification.cleanup_failed_output",
-    )
     config["complete_accept_threshold"] = min(1.0, max(0.0, _float_field(config, "complete_accept_threshold")))
     config["partial_accept_threshold"] = min(1.0, max(0.0, _float_field(config, "partial_accept_threshold")))
-    config["retry_on_verification_failure"] = require_boolean(
-        config["retry_on_verification_failure"],
-        "verification.retry_on_verification_failure",
-    )
     config["methods"] = _normalize_methods(config.get("methods"))
     return config
 

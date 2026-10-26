@@ -56,6 +56,8 @@ def _unregister_toast() -> None:
     try:
         # Wait for the helper's real exit status; slow startup is not failure.
         exit_code = process.wait()
+        if exit_code is None:
+            raise OSError("current-user Toast cleanup returned no exit status")
         if int(exit_code) != 0:
             raise OSError(f"current-user Toast cleanup failed with exit code {int(exit_code)}")
     finally:

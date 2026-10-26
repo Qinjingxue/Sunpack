@@ -10,6 +10,7 @@ from sunpack.core.contracts.extraction import ExtractionResult
 from sunpack.core.contracts.verification import (
     DECISION_ACCEPT_PARTIAL,
     DECISION_FAIL,
+    DECISION_RETRY_EXTRACT,
     VerificationResult,
 )
 from sunpack.core.i18n import I18nContext
@@ -17,15 +18,9 @@ from sunpack.pipeline.coordinator import archive_job
 from sunpack.pipeline.coordinator.archive_job import ArchiveJobExecutor
 
 
-def _executor(*, allow_partial: bool, retry_on_failure: bool) -> ArchiveJobExecutor:
+def _executor(*, allow_partial: bool) -> ArchiveJobExecutor:
     executor = object.__new__(ArchiveJobExecutor)
-    executor.verifier = SimpleNamespace(
-        config={
-            "max_retries": 2,
-            "cleanup_failed_output": True,
-            "retry_on_verification_failure": retry_on_failure,
-        }
-    )
+    executor.verifier = SimpleNamespace(config={})
     executor.content_policy = ContentRecoveryPolicy(
         CONTENT_REQUIREMENT_ALLOW_PARTIAL if allow_partial else "complete"
     )
@@ -44,7 +39,7 @@ def _finish_first_attempt(executor, task, result):
     return stopped.value.value
 
 
-def test_disabled_verification_retry_preserves_real_failed_verification(monkeypatch, tmp_path):
+def test_failed_verification_is_terminal_without_reextraction(monkeypatch, tmp_path):
     verification = VerificationResult(decision_hint=DECISION_FAIL)
     monkeypatch.setattr(archive_job, "write_extraction_result", lambda _task, _result: None)
     monkeypatch.setattr(archive_job, "verify_and_project", lambda _verifier, _task, _result: verification)
@@ -55,7 +50,7 @@ def test_disabled_verification_retry_preserves_real_failed_verification(monkeypa
         lambda *_args, **_kwargs: cleanup_calls.append(True),
     )
 
-    executor = _executor(allow_partial=False, retry_on_failure=False)
+    executor = _executor(allow_partial=False)
     task = SimpleNamespace(runtime={})
     result = ExtractionResult(success=True, out_dir=str(tmp_path / "out"))
 
@@ -78,7 +73,7 @@ def test_allowed_partial_verification_is_not_reextracted(monkeypatch, tmp_path):
         lambda *_args, **_kwargs: cleanup_calls.append(True),
     )
 
-    executor = _executor(allow_partial=True, retry_on_failure=True)
+    executor = _executor(allow_partial=True)
     task = SimpleNamespace(runtime={})
     result = ExtractionResult(
         success=True,
@@ -106,3 +101,21 @@ def test_container_structure_extraction_failure_is_not_proven_content_loss():
     verification = VerificationResult(decision_hint=DECISION_FAIL)
 
     assert archive_job._proves_content_loss(result, verification) is False
+
+
+def test_verification_retry_hint_is_a_failure_not_a_second_extraction(monkeypatch, tmp_path):
+    verification = VerificationResult(decision_hint=DECISION_RETRY_EXTRACT)
+    monkeypatch.setattr(archive_job, "write_extraction_result", lambda *_args: None)
+    monkeypatch.setattr(archive_job, "verify_and_project", lambda *_args: verification)
+    cleanup_calls = []
+    monkeypatch.setattr(archive_job, "cleanup_output_for_retry", lambda *a, **k: cleanup_calls.append((a, k)))
+
+    executor = _executor(allow_partial=False)
+    task = SimpleNamespace(runtime={})
+    result = ExtractionResult(success=True, out_dir=str(tmp_path / "out"))
+    outcome = _finish_first_attempt(executor, task, result)
+
+    assert outcome.verification is verification
+    assert outcome.attempts == 1
+    assert outcome.outcome_kind.value == "failure"
+    assert cleanup_calls == []

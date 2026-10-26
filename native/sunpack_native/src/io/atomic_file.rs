@@ -21,7 +21,10 @@ mod win {
         // Match the existing GUI atomic writer: ReplaceFile allows a reader
         // with FILE_SHARE_DELETE to retain the old file. MoveFileEx replacement
         // can return ACCESS_DENIED while that perfectly valid reader is open.
-        for attempt in 0..2 {
+        // An external reader controls when the sharing lock is released.
+        // Retry only Windows sharing conflicts; all other errors remain
+        // terminal. No arbitrary two-attempt failure under heavy I/O.
+        loop {
             if unsafe {
                 ReplaceFileW(
                     to.as_ptr(),
@@ -47,11 +50,13 @@ mod win {
             } else {
                 replace_error
             };
-            if attempt == 1 || !super::sharing_conflict(&error) {
+            if !super::sharing_conflict(&error) {
                 return Err(error);
             }
+            // Windows has no waitable handle for another process's sharing
+            // violation. Poll with a quiet interval instead of busy-spinning.
+            std::thread::sleep(std::time::Duration::from_millis(50));
         }
-        unreachable!()
     }
 }
 pub(crate) fn sharing_conflict(error: &io::Error) -> bool {

@@ -19,7 +19,6 @@ from sunpack.pipeline.extraction.internal.workflow.errors import (
 from sunpack.pipeline.extraction.internal.workflow.single_archive_extractor import (
     SingleArchiveExtractor,
 )
-from sunpack.pipeline.extraction.internal.workflow.retry_policy import ExtractRetryPolicy
 
 
 @pytest.mark.parametrize("encrypted", [None, True])
@@ -45,7 +44,7 @@ def test_split_empty_password_worker_rejection_is_not_downgraded(tmp_path, encry
         password_store=None,
         password_resolver=SimpleNamespace(reject_extraction_candidates=rejected.append),
         metadata_scanner=SimpleNamespace(scan_for_task=lambda *a, **k: SimpleNamespace(selected_codepage=None, error="")),
-        retry_policy=ExtractRetryPolicy(1),
+        retry_policy=None,
         sevenzip_runner=SimpleNamespace(
             emit_semantic_event=lambda *a, **k: None,
             extract_attempt=lambda **k: _worker_completed({
@@ -169,3 +168,29 @@ def test_failure_evidence_contract(subtests):
                 assert failure.details["missing_volume_name"] == "payload.7z.003"
             if payload and payload.get("missing_volume_suspected") and payload.get("damaged"):
                 assert failure.details["missing_volume_confirmed"] is False
+
+
+def test_generic_worker_exit_does_not_infer_archive_damage_from_stderr():
+    # With no structured result, "Headers Error" is unverified diagnostic
+    # text. A generic worker exit must retain the actual process failure.
+    completed = attach_worker_diagnostics(
+        subprocess.CompletedProcess(["worker"], 2, "", "Headers Error")
+    )
+    assert completed.worker_diagnostics["process_failure"]["failure_kind"] == "process_exit"
+    failure = classify_extract_failure(completed, completed.stderr, archive="broken.zip")
+    assert failure.kind is FailureKind.PROCESS_ERROR
+    assert failure.details["failure_kind"] == "process_exit"
+    assert failure.details["failure_stage"] == "worker_exit"
+    assert failure.details["message"] == "Headers Error"
+    assert "Headers Error" in failure.message
+
+
+def test_generic_worker_exit_retains_process_details_without_archive_evidence():
+    completed = attach_worker_diagnostics(
+        subprocess.CompletedProcess(["worker"], 8, "", "operation failed")
+    )
+    failure = classify_extract_failure(completed, completed.stderr, archive="unknown.zip")
+    assert failure.kind is FailureKind.PROCESS_ERROR
+    assert failure.details["failure_kind"] == "process_exit"
+    assert failure.details["failure_stage"] == "worker_exit"
+    assert failure.details["message"] == "operation failed"
