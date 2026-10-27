@@ -256,9 +256,20 @@ def test_log_corruption_rebuilds_through_cli_and_writer_and_retries_after_failur
     ctx = CliContext(language="en", cwd=str(tmp_path))
     args = build_cli_parser(ctx).parse_args(["watch", "rebuild-log"])
 
-    async def command():
+    async def command(expected=True, language="en"):
+        import io
+        from sunpack.runtime.cli.cli_reporter import CliReporter
+
+        ctx = CliContext(language=language, cwd=str(tmp_path))
+        output, errors = io.StringIO(), io.StringIO()
+        ctx.reporter = CliReporter(stdout=output, stderr=errors)
         code, result = await watch.handle(args, ctx)
-        assert code == 0 and not result.errors
+        assert code == (0 if expected else 1)
+        assert result.summary == {"rebuilt": expected}
+        message = ctx.t("cli.watch.rebuild_log_done" if expected else "cli.watch.rebuild_log_failed")
+        assert (output.getvalue() if expected else errors.getvalue()).strip() == message
+        assert result.errors == ([] if expected else [message])
+        assert result.logs == ([message] if expected else [])
 
     def restored():
         rows = _records(path)
@@ -270,6 +281,13 @@ def test_log_corruption_rebuilds_through_cli_and_writer_and_retries_after_failur
     asyncio.run(command())
     restored()
     assert not (folder / "broken.index").exists()
+    # Offline failure must also return failure, rather than its outer exception
+    # handler converting it into a successful CLI result.
+    path.unlink()
+    path.mkdir()
+    asyncio.run(command(False))
+    path.rmdir()
+    asyncio.run(command(language="zh"))
 
     state = WatchStateStore(state_path)
     log = WatchLogStore(str(path))
@@ -278,12 +296,16 @@ def test_log_corruption_rebuilds_through_cli_and_writer_and_retries_after_failur
     try:
         # Force both publication and rebuild to fail, without a retry timer.
         log.flush()
+        sentinel = folder / "retained-on-delete-failure"
+        sentinel.touch()
         path.unlink()
         path.mkdir()
         log.write("done", path="lost-during-storage-failure")
         log.flush()  # Failed recovery must not escape to the business caller.
         assert log.error
-        asyncio.run(command())  # The explicit CLI also swallows failed rebuilds.
+        for language in ("en", "zh"):
+            asyncio.run(command(False, language))
+        assert sentinel.exists()  # Manifest deletion failure must stop cleanup.
         path.rmdir()
         log.write("done", path="after-storage-repair")
         log.flush()
@@ -294,6 +316,20 @@ def test_log_corruption_rebuilds_through_cli_and_writer_and_retries_after_failur
         path.write_text("[]", encoding="utf-8")
         asyncio.run(command())
         restored()
+        # Race native snapshot recovery with real WAL changes and ordinary
+        # writes. The serial recovery checks cannot catch overwritten notices.
+        def mutate():
+            for index in range(32):
+                state.mark(str(source), 0, 1.0, status=("failed_password" if index % 2 else "suspended_missing_volume"), source_group=group)
+
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            futures = [pool.submit(mutate), pool.submit(lambda: [log.rebuild() for _ in range(16)]),
+                       pool.submit(lambda: [log.write("diagnostic", index=i) for i in range(32)])]
+            for future in futures:
+                future.result()
+        log.flush()
+        waiting = [r for r in _records(path) if r["event"] in {"failed_password", "suspended_missing_volume"}]
+        assert len(waiting) == 1 and waiting[0]["event"] == "failed_password"
     finally:
         host._watch_service = None
         state.close()

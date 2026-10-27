@@ -68,12 +68,13 @@ class WatchLogStore:
             # must not break the task; the next log operation tries again.
             pass
 
-    def rebuild(self) -> None:
+    def rebuild(self) -> bool:
         try:
             self._native.rebuild()
-            self.flush()
+            self._native.flush()
+            return True
         except Exception:
-            pass
+            return False
 
     @property
     def error(self) -> str | None:

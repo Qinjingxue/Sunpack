@@ -81,7 +81,7 @@ void pump_diagnostic(Application& app,const std::function<bool()>& condition,con
     try { pump(condition,phase); }
     catch(...) {
         std::cerr<<"UI wait diagnostic ["<<phase<<"]";
-        for(const char* key:{"tab","taskQuery","taskRoot","taskStatus","requests","dispatch",
+        for(const char* key:{"tab","language","taskQuery","taskRoot","taskStatus","requests","dispatch",
                              "errors","logPath","actionError","busy","lastCommand",
                              "saving","pendingFields","saveErrors","drafts","tagInputs"}) {
             try { std::cerr<<" "<<key<<"="<<state(app.page(),key).dump(); }
@@ -90,6 +90,7 @@ void pump_diagnostic(Application& app,const std::function<bool()>& condition,con
         try {
             auto tasks=state(app.page(),"tasks");
             std::cerr<<" tasks.total="<<tasks.value("total",-1);
+            if(tasks.contains("rows") && !tasks["rows"].empty()) std::cerr<<" tasks.first="<<tasks["rows"][0]["name"];
         } catch(const std::exception& e) { std::cerr<<" tasks=<unavailable: "<<e.what()<<">"; }
         std::cerr<<'\n';
         throw;
@@ -1334,7 +1335,7 @@ int wmain(int argc,wchar_t** argv) {
         Json args=Json::array(); for(int i=3;i<argc;++i) args.push_back(utf8(argv[i])); atomic_write(fs::current_path()/"cli-arguments.json",args.dump());
         if(args==Json::array({"watch","rebuild-log"}))
             publish_events(fs::current_path()/".sunpack_watch"/"events.json",
-                Json{{"event","done"},{"path",utf8((fs::current_path()/"carrier.001").wstring())}}.dump()+"\n");
+                Json{{"event","done"},{"path",utf8((fs::current_path()/("recovered-"+std::to_string(GetCurrentProcessId())+".001")).wstring())}}.dump()+"\n");
         Handle gate(OpenEventW(SYNCHRONIZE,FALSE,argv[2])); assert(gate.value);
         assert(WaitForSingleObject(gate,10000)==WAIT_OBJECT_0);
         std::cout<<args.dump(); return 0;
@@ -1371,18 +1372,63 @@ int wmain(int argc,wchar_t** argv) {
                 // this window for manifest and page-data corruption; without
                 // these checks neither read failure is covered end to end.
                 auto log_path=dir/".sunpack_watch"/"events.json", cli_args=dir/"cli-arguments.json";
+                auto task_name=state(app.page(),"tasks")["rows"][0]["name"];
                 auto await_rebuild=[&] {
-                    pump_diagnostic(app,[&]{return fs::exists(cli_args) && read_json(cli_args)==Json::array({"watch","rebuild-log"}) &&
-                        state(app.page(),"errors").empty();},"Log recovery command and refreshed tasks");
-                    assert(state(app.page(),"tasks")["rows"][0]["name"]=="carrier.001");
+                    pump_diagnostic(app,[&]{
+                        auto rows=state(app.page(),"tasks")["rows"];
+                        return fs::exists(cli_args) && read_json(cli_args)==Json::array({"watch","rebuild-log"}) &&
+                            state(app.page(),"errors").empty() && rows.size()==1 && rows[0]["name"]!=task_name;
+                    },"Log recovery command and refreshed tasks");
+                    task_name=state(app.page(),"tasks")["rows"][0]["name"];
                     fs::remove(cli_args);
                 };
-                atomic_write(log_path,"{"); await_rebuild();
+                // In-place fixture writes permit readers, avoiding an unrelated
+                // rename-sharing window before the corruption is observed.
+                { std::ofstream broken(log_path,std::ios::binary|std::ios::trunc); broken<<"{"; }
+                await_rebuild();
                 auto manifest=read_json(log_path);
                 auto run=manifest["runs"][0]["name"].get<std::string>();
                 atomic_write(log_path.parent_path()/"events.json.store"/(run+".data"),"bad");
-                manifest["task_revision"]=manifest["task_revision"].get<uint64_t>()+1;
-                atomic_write(log_path,manifest.dump()); await_rebuild();
+                auto config=read_json(dir/"sunpack_config.json");
+                auto original_language=state(app.page(),"language").get<std::string>();
+                auto changed_language=original_language=="en"?"zh":"en";
+                config["cli"]["language"]=changed_language;
+                atomic_write(dir/"sunpack_config.json",config.dump()); await_rebuild();
+                publish_events(log_path,Json{{"event","done"},{"path",utf8((dir/"carrier.001").wstring())}}.dump()+"\n");
+                config["cli"]["language"]=original_language;
+                atomic_write(dir/"sunpack_config.json",config.dump());
+                pump_diagnostic(app,[&]{return state(app.page(),"language")==original_language &&
+                    state(app.page(),"tasks")["rows"][0]["name"]=="carrier.001";},"Restore recovery fixture");
+                // Unlike corruption, a sharing conflict or an unpublished file
+                // must retain history and never invoke the destructive command.
+                // Language publication acknowledges that the task query ran.
+                manifest=read_json(log_path);
+                run=manifest["runs"][0]["name"].get<std::string>();
+                auto data=log_path.parent_path()/"events.json.store"/(run+".data");
+                auto query_conflict=[&] {
+                    config["cli"]["language"]=changed_language;
+                    atomic_write(dir/"sunpack_config.json",config.dump());
+                    pump_diagnostic(app,[&]{return state(app.page(),"language")==changed_language;},"Log conflict query");
+                    assert(!fs::exists(cli_args));
+                    assert(state(app.page(),"tasks")["rows"][0]["name"]=="carrier.001");
+                };
+                auto query_restored=[&] {
+                    config["cli"]["language"]=original_language;
+                    atomic_write(dir/"sunpack_config.json",config.dump());
+                    manifest["task_revision"]=manifest["task_revision"].get<uint64_t>()+1;
+                    atomic_write(log_path,manifest.dump());
+                    pump_diagnostic(app,[&]{return state(app.page(),"language")==original_language && state(app.page(),"errors").empty();},"Log conflict released");
+                    assert(!fs::exists(cli_args));
+                };
+                {
+                    Handle held(CreateFileW(data.c_str(),GENERIC_READ,0,nullptr,OPEN_EXISTING,0,nullptr));
+                    assert(held.value!=INVALID_HANDLE_VALUE);
+                    query_conflict();
+                }
+                query_restored();
+                auto unpublished=data; unpublished+=L".unpublished";
+                fs::rename(data,unpublished); query_conflict();
+                fs::rename(unpublished,data); query_restored();
             }
             screenshot(app,L"startup.png");
                 page_motion(app);

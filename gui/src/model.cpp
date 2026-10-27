@@ -635,7 +635,15 @@ bool EventLog::refresh(bool missing_is_final) {
     try {
         auto next=read_json(path_);
         if(!next.is_object() || next.value("format",0)!=1) throw std::runtime_error("logRecordTooLarge");
-        auto changed=manifest.is_null() || next.value("task_revision",uint64_t(0))!=manifest.value("task_revision",uint64_t(0)) || next.value("dropped",uint64_t(0))!=manifest.value("dropped",uint64_t(0));
+        // File identity detects rebuilt storage even when counters collide.
+        // Diagnostic-only appends can change run sizes without changing tasks.
+        auto same_run=[](const Json& a,const Json& b) {
+            return a.is_null() || b.is_null()?a==b:a.at("name")==b.at("name");
+        };
+        auto changed=manifest.is_null() || next.value("task_revision",uint64_t(0))!=manifest.value("task_revision",uint64_t(0)) ||
+            next.value("dropped",uint64_t(0))!=manifest.value("dropped",uint64_t(0)) ||
+            !std::equal(next.at("runs").begin(),next.at("runs").end(),manifest.at("runs").begin(),manifest.at("runs").end(),same_run) ||
+            !same_run(next.at("live"),manifest.at("live"));
         manifest=std::move(next);
         if(changed) { tasks.clear(); }
         return changed;

@@ -76,8 +76,14 @@ async def handle(args, ctx):
         if action == "rebuild-log":
             from sunpack.runtime.cli.runtime_state import require_runtime_host
 
-            await require_runtime_host().rebuild_watch_log(load_request_config(ctx.cwd))
-            return 0, CliCommandResult(command=COMMAND, inputs={"action": action}, summary={})
+            rebuilt = await require_runtime_host().rebuild_watch_log(load_request_config(ctx.cwd))
+            message = ctx.t("cli.watch.rebuild_log_done" if rebuilt else "cli.watch.rebuild_log_failed")
+            if ctx.reporter is not None:
+                (ctx.reporter.info if rebuilt else ctx.reporter.error)(message)
+            return (0 if rebuilt else EXIT_TASK_FAILED), CliCommandResult(
+                command=COMMAND, inputs={"action": action}, summary={"rebuilt": rebuilt},
+                logs=[message] if rebuilt else [], errors=[] if rebuilt else [message],
+            )
         if action == "stop":
             return await _handle_stop(ctx)
         if action == "status":

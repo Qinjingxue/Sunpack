@@ -387,27 +387,32 @@ impl NativeWatchState {
     pub(crate) fn with_event_projection<T>(&self, publish: impl FnOnce(Vec<Value>) -> T) -> T {
         // Use the existing sink mutex to order snapshot publication with apply's
         // state mutation + notifications. The data-map lock still ends before
-        // projection serialization, and no disk I/O is covered by this gate.
+        // member checks and projection serialization.
         let _publication = self.events.lock().unwrap();
         publish(Self::event_projection(&self.data))
     }
     pub(crate) fn event_projection(data: &Mutex<StateData>) -> Vec<Value> {
-        let data = data.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut entries: Vec<_> = {
+            let data = data.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            data.entries
+                .values()
+                .filter(|record| {
+                    matches!(
+                        record.status.as_str(),
+                        "failed_password" | "suspended_missing_volume"
+                    )
+                })
+                .cloned()
+                .collect()
+        };
         let mut rows = Vec::new();
         let mut member_presence = HashMap::new();
-        let mut entries: Vec<_> = data.entries.values().collect();
         entries.sort_by(|a, b| {
             a.last_attempt_at
                 .total_cmp(&b.last_attempt_at)
                 .then_with(|| a.path.cmp(&b.path))
         });
-        for record in entries {
-            if !matches!(
-                record.status.as_str(),
-                "failed_password" | "suspended_missing_volume"
-            ) {
-                continue;
-            }
+        for record in &entries {
             if let Some(group) = record.failure_payload.get("source_group") {
                 // A member can disappear after its blocker WAL commit (even
                 // while offline). Verify only recorded member presence; never
@@ -429,7 +434,6 @@ impl NativeWatchState {
             }
             rows.push(entry_event(record));
         }
-        drop(data);
         rows
     }
     pub(crate) fn lock(&self) -> MutexGuard<'_, StateData> {

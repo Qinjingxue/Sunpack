@@ -285,11 +285,14 @@ impl Store {
             "{}.store",
             path.file_name().unwrap().to_string_lossy()
         ));
-        for result in [fs::remove_file(&path), fs::remove_dir_all(&folder)] {
-            if let Err(error) = result {
-                if error.kind() != io::ErrorKind::NotFound {
-                    return Err(error);
-                }
+        if let Err(error) = fs::remove_file(&path) {
+            if error.kind() != io::ErrorKind::NotFound {
+                return Err(error);
+            }
+        }
+        if let Err(error) = fs::remove_dir_all(&folder) {
+            if error.kind() != io::ErrorKind::NotFound {
+                return Err(error);
             }
         }
         Self::open(path)

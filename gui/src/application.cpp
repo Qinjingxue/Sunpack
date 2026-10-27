@@ -1071,27 +1071,39 @@ void Application::work() {
                 } catch(const std::exception& e) { errors["logObserver"]=e.what(); }
                 log.set_path(log_dir/"events.json"); flags|=Log; tasks_changed=true;
             }
-            bool rebuild_log=false;
-            if(flags&Log) {
+            bool rebuild_log=false, log_unavailable=false;
+            auto log_error=[&](const std::exception& error) {
+                log_unavailable=true;
+                const auto* io=dynamic_cast<const WinError*>(&error);
+                if(io && (io->code==ERROR_SHARING_VIOLATION || io->code==ERROR_LOCK_VIOLATION ||
+                    io->code==ERROR_FILE_NOT_FOUND || io->code==ERROR_PATH_NOT_FOUND)) {
+                    // Publication conflicts wait for the next file notification.
+                    task_query_pending=true;
+                    errors.erase("events.json");
+                    return;
+                }
+                errors["events.json"]=error.what(); rebuild_log=true;
+            };
+            if((flags&Log) || task_query_pending) {
                 try {
                     bool refreshed=log.refresh();
                     tasks_changed|=refreshed || task_query_pending;
                     errors.erase("events.json");
                 }
-                catch(const std::exception& e){ errors["events.json"]=e.what(); rebuild_log=true; }
+                catch(const std::exception& e){ log_error(e); }
             }
             Json patch=Json::object();
             auto next_language=gui_language(config);
             bool language_changed=language!=next_language || !previous_patch.contains("language");
             language=std::move(next_language);
             if(language_changed) { patch["language"]=language; patch["texts"]=interface_texts(language); }
-            if(!rebuild_log && (tasks_changed || language_changed || !previous_patch.contains("tasks"))) {
+            if(!log_unavailable && (tasks_changed || language_changed || !previous_patch.contains("tasks"))) {
                 log.cancelled=[this,query_generation]{return task_query_generation_.load()!=query_generation || WaitForSingleObject(stop_,0)==WAIT_OBJECT_0;};
                 try {
                     auto projected=task_rows(log,roots,view,language);
                     if(!projected.is_null()) { patch["tasks"]=std::move(projected); task_query_pending=false; }
                     errors.erase("events.json");
-                } catch(const std::exception& e) { errors["events.json"]=e.what(); rebuild_log=true; }
+                } catch(const std::exception& e) { log_error(e); }
                 log.cancelled={};
             }
             if(rebuild_log) {

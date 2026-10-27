@@ -201,7 +201,7 @@ Subcommands and options:
 | `remove PATH...`, `rm PATH...` | — | Remove a monitored root by input directory. |
 | `list`, `ls` | — | List the persisted input directories. |
 | `reload` | — | Re-read the configuration and monitored roots. |
-| `rebuild-log` | — | Clear display logs and rebuild from the watch snapshot/WAL. Completed history is discarded; recovery errors are ignored. |
+| `rebuild-log` | — | Clear display logs and rebuild from the watch snapshot/WAL. Completed history is discarded. Reports success or failure (exit code 1); automatic recovery still ignores failures and retries on later log operations. |
 | `stop` | — | Stop continuous monitoring. |
 | `status`, `st` | — | Show run status, pending counts, errors, and root directories. |
 | `startup enable\|disable\|status` | — | Manage the current user's logon startup entry. |

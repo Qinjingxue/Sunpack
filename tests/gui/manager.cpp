@@ -43,6 +43,23 @@ void projection(Fixture& f) {
     assert(task_rows(log,{},view)["total"]==1);
     log.cancelled=[]{return true;}; view.task_query="not-present";
     assert(task_rows(log,{},view).is_null()); log.cancelled={};
+    // A background rebuild can reuse both counters. Ordinary appends cannot
+    // detect stale cards in that case; reuse this disk fixture at negligible cost.
+    auto before=log.manifest;
+    publish_events(p,event("done",source,1));
+    auto replaced=read_json(p);
+    replaced["task_revision"]=before["task_revision"]; replaced["dropped"]=before["dropped"];
+    atomic_write(p,replaced.dump());
+    assert(log.refresh());
+    view.task_query.clear();
+    assert(task_rows(log,{},view)["rows"][0]["name"]==utf8(source.filename().wstring()));
+    // Live storage replacement has the same contract even when runs stay fixed.
+    replaced["live"]=replaced["runs"][0]; replaced["runs"]=Json::array();
+    atomic_write(p,replaced.dump()); assert(log.refresh());
+    publish_events(p,"");
+    auto empty=read_json(p); replaced["live"]=empty["runs"][0];
+    atomic_write(p,replaced.dump()); assert(log.refresh());
+    assert(task_rows(log,{},view)["rows"].empty());
     fs::remove(p); fails([&]{log.refresh();}); log.refresh(true); assert(log.manifest.is_null());
     // Numeric UTC epochs display in local wall time. TZ is process-only.
     EventLog timestamps;

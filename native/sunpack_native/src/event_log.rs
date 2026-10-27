@@ -835,19 +835,32 @@ fn writer(shared: Arc<Shared>, path: PathBuf) {
                 continue;
             }
             state.working = true;
-            let rebuild = std::mem::take(&mut state.rebuild);
-            if rebuild {
-                // Reuse the WAL-backed state's projection without retaining its
-                // lifetime or passing its records through Python.
-                if let Some(source) = shared.source.lock().unwrap().upgrade() {
-                    state.projection = Projection::default();
+            if state.rebuild {
+                let revision = state.revision;
+                drop(state);
+                // Snapshot and member I/O never hold the log mutex. Build the
+                // projection here too, so producers can keep submitting work.
+                let source = shared.source.lock().unwrap().upgrade();
+                let projection = source.map(|source| {
+                    let mut projection = Projection::default();
                     for mut value in NativeWatchState::event_projection(&source) {
-                        let _ = state.projection.apply(&mut value);
+                        let _ = projection.apply(&mut value);
                     }
+                    projection
+                });
+                state = shared.state.lock().unwrap();
+                if state.revision != revision {
+                    // Preserve notifications received after the snapshot; retry
+                    // from current state instead of overwriting those updates.
+                    continue;
+                }
+                if let Some(projection) = projection {
+                    state.projection = projection;
                 }
                 state.live_dirty = shared.stateful;
                 state.reset_live = true;
             }
+            let rebuild = std::mem::take(&mut state.rebuild);
             let live = if state.live_dirty {
                 state.live_dirty = false;
                 let reset = std::mem::take(&mut state.reset_live);
@@ -1080,6 +1093,46 @@ impl NativeEventLog {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn blocked_rebuild_snapshot_leaves_producers_available() {
+        // Disk recovery tests miss a producer blocked by the snapshot's log
+        // mutex. Hold the source map while native producers keep submitting;
+        // only a bounded deadlock guard is used, with no disk-speed threshold.
+        let path = crate::test_support::temp_file("display_rebuild_lock", b"");
+        std::fs::remove_file(&path).unwrap();
+        let log = NativeEventLog::new(path.clone(), 7, false).unwrap();
+        let shared = Arc::clone(log.shared().unwrap());
+        let source = Arc::new(Mutex::new(crate::watch_store::StateData::default()));
+        *shared.source.lock().unwrap() = Arc::downgrade(&source);
+        let blocked = source.lock().unwrap();
+        log.rebuild().unwrap();
+        let (sent, received) = std::sync::mpsc::channel();
+        let producer = Arc::clone(&shared);
+        let thread = std::thread::spawn(move || {
+            for index in 0..1024 {
+                producer.submit(json!({"event":"diagnostic","index":index}));
+                std::thread::yield_now();
+            }
+            sent.send(()).unwrap();
+        });
+        let progress = received.recv_timeout(std::time::Duration::from_secs(5));
+        // Always unblock both threads before reporting a regression.
+        drop(blocked);
+        thread.join().unwrap();
+        drop(shared);
+        drop(log);
+        assert!(
+            progress.is_ok(),
+            "log producers waited for the rebuild snapshot"
+        );
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir_all(path.with_file_name(format!(
+            "{}.store",
+            path.file_name().unwrap().to_string_lossy()
+        )))
+        .unwrap();
+    }
+
     #[test]
     fn completed_families_leave_no_resident_history_or_aliases() {
         // Disk/GUI checks cannot see producer references. Removing this test
