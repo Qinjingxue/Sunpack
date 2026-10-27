@@ -637,15 +637,6 @@ fn inspect_structural_stream(
     let reader = py
         .detach(|| ManagedReader::open(path))
         .map_err(crate::io::resource_error::to_py_error)?;
-    inspect_structural_stream_reader(py, &reader, file_size, kind)
-}
-
-fn inspect_structural_stream_reader(
-    py: Python<'_>,
-    reader: &ManagedReader,
-    file_size: u64,
-    kind: StructuralStreamKind,
-) -> PyResult<Py<PyDict>> {
     let (format, ext, magic, fields, cost) = match kind {
         StructuralStreamKind::Gzip => (
             "gzip",

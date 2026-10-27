@@ -140,7 +140,6 @@ impl AnalysisBinaryView {
             signature_prepass,
             format_structure,
             None,
-            Some(&self.path),
         )
     }
 

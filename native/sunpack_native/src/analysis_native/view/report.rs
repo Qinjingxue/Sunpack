@@ -320,9 +320,6 @@ struct ReportContext<'a, 'py> {
     py: Python<'py>,
     view: &'a AnalysisBinaryView,
     disk_starts: Option<&'a [u64]>,
-    // Only a physical single file receives full compression-stream structure
-    // validation; a logical multi-volume stream is header-validated.
-    stream_path: Option<&'a str>,
     prepass: Bound<'py, PyDict>,
     hits: Arc<[SignatureHit]>,
     embedded: HashMap<String, Vec<Bound<'py, PyDict>>>,
@@ -330,7 +327,6 @@ struct ReportContext<'a, 'py> {
 }
 
 impl AnalysisBinaryView {
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn analyze_report<'py>(
         &self,
         py: Python<'py>,
@@ -339,7 +335,6 @@ impl AnalysisBinaryView {
         signature_prepass: bool,
         format_structure: bool,
         disk_starts: Option<&[u64]>,
-        stream_path: Option<&str>,
     ) -> PyResult<Py<PyDict>> {
         self.ensure_open()?;
         let (prepass, hits) = match initial_prepass {
@@ -369,7 +364,6 @@ impl AnalysisBinaryView {
             py,
             view: self,
             disk_starts,
-            stream_path,
             prepass,
             hits,
             embedded,
@@ -1013,13 +1007,11 @@ impl<'a, 'py> ReportContext<'a, 'py> {
             return Ok(structure.clone());
         }
         let structure = if stream_family(&self.view.reader.read_at(0, 32).unwrap_or_default()) {
-            Some(match (self.stream_path, self.view.reader.file_identity().ok()) {
-                (Some(path), Some(identity)) => stream_structure_cached(self.py, identity, path)?,
-                (path, _) => {
-                    crate::analysis_native::structure::inspect_compression_stream_source(
-                        self.py, &self.view.reader, path,
-                    )?.into_bound(self.py)
-                }
+            Some(match self.view.reader.file_identity().ok() {
+                Some(identity) => stream_structure_cached(self.py, identity, &self.view.path)?,
+                None => crate::analysis_native::inspect_compression_stream_structure(
+                    self.py, &self.view.path,
+                )?.into_bound(self.py),
             })
         } else {
             // No compression family can match; the requested-format mismatch

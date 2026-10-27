@@ -297,7 +297,7 @@ int wmain(int argc,wchar_t **argv) {
         save(root/L"uncompressed_blocks.lz4",random_frame);
         if(argc>2 && std::wstring(argv[2])==L"--benchmark") { benchmark(input); benchmark(random); }
         // A logical 1 GiB skippable payload occupies almost no physical space.
-        // Analysis and TAR sampling must jump over it, not decode/read it.
+        // Analysis must jump over it, not decode/read it.
         const auto sparse_path=(root/L"large_skip.tar.lz4").wstring();
         HANDLE sparse=CreateFileW(sparse_path.c_str(),GENERIC_WRITE,0,nullptr,CREATE_ALWAYS,FILE_ATTRIBUTE_NORMAL,nullptr);
         check(sparse!=INVALID_HANDLE_VALUE,"sparse fixture open");DWORD processed=0;
@@ -310,7 +310,6 @@ int wmain(int argc,wchar_t **argv) {
         check(WriteFile(sparse,tar_frame.data(),static_cast<DWORD>(tar_frame.size()),&processed,nullptr)&&processed==tar_frame.size(),"sparse frame");CloseHandle(sparse);
         save(root/L"nested.lz4",frame(standard,4,true,true,true,true));
         Bytes carrier(1031,0x89);carrier.insert(carrier.end(),concatenated.begin(),concatenated.end());carrier.resize(carrier.size()+29,0x88);save(root/L"carrier.dat",carrier);
-        const auto split=standard.size()/2;save(root/L"split.any.001",Bytes(standard.begin(),standard.begin()+split));save(root/L"split.any.002",Bytes(standard.begin()+split,standard.end()));
         auto extracted=sunpack::sevenzip::extract_archive_with_parts((root/L"frame_7_15.lz4").wstring(),{},L"lz4",L"",(root/L"worker_output").wstring(),L"",nullptr,false);
         if (!extracted.command_ok) std::cerr<<"worker: "<<extracted.message<<" kind="<<extracted.failure_kind<<" hr="<<extracted.hresult<<" op="<<extracted.operation_result<<"\n";
         check(extracted.command_ok&&extracted.has_stream_receipt&&extracted.stream_receipt.content_checked_frames==1,"worker extraction");

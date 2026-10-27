@@ -150,11 +150,9 @@ def test_manifest_views_share_full_native_entries_and_unpacked_size(tmp_path):
     assert full.retained_file_count == 30
 
 
-def test_tar_manifest_preserves_all_pax_members_across_parts(tmp_path):
-    # Later metadata and PAX records split across physical parts must both
-    # survive the walk; ordinary member-count tests miss either boundary.
-    from sunpack_native import archive_state_tar_manifest_native
-
+def test_tar_manifest_preserves_all_pax_members(tmp_path):
+    # Later metadata and PAX records must survive the walk; ordinary
+    # member-count tests miss the per-member PAX size override.
     path = tmp_path / "members.tar"
     body = bytearray()
     for index in range(12):
@@ -170,14 +168,3 @@ def test_tar_manifest_preserves_all_pax_members_across_parts(tmp_path):
     assert manifest.file_count == 12
     assert manifest.retained_file_count == 12
     assert manifest.total_unpacked_size == 24
-
-    first, second = tmp_path / "part.001", tmp_path / "part.002"
-    first.write_bytes(body[:517])
-    second.write_bytes(body[517:])
-    source = {"entry_path": str(first), "parts": [{"path": str(first)}, {"path": str(second)}]}
-    joined = archive_state_tar_manifest_native(source)
-    assert joined.archive_walk_complete
-    assert (joined.file_count, joined.total_unpacked_size) == (12, 24)
-    assert joined.entry_page(0, 10) == manifest.entries.entry_page(0, 10)
-    incomplete = archive_state_tar_manifest_native({'entry_path': str(first)})
-    assert not incomplete.archive_walk_complete

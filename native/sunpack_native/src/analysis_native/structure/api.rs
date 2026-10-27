@@ -694,30 +694,18 @@ pub(crate) fn inspect_compression_stream_structure(
     let Ok(reader) = py.detach(|| ManagedReader::open(path)) else {
         return compression_empty(py, "os_error", "", "", false);
     };
-    inspect_compression_stream_source(py, &reader, Some(path))
-}
-
-/// Use the same structural validators for logical inputs such as split streams.
-/// Their existing ManagedReader owns the concatenation; no materialization or
-/// second analysis of the individual volumes is needed.
-pub(crate) fn inspect_compression_stream_source(
-    py: Python<'_>,
-    reader: &ManagedReader,
-    path: Option<&str>,
-) -> PyResult<Py<PyDict>> {
     let file_size = reader.len();
     let header = py.detach(|| reader.read_cached_at(0, 32))?;
     if let Some(kind) = StructuralStreamKind::from_header(&header) {
-        return match (path, kind) {
-            (Some(path), StructuralStreamKind::Gzip) => inspect_gzip(py, path, &header, file_size),
-            (Some(path), StructuralStreamKind::Bzip2) => inspect_bzip2(py, path, &header, file_size),
-            (Some(path), StructuralStreamKind::Xz) => inspect_xz(py, path, &header, file_size),
-            (Some(path), StructuralStreamKind::Zstd) => inspect_zstd(py, path, &header, file_size),
-            (None, kind) => inspect_structural_stream_reader(py, reader, file_size, kind),
+        return match kind {
+            StructuralStreamKind::Gzip => inspect_gzip(py, path, &header, file_size),
+            StructuralStreamKind::Bzip2 => inspect_bzip2(py, path, &header, file_size),
+            StructuralStreamKind::Xz => inspect_xz(py, path, &header, file_size),
+            StructuralStreamKind::Zstd => inspect_zstd(py, path, &header, file_size),
         };
     }
     if crate::formats::lz4::leading(&header) {
-        let index = py.detach(|| crate::formats::lz4::walk(reader, 0, file_size));
+        let index = py.detach(|| crate::formats::lz4::walk(&reader, 0, file_size));
         if index.frames == 0 && matches!(index.error, "" | "lz4_magic_not_found") {
             return compression_empty(py, "ambiguous_skippable_stream", "", "", false);
         }

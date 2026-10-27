@@ -14,11 +14,11 @@ from sunpack_native import inspect_compression_stream_structure, inspect_tar_hea
 def test_gzip_optional_header_contract_is_shared_by_analysis_identity_and_carving(tmp_path):
     # The streaming parser's optional-header tests cannot detect a separate
     # analysis/identity parser misplacing FHCRC. One small matrix covers all
-    # optional-field combinations, split headers, invalid CRC and truncation.
+    # optional-field combinations, invalid CRC and truncation.
     import struct
     import zlib
     from sunpack_native import (
-        AnalysisBinaryView, AnalysisMultiVolumeView, NativeAnalysisConfig,
+        AnalysisBinaryView, NativeAnalysisConfig,
         inspect_compression_stream_identity, scan_embedded_archives,
     )
 
@@ -43,17 +43,13 @@ def test_gzip_optional_header_contract_is_shared_by_analysis_identity_and_carvin
             path.write_bytes(body)
             assert inspect_compression_stream_identity(str(path))["plausible"]
             assert inspect_compression_stream_structure(str(path))["plausible"]
-            split = len(head) - 1
-            parts = [tmp_path / f"first-{optional}-{crc}.jpg", tmp_path / f"second-{optional}-{crc}.jpg"]
-            parts[0].write_bytes(body[:split])
-            parts[1].write_bytes(body[split:])
-            for view in (AnalysisBinaryView(str(path)), AnalysisMultiVolumeView(list(map(str, parts)))):
-                try:
-                    assert view.probe_compression_stream("gzip")["plausible"]
-                    report = view.analyze(cfg)
-                    assert report["evidences"][0][1:3] == (0.97, "extractable")
-                finally:
-                    view.close()
+            view = AnalysisBinaryView(str(path))
+            try:
+                assert view.probe_compression_stream("gzip")["plausible"]
+                report = view.analyze(cfg)
+                assert report["evidences"][0][1:3] == (0.97, "extractable")
+            finally:
+                view.close()
             if crc:
                 damaged = bytearray(body)
                 damaged[len(head) - 1] ^= 1

@@ -490,13 +490,6 @@ def test_tar_is_recognized_only_at_the_logical_start_or_from_embedded_evidence(t
         assert report.best_selected.format == fmt
         assert all("." not in item.format for item in report.evidences)
         assert next(item for item in report.evidences if item.format == "tar").status == "not_found"
-        data = path.read_bytes()
-        first, second = tmp_path / (fmt + ".001"), tmp_path / (fmt + ".002")
-        first.write_bytes(data[:len(data) // 2])
-        second.write_bytes(data[len(data) // 2:])
-        split = engine.analyze_paths([str(first), str(second)])
-        assert split.best_selected.format == fmt
-        assert split.best_selected.segments[0].end_offset == len(data)
 
     # A genuine nonzero TAR is available only through the existing scanner.
     carrier = tmp_path / "carrier.photo"
@@ -510,26 +503,20 @@ def test_tar_is_recognized_only_at_the_logical_start_or_from_embedded_evidence(t
 
 
 def test_outer_stream_damage_cannot_be_upgraded_by_a_readable_tar_prefix(tmp_path, tar_stream_samples):
-    # Only this test puts a valid TAR prefix behind an incomplete outer trailer
-    # and follows both single-file and split-source report projection. Removing
-    # it loses the regression that motivated deleting composite recognition.
+    # Only this test puts a valid TAR prefix behind an incomplete outer trailer.
+    # Removing it loses the regression that motivated deleting composite recognition.
     _, streams = tar_stream_samples
     engine = AnalysisEngine()
     for fmt, source in streams.items():
         data = source.read_bytes()[:-{"gzip": 8, "bzip2": 10, "xz": 12, "zstd": 4, "lz4": 4}[fmt]]
-        first = tmp_path / (fmt + "-damaged.photo")
-        second = tmp_path / (fmt + "-tail.photo")
-        first.write_bytes(data)
-        single = engine.analyze_path(str(first))
-        first.write_bytes(data[:len(data) // 2])
-        second.write_bytes(data[len(data) // 2:])
-        split = engine.analyze_paths([str(first), str(second)])
-        for report in (single, split):
-            outer = next(item for item in report.evidences if item.format == fmt)
-            assert outer.status == "damaged", (fmt, outer)
-            assert outer.details.get("structure_validation_complete", False) is False
-            assert report.best_selected is None, (fmt, report.selected)
-            assert report.extractable_segments == ()
+        path = tmp_path / (fmt + "-damaged.photo")
+        path.write_bytes(data)
+        report = engine.analyze_path(str(path))
+        outer = next(item for item in report.evidences if item.format == fmt)
+        assert outer.status == "damaged", (fmt, outer)
+        assert outer.details.get("structure_validation_complete", False) is False
+        assert report.best_selected is None, (fmt, report.selected)
+        assert report.extractable_segments == ()
 
     # A present but incorrect GZIP CRC must also remain damaged even though its
     # complete DEFLATE structure and inner TAR header are both readable.

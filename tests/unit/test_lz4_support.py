@@ -142,17 +142,6 @@ def test_lz4_damage_does_not_become_wrong_password(fixtures, tmp_path, name, kin
     assert path.exists()
 
 
-def test_explicit_concat_input_reuses_multivolume_reader_and_worker(fixtures, tmp_path):
-    paths = [str(fixtures / f"split.any.00{i}") for i in (1, 2)]
-    report = AnalysisEngine().analyze_paths(paths)
-    selected = report.best_selected
-    assert selected.format == "lz4" and selected.details["stream_plan"]["complete"]
-    descriptor = ArchiveInputDescriptor(entry_path=paths[0], open_mode="concat_ranges", format_hint="lz4",
-        extents=[InputExtent(path) for path in paths], analysis={"stream_plan": selected.details["stream_plan"]})
-    result = worker(descriptor, tmp_path / "split")
-    assert result["status"] == "ok" and result["stream_receipt"]["output_bytes"] == 5 * 1024 * 1024
-
-
 def test_parallel_jobs_have_independent_lz4_state(fixtures, tmp_path):
     descriptor = ArchiveInputDescriptor(entry_path=str(fixtures / "concat.bin"), format_hint="lz4")
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
@@ -292,10 +281,3 @@ def test_prefix_carrier_is_a_strict_subrange_at_zero(fixtures, tmp_path):
     assert result["status"] == "ok"
     assert result["stream_receipt"]["input_bytes"] == segment.end_offset
     assert fingerprints(fixtures / "expected_standard") == fingerprints(tmp_path / "prefix")
-
-
-def test_incomplete_split_never_has_a_complete_stream_plan(fixtures):
-    report = AnalysisEngine().analyze_path(str(fixtures / "split.any.001"))
-    assert not report.selected
-    evidence = next(e for e in report.evidences if e.format == "lz4")
-    assert not evidence.details["stream_plan"]["complete"]

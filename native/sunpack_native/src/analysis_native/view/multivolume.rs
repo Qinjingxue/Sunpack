@@ -152,29 +152,6 @@ impl AnalysisMultiVolumeView {
         .probe_seven_zip(py, start_offset)
     }
 
-    #[pyo3(signature = (start_offset=0))]
-    fn probe_tar(
-        &self,
-        py: Python<'_>,
-        start_offset: u64,
-    ) -> PyResult<Py<PyDict>> {
-        AnalysisBinaryView {
-            path: self.path.clone(),
-            reader: self.reader.clone(),
-            closed: self.closed,
-        }
-        .probe_tar(py, start_offset)
-    }
-
-    fn probe_compression_stream(&self, py: Python<'_>, format: &str) -> PyResult<Py<PyDict>> {
-        AnalysisBinaryView {
-            path: self.path.clone(),
-            reader: self.reader.clone(),
-            closed: self.closed,
-        }
-        .probe_compression_stream(py, format)
-    }
-
     fn stats(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
         self.ensure_open()?;
         let stats = self.reader.stats()?;
@@ -205,7 +182,6 @@ impl AnalysisMultiVolumeView {
             signature_prepass,
             format_structure,
             Some(&self.volume_starts),
-            None,
         )
     }
 

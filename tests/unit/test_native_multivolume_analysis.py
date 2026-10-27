@@ -1,6 +1,4 @@
-import io
 import struct
-import tarfile
 from binascii import crc32
 
 from sunpack.core.analysis.analyzer import ArchiveAnalyzer
@@ -37,16 +35,6 @@ def _evidence(volumes, archive_format: str):
     report = ArchiveAnalyzer().analyze(volumes)
     evidence = next(item for item in report.evidences if item.format == archive_format)
     return report, evidence
-
-
-def _tar_bytes() -> bytes:
-    output = io.BytesIO()
-    with tarfile.open(fileobj=output, mode="w", format=tarfile.USTAR_FORMAT) as archive:
-        info = tarfile.TarInfo("payload.bin")
-        info.size = 3
-        archive.addfile(info, io.BytesIO(b"abc"))
-    return output.getvalue()
-
 
 
 def _zip_bytes() -> bytes:
@@ -172,18 +160,3 @@ def test_multivolume_7z_structural_aes_coder_is_encrypted(tmp_path):
     assert raw["encrypted_header"] is False
     assert raw["encryption_scan_complete"] is True
     assert raw["password_state"] == "required"
-
-
-def test_multivolume_tar_walks_across_physical_volume_boundary(tmp_path):
-    archive = _tar_bytes()
-    # Split inside the first 512-byte TAR header.
-    paths = _write_parts(tmp_path, archive[:173], archive[173:])
-
-    _report, evidence = _evidence(paths, "tar")
-    raw = evidence.details
-
-    assert raw["plausible"] is True
-    assert raw["entry_walk_ok"] is True
-    assert raw["entries_checked"] == 1
-    assert raw["walk_complete"] is True
-    assert raw["end_zero_blocks"] is True
