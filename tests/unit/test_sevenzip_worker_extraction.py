@@ -51,6 +51,24 @@ def _require_7z_or_skip():
     return seven_zip
 
 
+def test_lzfse_uncompressed_blocks_stop_before_next_header(tmp_path):
+    # Other ZIP tests never use LZFSE raw blocks: a missing decrement copies
+    # later headers into output and reports legal archives as damaged. This
+    # small real-worker test protects the block boundary at negligible IO cost.
+    from tests.helpers.generated_fixtures import write_single_method_zip
+    archive = tmp_path / "lzfse.blob"
+    blocks = [bytes(range(256)) * 3, b"", b"last block" * 37]
+    payload = b"".join(blocks)
+    packed = b"".join(b"bvx-" + struct.pack("<I", len(block)) + block for block in blocks) + b"bvx$"
+    write_single_method_zip(archive, payload, packed, 99)
+    output = tmp_path / "out"
+    result = _invoke_worker(_require_worker_or_skip(), {
+        "job_id": "lzfse", "archive_path": str(archive), "format_hint": "zip", "output_dir": str(output)})
+    final = _worker_result(result.stdout)
+    assert result.returncode == 0 and final["status"] == "ok", result.stdout + result.stderr
+    assert (output / "payload.bin").read_bytes() == payload
+
+
 @pytest.mark.parametrize("tar_format", [tarfile.GNU_FORMAT, tarfile.PAX_FORMAT])
 def test_worker_resolves_hard_link_graph_and_rejects_invalid_targets(tmp_path, tar_format):
     # Other extraction tests only exercise payload-bearing members. This one
@@ -901,7 +919,7 @@ def test_memory_wait_releases_execution_lanes_and_accepts_cancellation(tmp_path)
     def capacity(mib):
         limits.JobMemoryLimit = mib * 1024**2
         assert kernel.SetInformationJobObject(handle, 9, ctypes.byref(limits), ctypes.sizeof(limits))
-    capacity(256 + 48)
+    capacity(512 + 48)
     process = subprocess.Popen([str(worker)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                text=True, encoding="utf-8", creationflags=subprocess.CREATE_NO_WINDOW,
                                env=os.environ | {"SUNPACK_NATIVE_WORKER_THREAD_CAPACITY": "2"})
@@ -941,7 +959,7 @@ def test_memory_wait_releases_execution_lanes_and_accepts_cancellation(tmp_path)
         # receipts for a changed source must require a rescan, never report CRC damage.
         with changed.open("ab") as output:
             output.write(b"\0" * 4)
-        capacity(256 + 128)
+        capacity(512 + 128)
         until(lambda event: {e.get("job_id") for e in seen if e.get("type") == "result"} >= {"large-2", "changed"})
         assert next(e for e in seen if e.get("type") == "result" and e.get("job_id") == "large-2")["status"] == "ok"
         assert next(e for e in seen if e.get("type") == "result" and e.get("job_id") == "changed")["failure_kind"] == "input_changed"
@@ -975,6 +993,7 @@ def test_native_worker_reports_cpu_credit_sizing_plan():
         "SUNPACK_NATIVE_WORKER_THREAD_CAPACITY",
         "SUNPACK_NATIVE_PROCESS_MODE",
         "SUNPACK_NATIVE_WORKER_PROFILE",
+        "SUNPACK_NATIVE_MEMORY_RESERVE_BYTES",
     ):
         environment.pop(key, None)
     completed = subprocess.run(
@@ -996,7 +1015,7 @@ def test_native_worker_reports_cpu_credit_sizing_plan():
     assert int(handshake["thread_capacity"]) == logical_processors
     assert int(handshake["nominal_cpu_budget"]) == logical_processors
     assert handshake["memory_management"] == "commitment_replay"
-    assert int(handshake["memory_reserve_bytes"]) == 268435456
+    assert int(handshake["memory_reserve_bytes"]) == 536870912
 
 
 def test_worker_event_rejects_non_objects_and_malformed_rows():

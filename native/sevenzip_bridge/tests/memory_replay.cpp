@@ -92,7 +92,7 @@ void admission_and_recovery() {
 }
 
 void simultaneous_scaled_machine_budgets() {
-    // 1:256 scale models 8/16/32 GiB with a fixed 256 MiB reserve. This
+    // 1:256 scale models 8/16/32 GiB with a fixed 512 MiB reserve. This
     // exercises simultaneous commitments against one budget while committing
     // at most 112 MiB on the development machine, without touching its RAM.
     for (const auto gib : {8, 16, 32}) {
@@ -118,6 +118,75 @@ void simultaneous_scaled_machine_budgets() {
         for (const auto &job : jobs) manager.end(*job);
         manager.stop();
     }
+}
+
+// Codec tests cannot distinguish a required dictionary from an earlier,
+// optional parallel buffer. This single scenario covers both restart gates
+// and the no-growth/no-spin invariant, without loading a large real archive.
+void restart_working_set() {
+    std::atomic<std::int64_t> capacity{128 * MiB};
+    NativeMemoryJob *active = nullptr;
+    NativeMemoryManager manager(0, [&] {
+        return NativeMemoryStatus{capacity.load() - static_cast<std::int64_t>(active ? active->committed : 0), 0, 0};
+    });
+    NativeMemoryJob job(manager);
+    active = &job;
+    manager.begin(job);
+    auto *unaligned = manager.allocate(job, 4 * MiB + 1);
+    require(unaligned && job.committed == 4 * MiB + 4096, "sub-page tail escaped commitment accounting");
+    require(!manager.allocate(job, SIZE_MAX), "oversized request wrapped the admission budget");
+    sunpack_memory_free(unaligned);
+    manager.end(job);
+    manager.begin(job);
+    auto *dictionary = manager.allocate(job, 24 * MiB);
+    auto *parallel = manager.allocate(job, 64 * MiB);
+    require(dictionary && parallel, "initial parallel workspace unavailable");
+    sunpack_memory_free(parallel);
+    capacity = 48 * MiB;
+    manager.changed();
+    require(!manager.allocate(job, 32 * MiB), "required allocation should be denied");
+    manager.retry(job);
+    sunpack_memory_free(dictionary);
+    manager.end(job);
+    std::atomic<bool> cancel{false};
+    std::promise<bool> resume;
+    auto resumed = resume.get_future();
+    manager.park(job, cancel, [&](bool value) { resume.set_value(value); });
+    require(resumed.wait_for(300ms) == std::future_status::timeout,
+        "refunding the failed attempt must not trigger a replay loop");
+    capacity = 64 * MiB; manager.changed();
+    require(resumed.wait_for(5s) == std::future_status::ready,
+        "optional historical peak blocked the required 56 MiB workspace");
+    require(resumed.get(), "restart canceled unexpectedly");
+    manager.begin(job);
+    dictionary = manager.allocate(job, 24 * MiB);
+    auto *required = manager.allocate(job, 32 * MiB);
+    require(dictionary && required, "replay lost the earlier dictionary's required commitment");
+    sunpack_memory_free(required);
+    // A governor withdrawal has no failed allocation to classify. Growth
+    // below its observed peak must permit one budgeted lower-memory attempt.
+    std::promise<bool> withdrawn;
+    auto withdrawal = withdrawn.get_future();
+    manager.set_wake(job, [&] { withdrawn.set_value(true); });
+    capacity = 16 * MiB;
+    manager.changed();
+    require(ready(withdrawal) && job.revoked, "external contraction did not withdraw the task");
+    sunpack_memory_free(dictionary);
+    manager.end(job);
+    std::promise<bool> probe;
+    auto probed = probe.get_future();
+    manager.park(job, cancel, [&](bool value) { probe.set_value(value); });
+    require(probed.wait_for(300ms) == std::future_status::timeout, "withdrawal restarted without external growth");
+    capacity = 20 * MiB; manager.changed();
+    require(probed.wait_for(5s) == std::future_status::ready,
+        "external growth below the old peak did not permit a bounded retry");
+    require(probed.get(), "growth probe canceled unexpectedly");
+    manager.begin(job);
+    dictionary = manager.allocate(job, 16 * MiB);
+    require(dictionary, "lower-memory execution could not consume its admission");
+    sunpack_memory_free(dictionary);
+    manager.end(job);
+    manager.stop();
 }
 
 void sparse_replay(const std::filesystem::path &directory) {
@@ -251,6 +320,7 @@ int main() {
     std::filesystem::create_directories(directory);
     admission_and_recovery();
     simultaneous_scaled_machine_budgets();
+    restart_working_set();
     sparse_replay(directory);
     disk_and_memory(directory, true);
     disk_and_memory(directory, false);

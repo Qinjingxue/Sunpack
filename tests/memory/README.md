@@ -9,6 +9,12 @@ cmake --build native/sevenzip_bridge/build-x64-ci --config Release --target sunp
 
 它不属于默认 pytest 收集；需要时手工测量。Job 限额、CPU 限额和 2 ms 采样均只用于测试子进程。
 
+全格式手动矩阵：`.venv/Scripts/python.exe tests/memory/worker_format_probe.py --jobs 32`。
+可用 `--corpus <目录>` 加入独立的旧 ZIP/RAR/7z 样本，`--case` 选择执行组。
+动态压力 probe 用 `--dynamic`，较快样本加 `--cpu-rate 25`，`--volumes 32` 测独立写入设施的叠加。
+当前默认固定预留为 512 MiB；`--reserve-mib 256` 保留旧预留对照。
+机制、完整测量与 A/B 命令参数见 [worker 内存优化报告](../../docs/worker_memory_optimization.md)。
+
 运行长期、大量文件的 watch 内存测试：
 
 ```powershell

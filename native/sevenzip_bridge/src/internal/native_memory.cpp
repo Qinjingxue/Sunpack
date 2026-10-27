@@ -16,6 +16,13 @@ struct Allocation { sunpack::sevenzip::NativeMemoryJob *job; std::size_t size; }
 std::mutex allocations_mutex;
 std::unordered_map<void *, Allocation> allocations;
 constexpr std::uint64_t quantum = SUNPACK_LARGE_ALLOCATION;
+std::uint64_t commitment(std::size_t size) noexcept {
+    if (size > UINT64_MAX - 4095) return UINT64_MAX;
+    return (static_cast<std::uint64_t>(size) + 4095) & ~std::uint64_t{4095};
+}
+bool can_fit(std::int64_t headroom, std::uint64_t bytes) noexcept {
+    return headroom >= 0 && bytes <= static_cast<std::uint64_t>(headroom);
+}
 std::int64_t difference(std::uint64_t a, std::uint64_t b) noexcept {
     return a >= b ? static_cast<std::int64_t>((std::min)(a - b, std::uint64_t{INT64_MAX}))
                   : -static_cast<std::int64_t>((std::min)(b - a, std::uint64_t{INT64_MAX}));
@@ -74,10 +81,20 @@ void NativeMemoryManager::stop() noexcept {
     if (thread_.joinable()) thread_.join();
 }
 void NativeMemoryManager::changed() noexcept {
+    resample_.store(true, std::memory_order_release);
     SetEvent(change_);
 }
-NativeMemoryStatus NativeMemoryManager::sample_locked() const {
-    auto status = query_ ? query_() : query_windows(reserve_bytes_);
+NativeMemoryStatus NativeMemoryManager::sample_locked(bool fresh) {
+    const auto now = GetTickCount64();
+    // Reconcile external changes on the existing active-only observation
+    // interval. Between samples every managed commit/free debits/refunds this
+    // ledger under the same mutex; concurrent dictionaries cannot spend it twice.
+    const bool requested = resample_.exchange(false, std::memory_order_acq_rel);
+    if (fresh || requested || now - sampled_at_ >= 250) {
+        cached_ = query_ ? query_() : query_windows(reserve_bytes_);
+        sampled_at_ = now;
+    }
+    auto status = cached_;
     for (const auto *job : jobs_) status.headroom -= static_cast<std::int64_t>(job->admission);
     status.available = static_cast<std::uint64_t>((std::max)(status.headroom, std::int64_t{0}));
     return status;
@@ -87,12 +104,15 @@ void NativeMemoryManager::begin(NativeMemoryJob &job, std::function<void()> wake
     job.running = true;
     job.wake_pending = false;
     job.failed_headroom = -1;
+    job.retry_headroom = INT64_MAX;
+    job.required = 0;
+    job.peak = job.committed;
     job.revoked.store(false, std::memory_order_release);
     job.denied.store(false, std::memory_order_release);
     job.cancel->store(false, std::memory_order_release);
     job.wake = std::move(wake);
     if (std::find(jobs_.begin(), jobs_.end(), &job) == jobs_.end()) jobs_.push_back(&job);
-    changed();
+    SetEvent(change_);
 }
 void NativeMemoryManager::end(NativeMemoryJob &job) {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -101,14 +121,14 @@ void NativeMemoryManager::end(NativeMemoryJob &job) {
     job.admission = 0;
     job.wake = {};
     jobs_.erase(std::remove(jobs_.begin(), jobs_.end(), &job), jobs_.end());
-    changed();
+    SetEvent(change_);
 }
 void NativeMemoryManager::set_wake(NativeMemoryJob &job, std::function<void()> wake) {
     std::lock_guard<std::mutex> lock(mutex_);
     job.wake = std::move(wake);
     if (job.revoked.load(std::memory_order_acquire)) {
         job.wake_pending = true;
-        changed();
+        SetEvent(change_);
     }
 }
 void NativeMemoryManager::revoke_locked(NativeMemoryJob &job) {
@@ -118,28 +138,41 @@ void NativeMemoryManager::revoke_locked(NativeMemoryJob &job) {
     // take a writer/registry lock under the arbitrator or on that same stack.
     job.wake_pending = true;
 }
+void NativeMemoryManager::failed_locked(NativeMemoryJob &job, std::uint64_t required, const NativeMemoryStatus &status) {
+    job.required = required;
+    // Compare external capacity after refunding this attempt, not the extra
+    // room produced merely by freeing its own dictionaries/admission.
+    job.retry_headroom = status.headroom + static_cast<std::int64_t>(job.committed + job.admission);
+}
 void NativeMemoryManager::retry(NativeMemoryJob &job) {
     std::lock_guard<std::mutex> lock(mutex_);
-    job.peak = (std::max)(job.peak, job.committed + quantum);
+    if (!job.revoked.load(std::memory_order_acquire) && !job.denied.load(std::memory_order_acquire))
+        failed_locked(job, (std::max)(job.peak, job.committed + quantum), sample_locked(true));
     revoke_locked(job);
-    changed();
+    SetEvent(change_);
 }
 void *NativeMemoryManager::allocate(NativeMemoryJob &job, std::size_t size) noexcept {
     try {
         std::lock_guard<std::mutex> lock(mutex_);
         if (job.revoked.load(std::memory_order_acquire)) return nullptr;
-        const auto wanted = static_cast<std::uint64_t>(size);
-        job.peak = (std::max)(job.peak, job.committed + wanted);
-        const auto status = sample_locked();
+        const auto wanted = commitment(size);
+        const auto total = wanted > UINT64_MAX - job.committed ? UINT64_MAX : job.committed + wanted;
+        job.peak = (std::max)(job.peak, total);
         const auto credit = (std::min)(wanted, job.admission);
-        if (status.headroom < static_cast<std::int64_t>(wanted - credit)) {
+        auto status = sample_locked();
+        // Do not deny a legal allocation on an old external snapshot. A low
+        // Windows notification also bypasses the ledger's normal fast path.
+        if (!can_fit(status.headroom, wanted - credit) ||
+            (low_ && WaitForSingleObject(low_, 0) == WAIT_OBJECT_0)) status = sample_locked(true);
+        if (!can_fit(status.headroom, wanted - credit)) {
             // Let existing codec fallbacks (e.g. MT -> serial) work first.
             // Only an unsuccessful attempt is replayed for this denial.
             // Reclaim on the monitor: global-new callers may already hold a
             // writer/registry mutex, so inline cache reclaim can deadlock.
             reclaim_requested_ = true;
+            failed_locked(job, total, status);
             job.denied.store(true, std::memory_order_release);
-            changed();
+            SetEvent(change_);
             return nullptr;
         }
         // Serialize only large commitments: no stale availability snapshot can
@@ -149,7 +182,11 @@ void *NativeMemoryManager::allocate(NativeMemoryJob &job, std::size_t size) noex
             // Freeing this attempt is not evidence of external recovery. Wait
             // for capacity beyond its fully-refunded budget, avoiding a rapid
             // fail/replay loop when Windows rejects an optimistic sample.
+            // External commit may have shrunk since the ledger's last sample.
+            // Its old optimistic value must not become a permanent retry gate.
+            status = sample_locked(true);
             job.failed_headroom = status.headroom + static_cast<std::int64_t>(job.committed + job.admission);
+            failed_locked(job, total, status);
             job.denied.store(true, std::memory_order_release);
             changed();
             return nullptr;
@@ -161,23 +198,31 @@ void *NativeMemoryManager::allocate(NativeMemoryJob &job, std::size_t size) noex
         } catch (...) { VirtualFree(result, 0, MEM_RELEASE); throw; }
         job.admission -= credit;
         job.committed += wanted;
+        cached_.headroom -= static_cast<std::int64_t>(wanted);
         return result;
     } catch (...) { retry(job); return nullptr; }
 }
-void NativeMemoryManager::released(NativeMemoryJob &job, std::size_t size) noexcept {
+void NativeMemoryManager::released(NativeMemoryJob &job, void *address, std::size_t size) noexcept {
     std::lock_guard<std::mutex> lock(mutex_);
-    job.committed -= size;
-    changed();
+    // Keep the OS release and ledger refund indivisible with respect to a
+    // fresh sample; otherwise an intervening query could refund it twice.
+    if (!VirtualFree(address, 0, MEM_RELEASE)) return;
+    const auto bytes = commitment(size);
+    job.committed -= bytes;
+    cached_.headroom += static_cast<std::int64_t>(bytes);
+    SetEvent(change_);
 }
 bool NativeMemoryManager::may_start_thread(NativeMemoryJob &job) noexcept {
     std::lock_guard<std::mutex> lock(mutex_);
     if (job.revoked.load(std::memory_order_acquire)) return false;
-    if (sample_locked().headroom + static_cast<std::int64_t>(job.admission) >= 0) return true;
+    auto status = sample_locked();
+    if (status.headroom + static_cast<std::int64_t>(job.admission) < 0) status = sample_locked(true);
+    if (status.headroom + static_cast<std::int64_t>(job.admission) >= 0) return true;
     // No per-thread memory accounting. Avoid entering the Windows loader while
     // already under pressure; its initial stack growth cannot run our callbacks.
     job.denied.store(true, std::memory_order_release);
-    job.peak = (std::max)(job.peak, job.committed + quantum);
-    changed();
+    failed_locked(job, job.committed + quantum, status);
+    SetEvent(change_);
     return false;
 }
 void NativeMemoryManager::park(NativeMemoryJob &job, const std::atomic<bool> &cancel,
@@ -186,6 +231,7 @@ void NativeMemoryManager::park(NativeMemoryJob &job, const std::atomic<bool> &ca
         std::lock_guard<std::mutex> lock(mutex_);
         if (!stopping_) {
             if (job.failed_headroom >= 0) job.failed_headroom -= static_cast<std::int64_t>(job.committed);
+            if (job.retry_headroom != INT64_MAX) job.retry_headroom -= static_cast<std::int64_t>(job.committed);
             waiters_.push_back({&job, &cancel, std::move(ready), std::move(notice)});
             changed();
             return;
@@ -206,15 +252,16 @@ void NativeMemoryManager::monitor() {
         HANDLE handles[2]{change_, low_seen ? high_ : low_};
         const DWORD count = active && handles[1] ? 2 : 1;
         // Windows notifications have a middle zone and cannot express our
-        // reserve. Sampling is active-only; every large allocation also checks
-        // synchronously. Idle workers have no timer or polling activity.
-        WaitForMultipleObjects(count, handles, FALSE, active ? 250 : INFINITE);
+        // reserve. Sampling is active-only; low-memory events bypass the cached
+        // ledger immediately. Idle workers have no timer or polling activity.
+        const auto event = WaitForMultipleObjects(count, handles, FALSE, active ? 250 : INFINITE);
         BOOL low = FALSE;
         if (low_) QueryMemoryResourceNotification(low_, &low);
         low_seen = low != FALSE;
         bool pressure;
         {
             std::lock_guard<std::mutex> lock(mutex_);
+            sample_locked(event == WAIT_OBJECT_0 + 1 || event == WAIT_TIMEOUT);
             // Refund forecasts before reclaiming real memory. An unconsumed
             // restart reservation is not a working dictionary to protect.
             if (sample_locked().headroom < 0)
@@ -228,7 +275,7 @@ void NativeMemoryManager::monitor() {
         {
             std::lock_guard<std::mutex> lock(mutex_);
             stopped = stopping_;
-            const auto status = sample_locked();
+            const auto status = sample_locked(pressure);
             if (!stopped && status.headroom < 0) {
                 std::uint64_t retiring = 0;
                 NativeMemoryJob *victim = nullptr;
@@ -236,7 +283,10 @@ void NativeMemoryManager::monitor() {
                     if (job->revoked.load(std::memory_order_acquire)) retiring += job->committed;
                     else if (job->running && job->committed && (!victim || victim->committed < job->committed)) victim = job;
                 }
-                if (victim && retiring < static_cast<std::uint64_t>(-status.headroom)) revoke_locked(*victim);
+                if (victim && retiring < static_cast<std::uint64_t>(-status.headroom)) {
+                    failed_locked(*victim, victim->committed, status);
+                    revoke_locked(*victim);
+                }
             }
             for (auto *job : jobs_) if (job->wake_pending && job->wake) {
                 callbacks.push_back(job->wake);
@@ -249,13 +299,22 @@ void NativeMemoryManager::monitor() {
                 const auto available = sample_locked();
                 // Retained replay metadata is already in process commitment;
                 // reserve only the additional workspace, never charge it twice.
-                const auto needed = job.peak - job.committed;
-                const bool fits = available.headroom >= static_cast<std::int64_t>(needed) &&
+                const auto needed = job.required > job.committed ? job.required - job.committed : 0;
+                // A failed mandatory allocation includes the dictionaries still
+                // live at that point. An unclassified withdrawal may include
+                // optional parallel storage: allow a budgeted probe after real
+                // capacity grows by one managed-allocation quantum.
+                const bool growth = available.headroom >= static_cast<std::int64_t>(quantum) &&
+                    job.retry_headroom <= available.headroom - static_cast<std::int64_t>(quantum);
+                const bool fits = (can_fit(available.headroom, needed) || growth) &&
                     (job.failed_headroom < 0 || available.headroom > job.failed_headroom);
                 if (canceled || fits) {
-                    if (!canceled) { job.admission = needed; jobs_.push_back(&job); }
+                    if (!canceled) {
+                        job.admission = (std::min)(needed, static_cast<std::uint64_t>((std::max)(available.headroom, std::int64_t{0})));
+                        jobs_.push_back(&job);
+                    }
                     callbacks.push_back([waiter = std::move(waiter), available, canceled]() mutable {
-                        if (waiter.announced && waiter.notice) waiter.notice(false, available, waiter.job->peak);
+                        if (waiter.announced && waiter.notice) waiter.notice(false, available, waiter.job->required);
                         waiter.ready(!canceled);
                     });
                     it = waiters_.erase(it);
@@ -265,7 +324,7 @@ void NativeMemoryManager::monitor() {
                     });
                     if (!waiter.announced && !progressing && waiter.notice) {
                         waiter.announced = true;
-                        callbacks.push_back([notice = waiter.notice, available, needed = job.peak] { notice(true, available, needed); });
+                        callbacks.push_back([notice = waiter.notice, available, needed = job.required] { notice(true, available, needed); });
                     }
                     ++it;
                 }
@@ -310,8 +369,7 @@ int sunpack_memory_free(void *address) {
         allocation = found->second;
         allocations.erase(found);
     }
-    VirtualFree(address, 0, MEM_RELEASE);
-    allocation.job->owner.released(*allocation.job, allocation.size);
+    allocation.job->owner.released(*allocation.job, address, allocation.size);
     return 1;
 }
 }

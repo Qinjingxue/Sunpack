@@ -84,6 +84,7 @@ HRESULT CDecoder::DecodeUncompressed(UInt32 unpackSize)
     m_OutWindowStream.PutBytes(buf, cur2);
     if (cur != cur2)
       return S_FALSE;
+    unpackSize -= cur;
   }
 }
 

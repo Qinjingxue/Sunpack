@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iostream>
 #include <memory>
 #include <string>
@@ -209,12 +210,21 @@ bool cancelled_job_returns_pending_to_zero(const std::filesystem::path& director
         job, (directory / L"cancelled.bin").wstring(), L"cancelled.bin", 3, 3);
 
     std::uint32_t processed = 0;
+    std::promise<void> accepted;
+    auto started = accepted.get_future();
     std::thread producer([&] {
-        writer.write(file, payload.data(), static_cast<std::uint32_t>(payload.size()), &processed);
+        constexpr std::uint32_t first_chunk = 1U << 20;
+        writer.write(file, payload.data(), first_chunk, &processed);
+        accepted.set_value();
+        writer.write(file, payload.data() + first_chunk,
+            static_cast<std::uint32_t>(payload.size() - first_chunk), &processed);
     });
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    // Synchronize on real accepted output, not an assumed scheduling delay.
+    // Under concurrent builds the producer may not run within 50 ms at all.
+    const bool began = started.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
     writer.cancel_job(job);
     producer.join();
+    if (!began) return false;
 
     const auto mid = writer.snapshot_metrics();
     if (mid.accepted_bytes == 0 || mid.accepted_bytes > payload_size ||

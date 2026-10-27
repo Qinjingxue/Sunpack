@@ -2140,7 +2140,7 @@ private:
             request_monitor_recheck();
             if (code == kMemoryRetry) {
                 print_json_line("{\"type\":\"native_memory\",\"job_id\":\"" + json_escape(job_id) +
-                    "\",\"event\":\"memory_reclaimed\",\"required_bytes\":" + std::to_string(memory_job.peak) + "}");
+                    "\",\"event\":\"memory_reclaimed\",\"required_bytes\":" + std::to_string(memory_job.required) + "}");
                 auto parked = std::make_shared<Job>(std::move(job));
                 const auto notice = [parked](bool blocked, const sunpack::sevenzip::NativeMemoryStatus &status, std::uint64_t needed) {
                     auto &episode = parked->execution->memory_episode;

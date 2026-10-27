@@ -28,7 +28,9 @@ struct NativeMemoryJob final {
     std::function<void()> wake;
     // The manager mutex protects all non-atomic fields.
     std::uint64_t committed = 0, peak = 0, admission = 0;
+    std::uint64_t required = 0; // last failed request plus its still-live workspace
     std::int64_t failed_headroom = -1;
+    std::int64_t retry_headroom = INT64_MAX;
     bool running = false, wake_pending = false;
 };
 
@@ -37,7 +39,7 @@ class NativeMemoryManager final {
 public:
     using Query = std::function<NativeMemoryStatus()>;
     using WaitNotice = std::function<void(bool, const NativeMemoryStatus &, std::uint64_t)>;
-    static constexpr std::uint64_t default_reserve_bytes = 256ULL << 20;
+    static constexpr std::uint64_t default_reserve_bytes = 512ULL << 20;
     explicit NativeMemoryManager(std::uint64_t reserve_bytes = default_reserve_bytes, Query query = {},
                                  std::function<void()> reclaim = {});
     ~NativeMemoryManager();
@@ -56,11 +58,12 @@ public:
     void stop() noexcept;
     void *allocate(NativeMemoryJob &job, std::size_t size) noexcept;
     bool may_start_thread(NativeMemoryJob &job) noexcept;
-    void released(NativeMemoryJob &job, std::size_t size) noexcept;
+    void released(NativeMemoryJob &job, void *address, std::size_t size) noexcept;
     static NativeMemoryStatus query_windows(std::uint64_t reserve_bytes) noexcept;
 
 private:
-    NativeMemoryStatus sample_locked() const;
+    NativeMemoryStatus sample_locked(bool fresh = false);
+    void failed_locked(NativeMemoryJob &job, std::uint64_t required, const NativeMemoryStatus &status);
     void revoke_locked(NativeMemoryJob &job);
     void monitor();
     const std::uint64_t reserve_bytes_;
@@ -80,6 +83,9 @@ private:
     std::thread thread_;
     bool stopping_ = false;
     bool reclaim_requested_ = false;
+    NativeMemoryStatus cached_{};
+    ULONGLONG sampled_at_ = 0;
+    std::atomic<bool> resample_{true};
 };
 
 class NativeMemoryScope final {

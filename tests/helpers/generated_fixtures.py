@@ -3,6 +3,18 @@ import struct
 import zlib
 
 
+def write_single_method_zip(path: Path, payload: bytes, packed: bytes, method: int) -> None:
+    """Independent APPNOTE headers for decode-only method fixtures."""
+    member = b"payload.bin"
+    crc = zlib.crc32(payload)
+    local = struct.pack("<I5H3I2H", 0x04034B50, 63, 0, method, 0, 0,
+                        crc, len(packed), len(payload), len(member), 0) + member + packed
+    central = struct.pack("<I6H3I5H2I", 0x02014B50, 63, 63, 0, method, 0, 0,
+                          crc, len(packed), len(payload), len(member), 0, 0, 0, 0, 0, 0) + member
+    path.write_bytes(local + central + struct.pack("<I4H2IH", 0x06054B50, 0, 0, 1, 1,
+                                                 len(central), len(local), 0))
+
+
 def _minimal_7z_header(payload_size: int) -> bytes:
     next_header = b"\x17\x06"
     start_header = struct.pack("<QQI", payload_size, len(next_header), zlib.crc32(next_header) & 0xFFFFFFFF)
