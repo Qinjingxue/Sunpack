@@ -25,7 +25,7 @@ template<class T> T ready(std::future<T> &future) {
 void admission_and_recovery() {
     std::atomic<std::int64_t> capacity{64 * MiB};
     std::vector<NativeMemoryJob *> jobs;
-    NativeMemoryManager manager(.10, [&] {
+    NativeMemoryManager manager(0, [&] {
         auto room = capacity.load();
         for (auto *job : jobs) room -= job->committed;
         return NativeMemoryStatus{room, static_cast<std::uint64_t>((std::max)(room, std::int64_t{0})), 0};
@@ -92,17 +92,18 @@ void admission_and_recovery() {
 }
 
 void simultaneous_scaled_machine_budgets() {
-    // 1:256 scale models 8/16/32 GiB with the existing 10% reserve. This
+    // 1:256 scale models 8/16/32 GiB with a fixed 256 MiB reserve. This
     // exercises simultaneous commitments against one budget while committing
     // at most 112 MiB on the development machine, without touching its RAM.
     for (const auto gib : {8, 16, 32}) {
         const auto total = static_cast<std::uint64_t>(gib) * 4 * MiB;
-        const auto budget = total - total / 10;
+        constexpr auto reserve = NativeMemoryManager::default_reserve_bytes / 256;
+        const auto budget = total - reserve;
         std::vector<std::unique_ptr<NativeMemoryJob>> jobs;
-        NativeMemoryManager manager(.10, [&] {
+        NativeMemoryManager manager(reserve, [&] {
             std::int64_t room = budget;
             for (const auto &job : jobs) room -= job->committed;
-            return NativeMemoryStatus{room, 0, total / 10};
+            return NativeMemoryStatus{room, 0, reserve};
         });
         for (int i = 0; i < 8; ++i) jobs.push_back(std::make_unique<NativeMemoryJob>(manager));
         for (const auto &job : jobs) manager.begin(*job);
@@ -159,7 +160,7 @@ void sparse_replay(const std::filesystem::path &directory) {
 void disk_and_memory(const std::filesystem::path &directory, bool memory_first) {
     std::atomic<std::int64_t> capacity{64 * MiB};
     NativeMemoryJob *active = nullptr;
-    NativeMemoryManager manager(.10, [&] { return NativeMemoryStatus{capacity.load() - static_cast<std::int64_t>(active ? active->committed : 0), 0, 0}; });
+    NativeMemoryManager manager(0, [&] { return NativeMemoryStatus{capacity.load() - static_cast<std::int64_t>(active ? active->committed : 0), 0, 0}; });
     NativeMemoryJob memory(manager);
     active = &memory;
     auto state = make_volume_state("memory-disk", true);

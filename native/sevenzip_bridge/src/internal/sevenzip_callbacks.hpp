@@ -1219,9 +1219,15 @@ namespace sunpack::sevenzip
                     return static_cast<Int32>(HRESULT_FROM_WIN32(static_cast<DWORD>(win32_error)));
                 }
             }
+            catch (const std::bad_alloc &)
+            {
+                output_error_ = true;
+                mark_current_item_failure(E_OUTOFMEMORY, ERROR_OUTOFMEMORY);
+                return E_OUTOFMEMORY;
+            }
             catch (...)
             {
-                // 兜底：只应捕获非 filesystem 的意外异常（例如 bad_alloc）。
+                // Preserve the explicit allocation error above for replay.
 
                 failed_item_ = name;
 
@@ -1706,6 +1712,10 @@ namespace sunpack::sevenzip
                     *out_error = error.code();
                 }
                 return false;
+            }
+            catch (const std::bad_alloc &)
+            {
+                throw; // GetStream translates it to E_OUTOFMEMORY, not a path failure.
             }
             catch (...)
             {

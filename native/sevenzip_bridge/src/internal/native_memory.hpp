@@ -13,7 +13,7 @@
 namespace sunpack::sevenzip {
 
 struct NativeMemoryStatus {
-    std::int64_t headroom = 0; // after the configured reserve and unresident commit
+    std::int64_t headroom = 0; // after the fixed reserve and unresident commit
     std::uint64_t available = 0;
     std::uint64_t reserve = 0;
 };
@@ -37,7 +37,8 @@ class NativeMemoryManager final {
 public:
     using Query = std::function<NativeMemoryStatus()>;
     using WaitNotice = std::function<void(bool, const NativeMemoryStatus &, std::uint64_t)>;
-    explicit NativeMemoryManager(double reserve_ratio = .10, Query query = {},
+    static constexpr std::uint64_t default_reserve_bytes = 256ULL << 20;
+    explicit NativeMemoryManager(std::uint64_t reserve_bytes = default_reserve_bytes, Query query = {},
                                  std::function<void()> reclaim = {});
     ~NativeMemoryManager();
     NativeMemoryManager(const NativeMemoryManager &) = delete;
@@ -56,13 +57,13 @@ public:
     void *allocate(NativeMemoryJob &job, std::size_t size) noexcept;
     bool may_start_thread(NativeMemoryJob &job) noexcept;
     void released(NativeMemoryJob &job, std::size_t size) noexcept;
-    static NativeMemoryStatus query_windows(double reserve_ratio) noexcept;
+    static NativeMemoryStatus query_windows(std::uint64_t reserve_bytes) noexcept;
 
 private:
     NativeMemoryStatus sample_locked() const;
     void revoke_locked(NativeMemoryJob &job);
     void monitor();
-    const double reserve_ratio_;
+    const std::uint64_t reserve_bytes_;
     Query query_;
     std::function<void()> reclaim_;
     std::mutex mutex_;

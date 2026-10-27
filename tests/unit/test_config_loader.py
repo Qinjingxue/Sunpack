@@ -31,7 +31,7 @@ def _advanced_payload():
         "recursive_extract": "*",
         "post_extract": {"archive_cleanup_mode": "r", "flatten_single_directory": True},
         "filesystem": {"scan_filters_enabled": True, "scan_filters": []},
-        "performance": {"worker": {"minimum_available_memory_ratio": 0.1, "max_queue_jobs": 256}},
+        "performance": {"worker": {"memory_reserve_bytes": 268435456, "max_queue_jobs": 256}},
         "verification": _verification_config(),
         "detection": {"enabled": True},
     }
@@ -48,7 +48,7 @@ def test_load_config_merges_simple_config_over_advanced_config(tmp_path, monkeyp
         "cli": {"language": "zh"},
         "runtime": {"process_mode": "high"},
         "filesystem": {"scan_filters": [{"name": "size_range", "enabled": True, "min_bytes": 2097152, "max_bytes": None}]},
-        "performance": {"worker": {"minimum_available_memory_ratio": 0.2}},
+        "performance": {"worker": {"memory_reserve_bytes": 134217728}},
     })
     monkeypatch.setattr(loader, "_candidate_config_paths", _layered_config_paths(simple, advanced))
     config = loader.load_config()
@@ -58,7 +58,7 @@ def test_load_config_merges_simple_config_over_advanced_config(tmp_path, monkeyp
     assert config["filesystem"]["scan_filters"][0]["min_bytes"] == 2097152
     assert config["filesystem"]["scan_filters"][0]["max_bytes"] is None
     assert config["performance"]["worker"]["max_queue_jobs"] == 256
-    assert config["performance"]["worker"]["minimum_available_memory_ratio"] == 0.2
+    assert config["performance"]["worker"]["memory_reserve_bytes"] == 134217728
 
 
 @pytest.mark.parametrize(

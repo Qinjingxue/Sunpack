@@ -10,7 +10,6 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
-#include <cmath>
 #include <filesystem>
 #include <iomanip>
 #include <iostream>
@@ -24,6 +23,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -1406,24 +1406,6 @@ std::size_t configured_native_size(
     return (std::max)(minimum, static_cast<std::size_t>(bounded));
 }
 
-double configured_native_double(
-    const char* name,
-    double fallback,
-    double minimum,
-    double maximum
-) noexcept {
-    const char* value = std::getenv(name);
-    if (!value || !*value) {
-        return fallback;
-    }
-    char* end = nullptr;
-    const double configured = std::strtod(value, &end);
-    if (end == value || *end != '\0' || !std::isfinite(configured)) {
-        return fallback;
-    }
-    return (std::max)(minimum, (std::min)(maximum, configured));
-}
-
 sunpack::sevenzip::NativeMachineResources native_machine_resources() noexcept {
     sunpack::sevenzip::NativeMachineResources resources;
     const unsigned hardware = std::thread::hardware_concurrency();
@@ -1470,21 +1452,21 @@ bool apply_native_process_mode(const std::string& mode) noexcept {
 #endif
 }
 
-double configured_memory_reserve_ratio() noexcept {
-    return configured_native_double(
-        "SUNPACK_NATIVE_MIN_AVAILABLE_MEMORY_RATIO",
-        .10,
-        0.01,
-        0.95);
+std::uint64_t configured_memory_reserve_bytes() noexcept {
+    return configured_native_size(
+        "SUNPACK_NATIVE_MEMORY_RESERVE_BYTES",
+        sunpack::sevenzip::NativeMemoryManager::default_reserve_bytes,
+        0,
+        static_cast<std::size_t>((std::numeric_limits<std::int64_t>::max)()));
 }
 
 class NativeJobExecutor final {
 public:
     NativeJobExecutor(
         const sunpack::sevenzip::NativeSizingPlan& sizing,
-        double memory_reserve_ratio
+        std::uint64_t memory_reserve_bytes
     )
-        : memory_(memory_reserve_ratio, {}, [this] { writer_registry_->reclaim_idle_memory(); }),
+        : memory_(memory_reserve_bytes, {}, [this] { writer_registry_->reclaim_idle_memory(); }),
           writer_meters_(std::make_shared<sunpack::sevenzip::WriterMeters>()),
           // The sink is owned solely by the executor and the long-lived gates: AsyncFileWriter never holds or resets it.
           space_change_sink_(
@@ -2133,7 +2115,23 @@ private:
                 } catch (const std::bad_alloc&) {
                     memory_.retry(memory_job);
                     code = kMemoryRetry;
+                } catch (const std::system_error &error) {
+                    // MSVC std::thread reports _beginthreadex exhaustion as
+                    // EAGAIN, including a failed small stack/CRT allocation.
+                    // Writer-facility threads do not use the SDK allocator.
+                    if (error.code() == std::errc::resource_unavailable_try_again) {
+                        memory_.retry(memory_job);
+                        code = kMemoryRetry;
+                        print_json_line("{\"type\":\"native_memory\",\"job_id\":\"" + json_escape(job_id) +
+                            "\",\"event\":\"memory_thread_resource_retry\",\"error_code\":" +
+                            std::to_string(error.code().value()) + "}");
+                    }
                 } catch (...) { code = -100; }
+            }
+            if (code == -100) {
+                print_json_line("{\"type\":\"result\",\"job_id\":\"" + json_escape(job_id) +
+                    "\",\"status\":\"failed\",\"native_status\":\"error\",\"failure_kind\":\"native_exception\","
+                    "\"failure_stage\":\"native_execution\",\"message\":\"unexpected native execution exception\"}");
             }
             // Pending output and decoder threads have drained. Parked tasks
             // retain neither dictionaries, writer leases nor execution threads.
@@ -2271,8 +2269,8 @@ int main() {
     const auto sizing = sunpack::sevenzip::derive_native_sizing_plan(
         resources,
         configured_native_sizing_overrides());
-    const auto memory_reserve_ratio = configured_memory_reserve_ratio();
-    NativeJobExecutor executor(sizing, memory_reserve_ratio);
+    const auto memory_reserve_bytes = configured_memory_reserve_bytes();
+    NativeJobExecutor executor(sizing, memory_reserve_bytes);
     const bool sizing_overridden = sizing.thread_capacity_overridden;
     print_json_line(
         "{\"type\":\"worker_ready\",\"sizing_mode\":\"" +
@@ -2281,8 +2279,8 @@ int main() {
         ",\"thread_capacity\":" + std::to_string(sizing.thread_capacity) +
         ",\"nominal_cpu_budget\":" + std::to_string(sizing.thread_capacity) +
         ",\"memory_management\":\"commitment_replay\"" +
-        ",\"minimum_available_memory_ratio\":" +
-            std::to_string(memory_reserve_ratio) +
+        ",\"memory_reserve_bytes\":" +
+            std::to_string(memory_reserve_bytes) +
         ",\"process_mode\":\"" + requested_process_mode +
         "\",\"process_mode_applied\":" + (process_mode_applied ? "true" : "false") + "}");
     std::string line;

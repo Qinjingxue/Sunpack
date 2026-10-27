@@ -7,6 +7,7 @@ import io
 import json
 import lzma
 import os
+from pathlib import Path
 import subprocess
 import struct
 import tarfile
@@ -864,11 +865,11 @@ def test_native_environment_configures_memory_reserve():
     _apply_native_environment(
         environment,
         {
-            "minimum_available_memory_ratio": 0.10,
+            "memory_reserve_bytes": 268435456,
         },
     )
 
-    assert environment["SUNPACK_NATIVE_MIN_AVAILABLE_MEMORY_RATIO"] == "0.1"
+    assert environment["SUNPACK_NATIVE_MEMORY_RESERVE_BYTES"] == "268435456"
 
 
 def test_memory_wait_releases_execution_lanes_and_accepts_cancellation(tmp_path):
@@ -879,7 +880,9 @@ def test_memory_wait_releases_execution_lanes_and_accepts_cancellation(tmp_path)
     import threading
     from sunpack.core.platform.windows.process_job import JOBOBJECT_EXTENDED_LIMIT_INFORMATION_STRUCT, _kernel32
 
-    worker = _require_worker_or_skip()
+    worker = Path(_require_worker_or_skip()).with_name("sunpack_sevenzip_memory_worker.exe")
+    if not worker.is_file():
+        pytest.skip("build the sunpack_sevenzip_memory_worker test target")
     archive = tmp_path / "large-dictionary.blob"
     xz = bytearray(lzma.compress(b"memory replay" * 100, filters=[{"id": lzma.FILTER_LZMA2, "dict_size": 1 << 20}]))
     header_size = (xz[12] + 1) * 4
@@ -898,8 +901,8 @@ def test_memory_wait_releases_execution_lanes_and_accepts_cancellation(tmp_path)
     def capacity(mib):
         limits.JobMemoryLimit = mib * 1024**2
         assert kernel.SetInformationJobObject(handle, 9, ctypes.byref(limits), ctypes.sizeof(limits))
-    capacity(48)
-    process = subprocess.Popen([worker], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    capacity(256 + 48)
+    process = subprocess.Popen([str(worker)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                text=True, encoding="utf-8", creationflags=subprocess.CREATE_NO_WINDOW,
                                env=os.environ | {"SUNPACK_NATIVE_WORKER_THREAD_CAPACITY": "2"})
     events = queue.Queue()
@@ -938,7 +941,7 @@ def test_memory_wait_releases_execution_lanes_and_accepts_cancellation(tmp_path)
         # receipts for a changed source must require a rescan, never report CRC damage.
         with changed.open("ab") as output:
             output.write(b"\0" * 4)
-        capacity(128)
+        capacity(256 + 128)
         until(lambda event: {e.get("job_id") for e in seen if e.get("type") == "result"} >= {"large-2", "changed"})
         assert next(e for e in seen if e.get("type") == "result" and e.get("job_id") == "large-2")["status"] == "ok"
         assert next(e for e in seen if e.get("type") == "result" and e.get("job_id") == "changed")["failure_kind"] == "input_changed"
@@ -993,7 +996,7 @@ def test_native_worker_reports_cpu_credit_sizing_plan():
     assert int(handshake["thread_capacity"]) == logical_processors
     assert int(handshake["nominal_cpu_budget"]) == logical_processors
     assert handshake["memory_management"] == "commitment_replay"
-    assert float(handshake["minimum_available_memory_ratio"]) == 0.1
+    assert int(handshake["memory_reserve_bytes"]) == 268435456
 
 
 def test_worker_event_rejects_non_objects_and_malformed_rows():

@@ -1210,13 +1210,14 @@
       "max": null,
       "integer": true
     },
-    "/performance/worker/minimum_available_memory_ratio": {
+    "/performance/worker/memory_reserve_bytes": {
       "label": {
-        "zh": "最低可用内存比例",
-        "en": "Minimum available memory ratio"
+        "zh": "内存预留（字节）",
+        "en": "Memory reserve (bytes)"
       },
       "min": 0,
-      "max": 1
+      "max": null,
+      "integer": true
     },
     "/runtime/process_mode": {
       "label": {

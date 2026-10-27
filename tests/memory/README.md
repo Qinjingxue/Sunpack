@@ -1,5 +1,14 @@
 # Watch 内存增长测试
 
+解压 worker 的固定预留测量使用独立测试可执行文件和 Windows Job，见 [测量说明](../../docs/worker_memory_reserve.md)。执行示例：
+
+```powershell
+cmake --build native/sevenzip_bridge/build-x64-ci --config Release --target sunpack_sevenzip_memory_probe sunpack_sevenzip_memory_worker --parallel 4
+.venv/Scripts/python.exe tests/memory/worker_reserve_probe.py <压缩包路径> --format 7z --jobs 8 --dynamic
+```
+
+它不属于默认 pytest 收集；需要时手工测量。Job 限额、CPU 限额和 2 ms 采样均只用于测试子进程。
+
 运行长期、大量文件的 watch 内存测试：
 
 ```powershell

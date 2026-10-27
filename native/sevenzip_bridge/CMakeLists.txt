@@ -572,6 +572,24 @@ target_link_libraries(sunpack_sevenzip_worker
 
 sup7z_attach_bundled_7z(sunpack_sevenzip_worker)
 
+add_executable(sunpack_sevenzip_memory_worker
+    src/worker.cpp tests/memory_worker.cpp src/worker_alloc.cpp)
+add_executable(sunpack_sevenzip_memory_probe EXCLUDE_FROM_ALL
+    src/worker.cpp tests/memory_probe.cpp src/worker_alloc.cpp)
+foreach(test_worker IN ITEMS sunpack_sevenzip_memory_worker sunpack_sevenzip_memory_probe)
+    apply_release_optimizations(${test_worker})
+    apply_source_charset(${test_worker})
+    target_link_libraries(${test_worker} PRIVATE sunpack_sevenzip_core)
+    sup7z_attach_bundled_7z(${test_worker})
+    if(MSVC)
+        target_link_options(${test_worker} PRIVATE /STACK:1048576,65536)
+    endif()
+    target_compile_definitions(${test_worker} PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    if(SUP7Z_ENABLE_PIPELINE_TIMING)
+        target_compile_definitions(${test_worker} PRIVATE SUP7Z_ENABLE_PIPELINE_TIMING=1)
+    endif()
+endforeach()
+
 if(WIN32)
     target_compile_definitions(sunpack_sevenzip_worker PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     if(SUP7Z_ENABLE_PIPELINE_TIMING)

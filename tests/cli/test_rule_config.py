@@ -85,7 +85,7 @@ def test_effective_config_includes_native_worker_and_format_switch():
     config["performance"] = {
         "worker": {
             "thread_capacity": 0,
-            "minimum_available_memory_ratio": 0.1,
+            "memory_reserve_bytes": 268435456,
         }
     }
 

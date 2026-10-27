@@ -23,7 +23,7 @@ std::int64_t difference(std::uint64_t a, std::uint64_t b) noexcept {
 }
 
 namespace sunpack::sevenzip {
-NativeMemoryStatus NativeMemoryManager::query_windows(double ratio) noexcept {
+NativeMemoryStatus NativeMemoryManager::query_windows(std::uint64_t reserve) noexcept {
     MEMORYSTATUSEX memory{sizeof(memory)};
     if (!GlobalMemoryStatusEx(&memory)) return {INT64_MAX, 0, 0};
     // EX2 is available on current Windows 10/11. Retain the EX fallback for
@@ -37,35 +37,19 @@ NativeMemoryStatus NativeMemoryManager::query_windows(double ratio) noexcept {
     // also covers this conservative fallback's small accounting uncertainty.
     const auto resident = counters.private_working_set ? counters.private_working_set : process.WorkingSetSize;
     const auto debt = process.PrivateUsage > resident ? process.PrivateUsage - resident : 0;
-    const auto reserve = static_cast<std::uint64_t>(memory.ullTotalPhys * ratio);
     auto room = (std::min)(difference(memory.ullAvailPhys, reserve + debt),
                           difference(memory.ullAvailPageFile, 0));
-    // Keep the same physical reserve available as system commit, too. The
-    // process-specific AvailPageFile can be constrained by a much smaller Job,
-    // so subtracting the machine reserve from it would block valid small Jobs.
+    // Keep the same reserve against system commit, too. AvailPageFile remains
+    // process-specific; host/test Job limits need no separate policy here.
     PERFORMANCE_INFORMATION system{sizeof(system)};
     if (GetPerformanceInfo(&system, sizeof(system)))
         room = (std::min)(room, difference(system.CommitLimit * system.PageSize,
             system.CommitTotal * system.PageSize + reserve));
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
-    if (QueryInformationJobObject(nullptr, JobObjectExtendedLimitInformation, &limits, sizeof(limits), nullptr)) {
-        const auto flags = limits.BasicLimitInformation.LimitFlags;
-        if (flags & JOB_OBJECT_LIMIT_PROCESS_MEMORY)
-            room = (std::min)(room, difference(static_cast<std::uint64_t>(limits.ProcessMemoryLimit * (1 - ratio)), process.PrivateUsage));
-        if (flags & JOB_OBJECT_LIMIT_JOB_MEMORY) {
-            // This worker normally has no child processes. The job's memory
-            // usage query includes siblings when the host grouped them together.
-            struct Usage { ULONG64 total, peak; } usage{};
-            if (!QueryInformationJobObject(nullptr, static_cast<JOBOBJECTINFOCLASS>(28), &usage, sizeof(usage), nullptr))
-                usage.total = process.PrivateUsage;
-            room = (std::min)(room, difference(static_cast<std::uint64_t>(limits.JobMemoryLimit * (1 - ratio)), usage.total));
-        }
-    }
     return {room, memory.ullAvailPhys, reserve};
 }
 
-NativeMemoryManager::NativeMemoryManager(double ratio, Query query, std::function<void()> reclaim)
-    : reserve_ratio_(ratio), query_(std::move(query)), reclaim_(std::move(reclaim)) {
+NativeMemoryManager::NativeMemoryManager(std::uint64_t reserve, Query query, std::function<void()> reclaim)
+    : reserve_bytes_(reserve), query_(std::move(query)), reclaim_(std::move(reclaim)) {
     change_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     if (!change_) throw std::bad_alloc();
     low_ = CreateMemoryResourceNotification(LowMemoryResourceNotification);
@@ -93,7 +77,7 @@ void NativeMemoryManager::changed() noexcept {
     SetEvent(change_);
 }
 NativeMemoryStatus NativeMemoryManager::sample_locked() const {
-    auto status = query_ ? query_() : query_windows(reserve_ratio_);
+    auto status = query_ ? query_() : query_windows(reserve_bytes_);
     for (const auto *job : jobs_) status.headroom -= static_cast<std::int64_t>(job->admission);
     status.available = static_cast<std::uint64_t>((std::max)(status.headroom, std::int64_t{0}));
     return status;
