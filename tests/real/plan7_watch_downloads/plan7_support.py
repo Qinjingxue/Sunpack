@@ -532,7 +532,6 @@ def start_watch(
         watcher = WatchScheduler(
             config,
             [str(watch_root)],
-            out_dir=str(output_root),
             state_path=str(state_path or (tmp_path / label / "state.snapshot")),
             cold_start_seconds=cold_start_seconds,
             pipeline_engine=engine,

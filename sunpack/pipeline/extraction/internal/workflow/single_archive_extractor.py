@@ -53,7 +53,6 @@ class SingleArchiveExtractor:
         password_store,
         password_resolver,
         metadata_scanner: ArchiveMetadataScanner,
-        retry_policy=None,  # Legacy constructor compatibility; intentionally unused.
         sevenzip_runner: SevenZipRunner | None = None,
         best_effort: bool = True,
         quiet: bool = False,

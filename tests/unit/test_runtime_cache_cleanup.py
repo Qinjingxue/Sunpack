@@ -142,7 +142,7 @@ def test_watch_deadline_clears_only_after_idle_window(tmp_path):
             }
         }),
         [str(tmp_path)],
-        out_dir=str(tmp_path / "out"),
+        output_roots={str(tmp_path): str(tmp_path / "out")},
         state_path=str(tmp_path / "state.snapshot"),
         cold_start_seconds=0,
         pipeline_engine=engine,
@@ -177,7 +177,7 @@ def test_ignored_log_history_expires_without_pipeline_activity(tmp_path, monkeyp
         watcher = WatchScheduler(
             make_config({"watch": {"clipboard_monitor_enabled": False,
                 "runtime_cache_cleanup_enabled": cache_cleanup_enabled}}),
-            [str(tmp_path)], out_dir=str(tmp_path / "out"),
+            [str(tmp_path)], output_roots={str(tmp_path): str(tmp_path / "out")},
             state_path=str(tmp_path / "state.snapshot"),
             pipeline_engine=engine, wake_callback=lambda: wakeups.append("wake"),
         )
@@ -224,7 +224,7 @@ def test_failed_wal_retirement_schedules_one_idle_retry(tmp_path, monkeypatch, s
         watcher = WatchScheduler(
             make_config({"watch": {"clipboard_monitor_enabled": False,
                 "runtime_cache_cleanup_enabled": False, "runtime_cache_cleanup_idle_seconds": 10}}),
-            [str(tmp_path)], out_dir=str(tmp_path / "out"),
+            [str(tmp_path)], output_roots={str(tmp_path): str(tmp_path / "out")},
             state_path=str(tmp_path / "state.snapshot"),
             pipeline_engine=_CleanupOnlyEngine(), wake_callback=wake.set,
         )
@@ -270,7 +270,7 @@ def test_completed_family_cache_waits_for_watch_callbacks_and_foreground(tmp_pat
     async def scenario():
         config = make_config({"watch": {"clipboard_monitor_enabled": False}})
         async with PipelineEngine(config) as engine:
-            watcher = WatchScheduler(config, [str(tmp_path)], out_dir=str(tmp_path / "out"),
+            watcher = WatchScheduler(config, [str(tmp_path)], output_roots={str(tmp_path): str(tmp_path / "out")},
                 state_path=str(tmp_path / "state.snapshot"), pipeline_engine=engine)
             parts = [tmp_path / "a.001", tmp_path / "a.002"]
             for part in parts:
@@ -313,7 +313,7 @@ def test_retained_sources_release_models_and_native_capacity_across_batches(tmp_
             "post_extract": {"archive_cleanup_mode": "k"},
         })
         async with PipelineEngine(config) as engine:
-            watcher = WatchScheduler(config, [str(root)], out_dir=str(tmp_path / "out"),
+            watcher = WatchScheduler(config, [str(root)], output_roots={str(root): str(tmp_path / "out")},
                 state_path=str(tmp_path / "state.snapshot"), pipeline_engine=engine)
             sources = []
             for batch in range(3):
@@ -370,7 +370,7 @@ def test_external_activity_resets_and_rearms_idle_cleanup(tmp_path):
             }
         }),
         [str(tmp_path)],
-        out_dir=str(tmp_path / "out"),
+        output_roots={str(tmp_path): str(tmp_path / "out")},
         state_path=str(tmp_path / "state.snapshot"),
         cold_start_seconds=0,
         pipeline_engine=_CleanupOnlyEngine(),
@@ -401,7 +401,7 @@ def test_idle_maintenance_expires_cli_mode_when_cache_cleanup_is_disabled(tmp_pa
                 }
             }),
             [str(tmp_path)],
-            out_dir=str(tmp_path / "out"),
+            output_roots={str(tmp_path): str(tmp_path / "out")},
             state_path=str(tmp_path / "state.snapshot"),
             cold_start_seconds=0,
             pipeline_engine=engine,
@@ -451,7 +451,7 @@ def test_cleanup_gate_waits_for_foreground_activity(tmp_path):
                 }
             }),
             [str(tmp_path)],
-            out_dir=str(tmp_path / "out"),
+            output_roots={str(tmp_path): str(tmp_path / "out")},
             state_path=str(tmp_path / "state.snapshot"),
             cold_start_seconds=0,
             pipeline_engine=engine,
@@ -483,7 +483,7 @@ def test_external_activity_waits_for_cleanup_already_in_progress(tmp_path):
                 }
             }),
             [str(tmp_path)],
-            out_dir=str(tmp_path / "out"),
+            output_roots={str(tmp_path): str(tmp_path / "out")},
             state_path=str(tmp_path / "state.snapshot"),
             cold_start_seconds=0,
             pipeline_engine=engine,
@@ -517,7 +517,7 @@ def test_foreground_lifecycle_clears_runtime_caches_after_idle(tmp_path):
                 }
             }),
             [str(tmp_path)],
-            out_dir=str(tmp_path / "out"),
+            output_roots={str(tmp_path): str(tmp_path / "out")},
             state_path=str(tmp_path / "state.snapshot"),
             cold_start_seconds=0,
             pipeline_engine=engine,
@@ -556,7 +556,7 @@ def test_disconnect_during_foreground_admission_restores_idle_cleanup(tmp_path, 
 
         def scheduler(name):
             return WatchScheduler(
-                config, [str(tmp_path)], out_dir=str(tmp_path / "out"),
+                config, [str(tmp_path)], output_roots={str(tmp_path): str(tmp_path / "out")},
                 state_path=str(tmp_path / name), pipeline_engine=engine,
             )
 
@@ -632,7 +632,7 @@ def test_external_activity_release_during_pending_acquire_leaves_gate_free(tmp_p
                 }
             }),
             [str(tmp_path)],
-            out_dir=str(tmp_path / "out"),
+            output_roots={str(tmp_path): str(tmp_path / "out")},
             state_path=str(tmp_path / "state.snapshot"),
             cold_start_seconds=0,
             pipeline_engine=engine,

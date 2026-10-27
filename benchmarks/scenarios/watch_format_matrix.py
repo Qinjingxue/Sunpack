@@ -353,10 +353,10 @@ def _attempt_outcome(response: Any) -> dict[str, Any]:
 
 
 def _output_summary(root: Path, fed_names: set[str]) -> dict[str, Any]:
-    excluded = fed_names | {"state.snapshot", "events.jsonl"}
+    excluded = fed_names | {"state.snapshot", "events.json"}
     files = [
         path for path in root.rglob("*")
-        if path.is_file() and path.name not in excluded
+        if path.is_file() and path.name not in excluded and "events.json.store" not in path.relative_to(root).parts
     ]
     return {
         "file_count": len(files),
@@ -441,7 +441,6 @@ async def _run_case(
             [str(root)],
             # A relative dot is resolved against the watched root, so outputs
             # land in the watch directory itself, exactly like production watch.
-            out_dir=".",
             state_path=str(state_path),
             cold_start_seconds=cold_start_seconds,
             pipeline_engine=engine,

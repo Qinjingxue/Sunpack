@@ -261,6 +261,10 @@ followed by the same metrics for `7z.exe`. The raw full-matrix report is
 
 ---
 
+## Upgrading from an older release
+
+v1.3.0 starts a new data generation. Installing over any version below v1.3.0, including v1.2.8, deletes settings, passwords, monitored roots, logs, state and custom Watch state directories. Back up the information you need before upgrading and configure it again using the [current guide](docs/configuration.md). Do not restore old configuration or persistence files wholesale. Check leftover output folders before enabling recursive Watch, since output-folder exclusions are also reset.
+
 ## Known Issue
 
 - When SunPack monitors a download directory, some downloaders may perform final file verification relatively slowly. SunPack may finish processing the archive and clean up the source files before the downloader completes its verification, causing the downloader to consider the source files corrupted and retry the download or report an error.
@@ -270,12 +274,12 @@ followed by the same metrics for `7z.exe`. The raw full-matrix report is
 Contributions are welcome. Use [GitHub Issues](https://github.com/Qinjingxue/Sunpack/issues) to report bugs or suggest improvements, and submit a [Pull Request](https://github.com/Qinjingxue/Sunpack/pulls) to help improve the project.
 
 When reporting a problem, you can attach relevant logs. Default locations for installed SunPack:
-- Watch events: `%ProgramData%\SunPack\.sunpack_watch\events.jsonl`
+- Watch events: `%ProgramData%\SunPack\.sunpack_watch\events.json` and `events.json.store`
 - Extraction failure reports: `%ProgramData%\SunPack\.sunpack_watch\failures\failed-*.txt`
 - Windows notifications: `%ProgramData%\SunPack\.sunpack_watch\toast_host_events.jsonl`
-- Background runtime: `%ProgramData%\SunPack\runtime-*.state.events.jsonl`
+- Background runtime: `%ProgramData%\SunPack\runtime-*.state.events.json` and matching `.store` directories
 
-If you changed `watch.state_dir`, the first three locations use that custom state directory. Remove passwords, private paths and other sensitive information before posting.
+Include both the display manifest and its `.store` directory; display history is not a JSONL text log. If you changed `watch.state_dir`, the first three locations use that custom state directory. Remove passwords, private paths and other sensitive information before posting.
 
 ## Acknowledgements
 

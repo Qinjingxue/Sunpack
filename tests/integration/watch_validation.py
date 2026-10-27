@@ -340,7 +340,7 @@ def run_scenario(base: Path, scenario: Scenario, payload: bytes, *, chunk_bytes:
     watcher = WatchScheduler(
         _watch_config(),
         [str(scenario_root)],
-        out_dir=str(base / scenario.name / "out"),
+        output_roots={str(scenario_root): str(base / scenario.name / "out")},
         state_path=str(state_path),
         cold_start_seconds=1.0,
         pipeline_engine=object(),

@@ -143,7 +143,6 @@ fn event_value(value: &Bound<'_, PyAny>) -> PyResult<Value> {
     result.insert("event".into(), json!(diagnostic_text(event)));
     for name in [
         "ts",
-        "time",
         "path",
         "task_path",
         "groups",
@@ -156,7 +155,7 @@ fn event_value(value: &Bound<'_, PyAny>) -> PyResult<Value> {
         "owner",
         "task_id",
     ] {
-        if state || matches!(name, "ts" | "time") {
+        if state || name == "ts" {
             if let Some(item) = dict.get_item(name)? {
                 result.insert(name.to_owned(), py_to_json(&item)?);
             }
@@ -372,7 +371,6 @@ impl Projection {
             let owner = field(value, "owner").to_owned();
             let processing = value["processing"].as_bool().unwrap_or(false);
             let ts = value["ts"].clone();
-            let time = value["time"].clone();
             if let Some(groups) = value["groups"].as_array_mut() {
                 for group in groups {
                     let path = field(group, "path").to_owned();
@@ -457,7 +455,7 @@ impl Projection {
                         task.expired = false;
                         task.status =
                             Some(encode(&json!({"event":"processing_started","path":path,
-                        "ts":ts,"time":time,"owner":task.owner,"task_id":id})));
+                        "ts":ts,"owner":task.owner,"task_id":id})));
                         task.order = self.order;
                         task.terminal = false;
                         task.blocked = false;

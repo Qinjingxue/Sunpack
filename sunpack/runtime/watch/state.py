@@ -293,18 +293,6 @@ class WatchStateStore:
             coordinator = self._path_coordinator
         with coordinator.checkpoint_lock, self._state_lock:
             self._ensure_open_locked()
-            if self.path.suffix == ".snapshot" and (
-                self.path.with_suffix(".json").exists()
-                or any(
-                    path.name[len(f"{self.path.stem}.journal."):-len(".jsonl")].isdecimal()
-                    for path in self.path.parent.glob(f"{self.path.stem}.journal.*.jsonl")
-                )
-            ):
-                raise WatchStateJournalError(
-                    "Old Watch persistence must be reset before using binary WAL. "
-                    "Run the installer to remove old state files; unfinished tasks and "
-                    "existing output-folder exclusions will be reset."
-                )
             self._reset_memory_locked()
             if self.path.exists():
                 try:

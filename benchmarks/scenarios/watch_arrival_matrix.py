@@ -44,11 +44,11 @@ def _same_path(left: str | Path, right: str | Path) -> bool:
 
 
 def _output_summary(root: Path, source_name: str) -> dict[str, Any]:
-    excluded = {source_name, "state.snapshot", "events.jsonl"}
+    excluded = {source_name, "state.snapshot", "events.json"}
     files = [
         path for path in root.rglob("*")
         if path.is_file()
-        and path.name not in excluded
+        and path.name not in excluded and "events.json.store" not in path.relative_to(root).parts
     ]
     return {
         "file_count": len(files),
@@ -278,7 +278,6 @@ async def _run_case(
         watcher = WatchScheduler(
             config,
             [str(root)],
-            out_dir=".",
             state_path=str(state_path),
             cold_start_seconds=cold_start_seconds,
             pipeline_engine=engine,

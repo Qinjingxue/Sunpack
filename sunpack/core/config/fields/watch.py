@@ -40,7 +40,6 @@ def normalize_watch_config(value: Any) -> dict[str, Any]:
         "watch.clipboard_monitor_enabled",
     )
     config["clipboard_builtin_max_entries"] = max(1, _int_field(config, "clipboard_builtin_max_entries"))
-    config["out_dir"] = str(config["out_dir"])
     config["tray_enabled"] = require_boolean(config["tray_enabled"], "watch.tray_enabled")
     config["toast_enabled"] = require_boolean(config["toast_enabled"], "watch.toast_enabled")
     config["toast_update_interval_ms"] = max(10, _int_field(config, "toast_update_interval_ms"))

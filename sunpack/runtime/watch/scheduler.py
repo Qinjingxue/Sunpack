@@ -165,7 +165,6 @@ class WatchScheduler:
         *,
         output_roots: dict[str, str] | None = None,
         root_entries: Iterable[WatchRootEntry] | None = None,
-        out_dir: str = ".",
         state_path: str,
         cold_start_seconds: float | None = None,
         pipeline_engine=None,
@@ -178,8 +177,6 @@ class WatchScheduler:
         self.watch_roots = [os.path.abspath(path) for path in watch_roots]
         validate_ntfs_watch_roots([directory for root in self.watch_roots
                                   if (directory := _nearest_existing_directory(root)) is not None])
-        expanded_out_dir = os.path.expanduser(out_dir)
-        self.out_dir = os.path.normpath(expanded_out_dir) if not os.path.isabs(expanded_out_dir) else os.path.abspath(expanded_out_dir)
         # Explicit per-root output roots are resolved here.  A missing mapping means that the
         # pipeline should use its normal default beside the archive.
         self.output_roots = {
@@ -187,15 +184,6 @@ class WatchScheduler:
             for root, output in (output_roots or {}).items()
             if str(output or "").strip()
         }
-        # Keep the direct constructor's historical fallback for callers that do not provide
-        # root policies.  WatchService always supplies root_entries, where an empty output is
-        # intentionally preserved as the archive-folder default.
-        if root_entries is None:
-            for root in self.watch_roots:
-                self.output_roots.setdefault(
-                    path_key(root),
-                    os.path.abspath(os.path.join(root, self.out_dir)) if not os.path.isabs(expanded_out_dir) else self.out_dir,
-                )
         self._validate_output_roots()
         configured_entries = {path_key(entry.input_root): entry for entry in root_entries or ()}
         self.root_entries = {
@@ -397,7 +385,6 @@ class WatchScheduler:
         self.log.write(
             "scheduler_started",
             roots=self.watch_roots,
-            out_dir=self.out_dir,
             output_roots=self.output_roots,
             recursive=any(entry.recursive for entry in self.root_entries.values()),
             pending=self.pending_count,
@@ -2017,11 +2004,7 @@ class WatchScheduler:
     ) -> _ActivePipelineRequest | None:
         pending_recovery = self.state.pending_work_for_path(candidate.path)
         internal_scope = (DiscoveryScope.from_record(pending_recovery.discovery_scope)
-            if pending_recovery and pending_recovery.internal_recovery and pending_recovery.discovery_scope else None)
-        if pending_recovery and pending_recovery.internal_recovery and internal_scope is None:
-            # Legacy records had no scope: a shallow boundary is the only
-            # evidence they authorize. New records always carry their scope.
-            internal_scope = DiscoveryScope(os.path.dirname(candidate.path))
+            if pending_recovery and pending_recovery.internal_recovery else None)
         if internal_scope is not None and not internal_scope.contains(candidate.path):
             raise ValueError("Recovery input is outside its persisted discovery scope")
         if self.should_ignore_event_path(candidate.path) and internal_scope is None:
@@ -2413,6 +2396,7 @@ class WatchScheduler:
                 path=candidate.path,
                 owner=request.notification_id,
                 error=error,
+                error_kind=terminal_failures[0].kind.value,
                 failures=payloads,
             )
             self._notify("failed", request.notification_id, errors, payloads)

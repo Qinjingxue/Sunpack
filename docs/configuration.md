@@ -6,7 +6,11 @@ Edit `sunpack_config.json` to change everyday settings. When running from source
 
 Objects are merged by field, and `filesystem.scan_filters` entries are merged by `name`. Other arrays are replaced as a whole. Watch reloads configuration changes automatically.
 
-When installing over a version below 1.2.0, the installer removes the application directory, `%ProgramData%\SunPack`, and any configured custom Watch state directory before installing fresh defaults. All settings, passwords, monitored roots, logs, and state are deleted. Unrecognized or missing installed versions use the same reset policy. Reinstalling 1.2.0 or newer preserves the data directory; application files and advanced defaults are replaced.
+When installing over a version below 1.3.0, the installer removes the application directory, `%ProgramData%\SunPack`, and any configured custom Watch state directory before installing fresh defaults. All settings, passwords, monitored roots, logs, and state are deleted. Unrecognized or missing installed versions use the same reset policy. Reinstalling 1.3.0 or newer preserves the data directory; application files and advanced defaults are replaced.
+
+**For existing users: 1.3.0 starts a new data generation, including upgrades from 1.2.8.** Back up settings, passwords and monitored roots before upgrading, then configure them again using the current format. Do not restore old configuration or state files wholesale. Historical field migrations, JSON/JSONL state handling and old log readers have been removed. Watch output locations use per-root mappings; an empty mapping writes beside the archive. `watch.out_dir` has been removed. Unfinished tasks and automatic output-folder exclusions are reset too; check leftover output directories before enabling recursive Watch again to avoid processing them twice.
+
+Display history uses an `events.json` manifest and an `events.json.store` directory. Runtime diagnostics use `runtime-*.state.events.json` with their corresponding `.store` directories. These are not JSONL text logs; include both the manifest and data directory in a bug report. Task state uses binary `state.snapshot` and `state.journal.*.wal`; discovery uses `catalog.snapshot.bin` and `catalog.wal.bin`. Do not edit them manually.
 
 Check your changes and view the resulting configuration:
 
@@ -27,7 +31,6 @@ For an installed copy, replace `python sunpack.py` with `sunpack.exe`.
 | `post_extract.archive_cleanup_mode` | `"r"` to recycle the original archive after success, `"k"` to keep it, or `"d"` to delete it. |
 | `post_extract.flatten_single_directory` | `true` to lift the contents of a single top-level output folder. |
 | `extraction.content_requirement` | `"complete"` to require a complete result, or `"allow_partial"` to accept partial recovery. |
-| `watch.out_dir` | Legacy default retained for configuration compatibility; an empty per-root output path writes beside each archive. |
 
 For example, add these fields to the main configuration to keep original archives:
 
@@ -39,8 +42,7 @@ For example, add these fields to the main configuration to keep original archive
 
 CLI options such as `--recur`, `--cleanup`, and `--out-dir` let you set extraction behavior for one command. See the [CLI parameter reference](cli_parameters.md).
 
-
-Directory discovery is shallow by default. Use `--recursive` with `scan`, `inspect`, or `extract`; nested extraction continues to use `--recur`. On upgrades from 1.2.0 or newer, the installer compares old and new advanced fields: it removes retired fields and adds new fields declared by the ordinary template, preserving existing user values and permissions.
+Directory discovery is shallow by default. Use `--recursive` with `scan`, `inspect`, or `extract`; nested extraction continues to use `--recur`. The configuration upgrade hook, atomic commit and failure rollback remain available from 1.3.0 onward. There are currently no migration rules, so upgrades do not rewrite user configuration.
 
 ## Scan filters
 

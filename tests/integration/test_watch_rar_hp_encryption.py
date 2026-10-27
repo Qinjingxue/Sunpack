@@ -116,7 +116,7 @@ def test_watch_split_hp_rar_recovers_after_wrong_then_correct_password(tmp_path,
     async def scenario():
         async with PipelineEngine(config) as delegate:
             watcher = WatchScheduler(
-                config, [str(watch_root)], out_dir=str(output_root),
+                config, [str(watch_root)], output_roots={str(watch_root): str(output_root)},
                 state_path=str(tmp_path / "state.snapshot"), cold_start_seconds=0,
                 pipeline_engine=delegate,
             )

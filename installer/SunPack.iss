@@ -81,8 +81,6 @@ english.WatchRootsFileMapping=# Optional columns: input folder | output folder |
 english.WatchRootsFileDeepDetect=# deep_detect accepts true or false; blank defaults to false.
 english.WatchRootsFileExample=# Example: C:\Downloads | D:\Extracted | true
 english.EditableConfigCreateFailed=Failed to create the initial editable configuration file: %s
-english.WalResetFailed=Unable to remove old Watch persistence files. Close sunpack and run the installer again.
-english.WalResetNotice=Watch persistence now uses a binary format. Unfinished tasks and automatic exclusions for existing output folders have been reset. Check leftover output folders before resuming recursive Watch.
 chinesesimplified.TaskAddToPath=将 sunpack 添加到系统 PATH
 chinesesimplified.TaskContextMenu=注册 sunpack 文件夹右键菜单
 chinesesimplified.TaskAutostart=Windows 启动时运行 sunpack 监控
@@ -111,8 +109,6 @@ chinesesimplified.WatchRootsFileMapping=# 可选字段格式：输入目录 | �
 chinesesimplified.WatchRootsFileDeepDetect=# deep_detect 可填写 true 或 false；留空时默认为 false。
 chinesesimplified.WatchRootsFileExample=# 示例：C:\Downloads | D:\Extracted | true
 chinesesimplified.EditableConfigCreateFailed=无法创建初始可编辑配置文件：%s
-chinesesimplified.WalResetFailed=无法删除旧版监控持久化文件。请关闭 sunpack 后重新运行安装程序。
-chinesesimplified.WalResetNotice=监控持久化已改为二进制格式。未完成任务和既有输出目录的自动排除记录已重置。恢复递归监控前请检查残留输出目录。
 
 [Tasks]
 Name: "addtopath"; Description: "{cm:TaskAddToPath}"; GroupDescription: "{cm:GroupShellIntegration}"
@@ -120,12 +116,11 @@ Name: "contextmenu"; Description: "{cm:TaskContextMenu}"; GroupDescription: "{cm
 Name: "autostart"; Description: "{cm:TaskAutostart}"; GroupDescription: "{cm:GroupBackgroundWatch}"; Flags: unchecked
 
 [Files]
-Source: "{#SourceDir}\*"; DestDir: "{app}"; Excludes: "sunpack.exe,sunpack_config.json,sunpack_watch_roots.txt,builtin_passwords.json,scripts\upgrade_config.ps1,scripts\reset_legacy_watch_state.ps1"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#SourceDir}\*"; DestDir: "{app}"; Excludes: "sunpack.exe,sunpack_config.json,sunpack_watch_roots.txt,builtin_passwords.json,scripts\upgrade_config.ps1"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#SourceDir}\sunpack.exe"; DestDir: "{app}\bin"; Flags: ignoreversion
 Source: "{#SourceDir}\sunpack_config.json"; DestDir: "{commonappdata}\SunPack"; Flags: onlyifdoesntexist
 Source: "{#SourceDir}\sunpack_config.json"; DestDir: "{tmp}"; DestName: "sunpack-config-template.json"; Flags: deleteafterinstall
 Source: "{#SourceDir}\scripts\upgrade_config.ps1"; DestDir: "{tmp}\SunPackInstallScripts"; Flags: deleteafterinstall
-Source: "{#SourceDir}\scripts\reset_legacy_watch_state.ps1"; DestDir: "{tmp}\SunPackInstallScripts"; Flags: deleteafterinstall
 Source: "{#SourceDir}\builtin_passwords.json"; DestDir: "{commonappdata}\SunPack"; Flags: onlyifdoesntexist
 
 [Dirs]
@@ -460,7 +455,7 @@ begin
   Value := Trim(Version);
   if Copy(Value, 1, 1) = 'v' then
     Delete(Value, 1, 1);
-  { Development builds use the git-describe form 1.2.2-7-gabcdef0.
+  { Development builds use the git-describe form 1.3.0-7-gabcdef0.
     Compare its numeric base version instead of treating the suffix as an
     unknown version and deleting current data during an upgrade. }
   Suffix := Pos('-', Value);
@@ -474,7 +469,7 @@ end;
 
 function RequiresDataReset(const Version: string): Boolean;
 begin
-  Result := VersionBefore(Version, PackVersionComponents(1, 2, 0, 0));
+  Result := VersionBefore(Version, PackVersionComponents(1, 3, 0, 0));
 end;
 
 function InstalledVersion: string;
@@ -727,7 +722,6 @@ end;
 var
   StartupTaskDefaultApplied: Boolean;
   ExistingWatchStateCaptured: Boolean;
-  TaskWalResetRequired: Boolean;
   RestartWatchAfterUpgrade: Boolean;
   ConfigBackupCaptured: Boolean;
   ConfigMigrationApplied: Boolean;
@@ -877,9 +871,6 @@ begin
   if not ExistingWatchStateCaptured then
   begin
     RestartWatchAfterUpgrade := QueryExistingWatchRunning;
-    { Capture the old version before deployment changes DisplayVersion.
-      1.2.8 is the first release with durable promotion destinations. }
-    TaskWalResetRequired := VersionBefore(InstalledVersion, PackVersionComponents(1, 2, 8, 0));
     ExistingWatchStateCaptured := True;
   end;
   if not StopExistingProcessesAndWait then
@@ -900,7 +891,7 @@ begin
   CaptureConfigurationForUpgrade;
   if InstalledDataRequiresReset then
   begin
-    Log('Removing pre-1.2.0 or unversioned SunPack data for a fresh installation.');
+    Log('Removing pre-1.3.0 or unversioned SunPack data for a fresh installation.');
     if not RemoveInstalledData then
     begin
       Result := CustomMessage('PrepareOldFilesRemoveFailed');
@@ -925,28 +916,6 @@ begin
     MsgBox(CustomMessage('UninstallStopFailed'), mbError, MB_OK);
 end;
 
-procedure ResetLegacyWatchState;
-var
-  Parameters: string;
-  ResultCode: Integer;
-begin
-  Parameters := '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ' +
-    AddQuotes(ExpandConstant('{tmp}\SunPackInstallScripts\reset_legacy_watch_state.ps1')) +
-    ' -DataRoot ' + AddQuotes(ExpandConstant('{commonappdata}\SunPack')) +
-    ' -AdvancedConfig ' + AddQuotes(ExpandConstant('{app}\sunpack_advanced_config.json')) +
-    ' -OldAdvancedConfig ' + AddQuotes(ExpandConstant('{tmp}\sunpack-old-advanced.json')) +
-    ' -UserConfig ' + AddQuotes(ExpandConstant('{commonappdata}\SunPack\sunpack_config.json'));
-  if TaskWalResetRequired then
-    Parameters := Parameters + ' -ResetTaskWal';
-  if not Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
-              Parameters, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
-    RaiseException(CustomMessage('WalResetFailed'));
-  if (ResultCode <> 0) and (ResultCode <> 10) then
-    RaiseException(CustomMessage('WalResetFailed'));
-  if ResultCode = 10 then
-    Log(CustomMessage('WalResetNotice'));
-end;
-
 procedure CurStepChanged(CurStep: TSetupStep);
 var
   ResultCode: Integer;
@@ -956,7 +925,6 @@ begin
   begin
     EnsureLocalizedEditableConfigFiles;
     UpgradeConfigurationFields;
-    ResetLegacyWatchState;
     InstallBrokerService;
     if not Exec(
       ExpandConstant('{app}\sunpack-runtime.exe'),

@@ -89,8 +89,7 @@ void pump_diagnostic(Application& app,const std::function<bool()>& condition,con
         }
         try {
             auto tasks=state(app.page(),"tasks");
-            std::cerr<<" tasks.total="<<tasks.value("total",-1)
-                     <<" tasks.malformed="<<tasks.value("malformed",0);
+            std::cerr<<" tasks.total="<<tasks.value("total",-1);
         } catch(const std::exception& e) { std::cerr<<" tasks=<unavailable: "<<e.what()<<">"; }
         std::cerr<<'\n';
         throw;
@@ -1450,7 +1449,7 @@ int wmain(int argc,wchar_t** argv) {
             assert(state(app.page(),"tasks")["total"]==1);
             std::string many;
             const char* phases[]={"processing_started","failed_terminal","suspended_missing_volume","done"};
-            for(int i=0;i<virtualTaskCount;++i) many+=Json({{"event",phases[i%4]},{"path",utf8((dir/"history"/("task-"+std::to_string(i)+".001")).wstring())},{"time","2026-10-19T09:15:42.731112+00:00"},{"output_dirs",{utf8(dir.wstring())}}}).dump()+"\n";
+            for(int i=0;i<virtualTaskCount;++i) many+=Json({{"event",phases[i%4]},{"path",utf8((dir/"history"/("task-"+std::to_string(i)+".001")).wstring())},{"ts",1792401342.731112},{"output_dirs",{utf8(dir.wstring())}}}).dump()+"\n";
             publish_events(dir/".sunpack_watch"/"events.json",many);
             pump_diagnostic(app,[&]{return state(app.page(),"tasks")["total"]==std::min(100,virtualTaskCount);},"Load virtual tasks");
             virtual_tail(app,"taskItems","taskListScroll",std::min(100,virtualTaskCount));
@@ -2091,9 +2090,8 @@ int wmain(int argc,wchar_t** argv) {
             click(app,"tabTasks"); pump([&]{return state(app.page(),"tab")=="tasks";});
             auto main=utf8((dir/"carrier.001").wstring()), sibling=utf8((dir/"disguised.blob").wstring());
             publish_events(dir/".sunpack_watch"/"events.json",
-                Json{{"event","pipeline_sources_claimed"},{"path",sibling},{"groups",Json::array({
-                    Json{{"path",main},{"name","movie.7z"},{"members",{main,sibling}}}})}}.dump()+"\n"+
-                Json{{"event","failed_password"},{"path",sibling}}.dump()+"\n");
+                Json{{"event","failed_password"},{"path",sibling},{"group",
+                    Json{{"path",main},{"name","movie.7z"},{"members",{main,sibling}}}}}.dump()+"\n");
             try { pump([&]{return state(app.page(),"tasks")["rows"][0]["status"]=="taskWaiting";}); }
             catch(...) { std::cerr<<"Log model: "<<state(app.page(),"tasks")<<" errors="<<state(app.page(),"errors")<<"\n"; throw; }
             auto grouped=state(app.page(),"tasks")["rows"][0];

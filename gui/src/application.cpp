@@ -1075,7 +1075,6 @@ void Application::work() {
                 try {
                     bool refreshed=log.refresh(retries.count(Log) && retries.at(Log).attempts>=3);
                     tasks_changed|=refreshed || task_query_pending;
-                    if(log.retry_required) changed(Log);
                     errors.erase("events.json");
                     if(!task_query_pending) retries.erase(Log);
                 }
@@ -1104,7 +1103,7 @@ void Application::work() {
                     retry_io(Log,e);
                 }
                   catch(const std::exception& e) { task_query_pending=true; errors["events.json"]=e.what(); }
-                log.cancelled={}; log.changed_keys.clear();
+                log.cancelled={};
             }
             if(passwords_changed || language_changed || !previous_patch.contains("passwords")) {
                 if(!password_delta.is_null() && !language_changed && previous_patch.contains("passwords"))

@@ -9,6 +9,7 @@ from pathlib import Path
 
 from benchmarks.harness import BenchmarkReport, BenchmarkWorkspace, ProcessSampler, write_report
 from sunpack_native import NativeEventLog
+from tests.display_history import storage_bytes
 
 
 def main(argv=None):
@@ -29,13 +30,13 @@ def main(argv=None):
         "tasks": args.tasks, "rounds": args.rounds, "cold_starts": args.cold_starts,
         "lifetime_batches": args.lifetime_batches,
         "compaction_tasks": args.compaction_tasks,
-        "method": "Installed native extension; rebuild it after changing Rust sources. Submission and final drain timed separately. No extraction, Broker, sleeps or GUI process. The benchmark never retries or excludes OS I/O faults; the native writer may retry one sharing conflict.",
+        "method": "Installed native extension; rebuild it after changing Rust sources. Submission and final drain timed separately. No extraction, Broker, sleeps or GUI process. The benchmark reports native writer faults.",
     })
     sampler = ProcessSampler()
     with BenchmarkWorkspace(report.scenario, results_root=args.results_root) as workspace:
         report.summary["initial_memory"] = sampler.take().to_dict()
         for count in args.compaction_tasks:
-            path = workspace.work / f"compaction-{count}" / "events.jsonl"
+            path = workspace.work / f"compaction-{count}" / "events.json"
             log = NativeEventLog(str(path))
             latencies = []
             try:
@@ -43,9 +44,9 @@ def main(argv=None):
                 for index in range(count):
                     log.write({"event": "failed_password", "path": str(path.parent / f"task-{index}.opaque")})
                 log.flush()
-                initial_bytes = path.stat().st_size
-                # Exceed the obsolete-byte threshold with actual diagnostic
-                # submissions. Each call's latency includes projection lock
+                initial_bytes = storage_bytes(path)
+                # Submit diagnostic traffic proportional to the stored live
+                # data. Each call's latency includes projection lock
                 # contention; it is an upper bound, not pure lock-wait time.
                 events = (initial_bytes // 2 + 262144) // 3800 + 64
                 started = time.perf_counter()
@@ -63,13 +64,13 @@ def main(argv=None):
                     "median_submit_ms": statistics.median(ordered),
                     "submit_ms": (submitted-started)*1000,
                     "drain_total_ms": (time.perf_counter()-started)*1000,
-                    "initial_file_bytes": initial_bytes, "file_bytes": path.stat().st_size,
+                    "initial_file_bytes": initial_bytes, "file_bytes": storage_bytes(path),
                     "memory": sampler.take().to_dict(),
                 })
             finally:
                 log.close()
         for index in range(args.rounds):
-            path = workspace.work / str(index) / "events.jsonl"
+            path = workspace.work / str(index) / "events.json"
             log = NativeEventLog(str(path))
             sources = [str(path.parent / f"task-{i}.opaque") for i in range(args.tasks)]
             try:
@@ -86,7 +87,7 @@ def main(argv=None):
                 drained = time.perf_counter()
                 report.samples.append({
                     "phase": "deletion_storm", "submit_ms": (submitted-start)*1000,
-                    "drain_total_ms": (drained-start)*1000, "file_bytes": path.stat().st_size,
+                    "drain_total_ms": (drained-start)*1000, "file_bytes": storage_bytes(path),
                     "active_memory": active, "retired_memory": sampler.take().to_dict(),
                 })
             finally:
@@ -94,7 +95,7 @@ def main(argv=None):
 
         # Repeated logical families keep membership payloads while replacing
         # provisional cards; completed families move into bounded history.
-        path = workspace.work / "groups" / "events.jsonl"
+        path = workspace.work / "groups" / "events.json"
         log = NativeEventLog(str(path))
         try:
             log.recover()
@@ -109,13 +110,13 @@ def main(argv=None):
             log.flush()
             report.samples.append({"phase": "grouped_compaction", "submit_ms": (submitted-start)*1000,
                                    "drain_total_ms": (time.perf_counter()-start)*1000,
-                                   "file_bytes": path.stat().st_size})
+                                   "file_bytes": storage_bytes(path)})
         finally:
             log.close()
 
         # Keep the same coordinator alive across unrelated logical families;
         # one closed logger cannot reveal accumulating active-map/handle state.
-        path = workspace.work / "lifetime" / "events.jsonl"
+        path = workspace.work / "lifetime" / "events.json"
         log = NativeEventLog(str(path))
         try:
             log.recover()
@@ -139,14 +140,14 @@ def main(argv=None):
                     faults.append({"phase": "retired", "error": str(error)})
                 report.samples.append({"phase": "steady_lifetime", "batch": batch,
                                        "active_memory": active, "retired_memory": sampler.take().to_dict(),
-                                       "file_bytes": path.stat().st_size, "faults": faults})
+                                       "file_bytes": storage_bytes(path), "faults": faults})
         finally:
             log.close()
 
-        path = workspace.work / "runtime.state.events.jsonl"
+        path = workspace.work / "runtime.state.events.json"
         sizes, errors = [], []
         for index in range(args.cold_starts):
-            log = NativeEventLog(str(path), 8192, False)
+            log = NativeEventLog(str(path), 7, False)
             try:
                 log.write({"event": "host_started", "index": index, "padding": "x" * 2048})
                 log.flush()
@@ -154,7 +155,7 @@ def main(argv=None):
                 errors.append({"restart": index, "error": str(error)})
             finally:
                 log.close()
-            sizes.append(path.stat().st_size if path.exists() else 0)
+            sizes.append(storage_bytes(path) if path.exists() else 0)
         deletion = [s for s in report.samples if s["phase"] == "deletion_storm"]
         gc.collect()
         report.summary.update({

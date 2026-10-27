@@ -225,10 +225,6 @@
       "zh": "个任务",
       "en": "tasks"
     },
-    "invalidLogs": {
-      "zh": "条无效日志已跳过",
-      "en": "invalid log entries skipped"
-    },
     "startup": {
       "zh": "开机启动",
       "en": "Start at sign-in"

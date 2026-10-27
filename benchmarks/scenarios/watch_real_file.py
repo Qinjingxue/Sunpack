@@ -79,12 +79,12 @@ def _phase_seconds(profiler: RequestRuntimeProfiler) -> dict[str, float]:
 
 
 def _output_summary(root: Path, source_name: str) -> dict[str, Any]:
-    excluded = {source_name, "state.snapshot", "events.jsonl"}
+    excluded = {source_name, "state.snapshot", "events.json"}
     files = [
         path
         for path in root.rglob("*")
         if path.is_file()
-        and path.name not in excluded
+        and path.name not in excluded and "events.json.store" not in path.relative_to(root).parts
     ]
     return {
         "file_count": len(files),
@@ -133,7 +133,6 @@ async def _run_once(
             [str(root)],
             # A relative dot is resolved against the watched root, so the
             # result lands in the watch directory itself.
-            out_dir=".",
             state_path=str(state_path),
             cold_start_seconds=cold_start_seconds,
             pipeline_engine=engine,

@@ -40,7 +40,7 @@ def _watcher(root: Path, *, cold_start_seconds: float = 0.05) -> WatchScheduler:
             }
         }),
         [str(root)],
-        out_dir=str(root / "out"),
+        output_roots={str(root): str(root / "out")},
         state_path=str(root / ".watch-state" / "state.snapshot"),
         cold_start_seconds=cold_start_seconds,
         pipeline_engine=FakePipelineEngine(lambda _config: None),

@@ -314,4 +314,4 @@ extract "%1" --ask-pw --deep-detect --pause
 
 Output lands next to the archive by default.
 
-`watch add DIR --recursive` enables recursive discovery for that root. Legacy roots with four or fewer columns remain shallow. Split volumes may span subdirectories within one scope; separate roots remain independent. Watch outputs go directly to the root’s mapped output directory. CLI outputs default beside each archive, or beside the entry volume for a split archive. Pipeline output subtrees are protected from Watch, including later files added there.
+`watch add DIR --recursive` enables recursive discovery for that root. Omitted optional columns use their default values. Split volumes may span subdirectories within one scope; separate roots remain independent. Watch outputs go directly to the root’s mapped output directory. CLI outputs default beside each archive, or beside the entry volume for a split archive. Pipeline output subtrees are protected from Watch, including later files added there.

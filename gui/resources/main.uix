@@ -8,7 +8,7 @@ export default {
   data() { return {
     tab:'tasks',theme:'system',themeChoice:0,appearance:'light',language:'en',texts:{},dispatch:false,requests:[],ready:false,busy:false,
     actionError:'',lastCommand:{},errors:{},logPath:'',cliAllowed:false,runtime:{known:false,running:false},
-    taskCursors:[],taskCursor:'',tasks:{rows:[],total:0,malformed:0,hasMore:false,next:'',dropped:0},passwords:{rows:[],total:0},fields:[],directories:[],
+    taskCursors:[],taskCursor:'',tasks:{rows:[],total:0,hasMore:false,next:'',dropped:0},passwords:{rows:[],total:0},fields:[],directories:[],
     startup:{enabled:false,command:''},directoryQuery:'',
     taskQuery:'',taskRoot:'',taskStatus:0,
     statusNames:['','taskProcessing','taskWaiting','taskSucceeded','taskFailed'],
@@ -773,7 +773,6 @@ export default {
         </div></ScrollView>
         <div class="row"><button @click="latestTaskPage">{{ texts.taskLatest }}</button><button :disabled="!taskCursors.length" @click="previousTaskPage">{{ texts.taskPrevious }}</button><div class="spacer"/><button :disabled="!tasks.hasMore" @click="nextTaskPage">{{ texts.taskNext }}</button></div>
         <label v-show="tasks.dropped" class="error">{{ tasks.dropped }} {{ texts.droppedLogs }}</label>
-        <label v-show="tasks.malformed" class="error">{{ tasks.malformed }} {{ texts.invalidLogs }}</label>
       </div>
       <div id="page-config" v-show="tab==='config'" class="content">
         <div class="page-header"><label class="heading">{{ texts.config }}</label></div>

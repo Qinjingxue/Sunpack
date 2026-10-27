@@ -248,6 +248,10 @@ uv run --locked pytest
 
 ---
 
+## 从旧版升级
+
+v1.3.0 为断代更新：覆盖安装低于 v1.3.0 的版本（包括 v1.2.8）会清空配置、密码、监控目录、日志和状态，以及自定义 Watch 状态目录。请在升级前备份所需信息，升级后按[当前配置说明](docs/zh-CN/configuration.md)重新设置；不要直接恢复旧配置或持久化文件。重新启用递归监控前请检查残留输出目录，原有输出目录排除记录也已清空。
+
 ## 已知问题
 
 - sunpack如果监控下载目录，在最终压缩包处理后，部分下载器的校验行为执行较慢，而sunpack可能在下载器校验时已经完成了源文件的清理，导致下载器认为源文件损坏，从而重试下载或报错。
@@ -257,12 +261,12 @@ uv run --locked pytest
 欢迎通过 [GitHub Issues](https://github.com/Qinjingxue/Sunpack/issues) 报告问题、提出建议，也欢迎提交 [Pull Request](https://github.com/Qinjingxue/Sunpack/pulls) 改进项目。
 
 报告问题时可附上相关日志。安装版默认位置：
-- Watch 事件：`%ProgramData%\SunPack\.sunpack_watch\events.jsonl`
+- Watch 事件：`%ProgramData%\SunPack\.sunpack_watch\events.json` 和 `events.json.store`
 - 解压失败报告：`%ProgramData%\SunPack\.sunpack_watch\failures\failed-*.txt`
 - Windows 通知：`%ProgramData%\SunPack\.sunpack_watch\toast_host_events.jsonl`
-- 后台 Runtime：`%ProgramData%\SunPack\runtime-*.state.events.jsonl`
+- 后台 Runtime：`%ProgramData%\SunPack\runtime-*.state.events.json` 及对应 `.store` 目录
 
-若修改了 `watch.state_dir`，前三项位于自定义状态目录。提交前请删除日志中的密码、私人路径等敏感信息。
+显示历史清单与对应 `.store` 数据目录需一起打包，不是可逐行读取的 JSONL。若修改了 `watch.state_dir`，前三项位于自定义状态目录。提交前请删除日志中的密码、私人路径等敏感信息。
 
 ## 致谢
 

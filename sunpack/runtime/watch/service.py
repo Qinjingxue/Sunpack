@@ -68,7 +68,7 @@ def _release_watch_broker() -> None:
 def service_config_from(config: dict) -> dict:
     service = config["watch"]
     result = dict(service)
-    result["root_entries"] = list(_iter_watch_root_entries("", None))
+    result["root_entries"] = _read_watch_root_entries()
     return result
 
 
@@ -235,19 +235,7 @@ def _read_watch_root_entries(path: Path | None = None) -> list[WatchRootEntry]:
     return entries
 
 
-def _iter_watch_root_entries(_default_output_root: str, path: Path | None):
-    """Yield input policies with explicit output paths resolved in file order.
-
-    An empty output column is meaningful: it leaves output routing to the pipeline, which
-    places the result beside the archive.  Relative explicit output roots are resolved against
-    their own input root, never against the process working directory.
-    """
-    for entry in _read_watch_root_entries(path):
-        yield entry
-
-
 def read_watch_root_outputs(
-    default_output_root: str = ".",
     path: Path | None = None,
 ) -> dict[str, str]:
     """Every watch root mapped to its one absolute output root.
@@ -257,16 +245,16 @@ def read_watch_root_outputs(
     """
     return {
         path_key(entry.input_root): entry.output_root
-        for entry in _iter_watch_root_entries(default_output_root, path)
+        for entry in _read_watch_root_entries(path)
         if entry.output_root
     }
 
 
-def read_watch_roots(default_output_root: str = ".", path: Path | None = None) -> list[str]:
+def read_watch_roots(path: Path | None = None) -> list[str]:
     """The watched input roots, in their own casing and file order."""
     roots: list[str] = []
     seen: set[str] = set()
-    for entry in _iter_watch_root_entries(default_output_root, path):
+    for entry in _read_watch_root_entries(path):
         input_root = entry.input_root
         key = path_key(input_root)
         if key in seen:
@@ -653,8 +641,6 @@ class WatchService:
             self._stop_toast_host()
             self.log.write("scheduler_not_started", reason="no_existing_roots", configured_roots=[entry.input_root for entry in self.service_config["root_entries"]])
             return
-        configured_out_dir = str(self.service_config.get("out_dir") or self.config.get("output", {}).get("root") or ".")
-        out_dir = resolve_service_path(configured_out_dir) if Path(configured_out_dir).expanduser().is_absolute() else configured_out_dir
         state_path = os.path.join(self.state_dir, SERVICE_STATE)
         run_config = deepcopy(self.config)
         require_complete_content(run_config)
@@ -678,7 +664,6 @@ class WatchService:
             scheduler = WatchScheduler(
                 run_config,
                 roots,
-                out_dir=out_dir,
                 output_roots=self.root_outputs,
                 root_entries=self.service_config["root_entries"],
                 state_path=state_path,
@@ -716,7 +701,6 @@ class WatchService:
         self.log.write(
             "scheduler_attached",
             roots=roots,
-            out_dir=out_dir,
             root_outputs=self.root_outputs,
             state_path=state_path,
         )

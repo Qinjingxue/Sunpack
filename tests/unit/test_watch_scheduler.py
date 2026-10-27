@@ -49,7 +49,8 @@ def WatchScheduler(*args, pipeline_engine=None, **kwargs):
 
 
 def _watcher(tmp_path, *, config=None, roots=None, **overrides):
-    options = dict(out_dir=str(tmp_path / "out"), state_path=str(tmp_path / "state.snapshot"))
+    options = dict(output_roots={str(root): str(tmp_path / "out") for root in (roots if roots is not None else [tmp_path])},
+                   state_path=str(tmp_path / "state.snapshot"))
     options.update(overrides)
     return WatchScheduler(
         config if config is not None else make_config({"watch": {"clipboard_monitor_enabled": False}}),
@@ -379,7 +380,6 @@ def test_watch_scheduler_prunes_missing_state_before_start(tmp_path, monkeypatch
     watcher = WatchScheduler(
         make_config({"watch": {"clipboard_monitor_enabled": False}}),
         [str(watch_root)],
-        out_dir=".",
         state_path=str(state_path),
         cold_start_seconds=0,
     )
@@ -1828,7 +1828,7 @@ def test_watch_scheduler_empty_root_output_uses_pipeline_default(tmp_path, monke
         tmp_path,
         config=make_config({}),
         roots=[str(watch_root)],
-        out_dir=str(tmp_path / "legacy-out"),
+        output_roots={},
         root_entries=[WatchRootEntry(str(watch_root), None)],
         cold_start_seconds=0,
         pipeline_engine=FakePipelineEngine(FakePipelineRunner),
@@ -1839,7 +1839,6 @@ def test_watch_scheduler_empty_root_output_uses_pipeline_default(tmp_path, monke
 
     assert result.succeeded == 1
     assert captured["config"]["output"]["root"] == ""
-    assert not (tmp_path / "legacy-out").exists()
 
 
 def test_watch_scheduler_moved_file_uses_common_quiet_window(tmp_path, monkeypatch):
@@ -1986,7 +1985,7 @@ def test_watch_scheduler_processes_archive_when_output_root_matches_watch_root(t
 
     watcher = _watcher(
         tmp_path,
-        out_dir=str(tmp_path),
+        output_roots={root: str(tmp_path) for root in [str(tmp_path)]},
         state_path=str(tmp_path / ".sunpack_watch" / "state.snapshot"),
         cold_start_seconds=0,
         pipeline_engine=FakePipelineEngine(FakePipelineRunner),
@@ -2036,7 +2035,6 @@ def test_watch_scheduler_recovers_persisted_pending_input_after_restart(tmp_path
     state_path = tmp_path / ".sunpack_watch" / "state.snapshot"
     first = _watcher(
         tmp_path,
-        out_dir=".",
         state_path=str(state_path),
         cold_start_seconds=0,
     )
@@ -2056,7 +2054,6 @@ def test_watch_scheduler_recovers_persisted_pending_input_after_restart(tmp_path
 
     restarted = _watcher(
         tmp_path,
-        out_dir=".",
         state_path=str(state_path),
         cold_start_seconds=0,
         pipeline_engine=FakePipelineEngine(FakePipelineRunner),
@@ -2067,44 +2064,6 @@ def test_watch_scheduler_recovers_persisted_pending_input_after_restart(tmp_path
     assert len(runs) == 1
     assert not restarted.state.pending_work_items()
     _await(restarted.stop())
-
-
-def test_relative_output_directory_is_resolved_per_matching_watch_root(tmp_path, monkeypatch):
-    monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
-    first_root = tmp_path / "first"
-    second_root = tmp_path / "second"
-    first_root.mkdir()
-    second_root.mkdir()
-    archive_path = second_root / "sample.zip"
-    _write_zip(archive_path)
-    captured = {}
-
-    class FakePipelineRunner:
-        def __init__(self, config):
-            captured["output"] = config["output"]
-            self.output_dir = Path(config["output"]["root"]) / "sample"
-            self.context = SimpleNamespace(generated_outputs={str(self.output_dir)})
-
-        def run_targets(self, paths):
-            self.output_dir.mkdir(parents=True)
-            return RunSummary(target_results=(TargetRunResult(paths[0], OutcomeKind.COMPLETE_SUCCESS),))
-
-    watcher = WatchScheduler(
-        make_config({"watch": {"clipboard_monitor_enabled": False}}),
-        [str(first_root), str(second_root)],
-        out_dir=".",
-        state_path=str(first_root / ".sunpack_watch" / "state.snapshot"),
-        cold_start_seconds=0,
-        pipeline_engine=FakePipelineEngine(FakePipelineRunner),
-    )
-    watcher.enqueue(str(archive_path))
-
-    result = _await(watcher.run_once())
-
-    assert result.succeeded == 1
-    assert Path(captured["output"]["root"]).is_relative_to(second_root)
-    assert Path(captured["output"]["root"]) == second_root.resolve()
-    assert captured["output"]["common_root"] == str(second_root.resolve())
 
 
 def test_watch_scheduler_routes_each_watch_root_to_its_configured_output_root(tmp_path, monkeypatch):
@@ -2135,7 +2094,6 @@ def test_watch_scheduler_routes_each_watch_root_to_its_configured_output_root(tm
     watcher = _watcher(
         tmp_path,
         roots=[str(first_root), str(second_root)],
-        out_dir=str(tmp_path / "legacy-out"),
         output_roots={
             str(first_root): str(first_out),
             str(second_root): str(second_out),
@@ -2151,7 +2109,6 @@ def test_watch_scheduler_routes_each_watch_root_to_its_configured_output_root(tm
     assert result.succeeded == 1
     assert captured["output_dir"].is_relative_to(second_out)
     assert list(second_out.rglob("payload.bin"))
-    assert not (tmp_path / "legacy-out").exists()
     assert not list(first_out.rglob("payload.bin"))
 
 
@@ -2204,22 +2161,20 @@ def test_watch_root_without_explicit_output_uses_archive_folder_default(tmp_path
     archive_path.parent.mkdir()
     _write_zip(archive_path)
 
-    def output_root_for(out_dir, output_roots=None, root_entries=None):
+    def output_root_for(output_roots, root_entries=None):
         watcher = _watcher(
             tmp_path,
             config=make_config({}),
             roots=[str(watch_root)],
-            out_dir=out_dir,
             output_roots=output_roots,
             root_entries=root_entries,
             cold_start_seconds=0,
         )
         return watcher._output_root_for(str(archive_path))
 
-    assert output_root_for(".", root_entries=[WatchRootEntry(str(watch_root), None)]) is None
-    assert output_root_for(str(tmp_path / "global-out"), root_entries=[WatchRootEntry(str(watch_root), None)]) is None
-    # An enumerated output root wins over the process-wide one.
-    assert output_root_for(".", {str(watch_root): str(tmp_path / "per-root")}) == str(
+    assert output_root_for({}) is None
+    assert output_root_for({}, root_entries=[WatchRootEntry(str(watch_root), None)]) is None
+    assert output_root_for({str(watch_root): str(tmp_path / "per-root")}) == str(
         (tmp_path / "per-root").resolve()
     )
 

@@ -66,10 +66,10 @@ def _arrival_order(sources: list[Path], policy: str) -> list[Path]:
 
 
 def _manifest(root: Path, source_names: set[str]) -> list[dict[str, Any]]:
-    excluded = source_names | {"state.snapshot", "events.jsonl"}
+    excluded = source_names | {"state.snapshot", "events.json"}
     rows: list[dict[str, Any]] = []
     for path in sorted(root.rglob("*")):
-        if not path.is_file() or path.name in excluded:
+        if not path.is_file() or path.name in excluded or "events.json.store" in path.relative_to(root).parts:
             continue
         digest = hashlib.sha256()
         with path.open("rb") as handle:
@@ -367,7 +367,6 @@ async def _run_case(
         watcher = WatchScheduler(
             config,
             [str(root)],
-            out_dir=".",
             state_path=str(state_path),
             cold_start_seconds=cold_start_seconds,
             pipeline_engine=engine,

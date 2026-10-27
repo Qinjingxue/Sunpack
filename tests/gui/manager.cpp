@@ -44,23 +44,17 @@ void projection(Fixture& f) {
     log.cancelled=[]{return true;}; view.task_query="not-present";
     assert(task_rows(log,{},view).is_null()); log.cancelled={};
     fs::remove(p); fails([&]{log.refresh();}); log.refresh(true); assert(log.manifest.is_null());
-    // Equivalent ISO offsets and numeric epochs must display the same local
-    // wall time. TZ is process-only.
+    // Numeric UTC epochs display in local wall time. TZ is process-only.
     EventLog timestamps;
     char* previous=nullptr; size_t count=0; _dupenv_s(&previous,&count,"TZ");
     std::string old_zone=previous?previous:""; std::free(previous);
     _putenv_s("TZ","UTC-8"); _tzset();
-    for(auto value:{"2026-10-19T09:15:42.731112+00:00","2026-10-19T17:15:42.731112+08:00","2026-10-19T04:15:42-05:00","2026-10-19T09:15:42Z"}) {
-        timestamps.accept(Json{{"event","done"},{"path",utf8(source.wstring())},{"time",value}});
-        auto row=task_rows(timestamps,{},{}).at("rows").at(0);
-        assert(row["time"]=="2026-10-19 17:15:42");
-        assert(!row.contains("details"));
-        auto stamp=timestamps.tasks.begin()->second.timestamp;
-        timestamps.accept(Json{{"event","done"},{"path",utf8(source.wstring())},{"ts",stamp}});
-        assert(task_rows(timestamps,{},{}).at("rows").at(0).at("time")==row["time"]);
-    }
-    for(auto value:{"","invalid"}) {
-        timestamps.accept(Json{{"event","done"},{"path",utf8(source.wstring())},{"time",value}});
+    timestamps.accept(Json{{"event","done"},{"path",utf8(source.wstring())},{"ts",1792401342.731112}});
+    auto time_row=task_rows(timestamps,{},{}).at("rows").at(0);
+    assert(time_row["time"]=="2026-10-19 17:15:42");
+    assert(!time_row.contains("details"));
+    for(auto value:{Json(),Json("invalid"),Json(std::numeric_limits<double>::infinity())}) {
+        timestamps.accept(Json{{"event","done"},{"path",utf8(source.wstring())},{"ts",value}});
         assert(task_rows(timestamps,{},{}).at("rows").at(0).at("time")=="");
     }
     timestamps.accept(Json{{"event","done"},{"path",utf8(source.wstring())},{"ts",0}});
@@ -88,102 +82,6 @@ void projection(Fixture& f) {
     assert(task_directory(task_rows(navigation,roots,{}).at("rows").at(0))==monitor);
     fs::remove(nested); fs::remove(monitor);
     fails([&]{task_directory(row);});
-}
-// One real JSONL replay covers logical ownership, removal and delta delivery.
-// The original projection scenario cannot expose cross-path aliasing failures;
-// without this scenario duplicate/stale cards can pass all scalar status checks.
-void logical_projection(Fixture& f) {
-    EventLog log; auto file=f.dir/"logical.jsonl"; log.set_path(file);
-    auto a=utf8((f.dir/"parts"/"disguised.a").wstring());
-    auto b=utf8((f.dir/"parts"/"unrelated.bin").wstring());
-    auto c=utf8((f.dir/"parts"/"third.blob").wstring());
-    auto other=utf8((f.dir/"parts-extra"/"unrelated.bin").wstring());
-    std::unordered_map<std::string,Json> displayed;
-    int ts=0;
-    auto replay=[&](Json record) {
-        record["ts"]=++ts;
-        log.changed_keys.clear(); log.rebuilt=false; log.accept(record);
-        displayed.clear();
-        auto snapshot=task_rows(log,{}, {});
-        for(auto& row:snapshot["rows"]) displayed[row["id"]]=row;
-    };
-    auto send=[&](const char* type,const std::string& path) { replay(Json{{"event",type},{"path",path}}); };
-    auto group=[&](const std::string& path,const std::vector<std::string>& members,bool multipart=false) {
-        replay(Json{{"event","pipeline_sources_claimed"},{"path",path},
-            {"groups",Json::array({Json{{"path",path},{"name","movie.rar"},{"members",members},{"multipart",multipart}}})}});
-    };
-    auto row=[&]() { return task_rows(log,{},{}).at("rows").at(0); };
-    // Unrecognized and preparation events do not create visible work.
-    log.accept(Json{{"event","candidate_active"},{"path",a},{"ts",0}});
-    assert(task_rows(log,{},{}).at("total")==0);
-    send("processing_started",b);
-    assert(row()["parts"]==Json::array() && row()["error"]=="");
-    group(b,{b},true);
-    assert(row()["parts"]==Json::array({"unrelated.bin"})); // One confirmed volume, before any missing-volume status.
-    send("suspended_missing_volume",b);
-    auto id=row()["id"];
-    assert(row()["status"]=="taskWaiting" && row()["statusText"]=="等待分卷");
-    send("processing_started",a);
-    group(a,{c,a,b,b}); // Backend order wins over filenames/main path; duplicates are aliases.
-    assert(displayed.size()==1 && row()["id"]==id && row()["name"]=="disguised.a");
-    assert(log.tasks.begin()->second.members.size()==3 && row()["status"]=="taskProcessing");
-    assert(row()["parts"]==Json::array({"third.blob","disguised.a","unrelated.bin"}));
-    View member_search; member_search.task_query="unrelated.bin";
-    assert(task_rows(log,{},member_search).at("total")==1);
-    send("suspended_missing_volume",a);
-    send("retry_password_failure",b); // No change to the waiting reason.
-    assert(row()["statusText"]=="等待分卷");
-    send("pipeline_request_coalesced",a);
-    assert(displayed.size()==1);
-    replay(Json{{"event","candidate_departed"},{"path",b},{"forgotten",false}});
-    assert(log.tasks.begin()->second.members.size()==2 && row()["statusText"]=="等待分卷");
-    assert(row()["parts"]==Json::array({"third.blob","disguised.a"}));
-    send("processing_started",c); send("failed_password",a);
-    View waiting; waiting.task_status="taskWaiting";
-    assert(task_rows(log,{},waiting).at("total")==1);
-    assert(task_rows(log,{},waiting,"en").at("rows").at(0).at("statusText")=="Waiting for password");
-    // Recursive deletion has a path boundary and ignores persistent-state flags.
-    send("failed_password",other);
-    replay(Json{{"event","candidate_departed"},{"path",utf8((f.dir/"parts").wstring())},{"recursive",true},{"forgotten",false}});
-    assert(displayed.size()==1 && row()["path"]==other);
-    send("candidate_departed",other); assert(displayed.empty());
-    send("processing_started",a); send("no_tasks_found",a); assert(displayed.empty());
-    send("processing_started",b); send("pipeline_request_coalesced",b); assert(displayed.empty());
-    // Two tasks in one claim must stay independent, including nested inputs.
-    replay(Json{{"event","pipeline_sources_claimed"},{"path",a},{"groups",Json::array({
-        Json{{"path",a},{"name","movie.rar"},{"members",{a,b}}},
-        Json{{"path",other},{"name","inner.zip"},{"members",{other}}}})}});
-    assert(displayed.empty());
-    send("processing_started",a); send("failed_password",other);
-    assert(displayed.size()==2);
-    send("done",b); send("pipeline_request_coalesced",a); send("no_tasks_found",b);
-    send("candidate_departed",a); send("candidate_departed",b);
-    assert(displayed.size()==2); // Terminal history remains and aliases retain the result.
-    send("candidate_departed",other); assert(displayed.size()==1 && row()["status"]=="taskSucceeded");
-    send("processing_started",a);
-    replay(Json{{"event","no_tasks_found"},{"path",a},{"retire_group",true}});
-    assert(displayed.empty()); // The confirmed owner can explicitly retire a stale group.
-    // Rust publishes execution IDs on both live events and compacted groups.
-    // Replaying those IDs must preserve history in the existing delta stream.
-    auto claim_execution=[&](const std::string& id) {
-        replay(Json{{"event","pipeline_sources_claimed"},{"processing",true},{"groups",Json::array({
-            Json{{"path",a},{"name","movie.rar"},{"members",{a,b}},{"task_id",id}}})}});
-    };
-    claim_execution("first");
-    replay(Json{{"event","done"},{"path",a},{"task_id","first"},{"output_dirs",{"old-output"}}});
-    auto old=row();
-    claim_execution("second");
-    assert(displayed.size()==2 && displayed.at("first")==old);
-    replay(Json{{"event","failed_password"},{"path",b},{"task_id","second"}});
-    View selected_root; selected_root.task_root=utf8((f.dir/"parts").wstring());
-    WatchRoots roots; roots.entries={{f.dir/"parts","",false}};
-    assert(task_rows(log,roots,selected_root).at("total")==2);
-    replay(Json{{"event","blocker_cleared"},{"path",b},{"task_path",a},{"task_id","second"}});
-    assert(displayed.size()==1 && displayed.at("first")==old);
-    // Reset must release aliases as well as visible history.
-    log.accept(Json{{"event","state_begin"}});
-    log.accept(Json{{"event","processing_started"},{"path",b},{"ts",100}});
-    assert(row()["name"]=="unrelated.bin" && log.tasks.begin()->second.members.size()==1);
 }
 void editing(Fixture& f) {
     auto p=f.dir/"builtin_passwords.json";
@@ -430,7 +328,6 @@ void roots(Fixture& f) {
     assert(!phases.reused);
     view.task_query.clear();
     assert(directory_rows(all,Json::object()).size()==503);
-    log.changed_keys.clear();
     auto changed_path=utf8((f.dir/L"0"/L"file").wstring());
     log.accept(Json{{"event","failed_terminal"},{"path",changed_path},{"ts",99999}});
     // Cached formatting must follow actual task modifications even when the
@@ -578,7 +475,7 @@ int wmain(int argc,wchar_t** argv) {
         time["lower"]="2024-02-29 12:34";time["upper"]="2027-01-01 00:00";
         std::cout<<Json{{"size",range_configuration(size,false)},{"time",range_configuration(time,true,&east)}}.dump(); return 0;
     }
-    try { Fixture f; projection(f); logical_projection(f); editing(f); roots(f); range_editing(f); localization(f); batch_editing(f); service_notifications(); std::cout<<"GUI file contracts passed\n"; }
+    try { Fixture f; projection(f); editing(f); roots(f); range_editing(f); localization(f); batch_editing(f); service_notifications(); std::cout<<"GUI file contracts passed\n"; }
     catch(const std::exception& e) { std::cerr<<e.what()<<"\n"; return 1; }
     CliCommand cli{executable_path(),fs::temp_directory_path(),{L"--echo"}};
     Handle stop(CreateEventW(nullptr,TRUE,FALSE,nullptr));

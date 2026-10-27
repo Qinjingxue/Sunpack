@@ -32,7 +32,7 @@ Json save_changes(const fs::path& directory, const Json& fields, const Json& pas
     const Json& roots, PasswordSaveSnapshot* password_snapshot = nullptr);
 std::string root_for(const fs::path& path, const WatchRoots& roots);
 struct Task {
-    std::string path, name, status, waiting_reason, owner;
+    std::string path, name, status, waiting_reason;
     // Backend order and original filename spelling; one contiguous collection
     // serves alias retirement, search and display (no resident duplicate set).
     struct Member { std::wstring key; std::string filename; };
@@ -56,22 +56,11 @@ struct Task {
 class EventLog {
     fs::path path_;
     uint64_t sequence_ = 0;
-    // Only backend-confirmed members are aliases; filenames are never inferred.
-    std::unordered_map<std::wstring, std::wstring> aliases_;
-    void mark_changed(const std::wstring& key);
-    void erase_task(const std::wstring& key);
-    void accept_group(const Json& group, const std::string& owner = {});
 public:
     Json manifest;
     std::function<bool()> cancelled;
     Json query(const WatchRoots& roots, const struct View& view, const std::string& language) const;
     std::unordered_map<std::wstring, Task> tasks;
-    size_t malformed = 0;
-    uint64_t bytes_parsed = 0; // Diagnostic counter, never persisted.
-    bool retry_required = false;
-    // Distinct changes from the latest refresh, including removed task IDs.
-    std::unordered_set<std::wstring> changed_keys;
-    bool rebuilt = false;
     void set_path(const fs::path& path);
     bool refresh(bool missing_is_final = false);
     void accept(const Json& event);

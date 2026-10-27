@@ -115,7 +115,6 @@ class ExtractionScheduler:
             password_store=self.password_store,
             password_resolver=self.password_resolver,
             metadata_scanner=self.metadata_scanner,
-            retry_policy=None,
             sevenzip_runner=self.sevenzip_runner,
             best_effort=True,
             quiet=bool(self.extraction_config.get("quiet", False)),

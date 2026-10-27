@@ -408,7 +408,6 @@ impl NativeWatchState {
             if let Some(group) = record
                 .failure_payload
                 .get("source_group")
-                .or_else(|| record.failure_payload.get("ui_group"))
             {
                 // A member can disappear after its blocker WAL commit (even
                 // while offline). Verify only recorded member presence; never
@@ -457,8 +456,7 @@ impl NativeWatchState {
                 if let Some(record) = removed {
                     let group = record
                         .failure_payload
-                        .get("source_group")
-                        .or_else(|| record.failure_payload.get("ui_group"));
+                        .get("source_group");
                     let remaining = group
                         .and_then(|g| g["members"].as_array())
                         .into_iter()

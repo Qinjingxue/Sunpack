@@ -631,8 +631,6 @@ def test_input_only_line_leaves_output_unset_for_archive_folder_default(tmp_path
     key = service_module.path_key(str(watch_root.resolve()))
 
     assert service_module.read_watch_root_outputs() == {}
-    assert service_module.read_watch_root_outputs("D:\\Unpacked") == {}
-    assert service_module.read_watch_root_outputs("extracted") == {}
 
 
 @pytest.mark.parametrize("columns, enabled", [
@@ -644,7 +642,7 @@ def test_watch_root_deep_column_is_optional(tmp_path, columns, enabled):
     root = tmp_path / "input"
     roots_path.write_text(f"{root}{columns}\n", encoding="utf-8")
 
-    [entry] = service_module._iter_watch_root_entries("default-out", roots_path)
+    [entry] = service_module._read_watch_root_entries(roots_path)
 
     assert entry.input_root == str(root)
     assert entry.deep_detect is enabled
@@ -685,7 +683,7 @@ def test_watch_service_reads_one_root_policy_snapshot(tmp_path, monkeypatch):
     entries = [service_module.WatchRootEntry(str(tmp_path), str(tmp_path / "out"), True)]
     calls = []
 
-    def read(_path):
+    def read(_path=None):
         calls.append(True)
         return entries
 
@@ -732,7 +730,7 @@ def test_watch_service_scheduler_receives_root_outputs(tmp_path, monkeypatch):
     monkeypatch.setattr(
         service_module,
         "load_config",
-        lambda: make_config({"watch": {"state_dir": str(state_dir), "out_dir": ".", "tray_enabled": False, "roots": [str(tmp_path / "ignored-config-root")]}}),
+        lambda: make_config({"watch": {"state_dir": str(state_dir), "tray_enabled": False, "roots": [str(tmp_path / "ignored-config-root")]}}),
     )
     monkeypatch.setattr(service_module, "WatchScheduler", FakeScheduler)
 
@@ -762,7 +760,7 @@ def test_watch_service_leaves_empty_root_output_for_pipeline_default(tmp_path, m
     monkeypatch.setattr(
         service_module,
         "load_config",
-        lambda: make_config({"watch": {"state_dir": str(state_dir), "out_dir": "D:\\Legacy", "tray_enabled": False}}),
+        lambda: make_config({"watch": {"state_dir": str(state_dir), "tray_enabled": False}}),
     )
     monkeypatch.setattr(service_module, "WatchScheduler", FakeScheduler)
 
@@ -905,7 +903,7 @@ def test_removing_last_root_retires_state_without_a_successor_scheduler(tmp_path
     assert snapshot.stat().st_mtime_ns == mtime
 
 
-def test_default_watch_state_uses_program_directory_and_output_stays_relative(tmp_path, monkeypatch):
+def test_default_watch_state_uses_program_directory_and_per_root_outputs(tmp_path, monkeypatch):
     program_dir = tmp_path / "program"
     working_dir = tmp_path / "windows-system-directory"
     watch_root = tmp_path / "watched"
@@ -919,13 +917,13 @@ def test_default_watch_state_uses_program_directory_and_output_stays_relative(tm
     monkeypatch.setattr(
         service_module,
         "load_config",
-        lambda: make_config({"watch": {"out_dir": ".", "state_dir": "", "tray_enabled": False}}),
+        lambda: make_config({"watch": {"state_dir": "", "tray_enabled": False}}),
     )
     captured = {}
 
     class FakeScheduler(_SchedulerLifecycle):
         def __init__(self, config, roots, **kwargs):
-            captured["out_dir"] = kwargs["out_dir"]
+            captured["output_roots"] = kwargs["output_roots"]
             captured["state_path"] = kwargs["state_path"]
 
     monkeypatch.setattr(service_module, "WatchScheduler", FakeScheduler)
@@ -934,7 +932,7 @@ def test_default_watch_state_uses_program_directory_and_output_stays_relative(tm
     _await(service._start_scheduler())
 
     assert service.state_dir == str((program_dir / ".sunpack_watch").resolve())
-    assert captured["out_dir"] == "."
+    assert captured["output_roots"] == {}
     assert captured["state_path"] == str((program_dir / ".sunpack_watch" / "state.snapshot").resolve())
 
 

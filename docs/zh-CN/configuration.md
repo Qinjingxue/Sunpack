@@ -6,7 +6,11 @@
 
 对象按字段合并，`filesystem.scan_filters` 按 `name` 合并，其余数组整体覆盖。Watch 会自动重新加载配置变更。
 
-覆盖安装低于 1.2.0 的版本时，安装器会整体删除程序目录、`%ProgramData%\SunPack` 及配置指定的自定义 Watch 状态目录，再安装全新默认数据。配置、密码、监控目录、日志和状态全部清空。无法识别或缺少版本号时采用相同策略。重装 1.2.0 及以上版本保留数据目录，程序文件和高级默认配置仍会替换。
+覆盖安装低于 1.3.0 的版本时，安装器会整体删除程序目录、`%ProgramData%\SunPack` 及配置指定的自定义 Watch 状态目录，再安装全新默认数据。配置、密码、监控目录、日志和状态全部清空。无法识别或缺少版本号时采用相同策略。重装 1.3.0 及以上版本保留数据目录，程序文件和高级默认配置仍会替换。
+
+**给旧版用户：1.3.0 是断代更新，包含从 1.2.8 升级的情况。** 升级前请自行备份需要保留的配置、密码及监控目录列表；升级后按当前格式重新配置，不要整体覆盖回旧配置或状态文件。旧版字段升级规则、JSON/JSONL 状态和旧日志读取已移除。Watch 的输出位置由各监控根的映射决定，映射留空时写到归档旁，`watch.out_dir` 已删除。未完成任务和输出目录自动排除记录也会清空；重新启用递归监控前请检查残留输出目录，避免重复处理。
+
+显示历史使用 `events.json` 清单及同名的 `events.json.store` 目录，后台 Runtime 使用 `runtime-*.state.events.json` 及对应 `.store` 目录。它们不是 JSONL 文本日志，报告问题时请一起打包清单和数据目录。任务状态使用二进制 `state.snapshot` 和 `state.journal.*.wal`，发现目录使用 `catalog.snapshot.bin` 和 `catalog.wal.bin`；不要手工编辑。
 
 修改后校验并查看最终配置：
 
@@ -27,7 +31,6 @@ python sunpack.py config show
 | `post_extract.archive_cleanup_mode` | 成功后 `"r"` 移入回收站、`"k"` 保留、`"d"` 删除原归档。 |
 | `post_extract.flatten_single_directory` | `true` 时提升唯一顶层输出目录中的内容。 |
 | `extraction.content_requirement` | `"complete"` 要求完整结果；`"allow_partial"` 接受部分恢复结果。 |
-| `watch.out_dir` | 为兼容配置保留的旧字段；监控目录的输出路径留空时，解压到各归档所在文件夹。 |
 
 例如，在主配置中加入以下字段，可保留原归档并扫描子目录：
 
@@ -39,8 +42,7 @@ python sunpack.py config show
 
 CLI 的 `--recur`、`--cleanup` 和 `--out-dir` 等参数可为单次命令指定解压行为，详见 [CLI 参数说明](cli_parameters.md)。
 
-
-目录发现默认只扫描当前层；`scan`、`inspect`、`extract` 使用 `--recursive` 发现子目录，嵌套解压仍由 `--recur` 控制。升级 1.2.0 及更新版本时，安装器比较新旧高级配置字段，删除废弃字段，并按普通模板补充新增字段；过滤器、分析模块和验证方法按 `name` 更新，保留用户值、模块顺序和未知扩展项。已有权限保持原样。
+目录发现默认只扫描当前层；`scan`、`inspect`、`extract` 使用 `--recursive` 发现子目录，嵌套解压仍由 `--recur` 控制。1.3.0 起保留配置升级入口和原子提交、失败恢复框架，目前没有迁移规则，不会自动重写配置。
 
 ## 扫描过滤
 

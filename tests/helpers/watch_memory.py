@@ -24,6 +24,8 @@ from typing import Any, Callable, Iterable
 
 import psutil
 
+from tests.display_history import iter_records, storage_bytes
+
 from sunpack.pipeline.coordinator.engine import PipelineEngine
 from sunpack.runtime.watch.scheduler import WatchRunResult, WatchScheduler
 
@@ -188,7 +190,7 @@ class WatchMemoryHarness:
         watcher = WatchScheduler(
             config,
             [str(watch_root)],
-            out_dir=str(output_root),
+            output_roots={str(watch_root): str(output_root)},
             state_path=str(state_path),
             cold_start_seconds=cold_start_seconds,
             pipeline_engine=engine,
@@ -296,23 +298,20 @@ def _state_stats(watcher: WatchScheduler, state_path: Path) -> dict[str, Any]:
         result["state_file_bytes"] + result["state_journal_bytes"]
     )
     try:
-        result["event_log_bytes"] = state_path.with_name("events.jsonl").stat().st_size
+        result["event_log_bytes"] = storage_bytes(state_path.with_name("events.json"))
     except OSError:
         result["event_log_bytes"] = 0
     cleanup_events = {"scheduled": 0, "started": 0, "finished": 0}
     try:
-        with state_path.with_name("events.jsonl").open("r", encoding="utf-8") as handle:
-            for line in handle:
-                try:
-                    event = json.loads(line).get("event")
-                except (TypeError, ValueError):
-                    continue
-                if event == "cache_cleanup_scheduled":
-                    cleanup_events["scheduled"] += 1
-                elif event == "cache_cleanup_started":
-                    cleanup_events["started"] += 1
-                elif event == "cache_cleanup_finished":
-                    cleanup_events["finished"] += 1
+        watcher.log.flush()
+        for row in iter_records(state_path.with_name("events.json")):
+            event = row.get("event")
+            if event == "cache_cleanup_scheduled":
+                cleanup_events["scheduled"] += 1
+            elif event == "cache_cleanup_started":
+                cleanup_events["started"] += 1
+            elif event == "cache_cleanup_finished":
+                cleanup_events["finished"] += 1
     except (OSError, UnicodeError):
         pass
     result["cache_cleanup"] = cleanup_events

@@ -62,16 +62,6 @@ class _RecordingPasswordResolver:
         )
 
 
-class _FakeRetryPolicy:
-    max_retries = 1
-
-    def can_retry(self, *_args, **_kwargs):
-        return False
-
-    def append_retry_count(self, error, _retry_count):
-        return error
-
-
 class _FakeSevenZipRunner:
     def __init__(self, *, include_output_counts: bool = True):
         self.sources = []
@@ -141,7 +131,6 @@ def test_unknown_input_without_passwords_uses_unconfirmed_empty_candidate(tmp_pa
         password_store=_FakePasswordStore(),
         password_resolver=Resolver(),
         metadata_scanner=ArchiveMetadataScanner(),
-        retry_policy=_FakeRetryPolicy(),
         sevenzip_runner=_FakeSevenZipRunner(),
         best_effort=True,
     )
@@ -179,7 +168,6 @@ def test_embedded_password_probe_and_session_key_follow_active_segment(tmp_path)
         password_store=_CandidatePasswordStore(),
         password_resolver=resolver,
         metadata_scanner=ArchiveMetadataScanner(),
-        retry_policy=_FakeRetryPolicy(),
         sevenzip_runner=_FakeSevenZipRunner(),
         best_effort=True,
     )
@@ -219,7 +207,6 @@ def test_embedded_boundary_password_is_reused_without_second_search(tmp_path):
         password_store=_CandidatePasswordStore(),
         password_resolver=_NeverPasswordResolver(),
         metadata_scanner=ArchiveMetadataScanner(),
-        retry_policy=_FakeRetryPolicy(),
         sevenzip_runner=_FakeSevenZipRunner(),
         best_effort=True,
     )
@@ -253,7 +240,6 @@ def test_single_embedded_segment_exposes_logical_input_for_verification(tmp_path
         password_store=_FakePasswordStore(),
         password_resolver=_FakePasswordResolver(),
         metadata_scanner=ArchiveMetadataScanner(),
-        retry_policy=_FakeRetryPolicy(),
         sevenzip_runner=_FakeSevenZipRunner(),
         best_effort=True,
     )
@@ -284,7 +270,6 @@ def test_multiple_embedded_failures_keep_aggregate_diagnosis(count):
         password_store=_FakePasswordStore(),
         password_resolver=_FakePasswordResolver(),
         metadata_scanner=ArchiveMetadataScanner(),
-        retry_policy=_FakeRetryPolicy(),
         sevenzip_runner=_FakeSevenZipRunner(),
         best_effort=True,
     )
@@ -322,7 +307,6 @@ def test_extractor_fills_success_output_counts_when_worker_omits_them(tmp_path):
         password_store=_FakePasswordStore(),
         password_resolver=_FakePasswordResolver(),
         metadata_scanner=ArchiveMetadataScanner(),
-        retry_policy=_FakeRetryPolicy(),
         sevenzip_runner=runner,
         best_effort=True,
     )

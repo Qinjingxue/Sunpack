@@ -1,4 +1,5 @@
 import asyncio
+from sunpack.pipeline.coordinator.async_work import CancellationToken
 from datetime import datetime
 
 from sunpack.pipeline.discovery.filesystem.filters.modules.mtime_range import (
@@ -36,7 +37,6 @@ def test_async_worker_failure_reaches_failed_process_fallback():
         password_store=None,
         password_resolver=None,
         metadata_scanner=None,
-        retry_policy=None,
         sevenzip_runner=runner,
     )
 
@@ -53,7 +53,7 @@ def test_async_worker_failure_reaches_failed_process_fallback():
             "out",
             request_id="request",
             file_id="file",
-            cancellation=None,
+            cancellation=CancellationToken(),
         )
     )
 
@@ -94,7 +94,6 @@ def test_async_retry_resubmits_without_timed_backoff(monkeypatch):
         password_store=None,
         password_resolver=None,
         metadata_scanner=None,
-        retry_policy=None,
         sevenzip_runner=_Runner(),
     )
 
@@ -111,7 +110,7 @@ def test_async_retry_resubmits_without_timed_backoff(monkeypatch):
             "out",
             request_id="request",
             file_id="file",
-            cancellation=None,
+            cancellation=CancellationToken(),
         )
     )
 

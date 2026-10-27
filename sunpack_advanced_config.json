@@ -122,7 +122,6 @@
     "password_retry_debounce_seconds": 0.5,
     "clipboard_monitor_enabled": true,
     "clipboard_builtin_max_entries": 30,
-    "out_dir": ".",
     "tray_enabled": true,
     "toast_enabled": true,
     "toast_update_interval_ms": 50,
