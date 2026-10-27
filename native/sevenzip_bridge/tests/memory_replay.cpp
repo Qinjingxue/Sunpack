@@ -92,12 +92,12 @@ void admission_and_recovery() {
 }
 
 void simultaneous_scaled_machine_budgets() {
-    // 1:256 scale models 8/16/32 GiB with a fixed 512 MiB reserve. This
+    // 1:256 scale models 8/16/32 GiB with 2/16/128 CPU credits. This
     // exercises simultaneous commitments against one budget while committing
     // at most 112 MiB on the development machine, without touching its RAM.
     for (const auto gib : {8, 16, 32}) {
         const auto total = static_cast<std::uint64_t>(gib) * 4 * MiB;
-        constexpr auto reserve = NativeMemoryManager::default_reserve_bytes / 256;
+        const auto reserve = NativeMemoryManager::default_reserve_bytes(gib == 8 ? 2 : gib == 16 ? 16 : 128) / 256;
         const auto budget = total - reserve;
         std::vector<std::unique_ptr<NativeMemoryJob>> jobs;
         NativeMemoryManager manager(reserve, [&] {
@@ -171,6 +171,7 @@ void restart_working_set() {
     capacity = 16 * MiB;
     manager.changed();
     require(ready(withdrawal) && job.revoked, "external contraction did not withdraw the task");
+    require(job.required == 56 * MiB, "early replay withdrawal forgot the observed required workspace");
     sunpack_memory_free(dictionary);
     manager.end(job);
     std::promise<bool> probe;

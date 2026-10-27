@@ -7,6 +7,7 @@
 
 /* #include "CpuArch.h" */
 #include "LzmaDec.h"
+#include "internal/decoder_memory.h"
 
 // #define kNumTopBits 24
 #define kTopValue ((UInt32)1 << 24)
@@ -1249,7 +1250,8 @@ void LzmaDec_FreeProbs(CLzmaDec *p, ISzAllocPtr alloc)
 
 static void LzmaDec_FreeDict(CLzmaDec *p, ISzAllocPtr alloc)
 {
-  ISzAlloc_Free(alloc, p->dic);
+  if (!sunpack_memory_free(p->dic))
+    ISzAlloc_Free(alloc, p->dic);
   p->dic = NULL;
 }
 
@@ -1329,7 +1331,12 @@ SRes LzmaDec_Allocate(CLzmaDec *p, const Byte *props, unsigned propsSize, ISzAll
   if (!p->dic || dicBufSize != p->dicBufSize)
   {
     LzmaDec_FreeDict(p, alloc);
-    p->dic = (Byte *)ISzAlloc_Alloc(alloc, dicBufSize);
+    /* Several sub-4-MiB dictionaries can dominate a multi-stream graph.
+       Manage these variable workspaces at 2 MiB without tracking fixed IO
+       buffers or rounding their requested size up to the dispatch threshold. */
+    p->dic = (Byte *)(dicBufSize >= ((SizeT)2 << 20) && sunpack_memory_current_context()
+        ? sunpack_memory_alloc(dicBufSize)
+        : ISzAlloc_Alloc(alloc, dicBufSize));
     if (!p->dic)
     {
       LzmaDec_FreeProbs(p, alloc);

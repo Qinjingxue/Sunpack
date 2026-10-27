@@ -105,7 +105,7 @@ void NativeMemoryManager::begin(NativeMemoryJob &job, std::function<void()> wake
     job.wake_pending = false;
     job.failed_headroom = -1;
     job.retry_headroom = INT64_MAX;
-    job.required = 0;
+    if (!job.revoked.load(std::memory_order_acquire)) job.required = 0;
     job.peak = job.committed;
     job.revoked.store(false, std::memory_order_release);
     job.denied.store(false, std::memory_order_release);
@@ -139,7 +139,11 @@ void NativeMemoryManager::revoke_locked(NativeMemoryJob &job) {
     job.wake_pending = true;
 }
 void NativeMemoryManager::failed_locked(NativeMemoryJob &job, std::uint64_t required, const NativeMemoryStatus &status) {
-    job.required = required;
+    // A replay can be withdrawn before it reaches the allocation that failed
+    // last time. Keep that observed workspace instead of relearning a smaller
+    // prefix forever under contention. Real capacity growth still permits the
+    // existing bounded probe below this requirement.
+    job.required = (std::max)(job.required, required);
     // Compare external capacity after refunding this attempt, not the extra
     // room produced merely by freeing its own dictionaries/admission.
     job.retry_headroom = status.headroom + static_cast<std::int64_t>(job.committed + job.admission);
@@ -199,6 +203,13 @@ void *NativeMemoryManager::allocate(NativeMemoryJob &job, std::size_t size) noex
         job.admission -= credit;
         job.committed += wanted;
         cached_.headroom -= static_cast<std::int64_t>(wanted);
+        if (job.admission && job.committed >= job.required) {
+            // The observed dictionary workspace is now funded. Reconcile the
+            // small allocations made while rebuilding it, then return the
+            // temporary cushion so it cannot suppress useful concurrency.
+            job.admission = 0;
+            sample_locked(true);
+        }
         return result;
     } catch (...) { retry(job); return nullptr; }
 }
@@ -300,17 +311,29 @@ void NativeMemoryManager::monitor() {
                 // Retained replay metadata is already in process commitment;
                 // reserve only the additional workspace, never charge it twice.
                 const auto needed = job.required > job.committed ? job.required - job.committed : 0;
+                // Replays also recreate their small codec/IO workspace. Do not
+                // wake a whole wave using dictionary bytes alone. This is the
+                // same coarse, measured per-credit cushion as the reserve;
+                // ordinary task admission and CPU credits are unchanged.
+                const auto reservation = needed > UINT64_MAX - small_workspace_bytes_per_credit
+                    ? UINT64_MAX : needed + small_workspace_bytes_per_credit;
+                const bool progressing = std::any_of(jobs_.begin(), jobs_.end(), [](const auto *other) {
+                    return other->running || other->admission != 0;
+                });
                 // A failed mandatory allocation includes the dictionaries still
                 // live at that point. An unclassified withdrawal may include
                 // optional parallel storage: allow a budgeted probe after real
                 // capacity grows by one managed-allocation quantum.
                 const bool growth = available.headroom >= static_cast<std::int64_t>(quantum) &&
                     job.retry_headroom <= available.headroom - static_cast<std::int64_t>(quantum);
-                const bool fits = (can_fit(available.headroom, needed) || growth) &&
+                // Always permit one otherwise-fitting task even if the extra
+                // cushion cannot fit; the fixed reserve protects that probe.
+                const bool fits = (can_fit(available.headroom, reservation) ||
+                    (!progressing && can_fit(available.headroom, needed)) || growth) &&
                     (job.failed_headroom < 0 || available.headroom > job.failed_headroom);
                 if (canceled || fits) {
                     if (!canceled) {
-                        job.admission = (std::min)(needed, static_cast<std::uint64_t>((std::max)(available.headroom, std::int64_t{0})));
+                        job.admission = (std::min)(reservation, static_cast<std::uint64_t>((std::max)(available.headroom, std::int64_t{0})));
                         jobs_.push_back(&job);
                     }
                     callbacks.push_back([waiter = std::move(waiter), available, canceled]() mutable {
@@ -319,9 +342,6 @@ void NativeMemoryManager::monitor() {
                     });
                     it = waiters_.erase(it);
                 } else {
-                    const bool progressing = std::any_of(jobs_.begin(), jobs_.end(), [](const auto *other) {
-                        return other->running || other->admission != 0;
-                    });
                     if (!waiter.announced && !progressing && waiter.notice) {
                         waiter.announced = true;
                         callbacks.push_back([notice = waiter.notice, available, needed = job.required] { notice(true, available, needed); });

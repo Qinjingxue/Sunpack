@@ -47,14 +47,16 @@ class Sandbox:
     def close(self): K.CloseHandle(self.handle)
 
 
-def run(name, archive, hint, jobs, *, limit=768, dynamic=False, password=False, dry=False, capacity=None, extra_env=None, reserve=512, expected_output=None, workloads=None, volumes=1, cpu_rate=100):
+def run(name, archive, hint, jobs, *, limit=768, dynamic=False, password=False, dry=False, capacity=None, extra_env=None, reserve=None, expected_output=None, workloads=None, volumes=1, cpu_rate=100, trace_memory=True):
     OUT.mkdir(parents=True, exist_ok=True)
     label = name + '-' + str(time.time_ns())
     trace = OUT / (label + '.csv')
+    configured_reserve = 0 if reserve is None else reserve * 1024**2
+    reserve = 128 + 16 * (capacity or jobs) if reserve is None else reserve
     initial_limit = reserve + 4 if dynamic else limit
     box = Sandbox(initial_limit, cpu_rate=cpu_rate, affinity=3)
     env = os.environ | {'SUNPACK_NATIVE_WORKER_THREAD_CAPACITY': str(capacity or jobs),
-        'SUNPACK_TEST_MEMORY_TRACE': str(trace), 'SUNPACK_NATIVE_MEMORY_RESERVE_BYTES':str(reserve*1024**2)} | (extra_env or {})
+        'SUNPACK_TEST_MEMORY_TRACE': str(trace) if trace_memory else '', 'SUNPACK_NATIVE_MEMORY_RESERVE_BYTES':str(configured_reserve)} | (extra_env or {})
     error_file = (OUT / (label + '.stderr.txt')).open('w', encoding='utf-8')
     p = subprocess.Popen([str(WORKER)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=error_file,
         text=True, encoding='utf-8', creationflags=subprocess.CREATE_NO_WINDOW, env=env)
@@ -74,6 +76,7 @@ def run(name, archive, hint, jobs, *, limit=768, dynamic=False, password=False, 
     # Capture idle workers, including the cost of their full execution lanes.
     handshake = q.get(timeout=10)
     assert handshake['memory_reserve_bytes'] == reserve * 1024**2, handshake
+    assert handshake['nominal_cpu_budget'] == (capacity or jobs), handshake
     time.sleep(.10)
     def set_limit(mib):
         box.limits.JobMemoryLimit = mib * 1024**2
@@ -113,11 +116,11 @@ def run(name, archive, hint, jobs, *, limit=768, dynamic=False, password=False, 
         process_times = [ctypes.c_ulonglong() for _ in range(4)]
         box.check(K.GetProcessTimes(int(p._handle), *(ctypes.byref(value) for value in process_times)))
         rows=[]
-        for line in trace.read_text().splitlines():
+        for line in (trace.read_text().splitlines() if trace_memory else ()):
             tick, phase, private, managed=line.split(',')
             private, managed = int(private), int(managed)
             rows.append({'tick':int(tick), 'phase':phase, 'private':private, 'managed':managed, 'unmanaged':private-managed})
-        peak=max(rows,key=lambda r:r['unmanaged'])
+        peak=max(rows,key=lambda r:r['unmanaged'],default={'unmanaged':0})
         output_checks = []
         if not dry:
             from sunpack_native import compute_directory_crc_manifest
@@ -136,20 +139,24 @@ def run(name, archive, hint, jobs, *, limit=768, dynamic=False, password=False, 
         recovery_tick = next((e['_tick'] for e in events if e.get('event') == 'memory_reclaimed'), None)
         recovery = [r for r in rows if recovery_tick is not None and r['tick'] >= recovery_tick]
         recovery_baseline = next((r['unmanaged'] for r in reversed(rows)
-            if recovery_tick is not None and r['tick'] < recovery_tick), rows[0]['unmanaged'])
+            if recovery_tick is not None and r['tick'] < recovery_tick), rows[0]['unmanaged'] if rows else 0)
         report={'label':label,'jobs':jobs,'capacity':capacity or jobs,'limit_mib':limit,'initial_limit_mib':initial_limit,'dynamic':dynamic,'dry':dry,'volumes':volumes,'cpu_rate':cpu_rate,
             'output_checks':output_checks, 'returncode':p.returncode,'elapsed':round(time.monotonic()-started,3), 'worker_seconds':worker_seconds,
             'cpu_seconds':(process_times[2].value + process_times[3].value) / 10_000_000, 'job_peak_mib':box.peak(),
             'unmanaged_peak_mib':peak['unmanaged']/1024**2,'unmanaged_peak_row':peak,
-            'private_peak_mib':max(r['private'] for r in rows)/1024**2,
-            'managed_peak_mib':max(r['managed'] for r in rows)/1024**2,
-            'idle_unmanaged_mib':rows[0]['unmanaged']/1024**2,
-            'reserve_mib':reserve,
+            'private_peak_mib':max((r['private'] for r in rows),default=0)/1024**2,
+            'managed_peak_mib':max((r['managed'] for r in rows),default=0)/1024**2,
+            'idle_unmanaged_mib':rows[0]['unmanaged']/1024**2 if rows else 0,
+            'reserve_mib':reserve, 'automatic_reserve':configured_reserve == 0,
             'recovery_unmanaged_peak_mib':max((r['unmanaged'] for r in recovery),default=0)/1024**2,
             'recovery_unmanaged_growth_mib':max((r['unmanaged']-recovery_baseline for r in recovery),default=0)/1024**2,
             'thread_resource_retries':sum(e.get('event')=='memory_thread_resource_retry' for e in events),'memory_reclaims':sum(e.get('event')=='memory_reclaimed' for e in events),
             'max_admitted':max((e.get('active_jobs',0) for e in events),default=0),
-            'host_min_available_mib':host_min/1024**2,'edits':edits,'samples':len(rows)}
+            'host_min_available_mib':host_min/1024**2,'edits':edits,'samples':len(rows),'memory_measured':trace_memory}
+        if not trace_memory:
+            for key in ('unmanaged_peak_mib', 'unmanaged_peak_row', 'private_peak_mib', 'managed_peak_mib',
+                        'idle_unmanaged_mib', 'recovery_unmanaged_peak_mib', 'recovery_unmanaged_growth_mib'):
+                report[key] = None
         (OUT/(label+'.summary.json')).write_text(json.dumps(report,indent=2))
         print(json.dumps(report),flush=True)
         return report
@@ -171,7 +178,7 @@ if __name__ == '__main__':
     parser.add_argument('--volumes', type=int, default=1, help='independent writer facilities on the test drive')
     parser.add_argument('--cpu-rate', type=int, default=100, help='child Job CPU rate in units of 1/100 percent')
     parser.add_argument('--limit-mib', type=int, default=768)
-    parser.add_argument('--reserve-mib', type=int, default=512)
+    parser.add_argument('--reserve-mib', type=int, help='positive fixed override; omitted uses worker automatic reserve')
     parser.add_argument('--dynamic', action='store_true')
     parser.add_argument('--dry-run', action='store_true')
     parser.add_argument('--password')

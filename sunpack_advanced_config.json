@@ -107,7 +107,7 @@
       "space_gate_enabled": true,
       "space_poll_interval_ms": 1000,
       "space_status_report_interval_ms": 15000,
-      "memory_reserve_bytes": 536870912
+      "memory_reserve_bytes": 0
     }
   },
   "runtime": {

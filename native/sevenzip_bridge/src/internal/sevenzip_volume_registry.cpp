@@ -323,7 +323,10 @@ namespace sunpack::sevenzip
             std::lock_guard<std::mutex> lock(mutex_);
             for (const auto &entry : entries_) if (entry.second.writer) writers.push_back(entry.second.writer);
         }
-        for (const auto &writer : writers) writer->reclaim_idle_memory();
+        std::size_t bytes = 0;
+        for (const auto &writer : writers) bytes += writer->idle_memory_bytes();
+        if (bytes >= (8U << 20))
+            for (const auto &writer : writers) writer->reclaim_idle_memory();
     }
 
     void VolumeWriterRegistry::abort_all_space_gates() noexcept

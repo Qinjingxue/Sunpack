@@ -4,7 +4,8 @@
 /* A dispatch threshold, never a format/dictionary size limit. Small buffers
    keep the SDK allocator and do not participate in arbitration. */
 /* Includes LZ4's legal 4 MiB block buffers (plus checksum/history), while
-   leaving the fixed 1 MiB output and smaller IO buffers on the original path. */
+   leaving the fixed 1 MiB output and smaller IO buffers on the original path.
+   LZMA's variable dictionaries use a dedicated 2 MiB entry in LzmaDec.c. */
 #define SUNPACK_LARGE_ALLOCATION ((size_t)4 << 20)
 
 #ifdef __cplusplus

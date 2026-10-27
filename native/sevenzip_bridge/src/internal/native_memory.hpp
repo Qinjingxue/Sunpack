@@ -13,7 +13,7 @@
 namespace sunpack::sevenzip {
 
 struct NativeMemoryStatus {
-    std::int64_t headroom = 0; // after the fixed reserve and unresident commit
+    std::int64_t headroom = 0; // after the worker reserve and unresident commit
     std::uint64_t available = 0;
     std::uint64_t reserve = 0;
 };
@@ -28,7 +28,7 @@ struct NativeMemoryJob final {
     std::function<void()> wake;
     // The manager mutex protects all non-atomic fields.
     std::uint64_t committed = 0, peak = 0, admission = 0;
-    std::uint64_t required = 0; // last failed request plus its still-live workspace
+    std::uint64_t required = 0; // observed failed workspace, retained across early replay withdrawals
     std::int64_t failed_headroom = -1;
     std::int64_t retry_headroom = INT64_MAX;
     bool running = false, wake_pending = false;
@@ -39,8 +39,17 @@ class NativeMemoryManager final {
 public:
     using Query = std::function<NativeMemoryStatus()>;
     using WaitNotice = std::function<void(bool, const NativeMemoryStatus &, std::uint64_t)>;
-    static constexpr std::uint64_t default_reserve_bytes = 512ULL << 20;
-    explicit NativeMemoryManager(std::uint64_t reserve_bytes = default_reserve_bytes, Query query = {},
+    static constexpr std::uint64_t small_workspace_bytes_per_credit = 16ULL << 20;
+    // Fixed recovery room plus the measured small-workspace growth per CPU
+    // credit. Use nominal capacity, not live credits: releasing an attempt
+    // must not lower its own recovery threshold or cause reserve oscillation.
+    static constexpr std::uint64_t default_reserve_bytes(std::size_t cpu_credits = 1) noexcept {
+        constexpr std::uint64_t base = 128ULL << 20, per_credit = small_workspace_bytes_per_credit;
+        const auto credits = cpu_credits == 0 ? std::size_t{1} : cpu_credits;
+        const auto maximum = (std::uint64_t{INT64_MAX} - base) / per_credit;
+        return base + (credits > maximum ? maximum : credits) * per_credit;
+    }
+    explicit NativeMemoryManager(std::uint64_t reserve_bytes = default_reserve_bytes(), Query query = {},
                                  std::function<void()> reclaim = {});
     ~NativeMemoryManager();
     NativeMemoryManager(const NativeMemoryManager &) = delete;

@@ -1452,12 +1452,14 @@ bool apply_native_process_mode(const std::string& mode) noexcept {
 #endif
 }
 
-std::uint64_t configured_memory_reserve_bytes() noexcept {
-    return configured_native_size(
+std::uint64_t configured_memory_reserve_bytes(std::size_t cpu_credits) noexcept {
+    const auto configured = configured_native_size(
         "SUNPACK_NATIVE_MEMORY_RESERVE_BYTES",
-        sunpack::sevenzip::NativeMemoryManager::default_reserve_bytes,
+        0,
         0,
         static_cast<std::size_t>((std::numeric_limits<std::int64_t>::max)()));
+    return configured != 0 ? configured
+        : sunpack::sevenzip::NativeMemoryManager::default_reserve_bytes(cpu_credits);
 }
 
 class NativeJobExecutor final {
@@ -2269,7 +2271,7 @@ int main() {
     const auto sizing = sunpack::sevenzip::derive_native_sizing_plan(
         resources,
         configured_native_sizing_overrides());
-    const auto memory_reserve_bytes = configured_memory_reserve_bytes();
+    const auto memory_reserve_bytes = configured_memory_reserve_bytes(sizing.thread_capacity);
     NativeJobExecutor executor(sizing, memory_reserve_bytes);
     const bool sizing_overridden = sizing.thread_capacity_overridden;
     print_json_line(

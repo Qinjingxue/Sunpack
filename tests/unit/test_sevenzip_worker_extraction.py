@@ -878,16 +878,17 @@ def test_native_environment_zero_thread_capacity_uses_native_auto_capacity():
     assert "SUNPACK_NATIVE_WORKER_THREAD_CAPACITY" not in environment
 
 
-def test_native_environment_configures_memory_reserve():
+@pytest.mark.parametrize("reserve", [0, 268435456])
+def test_native_environment_configures_memory_reserve(reserve):
     environment = {}
     _apply_native_environment(
         environment,
         {
-            "memory_reserve_bytes": 268435456,
+            "memory_reserve_bytes": reserve,
         },
     )
 
-    assert environment["SUNPACK_NATIVE_MEMORY_RESERVE_BYTES"] == "268435456"
+    assert environment["SUNPACK_NATIVE_MEMORY_RESERVE_BYTES"] == str(reserve)
 
 
 def test_memory_wait_releases_execution_lanes_and_accepts_cancellation(tmp_path):
@@ -919,10 +920,12 @@ def test_memory_wait_releases_execution_lanes_and_accepts_cancellation(tmp_path)
     def capacity(mib):
         limits.JobMemoryLimit = mib * 1024**2
         assert kernel.SetInformationJobObject(handle, 9, ctypes.byref(limits), ctypes.sizeof(limits))
-    capacity(512 + 48)
+    reserve_mib = 128 + 16 * 2
+    capacity(reserve_mib + 48)
     process = subprocess.Popen([str(worker)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                text=True, encoding="utf-8", creationflags=subprocess.CREATE_NO_WINDOW,
-                               env=os.environ | {"SUNPACK_NATIVE_WORKER_THREAD_CAPACITY": "2"})
+                               env=os.environ | {"SUNPACK_NATIVE_WORKER_THREAD_CAPACITY": "2",
+                                   "SUNPACK_NATIVE_MEMORY_RESERVE_BYTES": "0"})
     events = queue.Queue()
     seen = []
     def read():
@@ -943,6 +946,9 @@ def test_memory_wait_releases_execution_lanes_and_accepts_cancellation(tmp_path)
         pytest.fail("worker resource transition did not finish")
     try:
         assert kernel.AssignProcessToJobObject(handle, int(process._handle))
+        handshake = until(lambda event: event.get("type") == "worker_ready")
+        reserve_mib = handshake["memory_reserve_bytes"] // 1024**2
+        capacity(reserve_mib + 48)
         for job in ("large-1", "large-2"):
             send({"job_id": job, "archive_path": str(archive), "format_hint": "xz", "output_dir": str(tmp_path / job)})
         until(lambda event: sum(e.get("event") == "memory_blocked" for e in seen) == 2)
@@ -959,7 +965,7 @@ def test_memory_wait_releases_execution_lanes_and_accepts_cancellation(tmp_path)
         # receipts for a changed source must require a rescan, never report CRC damage.
         with changed.open("ab") as output:
             output.write(b"\0" * 4)
-        capacity(512 + 128)
+        capacity(reserve_mib + 128)
         until(lambda event: {e.get("job_id") for e in seen if e.get("type") == "result"} >= {"large-2", "changed"})
         assert next(e for e in seen if e.get("type") == "result" and e.get("job_id") == "large-2")["status"] == "ok"
         assert next(e for e in seen if e.get("type") == "result" and e.get("job_id") == "changed")["failure_kind"] == "input_changed"
@@ -986,7 +992,8 @@ def test_native_environment_does_not_freeze_worker_process_mode_at_startup():
     assert "SUNPACK_NATIVE_PROCESS_MODE" not in environment
 
 
-def test_native_worker_reports_cpu_credit_sizing_plan():
+@pytest.mark.parametrize("credits,reserve", [(None, None), (2, 0), (8, None), (2, 268435456)])
+def test_native_worker_reports_cpu_credit_sizing_plan(credits, reserve):
     worker_path = _require_worker_or_skip()
     environment = os.environ.copy()
     for key in (
@@ -996,6 +1003,10 @@ def test_native_worker_reports_cpu_credit_sizing_plan():
         "SUNPACK_NATIVE_MEMORY_RESERVE_BYTES",
     ):
         environment.pop(key, None)
+    if credits is not None:
+        environment["SUNPACK_NATIVE_WORKER_THREAD_CAPACITY"] = str(credits)
+    if reserve is not None:
+        environment["SUNPACK_NATIVE_MEMORY_RESERVE_BYTES"] = str(reserve)
     completed = subprocess.run(
         [worker_path],
         input='{"worker_command":"shutdown","job_id":"shutdown"}\n',
@@ -1011,11 +1022,12 @@ def test_native_worker_reports_cpu_credit_sizing_plan():
 
     logical_processors = max(1, int(handshake["logical_processors"]))
     assert handshake["type"] == "worker_ready"
-    assert handshake["sizing_mode"] == "dynamic"
-    assert int(handshake["thread_capacity"]) == logical_processors
-    assert int(handshake["nominal_cpu_budget"]) == logical_processors
+    capacity = min(credits, logical_processors) if credits else logical_processors
+    assert handshake["sizing_mode"] == ("overridden" if credits else "dynamic")
+    assert int(handshake["thread_capacity"]) == capacity
+    assert int(handshake["nominal_cpu_budget"]) == capacity
     assert handshake["memory_management"] == "commitment_replay"
-    assert int(handshake["memory_reserve_bytes"]) == 536870912
+    assert int(handshake["memory_reserve_bytes"]) == (reserve or (128 + 16 * capacity) * 1024**2)
 
 
 def test_worker_event_rejects_non_objects_and_malformed_rows():

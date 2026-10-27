@@ -518,6 +518,42 @@ bool registry_routes_by_volume_and_releases_leases(const std::filesystem::path& 
     return true;
 }
 
+// Ordinary extraction and facility expiry do not test pressure reclamation
+// across small pools. Eight 1 MiB outputs expose that gap, then reuse every
+// writer to verify that trimming does not invalidate its buffer descriptors.
+bool registry_reclaims_aggregate_small_pools(const std::filesystem::path& directory) {
+    AsyncWriterConfig config;
+    config.threads_per_volume = 1;
+    config.buffer_count = 4;
+    VolumeWriterRegistry registry(std::make_shared<WriterMeters>(), config);
+    std::vector<VolumeWriterRegistry::Lease> leases;
+    for (int i = 0; i < 8; ++i) leases.push_back(registry.acquire("pool-" + std::to_string(i)));
+    const std::vector<unsigned char> payload(1U << 20, 0x5A);
+    for (int phase = 0; phase < 2; ++phase) {
+        for (std::size_t i = 0; i < leases.size(); ++i) {
+            auto &writer = leases[i].writer();
+            const auto name = L"pool-" + std::to_wstring(i) + L"-" + std::to_wstring(phase) + L".bin";
+            const auto path = directory / name;
+            auto job = writer.make_job();
+            auto file = writer.make_file(job, path.wstring(), name, 0, 0);
+            UInt32 processed = 0;
+            if (writer.write(file, payload.data(), static_cast<UInt32>(payload.size()), &processed) != S_OK ||
+                processed != payload.size()) return false;
+            writer.record_operation_result(file, 0);
+            writer.close_file(file, {});
+            if (writer.finish_job(job) != S_OK || writer.idle_memory_bytes() < payload.size() ||
+                writer.idle_memory_bytes() >= (8U << 20)) return false;
+            std::vector<unsigned char> actual(payload.size());
+            std::ifstream output(path, std::ios::binary);
+            output.read(reinterpret_cast<char *>(actual.data()), actual.size());
+            if (!output || actual != payload) return false;
+        }
+        registry.reclaim_idle_memory();
+        for (auto &lease : leases) if (lease.writer().idle_memory_bytes() != 0) return false;
+    }
+    return true;
+}
+
 bool registry_reclaims_idle_facilities(const std::filesystem::path& directory) {
     auto meters = std::make_shared<WriterMeters>();
     AsyncWriterConfig config;
@@ -634,6 +670,7 @@ int main() {
         quiescence_tracks_jobs_and_files(directory) &&
         configuration_is_snapshotted_not_reread(directory) &&
         registry_routes_by_volume_and_releases_leases(directory) &&
+        registry_reclaims_aggregate_small_pools(directory) &&
         registry_reclaims_idle_facilities(directory);
     std::error_code error;
     std::filesystem::remove_all(directory, error);

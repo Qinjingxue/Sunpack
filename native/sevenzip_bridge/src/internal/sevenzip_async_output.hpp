@@ -419,14 +419,18 @@ namespace sunpack::sevenzip
             receipt.mtime = file->mtime_ns;
         }
 
-        // Coarse reclaim of the unused pool. In-flight IOCP buffers are never
-        // touched and small pools are left alone.
-        void reclaim_idle_memory() noexcept {
+        std::size_t idle_memory_bytes() noexcept {
             std::lock_guard<std::mutex> lock(mutex_);
             std::size_t bytes = 0;
             for (const auto *buffer : free_buffers_) if (buffer->data) bytes += kBufferSize;
-            if (bytes >= (8U << 20))
-                for (auto *buffer : free_buffers_) buffer->data.reset();
+            return bytes;
+        }
+
+        // The registry aggregates small pools before requesting coarse reclaim.
+        // Only free buffers are touched; IOCP keeps ownership of in-flight data.
+        void reclaim_idle_memory() noexcept {
+            std::lock_guard<std::mutex> lock(mutex_);
+            for (auto *buffer : free_buffers_) buffer->data.reset();
         }
 
         HRESULT write(

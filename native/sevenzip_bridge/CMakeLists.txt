@@ -575,7 +575,7 @@ sup7z_attach_bundled_7z(sunpack_sevenzip_worker)
 add_executable(sunpack_sevenzip_memory_worker
     src/worker.cpp tests/memory_worker.cpp src/worker_alloc.cpp)
 add_executable(sunpack_sevenzip_memory_probe EXCLUDE_FROM_ALL
-    src/worker.cpp tests/memory_probe.cpp src/worker_alloc.cpp)
+    tests/memory_probe_worker.cpp tests/memory_probe.cpp src/worker_alloc.cpp)
 foreach(test_worker IN ITEMS sunpack_sevenzip_memory_worker sunpack_sevenzip_memory_probe)
     apply_release_optimizations(${test_worker})
     apply_source_charset(${test_worker})

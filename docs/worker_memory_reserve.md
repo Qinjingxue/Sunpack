@@ -1,6 +1,6 @@
 # worker 固定内存预留：测量与选值
 
-本页保留提交 `0a09f128` 的历史测量。后续扩大格式与写入设施覆盖后发现更高峰值，当前默认已改为 **512 MiB**，详见 [后续优化与测量](worker_memory_optimization.md)。
+本页保留提交 `0a09f128` 的历史测量。当前使用随 CPU credit 变化的预留，见 [当前公式与测量](worker_memory_cpu_reserve.md)；中间版本固定 512 MiB 的依据见 [前轮优化与测量](worker_memory_optimization.md)。
 
 2026-10-27 上轮结论：默认预留从物理内存的 10% 改为 **256 MiB（268435456 字节）**。配置为 `performance.worker.memory_reserve_bytes`，传输环境变量为 `SUNPACK_NATIVE_MEMORY_RESERVE_BYTES`。旧比例字段不再参与决策。
 

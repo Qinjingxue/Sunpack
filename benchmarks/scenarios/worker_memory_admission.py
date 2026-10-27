@@ -23,10 +23,12 @@ if __name__ == '__main__':
     parser.add_argument('--cases', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--repetitions', type=int, default=3)
+    parser.add_argument('--case', action='append', help='real workload name; defaults to the six ordinary codecs')
+    parser.add_argument('--no-memory-trace', action='store_true', help='disable fine sampling and allocator trace IO for CPU comparisons')
     args = parser.parse_args()
     probe.OUT = args.output.resolve()
     samples = []
-    selected = {'zip-Deflate', 'zip-BZip2', 'zip-PPMd', '7z-LZMA2', 'lz4', 'zstd'}
+    selected = set(args.case or ['zip-Deflate', 'zip-BZip2', 'zip-PPMd', '7z-LZMA2', 'lz4', 'zstd'])
     for case in json.loads(args.cases.read_text()):
         if case['name'] not in selected: continue
         for repeat in range(args.repetitions):
@@ -37,7 +39,8 @@ if __name__ == '__main__':
                 probe.WORKER = worker.resolve()
                 with contextlib.redirect_stdout(io.StringIO()):
                     report = probe.run(case['name'] + '-' + version, Path(case['archive']), case['format'], 8,
-                        password=case['password'], expected_output=case['expected'])
+                        password=case['password'], expected_output=case['expected'], reserve=512,
+                        trace_memory=not args.no_memory_trace)
                 samples.append({'case': case['name'], 'version': version, **report})
         summary = {'case': case['name']}
         for version in ('before', 'after'):

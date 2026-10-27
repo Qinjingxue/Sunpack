@@ -5,6 +5,7 @@ and recovery are independent of the small functional format tests. Reuse their
 fixture encoders, and compare every byte count/CRC32 to the original payload.
 """
 import argparse
+import binascii
 import json
 import lzma
 import struct
@@ -32,7 +33,7 @@ def generate(folder):
     expected = [(v['size'], v['crc32']) for v in file_inventory(source).values()]
     cases = []
 
-    def pack(name, hint, tool, options, input_path=payload, password=None):
+    def pack(name, hint, tool, options, input_path=payload, password=None, reference=None):
         archive = folder / (name + '.' + hint)
         if not archive.exists():
             box = probe.Sandbox(512, cpu_rate=1000)
@@ -44,7 +45,7 @@ def generate(folder):
                 assert p.returncode == 0, (name, stdout[-1000:], stderr[-1000:])
             finally:
                 box.close()
-        cases.append((name, archive, hint, expected, password))
+        cases.append((name, archive, hint, expected if reference is None else reference, password))
 
     seven = require_7z()
     for method in ('Copy', 'Deflate', 'Deflate64', 'BZip2', 'LZMA', 'PPMd'):
@@ -53,6 +54,38 @@ def generate(folder):
         pack('7z-' + method, '7z', seven, ['a', '-t7z', '-mx=5', '-mmt=2', '-m0=' + method])
     pack('7z-LZ4', '7z', require_7z_zstd(), ['a', '-t7z', '-mmt=2', '-m0=LZ4'])
     pack('7z-BCJ2', '7z', seven, ['a', '-t7z', '-mmt=2', '-m0=BCJ2', '-m1=LZMA2', '-m2=LZMA2', '-m3=LZMA2', '-mb0:1', '-mb0s1:2', '-mb0s2:3'])
+    # Four legal 3 MiB dictionaries stay below the 4 MiB managed threshold.
+    # A single small source would let the encoder reduce their properties and
+    # would miss the aggregate commitment of a complete BCJ2 graph.
+    multi = folder / 'bcj2-small-dictionaries.bin'
+    if not multi.exists(): multi.write_bytes(bytes(range(256)) * 12288)
+    multi_expected = [(v['size'], v['crc32']) for k, v in file_inventory(folder).items() if k == multi.name]
+    pack('7z-BCJ2-four-small-dictionaries', '7z', seven,
+        ['a', '-t7z', '-mmt=2', '-m0=BCJ2', *('-m' + str(i) + '=LZMA2:d=3m' for i in range(1, 5)),
+         '-mb0:1', '-mb0s1:2', '-mb0s2:3', '-mb0s3:4'], input_path=multi, reference=multi_expected)
+    near = folder / 'bcj2-near-threshold.bin'
+    if not near.exists(): near.write_bytes(bytes(range(256)) * 16384)
+    near_expected = [(v['size'], v['crc32']) for k, v in file_inventory(folder).items() if k == near.name]
+    # The encoder rounds LZMA properties up to 4 MiB. The format also permits
+    # page-aligned smaller dictionaries; this repetitive input needs only short
+    # matches. Rewrite the four properties in an uncompressed header and repair
+    # both header CRCs. Output CRC is still checked against the original file.
+    for name, dictionary in (('subthreshold', (4 << 20) - 4096), ('unmanaged', (2 << 20) - 4096)):
+        pack('7z-BCJ2-four-' + name + '-dictionaries', '7z', seven,
+            ['a', '-t7z', '-mhc=off', '-mmt=2', '-m0=BCJ2', *('-m' + str(i) + '=LZMA:d=4m' for i in range(1, 5)),
+             '-mb0:1', '-mb0s1:2', '-mb0s2:3', '-mb0s3:4'], input_path=near, reference=near_expected)
+        archive = cases[-1][1]
+        data = bytearray(archive.read_bytes())
+        offset, size = struct.unpack_from('<QQ', data, 12)
+        header = data[32 + offset:32 + offset + size]
+        old, new = b'\x5d' + struct.pack('<I', 4 << 20), b'\x5d' + struct.pack('<I', dictionary)
+        if header.count(old) == 4:
+            data[32 + offset:32 + offset + size] = header.replace(old, new)
+            struct.pack_into('<I', data, 28, binascii.crc32(data[32 + offset:32 + offset + size]))
+            struct.pack_into('<I', data, 8, binascii.crc32(data[12:32]))
+            archive.write_bytes(data)
+        else:
+            assert header.count(new) == 4, 'expected four explicit LZMA dictionary properties'
     for filter_name in ('BCJ', 'ARM', 'ARMT', 'ARM64', 'PPC', 'IA64', 'SPARC', 'RISCV', 'Delta'):
         pack('7z-' + filter_name, '7z', seven, ['a', '-t7z', '-mmt=2', '-m0=' + filter_name, '-m1=LZMA2'])
     # Independent legal ZIP payloads for decode-only methods. LZFSE's raw block

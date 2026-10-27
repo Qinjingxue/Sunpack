@@ -1212,8 +1212,12 @@
     },
     "/performance/worker/memory_reserve_bytes": {
       "label": {
-        "zh": "内存预留（字节）",
-        "en": "Memory reserve (bytes)"
+        "zh": "内存预留（字节，0 为自动）",
+        "en": "Memory reserve (bytes, 0 = automatic)"
+      },
+      "description": {
+        "zh": "自动预留随可并行任务数量调整；正数固定使用指定字节数。",
+        "en": "Automatic reserve scales with concurrency; a positive value sets a fixed byte amount."
       },
       "min": 0,
       "max": null,
