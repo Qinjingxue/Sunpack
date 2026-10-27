@@ -121,6 +121,22 @@ enum StructuralStreamKind {
     Zstd,
 }
 
+impl StructuralStreamKind {
+    fn from_header(header: &[u8]) -> Option<Self> {
+        if header.starts_with(b"\x1f\x8b") {
+            Some(Self::Gzip)
+        } else if header.starts_with(b"BZh") {
+            Some(Self::Bzip2)
+        } else if header.starts_with(XZ_MAGIC) {
+            Some(Self::Xz)
+        } else if header.starts_with(ZSTD_MAGIC) {
+            Some(Self::Zstd)
+        } else {
+            None
+        }
+    }
+}
+
 const IDENTITY_PROBE_MAX_BYTES: u64 = 64 * 1024;
 
 struct CompressionIdentityResult {
@@ -618,6 +634,18 @@ fn inspect_structural_stream(
     file_size: u64,
     kind: StructuralStreamKind,
 ) -> PyResult<Py<PyDict>> {
+    let reader = py
+        .detach(|| ManagedReader::open(path))
+        .map_err(crate::io::resource_error::to_py_error)?;
+    inspect_structural_stream_reader(py, &reader, file_size, kind)
+}
+
+fn inspect_structural_stream_reader(
+    py: Python<'_>,
+    reader: &ManagedReader,
+    file_size: u64,
+    kind: StructuralStreamKind,
+) -> PyResult<Py<PyDict>> {
     let (format, ext, magic, fields, cost) = match kind {
         StructuralStreamKind::Gzip => (
             "gzip",
@@ -647,10 +675,6 @@ fn inspect_structural_stream(
             ZSTD_FIELDS,
             "block_header_linear_payload_skipped",
         ),
-    };
-    let reader = match py.detach(|| ManagedReader::open(path)) {
-        Ok(value) => value,
-        Err(error) => return Err(crate::io::resource_error::to_py_error(error)),
     };
     let head = py.detach(|| reader.read_cached_at(0, magic.len()))?;
     let magic_matched = head.starts_with(magic);

@@ -285,10 +285,11 @@ void editing(Fixture& f) {
             assert(!describe_setting(pointer,"",language)["known"].get<bool>());
         auto unknown=config_fields(parse_json(R"({"watch":{"roots":[],"custom":["keep"]}})"),"",language);
         for(auto& field:unknown) assert(!field["known"].get<bool>() && field["editor"]=="readonly");
-        for(auto name:{"gzip","bzip2","xz","zstd"})
+        for(auto name:{"gzip","bzip2","xz","zstd","tar_gz","tar_bz2","tar_xz","tar_zst","tar_lz4"})
             assert(!describe_setting("/analysis/modules/0/max_probe_bytes",name,language)["known"].get<bool>());
-        auto module=config_fields(parse_json(R"({"analysis":{"modules":[{"name":"tar_gz","max_probe_bytes":2048}]}})"),"",language);
-        assert(module.size()==1 && module[0]["known"].get<bool>() && module[0]["module"]=="tar_gz" && module[0]["blockLabel"]=="TAR + GZIP");
+        assert(!describe_setting("/analysis/modules/0/enabled","tar_gz",language)["known"].get<bool>());
+        auto module=config_fields(parse_json(R"({"analysis":{"modules":[{"name":"gzip","enabled":true}]}})"),"",language);
+        assert(module.size()==1 && module[0]["known"].get<bool>() && module[0]["module"]=="gzip" && module[0]["blockLabel"]=="GZIP");
     }
     assert(log_directory(f.dir,Json({{"watch",{{"state_dir","other"}}}}))==f.dir/"other");
 }

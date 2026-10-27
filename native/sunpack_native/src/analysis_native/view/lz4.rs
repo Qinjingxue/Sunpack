@@ -1,8 +1,8 @@
 // LZ4 report projection reuses the canonical structural index and existing segment policy.
 impl<'a, 'py> ReportContext<'a, 'py> {
-    fn lz4_module(&mut self, tar: bool, read_budget: u64) -> PyResult<Evidence<'py>> {
+    fn lz4_module(&mut self) -> PyResult<Evidence<'py>> {
         let py = self.py;
-        let format = if tar { "tar.lz4" } else { "lz4" };
+        let format = "lz4";
         let mut rows = self.embedded("lz4", true)?;
         if rows.is_empty() {
             let Ok(prefix) = self.view.reader.read_cached_at(0, 4) else {
@@ -51,41 +51,12 @@ impl<'a, 'py> ReportContext<'a, 'py> {
             let offset = u64_of(row, "offset")?;
             let end = opt_u64_of(row, "end_offset")?;
             let complete = truthy(&plan, "complete")?;
-            if tar {
-                if !complete {
-                    continue;
-                }
-                let mut reader = self.view.reader.stream_cursor();
-                std::io::Seek::seek(&mut reader, std::io::SeekFrom::Start(offset))?;
-                let sample = py.detach(|| {
-                    crate::formats::lz4::sample_seekable(
-                        reader,
-                        1024,
-                        end.unwrap_or(self.view.reader.len()) - offset,
-                        read_budget,
-                    )
-                });
-                let Ok(sample) = sample else {
-                    continue;
-                };
-                if sample.len() < 512 || !tar_header_plausible(&sample[..512]).0 {
-                    continue;
-                }
-            }
             let mut flags = Vec::new();
             let error = str_of(row, "error")?;
             if !error.is_empty() {
                 flags.push(error);
             }
-            let confidence = if complete {
-                if tar {
-                    0.99
-                } else {
-                    0.98
-                }
-            } else {
-                0.72
-            };
+            let confidence = if complete { 0.98 } else { 0.72 };
             segments.push(Segment::new(
                 offset,
                 end,
@@ -106,15 +77,7 @@ impl<'a, 'py> ReportContext<'a, 'py> {
         details.set_item("candidates", pyo3::types::PyList::new(py, &rows)?)?;
         Ok(Evidence::new(
             format,
-            if blocked {
-                0.72
-            } else {
-                if tar {
-                    0.99
-                } else {
-                    0.98
-                }
-            },
+            if blocked { 0.72 } else { 0.98 },
             if blocked { "damaged" } else { "extractable" },
             segments,
             details,

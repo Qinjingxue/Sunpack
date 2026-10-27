@@ -164,7 +164,7 @@ def test_gigabyte_skippable_tar_uses_length_jumps(fixtures, tmp_path):
     from sunpack.core.analysis.request import AnalysisCapability
     path = fixtures / "large_skip.tar.lz4"
     report = AnalysisEngine().analyze_path(str(path), capabilities=frozenset({AnalysisCapability.FORMAT_STRUCTURE}))
-    assert report.best_selected.format == "tar.lz4"
+    assert report.best_selected.format == "lz4"
     assert report.read_bytes < 5 * 1024 * 1024
     descriptor = ArchiveInputDescriptor(entry_path=str(path), format_hint="lz4")
     result = worker(descriptor, tmp_path / "large_skip")
@@ -219,12 +219,6 @@ def test_dict_id_returns_generic_unsupported_and_keeps_source(fixtures, tmp_path
     assert result["failure_kind"] == "unsupported_method"
     assert not result["damaged"] and not result["wrong_password"] and path.exists()
     assert result["stream_receipt"]["error"] == 5
-
-
-def test_unsupported_tar_sample_does_not_claim_tar(fixtures):
-    report = AnalysisEngine().analyze_path(str(fixtures / "unsupported_id.tar.lz4"))
-    assert report.best_selected.format == "lz4"
-    assert not any(e.format == "tar.lz4" and e.status != "not_found" for e in report.evidences)
 
 
 def test_invalid_backreference_is_generic_data_error(fixtures, tmp_path):

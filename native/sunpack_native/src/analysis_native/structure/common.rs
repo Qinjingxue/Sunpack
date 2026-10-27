@@ -20,13 +20,6 @@ fn set_read_fault(
     Ok(())
 }
 
-fn read_at(path: &str, offset: u64, max_len: usize) -> std::io::Result<(u64, Vec<u8>)> {
-    let reader = ManagedReader::open(path)?;
-    let file_size = reader.len();
-    let len = max_len.min(file_size.saturating_sub(offset) as usize);
-    Ok((file_size, reader.read_exact_at(offset, len)?))
-}
-
 fn has_central_directory_signature(file: &mut SourceCursor, offset: u64, file_size: u64) -> bool {
     let mut sig = [0u8; 4];
     seek_field(

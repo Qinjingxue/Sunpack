@@ -722,10 +722,16 @@ impl AnalysisBinaryView {
             // Candidate recognition belongs to the native walker.  This lets
             // Python dispatch damaged TAR files without re-reading or parsing
             // archive bytes as a fallback.
-            result.set_item("magic_matched", true)?;
             zero_blocks = 0;
             let first_identity = (checked == 0).then(|| tar_header_identity(&header, cursor, size));
             if let Some(identity) = first_identity {
+                result.set_item(
+                    "magic_matched",
+                    identity.ustar_magic
+                        || (identity.name_nonempty
+                            && identity.numeric_fields_valid
+                            && identity.typeflag_valid),
+                )?;
                 result.set_item("stored_checksum", identity.stored_checksum)?;
                 result.set_item("computed_checksum", identity.computed_checksum)?;
                 result.set_item("member_size", identity.member_size)?;

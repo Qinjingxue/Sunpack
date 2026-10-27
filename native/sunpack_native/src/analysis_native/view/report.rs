@@ -34,21 +34,6 @@ const ZIP_LOCAL_RECOVERY_ERRORS: &[&str] = &[
     "archive_offset_underflow",
     "central_directory_size_out_of_range",
 ];
-const COMPOSITE_INNER_FORMATS: &[(&str, &[&str])] = &[
-    ("tar.gz", &["tar", "gzip"]),
-    ("tar.bz2", &["tar", "bzip2"]),
-    ("tar.xz", &["tar", "xz"]),
-    ("tar.zst", &["tar", "zstd"]),
-    ("tar.lz4", &["tar", "lz4"]),
-];
-const STREAM_CONTAINERS: &[(&str, &str)] = &[
-    ("gzip", "tar.gz"),
-    ("bzip2", "tar.bz2"),
-    ("xz", "tar.xz"),
-    ("zstd", "tar.zst"),
-    ("lz4", "tar.lz4"),
-];
-
 #[derive(Clone, Copy)]
 enum ModuleKind {
     Zip,
@@ -56,7 +41,6 @@ enum ModuleKind {
     SevenZip,
     Tar,
     Stream(&'static str),
-    CompressedTar(&'static str, &'static str, u64),
 }
 
 impl ModuleKind {
@@ -71,11 +55,6 @@ impl ModuleKind {
             "xz" => Self::Stream("xz"),
             "zstd" => Self::Stream("zstd"),
             "lz4" => Self::Stream("lz4"),
-            "tar_gz" => Self::CompressedTar("tar.gz", "gzip", 4 * 1024 * 1024),
-            "tar_bz2" => Self::CompressedTar("tar.bz2", "bzip2", 4 * 1024 * 1024),
-            "tar_xz" => Self::CompressedTar("tar.xz", "xz", 4 * 1024 * 1024),
-            "tar_zst" => Self::CompressedTar("tar.zst", "zstd", 4 * 1024 * 1024),
-            "tar_lz4" => Self::CompressedTar("tar.lz4", "lz4", 4 * 1024 * 1024),
             _ => return None,
         })
     }
@@ -87,7 +66,6 @@ impl ModuleKind {
             Self::SevenZip => "7z",
             Self::Tar => "tar",
             Self::Stream(format) => format,
-            Self::CompressedTar(format, _, _) => format,
         }
     }
 }
@@ -148,16 +126,6 @@ impl NativeAnalysisConfig {
                     }
                     let Some(kind) = ModuleKind::from_name(&name) else {
                         continue;
-                    };
-                    let kind = match kind {
-                        ModuleKind::CompressedTar(format, stream, default) => {
-                            ModuleKind::CompressedTar(
-                                format,
-                                stream,
-                                positive_int_or(item, "max_probe_bytes", default)?,
-                            )
-                        }
-                        other => other,
                     };
                     let module = ModuleConfig { name, kind };
                     // A repeated name keeps its first position and last settings.
@@ -503,14 +471,8 @@ impl<'a, 'py> ReportContext<'a, 'py> {
             ModuleKind::Rar => self.rar_module(),
             ModuleKind::SevenZip => self.seven_zip_module(),
             ModuleKind::Tar => self.tar_module(),
-            ModuleKind::Stream("lz4") => self.lz4_module(false, 0),
+            ModuleKind::Stream("lz4") => self.lz4_module(),
             ModuleKind::Stream(format) => self.stream_module(format),
-            ModuleKind::CompressedTar("tar.lz4", "lz4", probe_bytes) => {
-                self.lz4_module(true, probe_bytes)
-            }
-            ModuleKind::CompressedTar(format, stream, probe_bytes) => {
-                self.compressed_tar_module(format, stream, probe_bytes as usize)
-            }
         }
     }
 
@@ -682,45 +644,10 @@ impl<'a, 'py> ReportContext<'a, 'py> {
             }
             return combine_candidates(py, "tar", candidates, true);
         }
-        let mut hit_starts = self
-            .hits(|kind| kind == ReportHitKind::Tar)
-            .iter()
-            .map(|hit| hit.offset.saturating_sub(257))
-            .collect::<Vec<_>>();
-        hit_starts.sort_unstable();
-        hit_starts.dedup();
-
-        // A valid archive at offset zero owns its member headers. Treating
-        // every member's ustar marker as another embedded archive would turn a
-        // large archive into suffix-only extraction.
-        let primary = self.tar_candidate(0)?;
-        let mut evidences = Vec::new();
-        if let Some(primary) = primary {
-            if primary.status == "extractable" {
-                return Ok(primary);
-            }
-            evidences.push(primary);
-        }
-        let mut covered_until = 0u64;
-        for start in hit_starts {
-            if start == 0 || start < covered_until {
-                continue;
-            }
-            let Some(candidate) = self.tar_candidate(start)? else {
-                continue;
-            };
-            let end = candidate.segments.first().and_then(|segment| segment.end);
-            let extractable = candidate.status == "extractable";
-            evidences.push(candidate);
-            if let Some(end) = end {
-                covered_until = covered_until.max(end);
-            } else if extractable {
-                // Without a proven end, later ustar hits may be members of
-                // this archive and cannot be emitted independently.
-                break;
-            }
-        }
-        combine_candidates(py, "tar", evidences, self.preserve_multiple()?)
+        // Ordinary analysis owns only a TAR starting at the logical input start.
+        // Nonzero TAR candidates belong to the canonical embedded scanner;
+        // raw ustar hits can also be bytes inside a compression stream.
+        Ok(self.tar_candidate(0)?.unwrap_or_else(|| Evidence::not_found(py, "tar")))
     }
 
     fn tar_observation(&self, start: u64) -> PyResult<Bound<'py, PyDict>> {
@@ -1060,7 +987,11 @@ impl<'a, 'py> ReportContext<'a, 'py> {
         Ok(Evidence::new(
             format,
             0.35,
-            "weak",
+            if damage_flags.iter().any(|flag| flag != "stream_unverified") {
+                "damaged"
+            } else {
+                "weak"
+            },
             vec![Segment::new(0, None, 0.35, damage_flags, evidence)],
             details,
         ))
@@ -1068,39 +999,26 @@ impl<'a, 'py> ReportContext<'a, 'py> {
 
     fn stream_observation(&mut self, format: &str) -> PyResult<Bound<'py, PyDict>> {
         let py = self.py;
-        let raw = match self.stream_path {
-            Some(path) => match self.full_stream_structure(path)? {
-                Some(structure) => structure.copy()?,
-                None => PyDict::new(py),
-            },
-            None => {
-                let raw = self.view.probe_compression(py, format)?;
-                set_default(&raw, "validation_scope", "header_only")?;
-                set_default(&raw, "structure_status", "incomplete")?;
-                set_default(&raw, "structure_validation_complete", false)?;
-                set_default(&raw, "boundary_exact", false)?;
-                set_default(&raw, "integrity_status", "deferred")?;
-                set_default(&raw, "integrity_validation_complete", false)?;
-                set_default(&raw, "file_size", self.view.reader.len())?;
-                raw
-            }
+        let raw = match self.full_stream_structure()? {
+            Some(structure) => structure.copy()?,
+            None => PyDict::new(py),
         };
         stream_observation(py, raw, format)
     }
 
     /// Full-stream validation walks the complete structure, so it runs at most once
     /// per analysis and once per physical file generation across analyses.
-    fn full_stream_structure(&mut self, path: &str) -> PyResult<Option<Bound<'py, PyDict>>> {
+    fn full_stream_structure(&mut self) -> PyResult<Option<Bound<'py, PyDict>>> {
         if let Some(structure) = &self.stream_structure {
             return Ok(structure.clone());
         }
         let structure = if stream_family(&self.view.reader.read_at(0, 32).unwrap_or_default()) {
-            let identity = self.view.reader.file_identity().ok();
-            Some(match identity {
-                Some(identity) => stream_structure_cached(self.py, identity, path)?,
-                None => {
-                    crate::analysis_native::inspect_compression_stream_structure(self.py, path)?
-                        .into_bound(self.py)
+            Some(match (self.stream_path, self.view.reader.file_identity().ok()) {
+                (Some(path), Some(identity)) => stream_structure_cached(self.py, identity, path)?,
+                (path, _) => {
+                    crate::analysis_native::structure::inspect_compression_stream_source(
+                        self.py, &self.view.reader, path,
+                    )?.into_bound(self.py)
                 }
             })
         } else {
@@ -1112,48 +1030,6 @@ impl<'a, 'py> ReportContext<'a, 'py> {
         Ok(structure)
     }
 
-    fn compressed_tar_module(
-        &mut self,
-        format: &str,
-        stream: &str,
-        max_probe_bytes: usize,
-    ) -> PyResult<Evidence<'py>> {
-        let py = self.py;
-        let result = self
-            .view
-            .probe_compressed_tar(py, stream, max_probe_bytes)?
-            .into_bound(py);
-        if str_of(&result, "tar_probe_error")? == "out_of_memory" {
-            result.set_item("error", "out_of_memory")?;
-            result.set_item("failure_kind", "resource_unavailable")?;
-            return Ok(Evidence::new(format, 0.0, "error", Vec::new(), result));
-        }
-        if !truthy(&result, "magic_matched")? || !truthy(&result, "tar_plausible")? {
-            return Ok(Evidence::new(format, 0.0, "not_found", Vec::new(), result));
-        }
-        let confidence = if truthy(&result, "plausible")? {
-            0.93
-        } else {
-            0.75
-        };
-        let mut evidence = str_list(&result, "evidence")?;
-        evidence.push("tar:inner_header".to_string());
-        let details = result.copy()?;
-        details.set_item("inner_format", "tar")?;
-        Ok(Evidence::new(
-            format,
-            confidence,
-            "extractable",
-            vec![Segment::new(
-                0,
-                Some(self.view.reader.len()),
-                confidence,
-                Vec::new(),
-                evidence,
-            )],
-            details,
-        ))
-    }
 }
 
 fn native_read_fault_flags(fault: &ReadFault) -> Vec<String> {
@@ -1875,8 +1751,7 @@ struct SegmentPlan {
 }
 
 impl SegmentPlan {
-    /// Order extractable carved segments, prefer specific container formats,
-    /// and drop inner segments already covered by a whole-file composite.
+    /// Order the canonical extractable carved segments by physical position.
     fn build(evidences: &[Evidence<'_>], selected: &[usize], size: u64) -> PyResult<Self> {
         let mut by_confidence = selected.to_vec();
         by_confidence.sort_by(|left, right| {
@@ -1907,54 +1782,6 @@ impl SegmentPlan {
                 .then_with(|| evidences[left.0].format.cmp(&evidences[right.0].format))
                 .then_with(|| left.2.cmp(&right.2))
         });
-        let ranges = candidates
-            .iter()
-            .map(|(evidence, segment, _)| {
-                let segment = &evidences[*evidence].segments[*segment];
-                (
-                    segment.start,
-                    segment.end,
-                    evidences[*evidence].format.as_str(),
-                )
-            })
-            .collect::<HashSet<_>>();
-        candidates.retain(|(evidence, segment, _)| {
-            let format = evidences[*evidence].format.as_str();
-            let segment = &evidences[*evidence].segments[*segment];
-            !STREAM_CONTAINERS.iter().any(|(stream, container)| {
-                *stream == format && ranges.contains(&(segment.start, segment.end, *container))
-            })
-        });
-        let composites = selected
-            .iter()
-            .filter_map(|index| {
-                let evidence = &evidences[*index];
-                let inner = COMPOSITE_INNER_FORMATS
-                    .iter()
-                    .find(|(format, _)| *format == evidence.format)?
-                    .1;
-                Some(
-                    evidence
-                        .segments
-                        .iter()
-                        .filter(|segment| {
-                            segment.start == 0 && segment.end.is_some_and(|end| end >= size)
-                        })
-                        .map(move |segment| (evidence.confidence, segment.end.unwrap_or(0), inner)),
-                )
-            })
-            .flatten()
-            .collect::<Vec<_>>();
-        candidates.retain(|(evidence, segment, _)| {
-            let evidence = &evidences[*evidence];
-            let segment = &evidence.segments[*segment];
-            !composites.iter().any(|(confidence, end, inner)| {
-                inner.contains(&evidence.format.as_str())
-                    && evidence.confidence < *confidence
-                    && segment.end.is_some_and(|segment_end| segment_end <= *end)
-            })
-        });
-
         let mut password_segment = None::<(usize, usize)>;
         for (evidence_index, evidence) in evidences.iter().enumerate() {
             if !evidence.details.password_required()? {
@@ -2462,33 +2289,6 @@ mod report_tests {
                 planned(&evidences, &plan),
                 vec![("7z".into(), 0), ("7z".into(), 4), ("rar".into(), 40)]
             );
-        });
-    }
-
-    #[test]
-    fn plan_prefers_compressed_tar_over_stream_for_same_range() {
-        Python::initialize();
-        Python::attach(|py| {
-            let evidences = vec![
-                evidence(py, "tar.gz", 0.93, "extractable", &[(5, Some(100))], &[]),
-                evidence(py, "gzip", 0.88, "extractable", &[(5, Some(100))], &[]),
-            ];
-            let plan = SegmentPlan::build(&evidences, &[0, 1], 200).unwrap();
-            assert_eq!(planned(&evidences, &plan), vec![("tar.gz".into(), 5)]);
-        });
-    }
-
-    #[test]
-    fn plan_suppresses_inner_tar_shadowed_by_whole_compressed_tar() {
-        Python::initialize();
-        Python::attach(|py| {
-            let evidences = vec![
-                evidence(py, "tar.zst", 0.93, "extractable", &[(0, Some(200))], &[]),
-                evidence(py, "tar", 0.86, "extractable", &[(12, Some(180))], &[]),
-                evidence(py, "zip", 0.99, "extractable", &[(20, Some(120))], &[]),
-            ];
-            let plan = SegmentPlan::build(&evidences, &[0, 1, 2], 200).unwrap();
-            assert_eq!(planned(&evidences, &plan), vec![("zip".into(), 20)]);
         });
     }
 

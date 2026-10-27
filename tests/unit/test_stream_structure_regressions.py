@@ -23,7 +23,7 @@ def test_gzip_optional_header_contract_is_shared_by_analysis_identity_and_carvin
     )
 
     raw = _tar("payload.txt")
-    cfg = NativeAnalysisConfig({"modules": [{"name": "tar_gz", "enabled": True}]})
+    cfg = NativeAnalysisConfig({"modules": [{"name": "gzip", "enabled": True}]})
     for optional in range(8):
         for crc in (False, True):
             flags = (optional << 2) | (2 if crc else 0)
@@ -51,7 +51,7 @@ def test_gzip_optional_header_contract_is_shared_by_analysis_identity_and_carvin
                 try:
                     assert view.probe_compression_stream("gzip")["plausible"]
                     report = view.analyze(cfg)
-                    assert report["evidences"][0][1:3] == (0.93, "extractable")
+                    assert report["evidences"][0][1:3] == (0.97, "extractable")
                 finally:
                     view.close()
             if crc:

@@ -1570,81 +1570,11 @@
         "en": "LZ4"
       }
     },
-    "/analysis/modules/@tar_lz4/enabled": {
-      "label": {
-        "zh": "TAR + LZ4",
-        "en": "TAR + LZ4"
-      }
-    },
-    "/analysis/modules/@tar_lz4/max_probe_bytes": {
-      "label": {
-        "zh": "读取上限（字节）",
-        "en": "Read limit (bytes)"
-      },
-      "min": 0,
-      "integer": true
-    },
     "/analysis/modules/@zstd/enabled": {
       "label": {
         "zh": "Zstandard",
         "en": "Zstandard"
       }
-    },
-    "/analysis/modules/@tar_gz/enabled": {
-      "label": {
-        "zh": "TAR + GZIP",
-        "en": "TAR + GZIP"
-      }
-    },
-    "/analysis/modules/@tar_gz/max_probe_bytes": {
-      "label": {
-        "zh": "读取上限（字节）",
-        "en": "Read limit (bytes)"
-      },
-      "min": 0,
-      "integer": true
-    },
-    "/analysis/modules/@tar_bz2/enabled": {
-      "label": {
-        "zh": "TAR + BZIP2",
-        "en": "TAR + BZIP2"
-      }
-    },
-    "/analysis/modules/@tar_bz2/max_probe_bytes": {
-      "label": {
-        "zh": "读取上限（字节）",
-        "en": "Read limit (bytes)"
-      },
-      "min": 0,
-      "integer": true
-    },
-    "/analysis/modules/@tar_xz/enabled": {
-      "label": {
-        "zh": "TAR + XZ",
-        "en": "TAR + XZ"
-      }
-    },
-    "/analysis/modules/@tar_xz/max_probe_bytes": {
-      "label": {
-        "zh": "读取上限（字节）",
-        "en": "Read limit (bytes)"
-      },
-      "min": 0,
-      "integer": true
-    },
-    "/analysis/modules/@tar_zst/enabled": {
-      "label": {
-        "zh": "TAR + Zstandard",
-        "en": "TAR + Zstandard"
-      }
-    },
-    "/analysis/modules/@tar_zst/max_probe_bytes": {
-      "label": {
-        "zh": "读取上限（字节）",
-        "en": "Read limit (bytes)"
-      },
-      "min": 0,
-      "integer": true
     },
     "/verification/enabled": {
       "label": {
@@ -1834,29 +1764,9 @@
       "zh": "LZ4",
       "en": "LZ4"
     },
-    "tar_lz4": {
-      "zh": "TAR + LZ4",
-      "en": "TAR + LZ4"
-    },
     "zstd": {
       "zh": "Zstandard",
       "en": "Zstandard"
-    },
-    "tar_gz": {
-      "zh": "TAR + GZIP",
-      "en": "TAR + GZIP"
-    },
-    "tar_bz2": {
-      "zh": "TAR + BZIP2",
-      "en": "TAR + BZIP2"
-    },
-    "tar_xz": {
-      "zh": "TAR + XZ",
-      "en": "TAR + XZ"
-    },
-    "tar_zst": {
-      "zh": "TAR + Zstandard",
-      "en": "TAR + Zstandard"
     }
   },
   "blocks": {

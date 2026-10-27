@@ -8,12 +8,18 @@ FORMAT_ALIASES = {
     "gz": "gzip",
     "bz2": "bzip2",
     "zst": "zstd",
-    "tgz": "tar.gz",
-    "tbz": "tar.bz2",
-    "tbz2": "tar.bz2",
-    "txz": "tar.xz",
-    "tzst": "tar.zst",
-    "tar.zstd": "tar.zst",
+    "tgz": "gzip",
+    "tbz": "bzip2",
+    "tbz2": "bzip2",
+    "txz": "xz",
+    "tzst": "zstd",
+    "tar.zstd": "zstd",
+    # Legacy spelling aliases identify only the outer stream.
+    "tar.gz": "gzip",
+    "tar.bz2": "bzip2",
+    "tar.xz": "xz",
+    "tar.zst": "zstd",
+    "tar.lz4": "lz4",
 }
 
 

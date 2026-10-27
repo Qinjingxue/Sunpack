@@ -174,7 +174,8 @@ fn random(state: &mut u32) -> u32 {
 }
 fn compare_stream(bytes: &[u8], case: usize) {
     let reference = Reference::decode(bytes);
-    let decoded = sample(std::io::Cursor::new(bytes), 1024 * 1024);
+    let mut output = Vec::new();
+    let decoded = decode_into(std::io::Cursor::new(bytes), &mut output).map(|()| output);
     assert_eq!(
         decoded.is_ok(),
         reference.is_some(),

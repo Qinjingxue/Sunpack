@@ -38,16 +38,16 @@ namespace sunpack::sevenzip
                 return {0xCC, 0x03};
             if (hint == L"tar")
                 return {0xEE};
-            if (hint == L"gz" || hint == L"gzip" || hint == L"tar.gz" || hint == L"tgz")
-                return {0xEF, 0xEE};
-            if (hint == L"bz2" || hint == L"bzip2" || hint == L"tar.bz2" || hint == L"tbz2" || hint == L"tbz")
-                return {0x02, 0xEE};
-            if (hint == L"xz" || hint == L"tar.xz" || hint == L"txz")
-                return {0x0C, 0xEE};
-            if (hint == L"lz4" || hint == L"tar.lz4")
-                return {0xFA, 0xEE};
-            if (hint == L"zst" || hint == L"zstd" || hint == L"tar.zst" || hint == L"tzst")
-                return {0x0E, 0xEE};
+            if (hint == L"gz" || hint == L"gzip" || hint == L"tgz")
+                return {0xEF};
+            if (hint == L"bz2" || hint == L"bzip2" || hint == L"tbz2" || hint == L"tbz")
+                return {0x02};
+            if (hint == L"xz" || hint == L"txz")
+                return {0x0C};
+            if (hint == L"lz4")
+                return {0xFA};
+            if (hint == L"zst" || hint == L"zstd" || hint == L"tzst")
+                return {0x0E};
             return {};
         }
 

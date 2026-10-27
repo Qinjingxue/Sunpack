@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from sunpack.core.support.archive_formats import canonical_format
+
 from sunpack.core.contracts.archive_knowledge import ArchiveKnowledge
 from sunpack.core.passwords.candidates import PasswordCandidatePipeline
 from sunpack.core.passwords.fingerprint import build_archive_fingerprint
@@ -37,13 +39,7 @@ def _selected_structure_format(task: Any | None) -> str:
         return "rar"
     if hint == "tar":
         return "tar"
-    if hint in {
-        "gz", "gzip", "tgz", "tar.gz",
-        "bz2", "bzip2", "tbz", "tbz2", "tar.bz2",
-        "xz", "txz", "tar.xz",
-        "zst", "zstd", "tzst", "tar.zst",
-        "lz4", "tar.lz4",
-    }:
+    if canonical_format(hint, unknown="") in {"gzip", "bzip2", "xz", "zstd", "lz4"}:
         return "compression"
     return ""
 

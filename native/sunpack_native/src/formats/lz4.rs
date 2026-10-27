@@ -4,7 +4,7 @@ use crate::io::reader::{CachedBytes, ManagedReader};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use std::ffi::c_void;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::Read;
 
 pub(crate) const MAGIC: &[u8] = b"\x04\x22\x4d\x18";
 
@@ -347,67 +347,6 @@ pub(crate) struct DecodeResult {
     pub(crate) block_checked_frames: u64,
     pub(crate) error: i32,
 }
-struct Sample<R> {
-    reader: R,
-    output: Vec<u8>,
-    limit: usize,
-    stopped: bool,
-    input_remaining: u64,
-    read_remaining: u64,
-}
-unsafe extern "C" fn sample_read<R: Read>(
-    opaque: *mut c_void,
-    dst: *mut c_void,
-    n: usize,
-) -> isize {
-    let state = &mut *opaque.cast::<Sample<R>>();
-    let n = n.min(
-        state
-            .input_remaining
-            .min(state.read_remaining)
-            .min(usize::MAX as u64) as usize,
-    );
-    match state
-        .reader
-        .read(std::slice::from_raw_parts_mut(dst.cast(), n))
-    {
-        Ok(n) => {
-            state.input_remaining -= n as u64;
-            state.read_remaining -= n as u64;
-            n as isize
-        }
-        Err(_) => -1,
-    }
-}
-unsafe extern "C" fn sample_write<R: Read>(
-    opaque: *mut c_void,
-    src: *const c_void,
-    n: usize,
-) -> i32 {
-    let state = &mut *opaque.cast::<Sample<R>>();
-    let take = n.min(state.limit - state.output.len());
-    state
-        .output
-        .extend_from_slice(std::slice::from_raw_parts(src.cast(), take));
-    if state.output.len() == state.limit {
-        state.stopped = true;
-        1
-    } else {
-        0
-    }
-}
-pub(crate) fn sample<R: Read>(reader: R, limit: usize) -> Result<Vec<u8>, &'static str> {
-    let state = Sample {
-        reader,
-        output: Vec::with_capacity(limit),
-        limit,
-        stopped: false,
-        input_remaining: u64::MAX,
-        read_remaining: u64::MAX,
-    };
-    run_sample(state, None)
-}
-
 pub(crate) fn decode_into<R: Read, W: std::io::Write>(reader: R, writer: W) -> std::io::Result<()> {
     struct State<R, W> {
         reader: R,
@@ -470,64 +409,6 @@ pub(crate) fn decode_into<R: Read, W: std::io::Write>(reader: R, writer: W) -> s
     }
     Ok(())
 }
-unsafe extern "C" fn sample_skip<R: Read + Seek>(opaque: *mut c_void, n: u64) -> i32 {
-    let state = &mut *opaque.cast::<Sample<R>>();
-    if n > state.input_remaining {
-        return 1;
-    }
-    if n > i64::MAX as u64 {
-        return -1;
-    }
-    match state.reader.seek(SeekFrom::Current(n as i64)) {
-        Ok(_) => {
-            state.input_remaining -= n;
-            0
-        }
-        Err(_) => -1,
-    }
-}
-pub(crate) fn sample_seekable<R: Read + Seek>(
-    reader: R,
-    limit: usize,
-    input_limit: u64,
-    read_budget: u64,
-) -> Result<Vec<u8>, &'static str> {
-    let state = Sample {
-        reader,
-        output: Vec::with_capacity(limit),
-        limit,
-        stopped: false,
-        input_remaining: input_limit,
-        read_remaining: read_budget,
-    };
-    run_sample(state, Some(sample_skip::<R>))
-}
-fn run_sample<R: Read>(
-    mut state: Sample<R>,
-    skip: Option<unsafe extern "C" fn(*mut c_void, u64) -> i32>,
-) -> Result<Vec<u8>, &'static str> {
-    let mut result = DecodeResult::default();
-    let rc = unsafe {
-        sup_lz4_decode(
-            (&mut state as *mut Sample<R>).cast(),
-            sample_read::<R>,
-            skip,
-            sample_write::<R>,
-            None,
-            &mut result,
-        )
-    };
-    if state.stopped || rc == 0 {
-        Ok(state.output)
-    } else {
-        Err(if rc == 5 {
-            "lz4_unsupported"
-        } else {
-            "lz4_decompression_probe_failed"
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -601,7 +482,7 @@ mod tests {
         let parsed = index(bytes.clone(), 0);
         assert!(parsed.complete);
         assert_eq!(parsed.blocks, 1);
-        assert_eq!(sample(std::io::Cursor::new(&bytes), 1).unwrap(), b"");
+        decode_into(std::io::Cursor::new(&bytes), std::io::sink()).unwrap();
         for magic in 0x50..=0x5fu8 {
             for n in 1..4 {
                 let mut truncated = bytes.clone();
@@ -670,23 +551,7 @@ mod tests {
         assert_eq!(parse_header(&header).unwrap_err(), "lz4_reserved_bits_set");
     }
     #[test]
-    fn sample_checks_checksum_and_returns_bounded_prefix() {
-        let payload = vec![b'x'; 60000];
-        let mut bytes = frame(&payload, 0x74, 0x40, None, None);
-        assert_eq!(
-            sample(std::io::Cursor::new(&bytes), 1024).unwrap().len(),
-            1024
-        );
-        assert_eq!(
-            sample(std::io::Cursor::new(&bytes), 65536).unwrap(),
-            payload
-        );
-        *bytes.last_mut().unwrap() ^= 1;
-        assert!(sample(std::io::Cursor::new(&bytes), 65536).is_err());
-    }
-
-    #[test]
-    fn unsupported_inputs_do_not_need_external_context() {
+    fn legacy_inputs_and_dictionary_descriptors_preserve_structure_identity() {
         let legacy = b"\x02\x21\x4c\x18\x06\0\0\0\x50hello";
         assert!(!leading(legacy));
         assert!(!identity(
@@ -695,14 +560,9 @@ mod tests {
         )
         .unwrap());
         assert_eq!(index(legacy.to_vec(), 0).error, "lz4_magic_not_found");
-        assert!(sample(std::io::Cursor::new(legacy), 32).is_err());
         for id in [0, 123, u32::MAX] {
             let bytes = frame(b"hello", 0x61, 0x40, None, Some(id));
-            assert!(index(bytes.clone(), 0).complete);
-            assert_eq!(
-                sample(std::io::Cursor::new(&bytes), 32),
-                Err("lz4_unsupported")
-            );
+            assert!(index(bytes, 0).complete);
         }
     }
 }

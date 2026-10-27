@@ -192,33 +192,8 @@
         "enabled": true
       },
       {
-        "name": "tar_lz4",
-        "enabled": true,
-        "max_probe_bytes": 4194304
-      },
-      {
         "name": "zstd",
         "enabled": true
-      },
-      {
-        "name": "tar_gz",
-        "enabled": true,
-        "max_probe_bytes": 4194304
-      },
-      {
-        "name": "tar_bz2",
-        "enabled": true,
-        "max_probe_bytes": 4194304
-      },
-      {
-        "name": "tar_xz",
-        "enabled": true,
-        "max_probe_bytes": 4194304
-      },
-      {
-        "name": "tar_zst",
-        "enabled": true,
-        "max_probe_bytes": 4194304
       }
     ]
   },

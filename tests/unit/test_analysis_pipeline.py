@@ -174,7 +174,8 @@ def test_clean_whole_input_formats_use_structure_evidence(tmp_path):
         path = _write_bytes(tmp_path / f"clean-{name}.bin", data)
         report = AnalysisEngine().analyze_path(str(path))
 
-        expected = "rar" if name in {"rar4", "rar5"} else "7z" if name == "7z-empty" else name
+        expected = {"rar4": "rar", "rar5": "rar", "7z-empty": "7z",
+                    "tar.gz": "gzip", "tar.bz2": "bzip2", "tar.xz": "xz"}.get(name, name)
         evidence = next(item for item in report.selected if item.format == expected)
         assert evidence.status == "extractable", name
         assert evidence.segments[0].start_offset == 0
@@ -457,35 +458,90 @@ def test_analysis_does_not_call_a_zstd_header_fragment_extractable(tmp_path):
     assert evidence.details["structure_validation_complete"] is False
 
 
-def test_bzip2_compressed_tar_stream_probe_preserves_input_budget_failure(tmp_path):
-    payload = random.Random(20260811).randbytes(1024 * 1024)
+@pytest.fixture
+def tar_stream_samples(tmp_path):
+    from tests.helpers.real_archives import create_compression_stream
+
+    source = tmp_path / "payload.tar"
     buffer = BytesIO()
-    info = tarfile.TarInfo("payload.bin")
-    info.size = len(payload)
-    with tarfile.open(fileobj=buffer, mode="w") as archive:
-        archive.addfile(info, BytesIO(payload))
-    compressed = bz2.compress(buffer.getvalue())
-    path = tmp_path / "payload.tar.bz2"
-    path.write_bytes(compressed)
-    view = AnalysisBinaryView(str(path))
-
-    incomplete = dict(view.probe_compressed_tar("bzip2", len(compressed) // 4))
-    complete = dict(view.probe_compressed_tar("bzip2", len(compressed)))
-
-    assert incomplete["tar_plausible"] is False
-    assert incomplete["tar_probe_error"] == "decompression_probe_failed"
-    assert complete["tar_plausible"] is True
-    assert complete["inner_tar_verified"] is True
+    payload = random.Random(20261027).randbytes(256 * 1024)
+    with tarfile.open(fileobj=buffer, mode="w", format=tarfile.USTAR_FORMAT) as archive:
+        entry = tarfile.TarInfo("payload.bin")
+        entry.size = len(payload)
+        archive.addfile(entry, BytesIO(payload))
+    source.write_bytes(buffer.getvalue())
+    streams = {}
+    for fmt in ("gzip", "bzip2", "xz", "zstd", "lz4"):
+        path = tmp_path / (fmt + ".photo")
+        create_compression_stream(source, path, fmt, **({"compression_level": 0} if fmt == "gzip" else {}))
+        streams[fmt] = path
+    return source, streams
 
 
-def test_tar_zst_requires_real_zstd_inner_tar(tmp_path):
-    path = tmp_path / "payload.tar.zst"
-    path.write_bytes(b"\x28\xb5\x2f\xfd\x20\x00")
+def test_tar_is_recognized_only_at_the_logical_start_or_from_embedded_evidence(tmp_path, tar_stream_samples):
+    # Proves that raw TAR headers in stored compression blocks cannot become
+    # peer archives, without teaching the TAR module about any other format.
+    # Existing clean-input tests do not cover this positioning boundary.
+    source, streams = tar_stream_samples
+    engine = AnalysisEngine()
+    assert engine.analyze_path(str(source)).best_selected.format == "tar"
+    for fmt, path in streams.items():
+        report = engine.analyze_path(str(path))
+        assert report.best_selected.format == fmt
+        assert all("." not in item.format for item in report.evidences)
+        assert next(item for item in report.evidences if item.format == "tar").status == "not_found"
+        data = path.read_bytes()
+        first, second = tmp_path / (fmt + ".001"), tmp_path / (fmt + ".002")
+        first.write_bytes(data[:len(data) // 2])
+        second.write_bytes(data[len(data) // 2:])
+        split = engine.analyze_paths([str(first), str(second)])
+        assert split.best_selected.format == fmt
+        assert split.best_selected.segments[0].end_offset == len(data)
 
-    evidence = {item.format: item for item in AnalysisEngine().analyze_path(str(path)).evidences}["tar.zst"]
+    # A genuine nonzero TAR is available only through the existing scanner.
+    carrier = tmp_path / "carrier.photo"
+    carrier.write_bytes(b"carrier-prefix" + source.read_bytes() + b"carrier-suffix")
+    ordinary = engine.analyze_path(str(carrier))
+    assert next(item for item in ordinary.evidences if item.format == "tar").status == "not_found"
+    scan = scan_embedded_archives(str(carrier))
+    embedded = engine.analyze_path(str(carrier), initial_prepass=scan.to_prepass())
+    assert embedded.best_selected.format == "tar"
+    assert embedded.best_selected.segments[0].start_offset == len(b"carrier-prefix")
 
-    assert evidence.status == "not_found"
-    assert evidence.details["tar_probe_error"]
+
+def test_outer_stream_damage_cannot_be_upgraded_by_a_readable_tar_prefix(tmp_path, tar_stream_samples):
+    # Only this test puts a valid TAR prefix behind an incomplete outer trailer
+    # and follows both single-file and split-source report projection. Removing
+    # it loses the regression that motivated deleting composite recognition.
+    _, streams = tar_stream_samples
+    engine = AnalysisEngine()
+    for fmt, source in streams.items():
+        data = source.read_bytes()[:-{"gzip": 8, "bzip2": 10, "xz": 12, "zstd": 4, "lz4": 4}[fmt]]
+        first = tmp_path / (fmt + "-damaged.photo")
+        second = tmp_path / (fmt + "-tail.photo")
+        first.write_bytes(data)
+        single = engine.analyze_path(str(first))
+        first.write_bytes(data[:len(data) // 2])
+        second.write_bytes(data[len(data) // 2:])
+        split = engine.analyze_paths([str(first), str(second)])
+        for report in (single, split):
+            outer = next(item for item in report.evidences if item.format == fmt)
+            assert outer.status == "damaged", (fmt, outer)
+            assert outer.details.get("structure_validation_complete", False) is False
+            assert report.best_selected is None, (fmt, report.selected)
+            assert report.extractable_segments == ()
+
+    # A present but incorrect GZIP CRC must also remain damaged even though its
+    # complete DEFLATE structure and inner TAR header are both readable.
+    data = bytearray(streams["gzip"].read_bytes())
+    data[-8] ^= 1
+    bad_crc = tmp_path / "crc.photo"
+    bad_crc.write_bytes(data)
+    report = engine.analyze_path(str(bad_crc))
+    outer = next(item for item in report.evidences if item.format == "gzip")
+    assert outer.status == "damaged"
+    assert outer.details["integrity_status"] == "failed"
+    assert report.best_selected is None
 
 
 def test_analysis_module_config_can_disable_formats(tmp_path):

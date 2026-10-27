@@ -124,53 +124,6 @@ impl AnalysisBinaryView {
         Ok(result.unbind())
     }
 
-    #[pyo3(signature = (format, max_probe_bytes=4194304))]
-    fn probe_compressed_tar(
-        &self,
-        py: Python<'_>,
-        format: &str,
-        max_probe_bytes: usize,
-    ) -> PyResult<Py<PyDict>> {
-        let stream = self.probe_compression(py, format)?;
-        stream.set_item("container", format)?;
-        stream.set_item("inner_format", "tar")?;
-        stream.set_item("inner_tar_verified", false)?;
-        stream.set_item("tar_plausible", false)?;
-        stream.set_item("tar_probe_error", "")?;
-        if !stream
-            .get_item("magic_matched")?
-            .unwrap()
-            .extract::<bool>()?
-        {
-            return Ok(stream.unbind());
-        }
-        let input_budget = self.reader.len().min(max_probe_bytes as u64);
-        let source = self.reader.stream_cursor().take(input_budget);
-        match py.detach(|| decompress_sample(format, source, TAR_BLOCK_SIZE * 2)) {
-            Ok(sample) => {
-                if sample.len() < TAR_BLOCK_SIZE {
-                    stream.set_item("tar_probe_error", "inner_sample_too_small")?;
-                    return Ok(stream.unbind());
-                }
-                let (ok, error, member_size, ustar) =
-                    tar_header_plausible(&sample[..TAR_BLOCK_SIZE]);
-                stream.set_item("inner_tar_verified", ok)?;
-                stream.set_item("tar_plausible", ok)?;
-                stream.set_item("tar_probe_error", error)?;
-                stream.set_item("inner_tar_member_size", member_size)?;
-                stream.set_item("inner_tar_ustar", ustar)?;
-            }
-            Err(error) => {
-                stream.set_item("tar_probe_error", if crate::io::resource_error::is_memory_error(&error) {
-                    "out_of_memory"
-                } else { "decompression_probe_failed" })?;
-                stream.set_item("tar_probe_message", error.to_string())?;
-                stream.set_item("tar_probe_os_error", error.raw_os_error())?;
-            }
-        }
-        Ok(stream.unbind())
-    }
-
     #[pyo3(signature = (config, initial_prepass=None, signature_prepass=true, format_structure=true))]
     fn analyze<'py>(
         &self,

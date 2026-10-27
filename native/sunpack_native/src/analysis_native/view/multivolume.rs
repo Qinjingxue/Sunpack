@@ -175,21 +175,6 @@ impl AnalysisMultiVolumeView {
         .probe_compression_stream(py, format)
     }
 
-    #[pyo3(signature = (format, max_probe_bytes=4194304))]
-    fn probe_compressed_tar(
-        &self,
-        py: Python<'_>,
-        format: &str,
-        max_probe_bytes: usize,
-    ) -> PyResult<Py<PyDict>> {
-        AnalysisBinaryView {
-            path: self.path.clone(),
-            reader: self.reader.clone(),
-            closed: self.closed,
-        }
-        .probe_compressed_tar(py, format, max_probe_bytes)
-    }
-
     fn stats(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
         self.ensure_open()?;
         let stats = self.reader.stats()?;

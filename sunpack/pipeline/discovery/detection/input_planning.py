@@ -134,7 +134,7 @@ class ArchiveInputPlanningStage:
         descriptor = task.archive_input()
         # Identity confirmation does not carry stream structure.
         # Embedded tasks already own the canonical plan; reuse it directly.
-        if descriptor.format_hint in {"lz4", "tar.lz4"}:
+        if descriptor.format_hint == "lz4":
             return not descriptor.analysis.get("stream_plan")
         return not _discovery_confirmed(task)
 
@@ -180,7 +180,7 @@ class ArchiveInputPlanningStage:
             AnalysisRequest(
                 initial_prepass=initial_prepass,
                 capabilities=(frozenset({AnalysisCapability.FORMAT_STRUCTURE})
-                    if _discovery_confirmed(task) and descriptor.format_hint in {"lz4", "tar.lz4"}
+                    if _discovery_confirmed(task) and descriptor.format_hint == "lz4"
                     else DEFAULT_ANALYSIS_CAPABILITIES),
             ),
         )

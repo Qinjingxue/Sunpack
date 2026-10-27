@@ -34,7 +34,6 @@ def test_installer_field_upgrade_preserves_values_and_modules(tmp_path, repo_roo
             {"name": "advanced_only", "enabled": True},
         ]},
         "analysis": {"modules": [
-            {"name": "tar_gz", "enabled": True, "max_probe_bytes": 4194304},
             {"name": "gzip", "enabled": True},
         ]},
         "verification": {"methods": [
@@ -87,7 +86,6 @@ def test_installer_field_upgrade_preserves_values_and_modules(tmp_path, repo_roo
         ]},
         "analysis": {"modules": [
             {"name": "gzip", "enabled": False, "custom": 9},
-            {"name": "tar_gz", "enabled": False, "max_probe_bytes": 2048},
         ]},
         "verification": {"methods": [{"name": "archive_test_crc", "max_reported_items": 0}]},
     }
