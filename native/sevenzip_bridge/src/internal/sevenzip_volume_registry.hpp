@@ -107,6 +107,7 @@ namespace sunpack::sevenzip
 
         // 关停用：唤醒所有等待者，不改变任何 gate 状态。
         void abort_all_space_gates() noexcept;
+        void reclaim_idle_memory();
 
         void shutdown() noexcept;
 

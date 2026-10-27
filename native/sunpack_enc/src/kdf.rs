@@ -36,6 +36,7 @@ pub(super) fn derive(
     output: &mut [u8; 256],
     memory: &mut [Block],
     threads: usize,
+    cancelled: impl Fn() -> bool,
 ) -> Result<(), Error> {
     if memory.len() != params.memory_blocks() as usize || params.tag_len_bytes() != output.len() {
         return Err(Error::IncorrectParameter);
@@ -77,6 +78,9 @@ pub(super) fn derive(
     };
     for pass in 0..instance.passes {
         for slice in 0..4 {
+            if cancelled() {
+                return Err(Error::IncorrectParameter);
+            }
             if threads == 1 {
                 for lane in 0..instance.lanes {
                     executor.fill_lane(pass, slice, lane);

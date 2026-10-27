@@ -7,12 +7,21 @@
 
 #include "Defs.h"
 #include "MyTypes.h"
+#include "../../C/Alloc.h"
+#include <new>
 
 /* 7-Zip now uses CBuffer only as CByteBuffer.
    So there is no need to use Z7_ARRAY_NEW macro in CBuffer code. */
 
 template <class T> class CBuffer
 {
+  static T *Allocate(size_t size)
+  {
+    static_assert(sizeof(T) == 1, "CBuffer is the SDK byte buffer");
+    T *p = (T *)MyAlloc(size);
+    if (!p) throw std::bad_alloc();
+    return p;
+  }
   T *_items;
   size_t _size;
 
@@ -21,7 +30,7 @@ public:
   {
     if (_items)
     {
-      delete []_items;
+      MyFree(_items);
       _items = NULL;
     }
     _size = 0;
@@ -32,7 +41,7 @@ public:
   {
     if (size != 0)
     {
-      _items = new T[size];
+      _items = Allocate(size);
       _size = size;
     }
   }
@@ -41,13 +50,13 @@ public:
     const size_t size = buffer._size;
     if (size != 0)
     {
-      _items = new T[size];
+      _items = Allocate(size);
       memcpy(_items, buffer._items, size * sizeof(T));
       _size = size;
     }
   }
 
-  ~CBuffer() { delete []_items; }
+  ~CBuffer() { MyFree(_items); }
 
   operator       T *()       { return _items; }
   operator const T *() const { return _items; }
@@ -66,7 +75,7 @@ public:
       Free();
       if (size != 0)
       {
-        _items = new T[size];
+        _items = Allocate(size);
         _size = size;
       }
     }
@@ -77,7 +86,7 @@ public:
     if (size > _size)
     {
       Free();
-      _items = new T[size];
+      _items = Allocate(size);
       _size = size;
     }
   }
@@ -96,13 +105,13 @@ public:
     T *newBuffer = NULL;
     if (newSize != 0)
     {
-      newBuffer = new T[newSize];
+      newBuffer = Allocate(newSize);
       if (keepSize > _size)
         keepSize = _size;
       if (keepSize != 0)
         memcpy(newBuffer, _items, MyMin(keepSize, newSize) * sizeof(T));
     }
-    delete []_items;
+    MyFree(_items);
     _items = newBuffer;
     _size = newSize;
   }

@@ -9,6 +9,7 @@
 #include "7zip/Common/RegisterCodec.h"
 #include "7zip/Common/StreamUtils.h"
 #include "stream.h"
+#include "decoder_memory.h"
 #include <algorithm>
 
 namespace NCompress { namespace NSunpackLz4 {
@@ -88,7 +89,8 @@ Z7_COM7F_IMF(CDecoder::Code(ISequentialInStream *input, ISequentialOutStream *ou
     if (!finish && output_size && !*output_size) return S_OK;
     Context context{input, output, report, input_size, output_size, finish};
     sup_lz4_result result{};
-    const int error = sup_lz4_decode(&context, read, nullptr, write, progress, &result);
+    const int error = sup_lz4_decode_with_memory(&context, read, nullptr, write, progress, &result,
+        sunpack_decoder_allocate, sunpack_decoder_free);
     processed = result.input_bytes;
     if (context.cut) return S_OK;
     if (context.status != S_OK) return context.status;

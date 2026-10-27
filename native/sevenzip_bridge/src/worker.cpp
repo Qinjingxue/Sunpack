@@ -33,7 +33,8 @@
 #include "internal/archive_operations.hpp"
 #include "internal/sevenzip_formats.hpp"
 #include "internal/sevenzip_sdk.hpp"
-#include "internal/native_memory_guard.hpp"
+#include "internal/native_memory.hpp"
+#include "internal/extraction_replay.hpp"
 #include "internal/native_cpu_budget.hpp"
 #include "internal/native_worker_sizing.hpp"
 #ifdef SUP7Z_ENABLE_PIPELINE_TIMING
@@ -1087,6 +1088,8 @@ std::string diagnostics_json(const sunpack::sevenzip::ExtractArchiveResult& resu
 
 }  // namespace
 
+constexpr int kMemoryRetry = -102;
+
 int run_request(
     const WorkerRequest& request,
     // The job's output-volume write facility, borrowed from the registry lease held by worker_loop; null for dry runs.
@@ -1097,6 +1100,8 @@ int run_request(
 
     const std::string& job_id = request.job_id;
     const std::string& command = request.worker_command;
+    if (auto *memory = current_native_memory_job(); memory && memory->revoked.load(std::memory_order_acquire))
+        return kMemoryRetry;
     if (command == "shutdown") {
         print_json_line(
             "{\"type\":\"result\",\"job_id\":\"" + json_escape(job_id) +
@@ -1211,7 +1216,10 @@ int run_request(
         result = extract_with_password(password_candidates.front());
         const bool direct_ok = result.status == PasswordTestStatus::Ok && result.command_ok;
         result.password_attempts = direct_ok ? 0 : 1;
-        if (!direct_ok && result.encrypted && !(result.status == PasswordTestStatus::WrongPassword && result.operation_result == kOpWrongPassword)) {
+        if (!direct_ok && result.encrypted && result.failure_kind != "resource_unavailable" &&
+            !(current_native_memory_job() && current_native_memory_job()->revoked.load(std::memory_order_acquire)) &&
+            !(current_native_memory_job() && current_native_memory_job()->denied.load(std::memory_order_acquire)) &&
+            !(result.status == PasswordTestStatus::WrongPassword && result.operation_result == kOpWrongPassword)) {
             const auto probe = run_password_candidate_probe(archive_input, password_candidates);
             result.password_attempts = probe.attempts;
             if (probe.status == PasswordTestStatus::WrongPassword) {
@@ -1244,6 +1252,16 @@ int run_request(
             result.password_attempts = probe.attempts;
             result.matched_index = probe.matched_index;
         }
+    }
+
+    if (auto *memory = current_native_memory_job()) {
+        if ((result.failure_kind == "resource_unavailable" ||
+             (memory->denied.load(std::memory_order_acquire) && !(result.status == PasswordTestStatus::Ok && result.command_ok))) &&
+            !memory->revoked.load(std::memory_order_acquire))
+            memory->owner.retry(*memory);
+        // An interrupted attempt is internal. Never publish its provisional
+        // damage/password/output errors or a final result to the caller.
+        if (memory->revoked.load(std::memory_order_acquire) && !(result.status == PasswordTestStatus::Ok && result.command_ok)) return kMemoryRetry;
     }
 
     if (!archive_input.analyzed_missing_volume_evidence.empty()) {
@@ -1452,23 +1470,22 @@ bool apply_native_process_mode(const std::string& mode) noexcept {
 #endif
 }
 
-sunpack::sevenzip::NativeMemoryGuardConfig configured_native_memory_guard_config() noexcept {
-    sunpack::sevenzip::NativeMemoryGuardConfig config;
-    config.minimum_available_ratio = configured_native_double(
+double configured_memory_reserve_ratio() noexcept {
+    return configured_native_double(
         "SUNPACK_NATIVE_MIN_AVAILABLE_MEMORY_RATIO",
-        config.minimum_available_ratio,
+        .10,
         0.01,
         0.95);
-    return config;
 }
 
 class NativeJobExecutor final {
 public:
     NativeJobExecutor(
         const sunpack::sevenzip::NativeSizingPlan& sizing,
-        sunpack::sevenzip::NativeMemoryGuardConfig memory_guard_config
+        double memory_reserve_ratio
     )
-        : writer_meters_(std::make_shared<sunpack::sevenzip::WriterMeters>()),
+        : memory_(memory_reserve_ratio, {}, [this] { writer_registry_->reclaim_idle_memory(); }),
+          writer_meters_(std::make_shared<sunpack::sevenzip::WriterMeters>()),
           // The sink is owned solely by the executor and the long-lived gates: AsyncFileWriter never holds or resets it.
           space_change_sink_(
               [this](const sunpack::sevenzip::VolumeSpaceTransition &transition) {
@@ -1486,10 +1503,7 @@ public:
           cpu_budget_(
               worker_count_,
               &NativeJobExecutor::on_cpu_capacity_available,
-              this),
-          memory_guard_(
-              worker_count_,
-              memory_guard_config) {
+              this) {
         // tick() must be called with the executor mutex_ released; the monitor keeps no membership and pulls blocked volumes from the registry.
         space_monitor_ = std::make_unique<sunpack::sevenzip::VolumeSpaceMonitor>(
             sunpack::sevenzip::VolumeSpaceMonitor::Options{
@@ -1578,6 +1592,8 @@ public:
                 return false;
             }
             token = found->second.cancel_token;
+            token->store(true, std::memory_order_release);
+            if (auto attempt = found->second.attempt_cancel.lock()) attempt->store(true, std::memory_order_release);
             // Locked only for this call: the token carries the cancel, the writer is just the thing to wake.
             writer_to_wake = found->second.writer.lock();
         }
@@ -1585,6 +1601,7 @@ public:
             return false;
         }
         token->store(true, std::memory_order_release);
+        memory_.changed();
         // Cancellation is rare: withdraw queued jobs here rather than making
         // them wait for a CPU credit just to acknowledge their terminal state.
         std::optional<Job> withdrawn;
@@ -1598,11 +1615,12 @@ public:
                 if (found == queue->end()) continue;
                 withdrawn.emplace(std::move(*found));
                 queue->erase(found);
-                drained = queues_empty_locked() && active_jobs_ == 0;
+                drained = queues_empty_locked() && active_jobs_ == 0 && parked_jobs_ == 0;
                 break;
             }
         }
         if (withdrawn) {
+            if (withdrawn->execution) memory_.end(withdrawn->execution->memory);
             {
                 std::lock_guard<std::mutex> lock(cancel_mutex_);
                 cancel_tokens_.erase(job_id);
@@ -1621,7 +1639,7 @@ public:
 #endif
         // One canceled queued job needs at most one execution lane. Baton
         // passing handles any additional ready work without a wake-all storm.
-        condition_.notify_one();
+        condition_.notify_all(); // cancellation must also wake a parked retry
         return true;
     }
 
@@ -1632,7 +1650,7 @@ public:
         std::unique_lock<std::mutex> lock(mutex_);
         drain_condition_.wait(
             lock,
-            [this] { return queues_empty_locked() && active_jobs_ == 0; });
+            [this] { return queues_empty_locked() && active_jobs_ == 0 && parked_jobs_ == 0; });
     }
 
     // Normal shutdown and stdin EOF drain first; destructor fallback cancels.
@@ -1650,12 +1668,18 @@ public:
             stopping_ = true;
         }
         if (cancel_pending_jobs) {
-            std::lock_guard<std::mutex> cancel_lock(cancel_mutex_);
-            for (auto& entry : cancel_tokens_) {
-                if (entry.second.cancel_token) {
-                    entry.second.cancel_token->store(true, std::memory_order_release);
+            std::vector<std::shared_ptr<sunpack::sevenzip::AsyncFileWriter>> writers;
+            {
+                std::lock_guard<std::mutex> cancel_lock(cancel_mutex_);
+                for (auto& entry : cancel_tokens_) {
+                    if (entry.second.cancel_token) {
+                        entry.second.cancel_token->store(true, std::memory_order_release);
+                        if (auto attempt = entry.second.attempt_cancel.lock()) attempt->store(true, std::memory_order_release);
+                        if (auto writer = entry.second.writer.lock()) writers.push_back(std::move(writer));
+                    }
                 }
             }
+            for (const auto &writer : writers) writer->wake_waiters();
         }
         {
             std::lock_guard<std::mutex> monitor_lock(monitor_mutex_);
@@ -1663,6 +1687,7 @@ public:
             monitor_recheck_ = true;
         }
         condition_.notify_all();
+        memory_.stop();
         monitor_condition_.notify_all();
 #ifdef _WIN32
         // Must run before join(): gate waiters would otherwise never see the terminal conditions set above. It only broadcasts and changes no gate state.
@@ -1700,10 +1725,47 @@ private:
         std::string lifecycle_context_json;
     };
 
+    struct JobExecution {
+        struct InputStamp {
+            std::wstring path;
+            WIN32_FILE_ATTRIBUTE_DATA data{};
+            bool present = false;
+        };
+        JobExecution(sunpack::sevenzip::NativeMemoryManager &manager, const WorkerRequest &request) : memory(manager) {
+            std::unordered_set<std::wstring> seen;
+            const auto remember = [&](const std::wstring &path) {
+                if (path.empty() || !seen.insert(path).second) return;
+                InputStamp stamp;
+                stamp.path = sunpack::sevenzip::win32_extended_path(path);
+                stamp.present = GetFileAttributesExW(stamp.path.c_str(), GetFileExInfoStandard, &stamp.data) != FALSE;
+                inputs.push_back(std::move(stamp));
+            };
+            remember(request.archive_input.archive_path);
+            for (const auto &path : request.archive_input.part_paths) remember(path);
+            for (const auto &range : request.archive_input.ranges) remember(range.path);
+        }
+        bool inputs_unchanged() const {
+            for (const auto &stamp : inputs) {
+                WIN32_FILE_ATTRIBUTE_DATA data{};
+                const bool present = GetFileAttributesExW(stamp.path.c_str(), GetFileExInfoStandard, &data) != FALSE;
+                if (present != stamp.present || (present &&
+                    (data.nFileSizeHigh != stamp.data.nFileSizeHigh || data.nFileSizeLow != stamp.data.nFileSizeLow ||
+                     CompareFileTime(&data.ftLastWriteTime, &stamp.data.ftLastWriteTime) != 0 ||
+                     CompareFileTime(&data.ftCreationTime, &stamp.data.ftCreationTime) != 0))) return false;
+            }
+            return true;
+        }
+        sunpack::sevenzip::NativeMemoryJob memory;
+        sunpack::sevenzip::ExtractionReplay replay;
+        std::vector<InputStamp> inputs;
+        std::uint64_t memory_episode = 0;
+    };
+
     struct Job {
         WorkerRequest request;
         std::shared_ptr<std::atomic<bool>> cancel_token;
         JobMetadata metadata;
+        std::unique_ptr<JobExecution> execution;
     };
 
     // The writer reference is deliberately weak: a strong one would keep a facility alive past its lease and could run ~AsyncFileWriter under the executor mutex.
@@ -1712,6 +1774,7 @@ private:
             : cancel_token(std::move(token)) {}
 
         std::shared_ptr<std::atomic<bool>> cancel_token;
+        std::weak_ptr<std::atomic<bool>> attempt_cancel;
         std::weak_ptr<sunpack::sevenzip::AsyncFileWriter> writer;
     };
 
@@ -1739,7 +1802,7 @@ private:
     }
 
     std::size_t queued_job_count_locked() const noexcept {
-        return foreground_queue_.size() + background_queue_.size();
+        return foreground_queue_.size() + background_queue_.size() + parked_jobs_;
     }
 
     Job pop_next_job_locked() {
@@ -1821,24 +1884,6 @@ private:
             event,
             job.metadata,
             active_jobs);
-    }
-
-    void print_memory_guard_event(
-        const sunpack::sevenzip::NativeMemoryGuardSnapshot& snapshot
-    ) const noexcept {
-        const auto budget = cpu_budget_.snapshot();
-        print_json_line(
-            "{\"type\":\"native_memory\",\"event\":\"" +
-            std::string(snapshot.under_pressure ? "budget_reduced" : "budget_restored") +
-            "\",\"nominal_cpu_budget\":" + std::to_string(snapshot.nominal_cpu_budget) +
-            ",\"effective_cpu_budget\":" + std::to_string(snapshot.effective_cpu_budget) +
-            ",\"budget_step\":" + std::to_string(snapshot.budget_step) +
-            ",\"reserved_cpu_credits\":" + std::to_string(budget.reserved_credits) +
-            ",\"total_physical_bytes\":" + std::to_string(snapshot.total_physical_bytes) +
-            ",\"available_physical_bytes\":" + std::to_string(snapshot.available_physical_bytes) +
-            ",\"available_ratio\":" + std::to_string(snapshot.available_ratio) +
-            ",\"minimum_available_ratio\":" + std::to_string(snapshot.minimum_available_ratio) +
-            "}");
     }
 
     // Facility lifecycle, so an empty `live_facilities` count can be told apart from a volume key that never reached the writer.
@@ -1972,127 +2017,27 @@ private:
         print_volume_space_event(transition);
     }
 
-    static constexpr std::chrono::milliseconds kMemoryPollInterval{1000};
-
-#ifdef _WIN32
-    static bool query_physical_memory(
-        std::uint64_t& total_bytes,
-        std::uint64_t& available_bytes
-    ) noexcept {
-        MEMORYSTATUSEX status{};
-        status.dwLength = sizeof(status);
-        if (!GlobalMemoryStatusEx(&status)) {
-            return false;
-        }
-        total_bytes = status.ullTotalPhys;
-        available_bytes = status.ullAvailPhys;
-        return total_bytes != 0;
-    }
-#endif
-
     void monitor_loop() noexcept {
-        std::optional<std::chrono::steady_clock::time_point> next_memory_poll;
-        std::uint64_t observed_activity_epoch = 0;
-
-        while (true) {
-            std::unique_lock<std::mutex> wait_lock(monitor_mutex_);
+        // Disk-space monitoring retains its existing active-only schedule.
+        // Memory notifications and commitment checks belong to memory_.
+        for (;;) {
+            std::unique_lock<std::mutex> lock(monitor_mutex_);
             const auto now = std::chrono::steady_clock::now();
-            const bool has_active_jobs =
-                monitor_has_active_jobs_.load(std::memory_order_acquire);
-            const std::uint64_t activity_epoch =
-                monitor_activity_epoch_.load(std::memory_order_acquire);
-
-            if (has_active_jobs) {
-                if (activity_epoch != observed_activity_epoch) {
-                    // Every 0->1 active transition is a new activity episode.
-                    // Force its first memory sample immediately even if the
-                    // previous episode ended less than one poll interval ago.
-                    observed_activity_epoch = activity_epoch;
-                    next_memory_poll = now;
-                } else if (!next_memory_poll) {
-                    next_memory_poll = now;
-                }
-            } else {
-                // No active extraction means no system-memory polling.
-                next_memory_poll.reset();
+            auto deadline = writer_registry_->next_reap_deadline();
+            if (space_monitor_->sampling()) {
+                const auto space = now + writer_config_.space_poll_interval;
+                if (!deadline || space < *deadline) deadline = space;
             }
-
-            std::optional<std::chrono::steady_clock::time_point> deadline =
-                next_memory_poll;
-#ifdef _WIN32
-            if (space_monitor_->sampling() &&
-                writer_config_.space_poll_interval > std::chrono::milliseconds::zero()) {
-                const auto space_deadline = now + writer_config_.space_poll_interval;
-                if (!deadline || space_deadline < *deadline) {
-                    deadline = space_deadline;
-                }
-            }
-            if (const auto reap_deadline = writer_registry_->next_reap_deadline()) {
-                if (!deadline || *reap_deadline < *deadline) {
-                    deadline = *reap_deadline;
-                }
-            }
-#endif
-
-            if (deadline && *deadline > now) {
-                monitor_condition_.wait_until(
-                    wait_lock,
-                    *deadline,
-                    [this] { return monitor_stopping_ || monitor_recheck_; });
-            } else if (!deadline) {
-                monitor_condition_.wait(
-                    wait_lock,
-                    [this] { return monitor_stopping_ || monitor_recheck_; });
-            }
-
-            if (monitor_stopping_) {
-                break;
-            }
-
+            if (deadline) monitor_condition_.wait_until(lock, *deadline,
+                [this] { return monitor_stopping_ || monitor_recheck_; });
+            else monitor_condition_.wait(lock,
+                [this] { return monitor_stopping_ || monitor_recheck_; });
+            if (monitor_stopping_) return;
             monitor_recheck_ = false;
-            const auto wake_time = std::chrono::steady_clock::now();
-            wait_lock.unlock();
-
-#ifdef _WIN32
-            for (const auto& volume : writer_registry_->reap_idle()) {
+            lock.unlock();
+            for (const auto &volume : writer_registry_->reap_idle())
                 print_writer_facility_event("writer_facility_reaped", volume);
-            }
-            space_monitor_->tick(wake_time);
-#endif
-
-            const bool active_after_tick =
-                monitor_has_active_jobs_.load(std::memory_order_acquire);
-            const bool should_poll_memory =
-                active_after_tick &&
-                next_memory_poll &&
-                wake_time >= *next_memory_poll;
-            if (!active_after_tick) {
-                next_memory_poll.reset();
-            } else if (should_poll_memory) {
-                next_memory_poll = wake_time + kMemoryPollInterval;
-            }
-
-            if (!should_poll_memory) {
-                continue;
-            }
-
-#ifdef _WIN32
-            std::uint64_t total_bytes = 0;
-            std::uint64_t available_bytes = 0;
-            if (query_physical_memory(total_bytes, available_bytes)) {
-                const bool changed =
-                    memory_guard_.observe(total_bytes, available_bytes);
-                if (changed) {
-                    const auto snapshot = memory_guard_.snapshot();
-                    cpu_budget_.set_effective_capacity(
-                        snapshot.effective_cpu_budget);
-                    // NativeCpuBudget emits at most one admission wake when
-                    // an effective-capacity increase changes the budget from
-                    // saturated to available; reductions need no wakeup.
-                    print_memory_guard_event(snapshot);
-                }
-            }
-#endif
+            space_monitor_->tick(std::chrono::steady_clock::now());
         }
     }
 
@@ -2121,15 +2066,14 @@ private:
             Job job;
             std::size_t admitted_jobs = 0;
             bool wake_next_job = false;
-            bool monitor_became_active = false;
             {
                 std::unique_lock<std::mutex> lock(mutex_);
                 condition_.wait(lock, [this] {
                     const bool empty = queues_empty_locked();
                     return (!empty && cpu_budget_.can_acquire_base()) ||
-                        (stopping_ && empty);
+                        (stopping_ && empty && parked_jobs_ == 0);
                 });
-                if (stopping_ && queues_empty_locked()) {
+                if (stopping_ && queues_empty_locked() && parked_jobs_ == 0) {
                     break;
                 }
                 if (!cpu_budget_.try_acquire_base()) {
@@ -2139,13 +2083,6 @@ private:
                 job = pop_next_job_locked();
                 active_jobs_ += 1;
                 admitted_jobs = active_jobs_;
-                monitor_became_active = active_jobs_ == 1;
-                if (monitor_became_active) {
-                    monitor_has_active_jobs_.store(
-                        true, std::memory_order_release);
-                    monitor_activity_epoch_.fetch_add(
-                        1, std::memory_order_release);
-                }
                 wake_next_job =
                     !queues_empty_locked() && cpu_budget_.can_acquire_base();
             }
@@ -2155,48 +2092,84 @@ private:
             if (wake_next_job) {
                 condition_.notify_one();
             }
-            if (monitor_became_active) {
-                request_monitor_recheck();
-            }
 
-            print_job_start_events(job, admitted_jobs);
+            const bool replaying = job.execution != nullptr;
+            if (!job.execution) {
+                print_job_start_events(job, admitted_jobs);
+                job.execution = std::make_unique<JobExecution>(memory_, job.request);
+            }
             int code = -100;
             const std::string& job_id = job.metadata.job_id;
+            auto &memory_job = job.execution->memory;
+            memory_.begin(memory_job);
+            {
+                std::lock_guard<std::mutex> lock(cancel_mutex_);
+                const auto found = cancel_tokens_.find(job_id);
+                if (found != cancel_tokens_.end()) found->second.attempt_cancel = memory_job.cancel;
+                if (job.cancel_token->load(std::memory_order_acquire)) memory_job.cancel->store(true, std::memory_order_release);
+            }
             {
                 sunpack::sevenzip::NativeCpuJobContext cpu_job_context(cpu_budget_);
                 sunpack::sevenzip::NativeCpuContextScope cpu_scope(&cpu_job_context);
+                sunpack::sevenzip::NativeMemoryScope memory_scope(&memory_job);
+                sunpack::sevenzip::ExtractionReplayScope replay_scope(&job.execution->replay);
                 try {
-                if (job.metadata.requires_writer) {
-                    // The lease is released before the job is reported finished, so active_jobs_ == 0 implies every finished job's lease is gone.
-                    const std::string key = job.metadata.volume_key.empty()
-                        ? synthetic_volume_key(job_id)
-                        : job.metadata.volume_key;
-                    auto lease = writer_registry_->acquire(key);
-                    if (lease.created_facility()) {
-                        print_writer_facility_event("writer_facility_created", key);
-                    }
-                    register_cancel_writer(job_id, lease.writer_pointer());
-                    // Registered inside the volume lease scope and declared after it: root output dir creation can fill the disk before make_job, and reverse destruction must deregister before the lease is released.
-                    sunpack::sevenzip::SpaceJobRegistration space_registration(lease, job_id);
-                    code = run_request(job.request, lease.writer_pointer(), job.cancel_token);
-                } else {
-                    code = run_request(job.request, nullptr, job.cancel_token);
-                }
+                    if (replaying && !job.cancel_token->load(std::memory_order_acquire) && !job.execution->inputs_unchanged()) {
+                        code = 1;
+                        print_json_line("{\"type\":\"result\",\"job_id\":\"" + json_escape(job_id) +
+                            "\",\"status\":\"failed\",\"native_status\":\"error\",\"failure_kind\":\"input_changed\","
+                            "\"failure_stage\":\"native_replay\",\"message\":\"archive input changed while waiting for memory; rescan required\"}");
+                    } else if (job.metadata.requires_writer) {
+                        const std::string key = job.metadata.volume_key.empty() ? synthetic_volume_key(job_id) : job.metadata.volume_key;
+                        auto lease = writer_registry_->acquire(key);
+                        if (lease.created_facility()) print_writer_facility_event("writer_facility_created", key);
+                        register_cancel_writer(job_id, lease.writer_pointer());
+                        const auto weak = std::weak_ptr<sunpack::sevenzip::AsyncFileWriter>(lease.writer_pointer());
+                        memory_.set_wake(memory_job, [weak] { if (auto writer = weak.lock()) writer->wake_waiters(); });
+                        if (job.cancel_token->load(std::memory_order_acquire)) memory_job.cancel->store(true, std::memory_order_release);
+                        sunpack::sevenzip::SpaceJobRegistration registration(lease, job_id);
+                        code = run_request(job.request, lease.writer_pointer(), memory_job.cancel);
+                    } else code = run_request(job.request, nullptr, memory_job.cancel);
                 } catch (const std::bad_alloc&) {
-                    // Best effort at the task boundary; no per-allocation
-                    // handlers or reserve-memory recovery machinery.
-                    code = 2;
-                    print_json_line(
-                        "{\"type\":\"result\",\"job_id\":\"" + json_escape(job_id) +
-                        "\",\"status\":\"failed\",\"native_status\":\"error\","
-                        "\"failure_kind\":\"resource_unavailable\",\"failure_stage\":\"worker_job\","
-                        "\"hresult\":-2147024882,\"hresult_hex\":\"0x8007000e\","
-                        "\"message\":\"insufficient memory to process archive\"}");
-                } catch (...) {
-                    code = -100;
-                }
+                    memory_.retry(memory_job);
+                    code = kMemoryRetry;
+                } catch (...) { code = -100; }
             }
+            // Pending output and decoder threads have drained. Parked tasks
+            // retain neither dictionaries, writer leases nor execution threads.
             cpu_budget_.release(1);
+            memory_.end(memory_job);
+            request_monitor_recheck();
+            if (code == kMemoryRetry) {
+                print_json_line("{\"type\":\"native_memory\",\"job_id\":\"" + json_escape(job_id) +
+                    "\",\"event\":\"memory_reclaimed\",\"required_bytes\":" + std::to_string(memory_job.peak) + "}");
+                auto parked = std::make_shared<Job>(std::move(job));
+                const auto notice = [parked](bool blocked, const sunpack::sevenzip::NativeMemoryStatus &status, std::uint64_t needed) {
+                    auto &episode = parked->execution->memory_episode;
+                    if (blocked) ++episode;
+                    print_json_line("{\"type\":\"native_memory\",\"job_id\":\"" + parked->metadata.escaped_job_id +
+                        "\",\"event\":\"" + (blocked ? "memory_blocked" : "memory_resumed") +
+                        "\",\"episode_id\":" + std::to_string(episode) +
+                        ",\"required_bytes\":" + std::to_string(needed) +
+                        ",\"available_bytes\":" + std::to_string(status.available) + "}");
+                };
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    --active_jobs_;
+                    ++parked_jobs_;
+                }
+                memory_.park(memory_job, *parked->cancel_token, [this, parked](bool ready) {
+                    if (!ready) parked->cancel_token->store(true, std::memory_order_release);
+                    {
+                        std::lock_guard<std::mutex> lock(mutex_);
+                        --parked_jobs_;
+                        auto &queue = parked->metadata.foreground ? foreground_queue_ : background_queue_;
+                        queue.push_front(std::move(*parked));
+                    }
+                    condition_.notify_one();
+                }, notice);
+                continue;
+            }
 
             std::size_t remaining_jobs = 0;
             bool drained = false;
@@ -2204,11 +2177,7 @@ private:
                 std::lock_guard<std::mutex> lock(mutex_);
                 active_jobs_ = active_jobs_ > 0 ? active_jobs_ - 1 : 0;
                 remaining_jobs = active_jobs_;
-                if (active_jobs_ == 0) {
-                    monitor_has_active_jobs_.store(
-                        false, std::memory_order_release);
-                }
-                drained = queues_empty_locked() && active_jobs_ == 0;
+                drained = queues_empty_locked() && active_jobs_ == 0 && parked_jobs_ == 0;
                 any_job_failed_ = any_job_failed_ || code != 0;
             }
             if (!job_id.empty()) {
@@ -2229,6 +2198,7 @@ private:
     std::vector<std::thread> workers_;
     std::thread monitor_thread_;
     // Declaration order is destruction order reversed: meters, sink and config outlive writer_registry_, and space_monitor_ holds writer_registry_ and is destroyed before it.
+    sunpack::sevenzip::NativeMemoryManager memory_;
     sunpack::sevenzip::WriterMetersPtr writer_meters_;
     sunpack::sevenzip::VolumeSpaceChangeSink space_change_sink_;
     sunpack::sevenzip::AsyncWriterConfig writer_config_;
@@ -2252,16 +2222,14 @@ private:
     // this mutex except on the 0->1 / 1->0 activity edges.
     std::mutex monitor_mutex_;
     std::condition_variable monitor_condition_;
-    std::atomic<bool> monitor_has_active_jobs_{false};
-    std::atomic<std::uint64_t> monitor_activity_epoch_{0};
     bool monitor_recheck_ = false;
     bool monitor_stopping_ = false;
 
     const std::size_t worker_count_;
     const std::size_t queue_capacity_;
     sunpack::sevenzip::NativeCpuBudget cpu_budget_;
-    sunpack::sevenzip::NativeMemoryGuard memory_guard_;
     std::size_t active_jobs_ = 0;
+    std::size_t parked_jobs_ = 0;
     bool any_job_failed_ = false;
     bool stopping_ = false;
 };
@@ -2303,8 +2271,8 @@ int main() {
     const auto sizing = sunpack::sevenzip::derive_native_sizing_plan(
         resources,
         configured_native_sizing_overrides());
-    const auto memory_guard_config = configured_native_memory_guard_config();
-    NativeJobExecutor executor(sizing, memory_guard_config);
+    const auto memory_reserve_ratio = configured_memory_reserve_ratio();
+    NativeJobExecutor executor(sizing, memory_reserve_ratio);
     const bool sizing_overridden = sizing.thread_capacity_overridden;
     print_json_line(
         "{\"type\":\"worker_ready\",\"sizing_mode\":\"" +
@@ -2312,9 +2280,9 @@ int main() {
         "\",\"logical_processors\":" + std::to_string(resources.logical_processors) +
         ",\"thread_capacity\":" + std::to_string(sizing.thread_capacity) +
         ",\"nominal_cpu_budget\":" + std::to_string(sizing.thread_capacity) +
-        ",\"memory_poll_interval_ms\":1000" +
+        ",\"memory_management\":\"commitment_replay\"" +
         ",\"minimum_available_memory_ratio\":" +
-            std::to_string(memory_guard_config.minimum_available_ratio) +
+            std::to_string(memory_reserve_ratio) +
         ",\"process_mode\":\"" + requested_process_mode +
         "\",\"process_mode_applied\":" + (process_mode_applied ? "true" : "false") + "}");
     std::string line;

@@ -292,21 +292,26 @@ def test_on_space_event_reports_acceptance():
     assert state["space_waiting"] is False, "stale 事件绝不能改变等待状态"
 
 
-def test_stale_space_event_is_not_forwarded_to_the_ui(tmp_path):
+@pytest.mark.parametrize("resource", ["space", "memory"])
+@pytest.mark.parametrize("transport", ["async", "future"])
+def test_stale_resource_event_is_not_forwarded_to_the_ui(tmp_path, resource, transport):
     """端到端：native 按 resumed(ep3) → blocked(ep3) 乱序发送时，
     progress_callback（UI/Toast 的唯一入口）只能看到 resumed。
     """
 
     archive = tmp_path / "archive.zip"
     archive.write_bytes(b"payload")
+    def event(name):
+        return _space_event(f"{resource}_{name}", episode=3,
+                            type="native_memory" if resource == "memory" else "progress")
     worker = _write_python_worker(
         tmp_path,
         [
-            _space_event("space_blocked", episode=3),
-            _space_event("space_resumed", episode=3),
+            event("blocked"),
+            event("resumed"),
             # native 在 gate 锁外发送，这条 blocked(ep3) 晚到是合法的。
-            _space_event("space_blocked", episode=3),
-            _space_event("space_status", episode=3),
+            event("blocked"),
+            event("blocked"),
             # 正常收尾，避免用固定 5s 超时等待一个永不完结的假 job。
             {"type": "result", "status": "ok"},
             {"type": "native_event", "event": "job_finished"},
@@ -330,14 +335,20 @@ def test_stale_space_event_is_not_forwarded_to_the_ui(tmp_path):
         finally:
             await runner.aclose()
 
-    asyncio.run(run_attempt())
+    if transport == "async":
+        asyncio.run(run_attempt())
+    else:
+        try:
+            assert runner._submit_native_job({"job_id": "event-job"}, task=_task(archive)).result(timeout=5).returncode == 0
+        finally:
+            runner.close()
 
     forwarded = [
         str(event.get("event"))
         for event in seen
-        if str(event.get("event", "")).startswith("space_")
+        if str(event.get("event", "")).startswith(f"{resource}_")
     ]
-    assert forwarded == ["space_blocked", "space_resumed"], (
+    assert forwarded == [f"{resource}_blocked", f"{resource}_resumed"], (
         "迟到的 blocked(ep3)/status(ep3) 必须在 dispatcher 层被拦下，"
         f"绝不能进 UI；实际转发序列：{forwarded}"
     )

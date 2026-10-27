@@ -10,6 +10,45 @@
 #endif
 
 #include "Threads.h"
+#include "internal/decoder_memory.h"
+#include <stdlib.h>
+
+#ifndef USE_THREADS_CreateThread
+typedef struct {
+  THREAD_FUNC_TYPE func;
+  LPVOID param;
+  void *memory;
+} CSunpackThreadStart;
+
+static unsigned Z7_STDCALL SunpackThreadStart(void *opaque)
+{
+  const CSunpackThreadStart start = *(CSunpackThreadStart *)opaque;
+  void *previous;
+  unsigned result;
+  free(opaque);
+  previous = sunpack_memory_exchange_context(start.memory);
+  result = start.func(start.param);
+  sunpack_memory_exchange_context(previous);
+  return result;
+}
+
+static HANDLE SunpackBeginThread(THREAD_FUNC_TYPE func, void *param, unsigned flags, unsigned *id)
+{
+  void *memory = sunpack_memory_current_context();
+  CSunpackThreadStart *start;
+  HANDLE handle;
+  if (!memory)
+    return (HANDLE)_beginthreadex(NULL, 1 << 20, func, param, flags | STACK_SIZE_PARAM_IS_A_RESERVATION, id);
+  if (!sunpack_memory_may_start_thread(memory))
+  { SetLastError(ERROR_NOT_ENOUGH_MEMORY); return NULL; }
+  start = (CSunpackThreadStart *)malloc(sizeof(*start));
+  if (!start) { SetLastError(ERROR_NOT_ENOUGH_MEMORY); return NULL; }
+  start->func = func; start->param = param; start->memory = memory;
+  handle = (HANDLE)_beginthreadex(NULL, 1 << 20, SunpackThreadStart, start, flags | STACK_SIZE_PARAM_IS_A_RESERVATION, id);
+  if (!handle) free(start);
+  return handle;
+}
+#endif
 
 static WRes GetError(void)
 {
@@ -176,7 +215,7 @@ WRes Thread_Create(CThread *p, THREAD_FUNC_TYPE func, LPVOID param)
   #else
 
 #define CALL_beginthreadex(func2, param2, flags, threadIdPtr) \
-    ((HANDLE)(_beginthreadex(NULL, k_StackSize_ReserveSize, func2, param2, (flags) | STACK_SIZE_PARAM_IS_A_RESERVATION, threadIdPtr)))
+    SunpackBeginThread(func2, param2, flags, threadIdPtr)
   
   unsigned threadId;
   *p = CALL_beginthreadex(func, param, 0, &threadId);

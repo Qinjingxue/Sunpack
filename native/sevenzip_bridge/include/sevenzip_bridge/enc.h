@@ -11,7 +11,10 @@ typedef int (*sup_enc_write)(void *, const uint8_t *, size_t);
 typedef int (*sup_enc_progress)(void *, uint64_t);
 typedef uint32_t (*sup_enc_acquire)(void *, uint32_t);
 typedef void (*sup_enc_release)(void *, uint32_t);
-int sup_enc_open(void *, sup_enc_read, sup_enc_seek, uint64_t, const uint16_t *, size_t, sup_enc_decoder **, uint64_t *, sup_enc_acquire, sup_enc_release);
+typedef void *(*sup_enc_allocate)(void *, size_t);
+typedef void (*sup_enc_free)(void *, void *);
+typedef int (*sup_enc_cancel)(void *);
+int sup_enc_open(void *, sup_enc_read, sup_enc_seek, uint64_t, const uint16_t *, size_t, sup_enc_decoder **, uint64_t *, sup_enc_acquire, sup_enc_release, sup_enc_allocate, sup_enc_free, sup_enc_cancel);
 int sup_enc_decrypt(const sup_enc_decoder *, void *, sup_enc_read, sup_enc_seek, sup_enc_write, sup_enc_progress, sup_enc_acquire, sup_enc_release);
 void sup_enc_close(sup_enc_decoder *);
 #ifdef __cplusplus

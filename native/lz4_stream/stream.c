@@ -16,6 +16,8 @@ typedef struct {
     sup_lz4_write write;
     sup_lz4_progress progress;
     sup_lz4_result *result;
+    sup_lz4_allocate allocate;
+    sup_lz4_free release;
     unsigned char *input, *output;
     size_t pos, size;
 } stream;
@@ -102,8 +104,14 @@ static int modern(stream *s) {
     rc = need(s, header_size);
     if (rc) return rc;
     if (has_size) expected = le64(s->input+s->pos+6);
-    hint = LZ4F_createDecompressionContext(&ctx, LZ4F_VERSION);
-    if (LZ4F_isError(hint)) return library_error(hint);
+    if (s->allocate) {
+        const LZ4F_CustomMem memory = {s->allocate, NULL, s->release, s->opaque};
+        ctx = LZ4F_createDecompressionContext_advanced(memory, LZ4F_VERSION);
+        if (!ctx) return SUP_LZ4_MEMORY;
+    } else {
+        hint = LZ4F_createDecompressionContext(&ctx, LZ4F_VERSION);
+        if (LZ4F_isError(hint)) return library_error(hint);
+    }
     source_size = header_size;
     hint = LZ4F_getFrameInfo(ctx, &info, s->input+s->pos, &source_size);
     if (LZ4F_isError(hint)) { rc = library_error(hint); goto done; }
@@ -132,12 +140,18 @@ done:
 }
 int sup_lz4_decode(void *opaque, sup_lz4_read read, sup_lz4_skip skip,
     sup_lz4_write write, sup_lz4_progress progress, sup_lz4_result *result) {
+    return sup_lz4_decode_with_memory(opaque, read, skip, write, progress, result, NULL, NULL);
+}
+int sup_lz4_decode_with_memory(void *opaque, sup_lz4_read read, sup_lz4_skip skip,
+    sup_lz4_write write, sup_lz4_progress progress, sup_lz4_result *result,
+    sup_lz4_allocate allocate, sup_lz4_free release) {
     stream s;
     int rc = SUP_LZ4_OK;
     memset(result, 0, sizeof(*result));
     memset(&s, 0, sizeof(s));
     s.opaque=opaque; s.read=read; s.skip=skip; s.write=write;
     s.progress=progress; s.result=result;
+    s.allocate=allocate; s.release=release;
     s.input=(unsigned char *)malloc(BUFFER_SIZE);
     s.output=(unsigned char *)malloc(BUFFER_SIZE);
     if (!s.input || !s.output) { rc=SUP_LZ4_MEMORY; goto done; }

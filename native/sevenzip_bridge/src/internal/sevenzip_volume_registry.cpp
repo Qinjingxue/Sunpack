@@ -316,6 +316,16 @@ namespace sunpack::sevenzip
         return blocked;
     }
 
+    void VolumeWriterRegistry::reclaim_idle_memory()
+    {
+        std::vector<std::shared_ptr<AsyncFileWriter>> writers;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            for (const auto &entry : entries_) if (entry.second.writer) writers.push_back(entry.second.writer);
+        }
+        for (const auto &writer : writers) writer->reclaim_idle_memory();
+    }
+
     void VolumeWriterRegistry::abort_all_space_gates() noexcept
     {
         // 关停路径：只唤醒被 blocked 的 gate，不改变任何 gate 状态。

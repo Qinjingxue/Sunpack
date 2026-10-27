@@ -8,6 +8,9 @@
 #include "sevenzip_async_output.hpp"
 
 #include "sevenzip_space_directory.hpp"
+#include "native_memory.hpp"
+#include "sevenzip_status.hpp"
+#include <exception>
 
 #ifdef _WIN32
 
@@ -334,7 +337,19 @@ namespace sunpack::sevenzip
                 return E_FAIL;
             }
             UInt32 consumed = 0;
-            const HRESULT hr = writer_->write(file_, data, size, &consumed);
+            HRESULT hr = S_OK;
+            while (consumed < size) {
+                const auto run = file_->previous_writes().next(position_, size - consumed);
+                UInt32 done = 0;
+                const auto amount = static_cast<UInt32>(run.second);
+                if (run.first) {
+                    hr = writer_->skip_written(file_, amount);
+                    if (hr == S_OK) done = amount;
+                } else hr = writer_->write(file_, static_cast<const unsigned char *>(data) + consumed, amount, &done);
+                consumed += done;
+                position_ += done;
+                if (hr != S_OK || done != amount) break;
+            }
             if (consumed != 0 && magic_.size() < 512)
             {
                 const auto *bytes = static_cast<const unsigned char *>(data);
@@ -352,6 +367,7 @@ namespace sunpack::sevenzip
         std::shared_ptr<AsyncFileWriter> writer_;
         AsyncFileWriter::FileStatePtr file_;
         std::vector<unsigned char> magic_;
+        UInt64 position_ = 0;
         std::mutex mutex_;
     };
 
@@ -438,8 +454,17 @@ namespace sunpack::sevenzip
     class OutputPathAllocator
     {
     public:
-        explicit OutputPathAllocator(const std::filesystem::path &root) : root_(root) {}
+        explicit OutputPathAllocator(const std::filesystem::path &root, ExtractionReplay *replay = nullptr) : root_(root), replay_(replay) {
+            if (replay_) {
+                for (const auto &item : replay_->files) if (!item.second.path.empty()) used_.insert(normalized_output_path_key(item.second.path));
+                for (const auto &directory : replay_->directories) {
+                    directories_.emplace(directory);
+                    used_.insert(normalized_output_path_key(directory.second));
+                }
+            }
+        }
         void reserve(std::size_t count) { used_.reserve(count); }
+        void preserve_replay() { if (replay_) replay_->directories = std::move(directories_); }
 
         void clear() noexcept
         {
@@ -529,6 +554,7 @@ namespace sunpack::sevenzip
         std::unordered_map<std::wstring, std::size_t> next_numbers_;
         std::unordered_map<std::wstring, std::filesystem::path> directories_;
         std::filesystem::path root_;
+        ExtractionReplay *replay_;
     };
 
     inline bool is_windows_invalid_name_char(wchar_t value)
@@ -704,9 +730,13 @@ namespace sunpack::sevenzip
 
                 output_root_(win32_extended_path(output_dir_)),
 
-                output_root_initially_empty_(directory_is_empty_or_missing(output_root_)),
-                output_paths_(output_root_)
+                replay_(current_extraction_replay),
+                output_root_initially_empty_(replay_ && replay_->initialized ? replay_->root_was_empty : directory_is_empty_or_missing(output_root_)),
+                output_paths_(output_root_, replay_)
         {
+            if (replay_ && !replay_->initialized) {
+                replay_->root_was_empty = output_root_initially_empty_;
+            }
             output_paths_.reserve(static_cast<std::size_t>(estimated_items) * 2U + 1U);
             created_directories_.reserve(static_cast<std::size_t>(estimated_items) + 1U);
             // Query the handler's property schema once. ZIP/7z/stream hot paths
@@ -782,12 +812,13 @@ namespace sunpack::sevenzip
                 return;
             }
             output_finalized_ = true;
-            // Decoder callbacks are over. Writers own their output paths;
-            // release reservations and directory-cache buckets before draining.
-            output_paths_.clear();
+            archive_ = nullptr; // metadata needed below was captured during GetStream
+            // Decoder callbacks are over. Directory reservations survive until
+            // the final snapshot, so a late interruption can replay collisions.
             std::unordered_set<std::wstring>{}.swap(created_directories_);
             if (!async_writer_)
             {
+                output_paths_.clear();
                 finalize_hard_links();
                 return;
             }
@@ -888,6 +919,23 @@ namespace sunpack::sevenzip
             }
             finalize_hard_links();
             restore_directory_metadata();
+            const auto *memory = current_native_memory_job();
+            if (replay_ && (is_cancelled() || std::uncaught_exceptions() ||
+                is_memory_hresult(writer_error) || (memory && (memory->revoked.load() || memory->denied.load())))) {
+                replay_->initialized = true;
+                output_paths_.preserve_replay();
+                for (const auto &state : async_files_) async_writer_->capture_replay(state, replay_);
+                for (const auto &item : output_trace_->items)
+                    if (!item.is_dir && item.done && !item.output_path.empty() && replay_->files.find(item.index) == replay_->files.end()) {
+                        auto &receipt = replay_->files[item.index];
+                        receipt.path = (output_root_ / item.output_path).native();
+                        receipt.created = receipt.complete = true;
+                        receipt.written.add(0, item.bytes_written);
+                        receipt.has_mtime = item.has_mtime_ns;
+                        receipt.mtime = item.mtime_ns;
+                    }
+            }
+            output_paths_.clear();
         }
 
 
@@ -1086,6 +1134,11 @@ namespace sunpack::sevenzip
             emit("item_start", index, name);
 
             std::filesystem::path target;
+            ReplayFile *receipt = nullptr;
+            if (replay_) {
+                const auto found = replay_->files.find(index);
+                if (found != replay_->files.end()) receipt = &found->second;
+            }
             try
             {
                 // 目录创建失败按真实 std::error_code 判定并透传，空间错误码不能被吞成 E_FAIL。
@@ -1098,7 +1151,9 @@ namespace sunpack::sevenzip
                     if (!dry_run_)
                     {
 
-                        target = output_paths_.allocate(output_root_ / safe_path.value(), output_root_initially_empty_, true);
+                        target = receipt && !receipt->path.empty() ? std::filesystem::path(receipt->path)
+                            : output_paths_.allocate(output_root_ / safe_path.value(), output_root_initially_empty_, true);
+                        if (receipt) receipt->path = target.native();
 
                         directory_ready = ensure_directory(target, &directory_error);
                         if (directory_ready)
@@ -1129,7 +1184,9 @@ namespace sunpack::sevenzip
                 else if (!dry_run_)
                 {
 
-                    target = available_output_path(output_root_ / safe_path.value());
+                    target = receipt && !receipt->path.empty() ? std::filesystem::path(receipt->path)
+                        : available_output_path(output_root_ / safe_path.value());
+                    if (receipt) receipt->path = target.native();
 
                     directory_ready = ensure_directory(target.parent_path(), &directory_error);
 
@@ -1208,6 +1265,7 @@ namespace sunpack::sevenzip
 #ifdef SUP7Z_ENABLE_WRITER_PROBE
                                                            , has_expected_size ? expected_size : 0
 #endif
+                                                           , receipt
                                                            );
             async_files_.push_back(current_async_file_);
 
@@ -1413,7 +1471,9 @@ namespace sunpack::sevenzip
                             {
                                 const auto path = (output_root_ / item.output_path).make_preferred();
                                 const auto target = (output_root_ / source.output_path).make_preferred();
-                                const auto result = dry_run_ ? AttemptResult{} : retry_with_space_gate(
+                                const auto saved = replay_ ? replay_->files.find(item.index) : std::map<std::uint32_t, ReplayFile>::iterator{};
+                                const bool already_created = replay_ && saved != replay_->files.end() && saved->second.complete;
+                                const auto result = dry_run_ || already_created ? AttemptResult{} : retry_with_space_gate(
                                     volume_space_gate(), [&] { return space_terminal_predicate(); }, path.native(),
                                     [&]() noexcept -> AttemptResult
                                     {
@@ -1884,6 +1944,7 @@ namespace sunpack::sevenzip
         }
 
         std::filesystem::path output_root_;
+        ExtractionReplay *replay_ = nullptr;
 
         bool output_root_initially_empty_ = false;
 

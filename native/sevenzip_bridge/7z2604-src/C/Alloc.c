@@ -9,6 +9,11 @@
 #include <stdlib.h>
 
 #include "Alloc.h"
+#include "internal/decoder_memory.h"
+#ifdef _WIN32
+#include <malloc.h>
+#include <string.h>
+#endif
 
 #if defined(Z7_LARGE_PAGES) && defined(_WIN32) && \
     (!defined(Z7_WIN32_WINNT_MIN) || Z7_WIN32_WINNT_MIN < 0x0502)  // < Win2003 (xp-64)
@@ -171,6 +176,8 @@ void *MyAlloc(size_t size)
 {
   if (size == 0)
     return NULL;
+  if (size >= SUNPACK_LARGE_ALLOCATION && sunpack_memory_current_context())
+    return sunpack_memory_alloc(size);
   // PRINT_ALLOC("Alloc    ", g_allocCount, size, NULL)
   #ifdef SZ_ALLOC_DEBUG
   {
@@ -188,6 +195,7 @@ void *MyAlloc(size_t size)
 
 void MyFree(void *address)
 {
+  if (sunpack_memory_free(address)) return;
   PRINT_FREE("Free    ", g_allocCount, address)
   
   free(address);
@@ -200,6 +208,22 @@ void *MyRealloc(void *address, size_t size)
     MyFree(address);
     return NULL;
   }
+  #ifdef _WIN32
+  {
+    const size_t oldSize = sunpack_memory_size(address);
+    if (oldSize || (size >= SUNPACK_LARGE_ALLOCATION && sunpack_memory_current_context()))
+    {
+      void *p = MyAlloc(size);
+      if (p)
+      {
+        const size_t capacity = oldSize ? oldSize : (address ? _msize(address) : 0);
+        if (capacity) memcpy(p, address, capacity < size ? capacity : size);
+        MyFree(address);
+      }
+      return p;
+    }
+  }
+  #endif
   // PRINT_REALLOC("Realloc  ", g_allocCount, size, address)
   #ifdef SZ_ALLOC_DEBUG
   {
@@ -222,6 +246,8 @@ void *MidAlloc(size_t size)
 {
   if (size == 0)
     return NULL;
+  if (size >= SUNPACK_LARGE_ALLOCATION && sunpack_memory_current_context())
+    return sunpack_memory_alloc(size);
   #ifdef SZ_ALLOC_DEBUG
   {
     void *p = VirtualAlloc(NULL, size, MEM_COMMIT, PAGE_READWRITE);
@@ -238,6 +264,7 @@ void *MidAlloc(size_t size)
 
 void MidFree(void *address)
 {
+  if (sunpack_memory_free(address)) return;
   PRINT_FREE("Free-Mid", g_allocCountMid, address)
 
   if (!address)
@@ -268,6 +295,8 @@ void *BigAlloc(size_t size)
 {
   if (size == 0)
     return NULL;
+  if (size >= SUNPACK_LARGE_ALLOCATION && sunpack_memory_current_context())
+    return sunpack_memory_alloc(size);
 
   PRINT_ALLOC("Alloc-Big", g_allocCountBig, size, NULL)
 

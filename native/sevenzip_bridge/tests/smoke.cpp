@@ -3,7 +3,6 @@
 #include "internal/sevenzip_formats.hpp"
 #include "internal/password_probe_policy.hpp"
 #include "internal/sevenzip_status.hpp"
-#include "internal/native_memory_guard.hpp"
 #include "internal/native_cpu_budget.hpp"
 #include "internal/decoder_cpu_budget.h"
 #include "internal/native_worker_sizing.hpp"
@@ -153,19 +152,12 @@ bool check_cpu_budget_notifies_only_availability_edges() {
         return false;
     }
 
-    // Re-saturate, shrink capacity, and release while still saturated.
+    // Re-saturating and releasing produces the next availability edge.
     if (budget.acquire_up_to(2, 2) != 2) {
         return false;
     }
-    budget.set_effective_capacity(2);
     budget.release(2);
-    if (probe.calls != 1 || budget.reserved_credits() != 2) {
-        return false;
-    }
-
-    // Raising the cap from saturated to available is also one edge.
-    budget.set_effective_capacity(4);
-    if (probe.calls != 2) {
+    if (probe.calls != 2 || budget.reserved_credits() != 2) {
         return false;
     }
 
@@ -173,36 +165,9 @@ bool check_cpu_budget_notifies_only_availability_edges() {
     return probe.calls == 2 && budget.reserved_credits() == 0;
 }
 
-bool check_cpu_budget_honors_effective_capacity() {
-    using namespace sunpack::sevenzip;
-    NativeCpuBudget budget(8);
-    for (int i = 0; i < 4; ++i) {
-        if (!budget.try_acquire_base()) {
-            return false;
-        }
-    }
-    budget.set_effective_capacity(2);
-    if (budget.effective_capacity() != 2 ||
-        budget.can_acquire_base() ||
-        budget.acquire_up_to(1, 1) != 0) {
-        return false;
-    }
-    budget.release(3);
-    if (budget.reserved_credits() != 1 ||
-        !budget.can_acquire_base() ||
-        !budget.try_acquire_base()) {
-        return false;
-    }
-    budget.release(2);
-    budget.set_effective_capacity(8);
-    return budget.reserved_credits() == 0 &&
-        budget.effective_capacity() == 8;
-}
-
 bool check_cpu_budget_tracks_decoder_thread_lifetimes() {
     using namespace sunpack::sevenzip;
-    NativeCpuBudget budget(8);
-    budget.set_effective_capacity(4);
+    NativeCpuBudget budget(4);
     if (!budget.try_acquire_base() || budget.reserved_credits() != 1) {
         return false;
     }
@@ -327,85 +292,6 @@ bool check_cpu_budget_acquire_all_available() {
     return budget.reserved_credits() == 0;
 }
 
-bool check_memory_guard_reduces_below_ten_percent() {
-    using namespace sunpack::sevenzip;
-    NativeMemoryGuard guard(16);
-    if (!guard.observe(1000, 99)) {
-        return false;
-    }
-    const auto snapshot = guard.snapshot();
-    return snapshot.nominal_cpu_budget == 16 &&
-        snapshot.effective_cpu_budget == 14 &&
-        snapshot.budget_step == 2 &&
-        snapshot.total_physical_bytes == 1000 &&
-        snapshot.available_physical_bytes == 99 &&
-        snapshot.available_ratio == 0.099 &&
-        snapshot.minimum_available_ratio == 0.10 &&
-        snapshot.under_pressure;
-}
-
-bool check_memory_guard_keeps_budget_at_threshold() {
-    using namespace sunpack::sevenzip;
-    NativeMemoryGuard guard(16);
-    if (guard.observe(1000, 100)) {
-        return false;
-    }
-    const auto snapshot = guard.snapshot();
-    return snapshot.effective_cpu_budget == 16 &&
-        !snapshot.under_pressure;
-}
-
-bool check_memory_guard_reduces_and_restores_by_core_eighth() {
-    using namespace sunpack::sevenzip;
-    NativeMemoryGuard guard(32);
-
-    if (!guard.observe(1000, 50) ||
-        guard.snapshot().effective_cpu_budget != 28) {
-        return false;
-    }
-    if (!guard.observe(1000, 50) ||
-        guard.snapshot().effective_cpu_budget != 24) {
-        return false;
-    }
-    if (!guard.observe(1000, 200) ||
-        guard.snapshot().effective_cpu_budget != 28) {
-        return false;
-    }
-    if (!guard.observe(1000, 200) ||
-        guard.snapshot().effective_cpu_budget != 32) {
-        return false;
-    }
-    return !guard.observe(1000, 200) &&
-        guard.snapshot().effective_cpu_budget == 32;
-}
-
-bool check_memory_guard_never_drops_below_one() {
-    using namespace sunpack::sevenzip;
-    NativeMemoryGuard guard(4);
-    for (int i = 0; i < 16; ++i) {
-        guard.observe(1000, 1);
-    }
-    return guard.snapshot().effective_cpu_budget == 1;
-}
-
-bool check_memory_guard_custom_ratio() {
-    using namespace sunpack::sevenzip;
-    NativeMemoryGuardConfig config;
-    config.minimum_available_ratio = 0.20;
-    NativeMemoryGuard guard(8, config);
-
-    if (guard.observe(1000, 200)) {
-        return false;
-    }
-    if (!guard.observe(1000, 199)) {
-        return false;
-    }
-    const auto snapshot = guard.snapshot();
-    return snapshot.effective_cpu_budget == 7 &&
-        snapshot.minimum_available_ratio == 0.20 &&
-        snapshot.under_pressure;
-}
-
 bool check_native_sizing_tracks_logical_processors() {
     using namespace sunpack::sevenzip;
     const std::size_t cases[] = {1, 2, 4, 8, 16, 32, 64, 128};
@@ -465,10 +351,6 @@ int wmain(int argc, wchar_t** argv) {
         std::cerr << "CPU credit accounting check failed\n";
         return 23;
     }
-    if (!check_cpu_budget_honors_effective_capacity()) {
-        std::cerr << "CPU credit effective-capacity check failed\n";
-        return 22;
-    }
     if (!check_cpu_budget_notifies_only_availability_edges()) {
         std::cerr << "CPU credit availability-edge callback check failed\n";
         return 33;
@@ -484,26 +366,6 @@ int wmain(int argc, wchar_t** argv) {
     if (!check_cpu_context_exchange_propagates_and_restores()) {
         std::cerr << "CPU context exchange check failed\n";
         return 32;
-    }
-    if (!check_memory_guard_reduces_below_ten_percent()) {
-        std::cerr << "memory guard pressure threshold check failed\n";
-        return 7;
-    }
-    if (!check_memory_guard_keeps_budget_at_threshold()) {
-        std::cerr << "memory guard threshold boundary check failed\n";
-        return 26;
-    }
-    if (!check_memory_guard_reduces_and_restores_by_core_eighth()) {
-        std::cerr << "memory guard CPU eighth-step check failed\n";
-        return 18;
-    }
-    if (!check_memory_guard_never_drops_below_one()) {
-        std::cerr << "memory guard minimum budget check failed\n";
-        return 24;
-    }
-    if (!check_memory_guard_custom_ratio()) {
-        std::cerr << "memory guard custom ratio check failed\n";
-        return 25;
     }
     if (!check_native_sizing_tracks_logical_processors()) {
         std::cerr << "native sizing logical-processor check failed\n";

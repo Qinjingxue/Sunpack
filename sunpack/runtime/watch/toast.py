@@ -83,6 +83,7 @@ class _TaskProgress:
     total_bytes: int = 0
     # 该 task 因输出卷空间不足被 native 合法暂停：进度条不得推进，但提示文案必须能表达"已暂停"。
     disk_blocked: bool = False
+    memory_blocked: bool = False
     space_detail: str = ""
     # 该 task 在空间事件里出现过的真实 job_id，job 终态时从 (volume_key, episode) → job_id 集合里删除。
     space_job_ids: set[str] = field(default_factory=set)
@@ -242,6 +243,17 @@ class WatchToastCoordinator:
             request = self._requests.get(str(request_id))
             if self._closed or request is None:
                 return
+            if space_event in {"memory_blocked", "memory_resumed"}:
+                task_id = id(task)
+                if space_event == "memory_blocked":
+                    request.visible = True
+                    self._ensure_batch_locked(request.source_path)
+                    self._cancel_finalize_locked()
+                    request.tasks.setdefault(task_id, _TaskProgress(name=_task_name(task, request.source_path)))
+                if task_id in request.tasks:
+                    request.tasks[task_id].memory_blocked = space_event == "memory_blocked"
+                self._publish_progress_locked()
+                return
             if space_event in _SPACE_EVENTS:
                 self._space_progress_locked(request, task, space_event, event)
                 return
@@ -261,7 +273,7 @@ class WatchToastCoordinator:
             except (TypeError, ValueError):
                 return
             # 磁盘满暂停期间不得推进进度条（那是"等待"，不是进展）。
-            if task_progress.disk_blocked:
+            if task_progress.disk_blocked or task_progress.memory_blocked:
                 task_progress.completed_bytes = min(completed, total) if total > 0 else completed
                 task_progress.total_bytes = total
                 return
@@ -325,6 +337,7 @@ class WatchToastCoordinator:
         """job 终态时把它的 job_id 从所有 episode 集合里移除，集合空则提示消失。"""
 
         for task_progress in request.tasks.values():
+            task_progress.memory_blocked = False
             task_progress.disk_blocked = False
             task_progress.space_detail = ""
             if not task_progress.space_job_ids:
@@ -475,7 +488,13 @@ class WatchToastCoordinator:
             value_text = self.i18n.t("toast.progress.indeterminate")
         # 空间不足并入既有进度快照，不另发 publish，否则 toast 会在"进度"与"暂停"之间来回抖动。
         disk_paused = any(task.disk_blocked for task in tasks)
-        if disk_paused:
+        memory_paused = any(task.memory_blocked for task in tasks)
+        if memory_paused:
+            mode = ToastProgressMode.INDETERMINATE
+            value = 0.0
+            value_text = self.i18n.t("report.status.memory_paused")
+            progress_status = self.i18n.t("toast.progress.memory_paused")
+        elif disk_paused:
             mode = ToastProgressMode.INDETERMINATE
             value = 0.0
             value_text = self.i18n.t("report.status.disk_paused")
@@ -489,7 +508,7 @@ class WatchToastCoordinator:
         self.host.publish(ToastSnapshot(
             kind=ToastSnapshotKind.PROGRESS,
             batch_id=self._batch_id,
-            title=self.i18n.t("toast.progress.paused_title" if disk_paused else "toast.progress.title"),
+            title=self.i18n.t("toast.progress.paused_title" if disk_paused or memory_paused else "toast.progress.title"),
             body=self.i18n.t("interrupt.stopping") if batch.stopping else self.i18n.t("toast.progress.body", completed=completed_requests, total=count),
             progress_mode=mode,
             progress_value=value,

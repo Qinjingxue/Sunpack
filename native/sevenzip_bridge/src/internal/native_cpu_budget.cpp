@@ -17,7 +17,6 @@ NativeCpuBudget::NativeCpuBudget(
     CapacityAvailableCallback capacity_available,
     void *capacity_available_context) noexcept
     : nominal_capacity_((std::max)(std::size_t{1}, nominal_capacity)),
-      effective_capacity_(nominal_capacity_),
       capacity_available_(capacity_available),
       capacity_available_context_(capacity_available_context)
 {
@@ -41,12 +40,10 @@ std::size_t NativeCpuBudget::acquire_up_to(
     std::size_t reserved = reserved_credits_.load(std::memory_order_acquire);
     for (;;)
     {
-        const std::size_t effective =
-            effective_capacity_.load(std::memory_order_acquire);
-        if (reserved >= effective)
+        if (reserved >= nominal_capacity_)
             return 0;
 
-        const std::size_t available = effective - reserved;
+        const std::size_t available = nominal_capacity_ - reserved;
         const std::size_t grant = (std::min)(wanted, available);
         if (grant < minimum_grant)
             return 0;
@@ -88,31 +85,9 @@ void NativeCpuBudget::release(std::size_t count) noexcept
     // submission/baton passing already owns the wakeup chain.
     if (capacity_available_)
     {
-        const std::size_t effective =
-            effective_capacity_.load(std::memory_order_acquire);
-        if (reserved >= effective && next < effective)
+        if (reserved >= nominal_capacity_ && next < nominal_capacity_)
             capacity_available_(capacity_available_context_);
     }
-}
-
-void NativeCpuBudget::set_effective_capacity(std::size_t capacity) noexcept
-{
-    const std::size_t next =
-        (std::max)(std::size_t{1}, (std::min)(capacity, nominal_capacity_));
-    const std::size_t previous =
-        effective_capacity_.exchange(next, std::memory_order_acq_rel);
-    if (next > previous && capacity_available_)
-    {
-        const std::size_t reserved =
-            reserved_credits_.load(std::memory_order_acquire);
-        if (reserved >= previous && reserved < next)
-            capacity_available_(capacity_available_context_);
-    }
-}
-
-std::size_t NativeCpuBudget::effective_capacity() const noexcept
-{
-    return effective_capacity_.load(std::memory_order_acquire);
 }
 
 std::size_t NativeCpuBudget::reserved_credits() const noexcept
@@ -122,16 +97,7 @@ std::size_t NativeCpuBudget::reserved_credits() const noexcept
 
 bool NativeCpuBudget::can_acquire_base() const noexcept
 {
-    return reserved_credits() < effective_capacity();
-}
-
-NativeCpuBudgetSnapshot NativeCpuBudget::snapshot() const noexcept
-{
-    return {
-        nominal_capacity_,
-        effective_capacity(),
-        reserved_credits(),
-    };
+    return reserved_credits() < nominal_capacity_;
 }
 
 NativeCpuJobContext::NativeCpuJobContext(

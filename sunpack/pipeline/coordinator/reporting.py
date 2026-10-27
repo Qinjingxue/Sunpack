@@ -146,6 +146,16 @@ class RunReporter:
         if self.quiet:
             return
         name = str(event.get("event") or "")
+        if name in {"memory_blocked", "memory_resumed"}:
+            row = self._task_rows.get(id(task))
+            if row is not None:
+                row["memory_blocked"] = name == "memory_blocked"
+                row["state"] = "memory_paused" if row["memory_blocked"] else ("disk_paused" if row.get("space_blocked") else "extracting")
+                if self._interactive:
+                    self._render_panel_locked(force=True, task_id=id(task))
+                else:
+                    self._print(self.i18n.t("report." + name, name=_task_name(task)))
+            return
         if name in _SPACE_EVENTS:
             self._space_progress(task, name, event)
             return
@@ -167,7 +177,7 @@ class RunReporter:
             new_percent = int(progress * 100) if known else None
             old_state = row.get("state")
             # 磁盘满暂停期间不得把状态改回 extracting：暂停是"等待"，不是进度。
-            if row.get("space_blocked"):
+            if row.get("space_blocked") or row.get("memory_blocked"):
                 self._remember_progress_locked(row, progress, completed, total)
                 return
             row.update({
@@ -249,7 +259,7 @@ class RunReporter:
         row["total_bytes"] = total
 
     def _restore_progress_locked(self, row: dict[str, Any]) -> None:
-        row["state"] = "extracting"
+        row["state"] = "memory_paused" if row.get("memory_blocked") else "extracting"
 
     def task_finished(self, task: Any, outcome: Any, depth: int) -> None:
         with self._lock:
@@ -441,6 +451,7 @@ class RunReporter:
             "preparing": "report.status.preparing",
             "extracting": "report.status.extracting",
             "disk_paused": "report.status.disk_paused",
+            "memory_paused": "report.status.memory_paused",
             "error": "report.status.error",
             "partial": "report.status.partial",
             "complete": "report.status.complete",
@@ -451,6 +462,7 @@ class RunReporter:
             "preparing": "\033[36m",
             "extracting": "\033[36m",
             "disk_paused": "\033[33m",
+            "memory_paused": "\033[33m",
             "error": "\033[31m",
             "partial": "\033[33m",
             "complete": "\033[32m",
@@ -481,9 +493,9 @@ class RunReporter:
                 max(1, terminal_columns - 1),
             )
         available = max(0, terminal_columns - fixed_width - 1)
-        if state == "disk_paused":
+        if state in {"disk_paused", "memory_paused"}:
             # Put the recovery hint before the filename so a long name cannot hide it.
-            hint = str(row.get("detail") or "") or self.i18n.t("report.status.disk_resume_hint")
+            hint = self.i18n.t("report.status.memory_resume_hint") if state == "memory_paused" else (str(row.get("detail") or "") or self.i18n.t("report.status.disk_resume_hint"))
             suffix_text = f"{hint}  {_task_name(task)}{relation}"
         else:
             suffix_text = f"{_task_name(task)}{relation}{detail}"

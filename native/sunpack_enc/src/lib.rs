@@ -94,6 +94,7 @@ struct Keys {
 #[derive(Default)]
 pub struct Workspace {
     memory: Vec<Block>,
+    external: Option<ffi::ExternalArena>,
     kdf_threads: Option<usize>,
     #[cfg(test)]
     kdf_runs: usize,
@@ -119,7 +120,7 @@ impl Workspace {
             .map_err(|_| Error::Format)?;
         let params = header.params()?;
         let count = params.memory_blocks() as usize;
-        if count != self.memory.len() {
+        if self.external.is_none() && count != self.memory.len() {
             // The KDF, not candidate count or archive size, determines this bounded allocation.
             secure_wipe_blocks(&mut self.memory);
             self.memory.clear();
@@ -128,6 +129,12 @@ impl Workspace {
                 .map_err(|_| Error::Memory)?;
             self.memory.resize(count, Block::default());
         }
+        let callbacks = self.external.as_ref().map(|arena| arena.callbacks);
+        let memory = if let Some(arena) = &mut self.external {
+            arena.blocks(count)?
+        } else {
+            self.memory.as_mut_slice()
+        };
         let mut derived = Zeroizing::new([0u8; 256]);
         #[cfg(test)]
         {
@@ -138,10 +145,17 @@ impl Workspace {
             &*master,
             header.bytes[8..40].try_into().unwrap(),
             &mut *derived,
-            &mut self.memory,
+            memory,
             self.kdf_threads.unwrap_or(4),
+            || callbacks.is_some_and(|callbacks| callbacks.cancelled()),
         )
-        .map_err(|_| Error::Format)?;
+        .map_err(|_| {
+            if callbacks.is_some_and(|callbacks| callbacks.cancelled()) {
+                Error::Cancelled
+            } else {
+                Error::Format
+            }
+        })?;
         let (key_size, nonce_size) = header.dimensions();
         let mut keys = Keys {
             key: vec![0; key_size],
@@ -276,6 +290,23 @@ impl Decoder {
         input: &mut R,
         length: u64,
         password: &[u16],
+        acquire: impl FnMut(usize) -> usize,
+        release: impl FnMut(usize),
+    ) -> Result<Self> {
+        Self::open_with_workspace_budget(
+            input,
+            length,
+            password,
+            Workspace::default(),
+            acquire,
+            release,
+        )
+    }
+    fn open_with_workspace_budget<R: Read + Seek>(
+        input: &mut R,
+        length: u64,
+        password: &[u16],
+        mut workspace: Workspace,
         mut acquire: impl FnMut(usize) -> usize,
         mut release: impl FnMut(usize),
     ) -> Result<Self> {
@@ -298,8 +329,10 @@ impl Decoder {
                     lease.extra = usable;
                 }
             }
-            probe.keys(password, &mut Workspace::with_threads(1 + lease.extra))?
+            workspace.kdf_threads = Some(1 + lease.extra);
+            probe.keys(password, &mut workspace)?
         };
+        drop(workspace); // return large KDF memory before recovery/payload I/O
         Self::finish_open(input, length, probe, keys)
     }
     fn finish_open<R: Read + Seek>(

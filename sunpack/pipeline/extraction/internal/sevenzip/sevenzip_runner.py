@@ -145,6 +145,7 @@ def _apply_native_environment(environment: dict[str, str], process_config: dict)
 # native 侧的空间事件名（space_blocked / space_status / space_resumed），与 Python 内部状态名
 # state["space_waiting"] 刻意不同名。
 _SPACE_EVENTS = frozenset({"space_blocked", "space_status", "space_resumed"})
+_MEMORY_EVENTS = frozenset({"memory_blocked", "memory_resumed"})
 _SPACE_JOB_STATES = frozenset({"queued", "admitted", "running", "output_closed"})
 _KNOWN_JOB_EVENTS = frozenset(
     {
@@ -155,6 +156,7 @@ _KNOWN_JOB_EVENTS = frozenset(
         "extract_started",
         "result",
         *_SPACE_EVENTS,
+        *_MEMORY_EVENTS,
     }
 )
 
@@ -222,6 +224,17 @@ def _apply_native_event_to_job_state(
             if _on_space_event(state, event, payload)
             else _SPACE_STALE
         )
+    if event in _MEMORY_EVENTS:
+        episode = int(payload.get("episode_id") or 0)
+        latest = int(state.get("memory_episode") or 0)
+        if episode < latest or (episode == latest and state.get("memory_resumed_seen")):
+            return _SPACE_STALE
+        state["memory_episode"] = episode
+        state["memory_waiting"] = event == "memory_blocked"
+        state["memory_resumed_seen"] = event == "memory_resumed"
+        return _SPACE_ACCEPTED
+    if payload.get("type") == "native_memory":
+        return _SPACE_NOT_APPLICABLE
     if payload.get("type") == "progress" and event not in _KNOWN_JOB_EVENTS:
         if logger is not None:
             logger.debug("sevenzip_worker unknown progress event: %s", event)
@@ -1034,6 +1047,12 @@ class SevenZipRunner:
                     progress_events.append(value)
                     self._emit_progress(task, value)
                     return False
+                if value and value.get("type") == "native_memory":
+                    self._emit_native_event(task, value)
+                    if value.get("event") in _MEMORY_EVENTS:
+                        progress_events.append(value)
+                        self._emit_progress(task, value)
+                    return False
                 if value and value.get("type") == "native_cpu":
                     self._emit_native_event(task, value)
                     return False
@@ -1199,6 +1218,12 @@ class SevenZipRunner:
                 if payload_value and payload_value.get("type") == "progress":
                     progress_events.append(payload_value)
                     self._emit_progress(task, payload_value)
+                    return False
+                if payload_value and payload_value.get("type") == "native_memory":
+                    self._emit_native_event(task, payload_value)
+                    if payload_value.get("event") in _MEMORY_EVENTS:
+                        progress_events.append(payload_value)
+                        self._emit_progress(task, payload_value)
                     return False
                 if payload_value and payload_value.get("type") == "native_cpu":
                     self._emit_native_event(task, payload_value)

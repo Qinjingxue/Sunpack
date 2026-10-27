@@ -565,6 +565,15 @@ namespace sunpack::sevenzip
             }
 
             result.archive_type = canonical_archive_type_for_guid(format);
+            auto *job_replay = current_extraction_replay;
+            std::array<std::uint8_t, 16> handler{};
+            static_assert(sizeof(format) == handler.size());
+            std::memcpy(handler.data(), &format, sizeof(format));
+            // The SDK fallback plan can try more than one handler. Only the
+            // handler that produced the saved output may reuse its receipts.
+            ExtractionReplayScope handler_replay(job_replay &&
+                (!job_replay->initialized || job_replay->handler == handler) ? job_replay : nullptr);
+            if (current_extraction_replay && !job_replay->initialized) job_replay->handler = handler;
 
 #ifdef SUP7Z_ENABLE_PIPELINE_TIMING
             ExtractToDiskCallback *raw_extract_callback = nullptr;
@@ -574,13 +583,13 @@ namespace sunpack::sevenzip
                 archive.Interface(),
                 password,
                 output_dir,
-                std::move(progress),
+                progress,
                 dry_run,
                 &result.output_trace,
                 num_items,
-                std::move(shared_writer),
+                shared_writer,
                 job_buffer_budget,
-                std::move(cancel_token)
+                cancel_token
                 ,
                 pipeline_timing.get());
             }
@@ -589,13 +598,13 @@ namespace sunpack::sevenzip
                 archive.Interface(),
                 password,
                 output_dir,
-                std::move(progress),
+                progress,
                 dry_run,
                 &result.output_trace,
                 num_items,
-                std::move(shared_writer),
+                shared_writer,
                 job_buffer_budget,
-                std::move(cancel_token));
+                cancel_token);
 #endif
 
             raw_extract_callback->set_input_file(archive_path);
@@ -613,6 +622,23 @@ namespace sunpack::sevenzip
 
             // Extraction success must not be published before every queued write and close
             // has finished and any delayed filesystem error has been folded back in.
+            if (is_memory_hresult(hr))
+                if (auto *memory = current_native_memory_job(); memory && !memory->revoked.load())
+                    memory->owner.retry(*memory);
+            if (format.Data4[5] == kLz4FormatId) read_lz4_receipt(archive, result);
+            // Output callbacks have captured all item metadata. Release the
+            // decoder and its cached dictionaries before draining disk output
+            // or allocating a replay inventory under pressure.
+#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+            {
+                PipelinePrepareScope scope(pipeline_timing.get(), PipelinePreparePhase::ArchiveClose);
+                archive->Close();
+                archive.Release();
+            }
+#else
+            archive->Close();
+            archive.Release();
+#endif
 #ifdef SUP7Z_ENABLE_PIPELINE_TIMING
             {
                 PipelinePrepareScope scope(pipeline_timing.get(), PipelinePreparePhase::OutputFinalize);
@@ -621,8 +647,10 @@ namespace sunpack::sevenzip
 #else
             raw_extract_callback->finalize_output();
 #endif
-
-            if (format.Data4[5] == kLz4FormatId) read_lz4_receipt(archive, result);
+            // A stream receipt carries frame integrity separately from the
+            // generic per-item CRC fields populated by output finalization.
+            if (result.has_stream_receipt)
+                for (auto &item : result.output_trace.items) item.crc_verified = false;
 
             last_hr = hr;
 
@@ -665,15 +693,6 @@ namespace sunpack::sevenzip
             if (raw_extract_callback->output_error() &&
                 set_memory_failure(result, "output_write", static_cast<HRESULT>(result.output_trace.last_hresult)))
                 return result;
-
-#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
-            {
-                PipelinePrepareScope scope(pipeline_timing.get(), PipelinePreparePhase::ArchiveClose);
-                archive->Close();
-            }
-#else
-            archive->Close();
-#endif
 
             if (hr == S_OK && last_op_res == kOpOk)
             {

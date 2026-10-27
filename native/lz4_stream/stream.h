@@ -23,8 +23,13 @@ typedef ptrdiff_t (*sup_lz4_read)(void *, void *, size_t);
 typedef int (*sup_lz4_skip)(void *, uint64_t);
 typedef int (*sup_lz4_write)(void *, const void *, size_t);
 typedef int (*sup_lz4_progress)(void *, uint64_t, uint64_t);
+typedef void *(*sup_lz4_allocate)(void *, size_t);
+typedef void (*sup_lz4_free)(void *, void *);
 int sup_lz4_decode(void *opaque, sup_lz4_read read, sup_lz4_skip skip,
     sup_lz4_write write, sup_lz4_progress progress, sup_lz4_result *result);
+int sup_lz4_decode_with_memory(void *opaque, sup_lz4_read read, sup_lz4_skip skip,
+    sup_lz4_write write, sup_lz4_progress progress, sup_lz4_result *result,
+    sup_lz4_allocate allocate, sup_lz4_free release);
 #ifdef __cplusplus
 }
 #endif

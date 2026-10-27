@@ -11,6 +11,65 @@ type WriteFn = unsafe extern "C" fn(*mut c_void, *const u8, usize) -> i32;
 type ProgressFn = unsafe extern "C" fn(*mut c_void, u64) -> i32;
 type AcquireFn = unsafe extern "C" fn(*mut c_void, u32) -> u32;
 type ReleaseFn = unsafe extern "C" fn(*mut c_void, u32);
+type AllocateFn = unsafe extern "C" fn(*mut c_void, usize) -> *mut c_void;
+type FreeFn = unsafe extern "C" fn(*mut c_void, *mut c_void);
+type CancelFn = unsafe extern "C" fn(*mut c_void) -> i32;
+
+#[derive(Clone, Copy)]
+pub(crate) struct MemoryCallbacks {
+    ctx: *mut c_void,
+    allocate: AllocateFn,
+    free: FreeFn,
+    cancel: CancelFn,
+}
+impl MemoryCallbacks {
+    pub(crate) fn cancelled(self) -> bool {
+        unsafe { (self.cancel)(self.ctx) != 0 }
+    }
+}
+pub(crate) struct ExternalArena {
+    pub(crate) callbacks: MemoryCallbacks,
+    data: *mut argon2_rust::__internal::Block,
+    len: usize,
+}
+impl ExternalArena {
+    pub(crate) fn blocks(
+        &mut self,
+        len: usize,
+    ) -> crate::Result<&mut [argon2_rust::__internal::Block]> {
+        if self.len != len {
+            self.clear();
+            let size = len
+                .checked_mul(std::mem::size_of::<argon2_rust::__internal::Block>())
+                .ok_or(Error::Memory)?;
+            // Worker callback supplies zeroed, 64-byte-aligned memory. Its
+            // allocator performs admission before committing the arena.
+            self.data = unsafe { (self.callbacks.allocate)(self.callbacks.ctx, size) }.cast();
+            if self.data.is_null() {
+                return Err(Error::Memory);
+            }
+            self.len = len;
+        }
+        Ok(unsafe { std::slice::from_raw_parts_mut(self.data, self.len) })
+    }
+    fn clear(&mut self) {
+        if !self.data.is_null() {
+            unsafe {
+                argon2_rust::__internal::secure_wipe_blocks(std::slice::from_raw_parts_mut(
+                    self.data, self.len,
+                ));
+                (self.callbacks.free)(self.callbacks.ctx, self.data.cast());
+            }
+            self.data = std::ptr::null_mut();
+            self.len = 0;
+        }
+    }
+}
+impl Drop for ExternalArena {
+    fn drop(&mut self) {
+        self.clear();
+    }
+}
 struct Input {
     ctx: *mut c_void,
     read: ReadFn,
@@ -79,6 +138,9 @@ pub unsafe extern "C" fn sup_enc_open(
     output_size: *mut u64,
     acquire: AcquireFn,
     release: ReleaseFn,
+    allocate: AllocateFn,
+    free: FreeFn,
+    cancel: CancelFn,
 ) -> i32 {
     if decoder.is_null() || output_size.is_null() || (password.is_null() && password_len != 0) {
         return 4;
@@ -93,10 +155,22 @@ pub unsafe extern "C" fn sup_enc_open(
         let mut input = Input { ctx, read, seek };
         // Only the selected password reaches extraction. KDF memory is released
         // at the end of Open; the decoder retains just its small derived keys.
-        let opened = Decoder::open_with_budget(
+        let mut workspace = crate::Workspace::default();
+        workspace.external = Some(ExternalArena {
+            callbacks: MemoryCallbacks {
+                ctx,
+                allocate,
+                free,
+                cancel,
+            },
+            data: std::ptr::null_mut(),
+            len: 0,
+        });
+        let opened = Decoder::open_with_workspace_budget(
             &mut input,
             length,
             pw,
+            workspace,
             |wanted| acquire(ctx, wanted as u32) as usize,
             |count| release(ctx, count as u32),
         );

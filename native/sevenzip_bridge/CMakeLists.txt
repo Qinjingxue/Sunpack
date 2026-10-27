@@ -406,6 +406,7 @@ set(SUP7Z_INTERNAL_SOURCES
     src/internal/archive_open_plan.cpp
     src/internal/password_testing.cpp
     src/internal/native_cpu_budget.cpp
+    src/internal/native_memory.cpp
     src/internal/sevenzip_engine.cpp
     src/internal/sevenzip_formats.cpp
     src/internal/sevenzip_guid_defs.cpp
@@ -447,7 +448,7 @@ endif()
 
 if(WIN32)
     target_compile_definitions(sunpack_sevenzip_core PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
-    target_link_libraries(sunpack_sevenzip_core PUBLIC OleAut32)
+    target_link_libraries(sunpack_sevenzip_core PUBLIC OleAut32 Psapi)
     target_link_libraries(sunpack_sevenzip_core PUBLIC sunpack_enc Userenv Ws2_32 Bcrypt Ntdll AdvApi32)
 endif()
 target_link_libraries(sunpack_sevenzip_core PUBLIC sunpack_lz4 PRIVATE zlib-ng::zlibstatic)
@@ -555,7 +556,13 @@ target_include_directories(sunpack_sevenzip_writer_cost
 
 add_executable(sunpack_sevenzip_worker
     src/worker.cpp
+    src/worker_alloc.cpp
 )
+if(MSVC)
+    # Commit one coarse stack region up front. Under commit pressure Windows
+    # can otherwise fault in LdrInitializeThunk before our thread entry runs.
+    target_link_options(sunpack_sevenzip_worker PRIVATE /STACK:1048576,65536)
+endif()
 apply_release_optimizations(sunpack_sevenzip_worker)
 apply_source_charset(sunpack_sevenzip_worker)
 
@@ -625,6 +632,14 @@ if(WIN32)
 endif()
 
 enable_testing()
+add_executable(sunpack_sevenzip_memory_replay tests/memory_replay.cpp)
+apply_release_optimizations(sunpack_sevenzip_memory_replay)
+apply_source_charset(sunpack_sevenzip_memory_replay)
+target_link_libraries(sunpack_sevenzip_memory_replay PRIVATE sunpack_sevenzip_core)
+target_include_directories(sunpack_sevenzip_memory_replay PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_compile_definitions(sunpack_sevenzip_memory_replay PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+sup7z_attach_bundled_7z(sunpack_sevenzip_memory_replay)
+add_test(NAME sunpack_sevenzip_memory_replay COMMAND sunpack_sevenzip_memory_replay)
 add_test(NAME sunpack_sevenzip_smoke COMMAND sunpack_sevenzip_smoke)
 add_test(NAME sunpack_sevenzip_async_output COMMAND sunpack_sevenzip_async_output)
 add_test(NAME sunpack_sevenzip_space_gate COMMAND sunpack_sevenzip_space_gate)

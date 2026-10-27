@@ -859,7 +859,7 @@ def test_native_environment_zero_thread_capacity_uses_native_auto_capacity():
     assert "SUNPACK_NATIVE_WORKER_THREAD_CAPACITY" not in environment
 
 
-def test_native_environment_configures_memory_guard():
+def test_native_environment_configures_memory_reserve():
     environment = {}
     _apply_native_environment(
         environment,
@@ -869,6 +869,88 @@ def test_native_environment_configures_memory_guard():
     )
 
     assert environment["SUNPACK_NATIVE_MIN_AVAILABLE_MEMORY_RATIO"] == "0.1"
+
+
+def test_memory_wait_releases_execution_lanes_and_accepts_cancellation(tmp_path):
+    # Unique coverage: park every native lane, then run a small unrelated job
+    # before increasing memory. Algorithm-only tests cannot detect lane starvation
+    # or lost worker cancellation/results. Input/output stay below one MiB.
+    import queue
+    import threading
+    from sunpack.core.platform.windows.process_job import JOBOBJECT_EXTENDED_LIMIT_INFORMATION_STRUCT, _kernel32
+
+    worker = _require_worker_or_skip()
+    archive = tmp_path / "large-dictionary.blob"
+    xz = bytearray(lzma.compress(b"memory replay" * 100, filters=[{"id": lzma.FILTER_LZMA2, "dict_size": 1 << 20}]))
+    header_size = (xz[12] + 1) * 4
+    assert xz[14:16] == bytes([0x21, 1])
+    xz[16] = 28  # legal 64 MiB LZMA2 dictionary; compressed payload is unchanged
+    xz[12 + header_size - 4:12 + header_size] = struct.pack("<I", binascii.crc32(xz[12:12 + header_size - 4]))
+    archive.write_bytes(xz)
+    tiny = tmp_path / "small.zip"
+    with zipfile.ZipFile(tiny, "w") as output:
+        output.writestr("small.txt", b"small")
+    kernel = _kernel32()
+    handle = kernel.CreateJobObjectW(None, None)
+    assert handle
+    limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION_STRUCT()
+    limits.BasicLimitInformation.LimitFlags = 0x2000 | 0x200
+    def capacity(mib):
+        limits.JobMemoryLimit = mib * 1024**2
+        assert kernel.SetInformationJobObject(handle, 9, ctypes.byref(limits), ctypes.sizeof(limits))
+    capacity(48)
+    process = subprocess.Popen([worker], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               text=True, encoding="utf-8", creationflags=subprocess.CREATE_NO_WINDOW,
+                               env=os.environ | {"SUNPACK_NATIVE_WORKER_THREAD_CAPACITY": "2"})
+    events = queue.Queue()
+    seen = []
+    def read():
+        for line in process.stdout:
+            events.put(json.loads(line))
+    reader = threading.Thread(target=read, daemon=True)
+    reader.start()
+    def send(value):
+        process.stdin.write(json.dumps(value) + "\n")
+        process.stdin.flush()
+    def until(predicate):
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            event = events.get(timeout=max(.01, deadline - time.monotonic()))
+            seen.append(event)
+            if predicate(event):
+                return event
+        pytest.fail("worker resource transition did not finish")
+    try:
+        assert kernel.AssignProcessToJobObject(handle, int(process._handle))
+        for job in ("large-1", "large-2"):
+            send({"job_id": job, "archive_path": str(archive), "format_hint": "xz", "output_dir": str(tmp_path / job)})
+        until(lambda event: sum(e.get("event") == "memory_blocked" for e in seen) == 2)
+        send({"job_id": "small", "archive_path": str(tiny), "format_hint": "zip", "output_dir": str(tmp_path / "small")})
+        assert until(lambda event: event.get("job_id") == "small" and event.get("type") == "result")["status"] == "ok"
+        assert (tmp_path / "small/small.txt").read_bytes() == b"small"
+        send({"worker_command": "cancel", "job_id": "large-1"})
+        assert until(lambda event: event.get("job_id") == "large-1" and event.get("type") == "result")["native_status"] == "cancelled"
+        changed = tmp_path / "changed.blob"
+        changed.write_bytes(xz)
+        send({"job_id": "changed", "archive_path": str(changed), "format_hint": "xz", "output_dir": str(tmp_path / "changed-output")})
+        until(lambda event: event.get("job_id") == "changed" and event.get("event") == "memory_blocked")
+        # Legal XZ stream padding changes input identity while parked. Reusing
+        # receipts for a changed source must require a rescan, never report CRC damage.
+        with changed.open("ab") as output:
+            output.write(b"\0" * 4)
+        capacity(128)
+        until(lambda event: {e.get("job_id") for e in seen if e.get("type") == "result"} >= {"large-2", "changed"})
+        assert next(e for e in seen if e.get("type") == "result" and e.get("job_id") == "large-2")["status"] == "ok"
+        assert next(e for e in seen if e.get("type") == "result" and e.get("job_id") == "changed")["failure_kind"] == "input_changed"
+        assert next((tmp_path / "large-2").iterdir()).read_bytes() == b"memory replay" * 100
+        send({"worker_command": "shutdown"})
+        process.wait(timeout=10)
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            process.wait(timeout=5)
+        reader.join(timeout=5)
+        kernel.CloseHandle(handle)
 
 
 def test_native_environment_does_not_freeze_worker_process_mode_at_startup():
@@ -910,7 +992,7 @@ def test_native_worker_reports_cpu_credit_sizing_plan():
     assert handshake["sizing_mode"] == "dynamic"
     assert int(handshake["thread_capacity"]) == logical_processors
     assert int(handshake["nominal_cpu_budget"]) == logical_processors
-    assert int(handshake["memory_poll_interval_ms"]) == 1000
+    assert handshake["memory_management"] == "commitment_replay"
     assert float(handshake["minimum_available_memory_ratio"]) == 0.1
 
 

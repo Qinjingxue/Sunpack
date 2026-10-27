@@ -3,6 +3,9 @@
 #include "sevenzip_sdk.hpp"
 #include "sevenzip_bridge/enc.h"
 #include "decoder_cpu_budget.h"
+#include "native_memory.hpp"
+#include <malloc.h>
+#include <cstring>
 #include "Common/ComTry.h"
 #include "Windows/PropVariant.h"
 #include "7zip/Common/RegisterArc.h"
@@ -51,6 +54,18 @@ static void release_cpu(void *p, uint32_t count) {
     auto &c = *static_cast<Context *>(p);
     sunpack_cpu_release_extra_for_context(c.cpu_context, count);
 }
+static void *allocate_memory(void *, size_t size) {
+    if (sunpack_memory_current_context() && size >= SUNPACK_LARGE_ALLOCATION)
+        return sunpack_memory_alloc(size);
+    void *p = _aligned_malloc(size, 64);
+    if (p) std::memset(p, 0, size);
+    return p;
+}
+static void free_memory(void *, void *p) { if (!sunpack_memory_free(p)) _aligned_free(p); }
+static int cancelled(void *) {
+    auto *job = sunpack::sevenzip::current_native_memory_job();
+    return job && job->cancel->load(std::memory_order_acquire);
+}
 static ptrdiff_t read(void *p, uint8_t *dst, size_t n) {
     auto &c = *static_cast<Context *>(p); UInt32 got = 0;
     c.error = c.input->Read(dst, static_cast<UInt32>(n), &got);
@@ -83,7 +98,7 @@ Z7_COM7F_IMF(CHandler::Open(IInStream *input, const UInt64 *, IArchiveOpenCallba
     Context c{input};
     const int rc = sup_enc_open(&c, read, seek, packed,
         reinterpret_cast<const uint16_t *>(password), SysStringLen(password), &decoder, &unpacked,
-        acquire_cpu, release_cpu);
+        acquire_cpu, release_cpu, allocate_memory, free_memory, cancelled);
     SysFreeString(password);
     if (c.error != S_OK) return c.error;
     if (rc == 5) return E_OUTOFMEMORY;

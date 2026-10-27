@@ -6,13 +6,6 @@
 namespace sunpack::sevenzip
 {
 
-struct NativeCpuBudgetSnapshot
-{
-    std::size_t nominal_capacity = 1;
-    std::size_t effective_capacity = 1;
-    std::size_t reserved_credits = 0;
-};
-
 class NativeCpuBudget final
 {
 public:
@@ -30,16 +23,11 @@ public:
     std::size_t acquire_all_available() noexcept;
     void release(std::size_t count) noexcept;
 
-    void set_effective_capacity(std::size_t capacity) noexcept;
-
-    std::size_t effective_capacity() const noexcept;
     std::size_t reserved_credits() const noexcept;
     bool can_acquire_base() const noexcept;
-    NativeCpuBudgetSnapshot snapshot() const noexcept;
 
 private:
     const std::size_t nominal_capacity_;
-    std::atomic<std::size_t> effective_capacity_;
     std::atomic<std::size_t> reserved_credits_{0};
     CapacityAvailableCallback capacity_available_;
     void *capacity_available_context_;

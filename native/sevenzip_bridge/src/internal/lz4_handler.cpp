@@ -6,6 +6,7 @@
 #include "7zip/Common/RegisterArc.h"
 #include "7zip/Common/StreamUtils.h"
 #include "stream.h"
+#include "decoder_memory.h"
 #include <algorithm>
 namespace NArchive { namespace NSunpackLz4 {
 Z7_CLASS_IMP_CHandler_IInArchive_0
@@ -92,7 +93,8 @@ Z7_COM7F_IMF(CHandler::Extract(const UInt32 *indices, UInt32 count, Int32 test, 
     RINOK(callback->PrepareOperation(ask))
     RINOK(InStream_SeekToBegin(stream))
     Context c{stream, output, callback, S_OK, packed};
-    const int rc = sup_lz4_decode(&c, read, skip, write, progress, &receipt);
+    const int rc = sup_lz4_decode_with_memory(&c, read, skip, write, progress, &receipt,
+        sunpack_decoder_allocate, sunpack_decoder_free);
     decoded = true;
     output.Release();
     if (c.error != S_OK) return c.error;
@@ -120,6 +122,5 @@ void read_lz4_receipt(IInArchive *archive, ExtractArchiveResult &result) {
     result.stream_receipt = {fields[0], fields[1], fields[2], fields[3], fields[4], fields[5],
         static_cast<unsigned int>(fields[6])};
     result.stream_receipt.format = "lz4";
-    for (auto &item : result.output_trace.items) item.crc_verified = false;
 }
 }

@@ -5,6 +5,8 @@
 #include "sevenzip_volume_state.hpp"
 #include "sevenzip_writer_meters.hpp"
 #include "sevenzip_writer_probe.hpp"
+#include "extraction_replay.hpp"
+#include "decoder_memory.h"
 #ifdef SUP7Z_ENABLE_PIPELINE_TIMING
 #include "worker_pipeline_timing.hpp"
 #endif
@@ -223,6 +225,10 @@ namespace sunpack::sevenzip
             // 本文件所属卷的空间 gate，可能为 nullptr（功能关闭 / 无卷身份）。
             // 在 make_file() 时快照进来，writer 线程不再取 state_。
             VolumeSpaceGate *volume_space_gate() const noexcept { return space_gate.get(); }
+            const WrittenRanges &previous_writes() const noexcept {
+                static const WrittenRanges empty;
+                return replay ? replay->written : empty;
+            }
 
         private:
             friend class AsyncFileWriter;
@@ -255,6 +261,11 @@ namespace sunpack::sevenzip
             bool inflight_released = false;
             HANDLE handle = INVALID_HANDLE_VALUE;
             bool open_attempted = false;
+            bool new_writes = false;
+            bool output_created = false;
+            ReplayFile *replay = nullptr;
+            bool track_replay = false;
+            WrittenRanges written_ranges_;
 #ifdef SUP7Z_ENABLE_WRITER_PROBE
             UInt64 probe_expected_size = 0;
 #endif
@@ -352,11 +363,20 @@ namespace sunpack::sevenzip
 #ifdef SUP7Z_ENABLE_WRITER_PROBE
             , UInt64 expected_size = 0
 #endif
+            , ReplayFile *replay = nullptr
             )
         {
             auto file = std::make_shared<FileState>(
                 job ? job : make_job(),
                 std::move(path), std::move(item_path), item_index, trace_index, metadata);
+            file->replay = replay;
+            file->track_replay = replay || current_extraction_replay;
+            if (replay) {
+                file->written_ranges_ = replay->written;
+                file->written_bytes = replay->written.bytes();
+                file->has_mtime_ns = replay->has_mtime;
+                file->mtime_ns = replay->mtime;
+            }
             std::lock_guard<std::mutex> lock(mutex_);
 #ifdef SUP7Z_ENABLE_WRITER_PROBE
             file->probe_expected_size = expected_size;
@@ -371,6 +391,42 @@ namespace sunpack::sevenzip
                 prune_expired_files_locked();
             }
             return file;
+        }
+
+        // Seal staging before a replay crosses confirmed bytes. Those bytes
+        // advance the logical cursor without accepting another disk write.
+        HRESULT skip_written(const FileStatePtr &file, UInt32 size) {
+            std::lock_guard<std::mutex> producer_lock(file->producer_mutex);
+            std::lock_guard<std::mutex> lock(mutex_);
+            const auto error = terminal_result_locked(file->job);
+            if (error != S_OK) return error;
+            if (file->staging_buffer && file->staging_buffer->size && !enqueue_staging_locked(file, true))
+                return terminal_result_locked(file->job);
+            file->next_write_offset.fetch_add(size, std::memory_order_relaxed);
+            file->accepted_bytes.fetch_add(size, std::memory_order_relaxed);
+            return S_OK;
+        }
+
+        void capture_replay(const FileStatePtr &file, ExtractionReplay *saved = nullptr) {
+            if (!file || (!file->replay && !saved)) return;
+            std::lock_guard<std::mutex> lock(mutex_);
+            auto &receipt = saved ? saved->files[file->item_index] : *file->replay;
+            if (receipt.path.empty()) receipt.path = std::move(file->path);
+            receipt.created = receipt.created || file->output_created;
+            receipt.written = std::move(file->written_ranges_);
+            receipt.complete = receipt.complete || (file->closed && !file->failed && file->operation_result_set && file->operation_result == 0);
+            receipt.has_mtime = file->has_mtime_ns;
+            receipt.mtime = file->mtime_ns;
+        }
+
+        // Coarse reclaim of the unused pool. In-flight IOCP buffers are never
+        // touched and small pools are left alone.
+        void reclaim_idle_memory() noexcept {
+            std::lock_guard<std::mutex> lock(mutex_);
+            std::size_t bytes = 0;
+            for (const auto *buffer : free_buffers_) if (buffer->data) bytes += kBufferSize;
+            if (bytes >= (8U << 20))
+                for (auto *buffer : free_buffers_) buffer->data.reset();
         }
 
         HRESULT write(
@@ -599,6 +655,7 @@ namespace sunpack::sevenzip
                             ++file->outstanding_data;
                         }
                         file->accepted_bytes.fetch_add(chunk, std::memory_order_relaxed);
+                        file->new_writes = true;
                         account_accepted(chunk);
                         consumed += chunk;
                         if (buffer->size == kBufferSize)
@@ -1422,8 +1479,8 @@ namespace sunpack::sevenzip
                 }
                 else
                 {
+                    add_written_bytes(file, bytes, buffer->output_offset + buffer->transferred);
                     buffer->transferred += bytes;
-                    add_written_bytes(file, bytes);
                 }
             }
             if (result.kind == AttemptResult::Kind::Succeeded && buffer->transferred < buffer->size)
@@ -1544,10 +1601,12 @@ namespace sunpack::sevenzip
                 GENERIC_WRITE,
                 0,
                 nullptr,
-                CREATE_NEW,
+                file->replay && file->replay->created ? OPEN_EXISTING : CREATE_NEW,
                 creation_flags,
                 nullptr);
             const DWORD open_error = handle == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS;
+            if (handle != INVALID_HANDLE_VALUE) file->output_created = true;
+            if (handle != INVALID_HANDLE_VALUE && file->replay) file->replay->created = true;
 #ifdef SUP7Z_ENABLE_WRITER_PROBE
                 probe_open.finish();
 #endif
@@ -1632,13 +1691,17 @@ namespace sunpack::sevenzip
             }
         }
 
-        void add_written_bytes(const FileStatePtr &file, DWORD written) noexcept
+        void add_written_bytes(const FileStatePtr &file, DWORD written, UInt64 offset = 0) noexcept
         {
             account_written(written);
             std::lock_guard<std::mutex> lock(mutex_);
             if (file)
             {
                 file->written_bytes += written;
+                if (file->track_replay) {
+                    try { file->written_ranges_.add(offset, offset + written); }
+                    catch (...) { set_job_error_locked(file->job, E_OUTOFMEMORY, ERROR_OUTOFMEMORY); }
+                }
             }
         }
 
@@ -1734,7 +1797,7 @@ namespace sunpack::sevenzip
             {
                 std::lock_guard<std::mutex> lock(mutex_);
                 should_open = !file->failed && file->handle == INVALID_HANDLE_VALUE &&
-                              !file->open_attempted;
+                              !file->open_attempted && !(file->replay && file->replay->complete && !file->new_writes);
 #ifdef SUP7Z_ENABLE_WRITER_PROBE
                 if (writer_probe_memory()) should_open = false;
 #endif
