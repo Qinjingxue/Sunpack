@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import time
 import ctypes
+import asyncio
 from ctypes import wintypes
+from types import SimpleNamespace
 
 from tests.display_history import records as _records
 from concurrent.futures import ThreadPoolExecutor
@@ -218,3 +220,81 @@ def test_throttle_expiry_preserves_live_limits_and_releases_bounded_history(tmp_
     store.clear_expired_history()
     assert not store._last_throttled_write
     assert store.next_history_expiry is None
+
+
+def test_log_corruption_rebuilds_through_cli_and_writer_and_retries_after_failure(tmp_path, monkeypatch):
+    # Ordinary recovery preserves the log, so it cannot catch broken deletion,
+    # CLI routing or a writer stuck after failed recovery. One WAL-backed coarse
+    # scenario uniquely covers these contracts with a few small disk writes.
+    from sunpack.runtime.cli.cli import build_cli_parser
+    from sunpack.runtime.cli.cli_context import CliContext
+    from sunpack.runtime.cli.commands import watch
+    from sunpack.runtime.cli.runtime_host import RuntimeHost
+    from sunpack.runtime.cli import runtime_state
+    from tests.helpers.config_factory import make_config
+
+    path = tmp_path / "events.json"
+    source = tmp_path / "carrier.fake.002"
+    source.touch()
+    group = {"path": str(source), "name": "nested.rar", "members": [str(source)]}
+    state_path = str(tmp_path / "state.snapshot")
+    state = WatchStateStore(state_path)
+    state.mark(str(source), 0, 1.0, status="suspended_missing_volume", source_group=group)
+    state.close()  # Rebuild must actually load the WAL, with watch stopped.
+    assert list(tmp_path.glob("*.wal"))
+    log = WatchLogStore(str(path))
+    log.write("done", path="old-completed-history")
+    log.close()
+    path.write_text("broken manifest", encoding="utf-8")
+    folder = path.with_name(path.name + ".store")
+    (folder / "broken.index").write_bytes(b"bad")
+
+    config = make_config({"watch": {"state_dir": str(tmp_path)}})
+    host = RuntimeHost()
+    monkeypatch.setattr(runtime_state, "require_runtime_host", lambda: host)
+    monkeypatch.setattr(watch, "load_request_config", lambda _: config)
+    ctx = CliContext(language="en", cwd=str(tmp_path))
+    args = build_cli_parser(ctx).parse_args(["watch", "rebuild-log"])
+
+    async def command():
+        code, result = await watch.handle(args, ctx)
+        assert code == 0 and not result.errors
+
+    def restored():
+        rows = _records(path)
+        assert not any(row["event"] == "done" and row["path"] == "old-completed-history" for row in rows)
+        assert any(row["event"] == "suspended_missing_volume" for row in rows)
+        restored_group = next(row for row in rows if row["event"] == "pipeline_sources_claimed")["groups"][0]
+        assert {key: restored_group[key] for key in group} == group
+
+    asyncio.run(command())
+    restored()
+    assert not (folder / "broken.index").exists()
+
+    state = WatchStateStore(state_path)
+    log = WatchLogStore(str(path))
+    state._native.attach_events(log._native)
+    host._watch_service = SimpleNamespace(log=log)
+    try:
+        # Force both publication and rebuild to fail, without a retry timer.
+        log.flush()
+        path.unlink()
+        path.mkdir()
+        log.write("done", path="lost-during-storage-failure")
+        log.flush()  # Failed recovery must not escape to the business caller.
+        assert log.error
+        asyncio.run(command())  # The explicit CLI also swallows failed rebuilds.
+        path.rmdir()
+        log.write("done", path="after-storage-repair")
+        log.flush()
+        assert log.error is None
+        restored()
+        assert any(row.get("path") == "after-storage-repair" for row in _records(path))
+        # GUI-reported damage can be invisible to an already-open Rust writer.
+        path.write_text("[]", encoding="utf-8")
+        asyncio.run(command())
+        restored()
+    finally:
+        host._watch_service = None
+        state.close()
+        log.close()

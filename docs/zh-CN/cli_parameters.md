@@ -171,7 +171,7 @@ python sunpack.py inspect D:\Downloads -v
 用法：
 
 ```powershell
-python sunpack.py watch <add|remove|list|start|stop|reload|status|startup> [options]
+python sunpack.py watch <add|remove|list|start|stop|reload|rebuild-log|status|startup> [options]
 ```
 
 监控根目录保存在程序资源目录下的 `sunpack_watch_roots.txt`。格式为 `输入目录 | 输出根 | deep_detect | initial_scanned | recursive`，后四列可省略：
@@ -201,6 +201,7 @@ G:\Incoming | | true
 | `remove PATH...`, `rm PATH...` | — | 按输入目录移除监控根。 |
 | `list`, `ls` | — | 列出持久化的输入目录。 |
 | `reload` | — | 重新读取配置和监控根。 |
+| `rebuild-log` | — | 清空显示日志，从监控快照/WAL重建。已完成的历史记录会丢弃，重建错误会被忽略。 |
 | `stop` | — | 停止持续监控。 |
 | `status`, `st` | — | 显示运行状态、待处理数量、错误和根目录。 |
 | `startup enable\|disable\|status` | — | 管理当前用户登录启动项。 |

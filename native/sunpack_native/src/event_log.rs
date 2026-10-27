@@ -730,6 +730,7 @@ struct State {
     queue_bytes: usize,
     live_dirty: bool,
     reset_live: bool,
+    rebuild: bool,
     revision: u64,
     published: u64,
     stopping: bool,
@@ -739,6 +740,7 @@ struct State {
     dropped: u64,
 }
 pub(crate) struct Shared {
+    pub(crate) source: Mutex<Weak<Mutex<crate::watch_store::StateData>>>,
     state: Mutex<State>,
     wake: Wake,
     drained: Condvar,
@@ -811,7 +813,7 @@ fn writer(shared: Arc<Shared>, path: PathBuf) {
     let mut completed = 0;
     loop {
         let now = utc_us();
-        let (rows, live, days, dropped, revision) = {
+        let (rows, live, days, dropped, revision, rebuild) = {
             let mut state = shared.state.lock().unwrap();
             let due = deadline.is_some_and(|time| time <= now);
             if completed == state.revision && !due {
@@ -833,6 +835,19 @@ fn writer(shared: Arc<Shared>, path: PathBuf) {
                 continue;
             }
             state.working = true;
+            let rebuild = std::mem::take(&mut state.rebuild);
+            if rebuild {
+                // Reuse the WAL-backed state's projection without retaining its
+                // lifetime or passing its records through Python.
+                if let Some(source) = shared.source.lock().unwrap().upgrade() {
+                    state.projection = Projection::default();
+                    for mut value in NativeWatchState::event_projection(&source) {
+                        let _ = state.projection.apply(&mut value);
+                    }
+                }
+                state.live_dirty = shared.stateful;
+                state.reset_live = true;
+            }
             let live = if state.live_dirty {
                 state.live_dirty = false;
                 let reset = std::mem::take(&mut state.reset_live);
@@ -847,9 +862,14 @@ fn writer(shared: Arc<Shared>, path: PathBuf) {
                 state.retention_days,
                 state.dropped,
                 state.revision,
+                rebuild,
             )
         };
         let result = (|| -> std::io::Result<()> {
+            if rebuild {
+                store = None; // Release all handles before deleting the log.
+                store = Some(Store::rebuild(path.clone())?);
+            }
             if store.is_none() {
                 store = Some(Store::open(path.clone())?);
             }
@@ -902,6 +922,12 @@ fn writer(shared: Arc<Shared>, path: PathBuf) {
             store = None;
             state.live_dirty = true;
             state.reset_live = true;
+            state.rebuild = true;
+            // Try recovery once for this operation. A failed rebuild stays
+            // pending until the next operation, never an idle retry loop.
+            if !rebuild {
+                state.revision += 1;
+            }
         }
         state.dropped = state.dropped.saturating_sub(dropped);
         completed = revision;
@@ -947,12 +973,14 @@ impl NativeEventLog {
             owners = retired.wait(owners).unwrap();
         }
         let shared = Arc::new(Shared {
+            source: Mutex::new(Weak::new()),
             state: Mutex::new(State {
                 projection: Projection::default(),
                 queue: Vec::new(),
                 queue_bytes: 0,
                 live_dirty: stateful,
                 reset_live: stateful,
+                rebuild: false,
                 revision: 1,
                 published: 0,
                 stopping: false,
@@ -999,10 +1027,22 @@ impl NativeEventLog {
             None => self.reset(Vec::new()),
         }
     }
+    fn rebuild(&self) -> PyResult<()> {
+        let shared = self.shared()?;
+        let mut state = shared.state.lock().unwrap();
+        state.rebuild = true;
+        state.revision += 1;
+        shared.wake.notify();
+        Ok(())
+    }
     fn flush(&self, py: Python<'_>) -> PyResult<()> {
         let shared = Arc::clone(self.shared()?);
         py.detach(move || {
             let mut state = shared.state.lock().unwrap();
+            if state.error.is_some() && !state.stopping {
+                state.revision += 1;
+                shared.wake.notify();
+            }
             while state.working || state.published != state.revision {
                 state = shared.drained.wait(state).unwrap();
             }

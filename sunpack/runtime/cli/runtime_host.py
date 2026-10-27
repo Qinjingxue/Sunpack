@@ -194,6 +194,35 @@ class RuntimeHost:
         self.log_event("watch_reloaded" if reloaded else "watch_reload_skipped")
         return {"reloaded": reloaded, "running": True, "generation": self._watch_generation}
 
+    async def rebuild_watch_log(self, config: dict) -> None:
+        from sunpack.runtime.watch.log import WatchLogStore
+        from sunpack.runtime.watch.service import SERVICE_STATE, service_state_dir
+        from sunpack.runtime.watch.state import WatchStateStore
+
+        service = self._watch_service
+        if service is not None:
+            await asyncio.to_thread(service.log.rebuild)
+            return
+
+        def rebuild():
+            state_dir = Path(service_state_dir(config))
+            try:
+                log = WatchLogStore(str(state_dir / "events.json"),
+                                    retention_days=config["watch"]["event_log_retention_days"])
+                try:
+                    state = WatchStateStore(str(state_dir / SERVICE_STATE))
+                    try:
+                        state._native.attach_events(log._native)
+                        log.rebuild()
+                    finally:
+                        state.close()
+                finally:
+                    log.close()
+            except Exception:
+                pass
+
+        await asyncio.to_thread(rebuild)
+
     async def add_watch_roots(
         self,
         paths: list[str],

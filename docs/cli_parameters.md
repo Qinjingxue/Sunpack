@@ -171,7 +171,7 @@ python sunpack.py inspect D:\Downloads -v
 Usage:
 
 ```powershell
-python sunpack.py watch <add|remove|list|start|stop|reload|status|startup> [options]
+python sunpack.py watch <add|remove|list|start|stop|reload|rebuild-log|status|startup> [options]
 ```
 
 Monitored roots are stored in `sunpack_watch_roots.txt` inside the program resource directory. The format is `input directory | output root | deep_detect | initial_scanned | recursive`; the last four columns are optional:
@@ -201,6 +201,7 @@ Subcommands and options:
 | `remove PATH...`, `rm PATH...` | — | Remove a monitored root by input directory. |
 | `list`, `ls` | — | List the persisted input directories. |
 | `reload` | — | Re-read the configuration and monitored roots. |
+| `rebuild-log` | — | Clear display logs and rebuild from the watch snapshot/WAL. Completed history is discarded; recovery errors are ignored. |
 | `stop` | — | Stop continuous monitoring. |
 | `status`, `st` | — | Show run status, pending counts, errors, and root directories. |
 | `startup enable\|disable\|status` | — | Manage the current user's logon startup entry. |

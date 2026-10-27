@@ -1332,6 +1332,9 @@ int wmain(int argc,wchar_t** argv) {
     _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
     if(argc>1 && std::wstring(argv[1])==L"--fake-cli") {
         Json args=Json::array(); for(int i=3;i<argc;++i) args.push_back(utf8(argv[i])); atomic_write(fs::current_path()/"cli-arguments.json",args.dump());
+        if(args==Json::array({"watch","rebuild-log"}))
+            publish_events(fs::current_path()/".sunpack_watch"/"events.json",
+                Json{{"event","done"},{"path",utf8((fs::current_path()/"carrier.001").wstring())}}.dump()+"\n");
         Handle gate(OpenEventW(SYNCHRONIZE,FALSE,argv[2])); assert(gate.value);
         assert(WaitForSingleObject(gate,10000)==WAIT_OBJECT_0);
         std::cout<<args.dump(); return 0;
@@ -1363,6 +1366,24 @@ int wmain(int argc,wchar_t** argv) {
             pump_diagnostic(app,[&]{return state(app.page(),"ready")==true;},"Initial snapshot");
             assert(IsWindowVisible(static_cast<HWND>(ui_window_hwnd(app.window()))));
             assert(state(app.page(),"errors").empty() && state(app.page(),"actionError")=="");
+            if(!rangesOnly) {
+                // Valid projection tests miss the error-to-CLI bridge. Reuse
+                // this window for manifest and page-data corruption; without
+                // these checks neither read failure is covered end to end.
+                auto log_path=dir/".sunpack_watch"/"events.json", cli_args=dir/"cli-arguments.json";
+                auto await_rebuild=[&] {
+                    pump_diagnostic(app,[&]{return fs::exists(cli_args) && read_json(cli_args)==Json::array({"watch","rebuild-log"}) &&
+                        state(app.page(),"errors").empty();},"Log recovery command and refreshed tasks");
+                    assert(state(app.page(),"tasks")["rows"][0]["name"]=="carrier.001");
+                    fs::remove(cli_args);
+                };
+                atomic_write(log_path,"{"); await_rebuild();
+                auto manifest=read_json(log_path);
+                auto run=manifest["runs"][0]["name"].get<std::string>();
+                atomic_write(log_path.parent_path()/"events.json.store"/(run+".data"),"bad");
+                manifest["task_revision"]=manifest["task_revision"].get<uint64_t>()+1;
+                atomic_write(log_path,manifest.dump()); await_rebuild();
+            }
             screenshot(app,L"startup.png");
                 page_motion(app);
             if(!rangesOnly) task_card_details(app);

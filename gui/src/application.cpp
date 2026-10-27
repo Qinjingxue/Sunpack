@@ -1071,39 +1071,36 @@ void Application::work() {
                 } catch(const std::exception& e) { errors["logObserver"]=e.what(); }
                 log.set_path(log_dir/"events.json"); flags|=Log; tasks_changed=true;
             }
+            bool rebuild_log=false;
             if(flags&Log) {
                 try {
-                    bool refreshed=log.refresh(retries.count(Log) && retries.at(Log).attempts>=3);
+                    bool refreshed=log.refresh();
                     tasks_changed|=refreshed || task_query_pending;
                     errors.erase("events.json");
-                    if(!task_query_pending) retries.erase(Log);
                 }
-                catch(const WinError& e){
-                    const bool transient=e.code==ERROR_SHARING_VIOLATION || e.code==ERROR_LOCK_VIOLATION || e.code==ERROR_FILE_NOT_FOUND || e.code==ERROR_PATH_NOT_FOUND;
-                    if(transient) errors.erase("events.json"); else errors["events.json"]=e.what();
-                    tasks_changed=true; retry_io(Log,e);
-                }
-                catch(const std::exception& e){ errors["events.json"]=e.what(); tasks_changed=true; }
+                catch(const std::exception& e){ errors["events.json"]=e.what(); rebuild_log=true; }
             }
             Json patch=Json::object();
             auto next_language=gui_language(config);
             bool language_changed=language!=next_language || !previous_patch.contains("language");
             language=std::move(next_language);
             if(language_changed) { patch["language"]=language; patch["texts"]=interface_texts(language); }
-            if(tasks_changed || language_changed || !previous_patch.contains("tasks")) {
+            if(!rebuild_log && (tasks_changed || language_changed || !previous_patch.contains("tasks"))) {
                 log.cancelled=[this,query_generation]{return task_query_generation_.load()!=query_generation || WaitForSingleObject(stop_,0)==WAIT_OBJECT_0;};
                 try {
                     auto projected=task_rows(log,roots,view,language);
-                    if(!projected.is_null()) { patch["tasks"]=std::move(projected); task_query_pending=false; retries.erase(Log); }
+                    if(!projected.is_null()) { patch["tasks"]=std::move(projected); task_query_pending=false; }
                     errors.erase("events.json");
-                } catch(const WinError& e) {
-                    task_query_pending=true;
-                    const bool transient=e.code==ERROR_SHARING_VIOLATION || e.code==ERROR_LOCK_VIOLATION || e.code==ERROR_FILE_NOT_FOUND || e.code==ERROR_PATH_NOT_FOUND;
-                    if(transient) errors.erase("events.json"); else errors["events.json"]=e.what();
-                    retry_io(Log,e);
-                }
-                  catch(const std::exception& e) { task_query_pending=true; errors["events.json"]=e.what(); }
+                } catch(const std::exception& e) { errors["events.json"]=e.what(); rebuild_log=true; }
                 log.cancelled={};
+            }
+            if(rebuild_log) {
+                task_query_pending=true;
+                view.task_cursor.clear();
+                log.manifest=Json(); log.tasks.clear();
+                try {
+                    if(options_.allow_cli) run_cli(options_.cli,{L"watch",L"rebuild-log"},stop_);
+                } catch(...) {} // A later log operation can request recovery again.
             }
             if(passwords_changed || language_changed || !previous_patch.contains("passwords")) {
                 if(!password_delta.is_null() && !language_changed && previous_patch.contains("passwords"))

@@ -89,7 +89,7 @@ def test_command_help_exposes_public_options(subtests, capsys):
              "--direct-file", "--process-mode"),
             ("--color", "--worker-profile", "--min-size", "--write-manifest", "--manifest"),
         ),
-        "watch": (("add", "start", "list", "startup"), ("--process-mode",)),
+        "watch": (("add", "start", "list", "startup", "rebuild-log"), ("--process-mode",)),
         "passwords": (
             ("--json", "--password"),
             ("--clipboard-pw", "--quiet", "--verbose", "--pause"),

@@ -389,7 +389,10 @@ impl NativeWatchState {
         // state mutation + notifications. The data-map lock still ends before
         // projection serialization, and no disk I/O is covered by this gate.
         let _publication = self.events.lock().unwrap();
-        let data = self.lock();
+        publish(Self::event_projection(&self.data))
+    }
+    pub(crate) fn event_projection(data: &Mutex<StateData>) -> Vec<Value> {
+        let data = data.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut rows = Vec::new();
         let mut member_presence = HashMap::new();
         let mut entries: Vec<_> = data.entries.values().collect();
@@ -405,10 +408,7 @@ impl NativeWatchState {
             ) {
                 continue;
             }
-            if let Some(group) = record
-                .failure_payload
-                .get("source_group")
-            {
+            if let Some(group) = record.failure_payload.get("source_group") {
                 // A member can disappear after its blocker WAL commit (even
                 // while offline). Verify only recorded member presence; never
                 // probe or rediscover an archive for the GUI projection.
@@ -430,7 +430,7 @@ impl NativeWatchState {
             rows.push(entry_event(record));
         }
         drop(data);
-        publish(rows)
+        rows
     }
     pub(crate) fn lock(&self) -> MutexGuard<'_, StateData> {
         self.data
@@ -454,9 +454,7 @@ impl NativeWatchState {
                     continue;
                 }
                 if let Some(record) = removed {
-                    let group = record
-                        .failure_payload
-                        .get("source_group");
+                    let group = record.failure_payload.get("source_group");
                     let remaining = group
                         .and_then(|g| g["members"].as_array())
                         .into_iter()
@@ -553,6 +551,7 @@ impl NativeWatchState {
 
     fn attach_events(&self, log: PyRef<'_, crate::event_log::NativeEventLog>) -> PyResult<()> {
         *self.events.lock().unwrap() = Some(Arc::downgrade(log.shared()?));
+        *log.shared()?.source.lock().unwrap() = Arc::downgrade(&self.data);
         Ok(())
     }
 

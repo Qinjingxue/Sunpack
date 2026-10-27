@@ -26,7 +26,7 @@ def register(subparsers, ctx):
         aliases=COMMAND_ALIASES[COMMAND],
         parents=[common],
         help=ctx.t("cli.watch.help"),
-        usage="sunpack watch <add|remove|list|start|stop|reload|status|startup> [options]",
+        usage="sunpack watch <add|remove|list|start|stop|reload|rebuild-log|status|startup> [options]",
         formatter_class=CliHelpFormatter,
     )
     parser.set_defaults(command=COMMAND)
@@ -51,6 +51,7 @@ def register(subparsers, ctx):
     list_parser = actions.add_parser("list", aliases=["ls"], parents=[common], help=ctx.t("cli.watch.list"), formatter_class=CliHelpFormatter)
     list_parser.set_defaults(watch_action="list")
     actions.add_parser("reload", parents=[common], help=ctx.t("cli.watch.reload"), formatter_class=CliHelpFormatter)
+    actions.add_parser("rebuild-log", parents=[common], help=ctx.t("cli.watch.rebuild_log"), formatter_class=CliHelpFormatter)
     actions.add_parser("stop", parents=[common], help=ctx.t("cli.watch.stop"), formatter_class=CliHelpFormatter)
     status_parser = actions.add_parser("status", aliases=["st"], parents=[common], help=ctx.t("cli.watch.status"), formatter_class=CliHelpFormatter)
     status_parser.set_defaults(watch_action="status")
@@ -72,6 +73,11 @@ async def handle(args, ctx):
             return _handle_list()
         if action == "reload":
             return await _handle_reload(ctx)
+        if action == "rebuild-log":
+            from sunpack.runtime.cli.runtime_state import require_runtime_host
+
+            await require_runtime_host().rebuild_watch_log(load_request_config(ctx.cwd))
+            return 0, CliCommandResult(command=COMMAND, inputs={"action": action}, summary={})
         if action == "stop":
             return await _handle_stop(ctx)
         if action == "status":

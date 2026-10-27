@@ -280,6 +280,20 @@ fn kind(value: &Value) -> u32 {
     }
 }
 impl Store {
+    pub(crate) fn rebuild(path: PathBuf) -> io::Result<Self> {
+        let folder = path.with_file_name(format!(
+            "{}.store",
+            path.file_name().unwrap().to_string_lossy()
+        ));
+        for result in [fs::remove_file(&path), fs::remove_dir_all(&folder)] {
+            if let Err(error) = result {
+                if error.kind() != io::ErrorKind::NotFound {
+                    return Err(error);
+                }
+            }
+        }
+        Self::open(path)
+    }
     pub(crate) fn open(path: PathBuf) -> io::Result<Self> {
         let folder = path.with_file_name(format!(
             "{}.store",

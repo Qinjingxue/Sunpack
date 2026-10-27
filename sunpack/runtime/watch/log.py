@@ -48,14 +48,32 @@ class WatchLogStore:
         )
 
     def configure_retention(self, days: int) -> None:
-        self._native.configure_retention(max(1, int(days)))
+        try:
+            self._native.configure_retention(max(1, int(days)))
+        except Exception:
+            self.rebuild()
 
     def recover(self, state=None) -> None:
-        self._native.recover(state)
+        try:
+            self._native.recover(state)
+        except Exception:
+            self.rebuild()
 
     def flush(self) -> None:
         """Explicit drain for shutdown/tests; ordinary write never waits for I/O."""
-        self._native.flush()
+        try:
+            self._native.flush()
+        except Exception:
+            # The Rust writer already requested a rebuild. A failed recovery
+            # must not break the task; the next log operation tries again.
+            pass
+
+    def rebuild(self) -> None:
+        try:
+            self._native.rebuild()
+            self.flush()
+        except Exception:
+            pass
 
     @property
     def error(self) -> str | None:
@@ -73,7 +91,10 @@ class WatchLogStore:
             "event": event,
             **payload,
         }
-        self._native.write(record)
+        try:
+            self._native.write(record)
+        except Exception:
+            self.rebuild()
 
     def write_throttled(
         self,
