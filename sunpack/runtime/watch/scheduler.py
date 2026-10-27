@@ -180,25 +180,28 @@ class WatchScheduler:
                                   if (directory := _nearest_existing_directory(root)) is not None])
         expanded_out_dir = os.path.expanduser(out_dir)
         self.out_dir = os.path.normpath(expanded_out_dir) if not os.path.isabs(expanded_out_dir) else os.path.abspath(expanded_out_dir)
-        # Every watch root has exactly one absolute output root, resolved here so no request path
-        # ever chooses between a per-root and a global output directory.  out_dir only supplies the
-        # roots the caller did not enumerate, and stays relative to its own input root.
+        # Explicit per-root output roots are resolved here.  A missing mapping means that the
+        # pipeline should use its normal default beside the archive.
         self.output_roots = {
             path_key(os.path.abspath(str(root))): os.path.abspath(os.path.expanduser(str(output)))
             for root, output in (output_roots or {}).items()
             if str(output or "").strip()
         }
-        for root in self.watch_roots:
-            self.output_roots.setdefault(
-                path_key(root),
-                os.path.abspath(os.path.join(root, self.out_dir)) if not os.path.isabs(expanded_out_dir) else self.out_dir,
-            )
+        # Keep the direct constructor's historical fallback for callers that do not provide
+        # root policies.  WatchService always supplies root_entries, where an empty output is
+        # intentionally preserved as the archive-folder default.
+        if root_entries is None:
+            for root in self.watch_roots:
+                self.output_roots.setdefault(
+                    path_key(root),
+                    os.path.abspath(os.path.join(root, self.out_dir)) if not os.path.isabs(expanded_out_dir) else self.out_dir,
+                )
         self._validate_output_roots()
         configured_entries = {path_key(entry.input_root): entry for entry in root_entries or ()}
         self.root_entries = {
             path_key(root): WatchRootEntry(
                 root,
-                self.output_roots[path_key(root)],
+                self.output_roots.get(path_key(root)),
                 configured_entries[path_key(root)].deep_detect if path_key(root) in configured_entries else False,
                 recursive=configured_entries[path_key(root)].recursive if path_key(root) in configured_entries else False,
             )
@@ -335,6 +338,7 @@ class WatchScheduler:
         resolved = [
             (root, self.output_roots[path_key(root)])
             for root in self.watch_roots
+            if path_key(root) in self.output_roots
         ]
         for index, (first_root, first_output) in enumerate(resolved):
             for second_root, second_output in resolved[index + 1:]:
@@ -2052,7 +2056,7 @@ class WatchScheduler:
         nested_recovery = internal_scope is not None and path_key(internal_scope.root) != path_key(source_input_root)
         run_config["output"] = {
             **(run_config.get("output", {}) if isinstance(run_config.get("output"), dict) else {}),
-            "root": "" if nested_recovery else output_root,
+            "root": "" if nested_recovery or not output_root else output_root,
             "common_root": "" if nested_recovery else self._common_root_for(candidate.path),
             "fixed_root": not nested_recovery,
         }
@@ -2559,11 +2563,11 @@ class WatchScheduler:
             return os.path.dirname(matched)
         return os.path.dirname(path)
 
-    def _output_root_for(self, path: str) -> str:
+    def _output_root_for(self, path: str) -> str | None:
         normalized = os.path.abspath(path)
         matched_root = _longest_matching_root(normalized, self.watch_roots)
         if matched_root is not None:
-            return self.output_roots[path_key(matched_root)]
+            return self.output_roots.get(path_key(matched_root))
         return self._common_root_for(path)
 
     def _is_under_watched_root(self, path: str) -> bool:

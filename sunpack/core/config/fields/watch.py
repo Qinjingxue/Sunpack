@@ -26,7 +26,6 @@ def normalize_watch_config(value: Any) -> dict[str, Any]:
         0.0,
         _float_field(config, "boundary_confirmation_seconds"),
     )
-    config["max_folders"] = max(1, _int_field(config, "max_folders"))
     config["runtime_cache_cleanup_enabled"] = require_boolean(
         config["runtime_cache_cleanup_enabled"],
         "watch.runtime_cache_cleanup_enabled",
@@ -41,13 +40,6 @@ def normalize_watch_config(value: Any) -> dict[str, Any]:
         "watch.clipboard_monitor_enabled",
     )
     config["clipboard_builtin_max_entries"] = max(1, _int_field(config, "clipboard_builtin_max_entries"))
-    roots = config["roots"]
-    if roots is None:
-        roots = []
-    if not isinstance(roots, list):
-        raise ValueError("watch.roots must be a list")
-    config["roots"] = [str(item) for item in roots if str(item or "").strip()]
-    config["enabled"] = require_boolean(config["enabled"], "watch.enabled")
     config["out_dir"] = str(config["out_dir"])
     config["tray_enabled"] = require_boolean(config["tray_enabled"], "watch.tray_enabled")
     config["toast_enabled"] = require_boolean(config["toast_enabled"], "watch.toast_enabled")

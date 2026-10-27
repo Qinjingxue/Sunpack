@@ -67,9 +67,8 @@ def _release_watch_broker() -> None:
 
 def service_config_from(config: dict) -> dict:
     service = config["watch"]
-    default_output_root = str(service.get("out_dir") or ".")
     result = dict(service)
-    result["root_entries"] = list(_iter_watch_root_entries(default_output_root, None))
+    result["root_entries"] = list(_iter_watch_root_entries("", None))
     return result
 
 
@@ -127,7 +126,6 @@ def _config_without_tray(config: dict) -> dict:
     watch = result.get("watch")
     if isinstance(watch, dict):
         watch.pop("tray_enabled", None)
-        watch.pop("roots", None)
     runtime = result.get("runtime")
     if isinstance(runtime, dict):
         runtime.pop("process_mode", None)
@@ -137,7 +135,6 @@ def _config_without_tray(config: dict) -> dict:
 def _service_config_without_tray(service_config: dict) -> dict:
     result = dict(service_config)
     result.pop("tray_enabled", None)
-    result.pop("roots", None)
     result["root_entries"] = dict(_root_policy(entry) for entry in result["root_entries"])
     return result
 
@@ -238,15 +235,15 @@ def _read_watch_root_entries(path: Path | None = None) -> list[WatchRootEntry]:
     return entries
 
 
-def _iter_watch_root_entries(default_output_root: str, path: Path | None):
-    """Yield input policies with resolved absolute output paths, in file order.
+def _iter_watch_root_entries(_default_output_root: str, path: Path | None):
+    """Yield input policies with explicit output paths resolved in file order.
 
-    A line without an explicit output keeps the configured ``watch.out_dir``.  Relative output
-    roots are resolved against their own input root, never against the process working directory.
+    An empty output column is meaningful: it leaves output routing to the pipeline, which
+    places the result beside the archive.  Relative explicit output roots are resolved against
+    their own input root, never against the process working directory.
     """
     for entry in _read_watch_root_entries(path):
-        output_root = entry.output_root or _resolve_watch_output_root(entry.input_root, default_output_root)
-        yield replace(entry, output_root=output_root)
+        yield entry
 
 
 def read_watch_root_outputs(
@@ -261,6 +258,7 @@ def read_watch_root_outputs(
     return {
         path_key(entry.input_root): entry.output_root
         for entry in _iter_watch_root_entries(default_output_root, path)
+        if entry.output_root
     }
 
 
@@ -432,7 +430,11 @@ class WatchService:
     def root_outputs(self) -> dict[str, str]:
         """Output root of every existing watch root, keyed by the input root."""
         roots = {path_key(root) for root in self.roots}
-        return {path_key(entry.input_root): entry.output_root for entry in self.service_config["root_entries"] if path_key(entry.input_root) in roots}
+        return {
+            path_key(entry.input_root): entry.output_root
+            for entry in self.service_config["root_entries"]
+            if path_key(entry.input_root) in roots and entry.output_root
+        }
 
     async def run(
         self,
@@ -1032,15 +1034,13 @@ class WatchService:
             return
         completed_keys = {path_key(root) for root in completed}
         roots_path = watch_roots_path()
-        default_output = str(self.service_config.get("out_dir") or ".")
         with _watch_roots_mutex(roots_path):
             entries = _read_watch_root_entries(path=roots_path)
             updated = []
             marked = set()
             for entry in entries:
                 key = path_key(entry.input_root)
-                effective = replace(entry, output_root=entry.output_root or _resolve_watch_output_root(entry.input_root, default_output))
-                if key in completed_keys and key in pending and _root_policy(effective) == _root_policy(pending[key]):
+                if key in completed_keys and key in pending and _root_policy(entry) == _root_policy(pending[key]):
                     marked.add(key)
                     entry = replace(entry, initial_scanned=True)
                 updated.append(entry)

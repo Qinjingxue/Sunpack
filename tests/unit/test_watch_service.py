@@ -621,7 +621,7 @@ def test_adding_and_removing_root_preserves_other_output_mappings(tmp_path, monk
     ]
 
 
-def test_input_only_line_keeps_the_configured_out_dir(tmp_path, monkeypatch):
+def test_input_only_line_leaves_output_unset_for_archive_folder_default(tmp_path, monkeypatch):
     roots_path = tmp_path / "sunpack_watch_roots.txt"
     watch_root = tmp_path / "downloads"
     watch_root.mkdir()
@@ -630,13 +630,9 @@ def test_input_only_line_keeps_the_configured_out_dir(tmp_path, monkeypatch):
 
     key = service_module.path_key(str(watch_root.resolve()))
 
-    # The default configured output root is "." -> output beside the input.
-    assert service_module.read_watch_root_outputs() == {key: str(watch_root.resolve())}
-    # An explicit configured output still applies to input-only lines.
-    assert service_module.read_watch_root_outputs("D:\\Unpacked") == {key: "D:\\Unpacked"}
-    assert service_module.read_watch_root_outputs("extracted") == {
-        key: str((watch_root / "extracted").resolve())
-    }
+    assert service_module.read_watch_root_outputs() == {}
+    assert service_module.read_watch_root_outputs("D:\\Unpacked") == {}
+    assert service_module.read_watch_root_outputs("extracted") == {}
 
 
 @pytest.mark.parametrize("columns, enabled", [
@@ -652,8 +648,8 @@ def test_watch_root_deep_column_is_optional(tmp_path, columns, enabled):
 
     assert entry.input_root == str(root)
     assert entry.deep_detect is enabled
-    expected_output = "out" if "out" in columns else "default-out"
-    assert entry.output_root == str(root / expected_output)
+    expected_output = str(root / "out") if "out" in columns else None
+    assert entry.output_root == expected_output
 
 
 @pytest.mark.parametrize("columns", [" | out | yes", " | out | true | extra"])
@@ -747,6 +743,37 @@ def test_watch_service_scheduler_receives_root_outputs(tmp_path, monkeypatch):
     assert captured["kwargs"]["output_roots"] == {
         service_module.path_key(str(watch_root.resolve())): "D:\\Extracted"
     }
+
+
+def test_watch_service_leaves_empty_root_output_for_pipeline_default(tmp_path, monkeypatch):
+    roots_path = tmp_path / "sunpack_watch_roots.txt"
+    watch_root = tmp_path / "downloads"
+    watch_root.mkdir()
+    roots_path.write_text(f"{watch_root}\n", encoding="utf-8")
+    state_dir = tmp_path / ".sunpack_watch"
+    captured = {}
+
+    class FakeScheduler(_SchedulerLifecycle):
+        def __init__(self, config, roots, **kwargs):
+            captured["roots"] = roots
+            captured["kwargs"] = kwargs
+
+    monkeypatch.setattr(service_module, "watch_roots_path", lambda: roots_path)
+    monkeypatch.setattr(
+        service_module,
+        "load_config",
+        lambda: make_config({"watch": {"state_dir": str(state_dir), "out_dir": "D:\\Legacy", "tray_enabled": False}}),
+    )
+    monkeypatch.setattr(service_module, "WatchScheduler", FakeScheduler)
+
+    service = WatchService(engine_factory=lambda _config: FakePipelineEngine(FakeRunner))
+    _await(service._start_scheduler())
+
+    assert captured["roots"] == [str(watch_root.resolve())]
+    assert captured["kwargs"]["output_roots"] == {}
+    assert captured["kwargs"]["root_entries"] == [
+        service_module.WatchRootEntry(str(watch_root.resolve()), None)
+    ]
 
 
 def test_output_registration_and_state_admission_do_not_deadlock(tmp_path, monkeypatch):

@@ -183,7 +183,7 @@ F:\Incoming | . | true
 G:\Incoming | | true
 ```
 
-When only the input directory is given, `watch.out_dir` is used; a relative output path is resolved against that input directory and persisted as an absolute path. The output root may be on a different drive. `watch` only observes the direct files of each root and does not recursively watch subdirectories; the input root must be on an NTFS volume with a readable USN Journal.
+When only the input directory is given, the output column remains empty and extraction writes beside each archive. With `--out-dir`, a relative output path is resolved against that input directory and persisted as an absolute path. The output root may be on a different drive. `watch` only observes the direct files of each root and does not recursively watch subdirectories; the input root must be on an NTFS volume with a readable USN Journal.
 
 `deep_detect` accepts `true` or `false`; an omitted or empty value defaults to `false`. This mode belongs to the input directory. Different input roots may share an output root and use different modes. Nested extraction, password retries, and crash recovery retain the original input root and use its configured mode. Deep mode disables all filesystem scan filters for that root's requests. Editing the column triggers configuration reload; `watch reload` also applies it.
 

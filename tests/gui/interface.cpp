@@ -528,7 +528,7 @@ void localized_config_search(Application& app) {
         auto fields=state(app.page(),"fields"),texts=state(app.page(),"texts");
         for(auto& f:fields) {
             if(f["id"]=="/runtime/process_mode") matches(f["options"][0]["label"],f["id"]);
-            if(f["id"]=="/watch/enabled") matches(f["description"],f["id"]);
+            if(f["id"]=="/watch/event_log_retention_days") matches(f["description"],f["id"]);
             if(f["id"]=="/watch/state_dir") matches(f["text"],f["id"]);
             if(f["editor"]=="datetime_range") matches(texts["rangeEnd"],f["id"]);
             if(f["editor"]=="size_range") matches("GiB",f["id"]);
@@ -1339,6 +1339,7 @@ int wmain(int argc,wchar_t** argv) {
     }
     const bool rangesOnly=argc==2 && std::wstring(argv[1])==L"--ranges";
     const bool acceptance=argc==2 && std::wstring(argv[1])==L"--acceptance";
+    const auto expected_fields=config_fields(parse_json(kUiDefaultsJson),kUiDefaultsJson).size();
     CoInitializeEx(nullptr,COINIT_APARTMENTTHREADED);
     auto dir=fs::temp_directory_path()/(L"sunpack-gui-ui-"+std::to_wstring(GetCurrentProcessId())); fs::create_directory(dir);
     auto gate_name=L"Local\\SunPack.GUI.TestCommand."+std::to_wstring(GetCurrentProcessId());
@@ -1367,7 +1368,7 @@ int wmain(int argc,wchar_t** argv) {
                 page_motion(app);
             if(!rangesOnly) task_card_details(app);
             if(rangesOnly || acceptance) {
-                pump_diagnostic(app,[&]{return state(app.page(),"fields").size()>100;},"Configuration fields loaded");
+                pump_diagnostic(app,[&]{return state(app.page(),"fields").size()==expected_fields;},"Configuration fields loaded");
                 click(app,"tabConfig"); pump([&]{return state(app.page(),"tab")=="config";});
                 if(acceptance) {
                     settle_motion(app);
@@ -1817,7 +1818,7 @@ int wmain(int argc,wchar_t** argv) {
             assert(state(app.page(),"rootCell")=="");
             assert(state(app.page(),"rootRows").size()==3 && state(app.page(),"rootDrafts").empty());
             for(auto& entry:read_roots(dir/"sunpack_watch_roots.txt").entries)
-                if(entry.input==pending_root || entry.input==pending_second) assert(entry.output==utf8(entry.input.wstring()));
+                if(entry.input==pending_root || entry.input==pending_second) assert(entry.output.empty());
             assert(read_file(dir/"sunpack_watch_roots.txt")!=disk_roots);
             auto first_root_id=root_row_id(app,pending_root),second_root_id=root_row_id(app,pending_second);
             edit_root_cell(app,first_root_id,"output",L"");
@@ -2113,7 +2114,7 @@ int wmain(int argc,wchar_t** argv) {
             // Exercise an ordinary config containing all advanced settings.
             auto complete=parse_json(kUiDefaultsJson); complete["watch"]["state_dir"]="elsewhere";
             atomic_write(dir/"sunpack_config.json",complete.dump());
-            pump([&]{return state(app.page(),"fields").size()>100;});
+            pump([&]{return state(app.page(),"fields").size()==expected_fields;});
             std::cerr<<"Advanced configuration loaded\n";
             ui_page_set_json(app.page(),"drafts","{}");
             click(app,"tabConfig"); pump([&]{return state(app.page(),"tab")=="config";});
@@ -2341,20 +2342,20 @@ int wmain(int argc,wchar_t** argv) {
             }
             assert(history_matches==1 && state(app.page(),"passwordDrafts").empty());
             click(app,"tabConfig"); pump([&]{return state(app.page(),"tab")=="config";});
-            search_setting(app,"/watch/max_folders");
-            auto invalid_input=ui_widget_find_by_id(ui_page_root(app.page()),"input-/watch/max_folders"); assert(invalid_input);
+            search_setting(app,"/watch/clipboard_builtin_max_entries");
+            auto invalid_input=ui_widget_find_by_id(ui_page_root(app.page()),"input-/watch/clipboard_builtin_max_entries"); assert(invalid_input);
             ui_text_input_set_text(invalid_input,L""); ui_widget_destroy(invalid_input);
-            click(app,"input-/watch/max_folders"); ui_debug_type_text(app.window(),L"0");
+            click(app,"input-/watch/clipboard_builtin_max_entries"); ui_debug_type_text(app.window(),L"0");
             assert(ui_debug_key(app.window(),VK_RETURN)==0);
-            pump([&]{return state(app.page(),"saveErrors").contains("/watch/max_folders") && !state(app.page(),"saving").get<bool>();});
-            assert(read_json(dir/"sunpack_config.json")["watch"]["max_folders"]==16);
+            pump([&]{return state(app.page(),"saveErrors").contains("/watch/clipboard_builtin_max_entries") && !state(app.page(),"saving").get<bool>();});
+            assert(read_json(dir/"sunpack_config.json")["watch"]["clipboard_builtin_max_entries"]==30);
             search_setting(app,"/watch/out_dir");
             auto independent=ui_widget_find_by_id(ui_page_root(app.page()),"input-/watch/out_dir"); assert(independent);
             ui_text_input_set_text(independent,L""); ui_widget_destroy(independent);
             click(app,"input-/watch/out_dir"); ui_debug_type_text(app.window(),L"independent");
             assert(ui_debug_key(app.window(),VK_RETURN)==0);
             pump([&]{return read_json(dir/"sunpack_config.json")["watch"]["out_dir"]=="independent" && !state(app.page(),"saving").get<bool>();});
-            assert(state(app.page(),"saveErrors").contains("/watch/max_folders"));
+            assert(state(app.page(),"saveErrors").contains("/watch/clipboard_builtin_max_entries"));
             search_setting(app,"mtime_range");
             std::string closingDate;
             for(auto& f:state(app.page(),"fields")) if(f["module"]=="mtime_range" && f["type"]=="object") closingDate=f["id"];

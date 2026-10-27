@@ -63,7 +63,7 @@ Json describe_setting(const std::string& pointer,const std::string& module,const
     auto& modules=catalog()["modules"];
     auto block_label=!module.empty()?(modules.contains(module)?local(modules[module],language):module):
         blocks.contains(block)?local(blocks[block],language):groups.contains(group)?local(groups[group],language):label;
-    bool primary=pointer!="/watch/enabled" && pointer.size()>=8 && pointer.compare(pointer.size()-8,8,"/enabled")==0 && !meta.empty();
+    bool primary=pointer.size()>=8 && pointer.compare(pointer.size()-8,8,"/enabled")==0 && !meta.empty();
     if(primary) label=block_label;
     Json result={{"label",label},{"category",category},{"categoryLabel",groups.contains(category)?local(groups[category],language):tr("readOnly",language)},
         {"block",block},{"blockLabel",block_label},{"module",module},{"primary",primary},

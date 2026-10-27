@@ -28,13 +28,6 @@ def normalize_verification_config(value: Any) -> dict[str, Any]:
     return config
 
 
-def _int_field(config: dict[str, Any], name: str) -> int:
-    try:
-        return int(config[name])
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"verification.{name} must be an integer") from exc
-
-
 def _float_field(config: dict[str, Any], name: str) -> float:
     try:
         return float(config[name])

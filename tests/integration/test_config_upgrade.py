@@ -16,6 +16,13 @@ def test_installer_field_upgrade_preserves_values_and_modules(tmp_path, repo_roo
             {"name": "keep", "removed": 1, "enabled": True, "rules": ["old"]},
             {"name": "deleted", "enabled": True},
         ]},
+        "analysis": {"modules": [
+            {"name": "gzip", "enabled": True, "max_probe_bytes": 4194304},
+            {"name": "tar_gz", "enabled": True, "max_probe_bytes": 4194304},
+        ]},
+        "verification": {"methods": [
+            {"name": "archive_test_crc", "max_items": 200000, "max_reported_items": 20},
+        ]},
     }
     new = {
         "keep": {"false": False, "zero": 6, "empty": "new", "null": 3, "array": [2], "added": 8},
@@ -25,6 +32,13 @@ def test_installer_field_upgrade_preserves_values_and_modules(tmp_path, repo_roo
             {"name": "keep", "enabled": False, "rules": ["new"], "added": 4},
             {"name": "new", "enabled": True},
             {"name": "advanced_only", "enabled": True},
+        ]},
+        "analysis": {"modules": [
+            {"name": "tar_gz", "enabled": True, "max_probe_bytes": 4194304},
+            {"name": "gzip", "enabled": True},
+        ]},
+        "verification": {"methods": [
+            {"name": "archive_test_crc", "max_reported_items": 20},
         ]},
     }
     template = {
@@ -40,6 +54,13 @@ def test_installer_field_upgrade_preserves_values_and_modules(tmp_path, repo_roo
             {"name": "unknown", "rules": []},
             {"name": "keep", "enabled": False, "rules": ["user"], "removed": 99},
             {"name": "deleted", "enabled": False},
+        ]},
+        "analysis": {"modules": [
+            {"name": "gzip", "enabled": False, "max_probe_bytes": 123, "custom": 9},
+            {"name": "tar_gz", "enabled": False, "max_probe_bytes": 2048},
+        ]},
+        "verification": {"methods": [
+            {"name": "archive_test_crc", "max_items": 1, "max_reported_items": 0},
         ]},
     }
     paths = {}
@@ -59,7 +80,16 @@ def test_installer_field_upgrade_preserves_values_and_modules(tmp_path, repo_roo
     expected = {
         "unknown": {"value": 7}, "keep": {**user["keep"], "added": 80},
         "absent": {"added": 90}, "new_null": None,
-        "filesystem": {"scan_filters": user["filesystem"]["scan_filters"]},
+        "filesystem": {"scan_filters": [
+            {"name": "unknown", "rules": []},
+            {"name": "keep", "enabled": False, "rules": ["user"], "added": 40},
+            {"name": "new", "enabled": False},
+        ]},
+        "analysis": {"modules": [
+            {"name": "gzip", "enabled": False, "custom": 9},
+            {"name": "tar_gz", "enabled": False, "max_probe_bytes": 2048},
+        ]},
+        "verification": {"methods": [{"name": "archive_test_crc", "max_reported_items": 0}]},
     }
     assert json.loads(paths["user"].read_text(encoding="utf-8")) == expected
     committed = paths["user"].read_bytes()

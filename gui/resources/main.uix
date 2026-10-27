@@ -182,15 +182,13 @@ export default {
     changeRoot(r,part,value) {
       let d=Object.assign({},this.ensureRootDraft(r),{[part]:value,error:''});
       if(!/[\r\n]/.test(value)) {
-        if(part==='input'&&!d.original&&(!d.output||d.output===this.rootDraft(r).input)) d.output=value;
         this.putRootDraft(d); return;
       }
       let lines=value.split(/\r\n|\r|\n/).map(v=>v.trim()).filter(v=>v.length),rows=[];
       if(!lines.length) { d[part]=''; this.putRootDraft(d); this.finishRootCell(); return; }
       if(part==='input') {
-        if(!d.original&&(!d.output||d.output===this.rootDraft(r).input)) d.output=lines[0];
         d.input=lines[0]; rows.push(d);
-        let extra=lines.slice(1).map(input=>this.makeRoot(input,input,d.deep,d.recursive)); this.rootNew=this.rootNew.concat(extra); rows=rows.concat(extra);
+        let extra=lines.slice(1).map(input=>this.makeRoot(input,'',d.deep,d.recursive)); this.rootNew=this.rootNew.concat(extra); rows=rows.concat(extra);
       } else {
         let current=this.shownRootRows,start=current.findIndex(p=>p.id===r.id),extra=[];
         for(let i=0;i<lines.length;i++) {

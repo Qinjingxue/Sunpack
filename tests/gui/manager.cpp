@@ -7,6 +7,7 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <tuple>
 
 using namespace spg;
 void service_notifications();
@@ -254,7 +255,16 @@ void editing(Fixture& f) {
     assert(conf["filters"][0]["rules"]==Json::array({"*","r",3}));
     fails([&]{save_config_field(c,"/watch/out_dir","\".\"","string","stale",false);});
     fails([&]{validate_setting("/runtime/process_mode",Json("typo"));});
-    fails([&]{validate_setting("/watch/max_folders",Json(0));});
+    fails([&]{validate_setting("/watch/clipboard_builtin_max_entries",Json(0));});
+    for(auto bounds:{std::make_tuple("/performance/worker/space_poll_interval_ms",50,60000),
+                     std::make_tuple("/performance/worker/space_status_report_interval_ms",1000,600000),
+                     std::make_tuple("/performance/worker/writer_threads",1,8),
+                     std::make_tuple("/performance/worker/max_queue_jobs",1,1000000)}) {
+        const auto& [pointer,lower,upper]=bounds;
+        validate_setting(pointer,Json(lower)); validate_setting(pointer,Json(upper));
+        fails([&]{validate_setting(pointer,Json(lower-1));});
+        fails([&]{validate_setting(pointer,Json(upper+1));});
+    }
     fails([&]{validate_setting("/embedded_scan/recursive_candidate_ratio",Json(1.5));});
     validate_setting("/recursive_extract",Json("12"));
     fails([&]{validate_setting("/recursive_extract",Json("0"));});
@@ -265,13 +275,20 @@ void editing(Fixture& f) {
         for(auto& field:config_fields(defaults,kDefaultsJson,language)) {
             if(!field["known"].get<bool>()) throw std::runtime_error("Missing setting description: "+field["id"].get<std::string>());
             assert(!field["label"].get<std::string>().empty());
+            assert(field["editor"]!="readonly");
         }
         assert(!describe_setting("/retired/enabled","",language)["known"].get<bool>());
         assert(!describe_setting("/watch/directory_password_file_auto_create","",language)["known"].get<bool>());
         assert(!describe_setting("/passwords/directory_passwords_enabled","",language)["known"].get<bool>());
         // Module identity, rather than position, survives copying/reordering.
-        auto module=config_fields(parse_json(R"({"analysis":{"modules":[{"name":"gzip","max_probe_bytes":2048}]}})"),"",language);
-        assert(module.size()==1 && module[0]["known"].get<bool>() && module[0]["module"]=="gzip" && module[0]["blockLabel"]=="GZIP");
+        for(auto pointer:{"/watch/enabled","/watch/roots","/watch/max_folders","/performance/worker/priority_aging_quantum"})
+            assert(!describe_setting(pointer,"",language)["known"].get<bool>());
+        auto unknown=config_fields(parse_json(R"({"watch":{"roots":[],"custom":["keep"]}})"),"",language);
+        for(auto& field:unknown) assert(!field["known"].get<bool>() && field["editor"]=="readonly");
+        for(auto name:{"gzip","bzip2","xz","zstd"})
+            assert(!describe_setting("/analysis/modules/0/max_probe_bytes",name,language)["known"].get<bool>());
+        auto module=config_fields(parse_json(R"({"analysis":{"modules":[{"name":"tar_gz","max_probe_bytes":2048}]}})"),"",language);
+        assert(module.size()==1 && module[0]["known"].get<bool>() && module[0]["module"]=="tar_gz" && module[0]["blockLabel"]=="TAR + GZIP");
     }
     assert(log_directory(f.dir,Json({{"watch",{{"state_dir","other"}}}}))==f.dir/"other");
 }
@@ -438,7 +455,7 @@ void roots(Fixture& f) {
 void batch_editing(Fixture& fixture) {
     auto dir=fixture.dir/"batch"; fs::create_directory(dir);
     auto config=dir/"sunpack_config.json", passwords=dir/"builtin_passwords.json", roots=dir/"sunpack_watch_roots.txt";
-    atomic_write(config,R"({"watch":{"out_dir":".","toast_enabled":true,"max_folders":1},"large":123456789012345678901234567890})");
+    atomic_write(config,R"({"watch":{"out_dir":".","toast_enabled":true,"clipboard_builtin_max_entries":1},"large":123456789012345678901234567890})");
     Json old={{"value","old"},{"scopes",{utf8(dir.wstring())}}};
     atomic_write(passwords,Json{{"passwords",{old}},{"clipboard_history",{"latest background history"}}}.dump());
     atomic_write(roots,"# retained\n"+utf8(dir.wstring())+"\n");
@@ -447,7 +464,7 @@ void batch_editing(Fixture& fixture) {
     Json pwd=Json::array({Json{{"operation","replace"},{"original",old.dump()},{"value","changed"},{"scopes",{utf8(dir.wstring())}}}});
     Json root=Json::array({Json{{"operation","save"},{"original",utf8(dir.wstring())},{"input",utf8(dir.wstring())},{"output","new"},{"deep",true},{"expected",{{"output",""},{"deep",false}}}}});
     auto before_config=read_file(config), before_passwords=read_file(passwords), before_roots=read_file(roots);
-    auto invalid=fields; invalid.push_back({{"pointer","/watch/max_folders"},{"original","1"},{"type","number"},{"text","0"},{"boolean",false}});
+    auto invalid=fields; invalid.push_back({{"pointer","/watch/clipboard_builtin_max_entries"},{"original","1"},{"type","number"},{"text","0"},{"boolean",false}});
     auto rejected=save_changes(dir,invalid,pwd,root);
     assert(rejected["saved"].empty() && rejected["error"]!="");
     assert(read_file(config)==before_config && read_file(passwords)==before_passwords && read_file(roots)==before_roots);

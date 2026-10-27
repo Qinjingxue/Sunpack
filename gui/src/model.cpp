@@ -960,7 +960,7 @@ Json config_fields(const Json& config,const std::string& source,const std::strin
         auto field=describe_setting(pointer,module,language);
         std::string editor=field["editor"], text=item.is_string()?item.get<std::string>():raw;
         bool lines=item.is_array() && std::all_of(item.begin(),item.end(),[](const Json& i){return i.is_string();});
-        if(editor.empty()) editor=lines?"list":!field["known"].get<bool>()?"readonly":!field["options"].empty()?"choice":type=="boolean"?"toggle":type=="string"||type=="number"?"text":"readonly";
+        if(editor.empty()) editor=!field["known"].get<bool>()?"readonly":lines?"list":!field["options"].empty()?"choice":type=="boolean"?"toggle":type=="string"||type=="number"?"text":"readonly";
         int choice=-1;
         for(size_t i=0;i<field["options"].size();++i) if(field["options"][i]["value"]==item) choice=int(i);
         if(editor=="recursive" && choice<0) choice=2;
@@ -970,14 +970,12 @@ Json config_fields(const Json& config,const std::string& source,const std::strin
     };
     walk(config,"",""); return rows;
 }
-Json directory_rows(const WatchRoots& roots,const Json& config) {
+Json directory_rows(const WatchRoots& roots,const Json&) {
     Json rows=Json::array();
-    std::string default_out=".";
-    if(config.contains("watch") && config["watch"].is_object() && config["watch"].contains("out_dir") && config["watch"]["out_dir"].is_string()) default_out=config["watch"]["out_dir"].get<std::string>();
     for(auto& r:roots.entries) {
         auto key=path_key(r.input);
         rows.push_back({{"id",utf8(key)},{"path",utf8(r.input.wstring())},{"name",utf8(r.input.filename().wstring())},
-            {"watch",true},{"output",r.output},{"effectiveOutput",utf8(resolve_path(wide(r.output.empty()?default_out:r.output),r.input).wstring())},{"deep",r.deep},{"recursive",r.recursive}});
+            {"watch",true},{"output",r.output},{"effectiveOutput",r.output.empty()?utf8(r.input.wstring()):utf8(resolve_path(wide(r.output),r.input).wstring())},{"deep",r.deep},{"recursive",r.recursive}});
     }
     return rows;
 }

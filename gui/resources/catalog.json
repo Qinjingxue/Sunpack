@@ -113,8 +113,8 @@
       "en": "Paste one or more folders"
     },
     "rootOutputHint": {
-      "zh": "同监控目录",
-      "en": "Same as monitored folder"
+      "zh": "同归档所在文件夹",
+      "en": "Same as archive folder"
     },
     "searchDirectory": {
       "zh": "搜索目录",
@@ -1148,20 +1148,7 @@
         "en": "Queued task limit"
       },
       "min": 1,
-      "max": null,
-      "integer": true
-    },
-    "/performance/worker/priority_aging_quantum": {
-      "label": {
-        "zh": "等待任务提权步长",
-        "en": "Waiting task priority step"
-      },
-      "description": {
-        "zh": "防止低优先级任务一直等待",
-        "en": "Prevents low-priority tasks from waiting indefinitely"
-      },
-      "min": 1,
-      "max": null,
+      "max": 1000000,
       "integer": true
     },
     "/performance/worker/writer_threads": {
@@ -1170,7 +1157,7 @@
         "en": "Writer threads"
       },
       "min": 1,
-      "max": null,
+      "max": 8,
       "integer": true
     },
     "/performance/worker/job_buffer_budget_bytes": {
@@ -1180,34 +1167,42 @@
       },
       "min": 0,
       "max": null,
-      "integer": true
+      "integer": true,
+      "description": {
+        "zh": "0 使用工作进程默认缓冲预算；正数指定每个任务的字节上限。",
+        "en": "0 uses the worker default buffer budget; a positive value sets a per-task byte limit."
+      }
     },
     "/performance/worker/space_gate_enabled": {
       "label": {
-        "zh": "资源不足时暂停新任务",
-        "en": "Pause new tasks when resources are low"
+        "zh": "磁盘空间不足时暂停写入",
+        "en": "Pause writes when disk space is low"
+      },
+      "description": {
+        "zh": "控制磁盘空间门控；内存准入由内存预留单独控制。",
+        "en": "Controls the disk space gate. Memory admission is controlled separately by the memory reserve."
       }
     },
     "/performance/worker/space_poll_interval_ms": {
       "label": {
-        "zh": "资源复查间隔（毫秒）",
-        "en": "Resource recheck interval (ms)"
+        "zh": "磁盘空间复查间隔（毫秒）",
+        "en": "Disk space recheck interval (ms)"
       },
       "description": {
-        "zh": "仅在资源不足时复查",
-        "en": "Recheck only when resources are insufficient"
+        "zh": "仅在等待磁盘空间恢复时复查，范围为 50–60000 毫秒。",
+        "en": "Recheck only while waiting for disk space, between 50 and 60000 ms."
       },
-      "min": 1,
-      "max": null,
+      "min": 50,
+      "max": 60000,
       "integer": true
     },
     "/performance/worker/space_status_report_interval_ms": {
       "label": {
-        "zh": "资源状态报告间隔（毫秒）",
-        "en": "Resource report interval (ms)"
+        "zh": "磁盘空间状态报告间隔（毫秒）",
+        "en": "Disk space status report interval (ms)"
       },
-      "min": 1,
-      "max": null,
+      "min": 1000,
+      "max": 600000,
       "integer": true
     },
     "/performance/worker/memory_reserve_bytes": {
@@ -1229,8 +1224,8 @@
         "en": "Process priority"
       },
       "description": {
-        "zh": "优先级越高速度越快，内存占用越大",
-        "en": "Higher priority increases speed and memory usage"
+        "zh": "设置 Windows 进程调度优先级，不改变任务并发数或缓冲预算。",
+        "en": "Sets Windows process scheduling priority without changing task concurrency or buffer budgets."
       },
       "options": [
         {
@@ -1300,14 +1295,6 @@
       "min": 0,
       "integer": false
     },
-    "/watch/max_folders": {
-      "label": {
-        "zh": "同时处理目录数",
-        "en": "Concurrent folders"
-      },
-      "min": 1,
-      "integer": true
-    },
     "/watch/runtime_cache_cleanup_enabled": {
       "label": {
         "zh": "清理空闲缓存",
@@ -1343,22 +1330,6 @@
       },
       "min": 1,
       "integer": true
-    },
-    "/watch/enabled": {
-      "label": {
-        "zh": "默认启动监控",
-        "en": "Start Watch by default"
-      },
-      "description": {
-        "zh": "当前监控在任务页启停",
-        "en": "Start or stop the current monitor on the Tasks page"
-      }
-    },
-    "/watch/roots": {
-      "label": {
-        "zh": "附加监控目录",
-        "en": "Additional monitored folders"
-      }
     },
     "/watch/out_dir": {
       "label": {
@@ -1581,41 +1552,17 @@
         "en": "GZIP"
       }
     },
-    "/analysis/modules/@gzip/max_probe_bytes": {
-      "label": {
-        "zh": "读取上限（字节）",
-        "en": "Read limit (bytes)"
-      },
-      "min": 0,
-      "integer": true
-    },
     "/analysis/modules/@bzip2/enabled": {
       "label": {
         "zh": "BZIP2",
         "en": "BZIP2"
       }
     },
-    "/analysis/modules/@bzip2/max_probe_bytes": {
-      "label": {
-        "zh": "读取上限（字节）",
-        "en": "Read limit (bytes)"
-      },
-      "min": 0,
-      "integer": true
-    },
     "/analysis/modules/@xz/enabled": {
       "label": {
         "zh": "XZ",
         "en": "XZ"
       }
-    },
-    "/analysis/modules/@xz/max_probe_bytes": {
-      "label": {
-        "zh": "读取上限（字节）",
-        "en": "Read limit (bytes)"
-      },
-      "min": 0,
-      "integer": true
     },
     "/analysis/modules/@lz4/enabled": {
       "label": {
@@ -1642,14 +1589,6 @@
         "zh": "Zstandard",
         "en": "Zstandard"
       }
-    },
-    "/analysis/modules/@zstd/max_probe_bytes": {
-      "label": {
-        "zh": "读取上限（字节）",
-        "en": "Read limit (bytes)"
-      },
-      "min": 0,
-      "integer": true
     },
     "/analysis/modules/@tar_gz/enabled": {
       "label": {
@@ -1819,7 +1758,11 @@
         "en": "Log retention (days)"
       },
       "min": 1,
-      "integer": true
+      "integer": true,
+      "description": {
+        "zh": "保留最近指定天数的任务历史和事件，CLI 与监控模式共用。",
+        "en": "Retain task history and events for this many days, shared by CLI and Watch."
+      }
     }
   },
   "modules": {

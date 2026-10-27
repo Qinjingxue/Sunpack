@@ -29,6 +29,7 @@ from sunpack.core.contracts.pipeline import (
 from sunpack.core.contracts.results import ArchiveCleanupResult, OutcomeKind, RunSummary, TargetRunResult
 from sunpack.core.support.resource_lifecycle import promotion_barrier
 from sunpack.runtime.watch.scanner import WatchCandidate
+from sunpack.runtime.watch.roots import WatchRootEntry
 from sunpack.runtime.watch.scheduler import WatchScheduler as RuntimeWatchScheduler
 from sunpack.runtime.watch.state import WatchStateStore
 from tests.helpers.config_factory import make_config
@@ -1807,6 +1808,40 @@ def test_watch_scheduler_processes_direct_quiet_candidate_with_watch_root_common
     assert captured["config"]["output"]["common_root"] == str(watch_root.resolve())
 
 
+def test_watch_scheduler_empty_root_output_uses_pipeline_default(tmp_path, monkeypatch):
+    monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
+    captured = {}
+
+    class FakePipelineRunner:
+        def __init__(self, config):
+            captured["config"] = config
+
+        def run_targets(self, paths):
+            return RunSummary(target_results=(TargetRunResult(paths[0], OutcomeKind.COMPLETE_SUCCESS),))
+
+    watch_root = tmp_path / "in"
+    watch_root.mkdir()
+    archive_path = watch_root / "sample.disguised"
+    _write_zip(archive_path)
+
+    watcher = _watcher(
+        tmp_path,
+        config=make_config({}),
+        roots=[str(watch_root)],
+        out_dir=str(tmp_path / "legacy-out"),
+        root_entries=[WatchRootEntry(str(watch_root), None)],
+        cold_start_seconds=0,
+        pipeline_engine=FakePipelineEngine(FakePipelineRunner),
+    )
+    watcher.enqueue(str(archive_path))
+
+    result = _await(watcher.run_once())
+
+    assert result.succeeded == 1
+    assert captured["config"]["output"]["root"] == ""
+    assert not (tmp_path / "legacy-out").exists()
+
+
 def test_watch_scheduler_moved_file_uses_common_quiet_window(tmp_path, monkeypatch):
     monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
     now = [2000000000.0]
@@ -2161,7 +2196,7 @@ def test_watch_scheduler_allows_shared_output_root(tmp_path, monkeypatch):
     }
 
 
-def test_watch_root_always_has_a_resolved_output_root(tmp_path, monkeypatch):
+def test_watch_root_without_explicit_output_uses_archive_folder_default(tmp_path, monkeypatch):
     monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
     watch_root = tmp_path / "in"
     watch_root.mkdir()
@@ -2169,20 +2204,20 @@ def test_watch_root_always_has_a_resolved_output_root(tmp_path, monkeypatch):
     archive_path.parent.mkdir()
     _write_zip(archive_path)
 
-    def output_root_for(out_dir, output_roots=None):
+    def output_root_for(out_dir, output_roots=None, root_entries=None):
         watcher = _watcher(
             tmp_path,
             config=make_config({}),
             roots=[str(watch_root)],
             out_dir=out_dir,
             output_roots=output_roots,
+            root_entries=root_entries,
             cold_start_seconds=0,
         )
-        return watcher.output_roots[scheduler_module.path_key(str(watch_root.resolve()))]
+        return watcher._output_root_for(str(archive_path))
 
-    # A caller that does not enumerate outputs still gets one absolute output root per watch root.
-    assert output_root_for(".") == str(watch_root.resolve())
-    assert output_root_for(str(tmp_path / "global-out")) == str((tmp_path / "global-out").resolve())
+    assert output_root_for(".", root_entries=[WatchRootEntry(str(watch_root), None)]) is None
+    assert output_root_for(str(tmp_path / "global-out"), root_entries=[WatchRootEntry(str(watch_root), None)]) is None
     # An enumerated output root wins over the process-wide one.
     assert output_root_for(".", {str(watch_root): str(tmp_path / "per-root")}) == str(
         (tmp_path / "per-root").resolve()

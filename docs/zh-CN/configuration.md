@@ -27,7 +27,7 @@ python sunpack.py config show
 | `post_extract.archive_cleanup_mode` | 成功后 `"r"` 移入回收站、`"k"` 保留、`"d"` 删除原归档。 |
 | `post_extract.flatten_single_directory` | `true` 时提升唯一顶层输出目录中的内容。 |
 | `extraction.content_requirement` | `"complete"` 要求完整结果；`"allow_partial"` 接受部分恢复结果。 |
-| `watch.out_dir` | 未单独指定输出路径的 Watch 根目录所用的默认输出目录；`"."` 表示输入目录旁。 |
+| `watch.out_dir` | 为兼容配置保留的旧字段；监控目录的输出路径留空时，解压到各归档所在文件夹。 |
 
 例如，在主配置中加入以下字段，可保留原归档并扫描子目录：
 
@@ -40,7 +40,7 @@ python sunpack.py config show
 CLI 的 `--recur`、`--cleanup` 和 `--out-dir` 等参数可为单次命令指定解压行为，详见 [CLI 参数说明](cli_parameters.md)。
 
 
-目录发现默认只扫描当前层；`scan`、`inspect`、`extract` 使用 `--recursive` 发现子目录，嵌套解压仍由 `--recur` 控制。升级 1.2.0 及更新版本时，安装器比较新旧高级配置字段，删除废弃字段，并按普通模板补充新增字段；已有用户值和权限保持原样。
+目录发现默认只扫描当前层；`scan`、`inspect`、`extract` 使用 `--recursive` 发现子目录，嵌套解压仍由 `--recur` 控制。升级 1.2.0 及更新版本时，安装器比较新旧高级配置字段，删除废弃字段，并按普通模板补充新增字段；过滤器、分析模块和验证方法按 `name` 更新，保留用户值、模块顺序和未知扩展项。已有权限保持原样。
 
 ## 扫描过滤
 
@@ -75,7 +75,11 @@ GUI 按 Windows 本地时区编辑时间，保存时转成 UTC。大小单位支
 
 ## Watch 与密码
 
-使用 `python sunpack.py watch add C:\Downloads` 添加监控目录，附加 `-o E:\Output` 可指定输出目录；未指定时使用 `watch.out_dir`。`watch list` 可查看目录。加 `--recursive` 可递归监控子目录，每个监控根独立保存该标志。
+监控目录保存在 `sunpack_watch_roots.txt`，通过 GUI 或 `watch add/remove` 管理；监控启停通过 GUI 或 `watch start/stop` 控制。已移除无效的 `watch.enabled`、`watch.roots`、`watch.max_folders` 和 `performance.worker.priority_aging_quantum`。
+
+普通 gzip、bzip2、xz、zstd 分析模块不再提供无效的 `max_probe_bytes`；该字段只用于 `tar_*` 模块的 TAR 探测。`watch.state_dir` 留空仍表示默认状态目录；`memory_reserve_bytes` 和 `job_buffer_budget_bytes` 为 0 时仍使用自动值或工作进程默认值。`watch.event_log_retention_days` 控制 CLI 与监控共用的任务历史和事件保留天数。
+
+使用 `python sunpack.py watch add C:\Downloads` 添加监控目录，附加 `-o E:\Output` 可指定输出目录；留空时解压到各归档所在文件夹。`watch list` 可查看目录。加 `--recursive` 可递归监控子目录，每个监控根独立保存该标志。
 
 持久化密码只来自 `builtin_passwords.json`，包括其中的 `clipboard_history`。在 `passwords` 中填写 `value`，可用 `scopes` 指定一个或多个绝对目录，对其子目录也生效；省略 `scopes` 即全局生效。运行时来源包括显式输入（`-p`、`--pw-file` 或密码提示框）与当前剪贴板。
 

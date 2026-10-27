@@ -27,7 +27,7 @@ For an installed copy, replace `python sunpack.py` with `sunpack.exe`.
 | `post_extract.archive_cleanup_mode` | `"r"` to recycle the original archive after success, `"k"` to keep it, or `"d"` to delete it. |
 | `post_extract.flatten_single_directory` | `true` to lift the contents of a single top-level output folder. |
 | `extraction.content_requirement` | `"complete"` to require a complete result, or `"allow_partial"` to accept partial recovery. |
-| `watch.out_dir` | Default output directory for Watch roots without their own output path; `"."` means beside the input. |
+| `watch.out_dir` | Legacy default retained for configuration compatibility; an empty per-root output path writes beside each archive. |
 
 For example, add these fields to the main configuration to keep original archives:
 
@@ -75,7 +75,11 @@ The GUI edits time in the Windows local time zone and saves UTC. Size units acce
 
 ## Watch and passwords
 
-Add a monitored directory with `python sunpack.py watch add C:\Downloads`. Use `-o E:\Output` to choose its output directory, or set `watch.out_dir` for roots without one. `watch list` shows the configured roots. Watch monitors files directly in each root, not its subdirectories.
+Monitored roots are stored in `sunpack_watch_roots.txt` and managed through the GUI or `watch add/remove`. Start and stop monitoring through the GUI or `watch start/stop`. The unused `watch.enabled`, `watch.roots`, `watch.max_folders`, and `performance.worker.priority_aging_quantum` settings have been removed.
+
+Plain gzip, bzip2, xz, and zstd analysis modules no longer expose the unused `max_probe_bytes`; it applies only to TAR probing in `tar_*` modules. An empty `watch.state_dir` still selects the default state directory. A zero `memory_reserve_bytes` or `job_buffer_budget_bytes` still selects automatic sizing or the worker default. `watch.event_log_retention_days` controls task history and event retention shared by CLI and Watch. Installer upgrades update named filters, analysis modules, and verification methods while preserving user values, module order, and unknown extensions.
+
+Add a monitored directory with `python sunpack.py watch add C:\Downloads`. Use `-o E:\Output` to choose its output directory; leaving it empty writes beside each archive. `watch list` shows the configured roots. Watch monitors files directly in each root, not its subdirectories.
 
 Persistent passwords come only from `builtin_passwords.json`, including its `clipboard_history`. Add records with `value` to `passwords`; optional `scopes` lists absolute directories and applies to their descendants too. Omit `scopes` for global passwords. Runtime sources are explicit input (`-p`, `--pw-file`, or the password prompt) and the current clipboard.
 
