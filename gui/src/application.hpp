@@ -19,6 +19,8 @@ class Application {
     UiPage page_ = 0;
     UiWindow window_ = 0;
     HWND hwnd_ = nullptr;
+    HICON large_icon_ = nullptr, small_icon_ = nullptr;
+    void update_icons(UINT dpi);
     Handle stop_{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
     Handle service_refresh_{CreateEventW(nullptr, FALSE, FALSE, nullptr)};
     std::mutex mutex_;

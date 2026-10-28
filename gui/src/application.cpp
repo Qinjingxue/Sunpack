@@ -769,9 +769,28 @@ void Application::finish_date_popup(UINT_PTR generation) {
         else throw;
     }
 }
+void Application::update_icons(UINT dpi) {
+    dpi=dpi?dpi:96;
+    auto load=[&](int x,int y) {
+        return static_cast<HICON>(LoadImageW(GetModuleHandleW(nullptr),MAKEINTRESOURCEW(1),IMAGE_ICON,
+            GetSystemMetricsForDpi(x,dpi),GetSystemMetricsForDpi(y,dpi),0));
+    };
+    auto large=load(SM_CXICON,SM_CYICON), small=load(SM_CXSMICON,SM_CYSMICON);
+    if(!large || !small) {
+        if(large) DestroyIcon(large);
+        if(small) DestroyIcon(small);
+        return;
+    }
+    SendMessageW(hwnd_,WM_SETICON,ICON_BIG,reinterpret_cast<LPARAM>(large));
+    SendMessageW(hwnd_,WM_SETICON,ICON_SMALL,reinterpret_cast<LPARAM>(small));
+    if(large_icon_) DestroyIcon(large_icon_);
+    if(small_icon_) DestroyIcon(small_icon_);
+    large_icon_=large; small_icon_=small;
+}
 LRESULT CALLBACK Application::subclass(HWND hwnd,UINT message,WPARAM wparam,LPARAM lparam,UINT_PTR,DWORD_PTR data) {
     auto* self=reinterpret_cast<Application*>(data);
     try {
+        if(message==WM_DPICHANGED) self->update_icons(LOWORD(wparam));
         if(message==TaskRange) {
             self->task_range_pending_=false;
             auto* window=ui::GetContext().GetWindow(self->window_);
@@ -840,9 +859,7 @@ void Application::open() {
     hwnd_=static_cast<HWND>(ui_window_hwnd(window_));
     ui_window_set_title(window_,wide(tr("title",language)).c_str());
     style_frame(hwnd_,system_theme());
-    auto icon=LoadIconW(GetModuleHandleW(nullptr),MAKEINTRESOURCEW(1));
-    SendMessageW(hwnd_,WM_SETICON,ICON_BIG,reinterpret_cast<LPARAM>(icon));
-    SendMessageW(hwnd_,WM_SETICON,ICON_SMALL,reinterpret_cast<LPARAM>(icon));
+    update_icons(GetDpiForWindow(hwnd_));
     SetPropW(hwnd_,mutex_name(options_.data_dir,L"SunPack.GUI").c_str(),reinterpret_cast<HANDLE>(1));
     if(!SetWindowSubclass(hwnd_,subclass,1,reinterpret_cast<DWORD_PTR>(this))) win_error("opWindowEvents");
     if(auto* list=dynamic_cast<ui::VirtualListWidget*>(ui::GetContext().GetWindow(window_)->Root()->FindById("taskItems"))) {
@@ -910,6 +927,8 @@ Application::~Application() {
     if(worker_.joinable()) worker_.join();
     if(registry_.joinable()) registry_.join();
     if(hwnd_ && IsWindow(hwnd_)) { RemoveWindowSubclass(hwnd_,subclass,1); ui_window_destroy(window_); }
+    if(large_icon_) DestroyIcon(large_icon_);
+    if(small_icon_) DestroyIcon(small_icon_);
     if(page_) ui_page_destroy(page_);
     if(theme_widget_) ui_widget_destroy(theme_widget_);
     if(status_widget_) ui_widget_destroy(status_widget_);

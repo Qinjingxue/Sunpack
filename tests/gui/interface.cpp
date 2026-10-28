@@ -18,6 +18,34 @@
 using namespace spg;
 void rendering_contracts();
 namespace {
+// Existing UI checks do not inspect the native icons: one default-sized HICON
+// looked correct to those checks even when Windows had to rescale every small
+// icon. Exercise DPI changes in this host, including release of replaced icons.
+void window_icon_contracts(Application& app) {
+    auto hwnd=static_cast<HWND>(ui_window_hwnd(app.window()));
+    auto original_dpi=GetDpiForWindow(hwnd);
+    RECT bounds{}; GetWindowRect(hwnd,&bounds);
+    auto inspect=[](HICON icon,int size) {
+        ICONINFO info{};
+        assert(GetIconInfo(icon,&info));
+        BITMAP bitmap{};
+        assert(GetObjectW(info.hbmColor,sizeof(bitmap),&bitmap));
+        DeleteObject(info.hbmColor); DeleteObject(info.hbmMask);
+        assert(bitmap.bmWidth==size && bitmap.bmHeight==size);
+    };
+    inspect(reinterpret_cast<HICON>(SendMessageW(hwnd,WM_GETICON,ICON_BIG,0)),GetSystemMetricsForDpi(SM_CXICON,original_dpi));
+    inspect(reinterpret_cast<HICON>(SendMessageW(hwnd,WM_GETICON,ICON_SMALL,0)),GetSystemMetricsForDpi(SM_CXSMICON,original_dpi));
+    for(UINT dpi:{96u,120u,144u,192u,240u,288u,original_dpi}) {
+        auto old_large=reinterpret_cast<HICON>(SendMessageW(hwnd,WM_GETICON,ICON_BIG,0));
+        auto old_small=reinterpret_cast<HICON>(SendMessageW(hwnd,WM_GETICON,ICON_SMALL,0));
+        SendMessageW(hwnd,WM_DPICHANGED,MAKELONG(dpi,dpi),reinterpret_cast<LPARAM>(&bounds));
+        inspect(reinterpret_cast<HICON>(SendMessageW(hwnd,WM_GETICON,ICON_BIG,0)),GetSystemMetricsForDpi(SM_CXICON,dpi));
+        inspect(reinterpret_cast<HICON>(SendMessageW(hwnd,WM_GETICON,ICON_SMALL,0)),GetSystemMetricsForDpi(SM_CXSMICON,dpi));
+        ICONINFO released{};
+        assert(!GetIconInfo(old_large,&released));
+        assert(!GetIconInfo(old_small,&released));
+    }
+}
 constexpr int virtualTaskCount=350, virtualPasswordCount=80, virtualHistoryCount=96;
 struct AnimationFrames {
     bool finished=false, layout=false, started=false, stopped=false;
@@ -1477,6 +1505,7 @@ int wmain(int argc,wchar_t** argv) {
             Options options; options.data_dir=dir; options.allow_cli=true;
             options.cli={executable_path(),dir,{L"--fake-cli",gate_name}};
             Application app(options); std::cerr<<"Opening UI\n"; app.open(); std::cerr<<"UI opened\n";
+            window_icon_contracts(app);
             // The old show-before-load path flashed an incomplete first page.
             assert(!IsWindowVisible(static_cast<HWND>(ui_window_hwnd(app.window()))));
             pump_diagnostic(app,[&]{return state(app.page(),"ready")==true;},"Initial snapshot");
