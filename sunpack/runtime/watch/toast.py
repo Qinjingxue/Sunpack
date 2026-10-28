@@ -542,7 +542,9 @@ class WatchToastCoordinator:
             progress_title=progress_title,
             progress_status=progress_status,
             progress_value_text=value_text,
-            actions=() if stopping or not self._requests else (
+            # Keep Stop stable until the final toast replaces this progress
+            # notification; removing it requires Windows to show another popup.
+            actions=(
                 ToastAction(ToastActionKind.CANCEL_BATCH, self.i18n.t("interrupt.stop"), self._batch_id),
             ),
         ))

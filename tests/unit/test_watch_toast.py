@@ -103,13 +103,13 @@ def test_stop_targets_only_current_batch_and_reports_cleanup_truthfully(tmp_path
         assert coordinator.cancel_batch(snapshot.batch_id) == ("active", "scanning")
         stopping = host.snapshots[-1]
         assert stopping.title == ("SunPack 正在停止" if language == "zh" else "SunPack is stopping")
-        assert stopping.actions == ()
+        assert stopping.actions == snapshot.actions
         assert stopping.progress_status == stopping.body == coordinator.i18n.t("interrupt.stopping")
         assert stopping.progress_mode == ToastProgressMode.INDETERMINATE
         assert stopping.progress_value_text == ""
         coordinator.progress("active", task, {"event": "memory_blocked"})
         assert host.snapshots[-1].title == stopping.title
-        assert host.snapshots[-1].actions == ()
+        assert host.snapshots[-1].actions == snapshot.actions
         coordinator.interrupted("active", errors)
         coordinator._finalize(coordinator._finalize_generation)
         assert not _terminal_snapshots(host)
@@ -205,10 +205,12 @@ def test_busy_batch_releases_completed_requests_and_bounds_failure_details(tmp_p
     assert coordinator._batch.failure_chars <= coordinator.report_store.max_bytes // 4
     assert len(coordinator._batch.failure_details) < coordinator._batch.failed
     assert host.snapshots[-1].progress_value == pytest.approx(4001 / 4100)
+    actions = host.snapshots[-1].actions
     coordinator.succeeded("active", [])
-    # The debounced final notification has not replaced progress yet. A drained
-    # batch must already have removed its Stop action during that window.
-    assert host.snapshots[-1].actions == ()
+    # Keep controls stable while completion is debounced: changing them would
+    # require another popup. A click during this window has no work to stop.
+    assert host.snapshots[-1].actions == actions
+    assert coordinator.cancel_batch(host.snapshots[-1].batch_id) == ()
     coordinator._finalize(coordinator._finalize_generation)
     terminal = _terminal_snapshots(host)[-1]
     assert terminal.kind == ToastSnapshotKind.MIXED

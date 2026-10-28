@@ -1,6 +1,6 @@
 // Snapshot/ABI tests never exercise the native presenter's banner lifecycle.
 // Run the real presenter against an in-memory Windows notification surface:
-// this catches queued completion, stale controls and deleted final history
+// this catches redundant popups, queued completion and deleted final history
 // in one lifecycle without desktop notifications, polling or timing limits.
 #include <winrt/Windows.Data.Xml.Dom.h>
 #include <winrt/Windows.Foundation.Collections.h>
@@ -91,22 +91,26 @@ int main() {
             presenter.show(snapshot, 2);
             toast_test::require(toast_test::banner == original && toast_test::shows == 1 && toast_test::hides == 0);
 
-            // Stop removes controls; a concurrent new arrival restores them.
+            // Even action changes must update in place, without another popup.
             snapshot.actions.clear();
             presenter.show(snapshot, 3);
-            toast_test::require(toast_test::banner != original);
-            toast_test::require(toast_test::banner.Content().GetElementsByTagName(L"action").Length() == 0);
+            toast_test::require(toast_test::banner == original && toast_test::shows == 1 && toast_test::hides == 0);
+            toast_test::require(toast_test::banner.Content().GetElementsByTagName(L"action").Length() == 1);
             snapshot.actions.push_back({ActionKind::cancel_batch, L"Stop", L"first"});
             presenter.show(snapshot, 4);
-            toast_test::require(toast_test::banner.Content().GetElementsByTagName(L"action").Length() == 1);
+            toast_test::require(toast_test::banner == original && toast_test::shows == 1 && toast_test::hides == 0);
 
-            // Draining removes Stop before the debounce publishes completion.
+            // Draining keeps the banner until the real completion notification.
             snapshot.actions.clear();
             snapshot.progress_value = 1;
             presenter.show(snapshot, 5);
+            toast_test::require(toast_test::banner == original && toast_test::shows == 1 && toast_test::hides == 0);
+            toast_test::require(original.Data().Values().Lookup(L"progressValue") == L"1");
             snapshot.kind = SnapshotKind::success;
             presenter.show(snapshot, 6);
+            toast_test::require(toast_test::shows == 2 && toast_test::hides == 1);
             toast_test::require(toast_test::banner.Tag() == L"first-f");
+            toast_test::require(toast_test::banner.Content().GetElementsByTagName(L"action").Length() == 0);
             toast_test::require(!toast_test::history.contains({L"first-p", kToastGroup}));
             presenter.clear();
             toast_test::require(toast_test::history.contains({L"first-f", kToastGroup}));

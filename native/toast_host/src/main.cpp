@@ -799,12 +799,11 @@ private:
             values.Insert(L"progressValue", winrt::to_hstring(snapshot.progress_value));
         }
         data.SequenceNumber(static_cast<std::uint32_t>(sequence & 0xffffffff));
-        // NotificationData cannot add/remove buttons. Replace the XML only
-        // when actions change; normal progress stays in-place through Update.
+        // Keep the original controls throughout a batch. NotificationData
+        // cannot change buttons; replacing XML just to hide Stop would show
+        // another popup. Late clicks are checked against the active batch.
         const bool same_batch = progress_tag_ == tag;
-        const bool has_cancel = std::any_of(snapshot.actions.begin(), snapshot.actions.end(),
-            [](const Action& action) { return action.kind == ActionKind::cancel_batch; });
-        if (same_batch && progress_has_cancel_ == has_cancel) {
+        if (same_batch) {
             const auto updated = notifier_.Update(data, tag, kToastGroup);
             if (updated == NotificationUpdateResult::Succeeded) {
                 return;
@@ -829,7 +828,6 @@ private:
         notifier_.Show(toast);
         progress_popup_ = toast;
         progress_tag_ = tag;
-        progress_has_cancel_ = has_cancel;
     }
 
     void show_final(const Snapshot& snapshot) {
@@ -879,7 +877,6 @@ private:
     std::shared_ptr<DiagnosticLog> diagnostic_log_;
     ToastNotification progress_popup_{nullptr};
     std::wstring progress_tag_;
-    bool progress_has_cancel_{};
 };
 
 struct ToastContext {

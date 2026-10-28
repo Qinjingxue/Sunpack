@@ -113,11 +113,12 @@ raise SystemExit(main())
             submit("active")
             coordinator.submitted("scanning", str(tmp_path / "scanning.blob"))
             batch = snapshots[-1].batch_id
+            actions = snapshots[-1].actions
             await click(batch)
             assert token.cancelled and cancelled == [("active", "scanning")]
             coordinator.interrupted("active", [])
             coordinator.interrupted("scanning", [])
-            assert not snapshots[-1].actions
+            assert snapshots[-1].actions == actions
             await click(batch)  # Completion debounce has not fired.
             coordinator._finalize(coordinator._finalize_generation)
             submit("next")
