@@ -528,6 +528,10 @@ class WatchToastCoordinator:
             progress_status = detail or self.i18n.t("toast.progress.disk_paused")
         else:
             progress_status = self.i18n.t("toast.progress.status", completed=completed_requests, total=count)
+        if not stopping and memory_paused and disk_paused:
+            value_text = self.i18n.t("report.status.resources_paused")
+            detail = next((task.space_detail for task in tasks if task.disk_blocked and task.space_detail), "")
+            progress_status = detail or self.i18n.t("report.status.resources_resume_hint")
         self.host.publish(ToastSnapshot(
             kind=ToastSnapshotKind.PROGRESS,
             batch_id=self._batch_id,

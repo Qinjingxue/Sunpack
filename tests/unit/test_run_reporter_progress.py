@@ -233,3 +233,142 @@ def test_noninteractive_terminal_streams_throttled_progress_bar(tmp_path, monkey
     assert output.count("正在解压") == 2
     assert "  5%" in output
     assert " 50%" in output
+
+
+@pytest.mark.parametrize("language", ["zh", "en"])
+@pytest.mark.parametrize("interactive", [True, False])
+@pytest.mark.parametrize("blocked_first", ["memory", "space"])
+@pytest.mark.parametrize("resumed_first", ["memory", "space"])
+def test_resource_waits_overlap_and_clear(tmp_path, monkeypatch, language, interactive, blocked_first, resumed_first):
+    # Single-resource tests miss ordering-dependent labels, premature recovery,
+    # and diagnostics left behind after recovery. Exercise both output modes.
+    stream = io.StringIO()
+    stream.terminal_columns = 200
+    monkeypatch.setattr(reporting, "_terminal_supports_updates", lambda _stream: interactive)
+    reporter = RunReporter(language, stdout=stream, verbose=True)
+    task = _task(tmp_path / "sample.7z")
+    reporter.tasks_discovered(1, [task])
+    reporter.task_progress(task, {"type": "progress", "completed_bytes": 25, "total_bytes": 100})
+
+    def send(resource, action, **extra):
+        reporter.task_progress(task, {"event": resource + "_" + action,
+            "volume_key": "C:", "episode_id": 1, "job_id": "job", **extra})
+
+    def latest():
+        return reporter._format_task_row(reporter._task_rows[id(task)])
+
+    send(blocked_first, "blocked")
+    send("space" if blocked_first == "memory" else "memory", "blocked")
+    combined = reporter.i18n.t("report.status.resources_paused")
+    assert combined in latest() and combined in stream.getvalue()
+    reporter.task_status(task, "extracting")
+    assert combined in latest()
+    send("space", "status", volume_query_ok=False, volume_query_error=21)
+    unavailable = reporter.i18n.t("report.status.disk_unavailable", error="21")
+    assert unavailable in latest()
+    send("space", "status", volume_query_ok=True)
+    assert unavailable not in latest()
+    assert unavailable not in stream.getvalue().splitlines()[-1]
+
+    send(resumed_first, "resumed")
+    remaining = "disk" if resumed_first == "memory" else "memory"
+    label = reporter.i18n.t("report.status." + remaining + "_paused")
+    assert label in latest() and combined not in latest()
+    assert label in stream.getvalue().splitlines()[-1]
+    send("space" if resumed_first == "memory" else "memory", "resumed")
+    restored = latest()
+    assert reporter.i18n.t("report.status.extracting") in restored
+    assert label not in restored and unavailable not in restored
+    assert "25%" in restored
+    assert reporter.i18n.t("report.status.extracting") in stream.getvalue().splitlines()[-1]
+
+
+@pytest.mark.parametrize("interactive", [True, False])
+@pytest.mark.parametrize("finish_while_pending", [False, True])
+@pytest.mark.parametrize("cancel_drain", [False, True])
+def test_resource_recovery_survives_report_lock_and_output_backpressure(tmp_path, monkeypatch, interactive, finish_while_pending, cancel_drain):
+    # Unlike ordinary progress tests, park a real output writer holding the
+    # report lock, send both recovery events, then send no further progress.
+    # This detects lost transitions, loop deadlock and late terminal revival.
+    import asyncio
+    import threading
+    from sunpack.pipeline.coordinator.async_work import AsyncWorkBroker
+
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        held = asyncio.Event()
+        release = threading.Event()
+
+        class Output(io.StringIO):
+            terminal_columns = 200
+            parked = False
+
+            def write(self, text):
+                if self.parked:
+                    self.parked = False
+                    loop.call_soon_threadsafe(held.set)
+                    assert release.wait(3), "resource progress blocked the event loop"
+                return super().write(text)
+
+        output = Output()
+        broker = AsyncWorkBroker(thread_capacity=2)
+        reporter = RunReporter("zh", stdout=output, work_broker=broker, request_id="test")
+        task = _task(tmp_path / "sample.7z")
+        reporter.tasks_discovered(1, [task])
+
+        def send(resource, action):
+            reporter.task_progress(task, {"event": resource + "_" + action,
+                "volume_key": "C:", "episode_id": 1, "job_id": "job"})
+
+        send("memory", "blocked")
+        send("space", "blocked")
+        await reporter.drain_progress()
+        assert "等待内存/磁盘" in output.getvalue()
+        output.parked = True
+
+        def parked_report():
+            with reporter._lock:
+                reporter._print("other report")
+                if finish_while_pending:
+                    reporter.task_finished(task, _outcome(tmp_path / "sample"), 1)
+
+        writer = asyncio.create_task(broker.run("report", "", parked_report))
+        draining = None
+        try:
+            await held.wait()
+            # Repeated transitions must coalesce rather than retain an event
+            # history or create one waiting asyncio task per native event.
+            for _ in range(100):
+                send("memory", "blocked")
+                send("space", "blocked")
+                send("memory", "resumed")
+                send("space", "resumed")
+            assert len(reporter._pending_resource_progress) <= 2
+            reporter.task_progress(task, {"type": "progress", "completed_bytes": 1, "total_bytes": 2})
+            if cancel_drain:
+                draining = asyncio.create_task(reporter.drain_progress())
+                await asyncio.sleep(0)  # Enter the drain before cancelling its waiter.
+                draining.cancel()
+        finally:
+            release.set()
+            await writer
+            try:
+                if draining is not None:
+                    with pytest.raises(asyncio.CancelledError):
+                        await draining
+                else:
+                    await reporter.drain_progress()
+            finally:
+                await broker.close()
+        row = reporter._task_rows[id(task)]
+        if interactive and finish_while_pending:
+            assert row["state"] == "complete"
+        elif not finish_while_pending:
+            assert row["state"] == "extracting"
+            assert not row["space_blocked"] and not row["memory_blocked"]
+            assert "正在解压" in output.getvalue().splitlines()[-1]
+        assert reporter._pending_resource_progress == {}
+        assert reporter._resource_progress_task is None
+
+    monkeypatch.setattr(reporting, "_terminal_supports_updates", lambda _stream: interactive)
+    asyncio.run(scenario())

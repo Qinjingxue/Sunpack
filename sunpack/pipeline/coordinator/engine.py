@@ -1094,6 +1094,8 @@ class _RequestRuntime:
             emit_errors=submission.origin == "foreground" and not cli_config.get("json", False),
             stdout=submission.stdout,
             stderr=submission.stderr,
+            work_broker=services.broker,
+            request_id=submission.request_id,
         )
         self._shell_updates = _ShellUpdateBatch()
         self.source_cleanup = _SourceCleanup(
@@ -1287,6 +1289,7 @@ class _RequestRuntime:
             await self._drain_cleanup_tasks()
             self._shell_updates.flush()
             self.extractor.set_progress_callback(None)
+            await self.reporter.drain_progress()
             await broker.run(
                 "extractor_close",
                 request_id,

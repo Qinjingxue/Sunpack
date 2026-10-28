@@ -32,14 +32,18 @@ def test_memory_wait_reaches_both_presenters_without_owning_task_state(tmp_path)
     deliver("space_blocked")
     deliver("memory_blocked")
     assert state["state"] == "running" and state["memory_waiting"] and state["space_waiting"]
-    assert "等待可用内存" in output.getvalue()
-    assert "内存恢复后自动继续" in snapshots[-1].progress_status
+    assert "等待内存/磁盘" in output.getvalue().splitlines()[-1]
+    assert snapshots[-1].progress_value_text == "等待内存/磁盘"
+    assert "内存和磁盘空间恢复后自动继续" in snapshots[-1].progress_status
     deliver("space_resumed")
     assert "内存" in snapshots[-1].progress_status
+    assert "等待可用内存" in output.getvalue().splitlines()[-1]
+    assert "磁盘" not in output.getvalue().splitlines()[-1]
     assert cli._task_rows[id(task)]["state"] == "memory_paused"
     deliver("memory_resumed")
     assert not state["memory_waiting"] and not state["space_waiting"]
-    assert "内存已恢复" in output.getvalue()
+    restored = output.getvalue().splitlines()[-1]
+    assert "正在解压" in restored and "内存" not in restored and "磁盘" not in restored
     assert "内存" not in snapshots[-1].progress_status
     assert cli._task_rows[id(task)]["state"] == "extracting"
     # A late blocked event cannot resurrect an already-resumed wait.

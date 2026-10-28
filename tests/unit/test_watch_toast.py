@@ -491,3 +491,55 @@ def test_failure_toast_links_to_unique_localized_aggregate_report(tmp_path):
     assert "CRC mismatch" in text
     assert report.parent.name == "failures"
     coordinator.stop()
+
+
+@pytest.mark.parametrize("language", ["zh", "en"])
+@pytest.mark.parametrize("separate_requests", [False, True])
+@pytest.mark.parametrize("blocked_first", ["memory", "space"])
+@pytest.mark.parametrize("resumed_first", ["memory", "space"])
+def test_overlapping_resource_waits_clear_independently(tmp_path, language, separate_requests, blocked_first, resumed_first):
+    # A batch can wait on different resources in different requests. Verify the
+    # aggregate stays paused until the last reason clears, including task exit.
+    host = _Host()
+    coordinator = WatchToastCoordinator(host, _config(language=language), str(tmp_path / "state"))
+    tasks = {"memory": _task(tmp_path / "first.7z"), "space": _task(tmp_path / "second.zip")}
+    requests = {"memory": "first", "space": "second" if separate_requests else "first"}
+    if not separate_requests:
+        tasks["space"] = tasks["memory"]
+    for resource in ("memory", "space"):
+        key = requests[resource]
+        if key not in coordinator._requests:
+            coordinator.submitted(key, tasks[resource].main_path)
+            _ready(coordinator, key, tasks[resource])
+
+    def send(resource, action, **extra):
+        coordinator.progress(requests[resource], tasks[resource], {
+            "event": resource + "_" + action, "volume_key": "C:",
+            "episode_id": 1, "job_id": resource, **extra})
+
+    try:
+        send(blocked_first, "blocked")
+        send("space" if blocked_first == "memory" else "memory", "blocked")
+        combined = coordinator.i18n.t("report.status.resources_paused")
+        assert host.snapshots[-1].progress_value_text == combined
+        send("space", "status", volume_query_ok=False, volume_query_error=21)
+        unavailable = coordinator.i18n.t("report.status.disk_unavailable", error="21")
+        assert host.snapshots[-1].progress_status == unavailable
+        send("space", "status", volume_query_ok=True)
+        assert unavailable not in host.snapshots[-1].progress_status
+        send(resumed_first, "resumed")
+        remaining = "space" if resumed_first == "memory" else "memory"
+        label = coordinator.i18n.t("report.status." + ("disk" if remaining == "space" else "memory") + "_paused")
+        assert host.snapshots[-1].progress_value_text == label
+        assert host.snapshots[-1].progress_mode == ToastProgressMode.INDETERMINATE
+        if separate_requests:
+            coordinator.succeeded(requests[remaining], [])
+        else:
+            send(remaining, "resumed")
+        resumed = host.snapshots[-1]
+        assert resumed.title == coordinator.i18n.t("toast.progress.title")
+        assert resumed.progress_mode == ToastProgressMode.DETERMINATE
+        assert unavailable not in resumed.progress_status
+        assert resumed.progress_value_text not in (label, combined)
+    finally:
+        coordinator.stop()

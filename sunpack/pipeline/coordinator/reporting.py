@@ -1,3 +1,4 @@
+import asyncio
 import os
 import shutil
 import sys
@@ -37,6 +38,8 @@ class RunReporter:
         emit_errors: bool = True,
         stdout=None,
         stderr=None,
+        work_broker=None,
+        request_id: str = "",
     ):
         self.i18n = I18nContext(language)
         self.language = self.i18n.language
@@ -62,6 +65,10 @@ class RunReporter:
         # (volume_key, episode_id) -> 仍在等待该 episode 的 job_id 集合；收到 space_resumed 时移除。
         self._space_blocked_jobs: dict[tuple[str, int], set[str]] = {}
         self._last_render_at = 0.0
+        self._work_broker = work_broker
+        self._request_id = request_id
+        self._pending_resource_progress: dict[tuple[int, str], tuple[Any, dict[str, Any]]] = {}
+        self._resource_progress_task: asyncio.Task | None = None
 
     def scan_started(self, depth: int) -> None:
         if self.quiet:
@@ -130,6 +137,22 @@ class RunReporter:
                 return
 
     def task_progress(self, task: Any, event: dict[str, Any]) -> None:
+        name = str(event.get("event") or "")
+        if name in _SPACE_EVENTS or name in {"memory_blocked", "memory_resumed"}:
+            if self.quiet:
+                return
+            if self._work_broker is None:
+                self._resource_progress(task, event)
+            else:
+                # Called on the request loop. Keep at most one latest event per
+                # task/resource while the existing broker waits for output.
+                resource = "space" if name in _SPACE_EVENTS else "memory"
+                self._pending_resource_progress[id(task), resource] = (task, dict(event))
+                if self._resource_progress_task is None or self._resource_progress_task.done():
+                    if self._resource_progress_task is not None:
+                        self._resource_progress_task.result()
+                    self._resource_progress_task = asyncio.create_task(self._drain_resource_progress())
+            return
         # Native progress is best-effort. Never park the runtime loop behind a
         # report thread holding this lock while waiting for client capacity.
         if not self._lock.acquire(blocking=False):
@@ -142,6 +165,40 @@ class RunReporter:
         finally:
             self._lock.release()
 
+    def _resource_progress(self, task: Any, event: dict[str, Any]) -> None:
+        # Broker workers may wait for the reporter and output; the loop must not.
+        with self._lock:
+            row = self._task_rows.get(id(task))
+            if row is not None and not row.get("finished"):
+                self._task_progress(task, event)
+
+    async def _drain_resource_progress(self) -> None:
+        while self._pending_resource_progress:
+            key = next(iter(self._pending_resource_progress))
+            task, event = self._pending_resource_progress.pop(key)
+            await self._work_broker.run(
+                "report", "", self._resource_progress, task, event,
+                request_id=self._request_id,
+            )
+
+    async def drain_progress(self) -> None:
+        pending = self._resource_progress_task
+        if pending is not None:
+            try:
+                await asyncio.shield(pending)
+            except asyncio.CancelledError:
+                # Match the broker's join-before-release cancellation contract.
+                while not pending.done():
+                    try:
+                        await asyncio.shield(pending)
+                    except asyncio.CancelledError:
+                        continue
+                pending.result()
+                raise
+            finally:
+                self._resource_progress_task = None
+                self._pending_resource_progress.clear()
+
     def _task_progress(self, task: Any, event: dict[str, Any]) -> None:
         if self.quiet:
             return
@@ -150,11 +207,11 @@ class RunReporter:
             row = self._task_rows.get(id(task))
             if row is not None:
                 row["memory_blocked"] = name == "memory_blocked"
-                row["state"] = "memory_paused" if row["memory_blocked"] else ("disk_paused" if row.get("space_blocked") else "extracting")
+                self._restore_progress_locked(row)
                 if self._interactive:
                     self._render_panel_locked(force=True, task_id=id(task))
                 else:
-                    self._print(self.i18n.t("report." + name, name=_task_name(task)))
+                    self._print(self._format_task_row(row))
             return
         if name in _SPACE_EVENTS:
             self._space_progress(task, name, event)
@@ -215,31 +272,37 @@ class RunReporter:
             if event == "space_resumed":
                 row["space_blocked"] = False
                 row.pop("space_episode", None)
+                row["detail"] = ""
                 self._space_blocked_jobs.pop(key, None)
                 self._restore_progress_locked(row)
                 if self._interactive:
                     self._render_panel_locked(force=True, task_id=id(task))
+                else:
+                    self._print(self._format_task_row(row))
                 return
 
             row["space_blocked"] = True
             row["space_episode"] = key[1]
-            row["state"] = "disk_paused"
+            self._restore_progress_locked(row)
             if job_id:
                 self._space_blocked_jobs.setdefault(key, set()).add(job_id)
             if event == "space_status":
-                detail = self._space_status_detail(payload)
-                if detail:
-                    row["detail"] = detail
+                previous_detail = row.get("detail", "")
+                row["detail"] = self._space_status_detail(payload)
             else:
                 row["detail"] = ""
             if self._interactive:
                 self._render_panel_locked(force=True, task_id=id(task))
             elif not self._interactive and event == "space_blocked":
-                self._print(self.i18n.t(
-                    "report.disk_paused",
-                    name=_task_name(task),
-                    free=_format_bytes(int(payload.get("free_bytes") or 0)),
-                ))
+                if row.get("memory_blocked"):
+                    self._print(self._format_task_row(row))
+                else:
+                    self._print(self.i18n.t(
+                        "report.disk_paused", name=_task_name(task),
+                        free=_format_bytes(int(payload.get("free_bytes") or 0)),
+                    ))
+            elif event == "space_status" and previous_detail != row["detail"]:
+                self._print(self._format_task_row(row))
 
     def _space_status_detail(self, payload: dict[str, Any]) -> str:
         # 卷查询失败（拔盘 / UNC 断开 / 权限变化）必须与"空间不足"可区分。
@@ -259,10 +322,13 @@ class RunReporter:
         row["total_bytes"] = total
 
     def _restore_progress_locked(self, row: dict[str, Any]) -> None:
-        row["state"] = "memory_paused" if row.get("memory_blocked") else "extracting"
+        row["state"] = "memory_paused" if row.get("memory_blocked") else ("disk_paused" if row.get("space_blocked") else "extracting")
 
     def task_finished(self, task: Any, outcome: Any, depth: int) -> None:
         with self._lock:
+            row = self._task_rows.get(id(task))
+            if row is not None:
+                row["finished"] = True
             depth = max(1, int(depth or 1))
             self._completed_tasks += 1
             name = _task_name(task)
@@ -412,6 +478,8 @@ class RunReporter:
             return
         if state is not None:
             row["state"] = state
+            if state in {"waiting", "preparing", "extracting"} and (row.get("space_blocked") or row.get("memory_blocked")):
+                self._restore_progress_locked(row)
         if progress is not None:
             row["progress"] = min(1.0, max(0.0, float(progress)))
             row["progress_known"] = True
@@ -457,6 +525,9 @@ class RunReporter:
             "complete": "report.status.complete",
         }
         label = self.i18n.t(labels.get(state, labels["waiting"]))
+        both_paused = state in {"disk_paused", "memory_paused"} and row.get("space_blocked") and row.get("memory_blocked")
+        if both_paused:
+            label = self.i18n.t("report.status.resources_paused")
         colors = {
             "waiting": "\033[90m",
             "preparing": "\033[36m",
@@ -496,6 +567,8 @@ class RunReporter:
         if state in {"disk_paused", "memory_paused"}:
             # Put the recovery hint before the filename so a long name cannot hide it.
             hint = self.i18n.t("report.status.memory_resume_hint") if state == "memory_paused" else (str(row.get("detail") or "") or self.i18n.t("report.status.disk_resume_hint"))
+            if both_paused:
+                hint = str(row.get("detail") or "") or self.i18n.t("report.status.resources_resume_hint")
             suffix_text = f"{hint}  {_task_name(task)}{relation}"
         else:
             suffix_text = f"{_task_name(task)}{relation}{detail}"
