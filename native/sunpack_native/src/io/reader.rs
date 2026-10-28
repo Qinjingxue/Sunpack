@@ -2066,27 +2066,13 @@ fn path_is_under_roots(path: &Path, roots: &[PathBuf]) -> bool {
 }
 
 fn canonical_release_roots(paths: &[String]) -> Vec<PathBuf> {
-    let mut roots = paths
+    let roots = paths
         .iter()
         .filter(|path| !path.is_empty())
-        .map(|path| std::fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path)))
-        .collect::<Vec<_>>();
-    roots.sort_by(|left, right| {
-        left.components()
-            .count()
-            .cmp(&right.components().count())
-            .then_with(|| left.cmp(right))
-    });
-    roots.dedup();
-
-    let mut merged: Vec<PathBuf> = Vec::with_capacity(roots.len());
-    for root in roots {
-        if merged.iter().any(|parent| root.starts_with(parent)) {
-            continue;
-        }
-        merged.push(root);
-    }
-    merged
+        .map(|path| std::fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path)));
+    crate::path_keys::merge_roots(roots, |path| {
+        crate::path_keys::path_key(&path.to_string_lossy())
+    })
 }
 
 fn cache_shard_index(key: &BlockKey) -> usize {
@@ -2191,10 +2177,12 @@ pub(crate) fn release_reader_resources_under_roots(
     py: Python<'_>,
     paths: Vec<String>,
 ) -> PyResult<Py<PyDict>> {
-    let roots = canonical_release_roots(&paths);
-    crate::password::context::release_under_roots(&roots);
-    crate::analysis_native::release_stream_structure_cache_under_roots(&roots);
-    let (handles, cache_entries, cache_bytes) = manager().release_resources_under_roots(&roots)?;
+    let (handles, cache_entries, cache_bytes) = py.detach(|| {
+        let roots = canonical_release_roots(&paths);
+        crate::password::context::release_under_roots(&roots);
+        crate::analysis_native::release_stream_structure_cache_under_roots(&roots);
+        manager().release_resources_under_roots(&roots)
+    })?;
     let dict = PyDict::new(py);
     dict.set_item("handles", handles)?;
     dict.set_item("cache_entries", cache_entries)?;

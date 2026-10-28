@@ -363,6 +363,95 @@ def test_output_roots_persist_and_external_replacements_are_inputs(tmp_path):
         state.close()
 
 
+@pytest.mark.parametrize("origin", ["foreground", "watch"])
+@pytest.mark.parametrize("inside", [False, True])
+def test_junction_outputs_stay_excluded_through_admission_recovery_and_promotion(
+    tmp_path, monkeypatch, origin, inside,
+):
+    """Lexical-only tests miss generated inputs re-entering through a junction.
+
+    One tiny real extraction covers admission after reservations end, legacy WAL
+    recovery, promotion and retirement. Removing it leaves both output namespaces
+    untested; four cases cover the two entry modes and scope relevance at low cost.
+    """
+    import io
+    import subprocess
+    import zipfile
+
+    from sunpack.core.support.path_keys import path_key
+    from sunpack.runtime.watch.scheduler import WatchScheduler
+
+    watched = tmp_path / "watched"
+    target = watched / "target"
+    target.mkdir(parents=True)
+    alias = (watched if inside else tmp_path) / "junction"
+    subprocess.run(["cmd", "/c", "mklink", "/J", str(alias), str(target)],
+                   check=True, capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
+    archive = watched / "outer.blob"
+    content = io.BytesIO()
+    with zipfile.ZipFile(content, "w") as inner:
+        inner.writestr("payload.txt", b"payload")
+    with zipfile.ZipFile(archive, "w") as outer:
+        outer.writestr("inner.blob", content.getvalue())
+    config = make_config({"cli": {"quiet": True}, "recursive_extract": 1,
+        "output": {"root": str(alias / "results")},
+        "post_extract": {"archive_cleanup_mode": "k", "flatten_single_directory": False},
+        "watch": {"clipboard_monitor_enabled": False}})
+    state_path = str(tmp_path / "state" / "state.snapshot")
+    # No Broker service is needed to exercise the real scheduler's admission.
+    monkeypatch.setattr("sunpack.runtime.watch.scheduler.validate_ntfs_watch_roots", lambda roots: None)
+
+    async def execute():
+        async with PipelineEngine(config) as engine:
+            scheduler = WatchScheduler(config, [str(watched)],
+                root_entries=[WatchRootEntry(str(watched), recursive=True)],
+                pipeline_engine=engine, state_path=state_path, cold_start_seconds=0)
+            try:
+                response = await engine.run([str(archive)], origin=origin,
+                    stdout=io.StringIO(), stderr=io.StringIO())
+                assert response.summary.success_count == 1
+                output = Path(response.summary.target_results[0].output_dir)
+                physical = output.resolve()
+                assert (physical / "inner.blob").is_file()
+                assert not engine._services.output_reservations.contains(str(physical / "inner.blob"))
+                before = scheduler.pending_count
+                for root in (output, physical):
+                    assert scheduler.should_ignore_event_path(str(root / "inner.blob"))
+                    scheduler.enqueue(str(root / "inner.blob"), event_type="initial_scan")
+                assert scheduler.pending_count == before
+                # Simulate a pre-upgrade record: recovery must add the physical
+                # alias to the same persistent index without an event-time stat.
+                scheduler.state.commit_runtime([
+                    {"op": "runtime", "key": "owned|" + path_key(physical)},
+                ], durable=True)
+                return output, physical
+            finally:
+                await scheduler.aclose()
+
+    try:
+        output, physical = asyncio.run(execute())
+        scope = DiscoveryScope(str(watched), recursive=True)
+        state = WatchStateStore(state_path)
+        outputs = WatchOutputRoots(state, (scope,))
+        try:
+            assert outputs.protected(str(output / "inner.blob"))
+            assert outputs.protected(str(physical / "inner.blob"))
+            promoted = output.with_name("promoted")
+            output.rename(promoted)
+            outputs.replace(str(output), str(promoted))
+            assert not outputs.protected(str(physical / "inner.blob"))
+            assert outputs.protected(str(promoted.resolve() / "inner.blob"))
+            # Retiring via the physical namespace must also remove the alias.
+            shutil.rmtree(promoted.resolve())
+            outputs.reconcile(str(promoted.resolve()), recursive=True)
+            assert not state._native.runtime_keys("owned|")
+        finally:
+            outputs.close()
+            state.close()
+    finally:
+        alias.rmdir()
+
+
 def test_reserved_output_rejects_external_directory_before_registration(tmp_path):
     """Internal collision tests never create an external directory after reservation.
 

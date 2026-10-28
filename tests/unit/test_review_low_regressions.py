@@ -57,21 +57,24 @@ def test_output_path_containment_uses_canonical_case(monkeypatch):
     ) is True
 
 
-def test_archive_session_containment_uses_canonical_case(monkeypatch):
-    monkeypatch.setattr(
-        archive_sessions,
-        "absolute_path_key",
-        # Mirror the real key's Windows normcase form (backslashes, lower
-        # case); os.path.commonpath always returns backslash separators.
-        lambda value: str(value).replace("/", "\\").lower(),
-    )
-
-    assert archive_sessions._is_under(
-        "/ROOT/Output/Nested/archive.zip",
-        "/root/output",
-    ) is True
+def test_archive_release_roots_preserve_case_and_component_boundaries():
     roots = archive_sessions._merge_release_roots([
         "/ROOT/Output",
         "/root/output",
     ])
     assert len(roots) == 1
+    roots = archive_sessions._merge_release_roots([
+        r"C:\Input\Output\nested\part.001",
+        r"C:\Input\Output-other\keep.001",
+        r"C:\INPUT\OUTPUT",
+        r"C:\Input\Output-else",
+        "C:\\Input\\Output\\",
+        r"\\server\share\nested\part.001",
+        "\\\\SERVER\\SHARE\\",
+        r"D:\nested\part.001",
+        "D:\\",
+    ])
+    assert {path.lower().rstrip("\\") for path in roots} == {
+        r"c:\input\output", r"c:\input\output-other\keep.001",
+        r"c:\input\output-else", r"\\server\share", "d:",
+    }

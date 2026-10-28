@@ -48,6 +48,7 @@ fn sunpack_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m
     )?)?;
     m.add_function(wrap_pyfunction!(path_keys::path_key, m)?)?;
+    m.add_function(wrap_pyfunction!(path_keys::merge_release_roots, m)?)?;
     m.add_function(wrap_pyfunction!(fast_hash::fast_hash64, m)?)?;
     m.add_function(wrap_pyfunction!(fast_hash::fast_hash128, m)?)?;
     m.add_function(wrap_pyfunction!(fast_hash::fast_hash128_file, m)?)?;

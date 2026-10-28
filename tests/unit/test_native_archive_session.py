@@ -136,7 +136,7 @@ def test_batched_release_merges_overlapping_roots_and_preserves_unrelated_sessio
     assert bytes(other_session.read_at(0, 5)) == b"other"
 
     report = release_archive_sessions_under_roots(
-        (os.fspath(first_root), os.fspath(nested_root))
+        (os.fspath(first_root).upper(), os.fspath(nested_root))
     )
 
     assert report["sessions"] == 2

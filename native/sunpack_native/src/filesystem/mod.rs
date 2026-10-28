@@ -160,7 +160,9 @@ pub(crate) fn watch_broker_ping_seconds() -> PyResult<f64> {
 pub(crate) fn watch_path_identity(path: &str) -> PyResult<(String, String, i64)> {
     #[cfg(windows)]
     {
-        return windows::watch_path_identity(Path::new(path)).map_err(os_error);
+        // Output retirement distinguishes a missing directory from transient IO
+        // failures. Preserve io::ErrorKind instead of flattening it to OSError.
+        return windows::watch_path_identity(Path::new(path)).map_err(PyErr::from);
     }
     #[cfg(not(windows))]
     {

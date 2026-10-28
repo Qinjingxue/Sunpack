@@ -104,20 +104,25 @@ pub(crate) fn authorize_nested_candidates(
     minimum_archive_byte_ratio: f64,
 ) -> PyResult<Vec<Py<PyDict>>> {
     let root = PathBuf::from(root_path);
-    let root_key = path_key(&root);
-    let mut raw_entries = Vec::new();
-    let mut file_sizes: HashMap<String, u64> = HashMap::new();
+    // The frozen snapshot owns immutable Rust storage. Borrow it directly while
+    // detached; neither the table nor its row view needs a copy or Python data.
+    let snapshot = &*raw_snapshot;
+    let (contexts, scope_stats, root_stats) = py.detach(|| {
+        let root_key = path_key(&root);
+        let mut raw_entries = Vec::new();
+        let mut file_sizes: HashMap<String, u64> = HashMap::new();
 
-    for (path, is_dir, size, _) in raw_snapshot.records() {
-        let key = path_key_from_str(path);
-        let Some(relative) = relative_key(&key, &root_key) else {
-            continue;
-        };
-        if relative.is_empty() {
-            continue;
-        }
-        let (scope_key, root_branch_key, local_branch_key) =
-            if let Some((first, remainder)) = relative.split_once('\\') {
+        for (path, is_dir, size, _) in snapshot.records() {
+            let key = path_key_from_str(path);
+            let Some(relative) = relative_key(&key, &root_key) else {
+                continue;
+            };
+            if relative.is_empty() {
+                continue;
+            }
+            let (scope_key, root_branch_key, local_branch_key) = if let Some((first, remainder)) =
+                relative.split_once('\\')
+            {
                 let scope_key = format!("{root_key}\\{first}");
                 let local_branch_key = if let Some((first_local, _)) = remainder.split_once('\\') {
                     Some(format!("{scope_key}\\{first_local}"))
@@ -131,102 +136,104 @@ pub(crate) fn authorize_nested_candidates(
                 let root_branch_key = is_dir.then(|| key.clone());
                 (root_key.clone(), root_branch_key.clone(), root_branch_key)
             };
-        let size = if is_dir { 0 } else { size.unwrap_or(0) };
-        if !is_dir {
-            file_sizes.insert(key.clone(), size);
+            let size = if is_dir { 0 } else { size.unwrap_or(0) };
+            if !is_dir {
+                file_sizes.insert(key.clone(), size);
+            }
+            raw_entries.push(RawEntry {
+                key,
+                scope_key,
+                root_branch_key,
+                local_branch_key,
+                is_dir,
+                size,
+            });
         }
-        raw_entries.push(RawEntry {
-            key,
-            scope_key,
-            root_branch_key,
-            local_branch_key,
-            is_dir,
-            size,
-        });
-    }
 
-    let mut contexts = Vec::with_capacity(candidates.len());
-    let mut scopes: HashMap<String, ScopeCandidates> = HashMap::new();
-    let mut root_candidates = ScopeCandidates::default();
+        let mut contexts = Vec::with_capacity(candidates.len());
+        let mut scopes: HashMap<String, ScopeCandidates> = HashMap::new();
+        let mut root_candidates = ScopeCandidates::default();
 
-    for (entry_path, raw_members) in candidates {
-        let entry = PathBuf::from(&entry_path);
-        let Some((scope_path, direct_child)) = semantic_scope(&entry, &root) else {
+        for (entry_path, raw_members) in candidates {
+            let entry = PathBuf::from(&entry_path);
+            let Some((scope_path, direct_child)) = semantic_scope(&entry, &root) else {
+                contexts.push(CandidateContext {
+                    entry_path,
+                    scope_path: PathBuf::new(),
+                    scope_key: String::new(),
+                    member_keys: HashSet::new(),
+                    candidate_bytes: 0,
+                    direct_child: false,
+                });
+                continue;
+            };
+            let scope_key = path_key(&scope_path);
+            let members = if raw_members.is_empty() {
+                vec![entry.to_string_lossy().into_owned()]
+            } else {
+                raw_members
+            };
+            let member_keys: HashSet<String> = members
+                .into_iter()
+                .map(|member| path_key(Path::new(&member)))
+                .collect();
+            let candidate_bytes = member_keys
+                .iter()
+                .map(|member| file_sizes.get(member).copied().unwrap_or(0))
+                .fold(0u64, u64::saturating_add);
+
+            add_candidate(&mut root_candidates, &root, &entry, &member_keys);
+            add_candidate(
+                scopes.entry(scope_key.clone()).or_default(),
+                &scope_path,
+                &entry,
+                &member_keys,
+            );
             contexts.push(CandidateContext {
                 entry_path,
-                scope_path: PathBuf::new(),
-                scope_key: String::new(),
-                member_keys: HashSet::new(),
-                candidate_bytes: 0,
-                direct_child: false,
+                scope_path,
+                scope_key,
+                member_keys,
+                candidate_bytes,
+                direct_child,
             });
-            continue;
-        };
-        let scope_key = path_key(&scope_path);
-        let members = if raw_members.is_empty() {
-            vec![entry.to_string_lossy().into_owned()]
-        } else {
-            raw_members
-        };
-        let member_keys: HashSet<String> = members
-            .into_iter()
-            .map(|member| path_key(Path::new(&member)))
-            .collect();
-        let candidate_bytes = member_keys
-            .iter()
-            .map(|member| file_sizes.get(member).copied().unwrap_or(0))
-            .fold(0u64, u64::saturating_add);
-
-        add_candidate(&mut root_candidates, &root, &entry, &member_keys);
-        add_candidate(
-            scopes.entry(scope_key.clone()).or_default(),
-            &scope_path,
-            &entry,
-            &member_keys,
-        );
-        contexts.push(CandidateContext {
-            entry_path,
-            scope_path,
-            scope_key,
-            member_keys,
-            candidate_bytes,
-            direct_child,
-        });
-    }
-
-    let mut root_accumulator = ScopeAccumulator::new(&root_candidates);
-    let mut scope_accumulators: HashMap<String, ScopeAccumulator> = scopes
-        .iter()
-        .filter(|(key, _)| key.as_str() != root_key.as_str())
-        .map(|(key, candidates)| (key.clone(), ScopeAccumulator::new(candidates)))
-        .collect();
-    for entry in &raw_entries {
-        accumulate_entry(
-            &mut root_accumulator,
-            entry,
-            &root_candidates,
-            entry.root_branch_key.as_deref(),
-        );
-        if let (Some(accumulator), Some(candidates)) = (
-            scope_accumulators.get_mut(&entry.scope_key),
-            scopes.get(&entry.scope_key),
-        ) {
-            accumulate_entry(
-                accumulator,
-                entry,
-                candidates,
-                entry.local_branch_key.as_deref(),
-            );
         }
-    }
-    let root_stats = root_accumulator.finish(&root_candidates);
-    let scope_stats: HashMap<String, ScopeStats> = scope_accumulators
-        .into_iter()
-        .map(|(key, accumulator)| {
-            let candidates = scopes.get(&key).expect("scope candidates must exist");
-            (key, accumulator.finish(candidates))
-        })
-        .collect();
+
+        let mut root_accumulator = ScopeAccumulator::new(&root_candidates);
+        let mut scope_accumulators: HashMap<String, ScopeAccumulator> = scopes
+            .iter()
+            .filter(|(key, _)| key.as_str() != root_key.as_str())
+            .map(|(key, candidates)| (key.clone(), ScopeAccumulator::new(candidates)))
+            .collect();
+        for entry in &raw_entries {
+            accumulate_entry(
+                &mut root_accumulator,
+                entry,
+                &root_candidates,
+                entry.root_branch_key.as_deref(),
+            );
+            if let (Some(accumulator), Some(candidates)) = (
+                scope_accumulators.get_mut(&entry.scope_key),
+                scopes.get(&entry.scope_key),
+            ) {
+                accumulate_entry(
+                    accumulator,
+                    entry,
+                    candidates,
+                    entry.local_branch_key.as_deref(),
+                );
+            }
+        }
+        let root_stats = root_accumulator.finish(&root_candidates);
+        let scope_stats: HashMap<String, ScopeStats> = scope_accumulators
+            .into_iter()
+            .map(|(key, accumulator)| {
+                let candidates = scopes.get(&key).expect("scope candidates must exist");
+                (key, accumulator.finish(candidates))
+            })
+            .collect();
+        (contexts, scope_stats, root_stats)
+    });
 
     contexts
         .into_iter()

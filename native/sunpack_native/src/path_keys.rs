@@ -35,3 +35,38 @@ pub(crate) fn path_key(value: &str) -> String {
         key
     }
 }
+
+/// A trailing separator keeps each parent's descendants adjacent in sort order,
+/// even when a sibling name contains punctuation before '\\'. Only the last
+/// retained root can contain the next key, so reduction is linear after sorting.
+pub(crate) fn merge_roots<T>(
+    roots: impl IntoIterator<Item = T>,
+    key: impl Fn(&T) -> String,
+) -> Vec<T> {
+    let mut keyed: Vec<_> = roots
+        .into_iter()
+        .map(|root| {
+            let mut key = key(&root);
+            key.truncate(key.trim_end_matches('\\').len());
+            key.push('\\');
+            (key, root)
+        })
+        .collect();
+    keyed.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut merged: Vec<(String, T)> = Vec::with_capacity(keyed.len());
+    for (key, root) in keyed {
+        if merged
+            .last()
+            .is_some_and(|(parent, _)| key.starts_with(parent))
+        {
+            continue;
+        }
+        merged.push((key, root));
+    }
+    merged.into_iter().map(|(_, root)| root).collect()
+}
+
+#[pyo3::pyfunction]
+pub(crate) fn merge_release_roots(py: pyo3::Python<'_>, paths: Vec<String>) -> Vec<String> {
+    py.detach(|| merge_roots(paths, |path| path_key(path)))
+}

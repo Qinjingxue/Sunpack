@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable
 
 import sunpack_native
-from sunpack.core.support.path_keys import absolute_path_key, path_key_is_under
+from sunpack.core.support.path_keys import absolute_path_key
 from sunpack_native import NativeArchiveSession, clear_reader_resources
 
 from sunpack.core.support.resource_lifecycle import (
@@ -256,41 +256,28 @@ def clear_archive_sessions() -> dict:
     }
 
 
-def _is_under(candidate: str, root: str) -> bool:
-    candidate_key = absolute_path_key(candidate)
-    root_key = absolute_path_key(root)
-    return path_key_is_under(candidate_key, root_key)
-
-
 def _merge_release_roots(
     paths: Iterable[os.PathLike[str] | str],
 ) -> tuple[str, ...]:
-    unique: dict[str, str] = {}
-    for path in paths:
-        if not path:
-            continue
-        normalized_path = os.path.abspath(os.path.normpath(os.fspath(path)))
-        unique.setdefault(absolute_path_key(normalized_path), normalized_path)
-    normalized = tuple(unique.values())
-    return tuple(
-        root
-        for root in normalized
-        if not any(
-            other != root and _is_under(root, other)
-            for other in normalized
-        )
-    )
+    return tuple(sunpack_native.merge_release_roots([
+        os.path.abspath(os.fspath(path)) for path in paths if path
+    ]))
 
 
 def release_archive_sessions_under_roots(
     paths: Iterable[os.PathLike[str] | str],
 ) -> dict[str, Any]:
     roots = _merge_release_roots(paths)
+    root_keys = {absolute_path_key(root).rstrip("\\/") for root in roots}
+    prefixes = tuple(root + os.sep for root in root_keys)
     with _CHANGED:
+        # The session pool is bounded. Normalize each session once and let the
+        # builtin prefix check compare its key without repeated native crossings.
         stale = [
             key
             for key in _SESSIONS
-            if any(_is_under(key[0], root) for root in roots)
+            if (normalized := absolute_path_key(key[0])) in root_keys
+            or normalized.startswith(prefixes)
         ]
         entries = [_SESSIONS.pop(key) for key in stale]
     sessions = _close_entries(entries)
