@@ -113,3 +113,49 @@ def test_real_watchdog_observer_detects_config_change(tmp_path):
         finally:
             observer.stop()
     asyncio.run(scenario())
+
+def test_config_directory_handle_is_tracked_without_blocking_promotion(tmp_path):
+    from sunpack.core.support.resource_lifecycle import promotion_barrier
+    from sunpack_native import (
+        NativeArchiveSession,
+        NativeConfigChanges,
+        native_resource_snapshot,
+        native_wait_for_resources,
+        release_reader_resources_under_roots,
+    )
+
+    archive = tmp_path / "example.zip"
+    archive.write_bytes(b"archive")
+    listener = NativeConfigChanges(str(tmp_path))
+    try:
+        resources = [dict(item) for item in native_resource_snapshot([str(archive)])]
+        assert any(
+            item["kind"] == "config_directory" and item["promotion_blocking"] is False
+            for item in resources
+        )
+        assert list(native_wait_for_resources([str(archive)], 0.0)) == []
+
+        # A passive listener can be opened while an archive's promotion gate
+        # is held; neither the existing nor the new listener blocks it.
+        with promotion_barrier((archive,), timeout=0, quiesce=False):
+            second = NativeConfigChanges(str(tmp_path))
+            try:
+                resources = [dict(item) for item in native_resource_snapshot([str(archive)])]
+                assert sum(item["kind"] == "config_directory" for item in resources) == 2
+            finally:
+                second.close()
+
+        # Ordinary file handles still participate in the promotion barrier.
+        session = NativeArchiveSession(str(archive))
+        try:
+            blockers = [dict(item) for item in native_wait_for_resources([str(archive)], 0.0)]
+            assert any(
+                item["kind"] == "reader_file" and item["promotion_blocking"] is True
+                for item in blockers
+            )
+        finally:
+            session.close()
+            release_reader_resources_under_roots([str(archive)])
+    finally:
+        listener.close()
+    assert list(native_resource_snapshot([str(archive)])) == []
