@@ -12,6 +12,7 @@ use std::sync::{Condvar, Mutex, OnceLock};
 struct NativeResourceRecord {
     kind: &'static str,
     paths: Vec<PathBuf>,
+    promotion_blocking: bool,
     // Keep diagnostics cheap while the registry lock is held. Formatting is
     // only needed when a resource snapshot is requested.
     thread: std::thread::ThreadId,
@@ -60,8 +61,36 @@ impl TrackedFile {
     where
         F: FnOnce(&mut std::fs::OpenOptions),
     {
+        Self::open_with_promotion(path, kind, true, configure)
+    }
+
+    // Passive directory observers own handles but cannot hold up file promotion.
+    #[track_caller]
+    pub(crate) fn open_passive_with<F>(
+        path: impl AsRef<Path>,
+        kind: &'static str,
+        configure: F,
+    ) -> io::Result<Self>
+    where
+        F: FnOnce(&mut std::fs::OpenOptions),
+    {
+        Self::open_with_promotion(path, kind, false, configure)
+    }
+
+    #[track_caller]
+    fn open_with_promotion<F>(
+        path: impl AsRef<Path>,
+        kind: &'static str,
+        promotion_blocking: bool,
+        configure: F,
+    ) -> io::Result<Self>
+    where
+        F: FnOnce(&mut std::fs::OpenOptions),
+    {
         let path = path.as_ref();
-        let resource = NativeResourceGuard::register(kind, [path.to_path_buf()])?;
+        let resource = NativeResourceGuard::register_with_promotion(
+            kind, [path.to_path_buf()], promotion_blocking,
+        )?;
         let mut options = std::fs::OpenOptions::new();
         configure(&mut options);
         let file = options.open(path)?;
@@ -182,6 +211,15 @@ impl NativeResourceGuard {
         kind: &'static str,
         paths: impl IntoIterator<Item = PathBuf>,
     ) -> io::Result<Self> {
+        Self::register_with_promotion(kind, paths, true)
+    }
+
+    #[track_caller]
+    fn register_with_promotion(
+        kind: &'static str,
+        paths: impl IntoIterator<Item = PathBuf>,
+        promotion_blocking: bool,
+    ) -> io::Result<Self> {
         static NEXT_ID: AtomicU64 = AtomicU64::new(1);
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let paths = paths.into_iter().map(normalized_path).collect::<Vec<_>>();
@@ -189,10 +227,11 @@ impl NativeResourceGuard {
             .registry
             .lock()
             .map_err(|_| io::Error::other("native resource registry poisoned"))?;
-        if registry
-            .promotions
-            .values()
-            .any(|roots| paths_overlap(&paths, roots))
+        if promotion_blocking
+            && registry
+                .promotions
+                .values()
+                .any(|roots| paths_overlap(&paths, roots))
         {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
@@ -205,6 +244,7 @@ impl NativeResourceGuard {
             NativeResourceRecord {
                 kind,
                 paths,
+                promotion_blocking,
                 thread: std::thread::current().id(),
                 created_from: caller,
             },
@@ -323,7 +363,7 @@ pub(crate) fn native_resource_snapshot(py: Python<'_>, roots: Vec<String>) -> Py
     let registry = registry().registry.lock().map_err(|_| {
         pyo3::exceptions::PyRuntimeError::new_err("native resource registry poisoned")
     })?;
-    resource_snapshot_to_python(py, matching_resources(&registry, &roots))
+    resource_snapshot_to_python(py, matching_resources(&registry, &roots, false))
 }
 
 #[pyfunction]
@@ -347,7 +387,7 @@ pub(crate) fn native_wait_for_resources(
             // Zero is an explicit non-blocking probe, not an elapsed-time failure.
             // Positive values are accepted for API compatibility, but wait for release.
             if timeout_seconds <= 0.0 {
-                return Ok::<_, io::Error>(matching_resources(&registry, &roots));
+                return Ok::<_, io::Error>(matching_resources(&registry, &roots, true));
             }
             let registry = state
                 .changed
@@ -355,10 +395,12 @@ pub(crate) fn native_wait_for_resources(
                     registry
                         .resources
                         .values()
-                        .any(|record| roots.is_empty() || overlaps(record, &roots))
+                        .any(|record| {
+                            record.promotion_blocking && (roots.is_empty() || overlaps(record, &roots))
+                        })
                 })
                 .map_err(|_| io::Error::other("native resource registry poisoned"))?;
-            Ok::<_, io::Error>(matching_resources(&registry, &roots))
+            Ok::<_, io::Error>(matching_resources(&registry, &roots, true))
         })
         .map_err(|error| pyo3::exceptions::PyRuntimeError::new_err(error.to_string()))?;
     resource_snapshot_to_python(py, records)
@@ -367,11 +409,15 @@ pub(crate) fn native_wait_for_resources(
 fn matching_resources(
     registry: &NativeRegistry,
     roots: &[PathBuf],
+    promotion_only: bool,
 ) -> Vec<(u64, NativeResourceRecord)> {
     registry
         .resources
         .iter()
-        .filter(|(_, record)| roots.is_empty() || overlaps(record, roots))
+        .filter(|(_, record)| {
+            (!promotion_only || record.promotion_blocking)
+                && (roots.is_empty() || overlaps(record, roots))
+        })
         .map(|(id, record)| (*id, record.clone()))
         .collect()
 }
@@ -385,6 +431,7 @@ fn resource_snapshot_to_python(
         let item = PyDict::new(py);
         item.set_item("resource_id", id)?;
         item.set_item("kind", record.kind)?;
+        item.set_item("promotion_blocking", record.promotion_blocking)?;
         item.set_item(
             "paths",
             record
