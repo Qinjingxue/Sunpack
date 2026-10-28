@@ -395,7 +395,9 @@ pub(crate) fn native_wait_for_resources(
                     registry
                         .resources
                         .values()
-                        .any(|record| record.promotion_blocking && (roots.is_empty() || overlaps(record, &roots)))
+                        .any(|record| {
+                            record.promotion_blocking && (roots.is_empty() || overlaps(record, &roots))
+                        })
                 })
                 .map_err(|_| io::Error::other("native resource registry poisoned"))?;
             Ok::<_, io::Error>(matching_resources(&registry, &roots, true))
