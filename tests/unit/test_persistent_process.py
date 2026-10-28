@@ -792,6 +792,112 @@ def test_server_removes_published_state_if_pipe_creation_fails(tmp_path, monkeyp
     assert closed == ["host", "runtime"]
 
 
+def test_competing_server_waits_for_owner_endpoint_before_exiting(tmp_path):
+    """Single-process publication tests miss a losing server exiting too early.
+
+    Two real processes and pipe gates cover that handoff without a speed
+    threshold; the queue/exit timeouts only guard a broken handshake.
+    """
+    import queue
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    script = r'''
+import asyncio, contextlib, sys
+from sunpack.core.support.runtime_identity import set_runtime_id
+from sunpack.runtime.cli import persistent_process as runtime
+from sunpack.core.platform.windows import file_mutex, secure_pipe
+role, path, identity = sys.argv[1:]
+set_runtime_id(identity)
+runtime.state_path = lambda: path
+acquire = runtime._acquire_server_lock
+def observed_acquire():
+    owner = acquire()
+    if role == "owner":
+        assert owner is not None
+        print("OWNED", flush=True)
+        assert sys.stdin.readline().strip() == "publish"
+    elif owner is None:
+        endpoint = runtime._read_state()
+        connection = runtime._open_pipe(endpoint[0]) if endpoint else None
+        print("OWNER_READY=" + str(connection is not None), flush=True)
+        if connection is not None:
+            connection.close()
+    return owner
+runtime._acquire_server_lock = observed_acquire
+if role == "contender":
+    gate = file_mutex.file_mutex
+    @contextlib.contextmanager
+    def observed_gate(*args, **kwargs):
+        print("ENTERING", flush=True)
+        with gate(*args, **kwargs):
+            yield
+    file_mutex.file_mutex = observed_gate
+else:
+    expose = secure_pipe.start_serving_current_user_pipe
+    async def ready(loop, factory, name):
+        servers = await expose(loop, factory, name)
+        async def stop():
+            assert (await asyncio.to_thread(sys.stdin.readline)).strip() == "stop"
+            factory()._on_shutdown()
+        asyncio.create_task(stop())
+        print("READY", flush=True)
+        return servers
+    secure_pipe.start_serving_current_user_pipe = ready
+raise SystemExit(asyncio.run(runtime.run_server()))
+'''
+    identity = "v2-" + secrets.token_hex(8)
+    children = []
+    readers = []
+
+    def start(role):
+        process = subprocess.Popen(
+            [sys.executable, "-c", script, role, str(tmp_path / "runtime.state"), identity],
+            cwd=Path(__file__).resolve().parents[2], stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8",
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        children.append(process)
+        messages = queue.Queue()
+        def read():
+            for line in process.stdout:
+                messages.put(line.strip())
+            messages.put(None)
+        reader = threading.Thread(target=read, daemon=True)
+        reader.start()
+        readers.append(reader)
+        return process, messages
+
+    try:
+        owner, owner_messages = start("owner")
+        assert owner_messages.get(timeout=10) == "OWNED"
+        contender, contender_messages = start("contender")
+        # The old implementation first reports OWNER_READY=False. Release the
+        # owner on either event, so both versions finish and yield real evidence.
+        first = contender_messages.get(timeout=10)
+        owner.stdin.write("publish\n")
+        owner.stdin.flush()
+        assert owner_messages.get(timeout=10) == "READY"
+        evidence = contender_messages.get(timeout=10) if first == "ENTERING" else first
+        assert contender.wait(timeout=10) == 0
+        assert evidence == "OWNER_READY=True"
+        owner.stdin.write("stop\n")
+        owner.stdin.flush()
+        assert owner.wait(timeout=10) == 0
+    finally:
+        for process in children:
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=10)
+            process.stdin.close()
+        for reader in readers:
+            reader.join(timeout=10)
+        for process in children:
+            process.stdout.close()
+            process.stderr.close()
+
+
 def test_protocol_incrementally_parses_a_fragmented_request(monkeypatch):
     captured = {}
     completed = []

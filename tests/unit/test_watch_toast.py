@@ -121,6 +121,39 @@ def test_stop_targets_only_current_batch_and_reports_cleanup_truthfully(tmp_path
         coordinator.stop()
 
 
+@pytest.mark.parametrize("late_ready", [False, True])
+@pytest.mark.parametrize("errors", [[], ["output is in use"]])
+def test_arrivals_during_stop_keep_controls_and_allow_finalization(tmp_path, late_ready, errors):
+    # Ordinary stop tests admit every request before the click. Only this
+    # arrival order catches inherited stop UI and a final invisible retirement.
+    # Reuse one small coordinator lifecycle, with no polling or fixed sleeps.
+    host = _Host()
+    coordinator = WatchToastCoordinator(host, _config(), str(tmp_path / "state"))
+    try:
+        first, late = _task(tmp_path / "first.zip"), _task(tmp_path / "late.zip")
+        coordinator.submitted("first", first.main_path)
+        _ready(coordinator, "first", first)
+        assert coordinator.cancel_batch(host.snapshots[-1].batch_id) == ("first",)
+        coordinator.submitted("late", late.main_path)
+        if late_ready:
+            _ready(coordinator, "late", late)
+            assert host.snapshots[-1].actions[0].kind == ToastActionKind.CANCEL_BATCH
+            assert host.snapshots[-1].title != coordinator.i18n.t("interrupt.stopping_title")
+        coordinator.interrupted("first", errors)
+        if late_ready:
+            assert host.snapshots[-1].actions[0].kind == ToastActionKind.CANCEL_BATCH
+            coordinator.succeeded("late", [])
+        else:
+            coordinator.suppressed("late")
+        final = host.wait_for_terminal_snapshots()[-1]
+        assert coordinator.i18n.t("interrupt.cleanup_failed" if errors else "interrupt.cleaned") in final.body
+        if late_ready:
+            assert final.title == coordinator.i18n.t("toast.final.mixed.title" if errors else "toast.final.success.title")
+        assert not coordinator._requests
+    finally:
+        coordinator.stop()
+
+
 def test_aggregate_progress_regresses_when_a_new_archive_joins(tmp_path):
     host = _Host()
     coordinator = WatchToastCoordinator(host, _config(), str(tmp_path / "state"))

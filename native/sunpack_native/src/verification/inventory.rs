@@ -2,7 +2,7 @@ use super::paths::{
     clean_relative_archive_path, unsafe_archive_path, windows_output_relative_path,
 };
 use crate::io::reader::ManagedReader;
-use crate::io::scratch::{Slots, SpillMap};
+use crate::io::scratch::Slots;
 use crate::scan::directory::{
     NativeOutputInventory, OutputFileRecord, OutputInventoryVerificationSnapshot,
 };
@@ -233,67 +233,86 @@ struct MatchResult {
 struct OutputIndex<'a> {
     files: &'a [OutputFileRecord],
     root: &'a Path,
-    by_path: SpillMap<usize>,
-    by_folded_path: SpillMap<usize>,
-    by_basename: SpillMap<usize>,
+    by_path: Slots,
 }
 
-const AMBIGUOUS_OUTPUT: usize = usize::MAX;
-
-fn insert_unique_output(index: &mut SpillMap<usize>, key: String, value: usize) -> io::Result<()> {
-    if !index.insert_new(key.clone(), value)? {
-        index.put(key, AMBIGUOUS_OUTPUT)?;
+// The inventory already owns these names. Keep only row numbers in the
+// existing spillable slots instead of serializing a second copy of every key.
+// Bit zero marks duplicate keys; the remaining bits encode row + 1.
+fn output_match_key(item: &OutputFileRecord, pass: u64) -> Cow<'_, str> {
+    let path = output_relative_path(item);
+    match pass {
+        0 => path,
+        1 => Cow::Owned(normalize_match_path(&path)),
+        _ => Cow::Owned(normalize_match_name(basename(&path))),
     }
-    Ok(())
+}
+
+fn output_slot(files: &[OutputFileRecord], slots: &Slots, key: &str, pass: u64) -> usize {
+    let mask = slots.len() - 1;
+    let mut slot = crate::fast_hash::xxh64(key.as_bytes(), 0) as usize & mask;
+    loop {
+        let value = slots.get(slot);
+        if value == 0 || output_match_key(&files[(value >> 1) as usize - 1], pass) == key {
+            return slot;
+        }
+        slot = (slot + 1) & mask;
+    }
+}
+
+fn output_lookup(files: &[OutputFileRecord], pass: u64) -> io::Result<Slots> {
+    let capacity = files
+        .len()
+        .checked_mul(2)
+        .and_then(|n| n.max(2).checked_next_power_of_two())
+        .ok_or_else(|| io::Error::other("output index overflow"))?;
+    let mut slots = Slots::new(capacity)?;
+    for (index, item) in files.iter().enumerate() {
+        let key = output_match_key(item, pass);
+        if key.is_empty() {
+            continue;
+        }
+        let slot = output_slot(files, &slots, &key, pass);
+        let previous = slots.get(slot);
+        slots.set(
+            slot,
+            if previous == 0 {
+                (index as u64 + 1) << 1
+            } else {
+                previous | 1
+            },
+        );
+    }
+    Ok(slots)
 }
 
 impl<'a> OutputIndex<'a> {
     fn new(snapshot: &'a OutputInventoryVerificationSnapshot) -> io::Result<Self> {
-        let mut by_path = SpillMap::default();
-        for (index, item) in snapshot.files.iter().enumerate() {
-            let path = output_relative_path(item);
-            if path.is_empty() {
-                continue;
-            }
-            insert_unique_output(&mut by_path, path.into_owned(), index)?;
-        }
         Ok(Self {
             files: &snapshot.files,
             root: Path::new(&snapshot.root),
-            by_path,
-            by_folded_path: SpillMap::default(),
-            by_basename: SpillMap::default(),
+            by_path: output_lookup(&snapshot.files, 0)?,
         })
     }
 
-    fn match_expected(&mut self, expected: &Expected<'_>, mode: BasenameMode) -> io::Result<Slots> {
+    fn match_expected(&self, expected: &Expected<'_>, mode: BasenameMode) -> io::Result<Slots> {
         let mut matched = Slots::new(expected.len())?;
         let mut used = vec![false; self.files.len()];
-        let mut remaining = expected.len();
+        let mut remaining = 0;
         // Reserve exact matches for the entire manifest before any fallback
         // can steal another entry's output. Every output contributes once.
         for pass in 0..3 {
-            if remaining == 0 || (pass == 2 && matches!(mode, BasenameMode::None)) {
+            if (pass != 0 && remaining == 0) || (pass == 2 && matches!(mode, BasenameMode::None)) {
                 break;
             }
-            if pass == 1 {
-                // The common exact-path case never builds fallback indexes.
-                for (output, item) in self.files.iter().enumerate() {
-                    let path = output_relative_path(item);
-                    if path.is_empty() {
-                        continue;
-                    }
-                    let folded = normalize_match_path(&path);
-                    insert_unique_output(&mut self.by_folded_path, folded.clone(), output)?;
-                    if !matches!(mode, BasenameMode::None) {
-                        insert_unique_output(
-                            &mut self.by_basename,
-                            normalize_match_name(basename(&folded)),
-                            output,
-                        )?;
-                    }
-                }
-            }
+            // Build each fallback only while a safe unmatched name needs it.
+            let fallback;
+            let slots = if pass == 0 {
+                &self.by_path
+            } else {
+                fallback = output_lookup(self.files, pass)?;
+                &fallback
+            };
             for position in 0..expected.len() {
                 if matched.get(position) != 0 {
                     continue;
@@ -302,22 +321,19 @@ impl<'a> OutputIndex<'a> {
                 if item.unsafe_path {
                     continue;
                 }
-                let (output, by) = match pass {
-                    0 => (self.by_path.get(item.path.as_ref())?, "path"),
-                    1 => (
-                        self.by_folded_path.get(&normalize_match_path(&item.path))?,
-                        "path",
-                    ),
-                    _ => (
-                        self.by_basename
-                            .get(&normalize_match_name(basename(&item.path)))?,
-                        "basename",
-                    ),
+                if pass == 0 {
+                    remaining += 1;
+                }
+                let key = match pass {
+                    0 => Cow::Borrowed(item.path.as_ref()),
+                    1 => Cow::Owned(normalize_match_path(&item.path)),
+                    _ => Cow::Owned(normalize_match_name(basename(&item.path))),
                 };
-                if let Some(output) = output {
-                    if output != AMBIGUOUS_OUTPUT && !used[output] {
+                let value = slots.get(output_slot(self.files, slots, &key, pass));
+                if value != 0 && value & 1 == 0 {
+                    let output = (value >> 1) as usize - 1;
+                    if !used[output] {
                         used[output] = true;
-                        let _ = by;
                         matched.set(position, output as u64 * 4 + pass + 1);
                         remaining -= 1;
                     }
@@ -395,7 +411,7 @@ fn match_inventory_source(
         ));
     }
 
-    let mut index = OutputIndex::new(&snapshot)?;
+    let index = OutputIndex::new(&snapshot)?;
     let matches = index.match_expected(&expected, basename_mode)?;
     let mut coverage = Coverage::default();
     coverage.expected_files = expected.len();
@@ -1134,6 +1150,28 @@ mod windows_output_name_tests {
         );
         assert_eq!(result.coverage.complete_files, 0);
         assert_eq!(result.missing_count, 1);
+    }
+
+    #[test]
+    fn output_slots_compare_full_keys_through_collisions_and_duplicate_paths() {
+        // Existing name cases do not force a probe chain or an exact duplicate.
+        // One in-memory inventory checks both without a large filesystem corpus.
+        let names = (0..)
+            .map(|index| format!("collision-{index}.txt"))
+            .filter(|name| crate::fast_hash::xxh64(name.as_bytes(), 0) & 255 == 0)
+            .take(64)
+            .collect::<Vec<_>>();
+        let expected = names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| (name.as_str(), index as u32))
+            .collect::<Vec<_>>();
+        let mut actual = expected.clone();
+        actual.push(expected[0]);
+        let result = bug_regression_match(&expected, &actual, BasenameMode::None);
+        assert_eq!(result.coverage.complete_files, 63);
+        assert_eq!(result.missing, vec![names[0].clone()]);
+        assert_eq!(result.mismatch_count, 0);
     }
 
     #[test]

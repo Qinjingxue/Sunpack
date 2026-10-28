@@ -309,6 +309,12 @@ impl Slots {
         file.set_len(bytes as u64)?;
         Ok(Self::Disk(Mapping::new(&file, true)?))
     }
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Memory(values) => values.len(),
+            Self::Disk(map) => map.len() / 8,
+        }
+    }
     pub fn get(&self, index: usize) -> u64 {
         match self {
             Self::Memory(values) => values[index],

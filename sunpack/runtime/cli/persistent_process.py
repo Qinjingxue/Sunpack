@@ -760,98 +760,104 @@ async def run_server() -> int:
         return 2
     import secrets
 
-    lock_stream = _acquire_server_lock()
-    if lock_stream is None:
-        return 0
-    token = secrets.token_bytes(32)
-    from sunpack.runtime.cli.persistent_runtime import (
-        close_persistent_runtime,
-        enable_persistent_runtime,
-        persistent_runtime_is_idle,
-        persistent_server_idle_seconds,
-    )
-    from sunpack.runtime.cli.runtime_host import RuntimeHost
-    from sunpack.runtime.cli.runtime_state import set_runtime_host
+    from sunpack.core.platform.windows.file_mutex import file_mutex
 
-    shutdown = asyncio.Event()
-    state_changed = asyncio.Event()
-    state = {
-        "served": False,
-        "last_completed": time.monotonic(),
-        "active": 0,
-        "exit_reason": "shutdown",
-    }
-
-    def notify_state_changed() -> None:
-        state_changed.set()
-
-    enable_persistent_runtime(state_changed=notify_state_changed)
-    runtime_host = RuntimeHost(
-        log_path=state_path() + ".events.json",
-        state_changed=notify_state_changed,
-    )
-    set_runtime_host(runtime_host)
-
-    def connected() -> None:
-        state["active"] += 1
-        notify_state_changed()
-
-    def closed() -> None:
-        state["active"] = max(0, state["active"] - 1)
-        notify_state_changed()
-
-    def completed() -> None:
-        state["served"] = True
-        state["last_completed"] = time.monotonic()
-        notify_state_changed()
-
-    def requested_shutdown() -> None:
-        state["exit_reason"] = "cli_shutdown"
-        shutdown.set()
-        notify_state_changed()
-
-    loop = asyncio.get_running_loop()
-    start_serving_pipe = getattr(loop, "start_serving_pipe", None)
-    if start_serving_pipe is None:
-        try:
-            await runtime_host.close(exit_reason="pipe_transport_unavailable")
-        finally:
-            set_runtime_host(None)
-            await close_persistent_runtime()
-            lock_stream.close()
-        return 1
-
-    # Each server owns a distinct endpoint. A state file left by a terminated
-    # server can only name its dead pipe, never the next server's pipe.
-    name = f"{pipe_name()}-{secrets.token_hex(16)}"
-
-    def protocol_factory() -> _PipeRequestProtocol:
-        return _PipeRequestProtocol(
-            token,
-            on_connected=connected,
-            on_closed=closed,
-            on_completed=completed,
-            on_shutdown=requested_shutdown,
+    # A competing server may exit successfully only after its lock owner has
+    # published a usable endpoint (or failed and released startup ownership).
+    # Release this short startup gate before accepting any command work.
+    with file_mutex(state_path(), prefix="SunPack.RuntimeStartup"):
+        lock_stream = _acquire_server_lock()
+        if lock_stream is None:
+            return 0
+        token = secrets.token_bytes(32)
+        from sunpack.runtime.cli.persistent_runtime import (
+            close_persistent_runtime,
+            enable_persistent_runtime,
+            persistent_runtime_is_idle,
+            persistent_server_idle_seconds,
         )
+        from sunpack.runtime.cli.runtime_host import RuntimeHost
+        from sunpack.runtime.cli.runtime_state import set_runtime_host
 
-    from sunpack.core.platform.windows.secure_pipe import start_serving_current_user_pipe
+        shutdown = asyncio.Event()
+        state_changed = asyncio.Event()
+        state = {
+            "served": False,
+            "last_completed": time.monotonic(),
+            "active": 0,
+            "exit_reason": "shutdown",
+        }
 
-    try:
-        # Publish this server's token before its pipe can accept a connection.
-        # A previous session may have left a state file with an old token;
-        # exposing the new pipe first lets a client submit that stale token
-        # and mistake the resulting rejection for an uncertain delivery.
-        _write_state(name, token)
-        servers = await start_serving_current_user_pipe(loop, protocol_factory, name)
-    except Exception:
-        _remove_state_if_owned(name, token)
+        def notify_state_changed() -> None:
+            state_changed.set()
+
+        enable_persistent_runtime(state_changed=notify_state_changed)
+        runtime_host = RuntimeHost(
+            log_path=state_path() + ".events.json",
+            state_changed=notify_state_changed,
+        )
+        set_runtime_host(runtime_host)
+
+        def connected() -> None:
+            state["active"] += 1
+            notify_state_changed()
+
+        def closed() -> None:
+            state["active"] = max(0, state["active"] - 1)
+            notify_state_changed()
+
+        def completed() -> None:
+            state["served"] = True
+            state["last_completed"] = time.monotonic()
+            notify_state_changed()
+
+        def requested_shutdown() -> None:
+            state["exit_reason"] = "cli_shutdown"
+            shutdown.set()
+            notify_state_changed()
+
+        loop = asyncio.get_running_loop()
+        start_serving_pipe = getattr(loop, "start_serving_pipe", None)
+        if start_serving_pipe is None:
+            try:
+                await runtime_host.close(exit_reason="pipe_transport_unavailable")
+            finally:
+                set_runtime_host(None)
+                await close_persistent_runtime()
+                lock_stream.close()
+            return 1
+
+        # Each server owns a distinct endpoint. A state file left by a terminated
+        # server can only name its dead pipe, never the next server's pipe.
+        name = f"{pipe_name()}-{secrets.token_hex(16)}"
+
+        def protocol_factory() -> _PipeRequestProtocol:
+            return _PipeRequestProtocol(
+                token,
+                on_connected=connected,
+                on_closed=closed,
+                on_completed=completed,
+                on_shutdown=requested_shutdown,
+            )
+
+        from sunpack.core.platform.windows.secure_pipe import start_serving_current_user_pipe
+
         try:
-            await runtime_host.close(exit_reason="pipe_create_failed")
-        finally:
-            set_runtime_host(None)
-            await close_persistent_runtime()
-            lock_stream.close()
-        return 1
+            # Publish this server's token before its pipe can accept a connection.
+            # A previous session may have left a state file with an old token;
+            # exposing the new pipe first lets a client submit that stale token
+            # and mistake the resulting rejection for an uncertain delivery.
+            _write_state(name, token)
+            servers = await start_serving_current_user_pipe(loop, protocol_factory, name)
+        except Exception:
+            _remove_state_if_owned(name, token)
+            try:
+                await runtime_host.close(exit_reason="pipe_create_failed")
+            finally:
+                set_runtime_host(None)
+                await close_persistent_runtime()
+                lock_stream.close()
+            return 1
 
     async def monitor_idle() -> None:
         await _monitor_idle_shutdown(
