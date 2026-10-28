@@ -114,6 +114,7 @@ def test_real_watchdog_observer_detects_config_change(tmp_path):
             observer.stop()
     asyncio.run(scenario())
 
+
 def test_config_directory_handle_is_tracked_without_blocking_promotion(tmp_path):
     from sunpack.core.support.resource_lifecycle import promotion_barrier
     from sunpack_native import (
