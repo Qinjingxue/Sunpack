@@ -32,12 +32,13 @@ const FILE_FLAG_OVERLAPPED: u32 = 0x4000_0000;
 const FILE_FLAG_SEQUENTIAL_SCAN: u32 = 0x0800_0000;
 
 #[repr(C)]
-struct Overlapped {
-    internal: usize,
-    internal_high: usize,
-    offset: u32,
-    offset_high: u32,
-    event: Handle,
+#[derive(Default)]
+pub(super) struct Overlapped {
+    pub(super) internal: usize,
+    pub(super) internal_high: usize,
+    pub(super) offset: u32,
+    pub(super) offset_high: u32,
+    pub(super) event: Handle,
 }
 
 #[link(name = "kernel32")]
@@ -77,7 +78,7 @@ unsafe extern "system" {
         completion_key: usize,
         overlapped: *mut Overlapped,
     ) -> i32;
-    fn CancelIoEx(file: Handle, overlapped: *mut Overlapped) -> i32;
+    pub(super) fn CancelIoEx(file: Handle, overlapped: *mut Overlapped) -> i32;
     fn CloseHandle(handle: Handle) -> i32;
     fn GetLastError() -> u32;
 }

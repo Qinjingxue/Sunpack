@@ -1,5 +1,7 @@
 pub(crate) mod archive_state;
 pub(crate) mod atomic_file;
+#[cfg(windows)]
+pub(crate) mod config_changes;
 pub(crate) mod directory_errors;
 pub(crate) mod display_store;
 pub(crate) mod display_wake;

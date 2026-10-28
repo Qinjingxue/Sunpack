@@ -2,11 +2,35 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import os
 from pathlib import Path
 from typing import Callable, Iterable
 
-from watchdog.events import FileSystemEvent, FileSystemEventHandler
-from watchdog.observers import Observer
+from watchdog.events import DirModifiedEvent, FileModifiedEvent, FileSystemEvent, FileSystemEventHandler
+from watchdog.observers.api import BaseObserver, EventEmitter
+
+
+class _ConfigEmitter(EventEmitter):
+    def on_thread_start(self) -> None:
+        from sunpack_native import NativeConfigChanges
+        # The first OS request is armed synchronously, before start() returns.
+        self._changes = NativeConfigChanges(self.watch.path)
+
+    def on_thread_stop(self) -> None:
+        if changes := getattr(self, "_changes", None):
+            changes.close()
+
+    def queue_events(self, timeout: float) -> None:
+        names = self._changes.read()
+        if names is None:
+            self.queue_event(DirModifiedEvent(self.watch.path))
+        else:
+            for name in names:
+                self.queue_event(FileModifiedEvent(os.path.join(self.watch.path, name)))
+
+
+def _config_observer():
+    return BaseObserver(_ConfigEmitter)
 
 
 class ConfigFileObserver:
@@ -19,7 +43,7 @@ class ConfigFileObserver:
         callback: Callable[[], None],
         *,
         debounce_seconds: float = 0.5,
-        observer_factory=Observer,
+        observer_factory=_config_observer,
         loop: asyncio.AbstractEventLoop,
         additional_files=(),
     ) -> None:
@@ -55,6 +79,8 @@ class ConfigFileObserver:
                 return
             started = self._started
             previous = self._directories
+            # Dispatch may start inside schedule(); publish filters first.
+            self._files = selected
         # Watchdog dispatch holds its own lock before calling our handler.
         # Never take that lock while holding the callback/timer lock.
         if started:
@@ -63,7 +89,6 @@ class ConfigFileObserver:
             for directory in previous - directories:
                 self._observer.unschedule(self._watches.pop(directory))
         with self._lock:
-            self._files = selected
             self._directories = directories
 
     def start(self) -> None:
@@ -108,6 +133,12 @@ class ConfigFileObserver:
             self._pending_callbacks.update(callbacks)
             self._loop.call_soon_threadsafe(self._schedule_emit)
 
+    def notify_directory_changed(self, path: str) -> None:
+        directory = Path(path).resolve()
+        for filename in tuple(self._files):
+            if Path(filename).parent == directory:
+                self.notify_path_changed(filename)
+
     def _schedule_emit(self) -> None:
         with self._lock:
             if self._stopped:
@@ -135,7 +166,10 @@ class _ConfigEventHandler(FileSystemEventHandler):
         self._handle(event)
 
     def on_modified(self, event: FileSystemEvent) -> None:
-        self._handle(event)
+        if event.is_directory:
+            self.owner.notify_directory_changed(event.src_path)
+        else:
+            self._handle(event)
 
     def on_deleted(self, event: FileSystemEvent) -> None:
         self._handle(event)

@@ -1161,14 +1161,31 @@ def test_persistent_config_snapshot_reuses_a_source_without_mtime_checks(tmp_pat
     assert calls == ["first", "second"]
 
 
-def test_external_config_sources_reload_between_requests_and_evict_watches(tmp_path, monkeypatch):
+@pytest.mark.parametrize("delay_reader", [False, True])
+def test_external_config_sources_reload_between_requests_and_evict_watches(tmp_path, monkeypatch, delay_reader):
     """Cover real request-source events and bounded watch lifetime together.
 
     Fixed-directory/fake-snapshot tests miss external override updates. This
     single event-driven case also catches observer retention after LRU eviction.
+    Holding the emitter until after replacement exposes lost startup events
+    deterministically; normal scheduling and fake events cannot guarantee this.
     """
     import json
+    import threading
+    from pathlib import Path
+    from watchdog.observers.api import EventEmitter
     from sunpack.runtime.cli import persistent_runtime as runtime
+
+    read_allowed = threading.Event()
+    original_run = EventEmitter.run
+
+    def run_after_replacement(emitter):
+        if Path(emitter.watch.path).name == "external-one":
+            read_allowed.wait()
+        original_run(emitter)
+
+    if delay_reader:
+        monkeypatch.setattr(EventEmitter, "run", run_after_replacement)
 
     async def scenario():
         await runtime.close_persistent_runtime()
@@ -1189,12 +1206,14 @@ def test_external_config_sources_reload_between_requests_and_evict_watches(tmp_p
             replacement = first_dir / "replacement.json"
             replacement.write_text(json.dumps({"post_extract": {"archive_cleanup_mode": "d"}}), encoding="utf-8")
             replacement.replace(first)
+            read_allowed.set()
             await asyncio.wait_for(reloaded.wait(), 3)
             assert runtime.load_request_config()["post_extract"]["archive_cleanup_mode"] == "delete"
             monkeypatch.setenv("SUNPACK_CONFIG_OVERRIDES", str(second))
             assert runtime.load_request_config()["post_extract"]["archive_cleanup_mode"] == "recycle"
             assert first_dir.resolve() not in runtime._CONFIG_OBSERVER._directories
         finally:
+            read_allowed.set()
             await runtime.close_persistent_runtime()
     asyncio.run(scenario())
 

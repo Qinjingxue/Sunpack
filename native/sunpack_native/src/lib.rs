@@ -55,6 +55,7 @@ fn sunpack_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<fast_hash::FastHash128>()?;
     #[cfg(windows)]
     {
+        m.add_class::<io::config_changes::NativeConfigChanges>()?;
         m.add_function(wrap_pyfunction!(
             io::file_generation::file_generation_tokens,
             m
