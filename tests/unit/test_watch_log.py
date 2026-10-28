@@ -275,7 +275,8 @@ def test_log_corruption_rebuilds_through_cli_and_writer_and_retries_after_failur
         rows = _records(path)
         assert not any(row["event"] == "done" and row["path"] == "old-completed-history" for row in rows)
         assert any(row["event"] == "suspended_missing_volume" for row in rows)
-        restored_group = next(row for row in rows if row["event"] == "pipeline_sources_claimed")["groups"][0]
+        restored_group = next(row["groups"][0] for row in rows
+                              if row["event"] == "pipeline_sources_claimed" and row["groups"][0]["path"] == str(source))
         assert {key: restored_group[key] for key in group} == group
 
     asyncio.run(command())
@@ -292,6 +293,10 @@ def test_log_corruption_rebuilds_through_cli_and_writer_and_retries_after_failur
     state = WatchStateStore(state_path)
     log = WatchLogStore(str(path))
     state._native.attach_events(log._native)
+    log.recover(state._native)  # Match scheduler startup before online rebuilds.
+    active, member = str(tmp_path / "active.blob"), str(tmp_path / "active.002")
+    log.write("pipeline_sources_claimed", owner="live", processing=True,
+              groups=[{"path": active, "members": [active, member], "name": "inside.zip"}])
     host._watch_service = SimpleNamespace(log=log)
     try:
         # Force both publication and rebuild to fail, without a retry timer.
@@ -316,6 +321,19 @@ def test_log_corruption_rebuilds_through_cli_and_writer_and_retries_after_failur
         path.write_text("[]", encoding="utf-8")
         asyncio.run(command())
         restored()
+        # WAL-only reconstruction tests miss live processing and owner aliases.
+        # Reuse the failure/rebuild lifecycle: removing these checks loses that
+        # online coverage; two tiny events add no separate fixture or timing.
+        active_row = next(r for r in _records(path) if r["event"] == "processing_started")
+        assert active_row["path"] == active
+        log.write("done", path=member, owner="live")
+        log.write("pipeline_sources_released", owner="live")
+        log.flush()
+        rows = _records(path)
+        finished = next(r for r in rows if r["event"] == "done" and r.get("owner") == "live")
+        finished_group = next(r["groups"][0] for r in rows
+                              if r["event"] == "pipeline_sources_claimed" and r["groups"][0]["path"] == active)
+        assert finished["path"] == active and set(finished_group["members"]) == {active, member}
         # Race native snapshot recovery with real WAL changes and ordinary
         # writes. The serial recovery checks cannot catch overwritten notices.
         def mutate():

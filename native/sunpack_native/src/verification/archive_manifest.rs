@@ -16,6 +16,17 @@ pub(crate) struct ManifestEntry {
     pub(crate) crc32: Option<u32>,
 }
 
+/// Same MessagePack field order as ManifestEntry. The mapping owns every
+/// borrowed name, so verification allocates no per-row copies or cache.
+#[derive(Deserialize)]
+pub(crate) struct ManifestEntryView<'a> {
+    pub(crate) path: &'a str,
+    #[serde(borrow)]
+    pub(crate) raw_path: Option<&'a str>,
+    pub(crate) size: u64,
+    pub(crate) crc32: Option<u32>,
+}
+
 /// Summary plus a Rust-owned entry table for one archive-input manifest.
 ///
 /// Python only sees aggregate fields and bounded views; the per-entry table
@@ -39,6 +50,22 @@ pub(crate) struct NativeArchiveManifest {
 }
 
 impl NativeArchiveManifest {
+    pub(crate) fn entry_view(&self, index: usize) -> std::io::Result<ManifestEntryView<'_>> {
+        if let Some(bytes) = self.entries.serialized(index)? {
+            return rmp_serde::from_slice(bytes).map_err(std::io::Error::other);
+        }
+        let Rows::Memory(rows) = self.entries.as_ref() else {
+            unreachable!()
+        };
+        let row = &rows[index];
+        Ok(ManifestEntryView {
+            path: &row.path,
+            raw_path: row.raw_path.as_deref(),
+            size: row.size,
+            crc32: row.crc32,
+        })
+    }
+
     pub(crate) fn entry_count(&self, limit: Option<usize>) -> usize {
         limit.unwrap_or(self.entries.len()).min(self.entries.len())
     }

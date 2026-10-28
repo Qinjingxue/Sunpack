@@ -4,6 +4,42 @@ from types import SimpleNamespace
 from sunpack.pipeline.coordinator.engine import _PathLeaseRegistry, _RequestRuntime
 
 
+def test_stop_during_family_replacement_unregisters_only_its_waiter(tmp_path):
+    # Split-request integration coalesces exact watch generations; it never
+    # waits in replace. Removing this loses that separate upgrade path. One
+    # file-free, event-synchronized lease is enough to cover it.
+    import pytest
+    from sunpack.pipeline.coordinator.async_work import CancellationToken
+
+    async def scenario():
+        registry = _PathLeaseRegistry()
+        path = str(tmp_path / "shared.zip")
+        await registry.acquire("owner", [path])
+        token = CancellationToken()
+        registered = asyncio.Event()
+        register = registry._register_waiter
+
+        def observe(blockers):
+            future = register(blockers)
+            registered.set()
+            return future
+
+        registry._register_waiter = observe
+        waiter = asyncio.create_task(registry.replace("follower", [path], cancellation=token))
+        await registered.wait()
+        token.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(waiter, 3)
+        assert registry._owned == {"owner": {path}}
+        assert not registry._waiter_blockers and not registry._waiters_by_blocker
+        assert not token._callbacks
+        await registry.release("owner")
+        await registry.acquire("next", [path])
+        await registry.release("next")
+
+    asyncio.run(scenario())
+
+
 def test_conflicting_path_lease_is_woken_by_release(tmp_path):
     async def scenario() -> None:
         registry = _PathLeaseRegistry()

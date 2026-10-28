@@ -15,6 +15,154 @@ from tests.helpers.fs_builder import make_zip
 
 
 @pytest.mark.parametrize("origin", ["foreground", "watch"])
+def test_stop_waiting_split_member_finishes_without_cancelling_its_owner(tmp_path, monkeypatch, origin):
+    """Live-IO stop tests never cancel a lease/coalesced follower.
+
+    Removing this loses distinct-volume admission and token wiring coverage.
+    Two tiny real volumes and an event gate cover both modes without load.
+    """
+    from sunpack.pipeline.coordinator.archive_registry import ActiveArchiveRegistry
+
+    data = make_zip({"payload.txt": b"split cancellation" * 100})
+    first, second = tmp_path / "archive.zip.001", tmp_path / "archive.zip.002"
+    cut = len(data) // 2
+    first.write_bytes(data[:cut])
+    second.write_bytes(data[cut:])
+    admission = ActiveArchiveRegistry()
+    assert admission.reserve("one", origin, [str(first)]) is None
+    assert admission.reserve("two", origin, [str(second)]) is None
+    config = make_config({"post_extract": {"archive_cleanup_mode": "k", "flatten_single_directory": False}})
+    verify = archive_job.verify_and_project
+
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        verifying, waiting = asyncio.Event(), asyncio.Event()
+        release = threading.Event()
+        token = CancellationToken()
+
+        def gated_verify(*args, **kwargs):
+            loop.call_soon_threadsafe(verifying.set)
+            assert release.wait(10)
+            return verify(*args, **kwargs)
+
+        monkeypatch.setattr(archive_job, "verify_and_project", gated_verify)
+        async with PipelineEngine(config) as engine:
+            registry = engine._path_leases
+            register, replace = registry._register_waiter, registry.replace
+
+            def registered(blockers):
+                future = register(blockers)
+                waiting.set()
+                return future
+
+            async def replaced(*args, **kwargs):
+                owner = await replace(*args, **kwargs)
+                if owner:
+                    waiting.set()
+                return owner
+
+            monkeypatch.setattr(registry, "_register_waiter", registered)
+            monkeypatch.setattr(registry, "replace", replaced)
+            one = asyncio.create_task(engine.run([str(first)], origin=origin,
+                stdout=io.StringIO(), stderr=io.StringIO()))
+            two = None
+            try:
+                await asyncio.wait_for(verifying.wait(), 10)
+                two = asyncio.create_task(engine.run([str(second)], origin=origin, cancellation=token,
+                    stdout=io.StringIO(), stderr=io.StringIO()))
+                await asyncio.wait_for(waiting.wait(), 10)
+                token.cancel()
+                response = await asyncio.wait_for(asyncio.shield(two), 3)
+                assert response.interrupted and response.summary.success_count == 0
+                assert not token._callbacks
+                assert not one.done(), "stopping a follower joined/cancelled its owner"
+            finally:
+                release.set()
+                results = await asyncio.wait_for(asyncio.gather(one, *([two] if two else [])), 10)
+            assert results[0].summary.success_count == 1 and not results[0].interrupted
+            assert engine.is_idle()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("prompt", ["initial", "retry", "replacement"])
+def test_cli_prompt_stop_returns_interrupted_over_the_real_protocol(tmp_path, monkeypatch, prompt):
+    """Pipeline/console stop tests miss command results after prompt input.
+
+    Without this, empty answers can silently turn stop into ordinary failure.
+    A tiny encrypted ZIP exercises all password prompt phases with no server.
+    """
+    import struct
+    import subprocess
+    from sunpack.runtime.cli import cli, persistent_process, runtime_state
+    from sunpack.runtime.cli.commands import extract
+    from tests.helpers.tool_config import require_7z
+
+    payload, archive = tmp_path / "payload.txt", tmp_path / "prompt.zip"
+    payload.write_text("password prompt", encoding="utf-8")
+    subprocess.run([str(require_7z()), "a", "-tzip", "-psecret", str(archive), str(payload), "-y"],
+                   check=True, capture_output=True)
+    config = make_config({"post_extract": {"archive_cleanup_mode": "k"}})
+    monkeypatch.setattr(cli, "runtime_id_available", lambda: False)
+    monkeypatch.setattr(extract, "load_request_config", lambda *a, **k: config)
+    monkeypatch.setattr(extract, "pipeline_engine", PipelineEngine)
+    monkeypatch.setattr(runtime_state, "runtime_host", lambda: None)
+
+    async def scenario():
+        protocol = persistent_process._PipeRequestProtocol(b"t" * 32,
+            on_connected=lambda: None, on_closed=lambda: None,
+            on_completed=lambda: None, on_shutdown=lambda: None)
+        prompts = asyncio.Queue()
+
+        class Transport:
+            def __init__(self):
+                self.wire = bytearray()
+
+            def write(self, data):
+                self.wire.extend(data)
+                if data == struct.pack("!BI", 3, 0):
+                    prompts.put_nowait(None)
+
+            def get_write_buffer_size(self):
+                return 0
+
+            def close(self):
+                pass
+
+        transport = Transport()
+        protocol.connection_made(transport)
+        argv = ["extract", str(archive), "--no-builtin-pw", "--pause"]
+        if prompt == "initial":
+            argv.append("--ask-pw")
+        request = {"cwd": str(tmp_path), "argv": argv}
+        protocol._payload = request
+        task = protocol._request_task = asyncio.create_task(protocol._run_request(request))
+        try:
+            await asyncio.wait_for(prompts.get(), 10)
+            if prompt == "replacement":
+                protocol.data_received(struct.pack("!I", 2) + b"y\n")
+                await asyncio.wait_for(prompts.get(), 10)
+            protocol.data_received(b"\xff" * 4 + struct.pack("!I", 0))
+            await asyncio.wait_for(task, 10)
+            data, code = io.BytesIO(transport.wire[20:]), None
+            while header := data.read(5):
+                kind, size = struct.unpack("!BI", header)
+                body = data.read(size)
+                if kind == 0:
+                    code = struct.unpack("!i", body)[0]
+            assert protocol._cancellation.cancelled and code == 130
+            assert not protocol._cancellation._callbacks
+            assert prompts.empty(), "stop must not enter pause-on-exit"
+        finally:
+            pending = [t for t in (task, protocol._output_task) if t is not None and not t.done()]
+            for t in pending:
+                t.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("origin", ["foreground", "watch"])
 def test_interruption_joins_verification_rolls_back_tree_and_keeps_completed_root(tmp_path, monkeypatch, origin):
     """Other extraction tests never interrupt a live verifier in a nested tree.
 

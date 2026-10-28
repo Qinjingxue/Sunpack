@@ -555,7 +555,6 @@ impl NativeWatchState {
 
     fn attach_events(&self, log: PyRef<'_, crate::event_log::NativeEventLog>) -> PyResult<()> {
         *self.events.lock().unwrap() = Some(Arc::downgrade(log.shared()?));
-        *log.shared()?.source.lock().unwrap() = Arc::downgrade(&self.data);
         Ok(())
     }
 

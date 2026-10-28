@@ -120,37 +120,24 @@ impl Expected<'_> {
         match self {
             Self::Items(items) => Ok(items[index].clone()),
             Self::Manifest(manifest, _, names_only) => {
-                let item = manifest.entries.get(index)?;
-                let mut file = match item {
-                    Cow::Borrowed(item) => archive_file(
-                        &item.path,
-                        Cow::Borrowed(item.raw_path.as_deref().unwrap_or(&item.path)),
-                        Some(item.size),
-                        item.crc32.is_some(),
-                        item.crc32,
-                    )
-                    .unwrap_or_else(|| ArchiveFile {
-                        path: Cow::Borrowed(""),
-                        raw_path: Cow::Borrowed(item.raw_path.as_deref().unwrap_or(&item.path)),
-                        unsafe_path: true,
-                        size: Some(item.size),
-                        has_crc: item.crc32.is_some(),
-                        crc32: item.crc32,
-                    }),
-                    Cow::Owned(item) => {
-                        let raw = item.raw_path.as_deref().unwrap_or(&item.path);
-                        let path =
-                            windows_output_relative_path(clean_relative_archive_path(&item.path))
-                                .into_owned();
-                        ArchiveFile {
-                            unsafe_path: path.is_empty() || unsafe_archive_path(raw),
-                            path: Cow::Owned(path),
-                            raw_path: Cow::Owned(raw.to_owned()),
-                            size: Some(item.size),
-                            has_crc: item.crc32.is_some(),
-                            crc32: item.crc32,
-                        }
-                    }
+                let item = manifest.entry_view(index)?;
+                let raw = item.raw_path.unwrap_or(item.path);
+                let unsafe_path = unsafe_archive_path(raw);
+                // Native manifests already own the worker's projected names,
+                // including numbered collisions. Only rejected raw names bypass
+                // that projection; keep their existing diagnostic/name-only view.
+                let path = if unsafe_path {
+                    windows_output_relative_path(clean_relative_archive_path(item.path))
+                } else {
+                    Cow::Borrowed(item.path)
+                };
+                let mut file = ArchiveFile {
+                    unsafe_path: unsafe_path || path.is_empty(),
+                    path,
+                    raw_path: Cow::Borrowed(raw),
+                    size: Some(item.size),
+                    has_crc: item.crc32.is_some(),
+                    crc32: item.crc32,
                 };
                 // Name coverage retains its original semantics. Size/CRC methods
                 // consume the same table without this projection.
@@ -839,22 +826,6 @@ fn archive_items_from_py(archive_files: &Bound<'_, PyAny>) -> PyResult<Vec<Archi
     Ok(items)
 }
 
-#[cfg(test)]
-fn archive_items_from_manifest(entries: &[ManifestEntry]) -> Vec<ArchiveFile<'_>> {
-    entries
-        .iter()
-        .filter_map(|item| {
-            archive_file(
-                &item.path,
-                Cow::Borrowed(item.raw_path.as_deref().unwrap_or(&item.path)),
-                Some(item.size),
-                item.crc32.is_some(),
-                item.crc32,
-            )
-        })
-        .collect()
-}
-
 fn archive_file<'a>(
     projected: &'a str,
     raw_path: Cow<'a, str>,
@@ -985,7 +956,10 @@ mod windows_output_name_tests {
     use super::*;
 
     #[test]
-    fn manifest_borrows_names_but_still_projects_invalid_windows_names() {
+    fn resident_and_spilled_manifests_preserve_projected_raw_and_blocked_names() {
+        // Small dict expectations never exercise the native spill decoder or
+        // its distinct projected/raw names. Replace the old projection-only
+        // check with both storage modes; three rows force spill without a corpus.
         let entries = vec![
             ManifestEntry {
                 path: "dir/é.txt".into(),
@@ -994,8 +968,8 @@ mod windows_output_name_tests {
                 crc32: Some(10),
             },
             ManifestEntry {
-                path: "logs/12:30.log".into(),
-                raw_path: None,
+                path: "logs/12_30(1).log".into(),
+                raw_path: Some("logs/12:30.log".into()),
                 size: 2,
                 crc32: Some(20),
             },
@@ -1006,15 +980,53 @@ mod windows_output_name_tests {
                 crc32: None,
             },
         ];
-        let expected = archive_items_from_manifest(&entries);
-        assert!(matches!(expected[0].path, Cow::Borrowed(_)));
-        assert!(matches!(expected[0].raw_path, Cow::Borrowed(_)));
-        assert_eq!(expected[0].path.as_ptr(), entries[0].path.as_ptr());
-        assert_eq!(expected[1].path, "logs/12_30.log");
-        assert!(matches!(expected[1].path, Cow::Owned(_)));
-        assert_eq!(expected[1].raw_path, "logs/12:30.log");
-        assert!(!expected[1].unsafe_path);
-        assert!(expected[2].unsafe_path);
+        for spill in [false, true] {
+            let mut rows = crate::io::scratch::RowBuilder::default();
+            for entry in &entries {
+                rows.push(
+                    entry.clone(),
+                    if spill {
+                        crate::io::scratch::MEMORY_BYTES
+                    } else {
+                        64
+                    },
+                )
+                .unwrap();
+            }
+            let manifest = NativeArchiveManifest {
+                status: 0,
+                is_archive: true,
+                damaged: false,
+                checksum_error: false,
+                item_count: 3,
+                file_count: 3,
+                total_unpacked_size: 6,
+                message: String::new(),
+                archive_type: "zip".into(),
+                source: "test".into(),
+                archive_walk_complete: true,
+                verified_item_count: 3,
+                failure_kind: String::new(),
+                entries: Arc::new(rows.finish().unwrap()),
+            };
+            let expected = Expected::Manifest(&manifest, 3, false);
+            let first = expected.get(0).unwrap();
+            assert_eq!(first.path, "dir/é.txt");
+            assert!(matches!(first.path, Cow::Borrowed(_)));
+            assert!(matches!(first.raw_path, Cow::Borrowed(_)));
+            assert_eq!((first.size, first.crc32), (Some(1), Some(10)));
+            let second = expected.get(1).unwrap();
+            assert_eq!(second.path, "logs/12_30(1).log");
+            assert_eq!(second.raw_path, "logs/12:30.log");
+            assert!(!second.unsafe_path);
+            let blocked = expected.get(2).unwrap();
+            assert!(blocked.unsafe_path);
+            assert_eq!(blocked.raw_path, "../safe.txt");
+            let names = Expected::Manifest(&manifest, 3, true);
+            let name = names.get(1).unwrap();
+            assert_eq!(name.path, name.raw_path);
+            assert_eq!((name.size, name.crc32, name.has_crc), (None, None, false));
+        }
     }
 
     #[test]

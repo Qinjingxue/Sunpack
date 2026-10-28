@@ -217,6 +217,7 @@ class RuntimeHost:
                     state = WatchStateStore(str(state_dir / SERVICE_STATE))
                     try:
                         state._native.attach_events(log._native)
+                        log.recover(state._native)
                         return log.rebuild()
                     finally:
                         state.close()

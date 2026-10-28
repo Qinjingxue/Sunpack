@@ -146,7 +146,7 @@ async def maybe_pause(args, ctx: CliContext, exit_code: int, result: CliCommandR
         and exit_code == EXIT_OK
         and not result.errors
     )
-    if getattr(args, "pause_on_exit", False) and not successful_extract:
+    if getattr(args, "pause_on_exit", False) and not successful_extract and exit_code != 130:
         await ctx.readline(ctx.t("cli.pause_prompt"))
 
 
@@ -248,6 +248,14 @@ async def async_main(
         async with command_work_broker(ctx) as broker:
             try:
                 exit_code, result = await dispatch_command(args, ctx)
+            except asyncio.CancelledError:
+                from sunpack.pipeline.coordinator.async_work import CURRENT_CANCELLATION
+                from sunpack.runtime.cli.cli_runtime import interrupted_result
+
+                cancellation = CURRENT_CANCELLATION.get()
+                if cancellation is None or not cancellation.cancelled:
+                    raise
+                exit_code, result = interrupted_result(ctx, getattr(args, "command", ""), {"argv": argv})
             except Exception as exc:
                 await broker.run("cli_output", "", reporter.error, ctx.t("cli.runtime_failure", error=exc))
                 result = CliCommandResult(

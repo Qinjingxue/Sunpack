@@ -1283,9 +1283,13 @@ impl MultiVolumeSource {
             let chunk_len = (logical_end - logical_start) as usize;
             let target = &mut buffer[written..written + chunk_len];
             let count = if direct {
-                volume.source.read_direct_into_at(logical_start - volume.start, target)?
+                volume
+                    .source
+                    .read_direct_into_at(logical_start - volume.start, target)?
             } else {
-                volume.source.read_into_at(logical_start - volume.start, target)?
+                volume
+                    .source
+                    .read_into_at(logical_start - volume.start, target)?
             };
             written += count;
             if count != chunk_len {

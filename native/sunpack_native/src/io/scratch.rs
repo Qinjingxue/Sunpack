@@ -272,6 +272,21 @@ impl<T: DeserializeOwned + Clone> Rows<T> {
                 .get(index)
                 .map(Cow::Borrowed)
                 .ok_or_else(|| io::Error::other("row index out of range")),
+            Self::Disk { .. } => rmp_serde::from_slice(self.serialized(index)?.unwrap())
+                .map(Cow::Owned)
+                .map_err(io::Error::other),
+        }
+    }
+    /// Borrow a spill record for zero-copy deserialization. Resident rows need
+    /// no serialization; callers borrow their typed fields directly instead.
+    pub fn serialized(&self, index: usize) -> io::Result<Option<&[u8]>> {
+        match self {
+            Self::Memory(rows) => {
+                if index >= rows.len() {
+                    return Err(io::Error::other("row index out of range"));
+                }
+                Ok(None)
+            }
             Self::Disk {
                 data,
                 offsets,
@@ -284,9 +299,7 @@ impl<T: DeserializeOwned + Clone> Rows<T> {
                 let start =
                     u64::from_le_bytes(offsets[index * 8..index * 8 + 8].try_into().unwrap())
                         as usize;
-                rmp_serde::from_slice(&data[start..])
-                    .map(Cow::Owned)
-                    .map_err(io::Error::other)
+                Ok(Some(&data[start..]))
             }
         }
     }

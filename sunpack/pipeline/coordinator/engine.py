@@ -16,7 +16,7 @@ from sunpack.core.support.path_keys import case_key, path_key_is_under, path_key
 from sunpack.core.support.path_map import PathMap
 from sunpack.pipeline.discovery.detection.input_planning import ArchiveInputPlanningStage
 from sunpack.core.contracts.pipeline import PipelineArtifacts, PipelineDiscovery, PipelineResponse, PipelineTarget
-from sunpack.core.contracts.results import ArchiveCleanupResult, DirectoryFlattenResult, OutcomeKind, TargetRunResult
+from sunpack.core.contracts.results import ArchiveCleanupResult, DirectoryFlattenResult, OutcomeKind, TargetRunResult, RunSummary
 from sunpack.core.contracts.run_state import RunState
 from sunpack.pipeline.coordinator.archive_job import ArchiveJobExecutor
 from sunpack.pipeline.coordinator.output_scan_policy import NestedOutputScanPolicy
@@ -227,7 +227,17 @@ class PipelineEngine:
                     owner_task = self._active_requests.get(coalesced.owner_request_id)
                     if owner_task is None or owner_task is task:
                         raise
-                    owner_response = await asyncio.shield(owner_task)
+                    try:
+                        owner_response = await cancellation.wait(asyncio.shield(owner_task))
+                    except asyncio.CancelledError:
+                        if not cancellation.cancelled:
+                            raise
+                        # Coalescing happens before this request starts any jobs.
+                        # Its cancellation must neither join nor roll back the owner.
+                        return PipelineResponse(
+                            request_id=submission.request_id, summary=RunSummary(), interrupted=True,
+                            discovery=PipelineDiscovery(coalesced_from_request_id=coalesced.owner_request_id),
+                        )
                     return replace(
                         owner_response,
                         request_id=submission.request_id,
@@ -460,13 +470,16 @@ class _PathLeaseRegistry:
             prepared[key] = _snapshot_lease_path(normalized)
         return tuple(prepared.values())
 
-    async def acquire(self, owner: str, paths: Iterable[str], *, lease_id: object = None) -> tuple[_LeasePath, ...]:
+    async def acquire(self, owner: str, paths: Iterable[str], *, lease_id: object = None,
+                      cancellation: CancellationToken | None = None) -> tuple[_LeasePath, ...]:
         paths = tuple(paths)
         prepared = self._snapshot_paths(paths, refresh=False)
         # The caller has finished its previous extraction/verification attempt.
         # Other jobs in this request keep their pins throughout an upgrade.
         first = True
         while True:
+            if cancellation is not None:
+                cancellation.raise_if_cancelled()
             async with self._lock:
                 if first:
                     self._unpin(owner, lease_id)
@@ -488,7 +501,10 @@ class _PathLeaseRegistry:
                     self._wake_waiters_for(owner)
                 waiter = self._register_waiter(blockers)
             try:
-                await waiter
+                if cancellation is None:
+                    await waiter
+                else:
+                    await cancellation.wait(waiter)
             except BaseException:
                 async with self._lock:
                     self._unregister_waiter(waiter)
@@ -529,6 +545,7 @@ class _PathLeaseRegistry:
         *,
         coalesce_exact: bool = False,
         deep_detect: bool = False,
+        cancellation: CancellationToken | None = None,
     ) -> str | None:
         """Atomically claim a fully resolved physical input set.
 
@@ -548,6 +565,8 @@ class _PathLeaseRegistry:
         release_previous = True
 
         while True:
+            if cancellation is not None:
+                cancellation.raise_if_cancelled()
             async with self._lock:
                 if release_previous:
                     release_previous = False
@@ -570,7 +589,10 @@ class _PathLeaseRegistry:
                     return None
                 waiter = self._register_waiter(blockers)
             try:
-                await waiter
+                if cancellation is None:
+                    await waiter
+                else:
+                    await cancellation.wait(waiter)
             except BaseException:
                 async with self._lock:
                     self._unregister_waiter(waiter)
@@ -1362,6 +1384,7 @@ class _RequestRuntime:
                 member_paths,
                 coalesce_exact=True,
                 deep_detect=self.submission.detection_options.force_scan,
+                cancellation=cancellation,
             )
             if coalesced_owner:
                 raise _CoalescedWatchRequest(coalesced_owner)
@@ -1489,7 +1512,7 @@ class _RequestRuntime:
             # Planning and password/metadata probes use the same physical input
             # lifetime as extraction. A queued old snapshot is checked only
             # after the previous owner's cleanup has relinquished its lease.
-            await self._ensure_task_lease(task, depth=depth)
+            await self._ensure_task_lease(task, depth=depth, cancellation=cancellation)
             if self.input_planning_stage.requires_analysis(task):
                 planned = await broker.run(
                     "plan", task_key, self._plan_task_isolated, task,
@@ -1894,7 +1917,8 @@ class _RequestRuntime:
                              request_id=self.submission.request_id, cancellation=cancellation)
         return result
 
-    async def _ensure_task_lease(self, task, *, depth: int = 1) -> None:
+    async def _ensure_task_lease(self, task, *, depth: int = 1,
+                               cancellation: CancellationToken | None = None) -> None:
         self.source_cleanup.register([task])
         paths = task.all_parts or [task.main_path]
         if not task.runtime.get("missing_input_paths") and self.path_leases.holds_lease(
@@ -1905,7 +1929,9 @@ class _RequestRuntime:
             self.path_leases.input_version_for(paths)
             if self.submission.origin == "watch" and depth == 1 and len(paths) > 1 else ()
         )
-        inputs = await self.path_leases.acquire(self.submission.request_id, paths, lease_id=id(task))
+        inputs = await self.path_leases.acquire(
+            self.submission.request_id, paths, lease_id=id(task), cancellation=cancellation,
+        )
         if task.runtime.get("discovery_scope") is not None:
             missing = tuple(item.path for item in inputs if item.missing)
             if missing and len(missing) == len(inputs):

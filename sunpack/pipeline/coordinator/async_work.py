@@ -54,13 +54,18 @@ class CancellationToken:
                 self._callbacks.discard(callback)
         return unsubscribe
 
-    async def run_native(self, operation):
-        """Cancel only the native await; its existing handler drains the job."""
+    async def wait(self, operation):
+        """Cancel this await; native operations retain their own drain handler.
+
+        Shared operations must be shielded by their caller.
+        """
         loop = asyncio.get_running_loop()
-        task = asyncio.create_task(operation)
+        task = asyncio.ensure_future(operation)
         remove = self.subscribe(lambda: loop.call_soon_threadsafe(task.cancel))
         try:
-            return await task
+            result = await task
+            self.raise_if_cancelled()
+            return result
         finally:
             remove()
 

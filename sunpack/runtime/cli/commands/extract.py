@@ -15,6 +15,7 @@ from sunpack.runtime.cli.cli_runtime import (
     build_password_summary,
     collect_clipboard_passwords,
     collect_cli_passwords_async,
+    interrupted_result,
     password_summary_item,
     prompt_for_passwords_async,
     resolve_common_root,
@@ -164,14 +165,7 @@ async def handle(args, ctx):
             )
             summary = response.summary
             if response.interrupted:
-                ctx.stderr.write(ctx.t("interrupt.finished") + "\n")
-                key = "interrupt.cleanup_failed" if response.interruption_cleanup_errors else "interrupt.cleaned"
-                ctx.stderr.write(ctx.t(key) + "\n")
-                for error in response.interruption_cleanup_errors:
-                    ctx.stderr.write(error + "\n")
-                return 130, CliCommandResult(command=COMMAND, inputs={"paths": target_paths},
-                    summary={"interrupted": True, "cleanup_complete": not response.interruption_cleanup_errors},
-                    errors=list(response.interruption_cleanup_errors))
+                return interrupted_result(ctx, COMMAND, {"paths": target_paths}, response.interruption_cleanup_errors)
             failures = list(summary.failures)
             scan_report.record_failures(summary.scan_failures, ctx.language)
             processed_keys = list(summary.processed_keys)

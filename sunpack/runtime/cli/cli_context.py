@@ -31,9 +31,17 @@ class CliContext:
         return self.i18n.t(key, **params)
 
     async def readline(self, prompt: str = "") -> str:
+        from sunpack.pipeline.coordinator.async_work import CURRENT_CANCELLATION
+
+        cancellation = CURRENT_CANCELLATION.get()
+        if cancellation is not None:
+            cancellation.raise_if_cancelled()
         if self.input_reader is not None:
             value = self.input_reader(prompt)
             if inspect.isawaitable(value):
-                value = await value
-            return str(value)
-        return input(prompt)
+                value = await value if cancellation is None else await cancellation.wait(value)
+        else:
+            value = input(prompt)
+        if cancellation is not None:
+            cancellation.raise_if_cancelled()
+        return str(value)

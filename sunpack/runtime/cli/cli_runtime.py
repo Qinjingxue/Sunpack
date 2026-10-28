@@ -2,7 +2,7 @@ import os
 from dataclasses import fields
 from typing import Any
 
-from sunpack.runtime.cli.cli_types import CliPasswordSummary
+from sunpack.runtime.cli.cli_types import CliCommandResult, CliPasswordSummary
 from sunpack.core.config.loader import apply_config_overrides
 from sunpack.core.config.schema import normalize_config_value
 from sunpack.core.config.detection_view import scan_filter_config, scan_filters_enabled
@@ -12,6 +12,19 @@ from sunpack.core.passwords import dedupe_passwords, PasswordStore, read_passwor
 from sunpack.core.passwords.internal.clipboard import read_clipboard_passwords
 from sunpack.core.passwords.internal.builtin import password_file_source
 from sunpack.core.passwords.internal.store import EMPTY_PASSWORD_SNAPSHOT
+
+
+def interrupted_result(ctx, command: str, inputs: dict, cleanup_errors=()):
+    ctx.stderr.write(ctx.t("interrupt.finished") + "\n")
+    key = "interrupt.cleanup_failed" if cleanup_errors else "interrupt.cleaned"
+    ctx.stderr.write(ctx.t(key) + "\n")
+    for error in cleanup_errors:
+        ctx.stderr.write(error + "\n")
+    return 130, CliCommandResult(
+        command=command, inputs=inputs,
+        summary={"interrupted": True, "cleanup_complete": not cleanup_errors},
+        errors=list(cleanup_errors),
+    )
 
 
 def build_effective_config(config: dict) -> dict[str, Any]:
