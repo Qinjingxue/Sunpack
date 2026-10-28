@@ -4,6 +4,7 @@ Ordinary extraction tests never force these boundaries. Small real fixtures
 and event gates cover the lifecycle without sleeps or probabilistic retries.
 """
 import asyncio
+import os
 import threading
 
 import pytest
@@ -13,11 +14,12 @@ from sunpack.core.contracts.discovery_scope import DiscoveryScope
 from sunpack.core.contracts.failures import FailureKind
 from sunpack.core.support.archive_sessions import release_archive_sessions_under_roots
 from sunpack.core.support.resource_lifecycle import promotion_barrier
-from sunpack.pipeline.coordinator.engine import PipelineEngine, _PathLeaseRegistry
+from sunpack.pipeline.coordinator.engine import PipelineEngine, _PathLeaseRegistry, _SourceCleanup
 from sunpack.pipeline.coordinator.scan_session import DiscoveryScanSession
 from sunpack.pipeline.coordinator.task_provider import ArchiveTaskProvider
 from sunpack.pipeline.discovery.filesystem.directory_scanner import DirectoryScanner
 from sunpack.pipeline.extraction.internal.workflow.preflight import PreExtractInspector
+from sunpack.pipeline.extraction.internal.sevenzip.sevenzip_runner import SevenZipRunner
 from sunpack.pipeline.postprocess.internal.cleanup import ArchiveCleanup
 from tests.helpers.config_factory import make_config
 from tests.helpers.real_archives import ArchiveFixtureFactory, create_encrypted_rar_archive
@@ -86,6 +88,111 @@ def test_consumed_snapshot_is_retired_at_input_admission(tmp_path, monkeypatch, 
                 raise late
             assert not late.summary.failures
             assert late.summary.success_count == 0
+            assert_expected_files_extracted(case, output)
+            assert all(len(list(output.rglob(name))) == 1 for name in case.metadata["expected_files"])
+            assert not engine._path_leases._pins
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("cleanup", ["keep", "delete"])
+def test_copy_timestamp_finalization_does_not_repeat_completed_split(tmp_path, monkeypatch, cleanup):
+    """Stable-copy tests never finalize timestamps between discovery and admission.
+
+    A copy's final metadata must identify the generation actually extracted.
+    Otherwise a concurrent member repeats the same completed archive. One
+    real split set covers retained and consumed sources without random trials.
+    """
+    case = ArchiveFixtureFactory().create(tmp_path/"fixture", "late", "7z",
+        split=True, payload_size=256*1024, split_volume_size=100*1024)
+    parts = sorted(case.archive_dir.iterdir())
+    output = tmp_path/"output"
+    config = _config(case.archive_dir, output)
+    config["post_extract"]["archive_cleanup_mode"] = cleanup
+
+    async def scenario():
+        paused, resume = _pause_first(monkeypatch, PreExtractInspector, "inspect")
+        waiting = asyncio.Event()
+        original_replace = _PathLeaseRegistry.replace
+        original_waiter = _PathLeaseRegistry._register_waiter
+        original_cleanup = _SourceCleanup._run_cleanup
+        original_submit = SevenZipRunner.submit_attempt_asyncio
+        finalized = False
+        started = []
+        cleanup_paused, cleanup_resume, cleanup_done = (asyncio.Event() for _ in range(3))
+        second_attempt, second_resume = asyncio.Event(), asyncio.Event()
+        attempts = 0
+
+        async def clean(self, *args, **kwargs):
+            cleanup_paused.set()
+            await cleanup_resume.wait()
+            try:
+                return await original_cleanup(self, *args, **kwargs)
+            finally:
+                cleanup_done.set()
+
+        async def submit(self, *args, **kwargs):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 2:
+                second_attempt.set()
+                await second_resume.wait()
+            return await original_submit(self, *args, **kwargs)
+
+        async def finalize_copy(self, owner, paths, **kwargs):
+            nonlocal finalized
+            result = await original_replace(self, owner, paths, **kwargs)
+            if not finalized:
+                finalized = True
+                for path in parts:
+                    metadata = path.stat()
+                    os.utime(path, ns=(metadata.st_atime_ns, metadata.st_mtime_ns + 1_000_000_000))
+            return result
+
+        def waiter(self, blockers):
+            waiting.set()
+            return original_waiter(self, blockers)
+
+        def progress(task, event):
+            if event.get("event") == "extract_started":
+                started.append(task.main_path)
+
+        monkeypatch.setattr(_PathLeaseRegistry, "replace", finalize_copy)
+        monkeypatch.setattr(_PathLeaseRegistry, "_register_waiter", waiter)
+        if cleanup == "delete":
+            monkeypatch.setattr(_SourceCleanup, "_run_cleanup", clean)
+            monkeypatch.setattr(SevenZipRunner, "submit_attempt_asyncio", submit)
+        async with PipelineEngine(config) as engine:
+            first = asyncio.create_task(engine.run([str(case.entry_path)], origin="watch", progress_callback=progress))
+            late = None
+            try:
+                await asyncio.wait_for(paused.wait(), 10)
+                late = asyncio.create_task(engine.run([str(parts[-1])], origin="watch", progress_callback=progress))
+                await asyncio.wait_for(waiting.wait(), 10)
+                if cleanup == "delete":
+                    resume.set()
+                    await asyncio.wait_for(cleanup_paused.wait(), 10)
+                    queued = asyncio.create_task(second_attempt.wait())
+                    try:
+                        # Let cleanup consume the sources before a duplicate
+                        # worker opens them. A reused result completes instead.
+                        await asyncio.wait_for(asyncio.wait([late, queued], return_when=asyncio.FIRST_COMPLETED), 10)
+                        cleanup_resume.set()
+                        await asyncio.wait_for(cleanup_done.wait(), 10)
+                    finally:
+                        queued.cancel()
+                        await asyncio.gather(queued, return_exceptions=True)
+            finally:
+                resume.set()
+                cleanup_resume.set()
+                second_resume.set()
+                responses = await asyncio.gather(first, *([late] if late else []), return_exceptions=True)
+            for response in responses:
+                if isinstance(response, BaseException):
+                    raise response
+                assert not response.summary.failures
+            assert responses[0].summary.success_count == 1
+            assert len(started) == 1
             assert_expected_files_extracted(case, output)
             assert all(len(list(output.rglob(name))) == 1 for name in case.metadata["expected_files"])
             assert not engine._path_leases._pins

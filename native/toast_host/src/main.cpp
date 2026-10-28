@@ -740,6 +740,7 @@ public:
     // Terminal notifications belong to Windows notification history and must
     // survive presenter teardown, watch reloads, and later batches.
     void clear() noexcept {
+        hide_progress_popup();
         if (!progress_tag_.empty()) {
             remove(progress_tag_);
             progress_tag_.clear();
@@ -758,6 +759,16 @@ private:
         try {
             ToastNotificationManager::History().Remove(tag, kToastGroup, kAppId);
         } catch (...) {
+        }
+    }
+
+    void hide_progress_popup() noexcept {
+        if (progress_popup_) {
+            try {
+                notifier_.Hide(progress_popup_);
+            } catch (...) {
+            }
+            progress_popup_ = nullptr;
         }
     }
 
@@ -789,7 +800,7 @@ private:
         }
         data.SequenceNumber(static_cast<std::uint32_t>(sequence & 0xffffffff));
         // NotificationData cannot add/remove buttons. Replace the XML only
-        // when stopping changes the actions; normal progress stays in-place.
+        // when actions change; normal progress stays in-place through Update.
         const bool same_batch = progress_tag_ == tag;
         const bool has_cancel = std::any_of(snapshot.actions.begin(), snapshot.actions.end(),
             [](const Action& action) { return action.kind == ActionKind::cancel_batch; });
@@ -810,9 +821,13 @@ private:
         toast.Tag(tag);
         toast.Group(kToastGroup);
         toast.Data(data);
-        toast.SuppressPopup(same_batch && progress_has_cancel_ != has_cancel);
+        toast.SuppressPopup(false);
         observe_dismissal(toast, "progress");
+        // A silent replacement can leave the old banner alive while changing
+        // its history entry. Hide the owned object before replacing its XML.
+        hide_progress_popup();
         notifier_.Show(toast);
+        progress_popup_ = toast;
         progress_tag_ = tag;
         progress_has_cancel_ = has_cancel;
     }
@@ -821,14 +836,13 @@ private:
         const std::wstring progress_tag = toast_tag(snapshot, L"-p");
         const std::wstring final_tag = toast_tag(snapshot, L"-f");
 
-        // Progress is transient state. Remove it before publishing the terminal
-        // event so completion is a distinct popup request rather than an in-place
-        // replacement of a progress notification that may still be on screen.
-        if (!progress_tag_.empty() && progress_tag_ != progress_tag) {
-            clear();
+        // History.Remove alone leaves the on-screen banner alive. Hide it
+        // before Show so Windows need not queue completion behind that banner.
+        const bool current_batch = progress_tag_ == progress_tag;
+        clear();
+        if (!current_batch) {
+            remove(progress_tag);
         }
-        remove(progress_tag);
-        progress_tag_.clear();
 
         // Terminal notifications intentionally use their own per-batch tag.
         // Windows owns their banner lifetime and keeps them in Notification Center.
@@ -863,6 +877,7 @@ private:
 
     winrt::Windows::UI::Notifications::ToastNotifier notifier_{nullptr};
     std::shared_ptr<DiagnosticLog> diagnostic_log_;
+    ToastNotification progress_popup_{nullptr};
     std::wstring progress_tag_;
     bool progress_has_cancel_{};
 };

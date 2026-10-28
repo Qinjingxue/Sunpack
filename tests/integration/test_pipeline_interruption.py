@@ -235,7 +235,7 @@ def test_watch_toast_stop_reaches_pipeline_and_finishes_after_durable_cleanup(tm
                 await asyncio.wait_for(finalized.wait(), 5)
                 await asyncio.gather(*controls)
                 assert host.stopped
-                assert "has been cleaned" in host.snapshots[-1].body
+                assert host.snapshots[-1].body == toast.i18n.t("interrupt.cleaned")
                 assert not watcher.state.pending_work_items()
                 assert watcher.state.latest_entry_for_path(str(archive)).status == "interrupted"
                 assert not [path for path in (tmp_path / "out").rglob("*") if path.is_file()]

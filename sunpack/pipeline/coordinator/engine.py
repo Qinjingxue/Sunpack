@@ -583,25 +583,6 @@ class _PathLeaseRegistry:
             if self._remove_owner(owner):
                 self._wake_waiters_for(owner)
 
-    def ownership_version_for(
-        self,
-        owner: str,
-        paths: Iterable[str],
-    ) -> tuple[tuple[str, int, int, int, int], ...]:
-        """Project one task's byte generation from the already-computed Watch lease."""
-        owned_version = self._ownership_versions.get(owner, ())
-        if not owned_version:
-            return ()
-        keys = {
-            path_key(os.path.abspath(os.path.normpath(path)))
-            for path in paths
-            if path
-        }
-        if not keys:
-            return ()
-        selected = tuple(row for row in owned_version if row[0] in keys)
-        return selected if len(selected) == len(keys) else ()
-
     def input_version_for(self, paths: Iterable[str], *, departed_version=()):
         snapshots = self._snapshot_paths(paths, refresh=True)
         version = _lease_ownership_version(snapshots)
@@ -1524,9 +1505,10 @@ class _RequestRuntime:
                 )
 
             ownership.remember_tasks([task])
-            watch_version = self._watch_generation_for_task(task, depth=depth)
-            if watch_version:
-                task.runtime["source_generation"] = watch_version
+            # Admission already confirmed the physical generation under the
+            # task lease. Discovery may predate a copy's final timestamp or a
+            # volume arrival; never overwrite admission with that older version.
+            watch_version = task.runtime.get("source_generation", ())
             output_dir_resolver = build_output_dir_resolver(
                 [task],
                 lambda current: ownership.output_dir_for_task(current, depth=depth),
@@ -1732,17 +1714,6 @@ class _RequestRuntime:
             )
             self._prompt_gates[depth] = gate
         return bool(await gate)
-
-    def _watch_generation_for_task(self, task, *, depth: int):
-        if self.submission.origin != "watch" or depth != 1:
-            return ()
-        part_paths = tuple(task.archive_input().part_paths())
-        if len(part_paths) < 2:
-            return ()
-        return self.path_leases.ownership_version_for(
-            self.submission.request_id,
-            part_paths,
-        )
 
     def _schedule_cleanup(self, request, *, broker, cancellation, lease_id=None,
                           mode_override: str | None = None) -> None:

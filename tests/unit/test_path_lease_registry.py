@@ -140,7 +140,7 @@ def test_completed_watch_generation_reuses_only_the_exact_unchanged_family(tmp_p
         family = (first_part, second_part)
 
         assert await registry.replace("first", family, coalesce_exact=True) is None
-        version = registry.ownership_version_for("first", family)
+        version = registry.input_version_for(family)
         assert version
         registry.remember_completed_watch(version, str(output))
         assert registry.completed_watch_output(version) == str(output)
@@ -148,7 +148,7 @@ def test_completed_watch_generation_reuses_only_the_exact_unchanged_family(tmp_p
         await registry.release("first")
         second_part.write_bytes(b"second-new-version")
         assert await registry.replace("second", family, coalesce_exact=True) is None
-        newer = registry.ownership_version_for("second", family)
+        newer = registry.input_version_for(family)
         assert newer and newer != version
         assert registry.completed_watch_output(newer) == ""
 
@@ -167,7 +167,7 @@ def test_completed_watch_generation_is_not_reused_after_output_disappears(tmp_pa
         family = (first_part, second_part)
 
         assert await registry.replace("first", family, coalesce_exact=True) is None
-        version = registry.ownership_version_for("first", family)
+        version = registry.input_version_for(family)
         registry.remember_completed_watch(version, str(output))
         output.rmdir()
 
@@ -324,7 +324,7 @@ def test_completed_watch_outputs_are_isolated_by_detection_mode(tmp_path):
         output = tmp_path / "out"
         output.mkdir()
         await registry.replace("ordinary", (path,), coalesce_exact=True)
-        version = registry.ownership_version_for("ordinary", (path,))
+        version = registry.input_version_for((path,))
         registry.remember_completed_watch(version, str(output))
         assert registry.completed_watch_output(version) == str(output)
         assert registry.completed_watch_output(version, deep_detect=True) == ""

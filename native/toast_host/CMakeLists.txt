@@ -46,3 +46,18 @@ enable_testing()
 add_executable(sunpack_toast_self_test src/self_test.cpp)
 target_link_libraries(sunpack_toast_self_test PRIVATE sunpack_toast)
 add_test(NAME sunpack_toast_self_test COMMAND sunpack_toast_self_test)
+
+add_executable(sunpack_toast_presenter_test tests/presenter.cpp)
+target_compile_definitions(sunpack_toast_presenter_test PRIVATE
+    SUNPACK_TOAST_EXPORTS WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE
+)
+if(MSVC)
+    set_property(TARGET sunpack_toast_presenter_test PROPERTY
+        MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
+    )
+    target_compile_options(sunpack_toast_presenter_test PRIVATE /utf-8 /permissive- /W4)
+endif()
+target_link_libraries(sunpack_toast_presenter_test PRIVATE
+    windowsapp runtimeobject ole32 shell32 advapi32
+)
+add_test(NAME sunpack_toast_presenter_test COMMAND sunpack_toast_presenter_test)
