@@ -665,6 +665,12 @@ fn score_decoded_name(decoded: &str, encoding: EncodingKind) -> (i64, NameStats)
         score -= 3;
     }
 
+    // ASCII contributes only the format-independent penalties above.
+    // Full-directory scans must not run five Unicode scoring passes over it.
+    if decoded.is_ascii() {
+        return (score, stats);
+    }
+
     score -= decoded
         .chars()
         .filter(|ch| ('\u{e000}'..='\u{f8ff}').contains(ch))

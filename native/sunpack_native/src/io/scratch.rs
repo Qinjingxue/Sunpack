@@ -118,7 +118,10 @@ impl Write for Spool {
                 let end = self.memory.position() as usize + bytes.len();
                 let additional = end.saturating_sub(self.memory.get_ref().len());
                 self.memory.get_mut().try_reserve(additional).map_err(|_| {
-                    io::Error::new(io::ErrorKind::OutOfMemory, "scratch buffer allocation failed")
+                    io::Error::new(
+                        io::ErrorKind::OutOfMemory,
+                        "scratch buffer allocation failed",
+                    )
                 })?;
                 self.memory.write(bytes)
             }
@@ -356,33 +359,42 @@ impl<V: Serialize + DeserializeOwned + Clone> SpillMap<V> {
         }
     }
     pub fn put(&mut self, key: String, value: V) -> io::Result<()> {
-        self.bytes = self
-            .bytes
-            .saturating_add(key.len() + std::mem::size_of::<V>() + 64);
-        self.spill()?;
         match &mut self.disk {
             Some(disk) => {
                 disk.put(&key, &value, false)?;
             }
             None => {
-                self.memory.insert(key, value);
+                match self.memory.entry(key) {
+                    std::collections::hash_map::Entry::Occupied(mut entry) => {
+                        entry.insert(value);
+                    }
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        self.bytes = self
+                            .bytes
+                            .saturating_add(entry.key().len() + std::mem::size_of::<V>() + 64);
+                        entry.insert(value);
+                    }
+                }
+                self.spill()?;
             }
         }
         Ok(())
     }
     pub fn insert_new(&mut self, key: String, value: V) -> io::Result<bool> {
-        if self.disk.is_none() && self.bytes.saturating_add(key.len() + 64) <= MEMORY_BYTES {
-            return Ok(match self.memory.entry(key) {
+        if self.disk.is_none() {
+            let inserted = match self.memory.entry(key) {
                 std::collections::hash_map::Entry::Occupied(_) => false,
                 std::collections::hash_map::Entry::Vacant(entry) => {
-                    self.bytes += entry.key().len() + 64;
+                    self.bytes = self
+                        .bytes
+                        .saturating_add(entry.key().len() + std::mem::size_of::<V>() + 64);
                     entry.insert(value);
                     true
                 }
-            });
+            };
+            self.spill()?;
+            return Ok(inserted);
         }
-        self.bytes = MEMORY_BYTES + 1;
-        self.spill()?;
         self.disk.as_mut().unwrap().put(&key, &value, true)
     }
 }
@@ -396,15 +408,19 @@ struct DiskMap<V> {
 impl<V: Serialize + DeserializeOwned + Clone> DiskMap<V> {
     fn new(capacity: usize) -> io::Result<Self> {
         Ok(Self {
-            slots: Slots::new(capacity)?,
+            slots: Slots::new(
+                capacity
+                    .checked_mul(2)
+                    .ok_or_else(|| io::Error::other("scratch index overflow"))?,
+            )?,
             capacity,
             count: 0,
             data: Mutex::new(Spool::default()),
             marker: PhantomData,
         })
     }
-    fn hash(key: &str) -> usize {
-        crate::fast_hash::xxh64(key.as_bytes(), 0) as usize
+    fn hash(key: &str) -> u64 {
+        crate::fast_hash::xxh64(key.as_bytes(), 0)
     }
     fn row(&self, offset: u64) -> io::Result<(String, V)> {
         let mut data = self
@@ -418,48 +434,62 @@ impl<V: Serialize + DeserializeOwned + Clone> DiskMap<V> {
         data.read_exact(&mut bytes)?;
         rmp_serde::from_slice(&bytes).map_err(io::Error::other)
     }
-    fn find(&self, key: &str) -> io::Result<(usize, Option<V>)> {
-        let mut slot = Self::hash(key) & (self.capacity - 1);
+    fn find(&self, key: &str, hash: u64) -> io::Result<(usize, Option<V>)> {
+        let mut slot = hash as usize & (self.capacity - 1);
         loop {
-            let offset = self.slots.get(slot);
+            let offset = self.slots.get(slot * 2);
             if offset == 0 {
                 return Ok((slot, None));
             }
-            let (stored, value) = self.row(offset - 1)?;
-            if stored == key {
-                return Ok((slot, Some(value)));
+            // Probe and rehash fixed-width metadata without reading the spool.
+            // The full key still decides equality, including hash collisions.
+            if self.slots.get(slot * 2 + 1) == hash {
+                let (stored, value) = self.row(offset - 1)?;
+                if stored == key {
+                    return Ok((slot, Some(value)));
+                }
             }
             slot = (slot + 1) & (self.capacity - 1);
         }
     }
     fn get(&self, key: &str) -> io::Result<Option<V>> {
-        self.find(key).map(|(_, value)| value)
+        self.find(key, Self::hash(key)).map(|(_, value)| value)
     }
     fn put(&mut self, key: &str, value: &V, only_new: bool) -> io::Result<bool> {
-        if self.count >= self.capacity / 2 {
+        let hash = Self::hash(key);
+        let (mut slot, previous) = self.find(key, hash)?;
+        if only_new && previous.is_some() {
+            return Ok(false);
+        }
+        if previous.is_none() && self.count >= self.capacity / 2 {
             let capacity = self
                 .capacity
                 .checked_mul(2)
                 .ok_or_else(|| io::Error::other("scratch index overflow"))?;
-            let mut slots = Slots::new(capacity)?;
+            let mut slots = Slots::new(
+                capacity
+                    .checked_mul(2)
+                    .ok_or_else(|| io::Error::other("scratch index overflow"))?,
+            )?;
             for index in 0..self.capacity {
-                let offset = self.slots.get(index);
+                let offset = self.slots.get(index * 2);
                 if offset == 0 {
                     continue;
                 }
-                let (key, _) = self.row(offset - 1)?;
-                let mut slot = Self::hash(&key) & (capacity - 1);
-                while slots.get(slot) != 0 {
+                let hash = self.slots.get(index * 2 + 1);
+                let mut slot = hash as usize & (capacity - 1);
+                while slots.get(slot * 2) != 0 {
                     slot = (slot + 1) & (capacity - 1);
                 }
-                slots.set(slot, offset);
+                slots.set(slot * 2, offset);
+                slots.set(slot * 2 + 1, hash);
             }
             self.capacity = capacity;
             self.slots = slots;
-        }
-        let (slot, previous) = self.find(key)?;
-        if only_new && previous.is_some() {
-            return Ok(false);
+            slot = hash as usize & (capacity - 1);
+            while self.slots.get(slot * 2) != 0 {
+                slot = (slot + 1) & (capacity - 1);
+            }
         }
         let data = self
             .data
@@ -470,7 +500,8 @@ impl<V: Serialize + DeserializeOwned + Clone> DiskMap<V> {
         let len = u32::try_from(bytes.len()).map_err(io::Error::other)?;
         data.write_all(&len.to_le_bytes())?;
         data.write_all(&bytes)?;
-        self.slots.set(slot, offset + 1);
+        self.slots.set(slot * 2, offset + 1);
+        self.slots.set(slot * 2 + 1, hash);
         if previous.is_none() {
             self.count += 1;
         }
@@ -574,5 +605,67 @@ impl Drop for Mapping {
         unsafe {
             UnmapViewOfFile(self.view.as_ptr().cast());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Small manifest tests never cross spill storage or rehash a disk index.
+    // One lifecycle covers replacement, duplicate insertion, collision equality,
+    // growth, mapped slots and concurrent readers at a few MiB of temporary IO.
+    #[test]
+    fn spill_index_keeps_exact_keys_and_updates_across_storage_and_growth() {
+        let mut map = SpillMap::<usize>::default();
+        for value in 0..100_000 {
+            map.put("same".to_owned(), value).unwrap();
+            assert!(!map.insert_new("same".to_owned(), 0).unwrap());
+        }
+        assert_eq!(map.get("same").unwrap(), Some(99_999));
+        assert!(
+            map.disk.is_none(),
+            "replacement must not consume new-key budget"
+        );
+        let suffix = "x".repeat(20_000);
+        for value in 0..400 {
+            assert!(map.insert_new(format!("{value}-{suffix}"), value).unwrap());
+        }
+        let disk = map.disk.as_mut().unwrap();
+        assert!(disk.capacity >= 1024);
+        // Exercise mapped slots without a huge corpus just to fill the slot budget.
+        let file = scratch_file().unwrap();
+        let mut file = file;
+        for index in 0..disk.capacity * 2 {
+            file.write_all(&disk.slots.get(index).to_le_bytes())
+                .unwrap();
+        }
+        disk.slots = Slots::Disk(Mapping::new(&file, true).unwrap());
+        drop(file);
+        let capacity = disk.capacity;
+        assert!(!disk.put("same", &7, false).unwrap());
+        assert!(!disk.put("same", &8, true).unwrap());
+        assert_eq!(disk.capacity, capacity);
+        let hash = DiskMap::<usize>::hash("same");
+        assert!(disk.find("different-full-key", hash).unwrap().1.is_none());
+        for value in 400..600 {
+            assert!(disk
+                .put(&format!("{value}-{suffix}"), &value, true)
+                .unwrap());
+        }
+        assert!(disk.capacity > capacity);
+        std::thread::scope(|scope| {
+            for shard in 0..4 {
+                let map = &map;
+                let suffix = &suffix;
+                scope.spawn(move || {
+                    for value in (shard..600).step_by(4) {
+                        assert_eq!(map.get(&format!("{value}-{suffix}")).unwrap(), Some(value));
+                    }
+                    assert_eq!(map.get("same").unwrap(), Some(7));
+                    assert_eq!(map.get("absent").unwrap(), None);
+                });
+            }
+        });
     }
 }

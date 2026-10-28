@@ -804,6 +804,53 @@ def test_scope_retirement_persists_without_losing_pending_output_recovery(tmp_pa
         state.close()
 
 
+def test_output_commit_preserves_identity_during_child_promotion_and_after_flatten(tmp_path):
+    # Real nested tests do not force this overlap or check crash-recovery identity.
+    # One tiny lifecycle covers both the blocked metadata read and the required
+    # identity refresh after flattening; removing it loses that independent coverage.
+    from sunpack.core.support.resource_lifecycle import promotion_barrier
+    from sunpack_native import flatten_single_branch_directories, watch_path_identity
+
+    source = tmp_path / "outer.zip"
+    source.touch()
+    output = tmp_path / "output"
+    wrapper = output / "wrapper"
+    wrapper.mkdir(parents=True)
+    child = wrapper / "payload.bin"
+    child.write_bytes(b"payload")
+    state_path = tmp_path / "state.snapshot"
+    state = WatchStateStore(str(state_path))
+    try:
+        state.queue_active(_candidate(source), durable_owner=True, durable=True)
+        assert state.record_task_output_started(str(source), str(source), str(output))
+        identity = state.pending_work_for_path(str(source)).output_identities[str(output)]
+        with promotion_barrier([child], quiesce=False):
+            assert state.record_task_output_finished(
+                str(source), str(source), str(output), keep_output=True,
+            )
+        assert state.pending_work_for_path(str(source)).output_identities[str(output)] == identity
+
+        flattened = flatten_single_branch_directories(str(output))
+        assert not flattened["errors"] and flattened["source_dir"]
+        assert state.record_task_output_finished(
+            str(source), str(source), str(output), keep_output=True,
+        )
+        volume, file_id, _ = watch_path_identity(str(output))
+        refreshed = f"{volume}|{file_id}"
+        assert refreshed != identity
+        assert state.pending_work_for_path(str(source)).output_identities == {str(output): refreshed}
+    finally:
+        state.close()
+    state = WatchStateStore(str(state_path))
+    try:
+        pending = state.pending_work_for_path(str(source))
+        assert pending.committed_roots == [str(output)]
+        assert pending.output_identities == {str(output): refreshed}
+        assert not pending.active_outputs
+    finally:
+        state.close()
+
+
 def test_native_checkpoint_round_trips_nested_unicode_payload(tmp_path):
     state_path = tmp_path / "state.snapshot"
     archive = tmp_path / "雪-special.zip"

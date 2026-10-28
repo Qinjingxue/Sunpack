@@ -933,7 +933,9 @@ def test_default_watch_state_uses_program_directory_and_per_root_outputs(tmp_pat
 
     assert service.state_dir == str((program_dir / ".sunpack_watch").resolve())
     assert captured["output_roots"] == {}
-    assert captured["state_path"] == str((program_dir / ".sunpack_watch" / "state.snapshot").resolve())
+    # Resolving an absent leaf can retain \\?\ when the log thread creates
+    # its parent between Python's ERROR_PATH_NOT_FOUND/FILE_NOT_FOUND probes.
+    assert captured["state_path"] == str(program_dir.resolve() / ".sunpack_watch" / "state.snapshot")
 
 
     roots_path.unlink()

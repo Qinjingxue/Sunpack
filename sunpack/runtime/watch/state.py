@@ -1019,7 +1019,7 @@ class WatchStateStore:
                     return False
                 if output_dir not in pending.committed_roots:
                     return any(_is_path_under(_path_key(output_dir), _path_key(root)) for root in pending.committed_roots)
-            active.pop(task_path, None)
+            active_output = active.pop(task_path, None)
             roots = list(pending.committed_roots)
             completed = list(pending.completed_sources)
             if keep_output:
@@ -1043,7 +1043,12 @@ class WatchStateStore:
                 ):
                     completed.append(task_path)
             identities = dict(pending.output_identities)
-            if keep_output and os.path.isdir(output_dir):
+            # Start/relocation already captured this directory's identity.
+            # Child cleanup can still hold a promotion gate below it, so a
+            # redundant parent-handle probe would abort the completion. A
+            # post-flatten notification without an active output must refresh it.
+            if (keep_output and (active_output != output_dir or output_dir not in identities)
+                    and os.path.isdir(output_dir)):
                 from sunpack_native import watch_path_identity
                 volume, identity, _ = watch_path_identity(output_dir)
                 identities[os.path.abspath(output_dir)] = f"{volume}|{identity}"

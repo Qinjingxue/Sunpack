@@ -38,6 +38,7 @@ def test_flatten_relocates_nested_outputs_and_reports_retained_work(tmp_path, mo
     runtime = object.__new__(_RequestRuntime)
     from sunpack.core.support.output_reservation import OutputReservationRegistry
     runtime.services = SimpleNamespace(output_reservations=OutputReservationRegistry())
+    runtime.job_executor = SimpleNamespace(relocate_output=lambda _result: True)
     runtime.config = {"post_extract": {"archive_cleanup_mode": "keep"}}
     runtime.context = state
     runtime.submission = SimpleNamespace(request_id="request", origin="foreground", stdout=io.StringIO(), targets=(PipelineTarget("outer.carrier"),))

@@ -414,9 +414,27 @@ impl Write for ExactOutput<'_> {
     }
     fn flush(&mut self)->std::io::Result<()> { self.output.flush() }
 }
+// These decoders read immutable memory/mappings, not source files. Some use
+// ErrorKind::Other for invalid compressed bytes (e.g. LZMA distance overflow).
+// Normalize only decoder reads; spool writes must retain their resource errors.
+struct DecoderReader<R>(R);
+impl<R: Read> Read for DecoderReader<R> {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        self.0.read(bytes).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::Other
+                && error.raw_os_error().is_none()
+                && !crate::io::resource_error::is_memory_error(&error)
+            {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, error)
+            } else {
+                error
+            }
+        })
+    }
+}
 fn collect_decoded(reader:impl Read, size:u64)->Result<Blob,String> {
     let mut output=Spool::default();
-    std::io::copy(&mut reader.take(size.saturating_add(1)), &mut ExactOutput {output:&mut output, remaining:size}).map_err(decode_error)?;
+    std::io::copy(&mut DecoderReader(reader).take(size.saturating_add(1)), &mut ExactOutput {output:&mut output, remaining:size}).map_err(decode_error)?;
     let output=output.finish().map_err(resource_error)?;
     if output.len() as u64 != size { return Err("encoded_header_payload_crc_bad:unpack_size".into()); }
     Ok(output)
@@ -863,6 +881,28 @@ mod encoded_folder_graph_tests {
         };
         let decoded = decode_seven_zip_encoded_folder(&[b"test".to_vec().into()], &folder, None).unwrap();
         assert_eq!(decoded, b"test");
+    }
+
+    // Real password tests cover malformed plaintext, but cannot inject OOM or
+    // OS read failures. This tiny case preserves that independent distinction
+    // without large allocations or another archive-generation matrix.
+    #[test]
+    fn decoder_read_failures_keep_resource_errors_distinct_from_invalid_data() {
+        struct FailedRead(Option<std::io::Error>);
+        impl Read for FailedRead {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(self.0.take().unwrap())
+            }
+        }
+        for (error, resource) in [
+            (std::io::Error::other("invalid compressed distance"), false),
+            (std::io::Error::from(std::io::ErrorKind::OutOfMemory), true),
+            (std::io::Error::from_raw_os_error(8), true),
+            (std::io::Error::from_raw_os_error(5), true),
+        ] {
+            let error = collect_decoded(FailedRead(Some(error)), 1).unwrap_err();
+            assert_eq!(error.starts_with("resource_unavailable:"), resource, "{error}");
+        }
     }
 
     #[test]
