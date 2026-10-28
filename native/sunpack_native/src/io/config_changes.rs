@@ -18,8 +18,8 @@ unsafe extern "system" {
     fn GetOverlappedResult(file: *mut c_void, overlapped: *mut Overlapped, bytes: *mut u32, wait: i32) -> i32;
 }
 
-fn event() -> io::Result<OwnedHandle> {
-    let handle = unsafe { CreateEventW(std::ptr::null_mut(), 0, 0, std::ptr::null()) };
+fn event(manual_reset: bool) -> io::Result<OwnedHandle> {
+    let handle = unsafe { CreateEventW(std::ptr::null_mut(), i32::from(manual_reset), 0, std::ptr::null()) };
     if handle.is_null() { return Err(io::Error::last_os_error()); }
     Ok(unsafe { OwnedHandle::from_raw_handle(handle) })
 }
@@ -96,11 +96,12 @@ pub(crate) struct NativeConfigChanges {
 impl NativeConfigChanges {
     #[new]
     fn new(path: PathBuf) -> io::Result<Self> {
-        let stopped = event()?;
+        let stopped = event(false)?;
         let file = TrackedFile::open_with(path, "config_directory", |options| {
             options.access_mode(1).share_mode(7).custom_flags(0x4200_0000);
         })?;
-        let event = event()?;
+        // OVERLAPPED completion events must remain signaled until the result is collected.
+        let event = event(true)?;
         let mut request = Request {
             file, overlapped: Box::new(Overlapped { event: event.as_raw_handle(), ..Default::default() }),
             _event: event, buffer: vec![0u32; 1024].into_boxed_slice(), pending: false,
@@ -142,5 +143,28 @@ impl NativeConfigChanges {
             unsafe { SetEvent(self.stopped.as_raw_handle()); }
             self.request.lock().unwrap().take();
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn completion_event_is_manual_reset_while_stop_event_is_auto_reset() {
+        let completion = event(true).unwrap();
+        let stopped = event(false).unwrap();
+        let completion_handle = [completion.as_raw_handle()];
+        let stopped_handle = [stopped.as_raw_handle()];
+
+        unsafe {
+            assert_ne!(SetEvent(completion.as_raw_handle()), 0);
+            assert_eq!(WaitForMultipleObjects(1, completion_handle.as_ptr(), 0, 0), 0);
+            assert_eq!(WaitForMultipleObjects(1, completion_handle.as_ptr(), 0, 0), 0);
+
+            assert_ne!(SetEvent(stopped.as_raw_handle()), 0);
+            assert_eq!(WaitForMultipleObjects(1, stopped_handle.as_ptr(), 0, 0), 0);
+            assert_eq!(WaitForMultipleObjects(1, stopped_handle.as_ptr(), 0, 0), 258);
+        }
     }
 }
