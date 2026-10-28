@@ -123,8 +123,9 @@ def _archive(root, kind):
     marker = payload / "wal-marker.txt"
     marker.write_text("WAL recovery verified\n" * 8192, encoding="utf-8")
 
-    def pack(destination, source, *options):
-        subprocess.run([seven_zip, "a", "-y", "-mx=0", *options, str(destination), str(source)],
+    def pack(destination, source, *options, extra_sources=()):
+        subprocess.run([seven_zip, "a", "-y", "-mx=0", *options, str(destination), str(source),
+                        *map(str, extra_sources)],
                        check=True, capture_output=True, text=True)
 
     source = input_root / "disguised.video"
@@ -137,7 +138,19 @@ def _archive(root, kind):
             pack(inner, marker, "-t7z", "-pwal-test-secret", "-mhe=on")
         else:
             pack(inner, marker, "-tzip")
-        pack(source, inner, "-tzip")
+        if kind == "nested_encrypted_split":
+            # Retain ordinary files at two verified levels. Recovery must not
+            # discard them while continuing the promoted split input, nor
+            # re-extract the enclosing archives and duplicate its payload.
+            nested_marker = payload / "nested-marker.txt"
+            nested_marker.write_text("verified nested payload", encoding="utf-8")
+            middle = payload / "middle.blob"
+            pack(middle, inner, "-tzip", extra_sources=[nested_marker])
+            outer_marker = payload / "outer-marker.txt"
+            outer_marker.write_text("verified outer payload", encoding="utf-8")
+            pack(source, middle, "-tzip", extra_sources=[outer_marker])
+        else:
+            pack(source, inner, "-tzip")
     elif kind == "encrypted":
         pack(source, marker, "-t7z", "-pwal-test-secret", "-mhe=on")
     elif kind == "split":
@@ -293,4 +306,7 @@ def test_promoted_split_provenance_survives_process_death(tmp_path, boundary):
     assert not list((tmp_path / "input").glob("inner.data.*"))
     [marker] = list((tmp_path / "output").rglob("wal-marker.txt"))
     assert marker.read_text(encoding="utf-8") == expected
+    for name, text in (("outer", "verified outer payload"), ("nested", "verified nested payload")):
+        [retained] = list((tmp_path / "output").rglob(f"{name}-marker.txt"))
+        assert retained.read_text(encoding="utf-8") == text
     assert _run_child(tmp_path, "watch", "recover")["pending"] == 0

@@ -959,7 +959,9 @@ class WatchStateStore:
         with self._state_lock:
             return self._pending_record(path)
 
-    def prepare_input_promotion(self, owner_path: str, destinations: Iterable[str]) -> bool:
+    def prepare_input_promotion(
+        self, owner_path: str, destinations: Iterable[str], *, sources: Iterable[str] = (),
+    ) -> bool:
         """Durably retain nested provenance before the first physical move."""
         with self._state_lock:
             key = _path_key(owner_path)
@@ -968,7 +970,16 @@ class WatchStateStore:
                 return False
             paths = {_path_key(path): path for path in pending.promoted_destinations}
             paths.update((_path_key(path), os.path.abspath(path)) for path in destinations)
-            updated = replace(pending, durable_owner=True, promoted_destinations=list(paths.values()))
+            # Recursion can only promote inputs from a verified parent output.
+            # Checkpoint that tree in the same WAL transaction as the move
+            # intent, while retaining its active record for cancellation rollback.
+            source_keys = tuple(_path_key(path) for path in sources)
+            roots = list(pending.committed_roots)
+            for output in pending.active_outputs.values():
+                if any(_is_path_under(source, _path_key(output)) for source in source_keys):
+                    roots = _retain_output_root(roots, output)
+            updated = replace(pending, durable_owner=True, promoted_destinations=list(paths.values()),
+                              committed_roots=roots)
             self._commit_operations_locked([
                 self._put_operation("pending_work", key, updated),
             ], durable=True)
@@ -1024,24 +1035,19 @@ class WatchStateStore:
             completed = list(pending.completed_sources)
             if keep_output:
                 output_dir = os.path.abspath(output_dir)
-                root_key = _path_key(output_dir)
-                if not any(
-                    root_key == _path_key(existing)
-                    or _is_path_under(root_key, _path_key(existing))
-                    for existing in roots
-                ):
-                    roots = [
-                        existing
-                        for existing in roots
-                        if not _is_path_under(_path_key(existing), root_key)
-                    ]
-                    roots.append(output_dir)
+                roots = _retain_output_root(roots, output_dir)
                 task_key = _path_key(task_path)
                 if (
                     task_key != _path_key(pending.path)
                     and not any(_path_key(existing) == task_key for existing in completed)
                 ):
                     completed.append(task_path)
+            else:
+                # A promotion checkpoint does not commit the live subtree:
+                # cancellation still removes it and revokes its recovery roots.
+                root_key = _path_key(output_dir)
+                roots = [root for root in roots if not _is_path_under(_path_key(root), root_key)]
+                completed = [path for path in completed if not _is_path_under(_path_key(path), root_key)]
             identities = dict(pending.output_identities)
             # Start/relocation already captured this directory's identity.
             # Child cleanup can still hold a promotion gate below it, so a
@@ -1406,3 +1412,10 @@ def _path_key(path: str) -> str:
 
 def _is_path_under(path: str, root: str) -> bool:
     return path_key_is_under(absolute_path_key(path), absolute_path_key(root))
+
+
+def _retain_output_root(roots: list[str], output: str) -> list[str]:
+    key = _path_key(output)
+    if any(_is_path_under(key, _path_key(root)) for root in roots):
+        return roots
+    return [root for root in roots if not _is_path_under(_path_key(root), key)] + [output]

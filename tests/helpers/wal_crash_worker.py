@@ -109,8 +109,8 @@ async def watch_scenario(root, mode):
             if mode == "promotion_prepared":
                 prepare = watcher.state.prepare_input_promotion
 
-                def prepare_and_crash(owner, destinations):
-                    assert prepare(owner, destinations)
+                def prepare_and_crash(owner, destinations, **kwargs):
+                    assert prepare(owner, destinations, **kwargs)
                     crash_gate(destinations=list(destinations),
                                pending=[asdict(item) for item in watcher.state.pending_work_items()])
 

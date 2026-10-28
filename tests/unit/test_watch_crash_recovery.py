@@ -131,6 +131,42 @@ def test_promotion_intent_survives_queue_refresh_and_missing_owner(tmp_path):
         reopened.close()
 
 
+def test_promotion_checkpoint_keeps_other_active_outputs_and_rolls_back(tmp_path):
+    """Crash tests cannot cover cancellation revoking the promotion checkpoint.
+
+    One state roundtrip also rejects checkpointing an unrelated active writer;
+    either mistake can silently retain partial output after a later restart.
+    """
+    source = tmp_path / "outer.zip"
+    source.write_text("outer")
+    output = tmp_path / "out" / "outer"
+    sibling = tmp_path / "out" / "other"
+    state_path = str(tmp_path / "state.snapshot")
+    state = WatchStateStore(state_path)
+    try:
+        state.queue_active(_candidate(source))
+        assert state.record_task_output_started(str(source), str(source), str(output))
+        assert state.record_task_output_started(str(source), str(tmp_path / "other.zip"), str(sibling))
+        assert state.prepare_input_promotion(
+            str(source), [str(tmp_path / "inner.data")], sources=[str(output / "inner.data")],
+        )
+        state.save()
+    finally:
+        state.close()
+    state = WatchStateStore(state_path)
+    try:
+        [pending] = state.pending_work_items()
+        assert pending.committed_roots == [str(output)]
+        assert set(pending.active_outputs.values()) == {str(output), str(sibling)}
+        assert state.record_task_output_finished(str(source), str(source), str(output), keep_output=False)
+        [pending] = state.pending_work_items()
+        assert pending.committed_roots == []
+        assert list(pending.active_outputs.values()) == [str(sibling)]
+        assert str(output) not in pending.output_identities
+    finally:
+        state.close()
+
+
 def test_live_enqueue_keeps_owner_memory_only(tmp_path):
     import threading
     import sunpack.runtime.watch.scheduler as scheduler_module

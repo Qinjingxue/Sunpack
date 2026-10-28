@@ -702,6 +702,8 @@ class WatchScheduler:
 
             cleanup_failed = False
             for output_dir in dict.fromkeys(active_outputs.values()):
+                if output_dir in committed_roots:
+                    continue
                 if not self._recovery_output_matches(pending, output_dir):
                     self.log.write("crash_output_identity_changed", owner_path=pending.path, output_dir=output_dir)
                     continue
@@ -730,7 +732,9 @@ class WatchScheduler:
                 self.state.complete_work([pending.path], durable=True)
                 continue
 
-            for task_path in active_outputs:
+            for task_path, output_dir in active_outputs.items():
+                if output_dir in committed_roots:
+                    continue
                 if path_key(task_path) in completed_sources:
                     continue
                 candidate = _candidate_for_event_path(task_path)
@@ -2156,7 +2160,7 @@ class WatchScheduler:
                 # is persisted; ownership transfer preserves their provenance.
                 archive_task.runtime["promoted_nested_input"] = True
             destinations = event.get("promoted_destinations")
-            if destinations and not self.state.prepare_input_promotion(owner_path, destinations):
+            if destinations and not self.state.prepare_input_promotion(owner_path, destinations, sources=source_paths):
                 raise RuntimeError("watch input promotion state transition rejected")
             return
         if name == "task_output_started":
