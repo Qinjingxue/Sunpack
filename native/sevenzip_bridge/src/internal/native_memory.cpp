@@ -13,8 +13,17 @@ struct BookkeepingScope {
     ~BookkeepingScope() { bookkeeping = false; }
 };
 struct Allocation { sunpack::sevenzip::NativeMemoryJob *job; std::size_t size; };
+std::atomic<bool> allocations_ready{false};
 std::mutex allocations_mutex;
 std::unordered_map<void *, Allocation> allocations;
+// Global new/delete can run in other static constructors/destructors. A CRT
+// address can also be 64 KiB aligned: never probe the table outside its life.
+// Declared last, this guard disables lookups before the table frees its own
+// storage, and enables them only after the table and mutex are constructed.
+struct AllocationLifetime {
+    AllocationLifetime() { allocations_ready.store(true, std::memory_order_release); }
+    ~AllocationLifetime() { allocations_ready.store(false, std::memory_order_release); }
+} allocation_lifetime;
 constexpr std::uint64_t quantum = SUNPACK_LARGE_ALLOCATION;
 std::uint64_t commitment(std::size_t size) noexcept {
     if (size > UINT64_MAX - 4095) return UINT64_MAX;
@@ -373,13 +382,15 @@ void *sunpack_memory_alloc(size_t size) {
     return job ? job->owner.allocate(*job, size) : nullptr;
 }
 size_t sunpack_memory_size(void *address) {
-    if ((reinterpret_cast<std::uintptr_t>(address) & 65535) != 0 || !address) return 0;
+    if ((reinterpret_cast<std::uintptr_t>(address) & 65535) != 0 || !address ||
+        !allocations_ready.load(std::memory_order_acquire)) return 0;
     std::lock_guard<std::mutex> lock(allocations_mutex);
     const auto found = allocations.find(address);
     return found == allocations.end() ? 0 : found->second.size;
 }
 int sunpack_memory_free(void *address) {
-    if ((reinterpret_cast<std::uintptr_t>(address) & 65535) != 0 || !address || bookkeeping) return 0;
+    if ((reinterpret_cast<std::uintptr_t>(address) & 65535) != 0 || !address || bookkeeping ||
+        !allocations_ready.load(std::memory_order_acquire)) return 0;
     Allocation allocation{};
     {
         std::lock_guard<std::mutex> lock(allocations_mutex);

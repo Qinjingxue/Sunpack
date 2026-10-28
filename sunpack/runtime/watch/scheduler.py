@@ -978,7 +978,7 @@ class WatchScheduler:
         with self._lock:
             available = max(0, self.pipeline_engine.work_broker.max_pending_jobs - len(self._inflight_requests))
         ready = await self.pipeline_engine.work_broker.run(
-            "watch_admission", "watch", self._prepare_ready, time.monotonic(), available,
+            "watch_admission", "watch", self._prepare_ready, available,
             request_id="watch", origin="watch",
         )
         active_requests = []
@@ -1761,10 +1761,12 @@ class WatchScheduler:
         if self._wake_callback is not None:
             self._wake_callback()
 
-    def _prepare_ready(self, now: float, limit: int) -> list[WatchCandidate]:
-        self._process_password_retries(now)
+    def _prepare_ready(self, limit: int) -> list[WatchCandidate]:
+        self._process_password_retries(time.monotonic())
         admissions = []
-        for candidate in self._pop_ready(now, limit=limit):
+        # Retried candidates acquire their deadline during enqueue. Take the
+        # cutoff afterwards so zero-delay retries can run in this same tick.
+        for candidate in self._pop_ready(time.monotonic(), limit=limit):
             pending = self.state.pending_work_for_path(candidate.path)
             internal = bool(pending and pending.internal_recovery)
             if self.should_ignore_event_path(candidate.path) and not internal:

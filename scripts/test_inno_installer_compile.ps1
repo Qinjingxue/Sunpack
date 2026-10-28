@@ -63,6 +63,9 @@ try {
     )
 
     Copy-Item -LiteralPath (Join-Path $repoRoot "builtin_passwords.json") -Destination $sourceDir
+    $scriptsDir = Join-Path $sourceDir "scripts"
+    New-Item -ItemType Directory -Path $scriptsDir | Out-Null
+    Copy-Item -LiteralPath (Join-Path $repoRoot "scripts\upgrade_config.ps1") -Destination $scriptsDir
 
     foreach ($arch in @("x64", "arm64")) {
         $arguments = @(

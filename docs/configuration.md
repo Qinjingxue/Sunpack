@@ -6,12 +6,6 @@ Edit `sunpack_config.json` to change everyday settings. When running from source
 
 Objects are merged by field, and `filesystem.scan_filters` entries are merged by `name`. Other arrays are replaced as a whole. Watch reloads configuration changes automatically.
 
-When installing over a version below 1.3.0, the installer removes the application directory, `%ProgramData%\SunPack`, and any configured custom Watch state directory before installing fresh defaults. All settings, passwords, monitored roots, logs, and state are deleted. Unrecognized or missing installed versions use the same reset policy. Reinstalling 1.3.0 or newer preserves the data directory; application files and advanced defaults are replaced.
-
-**For existing users: 1.3.0 starts a new data generation, including upgrades from 1.2.8.** Back up settings, passwords and monitored roots before upgrading, then configure them again using the current format. Do not restore old configuration or state files wholesale. Historical field migrations, JSON/JSONL state handling and old log readers have been removed. Watch output locations use per-root mappings; an empty mapping writes beside the archive. `watch.out_dir` has been removed. Unfinished tasks and automatic output-folder exclusions are reset too; check leftover output directories before enabling recursive Watch again to avoid processing them twice.
-
-Display history uses an `events.json` manifest and an `events.json.store` directory. Runtime diagnostics use `runtime-*.state.events.json` with their corresponding `.store` directories. These are not JSONL text logs; include both the manifest and data directory in a bug report. Task state uses binary `state.snapshot` and `state.journal.*.wal`; discovery uses `catalog.snapshot.bin` and `catalog.wal.bin`. Do not edit them manually.
-
 Check your changes and view the resulting configuration:
 
 ```powershell
@@ -23,20 +17,20 @@ For an installed copy, replace `python sunpack.py` with `sunpack.exe`.
 
 ## Common settings
 
-| Setting | What to set |
-| --- | --- |
-| `cli.language` | `zh` for Chinese or `en` for English. |
-| `recursive_extract` | `"*"` to keep processing nested archives, a positive integer for a fixed number of rounds, or `"?"` to ask after each round. |
-| `recursive_authorization.enabled` | `true` to apply the nested archive selection policy; `false` to skip this policy. |
-| `post_extract.archive_cleanup_mode` | `"r"` to recycle the original archive after success, `"k"` to keep it, or `"d"` to delete it. |
-| `post_extract.flatten_single_directory` | `true` to lift the contents of a single top-level output folder. |
-| `extraction.content_requirement` | `"complete"` to require a complete result, or `"allow_partial"` to accept partial recovery. |
+| Setting                                 | What to set                                                                                                                  |
+| --------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| `cli.language`                          | `zh` for Chinese or `en` for English.                                                                                        |
+| `recursive_extract`                     | `"*"` to keep processing nested archives, a positive integer for a fixed number of rounds, or `"?"` to ask after each round. |
+| `recursive_authorization.enabled`       | `true` to apply the nested archive selection policy; `false` to skip this policy.                                            |
+| `post_extract.archive_cleanup_mode`     | `"r"` to recycle the original archive after success, `"k"` to keep it, or `"d"` to delete it.                                |
+| `post_extract.flatten_single_directory` | `true` to lift the contents of a single top-level output folder.                                                             |
+| `extraction.content_requirement`        | `"complete"` to require a complete result, or `"allow_partial"` to accept partial recovery.                                  |
 
 For example, add these fields to the main configuration to keep original archives:
 
 ```json
 {
-  "post_extract": {"archive_cleanup_mode": "k"}
+  "post_extract": { "archive_cleanup_mode": "k" }
 }
 ```
 
@@ -51,9 +45,7 @@ Set `filesystem.scan_filters_enabled` to `false` to turn off all scan filters. T
 ```json
 {
   "filesystem": {
-    "scan_filters": [
-      {"name": "size_range", "enabled": false}
-    ]
+    "scan_filters": [{ "name": "size_range", "enabled": false }]
   }
 }
 ```
@@ -66,8 +58,18 @@ Size bounds are inclusive integer bytes from 0 to 18446744073709551615. Equal bo
 {
   "filesystem": {
     "scan_filters": [
-      {"name": "size_range", "enabled": true, "min_bytes": 1, "max_bytes": null},
-      {"name": "mtime_range", "enabled": true, "start_utc": "2024-01-01T00:00Z", "end_utc": "2027-01-01T00:00Z"}
+      {
+        "name": "size_range",
+        "enabled": true,
+        "min_bytes": 1,
+        "max_bytes": null
+      },
+      {
+        "name": "mtime_range",
+        "enabled": true,
+        "start_utc": "2024-01-01T00:00Z",
+        "end_utc": "2027-01-01T00:00Z"
+      }
     ]
   }
 }
@@ -88,8 +90,8 @@ Persistent passwords come only from `builtin_passwords.json`, including its `cli
 ```json
 {
   "passwords": [
-    {"value": "global-password"},
-    {"value": "scoped-password", "scopes": ["D:/Downloads", "E:/Archives"]}
+    { "value": "global-password" },
+    { "value": "scoped-password", "scopes": ["D:/Downloads", "E:/Archives"] }
   ],
   "clipboard_history": []
 }

@@ -504,10 +504,22 @@ var
   Command: string;
   ResultCode: Integer;
 begin
-  { Locate custom Watch data, then remove whole directories without conversion. }
+  { Preserve only editable roots/passwords, including when custom Watch data
+    overlaps the data directory. Remove other data in place without conversion. }
   Command :=
     '$ErrorActionPreference = ''Stop''; $state = ''''; ' +
     '$data = ' + PowerShellSingleQuotedString(ExpandConstant('{commonappdata}\SunPack')) + '; ' +
+    '$keep = @((Join-Path $data ''sunpack_watch_roots.txt''), (Join-Path $data ''builtin_passwords.json'')); ' +
+    'function Remove-ResetData([string]$path) { ' +
+    '  if (-not (Test-Path -LiteralPath $path)) { return }; ' +
+    '  $item = Get-Item -LiteralPath $path -Force; ' +
+    '  if (-not $item.PSIsContainer -and $keep -contains $item.FullName) { return }; ' +
+    '  $prefix = $item.FullName.TrimEnd(''\'') + ''\''; ' +
+    '  if ($item.PSIsContainer -and @($keep | Where-Object { $_.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) }).Count -gt 0) { ' +
+    '    foreach ($child in @(Get-ChildItem -LiteralPath $path -Force)) { Remove-ResetData $child.FullName }; ' +
+    '    if ([IO.Directory]::GetFileSystemEntries($path).Length -eq 0) { Remove-Item -LiteralPath $path -Force } ' +
+    '  } else { Remove-Item -LiteralPath $path -Recurse -Force } ' +
+    '}; ' +
     'foreach ($file in @(' + PowerShellSingleQuotedString(AddBackslash(ExistingApplicationDirectory) + 'sunpack_advanced_config.json') +
     ', (Join-Path $data ''sunpack_config.json''))) { ' +
     '  if (Test-Path -LiteralPath $file) { ' +
@@ -520,13 +532,12 @@ begin
     '  if ($state -eq ''~'') { $state = $env:USERPROFILE } ' +
     '  elseif ($state.StartsWith(''~\'') -or $state.StartsWith(''~/'')) { $state = Join-Path $env:USERPROFILE $state.Substring(2) }; ' +
     '  if (-not [IO.Path]::IsPathRooted($state)) { $state = Join-Path $data $state }; ' +
-    '  if (Test-Path -LiteralPath $state) { Remove-Item -LiteralPath $state -Recurse -Force } ' +
-    '}';
+    '  Remove-ResetData $state ' +
+    '}; Remove-ResetData $data';
   Result := Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
     '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ' + AddQuotes(Command),
     '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   if Result then Result := ResultCode = 0;
-  if Result then Result := RemoveDataDirectory(ExpandConstant('{commonappdata}\SunPack'));
 end;
 
 function ExistingLauncherPath: string;
@@ -891,7 +902,7 @@ begin
   CaptureConfigurationForUpgrade;
   if InstalledDataRequiresReset then
   begin
-    Log('Removing pre-1.3.0 or unversioned SunPack data for a fresh installation.');
+    Log('Resetting pre-1.3.0 or unversioned SunPack data, preserving Watch roots and builtin passwords.');
     if not RemoveInstalledData then
     begin
       Result := CustomMessage('PrepareOldFilesRemoveFailed');

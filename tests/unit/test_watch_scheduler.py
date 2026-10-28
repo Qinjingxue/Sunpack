@@ -2693,6 +2693,13 @@ def test_watch_scheduler_defaults_to_user_and_builtin_password_sources(tmp_path,
 
 
 def test_watch_scheduler_clipboard_persistence_refreshes_candidates_and_retries(tmp_path, monkeypatch):
+    # Coarse clock samples can hide a retry enqueued after admission's old
+    # cutoff. Advancing only the scheduler clock exposes that lost tick.
+    from itertools import count
+    clock = count(step=0.001)
+    monkeypatch.setattr(scheduler_module, "time", SimpleNamespace(
+        monotonic=lambda: next(clock), perf_counter=time.perf_counter,
+    ))
     monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
     builtin_path = tmp_path / "builtin_passwords.json"
     monkeypatch.setattr(builtin_module, "builtin_password_path", lambda: builtin_path)
