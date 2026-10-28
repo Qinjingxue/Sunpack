@@ -82,28 +82,40 @@ def _terminal_snapshots(host):
 
 
 @pytest.mark.parametrize("errors", [[], ["output is in use"]])
-def test_stop_targets_only_current_batch_and_reports_cleanup_truthfully(tmp_path, errors):
+@pytest.mark.parametrize("pause", [None, "space_blocked", "memory_blocked"])
+@pytest.mark.parametrize("language", ["en", "zh"])
+def test_stop_targets_only_current_batch_and_reports_cleanup_truthfully(tmp_path, errors, pause, language):
     # Normal success/failure aggregation cannot cover stale activation, repeated
     # stop, or falsely claiming rollback succeeded. One batch covers all three.
     host = _Host()
-    coordinator = WatchToastCoordinator(host, _config(), str(tmp_path / "state"))
+    coordinator = WatchToastCoordinator(host, _config(language=language), str(tmp_path / "state"))
     try:
         coordinator.submitted("active", str(tmp_path / "active.zip"))
         coordinator.submitted("scanning", str(tmp_path / "scanning.zip"))
-        _ready(coordinator, "active", _task(tmp_path / "active.zip"))
+        task = _task(tmp_path / "active.zip")
+        _ready(coordinator, "active", task)
+        if pause:
+            coordinator.progress("active", task, {"event": pause})
         snapshot = host.snapshots[-1]
         assert snapshot.actions[0].kind == ToastActionKind.CANCEL_BATCH
         assert coordinator.cancel_batch("obsolete") == ()
         assert coordinator.cancel_batch(snapshot.batch_id) == ("active", "scanning")
         assert coordinator.cancel_batch(snapshot.batch_id) == ("active", "scanning")
-        assert "Stopping" in host.snapshots[-1].body
+        stopping = host.snapshots[-1]
+        assert stopping.title == ("SunPack 正在停止" if language == "zh" else "SunPack is stopping")
+        assert stopping.actions == ()
+        assert stopping.progress_status == stopping.body == coordinator.i18n.t("interrupt.stopping")
+        assert stopping.progress_mode == ToastProgressMode.INDETERMINATE
+        assert stopping.progress_value_text == ""
+        coordinator.progress("active", task, {"event": "memory_blocked"})
+        assert host.snapshots[-1].title == stopping.title
+        assert host.snapshots[-1].actions == ()
         coordinator.interrupted("active", errors)
         coordinator._finalize(coordinator._finalize_generation)
         assert not _terminal_snapshots(host)
         coordinator.interrupted("scanning", [])
         final = host.wait_for_terminal_snapshots()[-1]
-        assert "preserved" in final.body
-        assert ("could not be cleaned" in final.body) == bool(errors)
+        assert final.body == coordinator.i18n.t("interrupt.cleanup_failed" if errors else "interrupt.cleaned")
         assert coordinator.cancel_batch(snapshot.batch_id) == ()
     finally:
         coordinator.stop()

@@ -195,6 +195,64 @@ def test_streaming_execute_uses_request_local_cwd_and_streams(tmp_path, monkeypa
     assert b"warning" in wire
 
 
+def test_watch_stop_control_acknowledges_only_an_active_batch(tmp_path, monkeypatch):
+    # Transport framing tests do not exercise real host/coordinator rejection.
+    # One in-process round trip covers absent/reloading Watch, expired batches,
+    # repeated delivery and cleanup without launching an engine or another host.
+    from types import SimpleNamespace
+    from sunpack.runtime.cli import runtime_state
+    from sunpack.runtime.cli.runtime_host import RuntimeHost
+    from sunpack.runtime.watch.toast import WatchToastCoordinator
+    from tests.helpers.config_factory import make_config
+
+    snapshots, cancelled = [], []
+    coordinator = WatchToastCoordinator(
+        SimpleNamespace(publish=snapshots.append, clear=lambda: None),
+        make_config(), str(tmp_path / 'state'),
+    )
+    host = RuntimeHost()
+    current = None
+    monkeypatch.setattr(runtime_state, 'runtime_host', lambda: current)
+
+    async def send(argv):
+        return await persistent_process._execute_streaming_request_async({'argv': argv}, None)
+
+    async def scenario():
+        nonlocal current
+        assert await send(['--cancel-watch-batch']) == 2
+        assert await send(['--cancel-watch-batch', 'obsolete']) == 1
+        current = host
+        assert await send(['--cancel-watch-batch', 'obsolete']) == 1
+        service = SimpleNamespace(scheduler=None, toast_coordinator=coordinator)
+        host._watch_service = service
+        assert await send(['--cancel-watch-batch', 'obsolete']) == 1
+        service.scheduler = SimpleNamespace(cancel_requests=cancelled.append)
+        service.toast_coordinator = None
+        assert await send(['--cancel-watch-batch', 'obsolete']) == 1
+        service.toast_coordinator = coordinator
+        coordinator.submitted('active', str(tmp_path / 'active.zip'))
+        coordinator.submitted('scanning', str(tmp_path / 'scanning.zip'))
+        coordinator.progress('active', SimpleNamespace(main_path='active.zip'), {
+            'type': 'progress', 'event': 'extract_started',
+        })
+        batch_id = snapshots[-1].batch_id
+        assert await send(['--cancel-watch-batch', 'obsolete']) == 1
+        assert not cancelled and snapshots[-1].actions
+        for _ in range(2):
+            assert await send(['--cancel-watch-batch', batch_id]) == 0
+            assert cancelled[-1] == ('active', 'scanning')
+        assert not snapshots[-1].actions
+        coordinator.aborted('active')
+        coordinator.aborted('scanning')
+        assert await send(['--cancel-watch-batch', batch_id]) == 1
+        assert len(cancelled) == 2
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        coordinator.stop()
+
+
 def test_submit_request_strips_server_side_pause(tmp_path, monkeypatch):
     captured = {}
     request_cwd = os.getcwd()

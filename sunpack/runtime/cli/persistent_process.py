@@ -1162,10 +1162,10 @@ async def _execute_streaming_request_async(
 
     if argv and argv[0] == "--cancel-watch-batch":
         from sunpack.runtime.cli.runtime_state import runtime_host
+        if len(argv) != 2:
+            return 2
         host = runtime_host()
-        if host is not None and len(argv) == 2:
-            host.cancel_watch_batch(argv[1])
-        return 0
+        return 0 if host is not None and host.cancel_watch_batch(argv[1]) else 1
 
     stdout = _AsyncConnectionTextStream(
         loop,

@@ -489,7 +489,14 @@ class WatchToastCoordinator:
         # 空间不足并入既有进度快照，不另发 publish，否则 toast 会在"进度"与"暂停"之间来回抖动。
         disk_paused = any(task.disk_blocked for task in tasks)
         memory_paused = any(task.memory_blocked for task in tasks)
-        if memory_paused:
+        title_key = "toast.progress.paused_title" if disk_paused or memory_paused else "toast.progress.title"
+        if batch.stopping:
+            title_key = "interrupt.stopping_title"
+            mode = ToastProgressMode.INDETERMINATE
+            value = 0.0
+            value_text = ""
+            progress_status = self.i18n.t("interrupt.stopping")
+        elif memory_paused:
             mode = ToastProgressMode.INDETERMINATE
             value = 0.0
             value_text = self.i18n.t("report.status.memory_paused")
@@ -508,14 +515,16 @@ class WatchToastCoordinator:
         self.host.publish(ToastSnapshot(
             kind=ToastSnapshotKind.PROGRESS,
             batch_id=self._batch_id,
-            title=self.i18n.t("toast.progress.paused_title" if disk_paused or memory_paused else "toast.progress.title"),
+            title=self.i18n.t(title_key),
             body=self.i18n.t("interrupt.stopping") if batch.stopping else self.i18n.t("toast.progress.body", completed=completed_requests, total=count),
             progress_mode=mode,
             progress_value=value,
             progress_title=progress_title,
             progress_status=progress_status,
             progress_value_text=value_text,
-            actions=(ToastAction(ToastActionKind.CANCEL_BATCH, self.i18n.t("interrupt.stop"), self._batch_id),),
+            actions=() if batch.stopping else (
+                ToastAction(ToastActionKind.CANCEL_BATCH, self.i18n.t("interrupt.stop"), self._batch_id),
+            ),
         ))
 
     def _schedule_finalize_if_drained_locked(self) -> None:

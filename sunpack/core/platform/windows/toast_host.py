@@ -148,7 +148,23 @@ def handle_toast_argv(argv: list[str]) -> int | None:
         if batch.value:
             from sunpack.runtime.cli.persistent_process import _try_send
             response = _try_send({"argv": ["--cancel-watch-batch", batch.value], "cwd": os.getcwd()})
-            return int(response.get("exit_code", 0)) if response else 0
+            exit_code = int(response.get("exit_code", 1)) if response is not None else 1
+            if exit_code:
+                from sunpack.core.config.cli_settings import load_cli_language_from_config
+                from sunpack.core.i18n import I18nContext
+
+                i18n = I18nContext(load_cli_language_from_config())
+                presenter = _NativeToastPresenter()
+                try:
+                    presenter.show(encode_snapshot(ToastSnapshot(
+                        kind=ToastSnapshotKind.FAILURE,
+                        batch_id=batch.value + "-cancel",
+                        title=i18n.t("interrupt.stop_failed_title"),
+                        body=i18n.t("interrupt.stop_failed"),
+                    )), 1)
+                finally:
+                    presenter.close()
+            return exit_code
     return 0
 
 

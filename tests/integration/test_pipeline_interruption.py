@@ -174,8 +174,11 @@ def test_watch_toast_stop_reaches_pipeline_and_finishes_after_durable_cleanup(tm
     state and ensures its final notification follows output cleanup.
     """
     from sunpack.core.platform.windows.toast_protocol import ToastSnapshotKind
+    from sunpack.runtime.cli import persistent_process, runtime_state
+    from sunpack.runtime.cli.runtime_host import RuntimeHost
     from sunpack.runtime.watch.scheduler import WatchScheduler
     from sunpack.runtime.watch.toast import WatchToastCoordinator
+    from types import SimpleNamespace
 
     # This test admits a filesystem candidate directly; SCM/USN subscription
     # installation is independently covered by broker integration tests.
@@ -191,6 +194,15 @@ def test_watch_toast_stop_reaches_pipeline_and_finishes_after_durable_cleanup(tm
     async def scenario():
         loop = asyncio.get_running_loop()
         wake, finalized = asyncio.Event(), asyncio.Event()
+        runtime = RuntimeHost()
+        monkeypatch.setattr(runtime_state, "runtime_host", lambda: runtime)
+        controls = []
+
+        async def stop(batch_id):
+            assert await persistent_process._execute_streaming_request_async(
+                {"argv": ["--cancel-watch-batch", batch_id]}, None,
+            ) == 0
+
         class Host:
             stopped = False
             snapshots = []
@@ -202,7 +214,7 @@ def test_watch_toast_stop_reaches_pipeline_and_finishes_after_durable_cleanup(tm
                     loop.call_soon_threadsafe(finalized.set)
                 elif not self.stopped:
                     self.stopped = True
-                    watcher.cancel_requests(toast.cancel_batch(snapshot.batch_id))
+                    loop.call_soon_threadsafe(lambda: controls.append(asyncio.create_task(stop(snapshot.batch_id))))
 
         host = Host()
         toast = WatchToastCoordinator(host, config, str(tmp_path / "state"))
@@ -210,6 +222,7 @@ def test_watch_toast_stop_reaches_pipeline_and_finishes_after_durable_cleanup(tm
             watcher = WatchScheduler(config, [str(source)], output_roots={str(source): str(tmp_path / "out")},
                 state_path=str(tmp_path / "state.snapshot"), cold_start_seconds=0,
                 pipeline_engine=engine, notification_sink=toast, wake_callback=wake.set)
+            runtime._watch_service = SimpleNamespace(scheduler=watcher, toast_coordinator=toast)
             try:
                 watcher.enqueue(str(archive))
                 await watcher.run_once()
@@ -220,6 +233,7 @@ def test_watch_toast_stop_reaches_pipeline_and_finishes_after_durable_cleanup(tm
                         await watcher.run_once()
                 await asyncio.wait_for(drain(), 10)
                 await asyncio.wait_for(finalized.wait(), 5)
+                await asyncio.gather(*controls)
                 assert host.stopped
                 assert "has been cleaned" in host.snapshots[-1].body
                 assert not watcher.state.pending_work_items()
@@ -228,6 +242,7 @@ def test_watch_toast_stop_reaches_pipeline_and_finishes_after_durable_cleanup(tm
                 watcher.enqueue(str(archive))
                 assert watcher.pending_count == 0
             finally:
+                await asyncio.gather(*controls, return_exceptions=True)
                 await watcher.aclose()
                 toast.stop()
     asyncio.run(scenario())

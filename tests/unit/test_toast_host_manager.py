@@ -294,6 +294,56 @@ def test_main_runtime_handles_toast_bootstrap_without_starting_engine(monkeypatc
     assert [call[0] for call in calls[1:]] == (['cancel_batch'] if native_method == 'activate' else [])
 
 
+@pytest.mark.parametrize('response, expected_code', [
+    (None, 1), ({}, 1), ({'exit_code': 1}, 1), ({'exit_code': 2}, 2), ({'exit_code': 0}, 0),
+])
+def test_stop_activation_requires_acknowledgement_and_reports_failure(monkeypatch, response, expected_code):
+    # Bootstrap tests activate no action; they cannot catch a lost or rejected
+    # stop being reported as success by the hidden helper. No process is needed.
+    from types import SimpleNamespace
+    from sunpack.runtime.cli import persistent_process
+    from sunpack.core.config import cli_settings
+
+    batch_id = '0123456789abcdef0123456789abcdef'
+    calls = []
+    snapshots = []
+
+    def cancel_batch(buffer, _capacity):
+        buffer.value = batch_id
+        return 0
+
+    library = SimpleNamespace(sunpack_toast_activate=lambda: 0, sunpack_toast_cancel_batch=cancel_batch)
+    monkeypatch.setattr(module, '_load_library', lambda: library)
+    monkeypatch.setattr(cli_settings, 'load_cli_language_from_config', lambda: 'zh')
+
+    def send(payload):
+        calls.append(payload)
+        return response
+
+    monkeypatch.setattr(persistent_process, '_try_send', send)
+    monkeypatch.setattr(persistent_process, '_send_or_start', lambda _payload: pytest.fail('stop started a new runtime'))
+    original_encode = module.encode_snapshot
+
+    def encode(snapshot):
+        snapshots.append(snapshot)
+        return original_encode(snapshot)
+
+    monkeypatch.setattr(module, 'encode_snapshot', encode)
+    recorder = Recorder()
+    monkeypatch.setattr(module, '_NativeToastPresenter', recorder.factory)
+    assert module.handle_toast_argv(['--toast-activated']) == expected_code
+    assert calls == [{'argv': ['--cancel-watch-batch', batch_id], 'cwd': os.getcwd()}]
+    if expected_code:
+        failure, = snapshots
+        assert failure.kind == ToastSnapshotKind.FAILURE
+        assert failure.batch_id != batch_id  # Never remove live progress on uncertain delivery.
+        assert failure.title == 'SunPack 未能确认停止'
+        assert '未收到停止确认' in failure.body
+        assert [event[0] for event in recorder.events] == ['create', 'show', 'close']
+    else:
+        assert not snapshots and not recorder.events
+
+
 def test_unregister_toast_unelevated_removes_current_user_identity_without_native(monkeypatch):
     from sunpack.core.platform.windows import elevation
 

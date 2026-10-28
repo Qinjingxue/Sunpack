@@ -704,6 +704,20 @@ std::wstring action_arguments(const Action& action) {
     return std::wstring(action.kind == ActionKind::cancel_batch ? L"cancel|" : action.kind == ActionKind::open_directory ? L"dir|" : L"log|") + hex_encode(action.target);
 }
 
+std::wstring progress_xml(const Snapshot& snapshot) {
+    std::wstring xml = LR"(<toast launch="noop"><visual><binding template="ToastGeneric"><text>{title}</text><text>{body}</text><progress title="{progressTitle}" value="{progressValue}" valueStringOverride="{progressValueString}" status="{progressStatus}"/></binding></visual>)";
+    if (!snapshot.actions.empty()) {
+        xml += L"<actions>";
+        for (const auto& action : snapshot.actions) {
+            if (action.kind != ActionKind::cancel_batch) continue;
+            xml += L"<action activationType=\"background\" content=\"";
+            xml += xml_escape(action.label) + L"\" arguments=\"" + xml_escape(action_arguments(action)) + L"\"/>";
+        }
+        xml += L"</actions>";
+    }
+    return xml + L"</toast>";
+}
+
 class ToastPresenter {
 public:
     explicit ToastPresenter(std::shared_ptr<DiagnosticLog> diagnostic_log)
@@ -774,36 +788,33 @@ private:
             values.Insert(L"progressValue", winrt::to_hstring(snapshot.progress_value));
         }
         data.SequenceNumber(static_cast<std::uint32_t>(sequence & 0xffffffff));
-        if (progress_tag_ == tag) {
+        // NotificationData cannot add/remove buttons. Replace the XML only
+        // when stopping changes the actions; normal progress stays in-place.
+        const bool same_batch = progress_tag_ == tag;
+        const bool has_cancel = std::any_of(snapshot.actions.begin(), snapshot.actions.end(),
+            [](const Action& action) { return action.kind == ActionKind::cancel_batch; });
+        if (same_batch && progress_has_cancel_ == has_cancel) {
             const auto updated = notifier_.Update(data, tag, kToastGroup);
             if (updated == NotificationUpdateResult::Succeeded) {
                 return;
             }
-        } else if (!progress_tag_.empty()) {
+        } else if (!same_batch && !progress_tag_.empty()) {
             // A new batch arrived while an older progress notification was
             // still active. The old progress is stale and may be removed.
             clear();
         }
 
         XmlDocument document;
-        std::wstring xml = LR"(<toast launch="noop"><visual><binding template="ToastGeneric"><text>{title}</text><text>{body}</text><progress title="{progressTitle}" value="{progressValue}" valueStringOverride="{progressValueString}" status="{progressStatus}"/></binding></visual>)";
-        if (!snapshot.actions.empty()) {
-            xml += L"<actions>";
-            for (const auto& action : snapshot.actions) {
-                if (action.kind != ActionKind::cancel_batch) continue;
-                xml += L"<action placement=\"contextMenu\" activationType=\"background\" content=\"";
-                xml += xml_escape(action.label) + L"\" arguments=\"" + xml_escape(action_arguments(action)) + L"\"/>";
-            }
-            xml += L"</actions>";
-        }
-        document.LoadXml(xml + L"</toast>");
+        document.LoadXml(progress_xml(snapshot));
         ToastNotification toast(document);
         toast.Tag(tag);
         toast.Group(kToastGroup);
         toast.Data(data);
+        toast.SuppressPopup(same_batch && progress_has_cancel_ != has_cancel);
         observe_dismissal(toast, "progress");
         notifier_.Show(toast);
         progress_tag_ = tag;
+        progress_has_cancel_ = has_cancel;
     }
 
     void show_final(const Snapshot& snapshot) {
@@ -853,12 +864,14 @@ private:
     winrt::Windows::UI::Notifications::ToastNotifier notifier_{nullptr};
     std::shared_ptr<DiagnosticLog> diagnostic_log_;
     std::wstring progress_tag_;
+    bool progress_has_cancel_{};
 };
 
 struct ToastContext {
-    explicit ToastContext(const CLSID& clsid = kToastActivatorClsid) : activation(clsid) {}
     WinrtApartmentScope apartment;
-    ActivationRegistration activation;
+    // Only the activation helper registers the COM callback. A presenter in
+    // the resident runtime must not consume an activation that only the
+    // helper forwards through the existing command pipe.
     std::wstring diagnostic_log_path;
     std::shared_ptr<DiagnosticLog> diagnostic_log;
     std::unique_ptr<ToastPresenter> presenter;
@@ -906,7 +919,8 @@ int self_test() {
     {
         CLSID test_clsid{};
         winrt::check_hresult(CoCreateGuid(&test_clsid));
-        ToastContext context(test_clsid);
+        ToastContext context;
+        ActivationRegistration activation(test_clsid);
         XmlDocument first;
         first.LoadXml(L"<root><value>first</value></root>");
         XmlDocument second;
@@ -923,6 +937,24 @@ int self_test() {
         winrt::com_ptr<INotificationActivationCallback> callback;
         winrt::check_hresult(factory->CreateInstance(nullptr, IID_PPV_ARGS(callback.put())));
         winrt::check_hresult(callback->Activate(kAppId, L"noop", nullptr, 0));
+        Snapshot snapshot;
+        snapshot.actions.push_back({ActionKind::cancel_batch, L"Stop & clean", L"0123456789abcdef0123456789abcdef"});
+        XmlDocument document;
+        document.LoadXml(progress_xml(snapshot));
+        const auto actions = document.GetElementsByTagName(L"action");
+        if (actions.Length() != 1) return 10;
+        const auto action = actions.Item(0).as<winrt::Windows::Data::Xml::Dom::XmlElement>();
+        if (!action.GetAttribute(L"placement").empty() || action.GetAttribute(L"content") != L"Stop & clean" ||
+            action.GetAttribute(L"arguments") != action_arguments(snapshot.actions.front())) return 11;
+        winrt::check_hresult(callback->Activate(kAppId, action_arguments(snapshot.actions.front()).c_str(), nullptr, 0));
+        wchar_t batch[33]{};
+        winrt::check_hresult(sunpack_toast_cancel_batch(batch, 33));
+        if (std::wstring_view(batch) != snapshot.actions.front().target) return 13;
+        winrt::check_hresult(sunpack_toast_cancel_batch(batch, 33));
+        if (batch[0] != L'\0') return 14;
+        snapshot.actions.clear();
+        document.LoadXml(progress_xml(snapshot));
+        if (document.GetElementsByTagName(L"action").Length() != 0) return 12;
     }
     // Rust log tests cannot cover this separate C++ callback writer. One tiny
     // file verifies queued diagnostics survive owner teardown without waits.
