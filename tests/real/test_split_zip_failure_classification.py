@@ -6,7 +6,6 @@ import json
 import os
 import subprocess
 import sys
-import uuid
 import zipfile
 from pathlib import Path
 
@@ -14,6 +13,7 @@ import pytest
 import psutil
 
 from sunpack.core.contracts.failures import FailureInfo, FailureKind
+from sunpack.core.support.runtime_identity import SOURCE_RUNTIME_ID
 from tests.helpers.passwords import write_password_json
 from sunpack.pipeline.coordinator.engine import PipelineEngine
 from sunpack.pipeline.coordinator.task_provider import ArchiveTaskProvider
@@ -170,7 +170,7 @@ def test_cli_nested_disguised_split_groups_keep_failure_classifications(tmp_path
     # The resident CLI owns its startup environment. Isolate its namespace
     # and close it even on failure, rather than reusing a developer's server.
     bootstrap = [sys.executable, "-B", str(root / "sunpack.py")]
-    runtime_id = f"v2-{uuid.uuid4().hex[:16]}"
+    runtime_id = SOURCE_RUNTIME_ID
     identity = f"--_sunpack-runtime-id={runtime_id}"
     environment = {**os.environ, "SUNPACK_CONFIG_OVERRIDES": json.dumps(overrides)}
     try:

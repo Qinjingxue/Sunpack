@@ -709,8 +709,7 @@ def test_split_arrivals_publish_only_confirmed_cards(tmp_path, monkeypatch):
                 for index, source in enumerate(parts):
                     arrived = root / source.name
                     shutil.copyfile(source, arrived)
-                    scope, = watcher.scopes.values()
-                    watcher._scan_options.catalog_update(watcher._catalog, scope.native)
+                    watcher.enqueue(str(arrived), force=True, event_type="created")
                     request = await watcher._submit_candidate(watch_candidate_for_path(str(arrived)))
                     assert request is not None
                     # Admission has no confirmed descriptor yet. It must neither
@@ -777,8 +776,7 @@ def test_real_recursive_watch_executions_keep_two_outer_rows(tmp_path, monkeypat
                 payload = archive("B.other", archive("C.blob", archive("payload.txt", "same-payload")))
                 for index in range(2):
                     source.write_bytes(b"carrier-prefix" + payload + b"carrier-tail")
-                    scope, = watcher.scopes.values()
-                    watcher._scan_options.catalog_update(watcher._catalog, scope.native)
+                    watcher.enqueue(str(source), force=True, event_type="created")
                     request = await watcher._submit_candidate(watch_candidate_for_path(str(source)))
                     assert request is not None
                     await request.task
