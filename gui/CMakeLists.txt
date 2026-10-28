@@ -65,11 +65,12 @@ target_link_libraries(sunpack_gui_ui_tests PRIVATE sunpack_gui_app sunpack_gui_d
 target_compile_options(sunpack_gui_ui_tests PRIVATE /UNDEBUG)
 target_link_options(sunpack_gui_ui_tests PRIVATE "$<$<CONFIG:Release>:/LTCG>")
 add_test(NAME gui_interface COMMAND sunpack_gui_ui_tests --acceptance)
+add_test(NAME gui_history_window COMMAND sunpack_gui_ui_tests --history)
 if(SUNPACK_GUI_ASAN)
   target_sources(sunpack_gui_tests PRIVATE ../tests/gui/asan_options.cpp)
   target_sources(sunpack_gui_ui_tests PRIVATE ../tests/gui/asan_options.cpp)
 endif()
-set_tests_properties(gui_file_contracts gui_interface PROPERTIES TIMEOUT 60)
+set_tests_properties(gui_file_contracts gui_interface gui_history_window PROPERTIES TIMEOUT 60)
 
 # One MSBuild invocation can schedule all independent targets in parallel.
 add_custom_target(sunpack_gui_checks DEPENDS SunPackGUI sunpack_gui_tests sunpack_gui_ui_tests)

@@ -26,6 +26,8 @@ class Application {
     std::deque<Json> commands_;
     Json pending_ = Json::object();
     bool notified_ = false, stopping_ = false, choosing_directory_ = false, shown_ = false;
+    bool task_range_pending_ = false;
+    void schedule_task_range();
     unsigned dirty_ = 15;
     std::atomic<uint64_t> task_query_generation_{0};
     std::thread worker_, registry_;

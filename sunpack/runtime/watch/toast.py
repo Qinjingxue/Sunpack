@@ -225,9 +225,13 @@ class WatchToastCoordinator:
                     self._release_space_jobs_for_request_locked(previous)
                 self._requests[str(request_id)] = _RequestProgress(source_path=os.path.abspath(source_path))
 
-    def cancel_batch(self, batch_id: str) -> tuple[str, ...]:
+    def cancel_batch(self, batch_id: str) -> tuple[str, ...] | None:
         with self._lock:
-            if self._closed or not batch_id or batch_id != self._batch_id or not self._requests:
+            if self._closed:
+                return None
+            # Only the current batch owns cancellable work. A late activation
+            # needs no history and must never stop requests from a newer batch.
+            if not batch_id or batch_id != self._batch_id or not self._requests:
                 return ()
             if any(not request.stopping for request in self._requests.values()):
                 for request in self._requests.values():
@@ -534,7 +538,7 @@ class WatchToastCoordinator:
             progress_title=progress_title,
             progress_status=progress_status,
             progress_value_text=value_text,
-            actions=() if stopping else (
+            actions=() if stopping or not self._requests else (
                 ToastAction(ToastActionKind.CANCEL_BATCH, self.i18n.t("interrupt.stop"), self._batch_id),
             ),
         ))

@@ -5,6 +5,9 @@
   "runtime": {
     "process_mode": "high"
   },
+  "watch": {
+    "event_log_retention_days": 7
+  },
   "recursive_extract": "*",
   "recursive_authorization": {
     "enabled": true

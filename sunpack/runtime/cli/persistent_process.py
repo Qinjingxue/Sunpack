@@ -1171,7 +1171,10 @@ async def _execute_streaming_request_async(
         if len(argv) != 2:
             return 2
         host = runtime_host()
-        return 0 if host is not None and host.cancel_watch_batch(argv[1]) else 1
+        if host is None:
+            return 1
+        outcome = host.cancel_watch_batch(argv[1])
+        return 0 if outcome in {"accepted", "already_finished"} else 1
 
     stdout = _AsyncConnectionTextStream(
         loop,

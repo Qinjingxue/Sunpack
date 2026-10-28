@@ -759,18 +759,6 @@
       "zh": "暂无条目",
       "en": "No tags yet"
     },
-    "taskNext": {
-      "zh": "下一页",
-      "en": "Next"
-    },
-    "taskPrevious": {
-      "zh": "上一页",
-      "en": "Previous"
-    },
-    "taskLatest": {
-      "zh": "最新",
-      "en": "Latest"
-    },
     "droppedLogs": {
       "zh": "条日志因写入积压未保存",
       "en": "log entries dropped during write overload"

@@ -650,6 +650,17 @@ if(WIN32)
 endif()
 
 enable_testing()
+if(WIN32)
+    add_executable(sunpack_toast_registration_runtime tests/toast_registration_runtime.cpp)
+    apply_release_optimizations(sunpack_toast_registration_runtime)
+    apply_source_charset(sunpack_toast_registration_runtime)
+    add_test(NAME sunpack_launcher_toast_registration COMMAND ${CMAKE_COMMAND}
+        "-DLAUNCHER=$<TARGET_FILE:sunpack_launcher>"
+        "-DRUNTIME=$<TARGET_FILE:sunpack_toast_registration_runtime>"
+        "-DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/toast_registration.cmake")
+    set_tests_properties(sunpack_launcher_toast_registration PROPERTIES TIMEOUT 15)
+endif()
 add_executable(sunpack_memory_admission_cost EXCLUDE_FROM_ALL ../../benchmarks/native/memory_admission.cpp)
 apply_release_optimizations(sunpack_memory_admission_cost)
 apply_source_charset(sunpack_memory_admission_cost)

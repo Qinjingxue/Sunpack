@@ -927,7 +927,7 @@ begin
     UpgradeConfigurationFields;
     InstallBrokerService;
     if not Exec(
-      ExpandConstant('{app}\sunpack-runtime.exe'),
+      ExpandConstant('{app}\bin\sunpack.exe'),
       '--register-toast',
       '',
       SW_HIDE,

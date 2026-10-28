@@ -12,6 +12,7 @@ from pathlib import Path
 from sunpack.core.platform.windows.toast_protocol import ToastSnapshot, ToastSnapshotKind, encode_snapshot
 from sunpack.core.support.process_executable import current_process_executable
 from sunpack.core.support.resources import get_toast_library_path
+from sunpack.core.support.runtime_identity import runtime_id_argument
 
 
 _TOAST_APP_ID_KEY = r"Software\Classes\AppUserModelId\SunPack.Watch.Toast"
@@ -27,6 +28,7 @@ def _runtime_argv(argument: str) -> list[str]:
 
 def _activation_command() -> tuple[str, str]:
     argv = _runtime_argv("--toast-activated")
+    argv.append(runtime_id_argument())
     return argv[0], subprocess.list2cmdline(argv[1:])
 
 

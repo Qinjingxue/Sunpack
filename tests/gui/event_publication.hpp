@@ -6,7 +6,7 @@
 #include <cstring>
 
 // Test-only publisher; the shipping GUI never writes display history.
-inline void publish_events(const spg::fs::path& path,const std::string& events) {
+inline void publish_events(const spg::fs::path& path,const std::string& events,const spg::Json& retained_runs=spg::Json::array()) {
     using namespace spg;
     EventLog projection;
     size_t at=0;
@@ -44,5 +44,6 @@ inline void publish_events(const spg::fs::path& path,const std::string& events) 
     }
     data.close(); index.close();
     auto run=Json{{"name",name},{"head",0},{"count",rows.size()}};
-    atomic_write(path,Json{{"format",1},{"revision",generation},{"task_revision",generation},{"runs",{run}},{"live",nullptr},{"dropped",0}}.dump());
+    auto runs=retained_runs; runs.push_back(std::move(run));
+    atomic_write(path,Json{{"format",1},{"revision",generation},{"task_revision",generation},{"runs",std::move(runs)},{"live",nullptr},{"dropped",0}}.dump());
 }

@@ -49,18 +49,6 @@ def main() -> int:
             return 2
         return _configure_startup_current_user(sys.argv[2])
 
-    # Registration and COM activation enter the main runtime directly and do
-    # not start an extraction engine or a watch service.
-    if sys.argv[1:2] and sys.argv[1] in {
-        "--register-toast",
-        "--unregister-toast",
-        "--unregister-toast-current-user",
-        "--toast-activated",
-    }:
-        from sunpack.core.platform.windows.toast_host import handle_toast_argv
-
-        return handle_toast_argv(sys.argv[1:])
-
     from sunpack.core.support.runtime_identity import consume_runtime_id
 
     try:
@@ -75,6 +63,18 @@ def main() -> int:
     # Existing CLI and GUI entry points read sys.argv directly. Remove the
     # process-local private bootstrap arguments before either is entered.
     sys.argv[:] = [sys.argv[0], *public_argv]
+
+    # Toast helpers need the same namespace as Watch, but must not start an
+    # extraction engine or a persistent server. COM may append -Embedding.
+    if sys.argv[1:2] and sys.argv[1] in {
+        "--register-toast",
+        "--unregister-toast",
+        "--unregister-toast-current-user",
+        "--toast-activated",
+    }:
+        from sunpack.core.platform.windows.toast_host import handle_toast_argv
+
+        return handle_toast_argv(sys.argv[1:])
 
     from sunpack.runtime.cli.persistent_process import handle_early_argv
 

@@ -2495,7 +2495,7 @@ void VirtualListWidget::RemapRows(const std::vector<size_t>& previousIndices) {
     auto* ancestor = Parent();
     while (ancestor && !dynamic_cast<ScrollViewWidget*>(ancestor)) ancestor = ancestor->Parent();
     auto* scroll = dynamic_cast<ScrollViewWidget*>(ancestor);
-    const size_t anchor = scroll ? RowAt(std::max(0.0f, scroll->rect.top - rect.top - padT)) : 0;
+    const size_t anchor = scroll ? RowAt(std::max(0.0f, scroll->rect.top + scroll->padT - rect.top - padT)) : 0;
     const float before = Sum(anchor);
     size_t nextAnchor = previousIndices.size();
     std::vector<float> next(previousIndices.size(), std::max(1.0f, estimatedHeight + gap_));
@@ -2508,7 +2508,7 @@ void VirtualListWidget::RemapRows(const std::vector<size_t>& previousIndices) {
     RebuildSums();
     // A surviving visible key keeps its screen position across insert/reorder.
     // Lists below the viewport must not move the surrounding page.
-    if (scroll && scroll->rect.top >= rect.top + padT && nextAnchor < heights_.size())
+    if (scroll && scroll->rect.top + scroll->padT >= rect.top + padT - 0.5f && nextAnchor < heights_.size())
         scroll->CorrectVirtualAnchor(Sum(nextAnchor) - before);
     ui::RequestLayout();
 }
@@ -2590,7 +2590,7 @@ void VirtualListWidget::DoLayout() {
     auto* ancestor = Parent();
     while (ancestor && !dynamic_cast<ScrollViewWidget*>(ancestor)) ancestor = ancestor->Parent();
     auto* scroll = dynamic_cast<ScrollViewWidget*>(ancestor);
-    size_t anchor = scroll ? RowAt(std::max(0.0f, scroll->rect.top - rect.top - padT)) : 0;
+    size_t anchor = scroll ? RowAt(std::max(0.0f, scroll->rect.top + scroll->padT - rect.top - padT)) : 0;
     float anchorBefore = Sum(anchor);
     bool changed = false;
     std::unordered_map<Widget*, RowLayout> nextLayouts;

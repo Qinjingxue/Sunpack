@@ -1452,7 +1452,14 @@ LRESULT UiWindowImpl::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
     }
 
     case WM_SHOWWINDOW:
-        if (wParam) UpdateToggleAnimTimer();
+        if (wParam) {
+            UpdateToggleAnimTimer();
+            // WM_SHOWWINDOW may arrive before WS_VISIBLE is set, when
+            // Invalidate() skips hidden windows. Queue the first frame
+            // directly; transparent popups cannot rely on an incidental
+            // WM_PAINT to resume motion after the hidden startup frame.
+            if (HasAnimationFrameWork()) RequestRenderFrame(FrameReason::Animation);
+        }
         else { scrollFrameGeneration_ = 0; StopAnimationFrames(); }
         break;
     case WM_SIZE: {

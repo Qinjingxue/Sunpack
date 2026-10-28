@@ -1,6 +1,7 @@
 import os
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
@@ -286,11 +287,14 @@ def test_main_runtime_handles_toast_bootstrap_without_starting_engine(monkeypatc
         for name in ('register', 'unregister', 'activate', 'cancel_batch')
     })
     monkeypatch.setattr(module, '_load_library', lambda: library)
-    monkeypatch.setattr(module, '_activation_command', lambda: ('main.exe', '--toast-activated'))
-    monkeypatch.setattr(sys, 'argv', ['sunpack-runtime.exe', argument])
-    monkeypatch.setattr(runtime_identity, 'consume_runtime_id', lambda _argv: pytest.fail('entered normal runtime'))
+    identity = 'v2-0123456789abcdef'
+    monkeypatch.setattr(runtime_identity, '_runtime_id', None)
+    monkeypatch.setattr(module, '__compiled__', object(), raising=False)
+    monkeypatch.setattr(module, 'current_process_executable', lambda: Path('main.exe'))
+    monkeypatch.setattr(sys, 'argv', ['sunpack-runtime.exe', argument, runtime_identity.runtime_id_argument(identity)])
     assert entrypoint.main() == 0
-    assert calls[0] == (native_method, ('main.exe', '--toast-activated') if native_method == 'register' else ())
+    assert runtime_identity.runtime_id() == identity
+    assert calls[0] == (native_method, ('main.exe', '--toast-activated ' + runtime_identity.runtime_id_argument(identity)) if native_method == 'register' else ())
     assert [call[0] for call in calls[1:]] == (['cancel_batch'] if native_method == 'activate' else [])
 
 
@@ -446,7 +450,7 @@ def test_unregister_toast_current_user_helper_is_dispatched_before_normal_runtim
     calls = []
     monkeypatch.setattr(sys, 'argv', ['sunpack-runtime.exe', '--unregister-toast-current-user'])
     monkeypatch.setattr(module, '_remove_current_user_toast_identity', lambda: calls.append('user'))
-    monkeypatch.setattr(runtime_identity, 'consume_runtime_id', lambda _argv: pytest.fail('entered normal runtime'))
+    monkeypatch.setattr(runtime_identity, '_runtime_id', None)
 
     assert entrypoint.main() == 0
     assert calls == ['user']

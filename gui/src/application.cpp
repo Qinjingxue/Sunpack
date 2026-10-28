@@ -23,7 +23,7 @@ void update_tags(TagCollection& tags,const Json& field,const Json& drafts,const 
     tags.SetItems((drafts.contains(id)?drafts[id]["text"]:field["text"]).get_ref<const std::string&>(),wide(tr("emptyEntry",language)),wide(tr("noTags",language)));
 }
 // Keep host messages outside Core UI's startup/render message range.
-constexpr UINT Dispatch = WM_APP + 0x401, Update = WM_APP + 0x402, DateResult = WM_APP + 0x403;
+constexpr UINT Dispatch = WM_APP + 0x401, Update = WM_APP + 0x402, DateResult = WM_APP + 0x403, TaskRange = WM_APP + 0x404;
 constexpr unsigned Config = 1, Passwords = 2, Roots = 4, Log = 8, Startup = 16;
 using Clock=std::chrono::steady_clock;
 using motion::VisualBatch;
@@ -97,6 +97,9 @@ void Application::publish(Json patch) {
     // A later full snapshot supersedes previous incremental updates.
     if(patch.contains("passwords")) pending_.erase("passwordDelta");
     if(patch.contains("passwordDelta") && pending_.contains("passwords")) patch.erase("passwordDelta");
+    if(patch.contains("tasks") && pending_.contains("tasks") &&
+        patch["tasks"]["generation"]==pending_["tasks"]["generation"] && pending_["tasks"].value("reset",false))
+        patch["tasks"]["reset"]=true;
     for(auto it=patch.begin();it!=patch.end();++it) pending_[it.key()]=std::move(it.value());
     if(!notified_) { notified_=true; PostMessageW(hwnd_,Update,0,0); }
 }
@@ -322,11 +325,17 @@ void Application::acknowledge_save(const Json& ack) {
     }
     active_save_=Json();
 }
+void Application::schedule_task_range() {
+    // Defer data edits until the virtual list has finished realization/layout.
+    if(!task_range_pending_) { task_range_pending_=true; PostMessageW(hwnd_,TaskRange,0,0); }
+}
 void Application::apply_pending() {
     Json patch;
     { std::lock_guard<std::mutex> lock(mutex_); patch=std::move(pending_); pending_=Json::object(); notified_=false; }
     auto reset_scroll=patch.value("resetScroll",Json::array()); patch.erase("resetScroll");
     auto password_delta_patch=patch.value("passwordDelta",Json()); patch.erase("passwordDelta");
+    Json task_snapshot;
+    if(patch.contains("tasks")) { task_snapshot=std::move(patch["tasks"]); patch.erase("tasks"); }
     VisualBatch visual(window_);
     auto ack=patch.value("saveAck",Json()); patch.erase("saveAck");
     const bool cell_ack=!ack.is_null() && (ack["job"]["kind"]=="passwords" || ack["job"]["kind"]=="roots");
@@ -340,6 +349,18 @@ void Application::apply_pending() {
     for(auto it=patch.begin();it!=patch.end();++it) {
         auto text=it.value().dump();
         if(ui_page_set_json(page_,it.key().c_str(),text.c_str())!=0) throw std::runtime_error("uiBindingFailed");
+    }
+    if(!task_snapshot.is_null() && task_snapshot.value("generation",uint64_t(0))==task_query_generation_.load()) {
+        auto* window=ui::GetContext().GetWindow(window_);
+        auto* list=window?dynamic_cast<ui::VirtualListWidget*>(window->Root()->FindById("taskItems")):nullptr;
+        if(list && !list->Indices().empty()) task_snapshot["range"]={{"first",list->Indices().front()},{"last",list->Indices().back()+1}};
+        auto encoded=task_snapshot.dump();
+        if(ui_page_call_json(page_,"applyTasks",encoded.c_str())!=0) throw std::runtime_error("uiBindingFailed");
+        if(task_snapshot.value("reset",false)) {
+            auto widget=ui_widget_find_by_id(ui_page_root(page_),"taskListScroll");
+            if(widget) { ui_debug_scroll_set(widget,0); ui_widget_destroy(widget); }
+        }
+        schedule_task_range();
     }
     if(!directory_snapshot.is_null()) {
         auto encoded=directory_snapshot.dump();
@@ -427,6 +448,7 @@ void Application::navigate(const std::string& tab) {
     motion::enter(window_,("page-"+tab).c_str());
     if(sidebar_changed && next_sidebar) motion::enter(window_,next_sidebar);
     motion::select(window_,"navIndicator",tab=="tasks"?"tabTasks":tab=="config"?"tabConfig":tab=="roots"?"tabRoots":"tabPasswords");
+    if(tab=="tasks") schedule_task_range();
 }
 void Application::sync_toggles() {
     auto drafts=page_value(page_,"toggleDrafts");
@@ -712,9 +734,13 @@ void Application::handle_command(Json command) {
         } else throw std::runtime_error("pathMissing");
         return;
     }
-    if(op=="filterTasks") ui_page_call_json(page_,"resetTaskPages","{}");
-    if(op=="filterTasks" || op=="taskPage") ++task_query_generation_;
+    if(op=="filterTasks") {
+        ui_page_call_json(page_,"resetTaskPages","{}");
+        auto widget=ui_widget_find_by_id(ui_page_root(page_),"taskListScroll");
+        if(widget) { ui_debug_scroll_set(widget,0); ui_widget_destroy(widget); }
+    }
     { std::lock_guard<std::mutex> lock(mutex_);
+      if(op=="filterTasks" || op=="taskPage") ++task_query_generation_;
       if(op=="filterTasks" || op=="taskPage") commands_.erase(std::remove_if(commands_.begin(),commands_.end(),[](const auto& pending){
           auto op=pending.value("op",std::string()); return op=="filterTasks" || op=="taskPage";
       }),commands_.end());
@@ -746,6 +772,16 @@ void Application::finish_date_popup(UINT_PTR generation) {
 LRESULT CALLBACK Application::subclass(HWND hwnd,UINT message,WPARAM wparam,LPARAM lparam,UINT_PTR,DWORD_PTR data) {
     auto* self=reinterpret_cast<Application*>(data);
     try {
+        if(message==TaskRange) {
+            self->task_range_pending_=false;
+            auto* window=ui::GetContext().GetWindow(self->window_);
+            auto* list=window?dynamic_cast<ui::VirtualListWidget*>(window->Root()->FindById("taskItems")):nullptr;
+            if(list && !list->Indices().empty() && page_value(self->page_,"tab")=="tasks") {
+                auto range=Json{{"first",list->Indices().front()},{"last",list->Indices().back()+1}}.dump();
+                if(ui_page_call_json(self->page_,"taskRange",range.c_str())!=0) throw std::runtime_error("uiBindingFailed");
+            }
+            return 0;
+        }
         if(message==DateResult) { self->finish_date_popup(wparam); return 0; }
         if(message==WM_CLOSE || message==WM_LBUTTONDOWN || message==WM_RBUTTONDOWN || message==WM_NCLBUTTONDOWN ||
            message==WM_MOUSEWHEEL || message==WM_MOUSEHWHEEL || message==WM_MOVE || message==WM_SIZE ||
@@ -809,6 +845,13 @@ void Application::open() {
     SendMessageW(hwnd_,WM_SETICON,ICON_SMALL,reinterpret_cast<LPARAM>(icon));
     SetPropW(hwnd_,mutex_name(options_.data_dir,L"SunPack.GUI").c_str(),reinterpret_cast<HANDLE>(1));
     if(!SetWindowSubclass(hwnd_,subclass,1,reinterpret_cast<DWORD_PTR>(this))) win_error("opWindowEvents");
+    if(auto* list=dynamic_cast<ui::VirtualListWidget*>(ui::GetContext().GetWindow(window_)->Root()->FindById("taskItems"))) {
+        auto realize=std::move(list->onRangeChanged);
+        list->onRangeChanged=[this,realize=std::move(realize)] {
+            if(realize) realize();
+            schedule_task_range();
+        };
+    }
     if(!service_refresh_.value) win_error("opServiceRefresh");
     ui_page_on_widget_mount(page_,"dispatch",[](UiPage,UiWidget,void* context){
         auto* self=static_cast<Application*>(context); PostMessageW(self->hwnd_,Dispatch,0,0);
@@ -897,6 +940,10 @@ void Application::work() {
         Json previous_patch=Json::object();
         // Retry only after an observed publication race; no history cache.
         bool task_query_pending=true;
+        std::vector<std::string> task_window{""};
+        bool task_window_reset=false;
+        bool task_window_dirty=true;
+        uint64_t task_revision=0;
         std::map<unsigned,ReadRetry> retries;
         bool initial_load_complete=false;
         auto retry_io=[&](unsigned bit,const WinError& error) {
@@ -924,6 +971,7 @@ void Application::work() {
                 else if(retry.second.due<=Clock::now()) { flags|=retry.first; retry.second.due=Clock::time_point::max(); }
             }
             bool tasks_changed=false,passwords_changed=false,dirs_changed=false,config_changed=false;
+            bool task_page_requested=false;
             Json password_delta;
             Json edit_feedback=Json::object();
             if(!data_watcher || !data_watcher->alive() || (!data_watcher->direct() && fs::is_directory(dir))) {
@@ -935,21 +983,19 @@ void Application::work() {
             for(auto& command:commands) {
                 auto op=command.value("op",std::string()); auto p=command.value("payload",Json::object());
                 try {
-                    if(op=="taskPage") {
+                    if(op=="taskWindow") {
+                        task_window=p.at("window").get<std::vector<std::string>>();
+                        if(p.value("revision",uint64_t(0))==task_revision) task_window_dirty=false;
+                    } else if(op=="taskPage") {
                         view.task_cursor=p.value("cursor",std::string()); tasks_changed=true;
-                        if(!edit_feedback.contains("resetScroll")) edit_feedback["resetScroll"]=Json::array();
-                        edit_feedback["resetScroll"].push_back("taskListScroll");
+                        task_window=p.at("window").get<std::vector<std::string>>(); task_page_requested=true;
                     } else if(op=="filterTasks") {
                         auto query=p.value("query",std::string()), root=p.value("root",std::string());
                         auto status=p.value("status",std::string());
-                        if(view.task_query!=query || view.task_root!=root || view.task_status!=status) {
-                            if(!edit_feedback.contains("resetScroll")) edit_feedback["resetScroll"]=Json::array();
-                            edit_feedback["resetScroll"].push_back("taskListScroll");
-                            view.task_cursor.clear();
-                            view.task_query=std::move(query); view.task_root=std::move(root);
-                            view.task_status=std::move(status);
-                            tasks_changed=true;
-                        }
+                        view.task_cursor.clear();
+                        view.task_query=std::move(query); view.task_root=std::move(root);
+                        view.task_status=std::move(status); tasks_changed=true;
+                        task_window={""};
                     } else if(op=="filterPasswords") {
                         password_delta=Json(); // Filter changes require the whole result set.
                         if(!edit_feedback.contains("resetScroll")) edit_feedback["resetScroll"]=Json::array();
@@ -1070,6 +1116,7 @@ void Application::work() {
                     }); errors.erase("logObserver");
                 } catch(const std::exception& e) { errors["logObserver"]=e.what(); }
                 log.set_path(log_dir/"events.json"); flags|=Log; tasks_changed=true;
+                task_window={""}; view.task_cursor.clear(); task_window_reset=true;
             }
             bool rebuild_log=false, log_unavailable=false;
             auto log_error=[&](const std::exception& error) {
@@ -1077,16 +1124,24 @@ void Application::work() {
                 const auto* io=dynamic_cast<const WinError*>(&error);
                 if(io && (io->code==ERROR_SHARING_VIOLATION || io->code==ERROR_LOCK_VIOLATION ||
                     io->code==ERROR_FILE_NOT_FOUND || io->code==ERROR_PATH_NOT_FOUND)) {
-                    // Publication conflicts wait for the next file notification.
+                    // Rename notifications may precede release of the writer's
+                    // sharing lock. No further notification is guaranteed then.
+                    // Retry that observed conflict, without a failure limit;
+                    // unpublished/missing files still wait for file events.
+                    if(io->code==ERROR_SHARING_VIOLATION || io->code==ERROR_LOCK_VIOLATION)
+                        retries[Log].due=Clock::now()+std::chrono::milliseconds(20);
                     task_query_pending=true;
                     errors.erase("events.json");
                     return;
                 }
                 errors["events.json"]=error.what(); rebuild_log=true;
             };
-            if((flags&Log) || task_query_pending) {
+            if((flags&Log) || task_query_pending || tasks_changed) {
                 try {
                     bool refreshed=log.refresh();
+                    retries.erase(Log);
+                    if(refreshed) ++task_revision;
+                    task_window_dirty|=refreshed;
                     tasks_changed|=refreshed || task_query_pending;
                     errors.erase("events.json");
                 }
@@ -1100,8 +1155,38 @@ void Application::work() {
             if(!log_unavailable && (tasks_changed || language_changed || !previous_patch.contains("tasks"))) {
                 log.cancelled=[this,query_generation]{return task_query_generation_.load()!=query_generation || WaitForSingleObject(stop_,0)==WAIT_OBJECT_0;};
                 try {
-                    auto projected=task_rows(log,roots,view,language);
-                    if(!projected.is_null()) { patch["tasks"]=std::move(projected); task_query_pending=false; }
+                    // Replaced/expired runs cannot keep old disk cursors alive.
+                    if(!log.manifest.is_null()) for(const auto& cursor:task_window) if(!cursor.empty()) {
+                        auto key=Json::parse(cursor); auto name=key.at(1);
+                        bool exists=log.manifest["live"].is_object() && log.manifest["live"]["name"]==name;
+                        for(const auto& run:log.manifest["runs"]) if(run["name"]==name)
+                            exists=key.at(2).get<uint64_t>()>=run.at("head").get<uint64_t>();
+                        if(!exists) { task_window_reset=true; break; }
+                    }
+                    if(task_window_reset) { task_window={""}; view.task_cursor.clear(); }
+                    Json pages=Json::array();
+                    const bool full=!task_page_requested || task_query_pending || task_window_reset || task_window_dirty || language_changed || view.task_cursor==task_window.front();
+                    auto cursors=full?task_window:std::vector<std::string>{view.task_cursor};
+                    std::vector<std::string> refreshed_window;
+                    std::string next_cursor=cursors.front();
+                    for(const auto& requested_cursor:cursors) {
+                        const auto cursor=full?next_cursor:requested_cursor;
+                        auto selected=view; selected.task_cursor=cursor;
+                        auto projected=task_rows(log,roots,selected,language);
+                        if(projected.is_null()) { pages=Json(); break; }
+                        projected["cursor"]=cursor;
+                        projected["query"]=view.task_query; projected["root"]=view.task_root; projected["status"]=view.task_status;
+                        refreshed_window.push_back(cursor);
+                        next_cursor=projected["next"].get<std::string>();
+                        const bool more=projected["hasMore"].get<bool>();
+                        pages.push_back(std::move(projected));
+                        if(full && !more) break;
+                    }
+                    if(!pages.is_null()) {
+                        patch["tasks"]={{"generation",query_generation},{"pages",std::move(pages)},{"reset",task_window_reset},{"full",full},{"window",cursors},{"revision",task_revision}};
+                        if(full) task_window=std::move(refreshed_window);
+                        task_query_pending=false; task_window_reset=false;
+                    } else task_query_pending=true;
                     errors.erase("events.json");
                 } catch(const std::exception& e) { log_error(e); }
                 log.cancelled={};
@@ -1109,6 +1194,7 @@ void Application::work() {
             if(rebuild_log) {
                 task_query_pending=true;
                 view.task_cursor.clear();
+                task_window={""}; task_window_reset=true;
                 log.manifest=Json(); log.tasks.clear();
                 try {
                     if(options_.allow_cli) run_cli(options_.cli,{L"watch",L"rebuild-log"},stop_);

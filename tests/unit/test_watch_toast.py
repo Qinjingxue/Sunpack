@@ -206,6 +206,9 @@ def test_busy_batch_releases_completed_requests_and_bounds_failure_details(tmp_p
     assert len(coordinator._batch.failure_details) < coordinator._batch.failed
     assert host.snapshots[-1].progress_value == pytest.approx(4001 / 4100)
     coordinator.succeeded("active", [])
+    # The debounced final notification has not replaced progress yet. A drained
+    # batch must already have removed its Stop action during that window.
+    assert host.snapshots[-1].actions == ()
     coordinator._finalize(coordinator._finalize_generation)
     terminal = _terminal_snapshots(host)[-1]
     assert terminal.kind == ToastSnapshotKind.MIXED

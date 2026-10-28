@@ -8,7 +8,7 @@ export default {
   data() { return {
     tab:'tasks',theme:'system',themeChoice:0,appearance:'light',language:'en',texts:{},dispatch:false,requests:[],ready:false,busy:false,
     actionError:'',lastCommand:{},errors:{},logPath:'',cliAllowed:false,runtime:{known:false,running:false},
-    taskCursors:[],taskCursor:'',tasks:{rows:[],total:0,hasMore:false,next:'',dropped:0},passwords:{rows:[],total:0},fields:[],directories:[],
+    taskCursors:[],taskPages:[],taskPending:null,taskRevision:0,tasks:{rows:[],total:0,hasMore:false,next:'',dropped:0},passwords:{rows:[],total:0},fields:[],directories:[],
     startup:{enabled:false,command:''},directoryQuery:'',
     taskQuery:'',taskRoot:'',taskStatus:0,
     statusNames:['','taskProcessing','taskWaiting','taskSucceeded','taskFailed'],
@@ -123,11 +123,78 @@ export default {
       this.passwordHistory=snapshot.scope==='@history';
     },
     searchPasswords(value) { this.passwordQuery=value; this.filterPasswords(); },
-    filterTasks() { this.taskCursors=[]; this.taskCursor=''; this.send('filterTasks',{query:this.taskQuery,root:this.taskRoot,status:this.statusNames[this.taskStatus]||''}); },
-    resetTaskPages() { this.taskCursors=[]; this.taskCursor=''; },
-    nextTaskPage() { if(!this.tasks.hasMore) return; let back=this.taskCursors.concat([this.taskCursor]); if(back.length>32) back.shift(); this.taskCursors=back; this.taskCursor=this.tasks.next; this.send('taskPage',{cursor:this.taskCursor}); },
-    previousTaskPage() { if(!this.taskCursors.length) return; let back=this.taskCursors.slice(); this.taskCursor=back.pop(); this.taskCursors=back; this.send('taskPage',{cursor:this.taskCursor}); },
-    latestTaskPage() { this.taskCursors=[]; this.taskCursor=''; this.send('taskPage',{cursor:''}); },
+    filterTasks() { this.resetTaskPages(); this.send('filterTasks',{query:this.taskQuery,root:this.taskRoot,status:this.statusNames[this.taskStatus]||''}); },
+    resetTaskPages() { this.taskCursors=[]; this.taskPages=[]; this.taskPending=null; this.tasks={rows:[],total:0,hasMore:false,next:'',dropped:0}; },
+    trimTaskPages(range) {
+      let rows=this.taskPages.reduce((count,page)=>count+page.rows.length,0);
+      while(this.taskPages.length>1) {
+        let first=this.taskPages[0],last=this.taskPages[this.taskPages.length-1];
+        if(range.first>first.rows.length+Math.min(12,Math.floor(first.rows.length/4))) {
+          this.taskPages.shift(); this.taskCursors.push(first.cursor);
+          range={first:range.first-first.rows.length,last:range.last-first.rows.length}; rows-=first.rows.length;
+        } else if(range.last<rows-last.rows.length-Math.min(12,Math.floor(last.rows.length/4))) {
+          this.taskPages.pop(); rows-=last.rows.length;
+        } else break;
+      }
+      return range;
+    },
+    taskRange(range) {
+      if(!range||!this.tasks.rows.length) return;
+      if(this.taskPending) { this.taskPending.range=range; return; }
+      let count=this.taskPages.length; range=this.trimTaskPages(range);
+      if(count!==this.taskPages.length) this.publishTaskPages();
+      let first=this.taskPages[0],last=this.taskPages[this.taskPages.length-1];
+      if(this.tasks.hasMore&&range.last>=this.tasks.rows.length-Math.min(12,Math.floor(last.rows.length/4))) this.requestTaskPage('append',this.tasks.next,range);
+      else if(this.taskCursors.length&&range.first<=Math.min(12,Math.floor(first.rows.length/4))) this.requestTaskPage('prepend',this.taskCursors[this.taskCursors.length-1],range);
+    },
+    requestTaskPage(mode,cursor,range) {
+      this.taskPending={mode:mode,cursor:cursor,range:range};
+      let window=this.taskPages.map(page=>page.cursor);
+      if(mode==='prepend') window.unshift(cursor); else window.push(cursor);
+      this.send('taskPage',{cursor:cursor,window:window});
+    },
+    applyTasks(packet) {
+      if(packet.pages.some(snapshot=>snapshot.query!==this.taskQuery||snapshot.root!==this.taskRoot||snapshot.status!==(this.statusNames[this.taskStatus]||''))) return;
+      if(packet.reset) this.resetTaskPages();
+      this.taskRevision=packet.revision;
+      if(packet.full) {
+        let pending=this.taskPending, range=pending?pending.range:packet.range;
+        // A refresh can already be in flight when the UI evicts its first page.
+        let first=pending&&pending.mode==='prepend'?pending.cursor:this.taskPages.length?this.taskPages[0].cursor:'';
+        let start=packet.window.indexOf(first);
+        let pages=start>0&&start<packet.pages.length?packet.pages.slice(start):packet.pages;
+        if(start>=packet.pages.length) this.taskCursors=[];
+        if(pending&&pending.mode==='prepend') {
+          this.taskCursors.pop();
+          range={first:range.first+pages[0].rows.length,last:range.last+pages[0].rows.length};
+        }
+        this.taskPending=null;
+        this.taskPages=pages;
+        if(range&&!packet.reset) this.trimTaskPages(range);
+      } else for(let snapshot of packet.pages) this.applyTaskPage(snapshot);
+      if(this.taskPages.length) this.publishTaskPages();
+    },
+    applyTaskPage(snapshot) {
+      if(snapshot.query!==this.taskQuery||snapshot.root!==this.taskRoot||snapshot.status!==(this.statusNames[this.taskStatus]||'')) return;
+      let pending=this.taskPending, index=this.taskPages.findIndex(page=>page.cursor===snapshot.cursor);
+      if(pending&&pending.cursor===snapshot.cursor) {
+        this.taskPending=null;
+        if(pending.mode==='prepend') {
+          this.taskCursors.pop(); this.taskPages.unshift(snapshot);
+          pending.range={first:pending.range.first+snapshot.rows.length,last:pending.range.last+snapshot.rows.length};
+        }
+        else this.taskPages.push(snapshot);
+        this.trimTaskPages(pending.range);
+      } else if(index>=0) this.taskPages[index]=snapshot;
+      else if(!this.taskPages.length) this.taskPages=[snapshot];
+      else return;
+    },
+    publishTaskPages() {
+      // Both arrays share row objects; evicted pages retain only disk cursors.
+      let last=this.taskPages[this.taskPages.length-1],rows=this.taskPages.flatMap(page=>page.rows);
+      this.tasks={rows:rows,total:rows.length,hasMore:last.hasMore,next:last.next,dropped:last.dropped};
+      this.send('taskWindow',{window:this.taskPages.map(page=>page.cursor),revision:this.taskRevision});
+    },
     selectRoot(path) { this.taskRoot=path; this.filterTasks(); },
     filterPasswords() { this.send('filterPasswords',{query:this.passwordQuery,scope:this.passwordScope}); },
     selectPasswordView(history) {
@@ -281,7 +348,8 @@ export default {
         let current=this.rootValue(d),pending=pendingIds.has(d.id);
         d=Object.assign({},d,{pending:pending,error:ack.ok?'':ack.error});
         if(ack.ok) {
-          let record=records.get(d.id),same=JSON.stringify(current)===JSON.stringify(sent.value);
+          // Native round trips can change the payload's property order.
+          let record=records.get(d.id),submitted=this.rootValue(sent.value),same=JSON.stringify(current)===JSON.stringify(submitted);
           if(record.remove) {
             removed.add(d.id);
             if(!pending&&this.rootCell!==d.id&&same) { delete drafts[d.id]; continue; }
@@ -298,7 +366,7 @@ export default {
             if(this.passwordRoot===previous&&previous!==record.input) { this.passwordRoot=record.input; if(!this.passwordHistoryTarget) this.filterPasswords(); }
             if(same&&this.rootCell!==d.id) Object.assign(d,{input:record.input,output:record.output,deep:record.deep,recursive:record.recursive});
           }
-          d.baseline=JSON.stringify(same?this.rootValue(d):sent.value); d.submitted='';
+          d.baseline=JSON.stringify(same?this.rootValue(d):submitted); d.submitted='';
         }
         drafts[d.id]=d;
       }
@@ -771,7 +839,6 @@ export default {
           </div>
           </VirtualList>
         </div></ScrollView>
-        <div class="row"><button @click="latestTaskPage">{{ texts.taskLatest }}</button><button :disabled="!taskCursors.length" @click="previousTaskPage">{{ texts.taskPrevious }}</button><div class="spacer"/><button :disabled="!tasks.hasMore" @click="nextTaskPage">{{ texts.taskNext }}</button></div>
         <label v-show="tasks.dropped" class="error">{{ tasks.dropped }} {{ texts.droppedLogs }}</label>
       </div>
       <div id="page-config" v-show="tab==='config'" class="content">

@@ -4,7 +4,7 @@ import asyncio
 import logging
 import os
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Literal
 
 from sunpack.runtime.cli.persistent_runtime import shared_pipeline_engine
 from sunpack.core.config.loader import load_config
@@ -22,15 +22,17 @@ def _configured_runtime_process_mode(config: dict) -> str:
 class RuntimeHost:
     """Own the one engine and optional watch lifecycle for one installed executable."""
 
-    def cancel_watch_batch(self, batch_id: str) -> bool:
+    def cancel_watch_batch(self, batch_id: str) -> Literal["accepted", "already_finished", "unavailable"]:
         service = self._watch_service
         if service is None or service.scheduler is None or service.toast_coordinator is None:
-            return False
+            return "unavailable"
         requests = service.toast_coordinator.cancel_batch(batch_id)
+        if requests is None:
+            return "unavailable"
         if not requests:
-            return False
+            return "already_finished"
         service.scheduler.cancel_requests(requests)
-        return True
+        return "accepted"
 
     def __init__(
         self,

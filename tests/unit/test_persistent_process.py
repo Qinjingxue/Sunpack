@@ -195,7 +195,7 @@ def test_streaming_execute_uses_request_local_cwd_and_streams(tmp_path, monkeypa
     assert b"warning" in wire
 
 
-def test_watch_stop_control_acknowledges_only_an_active_batch(tmp_path, monkeypatch):
+def test_watch_stop_control_acknowledges_active_and_finished_batches(tmp_path, monkeypatch):
     # Transport framing tests do not exercise real host/coordinator rejection.
     # One in-process round trip covers absent/reloading Watch, expired batches,
     # repeated delivery and cleanup without launching an engine or another host.
@@ -236,16 +236,27 @@ def test_watch_stop_control_acknowledges_only_an_active_batch(tmp_path, monkeypa
             'type': 'progress', 'event': 'extract_started',
         })
         batch_id = snapshots[-1].batch_id
-        assert await send(['--cancel-watch-batch', 'obsolete']) == 1
+        assert await send(['--cancel-watch-batch', 'obsolete']) == 0
         assert not cancelled and snapshots[-1].actions
         for _ in range(2):
             assert await send(['--cancel-watch-batch', batch_id]) == 0
             assert cancelled[-1] == ('active', 'scanning')
         assert not snapshots[-1].actions
-        coordinator.aborted('active')
-        coordinator.aborted('scanning')
-        assert await send(['--cancel-watch-batch', batch_id]) == 1
+        coordinator.interrupted('active', [])
+        coordinator.interrupted('scanning', [])
+        assert not snapshots[-1].actions
+        assert await send(['--cancel-watch-batch', batch_id]) == 0
+        coordinator._finalize(coordinator._finalize_generation)
+        assert await send(['--cancel-watch-batch', batch_id]) == 0
         assert len(cancelled) == 2
+        coordinator.submitted('next', str(tmp_path / 'next.zip'))
+        coordinator.progress('next', SimpleNamespace(main_path='next.zip'), {
+            'type': 'progress', 'event': 'extract_started',
+        })
+        assert await send(['--cancel-watch-batch', batch_id]) == 0
+        assert snapshots[-1].actions and len(cancelled) == 2
+        coordinator.stop()
+        assert await send(['--cancel-watch-batch', batch_id]) == 1
 
     try:
         asyncio.run(scenario())

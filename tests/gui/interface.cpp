@@ -8,6 +8,7 @@
 #include <iostream>
 #include <dwmapi.h>
 #include <cstring>
+#include <set>
 #include <commctrl.h>
 #include <ui/ui_context.h>
 #include <ui/ui_window.h>
@@ -17,7 +18,7 @@
 using namespace spg;
 void rendering_contracts();
 namespace {
-constexpr int virtualTaskCount=196, virtualPasswordCount=80, virtualHistoryCount=96;
+constexpr int virtualTaskCount=350, virtualPasswordCount=80, virtualHistoryCount=96;
 struct AnimationFrames {
     bool finished=false, layout=false, started=false, stopped=false;
     unsigned frames=0, submitted=0, rootLayouts=0;
@@ -81,7 +82,7 @@ void pump_diagnostic(Application& app,const std::function<bool()>& condition,con
     try { pump(condition,phase); }
     catch(...) {
         std::cerr<<"UI wait diagnostic ["<<phase<<"]";
-        for(const char* key:{"tab","language","taskQuery","taskRoot","taskStatus","requests","dispatch",
+        for(const char* key:{"tab","language","taskQuery","taskRoot","taskStatus","taskPending","taskCursors","requests","dispatch",
                              "errors","logPath","actionError","busy","lastCommand",
                              "saving","pendingFields","saveErrors","drafts","tagInputs"}) {
             try { std::cerr<<" "<<key<<"="<<state(app.page(),key).dump(); }
@@ -92,6 +93,12 @@ void pump_diagnostic(Application& app,const std::function<bool()>& condition,con
             std::cerr<<" tasks.total="<<tasks.value("total",-1);
             if(tasks.contains("rows") && !tasks["rows"].empty()) std::cerr<<" tasks.first="<<tasks["rows"][0]["name"];
         } catch(const std::exception& e) { std::cerr<<" tasks=<unavailable: "<<e.what()<<">"; }
+        try {
+            Json cursors=Json::array(); for(auto& page:state(app.page(),"taskPages")) cursors.push_back(page["cursor"]);
+            EventLog disk; disk.set_path(wide(state(app.page(),"logPath").get<std::string>())); disk.refresh();
+            auto fresh=task_rows(disk,{},{});
+            std::cerr<<" windowCursors="<<cursors<<" diskRows="<<fresh["rows"].size()<<" diskFirst="<<(fresh["rows"].empty()?Json():fresh["rows"][0]["name"]);
+        } catch(...) {}
         std::cerr<<'\n';
         throw;
     }
@@ -156,6 +163,19 @@ void settle_motion(Application& app) {
         };
         return settled(root.get());
     }); } catch(...) { std::cerr<<"Unfinished motion: "<<pending<<'\n'; throw; }
+}
+void motion_after_hidden_start(UiWindow handle) {
+    // Use the real popup surface. Its focus setup would invalidate it again
+    // after showing and mask a lost first frame, so exercise showing alone.
+    motion::popup(handle,true);
+    ui_window_show_immediate(handle);
+    auto* window=ui::GetContext().GetWindow(handle);
+    auto surface=window->Root();
+    assert(surface->id=="datePopupSurface");
+    ValidateRect(window->Handle(),nullptr);
+    pump([&]{return surface->opacity==1;},"Motion after hidden start",false);
+    BYTE alpha=0; DWORD flags=0;
+    assert(GetLayeredWindowAttributes(window->Handle(),nullptr,&alpha,&flags) && alpha==255 && (flags&LWA_ALPHA));
 }
 void click(Application& app,const char* id) {
     // Conditional editor views mount during the UI event turn. Drain the
@@ -798,12 +818,25 @@ void range_config(Application& app,const fs::path& dir) {
     auto before=read_file(dir/"sunpack_config.json");
     auto open=[&](const std::string& side) {
         settle_motion(app);
+        // Simulated clicks bypass WM_MOUSEACTIVATE. Match a real click's
+        // owner activation before opening a popup that cancels on deactivation.
+        auto owner=static_cast<HWND>(ui_window_hwnd(app.window()));
+        SendMessageW(owner,WM_MOUSEACTIVATE,reinterpret_cast<WPARAM>(owner),MAKELPARAM(HTCLIENT,WM_LBUTTONDOWN));
+        ui_debug_pump();
         AnimationFrames animation;
         click(app,("range-"+side+"-pick-"+tid).c_str()); ui_debug_pump();
         auto* popup=date_popup(app); assert(popup);
-        auto* surface=popup->Root().get();
+        auto surface=popup->Root();
         assert(surface->id=="datePopupSurface");
-        pump([&]{return surface->opacity==1;},"Date popup entrance",false);
+        try { pump([&]{
+            if(date_popup(app)!=popup) throw std::runtime_error("Date popup closed during entrance");
+            return surface->opacity==1;
+        },"Date popup entrance",false); }
+        catch(...) {
+            std::cerr<<"Date entrance: alive="<<(date_popup(app)==popup)<<" opacity="<<surface->opacity
+                     <<" frames="<<animation.frames<<" submitted="<<animation.submitted<<" started="<<animation.started<<" stopped="<<animation.stopped<<'\n';
+            throw;
+        }
         BYTE alpha=0; DWORD flags=0;
         assert(GetLayeredWindowAttributes(popup->Handle(),nullptr,&alpha,&flags) && alpha==255 && (flags&LWA_ALPHA));
         auto* picker=ui::GetContext().GetWindow(app.window())->Root()->FindById("range-"+side+"-pick-"+tid);
@@ -913,6 +946,7 @@ void range_config(Application& app,const fs::path& dir) {
     // Exercise placement on each attached monitor, including negative screen
     // coordinates and its real DPI. No desktop resolution or scaling changes.
     std::vector<RECT> workAreas;
+    bool checkedHiddenStart=false;
     EnumDisplayMonitors(nullptr,nullptr,[](HMONITOR monitor,HDC,LPRECT,LPARAM context)->BOOL {
         MONITORINFO info{sizeof(info)}; assert(GetMonitorInfoW(monitor,&info));
         reinterpret_cast<std::vector<RECT>*>(context)->push_back(info.rcWork); return TRUE;
@@ -931,6 +965,7 @@ void range_config(Application& app,const fs::path& dir) {
             if(!bottom && bounds.bottom-bounds.top<work.bottom-anchor.bottom) assert(bounds.top>anchor.bottom);
             auto* first=actual->Root()->FindById("date-day-0"),*seventh=actual->Root()->FindById("date-day-6"),*eighth=actual->Root()->FindById("date-day-7");
             assert(first && seventh && eighth && std::abs(first->rect.top-seventh->rect.top)<0.1f && eighth->rect.top>first->rect.bottom);
+            if(!checkedHiddenStart) { motion_after_hidden_start(actual->windowId); checkedHiddenStart=true; }
         }
         assert(tree.expired());
     }
@@ -1328,6 +1363,85 @@ void bound_style_updates() {
     ui_page_destroy(page);
 }
 }
+void task_history(Application& app,const fs::path& dir) {
+    // Disk projection tests cannot expose missing scroll notifications, retained
+    // card payloads, or broken anchors after eviction. One window covers all.
+    std::string many;
+    const char* phases[]={"processing_started","failed_terminal","suspended_missing_volume","done"};
+    for(int i=0;i<virtualTaskCount;++i) many+=Json({{"event",phases[i%4]},{"path",utf8((dir/"history"/("task-"+std::to_string(i)+".001")).wstring())},{"ts",1792401342.731112},{"output_dirs",{utf8(dir.wstring())}}}).dump()+"\n";
+    publish_events(dir/".sunpack_watch"/"events.json",many);
+    assert(ui_page_call_json(app.page(),"searchTasks",R"("")")==0);
+    pump_diagnostic(app,[&]{return state(app.page(),"tasks")["total"]==100;},"Load virtual tasks");
+    const auto first_id=state(app.page(),"tasks")["rows"][0]["id"];
+    auto* window=ui::GetContext().GetWindow(app.window());
+    auto* list=dynamic_cast<ui::VirtualListWidget*>(window->Root()->FindById("taskItems"));
+    auto* scroll=dynamic_cast<ui::ScrollViewWidget*>(window->Root()->FindById("taskListScroll"));
+    assert(list && scroll);
+    std::set<std::string> seen;
+    auto observe=[&] {
+        auto tasks=state(app.page(),"tasks");
+        assert(tasks["rows"].size()<=200 && list->Children().size()<40);
+        for(auto& row:tasks["rows"]) seen.insert(row["id"].get<std::string>());
+    };
+    observe();
+    auto visible_anchor=[&]() -> ui::Widget* {
+        for(auto& row:list->Children()) if(row->rect.top>=scroll->rect.top && row->rect.bottom<=scroll->rect.bottom) return row.get();
+        throw std::runtime_error("No visible task history anchor");
+    };
+    for(int page=1;page<4;++page) {
+        auto old_next=state(app.page(),"tasks")["next"];
+        window->ScrollWithMeasureContext(scroll,1e9f);
+        auto anchor=visible_anchor()->id;
+        auto top=visible_anchor()->rect.top;
+        pump_diagnostic(app,[&]{return state(app.page(),"taskPending").is_null()&&state(app.page(),"tasks")["next"]!=old_next;},"Automatic history append and eviction");
+        auto* retained=list->FindById(anchor);
+        if(!retained || std::abs(retained->rect.top-top)>=1) std::cerr<<"History append page="<<page<<" anchor="<<anchor<<" oldTop="<<top<<" newTop="<<(retained?retained->rect.top:-1)<<" scroll="<<scroll->ScrollY()<<" count="<<state(app.page(),"tasks")["total"]<<" first="<<list->Indices().front()<<'\n';
+        assert(retained && std::abs(retained->rect.top-top)<1);
+        observe();
+    }
+    assert(seen.size()==virtualTaskCount && !state(app.page(),"tasks")["hasMore"].get<bool>());
+    assert(state(app.page(),"tasks")["rows"][0]["id"]!=first_id);
+    while(!state(app.page(),"taskCursors").empty()) {
+        auto previous=state(app.page(),"tasks")["rows"][0]["id"];
+        window->ScrollWithMeasureContext(scroll,0);
+        auto anchor=visible_anchor()->id;
+        auto top=visible_anchor()->rect.top;
+        pump_diagnostic(app,[&]{return state(app.page(),"taskPending").is_null()&&state(app.page(),"tasks")["rows"][0]["id"]!=previous;},"Task history cursor reread");
+        auto* retained=list->FindById(anchor);
+        if(!retained || std::abs(retained->rect.top-top)>=1) std::cerr<<"History prepend anchor="<<anchor<<" oldTop="<<top<<" newTop="<<(retained?retained->rect.top:-1)<<" scroll="<<scroll->ScrollY()<<" count="<<state(app.page(),"tasks")["total"]<<" first="<<list->Indices().front()<<'\n';
+        assert(retained && std::abs(retained->rect.top-top)<1);
+        observe();
+    }
+    assert(state(app.page(),"tasks")["rows"][0]["id"]==first_id);
+    assert(ui_page_call_json(app.page(),"searchTasks",R"("task-0")")==0);
+    pump_diagnostic(app,[&]{auto tasks=state(app.page(),"tasks");return tasks["rows"].size()==1&&tasks["rows"][0]["name"]=="task-0.001";},"Search full task history");
+    assert(state(app.page(),"taskCursors").empty() && state(app.page(),"taskPages").size()==1 && scroll->ScrollY()==0);
+    assert(ui_page_call_json(app.page(),"searchTasks",R"("")")==0);
+    pump_diagnostic(app,[&]{return state(app.page(),"tasks")["rows"].size()==100;},"Reset task history search");
+    window->ScrollWithMeasureContext(scroll,1e9f);
+    pump_diagnostic(app,[&]{return state(app.page(),"tasks")["rows"].size()==200;},"History before storage replacement");
+    // Keep the existing run alive while a newer run shifts the page boundary.
+    // Reusing the old second-page cursor silently skips the former 100th row.
+    auto history_path=dir/".sunpack_watch"/"events.json";
+    auto prior_manifest=read_json(history_path);
+    auto boundary=state(app.page(),"tasks")["rows"][99]["id"];
+    publish_events(history_path,Json{{"event","done"},{"path",utf8((dir/"newest.001").wstring())},{"ts",1792401343.0}}.dump()+"\n",prior_manifest["runs"]);
+    pump_diagnostic(app,[&]{auto rows=state(app.page(),"tasks")["rows"];return !rows.empty()&&rows[0]["name"]=="newest.001";},"Refresh contiguous history window");
+    auto refreshed=state(app.page(),"tasks")["rows"];
+    assert(refreshed.size()==200 && refreshed[100]["id"]==boundary);
+    std::set<std::string> refreshed_ids;
+    for(const auto& row:refreshed) assert(refreshed_ids.insert(row["id"].get<std::string>()).second);
+    publish_events(dir/".sunpack_watch"/"events.json",Json{{"event","done"},{"path",utf8((dir/"replacement.001").wstring())}}.dump()+"\n");
+    window->ScrollWithMeasureContext(scroll,1e9f);
+    pump_diagnostic(app,[&]{auto rows=state(app.page(),"tasks")["rows"];return rows.size()==1&&rows[0]["name"]=="replacement.001"&&state(app.page(),"taskCursors").empty();},"Discard invalid history cursors");
+    publish_events(dir/".sunpack_watch"/"events.json",many);
+    assert(ui_page_call_json(app.page(),"searchTasks",R"("no-such-task")")==0);
+    ui_debug_pump();
+    assert(ui_page_call_json(app.page(),"searchTasks",R"("")")==0);
+    pump_diagnostic(app,[&]{return state(app.page(),"tasks")["rows"].size()==100;},"Latest search supersedes pending history");
+    assert(state(app.page(),"actionError")=="" && state(app.page(),"errors").empty());
+}
+
 int wmain(int argc,wchar_t** argv) {
     _set_error_mode(_OUT_TO_STDERR);
     _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
@@ -1342,6 +1456,7 @@ int wmain(int argc,wchar_t** argv) {
     }
     const bool rangesOnly=argc==2 && std::wstring(argv[1])==L"--ranges";
     const bool acceptance=argc==2 && std::wstring(argv[1])==L"--acceptance";
+    const bool historyOnly=argc==2 && std::wstring(argv[1])==L"--history";
     const auto expected_fields=config_fields(parse_json(kUiDefaultsJson),kUiDefaultsJson).size();
     CoInitializeEx(nullptr,COINIT_APARTMENTTHREADED);
     auto dir=fs::temp_directory_path()/(L"sunpack-gui-ui-"+std::to_wstring(GetCurrentProcessId())); fs::create_directory(dir);
@@ -1367,6 +1482,7 @@ int wmain(int argc,wchar_t** argv) {
             pump_diagnostic(app,[&]{return state(app.page(),"ready")==true;},"Initial snapshot");
             assert(IsWindowVisible(static_cast<HWND>(ui_window_hwnd(app.window()))));
             assert(state(app.page(),"errors").empty() && state(app.page(),"actionError")=="");
+            if(historyOnly) { task_history(app,dir); } else {
             if(!rangesOnly) {
                 // Valid projection tests miss the error-to-CLI bridge. Reuse
                 // this window for manifest and page-data corruption; without
@@ -1425,6 +1541,9 @@ int wmain(int argc,wchar_t** argv) {
                     assert(held.value!=INVALID_HANDLE_VALUE);
                     query_conflict();
                 }
+                // Releasing a sharing lock emits no directory notification.
+                // The old-language row must refresh without another file write.
+                pump_diagnostic(app,[&]{return state(app.page(),"tasks")["rows"][0]["statusText"]==state(app.page(),"texts")["taskSucceeded"];},"Refresh after history sharing lock release");
                 query_restored();
                 auto unpublished=data; unpublished+=L".unpublished";
                 fs::rename(data,unpublished); query_conflict();
@@ -1514,20 +1633,7 @@ int wmain(int argc,wchar_t** argv) {
             if(SUCCEEDED(DwmGetWindowAttribute(static_cast<HWND>(ui_window_hwnd(app.window())),DWMWA_TRANSITIONS_FORCEDISABLED,&disabled,sizeof(disabled)))) assert(!disabled);
             std::cerr<<"Initial files loaded\n";
             assert(state(app.page(),"tasks")["total"]==1);
-            std::string many;
-            const char* phases[]={"processing_started","failed_terminal","suspended_missing_volume","done"};
-            for(int i=0;i<virtualTaskCount;++i) many+=Json({{"event",phases[i%4]},{"path",utf8((dir/"history"/("task-"+std::to_string(i)+".001")).wstring())},{"ts",1792401342.731112},{"output_dirs",{utf8(dir.wstring())}}}).dump()+"\n";
-            publish_events(dir/".sunpack_watch"/"events.json",many);
-            pump_diagnostic(app,[&]{return state(app.page(),"tasks")["total"]==std::min(100,virtualTaskCount);},"Load virtual tasks");
-            virtual_tail(app,"taskItems","taskListScroll",std::min(100,virtualTaskCount));
-            auto first_page=state(app.page(),"tasks");
-            assert(first_page["hasMore"]==true);
-            assert(ui_page_call_json(app.page(),"nextTaskPage","{}")==0);
-            pump_diagnostic(app,[&]{return state(app.page(),"tasks")["rows"][0]["id"]!=first_page["rows"][0]["id"];},"Next history page");
-            assert(state(app.page(),"tasks")["rows"].size()<=100);
-            assert(ui_page_call_json(app.page(),"previousTaskPage","{}")==0);
-            pump_diagnostic(app,[&]{return state(app.page(),"tasks")["rows"][0]["id"]==first_page["rows"][0]["id"];},"Previous history page");
-            virtual_tail(app,"taskItems","taskListScroll",std::min(100,virtualTaskCount));
+            task_history(app,dir);
             auto task=state(app.page(),"tasks")["rows"][0];
             assert(task["time"].get<std::string>().size()==19);
                 resize_tasks(app);
@@ -1882,7 +1988,11 @@ int wmain(int argc,wchar_t** argv) {
             finish_input(app);
             button_texts(app); screenshot(app,L"root-inline-batch-small.png");
             assert(state(app.page(),"rootCell")=="");
-            assert(state(app.page(),"rootRows").size()==3 && state(app.page(),"rootDrafts").empty());
+            if(state(app.page(),"rootRows").size()!=3 || !state(app.page(),"rootDrafts").empty() || !state(app.page(),"rootNew").empty()) {
+                for(auto key:{"rootRows","rootNew","rootDrafts","rootCell","rootPart","requests","saving","saveErrors"}) std::cerr<<key<<"="<<state(app.page(),key)<<'\n';
+                std::cerr<<"Root batch disk="<<read_file(dir/"sunpack_watch_roots.txt")<<'\n';
+            }
+            assert(state(app.page(),"rootRows").size()==3 && state(app.page(),"rootDrafts").empty() && state(app.page(),"rootNew").empty());
             for(auto& entry:read_roots(dir/"sunpack_watch_roots.txt").entries)
                 if(entry.input==pending_root || entry.input==pending_second) assert(entry.output.empty());
             assert(read_file(dir/"sunpack_watch_roots.txt")!=disk_roots);
@@ -2414,12 +2524,13 @@ int wmain(int argc,wchar_t** argv) {
             assert(ui_debug_key(app.window(),VK_RETURN)==0);
             pump([&]{return state(app.page(),"saveErrors").contains("/watch/clipboard_builtin_max_entries") && !state(app.page(),"saving").get<bool>();});
             assert(read_json(dir/"sunpack_config.json")["watch"]["clipboard_builtin_max_entries"]==30);
-            search_setting(app,"/watch/out_dir");
-            auto independent=ui_widget_find_by_id(ui_page_root(app.page()),"input-/watch/out_dir"); assert(independent);
+            const std::string independent_field="/watch/toast_update_interval_ms";
+            search_setting(app,independent_field);
+            auto independent=ui_widget_find_by_id(ui_page_root(app.page()),("input-"+independent_field).c_str()); assert(independent);
             ui_text_input_set_text(independent,L""); ui_widget_destroy(independent);
-            click(app,"input-/watch/out_dir"); ui_debug_type_text(app.window(),L"independent");
+            click(app,("input-"+independent_field).c_str()); ui_debug_type_text(app.window(),L"51");
             assert(ui_debug_key(app.window(),VK_RETURN)==0);
-            pump([&]{return read_json(dir/"sunpack_config.json")["watch"]["out_dir"]=="independent" && !state(app.page(),"saving").get<bool>();});
+            pump([&]{return read_json(dir/"sunpack_config.json")[Json::json_pointer(independent_field)]==51 && !state(app.page(),"saving").get<bool>();});
             assert(state(app.page(),"saveErrors").contains("/watch/clipboard_builtin_max_entries"));
             search_setting(app,"mtime_range");
             std::string closingDate;
@@ -2433,6 +2544,7 @@ int wmain(int argc,wchar_t** argv) {
             pump([&]{return !IsWindow(static_cast<HWND>(ui_window_hwnd(app.window())));});
             assert(!date_popup(app) && closingTree.expired());
             }
+        }
         }
         fs::remove_all(dir); std::cout<<"GUI interface and observation passed\n";
     } catch(const std::exception& e) { std::cerr<<e.what()<<"\n"; std::error_code ec; fs::remove_all(dir,ec); return 1; }
