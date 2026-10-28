@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
+import stat
 
 import pytest
 
@@ -45,6 +47,35 @@ def test_policy_rejected_partial_can_remove_nonempty_canonical_output(tmp_path):
     assert result.cleaned is True
     assert result.reason == "policy_rejected_partial_cleaned"
     assert not output.exists()
+
+
+def test_readonly_cleanup_covers_cancelled_tree_partial_file_and_nested_archive(tmp_path):
+    # Attribute-preservation tests do not delete their outputs through the
+    # managed cleanup paths. One filesystem scenario covers all three callers.
+    from sunpack_native import delete_files_batch
+
+    output = tmp_path / "output"
+    nested = output / "nested"
+    nested.mkdir(parents=True)
+    payload = nested / "payload.bin"
+    partial = output / "partial.bin"
+    archive = output / "inner.disguised"
+    for path in (payload, partial, archive):
+        path.write_bytes(b"payload")
+        os.chmod(path, stat.S_IREAD)
+    manager = OutputCleanupManager()
+    try:
+        assert delete_files_batch([str(archive)])[0]["status"] == "deleted"
+        assert manager.cleanup_partial_file(str(partial), output_root=str(output)).cleaned
+        os.chmod(nested, stat.S_IREAD)
+        result = manager.cleanup_canonical(
+            str(output), event=OutputCleanupEvent.USER_CANCELLED, allow_nonempty=True,
+        )
+        assert result.cleaned and not output.exists()
+    finally:
+        for path in (nested, payload, partial, archive):
+            if path.exists():
+                os.chmod(path, stat.S_IREAD | stat.S_IWRITE)
 
 
 def test_canonical_cleanup_refuses_unowned_and_root_paths(tmp_path):

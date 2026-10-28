@@ -99,6 +99,8 @@ class FakePipelineEngine:
 
 
 class _InlineBroker:
+    max_pending_jobs = 4096
+
     async def run(self, _stage, _file_id, operation, *args, **kwargs):
         kwargs.pop("request_id", None)
         kwargs.pop("cancellation", None)

@@ -247,12 +247,86 @@ pub(crate) fn flatten_single_branch_directories(
 }
 
 #[pyfunction]
+pub(crate) fn remove_output_path(py: Python<'_>, path: String, recursive: bool) -> PyResult<()> {
+    py.detach(|| {
+        if recursive {
+            remove_owned_tree(Path::new(&path))
+        } else {
+            remove_owned_file(Path::new(&path))
+        }
+    })?;
+    Ok(())
+}
+
+fn remove_owned_file(path: &Path) -> io::Result<()> {
+    remove_with_readonly(path, |path| fs::remove_file(path))
+}
+
+fn remove_with_readonly(path: &Path, remove: impl Fn(&Path) -> io::Result<()>) -> io::Result<()> {
+    match remove(path) {
+        #[cfg(windows)]
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+            use std::os::windows::fs::MetadataExt;
+            let metadata = fs::symlink_metadata(path)?;
+            let permissions = metadata.permissions();
+            // Never change a reparse target's attributes. Only deletion-owned
+            // regular entries may have their read-only bit cleared.
+            if !permissions.readonly() || metadata.file_attributes() & 0x400 != 0 {
+                return Err(error);
+            }
+            let mut writable = permissions.clone();
+            writable.set_readonly(false);
+            fs::set_permissions(path, writable)?;
+            let result = remove(path);
+            if result.is_err() {
+                let _ = fs::set_permissions(path, permissions);
+            }
+            result
+        }
+        result => result,
+    }
+}
+
+fn remove_owned_tree(path: &Path) -> io::Result<()> {
+    match fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+            let metadata = fs::symlink_metadata(path)?;
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::MetadataExt;
+                if metadata.file_attributes() & 0x400 != 0 {
+                    return Err(error);
+                }
+            }
+            if !metadata.is_dir() {
+                return Err(error);
+            }
+            // The normal path uses std's native tree removal. Walk only the
+            // retained subtree after a read-only/permission failure, streaming
+            // entries without following directory links.
+            for entry in fs::read_dir(path)? {
+                let entry = entry?;
+                let kind = entry.file_type()?;
+                if kind.is_dir() && !kind.is_symlink() {
+                    remove_owned_tree(&entry.path())?;
+                } else {
+                    remove_owned_file(&entry.path())?;
+                }
+            }
+            remove_with_readonly(path, |path| fs::remove_dir(path))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[pyfunction]
 pub(crate) fn delete_files_batch(py: Python<'_>, paths: Vec<String>) -> PyResult<Py<PyList>> {
     let rows = py.detach(|| {
         paths
             .into_iter()
             .map(|raw| {
-                let result = fs::remove_file(&raw);
+                let result = remove_owned_file(Path::new(&raw));
                 let (status, error, error_code) = match result {
                     Ok(()) => ("deleted", String::new(), 0),
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {

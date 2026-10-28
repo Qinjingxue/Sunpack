@@ -114,9 +114,8 @@ def test_stage_queue_cancellation_drain_preserves_global_fifo():
 
 @pytest.mark.parametrize("cancel_token", [False, True])
 def test_broker_cancelled_queued_work_releases_slots_across_stage_buckets(cancel_token):
-    # Future cancellation alone misses discarded token-only jobs whose callers
-    # never finish. Both admission paths must settle without executing the job;
-    # sharing this inexpensive queue scenario avoids a second scheduling test.
+    # Cancel both a queued job and a capacity waiter before releasing an
+    # unrelated worker. Eventual-drain tests miss these unbounded cancel waits.
     async def scenario():
         broker = AsyncWorkBroker(thread_capacity=1, max_pending_jobs=4)
         entered = threading.Event()
@@ -138,13 +137,25 @@ def test_broker_cancelled_queued_work_releases_slots_across_stage_buckets(cancel
             verify = asyncio.create_task(broker.run("verify", "verify", operation, "verify", request_id="r"))
             background = asyncio.create_task(broker.run("background", "background", operation, "background", request_id="r"))
             await asyncio.sleep(0)
+            admission_token = CancellationToken()
+            admission = asyncio.create_task(broker.run(
+                "scan", "admission", operation, "admission", request_id="waiting",
+                cancellation=admission_token,
+            ))
+            await asyncio.sleep(0)
             if cancel_token:
                 token.cancel()
+                admission_token.cancel()
             else:
                 cancelled.cancel()
-            release.set()
+                admission.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await asyncio.wait_for(cancelled, timeout=3)
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(admission, timeout=3)
+            assert started == ["active"] and not active.done()
+            assert broker.pending_jobs == 2
+            release.set()
             assert await asyncio.wait_for(asyncio.gather(active, verify, background), timeout=3) == [
                 "active", "verify", "background",
             ]

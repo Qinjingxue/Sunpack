@@ -116,6 +116,10 @@ class ArchiveJobExecutor:
                 output_dir=output_dir, keep_output=keep,
             )
 
+    @property
+    def has_uncommitted_outputs(self) -> bool:
+        return bool(self._uncommitted_outputs)
+
     def rollback_interrupted_outputs(self) -> tuple[str, ...]:
         errors = []
         for output_dir, task in self._uncommitted_outputs.items():

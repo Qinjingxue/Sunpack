@@ -15,6 +15,44 @@ from tests.helpers.fs_builder import make_zip
 
 
 @pytest.mark.parametrize("origin", ["foreground", "watch"])
+def test_cancel_unstarted_request_does_not_queue_empty_rollback_or_shared_close(tmp_path, origin):
+    # Broker-only cancellation tests cannot catch empty rollback/close work
+    # making the request wait for an unrelated worker after its job is gone.
+    archive = tmp_path / "queued.blob"
+    archive.write_bytes(make_zip({"payload.txt": b"queued input"}))
+
+    async def scenario():
+        broker = AsyncWorkBroker(thread_capacity=1, max_pending_jobs=2)
+        async with PipelineEngine(make_config(), work_broker=broker) as engine:
+            loop = asyncio.get_running_loop()
+            entered, queued = asyncio.Event(), asyncio.Event()
+            release = threading.Event()
+
+            def hold_worker():
+                loop.call_soon_threadsafe(entered.set)
+                assert release.wait(10)
+
+            blocker = asyncio.create_task(broker.run("scan", "unrelated", hold_worker))
+            await asyncio.wait_for(entered.wait(), 3)
+            engine.set_state_changed_callback(lambda: queued.set() if broker.pending_jobs else None)
+            token = CancellationToken()
+            request = asyncio.create_task(engine.run([str(archive)], origin=origin, cancellation=token,
+                stdout=io.StringIO(), stderr=io.StringIO()))
+            try:
+                await asyncio.wait_for(queued.wait(), 3)
+                token.cancel()
+                response = await asyncio.wait_for(asyncio.shield(request), 3)
+                assert response.interrupted and not response.interruption_cleanup_errors
+                assert not blocker.done() and not token._callbacks
+                assert broker.pending_jobs == 0 and not engine._active_requests
+            finally:
+                release.set()
+                await asyncio.gather(blocker, request, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("origin", ["foreground", "watch"])
 def test_stop_waiting_split_member_finishes_without_cancelling_its_owner(tmp_path, monkeypatch, origin):
     """Live-IO stop tests never cancel a lease/coalesced follower.
 

@@ -859,42 +859,56 @@ class WatchStateStore:
         durable: bool = False,
         admit=None,
     ) -> None:
-        key = _path_key(candidate.path)
         with self._state_lock:
             if admit is not None and not admit():
                 return
-            previous = self._pending_record(key)
-            pending = WatchPendingWork(
-                path=os.path.abspath(candidate.path),
-                size=int(candidate.size),
-                mtime=float(candidate.mtime),
-                file_id=str(getattr(candidate, "file_id", "") or ""),
-                change_usn=int(getattr(candidate, "change_usn", 0) or 0),
-                force=bool(force),
-                source_input_root=source_input_root or (previous.source_input_root if previous else ""),
-                password_scope_dir=os.path.abspath(
-                    password_scope_dir
-                    or (previous.password_scope_dir if previous else "")
-                    or os.path.dirname(os.path.abspath(candidate.path))
-                ),
-                internal_recovery=bool(
-                    internal_recovery or (previous.internal_recovery if previous else False)
-                ),
-                discovery_scope=dict(discovery_scope or (previous.discovery_scope if previous else {})),
-                durable_owner=bool(
-                    durable_owner or (previous.durable_owner if previous else False)
-                ),
-                active_outputs=dict(previous.active_outputs if previous else {}),
-                committed_roots=list(previous.committed_roots if previous else []),
-                output_identities=dict(previous.output_identities if previous else {}),
-                completed_sources=list(previous.completed_sources if previous else []),
-                promoted_destinations=list(previous.promoted_destinations if previous else []),
-            )
-            operations = [self._put_operation("pending_work", key, pending)]
+            operations = [self._queue_active_operation(
+                candidate, force=force, password_scope_dir=password_scope_dir,
+                source_input_root=source_input_root, internal_recovery=internal_recovery,
+                discovery_scope=discovery_scope, durable_owner=durable_owner,
+            )]
             if persist:
                 self._commit_operations_locked(operations, durable=durable)
             else:
                 self._apply_in_memory_locked(operations)
+
+    def queue_active_batch(self, candidates) -> None:
+        """Publish one durable admission frontier before any batch task starts."""
+        with self._state_lock:
+            operations = [self._queue_active_operation(
+                candidate, source_input_root=root, discovery_scope=scope,
+            ) for candidate, root, scope in candidates]
+            self._commit_operations_locked(operations, durable=True)
+
+    def _queue_active_operation(
+        self, candidate, *, force=False, password_scope_dir="", source_input_root="",
+        internal_recovery=False, discovery_scope=None, durable_owner=False,
+    ) -> dict[str, Any]:
+        key = _path_key(candidate.path)
+        previous = self._pending_record(key)
+        pending = WatchPendingWork(
+            path=os.path.abspath(candidate.path),
+            size=int(candidate.size),
+            mtime=float(candidate.mtime),
+            file_id=str(getattr(candidate, "file_id", "") or ""),
+            change_usn=int(getattr(candidate, "change_usn", 0) or 0),
+            force=bool(force),
+            source_input_root=source_input_root or (previous.source_input_root if previous else ""),
+            password_scope_dir=os.path.abspath(
+                password_scope_dir
+                or (previous.password_scope_dir if previous else "")
+                or os.path.dirname(os.path.abspath(candidate.path))
+            ),
+            internal_recovery=bool(internal_recovery or (previous.internal_recovery if previous else False)),
+            discovery_scope=dict(discovery_scope or (previous.discovery_scope if previous else {})),
+            durable_owner=bool(durable_owner or (previous.durable_owner if previous else False)),
+            active_outputs=dict(previous.active_outputs if previous else {}),
+            committed_roots=list(previous.committed_roots if previous else []),
+            output_identities=dict(previous.output_identities if previous else {}),
+            completed_sources=list(previous.completed_sources if previous else []),
+            promoted_destinations=list(previous.promoted_destinations if previous else []),
+        )
+        return self._put_operation("pending_work", key, pending)
 
     def record_attempt(
         self,
@@ -942,18 +956,6 @@ class WatchStateStore:
     def pending_work_items(self) -> list[WatchPendingWork]:
         with self._state_lock:
             return [WatchPendingWork(**item) for item in self._native.pending_items()]
-
-    def bind_input_root(self, path: str, input_root: str) -> None:
-        """Persist request provenance before an extraction can create outputs."""
-        with self._state_lock:
-            key = _path_key(path)
-            pending = self._pending_record(key)
-            if pending is None or pending.source_input_root == input_root:
-                return
-            updated = replace(pending, source_input_root=input_root)
-            self._commit_operations_locked([
-                self._put_operation("pending_work", key, updated),
-            ], durable=pending.durable_owner)
 
     def pending_work_for_path(self, path: str) -> WatchPendingWork | None:
         with self._state_lock:

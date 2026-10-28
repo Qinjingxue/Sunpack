@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import logging
 import os
-import shutil
 from dataclasses import asdict, dataclass
 from enum import Enum
 
 from sunpack.core.support.path_keys import case_key, path_key_is_under
 from sunpack.core.support.resource_lifecycle import promotion_barrier, task_walk
+from sunpack_native import remove_output_path
 
 
 LOGGER = logging.getLogger(__name__)
@@ -76,11 +76,11 @@ class OutputCleanupExecutor:
 
     @staticmethod
     def remove_tree(path: str) -> None:
-        shutil.rmtree(path)
+        remove_output_path(path, True)
 
     @staticmethod
     def remove_file(path: str) -> None:
-        os.unlink(path)
+        remove_output_path(path, False)
 
 
 class OutputCleanupManager:

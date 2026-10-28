@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import shutil
 import threading
 from types import SimpleNamespace
 
@@ -176,7 +175,8 @@ def test_async_terminal_cleanup_yields_to_loop_and_finishes_before_watch_event(t
         return task, outcome
 
     runner._execute_one_async = extract
-    remove_tree = shutil.rmtree
+    from sunpack.pipeline.postprocess.output_cleanup import OutputCleanupExecutor
+    remove_tree = OutputCleanupExecutor.remove_tree
 
     async def run():
         loop = asyncio.get_running_loop()
@@ -190,7 +190,7 @@ def test_async_terminal_cleanup_yields_to_loop_and_finishes_before_watch_event(t
             assert release.wait(2), "event loop did not respond during cleanup"
             remove_tree(path)
 
-        monkeypatch.setattr("sunpack.pipeline.postprocess.output_cleanup.shutil.rmtree", blocked_cleanup)
+        monkeypatch.setattr(OutputCleanupExecutor, "remove_tree", staticmethod(blocked_cleanup))
         broker = AsyncWorkBroker(thread_capacity=2)
         work = asyncio.create_task(runner.execute_async(task, depth=1, output_dir_resolver=None,
             broker=broker, cancellation=None))

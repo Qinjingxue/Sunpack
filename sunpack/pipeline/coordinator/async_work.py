@@ -6,7 +6,7 @@ import functools
 import heapq
 import os
 import threading
-from collections import OrderedDict, deque
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Callable, Generic, TypeVar
@@ -90,7 +90,7 @@ class _StageWorkQueue:
     __slots__ = ("_stages", "_size", "_first")
 
     def __init__(self) -> None:
-        self._stages: dict[int, deque[_WorkItem[Any]]] = {}
+        self._stages: dict[int, OrderedDict[int, _WorkItem[Any]]] = {}
         self._size = 0
         self._first: _WorkItem[Any] | None = None
 
@@ -106,18 +106,32 @@ class _StageWorkQueue:
             return
         if self._first is not None:
             first = self._first
-            self._stages[_stage_priority(first.context.stage)] = deque((first,))
+            self._stages[_stage_priority(first.context.stage)] = OrderedDict(((first.sequence, first),))
             self._first = None
         priority = _stage_priority(item.context.stage)
         jobs = self._stages.get(priority)
         if jobs is None:
-            jobs = self._stages[priority] = deque()
-        jobs.append(item)
+            jobs = self._stages[priority] = OrderedDict()
+        jobs[item.sequence] = item
         self._size += 1
+
+    def remove(self, item: _WorkItem[Any]) -> bool:
+        if self._first is item:
+            self._first = None
+            self._size = 0
+            return True
+        priority = _stage_priority(item.context.stage)
+        jobs = self._stages.get(priority)
+        if jobs is None or jobs.pop(item.sequence, None) is None:
+            return False
+        self._size -= 1
+        if not jobs:
+            del self._stages[priority]
+        return True
 
     def _pop(self, priority: int) -> _WorkItem[Any]:
         jobs = self._stages[priority]
-        item = jobs.popleft()
+        _, item = jobs.popitem(last=False)
         self._size -= 1
         if not jobs:
             del self._stages[priority]
@@ -129,7 +143,7 @@ class _StageWorkQueue:
             self._first = None
             self._size = 0
             return item
-        priority = min(self._stages, key=lambda value: self._stages[value][0].sequence)
+        priority = min(self._stages, key=lambda value: next(iter(self._stages[value])))
         return self._pop(priority)
 
     def take_prioritized(self, current_sequence: int) -> _WorkItem[Any]:
@@ -145,8 +159,8 @@ class _StageWorkQueue:
         priority = max(
             self._stages,
             key=lambda value: (
-                value + max(0, current_sequence - self._stages[value][0].sequence) // 32,
-                -self._stages[value][0].sequence,
+                value + max(0, current_sequence - next(iter(self._stages[value]))) // 32,
+                -next(iter(self._stages[value])),
             ),
         )
         return self._pop(priority)
@@ -169,7 +183,7 @@ class _RequestOrder:
     __slots__ = ("_foreground", "_watch", "_promoted", "_sequence")
 
     def __init__(self) -> None:
-        self._foreground: deque[tuple[int, str]] = deque()
+        self._foreground: OrderedDict[str, int] = OrderedDict()
         self._watch: OrderedDict[str, int] = OrderedDict()
         self._promoted: list[tuple[int, str]] = []
         self._sequence = 0
@@ -182,7 +196,7 @@ class _RequestOrder:
         if origin == "watch":
             self._watch[request_id] = self._sequence
         else:
-            self._foreground.append((self._sequence, request_id))
+            self._foreground[request_id] = self._sequence
 
     def promote(self, request_id: str) -> None:
         position = self._watch.pop(request_id)
@@ -192,15 +206,31 @@ class _RequestOrder:
 
     def popleft(self) -> str:
         if self._promoted and (
-            not self._foreground or self._promoted[0][0] < self._foreground[0][0]
+            not self._foreground or self._promoted[0][0] < next(iter(self._foreground.values()))
         ):
             return heapq.heappop(self._promoted)[1]
         if self._foreground:
-            return self._foreground.popleft()[1]
+            request_id, _ = self._foreground.popitem(last=False)
+            if not self._foreground:
+                self._foreground.clear()
+            return request_id
         request_id, _ = self._watch.popitem(last=False)
         if not self._watch:
             self._watch.clear()
         return request_id
+
+    def discard(self, request_id: str) -> None:
+        if self._foreground.pop(request_id, None) is not None:
+            if not self._foreground:
+                self._foreground.clear()
+        elif self._watch.pop(request_id, None) is not None:
+            if not self._watch:
+                self._watch.clear()
+        elif self._promoted:
+            # Only cross-origin promotions use the heap. Remove their entry
+            # eagerly so cancellation cannot retain stale request IDs.
+            self._promoted[:] = [entry for entry in self._promoted if entry[1] != request_id]
+            heapq.heapify(self._promoted)
 
     def clear(self) -> None:
         self._foreground.clear()
@@ -298,7 +328,18 @@ class AsyncWorkBroker:
             raise RuntimeError("AsyncWorkBroker is closed")
         token = cancellation or CancellationToken()
         token.raise_if_cancelled()
-        await self._pending_slots.acquire()
+        if self._pending_slots.locked():
+            admission = asyncio.create_task(self._pending_slots.acquire())
+            try:
+                await token.wait(admission)
+            except BaseException:
+                # Cancellation can arrive after acquire succeeded but before
+                # its result was delivered to this caller.
+                if admission.done() and not admission.cancelled() and admission.exception() is None:
+                    self._pending_slots.release()
+                raise
+        else:
+            await self._pending_slots.acquire()
         if self._closed:
             self._pending_slots.release()
             raise RuntimeError("AsyncWorkBroker is closed")
@@ -335,11 +376,13 @@ class AsyncWorkBroker:
             queue.origin = "foreground"
         queue.jobs.append(item)
         self._pending_jobs += 1
-        self._dispatch()
+        unsubscribe = token.subscribe(lambda: loop.call_soon_threadsafe(self._cancel_pending, item))
         try:
+            self._dispatch()
             return await asyncio.shield(future)
         except asyncio.CancelledError:
             token.cancel()
+            self._cancel_pending(item)
             # A cancelled asyncio waiter does not stop executor work. Join it
             # before allowing resource release or output rollback.
             while not future.done():
@@ -352,6 +395,22 @@ class AsyncWorkBroker:
             if not future.cancelled():
                 future.exception()
             raise
+        finally:
+            unsubscribe()
+
+    def _cancel_pending(self, item: _WorkItem[Any]) -> None:
+        queue = self._queues.get(item.context.request_id)
+        if queue is None or not queue.jobs.remove(item):
+            return  # Already executing: its worker still owns the resources.
+        self._pending_jobs -= 1
+        self._pending_slots.release()
+        item.future.cancel()
+        if not queue.jobs:
+            self._queues.pop(item.context.request_id)
+            self._request_order.discard(item.context.request_id)
+            if not self._queues:
+                self._queues.clear()
+        self._notify_state_changed()
 
     async def close(self, *, graceful: bool = True) -> None:
         self.bind()

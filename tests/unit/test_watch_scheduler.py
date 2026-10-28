@@ -509,6 +509,7 @@ class _NoItemsDict(dict):
 
 def _indexed_scheduler_for_test():
     watcher = object.__new__(RuntimeWatchScheduler)
+    watcher.pipeline_engine = _DeferredPipelineEngine()
     watcher._lock = threading.Lock()
     watcher._directory_pending = set()
     watcher._watch_rearm = set()
@@ -1204,6 +1205,78 @@ def test_watch_run_once_harvests_futures_without_waiting_for_slow_batch(tmp_path
     engine.handles[2].complete_no_tasks()
     final = _await(watcher.run_once())
     assert final.processed == 2
+
+
+def test_watch_admission_batches_durability_off_loop_and_resumes_without_polling(tmp_path, monkeypatch):
+    # Existing small/inline-broker tests miss request accumulation, per-file
+    # fsyncs, and an event-loop stall during a durable admission barrier.
+    from sunpack.pipeline.coordinator.async_work import AsyncWorkBroker
+
+    async def scenario():
+        broker = AsyncWorkBroker(thread_capacity=2, max_pending_jobs=4)
+        engine = _DeferredPipelineEngine()
+        engine.work_broker = broker
+        wake = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        watcher = _watcher(tmp_path, cold_start_seconds=0, pipeline_engine=engine,
+                           wake_callback=lambda: loop.call_soon_threadsafe(wake.set))
+        for index in range(12):
+            path = tmp_path / f"input-{index}.blob"
+            path.write_bytes(b"candidate")
+            watcher.enqueue(str(path))
+        entered = asyncio.Event()
+        release = threading.Event()
+        transactions = []
+        commit = watcher.state._commit_operations_locked
+        loop_thread = threading.get_ident()
+
+        def durable_barrier(operations, *, durable=False):
+            if durable and operations:
+                assert threading.get_ident() != loop_thread
+                transactions.append(len(operations))
+                loop.call_soon_threadsafe(entered.set)
+                assert release.wait(3), "event loop could not release the WAL barrier"
+            return commit(operations, durable=durable)
+
+        monkeypatch.setattr(watcher.state, "_commit_operations_locked", durable_barrier)
+        try:
+            tick = asyncio.create_task(watcher.run_once())
+            await asyncio.wait_for(entered.wait(), 2)
+            assert not engine.handles  # A task must not precede its durable intent.
+            release.set()
+            await asyncio.wait_for(tick, 3)
+            assert transactions == [4]
+            assert len(engine.handles) == 4 and watcher.pending_count == 8
+            # Reopen the real WAL: an observed barrier must retain input
+            # provenance and scope, not merely update this store's memory.
+            recovered = WatchStateStore(str(watcher.state.path))
+            try:
+                for handle in engine.handles:
+                    pending = recovered.pending_work_for_path(handle.path)
+                    assert pending.source_input_root == str(tmp_path)
+                    assert pending.discovery_scope["root"] == str(tmp_path)
+            finally:
+                recovered.close()
+            assert watcher.next_delay_seconds() != 0  # Full admission sleeps until a completion event.
+            while watcher.pending_count or watcher._inflight_requests:
+                wake.clear()
+                for handle in engine.handles:
+                    if not handle.done():
+                        handle.complete_no_tasks()
+                await asyncio.wait_for(wake.wait(), 2)
+                await watcher.run_once()
+                assert len(watcher._inflight_requests) <= 4
+            assert len(engine.handles) == 12 and transactions == [4, 4, 4]
+            assert not watcher.state.pending_work_items()
+        finally:
+            release.set()
+            for handle in engine.handles:
+                if not handle.done():
+                    handle.complete_no_tasks()
+            await watcher.aclose()
+            await broker.close()
+
+    _await(scenario())
 
 
 def test_watch_candidate_coroutines_are_harvested_without_completion_pool(tmp_path, monkeypatch):

@@ -305,6 +305,7 @@ fn sunpack_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m
     )?)?;
     m.add_function(wrap_pyfunction!(postprocess::delete_files_batch, m)?)?;
+    m.add_function(wrap_pyfunction!(postprocess::remove_output_path, m)?)?;
     m.add_function(wrap_pyfunction!(
         postprocess::promote_blocked_input_files,
         m

@@ -974,16 +974,22 @@ class WatchScheduler:
             await self.pipeline_engine.work_broker.run(
                 "password_reload", "watch", self._publish_password_update, request_id="watch", origin="watch",
             )
-        self._process_password_retries(time.monotonic())
         result = await self._harvest_completed_requests()
-        ready = self._pop_ready(time.monotonic())
+        with self._lock:
+            available = max(0, self.pipeline_engine.work_broker.max_pending_jobs - len(self._inflight_requests))
+        ready = await self.pipeline_engine.work_broker.run(
+            "watch_admission", "watch", self._prepare_ready, time.monotonic(), available,
+            request_id="watch", origin="watch",
+        )
         active_requests = []
         for candidate in ready:
             request = await self._submit_candidate(candidate)
             if request is not None:
                 active_requests.append(request)
-        with self._lock:
-            self._register_inflight_requests_locked(active_requests)
+                # A later candidate may await deferred state I/O. Publish
+                # this request before its task can run during that await.
+                with self._lock:
+                    self._register_inflight_requests_locked((request,))
         # Give newly submitted candidate coroutines one scheduling turn.  Fast
         # no-op/failure requests can be harvested in this tick without ever
         # waiting for slow candidates.
@@ -991,7 +997,9 @@ class WatchScheduler:
             await asyncio.sleep(0)
         self._merge_run_result(result, await self._harvest_completed_requests())
         result.pending = self.pending_count
-        self._catalog.commit()
+        await self.pipeline_engine.work_broker.run(
+            "catalog_commit", "watch", self._catalog.commit, request_id="watch", origin="watch",
+        )
         await self._maybe_clear_idle_caches()
         with self._lock:
             state_is_idle = not self._pending and not self._inflight_requests
@@ -1052,7 +1060,11 @@ class WatchScheduler:
                 )
             else:
                 if not request.interruption_cleanup_failed:
-                    self.state.complete_work_if_matches(request.candidate)
+                    await self.pipeline_engine.work_broker.run(
+                        "watch_complete_state", request.candidate.path,
+                        self.state.complete_work_if_matches, request.candidate,
+                        request_id="watch", origin="watch",
+                    )
             self._arm_idle_cache_cleanup()
             return single
         finally:
@@ -1180,7 +1192,11 @@ class WatchScheduler:
         with self._lock:
             if self._directory_pending or self._watch_rearm:
                 return 0.0
-            next_ready = self._next_ready_entry_locked()
+            # Completion callbacks wake the service when admission space opens.
+            # A full request window must not turn due candidates into polling.
+            next_ready = (self._next_ready_entry_locked()
+                          if len(self._inflight_requests) < self.pipeline_engine.work_broker.max_pending_jobs
+                          else None)
             delay = (
                 None
                 if next_ready is None
@@ -1745,12 +1761,33 @@ class WatchScheduler:
         if self._wake_callback is not None:
             self._wake_callback()
 
-    def _pop_ready(self, now: float) -> list[WatchCandidate]:
+    def _prepare_ready(self, now: float, limit: int) -> list[WatchCandidate]:
+        self._process_password_retries(now)
+        admissions = []
+        for candidate in self._pop_ready(now, limit=limit):
+            pending = self.state.pending_work_for_path(candidate.path)
+            internal = bool(pending and pending.internal_recovery)
+            if self.should_ignore_event_path(candidate.path) and not internal:
+                self.state.complete_work([candidate.path])
+                self.log.write("task_retired", path=candidate.path)
+                continue
+            root = self._source_input_root_for(candidate.path)
+            if path_key(root) not in self.root_entries:
+                self.log.write("processing_deferred_missing_input_root", path=candidate.path, source_input_root=root)
+                continue
+            scope = pending.discovery_scope if internal else self.scopes[path_key(root)].to_record()
+            admissions.append((candidate, root, scope))
+        # The old per-file root binding and durable queue calls are one WAL
+        # transaction. No pipeline task can run before this barrier returns.
+        self.state.queue_active_batch(admissions)
+        return [candidate for candidate, _, _ in admissions]
+
+    def _pop_ready(self, now: float, *, limit: int | None = None) -> list[WatchCandidate]:
         ready: list[WatchCandidate] = []
         due: list[tuple[str, WatchCandidate, int, int, float]] = []
         due_paths: set[str] = set()
         with self._lock:
-            while True:
+            while limit is None or len(due) < limit:
                 entry = self._next_ready_entry_locked()
                 if entry is None or entry[0] > now:
                     break
@@ -2012,7 +2049,10 @@ class WatchScheduler:
         if internal_scope is not None and not internal_scope.contains(candidate.path):
             raise ValueError("Recovery input is outside its persisted discovery scope")
         if self.should_ignore_event_path(candidate.path) and internal_scope is None:
-            self.state.complete_work([candidate.path])
+            await self.pipeline_engine.work_broker.run(
+                "watch_retire", candidate.path, self.state.complete_work, [candidate.path],
+                request_id="watch", origin="watch",
+            )
             self.log.write("task_retired", path=candidate.path)
             return None
         source_input_root = self._source_input_root_for(candidate.path)
@@ -2021,9 +2061,7 @@ class WatchScheduler:
             self.log.write("processing_deferred_missing_input_root", path=candidate.path, source_input_root=source_input_root)
             return None
         options = EmbeddedOptions(force_scan=root_entry.deep_detect)
-        self.state.bind_input_root(candidate.path, source_input_root)
         scope = internal_scope or self.scopes[path_key(source_input_root)]
-        self.state.queue_active(candidate, discovery_scope=scope.to_record(), durable=True)
         notification_id = uuid.uuid4().hex
         with self._password_source_lock:
             run_config = dict(self.config)
@@ -2060,7 +2098,10 @@ class WatchScheduler:
                     owner_origin=conflict.origin,
                     owner_paths=list(conflict.paths),
                 )
-                self.enqueue(candidate.path, force=True, event_type="active_owner_deferred")
+                await self.pipeline_engine.work_broker.run(
+                    "watch_defer", candidate.path, self.enqueue, candidate.path,
+                    force=True, event_type="active_owner_deferred", request_id="watch", origin="watch",
+                )
                 return None
         self._notify("submitted", notification_id, candidate.path)
         # Admission is only a physical candidate, possibly another volume of

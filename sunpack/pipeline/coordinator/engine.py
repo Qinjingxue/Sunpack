@@ -1277,11 +1277,13 @@ class _RequestRuntime:
             # Consumer gathering and native cancel_and_wait have joined all
             # writers. Rollback uses an uncancelled broker operation.
             await self._drain_cleanup_tasks()
-            errors = await broker.run(
-                "cancel_output_cleanup", request_id,
-                self.job_executor.rollback_interrupted_outputs,
-                request_id=request_id,
-            )
+            errors = ()
+            if self.job_executor.has_uncommitted_outputs:
+                errors = await broker.run(
+                    "cancel_output_cleanup", request_id,
+                    self.job_executor.rollback_interrupted_outputs,
+                    request_id=request_id,
+                )
             response = ownership.response(
                 self.context, recent_passwords=self.extractor.recent_passwords,
             )
@@ -1293,12 +1295,10 @@ class _RequestRuntime:
             self._shell_updates.flush()
             self.extractor.set_progress_callback(None)
             await self.reporter.drain_progress()
-            await broker.run(
-                "extractor_close",
-                request_id,
-                self.extractor.close,
-                request_id=request_id,
-            )
+            # Request runners are forks: close releases no shared worker and
+            # performs no I/O. The engine owns worker shutdown. Do not queue a
+            # no-op close behind unrelated work, especially after cancellation.
+            self.extractor.close()
             self.input_planning_stage.clear_report_cache()
 
     async def _discover_and_run(
