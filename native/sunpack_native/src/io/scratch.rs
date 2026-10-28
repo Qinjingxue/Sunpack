@@ -2,7 +2,7 @@
 use crate::io::resource_lifecycle::TrackedFile;
 use serde::{de::DeserializeOwned, Serialize};
 use std::borrow::Cow;
-use std::io::{self, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
 use std::marker::PhantomData;
 use std::ops::Deref;
 use std::os::windows::io::AsRawHandle;
@@ -12,6 +12,9 @@ use std::sync::{
 };
 
 pub(crate) const MEMORY_BYTES: usize = 4 * 1024 * 1024;
+// Small records are often accessed in hash order. Avoid the standard reader's
+// 8 KiB read amplification while still combining their MessagePack fields.
+const RECORD_READ_BUFFER_BYTES: usize = 256;
 
 #[derive(Debug)]
 pub(crate) enum Blob {
@@ -206,8 +209,13 @@ impl<T: Serialize + DeserializeOwned + Clone> RowBuilder<T> {
             let mut offset = [0; 8];
             offsets.read_exact(&mut offset)?;
             data.seek(SeekFrom::Start(u64::from_le_bytes(offset)))?;
-            let mut value = T::deserialize(&mut rmp_serde::Deserializer::new(&mut *data))
-                .map_err(io::Error::other)?;
+            // MessagePack reads individual fields; buffer them before touching
+            // the spill file. The following end seek discards any read-ahead.
+            let mut value = rmp_serde::from_read::<_, T>(BufReader::with_capacity(
+                RECORD_READ_BUFFER_BYTES,
+                &mut *data,
+            ))
+            .map_err(io::Error::other)?;
             change(&mut value);
             let end = data.seek(SeekFrom::End(0))?;
             rmp_serde::encode::write(&mut *data, &value).map_err(io::Error::other)?;
@@ -276,7 +284,7 @@ impl<T: DeserializeOwned + Clone> Rows<T> {
                 let start =
                     u64::from_le_bytes(offsets[index * 8..index * 8 + 8].try_into().unwrap())
                         as usize;
-                rmp_serde::from_read(&data[start..])
+                rmp_serde::from_slice(&data[start..])
                     .map(Cow::Owned)
                     .map_err(io::Error::other)
             }
@@ -402,7 +410,7 @@ struct DiskMap<V> {
     slots: Slots,
     capacity: usize,
     count: usize,
-    data: Mutex<Spool>,
+    data: Mutex<BufReader<Spool>>,
     marker: PhantomData<V>,
 }
 impl<V: Serialize + DeserializeOwned + Clone> DiskMap<V> {
@@ -415,7 +423,10 @@ impl<V: Serialize + DeserializeOwned + Clone> DiskMap<V> {
             )?,
             capacity,
             count: 0,
-            data: Mutex::new(Spool::default()),
+            data: Mutex::new(BufReader::with_capacity(
+                RECORD_READ_BUFFER_BYTES,
+                Spool::default(),
+            )),
             marker: PhantomData,
         })
     }
@@ -427,7 +438,15 @@ impl<V: Serialize + DeserializeOwned + Clone> DiskMap<V> {
             .data
             .lock()
             .map_err(|_| io::Error::other("scratch index poisoned"))?;
-        data.seek(SeekFrom::Start(offset))?;
+        // Spool tracks the underlying position, including read-ahead. Adjacent
+        // records can reuse the buffer without a file seek or another read.
+        let end = data.get_ref().position;
+        let start = end - data.buffer().len() as u64;
+        if (start..=end).contains(&offset) {
+            data.consume((offset - start) as usize);
+        } else {
+            data.seek(SeekFrom::Start(offset))?;
+        }
         let mut length = [0; 4];
         data.read_exact(&mut length)?;
         let mut bytes = vec![0; u32::from_le_bytes(length) as usize];
@@ -495,7 +514,9 @@ impl<V: Serialize + DeserializeOwned + Clone> DiskMap<V> {
             .data
             .get_mut()
             .map_err(|_| io::Error::other("scratch index poisoned"))?;
+        // Discard buffered reads before appending through the inner writer.
         let offset = data.seek(SeekFrom::End(0))?;
+        let data = data.get_mut();
         let bytes = rmp_serde::to_vec(&(key, value)).map_err(io::Error::other)?;
         let len = u32::try_from(bytes.len()).map_err(io::Error::other)?;
         data.write_all(&len.to_le_bytes())?;
@@ -664,6 +685,56 @@ mod tests {
                     }
                     assert_eq!(map.get("same").unwrap(), Some(7));
                     assert_eq!(map.get("absent").unwrap(), None);
+                });
+            }
+        });
+        // Short adjacent records exercise read-ahead. Interleave reverse reads
+        // with appends/replacements so buffered bytes cannot hide newer rows.
+        for value in 0..128 {
+            assert!(map.insert_new(format!("short-{value}"), value).unwrap());
+        }
+        for value in 0..128 {
+            assert_eq!(map.get(&format!("short-{value}")).unwrap(), Some(value));
+        }
+        for value in (0..128).rev() {
+            assert_eq!(map.get(&format!("short-{value}")).unwrap(), Some(value));
+            map.put(format!("short-{value}"), value + 1).unwrap();
+            assert_eq!(map.get(&format!("short-{value}")).unwrap(), Some(value + 1));
+            assert!(!map.insert_new(format!("short-{value}"), 0).unwrap());
+        }
+        assert_eq!(map.get("same").unwrap(), Some(7));
+    }
+
+    // Small archive fixtures never update spilled rows. This one lifecycle
+    // checks variable-length replacements, offsets and shared immutable reads
+    // with only a few MiB of IO; another small manifest test cannot replace it.
+    #[test]
+    fn spilled_rows_preserve_replacements_and_concurrent_views() {
+        let mut builder = RowBuilder::<(String, u64)>::default();
+        let mut expected = Vec::new();
+        for index in 0..64 {
+            let row = (format!("{index}:{}", "x".repeat(96 * 1024)), index);
+            builder.push(row.clone(), row.0.len() + 8).unwrap();
+            expected.push(row);
+        }
+        assert!(builder.disk.is_some());
+        for (index, length) in [(0, 0), (63, 200_000), (7, 30), (0, 12_000), (31, 8192)] {
+            expected[index] = ("y".repeat(length), 100 + index as u64);
+            builder
+                .update(index, |row| *row = expected[index].clone())
+                .unwrap();
+        }
+        let rows = builder.finish().unwrap();
+        assert!(matches!(&rows, Rows::Disk { .. }));
+        std::thread::scope(|scope| {
+            for shard in 0..4 {
+                let rows = &rows;
+                let expected = &expected;
+                scope.spawn(move || {
+                    for index in (shard..64).step_by(4).rev() {
+                        assert_eq!(rows.get(index).unwrap().as_ref(), &expected[index]);
+                    }
+                    assert!(rows.get(64).is_err());
                 });
             }
         });
