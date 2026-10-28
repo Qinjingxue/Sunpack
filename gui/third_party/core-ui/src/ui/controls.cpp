@@ -880,9 +880,22 @@ void ImageWidget::OnDraw(Renderer& r) {
         float dy = rect.top  + (rh - dh) * 0.5f;
         dst = { dx, dy, dx + dw, dy + dh };
     }
+    /* ImageWidget is also used for small UI artwork.  A large source bitmap
+     * reduced to a small slot needs the D2D high quality cubic prefilter;
+     * linear sampling only considers a 2x2 neighborhood and leaves thin
+     * outlines jagged after a large reduction (for example the 526px
+     * application logo rendered in a 40 DIP slot). */
+    const bool downscaling = (dst.right - dst.left < bw ||
+                              dst.bottom - dst.top < bh);
+    const ImageSampling sampling = downscaling
+        ? ImageSampling::HighQualityCubic
+        : ImageSampling::Linear;
     r.PushClip(rect);
-    r.RecordImage(imageResourceKey_, dst, ImageSampling::Linear);
-    if (bitmap_) r.DrawBitmap(bitmap_.Get(), dst);
+    r.RecordImage(imageResourceKey_, dst, sampling);
+    if (bitmap_) {
+        if (downscaling) r.DrawBitmapHQ(bitmap_.Get(), dst);
+        else             r.DrawBitmap(bitmap_.Get(), dst);
+    }
     r.PopClip();
 }
 
