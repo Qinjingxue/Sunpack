@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import gc
-import hashlib
 import os
 import sys
 import threading
@@ -12,6 +11,8 @@ import tracemalloc
 import weakref
 from pathlib import Path
 from types import SimpleNamespace
+
+from sunpack_native import fast_hash128
 
 from benchmarks.harness import BenchmarkReport, BenchmarkWorkspace, ProcessSampler, measure, write_report
 from sunpack.runtime.watch import scheduler
@@ -101,9 +102,9 @@ def main(argv=None):
         scenario="memory.watch-source-indexes",
         parameters={
             "paths_per_batch": args.paths, "batches": args.batches, "warmups": args.warmups,
-            "scheduler_source_sha256": hashlib.sha256(
+            "scheduler_source_xxh128": fast_hash128(
                 Path(scheduler.__file__).read_text(encoding="utf-8").encode("utf-8"),
-            ).hexdigest(),
+            ),
             "method": "Unique paths and owners each batch; production pending/claim/dirty-transfer/release methods. Weakrefs verify buckets and candidates die before GC. Snapshot bytes select scheduler allocations across all recorded frames; includes original pending/claim table capacities. Empty index table sizes and populated scheduler destruction also verified. Timing runs with tracemalloc and is diagnostic, not a performance comparison; RSS may include allocator reserves. No archive IO, log/state persistence, or deferred-event observation.",
         },
     )

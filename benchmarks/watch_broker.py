@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import base64
 import os
 import platform
 import shutil
@@ -10,11 +9,13 @@ from pathlib import Path
 from typing import Iterator
 from uuid import uuid4
 
+from sunpack_native import fast_hash128_file
+
 
 SERVICE_ENV = "SUNPACK_WATCH_BROKER_SERVICE_NAME"
 PIPE_ENV = "SUNPACK_WATCH_BROKER_PIPE_NAME"
 BINARY_ENV = "SUNPACK_WATCH_BROKER_BINARY_PATH"
-HASH_ENV = "SUNPACK_WATCH_BROKER_BINARY_SHA256"
+HASH_ENV = "SUNPACK_WATCH_BROKER_BINARY_XXH128"
 TEST_SERVICE_PREFIX = "SunPackWatchBrokerTest_"
 TEST_PIPE_PREFIX = r"\\.\pipe\SunPack.WatchBroker.Test."
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -27,38 +28,6 @@ def isolated_broker_environment() -> bool:
         os.environ.get(SERVICE_ENV, "").startswith(TEST_SERVICE_PREFIX)
         and os.environ.get(PIPE_ENV, "").startswith(TEST_PIPE_PREFIX)
     )
-
-
-def _binary_sha256(path: str) -> str:
-    declared = os.environ.get(HASH_ENV, "").strip().lower()
-    if declared:
-        return declared
-    escaped_path = str(Path(path).resolve()).replace("'", "''")
-    hash_command = (
-        "Import-Module Microsoft.PowerShell.Utility; "
-        f"(Get-FileHash -LiteralPath '{escaped_path}' -Algorithm SHA256).Hash.ToLowerInvariant()"
-    )
-    encoded_command = base64.b64encode(hash_command.encode("utf-16-le")).decode("ascii")
-    completed = subprocess.run(
-        [
-            _powershell_host(),
-            "-NoProfile",
-            "-NonInteractive",
-            "-EncodedCommand",
-            encoded_command,
-        ],
-        cwd=REPO_ROOT,
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    if completed.returncode != 0:
-        detail = completed.stderr.strip() or completed.stdout.strip()
-        raise RuntimeError(f"PowerShell could not hash the Watch Broker executable: {detail}")
-    digest = completed.stdout.strip().lower()
-    if len(digest) != 64:
-        raise RuntimeError(f"PowerShell returned an invalid Watch Broker SHA-256: {digest!r}")
-    return digest
 
 
 def _powershell_host() -> str:
@@ -142,7 +111,7 @@ def temporary_watch_broker_service() -> Iterator[None]:
         os.environ[SERVICE_ENV] = service_name
         os.environ[PIPE_ENV] = pipe_name
         os.environ[BINARY_ENV] = str(binary)
-        os.environ[HASH_ENV] = _binary_sha256(str(binary))
+        os.environ[HASH_ENV] = fast_hash128_file(binary)
         print(f"==> Installing temporary Watch Broker service: {service_name}", flush=True)
         _run_service_manager("Install", service_name, pipe_name, binary)
         installed = True
@@ -183,7 +152,8 @@ def watch_broker_lease() -> Iterator[dict[str, object]]:
             "service_name": os.environ[SERVICE_ENV],
             "pipe_name": os.environ[PIPE_ENV],
             "binary_path": binary_path,
-            "binary_sha256": _binary_sha256(binary_path) if binary_path else "",
+            "binary_xxh128": os.environ.get(HASH_ENV, "").strip().lower()
+            or (fast_hash128_file(binary_path) if binary_path else ""),
             "connected": connected,
         }
     finally:

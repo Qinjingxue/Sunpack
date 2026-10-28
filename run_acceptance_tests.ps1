@@ -700,12 +700,14 @@ $powerShellHost = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
 $watchServiceRunId = [guid]::NewGuid().ToString("N")
 $watchServiceName = "SunPackWatchBrokerTest_$watchServiceRunId"
 $watchPipeName = "\\.\pipe\SunPack.WatchBroker.Test.$watchServiceRunId"
-$watchBrokerSha256 = (Get-FileHash -LiteralPath $brokerPath -Algorithm SHA256).Hash.ToLowerInvariant()
+$watchBrokerXxh128 = & $python -c "import sys; from sunpack_native import fast_hash128_file; print(fast_hash128_file(sys.argv[1]))" $brokerPath
+if ($LASTEXITCODE -ne 0) { throw "Cannot hash the Watch Broker executable" }
+$watchBrokerXxh128 = ([string]$watchBrokerXxh128).Trim()
 $watchEnvironmentNames = @(
     "SUNPACK_WATCH_BROKER_SERVICE_NAME",
     "SUNPACK_WATCH_BROKER_PIPE_NAME",
     "SUNPACK_WATCH_BROKER_BINARY_PATH",
-    "SUNPACK_WATCH_BROKER_BINARY_SHA256",
+    "SUNPACK_WATCH_BROKER_BINARY_XXH128",
     "SUNPACK_TEST_ARCH",
     "SUNPACK_TEST_BUILD_PROFILE"
 )
@@ -724,7 +726,7 @@ try {
     $env:SUNPACK_WATCH_BROKER_SERVICE_NAME = $watchServiceName
     $env:SUNPACK_WATCH_BROKER_PIPE_NAME = $watchPipeName
     $env:SUNPACK_WATCH_BROKER_BINARY_PATH = $brokerPath
-    $env:SUNPACK_WATCH_BROKER_BINARY_SHA256 = $watchBrokerSha256
+    $env:SUNPACK_WATCH_BROKER_BINARY_XXH128 = $watchBrokerXxh128
 
     Write-Host ""
     Write-Host "==> Installing temporary Watch Broker service" -ForegroundColor Cyan

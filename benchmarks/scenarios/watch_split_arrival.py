@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import hashlib
 import json
 import os
 import random
@@ -16,6 +15,8 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from sunpack_native import fast_hash128, fast_hash128_file
 
 from benchmarks.harness.reporting import report_from_payload, render_report
 from benchmarks.harness.workspace import BenchmarkWorkspace
@@ -71,14 +72,10 @@ def _manifest(root: Path, source_names: set[str]) -> list[dict[str, Any]]:
     for path in sorted(root.rglob("*")):
         if not path.is_file() or path.name in excluded or "events.json.store" in path.relative_to(root).parts:
             continue
-        digest = hashlib.sha256()
-        with path.open("rb") as handle:
-            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                digest.update(chunk)
         rows.append({
             "path": path.relative_to(root).as_posix(),
             "bytes": path.stat().st_size,
-            "sha256": digest.hexdigest(),
+            "xxh128": fast_hash128_file(path),
         })
     return rows
 
@@ -432,7 +429,7 @@ async def _run_case(
                 "file_count": len(manifest),
                 "total_bytes": sum(row["bytes"] for row in manifest),
                 "manifest": manifest,
-                "manifest_sha256": hashlib.sha256(manifest_json).hexdigest(),
+                "manifest_xxh128": fast_hash128(manifest_json),
             },
             "success": bool(completed_attempts and manifest),
         }
@@ -503,7 +500,7 @@ def main() -> int:
                 q0 = next((sample for sample in samples if sample["run_index"] == run_index and sample["mode"] == mode and sample["quiet_seconds_argument"] == 0.0), None)
                 q125 = next((sample for sample in samples if sample["run_index"] == run_index and sample["mode"] == mode and sample["quiet_seconds_argument"] == 1.25), None)
                 if q0 is not None and q125 is not None:
-                    equal = q0["output"]["manifest_sha256"] == q125["output"]["manifest_sha256"]
+                    equal = q0["output"]["manifest_xxh128"] == q125["output"]["manifest_xxh128"]
                     q0["correctness_matches_quiet_1_25"] = equal
                     q125["correctness_matches_quiet_1_25"] = equal
                     comparisons.append({"mode": mode, "run": run_index, "manifest_equal": equal})

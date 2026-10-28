@@ -35,6 +35,7 @@ def test_snapshot_literal_values_scopes_and_semantic_reuse(tmp_path):
         first.scoped_index["new"] = ()
     path.write_text(json.dumps(json.loads(path.read_text(encoding="utf-8")), indent=4), encoding="utf-8")
     assert builtin.read_builtin_password_file(path, first) is first
+    assert builtin.read_builtin_password_file(path).signature == first.signature
     seed(path, [special, "changed"], [("secret", ["D:/Work", "//server/share/Files"]), ("near", ["D:/Work/Child"])])
     second = builtin.read_builtin_password_file(path, first)
     assert second.signature != first.signature

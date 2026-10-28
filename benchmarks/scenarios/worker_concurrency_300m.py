@@ -19,6 +19,7 @@ import sys
 import threading
 import time
 import psutil
+from sunpack_native import fast_hash128_file
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
@@ -257,12 +258,7 @@ def main():
             cases = [c for c in cases if c["format"] in args.format]
         binaries = {}
         for name, path in {"worker": worker_path, "7z": seven, "dll": dll}.items():
-            literal = "'" + str(path).replace("'", "''") + "'"
-            script = f"$stream=[IO.File]::OpenRead({literal}); $hash=[Security.Cryptography.SHA256]::Create(); try {{ [BitConverter]::ToString($hash.ComputeHash($stream)).Replace('-', '') }} finally {{ $stream.Dispose(); $hash.Dispose() }}"
-            result = subprocess.run(["powershell.exe", "-NoProfile", "-Command", script], capture_output=True, text=True)
-            if result.returncode:
-                raise RuntimeError(result.stderr)
-            binaries[name] = {"path": str(path), "sha256": result.stdout.strip()}
+            binaries[name] = {"path": str(path), "xxh128": fast_hash128_file(path)}
         report = {"source_commit": _git_commit(), "binaries": binaries, "environment": _collect_environment(workspace.root),
                   "corpus": corpus, "cases": cases, "concurrency": widths, "runs": args.runs,
                   "worker_capacity": args.worker_capacity, "profile": args.profile, "dry_run": args.dry_run,

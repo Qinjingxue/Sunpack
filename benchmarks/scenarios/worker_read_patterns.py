@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import hashlib
 import os
 import random
 import re
@@ -15,6 +14,8 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+from sunpack_native import fast_hash128_file
 
 from benchmarks.harness import BenchmarkWorkspace, ProcessSampler, render_report, report_from_payload
 from benchmarks.scenarios.extraction_format_matrix import (
@@ -681,7 +682,7 @@ def main() -> int:
                 "environment": {
                     "worker_path": str(worker_path),
                     "worker_size_bytes": worker_path.stat().st_size,
-                    "worker_sha256": hashlib.sha256(worker_path.read_bytes()).hexdigest()[:16],
+                    "worker_xxh128": fast_hash128_file(worker_path)[:16],
                     "python": sys.version,
                 },
                 "corpus": corpus_info,

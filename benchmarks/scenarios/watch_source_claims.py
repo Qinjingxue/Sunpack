@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import gc
-import hashlib
 import os
 import statistics
 import subprocess
@@ -13,6 +12,8 @@ import threading
 import tracemalloc
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
+
+from sunpack_native import fast_hash128
 
 from benchmarks.harness import BenchmarkReport, BenchmarkWorkspace, measure, write_report
 from sunpack.runtime.watch import scheduler as candidate
@@ -34,7 +35,7 @@ def _baseline(ref):
     module.__file__ = f"{revision}:{SOURCE_PATH}"
     sys.modules[module.__name__] = module
     exec(compile(source, module.__file__, "exec"), module.__dict__)
-    return module, revision, hashlib.sha256(source.encode("utf-8")).hexdigest()
+    return module, revision, fast_hash128(source.encode("utf-8"))
 
 
 def _store(module, watcher, path, item):
@@ -233,10 +234,10 @@ def main(argv: list[str] | None = None) -> int:
     report = BenchmarkReport(
         scenario="scheduling.watch-source-claims",
         parameters={
-            "baseline_revision": revision, "baseline_source_sha256": source_hash,
-            "candidate_source_sha256": hashlib.sha256(
+            "baseline_revision": revision, "baseline_source_xxh128": source_hash,
+            "candidate_source_xxh128": fast_hash128(
                 (REPO_ROOT / SOURCE_PATH).read_text(encoding="utf-8").encode("utf-8"),
-            ).hexdigest(),
+            ),
             "sizes": sizes, "sources": args.sources, "runs": args.runs,
             "warmups": args.warmups, "repeats": args.repeats,
             "logical_processors": os.cpu_count(),

@@ -1,7 +1,10 @@
 //! Test-only binary IO. No SunPack parser is used to construct or select fixtures.
 use serde::Deserialize;
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
+#[path = "../src/fast_hash_core.rs"]
+#[allow(dead_code)]
+mod fast_hash_core;
+use fast_hash_core::Hash128;
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -314,7 +317,7 @@ fn junk(
     length: usize,
     decoys: bool,
 ) -> io::Result<Value> {
-    let mut digest = Sha256::new();
+    let mut digest = Hash128::new();
     let mut buffer = [0u8; 64 * 1024];
     let mut written = 0;
     while written < length {
@@ -334,12 +337,12 @@ fn junk(
         digest.update(&buffer[..count]);
         written += count;
     }
-    Ok(json!({"length": length, "sha256": format!("{:x}", digest.finalize())}))
+    Ok(json!({"length": length, "xxh128": digest.hexdigest()}))
 }
 
 fn transfer(path: &Path, writer: &mut impl Write) -> io::Result<(u64, String)> {
     let mut reader = BufReader::new(File::open(path)?);
-    let mut digest = Sha256::new();
+    let mut digest = Hash128::new();
     let mut buffer = [0u8; 64 * 1024];
     let mut size = 0;
     loop {
@@ -351,7 +354,7 @@ fn transfer(path: &Path, writer: &mut impl Write) -> io::Result<(u64, String)> {
         digest.update(&buffer[..count]);
         size += count as u64;
     }
-    Ok((size, format!("{:x}", digest.finalize())))
+    Ok((size, digest.hexdigest()))
 }
 
 fn inventory(root: &Path, directory: &Path, entries: &mut Vec<Value>) -> io::Result<()> {
@@ -451,8 +454,8 @@ fn run(request: Request) -> io::Result<Value> {
                     });
                 blocks.push(junk(&mut writer, &mut state, length, decoys)?);
                 offset += length as u64;
-                let (size, sha256) = transfer(path, &mut writer)?;
-                segments.push(json!({"offset": offset, "length": size, "sha256": sha256}));
+                let (size, xxh128) = transfer(path, &mut writer)?;
+                segments.push(json!({"offset": offset, "length": size, "xxh128": xxh128}));
                 offset += size;
             }
             let length = junk_min + next(&mut state) as usize % (junk_max - junk_min + 1);

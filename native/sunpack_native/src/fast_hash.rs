@@ -1,15 +1,9 @@
 //! Stable non-cryptographic identities using the already bundled XXH64.
+pub(crate) use crate::fast_hash_core::xxh64;
+use crate::fast_hash_core::{hash_reader, Hash128};
+use crate::io::resource_lifecycle::TrackedFile;
 use pyo3::prelude::*;
-use std::ffi::c_void;
-
-unsafe extern "C" {
-    fn SUNPACK_LZ4_XXH64(input: *const c_void, size: usize, seed: u64) -> u64;
-}
-
-pub(crate) fn xxh64(data: &[u8], seed: u64) -> u64 {
-    // XXH64 reads this live slice synchronously and retains no pointers.
-    unsafe { SUNPACK_LZ4_XXH64(data.as_ptr().cast(), data.len(), seed) }
-}
+use std::path::PathBuf;
 
 #[pyfunction]
 pub(crate) fn fast_hash64(py: Python<'_>, data: &[u8]) -> String {
@@ -19,6 +13,35 @@ pub(crate) fn fast_hash64(py: Python<'_>, data: &[u8]) -> String {
 #[pyfunction]
 pub(crate) fn fast_hash128(py: Python<'_>, data: &[u8]) -> String {
     py.detach(|| format!("{:016x}{:016x}", xxh64(data, 0), xxh64(data, 1)))
+}
+
+#[pyclass(module = "sunpack_native")]
+pub(crate) struct FastHash128(Hash128);
+
+#[pymethods]
+impl FastHash128 {
+    #[new]
+    fn new() -> Self {
+        Self(Hash128::new())
+    }
+
+    fn update(&mut self, py: Python<'_>, data: &[u8]) {
+        py.detach(|| self.0.update(data));
+    }
+
+    fn hexdigest(&self) -> String {
+        self.0.hexdigest()
+    }
+}
+
+#[pyfunction]
+pub(crate) fn fast_hash128_file(py: Python<'_>, path: PathBuf) -> PyResult<String> {
+    py.detach(move || {
+        let file = TrackedFile::open_reader(path, "fast_hash128_file")?;
+        let mut digest = Hash128::new();
+        hash_reader(file, |data| digest.update(data))?;
+        Ok(digest.hexdigest())
+    })
 }
 
 #[cfg(test)]

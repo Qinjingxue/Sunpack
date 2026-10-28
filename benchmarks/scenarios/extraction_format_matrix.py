@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import hashlib
 import json
 import os
 import random
@@ -31,6 +30,8 @@ from typing import Any, Callable
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+from sunpack_native import fast_hash128
 
 from benchmarks.harness import AdaptivePressureGate, BenchmarkWorkspace, PhaseReporter, render_report, report_from_payload
 
@@ -393,7 +394,7 @@ def _cache_key(small_files: int, large_files: int, large_file_mib: int) -> str:
         "tools": tool_fingerprints,
         "formats": GENERATED_FORMATS,
     }
-    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:20]
+    return fast_hash128(json.dumps(payload, sort_keys=True).encode("utf-8"))[:20]
 
 
 def _cached_corpus(

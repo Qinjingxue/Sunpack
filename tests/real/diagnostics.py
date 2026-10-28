@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import os
 import platform
 import sys
@@ -10,6 +9,8 @@ from dataclasses import fields, is_dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Any, Iterable
+
+from sunpack_native import fast_hash128
 
 
 _MAX_SNAPSHOT_ENTRIES = 2048
@@ -66,7 +67,7 @@ def password_summary(passwords: Iterable[str] | None) -> dict[str, Any]:
     joined = "\0".join(values).encode("utf-8")
     return {
         "count": len(values),
-        "sha256": hashlib.sha256(joined).hexdigest(),
+        "xxh128": fast_hash128(joined),
         "lengths": [len(value) for value in values],
     }
 
@@ -173,7 +174,7 @@ def case_snapshot(case: Any) -> dict[str, Any]:
         "marker_name": getattr(case, "marker_name", ""),
         "marker_text_length": len(str(getattr(case, "marker_text", ""))),
         "password_present": password is not None,
-        "password_sha256": hashlib.sha256(str(password).encode("utf-8")).hexdigest()
+        "password_xxh128": fast_hash128(str(password).encode("utf-8"))
         if password is not None
         else None,
         "split": bool(getattr(case, "split", False)),

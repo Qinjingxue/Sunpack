@@ -231,7 +231,7 @@ def _write_embedded_case(
             error_info["fixture_layout"] = layout
         return EmbeddedMixedCase(
             case_id=case_id, file_path=file_path, segments=specs, password=password,
-            junk_blocks=tuple((block["length"], block["sha256"]) for block in layout["junk_blocks"]),
+            junk_blocks=tuple((block["length"], block["xxh128"]) for block in layout["junk_blocks"]),
             skipped_formats=skipped,
         )
     finally:

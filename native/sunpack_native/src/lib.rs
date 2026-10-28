@@ -4,6 +4,7 @@ mod analysis_native;
 mod collections;
 mod event_log;
 mod fast_hash;
+mod fast_hash_core;
 mod filesystem;
 mod formats;
 mod io;
@@ -49,6 +50,8 @@ fn sunpack_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(path_keys::path_key, m)?)?;
     m.add_function(wrap_pyfunction!(fast_hash::fast_hash64, m)?)?;
     m.add_function(wrap_pyfunction!(fast_hash::fast_hash128, m)?)?;
+    m.add_function(wrap_pyfunction!(fast_hash::fast_hash128_file, m)?)?;
+    m.add_class::<fast_hash::FastHash128>()?;
     #[cfg(windows)]
     {
         m.add_function(wrap_pyfunction!(

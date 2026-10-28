@@ -9,7 +9,6 @@ compared without guessing what was actually tested.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import platform
@@ -26,6 +25,8 @@ import psutil
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+from sunpack_native import fast_hash128_file
 
 from benchmarks.harness import BenchmarkWorkspace, ProcessSampler
 from benchmarks.scenarios.extraction_format_matrix import GENERATED_FORMATS
@@ -73,14 +74,6 @@ METHODS = {
 }
 
 
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def _git_commit() -> str | None:
     try:
         result = subprocess.run(
@@ -102,7 +95,7 @@ def _tool_info(path: Path, *, query_version: bool = False) -> dict[str, Any]:
     info: dict[str, Any] = {
         "path": str(path),
         "file_size_bytes": path.stat().st_size,
-        "sha256": _sha256(path),
+        "xxh128": fast_hash128_file(path),
     }
     if query_version:
         try:

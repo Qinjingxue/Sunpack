@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import hashlib
 import json
 import math
 import os
@@ -20,6 +19,8 @@ import zipfile
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+from sunpack_native import FastHash128, fast_hash128_file
 
 from benchmarks.harness import BenchmarkWorkspace, ProcessSampler, render_report, report_from_payload
 from sunpack.pipeline.extraction.internal.sevenzip.sevenzip_runner import _NativeWorkerProcess
@@ -45,7 +46,7 @@ def _payload_block(size: int, block_index: int) -> bytes:
 
 def _create_archive(root: Path, *, payload_bytes: int, chunk_bytes: int) -> dict[str, Any]:
     archive = root / "single-large-member.zip"
-    digest = hashlib.sha256()
+    digest = FastHash128()
     started = time.perf_counter()
     with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_STORED, allowZip64=True) as stream:
         with stream.open(MEMBER_NAME, "w", force_zip64=True) as member:
@@ -61,7 +62,7 @@ def _create_archive(root: Path, *, payload_bytes: int, chunk_bytes: int) -> dict
         "archive": archive,
         "archive_bytes": archive.stat().st_size,
         "payload_bytes": payload_bytes,
-        "payload_sha256": digest.hexdigest(),
+        "payload_xxh128": digest.hexdigest(),
         "member_name": MEMBER_NAME,
         "build_seconds": round(time.perf_counter() - started, 3),
     }
@@ -71,14 +72,6 @@ def _prefetch_archive(path: Path, *, chunk_bytes: int) -> None:
     with path.open("rb", buffering=0) as stream:
         while stream.read(chunk_bytes):
             pass
-
-
-def _digest_path(path: Path, *, chunk_bytes: int) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb", buffering=0) as stream:
-        while block := stream.read(chunk_bytes):
-            digest.update(block)
-    return digest.hexdigest()
 
 
 def _worker_counters(worker: _NativeWorkerProcess) -> dict[str, float | int | None]:
@@ -214,7 +207,7 @@ def _run_worker(
     output_file = output_dir / str(corpus["member_name"])
     output_exists = output_file.is_file()
     output_bytes = output_file.stat().st_size if output_exists else 0
-    output_sha256 = _digest_path(output_file, chunk_bytes=8 * MIB) if output_exists else None
+    output_xxh128 = fast_hash128_file(output_file) if output_exists else None
     wall_seconds = max(0.000001, (finished - started) / 1_000_000_000.0)
     samples = sampler.samples[sample_start:]
     worker_rss = [sample.children_rss_mib for sample in samples]
@@ -225,7 +218,7 @@ def _run_worker(
         passed = (
             status == "ok"
             and output_bytes == int(corpus["payload_bytes"])
-            and output_sha256 == str(corpus["payload_sha256"])
+            and output_xxh128 == str(corpus["payload_xxh128"])
         )
     row = {
         "label": label,
@@ -250,7 +243,7 @@ def _run_worker(
         "bytes_written": int(result.get("bytes_written", 0) or 0),
         "output_exists": output_exists,
         "output_bytes": output_bytes,
-        "output_sha256": output_sha256,
+        "output_xxh128": output_xxh128,
         "event_count": len(events),
         "progress_event_count": sum(event.get("type") == "progress" for event in events),
         "failure_stage": result.get("failure_stage"),
@@ -515,7 +508,7 @@ def main() -> int:
         corpus = _create_archive(workspace.corpus, payload_bytes=payload_bytes, chunk_bytes=chunk_bytes)
         print(
             f"  archive={corpus['archive_bytes'] / MIB:.1f} MiB build={corpus['build_seconds']:.2f}s "
-            f"sha256={corpus['payload_sha256'][:12]}",
+            f"xxh128={corpus['payload_xxh128'][:12]}",
             flush=True,
         )
         rows: list[dict[str, Any]] = []

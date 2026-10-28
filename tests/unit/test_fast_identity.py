@@ -1,6 +1,15 @@
 from concurrent.futures import ThreadPoolExecutor
 
-from sunpack_native import fast_hash64, fast_hash128
+import pytest
+
+from sunpack_native import (
+    FastHash128,
+    fast_hash64,
+    fast_hash128,
+    fast_hash128_file,
+    native_resource_snapshot,
+    runtime_binary_build_id,
+)
 
 from sunpack.core.passwords.fingerprint import build_archive_fingerprint
 from sunpack.core.support.archive_knowledge_projection import _source_input_fingerprint
@@ -21,6 +30,39 @@ def test_fast_hash_vectors_and_concurrent_memory_identities():
         assert identity["xxh128"] == digest
         assert identity["size"] == len(data)
         assert "sha256" not in identity
+
+
+def test_streaming_and_file_hashes_match_memory_and_release_resources(tmp_path):
+    # Unique coverage: partial XXH blocks, multi-buffer files, independent concurrent
+    # streams and handle cleanup on success/error. One-shot identity tests cannot
+    # detect these failures; this bounded fixture also covers the CLI build ID.
+    payload = bytes(range(256)) * 4097
+    paths = []
+    expected = []
+    for size in (0, 1, 31, 32, 33, len(payload)):
+        data = payload[:size]
+        path = tmp_path / f"密码-{size}.bin"
+        path.write_bytes(data)
+        paths.append(path)
+        expected.append(fast_hash128(data))
+        digest = FastHash128()
+        digest.update(b"")
+        digest.update(data[:31])
+        assert digest.hexdigest() == fast_hash128(data[:31])
+        # Reading a digest must not consume/finalize the state.
+        assert digest.hexdigest() == fast_hash128(data[:31])
+        digest.update(data[31:33])
+        digest.update(data[33:])
+        assert digest.hexdigest() == expected[-1]
+        assert runtime_binary_build_id(str(path)) == fast_hash64(data)
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        assert list(pool.map(fast_hash128_file, paths * 4)) == expected * 4
+    missing = tmp_path / "missing.bin"
+    with pytest.raises(OSError):
+        fast_hash128_file(missing)
+    with pytest.raises(OSError):
+        fast_hash128_file(tmp_path)
+    assert list(native_resource_snapshot([str(tmp_path)])) == []
 
 
 def test_password_signature_preserves_boundaries_order_and_unicode():

@@ -11,6 +11,7 @@ import subprocess
 import time
 
 import psutil
+from sunpack_native import fast_hash128_file
 
 from benchmarks.harness import BenchmarkWorkspace
 from benchmarks.scenarios.worker_concurrency_300m import prepare, run_worker, run_cli, validate, _volume_paths, STREAMS
@@ -61,16 +62,7 @@ def main():
     report["source_commit"] = _git_commit()
     report["binaries"] = {}
     for name, binary in {"baseline": args.baseline, "candidate": args.candidate, "cli": seven, "dll": dll}.items():
-        literal = "'" + str(binary.resolve()).replace("'", "''") + "'"
-        script = (f"$stream=[IO.File]::OpenRead({literal}); $hash=[Security.Cryptography.SHA256]::Create(); "
-                  "try { [BitConverter]::ToString($hash.ComputeHash($stream)).Replace('-', '') } "
-                  "finally { $stream.Dispose(); $hash.Dispose() }")
-        result = subprocess.run(["powershell.exe", "-NoProfile", "-Command",
-                                 script],
-                                capture_output=True, text=True)
-        if result.returncode:
-            raise RuntimeError(result.stderr)
-        report["binaries"][name] = {"path": str(binary.resolve()), "sha256": result.stdout.strip()}
+        report["binaries"][name] = {"path": str(binary.resolve()), "xxh128": fast_hash128_file(binary)}
     with BenchmarkWorkspace("extraction.worker-iocp-300m") as workspace:
         cases, corpus = prepare(workspace, ROOT / "benchmarks/.cache/worker-concurrency-300m")
         report["corpus"] = corpus

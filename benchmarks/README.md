@@ -15,7 +15,7 @@ Watch Broker test service, launches the benchmark with an ordinary user token,
 and removes only that service afterward. It never reuses, stops, or deletes an
 installed release `SunPackWatchBroker` service. CI must already run with an
 elevated account; interactive UAC is deliberately disabled there. Watch reports
-include the test service/pipe identity, Broker binary SHA-256, and connection state.
+include the test service/pipe identity, Broker binary XXH128 (the two-seed Rust XXH64 identity), and connection state.
 
 ```powershell
 uv run --locked python -m benchmarks reader password-fast-path --rounds 5
