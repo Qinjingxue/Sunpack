@@ -696,6 +696,7 @@ export default {
      inset). Reserve 18 px for the bar and shadows in every scroll pane. */
   ScrollView { flex:1; padding:2px 18px 6px 2px; }
   .setting-control { gap:8px; justify-content:center; }
+  .setting-control.number-control { width:112px; flex-shrink:0; }
   .setting-control.wide-control { width:220px; }
   .setting-control.choice-control { min-width:120px; flex-shrink:0; }
   .selector-host { min-width:120px; height:32px; flex-shrink:0; }
@@ -860,7 +861,7 @@ export default {
             <div class="settings-row" :class="f.editor==='list'?'tag-setting':''">
               <div class="setting-copy"><label :class="f.primary?'subheading':'setting-title'">{{ f.label }}</label><label v-show="f.description" class="setting-description">{{ f.description }}</label><input v-show="f.editor==='list'" :id="'tag-input-'+f.id" :value="tagInputs[f.id]||''" :placeholder="texts.tagInputPlaceholder" @input="v=>changeTagInput(f,v)" @submit="addTag(f)"/></div>
               <ScrollView v-if="f.editor==='list'" :id="'tag-scroll-'+f.id" class="tag-region"><div :id="'tags-host-'+f.id"/></ScrollView>
-              <div v-show="!isRange(f) &amp;&amp; f.editor!=='list'" class="setting-control" :class="f.editor==='choice'||f.editor==='recursive'?'choice-control':'wide-control'">
+              <div v-show="!isRange(f) &amp;&amp; f.editor!=='list'" class="setting-control" :class="f.editor==='choice'||f.editor==='recursive'?'choice-control':f.editor==='text'?(f.type==='number'?'number-control':'wide-control'):''">
                 <div v-show="f.editor==='toggle'" :id="'toggle-host-'+f.id" class="toggle-host"/>
                 <div v-show="f.editor==='choice'||f.editor==='recursive'" :id="'choice-'+f.id" class="choice-host"/>
                 <input v-show="f.editor==='text'" :ellipsis-start="isDirectoryValue(drafts[f.id]?drafts[f.id].text:f.text)" :id="'input-'+f.id" :value="drafts[f.id]?drafts[f.id].text:f.text" @input="v=>changeField(f,v)" @blur="commitField(f)" @submit="commitField(f)"/>
