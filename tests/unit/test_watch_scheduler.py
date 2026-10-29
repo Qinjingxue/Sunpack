@@ -115,13 +115,14 @@ def test_existing_watch_success_notification_includes_postprocess_warning(tmp_pa
 
 
 @pytest.mark.parametrize("archive_outcome", [None, OutcomeKind.COMPLETE_SUCCESS, OutcomeKind.FAILURE])
-def test_scan_filesystem_errors_only_log_and_do_not_replace_archive_notifications(tmp_path, monkeypatch, archive_outcome):
+@pytest.mark.parametrize("scan_stage", ["filesystem_scan", "embedded_boundary"])
+def test_scan_filesystem_errors_only_log_and_do_not_replace_archive_notifications(tmp_path, monkeypatch, archive_outcome, scan_stage):
     # The native scan test covers standalone scans. This covers the separate
     # pipeline completion path, including coexistence with real archive results.
     monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
     source = tmp_path / "archive.blob"
     source.write_text("source")
-    scan_error = FailureInfo(FailureKind.FILESYSTEM_ERROR, "filesystem_scan", "blocked directory: access denied")
+    scan_error = FailureInfo(FailureKind.FILESYSTEM_ERROR, scan_stage, "input: access denied", details={"path": str(source)})
     archive_error = FailureInfo(FailureKind.DAMAGED, "extract", "archive damaged")
     results = () if archive_outcome is None else (TargetRunResult(
         str(source), archive_outcome,
@@ -153,6 +154,11 @@ def test_scan_filesystem_errors_only_log_and_do_not_replace_archive_notification
         return await watcher._finish_active_request(request)
 
     run_result = _await(scenario())
+    if scan_stage == "embedded_boundary":
+        assert notices[-1][0] == "failed" and run_result.failed == 1
+        assert not any(event == "no_tasks_found" for event, _ in events)
+        assert any(scan_error.message in str(notice) for notice in notices)
+        return
     expected = {None: "suppressed", OutcomeKind.COMPLETE_SUCCESS: "succeeded", OutcomeKind.FAILURE: "failed"}
     assert notices[-1][0] == expected[archive_outcome]
     assert all(scan_error.message not in str(notice) for notice in notices)

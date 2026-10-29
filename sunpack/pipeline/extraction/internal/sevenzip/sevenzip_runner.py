@@ -393,6 +393,11 @@ class _NativeWorkerProcess:
                 with self._dispatch_lock:
                     if self._async_jobs.get(job_id) is not async_state:
                         return
+                # Completion callbacks can publish results or resubmit from
+                # another thread immediately. Retire terminal registrations
+                # before handing off ownership, just as _fail_async_job does.
+                if _is_job_finished(payload):
+                    self._finish_async_job(job_id, expected=async_state)
                 try:
                     if callback_error:
                         completed = _is_job_finished(payload)
@@ -407,6 +412,8 @@ class _NativeWorkerProcess:
                             if async_state.get("parsed_events")
                             else callback(line)
                         )
+                        if _is_job_finished(payload) and not completed:
+                            raise ValueError("sevenzip_worker finished without a result")
                 except Exception as exc:
                     callback_error = f"sevenzip_worker job protocol/callback failed: {exc}"
                     async_state["callback_error"] = callback_error
@@ -1253,8 +1260,8 @@ class SevenZipRunner:
                                 on_error("native worker backpressure requires an event loop")
                                 return True
                             event_loop = self._event_loop
-                            # Resubmission runs on the loop, after this job's
-                            # current registration has been retired.
+                            # Terminal dispatch retires the old registration
+                            # before invoking this callback.
                             worker.queue_capacity.park(
                                 job_id,
                                 lambda: event_loop.call_soon_threadsafe(retry_submission),

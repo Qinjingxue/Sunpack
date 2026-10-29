@@ -133,6 +133,15 @@ class ArchiveTaskProvider:
             ),
         }
         for trace in result.traces:
+            if trace.reason == "embedded_scan_io_error":
+                info = FailureInfo(
+                    FailureKind.FILESYSTEM_ERROR, "embedded_boundary",
+                    trace.error or "Unable to read archive input",
+                    details={"path": trace.entry_path, "reason": trace.reason},
+                )
+                if info not in self.failed_candidate_failures:
+                    self.failed_candidate_failures.append(info)
+                continue
             if trace.source == "relations" and trace.reason in {"missing_volume", "ambiguous_volume_mapping", "structural_conflict"}:
                 info = FailureInfo(FailureKind.MISSING_VOLUME, "relations",
                     "Volume set is incomplete or ambiguous", message_key="failure.possible_missing_volume",

@@ -20,7 +20,7 @@ from sunpack_native import fast_hash128, NativeWatchCatalog
 from sunpack.core.config.fields.watch import DEFAULT_WATCH_CONFIG
 from sunpack.pipeline.discovery.embedded.options import EmbeddedOptions
 from sunpack.core.contracts.failures import FailureInfo, FailureKind
-from sunpack.core.support.filesystem_scan_errors import filesystem_scan_failure
+from sunpack.core.support.filesystem_scan_errors import filesystem_scan_failure, is_filesystem_scan_failure
 from sunpack.core.contracts.retry_targets import (
     failure_contains,
     failure_is_password,
@@ -2276,7 +2276,7 @@ class WatchScheduler:
 
         scan_errors = {
             failure.message for failure in summary.scan_failures
-            if failure.kind == FailureKind.FILESYSTEM_ERROR
+            if is_filesystem_scan_failure(failure)
         }
         if scan_errors:
             self.log.write("filesystem_scan_failed", path=candidate.path, errors=sorted(scan_errors))
@@ -2285,7 +2285,7 @@ class WatchScheduler:
             summary = replace(
                 summary,
                 scan_failures=tuple(failure for failure in summary.scan_failures
-                                    if failure.kind != FailureKind.FILESYSTEM_ERROR),
+                                    if not is_filesystem_scan_failure(failure)),
             )
 
         results = target_results(summary)

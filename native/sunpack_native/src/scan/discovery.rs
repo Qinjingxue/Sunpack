@@ -33,7 +33,7 @@ pub(crate) struct NativeCandidateTable {
 #[pyclass(module = "sunpack_native")]
 #[derive(Default)]
 pub(crate) struct NativeDiscoveryRoutes {
-    scans: HashMap<usize, Result<Arc<NativeScanResult>, &'static str>>,
+    scans: HashMap<usize, Result<Arc<NativeScanResult>, Arc<str>>>,
     #[pyo3(get)]
     pub(crate) relation_events: Vec<(usize, u8)>,
     #[pyo3(get)]
@@ -54,12 +54,13 @@ pub(crate) struct NativeDiscoveryRoutes {
 
 enum EmbeddedOutcome {
     Residual(&'static str),
+    Failed(Arc<str>),
     Scan(Arc<NativeScanResult>),
 }
 
 #[pyclass(module = "sunpack_native")]
 pub(crate) struct NativeEmbeddedBatch {
-    scans: HashMap<usize, Result<Arc<NativeScanResult>, &'static str>>,
+    scans: HashMap<usize, Result<Arc<NativeScanResult>, Arc<str>>>,
     ids: Vec<usize>,
     selected: HashSet<usize>,
     select_all: bool,
@@ -105,6 +106,11 @@ impl NativeEmbeddedBatch {
                     chunk
                         .iter()
                         .filter_map(|&index| {
+                            // An earlier detection attempt already failed. Policy
+                            // gates may skip new I/O, never erase an observed error.
+                            if let Some(Err(error)) = self.scans.get(&index) {
+                                return Some((index, EmbeddedOutcome::Failed(Arc::clone(error))));
+                            }
                             if !self.select_all && !self.selected.contains(&index) {
                                 return self.include_residual_details.then_some((
                                     index,
@@ -114,10 +120,10 @@ impl NativeEmbeddedBatch {
                             if let Some(scan) = self.scans.get(&index) {
                                 let outcome = match scan {
                                     Ok(scan) => EmbeddedOutcome::Scan(Arc::clone(scan)),
-                                    Err(reason) => EmbeddedOutcome::Residual(reason),
+                                    Err(error) => EmbeddedOutcome::Failed(Arc::clone(error)),
                                 };
                                 return (self.include_residual_details
-                                    || matches!(outcome, EmbeddedOutcome::Scan(_)))
+                                    || !matches!(outcome, EmbeddedOutcome::Residual(_)))
                                 .then_some((index, outcome));
                             }
                             let (path, pe_state) = match &rows[index] {
@@ -135,7 +141,7 @@ impl NativeEmbeddedBatch {
                                         parallel_files,
                                     );
                                     return (self.include_residual_details
-                                        || matches!(outcome, EmbeddedOutcome::Scan(_)))
+                                        || !matches!(outcome, EmbeddedOutcome::Residual(_)))
                                     .then_some((index, outcome));
                                 }
                             };
@@ -146,7 +152,7 @@ impl NativeEmbeddedBatch {
                                 parallel_files,
                             );
                             (self.include_residual_details
-                                || matches!(outcome, EmbeddedOutcome::Scan(_)))
+                                || !matches!(outcome, EmbeddedOutcome::Residual(_)))
                             .then_some((index, outcome))
                         })
                         .collect::<Vec<_>>()
@@ -160,6 +166,11 @@ impl NativeEmbeddedBatch {
             .into_iter()
             .map(|(index, outcome)| match outcome {
                 EmbeddedOutcome::Residual(reason) => Ok((index, 0, reason, None)),
+                EmbeddedOutcome::Failed(error) => {
+                    let detail = PyDict::new(py);
+                    detail.set_item("error", error.as_ref())?;
+                    Ok((index, 2, "embedded_scan_io_error", Some(detail.unbind())))
+                }
                 EmbeddedOutcome::Scan(scan) => Ok((index, 1, "", Some(scan.to_py_dict(py)?))),
             })
             .collect()
@@ -575,7 +586,7 @@ impl NativeCandidateTable {
                             Some(
                                 scan_detected_path(path, format, parallel_files)
                                     .map(Arc::new)
-                                    .map_err(|_| "embedded_scan_io_error"),
+                                    .map_err(|error| Arc::<str>::from(error.to_string())),
                             )
                         } else {
                             None
@@ -743,15 +754,16 @@ fn scan_embedded_candidate(
             Some(PeState::Candidate) | None => match inspect_pe_image_native(path) {
                 Ok(PeProbe::Confirmed(_)) => true,
                 Ok(_) => false,
-                Err(_) => return EmbeddedOutcome::Residual("embedded_scan_io_error"),
+                Err(error) => return EmbeddedOutcome::Failed(error.to_string().into()),
             },
         };
         if is_pe {
             return EmbeddedOutcome::Residual("embedded_executable_skipped");
         }
     }
-    let Ok(metadata) = std::fs::metadata(path) else {
-        return EmbeddedOutcome::Residual("embedded_scan_io_error");
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) => return EmbeddedOutcome::Failed(error.to_string().into()),
     };
     if !metadata.is_file() || metadata.len() == 0 {
         return EmbeddedOutcome::Residual("missing_or_empty_file");
@@ -759,7 +771,7 @@ fn scan_embedded_candidate(
     match scan_embedded_path(path, parallel_files) {
         Ok(scan) if scan.has_candidates() => EmbeddedOutcome::Scan(Arc::new(scan)),
         Ok(_) => EmbeddedOutcome::Residual("no_complete_embedded_archive"),
-        Err(_) => EmbeddedOutcome::Residual("embedded_scan_io_error"),
+        Err(error) => EmbeddedOutcome::Failed(error.to_string().into()),
     }
 }
 

@@ -1,5 +1,6 @@
 //! Compact resident rows. Scan anchors and runtime observations never enter the WAL.
 use super::directory::DirectoryEntryRecord;
+use crate::analysis_native::volume_anchor::CheapAnchorCell;
 use crate::path_keys::path_key;
 use pyo3::prelude::*;
 use serde::Serialize;
@@ -114,11 +115,21 @@ pub(super) struct CatalogRow {
     size: u64,
     mtime_ns: u64,
     flags: u8,
+    pub cheap_anchor: Option<CheapAnchorCell>,
     pub observation: Option<Box<NativeWatchObservation>>,
 }
 
 impl CatalogRow {
     pub fn remember_observation(&mut self, size: u64, mtime: f64, file_id: &str, change_usn: i64) {
+        let unchanged = self.observation.as_ref().is_some_and(|old| {
+            old.size == size
+                && old.mtime == mtime
+                && old.change_usn == change_usn
+                && old.file_id.text() == file_id
+        });
+        if !unchanged {
+            self.cheap_anchor = None;
+        }
         if let Some(observation) = self.observation.as_mut() {
             observation.update(size, mtime, file_id, change_usn);
         } else {
@@ -244,6 +255,9 @@ impl ScopeCatalog {
                 && old.is_dir() == record.is_dir
                 && record.path.strip_prefix(old.parent.as_ref()) == Some(old.name.as_ref())
             {
+                if old.size() != record.size || old.mtime_ns() != record.mtime_ns {
+                    old.cheap_anchor = None;
+                }
                 old.size = record.size.unwrap_or(0);
                 old.mtime_ns = record.mtime_ns.unwrap_or(0);
                 old.flags = u8::from(record.is_dir) * DIRECTORY
@@ -271,6 +285,7 @@ impl ScopeCatalog {
                 | u8::from(record.mtime_ns.is_some()) * HAS_MTIME
                 | u8::from(transient) * TRANSIENT,
             observation: None,
+            cheap_anchor: None,
         };
         let mut reuse_indexes = false;
         if let Some((old_key, mut old)) = self.rows.remove_entry(key.as_ref()) {

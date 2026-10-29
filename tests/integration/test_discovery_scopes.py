@@ -184,6 +184,47 @@ def test_cross_directory_parts_share_one_scope_and_execute_beside_entry(tmp_path
     assert marker.read_text(encoding="utf-8") == case.marker_text
 
 
+def test_catalog_head_facts_follow_metadata_and_observation_generations(tmp_path):
+    # Snapshot tests without a warmed catalog cannot detect stale cached routing
+    # after same-metadata replacement or a new USN. Old request views must keep
+    # their own immutable facts while new requests observe the new generation.
+    import gzip
+    import os
+    from concurrent.futures import ThreadPoolExecutor
+    from sunpack_native import NativeDirectoryScanOptions, NativeWatchState
+    path = tmp_path / "same.photo"
+    blob = gzip.compress(b"payload").ljust(128, b"\0")
+    path.write_bytes(b"x" * 128)
+    stamp = path.stat().st_mtime_ns
+    scope = DiscoveryScope(str(tmp_path))
+    catalog = NativeWatchCatalog(NativeWatchState())
+    options = NativeDirectoryScanOptions([], [], [], [], [], [], [])
+    def snapshot(_=None):
+        return options.catalog_snapshot(catalog, scope.native, str(path))[1]
+    def format_of(view):
+        return view.filesystem_candidate_specs()[0][3]
+    try:
+        assert not options.catalog_update(catalog, scope.native)
+        catalog.remember_observation(str(path), 128, stamp / 1e9, "file-a", 10)
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            assert all(format_of(view) == "" for view in pool.map(snapshot, range(8)))
+        path.write_bytes(blob)
+        os.utime(path, ns=(stamp, stamp))
+        assert not options.catalog_update(catalog, scope.native, str(path))
+        catalog.remember_observation(str(path), 128, stamp / 1e9, "file-a", 11)
+        previous = snapshot()
+        assert format_of(previous) == "gzip"
+        path.write_bytes(b"y" * 128)
+        os.utime(path, ns=(stamp, stamp))
+        catalog.remember_observation(str(path), 128, stamp / 1e9, "file-b", 11)
+        assert format_of(snapshot()) == "" and format_of(previous) == "gzip"
+        path.write_bytes(gzip.compress(b"new metadata generation"))
+        assert not options.catalog_update(catalog, scope.native, str(path))
+        assert format_of(snapshot()) == "gzip"
+    finally:
+        catalog.close()
+
+
 def test_targeted_catalog_updates_preserve_original_depth_pruning_and_conflicts(tmp_path):
     """Full-root scans cannot detect incremental scope widening or stale conflict rows."""
     from sunpack_native import NativeDirectoryScanOptions

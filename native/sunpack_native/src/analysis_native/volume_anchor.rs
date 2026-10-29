@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crc32fast::hash as crc32;
 use memchr::memmem;
@@ -138,11 +138,30 @@ pub(crate) fn probe_volume_anchor_paths_cheap(
     )
 }
 
-pub(crate) fn probe_volume_anchor_records_cheap(records: &[(&str, u64)]) -> Vec<VolumeAnchor> {
+/// One cheap, password-independent fact per catalog row generation. Contention
+/// is per file, never on the catalog lock; failed reads remain retryable.
+pub(crate) type CheapAnchorCell = Arc<Mutex<Option<Arc<VolumeAnchor>>>>;
+
+pub(crate) fn probe_volume_anchor_records_cheap(
+    records: &[(&str, u64, Option<&CheapAnchorCell>)],
+) -> Vec<Arc<VolumeAnchor>> {
     cheap_fast_probe_pool().install(|| {
         records
             .par_iter()
-            .map(|(path, size)| probe_path_cheap_direct(path, *size, None))
+            .map(|(path, size, cell)| {
+                let Some(cell) = cell else {
+                    return Arc::new(probe_path_cheap_direct(path, *size, None));
+                };
+                let mut cached = cell.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(anchor) = cached.as_ref() {
+                    return anchor.clone();
+                }
+                let anchor = Arc::new(probe_path_cheap_direct(path, *size, None));
+                if anchor.error.is_empty() {
+                    *cached = Some(anchor.clone());
+                }
+                anchor
+            })
             .collect()
     })
 }

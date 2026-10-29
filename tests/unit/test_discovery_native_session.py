@@ -173,10 +173,59 @@ def test_native_embedded_pages_scan_on_demand(tmp_path):
     path = tmp_path / "fake.zip"
     path.write_bytes(b"not an archive")
     table = build_native_table_for_targets([str(tmp_path)], config=make_config({}))
-    batch = table.scan_embedded(table.resolve(), include_residual_details=True)
+    routes = table.resolve()
+    batch = table.scan_embedded(routes, include_residual_details=False)
 
     path.unlink()
-    assert batch.scan_page(table, 0, 1)[0][2] == "embedded_scan_io_error"
+    row, = batch.scan_page(table, 0, 1)
+    assert row[1:3] == (2, "embedded_scan_io_error") and row[3]["error"]
+    from sunpack.core.contracts.failures import FailureKind
+    from sunpack.pipeline.coordinator.task_provider import ArchiveTaskProvider
+    provider = ArchiveTaskProvider(make_config({}))
+    session = DiscoveryScanSession(config=provider.config)
+    result = provider.discovery.embedded.discover_native(table, routes, session, include_details=False)
+    assert result.blocked_paths and not result.residual_paths
+    provider._record_discovery_failures(result, session)
+    failure, = provider.failed_candidate_failures
+    assert failure.kind == FailureKind.FILESYSTEM_ERROR
+    assert failure.details["path"] == str(path) and failure.message == row[3]["error"]
+
+    # Detection's cached read failure must also survive a later policy gate.
+    import gzip
+    path.write_bytes(gzip.compress(b"payload"))
+    table = build_native_table_for_targets([str(path)], config=provider.config)
+    path.unlink()
+    routes = table.resolve(include_residual_details=False)
+    batch = table.scan_embedded(routes, enabled=False, include_residual_details=False)
+    row, = batch.scan_page(table, 0, 1)
+    assert row[1:3] == (2, "embedded_scan_io_error") and row[3]["error"]
+
+
+def test_spilled_signature_noise_preserves_carrier_peers_concurrently(tmp_path):
+    # Small carrier fixtures never cross spill/merge storage. A stored ZIP owns
+    # dense inner noise, and a later gzip must survive both spill paths without
+    # leaking inner signatures as peers or losing cross-chunk evidence.
+    import gzip
+    from sunpack_native import scan_embedded_archives
+    footer = lzma.compress(b"")[-12:]
+    payload = (b"\x28\xb5\x2f\xfd\xff" + footer) * 1_000_000
+    packed = BytesIO()
+    with zipfile.ZipFile(packed, "w", compression=zipfile.ZIP_STORED) as archive:
+        archive.writestr("payload.bin", payload)
+    prefix, gap = b"invalid prefix", b"invalid gap"
+    zip_data = packed.getvalue()
+    peer = gzip.compress(b"peer")
+    path = tmp_path / "carrier.photo"
+    path.write_bytes(prefix + zip_data + gap + peer + b"invalid suffix")
+    def scan(_):
+        result = scan_embedded_archives(str(path))
+        assert [(row["format"], row["offset"], row["end_offset"]) for row in result["candidates"]] == [
+            ("zip", len(prefix), len(prefix) + len(zip_data)),
+            ("gzip", len(prefix) + len(zip_data) + len(gap), len(prefix) + len(zip_data) + len(gap) + len(peer)),
+        ]
+        assert result["raw_hit_count"] >= 1_000_000
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(scan, range(2)))
 
 
 def test_native_head_fact_cache_accepts_concurrent_reads(tmp_path):

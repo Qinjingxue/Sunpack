@@ -102,8 +102,7 @@ struct ScanJob {
 // completion port never accesses it after the owner removes it from pending.
 unsafe impl Send for IocpSlot {}
 
-pub(crate) struct IocpScanOutput<T> {
-    pub(crate) results: Vec<T>,
+pub(crate) struct IocpScanOutput {
     pub(crate) discarded_results: usize,
     pub(crate) read_bytes: u64,
     pub(crate) read_operations: u64,
@@ -330,12 +329,13 @@ fn cancel_pending(handles: &IocpHandles, pending: &mut HashMap<usize, Box<IocpSl
     }
 }
 
-/// Run a bounded overlapped sequential scan and return the worker results.
+/// Run a bounded overlapped sequential scan, handing each completed batch to
+/// the caller before recycling its buffer. Result storage belongs to the sink.
 ///
 /// `scan` receives a buffer containing `leading_overlap` bytes before the
 /// visible chunk.  It may return results in any order; the caller is expected
 /// to sort offsets after this function returns.
-pub(crate) fn scan_file<T, F>(
+pub(crate) fn scan_file<T, F, C>(
     path: &Path,
     file_size: u64,
     chunk_bytes: usize,
@@ -343,14 +343,15 @@ pub(crate) fn scan_file<T, F>(
     requested_worker_count: usize,
     overlap: usize,
     scan: F,
-) -> io::Result<IocpScanOutput<T>>
+    mut collect: C,
+) -> io::Result<IocpScanOutput>
 where
     T: Send,
     F: Fn(&[u8], usize, u64) -> ScanBatch<T> + Send + Sync,
+    C: FnMut(Vec<T>) -> io::Result<()> + Send,
 {
     if file_size == 0 {
         return Ok(IocpScanOutput {
-            results: Vec::new(),
             discarded_results: 0,
             read_bytes: 0,
             read_operations: 0,
@@ -379,7 +380,7 @@ where
 
     // Producers stay on their calling threads. A separate shared pool runs
     // finite matching jobs, so concurrent Rayon producers cannot starve them.
-    let result = scan_pool().in_place_scope(|scope| -> io::Result<IocpScanOutput<T>> {
+    let result = scan_pool().in_place_scope(|scope| -> io::Result<IocpScanOutput> {
         // Read slots stay owned by the IOCP producer. Completed bytes move to
         // independent scan jobs, so the slot can issue its next predicted
         // sequential read without waiting for matching to finish.
@@ -395,7 +396,6 @@ where
             .collect::<Vec<_>>();
         let mut next_base = 0u64;
         let mut scan_jobs = 0usize;
-        let mut all_results = Vec::new();
         let mut discarded_results = 0;
         let mut initial_error = None;
         for _ in 0..buffer_count {
@@ -432,7 +432,10 @@ where
                     Ok((buffer, hits)) => {
                         scan_jobs = scan_jobs.saturating_sub(1);
                         discarded_results += hits.discarded_results;
-                        all_results.extend(hits.results);
+                        if let Err(error) = collect(hits.results) {
+                            fatal_error = Some(error);
+                            break;
+                        }
                         available_buffers.push(buffer);
                     }
                     Err(mpsc::TryRecvError::Empty) => break,
@@ -499,7 +502,10 @@ where
                         job.read_start,
                     );
                     discarded_results += hits.discarded_results;
-                    all_results.extend(hits.results);
+                    if let Err(error) = collect(hits.results) {
+                        fatal_error = Some(error);
+                        break;
+                    }
                     available_buffers.push(job.buffer);
                     continue;
                 }
@@ -576,7 +582,6 @@ where
         }
 
         Ok(IocpScanOutput {
-            results: all_results,
             discarded_results,
             read_bytes: expected_read_bytes,
             read_operations: expected_read_operations,
@@ -617,6 +622,7 @@ mod tests {
             .num_threads(1)
             .build()
             .unwrap();
+        let mut actual = Vec::new();
         let output = pool
             .install(|| {
                 scan_file(
@@ -633,6 +639,10 @@ mod tests {
                             discarded_results: 0,
                         }
                     },
+                    |batch| {
+                        actual.extend(batch);
+                        Ok(())
+                    },
                 )
             })
             .unwrap();
@@ -641,7 +651,6 @@ mod tests {
             .step_by(chunk_bytes)
             .map(|offset| offset as u64)
             .collect::<Vec<_>>();
-        let mut actual = output.results;
         actual.sort_unstable();
         assert_eq!(actual, expected);
         assert_eq!(output.read_operations, expected.len() as u64);

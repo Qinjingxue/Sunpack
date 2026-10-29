@@ -105,19 +105,7 @@ class EmbeddedDiscovery:
                 )
                 continue
 
-            resolved, reason, findings = self._discover_candidate(candidate)
-            if resolved is None:
-                if reason in {
-                    "embedded_password_required",
-                    "embedded_wrong_password",
-                    "embedded_truncated",
-                }:
-                    result.findings.extend(findings)
-                    result.add_blocked(candidate, source="embedded", reason=reason)
-                else:
-                    result.add_residual(candidate, source="embedded", reason=reason)
-                continue
-            result.add_resolved(resolved, reason=reason)
+            self._discover_into(result, candidate)
 
         result.validate()
         return result
@@ -144,6 +132,14 @@ class EmbeddedDiscovery:
         result = StageResult()
         for offset in range(0, len(batch), 256):
             for index, status, reason, raw_scan in batch.scan_page(table, offset, 256):
+                if status == 2:
+                    entry_path, format_hint = table.summary(index)
+                    result.blocked_paths.update(table.path_keys(index))
+                    result.traces.append(DiscoveryTrace(
+                        entry_path=entry_path, source="embedded", status="blocked",
+                        format=format_hint, reason=reason, error=raw_scan["error"],
+                    ))
+                    continue
                 if status == 0:
                     entry_path, format_hint = table.summary(index)
                     result.residual_paths.update(table.path_keys(index))
@@ -157,24 +153,28 @@ class EmbeddedDiscovery:
                     continue
 
                 candidate = session.project_native_candidate(table, index)
-                resolved, reason, findings = self._discover_candidate(
-                    candidate,
-                    precomputed_scan=raw_scan,
-                )
-                if resolved is None:
-                    if reason in {
-                        "embedded_password_required",
-                        "embedded_wrong_password",
-                        "embedded_truncated",
-                    }:
-                        result.findings.extend(findings)
-                        result.add_blocked(candidate, source="embedded", reason=reason)
-                    elif include_details:
-                        result.add_residual(candidate, source="embedded", reason=reason)
-                else:
-                    result.add_resolved(resolved, reason=reason)
+                self._discover_into(result, candidate, raw_scan, include_details=include_details)
         result.validate()
         return result
+
+    def _discover_into(
+        self, result: StageResult, candidate: DiscoveryCandidate, precomputed_scan=None,
+        *, include_details: bool = True,
+    ) -> None:
+        try:
+            resolved, reason, findings = self._discover_candidate(
+                candidate, precomputed_scan=precomputed_scan,
+            )
+        except OSError as exc:
+            result.add_blocked(candidate, source="embedded", reason="embedded_scan_io_error", error=str(exc))
+            return
+        if resolved is not None:
+            result.add_resolved(resolved, reason=reason)
+        elif reason in {"embedded_password_required", "embedded_wrong_password", "embedded_truncated"}:
+            result.findings.extend(findings)
+            result.add_blocked(candidate, source="embedded", reason=reason)
+        elif include_details:
+            result.add_residual(candidate, source="embedded", reason=reason)
 
     def _discover_candidate(
         self,
@@ -186,20 +186,17 @@ class EmbeddedDiscovery:
         if not path:
             return None, "missing_or_empty_file", ()
         if precomputed_scan is None:
-            try:
-                if not self.options.force_scan and inspect_pe_image(path):
-                    return None, "embedded_executable_skipped", ()
-                identity = file_identity(path)
-                size = int(identity[1])
-                if size <= 0:
-                    return None, "missing_or_empty_file", ()
-                scan = scan_embedded_archives(
-                    path,
-                    expected_size=size,
-                    identity=identity,
-                ).to_dict()
-            except OSError:
-                return None, "embedded_scan_io_error", ()
+            if not self.options.force_scan and inspect_pe_image(path):
+                return None, "embedded_executable_skipped", ()
+            identity = file_identity(path)
+            size = int(identity[1])
+            if size <= 0:
+                return None, "missing_or_empty_file", ()
+            scan = scan_embedded_archives(
+                path,
+                expected_size=size,
+                identity=identity,
+            ).to_dict()
         else:
             scan = precomputed_scan
             size = int(scan["file_size"])
@@ -220,8 +217,8 @@ class EmbeddedDiscovery:
                     encrypted_offsets,
                     passwords,
                 )
-            except (OSError, RuntimeError, ValueError):
-                return None, "embedded_scan_io_error", ()
+            except (RuntimeError, ValueError) as exc:
+                raise OSError(str(exc)) from exc
             status = str(boundary.get("status") or "")
             resolved_rows = {
                 int(row["offset"]): (int(row["end_offset"]), str(row["password"]))
@@ -248,7 +245,7 @@ class EmbeddedDiscovery:
                     ),
                 )
             if status != "ok":
-                return None, "embedded_scan_io_error", ()
+                raise OSError(str(boundary.get("error") or "Unable to resolve encrypted archive boundary"))
             rewritten = []
             for item in scan["candidates"]:
                 resolved = resolved_rows.get(item["offset"])

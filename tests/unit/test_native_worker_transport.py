@@ -201,6 +201,46 @@ def test_sync_fatal_protocol_error_stops_process_before_failure_callback():
     assert order == ["stopped", "failed"]
 
 
+def test_sync_terminal_callback_can_resubmit_before_returning():
+    # Queue mocks finish on one thread. Force the loop/thread handoff while the
+    # stdout callback is still on the stack; without retirement it rejects the
+    # replacement job, and an unconditional old cleanup would delete it.
+    worker = object.__new__(_NativeWorkerProcess)
+    worker.process_config = {}
+    worker.worker_epoch = "test"
+    worker._async_jobs = {}
+    worker._job_states = {}
+    worker._dispatch_lock = threading.Lock()
+    worker._idle = threading.Condition(worker._dispatch_lock)
+    worker._closing = False
+    worker._shutdown_sent = False
+    worker.send = lambda _: None
+    failures = []
+    replacement = []
+
+    def terminal(line, event):
+        def resubmit():
+            try:
+                worker.submit_async("retry", "job", parsed_events=True,
+                    on_line=lambda line, event: True, on_error=failures.append)
+                replacement.append(worker._async_jobs["job"])
+            except Exception as exc:
+                failures.append(str(exc))
+        thread = threading.Thread(target=resubmit)
+        thread.start()
+        thread.join(2)
+        assert not thread.is_alive()
+        return True
+
+    worker.submit_async("request", "job", parsed_events=True,
+                        on_line=terminal, on_error=failures.append)
+    worker._dispatch_line("", _event("native_event", event="job_finished"), "job")
+    assert not failures and len(replacement) == 1
+    assert worker._async_jobs["job"] is replacement[0]
+    worker._dispatch_line("", _event("native_event", event="job_finished"), "job")
+    assert not worker._async_jobs and not worker._job_states
+
+
 @pytest.mark.parametrize("transport", ["sync", "async"])
 def test_queued_and_running_jobs_ignore_legacy_timeout_and_complete_on_native_events(tmp_path, transport):
     # Existing transport tests finish promptly and cannot catch a watchdog

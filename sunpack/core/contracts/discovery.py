@@ -59,6 +59,7 @@ class DiscoveryTrace:
     status: str
     format: str = ""
     reason: str = ""
+    error: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,7 +99,7 @@ class StageResult:
             reason=reason,
         ))
 
-    def add_blocked(self, candidate: DiscoveryCandidate, *, source: str, reason: str) -> None:
+    def add_blocked(self, candidate: DiscoveryCandidate, *, source: str, reason: str, error: str = "") -> None:
         self.blocked_paths.update(candidate.path_keys)
         self.traces.append(DiscoveryTrace(
             entry_path=candidate.entry_path,
@@ -106,6 +107,7 @@ class StageResult:
             status="blocked",
             format=candidate.format_hint,
             reason=reason,
+            error=error,
         ))
 
     def add_residual(self, candidate: DiscoveryCandidate, *, source: str, reason: str = "") -> None:

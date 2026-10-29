@@ -14,7 +14,7 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 use super::catalog::{catalog_stem, CatalogRow, NativeWatchObservation, ScopeCatalog};
 use crate::analysis_native::volume_anchor::{
     probe_volume_anchor_from_head, probe_volume_anchor_paths_cheap,
-    probe_volume_anchor_records_cheap, VolumeAnchor,
+    probe_volume_anchor_records_cheap, CheapAnchorCell, VolumeAnchor,
 };
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -26,7 +26,7 @@ pub(crate) struct DirectoryEntryRecord {
     #[serde(skip)]
     pub(super) relation_member_eligible: bool,
     #[serde(skip)]
-    pub(super) relation_anchor: Option<Box<VolumeAnchor>>,
+    pub(super) relation_anchor: Option<Arc<VolumeAnchor>>,
 }
 
 #[derive(Debug)]
@@ -37,7 +37,7 @@ pub(crate) struct DirectorySnapshotTable {
     pub(crate) sizes: Vec<Option<u64>>,
     mtimes_ns: Vec<Option<u64>>,
     pub(crate) relation_member_eligible: Vec<bool>,
-    pub(crate) relation_anchors: Vec<Option<Box<VolumeAnchor>>>,
+    pub(crate) relation_anchors: Vec<Option<Arc<VolumeAnchor>>>,
     pub(crate) file_routes: Vec<u8>,
 }
 
@@ -1312,35 +1312,45 @@ impl NativeDirectoryScanOptions {
         scope: &crate::scan::scope::NativeDiscoveryScope,
         seed: &str,
     ) -> PyResult<(Py<NativeDirectorySnapshot>, Py<NativeDirectorySnapshot>)> {
-        let mut raw: Vec<DirectoryEntryRecord> = {
-            let data = state.catalogs.lock().unwrap_or_else(|e| e.into_inner());
-            data.get(&crate::path_keys::path_key(&scope.root))
-                .into_iter()
-                .flat_map(|catalog| {
-                    catalog
-                        .buckets
-                        .get(catalog_stem(seed).as_str())
-                        .into_iter()
-                        .flat_map(|bucket| bucket.iter())
-                        .filter_map(|key| catalog.rows.get(key))
-                })
-                .map(|row| row.record())
-                .filter(|row| scope.contains(&row.path) && !state.is_owned(&row.path))
-                .collect()
-        };
         let root = Path::new(&scope.root);
-        let mut accepted = HashSet::new();
         let mut directory_cache = HashMap::new();
-        for row in &mut raw {
-            row.relation_member_eligible = scope.contains(&row.path)
-                && !file_under_rejected_directory(
-                    Path::new(&row.path),
-                    root,
-                    &self.options,
-                    &mut directory_cache,
-                )
-                && !file_rejected_by_path(Path::new(&row.path), root, &self.options)
-                && numeric_ranges_allow(&self.options.mtime_ranges, row.mtime_ns);
+        let (mut raw, cells): (Vec<DirectoryEntryRecord>, Vec<Option<CheapAnchorCell>>) = {
+            let mut data = state.catalogs.lock().unwrap_or_else(|e| e.into_inner());
+            let mut records = Vec::new();
+            let mut cells = Vec::new();
+            if let Some(catalog) = data.get_mut(&crate::path_keys::path_key(&scope.root)) {
+                if let Some(bucket) = catalog.buckets.get(catalog_stem(seed).as_str()) {
+                    for key in bucket.iter() {
+                        let Some(row) = catalog.rows.get_mut(key) else {
+                            continue;
+                        };
+                        let mut record = row.record();
+                        if scope.contains(&record.path) && !state.is_owned(&record.path) {
+                            record.relation_member_eligible = !file_under_rejected_directory(
+                                Path::new(&record.path),
+                                root,
+                                &self.options,
+                                &mut directory_cache,
+                            ) && !file_rejected_by_path(
+                                Path::new(&record.path),
+                                root,
+                                &self.options,
+                            ) && numeric_ranges_allow(
+                                &self.options.mtime_ranges,
+                                record.mtime_ns,
+                            );
+                            cells.push(record.relation_member_eligible.then(|| {
+                                Arc::clone(row.cheap_anchor.get_or_insert_with(Default::default))
+                            }));
+                            records.push(record);
+                        }
+                    }
+                }
+            }
+            (records, cells)
+        };
+        let mut accepted = HashSet::new();
+        for row in &raw {
             if row.relation_member_eligible
                 && numeric_ranges_allow(&self.options.size_ranges, row.size)
             {
@@ -1360,7 +1370,7 @@ impl NativeDirectoryScanOptions {
             })
             .cloned()
             .collect();
-        py.detach(|| populate_relation_anchors(&mut raw));
+        py.detach(|| populate_relation_anchors_cached(&mut raw, &cells));
         let (filtered, raw) =
             NativeDirectorySnapshot::from_views(filtered, raw, DirectoryReadErrors::report());
         Ok((Py::new(py, filtered)?, Py::new(py, raw)?))
@@ -1795,7 +1805,7 @@ fn build_inventory_snapshot_views(
         }
         let item = &files[item_index];
         if item.magic.len() >= item.size.min(512) as usize {
-            record.relation_anchor = Some(Box::new(probe_volume_anchor_from_head(
+            record.relation_anchor = Some(Arc::new(probe_volume_anchor_from_head(
                 &record.path,
                 item.size,
                 &item.magic,
@@ -2631,6 +2641,13 @@ fn normalize_extensions(extensions: Vec<String>) -> HashSet<String> {
 }
 
 fn populate_relation_anchors(records: &mut [DirectoryEntryRecord]) {
+    populate_relation_anchors_cached(records, &[]);
+}
+
+fn populate_relation_anchors_cached(
+    records: &mut [DirectoryEntryRecord],
+    cells: &[Option<CheapAnchorCell>],
+) {
     let eligible_indices: Vec<usize> = records
         .iter()
         .enumerate()
@@ -2648,7 +2665,11 @@ fn populate_relation_anchors(records: &mut [DirectoryEntryRecord]) {
     for &index in &eligible_indices {
         let record = &records[index];
         if let Some(size) = record.size {
-            known_size_inputs.push((record.path.as_str(), size));
+            known_size_inputs.push((
+                record.path.as_str(),
+                size,
+                cells.get(index).and_then(Option::as_ref),
+            ));
         } else {
             unknown_size_inputs.push(record.path.clone());
         }
@@ -2660,9 +2681,9 @@ fn populate_relation_anchors(records: &mut [DirectoryEntryRecord]) {
         let anchor = if records[index].size.is_some() {
             known_anchors.next()
         } else {
-            unknown_anchors.next()
+            unknown_anchors.next().map(Arc::new)
         };
-        records[index].relation_anchor = anchor.map(Box::new);
+        records[index].relation_anchor = anchor;
     }
 }
 
