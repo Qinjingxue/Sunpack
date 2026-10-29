@@ -470,6 +470,15 @@ void check_prefetch_virtual_inputs()
         stream->Seek(0, FILE_BEGIN, nullptr);
         correct &= stream->Read(bytes, 1, &read) == S_OK && read == 1;
         check(correct, "single-file double buffers preserve bytes across windows, fallback, EOF and seek");
+        // The decoder handle must be lazily repositioned on a cache miss:
+        // one direct byte, one prefetched window, then a request exceeding
+        // both available windows without an intervening Seek.
+        stream->Seek(0, FILE_BEGIN, nullptr);
+        bool lazy_sync = stream->Read(bytes, 1, &read) == S_OK && read == 1;
+        lazy_sync &= stream->Read(bytes + 1, 64, &read) == S_OK && read == 64;
+        lazy_sync &= stream->Read(bytes + 65, 192, &read) == S_OK && read == 192;
+        check(lazy_sync && !std::memcmp(bytes, payload, 257),
+              "prefetch hit followed by direct fallback keeps the logical file offset");
         // Both the seek above and destruction below can retire live requests.
         const std::wstring path = first.wstring();
         OverlappedPrefetcher short_read({true, 64}, 321,
