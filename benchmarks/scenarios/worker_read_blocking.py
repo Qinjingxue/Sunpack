@@ -3,8 +3,8 @@
 The generated archive is a ZIP stored without compression, so its input size
 is approximately the requested payload size and 7z.dll must fetch every byte
 through ``IInStream::Read``. The worker opt-in timer surrounds only the
-underlying synchronous ``ReadFile`` calls, not decompression, output writes,
-or Python protocol handling.
+underlying ``ReadFile`` calls (including OVERLAPPED submission), not
+decompression, output writes, or Python protocol handling.
 """
 from __future__ import annotations
 
@@ -81,12 +81,11 @@ def _run_case(
     sample_interval: float,
     prefetch_enabled: bool,
     prefetch_window_kib: int,
-    prefetch_depth: int,
     run_start: int = 0,
 ) -> list[dict[str, Any]]:
     prior_environment = {
         name: os.environ.get(name)
-        for name in ("SUNPACK_SEVENZIP_PROFILE_READS", "SUNPACK_SEVENZIP_PREFETCH", "SUNPACK_SEVENZIP_PREFETCH_WINDOW_KIB", "SUNPACK_SEVENZIP_PREFETCH_DEPTH")
+        for name in ("SUNPACK_SEVENZIP_PROFILE_READS", "SUNPACK_SEVENZIP_PREFETCH", "SUNPACK_SEVENZIP_PREFETCH_WINDOW_KIB")
     }
     worker: _NativeWorkerProcess | None = None
     sampler = ProcessSampler(interval_seconds=sample_interval)
@@ -97,7 +96,6 @@ def _run_case(
         os.environ["SUNPACK_SEVENZIP_PROFILE_READS"] = "1"
         os.environ["SUNPACK_SEVENZIP_PREFETCH"] = "1" if prefetch_enabled else "0"
         os.environ["SUNPACK_SEVENZIP_PREFETCH_WINDOW_KIB"] = str(prefetch_window_kib)
-        os.environ["SUNPACK_SEVENZIP_PREFETCH_DEPTH"] = str(prefetch_depth)
         worker = _NativeWorkerProcess(str(worker_path), None)
         sampler.start()
         sampling = True
@@ -116,7 +114,6 @@ def _run_case(
                 "payload_bytes": payload_bytes,
                 "prefetch_enabled": prefetch_enabled,
                 "prefetch_window_kib": prefetch_window_kib,
-                "prefetch_depth": prefetch_depth,
             })
             rows.append(measured)
     finally:
@@ -139,7 +136,7 @@ def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         "input_read_file_max_wall_ms", "input_read_file_wall_ratio", "input_prefetch_enabled",
         "input_prefetch_hit_count", "input_prefetch_miss_count", "input_prefetch_invalidation_count",
         "input_prefetch_consumer_wait_ms", "input_consumer_read_blocking_ms", "prefetch_enabled",
-        "prefetch_window_kib", "prefetch_depth", "bytes_written", "files_written",
+        "prefetch_window_kib", "bytes_written", "files_written",
     ]
     with path.open("w", encoding="utf-8", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=columns, extrasaction="ignore")
@@ -154,7 +151,6 @@ def main() -> int:
     parser.add_argument("--runs", type=int, default=1)
     parser.add_argument("--prefetch", choices=("on", "off", "compare"), default="compare")
     parser.add_argument("--prefetch-window-kib", type=int, default=512)
-    parser.add_argument("--prefetch-depth", type=int, default=2)
     parser.add_argument("--timeout-seconds", type=float, default=900.0)
     parser.add_argument("--sample-interval", type=float, default=0.02)
     parser.add_argument("--results-root", type=Path)
@@ -165,8 +161,8 @@ def main() -> int:
         parser.error("--payload-gib and --runs must be positive")
     if args.timeout_seconds <= 0 or args.sample_interval <= 0:
         parser.error("--timeout-seconds and --sample-interval must be positive")
-    if not 64 <= args.prefetch_window_kib <= 16 * 1024 or not 1 <= args.prefetch_depth <= 8:
-        parser.error("--prefetch-window-kib must be 64..16384 and --prefetch-depth must be 1..8")
+    if not 64 <= args.prefetch_window_kib <= 16 * 1024:
+        parser.error("--prefetch-window-kib must be 64..16384")
 
     worker_path = Path(get_sevenzip_bridge_worker_path()).resolve()
     dll_path = Path(get_7z_cli_dll_path()).resolve()
@@ -203,7 +199,6 @@ def main() -> int:
                     sample_interval=args.sample_interval,
                     prefetch_enabled=mode == "on",
                     prefetch_window_kib=args.prefetch_window_kib,
-                    prefetch_depth=args.prefetch_depth,
                     run_start=run_start,
                 ))
         by_prefetch = {
@@ -234,17 +229,17 @@ def main() -> int:
                 "timeout_seconds": args.timeout_seconds,
                 "prefetch": args.prefetch,
                 "prefetch_window_kib": args.prefetch_window_kib,
-                "prefetch_depth": args.prefetch_depth,
+                "prefetch_buffers": 2,
             },
             "method": {
                 "input": source,
                 "archive": str(archive),
                 "archive_format": "zip",
                 "archive_compression": "store (-mx=0)" if source == "generated_stored_zip" else "user supplied",
-                "timed_region": "synchronous ReadFile calls made by IInStream::Read implementations",
+                "timed_region": "ReadFile calls, including OVERLAPPED submission, made by IInStream implementations",
                 "ratio": "sum(ReadFile wall time) / native worker job wall time",
                 "cache_caveat": "Windows file-cache state is not purged or controlled; generated archives are likely warm. Use --archive with a representative pre-existing archive for a production-cache-state sample.",
-                "prefetch_comparison": "Consumer blocking is synchronous ReadFile time plus wait for prefetch; background ReadFile may overlap output work and is not added to that metric.",
+                "prefetch_comparison": "Consumer blocking includes direct ReadFile and OVERLAPPED submission time plus completion waits and buffer copies. Pending OS I/O can overlap decoding between stream reads.",
             },
             "environment": {"worker_path": str(worker_path), "python": sys.version, "cpu_count": os.cpu_count()},
             "results": rows,

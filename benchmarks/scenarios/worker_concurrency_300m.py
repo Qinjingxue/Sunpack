@@ -237,7 +237,8 @@ def main():
     parser.add_argument("--writer-threads", type=int, choices=range(1, 9), help="Diagnostic: override writers per volume")
     parser.add_argument("--no-mixed", action="store_true", help="Only homogeneous format batches")
     parser.add_argument("--profile", action="store_true")
-    parser.add_argument("--prefetch", choices=("on", "off"), default="on", help="Use the product's format-aware prefetch policy by default")
+    parser.add_argument("--prefetch", choices=("default", "on", "off"), default="default",
+                        help="Use the production format policy by default; on/off forces an override")
     parser.add_argument("--dry-run", action="store_true", help="Diagnostic: decode/verify without output writes; compare 7z t")
     parser.add_argument("--resume", action="store_true", help="Reuse completed paired batches with identical binary/settings fingerprints")
     parser.add_argument("--cache-root", type=Path, default=ROOT / "benchmarks/.cache/worker-concurrency-300m")
@@ -250,7 +251,10 @@ def main():
     seven, dll = require_7z().resolve(), Path(get_7z_cli_dll_path()).resolve()
     os.environ["SUNPACK_SEVENZIP_PROFILE_READS"] = "1" if args.profile else "0"
     os.environ["SUNPACK_SEVENZIP_PROFILE_PIPELINE"] = "1" if args.profile else "0"
-    os.environ["SUNPACK_SEVENZIP_PREFETCH"] = "1" if args.prefetch == "on" else "0"
+    if args.prefetch == "default":
+        os.environ.pop("SUNPACK_SEVENZIP_PREFETCH", None)
+    else:
+        os.environ["SUNPACK_SEVENZIP_PREFETCH"] = "1" if args.prefetch == "on" else "0"
     with BenchmarkWorkspace("extraction.worker-concurrency-300m") as workspace:
         cases, corpus = prepare(workspace, args.cache_root.resolve())
         tar_bytes = next(_volume_paths(c["item"])[0].stat().st_size for c in cases if c["format"] == "tar")

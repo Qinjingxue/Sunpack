@@ -393,7 +393,6 @@ def _run_case(
     sample_interval: float,
     prefetch_enabled: bool,
     prefetch_window_kib: int,
-    prefetch_depth: int,
     run_start: int = 0,
     copy_slots: list[Path] | None = None,
 ) -> list[dict[str, Any]]:
@@ -404,7 +403,6 @@ def _run_case(
             "SUNPACK_SEVENZIP_PROFILE_PIPELINE",
             "SUNPACK_SEVENZIP_PREFETCH",
             "SUNPACK_SEVENZIP_PREFETCH_WINDOW_KIB",
-            "SUNPACK_SEVENZIP_PREFETCH_DEPTH",
         )
     }
     worker: _NativeWorkerProcess | None = None
@@ -416,7 +414,6 @@ def _run_case(
         os.environ["SUNPACK_SEVENZIP_PROFILE_PIPELINE"] = "1"
         os.environ["SUNPACK_SEVENZIP_PREFETCH"] = "1" if prefetch_enabled else "0"
         os.environ["SUNPACK_SEVENZIP_PREFETCH_WINDOW_KIB"] = str(prefetch_window_kib)
-        os.environ["SUNPACK_SEVENZIP_PREFETCH_DEPTH"] = str(prefetch_depth)
         worker = _NativeWorkerProcess(str(worker_path), None)
         sampler.start()
         sampling = True
@@ -506,10 +503,9 @@ def main() -> int:
         "--prefetch",
         choices=("on", "off", "compare"),
         default="on",
-        help="Enable prefetch subject to the production format policy, disable it, or compare both.",
+        help="Force prefetch on, force it off, or compare both.",
     )
     parser.add_argument("--prefetch-window-kib", type=int, default=512)
-    parser.add_argument("--prefetch-depth", type=int, default=2)
     parser.add_argument(
         "--copy-to",
         type=Path,
@@ -533,8 +529,8 @@ def main() -> int:
         parser.error("--runs, --small-files, --large-files, and --large-file-mib must be positive")
     if args.timeout_seconds <= 0 or args.sample_interval <= 0:
         parser.error("--timeout-seconds and --sample-interval must be positive")
-    if not 64 <= args.prefetch_window_kib <= 16 * 1024 or not 1 <= args.prefetch_depth <= 8:
-        parser.error("--prefetch-window-kib must be 64..16384 and --prefetch-depth must be 1..8")
+    if not 64 <= args.prefetch_window_kib <= 16 * 1024:
+        parser.error("--prefetch-window-kib must be 64..16384")
     formats = list(dict.fromkeys(args.formats)) if args.formats else list(GENERATED_FORMATS)
     seven_zip_variants = set(args.seven_zip_variants or ("solid", "non-solid"))
     if args.large_content != "mixed" and not args.archive and not set(formats) <= {"7z", "rar4", "rar-split", "tar"}:
@@ -621,7 +617,6 @@ def main() -> int:
                                     sample_interval=args.sample_interval,
                                     prefetch_enabled=mode == "on",
                                     prefetch_window_kib=args.prefetch_window_kib,
-                                    prefetch_depth=args.prefetch_depth,
                                     run_start=run,
                                     copy_slots=copy_slots,
                                 ))
@@ -636,7 +631,6 @@ def main() -> int:
                             sample_interval=args.sample_interval,
                             prefetch_enabled=args.prefetch == "on",
                             prefetch_window_kib=args.prefetch_window_kib,
-                            prefetch_depth=args.prefetch_depth,
                             copy_slots=copy_slots,
                         ))
                 except Exception as exc:
@@ -671,13 +665,13 @@ def main() -> int:
                 "seven_zip_variants": sorted(seven_zip_variants),
                 "payload": corpus_info.get("payload"),
                 "explicit_archives": [case["case_id"] for case in cases] if args.archive else [],
-                "prefetch": {"mode": args.prefetch, "window_kib": args.prefetch_window_kib, "depth": args.prefetch_depth},
+                "prefetch": {"mode": args.prefetch, "window_kib": args.prefetch_window_kib, "buffers": 2},
                 },
                 "method": {
-                    "timed_region": "synchronous ReadFile calls within native IInStream implementations",
+                    "timed_region": "ReadFile calls, including OVERLAPPED submission, within native IInStream implementations",
                     "logical_trace": "successful IInStream reads and seeks requested by 7z.dll",
-                    "prefetch_caveat": "The on mode enables prefetch where the production format policy permits it. Consumer blocking is synchronous ReadFile time plus any wait for the current prefetch epoch; background ReadFile time is intentionally not added because it can overlap decompression.",
-                    "decoder_verdict": "A prefetch miss means the consumer had to read the file itself and the prefetch epoch was discarded; misses beyond the few non-window-aligned reads (archive tails, header probes) indicate decoder starvation.",
+                    "prefetch_caveat": "The on mode explicitly enables double buffering. Consumer blocking includes direct ReadFile and OVERLAPPED submission time plus completion waits and buffer copies; pending OS I/O between decoder reads is not timed directly.",
+                    "decoder_verdict": "A prefetch miss uses the direct input path. Header probes, tails and requests exceeding the two available source windows can legitimately miss.",
                 },
                 "environment": {
                     "worker_path": str(worker_path),

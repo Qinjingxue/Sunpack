@@ -12,9 +12,9 @@
 
 #include <algorithm>
 
-#include <chrono>
+#include <array>
 
-#include <condition_variable>
+#include <chrono>
 
 #include <cstring>
 
@@ -24,15 +24,9 @@
 
 #include <functional>
 
-#include <map>
-
 #include <memory>
 
-#include <mutex>
-
 #include <string>
-
-#include <thread>
 
 #include <utility>
 
@@ -59,7 +53,6 @@ namespace sunpack::sevenzip
     {
         bool enabled = true;
         UInt32 window_bytes = 512 * 1024;
-        std::size_t depth = 2;
     };
 
     inline InputPrefetchConfig input_prefetch_config() noexcept
@@ -79,14 +72,6 @@ namespace sunpack::sevenzip
                     value.window_bytes = static_cast<UInt32>(parsed * 1024);
                 }
             }
-            if (const char *depth = std::getenv("SUNPACK_SEVENZIP_PREFETCH_DEPTH"))
-            {
-                const unsigned long parsed = std::strtoul(depth, nullptr, 10);
-                if (parsed >= 1 && parsed <= 8)
-                {
-                    value.depth = static_cast<std::size_t>(parsed);
-                }
-            }
             return value;
         }();
         return config;
@@ -97,7 +82,8 @@ namespace sunpack::sevenzip
         bool native_volume_input) noexcept
     {
         InputPrefetchConfig config = input_prefetch_config();
-        if (!config.enabled || format_hint.empty())
+        // Explicit process-level overrides are also used by paired benchmarks.
+        if (!config.enabled || format_hint.empty() || std::getenv("SUNPACK_SEVENZIP_PREFETCH"))
         {
             return config;
         }
@@ -110,13 +96,10 @@ namespace sunpack::sevenzip
                 character = static_cast<wchar_t>(character - L'A' + L'a');
             }
         }
-        if (normalized == L"lz4" &&
-            std::getenv("SUNPACK_SEVENZIP_PREFETCH") == nullptr)
-        {
-            config.enabled = false;
-        }
-
-        if (normalized == L"tar" ||
+        // Cached-read A/B: these formats do not consistently recover the cost
+        // of speculative reads/copies. Keep their direct input path by default.
+        if (normalized == L"gz" || normalized == L"gzip" || normalized == L"xz" ||
+            normalized == L"lz4" || normalized == L"zst" || normalized == L"zstd" || normalized == L"tar" ||
             (native_volume_input &&
              (normalized == L"rar" || normalized == L"rar4" || normalized == L"rar5")))
         {
@@ -124,377 +107,6 @@ namespace sunpack::sevenzip
         }
         return config;
     }
-
-    // Opened once per file and reused; the handle carries its own file cursor and is owned by exactly one thread that reads sequentially.
-    // Streams that also serve the embedded 7-Zip decoder keep a second,
-    // independent handle for decoder driven Seek/Read calls.
-    class [[nodiscard]] PathHandle final
-    {
-    public:
-        explicit PathHandle(const std::wstring &path) noexcept
-            : handle_(CreateFileW(win32_extended_path(path).c_str(), GENERIC_READ,
-                                  FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                                  nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr)),
-              open_error_(handle_ == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS) {}
-
-        PathHandle(const PathHandle &) = delete;
-        PathHandle &operator=(const PathHandle &) = delete;
-        PathHandle(PathHandle &&) = delete;
-        PathHandle &operator=(PathHandle &&) = delete;
-
-        ~PathHandle() { close(); }
-
-        bool valid() const noexcept { return handle_ != INVALID_HANDLE_VALUE; }
-
-        // Win32 error of the failed open, so callers report the real reason.
-        DWORD open_error() const noexcept { return open_error_; }
-
-        // Reads directly at the requested offset; the caller's own position is not part of the contract.
-        HRESULT read_at(
-            UInt64 offset,
-            void *data,
-            UInt32 size,
-            UInt32 *processed
-#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
-            , PipelineTiming *pipeline_timing = nullptr
-#endif
-            ) noexcept
-        {
-            if (processed)
-            {
-                *processed = 0;
-            }
-            if (handle_ == INVALID_HANDLE_VALUE)
-            {
-                return HRESULT_FROM_WIN32(open_error_ != ERROR_SUCCESS ? open_error_ : ERROR_INVALID_HANDLE);
-            }
-            LARGE_INTEGER distance{};
-            distance.QuadPart = static_cast<LONGLONG>(offset);
-            if (!SetFilePointerEx(handle_, distance, nullptr, FILE_BEGIN))
-            {
-                return HRESULT_FROM_WIN32(GetLastError());
-            }
-            DWORD read = 0;
-#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
-            PipelineStageScope pipeline_scope(pipeline_timing, PipelineStage::Input);
-#endif
-            const BOOL ok = ReadFile(handle_, data, size, &read, nullptr);
-            if (!ok)
-            {
-                return HRESULT_FROM_WIN32(GetLastError());
-            }
-            if (processed)
-            {
-                *processed = read;
-            }
-            return S_OK;
-        }
-
-        void close() noexcept
-        {
-            if (handle_ != INVALID_HANDLE_VALUE)
-            {
-                CloseHandle(handle_);
-                handle_ = INVALID_HANDLE_VALUE;
-            }
-        }
-
-    private:
-        HANDLE handle_ = INVALID_HANDLE_VALUE;
-        DWORD open_error_ = ERROR_SUCCESS;
-    };
-
-    // One long lived handle per distinct path, opened on first use; only the owning thread touches a cache, never two at once.
-    // Failed opens are not remembered, so a file that is still locked when first probed is retried on the next read.
-    class PathHandleCache final
-    {
-    public:
-        PathHandleCache() = default;
-        PathHandleCache(const PathHandleCache &) = delete;
-        PathHandleCache &operator=(const PathHandleCache &) = delete;
-
-        HRESULT read_at(
-            const std::wstring &path,
-            UInt64 offset,
-            void *data,
-            UInt32 size,
-            UInt32 *processed
-#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
-            , PipelineTiming *pipeline_timing = nullptr
-#endif
-            ) noexcept
-        {
-            if (processed)
-            {
-                *processed = 0;
-            }
-            const auto found = handles_.find(path);
-            if (found != handles_.end())
-            {
-                return found->second->read_at(offset, data, size, processed
-#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
-                                              , pipeline_timing
-#endif
-                );
-            }
-            auto handle = std::make_unique<PathHandle>(path);
-            if (!handle->valid())
-            {
-                return HRESULT_FROM_WIN32(handle->open_error());
-            }
-            PathHandle *raw = handle.get();
-            handles_.emplace(path, std::move(handle));
-            return raw->read_at(offset, data, size, processed
-#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
-                                , pipeline_timing
-#endif
-            );
-        }
-
-    private:
-        std::map<std::wstring, std::unique_ptr<PathHandle>> handles_;
-    };
-
-    class SequentialPrefetcher final
-    {
-    public:
-        using Reader = std::function<HRESULT(UInt64, void *, UInt32, UInt32 *)>;
-
-        SequentialPrefetcher(InputPrefetchConfig config, UInt64 virtual_size, Reader reader)
-            : config_(config), virtual_size_(virtual_size), reader_(std::move(reader))
-        {
-            if (config_.enabled && virtual_size_)
-            {
-                worker_ = std::thread(&SequentialPrefetcher::worker_loop, this);
-            }
-            else
-            {
-                config_.enabled = false;
-            }
-        }
-
-        ~SequentialPrefetcher()
-        {
-            {
-                std::lock_guard lock(mutex_);
-                stopping_ = true;
-            }
-            ready_.notify_all();
-            if (worker_.joinable())
-            {
-                worker_.join();
-            }
-        }
-
-        bool enabled() const noexcept { return config_.enabled; }
-
-        bool consume(UInt64 offset, void *data, UInt32 size, ExtractInputTrace *trace)
-        {
-            if (!config_.enabled || size == 0)
-            {
-                return false;
-            }
-            const bool profiling = trace && read_file_timing_enabled();
-            const auto wait_started = profiling ? std::chrono::steady_clock::now()
-                                                : std::chrono::steady_clock::time_point{};
-            std::unique_lock lock(mutex_);
-            auto chunk = find_chunk_locked(offset, size);
-            if (chunk == chunks_.end())
-            {
-                if (profiling)
-                {
-                    ++trace->prefetch_miss_count;
-                }
-                return false;
-            }
-            const UInt64 epoch = chunk->epoch;
-            while ((chunk->state == ChunkState::Queued || chunk->state == ChunkState::Reading) && !stopping_ && epoch == epoch_)
-            {
-                ready_.wait(lock);
-                chunk = find_chunk_locked(offset, size);
-                if (chunk == chunks_.end())
-                {
-                    if (profiling)
-                    {
-                        ++trace->prefetch_miss_count;
-                        trace->prefetch_consumer_wait_ns += elapsed_ns(wait_started);
-                    }
-                    return false;
-                }
-            }
-            if (chunk->state != ChunkState::Ready || epoch != epoch_)
-            {
-                if (profiling)
-                {
-                    ++trace->prefetch_miss_count;
-                    trace->prefetch_consumer_wait_ns += elapsed_ns(wait_started);
-                }
-                return false;
-            }
-            std::memcpy(data, chunk->bytes.data() + static_cast<std::size_t>(offset - chunk->offset), size);
-            if (profiling)
-            {
-                ++trace->prefetch_hit_count;
-                trace->prefetch_consumer_wait_ns += elapsed_ns(wait_started);
-            }
-            return true;
-        }
-
-        void after_sync_read(UInt64 end)
-        {
-            if (!config_.enabled || end > virtual_size_)
-            {
-                return;
-            }
-            std::lock_guard lock(mutex_);
-            chunks_.erase(std::remove_if(chunks_.begin(), chunks_.end(), [end](const Chunk &chunk)
-                                         { return chunk.offset + chunk.size <= end; }),
-                          chunks_.end());
-            if (chunks_.empty())
-            {
-                next_offset_ = end;
-            }
-            active_ = true;
-            schedule_locked();
-            ready_.notify_all();
-        }
-
-        void after_cached_read(UInt64 end)
-        {
-            if (!config_.enabled)
-            {
-                return;
-            }
-            std::lock_guard lock(mutex_);
-            chunks_.erase(std::remove_if(chunks_.begin(), chunks_.end(), [end](const Chunk &chunk)
-                                         { return chunk.offset + chunk.size <= end; }),
-                          chunks_.end());
-            schedule_locked();
-            ready_.notify_all();
-        }
-
-        void invalidate(UInt64 next, ExtractInputTrace *trace)
-        {
-            if (!config_.enabled)
-            {
-                return;
-            }
-            std::lock_guard lock(mutex_);
-            if (!chunks_.empty() && trace && read_file_timing_enabled())
-            {
-                ++trace->prefetch_invalidation_count;
-            }
-            ++epoch_;
-            chunks_.clear();
-            next_offset_ = next;
-            active_ = false;
-            ready_.notify_all();
-        }
-
-    private:
-        enum class ChunkState
-        {
-            Queued,
-            Reading,
-            Ready,
-            Failed
-        };
-
-        struct Chunk
-        {
-            UInt64 epoch = 0;
-            UInt64 offset = 0;
-            UInt32 size = 0;
-            ChunkState state = ChunkState::Queued;
-            std::vector<unsigned char> bytes;
-        };
-
-        static unsigned long long elapsed_ns(std::chrono::steady_clock::time_point started) noexcept
-        {
-            const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count();
-            return elapsed > 0 ? static_cast<unsigned long long>(elapsed) : 0ULL;
-        }
-
-        std::vector<Chunk>::iterator find_chunk_locked(UInt64 offset, UInt32 size)
-        {
-            return std::find_if(chunks_.begin(), chunks_.end(), [offset, size](const Chunk &chunk)
-                                { return chunk.offset <= offset && offset + size <= chunk.offset + chunk.size; });
-        }
-
-        void schedule_locked()
-        {
-            if (!active_)
-            {
-                return;
-            }
-            while (chunks_.size() < config_.depth && next_offset_ < virtual_size_)
-            {
-                const UInt64 remaining = virtual_size_ - next_offset_;
-                const UInt32 size = static_cast<UInt32>(std::min<UInt64>(remaining, config_.window_bytes));
-                chunks_.push_back(Chunk{epoch_, next_offset_, size});
-                next_offset_ += size;
-            }
-        }
-
-        void worker_loop()
-        {
-            while (true)
-            {
-                UInt64 epoch = 0;
-                UInt64 offset = 0;
-                UInt32 size = 0;
-                {
-                    std::unique_lock lock(mutex_);
-                    ready_.wait(lock, [this]
-                                { return stopping_ || std::any_of(chunks_.begin(), chunks_.end(), [](const Chunk &chunk)
-                                                                  { return chunk.state == ChunkState::Queued; }); });
-                    if (stopping_)
-                    {
-                        return;
-                    }
-                    const auto chunk = std::find_if(chunks_.begin(), chunks_.end(), [](const Chunk &candidate)
-                                                    { return candidate.state == ChunkState::Queued; });
-                    epoch = chunk->epoch;
-                    offset = chunk->offset;
-                    size = chunk->size;
-                    chunk->state = ChunkState::Reading;
-                }
-                std::vector<unsigned char> bytes(size);
-                UInt32 read = 0;
-                const HRESULT result = reader_(offset, bytes.data(), size, &read);
-                {
-                    std::lock_guard lock(mutex_);
-                    const auto chunk = std::find_if(chunks_.begin(), chunks_.end(), [epoch, offset](const Chunk &candidate)
-                                                    { return candidate.epoch == epoch && candidate.offset == offset; });
-                    if (chunk != chunks_.end() && epoch == epoch_)
-                    {
-                        if (result == S_OK && read == size)
-                        {
-                            chunk->bytes = std::move(bytes);
-                            chunk->state = ChunkState::Ready;
-                        }
-                        else
-                        {
-                            chunk->state = ChunkState::Failed;
-                        }
-                    }
-                }
-                ready_.notify_all();
-            }
-        }
-
-        InputPrefetchConfig config_;
-        UInt64 virtual_size_ = 0;
-        Reader reader_;
-        std::mutex mutex_;
-        std::condition_variable ready_;
-        std::thread worker_;
-        std::vector<Chunk> chunks_;
-        UInt64 epoch_ = 0;
-        UInt64 next_offset_ = 0;
-        bool active_ = false;
-        bool stopping_ = false;
-    };
 
     class ReadFileWallTimer final
     {
@@ -579,6 +191,254 @@ namespace sunpack::sevenzip
         }
     }
 
+    struct PrefetchSource
+    {
+        const std::wstring *path = nullptr;
+        UInt64 offset = 0;
+        UInt64 length = 0;
+    };
+
+    // Single-consumer prefetch: two stable buffers and event-based OVERLAPPED
+    // reads. Submission, consumption and cancellation all run on the decoder
+    // thread; only the OS owns an in-flight buffer between Read calls.
+    class OverlappedPrefetcher final
+    {
+    public:
+        // Sources borrow immutable path/range metadata from the owning stream.
+        // Each slot clips its request at that source's end; no format probing
+        // or copying of the stream's volume/range table is needed here.
+        using Resolver = std::function<bool(UInt64, PrefetchSource &)>;
+
+        OverlappedPrefetcher(InputPrefetchConfig config, UInt64 size, Resolver resolver,
+                            ExtractInputTrace *trace = nullptr)
+            : window_bytes_(config.window_bytes), virtual_size_(size),
+              resolver_(std::move(resolver)), trace_(trace),
+              enabled_(config.enabled && config.window_bytes && size)
+        {
+            if (!enabled_) return;
+            for (auto &slot : slots_)
+            {
+                slot.overlapped.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+                if (!slot.overlapped.hEvent)
+                {
+                    close();
+                    return;
+                }
+            }
+        }
+
+        OverlappedPrefetcher(const OverlappedPrefetcher &) = delete;
+        OverlappedPrefetcher &operator=(const OverlappedPrefetcher &) = delete;
+        ~OverlappedPrefetcher() { close(); }
+
+        bool enabled() const noexcept { return enabled_; }
+
+        bool consume(UInt64 offset, void *data, UInt32 size, ExtractInputTrace *trace)
+        {
+            if (!enabled() || !size)
+            {
+                return false;
+            }
+            const bool profiling = trace && read_file_timing_enabled();
+            // A decoder read may straddle the two windows. Verify coverage
+            // before copying; an uncovered or short read uses the direct path.
+            UInt64 cursor = offset;
+            UInt32 remaining = size;
+            while (remaining)
+            {
+                Slot *slot = find(cursor);
+                if (!slot || slot->state == State::Failed)
+                {
+                    if (profiling) ++trace->prefetch_miss_count;
+                    return false;
+                }
+                const UInt32 count = static_cast<UInt32>(std::min<UInt64>(remaining, slot->offset + slot->size - cursor));
+                cursor += count;
+                remaining -= count;
+            }
+            const auto started = profiling ? std::chrono::steady_clock::now()
+                                           : std::chrono::steady_clock::time_point{};
+            cursor = offset;
+            remaining = size;
+            auto *destination = static_cast<unsigned char *>(data);
+            while (remaining)
+            {
+                Slot &slot = *find(cursor);
+                if (slot.state == State::Pending)
+                {
+                    DWORD read = 0;
+#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+                    PipelineStageScope input_scope(trace_ ? trace_->pipeline_timing : nullptr, PipelineStage::Input);
+#endif
+                    const BOOL ok = GetOverlappedResult(slot.handle, &slot.overlapped, &read, TRUE);
+                    slot.state = ok && read == slot.size ? State::Ready : State::Failed;
+                }
+                if (slot.state != State::Ready)
+                {
+                    if (profiling)
+                    {
+                        ++trace->prefetch_miss_count;
+                        trace->prefetch_consumer_wait_ns += elapsed_ns(started);
+                    }
+                    return false;
+                }
+                const auto displacement = static_cast<std::size_t>(cursor - slot.offset);
+                const UInt32 count = std::min<UInt32>(remaining, slot.size - static_cast<UInt32>(displacement));
+                std::memcpy(destination, slot.bytes.get() + displacement, count);
+                cursor += count;
+                destination += count;
+                remaining -= count;
+            }
+            if (profiling)
+            {
+                ++trace->prefetch_hit_count;
+                trace->prefetch_consumer_wait_ns += elapsed_ns(started);
+            }
+            return true;
+        }
+
+        void after_sync_read(UInt64 end) { advance(end); }
+        void after_cached_read(UInt64 end) { advance(end); }
+
+        void invalidate(UInt64 next, ExtractInputTrace *trace)
+        {
+            if (trace && read_file_timing_enabled() &&
+                std::any_of(slots_.begin(), slots_.end(), [](const Slot &slot) { return slot.state != State::Empty; }))
+            {
+                ++trace->prefetch_invalidation_count;
+            }
+            cancel();
+            next_offset_ = next;
+        }
+
+    private:
+        enum class State { Empty, Pending, Ready, Failed };
+        struct Slot
+        {
+            OVERLAPPED overlapped{};
+            HANDLE handle = INVALID_HANDLE_VALUE;
+            const std::wstring *path = nullptr;
+            std::unique_ptr<unsigned char[]> bytes;
+            UInt64 offset = 0;
+            UInt32 size = 0;
+            State state = State::Empty;
+        };
+
+        static unsigned long long elapsed_ns(std::chrono::steady_clock::time_point started) noexcept
+        {
+            return static_cast<unsigned long long>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - started).count());
+        }
+
+        Slot *find(UInt64 offset) noexcept
+        {
+            for (auto &slot : slots_)
+            {
+                if (slot.state != State::Empty && offset >= slot.offset && offset - slot.offset < slot.size)
+                    return &slot;
+            }
+            return nullptr;
+        }
+
+        static void drain(Slot &slot) noexcept
+        {
+            if (slot.state == State::Pending)
+            {
+                DWORD ignored = 0;
+                // CancelIoEx requests cancellation; completion still owns both
+                // OVERLAPPED and bytes until GetOverlappedResult has returned.
+                GetOverlappedResult(slot.handle, &slot.overlapped, &ignored, TRUE);
+            }
+            slot.state = State::Empty;
+        }
+
+        static void retire(Slot &slot) noexcept
+        {
+            if (slot.state == State::Pending) CancelIoEx(slot.handle, &slot.overlapped);
+            drain(slot);
+        }
+
+        void cancel() noexcept
+        {
+            // Request both cancellations before waiting for either completion.
+            for (auto &slot : slots_)
+                if (slot.state == State::Pending) CancelIoEx(slot.handle, &slot.overlapped);
+            for (auto &slot : slots_) drain(slot);
+        }
+
+        void close() noexcept
+        {
+            cancel();
+            for (auto &slot : slots_)
+            {
+                if (slot.overlapped.hEvent) CloseHandle(slot.overlapped.hEvent);
+                slot.overlapped.hEvent = nullptr;
+                if (slot.handle != INVALID_HANDLE_VALUE) CloseHandle(slot.handle);
+                slot.handle = INVALID_HANDLE_VALUE;
+                slot.path = nullptr;
+            }
+            enabled_ = false;
+        }
+
+        void advance(UInt64 end)
+        {
+            if (!enabled() || end > virtual_size_) return;
+            for (auto &slot : slots_)
+                if (slot.state != State::Empty && slot.offset + slot.size <= end) retire(slot);
+            if (std::all_of(slots_.begin(), slots_.end(), [](const Slot &slot) { return slot.state == State::Empty; }))
+                next_offset_ = end;
+            for (auto &slot : slots_)
+            {
+                if (slot.state != State::Empty || next_offset_ >= virtual_size_) continue;
+                PrefetchSource source;
+                if (!resolver_(next_offset_, source) || !source.path || !source.length) break;
+                if (slot.handle == INVALID_HANDLE_VALUE || slot.path != source.path)
+                {
+                    if (slot.handle != INVALID_HANDLE_VALUE) CloseHandle(slot.handle);
+                    slot.handle = CreateFileW(win32_extended_path(*source.path).c_str(), GENERIC_READ,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED, nullptr);
+                    slot.path = source.path;
+                    // Failed speculative opens remain recoverable: the direct
+                    // path reports the error, and a later read can try again.
+                    if (slot.handle == INVALID_HANDLE_VALUE) break;
+                }
+                if (!slot.bytes) slot.bytes.reset(new unsigned char[window_bytes_]);
+                const HANDLE event = slot.overlapped.hEvent;
+                slot.overlapped = {};
+                slot.overlapped.hEvent = event;
+                ResetEvent(event);
+                slot.offset = next_offset_;
+                slot.size = static_cast<UInt32>(std::min<UInt64>(window_bytes_,
+                    std::min<UInt64>(source.length, virtual_size_ - next_offset_)));
+                slot.overlapped.Offset = static_cast<DWORD>(source.offset);
+                slot.overlapped.OffsetHigh = static_cast<DWORD>(source.offset >> 32);
+                DWORD read = 0;
+                BOOL ok;
+                DWORD error = ERROR_SUCCESS;
+                {
+                    // Submission itself can block on cached Windows I/O; it
+                    // belongs in consumer blocking time as well as the wait.
+                    ReadFileWallTimer timer(trace_);
+                    ok = ReadFile(slot.handle, slot.bytes.get(), slot.size, &read, &slot.overlapped);
+                    if (!ok) error = GetLastError();
+                }
+                slot.state = ok ? (read == slot.size ? State::Ready : State::Failed)
+                                : (error == ERROR_IO_PENDING ? State::Pending : State::Failed);
+                next_offset_ += slot.size;
+            }
+        }
+
+        UInt32 window_bytes_;
+        UInt64 virtual_size_;
+        UInt64 next_offset_ = 0;
+        Resolver resolver_;
+        ExtractInputTrace *trace_;
+        bool enabled_;
+        // At most two file handles, even for thousands of volumes/ranges.
+        std::array<Slot, 2> slots_;
+    };
+
     class FileInStream final : public CMyUnknownImp, public IInStream
     {
         Z7_COM_UNKNOWN_IMP_2(ISequentialInStream, IInStream)
@@ -633,24 +493,12 @@ namespace sunpack::sevenzip
 
             if (size_ && prefetch_config.enabled)
             {
-                // A handle of its own, so prefetch offset reads never touch the decoder handle or its file cursor.
-                prefetch_reader_ = std::make_unique<PathHandle>(path_);
-                if (prefetch_reader_->valid())
-                {
-                    PathHandle *reader = prefetch_reader_.get();
-#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
-                    PipelineTiming *pipeline_timing = trace_ ? trace_->pipeline_timing : nullptr;
-                    prefetch_ = std::make_unique<SequentialPrefetcher>(prefetch_config, size_, [reader, pipeline_timing](UInt64 offset, void *data, UInt32 read_size, UInt32 *processed)
-                                                                       { return reader->read_at(offset, data, read_size, processed, pipeline_timing); });
-#else
-                    prefetch_ = std::make_unique<SequentialPrefetcher>(prefetch_config, size_, [reader](UInt64 offset, void *data, UInt32 read_size, UInt32 *processed)
-                                                                       { return reader->read_at(offset, data, read_size, processed); });
-#endif
-                }
-                else
-                {
-                    prefetch_reader_.reset();
-                }
+                prefetch_ = std::make_unique<OverlappedPrefetcher>(prefetch_config, size_,
+                    [this](UInt64 offset, PrefetchSource &source)
+                    {
+                        source = PrefetchSource{&path_, offset, size_ - offset};
+                        return true;
+                    }, trace_);
             }
             if (trace_ && read_file_timing_enabled())
             {
@@ -878,10 +726,7 @@ namespace sunpack::sevenzip
 
         UInt64 size_ = 0;
 
-        // Declared before the prefetcher so it outlives the prefetch thread.
-        std::unique_ptr<PathHandle> prefetch_reader_;
-
-        std::unique_ptr<SequentialPrefetcher> prefetch_;
+        std::unique_ptr<OverlappedPrefetcher> prefetch_;
     };
 
     class MultiFileInStream final : public CMyUnknownImp, public IInStream
@@ -939,8 +784,15 @@ namespace sunpack::sevenzip
 
             if (valid_ && total_size_ && prefetch_config.enabled)
             {
-                prefetch_ = std::make_unique<SequentialPrefetcher>(prefetch_config, total_size_, [this](UInt64 offset, void *data, UInt32 read_size, UInt32 *processed)
-                                                                   { return read_prefetch_at(offset, data, read_size, processed); });
+                prefetch_ = std::make_unique<OverlappedPrefetcher>(prefetch_config, total_size_,
+                    [this](UInt64 offset, PrefetchSource &source)
+                    {
+                        const std::size_t index = find_part_index(offset);
+                        if (index >= paths_.size()) return false;
+                        const UInt64 part_offset = offset - offsets_[index];
+                        source = PrefetchSource{&paths_[index], part_offset, sizes_[index] - part_offset};
+                        return true;
+                    }, trace_);
             }
             if (trace_ && read_file_timing_enabled())
             {
@@ -1277,53 +1129,6 @@ namespace sunpack::sevenzip
             return S_OK;
         }
 
-        HRESULT read_prefetch_at(UInt64 offset, void *data, UInt32 size, UInt32 *processed) const
-        {
-            if (processed)
-            {
-                *processed = 0;
-            }
-            auto *out = static_cast<unsigned char *>(data);
-            UInt32 total_read = 0;
-            while (total_read < size && offset < total_size_)
-            {
-                const std::size_t index = find_part_index(offset);
-                if (index >= paths_.size())
-                {
-                    break;
-                }
-                const UInt64 part_offset = offset - offsets_[index];
-                const UInt64 remaining = sizes_[index] - part_offset;
-                const UInt32 want = static_cast<UInt32>(std::min<UInt64>(size - total_read, remaining));
-                UInt32 read = 0;
-                const HRESULT result = prefetch_handles_.read_at(
-                    paths_[index],
-                    part_offset,
-                    out + total_read,
-                    want,
-                    &read
-#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
-                    , trace_ ? trace_->pipeline_timing : nullptr
-#endif
-                    );
-                if (result != S_OK)
-                {
-                    return result;
-                }
-                total_read += read;
-                offset += read;
-                if (read != want)
-                {
-                    break;
-                }
-            }
-            if (processed)
-            {
-                *processed = total_read;
-            }
-            return S_OK;
-        }
-
         void close_cached_handle()
         {
 
@@ -1361,10 +1166,7 @@ namespace sunpack::sevenzip
 
         bool valid_ = true;
 
-        // Declared before the prefetcher so the handles outlive its thread; mutable because the prefetch reader runs from a const accessor.
-        mutable PathHandleCache prefetch_handles_;
-
-        std::unique_ptr<SequentialPrefetcher> prefetch_;
+        std::unique_ptr<OverlappedPrefetcher> prefetch_;
     };
 
     struct NormalizedInputRange
@@ -1388,7 +1190,7 @@ namespace sunpack::sevenzip
         explicit MultiRangeInStream(
             const std::vector<ExtractInputRange> &ranges,
             ExtractInputTrace *trace = nullptr,
-            InputPrefetchConfig prefetch_config = InputPrefetchConfig{false, 512 * 1024, 2})
+            InputPrefetchConfig prefetch_config = InputPrefetchConfig{false, 512 * 1024})
 
             : trace_(trace)
         {
@@ -1460,8 +1262,16 @@ namespace sunpack::sevenzip
 
             if (valid_ && total_size_ && prefetch_config.enabled)
             {
-                prefetch_ = std::make_unique<SequentialPrefetcher>(prefetch_config, total_size_, [this](UInt64 offset, void *data, UInt32 read_size, UInt32 *processed)
-                                                                   { return read_prefetch_at(offset, data, read_size, processed); });
+                prefetch_ = std::make_unique<OverlappedPrefetcher>(prefetch_config, total_size_,
+                    [this](UInt64 offset, PrefetchSource &source)
+                    {
+                        const std::size_t index = find_range_index(offset);
+                        if (index >= ranges_.size()) return false;
+                        const auto &range = ranges_[index];
+                        const UInt64 displacement = offset - range.virtual_offset;
+                        source = PrefetchSource{&range.path, range.start + displacement, range.length - displacement};
+                        return true;
+                    }, trace_);
             }
             if (trace_ && read_file_timing_enabled())
             {
@@ -1758,54 +1568,6 @@ namespace sunpack::sevenzip
         }
 
     private:
-        HRESULT read_prefetch_at(UInt64 offset, void *data, UInt32 size, UInt32 *processed) const
-        {
-            if (processed)
-            {
-                *processed = 0;
-            }
-            auto *out = static_cast<unsigned char *>(data);
-            UInt32 total_read = 0;
-            while (total_read < size && offset < total_size_)
-            {
-                const std::size_t index = find_range_index(offset);
-                if (index >= ranges_.size())
-                {
-                    break;
-                }
-                const auto &range = ranges_[index];
-                const UInt64 offset_in_range = offset - range.virtual_offset;
-                const UInt64 remaining = range.length - offset_in_range;
-                const UInt32 want = static_cast<UInt32>(std::min<UInt64>(size - total_read, remaining));
-                UInt32 read = 0;
-                const HRESULT result = prefetch_handles_.read_at(
-                    range.path,
-                    range.start + offset_in_range,
-                    out + total_read,
-                    want,
-                    &read
-#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
-                    , trace_ ? trace_->pipeline_timing : nullptr
-#endif
-                    );
-                if (result != S_OK)
-                {
-                    return result;
-                }
-                total_read += read;
-                offset += read;
-                if (read != want)
-                {
-                    break;
-                }
-            }
-            if (processed)
-            {
-                *processed = total_read;
-            }
-            return S_OK;
-        }
-
         std::size_t find_range_index(UInt64 position) const
         {
 
@@ -1886,12 +1648,10 @@ namespace sunpack::sevenzip
 
         UInt64 cached_handle_position_ = 0;
 
-        std::unique_ptr<SequentialPrefetcher> prefetch_;
+        std::unique_ptr<OverlappedPrefetcher> prefetch_;
 
         bool valid_ = true;
 
-        // Declared after the prefetcher, which stops its thread before this closes the handles; mutable as in MultiFileInStream.
-        mutable PathHandleCache prefetch_handles_;
     };
 
     CMyComPtr<IInStream> open_archive_stream(

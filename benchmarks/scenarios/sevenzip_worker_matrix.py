@@ -264,7 +264,9 @@ def _case_job(
         "password": "",
         "format_hint": format_hint,
     }
-    if archive_format == "rar-split":
+    if "archive_input" in case:
+        job["archive_input"] = case["archive_input"]
+    elif archive_format == "rar-split":
         job["archive_input"] = {
             "entry_path": str(volumes[0]),
             "open_mode": "native_volumes",

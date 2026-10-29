@@ -373,46 +373,47 @@ void check_archive_open_start_and_carrier_fallback()
 void check_prefetch_lifetime_and_seek()
 {
     std::printf("Prefetch seek\n");
-    std::mutex mutex;
-    std::condition_variable cv;
-    bool entered = false, release = false;
-    SequentialPrefetcher prefetch({true, 64, 2}, 1024,
-        [&](UInt64 offset, void *data, UInt32 size, UInt32 *read) {
-            if (offset == 1)
-            {
-                std::unique_lock lock(mutex);
-                entered = true;
-                cv.notify_one();
-                cv.wait(lock, [&] { return release; });
-            }
-            std::memset(data, static_cast<int>(offset % 251), size);
-            *read = size;
-            return S_OK;
-        });
-    prefetch.after_sync_read(1);
-    {
-        std::unique_lock lock(mutex);
-        cv.wait(lock, [&] { return entered; });
-    }
-    prefetch.invalidate(400, nullptr);
-    prefetch.after_sync_read(400);
-    {
-        std::lock_guard lock(mutex);
-        release = true;
-    }
-    cv.notify_one();
     unsigned char bytes[64]{};
-    check(prefetch.consume(400, bytes, 64, nullptr) && bytes[0] == 400 % 251 && bytes[63] == 400 % 251,
-          "seek during a blocked read discards its completion without reusing its live buffer");
-
-    SequentialPrefetcher failed({true, 64, 1}, 256,
-        [](UInt64, void *, UInt32, UInt32 *read) { *read = 0; return S_FALSE; });
-    failed.after_sync_read(64);
-    check(!failed.consume(64, bytes, 64, nullptr), "short/error prefetch reads fall back without publishing bytes");
+    // Cached files frequently complete inline, so they cannot reliably catch
+    // freeing an outstanding OVERLAPPED or forgetting to cancel it on Seek.
+    // Two pipe instances hold real pending reads without sleeps or a thread.
+    const std::wstring pipe_name = LR"(\\.\pipe\sunpack-prefetch-)" + std::to_wstring(GetCurrentProcessId());
+    HANDLE pipes[2];
+    for (auto &pipe : pipes)
+        pipe = CreateNamedPipeW(pipe_name.c_str(), PIPE_ACCESS_OUTBOUND,
+            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT, 2, 4096, 4096, 0, nullptr);
+    check(pipes[0] != INVALID_HANDLE_VALUE && pipes[1] != INVALID_HANDLE_VALUE,
+          "pending-read fixture creates both pipe instances");
+    DWORD handles_before = 0, handles_after = 0;
+    GetProcessHandleCount(GetCurrentProcess(), &handles_before);
+    {
+        OverlappedPrefetcher prefetch({true, 64}, 1024,
+            [&](UInt64 offset, PrefetchSource &source) {
+                source = PrefetchSource{&pipe_name, offset, 1024 - offset};
+                return true;
+            });
+        prefetch.after_sync_read(1);
+        prefetch.invalidate(400, nullptr);
+        prefetch.after_sync_read(400);
+        unsigned char expected[64];
+        std::memset(expected, 400 % 251, sizeof(expected));
+        bool written = true;
+        for (auto pipe : pipes)
+        {
+            DWORD count = 0;
+            written &= WriteFile(pipe, expected, sizeof(expected), &count, nullptr) && count == sizeof(expected);
+        }
+        check(written && prefetch.consume(400, bytes, 64, nullptr) && !std::memcmp(bytes, expected, sizeof(bytes)),
+              "seek cancels pending reads before reusing their buffers and OVERLAPPED structures");
+        prefetch.after_cached_read(464); // Leave a real pending read for destruction.
+    }
+    GetProcessHandleCount(GetCurrentProcess(), &handles_after);
+    check(handles_before == handles_after, "prefetch destruction drains requests and releases file/event handles");
+    for (auto pipe : pipes) if (pipe != INVALID_HANDLE_VALUE) CloseHandle(pipe);
 
     wchar_t executable[MAX_PATH]{};
     GetModuleFileNameW(nullptr, executable, MAX_PATH);
-    auto *raw = new FileInStream(executable, nullptr, L"file", {true, 64, 2});
+    auto *raw = new FileInStream(executable, nullptr, L"file", {true, 64});
     CMyComPtr<IInStream> stream(raw);
     UInt32 read = 0;
     check(stream->Read(bytes, 64, &read) == S_OK && read == 64, "file stream starts with direct read");
@@ -423,7 +424,7 @@ void check_prefetch_lifetime_and_seek()
     check(stream->Seek(-65, FILE_CURRENT, &position) == S_OK && position == 63,
           "backward relative Seek recalibrates the decoder handle");
     unsigned char expected[65]{};
-    InputPrefetchConfig disabled{false, 64, 2};
+    InputPrefetchConfig disabled{false, 64};
     auto *direct_raw = new FileInStream(executable, nullptr, L"file", disabled);
     CMyComPtr<IInStream> direct(direct_raw);
     direct->Read(expected, 65, &read);
@@ -446,7 +447,42 @@ void check_prefetch_virtual_inputs()
         b.write(reinterpret_cast<const char *>(payload + 257), 256);
     }
     {
-        auto *raw = new MultiFileInStream({first.wstring(), second.wstring()}, nullptr, {true, 64, 2});
+        // The virtual-input checks below cannot exercise OVERLAPPED buffer
+        // reuse or a physical short read. Reuse this tiny fixture to cover
+        // cross-window reads, direct fallback, EOF and seek/close ownership.
+        auto *raw = new FileInStream(first.wstring(), nullptr, L"file", {true, 64});
+        CMyComPtr<IInStream> stream(raw);
+        unsigned char bytes[300]{};
+        UInt32 read = 0;
+        bool correct = stream->Read(bytes, 0, &read) == S_OK && read == 0;
+        for (unsigned offset = 0; offset < 257; offset += 17)
+        {
+            const UInt32 size = (std::min)(17u, 257u - offset);
+            correct &= stream->Read(bytes + offset, size, &read) == S_OK && read == size;
+        }
+        correct &= !std::memcmp(bytes, payload, 257);
+        correct &= stream->Read(bytes, sizeof(bytes), &read) == S_OK && read == 0;
+        stream->Seek(1, FILE_BEGIN, nullptr);
+        correct &= stream->Read(bytes, 1, nullptr) == S_OK && bytes[0] == payload[1];
+        correct &= stream->Read(bytes, 200, &read) == S_OK && read == 200 && !std::memcmp(bytes, payload + 2, 200);
+        stream->Seek(-33, FILE_END, nullptr);
+        correct &= stream->Read(bytes, 100, &read) == S_OK && read == 33 && !std::memcmp(bytes, payload + 224, 33);
+        stream->Seek(0, FILE_BEGIN, nullptr);
+        correct &= stream->Read(bytes, 1, &read) == S_OK && read == 1;
+        check(correct, "single-file double buffers preserve bytes across windows, fallback, EOF and seek");
+        // Both the seek above and destruction below can retire live requests.
+        const std::wstring path = first.wstring();
+        OverlappedPrefetcher short_read({true, 64}, 321,
+            [&](UInt64 offset, PrefetchSource &source) {
+                source = PrefetchSource{&path, offset, 321 - offset};
+                return true;
+            });
+        short_read.after_sync_read(240);
+        check(!short_read.consume(240, bytes, 64, nullptr),
+              "short OVERLAPPED completion falls back without publishing a partial window");
+    }
+    {
+        auto *raw = new MultiFileInStream({first.wstring(), second.wstring()}, nullptr, {true, 64});
         CMyComPtr<IInStream> stream(raw);
         unsigned char bytes[513]{};
         bool correct = true;
@@ -469,7 +505,7 @@ void check_prefetch_virtual_inputs()
         ExtractInputRange a, b;
         a.path = first.wstring(); a.start = 3; a.has_end = true; a.end = 251;
         b.path = second.wstring(); b.start = 7; b.has_end = true; b.end = 250;
-        auto *raw = new MultiRangeInStream({a, b}, nullptr, {true, 64, 2});
+        auto *raw = new MultiRangeInStream({a, b}, nullptr, {true, 64});
         CMyComPtr<IInStream> stream(raw);
         unsigned char bytes[491]{};
         bool correct = true;

@@ -94,7 +94,8 @@ struct ExtractInputTrace {
     unsigned long long max_position_seen = 0;
     unsigned long long total_bytes_returned = 0;
     // Populated only when SUNPACK_SEVENZIP_PROFILE_READS=1 in the worker
-    // environment. This is wall time spent in synchronous input ReadFile calls.
+    // environment. Includes synchronous reads and OVERLAPPED submissions;
+    // completion waits are accounted for in prefetch_consumer_wait_ns.
     unsigned long long read_file_call_count = 0;
     unsigned long long read_file_wall_ns = 0;
     unsigned long long read_file_max_wall_ns = 0;

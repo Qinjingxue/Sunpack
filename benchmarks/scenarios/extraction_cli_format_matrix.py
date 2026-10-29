@@ -406,7 +406,10 @@ async def _run(args: argparse.Namespace) -> int:
     warmup_rows: list[dict[str, Any]] = []
     profiler: RequestRuntimeProfiler | None = None
     original_prefetch = os.environ.get("SUNPACK_SEVENZIP_PREFETCH")
-    os.environ["SUNPACK_SEVENZIP_PREFETCH"] = "1" if args.prefetch == "on" else "0"
+    if args.prefetch == "default":
+        os.environ.pop("SUNPACK_SEVENZIP_PREFETCH", None)
+    else:
+        os.environ["SUNPACK_SEVENZIP_PREFETCH"] = "1" if args.prefetch == "on" else "0"
     restore_worker = _patch_worker_path(worker_path)
     from sunpack.runtime.cli import persistent_runtime
 
@@ -634,7 +637,7 @@ def main() -> int:
     parser.add_argument("--format", action="append", dest="formats", choices=FORMATS)
     parser.add_argument("--worker-path", type=Path, default=DEFAULT_WORKER)
     parser.add_argument("--lz4-tool", type=Path, default=DEFAULT_LZ4_TOOL)
-    parser.add_argument("--prefetch", choices=("on", "off"), default="on")
+    parser.add_argument("--prefetch", choices=("default", "on", "off"), default="default")
     parser.add_argument("--timeout", type=float, default=900.0)
     parser.add_argument("--json-out", type=Path)
     parser.add_argument("--results-root", type=Path)
