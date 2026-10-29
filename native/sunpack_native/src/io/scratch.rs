@@ -79,6 +79,13 @@ impl Default for Spool {
     }
 }
 impl Spool {
+    /// Resident allocation, including capacity retained after previous writes.
+    pub(crate) fn memory_bytes(&self) -> usize {
+        self.file
+            .as_ref()
+            .map_or_else(|| self.memory.get_ref().capacity(), |file| file.capacity())
+    }
+
     pub(crate) fn spill(&mut self) -> io::Result<()> {
         if self.file.is_none() {
             let mut file = scratch_file()?;

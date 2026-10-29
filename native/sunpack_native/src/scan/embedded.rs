@@ -1,7 +1,6 @@
 #[cfg(windows)]
 use crate::io::iocp;
 use crate::io::reader::{CachedBytes, ManagedReader};
-use crate::io::scratch::{Blob, Spool, MEMORY_BYTES};
 use crate::io::ScanBatch;
 use crate::scan::compression_stream::{
     bzip2_header_block_limit, bzip2_prefix_valid, gzip_fixed_header_flags, parse_xz_footer,
@@ -14,11 +13,14 @@ use memchr::memmem;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
-use std::ops::Deref;
+use std::io::{self, BufReader, Read, Seek, SeekFrom};
 use std::sync::OnceLock;
 
 use rayon::prelude::*;
+
+#[path = "hit_storage.rs"]
+mod hit_storage;
+use hit_storage::{Builder as HitBuilder, HitView};
 
 const ZIP_LOCAL: &[u8] = b"PK\x03\x04";
 const ZIP_EOCD: &[u8] = b"PK\x05\x06";
@@ -128,7 +130,7 @@ struct EmbeddedCandidate {
 #[repr(C)]
 struct RawHit {
     // Only validated root evidence retains absolute offsets. Transient scan
-    // batches and external runs use four-byte PackedHit records below.
+    // batches use four-byte records before immutable block encoding.
     location: [u8; 8],
     pattern: u8,
 }
@@ -161,11 +163,6 @@ impl PackedHit {
     }
 }
 
-fn hit_bytes(hits: &[PackedHit]) -> &[u8] {
-    // PackedHit is exactly four integer bytes, with alignment one and no padding.
-    unsafe { std::slice::from_raw_parts(hits.as_ptr().cast(), std::mem::size_of_val(hits)) }
-}
-
 // Matching jobs share one base rather than duplicating an absolute offset in
 // every hit. Even a chunk above 4 GiB produces four-byte records.
 #[derive(Default)]
@@ -181,273 +178,10 @@ impl HitBuffer {
         self.hits.push(PackedHit::new(relative as u32, hit.pattern));
     }
 
+    #[cfg(test)]
     fn iter(&self) -> impl Iterator<Item = RawHit> + '_ {
         self.hits.iter().map(|hit| hit.unpack(self.base))
     }
-}
-
-enum HitData {
-    Memory(Vec<PackedHit>),
-    Spill(Blob),
-}
-
-impl Deref for HitData {
-    type Target = [PackedHit];
-    fn deref(&self) -> &[PackedHit] {
-        match self {
-            Self::Memory(hits) => hits,
-            // Only whole, byte-aligned PackedHit records enter this private spool.
-            Self::Spill(blob) => unsafe {
-                std::slice::from_raw_parts(
-                    blob.as_ptr().cast(),
-                    blob.len() / std::mem::size_of::<PackedHit>(),
-                )
-            },
-        }
-    }
-}
-
-#[repr(C)]
-struct HitBlock {
-    base: [u8; 8],
-    end: [u8; 8],
-}
-
-impl HitBlock {
-    fn base(&self) -> u64 {
-        u64::from_ne_bytes(self.base)
-    }
-
-    fn end(&self) -> usize {
-        u64::from_ne_bytes(self.end) as usize
-    }
-}
-
-struct HitStorage {
-    hits: HitData,
-    // One 16-byte entry per occupied 256 MiB region. This index uses the same
-    // spill infrastructure, so sparse giant inputs do not grow a heap index.
-    blocks: Blob,
-}
-
-impl HitStorage {
-    fn blocks(&self) -> &[HitBlock] {
-        // HitBlock has only byte-aligned integer bytes and no invalid bit patterns.
-        unsafe {
-            std::slice::from_raw_parts(
-                self.blocks.as_ptr().cast(),
-                self.blocks.len() / std::mem::size_of::<HitBlock>(),
-            )
-        }
-    }
-
-    fn get(&self, index: usize) -> Option<RawHit> {
-        let hit = *self.hits.get(index)?;
-        let blocks = self.blocks();
-        let block = blocks.partition_point(|block| block.end() <= index);
-        Some(hit.unpack(blocks[block].base()))
-    }
-
-    fn iter_range(&self, start: usize, end: usize) -> impl Iterator<Item = RawHit> + '_ {
-        let blocks = self.blocks();
-        let mut block = blocks.partition_point(|block| block.end() <= start);
-        self.hits[start..end]
-            .iter()
-            .enumerate()
-            .map(move |(index, hit)| {
-                if start + index >= blocks[block].end() {
-                    block += 1;
-                }
-                hit.unpack(blocks[block].base())
-            })
-    }
-
-    fn iter(&self) -> impl Iterator<Item = RawHit> + '_ {
-        self.iter_range(0, self.hits.len())
-    }
-
-    fn par_iter(&self) -> impl ParallelIterator<Item = RawHit> + '_ {
-        (0..self.hits.len().div_ceil(4096))
-            .into_par_iter()
-            .flat_map_iter(|chunk| {
-                let start = chunk * 4096;
-                self.iter_range(start, (start + 4096).min(self.hits.len()))
-            })
-    }
-
-    fn partition_from(&self, start: usize, predicate: impl Fn(RawHit) -> bool) -> usize {
-        let (mut low, mut high) = (start, self.hits.len());
-        while low < high {
-            let mid = low + (high - low) / 2;
-            if predicate(self.get(mid).unwrap()) {
-                low = mid + 1;
-            } else {
-                high = mid;
-            }
-        }
-        low
-    }
-}
-
-#[derive(Default)]
-struct HitWriter {
-    data: Spool,
-    blocks: Spool,
-    base: Option<u64>,
-    count: usize,
-}
-
-impl HitWriter {
-    fn end_block(&mut self) -> io::Result<()> {
-        if let Some(base) = self.base {
-            self.blocks.write_all(&base.to_ne_bytes())?;
-            self.blocks.write_all(&(self.count as u64).to_ne_bytes())?;
-        }
-        Ok(())
-    }
-
-    fn append(&mut self, base: u64, hits: &[PackedHit]) -> io::Result<()> {
-        if hits.is_empty() {
-            return Ok(());
-        }
-        if self.base != Some(base) {
-            self.end_block()?;
-            self.base = Some(base);
-        }
-        let bytes = hit_bytes(hits);
-        if self.data.len()? + bytes.len() as u64 >= MEMORY_BYTES as u64 {
-            // Spill before copying a full budget-sized run into a second Vec.
-            self.data.spill()?;
-        }
-        self.data.write_all(bytes)?;
-        self.count += hits.len();
-        Ok(())
-    }
-
-    fn append_range(
-        &mut self,
-        source: &HitStorage,
-        mut start: usize,
-        end: usize,
-    ) -> io::Result<()> {
-        let blocks = source.blocks();
-        let mut block = blocks.partition_point(|block| block.end() <= start);
-        while start < end {
-            let next = end.min(blocks[block].end());
-            self.append(blocks[block].base(), &source.hits[start..next])?;
-            start = next;
-            block += 1;
-        }
-        Ok(())
-    }
-
-    fn finish(mut self) -> io::Result<HitStorage> {
-        self.end_block()?;
-        if self.count != 0 {
-            // Every external run releases its heap data, even when a sparse
-            // region boundary forced a flush before the normal byte budget.
-            self.data.spill()?;
-        }
-        Ok(HitStorage {
-            hits: HitData::Spill(self.data.finish()?),
-            blocks: self.blocks.finish()?,
-        })
-    }
-}
-
-/// Bounded heap, exact external merge. Ordinary scans keep their Vec fast
-/// path; dense signatures use the existing delete-on-close scratch mappings.
-/// Binary run merging bounds live mappings/handles logarithmically, and whole
-/// nonoverlapping ranges are copied in one write rather than one I/O per hit.
-#[derive(Default)]
-struct HitRuns {
-    base: u64,
-    memory: Vec<PackedHit>,
-    runs: Vec<Option<HitStorage>>,
-}
-
-impl HitRuns {
-    fn push(&mut self, hit: RawHit) -> io::Result<()> {
-        let base = hit.offset() & !HIT_OFFSET_MASK;
-        if self.memory.len() == MEMORY_BYTES / std::mem::size_of::<PackedHit>()
-            || (self.base != base && !self.memory.is_empty())
-        {
-            self.flush()?;
-        }
-        self.base = base;
-        self.memory
-            .push(PackedHit::new((hit.offset() - base) as u32, hit.pattern));
-        Ok(())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        if self.memory.is_empty() {
-            return Ok(());
-        }
-        self.memory.sort_unstable_by_key(|hit| hit.key());
-        let mut writer = HitWriter::default();
-        writer.append(self.base, &self.memory)?;
-        self.memory.clear();
-        let mut run = writer.finish()?;
-        let mut level = 0;
-        loop {
-            if level == self.runs.len() {
-                self.runs.push(None);
-            }
-            match self.runs[level].take() {
-                Some(previous) => run = merge_hits(previous, run)?,
-                None => {
-                    self.runs[level] = Some(run);
-                    return Ok(());
-                }
-            }
-            level += 1;
-        }
-    }
-
-    fn finish(mut self) -> io::Result<HitStorage> {
-        if self.runs.is_empty() {
-            self.memory.sort_unstable_by_key(|hit| hit.key());
-            let mut blocks = Spool::default();
-            if !self.memory.is_empty() {
-                blocks.write_all(&self.base.to_ne_bytes())?;
-                blocks.write_all(&(self.memory.len() as u64).to_ne_bytes())?;
-            }
-            return Ok(HitStorage {
-                hits: HitData::Memory(self.memory),
-                blocks: blocks.finish()?,
-            });
-        }
-        self.flush()?;
-        let mut result = None;
-        for run in self.runs.into_iter().flatten() {
-            result = Some(match result {
-                Some(previous) => merge_hits(previous, run)?,
-                None => run,
-            });
-        }
-        Ok(result.unwrap())
-    }
-}
-
-fn merge_hits(left: HitStorage, right: HitStorage) -> io::Result<HitStorage> {
-    let mut output = HitWriter::default();
-    let (mut a, mut b) = (&left, &right);
-    let (mut first, mut second) = (0, 0);
-    while first < a.hits.len() && second < b.hits.len() {
-        let key = |hit: RawHit| (hit.offset(), hit.hit_name());
-        if key(a.get(first).unwrap()) > key(b.get(second).unwrap()) {
-            std::mem::swap(&mut a, &mut b);
-            std::mem::swap(&mut first, &mut second);
-        }
-        let limit = key(b.get(second).unwrap());
-        let end = a.partition_from(first, |hit| key(hit) <= limit);
-        output.append_range(a, first, end)?;
-        first = end;
-    }
-    output.append_range(a, first, a.hits.len())?;
-    output.append_range(b, second, b.hits.len())?;
-    output.finish()
 }
 
 impl RawHit {
@@ -690,21 +424,37 @@ fn scan_native(
     primary_format: Option<&str>,
 ) -> io::Result<NativeScanResult> {
     let file_size = reader.len();
-    let mut hits = HitRuns::default();
-    let mut footers = HitRuns::default();
+    let chunk_bytes = iocp_chunk_bytes
+        .min((HIT_OFFSET_MASK - HIT_LOOKBEHIND) as usize - embedded_overlap())
+        .max(64 * 1024);
+    let matching_window = if file_size <= chunk_bytes as u64 {
+        1
+    } else {
+        iocp_buffers.clamp(2, 64) + iocp_workers.clamp(1, 8)
+    };
+    let mut builder = HitBuilder::new(file_size, chunk_bytes, matching_window)?;
     let mut raw_hit_count = 0;
-    let mut collect = |batch: HitBuffer| -> io::Result<()> {
-        for hit in batch.iter() {
-            match hit.kind() {
-                "xz_footer" => footers.push(hit)?,
-                "zip64_eocd" => hits.push(hit)?,
-                _ => {
-                    raw_hit_count += 1;
-                    hits.push(hit)?;
-                }
-            }
+    let mut collect = |batch: Option<hit_storage::Prepared>| -> io::Result<()> {
+        let Some(batch) = batch else {
+            return Ok(());
+        };
+        raw_hit_count += batch.raw_count;
+        builder.push(batch)
+    };
+    let scan = |sample: &[u8], carry: usize, base: u64| {
+        let batch = scan_sample_batch(sample, carry, base);
+        ScanBatch {
+            results: (!batch.results.hits.is_empty()).then(|| {
+                hit_storage::prepare(
+                    batch.results,
+                    base + carry as u64,
+                    base + sample.len() as u64,
+                    embedded_overlap(),
+                    base + sample.len() as u64 == file_size,
+                )
+            }),
+            discarded_results: batch.discarded_results,
         }
-        Ok(())
     };
     let output = {
         #[cfg(windows)]
@@ -721,7 +471,7 @@ fn scan_native(
                 let data = reader
                     .probe_reader()
                     .read_cached_at(0, file_size as usize)?;
-                let hits = scan_sample_batch(data.as_slice(), 0, 0);
+                let hits = scan(data.as_slice(), 0, 0);
                 collect(hits.results)?;
                 iocp::IocpScanOutput {
                     discarded_results: hits.discarded_results,
@@ -732,13 +482,21 @@ fn scan_native(
                 iocp::scan_file(
                     path,
                     file_size,
-                    iocp_chunk_bytes
-                        .min((HIT_OFFSET_MASK - HIT_LOOKBEHIND) as usize - embedded_overlap()),
+                    chunk_bytes,
                     iocp_buffers,
                     iocp_workers,
                     embedded_overlap(),
-                    scan_sample_batch,
-                    &mut collect,
+                    |sample, carry, base| {
+                        let batch = scan(sample, carry, base);
+                        ScanBatch {
+                            // Empty read jobs send only a pointer-sized None.
+                            // Keep encoded metadata off the IOCP channel's hot
+                            // path; the box lives only until this completion.
+                            results: batch.results.map(Box::new),
+                            discarded_results: batch.discarded_results,
+                        }
+                    },
+                    |batch| collect(batch.map(|batch| *batch)),
                 )?
             };
             output
@@ -758,8 +516,9 @@ fn scan_native(
             ));
         }
     };
-    let raw_hits = hits.finish()?;
-    let xz_footer_hits = footers.finish()?;
+    let storage = builder.finish()?;
+    let raw_hits = storage.view(0);
+    let xz_footer_hits = storage.view(1);
     raw_hit_count += output.discarded_results;
 
     // Identity alone may dispatch a stream only when this same signature pass
@@ -778,7 +537,7 @@ fn scan_native(
     let mut candidates = if identity_only {
         Vec::new()
     } else {
-        validate_raw_hits(&probe_reader, file_size, &raw_hits, &xz_footer_hits)?
+        validate_raw_hits(&probe_reader, file_size, raw_hits, xz_footer_hits)?
     };
     candidates.sort_by_key(|candidate| {
         (
@@ -791,17 +550,17 @@ fn scan_native(
     resolve_logical_candidates(&mut candidates);
     // Only validated root evidence survives in the cached native scan. Noise,
     // inner signatures and consumed directory records have no later users.
-    let raw_hits = raw_hits
-        .iter()
-        .filter(|hit| {
+    let mut roots = Vec::new();
+    let mut cursor = raw_hits.iter();
+    for group in candidates.chunk_by(|a, b| a.offset == b.offset) {
+        roots.extend(cursor.equal_offset(group[0].offset).filter(|hit| {
             hit.kind() != "zip64_eocd"
-                && candidates
-                    .binary_search_by_key(&(hit.offset(), hit.format()), |candidate| {
-                        (candidate.offset, candidate.format)
-                    })
-                    .is_ok()
-        })
-        .collect();
+                && group
+                    .iter()
+                    .any(|candidate| hit.format() == candidate.format)
+        }));
+    }
+    let raw_hits = roots;
     let logical_resolution_complete = candidates
         .iter()
         .filter(|candidate| candidate.candidate_kind == "logical_archive")
@@ -833,8 +592,8 @@ fn embedded_overlap() -> usize {
 fn validate_raw_hits(
     reader: &ManagedReader,
     file_size: u64,
-    raw_hits: &HitStorage,
-    xz_footer_hits: &HitStorage,
+    raw_hits: HitView<'_>,
+    xz_footer_hits: HitView<'_>,
 ) -> io::Result<Vec<EmbeddedCandidate>> {
     let mut suffixes: [FailedSuffixEvidence; 5] = std::array::from_fn(|_| Default::default());
     let mut xz_footers = XzFooterEvidence {
@@ -845,7 +604,7 @@ fn validate_raw_hits(
     // ZIP64 records were found in the same full-stream pass. Index each once
     // by its declared physical end; fake locators never trigger reverse scans.
     let mut zip64_records = BTreeMap::new();
-    for hit in raw_hits.iter().filter(|hit| hit.kind() == "zip64_eocd") {
+    for hit in raw_hits.iter_mask(1 << 12) {
         let fixed = read_at(reader, hit.offset(), 56)?;
         if let Ok(record) = crate::formats::zip::zip64::parse_record(&fixed) {
             if let Some(end) = hit
@@ -861,8 +620,7 @@ fn validate_raw_hits(
         }
     }
     let mut candidates = raw_hits
-        .par_iter()
-        .filter(|hit| hit.kind() == "zip_eocd")
+        .par_iter_mask(1 << 1)
         .map_init(DirectoryEvidence::default, |directories, hit| {
             validate_zip_eocd(reader, file_size, hit.offset(), &zip64_records, directories)
         })
@@ -892,15 +650,14 @@ fn validate_raw_hits(
     let mut range_index = 0usize;
     let mut covered_until = 0u64;
     let mut previous_xz: Option<usize> = None;
-    for hit in raw_hits
-        .iter()
-        .filter(|hit| !matches!(hit.kind(), "zip_eocd" | "zip64_eocd"))
-    {
+    let mut cursor = raw_hits.iter_mask(!((1 << 1) | (1 << 12)));
+    while let Some(hit) = cursor.next() {
         while range_index < seeded_ranges.len() && seeded_ranges[range_index].0 <= hit.offset() {
             covered_until = covered_until.max(seeded_ranges[range_index].1);
             range_index += 1;
         }
         if hit.offset() < covered_until {
+            cursor.seek_ge(covered_until);
             continue;
         }
 
@@ -2163,7 +1920,7 @@ fn validate_bzip2(
 // are discarded by advancing the cursor; only proven future roots are retained.
 // Nothing survives this scan. Read lazily to preserve the existing I/O order.
 struct XzFooterEvidence<'a> {
-    ends: &'a HitStorage,
+    ends: HitView<'a>,
     next_unchecked: usize,
     valid: BTreeMap<u64, u64>,
 }
@@ -2189,11 +1946,9 @@ fn validate_xz(
     }
     // Headers arrive in increasing physical order. No later header can need
     // an unchecked footer that precedes this minimum boundary.
-    footers.next_unchecked = footers.next_unchecked.max(
-        footers
-            .ends
-            .partition_from(footers.next_unchecked, |hit| hit.offset() + 2 < offset + 24),
-    );
+    footers.next_unchecked = footers
+        .next_unchecked
+        .max(footers.ends.lower_bound(offset + 22));
     while footers
         .valid
         .first_key_value()
@@ -2487,70 +2242,16 @@ mod tests {
     use std::io::Write;
     use xz2::write::XzEncoder;
 
-    fn stored_hits(hits: &[RawHit]) -> HitStorage {
-        let mut runs = HitRuns::default();
-        for hit in hits {
-            runs.push(hit.clone()).unwrap();
-        }
-        runs.finish().unwrap()
+    fn stored_hits(hits: &[RawHit]) -> hit_storage::HitStorage {
+        hit_storage::HitStorage::from_hits(hits)
     }
 
-    // Small carriers cannot catch offset truncation at compact region/u32
-    // boundaries, or corruption in multi-run views. One spill lifecycle checks
-    // those boundaries, tie ordering, parallel decoding and indexed seeks.
     #[test]
-    fn compact_spilled_hits_preserve_full_offsets_and_parallel_views() {
-        let base = 1u64 << 32;
-        let count = MEMORY_BYTES / std::mem::size_of::<PackedHit>() + 17;
-        let mut expected = Vec::new();
-        let mut runs = HitRuns::default();
-        for index in (0..count).rev() {
-            let hit = RawHit::new(base + index as u64 * 3, (index % 14) as u8);
-            runs.push(hit.clone()).unwrap();
-            expected.push(hit);
-        }
-        for offset in [
-            base - 1,
-            base,
-            base + HIT_OFFSET_MASK,
-            base + HIT_OFFSET_MASK + 1,
-            u64::MAX,
-        ] {
-            for pattern in 0..=PATTERNS.len() as u8 {
-                let hit = RawHit::new(offset, pattern);
-                runs.push(hit.clone()).unwrap();
-                expected.push(hit);
-            }
-        }
-        expected.sort_unstable_by_key(|hit| (hit.offset(), hit.hit_name()));
-        let storage = runs.finish().unwrap();
-        assert!(matches!(&storage.hits, HitData::Spill(Blob::Mapped(_))));
-        assert_eq!(storage.iter().collect::<Vec<_>>(), expected);
-        let mut parallel = storage.par_iter().collect::<Vec<_>>();
-        parallel.sort_unstable_by_key(|hit| (hit.offset(), hit.hit_name()));
-        assert_eq!(parallel, expected);
-        for offset in [
-            0,
-            base - 1,
-            base,
-            base + 12345,
-            base + HIT_OFFSET_MASK + 1,
-            u64::MAX,
-        ] {
-            let index = expected.partition_point(|hit| hit.offset() < offset);
-            assert_eq!(
-                storage.partition_from(0, |hit| hit.offset() < offset),
-                index
-            );
-            assert_eq!(storage.get(index).as_ref(), expected.get(index));
-        }
-        // TAR roots can precede the sample base; high absolute addresses must
-        // round-trip through the matching job's own four-byte representation.
+    fn packed_sample_keeps_tar_lookbehind_at_high_offsets() {
         let mut tar = vec![0u8; 32];
         tar[..TAR_USTAR.len()].copy_from_slice(TAR_USTAR);
         for base in [4096, 1 << 32, u64::MAX - 1024] {
-            let hits = scan_sample(&tar, 0, base);
-            assert_eq!(hits, [RawHit::new(base - 257, 9)]);
+            assert_eq!(scan_sample(&tar, 0, base), [RawHit::new(base - 257, 9)]);
         }
     }
 
@@ -2599,8 +2300,8 @@ mod tests {
         let candidates = validate_raw_hits(
             &source,
             source.len(),
-            &stored_hits(&hits),
-            &stored_hits(&ends),
+            stored_hits(&hits).view(0),
+            stored_hits(&ends).view(0),
         )
         .unwrap();
         assert_eq!(
@@ -2632,7 +2333,7 @@ mod tests {
         );
         let ends = stored_hits(&ends);
         let mut facts = XzFooterEvidence {
-            ends: &ends,
+            ends: ends.view(0),
             next_unchecked: 0,
             valid: BTreeMap::new(),
         };
@@ -2675,8 +2376,8 @@ mod tests {
             let candidates = validate_raw_hits(
                 &source,
                 source.len(),
-                &stored_hits(&hits),
-                &stored_hits(&[]),
+                stored_hits(&hits).view(0),
+                stored_hits(&[]).view(0),
             )
             .unwrap();
             assert_eq!(candidates[0].offset, root);
@@ -2738,8 +2439,8 @@ mod tests {
         let candidates = validate_raw_hits(
             &source,
             source.len(),
-            &stored_hits(&hits),
-            &stored_hits(&ends),
+            stored_hits(&hits).view(0),
+            stored_hits(&ends).view(0),
         )
         .unwrap();
         assert_eq!(
@@ -3002,8 +2703,8 @@ mod tests {
                 validate_raw_hits(
                     &source,
                     source.len(),
-                    &stored_hits(&hits),
-                    &stored_hits(&[])
+                    stored_hits(&hits).view(0),
+                    stored_hits(&[]).view(0)
                 )
                 .unwrap_or_else(|error| panic!("{kind}: {error}")),
                 expected,
@@ -3026,8 +2727,8 @@ mod tests {
         let candidates = validate_raw_hits(
             &source,
             source.len(),
-            &stored_hits(&hits),
-            &stored_hits(&[]),
+            stored_hits(&hits).view(0),
+            stored_hits(&[]).view(0),
         )
         .unwrap();
         assert_eq!(candidates.len(), 1);
