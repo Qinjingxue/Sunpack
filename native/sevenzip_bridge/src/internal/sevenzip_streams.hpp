@@ -26,6 +26,8 @@
 
 #include <memory>
 
+#include <new>
+
 #include <string>
 
 #include <utility>
@@ -297,8 +299,8 @@ namespace sunpack::sevenzip
             return true;
         }
 
-        void after_sync_read(UInt64 end) { advance(end); }
-        void after_cached_read(UInt64 end) { advance(end); }
+        void after_sync_read(UInt64 end) { advance_safely(end); }
+        void after_cached_read(UInt64 end) { advance_safely(end); }
 
         void invalidate(UInt64 next, ExtractInputTrace *trace)
         {
@@ -378,6 +380,20 @@ namespace sunpack::sevenzip
                 slot.path = nullptr;
             }
             enabled_ = false;
+        }
+
+        void advance_safely(UInt64 end) noexcept
+        {
+            try
+            {
+                advance(end);
+            }
+            catch (const std::bad_alloc &)
+            {
+                // A speculative read must never turn memory pressure into a
+                // decoder failure. Drain any pending I/O and use direct reads.
+                close();
+            }
         }
 
         void advance(UInt64 end)
@@ -550,20 +566,9 @@ namespace sunpack::sevenzip
             if (prefetch_ && prefetch_->consume(position_, data, size, trace_))
             {
                 position_ += size;
-                LARGE_INTEGER cached_position{};
-                cached_position.QuadPart = static_cast<LONGLONG>(position_);
-                if (!SetFilePointerEx(handle_, cached_position, nullptr, FILE_BEGIN))
-                {
-                    const DWORD error = GetLastError();
-                    const HRESULT hr = HRESULT_FROM_WIN32(error);
-                    if (trace_)
-                    {
-                        trace_->read_error = true;
-                        trace_->last_hresult = hr;
-                        trace_->last_win32_error = static_cast<int>(error);
-                    }
-                    return hr;
-                }
+                // The decoder handle is independent of the OVERLAPPED handles.
+                // Reposition it only if a later read misses the prefetch cache.
+                file_pointer_dirty_ = true;
                 record_logical_read(trace_, read_start, size);
                 prefetch_->after_cached_read(position_);
                 if (trace_)
@@ -580,6 +585,25 @@ namespace sunpack::sevenzip
                     *processedSize = size;
                 }
                 return S_OK;
+            }
+
+            if (file_pointer_dirty_ && size != 0)
+            {
+                LARGE_INTEGER logical_position{};
+                logical_position.QuadPart = static_cast<LONGLONG>(position_);
+                if (!SetFilePointerEx(handle_, logical_position, nullptr, FILE_BEGIN))
+                {
+                    const DWORD error = GetLastError();
+                    const HRESULT hr = HRESULT_FROM_WIN32(error);
+                    if (trace_)
+                    {
+                        trace_->read_error = true;
+                        trace_->last_hresult = hr;
+                        trace_->last_win32_error = static_cast<int>(error);
+                    }
+                    return hr;
+                }
+                file_pointer_dirty_ = false;
             }
 
             DWORD read = 0;
@@ -654,8 +678,19 @@ namespace sunpack::sevenzip
             distance.QuadPart = offset;
 
             LARGE_INTEGER new_pos{};
+            // FILE_CURRENT is relative to the decoder's logical position, not
+            // the possibly stale file pointer after prefetched reads.
+            BOOL positioned = TRUE;
+            if (file_pointer_dirty_ && seekOrigin == FILE_CURRENT)
+            {
+                LARGE_INTEGER logical_position{};
+                logical_position.QuadPart = static_cast<LONGLONG>(position_);
+                positioned = SetFilePointerEx(handle_, logical_position, nullptr, FILE_BEGIN);
+            }
+            if (positioned)
+                positioned = SetFilePointerEx(handle_, distance, &new_pos, seekOrigin);
 
-            if (!SetFilePointerEx(handle_, distance, &new_pos, seekOrigin))
+            if (!positioned)
             {
 
                 const DWORD error = GetLastError();
@@ -679,6 +714,7 @@ namespace sunpack::sevenzip
 
             const UInt64 prior_position = position_;
             position_ = static_cast<UInt64>(new_pos.QuadPart);
+            file_pointer_dirty_ = false;
 
             record_logical_seek(trace_, prior_position, position_);
 
@@ -726,6 +762,7 @@ namespace sunpack::sevenzip
 
         UInt64 size_ = 0;
 
+        bool file_pointer_dirty_ = false;
         std::unique_ptr<OverlappedPrefetcher> prefetch_;
     };
 
