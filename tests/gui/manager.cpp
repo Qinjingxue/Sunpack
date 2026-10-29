@@ -60,6 +60,25 @@ void projection(Fixture& f) {
     auto empty=read_json(p); replaced["live"]=empty["runs"][0];
     atomic_write(p,replaced.dump()); assert(log.refresh());
     assert(task_rows(log,{},view)["rows"].empty());
+    // A writer starting after the initial read used to produce an apparently
+    // valid empty/partial page. Pre-read conflict tests cannot catch removal
+    // of the final revision check; reuse this single-row disk fixture.
+    publish_events(p,event("failed_password",source,1),Json::array(),true);
+    assert(log.refresh());
+    auto stable=task_rows(log,{},view);
+    auto revision=log.manifest["task_revision"].get<uint64_t>();
+    auto index=p.parent_path()/(p.filename().wstring()+L".store")/(log.manifest["live"]["name"].get<std::string>()+".index");
+    auto mark=[&](uint64_t value) { std::fstream file(index,std::ios::binary|std::ios::in|std::ios::out); file.write(reinterpret_cast<const char*>(&value),sizeof(value)); assert(file); };
+    for(const auto& query:{"","not-present"}) {
+        view.task_query=query;
+        log.cancelled=[&]{mark(0); return false;};
+        bool conflict=false;
+        try { task_rows(log,{},view); }
+        catch(const WinError& error) { conflict=error.code==ERROR_SHARING_VIOLATION; }
+        assert(conflict);
+        log.cancelled={}; mark(revision);
+    }
+    view.task_query.clear(); assert(task_rows(log,{},view)==stable);
     fs::remove(p); fails([&]{log.refresh();}); log.refresh(true); assert(log.manifest.is_null());
     // Numeric UTC epochs display in local wall time. TZ is process-only.
     EventLog timestamps;
@@ -472,14 +491,16 @@ void batch_editing(Fixture& fixture) {
 int wmain(int argc,wchar_t** argv) {
     CoInitializeEx(nullptr,COINIT_MULTITHREADED);
     if(argc>=3 && std::wstring(argv[1])==L"--project") {
-        EventLog log; log.set_path(argv[2]); log.refresh();
-        View view;
-        if(argc>3) view.task_query=utf8(argv[3]);
-        if(argc>4) view.task_cursor=utf8(argv[4]);
-        WatchRoots roots;
-        if(argc>5 && *argv[5]) { view.task_root=utf8(argv[5]); roots.entries.push_back({fs::path(argv[5]),"",false}); }
-        if(argc>6) view.task_status=utf8(argv[6]);
-        std::cout<<Json{{"tasks",task_rows(log,roots,view)}}.dump(); return 0;
+        try {
+            EventLog log; log.set_path(argv[2]); log.refresh();
+            View view;
+            if(argc>3) view.task_query=utf8(argv[3]);
+            if(argc>4) view.task_cursor=utf8(argv[4]);
+            WatchRoots roots;
+            if(argc>5 && *argv[5]) { view.task_root=utf8(argv[5]); roots.entries.push_back({fs::path(argv[5]),"",false}); }
+            if(argc>6) view.task_status=utf8(argv[6]);
+            std::cout<<Json{{"tasks",task_rows(log,roots,view)}}.dump(); return 0;
+        } catch(const WinError& error) { std::cerr<<error.what()<<"\n"; return int(error.code); }
     }
     if(argc==3 && std::wstring(argv[1])==L"--mutex") { std::cout<<utf8(mutex_name(argv[2]))<<"\n"<<utf8(mutex_name(argv[2],L"SunPackWatchRoots"))<<"\n"; return 0; }
     if(argc>=2 && std::wstring(argv[1])==L"--echo") { Json args=Json::array(); for(int i=2;i<argc;++i) args.push_back(utf8(argv[i])); std::cout<<args.dump(); return 7; }

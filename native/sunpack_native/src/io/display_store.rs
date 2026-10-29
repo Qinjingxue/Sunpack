@@ -54,8 +54,17 @@ struct Live {
     time: BTreeMap<(i64, u64), String>,
     free: Vec<u64>,
     bytes: u64,
+    revision: u64,
 }
 impl Live {
+    fn set_revision(&mut self, revision: u64) -> io::Result<()> {
+        if self.revision != revision {
+            self.index.seek(SeekFrom::Start(0))?;
+            self.index.write_all(&revision.to_le_bytes())?;
+            self.revision = revision;
+        }
+        Ok(())
+    }
     fn remove(&mut self, id: &str) -> io::Result<()> {
         if let Some((slot, bytes)) = self.rows.remove(id) {
             self.time.remove(&(stamp(&bytes), slot));
@@ -453,15 +462,23 @@ impl Store {
     fn new_live(&self) -> io::Result<Live> {
         let mut run = self.create_run("live");
         run.unordered = true;
+        // The first index entry is a commit marker, outside the row range.
+        // Zero rejects readers while slots/data are changing; publish installs
+        // the manifest's task revision before making that manifest visible.
+        run.head = 1;
+        run.count = 1;
         let (data, index) = files(&self.folder, &run.name);
+        let mut index = open_sparse(&index)?;
+        index.write_all(&[0; ENTRY_BYTES])?;
         Ok(Live {
             run,
             data: open_sparse(&data)?,
-            index: open_sparse(&index)?,
+            index,
             rows: HashMap::new(),
             time: BTreeMap::new(),
             free: Vec::new(),
             bytes: 0,
+            revision: 0,
         })
     }
     pub(crate) fn update_live(
@@ -478,6 +495,9 @@ impl Store {
             if let Some(old) = self.manifest.live.take() {
                 self.obsolete.push(old.name);
             }
+        }
+        if let Some(live) = &mut self.live {
+            live.set_revision(0)?;
         }
         for (id, value) in rows {
             if value.as_ref().is_some_and(|(ts, _)| *ts <= cutoff) {
@@ -621,6 +641,9 @@ impl Store {
                 }
                 let id = id.clone();
                 self.expired_live.push(id.clone());
+                if !expired {
+                    live.set_revision(0)?;
+                }
                 live.remove(&id)?;
                 expired = true;
             }
@@ -637,6 +660,9 @@ impl Store {
     }
     pub(crate) fn publish(&mut self) -> io::Result<()> {
         self.manifest.revision = self.manifest.revision.wrapping_add(1);
+        if let Some(live) = &mut self.live {
+            live.set_revision(self.manifest.task_revision)?;
+        }
         let temp = self.path.with_file_name(format!(
             "{}.tmp",
             self.path.file_name().unwrap().to_string_lossy()

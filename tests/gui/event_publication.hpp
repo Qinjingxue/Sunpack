@@ -6,7 +6,7 @@
 #include <cstring>
 
 // Test-only publisher; the shipping GUI never writes display history.
-inline void publish_events(const spg::fs::path& path,const std::string& events,const spg::Json& retained_runs=spg::Json::array()) {
+inline void publish_events(const spg::fs::path& path,const std::string& events,const spg::Json& retained_runs=spg::Json::array(),bool live=false) {
     using namespace spg;
     EventLog projection;
     size_t at=0;
@@ -31,6 +31,7 @@ inline void publish_events(const spg::fs::path& path,const std::string& events,c
     }
     std::sort(rows.begin(),rows.end(),[](const auto& a,const auto& b){return a["ts"]<b["ts"];});
     std::ofstream data(folder/(name+".data"),std::ios::binary), index(folder/(name+".index"),std::ios::binary);
+    if(live) { std::array<char,64> header{}; memcpy(header.data(),&generation,8); index.write(header.data(),header.size()); }
     for(const auto& row:rows) {
         auto raw=Json::to_msgpack(row); std::vector<char> compressed(size_t(LZ4_compressBound(int(raw.size()))));
         auto size=LZ4_compress_default(reinterpret_cast<const char*>(raw.data()),compressed.data(),int(raw.size()),int(compressed.size()));
@@ -39,11 +40,12 @@ inline void publish_events(const spg::fs::path& path,const std::string& events,c
         auto event=row["event"].get<std::string>(); if(event=="done") kind=4; else if(event=="failed_terminal") kind=5;
         else if(event=="failed_password") kind=2; else if(event=="suspended_missing_volume") kind=3;
         memcpy(entry.data(),&time,8); memcpy(entry.data()+8,&offset,8); memcpy(entry.data()+16,&length,4);
-        memcpy(entry.data()+20,&raw_size,4); memcpy(entry.data()+24,&kind,4); memset(entry.data()+32,255,32);
+        auto ordinal=uint32_t(uint64_t(index.tellp())/64);
+        memcpy(entry.data()+20,&raw_size,4); memcpy(entry.data()+24,&kind,4); memcpy(entry.data()+28,&ordinal,4); memset(entry.data()+32,255,32);
         data.write(compressed.data(),size); index.write(entry.data(),64);
     }
     data.close(); index.close();
-    auto run=Json{{"name",name},{"head",0},{"count",rows.size()}};
-    auto runs=retained_runs; runs.push_back(std::move(run));
-    atomic_write(path,Json{{"format",1},{"revision",generation},{"task_revision",generation},{"runs",std::move(runs)},{"live",nullptr},{"dropped",0}}.dump());
+    auto run=Json{{"name",name},{"head",live?1:0},{"count",rows.size()+(live?1:0)},{"unordered",live}};
+    auto runs=retained_runs; if(!live) runs.push_back(run);
+    atomic_write(path,Json{{"format",1},{"revision",generation},{"task_revision",generation},{"runs",std::move(runs)},{"live",live?run:Json()},{"dropped",0}}.dump());
 }

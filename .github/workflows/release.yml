@@ -321,6 +321,8 @@ jobs:
 
       - name: Verify Core UI manager
         shell: pwsh
+        env:
+          sunpack_TEST_7Z: ${{ github.workspace }}/${{ matrix.arch == 'arm64' && 'tools-arm64' || 'tools' }}/7z.exe
         run: |
           .\scripts\build_gui.ps1 -Arch ${{ matrix.arch }} -TestsOnly
 

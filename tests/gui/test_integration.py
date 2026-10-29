@@ -370,6 +370,11 @@ def test_gui_reads_display_state_across_publication_faults_and_close(tmp_path):
         kernel.CreateFileW.restype = wintypes.HANDLE
         kernel.CloseHandle.argtypes = [wintypes.HANDLE]
         kernel.ReadFile.argtypes = [wintypes.HANDLE, wintypes.LPVOID, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD), wintypes.LPVOID]
+        kernel.FindFirstChangeNotificationW.argtypes = [wintypes.LPCWSTR, wintypes.BOOL, wintypes.DWORD]
+        kernel.FindFirstChangeNotificationW.restype = wintypes.HANDLE
+        kernel.FindNextChangeNotification.argtypes = [wintypes.HANDLE]
+        kernel.FindCloseChangeNotification.argtypes = [wintypes.HANDLE]
+        kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
         # A normal GUI reader allows deletion and must not prevent compaction.
         # MoveFileExW alone fails with error 5 even with this sharing mode.
         held = kernel.CreateFileW(str(path), 0x80000000, 7, None, 3, 0, None)
@@ -388,6 +393,8 @@ def test_gui_reads_display_state_across_publication_faults_and_close(tmp_path):
         held = kernel.CreateFileW(str(path), 0x80000000, 1, None, 3, 0, None)
         assert held != wintypes.HANDLE(-1).value
         before = path.read_bytes()
+        changed = kernel.FindFirstChangeNotificationW(str(tmp_path), False, 0x11)
+        assert changed != wintypes.HANDLE(-1).value
         from concurrent.futures import ThreadPoolExecutor
         with ThreadPoolExecutor(max_workers=1) as executor:
             try:
@@ -395,12 +402,21 @@ def test_gui_reads_display_state_across_publication_faults_and_close(tmp_path):
                 log.write("diagnostic", padding="x" * 4096)
                 publication = executor.submit(log.flush)
                 # A reader that denies deletion delays replacement until it
-                # releases its handle. The previously published file stays valid.
+                # releases its handle. Wait for actual publication via directory
+                # notifications, so the read cannot precede the writer's update.
+                while not path.with_name(path.name + ".tmp").exists():
+                    assert kernel.WaitForSingleObject(changed, 10000) == 0
+                    assert kernel.FindNextChangeNotification(changed)
                 assert path.read_bytes() == before
-                stale = _state_projection(path)
-                assert [(r["id"], r["status"]) for r in stale["tasks"]["rows"]] == [(r["id"], r["status"]) for r in published["tasks"]["rows"]]
+                # The old manifest cannot certify mutable slots from the next
+                # publication. The GUI retains its last page on this conflict;
+                # accepting an empty page here used to silently erase its cards.
+                with pytest.raises(subprocess.CalledProcessError) as pending:
+                    _state_projection(path)
+                assert pending.value.returncode == 32
             finally:
                 kernel.CloseHandle(held)
+                kernel.FindCloseChangeNotification(changed)
             publication.result()
         assert not log.error
         log.write("diagnostic", message="disk available again")
@@ -683,13 +699,14 @@ def test_split_arrivals_publish_only_confirmed_cards(tmp_path, monkeypatch):
     from sunpack.runtime.watch.scanner import watch_candidate_for_path
     from sunpack.runtime.watch.roots import WatchRootEntry
     from tests.helpers.config_factory import make_config
+    from tests.helpers.tool_config import require_7z
 
     monkeypatch.setattr("sunpack.runtime.watch.scheduler.validate_ntfs_watch_roots", lambda _roots: None)
     root = tmp_path / "input"
     root.mkdir()
     payload = tmp_path / "payload.txt"
     payload.write_text("split arrival payload\n" * 110, encoding="utf-8")
-    subprocess.run([str(Path(__file__).resolve().parents[2] / "tools" / "7z.exe"),
+    subprocess.run([str(require_7z()),
                     "a", "-t7z", "-mx=0", "-v1k", str(tmp_path / "split.7z"), str(payload)],
                    check=True, capture_output=True)
     parts = sorted(tmp_path.glob("split.7z.*"))

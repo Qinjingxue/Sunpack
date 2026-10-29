@@ -81,20 +81,21 @@ struct RunReader {
     fs::path data_path;
     Handle index;
     std::unique_ptr<Handle> data;
-    uint64_t head=0,count=0;
+    uint64_t head=0,count=0,revision=0;
     int64_t position=-1;
     Entry current{};
     std::vector<Entry> cache;
     bool unordered=false, filtered=false;
     std::vector<std::pair<Cursor,Entry>> selected;
     uint64_t cache_start=0;
-    RunReader(const fs::path& folder,const Json& run,const std::optional<Cursor>& before):name(run_name(run)),
-        data_path(folder/(name+".data")),index(open_reader(folder/(name+".index"))) {
+    RunReader(const fs::path& folder,const Json& run,const std::optional<Cursor>& before,uint64_t revision):name(run_name(run)),
+        data_path(folder/(name+".data")),index(open_reader(folder/(name+".index"))),revision(revision) {
         head=run.at("head").get<uint64_t>(); count=run.at("count").get<uint64_t>();
+        unordered=run.value("unordered",false);
+        validate();
         LARGE_INTEGER size{}; if(!GetFileSizeEx(index,&size)) win_error("opReadEventLog");
         count=std::min(count,uint64_t(size.QuadPart)/EntryBytes);
         if(head>=count) return;
-        unordered=run.value("unordered",false);
         auto end=count;
         if(before && !unordered) {
             uint64_t lo=head,hi=count;
@@ -104,6 +105,13 @@ struct RunReader {
             end=lo;
         }
         if(end>head) { position=int64_t(end-1); current=at(uint64_t(position)); }
+    }
+    void validate() const {
+        if(unordered) {
+            if(head!=1) throw std::runtime_error("logRecordTooLarge");
+            uint64_t committed=0; read_at(index,0,&committed,sizeof(committed));
+            if(!committed || committed!=revision) throw WinError(ERROR_SHARING_VIOLATION,"opReadEventLog");
+        }
     }
     Entry at(uint64_t pos) {
         if(cache.empty() || pos<cache_start || pos>=cache_start+cache.size()) {
@@ -118,6 +126,7 @@ struct RunReader {
     Json value(std::vector<char>& packed,std::vector<char>& raw) {
         try { return decode_value(packed,raw); }
         catch(...) {
+            validate();
             Entry after{};
             auto ordinal=unordered?uint64_t(current.reserved):uint64_t(position);
             read_at(index,ordinal*EntryBytes,&after,EntryBytes);
@@ -167,7 +176,8 @@ Json EventLog::query(const WatchRoots& roots,const View& view,const std::string&
     std::optional<Cursor> before;
     if(!view.task_cursor.empty()) { auto c=Json::parse(view.task_cursor); before=Cursor{c.at(0).get<int64_t>(),c.at(1).get<std::string>(),c.at(2).get<uint64_t>()}; }
     std::vector<std::unique_ptr<RunReader>> runs;
-    for(const auto& run:manifest.at("runs")) runs.push_back(std::make_unique<RunReader>(folder,run,before));
+    auto revision=manifest.value("task_revision",uint64_t(0));
+    for(const auto& run:manifest.at("runs")) runs.push_back(std::make_unique<RunReader>(folder,run,before,revision));
     auto query=folded(view.task_query); auto bits=filter(query);
     auto root_text=folded(view.task_root); std::replace(root_text.begin(),root_text.end(),L'/',L'\\'); auto root_bits=filter(root_text);
     EventLog page;
@@ -177,7 +187,7 @@ Json EventLog::query(const WatchRoots& roots,const View& view,const std::string&
     bool more=false;
     uint32_t desired=view.task_status=="taskSucceeded"?4:view.task_status=="taskFailed"?5:view.task_status=="taskProcessing"?1:0;
     if(manifest.contains("live") && manifest["live"].is_object()) {
-        auto live=std::make_unique<RunReader>(folder,manifest["live"],before);
+        auto live=std::make_unique<RunReader>(folder,manifest["live"],before,revision);
         if(live->unordered) {
             // Live slots are mutable. Scan only their compact metadata, keeping
             // at most one page of candidates; historical runs remain seekable.
@@ -222,6 +232,9 @@ Json EventLog::query(const WatchRoots& roots,const View& view,const std::string&
         bytes+=record.raw?record.raw:PageBytes; last=std::move(cursor); selected->previous();
     }
     if(cancelled && cancelled()) return Json();
+    // Even an empty/filtered page can have crossed a live-slot mutation.
+    // Reuse the GUI's existing observed-conflict retry, retaining its last page.
+    for(const auto& run:runs) run->validate();
     View selected_view; // Already filtered using complete on-disk member lists.
     auto result=task_rows(page,roots,selected_view,language);
     result["hasMore"]=more; result["dropped"]=manifest.value("dropped",uint64_t(0));
