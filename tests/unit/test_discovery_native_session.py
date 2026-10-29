@@ -208,7 +208,7 @@ def test_spilled_signature_noise_preserves_carrier_peers_concurrently(tmp_path):
     import gzip
     from sunpack_native import scan_embedded_archives
     footer = lzma.compress(b"")[-12:]
-    payload = (b"\x28\xb5\x2f\xfd\xff" + footer) * 1_000_000
+    payload = (b"\x28\xb5\x2f\xfd\xff" + footer) * 1_100_000
     packed = BytesIO()
     with zipfile.ZipFile(packed, "w", compression=zipfile.ZIP_STORED) as archive:
         archive.writestr("payload.bin", payload)

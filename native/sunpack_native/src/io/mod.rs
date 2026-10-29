@@ -17,15 +17,17 @@ pub(crate) mod runtime_binary;
 pub(crate) mod scratch;
 pub(crate) mod util;
 
+// The payload owns its representation and any shared coordinate context;
+// IOCP forwards it without expanding compact records into absolute objects.
 pub(crate) struct ScanBatch<T> {
-    pub(crate) results: Vec<T>,
+    pub(crate) results: T,
     pub(crate) discarded_results: usize,
 }
 
-impl<T> Default for ScanBatch<T> {
+impl<T: Default> Default for ScanBatch<T> {
     fn default() -> Self {
         Self {
-            results: Vec::new(),
+            results: T::default(),
             discarded_results: 0,
         }
     }

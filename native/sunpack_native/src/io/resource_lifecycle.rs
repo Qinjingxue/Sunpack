@@ -89,7 +89,9 @@ impl TrackedFile {
     {
         let path = path.as_ref();
         let resource = NativeResourceGuard::register_with_promotion(
-            kind, [path.to_path_buf()], promotion_blocking,
+            kind,
+            [path.to_path_buf()],
+            promotion_blocking,
         )?;
         let mut options = std::fs::OpenOptions::new();
         configure(&mut options);
@@ -392,12 +394,9 @@ pub(crate) fn native_wait_for_resources(
             let registry = state
                 .changed
                 .wait_while(registry, |registry| {
-                    registry
-                        .resources
-                        .values()
-                        .any(|record| {
-                            record.promotion_blocking && (roots.is_empty() || overlaps(record, &roots))
-                        })
+                    registry.resources.values().any(|record| {
+                        record.promotion_blocking && (roots.is_empty() || overlaps(record, &roots))
+                    })
                 })
                 .map_err(|_| io::Error::other("native resource registry poisoned"))?;
             Ok::<_, io::Error>(matching_resources(&registry, &roots, true))

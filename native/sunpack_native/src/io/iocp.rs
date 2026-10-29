@@ -348,7 +348,7 @@ pub(crate) fn scan_file<T, F, C>(
 where
     T: Send,
     F: Fn(&[u8], usize, u64) -> ScanBatch<T> + Send + Sync,
-    C: FnMut(Vec<T>) -> io::Result<()> + Send,
+    C: FnMut(T) -> io::Result<()> + Send,
 {
     if file_size == 0 {
         return Ok(IocpScanOutput {

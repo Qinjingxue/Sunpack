@@ -79,6 +79,17 @@ impl Default for Spool {
     }
 }
 impl Spool {
+    pub(crate) fn spill(&mut self) -> io::Result<()> {
+        if self.file.is_none() {
+            let mut file = scratch_file()?;
+            file.write_all(self.memory.get_ref())?;
+            file.seek(SeekFrom::Start(self.memory.position()))?;
+            self.memory = Cursor::new(Vec::new());
+            self.file = Some(BufWriter::with_capacity(64 * 1024, file));
+        }
+        Ok(())
+    }
+
     pub fn len(&self) -> io::Result<u64> {
         Ok(self.length)
     }
@@ -109,11 +120,7 @@ impl Write for Spool {
         if self.file.is_none()
             && self.memory.position().saturating_add(bytes.len() as u64) > MEMORY_BYTES as u64
         {
-            let mut file = scratch_file()?;
-            file.write_all(self.memory.get_ref())?;
-            file.seek(SeekFrom::Start(self.memory.position()))?;
-            self.memory = Cursor::new(Vec::new());
-            self.file = Some(BufWriter::with_capacity(64 * 1024, file));
+            self.spill()?;
         }
         let written = match self.file.as_mut() {
             Some(file) => file.write(bytes),
