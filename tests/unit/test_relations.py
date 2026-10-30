@@ -9,7 +9,7 @@ import pytest
 
 from sunpack.pipeline.coordinator.scan_session import DiscoveryScanSession
 from sunpack.pipeline.coordinator.target_groups import relation_group_to_candidate
-from sunpack.pipeline.coordinator.target_scan import build_candidates_for_target
+from sunpack.pipeline.coordinator.target_scan import build_candidates_for_targets
 from sunpack.pipeline.coordinator.task_provider import ArchiveTaskProvider
 from sunpack.pipeline.discovery.embedded.options import EmbeddedOptions
 from sunpack.pipeline.discovery.filesystem.directory_scanner import DirectoryScanner
@@ -77,7 +77,7 @@ def test_plain_file_relation_omits_empty_volume_anchor(tmp_path):
     path = tmp_path / "ordinary.bin"
     path.write_bytes(b"ordinary data")
 
-    candidates = build_candidates_for_target(str(path), session=DiscoveryScanSession(config=make_config()))
+    candidates = build_candidates_for_targets([str(path)], session=DiscoveryScanSession(config=make_config()))
 
     assert candidates
     assert all(candidate.relation_anchor == {} for candidate in candidates)

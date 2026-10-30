@@ -131,7 +131,8 @@ def test_discovery_candidate_projection_bypasses_legacy_routing_columns(tmp_path
     )
 
     session = DiscoveryScanSession(config=make_config({}))
-    candidates = session.candidates_for_directory(str(tmp_path))
+    from sunpack.pipeline.coordinator.target_scan import build_candidates_for_targets
+    candidates = build_candidates_for_targets([str(tmp_path)], session=session)
 
     assert len(candidates) == 1
     assert candidates[0].entry_path == str(payload)
@@ -153,7 +154,8 @@ def test_directory_without_relation_anchor_skips_relations_entirely(tmp_path, mo
         ),
     )
 
-    candidates = session.candidates_for_directory(str(tmp_path))
+    from sunpack.pipeline.coordinator.target_scan import build_candidates_for_targets
+    candidates = build_candidates_for_targets([str(tmp_path)], session=session)
 
     assert {candidate.route for candidate in candidates} == {"detection", "residual"}
 
@@ -183,12 +185,10 @@ def test_relations_anchor_view_recovers_unrouted_split_members_from_raw_snapshot
     assert routes[first.name][0] == "relations"
     assert routes[second.name][0] == "residual"
 
-    groups = session.relation_groups_for_directory(
-        str(tmp_path),
-        filesystem_routed=True,
-    )
-    split = next(group for group in groups if group.kind == "split_archive")
-    assert split.input_paths == [str(first), str(second)]
+    from sunpack.pipeline.coordinator.target_scan import build_candidates_for_targets
+    candidates = build_candidates_for_targets([str(tmp_path)], session=session)
+    split = next(candidate for candidate in candidates if candidate.is_split)
+    assert split.archive_input.part_paths() == [str(first), str(second)]
 
 
 def test_main_scan_routes_only_native_container_candidates_through_relations(tmp_path):
@@ -198,7 +198,8 @@ def test_main_scan_routes_only_native_container_candidates_through_relations(tmp
     (tmp_path / "plain.bin").write_bytes(b"ordinary file")
 
     session = DiscoveryScanSession(config=make_config({}))
-    candidates = session.candidates_for_directory(str(tmp_path))
+    from sunpack.pipeline.coordinator.target_scan import build_candidates_for_targets
+    candidates = build_candidates_for_targets([str(tmp_path)], session=session)
     by_name = {
         _basename(candidate.entry_path): candidate
         for candidate in candidates

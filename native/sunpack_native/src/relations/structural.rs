@@ -126,11 +126,10 @@ impl StructuralFacts {
 /// One collection per active bucket. Only encrypted headers and missing tail
 /// fields and PE/SFX facts are upgraded. Opaque 7z continuations do no I/O.
 pub(super) fn collect(
-    py: Python<'_>,
     rows: &mut [RelationInput],
     index: &BucketIndex,
     passwords: Option<&[(String, String)]>,
-) -> PyResult<()> {
+) {
     let password_map: HashMap<_, _> = passwords
         .into_iter()
         .flatten()
@@ -149,7 +148,7 @@ pub(super) fn collect(
         })
         .collect();
     if !encrypted.is_empty() {
-        let upgraded = py.detach(|| probe_volume_anchor_paths_cheap(&encrypted, passwords));
+        let upgraded = probe_volume_anchor_paths_cheap(&encrypted, passwords);
         for anchor in upgraded {
             if let Some(i) = index.entries_by_path.get(&path_key(&anchor.path)) {
                 // Embedded SFX headers need their known archive offset.
@@ -171,14 +170,12 @@ pub(super) fn collect(
             .filter(|a| a.needs_password && a.structure_offset.unwrap_or(0) > 0)
         {
             if let Some(password) = password_map.get(&rows[i].path_key) {
-                let mut upgraded = py.detach(|| {
-                    probe_volume_anchor_at_offset(
-                        &rows[i].path,
-                        anchor.structure_offset.unwrap(),
-                        &anchor.format,
-                        Some(password),
-                    )
-                });
+                let mut upgraded = probe_volume_anchor_at_offset(
+                    &rows[i].path,
+                    anchor.structure_offset.unwrap(),
+                    &anchor.format,
+                    Some(password),
+                );
                 upgraded.pe_state = anchor.pe_state;
                 upgraded.pe_image_end = anchor.pe_image_end;
                 upgraded.sfx = anchor.sfx;
@@ -206,7 +203,7 @@ pub(super) fn collect(
         {
             // Refine only structure facts. Stage ownership and filesystem routes
             // stay unchanged; the native residual retains this refined anchor.
-            let probe = py.detach(|| inspect_pe_image_native(&rows[i].path));
+            let probe = inspect_pe_image_native(&rows[i].path);
             let Ok(probe) = probe else {
                 // A transient read error is not evidence against PE identity.
                 continue;
@@ -215,7 +212,7 @@ pub(super) fn collect(
             anchor.pe_state = probe.state();
             anchor.pe_image_end = probe.image_end();
         }
-        if let Some(anchor) = promote_sfx_archive_anchor(py, &rows[i], passwords)? {
+        if let Some(anchor) = promote_sfx_archive_anchor(&rows[i], passwords) {
             rows[i].anchor = Some(anchor);
         }
         if let Some(anchor) = rows[i].anchor.as_mut() {
@@ -255,26 +252,41 @@ pub(super) fn collect(
             }
         }
     }
-    let updates = py.detach(|| {
-        rar.par_iter()
-            .map(|&i| {
-                (
-                    i,
-                    upgrade_relation_rar_end(
-                        rows[i].anchor.as_ref().unwrap(),
-                        password_map.get(&rows[i].path_key).copied(),
-                    ),
-                )
-            })
-            .chain(zip.par_iter().map(|&i| {
-                (
-                    i,
-                    upgrade_relation_zip_tail(rows[i].anchor.as_ref().unwrap()),
-                )
-            }))
-            .collect::<Vec<_>>()
-    });
+    let updates = rar
+        .par_iter()
+        .map(|&i| {
+            (
+                i,
+                upgrade_relation_rar_end(
+                    rows[i].anchor.as_ref().unwrap(),
+                    password_map.get(&rows[i].path_key).copied(),
+                ),
+            )
+        })
+        .chain(zip.par_iter().map(|&i| {
+            (
+                i,
+                upgrade_relation_zip_tail(rows[i].anchor.as_ref().unwrap()),
+            )
+        }))
+        .collect::<Vec<_>>();
     for (i, anchor) in updates {
+        // Reuse the catalog's existing per-generation fact cell. Only a ZIP
+        // proved standalone by its own head and tail is independent of bucket
+        // membership and passwords; never cache the contextual inference below.
+        if anchor.format == "zip"
+            && anchor.standalone
+            && anchor.error.is_empty()
+            && anchor.evidence.contains(&"zip:local_header")
+            && anchor.anchor_roles.contains(&"terminal")
+        {
+            if let Some(cell) = &rows[i].anchor_cell {
+                let mut cached = cell.lock().unwrap_or_else(|e| e.into_inner());
+                if cached.as_ref().is_none_or(|old| !old.standalone) {
+                    *cached = Some(Arc::new(anchor.clone()));
+                }
+            }
+        }
         rows[i].anchor = Some(anchor);
     }
     for indexes in index.rows_by_stem.values() {
@@ -299,5 +311,4 @@ pub(super) fn collect(
             }
         }
     }
-    Ok(())
 }

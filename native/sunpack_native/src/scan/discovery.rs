@@ -28,6 +28,126 @@ enum Candidate {
 #[derive(Default)]
 pub(crate) struct NativeCandidateTable {
     rows: Vec<Candidate>,
+    filesystem_routed: bool,
+    targets: Option<FileTargets>,
+}
+
+struct FileTargets {
+    names_by_path: HashMap<String, String>,
+}
+
+impl FileTargets {
+    fn new(targets: Vec<(String, String)>) -> Self {
+        Self {
+            names_by_path: targets
+                .into_iter()
+                .map(|(path, name)| (path_key(&path), case_key(&name)))
+                .collect(),
+        }
+    }
+
+    fn select(&self, snapshot: &NativeDirectorySnapshot) -> Option<NativeDirectorySnapshot> {
+        let rows: Vec<_> = snapshot
+            .rows
+            .iter()
+            .copied()
+            .filter(|&row| {
+                self.names_by_path
+                    .contains_key(&path_key(&snapshot.table.paths[row]))
+            })
+            .collect();
+        // Preserve logical-name recovery for targets excluded from the view.
+        (rows.len() == self.names_by_path.len()).then(|| snapshot.view(rows))
+    }
+
+    fn retain(&self, rows: &mut Vec<Candidate>) {
+        let mut matched = Vec::with_capacity(rows.len());
+        let mut physical_matches = HashSet::new();
+        for row in rows.iter() {
+            let mut matches = |path: &str| {
+                let key = path_key(path);
+                if self.names_by_path.contains_key(&key) {
+                    physical_matches.insert(key);
+                    true
+                } else {
+                    false
+                }
+            };
+            let contains = match row {
+                Candidate::File(table, index) => matches(&table.paths[*index]),
+                Candidate::Relation(group) => {
+                    let data = group.candidate_data();
+                    data.parts()
+                        .chain(data.companions.iter().map(String::as_str))
+                        .chain([data.carrier_path, data.entry_path])
+                        .filter(|path| matches(path))
+                        .count()
+                        > 0
+                }
+            };
+            matched.push(contains);
+        }
+        let expected: HashSet<&str> = self
+            .names_by_path
+            .iter()
+            .filter(|(path, _)| !physical_matches.contains(*path))
+            .map(|(_, name)| name.as_str())
+            .collect();
+        let mut selected = matched.into_iter();
+        rows.retain(|row| {
+            let contains = selected.next().unwrap();
+            contains || matches!(row, Candidate::Relation(group) if {
+                let data = group.candidate_data();
+                data.is_split && Path::new(data.logical_name().as_ref()).file_name()
+                    .is_some_and(|name| expected.contains(case_key(&name.to_string_lossy()).as_str()))
+            })
+        });
+    }
+}
+
+impl NativeCandidateTable {
+    fn relation_groups(
+        &self,
+        raw: &NativeDirectorySnapshot,
+        filtered: &NativeDirectorySnapshot,
+        passwords: Option<&[(String, String)]>,
+        cached: Option<&RelationCache>,
+    ) -> Vec<NativeRelationGroup> {
+        let selection = self
+            .targets
+            .as_ref()
+            .and_then(|targets| targets.select(filtered))
+            .unwrap_or_else(|| {
+                if self.filesystem_routed {
+                    filtered.file_route_view(FILE_ROUTE_RELATIONS)
+                } else {
+                    filtered.view(filtered.rows.clone())
+                }
+            });
+        let mut groups =
+            build_native_candidate_groups_from_snapshot_cached(raw, &selection, passwords, cached);
+        if self.filesystem_routed {
+            let routed: HashSet<_> = selection
+                .rows
+                .iter()
+                .filter(|&&row| selection.table.file_routes[row] == FILE_ROUTE_RELATIONS)
+                .map(|&row| path_key(&selection.table.paths[row]))
+                .collect();
+            groups.retain(|group| match group {
+                NativeRelationGroup::Ordinary(..) => {
+                    routed.contains(&path_key(group.candidate_data().entry_path))
+                }
+                _ => true,
+            });
+        }
+        groups
+    }
+
+    fn retain_targets(&mut self) {
+        if let Some(targets) = &self.targets {
+            targets.retain(&mut self.rows);
+        }
+    }
 }
 
 #[pyclass(module = "sunpack_native")]
@@ -197,12 +317,15 @@ impl NativeCandidateTable {
         filtered_snapshot: PyRef<'_, NativeDirectorySnapshot>,
         path_passwords: Option<Vec<(String, String)>>,
     ) -> PyResult<()> {
-        let groups = build_native_candidate_groups_from_snapshot(
-            py,
-            &raw_snapshot,
-            &filtered_snapshot,
-            path_passwords.as_deref(),
-        )?;
+        let raw_snapshot = &*raw_snapshot;
+        let filtered_snapshot = &*filtered_snapshot;
+        let groups = py.detach(|| {
+            build_native_candidate_groups_from_snapshot(
+                raw_snapshot,
+                filtered_snapshot,
+                path_passwords.as_deref(),
+            )
+        });
         self.rows.extend(
             groups
                 .into_iter()
@@ -211,30 +334,42 @@ impl NativeCandidateTable {
         Ok(())
     }
 
+    #[pyo3(signature = (raw_snapshot, filtered_snapshot, targets=None))]
     fn append_directory(
         &mut self,
         py: Python<'_>,
         raw_snapshot: PyRef<'_, NativeDirectorySnapshot>,
         filtered_snapshot: PyRef<'_, NativeDirectorySnapshot>,
+        targets: Option<Vec<(String, String)>>,
     ) -> PyResult<()> {
-        let relation_view = filtered_snapshot.file_route_view(FILE_ROUTE_RELATIONS);
-        let groups =
-            build_native_candidate_groups_from_snapshot(py, &raw_snapshot, &relation_view, None)?;
-        self.rows
-            .reserve(groups.len() + filtered_snapshot.rows.len());
-        self.rows.extend(
-            groups
-                .into_iter()
-                .map(|group| Candidate::Relation(Box::new(group))),
-        );
-        for &row in &filtered_snapshot.rows {
-            if !filtered_snapshot.table.is_dirs[row]
-                && filtered_snapshot.table.file_routes[row] != FILE_ROUTE_RELATIONS
-            {
-                self.rows
-                    .push(Candidate::File(Arc::clone(&filtered_snapshot.table), row));
+        let raw_snapshot = &*raw_snapshot;
+        let filtered_snapshot = &*filtered_snapshot;
+        py.detach(|| {
+            self.filesystem_routed = true;
+            self.targets = targets.map(FileTargets::new);
+            let groups = self.relation_groups(raw_snapshot, filtered_snapshot, None, None);
+            let selected = self
+                .targets
+                .as_ref()
+                .and_then(|targets| targets.select(filtered_snapshot));
+            let filtered_snapshot = selected.as_ref().unwrap_or(filtered_snapshot);
+            self.rows
+                .reserve(groups.len() + filtered_snapshot.rows.len());
+            self.rows.extend(
+                groups
+                    .into_iter()
+                    .map(|group| Candidate::Relation(Box::new(group))),
+            );
+            for &row in &filtered_snapshot.rows {
+                if !filtered_snapshot.table.is_dirs[row]
+                    && filtered_snapshot.table.file_routes[row] != FILE_ROUTE_RELATIONS
+                {
+                    self.rows
+                        .push(Candidate::File(Arc::clone(&filtered_snapshot.table), row));
+                }
             }
-        }
+            self.retain_targets();
+        });
         Ok(())
     }
 
@@ -262,19 +397,21 @@ impl NativeCandidateTable {
         path_passwords: Vec<(String, String)>,
         refresh_paths: Option<Vec<String>>,
     ) -> PyResult<()> {
-        let mut cached = RelationCache::default();
-        for row in &self.rows {
-            if let Candidate::Relation(group) = row {
-                relation_group_cached_anchors(group, &mut cached);
+        let raw_snapshot = &*raw_snapshot;
+        let filtered_snapshot = &*filtered_snapshot;
+        py.detach(|| {
+            let mut cached = RelationCache::default();
+            for row in &self.rows {
+                if let Candidate::Relation(group) = row {
+                    relation_group_cached_anchors(group, &mut cached);
+                }
             }
-        }
-        // A short password probe may start after another request consumed its
-        // inputs. Drop only proven departures from that proposal, sharing the
-        // original snapshot and surviving anchors instead of scanning again.
-        let departed: HashSet<String> = refresh_paths
-            .filter(|paths| !paths.is_empty())
-            .map(|paths| {
-                py.detach(|| {
+            // A short password probe may start after another request consumed its
+            // inputs. Drop only proven departures from that proposal, sharing the
+            // original snapshot and surviving anchors instead of scanning again.
+            let departed: HashSet<String> = refresh_paths
+                .filter(|paths| !paths.is_empty())
+                .map(|paths| {
                     paths
                         .into_iter()
                         .filter(|path| {
@@ -284,95 +421,30 @@ impl NativeCandidateTable {
                         .map(|path| path_key(&path))
                         .collect()
                 })
-            })
-            .unwrap_or_default();
-        let current_snapshots = (!departed.is_empty()).then(|| {
-            (
-                raw_snapshot.without_path_keys(&departed),
-                filtered_snapshot.without_path_keys(&departed),
-            )
+                .unwrap_or_default();
+            let current_snapshots = (!departed.is_empty()).then(|| {
+                (
+                    raw_snapshot.without_path_keys(&departed),
+                    filtered_snapshot.without_path_keys(&departed),
+                )
+            });
+            let (raw, filtered) = current_snapshots
+                .as_ref()
+                .map(|(raw, filtered)| (raw, filtered))
+                .unwrap_or((raw_snapshot, filtered_snapshot));
+            let groups = self.relation_groups(raw, filtered, Some(&path_passwords), Some(&cached));
+            self.rows.retain(|row| matches!(row, Candidate::File(..)));
+            let mut replacement = Vec::with_capacity(groups.len() + self.rows.len());
+            replacement.extend(
+                groups
+                    .into_iter()
+                    .map(|group| Candidate::Relation(Box::new(group))),
+            );
+            replacement.append(&mut self.rows);
+            self.rows = replacement;
+            self.retain_targets();
         });
-        let (raw, filtered) = current_snapshots
-            .as_ref()
-            .map(|(raw, filtered)| (raw, filtered))
-            .unwrap_or((&raw_snapshot, &filtered_snapshot));
-        let groups = build_native_candidate_groups_from_snapshot_cached(
-            py,
-            raw,
-            filtered,
-            Some(&path_passwords),
-            Some(&cached),
-        )?;
-        self.rows.retain(|row| matches!(row, Candidate::File(..)));
-        let mut replacement = Vec::with_capacity(groups.len() + self.rows.len());
-        replacement.extend(
-            groups
-                .into_iter()
-                .map(|group| Candidate::Relation(Box::new(group))),
-        );
-        replacement.append(&mut self.rows);
-        self.rows = replacement;
         Ok(())
-    }
-
-    fn retain_file_targets(&mut self, targets: Vec<(String, String)>) {
-        let selected: HashSet<String> = targets.iter().map(|(path, _)| path_key(path)).collect();
-        let mut matched = Vec::with_capacity(self.rows.len());
-        let mut physical_matches = HashSet::new();
-        for row in &self.rows {
-            let contains = match row {
-                Candidate::File(table, index) => {
-                    let key = path_key(&table.paths[*index]);
-                    if selected.contains(&key) {
-                        physical_matches.insert(key);
-                        true
-                    } else {
-                        false
-                    }
-                }
-                Candidate::Relation(group) => {
-                    let data = group.candidate_data();
-                    let contains = data
-                        .parts()
-                        .chain(data.companions.iter().map(String::as_str))
-                        .chain([data.carrier_path, data.entry_path])
-                        .filter(|part| {
-                            let key = path_key(part);
-                            if selected.contains(&key) {
-                                physical_matches.insert(key);
-                                true
-                            } else {
-                                false
-                            }
-                        })
-                        .count()
-                        > 0;
-                    contains
-                }
-            };
-            matched.push(contains);
-        }
-        let expected: HashSet<String> = targets
-            .into_iter()
-            .filter(|(path, _)| !physical_matches.contains(&path_key(path)))
-            .map(|(_, name)| case_key(&name))
-            .collect();
-        self.rows = self
-            .rows
-            .drain(..)
-            .zip(matched)
-            .filter_map(|(row, contains)| {
-                let logical_match = matches!(&row, Candidate::Relation(group)
-                        if {
-                            let data = group.candidate_data();
-                            data.is_split
-                                && Path::new(data.logical_name().as_ref())
-                                    .file_name()
-                                    .is_some_and(|name| expected.contains(&case_key(&name.to_string_lossy())))
-                        });
-                (contains || logical_match).then_some(row)
-            })
-            .collect();
     }
 
     fn extend(&mut self, other: &mut NativeCandidateTable) {

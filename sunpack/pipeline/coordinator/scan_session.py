@@ -8,10 +8,10 @@ from sunpack.core.support.path_keys import normalized_path, path_key
 from sunpack_native import NativeCandidateTable, NativeHeadFactCache
 
 from sunpack.core.contracts.discovery import DiscoveryCandidate
-from sunpack.core.contracts.filesystem import DirectorySnapshot, FILESYSTEM_ROUTE_RELATIONS
+from sunpack.core.contracts.filesystem import DirectorySnapshot
 from sunpack.pipeline.coordinator.target_groups import filesystem_candidate, relation_group_to_candidate
 from sunpack.pipeline.discovery.filesystem.directory_scanner import DirectoryScanner
-from sunpack.pipeline.discovery.relations import CandidateGroup, RelationsScheduler
+from sunpack.pipeline.discovery.relations import RelationsScheduler
 from sunpack.core.support.filesystem_scan_errors import DirectoryErrorReport
 
 
@@ -37,8 +37,6 @@ class DiscoveryScanSession:
         self.relations = relations or RelationsScheduler(self.config)
         self.include_raw_snapshots = include_raw_snapshots
         self._snapshots: dict[str, DirectorySnapshot] = {}
-        self._relation_groups: dict[str, list[CandidateGroup]] = {}
-        self._relation_group_signatures: dict[str, str] = {}
         self._head_facts = NativeHeadFactCache()
         self._scan_errors: DirectoryErrorReport | None = None
 
@@ -102,45 +100,13 @@ class DiscoveryScanSession:
             self.add_scan_errors(self._snapshots[key].native_snapshot.scan_errors())
         return self._snapshots[key]
 
-    def relation_groups_for_directory(
-        self,
-        directory: str,
-        path_passwords: dict[str, str] | None = None,
-        *,
-        refresh: bool = False,
-        filesystem_routed: bool = False,
-    ) -> list[CandidateGroup]:
-        key = self._directory_key(directory)
-        cache_key = f"{key}::relations" if filesystem_routed else key
-        signature = _password_signature(path_passwords)
-        cached_signature = self._relation_group_signatures.get(cache_key)
-        if refresh or cache_key not in self._relation_groups or cached_signature != signature:
-            snapshot = self.snapshot_for_directory(directory)
-            if filesystem_routed:
-                snapshot = snapshot.file_route_view(FILESYSTEM_ROUTE_RELATIONS)
-                if len(snapshot) == 0:
-                    self._relation_groups[cache_key] = []
-                    self._relation_group_signatures[cache_key] = signature
-                    return []
-            groups = self.relations.build_candidate_groups(
-                snapshot,
-                path_passwords=path_passwords,
-            )
-            self._relation_groups[cache_key] = groups
-            self._relation_group_signatures[cache_key] = signature
-        return self._relation_groups[cache_key]
-
-    def candidates_for_directory(self, directory: str) -> list[DiscoveryCandidate]:
-        table = self.native_table_for_directory(directory)
-        return [self.project_native_candidate(table, index) for index in range(len(table))]
-
-    def native_table_for_directory(self, directory: str) -> NativeCandidateTable:
+    def native_table_for_directory(
+        self, directory: str, *, targets: list[tuple[str, str]] | None = None,
+    ) -> NativeCandidateTable:
         snapshot = self.snapshot_for_directory(directory)
         table = NativeCandidateTable()
-        table.append_directory(snapshot.raw_native_snapshot, snapshot.native_snapshot)
-        self.relations._builder.probe_encrypted_groups(
-            table, snapshot, filesystem_routed=True,
-        )
+        table.append_directory(snapshot.raw_native_snapshot, snapshot.native_snapshot, targets)
+        self.relations._builder.probe_encrypted_groups(table, snapshot)
         return table
 
     def project_native_candidate(self, table: NativeCandidateTable, index: int) -> DiscoveryCandidate:
@@ -168,11 +134,8 @@ class DiscoveryScanSession:
         paths: list[str],
         *,
         magic_size: int = 16,
-        paths_normalized: bool = False,
-        copy_results: bool = True,
     ) -> dict[str, dict[str, Any]]:
-        del copy_results
-        requested = [str(path) if paths_normalized else normalized_path(path) for path in paths if path]
+        requested = [normalized_path(path) for path in paths if path]
         rows = self._head_facts.facts_for_paths(requested, max(0, int(magic_size or 0)))
         return {path_key(row["path"]): row for row in rows}
 
@@ -187,16 +150,3 @@ class DiscoveryScanSession:
         if isinstance(size, int) and isinstance(mtime_ns, int):
             return key, size, mtime_ns
         return key, 0, 0
-
-    def _directory_key(self, directory: str) -> str:
-        return path_key(directory)
-
-
-def _password_signature(path_passwords: dict[str, str] | None) -> str:
-    if not path_passwords:
-        return ""
-    return repr(sorted(
-        (path_key(path), str(password))
-        for path, password in path_passwords.items()
-        if str(password)
-    ))

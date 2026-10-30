@@ -1,7 +1,6 @@
 import subprocess
 from collections import deque
 from collections.abc import Iterable, Iterator
-from copy import deepcopy
 from typing import Any
 
 from sunpack_native import (
@@ -97,7 +96,7 @@ def build_worker_diagnostics(
         },
         "repro": {
             "args": list(args) if isinstance(args, (list, tuple)) else args,
-            "request": _redact_request(request_payload),
+            "request": request_payload if request_payload is not None else {},
         },
     }
     failure = process_failure or _infer_process_failure(returncode, result, stderr)
@@ -189,19 +188,3 @@ def _infer_process_failure(returncode: int | None, result: dict[str, Any], stder
             "message": message or f"sevenzip_worker exited with code {returncode}",
         }
     return {}
-
-
-def _redact_request(request_payload: dict[str, Any] | None) -> dict[str, Any]:
-    if not isinstance(request_payload, dict):
-        return {}
-    payload = deepcopy(request_payload)
-    if "password" in payload:
-        password = payload.get("password")
-        payload["password_present"] = bool(password)
-        payload["password_length"] = len(str(password)) if password is not None else 0
-        payload["password"] = "<redacted>" if password else ""
-    if "passwords" in payload:
-        passwords = payload.get("passwords")
-        payload["password_count"] = len(passwords) if isinstance(passwords, list) else 0
-        payload["passwords"] = "<redacted>"
-    return payload

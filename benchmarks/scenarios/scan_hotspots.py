@@ -290,9 +290,6 @@ def install_wrappers(recorder: HotspotRecorder) -> None:
     recorder.wrap(relation_resolver.RelationResolver, "resolve", "relations.resolve")
 
     recorder.wrap(scan_session.DiscoveryScanSession, "snapshot_for_directory", "session.snapshot_for_directory")
-    recorder.wrap(scan_session.DiscoveryScanSession, "shallow_snapshot_for_directory", "session.shallow_snapshot_for_directory")
-    recorder.wrap(scan_session.DiscoveryScanSession, "relation_groups_for_directory", "session.relation_groups_for_directory")
-    recorder.wrap(scan_session.DiscoveryScanSession, "candidates_for_directory", "session.candidates_for_directory")
     recorder.wrap(scan_session.DiscoveryScanSession, "native_table_for_directory", "session.native_table_for_directory")
     recorder.wrap(scan_session.DiscoveryScanSession, "file_head_facts_for_paths", "session.file_head_facts_for_paths")
 
@@ -314,9 +311,8 @@ def summarize_scan_session(session: Any | None) -> dict[str, Any]:
         return {}
     return {
         "snapshots": len(getattr(session, "_snapshots", {}) or {}),
-        "relation_groups": len(getattr(session, "_relation_groups", {}) or {}),
         "file_head_facts": len(getattr(session, "_head_facts", ())),
-        "scan_roots": list(getattr(session, "_scan_roots", []) or []),
+        "scan_roots": [scope.root for scope in getattr(session, "_scopes", {}).values()],
     }
 
 

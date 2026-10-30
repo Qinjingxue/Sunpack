@@ -38,6 +38,7 @@ pub(crate) struct DirectorySnapshotTable {
     mtimes_ns: Vec<Option<u64>>,
     pub(crate) relation_member_eligible: Vec<bool>,
     pub(crate) relation_anchors: Vec<Option<Arc<VolumeAnchor>>>,
+    pub(crate) relation_anchor_cells: Vec<Option<CheapAnchorCell>>,
     pub(crate) file_routes: Vec<u8>,
 }
 
@@ -54,6 +55,14 @@ pub(crate) struct NativeDirectorySnapshot {
 }
 
 impl NativeDirectorySnapshot {
+    pub(crate) fn view(&self, rows: Vec<usize>) -> Self {
+        Self {
+            table: Arc::clone(&self.table),
+            rows,
+            buckets: OnceLock::new(),
+        }
+    }
+
     fn from_records(records: Vec<DirectoryEntryRecord>, errors: DirectoryReadErrors) -> Self {
         let mut table = Self::build_table(records);
         table.scan_errors = errors.into_messages();
@@ -70,8 +79,11 @@ impl NativeDirectorySnapshot {
         filtered: Vec<DirectoryEntryRecord>,
         raw: Vec<DirectoryEntryRecord>,
         errors: DirectoryReadErrors,
+        cells: Vec<Option<CheapAnchorCell>>,
     ) -> (Self, Self) {
         let mut table = Self::build_table(raw);
+        debug_assert!(cells.is_empty() || cells.len() == table.paths.len());
+        table.relation_anchor_cells = cells;
         table.scan_errors = errors.into_messages();
         let table = Arc::new(table);
         let rows_by_path: HashMap<&str, usize> = table
@@ -108,6 +120,7 @@ impl NativeDirectorySnapshot {
             mtimes_ns: Vec::with_capacity(records.len()),
             relation_member_eligible: Vec::with_capacity(records.len()),
             relation_anchors: Vec::with_capacity(records.len()),
+            relation_anchor_cells: Vec::new(),
             file_routes: Vec::with_capacity(records.len()),
         };
         for record in records {
@@ -711,7 +724,12 @@ impl NativeOutputInventory {
                 );
             }
             populate_relation_anchors(&mut records.raw);
-            NativeDirectorySnapshot::from_views(records.filtered, records.raw, records.errors)
+            NativeDirectorySnapshot::from_views(
+                records.filtered,
+                records.raw,
+                records.errors,
+                Vec::new(),
+            )
         });
         Ok((Py::new(py, filtered)?, Py::new(py, raw)?))
     }
@@ -1312,67 +1330,70 @@ impl NativeDirectoryScanOptions {
         scope: &crate::scan::scope::NativeDiscoveryScope,
         seed: &str,
     ) -> PyResult<(Py<NativeDirectorySnapshot>, Py<NativeDirectorySnapshot>)> {
-        let root = Path::new(&scope.root);
-        let mut directory_cache = HashMap::new();
-        let (mut raw, cells): (Vec<DirectoryEntryRecord>, Vec<Option<CheapAnchorCell>>) = {
-            let mut data = state.catalogs.lock().unwrap_or_else(|e| e.into_inner());
-            let mut records = Vec::new();
-            let mut cells = Vec::new();
-            if let Some(catalog) = data.get_mut(&crate::path_keys::path_key(&scope.root)) {
-                if let Some(bucket) = catalog.buckets.get(catalog_stem(seed).as_str()) {
-                    for key in bucket.iter() {
-                        let Some(row) = catalog.rows.get_mut(key) else {
-                            continue;
-                        };
-                        let mut record = row.record();
-                        if scope.contains(&record.path) && !state.is_owned(&record.path) {
-                            record.relation_member_eligible = !file_under_rejected_directory(
-                                Path::new(&record.path),
-                                root,
-                                &self.options,
-                                &mut directory_cache,
-                            ) && !file_rejected_by_path(
-                                Path::new(&record.path),
-                                root,
-                                &self.options,
-                            ) && numeric_ranges_allow(
-                                &self.options.mtime_ranges,
-                                record.mtime_ns,
-                            );
-                            cells.push(record.relation_member_eligible.then(|| {
-                                Arc::clone(row.cheap_anchor.get_or_insert_with(Default::default))
-                            }));
-                            records.push(record);
+        let (filtered, raw) = py.detach(|| {
+            let root = Path::new(&scope.root);
+            let mut directory_cache = HashMap::new();
+            let (mut raw, cells): (Vec<DirectoryEntryRecord>, Vec<Option<CheapAnchorCell>>) = {
+                let mut data = state.catalogs.lock().unwrap_or_else(|e| e.into_inner());
+                let mut records = Vec::new();
+                let mut cells = Vec::new();
+                if let Some(catalog) = data.get_mut(&crate::path_keys::path_key(&scope.root)) {
+                    if let Some(bucket) = catalog.buckets.get(catalog_stem(seed).as_str()) {
+                        for key in bucket.iter() {
+                            let Some(row) = catalog.rows.get_mut(key) else {
+                                continue;
+                            };
+                            let mut record = row.record();
+                            if scope.contains(&record.path) && !state.is_owned(&record.path) {
+                                record.relation_member_eligible = !file_under_rejected_directory(
+                                    Path::new(&record.path),
+                                    root,
+                                    &self.options,
+                                    &mut directory_cache,
+                                ) && !file_rejected_by_path(
+                                    Path::new(&record.path),
+                                    root,
+                                    &self.options,
+                                ) && numeric_ranges_allow(
+                                    &self.options.mtime_ranges,
+                                    record.mtime_ns,
+                                );
+                                cells.push(record.relation_member_eligible.then(|| {
+                                    Arc::clone(
+                                        row.cheap_anchor.get_or_insert_with(Default::default),
+                                    )
+                                }));
+                                records.push(record);
+                            }
                         }
                     }
                 }
+                (records, cells)
+            };
+            let mut accepted = HashSet::new();
+            for row in &raw {
+                if row.relation_member_eligible
+                    && numeric_ranges_allow(&self.options.size_ranges, row.size)
+                {
+                    accepted.extend(crate::relations::relations_size_filter_split_family_keys(
+                        &row.path,
+                    ));
+                }
             }
-            (records, cells)
-        };
-        let mut accepted = HashSet::new();
-        for row in &raw {
-            if row.relation_member_eligible
-                && numeric_ranges_allow(&self.options.size_ranges, row.size)
-            {
-                accepted.extend(crate::relations::relations_size_filter_split_family_keys(
-                    &row.path,
-                ));
-            }
-        }
-        let filtered = raw
-            .iter()
-            .filter(|r| {
-                r.relation_member_eligible
-                    && (numeric_ranges_allow(&self.options.size_ranges, r.size)
-                        || crate::relations::relations_size_filter_split_family_keys(&r.path)
-                            .iter()
-                            .any(|k| accepted.contains(k)))
-            })
-            .cloned()
-            .collect();
-        py.detach(|| populate_relation_anchors_cached(&mut raw, &cells));
-        let (filtered, raw) =
-            NativeDirectorySnapshot::from_views(filtered, raw, DirectoryReadErrors::report());
+            let filtered = raw
+                .iter()
+                .filter(|r| {
+                    r.relation_member_eligible
+                        && (numeric_ranges_allow(&self.options.size_ranges, r.size)
+                            || crate::relations::relations_size_filter_split_family_keys(&r.path)
+                                .iter()
+                                .any(|k| accepted.contains(k)))
+                })
+                .cloned()
+                .collect();
+            populate_relation_anchors_cached(&mut raw, &cells);
+            NativeDirectorySnapshot::from_views(filtered, raw, DirectoryReadErrors::report(), cells)
+        });
         Ok((Py::new(py, filtered)?, Py::new(py, raw)?))
     }
 
@@ -1436,6 +1457,7 @@ impl NativeDirectoryScanOptions {
                 records.filtered,
                 records.raw,
                 records.errors,
+                Vec::new(),
             ))
         })?;
         Ok((Py::new(py, filtered)?, Py::new(py, raw)?))
@@ -1474,6 +1496,7 @@ fn scan_snapshots_with_options(
             records.filtered,
             records.raw,
             records.errors,
+            Vec::new(),
         ))
     })?;
     Ok((Py::new(py, filtered)?, Py::new(py, raw)?))

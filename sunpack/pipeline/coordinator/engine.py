@@ -1128,7 +1128,7 @@ class _RequestRuntime:
             if isinstance(performance.get("worker"), dict)
             else {}
         )
-        request_runner = services.sevenzip_runner.fork()
+        request_runner = services.sevenzip_runner.fork(worker_config)
         request_runner.request_id = submission.request_id
         request_runner.origin = submission.origin
         self.extractor = ExtractionScheduler(

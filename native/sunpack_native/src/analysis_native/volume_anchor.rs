@@ -138,8 +138,9 @@ pub(crate) fn probe_volume_anchor_paths_cheap(
     )
 }
 
-/// One cheap, password-independent fact per catalog row generation. Contention
-/// is per file, never on the catalog lock; failed reads remain retryable.
+/// One password-independent fact per catalog row generation. Relations may
+/// refine the cheap head with proven standalone facts. Contention is per file,
+/// never on the catalog lock; failed reads remain retryable.
 pub(crate) type CheapAnchorCell = Arc<Mutex<Option<Arc<VolumeAnchor>>>>;
 
 pub(crate) fn probe_volume_anchor_records_cheap(

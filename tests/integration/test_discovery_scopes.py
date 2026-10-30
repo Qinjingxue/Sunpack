@@ -225,6 +225,62 @@ def test_catalog_head_facts_follow_metadata_and_observation_generations(tmp_path
         catalog.close()
 
 
+def test_catalog_refined_zip_facts_do_not_hide_replaced_or_missing_volumes(tmp_path):
+    """Cheap-head cache tests cannot catch stale relation refinements.
+
+    Replace a warmed standalone ZIP with a split head at identical metadata,
+    then remove its peer. One small lifecycle checks USN invalidation and old
+    request isolation through the actual targeted watch discovery chain.
+    """
+    import io
+    import os
+    import zipfile
+    from concurrent.futures import ThreadPoolExecutor
+    from sunpack_native import NativeWatchState
+    from sunpack.pipeline.coordinator.target_scan import build_candidates_for_targets
+
+    def packed(payload):
+        stream = io.BytesIO()
+        with zipfile.ZipFile(stream, "w") as archive:
+            archive.writestr("payload.txt", payload)
+        return stream.getvalue()
+
+    first, second = tmp_path / "same.zip.001.photo", tmp_path / "same.zip.002.opaque"
+    first.write_bytes(packed(b"x" * (4096 - len(packed(b"")))))
+    stamp = first.stat().st_mtime_ns
+    config = make_config()
+    scope = DiscoveryScope(str(tmp_path))
+    options = DirectoryScanner.compile_scan_options(config)
+    catalog = NativeWatchCatalog(NativeWatchState())
+    def discover(_=None):
+        session = DiscoveryScanSession(config=config, scope=scope, catalog=(catalog, options, str(first)))
+        candidates = build_candidates_for_targets([str(first)], session=session)
+        assert len(candidates) == 1
+        return candidates[0]
+    try:
+        assert not options.catalog_update(catalog, scope.native)
+        catalog.remember_observation(str(first), 4096, stamp / 1e9, "same-file", 10)
+        previous = discover()
+        assert previous.archive_input.part_paths() == [str(first)] and not previous.is_split
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            assert all(not row.is_split for row in pool.map(discover, range(8)))
+        data = packed(b"split payload" * 1024)
+        first.write_bytes(data[:4096])
+        os.utime(first, ns=(stamp, stamp))
+        second.write_bytes(data[4096:])
+        assert not options.catalog_update(catalog, scope.native, str(second))
+        catalog.remember_observation(str(first), 4096, stamp / 1e9, "same-file", 11)
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            assert all(row.archive_input.part_paths() == [str(first), str(second)]
+                       for row in pool.map(discover, range(8)))
+        assert previous.archive_input.part_paths() == [str(first)] and not previous.is_split
+        second.unlink()
+        assert not options.catalog_update(catalog, scope.native, str(second))
+        assert discover().archive_input.part_paths() == [str(first)]
+    finally:
+        catalog.close()
+
+
 def test_targeted_catalog_updates_preserve_original_depth_pruning_and_conflicts(tmp_path):
     """Full-root scans cannot detect incremental scope widening or stale conflict rows."""
     from sunpack_native import NativeDirectoryScanOptions

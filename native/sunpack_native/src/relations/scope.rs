@@ -64,6 +64,15 @@ impl<'a> RelationSource<'a> {
             size,
             relation_member_eligible,
             anchor: self.anchor(row).cloned(),
+            anchor_cell: match self {
+                Self::Snapshot(snapshot, _) => snapshot
+                    .table
+                    .relation_anchor_cells
+                    .get(row)
+                    .cloned()
+                    .flatten(),
+                Self::Physical(rows) => rows[row].anchor_cell.clone(),
+            },
         }
     }
 }
@@ -145,6 +154,7 @@ mod tests {
             name: basename(path).into(),
             size: Some(17),
             relation_member_eligible: eligible,
+            anchor_cell: None,
             anchor: seed.then(|| VolumeAnchor {
                 multivolume: true,
                 ..VolumeAnchor::default()

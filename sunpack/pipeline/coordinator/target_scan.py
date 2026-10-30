@@ -12,13 +12,6 @@ from sunpack.core.support.path_keys import normalized_path, safe_relative_path
 RELATIONS = RelationsScheduler()
 
 
-def build_candidates_for_target(
-    target_path: str,
-    session: DiscoveryScanSession | None = None,
-) -> list[DiscoveryCandidate]:
-    return build_candidates_for_targets([target_path], session=session)
-
-
 def build_candidates_for_targets(
     target_paths: list[str],
     session: DiscoveryScanSession | None = None,
@@ -71,8 +64,7 @@ def build_native_table_for_targets(
             session.logical_name_for_archive(os.path.basename(file_path)),
         ))
     for parent, targets in by_parent.items():
-        partial = session.native_table_for_directory(parent)
-        partial.retain_file_targets(targets)
+        partial = session.native_table_for_directory(parent, targets=targets)
         table.extend(partial)
 
     table.dedupe()

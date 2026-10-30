@@ -13,7 +13,7 @@ from sunpack_native import (
     relations_resolve_volume_once as _native_resolve_volume_once,
 )
 
-from sunpack.core.contracts.filesystem import DirectorySnapshot, FILESYSTEM_ROUTE_RELATIONS
+from sunpack.core.contracts.filesystem import DirectorySnapshot
 from sunpack.core.contracts.archive_input import ArchiveInputDescriptor, ArchiveInputPart, InputExtent
 from sunpack.core.passwords.directory_context import password_scope_for_path
 from sunpack.core.passwords.internal.store import PasswordStore
@@ -49,15 +49,13 @@ class RelationsGroupBuilder:
             self.probe_encrypted_groups(table, snapshot)
         return self._groups_from_native(table.project(index)[1] for index in range(len(table)))
 
-    def probe_encrypted_groups(self, table, snapshot: DirectorySnapshot, *, filesystem_routed=False) -> None:
+    def probe_encrypted_groups(self, table, snapshot: DirectorySnapshot) -> None:
         groups = self._groups_from_native(table.encrypted_rar_groups())
         if not groups:
             return
         refresh_paths: set[str] = set()
         discovered = self._discover_passwords(groups, refresh_paths)
         if discovered or refresh_paths:
-            if filesystem_routed:
-                snapshot = snapshot.file_route_view(FILESYSTEM_ROUTE_RELATIONS)
             table.retry_relations(
                 snapshot.raw_native_snapshot, snapshot.native_snapshot,
                 _native_password_pairs(discovered) or [], list(refresh_paths),

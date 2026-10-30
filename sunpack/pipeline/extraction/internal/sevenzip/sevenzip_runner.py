@@ -895,7 +895,7 @@ class SevenZipRunner:
         shared_async_worker_holder: _AsyncNativeWorkerHolder | None = None,
         event_loop=None,
     ):
-        self.process_config = process_config
+        self.process_config = dict(process_config)
         self.progress_callback = None
         self.native_event_callback = None
         self.request_id = ""
@@ -908,12 +908,12 @@ class SevenZipRunner:
         self._worker_holder_lock = threading.Lock()
         self._event_loop = event_loop
 
-    def fork(self) -> "SevenZipRunner":
+    def fork(self, process_config: dict) -> "SevenZipRunner":
         """Create request-local callback state while sharing native workers."""
         shared_holder = self._worker_holder_or_create()
         shared_async_holder = self._async_worker_holder_or_create()
         runner = SevenZipRunner(
-            self.process_config,
+            process_config,
             shared_worker_holder=shared_holder,
             shared_async_worker_holder=shared_async_holder,
             event_loop=self._event_loop,

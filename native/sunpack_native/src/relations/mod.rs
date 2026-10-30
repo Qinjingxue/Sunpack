@@ -1,5 +1,5 @@
 use crate::analysis_native::volume_anchor::{
-    probe_volume_anchor_at_offset, probe_volume_anchor_paths_cheap, VolumeAnchor,
+    probe_volume_anchor_at_offset, probe_volume_anchor_paths_cheap, CheapAnchorCell, VolumeAnchor,
 };
 use crate::path_keys::{case_key, path_key};
 use crate::scan::directory::NativeDirectorySnapshot;
@@ -34,6 +34,7 @@ pub(crate) struct RelationInput {
     size: Option<u64>,
     relation_member_eligible: bool,
     anchor: Option<VolumeAnchor>,
+    anchor_cell: Option<CheapAnchorCell>,
 }
 
 #[derive(Debug, Clone)]
@@ -331,23 +332,24 @@ pub(crate) fn relations_build_candidate_groups_from_snapshot(
     filtered_snapshot: PyRef<'_, NativeDirectorySnapshot>,
     path_passwords: Option<Vec<(String, String)>>,
 ) -> PyResult<Vec<Py<PyDict>>> {
-    let groups = build_native_candidate_groups_from_snapshot(
-        py,
-        &raw_snapshot,
-        &filtered_snapshot,
-        path_passwords.as_deref(),
-    )?;
+    let raw_snapshot = &*raw_snapshot;
+    let filtered_snapshot = &*filtered_snapshot;
+    let groups = py.detach(|| {
+        build_native_candidate_groups_from_snapshot(
+            raw_snapshot,
+            filtered_snapshot,
+            path_passwords.as_deref(),
+        )
+    });
     groups.into_iter().map(|group| group.to_dict(py)).collect()
 }
 
 pub(crate) fn build_native_candidate_groups_from_snapshot(
-    py: Python<'_>,
     raw_snapshot: &NativeDirectorySnapshot,
     filtered_snapshot: &NativeDirectorySnapshot,
     path_passwords: Option<&[(String, String)]>,
-) -> PyResult<Vec<NativeRelationGroup>> {
+) -> Vec<NativeRelationGroup> {
     build_native_candidate_groups_from_snapshot_cached(
-        py,
         raw_snapshot,
         filtered_snapshot,
         path_passwords,
@@ -356,12 +358,11 @@ pub(crate) fn build_native_candidate_groups_from_snapshot(
 }
 
 pub(crate) fn build_native_candidate_groups_from_snapshot_cached(
-    py: Python<'_>,
     raw_snapshot: &NativeDirectorySnapshot,
     filtered_snapshot: &NativeDirectorySnapshot,
     path_passwords: Option<&[(String, String)]>,
     cached: Option<&RelationCache>,
-) -> PyResult<Vec<NativeRelationGroup>> {
+) -> Vec<NativeRelationGroup> {
     let filtered_keys: HashSet<String> = filtered_snapshot
         .rows
         .iter()
@@ -369,10 +370,9 @@ pub(crate) fn build_native_candidate_groups_from_snapshot_cached(
         .map(|&row| path_key(&filtered_snapshot.table.paths[row]))
         .collect();
     if filtered_keys.is_empty() {
-        return Ok(Vec::new());
+        return Vec::new();
     }
     build_candidate_groups_from_source(
-        py,
         RelationSource::Snapshot(raw_snapshot, cached),
         &filtered_keys,
         path_passwords,
@@ -408,12 +408,11 @@ pub(crate) fn relation_group_cached_anchors(
 }
 
 fn build_candidate_groups_from_source(
-    py: Python<'_>,
     source: RelationSource<'_>,
     filtered_keys: &HashSet<String>,
     path_passwords: Option<&[(String, String)]>,
     cached: Option<&RelationCache>,
-) -> PyResult<Vec<NativeRelationGroup>> {
+) -> Vec<NativeRelationGroup> {
     let scope = RelationScopeIndex::build(&source, filtered_keys);
     let mut output = Vec::new();
     for indices in [scope.rows] {
@@ -422,7 +421,7 @@ fn build_candidate_groups_from_source(
             .map(|row| source.materialize(row))
             .collect();
         let name_index = BucketIndex::build(&directory_rows, Some(filtered_keys));
-        structural::collect(py, &mut directory_rows, &name_index, path_passwords)?;
+        structural::collect(&mut directory_rows, &name_index, path_passwords);
         let mut validations = assignment::resolve_buckets(&directory_rows, &name_index, cached);
         for validation in &mut validations {
             validate::validate(validation);
@@ -557,7 +556,7 @@ fn build_candidate_groups_from_source(
             output.push(NativeRelationGroup::Ordinary(row, confirmed));
         }
     }
-    Ok(output)
+    output
 }
 
 fn cheap_seed_strength(anchor: &VolumeAnchor) -> Option<&'static str> {
@@ -605,28 +604,27 @@ fn anchor_is_relation_archive(anchor: &VolumeAnchor) -> bool {
 }
 
 fn promote_sfx_archive_anchor(
-    py: Python<'_>,
     row: &RelationInput,
     path_passwords: Option<&[(String, String)]>,
-) -> PyResult<Option<VolumeAnchor>> {
+) -> Option<VolumeAnchor> {
     let Some(facts) = row.anchor.as_ref() else {
-        return Ok(None);
+        return None;
     };
     if facts.pe_state != PeState::Confirmed {
-        return Ok(None);
+        return None;
     }
     let Some(image_end) = facts.pe_image_end else {
-        return Ok(None);
+        return None;
     };
-    let overlay = py.detach(|| inspect_pe_overlay_from_image_end(&row.path, facts.size, image_end));
+    let overlay = inspect_pe_overlay_from_image_end(&row.path, facts.size, image_end);
     let archive_like = overlay.archive_like;
     let format = overlay.format;
     if archive_like && !matches!(format, "rar" | "7z" | "zip") {
-        return Ok(None);
+        return None;
     }
     let image_end = overlay.overlay_offset;
     if image_end == 0 {
-        return Ok(None);
+        return None;
     }
 
     // Relations only owns genuine self-extracting archives.  A PE with an
@@ -634,20 +632,19 @@ fn promote_sfx_archive_anchor(
     // executable carriers, while explicit deep-detect may scan them separately.
     // Prove the decompressor stub first with a bounded image-only probe, then
     // validate the archive at the overlay offset below.
-    let sfx_path = row.path.clone();
-    let sfx_profile = py.detach(move || executable_sfx_stub_profile(&sfx_path, image_end));
+    let sfx_profile = executable_sfx_stub_profile(&row.path, image_end);
     if !archive_like {
         let evidence = match sfx_profile.as_str() {
             "seven_zip_sfx" => "sfx:seven_zip_stub",
             "winrar_sfx" => "sfx:winrar_stub",
-            _ => return Ok(None),
+            _ => return None,
         };
         let mut anchor = row.anchor.clone().unwrap_or_default();
         anchor.pe_state = PeState::Confirmed;
         anchor.pe_image_end = Some(image_end);
         anchor.sfx = true;
         anchor.evidence.push(evidence);
-        return Ok(Some(anchor));
+        return Some(anchor);
     }
     let sfx_matches_format = match sfx_profile.as_str() {
         "seven_zip_sfx" => matches!(format, "7z" | "zip"),
@@ -655,38 +652,29 @@ fn promote_sfx_archive_anchor(
         _ => false,
     };
     if !sfx_matches_format {
-        return Ok(None);
+        return None;
     }
 
     let archive_offset = overlay.archive_offset;
     if archive_offset == 0 {
-        return Ok(None);
+        return None;
     }
 
-    let path = row.path.clone();
     let password = path_passwords.and_then(|items| {
         items
             .iter()
-            .find(|(candidate, _)| path_key(candidate) == path_key(&path))
-            .map(|(_, password)| password.clone())
+            .find(|(candidate, _)| path_key(candidate) == row.path_key)
+            .map(|(_, password)| password.as_str())
     });
-    let format_for_probe = format;
-    let mut anchor = py.detach(move || {
-        probe_volume_anchor_at_offset(
-            &path,
-            archive_offset,
-            &format_for_probe,
-            password.as_deref(),
-        )
-    });
+    let mut anchor = probe_volume_anchor_at_offset(&row.path, archive_offset, format, password);
     if anchor.format != format || anchor.confidence != "strong" {
-        return Ok(None);
+        return None;
     }
     anchor.pe_state = PeState::Confirmed;
     anchor.pe_image_end = Some(image_end);
     anchor.sfx = true;
     anchor.evidence.push("sfx:pe_overlay");
-    Ok(Some(anchor))
+    Some(anchor)
 }
 
 fn proposal_owned_paths(proposal: &RelationProposal) -> HashSet<String> {
@@ -1134,56 +1122,60 @@ pub(crate) fn relations_resolve_volume_once(
     if current_paths.is_empty() || candidate_paths.is_empty() {
         return Ok(None);
     }
-    let mut visible_paths = current_paths.clone();
-    visible_paths.extend(candidate_paths);
-    let visible_paths = sorted_unique_paths(visible_paths);
-    if visible_paths.is_empty() {
-        return Ok(None);
-    }
-    let anchors = py.detach(|| probe_volume_anchor_paths_cheap(&visible_paths, None));
-    let anchor_by_path: HashMap<String, VolumeAnchor> = anchors
-        .into_iter()
-        .map(|anchor| (path_key(&anchor.path), anchor))
-        .collect();
-    let rows: Vec<_> = visible_paths
-        .iter()
-        .map(|path| RelationInput {
-            path: path.clone(),
-            path_key: path_key(path),
-            name: basename(path).to_string(),
-            size: anchor_by_path
-                .get(&path_key(path))
-                .map(|anchor| anchor.size),
-            relation_member_eligible: true,
-            anchor: anchor_by_path.get(&path_key(path)).cloned(),
-        })
-        .collect();
-    let filtered_keys: HashSet<String> = current_paths.iter().map(|path| path_key(path)).collect();
-    let groups = build_candidate_groups_from_source(
-        py,
-        RelationSource::Physical(&rows),
-        &filtered_keys,
-        path_passwords.as_deref(),
-        None,
-    )?;
-    let format_hint = normalize_retry_format(format_hint);
-    for group in groups {
-        let data = group.candidate_data();
-        if !data.is_split || !data.relation_confirmed {
-            continue;
+    let group = py.detach(|| {
+        let mut visible_paths = current_paths.clone();
+        visible_paths.extend(candidate_paths);
+        let visible_paths = sorted_unique_paths(visible_paths);
+        if visible_paths.is_empty() {
+            return None;
         }
-        if !format_hint.is_empty() && data.format_hint != format_hint {
-            continue;
+        let anchors = probe_volume_anchor_paths_cheap(&visible_paths, None);
+        let anchor_by_path: HashMap<String, VolumeAnchor> = anchors
+            .into_iter()
+            .map(|anchor| (path_key(&anchor.path), anchor))
+            .collect();
+        let rows: Vec<_> = visible_paths
+            .iter()
+            .map(|path| RelationInput {
+                path: path.clone(),
+                path_key: path_key(path),
+                name: basename(path).to_string(),
+                size: anchor_by_path
+                    .get(&path_key(path))
+                    .map(|anchor| anchor.size),
+                relation_member_eligible: true,
+                anchor: anchor_by_path.get(&path_key(path)).cloned(),
+                anchor_cell: None,
+            })
+            .collect();
+        let filtered_keys: HashSet<String> =
+            current_paths.iter().map(|path| path_key(path)).collect();
+        let groups = build_candidate_groups_from_source(
+            RelationSource::Physical(&rows),
+            &filtered_keys,
+            path_passwords.as_deref(),
+            None,
+        );
+        let format_hint = normalize_retry_format(format_hint);
+        for group in groups {
+            let data = group.candidate_data();
+            if !data.is_split || !data.relation_confirmed {
+                continue;
+            }
+            if !format_hint.is_empty() && data.format_hint != format_hint {
+                continue;
+            }
+            if current_paths.iter().all(|current| {
+                data.parts()
+                    .chain(data.companions.iter().map(String::as_str))
+                    .any(|part| path_key(part) == path_key(current))
+            }) {
+                return Some(group);
+            }
         }
-        if current_paths.iter().all(|current| {
-            data.parts()
-                .chain(data.companions.iter().map(String::as_str))
-                .any(|part| path_key(part) == path_key(current))
-        }) {
-            return group.to_dict(py).map(Some);
-        }
-    }
-    Ok(None)
+        None
+    });
+    group.map(|group| group.to_dict(py)).transpose()
 }
 
 fn sorted_unique_paths(mut paths: Vec<String>) -> Vec<String> {

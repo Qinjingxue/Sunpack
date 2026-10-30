@@ -802,6 +802,7 @@ mod tests {
             name: name.into(),
             size: Some(100),
             relation_member_eligible: true,
+            anchor_cell: None,
             anchor: Some(VolumeAnchor {
                 path: name.into(),
                 size: 100,

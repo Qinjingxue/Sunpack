@@ -110,6 +110,36 @@ def test_two_standalone_hp_rars_in_same_filename_family_return_to_plain_files(tm
     assert all(group.kind == "file" and not group.is_split_candidate for group in groups)
 
 
+def test_selected_hp_rar_head_or_member_probes_its_group_and_preserves_retry_selection(tmp_path, monkeypatch):
+    """Whole-directory tests miss probing and projecting unselected families.
+
+    Two tiny encrypted parts and an independent archive exercise selection on
+    both sides of native password retry without creating another RAR fixture.
+    """
+    from sunpack.pipeline.coordinator.scan_session import DiscoveryScanSession
+    from sunpack.pipeline.coordinator.target_scan import build_candidates_for_targets
+    from tests.helpers.config_factory import make_config
+
+    parts = [
+        _write_hex(tmp_path / "selected.part1.photo", PART1_HP_HEX),
+        _write_hex(tmp_path / "selected.part2.opaque", PART2_HP_HEX),
+    ]
+    _write_hex(tmp_path / "unselected.photo", SINGLE_HP_HEX)
+    original = RelationsPasswordProber.resolve_file
+    probed = []
+    def capture(prober, path, **kwargs):
+        probed.append(path)
+        return original(prober, path, **kwargs)
+    monkeypatch.setattr(RelationsPasswordProber, "resolve_file", capture)
+    for selected in parts:
+        probed.clear()
+        session = DiscoveryScanSession(config=make_config({"user_passwords": ["wrong", "secret"]}))
+        candidate, = build_candidates_for_targets([selected], session=session)
+        assert candidate.is_split and candidate.archive_input.part_paths() == parts
+        assert candidate.relation_anchor["needs_password"] is False
+        assert probed and set(probed).issubset(parts)
+
+
 def test_password_retry_keeps_unencrypted_structure_facts_native(tmp_path, monkeypatch):
     rar_path = _write_hex(tmp_path / "encrypted.rar", SINGLE_HP_HEX)
     case = ArchiveFixtureFactory().create(
