@@ -263,7 +263,7 @@ followed by the same metrics for `7z.exe`. The raw full-matrix report is
 
 ## Known Issue
 
-- When SunPack monitors a download directory, some downloaders may perform final file verification relatively slowly. SunPack may finish processing the archive and clean up the source files before the downloader completes its verification, causing the downloader to consider the source files corrupted and retry the download or report an error.
+- Not found so far. Welcome to report！
 
 ## Contributing
 
