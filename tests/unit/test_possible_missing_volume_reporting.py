@@ -43,7 +43,9 @@ def test_partial_split_recovery_reports_possible_missing_without_changing_outcom
     )
 
     assert warning is not None
-    assert warning.kind is FailureKind.MISSING_VOLUME
+    assert warning.kind is FailureKind.DAMAGED
+    assert not warning.contains(FailureKind.MISSING_VOLUME)
+    assert not warning.user_action
     assert warning.details["missing_volume_confirmed"] is False
     assert warning.details["partial_recovery"] is True
     assert "可能缺少" in warning.message
@@ -64,7 +66,7 @@ def test_actual_archive_failure_plus_observed_gap_reports_possible_missing_and_k
     assert warning is None
 
 
-def test_backend_possible_missing_probe_is_promoted_after_real_failure():
+def test_backend_possible_missing_probe_retains_warning_without_missing_volume_recovery():
     original = _failure(
         FailureKind.DAMAGED,
         details={"missing_volume_confirmed": False, "evidence": "tail_size_heuristic"},
@@ -78,6 +80,9 @@ def test_backend_possible_missing_probe_is_promoted_after_real_failure():
     )
 
     assert warning is not None
+    assert warning.kind is FailureKind.DAMAGED
+    assert not warning.contains(FailureKind.MISSING_VOLUME)
+    assert not warning.user_action
     assert warning.details["evidence"] == "backend_possible_missing_volume"
     assert warning.causes == (original,)
 

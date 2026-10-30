@@ -10,6 +10,6 @@ def detection_pipeline_config() -> dict:
     return make_config({"detection": {"enabled": True}, "embedded_scan": {"enabled": True}})
 
 
-def detect_archive_hits(path: Path):
-    result = ArchiveTaskProvider(detection_pipeline_config()).discover_targets([str(path)])
+def detect_archive_hits(path: Path, config: dict | None = None):
+    result = ArchiveTaskProvider(config or detection_pipeline_config()).discover_targets([str(path)])
     return list(result.tasks)

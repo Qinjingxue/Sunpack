@@ -13,6 +13,7 @@ class PasswordResolutionStatus(str, Enum):
     UNSUPPORTED = "unsupported"
     BACKEND_ERROR = "backend_error"
     NEEDS_VOLUME_OR_TAIL_DAMAGED = "needs_volume_or_tail_damaged"
+    MISSING_VOLUME = "missing_volume"
 
 
 @dataclass

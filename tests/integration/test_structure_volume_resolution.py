@@ -15,7 +15,6 @@ from sunpack.core.passwords.directory_context import PasswordScopeContext
 from sunpack.core.passwords.internal.store import PasswordStore
 from tests.helpers.passwords import write_password_json
 from sunpack.pipeline.coordinator.engine import PipelineEngine
-from sunpack.pipeline.coordinator.target_groups import relation_group_to_candidate
 from sunpack.pipeline.coordinator.task_provider import ArchiveTaskProvider
 from sunpack.pipeline.coordinator.task_scan import direct_file_task
 from sunpack.pipeline.discovery.detection.input_planning import (
@@ -23,7 +22,7 @@ from sunpack.pipeline.discovery.detection.input_planning import (
 )
 from sunpack.pipeline.discovery.filesystem.directory_scanner import DirectoryScanner
 from sunpack.pipeline.discovery.relations import RelationsScheduler
-from sunpack.pipeline.discovery.relations.resolver import RelationResolver
+from tests.helpers.detection_probe import detect_archive_hits
 from sunpack.pipeline.extraction.scheduler import ExtractionScheduler
 from tests.helpers.config_factory import make_config
 from tests.helpers.detection_config import with_detection_pipeline
@@ -61,8 +60,7 @@ def test_mixed_camouflaged_real_volumes_are_structure_resolved_and_extractable(m
         else:
             assert group.split_volumes[0].source == "structure"
 
-        candidate = relation_group_to_candidate(group)
-        resolved = RelationResolver().resolve([candidate]).tasks
+        resolved = detect_archive_hits(Path(group.entry_path))
         assert len(resolved) == 1
         task = resolved[0]
         planned = ArchiveInputPlanningStage(load_config()).plan_task_to_tasks(task)
@@ -153,7 +151,7 @@ def test_first_dot_stem_and_loose_format_markers_resolve_real_volume_sets(
     assert [volume.number for volume in group.split_volumes] == [
         number for number, _path in renamed
     ]
-    resolved = RelationResolver().resolve([relation_group_to_candidate(group)]).tasks
+    resolved = detect_archive_hits(Path(group.entry_path))
     assert len(resolved) == 1
     planned = ArchiveInputPlanningStage(load_config()).plan_task_to_tasks(resolved[0])
     assert len(planned) == 1
@@ -194,7 +192,7 @@ def test_context_free_numbers_preserve_encrypted_sfx_launcher_ownership(tmp_path
     assert group.input_paths == paths
     assert group.carrier_path == str(launcher)
     assert set(group.owned_paths) == set(paths + [str(launcher)])
-    tasks = RelationResolver().resolve([relation_group_to_candidate(group)]).tasks
+    tasks = detect_archive_hits(Path(group.entry_path))
     assert len(tasks) == 1
     planned = ArchiveInputPlanningStage(load_config()).plan_task_to_tasks(tasks[0])
     assert len(planned) == 1
@@ -228,7 +226,7 @@ def test_context_free_numeric_noise_does_not_create_a_missing_7z_volume(tmp_path
     assert group.input_paths == paths
     assert [volume.number for volume in group.split_volumes] == [1, 2, 3]
     assert set(group.owned_paths) == set(paths)
-    resolved = RelationResolver().resolve([relation_group_to_candidate(group)]).tasks
+    resolved = detect_archive_hits(Path(group.entry_path))
     assert len(resolved) == 1
     planned = ArchiveInputPlanningStage(load_config()).plan_task_to_tasks(resolved[0])
     assert len(planned) == 1
@@ -320,7 +318,7 @@ def test_competing_heads_keep_direct_schemes_and_partition_declared_formats(tmp_
             assert label in group.logical_name
         assert "\0" not in group.logical_name
         logical_names.add(group.logical_name)
-        tasks = RelationResolver().resolve([relation_group_to_candidate(group)]).tasks
+        tasks = detect_archive_hits(Path(group.entry_path))
         assert len(tasks) == 1
         planned = ArchiveInputPlanningStage(load_config()).plan_task_to_tasks(tasks[0])
         assert len(planned) == 1
@@ -367,7 +365,7 @@ def test_rar_structure_overrides_false_part_marker(tmp_path, competing, sfx, mar
     assert set(group.input_paths) == {str(path) for _, path in paths}
     assert [part.number for part in group.split_volumes] == [number for number, _ in paths]
     assert all(part.source == "structure" for part in group.split_volumes)
-    tasks = RelationResolver().resolve([relation_group_to_candidate(group)]).tasks
+    tasks = detect_archive_hits(Path(group.entry_path))
     assert len(tasks) == 1
     planned = ArchiveInputPlanningStage(load_config()).plan_task_to_tasks(tasks[0])
     assert len(planned) == 1
@@ -408,15 +406,15 @@ def test_structural_head_number_position_orders_real_opaque_members(tmp_path, ar
     assert set(group.input_paths) == set(inputs)
     assert [part.number for part in group.split_volumes] == [number for number, _ in paths]
     assert group.head_metadata.get("volume_set_incomplete") is not True
-    tasks = RelationResolver().resolve([relation_group_to_candidate(group)]).tasks
-    assert len(tasks) == 1
-    config = load_config()
-    planned = ArchiveInputPlanningStage(config).plan_task_to_tasks(tasks[0])
-    assert len(planned) == 1
-    PasswordScopeContext().annotate(planned)
+    config = make_config()
     config["password_snapshot"] = write_password_json(tmp_path / "passwords.json", scopes=[
         (value, [str(case.archive_dir)]) for value in ["wrong-password", password] if value
     ])
+    tasks = detect_archive_hits(Path(group.entry_path), config)
+    assert len(tasks) == 1
+    planned = ArchiveInputPlanningStage(config).plan_task_to_tasks(tasks[0])
+    assert len(planned) == 1
+    PasswordScopeContext().annotate(planned)
     extractor = ExtractionScheduler(password_store=PasswordStore.from_config(config), max_retries=0)
     output = tmp_path / "output"
     try:
@@ -463,7 +461,7 @@ def test_distinct_global_mappings_remain_blocked_and_cannot_be_resolved(tmp_path
     assert group.head_metadata["relation_failure_reason"] == "ambiguous_volume_mapping"
     assert group.head_metadata["volume_set_incomplete"] is True
     assert group.head_metadata["relation_confirmed"] is False
-    result = RelationResolver().resolve([relation_group_to_candidate(group)])
+    result = ArchiveTaskProvider(make_config()).discover_targets([str(case.archive_dir)])
     assert len(result.tasks) == 1
     assert result.tasks[0].discovery_failure.kind.value == "missing_volume"
     assert result.blocked_paths

@@ -403,6 +403,7 @@ class PasswordResolver:
             PasswordSearchStatus.UNSUPPORTED: PasswordResolutionStatus.UNSUPPORTED,
             PasswordSearchStatus.BACKEND_UNAVAILABLE: PasswordResolutionStatus.BACKEND_ERROR,
             PasswordSearchStatus.NEEDS_VOLUME_OR_TAIL_DAMAGED: PasswordResolutionStatus.NEEDS_VOLUME_OR_TAIL_DAMAGED,
+            PasswordSearchStatus.MISSING_VOLUME: PasswordResolutionStatus.MISSING_VOLUME,
             PasswordSearchStatus.INCONCLUSIVE: PasswordResolutionStatus.INCONCLUSIVE,
         }[search.status]
         return self._remember(

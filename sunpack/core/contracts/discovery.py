@@ -152,5 +152,6 @@ _DISCOVERY_FAILURES = {
     "ambiguous_volume_mapping": (FailureKind.MISSING_VOLUME, "failure.possible_missing_volume", ""),
     "structural_conflict": (FailureKind.MISSING_VOLUME, "failure.possible_missing_volume", ""),
     "corrupt_archive": (FailureKind.DAMAGED, "failure.damaged", ""),
+    "needs_volume_or_tail_damaged": (FailureKind.DAMAGED, "failure.missing_volume_or_tail_damaged", ""),
     "unsupported": (FailureKind.UNSUPPORTED, "failure.unsupported", ""),
 }

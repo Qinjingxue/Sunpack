@@ -63,7 +63,7 @@ def test_split_empty_password_worker_rejection_is_not_downgraded(tmp_path, encry
     assert result.diagnostics["password_candidates_inconclusive"] == 0
 
 
-def test_password_probe_tail_failure_maps_to_missing_volume_with_ambiguous_cli_message():
+def test_password_probe_tail_failure_keeps_ambiguity_without_missing_volume_recovery():
     extractor = object.__new__(SingleArchiveExtractor)
     extractor.i18n = I18nContext("zh")
     resolution = PasswordResolution(
@@ -84,7 +84,8 @@ def test_password_probe_tail_failure_maps_to_missing_volume_with_ambiguous_cli_m
     failure = extractor._password_resolution_failure(resolution)
 
     assert failure is not None
-    assert failure.kind is FailureKind.MISSING_VOLUME
+    assert failure.kind is FailureKind.DAMAGED
+    assert not failure.user_action
     assert "7z 尾部 Next Header" in failure.message
     assert "可能缺少分卷" in failure.message
     assert failure.message_key == "failure.archive_field_read_failed_possible_missing_volume"

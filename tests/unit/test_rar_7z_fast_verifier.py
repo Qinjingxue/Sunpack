@@ -313,7 +313,7 @@ def test_rar_fast_verifier_reports_missing_noncontiguous_volumes(tmp_path, volum
     )
 
     assert outcome.ok is False
-    assert outcome.status == "needs_volume_or_tail_damaged"
+    assert outcome.status == "missing_volume"
     assert outcome.attempts == 0
     assert "not contiguous" in outcome.error_text
 

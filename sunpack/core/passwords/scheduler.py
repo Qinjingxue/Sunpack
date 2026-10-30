@@ -30,6 +30,7 @@ class PasswordSearchStatus(str, Enum):
     UNSUPPORTED = "unsupported"
     BACKEND_UNAVAILABLE = "backend_unavailable"
     NEEDS_VOLUME_OR_TAIL_DAMAGED = "needs_volume_or_tail_damaged"
+    MISSING_VOLUME = "missing_volume"
 
 
 # Verdicts about the archive/backend rather than the tried passwords. Trying
@@ -39,6 +40,7 @@ _ARCHIVE_LEVEL_STATUSES = frozenset({
     PasswordSearchStatus.UNSUPPORTED,
     PasswordSearchStatus.BACKEND_UNAVAILABLE,
     PasswordSearchStatus.NEEDS_VOLUME_OR_TAIL_DAMAGED,
+    PasswordSearchStatus.MISSING_VOLUME,
 })
 
 
@@ -307,21 +309,10 @@ class PasswordScheduler:
                     if tested_count < len(batch):
                         inconclusive.extend(batch[tested_count:])
                     continue
-                if verification.status == "damaged":
+                if verification.status in {"damaged", "needs_volume_or_tail_damaged", "missing_volume"}:
                     result = PasswordSearchResult(
                         password=None,
-                        status=PasswordSearchStatus.DAMAGED,
-                        test_result=verification.test_result,
-                        error_text=verification.error_text,
-                        attempts=attempts,
-                        stopped_reason="terminal",
-                    )
-                    self._emit_finished(job, result, started_at, candidates_seen, skipped)
-                    return result
-                if verification.status == "needs_volume_or_tail_damaged":
-                    result = PasswordSearchResult(
-                        password=None,
-                        status=PasswordSearchStatus.NEEDS_VOLUME_OR_TAIL_DAMAGED,
+                        status=_archive_failure_status(verification.status, job),
                         test_result=verification.test_result,
                         error_text=verification.error_text,
                         attempts=attempts,
@@ -392,7 +383,7 @@ class PasswordScheduler:
         if (
             not verification.ok
             and attempted_in_batch == 0
-            and verification.status != "needs_volume_or_tail_damaged"
+            and verification.status not in {"needs_volume_or_tail_damaged", "missing_volume"}
         ):
             attempted_in_batch = len(batch)
         total_attempts = previous_attempts + attempted_in_batch
@@ -440,12 +431,14 @@ class PasswordScheduler:
             )
         status_by_verification = {
             "no_match": PasswordSearchStatus.EXHAUSTED,
-            "damaged": PasswordSearchStatus.DAMAGED,
             "unsupported_method": PasswordSearchStatus.UNSUPPORTED,
             "backend_unavailable": PasswordSearchStatus.BACKEND_UNAVAILABLE,
-            "needs_volume_or_tail_damaged": PasswordSearchStatus.NEEDS_VOLUME_OR_TAIL_DAMAGED,
         }
-        search_status = status_by_verification.get(verification.status, PasswordSearchStatus.INCONCLUSIVE)
+        search_status = (
+            _archive_failure_status(verification.status, job)
+            if verification.status in {"damaged", "needs_volume_or_tail_damaged", "missing_volume"}
+            else status_by_verification.get(verification.status, PasswordSearchStatus.INCONCLUSIVE)
+        )
         if search_status == PasswordSearchStatus.EXHAUSTED:
             self.cache.remember_negative_batch(fingerprint_key, batch[:attempted_in_batch])
         return PasswordSearchResult(
@@ -481,6 +474,16 @@ class PasswordScheduler:
             stopped_reason=result.stopped_reason,
             error_text=result.error_text,
         ))
+
+
+def _archive_failure_status(status: str, job: PasswordJob) -> PasswordSearchStatus:
+    if status == "needs_volume_or_tail_damaged":
+        # Reuse the Rust analysis already attached to this exact logical input.
+        # A tail read fault alone is not proof that another volume exists.
+        execution = (job.archive_input or {}).get("analysis", {}).get("execution", {})
+        if execution.get("missing_volume_evidence"):
+            return PasswordSearchStatus.MISSING_VOLUME
+    return PasswordSearchStatus(status)
 
 
 def _candidate_value(candidate: PasswordCandidate | str) -> str:

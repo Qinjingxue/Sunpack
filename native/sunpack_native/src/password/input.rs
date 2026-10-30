@@ -300,7 +300,7 @@ impl VolumeSet {
                 .any(|(index, volume)| volume.number != index as u32 + 1)
         {
             return Err(PreparedStatus::new(
-                "needs_volume_or_tail_damaged",
+                "missing_volume",
                 "structured volume numbers are not contiguous from one; missing volume",
             ));
         }

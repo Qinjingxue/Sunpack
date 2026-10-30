@@ -55,6 +55,55 @@ def _snapshot(root, paths):
     return DirectorySnapshot.from_entries(os.path.abspath(root), entries)
 
 
+def test_ambiguous_encrypted_probe_is_terminal_damage_instead_of_a_watch_volume_blocker(tmp_path, monkeypatch):
+    # Native routing remains real; inject only the ambiguous password verdict.
+    # Other tests do not carry that verdict through group projection, executor,
+    # result collection and Watch, where a later layer could reintroduce a wait.
+    import asyncio
+    from sunpack.core.contracts.failures import FailureKind
+    from sunpack.core.passwords.scheduler import PasswordSearchResult, PasswordSearchStatus
+    from sunpack.pipeline.coordinator.engine import PipelineEngine
+    from sunpack.pipeline.coordinator.task_provider import ArchiveTaskProvider
+    from sunpack.runtime.watch import scheduler as watch_module
+    from tests.helpers.config_factory import make_config
+
+    root = tmp_path / "inputs"
+    root.mkdir()
+    # A false part marker must not upgrade a standalone encrypted input to a
+    # missing-volume diagnosis when the password probe cannot settle its tail.
+    path = _write_hex(root / "standalone.part2.photo", SINGLE_HP_HEX)
+    config = make_config({"watch": {"clipboard_monitor_enabled": False}})
+    monkeypatch.setattr(RelationsPasswordProber, "resolve_file", lambda *args, **kwargs: PasswordSearchResult(
+        password=None, status=PasswordSearchStatus.NEEDS_VOLUME_OR_TAIL_DAMAGED,
+    ))
+    discovered = ArchiveTaskProvider(config).discover_targets([path])
+    assert len(discovered.tasks) == 1
+    assert discovered.tasks[0].discovery_failure.kind is FailureKind.DAMAGED
+    assert discovered.tasks[0].discovery_reason == "needs_volume_or_tail_damaged"
+    monkeypatch.setattr(watch_module, "validate_ntfs_watch_roots", lambda roots: None)
+    notices = []
+
+    async def scenario():
+        async with PipelineEngine(config) as engine:
+            watcher = watch_module.WatchScheduler(
+                config, [str(root)], output_roots={str(root): str(tmp_path / "out")},
+                state_path=str(tmp_path / "state.snapshot"), cold_start_seconds=0, pipeline_engine=engine,
+            )
+            watcher._notify = lambda *args: notices.append(args)
+            try:
+                watcher.enqueue(path)
+                await watcher.run_once()
+                result = await watcher.drain()
+                assert result.failed == 1
+                assert all(entry.status != "suspended_missing_volume" for entry in watcher.state.entries.values())
+                assert watcher.pending_count == 0
+            finally:
+                await watcher.aclose()
+
+    asyncio.run(scenario())
+    assert any(notice[0] == "failed" for notice in notices)
+
+
 @pytest.mark.parametrize("pe_offset", [0x80, 0x800])
 @pytest.mark.parametrize("split", [False, True])
 def test_encrypted_sfx_retry_preserves_confirmed_pe_facts(tmp_path, pe_offset, split):

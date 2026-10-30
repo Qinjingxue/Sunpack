@@ -149,7 +149,8 @@ class RelationsGroupBuilder:
                 reason = {
                     PasswordSearchStatus.EXHAUSTED: ("needs_password" if result.stopped_reason == "no_candidates" else "wrong_password"),
                     PasswordSearchStatus.DAMAGED: "corrupt_archive",
-                    PasswordSearchStatus.NEEDS_VOLUME_OR_TAIL_DAMAGED: "missing_volume",
+                    PasswordSearchStatus.NEEDS_VOLUME_OR_TAIL_DAMAGED: "needs_volume_or_tail_damaged",
+                    PasswordSearchStatus.MISSING_VOLUME: "missing_volume",
                     PasswordSearchStatus.UNSUPPORTED: "unsupported",
                 }.get(result.status, "")
                 failures.extend((path, reason) for path in proposal_paths)

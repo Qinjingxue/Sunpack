@@ -44,7 +44,7 @@ class SevenZipFastVerifier:
             attempts=attempts,
             test_result=outcome,
             error_text=message.lower(),
-            terminal=status in {"damaged", "needs_volume_or_tail_damaged"},
+            terminal=status in {"damaged", "needs_volume_or_tail_damaged", "missing_volume"},
             final_confirmation_required=bool(
                 outcome.get("final_confirmation_required", status == "match")
             ) if status != "not_required" else False,

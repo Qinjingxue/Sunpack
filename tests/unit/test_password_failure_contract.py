@@ -43,23 +43,30 @@ def test_scheduler_uses_no_match_status_not_backend_message(tmp_path):
     assert result.password is None
 
 
-def test_scheduler_stops_password_batch_on_unavailable_tail_without_negative_result(tmp_path):
+@pytest.mark.parametrize("planning", [False, True], ids=["search", "extraction-plan"])
+@pytest.mark.parametrize("evidence", ["ambiguous-tail", "native-missing-proof", "native-volume-gap"])
+def test_scheduler_stops_password_batch_on_unavailable_tail_without_negative_result(tmp_path, planning, evidence):
+    # Both scheduler entry points consume one native verdict. Without this
+    # distinction a truncated standalone file becomes a Watch volume blocker;
+    # without the proof case real missing sets would lose their recovery path.
     archive = tmp_path / "sample.7z.001"
     archive.write_bytes(b"7z")
     scheduler = PasswordScheduler(_StaticVerifier(PasswordBatchVerification(
         ok=False,
-        status="needs_volume_or_tail_damaged",
+        status="missing_volume" if evidence == "native-volume-gap" else "needs_volume_or_tail_damaged",
         attempts=0,
         error_text="missing volume or damaged next-header offset",
         terminal=True,
     )))
 
-    result = scheduler.run(PasswordJob(
+    run = scheduler.plan_for_extraction if planning else scheduler.run
+    result = run(PasswordJob(
         archive_path=str(archive),
+        archive_input={"analysis": {"execution": {"missing_volume_evidence": "relation_missing_volume"}}} if evidence == "native-missing-proof" else None,
         candidates=PasswordCandidatePipeline.from_values([f"bad-{index}" for index in range(50)]),
     ))
 
-    assert result.status == PasswordSearchStatus.NEEDS_VOLUME_OR_TAIL_DAMAGED
+    assert result.status == (PasswordSearchStatus.NEEDS_VOLUME_OR_TAIL_DAMAGED if evidence == "ambiguous-tail" else PasswordSearchStatus.MISSING_VOLUME)
     assert result.attempts == 0
     assert result.exhausted is False
 
@@ -133,12 +140,71 @@ def test_password_failure_bypasses_verification(tmp_path):
     assert verification.failures[0].code == "fail.password_required"
 
 
+def test_terminal_archive_jobs_report_one_start_and_finish_even_with_volume_retry(tmp_path):
+    # Existing reporter tests call notifications themselves. Only executor-level
+    # coverage catches discovery short-circuits losing start or retries emitting
+    # it twice; concurrent terminal jobs cover both with no archive IO.
+    import asyncio
+    from types import SimpleNamespace
+    from sunpack.core.i18n import I18nContext
+    from sunpack.pipeline.coordinator.archive_job import ArchiveJobExecutor
+    from sunpack.pipeline.coordinator.async_work import AsyncWorkBroker, CancellationToken
+
+    events, inspected, retries = [], [], []
+    tasks = [make_archive_task(tmp_path / f"{name}.opaque") for name in ("damaged", "password", "missing", "ordinary")]
+    for task, kind in zip(tasks, (FailureKind.DAMAGED, FailureKind.WRONG_PASSWORD, FailureKind.MISSING_VOLUME)):
+        task.discovery_failure = FailureInfo(kind, "relations", kind.value)
+
+    executor = object.__new__(ArchiveJobExecutor)
+    executor.request_id = "terminal-lifecycle"
+    executor.i18n = I18nContext("en")
+    executor.progress_reporter = SimpleNamespace(
+        task_started=lambda task, depth: events.append((task.key, "started", depth)),
+        task_finished=lambda task, outcome, depth: events.append((task.key, "finished", depth)),
+    )
+
+    def inspect(task, output_dir):
+        assert task.discovery_failure is None
+        inspected.append(task.key)
+        return SimpleNamespace(skip_result=ExtractionResult(False, output_dir, error="terminal inspection"))
+
+    def retry(task, outcome):
+        retries.append(task.key)
+        return make_archive_task(task.main_path)
+
+    def output_dir(task):
+        assert task.discovery_failure is None
+        return str(tmp_path / "out")
+
+    executor.extractor = SimpleNamespace(inspect=inspect)
+
+    async def scenario():
+        broker = AsyncWorkBroker(thread_capacity=3)
+        try:
+            await asyncio.gather(*(executor._execute_one_async(
+                task, output_dir, depth=index + 1, broker=broker,
+                cancellation=CancellationToken(), missing_volume_retry=retry,
+            ) for index, task in enumerate(tasks)))
+        finally:
+            await broker.close()
+
+    asyncio.run(scenario())
+    for index, task in enumerate(tasks):
+        assert [event[1:] for event in events if event[0] == task.key] == [
+            ("started", index + 1), ("finished", index + 1),
+        ]
+    assert retries == [tasks[2].key]
+    assert set(inspected) == {tasks[2].key, tasks[3].key}
+
+
 class _StaticVerifier:
     def __init__(self, result):
         self.result = result
 
     def verify_batch(self, archive_path, passwords, *, part_paths=None, archive_input=None):
         return self.result
+
+    verify_fast_batch = verify_batch
 
 
 def _task(path):

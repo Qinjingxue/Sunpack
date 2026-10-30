@@ -277,7 +277,6 @@ def install_wrappers(recorder: HotspotRecorder) -> None:
     import sunpack.pipeline.coordinator.task_scan as task_scan
     import sunpack.pipeline.discovery.relations.scheduler as relations_scheduler
     import sunpack.pipeline.discovery.relations.internal.group_builder as group_builder
-    import sunpack.pipeline.discovery.relations.resolver as relation_resolver
 
     recorder.wrap(directory_scanner, "_NATIVE_SCAN_DIRECTORY_SNAPSHOT", "native.scan_directory_snapshot")
     recorder.wrap(directory_scanner.DirectoryScanner, "scan", "filesystem.DirectoryScanner.scan")
@@ -287,7 +286,6 @@ def install_wrappers(recorder: HotspotRecorder) -> None:
 
     recorder.wrap(relations_scheduler.RelationsScheduler, "build_candidate_groups", "relations.build_candidate_groups")
     recorder.wrap(group_builder.RelationsGroupBuilder, "build_candidate_groups", "relations.builder.build_candidate_groups")
-    recorder.wrap(relation_resolver.RelationResolver, "resolve", "relations.resolve")
 
     recorder.wrap(scan_session.DiscoveryScanSession, "snapshot_for_directory", "session.snapshot_for_directory")
     recorder.wrap(scan_session.DiscoveryScanSession, "native_table_for_directory", "session.native_table_for_directory")
@@ -346,11 +344,11 @@ def run_mode(mode: str, target: str, max_depth: int | None, config: dict) -> tup
 
         provider = ArchiveTaskProvider(config)
         discovery_result = provider.discovery.discover_native(table, session, include_details=False)
-        extra["resolved_inputs"] = len(discovery_result.resolved_tasks)
+        extra["resolved_inputs"] = sum(task.discovery_failure is None for task in discovery_result.tasks)
         extra["blocked_paths"] = len(discovery_result.blocked_paths)
         extra["residual_paths"] = len(discovery_result.residual_paths)
         extra["scan_session"] = summarize_scan_session(session)
-        return discovery_result.resolved_tasks, extra
+        return discovery_result.tasks, extra
 
     if mode == "full":
         from sunpack.pipeline.coordinator.scanner import ScanOrchestrator

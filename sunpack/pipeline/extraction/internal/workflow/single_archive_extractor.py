@@ -562,9 +562,14 @@ class SingleArchiveExtractor:
                 "",
             ),
             PasswordResolutionStatus.NEEDS_VOLUME_OR_TAIL_DAMAGED: (
-                FailureKind.MISSING_VOLUME,
+                FailureKind.DAMAGED,
                 "failure.missing_volume_or_tail_damaged",
                 "",
+            ),
+            PasswordResolutionStatus.MISSING_VOLUME: (
+                FailureKind.MISSING_VOLUME,
+                "failure.missing_volume",
+                "wait_for_volume",
             ),
         }
         spec = mapping.get(resolution.status)

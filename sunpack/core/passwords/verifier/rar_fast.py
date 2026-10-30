@@ -62,7 +62,7 @@ class RarFastVerifier:
             attempts=attempts,
             test_result=outcome,
             error_text=message.lower(),
-            terminal=status in {"damaged", "needs_volume_or_tail_damaged"},
+            terminal=status in {"damaged", "needs_volume_or_tail_damaged", "missing_volume"},
             final_confirmation_required=False if status == "not_required" else final_confirmation_required,
             match_evidence=str(outcome.get("match_evidence") or ""),
         )

@@ -234,6 +234,8 @@ class ArchiveJobExecutor:
         file_id = task.key or task.main_path
 
         def preflight():
+            if not retried_missing_volume:
+                self._report_task_started(task, depth)
             if task.discovery_failure is not None:
                 failure = task.discovery_failure
                 if failure.message_key:
@@ -241,8 +243,8 @@ class ArchiveJobExecutor:
                 return "", ArchiveJobOutcome(ExtractionResult(
                     success=False, out_dir="", error=failure.message, failure=failure,
                 ))
-            inspected = self._inspect_tasks_before_extract([task], output_dir_resolver, depth=depth)[0]
-            _index, _task, out_dir, result = inspected
+            out_dir = output_dir_resolver(task)
+            result = self.extractor.inspect(task, out_dir)
             if result.skip_result is not None:
                 return out_dir, ArchiveJobOutcome(result.skip_result)
             return out_dir, None
@@ -350,20 +352,6 @@ class ArchiveJobExecutor:
     def _report_task_status(self, task: ArchiveTask, state: str, detail: str = "") -> None:
         if self.progress_reporter is not None:
             self.progress_reporter.task_status(task, state, detail)
-
-    def _inspect_tasks_before_extract(
-        self,
-        tasks: list[ArchiveTask],
-        output_dir_resolver,
-        *,
-        depth: int,
-    ) -> list[tuple[int, ArchiveTask, str, Any]]:
-        results = []
-        for index, task in enumerate(tasks):
-            self._report_task_started(task, depth)
-            out_dir = output_dir_resolver(task)
-            results.append((index, task, out_dir, self.extractor.inspect(task, out_dir)))
-        return results
 
     def _extract_verify_state_machine(
         self,
@@ -666,26 +654,11 @@ def _possible_missing_volume_failure(
     failure: FailureInfo | None,
     i18n: I18nContext,
 ) -> FailureInfo | None:
-    encrypted_rar_member = _is_unresolved_encrypted_rar_member(task)
-    if outcome_kind == OutcomeKind.COMPLETE_SUCCESS or (
-        not _task_is_split_input(task) and not encrypted_rar_member
-    ):
+    if outcome_kind == OutcomeKind.COMPLETE_SUCCESS or not _task_is_split_input(task):
         return None
     if failure is not None and failure.contains(FailureKind.MISSING_VOLUME):
         return None
-    # Header-encrypted RAR members cannot expose their volume number until a
-    # password is available.  They must remain ordinary visible candidates
-    # (a lone ``part2`` may be a standalone archive), but a damaged extraction
-    # of one is still the same user-visible condition as any other incomplete
-    # split input.  Keep authentication failures in their original category.
-    if encrypted_rar_member and failure is not None and failure.contains(
-        FailureKind.PASSWORD_REQUIRED,
-        FailureKind.WRONG_PASSWORD,
-        FailureKind.PASSWORD_INCONCLUSIVE,
-    ):
-        return None
-
-    probe_suspected = encrypted_rar_member or _failure_has_possible_missing_volume_evidence(failure)
+    probe_suspected = _failure_has_possible_missing_volume_evidence(failure)
 
     evidence = ""
     if outcome_kind == OutcomeKind.PARTIAL_SUCCESS:
@@ -704,11 +677,10 @@ def _possible_missing_volume_failure(
         details["original_failure_kind"] = failure.kind.value
 
     return FailureInfo(
-        kind=FailureKind.MISSING_VOLUME,
+        kind=FailureKind.DAMAGED,
         stage="extraction_report",
         message=i18n.t("failure.possible_missing_volume"),
         message_key="failure.possible_missing_volume",
-        user_action="wait_for_volume",
         causes=(failure,) if failure is not None else (),
         details=details,
     )
@@ -720,35 +692,6 @@ def _task_is_split_input(task: ArchiveTask) -> bool:
         descriptor.open_mode in {"native_volumes", "sfx_with_volumes"}
         or len(descriptor.part_paths()) > 1
     )
-
-
-def _is_unresolved_encrypted_rar_member(task: ArchiveTask) -> bool:
-    """Recognize a password-blocked RAR volume without suppressing it.
-
-    The relation layer deliberately does not hide filename-only ``partN``
-    files: a lone header-encrypted member must still be offered as an
-    ordinary candidate.  Once extraction proves that such a candidate cannot
-    stand alone, report the bounded missing-volume diagnosis here instead of
-    inventing a filename-based relation or relabeling it as generic damage.
-    """
-    anchor = task.knowledge().get("discovery.evidence", {})
-    if not isinstance(anchor, dict):
-        return False
-    if str(anchor.get("format") or "").casefold() != "rar":
-        return False
-    if not bool(anchor.get("needs_password")):
-        return False
-    if not any(
-        str(item) in {"rar4:encryption_header", "rar5:encryption_header"}
-        for item in (anchor.get("evidence") or [])
-    ):
-        return False
-    name = os.path.basename(str(task.main_path or "")).casefold()
-    # This is intentionally only a classification hint, never a relation
-    # builder.  The standard RAR spelling is the only form needed here; all
-    # disguised/ambiguous forms remain visible as ordinary candidates and
-    # retain their backend's original failure classification.
-    return ".part" in name and any(character.isdigit() for character in name[name.find(".part") + 5 :])
 
 
 def _failure_has_possible_missing_volume_evidence(failure: FailureInfo | None) -> bool:
