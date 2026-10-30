@@ -5,6 +5,7 @@ use crate::path_keys::path_key;
 use pyo3::prelude::*;
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::Path;
 use std::sync::Arc;
 
 const DIRECTORY: u8 = 1;
@@ -129,6 +130,7 @@ impl CatalogRow {
         });
         if !unchanged {
             self.cheap_anchor = None;
+            crate::io::reader::invalidate_reader_path(Path::new(&self.path()));
         }
         if let Some(observation) = self.observation.as_mut() {
             observation.update(size, mtime, file_id, change_usn);
@@ -257,6 +259,7 @@ impl ScopeCatalog {
             {
                 if old.size() != record.size || old.mtime_ns() != record.mtime_ns {
                     old.cheap_anchor = None;
+                    crate::io::reader::invalidate_reader_path(Path::new(&record.path));
                 }
                 old.size = record.size.unwrap_or(0);
                 old.mtime_ns = record.mtime_ns.unwrap_or(0);

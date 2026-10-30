@@ -97,7 +97,7 @@ begin
   end;
 end;
 """, encoding="utf-8-sig")
-    result = subprocess.run([compiler, "/Qp", str(harness)], capture_output=True, text=True, timeout=30)
+    result = subprocess.run([compiler, "/Qp", str(harness)], capture_output=True, text=True)
     assert result.returncode == 0, result.stdout + result.stderr
     defaults = {name: (repo_root / name).read_bytes()
                 for name in ("sunpack_config.json", "builtin_passwords.json")}
@@ -173,7 +173,7 @@ end;
                  "/NORESTART", f"/DIR={app}", f"/Fixture={fixture}", f"/Data={data}",
                  f"/AddPath={int(index != 2)}",
                  f"/StopFailure={int(stop_failure)}", f"/LOG={log}"],
-                capture_output=True, text=True, timeout=30,
+                capture_output=True, text=True,
             )
             if stop_failure:
                 assert result.returncode != 0

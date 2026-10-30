@@ -10,10 +10,13 @@ from sunpack.core.passwords.fingerprint import build_archive_fingerprint
 from sunpack.core.passwords.job import PasswordJob
 from sunpack.core.passwords.scheduler import PasswordScheduler
 from sunpack.core.passwords.verifier import PasswordBatchVerification, PasswordVerifierChain
+from sunpack.core.contracts.discovery_scope import DiscoveryScope
+from sunpack.core.support.archive_sessions import get_archive_session
 from sunpack.core.support.path_keys import safe_relative_path
 from sunpack.pipeline.coordinator.recursive_authorization import RecursiveAuthorization
 from sunpack.pipeline.coordinator.scan_session import DiscoveryScanSession
 from sunpack.pipeline.coordinator.task_scan import direct_file_task
+from tests.helpers.file_generation import preserve_file_times
 
 
 def _quote(path):
@@ -40,10 +43,19 @@ def _change(path, replace):
     _powershell(script)
 
 
-@pytest.mark.parametrize("replace", [False, True])
+@pytest.fixture
+def catalog():
+    catalog = sunpack_native.NativeWatchCatalog(sunpack_native.NativeWatchState())
+    try:
+        yield catalog
+    finally:
+        catalog.close()
+
+
+@pytest.mark.parametrize("replace", [False, True, "event"])
 @pytest.mark.parametrize("source", ["single", "split", "range"])
 @pytest.mark.parametrize("cached_success", [False, True])
-def test_password_cache_uses_each_physical_generation(tmp_path, replace, source, cached_success):
+def test_password_cache_uses_each_physical_generation(tmp_path, replace, source, cached_success, catalog):
     main, part = tmp_path / "disguised.jpg", tmp_path / "volume.bin"
     _write(main)
     _write(part)
@@ -53,6 +65,12 @@ def test_password_cache_uses_each_physical_generation(tmp_path, replace, source,
         if source == "range" else None
     )
     changed = part if source in {"split", "range"} else main
+    # Physical-generation tests cannot catch an event with identical metadata.
+    # Keep this in the same coarse password-cache lifecycle for all inputs.
+    options = sunpack_native.NativeDirectoryScanOptions([], [], [], [], [], [], [])
+    assert not options.catalog_update(catalog, DiscoveryScope(str(tmp_path)).native)
+    stamp = changed.stat()
+    catalog.remember_observation(str(changed), stamp.st_size, stamp.st_mtime, "same-file", 10)
 
     class Verifier:
         password = "old-password"
@@ -76,9 +94,19 @@ def test_password_cache_uses_each_physical_generation(tmp_path, replace, source,
     unchanged = scheduler.plan_for_extraction(PasswordJob(str(main), part_paths=parts, archive_input=descriptor, candidates=first_candidates))
     assert verifier.calls == calls
     assert unchanged.status == first.status
-    _change(changed, replace)
+    original = get_archive_session(str(changed))
+    assert original.read_at(0, 4) == b"old!"
+    if replace == "event":
+        token = sunpack_native.file_generation_tokens([str(changed)])[0]
+        with preserve_file_times(changed):
+            changed.write_bytes(b"new!")
+        assert sunpack_native.file_generation_tokens([str(changed)])[0] == token
+        catalog.remember_observation(str(changed), stamp.st_size, stamp.st_mtime, "same-file", 11)
+    else:
+        _change(changed, replace)
     after = build_archive_fingerprint(str(main), parts, descriptor)
     assert before.key != after.key
+    assert get_archive_session(str(changed)).read_at(0, 4) == b"new!"
     verifier.password = "new-password"
     result = scheduler.plan_for_extraction(PasswordJob(str(main), part_paths=parts, archive_input=descriptor, candidates=["new-password"]))
     assert result.password == "new-password"

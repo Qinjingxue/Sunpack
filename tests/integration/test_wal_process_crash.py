@@ -27,16 +27,30 @@ def _run_child(root, family, mode, *, kill=False):
             env={**os.environ, "PYTHONIOENCODING": "utf-8"})
 
         def read():
-            for line in process.stdout:
-                if line.startswith("WAL_TEST "):
-                    messages.put(json.loads(line[len("WAL_TEST "):]))
-            messages.put(None)
+            try:
+                with (root / f"{family}-{mode}.stdout.txt").open("w", encoding="utf-8") as output:
+                    for line in process.stdout:
+                        output.write(line)
+                        output.flush()
+                        if line.startswith("WAL_TEST "):
+                            messages.put(json.loads(line[len("WAL_TEST "):]))
+            except Exception as error:
+                messages.put(error)
+            finally:
+                messages.put(None)
 
         reader = threading.Thread(target=read, daemon=True)
         reader.start()
         try:
             if kill:
-                result = messages.get(timeout=75)
+                try:
+                    result = messages.get(timeout=75)
+                except queue.Empty as error:
+                    raise AssertionError(
+                        "Fault boundary was not reached:\n" + _error(root, family, mode)
+                    ) from error
+                if isinstance(result, Exception):
+                    raise result
                 assert result and result["kind"] == "crash", (
                     f"Fault boundary was not reached: {result}\n" + _error(root, family, mode))
                 # Only descendants of our disposable child are terminated.
@@ -59,6 +73,8 @@ def _run_child(root, family, mode, *, kill=False):
             result = None
             while not messages.empty():
                 item = messages.get_nowait()
+                if isinstance(item, Exception):
+                    raise item
                 if item is not None:
                     result = item
             return result
@@ -78,7 +94,11 @@ def _run_child(root, family, mode, *, kill=False):
 
 
 def _error(root, family, mode):
-    return (root / f"{family}-{mode}.stderr.txt").read_text(encoding="utf-8")
+    return "\n".join(
+        f"{stream}:\n" + path.read_text(encoding="utf-8")
+        for stream in ("stderr", "stdout")
+        if (path := root / f"{family}-{mode}.{stream}.txt").exists()
+    )
 
 
 @pytest.mark.parametrize("boundary", ["wal", "before_snapshot", "after_snapshot", "after_retire"])

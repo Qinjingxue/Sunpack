@@ -8,7 +8,7 @@ import uuid
 from threading import RLock
 from pathlib import Path
 from types import MappingProxyType
-from sunpack_native import file_generation_tokens, read_shared_utf8_text
+from sunpack_native import read_shared_utf8_text
 
 from sunpack.core.platform.windows.file_mutex import file_mutex
 from sunpack.core.support.resource_lifecycle import open_service_file, write_task_text
@@ -165,15 +165,13 @@ class PasswordFileSource:
     def __init__(self):
         self.path = ensure_builtin_password_file()
         self.snapshot = EMPTY_PASSWORD_SNAPSHOT
-        self._generation = object()
         self._lock = RLock()
         self.reload()
 
     def reload(self) -> PasswordSnapshot:
         with self._lock:
-            generation = file_generation_tokens([str(self.path)])[0]
-            if generation == self._generation:
-                return self.snapshot
+            # Called at startup or by the existing file-event reload chain. An
+            # event is authoritative even when two writes share all timestamps.
             try:
                 updated = read_builtin_password_file(self.path, self.snapshot)
             except FileNotFoundError:
@@ -181,9 +179,6 @@ class PasswordFileSource:
             except (OSError, ValueError, UnicodeError):
                 _LOG.error("Cannot load password JSON; keeping the last valid snapshot", exc_info=True)
                 return self.snapshot
-            # An edit during parsing must be consumed by its queued file event.
-            if file_generation_tokens([str(self.path)])[0] == generation:
-                self._generation = generation
             self.snapshot = updated
             return updated
 

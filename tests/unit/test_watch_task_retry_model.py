@@ -20,6 +20,7 @@ from sunpack.runtime.watch.scheduler import WatchScheduler, _ActivePipelineReque
 from sunpack.runtime.watch.state import WatchStateStore
 from tests.helpers.config_factory import make_config
 from tests.helpers.fake_pipeline_engine import FakePipelineEngine
+from tests.helpers.file_generation import preserve_file_times
 from tests.helpers.passwords import write_password_json
 
 
@@ -145,7 +146,10 @@ def test_password_updates_retry_only_applicable_scopes(tmp_path, monkeypatch, ti
                 scopes.append(("parent-new", [str(root)]))
             elif change == "unrelated":
                 scopes.extend([("child-new", [str(original / "child")]), ("output-new", [str(output)])])
-            write_password_json(password_file, ["global-new" if change == "global" else "global-old"], scopes=scopes)
+            # A file event must win over timestamp collisions, including an
+            # equal-length update while the old request is still completing.
+            with preserve_file_times(password_file):
+                write_password_json(password_file, ["global-new" if change == "global" else "global-old"], scopes=scopes)
             if timing == "restart":
                 watcher = WatchScheduler(
                     dict(watcher.config), [str(root)], output_roots={str(root): str(output)},

@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from sunpack_native import file_generation_tokens
+from sunpack.core.support.archive_sessions import borrow_archive_sessions
 
 
 @dataclass(frozen=True)
@@ -89,11 +89,18 @@ def build_archive_fingerprint(
     normalized_archive = normalized[archive_path]
     normalized_parts = tuple(normalized[path] for path in part_paths or [])
     source_paths = list(dict.fromkeys(normalized.values()))
-    # Paths and native generation tokens cannot contain NUL; JSON escapes it
-    # in logical scope. Keep the full identity rather than hashing it again.
+    # Reuse validated readers: their tokens include event invalidation even
+    # when physical metadata collides. Opening a session reads no archive data,
+    # and the password probe reuses it through the existing operation scope.
+    # Paths and native tokens cannot contain NUL; JSON escapes logical scope.
     fields = []
-    for path, generation in zip(source_paths, file_generation_tokens(source_paths)):
-        fields.extend((path, generation or "unavailable"))
+    for path in source_paths:
+        try:
+            with borrow_archive_sessions((path,)) as (session,):
+                generation = session.generation_token
+        except OSError:
+            generation = "unavailable"
+        fields.extend((path, generation))
     fields.append(_archive_input_scope(descriptor))
     return ArchiveFingerprint(
         key="\0".join(fields),

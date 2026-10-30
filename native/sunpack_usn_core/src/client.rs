@@ -22,9 +22,12 @@ use windows_sys::Win32::System::Pipes::{
     SetNamedPipeHandleState, WaitNamedPipeW, PIPE_READMODE_MESSAGE,
 };
 use windows_sys::Win32::System::Services::{
-    CloseServiceHandle, OpenSCManagerW, OpenServiceW, QueryServiceStatusEx, StartServiceW,
-    SC_MANAGER_CONNECT, SC_STATUS_PROCESS_INFO, SERVICE_QUERY_STATUS, SERVICE_RUNNING,
-    SERVICE_START, SERVICE_STATUS_PROCESS, SERVICE_STOPPED, SERVICE_STOP_PENDING,
+    CloseServiceHandle, NotifyServiceStatusChangeW, OpenSCManagerW, OpenServiceW,
+    QueryServiceStatusEx, StartServiceW, SC_MANAGER_CONNECT, SC_STATUS_PROCESS_INFO,
+    SERVICE_NOTIFY_2W, SERVICE_NOTIFY_RUNNING, SERVICE_NOTIFY_START_PENDING,
+    SERVICE_NOTIFY_STATUS_CHANGE, SERVICE_NOTIFY_STOPPED, SERVICE_NOTIFY_STOP_PENDING,
+    SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_START, SERVICE_START_PENDING,
+    SERVICE_STATUS_PROCESS, SERVICE_STOPPED, SERVICE_STOP_PENDING,
 };
 
 static REQUEST_IDS: AtomicU64 = AtomicU64::new(1);
@@ -428,69 +431,112 @@ fn start_service() -> io::Result<()> {
         )
     };
     if service.is_null() {
+        let error = io::Error::last_os_error();
         unsafe { CloseServiceHandle(manager) };
-        return Err(io::Error::last_os_error());
+        return Err(error);
     }
-    loop {
-        let status = match query_service_status(service) {
-            Ok(status) => status,
-            Err(error) => {
-                unsafe {
-                    CloseServiceHandle(service);
-                    CloseServiceHandle(manager);
-                }
-                return Err(error);
+    let result = drive_service_start(
+        || query_service_status(service),
+        || {
+            if unsafe { StartServiceW(service, 0, null()) } != 0 {
+                return Ok(());
             }
-        };
-        if status.dwCurrentState != SERVICE_STOP_PENDING {
-            break;
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
-
-    let started = unsafe { StartServiceW(service, 0, null()) };
-    if started == 0 {
-        let error = unsafe { GetLastError() };
-        if error != ERROR_SERVICE_ALREADY_RUNNING {
-            unsafe {
-                CloseServiceHandle(service);
-                CloseServiceHandle(manager);
+            let error = unsafe { GetLastError() };
+            if error == ERROR_SERVICE_ALREADY_RUNNING {
+                Ok(())
+            } else {
+                Err(io::Error::from_raw_os_error(error as i32))
             }
-            return Err(io::Error::from_raw_os_error(error as i32));
-        }
-    }
-    loop {
-        let status = match query_service_status(service) {
-            Ok(status) => status,
-            Err(error) => {
-                unsafe {
-                    CloseServiceHandle(service);
-                    CloseServiceHandle(manager);
-                }
-                return Err(error);
-            }
-        };
-        if status.dwCurrentState == SERVICE_RUNNING {
-            break;
-        }
-        if status.dwCurrentState == SERVICE_STOPPED {
-            unsafe {
-                CloseServiceHandle(service);
-                CloseServiceHandle(manager);
-            }
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!(
-                    "SunPack Watch Broker stopped before RUNNING (Win32 exit {})",
-                    status.dwWin32ExitCode
-                ),
-            ));
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
+        },
+        |state| wait_service_change(service, state),
+    );
     unsafe {
         CloseServiceHandle(service);
         CloseServiceHandle(manager);
+    }
+    result
+}
+
+fn drive_service_start(
+    mut query: impl FnMut() -> io::Result<SERVICE_STATUS_PROCESS>,
+    mut start: impl FnMut() -> io::Result<()>,
+    mut wait: impl FnMut(u32) -> io::Result<()>,
+) -> io::Result<()> {
+    let mut requested = false;
+    loop {
+        let status = query()?;
+        match status.dwCurrentState {
+            SERVICE_RUNNING => return Ok(()),
+            SERVICE_STOPPED => {
+                // A successful old instance can stop between StartService and
+                // the status query. Re-enter the same startup path; a real
+                // startup failure still propagates its OS error immediately.
+                if requested && status.dwWin32ExitCode != 0 {
+                    return Err(io::Error::from_raw_os_error(status.dwWin32ExitCode as i32));
+                }
+                start()?;
+                requested = true;
+            }
+            SERVICE_START_PENDING => {
+                requested = true;
+                wait(SERVICE_START_PENDING)?;
+            }
+            SERVICE_STOP_PENDING => wait(SERVICE_STOP_PENDING)?,
+            state => {
+                return Err(io::Error::other(format!(
+                    "unexpected Watch Broker service state {state}"
+                )))
+            }
+        }
+    }
+}
+
+fn wait_service_change(
+    service: windows_sys::Win32::System::Services::SC_HANDLE,
+    state: u32,
+) -> io::Result<()> {
+    use std::cell::Cell;
+    use std::ffi::c_void;
+    use windows_sys::Win32::System::Threading::{SleepEx, INFINITE};
+
+    unsafe extern "system" fn changed(parameter: *const c_void) {
+        let notification = &*parameter.cast::<SERVICE_NOTIFY_2W>();
+        let completed = &*notification.pContext.cast::<Cell<bool>>();
+        completed.set(true);
+    }
+
+    let completed = Cell::new(false);
+    let mut notification = SERVICE_NOTIFY_2W {
+        dwVersion: SERVICE_NOTIFY_STATUS_CHANGE,
+        pfnNotifyCallback: Some(changed),
+        pContext: (&completed as *const Cell<bool>).cast_mut().cast(),
+        ..Default::default()
+    };
+    let current = match state {
+        SERVICE_START_PENDING => SERVICE_NOTIFY_START_PENDING,
+        SERVICE_STOP_PENDING => SERVICE_NOTIFY_STOP_PENDING,
+        _ => unreachable!(),
+    };
+    let mask = (SERVICE_NOTIFY_STOPPED
+        | SERVICE_NOTIFY_START_PENDING
+        | SERVICE_NOTIFY_STOP_PENDING
+        | SERVICE_NOTIFY_RUNNING)
+        & !current;
+    let error = unsafe { NotifyServiceStatusChangeW(service, mask, &mut notification) };
+    if error != 0 {
+        return Err(io::Error::from_raw_os_error(error as i32));
+    }
+    // SCM queues the callback on this thread. Keeping both stack values alive
+    // through its delivery avoids an extra thread, timer, or polling loop.
+    while !completed.get() {
+        unsafe {
+            SleepEx(INFINITE, 1);
+        }
+    }
+    if notification.dwNotificationStatus != 0 {
+        return Err(io::Error::from_raw_os_error(
+            notification.dwNotificationStatus as i32,
+        ));
     }
     Ok(())
 }
@@ -619,6 +665,79 @@ fn configured_name(variable: &str, default: &str, test_prefix: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_follows_retiring_instances_but_propagates_real_failures() {
+        // Real service tests cannot force each SCM transition window. One
+        // deterministic trace covers that gap without timers or admin rights.
+        let status = |state, exit| SERVICE_STATUS_PROCESS {
+            dwCurrentState: state,
+            dwWin32ExitCode: exit,
+            ..Default::default()
+        };
+        let mut states = [
+            status(SERVICE_STOP_PENDING, 0),
+            status(SERVICE_STOPPED, 0),
+            status(SERVICE_STOPPED, 0),
+            status(SERVICE_START_PENDING, 0),
+            status(SERVICE_STOPPED, 0),
+            status(SERVICE_START_PENDING, 0),
+            status(SERVICE_RUNNING, 0),
+        ]
+        .into_iter();
+        let (mut starts, mut waits) = (0, Vec::new());
+        drive_service_start(
+            || Ok(states.next().expect("startup must converge")),
+            || {
+                starts += 1;
+                Ok(())
+            },
+            |state| {
+                waits.push(state);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(starts, 3);
+        assert_eq!(
+            waits,
+            [
+                SERVICE_STOP_PENDING,
+                SERVICE_START_PENDING,
+                SERVICE_START_PENDING
+            ]
+        );
+        for error in [5, 1066] {
+            let mut states =
+                [status(SERVICE_STOPPED, 0), status(SERVICE_STOPPED, error)].into_iter();
+            let failure = drive_service_start(
+                || Ok(states.next().unwrap()),
+                || Ok(()),
+                |_| panic!("no transition to wait for"),
+            )
+            .unwrap_err();
+            assert_eq!(failure.raw_os_error(), Some(error as i32));
+            let mut states = [
+                status(SERVICE_START_PENDING, 0),
+                status(SERVICE_STOPPED, error),
+            ]
+            .into_iter();
+            let failure = drive_service_start(
+                || Ok(states.next().unwrap()),
+                || panic!("a failed concurrent startup must propagate"),
+                |_| Ok(()),
+            )
+            .unwrap_err();
+            assert_eq!(failure.raw_os_error(), Some(error as i32));
+        }
+        let failure = drive_service_start(
+            || Ok(status(SERVICE_STOPPED, 0)),
+            || Err(io::Error::from_raw_os_error(5)),
+            |_| unreachable!(),
+        )
+        .unwrap_err();
+        assert_eq!(failure.raw_os_error(), Some(5));
+    }
 
     #[test]
     fn replay_only_transport_failures_not_permission_or_protocol_failures() {

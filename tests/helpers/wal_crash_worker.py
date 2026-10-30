@@ -16,12 +16,28 @@ import time
 from types import SimpleNamespace
 
 
+_message_lock = threading.Lock()
+_crashing = threading.Event()
+_message_output = sys.stdout
+
+
+def _emit_locked(payload):
+    _message_output.write("WAL_TEST " + json.dumps(payload) + "\n")
+    _message_output.flush()
+
+
 def emit(**payload):
-    print("WAL_TEST " + json.dumps(payload), flush=True)
+    with _message_lock:
+        _emit_locked(payload)
 
 
 def crash_gate(**payload):
-    emit(kind="crash", **payload)
+    # Every fault boundary in this disposable process shares one gate. Later
+    # callbacks must stop too, without publishing duplicate/interleaved frames.
+    with _message_lock:
+        if not _crashing.is_set():
+            _crashing.set()
+            _emit_locked(dict(kind="crash", **payload))
     threading.Event().wait()
 
 
@@ -147,6 +163,9 @@ async def watch_scenario(root, mode):
                         started.add(owner)
                         all_started = len(started) == len(manifest["sources"])
                     if all_started:
+                        # Pipeline logging can leave a line unfinished. Force
+                        # that boundary so protocol isolation is deterministic.
+                        print("WAL fixture pipeline output", end="", flush=True)
                         crash_gate(started=len(started),
                                    pending=[asdict(item) for item in watcher.state.pending_work_items()])
                 if mode in {"started", "finished"} and event.get("event") == target_event:
@@ -200,6 +219,9 @@ async def watch_scenario(root, mode):
 
 
 if __name__ == "__main__":
+    # Keep the existing stdout pipe exclusive to protocol frames. Production
+    # progress can write from other threads, including without a final newline.
+    sys.stdout = sys.stderr
     family, directory, mode = sys.argv[1:]
     root = Path(directory)
     if family == "state":

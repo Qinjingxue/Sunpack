@@ -20,6 +20,7 @@ from sunpack_native import NativeWatchCatalog
 from sunpack.pipeline.discovery.filesystem.directory_scanner import DirectoryScanner
 from sunpack.runtime.watch.roots import WatchRootEntry
 from tests.helpers.config_factory import make_config
+from tests.helpers.file_generation import preserve_file_times
 from tests.helpers.real_archives import ArchiveFixtureFactory
 
 
@@ -233,7 +234,6 @@ def test_catalog_refined_zip_facts_do_not_hide_replaced_or_missing_volumes(tmp_p
     request isolation through the actual targeted watch discovery chain.
     """
     import io
-    import os
     import zipfile
     from concurrent.futures import ThreadPoolExecutor
     from sunpack_native import NativeWatchState
@@ -265,8 +265,8 @@ def test_catalog_refined_zip_facts_do_not_hide_replaced_or_missing_volumes(tmp_p
         with ThreadPoolExecutor(max_workers=4) as pool:
             assert all(not row.is_split for row in pool.map(discover, range(8)))
         data = packed(b"split payload" * 1024)
-        first.write_bytes(data[:4096])
-        os.utime(first, ns=(stamp, stamp))
+        with preserve_file_times(first):
+            first.write_bytes(data[:4096])
         second.write_bytes(data[4096:])
         assert not options.catalog_update(catalog, scope.native, str(second))
         catalog.remember_observation(str(first), 4096, stamp / 1e9, "same-file", 11)

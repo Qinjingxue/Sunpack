@@ -26,6 +26,7 @@ const HOT_EDGE_BYTES: u64 = 4 * 1024 * 1024;
 const DEFAULT_HANDLE_CAPACITY: usize = 256;
 const MAX_CACHEABLE_READ_BYTES: usize = 4 * 1024 * 1024;
 const CACHE_ORDER_COMPACT_STALE_MIN: usize = 64;
+static NEXT_SOURCE_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone)]
 enum CachedBacking {
@@ -955,33 +956,47 @@ pub(crate) struct FileIdentity {
     len: u64,
     modified: Option<SystemTime>,
     created: Option<SystemTime>,
+    // Zero for metadata snapshots; opened readers share one immutable source
+    // incarnation across block, structure and prepared-password cache keys.
+    reader_generation: u64,
     #[cfg(windows)]
     physical: WindowsFileGeneration,
 }
 
 impl FileIdentity {
     pub(crate) fn generation_token(&self) -> String {
-        // Paths belong to the logical input key. The token identifies the
-        // opened physical generation, including writes with restored mtime.
+        // Metadata snapshots use generation zero. Reader tokens also carry
+        // their source incarnation so upper-layer caches honor invalidation
+        // even when every physical metadata field stayed unchanged.
         #[cfg(windows)]
         {
             let physical = &self.physical;
             return format!(
-                "{:x}:{:032x}:{:x}:{:x}:{:x}",
+                "{:x}:{:032x}:{:x}:{:x}:{:x}:{:x}",
                 physical.volume,
                 u128::from_le_bytes(physical.file_id),
                 physical.change_time,
                 physical.write_time,
-                self.len
+                self.len,
+                self.reader_generation
             );
         }
         #[cfg(not(windows))]
-        format!("{:?}", (self.len, self.modified, self.created))
+        format!(
+            "{:?}",
+            (
+                self.len,
+                self.modified,
+                self.created,
+                self.reader_generation
+            )
+        )
     }
 }
 
 struct FileSource {
     identity: FileIdentity,
+    cache_id: u64,
     file: RwLock<Option<TrackedFile>>,
     closed: AtomicBool,
     block_loads: Mutex<HashMap<u64, Arc<BlockLoad>>>,
@@ -1031,6 +1046,12 @@ enum BlockLoadClaim {
 }
 
 impl FileSource {
+    fn cache_identity(&self) -> FileIdentity {
+        let mut identity = self.identity.clone();
+        identity.reader_generation = self.cache_id;
+        identity
+    }
+
     fn ensure_open(&self) -> io::Result<()> {
         if self.closed.load(Ordering::Acquire) {
             Err(io::Error::other("resource closed"))
@@ -1065,7 +1086,7 @@ impl FileSource {
 
 impl ByteSource for FileSource {
     fn file_identity(&self) -> Option<FileIdentity> {
-        Some(self.identity.clone())
+        Some(self.cache_identity())
     }
 
     fn len(&self) -> u64 {
@@ -1421,6 +1442,15 @@ struct BlockKey {
     index: u64,
 }
 
+impl BlockKey {
+    fn new(source: &FileSource, index: u64) -> Self {
+        Self {
+            identity: source.cache_identity(),
+            index,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum CacheTier {
     Hot,
@@ -1675,6 +1705,7 @@ impl ReaderManager {
         }
         let source = Arc::new(FileSource {
             identity: identity.clone(),
+            cache_id: NEXT_SOURCE_ID.fetch_add(1, Ordering::Relaxed),
             file: RwLock::new(Some(file)),
             closed: AtomicBool::new(false),
             block_loads: Mutex::new(HashMap::new()),
@@ -1685,10 +1716,7 @@ impl ReaderManager {
     }
 
     fn claim_block_load(&self, source: &FileSource, index: u64) -> io::Result<BlockLoadClaim> {
-        let key = BlockKey {
-            identity: source.identity.clone(),
-            index,
-        };
+        let key = BlockKey::new(source, index);
         let mut loads = source
             .block_loads
             .lock()
@@ -1763,10 +1791,7 @@ impl ReaderManager {
     }
 
     fn read_block(&self, source: &FileSource, index: u64) -> io::Result<Arc<[u8]>> {
-        let key = BlockKey {
-            identity: source.identity.clone(),
-            index,
-        };
+        let key = BlockKey::new(source, index);
         let tier = cache_tier(source, index);
 
         loop {
@@ -1862,10 +1887,7 @@ impl ReaderManager {
                     break;
                 }
                 let to = (from + BLOCK_SIZE).min(data.len());
-                let key = BlockKey {
-                    identity: source.identity.clone(),
-                    index,
-                };
+                let key = BlockKey::new(source, index);
                 if let Err(error) =
                     self.insert_block(key, Arc::from(&data[from..to]), cache_tier(source, index))
                 {
@@ -1882,10 +1904,7 @@ impl ReaderManager {
 
         for (index, load) in waiting {
             load.wait()?;
-            let key = BlockKey {
-                identity: source.identity.clone(),
-                index,
-            };
+            let key = BlockKey::new(source, index);
             if !self.contains_block(&key)? {
                 // The overlapping loader failed before publishing. Retry this
                 // block through the normal path so prefetch keeps its
@@ -2024,7 +2043,11 @@ impl HandlePool {
     fn insert(&mut self, identity: FileIdentity, source: Arc<FileSource>) {
         self.generation = self.generation.wrapping_add(1);
         let generation = self.generation;
-        self.by_path.insert(identity.path.clone(), identity.clone());
+        if let Some(previous) = self.by_path.insert(identity.path.clone(), identity.clone()) {
+            // Only the current source belongs in the pool. Active requests keep
+            // their own Arc; obsolete handles need not wait for LRU eviction.
+            self.entries.remove(&previous);
+        }
         self.entries
             .insert(identity.clone(), HandleEntry { source, generation });
         self.order.push_back((identity, generation));
@@ -2190,8 +2213,21 @@ pub(crate) fn release_reader_resources_under_roots(
     Ok(dict.unbind())
 }
 
+static MANAGER: OnceLock<ReaderManager> = OnceLock::new();
+
+pub(crate) fn invalidate_reader_path(path: &Path) {
+    let Some(manager) = MANAGER.get() else { return };
+    let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut handles = manager.handles.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(identity) = handles.by_path.remove(&path) {
+        // Do not close a source used by an older request. Its late block loads
+        // carry its source id and cannot repopulate the new source's cache.
+        handles.entries.remove(&identity);
+        handles.compact_order();
+    }
+}
+
 fn manager() -> &'static ReaderManager {
-    static MANAGER: OnceLock<ReaderManager> = OnceLock::new();
     MANAGER.get_or_init(|| {
         let shard_capacity = DEFAULT_SHARED_CACHE_BYTES / CACHE_SHARDS;
         let hot_capacity = shard_capacity / HOT_CACHE_FRACTION;
@@ -2234,6 +2270,7 @@ pub(crate) fn file_identity(path: PathBuf, file: &File) -> io::Result<FileIdenti
         len: metadata.len(),
         modified: metadata.modified().ok(),
         created: metadata.created().ok(),
+        reader_generation: 0,
         #[cfg(windows)]
         physical: windows_file_generation(file)?,
     })
@@ -2690,18 +2727,9 @@ mod tests {
         assert_eq!(second.read_at(0, 8).unwrap(), b"ijklmnop");
         assert_eq!(other.read_at(0, 8).unwrap(), b"qrstuvwx");
 
-        let first_key = BlockKey {
-            identity: first.identity.clone(),
-            index: 0,
-        };
-        let second_key = BlockKey {
-            identity: second.identity.clone(),
-            index: 0,
-        };
-        let other_key = BlockKey {
-            identity: other.identity.clone(),
-            index: 0,
-        };
+        let first_key = BlockKey::new(&first, 0);
+        let second_key = BlockKey::new(&second, 0);
+        let other_key = BlockKey::new(&other, 0);
         assert!(manager().contains_block(&first_key).unwrap());
         assert!(manager().contains_block(&second_key).unwrap());
         assert!(manager().contains_block(&other_key).unwrap());
@@ -2855,10 +2883,7 @@ mod tests {
         let path = temp_file("managed_reader_shared", b"abcdefgh");
         let first = manager().open_file(&path).unwrap();
         assert_eq!(first.read_at(0, 4).unwrap(), b"abcd");
-        let key = BlockKey {
-            identity: first.identity.clone(),
-            index: 0,
-        };
+        let key = BlockKey::new(&first, 0);
         assert!(manager()
             .cached_block(&key, cache_tier(&first, 0))
             .unwrap()
@@ -2978,14 +3003,8 @@ mod tests {
             after - before
         });
 
-        let first_key = BlockKey {
-            identity: source.identity.clone(),
-            index: 0,
-        };
-        let third_key = BlockKey {
-            identity: source.identity.clone(),
-            index: 2,
-        };
+        let first_key = BlockKey::new(&source, 0);
+        let third_key = BlockKey::new(&source, 2);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             let first_ready = manager().contains_block(&first_key).unwrap();
@@ -3004,10 +3023,7 @@ mod tests {
         let block = source
             .with_file(|file| read_file_at(file, offset, BLOCK_SIZE, &manager().metrics))
             .unwrap();
-        let blocked_key = BlockKey {
-            identity: source.identity.clone(),
-            index: 1,
-        };
+        let blocked_key = BlockKey::new(&source, 1);
         manager()
             .insert_block(blocked_key, Arc::from(block), cache_tier(&source, 1))
             .unwrap();
@@ -3051,10 +3067,7 @@ mod tests {
         let block = source
             .with_file(|file| read_file_at(file, 0, BLOCK_SIZE, &manager().metrics))
             .unwrap();
-        let key = BlockKey {
-            identity: source.identity.clone(),
-            index: 0,
-        };
+        let key = BlockKey::new(&source, 0);
         manager()
             .insert_block(key, Arc::from(block), cache_tier(&source, 0))
             .unwrap();
@@ -3236,6 +3249,36 @@ mod tests {
             second.file_identity().unwrap(),
             third.file_identity().unwrap()
         );
+        assert_eq!(third.read_all().unwrap(), b"new!");
+
+        // The metadata-generation case above cannot expose an event-proven
+        // write in the same clock tick, or a late old loader publishing after
+        // invalidation. Reuse this tiny lifecycle to cover both boundaries.
+        let old_source = manager().open_file(&path).unwrap();
+        let token = old_source.identity.generation_token();
+        let metadata = std::fs::metadata(&path).unwrap();
+        let old_key = BlockKey::new(&old_source, 0);
+        manager().cache_shards[cache_shard_index(&old_key)]
+            .lock()
+            .unwrap()
+            .remove_entry(&old_key, true);
+        std::fs::write(&path, b"last").unwrap();
+        let writer = TrackedFile::open_with(&path, "generation_test_writer", |options| {
+            options.write(true);
+        })
+        .unwrap();
+        restore_generation_test_times(&writer, &metadata);
+        set_generation_test_change_time(&writer, old_source.identity.physical.change_time);
+        drop(writer);
+        invalidate_reader_path(&path);
+        let current = manager().open_file(&path).unwrap();
+        assert_eq!(token, current.identity.generation_token());
+        manager()
+            .insert_block(old_key, Arc::from(&b"new!"[..]), CacheTier::Hot)
+            .unwrap();
+        assert_eq!(current.read_at(0, 4).unwrap(), b"last");
+        assert_ne!(old_source.cache_identity(), current.cache_identity());
+        assert!(!old_source.closed.load(Ordering::Acquire));
         assert_eq!(third.read_all().unwrap(), b"new!");
         std::fs::remove_file(path).unwrap();
     }
