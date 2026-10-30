@@ -3,6 +3,7 @@ import os
 import sys
 import subprocess
 from contextlib import nullcontext
+from dataclasses import replace
 from typing import Any, Callable
 
 from sunpack.core.support.resource_lifecycle import task_walk
@@ -629,9 +630,10 @@ class SingleArchiveExtractor:
         selected_codepage = None
         any_success = False
         any_partial = False
-        segment_failures: list[FailureInfo] = []
+        segment_failures: list[FailureInfo] = list(task.runtime.get("password_retry_other_failures", ()))
         segment_paths: set[str] = set()
         segment_allocator = OutputPathAllocator()
+        segment_count = int(task.runtime.get("password_retry_segment_count", len(segments)))
 
         for position, segment in enumerate(segments, start=1):
             segment_id = str(segment.get("segment_id") or f"embedded_{position:02d}")
@@ -649,7 +651,7 @@ class SingleArchiveExtractor:
             # payloads still need isolated subdirectories to avoid collisions.
             segment_dir = (
                 out_dir
-                if len(segments) == 1
+                if segment_count == 1
                 else segment_allocator.next_available(
                     os.path.join(out_dir, self._safe_segment_dir_name(descriptor.logical_name, position)),
                     segment_paths,
@@ -657,6 +659,9 @@ class SingleArchiveExtractor:
                 )
             )
             segment_paths.add(resolved_path_key(segment_dir))
+            if "retry_created_outputs" in task.runtime:
+                # Only these new segment roots belong to this retry's rollback.
+                task.runtime["retry_created_outputs"].append(segment_dir)
             with _phase(phase_timer, f"{phase_prefix}_segment_set_archive_input"):
                 # Each logical payload owns its knowledge. The carrier stays
                 # unchanged, including when a payload fails or is cancelled.
@@ -718,7 +723,9 @@ class SingleArchiveExtractor:
             any_success = any_success or segment_success
             any_partial = any_partial or segment_partial
             if result.failure is not None:
-                segment_failures.append(result.failure)
+                segment_failures.append(replace(result.failure, details={
+                    **result.failure.details, "retry_input": descriptor.to_dict(),
+                }))
             segment_results.append({
                 "segment_id": segment_id,
                 "index": int(segment.get("index") or position),
@@ -746,7 +753,7 @@ class SingleArchiveExtractor:
                 "file_count": output_inventory.stats.file_count,
                 "total_bytes": output_inventory.stats.total_size,
             }
-        all_success = bool(segment_results) and all(item.get("success") for item in segment_results)
+        all_success = bool(segment_results) and not segment_failures and all(item.get("success") for item in segment_results)
         diagnostics = {
             "result": {
                 "status": "ok" if all_success else ("partial" if any_success or any_partial else "failed"),
@@ -762,8 +769,13 @@ class SingleArchiveExtractor:
         if segment_failures:
             aggregate_failure = self._aggregate_embedded_failure(
                 segment_failures,
-                segment_count=len(segment_results),
+                segment_count=segment_count,
             )
+            generation = task.runtime.get("input_generation")
+            if generation:
+                aggregate_failure = replace(aggregate_failure, details={
+                    **aggregate_failure.details, "retry_generation": generation,
+                })
         if any_success:
             self._log(self.i18n.t(
                 "extract.log.embedded_success" if all_success else "extract.log.embedded_failed",

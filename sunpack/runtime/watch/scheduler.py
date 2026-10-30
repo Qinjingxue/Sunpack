@@ -684,6 +684,11 @@ class WatchScheduler:
                 continue
             active_outputs = dict(getattr(pending, "active_outputs", {}) or {})
             entry = self.state.latest_entry_for_path(pending.path)
+            # A continuation borrows this retained container; it is never an
+            # uncommitted tree that crash recovery may remove wholesale.
+            continued_dir = entry.failure_payload.get("details", {}).get("retry_output_dir") if entry else None
+            if continued_dir:
+                active_outputs = {task: root for task, root in active_outputs.items() if root != continued_dir}
             interrupted = (entry is not None and entry.status == "interrupted"
                 and _candidate_change_kind(_candidate_from_state_entry(entry), WatchCandidate(
                     pending.path, pending.size, pending.mtime, pending.file_id, pending.change_usn,
@@ -2116,6 +2121,9 @@ class WatchScheduler:
             scope_dir = ""
             if retry_entry is not None and retry_entry.status == "failed_password":
                 scope_dir = retry_entry.password_scope_dir
+                failure = FailureInfo.from_dict(retry_entry.failure_payload)
+                if failure is not None and failure.details.get("retry_generation"):
+                    run_config["password_retry_failures"] = {path_key(candidate.path): failure}
             elif pending is not None:
                 scope_dir = str(pending.password_scope_dir or "")
             run_config["password_scope_dir"] = scope_dir or os.path.dirname(candidate.path)

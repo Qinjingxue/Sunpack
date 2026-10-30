@@ -28,6 +28,7 @@ from sunpack.core.contracts.retry_targets import (
     merge_latest_results,
     password_retry_paths,
     password_retry_results,
+    password_retry_failures,
 )
 from sunpack.core.contracts.results import RunSummary
 from sunpack.core.contracts.run_state import RunState
@@ -212,6 +213,7 @@ async def handle(args, ctx):
                 if item.failure.details.get("promoted_nested_input") is True
             )
             current_targets = retry_targets
+            run_config["password_retry_failures"] = password_retry_failures(summary)
             retry_count += 1
             reporter.info(ctx.t("cli.extract.retry_round"))
         recent_passwords = engine.recent_passwords

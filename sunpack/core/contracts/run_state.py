@@ -70,7 +70,13 @@ class RunState:
             for slot in slots:
                 old = self.target_results[slot]
                 path = result.relocate(old.output_dir)
-                self._store_target_result(slot, replace(old, output_dir=path) if path != old.output_dir else old)
+                failure = old.failure
+                if failure is not None and failure.details.get("retry_output_dir"):
+                    failure = replace(failure, details={
+                        **failure.details, "retry_output_dir": result.relocate(failure.details["retry_output_dir"]),
+                    })
+                self._store_target_result(slot, replace(old, output_dir=path, failure=failure)
+                                          if path != old.output_dir or failure is not old.failure else old)
         for _path, slots in self._cleanup_paths.pop_under(result.path):
             for slot in slots:
                 old = self.cleanup_results[slot]

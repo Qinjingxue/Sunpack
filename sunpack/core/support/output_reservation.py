@@ -8,7 +8,7 @@ from sunpack.core.support.path_keys import resolved_path_key
 
 
 class OutputReservationRegistry:
-    """Atomically reserve not-yet-created output paths across requests."""
+    """Atomically reserve new or continued output paths across requests."""
 
     def __init__(self):
         self._lock = threading.Lock()
@@ -17,10 +17,13 @@ class OutputReservationRegistry:
         self._allocator = OutputPathAllocator()
         self.watch_outputs = None
 
-    def reserve(self, default_path: str, owner: str, local_reserved: set[str]) -> str:
+    def reserve(self, default_path: str, owner: str, local_reserved: set[str], *, reuse_existing: bool = False) -> str:
         with self._lock:
-            path = self._allocator.next_available(default_path, self._reserved, local_reserved, is_directory=True)
+            path = (os.path.normpath(default_path) if reuse_existing else
+                    self._allocator.next_available(default_path, self._reserved, local_reserved, is_directory=True))
             key = resolved_path_key(path)
+            if reuse_existing and (key in self._reserved or key in local_reserved):
+                raise FileExistsError(f"output directory is already reserved: {path}")
             self._reserved.add(key)
             self._owner_paths.setdefault(owner, set()).add(key)
             local_reserved.add(key)
@@ -69,11 +72,12 @@ def build_output_dir_resolver(
     reserved: set[str] = set()
     allocator = OutputPathAllocator() if reservation_registry is None else None
     for task in tasks:
-        default_dir = default_output_dir_for_task(task)
+        continued_dir = task.runtime.get("retry_output_dir")
+        default_dir = continued_dir or default_output_dir_for_task(task)
         if reservation_registry is None:
-            path = allocator.next_available(default_dir, reserved, is_directory=True)
+            path = default_dir if continued_dir else allocator.next_available(default_dir, reserved, is_directory=True)
             reserved.add(resolved_path_key(path))
             resolved_dirs[id(task)] = path
         else:
-            resolved_dirs[id(task)] = reservation_registry.reserve(default_dir, owner, reserved)
+            resolved_dirs[id(task)] = reservation_registry.reserve(default_dir, owner, reserved, reuse_existing=bool(continued_dir))
     return lambda task: resolved_dirs[id(task)]

@@ -27,6 +27,7 @@ from sunpack.pipeline.coordinator.task_scan import ArchiveTaskScanner
 from sunpack.pipeline.coordinator.target_groups import relation_group_to_candidate
 from sunpack.core.contracts.tasks import ArchiveTask
 from sunpack.core.contracts.failures import FailureInfo, FailureKind
+from sunpack.core.contracts.retry_targets import apply_password_retry, remap_retry_failure
 from sunpack.pipeline.postprocess.internal.blocked_input import (
     BlockedInputPromotionError, NativeBlockedInputPromotion, promote_blocked_input,
 )
@@ -1541,6 +1542,10 @@ class _RequestRuntime:
                     "Archive input planning must preserve one logical ArchiveTask identity"
                 )
 
+            retry_failure = self.config.get("password_retry_failures", {}).get(path_key(task.main_path))
+            if retry_failure is not None:
+                apply_password_retry(task, retry_failure, task.runtime.get("input_generation", ()))
+
             ownership.remember_tasks([task])
             # Admission already confirmed the physical generation under the
             # task lease. Discovery may predate a copy's final timestamp or a
@@ -1647,6 +1652,7 @@ class _RequestRuntime:
             if (
                 output_dir
                 and subtree_complete
+                and not task.runtime.get("retry_output_dir")
                 and self.config.get("post_extract", {}).get("flatten_single_directory", True)
             ):
                 # Flatten mutates the output subtree namespace. Let cleanup remain
@@ -1886,8 +1892,11 @@ class _RequestRuntime:
             task.apply_path_mapping(moved.path_map)
             from sunpack.core.contracts.discovery_scope import DiscoveryScope
             task.runtime["discovery_scope"] = DiscoveryScope(destination)
-            promoted_failure = replace(result.failure, details={
-                **result.failure.details,
+            failure = remap_retry_failure(
+                result.failure, moved.path_map, self.path_leases.input_version_for(task.all_parts),
+            )
+            promoted_failure = replace(failure, details={
+                **failure.details,
                 "path": task.main_path,
                 "discovery_scope": task.runtime["discovery_scope"].to_record(),
                 "promoted_nested_input": True,
@@ -1984,6 +1993,8 @@ class _RequestRuntime:
         inputs = await self.path_leases.acquire(
             self.submission.request_id, paths, lease_id=id(task), cancellation=cancellation,
         )
+        # Reuse admission's metadata snapshot; no content hash or extra stat.
+        task.runtime["input_generation"] = _lease_ownership_version(inputs)
         if task.runtime.get("discovery_scope") is not None:
             missing = tuple(item.path for item in inputs if item.missing)
             if missing and len(missing) == len(inputs):

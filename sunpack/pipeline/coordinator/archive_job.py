@@ -123,14 +123,19 @@ class ArchiveJobExecutor:
     def rollback_interrupted_outputs(self) -> tuple[str, ...]:
         errors = []
         for output_dir, task in self._uncommitted_outputs.items():
-            result = DEFAULT_OUTPUT_CLEANUP_MANAGER.cleanup_canonical(
-                output_dir, event=OutputCleanupEvent.USER_CANCELLED,
-                planned_output_dir=output_dir, allow_nonempty=True,
-            )
-            if not (result.cleaned or result.already_absent):
-                errors.append(f"{output_dir}: {result.error or result.reason}")
+            continued = bool(task.runtime.get("retry_output_dir"))
+            paths = task.runtime.get("retry_created_outputs", ()) if continued else (output_dir,)
+            before_errors = len(errors)
+            for path in paths:
+                result = DEFAULT_OUTPUT_CLEANUP_MANAGER.cleanup_canonical(
+                    path, event=OutputCleanupEvent.USER_CANCELLED,
+                    planned_output_dir=path, allow_nonempty=True,
+                )
+                if not (result.cleaned or result.already_absent):
+                    errors.append(f"{path}: {result.error or result.reason}")
+            if not continued and len(errors) != before_errors:
                 continue
-            self._finish_output(task, output_dir, keep=False)
+            self._finish_output(task, output_dir, keep=continued)
         self._uncommitted_outputs.clear()
         return tuple(errors)
 
@@ -194,7 +199,8 @@ class ArchiveJobExecutor:
             cancellation=cancellation,
         )
         preserve_output = bool(result.output_dir and (
-            result.outcome_kind != OutcomeKind.FAILURE or any(outcome.result.complete_embedded_results())
+            task.runtime.get("retry_output_dir")
+            or result.outcome_kind != OutcomeKind.FAILURE or any(outcome.result.complete_embedded_results())
         ))
         path = outcome.planned_out_dir
         if path in self._uncommitted_outputs and not os.path.lexists(path):
@@ -285,6 +291,8 @@ class ArchiveJobExecutor:
                              planned_out_dir, request_id=self.request_id, cancellation=cancellation)
         if depth == 1:
             self._uncommitted_outputs[planned_out_dir] = task
+        if task.runtime.get("retry_output_dir"):
+            task.runtime["retry_created_outputs"] = []
         if self.origin == "watch":
             task.runtime["watch_active_output"] = (task.main_path, planned_out_dir)
             await self.extractor.emit_semantic_event_async(
@@ -431,12 +439,21 @@ class ArchiveJobExecutor:
         cleanup = cleanup_failed_output_if_eligible(
             out_dir,
             planned_output_dir=outcome.planned_out_dir,
-            failed=outcome.outcome_kind == OutcomeKind.FAILURE,
+            failed=outcome.outcome_kind == OutcomeKind.FAILURE and not task.runtime.get("retry_output_dir"),
             force_owned_output_cleanup=outcome.policy_rejected_partial_output,
             payload_inventory=(inventory.stats.file_count, inventory.stats.total_size) if inventory is not None else None,
         )
         diagnostics = res.diagnostics
         res.diagnostics = {**diagnostics, "failed_output_cleanup": cleanup.to_dict()}
+
+        if res.failure is not None and (
+            task.runtime.get("retry_output_dir") or any(res.complete_embedded_results())
+        ):
+            # The path itself is the continuation signal; no output scan or
+            # retained success inventories are needed across requests/restarts.
+            res.failure = replace(res.failure, details={
+                **res.failure.details, "retry_output_dir": out_dir,
+            })
 
         possible_missing_volume = _possible_missing_volume_failure(
             task,
