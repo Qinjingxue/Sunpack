@@ -12,7 +12,6 @@ from sunpack_native import (
     output_inventory_from_serialized as _native_inventory_from_serialized,
     rebase_output_inventory_root as _native_rebase_output_inventory_root,
     scan_output_inventory as _native_scan_output_inventory,
-    merge_output_inventories as _native_merge_output_inventories,
 )
 from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import native_worker_manifest
 
@@ -106,13 +105,6 @@ class OutputInventory:
                 os.path.abspath(new_root),
             )
         )
-
-    @classmethod
-    def merge(cls, output_dir: str, inventories: list["OutputInventory"]) -> "OutputInventory":
-        root = os.path.abspath(output_dir)
-        if len(inventories) == 1 and _path_key(inventories[0].root) == _path_key(root):
-            return inventories[0]
-        return cls.from_native(_native_merge_output_inventories(root, [inventory._native for inventory in inventories]))
 
     @classmethod
     def from_value(cls, value: OutputInventory | None, *, expected_root: str = "") -> OutputInventory | None:

@@ -179,6 +179,15 @@ def test_embedded_password_probe_and_session_key_follow_active_segment(tmp_path)
     assert len({key for key, _ in resolver.calls}) == 2
     assert all(key.startswith(f"{task.key}#zip:") for key, _ in resolver.calls)
     assert [call[1]["parts"][0]["start"] for call in resolver.calls] == [7, 17]
+    assert (result.files_written, result.bytes_written) == (2, 4)
+    # Multi-payload verification must consume the retained child tables, even
+    # though the carrier has no merged inventory. The single-SFX test cannot
+    # catch a fallback that counts only the first payload.
+    verification = VerificationScheduler(make_config({
+        "verification": {"enabled": True, "methods": [{"name": "archive_test_crc"}]},
+    })).verify(task, result)
+    assert verification.decision_hint == DECISION_ACCEPT
+    assert verification.archive_coverage.complete_files == 2
 
 
 def test_embedded_boundary_password_is_reused_without_second_search(tmp_path):

@@ -8,21 +8,6 @@ from sunpack_native import output_inventory_from_serialized
 from sunpack.pipeline.extraction.output_inventory import OutputInventory
 
 
-def test_inventory_merge_preserves_order_and_rejects_overlapping_windows_roots(tmp_path):
-    # Punctuation can sort between a parent and child under string ordering.
-    # Existing verification matches never exercise inventory root arbitration.
-    from sunpack_native import merge_output_inventories
-
-    roots = [tmp_path / name for name in ("Ä", "a-sibling", "nested/child", "a")]
-    inventories = [_inventory(root, [{"path": "file", "size": 1}])._native for root in roots]
-    merged = OutputInventory.from_native(merge_output_inventories(str(tmp_path), inventories))
-    assert [item["path"] for item in merged.file_page()] == ["Ä/file", "a-sibling/file", "nested/child/file", "a/file"]
-    assert merged.stats.file_count == merged.stats.total_size == 4
-    for invalid in (tmp_path / "a" / "child", tmp_path / "ä", tmp_path.parent / "outside"):
-        with pytest.raises(ValueError, match="disjoint"):
-            merge_output_inventories(str(tmp_path), [*inventories, _inventory(invalid, [])._native])
-
-
 def test_manifest_sizes_distinguish_short_exact_and_oversized_outputs(tmp_path):
     # Existing CRC/short-write cases cannot detect oversized content in formats
     # without file CRCs, such as TAR. All three states share one native match.

@@ -102,7 +102,8 @@ def test_complete_embedded_children_are_not_policy_rejected_with_failed_siblings
 
 
 @pytest.mark.parametrize("with_zero_file", [False, True])
-def test_collect_result_records_cleanup_and_preserves_zero_byte_files(tmp_path, with_zero_file, monkeypatch):
+@pytest.mark.parametrize("embedded", [False, True])
+def test_collect_result_records_cleanup_and_preserves_zero_byte_files(tmp_path, with_zero_file, embedded, monkeypatch):
     archive = tmp_path / "broken.zip"
     archive.write_bytes(b"broken")
     output = tmp_path / "broken"
@@ -122,6 +123,15 @@ def test_collect_result_records_cleanup_and_preserves_zero_byte_files(tmp_path, 
         error="damaged",
         output_inventory=collect_output_inventory(str(output)),
     )
+    if embedded:
+        # A carrier retains only child inventories. Ordinary-archive cleanup
+        # cannot catch loss of its aggregate zero-byte-file count.
+        extraction = ExtractionResult(
+            success=False, out_dir=str(output), error="damaged",
+            files_written=extraction.output_inventory.stats.file_count,
+            bytes_written=extraction.output_inventory.stats.total_size,
+            embedded_results=[({}, extraction)],
+        )
     if with_zero_file:
         def unexpected_walk(_path):
             raise AssertionError("positive native inventory must be reused")

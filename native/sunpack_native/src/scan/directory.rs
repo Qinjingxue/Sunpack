@@ -414,141 +414,6 @@ pub(crate) fn rebase_output_inventory_root(
     rebase_output_inventory_root_impl(&inventory, new_root)
 }
 
-/// Compose disjoint, already inventoried child directories without filesystem I/O.
-#[pyfunction]
-pub(crate) fn merge_output_inventories(
-    py: Python<'_>,
-    root: String,
-    inventories: Vec<Py<NativeOutputInventory>>,
-) -> PyResult<NativeOutputInventory> {
-    let inventories: Vec<_> = inventories
-        .iter()
-        .map(|inventory| inventory.borrow(py).clone())
-        .collect();
-    py.detach(move || {
-        if inventories.is_empty() {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "output inventory merge requires child inventories",
-            ));
-        }
-        let root_path = lexical_normalize_path(Path::new(&root));
-        let root_depth = root_path.components().count();
-        let mut child_roots: Vec<PathBuf> = Vec::with_capacity(inventories.len());
-        let root_key = inventory_path_key(&path_to_string(&root_path));
-        let mut child_keys = Vec::with_capacity(inventories.len());
-        for inventory in &inventories {
-            let child = lexical_normalize_path(Path::new(&inventory.root));
-            let key = inventory_path_key(&path_to_string(&child));
-            if !Path::new(&key).starts_with(Path::new(&root_key)) {
-                return Err(pyo3::exceptions::PyValueError::new_err(
-                    "output inventory roots must be disjoint and within the merged root",
-                ));
-            }
-            // Component ordering keeps a directory adjacent to its descendants,
-            // even when a sibling contains punctuation before the separator.
-            child_keys.push(key);
-            child_roots.push(child);
-        }
-        child_keys.sort_unstable_by(|left, right| Path::new(left).cmp(Path::new(right)));
-        if child_keys
-            .windows(2)
-            .any(|pair| Path::new(&pair[1]).starts_with(Path::new(&pair[0])))
-        {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "output inventory roots must be disjoint and within the merged root",
-            ));
-        }
-        let mut files = Vec::with_capacity(
-            inventories
-                .iter()
-                .map(|inventory| inventory.files.len())
-                .sum(),
-        );
-        let mut container_dirs = HashSet::new();
-        let mut dir_count = 0;
-        let mut total_size = 0u64;
-        let mut unreadable_count = 0;
-        let mut worker_inventory_complete = true;
-        let mut worker_crc_available = true;
-        for (inventory, child_root) in inventories.iter().zip(&child_roots) {
-            let prefix = normalize_path_separator(path_to_string(
-                &child_root
-                    .components()
-                    .skip(root_depth)
-                    .collect::<PathBuf>(),
-            ));
-            dir_count += inventory.dir_count;
-            total_size = total_size.saturating_add(inventory.total_size);
-            unreadable_count += inventory.unreadable_count;
-            worker_inventory_complete &= inventory.worker_inventory_complete;
-            if !inventory.files.is_empty() {
-                worker_crc_available &= inventory.worker_crc_available;
-            }
-            if inventory.exists && inventory.is_dir {
-                let mut directory = child_root.as_path();
-                while directory.components().count() > root_depth {
-                    container_dirs.insert(inventory_path_key(&path_to_string(directory)));
-                    directory = directory
-                        .parent()
-                        .expect("child inventory is below merge root");
-                }
-            }
-            for item in inventory.files.iter() {
-                let physical = item.output_path.as_ref().unwrap_or(&item.path);
-                let relative = if !physical.is_empty()
-                    && Path::new(physical)
-                        .components()
-                        .all(|component| matches!(component, std::path::Component::Normal(_)))
-                {
-                    let mut relative = String::with_capacity(prefix.len() + 1 + physical.len());
-                    if !prefix.is_empty() {
-                        relative.push_str(&prefix);
-                        relative.push('/');
-                    }
-                    relative.extend(physical.chars().map(|ch| if ch == '\\' { '/' } else { ch }));
-                    relative
-                } else {
-                    let actual = inventory_file_path(child_root, item).ok_or_else(|| {
-                        pyo3::exceptions::PyValueError::new_err(
-                            "output inventory file is outside its child root",
-                        )
-                    })?;
-                    normalize_path_separator(path_to_string(
-                        &actual.components().skip(root_depth).collect::<PathBuf>(),
-                    ))
-                };
-                files.push(OutputFileRecord {
-                    index: files.len() as u32,
-                    path: relative,
-                    abs_path: None,
-                    output_path: None,
-                    size: item.size,
-                    bytes_written: item.bytes_written,
-                    crc32: item.crc32,
-                    output_crc32: item.output_crc32,
-                    crc_ok: item.crc_ok,
-                    status: item.status,
-                    mtime_ns: item.mtime_ns,
-                    magic: item.magic.clone(),
-                });
-            }
-        }
-        Ok(NativeOutputInventory {
-            root: path_to_string(&root_path),
-            exists: true,
-            is_dir: true,
-            file_count: files.len(),
-            dir_count: dir_count + container_dirs.len(),
-            total_size,
-            unreadable_count,
-            worker_crc_available: worker_crc_available && !files.is_empty(),
-            worker_inventory_complete,
-            identity_paths: true,
-            files: Arc::new(files),
-        })
-    })
-}
-
 #[pymethods]
 impl NativeOutputInventory {
     #[getter]
@@ -1412,7 +1277,7 @@ impl NativeDirectoryScanOptions {
         let (filtered, raw) = py.detach(|| {
             let mut scope = scope.clone();
             if let Some(state) = state {
-                scope.exclude_roots(state.output_roots().into_iter());
+                scope.exclude_roots(state.output_roots(&scope.root).into_iter());
             }
             let mut options = self.options.clone();
             options.scope = Some(scope.clone());
@@ -3640,14 +3505,39 @@ impl NativeWatchCatalog {
         }
         directories
     }
-    fn output_roots(&self) -> Vec<String> {
-        self.outputs
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .runtime
-            .values()
-            .filter(|value| crate::watch_store::output_identity_matches(value))
-            .filter_map(|value| value["path"].as_str().map(str::to_owned))
+    fn output_roots(&self, under: &str) -> Vec<String> {
+        let key = format!(
+            "owned|{}",
+            crate::path_keys::path_key(under).trim_end_matches('\\')
+        );
+        let records = {
+            let data = self.outputs.lock().unwrap_or_else(|e| e.into_inner());
+            let mut records = Vec::new();
+            let mut current = key.as_str();
+            loop {
+                if let Some(value) = data.runtime.get(current) {
+                    records.push((current["owned|".len()..].to_owned(), value.clone()));
+                }
+                let Some((parent, _)) = current.rsplit_once('\\') else {
+                    break;
+                };
+                current = parent;
+            }
+            let prefix = format!("{key}\\");
+            records.extend(
+                data.runtime
+                    .range(prefix.clone()..)
+                    .take_while(|(key, _)| key.starts_with(&prefix))
+                    .map(|(key, value)| (key["owned|".len()..].to_owned(), value.clone())),
+            );
+            records
+        };
+        // Snapshot only intersecting aliases from the existing ordered index.
+        // Identity I/O must not hold the shared Watch state lock.
+        records
+            .into_iter()
+            .filter(|(_, value)| crate::watch_store::output_identity_matches(value))
+            .map(|(path, _)| path)
             .collect()
     }
     fn is_owned(&self, path: &str) -> bool {
@@ -3739,12 +3629,16 @@ fn update_catalog(
                 Vec::new(),
             ));
         }
-        if !metadata.as_ref().is_ok_and(|m| m.is_file()) {
-            effective.exclude_roots(state.output_roots().into_iter());
+        let target_owned = state.is_owned(target);
+        if metadata.as_ref().is_ok_and(|m| m.is_dir())
+            && effective.contains(target)
+            && !target_owned
+        {
+            effective.exclude_roots(state.output_roots(target).into_iter());
         }
         let mut options = options.options.clone();
         options.scope = Some(effective.clone());
-        let mut records = if !effective.contains(target) || state.is_owned(target) {
+        let mut records = if !effective.contains(target) || target_owned {
             DirectoryScanRecords {
                 filtered: Vec::new(),
                 raw: Vec::new(),

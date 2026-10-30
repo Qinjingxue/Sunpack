@@ -406,6 +406,55 @@ def test_watch_scheduler_prunes_missing_state_before_start(tmp_path, monkeypatch
         watcher._close_blocking()
 
 
+def test_scoped_catalog_updates_preserve_output_identity_and_sibling_inputs(tmp_path):
+    # Admission tests do not inspect subtree catalog replacement/deletion. One
+    # small lifecycle catches overbroad prefix exclusion and stale identities.
+    from sunpack.core.contracts.discovery_scope import DiscoveryScope
+    from sunpack.pipeline.discovery.filesystem.directory_scanner import DirectoryScanner
+    from sunpack.runtime.watch.output_roots import WatchOutputRoots
+    from sunpack_native import NativeWatchCatalog
+
+    root = tmp_path / "input"
+    branch = root / "branch"
+    sibling = root / "branch-other"
+    branch.mkdir(parents=True)
+    sibling.mkdir()
+    source, peer = branch / "source.blob", sibling / "source.blob"
+    source.write_bytes(b"source")
+    peer.write_bytes(b"peer")
+    scope = DiscoveryScope(str(root), recursive=True)
+    state = WatchStateStore(str(tmp_path / "state.snapshot"))
+    outputs = WatchOutputRoots(state, (scope,))
+    catalog = NativeWatchCatalog(state._native)
+    options = DirectoryScanner.compile_scan_options({"filesystem": {"scan_filters_enabled": False}})
+    output = branch / "result"
+    try:
+        outputs.register(str(output))
+        (output / "generated.blob").write_bytes(b"output")
+        assert not options.catalog_update(catalog, scope.native)
+
+        def paths():
+            return {item["path"] for item in options.catalog_candidates(catalog, scope.native)}
+
+        assert paths() == {str(source), str(peer)}
+        assert not options.catalog_update(catalog, scope.native, str(branch))
+        assert paths() == {str(source), str(peer)}
+        source.unlink()
+        assert not options.catalog_update(catalog, scope.native, str(source))
+        assert paths() == {str(peer)}
+        # A new directory at a formerly owned path must become ordinary input.
+        output.rename(tmp_path / "retired")
+        output.mkdir()
+        replacement = output / "new.blob"
+        replacement.write_bytes(b"new")
+        assert not options.catalog_update(catalog, scope.native, str(branch))
+        assert paths() == {str(peer), str(replacement)}
+    finally:
+        catalog.close()
+        outputs.close()
+        state.close()
+
+
 @pytest.mark.parametrize("volume_offline", [False, True])
 def test_unavailable_root_preserves_state_across_restart_and_event_recovery(tmp_path, monkeypatch, volume_offline):
     """Existing deletion tests keep the root accessible and miss destructive outage cleanup.

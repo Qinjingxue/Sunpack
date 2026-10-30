@@ -424,12 +424,15 @@ class ArchiveJobExecutor:
         res = outcome.result
         out_dir = res.out_dir
         inventory = OutputInventory.from_value(res.output_inventory, expected_root=out_dir) if out_dir else None
+        payload_inventory = (inventory.stats.file_count, inventory.stats.total_size) if inventory is not None else None
+        if res.embedded_results:
+            payload_inventory = (res.files_written, res.bytes_written)
         cleanup = cleanup_failed_output_if_eligible(
             out_dir,
             planned_output_dir=outcome.planned_out_dir,
             failed=outcome.outcome_kind == OutcomeKind.FAILURE and not task.runtime.get("retry_output_dir"),
             force_owned_output_cleanup=outcome.policy_rejected_partial_output,
-            payload_inventory=(inventory.stats.file_count, inventory.stats.total_size) if inventory is not None else None,
+            payload_inventory=payload_inventory,
         )
         diagnostics = res.diagnostics
         res.diagnostics = {**diagnostics, "failed_output_cleanup": cleanup.to_dict()}

@@ -23,7 +23,8 @@ class ExtractionResult:
     # Rust-owned per-file progress manifest (sunpack_native.NativeProgressManifest).
     progress_manifest_payload: NativeProgressManifest | None = None
     output_inventory: OutputInventory | None = None
-    # Cached native counters; the output inventory is authoritative when present.
+    # Cached native counters, summed from child inventories for a carrier.
+    # The output inventory is authoritative when present.
     files_written: int = 0
     bytes_written: int = 0
     # In-process child results for carriers containing independent archives.

@@ -630,7 +630,6 @@ class SingleArchiveExtractor:
 
         segment_results: list[dict[str, Any]] = []
         embedded_results: list[tuple[dict[str, Any], ExtractionResult]] = []
-        segment_inventories: list[OutputInventory] = []
         password_used = None
         selected_codepage = None
         any_success = False
@@ -713,7 +712,6 @@ class SingleArchiveExtractor:
                 if segment_inventory is None:
                     segment_inventory = collect_output_inventory(segment_dir)
                     result.output_inventory = segment_inventory
-                segment_inventories.append(segment_inventory)
                 stats = {
                     "file_count": segment_inventory.stats.file_count,
                     "total_bytes": segment_inventory.stats.total_size,
@@ -753,10 +751,11 @@ class SingleArchiveExtractor:
             })
 
         with _phase(phase_timer, f"{phase_prefix}_directory_stats_total"):
-            output_inventory = OutputInventory.merge(out_dir, segment_inventories)
+            # Verification and discovery consume each child's native inventory.
+            # The carrier only needs counters; a second per-file table is unused.
             totals = {
-                "file_count": output_inventory.stats.file_count,
-                "total_bytes": output_inventory.stats.total_size,
+                "file_count": sum(item["files_written"] for item in segment_results),
+                "total_bytes": sum(item["bytes_written"] for item in segment_results),
             }
         all_success = bool(segment_results) and not segment_failures and all(item.get("success") for item in segment_results)
         diagnostics = {
@@ -799,7 +798,6 @@ class SingleArchiveExtractor:
                 # corrupt partial files.  This keeps terminal-failure cleanup
                 # from deleting the complete child outputs.
                 partial_outputs=False,
-                output_inventory=output_inventory,
                 files_written=totals["file_count"],
                 bytes_written=totals["total_bytes"],
                 embedded_results=embedded_results,
@@ -827,6 +825,8 @@ class SingleArchiveExtractor:
             partial_outputs=any_partial,
         )
         failed_result.embedded_results = embedded_results
+        failed_result.files_written = totals["file_count"]
+        failed_result.bytes_written = totals["total_bytes"]
         return failed_result
 
     def _aggregate_embedded_failure(
