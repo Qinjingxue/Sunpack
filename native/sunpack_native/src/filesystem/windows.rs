@@ -192,13 +192,8 @@ pub(super) fn watch_path_identity(path: &Path) -> io::Result<(String, String, i6
 
 pub(super) fn watch_file_is_ready(path: &Path) -> io::Result<bool> {
     let metadata = std::fs::metadata(path)?;
-    // Permit concurrent readers: only a writer must conflict with this probe.
-    match open_path(
-        path,
-        GENERIC_READ,
-        FILE_SHARE_READ | FILE_SHARE_DELETE,
-        metadata.is_dir(),
-    ) {
+    // Permit readers; writers and DELETE access (rename/delete) must conflict.
+    match open_path(path, GENERIC_READ, FILE_SHARE_READ, metadata.is_dir()) {
         Ok(_handle) => Ok(true),
         Err(error)
             if matches!(

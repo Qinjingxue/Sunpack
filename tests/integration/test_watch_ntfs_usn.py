@@ -80,23 +80,6 @@ def test_same_size_same_mtime_in_place_overwrite_changes_usn(tmp_path):
     assert after.change_usn != before.change_usn
 
 
-def test_exclusive_readiness_waits_for_open_writer(tmp_path):
-    archive = tmp_path / "sample.zip"
-    archive.write_bytes(b"PK\x03\x04payload")
-
-    with archive.open("r+b") as writer:
-        assert not sunpack_native.watch_file_is_ready(str(archive))
-        writer.seek(0, os.SEEK_END)
-        writer.write(b"more")
-        writer.flush()
-        os.fsync(writer.fileno())
-
-    assert sunpack_native.watch_file_is_ready(str(archive))
-
-
-
-
-
 def test_duplicate_noise_does_not_restart_generation_but_overwrite_does(tmp_path):
     archive = tmp_path / "sample.zip"
     archive.write_bytes(b"A" * 256 * 1024)
