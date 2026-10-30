@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from sunpack.core.passwords.candidates import PasswordCandidatePipeline, PasswordCandidate
 
+import asyncio
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from enum import Enum
+from functools import wraps
 from itertools import chain, islice
 from typing import Literal
 
@@ -19,6 +21,37 @@ from sunpack.core.passwords.verifier.zip_fast import ZipFastVerifier
 from sunpack.core.passwords.verifier.enc_fast import EncFastVerifier
 from sunpack.core.passwords.verifier.input import PasswordProbeInput
 from sunpack.core.support.archive_sessions import archive_session_scope
+from sunpack.core.support.work_context import CURRENT_CANCELLATION
+
+
+def _raise_if_cancelled() -> None:
+    cancellation = CURRENT_CANCELLATION.get()
+    if cancellation is not None:
+        cancellation.raise_if_cancelled()
+
+
+def _cancellable_password_job(operation):
+    @wraps(operation)
+    def run(*args, **kwargs):
+        cancellation = CURRENT_CANCELLATION.get()
+        if cancellation is None:
+            return operation(*args, **kwargs)
+        from sunpack_native import PasswordCancellation, PasswordProbeCancelled
+
+        cancellation.raise_if_cancelled()
+        native = PasswordCancellation()
+        unsubscribe = cancellation.subscribe(native.cancel)
+        try:
+            with native:
+                try:
+                    result = operation(*args, **kwargs)
+                    cancellation.raise_if_cancelled()
+                    return result
+                except PasswordProbeCancelled:
+                    raise asyncio.CancelledError from None
+        finally:
+            unsubscribe()
+    return run
 
 
 class PasswordSearchStatus(str, Enum):
@@ -90,6 +123,7 @@ class PasswordScheduler:
         return cls(registry.build())
 
     @archive_session_scope()
+    @_cancellable_password_job
     def run(self, job: PasswordJob) -> PasswordSearchResult:
         started_at = time.monotonic()
         self._emit_progress(job, PasswordProgressEvent(stage="started"))
@@ -123,6 +157,7 @@ class PasswordScheduler:
             batch: list[str] = []
 
             for candidate in job.candidate_pipeline():
+                _raise_if_cancelled()
                 password = _candidate_value(candidate)
                 candidates_seen += 1
                 if self.cache.has_negative(fingerprint.key, password):
@@ -176,6 +211,7 @@ class PasswordScheduler:
             return result
 
     @archive_session_scope()
+    @_cancellable_password_job
     def plan_for_extraction(self, job: PasswordJob) -> PasswordSearchResult:
         """Resolve cheap proofs and return inconclusive candidates for real extraction.
 
@@ -215,6 +251,7 @@ class PasswordScheduler:
             def available_candidates():
                 nonlocal skipped, candidates_seen
                 for candidate in pipeline:
+                    _raise_if_cancelled()
                     password = _candidate_value(candidate)
                     if seen is not None:
                         if password in seen:
@@ -250,6 +287,7 @@ class PasswordScheduler:
             inconclusive_evidence = ""
             attempts = 0
             while batch := list(islice(candidates, batch_size)):
+                _raise_if_cancelled()
                 verification = _call_fast_verifier(
                     self.verifier,
                     job.archive_path,
@@ -257,6 +295,7 @@ class PasswordScheduler:
                     part_paths=job.part_paths,
                     archive_input=job.probe_input or job.archive_input,
                 )
+                _raise_if_cancelled()
                 attempts += max(0, min(int(verification.attempts or 0), len(batch)))
                 if verification.status == "not_required":
                     self.cache.remember_success(fingerprint.key, "")
@@ -379,6 +418,7 @@ class PasswordScheduler:
             part_paths=job.part_paths,
             archive_input=job.probe_input or job.archive_input,
         )
+        _raise_if_cancelled()
         attempted_in_batch = max(0, min(max(verification.attempts, 0), len(batch)))
         if (
             not verification.ok

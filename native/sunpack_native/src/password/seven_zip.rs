@@ -1,4 +1,7 @@
-use crate::formats::seven_zip::SevenZipPasswordProbe;
+use super::cancellation::Cancellation;
+use crate::formats::seven_zip::{
+    seven_zip_encryption_facts_from_next_header, SevenZipPasswordProbe,
+};
 use crate::io::read_fault::{read_exact_field, FieldLocation, ReadFault};
 use crate::io::reader::ManagedReader;
 use crate::password::context::{verify_prepared, InputKey, PasswordContext, PreparedStatus};
@@ -226,74 +229,54 @@ fn find_first_conclusive_header_with_probe(
     candidates: &[String],
     probe: &SevenZipPasswordProbe,
 ) -> Option<(usize, HeaderRead)> {
-    let mut start = 0usize;
-    while start < candidates.len() {
-        let possible = if candidates.len() - start >= PARALLEL_PASSWORD_THRESHOLD {
-            let search = || {
-                candidates[start..]
-                    .par_iter()
-                    .enumerate()
-                    .filter_map(|(relative, password)| {
-                        match probe.decoded_header_if_password_matches(password) {
-                            Ok(Some(decoded)) => Some((relative, Ok(decoded))),
-                            Ok(None) => None,
-                            Err(error) => Some((relative, Err(error))),
-                        }
-                    })
-                    .find_first(|_| true)
-            };
-            match seven_zip_password_pool() {
-                Some(pool) => pool.install(search),
-                None => search(),
-            }
-        } else {
-            candidates[start..]
-                .iter()
-                .enumerate()
-                .find_map(|(relative, password)| {
-                    match probe.decoded_header_if_password_matches(password) {
-                        Ok(Some(decoded)) => Some((relative, Ok(decoded))),
-                        Ok(None) => None,
-                        Err(error) => Some((relative, Err(error))),
-                    }
-                })
-        }?;
-        let index = start + possible.0;
-        let outcome = match possible.1 {
-            Ok(decoded) => read_predecoded_header_with_original_parser(&decoded),
-            Err(error) => HeaderRead::Unsupported(error),
-        };
-        if !matches!(outcome, HeaderRead::WrongPasswordOrPasswordRequired) {
-            return Some((index, outcome));
-        }
-        // A custom decoder false positive must never hide a later real password.
-        start = index + 1;
+    let cancellation = Cancellation::current();
+    if cancellation.cancelled() {
+        return None;
     }
-    None
+    let test = |(index, password): (usize, &String)| {
+        cancellation.run(
+            || match probe.decoded_header_if_password_matches(password) {
+                Ok(Some(decoded)) => Some((index, Ok(decoded))),
+                Ok(None) => None,
+                Err(error) => Some((index, Err(error))),
+            },
+        )
+    };
+    let possible = if candidates.len() >= PARALLEL_PASSWORD_THRESHOLD {
+        let search = || {
+            candidates
+                .par_iter()
+                .enumerate()
+                .filter_map(test)
+                .find_first(|_| true)
+        };
+        match seven_zip_password_pool() {
+            Some(pool) => pool.install(search),
+            None => search(),
+        }
+    } else {
+        candidates.iter().enumerate().find_map(test)
+    }?;
+    Some((
+        possible.0,
+        match possible.1 {
+            Ok(decoded) => read_predecoded_header(&decoded),
+            Err(error) => HeaderRead::Unsupported(error),
+        },
+    ))
 }
 
-fn read_predecoded_header_with_original_parser(decoded_header: &[u8]) -> HeaderRead {
-    let Ok(next_header_size) = u64::try_from(decoded_header.len()) else {
-        return HeaderRead::Unsupported("7z decoded header is too large".to_string());
-    };
-    use std::io::Write;
-    let mut header = [0u8; 32];
-    header[..6].copy_from_slice(SEVEN_Z_SIGNATURE);
-    header[7] = 4;
-    header[20..28].copy_from_slice(&next_header_size.to_le_bytes());
-    header[28..32].copy_from_slice(&crc32fast::hash(decoded_header).to_le_bytes());
-    let crc = crc32fast::hash(&header[12..32]);
-    header[8..12].copy_from_slice(&crc.to_le_bytes());
-    let mut synthetic = crate::io::scratch::Spool::default();
-    if let Err(error) = synthetic
-        .write_all(&header)
-        .and_then(|_| synthetic.write_all(decoded_header))
-    {
-        return HeaderRead::Unsupported(format!("resource_unavailable:{error}"));
-    }
-    match synthetic.finish() {
-        Ok(blob) => read_archive_header_from_reader(std::io::Cursor::new(blob), ""),
-        Err(error) => HeaderRead::Unsupported(format!("resource_unavailable:{error}")),
+fn read_predecoded_header(decoded_header: &[u8]) -> HeaderRead {
+    // The decoder already proved the header CRC. Reuse the analysis parser:
+    // FilesInfo properties are skipped in place, without per-file objects or
+    // another whole-header copy. Unhandled trees retain extraction fallback.
+    let facts = seven_zip_encryption_facts_from_next_header(decoded_header);
+    if facts.scan_complete {
+        HeaderRead::Ok {
+            payload_encrypted: facts.encrypted_payload,
+        }
+    } else {
+        HeaderRead::Unsupported("7z decoded header requires extraction confirmation".into())
     }
 }
 
@@ -389,13 +372,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn original_parser_confirms_predecoded_header() {
+    fn analysis_parser_confirms_predecoded_header() {
         assert!(matches!(
-            read_predecoded_header_with_original_parser(&[0x01, 0x00]),
+            read_predecoded_header(&[0x01, 0x00]),
             HeaderRead::Ok { .. }
         ));
         assert!(!matches!(
-            read_predecoded_header_with_original_parser(&[0x01, 0xff]),
+            read_predecoded_header(&[0x01, 0xff]),
             HeaderRead::Ok { .. }
         ));
     }

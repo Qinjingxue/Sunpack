@@ -141,6 +141,8 @@ pub(crate) fn verify_prepared(
     candidates: &[String],
     prepare: impl FnOnce() -> Prepared + Send,
 ) -> PyResult<Py<PyAny>> {
+    let cancellation = super::cancellation::Cancellation::current();
+    cancellation.check()?;
     // The key comes from the already opened physical readers. Their generation
     // is validated when the input is acquired, and the caller's lifecycle borrow
     // covers this probe. Reopening every path here would repeat that admission
@@ -225,6 +227,7 @@ pub(crate) fn verify_prepared(
                 .map_or(0, PasswordContext::retained_bytes),
         );
     }
+    cancellation.check()?;
     result
 }
 

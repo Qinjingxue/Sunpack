@@ -1,5 +1,6 @@
 //! ENC's quick block is a strong, bounded password proof. Authentication belongs
 //! to extraction. Reuse the existing generation-aware prepared-context cache.
+use super::cancellation::Cancellation;
 use super::context::{verify_prepared, InputKey, PasswordContext, PreparedStatus};
 use super::input::{parse_ranges, ranges_key, ranges_total_len, VirtualRangeReader};
 use crate::io::read_fault::{read_exact_field, FieldLocation};
@@ -150,12 +151,14 @@ impl EncPasswordContext {
             .max(1);
         let chunk_size = candidates.len().div_ceil(workers);
         let earliest = AtomicUsize::new(candidates.len());
+        let cancellation = Cancellation::current();
         let search = |(chunk_index, chunk): (usize, &[String])| {
             let mut workspace = Workspace::default();
+            workspace.set_cancellation(cancellation.flag());
             let mut utf16 = Vec::new();
             for (offset, password) in chunk.iter().enumerate() {
                 let index = chunk_index * chunk_size + offset;
-                if index >= earliest.load(Ordering::Relaxed) {
+                if index >= earliest.load(Ordering::Relaxed) || cancellation.cancelled() {
                     break;
                 }
                 utf16.clear();

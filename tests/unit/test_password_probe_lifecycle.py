@@ -90,6 +90,104 @@ def test_password_probe_releases_only_its_own_borrows(tmp_path, monkeypatch, mod
         scope.close()
 
 
+def test_cancelled_password_kdf_drains_without_cancelling_shared_input(tmp_path, monkeypatch):
+    """Existing borrow tests never interrupt native KDF work or share its cache.
+
+    Without this case, token propagation, cancellation-as-rejection, and a
+    cancelled flag leaking to another request all escape detection. One tiny
+    split carrier plus one surviving candidate covers them together.
+    """
+    import asyncio
+    import hashlib
+    import zlib
+
+    from sunpack.core.passwords.job import PasswordJob
+    from sunpack.core.passwords.scheduler import PasswordScheduler
+    from sunpack.core.passwords.verifier.registry import PasswordVerifierChain
+    from sunpack.core.support.work_context import CURRENT_CANCELLATION
+    from sunpack.pipeline.coordinator.async_work import AsyncWorkBroker, CancellationToken
+
+    # A valid RAR5 encryption record with a slow KDF and arbitrary quick proof.
+    check = b'password'
+    body = b'\x04\0\0\x01\x18' + b's' * 16 + check + hashlib.sha256(check).digest()[:4]
+    record = bytes([len(body)]) + body
+    raw = b'Rar!\x1a\x07\x01\0' + zlib.crc32(record).to_bytes(4, 'little') + record
+    paths = [tmp_path / 'first.jpg', tmp_path / 'second.dat']
+    chunks = [raw[:22], raw[22:]]
+    for path, chunk in zip(paths, chunks):
+        path.write_bytes(b'prefix' + chunk + b'suffix')
+    physical = [str(path) for path in paths]
+    descriptor = {
+        'kind': 'archive_input', 'open_mode': 'concat_ranges', 'format_hint': 'rar',
+        'entry_path': physical[0],
+        'ranges': [{'path': path, 'start': 6, 'end': 6 + len(chunk)}
+                   for path, chunk in zip(physical, chunks)],
+    }
+    scheduler = PasswordScheduler(PasswordVerifierChain([rar_fast.RarFastVerifier()]))
+    cancelled = CancellationToken()
+    survivor = CancellationToken()
+
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        entered = asyncio.Event()
+        probe = rar_fast.rar_fast_verify_passwords_from_ranges
+
+        def entering(*args, **kwargs):
+            if CURRENT_CANCELLATION.get() is cancelled:
+                loop.call_soon_threadsafe(entered.set)
+            return probe(*args, **kwargs)
+
+        monkeypatch.setattr(rar_fast, 'rar_fast_verify_passwords_from_ranges', entering)
+        broker = AsyncWorkBroker(thread_capacity=2, max_pending_jobs=2)
+        first = asyncio.create_task(broker.run(
+            'password', physical[0], scheduler.plan_for_extraction,
+            PasswordJob(physical[0], archive_input=descriptor,
+                        candidates=[f'cancel-{index}' for index in range(32)]),
+            request_id='cancelled-password', origin='watch', cancellation=cancelled,
+        ))
+        second = asyncio.create_task(broker.run(
+            'password', physical[0], scheduler.run,
+            PasswordJob(physical[0], archive_input=descriptor, candidates=['survivor']),
+            request_id='surviving-password', origin='foreground', cancellation=survivor,
+        ))
+        try:
+            await asyncio.wait_for(entered.wait(), 3)
+            # Interrupt an active KDF, rather than cancelling only queued work.
+            timer = loop.call_later(0.03, cancelled.cancel)
+            try:
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.wait_for(asyncio.shield(first), 1)
+            finally:
+                timer.cancel()
+            assert (await asyncio.wait_for(second, 10)).exhausted
+            assert not survivor.cancelled
+            assert not cancelled._callbacks and not survivor._callbacks
+            assert scheduler.cache.stats() == {'successes': 0, 'negative': 1}
+            assert broker.active_jobs == broker.pending_jobs == 0
+            # The same executor thread must not retain the native scope.
+            result = await broker.run('password', physical[0],
+                seven_zip_fast.SevenZipFastVerifier().verify_batch, physical[0], ['wrong'],
+                archive_input=descriptor)
+            assert result.status == 'unsupported_method'
+        finally:
+            cancelled.cancel()
+            survivor.cancel()
+            await asyncio.gather(first, second, return_exceptions=True)
+            await broker.close()
+
+    scope = TaskResourceScope('password-cancellation', files=physical)
+    try:
+        with scope.activate():
+            asyncio.run(scenario())
+            assert not borrows(physical)
+            with promotion_barrier(physical, timeout=0,
+                    cache_releasers=(sessions.release_archive_sessions_under_roots,)):
+                for path in paths:
+                    path.unlink()
+    finally:
+        scope.close()
+
+
 def test_concurrent_directory_probes_do_not_hold_each_others_cleanup_sources(tmp_path):
     paths = [tmp_path / 'encrypted.rar', tmp_path / 'split.part1.rar.jpg']
     for path in paths:

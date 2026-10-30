@@ -1,3 +1,4 @@
+use super::cancellation::Cancellation;
 use crate::io::read_fault::{read_exact_field, seek_field, FieldLocation, ReadFault};
 use crate::io::reader::ManagedReader;
 use crate::password::context::{verify_prepared, InputKey, PasswordContext, PreparedStatus};
@@ -698,18 +699,22 @@ fn verify_winzip_aes_candidates(
     verifier: &[u8; 2],
 ) -> PyResult<Py<PyAny>> {
     let attempts = candidates.len() as i32;
+    let cancellation = Cancellation::current();
     let matched_indices = py.detach(|| {
         let mut matched_indices = if candidates.len() >= AES_PARALLEL_PASSWORD_THRESHOLD {
             candidates
                 .par_iter()
                 .enumerate()
                 .filter_map(|(index, password)| {
-                    winzip_aes_verifier_matches(
-                        &zip_password_bytes(password),
-                        salt,
-                        verifier,
-                        key_len,
-                    )
+                    (!cancellation.cancelled()
+                        && cancellation.run(|| {
+                            winzip_aes_verifier_matches(
+                                &zip_password_bytes(password),
+                                salt,
+                                verifier,
+                                key_len,
+                            )
+                        }))
                     .then_some(index as i32)
                 })
                 .collect::<Vec<_>>()
@@ -718,12 +723,15 @@ fn verify_winzip_aes_candidates(
                 .iter()
                 .enumerate()
                 .filter_map(|(index, password)| {
-                    winzip_aes_verifier_matches(
-                        &zip_password_bytes(password),
-                        salt,
-                        verifier,
-                        key_len,
-                    )
+                    (!cancellation.cancelled()
+                        && cancellation.run(|| {
+                            winzip_aes_verifier_matches(
+                                &zip_password_bytes(password),
+                                salt,
+                                verifier,
+                                key_len,
+                            )
+                        }))
                     .then_some(index as i32)
                 })
                 .collect::<Vec<_>>()
@@ -756,17 +764,19 @@ fn verify_zipcrypto_material(
     check_byte: u8,
 ) -> PyResult<Py<PyAny>> {
     let attempts = candidates.len() as i32;
+    let cancellation = Cancellation::current();
     let matched_indices = py.detach(|| {
         let mut matched_indices = if candidates.len() >= ZIPCRYPTO_PARALLEL_PASSWORD_THRESHOLD {
             candidates
                 .par_iter()
                 .enumerate()
                 .filter_map(|(index, password)| {
-                    zipcrypto_header_matches(
-                        &zip_password_bytes(password),
-                        encryption_header,
-                        check_byte,
-                    )
+                    (!cancellation.cancelled()
+                        && zipcrypto_header_matches(
+                            &zip_password_bytes(password),
+                            encryption_header,
+                            check_byte,
+                        ))
                     .then_some(index as i32)
                 })
                 .collect::<Vec<_>>()
@@ -775,11 +785,12 @@ fn verify_zipcrypto_material(
                 .iter()
                 .enumerate()
                 .filter_map(|(index, password)| {
-                    zipcrypto_header_matches(
-                        &zip_password_bytes(password),
-                        encryption_header,
-                        check_byte,
-                    )
+                    (!cancellation.cancelled()
+                        && zipcrypto_header_matches(
+                            &zip_password_bytes(password),
+                            encryption_header,
+                            check_byte,
+                        ))
                     .then_some(index as i32)
                 })
                 .collect::<Vec<_>>()
@@ -929,7 +940,11 @@ fn winzip_aes_verifier_matches(
     mac.update(&block_index.to_be_bytes());
     let mut previous = mac.finalize().into_bytes();
     let mut derived = previous;
-    for _ in 1..1000 {
+    let cancellation = Cancellation::current();
+    for round in 1..1000 {
+        if round & 63 == 1 && cancellation.cancelled() {
+            return false;
+        }
         let mut mac = template.clone();
         mac.update(&previous);
         previous = mac.finalize().into_bytes();

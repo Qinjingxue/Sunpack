@@ -13,6 +13,10 @@ use hkdf::Hkdf;
 use sha3::Sha3_512;
 use skein::{consts::U128, Skein1024};
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 pub const MAGIC: &[u8; 6] = b"SSEFE\x04";
@@ -96,6 +100,7 @@ pub struct Workspace {
     memory: Vec<Block>,
     external: Option<ffi::ExternalArena>,
     kdf_threads: Option<usize>,
+    cancellation: Option<Arc<AtomicBool>>,
     #[cfg(test)]
     kdf_runs: usize,
 }
@@ -105,6 +110,11 @@ impl Drop for Workspace {
     }
 }
 impl Workspace {
+    /// Share the caller's cancellation flag with the existing Argon2 slice checks.
+    pub fn set_cancellation(&mut self, cancellation: Option<Arc<AtomicBool>>) {
+        self.cancellation = cancellation;
+    }
+
     /// Bound lane scheduling to the caller's CPU budget. One thread uses the
     /// same SIMD backend without initializing or dispatching to Rayon.
     pub fn with_threads(threads: usize) -> Self {
@@ -113,6 +123,19 @@ impl Workspace {
         workspace
     }
     fn derive(&mut self, header: &Header, password: &[u16]) -> Result<Keys> {
+        let cancellation = &self.cancellation;
+        let cancelled = || {
+            cancellation
+                .as_ref()
+                .is_some_and(|flag| flag.load(Ordering::Relaxed))
+                || self
+                    .external
+                    .as_ref()
+                    .is_some_and(|arena| arena.callbacks.cancelled())
+        };
+        if cancelled() {
+            return Err(Error::Cancelled);
+        }
         let normalized = normalize_password(password);
         let mut master = Zeroizing::new([0u8; 256]);
         MasterHkdf::new(Some(b"memorySalt"), &normalized)
@@ -130,6 +153,12 @@ impl Workspace {
             self.memory.resize(count, Block::default());
         }
         let callbacks = self.external.as_ref().map(|arena| arena.callbacks);
+        let cancelled = || {
+            cancellation
+                .as_ref()
+                .is_some_and(|flag| flag.load(Ordering::Relaxed))
+                || callbacks.is_some_and(|callbacks| callbacks.cancelled())
+        };
         let memory = if let Some(arena) = &mut self.external {
             arena.blocks(count)?
         } else {
@@ -147,10 +176,10 @@ impl Workspace {
             &mut *derived,
             memory,
             self.kdf_threads.unwrap_or(4),
-            || callbacks.is_some_and(|callbacks| callbacks.cancelled()),
+            cancelled,
         )
         .map_err(|_| {
-            if callbacks.is_some_and(|callbacks| callbacks.cancelled()) {
+            if cancelled() {
                 Error::Cancelled
             } else {
                 Error::Format

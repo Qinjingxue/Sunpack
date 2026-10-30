@@ -113,6 +113,7 @@ impl SevenZipPasswordProbe {
     }
 
     pub(crate) fn decoded_header_if_password_matches(&self, password: &str) -> Result<Option<Blob>, String> {
+        check_password_cancellation()?;
         let decoded = match decode_seven_zip_encoded_folder(
             &self.packed_data,
             &self.folder,
@@ -409,6 +410,9 @@ fn decode_error(error: std::io::Error) -> String {
 struct ExactOutput<'a> { output:&'a mut Spool, remaining:u64 }
 impl Write for ExactOutput<'_> {
     fn write(&mut self, bytes:&[u8])->std::io::Result<usize> {
+        if crate::password::cancellation::Cancellation::current().cancelled() {
+            return Err(std::io::Error::new(std::io::ErrorKind::ConnectionAborted, "password probe cancelled"));
+        }
         if bytes.len() as u64 > self.remaining { return Err(std::io::Error::new(std::io::ErrorKind::InvalidData,"decoded size exceeds declared size")); }
         self.output.write_all(bytes)?; self.remaining-=bytes.len() as u64; Ok(bytes.len())
     }
@@ -447,6 +451,7 @@ fn decrypt_seven_zip_aes256_sha256(data:&[u8], properties:&[u8], password:Option
     let mut output=Spool::default(); let mut remaining=unpack_size;
     let mut buffer=vec![0;64*1024];
     for bytes in data.chunks(buffer.len()) {
+        check_password_cancellation()?;
         buffer[..bytes.len()].copy_from_slice(bytes);
         Aes256CbcDec::new(&key.into(),&iv.into()).decrypt_padded::<NoPadding>(&mut buffer[..bytes.len()])
             .map_err(|_| "encoded_header_decode_password_rejected".to_string())?;
@@ -523,7 +528,7 @@ fn seven_zip_aes_key_iv(
         let cycles = 1u32
             .checked_shl(u32::from(num_cycles_power))
             .ok_or_else(|| "encoded_header_decoder_unsupported_method".to_string())?;
-        cached_seven_zip_aes_key(cycles, salt, password)
+        cached_seven_zip_aes_key(cycles, salt, password)?
     };
     Ok((key, iv))
 }
@@ -564,7 +569,8 @@ fn seven_zip_kdf_cache(
     CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::VecDeque::new()))
 }
 
-fn cached_seven_zip_aes_key(cycles: u32, salt: &[u8], password: &[u8]) -> [u8; 32] {
+fn cached_seven_zip_aes_key(cycles: u32, salt: &[u8], password: &[u8]) -> Result<[u8; 32], String> {
+    check_password_cancellation()?;
     if std::env::var_os("SUNPACK_DISABLE_7Z_KDF_CACHE").is_some() {
         return derive_seven_zip_aes_key(cycles, salt, password);
     }
@@ -581,11 +587,11 @@ fn cached_seven_zip_aes_key(cycles: u32, salt: &[u8], password: &[u8]) -> [u8; 3
             let entry = cache.remove(index).expect("located 7z KDF cache entry");
             let key = entry.key;
             cache.push_front(entry);
-            return key;
+            return Ok(key);
         }
     }
 
-    let key = derive_seven_zip_aes_key(cycles, salt, password);
+    let key = derive_seven_zip_aes_key(cycles, salt, password)?;
     let mut cache = seven_zip_kdf_cache()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -593,7 +599,7 @@ fn cached_seven_zip_aes_key(cycles: u32, salt: &[u8], password: &[u8]) -> [u8; 3
         let entry = cache.remove(index).expect("located 7z KDF cache entry");
         let cached_key = entry.key;
         cache.push_front(entry);
-        return cached_key;
+        return Ok(cached_key);
     }
     if cache.len() >= SEVEN_ZIP_KDF_CACHE_CAPACITY {
         if let Some(mut evicted) = cache.pop_back() {
@@ -606,10 +612,17 @@ fn cached_seven_zip_aes_key(cycles: u32, salt: &[u8], password: &[u8]) -> [u8; 3
         password: password.to_vec(),
     };
     cache.push_front(SevenZipKdfCacheEntry { parameters, key });
-    key
+    Ok(key)
 }
 
-fn derive_seven_zip_aes_key(cycles: u32, salt: &[u8], password: &[u8]) -> [u8; 32] {
+fn check_password_cancellation() -> Result<(), String> {
+    if crate::password::cancellation::Cancellation::current().cancelled() {
+        Err("resource_unavailable:password probe cancelled".into())
+    } else { Ok(()) }
+}
+
+fn derive_seven_zip_aes_key(cycles: u32, salt: &[u8], password: &[u8]) -> Result<[u8; 32], String> {
+    let cancellation = crate::password::cancellation::Cancellation::current();
     const KDF_RECORDS_PER_UPDATE: usize = 64;
     let mut sha = sha2_11::Sha256::default();
     let record_len = salt.len() + password.len() + 8;
@@ -625,6 +638,7 @@ fn derive_seven_zip_aes_key(cycles: u32, salt: &[u8], password: &[u8]) -> [u8; 3
     }
     let mut counter = 0u64;
     while counter < u64::from(cycles) {
+        if cancellation.cancelled() { return Err("resource_unavailable:password probe cancelled".into()); }
         let remaining = u64::from(cycles) - counter;
         let record_count = usize::try_from(remaining.min(KDF_RECORDS_PER_UPDATE as u64))
             .expect("7z KDF record count is bounded");
@@ -636,7 +650,7 @@ fn derive_seven_zip_aes_key(cycles: u32, salt: &[u8], password: &[u8]) -> [u8; 3
         sha2_11::Digest::update(&mut sha, &records[..record_count * record_len]);
         counter += record_count as u64;
     }
-    sha2_11::Digest::finalize(sha).into()
+    Ok(sha2_11::Digest::finalize(sha).into())
 }
 
 fn seven_zip_encoded_folder_from_unpack_info(
@@ -830,7 +844,7 @@ mod encoded_folder_graph_tests {
             for salt in [&[][..], &[0x5a; 16][..]] {
                 for cycles in [0, 3, 63, 65, 129] {
                     assert_eq!(
-                        derive_seven_zip_aes_key(cycles, salt, &password),
+                        derive_seven_zip_aes_key(cycles, salt, &password).unwrap(),
                         reference_aes_key_bytes(u64::from(cycles), salt, &password)
                     );
                 }

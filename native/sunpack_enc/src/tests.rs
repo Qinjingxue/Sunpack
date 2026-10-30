@@ -230,6 +230,19 @@ fn password_probe_read_cost_does_not_scale_with_payload() {
 }
 #[test]
 fn corruption_cancellation_and_short_reads() {
+    // Progress cancellation starts after the KDF. This additionally covers the
+    // request flag before allocation and reuse of its workspace after clearing.
+    let cancellation = Arc::new(AtomicBool::new(true));
+    let mut workspace = Workspace::default();
+    workspace.set_cancellation(Some(cancellation.clone()));
+    let probe = PasswordProbe::parse(FIXTURES[0], FIXTURES[0].len() as u64).unwrap();
+    assert_eq!(
+        probe.matches(&pw("sunpack-test"), &mut workspace),
+        Err(Error::Cancelled)
+    );
+    cancellation.store(false, Ordering::Relaxed);
+    assert!(probe.matches(&pw("sunpack-test"), &mut workspace).unwrap());
+
     let recovery = include_bytes!("../tests/data/recovery.enc");
     let mut damaged = recovery.to_vec();
     damaged[recovery.len() - 120] ^= 1; // Recovery trailer framing, before its CRC.

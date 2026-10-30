@@ -1,3 +1,4 @@
+use super::cancellation::Cancellation;
 use crate::analysis_native::volume_anchor::rar5_main_volume;
 use crate::io::read_fault::{FieldLocation, ReadFault};
 use crate::io::reader::ManagedReader;
@@ -479,9 +480,12 @@ impl RarPasswordContext {
                 verify_rar4_stored_data(py, encrypted, candidates, probe)
             }
             RarPasswordMaterial::Header { salt, encrypted } => {
+                let cancellation = Cancellation::current();
                 let matched = py.detach(|| {
                     let matches = |password: &String| {
-                        decrypt_rar4_header(encrypted, password, salt).is_some()
+                        !cancellation.cancelled()
+                            && cancellation
+                                .run(|| decrypt_rar4_header(encrypted, password, salt).is_some())
                     };
                     if candidates.len() >= PARALLEL_PASSWORD_THRESHOLD {
                         candidates.par_iter().position_first(matches)
@@ -655,7 +659,7 @@ fn decrypt_rar4_header(encrypted: &[u8], password: &str, salt_source: &[u8]) -> 
     if encrypted.len() < 16 {
         return None;
     }
-    let (key, iv) = derive_rar3_key_iv(password, Some(salt));
+    let (key, iv) = derive_rar3_key_iv(password, Some(salt))?;
     let mut first_block = encrypted[..16].to_vec();
     let first_plaintext = Aes128CbcDecryptor::new(&key.into(), &iv.into())
         .decrypt_padded::<NoPadding>(&mut first_block)
@@ -752,9 +756,19 @@ fn verify_rar4_stored_data(
     let salt = probe.salt.as_ref();
     let expected_crc = probe.file_crc;
     let unpacked_size = probe.unpacked_size;
+    let cancellation = Cancellation::current();
     let matched_index = py.detach(|| {
         let matches = |password: &String| {
-            rar4_stored_password_matches(password, salt, encrypted, unpacked_size, expected_crc)
+            !cancellation.cancelled()
+                && cancellation.run(|| {
+                    rar4_stored_password_matches(
+                        password,
+                        salt,
+                        encrypted,
+                        unpacked_size,
+                        expected_crc,
+                    )
+                })
         };
         if candidates.len() >= PARALLEL_PASSWORD_THRESHOLD {
             candidates.par_iter().position_first(matches)
@@ -791,7 +805,9 @@ fn rar4_stored_password_matches(
     unpacked_size: usize,
     expected_crc: u32,
 ) -> bool {
-    let (key, mut iv) = derive_rar3_key_iv(password, salt);
+    let Some((key, mut iv)) = derive_rar3_key_iv(password, salt) else {
+        return false;
+    };
     if encrypted.len() % 16 != 0 || encrypted.len() < unpacked_size {
         return false;
     }
@@ -799,6 +815,9 @@ fn rar4_stored_password_matches(
     let mut remaining = unpacked_size;
     let mut hash = crc32fast::Hasher::new();
     for bytes in encrypted.chunks(buffer.len()) {
+        if Cancellation::current().cancelled() {
+            return false;
+        }
         buffer[..bytes.len()].copy_from_slice(bytes);
         if Aes128CbcDecryptor::new(&key.into(), &iv.into())
             .decrypt_padded::<NoPadding>(&mut buffer[..bytes.len()])
@@ -814,7 +833,8 @@ fn rar4_stored_password_matches(
     hash.finalize() == expected_crc
 }
 
-fn derive_rar3_key_iv(password: &str, salt: Option<&[u8; 8]>) -> ([u8; 16], [u8; 16]) {
+fn derive_rar3_key_iv(password: &str, salt: Option<&[u8; 8]>) -> Option<([u8; 16], [u8; 16])> {
+    let cancellation = Cancellation::current();
     let mut password_bytes = Vec::with_capacity(password.len() * 2 + salt.map_or(0, |_| 8));
     for unit in password.encode_utf16() {
         password_bytes.extend_from_slice(&unit.to_le_bytes());
@@ -836,6 +856,9 @@ fn derive_rar3_key_iv(password: &str, salt: Option<&[u8; 8]>) -> ([u8; 16], [u8;
     let mut next = 0u32;
     let mut checkpoint_end = 1u32;
     while next < RAR3_KDF_ITERATIONS {
+        if cancellation.cancelled() {
+            return None;
+        }
         let count = (batch_size as u32)
             .min(RAR3_KDF_ITERATIONS - next)
             .min(checkpoint_end - next) as usize;
@@ -859,7 +882,7 @@ fn derive_rar3_key_iv(password: &str, salt: Option<&[u8; 8]>) -> ([u8; 16], [u8;
         key[src + 2] = digest[src + 1];
         key[src + 3] = digest[src];
     }
-    (key, iv)
+    Some((key, iv))
 }
 
 fn verify_rar5_material(
@@ -889,14 +912,15 @@ fn verify_rar5_material(
 }
 
 fn find_rar5_password_match(candidates: &[String], header: &Rar5EncryptionHeader) -> Option<usize> {
+    let cancellation = Cancellation::current();
+    let matches = |password: &String| {
+        !cancellation.cancelled()
+            && cancellation.run(|| rar5_checked_aes_key(password, header).is_some())
+    };
     if candidates.len() >= PARALLEL_PASSWORD_THRESHOLD {
-        candidates
-            .par_iter()
-            .position_first(|password| rar5_checked_aes_key(password, header).is_some())
+        candidates.par_iter().position_first(matches)
     } else {
-        candidates
-            .iter()
-            .position(|password| rar5_checked_aes_key(password, header).is_some())
+        candidates.iter().position(matches)
     }
 }
 
@@ -1056,6 +1080,7 @@ fn rar5_checked_aes_key(password: &str, header: &Rar5EncryptionHeader) -> Option
 }
 
 fn rar5_aes_key(password: &str, header: &Rar5EncryptionHeader) -> Option<[u8; 32]> {
+    let cancellation = Cancellation::current();
     let iterations = 1u32.checked_shl(header.lg2_count as u32).unwrap_or(0);
     if iterations == 0 {
         return None;
@@ -1076,7 +1101,10 @@ fn rar5_aes_key(password: &str, header: &Rar5EncryptionHeader) -> Option<[u8; 32
     let round_counts = [iterations, 17, 17];
     let mut key = [0u8; 32];
     for (round_index, count) in round_counts.iter().enumerate() {
-        for _ in 1..*count {
+        for round in 1..*count {
+            if round & 63 == 1 && cancellation.cancelled() {
+                return None;
+            }
             let mut mac = mac_template.clone();
             mac.update(&block);
             block = mac.finalize().into_bytes().into();
@@ -1484,7 +1512,9 @@ fn walk_rar4_encrypted_headers(
             return Ok(incomplete(password_matched));
         }
         let salt: [u8; 8] = salt.try_into().expect("RAR4 salt length checked");
-        let (key, iv) = derive_rar3_key_iv(password, Some(&salt));
+        let (key, iv) = derive_rar3_key_iv(password, Some(&salt)).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::ConnectionAborted, "password probe cancelled")
+        })?;
         let cipher = Aes128::new_from_slice(&key)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid RAR4 AES key"))?;
         let encrypted_offset = block_offset.checked_add(8).ok_or_else(|| {
@@ -1644,7 +1674,7 @@ mod kdf_regression_tests {
                     target.copy_from_slice(source);
                     target.reverse();
                 }
-                assert_eq!(derive_rar3_key_iv(password, salt), (key, iv));
+                assert_eq!(derive_rar3_key_iv(password, salt), Some((key, iv)));
             }
         }
     }
