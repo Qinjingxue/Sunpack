@@ -27,7 +27,9 @@ from sunpack.pipeline.coordinator.task_scan import ArchiveTaskScanner
 from sunpack.pipeline.coordinator.target_groups import relation_group_to_candidate
 from sunpack.core.contracts.tasks import ArchiveTask
 from sunpack.core.contracts.failures import FailureInfo, FailureKind
-from sunpack.pipeline.postprocess.internal.blocked_input import promote_blocked_input
+from sunpack.pipeline.postprocess.internal.blocked_input import (
+    BlockedInputPromotionError, NativeBlockedInputPromotion, promote_blocked_input,
+)
 from sunpack.pipeline.extraction.scheduler import ExtractionScheduler
 from sunpack.pipeline.extraction.output_inventory import OutputInventory
 from sunpack.core.i18n import I18nContext
@@ -488,6 +490,8 @@ class _PathLeaseRegistry:
             if absent_keys:
                 for path in prepared:
                     if path.key in absent_keys and not path.missing:
+                        if path.version_row is None:
+                            raise PermissionError(f"destination is inaccessible: {path.path}")
                         raise FileExistsError(f"destination exists or is inaccessible: {path.path}")
             async with self._lock:
                 if first:
@@ -1819,7 +1823,6 @@ class _RequestRuntime:
         sources = tuple(task.cleanup_parts or task.all_parts or [task.main_path])
         # Watch admission must claim publication paths before any file appears;
         # leases additionally protect requests already admitted by Watch.
-        destinations = [os.path.join(destination, os.path.basename(path)) for path in sources]
 
         def promote():
             def prepare():
@@ -1835,23 +1838,42 @@ class _RequestRuntime:
                 return promote_blocked_input(
                     sources, destination,
                     before_move=prepare if self.submission.origin == "watch" else None,
+                    plan=plan,
                 )
 
         promoted = False
         try:
-            await self.path_leases.acquire(
-                self.submission.request_id, [*sources, *destinations], lease_id=id(task),
-                cancellation=cancellation, absent_paths=destinations,
-            )
-            if self.submission.origin == "watch":
-                self._report_progress(task, {
-                    "type": "semantic", "event": "task_sources_claimed",
-                    "source_paths": (*sources, *destinations),
-                })
-            moved = await broker.run(
-                "postprocess", task.key or task.main_path, promote,
-                request_id=self.submission.request_id, cancellation=cancellation,
-            )
+            while True:
+                plan = await broker.run(
+                    "postprocess", task.key or task.main_path,
+                    lambda: NativeBlockedInputPromotion(list(sources), destination),
+                    request_id=self.submission.request_id, cancellation=cancellation,
+                )
+                destinations = list(plan.path_map.values())
+                try:
+                    await self.path_leases.acquire(
+                        self.submission.request_id, [*sources, *destinations], lease_id=id(task),
+                        cancellation=cancellation, absent_paths=destinations,
+                    )
+                except FileExistsError:
+                    # Another publisher won after planning. Replan only on an
+                    # actual collision; no timer or retry ceiling is needed.
+                    continue
+                if self.submission.origin == "watch":
+                    self._report_progress(task, {
+                        "type": "semantic", "event": "task_sources_claimed",
+                        "source_paths": (*sources, *destinations),
+                    })
+                try:
+                    moved = await broker.run(
+                        "postprocess", task.key or task.main_path, promote,
+                        request_id=self.submission.request_id, cancellation=cancellation,
+                    )
+                except BlockedInputPromotionError as exc:
+                    if exc.collision and not exc.path_map:
+                        continue
+                    raise
+                break
             task.apply_path_mapping(moved.path_map)
             from sunpack.core.contracts.discovery_scope import DiscoveryScope
             task.runtime["discovery_scope"] = DiscoveryScope(destination)
@@ -1881,7 +1903,8 @@ class _RequestRuntime:
                 ownership.remap_task(task, result.input_path)
             failure = FailureInfo(
                 FailureKind.FILESYSTEM_ERROR, "postprocess", f"Unable to promote blocked nested input: {exc}",
-                details={"blocked_input_failure": result.failure.to_dict(), "destination": destination},
+                details={"destination": destination},
+                causes=(result.failure,),
             )
             updated = replace(result, input_path=task.main_path, failure=failure, error=failure.message, failure_message="")
         self._replace_target_result(result, updated)

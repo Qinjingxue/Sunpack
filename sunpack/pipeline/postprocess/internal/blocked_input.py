@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable, Iterable
 
-from sunpack_native import promote_blocked_input_files
+from sunpack_native import NativeBlockedInputPromotion
 
 
 @dataclass(frozen=True)
@@ -14,15 +14,19 @@ class BlockedInputPromotionResult:
 
 
 class BlockedInputPromotionError(OSError):
-    def __init__(self, message: str, path_map: dict[str, str]):
+    def __init__(self, message: str, path_map: dict[str, str], collision: bool):
         super().__init__(message)
         self.path_map = path_map
+        self.collision = collision
 
 
 def promote_blocked_input(
     paths: Iterable[str], destination_dir: str, *, before_move: Callable[[], None] | None = None,
+    plan: NativeBlockedInputPromotion | None = None,
 ) -> BlockedInputPromotionResult:
-    mapping, removed, touched, error = promote_blocked_input_files(list(paths), destination_dir, before_move)
+    if plan is None:
+        plan = NativeBlockedInputPromotion(list(paths), destination_dir)
+    mapping, removed, touched, error, collision = plan.execute(before_move)
     if error:
-        raise BlockedInputPromotionError(error, mapping)
+        raise BlockedInputPromotionError(error, mapping, collision)
     return BlockedInputPromotionResult(mapping, tuple(removed), tuple(touched))

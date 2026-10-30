@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -46,7 +47,7 @@ def test_moves_complete_physical_group_preserving_names(tmp_path, keep_sibling):
     assert source.parent.exists()
 
 
-def test_collision_preflights_entire_group(tmp_path):
+def test_collision_renames_extension_and_preserves_entire_group(tmp_path):
     source = tmp_path / "out"
     destination = tmp_path / "input"
     source.mkdir()
@@ -55,11 +56,13 @@ def test_collision_preflights_entire_group(tmp_path):
     first.write_text("first")
     second.write_text("second")
     (destination / second.name).write_text("existing")
-    with pytest.raises(OSError):
-        promote_blocked_input([str(first), str(second)], str(destination),
-                              before_move=lambda: pytest.fail("collision must precede WAL intent"))
-    assert first.exists() and second.exists()
-    assert not (destination / first.name).exists()
+    result = promote_blocked_input([str(first), str(second)], str(destination))
+    assert not first.exists() and not second.exists()
+    assert Path(result.path_map[str(first)]).read_text() == "first"
+    renamed = Path(result.path_map[str(second)])
+    assert renamed.name.startswith(second.name + ".")
+    assert not any(char.isdigit() for char in renamed.name[len(second.name):])
+    assert renamed.read_text() == "second"
     assert (destination / second.name).read_text() == "existing"
 
 
@@ -82,9 +85,10 @@ def test_failed_promotion_precommit_leaves_all_sources_untouched(tmp_path):
     assert not list(destination.iterdir())
 
 
-@pytest.mark.parametrize("collision", [False, True])
+@pytest.mark.parametrize("collision", [False, True, "lease", "move", "denied"])
 @pytest.mark.parametrize("origin", ["foreground", "watch"])
-def test_coordinator_rewrites_recorded_result_and_cleanup_input(tmp_path, collision, origin):
+@pytest.mark.parametrize("kind", [FailureKind.WRONG_PASSWORD, FailureKind.MISSING_VOLUME])
+def test_coordinator_rewrites_recorded_result_and_cleanup_input(tmp_path, collision, origin, kind):
     async def scenario():
         source = tmp_path / "out" / "deep" / "nested"
         source.mkdir(parents=True)
@@ -94,7 +98,7 @@ def test_coordinator_rewrites_recorded_result_and_cleanup_input(tmp_path, collis
         outer.write_text("outer")
         inner = source / "inner.rar"
         inner.write_text("inner")
-        if collision:
+        if collision is True:
             (top / inner.name).write_text("existing")
         task = ArchiveTask.from_archive_input(
             ArchiveInputDescriptor(str(inner)), discovery_source="test",
@@ -106,7 +110,7 @@ def test_coordinator_rewrites_recorded_result_and_cleanup_input(tmp_path, collis
         # Snapshot survives removal of the original top-level archive.
         outer.unlink()
         original = TargetRunResult(str(inner), OutcomeKind.FAILURE,
-            failure=FailureInfo(FailureKind.WRONG_PASSWORD, "extraction", "wrong password"))
+            failure=FailureInfo(kind, "extraction", "blocked input"))
         runtime = object.__new__(_RequestRuntime)
         runtime.context = RunState()
         runtime.context.add_target_result(original)
@@ -118,21 +122,34 @@ def test_coordinator_rewrites_recorded_result_and_cleanup_input(tmp_path, collis
         # for it would deadlock if its own nested input needs our parent.
         parent = str(top / "pinned-parent.zip")
         await runtime.path_leases.acquire("request", [parent], lease_id="parent")
-        if collision:
+        if collision is True:
             await runtime.path_leases.acquire("sibling", [str(top / inner.name)], lease_id="parent")
+        raced = False
+        acquire = runtime.path_leases.acquire
+
+        async def race_acquire(*args, **kwargs):
+            nonlocal raced
+            if collision == "lease" and not raced:
+                raced = True
+                (top / inner.name).write_text("existing")
+            return await acquire(*args, **kwargs)
+
+        runtime.path_leases.acquire = race_acquire
         claims = []
         runtime._report_progress = lambda task, event: claims.append(event)
 
         class Broker:
             async def run(self, stage, key, function, **kwargs):
-                if origin == "watch":
-                    assert claims == [{
-                        "type": "semantic", "event": "task_sources_claimed",
-                        "source_paths": (str(inner), str(top / inner.name)),
-                    }]
-                    assert not (top / inner.name).exists() or collision
-                else:
-                    assert not claims
+                nonlocal raced
+                if function.__name__ == "promote":
+                    if collision == "denied":
+                        raise PermissionError("injected access denial")
+                    if origin == "watch":
+                        source_path, target_path = claims[-1]["source_paths"]
+                        assert source_path == str(inner) and not Path(target_path).exists()
+                    if collision == "move" and not raced:
+                        raced = True
+                        (top / inner.name).write_text("existing")
                 return function()
 
         result, promoted = await asyncio.wait_for(runtime._promote_blocked_input(
@@ -142,27 +159,33 @@ def test_coordinator_rewrites_recorded_result_and_cleanup_input(tmp_path, collis
         assert not runtime.path_leases._waiter_blockers
         assert runtime.context.target_results == [result]
         assert result.outcome_kind == OutcomeKind.FAILURE
-        if collision:
-            assert not promoted and inner.exists()
+        if collision == "denied":
+            assert not promoted and inner.read_text() == "inner"
             assert result.failure.kind == FailureKind.FILESYSTEM_ERROR
-            assert not result.failure.is_password_failure
-            assert result.failure.details["blocked_input_failure"]["kind"] == "wrong_password"
-        else:
-            assert promoted and result.input_path == str(top / inner.name)
-            assert result.failure is not original.failure
-            assert result.failure.kind == original.failure.kind
-            assert result.failure.message == original.failure.message
-            assert result.failure.details["promoted_nested_input"] is True
-            assert result.failure.details["discovery_scope"]
-            assert original.failure.details == {}
-            assert task.cleanup_parts == [str(top / inner.name)]
-            if origin == "watch":
-                assert claims[-1]["promoted_nested_input"] is True
-                assert claims[-1]["groups"] == [{
-                    "path": str(top / inner.name), "name": inner.name,
-                    "members": [str(top / inner.name)],
-                }]
-            assert ownership.response(runtime.context, recent_passwords=()).discovery.blocked_paths == (str(top / inner.name),)
+            assert result.failure.causes == (original.failure,)
+            assert result.failure.contains(kind)
+            return
+        target = Path(result.input_path)
+        assert promoted and not inner.exists() and target.read_text() == "inner"
+        assert target.parent == top and target.name.startswith(inner.name)
+        assert (target.name != inner.name) == bool(collision)
+        if collision:
+            assert (top / inner.name).read_text() == "existing"
+        assert result.failure is not original.failure
+        assert result.failure.kind == original.failure.kind
+        assert result.failure.message == original.failure.message
+        assert result.failure.details["promoted_nested_input"] is True
+        assert result.failure.details["discovery_scope"]["root"] == str(top)
+        assert original.failure.details == {}
+        assert task.cleanup_parts == [str(target)]
+        if origin == "watch":
+            intent = [event for event in claims if "promoted_destinations" in event]
+            assert len(intent) == 1 and intent[0]["promoted_destinations"] == [str(target)]
+            assert claims[-1]["promoted_nested_input"] is True
+            assert claims[-1]["groups"] == [{
+                "path": str(target), "name": target.name, "members": [str(target)],
+            }]
+        assert ownership.response(runtime.context, recent_passwords=()).discovery.blocked_paths == (str(target),)
 
     asyncio.run(scenario())
 
@@ -180,7 +203,7 @@ def test_stop_while_waiting_to_publish_group_keeps_sources_and_parent_pin(tmp_pa
         parts = [source / name for name in ("inner.blob.001", "inner.blob.002")]
         for path in parts:
             path.write_text(path.name)
-        task = SimpleNamespace(cleanup_parts=list(map(str, parts)))
+        task = SimpleNamespace(cleanup_parts=list(map(str, parts)), key="inner", main_path=str(parts[0]))
         registry = _PathLeaseRegistry()
         parent = str(destination / "outer.zip")
         await registry.acquire("request", [parent], lease_id="parent")
@@ -198,9 +221,13 @@ def test_stop_while_waiting_to_publish_group_keeps_sources_and_parent_pin(tmp_pa
         runtime = object.__new__(_RequestRuntime)
         runtime.submission = SimpleNamespace(request_id="request", origin="watch")
         runtime.path_leases = registry
+        class Broker:
+            async def run(self, stage, key, function, **kwargs):
+                return function()
+
         operation = asyncio.create_task(runtime._promote_blocked_input(
             task, None, ownership=SimpleNamespace(input_dir_for_task=lambda _task: str(destination)),
-            broker=None, cancellation=token,
+            broker=Broker(), cancellation=token,
         ))
         await asyncio.wait_for(waiting.wait(), 3)
         token.cancel()

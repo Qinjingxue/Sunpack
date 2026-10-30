@@ -258,7 +258,10 @@ namespace sunpack::sevenzip
             bool closed = false;
             bool close_requested = false;
             bool close_enqueued = false;
-            bool inflight_released = false;
+            std::size_t active_index = 0;
+            // Only open attempts for this file serialize. Never acquire this
+            // mutex while holding the writer mutex (including on close).
+            std::mutex open_mutex;
             HANDLE handle = INVALID_HANDLE_VALUE;
             bool open_attempted = false;
             bool new_writes = false;
@@ -383,13 +386,8 @@ namespace sunpack::sevenzip
 #endif
             // 快照本卷的空间 gate；功能关闭 / 空 key 时为 nullptr。
             file->space_gate = state_ ? state_->space_gate : nullptr;
+            file->active_index = active_files_.size();
             active_files_.push_back(file);
-            ++inflight_file_count_;
-            if (active_files_.size() >= 1024 &&
-                active_files_.size() > inflight_file_count_ * 2 + 256)
-            {
-                prune_expired_files_locked();
-            }
             return file;
         }
 
@@ -774,7 +772,6 @@ namespace sunpack::sevenzip
 
             const HRESULT result = terminal_result_locked(job);
             unregister_job_locked(job);
-            prune_expired_files_locked();
             if (result == S_OK)
             {
                 meters_->counters.completed_jobs.fetch_add(1, std::memory_order_relaxed);
@@ -874,7 +871,7 @@ namespace sunpack::sevenzip
         bool is_quiescent() const noexcept
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            if (queued_jobs_ != 0 || inflight_file_count_ != 0)
+            if (queued_jobs_ != 0 || !active_files_.empty())
             {
                 return false;
             }
@@ -947,8 +944,7 @@ namespace sunpack::sevenzip
                 stopping_.store(true, std::memory_order_release);
                 for (const auto &weak : active_jobs_)
                     if (auto job = weak.lock()) { cancel_job_locked(job); jobs.push_back(job); }
-                for (const auto &weak : active_files_)
-                    if (auto file = weak.lock()) files.push_back(file);
+                files = active_files_;
             }
             producer_cv_.notify_all();
             if (state_->space_gate) state_->space_gate->wake_waiters();
@@ -959,7 +955,7 @@ namespace sunpack::sevenzip
             drain_cancelled_retries();
             {
                 std::unique_lock<std::mutex> lock(mutex_);
-                producer_cv_.wait(lock, [this] { return queued_jobs_ == 0 && inflight_file_count_ == 0; });
+                producer_cv_.wait(lock, [this] { return queued_jobs_ == 0 && active_files_.empty(); });
             }
             // No packet can reference a recycled buffer or a closed file now.
             space_wake_->disable();
@@ -971,14 +967,18 @@ namespace sunpack::sevenzip
         }
 
     private:
-        void prune_expired_files_locked() noexcept
+        void unregister_file_locked(const FileStatePtr &file) noexcept
         {
-            active_files_.erase(
-                std::remove_if(
-                    active_files_.begin(),
-                    active_files_.end(),
-                    [](const auto &file) { return file.expired(); }),
-                active_files_.end());
+            // Callbacks retain closed files for final snapshots. Registry
+            // membership follows I/O lifetime rather than shared_ptr lifetime.
+            const auto index = file->active_index;
+            assert(index < active_files_.size() && active_files_[index] == file);
+            if (index + 1 != active_files_.size())
+            {
+                active_files_[index] = std::move(active_files_.back());
+                active_files_[index]->active_index = index;
+            }
+            active_files_.pop_back();
         }
 
         void initialize()
@@ -1190,19 +1190,11 @@ namespace sunpack::sevenzip
             try
             {
                 std::lock_guard<std::mutex> lock(mutex_);
-                for (auto it = active_files_.begin(); it != active_files_.end();)
+                for (const auto &file : active_files_)
                 {
-                    if (const auto file = it->lock())
+                    if (file->job.get() == job.get() && !file->close_requested)
                     {
-                        if (file->job.get() == job.get() && !file->close_requested)
-                        {
-                            files.push_back(file);
-                        }
-                        ++it;
-                    }
-                    else
-                    {
-                        it = active_files_.erase(it);
+                        files.push_back(file);
                     }
                 }
             }
@@ -1554,36 +1546,36 @@ namespace sunpack::sevenzip
             if (!retry_queue_.empty()) space_wake_->wake();
         }
 
-        // 一次 CreateFileW 尝试：在 writer mutex_ 内且只做一次，绝不等待。
-        // 同一 FileState 的多个 Data WorkItem 会被多个 writer 线程并发处理，去锁后
-        // 两个线程可能同时 CreateFileW(CREATE_NEW)，后者得到 ERROR_FILE_EXISTS 而把 job 标成永久失败；
-        // 空间失败由调用方排入 IOCP 恢复队列，绝不在这里等待。
-        // open_attempted 的语义是"已建立 handle 或已永久失败"，空间错误不置位。
-        // 空间错误无需清理残留：0 字节可用时 CreateFileW(CREATE_NEW) 仍成功，
-        // 错误实际发生在随后的 WriteFile，因此整个 FileState 生命周期内只调用一次 CreateFileW。
-        AttemptResult try_open_file_locked(const FileStatePtr &file) noexcept
+        // Publish the handle under mutex_, but keep filesystem calls outside
+        // that per-volume lock. Outstanding data prevents close during opening.
+        // Space failures remain retryable through the existing IOCP queue.
+        AttemptResult try_open_file(const FileStatePtr &file) noexcept
         {
-
-#ifdef SUP7Z_ENABLE_WRITER_PROBE
-                WriterProbeSpan probe_openlock(file ? &file->job->probe : nullptr, WriterProbePhase::OpenLock);
-#endif
-            std::lock_guard<std::mutex> lock(mutex_);
-
-#ifdef SUP7Z_ENABLE_WRITER_PROBE
-                probe_openlock.finish();
-#endif
-            if (!file || file->failed)
+            if (!file) return {AttemptResult::Kind::PermanentFailure, ERROR_INVALID_STATE};
             {
-                return {AttemptResult::Kind::PermanentFailure, ERROR_INVALID_STATE};
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (file->failed)
+                    return {AttemptResult::Kind::PermanentFailure, ERROR_INVALID_STATE};
+                if (file->handle != INVALID_HANDLE_VALUE)
+                    return {AttemptResult::Kind::Succeeded, 0};
+                if (file->open_attempted)
+                    return {AttemptResult::Kind::PermanentFailure, ERROR_OPEN_FAILED};
             }
-            if (file->handle != INVALID_HANDLE_VALUE)
+#ifdef SUP7Z_ENABLE_WRITER_PROBE
+            WriterProbeSpan probe_openlock(file->job->probe, WriterProbePhase::OpenLock);
+#endif
+            std::lock_guard<std::mutex> open_lock(file->open_mutex);
+#ifdef SUP7Z_ENABLE_WRITER_PROBE
+            probe_openlock.finish();
+#endif
             {
-                return {AttemptResult::Kind::Succeeded, 0}; // 已被本卷其他 writer 线程打开
-            }
-            if (file->open_attempted)
-            {
-                // 已尝试过且未成功，不再尝试。
-                return {AttemptResult::Kind::PermanentFailure, ERROR_OPEN_FAILED};
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (file->failed)
+                    return {AttemptResult::Kind::PermanentFailure, ERROR_INVALID_STATE};
+                if (file->handle != INVALID_HANDLE_VALUE)
+                    return {AttemptResult::Kind::Succeeded, 0};
+                if (file->open_attempted)
+                    return {AttemptResult::Kind::PermanentFailure, ERROR_OPEN_FAILED};
             }
 
             DWORD creation_flags = FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED;
@@ -1609,13 +1601,12 @@ namespace sunpack::sevenzip
                 creation_flags,
                 nullptr);
             const DWORD open_error = handle == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS;
-            if (handle != INVALID_HANDLE_VALUE) file->output_created = true;
-            if (handle != INVALID_HANDLE_VALUE && file->replay) file->replay->created = true;
 #ifdef SUP7Z_ENABLE_WRITER_PROBE
                 probe_open.finish();
 #endif
             if (handle == INVALID_HANDLE_VALUE)
             {
+                std::lock_guard<std::mutex> lock(mutex_);
                 const DWORD error = open_error;
                 if (failure_classifier_(static_cast<unsigned long>(error)))
                 {
@@ -1636,29 +1627,33 @@ namespace sunpack::sevenzip
                 return {AttemptResult::Kind::PermanentFailure,
                         static_cast<unsigned long>(error)};
             }
+            DWORD registration_error = ERROR_SUCCESS;
 #ifdef SUP7Z_ENABLE_WRITER_PROBE
             if (file->probe_expected_size && std::strcmp(writer_probe_mode(), "eof") == 0) {
                 WriterProbeSpan preallocate(file->job->probe, WriterProbePhase::Preallocate);
                 FILE_END_OF_FILE_INFO info{};
                 info.EndOfFile.QuadPart = file->probe_expected_size;
                 if (!SetFileInformationByHandle(handle, FileEndOfFileInfo, &info, sizeof(info))) {
-                    const DWORD error = GetLastError();
-                    CloseHandle(handle);
-                    return {AttemptResult::Kind::PermanentFailure, error};
+                    registration_error = GetLastError();
                 }
             }
 #endif
-            if (!CreateIoCompletionPort(handle, completion_port_, 0, static_cast<DWORD>(writer_count_)))
+            if (!registration_error && !CreateIoCompletionPort(handle, completion_port_, 0, static_cast<DWORD>(writer_count_)))
             {
-                const DWORD error = GetLastError();
-                CloseHandle(handle);
-                file->open_attempted = true;
-                mark_file_failure_locked(file, HRESULT_FROM_WIN32(error), error);
-                set_job_error_locked(file->job, HRESULT_FROM_WIN32(error), error);
-                return {AttemptResult::Kind::PermanentFailure, error};
+                registration_error = GetLastError();
+            }
+            if (registration_error) CloseHandle(handle);
+            std::lock_guard<std::mutex> lock(mutex_);
+            file->output_created = true;
+            if (file->replay) file->replay->created = true;
+            file->open_attempted = true;
+            if (registration_error)
+            {
+                mark_file_failure_locked(file, HRESULT_FROM_WIN32(registration_error), registration_error);
+                set_job_error_locked(file->job, HRESULT_FROM_WIN32(registration_error), registration_error);
+                return {AttemptResult::Kind::PermanentFailure, registration_error};
             }
             file->handle = handle;
-            file->open_attempted = true;
             return {AttemptResult::Kind::Succeeded, 0};
         }
 
@@ -1735,7 +1730,7 @@ namespace sunpack::sevenzip
                 return {};
             }
 #endif
-            const auto opened = try_open_file_locked(file);
+            const auto opened = try_open_file(file);
             if (opened.kind != AttemptResult::Kind::Succeeded) return opened;
             if (!begin_data_write(file)) return {AttemptResult::Kind::Terminal, 0};
             unsigned long injected = 0;
@@ -1807,7 +1802,7 @@ namespace sunpack::sevenzip
 #endif
             }
             AttemptResult result;
-            if (should_open) result = try_open_file_locked(file);
+            if (should_open) result = try_open_file(file);
             HANDLE handle;
             {
                 std::lock_guard<std::mutex> lock(mutex_);
@@ -1895,14 +1890,7 @@ namespace sunpack::sevenzip
                 {
                     --job->pending_jobs;
                 }
-                if (!file->inflight_released)
-                {
-                    file->inflight_released = true;
-                    if (inflight_file_count_ != 0)
-                    {
-                        --inflight_file_count_;
-                    }
-                }
+                unregister_file_locked(file);
             }
             if (completed_successfully)
             {
@@ -2007,7 +1995,7 @@ namespace sunpack::sevenzip
         std::vector<std::thread> workers_;
         std::deque<WorkItem> work_queue_;
         std::vector<std::weak_ptr<JobState>> active_jobs_;
-        std::vector<std::weak_ptr<FileState>> active_files_;
+        std::vector<FileStatePtr> active_files_;
         mutable std::mutex mutex_;
         std::condition_variable producer_cv_;
         HANDLE completion_port_ = nullptr;
@@ -2020,7 +2008,6 @@ namespace sunpack::sevenzip
         const std::size_t writer_count_;
         const std::size_t buffer_count_;
         const std::size_t queue_limit_;
-        std::size_t inflight_file_count_ = 0;
         std::size_t queued_jobs_ = 0;
         // 必须是 atomic：gate 的 terminal predicate 会无锁读它。
         std::atomic<bool> stopping_{false};

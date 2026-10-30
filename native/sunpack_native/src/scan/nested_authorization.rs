@@ -6,15 +6,6 @@ use std::path::{Path, PathBuf};
 
 type CandidateTuple = (String, Vec<String>);
 
-struct RawEntry {
-    key: String,
-    scope_key: String,
-    root_branch_key: Option<String>,
-    local_branch_key: Option<String>,
-    is_dir: bool,
-    size: u64,
-}
-
 #[derive(Default)]
 struct ScopeCandidates {
     projects: usize,
@@ -109,47 +100,6 @@ pub(crate) fn authorize_nested_candidates(
     let snapshot = &*raw_snapshot;
     let (contexts, scope_stats, root_stats) = py.detach(|| {
         let root_key = path_key(&root);
-        let mut raw_entries = Vec::new();
-        let mut file_sizes: HashMap<String, u64> = HashMap::new();
-
-        for (path, is_dir, size, _) in snapshot.records() {
-            let key = path_key_from_str(path);
-            let Some(relative) = relative_key(&key, &root_key) else {
-                continue;
-            };
-            if relative.is_empty() {
-                continue;
-            }
-            let (scope_key, root_branch_key, local_branch_key) = if let Some((first, remainder)) =
-                relative.split_once('\\')
-            {
-                let scope_key = format!("{root_key}\\{first}");
-                let local_branch_key = if let Some((first_local, _)) = remainder.split_once('\\') {
-                    Some(format!("{scope_key}\\{first_local}"))
-                } else if is_dir {
-                    Some(key.clone())
-                } else {
-                    None
-                };
-                (scope_key.clone(), Some(scope_key), local_branch_key)
-            } else {
-                let root_branch_key = is_dir.then(|| key.clone());
-                (root_key.clone(), root_branch_key.clone(), root_branch_key)
-            };
-            let size = if is_dir { 0 } else { size.unwrap_or(0) };
-            if !is_dir {
-                file_sizes.insert(key.clone(), size);
-            }
-            raw_entries.push(RawEntry {
-                key,
-                scope_key,
-                root_branch_key,
-                local_branch_key,
-                is_dir,
-                size,
-            });
-        }
-
         let mut contexts = Vec::with_capacity(candidates.len());
         let mut scopes: HashMap<String, ScopeCandidates> = HashMap::new();
         let mut root_candidates = ScopeCandidates::default();
@@ -177,11 +127,6 @@ pub(crate) fn authorize_nested_candidates(
                 .into_iter()
                 .map(|member| path_key(Path::new(&member)))
                 .collect();
-            let candidate_bytes = member_keys
-                .iter()
-                .map(|member| file_sizes.get(member).copied().unwrap_or(0))
-                .fold(0u64, u64::saturating_add);
-
             add_candidate(&mut root_candidates, &root, &entry, &member_keys);
             add_candidate(
                 scopes.entry(scope_key.clone()).or_default(),
@@ -194,7 +139,7 @@ pub(crate) fn authorize_nested_candidates(
                 scope_path,
                 scope_key,
                 member_keys,
-                candidate_bytes,
+                candidate_bytes: 0,
                 direct_child,
             });
         }
@@ -205,24 +150,57 @@ pub(crate) fn authorize_nested_candidates(
             .filter(|(key, _)| key.as_str() != root_key.as_str())
             .map(|(key, candidates)| (key.clone(), ScopeAccumulator::new(candidates)))
             .collect();
-        for entry in &raw_entries {
+        // Snapshot storage stays borrowed. Only candidate members need sizes;
+        // directory branches are deduplicated as they arrive, not per file.
+        let mut member_sizes: HashMap<&str, u64> = HashMap::new();
+        for (path, is_dir, size, _) in snapshot.records() {
+            let key = path_key_from_str(path);
+            let Some(relative) = relative_key(&key, &root_key) else {
+                continue;
+            };
+            if relative.is_empty() {
+                continue;
+            }
+            let (scope_key, root_branch, local_branch) =
+                if let Some((first, remainder)) = relative.split_once('\\') {
+                    let scope_end = root_key.len() + 1 + first.len();
+                    let scope_key = &key[..scope_end];
+                    let local_branch = if let Some((first_local, _)) = remainder.split_once('\\') {
+                        Some(&key[..scope_end + 1 + first_local.len()])
+                    } else {
+                        is_dir.then_some(key.as_str())
+                    };
+                    (scope_key, Some(scope_key), local_branch)
+                } else {
+                    let branch = is_dir.then_some(key.as_str());
+                    (root_key.as_str(), branch, branch)
+                };
+            let size = if is_dir { 0 } else { size.unwrap_or(0) };
+            if !is_dir {
+                if let Some(member) = root_candidates.member_keys.get(&key) {
+                    member_sizes.insert(member.as_str(), size);
+                }
+            }
             accumulate_entry(
                 &mut root_accumulator,
-                entry,
+                &key,
+                is_dir,
+                size,
                 &root_candidates,
-                entry.root_branch_key.as_deref(),
+                root_branch,
             );
-            if let (Some(accumulator), Some(candidates)) = (
-                scope_accumulators.get_mut(&entry.scope_key),
-                scopes.get(&entry.scope_key),
-            ) {
-                accumulate_entry(
-                    accumulator,
-                    entry,
-                    candidates,
-                    entry.local_branch_key.as_deref(),
-                );
+            if let (Some(accumulator), Some(candidates)) =
+                (scope_accumulators.get_mut(scope_key), scopes.get(scope_key))
+            {
+                accumulate_entry(accumulator, &key, is_dir, size, candidates, local_branch);
             }
+        }
+        for context in &mut contexts {
+            context.candidate_bytes = context
+                .member_keys
+                .iter()
+                .map(|member| member_sizes.get(member.as_str()).copied().unwrap_or(0))
+                .fold(0u64, u64::saturating_add);
         }
         let root_stats = root_accumulator.finish(&root_candidates);
         let scope_stats: HashMap<String, ScopeStats> = scope_accumulators
@@ -300,21 +278,25 @@ fn add_candidate(
 
 fn accumulate_entry(
     accumulator: &mut ScopeAccumulator,
-    entry: &RawEntry,
+    key: &str,
+    is_dir: bool,
+    size: u64,
     candidates: &ScopeCandidates,
     branch_key: Option<&str>,
 ) {
-    if !entry.is_dir {
-        accumulator.stats.total_bytes = accumulator.stats.total_bytes.saturating_add(entry.size);
-        if candidates.member_keys.contains(&entry.key) {
+    if !is_dir {
+        accumulator.stats.total_bytes = accumulator.stats.total_bytes.saturating_add(size);
+        if candidates.member_keys.contains(key) {
             accumulator.stats.candidate_bytes =
-                accumulator.stats.candidate_bytes.saturating_add(entry.size);
+                accumulator.stats.candidate_bytes.saturating_add(size);
         } else {
             accumulator.stats.other_file_count += 1;
         }
     }
     if let Some(branch) = branch_key {
-        accumulator.all_branches.insert(branch.to_owned());
+        if !accumulator.all_branches.contains(branch) {
+            accumulator.all_branches.insert(branch.to_owned());
+        }
     }
 }
 

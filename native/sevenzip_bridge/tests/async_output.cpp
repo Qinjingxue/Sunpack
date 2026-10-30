@@ -130,6 +130,43 @@ bool write_zero_length_file(const std::filesystem::path& directory) {
         std::filesystem::file_size(directory / L"empty.bin", error) == 0 && !error;
 }
 
+bool blocked_open_does_not_block_other_jobs(const std::filesystem::path& directory) {
+    // Same-file parallel write tests cannot detect a volume-wide lock held
+    // across open. A latch gives this test a deterministic overlap, and also
+    // verifies cancellation can settle while an unrelated open is stalled.
+    AsyncWriterConfig config;
+    config.threads_per_volume = 4;
+    AsyncFileWriter writer(std::make_shared<WriterMeters>(), make_volume_state("test:open", false), config);
+    std::promise<void> entered, release;
+    auto entered_future = entered.get_future();
+    auto released = release.get_future().share();
+    const auto blocked_path = directory / L"blocked-open.bin";
+    writer.set_open_probe_for_test([&](const std::wstring& path) {
+        if (path == blocked_path.wstring()) {
+            entered.set_value();
+            released.wait();
+        }
+    });
+    const auto blocked_job = writer.make_job();
+    const auto blocked = writer.make_file(blocked_job, blocked_path.wstring(), L"blocked", 0, 0);
+    writer.close_file(blocked, {});
+    const bool began = entered_future.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+    auto sibling = std::async(std::launch::async, [&] {
+        writer.cancel_job(blocked_job);
+        const auto job = writer.make_job();
+        const auto file = writer.make_file(job, (directory / L"independent-open.bin").wstring(), L"independent", 0, 0);
+        const unsigned char payload = 0x73;
+        UInt32 processed = 0;
+        writer.write(file, &payload, 1, &processed);
+        writer.close_file(file, {});
+        return writer.finish_job(job) == S_OK && processed == 1 && writer.snapshot_file(file).closed;
+    });
+    const bool independent = began && sibling.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+    release.set_value();
+    const bool sibling_ok = sibling.get();
+    return independent && sibling_ok && writer.finish_job(blocked_job) == E_ABORT && writer.snapshot_file(blocked).closed;
+}
+
 // Only this test reuses the same writer after an actual SetFileTime failure;
 // one-shot archive tests cannot cover that lifetime. Two tiny files suffice.
 bool timestamp_failure_does_not_fail_content(const std::filesystem::path& directory) {
@@ -662,6 +699,7 @@ int main() {
     const auto directory = make_test_directory();
     const bool passed = write_same_file_concurrently(directory) &&
         write_zero_length_file(directory) &&
+        blocked_open_does_not_block_other_jobs(directory) &&
         timestamp_failure_does_not_fail_content(directory) &&
         closes_after_delayed_open_failure(directory) &&
         cancelled_job_returns_pending_to_zero(directory) &&

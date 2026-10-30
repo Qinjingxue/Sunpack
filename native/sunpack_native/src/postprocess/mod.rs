@@ -5,43 +5,81 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::UNIX_EPOCH;
 
-type PromotionResult = (HashMap<String, String>, Vec<String>, Vec<String>, String);
+type PromotionResult = (
+    HashMap<String, String>,
+    Vec<String>,
+    Vec<String>,
+    String,
+    bool,
+);
 
-#[pyfunction]
-#[pyo3(signature = (paths, destination_dir, before_move=None))]
-pub(crate) fn promote_blocked_input_files(
-    py: Python<'_>,
-    paths: Vec<String>,
-    destination_dir: String,
-    before_move: Option<Py<PyAny>>,
-) -> PyResult<PromotionResult> {
-    Ok(py.detach(|| {
-        promote_input_files_with_move(
-            paths,
-            Path::new(&destination_dir),
-            || {
-                if let Some(callback) = before_move {
-                    Python::attach(|py| callback.call0(py))
-                        .map_err(|error| io::Error::other(error.to_string()))?;
-                }
-                Ok(())
-            },
-            move_input_no_replace,
-        )
-    }))
+#[pyclass(frozen)]
+pub(crate) struct NativeBlockedInputPromotion {
+    moves: Vec<(PathBuf, PathBuf)>,
+    destination: PathBuf,
+    // Shared with Python leases/WAL and the result; convert paths only once.
+    #[pyo3(get)]
+    path_map: Py<PyDict>,
 }
 
-fn promote_input_files_with_move(
+#[pymethods]
+impl NativeBlockedInputPromotion {
+    #[new]
+    fn new(py: Python<'_>, paths: Vec<String>, destination_dir: String) -> PyResult<Self> {
+        let destination = PathBuf::from(destination_dir);
+        let moves = py.detach(|| plan_promotion_moves(paths, &destination))?;
+        let path_map = PyDict::new(py);
+        for (source, target) in &moves {
+            path_map.set_item(normalize_path(source), normalize_path(target))?;
+        }
+        Ok(Self {
+            moves,
+            destination,
+            path_map: path_map.unbind(),
+        })
+    }
+
+    #[pyo3(signature = (before_move=None))]
+    fn execute(
+        &self,
+        py: Python<'_>,
+        before_move: Option<Py<PyAny>>,
+    ) -> PyResult<(Py<PyDict>, Vec<String>, Vec<String>, String, bool)> {
+        let (mapping, removed, touched, error, collision) = py.detach(|| {
+            promote_input_files_with_move(
+                &self.moves,
+                &self.destination,
+                || {
+                    if let Some(callback) = before_move {
+                        Python::attach(|py| callback.call0(py))
+                            .map_err(|error| io::Error::other(error.to_string()))?;
+                    }
+                    Ok(())
+                },
+                move_input_no_replace,
+            )
+        });
+        let path_map = if error.is_empty() {
+            self.path_map.clone_ref(py)
+        } else {
+            let partial = PyDict::new(py);
+            for (source, target) in mapping {
+                partial.set_item(source, target)?;
+            }
+            partial.unbind()
+        };
+        Ok((path_map, removed, touched, error, collision))
+    }
+}
+
+fn plan_promotion_moves(
     paths: Vec<String>,
     destination: &Path,
-    before_move: impl FnOnce() -> io::Result<()>,
-    mut move_file: impl FnMut(&Path, &Path) -> io::Result<()>,
-) -> PromotionResult {
-    let mut mapping = HashMap::new();
-    let mut removed = Vec::new();
-    let mut parents = HashSet::new();
+) -> io::Result<Vec<(PathBuf, PathBuf)>> {
+    static NEXT_ALIAS: AtomicU64 = AtomicU64::new(0);
     let mut destinations = HashSet::new();
     let mut sources = HashSet::new();
     let mut moves = Vec::new();
@@ -51,35 +89,71 @@ fn promote_input_files_with_move(
             continue;
         }
         let Some(name) = source.file_name() else {
-            return (mapping, removed, Vec::new(), "input has no basename".into());
+            return Err(io::Error::other("input has no basename"));
         };
-        let target = destination.join(name);
-        if !source.is_file()
-            || target.try_exists().unwrap_or(true)
-            || !destinations.insert(crate::path_keys::path_key(&normalize_path(&target)))
+        if !source.metadata()?.is_file() {
+            return Err(io::Error::other(format!(
+                "not an input file: {}",
+                source.display()
+            )));
+        }
+        let mut target = destination.join(name);
+        while target.try_exists()?
+            || destinations.contains(&crate::path_keys::path_key(&normalize_path(&target)))
         {
-            return (
-                mapping,
-                removed,
-                Vec::new(),
-                format!(
-                    "cannot promote {} to {}: missing source or destination exists",
-                    source.display(),
-                    target.display()
-                ),
-            );
+            // Keep the first-dot bucket and every original numeric channel.
+            // Alphabetic aliases introduce neither volume numbers nor format hints.
+            let mut value = NEXT_ALIAS.fetch_add(1, Ordering::Relaxed);
+            let mut suffix = String::from(".__sunpack_");
+            loop {
+                suffix.push((b'a' + (value & 15) as u8) as char);
+                value >>= 4;
+                if value == 0 {
+                    break;
+                }
+            }
+            let mut alias = name.to_os_string();
+            alias.push(suffix);
+            target = destination.join(alias);
+        }
+        destinations.insert(crate::path_keys::path_key(&normalize_path(&target)));
+        moves.push((source, target));
+    }
+    Ok(moves)
+}
+
+fn promote_input_files_with_move(
+    moves: &[(PathBuf, PathBuf)],
+    destination: &Path,
+    before_move: impl FnOnce() -> io::Result<()>,
+    mut move_file: impl FnMut(&Path, &Path) -> io::Result<()>,
+) -> PromotionResult {
+    let mut mapping = HashMap::new();
+    let mut removed = Vec::new();
+    let mut parents = HashSet::new();
+    // Recheck after acquiring publication leases, before the durable intent.
+    for (source, target) in moves {
+        match target.try_exists() {
+            Ok(false) => {}
+            Ok(true) => {
+                return (
+                    mapping,
+                    removed,
+                    Vec::new(),
+                    "promotion destination exists".into(),
+                    true,
+                )
+            }
+            Err(error) => return (mapping, removed, Vec::new(), error.to_string(), false),
         }
         if let Some(parent) = source.parent() {
             parents.insert(parent.to_path_buf());
         }
-        moves.push((source, target));
     }
-    // Preflight rejects existing user files before publishing a durable intent.
-    // The caller runs this barrier on its existing postprocess broker worker.
     if let Err(error) = before_move() {
-        return (mapping, removed, Vec::new(), error.to_string());
+        return (mapping, removed, Vec::new(), error.to_string(), false);
     }
-    for (source, target) in &moves {
+    for (source, target) in moves {
         if let Err(error) = move_file(source, target) {
             let mut message = error.to_string();
             for (old, new) in moves.iter().rev() {
@@ -99,7 +173,8 @@ fn promote_input_files_with_move(
                     }
                 }
             }
-            return (mapping, removed, Vec::new(), message);
+            let collision = is_name_collision(&error) && mapping.is_empty();
+            return (mapping, removed, Vec::new(), message, collision);
         }
         mapping.insert(normalize_path(source), normalize_path(target));
     }
@@ -111,7 +186,7 @@ fn promote_input_files_with_move(
     }
     let mut touched: Vec<_> = parents.iter().map(|p| normalize_path(p)).collect();
     touched.push(normalize_path(destination));
-    (mapping, removed, touched, String::new())
+    (mapping, removed, touched, String::new(), false)
 }
 
 fn move_input_no_replace(source: &Path, destination: &Path) -> io::Result<()> {
@@ -686,21 +761,31 @@ mod tests {
         let second = source.join("game.002");
         fs::write(&first, b"first").unwrap();
         fs::write(&second, b"second").unwrap();
-        let result = promote_input_files_with_move(
+        let moves = plan_promotion_moves(
             vec![normalize_path(&first), normalize_path(&second)],
             &destination,
-            || Ok(()),
-            |old, new| {
-                if old == second {
-                    return Err(io::Error::new(io::ErrorKind::PermissionDenied, "injected"));
-                }
-                rename_no_replace(old, new)
-            },
-        );
-        assert!(result.0.is_empty());
-        assert!(result.3.contains("injected"));
-        assert!(first.is_file() && second.is_file());
-        assert_eq!(fs::read_dir(&destination).unwrap().count(), 0);
+        )
+        .unwrap();
+        // Both a permanent failure and a concurrent collision must roll back
+        // earlier members. Only a fully restored collision may replan.
+        for kind in [io::ErrorKind::PermissionDenied, io::ErrorKind::AlreadyExists] {
+            let result = promote_input_files_with_move(
+                &moves,
+                &destination,
+                || Ok(()),
+                |old, new| {
+                    if old == second {
+                        return Err(io::Error::new(kind, "injected"));
+                    }
+                    rename_no_replace(old, new)
+                },
+            );
+            assert!(result.0.is_empty());
+            assert!(result.3.contains("injected"));
+            assert_eq!(result.4, kind == io::ErrorKind::AlreadyExists);
+            assert!(first.is_file() && second.is_file());
+            assert_eq!(fs::read_dir(&destination).unwrap().count(), 0);
+        }
     }
     use std::time::{SystemTime, UNIX_EPOCH};
 

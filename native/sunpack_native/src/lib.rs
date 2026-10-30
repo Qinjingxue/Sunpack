@@ -311,10 +311,7 @@ fn sunpack_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?)?;
     m.add_function(wrap_pyfunction!(postprocess::delete_files_batch, m)?)?;
     m.add_function(wrap_pyfunction!(postprocess::remove_output_path, m)?)?;
-    m.add_function(wrap_pyfunction!(
-        postprocess::promote_blocked_input_files,
-        m
-    )?)?;
+    m.add_class::<postprocess::NativeBlockedInputPromotion>()?;
     m.add_function(wrap_pyfunction!(
         password::enc::enc_fast_verify_passwords,
         m
