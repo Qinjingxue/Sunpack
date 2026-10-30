@@ -162,7 +162,27 @@ pub(super) fn watch_file_observation_known_kind(
 }
 
 pub(super) fn watch_path_identity(path: &Path) -> io::Result<(String, String, i64)> {
-    let observation = watch_file_observation(path, None)?;
+    use crate::io::resource_lifecycle::TrackedFile;
+    use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+
+    let metadata = std::fs::metadata(path)?;
+    // Identity probes share deletion and retain no handle after this query.
+    // Use the existing passive registration so promotion callbacks can record
+    // directory identities while the namespace is protected by their gate.
+    let observation = {
+        let file = TrackedFile::open_passive_with(path, "path_identity_handle", |options| {
+            options
+                .read(true)
+                .access_mode(FILE_READ_ATTRIBUTES)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+                .custom_flags(if metadata.is_dir() {
+                    FILE_FLAG_BACKUP_SEMANTICS
+                } else {
+                    FILE_ATTRIBUTE_NORMAL
+                });
+        })?;
+        read_file_usn(file.as_raw_handle())?
+    };
     Ok((
         volume_device(path)?,
         observation.file_id,

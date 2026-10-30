@@ -640,8 +640,11 @@ class WatchScheduler:
 
     def _recover_persisted_work(self) -> None:
         """Recover only durable in-flight work; never scan unrelated Watch roots."""
-
+        flatten_owners = {path_key(record["owner"]) for key in self.state._native.runtime_keys("flatten|")
+                         if (record := self.state._native.runtime_record(key)) and record["owner"]}
         for pending in self.state.pending_work_items():
+            if path_key(pending.path) in flatten_owners:
+                continue
             if not watch_path_available(pending.source_input_root or pending.path, self.scopes.values()):
                 continue
             active_outputs = dict(getattr(pending, "active_outputs", {}) or {})
@@ -1053,10 +1056,11 @@ class WatchScheduler:
                     phase="pipeline_completion",
                 )
                 self.log.write("failed_terminal", path=request.candidate.path, owner=request.notification_id, error=str(exc))
-                self.enqueue(
-                    request.candidate.path,
+                await self.pipeline_engine.work_broker.run(
+                    "watch_completion_retry", request.candidate.path, self.enqueue, request.candidate.path,
                     force=True,
                     event_type="pipeline_completion_error",
+                    request_id="watch", origin="watch",
                 )
             else:
                 if not request.interruption_cleanup_failed:
@@ -1075,7 +1079,11 @@ class WatchScheduler:
             request.top_level_keys.clear()
             request.source_groups.clear()
             request.source_observations.clear()
-            self._release_pipeline_source_claims(request.notification_id, request_path=request.candidate.path)
+            await self.pipeline_engine.work_broker.run(
+                "watch_release", request.candidate.path, self._release_pipeline_source_claims,
+                request.notification_id, request_path=request.candidate.path,
+                request_id="watch", origin="watch",
+            )
             if request.registry_owner:
                 from sunpack.runtime.cli.runtime_state import runtime_host
 
@@ -2226,9 +2234,40 @@ class WatchScheduler:
         self._notify("progress", notification_id, archive_task, event)
 
     async def _complete_candidate(self, request: _ActivePipelineRequest) -> WatchRunResult:
-        candidate = request.candidate
+        response, error = None, None
         try:
             response = await request.task
+        except FileNotFoundError as exc:
+            error = exc
+        tickets, notifications = [], []
+        try:
+            with self.state.defer_journal_waits() as tickets:
+                result = self._project_completion(request, response, error,
+                    lambda *args: notifications.append(args))
+        finally:
+            if tickets:
+                waiter = asyncio.create_task(self.pipeline_engine.work_broker.run(
+                    "watch_completion", request.candidate.path, self.state.wait_for_journal,
+                    tickets, request_id="watch", origin="watch",
+                ))
+                cancelled = False
+                while not waiter.done():
+                    try:
+                        await asyncio.shield(waiter)
+                    except asyncio.CancelledError:
+                        cancelled = True
+                waiter.result()
+                if cancelled:
+                    raise asyncio.CancelledError
+        for notification in notifications:
+            self._notify(*notification)
+        return result
+
+    def _project_completion(self, request, response, error, notify) -> WatchRunResult:
+        candidate = request.candidate
+        try:
+            if error is not None:
+                raise error
         except FileNotFoundError as exc:
             missing_path = os.path.abspath(os.fsdecode(exc.filename)) if exc.filename else ""
             if (
@@ -2244,7 +2283,7 @@ class WatchScheduler:
             # Retire only that stale input, preserving newly queued generations.
             self._retire_claimed_paths([missing_path], candidate)
             self.log.write("task_retired", path=missing_path)
-            self._notify("suppressed", request.notification_id)
+            notify("suppressed", request.notification_id)
             return WatchRunResult(processed=1)
         summary = response.summary
         claimed_paths = _response_claimed_paths(response, candidate.path)
@@ -2254,7 +2293,7 @@ class WatchScheduler:
                 self.state.complete_work_if_matches(candidate, durable=True)
             self.log.write("pipeline_request_interrupted", path=candidate.path,
                            cleanup_errors=list(response.interruption_cleanup_errors))
-            self._notify("interrupted", request.notification_id, list(response.interruption_cleanup_errors))
+            notify("interrupted", request.notification_id, list(response.interruption_cleanup_errors))
             return WatchRunResult(processed=1)
         coalesced_from = response.discovery.coalesced_from_request_id
         if coalesced_from:
@@ -2271,7 +2310,7 @@ class WatchScheduler:
                 owner_request_id=coalesced_from,
                 claimed_paths=claimed_paths,
             )
-            self._notify("suppressed", request.notification_id)
+            notify("suppressed", request.notification_id)
             return WatchRunResult(processed=1)
 
         scan_errors = {
@@ -2446,18 +2485,18 @@ class WatchScheduler:
                 error_kind=terminal_failures[0].kind.value,
                 failures=payloads,
             )
-            self._notify("failed", request.notification_id, errors, payloads)
+            notify("failed", request.notification_id, errors, payloads)
             return WatchRunResult(processed=1, failed=1, errors=errors)
 
         if waiting_failures:
-            self._notify("suppressed", request.notification_id)
+            notify("suppressed", request.notification_id)
             return WatchRunResult(
                 processed=1, failed=1,
                 errors=[_failure_message(failure, self.i18n.t("failure.possible_missing_volume")) for failure in waiting_failures],
             )
 
         if recorded_password_failures:
-            self._notify("suppressed", request.notification_id)
+            notify("suppressed", request.notification_id)
             errors = failed or [
                 _failure_message(failure, self.i18n.t("watch.failure.extraction_failed"))
                 for failure in recorded_password_failures
@@ -2465,14 +2504,14 @@ class WatchScheduler:
             return WatchRunResult(processed=1, failed=1, errors=errors)
 
         if retired_failures and not summary.scan_failures:
-            self._notify("suppressed", request.notification_id)
+            notify("suppressed", request.notification_id)
             return WatchRunResult(processed=1)
 
         if failed:
             # Unstructured failures cannot participate in an automatic wait.
             error = failed[0]
             self.log.write("failed_terminal", path=candidate.path, owner=request.notification_id, error=error, failures=[])
-            self._notify("failed", request.notification_id, failed, [])
+            notify("failed", request.notification_id, failed, [])
             return WatchRunResult(processed=1, failed=1, errors=failed)
 
         if _summary_processed_no_tasks(summary):
@@ -2488,19 +2527,19 @@ class WatchScheduler:
                 claim = self._active_claims.get(path_key(candidate.path))
                 retire_group = claim is None or claim.owner == request.notification_id
             self.log.write("no_tasks_found", path=candidate.path, owner=request.notification_id, retire_group=retire_group)
-            self._notify("suppressed", request.notification_id)
+            notify("suppressed", request.notification_id)
             return WatchRunResult(processed=1)
 
         if direct_outcome == OutcomeKind.PARTIAL_SUCCESS:
             error = self.i18n.t("watch.failure.partial_rejected")
             self.log.write("partial_rejected", path=candidate.path, owner=request.notification_id, error=error)
-            self._notify("failed", request.notification_id, [error], [])
+            notify("failed", request.notification_id, [error], [])
             return WatchRunResult(processed=1, failed=1, errors=[error])
 
         if direct_outcome != OutcomeKind.COMPLETE_SUCCESS:
             error = self.i18n.t("watch.failure.no_complete_outcome")
             self.log.write("failed_terminal", path=candidate.path, owner=request.notification_id, error=error, failures=[])
-            self._notify("failed", request.notification_id, [error], [])
+            notify("failed", request.notification_id, [error], [])
             return WatchRunResult(processed=1, failed=1, errors=[error])
 
         self.log.write(
@@ -2528,14 +2567,14 @@ class WatchScheduler:
             ],
         )
         if cleanup_failed:
-            self._notify(
+            notify(
                 "succeeded",
                 request.notification_id,
                 generated_output_dirs,
                 [self.i18n.t("cleanup.incomplete", count=len(cleanup_failed))],
             )
         else:
-            self._notify("succeeded", request.notification_id, generated_output_dirs)
+            notify("succeeded", request.notification_id, generated_output_dirs)
         return WatchRunResult(processed=1, succeeded=summary.success_count)
 
     def _notify(self, action: str, *args) -> None:

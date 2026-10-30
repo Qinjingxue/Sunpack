@@ -1285,6 +1285,91 @@ def test_watch_admission_batches_durability_off_loop_and_resumes_without_polling
     _await(scenario())
 
 
+def test_nested_watch_lifecycle_and_completion_keep_wal_off_loop(tmp_path, monkeypatch):
+    # Admission-only tests never run real output callbacks or the failure
+    # projection. One nested request covers starts, finishes and terminal WAL
+    # updates while the event loop releases a deliberately held writer barrier.
+    import io
+    from sunpack.pipeline.coordinator.engine import PipelineEngine
+
+    inner = io.BytesIO()
+    with zipfile.ZipFile(inner, "w") as archive:
+        archive.writestr("payload.txt", "nested data")
+    outer = tmp_path / "outer.disguised"
+    with zipfile.ZipFile(outer, "w") as archive:
+        archive.writestr("wrapper/inner.blob", inner.getvalue())
+    config = make_config({"watch": {"clipboard_monitor_enabled": False}})
+
+    async def scenario():
+        async with PipelineEngine(config) as engine:
+            watcher = _watcher(tmp_path, config=config, cold_start_seconds=0, pipeline_engine=engine)
+            watcher.enqueue(str(outer))
+            loop = asyncio.get_running_loop()
+            loop_thread = threading.get_ident()
+            entered, release = asyncio.Event(), threading.Event()
+            from sunpack.runtime.watch.journal_commit import JournalTicket
+            wait = JournalTicket.wait
+            lifecycle = []
+
+            def barrier(ticket):
+                assert threading.get_ident() != loop_thread
+                loop.call_soon_threadsafe(entered.set)
+                assert release.wait(5), "event loop stalled at a WAL barrier"
+                return wait(ticket)
+
+            monkeypatch.setattr(JournalTicket, "wait", barrier)
+            for name in ("record_task_output_started", "record_task_output_finished", "mark"):
+                original = getattr(watcher.state, name)
+                def observed(*args, _method=original, _name=name, **kwargs):
+                    if _name != "mark":
+                        assert threading.get_ident() != loop_thread
+                    lifecycle.append(_name)
+                    return _method(*args, **kwargs)
+                monkeypatch.setattr(watcher.state, name, observed)
+            try:
+                tick = asyncio.create_task(watcher.run_once())
+                await asyncio.wait_for(entered.wait(), 5)
+                release.set()
+                result = await asyncio.wait_for(tick, 10)
+                watcher._merge_run_result(result, await asyncio.wait_for(watcher.drain(), 10))
+                assert not result.failed and result.succeeded >= 2
+                assert lifecycle.count("record_task_output_started") >= 2
+                assert lifecycle.count("record_task_output_finished") >= 2
+                # Exercise a durable failure projection on the same completion
+                # path; successful requests normally need no retry entry.
+                locked = tmp_path / "locked.blob"
+                locked.write_text("retained input")
+                response = PipelineResponse("failure", RunSummary(target_results=(TargetRunResult(
+                    str(locked), OutcomeKind.FAILURE,
+                    failure=FailureInfo(FailureKind.WRONG_PASSWORD, "extraction", "locked"), error="locked",
+                ),)))
+                task = asyncio.get_running_loop().create_future()
+                task.set_result(response)
+                request = scheduler_module._ActivePipelineRequest("failure", scheduler_module._candidate_for_event_path(str(locked)), task,
+                    password_generation=watcher.state.password_generation)
+                lookup = engine.completed_watch_family_output
+                def completed_output(*args, **kwargs):
+                    assert threading.get_ident() == loop_thread  # The generation map belongs to this loop.
+                    return lookup(*args, **kwargs)
+                monkeypatch.setattr(engine, "completed_watch_family_output", completed_output)
+                notices = []
+                monkeypatch.setattr(watcher, "_notify", lambda *args: notices.append(args))
+                entered.clear()
+                release.clear()
+                completion = asyncio.create_task(watcher._complete_candidate(request))
+                await asyncio.wait_for(entered.wait(), 5)
+                assert not notices and not completion.done()
+                release.set()
+                assert (await asyncio.wait_for(completion, 5)).failed == 1
+                assert notices
+                assert "mark" in lifecycle
+            finally:
+                release.set()
+                await watcher.aclose()
+
+    _await(scenario())
+
+
 def test_watch_candidate_coroutines_are_harvested_without_completion_pool(tmp_path, monkeypatch):
     monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
     first = tmp_path / "first.zip"

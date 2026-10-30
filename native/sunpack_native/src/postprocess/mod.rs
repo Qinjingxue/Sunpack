@@ -204,11 +204,13 @@ pub(crate) fn watch_candidate_for_path(
 }
 
 #[pyfunction]
-#[pyo3(signature = (base, work_path=None))]
+#[pyo3(signature = (base, work_path=None, before_move=None, resume_leaf=None))]
 pub(crate) fn flatten_single_branch_directories(
     py: Python<'_>,
     base: &str,
     work_path: Option<&str>,
+    before_move: Option<Py<PyAny>>,
+    resume_leaf: Option<&str>,
 ) -> PyResult<Py<PyDict>> {
     let base_path = PathBuf::from(base);
     let result = PyDict::new(py);
@@ -217,7 +219,7 @@ pub(crate) fn flatten_single_branch_directories(
     result.set_item("errors", PyList::empty(py))?;
     result.set_item("output_dir", normalize_path(&base_path))?;
     result.set_item("source_dir", "")?;
-    if !base_path.is_dir() {
+    if !base_path.is_dir() && resume_leaf.is_none() {
         return Ok(result.unbind());
     }
 
@@ -232,6 +234,23 @@ pub(crate) fn flatten_single_branch_directories(
             &mut stats,
             work_path.map(Path::new),
             rename_no_replace,
+            |root, work, leaf| {
+                if let Some(callback) = before_move {
+                    Python::attach(|py| {
+                        callback.call1(
+                            py,
+                            (
+                                normalize_path(root),
+                                normalize_path(work),
+                                normalize_path(leaf),
+                            ),
+                        )
+                    })
+                    .map_err(|error| io::Error::other(error.to_string()))?;
+                }
+                Ok(())
+            },
+            resume_leaf.map(Path::new),
         )
     });
     result.set_item("moved", stats.moved)?;
@@ -411,7 +430,14 @@ struct FlattenStats {
 
 #[cfg(test)]
 fn flatten_single_branch_chain(root: &Path, stats: &mut FlattenStats) {
-    flatten_single_branch_chain_with_publisher(root, stats, None, rename_no_replace);
+    flatten_single_branch_chain_with_publisher(
+        root,
+        stats,
+        None,
+        rename_no_replace,
+        |_, _, _| Ok(()),
+        None,
+    );
 }
 
 fn flatten_single_branch_chain_with_publisher(
@@ -419,9 +445,13 @@ fn flatten_single_branch_chain_with_publisher(
     stats: &mut FlattenStats,
     reserved_work: Option<&Path>,
     publish: impl FnOnce(&Path, &Path) -> io::Result<()>,
+    before_move: impl FnOnce(&Path, &Path, &Path) -> io::Result<()>,
+    resume_leaf: Option<&Path>,
 ) {
-    let chain = discover_flatten_chain(root);
-    let Some(leaf) = chain.last() else {
+    let leaf = resume_leaf
+        .map(Path::to_path_buf)
+        .or_else(|| discover_flatten_chain(root).pop());
+    let Some(leaf) = leaf else {
         return;
     };
     let leaf_relative = match leaf.strip_prefix(root) {
@@ -436,7 +466,18 @@ fn flatten_single_branch_chain_with_publisher(
     };
 
     let work = if let Some(work) = reserved_work {
-        if let Err(error) = rename_no_replace(root, work) {
+        let prepared = if resume_leaf.is_none() {
+            before_move(root, work, &leaf)
+        } else {
+            Ok(())
+        };
+        if let Err(error) = prepared.and_then(|_| {
+            if resume_leaf.is_some() {
+                Ok(())
+            } else {
+                rename_no_replace(root, work)
+            }
+        }) {
             stats
                 .errors
                 .push(format!("{}: {error}", normalize_path(work)));
@@ -452,7 +493,11 @@ fn flatten_single_branch_chain_with_publisher(
     stats.output_dir = Some(work.clone());
     stats.source_dir = Some(root.to_path_buf());
     let leaf_in_work = work.join(&leaf_relative);
-    if let Err(error) = publish(&leaf_in_work, root) {
+    if let Err(error) = if resume_leaf.is_some() && root.is_dir() {
+        Ok(())
+    } else {
+        publish(&leaf_in_work, root)
+    } {
         stats.errors.push(format!(
             "{} -> {}: {}",
             normalize_path(&leaf_in_work),
@@ -465,7 +510,7 @@ fn flatten_single_branch_chain_with_publisher(
     }
     stats.moved += 1;
     stats.output_dir = Some(root.to_path_buf());
-    stats.source_dir = Some(leaf.clone());
+    stats.source_dir = Some(leaf);
 
     match remove_empty_flatten_wrappers(&work, &leaf_relative) {
         Ok(removed) => stats.removed_dirs += removed,
@@ -738,11 +783,18 @@ mod tests {
         fs::create_dir_all(output.join("outer/inner")).unwrap();
         fs::write(output.join("outer/inner/payload.txt"), b"payload").unwrap();
         let mut stats = FlattenStats::default();
-        flatten_single_branch_chain_with_publisher(&output, &mut stats, None, |leaf, root| {
-            fs::create_dir(root)?;
-            fs::write(root.join("unrelated.txt"), b"unrelated")?;
-            rename_no_replace(leaf, root)
-        });
+        flatten_single_branch_chain_with_publisher(
+            &output,
+            &mut stats,
+            None,
+            |leaf, root| {
+                fs::create_dir(root)?;
+                fs::write(root.join("unrelated.txt"), b"unrelated")?;
+                rename_no_replace(leaf, root)
+            },
+            |_, _, _| Ok(()),
+            None,
+        );
         let retained = stats.output_dir.as_ref().unwrap();
         assert_ne!(retained, &output);
         assert_eq!(stats.source_dir.as_ref(), Some(&output));

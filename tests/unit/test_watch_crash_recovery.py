@@ -12,6 +12,69 @@ def _candidate(path, *, size=10, mtime=1.0):
     return WatchCandidate(path=str(path), size=size, mtime=mtime, file_id="id", change_usn=3)
 
 
+@pytest.mark.parametrize("phase", ["intent", "root_moved", "retained_work", "published", "cleaned"])
+def test_flatten_intent_recovers_directory_identity_and_nested_progress(tmp_path, phase):
+    # Existing crash tests never interrupt the two-rename flatten transaction.
+    # All boundaries share this real WAL roundtrip; it also detects losing
+    # completed nested inputs or retaining the retired directory identity.
+    from sunpack.core.contracts.discovery_scope import DiscoveryScope
+    from sunpack.runtime.watch.output_roots import WatchOutputRoots
+    from sunpack.runtime.watch.scheduler import WatchScheduler
+    from sunpack_native import flatten_single_branch_directories
+
+    owner = tmp_path / "outer.disguised"
+    owner.write_text("source")
+    root, work = tmp_path / "output", tmp_path / "work"
+    leaf = root / "wrapper" / "inner"
+    source = leaf / "nested.blob"
+    output = leaf / "nested"
+    state_path = str(tmp_path / "state.snapshot")
+    scopes = (DiscoveryScope(str(tmp_path), recursive=True),)
+    state = WatchStateStore(state_path)
+    roots = WatchOutputRoots(state, scopes)
+    try:
+        state.queue_active(_candidate(owner), durable=True)
+        roots.register(str(root))
+        output.mkdir(parents=True)
+        source.write_text("nested source")
+        (output / "payload").write_text("data")
+        state.record_task_output_started(str(owner), str(owner), str(root))
+        state.record_task_output_started(str(owner), str(source), str(output))
+        state.record_task_output_finished(str(owner), str(source), str(output), keep_output=True)
+        roots.prepare_flatten(str(owner), str(root), str(work), str(leaf))
+        if phase == "cleaned":
+            flatten_single_branch_directories(str(root), work_path=str(work))
+            state.save()
+        elif phase != "intent":
+            root.rename(work)
+            if phase == "retained_work":
+                state.record_task_output_started(str(owner), str(owner), str(work))
+                state.record_task_output_finished(str(owner), str(owner), str(work), keep_output=True)
+            if phase == "published":
+                (work / "wrapper" / "inner").rename(root)
+    finally:
+        roots.close()
+        state.close()
+    state = WatchStateStore(state_path)
+    roots = WatchOutputRoots(state, scopes)
+    try:
+        [pending] = state.pending_work_items()
+        final_source = source if phase == "intent" else root / "nested.blob"
+        assert final_source.read_text() == "nested source"
+        assert pending.completed_sources == [str(final_source)]
+        assert pending.committed_roots == [str(root)]
+        assert pending.active_outputs == ({} if phase == "retained_work" else {str(owner): str(root)})
+        assert not work.exists()
+        assert not state._native.runtime_keys("flatten|")
+        scheduler = object.__new__(WatchScheduler)
+        scheduler.state = state
+        assert scheduler._recovery_output_matches(pending, str(root))
+        assert roots.protected(str(root))
+    finally:
+        roots.close()
+        state.close()
+
+
 def _watch_scheduler_shell(scheduler_module):
     import threading
 
@@ -150,6 +213,12 @@ def test_promotion_checkpoint_keeps_other_active_outputs_and_rolls_back(tmp_path
         assert state.prepare_input_promotion(
             str(source), [str(tmp_path / "inner.data")], sources=[str(output / "inner.data")],
         )
+        from sunpack.runtime.watch.output_roots import WatchOutputRoots
+        leaf = output / "wrapper"
+        leaf.mkdir()
+        roots = WatchOutputRoots(state, ())
+        roots.prepare_flatten(str(source), str(output), str(tmp_path / "flatten_work"), str(leaf))
+        roots.close()
         state.save()
     finally:
         state.close()
@@ -163,6 +232,7 @@ def test_promotion_checkpoint_keeps_other_active_outputs_and_rolls_back(tmp_path
         assert pending.committed_roots == []
         assert list(pending.active_outputs.values()) == [str(sibling)]
         assert str(output) not in pending.output_identities
+        assert not state._native.runtime_keys("flatten|")
     finally:
         state.close()
 

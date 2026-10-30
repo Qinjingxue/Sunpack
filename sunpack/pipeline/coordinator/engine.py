@@ -1263,7 +1263,8 @@ class _RequestRuntime:
 
             await self._drain_cleanup_tasks()
             cancellation.raise_if_cancelled()
-            self.job_executor.finish_outputs()
+            await broker.run("output_state", "", self.job_executor.finish_outputs,
+                             request_id=self.submission.request_id)
             response = ownership.response(
                 self.context,
                 recent_passwords=self.extractor.recent_passwords,
@@ -1640,7 +1641,8 @@ class _RequestRuntime:
                 ownership.relocate_outputs(flattened)
 
             if depth == 1 and outcome.outcome_kind == OutcomeKind.COMPLETE_SUCCESS:
-                self.job_executor.commit_output(task, output_dir, cancellation)
+                await broker.run("output_state", task.key or task.main_path, self.job_executor.commit_output,
+                                 task, output_dir, cancellation, request_id=self.submission.request_id)
 
             # Keep source archives until their recursive subtree has settled.
             # An interrupted root can then discard its whole output safely.
@@ -1677,8 +1679,8 @@ class _RequestRuntime:
                 ownership.remember_results([result])
             active_output = task.runtime.pop("watch_active_output", None)
             if active_output is not None:
-                self.extractor.emit_semantic_event(
-                    task, "task_output_finished", critical=True,
+                await self.extractor.emit_semantic_event_async(
+                    broker, task, "task_output_finished", request_id=self.submission.request_id, critical=True,
                     task_path=active_output[0], output_dir=active_output[1], keep_output=False,
                 )
             return True
@@ -1876,6 +1878,8 @@ class _RequestRuntime:
     async def _flatten_output(self, task, output_dir: str, *, broker, cancellation) -> DirectoryFlattenResult:
         def flatten():
             registry = self.services.output_reservations
+            outputs = registry.watch_outputs
+            owner = str(self.config.get("watch_owner_path") or "") if self.submission.origin == "watch" else ""
             work_path = (registry.reserve(output_dir + ".__sunpack_flatten_work__",
                 self.submission.request_id, set()) if registry.watch_outputs is not None else None)
             with promotion_barrier(
@@ -1886,9 +1890,12 @@ class _RequestRuntime:
                 result = _postprocess_actions_factory(
                     self.config,
                     stdout=self.submission.stdout,
-                ).flattener.flatten_dirs(output_dir, work_path=work_path)
+                ).flattener.flatten_dirs(output_dir, work_path=work_path,
+                    before_move=(lambda root, work, leaf: outputs.prepare_flatten(owner, root, work, leaf))
+                        if outputs is not None else None)
+            if outputs is not None and os.path.isdir(output_dir):
+                outputs.finish_flatten(output_dir)
             root_output = self.job_executor.relocate_output(result)
-            outputs = self.services.output_reservations.watch_outputs
             if outputs is not None:
                 outputs.replace(output_dir, result.output_dir)
             if self.submission.origin == "watch" and not root_output and result.source_dir and result.output_dir == output_dir:

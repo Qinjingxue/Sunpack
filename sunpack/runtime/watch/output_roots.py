@@ -14,6 +14,7 @@ class WatchOutputRoots:
         self.scopes = scopes
         self._lock = threading.RLock()
         self._closed = False
+        self.recover_flattens()
         changes = []
         keys = set(state._native.runtime_keys("owned|"))
         for key in tuple(keys):
@@ -81,6 +82,80 @@ class WatchOutputRoots:
         # already holds the state lock; taking the writer lock here would invert
         # register/reconcile's lock order. Reservations cover unpublished roots.
         return self.state._native.owned_root(path) is not None
+
+    def prepare_flatten(self, owner, root, work, leaf):
+        """Retain both directory identities before the first physical rename."""
+        with self._lock:
+            if not self._relevant(self._paths(root)):
+                return
+            old_identity, new_identity = self._identity(root), self._identity(leaf)
+            record = dict(owner=owner, root=root, work=work, leaf=leaf,
+                          old_identity=old_identity, new_identity=new_identity)
+            changes = [{"op": "runtime", "key": "flatten|" + path_key(root), "value": record}]
+            if owner:
+                # Reuse promotion's verified-output checkpoint. Keep the active
+                # record so cancellation can still revoke and remove this tree.
+                changes.append({"op": "checkpoint_output", "owner": owner, "output": root})
+            for path, identities in ((root, [old_identity, new_identity]), (work, [old_identity])):
+                changes.extend({"op": "runtime", "key": "owned|" + path_key(alias),
+                    "value": {"path": path, "identities": identities}} for alias in self._paths(path))
+            self.state.commit_runtime(changes, durable=True)
+
+    def finish_flatten(self, root):
+        with self._lock:
+            key = "flatten|" + path_key(root)
+            record = self.state._native.runtime_record(key)
+            if record is None:
+                return
+            work = record["work"]
+            identity = self._identity(root)
+            changes = []
+            if identity == record["new_identity"]:
+                # A failed publish can temporarily relocate active state to work.
+                if record["owner"]:
+                    for source in (work, record["leaf"]):
+                        changes.append({"op": "relocate_output", "owner": record["owner"],
+                            "source": source, "destination": root, "identity": identity})
+            elif identity != record["old_identity"] or os.path.exists(work):
+                return
+            if os.path.exists(work):
+                # Empty-wrapper cleanup failed; retain its intent for restart.
+                self.state.commit_runtime(changes, durable=True)
+                return
+            for alias in self._paths(root):
+                changes.append({"op": "runtime", "key": "owned|" + path_key(alias),
+                    "value": {"path": root, "identities": [identity]}})
+            changes.append({"op": "runtime", "key": key})
+            changes.extend({"op": "runtime", "key": "owned|" + path_key(alias)} for alias in self._paths(work))
+            self.state.commit_runtime(changes, durable=True)
+
+    def recover_flattens(self):
+        from sunpack_native import flatten_single_branch_directories
+
+        for key in self.state._native.runtime_keys("flatten|"):
+            record = self.state._native.runtime_record(key)
+            root, work = record["root"], record["work"]
+            try:
+                root_id = self._identity(root) if os.path.exists(root) else None
+                work_id = self._identity(work) if os.path.exists(work) else None
+                if work_id not in (None, record["old_identity"]):
+                    continue
+                if root_id == record["old_identity"] and work_id is None:
+                    self.finish_flatten(root)
+                    continue
+                if root_id not in (None, record["new_identity"]):
+                    continue
+                if root_id is None and work_id is None:
+                    continue
+                if root_id is None:
+                    leaf = os.path.join(work, os.path.relpath(record["leaf"], root))
+                    if self._identity(leaf) != record["new_identity"]:
+                        continue
+                flatten_single_branch_directories(root, work_path=work, resume_leaf=record["leaf"])
+                self.finish_flatten(root)
+            except OSError:
+                # Offline/locked output retains its intent and exclusions.
+                continue
 
     def reconcile(self, path, *, recursive=False):
         normalized = path_key(path)

@@ -187,6 +187,10 @@ fn sunpack_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(relations::relations_detect_split_role, m)?)?;
     m.add_function(wrap_pyfunction!(relations::relations_logical_name, m)?)?;
     m.add_function(wrap_pyfunction!(
+        verification::paths::output_name_component,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
         relations::relations_parse_numbered_volume,
         m
     )?)?;

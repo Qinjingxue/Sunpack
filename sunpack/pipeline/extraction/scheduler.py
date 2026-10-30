@@ -45,6 +45,12 @@ class ExtractionScheduler:
     def set_progress_callback(self, callback: Callable[[ArchiveTask, dict], None] | None) -> None:
         self.sevenzip_runner.progress_callback = callback
 
+    async def emit_semantic_event_async(self, broker, task, event, *, request_id, **payload):
+        await broker.run(
+            "output_state", task.key or task.main_path, self.emit_semantic_event,
+            task, event, request_id=request_id, **payload,
+        )
+
     def emit_semantic_event(
         self,
         task: ArchiveTask,

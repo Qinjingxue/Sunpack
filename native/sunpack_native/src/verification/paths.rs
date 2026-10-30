@@ -167,6 +167,20 @@ fn windows_output_part(part: &str) -> String {
     mapped
 }
 
+/// One ordinary Windows filename component, shared by logical names and output routing.
+#[pyo3::pyfunction]
+pub(crate) fn output_name_component(value: &str) -> String {
+    let part = value.rsplit(['\\', '/']).next().unwrap_or(value);
+    if part.is_empty() {
+        return "archive".to_owned();
+    }
+    if windows_output_part_needs_mapping(part) {
+        windows_output_part(part)
+    } else {
+        part.to_owned()
+    }
+}
+
 /// Project a cleaned archive path onto the name the worker writes on disk.
 /// The mapping is idempotent, so already-projected output paths pass through.
 pub(crate) fn windows_output_relative_path(cleaned: Cow<'_, str>) -> Cow<'_, str> {

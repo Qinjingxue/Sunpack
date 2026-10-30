@@ -199,14 +199,15 @@ class ArchiveJobExecutor:
         path = outcome.planned_out_dir
         if path in self._uncommitted_outputs and not os.path.lexists(path):
             self._uncommitted_outputs.pop(path)
-            self._finish_output(task, path, keep=False)
+            await broker.run("output_state", task.key or task.main_path, self._finish_output,
+                             task, path, keep=False, request_id=self.request_id)
         if self.origin == "watch" and depth == 1:
             task.runtime["watch_keep_output"] = preserve_output
         elif self.origin == "watch":
             active_output = task.runtime.pop("watch_active_output", None)
             if active_output is not None:
-                self.extractor.emit_semantic_event(
-                    task, "task_output_finished", critical=True,
+                await self.extractor.emit_semantic_event_async(
+                    broker, task, "task_output_finished", request_id=self.request_id, critical=True,
                     task_path=active_output[0], output_dir=active_output[1], keep_output=preserve_output,
                 )
         if preserve_output:
@@ -279,9 +280,10 @@ class ArchiveJobExecutor:
             self._uncommitted_outputs[planned_out_dir] = task
         if self.origin == "watch":
             task.runtime["watch_active_output"] = (task.main_path, planned_out_dir)
-            self.extractor.emit_semantic_event(
-                task,
+            await self.extractor.emit_semantic_event_async(
+                broker, task,
                 "task_output_started",
+                request_id=self.request_id,
                 critical=True,
                 output_dir=planned_out_dir,
             )

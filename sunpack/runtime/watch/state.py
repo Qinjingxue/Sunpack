@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
 import os
 import threading
@@ -9,7 +10,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from sunpack.core.support.path_keys import case_key, absolute_path_key, path_key_is_under
-from sunpack_native import NativeWatchState, watch_path_key
+from sunpack_native import NativeWatchState, NativeWatchOperations, watch_path_key
 from sunpack.core.platform.windows.file_mutex import file_mutex
 
 from sunpack.runtime.watch.journal_commit import (
@@ -184,6 +185,7 @@ class WatchStateStore:
         self._closing = False
         self._closed = False
         self._journal_waiters = 0
+        self._deferred_journal = threading.local()
         self._native = NativeWatchState()
         self.scopes = tuple(scopes)
 
@@ -757,11 +759,45 @@ class WatchStateStore:
                 return
             self._commit_operations_locked(operations, durable=durable)
 
+    @contextmanager
+    def defer_journal_waits(self):
+        """Keep synchronous state decisions atomic; join their WAL off-loop."""
+        previous = getattr(self._deferred_journal, "tickets", None)
+        if previous is not None:
+            yield previous
+            return
+        tickets = []
+        self._deferred_journal.tickets = tickets
+        try:
+            yield tickets
+        finally:
+            del self._deferred_journal.tickets
+
+    def wait_for_journal(self, tickets):
+        error = None
+        for ticket in tickets:
+            try:
+                self._wait_journal_ticket(ticket)
+            except BaseException as exc:
+                if error is None:
+                    error = exc
+        if error is not None:
+            raise error
+
+    def _wait_journal_ticket(self, ticket):
+        try:
+            ticket.wait()
+        finally:
+            with self._state_lock:
+                self._journal_waiters -= 1
+                self._checkpoint_condition.notify_all()
+        with self._state_lock:
+            self._raise_persistence_fault_locked()
 
 
     def _commit_operations_locked(
         self,
-        operations: list[dict[str, Any]],
+        operations: list[dict[str, Any]] | NativeWatchOperations,
         *,
         durable: bool = False,
     ) -> None:
@@ -769,7 +805,8 @@ class WatchStateStore:
             return
         self._ensure_open_locked()
         self._raise_persistence_fault_locked()
-        decoded = self._native.decode_operations(operations)
+        decoded = (operations if isinstance(operations, NativeWatchOperations)
+                   else self._native.decode_operations(operations))
         previous_seq = self._applied_seq
         seq, segment_start = self._path_coordinator.reserve(previous_seq)
         if seq != previous_seq + 1:
@@ -800,13 +837,15 @@ class WatchStateStore:
         # barrier.  The global state lock is released for that wait, so unrelated
         # Watch state progression is never serialized behind physical I/O.
         self._journal_waiters += 1
+        deferred = getattr(self._deferred_journal, "tickets", None)
+        if deferred is not None:
+            deferred.append(ticket)
+            return
         self._state_lock.release()
         try:
-            ticket.wait()
+            self._wait_journal_ticket(ticket)
         finally:
             self._state_lock.acquire()
-            self._journal_waiters -= 1
-            self._checkpoint_condition.notify_all()
         self._raise_persistence_fault_locked()
 
     def _update_compaction_due_locked(self) -> None:
@@ -966,112 +1005,33 @@ class WatchStateStore:
     ) -> bool:
         """Durably retain nested provenance before the first physical move."""
         with self._state_lock:
-            key = _path_key(owner_path)
-            pending = self._pending_record(key)
-            if pending is None:
+            operations = self._native.promotion_operation(
+                owner_path, [os.path.abspath(path) for path in destinations],
+                [os.path.abspath(path) for path in sources],
+            )
+            if operations is None:
                 return False
-            paths = {_path_key(path): path for path in pending.promoted_destinations}
-            paths.update((_path_key(path), os.path.abspath(path)) for path in destinations)
-            # Recursion can only promote inputs from a verified parent output.
-            # Checkpoint that tree in the same WAL transaction as the move
-            # intent, while retaining its active record for cancellation rollback.
-            source_keys = tuple(_path_key(path) for path in sources)
-            roots = list(pending.committed_roots)
-            for output in pending.active_outputs.values():
-                if any(_is_path_under(source, _path_key(output)) for source in source_keys):
-                    roots = _retain_output_root(roots, output)
-            updated = replace(pending, durable_owner=True, promoted_destinations=list(paths.values()),
-                              committed_roots=roots)
-            self._commit_operations_locked([
-                self._put_operation("pending_work", key, updated),
-            ], durable=True)
+            self._commit_operations_locked(operations, durable=True)
             return True
 
     def record_task_output_started(self, owner_path: str, task_path: str, output_dir: str) -> bool:
-        if not task_path or not output_dir:
-            return False
-        with self._state_lock:
-            key = _path_key(owner_path)
-            pending = self._pending_record(key)
-            if pending is None:
-                return False
-            active = dict(pending.active_outputs)
-            active[os.path.abspath(task_path)] = os.path.abspath(output_dir)
-            from sunpack_native import create_output_root, watch_path_identity
-            if not os.path.isdir(output_dir):
-                create_output_root(os.path.abspath(output_dir))
-            volume, identity, _ = watch_path_identity(output_dir)
-            identities = dict(pending.output_identities)
-            identities[os.path.abspath(output_dir)] = f"{volume}|{identity}"
-            updated = replace(pending, active_outputs=active, output_identities=identities)
-            self._commit_operations_locked([
-                self._put_operation("pending_work", key, updated),
-            ], durable=True)
-            return True
+        return self._record_output(owner_path, task_path, output_dir, keep=None)
 
     def record_task_output_finished(
-        self,
-        owner_path: str,
-        task_path: str,
-        output_dir: str,
-        *,
-        keep_output: bool,
+        self, owner_path: str, task_path: str, output_dir: str, *, keep_output: bool,
     ) -> bool:
-        """End the task's durable write record after verification."""
+        return self._record_output(owner_path, task_path, output_dir, keep=bool(keep_output))
+
+    def _record_output(self, owner_path, task_path, output_dir, *, keep):
         if not task_path or not output_dir:
             return False
         with self._state_lock:
-            key = _path_key(owner_path)
-            pending = self._pending_record(key)
-            if pending is None:
-                return False
-            task_path = os.path.abspath(task_path)
-            active = dict(pending.active_outputs)
-            if task_path not in active:
-                if not keep_output:
-                    return False
-                if output_dir not in pending.committed_roots:
-                    return any(_is_path_under(_path_key(output_dir), _path_key(root)) for root in pending.committed_roots)
-            active_output = active.pop(task_path, None)
-            roots = list(pending.committed_roots)
-            completed = list(pending.completed_sources)
-            if keep_output:
-                output_dir = os.path.abspath(output_dir)
-                roots = _retain_output_root(roots, output_dir)
-                task_key = _path_key(task_path)
-                if (
-                    task_key != _path_key(pending.path)
-                    and not any(_path_key(existing) == task_key for existing in completed)
-                ):
-                    completed.append(task_path)
-            else:
-                # A promotion checkpoint does not commit the live subtree:
-                # cancellation still removes it and revokes its recovery roots.
-                root_key = _path_key(output_dir)
-                roots = [root for root in roots if not _is_path_under(_path_key(root), root_key)]
-                completed = [path for path in completed if not _is_path_under(_path_key(path), root_key)]
-            identities = dict(pending.output_identities)
-            # Start/relocation already captured this directory's identity.
-            # Child cleanup can still hold a promotion gate below it, so a
-            # redundant parent-handle probe would abort the completion. A
-            # post-flatten notification without an active output must refresh it.
-            if (keep_output and (active_output != output_dir or output_dir not in identities)
-                    and os.path.isdir(output_dir)):
-                from sunpack_native import watch_path_identity
-                volume, identity, _ = watch_path_identity(output_dir)
-                identities[os.path.abspath(output_dir)] = f"{volume}|{identity}"
-            retained = set(active.values()) | set(roots)
-            identities = {path: identity for path, identity in identities.items() if path in retained}
-            updated = replace(
-                pending,
-                output_identities=identities,
-                active_outputs=active,
-                committed_roots=roots,
-                completed_sources=completed,
+            operations = self._native.output_operation(
+                owner_path, os.path.abspath(task_path), os.path.abspath(output_dir), keep,
             )
-            self._commit_operations_locked([
-                self._put_operation("pending_work", key, updated),
-            ], durable=True)
+            if operations is None:
+                return False
+            self._commit_operations_locked(operations, durable=True)
             return True
 
     def rebase_pending_work(
@@ -1414,10 +1374,3 @@ def _path_key(path: str) -> str:
 
 def _is_path_under(path: str, root: str) -> bool:
     return path_key_is_under(absolute_path_key(path), absolute_path_key(root))
-
-
-def _retain_output_root(roots: list[str], output: str) -> list[str]:
-    key = _path_key(output)
-    if any(_is_path_under(key, _path_key(root)) for root in roots):
-        return roots
-    return [root for root in roots if not _is_path_under(_path_key(root), key)] + [output]

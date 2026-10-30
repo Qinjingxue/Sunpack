@@ -1803,7 +1803,13 @@ fn clean_logical_name(value: &str) -> String {
         }
         name = &name[..basename_start + stem.len()];
     }
-    name.to_string()
+    let base = basename(name);
+    let component = crate::verification::paths::output_name_component(base);
+    if base.len() == name.len() {
+        component
+    } else {
+        format!("{}{component}", &name[..name.len() - base.len()])
+    }
 }
 
 fn re(pattern: &str) -> Regex {

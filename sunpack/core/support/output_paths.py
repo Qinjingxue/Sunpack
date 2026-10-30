@@ -1,6 +1,7 @@
 import heapq
 import os
 import re
+from sunpack_native import output_name_component
 from collections import OrderedDict
 from collections.abc import Container, MutableSet
 
@@ -12,7 +13,7 @@ def default_output_dir_for_task(task: ArchiveTask, output_config: dict | None = 
     """Build the preferred output path; the reservation layer resolves collisions."""
     output_config = output_config if isinstance(output_config, dict) else {}
     path = task.main_path
-    out_name = task.logical_name or os.path.splitext(os.path.basename(path))[0]
+    out_name = output_name_component(task.logical_name or os.path.splitext(os.path.basename(path))[0])
     if output_config.get("root"):
         output_root = os.path.abspath(os.path.normpath(str(output_config.get("root"))))
         common_root = output_config.get("common_root")

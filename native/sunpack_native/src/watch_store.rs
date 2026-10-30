@@ -33,6 +33,233 @@ fn recorded_file_presence(path: &str) -> Option<bool> {
     }
 }
 
+// Serialize the existing path list schema; index canonical keys only in memory.
+// Ancestor lookup and subtree retirement do not scan unrelated sibling outputs.
+#[derive(Debug, Clone, Default)]
+struct PathSet(BTreeMap<String, String>);
+impl Serialize for PathSet {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.0.values())
+    }
+}
+impl<'de> Deserialize<'de> for PathSet {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let paths = Vec::<String>::deserialize(deserializer)?;
+        Ok(Self(paths.into_iter().map(|p| (path_key(&p), p)).collect()))
+    }
+}
+impl PathSet {
+    fn iter(&self) -> impl Iterator<Item = &String> {
+        self.0.values()
+    }
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+    fn contains(&self, path: &str) -> bool {
+        self.0.contains_key(&path_key(path))
+    }
+    fn covers(&self, path: &str) -> bool {
+        let key = path_key(path);
+        let mut ancestor = key.as_str();
+        loop {
+            if self.0.contains_key(ancestor) {
+                return true;
+            }
+            let Some((parent, _)) = ancestor.rsplit_once('\\') else {
+                return false;
+            };
+            ancestor = parent;
+        }
+    }
+    fn remove_under(&mut self, path: &str) -> Vec<String> {
+        let key = path_key(path);
+        let prefix = format!("{}\\", key.trim_end_matches('\\'));
+        let mut keys: Vec<_> = self
+            .0
+            .range(prefix.clone()..)
+            .take_while(|(k, _)| k.starts_with(&prefix))
+            .map(|(k, _)| k.clone())
+            .collect();
+        if self.0.contains_key(&key) {
+            keys.push(key);
+        }
+        keys.into_iter().filter_map(|k| self.0.remove(&k)).collect()
+    }
+    fn insert(&mut self, path: String) {
+        self.0.insert(path_key(&path), path);
+    }
+    fn retain_root(&mut self, path: &str) -> Vec<String> {
+        if self.covers(path) {
+            return Vec::new();
+        }
+        let removed = self.remove_under(path);
+        self.insert(path.to_owned());
+        removed
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum OutputChange {
+    Start {
+        task: String,
+        output: String,
+        identity: String,
+    },
+    Finish {
+        task: String,
+        output: String,
+        keep: bool,
+        identity: Option<String>,
+    },
+    Relocate {
+        source: String,
+        destination: String,
+        identity: String,
+    },
+    Promote {
+        destinations: Vec<String>,
+        sources: Vec<String>,
+    },
+}
+
+impl PendingRecord {
+    fn change_output(&mut self, change: &OutputChange) {
+        match change {
+            OutputChange::Start {
+                task,
+                output,
+                identity,
+            } => {
+                if let Some(old) = self.active_outputs.insert(task.clone(), output.clone()) {
+                    if old != *output
+                        && !self.committed_roots.contains(&old)
+                        && !self.active_outputs.values().any(|p| p == &old)
+                    {
+                        self.output_identities.remove(&old);
+                    }
+                }
+                self.output_identities
+                    .insert(output.clone(), identity.clone());
+            }
+            OutputChange::Finish {
+                task,
+                output,
+                keep,
+                identity,
+            } => {
+                let old = self.active_outputs.remove(task);
+                let removed = if *keep {
+                    if path_key(task) != path_key(&self.path) {
+                        self.completed_sources.insert(task.clone());
+                    }
+                    self.committed_roots.retain_root(output)
+                } else {
+                    self.completed_sources.remove_under(output);
+                    self.committed_roots.remove_under(output)
+                };
+                if let Some(identity) = identity {
+                    self.output_identities
+                        .insert(output.clone(), identity.clone());
+                }
+                for path in removed
+                    .iter()
+                    .chain(old.iter())
+                    .chain(std::iter::once(output))
+                {
+                    if !self.committed_roots.contains(path)
+                        && !self.active_outputs.values().any(|p| p == path)
+                    {
+                        self.output_identities.remove(path);
+                    }
+                }
+            }
+            OutputChange::Relocate {
+                source,
+                destination,
+                identity,
+            } => {
+                let source_key = path_key(source);
+                let source_depth = Path::new(source).components().count();
+                let relocate = |path: &str| {
+                    let key = path_key(path);
+                    if key == source_key {
+                        destination.clone()
+                    } else if is_path_under(&key, &source_key) {
+                        Path::new(destination)
+                            .join(
+                                Path::new(path)
+                                    .components()
+                                    .skip(source_depth)
+                                    .collect::<std::path::PathBuf>(),
+                            )
+                            .to_string_lossy()
+                            .into_owned()
+                    } else {
+                        path.to_owned()
+                    }
+                };
+                self.active_outputs = std::mem::take(&mut self.active_outputs)
+                    .into_iter()
+                    .map(|(task, output)| (relocate(&task), relocate(&output)))
+                    .collect();
+                for path in self.committed_roots.remove_under(source) {
+                    self.committed_roots.retain_root(&relocate(&path));
+                }
+                for path in self.completed_sources.remove_under(source) {
+                    self.completed_sources.insert(relocate(&path));
+                }
+                for path in self.promoted_destinations.remove_under(source) {
+                    self.promoted_destinations.insert(relocate(&path));
+                }
+                let prefix = format!("{}\\", source.trim_end_matches('\\'));
+                let mut moved: Vec<_> = self
+                    .output_identities
+                    .range(prefix.clone()..)
+                    .take_while(|(path, _)| path.starts_with(&prefix))
+                    .map(|(path, _)| path.clone())
+                    .collect();
+                if self.output_identities.contains_key(source) {
+                    moved.push(source.clone());
+                }
+                for path in moved {
+                    if let Some(id) = self.output_identities.remove(&path) {
+                        self.output_identities.insert(relocate(&path), id);
+                    }
+                }
+                if self.committed_roots.contains(destination)
+                    || self.active_outputs.values().any(|p| p == destination)
+                {
+                    self.output_identities
+                        .insert(destination.clone(), identity.clone());
+                }
+            }
+            OutputChange::Promote {
+                destinations,
+                sources,
+            } => {
+                self.durable_owner = true;
+                for path in destinations {
+                    self.promoted_destinations.insert(path.clone());
+                }
+                let source_keys: Vec<_> = sources.iter().map(|p| path_key(p)).collect();
+                for output in self.active_outputs.values() {
+                    let root = path_key(output);
+                    if source_keys
+                        .iter()
+                        .any(|key| *key == root || is_path_under(key, &root))
+                    {
+                        for path in self.committed_roots.retain_root(output) {
+                            if !self.active_outputs.values().any(|p| p == &path) {
+                                self.output_identities.remove(&path);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PendingRecord {
@@ -48,10 +275,10 @@ struct PendingRecord {
     discovery_scope: Map<String, Value>,
     durable_owner: bool,
     active_outputs: BTreeMap<String, String>,
-    committed_roots: Vec<String>,
-    completed_sources: Vec<String>,
+    committed_roots: PathSet,
+    completed_sources: PathSet,
     output_identities: BTreeMap<String, String>,
-    promoted_destinations: Vec<String>,
+    promoted_destinations: PathSet,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,6 +314,7 @@ enum Collection {
 
 #[derive(Debug, Clone)]
 enum Operation {
+    Output(String, OutputChange),
     PutPending(String, Arc<PendingRecord>),
     PutEntry(String, Arc<EntryRecord>),
     Delete(Collection, String),
@@ -99,6 +327,7 @@ enum Operation {
 impl Serialize for Operation {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match self {
+            Self::Output(key, change) => (7u8, key, change).serialize(serializer),
             Self::PutPending(_, record) => (0u8, record).serialize(serializer),
             Self::PutEntry(_, record) => (1u8, record).serialize(serializer),
             Self::Delete(Collection::Pending, key) => (2u8, key).serialize(serializer),
@@ -164,11 +393,12 @@ impl<'de> Deserialize<'de> for Operation {
                     5 => Operation::SetCursors(field(&mut seq)?),
                     6 => {
                         let key: String = field(&mut seq)?;
-                        if !key.starts_with("owned|") {
+                        if !key.starts_with("owned|") && !key.starts_with("flatten|") {
                             return Err(A::Error::custom("unknown runtime record"));
                         }
                         Operation::Runtime(key, field(&mut seq)?)
                     }
+                    7 => Operation::Output(field(&mut seq)?, field(&mut seq)?),
                     _ => return Err(A::Error::custom("unknown operation opcode")),
                 };
                 if seq.next_element::<serde::de::IgnoredAny>()?.is_some() {
@@ -194,6 +424,37 @@ pub(crate) struct StateData {
 impl StateData {
     fn apply(&mut self, operation: &Operation) {
         match operation {
+            Operation::Output(key, change) => {
+                if let Some(record) = self.pending.get_mut(key) {
+                    Arc::make_mut(record).change_output(change);
+                }
+                if let OutputChange::Finish {
+                    output,
+                    keep: false,
+                    ..
+                } = change
+                {
+                    let retired: Vec<_> = self
+                        .runtime
+                        .range("flatten|".to_owned()..)
+                        .take_while(|(runtime_key, _)| runtime_key.starts_with("flatten|"))
+                        .filter(|(_, record)| {
+                            record["owner"]
+                                .as_str()
+                                .is_some_and(|p| path_key(p) == *key)
+                                && ["root", "work"].iter().any(|field| {
+                                    record[*field]
+                                        .as_str()
+                                        .is_some_and(|p| path_key(p) == path_key(output))
+                                })
+                        })
+                        .map(|(runtime_key, _)| runtime_key.clone())
+                        .collect();
+                    for key in retired {
+                        self.runtime.remove(&key);
+                    }
+                }
+            }
             Operation::Runtime(key, value) => {
                 if let Some(value) = value {
                     self.runtime.insert(key.clone(), value.clone());
@@ -230,6 +491,13 @@ pub(crate) struct Operations(Vec<Operation>);
 #[pyclass(module = "sunpack_native", frozen)]
 pub(crate) struct NativeWatchOperations {
     pub(crate) operations: Arc<Operations>,
+}
+
+#[pymethods]
+impl NativeWatchOperations {
+    fn __len__(&self) -> usize {
+        self.operations.0.len()
+    }
 }
 
 /// Frozen checkpoint view; writing it never touches the live maps.
@@ -494,6 +762,91 @@ impl NativeWatchState {
 
 #[pymethods]
 impl NativeWatchState {
+    fn promotion_operation(
+        &self,
+        owner: &str,
+        destinations: Vec<String>,
+        sources: Vec<String>,
+    ) -> Option<NativeWatchOperations> {
+        let key = path_key(owner);
+        self.lock()
+            .pending
+            .contains_key(&key)
+            .then(|| NativeWatchOperations {
+                operations: Arc::new(Operations(vec![Operation::Output(
+                    key,
+                    OutputChange::Promote {
+                        destinations,
+                        sources,
+                    },
+                )])),
+            })
+    }
+    /// Build a bounded WAL delta without exporting a growing pending record.
+    #[pyo3(signature = (owner, task, output, keep=None))]
+    fn output_operation(
+        &self,
+        py: Python<'_>,
+        owner: &str,
+        task: String,
+        output: String,
+        keep: Option<bool>,
+    ) -> PyResult<Option<NativeWatchOperations>> {
+        let key = path_key(owner);
+        let refresh = {
+            let data = self.lock();
+            let Some(record) = data.pending.get(&key) else {
+                return Ok(None);
+            };
+            if let Some(keep) = keep {
+                if !record.active_outputs.contains_key(&task) {
+                    if !keep {
+                        return Ok(None);
+                    }
+                    if !record.committed_roots.contains(&output) {
+                        return Ok(record.committed_roots.covers(&output).then(|| {
+                            NativeWatchOperations {
+                                operations: Arc::new(Operations::default()),
+                            }
+                        }));
+                    }
+                }
+                keep && (record.active_outputs.get(&task) != Some(&output)
+                    || !record.output_identities.contains_key(&output))
+            } else {
+                true
+            }
+        };
+        let identity = py.detach(|| -> PyResult<Option<String>> {
+            if keep.is_none() {
+                std::fs::create_dir_all(&output)?;
+            }
+            if refresh && Path::new(&output).is_dir() {
+                let (volume, identity, _) = crate::filesystem::watch_path_identity(&output)?;
+                Ok(Some(format!("{volume}|{identity}")))
+            } else {
+                Ok(None)
+            }
+        })?;
+        let change = if let Some(keep) = keep {
+            OutputChange::Finish {
+                task,
+                output,
+                keep,
+                identity,
+            }
+        } else {
+            OutputChange::Start {
+                task,
+                output,
+                identity: identity.ok_or_else(|| invalid("output root has no identity"))?,
+            }
+        };
+        Ok(Some(NativeWatchOperations {
+            operations: Arc::new(Operations(vec![Operation::Output(key, change)])),
+        }))
+    }
+
     fn runtime_record(&self, py: Python<'_>, key: &str) -> PyResult<Option<Py<PyDict>>> {
         self.lock()
             .runtime
@@ -517,13 +870,22 @@ impl NativeWatchState {
             let key = path_key(path);
             key == root || is_path_under(&key, &root) || is_path_under(&root, &key)
         };
-        self.lock().pending.values().any(|record| {
-            let source = path_key(&record.path);
-            source == root
-                || is_path_under(&source, &root)
-                || record.active_outputs.values().any(|path| intersects(path))
-                || record.committed_roots.iter().any(|path| intersects(path))
-        })
+        let data = self.lock();
+        data.runtime
+            .range("flatten|".to_owned()..)
+            .take_while(|(key, _)| key.starts_with("flatten|"))
+            .any(|(_, record)| {
+                ["root", "work"]
+                    .iter()
+                    .any(|field| record[*field].as_str().is_some_and(intersects))
+            })
+            || data.pending.values().any(|record| {
+                let source = path_key(&record.path);
+                source == root
+                    || is_path_under(&source, &root)
+                    || record.active_outputs.values().any(|path| intersects(path))
+                    || record.committed_roots.iter().any(|path| intersects(path))
+            })
     }
 
     fn owned_root(&self, path: &str) -> Option<String> {
@@ -989,12 +1351,50 @@ fn decode_operation(operation: &Value) -> PyResult<Operation> {
                 .get("key")
                 .and_then(Value::as_str)
                 .ok_or_else(|| invalid("runtime key missing"))?;
-            if !key.starts_with("owned|") {
+            if !key.starts_with("owned|") && !key.starts_with("flatten|") {
                 return Err(invalid("unknown runtime record"));
             }
             return Ok(Operation::Runtime(
                 key.to_owned(),
                 object.get("value").filter(|v| !v.is_null()).cloned(),
+            ));
+        }
+        "relocate_output" => {
+            require_fields(
+                object,
+                &["op", "owner", "source", "destination", "identity"],
+            )?;
+            let string = |field: &str| {
+                object
+                    .get(field)
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .ok_or_else(|| invalid(format!("missing {field}")))
+            };
+            return Ok(Operation::Output(
+                path_key(&string("owner")?),
+                OutputChange::Relocate {
+                    source: string("source")?,
+                    destination: string("destination")?,
+                    identity: string("identity")?,
+                },
+            ));
+        }
+        "checkpoint_output" => {
+            require_fields(object, &["op", "owner", "output"])?;
+            let string = |field: &str| {
+                object
+                    .get(field)
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .ok_or_else(|| invalid(format!("missing {field}")))
+            };
+            return Ok(Operation::Output(
+                path_key(&string("owner")?),
+                OutputChange::Promote {
+                    destinations: Vec::new(),
+                    sources: vec![string("output")?],
+                },
             ));
         }
         "set_metadata" => {

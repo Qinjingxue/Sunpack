@@ -61,6 +61,23 @@ def test_direct_input_keeps_filename_separate_from_disguised_format(tmp_path):
     assert default_output_dir_for_task(task) == str(tmp_path / "release.v2")
 
 
+def test_windows_special_stems_stay_inside_output_parent(tmp_path):
+    # Existing dotted-name tests miss names made special by suffix removal.
+    # Exercise the real logical-name path and explicit/fallback task names in
+    # one inexpensive check, including disguised and split inputs.
+    root = tmp_path / "outputs"
+    root.mkdir()
+    for filename in ("..rar.zip", "...zip.001", "aux.tar.gz", "nul.zip.txt", "..part1.rar"):
+        task = direct_file_task(str(tmp_path / filename))
+        for logical_name in (task.logical_name, ".", "..", "", "CON"):
+            task = make_archive_task(tmp_path / filename, logical_name=logical_name)
+            for config, parent in (({}, tmp_path), ({"root": str(root), "fixed_root": True}, root)):
+                output = default_output_dir_for_task(task, config)
+                from pathlib import Path
+                assert Path(output).parent == parent
+                assert Path(output).name not in {"", ".", "..", "CON", "aux", "nul"}
+
+
 def test_directory_numbering_appends_after_dotted_filename(tmp_path):
     archive = tmp_path / "release.v2.zip"
     (tmp_path / "release.v2").mkdir()

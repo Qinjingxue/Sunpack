@@ -842,11 +842,11 @@ def test_watch_filters_reserved_flatten_work_and_persists_final_identity(tmp_pat
         async with PipelineEngine(config) as engine:
             watcher = module.WatchScheduler(config, [str(root)], state_path=str(tmp_path / "state.snapshot"),
                 root_entries=[WatchRootEntry(str(root), recursive=True)], pipeline_engine=engine)
-            def protected_flatten(path, *, work_path=None):
+            def protected_flatten(path, *, work_path=None, **kwargs):
                 assert work_path is not None
                 assert watcher.should_ignore_event_path(str(Path(work_path) / "nested.zip"))
                 checked.append(work_path)
-                return original(path, work_path=work_path)
+                return original(path, work_path=work_path, **kwargs)
             monkeypatch.setattr(flatten, "_native_flatten_single_branch_directories", protected_flatten)
             try:
                 summary = (await engine.run([str(archive)])).summary
