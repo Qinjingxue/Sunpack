@@ -103,3 +103,4 @@ native/toast_host/build-*/
 /tools-arm64/
 runtime-v2-0000000000000000.state.events.json.store/
 runtime-v2-0000000000000000.state.events.json
+SPE/

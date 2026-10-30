@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from itertools import chain
 import json
 import logging
 import ntpath
@@ -9,7 +8,7 @@ import uuid
 from threading import RLock
 from pathlib import Path
 from types import MappingProxyType
-from sunpack_native import FastHash128, file_generation_tokens, read_shared_utf8_text
+from sunpack_native import file_generation_tokens, read_shared_utf8_text
 
 from sunpack.core.platform.windows.file_mutex import file_mutex
 from sunpack.core.support.resource_lifecycle import open_service_file, write_task_text
@@ -155,15 +154,7 @@ def _parse_document(text: str, previous: PasswordSnapshot = EMPTY_PASSWORD_SNAPS
         scoped[scope] = old if old == values else values
     if globals_ == previous.global_passwords and scoped == previous.scoped_index:
         return previous, history, history_bounds
-    # Incremental semantic digest avoids serializing another copy of the document.
-    digest = FastHash128()
-    for scope, values in chain((("", globals_),), sorted(scoped.items())):
-        digest.update(len(values).to_bytes(8, "little"))
-        for value in chain((scope,), values):
-            data = value.encode("utf-8")
-            digest.update(len(data).to_bytes(8, "little"))
-            digest.update(data)
-    return PasswordSnapshot(globals_, MappingProxyType(scoped), digest.hexdigest()), history, history_bounds
+    return PasswordSnapshot(globals_, MappingProxyType(scoped), previous=previous), history, history_bounds
 
 
 def read_builtin_password_file(path: str | Path, previous=EMPTY_PASSWORD_SNAPSHOT) -> PasswordSnapshot:

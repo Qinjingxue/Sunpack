@@ -1,10 +1,13 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import InitVar, dataclass, field
+from itertools import chain
 from threading import RLock
 from collections.abc import Mapping
 from types import MappingProxyType
 import os
+
+from sunpack_native import FastHash128
 
 from sunpack.core.support.path_keys import absolute_path_key
 from sunpack.core.passwords.internal.lists import dedupe_passwords
@@ -21,12 +24,40 @@ def password_scope_key(path: str) -> str:
 class PasswordSnapshot:
     global_passwords: tuple[str, ...] = ()
     scoped_index: Mapping[str, tuple[str, ...]] = field(default_factory=lambda: MappingProxyType({}))
-    signature: str = ""
+    previous: InitVar[PasswordSnapshot | None] = None
+    signature: str = field(init=False)
+    _bucket_signatures: Mapping[str, str] = field(init=False, repr=False, compare=False)
 
-    def __post_init__(self):
+    def __post_init__(self, previous):
         object.__setattr__(self, "global_passwords", tuple(self.global_passwords))
         if not isinstance(self.scoped_index, MappingProxyType):
             object.__setattr__(self, "scoped_index", MappingProxyType({k: tuple(v) for k, v in self.scoped_index.items()}))
+        # One compact digest per configured bucket; unchanged tuples already
+        # shared by the parser also reuse their digest on a scoped edit.
+        buckets = {}
+        digest = FastHash128()
+        for scope in chain(("",), sorted(self.scoped_index)):
+            values = self.scoped_index[scope] if scope else self.global_passwords
+            old = None
+            if previous is not None:
+                old = previous.scoped_index.get(scope) if scope else previous.global_passwords
+            if values is old:
+                signature = previous._bucket_signatures[scope]
+            else:
+                bucket = FastHash128()
+                bucket.update(len(values).to_bytes(8, "little"))
+                for value in values:
+                    data = value.encode("utf-8")
+                    bucket.update(len(data).to_bytes(8, "little"))
+                    bucket.update(data)
+                signature = bucket.hexdigest()
+            buckets[scope] = signature
+            data = scope.encode("utf-8")
+            digest.update(len(data).to_bytes(8, "little"))
+            digest.update(data)
+            digest.update(signature.encode("ascii"))
+        object.__setattr__(self, "_bucket_signatures", MappingProxyType(buckets))
+        object.__setattr__(self, "signature", digest.hexdigest())
 
     def __deepcopy__(self, memo):
         return self
@@ -34,9 +65,25 @@ class PasswordSnapshot:
     def scoped_passwords(self, scope_path: str):
         if not scope_path or not self.scoped_index:
             return
+        for key in self._scope_keys(scope_path):
+            yield from self.scoped_index.get(key, ())
+
+    def scope_signature(self, scope_path: str) -> str:
+        """Fingerprint applicable buckets in O(directory depth), without copying passwords."""
+        digest = FastHash128()
+        digest.update(self._bucket_signatures[""].encode("ascii"))
+        if scope_path and self.scoped_index:
+            for key in self._scope_keys(scope_path):
+                signature = self._bucket_signatures.get(key)
+                if signature is not None:
+                    digest.update(signature.encode("ascii"))
+        return digest.hexdigest()
+
+    @staticmethod
+    def _scope_keys(scope_path: str):
         key = absolute_path_key(scope_path)
         while True:
-            yield from self.scoped_index.get(key.rstrip("\\/"), ())
+            yield key.rstrip("\\/")
             parent = os.path.dirname(key)
             if parent == key:
                 break

@@ -46,6 +46,13 @@ def test_snapshot_literal_values_scopes_and_semantic_reuse(tmp_path):
     assert "secret" not in store.candidates("D:/Work")
     root = builtin._parse_document('{"passwords":[{"value":"root","scopes":["//server/share"]}]}')[0]
     assert PasswordStore.from_sources(password_snapshot=root).candidates("//server/share/child") == ["root"]
+    assert root.scope_signature("//SERVER/share/child") != EMPTY_PASSWORD_SNAPSHOT.scope_signature("//server/share/child")
+    seed(path, [special, "global"], [("secret", ["D:/Work", "//server/share/Files"]), ("new-near", ["D:/Work/Child"])])
+    scoped_edit = builtin.read_builtin_password_file(path, first)
+    for scope in ("D:/Work", "D:/Workspace", "//SERVER/share/files/child", "//server/share/FilesOther"):
+        assert scoped_edit.scope_signature(scope) == first.scope_signature(scope)
+    assert scoped_edit.scope_signature("d:/WORK/CHILD/deep") != first.scope_signature("D:/Work/Child/deep")
+    assert second.scope_signature("E:/Private") != first.scope_signature("E:/Private")
 
 
 def test_file_events_keep_last_valid_snapshot_clear_deletion_and_never_restore_defaults(tmp_path, monkeypatch):

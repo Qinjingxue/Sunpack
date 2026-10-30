@@ -1,5 +1,6 @@
 import asyncio
 import os
+import time
 from dataclasses import replace
 from types import SimpleNamespace
 import pytest
@@ -19,6 +20,7 @@ from sunpack.runtime.watch.scheduler import WatchScheduler, _ActivePipelineReque
 from sunpack.runtime.watch.state import WatchStateStore
 from tests.helpers.config_factory import make_config
 from tests.helpers.fake_pipeline_engine import FakePipelineEngine
+from tests.helpers.passwords import write_password_json
 
 
 class _Sink:
@@ -57,7 +59,7 @@ def _candidate(path):
     return WatchCandidate(str(path), stat.st_size, stat.st_mtime)
 
 
-def _watcher(tmp_path, monkeypatch, *, deep_detect=False):
+def _watcher(tmp_path, monkeypatch, *, deep_detect=False, recursive=False):
     root = tmp_path / "in"
     output = tmp_path / "out"
     root.mkdir()
@@ -68,7 +70,7 @@ def _watcher(tmp_path, monkeypatch, *, deep_detect=False):
         make_config({"watch": {"clipboard_monitor_enabled": False, "password_retry_debounce_seconds": 0}}),
         [str(root)],
         output_roots={str(root): str(output)},
-        root_entries=[WatchRootEntry(str(root), str(output), deep_detect)],
+        root_entries=[WatchRootEntry(str(root), str(output), deep_detect, recursive=recursive)],
         state_path=str(tmp_path / "state.snapshot"),
         cold_start_seconds=0,
         pipeline_engine=FakePipelineEngine(_Runner),
@@ -91,9 +93,95 @@ async def _complete(watcher, candidate, response):
         candidate=candidate,
         task=asyncio.create_task(done()),
         password_generation=watcher.state.password_generation,
+        password_signature=watcher._password_signature_for_scope(os.path.dirname(candidate.path)),
         source_input_root=watcher._source_input_root_for(candidate.path),
     )
     return await watcher._complete_candidate(request)
+
+
+@pytest.mark.parametrize("timing", ["after_failure", "before_failure", "restart"])
+@pytest.mark.parametrize("change", ["unrelated", "original", "ancestor", "global", "removed"])
+def test_password_updates_retry_only_applicable_scopes(tmp_path, monkeypatch, timing, change):
+    # Existing retry tests cannot detect scope leakage, especially for a nested
+    # failure whose physical directory differs from its inherited input scope.
+    # Removing this matrix loses isolation across live, late and offline updates.
+    # Tiny fake archives and the existing WAL keep those distinct cases cheap.
+    async def scenario():
+        watcher, root, output, _sink = _watcher(tmp_path, monkeypatch, recursive=True)
+        try:
+            original, sibling = root / "A", root / "AB"
+            original.mkdir()
+            sibling.mkdir()
+            outer, inner, other = original / "outer.carrier", sibling / "inner.opaque", sibling / "other.002"
+            for path in (outer, inner, other):
+                path.write_text("archive")
+            password_file = watcher._password_file_source.path
+            scopes = [("a-old", [str(original)]), ("b-old", [str(sibling)])]
+            write_password_json(password_file, ["global-old"], scopes=scopes)
+            watcher._publish_password_update()
+            failure = FailureInfo(FailureKind.WRONG_PASSWORD, "password_resolution", "wrong password")
+
+            async def run(targets, **kwargs):
+                path = targets[0].path
+                if path == str(outer):
+                    return _response(
+                        TargetRunResult(path, OutcomeKind.COMPLETE_SUCCESS),
+                        TargetRunResult(str(inner), OutcomeKind.FAILURE, failure=failure),
+                    )
+                return _response(TargetRunResult(path, OutcomeKind.FAILURE, failure=failure))
+
+            watcher.pipeline_engine.run = run
+            requests = [await watcher._submit_candidate(_candidate(path)) for path in (other, outer)]
+            if timing != "before_failure":
+                for request in requests:
+                    await watcher._complete_candidate(request)
+                assert watcher.state.latest_entry_for_path(str(inner)).password_scope_dir == str(original)
+            if timing == "restart":
+                await watcher.aclose()
+
+            if change in {"original", "removed"}:
+                scopes = [scopes[1], *([("a-new", [str(original)])] if change == "original" else [])]
+            elif change == "ancestor":
+                scopes.append(("parent-new", [str(root)]))
+            elif change == "unrelated":
+                scopes.extend([("child-new", [str(original / "child")]), ("output-new", [str(output)])])
+            write_password_json(password_file, ["global-new" if change == "global" else "global-old"], scopes=scopes)
+            if timing == "restart":
+                watcher = WatchScheduler(
+                    dict(watcher.config), [str(root)], output_roots={str(root): str(output)},
+                    root_entries=[WatchRootEntry(str(root), str(output), recursive=True)],
+                    state_path=str(tmp_path / "state.snapshot"), cold_start_seconds=0,
+                    pipeline_engine=FakePipelineEngine(_Runner),
+                )
+                watcher.pipeline_engine.run = run
+                watcher._reconcile_persisted_blockers()
+            else:
+                watcher._publish_password_update()
+            # Consume the update before old requests finish to expose lost or
+            # unrelated completion retries, without sleeps or weaker concurrency.
+            watcher._process_password_retries(time.monotonic())
+            expected = ({str(inner), str(other)} if change in {"ancestor", "global"}
+                        else {str(inner)} if change in {"original", "removed"} else set())
+            if timing == "before_failure":
+                for request in requests:
+                    await watcher._complete_candidate(request)
+                    if request.candidate.path == str(other) and str(other) not in expected:
+                        assert watcher._password_retry_at is None
+                assert (watcher._password_retry_at is not None) == bool(expected)
+                watcher._process_password_retries(time.monotonic())
+            assert set(watcher._pending) == expected
+            assert len(watcher.state.failed_password_entries()) == 2
+            for candidate in watcher._pop_ready(time.monotonic()):
+                request = await watcher._submit_candidate(candidate)
+                assert request.password_scope_dir == str(original if candidate.path == str(inner) else sibling)
+                await watcher._complete_candidate(request)
+            watcher._mark_all_password_failures_dirty()
+            watcher._process_password_retries(time.monotonic())
+            assert not watcher._pending
+        finally:
+            await watcher.aclose()
+
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize("promoted", [False, True])
@@ -278,6 +366,7 @@ def test_late_failure_cannot_overwrite_unchanged_success_but_new_failure_can(
         old_request = _ActivePipelineRequest(
             "old-request", _candidate(second), asyncio.create_task(old_pipeline()),
             password_generation=watcher.state.password_generation,
+            password_signature=watcher._password_signature_for_scope(str(root)),
             source_input_root=str(root),
         )
         paths = [str(first), str(second)]
@@ -308,6 +397,7 @@ def test_late_failure_cannot_overwrite_unchanged_success_but_new_failure_can(
         new_request = _ActivePipelineRequest(
             "new-request", _candidate(second), asyncio.create_task(new_pipeline()),
             password_generation=watcher.state.password_generation,
+            password_signature=watcher._password_signature_for_scope(str(root)),
             source_input_root=str(root), deep_detect=invalidation == "deep_detect",
         )
         assert (await watcher._complete_candidate(new_request)).failed == 1
@@ -590,6 +680,7 @@ def test_missing_file_exception_is_suppressed_only_for_departed_input(tmp_path, 
 
         request = _ActivePipelineRequest(notification_id="request", candidate=candidate,
             task=asyncio.create_task(failed()), password_generation=watcher.state.password_generation,
+            password_signature=watcher._password_signature_for_scope(str(root)),
             source_input_root=str(root))
         if departed:
             result = await watcher._complete_candidate(request)

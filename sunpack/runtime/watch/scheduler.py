@@ -122,6 +122,7 @@ class _ActivePipelineRequest:
     candidate: WatchCandidate
     task: asyncio.Task
     password_generation: int
+    password_signature: str
     registry_owner: str = ""
     source_input_root: str = ""
     deep_detect: bool = False
@@ -342,6 +343,9 @@ class WatchScheduler:
         )
         self.password_retry_debounce_seconds = max(0.0, float(watch_config["password_retry_debounce_seconds"]))
         self._configured_user_passwords = dedupe_passwords(list(config.get("user_passwords") or []))
+        self._user_password_signature = fast_hash128(json.dumps(
+            self._configured_user_passwords, ensure_ascii=False, separators=(",", ":"),
+        ).encode("utf-8"))
         self._password_file_source = password_file_source()
         self.builtin_password_file = os.path.abspath(str(builtin_passwords_module.builtin_password_path()))
         self._password_source_signature = self._refresh_password_sources()
@@ -878,7 +882,7 @@ class WatchScheduler:
             if not os.path.exists(entry.path):
                 continue
             if entry.status == "failed_password":
-                if entry.password_generation < self.state.password_generation:
+                if self._password_failure_needs_retry(entry):
                     self.enqueue(
                         entry.path,
                         force=True,
@@ -2075,7 +2079,7 @@ class WatchScheduler:
                 return
             self._password_retry_at = None
         for entry in self.state.failed_password_entries():
-            if (entry.password_generation < self.state.password_generation
+            if (self._password_failure_needs_retry(entry)
                     and os.path.exists(entry.path)):
                 self.log.write("retry_password_failure", path=entry.path)
                 self.enqueue(entry.path, force=True, event_type="password_retry", _password_retry_snapshot=entry)
@@ -2115,6 +2119,7 @@ class WatchScheduler:
             elif pending is not None:
                 scope_dir = str(pending.password_scope_dir or "")
             run_config["password_scope_dir"] = scope_dir or os.path.dirname(candidate.path)
+            password_signature = self._password_signature_for_scope(run_config["password_scope_dir"])
         output_root = self._output_root_for(candidate.path)
         run_config["watch_owner_path"] = candidate.path
         run_config["watch_deep_detect"] = options.force_scan
@@ -2180,6 +2185,7 @@ class WatchScheduler:
             candidate=candidate,
             task=task,
             password_generation=password_generation,
+            password_signature=password_signature,
             registry_owner=notification_id if host is not None else "",
             source_input_root=source_input_root,
             deep_detect=options.force_scan,
@@ -2416,6 +2422,8 @@ class WatchScheduler:
                 password_scope_dir=scope_dir if password else "",
                 source_input_root=self._source_input_root_for(retry_path),
             )
+            if password:
+                payload["password_signature"] = request.password_signature
             payload["discovery_scope"] = failure.details.get("discovery_scope") or (
                 self.scopes[path_key(request.source_input_root)].to_record()
                 if path_key(request.source_input_root) in self.scopes else DiscoveryScope(os.path.dirname(retry_path)).to_record())
@@ -2433,7 +2441,7 @@ class WatchScheduler:
                 )
                 retry_password = (
                     password and not missing
-                    and request.password_generation < self.state.password_generation
+                    and request.password_signature != self._password_signature_for_scope(scope_dir)
                 )
             if not published:
                 retired_failures.append(failure)
@@ -2678,7 +2686,20 @@ class WatchScheduler:
         self.config["user_passwords"] = self._configured_user_passwords
         self.config.pop("builtin_passwords", None)
         self.config["password_snapshot"] = snapshot
-        return _password_source_signature(self._configured_user_passwords, snapshot.signature)
+        return _password_source_signature(self._user_password_signature, snapshot.signature)
+
+    def _password_signature_for_scope(self, scope_dir: str) -> str:
+        return _password_source_signature(
+            self._user_password_signature, self.config["password_snapshot"].scope_signature(scope_dir),
+        )
+
+    def _password_failure_needs_retry(self, entry: WatchStateEntry) -> bool:
+        signature = entry.failure_payload.get("password_signature")
+        if signature is None:
+            # Pre-upgrade blockers have no scoped snapshot. Their next retry
+            # records one through the normal completion path.
+            return entry.password_generation < self.state.password_generation
+        return signature != self._password_signature_for_scope(entry.password_scope_dir)
 
     def _mark_all_password_failures_dirty(self) -> None:
         if not self.state.has_entry_status("failed_password"):
@@ -2889,15 +2910,10 @@ def _summary_outcome_kind(summary: RunSummary, target_result: TargetRunResult | 
 
 
 def _password_source_signature(
-    user_passwords: list[str],
+    user_password_signature: str,
     snapshot_signature: str,
 ) -> str:
-    payload = json.dumps(
-        [user_passwords, snapshot_signature],
-        ensure_ascii=False,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return fast_hash128(payload)
+    return fast_hash128((user_password_signature + snapshot_signature).encode("ascii"))
 
 
 def _failure_to_dict(failure: FailureInfo | None) -> dict:
