@@ -47,12 +47,12 @@ def test_retry_checks_completed_final_family_after_acquiring_lease(tmp_path):
             extents=[InputExtent(str(path)) for path in parts],
         ))
         with pytest.raises(_CompletedWatchOutput) as stopped:
-            await runtime._ensure_task_lease(task)
+            await runtime._ensure_task_lease(task, cancellation=None)
         assert stopped.value.output_dir == str(output)
         await registry.release("retry")
         # A changed physical member invalidates the entire completed generation.
         parts[1].write_text("changed part")
-        await runtime._ensure_task_lease(task)
+        await runtime._ensure_task_lease(task, cancellation=None)
         await registry.release("retry")
 
     asyncio.run(scenario())

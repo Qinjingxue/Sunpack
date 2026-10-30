@@ -146,7 +146,7 @@ def test_watch_claim_publishes_each_confirmed_task_and_updated_volume_members(tm
                 paths[0], open_mode="concat_ranges", logical_name="movie.7z",
                 extents=[InputExtent(path) for path in paths],
             ))
-            await runtime._ensure_task_lease(first)
+            await runtime._ensure_task_lease(first, cancellation=CancellationToken())
             assert claims[-1]["groups"] == [{"path": paths[0], "name": "movie.7z", "members": paths, "multipart": True}]
         finally:
             await broker.close()

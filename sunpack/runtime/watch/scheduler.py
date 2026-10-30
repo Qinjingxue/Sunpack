@@ -131,32 +131,63 @@ class _ActivePipelineRequest:
     source_groups: dict[str, dict] = field(default_factory=dict)
     source_observations: dict = field(default_factory=dict)
     cancellation: object = None
+    cancellation_pending: asyncio.Future | None = None
     interruption_cleanup_failed: bool = False
 
 
 class WatchScheduler:
-    def cancel_requests(self, request_ids) -> None:
+    async def cancel_requests(self, request_ids) -> None:
         wanted = set(request_ids)
         with self._lock:
             requests = [request for request in self._inflight_requests
                         if request.notification_id in wanted and request.cancellation is not None
-                        and not request.cancellation.cancelled]
-        try:
+                        and not request.cancellation.cancelled and request.cancellation_pending is None]
+            if not requests:
+                return
+            committed = asyncio.get_running_loop().create_future()
             for request in requests:
-                # Persist user intent before signalling; restart recovery cleans
-                # active output but must never resume this input generation.
-                for path in dedupe_normalized_paths((request.candidate.path, *request.source_paths, *request.source_observations)):
-                    observed = (request.candidate if path_key(path) == path_key(request.candidate.path)
-                                else request.source_observations.get(path_key(path)))
-                    if observed is None:
-                        observed = _candidate_for_event_path(path)
-                    if observed is not None:
-                        self.state.mark(path, observed.size, observed.mtime, file_id=observed.file_id,
-                                        change_usn=observed.change_usn, status="interrupted")
+                request.cancellation_pending = committed
+        tickets = []
+        try:
+            try:
+                with self.state.defer_journal_waits() as tickets:
+                    for request in requests:
+                        # Persist user intent before signalling; restart recovery
+                        # must never resume this input generation. Defer all waits
+                        # so the writer can batch this group off the event loop.
+                        for path in dedupe_normalized_paths((request.candidate.path, *request.source_paths, *request.source_observations)):
+                            observed = (request.candidate if path_key(path) == path_key(request.candidate.path)
+                                        else request.source_observations.get(path_key(path)))
+                            if observed is None:
+                                observed = _candidate_for_event_path(path)
+                            if observed is not None:
+                                self.state.mark(path, observed.size, observed.mtime, file_id=observed.file_id,
+                                                change_usn=observed.change_usn, status="interrupted")
+            finally:
+                await self._wait_for_journal(tickets, stage="watch_cancel", file_id="watch")
         finally:
             # A full state volume must not prevent native writers being stopped.
             for request in requests:
                 request.cancellation.cancel()
+                request.cancellation_pending = None
+            committed.set_result(None)
+
+    async def _wait_for_journal(self, tickets, *, stage, file_id):
+        if not tickets:
+            return
+        waiter = asyncio.create_task(self.pipeline_engine.work_broker.run(
+            stage, file_id, self.state.wait_for_journal,
+            tickets, request_id="watch", origin="watch",
+        ))
+        cancelled = False
+        while not waiter.done():
+            try:
+                await asyncio.shield(waiter)
+            except asyncio.CancelledError:
+                cancelled = True
+        waiter.result()
+        if cancelled:
+            raise asyncio.CancelledError
 
     def __init__(
         self,
@@ -2239,26 +2270,18 @@ class WatchScheduler:
             response = await request.task
         except FileNotFoundError as exc:
             error = exc
+        # Completion must not overtake a pending durable cancellation decision.
+        if request.cancellation_pending is not None:
+            await asyncio.shield(request.cancellation_pending)
         tickets, notifications = [], []
         try:
             with self.state.defer_journal_waits() as tickets:
                 result = self._project_completion(request, response, error,
                     lambda *args: notifications.append(args))
         finally:
-            if tickets:
-                waiter = asyncio.create_task(self.pipeline_engine.work_broker.run(
-                    "watch_completion", request.candidate.path, self.state.wait_for_journal,
-                    tickets, request_id="watch", origin="watch",
-                ))
-                cancelled = False
-                while not waiter.done():
-                    try:
-                        await asyncio.shield(waiter)
-                    except asyncio.CancelledError:
-                        cancelled = True
-                waiter.result()
-                if cancelled:
-                    raise asyncio.CancelledError
+            await self._wait_for_journal(
+                tickets, stage="watch_completion", file_id=request.candidate.path,
+            )
         for notification in notifications:
             self._notify(*notification)
         return result

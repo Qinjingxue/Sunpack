@@ -1173,7 +1173,7 @@ async def _execute_streaming_request_async(
         host = runtime_host()
         if host is None:
             return 1
-        outcome = host.cancel_watch_batch(argv[1])
+        outcome = await host.cancel_watch_batch(argv[1])
         return 0 if outcome in {"accepted", "already_finished"} else 1
 
     stdout = _AsyncConnectionTextStream(

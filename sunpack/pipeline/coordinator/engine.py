@@ -471,15 +471,24 @@ class _PathLeaseRegistry:
         return tuple(prepared.values())
 
     async def acquire(self, owner: str, paths: Iterable[str], *, lease_id: object = None,
-                      cancellation: CancellationToken | None = None) -> tuple[_LeasePath, ...]:
+                      cancellation: CancellationToken | None = None,
+                      absent_paths: Iterable[str] = ()) -> tuple[_LeasePath, ...]:
         paths = tuple(paths)
-        prepared = self._snapshot_paths(paths, refresh=False)
+        absent_keys = frozenset(path_key(os.path.abspath(os.path.normpath(path))) for path in absent_paths)
+        prepared = self._snapshot_paths(paths, refresh=bool(absent_keys))
         # The caller has finished its previous extraction/verification attempt.
         # Other jobs in this request keep their pins throughout an upgrade.
         first = True
         while True:
             if cancellation is not None:
                 cancellation.raise_if_cancelled()
+            # Publication cannot replace an existing input. Reject the whole
+            # group before waiting on its owner, which may itself be waiting
+            # for one of this request's pinned ancestors. Recheck after wakes.
+            if absent_keys:
+                for path in prepared:
+                    if path.key in absent_keys and not path.missing:
+                        raise FileExistsError(f"destination exists or is inaccessible: {path.path}")
             async with self._lock:
                 if first:
                     self._unpin(owner, lease_id)
@@ -1546,7 +1555,9 @@ class _RequestRuntime:
                 broker=broker,
                 cancellation=cancellation,
                 missing_volume_retry=self._resolve_missing_volume_once,
-                ensure_input_lease=lambda current: self._ensure_task_lease(current, depth=depth),
+                ensure_input_lease=lambda current: self._ensure_task_lease(
+                    current, depth=depth, cancellation=cancellation,
+                ),
             )
             watch_version = task.runtime.get("source_generation", watch_version)
             retain_watch_lease = bool(watch_version and outcome.outcome_kind == OutcomeKind.COMPLETE_SUCCESS)
@@ -1809,14 +1820,6 @@ class _RequestRuntime:
         # Watch admission must claim publication paths before any file appears;
         # leases additionally protect requests already admitted by Watch.
         destinations = [os.path.join(destination, os.path.basename(path)) for path in sources]
-        await self.path_leases.acquire(
-            self.submission.request_id, [*sources, *destinations], lease_id=id(task),
-        )
-        if self.submission.origin == "watch":
-            self._report_progress(task, {
-                "type": "semantic", "event": "task_sources_claimed",
-                "source_paths": (*sources, *destinations),
-            })
 
         def promote():
             def prepare():
@@ -1836,6 +1839,15 @@ class _RequestRuntime:
 
         promoted = False
         try:
+            await self.path_leases.acquire(
+                self.submission.request_id, [*sources, *destinations], lease_id=id(task),
+                cancellation=cancellation, absent_paths=destinations,
+            )
+            if self.submission.origin == "watch":
+                self._report_progress(task, {
+                    "type": "semantic", "event": "task_sources_claimed",
+                    "source_paths": (*sources, *destinations),
+                })
             moved = await broker.run(
                 "postprocess", task.key or task.main_path, promote,
                 request_id=self.submission.request_id, cancellation=cancellation,
@@ -1925,7 +1937,7 @@ class _RequestRuntime:
         return result
 
     async def _ensure_task_lease(self, task, *, depth: int = 1,
-                               cancellation: CancellationToken | None = None) -> None:
+                               cancellation: CancellationToken | None) -> None:
         self.source_cleanup.register([task])
         paths = task.all_parts or [task.main_path]
         if not task.runtime.get("missing_input_paths") and self.path_leases.holds_lease(

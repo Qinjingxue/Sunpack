@@ -22,7 +22,7 @@ def _configured_runtime_process_mode(config: dict) -> str:
 class RuntimeHost:
     """Own the one engine and optional watch lifecycle for one installed executable."""
 
-    def cancel_watch_batch(self, batch_id: str) -> Literal["accepted", "already_finished", "unavailable"]:
+    async def cancel_watch_batch(self, batch_id: str) -> Literal["accepted", "already_finished", "unavailable"]:
         service = self._watch_service
         if service is None or service.scheduler is None or service.toast_coordinator is None:
             return "unavailable"
@@ -31,7 +31,7 @@ class RuntimeHost:
             return "unavailable"
         if not requests:
             return "already_finished"
-        service.scheduler.cancel_requests(requests)
+        await service.scheduler.cancel_requests(requests)
         return "accepted"
 
     def __init__(

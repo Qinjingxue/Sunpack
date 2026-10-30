@@ -40,6 +40,11 @@ def test_task_scope_releases_resources_in_reverse_creation_order(tmp_path):
     scope = TaskResourceScope("task-lifo", files=(path,))
 
     with scope.activate():
+        # Individual close must retire the scope's index immediately; a final
+        # close alone cannot expose unbounded history during a large request.
+        early = register_current_task_resource(object(), (path,), lambda: released.append("early"))
+        early.close()
+        assert not scope._resource_ids
         register_current_task_resource(
             object(),
             (path,),
@@ -56,7 +61,8 @@ def test_task_scope_releases_resources_in_reverse_creation_order(tmp_path):
     report = scope.close()
 
     assert report.released == 2
-    assert released == ["second", "first"]
+    assert released == ["early", "second", "first"]
+    assert not scope._resource_ids
     assert resource_snapshot((path,)) == ()
 
 

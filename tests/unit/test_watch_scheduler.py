@@ -1142,24 +1142,68 @@ class _DeferredPipelineEngine:
         return await handle.future
 
 
-def test_cancelled_input_generation_survives_restart_until_content_changes(tmp_path):
+def test_cancelled_input_generation_survives_restart_until_content_changes(tmp_path, monkeypatch):
     # Existing same-process observation tests cannot catch initial-scan or
     # recovery resurrecting user-cancelled work after the catalog is rebuilt.
     archive = tmp_path / "cancelled.blob"
     _write_zip(archive)
+    sibling = tmp_path / "cancelled.blob.002"
+    sibling.write_text("volume")
+    from sunpack.pipeline.coordinator.async_work import AsyncWorkBroker
+    broker = AsyncWorkBroker(thread_capacity=2)
     engine = _DeferredPipelineEngine()
+    engine.work_broker = broker
     watcher = _watcher(tmp_path, cold_start_seconds=0, pipeline_engine=engine)
     try:
         watcher.enqueue(str(archive))
         _await(watcher.run_once())
         request = watcher._inflight_requests[0]
-        watcher.cancel_requests([request.notification_id])
+        request.source_paths = (str(archive), str(sibling))
+
+        async def stop_with_slow_journal():
+            # Restart checks alone cannot detect blocking the shared loop or
+            # signalling stop before the whole source group's WAL is durable.
+            entered, release = asyncio.Event(), threading.Event()
+            loop = asyncio.get_running_loop()
+            wait_for_journal = watcher.state.wait_for_journal
+
+            def hold_journal(tickets):
+                assert len(tickets) == 2
+                loop.call_soon_threadsafe(entered.set)
+                if not release.wait(3):
+                    raise AssertionError("event loop blocked by cancellation WAL")
+                wait_for_journal(tickets)
+
+            monkeypatch.setattr(watcher.state, "wait_for_journal", hold_journal)
+            stopping = asyncio.create_task(watcher.cancel_requests([request.notification_id]))
+            try:
+                await asyncio.wait_for(entered.wait(), 3)
+                assert not request.cancellation.cancelled
+                assert watcher.state.latest_entry_for_path(str(sibling)).status == "interrupted"
+                monkeypatch.setattr(watcher.state, "wait_for_journal", wait_for_journal)
+                engine.handles[0].future.set_result(PipelineResponse("cancelled", RunSummary(), interrupted=True))
+                finishing = asyncio.create_task(watcher.run_once())
+                await asyncio.sleep(0)
+                assert not finishing.done()
+                stopping.cancel()
+                await asyncio.sleep(0)
+                assert not stopping.done() and not request.cancellation.cancelled
+                release.set()
+                with pytest.raises(asyncio.CancelledError):
+                    await stopping
+                await finishing
+                assert request.cancellation_pending is None
+                assert watcher.state._journal_waiters == 0
+            finally:
+                release.set()
+                await asyncio.gather(stopping, return_exceptions=True)
+
+        _await(stop_with_slow_journal())
         assert request.cancellation.cancelled
-        engine.handles[0].future.set_result(PipelineResponse("cancelled", RunSummary(), interrupted=True))
-        _await(watcher.run_once())
         assert watcher.state.latest_entry_for_path(str(archive)).status == "interrupted"
     finally:
         _await(watcher.aclose())
+        _await(broker.close())
 
     restarted = _watcher(tmp_path, cold_start_seconds=0, pipeline_engine=_DeferredPipelineEngine())
     try:

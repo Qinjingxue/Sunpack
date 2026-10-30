@@ -382,11 +382,11 @@ def test_retry_lease_upgrade_releases_idle_partial_families(tmp_path):
             source_cleanup=SimpleNamespace(register=lambda _tasks: None),
         ) for owner in ("first", "second")]
         for runtime, task in zip(runtimes, tasks):
-            await _RequestRuntime._ensure_task_lease(runtime, task)
+            await _RequestRuntime._ensure_task_lease(runtime, task, cancellation=None)
             task.all_parts = family
 
         async def upgrade(runtime, task):
-            await _RequestRuntime._ensure_task_lease(runtime, task)
+            await _RequestRuntime._ensure_task_lease(runtime, task, cancellation=None)
             await registry.release_lease(runtime.submission.request_id, id(task))
 
         await asyncio.wait_for(asyncio.gather(*(

@@ -12,11 +12,14 @@ from sunpack.core.contracts.extraction import ExtractionResult
 from sunpack.core.contracts.failures import FailureInfo, FailureKind
 from sunpack.core.contracts.tasks import ArchiveTask
 from sunpack.pipeline.coordinator.engine import PipelineEngine
+from sunpack.pipeline.coordinator.async_work import CancellationToken
 from tests.helpers.detection_config import with_detection_pipeline
 
 
-@pytest.mark.parametrize("concurrent", [False, True])
-def test_real_split_archive_retry_updates_cleanup_and_avoids_lease_cycle(tmp_path, concurrent):
+@pytest.mark.parametrize("concurrent,cancel_origin", [
+    (False, None), (True, None), (False, "foreground"), (False, "watch"),
+])
+def test_real_split_archive_retry_updates_cleanup_and_avoids_lease_cycle(tmp_path, concurrent, cancel_origin):
     sevenzip = Path(__file__).resolve().parents[2] / "tools" / "7z.exe"
     payload = tmp_path / "payload.txt"
     payload.write_text("volume retry payload\n" * 70, encoding="utf-8")
@@ -29,7 +32,7 @@ def test_real_split_archive_retry_updates_cleanup_and_avoids_lease_cycle(tmp_pat
     config = normalize_config(with_detection_pipeline({
         "recursive_extract": "1",
         "output": {"root": str(tmp_path / "out")},
-        "post_extract": {"archive_cleanup_mode": "k" if concurrent else "d", "flatten_single_directory": False},
+        "post_extract": {"archive_cleanup_mode": "k" if concurrent or cancel_origin else "d", "flatten_single_directory": False},
     }))
 
     def task_for(paths):
@@ -71,12 +74,45 @@ def test_real_split_archive_retry_updates_cleanup_and_avoids_lease_cycle(tmp_pat
 
     async def run():
         async with engine:
+            if cancel_origin:
+                # Admission-stop tests do not exercise the retry callback after
+                # it expands the physical family. Cancel before its owner exits.
+                registry = engine._path_leases
+                await registry.acquire("holder", parts[1:])
+                waiting = asyncio.Event()
+                register = registry._register_waiter
+
+                def observe(blockers):
+                    future = register(blockers)
+                    waiting.set()
+                    return future
+
+                registry._register_waiter = observe
+                token = CancellationToken()
+                request = asyncio.create_task(engine.run(
+                    parts[:1], direct=True, origin=cancel_origin, cancellation=token,
+                ))
+                try:
+                    await asyncio.wait_for(waiting.wait(), 5)
+                    token.cancel()
+                    response = await asyncio.wait_for(asyncio.shield(request), 5)
+                    assert response.interrupted and not token._callbacks
+                    assert registry._owned == {"holder": {parts[1]}}
+                    assert not registry._waiter_blockers
+                    assert all(Path(path).exists() for path in parts)
+                    return [response]
+                finally:
+                    await registry.release("holder")
+                    await asyncio.gather(request, return_exceptions=True)
             targets = parts if concurrent else parts[:1]
             return await asyncio.wait_for(asyncio.gather(*(
                 engine.run([path], direct=True, origin="watch") for path in targets
             )), timeout=15)
 
     responses = asyncio.run(run())
+    if cancel_origin:
+        assert not engine._path_leases._pins
+        return
     for response in responses:
         assert response.summary.failed_tasks == []
         assert response.summary.success_count == 1

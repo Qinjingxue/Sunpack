@@ -56,7 +56,7 @@ raise SystemExit(main())
     snapshots, cancelled = [], []
     token = CancellationToken()
 
-    def cancel(requests):
+    async def cancel(requests):
         cancelled.append(requests)
         token.cancel()
 

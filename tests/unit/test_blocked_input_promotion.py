@@ -114,6 +114,12 @@ def test_coordinator_rewrites_recorded_result_and_cleanup_input(tmp_path, collis
         runtime._shell_updates = SimpleNamespace(add=lambda paths: None)
         from sunpack.pipeline.coordinator.engine import _PathLeaseRegistry
         runtime.path_leases = _PathLeaseRegistry()
+        # An active sibling request owns the colliding destination. Waiting
+        # for it would deadlock if its own nested input needs our parent.
+        parent = str(top / "pinned-parent.zip")
+        await runtime.path_leases.acquire("request", [parent], lease_id="parent")
+        if collision:
+            await runtime.path_leases.acquire("sibling", [str(top / inner.name)], lease_id="parent")
         claims = []
         runtime._report_progress = lambda task, event: claims.append(event)
 
@@ -129,9 +135,11 @@ def test_coordinator_rewrites_recorded_result_and_cleanup_input(tmp_path, collis
                     assert not claims
                 return function()
 
-        result, promoted = await runtime._promote_blocked_input(
+        result, promoted = await asyncio.wait_for(runtime._promote_blocked_input(
             task, original, ownership=ownership, broker=Broker(), cancellation=None,
-        )
+        ), timeout=3)
+        assert runtime.path_leases.holds_lease("request", [parent], lease_id="parent")
+        assert not runtime.path_leases._waiter_blockers
         assert runtime.context.target_results == [result]
         assert result.outcome_kind == OutcomeKind.FAILURE
         if collision:
@@ -155,5 +163,53 @@ def test_coordinator_rewrites_recorded_result_and_cleanup_input(tmp_path, collis
                     "members": [str(top / inner.name)],
                 }]
             assert ownership.response(runtime.context, recent_passwords=()).discovery.blocked_paths == (str(top / inner.name),)
+
+    asyncio.run(scenario())
+
+
+def test_stop_while_waiting_to_publish_group_keeps_sources_and_parent_pin(tmp_path):
+    # Collision tests terminate before waiting. They cannot catch a publication
+    # blocked by another request's reservation ignoring the user's stop token.
+    from sunpack.pipeline.coordinator.async_work import CancellationToken
+    from sunpack.pipeline.coordinator.engine import _PathLeaseRegistry
+
+    async def scenario():
+        source, destination = tmp_path / "nested", tmp_path / "input"
+        source.mkdir()
+        destination.mkdir()
+        parts = [source / name for name in ("inner.blob.001", "inner.blob.002")]
+        for path in parts:
+            path.write_text(path.name)
+        task = SimpleNamespace(cleanup_parts=list(map(str, parts)))
+        registry = _PathLeaseRegistry()
+        parent = str(destination / "outer.zip")
+        await registry.acquire("request", [parent], lease_id="parent")
+        await registry.acquire("other", [str(destination / parts[-1].name)])
+        token = CancellationToken()
+        waiting = asyncio.Event()
+        register = registry._register_waiter
+
+        def observe(blockers):
+            future = register(blockers)
+            waiting.set()
+            return future
+
+        registry._register_waiter = observe
+        runtime = object.__new__(_RequestRuntime)
+        runtime.submission = SimpleNamespace(request_id="request", origin="watch")
+        runtime.path_leases = registry
+        operation = asyncio.create_task(runtime._promote_blocked_input(
+            task, None, ownership=SimpleNamespace(input_dir_for_task=lambda _task: str(destination)),
+            broker=None, cancellation=token,
+        ))
+        await asyncio.wait_for(waiting.wait(), 3)
+        token.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(operation, 3)
+        assert all(path.read_text() == path.name for path in parts)
+        assert not list(destination.iterdir())
+        assert registry.holds_lease("request", [parent], lease_id="parent")
+        assert not registry._waiter_blockers and not registry._waiters_by_blocker
+        assert not token._callbacks
 
     asyncio.run(scenario())

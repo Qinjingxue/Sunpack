@@ -470,6 +470,11 @@ def _release_resource(resource_id: str) -> bool:
         record.release_callback = lambda: None
         _RELEASE_HISTORY.append(record.describe())
         _RESOURCES.pop(resource_id, None)
+        scope = _TASK_SCOPES.get(record.task_id)
+        if scope is not None:
+            scope._resource_ids.pop(resource_id, None)
+            if not scope._resource_ids:
+                scope._resource_ids.clear()
         _CHANGED.notify_all()
     return True
 
@@ -495,7 +500,7 @@ class TaskResourceScope:
         self.files = file_identities(files)
         self.state = ScopeState.ACTIVE
         self.created_at = time.time()
-        self._resource_ids: list[str] = []
+        self._resource_ids: dict[str, None] = {}
         self._active_operations = 0
         self._active_file_operations: dict[FileIdentity, int] = {}
         self._async_idle_waiters: list[tuple[asyncio.AbstractEventLoop, asyncio.Event]] = []
@@ -540,7 +545,7 @@ class TaskResourceScope:
                     release=release,
                     promotion_blocking=True,
                 )
-                self._resource_ids.append(lease.resource_id)
+                self._resource_ids[lease.resource_id] = None
                 return lease
 
     @contextlib.contextmanager
