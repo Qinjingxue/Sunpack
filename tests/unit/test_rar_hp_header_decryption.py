@@ -151,7 +151,7 @@ def test_password_retry_keeps_unencrypted_structure_facts_native(tmp_path, monke
     snapshot = _snapshot(tmp_path, ["encrypted.rar", *[path.name for path in parts]])
     scheduler = RelationsScheduler()
 
-    def discover(encrypted_groups, refresh_paths):
+    def discover(encrypted_groups, refresh_paths, failures):
         # Only password-blocked data crosses Python before the final projection.
         assert len(encrypted_groups) == 1
         assert encrypted_groups[0].head_path == rar_path
@@ -273,7 +273,7 @@ def test_relations_password_prober_remembers_success_and_skips_second_probe(tmp_
     groups = RelationsScheduler().build_candidate_groups(snapshot)
     group = next(group for group in groups if group.kind == "split_archive")
 
-    assert RelationsPasswordProber(PasswordStore.from_sources()).resolve_file(group.head_path) is None
+    assert RelationsPasswordProber(PasswordStore.from_sources()).resolve_file(group.head_path).password is None
     store = PasswordStore.from_sources(
         cli_passwords=["secret"],
         builtin_passwords=[],
@@ -287,14 +287,14 @@ def test_relations_password_prober_remembers_success_and_skips_second_probe(tmp_
         return original_verify(archive_path, passwords, **kwargs)
 
     prober.scheduler.verifier.verify_fast_batch = counting_verify
-    assert prober.resolve_file(group.head_path) == "secret"
+    assert prober.resolve_file(group.head_path).password == "secret"
     assert calls["count"] == 1
 
     # Shared proof caches must not make a removed password eligible again.
-    assert RelationsPasswordProber(PasswordStore.from_sources()).resolve_file(group.head_path) is None
+    assert RelationsPasswordProber(PasswordStore.from_sources()).resolve_file(group.head_path).password is None
     assert store.recent_passwords == ["secret"]
 
     # The second probe hits the PasswordAttemptCache without touching the
     # fast verifier again (same bytes, same fingerprint).
-    assert prober.resolve_file(group.head_path) == "secret"
+    assert prober.resolve_file(group.head_path).password == "secret"
     assert calls["count"] == 1

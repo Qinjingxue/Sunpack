@@ -15,33 +15,12 @@ class RelationResolver:
         result = StageResult()
         for candidate in candidates:
             anchor = candidate.relation_anchor
-            archive_format = str(anchor.get("format") or candidate.format_hint or "").lower().lstrip(".")
-            anchor_roles = {str(role) for role in (anchor.get("anchor_roles") or ())}
-            try:
-                internal_volume_number = int(anchor.get("internal_volume_number") or 0)
-            except (TypeError, ValueError):
-                internal_volume_number = 0
-            structural_non_head_member = bool(
-                anchor.get("continuation_from_previous")
-                or internal_volume_number > 1
-                or "member" in anchor_roles
-            )
-            if not anchor.get("relation_confirmed") and (
-                anchor.get("needs_password")
-                or (
-                    anchor.get("multivolume")
-                    and (candidate.is_split or structural_non_head_member)
-                )
-            ):
-                result.add_blocked(
-                    candidate,
-                    source="relations",
-                    reason="Relations requires password or additional volume evidence",
-                )
+            if anchor.get("relation_failure_reason"):
+                result.add_blocked(candidate, source="relations", reason=str(anchor["relation_failure_reason"]))
                 continue
-
+            archive_format = str(anchor.get("format") or candidate.format_hint or "").lower().lstrip(".")
             if (
-                anchor.get("relation_confirmed")
+                (anchor.get("relation_confirmed") or anchor.get("needs_password"))
                 and archive_format in _FORMATS
             ):
                 result.add_resolved(

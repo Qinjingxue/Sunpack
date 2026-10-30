@@ -129,7 +129,7 @@ class ArchiveInputPlanningStage:
         return tasks
 
     def requires_analysis(self, task: ArchiveTask) -> bool:
-        if self.analyzer is None:
+        if task.discovery_failure is not None or self.analyzer is None:
             return False
         descriptor = task.archive_input()
         # Identity confirmation does not carry stream structure.

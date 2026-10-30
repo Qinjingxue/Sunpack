@@ -1,4 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
+import json
 
 import pytest
 
@@ -12,6 +13,7 @@ from sunpack_native import (
 )
 
 from sunpack.core.passwords.fingerprint import build_archive_fingerprint
+from sunpack.core.passwords.internal.store import PasswordSnapshot
 from sunpack.core.support.archive_knowledge_projection import _source_input_fingerprint
 from sunpack.runtime.watch.scheduler import _password_source_signature
 from sunpack.runtime.watch.service import watch_roots_mutex_name
@@ -68,10 +70,16 @@ def test_streaming_and_file_hashes_match_memory_and_release_resources(tmp_path):
 def test_password_signature_preserves_boundaries_order_and_unicode():
     values = [(["ab", "c"], []), (["a", "bc"], []),
               ([], ["ab", "c"]), (["c", "ab"], []), (["密码"], [])]
-    signatures = [_password_source_signature(*value) for value in values]
+    def signature(user_passwords, builtin_passwords):
+        return _password_source_signature(
+            fast_hash128(json.dumps(user_passwords, ensure_ascii=False, separators=(",", ":")).encode("utf-8")),
+            PasswordSnapshot(global_passwords=tuple(builtin_passwords)).signature,
+        )
+
+    signatures = [signature(*value) for value in values]
     assert len(set(signatures)) == len(values)
     assert all(len(value) == 32 for value in signatures)
-    assert signatures == [_password_source_signature(*value) for value in values]
+    assert signatures == [signature(*value) for value in values]
 
 
 def test_mutex_identity_normalizes_path_case(tmp_path):

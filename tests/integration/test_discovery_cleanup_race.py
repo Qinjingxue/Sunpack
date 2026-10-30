@@ -158,7 +158,7 @@ def test_departed_middle_volume_remains_missing_and_recovers_when_restored(tmp_p
             if isinstance(incomplete, BaseException):
                 raise incomplete
             assert incomplete.summary.success_count == 0
-            assert any(failure.contains(FailureKind.MISSING_VOLUME) for failure in incomplete.summary.failures)
+            assert any(failure.contains(FailureKind.MISSING_VOLUME) for failure in incomplete.summary.failures), incomplete.summary
             assert all(part.exists() for part in parts if part != middle)
             assert not any(row["kind"] == "archive_session_borrow" for row in resource_snapshot(map(str, parts)))
             shutil.copyfile(case.archive_dir / middle.name.removesuffix(".jpg"), middle)

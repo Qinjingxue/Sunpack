@@ -56,7 +56,7 @@ class ArchiveTaskProvider:
                     is_recursive_scan=True,
                     include_details=include_details,
                 )
-                result.resolved_tasks.extend(partial.resolved_tasks)
+                result.tasks.extend(partial.tasks)
                 result.findings.extend(partial.findings)
                 result.claimed_paths.update(partial.claimed_paths)
                 result.blocked_paths.update(partial.blocked_paths)
@@ -75,11 +75,11 @@ class ArchiveTaskProvider:
                 is_recursive_scan=is_recursive_scan,
                 include_details=include_details,
             )
-        for task in result.resolved_tasks:
+        for task in result.tasks:
             task.runtime["discovery_scope"] = session.scope_for(task.main_path)
             task.runtime["discovery_catalog"] = session.catalog
             task.runtime["discovery_snapshot"] = session.snapshot_for_directory(session.scope_for(task.main_path).root)
-        self._record_discovery_failures(result, session)
+        self._record_discovery_failures(result)
         return result
 
     def scan_targets(
@@ -98,7 +98,7 @@ class ArchiveTaskProvider:
             include_details=False,
         )
         return self.filter_processed_tasks(
-            discovered.resolved_tasks,
+            discovered.tasks,
             processed_keys=processed_keys,
         )
 
@@ -111,59 +111,14 @@ class ArchiveTaskProvider:
         processed = processed_keys or set()
         return [task for task in tasks if task.key not in processed]
 
-    def _record_discovery_failures(self, result: StageResult, session: DiscoveryScanSession) -> None:
-        mapping = {
-            "embedded_password_required": (
-                FailureKind.PASSWORD_REQUIRED,
-                "failure.password_required",
-                "Embedded archive requires a password",
-                "request_password",
-            ),
-            "embedded_wrong_password": (
-                FailureKind.WRONG_PASSWORD,
-                "failure.wrong_password",
-                "Embedded archive password is wrong",
-                "request_password",
-            ),
-            "embedded_truncated": (
-                FailureKind.DAMAGED,
-                "failure.damaged",
-                "Embedded archive is truncated before its terminal boundary",
-                "",
-            ),
-        }
+    def _record_discovery_failures(self, result: StageResult) -> None:
         for trace in result.traces:
-            if trace.reason == "embedded_scan_io_error":
-                info = FailureInfo(
-                    FailureKind.FILESYSTEM_ERROR, "embedded_boundary",
-                    trace.error or "Unable to read archive input",
-                    details={"path": trace.entry_path, "reason": trace.reason},
-                )
-                if info not in self.failed_candidate_failures:
-                    self.failed_candidate_failures.append(info)
+            if trace.reason != "embedded_scan_io_error":
                 continue
-            if trace.source == "relations" and trace.reason in {"missing_volume", "ambiguous_volume_mapping", "structural_conflict"}:
-                info = FailureInfo(FailureKind.MISSING_VOLUME, "relations",
-                    "Volume set is incomplete or ambiguous", message_key="failure.possible_missing_volume",
-                    details={"path": trace.entry_path, "reason": trace.reason,
-                             "discovery_scope": session.scope_for(trace.entry_path).to_record()})
-                if info not in self.failed_candidate_failures:
-                    self.failed_candidate_failures.append(info)
-                continue
-            failure = mapping.get(trace.reason)
-            if failure is None:
-                continue
-            kind, message_key, message, user_action = failure
             info = FailureInfo(
-                kind=kind,
-                stage="embedded_boundary",
-                message=message,
-                message_key=message_key,
-                user_action=user_action,
-                details={
-                    "path": trace.entry_path,
-                    "reason": trace.reason,
-                },
+                FailureKind.FILESYSTEM_ERROR, "embedded_boundary",
+                trace.error or "Unable to read archive input",
+                details={"path": trace.entry_path, "reason": trace.reason},
             )
             if info not in self.failed_candidate_failures:
                 self.failed_candidate_failures.append(info)

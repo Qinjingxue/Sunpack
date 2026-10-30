@@ -12,4 +12,4 @@ def detection_pipeline_config() -> dict:
 
 def detect_archive_hits(path: Path):
     result = ArchiveTaskProvider(detection_pipeline_config()).discover_targets([str(path)])
-    return list(result.resolved_tasks)
+    return list(result.tasks)

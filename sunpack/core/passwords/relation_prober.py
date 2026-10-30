@@ -8,7 +8,7 @@ from sunpack.core.passwords.candidates import PasswordCandidatePipeline
 from sunpack.core.passwords.fingerprint import build_archive_fingerprint
 from sunpack.core.passwords.internal.store import PasswordStore
 from sunpack.core.passwords.job import PasswordJob
-from sunpack.core.passwords.scheduler import PasswordScheduler, PasswordSearchStatus
+from sunpack.core.passwords.scheduler import PasswordScheduler, PasswordSearchResult, PasswordSearchStatus
 from sunpack.core.passwords.verifier import (
     PasswordVerifierRegistry,
     RarFastVerifier,
@@ -85,7 +85,7 @@ class RelationsPasswordProber:
         scope_path: str = "",
         part_paths: list[str] | None = None,
         archive_input: dict | None = None,
-    ) -> str | None:
+    ) -> PasswordSearchResult | None:
         path = os.path.abspath(path)
         # Preserve NotFound so the Relations caller can invalidate the old
         # snapshot, including departures before the first native borrow.
@@ -107,8 +107,7 @@ class RelationsPasswordProber:
         if result.status == PasswordSearchStatus.FOUND and result.password:
             self.password_store.remember_success(result.password)
             self._notify_found(result.password)
-            return result.password
-        return None
+        return result
 
     def _notify_found(self, password: str) -> None:
         if not password or self.password_callback is None:

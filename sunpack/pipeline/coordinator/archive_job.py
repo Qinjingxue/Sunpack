@@ -1,5 +1,5 @@
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from sunpack.core.contracts.run_state import RunState
@@ -228,6 +228,13 @@ class ArchiveJobExecutor:
         file_id = task.key or task.main_path
 
         def preflight():
+            if task.discovery_failure is not None:
+                failure = task.discovery_failure
+                if failure.message_key:
+                    failure = replace(failure, message=self.i18n.t(failure.message_key, **failure.message_params))
+                return "", ArchiveJobOutcome(ExtractionResult(
+                    success=False, out_dir="", error=failure.message, failure=failure,
+                ))
             inspected = self._inspect_tasks_before_extract([task], output_dir_resolver, depth=depth)[0]
             _index, _task, out_dir, result = inspected
             if result.skip_result is not None:

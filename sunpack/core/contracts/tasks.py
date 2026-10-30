@@ -4,6 +4,7 @@ from dataclasses import InitVar, dataclass, field
 from typing import Any
 
 from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
+from sunpack.core.contracts.failures import FailureInfo
 from sunpack.core.contracts.archive_knowledge import ArchiveKnowledge
 from sunpack.core.support.collections import dedupe_values
 from sunpack.core.support.path_keys import normalized_path, path_key
@@ -20,6 +21,7 @@ class ArchiveTask:
     discovery_segments: InitVar[tuple[tuple[ArchiveInputDescriptor, dict[str, Any]], ...]] = ()
     initial_discovery_reason: InitVar[str] = ""
     runtime: dict[str, Any] = field(default_factory=dict)
+    discovery_failure: FailureInfo | None = None
 
     def __post_init__(
         self,
@@ -60,6 +62,7 @@ class ArchiveTask:
         discovery_evidence: dict[str, Any] | None = None,
         discovery_segments: tuple[tuple[ArchiveInputDescriptor, dict[str, Any]], ...] = (),
         discovery_reason: str = "",
+        discovery_failure: FailureInfo | None = None,
     ) -> "ArchiveTask":
         return cls(
             _archive_input=descriptor,
@@ -69,6 +72,7 @@ class ArchiveTask:
             discovery_evidence=dict(discovery_evidence or {}),
             discovery_segments=tuple(discovery_segments),
             initial_discovery_reason=discovery_reason,
+            discovery_failure=discovery_failure,
         )
 
     @property
@@ -131,6 +135,7 @@ class ArchiveTask:
         self.key = replacement.key
         self._knowledge = ArchiveKnowledge.from_any(replacement.knowledge())
         self._archive_input = replacement.archive_input()
+        self.discovery_failure = replacement.discovery_failure
         self.runtime = runtime
 
     def _initialize_knowledge(

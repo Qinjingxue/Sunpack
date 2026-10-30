@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
+from sunpack.core.contracts.failures import FailureInfo, FailureKind
 from sunpack.core.contracts.tasks import ArchiveTask
 from sunpack.core.support.path_keys import path_key
 
@@ -81,7 +82,7 @@ class DiscoveryFinding:
 
 @dataclass
 class StageResult:
-    resolved_tasks: list[ArchiveTask] = field(default_factory=list)
+    tasks: list[ArchiveTask] = field(default_factory=list)
     findings: list[DiscoveryFinding] = field(default_factory=list)
     claimed_paths: set[str] = field(default_factory=set)
     blocked_paths: set[str] = field(default_factory=set)
@@ -89,7 +90,7 @@ class StageResult:
     traces: list[DiscoveryTrace] = field(default_factory=list)
 
     def add_resolved(self, task: ArchiveTask, *, reason: str = "") -> None:
-        self.resolved_tasks.append(task)
+        self.tasks.append(task)
         self.claimed_paths.update(path_key(path) for path in task.cleanup_parts if path)
         self.traces.append(DiscoveryTrace(
             entry_path=task.main_path,
@@ -101,6 +102,19 @@ class StageResult:
 
     def add_blocked(self, candidate: DiscoveryCandidate, *, source: str, reason: str, error: str = "") -> None:
         self.blocked_paths.update(candidate.path_keys)
+        spec = _DISCOVERY_FAILURES.get(reason)
+        if spec is not None:
+            kind, message_key, action = spec
+            self.tasks.append(ArchiveTask.from_archive_input(
+                candidate.archive_input, discovery_source=source,
+                carrier_path=candidate.carrier_path, cleanup_paths=candidate.cleanup_paths,
+                discovery_evidence=candidate.relation_anchor, discovery_reason=reason,
+                discovery_failure=FailureInfo(
+                    kind, "embedded_boundary" if source == "embedded" else source,
+                    error, message_key=message_key, user_action=action,
+                    details={"path": candidate.entry_path, "reason": reason},
+                ),
+            ))
         self.traces.append(DiscoveryTrace(
             entry_path=candidate.entry_path,
             source=source,
@@ -125,3 +139,18 @@ class StageResult:
             raise ValueError("discovery stage claimed a blocked physical file")
         if self.claimed_paths & self.residual_paths or self.blocked_paths & self.residual_paths:
             raise ValueError("discovery stage returned a physical file twice")
+
+
+# Project native verdicts once; presentation and recovery consume the same result.
+_DISCOVERY_FAILURES = {
+    "embedded_password_required": (FailureKind.PASSWORD_REQUIRED, "failure.password_required", "request_password"),
+    "embedded_wrong_password": (FailureKind.WRONG_PASSWORD, "failure.wrong_password", "request_password"),
+    "needs_password": (FailureKind.PASSWORD_REQUIRED, "failure.password_required", "request_password"),
+    "wrong_password": (FailureKind.WRONG_PASSWORD, "failure.wrong_password", "request_password"),
+    "embedded_truncated": (FailureKind.DAMAGED, "failure.damaged", ""),
+    "missing_volume": (FailureKind.MISSING_VOLUME, "failure.possible_missing_volume", ""),
+    "ambiguous_volume_mapping": (FailureKind.MISSING_VOLUME, "failure.possible_missing_volume", ""),
+    "structural_conflict": (FailureKind.MISSING_VOLUME, "failure.possible_missing_volume", ""),
+    "corrupt_archive": (FailureKind.DAMAGED, "failure.damaged", ""),
+    "unsupported": (FailureKind.UNSUPPORTED, "failure.unsupported", ""),
+}

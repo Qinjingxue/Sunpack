@@ -71,7 +71,7 @@ def test_scan_report_projects_multiple_embedded_findings_from_one_task(monkeypat
     monkeypatch.setattr(
         orchestrator.task_scanner,
         "scan_stage_result",
-        lambda _paths, **kwargs: StageResult(resolved_tasks=[task]),
+        lambda _paths, **kwargs: StageResult(tasks=[task]),
     )
 
     report = orchestrator.scan_report([path])

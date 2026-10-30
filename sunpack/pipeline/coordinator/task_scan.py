@@ -68,7 +68,7 @@ class ArchiveTaskScanner:
             scan_roots,
             scan_session=scan_session,
             is_recursive_scan=is_recursive_scan,
-            include_details=False,
+            include_details=True,
         )
         self._record_provider_failures()
         self.record_scan_errors(scan_session)
@@ -87,10 +87,11 @@ class ArchiveTaskScanner:
             scan_roots,
             scan_session=scan_session,
             is_recursive_scan=is_recursive_scan,
+            include_details=False,
         )
         self._record_provider_failures()
         self.record_scan_errors(scan_session)
-        return result.resolved_tasks
+        return result.tasks
 
     def record_scan_errors(self, session: DiscoveryScanSession | None) -> None:
         if session is not None:
@@ -132,7 +133,7 @@ class ArchiveTaskScanner:
         self.record_scan_errors(session)
         covered = set(discovered.claimed_paths | discovered.blocked_paths)
         tasks.extend(self.provider.filter_processed_tasks(
-            discovered.resolved_tasks,
+            discovered.tasks,
             processed_keys=self.context.processed_keys,
         ))
         for path in normalized_paths:

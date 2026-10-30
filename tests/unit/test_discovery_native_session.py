@@ -185,7 +185,7 @@ def test_native_embedded_pages_scan_on_demand(tmp_path):
     session = DiscoveryScanSession(config=provider.config)
     result = provider.discovery.embedded.discover_native(table, routes, session, include_details=False)
     assert result.blocked_paths and not result.residual_paths
-    provider._record_discovery_failures(result, session)
+    provider._record_discovery_failures(result)
     failure, = provider.failed_candidate_failures
     assert failure.kind == FailureKind.FILESYSTEM_ERROR
     assert failure.details["path"] == str(path) and failure.message == row[3]["error"]

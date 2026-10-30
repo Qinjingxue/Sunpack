@@ -163,7 +163,7 @@ class EmbeddedDiscovery:
     ) -> None:
         try:
             resolved, reason, findings = self._discover_candidate(
-                candidate, precomputed_scan=precomputed_scan,
+                candidate, precomputed_scan=precomputed_scan, include_details=include_details,
             )
         except OSError as exc:
             result.add_blocked(candidate, source="embedded", reason="embedded_scan_io_error", error=str(exc))
@@ -171,7 +171,8 @@ class EmbeddedDiscovery:
         if resolved is not None:
             result.add_resolved(resolved, reason=reason)
         elif reason in {"embedded_password_required", "embedded_wrong_password", "embedded_truncated"}:
-            result.findings.extend(findings)
+            if include_details:
+                result.findings.extend(findings)
             result.add_blocked(candidate, source="embedded", reason=reason)
         elif include_details:
             result.add_residual(candidate, source="embedded", reason=reason)
@@ -181,6 +182,7 @@ class EmbeddedDiscovery:
         candidate: DiscoveryCandidate,
         *,
         precomputed_scan=None,
+        include_details: bool = True,
     ) -> tuple[ArchiveTask | None, str, tuple[DiscoveryFinding, ...]]:
         path = candidate.entry_path
         if not path:
@@ -242,7 +244,7 @@ class EmbeddedDiscovery:
                         blocked_reason,
                         failed_offset=boundary.get("failed_offset"),
                         resolved_rows=resolved_rows,
-                    ),
+                    ) if include_details else (),
                 )
             if status != "ok":
                 raise OSError(str(boundary.get("error") or "Unable to resolve encrypted archive boundary"))
@@ -287,7 +289,7 @@ class EmbeddedDiscovery:
                     scan,
                     "embedded_truncated",
                     failed_offset=truncated["offset"],
-                ),
+                ) if include_details else (),
             )
 
         physical = [

@@ -34,7 +34,7 @@ def decisions_for(root: Path, config: dict):
     )
     return {
         Path(item.main_path).relative_to(root).as_posix(): item
-        for item in result.resolved_tasks
+        for item in result.tasks
     }
 
 

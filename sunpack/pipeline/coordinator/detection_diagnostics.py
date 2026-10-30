@@ -51,7 +51,7 @@ class DetectionDiagnostics:
         )
         resolved = {
             path_key(item.main_path): item
-            for item in result.resolved_tasks
+            for item in result.tasks
         }
         return [
             DiscoveryDiagnostic(

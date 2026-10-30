@@ -130,8 +130,8 @@ def test_truncated_7z_sfx_is_confirmed_by_relations_and_projected_to_declared_ra
         "embedded_scan": {"enabled": True},
     })).discover_targets([str(path)])
 
-    assert len(result.resolved_tasks) == 1
-    task = result.resolved_tasks[0]
+    assert len(result.tasks) == 1
+    task = result.tasks[0]
     assert task.discovery_source == "relations"
     assert task.archive_input().primary_extent is not None
     assert task.archive_input().primary_extent.start == pe_end
@@ -151,15 +151,15 @@ def test_arbitrary_pe_zip_overlay_requires_deep_detect_for_embedded_discovery(tm
         "embedded_scan": {"enabled": True},
     })
     default_result = ArchiveTaskProvider(config).discover_targets([str(path)])
-    assert default_result.resolved_tasks == []
+    assert default_result.tasks == []
 
     deep_result = ArchiveTaskProvider(
         config,
         EmbeddedOptions(force_scan=True),
     ).discover_targets([str(path)])
 
-    assert len(deep_result.resolved_tasks) == 1
-    task = deep_result.resolved_tasks[0]
+    assert len(deep_result.tasks) == 1
+    task = deep_result.tasks[0]
     assert task.discovery_source == "embedded"
     descriptor = task.archive_input()
     assert descriptor.format_hint == "zip"

@@ -100,9 +100,9 @@ def test_embedded_layer_finds_disguised_stream_after_junk(tmp_path):
     path.write_bytes(b"leading junk" + gzip.compress(b"payload") + b"trailing junk")
     result = EmbeddedDiscovery({}).discover([_candidate(path)])
 
-    assert len(result.resolved_tasks) == 1
-    assert result.resolved_tasks[0].discovery_source == "embedded"
-    assert result.resolved_tasks[0].archive_input().format_hint == "gzip"
+    assert len(result.tasks) == 1
+    assert result.tasks[0].discovery_source == "embedded"
+    assert result.tasks[0].archive_input().format_hint == "gzip"
 
 
 def test_embedded_layer_rejects_plain_data(tmp_path):
@@ -110,7 +110,7 @@ def test_embedded_layer_rejects_plain_data(tmp_path):
     path.write_bytes(b"not an archive")
     result = EmbeddedDiscovery({}).discover([_candidate(path)])
 
-    assert result.resolved_tasks == []
+    assert result.tasks == []
     assert result.residual_paths
 
 
@@ -124,7 +124,7 @@ def test_recursive_gate_may_exclude_small_residual_candidate(tmp_path):
         "embedded_scan": {"recursive_candidate_ratio": 0.3},
     }).discover([_candidate(large), _candidate(small)], is_recursive_scan=True)
 
-    assert result.resolved_tasks == []
+    assert result.tasks == []
     assert any(trace.entry_path == str(small) and trace.status == "residual" for trace in result.traces)
 
 
@@ -149,7 +149,7 @@ def test_default_embedded_scan_skips_confirmed_pe_before_full_scan(tmp_path, mon
 
     result = EmbeddedDiscovery({}).discover([_candidate(path)])
 
-    assert result.resolved_tasks == []
+    assert result.tasks == []
     assert result.residual_paths
     assert any(
         trace.reason == "embedded_executable_skipped" and trace.status == "residual"
@@ -231,7 +231,8 @@ def test_truncated_embedded_7z_is_reported_as_blocked_damage(tmp_path, monkeypat
 
     result = EmbeddedDiscovery({}).discover([_candidate(path)])
 
-    assert result.resolved_tasks == []
+    assert len(result.tasks) == 1
+    assert result.tasks[0].discovery_failure.kind.value == "damaged"
     assert result.blocked_paths
     assert any(
         trace.reason == "embedded_truncated" and trace.status == "blocked"
@@ -287,7 +288,7 @@ def test_truncated_7z_split_candidate_stays_residual_for_relations(tmp_path, mon
 
     result = EmbeddedDiscovery({}).discover([split])
 
-    assert result.resolved_tasks == []
+    assert result.tasks == []
     assert not result.blocked_paths
     assert result.residual_paths
     assert any(
@@ -356,7 +357,8 @@ def test_password_blocked_carrier_preserves_every_archive_finding(tmp_path, monk
 
     result = EmbeddedDiscovery({}).discover([_candidate(path)])
 
-    assert result.resolved_tasks == []
+    assert len(result.tasks) == 1
+    assert result.tasks[0].discovery_failure.kind.value == status
     assert result.blocked_paths
     assert [finding.format for finding in result.findings] == ["zip", "rar", "7z"]
     assert [finding.offset for finding in result.findings] == [8, 40, 96]

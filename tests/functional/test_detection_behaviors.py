@@ -34,24 +34,24 @@ def test_disguised_zip_is_resolved_by_relations(tmp_path):
     path = tmp_path / "movie.dat"
     path.write_bytes(_zip_bytes())
     result = ArchiveTaskProvider(make_config({"detection": {"enabled": True}})).discover_targets([str(path)])
-    assert len(result.resolved_tasks) == 1
-    assert result.resolved_tasks[0].discovery_source == "relations"
+    assert len(result.tasks) == 1
+    assert result.tasks[0].discovery_source == "relations"
 
 
 def test_embedded_carrier_with_prefix_and_suffix_is_discovered(tmp_path):
     path = tmp_path / "carrier.bin"
     path.write_bytes(b"prefix" + _zip_bytes() + b"suffix")
     result = ArchiveTaskProvider(make_config({"embedded_scan": {"enabled": True}})).discover_targets([str(path)])
-    assert len(result.resolved_tasks) == 1
-    assert result.resolved_tasks[0].discovery_source == "embedded"
-    assert result.resolved_tasks[0].archive_input().open_mode == "file_range"
+    assert len(result.tasks) == 1
+    assert result.tasks[0].discovery_source == "embedded"
+    assert result.tasks[0].archive_input().open_mode == "file_range"
 
 
 def test_embedded_switch_prevents_carrier_scan(tmp_path):
     path = tmp_path / "carrier.bin"
     path.write_bytes(b"prefix" + _zip_bytes() + b"suffix")
     result = ArchiveTaskProvider(make_config({"embedded_scan": {"enabled": False}})).discover_targets([str(path)])
-    assert result.resolved_tasks == []
+    assert result.tasks == []
 
 
 def test_detection_does_not_accept_relation_metadata(tmp_path):

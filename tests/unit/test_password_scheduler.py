@@ -288,6 +288,8 @@ def test_single_enc_candidate_uses_extraction_confirmation_and_cache(tmp_path, m
         scheduler.remember_extraction_rejection(key, "secret")
     repeated = scheduler.plan_for_extraction(job)
     assert repeated.status == (PasswordSearchStatus.FOUND if confirmed else PasswordSearchStatus.EXHAUSTED)
+    if not confirmed:
+        assert repeated.stopped_reason == "candidates_rejected"
     assert fast.batches == []
 
 

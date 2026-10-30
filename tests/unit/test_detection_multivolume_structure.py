@@ -36,7 +36,7 @@ def test_confirmed_disguised_split_family_is_one_input(tmp_path):
 
     result = RelationResolver().resolve([candidate])
 
-    assert len(result.resolved_tasks) == 1
+    assert len(result.tasks) == 1
     assert result.claimed_paths == {path_key(str(first)), path_key(str(second))}
 
 
@@ -44,6 +44,7 @@ def test_incomplete_split_family_is_blocked_from_embedded(tmp_path):
     first = tmp_path / "first.001"
     candidate = _candidate(first, {
         "format": "rar", "relation_confirmed": False, "multivolume": True,
+        "relation_failure_reason": "missing_volume",
     })
 
     result = RelationResolver().resolve([candidate])
@@ -73,6 +74,7 @@ def test_unconfirmed_structural_rar_tail_member_is_blocked(tmp_path):
         "internal_volume_number": 6,
         "continuation_from_previous": True,
         "anchor_roles": ["any_volume", "member"],
+        "relation_failure_reason": "missing_volume",
     }, is_split=False)
 
     result = RelationResolver().resolve([candidate])
@@ -81,17 +83,19 @@ def test_unconfirmed_structural_rar_tail_member_is_blocked(tmp_path):
     assert result.residual_paths == set()
 
 
-def test_confirmed_password_required_family_reaches_password_planning(tmp_path):
+def test_confirmed_password_required_family_returns_classified_failure(tmp_path):
     first = tmp_path / "encrypted.part1"
     candidate = _candidate(first, {
         "format": "rar", "relation_confirmed": True,
         "needs_password": True, "multivolume": True,
+        "relation_failure_reason": "needs_password",
     })
 
     result = RelationResolver().resolve([candidate])
 
-    assert len(result.resolved_tasks) == 1
-    assert result.blocked_paths == set()
+    assert len(result.tasks) == 1
+    assert result.blocked_paths == {path_key(str(first))}
+    assert result.tasks[0].discovery_failure.is_password_failure
 
 
 def test_unknown_relation_candidate_can_reach_embedded(tmp_path):

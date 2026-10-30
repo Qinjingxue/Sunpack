@@ -1546,12 +1546,19 @@ class _RequestRuntime:
             # task lease. Discovery may predate a copy's final timestamp or a
             # volume arrival; never overwrite admission with that older version.
             watch_version = task.runtime.get("source_generation", ())
-            output_dir_resolver = build_output_dir_resolver(
-                [task],
-                lambda current: ownership.output_dir_for_task(current, depth=depth),
-                reservation_registry=self.services.output_reservations,
-                owner=self.submission.request_id,
-            )
+            resolved_output_dirs = None
+
+            def output_dir_resolver(current):
+                nonlocal resolved_output_dirs
+                if resolved_output_dirs is None:
+                    resolved_output_dirs = build_output_dir_resolver(
+                        [current],
+                        lambda item: ownership.output_dir_for_task(item, depth=depth),
+                        reservation_registry=self.services.output_reservations,
+                        owner=self.submission.request_id,
+                    )
+                return resolved_output_dirs(current)
+
             task, outcome, result = await self.job_executor.execute_async(
                 task,
                 depth=depth,
@@ -1576,10 +1583,12 @@ class _RequestRuntime:
                 )
             )
             if promoted_retry and result.failure is not None:
-                result = replace(result, failure=replace(
+                updated = replace(result, failure=replace(
                     result.failure,
                     details={**result.failure.details, "promoted_nested_input": True},
                 ))
+                self._replace_target_result(result, updated)
+                result = updated
             ownership.remember_tasks([task])  # Missing-volume retry may adopt a complete family.
             if result.failure is not None and task.runtime.get("discovery_scope") is not None:
                 result.failure.details["discovery_scope"] = task.runtime["discovery_scope"].to_record()
@@ -1879,6 +1888,7 @@ class _RequestRuntime:
             task.runtime["discovery_scope"] = DiscoveryScope(destination)
             promoted_failure = replace(result.failure, details={
                 **result.failure.details,
+                "path": task.main_path,
                 "discovery_scope": task.runtime["discovery_scope"].to_record(),
                 "promoted_nested_input": True,
             })

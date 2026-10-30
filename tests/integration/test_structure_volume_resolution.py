@@ -62,7 +62,7 @@ def test_mixed_camouflaged_real_volumes_are_structure_resolved_and_extractable(m
             assert group.split_volumes[0].source == "structure"
 
         candidate = relation_group_to_candidate(group)
-        resolved = RelationResolver().resolve([candidate]).resolved_tasks
+        resolved = RelationResolver().resolve([candidate]).tasks
         assert len(resolved) == 1
         task = resolved[0]
         planned = ArchiveInputPlanningStage(load_config()).plan_task_to_tasks(task)
@@ -153,7 +153,7 @@ def test_first_dot_stem_and_loose_format_markers_resolve_real_volume_sets(
     assert [volume.number for volume in group.split_volumes] == [
         number for number, _path in renamed
     ]
-    resolved = RelationResolver().resolve([relation_group_to_candidate(group)]).resolved_tasks
+    resolved = RelationResolver().resolve([relation_group_to_candidate(group)]).tasks
     assert len(resolved) == 1
     planned = ArchiveInputPlanningStage(load_config()).plan_task_to_tasks(resolved[0])
     assert len(planned) == 1
@@ -194,7 +194,7 @@ def test_context_free_numbers_preserve_encrypted_sfx_launcher_ownership(tmp_path
     assert group.input_paths == paths
     assert group.carrier_path == str(launcher)
     assert set(group.owned_paths) == set(paths + [str(launcher)])
-    tasks = RelationResolver().resolve([relation_group_to_candidate(group)]).resolved_tasks
+    tasks = RelationResolver().resolve([relation_group_to_candidate(group)]).tasks
     assert len(tasks) == 1
     planned = ArchiveInputPlanningStage(load_config()).plan_task_to_tasks(tasks[0])
     assert len(planned) == 1
@@ -228,7 +228,7 @@ def test_context_free_numeric_noise_does_not_create_a_missing_7z_volume(tmp_path
     assert group.input_paths == paths
     assert [volume.number for volume in group.split_volumes] == [1, 2, 3]
     assert set(group.owned_paths) == set(paths)
-    resolved = RelationResolver().resolve([relation_group_to_candidate(group)]).resolved_tasks
+    resolved = RelationResolver().resolve([relation_group_to_candidate(group)]).tasks
     assert len(resolved) == 1
     planned = ArchiveInputPlanningStage(load_config()).plan_task_to_tasks(resolved[0])
     assert len(planned) == 1
@@ -320,7 +320,7 @@ def test_competing_heads_keep_direct_schemes_and_partition_declared_formats(tmp_
             assert label in group.logical_name
         assert "\0" not in group.logical_name
         logical_names.add(group.logical_name)
-        tasks = RelationResolver().resolve([relation_group_to_candidate(group)]).resolved_tasks
+        tasks = RelationResolver().resolve([relation_group_to_candidate(group)]).tasks
         assert len(tasks) == 1
         planned = ArchiveInputPlanningStage(load_config()).plan_task_to_tasks(tasks[0])
         assert len(planned) == 1
@@ -367,7 +367,7 @@ def test_rar_structure_overrides_false_part_marker(tmp_path, competing, sfx, mar
     assert set(group.input_paths) == {str(path) for _, path in paths}
     assert [part.number for part in group.split_volumes] == [number for number, _ in paths]
     assert all(part.source == "structure" for part in group.split_volumes)
-    tasks = RelationResolver().resolve([relation_group_to_candidate(group)]).resolved_tasks
+    tasks = RelationResolver().resolve([relation_group_to_candidate(group)]).tasks
     assert len(tasks) == 1
     planned = ArchiveInputPlanningStage(load_config()).plan_task_to_tasks(tasks[0])
     assert len(planned) == 1
@@ -408,7 +408,7 @@ def test_structural_head_number_position_orders_real_opaque_members(tmp_path, ar
     assert set(group.input_paths) == set(inputs)
     assert [part.number for part in group.split_volumes] == [number for number, _ in paths]
     assert group.head_metadata.get("volume_set_incomplete") is not True
-    tasks = RelationResolver().resolve([relation_group_to_candidate(group)]).resolved_tasks
+    tasks = RelationResolver().resolve([relation_group_to_candidate(group)]).tasks
     assert len(tasks) == 1
     config = load_config()
     planned = ArchiveInputPlanningStage(config).plan_task_to_tasks(tasks[0])
@@ -464,7 +464,8 @@ def test_distinct_global_mappings_remain_blocked_and_cannot_be_resolved(tmp_path
     assert group.head_metadata["volume_set_incomplete"] is True
     assert group.head_metadata["relation_confirmed"] is False
     result = RelationResolver().resolve([relation_group_to_candidate(group)])
-    assert not result.resolved_tasks
+    assert len(result.tasks) == 1
+    assert result.tasks[0].discovery_failure.kind.value == "missing_volume"
     assert result.blocked_paths
     assert scheduler.resolve_volume_once([paths[0]], paths, format_hint="7z") is None
 

@@ -1,6 +1,6 @@
 from sunpack.core.contracts.discovery import StageResult
-from sunpack.core.contracts.failures import FailureInfo, FailureKind
 from sunpack.core.contracts.run_state import RunState
+from sunpack.core.support.filesystem_scan_errors import filesystem_scan_failure
 from sunpack.pipeline.coordinator.task_provider import ArchiveTaskProvider
 from sunpack.pipeline.coordinator.task_scan import ArchiveTaskScanner
 
@@ -30,7 +30,7 @@ def test_recursive_provider_discovers_each_logical_root_independently(monkeypatc
         is_recursive_scan=True,
     )
 
-    assert result.resolved_tasks == []
+    assert result.tasks == []
     assert build_calls == [("segment-a",), ("segment-b",)]
     assert discover_calls == [(True, True, True, True), (True, True, True, True)]
 
@@ -38,11 +38,7 @@ def test_recursive_provider_discovers_each_logical_root_independently(monkeypatc
 def test_discover_targets_preserves_provider_failures_in_run_state(monkeypatch):
     context = RunState()
     scanner = ArchiveTaskScanner({}, context)
-    failure = FailureInfo(
-        kind=FailureKind.WRONG_PASSWORD,
-        stage="embedded_boundary",
-        message="wrong password",
-    )
+    failure = filesystem_scan_failure(("metadata", "carrier.bin", "Unable to read input"), "en")
 
     def fake_discover_targets(*_args, **_kwargs):
         scanner.provider.failed_candidate_failures = [failure]

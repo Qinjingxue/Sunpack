@@ -119,7 +119,7 @@ async def watch_scenario(root, mode):
                 import sunpack.pipeline.coordinator.engine as engine_module
                 promote = engine_module.promote_blocked_input
 
-                def promote_first(paths, destination, *, before_move=None):
+                def promote_first(paths, destination, *, before_move=None, plan=None):
                     result = promote(paths[:1], destination, before_move=before_move)
                     crash_gate(moved=list(result.path_map.values()),
                                pending=[asdict(item) for item in watcher.state.pending_work_items()])

@@ -26,8 +26,12 @@ class ArchiveDiscoveryPipeline:
         )
         result = StageResult()
         for index, status in routes.relation_events:
-            if status == 1:
+            if status in {1, 2}:
                 candidate = session.project_native_candidate(table, index)
+                failure_reason = candidate.relation_anchor.get("relation_failure_reason")
+                if failure_reason:
+                    result.add_blocked(candidate, source="relations", reason=str(failure_reason))
+                    continue
                 result.add_resolved(
                     ArchiveTask.from_archive_input(
                         candidate.archive_input,
@@ -40,20 +44,11 @@ class ArchiveDiscoveryPipeline:
                 )
             else:
                 entry_path, format_hint = table.summary(index)
-                blocked_reason = ""
-                if status == 2:
-                    result.blocked_paths.update(table.path_keys(index))
-                    candidate = session.project_native_candidate(table, index)
-                    blocked_reason = str(candidate.relation_anchor.get("relation_failure_reason") or "")
                 result.traces.append(DiscoveryTrace(
                     entry_path=entry_path,
                     source="relations",
-                    status="blocked" if status == 2 else "residual",
+                    status="residual",
                     format=format_hint,
-                    reason=(
-                        blocked_reason or "Relations requires password or additional volume evidence"
-                        if status == 2 else ""
-                    ),
                 ))
 
         detection_enabled = self.config.get("detection", {}).get("enabled", True)
@@ -88,7 +83,7 @@ class ArchiveDiscoveryPipeline:
             is_recursive_scan=is_recursive_scan,
             include_details=include_details,
         )
-        result.resolved_tasks.extend(embedded_result.resolved_tasks)
+        result.tasks.extend(embedded_result.tasks)
         result.findings.extend(embedded_result.findings)
         result.claimed_paths.update(embedded_result.claimed_paths)
         result.blocked_paths.update(embedded_result.blocked_paths)

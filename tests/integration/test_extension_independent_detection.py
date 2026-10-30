@@ -62,8 +62,8 @@ def test_header_encrypted_rar4_primary_uses_relations_identity(tmp_path):
 
     result = ArchiveTaskProvider(detection_pipeline_config()).discover_targets([str(path)])
 
-    assert len(result.resolved_tasks) == 1
-    resolved = result.resolved_tasks[0]
+    assert len(result.tasks) == 1
+    resolved = result.tasks[0]
     assert resolved.discovery_source == "relations"
     assert resolved.archive_input().format_hint == "rar"
     assert resolved.knowledge().get("discovery.evidence.needs_password") is True
@@ -78,7 +78,7 @@ def test_header_encrypted_rar4_primary_uses_relations_identity(tmp_path):
         + b"\xff" * 16 + path.read_bytes()
     )
     blocked = ArchiveTaskProvider(detection_pipeline_config()).discover_targets([str(carrier)])
-    assert not blocked.resolved_tasks
+    assert len(blocked.tasks) == 1 and blocked.tasks[0].discovery_failure.is_password_failure
     assert any(finding.format == "rar" for finding in blocked.findings)
 
 
@@ -105,7 +105,7 @@ def test_headerless_rar_fragment_is_not_confirmed_with_matching_password(tmp_pat
         path = tmp_path / name
         path.write_bytes(data)
         result = ArchiveTaskProvider(config).discover_targets([str(path)])
-        assert not result.resolved_tasks
+        assert not result.tasks
         if data == fragment:
             outcome = RarFastVerifier().verify_batch(str(path), ["hashcat"])
             assert outcome.status == "unknown_needs_final_verifier"

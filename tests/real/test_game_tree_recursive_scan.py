@@ -35,7 +35,7 @@ def test_game_tree_resources_are_not_authorized_for_recursive_extraction(monkeyp
         provider = ArchiveTaskProvider(config)
         inputs = provider.discover_targets(
             roots, scan_session=session, is_recursive_scan=True,
-        ).resolved_tasks
+        ).tasks
         result = RecursiveAuthorization(config).authorize_batch(
             inputs, roots, session, depth=2,
         )

@@ -29,8 +29,8 @@ class DetectionPipelineTests(unittest.TestCase):
             archive_path.write_bytes(b"PK\x05\x06" + b"\0" * 18)
 
             result = ArchiveTaskProvider(minimal_config()).discover_targets([str(archive_path)])
-            self.assertEqual(len(result.resolved_tasks), 1)
-            self.assertEqual(result.resolved_tasks[0].discovery_source, "relations")
+            self.assertEqual(len(result.tasks), 1)
+            self.assertEqual(result.tasks[0].discovery_source, "relations")
 
 if __name__ == "__main__":
     unittest.main()

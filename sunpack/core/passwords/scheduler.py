@@ -168,6 +168,7 @@ class PasswordScheduler:
                 error_text=last_error,
                 attempts=attempts,
                 exhausted=True,
+                stopped_reason="candidates_rejected" if candidates_seen else "no_candidates",
             )
             self._emit_finished(job, result, started_at, candidates_seen, skipped)
             return result
@@ -350,6 +351,7 @@ class PasswordScheduler:
                     status=PasswordSearchStatus.EXHAUSTED,
                     attempts=attempts,
                     exhausted=True,
+                    stopped_reason="candidates_rejected" if candidates_seen or skipped else "no_candidates",
                 )
             self._emit_finished(job, result, started_at, candidates_seen, skipped)
             return result

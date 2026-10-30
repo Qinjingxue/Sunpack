@@ -30,6 +30,9 @@ pub(crate) struct NativeCandidateTable {
     rows: Vec<Candidate>,
     filesystem_routed: bool,
     targets: Option<FileTargets>,
+    // Sparse verifier evidence; owned only for this scan, never per-file caches.
+    // An empty reason preserves the extraction fallback for inconclusive proof.
+    relation_failures: HashMap<String, String>,
 }
 
 struct FileTargets {
@@ -387,6 +390,12 @@ impl NativeCandidateTable {
         Ok(output)
     }
 
+    fn record_relation_failures(&mut self, failures: Vec<(String, String)>) {
+        self.relation_failures.extend(
+            failures.into_iter().map(|(path, reason)| (path_key(&path), reason)),
+        );
+    }
+
     /// Replace the relation evidence for one table after a password is found.
     #[pyo3(signature = (raw_snapshot, filtered_snapshot, path_passwords, refresh_paths=None))]
     fn retry_relations(
@@ -449,6 +458,7 @@ impl NativeCandidateTable {
 
     fn extend(&mut self, other: &mut NativeCandidateTable) {
         self.rows.append(&mut other.rows);
+        self.relation_failures.extend(other.relation_failures.drain());
     }
 
     fn dedupe(&mut self) {
@@ -528,10 +538,18 @@ impl NativeCandidateTable {
                     .into_any()
                     .unbind())
             }
-            Candidate::Relation(group) => Ok(("relation", group.to_dict(py)?)
-                .into_pyobject(py)?
-                .into_any()
-                .unbind()),
+            Candidate::Relation(group) => {
+                let dict = group.to_dict(py)?;
+                let data = group.candidate_data();
+                if data.needs_password {
+                    if let Some(reason) = self.relation_failures.get(&path_key(data.entry_path)) {
+                        if let Some(metadata) = dict.bind(py).get_item("head_metadata")? {
+                            metadata.cast::<PyDict>()?.set_item("relation_failure_reason", reason)?;
+                        }
+                    }
+                }
+                Ok(("relation", dict).into_pyobject(py)?.into_any().unbind())
+            }
         }
     }
 

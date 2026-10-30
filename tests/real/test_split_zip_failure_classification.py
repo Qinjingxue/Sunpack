@@ -90,11 +90,11 @@ def test_real_pkzip_disks_classify_wrong_password_and_missing_volumes(
                 # volumes; recognizing more headless sets remains valid.
                 unrecognized_headless = (
                     scenario in {"missing_head", "only_middle", "only_tail"}
-                    and not discovered.resolved_tasks
+                    and not discovered.tasks
                 )
                 if scenario == "missing_middle":
                     assert [[part.volume_number for part in task.archive_input().parts]
-                            for task in discovered.resolved_tasks] == [[1, 3]]
+                            for task in discovered.tasks] == [[1, 3]]
                 for label, passwords in (
                     ("correct", ["wrong", password]),
                     ("wrong", ["wrong-one", "wrong-two"]),

@@ -202,7 +202,7 @@ impl NativeRelationGroup {
     }
 
     pub(crate) fn to_dict(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
-        match self {
+        let dict = match self {
             Self::Ordinary(row, confirmed) => ordinary_file_group_to_dict(py, row, *confirmed),
             Self::Proposal(validation, GroupKind::Valid) => {
                 validated_proposal_to_dict(py, validation)
@@ -213,7 +213,29 @@ impl NativeRelationGroup {
             Self::Proposal(validation, GroupKind::Incomplete) => {
                 incomplete_proposal_to_dict(py, validation)
             }
+        }?;
+        let data = self.candidate_data();
+        let reason = if data.needs_password {
+            Some(if self.entry_anchor().is_some_and(|anchor| anchor.wrong_password) {
+                "wrong_password"
+            } else {
+                "needs_password"
+            })
+        } else if !data.relation_confirmed
+            && data.multivolume && (data.is_split || data.structural_non_head) {
+            Some("missing_volume")
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            if let Some(metadata) = dict.bind(py).get_item("head_metadata")? {
+                let metadata = metadata.cast::<PyDict>()?;
+                if !metadata.contains("relation_failure_reason")? {
+                    metadata.set_item("relation_failure_reason", reason)?;
+                }
+            }
         }
+        Ok(dict)
     }
 
     pub(crate) fn candidate_data(&self) -> RelationCandidateData<'_> {

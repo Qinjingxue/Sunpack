@@ -18,6 +18,7 @@ from sunpack.core.contracts.archive_input import ArchiveInputDescriptor, Archive
 from sunpack.core.passwords.directory_context import password_scope_for_path
 from sunpack.core.passwords.internal.store import PasswordStore
 from sunpack.core.passwords.relation_prober import RelationsPasswordProber
+from sunpack.core.passwords.scheduler import PasswordSearchStatus
 from sunpack.pipeline.discovery.relations.internal.models import CandidateGroup, FileRelation, SplitVolumeEntry
 from sunpack.pipeline.discovery.relations.internal.archive_input import archive_input_for_group
 
@@ -54,17 +55,21 @@ class RelationsGroupBuilder:
         if not groups:
             return
         refresh_paths: set[str] = set()
-        discovered = self._discover_passwords(groups, refresh_paths)
+        failures: list[tuple[str, str]] = []
+        discovered = self._discover_passwords(groups, refresh_paths, failures)
         if discovered or refresh_paths:
             table.retry_relations(
                 snapshot.raw_native_snapshot, snapshot.native_snapshot,
                 _native_password_pairs(discovered) or [], list(refresh_paths),
             )
+        if failures:
+            table.record_relation_failures(failures)
 
     def _discover_passwords(
         self,
         groups: List[CandidateGroup],
         refresh_paths: set[str],
+        failures: list[tuple[str, str]],
     ) -> dict[str, str] | None:
         """Second-pass password discovery for header-encrypted RAR5 files.
 
@@ -117,7 +122,7 @@ class RelationsGroupBuilder:
         for proposal_paths, part_paths, archive_input in encrypted_groups:
             probe_path = next((path for path in part_paths if path in proposal_paths), proposal_paths[0])
             try:
-                password = self.password_prober.resolve_file(
+                result = self.password_prober.resolve_file(
                     probe_path,
                     scope_path=password_scope_for_path(self.config, probe_path),
                     part_paths=part_paths or proposal_paths,
@@ -133,8 +138,21 @@ class RelationsGroupBuilder:
                 # anchors available for a later extraction or password verdict.
                 refresh_paths.update(proposal_paths)
                 refresh_paths.update(part_paths)
+                failures.extend((path, "missing_volume") for path in proposal_paths)
                 continue
+            if result is None:
+                continue
+            password = result.password
             if not password:
+                # Preserve the existing Rust proof, including cached rejection.
+                # An inconclusive probe must still reach extraction's fallback.
+                reason = {
+                    PasswordSearchStatus.EXHAUSTED: ("needs_password" if result.stopped_reason == "no_candidates" else "wrong_password"),
+                    PasswordSearchStatus.DAMAGED: "corrupt_archive",
+                    PasswordSearchStatus.NEEDS_VOLUME_OR_TAIL_DAMAGED: "missing_volume",
+                    PasswordSearchStatus.UNSUPPORTED: "unsupported",
+                }.get(result.status, "")
+                failures.extend((path, reason) for path in proposal_paths)
                 continue
             # Upgrade encrypted facts for the proposal's physical paths. Native
             # retry preserves the unrelated structure and filename features.

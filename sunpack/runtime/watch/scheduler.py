@@ -2380,17 +2380,12 @@ class WatchScheduler:
             if failure is not None and failure not in failures:
                 failures.append(failure)
 
-        direct_failure = result_failure(target_result)
-        if direct_failure is None and target_result is None and len(failures) == 1:
-            direct_failure = failures[0]
-
         waiting_failures: list = []
         recorded_password_failures: list = []
         retired_failures: list = []
-        retry_results = results or ([None] if direct_failure is not None else [])
-        for item in retry_results:
-            failure = direct_failure if item is None else result_failure(item)
-            retry_path = candidate.path if item is None else result_path(item)
+        for item in results:
+            failure = result_failure(item)
+            retry_path = result_path(item)
             if failure is None or not retry_path:
                 continue
             missing = failure_contains(failure, FailureKind.MISSING_VOLUME)

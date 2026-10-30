@@ -55,10 +55,10 @@ def test_pe_facts_reach_native_residual_regardless_of_filename(tmp_path, filenam
     )
     for target in [path, tmp_path]:
         ordinary = ArchiveTaskProvider(_config()).discover_targets([str(target)])
-        assert ordinary.resolved_tasks == []
+        assert ordinary.tasks == []
         assert any(trace.reason == "embedded_executable_skipped" for trace in ordinary.traces)
         deep = ArchiveTaskProvider(_config(), EmbeddedOptions(force_scan=True)).discover_targets([str(target)])
-        [task] = deep.resolved_tasks
+        [task] = deep.tasks
         assert task.discovery_source == "embedded"
         assert task.archive_input().primary_extent.start == len(image)
 
@@ -79,7 +79,7 @@ def test_non_pe_exe_carrier_is_scanned_in_native_and_fallback_paths(tmp_path, pr
         ArchiveTaskProvider(_config()).discover_targets([str(path)]),
         EmbeddedDiscovery(_config()).discover([_candidate(path)]),
     ]:
-        [task] = result.resolved_tasks
+        [task] = result.tasks
         assert task.discovery_source == "embedded"
         assert task.archive_input().primary_extent.start == len(prefix)
 
@@ -89,10 +89,10 @@ def test_python_fallback_uses_canonical_pe_policy(tmp_path, pe_offset):
     path = tmp_path / "disguised.jpg"
     path.write_bytes(make_minimal_pe(pe_offset=pe_offset) + make_minimal_7z())
     result = EmbeddedDiscovery(_config()).discover([_candidate(path)])
-    assert result.resolved_tasks == []
+    assert result.tasks == []
     assert any(trace.reason == "embedded_executable_skipped" for trace in result.traces)
     deep = EmbeddedDiscovery(_config(), EmbeddedOptions(force_scan=True)).discover([_candidate(path)])
-    assert len(deep.resolved_tasks) == 1
+    assert len(deep.tasks) == 1
 
 
 @pytest.mark.parametrize("pe_offset", [0x80, 0x800])
@@ -101,7 +101,7 @@ def test_disguised_sfx_remains_owned_by_relations(tmp_path, pe_offset):
     image = make_minimal_pe(b"7-Zip SFX", pe_offset=pe_offset)
     path.write_bytes(image + make_minimal_7z())
     for force in [False, True]:
-        [task] = ArchiveTaskProvider(_config(), EmbeddedOptions(force_scan=force)).discover_targets([str(path)]).resolved_tasks
+        [task] = ArchiveTaskProvider(_config(), EmbeddedOptions(force_scan=force)).discover_targets([str(path)]).tasks
         assert task.discovery_source == "relations"
         assert task.archive_input().primary_extent.start == len(image)
 
@@ -113,7 +113,7 @@ def test_concurrent_scan_lifetimes_keep_pe_and_sfx_facts_independent(tmp_path):
 
     def discover(force):
         result = ArchiveTaskProvider(_config(), EmbeddedOptions(force_scan=force)).discover_targets([str(tmp_path)])
-        sources = sorted(task.discovery_source for task in result.resolved_tasks)
+        sources = sorted(task.discovery_source for task in result.tasks)
         assert sources == (["embedded", "embedded", "relations"] if force else ["embedded", "relations"])
 
     with ThreadPoolExecutor(max_workers=8) as pool:
@@ -150,7 +150,7 @@ def test_invalid_coff_carriers_are_scanned_instead_of_skipped(tmp_path, pe_offse
         ArchiveTaskProvider(_config()).discover_targets([str(path)]),
         EmbeddedDiscovery(_config()).discover([_candidate(path)]),
     ]:
-        [task] = result.resolved_tasks
+        [task] = result.tasks
         assert task.discovery_source == "embedded"
         assert task.archive_input().primary_extent.start == len(image)
 
