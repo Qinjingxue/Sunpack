@@ -154,10 +154,7 @@ function New-WatchCommandString {
         [switch]$Recursive
     )
 
-    $watchArguments = @("watch", "add", $TargetToken, "--start")
-    if ($Recursive) { $watchArguments += "--recursive" }
-    if ($Launcher.Mode -ne "app") { $watchArguments = @($Launcher.ScriptPath) + $watchArguments }
-    return New-HiddenStartProcessCommand -FilePath $Launcher.AppPath -ArgumentList $watchArguments
+    return New-HiddenStartProcessCommand -Launcher $Launcher -WatchAction "add" -TargetToken $TargetToken -Recursive:$Recursive
 }
 
 function New-WatchRemoveCommandString {
@@ -166,29 +163,30 @@ function New-WatchRemoveCommandString {
         [string]$TargetToken
     )
 
-    if ($Launcher.Mode -eq "app") {
-        return New-HiddenStartProcessCommand -FilePath $Launcher.AppPath -ArgumentList @("watch", "remove", $TargetToken)
-    }
-
-    return New-HiddenStartProcessCommand -FilePath $Launcher.AppPath -ArgumentList @($Launcher.ScriptPath, "watch", "remove", $TargetToken)
+    return New-HiddenStartProcessCommand -Launcher $Launcher -WatchAction "remove" -TargetToken $TargetToken
 }
 
 function New-HiddenStartProcessCommand {
     param(
-        [string]$FilePath,
-        [string[]]$ArgumentList
+        [hashtable]$Launcher,
+        [ValidateSet("add", "remove")][string]$WatchAction,
+        [string]$TargetToken,
+        [switch]$Recursive
     )
 
-    $quotedFilePath = ConvertTo-PowerShellSingleQuotedString -Value $FilePath
-    $quotedArgs = ($ArgumentList | ForEach-Object { ConvertTo-PowerShellSingleQuotedString -Value $_ }) -join ","
-    $command = "Start-Process -WindowStyle Hidden -FilePath $quotedFilePath -ArgumentList @($quotedArgs)"
-    return ('"powershell.exe" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command "{0}"' -f $command)
-}
-
-function ConvertTo-PowerShellSingleQuotedString {
-    param([string]$Value)
-
-    return "'" + ($Value -replace "'", "''") + "'"
+    # Explorer expands %1/%V only when invoking the menu. Pass the resulting
+    # path as a native argument, not as source text in a PowerShell -Command.
+    # Start-Process -ArgumentList would also flatten an array into an unquoted
+    # command line, splitting folder names that contain spaces.
+    $helperPath = Join-Path $PSScriptRoot "context_menu_watch.ps1"
+    $command = ('"powershell.exe" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}" -AppPath "{1}" -WatchAction {2} -TargetPath "{3}"' -f $helperPath, $Launcher.AppPath, $WatchAction, $TargetToken)
+    if ($Launcher.Mode -ne "app") {
+        $command += (' -ScriptPath "{0}"' -f $Launcher.ScriptPath)
+    }
+    if ($Recursive) {
+        $command += " -Recursive"
+    }
+    return $command
 }
 
 function ConvertTo-RootSafeDirectoryToken {
