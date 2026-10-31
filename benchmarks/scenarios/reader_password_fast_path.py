@@ -6,7 +6,7 @@ import statistics
 import subprocess
 from pathlib import Path
 
-from sunpack_native import NativeArchiveSession, reader_cache_stats
+from sunpack_native import NativeArchiveSession, reader_cache_stats, fast_hash128_file
 
 from benchmarks.harness import BenchmarkWorkspace, measure, metrics_delta, render_report, report_from_payload
 from tests.helpers.tool_config import get_test_tools
@@ -80,7 +80,9 @@ def benchmark(
     return {
         "path": str(path),
         "size_bytes": path.stat().st_size,
+        "input_xxh128": fast_hash128_file(path),
         "rounds_ms": [round(value, 3) for value in durations_ms],
+        "samples": [row.to_dict(include_value=True) for row in measured],
         "first_ms": round(durations_ms[0], 3),
         "warm_median_ms": round(median_ms, 3),
         "warm_min_ms": round(min(warm), 3),

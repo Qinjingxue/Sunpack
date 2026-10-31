@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+from dataclasses import replace
 from pathlib import Path
 
 from benchmarks.harness import BenchmarkReport, BenchmarkWorkspace, ProcessSampler, measure, write_report
@@ -73,8 +74,21 @@ def main(argv=None):
             def enumerate_scope():
                 filtered, raw = options.scan_scope(reference_scope.native)
                 return len(raw.relation_bucket(str(members[0])))
-            lookup = measure(bucket, runs=args.rounds, warmups=1)
-            enumeration = measure(enumerate_scope, runs=min(args.rounds, 3), warmups=1)
+            # Warm both paths, then alternate paired order to avoid assigning
+            # all early/late cache and background conditions to one operation.
+            bucket()
+            enumerate_scope()
+            lookup, enumeration = [], []
+            for iteration in range(args.rounds):
+                pair = [("bucket", bucket, lookup),
+                        ("scope_reenumeration", enumerate_scope, enumeration)]
+                if iteration % 2:
+                    pair.reverse()
+                for order, (phase, operation, rows) in enumerate(pair):
+                    row = replace(measure(operation, runs=1)[0], iteration=iteration)
+                    rows.append(row)
+                    report.samples.append({"phase": phase, "pair_order": order,
+                                           **row.to_dict(include_value=True)})
             for row in [*lookup, *enumeration]:
                 if row.value != args.bucket_size:
                     raise RuntimeError(f"Different authorized bucket: {row.value}")
@@ -89,6 +103,8 @@ def main(argv=None):
                     commit()
                 return bucket()
             updates = measure(event, runs=args.rounds)
+            report.samples.extend({"phase": "file_update_wal_and_bucket",
+                                   **row.to_dict(include_value=True)} for row in updates)
             report.summary.update({
                 "bucket": timing_summary(lookup), "scope_reenumeration": timing_summary(enumeration),
                 "file_update_wal_and_bucket": timing_summary(updates),

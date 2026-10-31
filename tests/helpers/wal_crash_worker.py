@@ -219,6 +219,8 @@ async def watch_scenario(root, mode):
 
 
 if __name__ == "__main__":
+    import faulthandler
+    faulthandler.dump_traceback_later(20, repeat=True)
     # Keep the existing stdout pipe exclusive to protocol frames. Production
     # progress can write from other threads, including without a final newline.
     sys.stdout = sys.stderr
