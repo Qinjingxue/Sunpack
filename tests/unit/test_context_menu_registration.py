@@ -164,29 +164,23 @@ def test_context_menu_commands_are_safe_for_drive_roots_and_keep_password_flag()
         expanded = commands[key].replace("%1", "D:\\").replace("%V", "D:\\")
         argv = _windows_argv(expanded)
         assert ntpath.basename(argv[0]).lower() == "powershell.exe"
-        assert "-WindowStyle" in argv
-        assert "Hidden" in argv
-        command_text = argv[argv.index("-Command") + 1]
-        assert "Start-Process" in command_text
-        assert "-WindowStyle Hidden" in command_text
-        assert "'watch','add'," in command_text
-        assert "D:" in command_text
-        assert "\\." in command_text
-        assert "'--start'" in command_text
-        assert ("'--recursive'" in command_text) == ("recursive_watch" in key)
-        assert "--pause" not in command_text
-        assert "--deep-detect" not in command_text
+        assert "-WindowStyle" in argv and "Hidden" in argv
+        assert ntpath.basename(argv[argv.index("-File") + 1]) == "context_menu_watch.ps1"
+        assert argv[argv.index("-WatchAction") + 1] == "add"
+        assert ntpath.normpath(argv[argv.index("-TargetPath") + 1]) == "D:\\"
+        assert ("-Recursive" in argv) == ("recursive_watch" in key)
+        assert "-ScriptPath" not in argv
+        assert "--pause" not in argv
+        assert "--deep-detect" not in argv
 
     for key in ("folder_unwatch", "background_unwatch"):
         expanded = commands[key].replace("%1", "D:\\").replace("%V", "D:\\")
         argv = _windows_argv(expanded)
         assert ntpath.basename(argv[0]).lower() == "powershell.exe"
-        command_text = argv[argv.index("-Command") + 1]
-        assert "Start-Process" in command_text
-        assert "-WindowStyle Hidden" in command_text
-        assert "'watch','remove'," in command_text
-        assert "D:" in command_text
-        assert "\\." in command_text
+        assert ntpath.basename(argv[argv.index("-File") + 1]) == "context_menu_watch.ps1"
+        assert argv[argv.index("-WatchAction") + 1] == "remove"
+        assert ntpath.normpath(argv[argv.index("-TargetPath") + 1]) == "D:\\"
+        assert "-Recursive" not in argv
 
 
 @pytest.mark.parametrize("launcher_mode", ["app", "python"])
@@ -276,9 +270,10 @@ try {
         assert ntpath.normpath(argv[argv.index("--out-dir") + 1]) == "D:\\"
         assert "--recursive" in argv
         watch = entries["WatchFolderRecursive"]["command"]
-        assert "'watch','add'," in watch
-        assert f"'{token}\\.'" in watch
-        assert "'--recursive'" in watch
+        watch_argv = _windows_argv(watch)
+        assert watch_argv[watch_argv.index("-WatchAction") + 1] == "add"
+        assert watch_argv[watch_argv.index("-TargetPath") + 1] == token + r"\."
+        assert "-Recursive" in watch_argv
         assert "-WindowStyle Hidden" in watch
         assert "--recursive" not in entries["DirectExtract"]["command"]
         assert "--recursive" not in entries["WatchFolder"]["command"]
@@ -293,14 +288,61 @@ def test_context_menu_directory_token_is_stable_for_normal_paths():
     assert ntpath.normpath(argv[4]) == r"D:\Archives"
     assert argv[5:] == ["--ask-pw", "--pause"]
 
-    watch_command = '"powershell.exe" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command "Start-Process -WindowStyle Hidden -FilePath ''sunpack.exe'' -ArgumentList @(''watch'',''add'',''%V\\.'',''--start'')"'
+    watch_command = (
+        '"powershell.exe" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden '
+        '-File "C:\\Program Files\\SunPack\\scripts\\context_menu_watch.ps1" '
+        '-AppPath "C:\\Program Files\\SunPack\\bin\\sunpack.exe" '
+        '-WatchAction add -TargetPath "%V\\."'
+    )
     watch_argv = _windows_argv(watch_command.replace("%V", r"D:\Archives"))
-    command_text = watch_argv[watch_argv.index("-Command") + 1]
-    assert "watch" in command_text
-    assert "add" in command_text
-    assert r"D:\Archives\." in command_text
-    assert "--start" in command_text
-    assert "--start" in command_text
+    assert watch_argv[watch_argv.index("-WatchAction") + 1] == "add"
+    assert ntpath.normpath(watch_argv[watch_argv.index("-TargetPath") + 1]) == r"D:\Archives"
+
+
+@pytest.mark.parametrize(
+    ("menu_key", "expected_args"),
+    [
+        ("folder_watch", ["watch", "add", "--start"]),
+        ("background_watch", ["watch", "add", "--start"]),
+        ("folder_recursive_watch", ["watch", "add", "--start", "--recursive"]),
+        ("background_recursive_watch", ["watch", "add", "--start", "--recursive"]),
+        ("folder_unwatch", ["watch", "remove"]),
+        ("background_unwatch", ["watch", "remove"]),
+    ],
+)
+def test_context_menu_watch_passes_literal_complex_paths_to_child(tmp_path, menu_key, expected_args):
+    # Exercise the real PowerShell -File -> Python argv boundary, not merely
+    # the registry command text. No admin rights or live Watch service needed.
+    scripts_dir = tmp_path / "menu scripts"
+    scripts_dir.mkdir()
+    for name in ("register_context_menu.ps1", "context_menu_watch.ps1"):
+        shutil.copyfile(Path(__file__).resolve().parents[2] / "scripts" / name, scripts_dir / name)
+    stub = tmp_path / "sunpack.py"
+    stub.write_text(
+        'import json, sys\n'
+        'from pathlib import Path\n'
+        'Path(__file__).with_name("context_watch_args.json").write_text('
+        'json.dumps(sys.argv[1:]), encoding="ascii")\n',
+        encoding="ascii",
+    )
+    folder = tmp_path / "WeChat's 中文 Files & (2026)"
+    folder.mkdir()
+    completed = subprocess.run(
+        ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+         "-File", str(scripts_dir / "register_context_menu.ps1"),
+         "-PythonPath", sys.executable, "-DryRun"],
+        check=True, capture_output=True, text=True, encoding="utf-8-sig", timeout=30,
+    )
+    commands = json.loads(completed.stdout.strip().splitlines()[-1])
+    command = commands[menu_key].replace("%1", str(folder)).replace("%V", str(folder))
+    launched = subprocess.run(
+        _windows_argv(command), capture_output=True, text=True, timeout=30,
+    )
+    assert launched.returncode == 0, launched.stderr
+    actual = json.loads((tmp_path / "context_watch_args.json").read_text(encoding="ascii"))
+    assert actual[:2] == expected_args[:2]
+    assert ntpath.normpath(actual[2]) == ntpath.normpath(str(folder))
+    assert actual[3:] == expected_args[2:]
 
 
 def _windows_argv(command: str) -> list[str]:
