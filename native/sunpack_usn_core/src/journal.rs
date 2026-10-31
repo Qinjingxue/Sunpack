@@ -5,13 +5,14 @@ use std::ffi::c_void;
 use std::io;
 use std::ptr::{null, null_mut};
 use std::time::{Duration, Instant};
-use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_READ, HANDLE, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
 use windows_sys::Win32::System::IO::DeviceIoControl;
 
 const FSCTL_QUERY_USN_JOURNAL: u32 = 0x0009_00f4;
+const FSCTL_CREATE_USN_JOURNAL: u32 = 0x0009_00e7;
 const FSCTL_READ_USN_JOURNAL: u32 = 0x0009_00bb;
 const ALL_USN_REASONS: u32 = 0xffff_ffff;
 #[cfg(test)]
@@ -29,6 +30,7 @@ const VOLUME_CONTEXT_IDLE_TTL: Duration = Duration::from_secs(15 * 60);
 const ERROR_INVALID_HANDLE: i32 = 6;
 const ERROR_NOT_READY: i32 = 21;
 const ERROR_DEVICE_NOT_CONNECTED: i32 = 1167;
+const ERROR_JOURNAL_NOT_ACTIVE: i32 = 1179;
 
 #[repr(C)]
 struct ReadUsnJournalData {
@@ -93,7 +95,10 @@ impl JournalReader {
 
     pub fn probe_volume(&mut self, volume_guid: &str) -> io::Result<(u64, i64)> {
         self.with_volume(volume_guid, |volume| {
-            let (journal_id, next_usn) = query_journal(volume)?;
+            let (journal_id, next_usn) = query_or_create_journal(
+                || query_journal(volume),
+                || create_journal(volume_guid),
+            )?;
             let request = read_usn_journal_request(next_usn, journal_id);
             let mut output = vec![0u8; JOURNAL_BUFFER_BYTES];
             let bytes_returned = device_io_control(
@@ -229,7 +234,7 @@ impl JournalReader {
             self.entries.insert(
                 key.clone(),
                 VolumeContext {
-                    handle: open_volume(volume_guid)?,
+                    handle: open_volume(volume_guid, GENERIC_READ)?,
                     last_used: now,
                 },
             );
@@ -268,7 +273,7 @@ pub fn validate_volume_guid(value: &str) -> io::Result<()> {
     }
 }
 
-fn open_volume(volume_guid: &str) -> io::Result<OwnedHandle> {
+fn open_volume(volume_guid: &str, access: u32) -> io::Result<OwnedHandle> {
     let wide: Vec<u16> = volume_guid
         .encode_utf16()
         .chain(std::iter::once(0))
@@ -276,7 +281,7 @@ fn open_volume(volume_guid: &str) -> io::Result<OwnedHandle> {
     let handle = unsafe {
         CreateFileW(
             wide.as_ptr(),
-            GENERIC_READ,
+            access,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             null(),
             OPEN_EXISTING,
@@ -288,6 +293,44 @@ fn open_volume(volume_guid: &str) -> io::Result<OwnedHandle> {
         return Err(io::Error::last_os_error());
     }
     Ok(OwnedHandle(handle))
+}
+
+// Only the first failed probe can create a journal; normal queries stay read-only.
+fn query_or_create_journal(
+    mut query: impl FnMut() -> io::Result<(u64, i64)>,
+    create: impl FnOnce() -> io::Result<()>,
+) -> io::Result<(u64, i64)> {
+    match query() {
+        Err(error) if error.raw_os_error() == Some(ERROR_JOURNAL_NOT_ACTIVE) => {
+            create()?;
+            query()
+        }
+        result => result,
+    }
+}
+
+fn create_journal(volume_guid: &str) -> io::Result<()> {
+    // Keep the cached query handle read-only; writable access is only needed
+    // on this rare first-use path. Values match a 32 MiB / 8 MiB USN journal.
+    let volume = open_volume(volume_guid, GENERIC_WRITE)?;
+    let sizes = [32_u64 * 1024 * 1024, 8_u64 * 1024 * 1024];
+    let mut returned = 0;
+    let ok = unsafe {
+        DeviceIoControl(
+            volume.raw(),
+            FSCTL_CREATE_USN_JOURNAL,
+            sizes.as_ptr() as *const c_void,
+            std::mem::size_of_val(&sizes) as u32,
+            null_mut(),
+            0,
+            &mut returned,
+            null_mut(),
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 fn query_journal(volume: HANDLE) -> io::Result<(u64, i64)> {
@@ -683,6 +726,62 @@ mod tests {
         record[usn_offset..usn_offset + 8].copy_from_slice(&usn.to_le_bytes());
         record[reason_offset..reason_offset + 4].copy_from_slice(&reason.to_le_bytes());
         record
+    }
+
+    #[test]
+    fn probe_creates_journal_only_for_not_active_error() {
+        use std::cell::Cell;
+        let queries = Cell::new(0);
+        let creates = Cell::new(0);
+        let result = query_or_create_journal(
+            || {
+                queries.set(queries.get() + 1);
+                if queries.get() == 1 {
+                    Err(io::Error::from_raw_os_error(ERROR_JOURNAL_NOT_ACTIVE))
+                } else {
+                    Ok((42, 100))
+                }
+            },
+            || {
+                creates.set(creates.get() + 1);
+                Ok(())
+            },
+        );
+        assert_eq!(result.unwrap(), (42, 100));
+        assert_eq!((queries.get(), creates.get()), (2, 1));
+
+        assert_eq!(
+            query_or_create_journal(|| Ok((7, 50)), || panic!("journal already exists")).unwrap(),
+            (7, 50)
+        );
+        let error = query_or_create_journal(
+            || Err(io::Error::from_raw_os_error(5)),
+            || panic!("unrelated errors must not create journals"),
+        )
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(5));
+    }
+
+    #[test]
+    fn probe_propagates_create_or_requery_failures() {
+        let error = query_or_create_journal(
+            || Err(io::Error::from_raw_os_error(ERROR_JOURNAL_NOT_ACTIVE)),
+            || Err(io::Error::from_raw_os_error(5)),
+        )
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(5));
+
+        let queries = std::cell::Cell::new(0);
+        let error = query_or_create_journal(
+            || {
+                queries.set(queries.get() + 1);
+                Err(io::Error::from_raw_os_error(ERROR_JOURNAL_NOT_ACTIVE))
+            },
+            || Ok(()),
+        )
+        .unwrap_err();
+        assert_eq!(queries.get(), 2);
+        assert_eq!(error.raw_os_error(), Some(ERROR_JOURNAL_NOT_ACTIVE));
     }
 
     #[test]
