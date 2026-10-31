@@ -1181,6 +1181,7 @@ $distScriptsRoot = Join-Path $distAppRoot "scripts"
 New-Item -ItemType Directory -Path $distScriptsRoot -Force | Out-Null
 Copy-Item -LiteralPath (Join-Path $repoRoot "scripts\upgrade_config.ps1") -Destination (Join-Path $distScriptsRoot "upgrade_config.ps1") -Force
 Copy-Item -LiteralPath (Join-Path $repoRoot "scripts\register_context_menu.ps1") -Destination (Join-Path $distScriptsRoot "register_context_menu.ps1") -Force
+Copy-Item -LiteralPath (Join-Path $repoRoot "scripts\context_menu_watch.ps1") -Destination (Join-Path $distScriptsRoot "context_menu_watch.ps1") -Force
 Copy-Item -LiteralPath (Join-Path $repoRoot "scripts\unregister_context_menu.ps1") -Destination (Join-Path $distScriptsRoot "unregister_context_menu.ps1") -Force
 Copy-Item -LiteralPath (Join-Path $repoRoot "scripts\wait_sunpack_runtime_exit.ps1") -Destination (Join-Path $distScriptsRoot "wait_sunpack_runtime_exit.ps1") -Force
 
