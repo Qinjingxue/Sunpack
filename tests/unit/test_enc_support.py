@@ -93,10 +93,13 @@ def test_wrong_selected_password_uses_generic_failure_contract(tmp_path):
     assert result["bytes_written"] == 0 and not result["damaged"]
 
 
-def test_mac_damage_is_data_damage_after_password_proof(tmp_path):
-    result = worker(DATA / "bad_mac.enc", tmp_path / "output")
-    assert result["status"] == "failed" and result["damaged"] and result["checksum_error"]
-    assert not result["wrong_password"] and not result["password_candidates_all_rejected"]
+@pytest.mark.parametrize("candidates", [("sunpack-test",), ("wrong", "sunpack-test")])
+def test_mac_damage_is_data_damage_after_password_proof(tmp_path, candidates):
+    result = worker(DATA / "bad_mac.enc", tmp_path / "output", candidates)
+    assert result["status"] == "failed" and result["native_status"] == "damaged"
+    assert result["damaged"] and result["checksum_error"]
+    assert not result["wrong_password"] and not result["password_rejected"]
+    assert not result["password_candidates_all_rejected"]
     assert not result["verified_manifest"]["validated"]
 
 
@@ -107,6 +110,7 @@ def test_recovery_framing_damage_is_reported_as_damage(tmp_path):
     proof = enc_fast_verify_passwords(str(path), ["sunpack-test"])
     assert proof["status"] == "match"
     result = worker(path, tmp_path / "output")
+    assert result["native_status"] == "damaged"
     assert result["damaged"] and not result["wrong_password"]
     assert not result["verified_manifest"]["validated"]
 
