@@ -18,6 +18,23 @@
 using namespace spg;
 void rendering_contracts();
 namespace {
+void caret_blink_contracts() {
+    // The engine follows Windows, including the no-blink (INFINITE) policy.
+    const UINT systemMs = GetCaretBlinkTime();
+    const UINT expectedMs = systemMs == 0 ? 530 : systemMs;
+    assert(ui::TextInputWidget::EffectiveCaretBlinkMs() == expectedMs);
+    assert(ui::TextAreaWidget::EffectiveCaretBlinkMs() == expectedMs);
+
+    ui::TextInputWidget input;
+    ui::TextAreaWidget area;
+    ui::ChipsInputWidget chips;
+    input.ResetCaretBlink();
+    area.ResetCaretBlink();
+    chips.ResetCaretBlink();
+    assert(input.ShouldShowCaret());
+    assert(area.ShouldShowCaret());
+    assert(chips.ShouldShowCaret());
+}
 // Existing UI checks do not inspect the native icons: one default-sized HICON
 // looked correct to those checks even when Windows had to rescale every small
 // icon. Exercise DPI changes in this host, including release of replaced icons.
@@ -1547,6 +1564,7 @@ int wmain(int argc,wchar_t** argv) {
     Handle gate(CreateEventW(nullptr,TRUE,TRUE,gate_name.c_str()));
     try {
         scalar_reactivity_noop();
+        caret_blink_contracts();
         rendering_contracts();
         atomic_write(dir/"sunpack_config.json",R"({"cli":{"language":"zh"},"runtime":{"process_mode":"normal"},"recursive_extract":"*","watch":{"state_dir":".sunpack_watch","out_dir":".","toast_enabled":true},"unknown":9007199254740993})");
         if(rangesOnly || acceptance) {
