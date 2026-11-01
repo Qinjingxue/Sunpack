@@ -38,27 +38,7 @@
             "regex": false
           },
           {
-            "value": "py",
-            "regex": false
-          },
-          {
-            "value": "pyc",
-            "regex": false
-          },
-          {
-            "value": "json",
-            "regex": false
-          },
-          {
-            "value": "xml",
-            "regex": false
-          },
-          {
             "value": "cfg",
-            "regex": false
-          },
-          {
-            "value": "ini",
             "regex": false
           },
           {
@@ -71,26 +51,6 @@
           },
           {
             "value": "msi",
-            "regex": false
-          },
-          {
-            "value": "cur",
-            "regex": false
-          },
-          {
-            "value": "ani",
-            "regex": false
-          },
-          {
-            "value": "ttf",
-            "regex": false
-          },
-          {
-            "value": "woff",
-            "regex": false
-          },
-          {
-            "value": "ico",
             "regex": false
           },
           {
@@ -175,10 +135,6 @@
           },
           {
             "value": "pth",
-            "regex": false
-          },
-          {
-            "value": "safetensors",
             "regex": false
           },
           {
