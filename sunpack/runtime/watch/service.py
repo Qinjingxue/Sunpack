@@ -4,6 +4,7 @@ from sunpack.core.platform.windows.file_mutex import file_mutex, file_mutex_name
 
 import asyncio
 import os
+import threading
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -370,6 +371,17 @@ def list_watch_roots() -> tuple[Path, list[str]]:
     return roots_path, read_watch_roots(path=roots_path)
 
 
+def retained_watch_root_changes(
+    added: list[str], updated: list[str], effective_roots: list[str],
+) -> tuple[list[str], list[str]]:
+    # Reconcile requested changes against the same committed root policy used by Watch.
+    effective = {path_key(root) for root in effective_roots}
+    return (
+        [root for root in added if path_key(root) in effective],
+        [root for root in updated if path_key(root) in effective],
+    )
+
+
 def _prune_non_ntfs_watch_roots() -> tuple[list[WatchRootEntry], list[tuple[str, str]]]:
     from sunpack_native import watch_filesystem_type
 
@@ -621,6 +633,9 @@ class WatchService:
             self.config,
             new_service_config,
             service_state_dir(self.config),
+        )
+        added, updated = retained_watch_root_changes(
+            added, updated, [entry.input_root for entry in self.service_config["root_entries"]],
         )
         return {
             "roots_path": str(roots_path),
@@ -1048,11 +1063,14 @@ class WatchService:
             paths="\n".join(f"{root} ({filesystem})" for root, filesystem in rejected),
         )
         self.log.write("watch_non_ntfs_roots_removed", roots=[root for root, _ in rejected], message=message)
-        # Neither the roots mutex nor the event loop waits on a modal Win32 call.
-        try:
-            await asyncio.to_thread(show_error, i18n.t("watch.error_title"), message)
-        except OSError as exc:
-            self.log.write("watch_error_dialog_failed", error=str(exc))
+        # A modal dialog must not gate Watch readiness or keep its executor alive on shutdown.
+        def notify() -> None:
+            try:
+                show_error(i18n.t("watch.error_title"), message)
+            except OSError as exc:
+                self.log.write("watch_error_dialog_failed", error=str(exc))
+
+        threading.Thread(target=notify, name="sunpack-watch-error", daemon=True).start()
 
     async def _scan_pending_roots(self) -> None:
         if self.scheduler is None:
