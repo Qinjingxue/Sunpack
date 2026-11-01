@@ -14,8 +14,63 @@ function Read-Object([string]$Path) {
     return $value
 }
 function Update-Configuration($Old, $New, $User, $Defaults) {
-    # Future post-1.3.0 migrations belong here. Set $script:Changed only when
-    # a migration modifies $User; the installer owns backup and rollback.
+    # Migrations are shape-based and idempotent. The installer owns backup/rollback.
+    if (-not $User.PSObject.Properties['filesystem']) { return }
+    $filesystem = $User.filesystem
+    if (-not $filesystem.PSObject.Properties['scan_filters']) { return }
+    $filters = @($filesystem.scan_filters)
+    $merged = [Collections.Generic.List[object]]::new()
+    foreach ($filter in $filters) {
+        if ($filter.name -eq 'directory_prune') {
+            $paths = @()
+            foreach ($field in @('prune_dir_globs', 'path_globs')) {
+                if ($filter.PSObject.Properties[$field]) { $paths += @($filter.$field) }
+            }
+            $enabled = $filter.PSObject.Properties['enabled'] -and $filter.enabled
+            # Different enabled states must stay independent. Only merge rules
+            # with the same switch; never activate a disabled file blacklist.
+            $target = $filters | Where-Object {
+                $_.name -eq 'blacklist' -and
+                [bool]($_.PSObject.Properties['enabled'] -and $_.enabled) -eq [bool]$enabled
+            } | Select-Object -First 1
+            if ($null -eq $target) {
+                $filter.name = 'blacklist'
+                $target = $filter
+                $merged.Add($filter)
+            }
+            $existing = @()
+            if ($target.PSObject.Properties['path_globs']) { $existing = @($target.path_globs) }
+            $target | Add-Member -NotePropertyName path_globs -NotePropertyValue @(Merge-PathGlobs ($existing + $paths)) -Force
+            $filter.PSObject.Properties.Remove('prune_dir_globs')
+            $script:Changed = $true
+        } else {
+            if ($filter.name -eq 'whitelist' -and $filter.PSObject.Properties['prune_dir_globs']) {
+                $paths = @($filter.prune_dir_globs)
+                if ($filter.PSObject.Properties['path_globs']) { $paths += @($filter.path_globs) }
+                $filter | Add-Member -NotePropertyName path_globs -NotePropertyValue @(Merge-PathGlobs $paths) -Force
+                $filter.PSObject.Properties.Remove('prune_dir_globs')
+                $script:Changed = $true
+            }
+            $merged.Add($filter)
+        }
+    }
+    if ($script:Changed) { $filesystem.scan_filters = @($merged.ToArray()) }
+}
+
+function Merge-PathGlobs($Values) {
+    $unique = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $ordered = [Collections.Generic.List[string]]::new()
+    foreach ($value in $Values) {
+        $normalized = ([string]$value).Trim().Replace('\', '/').Trim('/')
+        if ($normalized -and $unique.Add($normalized)) { $ordered.Add($normalized) }
+    }
+    foreach ($value in $ordered) {
+        # A bare name already covers the same name and subtree at every depth.
+        $base = $value
+        if ($value.EndsWith('/**')) { $base = $value.Substring(0, $value.Length - 3) }
+        if ($base -ne $value -and -not $base.Contains('/') -and $unique.Contains($base)) { continue }
+        $value
+    }
 }
 
 $old = Read-Object $OldAdvanced

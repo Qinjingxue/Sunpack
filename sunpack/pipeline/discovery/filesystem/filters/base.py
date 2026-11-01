@@ -16,6 +16,7 @@ class ScanCandidate:
     size: int | None = None
     mtime_ns: int | None = None
     metadata: dict[str, Any] | None = None
+    root_path: Path | None = None
 
 
 @dataclass(frozen=True)

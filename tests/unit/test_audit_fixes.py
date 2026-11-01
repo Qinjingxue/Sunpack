@@ -67,7 +67,7 @@ def test_password_cache_uses_each_physical_generation(tmp_path, replace, source,
     changed = part if source in {"split", "range"} else main
     # Physical-generation tests cannot catch an event with identical metadata.
     # Keep this in the same coarse password-cache lifecycle for all inputs.
-    options = sunpack_native.NativeDirectoryScanOptions([], [], [], [], [], [], [])
+    options = sunpack_native.NativeDirectoryScanOptions([], [], [], [])
     assert not options.catalog_update(catalog, DiscoveryScope(str(tmp_path)).native)
     stamp = changed.stat()
     catalog.remember_observation(str(changed), stamp.st_size, stamp.st_mtime, "same-file", 10)

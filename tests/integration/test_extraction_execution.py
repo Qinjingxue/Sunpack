@@ -37,7 +37,7 @@ def runner_config():
         "recursive_extract": "1",
         "filesystem": {
             "scan_filters": [
-                {"name": "directory_prune", "enabled": True, "prune_dir_globs": []}
+                {"name": "blacklist", "enabled": True, "path_globs": []}
             ]
         },
         "post_extract": {

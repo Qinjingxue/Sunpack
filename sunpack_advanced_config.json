@@ -19,9 +19,9 @@
     "scan_filters_enabled": true,
     "scan_filters": [
       {
-        "name": "directory_prune",
+        "name": "blacklist",
         "enabled": true,
-        "prune_dir_globs": [
+        "path_globs": [
           ".git",
           ".vscode",
           "__pycache__",
@@ -31,38 +31,9 @@
           "venv",
           "env",
           ".cache",
-          "repositories"
+          "repositories",
+          "$RECYCLE.BIN"
         ],
-        "path_globs": [
-          ".git/**",
-          ".vscode/**",
-          "$RECYCLE.BIN/**"
-        ]
-      },
-      {
-        "name": "whitelist",
-        "enabled": false,
-        "path_globs": [
-          "archives/**",
-          "downloads/**"
-        ],
-        "prune_dir_globs": [
-          "archives",
-          "downloads"
-        ],
-        "allowed_files": [
-          "sample.zip"
-        ],
-        "allowed_extensions": [
-          ".zip",
-          ".zipx",
-          ".7z",
-          ".rar"
-        ]
-      },
-      {
-        "name": "blacklist",
-        "enabled": true,
         "blocked_files": [
           "Thumbs.db",
           "desktop.ini"
@@ -78,6 +49,23 @@
           ".pt", ".pth", ".safetensors", ".bin", ".dat",
           ".docm", ".xlsm", ".pptm", ".msix", ".msixbundle",
           ".crdownload", ".downloading", ".part", ".win", ".iso",".tmp"
+        ]
+      },
+      {
+        "name": "whitelist",
+        "enabled": false,
+        "path_globs": [
+          "archives/**",
+          "downloads/**"
+        ],
+        "allowed_files": [
+          "sample.zip"
+        ],
+        "allowed_extensions": [
+          ".zip",
+          ".zipx",
+          ".7z",
+          ".rar"
         ]
       },
       {

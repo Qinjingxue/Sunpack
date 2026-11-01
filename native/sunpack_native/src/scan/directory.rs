@@ -2,7 +2,6 @@ use crate::io::directory_errors::{DirectoryReadError, DirectoryReadErrors};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
 use rayon::prelude::*;
-use regex::{RegexSet, RegexSetBuilder};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::hash::{Hash, Hasher};
@@ -12,6 +11,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use super::catalog::{catalog_stem, CatalogRow, NativeWatchObservation, ScopeCatalog};
+use super::path_filter::{FilterPath, NativePathRule, PathRule};
 use crate::analysis_native::volume_anchor::{
     probe_volume_anchor_from_head, probe_volume_anchor_paths_cheap,
     probe_volume_anchor_records_cheap, CheapAnchorCell, VolumeAnchor,
@@ -877,22 +877,10 @@ impl NativeDirectorySnapshot {
 struct DirectoryScanOptions {
     scope: Option<crate::scan::scope::NativeDiscoveryScope>,
     relation_stem: Option<String>,
-    patterns: RegexSet,
-    prune_dir_names: HashSet<String>,
-    prune_dir_patterns: RegexSet,
-    whitelist_rules: Vec<WhitelistRule>,
-    blocked_extensions: HashSet<String>,
-    blocked_file_names: HashSet<String>,
+    blacklist_rules: Vec<Arc<PathRule>>,
+    whitelist_rules: Vec<Arc<PathRule>>,
     size_ranges: Vec<NativeNumericRange>,
     mtime_ranges: Vec<NativeNumericRange>,
-}
-
-#[derive(Clone)]
-struct WhitelistRule {
-    path_patterns: RegexSet,
-    prune_dir_patterns: RegexSet,
-    file_patterns: RegexSet,
-    allowed_extensions: HashSet<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -911,7 +899,6 @@ type NumericRangeTuple = (
     Option<u64>,
     Option<u64>,
 );
-type WhitelistRuleTuple = (Vec<String>, Vec<String>, Vec<String>, Vec<String>);
 
 impl NativeNumericRange {
     fn from_tuple(value: NumericRangeTuple) -> Self {
@@ -1045,41 +1032,21 @@ impl DirectoryEntryRecord {
 
 impl DirectoryScanOptions {
     fn new(
-        patterns: Vec<String>,
-        prune_dir_globs: Vec<String>,
-        blocked_extensions: Vec<String>,
-        blocked_file_names: Vec<String>,
+        blacklist_rules: Vec<PyRef<'_, NativePathRule>>,
         size_ranges: Vec<NumericRangeTuple>,
         mtime_ranges: Vec<NumericRangeTuple>,
-        whitelist_rules: Vec<WhitelistRuleTuple>,
+        whitelist_rules: Vec<PyRef<'_, NativePathRule>>,
     ) -> PyResult<Self> {
-        let (prune_dir_names, prune_dir_patterns) = compile_prune_dirs(prune_dir_globs)?;
         Ok(Self {
             scope: None,
             relation_stem: None,
-            patterns: compile_case_insensitive_regex_set(patterns)?,
-            prune_dir_names,
-            prune_dir_patterns,
+            blacklist_rules: blacklist_rules
+                .iter()
+                .map(|rule| Arc::clone(&rule.rule))
+                .collect(),
             whitelist_rules: whitelist_rules
-                .into_iter()
-                .map(
-                    |(path_patterns, prune_dir_patterns, file_patterns, extensions)| {
-                        Ok(WhitelistRule {
-                            path_patterns: compile_case_insensitive_regex_set(path_patterns)?,
-                            prune_dir_patterns: compile_case_insensitive_regex_set(
-                                prune_dir_patterns,
-                            )?,
-                            file_patterns: compile_case_insensitive_regex_set(file_patterns)?,
-                            allowed_extensions: normalize_extensions(extensions),
-                        })
-                    },
-                )
-                .collect::<PyResult<Vec<_>>>()?,
-            blocked_extensions: normalize_extensions(blocked_extensions),
-            blocked_file_names: blocked_file_names
-                .into_iter()
-                .map(|name| name.trim().to_ascii_lowercase())
-                .filter(|name| !name.is_empty())
+                .iter()
+                .map(|rule| Arc::clone(&rule.rule))
                 .collect(),
             size_ranges: size_ranges
                 .into_iter()
@@ -1102,20 +1069,14 @@ pub(crate) struct NativeDirectoryScanOptions {
 impl NativeDirectoryScanOptions {
     #[new]
     fn new(
-        patterns: Vec<String>,
-        prune_dir_globs: Vec<String>,
-        blocked_extensions: Vec<String>,
-        blocked_file_names: Vec<String>,
+        blacklist_rules: Vec<PyRef<'_, NativePathRule>>,
         size_ranges: Vec<NumericRangeTuple>,
         mtime_ranges: Vec<NumericRangeTuple>,
-        whitelist_rules: Vec<WhitelistRuleTuple>,
+        whitelist_rules: Vec<PyRef<'_, NativePathRule>>,
     ) -> PyResult<Self> {
         Ok(Self {
             options: DirectoryScanOptions::new(
-                patterns,
-                prune_dir_globs,
-                blocked_extensions,
-                blocked_file_names,
+                blacklist_rules,
                 size_ranges,
                 mtime_ranges,
                 whitelist_rules,
@@ -1368,28 +1329,18 @@ fn scan_snapshots_with_options(
 }
 
 #[pyfunction]
-#[pyo3(signature = (root_path, max_depth, patterns, prune_dir_globs, blocked_extensions, blocked_file_names, size_ranges, mtime_ranges, whitelist_rules))]
+#[pyo3(signature = (root_path, max_depth, blacklist_rules, size_ranges, mtime_ranges, whitelist_rules))]
 pub(crate) fn scan_directory_snapshot(
     py: Python<'_>,
     root_path: &str,
     max_depth: Option<usize>,
-    patterns: Vec<String>,
-    prune_dir_globs: Vec<String>,
-    blocked_extensions: Vec<String>,
-    blocked_file_names: Vec<String>,
+    blacklist_rules: Vec<PyRef<'_, NativePathRule>>,
     size_ranges: Vec<NumericRangeTuple>,
     mtime_ranges: Vec<NumericRangeTuple>,
-    whitelist_rules: Vec<WhitelistRuleTuple>,
+    whitelist_rules: Vec<PyRef<'_, NativePathRule>>,
 ) -> PyResult<Py<NativeDirectorySnapshot>> {
-    let options = DirectoryScanOptions::new(
-        patterns,
-        prune_dir_globs,
-        blocked_extensions,
-        blocked_file_names,
-        size_ranges,
-        mtime_ranges,
-        whitelist_rules,
-    )?;
+    let options =
+        DirectoryScanOptions::new(blacklist_rules, size_ranges, mtime_ranges, whitelist_rules)?;
     let snapshot = py.detach(|| {
         let mut records =
             scan_directory_impl::<false>(root_path, max_depth, &options, false, None, None)?;
@@ -1431,28 +1382,18 @@ pub(crate) fn classify_scan_targets(
 }
 
 #[pyfunction]
-#[pyo3(signature = (root_path, max_depth, patterns, prune_dir_globs, blocked_extensions, blocked_file_names, size_ranges, mtime_ranges, whitelist_rules))]
+#[pyo3(signature = (root_path, max_depth, blacklist_rules, size_ranges, mtime_ranges, whitelist_rules))]
 pub(crate) fn scan_directory_snapshots(
     py: Python<'_>,
     root_path: &str,
     max_depth: Option<usize>,
-    patterns: Vec<String>,
-    prune_dir_globs: Vec<String>,
-    blocked_extensions: Vec<String>,
-    blocked_file_names: Vec<String>,
+    blacklist_rules: Vec<PyRef<'_, NativePathRule>>,
     size_ranges: Vec<NumericRangeTuple>,
     mtime_ranges: Vec<NumericRangeTuple>,
-    whitelist_rules: Vec<WhitelistRuleTuple>,
+    whitelist_rules: Vec<PyRef<'_, NativePathRule>>,
 ) -> PyResult<(Py<NativeDirectorySnapshot>, Py<NativeDirectorySnapshot>)> {
-    let options = DirectoryScanOptions::new(
-        patterns,
-        prune_dir_globs,
-        blocked_extensions,
-        blocked_file_names,
-        size_ranges,
-        mtime_ranges,
-        whitelist_rules,
-    )?;
+    let options =
+        DirectoryScanOptions::new(blacklist_rules, size_ranges, mtime_ranges, whitelist_rules)?;
     scan_snapshots_with_options(py, root_path, max_depth, &options)
 }
 
@@ -1504,31 +1445,21 @@ pub(crate) fn directory_snapshot_from_columns(
 }
 
 #[pyfunction]
-#[pyo3(signature = (root_path, max_depth, patterns, prune_dir_globs, blocked_extensions, blocked_file_names, size_ranges, mtime_ranges, whitelist_rules, include_relation_anchors=false))]
+#[pyo3(signature = (root_path, max_depth, blacklist_rules, size_ranges, mtime_ranges, whitelist_rules, include_relation_anchors=false))]
 pub(crate) fn profile_directory_scan(
     py: Python<'_>,
     root_path: &str,
     max_depth: Option<usize>,
-    patterns: Vec<String>,
-    prune_dir_globs: Vec<String>,
-    blocked_extensions: Vec<String>,
-    blocked_file_names: Vec<String>,
+    blacklist_rules: Vec<PyRef<'_, NativePathRule>>,
     size_ranges: Vec<NumericRangeTuple>,
     mtime_ranges: Vec<NumericRangeTuple>,
-    whitelist_rules: Vec<WhitelistRuleTuple>,
+    whitelist_rules: Vec<PyRef<'_, NativePathRule>>,
     include_relation_anchors: bool,
 ) -> PyResult<(Py<NativeDirectorySnapshot>, Py<PyDict>)> {
     let call_started = Instant::now();
     let options_started = Instant::now();
-    let options = DirectoryScanOptions::new(
-        patterns,
-        prune_dir_globs,
-        blocked_extensions,
-        blocked_file_names,
-        size_ranges,
-        mtime_ranges,
-        whitelist_rules,
-    )?;
+    let options =
+        DirectoryScanOptions::new(blacklist_rules, size_ranges, mtime_ranges, whitelist_rules)?;
     let options_compile = options_started.elapsed();
 
     let (profile, snapshot, snapshot_building) = py.detach(|| {
@@ -1560,27 +1491,17 @@ pub(crate) fn profile_directory_scan(
 }
 
 #[pyfunction]
-#[pyo3(signature = (root_path, paths, sizes, patterns, prune_dir_globs, blocked_extensions, blocked_file_names, size_ranges, whitelist_rules))]
+#[pyo3(signature = (root_path, paths, sizes, blacklist_rules, size_ranges, whitelist_rules))]
 pub(crate) fn filter_inventory_file_indices(
     root_path: &str,
     paths: Vec<String>,
     sizes: Vec<u64>,
-    patterns: Vec<String>,
-    prune_dir_globs: Vec<String>,
-    blocked_extensions: Vec<String>,
-    blocked_file_names: Vec<String>,
+    blacklist_rules: Vec<PyRef<'_, NativePathRule>>,
     size_ranges: Vec<NumericRangeTuple>,
-    whitelist_rules: Vec<WhitelistRuleTuple>,
+    whitelist_rules: Vec<PyRef<'_, NativePathRule>>,
 ) -> PyResult<Vec<usize>> {
-    let options = DirectoryScanOptions::new(
-        patterns,
-        prune_dir_globs,
-        blocked_extensions,
-        blocked_file_names,
-        size_ranges,
-        Vec::new(),
-        whitelist_rules,
-    )?;
+    let options =
+        DirectoryScanOptions::new(blacklist_rules, size_ranges, Vec::new(), whitelist_rules)?;
     let root = PathBuf::from(root_path);
     let mut accepted = vec![false; paths.len()];
     let mut size_accepted_split_families = HashSet::new();
@@ -2468,66 +2389,6 @@ fn walk_output_tree(root: &Path, current: &Path, stats: &mut OutputTreeStats) {
     }
 }
 
-fn compile_case_insensitive_regex_set(patterns: Vec<String>) -> PyResult<RegexSet> {
-    RegexSetBuilder::new(patterns)
-        .case_insensitive(true)
-        .build()
-        .map_err(|err| pyo3::exceptions::PyValueError::new_err(err.to_string()))
-}
-
-fn compile_prune_dirs(patterns: Vec<String>) -> PyResult<(HashSet<String>, RegexSet)> {
-    let mut exact_names = HashSet::new();
-    let mut wildcard_patterns = Vec::new();
-    for pattern in patterns {
-        let normalized = pattern
-            .trim()
-            .replace('\\', "/")
-            .trim_matches('/')
-            .to_string();
-        if normalized.is_empty() {
-            continue;
-        }
-        if normalized.contains('*') || normalized.contains('?') {
-            wildcard_patterns.push(directory_glob_regex(&normalized));
-        } else {
-            exact_names.insert(normalized.to_ascii_lowercase());
-        }
-    }
-    Ok((
-        exact_names,
-        compile_case_insensitive_regex_set(wildcard_patterns)?,
-    ))
-}
-
-fn directory_glob_regex(pattern: &str) -> String {
-    let mut result = String::from("^");
-    for character in pattern.chars() {
-        match character {
-            '*' => result.push_str("[^/]*"),
-            '?' => result.push_str("[^/]"),
-            _ => result.push_str(&regex::escape(&character.to_string())),
-        }
-    }
-    result.push('$');
-    result
-}
-
-fn normalize_extensions(extensions: Vec<String>) -> HashSet<String> {
-    extensions
-        .into_iter()
-        .filter_map(|ext| {
-            let ext = ext.trim().to_ascii_lowercase();
-            if ext.is_empty() {
-                None
-            } else if ext.starts_with('.') {
-                Some(ext)
-            } else {
-                Some(format!(".{ext}"))
-            }
-        })
-        .collect()
-}
-
 fn populate_relation_anchors(records: &mut [DirectoryEntryRecord]) {
     populate_relation_anchors_cached(records, &[]);
 }
@@ -2954,31 +2815,31 @@ fn scan_directory_impl<const PROFILE: bool>(
 }
 
 fn dir_rejected(path: &Path, root: &Path, options: &DirectoryScanOptions) -> bool {
-    let name = normalized_file_name(path);
-    if options.prune_dir_names.contains(&name) || options.prune_dir_patterns.is_match(&name) {
-        return true;
-    }
-    let candidates = path_candidates(path, root);
-    regex_set_matches(&options.patterns, &candidates)
-        || !dir_allowed_by_whitelist(&candidates, options)
+    path_rules_reject(path, root, true, options)
 }
 
 fn file_rejected_by_path(path: &Path, root: &Path, options: &DirectoryScanOptions) -> bool {
-    if options
-        .blocked_file_names
-        .contains(&normalized_file_name(path))
-    {
-        return true;
+    path_rules_reject(path, root, false, options)
+}
+
+fn path_rules_reject(
+    path: &Path,
+    root: &Path,
+    is_dir: bool,
+    options: &DirectoryScanOptions,
+) -> bool {
+    if options.blacklist_rules.is_empty() && options.whitelist_rules.is_empty() {
+        return false;
     }
-    if let Some(ext) = path.extension().and_then(|value| value.to_str()) {
-        let ext = format!(".{}", ext.to_ascii_lowercase());
-        if options.blocked_extensions.contains(&ext) {
-            return true;
-        }
-    }
-    let candidates = path_candidates(path, root);
-    regex_set_matches(&options.patterns, &candidates)
-        || !file_allowed_by_whitelist(path, &candidates, options)
+    let candidate = FilterPath::new(path, root);
+    options
+        .blacklist_rules
+        .iter()
+        .any(|rule| rule.rejects(&candidate, is_dir, false))
+        || options
+            .whitelist_rules
+            .iter()
+            .any(|rule| rule.rejects(&candidate, is_dir, true))
 }
 
 fn file_under_rejected_directory(
@@ -3014,70 +2875,16 @@ fn directory_rejected_cached(
     rejected
 }
 
-fn dir_allowed_by_whitelist(candidates: &[String], options: &DirectoryScanOptions) -> bool {
-    options.whitelist_rules.iter().all(|rule| {
-        regex_field_allows(&rule.path_patterns, candidates)
-            && regex_field_allows(&rule.prune_dir_patterns, candidates)
-    })
-}
-
-fn file_allowed_by_whitelist(
-    path: &Path,
-    candidates: &[String],
-    options: &DirectoryScanOptions,
-) -> bool {
-    let extension = path
-        .extension()
-        .and_then(|value| value.to_str())
-        .map(|value| format!(".{}", value.to_ascii_lowercase()));
-    options.whitelist_rules.iter().all(|rule| {
-        regex_field_allows(&rule.path_patterns, candidates)
-            && regex_field_allows(&rule.file_patterns, candidates)
-            && (rule.allowed_extensions.is_empty()
-                || extension
-                    .as_ref()
-                    .is_some_and(|ext| rule.allowed_extensions.contains(ext)))
-    })
-}
-
-fn regex_field_allows(regexes: &RegexSet, candidates: &[String]) -> bool {
-    regexes.is_empty() || regex_set_matches(regexes, candidates)
-}
-
 fn numeric_ranges_allow(ranges: &[NativeNumericRange], value: Option<u64>) -> bool {
     ranges.iter().all(|range| range.allows(value))
 }
 
-fn regex_set_matches(regexes: &RegexSet, candidates: &[String]) -> bool {
-    candidates
-        .iter()
-        .any(|candidate| regexes.is_match(candidate))
-}
-
-fn normalized_file_name(path: &Path) -> String {
-    path.file_name()
-        .map(|value| value.to_string_lossy().to_ascii_lowercase())
-        .unwrap_or_default()
-}
-
-fn path_candidates(path: &Path, root: &Path) -> Vec<String> {
-    let name = path
-        .file_name()
-        .map(|value| value.to_string_lossy().to_string())
-        .unwrap_or_default();
-    let relative = path
-        .strip_prefix(root)
-        .map(path_to_string)
-        .unwrap_or_else(|_| name.clone());
-    vec![name, normalize_path_separator(relative)]
+fn path_to_string(path: &Path) -> String {
+    path.to_string_lossy().to_string()
 }
 
 fn normalize_path_separator(path: String) -> String {
     path.replace('\\', "/")
-}
-
-fn path_to_string(path: &Path) -> String {
-    path.to_string_lossy().to_string()
 }
 
 fn inventory_path_key(path: &str) -> String {
@@ -3100,15 +2907,7 @@ fn metadata_mtime_ns(metadata: &fs::Metadata) -> Option<u64> {
 pub(crate) fn scope_file_paths(
     scope: &crate::scan::scope::NativeDiscoveryScope,
 ) -> PyResult<(Vec<PathBuf>, Vec<DirectoryReadError>)> {
-    let mut options = DirectoryScanOptions::new(
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-    )?;
+    let mut options = DirectoryScanOptions::new(Vec::new(), Vec::new(), Vec::new(), Vec::new())?;
     options.scope = Some(scope.clone());
     let records = scan_directory_views(&scope.root, scope.max_depth, &options)?;
     Ok((

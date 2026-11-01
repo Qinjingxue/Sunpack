@@ -69,7 +69,7 @@ def test_filename_blacklist_filters_single_rename_candidate_before_planning(tmp_
     archive = tmp_path / "asset.foo"
     archive.write_bytes(make_zip({"payload.txt": "payload"}))
 
-    results = ScanOrchestrator(scan_config(blocked_files=["asset.foo"])).scan(str(tmp_path))
+    results = ScanOrchestrator(scan_config(blocked_files=["asset.*"])).scan(str(tmp_path))
 
     assert results == []
 
@@ -80,7 +80,7 @@ def test_filename_blacklist_filters_series_rename_candidate_before_planning(tmp_
     first.write_bytes(b"Rar!" + b"x" * 128)
     second.write_bytes(b"x" * 128)
 
-    results = ScanOrchestrator(scan_config(blocked_files=["bundle.part01.rar.jpg"])).scan(str(tmp_path))
+    results = ScanOrchestrator(scan_config(blocked_files=["bundle.part??.rar.jpg"])).scan(str(tmp_path))
 
     assert results == []
 

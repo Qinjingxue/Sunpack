@@ -53,7 +53,13 @@ CLI 的 `--recur`、`--cleanup` 和 `--out-dir` 等参数可为单次命令指�
 }
 ```
 
-可用过滤器包括 `directory_prune`（跳过目录）、`whitelist`（只包含指定路径、文件名或扩展名）、`blacklist`（排除指定项）、`size_range` 和 `mtime_range`。在 `sunpack_config.json` 中修改其字段；随程序提供的 `sunpack_advanced_config.json` 可作为格式示例。按扩展名过滤可能漏掉伪装扩展名的归档。
+可用过滤器包括 `blacklist`（黑名单）、`whitelist`（白名单）、`size_range` 和 `mtime_range`。在 `sunpack_config.json` 中修改其字段；随程序提供的 `sunpack_advanced_config.json` 可作为格式示例。按扩展名过滤可能漏掉伪装扩展名的归档。
+
+黑白名单统一使用 `path_globs`：单独名称（例如 `node_modules`）匹配任意层级；包含 `/` 的规则（例如 `archives/**`、`cache/private`）相对扫描根目录匹配。目录命中后包含整个子树。所有匹配不区分大小写，`*`、`?` 不跨目录，`**` 可以跨目录，`**/` 也可匹配零层目录。要匹配任意层级的 `archives` 目录，可写 `**/archives/**`。
+
+`blocked_files` / `allowed_files` 也支持 `*`、`?`，例如 `backup_*.zip`、`temp_??.7z`，只匹配文件名，不匹配目录名。正则方括号、`+` 等其他字符按字面匹配。`blocked_extensions` / `allowed_extensions` 精确匹配扩展名。同一字段内多条规则使用 OR；黑名单任一字段命中即排除，白名单各非空字段须同时满足，例如路径为 `archives/**` 且扩展名为 `.zip`。空字段不限制。白名单会保留到达允许路径所需的父目录，不会误剪枝嵌套归档。
+
+安装器会将旧的 `directory_prune` 和 `prune_dir_globs` 迁移到 `path_globs`；运行时只使用新字段。
 
 大小上下限为 0 至 18446744073709551615 的整数字节，两端包含；上下限相等表示精确匹配该大小。时间使用 `YYYY-MM-DDTHH:mmZ` 格式的 UTC 分钟字符串，开始包含、结束不包含。`null` 表示该侧无限制；覆盖默认配置时请显式填写两个边界。例如：
 

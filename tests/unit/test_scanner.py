@@ -464,39 +464,6 @@ def test_directory_scanner_whitelist_keeps_only_allowed_path_globs(tmp_path):
     assert "skip.zip" not in names
 
 
-def test_directory_scanner_pushes_whitelist_directory_rules_to_native(tmp_path, monkeypatch):
-    captured = {}
-
-    class FakeOptions:
-        def __init__(self, **options):
-            captured.update(options)
-
-        def scan_scope(self, scope):
-            return object(), object()
-
-    monkeypatch.setattr(
-        "sunpack.pipeline.discovery.filesystem.directory_scanner.NativeDirectoryScanOptions",
-        FakeOptions,
-    )
-
-    DirectoryScanner(str(tmp_path), include_raw_snapshot=True, config=make_config({
-        "filesystem": {
-            "scan_filters": [
-                {
-                    "name": "whitelist",
-                    "enabled": True,
-                    "path_globs": ["archives/**"],
-                    "prune_dir_globs": ["downloads"],
-                },
-            ]
-        }
-    })).scan()
-
-    assert captured["whitelist_rules"] == [
-        ([r"(^|/)archives($|/.*)"], [r"^downloads$"], [], [])
-    ]
-
-
 def test_directory_scanner_keeps_filter_rejected_files_in_raw_snapshot(tmp_path):
     blocked = tmp_path / "runtime.dll"
     blocked.write_bytes(b"x" * 16)
@@ -563,7 +530,6 @@ def test_directory_scanner_whitelist_empty_fields_are_not_restrictions(tmp_path)
                     "name": "whitelist",
                     "enabled": True,
                     "path_globs": ["archives/**"],
-                    "prune_dir_globs": [],
                     "allowed_files": [],
                     "allowed_extensions": [".zip"],
                 },
@@ -602,7 +568,7 @@ def test_directory_scanner_whitelist_non_empty_fields_are_combined_as_constraint
     assert "other.zip" not in names
 
 
-def test_directory_scanner_directory_prune_globs_are_directory_only(tmp_path):
+def test_directory_scanner_blacklist_paths_match_whole_components(tmp_path):
     blocked_dir = tmp_path / "site-packages"
     blocked_dir.mkdir()
     (blocked_dir / "payload.zip").write_bytes(b"PK\x03\x04payload")
@@ -612,7 +578,7 @@ def test_directory_scanner_directory_prune_globs_are_directory_only(tmp_path):
     snapshot = DirectoryScanner(str(tmp_path), config=make_config({
         "filesystem": {
             "scan_filters": [
-                {"name": "directory_prune", "enabled": True, "prune_dir_globs": ["site-packages"]},
+                {"name": "blacklist", "enabled": True, "path_globs": ["site-packages"]},
             ]
         }
     })).scan()

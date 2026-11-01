@@ -993,40 +993,14 @@
         "en": "Disabling this turns off all scan filters"
       }
     },
-    "/filesystem/scan_filters/@directory_prune/enabled": {
-      "label": {
-        "zh": "跳过目录",
-        "en": "Skip folders"
-      }
-    },
-    "/filesystem/scan_filters/@directory_prune/prune_dir_globs": {
-      "label": {
-        "zh": "跳过的目录",
-        "en": "Skipped folders"
-      },
-      "description": {
-        "zh": "支持通配符",
-        "en": "Wildcards supported"
-      }
-    },
-    "/filesystem/scan_filters/@directory_prune/path_globs": {
-      "label": {
-        "zh": "路径规则",
-        "en": "Path patterns"
-      },
-      "description": {
-        "zh": "支持通配符",
-        "en": "Wildcards supported"
-      }
-    },
     "/filesystem/scan_filters/@whitelist/enabled": {
       "label": {
         "zh": "白名单",
         "en": "Allow list"
       },
       "description": {
-        "zh": "只处理符合下方条件的文件",
-        "en": "Process only files matching the conditions below"
+        "zh": "同一字段内任一规则命中即可；路径、文件名和扩展名条件须同时满足，空字段不限制。",
+        "en": "Rules within a field use OR; nonempty path, file name and extension fields must all match. Empty fields impose no restriction."
       }
     },
     "/filesystem/scan_filters/@whitelist/path_globs": {
@@ -1035,24 +1009,18 @@
         "en": "Path patterns"
       },
       "description": {
-        "zh": "支持通配符",
-        "en": "Wildcards supported"
-      }
-    },
-    "/filesystem/scan_filters/@whitelist/prune_dir_globs": {
-      "label": {
-        "zh": "允许的目录",
-        "en": "Allowed folders"
-      },
-      "description": {
-        "zh": "支持通配符",
-        "en": "Wildcards supported"
+        "zh": "不区分大小写；*、? 不跨目录，** 跨目录。单独名称匹配任意层级，含 / 的规则相对扫描根目录；目录命中后包含整个子树。",
+        "en": "Case-insensitive; * and ? stay within a component, ** crosses folders. Bare names match at any depth; rules with / are relative to the scan root. A folder match includes its subtree."
       }
     },
     "/filesystem/scan_filters/@whitelist/allowed_files": {
       "label": {
         "zh": "文件名",
         "en": "File names"
+      },
+      "description": {
+        "zh": "不区分大小写，支持 * 和 ? 通配符；仅匹配文件名，不支持正则表达式。",
+        "en": "Case-insensitive file name globs with * and ?; regular expressions are not supported."
       }
     },
     "/filesystem/scan_filters/@whitelist/allowed_extensions": {
@@ -1067,14 +1035,28 @@
         "en": "Block list"
       },
       "description": {
-        "zh": "跳过下方文件名和扩展名",
-        "en": "Skip the file names and extensions below"
+        "zh": "路径、文件名或扩展名任一条件命中即跳过；命中的目录不再扫描。",
+        "en": "Skip matches in any path, file name or extension field. Matched folders are not scanned."
+      }
+    },
+    "/filesystem/scan_filters/@blacklist/path_globs": {
+      "label": {
+        "zh": "路径规则",
+        "en": "Path patterns"
+      },
+      "description": {
+        "zh": "不区分大小写；*、? 不跨目录，** 跨目录。单独名称匹配任意层级，含 / 的规则相对扫描根目录；目录命中后包含整个子树。",
+        "en": "Case-insensitive; * and ? stay within a component, ** crosses folders. Bare names match at any depth; rules with / are relative to the scan root. A folder match includes its subtree."
       }
     },
     "/filesystem/scan_filters/@blacklist/blocked_files": {
       "label": {
         "zh": "文件名",
         "en": "File names"
+      },
+      "description": {
+        "zh": "不区分大小写，支持 * 和 ? 通配符；仅匹配文件名，不支持正则表达式。",
+        "en": "Case-insensitive file name globs with * and ?; regular expressions are not supported."
       }
     },
     "/filesystem/scan_filters/@blacklist/blocked_extensions": {
@@ -1680,10 +1662,6 @@
     }
   },
   "modules": {
-    "directory_prune": {
-      "zh": "跳过目录",
-      "en": "Skip folders"
-    },
     "whitelist": {
       "zh": "白名单",
       "en": "Allow list"

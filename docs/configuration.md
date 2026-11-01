@@ -50,7 +50,13 @@ Set `filesystem.scan_filters_enabled` to `false` to turn off all scan filters. T
 }
 ```
 
-Available filters are `directory_prune` (skip directories), `whitelist` (include selected paths, names, or extensions), `blacklist` (exclude them), `size_range`, and `mtime_range`. Edit their fields in `sunpack_config.json`; the shipped `sunpack_advanced_config.json` shows the expected shapes. Extension filters can hide archives with disguised names.
+Available filters are `blacklist`, `whitelist`, `size_range`, and `mtime_range`. Edit their fields in `sunpack_config.json`; the shipped `sunpack_advanced_config.json` shows the expected shapes. Extension filters can hide archives with disguised names.
+
+Blacklists and whitelists share `path_globs`. Bare names such as `node_modules` match at any depth; rules containing `/`, such as `archives/**` or `cache/private`, are relative to the scan root. A matched directory includes its whole subtree. Matching is case-insensitive: `*` and `?` stay within one path component; `**` crosses directories, and `**/` can match zero levels. Use `**/archives/**` to select `archives` folders at any depth.
+
+`blocked_files` / `allowed_files` also accept `*` and `?` (for example `backup_*.zip` or `temp_??.7z`), but only match file names, never directory names. Other characters, including regex brackets and `+`, are literal. `blocked_extensions` / `allowed_extensions` use exact extensions. Rules inside a field use OR. A blacklist rejects any matching field; a whitelist requires all nonempty fields (for example path `archives/**` AND extension `.zip`). Empty fields impose no restriction. The whitelist keeps parent directories needed to reach an allowed path, so nested archives remain discoverable.
+
+The installer upgrades the former `directory_prune` and `prune_dir_globs` settings into `path_globs`. Runtime configuration uses only the new fields.
 
 Size bounds are inclusive integer bytes from 0 to 18446744073709551615. Equal bounds select one exact size. Time bounds use UTC minute strings in `YYYY-MM-DDTHH:mmZ` format, including the start and excluding the end. `null` leaves that side unbounded; specify both bounds explicitly to override defaults. For example:
 

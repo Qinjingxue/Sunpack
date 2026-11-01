@@ -478,10 +478,10 @@ void virtual_tail(Application& app,const char* list_id,const char* scroll_id,siz
 void scrolled_config_edits(Application& app) {
     auto* window=ui::GetContext().GetWindow(app.window());
     auto* scroll=dynamic_cast<ui::ScrollViewWidget*>(window->Root()->FindById("configListScroll")); assert(scroll);
-    for(auto id:{"/filesystem/scan_filters/0/enabled","/filesystem/scan_filters/0/prune_dir_globs","/runtime/process_mode"}) {
+    for(auto id:{"/filesystem/scan_filters/0/enabled","/filesystem/scan_filters/0/path_globs","/runtime/process_mode"}) {
         const std::string pointer=id;
         const std::string control=(pointer.find("enabled")!=std::string::npos?"toggle-":
-            pointer.find("prune_dir_globs")!=std::string::npos?"tag-input-":"select-")+pointer;
+            pointer.find("path_globs")!=std::string::npos?"tag-input-":"select-")+pointer;
         window->ScrollWithMeasureContext(scroll,0);
         // Visit preceding rows through the real measured scrolling path.
         for(int pass=0;pass<200 && !window->Root()->FindById(control);++pass) {
@@ -1004,7 +1004,7 @@ void range_config(Application& app,const fs::path& dir) {
 // Enter/delete are explicit writes; blur, scrolling and snapshot refreshes
 // must preserve unsubmitted text. This shares the existing configuration fixture.
 void tag_config(Application& app,const fs::path& dir) {
-    const std::string pointer="/filesystem/scan_filters/0/prune_dir_globs",inputId="tag-input-"+pointer;
+    const std::string pointer="/filesystem/scan_filters/0/path_globs",inputId="tag-input-"+pointer;
     auto config=read_json(dir/"sunpack_config.json");
     Json values=Json::array({"",std::string("a")+char(10)+"b","  spaced  ","duplicate","duplicate"});
     for(int i=0;i<180;++i) values.push_back("rule-"+std::to_string(i));

@@ -199,7 +199,7 @@ def test_catalog_head_facts_follow_metadata_and_observation_generations(tmp_path
     stamp = path.stat().st_mtime_ns
     scope = DiscoveryScope(str(tmp_path))
     catalog = NativeWatchCatalog(NativeWatchState())
-    options = NativeDirectoryScanOptions([], [], [], [], [], [], [])
+    options = NativeDirectoryScanOptions([], [], [], [])
     def snapshot(_=None):
         return options.catalog_snapshot(catalog, scope.native, str(path))[1]
     def format_of(view):
@@ -283,7 +283,7 @@ def test_catalog_refined_zip_facts_do_not_hide_replaced_or_missing_volumes(tmp_p
 
 def test_targeted_catalog_updates_preserve_original_depth_pruning_and_conflicts(tmp_path):
     """Full-root scans cannot detect incremental scope widening or stale conflict rows."""
-    from sunpack_native import NativeDirectoryScanOptions
+    from sunpack_native import NativeDirectoryScanOptions, NativePathRule
     from sunpack.runtime.watch.state import WatchStateStore
     root = tmp_path / "input"
     paths = [root / "same.part1.fake", root / "child" / "same.part2.fake",
@@ -292,7 +292,7 @@ def test_targeted_catalog_updates_preserve_original_depth_pruning_and_conflicts(
     for path in paths:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"opaque")
-    options = NativeDirectoryScanOptions([], ["skip"], [], ["same.blocked"], [], [], [])
+    options = NativeDirectoryScanOptions([NativePathRule(["skip"], ["same.blocked"], [])], [], [], [])
     scope = DiscoveryScope(str(root), max_depth=1)
     state = WatchStateStore(str(tmp_path / "state.snapshot"))
     catalog = NativeWatchCatalog(state._native)
@@ -638,7 +638,7 @@ root,folder=sys.argv[1:]
 second=os.path.join(root,'same.002')
 with open(second,'wb') as stream: stream.write(b'two')
 catalog=NativeWatchCatalog(NativeWatchState(),folder)
-options=NativeDirectoryScanOptions([],[],[],[],[],[],[])
+options=NativeDirectoryScanOptions([],[],[],[])
 scope=NativeDiscoveryScope(root,None)
 assert not options.catalog_update(catalog,scope,second)
 # Cursor publication must include all pending changes, even without normal close.
@@ -688,7 +688,7 @@ folder = Path(sys.argv[1])
 root = folder / 'input'
 first, second = root / 'part.001', root / 'part.002'
 first.write_bytes(b'one')
-options = NativeDirectoryScanOptions([], [], [], [], [], [], [])
+options = NativeDirectoryScanOptions([], [], [], [])
 scope = NativeDiscoveryScope(str(root), None)
 catalog = NativeWatchCatalog(NativeWatchState(), str(folder))
 assert not catalog.error, catalog.error

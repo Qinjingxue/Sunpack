@@ -137,6 +137,7 @@ fn sunpack_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<scan::directory::NativeWatchCatalog>()?;
     m.add_class::<scan::catalog::NativeWatchObservation>()?;
     m.add_class::<scan::directory::NativeDirectoryScanOptions>()?;
+    m.add_class::<scan::path_filter::NativePathRule>()?;
     m.add_class::<scan::discovery::NativeCandidateTable>()?;
     m.add_class::<scan::discovery::NativeDiscoveryRoutes>()?;
     m.add_class::<scan::discovery::NativeEmbeddedBatch>()?;

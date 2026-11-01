@@ -23,7 +23,10 @@ def normalize_scan_filters(value: Any) -> list[dict[str, Any]]:
             "name": name.strip(),
             "enabled": require_boolean(item.get("enabled", False), f"filesystem.scan_filters[{index}].enabled"),
         }
-        if normalized["name"] == "size_range":
+        if normalized["name"] in {"blacklist", "whitelist"}:
+            from sunpack.pipeline.discovery.filesystem.filters.path_rule import validate_path_rule_config
+            validate_path_rule_config(normalized)
+        elif normalized["name"] == "size_range":
             from sunpack.pipeline.discovery.filesystem.filters.modules.size_range import size_bounds
             size_bounds(normalized)
         elif normalized["name"] == "mtime_range":

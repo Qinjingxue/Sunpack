@@ -41,16 +41,16 @@ SCAN_STAGE_KEYS = (
 )
 
 
-def _prune_filter(config_path: Path) -> dict[str, Any]:
+def _blacklist_filter(config_path: Path) -> dict[str, Any]:
     config = json.loads(config_path.read_text(encoding="utf-8"))
     for item in config.get("filesystem", {}).get("scan_filters", []):
-        if item.get("name") == "directory_prune" and item.get("enabled", True):
+        if item.get("name") == "blacklist" and item.get("enabled", True):
             return dict(item)
-    raise RuntimeError(f"directory_prune filter not found in {config_path}")
+    raise RuntimeError(f"blacklist filter not found in {config_path}")
 
 
 def _native_options(scenario: str, config_path: Path) -> dict[str, Any]:
-    scan_filters = [] if scenario == "filters_off" else [_prune_filter(config_path)]
+    scan_filters = [] if scenario == "filters_off" else [_blacklist_filter(config_path)]
     config = {
         "filesystem": {
             
@@ -70,10 +70,7 @@ def run_sample(root: Path, scenario: str, config_path: Path) -> dict[str, Any]:
     snapshot, native_profile = profile_directory_scan(
         str(root),
         None,
-        options["patterns"],
-        options["prune_dir_globs"],
-        options["blocked_extensions"],
-        options["blocked_file_names"],
+        options["blacklist_rules"],
         options["size_ranges"],
         options["mtime_ranges"],
         options["whitelist_rules"],
@@ -228,7 +225,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--scenario",
-        choices=("filters_off", "directory_prune", "both"),
+        choices=("filters_off", "blacklist", "both"),
         default="both",
     )
     parser.add_argument("--worker", action="store_true")
@@ -243,7 +240,7 @@ def main() -> None:
         return
 
     scenarios = (
-        ["filters_off", "directory_prune"]
+        ["filters_off", "blacklist"]
         if args.scenario == "both"
         else [args.scenario]
     )

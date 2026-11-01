@@ -41,9 +41,17 @@ scan path does not create per-entry Python dictionaries, `Path` objects, or
 `FileEntry` objects. Custom filters must be expressible through native scan
 parameters or the caller fails explicitly.
 
-Exact `prune_dir_globs` are matched through a case-insensitive name set;
-wildcards are compiled into a regex set. Path patterns match paths relative to
-the selected scan root, and rejected directories are never descended into.
+`NativePathRule(path_globs, file_globs, extensions)` compiles one immutable rule
+shared by directory scans, watch catalogs, inventories and Python entry filters.
+Exact names use a case-insensitive set; globs use precompiled regex sets. Rules
+are shared with scan options through `Arc`, without recompiling or exporting
+native tables to Python. Path rules with `/` are relative to the scan root;
+bare names match at any depth. A directory match includes its subtree. `*` and
+`?` do not cross separators; `**` does, and `**/` also matches zero levels.
+Filename globs only match files; extensions are exact. Blacklists reject any
+matching field. Whitelists require every nonempty field and retain ancestors
+of possible path matches while traversing. Rejected directories are never
+opened.
 
 `profile_directory_scan(...)` is the diagnostic equivalent. It returns the
 same native snapshot plus nanosecond counters for directory enumeration,

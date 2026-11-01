@@ -110,6 +110,20 @@ def test_load_config_validates_scan_filter_entries_even_when_filters_disabled(tm
     with pytest.raises(loader.ConfigError, match=r"filesystem\.scan_filters\[0\]\.enabled"):
         loader.load_config()
 
+    # Path-rule schemas must reject retired fields and malformed lists even
+    # when disabled; otherwise enabling a saved rule can silently widen a scan.
+    for invalid in (
+        {"name": "whitelist", "prune_dir_globs": ["archives"]},
+        {"name": "blacklist", "path_globs": "cache/**"},
+        {"name": "whitelist", "allowed_files": [1]},
+    ):
+        _write_json(simple, {"filesystem": {
+            "scan_filters_enabled": False,
+            "scan_filters": [{**invalid, "enabled": False}],
+        }})
+        with pytest.raises(loader.ConfigError):
+            loader.load_config()
+
 
 def test_load_config_rejects_invalid_runtime_process_mode(tmp_path, monkeypatch):
     simple = tmp_path / "sunpack_config.json"

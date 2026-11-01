@@ -1,5 +1,4 @@
 from pathlib import Path
-import re
 
 from sunpack.core.support.path_keys import case_key
 from sunpack_native import (
@@ -13,10 +12,6 @@ from sunpack.core.contracts.filesystem import DirectorySnapshot, FileEntry
 from sunpack.core.contracts.discovery_scope import DiscoveryScope
 from sunpack.pipeline.discovery.filesystem.filters import build_filters
 from sunpack.pipeline.discovery.filesystem.filters.base import ScanCandidate, ScanFilter
-from sunpack.pipeline.discovery.filesystem.filters.modules.directory_prune import (
-    path_globs as directory_path_globs,
-    prune_dir_globs as directory_prune_dir_globs,
-)
 
 
 class DirectoryScanner:
@@ -71,10 +66,7 @@ class DirectoryScanner:
             str(scanner.root_path),
             paths,
             sizes,
-            options["patterns"],
-            options["prune_dir_globs"],
-            options["blocked_extensions"],
-            options["blocked_file_names"],
+            options["blacklist_rules"],
             options["size_ranges"],
             options["whitelist_rules"],
         ))
@@ -118,24 +110,15 @@ class DirectoryScanner:
         if self._custom_filters:
             return None
 
-        patterns: list[str] = []
-        prune_dir_globs: list[str] = []
-        blocked_extensions: list[str] = []
-        blocked_file_names: list[str] = []
+        blacklist_rules = []
         size_ranges: list[tuple] = []
         mtime_ranges: list[tuple] = []
-        whitelist_rules: list[tuple] = []
+        whitelist_rules = []
         for scan_filter in self.filters:
             name = getattr(scan_filter, "name", "")
             stage = getattr(scan_filter, "stage", "")
-            if name == "directory_prune":
-                prune_config = getattr(scan_filter, "config", {}) or {}
-                prune_dir_globs.extend(directory_prune_dir_globs(prune_config))
-                patterns.extend(_path_glob_to_regex(item) for item in directory_path_globs(prune_config))
-                continue
             if name == "blacklist" and stage == "path":
-                blocked_extensions.extend(getattr(scan_filter, "blocked_extensions", []) or [])
-                blocked_file_names.extend(getattr(scan_filter, "blocked_files", []) or [])
+                blacklist_rules.append(scan_filter.native_rule)
                 continue
             if name == "size_range" and stage == "size":
                 value_range = getattr(scan_filter, "value_range", None)
@@ -144,12 +127,7 @@ class DirectoryScanner:
                 size_ranges.append(_numeric_range_tuple(value_range))
                 continue
             if name == "whitelist":
-                whitelist_rules.append((
-                    list(getattr(scan_filter, "path_patterns", []) or []),
-                    list(getattr(scan_filter, "prune_dirs", []) or []),
-                    list(getattr(scan_filter, "file_patterns", []) or []),
-                    list(getattr(scan_filter, "allowed_extensions", []) or []),
-                ))
+                whitelist_rules.append(scan_filter.native_rule)
                 continue
             if name == "mtime_range":
                 value_range = getattr(scan_filter, "value_range", None)
@@ -160,10 +138,7 @@ class DirectoryScanner:
             return None
 
         return {
-            "patterns": patterns,
-            "prune_dir_globs": prune_dir_globs,
-            "blocked_extensions": blocked_extensions,
-            "blocked_file_names": blocked_file_names,
+            "blacklist_rules": blacklist_rules,
             "size_ranges": size_ranges,
             "mtime_ranges": mtime_ranges,
             "whitelist_rules": whitelist_rules,
@@ -189,12 +164,10 @@ class DirectoryScanner:
                 started = True
             if stop_before_filter is not None and name == stop_before_filter:
                 break
-            if name == "directory_prune":
-                continue
             current = (
                 _apply_size_filter_with_split_anchors(current, scan_filter)
                 if name == "size_range"
-                else apply_filter_to_entries(current, scan_filter)
+                else apply_filter_to_entries(current, scan_filter, root_path=self.root_path)
             )
         return current
 
@@ -267,7 +240,9 @@ def split_size_family_keys(path: str) -> tuple[str, ...]:
     return tuple(str(value) for value in _NATIVE_SPLIT_SIZE_FAMILY_KEYS(str(path)))
 
 
-def apply_filter_to_entries(entries: list[FileEntry], scan_filter: ScanFilter) -> list[FileEntry]:
+def apply_filter_to_entries(
+    entries: list[FileEntry], scan_filter: ScanFilter, *, root_path: Path | None = None,
+) -> list[FileEntry]:
     kept: list[FileEntry] = []
     pruned_dir_keys: set[str] = set()
     for entry in sorted(entries, key=lambda item: (len(item.path.parts), str(item.path).lower())):
@@ -279,6 +254,7 @@ def apply_filter_to_entries(entries: list[FileEntry], scan_filter: ScanFilter) -
             size=entry.size,
             mtime_ns=entry.mtime_ns,
             metadata=entry.metadata,
+            root_path=root_path,
         ))
         if decision.prune_dir and entry.is_dir:
             pruned_dir_keys.add(_path_key(entry.path))
@@ -311,34 +287,6 @@ def _under_any_key(path: Path, parent_keys: set[str]) -> bool:
 
 def _path_key(path: Path) -> str:
     return case_key(path).replace("\\", "/").rstrip("/")
-
-
-def _path_glob_to_regex(pattern: str) -> str:
-    pattern = _normalize_glob(pattern)
-    if not pattern:
-        return r"a\A"
-    if pattern.endswith("/**"):
-        base = pattern[:-3].rstrip("/")
-        if not base:
-            return r".*"
-        return f"(^|/){_glob_path_to_regex(base)}($|/.*)"
-    return f"(^|/){_glob_path_to_regex(pattern)}($|/.*)?"
-
-
-def _normalize_glob(pattern: str) -> str:
-    return str(pattern or "").strip().replace("\\", "/").strip("/")
-
-
-def _glob_path_to_regex(pattern: str) -> str:
-    return "".join(_glob_char_to_regex(char, slash=True) for char in pattern)
-
-
-def _glob_char_to_regex(char: str, *, slash: bool) -> str:
-    if char == "*":
-        return ".*" if slash else r"[^/]*"
-    if char == "?":
-        return "." if slash else r"[^/]"
-    return re.escape(char)
 
 
 def _numeric_range_tuple(value_range) -> tuple:
