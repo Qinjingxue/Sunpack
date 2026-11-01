@@ -135,6 +135,7 @@ async def _handle_add(args, ctx):
         )
     host = require_runtime_host()
     apply_summary = None
+    rejected = []
     if host.watch_enabled:
         apply_summary = await host.add_watch_roots(
             paths,
@@ -145,6 +146,7 @@ async def _handle_add(args, ctx):
         roots_path = apply_summary["roots_path"]
         added = list(apply_summary["added"])
         updated = list(apply_summary["updated"])
+        rejected = list(apply_summary.get("rejected", []))
     else:
         roots_path_obj, added, updated = add_watch_roots(paths, output_dir=output_dir, deep_detect=deep_detect, recursive=recursive)
         roots_path = str(roots_path_obj)
@@ -152,20 +154,26 @@ async def _handle_add(args, ctx):
     if start_requested and not host.watch_enabled:
         start_summary = await host.start_watch()
         if start_summary.get("running"):
+            requested_changes = [*added, *updated]
             _, effective_roots = list_watch_roots()
             added, updated = retained_watch_root_changes(added, updated, effective_roots)
-    return 0, CliCommandResult(
+            retained = {*added, *updated}
+            rejected = [root for root in requested_changes if root not in retained]
+    all_rejected = bool(rejected) and not (added or updated)
+    return (EXIT_TASK_FAILED if all_rejected else 0), CliCommandResult(
         command=COMMAND,
         inputs={"action": "add", "paths": paths, "output_dir": output_dir, "deep_detect": deep_detect},
         summary={
             "roots_path": str(roots_path),
             "added": added,
             "updated": updated,
+            "rejected": rejected,
             "apply": apply_summary,
             "start": start_summary,
             "start_requested": start_requested,
         },
         items=added,
+        errors=[ctx.t("cli.watch.add_all_rejected", paths="\n".join(rejected))] if all_rejected else [],
     )
 
 
