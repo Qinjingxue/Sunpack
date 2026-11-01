@@ -9,12 +9,12 @@ std::wstring TagCollection::label(const Tag& tag) const {
     for(auto& c:text) { if(c==L'\r') c=L'␍'; else if(c==L'\n') c=L'↵'; }
     return text;
 }
-bool TagCollection::SetItems(const std::string& source,const std::wstring& none) {
-    if(source_==source && none_==none) return false;
+bool TagCollection::SetItems(const std::string& source) {
+    if(source_==source) return false;
     auto values=parse_json(source);
     std::vector<Tag> next; next.reserve(values.size());
     for(const auto& value:values) next.push_back({wide(value.at("value").get_ref<const std::string&>()),value.at("regex").get<bool>()});
-    tags_=std::move(next); source_=source; none_=none; width_=-1;
+    tags_=std::move(next); source_=source; width_=-1;
     hovered_=pressed_=-1;
     ui::RequestLayout();
     return true;
@@ -50,10 +50,7 @@ int TagCollection::tag_at(float x,float y) const {
     return -1;
 }
 void TagCollection::OnDraw(ui::Renderer& r) {
-    if(tags_.empty()) {
-        r.DrawText(none_,{rect.left+4,rect.top,rect.right,rect.top+chipHeight},theme::kContentText(),font);
-        return;
-    }
+    if(tags_.empty()) return;
     // Intersect scroll ancestors before searching the first visible row.
     float top=rect.top,bottom=rect.bottom;
     for(auto* p=Parent();p;p=p->Parent()) if(dynamic_cast<ui::ScrollViewWidget*>(p)) { top=std::max(top,p->rect.top); bottom=std::min(bottom,p->rect.bottom); }

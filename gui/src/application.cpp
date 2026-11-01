@@ -19,9 +19,9 @@
 namespace spg {
 namespace {
 bool rule_editor(const Json& editor) { return editor=="rule_list"; }
-void update_tags(TagCollection& tags,const Json& field,const Json& drafts,const std::string& language) {
+void update_tags(TagCollection& tags,const Json& field,const Json& drafts) {
     auto id=field["id"].get<std::string>();
-    tags.SetItems((drafts.contains(id)?drafts[id]["text"]:field["text"]).get_ref<const std::string&>(),wide(tr("noTags",language)));
+    tags.SetItems((drafts.contains(id)?drafts[id]["text"]:field["text"]).get_ref<const std::string&>());
 }
 // Keep host messages outside Core UI's startup/render message range.
 constexpr UINT Dispatch = WM_APP + 0x401, Update = WM_APP + 0x402, DateResult = WM_APP + 0x403, TaskRange = WM_APP + 0x404;
@@ -464,10 +464,9 @@ void Application::sync_toggles() {
 }
 void Application::sync_tags(const std::string& id) {
     auto drafts=page_value(page_,"drafts");
-    auto language=page_value(page_,"language").get<std::string>();
     auto* root=ui::GetContext().GetWindow(window_)->Root().get();
     for(auto& pair:controls_) if((id.empty() || pair.first==id) && rule_editor(pair.second->field["editor"])) {
-        if(auto* tags=dynamic_cast<TagCollection*>(root->FindById("tags-"+pair.first))) update_tags(*tags,pair.second->field,drafts,language);
+        if(auto* tags=dynamic_cast<TagCollection*>(root->FindById("tags-"+pair.first))) update_tags(*tags,pair.second->field,drafts);
     }
 }
 void Application::bind_controls(const Json& fields) {
@@ -495,7 +494,7 @@ void Application::bind_controls(const Json& fields) {
                     auto payload=Json{{"id",id},{"index",index},{"value",utf8(value)},{"regex",regex}}.dump();
                     if(ui_page_call_json(self->page_,"editTag",payload.c_str())!=0) self->set_error("actionError","uiBindingFailed");
                 };
-                update_tags(*tags,binding->field,page_value(self->page_,"drafts"),page_value(self->page_,"language").get<std::string>());
+                update_tags(*tags,binding->field,page_value(self->page_,"drafts"));
                 host->AddChild(tags); return;
             }
             // Nested scope mounting visits descendants again when its parent

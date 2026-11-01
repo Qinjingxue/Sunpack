@@ -26,60 +26,10 @@
         "name": "blacklist",
         "enabled": true,
         "paths": [
-          {
-            "value": ".git",
-            "regex": false
-          },
-          {
-            "value": ".vscode",
-            "regex": false
-          },
-          {
-            "value": "__pycache__",
-            "regex": false
-          },
-          {
-            "value": "node_modules",
-            "regex": false
-          },
-          {
-            "value": "site-packages",
-            "regex": false
-          },
-          {
-            "value": ".venv",
-            "regex": false
-          },
-          {
-            "value": "venv",
-            "regex": false
-          },
-          {
-            "value": "env",
-            "regex": false
-          },
-          {
-            "value": ".cache",
-            "regex": false
-          },
-          {
-            "value": "repositories",
-            "regex": false
-          },
-          {
-            "value": "$RECYCLE.BIN",
-            "regex": false
-          }
+
         ],
         "full_names": [
-          {
-            "value": "Thumbs.db",
-            "regex": false
-          },
-          {
-            "value": "desktop.ini",
-            "regex": false
-          }
+
         ],
         "files": [],
         "extensions": [
@@ -293,34 +243,12 @@
         "name": "whitelist",
         "enabled": false,
         "paths": [
-          {
-            "value": "archives",
-            "regex": false
-          },
-          {
-            "value": "downloads",
-            "regex": false
-          }
+
         ],
         "full_names": [],
         "files": [],
         "extensions": [
-          {
-            "value": "zip",
-            "regex": false
-          },
-          {
-            "value": "zipx",
-            "regex": false
-          },
-          {
-            "value": "7z",
-            "regex": false
-          },
-          {
-            "value": "rar",
-            "regex": false
-          }
+
         ]
       },
       {

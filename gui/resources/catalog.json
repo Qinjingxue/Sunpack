@@ -796,10 +796,6 @@
       "zh": "输入后按 Enter 添加",
       "en": "Type a tag and press Enter"
     },
-    "noTags": {
-      "zh": "暂无条目",
-      "en": "No tags yet"
-    },
     "droppedLogs": {
       "zh": "条日志因写入积压未保存",
       "en": "log entries dropped during write overload"

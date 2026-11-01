@@ -9,7 +9,6 @@ class TagCollection final : public ui::Widget {
     struct Tag { std::wstring value; bool regex=false; float width=-1; D2D1_RECT_F bounds{}; };
     std::vector<Tag> tags_;
     std::string source_;
-    std::wstring none_;
     float width_=-1, height_=28;
     int hovered_=-1, pressed_=-1;
     bool hovered_close_=false, pressed_close_=false;
@@ -18,7 +17,7 @@ class TagCollection final : public ui::Widget {
     D2D1_RECT_F bounds(size_t index) const;
 public:
     std::function<void(size_t,const std::wstring&,bool)> onRemove, onEdit;
-    bool SetItems(const std::string& source,const std::wstring& none);
+    bool SetItems(const std::string& source);
     D2D1_SIZE_F SizeHint() const override { return {0,height_}; }
     void DoLayout() override;
     void OnDraw(ui::Renderer& renderer) override;
