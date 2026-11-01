@@ -150,11 +150,7 @@ def test_deep_detect_only_applies_to_initial_round_in_real_pipeline(tmp_path):
         "recursive_authorization": {"enabled": False},
         "filesystem": {
             "scan_filters_enabled": True,
-            "scan_filters": [{
-                "name": "blacklist",
-                "enabled": True,
-                "blocked_extensions": [".bin", ".apk"],
-            }],
+            "scan_filters": [{'name': 'blacklist', 'enabled': True, 'files': [{'value': '\\.(?:bin|apk)\\z', 'regex': True}]}],
         },
         "output": {"root": str(output_root)},
         "post_extract": {"archive_cleanup_mode": "k", "flatten_single_directory": False},

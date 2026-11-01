@@ -74,6 +74,12 @@ Json describe_setting(const std::string& pointer,const std::string& module,const
 }
 void validate_setting(const std::string& pointer,const Json& value,const std::string& module) {
     const auto& meta=setting(pointer,module);
+    if(meta.value("editor",std::string())=="rule_list") {
+        if(!value.is_array()) throw std::runtime_error("settingTypeMismatch");
+        for(const auto& entry:value) if(!entry.is_object() || entry.size()!=2 ||
+            !entry.contains("value") || !entry["value"].is_string() || entry["value"].get_ref<const std::string&>().empty() ||
+            !entry.contains("regex") || !entry["regex"].is_boolean()) throw std::runtime_error("validation");
+    }
     if(pointer=="/recursive_extract") {
         auto text=value.is_string()?value.get<std::string>():value.dump();
         if(text=="*" || text=="?") return;

@@ -13,14 +13,14 @@ def _entries(snapshot):
     ]
 
 
-def _config(*, path_globs=None):
+def _config(*, paths=None):
     return make_config({
         "filesystem": {
             "scan_filters": [
                 {
                     "name": "blacklist",
                     "enabled": True,
-                    "path_globs": list(path_globs or []),
+                    "paths": list(paths or []),
                 }
             ],
         }
@@ -34,7 +34,7 @@ def test_blacklist_path_exact_name_stops_descending(tmp_path):
     keep = tmp_path / "keep.zip"
     keep.write_bytes(b"PK\x03\x04payload")
 
-    snapshot = DirectoryScanner(str(tmp_path), scope=DiscoveryScope(str(tmp_path), recursive=True), config=_config(path_globs=["ignored"])).scan()
+    snapshot = DirectoryScanner(str(tmp_path), scope=DiscoveryScope(str(tmp_path), recursive=True), config=_config(paths=[{'value':'ignored','regex':False}])).scan()
     paths = {entry.path for entry in _entries(snapshot)}
 
     assert archive not in paths
@@ -42,17 +42,17 @@ def test_blacklist_path_exact_name_stops_descending(tmp_path):
     assert keep in paths
 
 
-def test_blacklist_path_wildcard_matches_directory_name_case_insensitively(tmp_path):
+def test_blacklist_path_regex_matches_directory_name_case_insensitively(tmp_path):
     archive = tmp_path / "Node_Modules" / "payload.zip"
     archive.parent.mkdir()
     archive.write_bytes(b"PK\x03\x04payload")
 
-    snapshot = DirectoryScanner(str(tmp_path), scope=DiscoveryScope(str(tmp_path), recursive=True), config=_config(path_globs=["node_*"])).scan()
+    snapshot = DirectoryScanner(str(tmp_path), scope=DiscoveryScope(str(tmp_path), recursive=True), config=_config(paths=[{'value':r'(?:\A|/)node_[^/]*(?:/|\z)','regex':True}])).scan()
 
     assert not snapshot
 
 
-def test_blacklist_path_glob_is_relative_to_scan_root(tmp_path):
+def test_blacklist_literal_path_is_relative_to_scan_root(tmp_path):
     blocked = tmp_path / "cache" / "private" / "payload.zip"
     allowed = tmp_path / "other" / "cache" / "payload.zip"
     blocked.parent.mkdir(parents=True)
@@ -64,7 +64,7 @@ def test_blacklist_path_glob_is_relative_to_scan_root(tmp_path):
     recycled.write_bytes(b"PK\x03\x04payload")
 
     snapshot = DirectoryScanner(str(tmp_path), scope=DiscoveryScope(str(tmp_path), recursive=True), config=_config(
-        path_globs=["cache/private/**", "$RECYCLE.BIN/**"]
+        paths=[{'value':'cache/private','regex':False},{'value':'$RECYCLE.BIN','regex':False}]
     )).scan()
     paths = {entry.path for entry in _entries(snapshot)}
 
@@ -107,6 +107,7 @@ def test_path_rules_agree_across_scans_watch_and_output_inventories(tmp_path):
         "elsewhere/cache/private/keep_07.zip", "a/x/b/keep_08.zip",
         "a/b/keep_08.zip", "axb/keep_09.zip", "downloads/sub/keep_10.zip",
         "NODE_Modules/deep/keep_11.zip", "keep_12.zip",
+        "中文/报告[1]+.zip", "unicode/Keep.txt", "unicode/ſample.zip",
     }
     for name in names:
         path = root / name
@@ -116,26 +117,36 @@ def test_path_rules_agree_across_scans_watch_and_output_inventories(tmp_path):
     entries = [FileEntry(path=Path(path), is_dir=False, size=6) for path in paths]
     inventory = collect_output_inventory(str(root))
     scope = DiscoveryScope(str(root), recursive=True)
+    def literal(value): return {"value": value, "regex": False}
+    def regex(value): return {"value": value, "regex": True}
     cases = [
         ([{"name": "blacklist", "enabled": True,
-           "path_globs": ["node_*", r"cache\private", "a*b"],
-           "blocked_files": ["keep_0?.rar", "regex[0-9]+.zip"]}],
+           "paths": [regex(r"(?:\A|/)node_[^/]*(?:/|\z)"), literal(r"cache\private"), regex(r"(?:\A|/)a[^/]*b(?:/|\z)")],
+           "files": [regex(r"keep_0[0-9]\.rar\z"), literal("regex[0-9]+.zip")]}],
          names - {"NODE_Modules/deep/keep_11.zip", "cache/private/keep_06.zip",
                   "axb/keep_09.zip", "archives/sub/deeper/keep_02.rar",
                   "archives/sub/deeper/regex[0-9]+.zip"}),
         ([{"name": "whitelist", "enabled": True,
-           "path_globs": ["archives/**", "downloads/**"],
-           "allowed_files": ["keep_??.*", "root.zip"], "allowed_extensions": ["ZIP"]},
-          {"name": "blacklist", "enabled": True, "path_globs": ["archives/skip_*"]}],
+           "paths": [regex(r"\A(?:archives|downloads)(?:/|\z)")],
+           "files": [regex(r"(?:keep_[0-9]{2}|root)\.zip\z")]},
+          {"name": "blacklist", "enabled": True, "paths": [regex(r"\Aarchives/skip_")]}],
          {"archives/root.zip", "archives/sub/deeper/Keep_01.ZIP",
           "archives/sub/deeper/keep_03.zip", "downloads/sub/keep_10.zip"}),
         ([{"name": "whitelist", "enabled": True,
-           "path_globs": ["downloads/sub/**"]}], {"downloads/sub/keep_10.zip"}),
+           "paths": [literal("downloads/sub")]}], {"downloads/sub/keep_10.zip"}),
         ([{"name": "whitelist", "enabled": True,
-           "path_globs": ["**/archives/**", "a/**/b/**"]}],
+           "paths": [regex(r"(?:\A|/)archives(?:/|\z)|\Aa/(?:[^/]+/)*b(?:/|\z)")]}],
          {name for name in names if name.startswith(("archives/", "elsewhere/archives/", "a/"))}),
-        ([{"name": "whitelist", "enabled": True, "path_globs": ["archives"]}],
+        ([{"name": "whitelist", "enabled": True, "paths": [literal("archives")]}],
          {name for name in names if name.startswith(("archives/", "elsewhere/archives/"))}),
+        ([{"name": "whitelist", "enabled": True, "paths": [regex(r"\Adownloads/sub\z")]}],
+         {"downloads/sub/keep_10.zip"}),
+        ([{"name": "whitelist", "enabled": True, "paths": [regex(r"\A中文/\p{L}+\[1\]\+\.zip\z")]}],
+         {"中文/报告[1]+.zip"}),
+        ([{"name": "whitelist", "enabled": True, "files": [literal("Keep.txt"), literal("sample.zip")]}],
+         {"unicode/Keep.txt", "unicode/ſample.zip"}),
+        ([{"name": "whitelist", "enabled": True, "paths": [regex(r"(?-i)\Aarchives/.*Keep_[0-9]+\.ZIP\z")]}],
+         {"archives/sub/deeper/Keep_01.ZIP"}),
     ]
 
     def relative_files(snapshot):
@@ -171,3 +182,25 @@ def test_path_rules_agree_across_scans_watch_and_output_inventories(tmp_path):
 
     with ThreadPoolExecutor(max_workers=4) as pool:
         list(pool.map(run_case, enumerate(cases)))
+
+
+def test_regex_cache_pressure_keeps_concurrent_batch_results():
+    """The filesystem matrix never fills a lazy DFA cache. This small in-memory
+    batch catches lost matches during cache clearing/fallback and concurrent
+    reuse of one compiled rule, without directory or archive startup costs.
+    """
+    import random
+    from concurrent.futures import ThreadPoolExecutor
+    from sunpack_native import NativePathRule
+
+    rng = random.Random(20261101)
+    names = ["".join(rng.choice("01") for _ in range(64)) for _ in range(1024)]
+    paths = [f"C:/input/{name}" for name in names]
+    expected = [index for index, name in enumerate(names) if name[-19] == "1"]
+    rule = NativePathRule([], [{"value": r"\A[01]*1[01]{18}\z", "regex": True}])
+
+    def run(_):
+        assert rule.accepted_indices("C:/input", paths, [False] * len(paths), True) == expected
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        list(pool.map(run, range(8)))

@@ -21,51 +21,85 @@
       {
         "name": "blacklist",
         "enabled": true,
-        "path_globs": [
-          ".git",
-          ".vscode",
-          "__pycache__",
-          "node_modules",
-          "site-packages",
-          ".venv",
-          "venv",
-          "env",
-          ".cache",
-          "repositories",
-          "$RECYCLE.BIN"
+        "paths": [
+          {
+            "value": ".git",
+            "regex": false
+          },
+          {
+            "value": ".vscode",
+            "regex": false
+          },
+          {
+            "value": "__pycache__",
+            "regex": false
+          },
+          {
+            "value": "node_modules",
+            "regex": false
+          },
+          {
+            "value": "site-packages",
+            "regex": false
+          },
+          {
+            "value": ".venv",
+            "regex": false
+          },
+          {
+            "value": "venv",
+            "regex": false
+          },
+          {
+            "value": "env",
+            "regex": false
+          },
+          {
+            "value": ".cache",
+            "regex": false
+          },
+          {
+            "value": "repositories",
+            "regex": false
+          },
+          {
+            "value": "$RECYCLE.BIN",
+            "regex": false
+          }
         ],
-        "blocked_files": [
-          "Thumbs.db",
-          "desktop.ini"
-        ],
-        "blocked_extensions": [
-          ".dll", ".save", ".py", ".pyc", ".json",
-          ".xml", ".cfg", ".ini", ".sys", ".db",
-          ".msi", ".cur", ".ani", ".ttf", ".woff",
-          ".ico", ".pak", ".obb", ".unitypackage", ".jar",
-          ".apk", ".ipa", ".epub", ".odt", ".ods",
-          ".odp", ".docx", ".xlsx", ".pptx", ".whl",
-          ".xpi", ".war", ".ear", ".aab", ".ckpt",
-          ".pt", ".pth", ".safetensors", ".bin", ".dat",
-          ".docm", ".xlsm", ".pptm", ".msix", ".msixbundle",
-          ".crdownload", ".downloading", ".part", ".win", ".iso",".tmp"
+        "files": [
+          {
+            "value": "Thumbs.db",
+            "regex": false
+          },
+          {
+            "value": "desktop.ini",
+            "regex": false
+          },
+          {
+            "value": "\\.(?:dll|save|py|pyc|json|xml|cfg|ini|sys|db|msi|cur|ani|ttf|woff|ico|pak|obb|unitypackage|jar|apk|ipa|epub|odt|ods|odp|docx|xlsx|pptx|whl|xpi|war|ear|aab|ckpt|pt|pth|safetensors|bin|dat|docm|xlsm|pptm|msix|msixbundle|crdownload|downloading|part|win|iso|tmp)\\z",
+            "regex": true
+          }
         ]
       },
       {
         "name": "whitelist",
         "enabled": false,
-        "path_globs": [
-          "archives/**",
-          "downloads/**"
+        "paths": [
+          {
+            "value": "archives",
+            "regex": false
+          },
+          {
+            "value": "downloads",
+            "regex": false
+          }
         ],
-        "allowed_files": [
-          "sample.zip"
-        ],
-        "allowed_extensions": [
-          ".zip",
-          ".zipx",
-          ".7z",
-          ".rar"
+        "files": [
+          {
+            "value": "\\.(?:zip|zipx|7z|rar)\\z",
+            "regex": true
+          }
         ]
       },
       {

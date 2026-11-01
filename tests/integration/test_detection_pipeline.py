@@ -16,7 +16,7 @@ def minimal_config():
             "flatten_single_directory": False,
         },
     }, precheck=[
-        {"name": "blacklist", "enabled": True, "blocked_files": []},
+        {'name': 'blacklist', 'enabled': True, 'files': []},
         {"name": "size_range", "enabled": True, "min_bytes": 0},
         {"name": "zip_structure_accept", "enabled": True},
     ]))

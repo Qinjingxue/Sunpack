@@ -233,11 +233,7 @@ def test_worker_inventory_fused_snapshot_preserves_raw_entries_and_rejects_escap
         },
     }
     inventory = collect_output_inventory(str(tmp_path), worker_result)
-    config = make_config(with_detection_pipeline(precheck=[{
-        "name": "blacklist",
-        "enabled": True,
-        "blocked_extensions": [".tmp"],
-    }]))
+    config = make_config(with_detection_pipeline(precheck=[{'name': 'blacklist', 'enabled': True, 'files': [{'value': '\\.(?:tmp)\\z', 'regex': True}]}]))
     policy = OutputScanPolicy(config)
 
     work = policy.prepare_scan(

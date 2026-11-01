@@ -1937,7 +1937,7 @@ def test_watch_scheduler_does_not_apply_pipeline_filesystem_filters(tmp_path, mo
         config=make_config({
             "filesystem": {
                 "scan_filters": [
-                    {"name": "blacklist", "enabled": True, "blocked_extensions": [".zip"]},
+                    {'name': 'blacklist', 'enabled': True, 'files': [{'value': '\\.(?:zip)\\z', 'regex': True}]},
                 ],
             },
             "watch": {"clipboard_monitor_enabled": False},

@@ -149,7 +149,7 @@ def test_directory_scanner_never_promotes_hard_rejected_split_member(tmp_path):
     snapshot = DirectoryScanner(str(tmp_path), config=make_config({
         "filesystem": {
             "scan_filters": [
-                {"name": "blacklist", "enabled": True, "blocked_files": [blocked_tail.name]},
+                {'name': 'blacklist', 'enabled': True, 'files': [{'value': blocked_tail.name, 'regex': False}]},
                 {"name": "size_range", "enabled": True, "min_bytes": 10},
             ]
         }
@@ -309,7 +309,7 @@ def test_directory_scanner_path_filter_skips_file_before_stat(tmp_path, monkeypa
     snapshot = DirectoryScanner(str(tmp_path), config=make_config({
         "filesystem": {
             "scan_filters": [
-                {"name": "blacklist", "enabled": True, "blocked_extensions": [".py"]},
+                {'name': 'blacklist', 'enabled': True, 'files': [{'value': '\\.(?:py)\\z', 'regex': True}]},
             ]
         }
     })).scan()
@@ -328,7 +328,7 @@ def test_directory_scanner_blacklist_blocks_exact_file_names(tmp_path):
     snapshot = DirectoryScanner(str(tmp_path), config=make_config({
         "filesystem": {
             "scan_filters": [
-                {"name": "blacklist", "enabled": True, "blocked_files": ["thumbs.db"]},
+                {'name': 'blacklist', 'enabled': True, 'files': [{'value': 'thumbs.db', 'regex': False}]},
             ]
         }
     })).scan()
@@ -346,7 +346,7 @@ def test_directory_scanner_scan_filters_global_switch_disables_filters(tmp_path)
         "filesystem": {
             "scan_filters_enabled": False,
             "scan_filters": [
-                {"name": "blacklist", "enabled": True, "blocked_extensions": [".py"]},
+                {'name': 'blacklist', 'enabled': True, 'files': [{'value': '\\.(?:py)\\z', 'regex': True}]},
             ],
         }
     })).scan()
@@ -413,7 +413,7 @@ def test_directory_scanner_whitelist_disabled_does_not_filter(tmp_path):
     snapshot = DirectoryScanner(str(tmp_path), config=make_config({
         "filesystem": {
             "scan_filters": [
-                {"name": "whitelist", "enabled": False, "allowed_extensions": [".zip"]},
+                {'name': 'whitelist', 'enabled': False, 'files': [{'value': '\\.(?:zip)\\z', 'regex': True}]},
             ]
         }
     })).scan()
@@ -423,14 +423,14 @@ def test_directory_scanner_whitelist_disabled_does_not_filter(tmp_path):
     assert "other.rar" in names
 
 
-def test_directory_scanner_whitelist_keeps_only_allowed_extensions(tmp_path):
+def test_directory_scanner_whitelist_keeps_only_filename_suffix_regex(tmp_path):
     (tmp_path / "keep.zip").write_bytes(b"PK\x03\x04payload")
     (tmp_path / "skip.rar").write_bytes(b"Rar!\x1a\x07\x00payload")
 
     snapshot = DirectoryScanner(str(tmp_path), config=make_config({
         "filesystem": {
             "scan_filters": [
-                {"name": "whitelist", "enabled": True, "allowed_extensions": [".zip"]},
+                {'name': 'whitelist', 'enabled': True, 'files': [{'value': '\\.(?:zip)\\z', 'regex': True}]},
             ]
         }
     })).scan()
@@ -440,7 +440,7 @@ def test_directory_scanner_whitelist_keeps_only_allowed_extensions(tmp_path):
     assert "skip.rar" not in names
 
 
-def test_directory_scanner_whitelist_keeps_only_allowed_path_globs(tmp_path):
+def test_directory_scanner_whitelist_keeps_only_rooted_path_regex(tmp_path):
     allowed_dir = tmp_path / "archives"
     blocked_dir = tmp_path / "other"
     allowed_dir.mkdir()
@@ -452,7 +452,7 @@ def test_directory_scanner_whitelist_keeps_only_allowed_path_globs(tmp_path):
         "filesystem": {
             
             "scan_filters": [
-                {"name": "whitelist", "enabled": True, "path_globs": ["archives/**"]},
+                {'name': 'whitelist', 'enabled': True, 'paths': [{'value': r'\Aarchives\z', 'regex': True}]},
             ]
         }
     })).scan()
@@ -473,11 +473,7 @@ def test_directory_scanner_keeps_filter_rejected_files_in_raw_snapshot(tmp_path)
     snapshot = DirectoryScanner(str(tmp_path), include_raw_snapshot=True, config=make_config({
         "filesystem": {
             "scan_filters": [
-                {
-                    "name": "blacklist",
-                    "enabled": True,
-                    "blocked_extensions": [".dll"],
-                },
+                {'name': 'blacklist', 'enabled': True, 'files': [{'value': '\\.(?:dll)\\z', 'regex': True}]},
             ]
         }
     })).scan()
@@ -503,8 +499,8 @@ def test_directory_scanner_whitelist_then_blacklist_both_apply(tmp_path):
     snapshot = DirectoryScanner(str(tmp_path), config=make_config({
         "filesystem": {
             "scan_filters": [
-                {"name": "whitelist", "enabled": True, "allowed_extensions": [".zip", ".py"]},
-                {"name": "blacklist", "enabled": True, "blocked_extensions": [".py"]},
+                {'name': 'whitelist', 'enabled': True, 'files': [{'value': '\\.(?:zip|py)\\z', 'regex': True}]},
+                {'name': 'blacklist', 'enabled': True, 'files': [{'value': '\\.(?:py)\\z', 'regex': True}]},
             ]
         }
     })).scan()
@@ -526,13 +522,7 @@ def test_directory_scanner_whitelist_empty_fields_are_not_restrictions(tmp_path)
         "filesystem": {
             
             "scan_filters": [
-                {
-                    "name": "whitelist",
-                    "enabled": True,
-                    "path_globs": ["archives/**"],
-                    "allowed_files": [],
-                    "allowed_extensions": [".zip"],
-                },
+                {'name': 'whitelist', 'enabled': True, 'paths': [{'value': r'\Aarchives\z', 'regex': True}], 'files': [{'value': '\\.(?:zip)\\z', 'regex': True}]},
             ]
         }
     })).scan()
@@ -552,12 +542,7 @@ def test_directory_scanner_whitelist_non_empty_fields_are_combined_as_constraint
     snapshot = DirectoryScanner(str(tmp_path), config=make_config({
         "filesystem": {
             "scan_filters": [
-                {
-                    "name": "whitelist",
-                    "enabled": True,
-                    "allowed_files": ["sample.zip"],
-                    "allowed_extensions": [".zip"],
-                },
+                {'name': 'whitelist', 'enabled': True, 'files': [{'value': 'sample.zip', 'regex': False}]},
             ]
         }
     })).scan()
@@ -578,7 +563,7 @@ def test_directory_scanner_blacklist_paths_match_whole_components(tmp_path):
     snapshot = DirectoryScanner(str(tmp_path), config=make_config({
         "filesystem": {
             "scan_filters": [
-                {"name": "blacklist", "enabled": True, "path_globs": ["site-packages"]},
+                {'name': 'blacklist', 'enabled': True, 'paths': [{'value': 'site-packages', 'regex': False}]},
             ]
         }
     })).scan()

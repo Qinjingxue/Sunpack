@@ -216,7 +216,10 @@
       "zh": "输出目录",
       "en": "Output folder"
     },
-    "recursiveScan": {"zh": "递归发现", "en": "Recursive discovery"},
+    "recursiveScan": {
+      "zh": "递归发现",
+      "en": "Recursive discovery"
+    },
     "deep": {
       "zh": "深度检测",
       "en": "Deep detection"
@@ -301,10 +304,6 @@
       "zh": "保存",
       "en": "Save"
     },
-    "emptyEntry": {
-      "zh": "（空字符串）",
-      "en": "(empty string)"
-    },
     "operationFailed": {
       "zh": "操作未完成",
       "en": "Could not complete the action"
@@ -369,20 +368,62 @@
       "zh": "失败",
       "en": "Failed"
     },
-    "taskErrorType": { "zh": "错误类型：", "en": "Error type: " },
-    "taskErrorMessage": { "zh": "错误信息：", "en": "Error message: " },
-    "taskError_invalid_input": { "zh": "无效输入", "en": "Invalid input" },
-    "taskError_password_required": { "zh": "需要密码", "en": "Password required" },
-    "taskError_wrong_password": { "zh": "密码错误", "en": "Wrong password" },
-    "taskError_password_inconclusive": { "zh": "密码无法确认", "en": "Password inconclusive" },
-    "taskError_damaged": { "zh": "压缩数据损坏", "en": "Damaged archive data" },
-    "taskError_missing_volume": { "zh": "缺少分卷", "en": "Missing volume" },
-    "taskError_unsupported": { "zh": "不支持的格式", "en": "Unsupported format" },
-    "taskError_backend_unavailable": { "zh": "解压后端不可用", "en": "Extraction backend unavailable" },
-    "taskError_filesystem_error": { "zh": "文件系统错误", "en": "Filesystem error" },
-    "taskError_process_error": { "zh": "解压进程错误", "en": "Extraction process error" },
-    "taskError_embedded_segments_failed": { "zh": "内嵌压缩包处理失败", "en": "Embedded archive processing failed" },
-    "taskError_unknown": { "zh": "未知错误", "en": "Unknown error" },
+    "taskErrorType": {
+      "zh": "错误类型：",
+      "en": "Error type: "
+    },
+    "taskErrorMessage": {
+      "zh": "错误信息：",
+      "en": "Error message: "
+    },
+    "taskError_invalid_input": {
+      "zh": "无效输入",
+      "en": "Invalid input"
+    },
+    "taskError_password_required": {
+      "zh": "需要密码",
+      "en": "Password required"
+    },
+    "taskError_wrong_password": {
+      "zh": "密码错误",
+      "en": "Wrong password"
+    },
+    "taskError_password_inconclusive": {
+      "zh": "密码无法确认",
+      "en": "Password inconclusive"
+    },
+    "taskError_damaged": {
+      "zh": "压缩数据损坏",
+      "en": "Damaged archive data"
+    },
+    "taskError_missing_volume": {
+      "zh": "缺少分卷",
+      "en": "Missing volume"
+    },
+    "taskError_unsupported": {
+      "zh": "不支持的格式",
+      "en": "Unsupported format"
+    },
+    "taskError_backend_unavailable": {
+      "zh": "解压后端不可用",
+      "en": "Extraction backend unavailable"
+    },
+    "taskError_filesystem_error": {
+      "zh": "文件系统错误",
+      "en": "Filesystem error"
+    },
+    "taskError_process_error": {
+      "zh": "解压进程错误",
+      "en": "Extraction process error"
+    },
+    "taskError_embedded_segments_failed": {
+      "zh": "内嵌压缩包处理失败",
+      "en": "Embedded archive processing failed"
+    },
+    "taskError_unknown": {
+      "zh": "未知错误",
+      "en": "Unknown error"
+    },
     "taskWaitingPassword": {
       "zh": "等待密码",
       "en": "Waiting for password"
@@ -762,6 +803,18 @@
     "droppedLogs": {
       "zh": "条日志因写入积压未保存",
       "en": "log entries dropped during write overload"
+    },
+    "regexMode": {
+      "zh": "正则",
+      "en": "Regex"
+    },
+    "tagEditPlaceholder": {
+      "zh": "修改后按 Enter 保存",
+      "en": "Press Enter to save changes"
+    },
+    "cancelTagEdit": {
+      "zh": "取消编辑",
+      "en": "Cancel edit"
     }
   },
   "groups": {
@@ -997,72 +1050,12 @@
       "label": {
         "zh": "白名单",
         "en": "Allow list"
-      },
-      "description": {
-        "zh": "同一字段内任一规则命中即可；路径、文件名和扩展名条件须同时满足，空字段不限制。",
-        "en": "Rules within a field use OR; nonempty path, file name and extension fields must all match. Empty fields impose no restriction."
-      }
-    },
-    "/filesystem/scan_filters/@whitelist/path_globs": {
-      "label": {
-        "zh": "路径规则",
-        "en": "Path patterns"
-      },
-      "description": {
-        "zh": "不区分大小写；*、? 不跨目录，** 跨目录。单独名称匹配任意层级，含 / 的规则相对扫描根目录；目录命中后包含整个子树。",
-        "en": "Case-insensitive; * and ? stay within a component, ** crosses folders. Bare names match at any depth; rules with / are relative to the scan root. A folder match includes its subtree."
-      }
-    },
-    "/filesystem/scan_filters/@whitelist/allowed_files": {
-      "label": {
-        "zh": "文件名",
-        "en": "File names"
-      },
-      "description": {
-        "zh": "不区分大小写，支持 * 和 ? 通配符；仅匹配文件名，不支持正则表达式。",
-        "en": "Case-insensitive file name globs with * and ?; regular expressions are not supported."
-      }
-    },
-    "/filesystem/scan_filters/@whitelist/allowed_extensions": {
-      "label": {
-        "zh": "扩展名",
-        "en": "Extensions"
       }
     },
     "/filesystem/scan_filters/@blacklist/enabled": {
       "label": {
         "zh": "黑名单",
         "en": "Block list"
-      },
-      "description": {
-        "zh": "路径、文件名或扩展名任一条件命中即跳过；命中的目录不再扫描。",
-        "en": "Skip matches in any path, file name or extension field. Matched folders are not scanned."
-      }
-    },
-    "/filesystem/scan_filters/@blacklist/path_globs": {
-      "label": {
-        "zh": "路径规则",
-        "en": "Path patterns"
-      },
-      "description": {
-        "zh": "不区分大小写；*、? 不跨目录，** 跨目录。单独名称匹配任意层级，含 / 的规则相对扫描根目录；目录命中后包含整个子树。",
-        "en": "Case-insensitive; * and ? stay within a component, ** crosses folders. Bare names match at any depth; rules with / are relative to the scan root. A folder match includes its subtree."
-      }
-    },
-    "/filesystem/scan_filters/@blacklist/blocked_files": {
-      "label": {
-        "zh": "文件名",
-        "en": "File names"
-      },
-      "description": {
-        "zh": "不区分大小写，支持 * 和 ? 通配符；仅匹配文件名，不支持正则表达式。",
-        "en": "Case-insensitive file name globs with * and ?; regular expressions are not supported."
-      }
-    },
-    "/filesystem/scan_filters/@blacklist/blocked_extensions": {
-      "label": {
-        "zh": "扩展名",
-        "en": "Extensions"
       }
     },
     "/performance/persistent_server_idle_seconds": {
@@ -1659,6 +1652,34 @@
         "zh": "保留最近指定天数的任务历史和事件，CLI 与监控模式共用。",
         "en": "Retain task history and events for this many days, shared by CLI and Watch."
       }
+    },
+    "/filesystem/scan_filters/@blacklist/paths": {
+      "label": {
+        "zh": "路径",
+        "en": "Paths"
+      },
+      "editor": "rule_list"
+    },
+    "/filesystem/scan_filters/@blacklist/files": {
+      "label": {
+        "zh": "文件名",
+        "en": "File names"
+      },
+      "editor": "rule_list"
+    },
+    "/filesystem/scan_filters/@whitelist/paths": {
+      "label": {
+        "zh": "路径",
+        "en": "Paths"
+      },
+      "editor": "rule_list"
+    },
+    "/filesystem/scan_filters/@whitelist/files": {
+      "label": {
+        "zh": "文件名",
+        "en": "File names"
+      },
+      "editor": "rule_list"
     }
   },
   "modules": {

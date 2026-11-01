@@ -57,7 +57,7 @@ fs::path choose_directory(HWND owner, const fs::path& initial = {});
 std::wstring quote_arg(const std::wstring& arg);
 struct CliCommand { fs::path executable, cwd; std::vector<std::wstring> prefix; };
 struct CliResult { DWORD code; std::string output; };
-CliResult run_cli(const CliCommand& cli, const std::vector<std::wstring>& args, HANDLE stop);
+CliResult run_cli(const CliCommand& cli, const std::vector<std::wstring>& args, HANDLE stop,const std::string* input=nullptr);
 fs::path executable_path();
 // Owned and destroyed on the thread that performs the alertable SCM wait.
 class ServiceMonitor {

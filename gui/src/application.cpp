@@ -18,9 +18,10 @@
 
 namespace spg {
 namespace {
+bool rule_editor(const Json& editor) { return editor=="rule_list"; }
 void update_tags(TagCollection& tags,const Json& field,const Json& drafts,const std::string& language) {
     auto id=field["id"].get<std::string>();
-    tags.SetItems((drafts.contains(id)?drafts[id]["text"]:field["text"]).get_ref<const std::string&>(),wide(tr("emptyEntry",language)),wide(tr("noTags",language)));
+    tags.SetItems((drafts.contains(id)?drafts[id]["text"]:field["text"]).get_ref<const std::string&>(),wide(tr("noTags",language)));
 }
 // Keep host messages outside Core UI's startup/render message range.
 constexpr UINT Dispatch = WM_APP + 0x401, Update = WM_APP + 0x402, DateResult = WM_APP + 0x403, TaskRange = WM_APP + 0x404;
@@ -380,7 +381,7 @@ void Application::apply_pending() {
         for(auto it=controls_.begin();it!=controls_.end();) {
             bool exists=std::any_of(patch["fields"].begin(),patch["fields"].end(),[&](const Json& f){return f["id"]==it->first;});
             if(!exists) {
-                auto host=(it->second->field["editor"]=="toggle"?"toggle-host-":it->second->field["editor"]=="list"?"tags-host-":"choice-")+it->first;
+                auto host=(it->second->field["editor"]=="toggle"?"toggle-host-":rule_editor(it->second->field["editor"])?"tags-host-":"choice-")+it->first;
                 ui_page_on_widget_mount(page_,host.c_str(),nullptr,nullptr);
                 ui_page_on_widget_unmount(page_,host.c_str(),nullptr,nullptr);
                 it=controls_.erase(it); continue;
@@ -430,6 +431,8 @@ void Application::navigate(const std::string& tab) {
     VisualBatch visual(window_);
     ui_window_focus_widget(window_,0);
     ui_page_set_json(page_,"tagInputs","{}");
+    ui_page_set_json(page_,"tagModes","{}");
+    ui_page_set_json(page_,"tagEdits","{}");
     const auto previous=page_value(page_,"tab").get<std::string>();
     auto sidebar=[](const std::string& section)->const char* {
         return section=="config"?"configSidebar":section=="tasks" || section=="passwords"?"directoryPane":nullptr;
@@ -463,30 +466,34 @@ void Application::sync_tags(const std::string& id) {
     auto drafts=page_value(page_,"drafts");
     auto language=page_value(page_,"language").get<std::string>();
     auto* root=ui::GetContext().GetWindow(window_)->Root().get();
-    for(auto& pair:controls_) if((id.empty() || pair.first==id) && pair.second->field["editor"]=="list") {
+    for(auto& pair:controls_) if((id.empty() || pair.first==id) && rule_editor(pair.second->field["editor"])) {
         if(auto* tags=dynamic_cast<TagCollection*>(root->FindById("tags-"+pair.first))) update_tags(*tags,pair.second->field,drafts,language);
     }
 }
 void Application::bind_controls(const Json& fields) {
     for(auto& field:fields) {
         auto editor=field.value("editor",std::string());
-        if(editor!="choice" && editor!="recursive" && editor!="toggle" && editor!="list") continue;
+        if(editor!="choice" && editor!="recursive" && editor!="toggle" && !rule_editor(editor)) continue;
         auto id=field["id"].get<std::string>();
         auto& binding=controls_[id];
         if(!binding) binding=std::make_unique<ControlBinding>(ControlBinding{this,field});
         else binding->field=field;
-        auto host=(editor=="toggle"?"toggle-host-":editor=="list"?"tags-host-":"choice-")+id;
+        auto host=(editor=="toggle"?"toggle-host-":rule_editor(editor)?"tags-host-":"choice-")+id;
         ui_page_on_widget_mount(page_,host.c_str(),[](UiPage,UiWidget parent,void* context){
             auto* binding=static_cast<ControlBinding*>(context); auto* self=binding->owner;
             auto id=binding->field["id"].get<std::string>();
             bool toggle=binding->field["editor"]=="toggle";
-            if(binding->field["editor"]=="list") {
+            if(rule_editor(binding->field["editor"])) {
                 auto* host=ui::GetContext().handles.LookupRaw(parent);
                 if(!host || host->FindById("tags-"+id)) return;
                 auto tags=std::make_shared<TagCollection>(); tags->id="tags-"+id;
-                tags->onRemove=[self,id](size_t index,const std::wstring& value) {
-                    auto payload=Json{{"id",id},{"index",index},{"value",utf8(value)}}.dump();
+                tags->onRemove=[self,id](size_t index,const std::wstring& value,bool regex) {
+                    auto payload=Json{{"id",id},{"index",index},{"value",utf8(value)},{"regex",regex}}.dump();
                     if(ui_page_call_json(self->page_,"removeTag",payload.c_str())!=0) self->set_error("actionError","uiBindingFailed");
+                };
+                tags->onEdit=[self,id](size_t index,const std::wstring& value,bool regex) {
+                    auto payload=Json{{"id",id},{"index",index},{"value",utf8(value)},{"regex",regex}}.dump();
+                    if(ui_page_call_json(self->page_,"editTag",payload.c_str())!=0) self->set_error("actionError","uiBindingFailed");
                 };
                 update_tags(*tags,binding->field,page_value(self->page_,"drafts"),page_value(self->page_,"language").get<std::string>());
                 host->AddChild(tags); return;
@@ -546,7 +553,7 @@ void Application::bind_controls(const Json& fields) {
         },binding.get());
         ui_page_on_widget_unmount(page_,host.c_str(),[](UiPage,UiWidget widget,void*){
             auto* host=ui::GetContext().handles.LookupRaw(widget);
-            if(host) for(auto& child:host->Children()) if(auto* tags=dynamic_cast<TagCollection*>(child.get())) tags->onRemove={};
+            if(host) for(auto& child:host->Children()) if(auto* tags=dynamic_cast<TagCollection*>(child.get())) { tags->onRemove={}; tags->onEdit={}; }
             ui_widget_destroy(widget);
         },nullptr);
     }
@@ -598,6 +605,11 @@ void Application::handle_command(Json command) {
     auto op=command.value("op",std::string());
     auto p=command.value("payload",Json::object());
     if(op=="navigate") { navigate(p.value("tab",std::string())); return; }
+    if(op=="focusTag") {
+        auto widget=ui_widget_find_by_id(ui_page_root(page_),("tag-input-"+p.at("id").get<std::string>()).c_str());
+        if(widget) { ui_window_focus_widget(window_,widget); ui_widget_destroy(widget); }
+        return;
+    }
     if(op=="syncTags") { sync_tags(p.at("id").get<std::string>()); return; }
     if(op=="scrollTop") {
         if(p.contains("category") && page_value(page_,"configCategory")==p["category"]) return;
@@ -607,6 +619,8 @@ void Application::handle_command(Json command) {
             // Commit category and viewport together. Filtering updates the
             // contents directly, including while a main-page move is active.
             ui_page_set_json(page_,"tagInputs","{}");
+            ui_page_set_json(page_,"tagModes","{}");
+            ui_page_set_json(page_,"tagEdits","{}");
             set_text(page_,"configCategory",p.at("category").get<std::string>());
         }
         const char* scroll=id=="configBlocks"?"configListScroll":id=="directoryItems"?"directoryListScroll":nullptr;
@@ -1023,6 +1037,22 @@ void Application::work() {
                         passwords_changed=true;
                     } else if(op=="commit") {
                         auto kind=p.at("kind").get<std::string>();
+                        if(kind=="config") for(const auto& edit:p.at("fields")) {
+                            auto pointer=edit.at("pointer").get<std::string>();
+                            auto slash=pointer.find_last_of('/');
+                            auto field=pointer.substr(slash+1);
+                            if(pointer.rfind("/filesystem/scan_filters/",0)!=0 || (field!="paths" && field!="files")) continue;
+                            if(!options_.allow_cli) throw std::runtime_error("cliUnbound");
+                            auto input=Json{{field,parse_json(edit.at("text").get<std::string>())}}.dump(-1,' ',true)+"\n";
+                            auto check=run_cli(options_.cli,{L"config",L"validate",L"--scan-rule-stdin",L"--json"},stop_,&input);
+                            if(check.code!=0) {
+                                auto report=Json::parse(check.output,nullptr,false);
+                                auto errors=report.is_object()?report.value("errors",Json::array()):Json::array();
+                                std::string message;
+                                for(const auto& error:errors) { if(!message.empty()) message+='\n'; message+=error.get<std::string>(); }
+                                throw std::runtime_error(message.empty()?"validation":message);
+                            }
+                        }
                         PasswordSaveSnapshot saved_passwords;
                         Json password_edits=Json::array();
                         if(kind=="passwords") {

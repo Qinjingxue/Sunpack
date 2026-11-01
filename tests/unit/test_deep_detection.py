@@ -13,8 +13,8 @@ from tests.helpers.config_factory import make_config
 
 
 @pytest.mark.parametrize("rule", [
-    {"name": "blacklist", "enabled": True, "blocked_extensions": [".bin"]},
-    {"name": "whitelist", "enabled": True, "allowed_extensions": [".zip"]},
+    {'name': 'blacklist', 'enabled': True, 'files': [{'value': '\\.(?:bin)\\z', 'regex': True}]},
+    {'name': 'whitelist', 'enabled': True, 'files': [{'value': '\\.(?:zip)\\z', 'regex': True}]},
     {"name": "size_range", "enabled": True, "min_bytes": 1024},
     {"name": "mtime_range", "enabled": True, "end_utc": "1970-01-01T00:00Z"},
 ])

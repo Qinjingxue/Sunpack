@@ -52,11 +52,44 @@ Set `filesystem.scan_filters_enabled` to `false` to turn off all scan filters. T
 
 Available filters are `blacklist`, `whitelist`, `size_range`, and `mtime_range`. Edit their fields in `sunpack_config.json`; the shipped `sunpack_advanced_config.json` shows the expected shapes. Extension filters can hide archives with disguised names.
 
-Blacklists and whitelists share `path_globs`. Bare names such as `node_modules` match at any depth; rules containing `/`, such as `archives/**` or `cache/private`, are relative to the scan root. A matched directory includes its whole subtree. Matching is case-insensitive: `*` and `?` stay within one path component; `**` crosses directories, and `**/` can match zero levels. Use `**/archives/**` to select `archives` folders at any depth.
+Blacklists and whitelists contain only `paths` and `files`, both arrays of records:
 
-`blocked_files` / `allowed_files` also accept `*` and `?` (for example `backup_*.zip` or `temp_??.7z`), but only match file names, never directory names. Other characters, including regex brackets and `+`, are literal. `blocked_extensions` / `allowed_extensions` use exact extensions. Rules inside a field use OR. A blacklist rejects any matching field; a whitelist requires all nonempty fields (for example path `archives/**` AND extension `.zip`). Empty fields impose no restriction. The whitelist keeps parent directories needed to reach an allowed path, so nested archives remain discoverable.
+```json
+{
+  "name": "blacklist",
+  "enabled": true,
+  "paths": [{"value": ".git", "regex": false}],
+  "files": [
+    {"value": "report[final]+.zip", "regex": false},
+    {"value": "\\.(?:tmp|log|bak)\\z", "regex": true}
+  ]
+}
+```
 
-The installer upgrades the former `directory_prune` and `prune_dir_globs` settings into `path_globs`. Runtime configuration uses only the new fields.
+Each record has an independent `regex` boolean. Disabled means literal matching;
+enabled uses Rust regex syntax, which excludes look-around and backreferences.
+Literal filenames match the entire basename; regex records search the basename.
+Extensions are filename regexes too. Matching defaults to Unicode-aware case
+insensitivity; regex inline flags may override this.
+
+A bare literal path matches a component at any depth. Literals containing `/` or
+`\` are relative to the scan root. Path regexes search root-relative paths with
+`/` separators; the expression itself is preserved. A matched directory includes
+its subtree, including matches ending in `\z`: `\Adownloads\z` selects the root's
+downloads directory and its descendants. The scan root itself is never pruned.
+Whitelist traversal retains ancestors of possible matches; unanchored regexes
+may match at any depth. A field uses OR; blacklists reject any matching field,
+while whitelists require every nonempty field. Empty arrays impose no restriction.
+
+The GUI checkbox controls the current record and defaults off. Click a tag to
+edit it; blue tags with `.*` denote regex records. Enter submits the change.
+Validation failures retain the draft and leave the saved configuration intact.
+Enter regex backslashes normally in the GUI; saving handles JSON escaping.
+
+The installer converts old Glob, directory-prune and extension fields into the
+new records, preserving switches and root anchoring. An old whitelist filename /
+extension intersection may become two ordinary whitelist modules to preserve
+its meaning. Migration is idempotent; the runtime accepts only the new fields.
 
 Size bounds are inclusive integer bytes from 0 to 18446744073709551615. Equal bounds select one exact size. Time bounds use UTC minute strings in `YYYY-MM-DDTHH:mmZ` format, including the start and excluding the end. `null` leaves that side unbounded; specify both bounds explicitly to override defaults. For example:
 

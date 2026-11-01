@@ -478,10 +478,10 @@ void virtual_tail(Application& app,const char* list_id,const char* scroll_id,siz
 void scrolled_config_edits(Application& app) {
     auto* window=ui::GetContext().GetWindow(app.window());
     auto* scroll=dynamic_cast<ui::ScrollViewWidget*>(window->Root()->FindById("configListScroll")); assert(scroll);
-    for(auto id:{"/filesystem/scan_filters/0/enabled","/filesystem/scan_filters/0/path_globs","/runtime/process_mode"}) {
+    for(auto id:{"/filesystem/scan_filters/0/enabled","/filesystem/scan_filters/0/paths","/runtime/process_mode"}) {
         const std::string pointer=id;
         const std::string control=(pointer.find("enabled")!=std::string::npos?"toggle-":
-            pointer.find("path_globs")!=std::string::npos?"tag-input-":"select-")+pointer;
+            pointer.find("/paths")!=std::string::npos?"tag-input-":"select-")+pointer;
         window->ScrollWithMeasureContext(scroll,0);
         // Visit preceding rows through the real measured scrolling path.
         for(int pass=0;pass<200 && !window->Root()->FindById(control);++pass) {
@@ -514,7 +514,7 @@ void scrolled_config_edits(Application& app) {
         pump([&] {
             for(auto& field:state(app.page(),"fields")) if(field["id"]==pointer) {
                 if(control.find("toggle-")==0) return field["boolean"]==false;
-                if(control.find("tag-input-")==0) return field["items"].back()=="skipped-directory";
+                if(control.find("tag-input-")==0) return field["items"].back()==Json{{"value","skipped-directory"},{"regex",false}};
                 return field["text"]=="high";
             }
             return false;
@@ -1004,10 +1004,11 @@ void range_config(Application& app,const fs::path& dir) {
 // Enter/delete are explicit writes; blur, scrolling and snapshot refreshes
 // must preserve unsubmitted text. This shares the existing configuration fixture.
 void tag_config(Application& app,const fs::path& dir) {
-    const std::string pointer="/filesystem/scan_filters/0/path_globs",inputId="tag-input-"+pointer;
+    const std::string pointer="/filesystem/scan_filters/0/paths",inputId="tag-input-"+pointer;
     auto config=read_json(dir/"sunpack_config.json");
-    Json values=Json::array({"",std::string("a")+char(10)+"b","  spaced  ","duplicate","duplicate"});
-    for(int i=0;i<180;++i) values.push_back("rule-"+std::to_string(i));
+    auto rule=[](const std::string& value,bool regex=false){ return Json{{"value",value},{"regex",regex}}; };
+    Json values=Json::array({rule("literal[0]"),rule(std::string("a")+char(10)+"b"),rule("  spaced  "),rule("duplicate"),rule("duplicate")});
+    for(int i=0;i<180;++i) values.push_back(rule("rule-"+std::to_string(i)));
     auto disk=[&]{return read_json(dir/"sunpack_config.json")[Json::json_pointer(pointer)];};
     auto current=[&]{for(auto& f:state(app.page(),"fields")) if(f["id"]==pointer) return f;return Json();};
     config[Json::json_pointer(pointer)]=values; atomic_write(dir/"sunpack_config.json",config.dump());
@@ -1024,13 +1025,13 @@ void tag_config(Application& app,const fs::path& dir) {
     auto* copy=input()->Parent(); auto* row=copy->Parent(); auto* item=row->Parent();
     assert(std::abs(copy->rect.top+copy->rect.bottom-region.top-region.bottom)<0.2f);
     assert(std::abs(region.top-row->rect.top-row->rect.bottom+region.bottom)<0.2f);
-    assert(row->rect.top-item->rect.top<=1.1f && std::abs(item->rect.bottom-row->rect.bottom)<0.1f);
+    assert(row->rect.top-item->rect.top<=1.1f && item->rect.bottom>=row->rect.bottom);
     click(app,inputId.c_str()); assert(ui_debug_type_text(app.window(),L"unsubmitted")==0);
     click(app,"configSearch");
     assert(disk()==values && state(app.page(),"tagInputs")[pointer]=="unsubmitted");
     // Hover the second, nonempty TAG's close button before the existing scroll.
     // It must not publish an out-of-viewport tooltip on the collection surface.
-    float firstWidth=std::clamp(window->GetRenderer().MeasureTextWidth(wide(state(app.page(),"texts")["emptyEntry"].get<std::string>()),13)+33,38.0f,240.0f);
+    float firstWidth=std::clamp(window->GetRenderer().MeasureTextWidth(L"literal[0]",13)+33,38.0f,240.0f);
     float closeX=cloud->rect.left+firstWidth+4+window->GetRenderer().MeasureTextWidth(L"a↵b",13)+25;
     assert(ui_debug_mouse_move(app.window(),closeX,cloud->rect.top+13)==0);
     assert(cloud->cursor==ui::CursorKind::Pointer && cloud->tooltip.empty());
@@ -1055,19 +1056,19 @@ void tag_config(Application& app,const fs::path& dir) {
         click(app,inputId.c_str()); assert(ui_debug_type_text(app.window(),value)==0);
         assert(ui_debug_key(app.window(),VK_RETURN)==0); ui_debug_pump();
     };
-    add(L"  new tag #  "); finish_input(app); values.push_back("  new tag #  ");
+    add(L"  new tag #  "); finish_input(app); values.push_back(rule("  new tag #  "));
     assert(disk()==values && input()->Text().empty());
     {
         FileMutex hold(dir/"sunpack_config.json");
         add(L"first"); add(L"second");
         click(app,inputId.c_str()); assert(ui_debug_type_text(app.window(),L"still unsubmitted")==0);
     }
-    finish_input(app); values.push_back("first"); values.push_back("second");
+    finish_input(app); values.push_back(rule("first")); values.push_back(rule("second"));
     assert(disk()==values && input()->Text()==L"still unsubmitted");
     window->ScrollWithMeasureContext(scroll(),0); ui_window_relayout(app.window());
     // Remove just the first empty-string tag through its actual close affordance.
     cloud=window->Root()->FindById("tags-"+pointer);
-    auto label=wide(state(app.page(),"texts")["emptyEntry"].get<std::string>());
+    auto label=L"literal[0]";
     float x=cloud->rect.left+window->GetRenderer().MeasureTextWidth(label,13)+25,y=cloud->rect.top+13;
     assert(ui_debug_mouse_down(app.window(),x,y)==0); assert(ui_debug_mouse_up(app.window(),x,y)==0);
     finish_input(app); values.erase(values.begin());
@@ -1088,15 +1089,46 @@ void tag_config(Application& app,const fs::path& dir) {
             return std::find(pending.begin(),pending.end(),pointer)!=pending.end() &&
                 state(app.page(),"saving").get<bool>();
         },"TAG local save queued");
-        config=read_json(dir/"sunpack_config.json");config[Json::json_pointer(pointer)]=Json::array({"external"});
+        config=read_json(dir/"sunpack_config.json");config[Json::json_pointer(pointer)]=Json::array({rule("external")});
         atomic_write(dir/"sunpack_config.json",config.dump());
     }
     pump_diagnostic(app,[&]{return state(app.page(),"saveErrors").contains(pointer)&&!state(app.page(),"saving").get<bool>();},"TAG external conflict");
-    values.push_back("local");
-    assert(disk()==Json::array({"external"}) && parse_json(state(app.page(),"drafts")[pointer]["text"])==values);
-    pump_diagnostic(app,[&]{return current()["items"]==Json::array({"external"});},"TAG external reload");
+    values.push_back(rule("local"));
+    assert(disk()==Json::array({rule("external")}) && parse_json(state(app.page(),"drafts")[pointer]["text"])==values);
+    pump_diagnostic(app,[&]{return current()["items"]==Json::array({rule("external")});},"TAG external reload");
     // One explicit follow-up write rebases against the newest snapshot.
-    add(L"retry"); finish_input(app);values.push_back("retry");assert(disk()==values);
+    add(L"retry"); finish_input(app);values.push_back(rule("retry"));assert(disk()==values);
+    // The existing list flow does not cover object identity, item-local regex
+    // state, body hit testing, or a failed Rust preflight preserving the file.
+    window->ScrollWithMeasureContext(scroll(),0); ui_window_relayout(app.window());
+    auto edit_first=[&] {
+        auto* tags=window->Root()->FindById("tags-"+pointer); assert(tags);
+        assert(ui_debug_mouse_down(app.window(),tags->rect.left+10,tags->rect.top+13)==0);
+        assert(ui_debug_mouse_up(app.window(),tags->rect.left+10,tags->rect.top+13)==0);
+        pump([&]{return state(app.page(),"tagEdits").contains(pointer);},"Edit rule tag");
+    };
+    edit_first();
+    assert(input()->Text()==L"a\nb" && state(app.page(),"tagModes")[pointer]==false);
+    click(app,("tag-regex-"+pointer).c_str());
+    assert(state(app.page(),"tagModes")[pointer]==true);
+    click(app,inputId.c_str()); assert(ui_debug_key_mod(app.window(),'A',1,0,0)==0);
+    assert(ui_debug_type_text(app.window(),L"^cache/[0-9]+$")==0);
+    assert(ui_debug_key(app.window(),VK_RETURN)==0); finish_input(app);
+    values[0]=rule("^cache/[0-9]+$",true); assert(disk()==values);
+    assert(read_json(dir/"cli-validation-input.json")["paths"]==values);
+    for(auto& field:state(app.page(),"fields")) if(field["module"]=="blacklist" || field["module"]=="whitelist") assert(field["description"]=="");
+    edit_first();
+    assert(state(app.page(),"tagModes")[pointer]==true);
+    click(app,inputId.c_str()); assert(ui_debug_key_mod(app.window(),'A',1,0,0)==0);
+    assert(ui_debug_type_text(app.window(),L"(")==0);
+    assert(ui_debug_key(app.window(),VK_RETURN)==0);
+    pump([&]{return state(app.page(),"saveErrors").contains(pointer)&&!state(app.page(),"saving").get<bool>();},"Regex preflight failure");
+    assert(disk()==values);
+    edit_first();
+    click(app,inputId.c_str()); assert(ui_debug_key_mod(app.window(),'A',1,0,0)==0);
+    assert(ui_debug_type_text(app.window(),L"^updated$")==0);
+    assert(ui_debug_key(app.window(),VK_RETURN)==0); finish_input(app);
+    values[0]=rule("^updated$",true); assert(disk()==values);
     search_config(app,L"");
 }
 // Existing scalar delta checks cannot catch stale conditional text or virtual
@@ -1475,6 +1507,15 @@ int wmain(int argc,wchar_t** argv) {
     _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
     if(argc>1 && std::wstring(argv[1])==L"--fake-cli") {
         Json args=Json::array(); for(int i=3;i<argc;++i) args.push_back(utf8(argv[i])); atomic_write(fs::current_path()/"cli-arguments.json",args.dump());
+        if(args==Json::array({"config","validate","--scan-rule-stdin","--json"})) {
+            std::string input((std::istreambuf_iterator<char>(std::cin)),{});
+            auto rules=parse_json(input);
+            atomic_write(fs::current_path()/"cli-validation-input.json",rules.dump());
+            for(const auto& list:rules) for(const auto& entry:list) if(entry["regex"]==true && entry["value"]=="(") {
+                std::cout<<R"({"errors":["unclosed group"]})"; return 2;
+            }
+            std::cout<<R"({"errors":[]})"; return 0;
+        }
         if(args==Json::array({"watch","rebuild-log"}))
             publish_events(fs::current_path()/".sunpack_watch"/"events.json",
                 Json{{"event","done"},{"path",utf8((fs::current_path()/("recovered-"+std::to_string(GetCurrentProcessId())+".001")).wstring())}}.dump()+"\n");

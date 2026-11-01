@@ -116,6 +116,9 @@ def test_load_config_validates_scan_filter_entries_even_when_filters_disabled(tm
         {"name": "whitelist", "prune_dir_globs": ["archives"]},
         {"name": "blacklist", "path_globs": "cache/**"},
         {"name": "whitelist", "allowed_files": [1]},
+        {"name": "blacklist", "paths": ["cache"]},
+        {"name": "whitelist", "files": [{"value": "a.zip", "regex": "false"}]},
+        {"name": "blacklist", "files": [{"value": "a.zip", "regex": False, "extra": True}]},
     ):
         _write_json(simple, {"filesystem": {
             "scan_filters_enabled": False,
@@ -243,7 +246,7 @@ def test_load_config_applies_inline_env_override_last(tmp_path, monkeypatch):
     _write_json(simple, {
         "filesystem": {"scan_filters": [
             {"name": "size_range", "enabled": True, "min_bytes": 2097152, "max_bytes": None},
-            {"name": "blacklist", "enabled": True, "blocked_extensions": [".tmp"]},
+            {'name': 'blacklist', 'enabled': True, 'files': [{'value': '\\.(?:tmp)\\z', 'regex': True}]},
         ]},
     })
     monkeypatch.setattr(loader, "_candidate_config_paths", _layered_config_paths(simple, advanced))

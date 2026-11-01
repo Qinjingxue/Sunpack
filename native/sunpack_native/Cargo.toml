@@ -23,6 +23,8 @@ memchr = "2.7"
 pbkdf2 = "0.12"
 pyo3 = { version = "0.29", features = ["extension-module"] }
 regex = "1.11"
+regex-automata = "0.4"
+regex-syntax = "0.8"
 rayon = "1.10"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }

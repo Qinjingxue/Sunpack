@@ -800,20 +800,19 @@ Json config_fields(const Json& config,const std::string& source,const std::strin
             for(auto it=item.begin();it!=item.end();++it) if(it.key()!="name" || module.empty()) walk(it.value(),pointer+"/"+pointer_escape(it.key()),module);
             return;
         }
-        if(item.is_array() && !item.empty() && std::all_of(item.begin(),item.end(),[](const Json& i){return i.is_object();})) {
+        if(item.is_array() && !item.empty() && describe_setting(pointer,module,language)["editor"]!="rule_list" && std::all_of(item.begin(),item.end(),[](const Json& i){return i.is_object();})) {
             for(size_t i=0;i<item.size();++i) walk(item[i],pointer+"/"+std::to_string(i),module); return;
         }
         std::string type=item.is_boolean()?"boolean":item.is_string()?"string":item.is_number()?"number":item.is_array()?"array":item.is_object()?"object":"null";
         auto raw=tokens?tokens->token(pointer):item.dump(2);
         auto field=describe_setting(pointer,module,language);
         std::string editor=field["editor"], text=item.is_string()?item.get<std::string>():raw;
-        bool lines=item.is_array() && std::all_of(item.begin(),item.end(),[](const Json& i){return i.is_string();});
-        if(editor.empty()) editor=!field["known"].get<bool>()?"readonly":lines?"list":!field["options"].empty()?"choice":type=="boolean"?"toggle":type=="string"||type=="number"?"text":"readonly";
+        if(editor.empty()) editor=!field["known"].get<bool>()?"readonly":!field["options"].empty()?"choice":type=="boolean"?"toggle":type=="string"||type=="number"?"text":"readonly";
         int choice=-1;
         for(size_t i=0;i<field["options"].size();++i) if(field["options"][i]["value"]==item) choice=int(i);
         if(editor=="recursive" && choice<0) choice=2;
         field.update(Json{{"id",pointer},{"key",pointer+"@"+language},{"type",type},{"original",raw},{"text",text},{"boolean",item.is_boolean()?item.get<bool>():false},
-            {"editor",editor},{"choice",choice},{"items",lines?item:Json::array()}});
+            {"editor",editor},{"choice",choice},{"items",editor=="rule_list"?item:Json::array()}});
         rows.push_back(std::move(field));
     };
     walk(config,"",""); return rows;

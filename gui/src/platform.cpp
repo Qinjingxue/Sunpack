@@ -297,7 +297,7 @@ bool ServiceMonitor::running() {
         }
     }
 }
-CliResult run_cli(const CliCommand& cli, const std::vector<std::wstring>& args, HANDLE stop) {
+CliResult run_cli(const CliCommand& cli, const std::vector<std::wstring>& args, HANDLE stop,const std::string* input) {
     if (!fs::is_regular_file(cli.executable)) throw std::runtime_error("cliMissing");
     std::wstring command = quote_arg(cli.executable.wstring());
     for (auto& arg : cli.prefix) command += L" " + quote_arg(arg);
@@ -310,16 +310,25 @@ CliResult run_cli(const CliCommand& cli, const std::vector<std::wstring>& args, 
     Handle writer(CreateFileW(output_path.c_str(),GENERIC_READ|GENERIC_WRITE,FILE_SHARE_READ|FILE_SHARE_DELETE,
         &sa,CREATE_NEW,FILE_ATTRIBUTE_TEMPORARY|FILE_FLAG_DELETE_ON_CLOSE,nullptr));
     if(writer.value==INVALID_HANDLE_VALUE) win_error("opCaptureCli");
-    Handle nullInput(CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, OPEN_EXISTING, 0, nullptr));
+    auto input_path=output_path; input_path+=L".input";
+    Handle reader(CreateFileW(input?input_path.c_str():L"NUL",input?GENERIC_READ|GENERIC_WRITE:GENERIC_READ,
+        FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,&sa,input?CREATE_NEW:OPEN_EXISTING,
+        input?FILE_ATTRIBUTE_TEMPORARY|FILE_FLAG_DELETE_ON_CLOSE:0,nullptr));
+    if(reader.value==INVALID_HANDLE_VALUE) win_error("opCaptureCli");
+    if(input) {
+        DWORD written=0;
+        if(!WriteFile(reader,input->data(),DWORD(input->size()),&written,nullptr) || written!=input->size()) win_error("opCaptureCli");
+        LARGE_INTEGER start{}; if(!SetFilePointerEx(reader,start,nullptr,FILE_BEGIN)) win_error("opCaptureCli");
+    }
     STARTUPINFOEXW si{}; si.StartupInfo.cb = sizeof(si);
     si.StartupInfo.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
     si.StartupInfo.wShowWindow = SW_HIDE;
-    si.StartupInfo.hStdOutput = writer; si.StartupInfo.hStdError = writer; si.StartupInfo.hStdInput = nullInput;
+    si.StartupInfo.hStdOutput = writer; si.StartupInfo.hStdError = writer; si.StartupInfo.hStdInput = reader;
     SIZE_T bytes = 0; InitializeProcThreadAttributeList(nullptr, 1, 0, &bytes);
     std::vector<unsigned char> attributes(bytes);
     si.lpAttributeList = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attributes.data());
     if (!InitializeProcThreadAttributeList(si.lpAttributeList, 1, 0, &bytes)) win_error("opCliAttributes");
-    HANDLE inherited[] = {writer, nullInput};
+    HANDLE inherited[] = {writer, reader};
     if (!UpdateProcThreadAttribute(si.lpAttributeList, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherited, sizeof(inherited), nullptr, nullptr)) {
         DeleteProcThreadAttributeList(si.lpAttributeList); win_error("opCliHandles");
     }

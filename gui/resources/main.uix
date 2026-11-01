@@ -15,7 +15,7 @@ export default {
     rootRows:[],rootDrafts:{},rootNew:[],rootCell:'',rootPart:'',rootNext:0,rootQuery:'',cellPointer:null,
     configCategory:'',configQuery:'',drafts:{},rangeUnitDrafts:{},toggleDrafts:{},saving:false,saveErrors:{},pendingFields:[],recordSaving:{passwords:false,roots:false},
     passwordRoot:'',passwordHistory:false,passwordHistoryTarget:false,passwordQuery:'',passwordDrafts:{},passwordNew:[],passwordCell:'',passwordNext:0,
-    tagInputs:{}
+    tagInputs:{},tagModes:{},tagEdits:{}
   }; },
   computed: {
     passwordScope() { return this.passwordHistoryTarget?'@history':this.passwordRoot||'@all'; },
@@ -60,7 +60,7 @@ export default {
       if(f.editor==='text'||f.editor==='recursive') parts.push(d.text);
       if(f.editor==='recursive') parts.push(t.rounds);
       if(f.editor==='readonly') parts.push(t.readOnly);
-      if(f.editor==='list') parts.push(t.tagInputPlaceholder,this.tagValues(f).map(v=>this.entryLabel(v)).join(' '));
+      if(this.isRuleList(f)) parts.push(t.tagInputPlaceholder,this.tagValues(f).map(v=>this.entryLabel(v.value)).join(' '));
       if(this.isRange(f)) {
         let r=this.rangeValue(f),date=f.editor==='datetime_range';
         parts.push(t.rangeEnable,date?t.rangeStart:t.rangeMin,date?t.rangeEnd:t.rangeMax,r.lower,r.upper);
@@ -576,7 +576,8 @@ export default {
       if(changed) this.passwordDrafts=drafts;
     },
     isDirectoryValue(value) { return typeof value==='string'&&/^(?:[a-zA-Z]:[\\/]|[\\/]{2}|\.{1,2}(?:[\\/]|$)|~[\\/])/.test(value); },
-    entryLabel(value) { return value.length?value.split(String.fromCharCode(13)).join('␍').split(String.fromCharCode(10)).join('↵'):this.texts.emptyEntry; },
+    entryLabel(value) { return value.split(String.fromCharCode(13)).join('␍').split(String.fromCharCode(10)).join('↵'); },
+    isRuleList(f) { return f.editor==='rule_list'; },
     tagField(f) { return this.fields.find(current=>current.id===f.id)||f; },
     tagValues(f) { f=this.tagField(f); return this.drafts[f.id]?JSON.parse(this.drafts[f.id].text):f.items; },
     changeTagInput(f,value) { this.tagInputs=Object.assign({},this.tagInputs,{[f.id]:value}); },
@@ -584,15 +585,36 @@ export default {
       f=this.tagField(f); this.changeField(f,JSON.stringify(values));
       this.send('syncTags',{id:f.id}); this.commitField(f);
     },
+    changeTagMode(f,value) { this.tagModes=Object.assign({},this.tagModes,{[f.id]:value}); },
+    cancelTagEdit(f) {
+      let edits=Object.assign({},this.tagEdits),inputs=Object.assign({},this.tagInputs),modes=Object.assign({},this.tagModes);
+      delete edits[f.id]; delete inputs[f.id]; delete modes[f.id];
+      this.tagEdits=edits; this.tagInputs=inputs; this.tagModes=modes;
+    },
+    tagMatches(item,p) { return item.value===p.value&&item.regex===p.regex; },
+    editTag(p) {
+      let f=this.fields.find(f=>f.id===p.id); if(!f||f.editor!=='rule_list') return;
+      let values=this.tagValues(f); if(p.index<0||p.index>=values.length||!this.tagMatches(values[p.index],p)) return;
+      this.tagEdits=Object.assign({},this.tagEdits,{[f.id]:{index:p.index,value:p.value,regex:p.regex}});
+      this.changeTagInput(f,p.value); this.changeTagMode(f,p.regex);
+      this.send('focusTag',{id:f.id});
+    },
     addTag(f) {
       let value=this.tagInputs[f.id]||''; if(!value.length) return;
-      this.saveTags(f,this.tagValues(f).concat([value]));
-      let inputs=Object.assign({},this.tagInputs); delete inputs[f.id]; this.tagInputs=inputs;
+      let values=this.tagValues(f).slice(),edit=this.tagEdits[f.id];
+      let entry={value:value,regex:!!this.tagModes[f.id]};
+      if(edit) {
+        if(edit.index>=values.length||!this.tagMatches(values[edit.index],edit)) { this.setSaveError(f.id,'settingChanged'); return; }
+        values[edit.index]=entry;
+      } else values.push(entry);
+      this.saveTags(f,values); this.cancelTagEdit(f);
     },
     removeTag(p) {
-      let f=this.fields.find(f=>f.id===p.id); if(!f||f.editor!=='list') return;
-      let values=this.tagValues(f); if(p.index<0||p.index>=values.length||values[p.index]!==p.value) return;
+      let f=this.fields.find(f=>f.id===p.id); if(!f||!this.isRuleList(f)) return;
+      let values=this.tagValues(f); if(p.index<0||p.index>=values.length||!this.tagMatches(values[p.index],p)) return;
       this.saveTags(f,values.filter((value,index)=>index!==p.index));
+      let edit=this.tagEdits[f.id];
+      if(edit) { if(edit.index===p.index) this.cancelTagEdit(f); else if(edit.index>p.index) this.tagEdits=Object.assign({},this.tagEdits,{[f.id]:Object.assign({},edit,{index:edit.index-1})}); }
     }
 
   }
@@ -730,6 +752,7 @@ export default {
   .choice-host { height:32px; flex-direction:row; }
   .tag-setting .setting-copy { width:190px; flex:0; flex-shrink:1; gap:8px; }
   .tag-setting .setting-copy input { width:100%; }
+  .tag-setting .setting-copy .tag-regex-check { width:24px; height:24px; flex-shrink:0; }
   .tag-region { height:112px; min-width:0px; padding:6px 18px 6px 6px; border:1px solid var(--card-border); border-radius:6px; }
   .history-entry { gap:0px; padding:0px 12px; border:1px solid var(--card-border); border-radius:8px; }
   .light .history-entry, .light .root-header { background:#fbfbfb; }
@@ -858,10 +881,10 @@ export default {
             <div v-if="true" class="block-fields">
             <div v-for="f in g.fields" :key="f.key" :id="'field-'+f.id" class="setting-item">
             <div v-show="f.id!==g.fields[0].id" class="setting-divider"/>
-            <div class="settings-row" :class="f.editor==='list'?'tag-setting':''">
-              <div class="setting-copy"><label :class="f.primary?'subheading':'setting-title'">{{ f.label }}</label><label v-show="f.description" class="setting-description">{{ f.description }}</label><input v-show="f.editor==='list'" :id="'tag-input-'+f.id" :value="tagInputs[f.id]||''" :placeholder="texts.tagInputPlaceholder" @input="v=>changeTagInput(f,v)" @submit="addTag(f)"/></div>
-              <ScrollView v-if="f.editor==='list'" :id="'tag-scroll-'+f.id" class="tag-region"><div :id="'tags-host-'+f.id"/></ScrollView>
-              <div v-show="!isRange(f) &amp;&amp; f.editor!=='list'" class="setting-control" :class="f.editor==='choice'||f.editor==='recursive'?'choice-control':f.editor==='text'?(f.type==='number'?'number-control':'wide-control'):''">
+            <div class="settings-row" :class="isRuleList(f)?'tag-setting':''">
+              <div class="setting-copy"><label :class="f.primary?'subheading':'setting-title'">{{ f.label }}</label><label v-show="f.description" class="setting-description">{{ f.description }}</label><input v-show="isRuleList(f)" :id="'tag-input-'+f.id" :value="tagInputs[f.id]||''" :placeholder="tagEdits[f.id]?texts.tagEditPlaceholder:texts.tagInputPlaceholder" @input="v=>changeTagInput(f,v)" @submit="addTag(f)"/><div v-if="f.editor==='rule_list'" class="row"><input type="checkbox" class="tag-regex-check" :id="'tag-regex-'+f.id" :checked="!!tagModes[f.id]" @change="v=>changeTagMode(f,v)"/><label @click="changeTagMode(f,!tagModes[f.id])">{{ texts.regexMode }}</label><button v-show="tagEdits[f.id]" @click="cancelTagEdit(f)">{{ texts.cancelTagEdit }}</button></div></div>
+              <ScrollView v-if="isRuleList(f)" :id="'tag-scroll-'+f.id" class="tag-region"><div :id="'tags-host-'+f.id"/></ScrollView>
+              <div v-show="!isRange(f) &amp;&amp; !isRuleList(f)" class="setting-control" :class="f.editor==='choice'||f.editor==='recursive'?'choice-control':f.editor==='text'?(f.type==='number'?'number-control':'wide-control'):''">
                 <div v-show="f.editor==='toggle'" :id="'toggle-host-'+f.id" class="toggle-host"/>
                 <div v-show="f.editor==='choice'||f.editor==='recursive'" :id="'choice-'+f.id" class="choice-host"/>
                 <input v-show="f.editor==='text'" :ellipsis-start="isDirectoryValue(drafts[f.id]?drafts[f.id].text:f.text)" :id="'input-'+f.id" :value="drafts[f.id]?drafts[f.id].text:f.text" @input="v=>changeField(f,v)" @blur="commitField(f)" @submit="commitField(f)"/>

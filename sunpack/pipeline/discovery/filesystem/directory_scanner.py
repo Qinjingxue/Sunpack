@@ -12,6 +12,7 @@ from sunpack.core.contracts.filesystem import DirectorySnapshot, FileEntry
 from sunpack.core.contracts.discovery_scope import DiscoveryScope
 from sunpack.pipeline.discovery.filesystem.filters import build_filters
 from sunpack.pipeline.discovery.filesystem.filters.base import ScanCandidate, ScanFilter
+from sunpack.pipeline.discovery.filesystem.filters.path_rule import PathRuleScanFilter
 
 
 class DirectoryScanner:
@@ -243,6 +244,14 @@ def split_size_family_keys(path: str) -> tuple[str, ...]:
 def apply_filter_to_entries(
     entries: list[FileEntry], scan_filter: ScanFilter, *, root_path: Path | None = None,
 ) -> list[FileEntry]:
+    if isinstance(scan_filter, PathRuleScanFilter):
+        indices = scan_filter.native_rule.accepted_indices(
+            str(root_path) if root_path is not None else None,
+            [str(entry.path) for entry in entries],
+            [entry.is_dir for entry in entries],
+            scan_filter.whitelist,
+        )
+        return [entries[index] for index in indices]
     kept: list[FileEntry] = []
     pruned_dir_keys: set[str] = set()
     for entry in sorted(entries, key=lambda item: (len(item.path.parts), str(item.path).lower())):

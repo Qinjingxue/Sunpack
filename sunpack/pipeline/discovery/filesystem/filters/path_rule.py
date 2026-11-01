@@ -4,22 +4,30 @@ from sunpack.pipeline.discovery.filesystem.filters.base import ScanCandidate, Sc
 
 
 def validate_path_rule_config(config: dict) -> None:
-    prefix = "allowed" if config.get("name") == "whitelist" else "blocked"
-    fields = ("path_globs", f"{prefix}_files", f"{prefix}_extensions")
-    unexpected = config.keys() - {"name", "enabled", *fields}
+    unexpected = config.keys() - {"name", "enabled", "paths", "files"}
     if unexpected:
         raise ValueError(f"Unsupported {config.get('name')} fields: {', '.join(sorted(unexpected))}")
-    for field in fields:
+    for field in ("paths", "files"):
         values = config.get(field, [])
-        if not isinstance(values, list) or any(not isinstance(value, str) for value in values):
-            raise ValueError(f"{field} must be a list of strings")
+        if not isinstance(values, list):
+            raise ValueError(f"{field} must be a list of rule objects")
+        for index, item in enumerate(values):
+            if (not isinstance(item, dict) or item.keys() != {"value", "regex"}
+                    or not isinstance(item["value"], str) or not item["value"]
+                    or not isinstance(item["regex"], bool)):
+                raise ValueError(f"{field}[{index}] requires a nonempty value string and a regex boolean")
 
 
 class PathRuleScanFilter:
     stage = "path"
 
-    def __init__(self, path_globs, file_globs, extensions):
-        self.native_rule = NativePathRule(path_globs or [], file_globs or [], extensions or [])
+    def __init__(self, paths=None, files=None):
+        self.native_rule = NativePathRule(paths or [], files or [])
+
+    @classmethod
+    def from_config(cls, config: dict):
+        validate_path_rule_config(config)
+        return cls(paths=config.get("paths"), files=config.get("files"))
 
     def evaluate(self, candidate: ScanCandidate) -> ScanDecision:
         if not self.native_rule.rejects(

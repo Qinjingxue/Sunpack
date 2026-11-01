@@ -54,7 +54,92 @@ function Update-Configuration($Old, $New, $User, $Defaults) {
             $merged.Add($filter)
         }
     }
-    if ($script:Changed) { $filesystem.scan_filters = @($merged.ToArray()) }
+    $converted = [Collections.Generic.List[object]]::new()
+    foreach ($filter in $merged) {
+        if ($filter.name -notin @('blacklist', 'whitelist') -or
+            ($filter.PSObject.Properties['paths'] -and $filter.PSObject.Properties['files'])) {
+            $converted.Add($filter)
+            continue
+        }
+        $prefix = if ($filter.name -eq 'blacklist') { 'blocked' } else { 'allowed' }
+        $paths = @(); $files = @(); $extensions = @()
+        if ($filter.PSObject.Properties['path_globs']) {
+            $paths = @(foreach ($value in $filter.path_globs) { Convert-GlobRule ([string]$value) $true })
+        }
+        $fileField = $prefix + '_files'; $extField = $prefix + '_extensions'
+        if ($filter.PSObject.Properties[$fileField]) {
+            $files = @(foreach ($value in $filter.$fileField) { Convert-GlobRule ([string]$value) $false })
+        }
+        if ($filter.PSObject.Properties[$extField]) {
+            $extensions = @(foreach ($value in $filter.$extField) {
+                $ext = ([string]$value).Trim().ToLowerInvariant()
+                if (-not $ext) { continue }
+                if ($ext.StartsWith('.')) { $ext = $ext.Substring(1) }
+                if (-not $ext.Contains('.')) { Escape-RuleLiteral $ext }
+            })
+        }
+        $extensionRules = @()
+        if ($filter.PSObject.Properties[$extField] -and @($filter.$extField | Where-Object { ([string]$_).Trim() }).Count) {
+            # Path.extension ignores a lone leading dot. Requiring one name
+            # character before the suffix preserves that behavior, including
+            # an explicitly configured trailing dot (empty extension).
+            $pattern = if ($extensions.Count) { '(?s:.)\.(?:' + ($extensions -join '|') + ')\z' } else { '\b\B' }
+            $extensionRules = @([pscustomobject]@{ value = $pattern; regex = $true })
+        }
+        # Whitelist fields used AND. Two ordinary whitelist modules preserve
+        # that intersection without runtime legacy fields or a second matcher.
+        $extra = $filter.name -eq 'whitelist' -and $files.Count -and $extensionRules.Count
+        if (-not $extra) { $files += $extensionRules }
+        foreach ($field in @('path_globs', $fileField, $extField)) { $filter.PSObject.Properties.Remove($field) }
+        $filter | Add-Member -NotePropertyName paths -NotePropertyValue @($paths) -Force
+        $filter | Add-Member -NotePropertyName files -NotePropertyValue @($files) -Force
+        $converted.Add($filter)
+        if ($extra) {
+            $converted.Add([pscustomobject]@{ name = 'whitelist'; enabled = $filter.enabled; paths = @(); files = @($extensionRules) })
+        }
+        $script:Changed = $true
+    }
+    if ($script:Changed) { $filesystem.scan_filters = @($converted.ToArray()) }
+}
+
+function Escape-RuleLiteral([string]$Value) {
+    $builder = [Text.StringBuilder]::new()
+    foreach ($c in $Value.ToCharArray()) {
+        if ('\.^$|?*+()[]{}'.Contains([string]$c)) { $null = $builder.Append('\') }
+        $null = $builder.Append($c)
+    }
+    $builder.ToString()
+}
+
+function Convert-GlobRule([string]$Value, [bool]$PathRule) {
+    $value = $Value.Trim().Replace('\', '/').Trim('/')
+    if (-not $PathRule) { $value = ($value -split '/')[-1] }
+    $rooted = $PathRule -and $value.Contains('/')
+    if ($rooted) {
+        while ($value.EndsWith('/**')) { $value = $value.Substring(0, $value.Length - 3) }
+    }
+    if (-not $value) { return }
+    if (-not $value.Contains('*') -and -not $value.Contains('?')) {
+        if ($rooted -and -not $value.Contains('/')) {
+            [pscustomobject]@{ value = ('\A(?:' + (Escape-RuleLiteral $value) + ')\z'); regex = $true }
+        } else { [pscustomobject]@{ value = $value; regex = $false } }
+        return
+    }
+    $body = [Text.StringBuilder]::new()
+    for ($index = 0; $index -lt $value.Length; $index++) {
+        $c = $value[$index]
+        if ($c -eq '*' -and $index + 1 -lt $value.Length -and $value[$index + 1] -eq '*') {
+            $index++
+            if ($index + 1 -lt $value.Length -and $value[$index + 1] -eq '/') { $index++; $null = $body.Append('(?:.*/)?') }
+            else { $null = $body.Append('.*') }
+        } elseif ($c -eq '*') { $null = $body.Append('[^/]*') }
+        elseif ($c -eq '?') { $null = $body.Append('[^/]') }
+        else { $null = $body.Append((Escape-RuleLiteral ([string]$c))) }
+    }
+    $pattern = if ($PathRule -and -not $rooted) {
+        '(?:\A|/)(?:' + $body.ToString() + ')(?:/|\z)'
+    } else { '\A(?:' + $body.ToString() + ')\z' }
+    [pscustomobject]@{ value = $pattern; regex = $true }
 }
 
 function Merge-PathGlobs($Values) {

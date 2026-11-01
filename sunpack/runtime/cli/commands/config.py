@@ -1,3 +1,6 @@
+import argparse
+import json
+
 from sunpack.runtime.cli.cli_aliases import COMMAND_ALIASES
 from sunpack.runtime.cli.cli_constants import EXIT_USAGE
 from sunpack.runtime.cli.cli_parsers import CliHelpFormatter, build_config_output_parser, localize_help_action
@@ -24,17 +27,25 @@ def register(subparsers, ctx):
     localize_help_action(config_parser, ctx)
     config_subparsers = config_parser.add_subparsers(dest="config_action", required=True)
     config_subparsers.add_parser("show", parents=[common_parser], help=ctx.t("cli.config.show_help"), formatter_class=CliHelpFormatter)
-    config_subparsers.add_parser(
+    validation = config_subparsers.add_parser(
         "validate",
         parents=[common_parser],
         help=ctx.t("cli.config.validate_help"),
         formatter_class=CliHelpFormatter,
     )
+    validation.add_argument("--scan-rule-stdin", action="store_true", help=argparse.SUPPRESS)
 
 
-def handle(args, ctx):
+async def handle(args, ctx):
     reporter = ctx.reporter
     try:
+        if args.config_action == "validate" and getattr(args, "scan_rule_stdin", False):
+            from sunpack.pipeline.discovery.filesystem.filters.path_rule import validate_path_rule_config
+            from sunpack_native import NativePathRule
+            rule = json.loads(await ctx.readline()) if ctx.input_reader is not None else json.load(ctx.stdin)
+            validate_path_rule_config({**rule, "name": "blacklist"})
+            NativePathRule(rule.get("paths", []), rule.get("files", []))
+            return 0, CliCommandResult(command=COMMAND, inputs={"action": "validate"}, summary={"valid": True})
         config_path, payload = load_request_config_payload(ctx.cwd)
         item = payload
         if args.config_action == "show":

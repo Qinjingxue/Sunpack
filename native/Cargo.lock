@@ -938,6 +938,8 @@ dependencies = [
  "pyo3",
  "rayon",
  "regex",
+ "regex-automata",
+ "regex-syntax",
  "rmp-serde",
  "serde",
  "serde_json",

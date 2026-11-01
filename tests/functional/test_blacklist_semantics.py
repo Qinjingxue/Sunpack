@@ -12,7 +12,7 @@ from tests.helpers.detection_config import with_detection_pipeline
 from tests.helpers.fs_builder import make_zip
 
 
-def scan_config(blocked_files=None, blocked_extensions=None):
+def scan_config(files=None):
     return make_config(with_detection_pipeline({
         "thresholds": {"archive_score_threshold": 5, "maybe_archive_threshold": 3},
     }, precheck=[
@@ -20,8 +20,7 @@ def scan_config(blocked_files=None, blocked_extensions=None):
         {
             "name": "blacklist",
             "enabled": True,
-            "blocked_files": blocked_files or [],
-            "blocked_extensions": blocked_extensions or [],
+            "files": files or [],
         },
         {"name": "embedded_payload_identity", "enabled": True},
         {"name": "zip_structure_accept", "enabled": True},
@@ -44,7 +43,7 @@ def test_blacklist_does_not_filter_directories_or_paths(tmp_path):
     (weapon_dir / "payload.zip").write_bytes(make_zip({"payload.txt": "payload"}))
     (tmp_path / "keep.zip").write_bytes(make_zip({"payload.txt": "payload"}))
 
-    decisions = decisions_for(tmp_path, scan_config(blocked_files=["weapon"]))
+    decisions = decisions_for(tmp_path, scan_config(files=[{'value': 'weapon', 'regex': False}]))
 
     assert "keep.zip" in decisions
     assert "FBX/weapon/payload.zip" in decisions
@@ -58,7 +57,7 @@ def test_blacklist_filters_exact_file_names_anywhere(tmp_path):
     (nested / "demo.zip").write_bytes(archive_bytes)
     (tmp_path / "keep.zip").write_bytes(archive_bytes)
 
-    decisions = decisions_for(tmp_path, scan_config(blocked_files=["demo.zip"]))
+    decisions = decisions_for(tmp_path, scan_config(files=[{'value': 'demo.zip', 'regex': False}]))
 
     assert "keep.zip" in decisions
     assert "demo.zip" not in decisions
@@ -69,7 +68,7 @@ def test_filename_blacklist_filters_single_rename_candidate_before_planning(tmp_
     archive = tmp_path / "asset.foo"
     archive.write_bytes(make_zip({"payload.txt": "payload"}))
 
-    results = ScanOrchestrator(scan_config(blocked_files=["asset.*"])).scan(str(tmp_path))
+    results = ScanOrchestrator(scan_config(files=[{'value': '\\A(?:asset\\.[^/]*)\\z', 'regex': True}])).scan(str(tmp_path))
 
     assert results == []
 
@@ -80,7 +79,7 @@ def test_filename_blacklist_filters_series_rename_candidate_before_planning(tmp_
     first.write_bytes(b"Rar!" + b"x" * 128)
     second.write_bytes(b"x" * 128)
 
-    results = ScanOrchestrator(scan_config(blocked_files=["bundle.part??.rar.jpg"])).scan(str(tmp_path))
+    results = ScanOrchestrator(scan_config(files=[{'value': '\\A(?:bundle\\.part[^/][^/]\\.rar\\.jpg)\\z', 'regex': True}])).scan(str(tmp_path))
 
     assert results == []
 
@@ -89,7 +88,7 @@ def test_blocked_semantic_extension_stops_magic_archive_in_generic_directory(tmp
     archive = tmp_path / "asset.unitypackage"
     archive.write_bytes(b"\x1f\x8b" + b"x" * 128)
 
-    decisions = decisions_for(tmp_path, scan_config(blocked_extensions=[".unitypackage"]))
+    decisions = decisions_for(tmp_path, scan_config(files=[{'value': '\\.(?:unitypackage)\\z', 'regex': True}]))
 
     assert "asset.unitypackage" not in decisions
 
@@ -98,8 +97,8 @@ def test_docx_semantic_container_is_not_promoted_to_extract_task(tmp_path):
     archive = tmp_path / "sample.docx"
     archive.write_bytes(b"PK\x03\x04" + b"x" * 128)
 
-    results = ScanOrchestrator(scan_config(blocked_extensions=[".docx"])).scan(str(tmp_path))
-    decisions = decisions_for(tmp_path, scan_config(blocked_extensions=[".docx"]))
+    results = ScanOrchestrator(scan_config(files=[{'value': '\\.(?:docx)\\z', 'regex': True}])).scan(str(tmp_path))
+    decisions = decisions_for(tmp_path, scan_config(files=[{'value': '\\.(?:docx)\\z', 'regex': True}]))
 
     assert results == []
     assert "sample.docx" not in decisions
@@ -109,7 +108,7 @@ def test_output_dir_scan_preserves_explicit_filesystem_blacklist(tmp_path):
     archive = tmp_path / "asset.unitypackage"
     archive.write_bytes(b"\x1f\x8b" + b"x" * 128)
 
-    config = scan_config(blocked_extensions=[".unitypackage"])
+    config = scan_config(files=[{'value': '\\.(?:unitypackage)\\z', 'regex': True}])
 
     assert not OutputScanPolicy(config).should_scan_output_dir(str(tmp_path))
     assert ScanOrchestrator(config).scan(str(tmp_path)) == []

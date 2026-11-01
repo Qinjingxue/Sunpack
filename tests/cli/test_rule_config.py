@@ -45,6 +45,34 @@ def test_config_validate_checks_verification_methods_are_registered():
     assert any("Unknown verification method" in error for error in result["errors"])
 
 
+def test_rule_preflight_uses_native_syntax_for_direct_and_persistent_input():
+    """GUI persistence tests use a CLI double; only this boundary catches engine
+    syntax drift or lost stdin forwarding, with no archive/worker startup cost.
+    """
+    import io
+    import json
+    import asyncio
+    from types import SimpleNamespace
+    from sunpack.runtime.cli.cli_context import CliContext
+    from sunpack.runtime.cli.cli_reporter import CliReporter
+    from sunpack.runtime.cli.commands import config
+
+    args = SimpleNamespace(config_action="validate", scan_rule_stdin=True)
+    for streamed in (False, True):
+        for value, regex, valid in (("报告[最终版]+.zip", False, True),
+                                    (r"\.(?:zip|7z|rar)\z", True, True),
+                                    ("(", False, True), ("(", True, False),
+                                    (r"(?<=a)b", True, False)):
+            payload = json.dumps({"files": [{"value": value, "regex": regex}]})
+            ctx = CliContext(stdin=io.StringIO(payload), reporter=CliReporter(stdout=io.StringIO(), stderr=io.StringIO()))
+            if streamed:
+                ctx.input_reader = lambda _prompt: payload
+            code, result = asyncio.run(config.handle(args, ctx))
+            assert (code == 0) is valid
+            if not valid:
+                assert result.errors
+
+
 def test_output_dir_override_is_relative_to_the_request_cwd(tmp_path):
     class Args:
         recursive_extract = None

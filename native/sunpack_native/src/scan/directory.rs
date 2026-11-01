@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use super::catalog::{catalog_stem, CatalogRow, NativeWatchObservation, ScopeCatalog};
-use super::path_filter::{FilterPath, NativePathRule, PathRule};
+use super::path_filter::{FilterPath, NativePathRule, PathRule, PathRuleScratch};
 use crate::analysis_native::volume_anchor::{
     probe_volume_anchor_from_head, probe_volume_anchor_paths_cheap,
     probe_volume_anchor_records_cheap, CheapAnchorCell, VolumeAnchor,
@@ -925,6 +925,8 @@ impl NativeNumericRange {
 
 #[derive(Default)]
 struct DirectoryScanProfile {
+    regex_compiled_bytes: usize,
+    regex_cache_bytes: usize,
     directory_enumeration: Duration,
     metadata_reads: Duration,
     path_matching: Duration,
@@ -970,6 +972,8 @@ impl DirectoryScanProfile {
     ) -> PyResult<Py<PyDict>> {
         let dict = PyDict::new(py);
         dict.set_item("options_compile_ns", duration_ns(options_compile))?;
+        dict.set_item("regex_compiled_bytes", self.regex_compiled_bytes)?;
+        dict.set_item("regex_cache_bytes", self.regex_cache_bytes)?;
         dict.set_item(
             "directory_enumeration_ns",
             duration_ns(self.directory_enumeration),
@@ -1158,6 +1162,7 @@ impl NativeDirectoryScanOptions {
     ) -> PyResult<(Py<NativeDirectorySnapshot>, Py<NativeDirectorySnapshot>)> {
         let (filtered, raw) = py.detach(|| {
             let root = Path::new(&scope.root);
+            let mut filter_scratch = PathFilterScratch::new(&self.options);
             let mut directory_cache = HashMap::new();
             let (mut raw, cells): (Vec<DirectoryEntryRecord>, Vec<Option<CheapAnchorCell>>) = {
                 let mut data = state.catalogs.lock().unwrap_or_else(|e| e.into_inner());
@@ -1175,11 +1180,13 @@ impl NativeDirectoryScanOptions {
                                     Path::new(&record.path),
                                     root,
                                     &self.options,
+                                    &mut filter_scratch,
                                     &mut directory_cache,
                                 ) && !file_rejected_by_path(
                                     Path::new(&record.path),
                                     root,
                                     &self.options,
+                                    &mut filter_scratch,
                                 ) && numeric_ranges_allow(
                                     &self.options.mtime_ranges,
                                     record.mtime_ns,
@@ -1506,12 +1513,19 @@ pub(crate) fn filter_inventory_file_indices(
     let mut accepted = vec![false; paths.len()];
     let mut size_accepted_split_families = HashSet::new();
     let mut size_deferred = Vec::new();
+    let mut filter_scratch = PathFilterScratch::new(&options);
     let mut directory_rejections = HashMap::new();
     for (index, path) in paths.into_iter().enumerate() {
         let size = sizes.get(index).copied().unwrap_or(0);
         let path = PathBuf::from(path);
-        if file_rejected_by_path(&path, &root, &options)
-            || file_under_rejected_directory(&path, &root, &options, &mut directory_rejections)
+        if file_rejected_by_path(&path, &root, &options, &mut filter_scratch)
+            || file_under_rejected_directory(
+                &path,
+                &root,
+                &options,
+                &mut filter_scratch,
+                &mut directory_rejections,
+            )
         {
             continue;
         }
@@ -1552,6 +1566,7 @@ fn build_inventory_snapshot_views(
     let mut pre_mtime_accepted = Vec::with_capacity(files.len());
     let mut size_accepted_split_families = HashSet::new();
     let mut size_deferred = Vec::new();
+    let mut filter_scratch = PathFilterScratch::new(&options);
     let mut directory_rejections = HashMap::new();
 
     for (item_index, item) in files.iter().enumerate() {
@@ -1571,8 +1586,14 @@ fn build_inventory_snapshot_views(
         raw_file_item_indices.push(item_index);
         pre_mtime_accepted.push(false);
 
-        if file_rejected_by_path(&path, &root, options)
-            || file_under_rejected_directory(&path, &root, options, &mut directory_rejections)
+        if file_rejected_by_path(&path, &root, options, &mut filter_scratch)
+            || file_under_rejected_directory(
+                &path,
+                &root,
+                options,
+                &mut filter_scratch,
+                &mut directory_rejections,
+            )
         {
             raw_files[index].relation_member_eligible = false;
             continue;
@@ -2493,11 +2514,18 @@ fn scan_directory_impl<const PROFILE: bool>(
             errors,
         });
     }
+    let mut filter_scratch = PathFilterScratch::new(options);
     let mut directory_cache = HashMap::new();
     if root != filter_root
-        && (dir_rejected(&root, filter_root, options)
+        && (dir_rejected(&root, filter_root, options, &mut filter_scratch)
             && metadata.as_ref().is_some_and(|metadata| metadata.is_dir())
-            || file_under_rejected_directory(&root, filter_root, options, &mut directory_cache))
+            || file_under_rejected_directory(
+                &root,
+                filter_root,
+                options,
+                &mut filter_scratch,
+                &mut directory_cache,
+            ))
     {
         return Ok(DirectoryScanRecords {
             filtered: Vec::new(),
@@ -2514,7 +2542,7 @@ fn scan_directory_impl<const PROFILE: bool>(
         };
         let size = metadata.len();
         let mtime_ns = metadata_mtime_ns(metadata);
-        let eligible = !file_rejected_by_path(&root, match_root, options)
+        let eligible = !file_rejected_by_path(&root, match_root, options, &mut filter_scratch)
             && numeric_ranges_allow(&options.mtime_ranges, mtime_ns);
         // Raw and filtered views describe the same observation. File events
         // already supplied metadata; repeated queries can also split the views
@@ -2541,6 +2569,7 @@ fn scan_directory_impl<const PROFILE: bool>(
         if PROFILE {
             if let Some(profile) = profile.as_deref_mut() {
                 profile.scan_total = scan_started.elapsed();
+                filter_scratch.record_memory(options, profile);
             }
         }
         return Ok(DirectoryScanRecords {
@@ -2664,7 +2693,7 @@ fn scan_directory_impl<const PROFILE: bool>(
                 let rejected =
                     measure::<PROFILE, _>(&mut profile, ProfileBucket::PathMatching, || {
                         max_depth.is_some_and(|limit| depth >= limit)
-                            || dir_rejected(&path, filter_root, options)
+                            || dir_rejected(&path, filter_root, options, &mut filter_scratch)
                     });
                 if rejected {
                     if PROFILE {
@@ -2714,7 +2743,7 @@ fn scan_directory_impl<const PROFILE: bool>(
             let hard_rejected =
                 measure::<PROFILE, _>(&mut profile, ProfileBucket::PathMatching, || {
                     !metadata.is_file()
-                        || file_rejected_by_path(&path, filter_root, options)
+                        || file_rejected_by_path(&path, filter_root, options, &mut filter_scratch)
                         || !numeric_ranges_allow(&options.mtime_ranges, mtime_ns)
                 });
             if hard_rejected {
@@ -2805,6 +2834,7 @@ fn scan_directory_impl<const PROFILE: bool>(
     if PROFILE {
         if let Some(profile) = profile.as_deref_mut() {
             profile.scan_total = scan_started.elapsed();
+            filter_scratch.record_memory(options, profile);
         }
     }
     Ok(DirectoryScanRecords {
@@ -2814,19 +2844,62 @@ fn scan_directory_impl<const PROFILE: bool>(
     })
 }
 
-fn dir_rejected(path: &Path, root: &Path, options: &DirectoryScanOptions) -> bool {
-    path_rules_reject(path, root, true, options)
+struct PathFilterScratch {
+    blacklist: Vec<PathRuleScratch>,
+    whitelist: Vec<PathRuleScratch>,
 }
-
-fn file_rejected_by_path(path: &Path, root: &Path, options: &DirectoryScanOptions) -> bool {
-    path_rules_reject(path, root, false, options)
+impl PathFilterScratch {
+    fn record_memory(&self, options: &DirectoryScanOptions, profile: &mut DirectoryScanProfile) {
+        profile.regex_compiled_bytes = options
+            .blacklist_rules
+            .iter()
+            .chain(&options.whitelist_rules)
+            .map(|r| r.regex_memory_usage())
+            .sum();
+        profile.regex_cache_bytes = self
+            .blacklist
+            .iter()
+            .chain(&self.whitelist)
+            .map(|s| s.regex_memory_usage())
+            .sum();
+    }
+    fn new(options: &DirectoryScanOptions) -> Self {
+        Self {
+            blacklist: options
+                .blacklist_rules
+                .iter()
+                .map(|_| PathRuleScratch::default())
+                .collect(),
+            whitelist: options
+                .whitelist_rules
+                .iter()
+                .map(|_| PathRuleScratch::default())
+                .collect(),
+        }
+    }
 }
-
+fn dir_rejected(
+    path: &Path,
+    root: &Path,
+    options: &DirectoryScanOptions,
+    scratch: &mut PathFilterScratch,
+) -> bool {
+    path_rules_reject(path, root, true, options, scratch)
+}
+fn file_rejected_by_path(
+    path: &Path,
+    root: &Path,
+    options: &DirectoryScanOptions,
+    scratch: &mut PathFilterScratch,
+) -> bool {
+    path_rules_reject(path, root, false, options, scratch)
+}
 fn path_rules_reject(
     path: &Path,
     root: &Path,
     is_dir: bool,
     options: &DirectoryScanOptions,
+    scratch: &mut PathFilterScratch,
 ) -> bool {
     if options.blacklist_rules.is_empty() && options.whitelist_rules.is_empty() {
         return false;
@@ -2835,27 +2908,30 @@ fn path_rules_reject(
     options
         .blacklist_rules
         .iter()
-        .any(|rule| rule.rejects(&candidate, is_dir, false))
+        .zip(&mut scratch.blacklist)
+        .any(|(rule, cache)| rule.rejects(&candidate, is_dir, false, cache))
         || options
             .whitelist_rules
             .iter()
-            .any(|rule| rule.rejects(&candidate, is_dir, true))
+            .zip(&mut scratch.whitelist)
+            .any(|(rule, cache)| rule.rejects(&candidate, is_dir, true, cache))
 }
-
 fn file_under_rejected_directory(
     path: &Path,
     root: &Path,
     options: &DirectoryScanOptions,
+    scratch: &mut PathFilterScratch,
     cache: &mut HashMap<PathBuf, bool>,
 ) -> bool {
-    path.parent()
-        .is_some_and(|directory| directory_rejected_cached(directory, root, options, cache))
+    path.parent().is_some_and(|directory| {
+        directory_rejected_cached(directory, root, options, scratch, cache)
+    })
 }
-
 fn directory_rejected_cached(
     directory: &Path,
     root: &Path,
     options: &DirectoryScanOptions,
+    scratch: &mut PathFilterScratch,
     cache: &mut HashMap<PathBuf, bool>,
 ) -> bool {
     if directory == root {
@@ -2869,8 +2945,8 @@ fn directory_rejected_cached(
     }
     let rejected = directory
         .parent()
-        .is_some_and(|parent| directory_rejected_cached(parent, root, options, cache))
-        || dir_rejected(directory, root, options);
+        .is_some_and(|parent| directory_rejected_cached(parent, root, options, scratch, cache))
+        || dir_rejected(directory, root, options, scratch);
     cache.insert(directory.to_path_buf(), rejected);
     rejected
 }

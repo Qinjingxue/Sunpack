@@ -41,20 +41,28 @@ scan path does not create per-entry Python dictionaries, `Path` objects, or
 `FileEntry` objects. Custom filters must be expressible through native scan
 parameters or the caller fails explicitly.
 
-`NativePathRule(path_globs, file_globs, extensions)` compiles one immutable rule
-shared by directory scans, watch catalogs, inventories and Python entry filters.
-Exact names use a case-insensitive set; globs use precompiled regex sets. Rules
-are shared with scan options through `Arc`, without recompiling or exporting
-native tables to Python. Path rules with `/` are relative to the scan root;
-bare names match at any depth. A directory match includes its subtree. `*` and
-`?` do not cross separators; `**` does, and `**/` also matches zero levels.
-Filename globs only match files; extensions are exact. Blacklists reject any
-matching field. Whitelists require every nonempty field and retain ancestors
-of possible path matches while traversing. Rejected directories are never
-opened.
+`NativePathRule(paths, files)` compiles one immutable rule shared by directory
+scans, watch catalogs, output inventories and Python entry filters. Both fields
+contain `{ "value": "...", "regex": false }` records. Literal names use an ASCII
+exact-set fast path with Unicode regex folding for non-ASCII names. Regex records
+use the existing regex-automata engine, with one combined matcher per group.
+No Glob or separate extension matcher remains. Filename rules only match files;
+path rules match normalized root-relative paths and inherit directory matches.
+Bare literal names match any component; literals containing `/` are root-relative.
+Blacklist fields use OR; whitelist nonempty fields use AND, with OR within each
+field. Anchored regex prefixes are extracted through regex-syntax to preserve
+safe directory pruning. Unknown prefix relations stay open, including Unicode.
+
+Compiled rules are shared through `Arc`. Each native scan, watch operation or
+inventory batch owns its lazy search caches and releases them on completion.
+The explicit-cache APIs bypass the engine's internal search pool. The lazy-DFA
+acceleration budget is 256 KiB per matcher cache; a full cache can be cleared or
+the engine falls back to an NFA. This budget does not bound total rule memory.
+There is no global/thread-local history of patterns or filenames. Python entry
+filters use one native batch call instead of creating a cache per file.
 
 `profile_directory_scan(...)` is the diagnostic equivalent. It returns the
-same native snapshot plus nanosecond counters for directory enumeration,
+same native snapshot plus regex compiled/cache byte estimates and nanosecond counters for directory enumeration,
 metadata reads, path matching, native record construction, traversal overhead,
 and snapshot construction. The reproducible benchmark driver is
 `python -m benchmarks scan directory`; its `fresh-process` mode resets
