@@ -1,4 +1,4 @@
-use super::cancellation::Cancellation;
+use crate::io::cancellation::Cancellation;
 use crate::io::read_fault::{read_exact_field, seek_field, FieldLocation, ReadFault};
 use crate::io::reader::ManagedReader;
 use crate::password::context::{verify_prepared, InputKey, PasswordContext, PreparedStatus};

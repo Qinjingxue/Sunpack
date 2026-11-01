@@ -1,5 +1,6 @@
 pub(crate) mod archive_state;
 pub(crate) mod atomic_file;
+pub(crate) mod cancellation;
 #[cfg(windows)]
 pub(crate) mod config_changes;
 pub(crate) mod directory_errors;

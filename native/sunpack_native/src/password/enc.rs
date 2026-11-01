@@ -1,6 +1,6 @@
 //! ENC's quick block is a strong, bounded password proof. Authentication belongs
 //! to extraction. Reuse the existing generation-aware prepared-context cache.
-use super::cancellation::Cancellation;
+use crate::io::cancellation::Cancellation;
 use super::context::{verify_prepared, InputKey, PasswordContext, PreparedStatus};
 use super::input::{parse_ranges, ranges_key, ranges_total_len, VirtualRangeReader};
 use crate::io::read_fault::{read_exact_field, FieldLocation};

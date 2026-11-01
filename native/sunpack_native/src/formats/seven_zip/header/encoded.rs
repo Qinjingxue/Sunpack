@@ -410,7 +410,7 @@ fn decode_error(error: std::io::Error) -> String {
 struct ExactOutput<'a> { output:&'a mut Spool, remaining:u64 }
 impl Write for ExactOutput<'_> {
     fn write(&mut self, bytes:&[u8])->std::io::Result<usize> {
-        if crate::password::cancellation::Cancellation::current().cancelled() {
+        if crate::io::cancellation::Cancellation::current().cancelled() {
             return Err(std::io::Error::new(std::io::ErrorKind::ConnectionAborted, "password probe cancelled"));
         }
         if bytes.len() as u64 > self.remaining { return Err(std::io::Error::new(std::io::ErrorKind::InvalidData,"decoded size exceeds declared size")); }
@@ -616,13 +616,13 @@ fn cached_seven_zip_aes_key(cycles: u32, salt: &[u8], password: &[u8]) -> Result
 }
 
 fn check_password_cancellation() -> Result<(), String> {
-    if crate::password::cancellation::Cancellation::current().cancelled() {
+    if crate::io::cancellation::Cancellation::current().cancelled() {
         Err("resource_unavailable:password probe cancelled".into())
     } else { Ok(()) }
 }
 
 fn derive_seven_zip_aes_key(cycles: u32, salt: &[u8], password: &[u8]) -> Result<[u8; 32], String> {
-    let cancellation = crate::password::cancellation::Cancellation::current();
+    let cancellation = crate::io::cancellation::Cancellation::current();
     const KDF_RECORDS_PER_UPDATE: usize = 64;
     let mut sha = sha2_11::Sha256::default();
     let record_len = salt.len() + password.len() + 8;

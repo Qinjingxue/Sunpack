@@ -2,6 +2,7 @@
 //! Physical generations and logical boundaries are part of the identity; no
 //! archive detection or member discovery is performed by this cache.
 use crate::io::read_fault::ReadFault;
+use crate::io::cancellation::CancellableOnce;
 use crate::io::reader::{FileIdentity, ManagedReader};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -123,7 +124,7 @@ impl From<ReadFault> for PreparedStatus {
 type Prepared = Result<PasswordContext, PreparedStatus>;
 #[derive(Default)]
 struct PreparedSlot {
-    value: OnceLock<Prepared>,
+    value: CancellableOnce<Prepared>,
     retired: AtomicBool,
 }
 type Entry = (InputKey, Arc<PreparedSlot>);
@@ -141,44 +142,66 @@ pub(crate) fn verify_prepared(
     candidates: &[String],
     prepare: impl FnOnce() -> Prepared + Send,
 ) -> PyResult<Py<PyAny>> {
-    let cancellation = super::cancellation::Cancellation::current();
+    let cancellation = crate::io::cancellation::Cancellation::current();
     cancellation.check()?;
     // The key comes from the already opened physical readers. Their generation
     // is validated when the input is acquired, and the caller's lifecycle borrow
     // covers this probe. Reopening every path here would repeat that admission
     // three times per password batch, including immutable prepared-cache hits.
-    let slot = {
-        let mut entries = cache().lock().unwrap_or_else(|error| error.into_inner());
-        let entry = if let Some(index) = entries.iter().position(|(old, _)| *old == key) {
-            // Insertion already retired conflicting generations. A current
-            // exact hit only refreshes the existing slot's LRU position.
-            entries.remove(index).unwrap()
-        } else {
-            // Index once per miss, not once per cached member or password batch.
-            let generations: HashMap<_, _> = key
-                .members
-                .iter()
-                .map(|member| (&member.generation.path, &member.generation))
-                .collect();
-            retain(&mut entries, |old, _| {
-                let membership_changed = old.format == key.format
-                    && old.mode == key.mode
-                    && old.members.len() != key.members.len()
-                    && old.members.first() == key.members.first();
-                !membership_changed
-                    && !old.members.iter().any(|left| {
-                        generations
-                            .get(&left.generation.path)
-                            .is_some_and(|right| left.generation != **right)
-                    })
-            });
-            (key.clone(), Arc::new(PreparedSlot::default()))
+    let mut prepare = Some(prepare);
+    let slot = loop {
+        let slot = {
+            let mut entries = cache().lock().unwrap_or_else(|error| error.into_inner());
+            let entry = if let Some(index) = entries.iter().position(|(old, _)| *old == key) {
+                // Insertion already retired conflicting generations. A current
+                // exact hit only refreshes the existing slot's LRU position.
+                entries.remove(index).unwrap()
+            } else {
+                // Index once per miss, not once per cached member or password batch.
+                let generations: HashMap<_, _> = key
+                    .members
+                    .iter()
+                    .map(|member| (&member.generation.path, &member.generation))
+                    .collect();
+                retain(&mut entries, |old, _| {
+                    let membership_changed = old.format == key.format
+                        && old.mode == key.mode
+                        && old.members.len() != key.members.len()
+                        && old.members.first() == key.members.first();
+                    !membership_changed
+                        && !old.members.iter().any(|left| {
+                            generations
+                                .get(&left.generation.path)
+                                .is_some_and(|right| left.generation != **right)
+                        })
+                });
+                (key.clone(), Arc::new(PreparedSlot::default()))
+            };
+            let slot = Arc::clone(&entry.1);
+            entries.push_back(entry);
+            slot
         };
-        let slot = Arc::clone(&entry.1);
-        entries.push_back(entry);
-        slot
+        let ready = py
+            .detach(|| {
+                slot.value.get_or_init(&cancellation, || {
+                    prepare
+                        .take()
+                        .expect("only the initializer consumes prepare")()
+                })
+            })
+            .is_some();
+        if ready {
+            break slot;
+        }
+        // Do not mark the input generation retired: only this initializer stopped.
+        cache()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .retain(|(old, current)| *old != key || !Arc::ptr_eq(current, &slot));
+        cancellation.check()?;
     };
-    let prepared = py.detach(|| slot.value.get_or_init(prepare));
+    cancellation.check()?;
+    let prepared = slot.value.get().expect("completed password material");
     if slot.retired.load(Ordering::Acquire) {
         retire_slot(&key, &slot);
         return Err(input_changed());

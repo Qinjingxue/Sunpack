@@ -23,6 +23,37 @@ def _outcome(out_dir, *, success=True, partial=False, error=""):
     )
 
 
+@pytest.mark.parametrize("quiet", [False, True])
+def test_reporter_keeps_display_and_lineage_without_retaining_finished_inputs(tmp_path, quiet):
+    """Display tests cannot detect a reporter pinning native discovery snapshots.
+
+    Without this, completed recursive subtrees can accumulate for the entire
+    request. Two tiny snapshots verify ownership and later rendering together.
+    """
+    import gc
+    import weakref
+    from sunpack.core.contracts.filesystem import DirectorySnapshot, FileEntry
+    from tests.helpers.archive_tasks import make_archive_task
+
+    output = io.StringIO()
+    reporter = RunReporter("en", stdout=output, quiet=quiet)
+    for depth, root in ((1, tmp_path), (2, tmp_path / "outer")):
+        task = make_archive_task(root / ("outer.zip" if depth == 1 else "inner.zip"))
+        snapshot = DirectorySnapshot.from_entries(root, [FileEntry(root / "member", False, 7)])
+        task.runtime["discovery_snapshot"] = snapshot
+        task_ref, snapshot_ref = weakref.ref(task), weakref.ref(snapshot)
+        reporter.tasks_discovered(depth, [task])
+        reporter.task_finished(task, _outcome(root / ("outer" if depth == 1 else "inner")), depth)
+        row = reporter._task_rows[id(task)]
+        assert row["name"] == ("outer.zip" if depth == 1 else "inner.zip")
+        if depth == 2:
+            assert row["lineage"] == ("outer.zip",)
+        del task, snapshot
+        gc.collect()
+        assert task_ref() is None and snapshot_ref() is None
+        assert row["name"] in reporter._format_task_row(row)
+
+
 def test_progress_displays_nested_archive_parent_chain_and_final_page(tmp_path, capsys):
     reporter = RunReporter("zh")
     outer = _task(tmp_path / "outer.zip")

@@ -5,6 +5,7 @@
 // projects the returned report into its task contracts.
 
 use crate::io::reader::FileIdentity;
+use crate::io::cancellation::{Cancellation, CancellableOnce};
 use pyo3::types::PyTuple;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -337,6 +338,8 @@ impl AnalysisBinaryView {
         disk_starts: Option<&[u64]>,
     ) -> PyResult<Py<PyDict>> {
         self.ensure_open()?;
+        let cancellation = Cancellation::current();
+        cancellation.check()?;
         let (prepass, hits) = match initial_prepass {
             Some(prepass) if !prepass.is_empty() => {
                 let hits = signature_hits_from_prepass(prepass)?;
@@ -372,6 +375,7 @@ impl AnalysisBinaryView {
         let mut evidences = Vec::new();
         if format_structure {
             for module in &config.modules {
+                cancellation.check()?;
                 evidences.push(match context.run_module(module) {
                     Ok(evidence) => evidence,
                     Err(error) => {
@@ -394,6 +398,7 @@ impl AnalysisBinaryView {
                 });
             }
         }
+        cancellation.check()?;
         let size = self.reader.len();
         let selected_in_module_order = evidences
             .iter()
@@ -2000,7 +2005,7 @@ pub(crate) fn confirm_format_identity_native(path: &str, format: &str) -> bool {
 
 // ---- Full-stream structure cache -----------------------------------------
 
-type StreamStructureSlot = OnceLock<PyResult<Py<PyDict>>>;
+type StreamStructureSlot = CancellableOnce<PyResult<Py<PyDict>>>;
 type StreamStructureEntry = (FileIdentity, Arc<StreamStructureSlot>);
 
 fn stream_structure_cache() -> &'static Mutex<VecDeque<StreamStructureEntry>> {
@@ -2013,29 +2018,45 @@ fn stream_structure_cached<'py>(
     identity: FileIdentity,
     path: &str,
 ) -> PyResult<Bound<'py, PyDict>> {
-    let slot = {
-        let mut entries = stream_structure_cache()
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        entries.retain(|(key, _)| key.path != identity.path || *key == identity);
-        let slot = entries
-            .iter()
-            .position(|(key, _)| *key == identity)
-            .and_then(|index| entries.remove(index))
-            .map(|(_, slot)| slot)
-            .unwrap_or_else(|| Arc::new(OnceLock::new()));
-        entries.push_back((identity.clone(), Arc::clone(&slot)));
-        slot
-    };
-    // Waiting for another initializer must release the GIL: its final Python
-    // result cannot be published until the initializer reacquires it.
-    let result = py.detach(|| {
-        slot.get_or_init(|| {
-            Python::attach(|py| {
-                crate::analysis_native::inspect_compression_stream_structure(py, path)
+    let cancellation = Cancellation::current();
+    cancellation.check()?;
+    let slot = loop {
+        let slot = {
+            let mut entries = stream_structure_cache()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            entries.retain(|(key, _)| key.path != identity.path || *key == identity);
+            let slot = entries
+                .iter()
+                .position(|(key, _)| *key == identity)
+                .and_then(|index| entries.remove(index))
+                .map(|(_, slot)| slot)
+                .unwrap_or_else(|| Arc::new(StreamStructureSlot::default()));
+            entries.push_back((identity.clone(), Arc::clone(&slot)));
+            slot
+        };
+        // Waiting for another initializer must release the GIL: its final Python
+        // result cannot be published until the initializer reacquires it.
+        let ready = py
+            .detach(|| {
+                slot.get_or_init(&cancellation, || {
+                    Python::attach(|py| {
+                        crate::analysis_native::inspect_compression_stream_structure(py, path)
+                    })
+                })
             })
-        })
-    });
+            .is_some();
+        if ready {
+            break slot;
+        }
+        stream_structure_cache()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .retain(|(key, current)| *key != identity || !Arc::ptr_eq(current, &slot));
+        cancellation.check()?;
+    };
+    cancellation.check()?;
+    let result = slot.get().expect("completed stream structure");
     let mut entries = stream_structure_cache()
         .lock()
         .unwrap_or_else(|error| error.into_inner());

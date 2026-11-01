@@ -27,6 +27,17 @@ class _WorkItem(Generic[T]):
     token: CancellationToken
     sequence: int
     execution_context: contextvars.Context = field(default_factory=contextvars.copy_context)
+    claim_lock: Any = field(default_factory=threading.Lock)
+    claimed: bool = False
+
+    def claim(self) -> bool:
+        # submit() can enqueue the call before thread creation fails. Exactly
+        # one of the worker and the submitter must own its final settlement.
+        with self.claim_lock:
+            if self.claimed:
+                return False
+            self.claimed = True
+            return True
 
 
 class _StageWorkQueue:
@@ -397,14 +408,13 @@ class AsyncWorkBroker:
                 self._pending_slots.release()
                 continue
             self._active += 1
-            worker_future = self._executor.submit(self._execute, item)
-            worker_future.add_done_callback(
-                lambda completed, current=item: self._owner_loop.call_soon_threadsafe(
-                    self._complete,
-                    current,
-                    completed,
-                )
-            )
+            try:
+                self._executor.submit(self._execute, item)
+            except Exception as exc:
+                if item.claim():
+                    self._settle(item, error=exc)
+                # If execution already started, the worker owns completion.
+                # A rejected but queued wrapper will see the claim and do no IO.
         self._notify_state_changed()
 
     def _pop_next_request_id(self) -> str:
@@ -415,9 +425,15 @@ class AsyncWorkBroker:
     def _take_prioritized(self, jobs: _StageWorkQueue) -> _WorkItem[Any]:
         return jobs.take_prioritized(self._sequence)
 
-    @staticmethod
-    def _execute(item: _WorkItem[T]) -> T:
-        return item.execution_context.run(AsyncWorkBroker._execute_in_context, item)
+    def _execute(self, item: _WorkItem[T]) -> None:
+        if not item.claim():
+            return
+        try:
+            result = item.execution_context.run(self._execute_in_context, item)
+        except BaseException as exc:
+            self._owner_loop.call_soon_threadsafe(self._complete, item, None, exc)
+        else:
+            self._owner_loop.call_soon_threadsafe(self._complete, item, result, None)
 
     @staticmethod
     def _execute_in_context(item: _WorkItem[T]) -> T:
@@ -429,7 +445,8 @@ class AsyncWorkBroker:
 
             scope = task_resource_scope(item.context.request_id)
             if scope is None:
-                return item.operation()
+                with item.token.native_scope():
+                    return item.operation()
             file_id = str(item.context.file_id or "")
             operation_files = ()
             if file_id:
@@ -442,24 +459,25 @@ class AsyncWorkBroker:
                         pass
                     else:
                         operation_files = (FileIdentity.from_stat(file_id, metadata),)
-            with scope.operation(files=operation_files):
+            with scope.operation(files=operation_files), item.token.native_scope():
                 return item.operation()
         finally:
             CURRENT_WORK.reset(marker)
             CURRENT_CANCELLATION.reset(cancellation_marker)
 
-    def _complete(self, item: _WorkItem[T], completed) -> None:
+    def _settle(self, item: _WorkItem[T], result=None, error: BaseException | None = None) -> None:
         self._active -= 1
         self._pending_slots.release()
         if not item.future.done():
-            try:
-                result = completed.result()
-            except BaseException as exc:
-                item.future.set_exception(exc)
+            if error is not None:
+                item.future.set_exception(error)
             else:
                 # Completed mutations must project their final paths/results.
                 # Cancellation stops the next admission, not that projection.
                 item.future.set_result(result)
+
+    def _complete(self, item: _WorkItem[T], result, error: BaseException | None) -> None:
+        self._settle(item, result, error)
         self._dispatch()
 
 

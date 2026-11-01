@@ -7,6 +7,7 @@
 //! separate pooled buffer.
 
 use super::ScanBatch;
+use super::cancellation::Cancellation;
 use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::io;
@@ -350,6 +351,8 @@ where
     F: Fn(&[u8], usize, u64) -> ScanBatch<T> + Send + Sync,
     C: FnMut(T) -> io::Result<()> + Send,
 {
+    let cancellation = Cancellation::current();
+    cancellation.check_io()?;
     if file_size == 0 {
         return Ok(IocpScanOutput {
             discarded_results: 0,
@@ -376,6 +379,11 @@ where
         expected_base = visible_end;
     }
     let handles = Arc::new(open_handles(path)?);
+    let wake_handles = Arc::clone(&handles);
+    let _subscription = cancellation.subscribe(move || unsafe {
+        CancelIoEx(wake_handles.file, null_mut());
+        PostQueuedCompletionStatus(wake_handles.port, 0, WORKER_COMPLETION_KEY, null_mut());
+    });
     let scan = &scan;
 
     // Producers stay on their calling threads. A separate shared pool runs
@@ -399,6 +407,10 @@ where
         let mut discarded_results = 0;
         let mut initial_error = None;
         for _ in 0..buffer_count {
+            if let Err(error) = cancellation.check_io() {
+                initial_error = Some(error);
+                break;
+            }
             match submit_next_slot(
                 &handles,
                 &mut pending,
@@ -427,6 +439,10 @@ where
             || !ready_jobs.is_empty()
             || scan_jobs > 0
         {
+            if let Err(error) = cancellation.check_io() {
+                fatal_error = Some(error);
+                break;
+            }
             loop {
                 match done_rx.try_recv() {
                     Ok((buffer, hits)) => {
@@ -452,6 +468,10 @@ where
             // Preserve the configured IO depth whenever there is a recycled
             // buffer. A full CPU queue only consumes the separate job pool.
             while let Some(mut slot) = completed_slots.pop_front() {
+                if let Err(error) = cancellation.check_io() {
+                    fatal_error = Some(error);
+                    break;
+                }
                 let Some(replacement_buffer) = available_buffers.pop() else {
                     completed_slots.push_front(slot);
                     break;
@@ -493,6 +513,10 @@ where
             }
 
             while let Some(job) = ready_jobs.pop_front() {
+                if let Err(error) = cancellation.check_io() {
+                    fatal_error = Some(error);
+                    break;
+                }
                 // One-chunk files already run on the batch's Rayon workers;
                 // matching inline avoids a second scheduling round entirely.
                 if expected_read_operations == 1 {
@@ -511,13 +535,16 @@ where
                 }
                 let done_tx = done_tx.clone();
                 let worker_handles = Arc::clone(&handles);
+                let worker_cancellation = cancellation.clone();
                 scan_jobs += 1;
                 scope.spawn(move |_| {
-                    let hits = scan(
-                        &job.buffer[..job.bytes_read],
-                        job.leading_overlap,
-                        job.read_start,
-                    );
+                    let hits = worker_cancellation.run(|| {
+                        scan(
+                            &job.buffer[..job.bytes_read],
+                            job.leading_overlap,
+                            job.read_start,
+                        )
+                    });
                     let _ = done_tx.send((job.buffer, hits));
                     unsafe {
                         let _ = PostQueuedCompletionStatus(

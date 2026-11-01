@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from sunpack.core.passwords.candidates import PasswordCandidatePipeline, PasswordCandidate
 
-import asyncio
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
@@ -36,21 +35,10 @@ def _cancellable_password_job(operation):
         cancellation = CURRENT_CANCELLATION.get()
         if cancellation is None:
             return operation(*args, **kwargs)
-        from sunpack_native import PasswordCancellation, PasswordProbeCancelled
-
-        cancellation.raise_if_cancelled()
-        native = PasswordCancellation()
-        unsubscribe = cancellation.subscribe(native.cancel)
-        try:
-            with native:
-                try:
-                    result = operation(*args, **kwargs)
-                    cancellation.raise_if_cancelled()
-                    return result
-                except PasswordProbeCancelled:
-                    raise asyncio.CancelledError from None
-        finally:
-            unsubscribe()
+        with cancellation.native_scope():
+            result = operation(*args, **kwargs)
+            cancellation.raise_if_cancelled()
+            return result
     return run
 
 

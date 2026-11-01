@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import threading
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Callable
 
@@ -39,6 +40,7 @@ class CancellationToken:
         self._cancelled = threading.Event()
         self._lock = threading.Lock()
         self._callbacks: set[Callable[[], None]] = set()
+        self._native = None
 
     @property
     def cancelled(self) -> bool:
@@ -51,8 +53,31 @@ class CancellationToken:
             self._cancelled.set()
             callbacks = tuple(self._callbacks)
             self._callbacks.clear()
+            native = self._native
+        if native is not None:
+            native.cancel()
         for callback in callbacks:
             callback()
+
+    @contextmanager
+    def native_scope(self):
+        """Reuse one native signal across this request's concurrent operations."""
+        from sunpack_native import NativeCancellation, NativeOperationCancelled
+
+        self.raise_if_cancelled()
+        with self._lock:
+            if self._native is None:
+                self._native = NativeCancellation()
+            native = self._native
+            cancelled = self.cancelled
+        if cancelled:
+            native.cancel()
+            self.raise_if_cancelled()
+        with native:
+            try:
+                yield
+            except NativeOperationCancelled:
+                raise asyncio.CancelledError from None
 
     def subscribe(self, callback: Callable[[], None]) -> Callable[[], None]:
         with self._lock:

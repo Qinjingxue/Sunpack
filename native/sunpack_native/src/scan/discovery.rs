@@ -217,6 +217,8 @@ impl NativeEmbeddedBatch {
         offset: usize,
         limit: usize,
     ) -> PyResult<Vec<(usize, u8, &'static str, Option<Py<PyDict>>)>> {
+        let cancellation = crate::io::cancellation::Cancellation::current();
+        cancellation.check()?;
         let rows = &table.rows;
         let outcomes = py.detach(|| {
             let end = offset.saturating_add(limit).min(self.ids.len());
@@ -225,10 +227,11 @@ impl NativeEmbeddedBatch {
             // Split into at most eight file jobs. Per-file IOCP buffers and
             // native metadata stay bounded, independently of machine core count.
             ids.par_chunks(ids.len().div_ceil(parallel_files).max(1))
-                .map(|chunk| {
+                .map(|chunk| cancellation.run(|| {
                     chunk
                         .iter()
                         .filter_map(|&index| {
+                            if cancellation.cancelled() { return None; }
                             // An earlier detection attempt already failed. Policy
                             // gates may skip new I/O, never erase an observed error.
                             if let Some(Err(error)) = self.scans.get(&index) {
@@ -279,12 +282,13 @@ impl NativeEmbeddedBatch {
                             .then_some((index, outcome))
                         })
                         .collect::<Vec<_>>()
-                })
+                }))
                 .collect::<Vec<_>>()
                 .into_iter()
                 .flatten()
                 .collect::<Vec<_>>()
         });
+        cancellation.check()?;
         outcomes
             .into_iter()
             .map(|(index, outcome)| match outcome {
@@ -601,6 +605,8 @@ impl NativeCandidateTable {
         detection_enabled: bool,
         include_residual_details: bool,
     ) -> PyResult<NativeDiscoveryRoutes> {
+        let cancellation = crate::io::cancellation::Cancellation::current();
+        cancellation.check()?;
         let mut routes = NativeDiscoveryRoutes::default();
         let mut claimed: HashSet<String> = HashSet::new();
         let mut blocked: HashSet<String> = HashSet::new();
@@ -651,11 +657,13 @@ impl NativeCandidateTable {
             .collect::<Vec<_>>();
         py.detach(|| {
             for batch in detection_indices.chunks(1024) {
+                if cancellation.cancelled() { break; }
                 let parallel_files = batch.len().min(rayon::current_num_threads()).clamp(1, 8);
                 let decisions = batch
                     .par_iter()
                     .with_min_len(batch.len().div_ceil(parallel_files))
-                    .map(|&index| {
+                    .map(|&index| cancellation.run(|| {
+                        if cancellation.cancelled() { return None; }
                         let Candidate::File(table, file_index) = &self.rows[index] else {
                             return None;
                         };
@@ -693,7 +701,7 @@ impl NativeCandidateTable {
                             accepted,
                             scan.filter(|_| !accepted || format == "lz4"),
                         ))
-                    })
+                    }))
                     .collect::<Vec<_>>();
                 for (index, key, accepted, scan) in decisions.into_iter().flatten() {
                     if claimed.contains(&key) {
@@ -715,6 +723,7 @@ impl NativeCandidateTable {
                 }
             }
         });
+        cancellation.check()?;
         // Preserve the former stage order: filesystem residuals, Relations
         // residuals, then Detection residuals.
         for (index, row) in self.rows.iter().enumerate() {

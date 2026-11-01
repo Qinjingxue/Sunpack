@@ -125,11 +125,11 @@ fn sunpack_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m
     )?)?;
     m.add_class::<io::reader::NativeArchiveSession>()?;
-    m.add_class::<password::cancellation::PasswordCancellation>()?;
+    m.add_class::<io::cancellation::NativeCancellation>()?;
     m.add(
-        "PasswordProbeCancelled",
+        "NativeOperationCancelled",
         m.py()
-            .get_type::<password::cancellation::PasswordProbeCancelled>(),
+            .get_type::<io::cancellation::NativeOperationCancelled>(),
     )?;
     m.add_class::<scan::scope::NativeDiscoveryScope>()?;
     m.add_function(wrap_pyfunction!(scan::scope::create_output_root, m)?)?;

@@ -1,4 +1,5 @@
 use crate::io::read_fault::{FieldLocation, ReadFault};
+use crate::io::cancellation::Cancellation;
 use crate::io::resource_lifecycle::TrackedFile;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyBytes, PyDict, PyList};
@@ -298,6 +299,7 @@ impl ManagedReader {
     /// immutable bytes. This owned boundary deliberately performs the one copy
     /// needed to hand independent storage to its caller.
     pub(crate) fn read_at(&self, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+        Cancellation::check_current_io()?;
         if offset >= self.len() || len == 0 {
             return Ok(Vec::new());
         }
@@ -327,6 +329,7 @@ impl ManagedReader {
     /// One-shot bounded probes bypass the shared block cache while retaining
     /// the managed file handle and resource lifecycle.
     pub(crate) fn read_direct_at(&self, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+        Cancellation::check_current_io()?;
         if offset >= self.len() || len == 0 {
             return Ok(Vec::new());
         }
@@ -372,6 +375,7 @@ impl ManagedReader {
     /// hot path. With request state, the cache owns shared immutable data and
     /// this boundary performs only the required copy into the caller buffer.
     pub(crate) fn read_into_at(&self, offset: u64, buffer: &mut [u8]) -> io::Result<usize> {
+        Cancellation::check_current_io()?;
         if offset >= self.len() || buffer.is_empty() {
             return Ok(0);
         }
@@ -422,6 +426,7 @@ impl ManagedReader {
     /// the source's native slice layout instead of paying for an uncacheable
     /// contiguous allocation.
     pub(crate) fn read_slices_at(&self, offset: u64, len: usize) -> io::Result<Vec<CachedSlice>> {
+        Cancellation::check_current_io()?;
         if offset >= self.len() || len == 0 {
             return Ok(Vec::new());
         }
@@ -446,6 +451,7 @@ impl ManagedReader {
     }
 
     pub(crate) fn read_cached_at(&self, offset: u64, len: usize) -> io::Result<CachedBytes> {
+        Cancellation::check_current_io()?;
         if offset >= self.len() || len == 0 {
             return Ok(CachedBytes::Owned(Vec::new()));
         }

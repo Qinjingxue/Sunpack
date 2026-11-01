@@ -10,6 +10,76 @@ import pytest
 from sunpack.pipeline.coordinator.async_work import AsyncWorkBroker, CancellationToken, CURRENT_WORK, _RequestOrder, _StageWorkQueue
 
 
+@pytest.mark.parametrize("failure_point", ["before_enqueue", "queued", "executing"])
+def test_submission_failure_settles_once_and_never_abandons_mutations(monkeypatch, failure_point):
+    """Ordinary job exceptions never exercise executor admission failure.
+
+    Removing this loses rejection-after-enqueue and rejection-after-start
+    coverage. Event gates cover all ownership outcomes without a stress run.
+    """
+    async def scenario():
+        broker = AsyncWorkBroker(thread_capacity=2, max_pending_jobs=2)
+        loop = asyncio.get_running_loop()
+        holding = asyncio.Event()
+        release_holder, entered, release_work = threading.Event(), threading.Event(), threading.Event()
+        mutations = []
+
+        def hold():
+            loop.call_soon_threadsafe(holding.set)
+            assert release_holder.wait(5)
+
+        def mutate():
+            entered.set()
+            assert release_work.wait(5)
+            mutations.append("committed")
+            return "result"
+
+        holder = asyncio.create_task(broker.run("verify", "holder", hold))
+        await asyncio.wait_for(holding.wait(), 3)
+        submit = broker._executor.submit
+
+        def reject(*args, **kwargs):
+            if failure_point == "executing":
+                submit(*args, **kwargs)
+                assert entered.wait(3)
+            raise RuntimeError("injected thread creation failure")
+
+        request = None
+        try:
+            with monkeypatch.context() as patch:
+                if failure_point == "queued":
+                    def reject_thread(_thread):
+                        raise RuntimeError("injected thread creation failure")
+                    patch.setattr(threading.Thread, "start", reject_thread)
+                else:
+                    patch.setattr(broker._executor, "submit", reject)
+                request = asyncio.create_task(broker.run("postprocess", "mutation", mutate))
+                if failure_point == "executing":
+                    # submit has thrown, but the running mutation must be joined.
+                    await asyncio.sleep(0)
+                    assert not request.done() and broker.active_jobs == 2
+                    release_work.set()
+                    assert await asyncio.wait_for(request, 3) == "result"
+                else:
+                    with pytest.raises(RuntimeError, match="thread creation failure"):
+                        await asyncio.wait_for(request, 3)
+                    assert broker.active_jobs == 1 and not entered.is_set()
+            release_holder.set()
+            release_work.set()
+            await asyncio.wait_for(holder, 3)
+            assert await broker.run("verify", "next", lambda: "next") == "next"
+            assert mutations == (["committed"] if failure_point == "executing" else [])
+            assert broker.active_jobs == broker.pending_jobs == 0
+            assert broker._pending_slots._value == broker.max_pending_jobs
+        finally:
+            release_holder.set()
+            release_work.set()
+            await asyncio.gather(holder, *([request] if request else []), return_exceptions=True)
+            await asyncio.wait_for(broker.close(), 3)
+
+    asyncio.run(scenario())
+
+
 def test_request_order_matches_global_fifo_across_promotions_rotation_and_reuse():
     # Existing broker examples cannot catch promotions being appended behind
     # newer foreground requests, or stale memberships after ID reuse/clear.

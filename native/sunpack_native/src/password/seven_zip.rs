@@ -1,4 +1,4 @@
-use super::cancellation::Cancellation;
+use crate::io::cancellation::Cancellation;
 use crate::formats::seven_zip::{
     seven_zip_encryption_facts_from_next_header, SevenZipPasswordProbe,
 };

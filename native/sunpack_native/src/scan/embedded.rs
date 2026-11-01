@@ -371,6 +371,8 @@ pub(crate) fn scan_embedded_archives_with_reader(
     iocp_buffers: usize,
     iocp_workers: usize,
 ) -> PyResult<Py<PyDict>> {
+    let cancellation = crate::io::cancellation::Cancellation::current();
+    cancellation.check()?;
     let reader = reader.clone();
     let scan = py.detach(move || {
         scan_embedded_archives_native_with_iocp(
@@ -379,7 +381,9 @@ pub(crate) fn scan_embedded_archives_with_reader(
             iocp_buffers,
             iocp_workers,
         )
-    })?;
+    });
+    cancellation.check()?;
+    let scan = scan?;
 
     scan.to_py_dict(py)
 }
@@ -423,6 +427,8 @@ fn scan_native(
     iocp_workers: usize,
     primary_format: Option<&str>,
 ) -> io::Result<NativeScanResult> {
+    let cancellation = crate::io::cancellation::Cancellation::current();
+    cancellation.check_io()?;
     let file_size = reader.len();
     let chunk_bytes = iocp_chunk_bytes
         .min((HIT_OFFSET_MASK - HIT_LOOKBEHIND) as usize - embedded_overlap())
@@ -517,6 +523,7 @@ fn scan_native(
         }
     };
     let storage = builder.finish()?;
+    cancellation.check_io()?;
     let raw_hits = storage.view(0);
     let xz_footer_hits = storage.view(1);
     raw_hit_count += output.discarded_results;
@@ -566,6 +573,7 @@ fn scan_native(
         .filter(|candidate| candidate.candidate_kind == "logical_archive")
         .all(|candidate| candidate.boundary_kind == "exact");
 
+    cancellation.check_io()?;
     Ok(NativeScanResult {
         file_size,
         scan_read_bytes: output.read_bytes,
@@ -595,6 +603,7 @@ fn validate_raw_hits(
     raw_hits: HitView<'_>,
     xz_footer_hits: HitView<'_>,
 ) -> io::Result<Vec<EmbeddedCandidate>> {
+    let cancellation = crate::io::cancellation::Cancellation::current();
     let mut suffixes: [FailedSuffixEvidence; 5] = std::array::from_fn(|_| Default::default());
     let mut xz_footers = XzFooterEvidence {
         ends: xz_footer_hits,
@@ -622,7 +631,9 @@ fn validate_raw_hits(
     let mut candidates = raw_hits
         .par_iter_mask(1 << 1)
         .map_init(DirectoryEvidence::default, |directories, hit| {
-            validate_zip_eocd(reader, file_size, hit.offset(), &zip64_records, directories)
+            cancellation.run(|| {
+                validate_zip_eocd(reader, file_size, hit.offset(), &zip64_records, directories)
+            })
         })
         .try_fold(Vec::new, |mut candidates, candidate| -> io::Result<_> {
             if let Some(candidate) = candidate? {
@@ -652,6 +663,7 @@ fn validate_raw_hits(
     let mut previous_xz: Option<usize> = None;
     let mut cursor = raw_hits.iter_mask(!((1 << 1) | (1 << 12)));
     while let Some(hit) = cursor.next() {
+        cancellation.check_io()?;
         while range_index < seeded_ranges.len() && seeded_ranges[range_index].0 <= hit.offset() {
             covered_until = covered_until.max(seeded_ranges[range_index].1);
             range_index += 1;

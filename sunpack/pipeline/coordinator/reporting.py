@@ -84,8 +84,9 @@ class RunReporter:
             for task in tasks:
                 parent_lineage = self._lineage_for_path(str(getattr(task, "main_path", "") or ""))
                 self._task_lineages[id(task)] = parent_lineage
+                self._last_streamed_progress.pop(id(task), None)
                 self._task_rows[id(task)] = {
-                    "task": task,
+                    "name": _task_name(task),
                     "depth": depth,
                     "lineage": parent_lineage,
                     "state": "waiting",
@@ -329,6 +330,7 @@ class RunReporter:
             row = self._task_rows.get(id(task))
             if row is not None:
                 row["finished"] = True
+                row["name"] = _task_name(task)
             depth = max(1, int(depth or 1))
             self._completed_tasks += 1
             name = _task_name(task)
@@ -476,6 +478,7 @@ class RunReporter:
         row = self._task_rows.get(id(task))
         if row is None:
             return
+        row["name"] = _task_name(task)
         if state is not None:
             row["state"] = state
             if state in {"waiting", "preparing", "extracting"} and (row.get("space_blocked") or row.get("memory_blocked")):
@@ -506,7 +509,7 @@ class RunReporter:
 
     def _format_task_row(self, row: dict[str, Any]) -> str:
         depth = int(row.get("depth", 1) or 1)
-        task = row.get("task")
+        name = str(row.get("name") or "archive")
         state = str(row.get("state") or "waiting")
         progress = float(row.get("progress", 0.0) or 0.0)
         known = bool(row.get("progress_known"))
@@ -560,7 +563,7 @@ class RunReporter:
             # A narrow/resized console must not wrap a panel row and corrupt
             # relative cursor positioning. Omit the bar in this edge case.
             return _truncate_display(
-                f"{prefix}[{plain_label}] {percent_text} {_task_name(task)}",
+                f"{prefix}[{plain_label}] {percent_text} {name}",
                 max(1, terminal_columns - 1),
             )
         available = max(0, terminal_columns - fixed_width - 1)
@@ -569,9 +572,9 @@ class RunReporter:
             hint = self.i18n.t("report.status.memory_resume_hint") if state == "memory_paused" else (str(row.get("detail") or "") or self.i18n.t("report.status.disk_resume_hint"))
             if both_paused:
                 hint = str(row.get("detail") or "") or self.i18n.t("report.status.resources_resume_hint")
-            suffix_text = f"{hint}  {_task_name(task)}{relation}"
+            suffix_text = f"{hint}  {name}{relation}"
         else:
-            suffix_text = f"{_task_name(task)}{relation}{detail}"
+            suffix_text = f"{name}{relation}{detail}"
         suffix = _truncate_display(suffix_text, available)
         return f"{prefix}[{label}] [{bar}] {percent_text}  {suffix}"
 
