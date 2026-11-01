@@ -626,6 +626,7 @@ class WatchService:
                 "roots_path": str(roots_path),
                 "added": [],
                 "updated": [],
+                "rejected": [],
                 "applied": False,
             }
         new_service_config = service_config_from(self.config)
@@ -634,13 +635,16 @@ class WatchService:
             new_service_config,
             service_state_dir(self.config),
         )
+        requested_changes = [*added, *updated]
         added, updated = retained_watch_root_changes(
             added, updated, [entry.input_root for entry in self.service_config["root_entries"]],
         )
+        retained = {*added, *updated}
         return {
             "roots_path": str(roots_path),
             "added": added,
             "updated": updated,
+            "rejected": [root for root in requested_changes if root not in retained],
             "applied": applied,
         }
 
