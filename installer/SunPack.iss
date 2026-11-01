@@ -865,7 +865,7 @@ var
   Parameters, Language: string;
   ResultCode: Integer;
 begin
-  if ActiveLanguage() = 'chinesesimplified' then Language := 'zh'
+  if ActiveLanguage = 'chinesesimplified' then Language := 'zh'
   else Language := 'en';
   Parameters := '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ' +
     AddQuotes(ExpandConstant('{tmp}\SunPackInstallScripts\initialize_config_language.ps1')) +
