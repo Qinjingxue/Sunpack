@@ -1,6 +1,5 @@
 """Install-time language selection and preservation of existing user preferences."""
 import json
-import re
 import shutil
 import subprocess
 
@@ -64,7 +63,8 @@ def test_installer_initializes_language_before_context_menu_registration(repo_ro
     assert "ActiveLanguage()" in installer
     assert "InitializeLanguageOnInstall := not FileExists(" in installer
     assert "initialize_config_language.ps1" in build
-    assert re.search(r'Source: ".*initialize_config_language.ps1"; DestDir: "\\{tmp\\}.*"; Flags: deleteafterinstall', installer)
+    assert any("initialize_config_language.ps1\"; DestDir: \"{tmp}" in line and
+               "deleteafterinstall" in line for line in installer.splitlines())
     post_install = installer.split("procedure CurStepChanged(CurStep: TSetupStep);", 1)[1]
     assert post_install.index("UpgradeConfigurationFields;") < post_install.index(
         "InitializeInstalledLanguage;"
