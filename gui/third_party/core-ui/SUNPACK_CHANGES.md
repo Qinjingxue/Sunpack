@@ -11,6 +11,12 @@ preserved.
 
 Local changes:
 
+- Bind UIX tooltips through the existing 500 ms hover service and allow
+  `tabindex="0"` on compact action labels. Reuse the toast overlay for optional
+  closable WinUI-style messages, with fade/slide motion, hover pause, owner theme
+  and Windows motion preference. Replacements release the previous surface;
+  holding schedules one deadline and hovering stops timers completely.
+
 - Size auto-width ComboBoxes to the widest localized item using the existing
   bounded DirectWrite measurement cache, with room for padding and the arrow.
   Explicit widths (including compact range operators/units) remain authoritative.

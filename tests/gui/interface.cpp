@@ -15,6 +15,7 @@
 #include <ui/uix/script_runtime.h>
 #include <ui/controls.h>
 #include <ui/ui_debug.h>
+#include <ui/overlay_service.h>
 using namespace spg;
 void rendering_contracts();
 namespace {
@@ -791,6 +792,10 @@ void range_config(Application& app,const fs::path& dir) {
     search_setting(app,"size_range");
     layout(id,false);
     auto bound=[&](const std::string& module,const std::string& key) {return parse_json(field(module)["text"])[key];};
+    // Defaults may ship disabled; establish the enabled edit scenario explicitly.
+    if(field("size_range")["range"]["enabled"]!=true) {
+        click(app,("range-enabled-"+id).c_str()); finish_input(app);
+    }
     assert(field("size_range")["range"]["enabled"]==true);
     input("range-lower-"+id,L"9007199254740993"); finish_input(app);
     pump([&]{return bound("size_range","min_bytes")==uint64_t(9007199254740993);},"Exact size range save");
@@ -1180,7 +1185,7 @@ void task_card_details(Application& app) {
     };
     auto label=[&](const std::string& prefix) {
         auto* result=dynamic_cast<ui::LabelWidget*>(window->Root()->FindById(prefix+id));
-        assert(result && result->selectable); return result;
+        assert(result && result->focusable && !result->selectable); return result;
     };
     row["parts"]=Json::array(); row["error"]=""; row["errorType"]=""; update();
     auto compact=rect(app,"task-"+id);
@@ -1219,7 +1224,7 @@ void task_card_details(Application& app) {
             ui::LabelWidget* previous=nullptr;
             for(size_t i=0;i<parts.size();++i) {
                 auto* part=dynamic_cast<ui::LabelWidget*>(window->Root()->FindById("taskPart-"+id+"-"+std::to_string(i)));
-                assert(part && part->selectable && part->Text()==wide(parts[i].get<std::string>()));
+                assert(part && part->focusable && !part->selectable && part->Text()==wide(parts[i].get<std::string>()));
                 auto bounds=part->rect;
                 assert(bounds.left>=flow.left-0.5f && bounds.right<=flow.right+0.5f);
                 assert(bounds.top>=flow.top-0.5f && bounds.bottom<=flow.bottom+0.5f);
@@ -1245,11 +1250,86 @@ void task_card_details(Application& app) {
         }
         screenshot(app,selected==1?L"task-details-light.png":L"task-details-dark.png");
     }
-    row["parts"]=Json::array(); row["error"]="CRC mismatch\n"+std::string(500,'W'); update();
-    assert(!window->Root()->FindById("taskParts-"+id)->visible);
+    assert(ui_page_set_json(app.page(),"texts",saved_texts.dump().c_str())==0);
+    row["parts"]=Json::array({"伪装-更新.blob"});
+    row["error"]="CRC mismatch\n"+std::string(500,'W'); update();
     auto* message=label("taskErrorMessage-");
     assert(message->Text().find(L'\n')==std::wstring::npos);
     assert(message->rect.right<=rect(app,"taskErrors-"+id).right+0.5f);
+    // The layout checks cannot catch stale keyed copy handlers, truncated
+    // clipboard contents, failure feedback or leaked notification windows.
+    // Cover that interaction here, reusing the same mounted virtual card.
+    auto owner=window->Handle();
+    std::vector<std::pair<UINT,HANDLE>> previousClipboard;
+    pump([&]{return OpenClipboard(owner)!=FALSE;},"Save clipboard before tag copy");
+    for(UINT format=0;(format=EnumClipboardFormats(format))!=0;)
+        if(auto original=GetClipboardData(format))
+            if(auto copy=OleDuplicateData(original,format,0)) previousClipboard.emplace_back(format,copy);
+    CloseClipboard();
+    auto toast=[&]() -> HWND {
+        for(HWND next=nullptr;(next=FindWindowExW(nullptr,next,L"UiCore_OverlayToast",nullptr))!=nullptr;)
+            if(GetWindow(next,GW_OWNER)==owner) return next;
+        return nullptr;
+    };
+    auto copy_tag=[&](const std::string& widget) {
+        click(app,widget.c_str());
+        pump([&]{return state(app.page(),"requests").empty();},"Copy task tag");
+        ui::OverlayService::Instance().InvokeSync([]{}); assert(toast());
+        return toast();
+    };
+    auto copied=[&](const std::string& widget,const std::string& expected) {
+        copy_tag(widget);
+        pump([&]{return OpenClipboard(owner)!=FALSE;},"Read copied tag");
+        auto memory=GetClipboardData(CF_UNICODETEXT); assert(memory);
+        auto* data=static_cast<const wchar_t*>(GlobalLock(memory)); assert(data);
+        assert(std::wstring(data)==wide(expected)); GlobalUnlock(memory); CloseClipboard();
+    };
+    assert(window->Root()->FindById("taskPart-"+id+"-0")->tooltip==wide(tr("copyTag",state(app.page(),"language"))));
+    copied("taskPart-"+id+"-0",row["parts"][0]);
+    copied("taskErrorMessage-"+id,row["error"]); // Raw multiline text, without label prefix.
+    wchar_t title[128]{}; GetWindowTextW(toast(),title,128);
+    assert(title==wide(tr("copySucceeded",state(app.page(),"language"))));
+    int count=0;
+    for(HWND next=nullptr;(next=FindWindowExW(nullptr,next,L"UiCore_OverlayToast",nullptr))!=nullptr;)
+        if(GetWindow(next,GW_OWNER)==owner) ++count;
+    assert(count==1); // Consecutive copies replace the previous notification.
+    // The status badge remains passive and never offers a copy action.
+    auto* status=window->Root()->FindById("task-"+id)->Children()[0]->Children().back().get();
+    assert(!status->onClick && status->tooltip.empty());
+    // Overlay timers run on their own thread; window-destroy accessibility
+    // events wake this existing UI pump without adding a polling timer.
+    auto destroyHook=SetWinEventHook(EVENT_OBJECT_DESTROY,EVENT_OBJECT_DESTROY,nullptr,
+        [](HWINEVENTHOOK,DWORD,HWND,LONG,LONG,DWORD,DWORD){},GetCurrentProcessId(),0,WINEVENT_OUTOFCONTEXT);
+    assert(destroyHook);
+    auto notice=toast();
+    ui::OverlayService::Instance().InvokeSync([&] {
+        RECT bounds{}; GetClientRect(notice,&bounds);
+        const auto point=MAKELPARAM(bounds.right-int(22*GetDpiForWindow(notice)/96.0f),bounds.bottom/2);
+        SendMessageW(notice,WM_MOUSEMOVE,0,point);
+        SendMessageW(notice,WM_LBUTTONDOWN,MK_LBUTTON,point);
+        SendMessageW(notice,WM_LBUTTONUP,0,point);
+    });
+    pump([&]{return !toast();},"Dismiss copy feedback");
+    Handle locked(CreateEventW(nullptr,TRUE,FALSE,nullptr)),release(CreateEventW(nullptr,TRUE,FALSE,nullptr));
+    bool clipboardLocked=false;
+    std::thread blocker([&] {
+        clipboardLocked=OpenClipboard(nullptr)!=FALSE; SetEvent(locked);
+        WaitForSingleObject(release,INFINITE); if(clipboardLocked) CloseClipboard();
+    });
+    assert(WaitForSingleObject(locked,INFINITE)==WAIT_OBJECT_0 && clipboardLocked);
+    GetWindowTextW(copy_tag("taskErrorType-"+id),title,128);
+    assert(title==wide(tr("copyFailed",state(app.page(),"language"))));
+    SetEvent(release); blocker.join();
+    // A shorter display duration exercises the same one-shot hold/exit path
+    // without adding the product's three-second reading time to this test.
+    ui::OverlayService::Instance().ShowToast(owner,L"deadline",40,0,1,0,true);
+    ui::OverlayService::Instance().InvokeSync([]{});
+    pump([&]{return !toast();},"Automatic copy feedback dismissal");
+    UnhookWinEvent(destroyHook);
+    pump([&]{return OpenClipboard(owner)!=FALSE;},"Restore clipboard after tag copy");
+    EmptyClipboard(); for(auto [format,copy]:previousClipboard) assert(SetClipboardData(format,copy)); CloseClipboard();
+    row["parts"]=Json::array(); update();
+    assert(!window->Root()->FindById("taskParts-"+id)->visible);
     row["error"]=""; row["errorType"]=""; update();
     assert(!window->Root()->FindById("taskErrors-"+id));
     auto collapsed=rect(app,"task-"+id);
@@ -1751,6 +1831,7 @@ int wmain(int argc,wchar_t** argv) {
             assert(ui_debug_mouse_move(app.window(),(name_bounds.left+name_bounds.right)/2,(name_bounds.top+name_bounds.bottom)/2)==0);
             auto* task_name=ui::GetContext().GetWindow(app.window())->Root()->FindById(("taskName-"+task_id).c_str());
             assert(task_name && task_name->css.hasFg && task_name->css.fg.b>task_name->css.fg.r);
+            assert(task_name->tooltip==L"在文件夹中显示");
             screenshot(app,L"task-name-hover.png");
             click(app,("taskName-"+task_id).c_str());
             assert(state(app.page(),"requests")==Json::array({Json{{"op","openTask"},{"payload",{{"task",task}}}}}));

@@ -675,6 +675,12 @@ void PageState::ApplyBindingToWidget(Widget* w, const std::string& prop, const u
         }
         return;
     }
+    if (prop == "tooltip") {
+        auto text = ToWide(v.ToString());
+        if (w->tooltip == text) { shouldInvalidate = false; return; }
+        w->tooltip = std::move(text);
+        return;
+    }
     if (prop == "placeholder") {
         if (auto* input = dynamic_cast<TextInputWidget*>(w)) input->SetPlaceholder(ToWide(v.ToString()));
         return;

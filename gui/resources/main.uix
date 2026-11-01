@@ -685,11 +685,15 @@ export default {
   .task-meta .time { flex-shrink:0; white-space:nowrap; }
   .task-details { gap:4px; padding-bottom:4px; }
   .task-chips { flex-wrap:wrap; gap:4px; align-items:flex-start; }
-  .task-chip { max-width:100%; flex-shrink:0; padding:3px 8px; border-radius:4px; font-size:12px; white-space:nowrap; user-select:text; }
+  .task-chip { max-width:100%; flex-shrink:0; padding:3px 8px; border-radius:4px; font-size:12px; white-space:nowrap; cursor:pointer; }
   .light .volume-chip { color:#005a9e; background:#e5f1fb; }
   .dark .volume-chip { color:#75b6e7; background:#243b50; }
   .light .error-chip { color:#a4262c; background:#fde7e9; }
   .dark .error-chip { color:#ff99a4; background:#442726; }
+  .light .volume-chip:hover { background:#d9eaf8; }
+  .dark .volume-chip:hover { background:#2c4862; }
+  .light .error-chip:hover { background:#f9dadd; }
+  .dark .error-chip:hover { background:#543130; }
   .status { font-size:14px; font-weight:600; padding:4px 10px; border-radius:4px; flex-shrink:0; white-space:nowrap; }
   .light .status-success { color:#0f6b35; background:#dff6dd; }
   .dark .status-success { color:#6ccb5f; background:#263c28; }
@@ -849,14 +853,14 @@ export default {
         </div>
         <ScrollView id="taskListScroll"><div id="taskBody" class="column">
           <VirtualList id="taskItems" class="column" estimated-height="68px" immutable-items="true"><div v-for="t in tasks.rows" :key="t.id" :id="'task-'+t.id" :class="'task '+appearance">
-            <div class="row"><button :id="'taskName-'+t.id" class="taskname" @click="send('openTask',{task:t})">{{ t.name }}</button><div class="spacer"/><label class="status" :class="'status-'+t.statusTone">{{ t.statusText }}</label></div>
+            <div class="row"><button :id="'taskName-'+t.id" class="taskname" :tooltip="texts.showInFolder" @click="send('openTask',{task:t})">{{ t.name }}</button><div class="spacer"/><label class="status" :class="'status-'+t.statusTone">{{ t.statusText }}</label></div>
             <div v-if="t.parts.length||t.errorType||t.error" class="column task-details">
               <div v-show="t.parts.length" :id="'taskParts-'+t.id" class="row task-chips">
-                <label v-for="(part,i) in t.parts" :key="i" :id="'taskPart-'+t.id+'-'+i" class="task-chip volume-chip">{{ part }}</label>
+                <label v-for="(part,i) in t.parts" :key="i" :id="'taskPart-'+t.id+'-'+i" class="task-chip volume-chip" tabindex="0" :tooltip="texts.copyTag" @click="send('copyTaskText',{text:part})">{{ part }}</label>
               </div>
               <div v-show="t.errorType||t.error" :id="'taskErrors-'+t.id" class="row task-chips">
-                <label v-show="t.errorType" :id="'taskErrorType-'+t.id" class="task-chip error-chip">{{ texts.taskErrorType }}{{ t.errorType }}</label>
-                <label v-show="t.error" :id="'taskErrorMessage-'+t.id" class="task-chip error-chip">{{ texts.taskErrorMessage }}{{ inlineTaskError(t.error) }}</label>
+                <label v-show="t.errorType" :id="'taskErrorType-'+t.id" class="task-chip error-chip" tabindex="0" :tooltip="texts.copyTag" @click="send('copyTaskText',{text:t.errorType})">{{ texts.taskErrorType }}{{ t.errorType }}</label>
+                <label v-show="t.error" :id="'taskErrorMessage-'+t.id" class="task-chip error-chip" tabindex="0" :tooltip="texts.copyTag" @click="send('copyTaskText',{text:t.error})">{{ texts.taskErrorMessage }}{{ inlineTaskError(t.error) }}</label>
               </div>
             </div>
             <div class="row task-meta"><label :id="'taskRoot-'+t.id" class="muted fill" :ellipsis-start="true">{{ texts.taskFolder }}{{ t.directory }}</label><label class="time">{{ t.time }}</label></div>

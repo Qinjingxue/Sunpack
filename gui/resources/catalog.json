@@ -1,5 +1,21 @@
 {
   "ui": {
+    "showInFolder": {
+      "zh": "在文件夹中显示",
+      "en": "Show in folder"
+    },
+    "copyTag": {
+      "zh": "点击复制",
+      "en": "Click to copy"
+    },
+    "copySucceeded": {
+      "zh": "已复制到剪贴板",
+      "en": "Copied to clipboard"
+    },
+    "copyFailed": {
+      "zh": "复制失败，请重试",
+      "en": "Could not copy. Try again."
+    },
     "rangeEnable": {
       "zh": "启用此过滤器",
       "en": "Enable this filter"

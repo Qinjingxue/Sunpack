@@ -1312,6 +1312,8 @@ WidgetPtr BuildWidget(const ui::uix::Node& node, const ui::css::ComputedStyle& s
     for (const auto& a : node.attrs) {
         if (a.kind == ui::uix::AttrKind::Static) {
             if (a.name == "id") w->id = a.rawValue;
+            else if (a.name == "tooltip") w->tooltip = ToWide(a.rawValue);
+            else if (a.name == "tabindex" && a.rawValue == "0") w->focusable = true;
             else if (a.name == "focus-indicator") {
                 w->focusIndicator = a.rawValue == "underline" ? Widget::FocusIndicator::Underline :
                     a.rawValue == "none" ? Widget::FocusIndicator::None : Widget::FocusIndicator::Default;

@@ -34,7 +34,7 @@ public:
     void InvokeSync(std::function<void()> fn);
 
     void ShowToast(HWND owner, const std::wstring& text, int durationMs,
-                   int position, int icon, int anim);
+                   int position, int icon, int anim, bool closable = false);
     void DismissOwner(HWND owner);
     void Stop();
 

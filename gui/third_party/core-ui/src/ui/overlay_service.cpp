@@ -3,6 +3,7 @@
 
 #include <d2d1.h>
 #include <dwrite.h>
+#include <windowsx.h>
 #include <timeapi.h>
 #include <wrl/client.h>
 
@@ -79,6 +80,9 @@ struct ToastOverlay {
     int position = 0;
     int icon = 0;
     int anim = 0;
+    bool closable = false, dark = false, motion = true, hovered = false, closeHovered = false, closePressed = false;
+    uint64_t pausedTick = 0, exitTick = 0;
+    float alpha = 0, slide = 0, exitAlpha = 1, exitSlide = 1;
     UINT dpi = 96;
     float dpiScale = 1.0f;
     float widthDip = 0.0f;
@@ -94,6 +98,10 @@ struct ToastOverlay {
 } // namespace
 
 struct OverlayService::Impl {
+    static bool CloseAt(const ToastOverlay& toast, LPARAM point) {
+        const float x=GET_X_LPARAM(point)/toast.dpiScale, y=GET_Y_LPARAM(point)/toast.dpiScale;
+        return x>=toast.widthDip-36 && x<=toast.widthDip-8 && std::abs(y-toast.heightDip*0.5f)<=14;
+    }
     enum class RequestType {
         CreateHostWindow,
         DestroyHostWindow,
@@ -123,6 +131,7 @@ struct OverlayService::Impl {
         int position = 0;
         int icon = 0;
         int anim = 0;
+        bool closable = false, dark = false, motion = true;
     };
 
     std::mutex mutex;
@@ -388,6 +397,9 @@ struct OverlayService::Impl {
         toast->position = request.position;
         toast->icon = request.icon;
         toast->anim = request.anim;
+        toast->closable = request.closable;
+        toast->dark = request.dark;
+        toast->motion = request.motion;
         toast->dpi = OverlayDpiForWindow(request.owner);
         toast->dpiScale = static_cast<float>(toast->dpi) / 96.0f;
 
@@ -403,8 +415,8 @@ struct OverlayService::Impl {
 
         ToastOverlay* raw = toast.get();
         HWND hwnd = CreateWindowExW(
-            WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
-            L"UiCore_OverlayToast", L"", WS_POPUP,
+            WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | (toast->closable ? 0 : WS_EX_TOPMOST | WS_EX_TRANSPARENT),
+            L"UiCore_OverlayToast", toast->text.c_str(), WS_POPUP,
             toast->targetX, startY, widthPx, heightPx,
             request.owner, nullptr, GetModuleHandleW(nullptr), raw);
         if (!hwnd) {
@@ -413,9 +425,6 @@ struct OverlayService::Impl {
 
         raw->hwnd = hwnd;
         raw->startTick = GetTickCount64();
-        timeBeginPeriod(1);
-        raw->timerPeriodSet = true;
-        SetTimer(hwnd, kToastTimerId, kToastTimerIntervalMs, nullptr);
         ShowWindow(hwnd, SW_SHOWNOACTIVATE);
 
         ownerToast[request.owner] = hwnd;
@@ -452,7 +461,8 @@ struct OverlayService::Impl {
         const float iconSpace = (toast.icon > 0) ? (iconSize + iconGap) : 0.0f;
         const float padH = 20.0f;
         const float padV = 10.0f;
-        const float maxTextW = std::max(120.0f, std::min(620.0f, clientW - padH * 2.0f - iconSpace - 40.0f));
+        const float closeSpace = toast.closable ? 32.0f : 0.0f;
+        const float maxTextW = std::max(1.0f, std::min(620.0f, clientW - padH * 2.0f - iconSpace - closeSpace - 40.0f));
 
         Microsoft::WRL::ComPtr<IDWriteTextLayout> layout;
         if (FAILED(dwriteFactory->CreateTextLayout(
@@ -465,7 +475,7 @@ struct OverlayService::Impl {
 
         const float textW = std::min(maxTextW, std::max(1.0f, metrics.widthIncludingTrailingWhitespace));
         const float textH = std::max(theme::kFontSizeNormal, metrics.height);
-        toast.widthDip = std::max(96.0f, textW + iconSpace + padH * 2.0f);
+        toast.widthDip = std::max(96.0f, textW + iconSpace + closeSpace + padH * 2.0f);
         toast.heightDip = std::max(iconSize, textH) + padV * 2.0f;
 
         const float xDip = (clientW - toast.widthDip) * 0.5f;
@@ -481,7 +491,8 @@ struct OverlayService::Impl {
 
         toast.targetX = origin.x + static_cast<int>(xDip * toast.dpiScale);
         toast.targetY = origin.y + static_cast<int>(yDip * toast.dpiScale);
-        toast.slideRangePx = static_cast<int>(hideOffsetDip * toast.dpiScale);
+        // Interactive messages move a short distance inside the owner.
+        toast.slideRangePx = static_cast<int>((toast.closable ? -12.0f : hideOffsetDip) * toast.dpiScale);
         return true;
     }
 
@@ -526,8 +537,17 @@ struct OverlayService::Impl {
 
         Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> bgBrush;
         Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> textBrush;
-        target->CreateSolidColorBrush(D2D1::ColorF(0.15f, 0.15f, 0.18f, 0.92f), bgBrush.GetAddressOf());
-        target->CreateSolidColorBrush(D2D1::ColorF(0.95f, 0.95f, 0.97f, 1.0f), textBrush.GetAddressOf());
+        D2D1_COLOR_F background = D2D1::ColorF(0.15f, 0.15f, 0.18f, 0.92f);
+        D2D1_COLOR_F foreground = D2D1::ColorF(0.95f, 0.95f, 0.97f);
+        if (toast.closable) {
+            // WinUI InfoBar surfaces; snapshot the owner theme on its UI thread.
+            const bool error = toast.icon == 2;
+            background = toast.dark ? (error ? theme::Rgb(0x44,0x27,0x26) : theme::Rgb(0x26,0x3c,0x28))
+                                    : (error ? theme::Rgb(0xfd,0xe7,0xe9) : theme::Rgb(0xdf,0xf6,0xdd));
+            foreground = toast.dark ? theme::Rgb(0xf5,0xf5,0xf5) : theme::Rgb(0x1a,0x1a,0x1a);
+        }
+        target->CreateSolidColorBrush(background, bgBrush.GetAddressOf());
+        target->CreateSolidColorBrush(foreground, textBrush.GetAddressOf());
 
         Microsoft::WRL::ComPtr<IDWriteTextFormat> format;
         if (!dwriteFactory ||
@@ -547,7 +567,19 @@ struct OverlayService::Impl {
         target->Clear(D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.0f));
 
         const D2D1_RECT_F box = D2D1::RectF(0.0f, 0.0f, toast.widthDip, toast.heightDip);
-        target->FillRoundedRectangle(D2D1::RoundedRect(box, 8.0f, 8.0f), bgBrush.Get());
+        const float radius = toast.closable ? 4.0f : 8.0f;
+        target->FillRoundedRectangle(D2D1::RoundedRect(box, radius, radius), bgBrush.Get());
+        if (toast.closable) {
+            bgBrush->SetColor(toast.dark ? theme::Rgba(255,255,255,0.08f) : theme::Rgba(0,0,0,0.08f));
+            target->DrawRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(0.5f,0.5f,toast.widthDip-0.5f,toast.heightDip-0.5f),4,4),bgBrush.Get());
+            const float cx=toast.widthDip-22.0f, cy=toast.heightDip*0.5f;
+            if (toast.closeHovered) {
+                bgBrush->SetColor(toast.dark ? theme::Rgba(255,255,255,0.08f) : theme::Rgba(0,0,0,0.06f));
+                target->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(cx-14,cy-14,cx+14,cy+14),4,4),bgBrush.Get());
+            }
+            target->DrawLine(D2D1::Point2F(cx-4,cy-4),D2D1::Point2F(cx+4,cy+4),textBrush.Get(),1.2f);
+            target->DrawLine(D2D1::Point2F(cx+4,cy-4),D2D1::Point2F(cx-4,cy+4),textBrush.Get(),1.2f);
+        }
 
         const float fontSize = theme::kFontSizeNormal;
         const float iconSize = fontSize + 2.0f;
@@ -561,7 +593,7 @@ struct OverlayService::Impl {
 
         const D2D1_RECT_F textRect = D2D1::RectF(
             padH + iconSpace, 0.0f,
-            toast.widthDip - padH, toast.heightDip);
+            toast.widthDip - padH - (toast.closable ? 32.0f : 0.0f), toast.heightDip);
         target->DrawTextW(toast.text.c_str(), static_cast<UINT32>(toast.text.size()),
                           format.Get(), textRect, textBrush.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
 
@@ -590,6 +622,9 @@ struct OverlayService::Impl {
         } else if (toast.icon == 3) {
             color = D2D1::ColorF(1.0f, 0.82f, 0.2f, 1.0f);
         }
+        if (toast.closable && toast.icon <= 2)
+            color = toast.dark ? (toast.icon==2 ? theme::Rgb(0xff,0x99,0xa4) : theme::Rgb(0x6c,0xcb,0x5f))
+                               : (toast.icon==2 ? theme::Rgb(0xa4,0x26,0x2c) : theme::Rgb(0x0f,0x6b,0x35));
 
         Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> brush;
         target.CreateSolidColorBrush(color, brush.GetAddressOf());
@@ -629,35 +664,61 @@ struct OverlayService::Impl {
         }
     }
 
+    void ScheduleToast(ToastOverlay& toast, UINT delay, bool animating) {
+        KillTimer(toast.hwnd, kToastTimerId);
+        if (animating != toast.timerPeriodSet) {
+            if (animating) timeBeginPeriod(1); else timeEndPeriod(1);
+            toast.timerPeriodSet = animating;
+        }
+        // Hold uses a single deadline; hover has no timer at all.
+        if (delay) SetTimer(toast.hwnd, kToastTimerId, delay, nullptr);
+    }
+
+    void BeginToastExit(ToastOverlay& toast) {
+        if (toast.exitTick) return;
+        toast.exitTick = GetTickCount64();
+        toast.exitAlpha = toast.alpha;
+        toast.exitSlide = toast.slide;
+        UpdateToastFrame(toast);
+    }
+
     void UpdateToastFrame(ToastOverlay& toast) {
         if (!toast.hwnd || !toast.bitmap || !toast.bitmap->dc) {
             return;
         }
+        if (!IsWindow(toast.owner)) { DestroyToastByHwnd(toast.hwnd); return; }
 
         const uint64_t now = GetTickCount64();
         const uint64_t elapsed = (toast.startTick != 0 && now >= toast.startTick)
                                      ? (now - toast.startTick) : 0;
-        const uint64_t inEnd = kToastInMs;
+        const uint64_t inEnd = toast.motion ? kToastInMs : 0;
         const uint64_t holdEnd = inEnd + static_cast<uint64_t>(toast.durationMs);
-        const uint64_t outEnd = holdEnd + kToastOutMs;
+        if (!toast.exitTick && !toast.hovered && elapsed >= holdEnd) {
+            toast.exitTick = now; toast.exitAlpha = 1; toast.exitSlide = 1;
+        }
 
         float alpha = 1.0f;
         float slide = 1.0f;
-        if (elapsed < inEnd) {
+        UINT next = 0;
+        bool animating = false;
+        if (toast.exitTick) {
+            const auto outgoing = now - toast.exitTick;
+            if (!toast.motion || outgoing >= kToastOutMs) { DestroyToastByHwnd(toast.hwnd); return; }
+            const float t = EaseOutCubic(float(outgoing) / kToastOutMs);
+            slide = toast.exitSlide * (1-t); alpha = toast.exitAlpha * (1-t);
+            next = kToastTimerIntervalMs; animating = true;
+        } else if (elapsed < inEnd) {
             const float t = EaseOutCubic(static_cast<float>(elapsed) / static_cast<float>(kToastInMs));
             slide = t;
-            alpha = (toast.anim == 1) ? t : 1.0f;
-        } else if (elapsed < holdEnd) {
-            slide = 1.0f;
-            alpha = 1.0f;
-        } else if (elapsed < outEnd) {
-            const float t = EaseOutCubic(static_cast<float>(elapsed - holdEnd) / static_cast<float>(kToastOutMs));
-            slide = 1.0f - t;
-            alpha = 1.0f - t;
+            alpha = (toast.closable || toast.anim == 1) ? t : 1.0f;
+            next = kToastTimerIntervalMs; animating = true;
+        } else if (toast.hovered) {
+            if (!toast.pausedTick) toast.pausedTick = now;
         } else {
-            DestroyToastByHwnd(toast.hwnd);
-            return;
+            next = UINT(holdEnd - elapsed);
         }
+        toast.alpha = alpha; toast.slide = slide;
+        ScheduleToast(toast, next, animating);
 
         const int y = (toast.anim == 1)
                           ? toast.targetY
@@ -749,7 +810,57 @@ struct OverlayService::Impl {
             }
             break;
         case WM_NCHITTEST:
-            return HTTRANSPARENT;
+            return toast && toast->closable ? HTCLIENT : HTTRANSPARENT;
+        case WM_MOUSEACTIVATE:
+            return MA_NOACTIVATE;
+        case WM_MOUSEMOVE:
+            if (toast && toast->closable) {
+                const bool close=CloseAt(*toast,lParam);
+                if (toast->hovered && close==toast->closeHovered) return 0;
+                if (!toast->hovered) {
+                    toast->hovered = true;
+                    TRACKMOUSEEVENT track{sizeof(track),TME_LEAVE,hwnd,0}; TrackMouseEvent(&track);
+                }
+                if (close != toast->closeHovered) {
+                    toast->closeHovered = close;
+                    OverlayService::Instance().impl_->RenderToastBitmap(*toast);
+                }
+                OverlayService::Instance().impl_->UpdateToastFrame(*toast);
+                return 0;
+            }
+            break;
+        case WM_MOUSELEAVE:
+            if (toast && toast->closable) {
+                toast->hovered = false;
+                if (toast->pausedTick) {
+                    toast->startTick += GetTickCount64()-toast->pausedTick; toast->pausedTick = 0;
+                }
+                if (toast->closeHovered) {
+                    toast->closeHovered = false; OverlayService::Instance().impl_->RenderToastBitmap(*toast);
+                }
+                OverlayService::Instance().impl_->UpdateToastFrame(*toast);
+                return 0;
+            }
+            break;
+        case WM_LBUTTONDOWN:
+            if (toast && toast->closable) {
+                toast->closePressed=CloseAt(*toast,lParam);
+                if(toast->closePressed) SetCapture(hwnd);
+                return 0;
+            }
+            break;
+        case WM_CAPTURECHANGED:
+            if(toast) toast->closePressed=false;
+            break;
+        case WM_LBUTTONUP:
+            if (toast && toast->closable) {
+                const bool close=toast->closePressed && CloseAt(*toast,lParam);
+                toast->closePressed=false;
+                if(GetCapture()==hwnd) ReleaseCapture();
+                if(close) OverlayService::Instance().impl_->BeginToastExit(*toast);
+                return 0;
+            }
+            break;
         case WM_NCCALCSIZE:
             if (wParam) return 0;
             break;
@@ -789,7 +900,7 @@ void OverlayService::InvokeSync(std::function<void()> fn) {
 }
 
 void OverlayService::ShowToast(HWND owner, const std::wstring& text, int durationMs,
-                               int position, int icon, int anim) {
+                               int position, int icon, int anim, bool closable) {
     auto request = std::make_unique<Impl::Request>();
     request->type = Impl::RequestType::ShowToast;
     request->owner = owner;
@@ -798,10 +909,16 @@ void OverlayService::ShowToast(HWND owner, const std::wstring& text, int duratio
     request->position = position;
     request->icon = icon;
     request->anim = anim;
+    request->closable = closable;
+    request->dark = theme::IsDark();
+    BOOL motion = TRUE; SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION,0,&motion,0);
+    request->motion = motion != FALSE;
     impl_->Post(std::move(request));
 }
 
 void OverlayService::DismissOwner(HWND owner) {
+    // Window geometry notifications must not start the service on their own.
+    { std::lock_guard<std::mutex> lock(impl_->mutex); if(!impl_->thread.joinable()) return; }
     auto request = std::make_unique<Impl::Request>();
     request->type = Impl::RequestType::DismissOwner;
     request->owner = owner;

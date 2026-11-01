@@ -12,12 +12,29 @@
 #include <ui/ui_window.h>
 #include <ui/controls.h>
 #include <ui/measure_context.h>
+#include <ui/overlay_service.h>
 #include <chrono>
 #include <cmath>
 #include <map>
 
 namespace spg {
 namespace {
+bool copy_text(HWND owner,const std::wstring& text) {
+    const auto bytes=(text.size()+1)*sizeof(wchar_t);
+    auto memory=GlobalAlloc(GMEM_MOVEABLE,bytes);
+    if(!memory) return false;
+    auto* data=GlobalLock(memory);
+    if(!data) { GlobalFree(memory); return false; }
+    memcpy(data,text.c_str(),bytes); GlobalUnlock(memory);
+    bool copied=false;
+    if(OpenClipboard(owner)) {
+        copied=EmptyClipboard() && SetClipboardData(CF_UNICODETEXT,memory);
+        CloseClipboard();
+    }
+    // SetClipboardData transfers ownership only on success.
+    if(!copied) GlobalFree(memory);
+    return copied;
+}
 bool rule_editor(const Json& editor) { return editor=="rule_list"; }
 void update_tags(TagCollection& tags,const Json& field,const Json& drafts) {
     auto id=field["id"].get<std::string>();
@@ -64,7 +81,7 @@ void apply_theme(UiPage page,UiThemeMode mode,HWND hwnd=nullptr) {
     if(page_value(page,"appearance")==appearance) return;
     ui_theme_set_mode(mode);
     set_text(page,"appearance",appearance);
-    if(hwnd) style_frame(hwnd,mode);
+    if(hwnd) { ui::OverlayService::Instance().DismissOwner(hwnd); style_frame(hwnd,mode); }
 }
 }
 Options parse_options(const std::vector<std::wstring>& args) {
@@ -604,6 +621,11 @@ void Application::handle_command(Json command) {
     auto op=command.value("op",std::string());
     auto p=command.value("payload",Json::object());
     if(op=="navigate") { navigate(p.value("tab",std::string())); return; }
+    if(op=="copyTaskText") {
+        const bool copied=copy_text(hwnd_,wide(p.at("text").get_ref<const std::string&>()));
+        ui::OverlayService::Instance().ShowToast(hwnd_,wide(tr(copied?"copySucceeded":"copyFailed",page_value(page_,"language"))),3000,0,copied?1:2,0,true);
+        return;
+    }
     if(op=="focusTag") {
         auto widget=ui_widget_find_by_id(ui_page_root(page_),("tag-input-"+p.at("id").get<std::string>()).c_str());
         if(widget) { ui_window_focus_widget(window_,widget); ui_widget_destroy(widget); }
@@ -804,6 +826,9 @@ LRESULT CALLBACK Application::subclass(HWND hwnd,UINT message,WPARAM wparam,LPAR
     auto* self=reinterpret_cast<Application*>(data);
     try {
         if(message==WM_DPICHANGED) self->update_icons(LOWORD(wparam));
+        if(message==WM_MOVE || message==WM_SIZE || message==WM_DPICHANGED || message==WM_CLOSE ||
+           message==WM_SHOWWINDOW || message==WM_SETTINGCHANGE || (message==WM_KEYDOWN && wparam==VK_ESCAPE))
+            ui::OverlayService::Instance().DismissOwner(hwnd);
         if(message==TaskRange) {
             self->task_range_pending_=false;
             auto* window=ui::GetContext().GetWindow(self->window_);
