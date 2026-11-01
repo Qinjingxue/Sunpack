@@ -11,6 +11,7 @@ from sunpack.runtime.watch.service import (
     add_watch_roots,
     list_watch_roots,
     remove_watch_roots,
+    retained_watch_root_changes,
     service_state_dir,
 )
 
@@ -150,6 +151,9 @@ async def _handle_add(args, ctx):
     start_summary = None
     if start_requested and not host.watch_enabled:
         start_summary = await host.start_watch()
+        if start_summary.get("running"):
+            _, effective_roots = list_watch_roots()
+            added, updated = retained_watch_root_changes(added, updated, effective_roots)
     return 0, CliCommandResult(
         command=COMMAND,
         inputs={"action": "add", "paths": paths, "output_dir": output_dir, "deep_detect": deep_detect},
