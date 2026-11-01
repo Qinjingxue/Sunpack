@@ -81,6 +81,7 @@ english.WatchRootsFileMapping=# Optional columns: input folder | output folder |
 english.WatchRootsFileDeepDetect=# deep_detect accepts true or false; blank defaults to false.
 english.WatchRootsFileExample=# Example: C:\Downloads | D:\Extracted | true
 english.EditableConfigCreateFailed=Failed to create the initial editable configuration file: %s
+english.ConfigLanguageInitializationFailed=Failed to initialize SunPack configuration language.
 chinesesimplified.TaskAddToPath=将 sunpack 添加到系统 PATH
 chinesesimplified.TaskContextMenu=注册 sunpack 文件夹右键菜单
 chinesesimplified.TaskAutostart=Windows 启动时运行 sunpack 监控
@@ -109,6 +110,7 @@ chinesesimplified.WatchRootsFileMapping=# 可选字段格式：输入目录 | �
 chinesesimplified.WatchRootsFileDeepDetect=# deep_detect 可填写 true 或 false；留空时默认为 false。
 chinesesimplified.WatchRootsFileExample=# 示例：C:\Downloads | D:\Extracted | true
 chinesesimplified.EditableConfigCreateFailed=无法创建初始可编辑配置文件：%s
+chinesesimplified.ConfigLanguageInitializationFailed=无法初始化 SunPack 配置语言。
 
 [Tasks]
 Name: "addtopath"; Description: "{cm:TaskAddToPath}"; GroupDescription: "{cm:GroupShellIntegration}"
@@ -116,11 +118,12 @@ Name: "contextmenu"; Description: "{cm:TaskContextMenu}"; GroupDescription: "{cm
 Name: "autostart"; Description: "{cm:TaskAutostart}"; GroupDescription: "{cm:GroupBackgroundWatch}"; Flags: unchecked
 
 [Files]
-Source: "{#SourceDir}\*"; DestDir: "{app}"; Excludes: "sunpack.exe,sunpack_config.json,sunpack_watch_roots.txt,builtin_passwords.json,scripts\upgrade_config.ps1"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#SourceDir}\*"; DestDir: "{app}"; Excludes: "sunpack.exe,sunpack_config.json,sunpack_watch_roots.txt,builtin_passwords.json,scripts\upgrade_config.ps1,scripts\initialize_config_language.ps1"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#SourceDir}\sunpack.exe"; DestDir: "{app}\bin"; Flags: ignoreversion
 Source: "{#SourceDir}\sunpack_config.json"; DestDir: "{commonappdata}\SunPack"; Flags: onlyifdoesntexist
 Source: "{#SourceDir}\sunpack_config.json"; DestDir: "{tmp}"; DestName: "sunpack-config-template.json"; Flags: deleteafterinstall
 Source: "{#SourceDir}\scripts\upgrade_config.ps1"; DestDir: "{tmp}\SunPackInstallScripts"; Flags: deleteafterinstall
+Source: "{#SourceDir}\scripts\initialize_config_language.ps1"; DestDir: "{tmp}\SunPackInstallScripts"; Flags: deleteafterinstall
 Source: "{#SourceDir}\builtin_passwords.json"; DestDir: "{commonappdata}\SunPack"; Flags: onlyifdoesntexist
 
 [Dirs]
@@ -737,6 +740,7 @@ var
   ConfigBackupCaptured: Boolean;
   ConfigMigrationApplied: Boolean;
   ConfigInstallCompleted: Boolean;
+  InitializeLanguageOnInstall: Boolean;
 
 procedure RestoreWatchAfterUpgrade;
 var
@@ -856,6 +860,24 @@ begin
   ConfigMigrationApplied := True;
 end;
 
+procedure InitializeInstalledLanguage;
+var
+  Parameters, Language: string;
+  ResultCode: Integer;
+begin
+  if ActiveLanguage = 'chinesesimplified' then Language := 'zh'
+  else Language := 'en';
+  Parameters := '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ' +
+    AddQuotes(ExpandConstant('{tmp}\SunPackInstallScripts\initialize_config_language.ps1')) +
+    ' -UserConfig ' + AddQuotes(ExpandConstant('{commonappdata}\SunPack\sunpack_config.json')) +
+    ' -AdvancedConfig ' + AddQuotes(ExpandConstant('{app}\sunpack_advanced_config.json')) +
+    ' -Language ' + Language;
+  if InitializeLanguageOnInstall then Parameters := Parameters + ' -InitializeUserConfig';
+  if not Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+              Parameters, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) or (ResultCode <> 0) then
+    RaiseException(CustomMessage('ConfigLanguageInitializationFailed'));
+end;
+
 procedure CleanupInstallScripts;
 var
   TempScripts: string;
@@ -915,6 +937,7 @@ begin
     Result := CustomMessage('PrepareOldFilesRemoveFailed');
     Exit;
   end;
+  InitializeLanguageOnInstall := not FileExists(ExpandConstant('{commonappdata}\SunPack\sunpack_config.json'));
   Result := '';
 end;
 
@@ -936,6 +959,7 @@ begin
   begin
     EnsureLocalizedEditableConfigFiles;
     UpgradeConfigurationFields;
+    InitializeInstalledLanguage;
     InstallBrokerService;
     if not Exec(
       ExpandConstant('{app}\bin\sunpack.exe'),
