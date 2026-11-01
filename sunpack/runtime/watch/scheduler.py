@@ -64,7 +64,7 @@ from sunpack.core.support.resource_lifecycle import (
 )
 
 from watchdog.events import FileSystemEvent, FileSystemEventHandler
-from watchdog.observers import Observer
+from sunpack.runtime.watch.observer import Observer
 
 
 USN_REASON_DATA_OVERWRITE = 0x00000001
@@ -274,6 +274,7 @@ class WatchScheduler:
         self._password_source_lock = threading.RLock()
         self._directory_pending: set[str] = set()
         self._watch_rearm: set[str] = set()
+        self._usn_checkpoint_pending = False
         self._observed_watches = {}
         self._pending: dict[str, WatchCandidate] = {}
         # All pending mutations use the helpers below under _lock. Keep every
@@ -415,7 +416,7 @@ class WatchScheduler:
         self._started = True
         self._recover_persisted_work()
         self._reconcile_persisted_blockers()
-        self._recover_usn_startup_gap()
+        self._recover_usn_gap(startup=True)
         self.log.recover(self.state._native)
         self.log.write(
             "scheduler_started",
@@ -481,6 +482,8 @@ class WatchScheduler:
                     continue
                 roots.append(root)
             self._watch_rearm.update(roots)
+            if roots:
+                self._usn_checkpoint_pending = True
             if arrived:
                 self._directory_pending.update(roots)
         if roots:
@@ -554,8 +557,12 @@ class WatchScheduler:
         if missing:
             self.state.merge_watch_cursors(missing, durable=True)
 
-    def _recover_usn_startup_gap(self) -> None:
-        """Restore the disposable index; task admission still uses the Watch WAL."""
+    def _recover_usn_gap(self, *, startup: bool = False) -> None:
+        """Cover a captured journal interval before advancing its durable boundary."""
+        if not self._started:
+            return
+        with self._lock:
+            self._usn_checkpoint_pending = False
         cursor_updates = {}
         changed_paths = {}
         rebuilt = []
@@ -619,21 +626,20 @@ class WatchScheduler:
                     if not scope.contains(path) or self.should_ignore_event_path(path):
                         continue
                     errors, arrivals = options.catalog_refresh(self._catalog, scope.native, path)
+                    changed_paths.update((path_key(arrival), arrival) for arrival in arrivals)
                     if errors:
                         raise OSError(str(errors))
                     covered.add(key)
                     if os.path.isfile(path):
                         changed_paths[path_key(path)] = path
-                    for arrival in arrivals:
-                        changed_paths[path_key(arrival)] = arrival
             except Exception as exc:
-                if cached is None:
+                if cached is None and startup:
                     errors = options.catalog_update(self._catalog, scope.native)
                     arrivals = ()
                 else:
                     errors, arrivals = options.catalog_refresh(self._catalog, scope.native)
                 rebuilt.append(root)
-                if cached is not None:
+                if cached is not None or not startup:
                     changed_paths.update((path_key(path), path) for path in arrivals)
                 self.log.write("catalog_rebuilt", root=root, reason=str(exc), errors=errors)
                 if errors:
@@ -650,15 +656,26 @@ class WatchScheduler:
             cursor_updates.pop(volume, None)
         for path in changed_paths.values():
             if not _persisted_blocker_owns_retry(self.state, path):
-                self.enqueue(path, force=True, event_type="startup_usn_recovery")
-        with self._lock:
-            recovered_candidates = list(self._pending.values())
+                self.enqueue(path, force=startup, event_type="startup_usn_recovery" if startup else "usn_recovery")
+        def candidates():
+            # queue_recovery_batch takes the state lock first. Keep the scheduler
+            # snapshot stable only while building the transaction, never over IO.
+            with self._lock:
+                yield from self._pending.values()
         if cursor_updates:
-            self.state.queue_recovery_batch(recovered_candidates, cursor_updates)
+            self.state.queue_recovery_batch(candidates(), cursor_updates)
         if self._catalog.error:
             self.log.write("catalog_persistence_failed", error=self._catalog.error)
-        self.log.write("usn_startup_recovered", changed=len(changed_paths),
-            queued=len(recovered_candidates), fallback_roots=rebuilt)
+        if startup or changed_paths or rebuilt:
+            self.log.write("usn_startup_recovered" if startup else "usn_checkpoint", changed=len(changed_paths),
+                queued=self.pending_count, fallback_roots=rebuilt)
+
+    def _request_usn_checkpoint(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._usn_checkpoint_pending = True
+        self._wake_service()
 
     def _recovery_output_matches(self, pending, path):
         # A recorded output root may have been replaced during our own flatten.
@@ -979,16 +996,21 @@ class WatchScheduler:
     def _stop_blocking(self):
         if not self._started:
             return
-        if self._observer_resource is not None:
-            self._observer_resource.close()
-            self._observer_resource = None
-        else:
-            self._release_observer()
-        self._clipboard_monitor.stop()
+        # Capture the boundary while directory notifications are still armed.
+        # Later writes remain beyond it and are replayed at the next startup.
+        try:
+            self._recover_usn_gap()
+        finally:
+            if self._observer_resource is not None:
+                self._observer_resource.close()
+                self._observer_resource = None
+            else:
+                self._release_observer()
+            self._clipboard_monitor.stop()
+            self._started = False
         self.state.compact_if_needed()
         with self._lock:
             self._cache_cleanup_deadline = None
-        self._started = False
 
     def _release_observer(self) -> None:
         self._observer.stop()
@@ -1008,6 +1030,12 @@ class WatchScheduler:
                 await self.pipeline_engine.work_broker.run("watch_directory", directory,
                     self._scan_initial_roots, [directory], request_id="watch", origin="watch")
                 covered.append(directory)
+        with self._lock:
+            checkpoint = self._usn_checkpoint_pending
+        if checkpoint:
+            await self.pipeline_engine.work_broker.run(
+                "watch_usn_checkpoint", "watch", self._recover_usn_gap, request_id="watch", origin="watch",
+            )
         now = time.monotonic()
         with self._lock:
             reload_due = self._password_reload_at is not None and self._password_reload_at <= now
@@ -1024,6 +1052,12 @@ class WatchScheduler:
             "watch_admission", "watch", self._prepare_ready, available,
             request_id="watch", origin="watch",
         )
+        if ready and not checkpoint:
+            # Admissions are already durable. Cover the whole event burst once
+            # before starting this batch, including candidates still waiting.
+            await self.pipeline_engine.work_broker.run(
+                "watch_usn_checkpoint", "watch", self._recover_usn_gap, request_id="watch", origin="watch",
+            )
         active_requests = []
         for candidate in ready:
             request = await self._submit_candidate(candidate)
@@ -1238,7 +1272,7 @@ class WatchScheduler:
     def next_delay_seconds(self) -> float | None:
         now = monotonic_now = time.monotonic()
         with self._lock:
-            if self._directory_pending or self._watch_rearm:
+            if self._directory_pending or self._watch_rearm or self._usn_checkpoint_pending:
                 return 0.0
             # Completion callbacks wake the service when admission space opens.
             # A full request window must not turn due candidates into polling.
@@ -1321,6 +1355,7 @@ class WatchScheduler:
                 self._runtime_cache_gate.release()
 
     def _maintain_persistent_state(self) -> None:
+        self._recover_usn_gap()
         self._catalog.commit(True)
         # Recovery preserved during a root change may have completed since
         # startup. Retire only resident state, not the file index.
@@ -2715,6 +2750,20 @@ class WatchScheduler:
 class _WatchEventHandler(FileSystemEventHandler):
     def __init__(self, scheduler: WatchScheduler):
         self.scheduler = scheduler
+
+    def on_any_event(self, event: FileSystemEvent):
+        for path in (event.src_path, getattr(event, "dest_path", "")):
+            if (path and not self.scheduler.should_ignore_event_path(path)
+                    and (self.scheduler._is_under_watched_root(path)
+                         or (event.is_directory and any(
+                             _paths_match(root, path, recursive=True) for root in self.scheduler.watch_roots)))):
+                if event.is_directory and event.is_synthetic and event.event_type == "modified":
+                    self.scheduler._request_usn_checkpoint()
+                else:
+                    # Reuse the one-shot maintenance deadline for metadata-only
+                    # events. Normal file bursts checkpoint at admission.
+                    self.scheduler._schedule_journal_retirement()
+                break
 
     def on_created(self, event: FileSystemEvent):
         self._handle(event, "created")

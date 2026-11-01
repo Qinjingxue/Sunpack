@@ -1166,6 +1166,14 @@ class WatchStateStore:
             for candidate in candidates:
                 key = _path_key(candidate.path)
                 previous = self._pending_record(key)
+                # A later checkpoint need not rewrite unchanged durable owners.
+                # The cursor's fsync also covers any preceding queued WAL writes.
+                if (previous is not None and previous.durable_owner
+                        and previous.size == int(candidate.size)
+                        and previous.mtime == float(candidate.mtime)
+                        and previous.file_id == str(getattr(candidate, "file_id", "") or "")
+                        and previous.change_usn == int(getattr(candidate, "change_usn", 0) or 0)):
+                    continue
                 pending = WatchPendingWork(
                     path=os.path.abspath(candidate.path),
                     size=int(candidate.size),

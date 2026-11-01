@@ -102,8 +102,8 @@ def test_watch_configuration_survives_disconnect_and_finishes_before_stop(tmp_pa
             pass
 
     monkeypatch.setattr(scheduler_module, "Observer", Observer)
-    for name in ("_prepare_usn_startup_baseline", "_recover_usn_startup_gap"):
-        monkeypatch.setattr(scheduler_module.WatchScheduler, name, lambda self: None)
+    for name in ("_prepare_usn_startup_baseline", "_recover_usn_gap"):
+        monkeypatch.setattr(scheduler_module.WatchScheduler, name, lambda self, **kwargs: None)
 
     async def scenario():
         engine = FakePipelineEngine(lambda _config: None)

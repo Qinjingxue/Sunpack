@@ -253,6 +253,7 @@ pub fn broker_for_each_directory_change(
     if state.connection.is_none() {
         state.connection = Some(connect_and_hello()?);
     }
+    let mut complete_rejection = false;
     let result = (|| {
         let connection = state.connection.as_mut().unwrap();
         let batch_ids = (crate::protocol::MAX_DIRECTORY_QUERY_BYTES - 8) / 16;
@@ -270,6 +271,9 @@ pub fn broker_for_each_directory_change(
                 request.previous_usn = cursor;
                 request.current_usn = end;
                 let (response, payload) = connection.transact_query(request, &query)?;
+                // A complete business rejection leaves the pipe framing intact.
+                // In particular, journal rollover must not release a live lease.
+                complete_rejection = response.status != Status::Ok;
                 ensure_ok(response)?;
                 if response.journal_id != journal
                     || response.next_usn <= cursor
@@ -307,7 +311,7 @@ pub fn broker_for_each_directory_change(
         Ok(())
     })();
     // A truncated exchange must never poison the framing of the next request.
-    if result.is_err() {
+    if result.is_err() && !complete_rejection {
         state.connection.take();
     }
     result

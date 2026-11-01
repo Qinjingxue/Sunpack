@@ -570,6 +570,7 @@ def _indexed_scheduler_for_test():
     watcher._lock = threading.Lock()
     watcher._directory_pending = set()
     watcher._watch_rearm = set()
+    watcher._usn_checkpoint_pending = False
     watcher._pending = {}
     watcher._pending_by_key = {}
     watcher._claims_by_owner = {}
@@ -1834,7 +1835,7 @@ def test_watch_scheduler_uses_watchdog_observer_and_initial_scan(tmp_path, monke
 
 def test_watch_scheduler_scans_only_requested_initial_scan_roots(tmp_path, monkeypatch):
     monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
-    monkeypatch.setattr(RuntimeWatchScheduler, "_recover_usn_startup_gap", lambda self: None)
+    monkeypatch.setattr(RuntimeWatchScheduler, "_recover_usn_gap", lambda self, **kwargs: None)
 
     first_root = tmp_path / "first"
     second_root = tmp_path / "second"

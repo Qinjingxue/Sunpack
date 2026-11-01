@@ -791,7 +791,11 @@ def test_catalog_event_batches_checkpoint_at_idle_and_preserve_case(tmp_path):
 
 @pytest.mark.requires_watch_broker
 def test_recursive_restart_replays_indexed_directories_without_initial_scan(tmp_path, monkeypatch):
-    """A flat native cache test cannot catch restart admission or empty-subdirectory gaps."""
+    """Flat cache tests miss restart/live admission, cross-root and journal gaps.
+
+    Removing this leaves durable coverage of a live burst and an event arriving
+    during replay untested. Tiny metadata fixtures reuse the same NTFS lifecycle.
+    """
     import os
     import sunpack_native
     import sunpack.runtime.watch.scheduler as module
@@ -858,6 +862,89 @@ def test_recursive_restart_replays_indexed_directories_without_initial_scan(tmp_
             scope = next(iter(second.scopes.values()))
             _, raw = compiled.catalog_snapshot(second._catalog, scope.native, str(modified))
             assert set(raw.file_columns()[0]) == {str(modified), str(arrived), str(root / "after/same.004")}
+
+            # Normal notifications wake admission/maintenance without querying
+            # the journal for each file. One replay covers every same-volume root,
+            # including a root whose notification was completely lost.
+            from watchdog.events import FileCreatedEvent, DirModifiedEvent
+            volume, journal, before = module.watch_volume_cursor(str(root))
+            live = root / "empty/live.opaque"
+            missed = other / "missed.002"
+            late = other / "late.disguised"
+            live.write_bytes(b"live")
+            missed.write_bytes(b"missed")
+            count = len(calls)
+            second._watch_handler.dispatch(FileCreatedEvent(str(live)))
+            assert len(calls) == count
+            generation = second._active_states[str(live)].generation
+
+            def racing_changes(*args):
+                paths = changes(*args)
+                late.write_bytes(b"late")
+                second._watch_handler.dispatch(DirModifiedEvent(str(other), is_synthetic=True))
+                return paths
+
+            monkeypatch.setattr(module, "watch_catalog_changes", racing_changes)
+            second._recover_usn_gap()
+            assert len(calls) == count + 1
+            assert {str(live), str(missed)} <= set(second._pending)
+            assert str(late) not in second._pending
+            assert second._active_states[str(live)].generation == generation
+            boundary = second.state.watch_cursor(volume)["next_usn"]
+            assert boundary > before
+            assert second._usn_checkpoint_pending and second.next_delay_seconds() == 0
+            assert sunpack_native.watch_candidate_for_path(str(late), None)["change_usn"] >= boundary
+            for native_scope in second.scopes.values():
+                assert second._catalog.cursor(native_scope.native) == (volume, journal, boundary)
+            # Reopen the WAL before stopping: shutdown must not hide a missing
+            # durability barrier or candidates waiting on missing volumes/passwords.
+            persisted = WatchStateStore(str(tmp_path / "state.snapshot"))
+            try:
+                assert persisted.watch_cursor(volume)["next_usn"] == boundary
+                for path in (live, missed):
+                    pending = persisted.pending_work_for_path(str(path))
+                    assert pending is not None and pending.durable_owner
+            finally:
+                persisted.close()
+
+            monkeypatch.setattr(module, "watch_catalog_changes", changes)
+            monkeypatch.setattr(second, "_prepare_ready", lambda available: [])
+            await second.run_once()
+            assert str(late) in second._pending and not second._usn_checkpoint_pending
+
+            # An already-pruned interval rebuilds the existing metadata baseline;
+            # the healthy physical connection survives the rejected USN request.
+            second._scan_options = compiled
+            for native_scope in second.scopes.values():
+                second._catalog.set_cursor(native_scope.native, volume, journal, 1)
+            second.state.merge_watch_cursors({volume: {"journal_id": journal, "next_usn": 1}})
+            rebuilt = root / "empty/rebuilt.003"
+            rebuilt.write_bytes(b"rebuilt")
+            second._recover_usn_gap()
+            assert str(rebuilt) in second._pending
+            assert second.state.watch_cursor(volume)["next_usn"] > 1
+            assert sunpack_native.watch_broker_is_connected()
+
+            # A partial metadata read may publish useful rows, but it must retain
+            # those arrivals and leave the shared durable boundary behind.
+            previous = second.state.watch_cursor(volume)
+            partial = root / "partial.004"
+            partial.write_bytes(b"partial")
+            class PartialRefresh:
+                def __getattr__(self, name):
+                    return getattr(compiled, name)
+                def catalog_refresh(self, catalog, native_scope, changed=None):
+                    errors, arrivals = compiled.catalog_refresh(catalog, native_scope, changed)
+                    if native_scope.root == str(root):
+                        errors = [*errors, (str(root), "scan", "temporarily unreadable")]
+                    return errors, arrivals
+            second._scan_options = PartialRefresh()
+            second._recover_usn_gap()
+            assert second.state.watch_cursor(volume) == previous
+            assert str(partial) in second._pending
+            second._scan_options = compiled
+            second._recover_usn_gap()
+            assert second.state.watch_cursor(volume)["next_usn"] > previous["next_usn"]
         finally:
             await second.stop()
             second._close_blocking()

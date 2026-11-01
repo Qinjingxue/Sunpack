@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import statistics
 import subprocess
 import sys
@@ -66,6 +67,26 @@ def _broker_lifecycle_roundtrip(tmp_path):
             )
             assert denied_stop.returncode != 0
         sunpack_native.validate_ntfs_watch_root(str(tmp_path))
+        # Ping reconnects automatically and previously hid lease loss on a
+        # complete journal rejection. Check the connection and SCM identity
+        # before issuing any request that could repair it.
+        def broker_pid():
+            result = subprocess.run(["sc.exe", "queryex", service_name],
+                                    capture_output=True, text=True, check=True)
+            return int(re.search(r"\bPID\s*:\s*(\d+)", result.stdout)[1])
+
+        pid = broker_pid()
+        volume, journal, start = sunpack_native.watch_volume_cursor(str(tmp_path))
+        archive.touch()
+        _, _, end = sunpack_native.watch_volume_cursor(str(tmp_path))
+        assert end > start
+        for expected_journal, previous in ((journal ^ 1, start), (journal, 1)):
+            with pytest.raises(OSError):
+                sunpack_native.watch_directories_changes([str(tmp_path)], volume, expected_journal, previous, end)
+            assert sunpack_native.watch_broker_is_connected()
+            assert broker_pid() == pid != 0
+        sunpack_native.watch_directories_changes([str(tmp_path)], volume, journal, start, end)
+        assert broker_pid() == pid
         baseline = sunpack_native.watch_candidate_for_path(str(archive), None)
         assert baseline is not None
         previous_usn = int(baseline["change_usn"])

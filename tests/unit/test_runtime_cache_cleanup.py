@@ -216,6 +216,8 @@ def test_failed_wal_retirement_schedules_one_idle_retry(tmp_path, monkeypatch, s
     from threading import Event
     from sunpack.runtime.watch.scanner import WatchCandidate
     import sunpack.runtime.watch.scheduler as scheduler_module
+    # This exercises WAL retirement without a broker lease or journal recovery.
+    monkeypatch.setattr(WatchScheduler, "_recover_usn_gap", lambda self, **kwargs: None)
 
     async def scenario():
         now = [100.0]
