@@ -42,14 +42,19 @@ def test_blacklist_path_exact_name_stops_descending(tmp_path):
     assert keep in paths
 
 
-def test_blacklist_path_regex_matches_directory_name_case_insensitively(tmp_path):
+def test_blacklist_path_regex_matches_directory_name_case_sensitively(tmp_path):
     archive = tmp_path / "Node_Modules" / "payload.zip"
     archive.parent.mkdir()
     archive.write_bytes(b"PK\x03\x04payload")
+    blocked = tmp_path / "nested" / "node_modules" / "payload.zip"
+    blocked.parent.mkdir(parents=True)
+    blocked.write_bytes(b"PK\x03\x04payload")
 
     snapshot = DirectoryScanner(str(tmp_path), scope=DiscoveryScope(str(tmp_path), recursive=True), config=_config(paths=[{'value':r'(?:\A|/)node_[^/]*(?:/|\z)','regex':True}])).scan()
 
-    assert not snapshot
+    paths = {entry.path for entry in _entries(snapshot)}
+    assert archive in paths
+    assert blocked not in paths
 
 
 def test_blacklist_literal_path_is_relative_to_scan_root(tmp_path):
@@ -123,14 +128,14 @@ def test_path_rules_agree_across_scans_watch_and_output_inventories(tmp_path):
         ([{"name": "blacklist", "enabled": True,
            "paths": [regex(r"(?:\A|/)node_[^/]*(?:/|\z)"), literal(r"cache\private"), regex(r"(?:\A|/)a[^/]*b(?:/|\z)")],
            "full_names": [regex(r"keep_0[0-9]\.rar\z"), literal("regex[0-9]+.zip")]}],
-         names - {"NODE_Modules/deep/keep_11.zip", "cache/private/keep_06.zip",
+         names - {"cache/private/keep_06.zip",
                   "axb/keep_09.zip", "archives/sub/deeper/keep_02.rar",
                   "archives/sub/deeper/regex[0-9]+.zip"}),
         ([{"name": "whitelist", "enabled": True,
            "paths": [regex(r"\A(?:archives|downloads)(?:/|\z)")],
            "full_names": [regex(r"(?:keep_[0-9]{2}|root)\.zip\z")]},
           {"name": "blacklist", "enabled": True, "paths": [regex(r"\Aarchives/skip_")]}],
-         {"archives/root.zip", "archives/sub/deeper/Keep_01.ZIP",
+         {"archives/root.zip",
           "archives/sub/deeper/keep_03.zip", "downloads/sub/keep_10.zip"}),
         ([{"name": "whitelist", "enabled": True,
            "paths": [literal("downloads/sub")]}], {"downloads/sub/keep_10.zip"}),
@@ -144,8 +149,10 @@ def test_path_rules_agree_across_scans_watch_and_output_inventories(tmp_path):
         ([{"name": "whitelist", "enabled": True, "paths": [regex(r"\A中文/\p{L}+\[1\]\+\.zip\z")]}],
          {"中文/报告[1]+.zip"}),
         ([{"name": "whitelist", "enabled": True, "full_names": [literal("Keep.txt"), literal("sample.zip")]}],
+         set()),
+        ([{"name": "whitelist", "enabled": True, "full_names": [literal("Keep.txt"), literal("ſample.zip")]}],
          {"unicode/Keep.txt", "unicode/ſample.zip"}),
-        ([{"name": "whitelist", "enabled": True, "paths": [regex(r"(?-i)\Aarchives/.*Keep_[0-9]+\.ZIP\z")]}],
+        ([{"name": "whitelist", "enabled": True, "paths": [regex(r"\Aarchives/.*Keep_[0-9]+\.ZIP\z")]}],
          {"archives/sub/deeper/Keep_01.ZIP"}),
         ([{"name": "whitelist", "enabled": True, "paths": [literal("a/*/b")]}],
          {"a/x/b/keep_08.zip"}),
@@ -154,16 +161,23 @@ def test_path_rules_agree_across_scans_watch_and_output_inventories(tmp_path):
           "archives/sub/deeper/keep_03.zip", "archives/sub/deeper/regex[0-9]+.zip"}),
         ([{"name": "whitelist", "enabled": True,
            "files": [literal("keep_??")], "extensions": [literal("z?p")],
-           "full_names": [literal("*_03.*"), regex(r"(?-i)\AKeep_01\.ZIP\z")]}],
-         {"archives/sub/deeper/Keep_01.ZIP", "archives/sub/deeper/keep_03.zip"}),
+           "full_names": [literal("*_03.*"), regex(r"\AKeep_01\.ZIP\z")]}],
+         {"archives/sub/deeper/keep_03.zip"}),
         ([{"name": "blacklist", "enabled": True, "paths": [literal("node_*")],
            "files": [literal("regex[0-9]+")], "extensions": [literal("r?r")],
            "full_names": [literal("keep_03.???")]}],
-         names - {"NODE_Modules/deep/keep_11.zip", "archives/sub/deeper/regex[0-9]+.zip",
+         names - {"archives/sub/deeper/regex[0-9]+.zip",
                   "archives/sub/deeper/keep_02.rar", "archives/sub/deeper/keep_03.zip"}),
         ([{"name": "whitelist", "enabled": True,
            "files": [literal("报告[?]+")], "extensions": [regex(r"\Az(?:ip|ipx)\z")]}],
          {"中文/报告[1]+.zip"}),
+        ([{"name": "whitelist", "enabled": True, "paths": [literal("Archives/sub")]}], set()),
+        ([{"name": "whitelist", "enabled": True, "paths": [literal("ARCHIVES/*")]}], set()),
+        ([{"name": "whitelist", "enabled": True, "paths": [regex(r"\A中文/报告")]}],
+         {"中文/报告[1]+.zip"}),
+        ([{"name": "whitelist", "enabled": True, "full_names": [literal("keep_01.zip")]}], set()),
+        ([{"name": "whitelist", "enabled": True, "full_names": [literal("Keep_01.ZIP")]}],
+         {"archives/sub/deeper/Keep_01.ZIP"}),
     ]
 
     def relative_files(snapshot):
@@ -236,12 +250,16 @@ def test_filename_parts_use_the_last_dot_and_handle_absent_or_empty_extensions()
         ({"files": [{"value": "bundle.part??.rar", "regex": False}]}, {names[0]}),
         ({"files": [{"value": "archive.tar", "regex": False}]}, {names[1]}),
         ({"files": [{"value": "README", "regex": False}]}, {names[2]}),
+        ({"files": [{"value": "readme", "regex": False}]}, set()),
         ({"extensions": [{"value": r"\A\z", "regex": True}]}, {names[3]}),
-        ({"extensions": [{"value": "zip", "regex": False}]}, {names[4], names[5]}),
+        ({"extensions": [{"value": "zip", "regex": False}]}, {names[4]}),
+        ({"extensions": [{"value": "ZIP", "regex": False}]}, {names[5]}),
         ({"files": [{"value": r"\A\z", "regex": True}]}, {names[4]}),
         ({"files": [{"value": "报告[?]+", "regex": False}]}, {names[5]}),
         ({"files": [{"value": "keep", "regex": False}],
-          "extensions": [{"value": "safetensors", "regex": False}]}, {names[6]}),
+          "extensions": [{"value": "safetensors", "regex": False}]}, set()),
+        ({"files": [{"value": "KEEP", "regex": False}],
+          "extensions": [{"value": "ſAFETENSORS", "regex": False}]}, {names[6]}),
         ({"full_names": [{"value": "*.rar.jpg", "regex": False}]}, {names[0]}),
         ({"extensions": [{"value": "*", "regex": False}]}, set(names) - {names[2]}),
     ]

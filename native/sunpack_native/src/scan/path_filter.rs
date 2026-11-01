@@ -2,7 +2,6 @@
 use pyo3::prelude::*;
 use regex_automata::{
     meta::{Cache, Regex},
-    util::syntax,
     Input,
 };
 use regex_syntax::hir::{literal::Extractor, Hir, HirKind, Look};
@@ -46,7 +45,6 @@ fn compile_patterns(patterns: &[String]) -> PyResult<Option<Regex>> {
         return Ok(None);
     }
     Regex::builder()
-        .syntax(syntax::Config::new().case_insensitive(true))
         // Acceleration budget, not a matching/failure limit: a full lazy DFA
         // cache can be cleared or the meta engine can fall back to its NFA.
         .configure(Regex::config().hybrid_cache_capacity(256 * 1024))
@@ -65,57 +63,29 @@ fn compile_patterns(patterns: &[String]) -> PyResult<Option<Regex>> {
         })
 }
 
-#[derive(Default)]
-struct TextScratch {
-    literals: Option<Cache>,
-    patterns: Option<Cache>,
-    folded: String,
-}
-impl TextScratch {
-    fn regex_memory_usage(&self) -> usize {
-        self.literals.as_ref().map_or(0, Cache::memory_usage)
-            + self.patterns.as_ref().map_or(0, Cache::memory_usage)
-    }
-}
+type TextScratch = Option<Cache>;
 
 struct TextMatcher {
     exact: HashSet<String>,
-    literals: Option<Regex>,
     patterns: Option<Regex>,
-    ascii_literals: bool,
 }
 
 impl TextMatcher {
     fn regex_memory_usage(&self) -> usize {
-        self.literals.as_ref().map_or(0, Regex::memory_usage)
-            + self.patterns.as_ref().map_or(0, Regex::memory_usage)
+        self.patterns.as_ref().map_or(0, Regex::memory_usage)
     }
     fn compile(values: Vec<String>, mut patterns: Vec<String>) -> PyResult<Self> {
-        let mut literals = Vec::new();
+        let mut exact = HashSet::new();
         for value in values {
             if value.contains(['*', '?']) {
                 patterns.push(wildcard_pattern(&value));
             } else {
-                literals.push(value);
+                exact.insert(value);
             }
         }
-        let ascii_literals = literals.iter().all(|s| s.is_ascii());
-        let exact = literals
-            .iter()
-            .filter(|s| s.is_ascii())
-            .map(|s| s.to_ascii_lowercase())
-            .collect();
-        // Unicode simple folding, including Kelvin sign/K and long s/S, must
-        // agree with regex rules. The ASCII hot path needs no regex cache.
-        let escaped: Vec<_> = literals
-            .iter()
-            .map(|s| format!("\\A(?:{})\\z", regex::escape(s)))
-            .collect();
         Ok(Self {
             exact,
-            literals: compile_patterns(&escaped)?,
             patterns: compile_patterns(&patterns)?,
-            ascii_literals,
         })
     }
     fn from_entries(entries: Vec<RuleEntry>, field: &str) -> PyResult<Self> {
@@ -135,33 +105,15 @@ impl TextMatcher {
         Self::compile(values, patterns)
     }
     fn is_empty(&self) -> bool {
-        self.literals.is_none() && self.patterns.is_none()
-    }
-    fn search(re: &Option<Regex>, cache: &mut Option<Cache>, value: &str) -> bool {
-        re.as_ref().is_some_and(|re| {
-            let cache = cache.get_or_insert_with(|| re.create_cache());
-            re.search_half_with(cache, &Input::new(value).earliest(true))
-                .is_some()
-        })
+        self.exact.is_empty() && self.patterns.is_none()
     }
     fn matches(&self, value: &str, scratch: &mut TextScratch) -> bool {
-        if value.is_ascii() {
-            if self.exact.contains(value) {
-                return true;
-            }
-            if !self.exact.is_empty() && value.bytes().any(|b| b.is_ascii_uppercase()) {
-                scratch.folded.clear();
-                scratch
-                    .folded
-                    .extend(value.bytes().map(|b| char::from(b.to_ascii_lowercase())));
-                if self.exact.contains(&scratch.folded) {
-                    return true;
-                }
-            }
-        }
-        ((!value.is_ascii() || !self.ascii_literals)
-            && Self::search(&self.literals, &mut scratch.literals, value))
-            || Self::search(&self.patterns, &mut scratch.patterns, value)
+        self.exact.contains(value)
+            || self.patterns.as_ref().is_some_and(|re| {
+                let cache = scratch.get_or_insert_with(|| re.create_cache());
+                re.search_half_with(cache, &Input::new(value).earliest(true))
+                    .is_some()
+            })
     }
 }
 
@@ -191,8 +143,6 @@ fn start_anchored(hir: &Hir) -> bool {
 }
 
 fn regex_routes(pattern: &str) -> Option<Vec<String>> {
-    // ASCII-insensitive prefix comparisons below safely over-approximate both
-    // case modes. Avoid expanding every default-folded letter into alternates.
     let hir = regex_syntax::ParserBuilder::new()
         .build()
         .parse(pattern)
@@ -200,16 +150,16 @@ fn regex_routes(pattern: &str) -> Option<Vec<String>> {
     if !start_anchored(&hir) {
         return None;
     }
-    // Extractor bounds expansion. Infinite/empty/non-ASCII prefixes disable
+    // Extractor bounds expansion. Infinite/empty/invalid UTF-8 prefixes disable
     // this optimization; they never reject an otherwise valid expression.
     let seq = Extractor::new().extract(&hir);
     let mut result = HashSet::new();
     for literal in seq.literals()? {
         let bytes = literal.as_bytes();
-        if bytes.is_empty() || !bytes.is_ascii() {
+        if bytes.is_empty() {
             return None;
         }
-        result.insert(String::from_utf8(bytes.to_ascii_lowercase()).ok()?);
+        result.insert(String::from_utf8(bytes.to_vec()).ok()?);
     }
     Some(result.into_iter().collect())
 }
@@ -290,25 +240,11 @@ impl PathMatcher {
         if self.is_empty() || !self.names.is_empty() || self.matches(relative, scratch) {
             return true;
         }
-        // Unknown Unicode prefix relations stay open. Actual matching above
-        // still uses the same Unicode semantics as every regex rule.
-        if !relative.is_ascii() {
-            return true;
-        }
-        let compatible = |route: &String| {
-            if !route.is_ascii() {
-                return true;
-            }
-            let (short, long) = if relative.len() < route.len() {
-                (relative, route.as_str())
-            } else {
-                (route.as_str(), relative)
-            };
-            short.eq_ignore_ascii_case(&long[..short.len()])
-        };
-        self.routes
-            .as_ref()
-            .is_none_or(|routes| routes.iter().any(compatible))
+        self.routes.as_ref().is_none_or(|routes| {
+            routes
+                .iter()
+                .any(|route| relative.starts_with(route) || route.starts_with(relative))
+        })
     }
 }
 
@@ -332,11 +268,10 @@ impl PathRuleScratch {
     pub(super) fn regex_memory_usage(&self) -> usize {
         self.files
             .iter()
-            .map(TextScratch::regex_memory_usage)
+            .chain([&self.paths.names, &self.paths.rooted, &self.paths.patterns])
+            .filter_map(Option::as_ref)
+            .map(Cache::memory_usage)
             .sum::<usize>()
-            + self.paths.names.regex_memory_usage()
-            + self.paths.rooted.regex_memory_usage()
-            + self.paths.patterns.regex_memory_usage()
     }
 }
 

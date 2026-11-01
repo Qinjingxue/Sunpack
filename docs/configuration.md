@@ -73,8 +73,8 @@ or more characters and `?` matches one Unicode character; other symbols are
 literal. These rules match the whole selected value. Neither wildcard crosses
 `/`, and repeated stars have no recursive meaning. Enabled uses Rust regex
 syntax, which excludes look-around and backreferences, and searches the selected
-value. Matching defaults to Unicode-aware case insensitivity; regex inline flags
-may override this.
+value. All four fields are case-sensitive for ordinary and regex rules; Unicode
+text is matched directly. Regex inline flags retain their standard meaning.
 
 `files` selects the filename before its last dot, `extensions` selects the part
 after that dot (without a leading dot), and `full_names` selects the full basename.

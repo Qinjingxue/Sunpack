@@ -26,7 +26,7 @@ def test_installer_merges_path_rules_preserves_switches_and_is_idempotent(tmp_pa
                      "path_globs": ["downloads/**"], "prune_dir_globs": ["downloads", "archives"],
                      "allowed_files": ["keep_01.zip"], "allowed_extensions": ["zip"]},
                     {"name": "blacklist", "enabled": blacklist_enabled,
-                     "blocked_files": ["Thumbs.db"], "blocked_extensions": ["tmp", ".", "..never"]},
+                     "blocked_files": ["Thumbs.db"], "blocked_extensions": ["tmp", "TMP", ".", "..never"]},
                     {"name": "size_range", "enabled": True, "min_bytes": 1},
                 ],
             },
@@ -54,6 +54,7 @@ def test_installer_merges_path_rules_preserves_switches_and_is_idempotent(tmp_pa
         assert files["files"] == []
         assert files["full_names"] == [{"value": "Thumbs.db", "regex": False}]
         assert files["extensions"] == [{"value": "tmp", "regex": False},
+                                       {"value": "TMP", "regex": False},
                                        {"value": r"\A\z", "regex": True},
                                        {"value": ".never", "regex": False}]
         whitelists = [item for item in filters if item["name"] == "whitelist"]
@@ -70,9 +71,15 @@ def test_installer_merges_path_rules_preserves_switches_and_is_idempotent(tmp_pa
             return NativePathRule(*(item[field] for field in ("paths", "files", "extensions", "full_names")))
         deny = native(files)
         assert deny.rejects("C:/input/a.tmp", "C:/input", False, False)
+        assert deny.rejects("C:/input/a.TMP", "C:/input", False, False)
+        assert deny.rejects("C:/input/Thumbs.db", "C:/input", False, False)
+        assert not deny.rejects("C:/input/thumbs.db", "C:/input", False, False)
         assert deny.rejects("C:/input/a.", "C:/input", False, False)
         assert deny.rejects("C:/input/.tmp", "C:/input", False, False)
         assert not deny.rejects("C:/input/a.never", "C:/input", False, False)
+        directory_deny = native(paths)
+        assert directory_deny.rejects("C:/input/Cache/Private/a.zip", "C:/input", False, False)
+        assert not directory_deny.rejects("C:/input/cache/private/a.zip", "C:/input", False, False)
         allow = [native(item) for item in whitelists]
         def accepted(path):
             return all(not rule.rejects(path, "C:/input", False, True) for rule in allow)

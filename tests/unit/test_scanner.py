@@ -328,7 +328,7 @@ def test_directory_scanner_blacklist_blocks_exact_file_names(tmp_path):
     snapshot = DirectoryScanner(str(tmp_path), config=make_config({
         "filesystem": {
             "scan_filters": [
-                {'name': 'blacklist', 'enabled': True, 'full_names': [{'value': 'thumbs.db', 'regex': False}]},
+                {'name': 'blacklist', 'enabled': True, 'full_names': [{'value': 'Thumbs.db', 'regex': False}]},
             ]
         }
     })).scan()

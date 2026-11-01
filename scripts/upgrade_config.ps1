@@ -50,7 +50,7 @@ function Convert-PathRule([string]$Value, [bool]$DirectoryName) {
 }
 
 function Unique-Rules($Rules) {
-    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     foreach ($rule in $Rules) {
         if ($seen.Add(([string]$rule.regex + ':' + $rule.value))) { $rule }
     }
@@ -119,7 +119,7 @@ foreach ($filter in @($user.filesystem.scan_filters)) {
     $converted.Add($filter)
     # The two old whitelist path groups were independent AND conditions.
     # Extension/name AND now fits directly in one module, without splitting it.
-    if ($directories.Count -and (ConvertTo-Json -InputObject $filter.paths -Compress) -ne (ConvertTo-Json -InputObject @(Unique-Rules $directories) -Compress)) {
+    if ($directories.Count -and (ConvertTo-Json -InputObject $filter.paths -Compress) -cne (ConvertTo-Json -InputObject @(Unique-Rules $directories) -Compress)) {
         $converted.Add([pscustomobject]@{ name = 'whitelist'; enabled = $enabled; paths = @(Unique-Rules $directories); full_names = @(); files = @(); extensions = @() })
     }
     $changed = $true

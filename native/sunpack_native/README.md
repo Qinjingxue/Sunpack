@@ -45,8 +45,9 @@ parameters or the caller fails explicitly.
 shared by directory scans, watch catalogs, output inventories and Python entry
 filters. All fields contain `{ "value": "...", "regex": false }` records. Ordinary
 rules support only `*` and `?`, anchored to the whole selected string and never
-crossing `/`; remaining characters are literal. Names without wildcards use an ASCII
-exact-set fast path with Unicode regex folding for non-ASCII names. Regex records
+crossing `/`; remaining characters are literal. Matching is case-sensitive.
+Names without wildcards use one exact set for ASCII and Unicode, with no case
+conversion or literal regex fallback. Regex records
 use the existing regex-automata engine, with one combined matcher per group.
 No separate Glob or extension engine is used. The three file selectors use the
 same fixed array of text matchers and one evaluation loop. `files` selects the
@@ -59,7 +60,8 @@ path rules match normalized root-relative paths and inherit directory matches.
 Bare literal names match any component; literals containing `/` are root-relative.
 Blacklist fields use OR; whitelist nonempty fields use AND, with OR within each
 field. Anchored regex prefixes are extracted through regex-syntax to preserve
-safe directory pruning. Unknown prefix relations stay open, including Unicode.
+safe directory pruning using direct string prefixes, including Unicode.
+Unknown prefix relations stay open.
 
 Compiled rules are shared through `Arc`. Each native scan, watch operation or
 inventory batch owns its lazy search caches and releases them on completion.
