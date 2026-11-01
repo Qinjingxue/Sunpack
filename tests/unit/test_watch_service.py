@@ -772,11 +772,23 @@ def test_watch_service_keeps_running_when_optional_tray_cannot_start():
     ]
 
 
-def test_watch_service_apply_failure_rolls_back_previous_config(tmp_path, monkeypatch):
+@pytest.mark.parametrize("operation", ["reload", "add", "remove"])
+@pytest.mark.parametrize("failure_phase", ["scheduler", "callback"])
+def test_watch_service_apply_failure_rolls_back_previous_config(tmp_path, monkeypatch, operation, failure_phase):
+    """Only this test combines durable cleanup, apply failure and a concurrent edit.
+
+    Other lifecycle tests miss stale rollback roots and overwritten policies.
+    Six small transactions cover both failure phases and all configuration entry
+    points without starting a broker or extracting archives.
+    """
+    import sunpack_native
+
     roots_path = tmp_path / "sunpack_watch_roots.txt"
-    watch_root = tmp_path / "watched"
-    watch_root.mkdir()
-    roots_path.write_text(str(watch_root), encoding="utf-8")
+    good, bad, changed, concurrent = [tmp_path / name for name in ("good", "bad", "changed", "concurrent")]
+    for root in (good, bad, changed, concurrent):
+        root.mkdir()
+    initial = [good, bad, changed] if operation == "remove" else [good, bad]
+    roots_path.write_text("# preserved\n" + "\n".join(map(str, initial)), encoding="utf-8")
     state_dir = tmp_path / ".sunpack_watch"
     configs = iter(
         [
@@ -786,20 +798,48 @@ def test_watch_service_apply_failure_rolls_back_previous_config(tmp_path, monkey
     )
     monkeypatch.setattr(service_module, "watch_roots_path", lambda: roots_path)
     monkeypatch.setattr(service_module, "load_config", lambda: make_config(next(configs)))
+    monkeypatch.setattr(sunpack_native, "watch_filesystem_type", lambda path: "exFAT" if path == str(bad) else "NTFS")
+    monkeypatch.setattr(service_module, "show_error", lambda *_args: None)
     service = WatchService(engine_factory=lambda _config: FakePipelineEngine(FakeRunner))
     starts = []
 
     async def start_scheduler():
-        starts.append(service.config["revision"])
-        if service.config["revision"] == 2:
-            raise RuntimeError("new runtime failed")
+        starts.append(list(service.roots))
+        if len(starts) == 1:
+            # A CLI/GUI writer commits while configuration application is pending.
+            service_module.add_watch_roots([str(concurrent)], output_dir="out", deep_detect=True, recursive=True)
+            if failure_phase == "scheduler":
+                raise RuntimeError("new runtime failed")
+
+    async def on_config(_config):
+        raise RuntimeError("new runtime failed")
 
     monkeypatch.setattr(service, "_start_scheduler", start_scheduler)
+    if failure_phase == "callback":
+        service.config_applied_callback = on_config
 
-    _await(service._reload_config())
+    async def scenario():
+        if operation == "reload":
+            assert await service.reload() is False
+        else:
+            with pytest.raises(RuntimeError, match="new runtime failed"):
+                if operation == "add":
+                    await service.add_roots([str(changed)])
+                else:
+                    await service.remove_roots([str(changed)])
 
-    assert service.config["revision"] == 1
-    assert starts == [2, 1]
+    try:
+        _await(scenario())
+        assert service.config["revision"] == 1
+        expected = [str(good), str(changed)] if operation == "add" else [str(good)]
+        assert starts == [expected, [*expected, str(concurrent)]]
+        assert service.roots == [*expected, str(concurrent)]
+        entries = service_module._read_watch_root_entries()
+        assert service.service_config["root_entries"] == entries
+        assert entries[-1] == service_module.WatchRootEntry(str(concurrent), str(concurrent / "out"), True, False, True)
+        assert roots_path.read_text(encoding="utf-8").startswith("# preserved\n")
+    finally:
+        service.log.close()
 
 
 def test_watch_roots_are_stored_in_program_txt(tmp_path, monkeypatch):

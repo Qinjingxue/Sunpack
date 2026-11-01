@@ -1014,9 +1014,9 @@ class WatchService:
         self.config = new_config
         self.service_config = new_service_config
         self.state_dir = new_state_dir
-        if plan.state_dir_changed:
-            self.log = WatchLogStore(os.path.join(new_state_dir, "events.json"), retention_days=new_config["watch"]["event_log_retention_days"])
         try:
+            if plan.state_dir_changed:
+                self.log = WatchLogStore(os.path.join(new_state_dir, "events.json"), retention_days=new_config["watch"]["event_log_retention_days"])
             if plan.restart_scheduler:
                 await self._start_scheduler()
             else:
@@ -1032,7 +1032,17 @@ class WatchService:
             if failed_log is not self.log:
                 await asyncio.to_thread(failed_log.close)
             try:
-                if plan.restart_scheduler:
+                # Root edits (including cleanup) are already durable. Restore
+                # ordinary settings, but reconcile roots from the latest file
+                # rather than resurrecting deleted roots or undoing other writers.
+                rollback_service_config = dict(self.service_config)
+                await self._clean_non_ntfs_roots(self.config, rollback_service_config)
+                roots_changed = (
+                    _service_config_without_tray(rollback_service_config)
+                    != _service_config_without_tray(self.service_config)
+                )
+                self.service_config = rollback_service_config
+                if plan.restart_scheduler or roots_changed:
                     await self._start_scheduler()
                 if plan.reconcile_tray:
                     self._reconcile_tray()
