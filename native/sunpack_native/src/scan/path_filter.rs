@@ -7,13 +7,38 @@ use regex_automata::{
 };
 use regex_syntax::hir::{literal::Extractor, Hir, HirKind, Look};
 use serde::Deserialize;
-use std::{cell::OnceCell, collections::HashSet, path::Path, sync::Arc};
+use std::{borrow::Cow, cell::OnceCell, collections::HashSet, path::Path, sync::Arc};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RuleEntry {
     value: String,
     regex: bool,
+}
+
+fn wildcard_pattern(value: &str) -> String {
+    // Only * and ? are special. Anchoring keeps ordinary rules full matches;
+    // neither wildcard crosses a path separator. Consecutive stars are equal.
+    let mut pattern = String::from("\\A(?:");
+    let mut start = 0;
+    let mut star = false;
+    for (index, c) in value.char_indices() {
+        if c != '*' && c != '?' {
+            star = false;
+            continue;
+        }
+        pattern.push_str(&regex::escape(&value[start..index]));
+        if c == '?' {
+            pattern.push_str("[^/]");
+        } else if !star {
+            pattern.push_str("[^/]*");
+        }
+        star = c == '*';
+        start = index + 1;
+    }
+    pattern.push_str(&regex::escape(&value[start..]));
+    pattern.push_str(")\\z");
+    pattern
 }
 
 fn compile_patterns(patterns: &[String]) -> PyResult<Option<Regex>> {
@@ -65,7 +90,15 @@ impl TextMatcher {
         self.literals.as_ref().map_or(0, Regex::memory_usage)
             + self.patterns.as_ref().map_or(0, Regex::memory_usage)
     }
-    fn compile(literals: Vec<String>, patterns: Vec<String>) -> PyResult<Self> {
+    fn compile(values: Vec<String>, mut patterns: Vec<String>) -> PyResult<Self> {
+        let mut literals = Vec::new();
+        for value in values {
+            if value.contains(['*', '?']) {
+                patterns.push(wildcard_pattern(&value));
+            } else {
+                literals.push(value);
+            }
+        }
         let ascii_literals = literals.iter().all(|s| s.is_ascii());
         let exact = literals
             .iter()
@@ -84,6 +117,22 @@ impl TextMatcher {
             patterns: compile_patterns(&patterns)?,
             ascii_literals,
         })
+    }
+    fn from_entries(entries: Vec<RuleEntry>, field: &str) -> PyResult<Self> {
+        let (mut values, mut patterns) = (Vec::new(), Vec::new());
+        for entry in entries {
+            if entry.regex {
+                patterns.push(entry.value);
+            } else {
+                if entry.value.contains(['/', '\\']) {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "{field} must not contain a path separator"
+                    )));
+                }
+                values.push(entry.value);
+            }
+        }
+        Self::compile(values, patterns)
     }
     fn is_empty(&self) -> bool {
         self.literals.is_none() && self.patterns.is_none()
@@ -120,9 +169,8 @@ struct PathMatcher {
     names: TextMatcher,
     rooted: TextMatcher,
     patterns: TextMatcher,
-    literal_routes: Vec<String>,
-    // None means at least one regex can match below an arbitrary prefix.
-    regex_routes: Option<Vec<String>>,
+    // None means at least one pattern can match below an arbitrary prefix.
+    routes: Option<Vec<String>>,
 }
 
 #[derive(Default)]
@@ -188,6 +236,17 @@ impl PathMatcher {
                     ));
                 }
                 if value.contains('/') {
+                    if let Some(combined) = routes.as_mut() {
+                        if value.contains(['*', '?']) {
+                            if let Some(prefixes) = regex_routes(&wildcard_pattern(&value)) {
+                                combined.extend(prefixes);
+                            } else {
+                                routes = None;
+                            }
+                        } else {
+                            combined.push(value.clone());
+                        }
+                    }
                     paths.push(value);
                 } else {
                     names.push(value);
@@ -196,10 +255,9 @@ impl PathMatcher {
         }
         Ok(Self {
             names: TextMatcher::compile(names, Vec::new())?,
-            rooted: TextMatcher::compile(paths.clone(), Vec::new())?,
+            rooted: TextMatcher::compile(paths, Vec::new())?,
             patterns: TextMatcher::compile(Vec::new(), patterns)?,
-            literal_routes: paths,
-            regex_routes: routes,
+            routes,
         })
     }
     fn is_empty(&self) -> bool {
@@ -248,26 +306,34 @@ impl PathMatcher {
             };
             short.eq_ignore_ascii_case(&long[..short.len()])
         };
-        self.literal_routes.iter().any(compatible)
-            || self
-                .regex_routes
-                .as_ref()
-                .is_none_or(|routes| routes.iter().any(compatible))
+        self.routes
+            .as_ref()
+            .is_none_or(|routes| routes.iter().any(compatible))
     }
+}
+
+#[derive(Clone, Copy)]
+enum FilePart {
+    Extension,
+    Stem,
+    Full,
 }
 
 pub(super) struct PathRule {
     paths: PathMatcher,
-    files: TextMatcher,
+    files: [(FilePart, TextMatcher); 3],
 }
 #[derive(Default)]
 pub(super) struct PathRuleScratch {
     paths: PathScratch,
-    files: TextScratch,
+    files: [TextScratch; 3],
 }
 impl PathRuleScratch {
     pub(super) fn regex_memory_usage(&self) -> usize {
-        self.files.regex_memory_usage()
+        self.files
+            .iter()
+            .map(TextScratch::regex_memory_usage)
+            .sum::<usize>()
             + self.paths.names.regex_memory_usage()
             + self.paths.rooted.regex_memory_usage()
             + self.paths.patterns.regex_memory_usage()
@@ -278,6 +344,8 @@ pub(super) struct FilterPath<'a> {
     path: &'a Path,
     root: &'a Path,
     relative: OnceCell<String>,
+    name: OnceCell<Cow<'a, str>>,
+    extension_start: OnceCell<Option<usize>>,
 }
 impl<'a> FilterPath<'a> {
     pub(super) fn new(path: &'a Path, root: &'a Path) -> Self {
@@ -285,6 +353,26 @@ impl<'a> FilterPath<'a> {
             path,
             root,
             relative: OnceCell::new(),
+            name: OnceCell::new(),
+            extension_start: OnceCell::new(),
+        }
+    }
+    fn name(&self) -> &str {
+        self.name
+            .get_or_init(|| self.path.file_name().unwrap_or_default().to_string_lossy())
+    }
+    fn part(&self, part: FilePart) -> Option<&str> {
+        let name = self.name();
+        if matches!(part, FilePart::Full) {
+            return Some(name);
+        }
+        let start = *self
+            .extension_start
+            .get_or_init(|| name.rfind('.').map(|index| index + 1));
+        match part {
+            FilePart::Extension => start.map(|start| &name[start..]),
+            FilePart::Stem => Some(start.map_or(name, |start| &name[..start - 1])),
+            FilePart::Full => unreachable!(),
         }
     }
     fn relative(&self, is_dir: bool) -> &str {
@@ -302,28 +390,36 @@ impl<'a> FilterPath<'a> {
 
 impl PathRule {
     pub(super) fn regex_memory_usage(&self) -> usize {
-        self.files.regex_memory_usage()
+        self.files
+            .iter()
+            .map(|(_, matcher)| matcher.regex_memory_usage())
+            .sum::<usize>()
             + self.paths.names.regex_memory_usage()
             + self.paths.rooted.regex_memory_usage()
             + self.paths.patterns.regex_memory_usage()
     }
-    fn compile(paths: Vec<RuleEntry>, files: Vec<RuleEntry>) -> PyResult<Self> {
-        let (mut literals, mut patterns) = (Vec::new(), Vec::new());
-        for entry in files {
-            if entry.regex {
-                patterns.push(entry.value);
-            } else {
-                if entry.value.contains(['/', '\\']) {
-                    return Err(pyo3::exceptions::PyValueError::new_err(
-                        "Filename must not contain a path separator",
-                    ));
-                }
-                literals.push(entry.value);
-            }
-        }
+    fn compile(
+        paths: Vec<RuleEntry>,
+        files: Vec<RuleEntry>,
+        extensions: Vec<RuleEntry>,
+        full_names: Vec<RuleEntry>,
+    ) -> PyResult<Self> {
         Ok(Self {
             paths: PathMatcher::compile(paths)?,
-            files: TextMatcher::compile(literals, patterns)?,
+            files: [
+                (
+                    FilePart::Extension,
+                    TextMatcher::from_entries(extensions, "Extension")?,
+                ),
+                (
+                    FilePart::Stem,
+                    TextMatcher::from_entries(files, "Filename")?,
+                ),
+                (
+                    FilePart::Full,
+                    TextMatcher::from_entries(full_names, "Filename + extension")?,
+                ),
+            ],
         })
     }
     pub(super) fn rejects(
@@ -347,24 +443,22 @@ impl PathRule {
                 self.paths.matches(relative, &mut scratch.paths)
             };
         }
-        let name = candidate
-            .path
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy();
-        if whitelist {
-            (!self.files.is_empty() && !self.files.matches(&name, &mut scratch.files))
-                || (!self.paths.is_empty()
-                    && !self
-                        .paths
-                        .matches(candidate.relative(false), &mut scratch.paths))
-        } else {
-            self.files.matches(&name, &mut scratch.files)
-                || (!self.paths.is_empty()
-                    && self
-                        .paths
-                        .matches(candidate.relative(false), &mut scratch.paths))
+        for ((part, matcher), scratch) in self.files.iter().zip(&mut scratch.files) {
+            if matcher.is_empty() {
+                continue;
+            }
+            let matched = candidate
+                .part(*part)
+                .is_some_and(|value| matcher.matches(value, scratch));
+            if matched != whitelist {
+                return true;
+            }
         }
+        !self.paths.is_empty()
+            && (self
+                .paths
+                .matches(candidate.relative(false), &mut scratch.paths)
+                != whitelist)
     }
 }
 
@@ -388,11 +482,18 @@ pub(crate) struct NativePathRule {
 #[pymethods]
 impl NativePathRule {
     #[new]
-    fn new(paths: &Bound<'_, PyAny>, files: &Bound<'_, PyAny>) -> PyResult<Self> {
+    fn new(
+        paths: &Bound<'_, PyAny>,
+        files: &Bound<'_, PyAny>,
+        extensions: &Bound<'_, PyAny>,
+        full_names: &Bound<'_, PyAny>,
+    ) -> PyResult<Self> {
         Ok(Self {
             rule: Arc::new(PathRule::compile(
                 entries(paths, "paths")?,
                 entries(files, "files")?,
+                entries(extensions, "extensions")?,
+                entries(full_names, "full_names")?,
             )?),
         })
     }

@@ -66,6 +66,7 @@ try {
     $scriptsDir = Join-Path $sourceDir "scripts"
     New-Item -ItemType Directory -Path $scriptsDir | Out-Null
     Copy-Item -LiteralPath (Join-Path $repoRoot "scripts\upgrade_config.ps1") -Destination $scriptsDir
+    Copy-Item -LiteralPath (Join-Path $repoRoot "scripts\initialize_config_language.ps1") -Destination $scriptsDir
 
     foreach ($arch in @("x64", "arm64")) {
         $arguments = @(

@@ -1129,6 +1129,20 @@ void tag_config(Application& app,const fs::path& dir) {
     assert(ui_debug_type_text(app.window(),L"^updated$")==0);
     assert(ui_debug_key(app.window(),VK_RETURN)==0); finish_input(app);
     values[0]=rule("^updated$",true); assert(disk()==values);
+    // The path editor alone cannot catch a new field missing its metadata or
+    // CLI preflight route. Reuse this host to save each filename selector.
+    for(const std::string field:{"files","extensions","full_names"}) {
+        auto id="/filesystem/scan_filters/0/"+field;
+        search_setting(app,id);
+        for(auto& item:state(app.page(),"fields")) if(item["id"]==id) assert(item["editor"]=="rule_list" && item["description"]=="");
+        click(app,("tag-regex-"+id).c_str());
+        click(app,("tag-input-"+id).c_str());
+        assert(ui_debug_type_text(app.window(),L"^gui-rule$")==0);
+        assert(ui_debug_key(app.window(),VK_RETURN)==0); finish_input(app);
+        auto saved=read_json(dir/"sunpack_config.json")[Json::json_pointer(id)];
+        assert(saved.back()==rule("^gui-rule$",true));
+        assert(read_json(dir/"cli-validation-input.json")==Json({{field,saved}}));
+    }
     search_config(app,L"");
 }
 // Existing scalar delta checks cannot catch stale conditional text or virtual

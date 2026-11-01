@@ -292,7 +292,7 @@ def test_targeted_catalog_updates_preserve_original_depth_pruning_and_conflicts(
     for path in paths:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"opaque")
-    options = NativeDirectoryScanOptions([NativePathRule([{'value':'skip','regex':False}], [{'value':'same.blocked','regex':False}])], [], [], [])
+    options = NativeDirectoryScanOptions([NativePathRule([{'value':'skip','regex':False}], [], [], [{'value':'same.blocked','regex':False}])], [], [], [])
     scope = DiscoveryScope(str(root), max_depth=1)
     state = WatchStateStore(str(tmp_path / "state.snapshot"))
     catalog = NativeWatchCatalog(state._native)
@@ -335,7 +335,7 @@ def test_deep_watch_catalog_and_internal_recovery_share_effective_policy(tmp_pat
             calls.append((targets, kwargs))
     monkeypatch.setattr(module, "validate_ntfs_watch_roots", lambda roots: None)
     config = make_config({"filesystem": {"scan_filters": [
-        {'name': 'blacklist', 'enabled': True, 'files': [{'value': '\\.(?:bin)\\z', 'regex': True}]}]},
+        {'name': 'blacklist', 'enabled': True, 'extensions': [{'value': 'bin', 'regex': False}]}]},
         "watch": {"clipboard_monitor_enabled": False}})
     watcher = module.WatchScheduler(config, [str(root)], state_path=str(tmp_path / "state.snapshot"),
         root_entries=[WatchRootEntry(str(root), str(output), deep_detect=True)], pipeline_engine=Engine())

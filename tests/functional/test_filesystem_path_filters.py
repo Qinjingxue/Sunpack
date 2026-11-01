@@ -122,13 +122,13 @@ def test_path_rules_agree_across_scans_watch_and_output_inventories(tmp_path):
     cases = [
         ([{"name": "blacklist", "enabled": True,
            "paths": [regex(r"(?:\A|/)node_[^/]*(?:/|\z)"), literal(r"cache\private"), regex(r"(?:\A|/)a[^/]*b(?:/|\z)")],
-           "files": [regex(r"keep_0[0-9]\.rar\z"), literal("regex[0-9]+.zip")]}],
+           "full_names": [regex(r"keep_0[0-9]\.rar\z"), literal("regex[0-9]+.zip")]}],
          names - {"NODE_Modules/deep/keep_11.zip", "cache/private/keep_06.zip",
                   "axb/keep_09.zip", "archives/sub/deeper/keep_02.rar",
                   "archives/sub/deeper/regex[0-9]+.zip"}),
         ([{"name": "whitelist", "enabled": True,
            "paths": [regex(r"\A(?:archives|downloads)(?:/|\z)")],
-           "files": [regex(r"(?:keep_[0-9]{2}|root)\.zip\z")]},
+           "full_names": [regex(r"(?:keep_[0-9]{2}|root)\.zip\z")]},
           {"name": "blacklist", "enabled": True, "paths": [regex(r"\Aarchives/skip_")]}],
          {"archives/root.zip", "archives/sub/deeper/Keep_01.ZIP",
           "archives/sub/deeper/keep_03.zip", "downloads/sub/keep_10.zip"}),
@@ -143,10 +143,27 @@ def test_path_rules_agree_across_scans_watch_and_output_inventories(tmp_path):
          {"downloads/sub/keep_10.zip"}),
         ([{"name": "whitelist", "enabled": True, "paths": [regex(r"\A中文/\p{L}+\[1\]\+\.zip\z")]}],
          {"中文/报告[1]+.zip"}),
-        ([{"name": "whitelist", "enabled": True, "files": [literal("Keep.txt"), literal("sample.zip")]}],
+        ([{"name": "whitelist", "enabled": True, "full_names": [literal("Keep.txt"), literal("sample.zip")]}],
          {"unicode/Keep.txt", "unicode/ſample.zip"}),
         ([{"name": "whitelist", "enabled": True, "paths": [regex(r"(?-i)\Aarchives/.*Keep_[0-9]+\.ZIP\z")]}],
          {"archives/sub/deeper/Keep_01.ZIP"}),
+        ([{"name": "whitelist", "enabled": True, "paths": [literal("a/*/b")]}],
+         {"a/x/b/keep_08.zip"}),
+        ([{"name": "whitelist", "enabled": True, "paths": [literal("archives/s?b")]}],
+         {"archives/sub/deeper/Keep_01.ZIP", "archives/sub/deeper/keep_02.rar",
+          "archives/sub/deeper/keep_03.zip", "archives/sub/deeper/regex[0-9]+.zip"}),
+        ([{"name": "whitelist", "enabled": True,
+           "files": [literal("keep_??")], "extensions": [literal("z?p")],
+           "full_names": [literal("*_03.*"), regex(r"(?-i)\AKeep_01\.ZIP\z")]}],
+         {"archives/sub/deeper/Keep_01.ZIP", "archives/sub/deeper/keep_03.zip"}),
+        ([{"name": "blacklist", "enabled": True, "paths": [literal("node_*")],
+           "files": [literal("regex[0-9]+")], "extensions": [literal("r?r")],
+           "full_names": [literal("keep_03.???")]}],
+         names - {"NODE_Modules/deep/keep_11.zip", "archives/sub/deeper/regex[0-9]+.zip",
+                  "archives/sub/deeper/keep_02.rar", "archives/sub/deeper/keep_03.zip"}),
+        ([{"name": "whitelist", "enabled": True,
+           "files": [literal("报告[?]+")], "extensions": [regex(r"\Az(?:ip|ipx)\z")]}],
+         {"中文/报告[1]+.zip"}),
     ]
 
     def relative_files(snapshot):
@@ -197,10 +214,38 @@ def test_regex_cache_pressure_keeps_concurrent_batch_results():
     names = ["".join(rng.choice("01") for _ in range(64)) for _ in range(1024)]
     paths = [f"C:/input/{name}" for name in names]
     expected = [index for index, name in enumerate(names) if name[-19] == "1"]
-    rule = NativePathRule([], [{"value": r"\A[01]*1[01]{18}\z", "regex": True}])
+    rule = NativePathRule([], [], [], [{"value": r"\A[01]*1[01]{18}\z", "regex": True}])
 
     def run(_):
         assert rule.accepted_indices("C:/input", paths, [False] * len(paths), True) == expected
 
     with ThreadPoolExecutor(max_workers=4) as pool:
         list(pool.map(run, range(8)))
+
+
+def test_filename_parts_use_the_last_dot_and_handle_absent_or_empty_extensions():
+    """The real tree cannot represent trailing dots on Windows. This native
+    batch adds those boundaries and checks all three selectors without IO.
+    """
+    from sunpack_native import NativePathRule
+
+    names = ["bundle.part01.rar.jpg", "archive.tar.gz", "README", "a.", ".zip",
+             "报告[终]+.ZIP", "KEEP.ſAFETENSORS"]
+    paths = [f"C:/input/{name}" for name in names]
+    cases = [
+        ({"files": [{"value": "bundle.part??.rar", "regex": False}]}, {names[0]}),
+        ({"files": [{"value": "archive.tar", "regex": False}]}, {names[1]}),
+        ({"files": [{"value": "README", "regex": False}]}, {names[2]}),
+        ({"extensions": [{"value": r"\A\z", "regex": True}]}, {names[3]}),
+        ({"extensions": [{"value": "zip", "regex": False}]}, {names[4], names[5]}),
+        ({"files": [{"value": r"\A\z", "regex": True}]}, {names[4]}),
+        ({"files": [{"value": "报告[?]+", "regex": False}]}, {names[5]}),
+        ({"files": [{"value": "keep", "regex": False}],
+          "extensions": [{"value": "safetensors", "regex": False}]}, {names[6]}),
+        ({"full_names": [{"value": "*.rar.jpg", "regex": False}]}, {names[0]}),
+        ({"extensions": [{"value": "*", "regex": False}]}, set(names) - {names[2]}),
+    ]
+    for fields, expected in cases:
+        rule = NativePathRule(*(fields.get(field, []) for field in ("paths", "files", "extensions", "full_names")))
+        indices = rule.accepted_indices("C:/input", paths, [False] * len(paths), True)
+        assert {names[index] for index in indices} == expected

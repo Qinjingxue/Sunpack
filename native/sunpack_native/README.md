@@ -41,12 +41,20 @@ scan path does not create per-entry Python dictionaries, `Path` objects, or
 `FileEntry` objects. Custom filters must be expressible through native scan
 parameters or the caller fails explicitly.
 
-`NativePathRule(paths, files)` compiles one immutable rule shared by directory
-scans, watch catalogs, output inventories and Python entry filters. Both fields
-contain `{ "value": "...", "regex": false }` records. Literal names use an ASCII
+`NativePathRule(paths, files, extensions, full_names)` compiles one immutable rule
+shared by directory scans, watch catalogs, output inventories and Python entry
+filters. All fields contain `{ "value": "...", "regex": false }` records. Ordinary
+rules support only `*` and `?`, anchored to the whole selected string and never
+crossing `/`; remaining characters are literal. Names without wildcards use an ASCII
 exact-set fast path with Unicode regex folding for non-ASCII names. Regex records
 use the existing regex-automata engine, with one combined matcher per group.
-No Glob or separate extension matcher remains. Filename rules only match files;
+No separate Glob or extension engine is used. The three file selectors use the
+same fixed array of text matchers and one evaluation loop. `files` selects the
+stem before the last dot, `extensions` selects the suffix without its dot, and
+`full_names` selects the entire basename. The candidate caches its UTF-8 filename
+and last-dot offset lazily; all rules borrow slices without allocating names or
+extension strings. No dot means no extension; a final dot means an empty extension.
+Filename rules only match files;
 path rules match normalized root-relative paths and inherit directory matches.
 Bare literal names match any component; literals containing `/` are root-relative.
 Blacklist fields use OR; whitelist nonempty fields use AND, with OR within each

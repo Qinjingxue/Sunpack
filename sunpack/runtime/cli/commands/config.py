@@ -44,7 +44,7 @@ async def handle(args, ctx):
             from sunpack_native import NativePathRule
             rule = json.loads(await ctx.readline()) if ctx.input_reader is not None else json.load(ctx.stdin)
             validate_path_rule_config({**rule, "name": "blacklist"})
-            NativePathRule(rule.get("paths", []), rule.get("files", []))
+            NativePathRule(*(rule.get(field, []) for field in ("paths", "files", "extensions", "full_names")))
             return 0, CliCommandResult(command=COMMAND, inputs={"action": "validate"}, summary={"valid": True})
         config_path, payload = load_request_config_payload(ctx.cwd)
         item = payload

@@ -1666,6 +1666,34 @@
       },
       "editor": "rule_list"
     },
+    "/filesystem/scan_filters/@blacklist/extensions": {
+      "label": {
+        "zh": "扩展名",
+        "en": "Extensions"
+      },
+      "editor": "rule_list"
+    },
+    "/filesystem/scan_filters/@whitelist/extensions": {
+      "label": {
+        "zh": "扩展名",
+        "en": "Extensions"
+      },
+      "editor": "rule_list"
+    },
+    "/filesystem/scan_filters/@blacklist/full_names": {
+      "label": {
+        "zh": "文件名+扩展名",
+        "en": "File name + extension"
+      },
+      "editor": "rule_list"
+    },
+    "/filesystem/scan_filters/@whitelist/full_names": {
+      "label": {
+        "zh": "文件名+扩展名",
+        "en": "File name + extension"
+      },
+      "editor": "rule_list"
+    },
     "/filesystem/scan_filters/@whitelist/files": {
       "label": {
         "zh": "文件名",

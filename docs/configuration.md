@@ -52,27 +52,39 @@ Set `filesystem.scan_filters_enabled` to `false` to turn off all scan filters. T
 
 Available filters are `blacklist`, `whitelist`, `size_range`, and `mtime_range`. Edit their fields in `sunpack_config.json`; the shipped `sunpack_advanced_config.json` shows the expected shapes. Extension filters can hide archives with disguised names.
 
-Blacklists and whitelists contain only `paths` and `files`, both arrays of records:
+Blacklists and whitelists use four lists of records:
 
 ```json
 {
   "name": "blacklist",
   "enabled": true,
   "paths": [{"value": ".git", "regex": false}],
-  "files": [
+  "files": [{"value": "report*", "regex": false}],
+  "extensions": [{"value": "zip", "regex": false}],
+  "full_names": [
     {"value": "report[final]+.zip", "regex": false},
     {"value": "\\.(?:tmp|log|bak)\\z", "regex": true}
   ]
 }
 ```
 
-Each record has an independent `regex` boolean. Disabled means literal matching;
-enabled uses Rust regex syntax, which excludes look-around and backreferences.
-Literal filenames match the entire basename; regex records search the basename.
-Extensions are filename regexes too. Matching defaults to Unicode-aware case
-insensitivity; regex inline flags may override this.
+Each record has an independent `regex` boolean. When disabled, `*` matches zero
+or more characters and `?` matches one Unicode character; other symbols are
+literal. These rules match the whole selected value. Neither wildcard crosses
+`/`, and repeated stars have no recursive meaning. Enabled uses Rust regex
+syntax, which excludes look-around and backreferences, and searches the selected
+value. Matching defaults to Unicode-aware case insensitivity; regex inline flags
+may override this.
 
-A bare literal path matches a component at any depth. Literals containing `/` or
+`files` selects the filename before its last dot, `extensions` selects the part
+after that dot (without a leading dot), and `full_names` selects the full basename.
+For `bundle.part01.rar.jpg` these values are `bundle.part01.rar`, `jpg`, and
+`bundle.part01.rar.jpg`. Without a dot, the filename is unchanged and there is no
+extension to match. A final dot gives an empty extension; `.zip` has an empty
+filename and extension `zip`. These selectors apply only to files. Archive
+detection still uses content, including for disguised names and split volumes.
+
+A bare ordinary path matches a component at any depth. Ordinary rules containing `/` or
 `\` are relative to the scan root. Path regexes search root-relative paths with
 `/` separators; the expression itself is preserved. A matched directory includes
 its subtree, including matches ending in `\z`: `\Adownloads\z` selects the root's
@@ -82,14 +94,18 @@ may match at any depth. A field uses OR; blacklists reject any matching field,
 while whitelists require every nonempty field. Empty arrays impose no restriction.
 
 The GUI checkbox controls the current record and defaults off. Click a tag to
-edit it; blue tags with `.*` denote regex records. Enter submits the change.
+edit it; blue tags denote regex records. Enter submits the change.
 Validation failures retain the draft and leave the saved configuration intact.
 Enter regex backslashes normally in the GUI; saving handles JSON escaping.
 
-The installer converts old Glob, directory-prune and extension fields into the
-new records, preserving switches and root anchoring. An old whitelist filename /
-extension intersection may become two ordinary whitelist modules to preserve
-its meaning. Migration is idempotent; the runtime accepts only the new fields.
+The installer migrates the released v1.3.4 schema directly into these records;
+untagged development schemas have no migration path. Old complete filenames move
+to `full_names`, and old extension entries move to `extensions`. Their whitelist
+AND relationship remains in one module. Directory-prune rules merge into a
+blacklist with the same enabled state. Old path Globs retain component-boundary
+matching, using regex records when necessary; independent whitelist path groups
+remain separate AND conditions. Migration is idempotent; runtime uses only the
+current schema.
 
 Size bounds are inclusive integer bytes from 0 to 18446744073709551615. Equal bounds select one exact size. Time bounds use UTC minute strings in `YYYY-MM-DDTHH:mmZ` format, including the start and excluding the end. `null` leaves that side unbounded; specify both bounds explicitly to override defaults. For example:
 

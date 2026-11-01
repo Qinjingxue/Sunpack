@@ -1041,7 +1041,7 @@ void Application::work() {
                             auto pointer=edit.at("pointer").get<std::string>();
                             auto slash=pointer.find_last_of('/');
                             auto field=pointer.substr(slash+1);
-                            if(pointer.rfind("/filesystem/scan_filters/",0)!=0 || (field!="paths" && field!="files")) continue;
+                            if(pointer.rfind("/filesystem/scan_filters/",0)!=0 || (field!="paths" && field!="files" && field!="extensions" && field!="full_names")) continue;
                             if(!options_.allow_cli) throw std::runtime_error("cliUnbound");
                             auto input=Json{{field,parse_json(edit.at("text").get<std::string>())}}.dump(-1,' ',true)+"\n";
                             auto check=run_cli(options_.cli,{L"config",L"validate",L"--scan-rule-stdin",L"--json"},stop_,&input);

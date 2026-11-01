@@ -825,16 +825,14 @@ end;
 
 procedure CaptureConfigurationForUpgrade;
 var
-  OldAdvanced, UserConfig: string;
+  UserConfig: string;
 begin
   if ConfigBackupCaptured then Exit;
   if InstalledDataRequiresReset then begin ConfigBackupCaptured := True; Exit; end;
-  OldAdvanced := AddBackslash(ExistingApplicationDirectory) + 'sunpack_advanced_config.json';
   UserConfig := ExpandConstant('{commonappdata}\SunPack\sunpack_config.json');
-  if FileExists(OldAdvanced) and FileExists(UserConfig) then
+  if FileExists(UserConfig) then
   begin
-    if not FileCopy(OldAdvanced, ExpandConstant('{tmp}\sunpack-old-advanced.json'), False) or
-       not FileCopy(UserConfig, ExpandConstant('{tmp}\sunpack-user-backup.json'), False) then
+    if not FileCopy(UserConfig, ExpandConstant('{tmp}\sunpack-user-backup.json'), False) then
       RaiseException('Unable to capture SunPack configuration before upgrade.');
   end;
   ConfigBackupCaptured := True;
@@ -845,12 +843,9 @@ var
   Parameters: string;
   ResultCode: Integer;
 begin
-  if not FileExists(ExpandConstant('{tmp}\sunpack-old-advanced.json')) then Exit;
+  if not FileExists(ExpandConstant('{tmp}\sunpack-user-backup.json')) then Exit;
   Parameters := '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ' +
     AddQuotes(ExpandConstant('{tmp}\SunPackInstallScripts\upgrade_config.ps1')) +
-    ' -OldAdvanced ' + AddQuotes(ExpandConstant('{tmp}\sunpack-old-advanced.json')) +
-    ' -NewAdvanced ' + AddQuotes(ExpandConstant('{app}\sunpack_advanced_config.json')) +
-    ' -Template ' + AddQuotes(ExpandConstant('{tmp}\sunpack-config-template.json')) +
     ' -UserConfig ' + AddQuotes(ExpandConstant('{commonappdata}\SunPack\sunpack_config.json'));
   if not Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
               Parameters, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then

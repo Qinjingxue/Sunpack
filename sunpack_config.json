@@ -71,7 +71,7 @@
             "regex": false
           }
         ],
-        "files": [
+        "full_names": [
           {
             "value": "Thumbs.db",
             "regex": false
@@ -79,10 +79,213 @@
           {
             "value": "desktop.ini",
             "regex": false
+          }
+        ],
+        "files": [],
+        "extensions": [
+          {
+            "value": "dll",
+            "regex": false
           },
           {
-            "value": "\\.(?:dll|save|py|pyc|json|xml|cfg|ini|sys|db|msi|cur|ani|ttf|woff|ico|pak|obb|unitypackage|jar|apk|ipa|epub|odt|ods|odp|docx|xlsx|pptx|whl|xpi|war|ear|aab|ckpt|pt|pth|safetensors|bin|dat|docm|xlsm|pptm|msix|msixbundle|crdownload|downloading|part|win|iso|tmp)\\z",
-            "regex": true
+            "value": "save",
+            "regex": false
+          },
+          {
+            "value": "py",
+            "regex": false
+          },
+          {
+            "value": "pyc",
+            "regex": false
+          },
+          {
+            "value": "json",
+            "regex": false
+          },
+          {
+            "value": "xml",
+            "regex": false
+          },
+          {
+            "value": "cfg",
+            "regex": false
+          },
+          {
+            "value": "ini",
+            "regex": false
+          },
+          {
+            "value": "sys",
+            "regex": false
+          },
+          {
+            "value": "db",
+            "regex": false
+          },
+          {
+            "value": "msi",
+            "regex": false
+          },
+          {
+            "value": "cur",
+            "regex": false
+          },
+          {
+            "value": "ani",
+            "regex": false
+          },
+          {
+            "value": "ttf",
+            "regex": false
+          },
+          {
+            "value": "woff",
+            "regex": false
+          },
+          {
+            "value": "ico",
+            "regex": false
+          },
+          {
+            "value": "pak",
+            "regex": false
+          },
+          {
+            "value": "obb",
+            "regex": false
+          },
+          {
+            "value": "unitypackage",
+            "regex": false
+          },
+          {
+            "value": "jar",
+            "regex": false
+          },
+          {
+            "value": "apk",
+            "regex": false
+          },
+          {
+            "value": "ipa",
+            "regex": false
+          },
+          {
+            "value": "epub",
+            "regex": false
+          },
+          {
+            "value": "odt",
+            "regex": false
+          },
+          {
+            "value": "ods",
+            "regex": false
+          },
+          {
+            "value": "odp",
+            "regex": false
+          },
+          {
+            "value": "docx",
+            "regex": false
+          },
+          {
+            "value": "xlsx",
+            "regex": false
+          },
+          {
+            "value": "pptx",
+            "regex": false
+          },
+          {
+            "value": "whl",
+            "regex": false
+          },
+          {
+            "value": "xpi",
+            "regex": false
+          },
+          {
+            "value": "war",
+            "regex": false
+          },
+          {
+            "value": "ear",
+            "regex": false
+          },
+          {
+            "value": "aab",
+            "regex": false
+          },
+          {
+            "value": "ckpt",
+            "regex": false
+          },
+          {
+            "value": "pt",
+            "regex": false
+          },
+          {
+            "value": "pth",
+            "regex": false
+          },
+          {
+            "value": "safetensors",
+            "regex": false
+          },
+          {
+            "value": "bin",
+            "regex": false
+          },
+          {
+            "value": "dat",
+            "regex": false
+          },
+          {
+            "value": "docm",
+            "regex": false
+          },
+          {
+            "value": "xlsm",
+            "regex": false
+          },
+          {
+            "value": "pptm",
+            "regex": false
+          },
+          {
+            "value": "msix",
+            "regex": false
+          },
+          {
+            "value": "msixbundle",
+            "regex": false
+          },
+          {
+            "value": "crdownload",
+            "regex": false
+          },
+          {
+            "value": "downloading",
+            "regex": false
+          },
+          {
+            "value": "part",
+            "regex": false
+          },
+          {
+            "value": "win",
+            "regex": false
+          },
+          {
+            "value": "iso",
+            "regex": false
+          },
+          {
+            "value": "tmp",
+            "regex": false
           }
         ]
       },
@@ -99,10 +302,24 @@
             "regex": false
           }
         ],
-        "files": [
+        "full_names": [],
+        "files": [],
+        "extensions": [
           {
-            "value": "\\.(?:zip|zipx|7z|rar)\\z",
-            "regex": true
+            "value": "zip",
+            "regex": false
+          },
+          {
+            "value": "zipx",
+            "regex": false
+          },
+          {
+            "value": "7z",
+            "regex": false
+          },
+          {
+            "value": "rar",
+            "regex": false
           }
         ]
       },

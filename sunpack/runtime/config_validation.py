@@ -11,7 +11,7 @@ def validate_config_payload(config: dict) -> dict[str, Any]:
     for index, rule in enumerate(config["filesystem"]["scan_filters"]):
         if rule["name"] in {"blacklist", "whitelist"}:
             try:
-                NativePathRule(rule.get("paths", []), rule.get("files", []))
+                NativePathRule(*(rule.get(field, []) for field in ("paths", "files", "extensions", "full_names")))
             except (TypeError, ValueError) as error:
                 errors.append(f"filesystem.scan_filters[{index}]: {error}")
     for index, method in enumerate(config["verification"]["methods"]):

@@ -59,18 +59,19 @@ def test_rule_preflight_uses_native_syntax_for_direct_and_persistent_input():
 
     args = SimpleNamespace(config_action="validate", scan_rule_stdin=True)
     for streamed in (False, True):
-        for value, regex, valid in (("报告[最终版]+.zip", False, True),
-                                    (r"\.(?:zip|7z|rar)\z", True, True),
-                                    ("(", False, True), ("(", True, False),
-                                    (r"(?<=a)b", True, False)):
-            payload = json.dumps({"files": [{"value": value, "regex": regex}]})
-            ctx = CliContext(stdin=io.StringIO(payload), reporter=CliReporter(stdout=io.StringIO(), stderr=io.StringIO()))
-            if streamed:
-                ctx.input_reader = lambda _prompt: payload
-            code, result = asyncio.run(config.handle(args, ctx))
-            assert (code == 0) is valid
-            if not valid:
-                assert result.errors
+        for field in ("files", "extensions", "full_names"):
+            for value, regex, valid in (("报告[最终版]+.zip", False, True),
+                                        (r"\.(?:zip|7z|rar)\z", True, True),
+                                        ("(", False, True), ("(", True, False),
+                                        (r"(?<=a)b", True, False)):
+                payload = json.dumps({field: [{"value": value, "regex": regex}]})
+                ctx = CliContext(stdin=io.StringIO(payload), reporter=CliReporter(stdout=io.StringIO(), stderr=io.StringIO()))
+                if streamed:
+                    ctx.input_reader = lambda _prompt: payload
+                code, result = asyncio.run(config.handle(args, ctx))
+                assert (code == 0) is valid
+                if not valid:
+                    assert result.errors
 
 
 def test_output_dir_override_is_relative_to_the_request_cwd(tmp_path):
