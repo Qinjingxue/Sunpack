@@ -182,7 +182,7 @@ private:
     void UpdateDwmFrameMargins();
     void NotifyResizeCallback(UINT width, UINT height);
     bool HasFocusedTextInput() const;
-    void UpdateCaretBlinkTimer();
+    void UpdateCaretBlinkTimer(bool restartPhase = false);
     void StartWindowOpenAnimation();
     void StartWindowCloseAnimation();
     void UnregisterRenderWindow();

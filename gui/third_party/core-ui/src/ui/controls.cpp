@@ -903,9 +903,8 @@ void ImageWidget::OnDraw(Renderer& r) {
 
 UINT TextInputWidget::EffectiveCaretBlinkMs() {
     UINT blinkMs = GetCaretBlinkTime();
-    if (blinkMs == 0 || blinkMs == INFINITE) blinkMs = 530;
-    constexpr double kBlinkSlowdown = 1.7;
-    return static_cast<UINT>(blinkMs * kBlinkSlowdown);
+    // INFINITE is the user's "do not blink" setting; only zero is an error.
+    return blinkMs == 0 ? 530 : blinkMs;
 }
 
 void TextInputWidget::ResetCaretBlink() {
@@ -914,7 +913,7 @@ void TextInputWidget::ResetCaretBlink() {
 
 bool TextInputWidget::ShouldShowCaret() const {
     UINT blinkMs = EffectiveCaretBlinkMs();
-    if (caretBlinkStartTick_ == 0) return true;
+    if (blinkMs == INFINITE || caretBlinkStartTick_ == 0) return true;
     uint64_t now = static_cast<uint64_t>(GetTickCount64());
     uint64_t elapsed = now - caretBlinkStartTick_;
     return ((elapsed / blinkMs) % 2ULL) == 0ULL;
@@ -1351,7 +1350,7 @@ void TextAreaWidget::ResetCaretBlink() {
 
 bool TextAreaWidget::ShouldShowCaret() const {
     UINT blinkMs = EffectiveCaretBlinkMs();
-    if (caretBlinkStartTick_ == 0) return true;
+    if (blinkMs == INFINITE || caretBlinkStartTick_ == 0) return true;
     uint64_t now = static_cast<uint64_t>(GetTickCount64());
     uint64_t elapsed = now - caretBlinkStartTick_;
     return ((elapsed / blinkMs) % 2ULL) == 0ULL;
@@ -5915,7 +5914,7 @@ void ChipsInputWidget::ResetCaretBlink() {
 
 bool ChipsInputWidget::ShouldShowCaret() const {
     UINT blinkMs = TextInputWidget::EffectiveCaretBlinkMs();
-    if (caretBlinkStartTick_ == 0) return true;
+    if (blinkMs == INFINITE || caretBlinkStartTick_ == 0) return true;
     uint64_t elapsed = static_cast<uint64_t>(GetTickCount64()) - caretBlinkStartTick_;
     return ((elapsed / blinkMs) % 2ULL) == 0ULL;
 }

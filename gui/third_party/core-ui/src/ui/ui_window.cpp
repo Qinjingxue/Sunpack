@@ -1775,6 +1775,7 @@ LRESULT UiWindowImpl::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         if (focusedWidget_) {
             ActiveMeasureContextScope measureScope(measureContext_, renderer_);
             if (focusedWidget_->OnKeyChar((wchar_t)wParam)) {
+                UpdateCaretBlinkTimer(true);
                 InvalidateNow();
                 return 0;
             }
@@ -3013,7 +3014,8 @@ void UiWindowImpl::OnMouseDown(float x, float y) {
         if (pointerTarget) pointerTarget->onMouseDownHook(e);
         hit->OnMouseDown(e);
     }
-    UpdateCaretBlinkTimer();
+    // Mouse placement also resets the input's blink phase.
+    UpdateCaretBlinkTimer(true);
     InvalidateNow();
 }
 
@@ -3486,6 +3488,7 @@ bool UiWindowImpl::DispatchKeyDown(int vk) {
 
     // 7. Forward to focused widget's generic OnKeyDown
     if (focusedWidget_ && focusedWidget_->OnKeyDown(vk)) {
+        UpdateCaretBlinkTimer(true);
         InvalidateNow();
         return true;
     }
@@ -3510,6 +3513,7 @@ void UiWindowImpl::SimKeyChar(wchar_t ch) {
     if (focusedWidget_) {
         ActiveMeasureContextScope measureScope(measureContext_, renderer_);
         if (focusedWidget_->OnKeyChar(ch)) {
+            UpdateCaretBlinkTimer(true);
             InvalidateNow();
         }
     }
@@ -3691,12 +3695,14 @@ bool UiWindowImpl::HasFocusedTextInput() const {
     return focused;
 }
 
-void UiWindowImpl::UpdateCaretBlinkTimer() {
+void UiWindowImpl::UpdateCaretBlinkTimer(bool restartPhase) {
     if (!hwnd_) return;
 
-    bool needTimer = HasFocusedTextInput();
-    if (needTimer && !caretBlinkTimerRunning_) {
-        UINT blinkMs = TextInputWidget::EffectiveCaretBlinkMs();
+    UINT blinkMs = TextInputWidget::EffectiveCaretBlinkMs();
+    bool needTimer = blinkMs != INFINITE && HasFocusedTextInput();
+    if (needTimer && (!caretBlinkTimerRunning_ || restartPhase)) {
+        // SetTimer replaces an existing timer and restarts its interval.
+        // Match the clock reset by the focused editor on focus/typing/click.
         if (SetTimer(hwnd_, kCaretBlinkTimerId, blinkMs, nullptr) != 0) {
             caretBlinkTimerRunning_ = true;
         }
@@ -3727,7 +3733,7 @@ void UiWindowImpl::SetFocus(Widget* w) {
         if (auto* ta = dynamic_cast<TextAreaWidget*>(w)) { ta->focused = true; ta->ResetCaretBlink(); }
         if (auto* ci = dynamic_cast<ChipsInputWidget*>(w)) ci->ResetCaretBlink();
     }
-    UpdateCaretBlinkTimer();
+    UpdateCaretBlinkTimer(true);
 }
 
 void UiWindowImpl::ClearFocus() {
