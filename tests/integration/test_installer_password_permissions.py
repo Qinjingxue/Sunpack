@@ -67,6 +67,7 @@ var
   StopStage: Integer;
   ExistingWatchStateCaptured, RestartWatchAfterUpgrade: Boolean;
   ConfigBackupCaptured: Boolean;
+  InitializeLanguageOnInstall: Boolean;
 procedure ApplyStartupTaskDefault;
 begin
 end;
