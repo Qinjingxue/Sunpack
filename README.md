@@ -25,6 +25,7 @@
   - [命令速览](#命令速览)
   - [密码管理](#密码管理)
   - [GUI管理面板](#gui管理面板)
+  - [使用注意](#使用注意)
 - [核心能力](#核心能力)
   - [递归处理](#递归处理)
   - [后处理](#后处理)
@@ -105,6 +106,10 @@ Sunpack为达到最大方便性，在使用时会尝试从各处获取密码，�
 - **用完即退出**：关闭窗口后 GUI 完全退出，不在后台常驻。
 
 ![SunPack 配置](docs/images/gui.zh-CN.png)
+
+### 使用注意
+
+- 深度检测参数：程序在正常模式已经能够检测几乎所有伪装文件，深度检测参数请仅在程序遇到某些强伪装的文件，正常无法识别时开启，日常开启会导致误解压大量正常文件。
 
 ---
 
@@ -257,6 +262,7 @@ uv run --locked pytest
 欢迎通过 [GitHub Issues](https://github.com/Qinjingxue/Sunpack/issues) 报告问题、提出建议，也欢迎提交 [Pull Request](https://github.com/Qinjingxue/Sunpack/pulls) 改进项目。
 
 报告问题时可附上相关日志。安装版默认位置：
+
 - Watch 事件：`%ProgramData%\SunPack\.sunpack_watch\events.json` 和 `events.json.store`
 - 解压失败报告：`%ProgramData%\SunPack\.sunpack_watch\failures\failed-*.txt`
 - Windows 通知：`%ProgramData%\SunPack\.sunpack_watch\toast_host_events.jsonl`

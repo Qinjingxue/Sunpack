@@ -25,6 +25,7 @@
   - [Command overview](#command-overview)
   - [Password management](#password-management)
   - [GUI manager](#gui-manager)
+  - [Usage note](#usage-note)
 - [Core capabilities](#core-capabilities)
   - [Recursive processing](#recursive-processing)
   - [Post-processing](#post-processing)
@@ -105,6 +106,10 @@ Open the manager from the Watch tray or by searching for Sunpackgui in the Start
 - **Exits when closed**: the GUI does not stay resident in the background.
 
 ![SunPack settings](docs/images/gui.en.png)
+
+### Usage note
+
+- Deep detection: SunPack's normal mode can already detect almost all disguised files. Enable deep detection only when the program cannot recognize a particularly well-disguised file in normal mode. Leaving it enabled during everyday use may cause many regular files to be mistakenly extracted.
 
 ---
 
