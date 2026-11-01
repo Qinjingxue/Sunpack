@@ -574,6 +574,16 @@ namespace sunpack::sevenzip
             }
 
             result.archive_type = canonical_archive_type_for_guid(format);
+            if (rar4_rejected_empty_encrypted_headers(
+                    archive.Interface(), format, num_items, raw_open_callback->password_requested()))
+            {
+                result.status = PasswordTestStatus::WrongPassword;
+                result.encrypted = result.wrong_password = result.password_rejected = true;
+                result.operation_result = kOpWrongPassword;
+                set_failure(result, "archive_open", "encrypted_or_wrong_password");
+                result.message = "RAR4 encrypted headers could not be decoded";
+                return result;
+            }
             auto *job_replay = current_extraction_replay;
             std::array<std::uint8_t, 16> handler{};
             static_assert(sizeof(format) == handler.size());
