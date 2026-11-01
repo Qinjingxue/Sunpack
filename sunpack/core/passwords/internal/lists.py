@@ -1,6 +1,6 @@
 from typing import List
 
-from sunpack.core.support.resource_lifecycle import open_task_file
+from sunpack_native import read_password_file
 
 
 def parse_password_lines(text: str) -> List[str]:
@@ -11,11 +11,6 @@ def parse_password_lines(text: str) -> List[str]:
     password and must not be discarded.
     """
     return [line for line in (text or "").splitlines() if line != ""]
-
-
-def read_password_file(password_file: str) -> List[str]:
-    with open_task_file(password_file, "r", encoding="utf-8") as handle:
-        return parse_password_lines(handle.read())
 
 
 def dedupe_passwords(passwords: List[str]) -> List[str]:

@@ -1574,7 +1574,8 @@ def test_worker_manifest_protocol(subtests):
             assert row["status"] == "complete" and "output_path" not in row
 
 
-def test_worker_password_candidates(tmp_path, subtests):
+@pytest.mark.parametrize("layout", ["file", "carrier", "concat_ranges"])
+def test_worker_password_candidates(tmp_path, subtests, layout):
     from sunpack.core.passwords.verifier.zip_fast import ZipFastVerifier
     worker = _require_worker_or_skip()
     filename = "encrypted-source.txt"
@@ -1590,31 +1591,97 @@ def test_worker_password_candidates(tmp_path, subtests):
         "00000000010018003ea1e33e3457dd0100000000000000000000000000000000"
         "504b0506000000000100010066000000560000000000"
     ))
+    # An encrypted stored empty item shares the fixture's weak check-byte
+    # collisions. Other candidate tests have no such item, so they cannot catch
+    # selecting it as proof, or accepting its CRC before a later password error.
+    # Reuse this small lifecycle on physical, carved and cross-part inputs.
+    data = archive.read_bytes()
+    central_offset = struct.unpack_from("<I", data, len(data) - 6)[0]
+    name_len = struct.unpack_from("<H", data, 26)[0]
+    header = bytearray(data[30 + name_len:42 + name_len])
+    header[-1] ^= data[17]  # CRC high byte -> empty item's zero CRC high byte.
+    name = b"00-empty.txt"
+    local = struct.pack("<IHHHHHIIIHH", 0x04034B50, 20, 1, 0, 0, 0, 0, 12, 0, len(name), 0) + name + header
+    central = struct.pack("<IHHHHHHIIIHHHHHII", 0x02014B50, 20, 20, 1, 0, 0, 0, 0, 12, 0,
+                          len(name), 0, 0, 0, 0, 0, 0) + name
+    original_central = bytearray(data[central_offset:-22])
+    struct.pack_into("<I", original_central, 42, len(local))
+    data = (local + data[:central_offset] + central + original_central
+            + struct.pack("<IHHHHIIH", 0x06054B50, 0, 0, 2, 2,
+                          len(central) + len(original_central), len(local) + central_offset, 0))
+    archive.write_bytes(data)
     collision = "weak-collision-106"
     proof = ZipFastVerifier().verify_batch(str(archive), [collision, "secret"])
     assert proof.matched_indices == (0, 1)
     assert proof.match_evidence == "zipcrypto_header_byte"
     assert proof.final_confirmation_required
+    source = None
+    if layout == "carrier":
+        prefix = b"arbitrary prefix"
+        archive.write_bytes(prefix + data + b"arbitrary suffix")
+        source = {"entry_path": str(archive), "format_hint": "zip", "open_mode": "file_range",
+                  "parts": [{"path": str(archive), "start": len(prefix), "end": len(prefix) + len(data)}]}
+    elif layout == "concat_ranges":
+        second = tmp_path / "second.blob"
+        archive.write_bytes(data[:55])
+        second.write_bytes(data[55:])
+        source = {"entry_path": str(archive), "format_hint": "zip", "open_mode": "concat_ranges",
+                  "ranges": [{"path": str(archive), "start": 0}, {"path": str(second), "start": 0}]}
     cases = [(["secret"], True), (["wrong-password-1", "wrong-password-2"], False),
              ([collision], False), ([collision, "secret"], True)]
     for index, (candidates, accepted) in enumerate(cases):
         with subtests.test(candidates=candidates):
             out = tmp_path / f"out-{index}"
-            result = _invoke_worker(worker, {
+            request = {
                 "job_id": str(index), "archive_path": str(archive), "output_dir": str(out),
                 "format_hint": "zip", "password": "placeholder", "password_candidates": candidates,
-            })
+            }
+            if source is not None:
+                request["archive_input"] = source
+            result = _invoke_worker(worker, request)
             final = _worker_result(result.stdout)
             assert (result.returncode == 0) is accepted, result.stdout + result.stderr
             assert (final["status"] == "ok") is accepted
             if accepted:
                 assert final["matched_index"] == candidates.index("secret")
                 assert (out / filename).read_text(encoding="utf-8") == "encrypted worker payload"
+                assert (out / "00-empty.txt").stat().st_size == 0
             else:
                 assert final["native_status"] == "wrong_password"
                 assert final["password_candidates_all_rejected"] and final["matched_index"] == -1
                 if len(candidates) > 1:
                     assert not (out / filename).exists()
+
+
+def test_worker_password_batches_preserve_header_and_volume_modes(tmp_path, subtests):
+    # ZIP collisions cannot catch a 7z/RAR handler retaining the first wrong
+    # password, reusing password-dependent headers, or losing later volumes.
+    # Six tiny real archives cover those independent failures in one lifecycle.
+    from tests.helpers.real_archives import create_encrypted_7z_archive, create_encrypted_rar_archive
+
+    worker = _require_worker_or_skip()
+    for archive_format in ("7z", "rar4", "rar5"):
+        for encrypted_headers in (False, True):
+            with subtests.test(format=archive_format, encrypted_headers=encrypted_headers):
+                case_id = f"batch-{archive_format}-{int(encrypted_headers)}"
+                if archive_format == "7z":
+                    case = create_encrypted_7z_archive(tmp_path, case_id, password="secret",
+                        header_encrypt=encrypted_headers)
+                else:
+                    case = create_encrypted_rar_archive(tmp_path, case_id, password="secret",
+                        rar4=archive_format == "rar4", header_encrypt=encrypted_headers,
+                        split=archive_format == "rar5", split_volume_size=8192)
+                out = tmp_path / (case_id + "-out")
+                result = _invoke_worker(worker, {
+                    "job_id": case_id, "archive_path": str(case.entry_path),
+                    "part_paths": [str(path) for path in sorted(case.archive_dir.iterdir())],
+                    "format_hint": "7z" if archive_format == "7z" else "rar",
+                    "output_dir": str(out), "password_candidates": ["wrong", "also-wrong", "secret"],
+                })
+                final = _worker_result(result.stdout)
+                assert result.returncode == 0 and final["matched_index"] == 2, result.stdout + result.stderr
+                marker = next(out.rglob(case.marker_name))
+                assert marker.read_text(encoding="utf-8") == case.marker_text
 
 
 def test_native_qos_ack_can_arrive_after_old_two_second_deadline():

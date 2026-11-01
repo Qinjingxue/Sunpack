@@ -85,10 +85,13 @@ def collect_cli_passwords(
     input_prompt = input_prompt or i18n.t("cli.password_input_prompt")
     passwords = list(getattr(args, "password", []) or [])
     if getattr(args, "password_file", None):
-        passwords.extend(read_password_file(args.password_file))
+        passwords = read_password_file(args.password_file, passwords)
+    else:
+        passwords = dedupe_passwords(passwords)
     if getattr(args, "prompt_passwords", False):
         passwords.extend(prompt_for_passwords(prompt_text=prompt_text, input_prompt=input_prompt))
-    return dedupe_passwords(passwords)
+        return dedupe_passwords(passwords)
+    return passwords
 
 
 def collect_clipboard_passwords(config: dict | None) -> list[str]:
@@ -151,7 +154,14 @@ async def collect_cli_passwords_async(
         password_file = str(args.password_file)
         if not os.path.isabs(password_file):
             password_file = os.path.join(ctx.cwd, password_file)
-        passwords.extend(read_password_file(password_file))
+        from sunpack.runtime.cli.cli import command_work_broker
+
+        async with command_work_broker(ctx) as broker:
+            passwords = await broker.run(
+                "password_file", password_file, read_password_file, password_file, passwords,
+            )
+    else:
+        passwords = dedupe_passwords(passwords)
     if getattr(args, "prompt_passwords", False):
         passwords.extend(
             await prompt_for_passwords_async(
@@ -160,7 +170,8 @@ async def collect_cli_passwords_async(
                 input_prompt=input_prompt,
             )
         )
-    return dedupe_passwords(passwords)
+        return dedupe_passwords(passwords)
+    return passwords
 
 
 def build_password_summary(

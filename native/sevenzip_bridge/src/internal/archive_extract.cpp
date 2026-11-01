@@ -155,6 +155,7 @@ namespace sunpack::sevenzip
                     item.encrypted &&
                     !item.is_dir &&
                     item.done &&
+                    item.bytes_written != 0 &&
                     item.has_source_crc32 &&
                     item.has_output_crc32 &&
                     item.source_crc32 == item.output_crc32)

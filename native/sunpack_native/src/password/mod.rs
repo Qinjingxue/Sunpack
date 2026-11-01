@@ -1,6 +1,7 @@
 pub(crate) mod cancellation;
 pub(crate) mod enc;
 pub(crate) mod input;
+pub(crate) mod lists;
 pub(crate) mod rar;
 pub(crate) mod seven_zip;
 pub(crate) mod zip;
