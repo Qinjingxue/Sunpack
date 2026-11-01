@@ -25,6 +25,21 @@ namespace sunpack::sevenzip
 
     bool archive_has_encrypted_items(IInArchive *archive);
 
+    // RAR4 may return Open=S_OK with zero items after a wrong encrypted-header
+    // password. The handler records that failed header parse in kpidErrorFlags.
+    // Only inspect this rare outcome; genuinely empty archives have no error.
+    inline bool rar4_rejected_empty_encrypted_headers(
+        IInArchive *archive, const GUID &format, UInt32 item_count, bool password_requested)
+    {
+        if (format.Data4[5] != 0x03 || item_count != 0 || !password_requested)
+            return false;
+        PROPVARIANT flags{};
+        const bool invalid = archive->GetArchiveProperty(kpidErrorFlags, &flags) == S_OK &&
+                             prop_u32(flags) != 0;
+        clear_prop(flags);
+        return invalid;
+    }
+
 #endif
 
 } // namespace sunpack::sevenzip
