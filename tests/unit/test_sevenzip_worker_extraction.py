@@ -1627,11 +1627,18 @@ def test_worker_password_candidates(tmp_path, subtests, layout):
         second.write_bytes(data[55:])
         source = {"entry_path": str(archive), "format_hint": "zip", "open_mode": "concat_ranges",
                   "ranges": [{"path": str(archive), "start": 0}, {"path": str(second), "start": 0}]}
-    cases = [(["secret"], True), (["wrong-password-1", "wrong-password-2"], False),
-             ([collision], False), ([collision, "secret"], True)]
-    for index, (candidates, accepted) in enumerate(cases):
+    # Confirm the successful first candidate too, and exercise the continuation
+    # boundary: rejecting a candidate must never discard pre-existing content.
+    # Reuse the same tiny physical/carved/cross-part lifecycle for these cases.
+    cases = [(["secret"], True, False), (["wrong-password-1", "wrong-password-2"], False, False),
+             ([collision], False, False), ([collision, "secret"], True, False),
+             (["secret", collision], True, False), ([collision, "secret"], True, True)]
+    for index, (candidates, accepted, existing_output) in enumerate(cases):
         with subtests.test(candidates=candidates):
             out = tmp_path / f"out-{index}"
+            if existing_output:
+                out.mkdir()
+                (out / "user.txt").write_text("preserved", encoding="utf-8")
             request = {
                 "job_id": str(index), "archive_path": str(archive), "output_dir": str(out),
                 "format_hint": "zip", "password": "placeholder", "password_candidates": candidates,
@@ -1640,6 +1647,8 @@ def test_worker_password_candidates(tmp_path, subtests, layout):
                 request["archive_input"] = source
             result = _invoke_worker(worker, request)
             final = _worker_result(result.stdout)
+            if existing_output:
+                assert (out / "user.txt").read_text(encoding="utf-8") == "preserved"
             assert (result.returncode == 0) is accepted, result.stdout + result.stderr
             assert (final["status"] == "ok") is accepted
             if accepted:

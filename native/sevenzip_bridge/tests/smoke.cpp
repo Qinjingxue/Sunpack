@@ -1,3 +1,4 @@
+#define NOMINMAX
 #include "sevenzip_bridge/bridge.hpp"
 #include "internal/sevenzip_paths.hpp"
 #include "internal/sevenzip_formats.hpp"
@@ -6,6 +7,7 @@
 #include "internal/native_cpu_budget.hpp"
 #include "internal/decoder_cpu_budget.h"
 #include "internal/native_worker_sizing.hpp"
+#include "internal/sevenzip_callbacks.hpp"
 
 #include <filesystem>
 #include <fstream>
@@ -15,6 +17,31 @@
 
 #ifdef _WIN32
 namespace {
+
+bool check_probe_cancellation_lifetime() {
+    // Transport/KDF tests never cancel these SDK callbacks on a decoder
+    // thread. One lifecycle verifies token capture, interruption and isolation.
+    using namespace sunpack::sevenzip;
+    NativeMemoryManager manager(0);
+    NativeMemoryJob job(manager);
+    CMyComPtr<IArchiveExtractCallback> extract;
+    CMyComPtr<IArchiveOpenCallback> open;
+    {
+        NativeMemoryScope scope(&job);
+        extract = new ExtractCallback(L"secret");
+        open = new OpenCallback(L"secret");
+    }
+    if (extract->SetCompleted(nullptr) != S_OK || open->SetCompleted(nullptr, nullptr) != S_OK) return false;
+    job.cancel->store(true);
+    bool stopped = false;
+    std::thread decoder([&] {
+        stopped = extract->SetCompleted(nullptr) == E_ABORT &&
+            open->SetCompleted(nullptr, nullptr) == E_ABORT;
+    });
+    decoder.join();
+    CMyComPtr<IArchiveExtractCallback> survivor(new ExtractCallback(L"secret"));
+    return stopped && survivor->SetCompleted(nullptr) == S_OK;
+}
 
 bool check_numbered_volume_paths() {
     const std::vector<std::wstring> zip_parts = {
@@ -327,6 +354,10 @@ bool check_native_sizing_respects_thread_override() {
 
 int wmain(int argc, wchar_t** argv) {
 #ifdef _WIN32
+    if (!check_probe_cancellation_lifetime()) {
+        std::cerr << "password probe cancellation lifetime check failed\n";
+        return 34;
+    }
     if (!check_numbered_volume_paths()) {
         std::cerr << "numbered volume path check failed\n";
         return 2;

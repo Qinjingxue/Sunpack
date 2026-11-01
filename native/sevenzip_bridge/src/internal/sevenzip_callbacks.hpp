@@ -56,7 +56,8 @@ namespace sunpack::sevenzip
             std::wstring archive_path = L"",
             std::vector<std::wstring> part_paths = {},
             std::vector<std::wstring> canonical_names = {},
-            InputPrefetchConfig volume_prefetch_config = input_prefetch_config())
+            InputPrefetchConfig volume_prefetch_config = input_prefetch_config(),
+            std::shared_ptr<std::atomic<bool>> cancel_token = native_job_cancel_token())
 
             : password_(std::move(password)),
 
@@ -64,7 +65,7 @@ namespace sunpack::sevenzip
 
               part_paths_(std::move(part_paths)),
 
-              volume_prefetch_config_(volume_prefetch_config)
+              volume_prefetch_config_(volume_prefetch_config), cancel_token_(std::move(cancel_token))
         {
 
             if (!canonical_names.empty() && canonical_names.size() == part_paths_.size())
@@ -108,12 +109,13 @@ namespace sunpack::sevenzip
         }
 
 
-        HRESULT STDMETHODCALLTYPE SetTotal(const UInt64 *, const UInt64 *) SUP7Z_NOEXCEPT override { return S_OK; }
+        HRESULT STDMETHODCALLTYPE SetTotal(const UInt64 *, const UInt64 *) SUP7Z_NOEXCEPT override { return cancelled() ? E_ABORT : S_OK; }
 
-        HRESULT STDMETHODCALLTYPE SetCompleted(const UInt64 *, const UInt64 *) SUP7Z_NOEXCEPT override { return S_OK; }
+        HRESULT STDMETHODCALLTYPE SetCompleted(const UInt64 *, const UInt64 *) SUP7Z_NOEXCEPT override { return cancelled() ? E_ABORT : S_OK; }
 
         HRESULT STDMETHODCALLTYPE GetProperty(PROPID propID, PROPVARIANT *value) SUP7Z_NOEXCEPT override
         {
+            if (cancelled()) return E_ABORT;
 
             if (!value)
             {
@@ -146,6 +148,7 @@ namespace sunpack::sevenzip
             }
 
             *inStream = nullptr;
+            if (cancelled()) return E_ABORT;
 
             if (!name)
             {
@@ -209,12 +212,14 @@ namespace sunpack::sevenzip
             }
 
             password_requested_ = true;
+            if (cancelled()) return E_ABORT;
             *password = SysAllocString(password_.c_str());
 
             return *password ? S_OK : E_OUTOFMEMORY;
         }
 
     private:
+        bool cancelled() const noexcept { return cancel_token_ && cancel_token_->load(std::memory_order_acquire); }
         static std::wstring lower_path(std::wstring value)
         {
             return lower_text(std::move(value));
@@ -228,6 +233,7 @@ namespace sunpack::sevenzip
         std::vector<std::wstring> part_paths_;
 
         const InputPrefetchConfig volume_prefetch_config_;
+        std::shared_ptr<std::atomic<bool>> cancel_token_;
 
         std::map<std::wstring, std::wstring> volume_paths_;
 
@@ -244,15 +250,15 @@ namespace sunpack::sevenzip
         
 
     public:
-        explicit ExtractCallback(std::wstring password) : password_(std::move(password)) {}
+        explicit ExtractCallback(std::wstring password) : password_(std::move(password)), cancel_token_(native_job_cancel_token()) {}
 
         Int32 operation_result() const { return operation_result_; }
         bool password_requested() const { return password_requested_; }
 
 
-        HRESULT STDMETHODCALLTYPE SetTotal(UInt64) SUP7Z_NOEXCEPT override { return S_OK; }
+        HRESULT STDMETHODCALLTYPE SetTotal(UInt64) SUP7Z_NOEXCEPT override { return cancelled() ? E_ABORT : S_OK; }
 
-        HRESULT STDMETHODCALLTYPE SetCompleted(const UInt64 *) SUP7Z_NOEXCEPT override { return S_OK; }
+        HRESULT STDMETHODCALLTYPE SetCompleted(const UInt64 *) SUP7Z_NOEXCEPT override { return cancelled() ? E_ABORT : S_OK; }
 
         HRESULT STDMETHODCALLTYPE GetStream(UInt32, ISequentialOutStream **outStream, Int32) SUP7Z_NOEXCEPT override
         {
@@ -264,18 +270,16 @@ namespace sunpack::sevenzip
             }
 
             *outStream = nullptr;
-
-            return S_OK;
+            return cancelled() ? E_ABORT : S_OK;
         }
 
-        HRESULT STDMETHODCALLTYPE PrepareOperation(Int32) SUP7Z_NOEXCEPT override { return S_OK; }
+        HRESULT STDMETHODCALLTYPE PrepareOperation(Int32) SUP7Z_NOEXCEPT override { return cancelled() ? E_ABORT : S_OK; }
 
         HRESULT STDMETHODCALLTYPE SetOperationResult(Int32 opRes) SUP7Z_NOEXCEPT override
         {
 
             operation_result_ = opRes;
-
-            return S_OK;
+            return cancelled() ? E_ABORT : S_OK;
         }
 
         HRESULT STDMETHODCALLTYPE CryptoGetTextPassword(BSTR *password) SUP7Z_NOEXCEPT override
@@ -288,14 +292,16 @@ namespace sunpack::sevenzip
             }
 
             password_requested_ = true;
+            if (cancelled()) return E_ABORT;
             *password = SysAllocString(password_.c_str());
 
             return *password ? S_OK : E_OUTOFMEMORY;
         }
 
     private:
-
+        bool cancelled() const noexcept { return cancel_token_ && cancel_token_->load(std::memory_order_acquire); }
         std::wstring password_;
+        std::shared_ptr<std::atomic<bool>> cancel_token_;
 
         Int32 operation_result_ = kOpOk;
         bool password_requested_ = false;

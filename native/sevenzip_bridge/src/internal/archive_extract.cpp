@@ -354,6 +354,12 @@ namespace sunpack::sevenzip
         const UInt64 start_only = 0;
         for (std::size_t attempt_index = 0; attempt_index < formats.size() * 2; ++attempt_index)
         {
+            if (cancel_token && cancel_token->load(std::memory_order_acquire)) {
+                result.status = PasswordTestStatus::Error;
+                set_failure(result, "native_cancel", "cancelled", E_ABORT);
+                result.message = "archive extraction cancelled";
+                return result;
+            }
             const GUID &format = formats[attempt_index % formats.size()];
             const UInt64 *search_limit = attempt_index < formats.size() ? &start_only : nullptr;
 
@@ -491,13 +497,13 @@ namespace sunpack::sevenzip
                 PipelinePrepareScope scope(pipeline_timing.get(), PipelinePreparePhase::CallbackSetup);
                 const std::wstring callback_path = canonical_names.empty() ? callback_archive_path(archive_path, part_paths) : canonical_names.front();
                 raw_open_callback = new OpenCallback(
-                    password, callback_path, part_paths, canonical_names, prefetch_config);
+                    password, callback_path, part_paths, canonical_names, prefetch_config, cancel_token);
                 open_callback = CMyComPtr<IArchiveOpenCallback>(raw_open_callback);
             }
 #else
             const std::wstring callback_path = canonical_names.empty() ? callback_archive_path(archive_path, part_paths) : canonical_names.front();
             auto *raw_open_callback = new OpenCallback(
-                password, callback_path, part_paths, canonical_names, prefetch_config);
+                password, callback_path, part_paths, canonical_names, prefetch_config, cancel_token);
             CMyComPtr<IArchiveOpenCallback> open_callback(raw_open_callback);
 #endif
 
@@ -509,7 +515,9 @@ namespace sunpack::sevenzip
 #else
             hr = archive->Open(stream.Interface(), search_limit, open_callback.Interface());
 #endif
-            last_encryption_evidence = raw_open_callback->password_requested();
+            // A later fallback handler cannot erase the encrypted-header
+            // evidence observed by an earlier handler for this password.
+            last_encryption_evidence = last_encryption_evidence || raw_open_callback->password_requested();
 
             if (set_memory_failure(result, "archive_open", hr)) {
                 attempt.open_hresult = static_cast<int>(hr);

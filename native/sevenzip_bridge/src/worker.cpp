@@ -1090,6 +1090,53 @@ std::string diagnostics_json(const sunpack::sevenzip::ExtractArchiveResult& resu
 
 constexpr int kMemoryRetry = -102;
 
+bool extraction_rejects_password(const sunpack::sevenzip::ExtractArchiveResult& result) {
+    // With a complete callback inventory, rejection by every eligible encrypted
+    // member also proves rejection by whichever member the fallback would test.
+    // Reuse decoder receipts; do not parse or rediscover the archive here.
+    if (!result.item_count || result.output_trace.items.size() != result.item_count) return false;
+    bool tested = false;
+    for (const auto& item : result.output_trace.items) {
+        if (!item.encrypted || item.is_dir || (item.has_expected_size && item.expected_size == 0)) continue;
+        tested = true;
+        if (!sunpack::sevenzip::looks_wrong_password(S_OK, item.operation_result, true)) return false;
+    }
+    return tested;
+}
+
+int cancelled_result(const std::string& job_id) {
+    print_json_line(
+        "{\"type\":\"result\",\"job_id\":\"" + json_escape(job_id) +
+        "\",\"status\":\"failed\",\"native_status\":\"cancelled\","
+        "\"failure_stage\":\"native_cancel\",\"failure_kind\":\"cancelled\","
+        "\"message\":\"native job was cancelled\"}");
+    return -101;
+}
+
+// Called only for a candidate transaction whose output was initially empty.
+// Extraction has already drained and closed every writer before this point.
+std::error_code discard_candidate_output(const std::wstring& output_dir) {
+    const std::filesystem::path root(sunpack::sevenzip::win32_extended_path(output_dir));
+    std::error_code error;
+    std::filesystem::remove_all(root, error);
+    if (!error || error != std::errc::permission_denied) return error;
+    // Archive metadata can make a successfully written plain sibling readonly.
+    // Match the ordinary output cleanup policy, without following reparse dirs.
+    const auto writable = [](const std::filesystem::path& path) {
+        const auto attributes = GetFileAttributesW(path.c_str());
+        if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_READONLY))
+            SetFileAttributesW(path.c_str(), attributes & ~FILE_ATTRIBUTE_READONLY);
+    };
+    writable(root);
+    std::filesystem::recursive_directory_iterator it(root, error), end;
+    while (!error && it != end) {
+        writable(it->path());
+        it.increment(error);
+    }
+    if (!error) std::filesystem::remove_all(root, error);
+    return error;
+}
+
 int run_request(
     const WorkerRequest& request,
     // The job's output-volume write facility, borrowed from the registry lease held by worker_loop; null for dry runs.
@@ -1109,12 +1156,7 @@ int run_request(
         return 0;
     }
     if (cancel_token && cancel_token->load(std::memory_order_acquire)) {
-        print_json_line(
-            "{\"type\":\"result\",\"job_id\":\"" + json_escape(job_id) +
-            "\",\"status\":\"failed\",\"native_status\":\"cancelled\","
-            "\"failure_stage\":\"native_cancel\",\"failure_kind\":\"cancelled\","
-            "\"message\":\"native job was cancelled before extraction started\"}");
-        return -101;
+        return cancelled_result(job_id);
     }
 
     const std::wstring& archive_path = request.archive_path;
@@ -1210,47 +1252,93 @@ int run_request(
         result.message = "structured volume " + std::to_string(archive_input.missing_volume_number) + " is missing";
     } else if (password_candidates.empty()) {
         result = extract_with_password(password);
-    } else if (password_candidates.size() == 1) {
-        // Single candidate: extract directly. An explicit wrong-password result
-        // is already conclusive; other failures retain the bounded diagnostic.
-        result = extract_with_password(password_candidates.front());
-        const bool direct_ok = result.status == PasswordTestStatus::Ok && result.command_ok;
-        result.password_attempts = direct_ok ? 0 : 1;
-        if (!direct_ok && result.encrypted && result.failure_kind != "resource_unavailable" &&
-            !(current_native_memory_job() && current_native_memory_job()->revoked.load(std::memory_order_acquire)) &&
-            !(current_native_memory_job() && current_native_memory_job()->denied.load(std::memory_order_acquire)) &&
-            !(result.status == PasswordTestStatus::WrongPassword && result.operation_result == kOpWrongPassword)) {
-            const auto probe = run_password_candidate_probe(archive_input, password_candidates);
-            result.password_attempts = probe.attempts;
-            if (probe.status == PasswordTestStatus::WrongPassword) {
-                result.status = PasswordTestStatus::WrongPassword;
-                result.encrypted = true;
-                result.wrong_password = true;
-                result.password_rejected = true;
-                result.password_candidates_all_rejected = true;
-                result.failure_stage = "password_probe";
-                result.failure_kind = "wrong_password";
-                result.operation_result = kOpWrongPassword;
-                result.message = probe.message;
-            }
-        }
-        result.password_candidate_direct = true;
-        result.password_candidate_count = 1;
-        result.matched_index = direct_ok ? 0 : -1;
-        result.password_candidates_all_rejected =
-            result.password_candidates_all_rejected || result.wrong_password || result.password_rejected;
     } else {
-        const auto probe = run_password_candidate_probe(archive_input, password_candidates);
-        if (probe.status != PasswordTestStatus::Ok ||
-            probe.matched_index < 0 ||
-            static_cast<std::size_t>(probe.matched_index) >= password_candidates.size()) {
-            result = password_candidate_failure(archive_input, probe, password_candidates.size());
+        auto *replay = current_extraction_replay;
+        if (password_candidates.size() > 1 && replay && !replay->candidates_started) {
+            replay->candidates_started = true;
+            std::error_code error;
+            const auto root = std::filesystem::path(win32_extended_path(output_dir));
+            replay->candidate_output_owned = !dry_run &&
+                (!std::filesystem::exists(root, error) || std::filesystem::is_empty(root, error)) && !error;
+        }
+        // Existing outputs belong to a continuation/user. Keep the read-only
+        // diagnostic fallback there; fresh outputs can confirm by extracting.
+        const bool direct_candidates = password_candidates.size() == 1 ||
+            (replay && replay->candidate_output_owned);
+        if (!direct_candidates) {
+            const auto probe = run_password_candidate_probe(archive_input, password_candidates);
+            if (probe.status != PasswordTestStatus::Ok || probe.matched_index < 0 ||
+                static_cast<std::size_t>(probe.matched_index) >= password_candidates.size()) {
+                result = password_candidate_failure(archive_input, probe, password_candidates.size());
+            } else {
+                result = extract_with_password(password_candidates[probe.matched_index]);
+                result.password_candidate_batch = true;
+                result.password_candidate_count = static_cast<unsigned int>(password_candidates.size());
+                result.password_attempts = probe.attempts;
+                result.matched_index = probe.matched_index;
+            }
         } else {
-            result = extract_with_password(password_candidates[probe.matched_index]);
-            result.password_candidate_batch = true;
-            result.password_candidate_count = static_cast<unsigned int>(password_candidates.size());
-            result.password_attempts = probe.attempts;
-            result.matched_index = probe.matched_index;
+            std::size_t index = replay ? replay->candidate_index : 0;
+            while (index < password_candidates.size() || (replay && replay->candidate_discard_pending)) {
+                if (replay && replay->candidate_discard_pending) {
+                    const auto error = discard_candidate_output(output_dir);
+                    if (error) {
+                        result = ExtractArchiveResult{};
+                        result.backend_available = true;
+                        result.status = PasswordTestStatus::Error;
+                        result.failure_stage = "candidate_cleanup";
+                        result.failure_kind = "output_filesystem";
+                        result.message = error.message();
+                        break;
+                    }
+                    replay->clear_output();
+                    replay->candidate_discard_pending = false;
+                    replay->candidate_index = ++index;
+                    continue;
+                }
+                if (cancel_token && cancel_token->load(std::memory_order_acquire)) break;
+                // Confirmation shares the real extraction and its CRC receipts.
+                // Only ambiguous failures need the existing read-only probe.
+                result = extract_with_password(password_candidates[index]);
+                const bool direct_ok = result.status == PasswordTestStatus::Ok && result.command_ok;
+                if (!direct_ok && result.encrypted && !result.password_crc_proven &&
+                    !(cancel_token && cancel_token->load(std::memory_order_acquire)) &&
+                    result.status != PasswordTestStatus::Error && result.failure_kind != "resource_unavailable" &&
+                    !(current_native_memory_job() && current_native_memory_job()->revoked.load(std::memory_order_acquire)) &&
+                    !(current_native_memory_job() && current_native_memory_job()->denied.load(std::memory_order_acquire)) &&
+                    !(result.status == PasswordTestStatus::WrongPassword && result.operation_result == kOpWrongPassword)) {
+                    if (extraction_rejects_password(result) ||
+                        run_password_candidate_probe(archive_input, {password_candidates[index]}).status == PasswordTestStatus::WrongPassword) {
+                        result.status = PasswordTestStatus::WrongPassword;
+                        result.encrypted = true;
+                        result.wrong_password = true;
+                        result.password_rejected = true;
+                        result.password_candidates_all_rejected = true;
+                        result.failure_stage = "password_probe";
+                        result.failure_kind = "wrong_password";
+                        result.operation_result = kOpWrongPassword;
+                        result.message = "wrong password";
+                    }
+                }
+                result.password_candidate_direct = true;
+                result.password_candidate_count = static_cast<unsigned int>(password_candidates.size());
+                result.password_attempts = password_candidates.size() == 1 && direct_ok ? 0 : static_cast<int>(index + 1);
+                result.matched_index = direct_ok ? static_cast<int>(index) : -1;
+                result.password_candidates_all_rejected =
+                    result.password_candidates_all_rejected || result.wrong_password || result.password_rejected;
+                if (direct_ok || !result.password_candidates_all_rejected || password_candidates.size() == 1 ||
+                    (cancel_token && cancel_token->load(std::memory_order_acquire))) break;
+                result.password_candidates_all_rejected = false;
+                replay->candidate_discard_pending = true;
+            }
+            if (index == password_candidates.size()) {
+                PasswordTestResult rejected;
+                rejected.status = PasswordTestStatus::WrongPassword;
+                rejected.backend_available = true;
+                rejected.attempts = static_cast<int>(password_candidates.size());
+                rejected.message = "wrong password";
+                result = password_candidate_failure(archive_input, rejected, password_candidates.size());
+            }
         }
     }
 
@@ -1263,6 +1351,8 @@ int run_request(
         // damage/password/output errors or a final result to the caller.
         if (memory->revoked.load(std::memory_order_acquire) && !(result.status == PasswordTestStatus::Ok && result.command_ok)) return kMemoryRetry;
     }
+
+    if (cancel_token && cancel_token->load(std::memory_order_acquire)) return cancelled_result(job_id);
 
     if (!archive_input.analyzed_missing_volume_evidence.empty()) {
         if (result.missing_volume && result.missing_volume_evidence.empty()) {

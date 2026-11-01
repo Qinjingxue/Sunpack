@@ -63,6 +63,14 @@ struct ExtractionReplay {
     std::unordered_map<std::wstring, std::filesystem::path> directories;
     std::array<std::uint8_t, 16> handler{};
     bool root_was_empty = false, initialized = false;
+    // Candidate confirmation is an extraction transaction, including across
+    // memory withdrawals. Never replay one password's bytes under another.
+    std::size_t candidate_index = 0;
+    bool candidates_started = false, candidate_output_owned = false, candidate_discard_pending = false;
+    void clear_output() {
+        files.clear(); directories.clear(); handler.fill(0);
+        root_was_empty = initialized = false;
+    }
 };
 inline thread_local ExtractionReplay *current_extraction_replay = nullptr;
 class ExtractionReplayScope {

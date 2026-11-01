@@ -60,6 +60,26 @@ class PathMap(MutableMapping):
         self._root.clear()
         self._sequence = 0
 
+    def ancestors(self, path):
+        """Yield stored ancestors, including the path, in root-first order."""
+        node = self._root
+        for component in absolute_path_key(path).split(os.sep):
+            node = node.get(component)
+            if node is None:
+                return
+            key = node.get(None)
+            if key is not None:
+                yield key, self._values[key][1]
+
+    def has_under(self, root):
+        """Check a subtree in O(path depth), without visiting its descendants."""
+        node = self._root
+        for component in absolute_path_key(root).split(os.sep):
+            node = node.get(component)
+            if node is None:
+                return False
+        return bool(node)
+
     def pop_under(self, root):
         node = self._root
         for component in absolute_path_key(root).split(os.sep):

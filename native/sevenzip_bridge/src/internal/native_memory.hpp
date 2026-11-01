@@ -107,4 +107,12 @@ private:
 inline NativeMemoryJob *current_native_memory_job() noexcept {
     return static_cast<NativeMemoryJob *>(sunpack_memory_current_context());
 }
+inline std::shared_ptr<std::atomic<bool>> native_job_cancel_token() noexcept {
+    const auto *job = current_native_memory_job();
+    return job ? job->cancel : nullptr;
+}
+inline bool native_job_cancelled() noexcept {
+    const auto *job = current_native_memory_job();
+    return job && job->cancel->load(std::memory_order_acquire);
+}
 }

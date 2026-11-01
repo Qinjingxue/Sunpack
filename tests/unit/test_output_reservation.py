@@ -1,7 +1,43 @@
 from tests.helpers.archive_tasks import make_archive_task
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+import shutil
+import pytest
 from sunpack.core.support.output_paths import next_available_path
 from sunpack.core.support.output_reservation import OutputReservationRegistry, build_output_dir_resolver
+
+
+@pytest.mark.parametrize("child_first", [False, True])
+@pytest.mark.parametrize("shared_request", [False, True])
+def test_output_subtrees_isolate_jobs_but_allow_owned_recursion(tmp_path, child_first, shared_request):
+    # Exact-name collision tests cannot catch parent cleanup deleting another
+    # job, or a tree lock incorrectly moving recursive work out of its parent.
+    # One small reservation/cleanup lifecycle covers both orders and ownership.
+    registry = OutputReservationRegistry()
+    parent = str(tmp_path / "out" / "parent")
+    child = str(Path(parent) / "child")
+    owners = ("parent", "parent" if shared_request else "child")
+    paths = [parent, child]
+    for index in ((1, 0) if child_first else (0, 1)):
+        paths[index] = registry.reserve(paths[index], owners[index], set())
+    roots = [Path(path) for path in paths]
+    assert not roots[0].is_relative_to(roots[1]) and not roots[1].is_relative_to(roots[0])
+    for root in roots:
+        root.mkdir(parents=True)
+        (root / "payload").write_text("kept", encoding="utf-8")
+    generated = roots[0] / "inner.zip"
+    nested = registry.reserve(str(roots[0] / "inner"), owners[0], set(), input_path=str(generated))
+    assert Path(nested).parent == roots[0]
+    foreign = registry.reserve(str(roots[0] / "foreign"), "foreign", set(), input_path=str(generated))
+    assert not Path(foreign).is_relative_to(roots[0])
+    with pytest.raises(FileExistsError):
+        registry.reserve(str(roots[0] / "continued"), "foreign", set(), reuse_existing=True)
+    shutil.rmtree(roots[0])
+    assert (roots[1] / "payload").read_text(encoding="utf-8") == "kept"
+    for owner in set((*owners, "foreign")):
+        registry.release(owner)
+    assert not registry.contains(nested)
+    assert registry.clear_idle_cache()["slots"] == 0
 
 
 def test_output_dir_resolver_disambiguates_duplicate_task_outputs(tmp_path):

@@ -123,13 +123,15 @@ class OutputPathAllocator:
         local_reserved: Container[str] = (),
         *,
         is_directory: bool = False,
+        physical_parent: str | None = None,
     ) -> str:
         candidate = os.path.normpath(path)
         parent = os.path.dirname(candidate)
         name = os.path.basename(candidate)
         # Resolve the existing parent once, then compare all numbered choices
         # in that namespace while preserving the caller's displayed path.
-        physical_parent = resolved_path_key(parent or os.curdir)
+        if physical_parent is None:
+            physical_parent = resolved_path_key(parent or os.curdir)
         key = os.path.join(physical_parent, case_key(name))
         if key not in reserved and key not in local_reserved and not os.path.exists(candidate):
             return candidate

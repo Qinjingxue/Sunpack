@@ -205,7 +205,12 @@ namespace sunpack::sevenzip
 
     )
     {
-
+        if (native_job_cancelled()) {
+            PasswordTestResult result;
+            result.status = PasswordTestStatus::Error;
+            result.message = "password probe cancelled";
+            return result;
+        }
         if (cache.archive)
         {
             PasswordTestResult result = cache.evidence;
@@ -267,6 +272,11 @@ namespace sunpack::sevenzip
             const UInt64 start_only = 0;
             for (std::size_t attempt_index = 0; attempt_index < plan.formats.size() * 2; ++attempt_index)
             {
+                if (native_job_cancelled()) {
+                    result.status = PasswordTestStatus::Error;
+                    result.message = "password probe cancelled";
+                    return result;
+                }
                 const GUID &format = plan.formats[attempt_index % plan.formats.size()];
                 const UInt64 *search_limit = attempt_index < plan.formats.size() ? &start_only : nullptr;
 
@@ -505,9 +515,19 @@ namespace sunpack::sevenzip
         PasswordTestResult last;
         for (int index = 0; index < password_count; ++index)
         {
+            if (native_job_cancelled()) {
+                last.status = PasswordTestStatus::Error;
+                last.message = "password probe cancelled";
+                return last;
+            }
             auto current = test_one_password(archive_path, passwords[index] ? passwords[index] : L"",
                 part_paths, formats, ranges, canonical_names, format_hint, cache);
             current.attempts = index + 1;
+            if (native_job_cancelled()) {
+                current.status = PasswordTestStatus::Error;
+                current.message = "password probe cancelled";
+                return current;
+            }
             if (current.status == PasswordTestStatus::Ok)
             {
                 current.matched_index = index;
