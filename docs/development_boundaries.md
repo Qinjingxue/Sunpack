@@ -157,6 +157,8 @@ Other pipeline stages must not import `sunpack.pipeline.coordinator` in reverse.
 
 Before watch starts, it must confirm that the root directory is on an NTFS volume with a readable Journal. File observation first reads file metadata and the current USN; when the current USN exceeds the last recorded one, the client asks the broker to read the reasons for `previous_usn < usn <= current_usn`, at most 1 MiB per call. The watcher distinguishes content changes from metadata changes based on the reasons, and hands content changes to the active/quiet state machine.
 
+Filesystem validation before a GUI save would couple the GUI to backend monitoring policy. On startup and configuration application, the backend reuses the Rust filesystem query, removes confirmed non-NTFS input paths in the watch-list mutex transaction, then uses `MessageBoxW` and `cli.language` to list the affected paths, filesystems, and removal result. After acknowledgment, startup continues for the remaining roots. Only monitoring records are removed; files and folders remain intact. Offline paths and filesystem-query failures retain their configuration, while Journal and permission errors follow the existing error path. These checks run only when applying configuration and add no idle polling.
+
 The standard service identity is `SunPackWatchBroker`, with the standard pipe `\\.\pipe\SunPack.WatchBroker.v1`. Clients use the service through process-level leases: the first lease establishes the connection, nested leases reuse it, and the last lease release closes it. Tests may only use the isolated identities with the `SunPackWatchBrokerTest_` and `\\.\pipe\SunPack.WatchBroker.Test.` prefixes.
 
 ## Prohibited list

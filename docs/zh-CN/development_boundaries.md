@@ -157,6 +157,8 @@ sunpack.runtime.watch
 
 watch 启动前必须确认根目录位于 NTFS 卷且 Journal 可读。文件观察先读取文件元数据和当前 USN；当前 USN 超过上次记录时，客户端请求 broker 读取 `previous_usn < usn <= current_usn` 的 reason，单次最多 1 MiB。watcher 根据 reason 区分内容变化和元数据变化，并把内容变化交给活跃/静默状态机。
 
+不在 GUI 保存前验证文件系统，否则会让 GUI 耦合后端的监控能力判断。后端在启动和应用配置时复用 Rust 文件系统查询，确认非 NTFS 的输入路径后，在监控列表的互斥事务内移除对应记录，再按 `cli.language` 用 `MessageBoxW` 汇总显示具体路径、文件系统和已移除说明；确认提示后继续启动其余监控目录。只移除监控配置，不删除目录或文件。暂时离线或无法读取文件系统的路径保留配置，Journal 和权限错误仍走原有错误链路。检查仅在配置应用时执行，不增加空闲轮询。
+
 标准服务身份是 `SunPackWatchBroker`，标准管道为 `\\.\pipe\SunPack.WatchBroker.v1`。客户端以进程级 lease 使用服务：首个 lease 建立连接，嵌套 lease 复用连接，最后一个 lease 释放连接。测试只能使用 `SunPackWatchBrokerTest_` 和 `\\.\pipe\SunPack.WatchBroker.Test.` 前缀的隔离身份。
 
 ## 禁止清单

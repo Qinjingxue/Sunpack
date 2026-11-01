@@ -12,10 +12,12 @@ from sunpack.core.support.path_keys import case_key, path_key
 
 from sunpack.core.config.fields.watch import DEFAULT_WATCH_CONFIG
 from sunpack.core.config.loader import ADVANCED_CONFIG_FILENAME, SIMPLE_CONFIG_FILENAME, load_config
+from sunpack.core.i18n import I18nContext
+from sunpack.core.platform.windows.message_box import show_error
 from sunpack.core.contracts.content_recovery import require_complete_content
 from sunpack.runtime.watch.config_observer import ConfigFileObserver
 from sunpack.runtime.watch.log import WatchLogStore
-from sunpack.runtime.watch.scheduler import WatchScheduler
+from sunpack.runtime.watch.scheduler import WatchScheduler, _nearest_existing_directory
 from sunpack.runtime.watch.roots import WatchRootEntry
 from sunpack.runtime.watch.toast import WatchToastCoordinator
 from sunpack.core.support.resources import get_resource_path
@@ -368,6 +370,40 @@ def list_watch_roots() -> tuple[Path, list[str]]:
     return roots_path, read_watch_roots(path=roots_path)
 
 
+def _prune_non_ntfs_watch_roots() -> tuple[list[WatchRootEntry], list[tuple[str, str]]]:
+    from sunpack_native import watch_filesystem_type
+
+    roots_path = watch_roots_path()
+    # Use the same transaction as CLI/GUI writers; never overwrite a concurrent
+    # save with the service's older configuration snapshot.
+    with _watch_roots_mutex(roots_path):
+        entries = _read_watch_root_entries(path=roots_path)
+        kept = []
+        rejected = []
+        filesystems = {}
+        for entry in entries:
+            directory = _nearest_existing_directory(entry.input_root)
+            if directory is None:
+                kept.append(entry)
+                continue
+            key = path_key(directory)
+            if key not in filesystems:
+                try:
+                    filesystems[key] = watch_filesystem_type(directory)
+                except OSError:
+                    # Offline/inaccessible is not evidence of an unsupported
+                    # filesystem. Keep its policy and existing recovery path.
+                    filesystems[key] = ""
+            filesystem = filesystems[key]
+            if filesystem and filesystem.upper() != "NTFS":
+                rejected.append((entry.input_root, filesystem))
+            else:
+                kept.append(entry)
+        if rejected:
+            _write_watch_root_entries_unlocked(kept, roots_path)
+    return kept, rejected
+
+
 class WatchService:
     def __init__(
         self,
@@ -445,6 +481,7 @@ class WatchService:
             if self._control_queue is None:
                 self._control_queue = asyncio.Queue()
             async with self._reload_lock:
+                await self._clean_non_ntfs_roots(self.config, self.service_config)
                 await self._start_scheduler()
                 self._reconcile_tray()
             self._ready_event.set()
@@ -938,6 +975,7 @@ class WatchService:
         new_service_config: dict,
         new_state_dir: str,
     ) -> bool:
+        await self._clean_non_ntfs_roots(new_config, new_service_config)
         plan = _build_reload_plan(
             self.config,
             self.service_config,
@@ -998,6 +1036,23 @@ class WatchService:
         if previous[3] is not self.log:
             await asyncio.to_thread(previous[3].close)
         return True
+
+    async def _clean_non_ntfs_roots(self, config: dict, service_config: dict) -> None:
+        entries, rejected = await asyncio.to_thread(_prune_non_ntfs_watch_roots)
+        service_config["root_entries"] = entries
+        if not rejected:
+            return
+        i18n = I18nContext(config["cli"]["language"])
+        message = i18n.t(
+            "watch.non_ntfs_removed",
+            paths="\n".join(f"{root} ({filesystem})" for root, filesystem in rejected),
+        )
+        self.log.write("watch_non_ntfs_roots_removed", roots=[root for root, _ in rejected], message=message)
+        # Neither the roots mutex nor the event loop waits on a modal Win32 call.
+        try:
+            await asyncio.to_thread(show_error, i18n.t("watch.error_title"), message)
+        except OSError as exc:
+            self.log.write("watch_error_dialog_failed", error=str(exc))
 
     async def _scan_pending_roots(self) -> None:
         if self.scheduler is None:

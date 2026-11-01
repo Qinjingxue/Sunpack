@@ -50,6 +50,113 @@ def _await(awaitable):
     return _TEST_LOOP.run_until_complete(awaitable)
 
 
+@pytest.mark.parametrize("language", ["zh", "en"])
+def test_non_ntfs_roots_are_removed_on_start_and_live_reload(tmp_path, monkeypatch, language):
+    """Existing lifecycle tests never reject filesystems or inspect the error UI.
+
+    Without this, destructive cleanup, poisoned startup and repeated prompts go
+    undetected. One tiny lifecycle covers startup, CLI add and GUI-style reload.
+    """
+    import sunpack_native
+
+    good, bad, another = [tmp_path / name for name in ("good", "非NTFS O'Brien", "another")]
+    for root in (good, bad, another):
+        root.mkdir()
+    marker = bad / "keep.txt"
+    marker.write_text("keep", encoding="utf-8")
+    roots_path = tmp_path / "roots.txt"
+    roots_path.write_text(f"# keep this comment\n{good} | out | true | true | true\n{bad}\n", encoding="utf-8")
+    config = make_config({"cli": {"language": language}, "watch": {
+        "state_dir": str(tmp_path / "state"), "tray_enabled": False,
+    }})
+    monkeypatch.setattr(service_module, "watch_roots_path", lambda: roots_path)
+    monkeypatch.setattr(service_module, "load_config", lambda: config)
+    monkeypatch.setattr(sunpack_native, "watch_filesystem_type", lambda path: "exFAT" if path == str(bad) else "NTFS")
+    starts, dialogs = [], []
+
+    class Scheduler(_SchedulerLifecycle):
+        def __init__(self, _config, roots, **kwargs):
+            starts.append(list(roots))
+
+        async def run_once(self):
+            pass
+
+    def show_error(title, message):
+        # Cleanup is durable before the user sees "removed". The dialog also
+        # runs off the service's event-loop thread.
+        assert str(bad) not in roots_path.read_text(encoding="utf-8")
+        assert threading.current_thread() is not threading.main_thread()
+        dialogs.append((title, message))
+
+    monkeypatch.setattr(service_module, "WatchScheduler", Scheduler)
+    monkeypatch.setattr(service_module, "show_error", show_error)
+    service = WatchService(engine_factory=lambda _config: FakePipelineEngine(FakeRunner))
+
+    async def scenario():
+        assert await service.run(once=True) == 0
+        # Allow a second service lifecycle, just as a real subsequent launch.
+        running = WatchService(engine_factory=lambda _config: FakePipelineEngine(FakeRunner))
+        try:
+            await running._start_scheduler()
+            result = await running.add_roots([str(bad), str(another)])
+            assert result["applied"] is True
+            assert running.roots == [str(good), str(another)]
+            assert not await running.reload()  # own cleanup event: no new prompt/restart
+            roots_path.write_text(f"# GUI save\n{bad}\n", encoding="utf-8")
+            assert await running.reload()
+            assert running.roots == [] and running.scheduler is None
+            assert not await running.reload()
+        finally:
+            await running._stop_scheduler()
+            running.log.close()
+        restarted = WatchService(engine_factory=lambda _config: FakePipelineEngine(FakeRunner))
+        assert await restarted.run(once=True) == 0
+
+    _await(scenario())
+    assert starts == [[str(good)], [str(good)], [str(good), str(another)]]
+    assert len(dialogs) == 3
+    assert all(str(bad) in message and "exFAT" in message for _, message in dialogs)
+    assert all(("已从监控列表中移除" if language == "zh" else "removed from the watch list") in message
+               for _, message in dialogs)
+    assert roots_path.read_text(encoding="utf-8") == "# GUI save\n"
+    assert marker.read_text(encoding="utf-8") == "keep"
+
+
+def test_non_ntfs_cleanup_keeps_unavailable_paths_and_root_policies(tmp_path, monkeypatch):
+    """Only this test distinguishes positive non-NTFS evidence from IO failure.
+
+    Existing outage tests bypass configuration cleanup. A few metadata probes
+    protect offline policies, comments and output/scan flags at negligible cost.
+    """
+    import sunpack_native
+
+    good, denied, offline, bad = [tmp_path / name for name in ("good", "denied", "offline", "bad")]
+    for root in (good, denied, offline, bad):
+        root.mkdir()
+    roots_path = tmp_path / "roots.txt"
+    roots_path.write_text(
+        f"# policies\n{good} | out | true | true | true\n{denied}\n{offline}\n{bad / 'missing'}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(service_module, "watch_roots_path", lambda: roots_path)
+    nearest = service_module._nearest_existing_directory
+    monkeypatch.setattr(service_module, "_nearest_existing_directory",
+                        lambda path: None if path == str(offline) else nearest(path))
+
+    def filesystem(path):
+        if path == str(denied):
+            raise PermissionError("not readable")
+        return "FAT32" if path == str(bad) else "NTFS"
+
+    monkeypatch.setattr(sunpack_native, "watch_filesystem_type", filesystem)
+    kept, rejected = service_module._prune_non_ntfs_watch_roots()
+    assert [entry.input_root for entry in kept] == [str(good), str(denied), str(offline)]
+    assert kept[0] == service_module.WatchRootEntry(str(good), str(good / "out"), True, True, True)
+    assert rejected == [(str(bad / "missing"), "FAT32")]
+    assert service_module._read_watch_root_entries() == kept
+    assert roots_path.read_text(encoding="utf-8").startswith("# policies\n")
+
+
 @pytest.mark.parametrize("enabled", [True, False])
 def test_watch_service_attaches_and_releases_toast_with_watch_lifecycle(tmp_path, monkeypatch, enabled):
     config = make_config({
