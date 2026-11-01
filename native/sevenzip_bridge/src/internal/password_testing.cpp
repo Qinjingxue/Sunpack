@@ -360,6 +360,16 @@ namespace sunpack::sevenzip
                 result.archive_type = canonical_archive_type_for_guid(format);
                 result.is_archive = true;
                 auto selection = bounded_password_probe_selection(archive);
+                if (selection.item_count_known && rar4_rejected_empty_encrypted_headers(
+                        archive.Interface(), format, selection.item_count, raw_open_callback->password_requested()))
+                {
+                    result.status = PasswordTestStatus::WrongPassword;
+                    result.encrypted = result.password_required = result.wrong_password = true;
+                    result.operation_result = kOpWrongPassword;
+                    result.message = "RAR4 encrypted headers could not be decoded";
+                    archive->Close();
+                    return result;
+                }
                 last_encryption_evidence = last_encryption_evidence || selection.encrypted;
                 result.encrypted = result.encrypted || last_encryption_evidence;
                 result.password_required = result.password_required || last_encryption_evidence;
