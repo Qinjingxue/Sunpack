@@ -26,7 +26,7 @@ void TagCollection::DoLayout() {
         for(auto& tag:tags_) {
             if(tag.width<0) {
                 auto text=label(tag);
-                tag.width=(ui::g_activeMeasureContext?ui::g_activeMeasureContext->MeasureTextWidth(text,font):float(text.size())*7)+textInset+closeGap+closeWidth+(tag.regex?20:0);
+                tag.width=(ui::g_activeMeasureContext?ui::g_activeMeasureContext->MeasureTextWidth(text,font):float(text.size())*7)+textInset+closeGap+closeWidth;
             }
             float w=std::min(width,std::min(240.0f,std::max(38.0f,tag.width)));
             if(x>0 && x+w>width) { x=0; y+=chipHeight+gap; }
@@ -69,8 +69,7 @@ void TagCollection::OnDraw(ui::Renderer& r) {
         }
         r.FillRoundedRect(box,4,4,bg);
         if(int(index)==hovered_ && hovered_close_) r.FillRoundedRect({box.right-closeWidth,box.top,box.right,box.bottom},4,4,theme::IsDark()?theme::Rgba(255,255,255,0.12f):theme::Rgba(0,0,0,0.08f));
-        if(it->regex) r.DrawText(L".*",{box.left+textInset,box.top,box.left+textInset+18,box.bottom},fg,font);
-        r.DrawText(label(*it),{box.left+textInset+(it->regex?20:0),box.top,box.right-closeWidth-closeGap,box.bottom},fg,font);
+        r.DrawText(label(*it),{box.left+textInset,box.top,box.right-closeWidth-closeGap,box.bottom},fg,font);
         float cx=box.right-closeWidth/2,cy=(box.top+box.bottom)/2;
         r.DrawLine(cx-3,cy-3,cx+3,cy+3,fg,1); r.DrawLine(cx+3,cy-3,cx-3,cy+3,fg,1);
     }

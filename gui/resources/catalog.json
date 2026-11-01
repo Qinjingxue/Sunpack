@@ -805,16 +805,8 @@
       "en": "log entries dropped during write overload"
     },
     "regexMode": {
-      "zh": "正则",
-      "en": "Regex"
-    },
-    "tagEditPlaceholder": {
-      "zh": "修改后按 Enter 保存",
-      "en": "Press Enter to save changes"
-    },
-    "cancelTagEdit": {
-      "zh": "取消编辑",
-      "en": "Cancel edit"
+      "zh": "使用正则表达式",
+      "en": "Use regular expressions"
     }
   },
   "groups": {
