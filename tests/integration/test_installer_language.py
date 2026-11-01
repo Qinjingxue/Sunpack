@@ -60,7 +60,7 @@ def test_upgrade_preserves_user_language(tmp_path, repo_root, stored_language, i
 def test_installer_initializes_language_before_context_menu_registration(repo_root):
     installer = (repo_root / "installer" / "SunPack.iss").read_text(encoding="utf-8")
     build = (repo_root / "scripts" / "build_windows.ps1").read_text(encoding="utf-8")
-    assert "ActiveLanguage()" in installer
+    assert "ActiveLanguage = 'chinesesimplified'" in installer
     assert "InitializeLanguageOnInstall := not FileExists(" in installer
     assert "initialize_config_language.ps1" in build
     assert any("initialize_config_language.ps1\"; DestDir: \"{tmp}" in line and
