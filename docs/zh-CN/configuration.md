@@ -74,7 +74,7 @@ GUI 按 Windows 本地时区编辑时间，保存时转成 UTC。大小单位支
 
 监控目录保存在 `sunpack_watch_roots.txt`，通过 GUI 或 `watch add/remove` 管理；监控启停通过 GUI 或 `watch start/stop` 控制。已移除无效的 `watch.enabled`、`watch.roots`、`watch.max_folders` 和 `performance.worker.priority_aging_quantum`。
 
-监控输入目录仅支持 NTFS。后端启动或重载配置时，会自动从监控列表移除确认位于非 NTFS 文件系统的路径，并按 `cli.language` 弹出经典 Windows 错误窗口，列出路径、文件系统和已移除说明。确认后继续监控其余目录；如果列表已空，服务仍可正常启动并等待添加目录。此操作不会删除目录或文件，暂时离线的路径不会因此被移除。
+监控输入目录仅支持 NTFS。后端启动或重载配置时，会自动从监控列表移除确认位于非 NTFS 文件系统的路径，并按 `cli.language` 弹出经典 Windows 错误窗口，列出路径、文件系统和已移除说明。无需等待弹窗确认即可继续监控其余目录；如果列表已空，服务仍可正常启动并等待添加目录。此操作不会删除目录或文件，暂时离线的路径不会因此被移除。
 
 分析只识别当前层格式。GZIP、BZIP2、XZ、Zstandard、LZ4 先解开外层流，产出的 TAR 再由正常递归流程识别和解压；不提前识别复合格式。原 `tar_*` 分析模块及全部 `max_probe_bytes` 配置已删除。普通 TAR 分析仅从偏移 0 开始，其他位置的 TAR 候选只来自统一的 embedded 扫描器。`watch.state_dir` 留空仍表示默认状态目录；`memory_reserve_bytes` 和 `job_buffer_budget_bytes` 为 0 时仍使用自动值或工作进程默认值。`watch.event_log_retention_days` 控制 CLI 与监控共用的任务历史和事件保留天数。
 
