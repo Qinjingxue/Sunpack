@@ -1691,6 +1691,34 @@ def test_worker_password_batches_preserve_header_and_volume_modes(tmp_path, subt
                 assert result.returncode == 0 and final["matched_index"] == 2, result.stdout + result.stderr
                 marker = next(out.rglob(case.marker_name))
                 assert marker.read_text(encoding="utf-8") == case.marker_text
+                if archive_format == "rar4" and encrypted_headers:
+                    # The RAR4 handler can report S_OK/zero items for a bad
+                    # encrypted-header password; neither path may accept it.
+                    wrong = _invoke_worker(worker, {
+                        "job_id": case_id + "-wrong",
+                        "archive_path": str(case.entry_path),
+                        "format_hint": "rar",
+                        "output_dir": str(tmp_path / (case_id + "-wrong-out")),
+                        "password_candidates": ["also-wrong"],
+                    })
+                    rejected = _worker_result(wrong.stdout)
+                    assert rejected["native_status"] == "wrong_password", wrong.stdout + wrong.stderr
+                    assert not rejected["verified_manifest"]["validated"]
+
+                    existing = tmp_path / (case_id + "-existing-out")
+                    existing.mkdir()
+                    (existing / "user.txt").write_text("preserved", encoding="utf-8")
+                    fallback = _invoke_worker(worker, {
+                        "job_id": case_id + "-fallback",
+                        "archive_path": str(case.entry_path),
+                        "format_hint": "rar",
+                        "output_dir": str(existing),
+                        "password_candidates": ["wrong", "also-wrong", "secret"],
+                    })
+                    confirmed = _worker_result(fallback.stdout)
+                    assert fallback.returncode == 0 and confirmed["matched_index"] == 2, fallback.stdout + fallback.stderr
+                    assert (existing / "user.txt").read_text(encoding="utf-8") == "preserved"
+                    assert next(existing.rglob(case.marker_name)).read_text(encoding="utf-8") == case.marker_text
 
 
 def test_native_qos_ack_can_arrive_after_old_two_second_deadline():
