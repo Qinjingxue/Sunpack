@@ -73,6 +73,7 @@ def test_non_ntfs_roots_are_removed_on_start_and_live_reload(tmp_path, monkeypat
     monkeypatch.setattr(service_module, "load_config", lambda: config)
     monkeypatch.setattr(sunpack_native, "watch_filesystem_type", lambda path: "exFAT" if path == str(bad) else "NTFS")
     starts, dialogs = [], []
+    dialogs_ready = threading.Event()
 
     class Scheduler(_SchedulerLifecycle):
         def __init__(self, _config, roots, **kwargs):
@@ -87,6 +88,8 @@ def test_non_ntfs_roots_are_removed_on_start_and_live_reload(tmp_path, monkeypat
         assert str(bad) not in roots_path.read_text(encoding="utf-8")
         assert threading.current_thread() is not threading.main_thread()
         dialogs.append((title, message))
+        if len(dialogs) == 4:
+            dialogs_ready.set()
 
     monkeypatch.setattr(service_module, "WatchScheduler", Scheduler)
     monkeypatch.setattr(service_module, "show_error", show_error)
@@ -100,7 +103,11 @@ def test_non_ntfs_roots_are_removed_on_start_and_live_reload(tmp_path, monkeypat
             await running._start_scheduler()
             result = await running.add_roots([str(bad), str(another)])
             assert result["applied"] is True
+            assert result["added"] == [str(another)] and result["updated"] == []
             assert running.roots == [str(good), str(another)]
+            rejected = await running.add_roots([str(bad)])
+            assert rejected["added"] == rejected["updated"] == []
+            assert rejected["applied"] is False
             assert not await running.reload()  # own cleanup event: no new prompt/restart
             roots_path.write_text(f"# GUI save\n{bad}\n", encoding="utf-8")
             assert await running.reload()
@@ -114,12 +121,42 @@ def test_non_ntfs_roots_are_removed_on_start_and_live_reload(tmp_path, monkeypat
 
     _await(scenario())
     assert starts == [[str(good)], [str(good)], [str(good), str(another)]]
-    assert len(dialogs) == 3
+    assert dialogs_ready.wait(3)
+    assert len(dialogs) == 4
     assert all(str(bad) in message and "exFAT" in message for _, message in dialogs)
     assert all(("已从监控列表中移除" if language == "zh" else "removed from the watch list") in message
                for _, message in dialogs)
     assert roots_path.read_text(encoding="utf-8") == "# GUI save\n"
     assert marker.read_text(encoding="utf-8") == "keep"
+
+
+def test_non_ntfs_error_dialog_cannot_block_watch_readiness(tmp_path, monkeypatch):
+    import sunpack_native
+
+    bad = tmp_path / "exfat"
+    bad.mkdir()
+    roots_path = tmp_path / "roots.txt"
+    roots_path.write_text(str(bad), encoding="utf-8")
+    monkeypatch.setattr(service_module, "watch_roots_path", lambda: roots_path)
+    monkeypatch.setattr(service_module, "load_config", lambda: make_config({
+        "watch": {"state_dir": str(tmp_path / "state"), "tray_enabled": False},
+    }))
+    monkeypatch.setattr(sunpack_native, "watch_filesystem_type", lambda _path: "exFAT")
+    entered, dismiss = threading.Event(), threading.Event()
+
+    def show_error(_title, _message):
+        entered.set()
+        dismiss.wait(5)
+
+    monkeypatch.setattr(service_module, "show_error", show_error)
+    service = WatchService(engine_factory=lambda _config: FakePipelineEngine(FakeRunner))
+    try:
+        assert _await(asyncio.wait_for(service.run(once=True), timeout=2)) == 0
+        assert entered.wait(2)
+        assert service.roots == []
+        assert service_module.read_watch_roots(path=roots_path) == []
+    finally:
+        dismiss.set()
 
 
 def test_non_ntfs_cleanup_keeps_unavailable_paths_and_root_policies(tmp_path, monkeypatch):
@@ -270,6 +307,9 @@ def test_watch_runtime_delegates_start_to_runtime_host(monkeypatch):
 
 def test_watch_add_reports_start_request_without_creating_watch_process(tmp_path, monkeypatch):
     monkeypatch.setattr(watch_command, "add_watch_roots", lambda paths, output_dir=None, deep_detect=None, recursive=None: (tmp_path / "roots.txt", paths, []))
+    monkeypatch.setattr(watch_command, "list_watch_roots", lambda: (
+        tmp_path / "roots.txt", watch_command._request_paths(["C:/downloads"], SimpleNamespace(cwd=str(tmp_path))),
+    ))
 
     class FakeHost:
         watch_enabled = False
@@ -289,6 +329,31 @@ def test_watch_add_reports_start_request_without_creating_watch_process(tmp_path
     assert code == 0
     assert result.summary["start_requested"] is True
     assert result.summary["start"] == {"started": True, "running": True}
+
+
+def test_watch_add_start_reports_only_effective_roots(tmp_path, monkeypatch):
+    good, bad = str(tmp_path / "good"), str(tmp_path / "bad")
+    roots_path = tmp_path / "roots.txt"
+    monkeypatch.setattr(watch_command, "add_watch_roots",
+                        lambda *_args, **_kwargs: (roots_path, [good, bad], []))
+    monkeypatch.setattr(watch_command, "list_watch_roots", lambda: (roots_path, [good]))
+
+    class FakeHost:
+        watch_enabled = False
+
+        async def start_watch(self):
+            return {"started": True, "running": True}
+
+    from sunpack.runtime.cli import runtime_state
+    monkeypatch.setattr(runtime_state, "require_runtime_host", lambda: FakeHost())
+    code, result = _await(watch_command._handle_add(
+        SimpleNamespace(paths=[good, bad], start=True),
+        SimpleNamespace(cwd=str(tmp_path)),
+    ))
+    assert code == 0
+    assert result.summary["added"] == [good]
+    assert result.summary["updated"] == []
+    assert result.items == [good]
 
 
 def test_running_watch_service_applies_added_roots_once(tmp_path, monkeypatch):
