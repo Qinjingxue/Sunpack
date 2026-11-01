@@ -104,9 +104,11 @@ def test_non_ntfs_roots_are_removed_on_start_and_live_reload(tmp_path, monkeypat
             result = await running.add_roots([str(bad), str(another)])
             assert result["applied"] is True
             assert result["added"] == [str(another)] and result["updated"] == []
+            assert result["rejected"] == [str(bad)]
             assert running.roots == [str(good), str(another)]
             rejected = await running.add_roots([str(bad)])
             assert rejected["added"] == rejected["updated"] == []
+            assert rejected["rejected"] == [str(bad)]
             assert rejected["applied"] is False
             assert not await running.reload()  # own cleanup event: no new prompt/restart
             roots_path.write_text(f"# GUI save\n{bad}\n", encoding="utf-8")
@@ -353,7 +355,118 @@ def test_watch_add_start_reports_only_effective_roots(tmp_path, monkeypatch):
     assert code == 0
     assert result.summary["added"] == [good]
     assert result.summary["updated"] == []
+    assert result.summary["rejected"] == [bad]
     assert result.items == [good]
+
+
+
+def test_watch_add_start_fails_if_every_new_root_is_rejected(tmp_path, monkeypatch):
+    bad = str(tmp_path / "bad")
+    roots_path = tmp_path / "roots.txt"
+    monkeypatch.setattr(watch_command, "add_watch_roots",
+                        lambda paths, **_kwargs: (roots_path, list(paths), []))
+    monkeypatch.setattr(watch_command, "list_watch_roots", lambda: (roots_path, []))
+
+    class FakeHost:
+        watch_enabled = False
+
+        async def start_watch(self):
+            return {"started": True, "running": True}
+
+    from sunpack.runtime.cli import runtime_state
+    monkeypatch.setattr(runtime_state, "require_runtime_host", lambda: FakeHost())
+    code, result = _await(watch_command._handle_add(
+        SimpleNamespace(paths=[bad], start=True),
+        SimpleNamespace(cwd=str(tmp_path), t=lambda key, **_kwargs: key),
+    ))
+    assert code == 1
+    assert result.summary["added"] == result.summary["updated"] == []
+    assert result.summary["rejected"] == [bad]
+    assert result.errors == ["cli.watch.add_all_rejected"]
+
+
+def test_watch_add_without_start_keeps_unverified_roots(tmp_path, monkeypatch):
+    root = str(tmp_path / "new")
+    roots_path = tmp_path / "roots.txt"
+    monkeypatch.setattr(watch_command, "add_watch_roots",
+                        lambda paths, **_kwargs: (roots_path, list(paths), []))
+
+    class FakeHost:
+        watch_enabled = False
+
+    from sunpack.runtime.cli import runtime_state
+    monkeypatch.setattr(runtime_state, "require_runtime_host", lambda: FakeHost())
+    code, result = _await(watch_command._handle_add(
+        SimpleNamespace(paths=[root], start=False),
+        SimpleNamespace(cwd=str(tmp_path)),
+    ))
+    assert code == 0
+    assert result.summary["added"] == [root]
+    assert result.summary["rejected"] == []
+    assert result.errors == []
+
+
+@pytest.mark.parametrize("mode, expected_code", [
+    ("rejected", 1),
+    ("partial", 0),
+    ("duplicate", 0),
+])
+def test_running_watch_add_exit_status_distinguishes_noop_and_rejection(
+    tmp_path, monkeypatch, mode, expected_code,
+):
+    good, bad = str(tmp_path / "good"), str(tmp_path / "bad")
+    retained = [good] if mode == "partial" else []
+    rejected = [bad] if mode != "duplicate" else []
+
+    class FakeHost:
+        watch_enabled = True
+
+        async def add_watch_roots(self, paths, *, output_dir=None, deep_detect=None, recursive=None):
+            return {
+                "roots_path": str(tmp_path / "roots.txt"),
+                "added": retained,
+                "updated": [],
+                "rejected": rejected,
+                "applied": bool(retained),
+            }
+
+        async def start_watch(self):
+            raise AssertionError("Already-running Watch must not restart")
+
+    from sunpack.runtime.cli import runtime_state
+    monkeypatch.setattr(runtime_state, "require_runtime_host", lambda: FakeHost())
+    code, result = _await(watch_command._handle_add(
+        SimpleNamespace(paths=[good, bad], start=True),
+        SimpleNamespace(cwd=str(tmp_path), t=lambda key, **_kwargs: key),
+    ))
+    assert code == expected_code
+    assert result.summary["added"] == retained
+    assert result.summary["rejected"] == rejected
+    assert result.errors == (["cli.watch.add_all_rejected"] if expected_code else [])
+
+
+def test_watch_add_start_duplicate_remains_successful(tmp_path, monkeypatch):
+    root = str(tmp_path / "already-watched")
+    roots_path = tmp_path / "roots.txt"
+    monkeypatch.setattr(watch_command, "add_watch_roots",
+                        lambda *_args, **_kwargs: (roots_path, [], []))
+    monkeypatch.setattr(watch_command, "list_watch_roots", lambda: (roots_path, [root]))
+
+    class FakeHost:
+        watch_enabled = False
+
+        async def start_watch(self):
+            return {"started": True, "running": True}
+
+    from sunpack.runtime.cli import runtime_state
+    monkeypatch.setattr(runtime_state, "require_runtime_host", lambda: FakeHost())
+    code, result = _await(watch_command._handle_add(
+        SimpleNamespace(paths=[root], start=True),
+        SimpleNamespace(cwd=str(tmp_path)),
+    ))
+    assert code == 0
+    assert result.summary["rejected"] == []
+    assert result.errors == []
 
 
 def test_running_watch_service_applies_added_roots_once(tmp_path, monkeypatch):
@@ -385,6 +498,7 @@ def test_running_watch_service_applies_added_roots_once(tmp_path, monkeypatch):
         "roots_path": str(roots_path),
         "added": [normalized_second],
         "updated": [],
+        "rejected": [],
         "applied": True,
     }
     assert roots_path.read_text(encoding="utf-8").splitlines() == [
