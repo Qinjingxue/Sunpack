@@ -1301,7 +1301,9 @@ int run_request(
                 // Only ambiguous failures need the existing read-only probe.
                 result = extract_with_password(password_candidates[index]);
                 const bool direct_ok = result.status == PasswordTestStatus::Ok && result.command_ok;
-                if (!direct_ok && result.encrypted && !result.password_crc_proven &&
+                // ENC authenticates the password during Open; later MAC/CRC failures are data damage.
+                if (!direct_ok && result.encrypted && result.archive_type != L"enc" &&
+                    !result.password_crc_proven &&
                     !(cancel_token && cancel_token->load(std::memory_order_acquire)) &&
                     result.status != PasswordTestStatus::Error && result.failure_kind != "resource_unavailable" &&
                     !(current_native_memory_job() && current_native_memory_job()->revoked.load(std::memory_order_acquire)) &&
