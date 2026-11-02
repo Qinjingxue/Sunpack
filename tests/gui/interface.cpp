@@ -578,7 +578,7 @@ void popup_key(ui::UiWindowImpl* popup,int key) {
         throw std::runtime_error("Date popup lost activation during keyboard operation");
 }
 // One shared-window scenario covers translated search sources that control-edit
-// tests never query: options, hints, values and the two standalone settings.
+// tests never query: options, labels, values and the two standalone settings.
 void localized_config_search(Application& app) {
     auto matches=[&](const std::string& query,const std::string& id) {
         auto text=wide(query); search_config(app,text.c_str());
@@ -604,6 +604,11 @@ void localized_config_search(Application& app) {
         assert(state(app.page(),"showThemeSetting")==true);
         search_config(app,wide(texts["startup"].get<std::string>()).c_str());
         assert(state(app.page(),"showStartupSetting")==true);
+        // Empty editor hints must neither retain rows nor become find targets.
+        for(const auto& hint:{texts["tagInputPlaceholder"].get<std::string>(),std::string("YYYY-MM-DD HH:mm")}) {
+            search_config(app,wide(hint).c_str());
+            assert(state(app.page(),"matchingBlocks").empty());
+        }
         search_config(app,L"max_pending_stage_jobs");
         assert(state(app.page(),"matchingBlocks").empty());
     }
@@ -1083,6 +1088,27 @@ void tag_config(Application& app,const fs::path& dir) {
             return matches;
         };
         auto same=[](const D2D1_RECT_F& a,const D2D1_RECT_F& b){return a.left==b.left && a.top==b.top && a.right==b.right && a.bottom==b.bottom;};
+        // The existing positive find cases cannot catch placeholder fallback.
+        // Change the hint, then use identical text as a real draft: exclusion
+        // follows the text's source, not a list of known strings or its color.
+        auto texts=state(app.page(),"texts"),changedTexts=texts;
+        const std::wstring hint=L"future editor hint 137";
+        changedTexts["tagInputPlaceholder"]=utf8(hint);
+        assert(ui_page_set_json(app.page(),"texts",changedTexts.dump().c_str())==0);
+        search_setting(app,pointer);
+        auto* editor=dynamic_cast<ui::TextInputWidget*>(window->Root()->FindById(inputId));
+        assert(editor && editor->Text().empty() && editor->Placeholder()==hint);
+        search_config(app,hint.c_str()); assert(state(app.page(),"matchingBlocks").empty());
+        assert(!active_find_widget(window->Root()->FindById("configListScroll")));
+        search_setting(app,pointer);
+        click(app,inputId.c_str()); assert(ui_debug_type_text(app.window(),hint.c_str())==0);
+        search_config(app,hint.c_str());
+        auto* found=active_find_widget(window->Root()->FindById("configListScroll"));
+        assert(found && found->id==inputId);
+        click(app,inputId.c_str()); assert(ui_debug_key_mod(app.window(),'A',1,0,0)==0);
+        assert(ui_debug_type_char(app.window(),8)==0);
+        search_config(app,hint.c_str()); assert(state(app.page(),"matchingBlocks").empty());
+        assert(ui_page_set_json(app.page(),"texts",texts.dump().c_str())==0);
         search_config(app,L"RULE-179");
         assert(activeTag().size()==1 && inner() && inner()->ScrollY()>0);
         auto* tags=dynamic_cast<TagCollection*>(window->Root()->FindById("tags-"+pointer)); assert(tags);

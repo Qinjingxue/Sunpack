@@ -80,18 +80,7 @@ export default {
           let rows=this.matchingBlocks;
           rows.forEach((g,i)=>{
             if((g.fields.length>1||g.module)&&!g.primary) add(i,'block-title-'+g.id,g.label);
-            g.fields.forEach(f=>{
-              let d=this.drafts[f.id]||f;
-              add(i,'field-title-'+f.id,f.label);add(i,'field-description-'+f.id,f.description);
-              if(this.isRuleList(f)) {
-                add(i,'tag-input-'+f.id,this.tagInputs[f.id]||this.texts.tagInputPlaceholder);
-                this.tagValues(f).forEach((v,j)=>add(i,'tags-'+f.id,this.entryLabel(v.value),j));
-              } else if(f.editor==='text') add(i,'input-'+f.id,d.text);
-              else if(f.editor==='choice'||f.editor==='recursive') {
-                add(i,'select-'+f.id,f.options[d.choice]?f.options[d.choice].label:'');
-                if(f.editor==='recursive'&&d.choice===2) add(i,'rounds-'+f.id,d.text);
-              } else if(this.isRange(f)) {let r=this.rangeValue(f);add(i,'range-lower-'+f.id,r.lower);add(i,'range-upper-'+f.id,r.upper);}
-            });
+            g.fields.forEach(f=>this.configSearchText(f,(text,id,tag)=>{if(id) add(i,id,text,tag);}));
           });
         }
       }
@@ -105,17 +94,28 @@ export default {
     },
     inlineTaskError(error) { return error.replace(/[\r\n]+/g,' '); },
     matchesConfig(text) { return !this.configQuery.trim()||text.toLowerCase().includes(this.configQuery.trim().toLowerCase()); },
-    configText(f) {
-      let t=this.texts,d=this.drafts[f.id]||f,parts=[f.label,f.description,f.categoryLabel,...f.options.map(o=>o.label)];
-      if(f.editor==='text'||f.editor==='recursive') parts.push(d.text);
-      if(f.editor==='recursive') parts.push(t.rounds);
-      if(f.editor==='readonly') parts.push(t.readOnly);
-      if(this.isRuleList(f)) parts.push(t.tagInputPlaceholder,this.tagValues(f).map(v=>this.entryLabel(v.value)).join(' '));
+    // Filtering and highlighting share labels/options and actual editor values.
+    // Placeholder bindings are presentation only, never value fallbacks here.
+    // Text without a widget ID can filter (e.g. an unselected option).
+    configSearchText(f,add) {
+      let t=this.texts,d=this.drafts[f.id]||f;
+      add(f.label,'field-title-'+f.id);add(f.description,'field-description-'+f.id);add(f.categoryLabel);
+      f.options.forEach((o,i)=>add(o.label,i===d.choice?'select-'+f.id:''));
+      if(this.isRuleList(f)) {
+        add(this.tagInputs[f.id],'tag-input-'+f.id);
+        this.tagValues(f).forEach((v,j)=>add(this.entryLabel(v.value),'tags-'+f.id,j));
+      } else if(f.editor==='text') add(d.text,'input-'+f.id);
+      else if(f.editor==='recursive') {add(d.text,d.choice===2?'rounds-'+f.id:'');add(t.rounds);}
+      else if(f.editor==='readonly') add(t.readOnly);
       if(this.isRange(f)) {
         let r=this.rangeValue(f),date=f.editor==='datetime_range';
-        parts.push(t.rangeEnable,date?t.rangeStart:t.rangeMin,date?t.rangeEnd:t.rangeMax,r.lower,r.upper);
-        if(date) parts.push(t.rangePick,t.rangeChoose,'YYYY-MM-DD HH:mm'); else parts.push('B KiB MiB GiB TiB');
+        add(t.rangeEnable);add(date?t.rangeStart:t.rangeMin);add(date?t.rangeEnd:t.rangeMax);
+        add(r.lower,'range-lower-'+f.id);add(r.upper,'range-upper-'+f.id);
+        if(date) {add(t.rangePick);add(t.rangeChoose);} else add('B KiB MiB GiB TiB');
       }
+    },
+    configText(f) {
+      let parts=[];this.configSearchText(f,text=>{if(text) parts.push(text);});
       return parts.join(' ');
     },
     rememberCellPointer(id,part,event) { this.cellPointer=event.button===0?{id:id,part:part,x:event.offsetX}:null; },
