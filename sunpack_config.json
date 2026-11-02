@@ -209,7 +209,7 @@
       },
       {
         "name": "size_range",
-        "enabled": true,
+        "enabled": false,
         "min_bytes": 1,
         "max_bytes": null
       },
