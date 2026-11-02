@@ -1720,7 +1720,7 @@ void task_history(Application& app,const fs::path& dir) {
     // selection lost at an unloaded page edge. Reuse those 350 history rows.
     assert(ui_page_call_json(app.page(),"searchTasks",R"("task-")")==0);
     auto activeId=[&]{auto* active=active_find_widget(list);return active?active->id:std::string();};
-    pump_diagnostic(app,[&]{auto rows=state(app.page(),"tasks")["rows"];return rows.size()==100 && rows[0]["name"]=="task-349.001" && activeId()=="taskName-"+rows[0]["id"].get<std::string>();},"Task find first page");
+    pump_diagnostic(app,[&]{auto rows=state(app.page(),"tasks")["rows"];return rows.size()==100 && rows[0]["id"]==first_id && activeId()=="taskName-"+rows[0]["id"].get<std::string>();},"Task find first page");
     size_t firstPageMatches=0;
     const auto firstRows=state(app.page(),"tasks")["rows"];
     for(const auto& row:firstRows) firstPageMatches+=1+row["parts"].size();
