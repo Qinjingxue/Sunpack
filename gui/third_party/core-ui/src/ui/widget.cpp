@@ -524,7 +524,10 @@ void Widget::DrawTree(Renderer& r) {
         r.DrawBackdropBlur(rect, bgRadius, backdropBlur);
     }
 
+    const auto* previousHighlights = r.textHighlights;
+    r.textHighlights = &textHighlights;
     OnDraw(r);
+    r.textHighlights = previousHighlights;
     paintedOnce_ = true;   // L45: mount-phase transition gate, 见 widget.h PaintedOnce()
     DrawFocusRing(r);
 

@@ -100,6 +100,32 @@ ui::DisplayList scene(Surface& surface,int step) {
 // replay, including alternating buffers, fractional motion, alpha and lifecycle.
 void rendering_contracts() {
     Surface actual(20),reference(700);
+    // Existing frame-damage scenes have no find ranges. Check shaped UTF-16
+    // ranges, both colors, clipped active hits, and record/replay in one scene.
+    {
+        auto& r=actual.renderer;
+        ui::DisplayList base; base.width_px=640; base.height_px=480;
+        ui::DisplayListRecorder recorder(std::move(base));
+        r.BeginDraw();
+        r.SetDisplayListRecorder(&recorder);
+        std::vector<ui::TextHighlight> ranges{{3,2,true},{6,2,false}};
+        r.textHighlights=&ranges;
+        r.DrawText(L"😀 中匹配 匹配",{20,20,290,65},D2D1::ColorF(0xffffff),20);
+        ranges={{60,4,true}};
+        r.DrawText(std::wstring(60,L'字')+L"匹配文字",{20,80,180,115},D2D1::ColorF(0xffffff),14,
+            DWRITE_TEXT_ALIGNMENT_LEADING,DWRITE_FONT_WEIGHT_NORMAL,DWRITE_PARAGRAPH_ALIGNMENT_CENTER,false,nullptr,true);
+        r.textHighlights=nullptr;
+        r.SetDisplayListRecorder(nullptr);
+        auto list=recorder.Finish();
+        r.skipPresent=true; assert(SUCCEEDED(r.EndDraw()));
+        size_t orange=0,yellow=0;
+        for(auto& command:list.commands) if(command.type==ui::DrawCommandType::FillRoundedRect) {
+            if(std::abs(command.color.r-245.0f/255)<0.001f) ++orange;
+            if(std::abs(command.color.r-247.0f/255)<0.001f) ++yellow;
+        }
+        assert(orange>=2 && yellow>=1);
+        r.BeginDraw(); r.ReplayDisplayList(list); r.skipPresent=true; assert(SUCCEEDED(r.EndDraw()));
+    }
     for(int step=0;step<31;++step) {
         if(step==18) {
             for(auto* surface:{&actual,&reference}) {

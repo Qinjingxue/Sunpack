@@ -1401,6 +1401,68 @@ void Renderer::DrawLine(float x1, float y1, float x2, float y2, const D2D1_COLOR
 void Renderer::DrawText(const std::wstring& text, const D2D1_RECT_F& rect, const D2D1_COLOR_F& color,
                          float fontSize, DWRITE_TEXT_ALIGNMENT align, DWRITE_FONT_WEIGHT weight,
                          DWRITE_PARAGRAPH_ALIGNMENT vAlign, bool wordWrap, const wchar_t* family, bool ellipsisStart) {
+    if(rect.right<=rect.left || rect.bottom<=rect.top) return;
+    if (textHighlights && !textHighlights->empty()) {
+        const auto* ranges = textHighlights;
+        textHighlights = nullptr;
+        struct Restore { const std::vector<TextHighlight>*& slot; const std::vector<TextHighlight>* value; ~Restore() { slot=value; } } restore{textHighlights,ranges};
+        const std::wstring* shown = &text;
+        std::wstring trimmedText;
+        auto area = rect;
+        std::vector<TextHighlight> trimmed;
+        const auto active = std::find_if(ranges->begin(),ranges->end(),[](const auto& h){return h.active;});
+        // Reveal an active hit hidden by either end of an ellipsized label.
+        // This is paint-only: it cannot resize a row or move an editor's caret.
+        if (!wordWrap && active!=ranges->end() && MeasureTextWidth(text,fontSize,family,weight)>rect.right-rect.left) {
+            area.right=area.left+MeasureTextWidth(text,fontSize,family,weight)+2;
+            D2D1_POINT_2F origin{};
+            auto layout=GetTextPaint(text,area,fontSize,family,weight,DWRITE_TEXT_ALIGNMENT_LEADING,vAlign,false,origin);
+            FLOAT x=0,y=0; DWRITE_HIT_TEST_METRICS hit{};
+            if (layout && SUCCEEDED(layout->HitTestTextPosition(active->start,FALSE,&x,&y,&hit))) {
+                float shift=std::clamp(x-(rect.right-rect.left)*0.35f,0.0f,area.right-rect.right);
+                area.left-=shift; area.right-=shift;
+            }
+            align=DWRITE_TEXT_ALIGNMENT_LEADING;
+        } else if (ellipsisStart) {
+            trimmedText=EllipsizeStart(text,rect.right-rect.left,fontSize,family,weight);
+            shown=&trimmedText;
+            if(shown->empty()) return;
+            if (*shown!=text) {
+                const auto removed=text.size()-(shown->size()-1);
+                for (auto h:*ranges) if(h.start>=removed) { h.start=uint32_t(h.start-removed+1); trimmed.push_back(h); }
+                ranges=&trimmed;
+            }
+        }
+        D2D1_POINT_2F origin{};
+        auto layout=GetTextPaint(*shown,area,fontSize,family,weight,align,vAlign,wordWrap,origin);
+        std::vector<std::pair<D2D1_RECT_F,bool>> boxes;
+        if (layout) for (auto h:*ranges) {
+            if(h.start>=shown->size() || !h.length) continue;
+            UINT32 count=0;
+            DWRITE_HIT_TEST_METRICS local[4];
+            auto* metrics=local;
+            auto result=layout->HitTestTextRange(h.start,h.length,origin.x,origin.y,local,4,&count);
+            std::vector<DWRITE_HIT_TEST_METRICS> overflow;
+            if(count>4) {
+                overflow.resize(count); metrics=overflow.data();
+                result=layout->HitTestTextRange(h.start,h.length,origin.x,origin.y,metrics,count,&count);
+            }
+            if(SUCCEEDED(result)) for(UINT32 i=0;i<count;++i) {auto& m=metrics[i]; if(!m.isTrimmed) {
+                    D2D1_RECT_F box{std::max(rect.left,m.left),std::max(rect.top,m.top),std::min(rect.right,m.left+m.width),std::min(rect.bottom,m.top+m.height)};
+                    if(box.right>box.left && box.bottom>box.top) boxes.push_back({box,h.active});
+                }}
+        }
+        PushClip(rect);
+        for(auto& b:boxes) FillRoundedRect(b.first,2,2,D2D1::ColorF(b.second?0xf5a33b:0xf7df68));
+        DrawText(*shown,area,color,fontSize,align,weight,vAlign,wordWrap,family);
+        for(auto& b:boxes) {
+            PushClip(b.first);
+            DrawText(*shown,area,D2D1::ColorF(0x242424),fontSize,align,weight,vAlign,wordWrap,family);
+            PopClip();
+        }
+        PopClip();
+        return;
+    }
     if (ellipsisStart) {
         DrawText(EllipsizeStart(text, rect.right - rect.left, fontSize, family, weight), rect,
                  color, fontSize, align, weight, vAlign, false, family);

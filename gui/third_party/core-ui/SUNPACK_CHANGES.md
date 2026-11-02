@@ -11,6 +11,12 @@ preserved.
 
 Local changes:
 
+- Add paint-only UTF-16 find ranges shared by ordinary text controls and native
+  TAG surfaces. Reuse DirectWrite shaping/layout caches and expand highlights
+  into existing rounded geometry, clips and text commands during recording.
+  Expose virtual row offsets/revisions, an after-layout notification and a
+  scrollbar decoration callback; the application owns find state/navigation.
+
 - Use Rayburst's default warm neutral ramp for light surfaces: #F2ECF1 window,
   #EAE4E8 controls and #FEF7FC cards, with tonal hover/pressed surfaces.
   Standard light controls and popups read the shared palette instead of white

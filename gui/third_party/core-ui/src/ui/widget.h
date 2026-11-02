@@ -19,6 +19,7 @@
 #include <cfloat>
 #include <algorithm>
 #include <unordered_set>
+#include "text_highlight.h"
 
 namespace ui {
 
@@ -340,6 +341,8 @@ public:
     std::function<void(bool)> onValueChanged;
     std::function<void(float)> onFloatChanged;
     std::function<void(const std::wstring&)> onTextChanged;
+    std::vector<TextHighlight> textHighlights;
+    uint64_t textHighlightRevision = 0;
 
     // ---- DSL chaining (all return WidgetPtr for fluid nesting) ----
     WidgetPtr Width(float w)    { fixedW = w; return shared_from_this(); }

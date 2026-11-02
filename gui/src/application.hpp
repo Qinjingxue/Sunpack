@@ -9,6 +9,7 @@
 #include <map>
 
 namespace spg {
+class FindController;
 struct Options {
     fs::path data_dir;
     CliCommand cli;
@@ -53,6 +54,7 @@ class Application {
     std::deque<Json> saves_;
     Json active_save_;
     std::unique_ptr<DatePopup> date_popup_;
+    std::unique_ptr<FindController> find_;
     UINT_PTR date_generation_ = 0;
     void finish_date_popup(UINT_PTR generation);
     bool field_pending(const std::string& id) const;
@@ -65,7 +67,7 @@ class Application {
     void refresh_error_texts();
     static LRESULT CALLBACK subclass(HWND, UINT, WPARAM, LPARAM, UINT_PTR, DWORD_PTR);
 public:
-    explicit Application(Options options) : options_(std::move(options)) {}
+    explicit Application(Options options);
     ~Application();
     void open();
     int run();

@@ -614,12 +614,16 @@ public:
     void SetCount(size_t count);
     void RemapRows(const std::vector<size_t>& previousIndices);
     const std::vector<size_t>& Indices() const { return indices_; }
+    size_t RowCount() const { return heights_.size(); }
+    float RowOffset(size_t index) const { return Sum(std::min(index,heights_.size())); }
+    uint64_t GeometryRevision() const { return geometryRevision_; }
     void RefreshViewport();
     void InvalidateRowLayouts() { rowLayouts_.clear(); }
     void DoLayout() override;
     D2D1_SIZE_F SizeHint() const override;
 private:
     std::vector<float> heights_, sums_;
+    uint64_t geometryRevision_ = 0;
     std::vector<size_t> indices_;
     size_t realizedFirst_ = 0, realizedLast_ = 0;
     float realizedViewportHeight_ = 0;
@@ -636,6 +640,13 @@ private:
 // ---- ScrollView ----
 class UI_API ScrollViewWidget : public Widget {
 public:
+    // Paint-only decorations, after clipped content and independent of thumb hit testing.
+    std::function<void(Renderer&)> onDrawSearchMarkers;
+    float ContentHeight() const { return contentHeight_; }
+    // Use the live thumb's horizontal bounds, including its hover/drag width.
+    D2D1_RECT_F ScrollbarTrackRect() const {
+        auto bounds=ThumbRect(); bounds.top=rect.top; bounds.bottom=rect.bottom; return bounds;
+    }
     void SetContent(WidgetPtr content);
     bool ClearPointerHover() {
         const bool changed=hovered || hoveringBar_;

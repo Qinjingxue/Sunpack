@@ -1351,6 +1351,7 @@ void UiWindowImpl::LayoutRoot() {
     Viewport() = root_->rect;
     ActiveMeasureContextScope measureScope(measureContext_, renderer_);
     root_->DoLayout();
+    if(onAfterLayout) onAfterLayout();
 }
 
 // ---- WndProc ----

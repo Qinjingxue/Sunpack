@@ -15,7 +15,7 @@ export default {
     rootRows:[],rootDrafts:{},rootNew:[],rootCell:'',rootPart:'',rootNext:0,rootQuery:'',cellPointer:null,
     configCategory:'',configQuery:'',drafts:{},rangeUnitDrafts:{},toggleDrafts:{},saving:false,saveErrors:{},pendingFields:[],recordSaving:{passwords:false,roots:false},
     passwordRoot:'',passwordHistory:false,passwordHistoryTarget:false,passwordQuery:'',passwordDrafts:{},passwordNew:[],passwordCell:'',passwordNext:0,
-    tagInputs:{},tagModes:{},tagEdits:{}
+    tagInputs:{},tagModes:{},tagEdits:{},searchSnapshot:null
   }; },
   computed: {
     passwordScope() { return this.passwordHistoryTarget?'@history':this.passwordRoot||'@all'; },
@@ -53,6 +53,56 @@ export default {
     showThemeSetting() { return !this.configCategory&&this.matchesConfig([this.texts.theme,this.texts.system,this.texts.light,this.texts.dark].join(' ')); },
   },
   methods: {
+    // Project display text only; filtering, drafts and task paging stay owned
+    // by their existing models. Native find stores ranges, never row objects.
+    searchSources(scope) {
+      let query=this[scope==='directory'?'directoryQuery':scope==='task'?'taskQuery':scope==='config'?'configQuery':scope==='root'?'rootQuery':'passwordQuery'];
+      let targets=[];
+      const add=(row,id,text,tag=-1)=>{ if(text) targets.push({row:row,id:id,text:String(text),tag:tag}); };
+      if(query && (scope!=='config'||query.trim())) {
+        if(scope==='directory') { let rows=this.shownDirectories; rows.forEach((d,i)=>{add(i,'directory-name-'+d.id,d.name||d.path);add(i,'directory-path-'+d.id,d.path);}); }
+        if(scope==='task') { this.tasks.rows.forEach((t,i)=>{
+          add(i,'taskName-'+t.id,t.name);
+          t.parts.forEach((part,j)=>add(i,'taskPart-'+t.id+'-'+j,part));
+          add(i,'taskRoot-'+t.id,this.texts.taskFolder+t.directory);
+        }); }
+        if(scope==='root') { let rows=this.shownRootRows; rows.forEach((r,i)=>{let d=this.rootDraft(r);
+          add(i,'root-input-'+(this.rootCell===r.id&&this.rootPart==='input'?'input-':'value-')+r.id,d.input);
+          add(i,'root-output-'+(this.rootCell===r.id&&this.rootPart==='output'?'input-':'value-')+r.id,d.output);
+        }); }
+        if(scope==='password') { let rows=this.shownPasswords; rows.forEach((p,i)=>{
+          add(i,(this.passwordHistory?'history-value-':this.passwordCell===p.id?'password-input-':'password-value-')+p.id,this.passwordHistory?p.value:this.passwordText(p));
+        }); }
+        if(scope==='config') {
+          query=query.trim();
+          if(this.showStartupSetting) {add(-1,'startup-title',this.texts.startup);add(-1,'startupToggle',this.startup.enabled?this.texts.startupOff:this.texts.startupOn);}
+          if(this.showThemeSetting) {add(-1,'theme-title',this.texts.theme);add(-1,'themeSelector',[this.texts.system,this.texts.light,this.texts.dark][this.themeChoice]);}
+          let rows=this.matchingBlocks;
+          rows.forEach((g,i)=>{
+            if((g.fields.length>1||g.module)&&!g.primary) add(i,'block-title-'+g.id,g.label);
+            g.fields.forEach(f=>{
+              let d=this.drafts[f.id]||f;
+              add(i,'field-title-'+f.id,f.label);add(i,'field-description-'+f.id,f.description);
+              if(this.isRuleList(f)) {
+                add(i,'tag-input-'+f.id,this.tagInputs[f.id]||this.texts.tagInputPlaceholder);
+                this.tagValues(f).forEach((v,j)=>add(i,'tags-'+f.id,this.entryLabel(v.value),j));
+              } else if(f.editor==='text') add(i,'input-'+f.id,d.text);
+              else if(f.editor==='choice'||f.editor==='recursive') {
+                add(i,'select-'+f.id,f.options[d.choice]?f.options[d.choice].label:'');
+                if(f.editor==='recursive'&&d.choice===2) add(i,'rounds-'+f.id,d.text);
+              } else if(this.isRange(f)) {let r=this.rangeValue(f);add(i,'range-lower-'+f.id,r.lower);add(i,'range-upper-'+f.id,r.upper);}
+            });
+          });
+        }
+      }
+      this.searchSnapshot={query:query,targets:targets,before:scope==='task'&&this.taskCursors.length>0,after:scope==='task'&&this.tasks.hasMore};
+    },
+    searchTaskPage(direction) {
+      if(this.taskPending) return;
+      let range={first:0,last:0};
+      if(direction>0&&this.tasks.hasMore) this.requestTaskPage('append',this.tasks.next,{first:this.tasks.rows.length,last:this.tasks.rows.length+100});
+      else if(direction<0&&this.taskCursors.length) this.requestTaskPage('prepend',this.taskCursors[this.taskCursors.length-1],range);
+    },
     inlineTaskError(error) { return error.replace(/[\r\n]+/g,' '); },
     matchesConfig(text) { return !this.configQuery.trim()||text.toLowerCase().includes(this.configQuery.trim().toLowerCase()); },
     configText(f) {
@@ -72,7 +122,7 @@ export default {
     cellPointerX(id,part) { let p=this.cellPointer; this.cellPointer=null; return p&&p.id===id&&p.part===part?p.x:null; },
     send(op,payload) {
       if(op==='cli') { if(this.busy) return; this.busy=true; this.actionError=''; }
-      let requests=op==='filterTasks'||op==='filterPasswords'?this.requests.filter(r=>r.op!==op):this.requests;
+      let requests=op==='filterTasks'||op==='filterPasswords'||op==='refreshSearch'?this.requests.filter(r=>r.op!==op):this.requests;
       this.requests=requests.concat([{op:op,payload:payload||{}}]); this.dispatch=true;
     },
     go(tab) { this.send('navigate',{tab:tab}); },
@@ -248,6 +298,7 @@ export default {
     },
     changeRoot(r,part,value) {
       let d=Object.assign({},this.ensureRootDraft(r),{[part]:value,error:''});
+      if(this.rootQuery) this.send('refreshSearch');
       if(!/[\r\n]/.test(value)) {
         this.putRootDraft(d); return;
       }
@@ -449,6 +500,7 @@ export default {
       let next=Object.assign({},this.drafts);
       if(d.text===d.baselineText&&this.pendingFields.indexOf(f.id)<0) delete next[f.id]; else next[f.id]=d;
       this.drafts=next; this.setSaveError(f.id,'');
+      if(this.configQuery) this.send('refreshSearch');
     },
     passwordDraft(p) { return this.passwordDrafts[p.id]||p; },
     passwordText(p) { return this.passwordDraft(p).value.replace(/[\r\n]/g,' '); },
@@ -480,6 +532,7 @@ export default {
     },
     changePassword(p,value) {
       let d=Object.assign({},this.ensurePasswordDraft(p),{value:value,batch:/[\r\n]/.test(value),error:''}); this.putPasswordDraft(d);
+      if(this.passwordQuery) this.send('refreshSearch');
       // A paste is one text-change event. Preserve spaces/#, skip blank lines,
       // and send one atomic batch through the existing password writer.
       if(/[\r\n]/.test(value)) this.finishPasswordCell();
@@ -580,7 +633,7 @@ export default {
     isRuleList(f) { return f.editor==='rule_list'; },
     tagField(f) { return this.fields.find(current=>current.id===f.id)||f; },
     tagValues(f) { f=this.tagField(f); return this.drafts[f.id]?JSON.parse(this.drafts[f.id].text):f.items; },
-    changeTagInput(f,value) { this.tagInputs=Object.assign({},this.tagInputs,{[f.id]:value}); },
+    changeTagInput(f,value) { this.tagInputs=Object.assign({},this.tagInputs,{[f.id]:value}); if(this.configQuery) this.send('refreshSearch'); },
     saveTags(f,values) {
       f=this.tagField(f); this.changeField(f,JSON.stringify(values));
       this.send('syncTags',{id:f.id}); this.commitField(f);
@@ -840,7 +893,7 @@ export default {
         </div>
         <ScrollView id="directoryListScroll"><VirtualList id="directoryItems" class="directory-list" estimated-height="60px">
           <button v-for="d in shownDirectories" :key="d.id" :id="'directory-'+d.id" class="context-item directory-item" :class="directorySelection===d.path?'on':''" @click="selectDirectory(d.path)">
-            <div class="column fill"><label :ellipsis-start="true" class="directory-name">{{ d.name||d.path }}</label><label :ellipsis-start="true" class="muted directory-path">{{ d.path }}</label></div>
+            <div class="column fill"><label :id="'directory-name-'+d.id" :ellipsis-start="true" class="directory-name">{{ d.name||d.path }}</label><label :id="'directory-path-'+d.id" :ellipsis-start="true" class="muted directory-path">{{ d.path }}</label></div>
           </button>
         </VirtualList></ScrollView>
       </div>
@@ -874,19 +927,19 @@ export default {
         <input id="configSearch" type="search" class="search-field" :placeholder="texts.settingSearch" :value="configQuery" @input="searchConfig"/>
         <ScrollView id="configListScroll"><div id="configBlocks" class="column">
           <div id="startupSetting" v-show="showStartupSetting" class="card settings-row">
-            <div class="setting-copy"><label class="setting-title">{{ texts.startup }}</label></div>
+            <div class="setting-copy"><label id="startup-title" class="setting-title">{{ texts.startup }}</label></div>
             <button id="startupToggle" :enabled="cliAllowed" @click="send('cli',{action:startup.enabled?'startupDisable':'startupEnable'})">{{ startup.enabled?texts.startupOff:texts.startupOn }}</button>
           </div>
-          <div id="themeSetting" v-show="showThemeSetting" class="card settings-row"><div class="setting-copy"><label class="setting-title">{{ texts.theme }}</label></div><div id="themeHost" class="selector-host"/></div>
+          <div id="themeSetting" v-show="showThemeSetting" class="card settings-row"><div class="setting-copy"><label id="theme-title" class="setting-title">{{ texts.theme }}</label></div><div id="themeHost" class="selector-host"/></div>
           <VirtualList id="configItems" class="column" estimated-height="140px"><div v-for="g in matchingBlocks" :key="g.key" :id="'block-'+g.id" :class="'setting-card '+appearance">
-            <label v-show="(g.fields.length>1||g.module) &amp;&amp; !g.primary" class="block-heading">{{ g.label }}</label>
+            <label :id="'block-title-'+g.id" v-show="(g.fields.length>1||g.module) &amp;&amp; !g.primary" class="block-heading">{{ g.label }}</label>
             <!-- This Core UI version binds inner loops through a conditional
                  scope. Groups are always nonempty; visibility uses v-show. -->
             <div v-if="true" class="block-fields">
             <div v-for="f in g.fields" :key="f.key" :id="'field-'+f.id" class="setting-item">
             <div v-show="f.id!==g.fields[0].id" class="setting-divider"/>
             <div class="settings-row" :class="isRuleList(f)?'tag-setting':''">
-              <div class="setting-copy"><label :class="f.primary?'subheading':'setting-title'">{{ f.label }}</label><label v-show="f.description" class="setting-description">{{ f.description }}</label><input v-show="isRuleList(f)" :id="'tag-input-'+f.id" :value="tagInputs[f.id]||''" :placeholder="tagEdits[f.id]?'':texts.tagInputPlaceholder" @input="v=>changeTagInput(f,v)" @submit="addTag(f)"/><div v-if="f.editor==='rule_list'" class="row"><input type="checkbox" class="tag-regex-check" :id="'tag-regex-'+f.id" :checked="!!tagModes[f.id]" @change="v=>changeTagMode(f,v)"/><label @click="changeTagMode(f,!tagModes[f.id])">{{ texts.regexMode }}</label></div></div>
+              <div class="setting-copy"><label :id="'field-title-'+f.id" :class="f.primary?'subheading':'setting-title'">{{ f.label }}</label><label :id="'field-description-'+f.id" v-show="f.description" class="setting-description">{{ f.description }}</label><input v-show="isRuleList(f)" :id="'tag-input-'+f.id" :value="tagInputs[f.id]||''" :placeholder="tagEdits[f.id]?'':texts.tagInputPlaceholder" @input="v=>changeTagInput(f,v)" @submit="addTag(f)"/><div v-if="f.editor==='rule_list'" class="row"><input type="checkbox" class="tag-regex-check" :id="'tag-regex-'+f.id" :checked="!!tagModes[f.id]" @change="v=>changeTagMode(f,v)"/><label @click="changeTagMode(f,!tagModes[f.id])">{{ texts.regexMode }}</label></div></div>
               <ScrollView v-if="isRuleList(f)" :id="'tag-scroll-'+f.id" class="tag-region"><div :id="'tags-host-'+f.id"/></ScrollView>
               <div v-show="!isRange(f) &amp;&amp; !isRuleList(f)" class="setting-control" :class="f.editor==='choice'||f.editor==='recursive'?'choice-control':f.editor==='text'?(f.type==='number'?'number-control':'wide-control'):''">
                 <div v-show="f.editor==='toggle'" :id="'toggle-host-'+f.id" class="toggle-host"/>
@@ -953,7 +1006,7 @@ export default {
       </div>
       <div id="page-passwords" v-show="tab==='passwords'" class="content">
         <div class="page-header"><label class="heading">{{ texts.passwords }}</label></div>
-        <div class="password-toolbar"><input id="passwordSearch" type="search" class="search-field management-search" :placeholder="texts.passwordSearch" :value="passwordQuery" @input="searchPasswords"/><div class="password-tabs"><button id="newPassword" @click="addPassword()">{{ texts.addPasswords }}</button><button id="savedPasswords" :class="!passwordHistoryTarget?'on':''" @click="selectPasswordView(false)">{{ texts.savedPasswords }}</button><button id="clipboardHistory" :class="passwordHistoryTarget?'on':''" @click="selectPasswordView(true)">{{ texts.history }}</button></div></div>
+        <div class="password-toolbar"><input id="passwordSearch" type="search" class="management-search search-field" :placeholder="texts.passwordSearch" :value="passwordQuery" @input="searchPasswords"/><div class="password-tabs"><button id="newPassword" @click="addPassword()">{{ texts.addPasswords }}</button><button id="savedPasswords" :class="!passwordHistoryTarget?'on':''" @click="selectPasswordView(false)">{{ texts.savedPasswords }}</button><button id="clipboardHistory" :class="passwordHistoryTarget?'on':''" @click="selectPasswordView(true)">{{ texts.history }}</button></div></div>
         <div class="password-table">
         <ScrollView id="passwordListScroll"><div id="passwordBody" class="column">
           <div v-show="shownPasswords.length>0">

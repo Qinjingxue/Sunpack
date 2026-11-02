@@ -6,6 +6,7 @@
 
 namespace spg {
 using Json = nlohmann::ordered_json;
+std::wstring fold_search(const std::string& text);
 Json parse_json(const std::string& text);
 Json read_json(const fs::path& path);
 void validate_passwords(const Json& document);

@@ -70,6 +70,7 @@ public:
     std::function<bool()> onCloseRequest;
     std::function<void(int, int)> onResize;
     std::function<void(int, int)> onPageResize;
+    std::function<void()> onAfterLayout;
     std::function<void(const std::wstring&)> onDrop;
     std::function<void(int)> onKey;
     std::function<void(float, float)> onRightClick;

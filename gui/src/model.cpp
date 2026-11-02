@@ -11,17 +11,18 @@
 #include <cmath>
 
 namespace spg {
+// Shared by filtering and paint-only find ranges. Non-expanding Windows case
+// mapping preserves UTF-16 offsets for filenames and editable values.
+std::wstring fold_search(const std::string& text) {
+    auto w=wide(text);
+    if(!w.empty()) CharLowerBuffW(w.data(),DWORD(w.size()));
+    return w;
+}
 namespace {
 std::string trim(std::string s) {
     auto start = s.find_first_not_of(" \t\r\n");
     if (start == std::string::npos) return {};
     return s.substr(start, s.find_last_not_of(" \t\r\n") - start + 1);
-}
-// Search uses the same non-expanding Windows casing as path identity.
-std::wstring fold_search(const std::string& text) {
-    auto w=wide(text);
-    if(!w.empty()) CharLowerBuffW(w.data(),DWORD(w.size()));
-    return w;
 }
 bool contains_folded(const std::string& text, const std::wstring& folded_query) {
     return folded_query.empty() || fold_search(text).find(folded_query)!=std::wstring::npos;

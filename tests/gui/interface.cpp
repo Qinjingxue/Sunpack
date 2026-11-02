@@ -3,6 +3,7 @@
 #include "presentation.hpp"
 #include "range_editor.hpp"
 #include "motion.hpp"
+#include "tag_collection.hpp"
 #include "ui_defaults_json.h"
 #include <cassert>
 #include <iostream>
@@ -1023,6 +1024,34 @@ void range_config(Application& app,const fs::path& dir) {
     layout(tid,true);
     screenshot(app,L"range-time-small.png");
 }
+ui::Widget* active_find_widget(ui::Widget* root) {
+    if(!root || !root->visible) return nullptr;
+    ui::Widget* active=nullptr;
+    for(const auto& range:root->textHighlights) if(range.active) { assert(!active); active=root; }
+    for(const auto& child:root->Children()) if(auto* found=active_find_widget(child.get())) { assert(!active); active=found; }
+    return active;
+}
+void find_controls(Application& app,const fs::path& dir) {
+    // The nested TAG case cannot catch missing wiring in the other four
+    // search boxes. Reuse the startup fixture; inspect actual painted targets.
+    auto* window=ui::GetContext().GetWindow(app.window());
+    auto check=[&](const char* method,const std::string& query,const char* scrollId) {
+        auto encoded=Json(query).dump(); assert(ui_page_call_json(app.page(),method,encoded.c_str())==0);
+        pump_diagnostic(app,[&]{
+            ui_window_relayout(app.window());
+            return active_find_widget(window->Root()->FindById(scrollId))!=nullptr;
+        },"Find control projection");
+        assert(ui_page_call_json(app.page(),method,R"("")")==0);
+        pump([&]{return state(app.page(),"requests").empty()&&!state(app.page(),"dispatch").get<bool>();});
+    };
+    check("searchDirectory",utf8(dir.filename().wstring()),"directoryListScroll");
+    check("searchTasks","carrier","taskListScroll");
+    click(app,"tabRoots"); pump([&]{return state(app.page(),"tab")=="roots";});
+    check("searchRoots",utf8(dir.filename().wstring()),"rootListScroll");
+    click(app,"tabPasswords"); pump([&]{return state(app.page(),"tab")=="passwords";});
+    check("searchPasswords","#中文","passwordListScroll");
+    click(app,"tabTasks"); pump([&]{return state(app.page(),"tab")=="tasks";});
+}
 // Enter/delete are explicit writes; blur, scrolling and snapshot refreshes
 // must preserve unsubmitted text. This shares the existing configuration fixture.
 void tag_config(Application& app,const fs::path& dir) {
@@ -1035,6 +1064,60 @@ void tag_config(Application& app,const fs::path& dir) {
     auto current=[&]{for(auto& f:state(app.page(),"fields")) if(f["id"]==pointer) return f;return Json();};
     config[Json::json_pointer(pointer)]=values; atomic_write(dir/"sunpack_config.json",config.dump());
     pump_diagnostic(app,[&]{return current().value("items",Json())==values;},"TAG fixture reload");
+    // Existing edit tests never reveal a find hit in a nested scroller. This
+    // one scenario covers offscreen TAGs, wrapping, keyboard navigation and
+    // read-only find behavior using the existing fixture/window.
+    {
+        auto* window=ui::GetContext().GetWindow(app.window());
+        auto inner=[&]{return dynamic_cast<ui::ScrollViewWidget*>(window->Root()->FindById("tag-scroll-"+pointer));};
+        ui::Renderer paint; assert(paint.Init()); // Record without a render target or another window.
+        auto record=[&](const std::function<void(ui::Renderer&)>& draw) {
+            ui::DisplayListRecorder recorder; paint.SetDisplayListRecorder(&recorder);
+            draw(paint); paint.SetDisplayListRecorder(nullptr); return recorder.Finish().commands;
+        };
+        auto activeTag=[&] {
+            auto* tags=dynamic_cast<TagCollection*>(window->Root()->FindById("tags-"+pointer));
+            std::vector<D2D1_RECT_F> matches;
+            if(tags) for(const auto& command:record([&](ui::Renderer& r){tags->OnDraw(r);}))
+                if(command.type==ui::DrawCommandType::FillRoundedRect && command.color.r==245.0f/255 && command.color.g==163.0f/255) matches.push_back(command.rect);
+            return matches;
+        };
+        auto same=[](const D2D1_RECT_F& a,const D2D1_RECT_F& b){return a.left==b.left && a.top==b.top && a.right==b.right && a.bottom==b.bottom;};
+        search_config(app,L"RULE-179");
+        assert(activeTag().size()==1 && inner() && inner()->ScrollY()>0);
+        auto* tags=dynamic_cast<TagCollection*>(window->Root()->FindById("tags-"+pointer)); assert(tags);
+        auto box=tags->TagBounds(184);
+        assert(box.top>=inner()->rect.top-1 && box.bottom<=inner()->rect.bottom+1);
+        search_config(app,L"duplicate"); assert(activeTag().size()==1);
+        const auto first=activeTag().front();
+        auto key=[&](int vk){SendMessageW(window->Handle(),WM_KEYDOWN,vk,0);ui_window_relayout(app.window());};
+        key(VK_DOWN); assert(activeTag().size()==1 && !same(activeTag().front(),first));
+        key(VK_DOWN); assert(activeTag().size()==1 && same(activeTag().front(),first));
+        key(VK_UP); assert(activeTag().size()==1 && !same(activeTag().front(),first));
+        assert(window->FocusedWidget()->id=="configSearch");
+        search_config(app,L"rule-");
+        key(VK_UP); assert(activeTag().size()==1 && inner()->ScrollY()>0);
+        ui_window_set_size(app.window(),850,560); ui_window_relayout(app.window());
+        key(VK_RETURN); assert(activeTag().size()==1);
+        // Compare markers with the actual painted thumb, including hover width;
+        // these checks catch an offset gutter in either nested or outer scroll.
+        for(auto* scroll:{inner(),dynamic_cast<ui::ScrollViewWidget*>(window->Root()->FindById("configListScroll"))}) {
+            assert(scroll && scroll->NeedsScrollbar() && scroll->onDrawSearchMarkers);
+            for(bool hover:{false,true}) {
+                scroll->ClearPointerHover();
+                if(hover) scroll->OnMouseMove({scroll->rect.right-3,scroll->rect.top+5,0});
+                auto thumb=record([&](ui::Renderer& r){scroll->OnDraw(r);}).back().rect;
+                auto markers=record(scroll->onDrawSearchMarkers); assert(!markers.empty());
+                for(const auto& marker:markers) assert(marker.rect.left==thumb.left && marker.rect.right==thumb.right);
+            }
+            scroll->ClearPointerHover();
+        }
+        screenshot(app,L"search-tags.png");
+        search_config(app,L"no-such-search-token"); assert(activeTag().empty());
+        search_config(app,L""); assert(activeTag().empty());
+        assert(disk()==values && state(app.page(),"searchSnapshot").is_null());
+        ui_window_set_size(app.window(),1120,720);
+    }
     search_setting(app,pointer);
     auto* window=ui::GetContext().GetWindow(app.window());
     assert(!window->Root()->FindById("listManager") && !window->Root()->FindById("list-"+pointer));
@@ -1601,6 +1684,21 @@ void task_history(Application& app,const fs::path& dir) {
     assert(ui_page_call_json(app.page(),"searchTasks",R"("task-0")")==0);
     pump_diagnostic(app,[&]{auto tasks=state(app.page(),"tasks");return tasks["rows"].size()==1&&tasks["rows"][0]["name"]=="task-0.001";},"Search full task history");
     assert(state(app.page(),"taskCursors").empty() && state(app.page(),"taskPages").size()==1 && scroll->ScrollY()==0);
+    // Ordinary scrolling exercises paging above, but cannot catch a find
+    // selection lost at an unloaded page edge. Reuse those 350 history rows.
+    assert(ui_page_call_json(app.page(),"searchTasks",R"("task-")")==0);
+    auto activeId=[&]{auto* active=active_find_widget(list);return active?active->id:std::string();};
+    pump_diagnostic(app,[&]{auto rows=state(app.page(),"tasks")["rows"];return rows.size()==100 && rows[0]["name"]=="task-349.001" && activeId()=="taskName-"+rows[0]["id"].get<std::string>();},"Task find first page");
+    size_t firstPageMatches=0;
+    const auto firstRows=state(app.page(),"tasks")["rows"];
+    for(const auto& row:firstRows) firstPageMatches+=1+row["parts"].size();
+    const auto last=firstRows.back();
+    click(app,"taskSearch");
+    for(size_t i=0;i<firstPageMatches;++i) SendMessageW(window->Handle(),WM_KEYDOWN,VK_DOWN,0);
+    pump_diagnostic(app,[&]{auto rows=state(app.page(),"tasks")["rows"];return rows.size()>100 && activeId()=="taskName-"+rows[100]["id"].get<std::string>();},"Task find crosses unloaded page");
+    assert(state(app.page(),"tasks")["rows"].size()<=200 && list->Children().size()<40);
+    SendMessageW(window->Handle(),WM_KEYDOWN,VK_UP,0);
+    assert(activeId()==(last["parts"].empty()?"taskName-"+last["id"].get<std::string>():"taskPart-"+last["id"].get<std::string>()+"-"+std::to_string(last["parts"].size()-1)));
     assert(ui_page_call_json(app.page(),"searchTasks",R"("")")==0);
     pump_diagnostic(app,[&]{return state(app.page(),"tasks")["rows"].size()==100;},"Reset task history search");
     window->ScrollWithMeasureContext(scroll,1e9f);
@@ -1678,6 +1776,7 @@ int wmain(int argc,wchar_t** argv) {
             pump_diagnostic(app,[&]{return state(app.page(),"ready")==true;},"Initial snapshot");
             assert(IsWindowVisible(static_cast<HWND>(ui_window_hwnd(app.window()))));
             assert(state(app.page(),"errors").empty() && state(app.page(),"actionError")=="");
+            if(acceptance) find_controls(app,dir);
             if(historyOnly) { task_history(app,dir); } else {
             if(!rangesOnly) {
                 // Valid projection tests miss the error-to-CLI bridge. Reuse

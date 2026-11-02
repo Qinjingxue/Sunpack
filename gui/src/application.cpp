@@ -3,6 +3,7 @@
 #include "presentation.hpp"
 #include "range_editor.hpp"
 #include "tag_collection.hpp"
+#include "find_controller.hpp"
 #include "main_uix.h"
 #include <commctrl.h>
 #include <dwmapi.h>
@@ -106,6 +107,7 @@ Options parse_options(const std::vector<std::wstring>& args) {
     result.cli.cwd=result.data_dir;
     return result;
 }
+Application::Application(Options options):options_(std::move(options)) {}
 void Application::changed(unsigned flags) {
     { std::lock_guard<std::mutex> lock(mutex_); if(stopping_) return; dirty_|=flags; }
     cv_.notify_one();
@@ -434,6 +436,8 @@ void Application::apply_pending() {
         ui_window_set_title(window_,wide(tr("title",language)).c_str());
         rebuild_theme(language);
     }
+    if(find_ && (patch.contains("fields") || patch.contains("language") || !task_snapshot.is_null() ||
+        !directory_snapshot.is_null() || !password_snapshot.is_null() || !password_delta_patch.is_null() || !ack.is_null())) find_->Refresh();
 }
 void Application::reveal() {
     if(shown_) return;
@@ -613,15 +617,20 @@ void Application::dispatch() {
     auto commands=page_value(page_,"requests");
     ui_page_set_json(page_,"requests","[]");
     ui_page_set_bool(page_,"dispatch",false);
+    bool refresh=false;
     if(commands.is_array()) for(auto& command:commands) {
+        const auto op=command.value("op",std::string());
+        refresh=refresh || (op!="taskWindow" && op!="taskPage" && op!="copyTaskText" && op!="openPath" && op!="openTask");
         try { handle_command(std::move(command)); }
         catch(const std::exception& e) { set_error("actionError",e.what()); }
     }
+    if(find_ && refresh) find_->Refresh();
 }
 void Application::handle_command(Json command) {
     if(!command.is_object()) return;
     auto op=command.value("op",std::string());
     auto p=command.value("payload",Json::object());
+    if(op=="refreshSearch") return;
     if(op=="navigate") { navigate(p.value("tab",std::string())); return; }
     if(op=="copyTaskText") {
         const bool copied=copy_text(hwnd_,wide(p.at("text").get_ref<const std::string&>()));
@@ -827,6 +836,7 @@ void Application::update_icons(UINT dpi) {
 LRESULT CALLBACK Application::subclass(HWND hwnd,UINT message,WPARAM wparam,LPARAM lparam,UINT_PTR,DWORD_PTR data) {
     auto* self=reinterpret_cast<Application*>(data);
     try {
+        if(message==WM_KEYDOWN && self->find_ && self->find_->Key(int(wparam))) return 0;
         if(message==WM_DPICHANGED) self->update_icons(LOWORD(wparam));
         if(message==WM_WINDOWPOSCHANGED || message==WM_DPICHANGED)
             ui::OverlayService::Instance().RefreshOwner(hwnd);
@@ -910,6 +920,7 @@ void Application::open() {
             schedule_task_range();
         };
     }
+    find_=std::make_unique<FindController>(page_,window_);
     if(!service_refresh_.value) win_error("opServiceRefresh");
     ui_page_on_widget_mount(page_,"dispatch",[](UiPage,UiWidget,void* context){
         auto* self=static_cast<Application*>(context); PostMessageW(self->hwnd_,Dispatch,0,0);
@@ -962,6 +973,7 @@ void Application::open() {
 }
 int Application::run() { open(); return ui_run(); }
 Application::~Application() {
+    find_.reset();
     date_popup_.reset();
     { std::lock_guard<std::mutex> lock(mutex_); stopping_=true; }
     SetEvent(stop_); cv_.notify_all();

@@ -20,6 +20,7 @@
 #include "theme.h"
 #include "display_list.h"
 #include "render_handles.h"
+#include "text_highlight.h"
 
 using Microsoft::WRL::ComPtr;
 
@@ -125,6 +126,7 @@ public:
     void DrawRect(const D2D1_RECT_F& rect, const D2D1_COLOR_F& color, float width = 1.0f);
     void DrawRoundedRect(const D2D1_RECT_F& rect, float rx, float ry, const D2D1_COLOR_F& color, float width = 1.0f);
     void DrawLine(float x1, float y1, float x2, float y2, const D2D1_COLOR_F& color, float width = 1.0f);
+    const std::vector<TextHighlight>* textHighlights = nullptr;
     void DrawText(const std::wstring& text, const D2D1_RECT_F& rect, const D2D1_COLOR_F& color,
                   float fontSize, DWRITE_TEXT_ALIGNMENT align = DWRITE_TEXT_ALIGNMENT_LEADING,
                   DWRITE_FONT_WEIGHT weight = DWRITE_FONT_WEIGHT_NORMAL,

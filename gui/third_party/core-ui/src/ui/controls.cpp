@@ -1083,6 +1083,13 @@ void TextInputWidget::OnDraw(Renderer& r) {
 
     D2D1_COLOR_F caret = css.hasCaretColor ? css.caretColor : accent;
 
+    if (!focused && !textHighlights.empty() && !text_.empty()) {
+        r.DrawText(text_, textArea, fg, fontSize, DWRITE_TEXT_ALIGNMENT_LEADING,
+                   DWRITE_FONT_WEIGHT_NORMAL, DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
+                   false, nullptr, ellipsisStart);
+        r.PopClip();
+        return;
+    }
     if (!focused && ellipsisStart && !text_.empty()) {
         r.DrawText(text_, textArea, fg, fontSize, DWRITE_TEXT_ALIGNMENT_LEADING,
                    DWRITE_FONT_WEIGHT_NORMAL, DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
@@ -2487,12 +2494,14 @@ size_t VirtualListWidget::RowAt(float y) const {
 }
 
 void VirtualListWidget::MeasureRow(size_t index, float height) {
+    ++geometryRevision_;
     float delta = height - heights_[index];
     heights_[index] = height;
     for (size_t i = index + 1; i < sums_.size(); i += i & -i) sums_[i] += delta;
 }
 
 void VirtualListWidget::RebuildSums() {
+    ++geometryRevision_;
     sums_.assign(heights_.size() + 1, 0);
     // Linear construction; no per-item widgets, closures, or event hooks.
     for (size_t i = 1; i < sums_.size(); ++i) {
@@ -2811,6 +2820,7 @@ void ScrollViewWidget::DrawTree(Renderer& r) {
     if (content_) content_->DrawTree(r);
     r.PopCull();
     r.PopClip();
+    if (NeedsScrollbar() && onDrawSearchMarkers) onDrawSearchMarkers(r);
     // Skip Widget::DrawTree's default children iteration (content is already drawn)
 }
 
