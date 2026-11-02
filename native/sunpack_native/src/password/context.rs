@@ -164,16 +164,14 @@ pub(crate) fn verify_prepared(
                     .map(|member| (&member.generation.path, &member.generation))
                     .collect();
                 retain(&mut entries, |old, _| {
-                    let membership_changed = old.format == key.format
-                        && old.mode == key.mode
-                        && old.members.len() != key.members.len()
-                        && old.members.first() == key.members.first();
-                    !membership_changed
-                        && !old.members.iter().any(|left| {
-                            generations
-                                .get(&left.generation.path)
-                                .is_some_and(|right| left.generation != **right)
-                        })
+                    // Concurrent discovery snapshots may contain different
+                    // volume sets. Their exact keys keep facts independent;
+                    // only a changed physical generation invalidates a borrower.
+                    !old.members.iter().any(|left| {
+                        generations
+                            .get(&left.generation.path)
+                            .is_some_and(|right| left.generation != **right)
+                    })
                 });
                 (key.clone(), Arc::new(PreparedSlot::default()))
             };
@@ -298,4 +296,84 @@ fn retain(
         }
         keep
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    #[test]
+    fn concurrent_volume_snapshots_preserve_independent_password_facts() {
+        // Arrival tests hit this overlap only by chance; cancellation tests use
+        // one identical key. Block one initializer while a larger snapshot
+        // completes, then check both cached verdicts without KDF/payload work.
+        Python::initialize();
+        let root = std::env::temp_dir().join(format!(
+            "sunpack_password_snapshots_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let readers: Vec<_> = (1..=4)
+            .map(|number| {
+                let path = root.join(format!("part{number}.bin"));
+                std::fs::write(&path, b"unchanged physical generation").unwrap();
+                ManagedReader::open(path).unwrap()
+            })
+            .collect();
+        let members: Vec<_> = readers
+            .iter()
+            .enumerate()
+            .map(|(index, reader)| InputMember::new(reader, 0, None, index as u32 + 1).unwrap())
+            .collect();
+        let partial = InputKey::new("rar", "volumes", members[..2].to_vec());
+        let complete = InputKey::new("rar", "volumes", members);
+        let owner_key = partial.clone();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let owner = std::thread::spawn(move || {
+            Python::attach(|py| {
+                verify_prepared(py, owner_key, &[], move || {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Err(PreparedStatus::new("missing_volume", "partial snapshot"))
+                })
+                .and_then(|value| value.bind(py).get_item("status")?.extract::<String>())
+            })
+        });
+        entered_rx.recv().unwrap();
+        let newer = Python::attach(|py| {
+            verify_prepared(py, complete.clone(), &[], || {
+                Err(PreparedStatus::new("not_required", "complete snapshot"))
+            })
+            .and_then(|value| value.bind(py).get_item("status")?.extract::<String>())
+        });
+        release_tx.send(()).unwrap();
+        let older = owner.join().unwrap();
+        let reused = Python::attach(|py| {
+            [partial, complete].map(|key| {
+                verify_prepared(py, key, &[], || {
+                    Err(PreparedStatus::new(
+                        "damaged",
+                        "unexpected reinitialization",
+                    ))
+                })
+                .and_then(|value| value.bind(py).get_item("status")?.extract::<String>())
+            })
+        });
+        release_under_roots(std::slice::from_ref(&root));
+        drop(readers);
+        std::fs::remove_dir_all(root).unwrap();
+
+        assert_eq!(older.unwrap(), "missing_volume");
+        assert_eq!(newer.unwrap(), "not_required");
+        assert_eq!(
+            reused.map(Result::unwrap),
+            ["missing_volume", "not_required"]
+        );
+    }
 }
