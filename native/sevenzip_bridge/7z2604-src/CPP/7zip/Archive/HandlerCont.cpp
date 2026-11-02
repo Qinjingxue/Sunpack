@@ -33,7 +33,7 @@ Z7_COM7F_IMF(CHandlerCont::Extract(const UInt32 *indices, UInt32 numItems,
   UInt32 i;
   for (i = 0; i < numItems; i++)
   {
-    UInt64 pos, size;
+    UInt64 pos = 0, size = 0;
     GetItem_ExtractInfo(allFilesMode ? i : indices[i], pos, size);
     totalSize += size;
   }
@@ -63,7 +63,7 @@ Z7_COM7F_IMF(CHandlerCont::Extract(const UInt32 *indices, UInt32 numItems,
     
     RINOK(extractCallback->GetStream(index, &outStream, askMode))
 
-    UInt64 pos, size;
+    UInt64 pos = 0, size = 0;
     int opRes = GetItem_ExtractInfo(index, pos, size);
     totalSize += size;
     if (!testMode && !outStream)

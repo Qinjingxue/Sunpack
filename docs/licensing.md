@@ -13,14 +13,14 @@ The root MIT License does **not** relicense third-party source code vendored in
 this repository. Third-party files remain under the licenses identified by
 their upstream projects and by [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md).
 
-## Vendored 7-Zip 26.04 source
+## Vendored 7-Zip 26.05 source
 
-The vendored tree is a trimmed, locally modified subset. The 26.04 runtime
-fixes were imported selectively; see
-[the synchronization record](zh-CN/sevenzip_26_04_sync_review.md) for the scope
-and preserved SunPack modifications.
+The vendored tree is a trimmed, locally modified subset. Runtime updates are
+imported selectively; see the [26.05 synchronization record](zh-CN/sevenzip_26_05_sync_review.md)
+and [26.04 synchronization record](zh-CN/sevenzip_26_04_sync_review.md) for the
+scope and preserved SunPack modifications.
 
-The repository vendors 7-Zip 26.04 source code at:
+The repository keeps its 7-Zip 26.05 runtime subset at the historical path:
 
 `native/sevenzip_bridge/7z2604-src/`
 
