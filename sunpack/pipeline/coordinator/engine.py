@@ -100,7 +100,7 @@ class PipelineEngine:
         self._runtime = self._services
         self._active_requests: dict[str, asyncio.Task] = {}
         self._request_runtime_factory = _RequestRuntime
-        self._path_leases = _PathLeaseRegistry()
+        self._path_leases = _PathLeaseRegistry(self._active_requests)
         self._recent_passwords: list[str] = []
         self._user_passwords = tuple(config.get("user_passwords", []) or [])
         self._password_snapshot = config.get("password_snapshot")
@@ -227,8 +227,8 @@ class PipelineEngine:
                 try:
                     response = await runtime.execute_async(self._broker, cancellation)
                 except _CoalescedWatchRequest as coalesced:
-                    owner_task = self._active_requests.get(coalesced.owner_request_id)
-                    if owner_task is None or owner_task is task:
+                    owner_task = coalesced.owner_task
+                    if owner_task is task:
                         raise
                     try:
                         owner_response = await cancellation.wait(asyncio.shield(owner_task))
@@ -343,9 +343,12 @@ class PipelineEngine:
 
 
 class _CoalescedWatchRequest(RuntimeError):
-    def __init__(self, owner_request_id: str):
+    """Transfer a live result reference across asynchronous runtime teardown."""
+
+    def __init__(self, owner_request_id: str, owner_task: asyncio.Task[PipelineResponse]):
         super().__init__(owner_request_id)
         self.owner_request_id = owner_request_id
+        self.owner_task = owner_task
 
 
 @dataclass(frozen=True, slots=True)
@@ -413,7 +416,10 @@ def _lease_ownership_version(
 class _PathLeaseRegistry:
     _COMPLETED_WATCH_LIMIT = 4096
 
-    def __init__(self):
+    def __init__(self, active_requests: dict[str, asyncio.Task]):
+        # Share the engine's existing registry; never retain a second history
+        # of requests or completed results here.
+        self._active_requests = active_requests
         self._owned: dict[str, set[str]] = {}
         self._lease_paths: dict[str, dict[str, _LeasePath]] = {}
         self._exact_owners: dict[str, str] = {}
@@ -560,7 +566,7 @@ class _PathLeaseRegistry:
         coalesce_exact: bool = False,
         deep_detect: bool = False,
         cancellation: CancellationToken | None = None,
-    ) -> str | None:
+    ) -> _CoalescedWatchRequest | None:
         """Atomically claim a fully resolved physical input set.
 
         Discovery is intentionally allowed to run without a lease. If a later
@@ -570,8 +576,9 @@ class _PathLeaseRegistry:
 
         Watch may submit two members of the same split family concurrently.
         Once discovery proves that both requests resolve to the exact same
-        physical ownership, the later request can coalesce with the active one
-        instead of waiting and extracting the same logical archive twice.
+        physical ownership, transfer its Task while the lease still proves
+        that owner is active. The follower may finish arbitrary asynchronous
+        teardown before consuming the result, after the owner has unregistered.
         """
         paths = tuple(paths)
         prepared = self._snapshot_paths(paths, refresh=coalesce_exact)
@@ -590,7 +597,7 @@ class _PathLeaseRegistry:
                 if coalesce_exact:
                     exact_owner = self._generation_owners.get((ownership_version, deep_detect), "")
                     if exact_owner and exact_owner != owner:
-                        return exact_owner
+                        return _CoalescedWatchRequest(exact_owner, self._active_requests[exact_owner])
 
                 blockers = self._blocking_owners(owner, prepared)
                 if not blockers:
@@ -1394,15 +1401,15 @@ class _RequestRuntime:
                 for task in tasks
                 for path in (task.all_parts or [task.main_path])
             ]
-            coalesced_owner = await self.path_leases.replace(
+            coalesced = await self.path_leases.replace(
                 self.submission.request_id,
                 member_paths,
                 coalesce_exact=True,
                 deep_detect=self.submission.detection_options.force_scan,
                 cancellation=cancellation,
             )
-            if coalesced_owner:
-                raise _CoalescedWatchRequest(coalesced_owner)
+            if coalesced:
+                raise coalesced
 
         # This registration is deliberately only a source-cleanup lifetime
         # guard. It never gates planning, extraction, verification or recursion.

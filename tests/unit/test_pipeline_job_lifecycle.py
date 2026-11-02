@@ -124,7 +124,7 @@ def test_watch_claim_publishes_each_confirmed_task_and_updated_volume_members(tm
         runtime.reporter = NS(tasks_discovered=lambda *a, **k: None)
         runtime.job_executor = NS(password_scope_context=NS(annotate=lambda tasks: None))
         runtime._consumer_budget = broker.max_pending_jobs
-        runtime.path_leases = _PathLeaseRegistry()
+        runtime.path_leases = _PathLeaseRegistry({})
         claims = []
         runtime._report_progress = lambda task, event: claims.append(event)
 

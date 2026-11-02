@@ -358,7 +358,7 @@ def test_late_failure_cannot_overwrite_unchanged_success_but_new_failure_can(
         completed_output = output / "archive"
         completed_output.mkdir()
         engine = object.__new__(PipelineEngine)
-        engine._path_leases = _PathLeaseRegistry()
+        engine._path_leases = _PathLeaseRegistry({})
         watcher.pipeline_engine.completed_watch_family_output = engine.completed_watch_family_output
         failure = FailureInfo(FailureKind.MISSING_VOLUME, "relations", "missing volume")
         failed_response = _response(TargetRunResult(str(second), OutcomeKind.FAILURE, failure=failure))

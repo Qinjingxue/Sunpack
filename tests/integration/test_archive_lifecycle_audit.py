@@ -170,7 +170,7 @@ def test_aliases_share_leases_deduplicate_inputs_and_reserve_absent_outputs(tmp_
         check=True, capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
 
     async def scenario():
-        registry = _PathLeaseRegistry()
+        registry = _PathLeaseRegistry({})
         await registry.acquire("first", [first])
         waiting = asyncio.create_task(registry.acquire("alias", [alias / first.name]))
         await asyncio.sleep(0)

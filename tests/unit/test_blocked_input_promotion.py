@@ -117,7 +117,7 @@ def test_coordinator_rewrites_recorded_result_and_cleanup_input(tmp_path, collis
         runtime.submission = submission
         runtime._shell_updates = SimpleNamespace(add=lambda paths: None)
         from sunpack.pipeline.coordinator.engine import _PathLeaseRegistry
-        runtime.path_leases = _PathLeaseRegistry()
+        runtime.path_leases = _PathLeaseRegistry({})
         # An active sibling request owns the colliding destination. Waiting
         # for it would deadlock if its own nested input needs our parent.
         parent = str(top / "pinned-parent.zip")
@@ -204,7 +204,7 @@ def test_stop_while_waiting_to_publish_group_keeps_sources_and_parent_pin(tmp_pa
         for path in parts:
             path.write_text(path.name)
         task = SimpleNamespace(cleanup_parts=list(map(str, parts)), key="inner", main_path=str(parts[0]))
-        registry = _PathLeaseRegistry()
+        registry = _PathLeaseRegistry({})
         parent = str(destination / "outer.zip")
         await registry.acquire("request", [parent], lease_id="parent")
         await registry.acquire("other", [str(destination / parts[-1].name)])

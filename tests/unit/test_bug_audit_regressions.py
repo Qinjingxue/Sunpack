@@ -174,7 +174,7 @@ def test_bug_regression_engine_idle_cleanup_includes_output_allocator(
             return action()
 
     engine = PipelineEngine.__new__(PipelineEngine)
-    engine._path_leases = _PathLeaseRegistry()
+    engine._path_leases = _PathLeaseRegistry({})
     engine._services = SimpleNamespace(output_reservations=registry)
     engine._broker = Broker()
     engine.is_idle = lambda: True

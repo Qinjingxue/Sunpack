@@ -34,7 +34,7 @@ def test_retry_checks_completed_final_family_after_acquiring_lease(tmp_path):
             path.write_text("part")
         output = tmp_path / "output"
         output.mkdir()
-        registry = _PathLeaseRegistry()
+        registry = _PathLeaseRegistry({})
         registry.remember_completed_watch(registry.input_version_for(map(str, parts)), str(output))
         runtime = object.__new__(_RequestRuntime)
         runtime.path_leases = registry
@@ -59,7 +59,7 @@ def test_retry_checks_completed_final_family_after_acquiring_lease(tmp_path):
 
 
 def test_consumed_family_generation_rejects_changed_surviving_member(tmp_path):
-    registry = _PathLeaseRegistry()
+    registry = _PathLeaseRegistry({})
     first, second = tmp_path / "a.001", tmp_path / "a.002"
     first.write_text("first")
     second.write_text("second")
@@ -72,7 +72,7 @@ def test_consumed_family_generation_rejects_changed_surviving_member(tmp_path):
 
 
 def test_late_completed_generation_lookup_preserves_newer_record(tmp_path):
-    registry = _PathLeaseRegistry()
+    registry = _PathLeaseRegistry({})
     path = tmp_path / "a.001"
     path.write_text("generation A")
     first = registry.input_version_for([str(path)])
