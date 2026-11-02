@@ -164,19 +164,6 @@ function Get-RustTarget {
     throw "Unsupported build architecture: $BuildArch"
 }
 
-function Resolve-Uri {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$BaseUri,
-        [Parameter(Mandatory = $true)]
-        [string]$Reference
-    )
-
-    $base = [System.Uri]$BaseUri
-    $resolved = [System.Uri]::new($base, $Reference)
-    return $resolved.AbsoluteUri
-}
-
 function Invoke-FileDownload {
     param(
         [Parameter(Mandatory = $true)]
@@ -205,25 +192,25 @@ function Invoke-FileDownload {
 function Get-7ZipWindowsDownloadInfo {
     param([string]$BuildArch = "x64")
 
-    $downloadPageUri = "https://www.7-zip.org/download.html"
+    $releaseApiUri = "https://api.github.com/repos/ip7z/7zip/releases/latest"
     $client = New-Object System.Net.WebClient
     try {
         $client.Headers["User-Agent"] = "SunPack dev bootstrap"
-        $html = $client.DownloadString($downloadPageUri)
+        $client.Headers["Accept"] = "application/vnd.github+json"
+        $release = $client.DownloadString($releaseApiUri) | ConvertFrom-Json
     } finally {
         $client.Dispose()
     }
 
     $sevenZipArch = if ($BuildArch -eq "arm64") { "arm64" } else { "x64" }
-    $installerPattern = 'href="([^"]*7z\d+-' + [regex]::Escape($sevenZipArch) + '\.exe)"'
-    $installerMatch = [regex]::Match($html, $installerPattern, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
-    if (-not $installerMatch.Success) {
-        throw "Could not locate the latest 7-Zip $sevenZipArch installer link on $downloadPageUri"
+    $installerPattern = '^7z\d+-' + [regex]::Escape($sevenZipArch) + '\.exe$'
+    $installer = $release.assets | Where-Object { $_.name -match $installerPattern } | Select-Object -First 1
+    if (-not $installer) {
+        throw "Could not locate a 7-Zip $sevenZipArch installer in GitHub release $($release.tag_name) from $releaseApiUri"
     }
 
     return @{
-        DownloadPageUri = $downloadPageUri
-        InstallerUri = Resolve-Uri -BaseUri $downloadPageUri -Reference $installerMatch.Groups[1].Value
+        InstallerUri = $installer.browser_download_url
     }
 }
 
