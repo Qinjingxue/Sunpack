@@ -6,8 +6,8 @@
 //! to scoped scan workers, and immediately reissues the next sequential read with a
 //! separate pooled buffer.
 
-use super::ScanBatch;
 use super::cancellation::Cancellation;
+use super::ScanBatch;
 use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::io;

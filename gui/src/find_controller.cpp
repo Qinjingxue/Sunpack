@@ -38,7 +38,40 @@ FindController::~FindController() {
     for(auto& hook:hooks_) if(auto list=hook.list.lock()) list->onRangeChanged=std::move(hook.previous);
     for(auto& s:searches_) if(auto* scroll=dynamic_cast<ui::ScrollViewWidget*>(root()->FindById(s.scroll))) scroll->onDrawSearchMarkers={};
 }
-void FindController::Refresh() { for(auto& s:searches_) if(visible(s)) refresh(s); }
+void FindController::Refresh(const char* scope) {
+    for(auto& s:searches_) {
+        if(!visible(s)) clear_matches(s);
+        else if(!scope || std::string_view(scope)==s.scope) refresh(s);
+    }
+}
+void FindController::clear_matches(Search& s) {
+    s.matchIndex.clear(); s.matches.clear(); s.matchBytes=0; s.matchIndex.rehash(0);
+}
+std::vector<ui::TextHighlight> FindController::match(Search& s,const std::string& text) {
+    auto found=s.matchIndex.find(text);
+    if(found!=s.matchIndex.end()) {
+        s.matches.splice(s.matches.begin(),s.matches,found->second);
+        return found->second->ranges;
+    }
+    auto folded=fold_search(text);
+    std::vector<ui::TextHighlight> ranges;
+    size_t at=0;
+    while((at=folded.find(s.query,at))!=std::wstring::npos) {
+        ranges.push_back({uint32_t(at),uint32_t(s.query.size()),false}); at+=s.query.size();
+    }
+    constexpr size_t budget=256*1024;
+    // Include list/hash node and bucket overhead in the acceleration budget.
+    const size_t bytes=sizeof(Match)+text.size()+1+ranges.size()*sizeof(ui::TextHighlight)+96;
+    if(bytes<=budget) {
+        while(s.matchBytes+bytes>budget) {
+            auto& old=s.matches.back(); s.matchBytes-=old.bytes;
+            s.matchIndex.erase(old.text); s.matches.pop_back();
+        }
+        s.matches.push_front({text,ranges,bytes}); s.matchBytes+=bytes;
+        s.matchIndex.emplace(s.matches.front().text,s.matches.begin());
+    }
+    return ranges;
+}
 void FindController::refresh(Search& s) {
     std::string oldId; int oldTag=-1; uint32_t oldStart=0;
     if(!s.hits.empty()) { auto h=s.hits[s.current]; auto& t=s.targets[h.target]; oldId=t.id; oldTag=t.tag; oldStart=t.ranges[h.range].start; }
@@ -48,6 +81,7 @@ void FindController::refresh(Search& s) {
     ui_page_set_json(page_,"searchSnapshot","null"); // Never retain a duplicate of the reactive rows.
     auto query=fold_search(snapshot.at("query").get_ref<const std::string&>());
     bool changed=s.query!=query;
+    if(changed || query.empty()) clear_matches(s);
     if(changed) s.pending=0;
     s.before=snapshot.value("before",false); s.after=snapshot.value("after",false);
     s.query=std::move(query); s.targets.clear(); s.hits.clear(); s.byId.clear(); s.rows.clear(); s.ticks.clear();
@@ -57,13 +91,11 @@ void FindController::refresh(Search& s) {
         decltype(s.rows)().swap(s.rows); decltype(s.ticks)().swap(s.ticks); s.byId.rehash(0);
     }
     if(!s.query.empty()) for(auto& source:snapshot.at("targets")) {
-        auto text=fold_search(source.at("text").get_ref<const std::string&>());
         Target target{source.at("id").get<std::string>(),source.at("row").get<int>(),source.at("tag").get<int>()};
-        size_t at=0;
-        while((at=text.find(s.query,at))!=std::wstring::npos) {
-            if(!changed && target.id==oldId && target.tag==oldTag && at==oldStart) s.current=s.hits.size();
-            target.ranges.push_back({uint32_t(at),uint32_t(s.query.size()),false});
-            s.hits.push_back({s.targets.size(),target.ranges.size()-1}); at+=s.query.size();
+        target.ranges=match(s,source.at("text").get_ref<const std::string&>());
+        for(size_t i=0;i<target.ranges.size();++i) {
+            if(!changed && target.id==oldId && target.tag==oldTag && target.ranges[i].start==oldStart) s.current=s.hits.size();
+            s.hits.push_back({s.targets.size(),i});
         }
         if(!target.ranges.empty()) { s.byId[target.id].push_back(s.targets.size()); s.targets.push_back(std::move(target)); }
     }

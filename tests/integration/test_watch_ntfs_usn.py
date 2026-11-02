@@ -80,6 +80,68 @@ def test_same_size_same_mtime_in_place_overwrite_changes_usn(tmp_path):
     assert after.change_usn != before.change_usn
 
 
+def test_catalog_recovery_reuses_ids_without_losing_renamed_or_replaced_subtrees(tmp_path):
+    """Existing USN tests query fresh identities, so cannot catch stale cached IDs.
+
+    One small tree covers contiguous replay, replacement, root replacement and
+    a rejected interval; without it those cache invalidations are untested.
+    Comparing refreshed inventories gives independent coverage with few IOs.
+    """
+    from sunpack.core.contracts.discovery_scope import DiscoveryScope
+    from sunpack.pipeline.discovery.filesystem.directory_scanner import DirectoryScanner
+    from sunpack.runtime.watch.state import WatchStateStore
+
+    root = tmp_path / "input"
+    for name in ("stable/nested/seed.001", "branch/nested/seed.002"):
+        target = root / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"opaque")
+    scope = DiscoveryScope(str(root), recursive=True)
+    options = DirectoryScanner.compile_scan_options(make_config({"filesystem": {"scan_filters_enabled": False}}))
+    state = WatchStateStore(str(tmp_path / "state"))
+    catalog = sunpack_native.NativeWatchCatalog(state._native)
+    try:
+        assert not options.catalog_update(catalog, scope.native)
+        volume, journal, start = sunpack_native.watch_volume_cursor(str(root))
+
+        def recover(*, rewind=False):
+            nonlocal start
+            _, _, end = sunpack_native.watch_volume_cursor(str(root))
+            if rewind:
+                with pytest.raises(OSError):
+                    catalog.recover_changes([scope.native], volume, journal ^ 1, start, end)
+            paths = catalog.recover_changes([scope.native], volume, journal, start, end)
+            covered = []
+            for path in sorted(map(Path, paths), key=lambda path: len(str(path))):
+                if not any(path == parent or parent in path.parents for parent in covered):
+                    errors, _ = options.catalog_refresh(catalog, scope.native, str(path))
+                    assert not errors
+                    covered.append(path)
+            candidates = options.catalog_candidates(catalog, scope.native)
+            assert {Path(row["path"]) for row in candidates} == {p for p in root.rglob("*") if p.is_file()}
+            start = end
+
+        for i in range(2):
+            (root / f"stable/nested/arrival{i}.disguised").write_bytes(b"new")
+            recover()
+        (root / "branch").rename(root / "renamed")
+        (root / "branch/nested").mkdir(parents=True)
+        (root / "branch/nested/replacement.003").write_bytes(b"new")
+        recover()
+        (root / "branch/nested/after-replacement.004").write_bytes(b"new")
+        recover(rewind=True)
+        root.rename(tmp_path / "departed")
+        (root / "stable/nested").mkdir(parents=True)
+        (root / "stable/nested/new-root.001").write_bytes(b"new")
+        recover()
+        catalog.commit(True)
+        (root / "stable/nested/after-idle.002").write_bytes(b"new")
+        recover()
+    finally:
+        catalog.close()
+        state.close()
+
+
 def test_duplicate_noise_does_not_restart_generation_but_overwrite_does(tmp_path):
     archive = tmp_path / "sample.zip"
     archive.write_bytes(b"A" * 256 * 1024)

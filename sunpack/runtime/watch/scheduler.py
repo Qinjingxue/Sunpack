@@ -598,9 +598,12 @@ class WatchScheduler:
                 plan["error"] = str(exc)
         for (volume, journal), group in volumes.items():
             try:
-                group["paths"] = sorted(watch_catalog_changes(
-                    self._catalog, group["scopes"], volume, journal, group["start"], group["end"],
-                ), key=len)
+                if group["start"] < group["end"]:
+                    # Normalize once per volume, rather than once per watched
+                    # root. An empty interval needs no directory identities/IO.
+                    group["paths"] = [(path, path_key(path)) for path in sorted(watch_catalog_changes(
+                        self._catalog, group["scopes"], volume, journal, group["start"], group["end"],
+                    ), key=len)]
             except Exception as exc:
                 group["error"] = str(exc)
             group["scopes"].clear()
@@ -616,14 +619,13 @@ class WatchScheduler:
                     raise OSError(group["error"])
                 cursor = (cursor[0], cursor[1], group["end"])
                 covered = set()
-                for path in group["paths"]:
-                    key = path_key(path)
+                for path, key in group["paths"]:
+                    if not scope.contains(path) or self.should_ignore_event_path(path):
+                        continue
                     ancestor = key
                     while ancestor and ancestor not in covered:
                         ancestor = ancestor.rpartition("\\")[0]
                     if ancestor:
-                        continue
-                    if not scope.contains(path) or self.should_ignore_event_path(path):
                         continue
                     errors, arrivals = options.catalog_refresh(self._catalog, scope.native, path)
                     changed_paths.update((path_key(arrival), arrival) for arrival in arrivals)
@@ -648,7 +650,8 @@ class WatchScheduler:
                     cursor = None
             if cursor is not None:
                 volume, journal, end = cursor
-                self._catalog.set_cursor(scope.native, volume, journal, end)
+                if cached != cursor:
+                    self._catalog.set_cursor(scope.native, volume, journal, end)
                 previous = cursor_updates.get(volume)
                 if previous is None or end < previous["next_usn"]:
                     cursor_updates[volume] = {"journal_id": journal, "next_usn": end}

@@ -436,8 +436,18 @@ void Application::apply_pending() {
         ui_window_set_title(window_,wide(tr("title",language)).c_str());
         rebuild_theme(language);
     }
-    if(find_ && (patch.contains("fields") || patch.contains("language") || !task_snapshot.is_null() ||
-        !directory_snapshot.is_null() || !password_snapshot.is_null() || !password_delta_patch.is_null() || !ack.is_null())) find_->Refresh();
+    if(find_) {
+        if(patch.contains("fields") || patch.contains("language") || patch.contains("texts") ||
+            !directory_snapshot.is_null() || !ack.is_null()) find_->Refresh();
+        else {
+            // Frequent task publications must not rematch the retained directory
+            // pane or a configuration/password page with unchanged sources.
+            if(!task_snapshot.is_null()) find_->Refresh("task");
+            if(patch.contains("rootRows")) find_->Refresh("root");
+            if(!password_snapshot.is_null() || !password_delta_patch.is_null()) find_->Refresh("password");
+            if(patch.contains("startup") || patch.contains("themeChoice")) find_->Refresh("config");
+        }
+    }
 }
 void Application::reveal() {
     if(shown_) return;

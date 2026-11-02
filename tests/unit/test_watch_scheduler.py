@@ -406,6 +406,46 @@ def test_watch_scheduler_prunes_missing_state_before_start(tmp_path, monkeypatch
         watcher._close_blocking()
 
 
+def test_usn_empty_checkpoint_retains_pending_before_resuming_recovery(tmp_path, monkeypatch):
+    """The recovery/scan tests do not checkpoint an unchanged journal boundary.
+
+    This catches an empty-interval fast path dropping durable pending owners or
+    skipping the next nonempty interval; one source and two boundaries cover it.
+    """
+    root = tmp_path / "input"
+    root.mkdir()
+    source = root / "source.disguised"
+    source.write_bytes(b"opaque")
+    watcher = _watcher(tmp_path, roots=[root])
+    scope = watcher.scopes[scheduler_module.path_key(str(root))]
+    end = 100
+    calls = []
+    monkeypatch.setattr(scheduler_module, "watch_volume_cursor", lambda path: ("volume", 1, end))
+
+    def changes(catalog, scopes, volume, journal, start, stop):
+        calls.append((start, stop))
+        return [str(source)]
+
+    monkeypatch.setattr(scheduler_module, "watch_catalog_changes", changes)
+    try:
+        assert not watcher._scan_options.catalog_update(watcher._catalog, scope.native)
+        watcher._catalog.set_cursor(scope.native, "volume", 1, end)
+        watcher.state.merge_watch_cursors({"volume": {"journal_id": 1, "next_usn": end}}, durable=True)
+        watcher.enqueue(str(source))
+        watcher._started = True
+        watcher._recover_usn_gap()
+        assert calls == []
+        assert watcher.state.pending_work_for_path(str(source)).durable_owner
+        end = 200
+        watcher._recover_usn_gap()
+        assert calls == [(100, 200)]
+        assert watcher.state.watch_cursor("volume") == {"journal_id": 1, "next_usn": end}
+        assert watcher._catalog.cursor(scope.native) == ("volume", 1, end)
+    finally:
+        watcher._started = False
+        watcher._close_blocking()
+
+
 def test_scoped_catalog_updates_preserve_output_identity_and_sibling_inputs(tmp_path):
     # Admission tests do not inspect subtree catalog replacement/deletion. One
     # small lifecycle catches overbroad prefix exclusion and stale identities.

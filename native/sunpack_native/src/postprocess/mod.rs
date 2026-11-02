@@ -768,7 +768,10 @@ mod tests {
         .unwrap();
         // Both a permanent failure and a concurrent collision must roll back
         // earlier members. Only a fully restored collision may replan.
-        for kind in [io::ErrorKind::PermissionDenied, io::ErrorKind::AlreadyExists] {
+        for kind in [
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::AlreadyExists,
+        ] {
             let result = promote_input_files_with_move(
                 &moves,
                 &destination,

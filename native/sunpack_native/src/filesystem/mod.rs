@@ -214,19 +214,92 @@ pub(crate) fn watch_directories_changes_impl(
     start_usn: i64,
     end_usn: i64,
 ) -> std::io::Result<Vec<String>> {
+    watch_directories_changes_cached_impl(
+        directories,
+        &[],
+        volume,
+        journal,
+        start_usn,
+        end_usn,
+        &mut DirectoryRecoveryCache::default(),
+    )
+}
+
+/// Identities are valid only across contiguous, successfully read intervals.
+/// Changed subtrees are evicted before the next query; roots are always checked.
+#[derive(Default)]
+pub(crate) struct DirectoryRecoveryCache {
+    journal: u64,
+    next_usn: i64,
+    ids: std::collections::BTreeMap<String, [u8; 16]>,
+    pub(crate) roots: std::collections::HashMap<String, [u8; 16]>,
+}
+
+pub(crate) fn watch_directories_changes_cached_impl(
+    directories: Vec<String>,
+    roots: &[String],
+    volume: &str,
+    journal: u64,
+    start_usn: i64,
+    end_usn: i64,
+    cache: &mut DirectoryRecoveryCache,
+) -> std::io::Result<Vec<String>> {
     #[cfg(windows)]
     {
+        if start_usn == end_usn {
+            return Ok(Vec::new());
+        }
+        let mut previous = std::mem::take(&mut cache.ids);
+        let previous_roots = std::mem::take(&mut cache.roots);
+        if cache.journal != journal || cache.next_usn != start_usn {
+            previous.clear();
+        }
+        let identity = |directory: &str| {
+            let (actual, id, _) = windows::watch_path_identity(Path::new(directory))?;
+            if !actual.eq_ignore_ascii_case(volume) {
+                return Err(std::io::Error::other("directory changed volume"));
+            }
+            sunpack_usn_core::protocol::parse_file_id(&id).map(|(id, _)| id)
+        };
+        let mut fresh = std::collections::HashMap::new();
+        for root in roots {
+            let key = crate::path_keys::path_key(root);
+            match identity(root) {
+                Ok(id) => {
+                    if previous_roots.get(&key) != Some(&id) {
+                        previous.clear();
+                    }
+                    fresh.insert(key, id);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => previous.clear(),
+                Err(error) => return Err(error),
+            }
+        }
+        let mut retained = std::collections::BTreeMap::new();
+        let mut retained_bytes = 0;
         let mut live = Vec::with_capacity(directories.len());
         let mut ids = Vec::with_capacity(directories.len());
         let mut paths = std::collections::BTreeSet::new();
         for directory in directories {
-            match windows::watch_path_identity(Path::new(&directory)) {
-                Ok((actual, id, _)) if actual.eq_ignore_ascii_case(volume) => {
-                    let (id, _) = sunpack_usn_core::protocol::parse_file_id(&id)?;
+            let key = crate::path_keys::path_key(&directory);
+            match fresh
+                .get(&key)
+                .copied()
+                .or_else(|| previous.remove(&key))
+                .map(Ok)
+                .unwrap_or_else(|| identity(&directory))
+            {
+                Ok(id) => {
+                    // An acceleration budget, never a recovery/scan limit.
+                    // Include the key, ID and conservative B-tree node overhead.
+                    let bytes = key.capacity() + 96;
+                    if retained_bytes + bytes <= 2 * 1024 * 1024 {
+                        retained_bytes += bytes;
+                        retained.insert(key, id);
+                    }
                     live.push(directory);
                     ids.push(id);
                 }
-                Ok(_) => return Err(std::io::Error::other("directory changed volume")),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     paths.insert(directory);
                 }
@@ -253,11 +326,36 @@ pub(crate) fn watch_directories_changes_impl(
                 },
             )?;
         }
+        for path in &paths {
+            let key = crate::path_keys::path_key(path);
+            retained.remove(&key);
+            let prefix = format!("{}\\", key.trim_end_matches('\\'));
+            let removed: Vec<_> = retained
+                .range(prefix.clone()..)
+                .take_while(|(key, _)| key.starts_with(&prefix))
+                .map(|(key, _)| key.clone())
+                .collect();
+            for key in removed {
+                retained.remove(&key);
+            }
+        }
+        cache.ids = retained;
+        cache.journal = journal;
+        cache.next_usn = end_usn;
+        cache.roots = fresh;
         Ok(paths.into_iter().collect())
     }
     #[cfg(not(windows))]
     {
-        let _ = (directories, volume, journal, start_usn, end_usn);
+        let _ = (
+            directories,
+            roots,
+            volume,
+            journal,
+            start_usn,
+            end_usn,
+            cache,
+        );
         Err(std::io::Error::other("watch mode requires Windows NTFS"))
     }
 }

@@ -216,13 +216,20 @@ impl NativeRelationGroup {
         }?;
         let data = self.candidate_data();
         let reason = if data.needs_password {
-            Some(if self.entry_anchor().is_some_and(|anchor| anchor.wrong_password) {
-                "wrong_password"
-            } else {
-                "needs_password"
-            })
+            Some(
+                if self
+                    .entry_anchor()
+                    .is_some_and(|anchor| anchor.wrong_password)
+                {
+                    "wrong_password"
+                } else {
+                    "needs_password"
+                },
+            )
         } else if !data.relation_confirmed
-            && data.multivolume && (data.is_split || data.structural_non_head) {
+            && data.multivolume
+            && (data.is_split || data.structural_non_head)
+        {
             Some("missing_volume")
         } else {
             None

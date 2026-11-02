@@ -1,7 +1,7 @@
-use crate::io::cancellation::Cancellation;
 use crate::formats::seven_zip::{
     seven_zip_encryption_facts_from_next_header, SevenZipPasswordProbe,
 };
+use crate::io::cancellation::Cancellation;
 use crate::io::read_fault::{read_exact_field, FieldLocation, ReadFault};
 use crate::io::reader::ManagedReader;
 use crate::password::context::{verify_prepared, InputKey, PasswordContext, PreparedStatus};

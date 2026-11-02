@@ -19,7 +19,7 @@ class TagCollection final : public ui::Widget {
     mutable float tick_height_=-1;
     int active_tag_=-1;
     void rebuild_markers();
-    std::wstring label(const Tag& tag) const;
+    const std::wstring& label(const Tag& tag,std::wstring& scratch) const;
     int tag_at(float x,float y) const;
     D2D1_RECT_F bounds(size_t index) const;
 public:

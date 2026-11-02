@@ -5,10 +5,11 @@
 
 namespace spg {
 namespace { constexpr float font=13, chipHeight=26, gap=4, closeWidth=22, textInset=8, closeGap=3; }
-std::wstring TagCollection::label(const Tag& tag) const {
-    auto text=tag.value;
-    for(auto& c:text) { if(c==L'\r') c=L'␍'; else if(c==L'\n') c=L'↵'; }
-    return text;
+const std::wstring& TagCollection::label(const Tag& tag,std::wstring& scratch) const {
+    if(tag.value.find_first_of(L"\r\n")==std::wstring::npos) return tag.value;
+    scratch=tag.value;
+    for(auto& c:scratch) { if(c==L'\r') c=L'␍'; else if(c==L'\n') c=L'↵'; }
+    return scratch;
 }
 bool TagCollection::SetItems(const std::string& source) {
     if(source_==source) return false;
@@ -25,9 +26,10 @@ void TagCollection::DoLayout() {
     const float width=std::max(1.0f,rect.right-rect.left);
     if(width_!=width) {
         float x=0,y=0;
+        std::wstring scratch;
         for(auto& tag:tags_) {
             if(tag.width<0) {
-                auto text=label(tag);
+                const auto& text=label(tag,scratch);
                 tag.width=(ui::g_activeMeasureContext?ui::g_activeMeasureContext->MeasureTextWidth(text,font):float(text.size())*7)+textInset+closeGap+closeWidth;
             }
             float w=std::min(width,std::min(240.0f,std::max(38.0f,tag.width)));
@@ -58,6 +60,7 @@ void TagCollection::OnDraw(ui::Renderer& r) {
     float top=rect.top,bottom=rect.bottom;
     for(auto* p=Parent();p;p=p->Parent()) if(dynamic_cast<ui::ScrollViewWidget*>(p)) { top=std::max(top,p->rect.top); bottom=std::min(bottom,p->rect.bottom); }
     auto first=std::lower_bound(tags_.begin(),tags_.end(),top-rect.top-chipHeight,[](const Tag& tag,float y){return tag.bounds.bottom<y;});
+    std::wstring scratch;
     for(auto it=first;it!=tags_.end() && it->bounds.top<=bottom-rect.top+chipHeight;++it) {
         auto index=size_t(it-tags_.begin()); auto box=bounds(index);
         if(r.IsCulled(box)) continue;
@@ -72,7 +75,7 @@ void TagCollection::OnDraw(ui::Renderer& r) {
         auto match=highlights_.find(index);
         auto* previous=r.textHighlights;
         r.textHighlights=match==highlights_.end()?nullptr:&match->second;
-        r.DrawText(label(*it),{box.left+textInset,box.top,box.right-closeWidth-closeGap,box.bottom},fg,font);
+        r.DrawText(label(*it,scratch),{box.left+textInset,box.top,box.right-closeWidth-closeGap,box.bottom},fg,font);
         r.textHighlights=previous;
         float cx=box.right-closeWidth/2,cy=(box.top+box.bottom)/2;
         r.DrawLine(cx-3,cy-3,cx+3,cy+3,fg,1); r.DrawLine(cx+3,cy-3,cx-3,cy+3,fg,1);

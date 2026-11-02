@@ -130,6 +130,11 @@ struct PathScratch {
     names: TextScratch,
     rooted: TextScratch,
     patterns: TextScratch,
+    // Only the last directory's ancestor chain is retained. This is batch-local
+    // scratch, so neither file count nor a long-running Watch grows the cache.
+    relative: String,
+    prefixes: Vec<(usize, bool)>,
+    one_shot: bool,
 }
 
 fn start_anchored(hir: &Hir) -> bool {
@@ -214,27 +219,58 @@ impl PathMatcher {
         self.names.is_empty() && self.rooted.is_empty() && self.patterns.is_empty()
     }
     fn matches(&self, relative: &str, scratch: &mut PathScratch) -> bool {
-        if !self.names.is_empty()
-            && relative
-                .split('/')
-                .any(|s| self.names.matches(s, &mut scratch.names))
-        {
-            return true;
-        }
-        // Directory prefixes supply subtree inheritance even for patterns
-        // ending in \z, including in flat watch/output inventories.
-        let mut prefix = relative;
-        loop {
-            if self.rooted.matches(prefix, &mut scratch.rooted)
-                || self.patterns.matches(prefix, &mut scratch.patterns)
-            {
-                return true;
+        let (start, mut matched) = if scratch.one_shot {
+            (0, false)
+        } else {
+            if scratch.relative == relative {
+                if let Some((_, matched)) = scratch.prefixes.last() {
+                    return *matched;
+                }
             }
-            match prefix.rsplit_once('/') {
-                Some((parent, _)) => prefix = parent,
-                None => return false,
+            let common = scratch
+                .relative
+                .bytes()
+                .zip(relative.bytes())
+                .take_while(|(a, b)| a == b)
+                .count();
+            while scratch.prefixes.last().is_some_and(|&(end, _)| {
+                end > common || (end < relative.len() && relative.as_bytes()[end] != b'/')
+            }) {
+                scratch.prefixes.pop();
+            }
+            scratch
+                .prefixes
+                .last()
+                .map_or((0, false), |&(end, matched)| (end + 1, matched))
+        };
+        if start <= relative.len() {
+            let mut end = start;
+            for component in relative[start..].split('/') {
+                end += component.len();
+                // Inherit a match at any directory prefix, including expressions
+                // ending in \z. Flat inventories may change branches or order;
+                // only complete common components can reuse their result.
+                matched = matched
+                    || self.names.matches(component, &mut scratch.names)
+                    || self.rooted.matches(&relative[..end], &mut scratch.rooted)
+                    || self
+                        .patterns
+                        .matches(&relative[..end], &mut scratch.patterns);
+                if scratch.one_shot {
+                    if matched {
+                        return true;
+                    }
+                } else {
+                    scratch.prefixes.push((end, matched));
+                }
+                end += 1;
             }
         }
+        if !scratch.one_shot {
+            scratch.relative.clear();
+            scratch.relative.push_str(relative);
+        }
+        matched
     }
     fn allows_directory(&self, relative: &str, scratch: &mut PathScratch) -> bool {
         if self.is_empty() || !self.names.is_empty() || self.matches(relative, scratch) {
@@ -433,11 +469,15 @@ impl NativePathRule {
         })
     }
     fn rejects(&self, path: &str, root: &str, is_dir: bool, whitelist: bool) -> bool {
+        let mut scratch = PathRuleScratch::default();
+        // Scalar events cannot reuse ancestor state; use the same matcher
+        // without allocating an immediately discarded path/prefix cache.
+        scratch.paths.one_shot = true;
         self.rule.rejects(
             &FilterPath::new(Path::new(path), Path::new(root)),
             is_dir,
             whitelist,
-            &mut PathRuleScratch::default(),
+            &mut scratch,
         )
     }
     fn accepted_indices(

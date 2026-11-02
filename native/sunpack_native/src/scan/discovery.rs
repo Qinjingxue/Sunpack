@@ -227,62 +227,69 @@ impl NativeEmbeddedBatch {
             // Split into at most eight file jobs. Per-file IOCP buffers and
             // native metadata stay bounded, independently of machine core count.
             ids.par_chunks(ids.len().div_ceil(parallel_files).max(1))
-                .map(|chunk| cancellation.run(|| {
-                    chunk
-                        .iter()
-                        .filter_map(|&index| {
-                            if cancellation.cancelled() { return None; }
-                            // An earlier detection attempt already failed. Policy
-                            // gates may skip new I/O, never erase an observed error.
-                            if let Some(Err(error)) = self.scans.get(&index) {
-                                return Some((index, EmbeddedOutcome::Failed(Arc::clone(error))));
-                            }
-                            if !self.select_all && !self.selected.contains(&index) {
-                                return self.include_residual_details.then_some((
-                                    index,
-                                    EmbeddedOutcome::Residual(self.skipped_reason),
-                                ));
-                            }
-                            if let Some(scan) = self.scans.get(&index) {
-                                let outcome = match scan {
-                                    Ok(scan) => EmbeddedOutcome::Scan(Arc::clone(scan)),
-                                    Err(error) => EmbeddedOutcome::Failed(Arc::clone(error)),
-                                };
-                                return (self.include_residual_details
-                                    || !matches!(outcome, EmbeddedOutcome::Residual(_)))
-                                .then_some((index, outcome));
-                            }
-                            let (path, pe_state) = match &rows[index] {
-                                Candidate::File(table, row) => (
-                                    table.paths[*row].as_str(),
-                                    table.relation_anchors[*row].as_ref().map(|a| a.pe_state),
-                                ),
-                                Candidate::Relation(group) => {
-                                    let data = group.candidate_data();
-                                    let pe_state = group.entry_anchor().map(|a| a.pe_state);
-                                    let outcome = scan_embedded_candidate(
-                                        data.entry_path,
-                                        self.force_scan,
-                                        pe_state,
-                                        parallel_files,
-                                    );
+                .map(|chunk| {
+                    cancellation.run(|| {
+                        chunk
+                            .iter()
+                            .filter_map(|&index| {
+                                if cancellation.cancelled() {
+                                    return None;
+                                }
+                                // An earlier detection attempt already failed. Policy
+                                // gates may skip new I/O, never erase an observed error.
+                                if let Some(Err(error)) = self.scans.get(&index) {
+                                    return Some((
+                                        index,
+                                        EmbeddedOutcome::Failed(Arc::clone(error)),
+                                    ));
+                                }
+                                if !self.select_all && !self.selected.contains(&index) {
+                                    return self.include_residual_details.then_some((
+                                        index,
+                                        EmbeddedOutcome::Residual(self.skipped_reason),
+                                    ));
+                                }
+                                if let Some(scan) = self.scans.get(&index) {
+                                    let outcome = match scan {
+                                        Ok(scan) => EmbeddedOutcome::Scan(Arc::clone(scan)),
+                                        Err(error) => EmbeddedOutcome::Failed(Arc::clone(error)),
+                                    };
                                     return (self.include_residual_details
                                         || !matches!(outcome, EmbeddedOutcome::Residual(_)))
                                     .then_some((index, outcome));
                                 }
-                            };
-                            let outcome = scan_embedded_candidate(
-                                path,
-                                self.force_scan,
-                                pe_state,
-                                parallel_files,
-                            );
-                            (self.include_residual_details
-                                || !matches!(outcome, EmbeddedOutcome::Residual(_)))
-                            .then_some((index, outcome))
-                        })
-                        .collect::<Vec<_>>()
-                }))
+                                let (path, pe_state) = match &rows[index] {
+                                    Candidate::File(table, row) => (
+                                        table.paths[*row].as_str(),
+                                        table.relation_anchors[*row].as_ref().map(|a| a.pe_state),
+                                    ),
+                                    Candidate::Relation(group) => {
+                                        let data = group.candidate_data();
+                                        let pe_state = group.entry_anchor().map(|a| a.pe_state);
+                                        let outcome = scan_embedded_candidate(
+                                            data.entry_path,
+                                            self.force_scan,
+                                            pe_state,
+                                            parallel_files,
+                                        );
+                                        return (self.include_residual_details
+                                            || !matches!(outcome, EmbeddedOutcome::Residual(_)))
+                                        .then_some((index, outcome));
+                                    }
+                                };
+                                let outcome = scan_embedded_candidate(
+                                    path,
+                                    self.force_scan,
+                                    pe_state,
+                                    parallel_files,
+                                );
+                                (self.include_residual_details
+                                    || !matches!(outcome, EmbeddedOutcome::Residual(_)))
+                                .then_some((index, outcome))
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })
                 .collect::<Vec<_>>()
                 .into_iter()
                 .flatten()
@@ -396,7 +403,9 @@ impl NativeCandidateTable {
 
     fn record_relation_failures(&mut self, failures: Vec<(String, String)>) {
         self.relation_failures.extend(
-            failures.into_iter().map(|(path, reason)| (path_key(&path), reason)),
+            failures
+                .into_iter()
+                .map(|(path, reason)| (path_key(&path), reason)),
         );
     }
 
@@ -462,7 +471,8 @@ impl NativeCandidateTable {
 
     fn extend(&mut self, other: &mut NativeCandidateTable) {
         self.rows.append(&mut other.rows);
-        self.relation_failures.extend(other.relation_failures.drain());
+        self.relation_failures
+            .extend(other.relation_failures.drain());
     }
 
     fn dedupe(&mut self) {
@@ -548,7 +558,9 @@ impl NativeCandidateTable {
                 if data.needs_password {
                     if let Some(reason) = self.relation_failures.get(&path_key(data.entry_path)) {
                         if let Some(metadata) = dict.bind(py).get_item("head_metadata")? {
-                            metadata.cast::<PyDict>()?.set_item("relation_failure_reason", reason)?;
+                            metadata
+                                .cast::<PyDict>()?
+                                .set_item("relation_failure_reason", reason)?;
                         }
                     }
                 }
@@ -657,51 +669,57 @@ impl NativeCandidateTable {
             .collect::<Vec<_>>();
         py.detach(|| {
             for batch in detection_indices.chunks(1024) {
-                if cancellation.cancelled() { break; }
+                if cancellation.cancelled() {
+                    break;
+                }
                 let parallel_files = batch.len().min(rayon::current_num_threads()).clamp(1, 8);
                 let decisions = batch
                     .par_iter()
                     .with_min_len(batch.len().div_ceil(parallel_files))
-                    .map(|&index| cancellation.run(|| {
-                        if cancellation.cancelled() { return None; }
-                        let Candidate::File(table, file_index) = &self.rows[index] else {
-                            return None;
-                        };
-                        let path = &table.paths[*file_index];
-                        let key = path_key(path);
-                        if claimed.contains(&key) || blocked.contains(&key) {
-                            return None;
-                        }
-                        let anchor = table.relation_anchors[*file_index].as_ref();
-                        let format = anchor.map(|anchor| anchor.format.as_str()).unwrap_or("");
-                        let accepted = detection_enabled
-                            && matches!(
-                                format,
-                                "tar" | "gzip" | "bzip2" | "xz" | "zstd" | "lz4" | "enc"
-                            )
-                            && anchor.is_some_and(|anchor| anchor.standalone);
-                        let scan = if accepted && format != "enc" {
-                            Some(
-                                scan_detected_path(path, format, parallel_files)
-                                    .map(Arc::new)
-                                    .map_err(|error| Arc::<str>::from(error.to_string())),
-                            )
-                        } else {
-                            None
-                        };
-                        let accepted = accepted
-                            && (format == "enc"
-                                || scan
-                                    .as_ref()
-                                    .and_then(|scan| scan.as_ref().ok())
-                                    .is_some_and(|scan| scan.is_primary(format)));
-                        Some((
-                            index,
-                            key,
-                            accepted,
-                            scan.filter(|_| !accepted || format == "lz4"),
-                        ))
-                    }))
+                    .map(|&index| {
+                        cancellation.run(|| {
+                            if cancellation.cancelled() {
+                                return None;
+                            }
+                            let Candidate::File(table, file_index) = &self.rows[index] else {
+                                return None;
+                            };
+                            let path = &table.paths[*file_index];
+                            let key = path_key(path);
+                            if claimed.contains(&key) || blocked.contains(&key) {
+                                return None;
+                            }
+                            let anchor = table.relation_anchors[*file_index].as_ref();
+                            let format = anchor.map(|anchor| anchor.format.as_str()).unwrap_or("");
+                            let accepted = detection_enabled
+                                && matches!(
+                                    format,
+                                    "tar" | "gzip" | "bzip2" | "xz" | "zstd" | "lz4" | "enc"
+                                )
+                                && anchor.is_some_and(|anchor| anchor.standalone);
+                            let scan = if accepted && format != "enc" {
+                                Some(
+                                    scan_detected_path(path, format, parallel_files)
+                                        .map(Arc::new)
+                                        .map_err(|error| Arc::<str>::from(error.to_string())),
+                                )
+                            } else {
+                                None
+                            };
+                            let accepted = accepted
+                                && (format == "enc"
+                                    || scan
+                                        .as_ref()
+                                        .and_then(|scan| scan.as_ref().ok())
+                                        .is_some_and(|scan| scan.is_primary(format)));
+                            Some((
+                                index,
+                                key,
+                                accepted,
+                                scan.filter(|_| !accepted || format == "lz4"),
+                            ))
+                        })
+                    })
                     .collect::<Vec<_>>();
                 for (index, key, accepted, scan) in decisions.into_iter().flatten() {
                     if claimed.contains(&key) {

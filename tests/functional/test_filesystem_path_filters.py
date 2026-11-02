@@ -257,6 +257,43 @@ def test_regex_cache_pressure_keeps_concurrent_batch_results():
         list(pool.map(run, range(8)))
 
 
+def test_path_batch_reuse_follows_complete_ancestors_in_arbitrary_order():
+    """The tree matrix does not revisit shuffled ancestors within one scratch.
+
+    This batch catches sibling-prefix, inherited-match and root-reset leakage;
+    removing it leaves cache state transitions uncovered. Scalar comparisons
+    and a concurrent replay add that coverage without filesystem/probe costs.
+    """
+    import random
+    from concurrent.futures import ThreadPoolExecutor
+    from sunpack_native import NativePathRule
+
+    relatives = ["", "a", "ab", "a/keep", "a/keeper", "a/keep/deep",
+                 "a/other", "ab/keep", "中文/keep", "中文/keeper", "別/keep"]
+    rows = [(f"C:/input/{relative}/payload.001", False) for relative in relatives]
+    rows += [(f"C:/input/{relative}", True) for relative in relatives]
+    rows *= 3
+    random.Random(20261102).shuffle(rows)
+    rules = [
+        NativePathRule([{"value": value, "regex": regex}], [], [], [])
+        for value, regex in [("keep", False), ("a/keep", False), ("a/k??p", False),
+                             (r"\Aa/keep\z|\A中文/keep\z", True),
+                             (r"(?:\A|/)keep\z", True), (r"\A\z", True)]
+    ]
+
+    def run(_):
+        for rule in rules:
+            for whitelist in (False, True):
+                for root in ("C:/input", None):
+                    expected = [i for i, (path, is_dir) in enumerate(rows)
+                                if not rule.rejects(path, root or str(Path(path).parent), is_dir, whitelist)]
+                    assert rule.accepted_indices(root, [p for p, _ in rows],
+                                                 [d for _, d in rows], whitelist) == expected
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        list(pool.map(run, range(4)))
+
+
 def test_filename_parts_use_the_last_dot_and_handle_absent_or_empty_extensions():
     """The real tree cannot represent trailing dots on Windows. This native
     batch adds those boundaries and checks all three selectors without IO.

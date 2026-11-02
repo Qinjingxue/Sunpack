@@ -1118,6 +1118,12 @@ void tag_config(Application& app,const fs::path& dir) {
         const auto first=activeTag().front();
         auto key=[&](int vk){SendMessageW(window->Handle(),WM_KEYDOWN,vk,0);ui_window_relayout(app.window());};
         key(VK_DOWN); assert(activeTag().size()==1 && !same(activeTag().front(),first));
+        // Repeated snapshots reuse text matches, while active ownership still
+        // belongs to one target/range (the two duplicate TAGs share their text).
+        for(int i=0;i<3;++i) {
+            search_config(app,L"DUPLICATE");
+            assert(activeTag().size()==1 && !same(activeTag().front(),first));
+        }
         key(VK_DOWN); assert(activeTag().size()==1 && same(activeTag().front(),first));
         key(VK_UP); assert(activeTag().size()==1 && !same(activeTag().front(),first));
         assert(window->FocusedWidget()->id=="configSearch");

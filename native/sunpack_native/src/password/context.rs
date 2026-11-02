@@ -1,8 +1,8 @@
 //! Immutable password material for the logical input selected by Rust analysis.
 //! Physical generations and logical boundaries are part of the identity; no
 //! archive detection or member discovery is performed by this cache.
-use crate::io::read_fault::ReadFault;
 use crate::io::cancellation::CancellableOnce;
+use crate::io::read_fault::ReadFault;
 use crate::io::reader::{FileIdentity, ManagedReader};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
