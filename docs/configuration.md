@@ -36,7 +36,7 @@ For example, add these fields to the main configuration to keep original archive
 
 CLI options such as `--recur`, `--cleanup`, and `--out-dir` let you set extraction behavior for one command. See the [CLI parameter reference](cli_parameters.md).
 
-Directory discovery is shallow by default. Use `--recursive` with `scan`, `inspect`, or `extract`; nested extraction continues to use `--recur`. The configuration upgrade hook, atomic commit and failure rollback remain available from 1.3.0 onward. There are currently no migration rules, so upgrades do not rewrite user configuration.
+Directory discovery is shallow by default. Use `--recursive` with `scan`, `inspect`, or `extract`; nested extraction continues to use `--recur`. The installer retains its atomic configuration upgrade and failure-recovery framework. Upgrading from the released v1.3.4 configuration migrates the old scan-filter fields into the current schema.
 
 ## Scan filters
 
@@ -103,11 +103,12 @@ Enter regex backslashes normally in the GUI; saving handles JSON escaping.
 The installer migrates the released v1.3.4 schema directly into these records;
 untagged development schemas have no migration path. Old complete filenames move
 to `full_names`, and old extension entries move to `extensions`. Their whitelist
-AND relationship remains in one module. Directory-prune rules merge into a
-blacklist with the same enabled state. Old path Globs retain component-boundary
-matching, using regex records when necessary; independent whitelist path groups
-remain separate AND conditions. Migration is idempotent; runtime uses only the
-current schema.
+AND relationship remains in one module. Directory-prune rules merge into the
+blacklist regardless of their former enabled states; if either was enabled, the
+merged blacklist is enabled. Old path Globs retain component-boundary matching,
+using regex records when necessary. Legacy whitelist path groups are combined
+into one OR list instead of separate AND conditions. Migration is idempotent;
+runtime uses only the current schema.
 
 Size bounds are inclusive integer bytes from 0 to 18446744073709551615. Equal bounds select one exact size. Time bounds use UTC minute strings in `YYYY-MM-DDTHH:mmZ` format, including the start and excluding the end. `null` leaves that side unbounded; specify both bounds explicitly to override defaults. For example:
 
