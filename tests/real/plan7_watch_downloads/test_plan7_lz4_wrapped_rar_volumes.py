@@ -90,9 +90,11 @@ def test_plan7_four_lz4_wrapped_encrypted_rar_volumes_extract_automatically(
             for event in harness.submission_events for path in event.paths
         )
         assert all(submissions[path.name] == 1 for path in inputs), submissions
-        events = {row["event"] for row in display_records((tmp_path / f"wrapped-rar-{write_mode}" / "events.json"))}
-        assert "failed_terminal" not in events
-        assert "error" not in events
+        unexpected_events = [
+            row for row in display_records(tmp_path / f"wrapped-rar-{write_mode}" / "events.json")
+            if row["event"] in {"failed_terminal", "error"}
+        ]
+        assert not unexpected_events, unexpected_events
     finally:
         plan7_error["output_files"] = file_inventory(harness.output_root)
         plan7_error["watch_entries"] = repr(harness.watcher.state.entries)
@@ -186,9 +188,11 @@ def test_plan7_lz4_wrapped_rar_volumes_arriving_in_separate_directories_extract_
             for event in harness.submission_events for path in event.paths
         )
         assert all(submissions[path.name] == 1 for path in inputs), submissions
-        events = {row["event"] for row in display_records((tmp_path / "wrapped-rar-split-dirs" / "events.json"))}
-        assert "failed_terminal" not in events
-        assert "error" not in events
+        unexpected_events = [
+            row for row in display_records(tmp_path / "wrapped-rar-split-dirs" / "events.json")
+            if row["event"] in {"failed_terminal", "error"}
+        ]
+        assert not unexpected_events, unexpected_events
     finally:
         plan7_error["output_files"] = file_inventory(harness.output_root)
         plan7_error["watch_entries"] = repr(harness.watcher.state.entries)
