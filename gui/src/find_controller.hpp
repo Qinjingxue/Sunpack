@@ -10,6 +10,7 @@
 namespace spg {
 class FindController {
     struct Target { std::string id; int row=-1, tag=-1; std::vector<ui::TextHighlight> ranges; };
+    struct Source { std::vector<size_t> targets; float offset=0; };
     struct Hit { size_t target, range; };
     struct Match { std::string text; std::vector<ui::TextHighlight> ranges; size_t bytes; };
     struct Search {
@@ -17,8 +18,7 @@ class FindController {
         std::wstring query;
         std::vector<Target> targets;
         std::vector<Hit> hits;
-        std::unordered_map<std::string,std::vector<size_t>> byId;
-        std::vector<int> rows;
+        std::unordered_map<std::string,Source> byId;
         std::vector<float> ticks;
         size_t current=0;
         uint64_t revision=0, geometry=~uint64_t(0);

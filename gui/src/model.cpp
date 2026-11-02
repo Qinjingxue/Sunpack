@@ -18,6 +18,21 @@ std::wstring fold_search(const std::string& text) {
     if(!w.empty()) CharLowerBuffW(w.data(),DWORD(w.size()));
     return w;
 }
+std::string task_time(double timestamp) {
+    if(!std::isfinite(timestamp) || timestamp<0 || timestamp>32535215999.0) return {};
+    auto seconds=static_cast<__time64_t>(timestamp);
+    std::tm local{};
+    if(_localtime64_s(&local,&seconds)) return {};
+    char text[32]{};
+    std::strftime(text,sizeof(text),"%Y-%m-%d %H:%M:%S",&local);
+    return text;
+}
+std::string task_time_query(const std::wstring& query) {
+    if(query.size()>19 || query.find_first_not_of(L"0123456789- :")!=std::wstring::npos) return {};
+    std::string result; result.reserve(query.size());
+    for(auto ch:query) result.push_back(static_cast<char>(ch));
+    return result;
+}
 namespace {
 std::string trim(std::string s) {
     auto start = s.find_first_not_of(" \t\r\n");
@@ -122,14 +137,13 @@ std::string indexed_root(const std::wstring& key,const RootIndex& index) {
     }
     return "@other";
 }
-std::string task_time(const Task& task) {
-    if(!task.has_timestamp || !std::isfinite(task.timestamp) || task.timestamp<0 || task.timestamp>32535215999.0) return {};
-    auto seconds=static_cast<__time64_t>(task.timestamp);
-    std::tm local{};
-    if(_localtime64_s(&local,&seconds)) return {};
-    char text[32]{};
-    std::strftime(text,sizeof(text),"%Y-%m-%d %H:%M:%S",&local);
-    return text;
+const std::string& cached_task_time(const Task& task) {
+    auto& cache=task.display;
+    if(!cache.time_valid || cache.timestamp!=task.timestamp || cache.has_timestamp!=task.has_timestamp) {
+        cache.time=task.has_timestamp?task_time(task.timestamp):std::string();
+        cache.timestamp=task.timestamp; cache.has_timestamp=task.has_timestamp; cache.time_valid=true;
+    }
+    return cache.time;
 }
 }
 bool password_matches_scope(const Json& record,const std::string& scope) {
@@ -667,12 +681,7 @@ Json project_task(const std::wstring& key,const Task& t,const RootIndex& roots,
         cache.filename=utf8(path.filename().wstring());
         cache.path=t.path;
     }
-    if(!cache.time_valid || cache.timestamp!=t.timestamp || cache.has_timestamp!=t.has_timestamp) {
-        cache.time=task_time(t);
-        cache.timestamp=t.timestamp;
-        cache.has_timestamp=t.has_timestamp;
-        cache.time_valid=true;
-    }
+    cached_task_time(t);
     const auto& status=t.status;
     const char* tone=status=="taskSucceeded"?"success":status=="taskFailed"?"failure":
         status=="taskWaiting"?"waiting":"info";
@@ -702,10 +711,11 @@ Json project_task(const std::wstring& key,const Task& t,const RootIndex& roots,
         {"outputs",t.outputs},{"sortTimestamp",t.timestamp},{"sortSequence",t.sequence}};
 }
 bool task_matches(const Task& t,const RootIndex& roots,const View& v,
-    const std::wstring& folded_query) {
+    const std::wstring& folded_query,const std::string& time_query) {
     if(t.status.empty() || (!v.task_status.empty() && t.status!=v.task_status) ||
         (!v.task_root.empty() && indexed_root(path_key(wide(t.path)),roots)!=v.task_root)) return false;
     if(contains_folded(t.path,folded_query) || contains_folded(t.name,folded_query)) return true;
+    if(!time_query.empty() && cached_task_time(t).find(time_query)!=std::string::npos) return true;
     return std::any_of(t.members.begin(),t.members.end(),[&](const auto& member){return contains_folded(utf8(member.key),folded_query);});
 }
 }
@@ -717,10 +727,11 @@ Json task_rows(const EventLog& log,const WatchRoots& roots,const View& v,const s
     if(!log.manifest.is_null()) return log.query(roots,v,language);
     const auto root_index=index_roots(roots);
     const auto query=fold_search(v.task_query);
+    const auto time_query=task_time_query(query);
     using TaskEntry=decltype(log.tasks)::value_type;
     std::vector<const TaskEntry*> rows;
     rows.reserve(log.tasks.size());
-    for(auto& pair:log.tasks) if(task_matches(pair.second,root_index,v,query)) rows.push_back(&pair);
+    for(auto& pair:log.tasks) if(task_matches(pair.second,root_index,v,query,time_query)) rows.push_back(&pair);
     const auto filtered=stats?Clock::now():Clock::time_point{};
     std::sort(rows.begin(),rows.end(),[](const auto& a,const auto& b){
         if(a->second.timestamp!=b->second.timestamp) return a->second.timestamp>b->second.timestamp;

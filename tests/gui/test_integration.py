@@ -328,17 +328,34 @@ def test_indexed_history_pages_and_literal_member_search_work_without_a_producer
     store.close()
     manifest = path.read_bytes()
     files = {p: p.stat().st_mtime_ns for p in path.with_name(path.name + ".store").iterdir()}
-    cursor, ids = "", set()
+    cursor, ids, times = "", set(), {}
     while True:
         page = _state_projection(path, cursor=cursor)["tasks"]
         assert 0 < len(page["rows"]) <= 100
         for row in page["rows"]:
             assert row["id"] not in ids
             ids.add(row["id"])
+            times[row["id"]] = row["time"]
         if not page["hasMore"]:
             break
         cursor = page["next"]
     assert len(ids) == 250
+    # The compact index was written without local-time text. Time queries must
+    # still find old runs, preserve pagination and use the GUI's displayed time.
+    stamp = _state_projection(path)["tasks"]["rows"][0]["time"]
+    for query in (stamp, stamp[:10], stamp[11:16]):
+        cursor, found = "", set()
+        while True:
+            page = _state_projection(path, query=query, cursor=cursor)["tasks"]
+            assert page["rows"] and all(query in row["time"] for row in page["rows"])
+            for row in page["rows"]:
+                assert row["id"] not in found
+                found.add(row["id"])
+            if not page["hasMore"]:
+                break
+            cursor = page["next"]
+        assert found == {key for key, time in times.items() if query in time}
+    assert not _state_projection(path, query="9999-12-31 23:59:59")["tasks"]["rows"]
     for query in ("密", "密钥", "100%", "PAYLOAD.RAR"):
         page = _state_projection(path, query=query)["tasks"]
         assert page["rows"]
@@ -365,6 +382,9 @@ def test_gui_reads_display_state_across_publication_faults_and_close(tmp_path):
         log.flush()
         live = _state_projection(path)
         assert live["tasks"]["rows"][0]["status"] == "taskProcessing"
+        stamp = live["tasks"]["rows"][0]["time"]
+        assert _state_projection(path, query=stamp)["tasks"]["rows"] == live["tasks"]["rows"]
+        assert not _state_projection(path, query="9999-12-31 23:59:59")["tasks"]["rows"]
         kernel = ctypes.WinDLL("kernel32", use_last_error=True)
         kernel.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
         kernel.CreateFileW.restype = wintypes.HANDLE

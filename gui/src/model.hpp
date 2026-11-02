@@ -7,6 +7,9 @@
 namespace spg {
 using Json = nlohmann::ordered_json;
 std::wstring fold_search(const std::string& text);
+std::string task_time(double timestamp);
+// Empty means the query cannot occur in the displayed local timestamp.
+std::string task_time_query(const std::wstring& query);
 Json parse_json(const std::string& text);
 Json read_json(const fs::path& path);
 void validate_passwords(const Json& document);

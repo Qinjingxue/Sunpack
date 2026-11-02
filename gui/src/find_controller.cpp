@@ -84,11 +84,11 @@ void FindController::refresh(Search& s) {
     if(changed || query.empty()) clear_matches(s);
     if(changed) s.pending=0;
     s.before=snapshot.value("before",false); s.after=snapshot.value("after",false);
-    s.query=std::move(query); s.targets.clear(); s.hits.clear(); s.byId.clear(); s.rows.clear(); s.ticks.clear();
+    s.query=std::move(query); s.targets.clear(); s.hits.clear(); s.byId.clear(); s.ticks.clear();
     s.current=0; s.geometry=~uint64_t(0); s.extent=-1; s.revision=++revision_;
     if(s.query.empty()) {
         decltype(s.targets)().swap(s.targets); decltype(s.hits)().swap(s.hits);
-        decltype(s.rows)().swap(s.rows); decltype(s.ticks)().swap(s.ticks); s.byId.rehash(0);
+        decltype(s.ticks)().swap(s.ticks); s.byId.rehash(0);
     }
     if(!s.query.empty()) for(auto& source:snapshot.at("targets")) {
         Target target{source.at("id").get<std::string>(),source.at("row").get<int>(),source.at("tag").get<int>()};
@@ -97,9 +97,8 @@ void FindController::refresh(Search& s) {
             if(!changed && target.id==oldId && target.tag==oldTag && target.ranges[i].start==oldStart) s.current=s.hits.size();
             s.hits.push_back({s.targets.size(),i});
         }
-        if(!target.ranges.empty()) { s.byId[target.id].push_back(s.targets.size()); s.targets.push_back(std::move(target)); }
+        if(!target.ranges.empty()) { s.byId[target.id].targets.push_back(s.targets.size()); s.targets.push_back(std::move(target)); }
     }
-    for(auto& t:s.targets) if(s.rows.empty() || s.rows.back()!=t.row) s.rows.push_back(t.row);
     if(!s.hits.empty()) {
         if(s.pending) s.current=s.pending>0?std::min(s.current+1,s.hits.size()-1):(s.current?s.current-1:0);
         auto h=s.hits[s.current]; s.targets[h.target].ranges[h.range].active=true;
@@ -111,14 +110,30 @@ void FindController::refresh(Search& s) {
 }
 void FindController::Decorate() { for(auto& s:searches_) if(visible(s)) decorate(s); }
 void FindController::decorate(Search& s) {
-    auto* area=root()->FindById(s.scroll); if(!area) return;
-    std::function<void(ui::Widget*)> visit=[&](ui::Widget* w) {
+    auto* area=dynamic_cast<ui::ScrollViewWidget*>(root()->FindById(s.scroll)); if(!area) return;
+    auto* list=root()->FindById(s.list);
+    std::function<void(ui::Widget*,ui::Widget*)> visit=[&](ui::Widget* w,ui::Widget* row) {
         if(!w->visible) return;
+        if(w->Parent()==list) row=w;
+        auto found=s.byId.find(w->id);
+        if(found!=s.byId.end()) {
+            // Keep only row-local geometry, never owning virtual widgets. Pure
+            // scrolling translates both rectangles equally. A nested scroller
+            // occupies one place in the outer document; its own markers locate
+            // individual TAGs without projecting their hidden extent outside it.
+            auto box=w->rect;
+            for(auto* p=w->Parent();p && p!=area;p=p->Parent())
+                if(dynamic_cast<ui::ScrollViewWidget*>(p)) box=p->rect;
+            const float offset=(box.top+box.bottom)/2-(row?row->rect.top:area->rect.top-area->ScrollY());
+            if(std::abs(found->second.offset-offset)>0.5f) {
+                found->second.offset=offset;
+                s.geometry=~uint64_t(0);
+            }
+        }
         if(w->textHighlightRevision!=s.revision) {
             w->textHighlightRevision=s.revision; w->textHighlights.clear();
             std::map<size_t,std::vector<ui::TextHighlight>> tags;
-            auto found=s.byId.find(w->id);
-            if(found!=s.byId.end()) for(size_t index:found->second) {
+            if(found!=s.byId.end()) for(size_t index:found->second.targets) {
                 auto& t=s.targets[index];
                 if(t.tag>=0) tags[size_t(t.tag)]=t.ranges; else w->textHighlights=t.ranges;
             }
@@ -132,9 +147,9 @@ void FindController::decorate(Search& s) {
                 }
             }
         }
-        for(auto& child:w->Children()) visit(child.get());
+        for(auto& child:w->Children()) visit(child.get(),row);
     };
-    visit(area);
+    visit(area,nullptr);
 }
 void FindController::reveal(Search& s) {
     auto* owner=ui::GetContext().GetWindow(window_);
@@ -199,17 +214,28 @@ void FindController::markers(Search& s,ui::Renderer& r) {
     auto* scroll=dynamic_cast<ui::ScrollViewWidget*>(root()->FindById(s.scroll));
     auto* list=dynamic_cast<ui::VirtualListWidget*>(root()->FindById(s.list));
     if(!scroll || !list) return;
-    const float extent=std::max(1.0f,scroll->ContentHeight()),height=scroll->rect.bottom-scroll->rect.top;
+    const auto b=scroll->ScrollbarTrackRect();
+    const float extent=std::max(1.0f,scroll->ContentHeight()),height=b.bottom-b.top;
     const float offset=list->rect.top-scroll->rect.top+scroll->ScrollY()+list->padT;
-    auto position=[&](int row){return row<0?0.0f:(offset+list->RowOffset(size_t(row)))/extent*(height-3);};
+    auto position=[&](const Source& source) {
+        const auto row=s.targets[source.targets.front()].row;
+        return std::clamp((row<0?0.0f:offset+list->RowOffset(size_t(row)))+source.offset,0.0f,extent)/extent*std::max(0.0f,height-3);
+    };
     if(s.geometry!=list->GeometryRevision() || s.extent!=extent || std::abs(s.offset-offset)>0.5f || s.height!=height) {
         s.geometry=list->GeometryRevision(); s.extent=extent; s.offset=offset; s.height=height; s.ticks.clear();
-        float last=-10;
-        for(int row:s.rows) {float at=std::floor(position(row));if(at!=last) {s.ticks.push_back(at);last=at;}}
+        // Pixel deduplication bounds paint cost by track height even when a
+        // large virtual list has many more matching widgets than screen pixels.
+        std::vector<bool> occupied(size_t(std::ceil(std::max(0.0f,height))),false);
+        // All matches in one widget share its outer-document location. A TAG
+        // cloud with thousands of hits still contributes only one outer tick.
+        for(const auto& source:s.byId) {
+            float at=std::floor(position(source.second));
+            const auto pixel=size_t(at);
+            if(pixel<occupied.size() && !occupied[pixel]) {occupied[pixel]=true;s.ticks.push_back(at);}
+        }
     }
-    const auto b=scroll->ScrollbarTrackRect();
     for(float tick:s.ticks) r.FillRoundedRect({b.left,b.top+tick,b.right,b.top+tick+2},1,1,D2D1::ColorF(0xd2ad22));
-    float at=b.top+position(s.targets[s.hits[s.current].target].row);
+    float at=b.top+position(s.byId.at(s.targets[s.hits[s.current].target].id));
     r.FillRoundedRect({b.left,at,b.right,at+3},1,1,D2D1::ColorF(0xef8c22));
 }
 }

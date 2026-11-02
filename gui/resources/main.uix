@@ -65,6 +65,7 @@ export default {
           add(i,'taskName-'+t.id,t.name);
           t.parts.forEach((part,j)=>add(i,'taskPart-'+t.id+'-'+j,part));
           add(i,'taskRoot-'+t.id,this.texts.taskFolder+t.directory);
+          add(i,'taskTime-'+t.id,t.time);
         }); }
         if(scope==='root') { let rows=this.shownRootRows; rows.forEach((r,i)=>{let d=this.rootDraft(r);
           add(i,'root-input-'+(this.rootCell===r.id&&this.rootPart==='input'?'input-':'value-')+r.id,d.input);
@@ -102,17 +103,24 @@ export default {
       add(f.label,'field-title-'+f.id);add(f.description,'field-description-'+f.id);add(f.categoryLabel);
       f.options.forEach((o,i)=>add(o.label,i===d.choice?'select-'+f.id:''));
       if(this.isRuleList(f)) {
+        if(f.editor==='rule_list') add(t.regexMode,'tag-regex-label-'+f.id);
         add(this.tagInputs[f.id],'tag-input-'+f.id);
         this.tagValues(f).forEach((v,j)=>add(this.entryLabel(v.value),'tags-'+f.id,j));
       } else if(f.editor==='text') add(d.text,'input-'+f.id);
-      else if(f.editor==='recursive') {add(d.text,d.choice===2?'rounds-'+f.id:'');add(t.rounds);}
-      else if(f.editor==='readonly') add(t.readOnly);
+      else if(f.editor==='recursive'&&d.choice===2) {add(d.text,'rounds-'+f.id);add(t.rounds,'rounds-label-'+f.id);}
+      else if(f.editor==='readonly') add(t.readOnly,'readonly-label-'+f.id);
       if(this.isRange(f)) {
         let r=this.rangeValue(f),date=f.editor==='datetime_range';
-        add(t.rangeEnable);add(date?t.rangeStart:t.rangeMin);add(date?t.rangeEnd:t.rangeMax);
+        add(t.rangeEnable,'range-enabled-label-'+f.id);
+        add(date?t.rangeStart:t.rangeMin,'range-lower-label-'+f.id);add(date?t.rangeEnd:t.rangeMax,'range-upper-label-'+f.id);
         add(r.lower,'range-lower-'+f.id);add(r.upper,'range-upper-'+f.id);
-        if(date) {add(t.rangePick);add(t.rangeChoose);} else add('B KiB MiB GiB TiB');
+        if(date) {add(t.rangePick,'range-lower-pick-'+f.id);add(t.rangePick,'range-upper-pick-'+f.id);}
+        else {
+          let units=['B','KiB','MiB','GiB','TiB'];add(units[r.lowerUnit],'range-lower-unit-'+f.id);add(units[r.upperUnit],'range-upper-unit-'+f.id);
+          add(units.join(' '));
+        }
       }
+      add(this.errorText(this.saveErrors[f.id]),'field-error-'+f.id);
     },
     configText(f) {
       let parts=[];this.configSearchText(f,text=>{if(text) parts.push(text);});
@@ -916,7 +924,7 @@ export default {
                 <label v-show="t.error" :id="'taskErrorMessage-'+t.id" class="task-chip error-chip" tabindex="0" :tooltip="texts.copyTag" @click="send('copyTaskText',{text:t.error})">{{ texts.taskErrorMessage }}{{ inlineTaskError(t.error) }}</label>
               </div>
             </div>
-            <div class="row task-meta"><label :id="'taskRoot-'+t.id" class="muted fill" :ellipsis-start="true">{{ texts.taskFolder }}{{ t.directory }}</label><label class="time">{{ t.time }}</label></div>
+            <div class="row task-meta"><label :id="'taskRoot-'+t.id" class="muted fill" :ellipsis-start="true">{{ texts.taskFolder }}{{ t.directory }}</label><label :id="'taskTime-'+t.id" class="time">{{ t.time }}</label></div>
           </div>
           </VirtualList>
         </div></ScrollView>
@@ -939,23 +947,23 @@ export default {
             <div v-for="f in g.fields" :key="f.key" :id="'field-'+f.id" class="setting-item">
             <div v-show="f.id!==g.fields[0].id" class="setting-divider"/>
             <div class="settings-row" :class="isRuleList(f)?'tag-setting':''">
-              <div class="setting-copy"><label :id="'field-title-'+f.id" :class="f.primary?'subheading':'setting-title'">{{ f.label }}</label><label :id="'field-description-'+f.id" v-show="f.description" class="setting-description">{{ f.description }}</label><input v-show="isRuleList(f)" :id="'tag-input-'+f.id" :value="tagInputs[f.id]||''" :placeholder="tagEdits[f.id]?'':texts.tagInputPlaceholder" @input="v=>changeTagInput(f,v)" @submit="addTag(f)"/><div v-if="f.editor==='rule_list'" class="row"><input type="checkbox" class="tag-regex-check" :id="'tag-regex-'+f.id" :checked="!!tagModes[f.id]" @change="v=>changeTagMode(f,v)"/><label @click="changeTagMode(f,!tagModes[f.id])">{{ texts.regexMode }}</label></div></div>
+              <div class="setting-copy"><label :id="'field-title-'+f.id" :class="f.primary?'subheading':'setting-title'">{{ f.label }}</label><label :id="'field-description-'+f.id" v-show="f.description" class="setting-description">{{ f.description }}</label><input v-show="isRuleList(f)" :id="'tag-input-'+f.id" :value="tagInputs[f.id]||''" :placeholder="tagEdits[f.id]?'':texts.tagInputPlaceholder" @input="v=>changeTagInput(f,v)" @submit="addTag(f)"/><div v-if="f.editor==='rule_list'" class="row"><input type="checkbox" class="tag-regex-check" :id="'tag-regex-'+f.id" :checked="!!tagModes[f.id]" @change="v=>changeTagMode(f,v)"/><label :id="'tag-regex-label-'+f.id" @click="changeTagMode(f,!tagModes[f.id])">{{ texts.regexMode }}</label></div></div>
               <ScrollView v-if="isRuleList(f)" :id="'tag-scroll-'+f.id" class="tag-region"><div :id="'tags-host-'+f.id"/></ScrollView>
               <div v-show="!isRange(f) &amp;&amp; !isRuleList(f)" class="setting-control" :class="f.editor==='choice'||f.editor==='recursive'?'choice-control':f.editor==='text'?(f.type==='number'?'number-control':'wide-control'):''">
                 <div v-show="f.editor==='toggle'" :id="'toggle-host-'+f.id" class="toggle-host"/>
                 <div v-show="f.editor==='choice'||f.editor==='recursive'" :id="'choice-'+f.id" class="choice-host"/>
                 <input v-show="f.editor==='text'" :ellipsis-start="isDirectoryValue(drafts[f.id]?drafts[f.id].text:f.text)" :id="'input-'+f.id" :value="drafts[f.id]?drafts[f.id].text:f.text" @input="v=>changeField(f,v)" @blur="commitField(f)" @submit="commitField(f)"/>
-                <div v-show="f.editor==='recursive' &amp;&amp; (drafts[f.id]?drafts[f.id].choice:f.choice)===2" class="column"><label class="muted">{{ texts.rounds }}</label><input :id="'rounds-'+f.id" :value="drafts[f.id]?drafts[f.id].text:f.text" @input="v=>changeField(f,v)" @blur="commitField(f)" @submit="commitField(f)"/></div>
-                <label v-show="f.editor==='readonly'" class="muted">{{ texts.readOnly }}</label>
+                <div v-show="f.editor==='recursive' &amp;&amp; (drafts[f.id]?drafts[f.id].choice:f.choice)===2" class="column"><label :id="'rounds-label-'+f.id" class="muted">{{ texts.rounds }}</label><input :id="'rounds-'+f.id" :value="drafts[f.id]?drafts[f.id].text:f.text" @input="v=>changeField(f,v)" @blur="commitField(f)" @submit="commitField(f)"/></div>
+                <label :id="'readonly-label-'+f.id" v-show="f.editor==='readonly'" class="muted">{{ texts.readOnly }}</label>
               </div>
             </div>
             <!-- Range modules have one draft and one atomic save target. -->
             <div v-if="isRange(f)" class="range-editor">
-              <div class="action-row"><toggle :id="'range-enabled-'+f.id" :checked="rangeValue(f).enabled" @change="v=>changeRange(f,'enabled',v,true)"/><label>{{ texts.rangeEnable }}</label></div>
+              <div class="action-row"><toggle :id="'range-enabled-'+f.id" :checked="rangeValue(f).enabled" @change="v=>changeRange(f,'enabled',v,true)"/><label :id="'range-enabled-label-'+f.id">{{ texts.rangeEnable }}</label></div>
               <div class="column">
                 <div class="range-pair">
                   <div :id="'range-lower-group-'+f.id" :class="f.editor==='datetime_range'?'range-group range-time':'range-group'">
-                    <label>{{ f.editor==='datetime_range'?texts.rangeStart:texts.rangeMin }}</label>
+                    <label :id="'range-lower-label-'+f.id">{{ f.editor==='datetime_range'?texts.rangeStart:texts.rangeMin }}</label>
                     <div class="range-bound">
                       <input :id="'range-lower-'+f.id" :class="f.editor==='datetime_range'?'range-date':''" :value="rangeValue(f).lower" :placeholder="f.editor==='datetime_range'?'YYYY-MM-DD HH:mm':''" @input="v=>changeRange(f,'lower',v,false)" @blur="commitField(f)" @submit="commitField(f)"/>
                       <select v-show="f.editor==='size_range'" class="range-unit" :id="'range-lower-unit-'+f.id" :value="rangeValue(f).lowerUnit" @change="v=>changeRange(f,'lowerUnit',v,true)"><option>B</option><option>KiB</option><option>MiB</option><option>GiB</option><option>TiB</option></select>
@@ -963,7 +971,7 @@ export default {
                     </div>
                   </div>
                   <div :id="'range-upper-group-'+f.id" :class="f.editor==='datetime_range'?'range-group range-time':'range-group'">
-                    <label>{{ f.editor==='datetime_range'?texts.rangeEnd:texts.rangeMax }}</label>
+                    <label :id="'range-upper-label-'+f.id">{{ f.editor==='datetime_range'?texts.rangeEnd:texts.rangeMax }}</label>
                     <div class="range-bound">
                       <input :id="'range-upper-'+f.id" :class="f.editor==='datetime_range'?'range-date':''" :value="rangeValue(f).upper" :placeholder="f.editor==='datetime_range'?'YYYY-MM-DD HH:mm':''" @input="v=>changeRange(f,'upper',v,false)" @blur="commitField(f)" @submit="commitField(f)"/>
                       <select v-show="f.editor==='size_range'" class="range-unit" :id="'range-upper-unit-'+f.id" :value="rangeValue(f).upperUnit" @change="v=>changeRange(f,'upperUnit',v,true)"><option>B</option><option>KiB</option><option>MiB</option><option>GiB</option><option>TiB</option></select>
@@ -973,7 +981,7 @@ export default {
                 </div>
               </div>
             </div>
-            <label v-show="saveErrors[f.id]" class="error">{{ errorText(saveErrors[f.id]) }}</label>
+            <label :id="'field-error-'+f.id" v-show="saveErrors[f.id]" class="error">{{ errorText(saveErrors[f.id]) }}</label>
             </div>
             </div>
           </div>

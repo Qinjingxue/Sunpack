@@ -156,10 +156,12 @@ struct RunReader {
         return Json::from_msgpack(raw.begin(),raw.end());
     }
 };
-bool matches(const Json& value,const std::wstring& query) {
+bool matches(const Json& value,const std::wstring& query,const std::string& time_query) {
     if(query.empty()) return true;
     auto contains=[&](const Json& v) { return v.is_string() && folded(v.get_ref<const std::string&>()).find(query)!=std::wstring::npos; };
     if(contains(value.value("path",Json()))) return true;
+    auto ts=value.find("ts");
+    if(!time_query.empty() && ts!=value.end() && ts->is_number() && task_time(ts->get<double>()).find(time_query)!=std::string::npos) return true;
     if(value.contains("group")) {
         const auto& group=value["group"];
         for(const char* field:{"path","name"}) if(group.contains(field) && contains(group[field])) return true;
@@ -179,6 +181,19 @@ Json EventLog::query(const WatchRoots& roots,const View& view,const std::string&
     auto revision=manifest.value("task_revision",uint64_t(0));
     for(const auto& run:manifest.at("runs")) runs.push_back(std::make_unique<RunReader>(folder,run,before,revision));
     auto query=folded(view.task_query); auto bits=filter(query);
+    // UTC microseconds are already indexed, including in old stores. Check
+    // local display time before rejecting the path bloom, decode candidates
+    // only, and reuse formatting across records within the same second.
+    const auto time_query=task_time_query(query);
+    int64_t time_second=INT64_MIN; bool time_match=false;
+    auto matches_time=[&](const Entry& row) {
+        if(time_query.empty()) return false;
+        const auto second=row.time/1000000;
+        if(second!=time_second) {
+            time_second=second; time_match=task_time(double(row.time)/1000000).find(time_query)!=std::string::npos;
+        }
+        return time_match;
+    };
     auto root_text=folded(view.task_root); std::replace(root_text.begin(),root_text.end(),L'/',L'\\'); auto root_bits=filter(root_text);
     EventLog page;
     std::optional<Cursor> last;
@@ -195,10 +210,10 @@ Json EventLog::query(const WatchRoots& roots,const View& view,const std::string&
                 if((++scanned&63)==0 && cancelled && cancelled()) return Json();
                 auto key=live->key(); auto row=live->current;
                 bool possible=row.kind && (!before || key<*before) && (!desired || row.kind==desired) &&
-                    (view.task_status!="taskWaiting" || row.kind==2 || row.kind==3) && includes(row,bits) && includes(row,root_bits);
+                    (view.task_status!="taskWaiting" || row.kind==2 || row.kind==3) && includes(row,root_bits) && (includes(row,bits) || matches_time(row));
                 if(possible && (live->selected.size()<PageRows+1 || key>live->selected.front().first)) {
                     auto value=live->value(packed,raw);
-                    if(matches(value,query) && (view.task_root.empty() || root_for(wide(value.value("path",std::string())),roots)==view.task_root)) {
+                    if(matches(value,query,time_query) && (view.task_root.empty() || root_for(wide(value.value("path",std::string())),roots)==view.task_root)) {
                         auto at=std::lower_bound(live->selected.begin(),live->selected.end(),key,[](const auto& item,const Cursor& key){return item.first<key;});
                         live->selected.insert(at,{key,row});
                         if(live->selected.size()>PageRows+1) live->selected.erase(live->selected.begin());
@@ -218,9 +233,9 @@ Json EventLog::query(const WatchRoots& roots,const View& view,const std::string&
         if(!selected) break;
         auto cursor=selected->key(); auto record=selected->current;
         if(!record.kind || (desired && record.kind!=desired) ||
-           (view.task_status=="taskWaiting" && record.kind!=2 && record.kind!=3) || !includes(record,bits) || !includes(record,root_bits)) { selected->previous(); continue; }
+           (view.task_status=="taskWaiting" && record.kind!=2 && record.kind!=3) || !includes(record,root_bits) || (!includes(record,bits) && !matches_time(record))) { selected->previous(); continue; }
         auto value=selected->value(packed,raw);
-        if(!matches(value,query) || (!view.task_root.empty() && root_for(wide(value.value("path",std::string())),roots)!=view.task_root)) { selected->previous(); continue; }
+        if(!matches(value,query,time_query) || (!view.task_root.empty() && root_for(wide(value.value("path",std::string())),roots)!=view.task_root)) { selected->previous(); continue; }
         if(page.tasks.size()>=PageRows || (bytes+(record.raw?record.raw:PageBytes)>PageBytes && !page.tasks.empty())) { more=true; break; }
         // These are independent snapshots, not events to merge across owners.
         // An older family's descriptor must never absorb a current retry card.

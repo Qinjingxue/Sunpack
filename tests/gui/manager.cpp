@@ -88,10 +88,13 @@ void projection(Fixture& f) {
     timestamps.accept(Json{{"event","done"},{"path",utf8(source.wstring())},{"ts",1792401342.731112}});
     auto time_row=task_rows(timestamps,{},{}).at("rows").at(0);
     assert(time_row["time"]=="2026-10-19 17:15:42");
+    View time_view;time_view.task_query="2026-10-19 17:15";
+    assert(task_rows(timestamps,{},time_view)["rows"].size()==1);
     assert(!time_row.contains("details"));
     for(auto value:{Json(),Json("invalid"),Json(std::numeric_limits<double>::infinity())}) {
         timestamps.accept(Json{{"event","done"},{"path",utf8(source.wstring())},{"ts",value}});
         assert(task_rows(timestamps,{},{}).at("rows").at(0).at("time")=="");
+        assert(task_rows(timestamps,{},time_view)["rows"].empty());
     }
     timestamps.accept(Json{{"event","done"},{"path",utf8(source.wstring())},{"ts",0}});
     assert(task_rows(timestamps,{},{}).at("rows").at(0).at("time")=="1970-01-01 08:00:00");

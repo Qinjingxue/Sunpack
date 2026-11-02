@@ -597,9 +597,40 @@ void localized_config_search(Application& app) {
             if(f["id"]=="/runtime/process_mode") matches(f["options"][0]["label"],f["id"]);
             if(f["id"]=="/watch/event_log_retention_days") matches(f["description"],f["id"]);
             if(f["id"]=="/watch/state_dir") matches(f["text"],f["id"]);
-            if(f["editor"]=="datetime_range") matches(texts["rangeEnd"],f["id"]);
-            if(f["editor"]=="size_range") matches("GiB",f["id"]);
+            if(f["editor"]=="datetime_range") {
+                // Filtering alone misses labels that have no find target.
+                for(const auto& side:{"lower","upper"}) {
+                    matches(texts[std::strcmp(side,"lower")==0?"rangeStart":"rangeEnd"],f["id"]);
+                    auto* label=ui::GetContext().GetWindow(app.window())->Root()->FindById("range-"+std::string(side)+"-label-"+f["id"].get<std::string>());
+                    assert(label && !label->textHighlights.empty());
+                }
+                matches(texts["rangePick"],f["id"]);
+                for(const char* side:{"lower","upper"}) {
+                    auto* button=ui::GetContext().GetWindow(app.window())->Root()->FindById("range-"+std::string(side)+"-pick-"+f["id"].get<std::string>());
+                    assert(button && !button->textHighlights.empty());
+                }
+            }
+            if(f["editor"]=="size_range") {
+                matches("GiB",f["id"]);
+                for(const char* side:{"lower","upper"}) {
+                    matches(texts[std::strcmp(side,"lower")==0?"rangeMin":"rangeMax"],f["id"]);
+                    auto* label=ui::GetContext().GetWindow(app.window())->Root()->FindById("range-"+std::string(side)+"-label-"+f["id"].get<std::string>());
+                    assert(label && !label->textHighlights.empty());
+                }
+            }
+            if(f["editor"]=="size_range" || f["editor"]=="datetime_range") {
+                matches(texts["rangeEnable"],f["id"]);
+                auto* label=ui::GetContext().GetWindow(app.window())->Root()->FindById("range-enabled-label-"+f["id"].get<std::string>());
+                assert(label && !label->textHighlights.empty());
+            }
         }
+        search_config(app,wide(texts["regexMode"].get<std::string>()).c_str());
+        size_t regexLabels=0;
+        for(auto& block:state(app.page(),"matchingBlocks")) for(auto& f:block["fields"]) if(f["editor"]=="rule_list") {
+            auto* label=ui::GetContext().GetWindow(app.window())->Root()->FindById("tag-regex-label-"+f["id"].get<std::string>());
+            if(label) {assert(!label->textHighlights.empty());++regexLabels;}
+        }
+        assert(regexLabels>0);
         search_config(app,wide(texts["dark"].get<std::string>()).c_str());
         assert(state(app.page(),"showThemeSetting")==true);
         search_config(app,wide(texts["startup"].get<std::string>()).c_str());
@@ -807,8 +838,18 @@ void range_config(Application& app,const fs::path& dir) {
     pump([&]{return bound("size_range","min_bytes")==uint64_t(9007199254740993);},"Exact size range save");
     input("range-upper-"+id,L"1"); ui_window_focus_widget(app.window(),0);
     pump([&]{return state(app.page(),"saveErrors").contains(id);},"Range ordering validation");
+    // Normal-value searches cannot catch omitted dynamic error text or stale
+    // matches after correction. Reuse this real validation error and window.
+    auto rangeError=state(app.page(),"saveErrors")[id]["text"].get<std::string>();
+    search_config(app,wide(rangeError).c_str());
+    auto* errorLabel=ui::GetContext().GetWindow(app.window())->Root()->FindById("field-error-"+id);
+    assert(errorLabel && errorLabel->visible && !errorLabel->textHighlights.empty());
+    search_setting(app,"size_range");
     assert(read_json(dir/"sunpack_config.json")[Json::json_pointer(id)]["min_bytes"]==uint64_t(9007199254740993));
     input("range-upper-"+id,L""); finish_input(app);
+    search_config(app,wide(rangeError).c_str());
+    assert(state(app.page(),"matchingBlocks").empty());
+    search_setting(app,"size_range");
     input("range-lower-"+id,L"2"); finish_input(app);
     auto unit=ui_widget_find_by_id(ui_page_root(app.page()),("range-lower-unit-"+id).c_str()); assert(unit);
     assert(ui_debug_combo_select(app.window(),unit,2)==0); ui_widget_destroy(unit); finish_input(app);
@@ -1109,11 +1150,33 @@ void tag_config(Application& app,const fs::path& dir) {
         assert(ui_debug_type_char(app.window(),8)==0);
         search_config(app,hint.c_str()); assert(state(app.page(),"matchingBlocks").empty());
         assert(ui_page_set_json(app.page(),"texts",texts.dump().c_str())==0);
+        // Thumb-width checks below cannot detect marks at the card's start.
+        // Compare the same-card field marks with their actual layout centers,
+        // including after resize and pure scrolling, using this existing host.
+        search_config(app,L"文件");
+        auto* outer=dynamic_cast<ui::ScrollViewWidget*>(window->Root()->FindById("configListScroll")); assert(outer);
+        auto markerY=[&](float center) {
+            const auto track=outer->ScrollbarTrackRect();
+            return track.top+(center-outer->rect.top+outer->ScrollY())/outer->ContentHeight()*(track.bottom-track.top-3);
+        };
+        auto fieldsMarked=[&] {
+            auto marks=record(outer->onDrawSearchMarkers);
+            for(const char* name:{"full_names","files"}) {
+                auto* label=window->Root()->FindById(std::string("field-title-/filesystem/scan_filters/0/")+name); assert(label);
+                const float y=markerY((label->rect.top+label->rect.bottom)/2);
+                assert(std::any_of(marks.begin(),marks.end(),[&](const auto& mark){return std::abs(mark.rect.top-y)<1.1f;}));
+            }
+        };
+        fieldsMarked();
+        window->ScrollWithMeasureContext(outer,outer->ScrollY()+150); fieldsMarked();
+        ui_window_set_size(app.window(),850,560); ui_window_relayout(app.window()); fieldsMarked();
+        ui_window_set_size(app.window(),1120,720); ui_window_relayout(app.window());
         search_config(app,L"RULE-179");
         assert(activeTag().size()==1 && inner() && inner()->ScrollY()>0);
         auto* tags=dynamic_cast<TagCollection*>(window->Root()->FindById("tags-"+pointer)); assert(tags);
         auto box=tags->TagBounds(184);
         assert(box.top>=inner()->rect.top-1 && box.bottom<=inner()->rect.bottom+1);
+        assert(std::abs(record(outer->onDrawSearchMarkers).back().rect.top-markerY((inner()->rect.top+inner()->rect.bottom)/2))<0.6f);
         search_config(app,L"duplicate"); assert(activeTag().size()==1);
         const auto first=activeTag().front();
         auto key=[&](int vk){SendMessageW(window->Handle(),WM_KEYDOWN,vk,0);ui_window_relayout(app.window());};
@@ -1672,6 +1735,16 @@ void task_history(Application& app,const fs::path& dir) {
     publish_events(dir/".sunpack_watch"/"events.json",many);
     assert(ui_page_call_json(app.page(),"searchTasks",R"("")")==0);
     pump_diagnostic(app,[&]{return state(app.page(),"tasks")["total"]==100;},"Load virtual tasks");
+    // Projection tests cannot catch omitted time-label targets or highlighters.
+    // The real history window also ensures a date query survives disk filtering.
+    auto time=state(app.page(),"tasks")["rows"][0]["time"].get<std::string>(); assert(time.size()==19);
+    assert(ui_page_call_json(app.page(),"searchTasks",Json(time).dump().c_str())==0);
+    pump_diagnostic(app,[&]{
+        auto* active=active_find_widget(ui::GetContext().GetWindow(app.window())->Root()->FindById("taskItems"));
+        return active && active->id.rfind("taskTime-",0)==0;
+    },"Task timestamp find and highlight");
+    assert(ui_page_call_json(app.page(),"searchTasks",R"("")")==0);
+    pump_diagnostic(app,[&]{return state(app.page(),"tasks")["total"]==100 && state(app.page(),"taskPending").is_null();},"Reset timestamp search");
     const auto first_id=state(app.page(),"tasks")["rows"][0]["id"];
     auto* window=ui::GetContext().GetWindow(app.window());
     auto* list=dynamic_cast<ui::VirtualListWidget*>(window->Root()->FindById("taskItems"));
