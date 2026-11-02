@@ -119,8 +119,10 @@ function Invoke-TestStep {
     $startTime = Get-Date
     $joinedCommand = $Command -join " "
     $junitReportPath = $null
+    $diagnosticStep = $null
     $stdoutPath = $null
     $stderrPath = $null
+    $retainOutput = $false
 
     if ($QuietOutput) {
         $stdoutPath = [System.IO.Path]::GetTempFileName()
@@ -132,6 +134,11 @@ function Invoke-TestStep {
             "sunpack-acceptance-{0}-{1}.xml" -f $PID, [guid]::NewGuid().ToString("N")
         )
         $argsList += "--junitxml=$junitReportPath"
+        if ($env:SUNPACK_ACCEPTANCE_DIAGNOSTICS_DIR) {
+            $diagnosticStep = Join-Path $env:SUNPACK_ACCEPTANCE_DIAGNOSTICS_DIR ($Label -replace '[^a-zA-Z0-9]+', '-')
+            New-Item -ItemType Directory -Force -Path $diagnosticStep | Out-Null
+            $argsList += @(('"--diagnostics-dir={0}"' -f $diagnosticStep), "-o", "faulthandler_timeout=60")
+        }
     }
 
     if ($VerboseOutput) {
@@ -142,6 +149,11 @@ function Invoke-TestStep {
     if ($KeepElevationIfAdministrator -and $script:AcceptanceProcessIsAdministrator) {
         Write-Host "    Running this step with the acceptance process administrator token" -ForegroundColor DarkGray
         $runnerArguments = $argsList
+        if ($diagnosticStep) {
+            $stdoutPath = Join-Path $diagnosticStep "stdout.bin"
+            $stderrPath = Join-Path $diagnosticStep "stderr.bin"
+            $retainOutput = $true
+        }
     } else {
         # The acceptance script may itself require elevation to install the temporary
         # Watch Broker service. Keep ordinary test/smoke commands behind the existing
@@ -149,10 +161,10 @@ function Invoke-TestStep {
         $runnerArguments = @(
             $unelevatedRunner,
             "--cwd", $repoRoot,
-            "--timeout-seconds", [string]$TimeoutSeconds,
-            "--",
-            $Command[0]
+            "--timeout-seconds", [string]$TimeoutSeconds
         )
+        if ($diagnosticStep) { $runnerArguments += @("--output-directory", ('"{0}"' -f $diagnosticStep)) }
+        $runnerArguments += @("--", $Command[0])
         $runnerArguments += $argsList
     }
 
@@ -280,7 +292,11 @@ function Invoke-TestStep {
         }
         foreach ($outputPath in @($stdoutPath, $stderrPath)) {
             if ($outputPath -and (Test-Path -LiteralPath $outputPath)) {
-                Remove-Item -LiteralPath $outputPath -Force
+                if ($retainOutput) {
+                    Get-Content -LiteralPath $outputPath -Encoding UTF8 | ForEach-Object { Write-Host $_ }
+                } else {
+                    Remove-Item -LiteralPath $outputPath -Force
+                }
             }
         }
     }

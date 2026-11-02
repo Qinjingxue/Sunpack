@@ -51,6 +51,7 @@ def repo_root() -> Path:
 
 
 def pytest_addoption(parser):
+    parser.addoption("--diagnostics-dir", default=None, help="Persist worker progress for acceptance diagnostics")
     parser.addoption(
         "--run-performance",
         action="store_true",
@@ -78,6 +79,14 @@ def pytest_addoption(parser):
         help="Payload size in MiB for each generated large archive.",
     )
 def pytest_configure(config):
+    diagnostic_dir = config.getoption("--diagnostics-dir")
+    if diagnostic_dir:
+        directory = Path(diagnostic_dir)
+        directory.mkdir(parents=True, exist_ok=True)
+        worker = os.environ.get("PYTEST_XDIST_WORKER", "controller")
+        log = (directory / f"{worker}-{os.getpid()}.log").open("w", encoding="utf-8", buffering=1)
+        config.pluginmanager.register(_AcceptanceDiagnostics(log))
+        config.add_cleanup(log.close)
     config.addinivalue_line(
         "markers",
         "performance: opt-in timing or resource stability assertion; run with --run-performance",
@@ -90,6 +99,33 @@ def pytest_configure(config):
         "markers",
         "requires_watch_broker: requires the isolated, ephemeral Watch Broker test service",
     )
+
+
+class _AcceptanceDiagnostics:
+    def __init__(self, log):
+        self.log = log
+        self.log.write("session configured\n")
+
+    def pytest_sessionstart(self, session):
+        self.log.write("session started\n")
+
+    def pytest_collection_finish(self, session):
+        self.log.write(f"collected {len(session.items)} tests\n")
+
+    @pytest.hookimpl(tryfirst=True)
+    def pytest_runtest_setup(self, item):
+        self.log.write(f"setup {item.nodeid}\n")
+
+    @pytest.hookimpl(tryfirst=True)
+    def pytest_runtest_call(self, item):
+        self.log.write(f"call {item.nodeid}\n")
+
+    @pytest.hookimpl(tryfirst=True)
+    def pytest_runtest_teardown(self, item):
+        self.log.write(f"teardown {item.nodeid}\n")
+
+    def pytest_sessionfinish(self, session, exitstatus):
+        self.log.write(f"session finished {exitstatus}\n")
 
 
 def pytest_collection_modifyitems(config, items):

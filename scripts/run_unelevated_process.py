@@ -16,6 +16,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--cwd", required=True)
     parser.add_argument("--timeout-seconds", type=float, default=600.0)
     parser.add_argument("--capture-directory", help=argparse.SUPPRESS)
+    parser.add_argument("--output-directory", help=argparse.SUPPRESS)
     parser.add_argument("--env", action="append", default=[], help=argparse.SUPPRESS)
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
@@ -77,6 +78,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.capture_directory:
         return _run_captured_child(args, cwd)
     if not is_process_elevated():
+        if args.output_directory:
+            args.capture_directory = args.output_directory
+            exit_code = _run_captured_child(args, cwd)
+            _replay(Path(args.output_directory) / "stdout.bin", sys.stdout)
+            _replay(Path(args.output_directory) / "stderr.bin", sys.stderr)
+            return exit_code
         try:
             return int(
                 subprocess.run(
@@ -91,8 +98,13 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Unelevated process timed out after {args.timeout_seconds:.1f}s", file=sys.stderr)
             return 124
 
-    temporary = tempfile.TemporaryDirectory(prefix="sunpack-unelevated-output-")
-    capture_root = Path(temporary.name)
+    temporary = None
+    if args.output_directory:
+        capture_root = Path(args.output_directory).resolve()
+        capture_root.mkdir(parents=True, exist_ok=True)
+    else:
+        temporary = tempfile.TemporaryDirectory(prefix="sunpack-unelevated-output-")
+        capture_root = Path(temporary.name)
     helper_command = [
         sys.executable,
         str(Path(__file__).resolve()),
@@ -128,7 +140,8 @@ def main(argv: list[str] | None = None) -> int:
         close = getattr(process, "close", None)
         if callable(close):
             close()
-        temporary.cleanup()
+        if temporary is not None:
+            temporary.cleanup()
 
 
 if __name__ == "__main__":

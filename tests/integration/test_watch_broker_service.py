@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import os
+import asyncio
 import re
 import statistics
 import subprocess
 import sys
+import tempfile
 import time
 import zipfile
 from pathlib import Path
@@ -118,8 +120,7 @@ def _broker_lifecycle_roundtrip(tmp_path):
             sunpack_native.watch_broker_release()
 
 
-def test_service_stays_alive_until_the_last_process_lease_is_released():
-    helper = """
+_LEASE_HELPER = """
 import sys
 import sunpack_native
 sunpack_native.watch_broker_acquire()
@@ -136,41 +137,69 @@ finally:
     sunpack_native.watch_broker_release()
 """
 
-    def start_client() -> subprocess.Popen[str]:
-        process = subprocess.Popen(
-            [sys.executable, "-c", helper],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
+async def _exercise_process_leases(helper: str, *, reply_timeout: float = 30.0):
+    processes = []
+    errors = []
+    failed = False
+
+    async def start_client():
+        error_file = tempfile.TemporaryFile()
+        errors.append(error_file)
+        process = await asyncio.create_subprocess_exec(
+            sys.executable, "-c", helper, stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE, stderr=error_file,
         )
-        assert process.stdout is not None
-        ready = process.stdout.readline().strip()
-        if ready != "READY":
-            stderr = process.stderr.read() if process.stderr is not None else ""
-            process.kill()
-            pytest.fail(f"broker lease subprocess failed: {ready!r} {stderr}")
+        processes.append(process)
+        await expect(process, b"READY")
         return process
 
-    first = start_client()
-    second = start_client()
-    try:
-        assert first.stdin is not None
-        first.stdin.write("exit\n")
-        first.stdin.flush()
-        assert first.wait(timeout=5.0) == 0
+    async def expect(process, expected):
+        try:
+            line = await asyncio.wait_for(process.stdout.readline(), reply_timeout)
+        except asyncio.TimeoutError as error:
+            raise AssertionError(f"broker lease subprocess {process.pid} did not send {expected.decode()}") from error
+        assert line.strip() == expected, f"broker lease subprocess {process.pid}: expected {expected!r}, got {line!r}"
 
-        assert second.stdin is not None and second.stdout is not None
-        second.stdin.write("ping\n")
-        second.stdin.flush()
-        assert second.stdout.readline().strip() == "PONG"
+    try:
+        first = await start_client()
+        second = await start_client()
+        first.stdin.write(b"exit\n")
+        await first.stdin.drain()
+        assert await asyncio.wait_for(first.wait(), 5.0) == 0
+        second.stdin.write(b"ping\n")
+        await second.stdin.drain()
+        await expect(second, b"PONG")
+    except BaseException:
+        failed = True
+        raise
     finally:
-        for process in (first, second):
-            if process.poll() is None:
-                if process.stdin is not None:
-                    process.stdin.write("exit\n")
-                    process.stdin.flush()
+        cleanup_failures = []
+        for process in processes:
+            if process.stdin is not None:
+                process.stdin.close()
+        for process in processes:
+            if process.returncode is None:
                 try:
-                    process.wait(timeout=5.0)
-                except subprocess.TimeoutExpired:
-                    process.kill()
+                    await asyncio.wait_for(process.wait(), 5.0)
+                except asyncio.TimeoutError:
+                    cleanup_failures.append(f"broker lease subprocess {process.pid} did not exit")
+                    try:
+                        process.kill()
+                    except ProcessLookupError:
+                        pass
+                    await process.wait()
+            if not failed and process.returncode != 0:
+                cleanup_failures.append(f"broker lease subprocess {process.pid} exited {process.returncode}")
+        for error_file in errors:
+            if failed or cleanup_failures:
+                error_file.seek(0)
+                diagnostic = error_file.read(65536).decode("utf-8", errors="replace")
+                if diagnostic:
+                    print(f"broker lease subprocess stderr:\n{diagnostic}", file=sys.stderr)
+            error_file.close()
+        if cleanup_failures and not failed:
+            raise AssertionError("; ".join(cleanup_failures))
+
+
+def test_service_stays_alive_until_the_last_process_lease_is_released():
+    asyncio.run(_exercise_process_leases(_LEASE_HELPER))

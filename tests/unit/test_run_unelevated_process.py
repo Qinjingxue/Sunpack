@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
 
 import pytest
 
@@ -101,3 +103,24 @@ def test_elevated_runner_passes_complete_environment_to_unelevated_launcher(monk
     )
     assert environment["SUNPACK_EXPLICIT_TEST_VALUE"] == "overridden"
     assert environment is not os.environ
+
+
+@pytest.mark.parametrize("elevated", [False, True])
+def test_runner_retains_child_output_for_acceptance_diagnostics(tmp_path, monkeypatch, capfd, elevated):
+    # A killed outer runner cannot replay its temporary files. Exercise the
+    # actual captured child and check its output remains available on disk.
+    monkeypatch.setattr(run_unelevated_process, "is_process_elevated", lambda: elevated)
+    monkeypatch.setattr(
+        run_unelevated_process, "launch_unelevated",
+        lambda argv, *, cwd, env: subprocess.Popen(argv, cwd=cwd, env=env),
+    )
+    output = tmp_path / "diagnostics"
+    code = run_unelevated_process.main([
+        "--cwd", str(tmp_path), "--output-directory", str(output), "--",
+        sys.executable, "-c", "import sys; print('progress'); print('stack', file=sys.stderr); sys.exit(7)",
+    ])
+    assert code == 7
+    assert b"progress" in (output / "stdout.bin").read_bytes()
+    assert b"stack" in (output / "stderr.bin").read_bytes()
+    captured = capfd.readouterr()
+    assert "progress" in captured.out and "stack" in captured.err
