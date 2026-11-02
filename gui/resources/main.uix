@@ -622,7 +622,7 @@ export default {
 </script>
 <style>
   .app { flex:1; gap:0px; color:var(--fg); font-size:14px; }
-  .light { background:#f3f3f3; }
+  .light { background:var(--window-bg); }
   .dark { background:#202020; }
   label { display:block; }
   .navigation { width:280px; flex-shrink:0; padding:16px 12px 8px; gap:4px; }
@@ -632,9 +632,9 @@ export default {
   .app-icon { width:40px; height:40px; flex-shrink:0; }
   .brand { font-size:20px; font-weight:600; }
   .nav-item { display:flex; width:100%; flex-direction:row; align-items:center; height:40px; padding:0px 4px; gap:12px; border:0px; border-radius:4px; background:#00000001; color:var(--fg); }
-  .light .nav-item:hover { background:#ebebeb; }
+  .light .nav-item:hover { background:var(--sidebar-hover); }
   .dark .nav-item:hover { background:#2d2d2d; }
-  .light .on { background:#e6e6e6; color:var(--fg); }
+  .light .on { background:var(--bg-4); color:var(--fg); }
   .dark .on { background:#363636; color:var(--fg); }
   .nav-icon { width:18px; height:18px; color:var(--fg); }
   .nav-mark { width:3px; height:16px; }
@@ -705,7 +705,7 @@ export default {
   .dark .status-info { color:#75b6e7; background:#243b50; }
   .time { color:var(--fg-2); font-size:12px; }
   .error { color:#d15b48; font-size:12px; width:100%; flex-shrink:0; }
-  .light .card, .task.light, .card.light { background:#fbfbfb; border:1px solid #e5e5e5; }
+  .light .card, .task.light, .card.light { background:var(--card-bg); border:1px solid var(--card-border); }
   .dark .card, .task.dark, .card.dark { background:#2b2b2b; border:1px solid #303030; }
   /* Actions keep their intrinsic text width even when a scrollbar appears.
      Flexible text/inputs yield space; action rows wrap instead of shrinking. */
@@ -739,7 +739,7 @@ export default {
   .setting-control input, .setting-control textarea { width:100%; }
   .toggle-host { height:26px; align-items:flex-end; }
   .setting-card { padding:16px 20px; gap:10px; border:1px solid var(--card-border); border-radius:8px; }
-  .setting-card.light { background:#fbfbfb; border:1px solid #e5e5e5; }
+  .setting-card.light { background:var(--card-bg); border:1px solid var(--card-border); }
   .setting-card.dark { background:#2b2b2b; border:1px solid #303030; }
   .setting-card { gap:0px; padding:0px 20px; }
   .block-fields { gap:0px; }
@@ -759,7 +759,7 @@ export default {
   .tag-setting .setting-copy .tag-regex-check { width:24px; height:24px; flex-shrink:0; }
   .tag-region { height:112px; min-width:0px; padding:6px 18px 6px 6px; border:1px solid var(--card-border); border-radius:6px; }
   .history-entry { gap:0px; padding:0px 12px; border:1px solid var(--card-border); border-radius:8px; }
-  .light .history-entry, .light .root-header { background:#fbfbfb; }
+  .light .history-entry, .light .root-header { background:var(--card-bg); }
   .dark .history-entry, .dark .root-header { background:#2b2b2b; }
   .history-entry > .action-row { padding-bottom:10px; }
   .history-row { flex-direction:row; align-items:center; gap:12px; padding:10px 0px; min-height:52px; }

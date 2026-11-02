@@ -26,7 +26,10 @@ enum class EasingFunction {
     EaseOutBounce,
     EaseOutBack,
     FluentEnter,     // cubic-bezier(0, 0, 0, 1)
-    FluentStandard   // cubic-bezier(0.55, 0.55, 0, 1)
+    FluentStandard,  // cubic-bezier(0.55, 0.55, 0, 1)
+    MaterialEnter,   // cubic-bezier(0, 0, 0.2, 1)
+    MaterialExit,    // cubic-bezier(0.4, 0, 1, 1)
+    MaterialStandard // cubic-bezier(0.4, 0, 0.2, 1)
 };
 
 UI_API float ApplyEasing(EasingFunction func, float t);

@@ -67,8 +67,10 @@ void style_frame(HWND hwnd,UiThemeMode mode) {
     BOOL dark=mode==UI_THEME_DARK;
     BOOL disable_transitions=FALSE;
     DwmSetWindowAttribute(hwnd,DWMWA_TRANSITIONS_FORCEDISABLED,&disable_transitions,sizeof(disable_transitions));
-    COLORREF background=dark?RGB(32,32,32):RGB(243,243,243);
-    COLORREF foreground=dark?RGB(255,255,255):RGB(26,26,26);
+    const auto& colors=theme::Current();
+    auto native_color=[](D2D1_COLOR_F c) { return RGB(int(c.r*255+0.5f),int(c.g*255+0.5f),int(c.b*255+0.5f)); };
+    COLORREF background=dark?RGB(32,32,32):native_color(colors.titleBarBg);
+    COLORREF foreground=dark?RGB(255,255,255):native_color(colors.titleBarText);
     auto corners=DWMWCP_ROUND;
     // These optional Win11 attributes fail harmlessly on older Windows builds.
     DwmSetWindowAttribute(hwnd,DWMWA_USE_IMMERSIVE_DARK_MODE,&dark,sizeof(dark));
@@ -826,8 +828,9 @@ LRESULT CALLBACK Application::subclass(HWND hwnd,UINT message,WPARAM wparam,LPAR
     auto* self=reinterpret_cast<Application*>(data);
     try {
         if(message==WM_DPICHANGED) self->update_icons(LOWORD(wparam));
-        if(message==WM_MOVE || message==WM_SIZE || message==WM_DPICHANGED || message==WM_CLOSE ||
-           message==WM_SHOWWINDOW || message==WM_SETTINGCHANGE || (message==WM_KEYDOWN && wparam==VK_ESCAPE))
+        if(message==WM_WINDOWPOSCHANGED || message==WM_DPICHANGED)
+            ui::OverlayService::Instance().RefreshOwner(hwnd);
+        if(message==WM_CLOSE || message==WM_SETTINGCHANGE || (message==WM_KEYDOWN && wparam==VK_ESCAPE))
             ui::OverlayService::Instance().DismissOwner(hwnd);
         if(message==TaskRange) {
             self->task_range_pending_=false;

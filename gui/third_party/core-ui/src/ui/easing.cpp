@@ -9,6 +9,20 @@ float ApplyEasing(EasingFunction func, float t) {
     t = std::clamp(t, 0.0f, 1.0f);
 
     switch (func) {
+        case EasingFunction::MaterialEnter:
+        case EasingFunction::MaterialExit:
+        case EasingFunction::MaterialStandard: {
+            if (t == 0.0f || t == 1.0f) return t;
+            const float x1 = func == EasingFunction::MaterialEnter ? 0.0f : 0.4f;
+            const float x2 = func == EasingFunction::MaterialExit ? 1.0f : 0.2f;
+            float lo = 0, hi = 1, s = t;
+            for (int i = 0; i < 14; ++i) {
+                s = (lo + hi) * 0.5f;
+                const float x = 3*(1-s)*(1-s)*s*x1 + 3*(1-s)*s*s*x2 + s*s*s;
+                if (x < t) lo = s; else hi = s;
+            }
+            return s*s*(3-2*s);
+        }
         case EasingFunction::FluentEnter:
             return 3.0f * std::pow(t, 2.0f / 3.0f) - 2.0f * t;
         case EasingFunction::FluentStandard: {

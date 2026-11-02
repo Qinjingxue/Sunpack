@@ -549,8 +549,43 @@ void UiWindowImpl::ShowImmediate(bool activate) {
 }
 
 void UiWindowImpl::Hide() {
+    HideTooltip(true);
     StopAnimationFrames();
     ShowWindow(hwnd_, SW_HIDE);
+}
+
+void UiWindowImpl::ShowTooltip(Widget* owner) {
+    if (!owner || owner->tooltip.empty()) return;
+    tooltipWidget_ = owner;
+    tooltipText_ = owner->tooltip;
+    tooltipAnchor_ = owner->rect;
+    tooltipMeasureWidth_ = 0;
+    tooltipVisible_ = true;
+    BOOL motion = TRUE;
+    SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &motion, 0);
+    if (motion)
+        tooltipProgress_.Retarget(1.0f, {150.0f, EasingFunction::MaterialEnter});
+    else
+        tooltipProgress_.SetImmediate(1.0f);
+    StartAnimationFrames();
+    Invalidate();
+}
+
+void UiWindowImpl::HideTooltip(bool immediate) {
+    if (tooltipTimerId_) { KillTimer(hwnd_, tooltipTimerId_); tooltipTimerId_ = 0; }
+    if (tooltipWidget_) tooltipAnchor_ = tooltipWidget_->rect;
+    tooltipVisible_ = false;
+    tooltipWidget_ = nullptr;
+    if (tooltipText_.empty()) return;
+    BOOL motion = TRUE;
+    if (!immediate)
+        SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &motion, 0);
+    if (immediate || !motion) tooltipProgress_.SetImmediate(0.0f);
+    else tooltipProgress_.Retarget(0.0f, {150.0f, EasingFunction::MaterialExit});
+    // Exit uses a value snapshot, so it never retains an unmounted row.
+    if (!tooltipProgress_.Active()) std::wstring{}.swap(tooltipText_);
+    StartAnimationFrames();
+    Invalidate();
 }
 
 void UiWindowImpl::NotifyWidgetDestroyed(Widget* w) {
@@ -558,7 +593,7 @@ void UiWindowImpl::NotifyWidgetDestroyed(Widget* w) {
     if (hoveredWidget_ == w) hoveredWidget_ = nullptr;
     if (pressedWidget_ == w) pressedWidget_ = nullptr;
     if (focusedWidget_ == w) focusedWidget_ = nullptr;
-    if (tooltipWidget_ == w) tooltipWidget_ = nullptr;
+    if (tooltipWidget_ == w) HideTooltip();
     if (dragSource_ == w) { dragSource_ = nullptr; dragActive_ = false; }
     if (dragOverTarget_ == w) dragOverTarget_ = nullptr;
     animationHost_.RemoveWidget(w);
@@ -579,9 +614,7 @@ void UiWindowImpl::ClearHiddenHover(Widget* subtree) {
         w->hovered = false;
         w->RefreshCssState();
     }
-    tooltipVisible_ = false;
-    tooltipWidget_ = nullptr;
-    if (tooltipTimerId_) { KillTimer(hwnd_, tooltipTimerId_); tooltipTimerId_ = 0; }
+    HideTooltip();
 }
 
 void UiWindowImpl::ActivateForMouseInput() {
@@ -1165,7 +1198,7 @@ void UiWindowImpl::StartWindowCloseAnimation() {
 }
 
 bool UiWindowImpl::HasAnimationFrameWork() const {
-    return !animationHost_.Empty() || propertyAnimations_.HasActive();
+    return !animationHost_.Empty() || propertyAnimations_.HasActive() || tooltipProgress_.Active();
 }
 
 void UiWindowImpl::StartAnimationFrames() {
@@ -1460,10 +1493,10 @@ LRESULT UiWindowImpl::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             // WM_PAINT to resume motion after the hidden startup frame.
             if (HasAnimationFrameWork()) RequestRenderFrame(FrameReason::Animation);
         }
-        else { scrollFrameGeneration_ = 0; StopAnimationFrames(); }
+        else { HideTooltip(true); scrollFrameGeneration_ = 0; StopAnimationFrames(); }
         break;
     case WM_SIZE: {
-        if (wParam == SIZE_MINIMIZED) { scrollFrameGeneration_ = 0; StopAnimationFrames(); }
+        if (wParam == SIZE_MINIMIZED) { HideTooltip(true); scrollFrameGeneration_ = 0; StopAnimationFrames(); }
         else UpdateToggleAnimTimer();
         TraceScope wmSizeScope("core_window", "wm_size_duration");
         {
@@ -1573,7 +1606,7 @@ LRESULT UiWindowImpl::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             }
             hoveredWidget_ = nullptr;
         }
-        tooltipVisible_ = false; tooltipWidget_ = nullptr;
+        HideTooltip();
         for(auto& weak:hoveredScrollViews_) if(auto alive=weak.lock())
             changed=static_cast<ScrollViewWidget*>(alive.get())->ClearPointerHover()||changed;
         hoveredScrollViews_.clear();
@@ -1621,13 +1654,7 @@ LRESULT UiWindowImpl::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             // 沿父链上溯取 tooltip owner (同 OnMouseMove 调度处, L72).
             Widget* tipOwner = hoveredWidget_;
             while (tipOwner && tipOwner->tooltip.empty()) tipOwner = tipOwner->Parent();
-            if (tipOwner && !tooltipVisible_) {
-                tooltipVisible_ = true;
-                tooltipWidget_ = tipOwner;
-                tooltipX_ = mouseX_;
-                tooltipY_ = mouseY_;
-                Invalidate();
-            }
+            if (tipOwner && !tooltipVisible_) ShowTooltip(tipOwner);
             return 0;
         }
         if (wParam == kCaretBlinkTimerId) {
@@ -2166,6 +2193,8 @@ LRESULT UiWindowImpl::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
 // ---- Paint ----
 
 void UiWindowImpl::BeginAnimationFrame() {
+    tooltipProgress_.SampleFrame(AnimationClockMs());
+    if (!tooltipVisible_ && !tooltipProgress_.Active()) std::wstring{}.swap(tooltipText_);
     if (animationHost_.Empty()) return;
     // Wheel motion can mount/measure virtual rows on an animation frame.
     ActiveMeasureContextScope measureScope(measureContext_, renderer_);
@@ -2300,7 +2329,7 @@ void UiWindowImpl::BeginAnimationFrame() {
     if (!anyAnimating) {
         animationHost_.Clear();
         lastAnimationFrameTick_ = 0;
-        if (!propertyAnimations_.HasActive()) StopAnimationFrames();
+        if (!HasAnimationFrameWork()) StopAnimationFrames();
     }
 }
 
@@ -2502,69 +2531,65 @@ DisplayList UiWindowImpl::OnPaint(uint64_t frameGeneration) {
                            DWRITE_TEXT_ALIGNMENT_CENTER);
     }
 
-    // Tooltip rendering
-    if (tooltipVisible_ && tooltipWidget_ && !tooltipWidget_->tooltip.empty()) {
-        const auto& text = tooltipWidget_->tooltip;
-        float fontSize = theme::kFontSizeSmall;
-        float padH = 10.0f, padV = 5.0f;
-
-        /* 在 BeginDraw 之外测量文字宽度（避免 RT 状态影响） */
-        float textW = fontSize * 0.65f * static_cast<float>(text.size());  /* 估算 */
-        /* 用 DWrite 精确测量 */
-        {
-            IDWriteFactory* dwf = renderer_.DWFactory();
-            IDWriteTextFormat* fmt = nullptr;
-            if (dwf) {
-                dwf->CreateTextFormat(theme::kFontFamily, nullptr,
-                    DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
-                    DWRITE_FONT_STRETCH_NORMAL, fontSize, L"", &fmt);
-                if (fmt) {
-                    IDWriteTextLayout* layout = nullptr;
-                    dwf->CreateTextLayout(text.c_str(), (UINT32)text.size(),
-                        fmt, 1000.0f, 100.0f, &layout);
-                    if (layout) {
-                        DWRITE_TEXT_METRICS metrics = {};
-                        layout->GetMetrics(&metrics);
-                        textW = metrics.width;
-                        layout->Release();
-                    }
-                    fmt->Release();
-                }
-            }
+    // Top-centered speech bubble. Only its paint transform changes during
+    // motion; measurement uses the renderer's existing bounded text cache.
+    if (!tooltipText_.empty() && tooltipProgress_.Current() > 0.0f) {
+        if (tooltipWidget_) tooltipAnchor_ = tooltipWidget_->rect;
+        constexpr float fontSize = theme::kFontSizeNormal;
+        constexpr float padH = 14.0f, padV = 8.0f;
+        constexpr float radius = 6.0f, arrow = 6.0f, gap = 10.0f, margin = 4.0f;
+        const auto winSize = CachedClientSizeDip();
+        if (tooltipMeasureWidth_ != winSize.width) {
+            tooltipSize_.width = std::min(renderer_.MeasureTextWidth(tooltipText_, fontSize) + padH*2,
+                                          std::max(padH*2 + arrow*2, winSize.width - margin*2));
+            tooltipSize_.height = std::max(fontSize*1.6f,
+                renderer_.MeasureTextHeight(tooltipText_, tooltipSize_.width - padH*2, fontSize)) + padV*2;
+            tooltipMeasureWidth_ = winSize.width;
         }
+        const float tipW = tooltipSize_.width, tipH = tooltipSize_.height;
+        const float cx = (tooltipAnchor_.left + tooltipAnchor_.right)*0.5f;
+        const float tipX = std::clamp(cx - tipW*0.5f, margin,
+                                      std::max(margin, winSize.width - margin - tipW));
+        const bool above = tooltipAnchor_.top - gap - tipH >= margin ||
+            tooltipAnchor_.top > winSize.height - tooltipAnchor_.bottom;
+        const float tipY = std::clamp(above ? tooltipAnchor_.top - gap - tipH : tooltipAnchor_.bottom + gap,
+                                      margin, std::max(margin, winSize.height - margin - tipH));
+        const D2D1_RECT_F bg = {tipX, tipY, tipX + tipW, tipY + tipH};
+        const float arrowX = std::clamp(cx, bg.left + radius + arrow, bg.right - radius - arrow);
+        const float edgeY = above ? bg.bottom : bg.top;
+        const float direction = above ? 1.0f : -1.0f;
+        const D2D1_POINT_2F origin = {arrowX, edgeY + direction*arrow};
+        const float progress = tooltipProgress_.Current();
+        const float scale = 0.85f + 0.15f*progress;
+        const D2D1_RECT_F bounds = {bg.left - 4, bg.top - arrow - 4, bg.right + 4, bg.bottom + arrow + 6};
+        renderer_.PushTransform(D2D1::Matrix3x2F::Scale(scale, scale, origin));
+        renderer_.PushOpacity(progress, bounds);
 
-        float tipW = textW + padH * 2;
-        float tipH = fontSize + padV * 2 + 4.0f;
-
-        /* 在 widget 下方居中显示 */
-        float cx = (tooltipWidget_->rect.left + tooltipWidget_->rect.right) * 0.5f;
-        float tipX = cx - tipW * 0.5f;
-        float tipY = tooltipWidget_->rect.bottom + 4.0f;
-
-        /* 确保不超出窗口 */
-        D2D1_SIZE_F winSize = CachedClientSizeDip();
-        if (tipX + tipW > winSize.width - 4) tipX = winSize.width - 4 - tipW;
-        if (tipX < 4) tipX = 4;
-        if (tipY + tipH > winSize.height - 4) {
-            tipY = tooltipWidget_->rect.top - tipH - 4.0f;
+        const auto& colors = theme::Current();
+        const auto bgColor = colors.tooltipBg;
+        const auto borderColor = colors.tooltipBorder;
+        const auto textColor = colors.tooltipText;
+        // A small geometry-only shadow avoids creating blur effects per frame.
+        for (int spread = 3; spread >= 1; --spread) {
+            const float s = static_cast<float>(spread);
+            renderer_.FillRoundedRect({bg.left-s, bg.top-s+2, bg.right+s, bg.bottom+s+2},
+                                      radius+s, radius+s, D2D1::ColorF(0, 0, 0, 0.04f));
         }
-
-        D2D1_RECT_F bg = {tipX, tipY, tipX + tipW, tipY + tipH};
-        /* 跟随主题：深色模式深底，浅色模式浅底 */
-        D2D1_COLOR_F bgColor, borderColor;
-        if (theme::IsDark()) {
-            bgColor     = {0.15f, 0.15f, 0.18f, 0.95f};
-            borderColor = {0.30f, 0.30f, 0.35f, 0.80f};
-        } else {
-            bgColor     = {0.98f, 0.98f, 0.98f, 0.97f};
-            borderColor = {0.70f, 0.70f, 0.72f, 0.80f};
-        }
-        renderer_.FillRoundedRect(bg, 4.0f, 4.0f, bgColor);
-        renderer_.DrawRoundedRect(bg, 4.0f, 4.0f, borderColor, 0.5f);
-
-        D2D1_RECT_F textRect = {tipX, tipY + padV, tipX + tipW, tipY + tipH - padV};
-        renderer_.DrawText(text, textRect, theme::kBtnText(), fontSize,
-                           DWRITE_TEXT_ALIGNMENT_CENTER);
+        renderer_.FillRoundedRect(bg, radius, radius, bgColor);
+        renderer_.DrawRoundedRect(bg, radius, radius, borderColor, 0.5f);
+        const D2D1_POINT_2F arrowPoints[4] = {
+            {arrowX-arrow-0.5f, edgeY-direction*0.5f}, origin,
+            {arrowX+arrow+0.5f, edgeY-direction*0.5f},
+            {arrowX-arrow-0.5f, edgeY-direction*0.5f}
+        };
+        renderer_.FillQuad(arrowPoints, bgColor);
+        renderer_.DrawLine(arrowX-arrow, edgeY, origin.x, origin.y, borderColor, 0.5f);
+        renderer_.DrawLine(origin.x, origin.y, arrowX+arrow, edgeY, borderColor, 0.5f);
+        const D2D1_RECT_F textRect = {bg.left+padH, bg.top+padV, bg.right-padH, bg.bottom-padV};
+        renderer_.DrawText(tooltipText_, textRect, textColor, fontSize, DWRITE_TEXT_ALIGNMENT_CENTER,
+                           DWRITE_FONT_WEIGHT_NORMAL, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, true);
+        renderer_.PopOpacity();
+        renderer_.PopTransform();
     }
 
     if (borderless_ && !maximized_) {
@@ -2795,22 +2820,16 @@ void UiWindowImpl::OnMouseMove(float x, float y) {
             }
             hoveredWidget_ = hit;
 
-            // Tooltip: reset on widget change, schedule timer for delayed show.
-            // 沿父链上溯找最近一个有 tooltip 的祖先 (跟 hover 状态传播 + cursor
-            // 继承一致) —— 容器 widget set_tooltip 后, hover 其内部子 widget
-            // (如图标按钮的 svg 子级) 也能弹 (L72).
-            tooltipVisible_ = false;
-            tooltipWidget_ = nullptr;
-            if (tooltipTimerId_) { KillTimer(hwnd_, tooltipTimerId_); tooltipTimerId_ = 0; }
+            // Resolve the tooltip owner through icon/label children. Moving
+            // inside the same trigger preserves its visible bubble.
             Widget* tipOwner = hit;
             while (tipOwner && tipOwner->tooltip.empty()) tipOwner = tipOwner->Parent();
-            if (tipOwner) {
-                hoverStartTick_ = GetTickCount();
-                tooltipTimerId_ = SetTimer(hwnd_, kTooltipTimerId, kTooltipDelayMs, nullptr);
+            if (tipOwner != tooltipWidget_ || !tooltipVisible_) {
+                HideTooltip();
+                if (tipOwner)
+                    tooltipTimerId_ = SetTimer(hwnd_, kTooltipTimerId, kTooltipDelayMs, nullptr);
             }
         }
-
-        mouseX_ = dx; mouseY_ = dy;
 
         // Forward move to hovered widget (for internal tracking like tab hover).
         // Fire the user-bound @mousemove hook first — many widget subclasses
@@ -2859,8 +2878,7 @@ void UiWindowImpl::OnMouseDown(float x, float y) {
     float dx = x / dpiScale_, dy = y / dpiScale_;
 
     // Hide tooltip on click
-    tooltipVisible_ = false; tooltipWidget_ = nullptr;
-    if (tooltipTimerId_) { KillTimer(hwnd_, tooltipTimerId_); tooltipTimerId_ = 0; }
+    HideTooltip();
 
     // Close any open context menu on left click
     if (activeMenu_) CloseMenu();

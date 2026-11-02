@@ -90,6 +90,23 @@ constexpr D2D1_COLOR_F white = { 1.0f, 1.0f, 1.0f, 1.0f };
 constexpr D2D1_COLOR_F black = { 0.0f, 0.0f, 0.0f, 1.0f };
 constexpr D2D1_COLOR_F transparent = { 0.0f, 0.0f, 0.0f, 0.0f };
 
+// Rayburst's default neutral surface ramp: warm, low-chroma tones rather
+// than pure white. Keep SunPack's existing blue accent and semantic colors.
+namespace neutral {
+    constexpr auto lowest = Rgb(0xFE, 0xF7, 0xFC);
+    constexpr auto low = Rgb(0xF2, 0xEC, 0xF1);
+    constexpr auto container = Rgb(0xEA, 0xE4, 0xE8);
+    constexpr auto high = Rgb(0xE1, 0xDB, 0xE0);
+    constexpr auto highest = Rgb(0xD8, 0xD3, 0xD7);
+    constexpr auto text = Rgb(0x1D, 0x1B, 0x1E);
+    constexpr auto textSecondary = Rgb(0x4A, 0x45, 0x4E);
+    constexpr auto outline = Rgb(0x7B, 0x75, 0x7F);
+    constexpr auto outlineSubtle = Rgb(0xCC, 0xC4, 0xCF);
+    constexpr auto inverseDark = Rgb(0x32, 0x2F, 0x33);
+    constexpr auto inverseLight = Rgb(0xE7, 0xE1, 0xE5);
+    constexpr auto inverseTextLight = Rgb(0xF5, 0xEF, 0xF4);
+}
+
 // ---- Status Colors ----
 namespace status {
     constexpr D2D1_COLOR_F danger       = Rgb(0xD1, 0x34, 0x38);  // #d13438
@@ -152,6 +169,11 @@ struct Colors {
     // ---- Card / Surface ----
     D2D1_COLOR_F cardBg;              // neutralCardBackground
     D2D1_COLOR_F cardBorder;          // neutralStroke1
+
+    // ---- Inverse tooltip surface ----
+    D2D1_COLOR_F tooltipBg;
+    D2D1_COLOR_F tooltipText;
+    D2D1_COLOR_F tooltipBorder;
 
     // ---- Disabled ----
     D2D1_COLOR_F disabledBg;          // neutralBackgroundDisabled
@@ -252,6 +274,9 @@ inline Colors MakeDark() {
         // cardBorder
         grey::g26,
 
+        // Inverse tooltip surface
+        neutral::inverseLight, neutral::inverseDark, neutral::outlineSubtle,
+
         // disabledBg
         grey::g8,
         // disabledText            — neutralForegroundDisabled
@@ -283,39 +308,39 @@ inline Colors MakeDark() {
 }
 
 // ============================================================================
-// Fluent 2 Light Theme — official alias tokens
+// Light theme — Rayburst neutral surfaces with SunPack's Fluent blue accent
 // ============================================================================
 inline Colors MakeLight() {
     return {
-        // titleBarBg              — #ffffff (= windowBg, GuoheView L43)
-        white,
+        // titleBarBg
+        neutral::low,
         // titleBarText            — neutralForeground1
-        grey::g14,
+        neutral::text,
         // windowBg                — neutralBackground1
-        white,
+        neutral::low,
         // windowBorder            — neutralStroke1
-        grey::g82,
+        neutral::outlineSubtle,
         // toolbarBg               — neutralBackground3
-        grey::g96,
+        neutral::container,
         // statusBarBg             — neutralBackground2
-        grey::g98,
+        neutral::container,
         // statusBarText           — neutralForeground3
-        grey::g38,
+        neutral::textSecondary,
         // contentBg               — neutralBackground1
-        white,
+        neutral::low,
         // contentText             — neutralForeground2
-        grey::g26,
-        // elevatedBg              — #fcfcfc, 介于 windowBg (#ffffff) 和 sidebarBg (#fafafa)
-        grey::g99,
+        neutral::textSecondary,
+        // elevatedBg
+        neutral::container,
 
         // btnNormal               — subtleBackground (transparent)
         transparent,
         // btnHover                — subtleBackgroundHover
-        grey::g96,
+        neutral::high,
         // btnPress                — subtleBackgroundPressed
-        grey::g88,
+        neutral::highest,
         // btnText                 — neutralForeground1
-        grey::g14,
+        neutral::text,
         // closeBtnHover
         status::danger,
         // closeBtnPress
@@ -333,53 +358,56 @@ inline Colors MakeLight() {
         brand::shade20,
 
         // sidebarBg               — neutralBackground2
-        grey::g98,
+        neutral::container,
         // sidebarItemHover        — subtleBackgroundHover
-        grey::g96,
+        neutral::high,
         // sidebarText             — neutralForeground2
-        grey::g26,
+        neutral::textSecondary,
 
         // divider                 — neutralStroke1
-        grey::g82,
+        neutral::outlineSubtle,
         // dividerSubtle           — neutralStroke2
-        grey::g88,
+        neutral::highest,
 
         // inputBg                 — neutralBackground1
-        white,
+        neutral::container,
         // inputBorder
-        grey::g82,
+        neutral::outlineSubtle,
         // inputBorderHover
-        grey::g78,
+        neutral::outline,
         // inputBorderFocus        — brandStroke1
         brand::primary,
 
         // cardBg                  — neutralCardBackground
-        white,
+        neutral::lowest,
         // cardBorder
-        grey::g82,
+        neutral::outlineSubtle,
+
+        // Inverse tooltip surface
+        neutral::inverseDark, neutral::inverseTextLight, neutral::textSecondary,
 
         // disabledBg
-        grey::g94,
+        neutral::container,
         // disabledText            — neutralForegroundDisabled
-        grey::g74,
+        neutral::outline,
 
         // foreground1             — neutralForeground1
-        grey::g14,
+        neutral::text,
         // foreground2
-        grey::g26,
+        neutral::textSecondary,
         // foreground3
-        grey::g38,
+        neutral::outline,
         // foreground4
-        grey::g44,
+        neutral::outline,
         // foregroundOnBrand
         white,
 
         // background1-5
-        white,
-        grey::g98,
-        grey::g96,
-        grey::g94,
-        grey::g92,
+        neutral::lowest,
+        neutral::low,
+        neutral::container,
+        neutral::high,
+        neutral::highest,
 
         // shadowAmbient
         Rgba(0, 0, 0, 0.12f),

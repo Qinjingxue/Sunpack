@@ -9,7 +9,7 @@ export default {
 </script>
 <style>
   .popup { flex:1; padding:16px; gap:12px; color:var(--fg); font-size:14px; border:1px solid var(--border); border-radius:8px; }
-  .light { background:#fafafa; }
+  .light { background:var(--bg-elevated); }
   .dark { background:#2b2b2b; }
   label { display:block; }
   .title { font-size:16px; font-weight:600; }
@@ -21,7 +21,7 @@ export default {
   .weekday { height:24px; flex-shrink:0; text-align:center; font-size:12px; color:var(--fg-2); }
   .calendar { flex-direction:row; flex-wrap:wrap; gap:4px; }
   .day { height:32px; flex-shrink:0; min-width:0px; padding:0px; border:0px; border-radius:4px; background:#00000001; color:var(--fg); }
-  .light .day:hover { background:#eaeaea; }
+  .light .day:hover { background:var(--btn-hover); }
   .dark .day:hover { background:#404040; }
   .day.other { color:var(--fg-2); }
   .light .day.selected { background:#0067c0; color:#ffffff; }

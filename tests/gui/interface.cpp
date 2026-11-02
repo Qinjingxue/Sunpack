@@ -1302,14 +1302,28 @@ void task_card_details(Application& app) {
         [](HWINEVENTHOOK,DWORD,HWND,LONG,LONG,DWORD,DWORD){},GetCurrentProcessId(),0,WINEVENT_OUTOFCONTEXT);
     assert(destroyHook);
     auto notice=toast();
+    // Copy checks cannot detect a misplaced notification or owner-move
+    // dismissal. Reuse this same notice for one move/resize and close it.
+    RECT ownerBounds{}; GetWindowRect(owner,&ownerBounds);
+    SetWindowPos(owner,nullptr,ownerBounds.left+29,ownerBounds.top+17,
+        ownerBounds.right-ownerBounds.left+40,ownerBounds.bottom-ownerBounds.top,SWP_NOZORDER|SWP_NOACTIVATE);
+    ui::OverlayService::Instance().InvokeSync([]{});
+    assert(toast()==notice);
+    RECT frame{},notification{}; GetWindowRect(notice,&notification);
+    if(FAILED(DwmGetWindowAttribute(owner,DWMWA_EXTENDED_FRAME_BOUNDS,&frame,sizeof(frame)))) GetWindowRect(owner,&frame);
+    assert(std::abs(notification.top-frame.top-int(12*GetDpiForWindow(owner)/96.0f+0.5f))<=1);
+    assert(std::abs(notification.left+notification.right-frame.left-frame.right)<=2);
     ui::OverlayService::Instance().InvokeSync([&] {
         RECT bounds{}; GetClientRect(notice,&bounds);
-        const auto point=MAKELPARAM(bounds.right-int(22*GetDpiForWindow(notice)/96.0f),bounds.bottom/2);
+        // This point stays within the close button while it scales in.
+        const auto point=MAKELPARAM(bounds.right-int(30*GetDpiForWindow(notice)/96.0f),bounds.bottom/2);
         SendMessageW(notice,WM_MOUSEMOVE,0,point);
         SendMessageW(notice,WM_LBUTTONDOWN,MK_LBUTTON,point);
         SendMessageW(notice,WM_LBUTTONUP,0,point);
     });
     pump([&]{return !toast();},"Dismiss copy feedback");
+    SetWindowPos(owner,nullptr,ownerBounds.left,ownerBounds.top,ownerBounds.right-ownerBounds.left,
+        ownerBounds.bottom-ownerBounds.top,SWP_NOZORDER|SWP_NOACTIVATE);
     Handle locked(CreateEventW(nullptr,TRUE,FALSE,nullptr)),release(CreateEventW(nullptr,TRUE,FALSE,nullptr));
     bool clipboardLocked=false;
     std::thread blocker([&] {

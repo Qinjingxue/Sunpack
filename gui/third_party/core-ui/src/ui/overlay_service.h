@@ -35,6 +35,7 @@ public:
 
     void ShowToast(HWND owner, const std::wstring& text, int durationMs,
                    int position, int icon, int anim, bool closable = false);
+    void RefreshOwner(HWND owner);
     void DismissOwner(HWND owner);
     void Stop();
 

@@ -1119,7 +1119,7 @@ void ContextMenu::Draw(Renderer& r) {
     // surface a 0.5px stroke crosses the alpha-blended corner band and
     // shows up as a darker rim against contrast-y desktops.
     D2D1_RECT_F bgRect = {x_, y_, x_ + w, y_ + h};
-    // Card surface — pure white in Light mode, an elevated grey in Dark
+    // Card surface — a tonal surface in Light mode, an elevated grey in Dark
     // mode (slightly above page bg so the popup reads as "above" the
     // canvas). hasBgColor_ override still wins for explicit tints.
     D2D1_COLOR_F cardBg;
@@ -1130,7 +1130,8 @@ void ContextMenu::Draw(Renderer& r) {
         cardBg = D2D1_COLOR_F{0x2C / 255.0f, 0x2C / 255.0f, 0x2C / 255.0f, alpha};
     } else {
         float alpha = frostedMaterial_ ? 0.75f : 1.0f;
-        cardBg = D2D1_COLOR_F{1.0f, 1.0f, 1.0f, alpha};
+        cardBg = theme::Current().elevatedBg;
+        cardBg.a = alpha;
     }
     float materialAlpha = std::clamp(cardBg.a, 0.0f, 1.0f);
     D2D1_COLOR_F separatorColor = (theme::CurrentMode() == theme::Mode::Dark)

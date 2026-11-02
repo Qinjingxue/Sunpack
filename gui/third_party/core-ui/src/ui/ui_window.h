@@ -183,6 +183,8 @@ private:
     void NotifyResizeCallback(UINT width, UINT height);
     bool HasFocusedTextInput() const;
     void UpdateCaretBlinkTimer(bool restartPhase = false);
+    void ShowTooltip(Widget* owner);
+    void HideTooltip(bool immediate = false);
     void StartWindowOpenAnimation();
     void StartWindowCloseAnimation();
     void UnregisterRenderWindow();
@@ -260,9 +262,11 @@ private:
 
     // Tooltip
     Widget*     tooltipWidget_ = nullptr;
-    DWORD       hoverStartTick_ = 0;
-    float       tooltipX_ = 0, tooltipY_ = 0;
-    float       mouseX_ = 0, mouseY_ = 0;
+    std::wstring tooltipText_;
+    D2D1_RECT_F tooltipAnchor_{};
+    D2D1_SIZE_F tooltipSize_{};
+    float       tooltipMeasureWidth_ = 0;
+    AnimatedFloat tooltipProgress_{0.0f, 150.0f, EasingFunction::MaterialEnter};
     bool        tooltipVisible_ = false;
     UINT_PTR    tooltipTimerId_ = 0;
     static constexpr DWORD kTooltipDelayMs = 500;

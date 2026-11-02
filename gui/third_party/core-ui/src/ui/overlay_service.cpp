@@ -1,8 +1,10 @@
 #include "overlay_service.h"
 #include "theme.h"
+#include "easing.h"
 
 #include <d2d1.h>
 #include <dwrite.h>
+#include <dwmapi.h>
 #include <windowsx.h>
 #include <timeapi.h>
 #include <wrl/client.h>
@@ -29,6 +31,7 @@ constexpr UINT_PTR kToastTimerId = 1;
 constexpr UINT kToastTimerIntervalMs = 16;
 constexpr int kToastInMs = 200;
 constexpr int kToastOutMs = 250;
+constexpr int kMessageMotionMs = 300;
 
 float EaseOutCubic(float t) {
     t = std::clamp(t, 0.0f, 1.0f);
@@ -58,8 +61,15 @@ struct ToastBitmap {
     HGDIOBJ oldBitmap = nullptr;
     int width = 0;
     int height = 0;
+    UINT dpi = 96;
+    Microsoft::WRL::ComPtr<ID2D1DCRenderTarget> target;
+    Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> background, foreground;
+    Microsoft::WRL::ComPtr<IDWriteTextFormat> format;
+    Microsoft::WRL::ComPtr<IDWriteTextLayout> textLayout;
 
     ~ToastBitmap() {
+        background.Reset(); foreground.Reset();
+        target.Reset();
         if (dc && oldBitmap) {
             SelectObject(dc, oldBitmap);
         }
@@ -83,6 +93,7 @@ struct ToastOverlay {
     bool closable = false, dark = false, motion = true, hovered = false, closeHovered = false, closePressed = false;
     uint64_t pausedTick = 0, exitTick = 0;
     float alpha = 0, slide = 0, exitAlpha = 1, exitSlide = 1;
+    float renderedScale = -1;
     UINT dpi = 96;
     float dpiScale = 1.0f;
     float widthDip = 0.0f;
@@ -90,6 +101,7 @@ struct ToastOverlay {
     int targetX = 0;
     int targetY = 0;
     int slideRangePx = 0;
+    int ownerWidthPx = 0;
     uint64_t startTick = 0;
     bool timerPeriodSet = false;
     std::unique_ptr<ToastBitmap> bitmap;
@@ -99,7 +111,9 @@ struct ToastOverlay {
 
 struct OverlayService::Impl {
     static bool CloseAt(const ToastOverlay& toast, LPARAM point) {
-        const float x=GET_X_LPARAM(point)/toast.dpiScale, y=GET_Y_LPARAM(point)/toast.dpiScale;
+        const float scale = 0.85f + 0.15f*toast.slide;
+        const float x=(GET_X_LPARAM(point)/toast.dpiScale-toast.widthDip*0.5f)/scale+toast.widthDip*0.5f;
+        const float y=GET_Y_LPARAM(point)/toast.dpiScale/scale;
         return x>=toast.widthDip-36 && x<=toast.widthDip-8 && std::abs(y-toast.heightDip*0.5f)<=14;
     }
     enum class RequestType {
@@ -107,6 +121,7 @@ struct OverlayService::Impl {
         DestroyHostWindow,
         Invoke,
         ShowToast,
+        RefreshOwner,
         DismissOwner,
         Stop
     };
@@ -343,6 +358,9 @@ struct OverlayService::Impl {
             case RequestType::ShowToast:
                 CreateToast(*request);
                 break;
+            case RequestType::RefreshOwner:
+                RefreshToastForOwner(request->owner);
+                break;
             case RequestType::DismissOwner:
                 DestroyToastForOwner(request->owner);
                 break;
@@ -437,10 +455,8 @@ struct OverlayService::Impl {
         if (!GetClientRect(toast.owner, &client)) {
             return false;
         }
-        POINT origin{0, 0};
-        ClientToScreen(toast.owner, &origin);
         const float clientW = std::max(1, static_cast<int>(client.right - client.left)) / toast.dpiScale;
-        const float clientH = std::max(1, static_cast<int>(client.bottom - client.top)) / toast.dpiScale;
+        toast.ownerWidthPx = client.right - client.left;
 
         Microsoft::WRL::ComPtr<IDWriteTextFormat> format;
         if (!dwriteFactory ||
@@ -478,8 +494,18 @@ struct OverlayService::Impl {
         toast.widthDip = std::max(96.0f, textW + iconSpace + closeSpace + padH * 2.0f);
         toast.heightDip = std::max(iconSize, textH) + padV * 2.0f;
 
+        return PositionToast(toast);
+    }
+
+    bool PositionToast(ToastOverlay& toast) {
+        RECT client{};
+        POINT origin{};
+        if (!GetClientRect(toast.owner, &client) || !ClientToScreen(toast.owner, &origin)) return false;
+        const float clientW = (client.right - client.left) / toast.dpiScale;
+        const float clientH = (client.bottom - client.top) / toast.dpiScale;
+
         const float xDip = (clientW - toast.widthDip) * 0.5f;
-        float yDip = 50.0f;
+        float yDip = toast.closable ? 12.0f : 50.0f;
         float hideOffsetDip = -(toast.heightDip + 60.0f);
         if (toast.position == 1) {
             yDip = (clientH - toast.heightDip) * 0.5f;
@@ -491,52 +517,103 @@ struct OverlayService::Impl {
 
         toast.targetX = origin.x + static_cast<int>(xDip * toast.dpiScale);
         toast.targetY = origin.y + static_cast<int>(yDip * toast.dpiScale);
-        // Interactive messages move a short distance inside the owner.
-        toast.slideRangePx = static_cast<int>((toast.closable ? -12.0f : hideOffsetDip) * toast.dpiScale);
+        if (toast.closable && toast.position == 0) {
+            // Match a frameless message container: 12 DIP from the visible
+            // window top, including the native caption rather than below it.
+            RECT frame{};
+            if (FAILED(DwmGetWindowAttribute(toast.owner, DWMWA_EXTENDED_FRAME_BOUNDS, &frame, sizeof(frame))) &&
+                !GetWindowRect(toast.owner, &frame)) return false;
+            toast.targetX = (frame.left+frame.right-static_cast<int>(toast.widthDip*toast.dpiScale+0.5f))/2;
+            toast.targetY = frame.top+static_cast<int>(12.0f*toast.dpiScale+0.5f);
+        }
+        toast.slideRangePx = toast.closable ? 0 : static_cast<int>(hideOffsetDip * toast.dpiScale);
         return true;
     }
 
-    bool RenderToastBitmap(ToastOverlay& toast) {
+    void RefreshToastForOwner(HWND owner) {
+        auto found = ownerToast.find(owner);
+        if (found == ownerToast.end()) return;
+        auto& toast = *toasts.at(found->second);
+        if (!IsWindowVisible(owner) || IsIconic(owner)) {
+            ShowWindow(toast.hwnd, SW_HIDE);
+            return;
+        }
+        RECT client{};
+        if (!GetClientRect(owner, &client)) return;
+        const UINT dpi = OverlayDpiForWindow(owner);
+        if (dpi != toast.dpi || client.right-client.left != toast.ownerWidthPx) {
+            toast.dpi = dpi; toast.dpiScale = float(dpi)/96.0f;
+            if (!MeasureToast(toast) || !RenderToastBitmap(toast)) {
+                DestroyToastForOwner(owner); return;
+            }
+        } else if (!PositionToast(toast)) return;
+        const HWND hwnd = toast.hwnd;
+        UpdateToastFrame(toast);
+        if (IsWindow(hwnd)) ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+    }
+
+    bool RenderToastBitmap(ToastOverlay& toast, float scale = -1) {
         const int widthPx = std::max(1, static_cast<int>(toast.widthDip * toast.dpiScale + 0.5f));
         const int heightPx = std::max(1, static_cast<int>(toast.heightDip * toast.dpiScale + 0.5f));
 
-        auto bitmap = std::make_unique<ToastBitmap>();
-        bitmap->width = widthPx;
-        bitmap->height = heightPx;
-        bitmap->dc = CreateCompatibleDC(nullptr);
-        if (!bitmap->dc) {
-            return false;
+        // Keep the tiny render surface and its D2D/DWrite resources for this
+        // notification. Scale frames redraw vectors into it without allocating
+        // a DC, bitmap, target or text format on every animation tick.
+        if (!toast.bitmap || toast.bitmap->width != widthPx || toast.bitmap->height != heightPx || toast.bitmap->dpi != toast.dpi) {
+            auto bitmap = std::make_unique<ToastBitmap>();
+            bitmap->width = widthPx;
+            bitmap->height = heightPx;
+            bitmap->dpi = toast.dpi;
+            bitmap->dc = CreateCompatibleDC(nullptr);
+            if (!bitmap->dc) {
+                return false;
+            }
+
+            BITMAPINFO bmi{};
+            bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+            bmi.bmiHeader.biWidth = widthPx;
+            bmi.bmiHeader.biHeight = -heightPx;
+            bmi.bmiHeader.biPlanes = 1;
+            bmi.bmiHeader.biBitCount = 32;
+            bmi.bmiHeader.biCompression = BI_RGB;
+            void* bits = nullptr;
+            bitmap->bitmap = CreateDIBSection(bitmap->dc, &bmi, DIB_RGB_COLORS, &bits, nullptr, 0);
+            if (!bitmap->bitmap || !bits) {
+                return false;
+            }
+            bitmap->oldBitmap = SelectObject(bitmap->dc, bitmap->bitmap);
+
+            auto& target = bitmap->target;
+            D2D1_RENDER_TARGET_PROPERTIES props = D2D1::RenderTargetProperties(
+                D2D1_RENDER_TARGET_TYPE_DEFAULT,
+                D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED),
+                static_cast<FLOAT>(toast.dpi), static_cast<FLOAT>(toast.dpi));
+            if (!d2dFactory || FAILED(d2dFactory->CreateDCRenderTarget(&props, target.GetAddressOf()))) {
+                return false;
+            }
+            RECT rc{0, 0, widthPx, heightPx};
+            if (FAILED(target->BindDC(bitmap->dc, &rc))) {
+                return false;
+            }
+            target->CreateSolidColorBrush(D2D1::ColorF(0,0,0), bitmap->background.GetAddressOf());
+            target->CreateSolidColorBrush(D2D1::ColorF(0,0,0), bitmap->foreground.GetAddressOf());
+            if (!bitmap->background || !bitmap->foreground || !dwriteFactory ||
+                FAILED(dwriteFactory->CreateTextFormat(L"Microsoft YaHei UI", nullptr,
+                    DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
+                    theme::kFontSizeNormal, L"zh-cn", bitmap->format.GetAddressOf()))) return false;
+            bitmap->format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+            bitmap->format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+            bitmap->format->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+            const float iconSpace = toast.icon > 0 ? theme::kFontSizeNormal + 10.0f : 0.0f;
+            if (FAILED(dwriteFactory->CreateTextLayout(toast.text.c_str(), static_cast<UINT32>(toast.text.size()),
+                bitmap->format.Get(), std::max(1.0f,toast.widthDip-40.0f-iconSpace-(toast.closable?32.0f:0.0f)),
+                toast.heightDip, bitmap->textLayout.GetAddressOf()))) return false;
+            toast.bitmap = std::move(bitmap);
         }
 
-        BITMAPINFO bmi{};
-        bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-        bmi.bmiHeader.biWidth = widthPx;
-        bmi.bmiHeader.biHeight = -heightPx;
-        bmi.bmiHeader.biPlanes = 1;
-        bmi.bmiHeader.biBitCount = 32;
-        bmi.bmiHeader.biCompression = BI_RGB;
-        void* bits = nullptr;
-        bitmap->bitmap = CreateDIBSection(bitmap->dc, &bmi, DIB_RGB_COLORS, &bits, nullptr, 0);
-        if (!bitmap->bitmap || !bits) {
-            return false;
-        }
-        bitmap->oldBitmap = SelectObject(bitmap->dc, bitmap->bitmap);
-
-        Microsoft::WRL::ComPtr<ID2D1DCRenderTarget> target;
-        D2D1_RENDER_TARGET_PROPERTIES props = D2D1::RenderTargetProperties(
-            D2D1_RENDER_TARGET_TYPE_DEFAULT,
-            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED),
-            static_cast<FLOAT>(toast.dpi), static_cast<FLOAT>(toast.dpi));
-        if (!d2dFactory || FAILED(d2dFactory->CreateDCRenderTarget(&props, target.GetAddressOf()))) {
-            return false;
-        }
-        RECT rc{0, 0, widthPx, heightPx};
-        if (FAILED(target->BindDC(bitmap->dc, &rc))) {
-            return false;
-        }
-
-        Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> bgBrush;
-        Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> textBrush;
+        auto& target = toast.bitmap->target;
+        auto& bgBrush = toast.bitmap->background;
+        auto& textBrush = toast.bitmap->foreground;
         D2D1_COLOR_F background = D2D1::ColorF(0.15f, 0.15f, 0.18f, 0.92f);
         D2D1_COLOR_F foreground = D2D1::ColorF(0.95f, 0.95f, 0.97f);
         if (toast.closable) {
@@ -546,22 +623,10 @@ struct OverlayService::Impl {
                                     : (error ? theme::Rgb(0xfd,0xe7,0xe9) : theme::Rgb(0xdf,0xf6,0xdd));
             foreground = toast.dark ? theme::Rgb(0xf5,0xf5,0xf5) : theme::Rgb(0x1a,0x1a,0x1a);
         }
-        target->CreateSolidColorBrush(background, bgBrush.GetAddressOf());
-        target->CreateSolidColorBrush(foreground, textBrush.GetAddressOf());
-
-        Microsoft::WRL::ComPtr<IDWriteTextFormat> format;
-        if (!dwriteFactory ||
-            FAILED(dwriteFactory->CreateTextFormat(L"Microsoft YaHei UI", nullptr,
-                                                   DWRITE_FONT_WEIGHT_NORMAL,
-                                                   DWRITE_FONT_STYLE_NORMAL,
-                                                   DWRITE_FONT_STRETCH_NORMAL,
-                                                   theme::kFontSizeNormal,
-                                                   L"zh-cn", format.GetAddressOf()))) {
-            return false;
-        }
-        format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-        format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-        format->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+        bgBrush->SetColor(background);
+        textBrush->SetColor(foreground);
+        if (scale < 0) scale = toast.closable ? 0.85f + 0.15f*toast.slide : 1.0f;
+        target->SetTransform(D2D1::Matrix3x2F::Scale(scale, scale, D2D1::Point2F(toast.widthDip*0.5f, 0)));
 
         target->BeginDraw();
         target->Clear(D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.0f));
@@ -588,25 +653,23 @@ struct OverlayService::Impl {
         const float padH = 20.0f;
 
         if (toast.icon > 0) {
-            DrawIcon(*target.Get(), toast);
+            DrawIcon(*target.Get(), toast, bgBrush);
         }
 
-        const D2D1_RECT_F textRect = D2D1::RectF(
-            padH + iconSpace, 0.0f,
-            toast.widthDip - padH - (toast.closable ? 32.0f : 0.0f), toast.heightDip);
-        target->DrawTextW(toast.text.c_str(), static_cast<UINT32>(toast.text.size()),
-                          format.Get(), textRect, textBrush.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        target->DrawTextLayout(D2D1::Point2F(padH+iconSpace, 0), toast.bitmap->textLayout.Get(),
+                               textBrush.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
 
         HRESULT hr = target->EndDraw();
         if (FAILED(hr)) {
             return false;
         }
 
-        toast.bitmap = std::move(bitmap);
+        toast.renderedScale = scale;
         return true;
     }
 
-    static void DrawIcon(ID2D1DCRenderTarget& target, const ToastOverlay& toast) {
+    static void DrawIcon(ID2D1DCRenderTarget& target, const ToastOverlay& toast,
+                         const Microsoft::WRL::ComPtr<ID2D1SolidColorBrush>& brush) {
         const float fontSize = theme::kFontSizeNormal;
         const float iconSize = fontSize + 2.0f;
         const float padH = 20.0f;
@@ -626,9 +689,7 @@ struct OverlayService::Impl {
             color = toast.dark ? (toast.icon==2 ? theme::Rgb(0xff,0x99,0xa4) : theme::Rgb(0x6c,0xcb,0x5f))
                                : (toast.icon==2 ? theme::Rgb(0xa4,0x26,0x2c) : theme::Rgb(0x0f,0x6b,0x35));
 
-        Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> brush;
-        target.CreateSolidColorBrush(color, brush.GetAddressOf());
-        if (!brush) return;
+        brush->SetColor(color);
 
         if (toast.icon == 1) {
             target.DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), r, r), brush.Get(), 1.5f);
@@ -691,7 +752,8 @@ struct OverlayService::Impl {
         const uint64_t now = GetTickCount64();
         const uint64_t elapsed = (toast.startTick != 0 && now >= toast.startTick)
                                      ? (now - toast.startTick) : 0;
-        const uint64_t inEnd = toast.motion ? kToastInMs : 0;
+        const uint64_t inEnd = toast.motion ? (toast.closable ? kMessageMotionMs : kToastInMs) : 0;
+        const uint64_t outMs = toast.closable ? kMessageMotionMs : kToastOutMs;
         const uint64_t holdEnd = inEnd + static_cast<uint64_t>(toast.durationMs);
         if (!toast.exitTick && !toast.hovered && elapsed >= holdEnd) {
             toast.exitTick = now; toast.exitAlpha = 1; toast.exitSlide = 1;
@@ -703,14 +765,15 @@ struct OverlayService::Impl {
         bool animating = false;
         if (toast.exitTick) {
             const auto outgoing = now - toast.exitTick;
-            if (!toast.motion || outgoing >= kToastOutMs) { DestroyToastByHwnd(toast.hwnd); return; }
-            const float t = EaseOutCubic(float(outgoing) / kToastOutMs);
-            slide = toast.exitSlide * (1-t); alpha = toast.exitAlpha * (1-t);
+            if (!toast.motion || outgoing >= outMs) { DestroyToastByHwnd(toast.hwnd); return; }
+            const float t = float(outgoing) / outMs;
+            slide = toast.exitSlide * (1-(toast.closable ? ApplyEasing(EasingFunction::MaterialStandard,t) : EaseOutCubic(t)));
+            alpha = toast.exitAlpha * (1-(toast.closable ? ApplyEasing(EasingFunction::MaterialEnter,t) : EaseOutCubic(t)));
             next = kToastTimerIntervalMs; animating = true;
         } else if (elapsed < inEnd) {
-            const float t = EaseOutCubic(static_cast<float>(elapsed) / static_cast<float>(kToastInMs));
-            slide = t;
-            alpha = (toast.closable || toast.anim == 1) ? t : 1.0f;
+            const float t = float(elapsed) / inEnd;
+            slide = toast.closable ? ApplyEasing(EasingFunction::MaterialStandard,t) : EaseOutCubic(t);
+            alpha = toast.closable ? ApplyEasing(EasingFunction::MaterialExit,t) : (toast.anim == 1 ? slide : 1.0f);
             next = kToastTimerIntervalMs; animating = true;
         } else if (toast.hovered) {
             if (!toast.pausedTick) toast.pausedTick = now;
@@ -719,6 +782,10 @@ struct OverlayService::Impl {
         }
         toast.alpha = alpha; toast.slide = slide;
         ScheduleToast(toast, next, animating);
+        const float scale = toast.closable ? 0.85f + 0.15f*slide : 1.0f;
+        if (scale != toast.renderedScale && !RenderToastBitmap(toast, scale)) {
+            DestroyToastByHwnd(toast.hwnd); return;
+        }
 
         const int y = (toast.anim == 1)
                           ? toast.targetY
@@ -921,6 +988,14 @@ void OverlayService::DismissOwner(HWND owner) {
     { std::lock_guard<std::mutex> lock(impl_->mutex); if(!impl_->thread.joinable()) return; }
     auto request = std::make_unique<Impl::Request>();
     request->type = Impl::RequestType::DismissOwner;
+    request->owner = owner;
+    impl_->Post(std::move(request));
+}
+
+void OverlayService::RefreshOwner(HWND owner) {
+    { std::lock_guard<std::mutex> lock(impl_->mutex); if(!impl_->thread.joinable()) return; }
+    auto request = std::make_unique<Impl::Request>();
+    request->type = Impl::RequestType::RefreshOwner;
     request->owner = owner;
     impl_->Post(std::move(request));
 }

@@ -382,10 +382,12 @@ void ButtonWidget::OnDraw(Renderer& r) {
     } else {
         // ---- Default Button: WinUI 3 Standard Button ----
         // ControlFillColor: Default / Secondary(hover) / Tertiary(press) / Disabled
-        if (!enabled)      bg = dark ? theme::Rgba(0xFF,0xFF,0xFF,0.04f) : theme::Rgba(0xF9,0xF9,0xF9,1.0f);
-        else if (pressed)  bg = dark ? theme::Rgba(0xFF,0xFF,0xFF,0.03f) : theme::Rgba(0xF9,0xF9,0xF9,0.95f);
-        else if (hovered)  bg = dark ? theme::Rgba(0xFF,0xFF,0xFF,0.08f) : theme::Rgba(0xF9,0xF9,0xF9,0.97f);
-        else               bg = dark ? theme::Rgba(0xFF,0xFF,0xFF,0.06f) : theme::Rgba(0xFF,0xFF,0xFF,0.95f);
+        if (!dark)         bg = !enabled ? theme::Current().disabledBg : pressed ? theme::kBtnPress()
+                                      : hovered ? theme::kBtnHover() : theme::Current().background2;
+        else if (!enabled) bg = theme::Rgba(0xFF,0xFF,0xFF,0.04f);
+        else if (pressed)  bg = theme::Rgba(0xFF,0xFF,0xFF,0.03f);
+        else if (hovered)  bg = theme::Rgba(0xFF,0xFF,0xFF,0.08f);
+        else               bg = theme::Rgba(0xFF,0xFF,0xFF,0.06f);
 
         r.FillRoundedRect(rect, cr, cr, bg);
 
@@ -1028,10 +1030,11 @@ void TextInputWidget::OnDraw(Renderer& r) {
     if (customBg) {
         bg = bgColor;
     } else {
-        if (!enabled)     bg = dark ? theme::Rgba(0xFF,0xFF,0xFF,0.03f) : theme::Rgba(0xF0,0xF0,0xF0,0.90f);
-        else if (focused) bg = dark ? theme::Rgba(0xFF,0xFF,0xFF,0.03f) : theme::Rgba(0xFF,0xFF,0xFF,1.0f);
-        else if (hovered) bg = dark ? theme::Rgba(0xFF,0xFF,0xFF,0.08f) : theme::Rgba(0xF9,0xF9,0xF9,0.97f);
-        else              bg = dark ? theme::Rgba(0xFF,0xFF,0xFF,0.06f) : theme::Rgba(0xFF,0xFF,0xFF,0.95f);
+        if (!dark)        bg = !enabled ? theme::Current().disabledBg : focused ? theme::Current().background2
+                                     : hovered ? theme::kBtnHover() : theme::kInputBg();
+        else if (!enabled || focused) bg = theme::Rgba(0xFF,0xFF,0xFF,0.03f);
+        else if (hovered) bg = theme::Rgba(0xFF,0xFF,0xFF,0.08f);
+        else              bg = theme::Rgba(0xFF,0xFF,0xFF,0.06f);
     }
     r.FillRoundedRect(rect, cr, cr, bg);
 
@@ -1591,9 +1594,10 @@ void TextAreaWidget::OnDraw(Renderer& r) {
     if (customBg) {
         bg = bgColor;
     } else {
-        if (focused)      bg = dark ? theme::Rgb(0x24, 0x24, 0x24) : theme::Rgb(0xFF, 0xFF, 0xFF);
-        else if (hovered) bg = dark ? theme::Rgb(0x44, 0x44, 0x44) : theme::Rgb(0xFB, 0xFB, 0xFB);
-        else              bg = dark ? theme::Rgb(0x3E, 0x3E, 0x3E) : theme::Rgb(0xFF, 0xFF, 0xFF);
+        if (!dark)        bg = focused ? theme::Current().background2 : hovered ? theme::kBtnHover() : theme::kInputBg();
+        else if (focused) bg = theme::Rgb(0x24, 0x24, 0x24);
+        else if (hovered) bg = theme::Rgb(0x44, 0x44, 0x44);
+        else              bg = theme::Rgb(0x3E, 0x3E, 0x3E);
     }
     r.FillRoundedRect(rect, cr, cr, bg);
 
@@ -1990,9 +1994,10 @@ void ComboBoxWidget::OnDraw(Renderer& r) {
     if (bgColor.a > 0) {
         bg = bgColor;
     } else {
-        if (open_)        bg = dark ? theme::Rgba(0xFF,0xFF,0xFF,0.03f) : theme::Rgba(0xFF,0xFF,0xFF,1.0f);
-        else if (hovered) bg = dark ? theme::Rgba(0xFF,0xFF,0xFF,0.08f) : theme::Rgba(0xF9,0xF9,0xF9,0.97f);
-        else              bg = dark ? theme::Rgba(0xFF,0xFF,0xFF,0.06f) : theme::Rgba(0xFF,0xFF,0xFF,0.95f);
+        if (!dark)        bg = open_ ? theme::Current().background2 : hovered ? theme::kBtnHover() : theme::kInputBg();
+        else if (open_)   bg = theme::Rgba(0xFF,0xFF,0xFF,0.03f);
+        else if (hovered) bg = theme::Rgba(0xFF,0xFF,0xFF,0.08f);
+        else              bg = theme::Rgba(0xFF,0xFF,0xFF,0.06f);
     }
     r.FillRoundedRect(rect, cr, cr, bg);
 
@@ -2157,7 +2162,7 @@ void ComboBoxWidget::OnDrawOverlay(Renderer& r) {
     D2D1_COLOR_F fg = css.hasFg ? css.fg : theme::kBtnText();
 
     D2D1_COLOR_F popupBg = (bgColor.a > 0) ? bgColor
-                                           : (dark ? theme::Rgb(0x2B, 0x2B, 0x2B) : theme::Rgb(0xFF, 0xFF, 0xFF));
+                                           : (dark ? theme::Rgb(0x2B, 0x2B, 0x2B) : theme::Current().elevatedBg);
     r.FillRoundedRect(dropBg, cr, cr, popupBg);
 
     float bw = (css.borderWidth >= 0) ? css.borderWidth : 0.5f;
@@ -3060,7 +3065,7 @@ void ToggleWidget::UpdateCachedColors() {
     // Off-state should feel soft, not high-contrast: track stays near the
     // surface color, thumb is a mid-gray (not near-black), border is faint.
     // Border alpha lives in OnDraw — keep both off colors here in sync.
-    CachedTrackColorOff_ = dark ? theme::Rgb(0x3D, 0x3D, 0x3D) : theme::Rgb(0xF8, 0xF7, 0xF7);
+    CachedTrackColorOff_ = dark ? theme::Rgb(0x3D, 0x3D, 0x3D) : theme::kInputBg();
     CachedTrackColorOn_ = theme::kAccent();
     CachedThumbColorOff_ = dark ? theme::Rgb(0xB8, 0xB8, 0xB8) : theme::Rgb(0x5B, 0x5B, 0x5B);
     // WinUI uses TextOnAccentFillColorPrimary: dark on a light dark-theme accent.
@@ -5217,9 +5222,10 @@ void NumberBoxWidget::OnDraw(Renderer& r) {
     if (bgColor.a > 0) {
         bg = bgColor;
     } else {
-        if (focused)      bg = dark ? theme::Rgba(0xFF,0xFF,0xFF,0.03f) : theme::Rgba(0xFF,0xFF,0xFF,1.0f);
-        else if (hovered) bg = dark ? theme::Rgba(0xFF,0xFF,0xFF,0.08f) : theme::Rgba(0xF9,0xF9,0xF9,0.97f);
-        else              bg = dark ? theme::Rgba(0xFF,0xFF,0xFF,0.06f) : theme::Rgba(0xFF,0xFF,0xFF,0.95f);
+        if (!dark)        bg = focused ? theme::Current().background2 : hovered ? theme::kBtnHover() : theme::kInputBg();
+        else if (focused) bg = theme::Rgba(0xFF,0xFF,0xFF,0.03f);
+        else if (hovered) bg = theme::Rgba(0xFF,0xFF,0xFF,0.08f);
+        else              bg = theme::Rgba(0xFF,0xFF,0xFF,0.06f);
     }
     r.FillRoundedRect(rect, cr, cr, bg);
 
@@ -5595,7 +5601,7 @@ void FlyoutWidget::OnDrawOverlay(Renderer& r) {
     r.FillRoundedRect(shadowRect, 8, 8, shadowColor);
 
     // Background
-    D2D1_COLOR_F bg = dark ? theme::Rgb(0x2B, 0x2B, 0x2B) : theme::white;
+    D2D1_COLOR_F bg = dark ? theme::Rgb(0x2B, 0x2B, 0x2B) : theme::Current().elevatedBg;
     r.FillRoundedRect(flyoutRect_, 8, 8, bg);
 
     // Border

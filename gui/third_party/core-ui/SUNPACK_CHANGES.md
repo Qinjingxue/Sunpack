@@ -11,11 +11,30 @@ preserved.
 
 Local changes:
 
+- Use Rayburst's default warm neutral ramp for light surfaces: #F2ECF1 window,
+  #EAE4E8 controls and #FEF7FC cards, with tonal hover/pressed surfaces.
+  Standard light controls and popups read the shared palette instead of white
+  literals. Keep SunPack's blue accent and semantic status colors. Tooltip colors
+  are shared inverse-surface tokens (#E7E1E5/#322F33), with softened foregrounds.
+
+- Draw hover tooltips above their trigger as arrowed, rounded bubbles, flipping
+  below when necessary. Use a light surface with dark text in dark mode and
+  a dark surface with light text in light mode, with
+  150 ms fade/scale about the arrow tip and shared Material entrance/exit curves.
+  Reuse AnimatedFloat, completion-driven presentation and cached text measurement;
+  retain only a text/anchor snapshot during exit and release it when motion ends.
+  Keep the 500 ms delay and respect the Windows motion preference.
+
 - Bind UIX tooltips through the existing 500 ms hover service and allow
   `tabindex="0"` on compact action labels. Reuse the toast overlay for optional
-  closable WinUI-style messages, with fade/slide motion, hover pause, owner theme
+  closable WinUI-style messages, with a 300 ms fade/scale from the top center,
+  hover pause, owner theme
   and Windows motion preference. Replacements release the previous surface;
   holding schedules one deadline and hovering stops timers completely.
+  Anchor these messages 12 DIP below the visible window top (including the native
+  caption) and refresh on owner geometry
+  events without restarting their lifetime. Pure moves reuse measured content;
+  scale frames reuse the notification's D2D surface and text format.
 
 - Size auto-width ComboBoxes to the widest localized item using the existing
   bounded DirectWrite measurement cache, with room for padding and the arrow.
