@@ -107,8 +107,8 @@ AND relationship remains in one module. Directory-prune rules merge into the
 blacklist regardless of their former enabled states; if either was enabled, the
 merged blacklist is enabled. Old path Globs retain component-boundary matching,
 using regex records when necessary. Legacy whitelist path groups are combined
-into one OR list instead of separate AND conditions. Migration is idempotent; runtime uses only the
-current schema.
+into one OR list instead of separate AND conditions. Migration is idempotent;
+runtime uses only the current schema.
 
 Size bounds are inclusive integer bytes from 0 to 18446744073709551615. Equal bounds select one exact size. Time bounds use UTC minute strings in `YYYY-MM-DDTHH:mmZ` format, including the start and excluding the end. `null` leaves that side unbounded; specify both bounds explicitly to override defaults. For example:
 
