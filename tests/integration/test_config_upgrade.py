@@ -6,13 +6,15 @@ from sunpack.core.config.schema import normalize_config
 from sunpack.pipeline.discovery.filesystem.directory_scanner import DirectoryScanner
 
 
-def test_installer_merges_path_rules_preserves_switches_and_is_idempotent(tmp_path, repo_root):
+def test_installer_unifies_path_rules_ors_switches_and_is_idempotent(tmp_path, repo_root):
     """Only the real upgrade script can catch lost rules, switch activation or repeated rewrites.
 
     One subprocess per shape exercises the installer boundary without building
     an installer or duplicating runtime matcher cases.
     """
-    for index, (prune_enabled, blacklist_enabled) in enumerate(((True, True), (True, False), (False, True), (False, False))):
+    for index, (prune_enabled, blacklist_enabled, whitelist_enabled) in enumerate(
+        ((True, True, False), (True, False, True), (False, True, False), (False, False, True))
+    ):
         user = tmp_path / f"user ' [{index}].json"
         payload = {
             "cli": {"language": "en"},
@@ -23,7 +25,7 @@ def test_installer_merges_path_rules_preserves_switches_and_is_idempotent(tmp_pa
                     {"name": "directory_prune", "enabled": prune_enabled,
                      "prune_dir_globs": [".git", "node_*"],
                      "path_globs": [".git/**", "Cache/Private/**"]},
-                    {"name": "whitelist", "enabled": False,
+                    {"name": "whitelist", "enabled": whitelist_enabled,
                      "path_globs": ["downloads/**"], "prune_dir_globs": ["downloads", "archives"],
                      "allowed_files": ["keep_01.zip"], "allowed_extensions": ["zip"]},
                     {"name": "blacklist", "enabled": blacklist_enabled,
@@ -56,7 +58,7 @@ def test_installer_merges_path_rules_preserves_switches_and_is_idempotent(tmp_pa
                                             {"value": r"\A\z", "regex": True},
                                             {"value": ".never", "regex": False}]
         whitelists = [item for item in filters if item["name"] == "whitelist"]
-        assert len(whitelists) == 1 and not whitelists[0]["enabled"]
+        assert len(whitelists) == 1 and whitelists[0]["enabled"] is whitelist_enabled
         # The two legacy path groups become a single OR list. Filenames and
         # extensions still use separate fields in the same whitelist module.
         assert whitelists[0]["paths"] == [{"value": "downloads", "regex": False},
