@@ -32,32 +32,6 @@ bool enabled() {
 ui::Widget* find(ui::UiWindowImpl* window, const char* id) {
     return window && window->Root() ? window->Root()->FindById(id) : nullptr;
 }
-void reset(ui::UiWindowImpl* window, ui::Widget* widget) {
-    for(auto property : {ui::AnimProperty::Opacity, ui::AnimProperty::TranslateX, ui::AnimProperty::TranslateY})
-        window->CancelPropertyAnimation(widget, property);
-    widget->opacity = 1; widget->animationX = widget->animationY = 0;
-}
-}
-void finish(UiWindow handle, const char* id) {
-    auto* window = ui::GetContext().GetWindow(handle);
-    if(auto* widget = find(window, id)) reset(window, widget);
-}
-void enter(UiWindow handle, const char* id) {
-    auto* window = ui::GetContext().GetWindow(handle);
-    auto* widget = find(window, id);
-    if(!widget) return;
-    for(auto* parent = widget; parent; parent = parent->Parent()) if(!parent->visible) {
-        reset(window, widget); return;
-    }
-    if(!enabled()) { reset(window, widget); window->Invalidate(); return; }
-    // Repeated requests join the existing finite clock. Only navigation calls
-    // this adapter; filtering and snapshot updates never start an entrance.
-    if(widget->animationY!=0) return;
-    reset(window, widget);
-    // Keep text and surfaces opaque throughout. This short paint-only move
-    // needs neither an opacity layer nor an outgoing-page snapshot or layout.
-    widget->animationY=6;
-    window->AnimateProperty(widget,ui::AnimProperty::TranslateY,6,0,260,ui::EasingFunction::EaseOutCubic);
 }
 void select(UiWindow handle, const char* id, const char* targetId) {
     auto* window = ui::GetContext().GetWindow(handle);

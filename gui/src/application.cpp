@@ -466,23 +466,10 @@ void Application::navigate(const std::string& tab) {
     ui_page_set_json(page_,"tagInputs","{}");
     ui_page_set_json(page_,"tagModes","{}");
     ui_page_set_json(page_,"tagEdits","{}");
-    const auto previous=page_value(page_,"tab").get<std::string>();
-    auto sidebar=[](const std::string& section)->const char* {
-        return section=="config"?"configSidebar":section=="tasks" || section=="passwords"?"directoryPane":nullptr;
-    };
-    const auto* previous_sidebar=sidebar(previous);
-    const auto* next_sidebar=sidebar(tab);
-    const bool sidebar_changed=previous_sidebar!=next_sidebar;
-    motion::finish(window_,("page-"+previous).c_str());
-    // Tasks and passwords share this retained directory pane. Preserve its
-    // current position and clock unless the lower content type changes.
-    if(sidebar_changed && previous_sidebar) motion::finish(window_,previous_sidebar);
     set_text(page_,"tab",tab);
     set_text(page_,"actionError","");
     // Tab targets retain fixed sidebar geometry; reactive tab visibility already
     // schedules layout. Avoid forcing an extra full-tree layout on every switch.
-    motion::enter(window_,("page-"+tab).c_str());
-    if(sidebar_changed && next_sidebar) motion::enter(window_,next_sidebar);
     motion::select(window_,"navIndicator",tab=="tasks"?"tabTasks":tab=="config"?"tabConfig":tab=="roots"?"tabRoots":"tabPasswords");
     if(tab=="tasks") schedule_task_range();
 }

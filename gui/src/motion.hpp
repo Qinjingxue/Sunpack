@@ -11,8 +11,6 @@ public:
     VisualBatch(const VisualBatch&) = delete;
     VisualBatch& operator=(const VisualBatch&) = delete;
 };
-void enter(UiWindow window, const char* id);
-void finish(UiWindow window, const char* id);
 void popup(UiWindow window, bool opening, std::function<void()> complete = {});
 void select(UiWindow window, const char* indicator, const char* target);
 }

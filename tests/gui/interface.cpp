@@ -694,43 +694,25 @@ void inline_cell_caret(Application& app) {
     click(app,"rootSearch"); finish_input(app);
     click(app,"tabConfig"); pump([&]{return state(app.page(),"tab")=="config";}); settle_motion(app);
 }
-void page_motion(Application& app) {
+void page_switching(Application& app) {
     settle_motion(app);
     auto* window=ui::GetContext().GetWindow(app.window());
     auto* page=window->Root()->FindById("page-tasks");
     auto* body=window->Root()->FindById("taskBody");
     assert(page && body);
     const auto bounds=body->rect;
-    BOOL animations=TRUE; SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION,0,&animations,0);
-    {
-        motion::VisualBatch visual(app.window());
-        motion::enter(app.window(),"page-tasks");
-        assert(page->opacity==1 && page->animationX==0);
-        if(animations) {
-            assert(page->animationY>0 && page->animationY<=8);
-            // Seed an intermediate frame without a machine-speed assumption.
-            // A repeated entrance must keep its position and finite clock.
-            window->CancelPropertyAnimation(page,ui::AnimProperty::TranslateY);
-            page->animationY=3;
-            window->AnimateProperty(page,ui::AnimProperty::TranslateY,3,0,260,ui::EasingFunction::EaseOutCubic);
-            motion::enter(app.window(),"page-tasks");
-            assert(page->animationY==3 && page->opacity==1);
-        } else assert(page->animationY==0);
-    }
-    settle_motion(app);
-    // Observe actual frames, not just final values: every page stays opaque,
-    // subview data never moves, and the shared directory pane stays put.
-    struct PairedEntrances {
-        ui::UiWindowImpl* window; bool shared=true,mismatch=false; unsigned frames=0;
-        explicit PairedEntrances(ui::UiWindowImpl* w):window(w) {
+    // Observe actual frames, not just final values: pages and sidebars must
+    // appear at their final positions throughout navigation.
+    struct StaticPages {
+        ui::UiWindowImpl* window; bool mismatch=false;
+        explicit StaticPages(ui::UiWindowImpl* w):window(w) {
             ui_trace_set_sink([](const UiTraceEvent* event,void* context) {
-                if(std::strcmp(event->name,"property_animation_frame")) return;
-                auto& self=*static_cast<PairedEntrances*>(context);
-                ++self.frames;
+                if(std::strcmp(event->name,"property_animation_frame") && std::strcmp(event->name,"frame_job_submitted")) return;
+                auto& self=*static_cast<StaticPages*>(context);
                 auto* root=self.window->Root().get();
                 for(const char* tab:{"tasks","config","roots","passwords"}) {
                     auto* page=root->FindById(std::string("page-")+tab);
-                    if(page && page->visible && (page->opacity!=1 || page->animationX!=0)) self.mismatch=true;
+                    if(page && page->visible && (page->opacity!=1 || page->animationX!=0 || page->animationY!=0)) self.mismatch=true;
                 }
                 for(const char* id:{"taskBody","configBlocks","passwordBody"}) {
                     auto* body=root->FindById(id);
@@ -738,28 +720,25 @@ void page_motion(Application& app) {
                 }
                 for(const char* id:{"configSidebar","directoryPane"}) {
                     auto* sidebar=root->FindById(id);
-                    if(sidebar && sidebar->opacity!=1) self.mismatch=true;
+                    if(sidebar && (sidebar->opacity!=1 || sidebar->animationX!=0 || sidebar->animationY!=0)) self.mismatch=true;
                 }
-                auto* directory=root->FindById("directoryPane");
-                if(self.shared && directory->animationY!=0) self.mismatch=true;
-                auto* config=root->FindById("page-config"),*sidebar=root->FindById("configSidebar");
-                if(config->visible && config->animationY>1 && sidebar->animationY==0) self.mismatch=true;
             },this);
         }
-        ~PairedEntrances() { ui_trace_set_sink(nullptr,nullptr); }
-    } paired(window);
+        ~StaticPages() { ui_trace_set_sink(nullptr,nullptr); }
+    } pages(window);
     const auto navigation=rect(app,"navItems"),monitor=rect(app,"monitorControls");
-    click(app,"tabPasswords"); pump([&]{return state(app.page(),"tab")=="passwords";});
-    settle_motion(app);
-    assert(!paired.mismatch);
-    paired.shared=false;
-    // Exercise both lower content types and rapid reversal in the same fixture.
-    click(app,"tabConfig"); click(app,"tabPasswords"); click(app,"tabTasks");
-    pump([&]{return state(app.page(),"tab")=="tasks" && state(app.page(),"requests").empty() && state(app.page(),"dispatch")==false;},"Subview motion cancellation");
+    for(const std::string tab:{"passwords","roots","config"}) {
+        click(app,tab=="passwords"?"tabPasswords":tab=="roots"?"tabRoots":"tabConfig");
+        pump([&]{return state(app.page(),"tab")==tab;});
+        settle_motion(app);
+        assert(!pages.mismatch);
+    }
+    // Exercise rapid reversal in the same fixture.
+    click(app,"tabTasks"); click(app,"tabPasswords"); click(app,"tabTasks");
+    pump([&]{return state(app.page(),"tab")=="tasks" && state(app.page(),"requests").empty() && state(app.page(),"dispatch")==false;},"Rapid page switching");
     assert(body->opacity==1 && body->animationY==0);
     settle_motion(app);
-    assert(!paired.mismatch);
-    if(animations) assert(paired.frames>0);
+    assert(!pages.mismatch);
     for(const char* id:{"configSidebar","directoryPane"}) {
         auto* sidebar=window->Root()->FindById(id); assert(sidebar);
         assert(sidebar->opacity==1 && sidebar->animationY==0);
@@ -1950,7 +1929,7 @@ int wmain(int argc,wchar_t** argv) {
                 fs::rename(unpublished,data); query_restored();
             }
             screenshot(app,L"startup.png");
-                page_motion(app);
+                page_switching(app);
             if(!rangesOnly) task_card_details(app);
             if(rangesOnly || acceptance) {
                 pump_diagnostic(app,[&]{return state(app.page(),"fields").size()==expected_fields;},"Configuration fields loaded");
