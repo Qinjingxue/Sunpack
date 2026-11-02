@@ -104,11 +104,15 @@ def test_concurrent_formats_share_numbered_directory_family(tmp_path):
         default, *(str(tmp_path / f"release.v2({index})") for index in range(1, 320)),
     }
     assert {fmt for _, fmt in results} == {"zip", "7z"}
-    for index in range(1, 320):
-        registry.release(str(index))
+    # executor.map returns results in input order, but reservations acquire
+    # the lock in an arbitrary order. Keep whichever owner got the base path.
+    base_owner = next(str(index) for index, (path, _) in enumerate(results) if path == default)
+    for index in range(320):
+        if str(index) != base_owner:
+            registry.release(str(index))
     assert registry.reserve(default, "reused", set()) == str(tmp_path / "release.v2(1)")
     registry.release("reused")
-    registry.release("0")
+    registry.release(base_owner)
     assert registry.reserve(default, "next", set()) == default
 
 
