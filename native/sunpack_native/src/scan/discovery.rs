@@ -15,6 +15,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
+use std::io;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -156,7 +157,7 @@ impl NativeCandidateTable {
 #[pyclass(module = "sunpack_native")]
 #[derive(Default)]
 pub(crate) struct NativeDiscoveryRoutes {
-    scans: HashMap<usize, Result<Arc<NativeScanResult>, Arc<str>>>,
+    scans: HashMap<usize, Result<Arc<NativeScanResult>, Arc<io::Error>>>,
     #[pyo3(get)]
     pub(crate) relation_events: Vec<(usize, u8)>,
     #[pyo3(get)]
@@ -177,19 +178,38 @@ pub(crate) struct NativeDiscoveryRoutes {
 
 enum EmbeddedOutcome {
     Residual(&'static str),
-    Failed(Arc<str>),
+    Failed(Arc<io::Error>),
     Scan(Arc<NativeScanResult>),
 }
 
 #[pyclass(module = "sunpack_native")]
 pub(crate) struct NativeEmbeddedBatch {
-    scans: HashMap<usize, Result<Arc<NativeScanResult>, Arc<str>>>,
+    scans: HashMap<usize, Result<Arc<NativeScanResult>, Arc<io::Error>>>,
     ids: Vec<usize>,
     selected: HashSet<usize>,
     select_all: bool,
     force_scan: bool,
     include_residual_details: bool,
     skipped_reason: &'static str,
+}
+
+impl EmbeddedOutcome {
+    fn read_error(path: &str, error: Arc<io::Error>) -> Self {
+        // Discovery proposals do not pin physical inputs. A peer may consume
+        // one between its snapshot/password proof and any later read. Preserve
+        // the typed error until this decision, across detection and policy
+        // gates. Confirm the source itself departed: a missing spill/temp file
+        // or a newly recreated input must still expose the original I/O error.
+        // This extra metadata read occurs only on the NotFound error path.
+        if error.kind() == io::ErrorKind::NotFound
+            && std::fs::metadata(path)
+                .is_err_and(|current| current.kind() == io::ErrorKind::NotFound)
+        {
+            Self::Residual("input_departed")
+        } else {
+            Self::Failed(error)
+        }
+    }
 }
 
 #[pymethods]
@@ -235,54 +255,40 @@ impl NativeEmbeddedBatch {
                                 if cancellation.cancelled() {
                                     return None;
                                 }
-                                // An earlier detection attempt already failed. Policy
-                                // gates may skip new I/O, never erase an observed error.
-                                if let Some(Err(error)) = self.scans.get(&index) {
-                                    return Some((
-                                        index,
-                                        EmbeddedOutcome::Failed(Arc::clone(error)),
-                                    ));
-                                }
-                                if !self.select_all && !self.selected.contains(&index) {
+                                let cached = self.scans.get(&index);
+                                // Policy may skip new I/O, never erase an observed
+                                // error. Departures use the same decision as new reads.
+                                if !self.select_all
+                                    && !self.selected.contains(&index)
+                                    && !matches!(cached, Some(Err(_)))
+                                {
                                     return self.include_residual_details.then_some((
                                         index,
                                         EmbeddedOutcome::Residual(self.skipped_reason),
                                     ));
-                                }
-                                if let Some(scan) = self.scans.get(&index) {
-                                    let outcome = match scan {
-                                        Ok(scan) => EmbeddedOutcome::Scan(Arc::clone(scan)),
-                                        Err(error) => EmbeddedOutcome::Failed(Arc::clone(error)),
-                                    };
-                                    return (self.include_residual_details
-                                        || !matches!(outcome, EmbeddedOutcome::Residual(_)))
-                                    .then_some((index, outcome));
                                 }
                                 let (path, pe_state) = match &rows[index] {
                                     Candidate::File(table, row) => (
                                         table.paths[*row].as_str(),
                                         table.relation_anchors[*row].as_ref().map(|a| a.pe_state),
                                     ),
-                                    Candidate::Relation(group) => {
-                                        let data = group.candidate_data();
-                                        let pe_state = group.entry_anchor().map(|a| a.pe_state);
-                                        let outcome = scan_embedded_candidate(
-                                            data.entry_path,
-                                            self.force_scan,
-                                            pe_state,
-                                            parallel_files,
-                                        );
-                                        return (self.include_residual_details
-                                            || !matches!(outcome, EmbeddedOutcome::Residual(_)))
-                                        .then_some((index, outcome));
-                                    }
+                                    Candidate::Relation(group) => (
+                                        group.candidate_data().entry_path,
+                                        group.entry_anchor().map(|a| a.pe_state),
+                                    ),
                                 };
-                                let outcome = scan_embedded_candidate(
-                                    path,
-                                    self.force_scan,
-                                    pe_state,
-                                    parallel_files,
-                                );
+                                let outcome = match cached {
+                                    Some(Ok(scan)) => EmbeddedOutcome::Scan(Arc::clone(scan)),
+                                    Some(Err(error)) => {
+                                        EmbeddedOutcome::read_error(path, Arc::clone(error))
+                                    }
+                                    None => scan_embedded_candidate(
+                                        path,
+                                        self.force_scan,
+                                        pe_state,
+                                        parallel_files,
+                                    ),
+                                };
                                 (self.include_residual_details
                                     || !matches!(outcome, EmbeddedOutcome::Residual(_)))
                                 .then_some((index, outcome))
@@ -302,7 +308,7 @@ impl NativeEmbeddedBatch {
                 EmbeddedOutcome::Residual(reason) => Ok((index, 0, reason, None)),
                 EmbeddedOutcome::Failed(error) => {
                     let detail = PyDict::new(py);
-                    detail.set_item("error", error.as_ref())?;
+                    detail.set_item("error", error.to_string())?;
                     Ok((index, 2, "embedded_scan_io_error", Some(detail.unbind())))
                 }
                 EmbeddedOutcome::Scan(scan) => Ok((index, 1, "", Some(scan.to_py_dict(py)?))),
@@ -701,7 +707,7 @@ impl NativeCandidateTable {
                                 Some(
                                     scan_detected_path(path, format, parallel_files)
                                         .map(Arc::new)
-                                        .map_err(|error| Arc::<str>::from(error.to_string())),
+                                        .map_err(Arc::new),
                                 )
                             } else {
                                 None
@@ -871,7 +877,7 @@ fn scan_embedded_candidate(
             Some(PeState::Candidate) | None => match inspect_pe_image_native(path) {
                 Ok(PeProbe::Confirmed(_)) => true,
                 Ok(_) => false,
-                Err(error) => return EmbeddedOutcome::Failed(error.to_string().into()),
+                Err(error) => return EmbeddedOutcome::read_error(path, Arc::new(error)),
             },
         };
         if is_pe {
@@ -880,7 +886,7 @@ fn scan_embedded_candidate(
     }
     let metadata = match std::fs::metadata(path) {
         Ok(metadata) => metadata,
-        Err(error) => return EmbeddedOutcome::Failed(error.to_string().into()),
+        Err(error) => return EmbeddedOutcome::read_error(path, Arc::new(error)),
     };
     if !metadata.is_file() || metadata.len() == 0 {
         return EmbeddedOutcome::Residual("missing_or_empty_file");
@@ -888,7 +894,7 @@ fn scan_embedded_candidate(
     match scan_embedded_path(path, parallel_files) {
         Ok(scan) if scan.has_candidates() => EmbeddedOutcome::Scan(Arc::new(scan)),
         Ok(_) => EmbeddedOutcome::Residual("no_complete_embedded_archive"),
-        Err(error) => EmbeddedOutcome::Failed(error.to_string().into()),
+        Err(error) => EmbeddedOutcome::read_error(path, Arc::new(error)),
     }
 }
 

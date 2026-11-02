@@ -37,17 +37,21 @@ def _pause_first_probe(monkeypatch, phase="borrow"):
             pause = not selected
             selected = True
         if pause:
-            # The old snapshot/fingerprint exist, but no borrow or path claim
-            # may pin the inputs while the other request cleans up.
+            # A provisional snapshot/probe may outlive the physical input;
+            # no path claim pins it while the other request cleans up.
             loop.call_soon_threadsafe(paused.set)
             assert resume.wait(15), "competing cleanup did not finish"
 
-    if phase == "admission":
+    if phase in {"admission", "proof"}:
         probe = RelationsPasswordProber.resolve_file
 
         def probe_after_cleanup(self, *args, **kwargs):
-            pause_once()
-            return probe(self, *args, **kwargs)
+            if phase == "admission":
+                pause_once()
+            result = probe(self, *args, **kwargs)
+            if phase == "proof":
+                pause_once()
+            return result
 
         monkeypatch.setattr(RelationsPasswordProber, "resolve_file", probe_after_cleanup)
     else:
@@ -64,7 +68,7 @@ def _pause_first_probe(monkeypatch, phase="borrow"):
 
 
 @pytest.mark.parametrize("origin", ["watch", "foreground"])
-@pytest.mark.parametrize("probe_phase", ["admission", "borrow"])
+@pytest.mark.parametrize("probe_phase", ["admission", "borrow", "proof"])
 def test_successful_cleanup_does_not_abort_older_volume_discovery(tmp_path, monkeypatch, origin, probe_phase):
     case = create_encrypted_rar_archive(
         tmp_path / "fixtures", "race", password="race-password",

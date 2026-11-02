@@ -10,6 +10,8 @@ from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from pathlib import Path
 
+import pytest
+
 from sunpack_native import reader_cache_stats
 
 from sunpack.pipeline.coordinator.scan_session import DiscoveryScanSession
@@ -169,36 +171,69 @@ def test_native_discovery_does_not_project_negative_embedded_candidates(tmp_path
     assert batch.scan_page(table, 0, 32) == []
 
 
-def test_native_embedded_pages_scan_on_demand(tmp_path):
-    path = tmp_path / "fake.zip"
-    path.write_bytes(b"not an archive")
-    table = build_native_table_for_targets([str(tmp_path)], config=make_config({}))
-    routes = table.resolve()
-    batch = table.scan_embedded(routes, include_residual_details=False)
+@pytest.mark.parametrize("phase,source_state", [
+    ("embedded", "departed"), ("detection", "departed"),
+    ("embedded", "unreadable"), ("detection", "unreadable"),
+    ("detection", "recreated"),
+])
+def test_native_discovery_distinguishes_departures_from_read_errors(tmp_path, phase, source_state):
+    """Real Plan7 misses detection's cached errors and genuine access failures.
 
-    path.unlink()
-    row, = batch.scan_page(table, 0, 1)
-    assert row[1:3] == (2, "embedded_scan_io_error") and row[3]["error"]
+    Replace the old missing-file-as-error assertion with the shared discovery
+    lifetime contract. Without these cheap native cases, a fix could silence
+    unreadable/recreated inputs or erase errors behind a disabled policy gate.
+    """
+    import ctypes
+    from ctypes import wintypes
+    import gzip
+    from sunpack.core.support.archive_sessions import release_archive_sessions_under_roots
     from sunpack.core.contracts.failures import FailureKind
     from sunpack.pipeline.coordinator.task_provider import ArchiveTaskProvider
-    provider = ArchiveTaskProvider(make_config({}))
-    session = DiscoveryScanSession(config=provider.config)
-    result = provider.discovery.embedded.discover_native(table, routes, session, include_details=False)
-    assert result.blocked_paths and not result.residual_paths
-    provider._record_discovery_failures(result)
-    failure, = provider.failed_candidate_failures
-    assert failure.kind == FailureKind.FILESYSTEM_ERROR
-    assert failure.details["path"] == str(path) and failure.message == row[3]["error"]
 
-    # Detection's cached read failure must also survive a later policy gate.
-    import gzip
-    path.write_bytes(gzip.compress(b"payload"))
-    table = build_native_table_for_targets([str(path)], config=provider.config)
-    path.unlink()
-    routes = table.resolve(include_residual_details=False)
-    batch = table.scan_embedded(routes, enabled=False, include_residual_details=False)
-    row, = batch.scan_page(table, 0, 1)
-    assert row[1:3] == (2, "embedded_scan_io_error") and row[3]["error"]
+    path = tmp_path / ("stream.gz" if phase == "detection" else "fake.zip")
+    content = gzip.compress(b"payload") if phase == "detection" else b"not an archive"
+    path.write_bytes(content)
+    table = build_native_table_for_targets([str(tmp_path)], config=make_config({}))
+    if phase == "embedded":
+        routes = table.resolve()
+    release_archive_sessions_under_roots((str(path),))
+    handle = None
+    if source_state == "unreadable":
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.CreateFileW.argtypes = (wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                                      wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE)
+        kernel.CreateFileW.restype = wintypes.HANDLE
+        kernel.CloseHandle.argtypes = (wintypes.HANDLE,)
+        handle = kernel.CreateFileW(str(path), 0x80000000, 0, None, 3, 0, None)
+        assert handle != ctypes.c_void_p(-1).value, ctypes.WinError(ctypes.get_last_error())
+    else:
+        path.unlink()
+    try:
+        if phase == "detection":
+            routes = table.resolve(include_residual_details=False)
+        if source_state == "recreated":
+            path.write_bytes(b"a different physical generation")
+        # Detection failures must survive even an explicitly disabled fallback.
+        batch = table.scan_embedded(routes, enabled=phase == "embedded")
+        row, = batch.scan_page(table, 0, 1)
+        provider = ArchiveTaskProvider(make_config({}))
+        session = DiscoveryScanSession(config=provider.config)
+        result = provider.discovery.embedded.discover_native(table, routes, session, include_details=False)
+        provider._record_discovery_failures(result)
+        if source_state == "departed":
+            assert row[1:] == (0, "input_departed", None)
+            assert not result.tasks and not result.blocked_paths and not provider.failed_candidate_failures
+            sparse = table.scan_embedded(routes, include_residual_details=False)
+            assert sparse.scan_page(table, 0, 1) == []
+        else:
+            assert row[1:3] == (2, "embedded_scan_io_error") and row[3]["error"]
+            failure, = provider.failed_candidate_failures
+            assert result.blocked_paths and not result.residual_paths
+            assert failure.kind == FailureKind.FILESYSTEM_ERROR
+            assert failure.details["path"] == str(path) and failure.message == row[3]["error"]
+    finally:
+        if handle is not None:
+            assert kernel.CloseHandle(handle)
 
 
 def test_spilled_signature_noise_preserves_carrier_peers_concurrently(tmp_path):
