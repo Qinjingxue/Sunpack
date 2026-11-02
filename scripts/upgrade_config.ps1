@@ -109,7 +109,8 @@ foreach ($filter in @($user.filesystem.scan_filters)) {
             else { [pscustomobject]@{ value = '\A\z'; regex = $true } }
         })
     }
-    if (-not $paths.Count) { $paths = $directories; $directories = @() }
+    # Combine the released whitelist path groups as one field (OR within paths).
+    $paths = @(Unique-Rules (@($paths) + @($directories)))
     foreach ($field in @('path_globs', 'prune_dir_globs', $fileField, $extField)) { $filter.PSObject.Properties.Remove($field) }
     $filter | Add-Member -NotePropertyName enabled -NotePropertyValue $enabled -Force
     $filter | Add-Member -NotePropertyName paths -NotePropertyValue @(Unique-Rules $paths) -Force
@@ -117,20 +118,17 @@ foreach ($filter in @($user.filesystem.scan_filters)) {
     $filter | Add-Member -NotePropertyName files -NotePropertyValue @() -Force
     $filter | Add-Member -NotePropertyName extensions -NotePropertyValue @(Unique-Rules $extensions) -Force
     $converted.Add($filter)
-    # The two old whitelist path groups were independent AND conditions.
-    # Extension/name AND now fits directly in one module, without splitting it.
-    if ($directories.Count -and (ConvertTo-Json -InputObject $filter.paths -Compress) -cne (ConvertTo-Json -InputObject @(Unique-Rules $directories) -Compress)) {
-        $converted.Add([pscustomobject]@{ name = 'whitelist'; enabled = $enabled; paths = @(Unique-Rules $directories); full_names = @(); files = @(); extensions = @() })
-    }
     $changed = $true
 }
 foreach ($prune in $pruned) {
-    $target = $converted | Where-Object { $_.name -eq 'blacklist' -and [bool]($_.PSObject.Properties['enabled'] -and $_.enabled) -eq $prune.enabled } | Select-Object -First 1
+    # One blacklist owns both legacy filters; any enabled source enables it.
+    $target = $converted | Where-Object { $_.name -eq 'blacklist' } | Select-Object -First 1
     if ($null -eq $target) { $converted.Insert(0, $prune) }
     else {
         $existing = @()
         if ($target.PSObject.Properties['paths']) { $existing = @($target.paths) }
         $target | Add-Member -NotePropertyName paths -NotePropertyValue @(Unique-Rules (@($prune.paths) + $existing)) -Force
+        $target | Add-Member -NotePropertyName enabled -NotePropertyValue ([bool]($target.enabled -or $prune.enabled)) -Force
     }
 }
 if (-not $changed) { exit 0 }
