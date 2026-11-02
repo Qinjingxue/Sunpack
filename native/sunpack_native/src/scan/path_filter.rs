@@ -278,7 +278,7 @@ impl PathRuleScratch {
 pub(super) struct FilterPath<'a> {
     path: &'a Path,
     root: &'a Path,
-    relative: OnceCell<String>,
+    relative_directory: OnceCell<String>,
     name: OnceCell<Cow<'a, str>>,
     extension_start: OnceCell<Option<usize>>,
 }
@@ -287,7 +287,7 @@ impl<'a> FilterPath<'a> {
         Self {
             path,
             root,
-            relative: OnceCell::new(),
+            relative_directory: OnceCell::new(),
             name: OnceCell::new(),
             extension_start: OnceCell::new(),
         }
@@ -310,15 +310,15 @@ impl<'a> FilterPath<'a> {
             FilePart::Full => unreachable!(),
         }
     }
-    fn relative(&self, is_dir: bool) -> &str {
-        self.relative.get_or_init(|| {
+    fn relative_directory(&self, is_dir: bool) -> &str {
+        self.relative_directory.get_or_init(|| {
             let relative = self.path.strip_prefix(self.root).unwrap_or(self.path);
-            let relative = if relative.as_os_str().is_empty() && !is_dir {
-                self.path.file_name().map(Path::new).unwrap_or(relative)
-            } else {
+            let directory = if is_dir {
                 relative
+            } else {
+                relative.parent().unwrap_or(Path::new(""))
             };
-            relative.to_string_lossy().replace('\\', "/")
+            directory.to_string_lossy().replace('\\', "/")
         })
     }
 }
@@ -368,7 +368,7 @@ impl PathRule {
             if self.paths.is_empty() {
                 return false;
             }
-            let relative = candidate.relative(true);
+            let relative = candidate.relative_directory(true);
             if relative.is_empty() {
                 return false;
             }
@@ -392,7 +392,7 @@ impl PathRule {
         !self.paths.is_empty()
             && (self
                 .paths
-                .matches(candidate.relative(false), &mut scratch.paths)
+                .matches(candidate.relative_directory(false), &mut scratch.paths)
                 != whitelist)
     }
 }

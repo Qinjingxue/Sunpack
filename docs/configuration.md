@@ -84,9 +84,11 @@ extension to match. A final dot gives an empty extension; `.zip` has an empty
 filename and extension `zip`. These selectors apply only to files. Archive
 detection still uses content, including for disguised names and split volumes.
 
-A bare ordinary path matches a component at any depth. Ordinary rules containing `/` or
-`\` are relative to the scan root. Path regexes search root-relative paths with
-`/` separators; the expression itself is preserved. A matched directory includes
+`paths` matches only directories. For a file, its final filename is removed before
+matching; use `files`, `extensions`, or `full_names` to match the filename. A bare
+ordinary path matches a directory component at any depth. Ordinary rules containing
+`/` or `\` are relative to the scan root. Path regexes search root-relative directory
+paths with `/` separators; the expression itself is preserved. A matched directory includes
 its subtree, including matches ending in `\z`: `\Adownloads\z` selects the root's
 downloads directory and its descendants. The scan root itself is never pruned.
 Whitelist traversal retains ancestors of possible matches; unanchored regexes

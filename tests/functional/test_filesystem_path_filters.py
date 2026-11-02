@@ -94,8 +94,10 @@ def test_game_like_tree_is_not_implicitly_protected(tmp_path):
 def test_path_rules_agree_across_scans_watch_and_output_inventories(tmp_path):
     """One shared tree catches drift between traversal, incremental watch and inventory filtering.
 
-    Existing scanner tests cannot detect a watch or inventory bypass. Running
-    the cases concurrently also checks that shared compiled rules stay immutable.
+    Existing scanner tests cannot detect a watch or inventory bypass, or a
+    filename leaking into directory-only rules. Removing this shared matrix
+    leaves those paths uncovered; one small tree covers both lists and concurrent
+    reuse of compiled rules without separate fixtures for each entry point.
     """
     from concurrent.futures import ThreadPoolExecutor
 
@@ -104,7 +106,11 @@ def test_path_rules_agree_across_scans_watch_and_output_inventories(tmp_path):
     from sunpack.runtime.watch.state import WatchStateStore
 
     root = tmp_path / "input"
-    names = {
+    directory_files = {
+        "folders/keep_12.zip/payload.part01.rar.jpg",
+        "folders/keep_12.zip/deep/payload.part02.rar.jpg",
+    }
+    names = directory_files | {
         "archives/root.zip", "archives/sub/deeper/Keep_01.ZIP",
         "archives/sub/deeper/keep_02.rar", "archives/sub/deeper/keep_03.zip",
         "archives/sub/deeper/regex[0-9]+.zip", "archives/skip_zone/keep_04.zip",
@@ -147,13 +153,13 @@ def test_path_rules_agree_across_scans_watch_and_output_inventories(tmp_path):
         ([{"name": "whitelist", "enabled": True, "paths": [regex(r"\Adownloads/sub\z")]}],
          {"downloads/sub/keep_10.zip"}),
         ([{"name": "whitelist", "enabled": True, "paths": [regex(r"\A中文/\p{L}+\[1\]\+\.zip\z")]}],
-         {"中文/报告[1]+.zip"}),
+         set()),
         ([{"name": "whitelist", "enabled": True, "full_names": [literal("Keep.txt"), literal("sample.zip")]}],
          set()),
         ([{"name": "whitelist", "enabled": True, "full_names": [literal("Keep.txt"), literal("ſample.zip")]}],
          {"unicode/Keep.txt", "unicode/ſample.zip"}),
         ([{"name": "whitelist", "enabled": True, "paths": [regex(r"\Aarchives/.*Keep_[0-9]+\.ZIP\z")]}],
-         {"archives/sub/deeper/Keep_01.ZIP"}),
+         set()),
         ([{"name": "whitelist", "enabled": True, "paths": [literal("a/*/b")]}],
          {"a/x/b/keep_08.zip"}),
         ([{"name": "whitelist", "enabled": True, "paths": [literal("archives/s?b")]}],
@@ -174,11 +180,22 @@ def test_path_rules_agree_across_scans_watch_and_output_inventories(tmp_path):
         ([{"name": "whitelist", "enabled": True, "paths": [literal("Archives/sub")]}], set()),
         ([{"name": "whitelist", "enabled": True, "paths": [literal("ARCHIVES/*")]}], set()),
         ([{"name": "whitelist", "enabled": True, "paths": [regex(r"\A中文/报告")]}],
-         {"中文/报告[1]+.zip"}),
+         set()),
         ([{"name": "whitelist", "enabled": True, "full_names": [literal("keep_01.zip")]}], set()),
         ([{"name": "whitelist", "enabled": True, "full_names": [literal("Keep_01.ZIP")]}],
          {"archives/sub/deeper/Keep_01.ZIP"}),
     ]
+    for path_rule, matched in [
+        (literal("keep_12.zip"), directory_files),
+        (literal("keep_??.zip"), directory_files),
+        (literal(r"folders\keep_12.zip"), directory_files),
+        (literal("archives/root.zip"), set()),
+        (literal("archives/*.zip"), set()),
+        (regex(r"(?:\A|/)keep_[0-9]+\.zip\z"), directory_files),
+    ]:
+        for name in ("blacklist", "whitelist"):
+            cases.append(([{"name": name, "enabled": True, "paths": [path_rule]}],
+                          names - matched if name == "blacklist" else matched))
 
     def relative_files(snapshot):
         return {Path(path).relative_to(root).as_posix()
@@ -189,6 +206,9 @@ def test_path_rules_agree_across_scans_watch_and_output_inventories(tmp_path):
         config = make_config({"filesystem": {"scan_filters": filters}})
         options = DirectoryScanner.compile_scan_options(config)
         assert relative_files(DirectoryScanner(str(root), scope=scope, config=config).scan()) == expected
+        assert relative_files(DirectoryScanner(str(root / "keep_12.zip"), config=config).scan()) == (
+            expected & {"keep_12.zip"}
+        )
         assert relative_files(DirectoryScanner.snapshot_from_entries(str(root), entries, config=config)) == expected
         indices = DirectoryScanner.inventory_file_indices(str(root), paths, [6] * len(paths), config=config)
         assert {Path(paths[i]).relative_to(root).as_posix() for i in indices} == expected
