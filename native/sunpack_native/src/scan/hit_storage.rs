@@ -132,18 +132,18 @@ struct TypePlan {
     sparse: bool,
 }
 impl TypePlan {
-    fn new(n: usize, counts: &[usize; 16]) -> Self {
+    fn new<T: Copy + Into<usize>>(n: usize, counts: &[T; 16]) -> Self {
         let mut tags = 0;
         let mut dominant = 0;
         for i in 0..14 {
-            if counts[i] != 0 {
+            if counts[i].into() != 0 {
                 tags |= 1 << i;
             }
-            if counts[i] > counts[dominant] {
+            if counts[i].into() > counts[dominant].into() {
                 dominant = i;
             }
         }
-        let exceptions = n - counts[dominant];
+        let exceptions = n - counts[dominant].into();
         let dense = bit_bytes(n, type_width(tags));
         let sparse = 8 + exceptions * position_width(n) + bit_bytes(exceptions, 4);
         let use_sparse = n <= u32::MAX as usize && sparse < dense;
@@ -451,8 +451,9 @@ fn release_slack(mut data: Vec<u8>) -> Vec<u8> {
 
 struct Stats {
     tags: u16,
-    counts: [usize; 16],
-    histogram: [usize; 33],
+    counts: [u8; 16],
+    histogram: [u8; 33],
+    patch: bool,
     step: Option<u32>,
     unique: usize,
     repeated_tuples: usize,
@@ -461,18 +462,130 @@ struct Stats {
     gap_index: usize,
 }
 impl Stats {
+    fn strict_uniform(hits: &[PackedHit]) -> Option<Self> {
+        let n = hits.len();
+        debug_assert!(n <= LEAF);
+        if n < 3 {
+            return None;
+        }
+        let t = tag(hits[0]);
+        let mut gaps = [0u32; LEAF];
+        let mut at = 1;
+        let mut runs = 1;
+        #[cfg(target_arch = "x86_64")]
+        let mut max_gap;
+        #[cfg(not(target_arch = "x86_64"))]
+        let mut max_gap = 0;
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            use std::arch::x86_64::*;
+            let tags = _mm_set1_epi32(15);
+            let expected = _mm_set1_epi32(t as i32);
+            let zero = _mm_setzero_si128();
+            let one = _mm_set1_epi32(1);
+            let mut maximum = zero;
+            let mut run_counts = zero;
+            while at + 4 <= n {
+                let packed = _mm_loadu_si128(hits.as_ptr().add(at).cast());
+                let prior = _mm_srli_epi32::<4>(_mm_loadu_si128(hits.as_ptr().add(at - 1).cast()));
+                let delta = _mm_sub_epi32(_mm_srli_epi32::<4>(packed), prior);
+                if _mm_movemask_epi8(_mm_cmpeq_epi32(_mm_and_si128(packed, tags), expected))
+                    != 65535
+                    || _mm_movemask_epi8(_mm_cmpeq_epi32(delta, zero)) != 0
+                {
+                    return None;
+                }
+                _mm_storeu_si128(gaps.as_mut_ptr().add(at).cast(), delta);
+                run_counts = _mm_sub_epi32(run_counts, _mm_cmpgt_epi32(delta, one));
+                let greater = _mm_cmpgt_epi32(delta, maximum);
+                maximum = _mm_or_si128(
+                    _mm_and_si128(greater, delta),
+                    _mm_andnot_si128(greater, maximum),
+                );
+                at += 4;
+            }
+            let mut lanes = [0u32; 4];
+            _mm_storeu_si128(lanes.as_mut_ptr().cast(), maximum);
+            max_gap = lanes.into_iter().max().unwrap();
+            _mm_storeu_si128(lanes.as_mut_ptr().cast(), run_counts);
+            runs += lanes.into_iter().sum::<u32>() as usize;
+        }
+        while at < n {
+            let gap = relative(hits[at]) - relative(hits[at - 1]);
+            if tag(hits[at]) != t || gap == 0 {
+                return None;
+            }
+            gaps[at] = gap;
+            runs += usize::from(gap > 1);
+            max_gap = max_gap.max(gap);
+            at += 1;
+        }
+        let mut counts = [0; 16];
+        counts[t as usize] = n as u8;
+        let mut s = Self {
+            tags: 1 << t,
+            counts,
+            histogram: [0; 33],
+            patch: true,
+            step: None,
+            unique: n,
+            repeated_tuples: 0,
+            runs,
+            max_gap,
+            gap_index: 0,
+        };
+        let span = relative(hits[n - 1]) - relative(hits[0]);
+        let words = (span as usize + 1).div_ceil(64);
+        let bitmap_bytes = (8 + (words + 1) * 2).next_multiple_of(8) + words * 8;
+        let patch_min = 8 + bit_bytes(n, 1) + bit_bytes(n.div_ceil(CHECKPOINT), bits(span));
+        // Strict gaps need at least one bit. Width zero would need n-1
+        // five-byte exceptions and cannot beat this bound for n >= 3.
+        // Equality retains PATCH's existing tie-break. Split sides with an
+        // omitted histogram are recomputed by without(), never subtracted.
+        s.patch = bitmap_bytes >= patch_min;
+        if !s.patch {
+            if max_gap as u64 * 4 > span as u64 {
+                s.gap_index = gaps[..n].iter().position(|&gap| gap == max_gap).unwrap();
+            }
+            return Some(s);
+        }
+        s.histogram[0] = 1;
+        let mut histograms = [[0u8; 33]; 4];
+        // Independent counters avoid a read-modify-write chain when most gaps
+        // fall in the same bucket. Each lane receives at most LEAF/4 values.
+        let mut i = 1;
+        while i + 4 <= n {
+            for lane in 0..4 {
+                histograms[lane][bits(gaps[i + lane]) as usize] += 1;
+            }
+            i += 4;
+        }
+        for gap in &gaps[i..n] {
+            s.histogram[bits(*gap) as usize] += 1;
+        }
+        for histogram in histograms {
+            for (total, count) in s.histogram.iter_mut().zip(histogram) {
+                *total += count;
+            }
+        }
+        if max_gap as u64 * 4 > span as u64 {
+            s.gap_index = gaps[..n].iter().position(|&gap| gap == max_gap).unwrap();
+        }
+        Some(s)
+    }
     fn new(hits: &[PackedHit]) -> Self {
         if let Some((_, step, t)) = uniform_arithmetic(hits) {
             let n = hits.len();
             let mut counts = [0; 16];
-            counts[t as usize] = n;
+            counts[t as usize] = n as u8;
             let mut histogram = [0; 33];
             histogram[0] = 1;
-            histogram[bits(step) as usize] += n - 1;
+            histogram[bits(step) as usize] += (n - 1) as u8;
             return Self {
                 tags: 1 << t,
                 counts,
                 histogram,
+                patch: true,
                 step: Some(step),
                 unique: if step == 0 { 1 } else { n },
                 repeated_tuples: if step == 0 { n - 1 } else { 0 },
@@ -481,11 +594,15 @@ impl Stats {
                 gap_index: usize::from(step != 0),
             };
         }
+        if let Some(stats) = Self::strict_uniform(hits) {
+            return stats;
+        }
         let step = (hits.len() > 1).then(|| relative(hits[1]) - relative(hits[0]));
         let mut s = Self {
             tags: 0,
             counts: [0; 16],
             histogram: [0; 33],
+            patch: true,
             step,
             unique: 0,
             repeated_tuples: 0,
@@ -529,6 +646,9 @@ impl Stats {
         s
     }
     fn without(&self, known: &Self, removed_gap: u32, hits: &[PackedHit]) -> Self {
+        if !self.patch || !known.patch {
+            return Self::new(hits);
+        }
         // A gap > 1 starts a new position group and run. Counts, duplicate
         // occurrences and run counts are therefore additive across this cut.
         // Each standalone side replaces the boundary gap by a first zero gap.
@@ -552,6 +672,7 @@ impl Stats {
             tags,
             counts,
             histogram,
+            patch: true,
             step: if hits.len() > 1 {
                 arithmetic_offsets(hits)
             } else {
@@ -599,8 +720,12 @@ fn choose(hits: &[PackedHit], s: &Stats) -> Plan {
     consider(types.ctl(EF, low), 48 + bit_bytes(n, low) + types.bytes);
     let mut covered = 0;
     let mut best_gap = (0, usize::MAX);
-    for width in 0..=bits(s.max_gap) as usize {
-        covered += s.histogram[width];
+    for width in 0..if s.patch {
+        bits(s.max_gap) as usize + 1
+    } else {
+        0
+    } {
+        covered += s.histogram[width] as usize;
         if width != 0 && s.histogram[width] == 0 {
             continue;
         }
@@ -612,7 +737,9 @@ fn choose(hits: &[PackedHit], s: &Stats) -> Plan {
             best_gap = (width as u32, size);
         }
     }
-    consider(types.ctl(PATCH, best_gap.0), best_gap.1 + types.bytes);
+    if s.patch {
+        consider(types.ctl(PATCH, best_gap.0), best_gap.1 + types.bytes);
+    }
     consider(types.ctl(BITMAP, 0) | RUNS, 8 + s.runs * 8 + types.bytes);
     if s.unique == n {
         let words = (span as usize + 1).div_ceil(64);
@@ -1193,7 +1320,7 @@ fn encode(hits: Vec<PackedHit>) -> Option<Encoded> {
     // Constant offsets with changing types are common in retained evidence.
     // Check that global form before building leaf statistics and directories.
     if let Some(step) = arithmetic_offsets(&hits) {
-        let mut counts = [0; 16];
+        let mut counts = [0usize; 16];
         for &hit in &hits {
             counts[tag(hit) as usize] += 1;
         }
@@ -1270,21 +1397,26 @@ fn encode(hits: Vec<PackedHit>) -> Option<Encoded> {
     for plan in &plans {
         let limit = (rank + plan.n + LEAF).min(count);
         while read < limit {
-            pending[read % (LEAF * 2)]
-                .0
-                .copy_from_slice(&data[read * 4..read * 4 + 4]);
-            read += 1;
+            let begin = read % pending.len();
+            let n = (limit - read).min(pending.len() - begin);
+            // PackedHit has alignment 1 and every four-byte pattern is valid.
+            let source =
+                unsafe { std::slice::from_raw_parts(data.as_ptr().add(read * 4).cast(), n) };
+            pending[begin..begin + n].copy_from_slice(source);
+            read += n;
         }
-        for i in 0..plan.n {
-            scratch[i] = pending[(rank + i) % (LEAF * 2)];
-        }
+        let begin = rank % pending.len();
+        let source = if begin + plan.n <= pending.len() {
+            &pending[begin..begin + plan.n]
+        } else {
+            let first = pending.len() - begin;
+            scratch[..first].copy_from_slice(&pending[begin..]);
+            scratch[first..plan.n].copy_from_slice(&pending[..plan.n - first]);
+            &scratch[..plan.n]
+        };
         let start = plan.leaf.offset as usize;
         data[previous..start].fill(0);
-        encode_leaf(
-            &mut data[start..start + plan.bytes],
-            &scratch[..plan.n],
-            *plan,
-        );
+        encode_leaf(&mut data[start..start + plan.bytes], source, *plan);
         previous = start + plan.bytes;
         rank += plan.n;
     }
