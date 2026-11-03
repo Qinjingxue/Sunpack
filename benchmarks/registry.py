@@ -30,6 +30,7 @@ _ROWS = [
     ("scan", "directory", "benchmarks.scenarios.scan_directory", "Directory scanner comparison."),
     ("scan", "watch-catalog", "benchmarks.scenarios.watch_catalog", "Native Watch catalog, bucket lookup, protected output pruning and state lifetime."),
     ("scan", "hotspots", "benchmarks.scenarios.scan_hotspots", "Full scan hotspot instrumentation."),
+    ("scan", "hit-index", "benchmarks.scenarios.hit_index", "Pinned integer-index baselines, exact typed-hit conformance, real traces and production Builder lifecycle."),
     ("scan", "synthetic-pressure", "benchmarks.scenarios.scan_synthetic_pressure", "Synthetic mixed-corpus scan."),
     ("watch", "catalog-recovery", "benchmarks.scenarios.watch_catalog_recovery", "Per-directory versus batched USN catalog recovery on one journal interval."),
     ("watch", "real-file", "benchmarks.scenarios.watch_real_file", "End-to-end watch arrival, extraction, and completion for one supplied file."),

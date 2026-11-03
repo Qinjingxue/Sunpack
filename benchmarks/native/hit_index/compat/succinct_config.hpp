@@ -1,0 +1,3 @@
+#pragma once
+#define SUCCINCT_USE_INTRINSICS 1
+#define SUCCINCT_USE_POPCNT 1

@@ -2,6 +2,11 @@
 
 Performance measurements and diagnostic profiles live here; behavioural assertions live under `tests/`.
 
+The typed-hit index protocol, pinned baselines, corpus recipes, statistics and
+release gates are documented in [hit_index/PROTOCOL.md](hit_index/PROTOCOL.md).
+`scan hit-index` runs exact semantic conformance separately from timing and
+can replay actual post-filter traces through the production Rust Builder.
+
 List the supported scenarios:
 
 ```powershell
@@ -26,6 +31,7 @@ uv run --locked python -m benchmarks reader embedded-scan --generate-plan5-mib 5
   --baseline-report benchmarks/results/reader.embedded-scan/<baseline-run>/report.json `
   --max-regression-percent 5
 uv run --locked python -m benchmarks scan hotspots . --mode full --json-out benchmarks/results/scan-hotspots.json
+uv run --no-sync python -m benchmarks scan hit-index --fetch --real --full-scan --strict
 uv run --no-sync python -m benchmarks scan watch-catalog --files 30000 --protected-files 100000 --bucket-size 8 --rounds 20 --event-batch-size 64
 uv run --no-sync python -m benchmarks watch catalog-recovery --directories 500 --changes 3000 --rounds 3
 uv run --locked python -m benchmarks extraction format-matrix --runs 5 --json-out benchmarks/results/extraction-benchmark.json

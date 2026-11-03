@@ -1,0 +1,8 @@
+{
+  "fastpfor": {"repository": "fast-pack/FastPFOR", "commit": "ae4e62db4de1ce6904e278f94afb56a87a36b32c"},
+  "croaring": {"repository": "RoaringBitmap/CRoaring", "commit": "1575f7d45eb1b7808a5817d7216ba0441bb6729b"},
+  "pef": {"repository": "ot/partitioned_elias_fano", "commit": "92c939c0840e81c58a903f5094be5f963760c3cf"},
+  "succinct": {"repository": "ot/succinct", "commit": "ea74747a8b1cc7c934b984f23198efbb0635ed1f"},
+  "streamvbyte": {"repository": "fast-pack/streamvbyte", "commit": "edc6105b24e150cd109ece75e6e37f54291635b0"},
+  "faw": {"repository": "mmkrasel/faw-encoding", "commit": "d13893ff6ea7d5299ea8061d494ef45f09a7cf07"}
+}

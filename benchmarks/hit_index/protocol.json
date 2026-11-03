@@ -1,0 +1,49 @@
+{
+  "protocol": "SunPack typed-hit index evaluation",
+  "revision": "2026-11-03",
+  "contract": {
+    "offset": "unsigned absolute u64",
+    "types": 14,
+    "order": "offset, then lexical production hit_name",
+    "multiplicity": "preserve duplicate offsets and duplicate (offset,type) tuples",
+    "operations": ["build", "sequential_all", "mask_common", "mask_rare", "mask_absent", "access_random", "lower_present", "lower_absent", "lower_mixed", "seek_forward", "equal_offset", "drop"],
+    "oracle": "exact full tuple comparison plus independent scalar std::lower_bound/access/seek; sums only prevent dead-code elimination"
+  },
+  "seeds": {
+    "development": [1729, 7919, 104729],
+    "evaluation": [15485863, 32452843, 49979687, 67867967, 86028121],
+    "selection": 20261103,
+    "statistics": 5151,
+    "note": "Public predetermined evaluation seeds, not a claim of blind testing. Freeze recipes before tuning. Separate RNG streams for positions/types/queries."
+  },
+  "algorithms": ["raw-packed", "raw64", "sunpack", "svb", "svb0124", "bp128", "fastpfor128", "optpfor", "simple8b", "vse", "ef", "pef-uniform", "pef-opt", "roaring", "roaring-packed", "faw", "faw-repaired"],
+  "boundary_lengths": [0, 1, 2, 7, 31, 32, 63, 64, 127, 128, 129, 255, 256, 257, 4095, 4096, 4097],
+  "evaluation_lengths": [4096, 65536, 262144, 1048576],
+  "type_patterns": ["one", "uniform", "palette3", "skew", "runs", "periodic", "coincident"],
+  "measurement": {
+    "quick": {"process_blocks": 3, "inner_samples": 3, "warmups": 1, "target_ms": 3, "queries": 512},
+    "evaluation": {"process_blocks": 7, "inner_samples": 5, "warmups": 2, "target_ms": 20, "queries": 4096},
+    "pairing": "same case/seed/process block, cyclic algorithm order (exact ordinal balance only over a complete cycle), rotated operation order",
+    "unit": "fresh process for a case/algorithm/configuration/block; inner iterations are not independent replicates",
+    "construction": "library initialization excluded and reported separately; typed-input adaptation included; validation outside timers",
+    "warm_cache": "normal repeated process-local accesses; no claim of physical cold disk cache",
+    "statistics": "median per process, paired ratios across process blocks; hierarchical bootstrap by case and process block within family; no pooled inner-loop confidence interval",
+    "memory": "phase private bytes/working set and absolute Windows process high-water marks; bytes = actual encoded streams including type/directory/padding plus a common 64-byte accounting envelope, not an on-disk image; reported capacities are partial diagnostic lower bounds, unknown is null",
+    "io": "Win32 transfer counters are process transfers, not physical storage-device bytes"
+  },
+  "release_gates": {
+    "required_layers": ["typed-index", "production-builder", "real-post-filter-traces", "full-scan"],
+    "correctness": "zero candidate errors on every mandatory case; unsupported cases remain in coverage denominator",
+    "publication": "all mandatory shards, all process blocks, pinned source/build/input manifests and external-data status disclosed; quick/conformance runs are exploratory",
+    "winner": "publish space/build/query/lifecycle Pareto fronts and worst strata; no universal winner or arbitrary single-score weight",
+    "performance_decision": "predeclare target effect and acceptable regressions for the intended workload before examining candidate results; confidence interval must resolve that effect"
+  },
+  "sources": [
+    {"id": "simd-integers", "url": "https://arxiv.org/html/1209.2137v7", "use": "author Uniform/ClusterData generators, length strata, decoding includes differential reconstruction"},
+    {"id": "pef", "url": "https://pages.di.unipi.it/rossano/assets/pdf/papers/SIGIR14.pdf", "use": "Access/Next/NextGEQ semantics, directory costs and query/build separation"},
+    {"id": "roaring", "url": "https://arxiv.org/html/1603.06549v4", "use": "run-rich and set workloads, run optimization and serialization costs"},
+    {"id": "partitioned-vbyte", "url": "https://arxiv.org/html/1804.10949v2", "use": "dense/sparse transitions and variable partition tradeoffs"},
+    {"id": "methodology", "url": "https://kar.kent.ac.uk/33611/45/p63-kaliber.pdf", "use": "levels of repetition and uncertainty"},
+    {"id": "acm-artifacts", "url": "https://www.acm.org/publications/policies/artifact-review-and-badging-current", "use": "documented, consistent, complete, exercisable artifacts"}
+  ]
+}
