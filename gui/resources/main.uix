@@ -9,17 +9,16 @@ export default {
     tab:'tasks',theme:'system',themeChoice:0,appearance:'light',language:'en',texts:{},dispatch:false,requests:[],ready:false,busy:false,
     actionError:'',lastCommand:{},errors:{},logPath:'',cliAllowed:false,runtime:{known:false,running:false},
     taskCursors:[],taskPages:[],taskPending:null,taskRevision:0,tasks:{rows:[],total:0,hasMore:false,next:'',dropped:0},passwords:{rows:[],total:0},fields:[],directories:[],
-    startup:{enabled:false,command:''},directoryQuery:'',
-    taskQuery:'',taskRoot:'',taskStatus:0,
+    startup:{enabled:false,command:''},directoryQuery:'',directorySelection:'',
+    taskQuery:'',taskDirectoryDirty:false,taskStatus:0,
     statusNames:['','taskProcessing','taskWaiting','taskSucceeded','taskFailed'],
     rootRows:[],rootDrafts:{},rootNew:[],rootCell:'',rootPart:'',rootNext:0,rootQuery:'',cellPointer:null,
     configCategory:'',configQuery:'',drafts:{},rangeUnitDrafts:{},toggleDrafts:{},saving:false,saveErrors:{},pendingFields:[],recordSaving:{passwords:false,roots:false},
-    passwordRoot:'',passwordHistory:false,passwordHistoryTarget:false,passwordQuery:'',passwordDrafts:{},passwordNew:[],passwordCell:'',passwordNext:0,
+    passwordHistory:false,passwordHistoryTarget:false,passwordDirectoryDirty:false,passwordQuery:'',passwordDrafts:{},passwordNew:[],passwordCell:'',passwordNext:0,
     tagInputs:{},tagModes:{},tagEdits:{},searchSnapshot:null
   }; },
   computed: {
-    passwordScope() { return this.passwordHistoryTarget?'@history':this.passwordRoot||'@all'; },
-    directorySelection() { return this.tab==='passwords'?this.passwordRoot:this.taskRoot; },
+    passwordScope() { return this.passwordHistoryTarget?'@history':this.directorySelection||'@all'; },
     shownRootRows() {
       let q=this.rootQuery.toLowerCase(),rows=this.rootNew.concat(this.rootRows),ids=new Set(rows.map(r=>r.id));
       for(let d of Object.values(this.rootDrafts)) if(!ids.has(d.id)&&(d.pending||d.error||this.rootCell===d.id)) rows.push(d);
@@ -29,12 +28,15 @@ export default {
     shownDirectories() { let q=this.directoryQuery.toLowerCase(); return this.directories.filter(d=>d.watch&&d.path.toLowerCase().indexOf(q)>=0); },
     shownPasswords() {
       if(this.passwordHistory) return this.passwords.rows;
-      let saved=this.passwords.scope===(this.passwordRoot||'@all')?this.passwords.rows:[],ids=passwordIndexes.get(saved);
+      // Keep the last snapshot mounted until its replacement arrives.
+      let saved=this.passwords.scope==='@history'?[]:this.passwords.rows,ids=passwordIndexes.get(saved);
+      // Synthetic editor rows belong only to the directory where they began.
+      if(this.passwords.scope!==this.passwordScope) { saved=saved.filter(p=>p.original); ids=passwordIndexes.get(saved); }
       if(!ids) { ids=new Set(saved.map(p=>p.id)); passwordIndexes.set(saved,ids); }
-      let extra=this.passwordNew.filter(p=>p.scope===this.passwordRoot&&!ids.has(p.id)),rows=extra.length?extra.concat(saved):saved;
+      let extra=this.passwordNew.filter(p=>p.scope===this.directorySelection&&!ids.has(p.id)),rows=extra.length?extra.concat(saved):saved;
       for(let id of Object.keys(this.passwordDrafts)) {
         let d=this.passwordDrafts[id];
-        if((d.original||d.historyValue===undefined)&&d.scope===this.passwordRoot&&!ids.has(id)&&!extra.some(p=>p.id===id)&&(d.pending||d.error||this.passwordCell===id)) rows=rows.concat([d]);
+        if((d.original||d.historyValue===undefined)&&d.scope===this.directorySelection&&!ids.has(id)&&!extra.some(p=>p.id===id)&&(d.pending||d.error||this.passwordCell===id)) rows=rows.concat([d]);
       }
       return rows;
     },
@@ -88,7 +90,7 @@ export default {
       this.searchSnapshot={query:query,targets:targets,before:scope==='task'&&this.taskCursors.length>0,after:scope==='task'&&this.tasks.hasMore};
     },
     searchTaskPage(direction) {
-      if(this.taskPending) return;
+      if(this.taskDirectoryDirty||this.taskPending||!this.taskPages.length) return;
       let range={first:0,last:0};
       if(direction>0&&this.tasks.hasMore) this.requestTaskPage('append',this.tasks.next,{first:this.tasks.rows.length,last:this.tasks.rows.length+100});
       else if(direction<0&&this.taskCursors.length) this.requestTaskPage('prepend',this.taskCursors[this.taskCursors.length-1],range);
@@ -156,7 +158,7 @@ export default {
       // mounted row/input, including focus and measured height, across renames.
       let order=this.passwordNew.concat(this.passwords.rows),ids=new Map(),reserved=new Set();
       let remember=(original,id)=>{ let group=ids.get(original); if(!group) { group={ids:[],next:0}; ids.set(original,group); } group.ids.push(id); };
-      for(let id of Object.keys(this.passwordDrafts)) { let d=this.passwordDrafts[id]; if(d.original&&d.scope===this.passwordRoot) { remember(d.original,id); reserved.add(id); } }
+      for(let id of Object.keys(this.passwordDrafts)) { let d=this.passwordDrafts[id]; if(d.original&&d.scope===this.directorySelection) { remember(d.original,id); reserved.add(id); } }
       if(this.passwords.scope===snapshot.scope) for(let p of this.passwords.rows) if(p.original&&!reserved.has(p.id)) remember(p.original,p.id);
       for(let p of snapshot.rows) if(p.original) {
         let group=ids.get(p.original);
@@ -168,7 +170,7 @@ export default {
         let byId=new Map(snapshot.rows.map(p=>[p.id,p])),rows=[];
         for(let id of Object.keys(this.passwordDrafts)) {
           let d=this.passwordDrafts[id];
-          if(d.historyValue===undefined&&d.scope===this.passwordRoot&&!byId.has(id)&&!d.original&&(d.pending||d.error||this.passwordCell===id)) byId.set(id,d);
+          if(d.historyValue===undefined&&d.scope===this.directorySelection&&!byId.has(id)&&!d.original&&(d.pending||d.error||this.passwordCell===id)) byId.set(id,d);
         }
         for(let previous of order) if(byId.has(previous.id)) {
           let current=byId.get(previous.id); byId.delete(previous.id);
@@ -178,11 +180,12 @@ export default {
         snapshot.rows=rows;
       }
       this.passwords=snapshot;
+      this.passwordDirectoryDirty=false;
       this.passwordHistory=snapshot.scope==='@history';
     },
     searchPasswords(value) { this.passwordQuery=value; this.filterPasswords(); },
-    filterTasks() { this.resetTaskPages(); this.send('filterTasks',{query:this.taskQuery,root:this.taskRoot,status:this.statusNames[this.taskStatus]||''}); },
-    resetTaskPages() { this.taskCursors=[]; this.taskPages=[]; this.taskPending=null; this.tasks={rows:[],total:0,hasMore:false,next:'',dropped:0}; },
+    filterTasks() { this.resetTaskPages(); this.send('filterTasks',{query:this.taskQuery,root:this.directorySelection,status:this.statusNames[this.taskStatus]||''}); },
+    resetTaskPages() { this.taskCursors=[]; this.taskPages=[]; this.taskPending=null; },
     trimTaskPages(range) {
       let rows=this.taskPages.reduce((count,page)=>count+page.rows.length,0);
       while(this.taskPages.length>1) {
@@ -197,7 +200,7 @@ export default {
       return range;
     },
     taskRange(range) {
-      if(!range||!this.tasks.rows.length) return;
+      if(this.taskDirectoryDirty||!range||!this.tasks.rows.length||!this.taskPages.length) return;
       if(this.taskPending) { this.taskPending.range=range; return; }
       let count=this.taskPages.length; range=this.trimTaskPages(range);
       if(count!==this.taskPages.length) this.publishTaskPages();
@@ -212,7 +215,7 @@ export default {
       this.send('taskPage',{cursor:cursor,window:window});
     },
     applyTasks(packet) {
-      if(packet.pages.some(snapshot=>snapshot.query!==this.taskQuery||snapshot.root!==this.taskRoot||snapshot.status!==(this.statusNames[this.taskStatus]||''))) return;
+      if(packet.pages.some(snapshot=>snapshot.query!==this.taskQuery||snapshot.root!==this.directorySelection||snapshot.status!==(this.statusNames[this.taskStatus]||''))) return;
       if(packet.reset) this.resetTaskPages();
       this.taskRevision=packet.revision;
       if(packet.full) {
@@ -231,9 +234,10 @@ export default {
         if(range&&!packet.reset) this.trimTaskPages(range);
       } else for(let snapshot of packet.pages) this.applyTaskPage(snapshot);
       if(this.taskPages.length) this.publishTaskPages();
+      this.taskDirectoryDirty=false;
     },
     applyTaskPage(snapshot) {
-      if(snapshot.query!==this.taskQuery||snapshot.root!==this.taskRoot||snapshot.status!==(this.statusNames[this.taskStatus]||'')) return;
+      if(snapshot.query!==this.taskQuery||snapshot.root!==this.directorySelection||snapshot.status!==(this.statusNames[this.taskStatus]||'')) return;
       let pending=this.taskPending, index=this.taskPages.findIndex(page=>page.cursor===snapshot.cursor);
       if(pending&&pending.cursor===snapshot.cursor) {
         this.taskPending=null;
@@ -253,22 +257,24 @@ export default {
       this.tasks={rows:rows,total:rows.length,hasMore:last.hasMore,next:last.next,dropped:last.dropped};
       this.send('taskWindow',{window:this.taskPages.map(page=>page.cursor),revision:this.taskRevision});
     },
-    selectRoot(path) { this.taskRoot=path; this.filterTasks(); },
     filterPasswords() { this.send('filterPasswords',{query:this.passwordQuery,scope:this.passwordScope}); },
     selectPasswordView(history) {
       if(this.passwordHistoryTarget===history) return;
       this.finishPasswordCell(); this.passwordHistoryTarget=history; this.filterPasswords();
     },
     selectDirectory(path) {
-      if(this.tab!=='passwords') { this.selectRoot(path); return; }
-      this.finishPasswordCell(); this.passwordRoot=path;
-      if(!this.passwordHistoryTarget) this.filterPasswords();
+      if(this.directorySelection===path) return;
+      this.finishPasswordCell(); this.directorySelection=path;
+      this.taskDirectoryDirty=true;
+      if(!this.passwordHistoryTarget) this.passwordDirectoryDirty=true;
+      this.syncDirectoryView();
     },
-    syncPasswordDirectory() {
-      if(this.passwordRoot&&!this.directories.some(d=>d.watch&&d.path===this.passwordRoot)) {
-        this.finishPasswordCell(); this.passwordRoot='';
-        if(!this.passwordHistoryTarget) this.filterPasswords();
-      }
+    syncDirectoryView() {
+      // Refresh the visible page only; the other page catches up on navigation.
+      if(this.tab==='tasks') {
+        let first=this.taskPages[0];
+        if(this.taskDirectoryDirty||!first||first.root!==this.directorySelection) this.filterTasks();
+      } else if(this.tab==='passwords'&&(this.passwordDirectoryDirty||this.passwords.scope!==this.passwordScope)) this.filterPasswords();
     },
     errorText(error) { return error && typeof error==='object' ? error.text : (this.texts[error]||error); },
     setSaveError(key,message) { let errors=Object.assign({},this.saveErrors); if(message) errors[key]=message; else delete errors[key]; this.saveErrors=errors; },
@@ -296,8 +302,7 @@ export default {
       let order=new Map(previous.map((r,i)=>[r.id,i]));
       rows.sort((a,b)=>(order.has(a.id)?order.get(a.id):previous.length)-(order.has(b.id)?order.get(b.id):previous.length));
       let ids=new Set(rows.map(r=>r.id)); this.rootNew=this.rootNew.filter(r=>!ids.has(r.id)); this.rootRows=rows; this.directories=snapshot;
-      this.syncPasswordDirectory();
-      if(this.taskRoot&&!snapshot.some(d=>d.watch&&d.path===this.taskRoot)) { this.taskRoot=''; this.filterTasks(); }
+      if(this.directorySelection&&!snapshot.some(d=>d.watch&&d.path===this.directorySelection)) this.selectDirectory('');
     },
     beginRoot(r,part) {
       if(this.rootCell===r.id&&this.rootPart===part) return;
@@ -421,8 +426,7 @@ export default {
             claimed.set(record.identity,d.id);
             d.original=record.input; d.identity=record.identity; d.expected={output:record.output,deep:record.deep,recursive:record.recursive};
             renamed.set(d.id,{original:record.input,identity:record.identity});
-            if(this.taskRoot===previous&&previous!==record.input) { this.taskRoot=record.input; this.filterTasks(); }
-            if(this.passwordRoot===previous&&previous!==record.input) { this.passwordRoot=record.input; if(!this.passwordHistoryTarget) this.filterPasswords(); }
+            if(this.directorySelection===previous&&previous!==record.input) this.selectDirectory(record.input);
             if(same&&this.rootCell!==d.id) Object.assign(d,{input:record.input,output:record.output,deep:record.deep,recursive:record.recursive});
           }
           d.baseline=JSON.stringify(same?this.rootValue(d):submitted); d.submitted='';
@@ -515,25 +519,27 @@ export default {
     putPasswordDraft(d) { this.passwordDrafts=Object.assign({},this.passwordDrafts,{[d.id]:d}); },
     ensurePasswordDraft(p) {
       let d=this.passwordDrafts[p.id];
-      if(!d) { d={id:p.id,original:p.original,value:p.value,scope:this.passwordRoot,pending:false,error:'',submitted:''}; this.putPasswordDraft(d); }
+      if(!d) { d={id:p.id,original:p.original,value:p.value,scope:this.directorySelection,pending:false,error:'',submitted:''}; this.putPasswordDraft(d); }
       return d;
     },
     addPassword() {
       this.finishPasswordCell();
-      let row={id:'new-'+(++this.passwordNext),original:'',value:'',scope:this.passwordRoot};
+      let row={id:'new-'+(++this.passwordNext),original:'',value:'',scope:this.directorySelection};
       this.passwordHistory=this.passwordHistoryTarget=false; this.passwordQuery=''; this.filterPasswords();
       this.passwordNew=this.passwordNew.concat([row]); this.ensurePasswordDraft(row);
       this.passwordCell=row.id; this.send('focusPassword',{id:row.id,part:'value',top:true});
     },
     historyDraft(p) {
-      return Object.values(this.passwordDrafts).find(d=>d.historyValue===p.value&&d.scope===this.passwordRoot)||{};
+      return Object.values(this.passwordDrafts).find(d=>d.historyValue===p.value&&d.scope===this.directorySelection)||{};
     },
     saveHistory(p) {
       let d=this.historyDraft(p); if(d.pending) return;
-      if(!d.id) d={id:'history-'+(++this.passwordNext),original:'',value:p.value,historyValue:p.value,scope:this.passwordRoot,pending:false,error:'',submitted:''};
+      if(!d.id) d={id:'history-'+(++this.passwordNext),original:'',value:p.value,historyValue:p.value,scope:this.directorySelection,pending:false,error:'',submitted:''};
       this.commitPassword(d);
     },
     beginPassword(p) {
+      // Retained cards still belong to the previous scope during a filter.
+      if(this.passwords.scope!==this.passwordScope&&p.scope!==this.directorySelection) return;
       if(this.passwordCell===p.id) return;
       this.finishPasswordCell(); this.ensurePasswordDraft(p); this.passwordCell=p.id;
       this.send('focusPassword',{id:p.id,part:'value',pointerX:this.cellPointerX(p.id,'value')});
@@ -569,6 +575,7 @@ export default {
     },
     blurPassword(p) { if(this.passwordCell===p.id) this.finishPasswordCell(); },
     deleteListedPassword(p) {
+      if(this.passwords.scope!==this.passwordScope&&p.scope!==this.directorySelection) return;
       if(this.passwordCell===p.id) this.passwordCell='';
       let d=this.ensurePasswordDraft(p);
       if(!d.original&&!d.pending) { this.discardPassword(p.id); return; }
@@ -1027,7 +1034,7 @@ export default {
                 <button class="password-actions" :id="'delete-password-'+p.id" @click="deleteListedPassword(p)">{{ texts.delete }}</button>
               </div>
               <div v-show="passwordDraft(p).error" class="action-row"><label class="error">{{ errorText(passwordDraft(p).error) }}</label><button :id="'discard-password-'+p.id" :enabled="!passwordDraft(p).pending" @click="discardPassword(p.id)">{{ texts.cancelEntries }}</button></div>
-              <div v-show="passwordHistory" class="history-row"><div class="history-content"><label class="history-text" :id="'history-value-'+p.id">{{ p.value }}</label></div><button class="history-save" :id="'save-history-'+p.id" :enabled="!historyDraft(p).pending" @click="saveHistory(p)">{{ passwordRoot?texts.saveHistoryToDirectory:texts.saveHistoryGlobally }}</button></div>
+              <div v-show="passwordHistory" class="history-row"><div class="history-content"><label class="history-text" :id="'history-value-'+p.id">{{ p.value }}</label></div><button class="history-save" :id="'save-history-'+p.id" :enabled="!historyDraft(p).pending" @click="saveHistory(p)">{{ directorySelection?texts.saveHistoryToDirectory:texts.saveHistoryGlobally }}</button></div>
               <div v-show="passwordHistory &amp;&amp; historyDraft(p).error" class="action-row"><label class="error">{{ errorText(historyDraft(p).error) }}</label><button @click="discardPassword(historyDraft(p).id)">{{ texts.cancelEntries }}</button></div>
             </div>
             </VirtualList>

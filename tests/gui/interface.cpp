@@ -129,7 +129,7 @@ void pump_diagnostic(Application& app,const std::function<bool()>& condition,con
     try { pump(condition,phase); }
     catch(...) {
         std::cerr<<"UI wait diagnostic ["<<phase<<"]";
-        for(const char* key:{"tab","language","taskQuery","taskRoot","taskStatus","taskPending","taskCursors","requests","dispatch",
+        for(const char* key:{"tab","language","taskQuery","directorySelection","taskStatus","taskPending","taskCursors","requests","dispatch",
                              "errors","logPath","actionError","busy","lastCommand",
                              "saving","pendingFields","saveErrors","drafts","tagInputs"}) {
             try { std::cerr<<" "<<key<<"="<<state(app.page(),key).dump(); }
@@ -257,7 +257,7 @@ void click(Application& app,const char* id) {
     auto clicked=ui_debug_click(app.window(),widget);
     if(clicked!=0) {
         std::cerr<<"Click failed: "<<id<<" "<<rendered_widget(app,id)<<'\n';
-        for(auto key:{"taskRoot","rootCell","rootPart","rootDrafts","saveErrors"}) std::cerr<<key<<"="<<state(app.page(),key)<<'\n';
+        for(auto key:{"directorySelection","rootCell","rootPart","rootDrafts","saveErrors"}) std::cerr<<key<<"="<<state(app.page(),key)<<'\n';
     }
     assert(clicked==0);
     ui_widget_destroy(widget);
@@ -1809,6 +1809,64 @@ void task_history(Application& app,const fs::path& dir) {
     assert(state(app.page(),"actionError")=="" && state(app.page(),"errors").empty());
 }
 
+// Settled projection checks cannot catch an empty intermediate frame or a
+// per-tab directory cache. Reuse the loaded window, and inspect the transition
+// before dispatching background work, then verify the real navigation result.
+void directory_selection(Application& app,const fs::path& dir) {
+    auto path=utf8(dir.wstring());
+    auto select=[&](const std::string& value) {
+        assert(ui_page_call_json(app.page(),"selectDirectory",Json(value).dump().c_str())==0);
+    };
+    auto tasks=state(app.page(),"tasks");
+    assert(!tasks["rows"].empty());
+    auto* root=ui::GetContext().GetWindow(app.window())->Root().get();
+    auto task_id="task-"+tasks["rows"][0]["id"].get<std::string>();
+    auto* task=root->FindById(task_id); assert(task);
+    select(path);
+    assert(state(app.page(),"tasks")==tasks);
+    ui_window_relayout(app.window());
+    assert(root->FindById(task_id)==task);
+    assert(ui_page_call_json(app.page(),"taskRange",R"({"first":0,"last":1})")==0);
+    assert(ui_page_call_json(app.page(),"searchTaskPage","1")==0);
+    auto requests=state(app.page(),"requests");
+    assert(requests.size()==1 && requests[0]["op"]=="filterTasks");
+    pump_diagnostic(app,[&]{auto pages=state(app.page(),"taskPages");return !pages.empty()&&pages[0]["root"]==path;},"Selected task directory");
+    click(app,"tabPasswords");
+    pump([&]{return state(app.page(),"passwords").value("scope","")==path;},"Shared password directory");
+    assert(state(app.page(),"directorySelection")==path);
+    select("");
+    pump([&]{return state(app.page(),"passwords").value("scope","")=="@all";},"Global password snapshot");
+    auto passwords=state(app.page(),"passwords");
+    assert(!passwords["rows"].empty());
+    ui_window_relayout(app.window());
+    auto password_id="password-"+passwords["rows"][0]["id"].get<std::string>();
+    auto* password=root->FindById(password_id); assert(password);
+    select(path);
+    assert(state(app.page(),"shownPasswords")==passwords["rows"]);
+    ui_window_relayout(app.window());
+    assert(root->FindById(password_id)==password);
+    // An old card must never create an edit/delete against the new directory.
+    auto row=passwords["rows"][0].dump();
+    assert(ui_page_call_json(app.page(),"beginPassword",row.c_str())==0);
+    assert(ui_page_call_json(app.page(),"deleteListedPassword",row.c_str())==0);
+    assert(state(app.page(),"passwordCell")=="" && state(app.page(),"passwordDrafts").empty());
+    select(""); select(path);
+    requests=state(app.page(),"requests");
+    assert(requests.size()==1 && requests[0]["op"]=="filterPasswords" && requests[0]["payload"]["scope"]==path);
+    assert(ui_page_call_json(app.page(),"applyPasswords",passwords.dump().c_str())==0);
+    assert(state(app.page(),"passwords")==passwords);
+    click(app,"tabTasks");
+    pump([&]{return state(app.page(),"tab")=="tasks";});
+    assert(state(app.page(),"directorySelection")==path);
+    click(app,"allRoots");
+    pump([&]{auto pages=state(app.page(),"taskPages");return !pages.empty()&&pages[0]["root"]=="";},"Global task directory");
+    click(app,"tabPasswords");
+    pump([&]{return state(app.page(),"passwords").value("scope","")=="@all"&&!state(app.page(),"passwordDirectoryDirty").get<bool>();},"Global directory survives navigation");
+    assert(state(app.page(),"directorySelection")=="");
+    click(app,"tabTasks");
+    pump([&]{return state(app.page(),"tab")=="tasks";});
+}
+
 int wmain(int argc,wchar_t** argv) {
     _set_error_mode(_OUT_TO_STDERR);
     _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
@@ -1860,6 +1918,7 @@ int wmain(int argc,wchar_t** argv) {
             pump_diagnostic(app,[&]{return state(app.page(),"ready")==true;},"Initial snapshot");
             assert(IsWindowVisible(static_cast<HWND>(ui_window_hwnd(app.window()))));
             assert(state(app.page(),"errors").empty() && state(app.page(),"actionError")=="");
+            if(!rangesOnly&&!historyOnly) directory_selection(app,dir);
             if(acceptance) find_controls(app,dir);
             if(historyOnly) { task_history(app,dir); } else {
             if(!rangesOnly) {
@@ -2409,7 +2468,7 @@ int wmain(int argc,wchar_t** argv) {
                 click(app,path.empty()?"allRoots":("directory-"+utf8(path_key(path))).c_str());
                 auto selected=path.empty()?std::string("@all"):utf8(path.wstring());
                 pump([&]{auto p=state(app.page(),"passwords");return p.value("scope","")==selected && p["total"]==count;},"Password directory projection");
-                assert(state(app.page(),"passwordRoot")== (path.empty()?"":utf8(path.wstring())));
+                assert(state(app.page(),"directorySelection")== (path.empty()?"":utf8(path.wstring())));
             };
             auto password_id=[&](const std::string& value) {
                 auto rows=state(app.page(),"passwords")["rows"];
@@ -2420,9 +2479,8 @@ int wmain(int argc,wchar_t** argv) {
                 auto passwords=read_json(dir/"builtin_passwords.json")["passwords"];
                 return std::any_of(passwords.begin(),passwords.end(),[&](const Json& row){return row["value"]==value;});
             };
-            auto unchanged_task_root=state(app.page(),"taskRoot");
             choose_password_root(pending_root,0);
-            assert(state(app.page(),"taskRoot")==unchanged_task_root);
+            assert(state(app.page(),"directorySelection")==utf8(pending_root.wstring()));
             click(app,"newPassword"); ui_debug_pump();
             auto scoped_id=state(app.page(),"passwordCell").get<std::string>();
             {
@@ -2433,7 +2491,7 @@ int wmain(int argc,wchar_t** argv) {
                 // Switch while the writer is blocked: the job retains the
                 // directory where editing began, not the next selection.
                 click(app,("directory-"+utf8(path_key(pending_second))).c_str());
-                assert(state(app.page(),"passwordRoot")==utf8(pending_second.wstring()));
+                assert(state(app.page(),"directorySelection")==utf8(pending_second.wstring()));
                 assert(state(app.page(),"shownPasswords").empty());
             }
             finish_input(app);
@@ -2454,7 +2512,7 @@ int wmain(int argc,wchar_t** argv) {
             click(app,"passwordSearch"); finish_input(app);
             assert(has_password("scoped receipt latest") && !has_password("pending scoped"));
             choose_password_root(fs::path(),3);
-            assert(state(app.page(),"taskRoot")==unchanged_task_root);
+            assert(state(app.page(),"directorySelection")=="");
             // Search is confined to this exact scope; globals do not include
             // scoped passwords and scoped views do not include globals/parents.
             click(app,"passwordSearch"); ui_debug_type_text(app.window(),L"scoped receipt");
@@ -2619,12 +2677,12 @@ int wmain(int argc,wchar_t** argv) {
             auto shared_after=std::find_if(after_root_delete.begin(),after_root_delete.end(),[](const Json& p){return p["value"]=="deleted-root-shared";});
             assert(shared_after!=after_root_delete.end() && (*shared_after)["scopes"]==Json::array({utf8(pending_root.wstring())}));
             assert(std::any_of(after_root_delete.begin(),after_root_delete.end(),[](const Json& p){return p["value"]=="deletion-global" && !p.contains("scopes");}));
-            assert(state(app.page(),"taskRoot")=="");
+            assert(state(app.page(),"directorySelection")=="");
             assert(read_roots(dir/"sunpack_watch_roots.txt").entries.size()==2);
             assert(fs::is_directory(pending_second));
             click(app,"tabTasks"); pump([&]{return state(app.page(),"tab")=="tasks";});
             click(app,("directory-"+utf8(path_key(pending_root))).c_str());
-            pump([&]{return state(app.page(),"taskRoot")==utf8(pending_root.wstring());});
+            pump([&]{return state(app.page(),"directorySelection")==utf8(pending_root.wstring());});
             click(app,"tabRoots"); pump([&]{return state(app.page(),"tab")=="roots";});
             auto root_edit_id=root_row_id(app,pending_root);
             edit_root_cell(app,root_edit_id,"output",L"automatic-output");
@@ -2642,7 +2700,7 @@ int wmain(int argc,wchar_t** argv) {
             click(app,("delete-root-"+root_edit_id).c_str()); finish_input(app);
             assert(read_roots(dir/"sunpack_watch_roots.txt").entries.size()==1);
             assert(fs::is_directory(pending_root));
-            pump([&]{return state(app.page(),"taskRoot")=="";});
+            pump([&]{return state(app.page(),"directorySelection")=="";});
 
             click(app,"tabTasks"); pump([&]{return state(app.page(),"tab")=="tasks";});
             auto main=utf8((dir/"carrier.001").wstring()), sibling=utf8((dir/"disguised.blob").wstring());
@@ -2761,7 +2819,7 @@ int wmain(int argc,wchar_t** argv) {
             auto first=state(app.page(),"shownDirectories")[1];
             click(app,("directory-"+first["id"].get<std::string>()).c_str());
             pump([&]{return state(app.page(),"tasks")["total"]==0;});
-            assert(state(app.page(),"taskRoot")==first["path"]);
+            assert(state(app.page(),"directorySelection")==first["path"]);
             {
                 auto card=rendered_widget(app,"directory-"+first["id"].get<std::string>());
                 auto bounds=card["rect"], copy=card["children"][0]["rect"];
@@ -2885,7 +2943,7 @@ int wmain(int argc,wchar_t** argv) {
                 assert(state(app.page(),"passwordDrafts").empty());
             }
             click(app,"allRoots");
-            assert(state(app.page(),"passwordHistory")==true && state(app.page(),"passwordRoot")=="");
+            assert(state(app.page(),"passwordHistory")==true && state(app.page(),"directorySelection")=="");
             assert(rendered_widget(app,"save-history-0")["text"]==state(app.page(),"texts")["saveHistoryGlobally"]);
             button_texts(app);
             reject_history_save();

@@ -467,6 +467,7 @@ void Application::navigate(const std::string& tab) {
     ui_page_set_json(page_,"tagModes","{}");
     ui_page_set_json(page_,"tagEdits","{}");
     set_text(page_,"tab",tab);
+    if(ui_page_call_json(page_,"syncDirectoryView","{}")!=0) throw std::runtime_error("uiBindingFailed");
     set_text(page_,"actionError","");
     // Tab targets retain fixed sidebar geometry; reactive tab visibility already
     // schedules layout. Avoid forcing an extra full-tree layout on every switch.
@@ -604,8 +605,7 @@ void Application::rebuild_theme(const std::string& language) {
     ui_combobox_on_changed(status_widget_,[](UiWidget,int index,void* context){
         auto* self=static_cast<Application*>(context);
         ui_page_set_int(self->page_,"taskStatus",index);
-        auto statuses=page_value(self->page_,"statusNames");
-        self->handle_command(Json{{"op","filterTasks"},{"payload",{{"query",page_value(self->page_,"taskQuery")},{"root",page_value(self->page_,"taskRoot")},{"status",index>=0 && size_t(index)<statuses.size()?statuses[index]:Json("")}}}});
+        ui_page_call_json(self->page_,"filterTasks","{}");
     },this);
     ui_widget_add_child(host,status_widget_); ui_widget_destroy(host);
 }
@@ -776,11 +776,6 @@ void Application::handle_command(Json command) {
             if(FAILED(result)) throw std::runtime_error("explorerFailed");
         } else throw std::runtime_error("pathMissing");
         return;
-    }
-    if(op=="filterTasks") {
-        ui_page_call_json(page_,"resetTaskPages","{}");
-        auto widget=ui_widget_find_by_id(ui_page_root(page_),"taskListScroll");
-        if(widget) { ui_debug_scroll_set(widget,0); ui_widget_destroy(widget); }
     }
     { std::lock_guard<std::mutex> lock(mutex_);
       if(op=="filterTasks" || op=="taskPage") ++task_query_generation_;
@@ -1065,6 +1060,7 @@ void Application::work() {
                         view.task_query=std::move(query); view.task_root=std::move(root);
                         view.task_status=std::move(status); tasks_changed=true;
                         task_window={""};
+                        task_window_reset=true;
                     } else if(op=="filterPasswords") {
                         password_delta=Json(); // Filter changes require the whole result set.
                         if(!edit_feedback.contains("resetScroll")) edit_feedback["resetScroll"]=Json::array();
