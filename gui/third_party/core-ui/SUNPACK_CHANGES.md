@@ -11,6 +11,11 @@ preserved.
 
 Local changes:
 
+- Let nested ScrollViews and multi-line text areas pass outward wheel input
+  to their existing ancestor route at the top/bottom boundary. ScrollViews
+  use the current motion position so pending inertia still stays inside the
+  inner viewport until it reaches the edge; inward input resumes immediately.
+
 - Add paint-only UTF-16 find ranges shared by ordinary text controls and native
   TAG surfaces. Reuse DirectWrite shaping/layout caches and expand highlights
   into existing rounded geometry, clips and text commands during recording.

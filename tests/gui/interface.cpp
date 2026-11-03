@@ -37,6 +37,22 @@ void caret_blink_contracts() {
     assert(area.ShouldShowCaret());
     assert(chips.ShouldShowCaret());
 }
+// TAG routing below cannot catch a TextArea swallowing outward input. One
+// in-memory round trip covers its separate handler without another UI fixture.
+void text_area_wheel_boundaries() {
+    ui::TextAreaWidget area; area.rect={0,0,200,80};
+    area.SetText(std::wstring(40,L'\n'));
+    assert(area.NeedsScrollbar());
+    assert(!area.OnMouseWheel({20,20,120}));
+    assert(area.OnMouseWheel({20,20,-120}));
+    assert(area.OnMouseWheel({20,20,-12000}));
+    assert(!area.OnMouseWheel({20,20,-120}));
+    assert(area.OnMouseWheel({20,20,120}));
+    assert(area.OnMouseWheel({20,20,12000}));
+    assert(!area.OnMouseWheel({20,20,120}));
+    area.SetText(L"short");
+    assert(!area.OnMouseWheel({20,20,-120}));
+}
 // Existing UI checks do not inspect the native icons: one default-sized HICON
 // looked correct to those checks even when Windows had to rescale every small
 // icon. Exercise DPI changes in this host, including release of replaced icons.
@@ -1205,6 +1221,51 @@ void tag_config(Application& app,const fs::path& dir) {
     assert(std::abs(copy->rect.top+copy->rect.bottom-region.top-region.bottom)<0.2f);
     assert(std::abs(region.top-row->rect.top-row->rect.bottom+region.bottom)<0.2f);
     assert(row->rect.top-item->rect.top<=1.1f && item->rect.bottom>=row->rect.bottom);
+    {
+        // Existing thumb/find tests set offsets directly and cannot detect
+        // swallowed wheel input. Reuse this TAG fixture to cover both edges,
+        // immediate reversal and pending inertia through the real window route.
+        auto* outer=dynamic_cast<ui::ScrollViewWidget*>(window->Root()->FindById("configListScroll"));
+        assert(outer && outer->NeedsScrollbar());
+        const float saved=outer->ScrollY();
+        window->ScrollWithMeasureContext(outer,std::max(24.0f,saved+(region.top+region.bottom-outer->rect.top-outer->rect.bottom)/2));
+        const float centered=outer->ScrollY();
+        const float limit=scroll()->ContentHeight()-(scroll()->rect.bottom-scroll()->rect.top);
+        auto wheel=[&](int delta) {
+            const auto box=scroll()->rect, viewport=outer->rect;
+            const float top=std::max(box.top,viewport.top),bottom=std::min(box.bottom,viewport.bottom);
+            assert(bottom>top);
+            window->SimMouseWheel(box.left+12,(top+bottom)/2,float(delta));
+        };
+        auto settled=[&]{return !scroll()->ScrollAnimating() && !outer->ScrollAnimating();};
+        for(int delta:{-120,120}) {
+            window->ScrollWithMeasureContext(outer,centered);
+            const float edge=delta<0?limit:0;
+            window->ScrollWithMeasureContext(scroll(),edge);
+            wheel(delta);
+            pump(settled,"TAG wheel handoff",false);
+            if(!((outer->ScrollY()-centered)*delta<0 && scroll()->ScrollY()==edge))
+                std::cerr<<"TAG handoff: delta="<<delta<<" outer="<<outer->ScrollY()<<" before="<<centered
+                    <<" outerLimit="<<outer->ContentHeight()-(outer->rect.bottom-outer->rect.top)
+                    <<" inner="<<scroll()->ScrollY()<<" edge="<<edge<<'\n';
+            assert((outer->ScrollY()-centered)*delta<0 && scroll()->ScrollY()==edge);
+            const float after=outer->ScrollY();
+            wheel(-delta);
+            pump(settled,"TAG reverse wheel",false);
+            assert(outer->ScrollY()==after && (scroll()->ScrollY()-edge)*delta>0);
+        }
+        BOOL animate=TRUE; SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION,0,&animate,0);
+        if(animate) {
+            window->ScrollWithMeasureContext(outer,centered);
+            window->ScrollWithMeasureContext(scroll(),limit/2);
+            wheel(-12000); wheel(-120);
+            assert(outer->ScrollY()==centered && !outer->ScrollAnimating());
+            pump(settled,"TAG inertia before boundary",false);
+            assert(std::abs(scroll()->ScrollY()-limit)<0.1f);
+        }
+        window->ScrollWithMeasureContext(outer,saved);
+        window->ScrollWithMeasureContext(scroll(),0);
+    }
     click(app,inputId.c_str()); assert(ui_debug_type_text(app.window(),L"unsubmitted")==0);
     click(app,"configSearch");
     assert(disk()==values && state(app.page(),"tagInputs")[pointer]=="unsubmitted");
@@ -1899,6 +1960,7 @@ int wmain(int argc,wchar_t** argv) {
     try {
         scalar_reactivity_noop();
         caret_blink_contracts();
+        text_area_wheel_boundaries();
         rendering_contracts();
         atomic_write(dir/"sunpack_config.json",R"({"cli":{"language":"zh"},"runtime":{"process_mode":"normal"},"recursive_extract":"*","watch":{"state_dir":".sunpack_watch","out_dir":".","toast_enabled":true},"unknown":9007199254740993})");
         if(rangesOnly || acceptance) {

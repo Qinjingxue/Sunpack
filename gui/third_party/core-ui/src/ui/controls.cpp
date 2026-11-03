@@ -1855,9 +1855,10 @@ bool TextAreaWidget::SelectionRange(int* start, int* end) const {
 
 bool TextAreaWidget::OnMouseWheel(const MouseEvent& e) {
     if (!Contains(e.x, e.y)) return false;
+    const float previous = scrollY_;
     scrollY_ -= e.delta * 0.5f;
     ClampScroll();
-    return true;
+    return scrollY_ != previous;
 }
 
 bool TextAreaWidget::OnKeyChar(wchar_t ch) {
@@ -2834,16 +2835,21 @@ bool ScrollViewWidget::OnMouseWheel(const MouseEvent& e) {
     const double step = -double(e.delta) / WHEEL_DELTA *
         (lines == WHEEL_PAGESCROLL ? VisibleHeight() : lines * 16.0);
     if (step == 0) return true;
-    BOOL animate = TRUE;
-    SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &animate, 0);
     const auto now = AnimationTimeMs();
     AdvanceScrollMotion(now);
+    const double limit = std::max(0.0f, contentHeight_ - VisibleHeight());
+    // Bubble outward at the current boundary. Pending inertia alone must not
+    // hand off a wheel while the inner view still has room in that direction.
+    if ((step < 0 && scrollPosition_ <= 0) ||
+        (step > 0 && scrollPosition_ >= limit)) return false;
+    BOOL animate = TRUE;
+    SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &animate, 0);
     // Like InteractionTracker's additional-velocity requests: integrate the
     // existing inertia before adding this impulse, rather than restart a
     // fixed-duration easing curve for each wheel packet. Reverse immediately.
     if (scrollVelocity_ * step < 0) scrollVelocity_ = 0;
     const double target = std::clamp(scrollPosition_ + scrollVelocity_ / kWheelDecay + step,
-        0.0, double(std::max(0.0f, contentHeight_ - VisibleHeight())));
+        0.0, limit);
     if (animate) scrollVelocity_ = (target - scrollPosition_) * kWheelDecay;
     else { scrollPosition_ = target; scrollVelocity_ = 0; }
     scrollTick_ = now;
