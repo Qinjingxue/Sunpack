@@ -30,7 +30,9 @@ def options():
     p.add_argument("--real", action="store_true", help="Generate real fixtures and capture canonical post-filter hit traces")
     p.add_argument("--full-scan", action="store_true", help="Run existing native scan/release on the frozen real inputs")
     p.add_argument("--candidate-module-root", type=Path, help="Frozen sunpack_native package root for full-scan A/B")
+    p.add_argument("--reference-module-root", type=Path, help="Frozen reference extension built with the same profile as the candidate")
     p.add_argument("--candidate-bridge", type=Path, help="Separately built private Rust probe DLL for index/Builder A/B")
+    p.add_argument("--reference-bridge", type=Path, help="Frozen reference probe; default is built from the working tree")
     p.add_argument("--conformance-report", type=Path, help="Prior conformance report for the same frozen candidate/source")
     p.add_argument("--corpus-manifest", type=Path, help="Reuse frozen real traces/inputs instead of recapturing")
     p.add_argument("--case", action="append", help="Include names containing this text; repeated values form a union")
@@ -78,7 +80,7 @@ def main():
         params["process_blocks"] = 1
     executable, pins = backends(fetch=args.fetch)
     validator = executable.with_name("hit_index_validate.exe")
-    dll = bridge()
+    dll = args.reference_bridge or bridge()
     if args.candidate_bridge and args.candidate_bridge.resolve() == dll.resolve():
         raise ValueError("Candidate probe must be frozen separately from the reference build cache")
     from sunpack_native import fast_hash128_file
@@ -154,10 +156,19 @@ def main():
         ws.write_result_json("configurations.json", configs)
         ws.write_result_text("CMakeCache.txt", (CACHE / "cpp/CMakeCache.txt").read_text(encoding="utf-8"))
         ws.write_result_text("candidate.diff", command(["git", "diff", "--", *source_paths]))
-        for filename in ["Cargo.toml", "Cargo.lock", "src/lib.rs", "src/scan/hit_storage.rs"]:
-            target = ws.result_dir / "bridge" / filename
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(CACHE / "bridge" / filename, target)
+        if args.reference_bridge:
+            # An external frozen binary need not match the working build cache.
+            # Do not attach unrelated cached source as its implementation.
+            ws.write_result_json("reference-probe.json", {
+                "origin": str(args.reference_bridge.resolve()),
+                "binary_xxh128": fast_hash128_file(dll),
+                "source": "external snapshot; source provenance supplied by the experiment",
+            })
+        else:
+            for filename in ["Cargo.toml", "Cargo.lock", "src/lib.rs", "src/scan/hit_storage.rs"]:
+                target = ws.result_dir / "bridge" / filename
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(CACHE / "bridge" / filename, target)
         ws.write_result_text("faw-repair.json", (CACHE / "cpp/generated/faw-repair.json").read_text(encoding="utf-8"))
         validation = []
         valid = {}
@@ -212,7 +223,8 @@ def main():
                                           "--bridge", chosen_dll, "--window", 6, "--workers", 4, "--order", 2])
                     result.update(case=case.name, configuration=name)
                     lifetimes.append(result)
-        full_scan = full_scan_cases(manifest, params["process_blocks"], candidate_module_root=args.candidate_module_root) if args.full_scan else []
+        full_scan = full_scan_cases(manifest, params["process_blocks"], candidate_module_root=args.candidate_module_root,
+                                    reference_module_root=args.reference_module_root) if args.full_scan else []
         changed = {str(p.relative_to(ROOT)): fast_hash128_file(p) for p in source_paths} != identities
         binary_versions = {}
         for result in full_scan:

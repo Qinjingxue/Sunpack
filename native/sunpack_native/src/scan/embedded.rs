@@ -163,24 +163,33 @@ impl PackedHit {
     }
 }
 
-// Matching jobs share one base rather than duplicating an absolute offset in
-// every hit. Even a chunk above 4 GiB produces four-byte records.
-#[derive(Default)]
+// Matching jobs keep only a bounded normalization horizon and encoded leaves.
 struct HitBuffer {
     base: u64,
-    hits: Vec<PackedHit>,
+    buffer: hit_storage::MatchBuffer,
 }
-
 impl HitBuffer {
+    fn new(base: u64, start: u64, end: u64, overlap: usize) -> Self {
+        Self {
+            base,
+            buffer: hit_storage::MatchBuffer::new(base, start, end, overlap),
+        }
+    }
     fn push(&mut self, hit: RawHit) {
         let relative = hit.offset() - self.base;
         debug_assert!(relative <= HIT_OFFSET_MASK);
-        self.hits.push(PackedHit::new(relative as u32, hit.pattern));
+        self.buffer
+            .push(PackedHit::new(relative as u32, hit.pattern));
     }
-
+    fn is_empty(&self) -> bool {
+        self.buffer.is_empty()
+    }
     #[cfg(test)]
-    fn iter(&self) -> impl Iterator<Item = RawHit> + '_ {
-        self.hits.iter().map(|hit| hit.unpack(self.base))
+    fn iter(&self) -> impl Iterator<Item = RawHit> {
+        let mut hits = Vec::new();
+        self.buffer.visit(|hit| hits.push(hit));
+        hits.sort_unstable_by_key(|h| (h.offset(), h.hit_name()));
+        hits.into_iter()
     }
 }
 
@@ -450,7 +459,7 @@ fn scan_native(
     let scan = |sample: &[u8], carry: usize, base: u64| {
         let batch = scan_sample_batch(sample, carry, base);
         ScanBatch {
-            results: (!batch.results.hits.is_empty()).then(|| {
+            results: (!batch.results.is_empty()).then(|| {
                 hit_storage::prepare(
                     batch.results,
                     base + carry as u64,
@@ -772,12 +781,14 @@ fn scan_sample(sample: &[u8], carry_len: usize, base_offset: u64) -> Vec<RawHit>
         .collect()
 }
 
-fn new_hit_batch(base_offset: u64) -> ScanBatch<HitBuffer> {
+fn new_hit_batch(base_offset: u64, carry_len: usize, len: usize) -> ScanBatch<HitBuffer> {
     ScanBatch {
-        results: HitBuffer {
-            base: base_offset.saturating_sub(HIT_LOOKBEHIND),
-            hits: Vec::new(),
-        },
+        results: HitBuffer::new(
+            base_offset.saturating_sub(HIT_LOOKBEHIND),
+            base_offset + carry_len as u64,
+            base_offset + len as u64,
+            embedded_overlap(),
+        ),
         discarded_results: 0,
     }
 }
@@ -815,7 +826,7 @@ fn signature_overlaps() -> &'static Vec<Vec<(usize, usize)>> {
 }
 
 fn scan_sample_packed(sample: &[u8], carry_len: usize, base_offset: u64) -> ScanBatch<HitBuffer> {
-    let mut hits = new_hit_batch(base_offset);
+    let mut hits = new_hit_batch(base_offset, carry_len, sample.len());
     if let Some(matcher) = embedded_packed_matcher() {
         for matched in matcher.find_iter(sample) {
             let pattern = matched.pattern().as_usize();
@@ -876,7 +887,7 @@ unsafe fn scan_sample_avx2(
     use std::arch::x86_64::*;
 
     let tables = SIMD_PREFIX_TABLES;
-    let mut hits = new_hit_batch(base_offset);
+    let mut hits = new_hit_batch(base_offset, carry_len, sample.len());
     let low_first = _mm256_loadu_si256(tables[0].as_ptr().cast());
     let high_first = _mm256_loadu_si256(tables[1].as_ptr().cast());
     let low_second = _mm256_loadu_si256(tables[2].as_ptr().cast());
@@ -2501,7 +2512,7 @@ mod tests {
     fn reference_raw_hits(data: &[u8]) -> Vec<RawHit> {
         // Compare matcher enumeration independently; both paths must apply the
         // same canonical fixed-header policy to each signature.
-        let mut hits = ScanBatch::default();
+        let mut hits = new_hit_batch(0, 0, data.len());
         for matched in embedded_matcher().find_overlapping_iter(data) {
             record_raw_hit(
                 &mut hits,
@@ -2543,7 +2554,7 @@ mod tests {
         for length in 0..=data.len() {
             for carry_len in [0, 31, 32, 33, 64] {
                 let sample = &data[..length];
-                let mut expected = ScanBatch::default();
+                let mut expected = new_hit_batch(4096, carry_len, sample.len());
                 for matched in embedded_matcher().find_overlapping_iter(sample) {
                     record_raw_hit(
                         &mut expected,
@@ -2576,7 +2587,7 @@ mod tests {
 
         for prefix in [b"PK".as_slice(), b"Rar", b"7z", b"YZ"] {
             let dense = prefix.repeat(4096);
-            let mut expected = ScanBatch::default();
+            let mut expected = new_hit_batch(0, 0, dense.len());
             for matched in embedded_matcher().find_overlapping_iter(&dense) {
                 record_raw_hit(
                     &mut expected,

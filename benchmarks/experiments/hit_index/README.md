@@ -1,6 +1,6 @@
 # 命中索引 benchmark：协议和基线
 
-本轮只完善评估工具和数据，不修改生产索引，也不将已有编码技术称为新增论文贡献。
+本页记录优化前的评估工具、数据和生产索引基线。后续生产优化、前后对照和回归验证见 [OPTIMIZATION.md](OPTIMIZATION.md)；已有编码技术不作为新增论文贡献。
 正式协议见 [PROTOCOL.md](../../hit_index/PROTOCOL.md)，运行入口为 `python -m benchmarks scan hit-index`。
 
 ## 固定的比较范围

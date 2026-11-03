@@ -57,7 +57,7 @@ fn codec_probe(input: &[ProbeHit]) -> io::Result<Probe> {
             .map(|h| PackedHit::new((h.offset - base) as u32, h.pattern))
             .collect();
         if let Some(e) = encode(hits) {
-            let payload = data.len().next_multiple_of(64);
+            let payload = data.len().next_multiple_of(8);
             data.resize(payload, 0);
             end += e.count as u64;
             let seg = Segment {
@@ -116,12 +116,13 @@ fn builder_probe(
             .map(|&(owner, a, b)| {
                 let start = owner as u64 * chunk as u64;
                 let base = start.saturating_sub(HIT_LOOKBEHIND + 11);
-                let hits = input[a..b]
-                    .iter()
-                    .map(|h| PackedHit::new((h.offset - base) as u32, h.pattern))
-                    .collect();
+                let mut batch = HitBuffer::new(base, start, (start + chunk as u64).min(size), 11);
+                for h in &input[a..b] {
+                    batch.push(RawHit::new(h.offset, h.pattern));
+                }
+
                 prepare(
-                    HitBuffer { base, hits },
+                    batch,
                     start,
                     (start + chunk as u64).min(size),
                     11,

@@ -154,10 +154,11 @@ def real_cases(workspace, *, module_root: Path | None = None) -> tuple[list[Case
     return cases, manifest
 
 
-def full_scan_cases(manifest: list[dict], blocks: int, *, candidate_module_root: Path | None = None) -> list[dict]:
+def full_scan_cases(manifest: list[dict], blocks: int, *, candidate_module_root: Path | None = None,
+                    reference_module_root: Path | None = None) -> list[dict]:
     from sunpack_native import fast_hash128_file
     rows = []
-    versions = [("installed", None)] + ([("candidate", candidate_module_root)] if candidate_module_root else [])
+    versions = [("reference" if reference_module_root else "installed", reference_module_root)] + ([("candidate", candidate_module_root)] if candidate_module_root else [])
     for block in range(blocks):
         for case in manifest:
             if fast_hash128_file(Path(case["input"])) != case["input_xxh128"]:

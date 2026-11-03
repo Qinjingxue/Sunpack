@@ -28,16 +28,17 @@ fn benchmark_capture_batch(
     }
     let state = state.as_mut().unwrap();
     let owner = u32::try_from(start / chunk as u64).map_err(std::io::Error::other)?;
-    let mut bytes = Vec::with_capacity(batch.hits.len() * 16);
-    for hit in &batch.hits {
-        let hit = hit.unpack(batch.base);
+    let mut bytes = Vec::new();
+    let mut count = 0;
+    batch.buffer.visit(|hit| {
         bytes.extend_from_slice(&hit.offset().to_le_bytes());
         bytes.push(hit.pattern);
         bytes.extend_from_slice(&[0; 3]);
         bytes.extend_from_slice(&owner.to_le_bytes());
-    }
+        count += 1;
+    });
     state.file.write_all(&bytes)?;
-    state.count += batch.hits.len() as u64;
+    state.count += count;
     Ok(())
 }
 fn benchmark_capture_finish() -> std::io::Result<()> {
