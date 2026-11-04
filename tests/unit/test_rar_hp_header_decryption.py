@@ -87,7 +87,7 @@ def test_ambiguous_encrypted_probe_is_terminal_damage_instead_of_a_watch_volume_
         async with PipelineEngine(config) as engine:
             watcher = watch_module.WatchScheduler(
                 config, [str(root)], output_roots={str(root): str(tmp_path / "out")},
-                state_path=str(tmp_path / "state.snapshot"), cold_start_seconds=0, pipeline_engine=engine,
+                state_path=str(tmp_path / "state.snapshot"), pipeline_engine=engine,
             )
             watcher._notify = lambda *args: notices.append(args)
             try:

@@ -285,9 +285,6 @@ def _watch_config() -> dict:
     return {
         "watch": {
             "clipboard_monitor_enabled": False,
-            "cold_start_seconds": 1.0,
-            "quiet_min_seconds": 1.25,
-            "quiet_max_seconds": 20.0,
             "boundary_confirmation_seconds": 0.5,
         }
     }
@@ -342,7 +339,6 @@ def run_scenario(base: Path, scenario: Scenario, payload: bytes, *, chunk_bytes:
         [str(scenario_root)],
         output_roots={str(scenario_root): str(base / scenario.name / "out")},
         state_path=str(state_path),
-        cold_start_seconds=1.0,
         pipeline_engine=object(),
     )
     original_enqueue = watcher.enqueue

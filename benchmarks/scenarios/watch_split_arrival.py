@@ -330,7 +330,6 @@ async def _run_case(
     run_index: int,
     label: str,
     mode: str,
-    cold_start_seconds: float,
     chunk_size: int,
     delay_seconds: float,
     timeout_seconds: float,
@@ -365,7 +364,6 @@ async def _run_case(
             config,
             [str(root)],
             state_path=str(state_path),
-            cold_start_seconds=cold_start_seconds,
             pipeline_engine=engine,
         )
         _install_instrumentation(watcher, source_names, timings, attempts)
@@ -398,9 +396,6 @@ async def _run_case(
         return {
             "run_index": run_index,
             "mode": mode,
-            "quiet_seconds_argument": cold_start_seconds,
-            "cold_start_seconds": cold_start_seconds,
-            "configured_quiet_min_seconds": float(config["watch"].get("quiet_min_seconds", 1.25)),
             "sources": [{"name": path.name, "bytes": path.stat().st_size} for path in sources],
             "arrival_order": timings.get("arrival_order", []),
             "timings_seconds": {
@@ -444,7 +439,6 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Watch split-volume arrival and quiet-window benchmark.")
     parser.add_argument("sources", nargs="*", type=Path)
     parser.add_argument("--modes", default=",".join(DEFAULT_MODES))
-    parser.add_argument("--quiet-values", default="0,1.25")
     parser.add_argument("--runs", type=int, default=1)
     parser.add_argument("--chunk-mib", type=float, default=4.0)
     parser.add_argument("--chunk-delay-ms", type=float, default=50.0)
@@ -465,66 +459,46 @@ def main() -> int:
     unknown = sorted(set(modes) - set(DEFAULT_MODES))
     if unknown:
         parser.error(f"unknown modes: {', '.join(unknown)}")
-    quiet_values = tuple(float(value.strip()) for value in args.quiet_values.split(",") if value.strip())
     chunk_size = max(1, int(args.chunk_mib * 1024 * 1024))
     delay_seconds = max(0.0, args.chunk_delay_ms / 1000.0)
 
     samples: list[dict[str, Any]] = []
     with watch_broker_lease() as broker_metadata, BenchmarkWorkspace("watch.split-arrival", results_root=args.results_root) as workspace:
         for run_index in range(args.runs):
-            for quiet_index, quiet_seconds in enumerate(quiet_values):
-                for mode in modes:
-                    label = f"run-{run_index}-quiet-{quiet_index}-{mode}"
-                    samples.append(asyncio.run(_run_case(
-                        sources, workspace,
-                        run_index=run_index,
-                        label=label,
-                        mode=mode,
-                        cold_start_seconds=quiet_seconds,
-                        chunk_size=chunk_size,
-                        delay_seconds=delay_seconds,
-                        timeout_seconds=args.timeout,
-                    )))
+            for mode in modes:
+                label = f"run-{run_index}-{mode}"
+                samples.append(asyncio.run(_run_case(
+                    sources, workspace,
+                    run_index=run_index,
+                    label=label,
+                    mode=mode,
+                    chunk_size=chunk_size,
+                    delay_seconds=delay_seconds,
+                    timeout_seconds=args.timeout,
+                )))
 
-        grouped: dict[str, dict[str, list[dict[str, Any]]]] = {}
+        grouped: dict[str, list[dict[str, Any]]] = {}
         for sample in samples:
-            grouped.setdefault(sample["mode"], {}).setdefault(
-                str(sample["quiet_seconds_argument"]), []
-            ).append(sample)
-        for mode_samples in grouped.values():
-            for quiet_samples in mode_samples.values():
-                quiet_samples.sort(key=lambda sample: sample["timings_seconds"]["arrival_start_to_completion"])
-        comparisons: list[dict[str, Any]] = []
-        for mode in modes:
-            for run_index in range(args.runs):
-                q0 = next((sample for sample in samples if sample["run_index"] == run_index and sample["mode"] == mode and sample["quiet_seconds_argument"] == 0.0), None)
-                q125 = next((sample for sample in samples if sample["run_index"] == run_index and sample["mode"] == mode and sample["quiet_seconds_argument"] == 1.25), None)
-                if q0 is not None and q125 is not None:
-                    equal = q0["output"]["manifest_xxh128"] == q125["output"]["manifest_xxh128"]
-                    q0["correctness_matches_quiet_1_25"] = equal
-                    q125["correctness_matches_quiet_1_25"] = equal
-                    comparisons.append({"mode": mode, "run": run_index, "manifest_equal": equal})
+            grouped.setdefault(sample["mode"], []).append(sample)
+        for rows in grouped.values():
+            rows.sort(key=lambda sample: sample["timings_seconds"]["arrival_start_to_completion"])
         summary = {
             mode: {
-                quiet: {
-                    "runs": len(rows),
-                    "median_total_seconds": statistics.median(row["timings_seconds"]["arrival_start_to_completion"] for row in rows),
-                    "min_total_seconds": min(row["timings_seconds"]["arrival_start_to_completion"] for row in rows),
-                    "max_total_seconds": max(row["timings_seconds"]["arrival_start_to_completion"] for row in rows),
-                    "successful_runs": sum(1 for row in rows if row["success"]),
-                    "median_attempt_count": statistics.median(row["attempt_count"] for row in rows),
-                    "median_failed_or_terminal_attempt_count": statistics.median(row["failed_or_terminal_attempt_count"] for row in rows),
-                }
-                for quiet, rows in quiet_groups.items()
+                "runs": len(rows),
+                "median_total_seconds": statistics.median(row["timings_seconds"]["arrival_start_to_completion"] for row in rows),
+                "min_total_seconds": min(row["timings_seconds"]["arrival_start_to_completion"] for row in rows),
+                "max_total_seconds": max(row["timings_seconds"]["arrival_start_to_completion"] for row in rows),
+                "successful_runs": sum(1 for row in rows if row["success"]),
+                "median_attempt_count": statistics.median(row["attempt_count"] for row in rows),
+                "median_failed_or_terminal_attempt_count": statistics.median(row["failed_or_terminal_attempt_count"] for row in rows),
             }
-            for mode, quiet_groups in grouped.items()
+            for mode, rows in grouped.items()
         }
         report = {
             "watch_broker": broker_metadata,
             "parameters": {
                 "sources": [str(path) for path in sources],
                 "modes": list(modes),
-                "quiet_values": list(quiet_values),
                 "runs": args.runs,
                 "password_count": 0,
                 "chunk_mib": args.chunk_mib,
@@ -532,7 +506,6 @@ def main() -> int:
             },
             "samples": samples,
             "summary": summary,
-            "correctness_comparisons": comparisons,
         }
         rendered = render_report(report_from_payload("watch.split-arrival", report))
         workspace.write_result_text("report.json", rendered)

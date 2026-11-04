@@ -73,7 +73,6 @@ def _watcher(tmp_path, monkeypatch, *, deep_detect=False, recursive=False):
         output_roots={str(root): str(output)},
         root_entries=[WatchRootEntry(str(root), str(output), deep_detect, recursive=recursive)],
         state_path=str(tmp_path / "state.snapshot"),
-        cold_start_seconds=0,
         pipeline_engine=FakePipelineEngine(_Runner),
         notification_sink=sink,
     )
@@ -154,7 +153,7 @@ def test_password_updates_retry_only_applicable_scopes(tmp_path, monkeypatch, ti
                 watcher = WatchScheduler(
                     dict(watcher.config), [str(root)], output_roots={str(root): str(output)},
                     root_entries=[WatchRootEntry(str(root), str(output), recursive=True)],
-                    state_path=str(tmp_path / "state.snapshot"), cold_start_seconds=0,
+                    state_path=str(tmp_path / "state.snapshot"),
                     pipeline_engine=FakePipelineEngine(_Runner),
                 )
                 watcher.pipeline_engine.run = run

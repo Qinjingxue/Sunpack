@@ -1214,38 +1214,6 @@
         }
       ]
     },
-    "/watch/cold_start_seconds": {
-      "label": {
-        "zh": "首次处理等待（秒）",
-        "en": "Initial delay (s)"
-      },
-      "min": 0,
-      "integer": false
-    },
-    "/watch/quiet_min_seconds": {
-      "label": {
-        "zh": "最短稳定等待（秒）",
-        "en": "Minimum stable time (s)"
-      },
-      "description": {
-        "zh": "文件停止变化后的等待时间",
-        "en": "Wait after a file stops changing"
-      },
-      "min": 0,
-      "integer": false
-    },
-    "/watch/quiet_max_seconds": {
-      "label": {
-        "zh": "最长稳定等待（秒）",
-        "en": "Maximum stable wait (s)"
-      },
-      "description": {
-        "zh": "不小于首次处理等待和最短稳定等待",
-        "en": "Must cover both the initial delay and minimum stable time"
-      },
-      "min": 0,
-      "integer": false
-    },
     "/watch/boundary_confirmation_seconds": {
       "label": {
         "zh": "写入确认间隔（秒）",

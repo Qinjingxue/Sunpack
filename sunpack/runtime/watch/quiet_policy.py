@@ -9,9 +9,6 @@ from dataclasses import dataclass, field
 class AdaptiveQuietPolicy:
     """Maps observed content-write intervals to a per-file quiet window."""
 
-    initial_seconds: float = 1.0
-    minimum_seconds: float = 1.25
-    maximum_seconds: float = 180.0
     window_size: int = 12
     interval_percentile: float = 0.9
     minimum_shrink_samples: int = 3
@@ -21,12 +18,6 @@ class AdaptiveQuietPolicy:
     shrink_time_constant_seconds: float = 2.0
 
     def __post_init__(self) -> None:
-        minimum = max(0.0, float(self.minimum_seconds))
-        maximum = max(minimum, float(self.maximum_seconds))
-        initial = min(max(0.0, float(self.initial_seconds)), maximum)
-        object.__setattr__(self, "minimum_seconds", minimum)
-        object.__setattr__(self, "maximum_seconds", maximum)
-        object.__setattr__(self, "initial_seconds", initial)
         object.__setattr__(self, "window_size", max(1, int(self.window_size)))
         object.__setattr__(self, "interval_percentile", min(1.0, max(0.0, float(self.interval_percentile))))
         object.__setattr__(self, "minimum_shrink_samples", max(1, int(self.minimum_shrink_samples)))
@@ -52,23 +43,19 @@ class AdaptiveQuietPolicy:
     def target_seconds(self, intervals: list[float] | tuple[float, ...]) -> float:
         interval = self.effective_interval(intervals)
         if interval is None:
-            return self.initial_seconds
-        target = (
-            self.minimum_seconds
-            + self.linear_factor * interval
+            return 0.0
+        return (
+            self.linear_factor * interval
             + self.logarithmic_scale * math.log1p(interval / self.logarithmic_pivot_seconds)
         )
-        return min(self.maximum_seconds, max(self.minimum_seconds, target))
 
     def adjusted_seconds(
         self,
         current: float,
         intervals: list[float] | tuple[float, ...],
-        *,
-        calibrated: bool,
     ) -> float:
         target = self.target_seconds(intervals)
-        current = min(self.maximum_seconds, max(self.minimum_seconds, float(current)))
+        current = max(0.0, float(current))
         # P90 ignores harmless isolated pauses, but once the newest interval
         # already exceeds the active window it represents a real premature
         # boundary. Learn it immediately so the same slowdown is not retried.
@@ -78,10 +65,6 @@ class AdaptiveQuietPolicy:
             return target
         if len(intervals) < self.minimum_shrink_samples:
             return current
-        if not calibrated:
-            # The initial window is a guess, not evidence of a slow writer.
-            # Calibrate once instead of requiring dozens of write callbacks.
-            return target
         # Only newly observed write intervals can shorten a learned window.
         # Busy/metadata checks never call this path. Cap credit so a pause
         # cannot count as sustained faster writing, and preserve long gaps
@@ -95,16 +78,14 @@ class AdaptiveQuietPolicy:
 @dataclass(slots=True)
 class AdaptiveQuietTracker:
     policy: AdaptiveQuietPolicy
-    quiet_seconds: float = field(init=False)
+    quiet_seconds: float = field(default=0.0, init=False)
     last_content_event_at: float | None = None
     last_size: int | None = None
     last_mtime: float | None = None
     last_change_usn: int | None = None
-    calibrated: bool = False
     _intervals: deque[float] = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
-        self.quiet_seconds = self.policy.initial_seconds
         self._intervals = deque(maxlen=self.policy.window_size)
 
     @property
@@ -140,12 +121,9 @@ class AdaptiveQuietTracker:
             interval = float(now) - self.last_content_event_at
             if interval > 0.0 and math.isfinite(interval):
                 self._intervals.append(interval)
-                previous_quiet = self.quiet_seconds
                 self.quiet_seconds = self.policy.adjusted_seconds(
-                    previous_quiet, self.intervals, calibrated=self.calibrated,
+                    self.quiet_seconds, self.intervals,
                 )
-                if self.quiet_seconds > previous_quiet or len(self._intervals) >= self.policy.minimum_shrink_samples:
-                    self.calibrated = True
         self.last_content_event_at = float(now)
         self.last_size = size
         self.last_mtime = mtime

@@ -250,7 +250,6 @@ def test_live_enqueue_keeps_owner_memory_only(tmp_path):
     scheduler._pending = {}
     scheduler._active_states = {}
     scheduler._quiet_trackers = {}
-    scheduler.cold_start_seconds = 0.0
     scheduler._quiet_policy = SimpleNamespace()
     scheduler.state = SimpleNamespace(
         latest_entry_for_path=lambda _path: None,
@@ -434,7 +433,6 @@ def test_enqueue_does_not_publish_memory_work_when_durable_queue_fails(tmp_path)
     scheduler._pending = {}
     scheduler._active_states = {}
     scheduler._quiet_trackers = {}
-    scheduler.cold_start_seconds = 0.0
     scheduler._quiet_policy = SimpleNamespace()
 
     def fail_queue(*_args, **kwargs):

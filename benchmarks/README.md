@@ -63,8 +63,8 @@ uv run --locked python -m benchmarks extraction worker-resource-pressure --modes
 uv run --locked python -m benchmarks watch real-file C:\path\to\sample.jpg --wrong-password-count 100 --password '⑨' --json-out benchmarks/results/watch-real-file.json
 uv run --locked python -m benchmarks watch cli-format-matrix --runs 3 --json-out benchmarks/results/watch-cli-format-matrix.json
 uv run --locked python -m benchmarks watch cli-format-matrix --format zipx --format lz4 --runs 3 --json-out benchmarks/results/watch-cli-zipx-lz4-baseline.json
-uv run --locked python -m benchmarks watch arrival-matrix C:\path\to\sample.jpg --quiet-values 0,1.25 --runs 2 --wrong-password-count 100 --password '⑨' --json-out benchmarks/results/watch-arrival-matrix.json
-uv run --locked python -m benchmarks watch split-arrival C:\path\to\archive.7z.001 C:\path\to\archive.7z.002 C:\path\to\archive.7z.003 C:\path\to\archive.7z.004 --quiet-values 0,1.25 --chunk-mib 4 --chunk-delay-ms 50 --json-out benchmarks/results/watch-split-arrival.json
+uv run --locked python -m benchmarks watch arrival-matrix C:\path\to\sample.jpg --runs 2 --wrong-password-count 100 --password '⑨' --json-out benchmarks/results/watch-arrival-matrix.json
+uv run --locked python -m benchmarks watch split-arrival C:\path\to\archive.7z.001 C:\path\to\archive.7z.002 C:\path\to\archive.7z.003 C:\path\to\archive.7z.004 --chunk-mib 4 --chunk-delay-ms 50 --json-out benchmarks/results/watch-split-arrival.json
 uv run --locked python -m benchmarks watch format-matrix --runs 3 --warmups 1 --json-out benchmarks/results/watch-format-matrix.json
 uv run --locked python -m benchmarks watch format-matrix --formats 7z,zip,rar --variants plain,encrypted --workloads many_small --runs 3
 # A/B the post-extract flatten stage (post_extract.flatten_single_directory) on real outputs

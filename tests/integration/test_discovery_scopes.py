@@ -53,7 +53,7 @@ def test_catalog_observations_share_rows_without_changing_scan_versions_or_persi
         identity = "0000000000000012"
         catalog.remember_observation(str(first), 5, 10.25, identity, 7)
         catalog.remember_observation(str(second), 6, 10.5, "0123456789abcdef" * 2, 8)
-        catalog.retire_observation(str(first), 30.0, 12.0, True)
+        catalog.retire_observation(str(first), 30.0, 12.0)
         accepted = catalog.observation(str(first).upper())
         assert accepted.file_id == identity and accepted.quiet_seconds == 30.0
         assert catalog.observation(str(second)).file_id == "0123456789abcdef" * 2
@@ -68,14 +68,14 @@ def test_catalog_observations_share_rows_without_changing_scan_versions_or_persi
         catalog.remember_observation(str(first), 23, 20.0, "replacement-id", 100)
         current = catalog.observation(str(first))
         assert current.size == 23 and current.file_id == "replacement-id" and current.change_usn == 100
-        assert current.quiet_seconds == 30.0 and current.last_content_event_at == 12.0 and current.quiet_calibrated
+        assert current.quiet_seconds == 30.0 and current.last_content_event_at == 12.0
         assert accepted.size == 5  # the admission snapshot remains immutable
         assert set(catalog.bucket_paths(scope.native, str(first))) == {str(first), str(second)}
 
         recovery = str(tmp_path / "generated" / "inner.bin")
         catalog.remember_observation(recovery, 3, 1.0, "recovery", 0)
         assert catalog.memory_stats()["transient_rows"] == 1
-        catalog.retire_observation(recovery, 2.0, None, False)
+        catalog.retire_observation(recovery, 2.0, None)
         assert catalog.observation(recovery) is None and catalog.memory_stats()["transient_rows"] == 0
         drive_catalog = NativeWatchCatalog(state._native)
         drive_catalog.retain_roots([root.anchor])
@@ -118,7 +118,7 @@ def test_catalog_bulk_retirement_releases_observations_parents_and_bucket_capaci
         for path in [*paths[:8], paths[-1]]:
             catalog.remember_observation(str(path), 1, 1.0, "id", 1)
         assert catalog.memory_stats()["observations"] == 9
-        catalog.retire_observation(str(paths[-1]), 30.0, 12.0, True)
+        catalog.retire_observation(str(paths[-1]), 30.0, 12.0)
         paths[-1] = paths[-1].rename(paths[-1].with_name(paths[-1].name.upper()))
         assert not options.catalog_update(catalog, scope.native, str(paths[-1]))
         assert len(catalog.bucket_paths(scope.native, str(paths[-1]))) == 256
@@ -502,7 +502,7 @@ def test_junction_outputs_stay_excluded_through_admission_recovery_and_promotion
         async with PipelineEngine(config) as engine:
             scheduler = WatchScheduler(config, [str(watched)],
                 root_entries=[WatchRootEntry(str(watched), recursive=True)],
-                pipeline_engine=engine, state_path=state_path, cold_start_seconds=0)
+                pipeline_engine=engine, state_path=state_path)
             try:
                 response = await engine.run([str(archive)], origin=origin,
                     stdout=io.StringIO(), stderr=io.StringIO())
@@ -1018,11 +1018,11 @@ def test_watch_volume_deletion_and_arrival_retry_the_existing_blocker(tmp_path, 
     parts = sorted(path for path in root.iterdir() if path.is_file())
     head, tail = parts[0], parts[-1]
     config = make_config({"post_extract": {"archive_cleanup_mode": "k"},
-        "watch": {"clipboard_monitor_enabled": False, "quiet_min_seconds": 0.01, "quiet_max_seconds": 0.01}})
+        "watch": {"clipboard_monitor_enabled": False}})
     async def execute():
         async with PipelineEngine(config) as engine:
             watcher = module.WatchScheduler(config, [str(root)], state_path=str(tmp_path / "state.snapshot"),
-                root_entries=[WatchRootEntry(str(root), recursive=True)], pipeline_engine=engine, cold_start_seconds=0)
+                root_entries=[WatchRootEntry(str(root), recursive=True)], pipeline_engine=engine)
             try:
                 scope = next(iter(watcher.scopes.values()))
                 watcher._scan_options.catalog_update(watcher._catalog, scope.native)

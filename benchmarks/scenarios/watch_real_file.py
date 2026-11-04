@@ -98,7 +98,6 @@ async def _run_once(
     workspace: BenchmarkWorkspace,
     *,
     passwords: list[str],
-    cold_start_seconds: float,
     timeout: float,
     case_key: str | None = None,
 ) -> dict[str, Any]:
@@ -134,7 +133,6 @@ async def _run_once(
             # A relative dot is resolved against the watched root, so the
             # result lands in the watch directory itself.
             state_path=str(state_path),
-            cold_start_seconds=cold_start_seconds,
             pipeline_engine=engine,
         )
         _wrap_scheduler_timers(watcher, destination, timings)
@@ -238,7 +236,6 @@ def main() -> int:
         default=0,
         help="Prepend wrong-0000 ... wrong-NNNN before --password candidates.",
     )
-    parser.add_argument("--quiet-seconds", type=float, default=1.0)
     parser.add_argument("--timeout", type=float, default=900.0)
     parser.add_argument("--results-root", type=Path)
     parser.add_argument("--keep-workdir", action="store_true")
@@ -266,7 +263,6 @@ def main() -> int:
                 source,
                 workspace,
                 passwords=passwords,
-                cold_start_seconds=args.quiet_seconds,
                 timeout=args.timeout,
             )))
         end_to_end = [row["timings_seconds"]["end_to_end_copy_start_to_completion"] for row in samples]
@@ -275,7 +271,6 @@ def main() -> int:
             "parameters": {
                 "source": str(source),
                 "runs": args.runs,
-                "quiet_seconds": args.quiet_seconds,
                 "password_count": len(passwords),
                 "explicit_password_count": len(args.password),
                 "wrong_password_count": args.wrong_password_count,

@@ -136,7 +136,7 @@ def test_watch_configuration_survives_disconnect_and_finishes_before_stop(tmp_pa
 
         async def change(index):
             if action == "reload":
-                config["watch"]["cold_start_seconds"] += 1
+                config["watch"]["boundary_confirmation_seconds"] += 1
                 return await host.reload_watch()
             if action == "add":
                 return await host.add_watch_roots([str(roots[index])])

@@ -127,7 +127,7 @@ def test_watch_restart_retries_promoted_carrier_without_replaying_siblings(
                 return WatchScheduler(
                     case.config, [str(case.watch)],
                     output_roots={str(case.watch): str(tmp_path / "out")},
-                    state_path=str(tmp_path / "state.snapshot"), cold_start_seconds=0,
+                    state_path=str(tmp_path / "state.snapshot"),
                     pipeline_engine=engine,
                 )
 

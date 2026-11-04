@@ -3104,14 +3104,13 @@ impl NativeWatchCatalog {
         })
     }
 
-    #[pyo3(signature = (path, quiet_seconds=None, last_content_event_at=None, quiet_calibrated=false))]
+    #[pyo3(signature = (path, quiet_seconds=None, last_content_event_at=None))]
     fn retire_observation(
         &self,
         py: Python<'_>,
         path: &str,
         quiet_seconds: Option<f64>,
         last_content_event_at: Option<f64>,
-        quiet_calibrated: bool,
     ) {
         py.detach(|| {
             let key = crate::path_keys::path_key(path);
@@ -3127,7 +3126,6 @@ impl NativeWatchCatalog {
                     {
                         observation.quiet_seconds = seconds;
                         observation.last_content_event_at = last_content_event_at;
-                        observation.quiet_calibrated = quiet_calibrated;
                     }
                 }
             }

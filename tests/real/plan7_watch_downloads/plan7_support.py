@@ -496,7 +496,6 @@ def start_watch(
     *,
     passwords: list[str],
     cleanup_mode: str = "keep",
-    cold_start_seconds: float = 0.0,
     state_path: Path | None = None,
     notification_sink: Any | None = None,
     flatten_single_directory: bool = False,
@@ -534,7 +533,6 @@ def start_watch(
             [str(watch_root)],
             output_roots={str(watch_root): str(output_root)},
             state_path=str(state_path or (tmp_path / label / "state.snapshot")),
-            cold_start_seconds=cold_start_seconds,
             pipeline_engine=engine,
             notification_sink=notification_sink,
             root_entries=(

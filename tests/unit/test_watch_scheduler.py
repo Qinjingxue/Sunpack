@@ -133,7 +133,7 @@ def test_scan_filesystem_errors_only_log_and_do_not_replace_archive_notification
     summary = RunSummary(
         target_results=results, scan_failures=(scan_error,),
     )
-    watcher = _watcher(tmp_path, cold_start_seconds=0)
+    watcher = _watcher(tmp_path)
     notices = []
     events = []
     watcher._notify = lambda *args: notices.append(args)
@@ -389,7 +389,6 @@ def test_watch_scheduler_prunes_missing_state_before_start(tmp_path, monkeypatch
         make_config({"watch": {"clipboard_monitor_enabled": False}}),
         [str(watch_root)],
         state_path=str(state_path),
-        cold_start_seconds=0,
     )
 
     watcher._start_blocking()
@@ -896,7 +895,7 @@ def test_watch_ready_batch_survives_one_candidate_error(tmp_path, monkeypatch, f
     paths = [root / name for name in ("first.disguised", "middle.download", "last.zip")]
     for path in paths:
         _write_zip(path)
-    watcher = _watcher(tmp_path, roots=[str(root)], cold_start_seconds=0)
+    watcher = _watcher(tmp_path, roots=[str(root)])
     for path in paths:
         watcher.enqueue(str(path))
 
@@ -1072,7 +1071,6 @@ def test_coalesced_pipeline_completion_is_consumed_without_duplicate_terminal_no
     notifications = CapturingNotificationSink()
     watcher = _watcher(
         tmp_path,
-        cold_start_seconds=0,
         pipeline_engine=_summary_pipeline_engine(),
         notification_sink=notifications,
     )
@@ -1247,7 +1245,7 @@ def test_cancelled_input_generation_survives_restart_until_content_changes(tmp_p
     broker = AsyncWorkBroker(thread_capacity=2)
     engine = _DeferredPipelineEngine()
     engine.work_broker = broker
-    watcher = _watcher(tmp_path, cold_start_seconds=0, pipeline_engine=engine)
+    watcher = _watcher(tmp_path, pipeline_engine=engine)
     try:
         watcher.enqueue(str(archive))
         _await(watcher.run_once())
@@ -1299,7 +1297,7 @@ def test_cancelled_input_generation_survives_restart_until_content_changes(tmp_p
         _await(watcher.aclose())
         _await(broker.close())
 
-    restarted = _watcher(tmp_path, cold_start_seconds=0, pipeline_engine=_DeferredPipelineEngine())
+    restarted = _watcher(tmp_path, pipeline_engine=_DeferredPipelineEngine())
     try:
         restarted._recover_persisted_work()
         restarted.enqueue(str(archive), force=True, event_type="initial_scan")
@@ -1320,7 +1318,6 @@ def test_watch_run_once_harvests_futures_without_waiting_for_slow_batch(tmp_path
     watcher = _watcher(
         tmp_path,
         config=make_config({"watch": {"runtime_cache_cleanup_idle_seconds": 0}}),
-        cold_start_seconds=0,
         pipeline_engine=engine,
     )
 
@@ -1362,7 +1359,7 @@ def test_watch_admission_batches_durability_off_loop_and_resumes_without_polling
         engine.work_broker = broker
         wake = asyncio.Event()
         loop = asyncio.get_running_loop()
-        watcher = _watcher(tmp_path, cold_start_seconds=0, pipeline_engine=engine,
+        watcher = _watcher(tmp_path, pipeline_engine=engine,
                            wake_callback=lambda: loop.call_soon_threadsafe(wake.set))
         for index in range(12):
             path = tmp_path / f"input-{index}.blob"
@@ -1440,7 +1437,7 @@ def test_nested_watch_lifecycle_and_completion_keep_wal_off_loop(tmp_path, monke
 
     async def scenario():
         async with PipelineEngine(config) as engine:
-            watcher = _watcher(tmp_path, config=config, cold_start_seconds=0, pipeline_engine=engine)
+            watcher = _watcher(tmp_path, config=config, pipeline_engine=engine)
             watcher.enqueue(str(outer))
             loop = asyncio.get_running_loop()
             loop_thread = threading.get_ident()
@@ -1534,7 +1531,6 @@ def test_watch_candidate_coroutines_are_harvested_without_completion_pool(tmp_pa
 
     watcher = _watcher(
         tmp_path,
-        cold_start_seconds=0,
         pipeline_engine=FakePipelineEngine(Runner),
     )
     watcher.enqueue(str(first))
@@ -1591,7 +1587,6 @@ def test_failed_watch_task_writes_to_direct_output_root(tmp_path, monkeypatch):
 
     watcher = _watcher(
         tmp_path,
-        cold_start_seconds=0,
         pipeline_engine=FakePipelineEngine(FailureRunner),
     )
     watcher.enqueue(str(archive))
@@ -1637,7 +1632,6 @@ def test_partial_result_does_not_self_retry_but_modified_epoch_does(tmp_path, mo
 
     watcher = _watcher(
         tmp_path,
-        cold_start_seconds=0,
         pipeline_engine=FakePipelineEngine(SequenceRunner),
     )
     watcher.enqueue(str(archive))
@@ -1664,7 +1658,7 @@ def test_cancelled_harvest_and_close_wait_for_completion_callbacks(tmp_path):
     from sunpack.runtime.watch.journal_commit import journal_stats
 
     async def scenario():
-        watcher = _watcher(tmp_path, cold_start_seconds=0)
+        watcher = _watcher(tmp_path)
         archive = tmp_path / "retained.zip"
         _write_zip(archive)
         watcher.enqueue(str(archive))
@@ -1716,7 +1710,6 @@ def test_metadata_event_during_and_after_processing_does_not_start_new_epoch(tmp
     wakeups = []
     watcher = _watcher(
         tmp_path,
-        cold_start_seconds=0,
         pipeline_engine=engine,
         wake_callback=lambda: wakeups.append("wake"),
     )
@@ -1786,12 +1779,13 @@ def test_metadata_event_during_and_after_processing_does_not_start_new_epoch(tmp
 
 def test_content_event_during_processing_still_starts_new_epoch_from_latest_metadata(tmp_path, monkeypatch):
     monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
+    clock = WatchClock(2000010000.0)
+    clock.install(monkeypatch)
     archive = tmp_path / "sample.zip"
     _write_zip(archive)
     engine = _DeferredPipelineEngine()
     watcher = _watcher(
         tmp_path,
-        cold_start_seconds=0,
         pipeline_engine=engine,
     )
     watcher.enqueue(str(archive), event_type="created")
@@ -1832,11 +1826,13 @@ def test_content_event_during_processing_still_starts_new_epoch_from_latest_meta
         lambda _path, *, since_usn=0: content,
     )
 
+    clock.advance(0.5)
     watcher.enqueue(str(archive), event_type="modified")
 
     assert watcher.pending_count == 1
     assert _observation_version(watcher._catalog.observation(str(archive))) == _observation_version(content)
     engine.handles[0].complete_no_tasks()
+    clock.advance(watcher._active_states[str(archive)].quiet_seconds + 0.01)
     assert _await(watcher.run_once()).processed == 1
     assert len(engine.handles) == 2
     engine.handles[1].complete_no_tasks()
@@ -1859,7 +1855,6 @@ def test_watch_scheduler_uses_watchdog_observer_and_initial_scan(tmp_path, monke
         config=make_config({}),
         roots=[str(watch_root)],
         state_path=str(state_path),
-        cold_start_seconds=0,
     )
 
     _await(watcher.start())
@@ -1887,7 +1882,6 @@ def test_watch_scheduler_scans_only_requested_initial_scan_roots(tmp_path, monke
     watcher = _watcher(
         tmp_path,
         roots=[str(first_root), str(second_root)],
-        cold_start_seconds=0,
     )
 
     _await(watcher.start())
@@ -1950,7 +1944,6 @@ def test_watch_scheduler_uses_each_roots_recursive_flag(tmp_path, monkeypatch, r
         config=make_config({"filesystem": {"scan_filters": []}}),
         root_entries=[scheduler_module.WatchRootEntry(str(watch_root), recursive=recursive)],
         roots=[str(watch_root)],
-        cold_start_seconds=0,
     )
 
     _await(watcher.start())
@@ -1984,7 +1977,6 @@ def test_watch_scheduler_does_not_apply_pipeline_filesystem_filters(tmp_path, mo
             "watch": {"clipboard_monitor_enabled": False},
         }),
         roots=[str(watch_root)],
-        cold_start_seconds=0,
         pipeline_engine=FakePipelineEngine(lambda _config: SimpleNamespace()),
     )
 
@@ -2009,7 +2001,6 @@ def test_watch_scheduler_joins_observer_without_deadline_or_suffix_prefilter(tmp
         tmp_path,
         config=make_config({}),
         roots=[str(watch_root)],
-        cold_start_seconds=0,
     )
 
     _await(watcher.start())
@@ -2030,7 +2021,6 @@ def test_event_burst_with_unchanged_usn_does_not_restart_quiet_window(tmp_path, 
     _write_zip(archive)
     watcher = _watcher(
         tmp_path,
-        cold_start_seconds=0,
         pipeline_engine=FakePipelineEngine(lambda _config: SimpleNamespace(
             context=SimpleNamespace(generated_outputs=set()),
             run_targets=lambda paths: _watch_summary(paths[0], OutcomeKind.PARTIAL_SUCCESS, {}),
@@ -2057,7 +2047,6 @@ def test_candidate_deadline_changes_wake_watch_service(tmp_path, monkeypatch):
     watcher = _watcher(
         tmp_path,
         config=make_config({"filesystem": {"scan_filters": []}, "watch": {"clipboard_monitor_enabled": False}}),
-        cold_start_seconds=30,
         wake_callback=lambda: wakeups.append("wake"),
     )
 
@@ -2097,7 +2086,6 @@ def test_watch_scheduler_processes_direct_quiet_candidate_with_watch_root_common
         tmp_path,
         config=make_config({}),
         roots=[str(watch_root)],
-        cold_start_seconds=0,
         pipeline_engine=FakePipelineEngine(FakePipelineRunner),
     )
     watcher.enqueue(str(archive_path))
@@ -2134,7 +2122,6 @@ def test_watch_scheduler_empty_root_output_uses_pipeline_default(tmp_path, monke
         roots=[str(watch_root)],
         output_roots={},
         root_entries=[WatchRootEntry(str(watch_root), None)],
-        cold_start_seconds=0,
         pipeline_engine=FakePipelineEngine(FakePipelineRunner),
     )
     watcher.enqueue(str(archive_path))
@@ -2145,7 +2132,7 @@ def test_watch_scheduler_empty_root_output_uses_pipeline_default(tmp_path, monke
     assert captured["config"]["output"]["root"] == ""
 
 
-def test_watch_scheduler_moved_file_uses_common_quiet_window(tmp_path, monkeypatch):
+def test_watch_scheduler_moved_file_is_immediately_ready(tmp_path, monkeypatch):
     monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
     now = [2000000000.0]
     monkeypatch.setattr(scheduler_module.time, "time", lambda: now[0])
@@ -2167,14 +2154,10 @@ def test_watch_scheduler_moved_file_uses_common_quiet_window(tmp_path, monkeypat
         tmp_path,
         roots=[str(watch_root)],
         state_path=str(tmp_path / ".sunpack_watch" / "state.snapshot"),
-        cold_start_seconds=10,
         pipeline_engine=FakePipelineEngine(FakePipelineRunner),
     )
     watcher.enqueue(str(archive_path), event_type="moved", src_path=str(tmp_path / "sample.zip"))
 
-    now[0] = 2000000009.9
-    assert _await(watcher.run_once()).processed == 0
-    now[0] = 2000000010.1
     assert _await(watcher.run_once()).processed == 1
 
 
@@ -2185,7 +2168,6 @@ def test_pending_metadata_event_advances_snapshot_without_generation_or_wakeup(t
     wakeups = []
     watcher = _watcher(
         tmp_path,
-        cold_start_seconds=10,
         wake_callback=lambda: wakeups.append("wake"),
     )
     watcher.enqueue(str(archive), event_type="created")
@@ -2251,7 +2233,6 @@ def test_watch_scheduler_ignores_unchanged_event_after_no_tasks_result(tmp_path,
         tmp_path,
         roots=[str(watch_root)],
         state_path=str(tmp_path / ".sunpack_watch" / "state.snapshot"),
-        cold_start_seconds=0,
         pipeline_engine=FakePipelineEngine(NoTasksRunner),
     )
     watcher.enqueue(str(target))
@@ -2291,7 +2272,6 @@ def test_watch_scheduler_processes_archive_when_output_root_matches_watch_root(t
         tmp_path,
         output_roots={root: str(tmp_path) for root in [str(tmp_path)]},
         state_path=str(tmp_path / ".sunpack_watch" / "state.snapshot"),
-        cold_start_seconds=0,
         pipeline_engine=FakePipelineEngine(FakePipelineRunner),
     )
     watcher.enqueue(str(archive_path))
@@ -2340,7 +2320,6 @@ def test_watch_scheduler_recovers_persisted_pending_input_after_restart(tmp_path
     first = _watcher(
         tmp_path,
         state_path=str(state_path),
-        cold_start_seconds=0,
     )
     stat = archive_path.stat()
     first.state.queue_active(
@@ -2359,7 +2338,6 @@ def test_watch_scheduler_recovers_persisted_pending_input_after_restart(tmp_path
     restarted = _watcher(
         tmp_path,
         state_path=str(state_path),
-        cold_start_seconds=0,
         pipeline_engine=FakePipelineEngine(FakePipelineRunner),
     )
     _await(restarted.start())
@@ -2403,7 +2381,6 @@ def test_watch_scheduler_routes_each_watch_root_to_its_configured_output_root(tm
             str(second_root): str(second_out),
         },
         state_path=str(first_root / ".sunpack_watch" / "state.snapshot"),
-        cold_start_seconds=0,
         pipeline_engine=FakePipelineEngine(SuccessRunner),
     )
     watcher.enqueue(str(archive_path))
@@ -2472,7 +2449,6 @@ def test_watch_root_without_explicit_output_uses_archive_folder_default(tmp_path
             roots=[str(watch_root)],
             output_roots=output_roots,
             root_entries=root_entries,
-            cold_start_seconds=0,
         )
         return watcher._output_root_for(str(archive_path))
 
@@ -2505,7 +2481,6 @@ def test_watch_scheduler_does_not_retry_terminal_failure_for_unchanged_event(tmp
     watcher = _watcher(
         tmp_path,
         roots=[str(watch_root)],
-        cold_start_seconds=0,
         pipeline_engine=FakePipelineEngine(FailingRunner),
         notification_sink=notifications,
     )
@@ -2548,7 +2523,6 @@ def test_unstructured_nested_password_failure_is_terminal_without_retry_anchor(t
         tmp_path,
         config=make_config({"cli": {"language": "zh"}, "watch": {"clipboard_monitor_enabled": False}}),
         roots=[str(watch_root)],
-        cold_start_seconds=0,
         pipeline_engine=FakePipelineEngine(NestedPasswordRunner),
         notification_sink=notifications,
     )
@@ -2709,7 +2683,6 @@ def test_watch_scheduler_does_not_retry_password_inconclusive_after_password_sou
         tmp_path,
         config=make_config({"watch": {"clipboard_monitor_enabled": False, "password_retry_debounce_seconds": 0}}),
         roots=[str(watch_root)],
-        cold_start_seconds=0,
         pipeline_engine=FakePipelineEngine(InconclusiveRunner),
     )
     watcher.enqueue(str(archive_path))
@@ -2757,11 +2730,11 @@ def test_password_retry_bypasses_learned_quiet_for_unchanged_failed_archive(tmp_
         notification_sink=notifications,
     )
     watcher.enqueue(str(archive_path))
-    wall_clock.advance(watcher.cold_start_seconds + 0.01)
-    watcher._quiet_trackers[str(archive_path)].quiet_seconds = 30.0
+    wall_clock.advance(0.01)
+    watcher._quiet_trackers[str(archive_path)].quiet_seconds = 300.0
     assert _await(watcher.run_once()).failed == 1
     assert str(archive_path) not in watcher._quiet_trackers
-    assert watcher._catalog.observation(str(archive_path)).quiet_seconds == 30.0
+    assert watcher._catalog.observation(str(archive_path)).quiet_seconds == 300.0
 
     _change_password_source(watcher)
     retried = _await(watcher.run_once())
@@ -2769,7 +2742,7 @@ def test_password_retry_bypasses_learned_quiet_for_unchanged_failed_archive(tmp_
     assert retried.succeeded == 1
     assert attempts["count"] == 2
     assert str(archive_path) not in watcher._quiet_trackers
-    assert watcher._catalog.observation(str(archive_path)).quiet_seconds == 30.0
+    assert watcher._catalog.observation(str(archive_path)).quiet_seconds == 300.0
 
 
     assert not watcher.state.entries
@@ -2799,18 +2772,16 @@ def test_password_retry_preserves_quiet_when_failed_archive_changed(tmp_path, mo
             "watch": {
                 "clipboard_monitor_enabled": False,
                 "password_retry_debounce_seconds": 0,
-                "cold_start_seconds": 1.0,
-                "quiet_min_seconds": 1.25,
             }
         }),
         pipeline_engine=FakePipelineEngine(PasswordFailureRunner),
     )
     watcher.enqueue(str(archive_path))
-    wall_clock.advance(watcher.cold_start_seconds + 0.01)
-    watcher._quiet_trackers[str(archive_path)].quiet_seconds = 30.0
+    wall_clock.advance(0.01)
+    watcher._quiet_trackers[str(archive_path)].quiet_seconds = 300.0
     assert _await(watcher.run_once()).failed == 1
     assert str(archive_path) not in watcher._quiet_trackers
-    assert watcher._catalog.observation(str(archive_path)).quiet_seconds == 30.0
+    assert watcher._catalog.observation(str(archive_path)).quiet_seconds == 300.0
     archive_path.write_bytes(b"PK\x03\x04changed-payload")
 
     _change_password_source(watcher)
@@ -2818,7 +2789,7 @@ def test_password_retry_preserves_quiet_when_failed_archive_changed(tmp_path, mo
 
     assert retried.processed == 0
     assert watcher.pending_count == 1
-    assert watcher._active_states[str(archive_path)].quiet_seconds >= 30.0
+    assert watcher._active_states[str(archive_path)].quiet_seconds >= 300.0
 
 
 def test_password_retry_debounce_uses_monotonic_clock_when_wall_clock_moves_backward(tmp_path, monkeypatch):
@@ -2856,7 +2827,6 @@ def test_password_retry_debounce_uses_monotonic_clock_when_wall_clock_moves_back
             }
         }),
         roots=[str(watch_root)],
-        cold_start_seconds=0,
         wake_callback=lambda: wakeups.append(monotonic_clock["value"]),
         pipeline_engine=FakePipelineEngine(PasswordThenSuccessRunner),
     )
@@ -2907,7 +2877,6 @@ def test_watch_scheduler_defaults_to_user_and_builtin_password_sources(tmp_path,
         config=make_config({"user_passwords": ["user-secret"], "watch": {"clipboard_monitor_enabled": False}}),
         roots=[str(watch_root)],
         state_path=str(state_path),
-        cold_start_seconds=0,
         pipeline_engine=FakePipelineEngine(CapturingRunner),
     )
 
@@ -2967,7 +2936,6 @@ def test_watch_scheduler_clipboard_persistence_refreshes_candidates_and_retries(
         tmp_path,
         config=make_config({"watch": {"clipboard_monitor_enabled": True, "password_retry_debounce_seconds": 0}}),
         roots=[str(watch_root)],
-        cold_start_seconds=0,
         pipeline_engine=FakePipelineEngine(ConfigAwareRunner),
     )
     watcher.enqueue(str(archive_path))
@@ -3019,7 +2987,6 @@ def test_watch_scheduler_retries_on_builtin_password_file_watchdog_event(tmp_pat
         tmp_path,
         config=make_config({"watch": {"clipboard_monitor_enabled": False, "password_retry_debounce_seconds": 0}}),
         roots=[str(watch_root)],
-        cold_start_seconds=0,
         pipeline_engine=FakePipelineEngine(ConfigAwareRunner),
     )
     watcher.enqueue(str(archive_path))
@@ -3072,7 +3039,6 @@ def test_watch_scheduler_retries_persisted_password_failure_when_config_password
         config=make_config({"user_passwords": ["wrong"], "watch": {"clipboard_monitor_enabled": False, "password_retry_debounce_seconds": 0}}),
         roots=[str(watch_root)],
         state_path=str(state_path),
-        cold_start_seconds=0,
         pipeline_engine=FakePipelineEngine(ConfigAwareRunner),
     )
     first_watcher.enqueue(str(archive_path))
@@ -3083,7 +3049,6 @@ def test_watch_scheduler_retries_persisted_password_failure_when_config_password
         config=make_config({"user_passwords": ["new-secret"], "watch": {"clipboard_monitor_enabled": False, "password_retry_debounce_seconds": 0}}),
         roots=[str(watch_root)],
         state_path=str(state_path),
-        cold_start_seconds=0,
         pipeline_engine=FakePipelineEngine(ConfigAwareRunner),
     )
     result = _await(second_watcher.run_once())
@@ -3126,7 +3091,6 @@ def test_watch_scheduler_success_hints_do_not_create_new_password_sources(tmp_pa
         tmp_path,
         config=make_config({"watch": {"clipboard_monitor_enabled": False, "password_retry_debounce_seconds": 0}}),
         roots=[str(watch_root)],
-        cold_start_seconds=0,
         pipeline_engine=FakePipelineEngine(LearningRunner),
     )
     watcher.enqueue(str(failed_archive))
@@ -3164,7 +3128,6 @@ def test_watch_scheduler_writes_display_log_for_failures(tmp_path, monkeypatch):
         tmp_path,
         roots=[str(watch_root)],
         state_path=str(tmp_path / ".sunpack_watch" / "state.snapshot"),
-        cold_start_seconds=0,
         pipeline_engine=FakePipelineEngine(FailingRunner),
     )
     watcher.enqueue(str(archive_path))
@@ -3190,7 +3153,6 @@ def test_watch_scheduler_silently_ignores_metadata_events(tmp_path, monkeypatch)
         config=make_config({}),
         roots=[str(watch_root)],
         state_path=str(metadata_dir / "state.snapshot"),
-        cold_start_seconds=0,
     )
 
     handler = scheduler_module._WatchEventHandler(watcher)
@@ -3258,7 +3220,6 @@ def test_watch_scheduler_claim_removes_pending_sibling_before_source_cleanup_pro
 
     watcher = _watcher(
         tmp_path,
-        cold_start_seconds=0,
     )
     watcher.enqueue(str(sibling_volume))
     assert watcher.pending_count == 1
@@ -3321,7 +3282,7 @@ def test_claim_during_probe_replays_new_generation_without_blocking_publication(
 
     source = tmp_path / "split.7z.002"
     source.write_bytes(b"old")
-    watcher = _watcher(tmp_path, cold_start_seconds=0)
+    watcher = _watcher(tmp_path)
     if stage == "attempt":
         watcher.enqueue(str(source))
     entered, resume = threading.Event(), threading.Event()
@@ -3379,7 +3340,6 @@ def test_watch_scheduler_claim_hands_off_only_new_generation_after_release(
 
     watcher = _watcher(
         tmp_path,
-        cold_start_seconds=0,
     )
     watcher.enqueue(str(sibling_volume))
     watcher._claim_pipeline_sources(
@@ -3418,7 +3378,6 @@ def test_watch_scheduler_transfers_dirty_generation_between_pipeline_claims(
 
     watcher = _watcher(
         tmp_path,
-        cold_start_seconds=0,
     )
     watcher.enqueue(str(source))
     watcher._claim_pipeline_sources("owner-a", (str(source),))
@@ -3457,7 +3416,6 @@ def test_watch_scheduler_departed_claimed_source_stays_owned_until_pipeline_fini
 
     watcher = _watcher(
         tmp_path,
-        cold_start_seconds=0,
     )
     watcher.enqueue(str(sibling_volume))
     watcher._claim_pipeline_sources(
@@ -3511,19 +3469,21 @@ def test_modified_epoch_triggers_even_when_size_mtime_and_file_id_are_unchanged(
     watcher = _watcher(
         tmp_path,
         roots=[str(watch_root)],
-        cold_start_seconds=10,
         pipeline_engine=FakePipelineEngine(FakePipelineRunner),
     )
     events = WatchEvents(watcher, clock)
     events.emit(archive_path)
+    clock.advance(0.5)
     with archive_path.open("r+b") as handle:
         handle.seek(0)
         handle.write(b"B" * 32 * 1024)
     os.utime(archive_path, (original_mtime, original_mtime))
     events.emit(archive_path, event_type="modified")
 
-    events.run_after(9.9, processed=0)
-    events.run_after(0.2, processed=1)
+    quiet_seconds = watcher._active_states[str(archive_path)].quiet_seconds
+    assert quiet_seconds > 0.5
+    events.run_after(quiet_seconds - 0.01, processed=0)
+    events.run_after(0.02, processed=1)
 
 
 def test_watch_scheduler_adapts_quiet_window_to_fast_content_writes(tmp_path, monkeypatch):
@@ -3537,8 +3497,6 @@ def test_watch_scheduler_adapts_quiet_window_to_fast_content_writes(tmp_path, mo
         tmp_path,
         config=make_config({"watch": {
             "clipboard_monitor_enabled": False,
-            "cold_start_seconds": 1.0,
-            "quiet_min_seconds": 1.25,
         }}),
         pipeline_engine=_summary_pipeline_engine(),
     )
@@ -3550,12 +3508,12 @@ def test_watch_scheduler_adapts_quiet_window_to_fast_content_writes(tmp_path, mo
         os.utime(archive_path, (clock.value, clock.value))
         events.emit(archive_path, event_type="modified")
 
-    quiet_seconds = WatchState.assert_quiet_seconds(watcher, archive_path, minimum=1.8, maximum=2.0)
+    quiet_seconds = WatchState.assert_quiet_seconds(watcher, archive_path, minimum=0.6, maximum=0.7)
     events.run_after(quiet_seconds - 0.01, processed=0)
     events.run_after(0.02, processed=1)
 
 
-def test_watch_scheduler_default_cold_start_is_zero_seconds(tmp_path, monkeypatch):
+def test_watch_scheduler_new_candidate_is_immediately_ready(tmp_path, monkeypatch):
     monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
     clock = WatchClock(2000035000.0)
     clock.install(monkeypatch)
@@ -3583,8 +3541,6 @@ def test_watch_scheduler_retains_slow_interval_learning_across_active_epochs(tmp
         tmp_path,
         config=make_config({"watch": {
             "clipboard_monitor_enabled": False,
-            "cold_start_seconds": 1.0,
-            "quiet_min_seconds": 1.25,
         }}),
         pipeline_engine=_summary_pipeline_engine(),
     )
@@ -3592,19 +3548,20 @@ def test_watch_scheduler_retains_slow_interval_learning_across_active_epochs(tmp
     events.emit(archive_path)
 
     events.run_after(10.01, processed=1)
-    assert not watcher._catalog.observation(str(archive_path)).quiet_calibrated
+    assert watcher._catalog.observation(str(archive_path)).quiet_seconds == 0.0
     clock.advance(9.99)
     archive_path.write_bytes(b"second")
     os.utime(archive_path, (clock.value, clock.value))
     events.emit(archive_path, event_type="modified")
 
     WatchState.assert_quiet_seconds(watcher, archive_path, minimum=20.0)
-    assert watcher._quiet_trackers[str(archive_path)].calibrated
     events.run_after(20.0, processed=0)
 
 
 def test_modified_event_retries_same_metadata_identity(tmp_path, monkeypatch):
     monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
+    clock = WatchClock(2000050000.0)
+    clock.install(monkeypatch)
     attempts = []
 
     class FakePipelineRunner:
@@ -3623,17 +3580,17 @@ def test_modified_event_retries_same_metadata_identity(tmp_path, monkeypatch):
     watcher = _watcher(
         tmp_path,
         roots=[str(watch_root)],
-        cold_start_seconds=0,
         pipeline_engine=FakePipelineEngine(FakePipelineRunner),
     )
-    events = WatchEvents(watcher, WatchClock(0.0))
+    events = WatchEvents(watcher, clock)
     events.emit(archive_path, event_type="modified")
     WatchState.assert_processed(_await(events.watcher.run_once()), 1)
 
+    clock.advance(0.1)
     archive_path.write_bytes(b"B" * (256 * 1024))
     os.utime(archive_path, (original_mtime, original_mtime))
     events.emit(archive_path, event_type="modified")
-    WatchState.assert_processed(_await(events.watcher.run_once()), 1)
+    events.run_after(watcher._active_states[str(archive_path)].quiet_seconds + 0.01, processed=1)
     assert len(attempts) == 2
 
 

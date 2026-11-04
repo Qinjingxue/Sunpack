@@ -398,7 +398,6 @@ async def _run_case(
     workspace: BenchmarkWorkspace,
     *,
     label: str,
-    cold_start_seconds: float,
     timeout_seconds: float,
 ) -> dict[str, Any]:
     root = workspace.work / label / "watch"
@@ -442,7 +441,6 @@ async def _run_case(
             # A relative dot is resolved against the watched root, so outputs
             # land in the watch directory itself, exactly like production watch.
             state_path=str(state_path),
-            cold_start_seconds=cold_start_seconds,
             pipeline_engine=engine,
         )
         _install_watch_instrumentation(watcher, fed_keys, timings, attempts)
@@ -668,7 +666,6 @@ def main() -> int:
     )
     parser.add_argument("--runs", type=int, default=3, help="Measured rounds per case.")
     parser.add_argument("--warmups", type=int, default=0, help="Extra rounds whose samples are marked warmup.")
-    parser.add_argument("--quiet-seconds", type=float, default=1.0)
     parser.add_argument("--timeout", type=float, default=180.0, help="Per-case wall-clock limit.")
     parser.add_argument("--small-files", type=int, default=1200)
     parser.add_argument("--large-files", type=int, default=2)
@@ -748,7 +745,6 @@ def main() -> int:
                         feed,
                         workspace,
                         label=label,
-                        cold_start_seconds=args.quiet_seconds,
                         timeout_seconds=args.timeout,
                     ))
                 sample["round"] = round_index
@@ -776,7 +772,6 @@ def main() -> int:
                     "flatten_modes": ["on" if mode else "off" for mode in flatten_modes],
                     "runs": args.runs,
                     "warmups": args.warmups,
-                    "quiet_seconds": args.quiet_seconds,
                     "timeout_seconds": args.timeout,
                     "small_files": max(1, args.small_files),
                     "large_files": max(1, args.large_files),

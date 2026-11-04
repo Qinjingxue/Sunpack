@@ -95,7 +95,7 @@ def test_watch_recovers_concurrent_discovery_and_execution_failures_after_restar
                 watcher = WatchScheduler(
                     case.config, [str(case.watch_root)],
                     output_roots={str(case.watch_root): str(tmp_path / "out")},
-                    state_path=str(tmp_path / "state.snapshot"), cold_start_seconds=0,
+                    state_path=str(tmp_path / "state.snapshot"),
                     pipeline_engine=engine,
                 )
                 watcher._notify = lambda *args: notices.append(args)

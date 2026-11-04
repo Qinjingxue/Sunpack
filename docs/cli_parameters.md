@@ -206,7 +206,7 @@ Subcommands and options:
 | `status`, `st` | — | Show run status, pending counts, errors, and root directories. |
 | `startup enable\|disable\|status` | — | Manage the current user's logon startup entry. |
 
-`start` keeps running until a stop request arrives; `start --once` completes one current scheduling pass and then exits. Writing, moving, or modifying a file triggers an active cycle; once the file is ready it is submitted for processing according to the configured quiet policy. The arrival of a new volume or a change in password sources reactivates the affected tasks.
+`start` keeps running until a stop request arrives; `start --once` completes one current scheduling pass and then exits. Writing, moving, or modifying a file triggers an active cycle. New candidates have no initial delay; subsequent content changes adapt the quiet window to observed write intervals, without a fixed minimum or maximum wait. Ready files are submitted for processing. The arrival of a new volume or a change in password sources reactivates the affected tasks.
 
 `add`'s `-o/--out-dir` can only be used together with a single input directory. Adding the same input directory again does not change the existing output mapping; you must `remove` and then `add` to update the mapping. The output roots of different monitored roots must not be strict ancestors or descendants of one another; the same output root may be shared.
 

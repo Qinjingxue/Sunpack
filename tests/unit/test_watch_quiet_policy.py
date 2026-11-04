@@ -6,24 +6,24 @@ from sunpack.runtime.watch.quiet_policy import AdaptiveQuietPolicy, AdaptiveQuie
 from tests.helpers.watch_write_simulator import WriteScenario, representative_write_scenarios, simulate_writes
 
 
-def test_policy_starts_below_dynamic_floor_then_corrects_after_first_interval():
+def test_policy_starts_immediately_then_learns_without_a_minimum_wait():
     tracker = AdaptiveQuietTracker(AdaptiveQuietPolicy())
 
     tracker.observe(0.0, size=1, mtime=0.0)
-    assert tracker.quiet_seconds == 1.0
+    assert tracker.quiet_seconds == 0.0
 
     tracker.observe(0.1, size=2, mtime=0.1)
 
-    assert 1.25 < tracker.quiet_seconds < 1.5
+    assert 0.1 < tracker.quiet_seconds < 0.15
 
 
 def test_policy_extends_immediately_after_one_long_observed_interval():
     tracker = AdaptiveQuietTracker(AdaptiveQuietPolicy())
     tracker.observe(0.0, size=1, mtime=0.0)
 
-    tracker.observe(20.0, size=2, mtime=20.0)
+    tracker.observe(300.0, size=2, mtime=300.0)
 
-    assert tracker.quiet_seconds > 20.0
+    assert tracker.quiet_seconds > 300.0
 
 
 def test_policy_uses_p90_instead_of_a_single_maximum_interval():
@@ -73,16 +73,15 @@ def test_explicit_metadata_only_change_updates_snapshot_without_resetting_quiet_
         content_changed=False,
     )
 
-    assert quiet_seconds == 1.0
+    assert quiet_seconds == 0.0
     assert tracker.intervals == ()
     assert tracker.last_mtime == 50.0
     assert tracker.last_change_usn == 11
 
 
 @pytest.mark.parametrize("observations", [10, 100])
-def test_fast_copy_calibrates_without_requiring_high_callback_throughput(observations):
-    """Existing profiles use a 1.25s floor and cannot expose the initial-seed tail."""
-    tracker = AdaptiveQuietTracker(AdaptiveQuietPolicy(minimum_seconds=0.0))
+def test_fast_copy_learns_without_requiring_high_callback_throughput(observations):
+    tracker = AdaptiveQuietTracker(AdaptiveQuietPolicy())
     tracker.observe(0.0, size=1, mtime=0.0)
     for index in range(1, observations + 1):
         now = 0.1 * index / observations
@@ -93,7 +92,7 @@ def test_fast_copy_calibrates_without_requiring_high_callback_throughput(observa
 @pytest.mark.parametrize("observations", [10, 100])
 def test_short_fast_burst_preserves_learned_download_pause(observations):
     """A burst with many callbacks must not erase a real, long inter-chunk pause."""
-    tracker = AdaptiveQuietTracker(AdaptiveQuietPolicy(minimum_seconds=0.0))
+    tracker = AdaptiveQuietTracker(AdaptiveQuietPolicy())
     tracker.observe(0.0, size=1, mtime=0.0)
     tracker.observe(20.0, size=2, mtime=20.0)
     learned = tracker.quiet_seconds
@@ -107,10 +106,9 @@ def test_short_fast_burst_preserves_learned_download_pause(observations):
 def test_representative_writes_avoid_repeated_premature_attempts(scenario: WriteScenario):
     result = simulate_writes(scenario, AdaptiveQuietPolicy())
 
-    expected_maximum = (
-        0 if scenario.name in {"very_fast", "fast"}
-        else 2 if scenario.name in {"slowing", "temporary_pauses"} else 1
-    )
+    # Starting at zero permits an initial attempt. Without a fixed floor,
+    # each isolated pause in a burst can also outlast the learned fast cadence.
+    expected_maximum = {"bursty": 9, "slowing": 4, "temporary_pauses": 3}.get(scenario.name, 1)
     assert result.premature_attempts <= expected_maximum
     maximum_latency = {"very_fast": 4.0, "fast": 6.0, "moderate": 10.0}.get(scenario.name)
     if maximum_latency is not None:

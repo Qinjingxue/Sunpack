@@ -66,7 +66,6 @@ def main() -> int:
         help="format to measure; may be repeated (default: all three)",
     )
     parser.add_argument("--runs", type=int, default=3)
-    parser.add_argument("--quiet-seconds", type=float, default=1.0)
     parser.add_argument("--timeout", type=float, default=900.0)
     parser.add_argument("--lz4-tool", type=Path, default=DEFAULT_LZ4_TOOL)
     parser.add_argument("--results-root", type=Path)
@@ -77,8 +76,8 @@ def main() -> int:
     formats = tuple(dict.fromkeys(args.formats or WATCH_FORMATS))
     if args.runs < 1:
         parser.error("--runs must be positive")
-    if args.quiet_seconds < 0 or args.timeout <= 0:
-        parser.error("--quiet-seconds must be nonnegative and --timeout must be positive")
+    if args.timeout <= 0:
+        parser.error("--timeout must be positive")
 
     if {"zipx", "lz4"}.intersection(formats):
         _ensure_special_archives(args.lz4_tool.resolve(), args.timeout)
@@ -104,7 +103,6 @@ def main() -> int:
                         source,
                         workspace,
                         passwords=passwords,
-                        cold_start_seconds=args.quiet_seconds,
                         timeout=args.timeout,
                         case_key=case_key,
                     )
@@ -138,7 +136,6 @@ def main() -> int:
                 "formats": list(formats),
                 "payload_bytes": PAYLOAD_BYTES,
                 "runs": args.runs,
-                "quiet_seconds": args.quiet_seconds,
                 "timeout_seconds": args.timeout,
                 "enc_password_candidate_count": 1 if "enc" in formats else 0,
                 "output_root_mode": "isolated_watch_root_per_format_and_run",

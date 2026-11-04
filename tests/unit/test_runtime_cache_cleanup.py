@@ -144,7 +144,6 @@ def test_watch_deadline_clears_only_after_idle_window(tmp_path):
         [str(tmp_path)],
         output_roots={str(tmp_path): str(tmp_path / "out")},
         state_path=str(tmp_path / "state.snapshot"),
-        cold_start_seconds=0,
         pipeline_engine=engine,
     )
 
@@ -310,8 +309,7 @@ def test_retained_sources_release_models_and_native_capacity_across_batches(tmp_
         root = tmp_path / "watch"
         root.mkdir()
         config = make_config({
-            "watch": {"clipboard_monitor_enabled": False, "cold_start_seconds": 0,
-                "quiet_min_seconds": 0, "quiet_max_seconds": 0},
+            "watch": {"clipboard_monitor_enabled": False},
             "post_extract": {"archive_cleanup_mode": "k"},
         })
         async with PipelineEngine(config) as engine:
@@ -374,7 +372,6 @@ def test_external_activity_resets_and_rearms_idle_cleanup(tmp_path):
         [str(tmp_path)],
         output_roots={str(tmp_path): str(tmp_path / "out")},
         state_path=str(tmp_path / "state.snapshot"),
-        cold_start_seconds=0,
         pipeline_engine=_CleanupOnlyEngine(),
         wake_callback=lambda: wakeups.append("wake"),
     )
@@ -405,7 +402,6 @@ def test_idle_maintenance_expires_cli_mode_when_cache_cleanup_is_disabled(tmp_pa
             [str(tmp_path)],
             output_roots={str(tmp_path): str(tmp_path / "out")},
             state_path=str(tmp_path / "state.snapshot"),
-            cold_start_seconds=0,
             pipeline_engine=engine,
         )
         host = RuntimeHost()
@@ -455,7 +451,6 @@ def test_cleanup_gate_waits_for_foreground_activity(tmp_path):
             [str(tmp_path)],
             output_roots={str(tmp_path): str(tmp_path / "out")},
             state_path=str(tmp_path / "state.snapshot"),
-            cold_start_seconds=0,
             pipeline_engine=engine,
         )
 
@@ -487,7 +482,6 @@ def test_external_activity_waits_for_cleanup_already_in_progress(tmp_path):
             [str(tmp_path)],
             output_roots={str(tmp_path): str(tmp_path / "out")},
             state_path=str(tmp_path / "state.snapshot"),
-            cold_start_seconds=0,
             pipeline_engine=engine,
         )
 
@@ -521,7 +515,6 @@ def test_foreground_lifecycle_clears_runtime_caches_after_idle(tmp_path):
             [str(tmp_path)],
             output_roots={str(tmp_path): str(tmp_path / "out")},
             state_path=str(tmp_path / "state.snapshot"),
-            cold_start_seconds=0,
             pipeline_engine=engine,
         )
         host = RuntimeHost()
@@ -636,7 +629,6 @@ def test_external_activity_release_during_pending_acquire_leaves_gate_free(tmp_p
             [str(tmp_path)],
             output_roots={str(tmp_path): str(tmp_path / "out")},
             state_path=str(tmp_path / "state.snapshot"),
-            cold_start_seconds=0,
             pipeline_engine=engine,
         )
 

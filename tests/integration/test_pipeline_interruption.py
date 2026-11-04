@@ -406,7 +406,7 @@ def test_watch_toast_stop_reaches_pipeline_and_finishes_after_durable_cleanup(tm
         toast = WatchToastCoordinator(host, config, str(tmp_path / "state"))
         async with PipelineEngine(config) as engine:
             watcher = WatchScheduler(config, [str(source)], output_roots={str(source): str(tmp_path / "out")},
-                state_path=str(tmp_path / "state.snapshot"), cold_start_seconds=0,
+                state_path=str(tmp_path / "state.snapshot"),
                 pipeline_engine=engine, notification_sink=toast, wake_callback=wake.set)
             runtime._watch_service = SimpleNamespace(scheduler=watcher, toast_coordinator=toast)
             try:

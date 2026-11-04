@@ -119,7 +119,7 @@ async def watch_scenario(root, mode):
             watcher = WatchScheduler(config, input_roots,
                 output_roots=output_roots,
                 root_entries=[WatchRootEntry(path, output_roots[path], True) for path in input_roots],
-                state_path=str(root / "state.snapshot"), cold_start_seconds=0,
+                state_path=str(root / "state.snapshot"),
                 pipeline_engine=engine)
             original = watcher._handle_pipeline_progress
             if mode == "promotion_prepared":

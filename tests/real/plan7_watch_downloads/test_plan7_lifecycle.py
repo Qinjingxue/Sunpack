@@ -27,8 +27,8 @@ def _finish(harness, marker_name: str, marker_text: str) -> None:
     assert marker_text_extracted(harness.output_root, marker_name, marker_text)
 
 
-def test_plan7_existing_file_initial_scan_and_quiet_window(tmp_path):
-    """watch 启动时已有完整文件，且使用非零 quiet window 时仍能处理。"""
+def test_plan7_existing_file_initial_scan(tmp_path):
+    """watch 启动时已有完整文件，可立即处理初始扫描发现的候选。"""
     case = FACTORY.create(
         tmp_path / "fixtures",
         "p7_initial_scan",
@@ -45,7 +45,6 @@ def test_plan7_existing_file_initial_scan_and_quiet_window(tmp_path):
         tmp_path,
         "initial_scan",
         passwords=[*wrong_password_list(), PASSWORD],
-        cold_start_seconds=0.05,
     )
     try:
         _finish(harness, case.marker_name, case.marker_text)

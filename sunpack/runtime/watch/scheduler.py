@@ -198,7 +198,6 @@ class WatchScheduler:
         output_roots: dict[str, str] | None = None,
         root_entries: Iterable[WatchRootEntry] | None = None,
         state_path: str,
-        cold_start_seconds: float | None = None,
         pipeline_engine=None,
         notification_sink=None,
         wake_callback: Callable[[], None] | None = None,
@@ -227,14 +226,6 @@ class WatchScheduler:
             )
             for root in self.watch_roots
         }
-        configured_cold_start = watch_config.get(
-            "cold_start_seconds",
-            DEFAULT_WATCH_CONFIG["cold_start_seconds"],
-        )
-        self.cold_start_seconds = max(
-            0.0,
-            float(configured_cold_start if cold_start_seconds is None else cold_start_seconds),
-        )
         self._scan_options = DirectoryScanner.compile_scan_options(config)
         from sunpack.core.config.detection_view import discovery_run_config
         self._deep_scan_options = (DirectoryScanner.compile_scan_options(
@@ -313,26 +304,7 @@ class WatchScheduler:
         if pipeline_engine is None:
             raise ValueError("WatchScheduler requires a PipelineEngine")
         self.pipeline_engine = pipeline_engine
-        quiet_min_seconds = max(
-            0.0,
-            float(watch_config.get("quiet_min_seconds", DEFAULT_WATCH_CONFIG["quiet_min_seconds"])),
-        )
-        quiet_max_seconds = (
-            0.0
-            if self.cold_start_seconds <= 0.0
-            else max(
-                self.cold_start_seconds,
-                quiet_min_seconds,
-                float(watch_config.get("quiet_max_seconds", DEFAULT_WATCH_CONFIG["quiet_max_seconds"])),
-            )
-        )
-        if self.cold_start_seconds <= 0.0:
-            quiet_min_seconds = 0.0
-        self._quiet_policy = AdaptiveQuietPolicy(
-            initial_seconds=self.cold_start_seconds,
-            minimum_seconds=quiet_min_seconds,
-            maximum_seconds=quiet_max_seconds,
-        )
+        self._quiet_policy = AdaptiveQuietPolicy()
         self.boundary_confirmation_seconds = max(
             0.0,
             float(
@@ -424,9 +396,6 @@ class WatchScheduler:
             output_roots=self.output_roots,
             recursive=any(entry.recursive for entry in self.root_entries.values()),
             pending=self.pending_count,
-            cold_start_seconds=self.cold_start_seconds,
-            quiet_min_seconds=self._quiet_policy.minimum_seconds,
-            quiet_max_seconds=self._quiet_policy.maximum_seconds,
         )
 
     def _refresh_directory_watches(self, changed=()):
@@ -2062,7 +2031,6 @@ class WatchScheduler:
                 path,
                 quiet_seconds=tracker.quiet_seconds if tracker is not None else None,
                 last_content_event_at=tracker.last_content_event_at if tracker is not None else None,
-                quiet_calibrated=tracker.calibrated if tracker is not None else False,
             )
             if not self._quiet_trackers:
                 self._quiet_trackers.clear()
@@ -2097,11 +2065,7 @@ class WatchScheduler:
             observation = self._catalog.observation(candidate.path)
             if observation is not None:
                 if observation.quiet_seconds > 0.0:
-                    tracker.quiet_seconds = min(
-                        self._quiet_policy.maximum_seconds,
-                        max(self._quiet_policy.minimum_seconds, observation.quiet_seconds),
-                    )
-                tracker.calibrated = observation.quiet_calibrated
+                    tracker.quiet_seconds = observation.quiet_seconds
                 tracker.last_content_event_at = observation.last_content_event_at
                 tracker.last_size = observation.size
                 tracker.last_mtime = observation.mtime

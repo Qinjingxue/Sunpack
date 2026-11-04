@@ -98,7 +98,6 @@ def test_watch_routes_each_root_to_its_output_root_without_input_tree_outputs(tm
                 [str(first_root), str(second_root)],
                 output_roots=output_roots,
                 state_path=str(tmp_path / "state.snapshot"),
-                cold_start_seconds=0,
                 pipeline_engine=delegate,
             )
             destination = second_root / case.entry_path.name

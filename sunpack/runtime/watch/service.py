@@ -11,7 +11,6 @@ from pathlib import Path
 
 from sunpack.core.support.path_keys import case_key, path_key
 
-from sunpack.core.config.fields.watch import DEFAULT_WATCH_CONFIG
 from sunpack.core.config.loader import ADVANCED_CONFIG_FILENAME, SIMPLE_CONFIG_FILENAME, load_config
 from sunpack.core.i18n import I18nContext
 from sunpack.core.platform.windows.message_box import show_error
@@ -723,12 +722,6 @@ class WatchService:
                 output_roots=self.root_outputs,
                 root_entries=self.service_config["root_entries"],
                 state_path=state_path,
-                cold_start_seconds=float(
-                    watch_config.get(
-                        "cold_start_seconds",
-                        DEFAULT_WATCH_CONFIG["cold_start_seconds"],
-                    )
-                ),
                 pipeline_engine=pipeline_engine,
                 notification_sink=toast_coordinator,
                 wake_callback=self._wake_scheduler,

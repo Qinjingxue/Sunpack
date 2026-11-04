@@ -15,13 +15,6 @@ def normalize_watch_config(value: Any) -> dict[str, Any]:
     raw_config = dict(value)
     config = dict(DEFAULT_WATCH_CONFIG)
     config.update(raw_config)
-    config["cold_start_seconds"] = max(0.0, _float_field(config, "cold_start_seconds"))
-    config["quiet_min_seconds"] = max(0.0, _float_field(config, "quiet_min_seconds"))
-    config["quiet_max_seconds"] = max(
-        config["cold_start_seconds"],
-        config["quiet_min_seconds"],
-        _float_field(config, "quiet_max_seconds"),
-    )
     config["boundary_confirmation_seconds"] = max(
         0.0,
         _float_field(config, "boundary_confirmation_seconds"),

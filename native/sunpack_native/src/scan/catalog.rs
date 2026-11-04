@@ -78,8 +78,6 @@ pub(crate) struct NativeWatchObservation {
     pub quiet_seconds: f64,
     #[pyo3(get)]
     pub last_content_event_at: Option<f64>,
-    #[pyo3(get)]
-    pub quiet_calibrated: bool,
 }
 
 #[pymethods]
@@ -99,7 +97,6 @@ impl NativeWatchObservation {
             change_usn,
             quiet_seconds: 0.0,
             last_content_event_at: None,
-            quiet_calibrated: false,
         }
     }
     pub fn update(&mut self, size: u64, mtime: f64, file_id: &str, change_usn: i64) {

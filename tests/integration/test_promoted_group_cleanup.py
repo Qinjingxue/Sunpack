@@ -53,7 +53,7 @@ def test_watch_promoted_sibling_controls_verified_group_cleanup(tmp_path, monkey
         async with PipelineEngine(config) as engine:
             watcher = WatchScheduler(
                 config, [str(case.archive_dir)], output_roots={str(case.archive_dir): str(output)},
-                state_path=state_path, cold_start_seconds=0, pipeline_engine=engine,
+                state_path=state_path, pipeline_engine=engine,
             )
             try:
                 watcher._scan_initial_roots([str(case.archive_dir)])

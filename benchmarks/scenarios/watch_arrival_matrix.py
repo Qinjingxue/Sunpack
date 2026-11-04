@@ -244,7 +244,6 @@ async def _run_case(
     *,
     label: str,
     mode: str,
-    cold_start_seconds: float,
     passwords: list[str],
     chunk_size: int,
     delay_seconds: float,
@@ -279,7 +278,6 @@ async def _run_case(
             config,
             [str(root)],
             state_path=str(state_path),
-            cold_start_seconds=cold_start_seconds,
             pipeline_engine=engine,
         )
         _install_instrumentation(watcher, destination, timings, attempts)
@@ -308,9 +306,6 @@ async def _run_case(
         ]
         return {
             "mode": mode,
-            "quiet_seconds_argument": cold_start_seconds,
-            "cold_start_seconds": cold_start_seconds,
-            "configured_quiet_min_seconds": float(config["watch"].get("quiet_min_seconds", 1.25)),
             "source_bytes": source.stat().st_size,
             "timings_seconds": {
                 "arrival": timings["arrival_seconds"],
@@ -350,7 +345,6 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Watch arrival and quiet-window matrix benchmark.")
     parser.add_argument("source", nargs="?", type=Path, default=DEFAULT_SOURCE)
     parser.add_argument("--modes", default=",".join(DEFAULT_MODES))
-    parser.add_argument("--quiet-values", default="0,1.25")
     parser.add_argument("--runs", type=int, default=1)
     parser.add_argument("--wrong-password-count", type=int, default=100)
     parser.add_argument("--password", action="append", default=[])
@@ -369,7 +363,6 @@ def main() -> int:
     unknown = sorted(set(modes) - set(DEFAULT_MODES))
     if unknown:
         parser.error(f"unknown modes: {', '.join(unknown)}")
-    quiet_values = tuple(float(value.strip()) for value in args.quiet_values.split(",") if value.strip())
     passwords = [f"wrong-{index:04d}" for index in range(args.wrong_password_count)]
     passwords.extend(args.password or ["⑨"])
     chunk_size = max(1, int(args.chunk_mib * 1024 * 1024))
@@ -378,55 +371,37 @@ def main() -> int:
     samples: list[dict[str, Any]] = []
     with watch_broker_lease() as broker_metadata, BenchmarkWorkspace("watch.arrival-matrix", results_root=args.results_root) as workspace:
         for run_index in range(args.runs):
-            for quiet_index, quiet_seconds in enumerate(quiet_values):
-                for mode in modes:
-                    label = f"run-{run_index}-quiet-{quiet_index}-{mode}"
-                    samples.append(asyncio.run(_run_case(
-                        source,
-                        workspace,
-                        label=label,
-                        mode=mode,
-                        cold_start_seconds=quiet_seconds,
-                        passwords=passwords,
-                        chunk_size=chunk_size,
-                        delay_seconds=delay_seconds,
-                        timeout_seconds=args.timeout,
-                    )))
-        grouped: dict[str, dict[str, list[float]]] = {}
+            for mode in modes:
+                label = f"run-{run_index}-{mode}"
+                samples.append(asyncio.run(_run_case(
+                    source,
+                    workspace,
+                    label=label,
+                    mode=mode,
+                    passwords=passwords,
+                    chunk_size=chunk_size,
+                    delay_seconds=delay_seconds,
+                    timeout_seconds=args.timeout,
+                )))
+        grouped: dict[str, list[dict[str, Any]]] = {}
         for sample in samples:
-            group = grouped.setdefault(sample["mode"], {})
-            key = str(sample["quiet_seconds_argument"])
-            group.setdefault(key, []).append(sample["timings_seconds"]["arrival_start_to_completion"])
+            grouped.setdefault(sample["mode"], []).append(sample)
         summary = {
             mode: {
-                quiet: {
-                    "runs": len(values),
-                    "median_total_seconds": statistics.median(values),
-                    "min_total_seconds": min(values),
-                    "max_total_seconds": max(values),
-                    "successful_runs": sum(
-                        1 for sample in samples
-                        if sample["mode"] == mode
-                        and str(sample["quiet_seconds_argument"]) == quiet
-                        and sample["success"]
-                    ),
-                    "median_attempt_count": statistics.median(
-                        sample["attempt_count"]
-                        for sample in samples
-                        if sample["mode"] == mode
-                        and str(sample["quiet_seconds_argument"]) == quiet
-                    ),
-                }
-                for quiet, values in quiet_groups.items()
+                "runs": len(rows),
+                "median_total_seconds": statistics.median(row["timings_seconds"]["arrival_start_to_completion"] for row in rows),
+                "min_total_seconds": min(row["timings_seconds"]["arrival_start_to_completion"] for row in rows),
+                "max_total_seconds": max(row["timings_seconds"]["arrival_start_to_completion"] for row in rows),
+                "successful_runs": sum(1 for row in rows if row["success"]),
+                "median_attempt_count": statistics.median(row["attempt_count"] for row in rows),
             }
-            for mode, quiet_groups in grouped.items()
+            for mode, rows in grouped.items()
         }
         report = {
             "watch_broker": broker_metadata,
             "parameters": {
                 "source": str(source),
                 "modes": list(modes),
-                "quiet_values": list(quiet_values),
                 "runs": args.runs,
                 "password_count": len(passwords),
                 "wrong_password_count": args.wrong_password_count,
