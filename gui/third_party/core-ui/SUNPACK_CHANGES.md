@@ -13,8 +13,11 @@ Local changes:
 
 - Let nested ScrollViews and multi-line text areas pass outward wheel input
   to their existing ancestor route at the top/bottom boundary. ScrollViews
-  use the current motion position so pending inertia still stays inside the
-  inner viewport until it reaches the edge; inward input resumes immediately.
+  retain input until their presented view reaches the physical edge. Preserve
+  full wheel impulses and clamp actual travel, avoiding a slow exponential
+  tail at the edge. Returning to an inner scroller cancels ancestor momentum
+  and pending travel so both levels do not keep moving together. Chaining at
+  the physical edge remains available without a gesture timeout or timer.
 
 - Add paint-only UTF-16 find ranges shared by ordinary text controls and native
   TAG surfaces. Reuse DirectWrite shaping/layout caches and expand highlights

@@ -1255,13 +1255,56 @@ void tag_config(Application& app,const fs::path& dir) {
             assert(outer->ScrollY()==after && (scroll()->ScrollY()-edge)*delta>0);
         }
         BOOL animate=TRUE; SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION,0,&animate,0);
-        if(animate) {
+        if(animate) for(int delta:{-120,120}) {
+            // A predicted edge must not start the parent while the inner view
+            // is still moving. Reuse this fixture to cover both physical edges
+            // and reversal after a handoff, which settled-offset tests miss.
             window->ScrollWithMeasureContext(outer,centered);
-            window->ScrollWithMeasureContext(scroll(),limit/2);
-            wheel(-12000); wheel(-120);
-            assert(outer->ScrollY()==centered && !outer->ScrollAnimating());
-            pump(settled,"TAG inertia before boundary",false);
-            assert(std::abs(scroll()->ScrollY()-limit)<0.1f);
+            const float edge=delta<0?limit:0;
+            const float start=delta<0?limit-8:8;
+            window->ScrollWithMeasureContext(scroll(),start);
+            wheel(delta);
+            assert(scroll()->ScrollY()==start && scroll()->ScrollAnimating() && !outer->ScrollAnimating());
+            wheel(delta);
+            assert(scroll()->ScrollY()==start && !outer->ScrollAnimating());
+            pump([&] {
+                assert(outer->ScrollY()==centered && !outer->ScrollAnimating());
+                return !scroll()->ScrollAnimating();
+            },"TAG inner owns boundary travel",false);
+            // Parent layout may shift the measured extent by a float ULP.
+            assert(std::abs(scroll()->ScrollY()-edge)<0.1f);
+            wheel(delta);
+            assert(outer->ScrollAnimating());
+            // Switch back before the parent has presented its pending input.
+            wheel(-delta);
+            assert(!outer->ScrollAnimating());
+            pump(settled,"TAG reverse queued handoff",false);
+            assert(outer->ScrollY()==centered && (scroll()->ScrollY()-edge)*delta>0);
+
+            window->ScrollWithMeasureContext(scroll(),edge);
+            wheel(delta);
+            pump([&]{return outer->ScrollY()!=centered;},"TAG outer handoff motion",false);
+            const float after=outer->ScrollY();
+            wheel(-delta);
+            assert(!outer->ScrollAnimating());
+            pump(settled,"TAG reverse moving handoff",false);
+            assert(outer->ScrollY()==after && (scroll()->ScrollY()-edge)*delta>0);
+
+            // Reversing an unfinished inner motion must still stay inside it.
+            window->ScrollWithMeasureContext(outer,centered);
+            window->ScrollWithMeasureContext(scroll(),start);
+            wheel(delta); wheel(-delta);
+            assert(!outer->ScrollAnimating());
+            pump(settled,"TAG reverse pending inertia",false);
+            assert(outer->ScrollY()==centered && (scroll()->ScrollY()-start)*delta>0);
+
+            // At the edge, undo an inward packet before any frame is shown.
+            // This reverses the pending inner motion instead of scrolling out.
+            window->ScrollWithMeasureContext(scroll(),edge);
+            wheel(-delta); wheel(delta);
+            assert(!outer->ScrollAnimating());
+            pump(settled,"TAG reverse unpresented edge motion",false);
+            assert(outer->ScrollY()==centered && std::abs(scroll()->ScrollY()-edge)<0.1f);
         }
         window->ScrollWithMeasureContext(outer,saved);
         window->ScrollWithMeasureContext(scroll(),0);

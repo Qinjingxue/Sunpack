@@ -3212,6 +3212,7 @@ void UiWindowImpl::OnMouseWheel(float x, float y, int delta) {
         bool smoothScroll = false;
         bool scrollHandled = false;
         bool hookFired = false;
+        Widget* scrollingWidget = nullptr;
 
         // Fire @wheel hook on the hit widget (subclass overrides may not
         // forward to Widget::OnMouseWheel).
@@ -3224,6 +3225,7 @@ void UiWindowImpl::OnMouseWheel(float x, float y, int delta) {
             if (auto* ta = dynamic_cast<TextAreaWidget*>(w)) {
                 if (ta->visible && ta->NeedsScrollbar()) {
                     handled = ta->OnMouseWheel(e);
+                    if (handled) scrollingWidget = ta;
                 }
             }
             else if (auto* iv = dynamic_cast<ImageViewWidget*>(w)) {
@@ -3249,11 +3251,20 @@ void UiWindowImpl::OnMouseWheel(float x, float y, int delta) {
             else if (auto* sv = dynamic_cast<ScrollViewWidget*>(w)) {
                 if (sv->visible) {
                     handled = sv->OnMouseWheel(e);
+                    if (handled) scrollingWidget = sv;
                     scrollHandled = handled;
                     smoothScroll = handled && sv->ScrollAnimating();
                     // The next scroll frame shifts arranged rows and refills
                     // virtualization under its renderer-backed measure scope.
                 }
+            }
+        }
+        // Returning to an inner scroller transfers ownership back from its
+        // ancestors. Keep their current view and discard any pending/inertial
+        // travel through the existing setter, without laying out or rendering.
+        if (scrollingWidget) for (Widget* parent = scrollingWidget->Parent(); parent; parent = parent->Parent()) {
+            if (auto* scroll = dynamic_cast<ScrollViewWidget*>(parent)) {
+                if (scroll->ScrollAnimating()) scroll->SetScrollY(scroll->ScrollY());
             }
         }
         if (handled || hookFired || dismissedDropdown) {

@@ -2838,20 +2838,24 @@ bool ScrollViewWidget::OnMouseWheel(const MouseEvent& e) {
     const auto now = AnimationTimeMs();
     AdvanceScrollMotion(now);
     const double limit = std::max(0.0f, contentHeight_ - VisibleHeight());
-    // Bubble outward at the current boundary. Pending inertia alone must not
-    // hand off a wheel while the inner view still has room in that direction.
-    if ((step < 0 && scrollPosition_ <= 0) ||
-        (step > 0 && scrollPosition_ >= limit)) return false;
+    // Keep ownership until the presented view reaches the physical edge.
+    // A pending destination at the edge does not mean the inner view is done.
+    // An unpresented inward motion must also get its reversal here first.
+    const bool reversing = scrollVelocity_ * step < 0;
+    if (!reversing && ((step < 0 && scrollY_ <= 0 && scrollPosition_ <= 0) ||
+        (step > 0 && scrollY_ >= limit && scrollPosition_ >= limit))) return false;
     BOOL animate = TRUE;
     SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &animate, 0);
     // Like InteractionTracker's additional-velocity requests: integrate the
     // existing inertia before adding this impulse, rather than restart a
     // fixed-duration easing curve for each wheel packet. Reverse immediately.
-    if (scrollVelocity_ * step < 0) scrollVelocity_ = 0;
-    const double target = std::clamp(scrollPosition_ + scrollVelocity_ / kWheelDecay + step,
-        0.0, limit);
+    if (reversing) scrollVelocity_ = 0;
+    // Preserve the full impulse; AdvanceScrollMotion clips actual travel at
+    // the edge. Clamping the destination here would turn every extra packet
+    // into another slow exponential approach instead of reaching the edge.
+    const double target = scrollPosition_ + scrollVelocity_ / kWheelDecay + step;
     if (animate) scrollVelocity_ = (target - scrollPosition_) * kWheelDecay;
-    else { scrollPosition_ = target; scrollVelocity_ = 0; }
+    else { scrollPosition_ = std::clamp(target, 0.0, limit); scrollVelocity_ = 0; }
     scrollTick_ = now;
     scrollPending_ = scrollPending_ || scrollVelocity_ != 0 || scrollPosition_ != double(scrollY_);
     if (ScrollAnimating()) GetContext().RegisterAnimatingWidget(this);
