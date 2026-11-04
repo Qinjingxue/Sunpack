@@ -392,21 +392,28 @@ where
         // Read slots stay owned by the IOCP producer. Completed bytes move to
         // independent scan jobs, so the slot can issue its next predicted
         // sequential read without waiting for matching to finish.
-        let job_capacity = buffer_count;
+        // Every allocation must be able to own a distinct real read job. Short
+        // streams cannot use the full configured pool; long streams retain the
+        // original IO depth and matching concurrency.
+        let jobs = usize::try_from(expected_read_operations).unwrap_or(usize::MAX);
+        let read_slots = buffer_count.min(jobs);
+        let job_capacity = buffer_count
+            .saturating_add(worker_count)
+            .min(jobs - read_slots);
         let slot_capacity = chunk_bytes.saturating_add(overlap).min(file_size as usize);
         let (done_tx, done_rx) = mpsc::channel::<(Vec<u8>, ScanBatch<T>)>();
 
         let mut pending = HashMap::<usize, Box<IocpSlot>>::new();
         let mut completed_slots = VecDeque::<Box<IocpSlot>>::new();
         let mut ready_jobs = VecDeque::<ScanJob>::new();
-        let mut available_buffers = (0..job_capacity.saturating_add(worker_count))
+        let mut available_buffers = (0..job_capacity)
             .map(|_| Vec::with_capacity(slot_capacity))
             .collect::<Vec<_>>();
         let mut next_base = 0u64;
         let mut scan_jobs = 0usize;
         let mut discarded_results = 0;
         let mut initial_error = None;
-        for _ in 0..buffer_count {
+        for _ in 0..read_slots {
             if let Err(error) = cancellation.check_io() {
                 initial_error = Some(error);
                 break;
@@ -472,6 +479,15 @@ where
                     fatal_error = Some(error);
                     break;
                 }
+                if next_base >= file_size {
+                    ready_jobs.push_back(ScanJob {
+                        buffer: slot.buffer,
+                        read_start: slot.read_start,
+                        leading_overlap: slot.leading_overlap,
+                        bytes_read: slot.bytes_read,
+                    });
+                    continue;
+                }
                 let Some(replacement_buffer) = available_buffers.pop() else {
                     completed_slots.push_front(slot);
                     break;
@@ -482,11 +498,6 @@ where
                     leading_overlap: slot.leading_overlap,
                     bytes_read: slot.bytes_read,
                 };
-                if next_base >= file_size {
-                    available_buffers.push(slot.buffer);
-                    ready_jobs.push_back(job);
-                    continue;
-                }
                 match submit_next_slot(
                     &handles,
                     &mut pending,
@@ -682,5 +693,55 @@ mod tests {
         assert_eq!(actual, expected);
         assert_eq!(output.read_operations, expected.len() as u64);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn short_job_sets_drain_with_overlap_and_no_spare_tail_buffers() {
+        // The slow-worker test uses the full pool. This catches omitted or
+        // stalled final completions when fewer real jobs than buffers exist.
+        let chunk = 64 * 1024;
+        for chunks in [1, 2, 3, 8, 9] {
+            let data = (0..chunk * chunks - 17)
+                .map(|i| (i % 251) as u8)
+                .collect::<Vec<_>>();
+            let path = std::env::temp_dir().join(format!(
+                "sunpack_iocp_short_{}_{}.bin",
+                std::process::id(),
+                chunks
+            ));
+            std::fs::write(&path, &data).unwrap();
+            let mut pieces = Vec::new();
+            let result = scan_file(
+                &path,
+                data.len() as u64,
+                chunk,
+                4,
+                4,
+                11,
+                |sample, carry, base| {
+                    let start = base as usize;
+                    assert_eq!(sample, &data[start..start + sample.len()]);
+                    ScanBatch {
+                        results: (start + carry, sample[carry..].to_vec()),
+                        discarded_results: 0,
+                    }
+                },
+                |piece| {
+                    pieces.push(piece);
+                    Ok(())
+                },
+            )
+            .unwrap();
+            pieces.sort_by_key(|(offset, _)| *offset);
+            assert_eq!(
+                pieces
+                    .into_iter()
+                    .flat_map(|(_, data)| data)
+                    .collect::<Vec<_>>(),
+                data
+            );
+            assert_eq!(result.read_operations, chunks as u64);
+            let _ = std::fs::remove_file(path);
+        }
     }
 }

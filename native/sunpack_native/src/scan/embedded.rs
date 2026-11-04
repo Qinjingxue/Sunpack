@@ -622,7 +622,15 @@ fn validate_raw_hits(
     // ZIP64 records were found in the same full-stream pass. Index each once
     // by its declared physical end; fake locators never trigger reverse scans.
     let mut zip64_records = BTreeMap::new();
+    let use_windows = raw_hits.len() + xz_footer_hits.len() >= 128;
+    let mut windowed = None;
     for hit in raw_hits.iter_mask(1 << 12) {
+        let reader: &ManagedReader = if use_windows {
+            windowed.get_or_insert_with(|| reader.windowed_probe_reader())
+        } else {
+            reader
+        };
+        reader.hint_probe_window(hit.offset());
         let fixed = read_at(reader, hit.offset(), 56)?;
         if let Ok(record) = crate::formats::zip::zip64::parse_record(&fixed) {
             if let Some(end) = hit
@@ -682,6 +690,15 @@ fn validate_raw_hits(
             continue;
         }
 
+        // EOCD ownership already skipped ordinary ZIP interiors. Only actual
+        // remaining probes pay for a scan-local window source; the common
+        // reader/cursor layout and directory fast path stay unchanged.
+        let reader: &ManagedReader = if use_windows {
+            windowed.get_or_insert_with(|| reader.windowed_probe_reader())
+        } else {
+            reader
+        };
+        reader.hint_probe_window(hit.offset());
         let resolved = if hit.kind() == "xz" {
             validate_xz(reader, file_size, hit.offset(), &mut xz_footers)?
         } else {

@@ -75,6 +75,14 @@ impl CachedSlice {
         self.data.len()
     }
 
+    fn slice(&self, start: usize, len: usize) -> Self {
+        Self {
+            data: self.data.clone(),
+            start: self.start + start,
+            end: self.start + start + len,
+        }
+    }
+
     #[cfg(test)]
     fn shares_backing(&self, other: &Self) -> bool {
         match (&self.data, &other.data) {
@@ -129,6 +137,10 @@ impl Deref for CachedBytes {
 
 pub(crate) trait ByteSource: Send + Sync {
     fn len(&self) -> u64;
+    fn hint_probe_window(&self, _offset: u64) {}
+    fn validate_cached_range(&self, _offset: u64, _len: usize) -> io::Result<()> {
+        Ok(())
+    }
     fn file_identity(&self) -> Option<FileIdentity> {
         None
     }
@@ -190,6 +202,113 @@ pub(crate) struct ManagedReader {
     source: Arc<dyn ByteSource>,
     state: Arc<ReaderState>,
     shared_blocks: bool,
+}
+
+#[derive(Default)]
+struct ProbeWindow {
+    previous_hit: Option<u64>,
+    read_ahead: bool,
+    cached: Option<(u64, CachedSlice)>,
+}
+
+struct ProbeSource {
+    reader: ManagedReader,
+    window: Mutex<ProbeWindow>,
+}
+
+impl ByteSource for ProbeSource {
+    fn len(&self) -> u64 {
+        self.reader.len()
+    }
+    fn file_identity(&self) -> Option<FileIdentity> {
+        self.reader.source.file_identity()
+    }
+    fn validate_cached_range(&self, offset: u64, len: usize) -> io::Result<()> {
+        self.reader.source.validate_cached_range(offset, len)
+    }
+    fn hint_probe_window(&self, offset: u64) {
+        if let Ok(mut window) = self.window.lock() {
+            window.read_ahead = window.previous_hit.is_some_and(|previous| {
+                previous != offset && previous / BLOCK_SIZE as u64 == offset / BLOCK_SIZE as u64
+            });
+            window.previous_hit = Some(offset);
+        }
+    }
+    #[cfg(windows)]
+    fn iocp_path(&self) -> Option<&Path> {
+        self.reader.iocp_path()
+    }
+    fn read_at(&self, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+        let slices = self.read_slices_at(offset, len)?;
+        let mut out =
+            crate::io::resource_error::bytes_with_capacity(slices.iter().map(|s| s.len()).sum())?;
+        for slice in slices {
+            out.extend_from_slice(&slice);
+        }
+        Ok(out)
+    }
+    fn read_slices_at(&self, offset: u64, len: usize) -> io::Result<Vec<CachedSlice>> {
+        let read_len = len.min(self.len().saturating_sub(offset) as usize);
+        if read_len != 0 && read_len <= BLOCK_SIZE {
+            let mut window = self
+                .window
+                .lock()
+                .map_err(|_| io::Error::other("probe window lock poisoned"))?;
+            if let Some((start, data)) = &window.cached {
+                if let Some(relative) = offset
+                    .checked_sub(*start)
+                    .and_then(|n| usize::try_from(n).ok())
+                {
+                    if relative <= data.len() && read_len <= data.len() - relative {
+                        self.validate_cached_range(offset, read_len)?;
+                        return Ok(vec![data.slice(relative, read_len)]);
+                    }
+                }
+            }
+            let block = offset / BLOCK_SIZE as u64;
+            let start = block * BLOCK_SIZE as u64;
+            // Only distinct nearby signature facts establish density. Several
+            // fields of one sparse header must remain exact reads.
+            if window.read_ahead
+                && window
+                    .previous_hit
+                    .is_some_and(|hit| hit / BLOCK_SIZE as u64 == block)
+                && read_len <= 512
+                && offset - start + read_len as u64 <= BLOCK_SIZE as u64
+            {
+                let length = BLOCK_SIZE.min((self.len() - start) as usize);
+                // Speculative faults/short reads outside the requested range
+                // fall back to its original IO path, including split volumes.
+                if let Ok(data) = self.reader.read_cached_at(start, length) {
+                    let data = match data {
+                        CachedBytes::Slice(data) => data,
+                        CachedBytes::Owned(data) => CachedSlice::from_vec(data),
+                    };
+                    let relative = (offset - start) as usize;
+                    if relative <= data.len() && read_len <= data.len() - relative {
+                        let result = data.slice(relative, read_len);
+                        window.cached = Some((start, data));
+                        return Ok(vec![result]);
+                    }
+                }
+            }
+        }
+        self.reader.read_slices_at(offset, read_len)
+    }
+    fn read_into_at(&self, offset: u64, buffer: &mut [u8]) -> io::Result<usize> {
+        if buffer.len() > BLOCK_SIZE {
+            return self.reader.read_into_at(offset, buffer);
+        }
+        let mut written = 0;
+        for slice in self.read_slices_at(offset, buffer.len())? {
+            buffer[written..written + slice.len()].copy_from_slice(&slice);
+            written += slice.len();
+        }
+        Ok(written)
+    }
+    fn read_direct_into_at(&self, offset: u64, buffer: &mut [u8]) -> io::Result<usize> {
+        self.reader.read_direct_into_at(offset, buffer)
+    }
 }
 
 struct ReaderState {
@@ -276,6 +395,20 @@ impl ManagedReader {
             state: Arc::clone(&self.state),
             shared_blocks: false,
         }
+    }
+
+    pub(crate) fn windowed_probe_reader(&self) -> Self {
+        Self::new(
+            Arc::new(ProbeSource {
+                reader: self.probe_reader(),
+                window: Mutex::default(),
+            }),
+            ReaderConfig::default(),
+        )
+    }
+
+    pub(crate) fn hint_probe_window(&self, offset: u64) {
+        self.source.hint_probe_window(offset);
     }
 
     pub(crate) fn len(&self) -> u64 {
@@ -1091,6 +1224,9 @@ impl FileSource {
 }
 
 impl ByteSource for FileSource {
+    fn validate_cached_range(&self, _offset: u64, _len: usize) -> io::Result<()> {
+        self.ensure_open()
+    }
     fn file_identity(&self) -> Option<FileIdentity> {
         Some(self.cache_identity())
     }
@@ -1366,6 +1502,12 @@ impl MultiVolumeSource {
 }
 
 impl ByteSource for MultiVolumeSource {
+    fn validate_cached_range(&self, offset: u64, len: usize) -> io::Result<()> {
+        for volume in &self.volumes[self.overlapping(offset, offset.saturating_add(len as u64))] {
+            volume.source.ensure_open()?;
+        }
+        Ok(())
+    }
     fn len(&self) -> u64 {
         self.len
     }
@@ -2563,6 +2705,100 @@ mod tests {
         assert_eq!(reader.stats().unwrap().read_bytes, 4);
         assert_eq!(reader.stats().unwrap().cache_hits, 1);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn scan_probe_windows_preserve_borrowed_ranges_and_generation() {
+        // Existing request-cache tests never enable scan windows. This coarse
+        // case guards their slicing, eviction lifetime and closed-generation
+        // behaviour together, using only three small blocks.
+        let bytes = (0..BLOCK_SIZE * 3 + 17)
+            .map(|n| (n % 251) as u8)
+            .collect::<Vec<_>>();
+        let path = temp_file("scan_probe_windows", &bytes);
+        let reader = ManagedReader::open(&path).unwrap();
+        let probe = reader.windowed_probe_reader();
+        assert_eq!(
+            reader.file_identity().unwrap().path,
+            probe.file_identity().unwrap().path
+        );
+        probe.hint_probe_window(20);
+        assert_eq!(&*probe.read_cached_at(20, 30).unwrap(), &bytes[20..50]);
+        probe.hint_probe_window(80);
+        let retained = probe.read_cached_at(80, 30).unwrap();
+        assert_eq!(&*retained, &bytes[80..110]);
+        assert_eq!(probe.read_at(90, 30).unwrap(), bytes[90..120]);
+        for offset in [
+            BLOCK_SIZE - 7,
+            BLOCK_SIZE + 10,
+            BLOCK_SIZE + 80,
+            BLOCK_SIZE * 2 + 10,
+            BLOCK_SIZE * 2 + 80,
+            bytes.len() - 7,
+        ] {
+            let end = (offset + 30).min(bytes.len());
+            probe.hint_probe_window(offset as u64);
+            let mut buffer = [0; 30];
+            let n = probe.read_into_at(offset as u64, &mut buffer).unwrap();
+            assert_eq!(&buffer[..n], &bytes[offset..end]);
+        }
+        assert_eq!(&*retained, &bytes[80..110]);
+        assert_eq!(
+            probe
+                .read_exact_at(bytes.len() as u64 - 3, 8)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+        let root = reader.file_identity().unwrap().path;
+        manager().release_resources_under_roots(&[root]).unwrap();
+        assert!(probe
+            .read_cached_at(BLOCK_SIZE as u64 * 2 + 80, 30)
+            .is_err());
+        assert_eq!(&*retained, &bytes[80..110]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn scan_probe_read_ahead_cannot_turn_neighbour_faults_into_requested_eof() {
+        // Only speculative windows read before the requested range. A truncated
+        // first volume must not hide readable bytes in the next volume.
+        let first = temp_file("scan_probe_short_part1", b"abcd");
+        let second = temp_file("scan_probe_short_part2", b"efgh");
+        let paths = [
+            first.to_string_lossy().into_owned(),
+            second.to_string_lossy().into_owned(),
+        ];
+        let reader = ManagedReader::open_volumes(&paths, ReaderConfig::default())
+            .unwrap()
+            .windowed_probe_reader();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&first)
+            .unwrap()
+            .set_len(2)
+            .unwrap();
+        reader.hint_probe_window(4);
+        assert_eq!(reader.read_at(4, 2).unwrap(), b"ef");
+        reader.hint_probe_window(6);
+        assert_eq!(reader.read_at(6, 4).unwrap(), b"gh");
+        assert_eq!(
+            reader.read_exact_at(1, 6).unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+        // Distinct fields of sparse hits must remain exact reads, rather than
+        // manufacturing a whole-block read for each tiny rejected header.
+        let sparse_source =
+            ManagedReader::from_bytes(vec![0x5a; BLOCK_SIZE * 3], ReaderConfig::default());
+        let sparse = sparse_source.windowed_probe_reader();
+        for offset in [0, BLOCK_SIZE as u64 * 2] {
+            sparse.hint_probe_window(offset);
+            assert_eq!(sparse.read_at(offset, 16).unwrap(), [0x5a; 16]);
+            assert_eq!(sparse.read_at(offset + 16, 8).unwrap(), [0x5a; 8]);
+        }
+        assert_eq!(sparse_source.stats().unwrap().read_bytes, 48);
+        let _ = std::fs::remove_file(first);
+        let _ = std::fs::remove_file(second);
     }
 
     #[test]
