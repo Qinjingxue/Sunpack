@@ -14,6 +14,7 @@ from benchmarks.hit_index import analysis
 from benchmarks.hit_index.build import ROOT, CACHE, backends, bridge, command, environment
 from benchmarks.hit_index.cases import Case, PROTOCOL, configurations, schedule, synthetic
 from benchmarks.hit_index.corpus import invoke_json, public_cases, real_cases, full_scan_cases
+from benchmarks.hit_index.parallel import DEFAULT_PARALLEL_JOBS, run_jobs
 
 SCENARIO = "scan.hit-index"
 
@@ -26,6 +27,8 @@ def options():
     p.add_argument("--blocks", type=int)
     p.add_argument("--samples", type=int)
     p.add_argument("--target-ms", type=int)
+    p.add_argument("--parallel-jobs", "--jobs", type=int, default=DEFAULT_PARALLEL_JOBS,
+                   help="Concurrent native benchmark processes (default: 16; use 1 for isolated latency)")
     p.add_argument("--public", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--real", action="store_true", help="Generate real fixtures and capture canonical post-filter hit traces")
     p.add_argument("--full-scan", action="store_true", help="Run existing native scan/release on the frozen real inputs")
@@ -64,6 +67,8 @@ def builder_cases() -> list[Case]:
 
 def main():
     args = options()
+    if args.parallel_jobs < 1:
+        raise ValueError("parallel-jobs must be positive")
     if args.shard_count < 1 or not 0 <= args.shard_index < args.shard_count:
         raise ValueError("invalid shard")
     if args.full_scan and not (args.real or args.corpus_manifest):
@@ -71,6 +76,8 @@ def main():
     if args.candidate_module_root and not args.full_scan:
         raise ValueError("--candidate-module-root requires --full-scan")
     params = dict(PROTOCOL["measurement"]["evaluation" if args.suite == "evaluation" else "quick"])
+    params.update(parallel_jobs=args.parallel_jobs,
+                  timing_context="shared-host" if args.parallel_jobs > 1 else "isolated")
     for name, value in [("process_blocks", args.blocks), ("inner_samples", args.samples), ("target_ms", args.target_ms)]:
         if value is not None:
             if value < 1:
@@ -177,54 +184,74 @@ def main():
         started = time.perf_counter()
         # Validation executable records exact emitted masked/seek tuples; timing
         # executable has all audit branches compiled out. No benchmark unit tests.
-        for case in cases:
-            for config in configs:
-                chosen_dll = args.candidate_bridge if config["name"] == "sunpack-candidate" else dll
-                result = native_call(validator, case, config, chosen_dll, mode="verify", params=params, block=0)
-                validation.append(result)
-                valid[(case.name, config["name"])] = result
-            print(f"validated {case.name}", flush=True)
+        def validate(job):
+            case, config = job
+            chosen_dll = args.candidate_bridge if config["name"] == "sunpack-candidate" else dll
+            return native_call(validator, case, config, chosen_dll, mode="verify", params=params, block=0)
+
+        for result in run_jobs(validate, ((case, config) for case in cases for config in configs),
+                               parallel_jobs=args.parallel_jobs):
+            validation.append(result)
+            valid[(result["case"], result["configuration"])] = result
+            if len(validation) % max(16, len(configs)) == 0 or len(validation) == len(cases) * len(configs):
+                print(f"validated {len(validation)}/{len(cases)*len(configs)} cells", flush=True)
         ws.write_result_json("validation.json", validation)
+        def measure_cell(job):
+            dispatch_index, (block, order, case, config) = job
+            checked = valid[(case.name, config["name"])]
+            if checked["status"] != "ok":
+                row = dict(checked, block=block, pair_order=order)
+            elif args.suite == "conformance":
+                row = dict(checked, block=block, pair_order=order)
+            else:
+                chosen_dll = args.candidate_bridge if config["name"] == "sunpack-candidate" else dll
+                row = native_call(executable, case, config, chosen_dll, mode="index", params=params, block=block)
+                row["pair_order"] = order
+            row.update(dispatch_index=dispatch_index, parallel_jobs=args.parallel_jobs,
+                       timing_context=params["timing_context"])
+            return row
+
         with journal.open("w", encoding="utf-8") as stream:
-            for block, order, case, config in schedule(cases, configs, params["process_blocks"]):
-                checked = valid[(case.name, config["name"])]
-                if checked["status"] != "ok":
-                    row = dict(checked, block=block, pair_order=order)
-                elif args.suite == "conformance":
-                    row = dict(checked, block=block, pair_order=order)
-                else:
-                    chosen_dll = args.candidate_bridge if config["name"] == "sunpack-candidate" else dll
-                    row = native_call(executable, case, config, chosen_dll, mode="index", params=params, block=block)
-                    row["pair_order"] = order
+            jobs = enumerate(schedule(cases, configs, params["process_blocks"]))
+            for row in run_jobs(measure_cell, jobs, parallel_jobs=args.parallel_jobs):
                 rows.append(row)
                 stream.write(json.dumps(row, ensure_ascii=False) + "\n")
                 stream.flush()
-                if len(rows) % len(configs) == 0:
-                    print(f"block {block + 1}/{params['process_blocks']} completed {case.name} ({time.perf_counter()-started:.1f}s)", flush=True)
+                if len(rows) % max(16, len(configs)) == 0 or len(rows) == len(cases) * len(configs) * params["process_blocks"]:
+                    print(f"completed {len(rows)}/{len(cases)*len(configs)*params['process_blocks']} cells ({time.perf_counter()-started:.1f}s)", flush=True)
         lifecycle = []
         lifetimes = []
         if args.suite != "conformance":
             replay = builder_cases() + [case for case in cases if case.family == "real-matcher-trace"]
-            for block in range(params["process_blocks"]):
-                versions = [("sunpack", dll)] + ([("sunpack-candidate", args.candidate_bridge)] if args.candidate_bridge else [])
-                if block % 2:
-                    versions.reverse()
-                for case in replay:
-                    for order in ([0, 2, 3] if case.family == "real-matcher-trace" else [0, 1, 2]):
-                        for name, chosen_dll in versions:
-                            result = invoke_json([executable, *case.argv(), "--mode", "builder", "--bridge", chosen_dll,
-                                                  "--window", "6", "--workers", "4", "--order", order])
-                            result.update(case=case.name, order=order, configuration=name, block=block)
-                            lifecycle.append(result)
-                    print(f"replayed Builder {case.name}, block {block + 1}", flush=True)
-            for case in builder_cases():
-                for name, chosen_dll in [("sunpack", dll)] + ([("sunpack-candidate", args.candidate_bridge)] if args.candidate_bridge else []):
-                    result = invoke_json([executable, *case.argv(), "--mode", "lifetime", "--cycles", 12,
-                                          "--bridge", chosen_dll, "--window", 6, "--workers", 4, "--order", 2])
-                    result.update(case=case.name, configuration=name)
-                    lifetimes.append(result)
+            versions = [("sunpack", dll)] + ([("sunpack-candidate", args.candidate_bridge)] if args.candidate_bridge else [])
+
+            def replay_job(job):
+                block, case, order, name, chosen_dll = job
+                result = invoke_json([executable, *case.argv(), "--mode", "builder", "--bridge", chosen_dll,
+                                      "--window", "6", "--workers", "4", "--order", order])
+                result.update(case=case.name, order=order, configuration=name, block=block,
+                              parallel_jobs=args.parallel_jobs, timing_context=params["timing_context"])
+                return result
+
+            jobs = ((block, case, order, name, chosen_dll) for block in range(params["process_blocks"])
+                    for case in replay for order in ([0, 2, 3] if case.family == "real-matcher-trace" else [0, 1, 2])
+                    for name, chosen_dll in (versions if block % 2 == 0 else list(reversed(versions))))
+            for result in run_jobs(replay_job, jobs, parallel_jobs=args.parallel_jobs):
+                lifecycle.append(result)
+            print(f"replayed {len(lifecycle)} Builder cells", flush=True)
+
+            def lifetime_job(job):
+                case, name, chosen_dll = job
+                result = invoke_json([executable, *case.argv(), "--mode", "lifetime", "--cycles", 12,
+                                      "--bridge", chosen_dll, "--window", 6, "--workers", 4, "--order", 2])
+                result.update(case=case.name, configuration=name, parallel_jobs=args.parallel_jobs,
+                              timing_context=params["timing_context"])
+                return result
+
+            lifetimes = list(run_jobs(lifetime_job, ((case, name, chosen_dll) for case in builder_cases()
+                                                   for name, chosen_dll in versions), parallel_jobs=args.parallel_jobs))
         full_scan = full_scan_cases(manifest, params["process_blocks"], candidate_module_root=args.candidate_module_root,
-                                    reference_module_root=args.reference_module_root) if args.full_scan else []
+                                    reference_module_root=args.reference_module_root, parallel_jobs=args.parallel_jobs) if args.full_scan else []
         changed = {str(p.relative_to(ROOT)): fast_hash128_file(p) for p in source_paths} != identities
         binary_versions = {}
         for result in full_scan:

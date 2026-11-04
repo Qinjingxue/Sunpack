@@ -6,6 +6,10 @@ The typed-hit index protocol, pinned baselines, corpus recipes, statistics and
 release gates are documented in [hit_index/PROTOCOL.md](hit_index/PROTOCOL.md).
 `scan hit-index` runs exact semantic conformance separately from timing and
 can replay actual post-filter traces through the production Rust Builder.
+The hit-index campaign defaults to 16 concurrent native jobs across validation,
+index timing, Builder, lifecycle and full scans. Use `--parallel-jobs` (`--jobs`)
+to change this. Reports record concurrency; use `--parallel-jobs 1` for isolated
+latency measurements, separately from concurrent campaign timings.
 
 List the supported scenarios:
 

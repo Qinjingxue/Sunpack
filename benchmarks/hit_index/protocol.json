@@ -1,6 +1,6 @@
 {
   "protocol": "SunPack typed-hit index evaluation",
-  "revision": "2026-11-03",
+  "revision": "2026-11-04",
   "contract": {
     "offset": "unsigned absolute u64",
     "types": 14,
@@ -21,6 +21,7 @@
   "evaluation_lengths": [4096, 65536, 262144, 1048576],
   "type_patterns": ["one", "uniform", "palette3", "skew", "runs", "periodic", "coincident"],
   "measurement": {
+    "execution": {"default_parallel_jobs": 16, "queue": "bounded to parallel_jobs; completion-driven, no idle polling", "isolation": "Shared-host timings include contention; --parallel-jobs 1 results are separate."},
     "quick": {"process_blocks": 3, "inner_samples": 3, "warmups": 1, "target_ms": 3, "queries": 512},
     "evaluation": {"process_blocks": 7, "inner_samples": 5, "warmups": 2, "target_ms": 20, "queries": 4096},
     "pairing": "same case/seed/process block, cyclic algorithm order (exact ordinal balance only over a complete cycle), rotated operation order",

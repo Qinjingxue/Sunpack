@@ -11,6 +11,7 @@ import zipfile
 from .build import CACHE, ROOT, command, environment
 from .cases import Case, PROTOCOL
 from .capture import instrumented_module
+from .parallel import DEFAULT_PARALLEL_JOBS, run_jobs
 
 
 def invoke_json(arguments, *, env=None) -> dict:
@@ -155,25 +156,32 @@ def real_cases(workspace, *, module_root: Path | None = None) -> tuple[list[Case
 
 
 def full_scan_cases(manifest: list[dict], blocks: int, *, candidate_module_root: Path | None = None,
-                    reference_module_root: Path | None = None) -> list[dict]:
+                    reference_module_root: Path | None = None,
+                    parallel_jobs: int = DEFAULT_PARALLEL_JOBS) -> list[dict]:
     from sunpack_native import fast_hash128_file
-    rows = []
     versions = [("reference" if reference_module_root else "installed", reference_module_root)] + ([("candidate", candidate_module_root)] if candidate_module_root else [])
-    for block in range(blocks):
-        for case in manifest:
-            if fast_hash128_file(Path(case["input"])) != case["input_xxh128"]:
-                raise RuntimeError("Frozen real input changed")
-            for name, root in (versions if block % 2 == 0 else list(reversed(versions))):
-                env = environment().copy()
-                env.pop("SUNPACK_BENCH_HIT_TRACE", None)
-                env["PYTHONPATH"] = os.pathsep.join(([str(root)] if root else []) + [str(ROOT)])
-                result = invoke_json([sys.executable, "-m", "benchmarks.hit_index.capture", "--path", case["input"]], env=env)
-                reference = case["semantic_reference"]
-                if (result.get("status") != "ok" or not result.get("complete")
-                        or result.get("read_bytes") != case["bytes"]
-                        or result.get("hits") != reference["hits"] or result.get("candidates") != reference["candidates"]):
-                    result["status"] = "invalid"
-                    result["error"] = "Full scan differs from frozen semantic reference"
-                result.update(case=case["name"], block=block, version=name)
-                rows.append(result)
-    return rows
+    for case in manifest:
+        if fast_hash128_file(Path(case["input"])) != case["input_xxh128"]:
+            raise RuntimeError("Frozen real input changed")
+
+    def scan_pair(job):
+        dispatch_index, (block, case) = job
+        rows = []
+        for name, root in (versions if block % 2 == 0 else list(reversed(versions))):
+            env = environment().copy()
+            env.pop("SUNPACK_BENCH_HIT_TRACE", None)
+            env["PYTHONPATH"] = os.pathsep.join(([str(root)] if root else []) + [str(ROOT)])
+            result = invoke_json([sys.executable, "-m", "benchmarks.hit_index.capture", "--path", case["input"]], env=env)
+            reference = case["semantic_reference"]
+            if (result.get("status") != "ok" or not result.get("complete")
+                    or result.get("read_bytes") != case["bytes"]
+                    or result.get("hits") != reference["hits"] or result.get("candidates") != reference["candidates"]):
+                result["status"] = "invalid"
+                result["error"] = "Full scan differs from frozen semantic reference"
+            result.update(case=case["name"], block=block, version=name, dispatch_index=dispatch_index,
+                          parallel_jobs=parallel_jobs, timing_context="shared-host" if parallel_jobs > 1 else "isolated")
+            rows.append(result)
+        return rows
+
+    return [row for pair in run_jobs(scan_pair, enumerate((block, case) for block in range(blocks) for case in manifest),
+                                    parallel_jobs=parallel_jobs) for row in pair]

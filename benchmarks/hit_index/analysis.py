@@ -95,7 +95,11 @@ def summarize(rows: list[dict], *, reference: str = "sunpack") -> dict:
         if row.get("status") == "ok" and "n" in row:
             characteristics.setdefault(row["case"], {key: row[key] for key in
                 ["n", "span", "type_counts", "duplicate_offsets", "duplicate_tuples", "origin"] if key in row})
+    parallelism = sorted({row.get("parallel_jobs", 1) for row in rows})
     return {"absolute": absolute, "paired_ratios": relative, "pareto": pareto,
+            "execution": {"parallel_jobs": parallelism,
+                          "timing_context": "shared-host" if any(n > 1 for n in parallelism) else "isolated",
+                          "scope": "Concurrent timings include host contention; isolated latency claims need --parallel-jobs 1."},
             "case_characteristics": characteristics, "failures": failures,
             "coverage": {"scheduled_rows": len(rows), "valid_rows": sum(r.get("status") == "ok" for r in rows),
                          "unsupported_rows": sum(r.get("status") == "unsupported" for r in rows),
@@ -110,6 +114,10 @@ def markdown(summary: dict) -> str:
              "Ratios below 1 use less space/time than the reference. These are family-specific estimates, not an overall winner.", "",
              "| Family | Configuration | Metric | Cases | Ratio | Bootstrap interval | Worst case |",
              "|---|---|---|---:|---:|---|---:|"]
+    execution = summary.get("execution")
+    if execution:
+        lines[4:4] = [f"Execution: {execution['parallel_jobs']} parallel jobs; {execution['timing_context']}. "
+                      "Concurrent timings include host contention; they are separate from isolated latency results.", ""]
     for row in summary["paired_ratios"]:
         if row["metric"] not in {"bytes", "build_ns", "sequential_all", "lower_mixed", "seek_forward"}:
             continue
@@ -123,7 +131,7 @@ def markdown(summary: dict) -> str:
 
 
 def main():
-    """Merge sequentially executed shards without silently pooling bad runs."""
+    """Merge compatible shards without silently pooling different execution modes."""
     import argparse
     import json
     from pathlib import Path

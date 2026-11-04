@@ -146,8 +146,11 @@ crash/invalid/unsupported 都保留在覆盖分母，不给缺失单元格虚构
 缺失查询在全稠密输入上会退化为边缘缺失，不能称为均匀内部缺失；极值 0/MAX 包含在混合查询内。
 `equal_offset` 用公共的 lower_bound 和 128 项 rank page 枚举，最多 32 组；是组合接口成本，不是生产 Cursor 的专门组枚举能力。
 
-每个 case/config/block 开新进程，按事先固定的打乱和循环顺序交错算法，按 block 轮转操作顺序。
-精确次序均衡需要完整循环；7 个 block 不保证 21 配置完全均衡。不要同时运行多个计时 shard。
+每个 case/config/block 开新进程，按事先固定的打乱和循环顺序提交算法，按 block 轮转操作顺序。
+默认 `--parallel-jobs 16`（别名 `--jobs`），验证、索引计时、Builder、生命周期和完整扫描共用有界调度；最多保留 16 个正在运行/等待返回的任务，不预排整个矩阵。
+完整扫描以一个 case/block 的参考与候选配对为任务，配对内保留 AB/BA 顺序。各子进程原来的 Rust/IOCP worker 数不变。
+精确次序均衡需要完整循环；7 个 block 不保证 21 配置完全均衡。并行时完成顺序也不同于提交顺序，不能声称独占 CPU/内存带宽。
+参数、原始行和报告记录 `parallel_jobs`/`timing_context`。并行耗时属于同机资源争用下的观测；单项独占延迟使用 `--parallel-jobs 1` 另跑，禁止与 16 路计时混合汇总。
 记录 CPU、系统、编译器、源码 commit、构建输入身份、DLL/exe 身份；发布时补充电源计划、亲和性、后台负载和 CPU 特征设置。
 本协议不清空 Windows 文件缓存，不能称为冷盘测试。不同 CPU/编译器的推广结论需要独立重复。
 
@@ -180,7 +183,7 @@ Win32 transfer bytes 是进程传输量，不是物理磁盘写入量。
 
 完整评估需要：178 项 conformance；1620 项合成矩阵和固定公共集合；全部算法配置及 block；真实轨迹和 Builder；完整扫描；来源/构建/输入/失败清单；全部 shard。
 仅合成正式矩阵就有 1620 × 21 × 7 = 238140 个独立进程单元；按每单元 10 操作 × 5 样本 × 20 ms 的目标，计时预算约 66 小时，另有校验、初始化和慢操作成本。分片是为管理运行，不是允许并行争抢 CPU。
-`quick` 只提供方向和协议落地证据。外部 IR、真实用户目录、CLI/Watch 和其他 CPU 未运行时必须写清，不能用默认勾选宣称完成。
+`quick` 只提供方向和协议落地证据。默认 16 路适合覆盖和完整矩阵吞吐，不能单独认证独占机器下的小幅速度提升。外部 IR、真实用户目录、CLI/Watch 和其他 CPU 未运行时必须写清，不能用默认勾选宣称完成。
 执行器只检查机械完整性；它不会自动认证论文结论、统计效力或对全体已有算法的领先性。
 
 ## 9. 执行与材料
@@ -194,6 +197,9 @@ uv run --no-sync python -m benchmarks scan hit-index --fetch --suite conformance
 
 # 开发对比：真实轨迹 + 同一输入的实际扫描
 uv run --no-sync python -m benchmarks scan hit-index --fetch --real --full-scan --strict
+
+# 默认 16 路；需要独占延迟时显式使用 1
+uv run --no-sync python -m benchmarks scan hit-index --suite evaluation --parallel-jobs 16 --strict
 
 # 完整矩阵可顺序分片运行；所有分片复用同一冻结 corpus.json
 uv run --no-sync python -m benchmarks scan hit-index --suite evaluation `
@@ -223,7 +229,7 @@ uv run --no-sync python -m benchmarks.hit_index.build --bridge `
 `.hits` 为 8 字节 magic `SPHITS\0\0`、四个 LE u64（文件大小、条数、保留 base、chunk），之后每条 16 字节：偏移 u64、类型 u8、零 padding 3 字节、job u32。
 评估过程不安装 probe/capture 到 `.venv`，不修改生产扫描逻辑。
 
-分片完成后合并（显式列出全部 `report.json`；参数、源码、工具、语料或重复单元格不一致会拒绝）：
+分片完成后合并（显式列出全部 `report.json`；并发度、参数、源码、工具、语料或重复单元格不一致会拒绝）：
 
 ```powershell
 uv run --no-sync python -m benchmarks.hit_index.analysis `
