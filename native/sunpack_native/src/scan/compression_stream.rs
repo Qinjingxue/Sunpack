@@ -96,23 +96,30 @@ impl<'a> ByteCursor<'a> {
             || self.pos < self.buffer_start
             || self.pos >= self.buffer_start + self.buffer.len() as u64;
         if outside {
-            // Most carrier candidates end inside this first small window.
-            // Grow only after consuming it; long streams retain bulk reads.
-            let window_size = if self.buffer_start == u64::MAX {
-                INITIAL_PROBE_BYTES
-            } else {
-                BUFFER_SIZE
-            };
-            self.buffer_start = self.pos;
-            let count = window_size.min((self.limit - self.pos) as usize);
-            self.buffer = self.reader.read_cached_at(self.pos, count)?;
-            if self.buffer.is_empty() {
-                return invalid("unexpected_end_of_stream");
-            }
+            self.refill()?;
         }
         let value = self.buffer[(self.pos - self.buffer_start) as usize];
         self.pos += 1;
         Ok(value)
+    }
+
+    // Keep refill policy out of the per-byte Huffman/deflate hot path.
+    #[inline(never)]
+    fn refill(&mut self) -> ValidationResult<()> {
+        // Grow after consuming each window so short carrier streams do
+        // not jump directly from a tiny probe to a full bulk read.
+        let window_size = if self.buffer_start == u64::MAX {
+            INITIAL_PROBE_BYTES
+        } else {
+            self.buffer.len().saturating_mul(4).min(BUFFER_SIZE)
+        };
+        self.buffer_start = self.pos;
+        let count = window_size.min((self.limit - self.pos) as usize);
+        self.buffer = self.reader.read_cached_at(self.pos, count)?;
+        if self.buffer.is_empty() {
+            return invalid("unexpected_end_of_stream");
+        }
+        Ok(())
     }
 
     fn check_read_len(&self, count: usize) -> ValidationResult<()> {

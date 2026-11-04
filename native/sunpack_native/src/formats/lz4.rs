@@ -140,12 +140,22 @@ impl<'a> StructureReader<'a> {
             return Err("lz4_stream_truncated");
         }
         if cursor < self.start || end > self.start + self.window.len() as u64 {
+            // Grow only when consuming the preceding window. Length jumps
+            // over payload begin with a small probe again.
+            let window_bytes = if !self.window.is_empty()
+                && cursor >= self.start
+                && cursor <= self.start + self.window.len() as u64
+            {
+                self.window.len().saturating_mul(4).min(self.window_bytes)
+            } else {
+                self.window_bytes.min(256)
+            };
             self.start = cursor;
             self.window = self
                 .reader
                 .read_cached_at(
                     cursor,
-                    (self.limit - cursor).min(self.window_bytes as u64) as usize,
+                    (self.limit - cursor).min(window_bytes as u64) as usize,
                 )
                 .map_err(|_| "os_error")?;
         }

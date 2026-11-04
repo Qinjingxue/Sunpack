@@ -292,6 +292,13 @@ impl ByteSource for ProbeSource {
                     }
                 }
             }
+            // Reuse bulk reads as the single scan window without another
+            // payload buffer. Tiny fields must not evict a wider window.
+            let slices = self.reader.read_slices_at(offset, read_len)?;
+            if read_len > 512 && slices.len() == 1 {
+                window.cached = Some((offset, slices[0].clone()));
+            }
+            return Ok(slices);
         }
         self.reader.read_slices_at(offset, read_len)
     }
@@ -2743,6 +2750,15 @@ mod tests {
             assert_eq!(&buffer[..n], &bytes[offset..end]);
         }
         assert_eq!(&*retained, &bytes[80..110]);
+        // Actual parser reads also populate the window; replacing it must
+        // preserve outstanding bytes just like speculative block windows.
+        probe.hint_probe_window(BLOCK_SIZE as u64 + 150);
+        let bulk = probe.read_cached_at(BLOCK_SIZE as u64 + 150, 4096).unwrap();
+        probe.hint_probe_window(BLOCK_SIZE as u64 * 2 + 200);
+        probe
+            .read_cached_at(BLOCK_SIZE as u64 * 2 + 200, 4096)
+            .unwrap();
+        assert_eq!(&*bulk, &bytes[BLOCK_SIZE + 150..BLOCK_SIZE + 150 + 4096]);
         assert_eq!(
             probe
                 .read_exact_at(bytes.len() as u64 - 3, 8)
@@ -2753,7 +2769,7 @@ mod tests {
         let root = reader.file_identity().unwrap().path;
         manager().release_resources_under_roots(&[root]).unwrap();
         assert!(probe
-            .read_cached_at(BLOCK_SIZE as u64 * 2 + 80, 30)
+            .read_cached_at(BLOCK_SIZE as u64 * 2 + 200, 30)
             .is_err());
         assert_eq!(&*retained, &bytes[80..110]);
         let _ = std::fs::remove_file(path);
