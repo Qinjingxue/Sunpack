@@ -2,6 +2,13 @@
 
 Performance measurements and diagnostic profiles live here; behavioural assertions live under `tests/`.
 
+File-quiescence algorithm research uses the offline `scheduling watch-quiet-window`
+baseline: [protocol](quiet_window/PROTOCOL.md), [papers and benchmark survey](quiet_window/RESEARCH.md),
+and [initial results](quiet_window/BASELINE.md) ([JSON](quiet_window/baseline.json)). It separates writer truth
+from delivered observations, reports premature proposals together with latency and
+censoring, and preserves the exact corpus for paired comparisons. It requires no
+Watch Broker. Existing real Watch scenarios remain the system-level evaluation.
+
 The typed-hit index protocol, pinned baselines, corpus recipes, statistics and
 release gates are documented in [hit_index/PROTOCOL.md](hit_index/PROTOCOL.md).
 `scan hit-index` runs exact semantic conformance separately from timing and
