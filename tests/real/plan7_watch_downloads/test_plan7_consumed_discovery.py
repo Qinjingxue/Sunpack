@@ -42,6 +42,13 @@ def test_plan7_discovery_resumes_after_successful_family_consumes_its_inputs(
 
     async def track_wrappers(self, targets, **kwargs):
         targets = tuple(targets)
+        # Capture the tail-only snapshot before another wrapper can publish
+        # an inner volume. Otherwise native discovery may probe the complete
+        # family's head, so the part4 probe gate below is never reached.
+        if any(str(getattr(target, "path", target)).endswith(".rar.lz4")
+               and not str(getattr(target, "path", target)).endswith(".part4.rar.lz4")
+               for target in targets):
+            await snapshot_captured.wait()
         response = await original_engine_run(self, targets, **kwargs)
         if response.summary.failures and any(str(getattr(target, "path", target)).endswith(".rar")
                                              for target in targets):

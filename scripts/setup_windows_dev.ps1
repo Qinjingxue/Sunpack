@@ -180,12 +180,54 @@ function Invoke-FileDownload {
     }
 
     Write-Host "Downloading $Description from $Uri" -ForegroundColor Yellow
-    $client = New-Object System.Net.WebClient
-    try {
-        $client.Headers["User-Agent"] = "SunPack dev bootstrap"
-        $client.DownloadFile($Uri, $DestinationPath)
-    } finally {
-        $client.Dispose()
+    $backoffSeconds = 1
+    while ($true) {
+        $client = New-Object System.Net.WebClient
+        $delaySeconds = $backoffSeconds
+        try {
+            $client.Headers["User-Agent"] = "SunPack dev bootstrap"
+            $client.DownloadFile($Uri, $DestinationPath)
+            return
+        } catch {
+            # PowerShell wraps exceptions raised by .NET method calls.
+            $exception = $_.Exception
+            while ($exception -and $exception -isnot [System.Net.WebException]) {
+                $exception = $exception.InnerException
+            }
+            if (-not $exception -or $exception.Response -isnot [System.Net.HttpWebResponse]) {
+                throw
+            }
+
+            $response = $exception.Response
+            try {
+                $statusCode = [int]$response.StatusCode
+                if ($statusCode -notin @(408, 429, 500, 502, 503, 504)) {
+                    throw
+                }
+
+                $retryAfter = $response.Headers["Retry-After"]
+                $retryAfterSeconds = 0
+                $retryAfterDate = [DateTimeOffset]::MinValue
+                if ([int]::TryParse($retryAfter, [Globalization.NumberStyles]::None,
+                        [Globalization.CultureInfo]::InvariantCulture, [ref]$retryAfterSeconds)) {
+                    $delaySeconds = [Math]::Max($delaySeconds, $retryAfterSeconds)
+                } elseif ([DateTimeOffset]::TryParse($retryAfter,
+                        [Globalization.CultureInfo]::InvariantCulture,
+                        [Globalization.DateTimeStyles]::AssumeUniversal, [ref]$retryAfterDate)) {
+                    $delaySeconds = [Math]::Max($delaySeconds, ($retryAfterDate - [DateTimeOffset]::UtcNow).TotalSeconds)
+                }
+            } finally {
+                $response.Dispose()
+            }
+        } finally {
+            $client.Dispose()
+        }
+
+        $delaySeconds = [Math]::Ceiling($delaySeconds)
+        Write-Warning ("Download of {0} failed with HTTP {1}; retrying in {2} seconds" -f $Description, $statusCode, $delaySeconds)
+        Start-Sleep -Seconds $delaySeconds
+        # Only retry transient HTTP failures; cancellation remains with the caller/CI job.
+        $backoffSeconds = [Math]::Min($backoffSeconds * 2, 60)
     }
 }
 

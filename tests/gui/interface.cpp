@@ -1230,7 +1230,6 @@ void tag_config(Application& app,const fs::path& dir) {
         const float saved=outer->ScrollY();
         window->ScrollWithMeasureContext(outer,std::max(24.0f,saved+(region.top+region.bottom-outer->rect.top-outer->rect.bottom)/2));
         const float centered=outer->ScrollY();
-        const float limit=scroll()->ContentHeight()-(scroll()->rect.bottom-scroll()->rect.top);
         auto wheel=[&](int delta) {
             const auto box=scroll()->rect, viewport=outer->rect;
             const float top=std::max(box.top,viewport.top),bottom=std::min(box.bottom,viewport.bottom);
@@ -1240,8 +1239,9 @@ void tag_config(Application& app,const fs::path& dir) {
         auto settled=[&]{return !scroll()->ScrollAnimating() && !outer->ScrollAnimating();};
         for(int delta:{-120,120}) {
             window->ScrollWithMeasureContext(outer,centered);
-            const float edge=delta<0?limit:0;
-            window->ScrollWithMeasureContext(scroll(),edge);
+            // Clamp against the live extent; layout can shift it by a float ULP.
+            window->ScrollWithMeasureContext(scroll(),delta<0?scroll()->ContentHeight():0.0f);
+            const float edge=scroll()->ScrollY();
             wheel(delta);
             pump(settled,"TAG wheel handoff",false);
             if(!((outer->ScrollY()-centered)*delta<0 && scroll()->ScrollY()==edge))
@@ -1260,6 +1260,7 @@ void tag_config(Application& app,const fs::path& dir) {
             // is still moving. Reuse this fixture to cover both physical edges
             // and reversal after a handoff, which settled-offset tests miss.
             window->ScrollWithMeasureContext(outer,centered);
+            const float limit=scroll()->ContentHeight()-(scroll()->rect.bottom-scroll()->rect.top);
             const float edge=delta<0?limit:0;
             const float start=delta<0?limit-8:8;
             window->ScrollWithMeasureContext(scroll(),start);
@@ -1281,7 +1282,7 @@ void tag_config(Application& app,const fs::path& dir) {
             pump(settled,"TAG reverse queued handoff",false);
             assert(outer->ScrollY()==centered && (scroll()->ScrollY()-edge)*delta>0);
 
-            window->ScrollWithMeasureContext(scroll(),edge);
+            window->ScrollWithMeasureContext(scroll(),delta<0?scroll()->ContentHeight():0.0f);
             wheel(delta);
             pump([&]{return outer->ScrollY()!=centered;},"TAG outer handoff motion",false);
             const float after=outer->ScrollY();
@@ -1300,7 +1301,7 @@ void tag_config(Application& app,const fs::path& dir) {
 
             // At the edge, undo an inward packet before any frame is shown.
             // This reverses the pending inner motion instead of scrolling out.
-            window->ScrollWithMeasureContext(scroll(),edge);
+            window->ScrollWithMeasureContext(scroll(),delta<0?scroll()->ContentHeight():0.0f);
             wheel(-delta); wheel(delta);
             assert(!outer->ScrollAnimating());
             pump(settled,"TAG reverse unpresented edge motion",false);
