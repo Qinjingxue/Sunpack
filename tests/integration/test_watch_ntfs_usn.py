@@ -69,12 +69,16 @@ def test_same_size_same_mtime_in_place_overwrite_changes_usn(tmp_path):
         stream.flush()
         os.fsync(stream.fileno())
     os.utime(archive, ns=(original_mtime_ns, original_mtime_ns))
-    after = _candidate_for(str(archive))
+    after = _candidate_for(str(archive), since_usn=before.change_usn)
 
     assert after.size == before.size
     assert after.mtime == before.mtime
     assert after.file_id == before.file_id
     assert after.change_usn != before.change_usn
+    # Same-stat overwrites and a restored timestamp must still expose the
+    # independent journal handle-epoch boundary used by the cadence sampler.
+    assert after.change_reasons_known
+    assert after.change_reasons & 0x80000000
 
 
 def test_catalog_recovery_reuses_ids_without_losing_renamed_or_replaced_subtrees(tmp_path):

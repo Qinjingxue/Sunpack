@@ -3056,6 +3056,7 @@ impl NativeWatchCatalog {
         })
     }
 
+    #[pyo3(signature = (path, size, mtime, file_id, change_usn, phase_boundary=false))]
     fn remember_observation(
         &self,
         py: Python<'_>,
@@ -3064,6 +3065,7 @@ impl NativeWatchCatalog {
         mtime: f64,
         file_id: &str,
         change_usn: i64,
+        phase_boundary: bool,
     ) {
         py.detach(|| {
             let key = crate::path_keys::path_key(path);
@@ -3082,7 +3084,7 @@ impl NativeWatchCatalog {
                 .unwrap_or_default();
             let table = tables.entry(scope).or_default();
             if let Some(row) = table.rows.get_mut(key.as_str()) {
-                row.remember_observation(size, mtime, file_id, change_usn);
+                row.remember_observation(size, mtime, file_id, change_usn, phase_boundary);
                 return;
             }
             table.insert_transient(
@@ -3100,17 +3102,19 @@ impl NativeWatchCatalog {
                 .rows
                 .get_mut(key.as_str())
                 .unwrap()
-                .remember_observation(size, mtime, file_id, change_usn);
+                .remember_observation(size, mtime, file_id, change_usn, phase_boundary);
         })
     }
 
-    #[pyo3(signature = (path, quiet_seconds=None, last_content_event_at=None))]
+    #[pyo3(signature = (path, quiet_seconds=None, last_content_event_at=None, cadence_seconds=0.0, pending_interval_seconds=0.0))]
     fn retire_observation(
         &self,
         py: Python<'_>,
         path: &str,
         quiet_seconds: Option<f64>,
         last_content_event_at: Option<f64>,
+        cadence_seconds: f64,
+        pending_interval_seconds: f64,
     ) {
         py.detach(|| {
             let key = crate::path_keys::path_key(path);
@@ -3126,6 +3130,8 @@ impl NativeWatchCatalog {
                     {
                         observation.quiet_seconds = seconds;
                         observation.last_content_event_at = last_content_event_at;
+                        observation.cadence_seconds = cadence_seconds;
+                        observation.pending_interval_seconds = pending_interval_seconds;
                     }
                 }
             }

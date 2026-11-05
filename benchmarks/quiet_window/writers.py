@@ -30,9 +30,12 @@ def _realize(index, family, expected, actions, *, preserve_mtime=False):
     size, content_usn = 0, 0
     mtime = 100.0
     covered, mutations, locks, blocked = [], [], {}, []
+    handles = set()
     complete, visible = None, actions[0].at
     for action in actions:
         at, kind, offset, length = action.at, action.kind, action.offset, action.length
+        if kind in {"exclusive_open", "shared_open"}:
+            handles.add(action.writer)
         if kind == "exclusive_open":
             if action.writer in locks:
                 raise ValueError("writer reopened an exclusive handle without closing it")
@@ -45,7 +48,13 @@ def _realize(index, family, expected, actions, *, preserve_mtime=False):
             visible = at
         elif kind == "seed":
             covered = _add(covered, offset, offset + length)
-        if kind not in {"allocate", "existing", "truncate", "replace", "write", "bad_write", "restore_mtime"}:
+        if kind == "close":
+            if action.writer not in handles:
+                raise ValueError("writer closed an unopened handle")
+            handles.remove(action.writer)
+            if handles:
+                continue
+        if kind not in {"allocate", "existing", "truncate", "replace", "write", "bad_write", "restore_mtime", "close"}:
             continue
         usn = len(mutations) + 1
         if kind in {"allocate", "existing", "truncate", "replace"}:
@@ -58,11 +67,11 @@ def _realize(index, family, expected, actions, *, preserve_mtime=False):
                 raise ValueError("writer range exceeds its target")
             size = max(size, offset + length)
             covered = (_add if kind == "write" else _remove)(covered, offset, offset + length)
-        if kind != "restore_mtime":
+        if kind not in {"restore_mtime", "close"}:
             content_usn = usn
             if not preserve_mtime:
                 mtime = 100.0 + at
-        else:
+        elif kind == "restore_mtime":
             mtime = 10.0
         mutations.append(Mutation(at, size, mtime, usn, kind, offset, length, action.writer, content_usn))
         full = size == expected and covered == [(0, expected)]

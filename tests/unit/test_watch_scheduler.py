@@ -2736,6 +2736,7 @@ def test_password_retry_bypasses_learned_quiet_for_unchanged_failed_archive(tmp_
     watcher.enqueue(str(archive_path))
     wall_clock.advance(0.01)
     watcher._quiet_trackers[str(archive_path)].quiet_seconds = 300.0
+    watcher._quiet_trackers[str(archive_path)].cadence_seconds = 300.0
     assert _await(watcher.run_once()).failed == 1
     assert str(archive_path) not in watcher._quiet_trackers
     assert watcher._catalog.observation(str(archive_path)).quiet_seconds == 300.0
@@ -2783,6 +2784,7 @@ def test_password_retry_relearns_quiet_when_failed_archive_changed(tmp_path, mon
     watcher.enqueue(str(archive_path))
     wall_clock.advance(0.01)
     watcher._quiet_trackers[str(archive_path)].quiet_seconds = 300.0
+    watcher._quiet_trackers[str(archive_path)].cadence_seconds = 300.0
     assert _await(watcher.run_once()).failed == 1
     assert str(archive_path) not in watcher._quiet_trackers
     assert watcher._catalog.observation(str(archive_path)).quiet_seconds == 300.0
@@ -3488,9 +3490,8 @@ def test_modified_epoch_triggers_even_when_size_mtime_and_file_id_are_unchanged(
     events.emit(archive_path, event_type="modified")
 
     quiet_seconds = watcher._active_states[str(archive_path)].quiet_seconds
-    assert quiet_seconds > 0.5
-    events.run_after(quiet_seconds - 0.01, processed=0)
-    events.run_after(0.02, processed=1)
+    assert quiet_seconds == 0.0  # one ambiguous gap does not establish a cadence
+    events.run_after(0.0, processed=1)
 
 
 def test_watch_scheduler_adapts_quiet_window_to_fast_content_writes(tmp_path, monkeypatch):
@@ -3537,7 +3538,7 @@ def test_watch_scheduler_new_candidate_is_immediately_ready(tmp_path, monkeypatc
     events.run_after(0.0, processed=1)
 
 
-def test_watch_scheduler_retains_slow_interval_learning_across_active_epochs(tmp_path, monkeypatch):
+def test_watch_scheduler_preserves_phase_evidence_across_retirement_and_resets_for_replacement(tmp_path, monkeypatch):
     monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
     clock = WatchClock(2000040000.0)
     clock.install(monkeypatch)
@@ -3561,8 +3562,31 @@ def test_watch_scheduler_retains_slow_interval_learning_across_active_epochs(tmp
     os.utime(archive_path, (clock.value, clock.value))
     events.emit(archive_path, event_type="modified")
 
+    assert watcher._active_states[str(archive_path)].quiet_seconds == 0.0
+    events.run_after(0.0, processed=1)
+    assert watcher._catalog.observation(str(archive_path)).pending_interval_seconds == pytest.approx(20.0)
+
+    clock.advance(20.0)
+    archive_path.write_bytes(b"third--")
+    os.utime(archive_path, (clock.value, clock.value))
+    events.emit(archive_path, event_type="modified")
     WatchState.assert_quiet_seconds(watcher, archive_path, minimum=20.0)
     events.run_after(20.0, processed=0)
+    events.run_after(2.0, processed=1)
+
+    clock.advance(3600.0)
+    archive_path.write_bytes(b"fourth--")
+    os.utime(archive_path, (clock.value, clock.value))
+    events.emit(archive_path, event_type="modified")
+    WatchState.assert_quiet_seconds(watcher, archive_path, minimum=20.0, maximum=25.0)
+    events.run_after(22.0, processed=1)
+
+    replacement = tmp_path / "replacement"
+    replacement.write_bytes(b"replaced")
+    os.replace(replacement, archive_path)
+    events.emit(archive_path, event_type="modified")
+    assert watcher._active_states[str(archive_path)].quiet_seconds == 0.0
+    events.run_after(0.0, processed=1)
 
 
 def test_modified_event_retries_same_metadata_identity(tmp_path, monkeypatch):

@@ -127,14 +127,14 @@ def main(argv=None, *, scheduler_mode=False):
                               "proposal_semantics": proposal_semantics,
                               "weighting": "equal-family-then-equal-channel-width-tie-within-seed",
                               "scope": "estimator-only-not-scheduler-or-extraction",
-                              "valid_proposal_latency": "complete-and-visible-arrival-to-first-readable-proposal;split-group-complete;busy-wait-included"}
+                              "valid_proposal_latency": "complete-visible-readable-and-split-ready-to-first-valid-proposal;exclusive-handle-wait-excluded"}
         if scheduler_mode:
             parameter_identity.update(
-                contract="sunpack.quiet-scheduler/2", metric_contract=EVALUATION_CONTRACT,
+                contract="sunpack.quiet-scheduler/3", metric_contract=EVALUATION_CONTRACT,
                 proposal_semantics="production-enqueue-pop-ready-boundary-confirmation-instant-retirement",
                 scope="production-admission-with-virtual-metadata-readiness-clock-and-memory-only-wal;not-extraction",
                 scoring_unit="single-file-or-complete-split-input;any-member-admission",
-                zero_delay_busy="coalesce-state-invariant-spin-until-next-physical-change-delivery-or-unlock;probe-cpu-not-modelled",
+                busy_timer_coalescing="skip-state-invariant-busy-timers-preserving-cadence-until-same-path-change-delivery-or-unlock;probe-cpu-not-modelled",
                 boundary_confirmation_seconds=DEFAULT_WATCH_CONFIG["boundary_confirmation_seconds"],
             )
         parameter_identity["evaluator_sources_xxh128"] = {
@@ -144,8 +144,9 @@ def main(argv=None, *, scheduler_mode=False):
         if scheduler_mode:
             from sunpack.runtime.watch import scheduler as runtime_scheduler, state as runtime_state
             parameter_identity["production_sources_xxh128"] = {}
-            for module in (runtime_scheduler, runtime_state):
-                path = Path(inspect.getsourcefile(module))
+            production_paths = [Path(inspect.getsourcefile(module)) for module in (runtime_scheduler, runtime_state)]
+            production_paths += [REPO / "native/sunpack_native/src/scan" / name for name in ("catalog.rs", "directory.rs")]
+            for path in production_paths:
                 source_text = path.read_text(encoding="utf-8")
                 parameter_identity["production_sources_xxh128"][path.name] = fast_hash128(source_text.encode("utf-8"))
                 workspace.write_result_text(f"implementation/production-{path.name}", source_text)
@@ -190,12 +191,12 @@ def main(argv=None, *, scheduler_mode=False):
                     resource[algorithm]["replay_cpu_ns"] += result["replay_cpu_ns"]
                     resource[algorithm]["observations"] += result["delivered_observations"]
                     resource[algorithm]["peak_live_estimators"] = max(resource[algorithm]["peak_live_estimators"], result["peak_live_estimators"])
-                    for name in ("metadata_probes", "readiness_probes", "coalesced_zero_delay_busy_checks"):
+                    for name in ("metadata_probes", "readiness_probes", "coalesced_busy_timer_runs"):
                         resource[algorithm][name] += result.get(name, 0)
                     resource[algorithm]["complete_arrival_inputs"] += metrics["complete_arrival_files"]
                     resource[algorithm]["missing_valid_proposal_inputs"] += metrics["complete_arrival_files"] - metrics["valid_proposal_files"]
                     for item in result.get("inputs", ()):
-                        if item.get("missing_reason") not in (None, "no_complete_arrival"):
+                        if item.get("missing_reason") not in (None, "no_processing_ready_input"):
                             resource[algorithm]["missing_reason:" + item["missing_reason"]] += 1
                     outcomes.write(json.dumps({"trace": trace.key, "algorithm": algorithm, "tie_order": tie_order,
                                                **result}, separators=(",", ":"), allow_nan=False) + "\n")
@@ -242,8 +243,8 @@ def main(argv=None, *, scheduler_mode=False):
         print(f"quiet-window baseline: {workspace.result_dir / 'report.json'}", flush=True)
         for split, summary in summaries.items():
             for algorithm, current in summary.items():
-                print(f"{split}/{algorithm}: complete-arrival-to-valid-proposal="
-                      f"{current['mean_complete_arrival_to_valid_proposal_seconds']['mean']}s, "
+                print(f"{split}/{algorithm}: ready-to-valid-proposal="
+                      f"{current['mean_ready_to_valid_proposal_seconds']['mean']}s, "
                       f"missing={current['censored_valid_proposal_rate']['mean']}, "
                       f"invalid/input={current['invalid_proposals_per_file']['mean']}")
     return 0

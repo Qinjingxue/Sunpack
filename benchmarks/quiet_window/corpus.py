@@ -7,7 +7,7 @@ from dataclasses import asdict, dataclass
 from typing import Iterator
 
 
-CONTRACT = "sunpack.writer-behaviour/1"
+CONTRACT = "sunpack.writer-behaviour/2"
 SPLITS = {"development": 0, "validation": 1_000_000, "heldout": 2_000_000}
 CHANNELS = ("immediate", "batched", "noisy", "lossy_reconciled")
 WIDTHS = (1, 4, 8, 64)
@@ -82,6 +82,7 @@ class Observation:
     usn: int
     content_changed: bool
     learn_interval: bool = True
+    phase_boundary: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -169,13 +170,19 @@ def _observe(file: FileTruth, channel: str, rng: random.Random) -> list[Observat
     if channel == "lossy_reconciled":
         scheduled.append((max(file.visible_at, file.mutations[-1].at) + 1, "reconcile"))
     times = [item.at for item in file.mutations]
-    last_content = 0
+    last_content = last_usn = 0
+    closes = [item.usn if item.operation == "close" else 0 for item in file.mutations]
+    for index in range(1, len(closes)):
+        closes[index] = max(closes[index], closes[index - 1])
     result = []
     for at, kind in sorted(set(scheduled)):
-        item = file.mutations[bisect.bisect_right(times, at) - 1]
+        position = bisect.bisect_right(times, at) - 1
+        item = file.mutations[position]
         result.append(Observation(at, file.key, kind, item.size, item.mtime, item.usn,
-                                  item.content_usn != last_content))
+                                  item.content_usn != last_content,
+                                  phase_boundary=closes[position] > last_usn))
         last_content = item.content_usn
+        last_usn = item.usn
     return result
 
 

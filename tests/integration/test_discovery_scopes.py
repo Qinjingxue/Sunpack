@@ -53,9 +53,10 @@ def test_catalog_observations_share_rows_without_changing_scan_versions_or_persi
         identity = "0000000000000012"
         catalog.remember_observation(str(first), 5, 10.25, identity, 7)
         catalog.remember_observation(str(second), 6, 10.5, "0123456789abcdef" * 2, 8)
-        catalog.retire_observation(str(first), 30.0, 12.0)
+        catalog.retire_observation(str(first), 30.0, 12.0, 24.0, 1200.0)
         accepted = catalog.observation(str(first).upper())
         assert accepted.file_id == identity and accepted.quiet_seconds == 30.0
+        assert accepted.cadence_seconds == 24.0 and accepted.pending_interval_seconds == 1200.0
         assert catalog.observation(str(second)).file_id == "0123456789abcdef" * 2
         assert catalog.memory_stats()["rows"] == before["rows"]
         catalog.commit()
@@ -69,7 +70,12 @@ def test_catalog_observations_share_rows_without_changing_scan_versions_or_persi
         current = catalog.observation(str(first))
         assert current.size == 23 and current.file_id == "replacement-id" and current.change_usn == 100
         assert current.quiet_seconds == 30.0 and current.last_content_event_at == 12.0
+        assert current.cadence_seconds == 24.0 and current.pending_interval_seconds == 1200.0
         assert accepted.size == 5  # the admission snapshot remains immutable
+        catalog.remember_observation(str(first), 23, 20.0, "replacement-id", 101, phase_boundary=True)
+        ended = catalog.observation(str(first))
+        assert ended.quiet_seconds == 30.0 and ended.cadence_seconds == 24.0
+        assert ended.last_content_event_at is None and ended.pending_interval_seconds == 0.0
         assert set(catalog.bucket_paths(scope.native, str(first))) == {str(first), str(second)}
 
         recovery = str(tmp_path / "generated" / "inner.bin")

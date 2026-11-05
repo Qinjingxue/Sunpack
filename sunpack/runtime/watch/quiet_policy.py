@@ -12,6 +12,8 @@ class AdaptiveQuietPolicy:
     window_size: int = 12
     interval_percentile: float = 0.9
     half_life_factor: float = 2.0
+    pause_ratio: float = 8.0
+    phase_confirmation_ratio: float = 2.0
     linear_factor: float = 1.0
     logarithmic_scale: float = 0.75
     logarithmic_pivot_seconds: float = 2.0
@@ -23,6 +25,11 @@ class AdaptiveQuietPolicy:
         if not math.isfinite(factor) or factor <= 0.0:
             raise ValueError("half_life_factor must be finite and positive")
         object.__setattr__(self, "half_life_factor", factor)
+        for name in ("pause_ratio", "phase_confirmation_ratio"):
+            ratio = float(getattr(self, name))
+            if not math.isfinite(ratio) or ratio <= 1.0:
+                raise ValueError(f"{name} must be finite and greater than one")
+            object.__setattr__(self, name, ratio)
         object.__setattr__(self, "linear_factor", max(0.0, float(self.linear_factor)))
         object.__setattr__(self, "logarithmic_scale", max(0.0, float(self.logarithmic_scale)))
         object.__setattr__(self, "logarithmic_pivot_seconds", max(1e-6, float(self.logarithmic_pivot_seconds)))
@@ -50,8 +57,7 @@ class AdaptiveQuietPolicy:
                 return value
         return weighted[-1][0]
 
-    def target_seconds(self, samples: deque[tuple[float, float]]) -> float:
-        interval = self.effective_interval(samples)
+    def target_seconds(self, interval: float) -> float:
         return (self.linear_factor * interval
                 + self.logarithmic_scale * math.log1p(interval / self.logarithmic_pivot_seconds))
 
@@ -60,6 +66,10 @@ class AdaptiveQuietPolicy:
 class AdaptiveQuietTracker:
     policy: AdaptiveQuietPolicy
     quiet_seconds: float = field(default=0.0, init=False)
+    # Bounded phase summary survives tracker retirement in the native catalog;
+    # the twelve-sample distribution remains local to an active tracker.
+    cadence_seconds: float = field(default=0.0, init=False)
+    pending_interval_seconds: float = field(default=0.0, init=False)
     last_content_event_at: float | None = None
     last_size: int | None = None
     last_mtime: float | None = None
@@ -82,6 +92,7 @@ class AdaptiveQuietTracker:
         change_usn: int = 0,
         content_changed: bool | None = None,
         learn_interval: bool = True,
+        phase_boundary: bool = False,
     ) -> float:
         size = int(size)
         mtime = float(mtime)
@@ -93,18 +104,48 @@ class AdaptiveQuietTracker:
             or (change_usn > 0 and self.last_change_usn != change_usn)
         )
         is_content_change = detected_change if content_changed is None else bool(content_changed)
+        if phase_boundary:
+            # A fresh journal CLOSE says this interval crosses a handle epoch,
+            # not that the file is complete or that another writer cannot open.
+            self.last_content_event_at = None
+            self.pending_interval_seconds = 0.0
         if not is_content_change:
             self.last_size = size
             self.last_mtime = mtime
             self.last_change_usn = change_usn
             return self.quiet_seconds
+        if self.last_size is not None and size < self.last_size:
+            # A truncate/restart is not an interval in the old writing phase.
+            self._samples.clear()
+            self.quiet_seconds = self.cadence_seconds = self.pending_interval_seconds = 0.0
+            self.last_content_event_at = None
         if self.last_content_event_at is not None and learn_interval:
             interval = float(now) - self.last_content_event_at
             if interval > 0.0 and math.isfinite(interval):
-                self._samples.append((interval, float(now)))
-                self.quiet_seconds = self.policy.target_seconds(self._samples)
-        self.last_content_event_at = float(now)
+                self._observe_interval(interval, float(now))
+        elif not learn_interval:
+            # A boundary probe does not time a writer interval; it also breaks
+            # the consecutive evidence required to confirm a tentative phase.
+            self.pending_interval_seconds = 0.0
+        self.last_content_event_at = None if phase_boundary else float(now)
         self.last_size = size
         self.last_mtime = mtime
         self.last_change_usn = change_usn
         return self.quiet_seconds
+
+    def _observe_interval(self, interval: float, now: float) -> None:
+        # A single gap cannot distinguish an idle writer from a slow writer.
+        # Quarantine unknown/out-of-phase gaps without extending the deadline.
+        # Repeated compatible intervals establish a real slower writing phase.
+        cadence = self.cadence_seconds
+        if cadence == 0.0 or interval > self.policy.pause_ratio * cadence:
+            pending = self.pending_interval_seconds
+            if not pending or max(interval, pending) > self.policy.phase_confirmation_ratio * min(interval, pending):
+                self.pending_interval_seconds = interval
+                return
+            self._samples.clear()
+            self._samples.append((pending, self.last_content_event_at))
+        self.pending_interval_seconds = 0.0
+        self._samples.append((interval, now))
+        self.cadence_seconds = self.policy.effective_interval(self._samples)
+        self.quiet_seconds = self.policy.target_seconds(self.cadence_seconds)

@@ -32,14 +32,22 @@ def _load(path):
 
 def _observe(module, traces, repetitions):
     policy = module.AdaptiveQuietPolicy()
+    # Frozen controls may predate the journal-phase input. Detect the call
+    # interface once, outside timing; never change a control's estimator.
+    phase_input = "phase_boundary" in inspect.signature(module.AdaptiveQuietTracker.observe).parameters
     started = time.process_time_ns()
     for _ in range(repetitions):
         for trace in traces:
             trackers = {file.key: module.AdaptiveQuietTracker(policy) for file in trace.files}
             for event in trace.observations:
-                trackers[event.key].observe(event.at, size=event.size, mtime=event.mtime,
-                                            change_usn=event.usn, content_changed=event.content_changed,
-                                            learn_interval=event.learn_interval)
+                if phase_input:
+                    trackers[event.key].observe(event.at, size=event.size, mtime=event.mtime,
+                                                change_usn=event.usn, content_changed=event.content_changed,
+                                                learn_interval=event.learn_interval, phase_boundary=event.phase_boundary)
+                else:
+                    trackers[event.key].observe(event.at, size=event.size, mtime=event.mtime,
+                                                change_usn=event.usn, content_changed=event.content_changed,
+                                                learn_interval=event.learn_interval)
     return time.process_time_ns() - started
 
 

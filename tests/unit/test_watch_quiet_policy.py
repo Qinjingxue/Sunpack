@@ -15,17 +15,10 @@ def test_policy_starts_immediately_then_learns_without_a_minimum_wait():
     assert tracker.quiet_seconds == 0.0
 
     tracker.observe(0.1, size=2, mtime=0.1)
+    assert tracker.quiet_seconds == 0.0
+    tracker.observe(0.2, size=3, mtime=0.2)
 
     assert 0.1 < tracker.quiet_seconds < 0.15
-
-
-def test_policy_extends_immediately_after_one_long_observed_interval():
-    tracker = AdaptiveQuietTracker(AdaptiveQuietPolicy())
-    tracker.observe(0.0, size=1, mtime=0.0)
-
-    tracker.observe(300.0, size=2, mtime=300.0)
-
-    assert tracker.quiet_seconds > 300.0
 
 
 def test_weighted_p90_uses_real_sample_age_and_excludes_underflowed_history():
@@ -48,27 +41,29 @@ def test_same_metadata_event_does_not_distort_write_interval_history():
     tracker = AdaptiveQuietTracker(AdaptiveQuietPolicy())
     tracker.observe(0.0, size=1, mtime=0.0)
     tracker.observe(0.1, size=2, mtime=0.1)
+    tracker.observe(0.2, size=3, mtime=0.2)
 
-    tracker.observe(5.0, size=2, mtime=0.1)
+    tracker.observe(5.0, size=3, mtime=0.2)
 
-    assert tracker.intervals == (0.1,)
+    assert tracker.intervals == (0.1, 0.1)
 
 
 def test_boundary_observation_updates_baseline_without_learning_wait_interval():
     tracker = AdaptiveQuietTracker(AdaptiveQuietPolicy())
     tracker.observe(0.0, size=1, mtime=0.0)
     tracker.observe(0.1, size=2, mtime=0.1)
+    tracker.observe(0.2, size=3, mtime=0.2)
     quiet_seconds = tracker.quiet_seconds
 
     tracker.observe(
         5.0,
-        size=3,
+        size=4,
         mtime=5.0,
         content_changed=True,
         learn_interval=False,
     )
 
-    assert tracker.intervals == (0.1,)
+    assert tracker.intervals == (0.1, 0.1)
     assert tracker.quiet_seconds == quiet_seconds
     assert tracker.last_content_event_at == 5.0
 
@@ -102,22 +97,55 @@ def test_fast_copy_learns_without_requiring_high_callback_throughput(observation
     assert len(tracker.intervals) == min(observations, tracker.policy.window_size)
 
 
-def test_rate_changes_grow_immediately_and_forget_long_pause_after_four_fast_writes():
-    """Exercise both directions without the removed shrink gate or smoothing."""
+def test_pause_is_excluded_but_repeated_slow_cadence_is_learned_then_fast_writes_shrink():
+    """An isolated pause and a sustained slow writer require different predictions."""
     tracker = AdaptiveQuietTracker(AdaptiveQuietPolicy())
     tracker.observe(0.0, size=1, mtime=0.0)
-    tracker.observe(20.0, size=2, mtime=20.0)
+    tracker.observe(0.1, size=2, mtime=0.1)
+    tracker.observe(0.2, size=3, mtime=0.2)
+    fast = tracker.quiet_seconds
+    tracker.observe(300.2, size=4, mtime=300.2)
+    assert tracker.quiet_seconds == fast
+    tracker.observe(300.3, size=5, mtime=300.3)
+    assert tracker.quiet_seconds < 0.15
+    tracker.observe(600.3, size=6, mtime=600.3)
+    assert tracker.quiet_seconds < 0.15
+    tracker.observe(900.3, size=7, mtime=900.3)
     learned = tracker.quiet_seconds
-    assert learned > 20.0
+    assert learned > 300.0
     for index in range(1, 5):
-        now = 20.0 + 0.1 * index
-        tracker.observe(now, size=index + 2, mtime=now)
+        now = 900.3 + 0.1 * index
+        tracker.observe(now, size=index + 7, mtime=now)
         if index < 4:
             assert tracker.quiet_seconds == learned
         else:
             assert 0.1 < tracker.quiet_seconds < 0.15
-    tracker.observe(320.4, size=7, mtime=320.4)
-    assert tracker.quiet_seconds > 300.0
+
+
+def test_truncation_starts_a_new_phase_and_boundary_probe_breaks_confirmation():
+    tracker = AdaptiveQuietTracker(AdaptiveQuietPolicy())
+    for now, size in ((0.0, 10), (0.1, 11), (0.2, 12)):
+        tracker.observe(now, size=size, mtime=now)
+    tracker.observe(300.2, size=13, mtime=300.2)
+    tracker.observe(400.2, size=14, mtime=400.2, learn_interval=False)
+    tracker.observe(700.2, size=15, mtime=700.2)
+    assert tracker.quiet_seconds < 0.15
+    tracker.observe(700.3, size=1, mtime=700.3)
+    assert tracker.quiet_seconds == tracker.cadence_seconds == tracker.pending_interval_seconds == 0.0
+    assert tracker.intervals == ()
+
+
+def test_close_summary_ends_frequency_sampling_without_claiming_file_completion():
+    tracker = AdaptiveQuietTracker(AdaptiveQuietPolicy())
+    for now, size in ((0.0, 1), (0.1, 2), (0.2, 3)):
+        tracker.observe(now, size=size, mtime=now)
+    learned = tracker.quiet_seconds
+    tracker.observe(0.3, size=3, mtime=0.2, change_usn=4, content_changed=False, phase_boundary=True)
+    assert tracker.last_content_event_at is None
+    tracker.observe(300.3, size=4, mtime=300.3)
+    assert tracker.quiet_seconds == learned and tracker.pending_interval_seconds == 0.0
+    tracker.observe(300.4, size=5, mtime=300.4)
+    assert tracker.quiet_seconds < 0.15
 
 
 @pytest.mark.parametrize("scenario", representative_write_scenarios())

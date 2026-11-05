@@ -77,6 +77,10 @@ pub(crate) struct NativeWatchObservation {
     #[pyo3(get)]
     pub quiet_seconds: f64,
     #[pyo3(get)]
+    pub cadence_seconds: f64,
+    #[pyo3(get)]
+    pub pending_interval_seconds: f64,
+    #[pyo3(get)]
     pub last_content_event_at: Option<f64>,
 }
 
@@ -96,6 +100,8 @@ impl NativeWatchObservation {
             file_id: FileId::new(file_id),
             change_usn,
             quiet_seconds: 0.0,
+            cadence_seconds: 0.0,
+            pending_interval_seconds: 0.0,
             last_content_event_at: None,
         }
     }
@@ -118,7 +124,7 @@ pub(super) struct CatalogRow {
 }
 
 impl CatalogRow {
-    pub fn remember_observation(&mut self, size: u64, mtime: f64, file_id: &str, change_usn: i64) {
+    pub fn remember_observation(&mut self, size: u64, mtime: f64, file_id: &str, change_usn: i64, phase_boundary: bool) {
         let unchanged = self.observation.as_ref().is_some_and(|old| {
             old.size == size
                 && old.mtime == mtime
@@ -135,6 +141,12 @@ impl CatalogRow {
             self.observation = Some(Box::new(NativeWatchObservation::new(
                 size, mtime, file_id, change_usn,
             )));
+        }
+        if phase_boundary {
+            if let Some(observation) = self.observation.as_mut() {
+                observation.last_content_event_at = None;
+                observation.pending_interval_seconds = 0.0;
+            }
         }
     }
     pub fn path(&self) -> String {

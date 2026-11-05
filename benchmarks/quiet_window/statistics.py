@@ -5,12 +5,12 @@ import random
 import statistics
 
 
-EVALUATION_CONTRACT = "sunpack.quiet-window/4"
+EVALUATION_CONTRACT = "sunpack.quiet-window/5"
 
 METRICS = ("false_ready_file_rate", "premature_proposals_per_file", "censored_complete_rate",
            "invalid_proposals_per_file",
            "censored_usable_rate",
-           "mean_complete_arrival_to_valid_proposal_seconds", "censored_valid_proposal_rate",
+           "mean_ready_to_valid_proposal_seconds", "censored_valid_proposal_rate",
            "mean_detection_latency_seconds", "busy_proposals_per_file", "early_group_proposals_per_file",
            "premature_exposure_seconds_per_file", "within_50ms", "within_500ms", "within_2s", "within_10s", "within_60s")
 METRICS += ("valid_within_50ms", "valid_within_500ms", "valid_within_2s", "valid_within_10s", "valid_within_60s")
@@ -30,14 +30,14 @@ def summarize_files(files: list[dict]) -> dict:
     total = len(files)
     completed = [file for file in files if file["completed"]]
     latencies = [file["first_detection_latency"] for file in completed if file["first_detection_latency"] is not None]
-    arrived = [file for file in files if file["complete_arrival_at"] is not None]
-    valid_latencies = [file["complete_arrival_to_valid_proposal_seconds"] for file in arrived
-                       if file["complete_arrival_to_valid_proposal_seconds"] is not None]
+    arrived = [file for file in files if file["processing_ready_at"] is not None]
+    valid_latencies = [file["ready_to_valid_proposal_seconds"] for file in arrived
+                       if file["ready_to_valid_proposal_seconds"] is not None]
     result = {
         "files": total, "completed_files": len(completed), "detected_complete_files": len(latencies),
         "complete_arrival_files": len(arrived), "valid_proposal_files": len(valid_latencies),
         "ineligible_valid_proposal_files": total - len(arrived),
-        "mean_complete_arrival_to_valid_proposal_seconds": statistics.mean(valid_latencies) if valid_latencies else None,
+        "mean_ready_to_valid_proposal_seconds": statistics.mean(valid_latencies) if valid_latencies else None,
         "censored_valid_proposal_rate": 1 - len(valid_latencies) / len(arrived) if arrived else None,
         "false_ready_file_rate": sum(file["premature"] > 0 for file in files) / total,
         "premature_proposals_per_file": sum(file["premature"] for file in files) / total,

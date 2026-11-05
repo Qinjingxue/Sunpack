@@ -23,7 +23,7 @@ class AdaptiveEstimator:
     def observe(self, event: Observation) -> float:
         return self.tracker.observe(event.at, size=event.size, mtime=event.mtime,
                                     change_usn=event.usn, content_changed=event.content_changed,
-                                    learn_interval=event.learn_interval)
+                                    learn_interval=event.learn_interval, phase_boundary=event.phase_boundary)
 
 
 class FixedEstimator:
@@ -121,8 +121,8 @@ def add_valid_proposal_latency(files: list[dict], boundaries: dict) -> None:
     for file in files:
         arrived, ready = boundaries[file["key"]]
         first = next((at for at in file["proposal_times"] if ready is not None and at >= ready), None)
-        file.update(complete_arrival_at=arrived, first_valid_proposal_at=first,
-                    complete_arrival_to_valid_proposal_seconds=None if first is None else first - arrived,
+        file.update(complete_arrival_at=arrived, processing_ready_at=ready, first_valid_proposal_at=first,
+                    ready_to_valid_proposal_seconds=None if first is None else first - ready,
                     invalid_proposals=sum(ready is None or at < ready for at in file["proposal_times"]))
 
 

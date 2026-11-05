@@ -1,0 +1,1218 @@
+{
+  "evaluation": {
+    "contract": "sunpack.quiet-scheduler/3",
+    "trace_contract": "sunpack.writer-behaviour/2",
+    "algorithms": [
+      "adaptive"
+    ],
+    "channels": [
+      "immediate",
+      "batched",
+      "noisy",
+      "lossy_reconciled"
+    ],
+    "families": [
+      "segmented_preallocated",
+      "segmented_sparse",
+      "segmented_straggler",
+      "segmented_work_stealing",
+      "segmented_retry_overlap",
+      "segmented_resume",
+      "segmented_restart",
+      "segmented_finalize_rename",
+      "torrent_rarest_first",
+      "torrent_recheck_repair",
+      "cached_piece_writeback",
+      "fragment_assembly",
+      "sync_reused_blocks",
+      "sync_inplace_delta",
+      "copy_restartable",
+      "copy_restart_from_zero",
+      "close_reopen_batches",
+      "shared_handle_tail",
+      "exclusive_commit_tail",
+      "archive_directory_last",
+      "archive_header_backpatch",
+      "multipart_serial",
+      "multipart_parallel",
+      "multipart_late_volume",
+      "mapped_page_batches",
+      "cloud_hydration",
+      "cancelled_holes",
+      "paused_holes"
+    ],
+    "runner_source_xxh128": "74cbdfcef1d493eaefa897645de91969",
+    "tie_orders": [
+      "observation_first",
+      "timer_first"
+    ],
+    "slo_resolution_nanoseconds": 1,
+    "proposal_semantics": "production-enqueue-pop-ready-boundary-confirmation-instant-retirement",
+    "weighting": "equal-family-then-equal-channel-width-tie-within-seed",
+    "scope": "production-admission-with-virtual-metadata-readiness-clock-and-memory-only-wal;not-extraction",
+    "valid_proposal_latency": "complete-visible-readable-and-split-ready-to-first-valid-proposal;exclusive-handle-wait-excluded",
+    "metric_contract": "sunpack.quiet-window/5",
+    "scoring_unit": "single-file-or-complete-split-input;any-member-admission",
+    "busy_timer_coalescing": "skip-state-invariant-busy-timers-preserving-cadence-until-same-path-change-delivery-or-unlock;probe-cpu-not-modelled",
+    "boundary_confirmation_seconds": 0.5,
+    "evaluator_sources_xxh128": {
+      "corpus.py": "e6b3cb42a68c90991815a4714206c790",
+      "writers.py": "d61c6dfb88c322c73ca72d281afb5723",
+      "replay.py": "8bd3a8f96aa45084c6631428320c1ded",
+      "statistics.py": "c0f39f19c7e4cb6a826ac37f6efe723f",
+      "scheduler_replay.py": "75581299683f176f6f182fa4192ba5a8"
+    },
+    "production_sources_xxh128": {
+      "scheduler.py": "b9cca0b9c0d39e850baed9b1fd669f9e",
+      "state.py": "a0c4705591785329c62c8bc641d1d3c2",
+      "catalog.rs": "50692a9f67c66f2895ec000432a15a03",
+      "directory.rs": "0d0b7c04cd490d1083ded16862a75292"
+    },
+    "corpus_xxh128": "f122a8003060bcedcd46a134b607ebbd"
+  },
+  "counts": {
+    "traces": 3648,
+    "files": 38112,
+    "observations": 4264624,
+    "complete_arrival_files": 37920,
+    "ineligible_valid_proposal_files": 192
+  },
+  "complete_processing_ready_inputs_per_split_without_tie_duplicates": 10624,
+  "missing_inputs_without_tie_duplicates": {
+    "baseline": {
+      "development": 12,
+      "validation": 15,
+      "heldout": 18
+    },
+    "candidate": {
+      "development": 0,
+      "validation": 0,
+      "heldout": 0
+    }
+  },
+  "by_split": {
+    "development": {
+      "baseline": {
+        "mean_ready_to_valid_proposal_seconds": {
+          "mean": 108.95998939646122,
+          "ci95": [
+            71.44844235069972,
+            145.1814300621234
+          ],
+          "independent_seed_blocks": 8
+        },
+        "invalid_proposals_per_file": {
+          "mean": 3.2178548177083335,
+          "ci95": [
+            3.1140909830729164,
+            3.309586007254464
+          ],
+          "independent_seed_blocks": 8
+        },
+        "censored_valid_proposal_rate": {
+          "mean": 0.014423076923076924,
+          "ci95": [
+            0.004807692307692308,
+            0.025240384615384616
+          ],
+          "independent_seed_blocks": 8
+        },
+        "valid_within_50ms": {
+          "mean": 0.28297150440705127,
+          "ci95": [
+            0.25441299829727565,
+            0.31261361929086534
+          ],
+          "independent_seed_blocks": 8
+        },
+        "valid_within_500ms": {
+          "mean": 0.5390249399038461,
+          "ci95": [
+            0.5104518792568109,
+            0.568685052333734
+          ],
+          "independent_seed_blocks": 8
+        },
+        "valid_within_2s": {
+          "mean": 0.728183844150641,
+          "ci95": [
+            0.7007962740384616,
+            0.7503591684194711
+          ],
+          "independent_seed_blocks": 8
+        },
+        "valid_within_10s": {
+          "mean": 0.8307917668269231,
+          "ci95": [
+            0.8025966546474359,
+            0.8605938251201922
+          ],
+          "independent_seed_blocks": 8
+        },
+        "valid_within_60s": {
+          "mean": 0.8938802083333334,
+          "ci95": [
+            0.8682803422976764,
+            0.9186412322215545
+          ],
+          "independent_seed_blocks": 8
+        }
+      },
+      "candidate": {
+        "mean_ready_to_valid_proposal_seconds": {
+          "mean": 1.413705691552518,
+          "ci95": [
+            0.9626966492240638,
+            1.9138188765791164
+          ],
+          "independent_seed_blocks": 8
+        },
+        "invalid_proposals_per_file": {
+          "mean": 5.083676292782738,
+          "ci95": [
+            4.879521106538318,
+            5.294677734375
+          ],
+          "independent_seed_blocks": 8
+        },
+        "censored_valid_proposal_rate": {
+          "mean": 0.0,
+          "ci95": [
+            0.0,
+            0.0
+          ],
+          "independent_seed_blocks": 8
+        },
+        "valid_within_50ms": {
+          "mean": 0.35201322115384615,
+          "ci95": [
+            0.305584716796875,
+            0.39867381560496795
+          ],
+          "independent_seed_blocks": 8
+        },
+        "valid_within_500ms": {
+          "mean": 0.7090907952724359,
+          "ci95": [
+            0.663749499198718,
+            0.7541524251302083
+          ],
+          "independent_seed_blocks": 8
+        },
+        "valid_within_2s": {
+          "mean": 0.9066944611378205,
+          "ci95": [
+            0.8940492287660257,
+            0.9230393629807693
+          ],
+          "independent_seed_blocks": 8
+        },
+        "valid_within_10s": {
+          "mean": 0.9685934995993589,
+          "ci95": [
+            0.9532802483974359,
+            0.9823719513721955
+          ],
+          "independent_seed_blocks": 8
+        },
+        "valid_within_60s": {
+          "mean": 0.9977526542467949,
+          "ci95": [
+            0.9952674278846154,
+            0.9994991987179487
+          ],
+          "independent_seed_blocks": 8
+        }
+      },
+      "paired_difference": {
+        "false_ready_file_rate": {
+          "mean": 5.812872023808202e-06,
+          "ci95": [
+            0.0,
+            1.7438616071424606e-05
+          ],
+          "independent_seed_blocks": 8
+        },
+        "premature_proposals_per_file": {
+          "mean": 1.8658214750744047,
+          "ci95": [
+            1.7173495338076636,
+            2.051845005580357
+          ],
+          "independent_seed_blocks": 8
+        },
+        "censored_complete_rate": {
+          "mean": -0.014423076923076924,
+          "ci95": [
+            -0.025240384615384616,
+            -0.004807692307692308
+          ],
+          "independent_seed_blocks": 8
+        },
+        "invalid_proposals_per_file": {
+          "mean": 1.8658214750744047,
+          "ci95": [
+            1.7173495338076636,
+            2.051845005580357
+          ],
+          "independent_seed_blocks": 8
+        },
+        "censored_usable_rate": {
+          "mean": -0.014423076923076924,
+          "ci95": [
+            -0.025240384615384616,
+            -0.004807692307692308
+          ],
+          "independent_seed_blocks": 8
+        },
+        "mean_ready_to_valid_proposal_seconds": {
+          "mean": -107.5462837049087,
+          "ci95": [
+            -143.39376865988197,
+            -70.2398552886029
+          ],
+          "independent_seed_blocks": 8
+        },
+        "censored_valid_proposal_rate": {
+          "mean": -0.014423076923076924,
+          "ci95": [
+            -0.025240384615384616,
+            -0.004807692307692308
+          ],
+          "independent_seed_blocks": 8
+        },
+        "mean_detection_latency_seconds": {
+          "mean": -108.92278952407368,
+          "ci95": [
+            -144.62138087020116,
+            -70.96713320955571
+          ],
+          "independent_seed_blocks": 8
+        },
+        "busy_proposals_per_file": {
+          "mean": 0.0,
+          "ci95": [
+            0.0,
+            0.0
+          ],
+          "independent_seed_blocks": 8
+        },
+        "early_group_proposals_per_file": {
+          "mean": 1.8658214750744047,
+          "ci95": [
+            1.7173495338076636,
+            2.051845005580357
+          ],
+          "independent_seed_blocks": 8
+        },
+        "premature_exposure_seconds_per_file": {
+          "mean": 16.259745431143088,
+          "ci95": [
+            9.504897098969389,
+            24.166003210031768
+          ],
+          "independent_seed_blocks": 8
+        },
+        "within_50ms": {
+          "mean": 0.06903545673076923,
+          "ci95": [
+            0.04934504582331731,
+            0.08759640424679487
+          ],
+          "independent_seed_blocks": 8
+        },
+        "within_500ms": {
+          "mean": 0.17007837540064105,
+          "ci95": [
+            0.14176197541065708,
+            0.20002676156850965
+          ],
+          "independent_seed_blocks": 8
+        },
+        "within_2s": {
+          "mean": 0.17851061698717952,
+          "ci95": [
+            0.15138596754807693,
+            0.2109371869991987
+          ],
+          "independent_seed_blocks": 8
+        },
+        "within_10s": {
+          "mean": 0.1378017327724359,
+          "ci95": [
+            0.11009505834334932,
+            0.1679432404346955
+          ],
+          "independent_seed_blocks": 8
+        },
+        "within_60s": {
+          "mean": 0.10387244591346152,
+          "ci95": [
+            0.07893848908253204,
+            0.1299086350661057
+          ],
+          "independent_seed_blocks": 8
+        },
+        "valid_within_50ms": {
+          "mean": 0.06904171674679488,
+          "ci95": [
+            0.049357409354967956,
+            0.08760266426282053
+          ],
+          "independent_seed_blocks": 8
+        },
+        "valid_within_500ms": {
+          "mean": 0.17006585536858976,
+          "ci95": [
+            0.14175555889423078,
+            0.2000206580528846
+          ],
+          "independent_seed_blocks": 8
+        },
+        "valid_within_2s": {
+          "mean": 0.1785106169871795,
+          "ci95": [
+            0.15138596754807693,
+            0.21093718699919867
+          ],
+          "independent_seed_blocks": 8
+        },
+        "valid_within_10s": {
+          "mean": 0.13780173277243588,
+          "ci95": [
+            0.11009505834334936,
+            0.1679432404346955
+          ],
+          "independent_seed_blocks": 8
+        },
+        "valid_within_60s": {
+          "mean": 0.10387244591346152,
+          "ci95": [
+            0.07893848908253202,
+            0.12990863506610573
+          ],
+          "independent_seed_blocks": 8
+        }
+      }
+    },
+    "validation": {
+      "baseline": {
+        "mean_ready_to_valid_proposal_seconds": {
+          "mean": 137.23018440741174,
+          "ci95": [
+            116.07610519552519,
+            153.39661226514974
+          ],
+          "independent_seed_blocks": 8
+        },
+        "invalid_proposals_per_file": {
+          "mean": 3.268949962797619,
+          "ci95": [
+            3.2191715785435266,
+            3.3172738211495534
+          ],
+          "independent_seed_blocks": 8
+        },
+        "censored_valid_proposal_rate": {
+          "mean": 0.018028846153846156,
+          "ci95": [
+            0.003605769230769231,
+            0.037259615384615384
+          ],
+          "independent_seed_blocks": 8
+        },
+        "valid_within_50ms": {
+          "mean": 0.2883926782852564,
+          "ci95": [
+            0.27778680263421474,
+            0.2998798076923077
+          ],
+          "independent_seed_blocks": 8
+        },
+        "valid_within_500ms": {
+          "mean": 0.5665877904647436,
+          "ci95": [
+            0.5478910006009615,
+            0.5880164513221153
+          ],
+          "independent_seed_blocks": 8
+        },
+        "valid_within_2s": {
+          "mean": 0.7191318609775641,
+          "ci95": [
+            0.7031059069511217,
+            0.7370247082832532
+          ],
+          "independent_seed_blocks": 8
+        },
+        "valid_within_10s": {
+          "mean": 0.8087815504807693,
+          "ci95": [
+            0.7865304800180288,
+            0.8298047188000801
+          ],
+          "independent_seed_blocks": 8
+        },
+        "valid_within_60s": {
+          "mean": 0.8877954727564102,
+          "ci95": [
+            0.8751751239483173,
+            0.9002604166666667
+          ],
+          "independent_seed_blocks": 8
+        }
+      },
+      "candidate": {
+        "mean_ready_to_valid_proposal_seconds": {
+          "mean": 1.287218330240625,
+          "ci95": [
+            0.6933392183693409,
+            2.023698272850312
+          ],
+          "independent_seed_blocks": 8
+        },
+        "invalid_proposals_per_file": {
+          "mean": 5.3495977492559526,
+          "ci95": [
+            5.296005103701637,
+            5.401986113048735
+          ],
+          "independent_seed_blocks": 8
+        },
+        "censored_valid_proposal_rate": {
+          "mean": 0.0,
+          "ci95": [
+            0.0,
+            0.0
+          ],
+          "independent_seed_blocks": 8
+        },
+        "valid_within_50ms": {
+          "mean": 0.36660531850961536,
+          "ci95": [
+            0.3511363494090545,
+            0.38248165815304486
+          ],
+          "independent_seed_blocks": 8
+        },
+        "valid_within_500ms": {
+          "mean": 0.7579314403044872,
+          "ci95": [
+            0.7303617037259615,
+            0.7861218574719552
+          ],
+          "independent_seed_blocks": 8
+        },
+        "valid_within_2s": {
+          "mean": 0.922588641826923,
+          "ci95": [
+            0.9101025703625801,
+            0.9381427471454327
+          ],
+          "independent_seed_blocks": 8
+        },
+        "valid_within_10s": {
+          "mean": 0.9774576822916666,
+          "ci95": [
+            0.9628527519030449,
+            0.9908794696514424
+          ],
+          "independent_seed_blocks": 8
+        },
+        "valid_within_60s": {
+          "mean": 0.996895032051282,
+          "ci95": [
+            0.9932077261117789,
+            0.9994929387019231
+          ],
+          "independent_seed_blocks": 8
+        }
+      },
+      "paired_difference": {
+        "false_ready_file_rate": {
+          "mean": 0.0,
+          "ci95": [
+            0.0,
+            0.0
+          ],
+          "independent_seed_blocks": 8
+        },
+        "premature_proposals_per_file": {
+          "mean": 2.0806477864583335,
+          "ci95": [
+            2.01487063453311,
+            2.1426751999627975
+          ],
+          "independent_seed_blocks": 8
+        },
+        "censored_complete_rate": {
+          "mean": -0.018028846153846156,
+          "ci95": [
+            -0.037259615384615384,
+            -0.003605769230769231
+          ],
+          "independent_seed_blocks": 8
+        },
+        "invalid_proposals_per_file": {
+          "mean": 2.0806477864583335,
+          "ci95": [
+            2.01487063453311,
+            2.1426751999627975
+          ],
+          "independent_seed_blocks": 8
+        },
+        "censored_usable_rate": {
+          "mean": -0.018028846153846156,
+          "ci95": [
+            -0.037259615384615384,
+            -0.003605769230769231
+          ],
+          "independent_seed_blocks": 8
+        },
+        "mean_ready_to_valid_proposal_seconds": {
+          "mean": -135.94296607717112,
+          "ci95": [
+            -152.2896022957645,
+            -114.7258155579898
+          ],
+          "independent_seed_blocks": 8
+        },
+        "censored_valid_proposal_rate": {
+          "mean": -0.018028846153846156,
+          "ci95": [
+            -0.037259615384615384,
+            -0.003605769230769231
+          ],
+          "independent_seed_blocks": 8
+        },
+        "mean_detection_latency_seconds": {
+          "mean": -136.52785902569175,
+          "ci95": [
+            -152.82451496961053,
+            -115.31473056211986
+          ],
+          "independent_seed_blocks": 8
+        },
+        "busy_proposals_per_file": {
+          "mean": 0.0,
+          "ci95": [
+            0.0,
+            0.0
+          ],
+          "independent_seed_blocks": 8
+        },
+        "early_group_proposals_per_file": {
+          "mean": 2.0806477864583335,
+          "ci95": [
+            2.01487063453311,
+            2.1426751999627975
+          ],
+          "independent_seed_blocks": 8
+        },
+        "premature_exposure_seconds_per_file": {
+          "mean": 8.444427522892674,
+          "ci95": [
+            4.816713926530458,
+            13.545467104319842
+          ],
+          "independent_seed_blocks": 8
+        },
+        "within_50ms": {
+          "mean": 0.07820638020833334,
+          "ci95": [
+            0.06908553685897437,
+            0.08767887995793269
+          ],
+          "independent_seed_blocks": 8
+        },
+        "within_500ms": {
+          "mean": 0.19134364983974358,
+          "ci95": [
+            0.16877347506009613,
+            0.21575786884014422
+          ],
+          "independent_seed_blocks": 8
+        },
+        "within_2s": {
+          "mean": 0.20345678084935898,
+          "ci95": [
+            0.1813958583733974,
+            0.2268513997395833
+          ],
+          "independent_seed_blocks": 8
+        },
+        "within_10s": {
+          "mean": 0.16868239182692307,
+          "ci95": [
+            0.15060330904447114,
+            0.18566706730769234
+          ],
+          "independent_seed_blocks": 8
+        },
+        "within_60s": {
+          "mean": 0.10909955929487179,
+          "ci95": [
+            0.09736062074318912,
+            0.12161473983373398
+          ],
+          "independent_seed_blocks": 8
+        },
+        "valid_within_50ms": {
+          "mean": 0.07821264022435898,
+          "ci95": [
+            0.06908553685897437,
+            0.08768498347355769
+          ],
+          "independent_seed_blocks": 8
+        },
+        "valid_within_500ms": {
+          "mean": 0.19134364983974358,
+          "ci95": [
+            0.16877347506009618,
+            0.21575786884014425
+          ],
+          "independent_seed_blocks": 8
+        },
+        "valid_within_2s": {
+          "mean": 0.20345678084935898,
+          "ci95": [
+            0.18139585837339742,
+            0.2268513997395833
+          ],
+          "independent_seed_blocks": 8
+        },
+        "valid_within_10s": {
+          "mean": 0.1686761318108974,
+          "ci95": [
+            0.1506033090444711,
+            0.18564860026041669
+          ],
+          "independent_seed_blocks": 8
+        },
+        "valid_within_60s": {
+          "mean": 0.1090995592948718,
+          "ci95": [
+            0.09736062074318913,
+            0.121614739833734
+          ],
+          "independent_seed_blocks": 8
+        }
+      }
+    },
+    "heldout": {
+      "baseline": {
+        "mean_ready_to_valid_proposal_seconds": {
+          "mean": 89.61335908536564,
+          "ci95": [
+            56.216139907732014,
+            128.80967407175982
+          ],
+          "independent_seed_blocks": 8
+        },
+        "invalid_proposals_per_file": {
+          "mean": 3.0672607421875,
+          "ci95": [
+            2.951807657877604,
+            3.1814153762090776
+          ],
+          "independent_seed_blocks": 8
+        },
+        "censored_valid_proposal_rate": {
+          "mean": 0.021634615384615384,
+          "ci95": [
+            0.004807692307692308,
+            0.040865384615384616
+          ],
+          "independent_seed_blocks": 8
+        },
+        "valid_within_50ms": {
+          "mean": 0.28867437900641024,
+          "ci95": [
+            0.2630896935096154,
+            0.31138884715544873
+          ],
+          "independent_seed_blocks": 8
+        },
+        "valid_within_500ms": {
+          "mean": 0.5610226362179487,
+          "ci95": [
+            0.5365013709435096,
+            0.5846926958133013
+          ],
+          "independent_seed_blocks": 8
+        },
+        "valid_within_2s": {
+          "mean": 0.7467322716346153,
+          "ci95": [
+            0.7234888321314102,
+            0.7729553222656249
+          ],
+          "independent_seed_blocks": 8
+        },
+        "valid_within_10s": {
+          "mean": 0.8420660556891025,
+          "ci95": [
+            0.8153592623197116,
+            0.8663732284154646
+          ],
+          "independent_seed_blocks": 8
+        },
+        "valid_within_60s": {
+          "mean": 0.892891125801282,
+          "ci95": [
+            0.8740860376602564,
+            0.9119222005208333
+          ],
+          "independent_seed_blocks": 8
+        }
+      },
+      "candidate": {
+        "mean_ready_to_valid_proposal_seconds": {
+          "mean": 0.7589651421587137,
+          "ci95": [
+            0.6164857972381443,
+            0.9291079407373312
+          ],
+          "independent_seed_blocks": 8
+        },
+        "invalid_proposals_per_file": {
+          "mean": 5.100120907738095,
+          "ci95": [
+            4.911434209914435,
+            5.289614722842261
+          ],
+          "independent_seed_blocks": 8
+        },
+        "censored_valid_proposal_rate": {
+          "mean": 0.0,
+          "ci95": [
+            0.0,
+            0.0
+          ],
+          "independent_seed_blocks": 8
+        },
+        "valid_within_50ms": {
+          "mean": 0.3553748497596154,
+          "ci95": [
+            0.3188116611578526,
+            0.39262084960937493
+          ],
+          "independent_seed_blocks": 8
+        },
+        "valid_within_500ms": {
+          "mean": 0.75390625,
+          "ci95": [
+            0.7279620830829328,
+            0.7836541591546474
+          ],
+          "independent_seed_blocks": 8
+        },
+        "valid_within_2s": {
+          "mean": 0.9352902143429487,
+          "ci95": [
+            0.9108285757211538,
+            0.9573390862880609
+          ],
+          "independent_seed_blocks": 8
+        },
+        "valid_within_10s": {
+          "mean": 0.9873234675480769,
+          "ci95": [
+            0.9809814453125,
+            0.9924757737379808
+          ],
+          "independent_seed_blocks": 8
+        },
+        "valid_within_60s": {
+          "mean": 0.9995743189102564,
+          "ci95": [
+            0.9994553786057693,
+            0.9996995192307693
+          ],
+          "independent_seed_blocks": 8
+        }
+      },
+      "paired_difference": {
+        "false_ready_file_rate": {
+          "mean": 1.1625744047616404e-05,
+          "ci95": [
+            0.0,
+            2.325148809523281e-05
+          ],
+          "independent_seed_blocks": 8
+        },
+        "premature_proposals_per_file": {
+          "mean": 2.0328601655505953,
+          "ci95": [
+            1.9387148902529763,
+            2.142333984375
+          ],
+          "independent_seed_blocks": 8
+        },
+        "censored_complete_rate": {
+          "mean": -0.021634615384615384,
+          "ci95": [
+            -0.040865384615384616,
+            -0.004807692307692308
+          ],
+          "independent_seed_blocks": 8
+        },
+        "invalid_proposals_per_file": {
+          "mean": 2.0328601655505953,
+          "ci95": [
+            1.9387148902529763,
+            2.142333984375
+          ],
+          "independent_seed_blocks": 8
+        },
+        "censored_usable_rate": {
+          "mean": -0.021634615384615384,
+          "ci95": [
+            -0.040865384615384616,
+            -0.004807692307692308
+          ],
+          "independent_seed_blocks": 8
+        },
+        "mean_ready_to_valid_proposal_seconds": {
+          "mean": -88.85439394320693,
+          "ci95": [
+            -128.11164148011233,
+            -55.404684418728344
+          ],
+          "independent_seed_blocks": 8
+        },
+        "censored_valid_proposal_rate": {
+          "mean": -0.021634615384615384,
+          "ci95": [
+            -0.040865384615384616,
+            -0.004807692307692308
+          ],
+          "independent_seed_blocks": 8
+        },
+        "mean_detection_latency_seconds": {
+          "mean": -90.43338587146799,
+          "ci95": [
+            -129.65109047861964,
+            -56.2993701557007
+          ],
+          "independent_seed_blocks": 8
+        },
+        "busy_proposals_per_file": {
+          "mean": 0.0,
+          "ci95": [
+            0.0,
+            0.0
+          ],
+          "independent_seed_blocks": 8
+        },
+        "early_group_proposals_per_file": {
+          "mean": 2.0328601655505953,
+          "ci95": [
+            1.9387148902529763,
+            2.142333984375
+          ],
+          "independent_seed_blocks": 8
+        },
+        "premature_exposure_seconds_per_file": {
+          "mean": 9.631286118553987,
+          "ci95": [
+            5.582624920695631,
+            14.701014882932313
+          ],
+          "independent_seed_blocks": 8
+        },
+        "within_50ms": {
+          "mean": 0.06669421073717949,
+          "ci95": [
+            0.046232252854567314,
+            0.08491289187700318
+          ],
+          "independent_seed_blocks": 8
+        },
+        "within_500ms": {
+          "mean": 0.1928836137820513,
+          "ci95": [
+            0.17484553410456735,
+            0.20876527443910253
+          ],
+          "independent_seed_blocks": 8
+        },
+        "within_2s": {
+          "mean": 0.18855794270833337,
+          "ci95": [
+            0.16696182642227567,
+            0.21085658929286863
+          ],
+          "independent_seed_blocks": 8
+        },
+        "within_10s": {
+          "mean": 0.1452574118589744,
+          "ci95": [
+            0.12305736052684296,
+            0.1677659254807692
+          ],
+          "independent_seed_blocks": 8
+        },
+        "within_60s": {
+          "mean": 0.10668319310897438,
+          "ci95": [
+            0.08768294896834936,
+            0.12549454126602566
+          ],
+          "independent_seed_blocks": 8
+        },
+        "valid_within_50ms": {
+          "mean": 0.06670047075320512,
+          "ci95": [
+            0.0462322528545673,
+            0.08493135892427882
+          ],
+          "independent_seed_blocks": 8
+        },
+        "valid_within_500ms": {
+          "mean": 0.1928836137820513,
+          "ci95": [
+            0.17484553410456732,
+            0.2087652744391026
+          ],
+          "independent_seed_blocks": 8
+        },
+        "valid_within_2s": {
+          "mean": 0.18855794270833337,
+          "ci95": [
+            0.16696182642227567,
+            0.21085658929286863
+          ],
+          "independent_seed_blocks": 8
+        },
+        "valid_within_10s": {
+          "mean": 0.14525741185897437,
+          "ci95": [
+            0.12305736052684296,
+            0.16776592548076916
+          ],
+          "independent_seed_blocks": 8
+        },
+        "valid_within_60s": {
+          "mean": 0.10668319310897438,
+          "ci95": [
+            0.08768294896834937,
+            0.12549454126602566
+          ],
+          "independent_seed_blocks": 8
+        }
+      }
+    }
+  },
+  "resources": {
+    "baseline": {
+      "replay_cpu_ns": 906718750000,
+      "observations": 8529248,
+      "metadata_probes": 9158760,
+      "readiness_probes": 522088,
+      "coalesced_busy_timer_runs": 522312,
+      "peak_live_estimators": 64,
+      "complete_arrival_inputs": 63744,
+      "missing_valid_proposal_inputs": 90,
+      "missing_reason:deadline_beyond_horizon": 90
+    },
+    "candidate": {
+      "replay_cpu_ns": 1115421875000,
+      "observations": 8529248,
+      "metadata_probes": 10418278,
+      "readiness_probes": 1596234,
+      "coalesced_busy_timer_runs": 2481128,
+      "peak_live_estimators": 64,
+      "complete_arrival_inputs": 63744,
+      "missing_valid_proposal_inputs": 0
+    }
+  },
+  "estimator_cost": {
+    "parameters": {
+      "source_xxh128": {
+        "baseline": "8870655b3bcbc231e707d2239d51ec87",
+        "candidate": "f3357b254cae401eff6d9d1f25cb9954"
+      },
+      "processes": 7,
+      "minimum_observations": 500000,
+      "live_trackers": 4096,
+      "workload": "development-seed-0/all-complex-writers/immediate/widths-1-and-4",
+      "scope": "tracker-observe-and-construction; allocation measured separately"
+    },
+    "summary": {
+      "baseline": {
+        "cpu_ns_per_observation": 3903.1274980015987,
+        "live_bytes_per_tracker": 1991.3466796875,
+        "peak_traced_bytes": 8157348,
+        "retained_after_release_bytes": 8308
+      },
+      "candidate": {
+        "cpu_ns_per_observation": 3965.5775379696242,
+        "live_bytes_per_tracker": 2006.3349609375,
+        "peak_traced_bytes": 8218740,
+        "retained_after_release_bytes": 7860
+      },
+      "paired_cpu_ratio_median": 1.007936507936508,
+      "paired_cpu_ratio_range": [
+        0.7017543859649124,
+        1.4452554744525548
+      ],
+      "artifacts": "C:\\Users\\29402\\Desktop\\sunpack\\benchmarks\\results\\scheduling.watch-quiet-cost\\20261105T081059Z-b0b22e01"
+    }
+  },
+  "artifacts": {
+    "baseline": "C:\\Users\\29402\\Desktop\\sunpack\\benchmarks\\results\\scheduling.watch-quiet-scheduler\\20261105T081725Z-672446ee",
+    "candidate": "C:\\Users\\29402\\Desktop\\sunpack\\benchmarks\\results\\scheduling.watch-quiet-scheduler\\20261105T081800Z-7bd819e6",
+    "cost": "C:\\Users\\29402\\Desktop\\sunpack\\benchmarks\\results\\scheduling.watch-quiet-cost\\20261105T081059Z-b0b22e01"
+  },
+  "scoring": "actual proposals unchanged; origin = complete + visible + all volumes + production readability projection; no handle-blocked duration",
+  "scoring_provenance": {
+    "method": "same actual proposals; scoring origin changed to processing readiness; no replay",
+    "source_report_xxh128": "d2b9dbbde95c7e65f467d86b93342239",
+    "source_evaluation": {
+      "contract": "sunpack.quiet-scheduler/3",
+      "trace_contract": "sunpack.writer-behaviour/2",
+      "algorithms": [
+        "adaptive"
+      ],
+      "channels": [
+        "immediate",
+        "batched",
+        "noisy",
+        "lossy_reconciled"
+      ],
+      "families": [
+        "segmented_preallocated",
+        "segmented_sparse",
+        "segmented_straggler",
+        "segmented_work_stealing",
+        "segmented_retry_overlap",
+        "segmented_resume",
+        "segmented_restart",
+        "segmented_finalize_rename",
+        "torrent_rarest_first",
+        "torrent_recheck_repair",
+        "cached_piece_writeback",
+        "fragment_assembly",
+        "sync_reused_blocks",
+        "sync_inplace_delta",
+        "copy_restartable",
+        "copy_restart_from_zero",
+        "close_reopen_batches",
+        "shared_handle_tail",
+        "exclusive_commit_tail",
+        "archive_directory_last",
+        "archive_header_backpatch",
+        "multipart_serial",
+        "multipart_parallel",
+        "multipart_late_volume",
+        "mapped_page_batches",
+        "cloud_hydration",
+        "cancelled_holes",
+        "paused_holes"
+      ],
+      "runner_source_xxh128": "17ab37431ed7664dca71ba967ae25c6c",
+      "tie_orders": [
+        "observation_first",
+        "timer_first"
+      ],
+      "slo_resolution_nanoseconds": 1,
+      "proposal_semantics": "production-enqueue-pop-ready-boundary-confirmation-instant-retirement",
+      "weighting": "equal-family-then-equal-channel-width-tie-within-seed",
+      "scope": "production-admission-with-virtual-metadata-readiness-clock-and-memory-only-wal;not-extraction",
+      "valid_proposal_latency": "complete-and-visible-arrival-to-first-readable-proposal;split-group-complete;busy-wait-included",
+      "metric_contract": "sunpack.quiet-window/4",
+      "scoring_unit": "single-file-or-complete-split-input;any-member-admission",
+      "busy_timer_coalescing": "skip-state-invariant-busy-timers-preserving-cadence-until-same-path-change-delivery-or-unlock;probe-cpu-not-modelled",
+      "boundary_confirmation_seconds": 0.5,
+      "evaluator_sources_xxh128": {
+        "corpus.py": "e6b3cb42a68c90991815a4714206c790",
+        "writers.py": "d61c6dfb88c322c73ca72d281afb5723",
+        "replay.py": "279d398ec576d70622230ceeebe771d9",
+        "statistics.py": "a459707895d1b4ef38f3d7b45c90d6a5",
+        "scheduler_replay.py": "f428f17abca16382e17e7c33f4f41522"
+      },
+      "production_sources_xxh128": {
+        "scheduler.py": "b9cca0b9c0d39e850baed9b1fd669f9e",
+        "state.py": "a0c4705591785329c62c8bc641d1d3c2",
+        "catalog.rs": "50692a9f67c66f2895ec000432a15a03",
+        "directory.rs": "0d0b7c04cd490d1083ded16862a75292"
+      },
+      "corpus_xxh128": "f122a8003060bcedcd46a134b607ebbd"
+    },
+    "recorded_outcomes": 7296,
+    "replay_resource_counters": "carried from original dev-profile virtual replay, not scoring CPU or production CPU"
+  },
+  "largest_family_invalid_attempt_ratios": [
+    [
+      3.0,
+      "development",
+      "sync_inplace_delta",
+      1.46875,
+      4.40625
+    ],
+    [
+      2.6826923076923075,
+      "validation",
+      "segmented_restart",
+      3.25,
+      8.71875
+    ],
+    [
+      2.4805194805194803,
+      "heldout",
+      "segmented_work_stealing",
+      2.40625,
+      5.96875
+    ],
+    [
+      2.42,
+      "validation",
+      "sync_inplace_delta",
+      1.5625,
+      3.78125
+    ],
+    [
+      2.3069306930693068,
+      "heldout",
+      "segmented_restart",
+      3.15625,
+      7.28125
+    ],
+    [
+      2.2962962962962963,
+      "heldout",
+      "sync_inplace_delta",
+      1.6875,
+      3.875
+    ],
+    [
+      2.1857142857142855,
+      "development",
+      "segmented_sparse",
+      2.1875,
+      4.78125
+    ],
+    [
+      2.0357142857142856,
+      "development",
+      "segmented_work_stealing",
+      2.625,
+      5.34375
+    ],
+    [
+      2.019607843137255,
+      "heldout",
+      "cloud_hydration",
+      3.1875,
+      6.4375
+    ],
+    [
+      2.0,
+      "development",
+      "shared_handle_tail",
+      1.0625,
+      2.125
+    ]
+  ]
+}

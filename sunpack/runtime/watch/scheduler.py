@@ -70,6 +70,7 @@ from sunpack.runtime.watch.observer import Observer
 USN_REASON_DATA_OVERWRITE = 0x00000001
 USN_REASON_DATA_EXTEND = 0x00000002
 USN_REASON_DATA_TRUNCATION = 0x00000004
+USN_REASON_CLOSE = 0x80000000
 USN_CONTENT_REASON_MASK = (
     USN_REASON_DATA_OVERWRITE
     | USN_REASON_DATA_EXTEND
@@ -1531,12 +1532,15 @@ class WatchScheduler:
                 if state is None:
                     retry_is_unchanged = password_retry or (
                         _crash_recovery and change_kind != _CandidateChangeKind.CONTENT_CHANGED)
-                    active_quiet_seconds = 0.0 if retry_is_unchanged else self._observe_candidate_activity(candidate, now)
+                    active_quiet_seconds = 0.0 if retry_is_unchanged else self._observe_candidate_activity(
+                        candidate, now, new_file=previous is not None and previous.file_id != candidate.file_id)
                     state = self._new_active_state_locked(last_event_at=now, quiet_seconds=active_quiet_seconds)
                     self._active_states[candidate.path] = state
                     became_active = True
                 else:
-                    active_quiet_seconds = self._observe_candidate_activity(candidate, now, content_changed=True)
+                    active_quiet_seconds = self._observe_candidate_activity(
+                        candidate, now, content_changed=True,
+                        new_file=previous is not None and previous.file_id != candidate.file_id)
                     state.last_event_at = now
                     state.quiet_seconds = active_quiet_seconds
                     state.generation += 1
@@ -1982,6 +1986,7 @@ class WatchScheduler:
                 or state.generation != generation
             ):
                 return
+            previous = self._pending.get(path)
             self._store_pending_locked(path, candidate)
             self._remember_observation_locked(candidate)
             state.last_event_at = now
@@ -1990,6 +1995,7 @@ class WatchScheduler:
                 now,
                 content_changed=content_changed,
                 learn_interval=False,
+                new_file=previous is not None and previous.file_id != candidate.file_id,
             )
             state.quiet_seconds = min(learned_quiet_seconds, self.boundary_confirmation_seconds)
             state.generation += 1
@@ -2018,6 +2024,7 @@ class WatchScheduler:
     def _remember_observation_locked(self, candidate: WatchCandidate) -> None:
         self._catalog.remember_observation(
             candidate.path, candidate.size, candidate.mtime, candidate.file_id, candidate.change_usn,
+            phase_boundary=candidate.change_reasons_known and bool(candidate.change_reasons & USN_REASON_CLOSE),
         )
 
     def _retire_quiet_tracker(self, path: str) -> None:
@@ -2031,6 +2038,8 @@ class WatchScheduler:
                 path,
                 quiet_seconds=tracker.quiet_seconds if tracker is not None else None,
                 last_content_event_at=tracker.last_content_event_at if tracker is not None else None,
+                cadence_seconds=tracker.cadence_seconds if tracker is not None else 0.0,
+                pending_interval_seconds=tracker.pending_interval_seconds if tracker is not None else 0.0,
             )
             if not self._quiet_trackers:
                 self._quiet_trackers.clear()
@@ -2058,18 +2067,23 @@ class WatchScheduler:
         *,
         content_changed: bool | None = None,
         learn_interval: bool = True,
+        new_file: bool = False,
     ) -> float:
+        if new_file:
+            self._quiet_trackers.pop(candidate.path, None)
         tracker = self._quiet_trackers.get(candidate.path)
         if tracker is None:
             tracker = AdaptiveQuietTracker(self._quiet_policy)
             observation = self._catalog.observation(candidate.path)
-            if observation is not None:
+            if observation is not None and not new_file and observation.file_id == candidate.file_id:
                 if observation.quiet_seconds > 0.0:
                     tracker.quiet_seconds = observation.quiet_seconds
                 tracker.last_content_event_at = observation.last_content_event_at
                 tracker.last_size = observation.size
                 tracker.last_mtime = observation.mtime
                 tracker.last_change_usn = observation.change_usn
+                tracker.cadence_seconds = observation.cadence_seconds
+                tracker.pending_interval_seconds = observation.pending_interval_seconds
             self._quiet_trackers[candidate.path] = tracker
         return tracker.observe(
             now,
@@ -2078,6 +2092,7 @@ class WatchScheduler:
             change_usn=candidate.change_usn,
             content_changed=content_changed,
             learn_interval=learn_interval,
+            phase_boundary=candidate.change_reasons_known and bool(candidate.change_reasons & USN_REASON_CLOSE),
         )
 
     def _process_password_retries(self, now: float) -> None:

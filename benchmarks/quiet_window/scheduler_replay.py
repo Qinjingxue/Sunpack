@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import bisect
 import heapq
+import math
 import os
 import threading
 import time
@@ -53,12 +54,15 @@ class _Filesystem:
         self.times = {}
         self.metadata_probes = 0
         self.readiness_probes = 0
+        self.busy_paths = set()
         for file in trace.files:
             snapshots = []
-            identity = 0
+            identity = close_usn = 0
             for item in file.mutations:
                 identity += item.operation == "replace"
-                snapshots.append((item.at, item.size, item.mtime, item.usn, item.content_usn, identity))
+                if item.operation == "close":
+                    close_usn = item.usn
+                snapshots.append((item.at, item.size, item.mtime, item.usn, item.content_usn, identity, close_usn))
             self.snapshots[file.key] = snapshots
             self.times[file.key] = [item[0] for item in snapshots]
 
@@ -70,15 +74,19 @@ class _Filesystem:
         position = bisect.bisect_right(self.times[key], self.now) - 1
         if position < 0:
             return None
-        _, size, mtime, usn, content_usn, identity = self.snapshots[key][position]
+        _, size, mtime, usn, content_usn, identity, close_usn = self.snapshots[key][position]
         reasons = scheduler.USN_REASON_DATA_OVERWRITE if content_usn > since_usn else 0
+        all_reasons = reasons | (scheduler.USN_REASON_CLOSE if close_usn > since_usn else 0)
         return WatchCandidate(path, size, mtime, f"{key}/{identity}", usn,
-                              change_reasons=reasons, change_reasons_without_close=reasons,
+                              change_reasons=all_reasons, change_reasons_without_close=reasons,
                               change_reasons_known=True)
 
     def ready(self, path):
         self.readiness_probes += 1
-        return self.truth[self.keys[path]].readable(self.now)
+        readable = self.truth[self.keys[path]].readable(self.now)
+        if not readable:
+            self.busy_paths.add(path)
+        return readable
 
 
 class _ControlTracker:
@@ -86,10 +94,12 @@ class _ControlTracker:
     def __init__(self, estimator):
         self.estimator = estimator
         self.quiet_seconds = 0.0
+        self.cadence_seconds = 0.0
+        self.pending_interval_seconds = 0.0
         self.last_content_event_at = None
         self.last_size = self.last_mtime = self.last_change_usn = None
 
-    def observe(self, now, *, size, mtime, change_usn=0, content_changed=None, learn_interval=True):
+    def observe(self, now, *, size, mtime, change_usn=0, content_changed=None, learn_interval=True, phase_boundary=False):
         changed = content_changed if content_changed is not None else (
             self.last_size is None or size != self.last_size or mtime != self.last_mtime
             or change_usn != self.last_change_usn)
@@ -178,8 +188,8 @@ def input_results(trace, files):
             premature_exposure_seconds=sum(file["premature_exposure_seconds"] for file in members),
             first_detection_latency=None if first_detection is None else first_detection - arrived,
             first_usable_latency=None if first is None else first - ready,
-            complete_arrival_at=arrived, first_valid_proposal_at=first,
-            complete_arrival_to_valid_proposal_seconds=None if first is None else first - arrived,
+            complete_arrival_at=arrived, processing_ready_at=ready, first_valid_proposal_at=first,
+            ready_to_valid_proposal_seconds=None if first is None else first - ready,
         ))
     return inputs
 
@@ -233,17 +243,28 @@ def _replay_scheduler(trace: Trace, factory, tie_order, metadata_root):
                 break
             filesystem.now = at
             if event_at < deadline or (event_at == deadline and tie_order == "observation_first"):
+                # Skip invariant busy timers analytically, retaining their
+                # cadence/phase. A physical mutation/unlock always has a wake
+                # event before delivery, so no changed snapshot is skipped.
+                path = filesystem.paths[events[0][-1]]
+                item = parked.pop(path, None)
+                if item is not None:
+                    state = watcher._active_states.get(path)
+                    if state is not None and (state.epoch, state.generation) == item[1:3]:
+                        step = state.quiet_seconds
+                        due = item[0]
+                        if step > 0.0 and due < at:
+                            due += math.ceil((at - due) / step) * step
+                            state.last_event_at = due - step
+                        heapq.heappush(watcher._ready_heap, (due, *item[1:]))
+                        if step > 0.0 and due <= at and tie_order == "timer_first":
+                            continue
                 _, _, _, event, key = heapq.heappop(events)
                 if event is not None:
                     watcher.enqueue(filesystem.paths[event.key], event_type="modified")
-                # Other files cannot change this path's readiness or content.
-                # Waking every busy path for unrelated duplicate notifications
-                # makes the virtual adapter's probe cost grow with width.
-                item = parked.pop(filesystem.paths[key], None)
-                if item is not None:
-                    heapq.heappush(watcher._ready_heap, item)
             else:
                 calls += 1
+                filesystem.busy_paths.clear()
                 for candidate in watcher._pop_ready(at):
                     key = filesystem.keys[candidate.path]
                     record_proposal(results[key], truth[key], at, group_ready, trace.horizon)
@@ -251,26 +272,26 @@ def _replay_scheduler(trace: Trace, factory, tie_order, metadata_root):
                     # Production retires distribution history on completion;
                     # retaining it forever changes subsequent epochs markedly.
                     watcher._retire_quiet_tracker(candidate.path)
-                # Native busy checks with quiet=0 can repeat without advancing
-                # virtual time. Collapse only this state-invariant spin, up to
-                # the next physical change/delivery/unlock. Record its presence;
-                # no claim is made about its real probe count or CPU cost.
-                while watcher._ready_heap:
-                    item = watcher._next_ready_entry_locked()
-                    if item is None or item[0] > at:
-                        break
-                    path = item[-1]
-                    if filesystem.truth[filesystem.keys[path]].readable(at):
-                        raise RuntimeError("zero-time non-busy scheduler cycle")
-                    parked[path] = heapq.heappop(watcher._ready_heap)
-                    coalesced_busy += 1
+                if filesystem.busy_paths:
+                    kept = []
+                    for item in watcher._ready_heap:
+                        path = item[-1]
+                        state = watcher._active_states.get(path)
+                        if (path in filesystem.busy_paths and state is not None
+                                and (state.epoch, state.generation) == item[1:3]):
+                            parked[path] = item
+                            coalesced_busy += 1
+                        else:
+                            kept.append(item)
+                    watcher._ready_heap[:] = kept
+                    heapq.heapify(watcher._ready_heap)
             peak_models = max(peak_models, len(watcher._quiet_trackers))
     files = [asdict(result) for result in results.values()]
     add_valid_proposal_latency(files, boundaries)
     inputs = input_results(trace, files)
     for item in inputs:
-        if item["complete_arrival_at"] is None:
-            item["missing_reason"] = "no_complete_arrival"
+        if item["processing_ready_at"] is None:
+            item["missing_reason"] = "no_processing_ready_input"
         elif item["first_valid_proposal_at"] is not None:
             item["missing_reason"] = None
         else:
@@ -283,5 +304,5 @@ def _replay_scheduler(trace: Trace, factory, tie_order, metadata_root):
     return dict(files=files, inputs=inputs, delivered_observations=len(trace.observations),
                 scheduled_deadlines=calls, peak_live_estimators=peak_models,
                 metadata_probes=filesystem.metadata_probes, readiness_probes=filesystem.readiness_probes,
-                coalesced_zero_delay_busy_checks=coalesced_busy,
+                coalesced_busy_timer_runs=coalesced_busy,
                 replay_cpu_ns=time.process_time_ns() - started)
