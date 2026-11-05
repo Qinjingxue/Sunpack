@@ -7,7 +7,7 @@ from dataclasses import asdict, dataclass
 from typing import Iterator
 
 
-CONTRACT = "sunpack.writer-behaviour/2"
+CONTRACT = "sunpack.writer-behaviour/3"
 SPLITS = {"development": 0, "validation": 1_000_000, "heldout": 2_000_000}
 CHANNELS = ("immediate", "batched", "noisy", "lossy_reconciled")
 WIDTHS = (1, 4, 8, 64)
@@ -35,6 +35,10 @@ class WriterAction:
     length: int = 0
     writer: int = 0
     phase: str = ""
+    # Abstract Windows access/share bits: READ=1, WRITE=2, DELETE=4.
+    # Transfer worker IDs on writes need not correspond to OS handle IDs.
+    access: int = 0
+    share: int = 7
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,6 +52,8 @@ class Mutation:
     length: int
     writer: int
     content_usn: int
+    change_reasons: int
+    directory_event: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,6 +89,8 @@ class Observation:
     content_changed: bool
     learn_interval: bool = True
     phase_boundary: bool = False
+    source: str = "directory"
+    event_type: str = "modified"
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,6 +149,8 @@ class Trace:
                 raise ValueError(f"invalid delivered timeline: {self.key}")
             if event.kind not in {"content", "metadata", "duplicate", "arrival", "reconcile"}:
                 raise ValueError(f"unknown observation kind: {event.kind}")
+            if event.source not in {"directory", "reconcile"} or event.event_type not in {"created", "modified", "moved", "recovery"}:
+                raise ValueError(f"unknown notification source: {self.key}")
             if event.size < 0 or not math.isfinite(event.mtime):
                 raise ValueError(f"invalid observation metadata: {self.key}")
             previous = event.at
@@ -152,9 +162,11 @@ def _observe(file: FileTruth, channel: str, rng: random.Random) -> list[Observat
     # A rename publishes the current file even when all writes happened under
     # an ignored staging name. Close/verify/sidecar traffic is not target data.
     deliveries.append((file.visible_at, "arrival"))
-    deliveries.extend((item.at, "duplicate") for item in file.actions
-                      if item.kind == "close" and item.at >= file.visible_at)
     for number, item in enumerate(visible_changes):
+        # Journal CLOSE is queryable state, not a directory callback. A flushed
+        # writer can close without a fresh ReadDirectoryChangesW completion.
+        if not item.directory_event:
+            continue
         if channel == "lossy_reconciled" and number % 4 and number != len(visible_changes) - 1:
             continue
         deliveries.append((item.at, "content" if item.content_usn == item.usn else "metadata"))
@@ -171,7 +183,7 @@ def _observe(file: FileTruth, channel: str, rng: random.Random) -> list[Observat
         scheduled.append((max(file.visible_at, file.mutations[-1].at) + 1, "reconcile"))
     times = [item.at for item in file.mutations]
     last_content = last_usn = 0
-    closes = [item.usn if item.operation == "close" else 0 for item in file.mutations]
+    closes = [item.usn if item.change_reasons & 0x80000000 else 0 for item in file.mutations]
     for index in range(1, len(closes)):
         closes[index] = max(closes[index], closes[index - 1])
     result = []
@@ -180,7 +192,11 @@ def _observe(file: FileTruth, channel: str, rng: random.Random) -> list[Observat
         item = file.mutations[position]
         result.append(Observation(at, file.key, kind, item.size, item.mtime, item.usn,
                                   item.content_usn != last_content,
-                                  phase_boundary=closes[position] > last_usn))
+                                  phase_boundary=closes[position] > last_usn,
+                                  source="reconcile" if kind == "reconcile" else "directory",
+                                  event_type="recovery" if kind == "reconcile" else (
+                                      "moved" if kind == "arrival" and any(a.kind == "rename" for a in file.actions)
+                                      else "created" if kind == "arrival" else "modified")))
         last_content = item.content_usn
         last_usn = item.usn
     return result

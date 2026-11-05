@@ -129,10 +129,10 @@ def main(argv=None, *, scheduler_mode=False):
                               "proposal_semantics": proposal_semantics,
                               "weighting": "equal-family-then-equal-channel-width-tie-within-seed",
                               "scope": "estimator-only-not-scheduler-or-extraction",
-                              "valid_proposal_latency": "complete-visible-readable-and-split-ready-to-first-valid-proposal;exclusive-handle-wait-excluded"}
+                              "valid_proposal_latency": "complete-visible-readable-and-split-ready-to-first-valid-proposal;incompatible-handle-wait-excluded"}
         if scheduler_mode:
             parameter_identity.update(
-                contract="sunpack.quiet-scheduler/4", metric_contract=EVALUATION_CONTRACT,
+                contract="sunpack.quiet-scheduler/5", metric_contract=EVALUATION_CONTRACT,
                 proposal_semantics="production-enqueue-pop-ready-boundary-confirmation-instant-retirement",
                 scope="production-admission-with-virtual-metadata-readiness-clock-and-memory-only-wal;not-extraction",
                 scoring_unit="single-file-or-complete-split-input;any-member-admission",

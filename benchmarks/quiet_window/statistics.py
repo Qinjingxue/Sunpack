@@ -5,7 +5,7 @@ import random
 import statistics
 
 
-EVALUATION_CONTRACT = "sunpack.quiet-window/6"
+EVALUATION_CONTRACT = "sunpack.quiet-window/7"
 
 # Fixed-duration, arbitrarily positioned half-open windows [start, start+span).
 # Integer nanoseconds share the latency SLO's timestamp resolution. Every
@@ -22,6 +22,7 @@ METRICS = ("false_ready_file_rate", "premature_proposals_per_file", "censored_co
            "premature_exposure_seconds_per_file", "within_50ms", "within_500ms", "within_2s", "within_10s", "within_60s")
 METRICS += ("valid_within_50ms", "valid_within_500ms", "valid_within_2s", "valid_within_10s", "valid_within_60s")
 METRICS += BURST_METRICS
+METRICS += ("valid_under_100ms",)
 
 
 def sliding_peak(timestamps_ns, span_ns):
@@ -75,6 +76,8 @@ def summarize_files(files: list[dict]) -> dict:
         "complete_arrival_files": len(arrived), "valid_proposal_files": len(valid_latencies),
         "ineligible_valid_proposal_files": total - len(arrived),
         "mean_ready_to_valid_proposal_seconds": statistics.mean(valid_latencies) if valid_latencies else None,
+        "max_ready_to_valid_proposal_seconds": max(valid_latencies, default=None),
+        "valid_under_100ms": sum(round(value * 1_000_000_000) < 100_000_000 for value in valid_latencies) / len(arrived) if arrived else None,
         "censored_valid_proposal_rate": 1 - len(valid_latencies) / len(arrived) if arrived else None,
         "false_ready_file_rate": sum(file["premature"] > 0 for file in files) / total,
         "premature_proposals_per_file": sum(file["premature"] for file in files) / total,

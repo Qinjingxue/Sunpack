@@ -5,7 +5,7 @@
 ## 优化目标
 
 1. 已完整到达但没有有效提案的输入数必须为零。报告同时给出绝对数量和 `censored_valid_proposal_rate`，不能用低平均延迟抵消漏提案。
-2. 核心指标 `mean_ready_to_valid_proposal_seconds`：从内容完整、目标路径可见、分卷齐备且句柄已允许处理的首个时刻，到首次有效提案。独占句柄尚未释放的等待在计时起点之前，不计入延迟；未有效提案不记零，也不混入条件平均值。另看 50ms/500ms/2s/10s/60s 预算命中率，未提案保留在分母。
+2. 核心指标 `mean_ready_to_valid_proposal_seconds`：从内容完整、目标路径可见、分卷齐备且句柄已允许处理的首个时刻，到首次有效提案。不兼容句柄尚未释放的等待在计时起点之前，不计入延迟；未有效提案不记零，也不混入条件平均值。另看严格 `<100ms` 的 `valid_under_100ms`，以及 50ms/500ms/2s/10s/60s 预算命中率，未提案保留在分母。
 3. 第二指标为整条写入者轨迹中任意 100ms、1s、10s 滑动窗口内的最大无效提案数。先对每个逻辑输入求峰值，再报告均值、每条 trace 内 P95 和最大值；另将同一并发 trace 的全部逻辑输入合并求峰值。报告保留全局、每族、每并发宽度的实际最坏峰值。窗口采用纳秒精度的半开区间 `[start,start+span)`，没有固定分桶边界；同时发生的多次提案分别计数。单文件一个逻辑输入，四个分卷合计一个；合并的是提案时间线，不去重真实尝试。
 4. `invalid_proposals_per_file` 降为诊断，不用于搜索或验收；CPU、IO 和在途工作量也不作为函数搜索或验收目标。旧资源字段仅供理解实验执行成本。首次有效提案延迟继续优先，峰值用于限制不可接受的短时错误尝试膨胀，不将这些指标加权成可以掩盖漏处理的总分。
 
@@ -20,12 +20,16 @@
 - `expected_size` 是写入者已知的最终目标长度。预分配只改变 EOF，不增加正确字节。重试重叠部分只算一次；错误块保持无效，直到实际修复写入。
 - `complete_at` 从正确范围覆盖及精确目标长度推导。不是最后一个事件、最后一次 close、最后一次 flush 或轨迹 EOF。主指标另由 `processing_ready_at` 将可读性与齐卷条件合入计时起点。最后 32 字节头部回填前，即便 EOF 已正确也仍未完成；内容写齐后的同内容重传、恢复 mtime、共享句柄关闭不会推迟内容完成。
 - `visible_at` 是目标路径发布时刻。发布程序选择监控范围外暂存：临时文件写入只在写入者侧出现，rename 后才向目标路径交付观察，不伪造临时文件对最终路径的写通知。不假设 SunPack 自动忽略任意 `.tmp`/`.partial` 后缀；监控范围内临时路径迁移继续由现有真实 arrival-matrix/temporary_rename 场景验证。
-- `blocked` 是禁止读访问的句柄区间并集。共享读句柄不阻塞；关闭重开可以在中间出现可读窗口；多个不兼容句柄必须全部释放。
+- `blocked` 是无法通过生产 readiness 门控的句柄区间并集。每个 open 明确记录 READ/WRITE/DELETE access 和 share。生产请求 READ、仅分享 READ，因此仍开的 WRITE/DELETE access 即便允许共享读也会阻塞；只读且允许分享 READ 的句柄不阻塞。关闭重开可以在中间出现可处理窗口；多个不兼容句柄必须全部释放。
 - 分卷只在三个真实多成员程序中出现，每组四个文件，有实际错峰/并行/落后成员。评分以整组完整可见且全部可读为起点，以任意成员首次有效提案为终点。
 
 估计器只能看到 `Observation`：观察时间、key、当时的 size/mtime/USN、已分类的内容变化、是否学习间隔、已见 journal CLOSE 阶段边界。没有范围覆盖、目标长度、完成标记、未来写入、writer 类型、seed、真实句柄存活表或分卷完成 oracle。生产调度器另外使用真实链路已有的元数据探测和可读性探测接口。
 
-物理变化与通知送达分离。所有延迟通知在送达时读取当前物理快照；同一内容版本的重复通知不会被误算成多个内容间隔。mtime 恢复是物理元数据变化，推进 USN 但不推进内容版本。侧车 checkpoint、只读校验和网络收包不直接伪装成目标内容变化。目标 close 不构造新内容。写入者侧跟踪共享/独占句柄，最后一个建模句柄关闭时产生独立的 journal CLOSE 元数据版本；仅清除跨句柄阶段的间隔，不宣称文件完成。观察中的 phase_boundary 从自上次已见 USN 起的 CLOSE 记录推导，重复交付不会重复产生边界。真实 NTFS 对同类数据变更还可进一步合并，因此这些仍是声明的可观察行为投影。
+物理变化与通知送达分离。所有延迟通知在送达时读取当前物理快照；同一内容版本的重复通知不会被误算成多个内容间隔。mtime 恢复是物理元数据变化，推进 USN 但不推进内容版本。侧车 checkpoint、只读校验和网络收包不直接伪装成目标内容变化。目标 close 不构造新内容。写入者侧跟踪全部句柄，最后一个句柄关闭时产生含本阶段累计原因的 journal CLOSE；留存只读句柄可以令文件先 ready、后 CLOSE。观察中的 phase_boundary 从自上次已见 USN 起的 CLOSE 记录推导，重复交付不会重复产生边界。EXTEND/OVERWRITE/TRUNCATION 分别保留，CLOSE 的累计原因不重复当作新内容。真实 NTFS 对同类数据变更还可进一步合并，因此这些仍是声明的可观察行为投影。
+
+全部程序平衡 open/close，包括取消、暂停、重连和最终写句柄释放；仍有字节洞时 close 不会令内容完整。每文件在生成完整写入程序后独立抽取一个 flush 模式：逐写 flush 或保留未 flush 的目录变更，不改变网络/写入时序；这是覆盖设计，不是客户端占比估计。逐写 flush 可以使 close 时没有新的目录回调；不再给每个 close 自动追加通知。`Observation.source` 区分 directory/reconcile；arrival 交付 created 或 moved，其余变化交付 modified。当前生产没有 USN CLOSE 主动订阅，本语料也不伪造该来源。
+
+真实 Windows 锚点入口为 `uv run --no-sync python -m benchmarks watch quiet-calibrate --repeats 3`。复用隔离 Watch Broker 服务和生产 Observer，验证 56 种 access/share 组合，以及未 flush、flush、只读句柄留存、两个写句柄四类生命周期。具体结果与局限见 [LIFECYCLE_RESULTS.md](LIFECYCLE_RESULTS.md)。
 
 ## 运行入口
 
@@ -69,7 +73,7 @@ uv run --no-sync python -m benchmarks scheduling watch-quiet-scheduler --corpus 
 
 ## 工件与资源
 
-轨迹合同 `sunpack.writer-behaviour/2`，估计器计分合同 `sunpack.quiet-window/6`，生产入场回放合同 `sunpack.quiet-scheduler/4`。旧摘要不直接比较；双方在同一评估器上重放。已保存的完整提案时间线可以按明确的新统计定义重新计分，不重建提案、不混用旧摘要。
+轨迹合同 `sunpack.writer-behaviour/3`，估计器计分合同 `sunpack.quiet-window/7`，生产入场回放合同 `sunpack.quiet-scheduler/5`。旧摘要不直接比较；双方在同一评估器上重放。已保存的完整提案时间线可以按明确的新统计定义重新计分，不重建提案、不混用旧摘要。
 
 复用 benchmark workspace/report envelope。每次实验保存 canonical gzip 轨迹、完整提案时间线、报告、冻结策略、生成器/评估器/相关生产源码。直接冻结当前源码，不把已经删除的数据通过 git diff 再存进工件。使用现有 Rust xxh128 标识语料和源码；指纹仅用于复现身份，不校验文件内容。两边语料和评估器不一致时拒绝配对。
 

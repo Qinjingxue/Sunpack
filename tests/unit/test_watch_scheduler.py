@@ -2218,6 +2218,74 @@ def test_pending_metadata_event_advances_snapshot_without_generation_or_wakeup(t
     assert tracker.last_change_usn == metadata.change_usn
 
 
+def test_pending_close_wakes_admission_without_forgetting_cadence_or_trusting_reopen(tmp_path, monkeypatch):
+    """Ordinary metadata tests cannot detect a missed CLOSE wake or stale readiness.
+
+    One lifecycle covers the new deadline path, failed probes, writer reopen
+    and duplicate retirement; separate per-field tests add no coverage.
+    """
+    from dataclasses import replace
+
+    monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
+    archive = tmp_path / "download.opaque"
+    archive.write_bytes(b"part")
+    now = [10.0]
+    monkeypatch.setattr(scheduler_module.time, "monotonic", lambda: now[0])
+    wakeups = []
+    watcher = _watcher(tmp_path, wake_callback=lambda: wakeups.append(now[0]))
+    try:
+        watcher.enqueue(str(archive), event_type="created")
+        candidate = watcher._pending[str(archive)]
+        for _ in range(3):
+            now[0] += 1.0
+            candidate = replace(candidate, size=candidate.size + 1, mtime=candidate.mtime + 1,
+                                change_usn=candidate.change_usn + 1, change_reasons=2,
+                                change_reasons_without_close=2, change_reasons_known=True)
+            monkeypatch.setattr(scheduler_module, "_candidate_for_event_path", lambda *_a, **_kw: candidate)
+            watcher.enqueue(str(archive), event_type="modified")
+        state = watcher._active_states[str(archive)]
+        tracker = watcher._quiet_trackers[str(archive)]
+        learned = tracker.quiet_seconds
+        assert learned > 0.1
+        before = len(wakeups)
+        ready = [False]
+
+        def probe(_path):
+            if ready[0] is None:
+                raise OSError("temporary probe failure")
+            return ready[0]
+
+        monkeypatch.setattr(scheduler_module, "watch_file_is_ready", probe)
+        for status in (False, None, True):
+            ready[0] = status
+            now[0] += 0.01
+            candidate = replace(candidate, change_usn=candidate.change_usn + 1,
+                                change_reasons=0x80000002, change_reasons_without_close=0)
+            watcher.enqueue(str(archive), event_type="modified")
+            if status is not True:
+                assert state.quiet_seconds == learned and len(wakeups) == before
+        assert state.quiet_seconds == 0.0 and wakeups[-1] == now[0] and len(wakeups) == before + 1
+        assert tracker.quiet_seconds == learned
+        # Readiness is a hint. A reopened writer still blocks actual admission.
+        ready[0] = False
+        assert watcher._pop_ready(now[0]) == []
+        ready[0] = True
+        deadline = state.last_event_at + state.quiet_seconds
+        now[0] = deadline - 0.025
+        before = len(wakeups)
+        candidate = replace(candidate, change_usn=candidate.change_usn + 1)
+        watcher.enqueue(str(archive), event_type="modified")
+        assert len(wakeups) == before and watcher._pop_ready(now[0]) == []
+        assert [item.path for item in watcher._pop_ready(deadline)] == [str(archive)]
+        watcher._retire_quiet_tracker(str(archive))
+        before = len(wakeups)
+        candidate = replace(candidate, change_usn=candidate.change_usn + 1)
+        watcher.enqueue(str(archive), event_type="modified")
+        assert watcher.pending_count == 0 and len(wakeups) == before
+    finally:
+        watcher._close_blocking()
+
+
 def test_watch_scheduler_ignores_unchanged_event_after_no_tasks_result(tmp_path, monkeypatch):
     monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
 
@@ -3280,7 +3348,7 @@ def test_watch_scheduler_claim_removes_pending_sibling_before_source_cleanup_pro
     assert watcher.pending_count == 0
 
 
-@pytest.mark.parametrize("stage", ["observation", "attempt"])
+@pytest.mark.parametrize("stage", ["observation", "attempt", "close_readiness"])
 def test_claim_during_probe_replays_new_generation_without_blocking_publication(tmp_path, monkeypatch, stage):
     """Cover publication during filesystem/WAL work; serial claim tests cannot.
 
@@ -3292,11 +3360,30 @@ def test_claim_during_probe_replays_new_generation_without_blocking_publication(
     source = tmp_path / "split.7z.002"
     source.write_bytes(b"old")
     watcher = _watcher(tmp_path)
-    if stage == "attempt":
+    if stage != "observation":
         watcher.enqueue(str(source))
+    if stage == "close_readiness":
+        from dataclasses import replace
+
+        # Exercise the native probe for an already delayed pending candidate.
+        watcher._active_states[str(source)].quiet_seconds = 3600.0
+        previous = watcher._pending[str(source)]
+        closed = replace(previous, change_usn=previous.change_usn + 1,
+                         change_reasons=0x80000000, change_reasons_known=True)
+        candidate_for_path = scheduler_module._candidate_for_event_path
+        first_observation = True
+
+        def observe_close(path, **kwargs):
+            nonlocal first_observation
+            if first_observation:
+                first_observation = False
+                return closed
+            return candidate_for_path(path, **kwargs)
+
+        monkeypatch.setattr(scheduler_module, "_candidate_for_event_path", observe_close)
     entered, resume = threading.Event(), threading.Event()
-    original = (scheduler_module._candidate_for_event_path if stage == "observation"
-                else watcher.state.record_attempt)
+    original = (scheduler_module._candidate_for_event_path if stage == "observation" else
+                scheduler_module.watch_file_is_ready if stage == "close_readiness" else watcher.state.record_attempt)
     first = True
 
     def blocked(path, *args, **kwargs):
@@ -3312,11 +3399,13 @@ def test_claim_during_probe_replays_new_generation_without_blocking_publication(
 
     if stage == "observation":
         monkeypatch.setattr(scheduler_module, "_candidate_for_event_path", blocked)
+    elif stage == "close_readiness":
+        monkeypatch.setattr(scheduler_module, "watch_file_is_ready", blocked)
     else:
         monkeypatch.setattr(watcher.state, "record_attempt", blocked)
     try:
         with ThreadPoolExecutor(max_workers=2) as pool:
-            probe = pool.submit(watcher.enqueue, str(source)) if stage == "observation" else pool.submit(
+            probe = pool.submit(watcher.enqueue, str(source)) if stage != "attempt" else pool.submit(
                 watcher._pop_ready, time.time() + 100)
             try:
                 assert entered.wait(10)

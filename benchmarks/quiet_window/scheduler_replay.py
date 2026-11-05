@@ -52,19 +52,19 @@ class _Filesystem:
         self.truth = {file.key: file for file in trace.files}
         self.snapshots = {}
         self.times = {}
+        self.journal = {}
         self.metadata_probes = 0
         self.readiness_probes = 0
         self.busy_paths = set()
         for file in trace.files:
             snapshots = []
-            identity = close_usn = 0
+            identity = 0
             for item in file.mutations:
                 identity += item.operation == "replace"
-                if item.operation == "close":
-                    close_usn = item.usn
-                snapshots.append((item.at, item.size, item.mtime, item.usn, item.content_usn, identity, close_usn))
+                snapshots.append((item.at, item.size, item.mtime, item.usn, identity))
             self.snapshots[file.key] = snapshots
             self.times[file.key] = [item[0] for item in snapshots]
+            self.journal[file.key] = [(item.usn, item.change_reasons) for item in file.mutations if item.change_reasons]
 
     def candidate(self, path, *, since_usn=0):
         self.metadata_probes += 1
@@ -74,12 +74,20 @@ class _Filesystem:
         position = bisect.bisect_right(self.times[key], self.now) - 1
         if position < 0:
             return None
-        _, size, mtime, usn, content_usn, identity, close_usn = self.snapshots[key][position]
-        reasons = scheduler.USN_REASON_DATA_OVERWRITE if content_usn > since_usn else 0
-        all_reasons = reasons | (scheduler.USN_REASON_CLOSE if close_usn > since_usn else 0)
+        _, size, mtime, usn, identity = self.snapshots[key][position]
+        all_reasons = reasons = 0
+        known = since_usn > 0
+        if known:
+            for record_usn, mask in self.journal[key]:
+                if since_usn < record_usn <= usn:
+                    all_reasons |= mask
+                    # A CLOSE record repeats the epoch's accumulated reasons;
+                    # it is not fresh content activity by itself.
+                    if not mask & scheduler.USN_REASON_CLOSE:
+                        reasons |= mask
         return WatchCandidate(path, size, mtime, f"{key}/{identity}", usn,
                               change_reasons=all_reasons, change_reasons_without_close=reasons,
-                              change_reasons_known=True)
+                              change_reasons_known=known)
 
     def ready(self, path):
         self.readiness_probes += 1
@@ -261,7 +269,7 @@ def _replay_scheduler(trace: Trace, factory, tie_order, metadata_root):
                             continue
                 _, _, _, event, key = heapq.heappop(events)
                 if event is not None:
-                    watcher.enqueue(filesystem.paths[event.key], event_type="modified")
+                    watcher.enqueue(filesystem.paths[event.key], event_type=event.event_type)
             else:
                 calls += 1
                 filesystem.busy_paths.clear()

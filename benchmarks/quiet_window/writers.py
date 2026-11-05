@@ -6,6 +6,8 @@ not measurements of the applications cited in WRITERS.md.
 from __future__ import annotations
 
 import heapq
+import math
+from dataclasses import replace
 
 from .corpus import FileTruth, MULTIPART, Mutation, WriterAction
 
@@ -29,32 +31,39 @@ def _realize(index, family, expected, actions, *, preserve_mtime=False):
     actions = tuple(sorted(actions, key=lambda item: item.at))
     size, content_usn = 0, 0
     mtime = 100.0
-    covered, mutations, locks, blocked = [], [], {}, []
-    handles = set()
+    covered, mutations, handles, blocked = [], [], {}, []
+    journal_reasons = 0
+    directory_pending = False
     complete, visible = None, actions[0].at
     for action in actions:
         at, kind, offset, length = action.at, action.kind, action.offset, action.length
-        if kind in {"exclusive_open", "shared_open"}:
-            handles.add(action.writer)
-        if kind == "exclusive_open":
-            if action.writer in locks:
-                raise ValueError("writer reopened an exclusive handle without closing it")
-            locks[action.writer] = at
-        elif kind == "close" and action.writer in locks:
-            start = locks.pop(action.writer)
-            if start < at:
-                blocked.append((start, at))
-        elif kind == "rename":
+        reason, directory_event = 0, True
+        if kind == "open":
+            if not action.access or action.writer in handles:
+                raise ValueError("invalid or repeated handle open")
+            handles[action.writer] = (at, action.access, action.share)
+        if kind == "rename":
             visible = at
         elif kind == "seed":
             covered = _add(covered, offset, offset + length)
         if kind == "close":
             if action.writer not in handles:
                 raise ValueError("writer closed an unopened handle")
-            handles.remove(action.writer)
-            if handles:
-                continue
-        if kind not in {"allocate", "existing", "truncate", "replace", "write", "bad_write", "restore_mtime", "close"}:
+            start, access, share = handles.pop(action.writer)
+            # The production reader asks for READ and shares READ only. Share
+            # compatibility is bidirectional, even for a writer sharing READ.
+            if ((access & ~1) or not (share & 1)) and start < at:
+                blocked.append((start, at))
+            directory_event = bool(access & 2 and directory_pending)
+            if access & 2:
+                directory_pending = False
+            if not handles and journal_reasons:
+                reason = journal_reasons | 0x80000000
+                journal_reasons = 0
+        if kind == "flush":
+            directory_event = directory_pending
+            directory_pending = False
+        if kind not in {"allocate", "existing", "truncate", "replace", "write", "bad_write", "restore_mtime", "close", "flush"}:
             continue
         usn = len(mutations) + 1
         if kind in {"allocate", "existing", "truncate", "replace"}:
@@ -62,25 +71,32 @@ def _realize(index, family, expected, actions, *, preserve_mtime=False):
                 covered = []
             covered = _remove(covered, length, max(size, expected))
             size = length
+            reason = 0x4 if kind in {"truncate", "replace"} else 0x2
         elif kind in {"write", "bad_write"}:
             if length <= 0 or offset < 0 or offset + length > expected:
                 raise ValueError("writer range exceeds its target")
             size = max(size, offset + length)
             covered = (_add if kind == "write" else _remove)(covered, offset, offset + length)
-        if kind not in {"restore_mtime", "close"}:
+            reason = 0x2 if offset + length > (mutations[-1].size if mutations else 0) else 0x1
+        if kind not in {"restore_mtime", "close", "flush"}:
             content_usn = usn
+            directory_pending = True
+            journal_reasons |= reason
             if not preserve_mtime:
                 mtime = 100.0 + at
         elif kind == "restore_mtime":
             mtime = 10.0
-        mutations.append(Mutation(at, size, mtime, usn, kind, offset, length, action.writer, content_usn))
+            reason = 0x8000
+            journal_reasons |= reason
+        mutations.append(Mutation(at, size, mtime, usn, kind, offset, length, action.writer, content_usn,
+                                  reason, directory_event))
         full = size == expected and covered == [(0, expected)]
         if not full:
             complete = None
         elif complete is None:
             complete = at
-    if locks:
-        raise ValueError("exclusive handle has no finite release")
+    if handles:
+        raise ValueError("writer lifecycle leaves open handles")
     # Adjacent/overlapping locks from different writers block a reader until
     # ALL incompatible handles close, rather than until the first close.
     merged = []
@@ -102,8 +118,8 @@ def build_file(family, index, rng, group_rng):
     start = index * 0.0001
     actions = []
 
-    def emit(at, kind, offset=0, length=0, writer=0, phase=""):
-        actions.append(WriterAction(at, kind, offset, length, writer, phase))
+    def emit(at, kind, offset=0, length=0, writer=0, phase="", *, access=0, share=7):
+        actions.append(WriterAction(at, kind, offset, length, writer, phase, access, share))
 
     def write(at, block, writer=0, *, kind="write", phase="transfer", length=None):
         emit(at, kind, block * chunk, chunk if length is None else length, writer, phase)
@@ -141,7 +157,7 @@ def build_file(family, index, rng, group_rng):
         return max(moment for moment, _ in clocks)
 
     if family not in {"close_reopen_batches", "exclusive_commit_tail"}:
-        emit(start, "shared_open")
+        emit(start, "open", access=2)
     # Preallocation changes EOF but contributes no correct target bytes.
     if family not in {"segmented_sparse", "fragment_assembly", "copy_restartable", "copy_restart_from_zero",
                        "close_reopen_batches", "shared_handle_tail", "exclusive_commit_tail",
@@ -160,7 +176,7 @@ def build_file(family, index, rng, group_rng):
             emit(at, "close")
             emit(at, "pause")
             at += pause
-            emit(at, "shared_open")
+            emit(at, "open", access=2)
             emit(at, "resume")
             if family == "segmented_restart":
                 emit(at, "truncate", phase="range_request_rejected")
@@ -174,9 +190,8 @@ def build_file(family, index, rng, group_rng):
                 # One stream reconnects after a stall; other streams continue.
                 stream_times = sorted(item.at for item in actions if item.kind == "write" and item.writer == workers - 1)
                 reconnect = stream_times[len(stream_times) // 2]
-                actions = [WriterAction(item.at + pause if item.writer == workers - 1
-                                        and item.kind == "write" and item.at >= reconnect else item.at,
-                                        item.kind, item.offset, item.length, item.writer, item.phase)
+                actions = [replace(item, at=item.at + pause if item.writer == workers - 1
+                                        and item.kind == "write" and item.at >= reconnect else item.at)
                            for item in actions]
                 # Resume validation/retries rewrite already correct overlapping
                 # ranges; they do not advance completion or the coverage count.
@@ -247,7 +262,7 @@ def build_file(family, index, rng, group_rng):
         emit(at, "close")
         emit(at, "checkpoint")
         at += pause
-        emit(at, "shared_open", writer=1)
+        emit(at, "open", writer=1, access=2)
         if family == "copy_restart_from_zero":
             emit(at, "replace", writer=1, phase="new_file_identity")
             at = sequential(range(count), at, writer=1)
@@ -257,7 +272,7 @@ def build_file(family, index, rng, group_rng):
         emit(at + step, "restore_mtime")
     elif family == "close_reopen_batches":
         for begin in range(0, count, 8):
-            emit(at, "exclusive_open")
+            emit(at, "open", access=2, share=0)
             at = sequential(range(begin, begin + 8), at)
             emit(at + step / 100, "close")
             if begin + 8 < count:
@@ -265,12 +280,17 @@ def build_file(family, index, rng, group_rng):
                 emit(at, "pause")
     elif family in {"shared_handle_tail", "exclusive_commit_tail"}:
         if family == "exclusive_commit_tail":
-            emit(at, "exclusive_open")
+            emit(at, "open", access=2, share=0)
         at = sequential(range(count), at)
         emit(at, "flush")
-        # No data write or completion signal at close. A readable shared handle
-        # must not delay readiness; an incompatible one must delay it.
-        emit(at + pause, "close")
+        if family == "shared_handle_tail":
+            # The writer releases while a distinct read-only handle remains.
+            # READ sharing is not the same as a still-open writable handle.
+            emit(at, "open", writer=1, access=1)
+            emit(math.nextafter(at, math.inf), "close")
+            emit(at + pause, "close", writer=1)
+        else:
+            emit(at + pause, "close")
     elif family == "archive_directory_last":
         at = sequential(range(count - 2), at, phase="compressed_payload")
         emit(at, "verify", phase="build_central_directory")
@@ -291,7 +311,7 @@ def build_file(family, index, rng, group_rng):
         group_start = (index // 4) * volume_step
         at = group_start + (index % 4) * count * volume_step * 1.5 if family == "multipart_serial" else group_start
         # Move the initial create/open to this member's actual arrival.
-        actions = [WriterAction(at, action.kind, action.offset, action.length, action.writer, action.phase)
+        actions = [replace(action, at=at)
                    for action in actions]
         for block in range(count):
             if family == "multipart_late_volume" and index % 4 == 3 and block == count // 2:
@@ -311,4 +331,24 @@ def build_file(family, index, rng, group_rng):
         emit(at + step, "cancel" if family == "cancelled_holes" else "pause")
     else:
         raise ValueError(f"unknown writer family: {family}")
+    # Close every remaining coordinator handle after its last action, including
+    # cancel/pause. Do not infer completion from this: holes/repairs stay truth.
+    actions.sort(key=lambda action: action.at)
+    opened = {}
+    for action in actions:
+        if action.kind == "open":
+            if action.writer in opened:
+                raise ValueError("unbalanced writer handle epoch")
+            opened[action.writer] = action
+        elif action.kind == "close":
+            del opened[action.writer]
+    last = math.nextafter(actions[-1].at, math.inf)
+    for writer in opened:
+        emit(last, "close", writer=writer)
+    # Two notification lifecycles occur in ordinary downloads. A flush may
+    # publish the last modification before the writer actually closes.
+    if rng.getrandbits(1):
+        actions = [item for action in sorted(actions, key=lambda item: item.at)
+                   for item in ([action, WriterAction(action.at, "flush")]
+                                if action.kind in {"write", "bad_write"} else [action])]
     return _realize(index, family, expected, actions, preserve_mtime=family == "mapped_page_batches")

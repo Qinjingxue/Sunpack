@@ -77,6 +77,9 @@ USN_CONTENT_REASON_MASK = (
     | USN_REASON_DATA_TRUNCATION
 )
 RESTORED_MTIME_MINIMUM_BACKSTEP_SECONDS = 2.0
+# Spend speculative CLOSE acceleration on waits beyond the latency target.
+# Short pending deadlines retain their cadence to avoid bunching attempts.
+CLOSE_ACCELERATION_MIN_REMAINING_SECONDS = 0.1
 BLOCKER_MISSING_VOLUME = "missing_volume"
 BLOCKER_PASSWORD = "password"
 
@@ -1502,6 +1505,7 @@ class WatchScheduler:
                 previous = self._candidate_baseline_locked(candidate.path) or previous_hint
                 change_kind = _candidate_change_kind(previous, candidate)
                 active = self._active_states.get(candidate.path)
+                active_deadline = active.last_event_at + active.quiet_seconds if active is not None else now
                 promote = event_type == "initial_scan" and active is not None
                 needs_queue = active is None or promote
             unchanged = not force and change_kind == _CandidateChangeKind.UNCHANGED
@@ -1519,6 +1523,17 @@ class WatchScheduler:
                 )
             if unchanged:
                 return
+            close_ready = False
+            if (metadata_only and active_deadline - now >= CLOSE_ACCELERATION_MIN_REMAINING_SECONDS
+                    and candidate.change_reasons_known
+                    and candidate.change_reasons & USN_REASON_CLOSE):
+                # CLOSE ends a handle epoch, not necessarily the download.
+                # Probe outside both scheduler gates; admission rechecks the
+                # snapshot and sharing in case another writer reopens it.
+                try:
+                    close_ready = watch_file_is_ready(candidate.path)
+                except OSError:
+                    pass
             if metadata_only:
                 self.state.advance_entry_observation(candidate, admit=admit)
             with self._claim_gate, self._lock:
@@ -1526,25 +1541,31 @@ class WatchScheduler:
                     return
                 if metadata_only:
                     self._accept_metadata_observation_locked(candidate, now)
-                    return
-                state = self._active_states.get(candidate.path)
-                self._store_pending_locked(candidate.path, candidate)
-                if state is None:
-                    retry_is_unchanged = password_retry or (
-                        _crash_recovery and change_kind != _CandidateChangeKind.CONTENT_CHANGED)
-                    active_quiet_seconds = 0.0 if retry_is_unchanged else self._observe_candidate_activity(
-                        candidate, now, new_file=previous is not None and previous.file_id != candidate.file_id)
-                    state = self._new_active_state_locked(last_event_at=now, quiet_seconds=active_quiet_seconds)
-                    self._active_states[candidate.path] = state
-                    became_active = True
-                else:
-                    active_quiet_seconds = self._observe_candidate_activity(
-                        candidate, now, content_changed=True,
-                        new_file=previous is not None and previous.file_id != candidate.file_id)
+                    state = self._active_states.get(candidate.path)
+                    if state is None or not close_ready:
+                        return
                     state.last_event_at = now
-                    state.quiet_seconds = active_quiet_seconds
+                    state.quiet_seconds = 0.0
                     state.generation += 1
-                self._remember_observation_locked(candidate)
+                else:
+                    state = self._active_states.get(candidate.path)
+                    self._store_pending_locked(candidate.path, candidate)
+                    if state is None:
+                        retry_is_unchanged = password_retry or (
+                            _crash_recovery and change_kind != _CandidateChangeKind.CONTENT_CHANGED)
+                        active_quiet_seconds = 0.0 if retry_is_unchanged else self._observe_candidate_activity(
+                            candidate, now, new_file=previous is not None and previous.file_id != candidate.file_id)
+                        state = self._new_active_state_locked(last_event_at=now, quiet_seconds=active_quiet_seconds)
+                        self._active_states[candidate.path] = state
+                        became_active = True
+                    else:
+                        active_quiet_seconds = self._observe_candidate_activity(
+                            candidate, now, content_changed=True,
+                            new_file=previous is not None and previous.file_id != candidate.file_id)
+                        state.last_event_at = now
+                        state.quiet_seconds = active_quiet_seconds
+                        state.generation += 1
+                    self._remember_observation_locked(candidate)
                 self._schedule_active_locked(candidate.path, state)
         finally:
             self._end_source_probe(probe)
