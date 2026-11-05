@@ -8,6 +8,8 @@ and [initial results](quiet_window/BASELINE.md) ([JSON](quiet_window/baseline.js
 from delivered observations, reports premature proposals together with latency and
 censoring, and preserves the exact corpus for paired comparisons. It requires no
 Watch Broker. Existing real Watch scenarios remain the system-level evaluation.
+The [time-decayed P90 comparison](quiet_window/TIME_DECAY.md) records the first
+candidate and its separate paired tracker CPU/allocation measurements.
 
 The typed-hit index protocol, pinned baselines, corpus recipes, statistics and
 release gates are documented in [hit_index/PROTOCOL.md](hit_index/PROTOCOL.md).

@@ -1,6 +1,6 @@
 # 文件静默算法基准协议
 
-研究依据见 [RESEARCH.md](RESEARCH.md)。当前任务是建立基线，生产算法没有更改。
+研究依据见 [RESEARCH.md](RESEARCH.md)。[初始基线](BASELINE.md)固定了优化前的生产算法；[时间衰减 P90 实验](TIME_DECAY.md)记录后续候选及其配对比较。
 
 ## 运行与工件
 
@@ -15,6 +15,9 @@ uv run --no-sync python -m benchmarks scheduling watch-quiet-window --splits dev
 
 # 基线目录中保存的原始轨迹用于后续严格配对；不要重新造不同样本后比较均值
 uv run --no-sync python -m benchmarks scheduling watch-quiet-window --corpus <baseline-dir>/traces.jsonl.gz --compare benchmarks/quiet_window/baseline.json
+
+# 单独测量 tracker 成本：7 个新进程内交替顺序配对，内存分开测量
+uv run --no-sync python -m benchmarks scheduling watch-quiet-cost --baseline-source <baseline-dir>/quiet_policy.py.txt --pin-report benchmarks/quiet_window/time_decay_cost.json
 ```
 
 每次运行保留 `traces.jsonl.gz`、`outcomes.jsonl.gz`、`report.json`、生产 `quiet_policy.py.txt`、生成器/评估器源码快照、工作树 diff。gzip 固定头部，无文件名/时间污染；XXH128 仅用于识别完全相同的语料和源码，不对解压输出计算安全摘要。`--pin-report` 只固定报告，不悄悄覆盖原始轨迹。原始工件保存在 `benchmarks/results/`，须连同报告归档；仅复制 compact report 不能替代原始实验材料。
@@ -73,9 +76,11 @@ uv run --no-sync python -m benchmarks scheduling watch-quiet-window --corpus <ba
 
 `replay_cpu_ns` 含 Python 回放堆、打分及估计器，轮转算法次序以减少顺序偏差；不是纯算法 CPU 成本，也不是 Windows 实测吞吐。`peak_live_estimators` 是对象数量，不是内存字节。本文不给单次进程计时附上虚假的机器性能置信区间；后续若优化 CPU/内存，应另做多进程重复资源测量。
 
+`cost.py` 单独调用实际 tracker（含构造和 `observe`），输入为 development seed 0、全部 family、immediate 通道、width 1。每个新进程内先预热，再交替基线/候选顺序；计时不含生成、JSON 和磁盘 IO，报告进程 CPU 时间及配对比值范围，不把这个范围当置信区间。此工作负载约 76% 是内容观察，其余为元数据；不是全内容事件吞吐上限。另用共享 policy 的 4096 个活跃 tracker 填满历史，通过 tracemalloc 测量每对象存活分配和释放后残留；它不是进程 RSS 或调度器总内存，单批释放检查也不构成长时间无泄漏证明。原始源码及各进程结果随报告归档。
+
 ## 后续研究规则
 
 - development 用于开发，validation 用于选择参数；heldout 只用于预先固定候选的最后一次比较。基线公布 heldout 是为了固定起点，不允许据其逐 family 结果反复调参再自称盲测。新增应用轨迹按应用/会话划分，不随机打散同一文件的事件。
 - 每个优化在同一冻结语料上与基线配对；不得删掉难例、减少并发、调高容许失败次数或修改真值使算法过关。协议/计分变更须新建 contract 并重跑两边，不能混比。
 - 不新增“测试 benchmark 是否能运行”的 pytest。语料读入检查只保护研究输入的有效性。这里实际执行的是完整实验，不是把 benchmark 包装为正确性测试。
-- 本次不改变生产调度算法，也不在 Rust 之外建立归档分析/密码探测链路。研究结果不能直接推出线上默认值，应再在已有真实 NTFS、格式、分卷、CLI/Watch 链路复核。
+- 初始基线没有改变生产调度算法；后续候选继续复用同一调度和 Rust 归档分析/密码探测链路。研究结果不能直接推出线上默认值，应再在已有真实 NTFS、格式、分卷、CLI/Watch 链路复核。

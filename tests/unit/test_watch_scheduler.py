@@ -1599,6 +1599,8 @@ def test_failed_watch_task_writes_to_direct_output_root(tmp_path, monkeypatch):
 
 def test_partial_result_does_not_self_retry_but_modified_epoch_does(tmp_path, monkeypatch):
     monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
+    clock = WatchClock(2000000000.0)
+    clock.install(monkeypatch)
     archive = tmp_path / "sample.zip"
     _write_zip(archive)
     calls = []
@@ -1642,7 +1644,9 @@ def test_partial_result_does_not_self_retry_but_modified_epoch_does(tmp_path, mo
     assert _await(watcher.run_once()).processed == 0
     with archive.open("ab") as stream:
         stream.write(b"changed")
+    clock.advance(1.0)
     watcher.enqueue(str(archive), event_type="modified")
+    clock.advance(watcher._active_states[str(archive)].quiet_seconds + 0.01)
     final = _await(watcher.run_once())
 
     assert final.succeeded == 1
@@ -2749,7 +2753,7 @@ def test_password_retry_bypasses_learned_quiet_for_unchanged_failed_archive(tmp_
     assert [event[0] for event in notifications.events] == ["submitted", "suppressed", "submitted", "succeeded"]
 
 
-def test_password_retry_preserves_quiet_when_failed_archive_changed(tmp_path, monkeypatch):
+def test_password_retry_relearns_quiet_when_failed_archive_changed(tmp_path, monkeypatch):
     monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
     wall_clock = WatchClock(1_000.0)
     wall_clock.install(monkeypatch)
@@ -2789,7 +2793,10 @@ def test_password_retry_preserves_quiet_when_failed_archive_changed(tmp_path, mo
 
     assert retried.processed == 0
     assert watcher.pending_count == 1
-    assert watcher._active_states[str(archive_path)].quiet_seconds >= 300.0
+    # A real content observation supersedes the restored scalar immediately.
+    assert 0.01 < watcher._active_states[str(archive_path)].quiet_seconds < 0.02
+    wall_clock.advance(0.02)
+    assert _await(watcher.run_once()).failed == 1
 
 
 def test_password_retry_debounce_uses_monotonic_clock_when_wall_clock_moves_backward(tmp_path, monkeypatch):

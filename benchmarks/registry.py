@@ -13,6 +13,7 @@ class Scenario:
 
 _ROWS = [
     ("scheduling", "watch-quiet-window", "benchmarks.scenarios.watch_quiet_window", "Seeded, censored file-quiescence traces; paired risk/latency baseline without Broker or payload IO."),
+    ("scheduling", "watch-quiet-cost", "benchmarks.quiet_window.cost", "Paired tracker CPU and bounded-history allocation cost against a frozen policy source."),
     ("scheduling", "event-log", "benchmarks.scenarios.event_log", "State-log submission, deletion storms, compaction and short restart retention."),
     ("scheduling", "broker-request-selection", "benchmarks.scenarios.broker_request_selection", "Request-count scaling and fixed-order no-scan scheduling ceiling."),
     ("scheduling", "broker-queue", "benchmarks.scenarios.broker_queue", "Committed versus working-tree broker queue selection and throughput."),

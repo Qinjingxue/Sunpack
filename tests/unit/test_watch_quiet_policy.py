@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections import deque
+
 import pytest
 
 from sunpack.runtime.watch.quiet_policy import AdaptiveQuietPolicy, AdaptiveQuietTracker
@@ -26,10 +28,20 @@ def test_policy_extends_immediately_after_one_long_observed_interval():
     assert tracker.quiet_seconds > 300.0
 
 
-def test_policy_uses_p90_instead_of_a_single_maximum_interval():
+def test_weighted_p90_uses_real_sample_age_and_excludes_underflowed_history():
+    """Same interval values/counts, different timestamps: event rank is insufficient."""
     policy = AdaptiveQuietPolicy()
 
-    assert policy.effective_interval([1.0] * 9 + [20.0]) == pytest.approx(2.9)
+    samples = [(20.0, 20.0), (0.1, 20.1), (0.1, 20.2), (0.1, 20.3)]
+    assert policy.effective_interval(deque(samples)) == 20.0
+    samples.append((0.1, 20.4))
+    assert policy.effective_interval(deque(samples)) == 0.1
+    samples = [(20.0, 0.0), (0.1, 1000.1), (0.1, 1000.2), (0.1, 1000.3)]
+    assert policy.effective_interval(deque(samples)) == 0.1
+    # Underflowed weights must not become the P0/minimum or P100/maximum.
+    for percentile in (0.0, 1.0):
+        edge_policy = AdaptiveQuietPolicy(interval_percentile=percentile)
+        assert edge_policy.effective_interval(deque([(0.01, 0.0), *samples])) == 0.1
 
 
 def test_same_metadata_event_does_not_distort_write_interval_history():
@@ -87,29 +99,34 @@ def test_fast_copy_learns_without_requiring_high_callback_throughput(observation
         now = 0.1 * index / observations
         tracker.observe(now, size=index + 1, mtime=now)
     assert tracker.quiet_seconds < 0.02
+    assert len(tracker.intervals) == min(observations, tracker.policy.window_size)
 
 
-@pytest.mark.parametrize("observations", [10, 100])
-def test_short_fast_burst_preserves_learned_download_pause(observations):
-    """A burst with many callbacks must not erase a real, long inter-chunk pause."""
+def test_rate_changes_grow_immediately_and_forget_long_pause_after_four_fast_writes():
+    """Exercise both directions without the removed shrink gate or smoothing."""
     tracker = AdaptiveQuietTracker(AdaptiveQuietPolicy())
     tracker.observe(0.0, size=1, mtime=0.0)
     tracker.observe(20.0, size=2, mtime=20.0)
     learned = tracker.quiet_seconds
-    for index in range(1, observations + 1):
-        now = 20.0 + 0.1 * index / observations
+    assert learned > 20.0
+    for index in range(1, 5):
+        now = 20.0 + 0.1 * index
         tracker.observe(now, size=index + 2, mtime=now)
-    assert tracker.quiet_seconds >= learned * 0.99
+        if index < 4:
+            assert tracker.quiet_seconds == learned
+        else:
+            assert 0.1 < tracker.quiet_seconds < 0.15
+    tracker.observe(320.4, size=7, mtime=320.4)
+    assert tracker.quiet_seconds > 300.0
 
 
 @pytest.mark.parametrize("scenario", representative_write_scenarios())
-def test_representative_writes_avoid_repeated_premature_attempts(scenario: WriteScenario):
-    result = simulate_writes(scenario, AdaptiveQuietPolicy())
+def test_representative_cadences_are_invariant_to_time_units(scenario: WriteScenario):
+    """The interval estimator is scale-free; the retained mapping is tested above."""
+    policy = AdaptiveQuietPolicy(logarithmic_scale=0.0)
+    result = simulate_writes(scenario, policy)
 
-    # Starting at zero permits an initial attempt. Without a fixed floor,
-    # each isolated pause in a burst can also outlast the learned fast cadence.
-    expected_maximum = {"bursty": 9, "slowing": 4, "temporary_pauses": 3}.get(scenario.name, 1)
-    assert result.premature_attempts <= expected_maximum
-    maximum_latency = {"very_fast": 4.0, "fast": 6.0, "moderate": 10.0}.get(scenario.name)
-    if maximum_latency is not None:
-        assert result.completion_latency <= maximum_latency
+    for factor in (1e-6, 1e6):
+        scaled = WriteScenario(scenario.name, tuple(value * factor for value in scenario.intervals))
+        scaled_result = simulate_writes(scaled, policy)
+        assert scaled_result.final_quiet_seconds == pytest.approx(result.final_quiet_seconds * factor)
