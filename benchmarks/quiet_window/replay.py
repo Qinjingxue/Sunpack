@@ -7,7 +7,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from typing import Callable, Protocol
 
-from sunpack.runtime.watch.quiet_policy import AdaptiveQuietPolicy, AdaptiveQuietTracker
+from sunpack.runtime.watch import quiet_policy
 
 from .corpus import Observation, Trace
 
@@ -17,8 +17,8 @@ class Estimator(Protocol):
 
 
 class AdaptiveEstimator:
-    def __init__(self):
-        self.tracker = AdaptiveQuietTracker(AdaptiveQuietPolicy())
+    def __init__(self, module=quiet_policy):
+        self.tracker = module.AdaptiveQuietTracker(module.AdaptiveQuietPolicy())
 
     def observe(self, event: Observation) -> float:
         return self.tracker.observe(event.at, size=event.size, mtime=event.mtime,
@@ -57,8 +57,8 @@ class EwmaEstimator:
         return 0.0 if self.mean is None else self.mean + 4 * self.variation
 
 
-def estimators() -> dict[str, Callable[[], Estimator]]:
-    return {"adaptive": AdaptiveEstimator, "ewma": EwmaEstimator,
+def estimators(module=quiet_policy) -> dict[str, Callable[[], Estimator]]:
+    return {"adaptive": lambda: AdaptiveEstimator(module), "ewma": EwmaEstimator,
             **{f"fixed-{seconds:g}s": lambda value=seconds: FixedEstimator(value)
                for seconds in (0.0, 0.05, 0.5, 2.0, 10.0, 180.0)}}
 
@@ -76,6 +76,77 @@ class FileResult:
     first_usable_latency: float | None = None
     premature_exposure_seconds: float = 0.0
     proposal_times: list[float] = field(default_factory=list)
+
+
+def proposal_boundaries(trace: Trace) -> tuple[dict, dict]:
+    """Scoring truth only: complete arrival excludes handle-release time."""
+    groups = {}
+    for file in trace.files:
+        groups.setdefault(file.group, []).append(file)
+    group_arrivals = {
+        key: None if any(file.complete_at is None for file in files)
+        else max(max(file.complete_at, file.visible_at) for file in files)
+        for key, files in groups.items()
+    }
+    group_ready = {
+        key: None if group_arrivals[key] is None
+        else readable_group_from(files, group_arrivals[key])
+        for key, files in groups.items()
+    }
+    boundaries = {}
+    for file in trace.files:
+        if file.shape == "split_complete":
+            boundaries[file.key] = (group_arrivals[file.group], group_ready[file.group])
+        elif file.complete_at is None:
+            boundaries[file.key] = (None, None)
+        else:
+            arrived = max(file.complete_at, file.visible_at)
+            boundaries[file.key] = (arrived, file.readable_from(arrived))
+    return group_ready, boundaries
+
+
+def readable_group_from(files, at):
+    for start, end in sorted(interval for file in files for interval in file.blocked):
+        if start <= at < end:
+            at = end
+    return at
+
+
+def add_valid_proposal_latency(files: list[dict], boundaries: dict) -> None:
+    """Score actual proposal times against writer-only readiness boundaries.
+
+    No proposal is synthesized at arrival/readability/group-completion time.
+    A missing proposal stays censored, even if a readiness guard could retry.
+    """
+    for file in files:
+        arrived, ready = boundaries[file["key"]]
+        first = next((at for at in file["proposal_times"] if ready is not None and at >= ready), None)
+        file.update(complete_arrival_at=arrived, first_valid_proposal_at=first,
+                    complete_arrival_to_valid_proposal_seconds=None if first is None else first - arrived,
+                    invalid_proposals=sum(ready is None or at < ready for at in file["proposal_times"]))
+
+
+def record_proposal(result: FileResult, file, at: float, group_ready: dict, horizon: float) -> None:
+    result.proposals += 1
+    result.proposal_times.append(at)
+    if group_ready[file.group] is None or at < group_ready[file.group]:
+        result.early_group_proposals += 1
+    if not file.readable(at):
+        result.busy_proposals += 1
+    if file.complete_at is None or at < file.complete_at:
+        result.premature += 1
+        mutations = [item.at for item in file.mutations]
+        position = bisect.bisect_right(mutations, at)
+        end = mutations[position] if position < len(mutations) else horizon
+        if file.complete_at is not None:
+            end = min(end, file.complete_at)
+        result.premature_exposure_seconds += max(0.0, end - at)
+    else:
+        if result.first_detection_latency is None:
+            result.first_detection_latency = at - file.complete_at
+        usable_at = file.readable_from(max(file.complete_at, file.visible_at))
+        if at >= usable_at and result.first_usable_latency is None:
+            result.first_usable_latency = at - usable_at
 
 
 def replay(trace: Trace, factory: Callable[[], Estimator], *, tie_order: str = "observation_first") -> dict:
@@ -101,12 +172,7 @@ def replay(trace: Trace, factory: Callable[[], Estimator], *, tie_order: str = "
     deadline_count = 0
     # Missing members are evaluated as a separate archive-group fact. They do
     # not turn a correctly stable individual volume into a false file decision.
-    groups = {}
-    for file in trace.files:
-        groups.setdefault(file.group, []).append(file)
-    group_ready = {key: None if any(file.complete_at is None or file.shape == "split_missing" for file in files)
-                   else max(max(file.complete_at, file.visible_at, file.busy_until) for file in files)
-                   for key, files in groups.items()}
+    group_ready, boundaries = proposal_boundaries(trace)
     while heap:
         at, _, _, key, payload = heapq.heappop(heap)
         if at > trace.horizon:
@@ -130,28 +196,9 @@ def replay(trace: Trace, factory: Callable[[], Estimator], *, tie_order: str = "
             continue
         pending.remove(key)
         result, file = results[key], truth[key]
-        result.proposals += 1
-        result.proposal_times.append(at)
-        if group_ready[file.group] is None or at < group_ready[file.group]:
-            result.early_group_proposals += 1
-        if at < file.busy_until:
-            result.busy_proposals += 1
-        if file.complete_at is None or at < file.complete_at:
-            result.premature += 1
-            # Each proposal is disarmed until new content, so these intervals
-            # cannot overlap. A later physical write ends this false suspicion.
-            mutations = [item.at for item in file.mutations]
-            position = bisect.bisect_right(mutations, at)
-            end = mutations[position] if position < len(mutations) else trace.horizon
-            if file.complete_at is not None:
-                end = min(end, file.complete_at)
-            result.premature_exposure_seconds += max(0.0, end - at)
-        else:
-            if result.first_detection_latency is None:
-                result.first_detection_latency = at - file.complete_at
-            usable_at = max(file.complete_at, file.visible_at, file.busy_until)
-            if at >= usable_at and result.first_usable_latency is None:
-                result.first_usable_latency = at - usable_at
-    return {"files": [asdict(result) for result in results.values()],
+        record_proposal(result, file, at, group_ready, trace.horizon)
+    files = [asdict(result) for result in results.values()]
+    add_valid_proposal_latency(files, boundaries)
+    return {"files": files,
             "delivered_observations": len(trace.observations), "scheduled_deadlines": deadline_count,
             "peak_live_estimators": peak_models, "replay_cpu_ns": time.process_time_ns() - started}

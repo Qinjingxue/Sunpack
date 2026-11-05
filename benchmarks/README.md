@@ -2,14 +2,21 @@
 
 Performance measurements and diagnostic profiles live here; behavioural assertions live under `tests/`.
 
-File-quiescence algorithm research uses the offline `scheduling watch-quiet-window`
-baseline: [protocol](quiet_window/PROTOCOL.md), [papers and benchmark survey](quiet_window/RESEARCH.md),
-and [initial results](quiet_window/BASELINE.md) ([JSON](quiet_window/baseline.json)). It separates writer truth
-from delivered observations, reports premature proposals together with latency and
-censoring, and preserves the exact corpus for paired comparisons. It requires no
-Watch Broker. Existing real Watch scenarios remain the system-level evaluation.
-The [time-decayed P90 comparison](quiet_window/TIME_DECAY.md) records the first
-candidate and its separate paired tracker CPU/allocation measurements.
+File-quiescence research uses 28 complex writer programs: segmented downloads,
+retries, sparse holes, cached writes, block reuse, assembly, handle lifetimes,
+archive backpatching and actual multipart arrival timelines. See the
+[writer/source matrix](quiet_window/WRITERS.md), [protocol](quiet_window/PROTOCOL.md)
+and [research survey](quiet_window/RESEARCH.md). Obsolete synthetic cadence code
+and its historical results have been removed.
+
+Use `scheduling watch-quiet-scheduler` for zero missing complete inputs, then
+complete-arrival-to-first-valid-proposal latency, then invalid-attempt cost.
+It reuses production admission, boundary checks and tracker retirement with
+virtual metadata/readiness IO; multipart inputs are scored once per group.
+`scheduling watch-quiet-window` isolates the estimator on the same writer corpus.
+`scheduling watch-quiet-cost` measures paired tracker CPU and allocation costs.
+These offline experiments require no Watch Broker. Existing real Watch/CLI
+scenarios remain the system-level and archive-format evaluation.
 
 The typed-hit index protocol, pinned baselines, corpus recipes, statistics and
 release gates are documented in [hit_index/PROTOCOL.md](hit_index/PROTOCOL.md).

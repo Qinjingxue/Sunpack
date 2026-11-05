@@ -35,11 +35,11 @@ def _observe(module, traces, repetitions):
     started = time.process_time_ns()
     for _ in range(repetitions):
         for trace in traces:
-            tracker = module.AdaptiveQuietTracker(policy)
+            trackers = {file.key: module.AdaptiveQuietTracker(policy) for file in trace.files}
             for event in trace.observations:
-                tracker.observe(event.at, size=event.size, mtime=event.mtime,
-                                change_usn=event.usn, content_changed=event.content_changed,
-                                learn_interval=event.learn_interval)
+                trackers[event.key].observe(event.at, size=event.size, mtime=event.mtime,
+                                            change_usn=event.usn, content_changed=event.content_changed,
+                                            learn_interval=event.learn_interval)
     return time.process_time_ns() - started
 
 
@@ -75,9 +75,9 @@ def main(argv=None):
         parser.error("counts must be positive")
     if args.worker is not None:
         baseline = _load(args.baseline_source)
-        # A fixed development seed, all writer families, immediate delivery,
-        # one file per trace. Preparation and JSON IO are outside the timer.
-        traces = tuple(generate(1, ("development",), ("immediate",), (1,)))
+        # All complex writers; multipart programs need four volumes. Writer
+        # preparation and JSON IO are outside the tracker-only timer.
+        traces = tuple(generate(1, ("development",), ("immediate",), (1, 4)))
         events = sum(len(trace.observations) for trace in traces)
         repetitions = max(1, (args.observations + events - 1) // events)
         order = [("baseline", baseline), ("candidate", quiet_policy)]
@@ -101,7 +101,8 @@ def main(argv=None):
             source = path.read_text(encoding="utf-8")
             identities[name] = fast_hash128(source.encode("utf-8"))
             workspace.write_result_text(f"{name}.py.txt", source)
-        workspace.write_result_text("cost.py.txt", Path(__file__).read_text(encoding="utf-8"))
+        for name in ("cost.py", "corpus.py", "writers.py"):
+            workspace.write_result_text(name + ".txt", Path(__file__).with_name(name).read_text(encoding="utf-8"))
         samples = []
         for index in range(args.processes):
             command = [sys.executable, "-m", "benchmarks.quiet_window.cost", "--worker", str(index),
@@ -117,7 +118,7 @@ def main(argv=None):
                        paired_cpu_ratio_range=[min(ratios), max(ratios)], artifacts=str(workspace.result_dir))
         payload = {"parameters": {"source_xxh128": identities, "processes": args.processes,
                                   "minimum_observations": args.observations, "live_trackers": args.trackers,
-                                  "workload": "development-seed-0/all-families/immediate/width-1",
+                                  "workload": "development-seed-0/all-complex-writers/immediate/widths-1-and-4",
                                   "scope": "tracker-observe-and-construction; allocation measured separately"},
                    "samples": samples, "summary": summary}
         rendered = render_report(report_from_payload(scenario, payload))
