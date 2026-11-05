@@ -6,7 +6,10 @@
 
 1. 已完整到达但没有有效提案的输入数必须为零。报告同时给出绝对数量和 `censored_valid_proposal_rate`，不能用低平均延迟抵消漏提案。
 2. 核心指标 `mean_ready_to_valid_proposal_seconds`：从内容完整、目标路径可见、分卷齐备且句柄已允许处理的首个时刻，到首次有效提案。独占句柄尚未释放的等待在计时起点之前，不计入延迟；未有效提案不记零，也不混入条件平均值。另看 50ms/500ms/2s/10s/60s 预算命中率，未提案保留在分母。
-3. `invalid_proposals_per_file` 为第二指标。在主回放中名字里的 file 指逻辑输入：单文件一个，四个分卷合计一个。每次无效提案只计一次；不重复累加内容未齐、占用和缺卷诊断。优化不能靠显著增加无效尝试换延迟，必须同时报告每族的尝试变化和资源成本，不把两项加权成可以掩盖漏处理的总分。
+3. 第二指标为整条写入者轨迹中任意 100ms、1s、10s 滑动窗口内的最大无效提案数。先对每个逻辑输入求峰值，再报告均值、每条 trace 内 P95 和最大值；另将同一并发 trace 的全部逻辑输入合并求峰值。报告保留全局、每族、每并发宽度的实际最坏峰值。窗口采用纳秒精度的半开区间 `[start,start+span)`，没有固定分桶边界；同时发生的多次提案分别计数。单文件一个逻辑输入，四个分卷合计一个；合并的是提案时间线，不去重真实尝试。
+4. `invalid_proposals_per_file` 降为诊断，不用于搜索或验收；CPU、IO 和在途工作量也不作为函数搜索或验收目标。旧资源字段仅供理解实验执行成本。首次有效提案延迟继续优先，峰值用于限制不可接受的短时错误尝试膨胀，不将这些指标加权成可以掩盖漏处理的总分。
+
+`invalid_burst_<100ms|1s|10s>_per_input` 是每个逻辑输入峰值的均值；`p95_per_trace` 是 trace 内逻辑输入峰值的 P95；`input_max_per_trace` 是 trace 内最坏单输入峰值；`all_inputs` 是并发合计峰值。这些 trace 指标按原有分组规则汇总，因此跨 trace 的值可能为小数，不能把“trace 最大值的均值”解释为全实验的最坏值。报告的 `burst_worst` 单独取真实最大值，按全局、family、width 分层保留，不平均。取消/暂停等没有完成的负例也参与全部峰值统计。
 
 取消和暂停保留三个未填范围，`complete_at=null`。这两个负例检查算法是否在没有新内容时不断重复尝试；没有完整到达，所以不进入主延迟和漏提案分母。它们不代表“末次通知随机丢失”。
 
@@ -66,7 +69,7 @@ uv run --no-sync python -m benchmarks scheduling watch-quiet-scheduler --corpus 
 
 ## 工件与资源
 
-轨迹合同 `sunpack.writer-behaviour/2`，估计器计分合同 `sunpack.quiet-window/5`，生产入场回放合同 `sunpack.quiet-scheduler/3`。不读取旧合同，也不保留历史重评分兼容入口。
+轨迹合同 `sunpack.writer-behaviour/2`，估计器计分合同 `sunpack.quiet-window/6`，生产入场回放合同 `sunpack.quiet-scheduler/4`。旧摘要不直接比较；双方在同一评估器上重放。已保存的完整提案时间线可以按明确的新统计定义重新计分，不重建提案、不混用旧摘要。
 
 复用 benchmark workspace/report envelope。每次实验保存 canonical gzip 轨迹、完整提案时间线、报告、冻结策略、生成器/评估器/相关生产源码。直接冻结当前源码，不把已经删除的数据通过 git diff 再存进工件。使用现有 Rust xxh128 标识语料和源码；指纹仅用于复现身份，不校验文件内容。两边语料和评估器不一致时拒绝配对。
 
@@ -81,3 +84,7 @@ uv run --no-sync python -m benchmarks scheduling watch-quiet-scheduler --corpus 
 不可读期间，回放将状态不变的重复 busy timer/probe 合并：正间隔按原重试周期解析推进，保留下一 deadline 的周期相位；零间隔合并无时间推进的自旋。同一文件物理变化、通知或句柄释放时继续调用真实 `_pop_ready`，记录 `coalesced_busy_timer_runs`。无关文件通知不会唤醒它。因此回放 CPU/probe 数不代表生产 busy 重试成本；生产没有新增轮询、等待或失败次数上限。对前版 608 条回放逐项比较提案时间，数量全部一致，最大浮点差 3.34e-13 秒。
 
 阶段模型的配对实验使用三个划分各 8 个 seed；参数只依据 development 冻结。结果与适用边界见 [PHASE_RESULTS.md](PHASE_RESULTS.md)。这是默认 16 seeds 设计的一半；不能沿用已删除旧语料的数字，也不能把合成 heldout 解释为真实下载器的外部验证。
+
+## 映射函数搜索
+
+入口、冻结计划、搜索空间、峰值边界、筛选与独立审核流程见 [SEARCH.md](SEARCH.md)。搜索复用上述生产调度回放，不新增生产分析路径，不把完成真值交给策略，不将归档输入的实际处理成本引入目标。

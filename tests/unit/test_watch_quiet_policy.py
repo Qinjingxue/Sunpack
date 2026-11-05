@@ -18,7 +18,7 @@ def test_policy_starts_immediately_then_learns_without_a_minimum_wait():
     assert tracker.quiet_seconds == 0.0
     tracker.observe(0.2, size=3, mtime=0.2)
 
-    assert 0.1 < tracker.quiet_seconds < 0.15
+    assert 0.1 < tracker.quiet_seconds < 0.2
 
 
 def test_weighted_p90_uses_real_sample_age_and_excludes_underflowed_history():
@@ -107,19 +107,20 @@ def test_pause_is_excluded_but_repeated_slow_cadence_is_learned_then_fast_writes
     tracker.observe(300.2, size=4, mtime=300.2)
     assert tracker.quiet_seconds == fast
     tracker.observe(300.3, size=5, mtime=300.3)
-    assert tracker.quiet_seconds < 0.15
+    assert tracker.quiet_seconds == pytest.approx(fast)
     tracker.observe(600.3, size=6, mtime=600.3)
-    assert tracker.quiet_seconds < 0.15
+    assert tracker.quiet_seconds == pytest.approx(fast)
     tracker.observe(900.3, size=7, mtime=900.3)
     learned = tracker.quiet_seconds
-    assert learned > 300.0
+    assert tracker.cadence_seconds == pytest.approx(300.0)
+    assert learned > 10.0 * fast
     for index in range(1, 5):
         now = 900.3 + 0.1 * index
         tracker.observe(now, size=index + 7, mtime=now)
         if index < 4:
             assert tracker.quiet_seconds == learned
         else:
-            assert 0.1 < tracker.quiet_seconds < 0.15
+            assert tracker.quiet_seconds == pytest.approx(fast)
 
 
 def test_truncation_starts_a_new_phase_and_boundary_probe_breaks_confirmation():
@@ -129,7 +130,7 @@ def test_truncation_starts_a_new_phase_and_boundary_probe_breaks_confirmation():
     tracker.observe(300.2, size=13, mtime=300.2)
     tracker.observe(400.2, size=14, mtime=400.2, learn_interval=False)
     tracker.observe(700.2, size=15, mtime=700.2)
-    assert tracker.quiet_seconds < 0.15
+    assert 0.1 < tracker.quiet_seconds < 0.2
     tracker.observe(700.3, size=1, mtime=700.3)
     assert tracker.quiet_seconds == tracker.cadence_seconds == tracker.pending_interval_seconds == 0.0
     assert tracker.intervals == ()
@@ -145,13 +146,17 @@ def test_close_summary_ends_frequency_sampling_without_claiming_file_completion(
     tracker.observe(300.3, size=4, mtime=300.3)
     assert tracker.quiet_seconds == learned and tracker.pending_interval_seconds == 0.0
     tracker.observe(300.4, size=5, mtime=300.4)
-    assert tracker.quiet_seconds < 0.15
+    assert tracker.quiet_seconds == pytest.approx(learned)
 
 
 @pytest.mark.parametrize("scenario", representative_write_scenarios())
 def test_representative_cadences_are_invariant_to_time_units(scenario: WriteScenario):
     """The interval estimator is scale-free; the retained mapping is tested above."""
-    policy = AdaptiveQuietPolicy(logarithmic_scale=0.0)
+    class IntervalPolicy(AdaptiveQuietPolicy):
+        def target_seconds(self, interval: float) -> float:
+            return interval
+
+    policy = IntervalPolicy()
     result = simulate_writes(scenario, policy)
 
     for factor in (1e-6, 1e6):

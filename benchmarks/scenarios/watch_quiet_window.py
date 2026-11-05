@@ -18,7 +18,7 @@ from benchmarks.harness.reporting import report_from_payload, render_report
 from benchmarks.harness.workspace import BenchmarkWorkspace
 from benchmarks.quiet_window.corpus import CHANNELS, CONTRACT, FAMILIES, SPLITS, WIDTHS, Trace, generate
 from benchmarks.quiet_window.replay import estimators, proposal_boundaries, replay
-from benchmarks.quiet_window.statistics import EVALUATION_CONTRACT, METRICS, interval, macro, paired_comparison, summarize_files
+from benchmarks.quiet_window.statistics import BURST_WINDOWS, EVALUATION_CONTRACT, METRICS, interval, macro, paired_comparison, summarize_files
 from sunpack.runtime.watch import quiet_policy
 from sunpack.core.config.fields.watch import DEFAULT_WATCH_CONFIG
 
@@ -124,13 +124,15 @@ def main(argv=None, *, scheduler_mode=False):
                               "runner_source_xxh128": fast_hash128(Path(__file__).read_text(encoding="utf-8").encode("utf-8")),
                               "tie_orders": list(args.tie_orders),
                               "slo_resolution_nanoseconds": 1,
+                              "invalid_burst_windows_nanoseconds": dict(BURST_WINDOWS),
+                              "invalid_burst_semantics": "max-sliding-half-open-window;per-logical-input-and-concurrent-trace;negative-writers-included",
                               "proposal_semantics": proposal_semantics,
                               "weighting": "equal-family-then-equal-channel-width-tie-within-seed",
                               "scope": "estimator-only-not-scheduler-or-extraction",
                               "valid_proposal_latency": "complete-visible-readable-and-split-ready-to-first-valid-proposal;exclusive-handle-wait-excluded"}
         if scheduler_mode:
             parameter_identity.update(
-                contract="sunpack.quiet-scheduler/3", metric_contract=EVALUATION_CONTRACT,
+                contract="sunpack.quiet-scheduler/4", metric_contract=EVALUATION_CONTRACT,
                 proposal_semantics="production-enqueue-pop-ready-boundary-confirmation-instant-retirement",
                 scope="production-admission-with-virtual-metadata-readiness-clock-and-memory-only-wal;not-extraction",
                 scoring_unit="single-file-or-complete-split-input;any-member-admission",
@@ -155,6 +157,7 @@ def main(argv=None, *, scheduler_mode=False):
         family_blocks, strata = Aggregates(), Aggregates()
         counts = Counter()
         resource = defaultdict(Counter)
+        burst_worst = defaultdict(Counter)
         seen = set()
         started = time.perf_counter()
         with ExitStack() as stack:
@@ -185,6 +188,12 @@ def main(argv=None, *, scheduler_mode=False):
                 for algorithm, tie_order, result in results:
                     scoring_files = result.get("inputs", result["files"])
                     metrics = summarize_files(scoring_files)
+                    for label, _ in BURST_WINDOWS:
+                        for suffix in ("input_max_per_trace", "all_inputs"):
+                            name = f"invalid_burst_{label}_{suffix}"
+                            for axis, value in (("all", "all"), ("family", trace.family), ("width", str(trace.width))):
+                                key = (trace.split, algorithm, axis, value)
+                                burst_worst[key][name] = max(burst_worst[key][name], metrics[name])
                     family_blocks.add((trace.split, trace.seed, algorithm, trace.family), metrics)
                     for axis, value in (("family", trace.family), ("channel", trace.channel), ("width", str(trace.width)), ("tie_order", tie_order)):
                         strata.add((trace.split, algorithm, axis, value), metrics)
@@ -231,6 +240,8 @@ def main(argv=None, *, scheduler_mode=False):
                                "strata": [{"split": split, "algorithm": algorithm, "axis": axis, "value": value, **metrics}
                                           for (split, algorithm, axis, value), metrics in strata.rows()],
                                "resources": {key: dict(value) for key, value in resource.items()},
+                               "burst_worst": [{"split": split, "algorithm": algorithm, "axis": axis, "value": value, **dict(values)}
+                                               for (split, algorithm, axis, value), values in sorted(burst_worst.items())],
                                "wall_seconds": time.perf_counter() - started,
                                "paired_difference_from_baseline": paired_comparison(samples, baseline) if baseline else None,
                                "artifacts": {"directory": str(workspace.result_dir), "traces": trace_path.name,

@@ -3570,16 +3570,18 @@ def test_watch_scheduler_preserves_phase_evidence_across_retirement_and_resets_f
     archive_path.write_bytes(b"third--")
     os.utime(archive_path, (clock.value, clock.value))
     events.emit(archive_path, event_type="modified")
-    WatchState.assert_quiet_seconds(watcher, archive_path, minimum=20.0)
-    events.run_after(20.0, processed=0)
-    events.run_after(2.0, processed=1)
+    learned_quiet = watcher._active_states[str(archive_path)].quiet_seconds
+    assert learned_quiet > 0.0
+    assert watcher._quiet_trackers[str(archive_path)].cadence_seconds == pytest.approx(20.0)
+    events.run_after(learned_quiet * 0.9, processed=0)
+    events.run_after(learned_quiet * 0.2, processed=1)
 
     clock.advance(3600.0)
     archive_path.write_bytes(b"fourth--")
     os.utime(archive_path, (clock.value, clock.value))
     events.emit(archive_path, event_type="modified")
-    WatchState.assert_quiet_seconds(watcher, archive_path, minimum=20.0, maximum=25.0)
-    events.run_after(22.0, processed=1)
+    assert watcher._active_states[str(archive_path)].quiet_seconds == pytest.approx(learned_quiet)
+    events.run_after(learned_quiet + 0.01, processed=1)
 
     replacement = tmp_path / "replacement"
     replacement.write_bytes(b"replaced")

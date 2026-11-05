@@ -213,9 +213,9 @@ def make_trace(family: str, split: str, seed: int, channel: str, width: int) -> 
 
 
 def generate(seeds: int, splits: tuple[str, ...], channels: tuple[str, ...], widths: tuple[int, ...],
-             families: tuple[str, ...] = FAMILIES) -> Iterator[Trace]:
+             families: tuple[str, ...] = FAMILIES, *, seed_start: int = 0) -> Iterator[Trace]:
     for split in splits:
-        for seed in range(seeds):
+        for seed in range(seed_start, seed_start + seeds):
             for family in families:
                 for channel in channels:
                     for width in widths:

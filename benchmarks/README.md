@@ -10,11 +10,15 @@ and [research survey](quiet_window/RESEARCH.md). Obsolete synthetic cadence code
 and its historical results have been removed.
 
 Use `scheduling watch-quiet-scheduler` for zero missing complete inputs, then
-complete-arrival-to-first-valid-proposal latency, then invalid-attempt cost.
+complete-arrival-to-first-valid-proposal latency, then sliding-window peaks of
+invalid attempts (100ms/1s/10s; per input and concurrent trace).
 It reuses production admission, boundary checks and tracker retirement with
 virtual metadata/readiness IO; multipart inputs are scored once per group.
 `scheduling watch-quiet-window` isolates the estimator on the same writer corpus.
 `scheduling watch-quiet-cost` measures paired tracker CPU and allocation costs.
+`scheduling watch-quiet-search` searches bounded symbolic mappings and constants
+through the same production replay; see [search protocol](quiet_window/SEARCH.md).
+CPU, IO, inflight work and total invalid attempts are not search/acceptance goals.
 These offline experiments require no Watch Broker. Existing real Watch/CLI
 scenarios remain the system-level and archive-format evaluation.
 

@@ -14,9 +14,6 @@ class AdaptiveQuietPolicy:
     half_life_factor: float = 2.0
     pause_ratio: float = 8.0
     phase_confirmation_ratio: float = 2.0
-    linear_factor: float = 1.0
-    logarithmic_scale: float = 0.75
-    logarithmic_pivot_seconds: float = 2.0
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "window_size", max(1, int(self.window_size)))
@@ -30,9 +27,6 @@ class AdaptiveQuietPolicy:
             if not math.isfinite(ratio) or ratio <= 1.0:
                 raise ValueError(f"{name} must be finite and greater than one")
             object.__setattr__(self, name, ratio)
-        object.__setattr__(self, "linear_factor", max(0.0, float(self.linear_factor)))
-        object.__setattr__(self, "logarithmic_scale", max(0.0, float(self.logarithmic_scale)))
-        object.__setattr__(self, "logarithmic_pivot_seconds", max(1e-6, float(self.logarithmic_pivot_seconds)))
 
     def effective_interval(self, samples: deque[tuple[float, float]]) -> float:
         # Each sample is (content interval, monotonic observation timestamp).
@@ -58,8 +52,9 @@ class AdaptiveQuietPolicy:
         return weighted[-1][0]
 
     def target_seconds(self, interval: float) -> float:
-        return (self.linear_factor * interval
-                + self.logarithmic_scale * math.log1p(interval / self.logarithmic_pivot_seconds))
+        # Frozen closed-loop search winner; see benchmarks/quiet_window/FUNCTION_SEARCH_RESULTS.md.
+        scaled = interval / 0.84
+        return 1.52 * math.log1p(0.5 * scaled + 0.5 * math.log1p(scaled))
 
 
 @dataclass(slots=True)

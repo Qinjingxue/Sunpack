@@ -15,6 +15,7 @@ _ROWS = [
     ("scheduling", "watch-quiet-scheduler", "benchmarks.scenarios.watch_quiet_scheduler", "Complex writer programs driving production Watch admission; complete-input latency and invalid attempts."),
     ("scheduling", "watch-quiet-window", "benchmarks.scenarios.watch_quiet_window", "Estimator diagnostics on the same complex writer byte-range, retry, publication and handle timelines."),
     ("scheduling", "watch-quiet-cost", "benchmarks.quiet_window.cost", "Paired tracker CPU and bounded-history allocation cost against a frozen policy source."),
+    ("scheduling", "watch-quiet-search", "benchmarks.quiet_window.search", "Bounded symbolic mapping and constant search; first-valid latency and sliding-window invalid-attempt peaks."),
     ("scheduling", "event-log", "benchmarks.scenarios.event_log", "State-log submission, deletion storms, compaction and short restart retention."),
     ("scheduling", "broker-request-selection", "benchmarks.scenarios.broker_request_selection", "Request-count scaling and fixed-order no-scan scheduling ceiling."),
     ("scheduling", "broker-queue", "benchmarks.scenarios.broker_queue", "Committed versus working-tree broker queue selection and throughput."),

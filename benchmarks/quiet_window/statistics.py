@@ -5,7 +5,14 @@ import random
 import statistics
 
 
-EVALUATION_CONTRACT = "sunpack.quiet-window/5"
+EVALUATION_CONTRACT = "sunpack.quiet-window/6"
+
+# Fixed-duration, arbitrarily positioned half-open windows [start, start+span).
+# Integer nanoseconds share the latency SLO's timestamp resolution. Every
+# admission counts, including simultaneous admissions of different volumes.
+BURST_WINDOWS = (("100ms", 100_000_000), ("1s", 1_000_000_000), ("10s", 10_000_000_000))
+BURST_METRICS = tuple(f"invalid_burst_{label}_{suffix}" for label, _ in BURST_WINDOWS
+                      for suffix in ("per_input", "p95_per_trace", "input_max_per_trace", "all_inputs"))
 
 METRICS = ("false_ready_file_rate", "premature_proposals_per_file", "censored_complete_rate",
            "invalid_proposals_per_file",
@@ -14,6 +21,36 @@ METRICS = ("false_ready_file_rate", "premature_proposals_per_file", "censored_co
            "mean_detection_latency_seconds", "busy_proposals_per_file", "early_group_proposals_per_file",
            "premature_exposure_seconds_per_file", "within_50ms", "within_500ms", "within_2s", "within_10s", "within_60s")
 METRICS += ("valid_within_50ms", "valid_within_500ms", "valid_within_2s", "valid_within_10s", "valid_within_60s")
+METRICS += BURST_METRICS
+
+
+def sliding_peak(timestamps_ns, span_ns):
+    """Linear scan of sorted timestamps; no bins and no time-step sampling."""
+    left = peak = 0
+    for right, at in enumerate(timestamps_ns):
+        while at - timestamps_ns[left] >= span_ns:
+            left += 1
+        peak = max(peak, right - left + 1)
+    return peak
+
+
+def invalid_bursts(inputs):
+    """Writer-truth scoring only; never supplied to the admission policy."""
+    histories = []
+    for item in inputs:
+        ready = item["processing_ready_at"]
+        histories.append(sorted(round(at * 1_000_000_000) for at in item["proposal_times"]
+                                if ready is None or at < ready))
+    concurrent = sorted(at for history in histories for at in history)
+    metrics = {}
+    for label, span in BURST_WINDOWS:
+        peaks = [sliding_peak(history, span) for history in histories]
+        prefix = f"invalid_burst_{label}_"
+        metrics.update({prefix + "per_input": statistics.mean(peaks) if peaks else None,
+                        prefix + "p95_per_trace": quantile(peaks, 0.95),
+                        prefix + "input_max_per_trace": max(peaks, default=0),
+                        prefix + "all_inputs": sliding_peak(concurrent, span)})
+    return metrics
 
 
 def quantile(values, probability):
@@ -52,6 +89,7 @@ def summarize_files(files: list[dict]) -> dict:
         "conditional_latency_p95_seconds": quantile(latencies, 0.95),
         "conditional_latency_p99_seconds": quantile(latencies, 0.99),
     }
+    result.update(invalid_bursts(files))
     for name, budget in (("within_50ms", 0.05), ("within_500ms", 0.5), ("within_2s", 2), ("within_10s", 10), ("within_60s", 60)):
         # Express the inclusive SLO in integer nanoseconds. Subtracting two
         # large binary timestamps can otherwise turn exactly 0.5s into
