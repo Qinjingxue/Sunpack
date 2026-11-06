@@ -10,7 +10,6 @@ from sunpack.core.passwords.internal.store import PasswordStore
 class PasswordCandidate:
     value: str
     source: str = "unknown"
-    rule: str = ""
     priority: int = 100
 
 

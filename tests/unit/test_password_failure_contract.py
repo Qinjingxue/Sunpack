@@ -69,7 +69,6 @@ def test_scheduler_stops_password_batch_on_unavailable_tail_without_negative_res
 
     assert result.status == (PasswordSearchStatus.NEEDS_VOLUME_OR_TAIL_DAMAGED if evidence == "ambiguous-tail" else PasswordSearchStatus.MISSING_VOLUME)
     assert result.attempts == 0
-    assert result.exhausted is False
 
 
 def test_fast_verifier_preserves_native_field_read_diagnostics():

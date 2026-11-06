@@ -72,7 +72,6 @@ class PasswordSearchResult:
     test_result: object = None
     error_text: str = ""
     attempts: int = 0
-    exhausted: bool = False
     stopped_reason: str = ""
     extraction_candidates: tuple[str, ...] = ()
     extraction_candidate_evidence: str = ""
@@ -192,7 +191,6 @@ class PasswordScheduler:
                 test_result=last_result,
                 error_text=last_error,
                 attempts=attempts,
-                exhausted=True,
                 stopped_reason="candidates_rejected" if candidates_seen else "no_candidates",
             )
             self._emit_finished(job, result, started_at, candidates_seen, skipped)
@@ -368,7 +366,6 @@ class PasswordScheduler:
                     password=None,
                     status=PasswordSearchStatus.EXHAUSTED,
                     attempts=attempts,
-                    exhausted=True,
                     stopped_reason="candidates_rejected" if candidates_seen or skipped else "no_candidates",
                 )
             self._emit_finished(job, result, started_at, candidates_seen, skipped)

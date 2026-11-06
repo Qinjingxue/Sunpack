@@ -103,7 +103,7 @@ def test_cancelled_password_kdf_drains_without_cancelling_shared_input(tmp_path,
     import zlib
 
     from sunpack.core.passwords.job import PasswordJob
-    from sunpack.core.passwords.scheduler import PasswordScheduler
+    from sunpack.core.passwords.scheduler import PasswordScheduler, PasswordSearchStatus
     from sunpack.core.passwords.verifier.registry import PasswordVerifierChain
     from sunpack.core.support.work_context import CURRENT_CANCELLATION
     from sunpack.pipeline.coordinator.async_work import AsyncWorkBroker, CancellationToken
@@ -160,7 +160,7 @@ def test_cancelled_password_kdf_drains_without_cancelling_shared_input(tmp_path,
                     await asyncio.wait_for(asyncio.shield(first), 1)
             finally:
                 timer.cancel()
-            assert (await asyncio.wait_for(second, 10)).exhausted
+            assert (await asyncio.wait_for(second, 10)).status == PasswordSearchStatus.EXHAUSTED
             assert not survivor.cancelled
             assert not cancelled._callbacks and not survivor._callbacks
             assert scheduler.cache.stats() == {'successes': 0, 'negative': 1}
@@ -275,7 +275,7 @@ def test_multibatch_password_job_releases_its_input_before_task_exit(tmp_path, m
     while the surrounding task remains alive proves independent cleanup safety.
     """
     from sunpack.core.passwords.job import PasswordJob
-    from sunpack.core.passwords.scheduler import PasswordScheduler
+    from sunpack.core.passwords.scheduler import PasswordScheduler, PasswordSearchStatus
     from sunpack.core.passwords.verifier.registry import PasswordVerifierChain
     physical = [str(tmp_path / name) for name in ("first.bin", "second.bin")]
     for path in physical:
@@ -301,7 +301,7 @@ def test_multibatch_password_job_releases_its_input_before_task_exit(tmp_path, m
                 with pytest.raises(RuntimeError, match="candidate source failed"):
                     scheduler.plan_for_extraction(job)
             else:
-                assert scheduler.plan_for_extraction(job).exhausted
+                assert scheduler.plan_for_extraction(job).status == PasswordSearchStatus.EXHAUSTED
             assert not borrows(physical)
             with promotion_barrier(physical, timeout=0,
                     cache_releasers=(sessions.release_archive_sessions_under_roots,)):

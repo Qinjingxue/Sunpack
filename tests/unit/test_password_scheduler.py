@@ -477,7 +477,6 @@ def test_password_scheduler_reports_backend_failure_instead_of_exhausted(tmp_pat
     ))
 
     assert result.status == PasswordSearchStatus.BACKEND_UNAVAILABLE
-    assert result.exhausted is False
     assert verifier.batches == [["one"]]
     key = build_archive_fingerprint(str(archive)).key
     assert not scheduler.cache.has_negative(key, "one")
