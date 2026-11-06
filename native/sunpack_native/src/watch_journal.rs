@@ -407,41 +407,21 @@ impl JournalRuntime {
             let mut state = lock_state(&self.shared);
             let mut targets = Vec::with_capacity(state.streams.len());
             for (key, stream) in state.streams.iter_mut() {
-                if let Some(error) = &stream.error {
-                    return Err(error.clone());
-                }
                 let target = stream.written_seq;
                 stream.requested_seq = stream.requested_seq.max(target);
-                targets.push((key.clone(), target));
+                targets.push((key.clone(), stream.retired.clone(), target));
             }
             self.shared.cv.notify_all();
             targets
         };
 
-        let mut state = lock_state(&self.shared);
-        loop {
-            let mut all_done = true;
-            for (key, target) in &targets {
-                let Some(stream) = state.streams.get(key) else {
-                    continue;
-                };
-                if let Some(error) = &stream.error {
-                    return Err(error.clone());
-                }
-                if stream.durable_seq < *target {
-                    all_done = false;
-                    break;
-                }
-            }
-            if all_done {
-                return Ok(());
-            }
-            state = self
-                .shared
-                .cv
-                .wait(state)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Keep each captured incarnation, including its retired outcome. A
+        // concurrent close/reopen must not erase errors or replace our target.
+        for (key, retired, target) in targets {
+            self.shared
+                .wait_for(&key, &retired, target, TicketGoal::Durable)?;
         }
+        Ok(())
     }
 }
 
@@ -1174,6 +1154,70 @@ mod tests {
 
     fn empty_operations() -> JournalPayload {
         JournalPayload::Task(Arc::new(Operations::default()))
+    }
+
+    #[test]
+    fn global_flush_keeps_the_original_stream_outcome_after_retirement() {
+        // Ticket tests do not cover the global flush snapshot. Coordinate the
+        // retirement after admission without sleeps or real storage failures.
+        let mut outcomes = Vec::new();
+        for reopen in [false, true] {
+            for failed in [false, true] {
+                let shared = Arc::new(Shared::new());
+                let (writer_tx, writer_rx) = mpsc::channel();
+                let runtime = JournalRuntime {
+                    shared: shared.clone(),
+                    writer_tx,
+                };
+                lock_state(&shared).streams.insert(
+                    "stream".to_string(),
+                    StreamState {
+                        written_seq: 1,
+                        ..StreamState::default()
+                    },
+                );
+                let flush = thread::spawn(move || runtime.flush_all());
+                let WriterCommand::Barrier { done } = writer_rx.recv().unwrap() else {
+                    panic!("expected the flush barrier");
+                };
+                done.send(()).unwrap();
+
+                let mut state = lock_state(&shared);
+                while state.streams["stream"].requested_seq != 1 {
+                    state = shared.cv.wait(state).unwrap();
+                }
+                let stream = state.streams.get_mut("stream").unwrap();
+                stream.closing = true;
+                if failed {
+                    stream.error = Some("old stream failed".to_string());
+                } else {
+                    stream.durable_seq = 1;
+                }
+                retire_closed_stream(&mut state, "stream");
+                if reopen {
+                    state.streams.insert(
+                        "stream".to_string(),
+                        StreamState {
+                            written_seq: 1,
+                            durable_seq: 1,
+                            error: (!failed).then(|| "new stream failed".to_string()),
+                            ..StreamState::default()
+                        },
+                    );
+                }
+                shared.cv.notify_all();
+                drop(state);
+                outcomes.push((reopen, failed, flush.join().unwrap()));
+            }
+        }
+        for (reopen, failed, result) in outcomes {
+            let expected = if failed {
+                Err("old stream failed".to_string())
+            } else {
+                Ok(())
+            };
+            assert_eq!(result, expected, "reopen={reopen}, failed={failed}");
+        }
     }
 
     #[test]
