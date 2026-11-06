@@ -562,7 +562,7 @@ def test_encrypted_comment_zip_in_nested_carriers_runs_for_both_origins(tmp_path
 
 
 def test_real_native_zip_progress_stays_complete_after_watch_semantic_finish(tmp_path):
-    """Extract a real ZIP through the native worker and retain final UI state.
+    """Extract a real ZIP through the native worker and retain final rendered state.
 
     Watch emits task_output_finished after task_finished; it must not reset the
     terminal's completed row to extracting/0%, even without byte fields.
@@ -584,9 +584,21 @@ def test_real_native_zip_progress_stays_complete_after_watch_semantic_finish(tmp
     output.terminal_columns = 100
     events = []
     reporters = []
+    rendered = []
+
+    def configure(runtime):
+        reporter = runtime.reporter
+        reporters.append(reporter)
+        original = reporter._format_task_row
+
+        def format_row(row):
+            rendered.append(dict(row))
+            return original(row)
+
+        reporter._format_task_row = format_row
 
     engine = PipelineEngine(config)
-    _configure_request_runtime(engine, lambda runtime: reporters.append(runtime.reporter))
+    _configure_request_runtime(engine, configure)
 
     async def run():
         async with engine:
@@ -602,9 +614,9 @@ def test_real_native_zip_progress_stays_complete_after_watch_semantic_finish(tmp
     assert any(event.get("event") == "extract_ready" for event in events)
     assert any(event.get("event") == "task_output_finished" for event in events)
     reporter = reporters[0]
-    rows = list(reporter._task_rows.values())
-    assert len(rows) == 1
-    assert rows[0]["state"] == "complete"
-    assert rows[0]["progress_known"] is True
-    assert rows[0]["progress"] == 1.0
+    # Completion releases resident rows; the terminal owns the rendered result.
+    assert not reporter._task_rows
+    assert rendered[-1]["state"] == "complete"
+    assert rendered[-1]["progress_known"] is True
+    assert rendered[-1]["progress"] == 1.0
     assert "100%" in output.getvalue()

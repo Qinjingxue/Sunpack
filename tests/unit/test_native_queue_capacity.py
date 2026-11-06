@@ -1,5 +1,4 @@
 import asyncio
-import queue
 from concurrent.futures import Future
 from types import SimpleNamespace
 
@@ -76,7 +75,6 @@ def test_cancelled_backpressure_request_does_not_strand_other_requests(transport
                 self.queue_capacity = _NativeQueueCapacity()
                 self.jobs = {}
                 self.submitted = asyncio.Queue()
-                self.stderr_queue = queue.Queue()
 
             def is_alive(self):
                 return True
@@ -167,7 +165,6 @@ def test_backpressure_can_retry_past_legacy_limit_without_failing(transport):
                 self.queue_capacity = _NativeQueueCapacity()
                 self.jobs = {}
                 self.submitted = asyncio.Queue()
-                self.stderr_queue = queue.Queue()
 
             def is_alive(self):
                 return True

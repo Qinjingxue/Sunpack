@@ -1255,7 +1255,6 @@ def test_runner_serializes_only_codepage_for_filename_override(tmp_path):
 
     job = runner._build_job(
         archive_path=str(archive),
-        part_paths=[str(archive)],
         out_dir=str(tmp_path / "out"),
         password=None,
         password_candidates=None,

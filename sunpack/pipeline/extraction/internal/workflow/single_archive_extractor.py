@@ -248,7 +248,6 @@ class SingleArchiveExtractor:
             with _phase(phase_timer, f"{phase_prefix}_sevenzip_attempt"):
                 run_result = yield {
                     "archive_path": run_archive,
-                    "part_paths": run_parts,
                     "out_dir": out_dir,
                     "password": correct_pwd,
                     "password_candidates": list(resolution.candidate_passwords),

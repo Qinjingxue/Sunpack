@@ -10,7 +10,6 @@ import argparse
 import json
 import os
 from pathlib import Path
-import queue
 import re
 import shutil
 import statistics
@@ -23,7 +22,7 @@ if str(ROOT) not in sys.path:
 
 from benchmarks.harness import BenchmarkWorkspace
 from benchmarks.scenarios.worker_concurrency_300m import prepare, run_worker, validate, _volume_paths
-from sunpack.pipeline.extraction.internal.sevenzip.sevenzip_runner import _NativeWorkerProcess
+from benchmarks.scenarios.worker_writer_probe import WriterProbeWorker, profiles
 from tests.helpers.tool_config import get_7z_cli_dll_path
 
 HEADER = ROOT / "native/sevenzip_bridge/src/internal/sevenzip_async_output.hpp"
@@ -49,18 +48,6 @@ def build() -> None:
     subprocess.run(["cmake", "--build", str(BUILD), "--config", "Release",
                     "--target", "sunpack_sevenzip_worker", "--parallel"],
                    check=True, cwd=str(ROOT), capture_output=True)
-
-
-def probes(worker, expected):
-    rows = []
-    while len(rows) < expected:
-        try:
-            line = worker.stderr_queue.get(timeout=10)
-        except queue.Empty as exc:
-            raise RuntimeError(f"missing probes {len(rows)}/{expected}") from exc
-        if line and line.startswith("WRITER_PROBE "):
-            rows.append(json.loads(line.removeprefix("WRITER_PROBE ")))
-    return rows
 
 
 def main():
@@ -99,11 +86,11 @@ def main():
                 order = windows if trial % 2 == 0 else list(reversed(windows))
                 for window in order:
                     output = workspace.outputs / f"{args.format}-{window}-{trial}"
-                    worker = _NativeWorkerProcess(str(binaries[window]), None, {"writer_threads": 8})
+                    worker = WriterProbeWorker(str(binaries[window]), None, {"writer_threads": 8})
                     try:
                         row = run_worker(worker, [case] * args.concurrency, output,
                                          args.concurrency, dll, 600, False)
-                        row["probes"] = probes(worker, args.concurrency)
+                        row["probes"] = profiles(worker, args.concurrency, timeout=10)
                     finally:
                         worker.close()
                     validate(row, [case] * args.concurrency, output, tar_bytes)

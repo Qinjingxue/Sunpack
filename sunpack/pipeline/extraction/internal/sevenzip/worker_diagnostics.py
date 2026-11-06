@@ -15,6 +15,43 @@ _STDIO_TAIL_CHARS = 4000
 _PROGRESS_TAIL_EVENTS = 64
 
 
+class StdioHistory:
+    """Retain only the textual tail already used by worker diagnostics."""
+
+    __slots__ = ("_tail", "_chars")
+
+    def __init__(self):
+        self._tail: deque[str] = deque()
+        self._chars = 0
+
+    def append(self, text: str) -> None:
+        if not text:
+            return
+        text = text[-_STDIO_TAIL_CHARS:]
+        self._tail.append(text)
+        self._chars += len(text)
+        while self._chars > _STDIO_TAIL_CHARS or len(self._tail) > _STDIO_TAIL_LINES:
+            oldest = self._tail.popleft()
+            self._chars -= len(oldest)
+            if self._chars < _STDIO_TAIL_CHARS and len(self._tail) < _STDIO_TAIL_LINES:
+                suffix = oldest[-(_STDIO_TAIL_CHARS - self._chars):]
+                self._tail.appendleft(suffix)
+                self._chars += len(suffix)
+
+    def extend(self, lines: Iterable[str]) -> None:
+        for line in lines:
+            self.append(line)
+
+    def take(self) -> list[str]:
+        lines = list(self._tail)
+        self._tail.clear()
+        self._chars = 0
+        return lines
+
+    def text(self) -> str:
+        return "".join(self._tail)
+
+
 class ProgressHistory:
     """One job's total event count and bounded diagnostic tail."""
 

@@ -321,8 +321,6 @@ class RequestRuntimeProfiler:
         sevenzip = _child(extractor, "sevenzip_runner")
         _wrap(sevenzip, "extract_attempt", timings, "sevenzip_worker_legacy", phase_timer=phase)
         _wrap(sevenzip, "submit_attempt_asyncio", timings, "sevenzip_worker", phase_timer=phase)
-        _wrap(sevenzip, "_json_line", timings, "worker_protocol_json_decode")
-        _wrap(sevenzip, "_drain_stderr", timings, "worker_protocol_drain_stderr")
         _wrap(sevenzip, "_emit_progress", timings, "worker_protocol_emit_progress")
         _wrap(job.verifier, "verify", timings, "verify_total", phase_timer=phase)
 

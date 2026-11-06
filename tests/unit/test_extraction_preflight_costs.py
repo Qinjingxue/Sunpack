@@ -150,7 +150,7 @@ def test_async_preparation_stays_in_broker_and_preserves_logical_inputs_after_fa
             for index, descriptor in enumerate([descriptors[0], *descriptors]):
                 task = ArchiveTask.from_archive_input(descriptor, discovery_source="test")
                 result = yield {
-                    "archive_path": path, "part_paths": descriptor.part_paths(),
+                    "archive_path": path,
                     "out_dir": str(tmp_path / (str(index) if index else "failed")),
                     "password": "secret", "password_candidates": ["wrong", "secret"],
                     "selected_codepage": "932", "startupinfo": None, "task": task,

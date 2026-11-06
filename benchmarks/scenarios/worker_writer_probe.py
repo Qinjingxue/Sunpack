@@ -19,15 +19,36 @@ from tests.helpers.tool_config import get_7z_cli_dll_path, require_7z
 ROOT = Path(__file__).resolve().parents[2]
 
 
-def profiles(worker, expected):
+class WriterProbeWorker(_NativeWorkerProcess):
+    """Collect benchmark measurements independently of production diagnostics."""
+
+    def __init__(self, *args, **kwargs):
+        self.probe_rows = queue.Queue()
+        super().__init__(*args, **kwargs)
+
+    def _pump_stderr(self, stream):
+        try:
+            for line in stream:
+                if line.startswith("WRITER_PROBE "):
+                    self.probe_rows.put(json.loads(line.removeprefix("WRITER_PROBE ")))
+                else:
+                    with self._stderr_lock:
+                        self._stderr.append(line)
+                del line
+        finally:
+            self.probe_rows.put(None)
+
+
+def profiles(worker, expected, *, timeout=2):
     result = []
     while len(result) < expected:
         try:
-            line = worker.stderr_queue.get(timeout=2)
+            row = worker.probe_rows.get(timeout=timeout)
         except queue.Empty as exc:
             raise RuntimeError(f"Missing writer probes: {len(result)}/{expected}") from exc
-        if line and line.startswith("WRITER_PROBE "):
-            result.append(json.loads(line.removeprefix("WRITER_PROBE ")))
+        if row is None:
+            raise RuntimeError(f"Worker exited before writer probes: {len(result)}/{expected}")
+        result.append(row)
     return result
 
 
@@ -90,7 +111,7 @@ def main():
                         binary = ROOT / "benchmarks/.cache/writer-probe" / ("probe.exe" if diagnostic else "baseline.exe")
                         config = {"writer_threads": int(mode.removeprefix("writers"))} if mode.startswith("writers") else {}
                         output = workspace.outputs / f"{fmt}-{width}-{mode}-{trial}"
-                        worker = _NativeWorkerProcess(str(binary), None, config)
+                        worker = WriterProbeWorker(str(binary), None, config)
                         try:
                             disk_before = psutil.disk_io_counters(perdisk=True)
                             row = run_worker(worker, [case] * width, output, width, dll, 60, mode == "dry")

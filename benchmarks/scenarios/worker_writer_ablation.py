@@ -10,7 +10,6 @@ import argparse
 import json
 import os
 from pathlib import Path
-import queue
 import shutil
 import statistics
 import sys
@@ -23,22 +22,10 @@ if str(ROOT) not in sys.path:
 from benchmarks.harness import BenchmarkWorkspace
 from benchmarks.scenarios.worker_concurrency_300m import prepare, run_worker, run_cli, validate, _volume_paths
 from sunpack.core.support.output_paths import resolve_output_volume_key
-from sunpack.pipeline.extraction.internal.sevenzip.sevenzip_runner import _NativeWorkerProcess
+from benchmarks.scenarios.worker_writer_probe import WriterProbeWorker, profiles
 from tests.helpers.tool_config import get_7z_cli_dll_path, require_7z
 
 MODES = ("real", "memory", "memory-nocopy", "eof", "cli", "writers1", "writers8", "writers16", "writers32")
-
-
-def drain_probes(worker, expected):
-    rows = []
-    while len(rows) < expected:
-        try:
-            line = worker.stderr_queue.get(timeout=5)
-        except queue.Empty as exc:
-            raise RuntimeError(f"Missing writer probes {len(rows)}/{expected}") from exc
-        if line and line.startswith("WRITER_PROBE "):
-            rows.append(json.loads(line.removeprefix("WRITER_PROBE ")))
-    return rows
 
 
 def phase_totals(probes):
@@ -122,10 +109,10 @@ def main():
                             validate(row, [case] * width, output, tar_bytes)
                             row["memory_sink"] = False
                         else:
-                            worker = _NativeWorkerProcess(str(args.worker.resolve()), None, config)
+                            worker = WriterProbeWorker(str(args.worker.resolve()), None, config)
                             try:
                                 row = run_worker(worker, [case] * width, output, width, dll, 600, False)
-                                row["probes"] = drain_probes(worker, width)
+                                row["probes"] = profiles(worker, width, timeout=5)
                             finally:
                                 worker.close()
                             row["phase_total_ms"] = phase_totals(row["probes"])

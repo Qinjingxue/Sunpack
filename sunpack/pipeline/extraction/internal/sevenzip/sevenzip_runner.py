@@ -2,7 +2,6 @@ import asyncio
 import json
 import logging
 import os
-import queue
 import subprocess
 import threading
 import time
@@ -14,12 +13,11 @@ from typing import Any, Callable
 
 from sunpack_native import NativeWorkerResultAccumulator, parse_worker_transport_event
 
-from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
 from sunpack.core.contracts.tasks import ArchiveTask
 from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import (
     ProgressHistory,
+    StdioHistory,
     attach_worker_diagnostics,
-    parse_worker_json_line,
 )
 from sunpack.core.support.output_paths import normalized_output_dir, resolve_output_volume_key
 from sunpack.core.support.resources import get_sevenzip_bridge_worker_path
@@ -241,8 +239,8 @@ class _NativeWorkerProcess:
         self.process_config = process_config or {}
         self.process: subprocess.Popen | None = None
         self.worker_epoch = ""
-        self.stderr_queue: queue.Queue[str | None] = queue.Queue()
-        self._job_states: dict[str, dict[str, Any]] = {}
+        self._stderr = StdioHistory()
+        self._stderr_lock = threading.Lock()
         self._async_jobs: dict[str, dict[str, Any]] = {}
         self._dispatch_lock = threading.Lock()
         self._stdin_lock = threading.Lock()
@@ -276,7 +274,7 @@ class _NativeWorkerProcess:
         assign_child_process(getattr(self.process, "pid", 0))
         self._reader_threads = [
             threading.Thread(target=self._dispatch_stdout, args=(self.process.stdout,), daemon=True),
-            threading.Thread(target=self._pump, args=(self.process.stderr, self.stderr_queue), daemon=True),
+            threading.Thread(target=self._pump_stderr, args=(self.process.stderr,), daemon=True),
         ]
         for thread in self._reader_threads:
             thread.start()
@@ -295,6 +293,7 @@ class _NativeWorkerProcess:
         The stdout dispatcher is the only reader of the worker's pipe; the native process owns extraction concurrency.
         """
         state = {
+            "state": "submitted",
             "on_line": on_line,
             "on_error": on_error,
             "parsed_events": bool(parsed_events),
@@ -306,9 +305,8 @@ class _NativeWorkerProcess:
         with self._dispatch_lock:
             if self._closing:
                 raise RuntimeError("sevenzip_worker is closing")
-            if job_id in self._job_states:
+            if job_id in self._async_jobs:
                 raise RuntimeError(f"sevenzip_worker job id is already active: {job_id}")
-            self._job_states[job_id] = {"state": "submitted", "worker_epoch": self.worker_epoch}
             self._async_jobs[job_id] = state
         try:
             self.send(payload)
@@ -329,7 +327,6 @@ class _NativeWorkerProcess:
             if state is None or (expected is not None and state is not expected):
                 return None
             self._async_jobs.pop(job_id, None)
-            self._job_states.pop(job_id, None)
             self._idle.notify_all()
         return state
 
@@ -378,12 +375,11 @@ class _NativeWorkerProcess:
     def _dispatch_line(self, line: str, payload: Any, job_id: str) -> None:
         with self._dispatch_lock:
             async_state = self._async_jobs.get(job_id) if job_id else None
-            job_state = self._job_states.get(job_id) if job_id else None
             forward = True
-            if job_state is not None and isinstance(payload, dict):
+            if async_state is not None and isinstance(payload, dict):
                 # 空间事件表达的是等待状态，绝不能写进 job_state["state"]（会让 watch_memory / 状态读取失真）。
                 if (
-                    _apply_native_event_to_job_state(job_state, payload, _LOGGER)
+                    _apply_native_event_to_job_state(async_state, payload, _LOGGER)
                     == _SPACE_STALE
                 ):
                     forward = False
@@ -437,15 +433,18 @@ class _NativeWorkerProcess:
                 except Exception:
                     pass
 
-    @staticmethod
-    def _pump(stream, output_queue: queue.Queue[str | None]) -> None:
+    def _pump_stderr(self, stream) -> None:
         try:
             for line in stream:
-                output_queue.put(line)
+                with self._stderr_lock:
+                    self._stderr.append(line)
+                del line
         except Exception:
             pass
-        finally:
-            output_queue.put(None)
+
+    def take_stderr(self) -> list[str]:
+        with self._stderr_lock:
+            return self._stderr.take()
 
     def is_alive(self) -> bool:
         return self.process is not None and self.process.poll() is None
@@ -538,7 +537,7 @@ class _AsyncNativeWorkerProcess:
         self.process: asyncio.subprocess.Process | None = None
         self.worker_epoch = ""
         self._jobs: dict[str, dict[str, Any]] = {}
-        self._stderr_lines: list[str] = []
+        self._stderr = StdioHistory()
         self._send_lock = asyncio.Lock()
         self.queue_capacity = _NativeQueueCapacity()
         self._resubmissions: set[asyncio.Task] = set()
@@ -671,9 +670,7 @@ class _AsyncNativeWorkerProcess:
                     waiter.cancel()
 
     def take_stderr(self) -> list[str]:
-        lines = self._stderr_lines
-        self._stderr_lines = []
-        return lines
+        return self._stderr.take()
 
     def has_other_jobs(self, job_id: str) -> bool:
         return any(other != job_id for other in self._jobs)
@@ -773,7 +770,7 @@ class _AsyncNativeWorkerProcess:
     async def _pump_stderr(self) -> None:
         assert self.process is not None and self.process.stderr is not None
         while line := await self.process.stderr.readline():
-            self._stderr_lines.append(line.decode("utf-8", "replace"))
+            self._stderr.append(line.decode("utf-8", "replace"))
             del line
 
     def _finish_job(self, job_id: str, expected: dict[str, Any]) -> dict[str, Any] | None:
@@ -951,7 +948,6 @@ class SevenZipRunner:
             if job is None:
                 job = self._build_job(
                     archive_path=kwargs["archive_path"],
-                    part_paths=kwargs.get("part_paths") or [],
                     out_dir=kwargs["out_dir"],
                     password=kwargs.get("password"),
                     password_candidates=kwargs.get("password_candidates"),
@@ -978,7 +974,6 @@ class SevenZipRunner:
             job,
             startupinfo=kwargs.get("startupinfo"),
             task=kwargs.get("task"),
-            on_complete=kwargs.get("on_complete"),
         )
 
     async def submit_attempt_asyncio(
@@ -1008,8 +1003,8 @@ class SevenZipRunner:
             worker = await self._async_worker_holder_or_create().get_or_start(startupinfo)
             result_future.add_done_callback(lambda _: worker.queue_capacity.discard(job_id))
             prepared_job["worker_epoch"] = worker.worker_epoch
-            stdout_lines: list[str] = []
-            stderr_lines: list[str] = []
+            stdout_lines = StdioHistory()
+            stderr_lines = StdioHistory()
             progress_events = ProgressHistory()
             pending_result: subprocess.CompletedProcess | None = None
             pending_payload: dict[str, Any] | None = None
@@ -1087,8 +1082,8 @@ class SevenZipRunner:
                     pending_result = self._completed_process(
                         [worker.worker_path],
                         0 if value.get("status") == "ok" else 1,
-                        "".join(stdout_lines),
-                        "".join(stderr_lines),
+                        stdout_lines.text(),
+                        stderr_lines.text(),
                         request_payload=prepared_job,
                         result_payload=value,
                         progress_events=progress_events,
@@ -1107,7 +1102,7 @@ class SevenZipRunner:
                 complete(self._completed_process(
                     [worker.worker_path],
                     -101,
-                    "".join(stdout_lines),
+                    stdout_lines.text(),
                     message,
                     request_payload=prepared_job,
                     process_failure={
@@ -1187,7 +1182,6 @@ class SevenZipRunner:
         *,
         startupinfo=None,
         task: ArchiveTask | None = None,
-        on_complete=None,
     ) -> Future:
         """Submit one prepared job to the single native worker process."""
         prepared_job = dict(job)
@@ -1203,10 +1197,19 @@ class SevenZipRunner:
         worker = None
         try:
             worker = self._worker_holder_or_create().get_or_start(startupinfo)
-            future.add_done_callback(lambda _: worker.queue_capacity.discard(job_id))
+            capacity = worker.queue_capacity
+
+            def retire_queue(_: Future) -> None:
+                nonlocal capacity
+                retired, capacity = capacity, None
+                retired.discard(job_id)
+
+            # concurrent.futures keeps done callbacks for the Future's whole
+            # lifetime. Release the queue reference when this one has run.
+            future.add_done_callback(retire_queue)
             prepared_job["worker_epoch"] = worker.worker_epoch
-            stdout_lines: list[str] = []
-            stderr_lines: list[str] = []
+            stdout_lines = StdioHistory()
+            stderr_lines = StdioHistory()
             progress_events = ProgressHistory()
             pending_result: subprocess.CompletedProcess | None = None
             pending_result_payload: dict[str, Any] | None = None
@@ -1280,12 +1283,12 @@ class SevenZipRunner:
                     return False
                 if payload_value and payload_value.get("type") == "result":
                     returncode = 0 if payload_value.get("status") == "ok" else 1
-                    self._drain_stderr(worker, stderr_lines)
+                    stderr_lines.extend(worker.take_stderr())
                     pending_result = self._completed_process(
                         [worker.worker_path],
                         returncode,
-                        "".join(stdout_lines),
-                        "".join(stderr_lines),
+                        stdout_lines.text(),
+                        stderr_lines.text(),
                         request_payload=prepared_job,
                         result_payload=payload_value,
                         progress_events=progress_events,
@@ -1297,7 +1300,7 @@ class SevenZipRunner:
 
             def on_error(message: str) -> None:
                 with worker._dispatch_lock:
-                    lifecycle_state = dict(worker._job_states.get(job_id) or {})
+                    job_state = (worker._async_jobs.get(job_id) or {}).get("state", "unknown")
                 failure_kind = (
                     "process_io" if "job protocol/callback failed" in message
                     else "worker_lost"
@@ -1307,14 +1310,14 @@ class SevenZipRunner:
                 complete(self._completed_process(
                     [worker.worker_path],
                     -101,
-                    "".join(stdout_lines),
+                    stdout_lines.text(),
                     message,
                     request_payload=prepared_job,
                     process_failure={
                         "failure_stage": "worker_communication",
                         "failure_kind": failure_kind,
                         "worker_epoch": worker.worker_epoch,
-                        "job_state": lifecycle_state.get("state", "unknown"),
+                        "job_state": job_state,
                         "message": message,
                     },
                     progress_events=progress_events,
@@ -1341,21 +1344,12 @@ class SevenZipRunner:
                 request_payload=prepared_job,
                 process_failure=process_failure,
             ))
-        if on_complete is not None:
-            def notify(done: Future) -> None:
-                try:
-                    on_complete(job_id, done.result())
-                except Exception:
-                    pass
-
-            future.add_done_callback(notify)
         return future
 
     def _build_job(
         self,
         *,
         archive_path: str,
-        part_paths: list[str],
         out_dir: str,
         password: str | None,
         password_candidates: list[str] | tuple[str, ...] | None,
@@ -1391,15 +1385,11 @@ class SevenZipRunner:
             job["codepage"] = selected_codepage
 
         with _phase(phase_timer, f"{phase_prefix}_archive_input"):
-            archive_input = self._archive_input(task, archive_path, part_paths)
+            archive_input = task.archive_input()
         if archive_input:
             descriptor_payload = archive_input.to_dict()
             job["archive_input"] = descriptor_payload
         return job
-
-    def _archive_input(self, task: ArchiveTask, archive_path: str, part_paths: list[str]) -> ArchiveInputDescriptor:
-        del archive_path, part_paths
-        return task.archive_input()
 
     @staticmethod
     def _completed_process(
@@ -1420,20 +1410,6 @@ class SevenZipRunner:
             result_payload=result_payload,
             progress_events=progress_events,
         )
-
-    @staticmethod
-    def _json_line(line: str) -> dict:
-        return parse_worker_json_line(line)
-
-    @staticmethod
-    def _drain_stderr(worker: _NativeWorkerProcess, stderr_lines: list[str]) -> None:
-        while True:
-            try:
-                line = worker.stderr_queue.get_nowait()
-            except queue.Empty:
-                return
-            if line is not None:
-                stderr_lines.append(line)
 
     def _worker_path(self) -> str:
         if self.worker_path is None:

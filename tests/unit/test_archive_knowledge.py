@@ -20,6 +20,31 @@ def test_archive_knowledge_namespace_merge_flags_and_roundtrip():
     assert "sfx" in ArchiveKnowledge.from_any(payload).flags()
 
 
+def test_archive_knowledge_exports_live_changes_without_aliasing():
+    # Existing tests mutate through set(). Direct edits through get()/data
+    # must also reach exports without retaining an obsolete snapshot.
+    knowledge = ArchiveKnowledge()
+    source = {"rows": [{"value": "original"}]}
+    knowledge.set("analysis", source, source_layer="test")
+    source["rows"].clear()
+    first = knowledge.to_dict()
+    knowledge.get("analysis.rows")[0]["value"] = "current"
+    knowledge.data["verification"] = {"complete": True}
+    second = knowledge.to_dict()
+
+    assert first["analysis"]["rows"] == [{"value": "original"}]
+    assert second["analysis"]["rows"] == [{"value": "current"}]
+    assert second["verification"] == {"complete": True}
+    second["analysis"]["rows"].clear()
+    assert knowledge.get("analysis.rows") == [{"value": "current"}]
+
+    merged = ArchiveKnowledge.from_any(knowledge)
+    merged.merge(knowledge, {"analysis": {"rows": [{"value": "new"}]}})
+    merged.get("analysis.rows")[0]["value"] = "detached"
+    assert knowledge.get("analysis.rows") == [{"value": "current"}]
+    assert len(merged.get("analysis.rows")) == 2
+
+
 def test_archive_knowledge_commit_revision_and_current_projections(tmp_path):
     archive_path = tmp_path / "sample.zip"
     archive_path.write_bytes(b"abc")

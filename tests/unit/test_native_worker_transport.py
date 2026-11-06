@@ -12,16 +12,75 @@ import pytest
 from sunpack_native import NativeWorkerResultAccumulator, parse_worker_transport_event
 
 from sunpack.pipeline.extraction.internal.sevenzip.sevenzip_runner import (
+    SevenZipRunner,
     _AsyncNativeWorkerProcess,
     _NativeQueueCapacity,
     _NativeWorkerProcess,
 )
+from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import StdioHistory
 from sunpack.core.support.resources import get_sevenzip_bridge_worker_path
 from tests.helpers.worker_events import worker_trace_item
 
 
 def _event(kind, job_id="job", **fields):
     return parse_worker_transport_event(json.dumps({"type": kind, "job_id": job_id, **fields}))
+
+
+@pytest.mark.parametrize("outcome", ["success", "protocol_error", "cancelled"])
+def test_completed_sync_future_releases_worker_and_queue(monkeypatch, outcome):
+    # Reader lifetime tests discard the Future. A caller retaining a finished
+    # Future must not keep the worker or other requests' queue callbacks alive.
+    monkeypatch.setattr(_NativeWorkerProcess, "_start", lambda self: None)
+    worker = _NativeWorkerProcess("unused", None)
+    worker.send = lambda _: None
+    runner = SevenZipRunner({}, shared_worker_holder=SimpleNamespace(get_or_start=lambda _: worker))
+    future = runner.submit_attempt({"job_id": "job"})
+    references = weakref.ref(worker), weakref.ref(worker.queue_capacity), weakref.ref(runner)
+    if outcome == "protocol_error":
+        worker._dispatch_line("", _event("manifest_chunk", seq=1, rows=[_row()]), "job")
+    else:
+        if outcome == "cancelled":
+            future.cancel()
+        worker._dispatch_line("", _event("result", status="ok"), "job")
+    worker._dispatch_line("", _event("native_event", event="job_finished"), "job")
+    assert future.done() and not worker._async_jobs
+    if outcome != "cancelled":
+        assert (future.result().returncode == 0) == (outcome == "success")
+    del worker, runner
+    gc.collect()
+    assert all(reference() is None for reference in references)
+
+
+@pytest.mark.parametrize("transport", ["sync", "async"])
+def test_worker_stderr_keeps_bounded_tail_and_drains_for_reuse(monkeypatch, transport):
+    # Progress tests contain no stderr burst. Exercise the real pump while no
+    # job result drains it, including long lines that defeat a line-only cap.
+    lines = [f"{index}:" + "x" * (8000 if index % 2 else 10) + "\n" for index in range(200)]
+    expected_tail = "".join(lines)[-4000:]
+    if transport == "sync":
+        monkeypatch.setattr(_NativeWorkerProcess, "_start", lambda self: None)
+        worker = _NativeWorkerProcess("unused", None)
+        worker._pump_stderr(io.StringIO("".join(lines)))
+    else:
+        async def pump():
+            worker = _AsyncNativeWorkerProcess("unused", None)
+            stream = asyncio.StreamReader()
+            stream.feed_data("".join(lines).encode())
+            stream.feed_eof()
+            worker.process = SimpleNamespace(stderr=stream)
+            await worker._pump_stderr()
+            return worker
+        worker = asyncio.run(pump())
+    assert "".join(worker.take_stderr()) == expected_tail
+    assert worker.take_stderr() == []
+
+    # The same tail is used for per-job stdout and across backpressure retries.
+    history = StdioHistory()
+    history.extend(f"line {index}\n" for index in range(200))
+    assert history.text().splitlines() == [f"line {index}" for index in range(160, 200)]
+    history.take()
+    history.append("next request\n")
+    assert history.text() == "next request\n"
 
 
 def test_shared_worker_process_mode_retries_failed_ack_and_serializes_transitions():
@@ -162,7 +221,6 @@ def test_sync_bad_job_waits_for_native_finish_and_does_not_affect_other_jobs():
     worker.process_config = {}
     worker.worker_epoch = "test"
     worker._async_jobs = {}
-    worker._job_states = {}
     worker._dispatch_lock = threading.Lock()
     worker._idle = threading.Condition(worker._dispatch_lock)
     worker._closing = False
@@ -194,7 +252,6 @@ def test_sync_fatal_protocol_error_stops_process_before_failure_callback():
     worker._closing = False
     worker._shutdown_sent = False
     worker.queue_capacity = _NativeQueueCapacity()
-    worker._job_states = {"job": {}}
     order = []
     worker._async_jobs = {"job": {"completion_lock": threading.Lock(), "on_error": lambda message: order.append("failed")}}
     worker.abort = lambda: order.append("stopped")
@@ -210,7 +267,6 @@ def test_sync_terminal_callback_can_resubmit_before_returning():
     worker.process_config = {}
     worker.worker_epoch = "test"
     worker._async_jobs = {}
-    worker._job_states = {}
     worker._dispatch_lock = threading.Lock()
     worker._idle = threading.Condition(worker._dispatch_lock)
     worker._closing = False
@@ -239,7 +295,7 @@ def test_sync_terminal_callback_can_resubmit_before_returning():
     assert not failures and len(replacement) == 1
     assert worker._async_jobs["job"] is replacement[0]
     worker._dispatch_line("", _event("native_event", event="job_finished"), "job")
-    assert not worker._async_jobs and not worker._job_states
+    assert not worker._async_jobs
 
 
 @pytest.mark.parametrize("transport", ["sync", "async"])

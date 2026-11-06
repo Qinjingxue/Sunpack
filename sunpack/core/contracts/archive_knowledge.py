@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -11,9 +10,6 @@ from sunpack.core.support.json_values import jsonable_value as _jsonable
 @dataclass
 class ArchiveKnowledge:
     data: dict[str, Any] = field(default_factory=dict)
-    _mutation_version: int = field(default=0, init=False, repr=False)
-    _snapshot_cache: dict[str, Any] | None = field(default=None, init=False, repr=False)
-    _snapshot_cache_version: int = field(default=-1, init=False, repr=False)
 
     @classmethod
     def from_any(cls, raw: Any | None) -> "ArchiveKnowledge":
@@ -24,10 +20,9 @@ class ArchiveKnowledge:
         return cls()
 
     def to_dict(self) -> dict[str, Any]:
-        if self._snapshot_cache is None or self._snapshot_cache_version != self._mutation_version:
-            self._snapshot_cache = _jsonable(self.data)
-            self._snapshot_cache_version = self._mutation_version
-        return deepcopy(self._snapshot_cache)
+        # get() and data expose the live tree. Normalize into one detached
+        # export; a second resident tree would duplicate it and can go stale.
+        return _jsonable(self.data)
 
     def revision(self) -> int:
         meta = self.data.get("_meta")
@@ -56,26 +51,10 @@ class ArchiveKnowledge:
         confidence: float | None = None,
         timestamp: str | None = None,
     ) -> "ArchiveKnowledge":
-        if not path:
-            return self
-        current = self.data
-        parts = _parts(path)
-        for part in parts[:-1]:
-            current = current.setdefault(part, {})
-            if not isinstance(current, dict):
-                return self
-        normalized = _jsonable(value)
-        current[parts[-1]] = normalized
-        self._invalidate_snapshot()
-        provenance = _provenance(
-            source_layer=source_layer,
-            source_module=source_module,
-            confidence=confidence,
-            timestamp=timestamp,
+        return self._set_value(
+            path, value, prepared=False, source_layer=source_layer,
+            source_module=source_module, confidence=confidence, timestamp=timestamp,
         )
-        if provenance:
-            self.add_evidence(path, value, provenance=provenance)
-        return self
 
     def set_prepared(
         self,
@@ -88,6 +67,16 @@ class ArchiveKnowledge:
         timestamp: str | None = None,
     ) -> "ArchiveKnowledge":
         """Transfer an already JSON-safe value into Knowledge without normalizing it again."""
+        return self._set_value(
+            path, value, prepared=True, source_layer=source_layer,
+            source_module=source_module, confidence=confidence, timestamp=timestamp,
+        )
+
+    def _set_value(
+        self, path: str, value: Any, *, prepared: bool,
+        source_layer: str, source_module: str, confidence: float | None,
+        timestamp: str | None,
+    ) -> "ArchiveKnowledge":
         if not path:
             return self
         current = self.data
@@ -96,8 +85,7 @@ class ArchiveKnowledge:
             current = current.setdefault(part, {})
             if not isinstance(current, dict):
                 return self
-        current[parts[-1]] = value
-        self._invalidate_snapshot()
+        current[parts[-1]] = value if prepared else _jsonable(value)
         provenance = _provenance(
             source_layer=source_layer,
             source_module=source_module,
@@ -112,8 +100,7 @@ class ArchiveKnowledge:
         for payload in payloads:
             raw = payload.to_dict() if isinstance(payload, ArchiveKnowledge) else payload
             if isinstance(raw, dict):
-                _deep_merge(self.data, _jsonable(raw))
-                self._invalidate_snapshot()
+                _deep_merge(self.data, raw if isinstance(payload, ArchiveKnowledge) else _jsonable(raw))
         if source_layer or source_module:
             self.add_evidence("knowledge.merge", True, provenance=_provenance(source_layer=source_layer, source_module=source_module))
         return self
@@ -142,7 +129,6 @@ class ArchiveKnowledge:
             item["provenance"] = _jsonable(provenance)
         evidence.append(item)
         self.data["_evidence"] = evidence[-500:]
-        self._invalidate_snapshot()
         return self
 
     def history(self, namespace: str = "") -> list[dict[str, Any]]:
@@ -157,11 +143,6 @@ class ArchiveKnowledge:
                     output.extend(str(flag) for flag in item if str(flag))
                 else:
                     self._collect_flags(item, output)
-
-    def _invalidate_snapshot(self) -> None:
-        self._mutation_version += 1
-        self._snapshot_cache = None
-        self._snapshot_cache_version = -1
 
 
 def merge_knowledge(*payloads: Any) -> dict[str, Any]:
@@ -202,7 +183,8 @@ def _deep_merge(target: dict[str, Any], source: dict[str, Any]) -> dict[str, Any
         elif isinstance(value, list) and isinstance(target.get(key), list):
             target[key] = _merge_lists(target[key], value)
         else:
-            target[key] = deepcopy(value)
+            # source is already an owned JSON tree normalized by merge().
+            target[key] = value
     return target
 
 
@@ -210,11 +192,12 @@ def _merge_lists(left: list[Any], right: list[Any]) -> list[Any]:
     output: list[Any] = []
     seen: set[str] = set()
     for item in [*left, *right]:
-        key = repr(_jsonable(item))
+        normalized = _jsonable(item)
+        key = repr(normalized)
         if key in seen:
             continue
         seen.add(key)
-        output.append(_jsonable(item))
+        output.append(normalized)
     return output
 
 

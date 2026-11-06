@@ -10,7 +10,6 @@ import argparse
 import csv
 import json
 import os
-import queue
 import shutil
 import statistics
 import sys
@@ -92,16 +91,7 @@ def _worker_cpu_ms(worker: _NativeWorkerProcess) -> float | None:
 
 
 def _worker_stderr(worker: _NativeWorkerProcess) -> str:
-    lines: list[str] = []
-    while True:
-        try:
-            line = worker.stderr_queue.get_nowait()
-        except queue.Empty:
-            break
-        if line is None:
-            break
-        lines.append(str(line))
-    return "".join(lines)[-4000:]
+    return "".join(worker.take_stderr())
 
 
 def _run_job(
