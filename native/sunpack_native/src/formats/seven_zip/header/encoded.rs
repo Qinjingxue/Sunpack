@@ -20,26 +20,9 @@ impl From<Cow<'_, [u8]>> for CoderInput<'_> {
     }
 }
 
-struct SevenZipEncodedHeaderCoder {
-    method_id: Vec<u8>,
-    properties: Vec<u8>,
-    num_in_streams: u64,
-    num_out_streams: u64,
-}
-
-struct SevenZipEncodedHeaderFolder {
-    coders: Vec<SevenZipEncodedHeaderCoder>,
-    bind_pairs: Vec<(u64, u64)>,
-    packed_streams: Vec<u64>,
-    main_output_stream: u64,
-    unpack_size: u64,
-    unpack_sizes: Vec<u64>,
-    expected_crc: Option<u32>,
-}
-
 pub(crate) struct SevenZipPasswordProbe {
     packed_data: Vec<Blob>,
-    folder: SevenZipEncodedHeaderFolder,
+    folder: SevenZipFolderAst,
 }
 
 impl SevenZipPasswordProbe {
@@ -84,6 +67,7 @@ impl SevenZipPasswordProbe {
             return Err("7z password probe next header crc is invalid".to_string());
         }
         let (pack, folder) = parse_seven_zip_encoded_header_descriptor(&raw)?;
+        drop(raw);
         if folder.expected_crc.is_none() || !seven_zip_probe_folder_supported(&folder) {
             return Err("7z password probe coder graph has no safe fast path".to_string());
         }
@@ -140,7 +124,7 @@ impl SevenZipPasswordProbe {
             && self
                 .folder
                 .expected_crc
-                .is_some_and(|expected| crc32(&decoded) == expected))
+                .is_some_and(|expected| crc32(&decoded) == expected.value))
         .then_some(decoded))
     }
 }
@@ -170,14 +154,13 @@ fn read_seven_zip_probe_range<R: Read + Seek>(
 
 fn parse_seven_zip_encoded_header_descriptor(
     raw: &[u8],
-) -> Result<(SevenZipPackInfoAst, SevenZipEncodedHeaderFolder), String> {
+) -> Result<(SevenZipPackInfoAst, SevenZipFolderAst), String> {
     let mut pos = 0usize;
     if raw.get(pos).copied() != Some(SZ_ENCODED_HEADER) {
         return Err("encoded_header_nid_missing".to_string());
     }
     pos += 1;
     let mut pack_info = None;
-    let mut folder = None;
     let mut unpack_info = None;
     loop {
         let Some(nid) = raw.get(pos).copied() else {
@@ -189,7 +172,9 @@ fn parse_seven_zip_encoded_header_descriptor(
             SZ_PACK_INFO => pack_info = Some(parse_seven_zip_pack_info(raw, &mut pos)?),
             SZ_UNPACK_INFO => {
                 let parsed = parse_seven_zip_unpack_info(raw, &mut pos)?;
-                folder = Some(seven_zip_encoded_folder_from_unpack_info(&parsed)?);
+                if parsed.folders.len() != 1 {
+                    return Err("encoded_header_folder_not_unique".to_string());
+                }
                 unpack_info = Some(parsed);
             }
             SZ_SUB_STREAMS_INFO => {
@@ -207,7 +192,11 @@ fn parse_seven_zip_encoded_header_descriptor(
     }
     Ok((
         pack_info.ok_or_else(|| "encoded_header_pack_info_missing".to_string())?,
-        folder.ok_or_else(|| "encoded_header_unpack_info_missing".to_string())?,
+        unpack_info
+            .ok_or_else(|| "encoded_header_unpack_info_missing".to_string())?
+            .folders
+            .pop()
+            .ok_or_else(|| "encoded_header_folder_missing".to_string())?,
     ))
 }
 
@@ -224,7 +213,7 @@ fn lzma2_dict_size(prop: u8) -> Option<u32> {
 
 fn decode_seven_zip_encoded_folder(
     packed_data: &[Blob],
-    folder: &SevenZipEncodedHeaderFolder,
+    folder: &SevenZipFolderAst,
     password: Option<&str>,
 ) -> Result<Blob, String> {
     if folder.coders.is_empty() {
@@ -243,7 +232,7 @@ fn decode_seven_zip_encoded_folder(
 fn decode_seven_zip_output(
     output_stream: u64,
     packed_data: &[Blob],
-    folder: &SevenZipEncodedHeaderFolder,
+    folder: &SevenZipFolderAst,
     password: Option<&str>,
     visiting: &mut [bool],
 ) -> Result<Blob, String> {
@@ -305,7 +294,7 @@ fn decode_seven_zip_output(
     let unpack_size = folder
         .unpack_sizes
         .get(usize::try_from(output_stream).unwrap_or(usize::MAX))
-        .copied()
+        .map(|span| span.value)
         .unwrap_or(folder.unpack_size);
     if coder.method_id.as_slice() == EncoderMethod::ID_BCJ2 {
         if inputs.len() != 4 {
@@ -321,7 +310,7 @@ fn decode_seven_zip_output(
     decode_seven_zip_encoded_coder(inputs.pop().unwrap(), coder, password, unpack_size)
 }
 
-fn seven_zip_bcj_start_pos(coder: &SevenZipEncodedHeaderCoder) -> Result<usize, String> {
+fn seven_zip_bcj_start_pos(coder: &SevenZipCoderAst) -> Result<usize, String> {
     let method = coder.method_id.as_slice();
     let alignment = if method == EncoderMethod::ID_BCJ_ARM64 {
         3
@@ -355,7 +344,7 @@ fn seven_zip_bcj_start_pos(coder: &SevenZipEncodedHeaderCoder) -> Result<usize, 
 
 fn decode_seven_zip_encoded_coder<'a>(
     data: impl Into<CoderInput<'a>>,
-    coder: &SevenZipEncodedHeaderCoder,
+    coder: &SevenZipCoderAst,
     password: Option<&str>,
     unpack_size: u64,
 ) -> Result<Blob, String> {
@@ -542,7 +531,7 @@ fn decrypt_seven_zip_aes256_sha256(
 }
 fn decode_lzma(
     data: &[u8],
-    coder: &SevenZipEncodedHeaderCoder,
+    coder: &SevenZipCoderAst,
     unpack_size: u64,
 ) -> Result<Blob, String> {
     let compressed = Cursor::new(data);
@@ -747,37 +736,7 @@ fn derive_seven_zip_aes_key(cycles: u32, salt: &[u8], password: &[u8]) -> Result
     Ok(sha2_11::Digest::finalize(sha).into())
 }
 
-fn seven_zip_encoded_folder_from_unpack_info(
-    unpack: &SevenZipUnpackInfoAst,
-) -> Result<SevenZipEncodedHeaderFolder, String> {
-    let folder = unpack
-        .folders
-        .first()
-        .ok_or_else(|| "encoded_header_folder_missing".to_string())?;
-    if unpack.folders.len() != 1 {
-        return Err("encoded_header_folder_not_unique".to_string());
-    }
-    Ok(SevenZipEncodedHeaderFolder {
-        coders: folder
-            .coders
-            .iter()
-            .map(|coder| SevenZipEncodedHeaderCoder {
-                method_id: coder.method_id.clone(),
-                properties: coder.properties.clone(),
-                num_in_streams: coder.num_in_streams,
-                num_out_streams: coder.num_out_streams,
-            })
-            .collect(),
-        bind_pairs: folder.bind_pairs.clone(),
-        packed_streams: folder.packed_streams.clone(),
-        main_output_stream: folder.main_output_stream,
-        unpack_size: folder.unpack_size,
-        unpack_sizes: folder.unpack_sizes.iter().map(|span| span.value).collect(),
-        expected_crc: folder.expected_crc.map(|crc| crc.value),
-    })
-}
-
-fn seven_zip_probe_folder_supported(folder: &SevenZipEncodedHeaderFolder) -> bool {
+fn seven_zip_probe_folder_supported(folder: &SevenZipFolderAst) -> bool {
     let mut aes_count = 0usize;
     for coder in &folder.coders {
         let method = coder.method_id.as_slice();
@@ -841,7 +800,7 @@ mod encoded_folder_graph_tests {
         let packed = [
             224, 1, 255, 0, 12, 93, 0, 58, 25, 74, 206, 43, 15, 35, 137, 235, 206, 128, 0, 0,
         ];
-        let coder = SevenZipEncodedHeaderCoder {
+        let coder = SevenZipCoderAst {
             method_id: EncoderMethod::ID_LZMA2.to_vec(),
             properties: vec![0],
             num_in_streams: 1,
@@ -879,7 +838,7 @@ mod encoded_folder_graph_tests {
         bytes.extend_from_slice(b"test");
         bytes.extend_from_slice(&0u32.to_le_bytes());
         bytes.extend_from_slice(&crate::formats::lz4::xxh32(b"test").to_le_bytes());
-        let mut coder = SevenZipEncodedHeaderCoder {
+        let mut coder = SevenZipCoderAst {
             method_id: vec![0x04, 0xf7, 0x11, 0x04],
             properties: vec![1, 10, 1, 0, 0],
             num_in_streams: 1,
@@ -983,7 +942,7 @@ mod encoded_folder_graph_tests {
 
     #[test]
     fn decoder_follows_bind_pairs_instead_of_coder_declaration_order() {
-        let copy = || SevenZipEncodedHeaderCoder {
+        let copy = || SevenZipCoderAst {
             method_id: EncoderMethod::ID_COPY.to_vec(),
             properties: Vec::new(),
             num_in_streams: 1,
@@ -991,13 +950,13 @@ mod encoded_folder_graph_tests {
         };
         // Packed input stream 1 -> coder 1/out 1 -> coder 2/in 2 ->
         // coder 2/out 2 -> coder 0/in 0 -> main output 0.
-        let folder = SevenZipEncodedHeaderFolder {
+        let folder = SevenZipFolderAst {
             coders: vec![copy(), copy(), copy()],
             bind_pairs: vec![(2, 1), (0, 2)],
             packed_streams: vec![1],
             main_output_stream: 0,
             unpack_size: 4,
-            unpack_sizes: vec![4, 4, 4],
+            unpack_sizes: vec![SevenZipVintSpan { value: 4 }; 3],
             expected_crc: None,
         };
         let decoded =
@@ -1033,19 +992,19 @@ mod encoded_folder_graph_tests {
 
     #[test]
     fn decoder_rejects_bind_pair_cycles() {
-        let copy = SevenZipEncodedHeaderCoder {
+        let copy = SevenZipCoderAst {
             method_id: EncoderMethod::ID_COPY.to_vec(),
             properties: Vec::new(),
             num_in_streams: 1,
             num_out_streams: 1,
         };
-        let folder = SevenZipEncodedHeaderFolder {
+        let folder = SevenZipFolderAst {
             coders: vec![copy],
             bind_pairs: vec![(0, 0)],
             packed_streams: Vec::new(),
             main_output_stream: 0,
             unpack_size: 1,
-            unpack_sizes: vec![1],
+            unpack_sizes: vec![SevenZipVintSpan { value: 1 }],
             expected_crc: None,
         };
         let error = decode_seven_zip_encoded_folder(&[], &folder, None).unwrap_err();
