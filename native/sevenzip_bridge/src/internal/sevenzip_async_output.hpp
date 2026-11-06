@@ -937,19 +937,15 @@ namespace sunpack::sevenzip
         {
             std::lock_guard<std::mutex> finish_lock(finish_mutex_);
             if (!completion_port_) return;
-            std::vector<JobStatePtr> jobs;
-            std::vector<FileStatePtr> files;
             {
                 std::lock_guard<std::mutex> lock(mutex_);
                 stopping_.store(true, std::memory_order_release);
                 for (const auto &weak : active_jobs_)
-                    if (auto job = weak.lock()) { cancel_job_locked(job); jobs.push_back(job); }
-                files = active_files_;
+                    if (auto job = weak.lock()) cancel_job_locked(job);
             }
             producer_cv_.notify_all();
             if (state_->space_gate) state_->space_gate->wake_waiters();
-            for (const auto &job : jobs) seal_job_files(job);
-            for (const auto &file : files) close_file(file, {});
+            seal_job_files(nullptr);
             if (state_ && state_->space_gate) state_->space_gate->wake_waiters();
             producer_cv_.notify_all();
             drain_cancelled_retries();
@@ -984,6 +980,7 @@ namespace sunpack::sevenzip
         void initialize()
         {
             buffers_.reserve(buffer_count_);
+            free_buffers_.reserve(buffer_count_);
             for (std::size_t index = 0; index < buffer_count_; ++index)
             {
                 auto buffer = std::make_unique<Buffer>();
@@ -1182,29 +1179,28 @@ namespace sunpack::sevenzip
 
         void seal_job_files(const JobStatePtr &job) noexcept
         {
-            if (!job)
+            // Scan backwards: unregister_file_locked swaps the tail into an
+            // erased slot, so removals can only move already-visited files.
+            // No snapshot allocation is safe here: cleanup must work under OOM.
+            // A null job seals the entire facility during shutdown.
+            std::size_t remaining = (std::numeric_limits<std::size_t>::max)();
+            for (;;)
             {
-                return;
-            }
-            std::vector<FileStatePtr> files;
-            try
-            {
-                std::lock_guard<std::mutex> lock(mutex_);
-                for (const auto &file : active_files_)
+                FileStatePtr file;
                 {
-                    if (file->job.get() == job.get() && !file->close_requested)
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    remaining = (std::min)(remaining, active_files_.size());
+                    while (remaining != 0)
                     {
-                        files.push_back(file);
+                        const auto &candidate = active_files_[--remaining];
+                        if ((!job || candidate->job == job) && !candidate->close_requested)
+                        {
+                            file = candidate;
+                            break;
+                        }
                     }
                 }
-            }
-            catch (...)
-            {
-                return;
-            }
-
-            for (const auto &file : files)
-            {
+                if (!file) return;
                 // Callers need not have reached Close(). Keep the file alive
                 // until submitted I/O drains and its handle closes.
                 close_file(file, {});
@@ -1991,7 +1987,8 @@ namespace sunpack::sevenzip
         }
 
         std::vector<std::unique_ptr<Buffer>> buffers_;
-        std::deque<Buffer *> free_buffers_;
+        // Every entry belongs to buffers_; returning one must never allocate.
+        std::vector<Buffer *> free_buffers_;
         std::vector<std::thread> workers_;
         std::deque<WorkItem> work_queue_;
         std::vector<std::weak_ptr<JobState>> active_jobs_;

@@ -3,6 +3,8 @@
 #include "internal/sevenzip_volume_state.hpp"
 
 #include <chrono>
+#include <array>
+#include <cstdlib>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -12,6 +14,22 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+// Fail allocations only on the cleanup caller, leaving IOCP threads available
+// to drain real operations. Normal tests never exercise allocation failure in
+// sealing/shutdown; this detects stranded staging buffers without an OOM load.
+thread_local bool reject_cleanup_allocations = false;
+
+void* operator new(std::size_t size) {
+    if (reject_cleanup_allocations) throw std::bad_alloc();
+    if (void* result = std::malloc(size ? size : 1)) return result;
+    throw std::bad_alloc();
+}
+void* operator new[](std::size_t size) { return ::operator new(size); }
+void operator delete(void* address) noexcept { std::free(address); }
+void operator delete[](void* address) noexcept { std::free(address); }
+void operator delete(void* address, std::size_t) noexcept { std::free(address); }
+void operator delete[](void* address, std::size_t) noexcept { std::free(address); }
 
 #ifdef _WIN32
 namespace {
@@ -331,6 +349,44 @@ bool successful_job_leaves_pending_at_zero(const std::filesystem::path& director
         return false;
     }
     return true;
+}
+
+bool cleanup_survives_allocation_failure(const std::filesystem::path& directory) {
+    AsyncWriterConfig config;
+    config.buffer_count = 8;
+    AsyncFileWriter writer(std::make_shared<WriterMeters>(), make_volume_state("oom:", false), config);
+    const auto first = writer.make_job();
+    const auto sibling = writer.make_job();
+    std::array<AsyncFileWriter::FileStatePtr, 8> files;
+    for (std::size_t index = 0; index < files.size(); ++index) {
+        const auto name = L"oom-" + std::to_wstring(index);
+        files[index] = writer.make_file(index % 2 ? sibling : first,
+            (directory / name).wstring(), name, static_cast<UInt32>(index), index);
+        const unsigned char byte = 1;
+        UInt32 processed = 0;
+        if (writer.write(files[index], &byte, 1, &processed) != S_OK || processed != 1) return false;
+    }
+    // All bytes are still staged. Cancelling one job must seal its interleaved
+    // files and preserve the sibling, even if no snapshot can be allocated.
+    reject_cleanup_allocations = true;
+    writer.cancel_job(first);
+    const auto cancelled = writer.snapshot_metrics();
+    reject_cleanup_allocations = false;
+    if (writer.finish_job(first) != E_ABORT || cancelled.pending_bytes != files.size() / 2) {
+        std::cerr << "allocation failure left cancelled output staged\n";
+        return false;
+    }
+    for (std::size_t index = 0; index < files.size(); ++index) {
+        if (writer.snapshot_file(files[index]).closed != (index % 2 == 0)) return false;
+    }
+    reject_cleanup_allocations = true;
+    writer.finish();
+    reject_cleanup_allocations = false;
+    const auto finished = writer.snapshot_metrics();
+    for (const auto& file : files) if (!writer.snapshot_file(file).closed) return false;
+    const std::weak_ptr released = files.front();
+    for (auto& file : files) file.reset();
+    return finished.pending_bytes == 0 && finished.discarded_bytes == files.size() && released.expired();
 }
 
 bool meters_separate_volumes_but_share_the_global_sink(const std::filesystem::path& directory) {
@@ -703,6 +759,7 @@ int main() {
         timestamp_failure_does_not_fail_content(directory) &&
         closes_after_delayed_open_failure(directory) &&
         cancelled_job_returns_pending_to_zero(directory) &&
+        cleanup_survives_allocation_failure(directory) &&
         successful_job_leaves_pending_at_zero(directory) &&
         meters_separate_volumes_but_share_the_global_sink(directory) &&
         quiescence_tracks_jobs_and_files(directory) &&

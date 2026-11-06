@@ -1510,10 +1510,17 @@ public:
                 print_volume_space_status(state, free_bytes, pending_bytes, query_ok, query_error);
             });
         workers_.reserve(worker_count_);
-        for (std::size_t index = 0; index < worker_count_; ++index) {
-            workers_.emplace_back([this] { worker_loop(); });
+        try {
+            for (std::size_t index = 0; index < worker_count_; ++index) {
+                workers_.emplace_back([this] { worker_loop(); });
+            }
+            monitor_thread_ = std::thread([this] { monitor_loop(); });
+        } catch (...) {
+            // A failed constructor does not run ~NativeJobExecutor. Drain
+            // threads already started before their joinable handles unwind.
+            stop();
+            throw;
         }
-        monitor_thread_ = std::thread([this] { monitor_loop(); });
     }
 
     ~NativeJobExecutor() { stop(); }
@@ -1525,10 +1532,10 @@ public:
         auto cancel_token = std::make_shared<std::atomic<bool>>(false);
         JobMetadata metadata = metadata_from_request(request);
         const std::string queued_event =
-            metadata.job_id.empty()
+            request.job_id.empty()
                 ? std::string{}
                 : worker_event_json("job_queued", metadata, 0);
-        const std::string job_id = metadata.job_id;
+        const std::string job_id = request.job_id;
         bool rejected_for_capacity = false;
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -1550,7 +1557,7 @@ public:
                     std::move(cancel_token),
                     std::move(metadata),
                 };
-                if (metadata.foreground) {
+                if (job.request.origin != "watch") {
                     foreground_queue_.push_back(std::move(job));
                 } else {
                     background_queue_.push_back(std::move(job));
@@ -1702,14 +1709,7 @@ public:
 
 private:
     struct JobMetadata {
-        std::string job_id;
-        std::string request_id;
-        bool foreground = true;
-        // Routing key for the per-volume write facility, resolved by the caller before submission; never empty in practice.
-        std::string volume_key;
-        // False only for dry runs, which write nothing and need no facility, writer threads or readiness gate.
-        bool requires_writer = true;
-
+        // WorkerRequest owns identity and routing; retain only encoded events.
         // Lifecycle events reuse these fields four times per job. Escaping them
         // once at submission avoids repeated allocations/string walks on the
         // admission and completion hot paths.
@@ -1772,20 +1772,13 @@ private:
 
     static JobMetadata metadata_from_request(const WorkerRequest& request) noexcept {
         JobMetadata metadata;
-        metadata.job_id = request.job_id;
-        metadata.request_id = request.request_id;
-        if (metadata.request_id.empty()) {
-            metadata.request_id = metadata.job_id;
-        }
-        metadata.foreground = request.origin != "watch";
-        metadata.volume_key = request.output_volume_key;
-        metadata.requires_writer = !request.dry_run;
-        metadata.escaped_job_id = json_escape(metadata.job_id);
+        const auto &request_id = request.request_id.empty() ? request.job_id : request.request_id;
+        metadata.escaped_job_id = json_escape(request.job_id);
         metadata.lifecycle_context_json =
-            ",\"request_id\":\"" + json_escape(metadata.request_id) +
-            "\",\"origin\":\"" + std::string(metadata.foreground ? "foreground" : "watch") +
-            "\",\"output_volume_key\":\"" + json_escape(metadata.volume_key) +
-            "\",\"requires_writer\":" + std::string(metadata.requires_writer ? "true" : "false");
+            ",\"request_id\":\"" + json_escape(request_id) +
+            "\",\"origin\":\"" + std::string(request.origin != "watch" ? "foreground" : "watch") +
+            "\",\"output_volume_key\":\"" + json_escape(request.output_volume_key) +
+            "\",\"requires_writer\":" + std::string(!request.dry_run ? "true" : "false");
         return metadata;
     }
 
@@ -1852,7 +1845,7 @@ private:
         const Job& job,
         std::size_t active_jobs
     ) const noexcept {
-        if (job.metadata.job_id.empty()) {
+        if (job.request.job_id.empty()) {
             return;
         }
         print_json_lines(
@@ -1872,7 +1865,7 @@ private:
         std::size_t active_jobs
     ) const noexcept {
         print_worker_event(
-            job.metadata.job_id,
+            job.request.job_id,
             event,
             job.metadata,
             active_jobs);
@@ -2091,7 +2084,7 @@ private:
                 job.execution = std::make_unique<JobExecution>(memory_, job.request);
             }
             int code = -100;
-            const std::string& job_id = job.metadata.job_id;
+            const std::string& job_id = job.request.job_id;
             auto &memory_job = job.execution->memory;
             memory_.begin(memory_job);
             {
@@ -2111,8 +2104,8 @@ private:
                         print_json_line("{\"type\":\"result\",\"job_id\":\"" + json_escape(job_id) +
                             "\",\"status\":\"failed\",\"native_status\":\"error\",\"failure_kind\":\"input_changed\","
                             "\"failure_stage\":\"native_replay\",\"message\":\"archive input changed while waiting for memory; rescan required\"}");
-                    } else if (job.metadata.requires_writer) {
-                        const std::string key = job.metadata.volume_key.empty() ? synthetic_volume_key(job_id) : job.metadata.volume_key;
+                    } else if (!job.request.dry_run) {
+                        const std::string key = job.request.output_volume_key.empty() ? synthetic_volume_key(job_id) : job.request.output_volume_key;
                         auto lease = writer_registry_->acquire(key);
                         if (lease.created_facility()) print_writer_facility_event("writer_facility_created", key);
                         register_cancel_writer(job_id, lease.writer_pointer());
@@ -2171,7 +2164,7 @@ private:
                     {
                         std::lock_guard<std::mutex> lock(mutex_);
                         --parked_jobs_;
-                        auto &queue = parked->metadata.foreground ? foreground_queue_ : background_queue_;
+                        auto &queue = parked->request.origin != "watch" ? foreground_queue_ : background_queue_;
                         queue.push_front(std::move(*parked));
                     }
                     condition_.notify_one();
