@@ -97,36 +97,6 @@ Return value:
 
 An empty `candidates` list means no reliable embedded identity was found.
 
-`scan_after_markers(path, markers, archive_magics, tail_start, file_size, allow_full_scan)`
-searches for archive magic bytes after carrier markers.
-
-- `markers`: list of carrier marker bytes, such as JPEG EOF bytes.
-- `archive_magics`: list of `(magic_bytes, detected_ext)` pairs.
-- `tail_start` and `file_size`: define the tail scan range.
-- `allow_full_scan`: when true, scan before the tail range if the tail scan misses.
-
-Return value:
-
-```python
-{"detected_ext": ".7z", "offset": 123, "scan_scope": "tail"}
-```
-
-or `None` when no marker/magic pair is found.
-
-`scan_magics_anywhere(path, archive_magics, min_offset, max_hits, end_offset=None)`
-streams through a file and collects archive magic hits.
-
-- `archive_magics`: list of `(magic_bytes, detected_ext)` pairs.
-- `min_offset`: first byte offset to scan.
-- `max_hits`: maximum number of hits to return.
-- `end_offset`: optional exclusive end offset.
-
-Return value:
-
-```python
-[{"detected_ext": ".zip", "offset": 123, "scan_scope": ""}]
-```
-
 `analyze_zip_filename_encoding(archive_input, max_samples, max_filename_bytes)`
 consumes the canonical serialized archive-input descriptor, reads the logical ZIP
 central directory across file ranges or multipart inputs, and performs filename

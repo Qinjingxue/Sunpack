@@ -16,7 +16,6 @@ pub(crate) mod resource_error;
 pub(crate) mod resource_lifecycle;
 pub(crate) mod runtime_binary;
 pub(crate) mod scratch;
-pub(crate) mod util;
 
 // The payload owns its representation and any shared coordinate context;
 // IOCP forwards it without expanding compact records into absolute objects.

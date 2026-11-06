@@ -1,8 +1,8 @@
 use crate::io::archive_state::{build_segments, Segment};
 use crate::io::reader::ManagedReader;
 use crate::io::scratch::SpillMap;
-use crate::scan::magic::rfind_subslice;
 use encoding_rs::{BIG5, GBK, SHIFT_JIS};
+use memchr::memmem;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use std::collections::{HashMap, HashSet};
@@ -311,7 +311,7 @@ fn scan_zip_names(reader: &ZipLogicalReader) -> io::Result<ZipFilenameAnalysis> 
     let tail_start = file_size - search_size;
     let tail = reader.read_at(tail_start, search_size as usize)?;
     let Some(eocd) = super::find_eocd_record(&tail, false) else {
-        let status = rfind_subslice(&tail, ZIP_EOCD_SIGNATURE)
+        let status = memmem::rfind(&tail, ZIP_EOCD_SIGNATURE)
             .filter(|offset| offset.saturating_add(ZIP_EOCD_LENGTH) > tail.len())
             .map(|_| "eocd_incomplete")
             .unwrap_or("eocd_not_found");

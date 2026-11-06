@@ -149,14 +149,12 @@ fn sunpack_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?)?;
     m.add_class::<scan::directory::NativeWorkerManifest>()?;
     m.add_class::<verification::archive_manifest::NativeArchiveManifest>()?;
-    m.add_function(wrap_pyfunction!(scan::magic::scan_after_markers, m)?)?;
     m.add_function(wrap_pyfunction!(filesystem::watch_broker_acquire, m)?)?;
     m.add_function(wrap_pyfunction!(filesystem::watch_broker_release, m)?)?;
     m.add_function(wrap_pyfunction!(filesystem::watch_volume_cursor, m)?)?;
     m.add_function(wrap_pyfunction!(filesystem::watch_path_identity, m)?)?;
     m.add_function(wrap_pyfunction!(filesystem::watch_root_changes, m)?)?;
     m.add_function(wrap_pyfunction!(filesystem::watch_directories_changes, m)?)?;
-    m.add_function(wrap_pyfunction!(scan::magic::scan_magics_anywhere, m)?)?;
     m.add_function(wrap_pyfunction!(analysis_native::probe_volume_anchors, m)?)?;
     m.add_function(wrap_pyfunction!(scan::embedded::scan_embedded_archives, m)?)?;
     m.add_function(wrap_pyfunction!(

@@ -45,7 +45,7 @@ fn has_central_directory_signature(file: &mut SourceCursor, offset: u64, file_si
 fn find_eocd(tail: &[u8], file_size: u64, read_size: u64) -> Option<(u64, &[u8])> {
     let mut search_end = tail.len();
     loop {
-        let index = rfind_subslice(&tail[..search_end], ZIP_EOCD_SIGNATURE)?;
+        let index = memmem::rfind(&tail[..search_end], ZIP_EOCD_SIGNATURE)?;
         if tail.len() - index >= ZIP_EOCD_MIN_SIZE {
             let eocd = &tail[index..index + ZIP_EOCD_MIN_SIZE];
             let comment_length = u16_le(eocd, 20) as u64;
@@ -66,7 +66,7 @@ fn find_eocd_candidate(
     file_size: u64,
     read_size: u64,
 ) -> Option<(u64, [u8; ZIP_EOCD_MIN_SIZE], i64)> {
-    let index = rfind_subslice(tail, ZIP_EOCD_SIGNATURE)?;
+    let index = memmem::rfind(tail, ZIP_EOCD_SIGNATURE)?;
     if tail.len().saturating_sub(index) < ZIP_EOCD_MIN_SIZE {
         return None;
     }
