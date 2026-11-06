@@ -78,15 +78,12 @@ class NullWatchNotificationSink:
 
 @dataclass
 class _TaskProgress:
-    name: str
     completed_bytes: int = 0
     total_bytes: int = 0
     # 该 task 因输出卷空间不足被 native 合法暂停：进度条不得推进，但提示文案必须能表达"已暂停"。
     disk_blocked: bool = False
     memory_blocked: bool = False
     space_detail: str = ""
-    # 该 task 在空间事件里出现过的真实 job_id，job 终态时从 (volume_key, episode) → job_id 集合里删除。
-    space_job_ids: set[str] = field(default_factory=set)
 
 
 @dataclass
@@ -207,8 +204,6 @@ class WatchToastCoordinator:
         self._finalize_generation = 0
         self._finalize_timer: threading.Timer | None = None
         self._closed = False
-        # (volume_key, episode_id) -> 仍在等待该 episode 的 job_id 集合；全部等待 job 终态后集合变空。
-        self._space_blocked_jobs: dict[tuple[str, int], set[str]] = {}
         self.report_store = WatchFailureReportStore(
             state_dir,
             self.i18n,
@@ -220,9 +215,6 @@ class WatchToastCoordinator:
     def submitted(self, request_id: str, source_path: str) -> None:
         with self._lock:
             if not self._closed:
-                previous = self._requests.get(str(request_id))
-                if previous is not None:
-                    self._release_space_jobs_for_request_locked(previous)
                 self._requests[str(request_id)] = _RequestProgress(source_path=os.path.abspath(source_path))
 
     def cancel_batch(self, batch_id: str) -> tuple[str, ...] | None:
@@ -254,7 +246,7 @@ class WatchToastCoordinator:
                     request.visible = True
                     self._ensure_batch_locked(request.source_path)
                     self._cancel_finalize_locked()
-                    request.tasks.setdefault(task_id, _TaskProgress(name=_task_name(task, request.source_path)))
+                    request.tasks.setdefault(task_id, _TaskProgress())
                 if task_id in request.tasks:
                     request.tasks[task_id].memory_blocked = space_event == "memory_blocked"
                 self._publish_progress_locked()
@@ -266,7 +258,7 @@ class WatchToastCoordinator:
             task_id = id(task)
             if extract_started:
                 request.visible = True
-                request.tasks.setdefault(task_id, _TaskProgress(name=_task_name(task, request.source_path)))
+                request.tasks.setdefault(task_id, _TaskProgress())
                 self._ensure_batch_locked(request.source_path)
                 self._cancel_finalize_locked()
             task_progress = request.tasks.get(task_id)
@@ -278,25 +270,16 @@ class WatchToastCoordinator:
             except (TypeError, ValueError):
                 return
             # 磁盘满暂停期间不得推进进度条（那是"等待"，不是进展）。
-            if task_progress.disk_blocked or task_progress.memory_blocked:
-                task_progress.completed_bytes = min(completed, total) if total > 0 else completed
-                task_progress.total_bytes = total
-                return
             task_progress.completed_bytes = min(completed, total) if total > 0 else completed
             task_progress.total_bytes = total
-            self._publish_progress_locked()
+            if not (task_progress.disk_blocked or task_progress.memory_blocked):
+                self._publish_progress_locked()
 
-    # 空间不足暂停/恢复：按 (volume_key, episode_id) 维护仍在等待的 job 集合，集合空后提示必须消失。
+    # Transport filters stale episodes; retain only each task's visible state.
     def _space_progress_locked(
         self, request: _RequestProgress, task: Any, event: str, payload: dict[str, Any]
     ) -> None:
-        try:
-            episode = int(payload.get("episode_id") or 0)
-        except (TypeError, ValueError):
-            episode = 0
-        key = (str(payload.get("volume_key") or ""), episode)
         task_id = id(task)
-        job_id = str(payload.get("job_id") or "")
 
         task_progress = request.tasks.get(task_id)
         if task_progress is None and event == "space_blocked":
@@ -304,11 +287,10 @@ class WatchToastCoordinator:
             request.visible = True
             self._ensure_batch_locked(request.source_path)
             self._cancel_finalize_locked()
-            task_progress = _TaskProgress(name=_task_name(task, request.source_path))
+            task_progress = _TaskProgress()
             request.tasks[task_id] = task_progress
 
         if event == "space_resumed":
-            self._space_blocked_jobs.pop(key, None)
             if task_progress is not None:
                 task_progress.disk_blocked = False
                 task_progress.space_detail = ""
@@ -318,9 +300,6 @@ class WatchToastCoordinator:
         if task_progress is None:
             return
         task_progress.disk_blocked = True
-        if job_id:
-            self._space_blocked_jobs.setdefault(key, set()).add(job_id)
-            task_progress.space_job_ids.add(job_id)
         if event == "space_status":
             if not bool(payload.get("volume_query_ok", True)):
                 # 卷不可访问与"空间不足"必须可区分。
@@ -333,25 +312,6 @@ class WatchToastCoordinator:
         else:
             task_progress.space_detail = ""
         self._publish_progress_locked()
-
-    def _space_blocked_jobs_empty(self) -> bool:
-        with self._lock:
-            return not any(self._space_blocked_jobs.values())
-
-    def _release_space_jobs_for_request_locked(self, request: _RequestProgress) -> None:
-        """job 终态时把它的 job_id 从所有 episode 集合里移除，集合空则提示消失。"""
-
-        for task_progress in request.tasks.values():
-            task_progress.memory_blocked = False
-            task_progress.disk_blocked = False
-            task_progress.space_detail = ""
-            if not task_progress.space_job_ids:
-                continue
-            for key in list(self._space_blocked_jobs):
-                self._space_blocked_jobs[key].difference_update(task_progress.space_job_ids)
-                if not self._space_blocked_jobs[key]:
-                    self._space_blocked_jobs.pop(key, None)
-            task_progress.space_job_ids.clear()
 
     def succeeded(self, request_id: str, output_dirs: list[str], warnings: list[str] | None = None) -> None:
         self._terminal(request_id, "success", output_dirs=output_dirs, errors=warnings)
@@ -374,7 +334,6 @@ class WatchToastCoordinator:
             request = self._requests.pop(str(request_id), None)
             if request is None or self._closed:
                 return
-            self._release_space_jobs_for_request_locked(request)
             if request.visible:
                 if self._batch.completed or self._has_pending_batch_requests_locked():
                     self._publish_progress_locked()
@@ -393,7 +352,6 @@ class WatchToastCoordinator:
             self._closed = True
             self._cancel_finalize_locked()
             self._requests.clear()
-            self._space_blocked_jobs.clear()
             self._reset_batch_locked(clear=True)
 
     def _terminal(
@@ -409,7 +367,6 @@ class WatchToastCoordinator:
             request = self._requests.pop(str(request_id), None)
             if request is None or self._closed:
                 return
-            self._release_space_jobs_for_request_locked(request)
             if not request.visible and outcome != "interrupted":
                 self._schedule_finalize_if_drained_locked()
                 return
@@ -654,11 +611,6 @@ def _bounded_text(parts: Iterable[str], limit: int) -> str:
         if not remaining:
             break
     return "".join(chunks)
-
-
-def _task_name(task: Any, fallback: str) -> str:
-    path = str(getattr(task, "main_path", "") or fallback)
-    return os.path.basename(path) or path
 
 
 def _format_bytes(value: int) -> str:

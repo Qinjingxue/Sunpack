@@ -53,9 +53,11 @@ class DiscoveryScanSession:
     def set_scan_roots(self, roots: list[str]) -> None:
         if self.scope is not None:
             return
+        recursive_scopes = tuple(scope for scope in self._scopes.values() if scope.max_depth is None)
         for root in roots:
-            if not any(scope.max_depth is None and scope.contains(root) for scope in self._scopes.values()):
-                self._scopes.setdefault(path_key(root), DiscoveryScope(root))
+            key = path_key(root)
+            if key not in self._scopes and not any(scope.contains(root) for scope in recursive_scopes):
+                self._scopes[key] = DiscoveryScope(root)
 
     def prime_snapshot(self, directory: str, snapshot: DirectorySnapshot) -> None:
         self.add_scan_errors(snapshot.native_snapshot.scan_errors())
@@ -68,10 +70,19 @@ class DiscoveryScanSession:
     def scope_for(self, path: str) -> DiscoveryScope:
         if self.scope is not None:
             return self.scope
-        matches = [scope for scope in self._scopes.values() if scope.contains(path)]
-        if matches:
-            return max(matches, key=lambda scope: len(scope.root))
-        return self._scopes.setdefault(path_key(path), DiscoveryScope(path))
+        key = path_key(path)
+        exact = self._scopes.get(key)
+        if exact is not None and exact.contains(path):
+            return exact
+        match = max(
+            (scope for scope in self._scopes.values() if scope.contains(path)),
+            key=lambda scope: len(scope.root), default=None,
+        )
+        if match is not None:
+            return match
+        if exact is None:
+            exact = self._scopes[key] = DiscoveryScope(path)
+        return exact
 
     def snapshot_for_directory(self, directory: str) -> DirectorySnapshot:
         scope = self.scope_for(directory)

@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 
 from sunpack.core.contracts.archive_knowledge import ArchiveKnowledge
 from tests.helpers.archive_tasks import make_archive_task
@@ -23,10 +24,14 @@ def test_archive_knowledge_namespace_merge_flags_and_roundtrip():
 def test_archive_knowledge_exports_live_changes_without_aliasing():
     # Existing tests mutate through set(). Direct edits through get()/data
     # must also reach exports without retaining an obsolete snapshot.
+    @dataclass
+    class Rows:
+        rows: list[dict]
+
     knowledge = ArchiveKnowledge()
-    source = {"rows": [{"value": "original"}]}
+    source = Rows([{"value": "original"}])
     knowledge.set("analysis", source, source_layer="test")
-    source["rows"].clear()
+    source.rows.clear()
     first = knowledge.to_dict()
     knowledge.get("analysis.rows")[0]["value"] = "current"
     knowledge.data["verification"] = {"complete": True}
@@ -114,4 +119,3 @@ def test_archive_knowledge_commit_reuses_unchanged_branches_and_isolates_working
     detached = task.knowledge().to_dict()
     detached["analysis"]["large"]["rows"].clear()
     assert len(task.knowledge().get("analysis.large.rows")) == 500
-

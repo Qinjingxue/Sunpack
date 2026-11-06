@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 import time
+import weakref
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -253,29 +254,40 @@ def test_disk_full_toast_shows_recovery_hint_and_resumes(tmp_path, language, tit
 
 
 def test_space_waits_are_released_for_every_request_exit(tmp_path):
-    # Suppression/abort and invisible failures bypass normal completion; two
-    # concurrent jobs in one episode must retain only the surviving owner's job.
-    for finish in ("suppressed", "aborted", "failed", "succeeded", "stop"):
-        coordinator = WatchToastCoordinator(_Host(), _config(), str(tmp_path / "state"))
+    # Every exit must release its request state without clearing a sibling's
+    # visible pause. Check the real notification and ownership, not a side index.
+    for finish in ("suppressed", "aborted", "failed", "succeeded", "interrupted", "replaced", "stop"):
+        host = _Host()
+        coordinator = WatchToastCoordinator(host, _config(), str(tmp_path / "state"))
+        tasks = {}
         for key in ("first", "second"):
-            task = _task(tmp_path / f"{key}.zip")
+            task = tasks[key] = _task(tmp_path / f"{key}.zip")
             coordinator.submitted(key, task.main_path)
             coordinator.progress(key, task, {
                 "event": "space_blocked", "volume_key": "C:", "episode_id": 1, "job_id": key,
             })
+        retired = weakref.ref(coordinator._requests["first"])
         if finish == "stop":
             coordinator.stop()
         elif finish == "failed":
             coordinator.failed("first", ["failed"], [])
         elif finish == "succeeded":
             coordinator.succeeded("first", [])
+        elif finish == "interrupted":
+            coordinator.interrupted("first", [])
+        elif finish == "replaced":
+            coordinator.submitted("first", tasks["first"].main_path)
+            _ready(coordinator, "first", tasks["first"])
         else:
             getattr(coordinator, finish)("first")
+        assert retired() is None
         if finish != "stop":
-            assert coordinator._space_blocked_jobs == {("C:", 1): {"second"}}
+            assert host.snapshots[-1].title == coordinator.i18n.t("toast.progress.paused_title")
+            coordinator.progress("second", tasks["second"], {"event": "space_resumed"})
+            assert host.snapshots[-1].title == coordinator.i18n.t("toast.progress.title")
             coordinator.aborted("second")
-        assert coordinator._space_blocked_jobs_empty()
         coordinator.stop()
+        assert not coordinator._requests
 
 
 def test_concurrent_requests_emit_one_unified_success_after_debounce(tmp_path):

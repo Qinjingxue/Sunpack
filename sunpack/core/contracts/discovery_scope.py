@@ -44,5 +44,7 @@ class DiscoveryScope:
         scopes = {}
         for path, kind in zip(paths, kinds):
             root = path if kind == 2 else os.path.dirname(path)
-            scopes.setdefault(normalized_path(root), cls(root, recursive=recursive))
+            key = normalized_path(root)
+            if key not in scopes:
+                scopes[key] = cls(root, recursive=recursive)
         return tuple(scopes.values())

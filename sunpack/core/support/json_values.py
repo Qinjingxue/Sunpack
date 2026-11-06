@@ -1,11 +1,13 @@
-from dataclasses import asdict, is_dataclass
+from dataclasses import fields, is_dataclass
 from pathlib import Path
 from typing import Any
 
 
 def jsonable_value(value: Any) -> Any:
     if is_dataclass(value):
-        return jsonable_value(asdict(value))
+        # Build the detached JSON tree once; asdict() first deep-copies a tree
+        # that this traversal would immediately rebuild.
+        return {field.name: jsonable_value(getattr(value, field.name)) for field in fields(value)}
     if isinstance(value, Path):
         return str(value)
     if isinstance(value, dict):
