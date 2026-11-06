@@ -6,6 +6,7 @@ import socket
 import struct
 import threading
 import time
+import weakref
 
 import pytest
 
@@ -153,19 +154,41 @@ print("exit", response["exit_code"], flush=True)
     asyncio.run(scenario())
 
 
-class _AsyncWriter:
-    def __init__(self, reader=None, input_line: bytes = b""):
+class _PipeTransport:
+    def __init__(self, input_line: bytes | None = None):
         self.wire = bytearray()
-        self.reader = reader
         self.input_line = input_line
+        self.protocol = None
 
     def write(self, data):
         self.wire.extend(data)
-        if self.reader is not None and data[:1] == b"\x03":
-            self.reader.feed_data(struct.pack("!I", len(self.input_line)) + self.input_line)
+        if self.input_line is not None and data[:1] == b"\x03":
+            self.protocol._buffer.extend(struct.pack("!I", len(self.input_line)) + self.input_line)
+            self.protocol._parse_input()
 
-    async def drain(self):
-        pass
+    def get_write_buffer_size(self):
+        return 0
+
+    def close(self):
+        self.protocol.connection_lost(None)
+
+
+def _connect_protocol(transport):
+    protocol = persistent_process._PipeRequestProtocol(
+        b"t" * 32, on_connected=lambda: None, on_closed=lambda: None,
+        on_completed=lambda: None, on_shutdown=lambda: None,
+    )
+    transport.protocol = protocol
+    protocol.connection_made(transport)
+    return protocol
+
+
+async def _execute_request(payload, transport):
+    protocol = _connect_protocol(transport)
+    try:
+        return await persistent_process._execute_streaming_request_async(payload, protocol)
+    finally:
+        await protocol._finish_after_output()
 
 
 def test_streaming_execute_uses_request_local_cwd_and_streams(tmp_path, monkeypatch):
@@ -181,10 +204,9 @@ def test_streaming_execute_uses_request_local_cwd_and_streams(tmp_path, monkeypa
     monkeypatch.setattr(cli, "async_main", fake_main)
 
     async def scenario():
-        writer = _AsyncWriter()
-        code = await persistent_process._execute_streaming_request_async(
+        writer = _PipeTransport()
+        code = await _execute_request(
             {"cwd": str(tmp_path), "argv": ["config", "validate"]},
-            asyncio.StreamReader(),
             writer,
         )
         return code, bytes(writer.wire)
@@ -193,6 +215,28 @@ def test_streaming_execute_uses_request_local_cwd_and_streams(tmp_path, monkeypa
     assert exit_code == 7
     assert f"cwd={tmp_path}".encode() in wire
     assert b"warning" in wire
+
+
+def test_idle_pipe_releases_sent_frame():
+    # Delivery assertions cannot detect the idle coroutine retaining a frame.
+    # A weak reference proves release without timing or allocator assumptions.
+    class Frame(bytearray):
+        pass
+
+    async def scenario():
+        connection = _connect_protocol(_PipeTransport())
+        try:
+            frame = Frame(b"sent")
+            reference = weakref.ref(frame)
+            await connection.send_frame(frame)
+            del frame
+            await connection.flush_output()
+            assert reference() is None
+            assert not connection._output_task.done()
+        finally:
+            await connection._finish_after_output()
+
+    asyncio.run(scenario())
 
 
 def test_submit_request_strips_server_side_pause(tmp_path, monkeypatch):
@@ -332,16 +376,18 @@ def test_large_unicode_stream_backpressure_and_disconnect(monkeypatch, disconnec
 
     async def scenario():
         entered = asyncio.Event()
-        release = asyncio.Event()
+        class SlowTransport(_PipeTransport):
+            blocked = True
 
-        class SlowWriter(_AsyncWriter):
-            async def drain(self):
+            def get_write_buffer_size(self):
+                if not self.blocked:
+                    return 0
+                self.protocol.pause_writing()
                 entered.set()
-                await release.wait()
+                return 256 * 1024 + 1
 
-        writer = SlowWriter()
-        connection = persistent_process._StreamRequestConnection(asyncio.StreamReader(), writer)
-        await connection.start()
+        writer = SlowTransport()
+        connection = _connect_protocol(writer)
         queue = connection.output_queue
         stream = persistent_process._AsyncConnectionTextStream(asyncio.get_running_loop(), queue, 1)
         broker = AsyncWorkBroker()
@@ -351,22 +397,22 @@ def test_large_unicode_stream_backpressure_and_disconnect(monkeypatch, disconnec
             assert not producer.done()
             assert queue.buffered_bytes <= queue.max_bytes
             if disconnect:
-                queue.close()
-                connection._output_task.cancel()
+                connection.connection_lost(ConnectionError("client disconnected"))
                 await asyncio.gather(connection._output_task, return_exceptions=True)
             else:
-                release.set()
+                writer.blocked = False
+                connection.resume_writing()
             assert await asyncio.wait_for(producer, 4) == len(text)
             if not disconnect:
                 await connection.flush_output()
                 await connection.send_frame(struct.pack("!BIi", 0, 4, 0))
-                await connection.close()
+                await connection._finish_after_output()
             assert queue.empty()
             assert queue.buffered_bytes == 0
             return bytes(writer.wire)
         finally:
-            release.set()
-            queue.close()
+            connection.connection_lost(None)
+            await asyncio.gather(connection._output_task, return_exceptions=True)
             await broker.close()
 
     wire = asyncio.run(scenario())
@@ -426,13 +472,12 @@ def test_streaming_request_strips_terminal_columns_metadata(monkeypatch):
     monkeypatch.setattr(cli, "async_main", fake_main)
 
     async def scenario():
-        return await persistent_process._execute_streaming_request_async(
+        return await _execute_request(
             {
                 "argv": ["extract", "sample.zip", "--_sunpack-terminal-columns=79"],
                 "stdout_tty": True,
             },
-            asyncio.StreamReader(),
-            _AsyncWriter(),
+            _PipeTransport(),
         )
 
     assert asyncio.run(scenario()) == 0
@@ -440,10 +485,9 @@ def test_streaming_request_strips_terminal_columns_metadata(monkeypatch):
 
 def test_streaming_request_returns_help_through_the_request_stream():
     async def scenario():
-        writer = _AsyncWriter()
-        code = await persistent_process._execute_streaming_request_async(
+        writer = _PipeTransport()
+        code = await _execute_request(
             {"argv": ["--help"]},
-            asyncio.StreamReader(),
             writer,
         )
         return code, bytes(writer.wire)
@@ -462,10 +506,9 @@ def test_streaming_request_round_trips_interactive_input(monkeypatch):
     monkeypatch.setattr(cli, "async_main", fake_main)
 
     async def scenario():
-        reader = asyncio.StreamReader()
-        writer = _AsyncWriter(reader, b"secret\n")
-        code = await persistent_process._execute_streaming_request_async(
-            {"argv": ["extract"], "stdin_tty": True}, reader, writer
+        writer = _PipeTransport(b"secret\n")
+        code = await _execute_request(
+            {"argv": ["extract"], "stdin_tty": True}, writer
         )
         return code, bytes(writer.wire)
 

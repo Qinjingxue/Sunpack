@@ -128,6 +128,11 @@ def test_nested_relocation_updates_replacements_and_collapsed_output_roots(tmp_p
     ]
     assert state.target_results[-1].error == "retained"
     assert state.cleanup_results[0].path.replace("\\", "/") == retained.replace("\\", "/") + "/source.001"
+    # A later cleanup outcome addresses the relocated path, possibly with a
+    # different Windows casing. Replace that warning, not the old source key.
+    latest = ArchiveCleanupResult(state.cleanup_results[0].path.upper(), "delete", "failed", message="latest")
+    state.add_cleanup_result(latest)
+    assert state.cleanup_results == (latest,)
 
 
 def test_output_target_ownership_survives_junction_flatten_and_forget(tmp_path):

@@ -6,6 +6,7 @@ import contextvars
 import os
 import threading
 import time
+import weakref
 
 import pytest
 
@@ -64,6 +65,45 @@ def test_task_scope_releases_resources_in_reverse_creation_order(tmp_path):
     assert released == ["early", "second", "first"]
     assert not scope._resource_ids
     assert resource_snapshot((path,)) == ()
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_failed_scope_release_remains_owned_until_retry(tmp_path, asynchronous):
+    # Successful closes never exercise a retained callback after partial failure.
+    # Cover both entry points with one small ownership/retry scenario.
+    released = []
+
+    class Owner:
+        attempts = 0
+
+        def close(self):
+            self.attempts += 1
+            if self.attempts == 1:
+                raise OSError("temporary release failure")
+            released.append("retried")
+
+    scope = TaskResourceScope("release-retry")
+    owner = Owner()
+    reference = weakref.ref(owner)
+    scope.register(owner, (tmp_path,), owner.close)
+    scope.register(object(), (), lambda: released.append("first"))
+    del owner
+
+    def close():
+        return asyncio.run(scope.aclose()) if asynchronous else scope.close()
+
+    with pytest.raises(lifecycle.ResourceLifecycleError, match="temporary release failure"):
+        close()
+    assert released == ["first"]
+    assert scope.state is lifecycle.ScopeState.QUIESCING
+    assert lifecycle.task_resource_scope(scope.task_id) is scope
+    assert reference() is not None
+    assert close().released == 1
+    assert released == ["first", "retried"]
+    assert reference() is None
+    assert not scope._resource_ids
+    assert lifecycle.task_resource_scope(scope.task_id) is None
+    assert resource_snapshot((tmp_path,)) == ()
 
 
 def test_promotion_gate_excludes_new_overlapping_file_opens(tmp_path):

@@ -939,9 +939,8 @@ class _SourceCleanup:
         )
         if outcome.failed:
             with self._context.lock:
-                by_path = {path_key(item.path): item for item in self._context.cleanup_results}
-                by_path.update({path_key(item.path): item for item in outcome.failed})
-                self._context.set_cleanup_results(by_path.values())
+                for failure in outcome.failed:
+                    self._context.add_cleanup_result(failure)
 
         return ReleaseOutcome(
             task_key=request.task_key,

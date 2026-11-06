@@ -19,11 +19,10 @@ class RunState:
         self.lock = threading.Lock()
         self._scan_failures: list[FailureInfo] = []
         self.processed_keys: set[str] = set()
-        self.cleanup_results: list[ArchiveCleanupResult] = []
         self.target_results: list[TargetRunResult] = []
         self._target_slots: dict[int, int] = {}
         self._target_outputs = PathMap()
-        self._cleanup_paths = PathMap()
+        self._cleanup_results = PathMap()
         self.policy_skips: list[dict] = []
         self._scan_error_keys: set[tuple[str, str, str]] | None = None
         self._omitted_scan_errors = 0
@@ -53,17 +52,12 @@ class RunState:
                     del self._target_outputs[old.output_dir]
         self._store_target_result(slot, new)
 
-    def add_cleanup_result(self, result: ArchiveCleanupResult) -> None:
-        slot = len(self.cleanup_results)
-        self.cleanup_results.append(result)
-        if result.path:
-            self._cleanup_paths.setdefault(result.path, []).append(slot)
+    @property
+    def cleanup_results(self) -> tuple[ArchiveCleanupResult, ...]:
+        return tuple(self._cleanup_results.values())
 
-    def set_cleanup_results(self, results: Iterable[ArchiveCleanupResult]) -> None:
-        self.cleanup_results.clear()
-        self._cleanup_paths.clear()
-        for result in results:
-            self.add_cleanup_result(result)
+    def add_cleanup_result(self, result: ArchiveCleanupResult) -> None:
+        self._cleanup_results[result.path] = result
 
     def relocate_outputs(self, result) -> None:
         for _path, slots in self._target_outputs.pop_under(result.path):
@@ -80,12 +74,9 @@ class RunState:
                     })
                 self._store_target_result(slot, replace(old, output_dir=path, failure=failure)
                                           if path != old.output_dir or failure is not old.failure else old)
-        for _path, slots in self._cleanup_paths.pop_under(result.path):
-            for slot in slots:
-                old = self.cleanup_results[slot]
-                path = result.relocate(old.path)
-                self.cleanup_results[slot] = replace(old, path=path) if path != old.path else old
-                self._cleanup_paths.setdefault(path, []).append(slot)
+        for _path, old in self._cleanup_results.pop_under(result.path):
+            path = result.relocate(old.path)
+            self.add_cleanup_result(replace(old, path=path) if path != old.path else old)
 
     @property
     def scan_failures(self) -> list[FailureInfo]:
@@ -143,5 +134,5 @@ class RunState:
             target_results=tuple(target_results),
             scan_failures=tuple(scan_failures),
             policy_skips=tuple(policy_skips),
-            cleanup_results=tuple(self.cleanup_results),
+            cleanup_results=self.cleanup_results,
         )

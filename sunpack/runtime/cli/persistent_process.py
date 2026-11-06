@@ -708,6 +708,9 @@ class _PipeRequestProtocol(asyncio.Protocol):
                         await self._write_ready.wait()
                 finally:
                     self._output_queue.task_done()
+                    # The next frame may arrive only after a long extraction
+                    # or password prompt. The transport now owns these bytes.
+                    del frame
         except asyncio.CancelledError:
             raise
         except (ConnectionError, OSError):
@@ -1092,66 +1095,12 @@ class _AsyncConnectionTextStream:
         return self._is_tty
 
 
-class _StreamRequestConnection:
-    """Stream adapter kept for direct unit tests of command streaming behavior."""
-
-    def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        self.reader = reader
-        self.writer = writer
-        self.output_queue = _ConnectionOutputQueue()
-        self._output_task: asyncio.Task[None] | None = None
-
-    async def start(self) -> None:
-        self._output_task = asyncio.create_task(self._pump_output(), name="persistent-stream-output")
-
-    async def close(self) -> None:
-        if self._output_task is not None:
-            await self.output_queue.put(None)
-            await self._output_task
-
-    async def _pump_output(self) -> None:
-        try:
-            while True:
-                frame = await self.output_queue.get()
-                try:
-                    if frame is None:
-                        return
-                    self.writer.write(frame)
-                    await self.writer.drain()
-                finally:
-                    self.output_queue.task_done()
-        finally:
-            self.output_queue.close()
-
-    async def send_frame(self, frame: bytes) -> None:
-        await self.output_queue.put(frame)
-
-    async def flush_output(self) -> None:
-        await self.output_queue.join()
-
-    async def read_input(self, prompt: str, stdout: _AsyncConnectionTextStream) -> str:
-        if prompt:
-            await stdout.awrite(prompt)
-        await self.flush_output()
-        await self.send_frame(struct.pack("!BI", 3, 0))
-        await self.flush_output()
-        size = struct.unpack("!I", await self.reader.readexactly(4))[0]
-        if size > _MAX_FIELD_BYTES:
-            raise ValueError("persistent input frame is too large")
-        return (await self.reader.readexactly(size)).decode("utf-8", "replace")
-
-
 async def _execute_streaming_request_async(
     payload: dict[str, Any],
-    connection_or_reader,
-    writer=None,
+    connection: _PipeRequestProtocol,
 ) -> int:
     from sunpack.runtime.cli.cli import async_main
 
-    owns_connection = writer is not None
-    connection = _StreamRequestConnection(connection_or_reader, writer) if owns_connection else connection_or_reader
-    if owns_connection:
-        await connection.start()
     loop = asyncio.get_running_loop()
 
     argv = []
@@ -1203,8 +1152,6 @@ async def _execute_streaming_request_async(
         return 1
     finally:
         await connection.flush_output()
-        if owns_connection:
-            await connection.close()
 
 
 def _write_state(name: str, token: bytes) -> None:

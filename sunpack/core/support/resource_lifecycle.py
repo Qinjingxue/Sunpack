@@ -664,22 +664,7 @@ class TaskResourceScope:
                         f"task {self.task_id} still has {self._active_operations} active operations"
                     )
                 _CHANGED.wait()
-            records = [
-                _RESOURCES[resource_id]
-                for resource_id in self._resource_ids
-                if resource_id in _RESOURCES and _RESOURCES[resource_id].state is not ResourceState.RELEASED
-            ]
-        report = _release_records(records)
-        with _CHANGED:
-            self.state = ScopeState.CLOSED
-            if _TASK_SCOPES.get(self.task_id) is self:
-                _TASK_SCOPES.pop(self.task_id, None)
-            _CHANGED.notify_all()
-        if not report.ok:
-            raise ResourceLifecycleError(
-                f"task {self.task_id} resource cleanup failed: {report.failed}"
-            )
-        return report
+        return self._finish_close()
 
     async def aclose(self, *, timeout: float | None = None) -> ReleaseReport:
         waiter: tuple[asyncio.AbstractEventLoop, asyncio.Event] | None = None
@@ -706,6 +691,9 @@ class TaskResourceScope:
                 with _CHANGED:
                     if waiter in self._async_idle_waiters:
                         self._async_idle_waiters.remove(waiter)
+        return self._finish_close()
+
+    def _finish_close(self) -> ReleaseReport:
         with _CHANGED:
             active_operations = self._active_operations
             if active_operations:
@@ -719,15 +707,19 @@ class TaskResourceScope:
                 and _RESOURCES[resource_id].state is not ResourceState.RELEASED
             ]
         report = _release_records(records)
-        with _CHANGED:
-            self.state = ScopeState.CLOSED
-            if _TASK_SCOPES.get(self.task_id) is self:
-                _TASK_SCOPES.pop(self.task_id, None)
-            _CHANGED.notify_all()
+        # A failed release retains its callback and owner. Keep their scope
+        # quiescing and discoverable so close() can retry only those resources.
         if not report.ok:
             raise ResourceLifecycleError(
                 f"task {self.task_id} resource cleanup failed: {report.failed}"
             )
+        with _CHANGED:
+            if self._resource_ids:
+                raise ResourceBusyError(f"task {self.task_id} resources are still being released")
+            self.state = ScopeState.CLOSED
+            if _TASK_SCOPES.get(self.task_id) is self:
+                _TASK_SCOPES.pop(self.task_id, None)
+            _CHANGED.notify_all()
         return report
 
 
