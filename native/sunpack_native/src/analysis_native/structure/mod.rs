@@ -1,3 +1,4 @@
+use crate::formats::rar::read_vint;
 use crate::io::read_fault::{read_exact_field, seek_field, FieldLocation, ReadFault};
 use crate::io::reader::{ManagedReader, SourceCursor};
 use crc32fast::hash as crc32;

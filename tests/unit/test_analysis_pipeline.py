@@ -125,6 +125,27 @@ def test_rar5_extra_area_larger_than_header_does_not_panic(tmp_path):
     assert result["format"] == "rar"
 
 
+def test_rar5_probe_rejects_overflowing_block_fields():
+    # Valid header CRCs do not protect against integer truncation. Existing
+    # size-vint tests reject long headers before these block fields are read.
+    signature = b"Rar!\x1a\x07\x01\x00"
+    end = _rar5_block(5)
+    assert probe_rar_bytes(signature + _rar5_block(1) + end, 0)["end_block_found"]
+    # The full valid u64 range remains legal for unknown skippable blocks.
+    assert probe_rar_bytes(
+        signature + _rar5_block(1) + _rar5_block((1 << 64) - 1, 4) + end, 0,
+    )["end_block_found"]
+    for block in (
+        _rar5_block((1 << 64) + 1),
+        _rar5_block(1, 1 << 64),
+        _rar5_block(1, 2, body=_rar5_vint(1 << 64)),
+        _rar5_block(1, 1, body=_rar5_vint(1 << 64)),
+    ):
+        observation = probe_rar_bytes(signature + block + end, 0)
+        assert not observation["end_block_found"]
+        assert not observation["strong_accept"]
+
+
 def test_rar4_large_packed_sizes_agree_across_native_analysis_paths(tmp_path):
     # Carrier extraction alone bypasses the standalone inspectors. This small
     # matrix uniquely catches high-word/truncated-header errors in those paths;
