@@ -16,50 +16,25 @@ RAR_AVAILABLE = get_optional_rar() is not None
 
 
 @pytest.mark.parametrize("archive_format", SFX_FORMATS)
-def test_plan2_encrypted_sfx_find_correct_password(tmp_path, archive_format, plan2_error):
+@pytest.mark.parametrize("split", [False, True], ids=["single", "split"])
+def test_plan2_encrypted_sfx_find_correct_password(tmp_path, archive_format, split, plan2_error):
     if archive_format == "rar" and not RAR_AVAILABLE:
         pytest.skip("RAR generator is not configured")
-    password = f"correct-sfx-{archive_format}"
-    plan2_error["case_id"] = f"sfx_{archive_format}"
+    case_id = f"sfx_{'split_' if split else ''}{archive_format}"
+    password = f"correct-{case_id}"
+    plan2_error["case_id"] = case_id
     plan2_error["archive_format"] = archive_format
     plan2_error["sfx"] = True
+    plan2_error["split"] = split
     plan2_error["password_list_size"] = 100
     case = FACTORY.create(
         tmp_path,
-        f"sfx_{archive_format}",
+        case_id,
         archive_format,
         password=password,
         sfx=True,
-        payload_size=16 * 1024,
-    )
-
-    assert_plan2_success(
-        case,
-        f".{archive_format}",
-        expected_container="pe",
-        passwords=encrypted_password_list(password),
-        error_info=plan2_error,
-    )
-
-
-@pytest.mark.parametrize("archive_format", SFX_FORMATS)
-def test_plan2_encrypted_sfx_split_find_correct_password(tmp_path, archive_format, plan2_error):
-    if archive_format == "rar" and not RAR_AVAILABLE:
-        pytest.skip("RAR generator is not configured")
-    password = f"correct-sfx-split-{archive_format}"
-    plan2_error["case_id"] = f"sfx_split_{archive_format}"
-    plan2_error["archive_format"] = archive_format
-    plan2_error["sfx"] = True
-    plan2_error["split"] = True
-    plan2_error["password_list_size"] = 100
-    case = FACTORY.create(
-        tmp_path,
-        f"sfx_split_{archive_format}",
-        archive_format,
-        password=password,
-        sfx=True,
-        split=True,
-        payload_size=420 * 1024,
+        split=split,
+        payload_size=(420 if split else 16) * 1024,
     )
 
     assert_plan2_success(

@@ -133,34 +133,18 @@ def test_naked_executable_does_not_attach_disguised_parts(tmp_path):
     }
 
 
-def test_missing_middle_split_volume_is_not_emitted_as_a_relation_group(tmp_path):
-    root = tmp_path / "missing_middle"
-    _write_files(root, ["gap.7z.001", "gap.7z.002", "gap.7z.004"])
+@pytest.mark.parametrize("names", [
+    pytest.param(["gap.7z.001", "gap.7z.002", "gap.7z.004"], id="missing-middle"),
+    pytest.param(["lost.7z.002", "lost.7z.003"], id="missing-head"),
+])
+def test_incomplete_split_volumes_remain_individual_candidates(tmp_path, names):
+    _write_files(tmp_path, names)
 
-    candidates = build_candidates_for_targets([str(root)], config=SCAN_CONFIG)
-    gap = [
-        candidate for candidate in candidates
-        if Path(candidate.entry_path).name.startswith("gap.7z.")
-    ]
-
-    assert len(gap) == 3
-    assert all(not candidate.is_split for candidate in gap)
-    assert all(len(candidate.archive_input.part_paths()) == 1 for candidate in gap)
-
-
-def test_missing_head_split_volume_is_not_emitted_as_a_relation_group(tmp_path):
-    root = tmp_path / "missing_head"
-    _write_files(root, ["lost.7z.002", "lost.7z.003"])
-
-    candidates = build_candidates_for_targets([str(root)], config=SCAN_CONFIG)
-    lost = [
-        candidate for candidate in candidates
-        if Path(candidate.entry_path).name.startswith("lost.7z.")
-    ]
-
-    assert len(lost) == 2
-    assert all(not candidate.is_split for candidate in lost)
-    assert all(len(candidate.archive_input.part_paths()) == 1 for candidate in lost)
+    candidates = build_candidates_for_targets([str(tmp_path)], config=SCAN_CONFIG)
+    assert len(candidates) == len(names)
+    assert {Path(candidate.entry_path).name for candidate in candidates} == set(names)
+    assert all(not candidate.is_split for candidate in candidates)
+    assert all(len(candidate.archive_input.part_paths()) == 1 for candidate in candidates)
 
 
 def test_missing_head_split_volume_is_not_recovered_by_filename_only_candidate(tmp_path):

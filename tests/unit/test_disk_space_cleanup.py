@@ -121,29 +121,6 @@ def test_failed_sibling_vetoes_shared_cleanup(tmp_path, success_first):
     assert table.count(shared) == 0
 
 
-def test_source_cleanup_reports_external_lock_without_timed_retry(tmp_path, monkeypatch):
-    source = tmp_path / "busy.zip"
-    source.write_text("payload")
-    calls = []
-
-    def fail(target):
-        calls.append(target)
-        raise locked()
-
-    monkeypatch.setattr(cleanup, "send2trash", fail)
-    scope = _scope()
-    task = _Task("busy", [source])
-    scope.register([task])
-
-    outcome = _release_and_apply(scope, task, OutcomeKind.COMPLETE_SUCCESS)
-
-    assert calls == [str(source)]
-    assert len(outcome.failed) == 1
-    assert outcome.failed[0].error_code == 32
-    assert tuple(scope._context.cleanup_results) == outcome.failed
-    assert source.exists()
-
-
 @pytest.mark.parametrize("mode", ["recycle", "delete"])
 @pytest.mark.parametrize("release_kind,success_first", [
     ("failure", True), ("failure", False),
@@ -213,6 +190,7 @@ def test_source_cleanup_reports_each_failure_once(tmp_path, monkeypatch):
     outcome = _release_and_apply(scope, task, OutcomeKind.COMPLETE_SUCCESS)
 
     failures = {item.path: item.error_code for item in outcome.failed}
+    assert len(outcome.failed) == 2
     assert failures == {str(inaccessible): 5, str(busy): 32}
     assert tuple(scope._context.cleanup_results) == outcome.failed
     assert sorted(calls) == sorted([str(inaccessible), str(busy)])

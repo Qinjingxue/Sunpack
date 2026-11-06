@@ -2,32 +2,52 @@ from __future__ import annotations
 
 import pytest
 
+from tests.helpers.real_archives import (
+    create_encrypted_7z_archive,
+    create_encrypted_rar_archive,
+    create_encrypted_zip_archive,
+)
 
-ZIP_CASES = [
-    pytest.param("zipcrypto", "ZipCrypto", None, id="zipcrypto"),
-    pytest.param("aes128", "AES128", None, id="aes128"),
-    pytest.param("aes256", "AES256", None, id="aes256"),
-    pytest.param("deflate64", "ZipCrypto", "Deflate64", id="deflate64"),
-    pytest.param("bzip2", "ZipCrypto", "BZip2", id="bzip2"),
-    pytest.param("lzma", "ZipCrypto", "LZMA", id="lzma"),
-    pytest.param("ppmd", "ZipCrypto", "PPMd", id="ppmd"),
-]
 
-RAR_CASES = [
-    pytest.param("rar5-header", False, True, id="rar5-header"),
-    pytest.param("rar5-data", False, False, id="rar5-data"),
-    pytest.param("rar4-header", True, True, id="rar4-header"),
-    pytest.param("rar4-data", True, False, id="rar4-data"),
-]
-
-SEVEN_ZIP_CASES = [
-    pytest.param("header-on", True, True, None, id="header-on"),
-    pytest.param("header-off", False, True, None, id="header-off"),
-    pytest.param("nonsolid", True, False, None, id="nonsolid"),
-    pytest.param("lzma", True, True, "LZMA", id="lzma"),
-    pytest.param("ppmd", True, True, "PPMd", id="ppmd"),
-    pytest.param("bzip2", True, True, "BZip2", id="bzip2"),
-    pytest.param("deflate", True, True, "Deflate", id="deflate"),
+# Success and wrong-password tests must exercise the same format variants.
+ENCRYPTED_CASES = [
+    *[
+        pytest.param("zip", case_id, create_encrypted_zip_archive,
+                     {"encryption": encryption, "method": method}, id=f"zip-{case_id}")
+        for case_id, encryption, method in (
+            ("zipcrypto", "ZipCrypto", None),
+            ("aes128", "AES128", None),
+            ("aes256", "AES256", None),
+            ("deflate64", "ZipCrypto", "Deflate64"),
+            ("bzip2", "ZipCrypto", "BZip2"),
+            ("lzma", "ZipCrypto", "LZMA"),
+            ("ppmd", "ZipCrypto", "PPMd"),
+        )
+    ],
+    *[
+        pytest.param("rar", case_id, create_encrypted_rar_archive,
+                     {"rar4": rar4, "header_encrypt": header_encrypt}, id=case_id)
+        for case_id, rar4, header_encrypt in (
+            ("rar5-header", False, True),
+            ("rar5-data", False, False),
+            ("rar4-header", True, True),
+            ("rar4-data", True, False),
+        )
+    ],
+    *[
+        pytest.param("7z", case_id, create_encrypted_7z_archive,
+                     {"header_encrypt": header_encrypt, "solid": solid, "method": method},
+                     id=f"7z-{case_id}")
+        for case_id, header_encrypt, solid, method in (
+            ("header-on", True, True, None),
+            ("header-off", False, True, None),
+            ("nonsolid", True, False, None),
+            ("lzma", True, True, "LZMA"),
+            ("ppmd", True, True, "PPMd"),
+            ("bzip2", True, True, "BZip2"),
+            ("deflate", True, True, "Deflate"),
+        )
+    ],
 ]
 
 SFX_FORMATS = ["7z", "zip", "rar"]

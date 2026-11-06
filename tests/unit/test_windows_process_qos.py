@@ -48,6 +48,8 @@ def test_processing_mode_supports_fixed_background_normal_and_high(monkeypatch):
 
     assert process_qos.set_processing_mode(mode="high") == "high"
     assert process_qos.set_processing_mode(mode="high") == "high"
+    assert process_qos.set_processing_mode(mode="background") == "background"
+    assert process_qos.set_processing_mode(mode="high") == "high"
     assert process_qos.set_processing_mode(mode="normal") == "normal"
     assert process_qos.set_processing_mode(mode="background") == "background"
     assert process_qos.set_processing_mode(mode="high") == "high"
@@ -58,24 +60,10 @@ def test_processing_mode_supports_fixed_background_normal_and_high(monkeypatch):
         (123, process_qos.PROCESS_MODE_BACKGROUND_BEGIN),
         (123, process_qos.PROCESS_MODE_BACKGROUND_END),
         (123, process_qos.HIGH_PRIORITY_CLASS),
-    ]
-
-
-def test_high_to_background_returns_to_normal_before_background_mode(monkeypatch):
-    calls = []
-    monkeypatch.setattr(process_qos.sys, "platform", "win32")
-    monkeypatch.setattr(
-        process_qos.ctypes,
-        "WinDLL",
-        lambda *_args, **_kwargs: _kernel32(calls),
-        raising=False,
-    )
-    monkeypatch.setattr(process_qos, "_MODE", "high")
-
-    assert process_qos.set_processing_mode(mode="background") == "background"
-    assert calls == [
         (123, process_qos.NORMAL_PRIORITY_CLASS),
         (123, process_qos.PROCESS_MODE_BACKGROUND_BEGIN),
+        (123, process_qos.PROCESS_MODE_BACKGROUND_END),
+        (123, process_qos.HIGH_PRIORITY_CLASS),
     ]
 
 

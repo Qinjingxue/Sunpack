@@ -114,67 +114,32 @@ def test_plan1_seven_zip_compression_methods_and_solid_modes_extract_all_members
 
 
 RAR_MODE_CASES = [
-    pytest.param(0, False, "m0", id="store-nonsolid"),
-    pytest.param(5, False, "m5", id="maximum-nonsolid"),
-    pytest.param(5, True, "m5", id="maximum-solid"),
+    pytest.param(False, 0, False, "m0", id="store-nonsolid"),
+    pytest.param(False, 5, False, "m5", id="maximum-nonsolid"),
+    pytest.param(False, 5, True, "m5", id="maximum-solid"),
+    pytest.param(True, 1, False, "m1", id="rar4-compressed-nonsolid"),
+    pytest.param(True, 5, True, "m5", id="rar4-compressed-solid"),
 ]
 
 
-@pytest.mark.parametrize(("level", "solid", "listed_method"), RAR_MODE_CASES)
+@pytest.mark.parametrize(("rar4", "level", "solid", "listed_method"), RAR_MODE_CASES)
 def test_plan1_rar_compression_levels_and_solid_modes_extract_all_members(
-    tmp_path, level, solid, listed_method, plan1_error
+    tmp_path, rar4, level, solid, listed_method, plan1_error
 ):
     if not RAR_AVAILABLE:
         pytest.skip("RAR generator is not configured")
-    case = FACTORY.create(
-        tmp_path,
-        f"rar_mode_{level}_{'solid' if solid else 'nonsolid'}",
-        "rar",
-        payload_size=256,
-        payload_profile="structured",
-        compression_level=level,
-        solid=solid,
+    case_id = f"rar{4 if rar4 else 5}_mode_{level}_{'solid' if solid else 'nonsolid'}"
+    options = dict(payload_size=256, payload_profile="structured", compression_level=level, solid=solid)
+    case = (
+        create_rar4_archive(tmp_path, case_id, **options) if rar4
+        else FACTORY.create(tmp_path, case_id, "rar", **options)
     )
     methods = _listed_methods(case.entry_path)
     plan1_error.update(
         {
             "case_id": case.case_id,
             "archive_format": "rar",
-            "compression_level": level,
-            "solid": solid,
-            "listed_methods": methods,
-        }
-    )
-    assert any(listed_method in value for value in methods)
-    assert_plan1_success(case, ".rar", error_info=plan1_error)
-
-
-@pytest.mark.parametrize(
-    ("level", "solid", "listed_method"),
-    [
-        pytest.param(1, False, "m1", id="rar4-compressed-nonsolid"),
-        pytest.param(5, True, "m5", id="rar4-compressed-solid"),
-    ],
-)
-def test_plan1_rar4_compression_modes_extract_all_members(
-    tmp_path, level, solid, listed_method, plan1_error
-):
-    if not RAR_AVAILABLE:
-        pytest.skip("RAR generator is not configured")
-    case = create_rar4_archive(
-        tmp_path,
-        f"rar4_mode_{level}_{'solid' if solid else 'nonsolid'}",
-        payload_size=256,
-        payload_profile="structured",
-        compression_level=level,
-        solid=solid,
-    )
-    methods = _listed_methods(case.entry_path)
-    plan1_error.update(
-        {
-            "case_id": case.case_id,
-            "archive_format": "rar",
-            "rar4": True,
+            "rar4": rar4,
             "compression_level": level,
             "solid": solid,
             "listed_methods": methods,

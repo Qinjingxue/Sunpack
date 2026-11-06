@@ -13,40 +13,23 @@ RAR_AVAILABLE = get_optional_rar() is not None
 
 
 @pytest.mark.parametrize("archive_format", SFX_FORMATS)
-def test_plan3_encrypted_sfx_reports_password_error(tmp_path, archive_format, plan3_error):
+@pytest.mark.parametrize("split", [False, True], ids=["single", "split"])
+def test_plan3_encrypted_sfx_reports_password_error(tmp_path, archive_format, split, plan3_error):
     if archive_format == "rar" and not RAR_AVAILABLE:
         pytest.skip("RAR generator is not configured")
-    plan3_error["case_id"] = f"sfx_{archive_format}"
+    case_id = f"sfx_{'split_' if split else ''}{archive_format}"
+    plan3_error["case_id"] = case_id
     plan3_error["archive_format"] = archive_format
     plan3_error["sfx"] = True
+    plan3_error["split"] = split
     case = FACTORY.create(
         tmp_path,
-        f"sfx_{archive_format}",
+        case_id,
         archive_format,
         password="correct-password-not-in-list",
         sfx=True,
-        payload_size=16 * 1024,
-    )
-
-    assert_password_error(case, error_info=plan3_error)
-
-
-@pytest.mark.parametrize("archive_format", SFX_FORMATS)
-def test_plan3_encrypted_sfx_split_reports_password_error(tmp_path, archive_format, plan3_error):
-    if archive_format == "rar" and not RAR_AVAILABLE:
-        pytest.skip("RAR generator is not configured")
-    plan3_error["case_id"] = f"sfx_split_{archive_format}"
-    plan3_error["archive_format"] = archive_format
-    plan3_error["sfx"] = True
-    plan3_error["split"] = True
-    case = FACTORY.create(
-        tmp_path,
-        f"sfx_split_{archive_format}",
-        archive_format,
-        password="correct-password-not-in-list",
-        sfx=True,
-        split=True,
-        payload_size=420 * 1024,
+        split=split,
+        payload_size=(420 if split else 16) * 1024,
     )
 
     assert_password_error(case, error_info=plan3_error)

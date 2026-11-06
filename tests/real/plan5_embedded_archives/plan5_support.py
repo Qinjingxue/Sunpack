@@ -592,12 +592,12 @@ def assert_plan5_success(
     )
 
 
-def assert_plan5_wrong_password_blocks_carrier(
+def assert_plan5_password_failure_preserves_healthy_segments(
     case: EmbeddedMixedCase,
     *,
     error_info: dict[str, Any] | None = None,
 ) -> None:
-    """任一加密段密码无法确认时，整个 carrier 必须停止并报密码错误。"""
+    """加密段保留密码错误，边界已确定的健康段仍须完整恢复。"""
     wrong = [f"wrong-{index:03d}-plan5" for index in range(20)]
     summary = run_plan1_pipeline(case.file_path, passwords=wrong)
     marker_status = _marker_status(case, case.file_path.parent)
@@ -620,10 +620,8 @@ def assert_plan5_wrong_password_blocks_carrier(
     assert summary.failed_tasks, "all-wrong passwords must leave failed tasks"
     assert summary.success_count == summary.partial_success_count == 0
     assert_failure_kind(summary.failures, FailureKind.WRONG_PASSWORD)
-    assert not extracted, (
-        "a carrier with an unresolved encrypted segment must not be partially processed; "
-        f"extracted={[item['variant'] for item in extracted]}"
-    )
+    expected = {segment.position for segment in case.segments if not segment.encrypted}
+    assert {item["position"] for item in extracted} == expected, marker_status
 
 
 __all__ = [
@@ -644,6 +642,6 @@ __all__ = [
     "assert_plan5_native_scan_coverage",
     "assert_plan5_single_task_scan",
     "assert_plan5_success",
-    "assert_plan5_wrong_password_blocks_carrier",
+    "assert_plan5_password_failure_preserves_healthy_segments",
     "_segment_table",
 ]

@@ -17,22 +17,26 @@ RAR_AVAILABLE = get_optional_rar() is not None
 
 @pytest.mark.parametrize("archive_format", ["zip", "rar", "7z"])
 @pytest.mark.parametrize("scenario", SCENARIOS)
+@pytest.mark.parametrize("sfx", [False, True], ids=["archive", "sfx"])
 def test_plan4_encrypted_split_missing_volumes(
-    tmp_path, archive_format, scenario, plan4_error
+    tmp_path, archive_format, scenario, sfx, plan4_error
 ):
     if archive_format == "rar" and not RAR_AVAILABLE:
         pytest.skip("RAR generator is not configured")
-    password = f"correct-{archive_format}-{scenario}"
-    plan4_error["case_id"] = f"split_{archive_format}_{scenario}"
+    case_id = f"{'sfx_' if sfx else ''}split_{archive_format}_{scenario}"
+    password = f"correct-{case_id}"
+    plan4_error["case_id"] = case_id
     plan4_error["archive_format"] = archive_format
     plan4_error["scenario"] = scenario
     plan4_error["split"] = True
+    plan4_error["sfx"] = sfx
     case = FACTORY.create(
         tmp_path,
-        f"enc_split_{archive_format}_{scenario}",
+        f"enc_{case_id}",
         archive_format,
         password=password,
         split=True,
+        sfx=sfx,
         payload_size=620 * 1024,
     )
     plan4_error["part_count_before"] = len(

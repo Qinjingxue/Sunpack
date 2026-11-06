@@ -36,46 +36,24 @@ def test_directory_scanner_captures_files_and_directories(tmp_path):
     assert next(entry for entry in entries if entry.path.name == "archive.zip").size == 4
 
 
-def test_directory_scanner_size_range_filters_files_outside_range(tmp_path):
-    small = tmp_path / "small.zip"
-    medium = tmp_path / "medium.zip"
-    large = tmp_path / "large.zip"
-    small.write_bytes(b"a" * 8)
-    medium.write_bytes(b"b" * 16)
-    large.write_bytes(b"c" * 32)
-
-    for bounds, expected in (
-        ({"min_bytes": 10, "max_bytes": 31}, {"medium.zip"}),
-        ({"min_bytes": 10}, {"medium.zip", "large.zip"}),
-    ):
-        snapshot = DirectoryScanner(str(tmp_path), config=make_config({
-            "filesystem": {
-                "scan_filters": [{"name": "size_range", "enabled": True, **bounds}]
-            }
-        })).scan()
-        assert {entry.path.name for entry in _entries(snapshot)} == expected
-
-
-def test_directory_scanner_size_range_accepts_integer_byte_bounds(tmp_path):
-    small = tmp_path / "small.zip"
-    keep = tmp_path / "keep.zip"
-    large = tmp_path / "large.zip"
-    small.write_bytes(b"a" * 512 * 1024)
-    keep.write_bytes(b"b" * 2 * 1024 * 1024)
-    large.write_bytes(b"c" * 11 * 1024 * 1024)
+@pytest.mark.parametrize(("sizes", "bounds", "expected"), [
+    ((8, 16, 32), {"min_bytes": 10, "max_bytes": 31}, {"medium.zip"}),
+    ((8, 16, 32), {"min_bytes": 10}, {"medium.zip", "large.zip"}),
+    ((512 * 1024, 2 * 1024 * 1024, 11 * 1024 * 1024),
+     {"min_bytes": 1048577, "max_bytes": 10485759}, {"medium.zip"}),
+])
+def test_directory_scanner_size_range_filters_integer_byte_bounds(tmp_path, sizes, bounds, expected):
+    for name, size in zip(("small.zip", "medium.zip", "large.zip"), sizes):
+        with (tmp_path / name).open("wb") as stream:
+            stream.truncate(size)
 
     snapshot = DirectoryScanner(str(tmp_path), config=make_config({
         "filesystem": {
-            "scan_filters": [
-                {"name": "size_range", "enabled": True, "min_bytes": 1048577, "max_bytes": 10485759},
-            ]
+            "scan_filters": [{"name": "size_range", "enabled": True, **bounds}]
         }
     })).scan()
 
-    names = {entry.path.name for entry in _entries(snapshot)}
-    assert "small.zip" not in names
-    assert "keep.zip" in names
-    assert "large.zip" not in names
+    assert {entry.path.name for entry in _entries(snapshot)} == expected
 
 
 def test_directory_scanner_promotes_small_split_member_with_accepted_family_anchor(tmp_path):
@@ -179,65 +157,31 @@ def test_snapshot_from_entries_preserves_anchored_small_split_member(tmp_path):
     assert names == {"payload.7z.001", "payload.7z.002"}
 
 
-def test_directory_scanner_mtime_range_filters_files_outside_range(tmp_path):
+@pytest.mark.parametrize(("times", "start", "end"), [
+    ((1_704_067_200, 1_735_689_600, 1_767_225_600), "2025-01-01T00:00Z", "2026-01-01T00:00Z"),
+    ((1_735_689_600, 1_767_225_600, 1_798_761_600), "2025-03-20T01:30Z", "2026-04-30T01:40Z"),
+])
+def test_directory_scanner_mtime_range_filters_utc_minutes(tmp_path, times, start, end):
+    import os
+
     old = tmp_path / "old.zip"
     keep = tmp_path / "keep.zip"
     new = tmp_path / "new.zip"
     old.write_bytes(b"old")
     keep.write_bytes(b"keep")
     new.write_bytes(b"new")
-    old_ns = 1_704_067_200_000_000_000
-    keep_ns = 1_735_689_600_000_000_000
-    new_ns = 1_767_225_600_000_000_000
-    import os
-    os.utime(old, ns=(old_ns, old_ns))
-    os.utime(keep, ns=(keep_ns, keep_ns))
-    os.utime(new, ns=(new_ns, new_ns))
+    for path, seconds in zip((old, keep, new), times):
+        os.utime(path, ns=(seconds * 1_000_000_000, seconds * 1_000_000_000))
 
     snapshot = DirectoryScanner(str(tmp_path), config=make_config({
         "filesystem": {
             "scan_filters": [
-                {"name": "mtime_range", "enabled": True, "start_utc": "2025-01-01T00:00Z", "end_utc": "2026-01-01T00:00Z"},
+                {"name": "mtime_range", "enabled": True, "start_utc": start, "end_utc": end},
             ]
         }
     })).scan()
 
-    names = {entry.path.name for entry in _entries(snapshot)}
-    assert "old.zip" not in names
-    assert "keep.zip" in names
-    assert "new.zip" not in names
-
-
-def test_directory_scanner_mtime_range_uses_utc_minutes(tmp_path):
-    old = tmp_path / "old.zip"
-    keep = tmp_path / "keep.zip"
-    new = tmp_path / "new.zip"
-    old.write_bytes(b"old")
-    keep.write_bytes(b"keep")
-    new.write_bytes(b"new")
-
-    import os
-    from datetime import datetime, timezone
-
-    def ns(value: str) -> int:
-        return int(datetime.strptime(value, "%Y%m%d %H:%M").replace(tzinfo=timezone.utc).timestamp() * 1_000_000_000)
-
-    os.utime(old, ns=(ns("20250101 00:00"), ns("20250101 00:00")))
-    os.utime(keep, ns=(ns("20260101 00:00"), ns("20260101 00:00")))
-    os.utime(new, ns=(ns("20270101 00:00"), ns("20270101 00:00")))
-
-    snapshot = DirectoryScanner(str(tmp_path), config=make_config({
-        "filesystem": {
-            "scan_filters": [
-                {"name": "mtime_range", "enabled": True, "start_utc": "2025-03-20T01:30Z", "end_utc": "2026-04-30T01:40Z"},
-            ]
-        }
-    })).scan()
-
-    names = {entry.path.name for entry in _entries(snapshot)}
-    assert "old.zip" not in names
-    assert "keep.zip" in names
-    assert "new.zip" not in names
+    assert {entry.path.name for entry in _entries(snapshot)} == {"keep.zip"}
 
 
 def test_directory_scanner_current_dir_only_scan_mode_skips_subdirectories(tmp_path):
@@ -319,40 +263,31 @@ def test_directory_scanner_path_filter_skips_file_before_stat(tmp_path, monkeypa
     assert "keep.zip" in names
 
 
-def test_directory_scanner_blacklist_blocks_exact_file_names(tmp_path):
-    blocked = tmp_path / "Thumbs.db"
-    blocked.write_bytes(b"not an archive")
-    keep = tmp_path / "Thumbs.zip"
-    keep.write_bytes(b"PK\x03\x04payload")
-
-    snapshot = DirectoryScanner(str(tmp_path), config=make_config({
-        "filesystem": {
-            "scan_filters": [
-                {'name': 'blacklist', 'enabled': True, 'full_names': [{'value': 'Thumbs.db', 'regex': False}]},
-            ]
-        }
-    })).scan()
-
-    names = {entry.path.name for entry in _entries(snapshot)}
-    assert "Thumbs.db" not in names
-    assert "Thumbs.zip" in names
-
-
-def test_directory_scanner_scan_filters_global_switch_disables_filters(tmp_path):
-    blocked = tmp_path / "skip.py"
-    blocked.write_text("print('keep when filters are globally disabled')", encoding="utf-8")
-
-    snapshot = DirectoryScanner(str(tmp_path), config=make_config({
-        "filesystem": {
-            "scan_filters_enabled": False,
-            "scan_filters": [
-                {'name': 'blacklist', 'enabled': True, 'extensions': [{'value': 'py', 'regex': False}]},
-            ],
-        }
-    })).scan()
-
-    names = {entry.path.name for entry in _entries(snapshot)}
-    assert "skip.py" in names
+def test_directory_scanner_name_filters_and_switches(tmp_path):
+    names = {"keep.zip", "skip.py", "skip.rar", "Thumbs.db", "Thumbs.zip",
+             "sample.zip", "sample.rar", "other.zip"}
+    for name in names:
+        (tmp_path / name).write_bytes(b"fixture")
+    zip_names = {name for name in names if name.endswith(".zip")}
+    whitelist = {"name": "whitelist", "enabled": True,
+                 "extensions": [{"value": "zip", "regex": False}]}
+    blacklist = {"name": "blacklist", "enabled": True,
+                 "extensions": [{"value": "py", "regex": False}]}
+    for filters_enabled, filters, expected in (
+        (True, [{**whitelist, "enabled": False}], names),
+        (True, [whitelist], zip_names),
+        (True, [{"name": "blacklist", "enabled": True,
+                 "full_names": [{"value": "Thumbs.db", "regex": False}]}], names - {"Thumbs.db"}),
+        (True, [{"name": "whitelist", "enabled": True,
+                 "full_names": [{"value": "sample.zip", "regex": False}]}], {"sample.zip"}),
+        (True, [{**whitelist, "extensions": whitelist["extensions"] + blacklist["extensions"]},
+                blacklist], zip_names),
+        (False, [blacklist], names),
+    ):
+        snapshot = DirectoryScanner(str(tmp_path), config=make_config({
+            "filesystem": {"scan_filters_enabled": filters_enabled, "scan_filters": filters},
+        })).scan()
+        assert {entry.path.name for entry in _entries(snapshot)} == expected, (filters_enabled, filters)
 
 
 def test_directory_scanner_executes_built_in_filters_natively(tmp_path, monkeypatch):
@@ -406,62 +341,27 @@ def test_directory_scanner_executes_built_in_filters_natively(tmp_path, monkeypa
     assert observed == []
 
 
-def test_directory_scanner_whitelist_disabled_does_not_filter(tmp_path):
-    (tmp_path / "keep.zip").write_bytes(b"PK\x03\x04payload")
-    (tmp_path / "other.rar").write_bytes(b"Rar!\x1a\x07\x00payload")
-
-    snapshot = DirectoryScanner(str(tmp_path), config=make_config({
-        "filesystem": {
-            "scan_filters": [
-                {'name': 'whitelist', 'enabled': False, 'extensions': [{'value': 'zip', 'regex': False}]},
-            ]
-        }
-    })).scan()
-
-    names = {entry.path.name for entry in _entries(snapshot)}
-    assert "keep.zip" in names
-    assert "other.rar" in names
-
-
-def test_directory_scanner_whitelist_keeps_only_filename_suffix_regex(tmp_path):
-    (tmp_path / "keep.zip").write_bytes(b"PK\x03\x04payload")
-    (tmp_path / "skip.rar").write_bytes(b"Rar!\x1a\x07\x00payload")
-
-    snapshot = DirectoryScanner(str(tmp_path), config=make_config({
-        "filesystem": {
-            "scan_filters": [
-                {'name': 'whitelist', 'enabled': True, 'extensions': [{'value': 'zip', 'regex': False}]},
-            ]
-        }
-    })).scan()
-
-    names = {entry.path.name for entry in _entries(snapshot)}
-    assert "keep.zip" in names
-    assert "skip.rar" not in names
-
-
-def test_directory_scanner_whitelist_keeps_only_rooted_path_regex(tmp_path):
+def test_directory_scanner_whitelist_combines_path_and_extension_constraints(tmp_path):
     allowed_dir = tmp_path / "archives"
     blocked_dir = tmp_path / "other"
     allowed_dir.mkdir()
     blocked_dir.mkdir()
-    (allowed_dir / "keep.zip").write_bytes(b"PK\x03\x04payload")
-    (blocked_dir / "skip.zip").write_bytes(b"PK\x03\x04payload")
-
-    snapshot = DirectoryScanner(str(tmp_path), scope=DiscoveryScope(str(tmp_path), recursive=True), config=make_config({
-        "filesystem": {
-            
-            "scan_filters": [
-                {'name': 'whitelist', 'enabled': True, 'paths': [{'value': r'\Aarchives\z', 'regex': True}]},
-            ]
-        }
-    })).scan()
-
-    names = {entry.path.name for entry in _entries(snapshot)}
-    assert "archives" in names
-    assert "keep.zip" in names
-    assert "other" not in names
-    assert "skip.zip" not in names
+    (allowed_dir / "keep.zip").write_bytes(b"fixture")
+    (allowed_dir / "skip.rar").write_bytes(b"fixture")
+    (blocked_dir / "skip.zip").write_bytes(b"fixture")
+    (tmp_path / "other.zip").write_bytes(b"fixture")
+    for extensions, expected in (
+        ([], {"archives", "keep.zip", "skip.rar"}),
+        ([{"value": "zip", "regex": False}], {"archives", "keep.zip"}),
+    ):
+        snapshot = DirectoryScanner(
+            str(tmp_path), scope=DiscoveryScope(str(tmp_path), recursive=True),
+            config=make_config({"filesystem": {"scan_filters": [{
+                "name": "whitelist", "enabled": True,
+                "paths": [{"value": r"\Aarchives\z", "regex": True}], "extensions": extensions,
+            }]}}),
+        ).scan()
+        assert {entry.path.name for entry in _entries(snapshot)} == expected, extensions
 
 
 def test_directory_scanner_keeps_filter_rejected_files_in_raw_snapshot(tmp_path):
@@ -489,68 +389,6 @@ def test_directory_scanner_keeps_filter_rejected_files_in_raw_snapshot(tmp_path)
     assert blocked in raw_file_paths
     assert archive in filtered_paths
     assert archive in raw_file_paths
-
-
-def test_directory_scanner_whitelist_then_blacklist_both_apply(tmp_path):
-    (tmp_path / "keep.zip").write_bytes(b"PK\x03\x04payload")
-    (tmp_path / "skip.py").write_text("print('skip')", encoding="utf-8")
-    (tmp_path / "skip.rar").write_bytes(b"Rar!\x1a\x07\x00payload")
-
-    snapshot = DirectoryScanner(str(tmp_path), config=make_config({
-        "filesystem": {
-            "scan_filters": [
-                {'name': 'whitelist', 'enabled': True, 'extensions': [{'value': 'zip', 'regex': False}, {'value': 'py', 'regex': False}]},
-                {'name': 'blacklist', 'enabled': True, 'extensions': [{'value': 'py', 'regex': False}]},
-            ]
-        }
-    })).scan()
-
-    names = {entry.path.name for entry in _entries(snapshot)}
-    assert "keep.zip" in names
-    assert "skip.py" not in names
-    assert "skip.rar" not in names
-
-
-def test_directory_scanner_whitelist_empty_fields_are_not_restrictions(tmp_path):
-    allowed_dir = tmp_path / "archives"
-    allowed_dir.mkdir()
-    (allowed_dir / "keep.zip").write_bytes(b"PK\x03\x04payload")
-    (allowed_dir / "skip.rar").write_bytes(b"Rar!\x1a\x07\x00payload")
-    (tmp_path / "other.zip").write_bytes(b"PK\x03\x04payload")
-
-    snapshot = DirectoryScanner(str(tmp_path), scope=DiscoveryScope(str(tmp_path), recursive=True), config=make_config({
-        "filesystem": {
-            
-            "scan_filters": [
-                {'name': 'whitelist', 'enabled': True, 'paths': [{'value': r'\Aarchives\z', 'regex': True}], 'extensions': [{'value': 'zip', 'regex': False}]},
-            ]
-        }
-    })).scan()
-
-    names = {entry.path.name for entry in _entries(snapshot)}
-    assert "archives" in names
-    assert "keep.zip" in names
-    assert "skip.rar" not in names
-    assert "other.zip" not in names
-
-
-def test_directory_scanner_whitelist_non_empty_fields_are_combined_as_constraints(tmp_path):
-    (tmp_path / "sample.zip").write_bytes(b"PK\x03\x04payload")
-    (tmp_path / "sample.rar").write_bytes(b"Rar!\x1a\x07\x00payload")
-    (tmp_path / "other.zip").write_bytes(b"PK\x03\x04payload")
-
-    snapshot = DirectoryScanner(str(tmp_path), config=make_config({
-        "filesystem": {
-            "scan_filters": [
-                {'name': 'whitelist', 'enabled': True, 'full_names': [{'value': 'sample.zip', 'regex': False}]},
-            ]
-        }
-    })).scan()
-
-    names = {entry.path.name for entry in _entries(snapshot)}
-    assert "sample.zip" in names
-    assert "sample.rar" not in names
-    assert "other.zip" not in names
 
 
 def test_directory_scanner_blacklist_paths_match_whole_components(tmp_path):

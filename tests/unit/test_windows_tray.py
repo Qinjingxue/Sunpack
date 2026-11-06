@@ -5,6 +5,8 @@ import sys
 import textwrap
 from types import SimpleNamespace
 
+import pytest
+
 import sunpack.runtime.gui.tray as tray_module
 from sunpack.runtime.gui.tray import WindowsTrayIcon, _tray_language_from_service
 
@@ -21,28 +23,17 @@ def test_tray_opens_manager_from_menu_and_left_click(monkeypatch):
     assert calls == ["manager", "manager", "manager", ("menu", 123)]
 
 
-def test_tray_uses_chinese_text_when_cli_language_is_zh():
-    service = SimpleNamespace(config={"cli": {"language": "zh"}})
-
-    assert _tray_language_from_service(service) == "zh"
-
-    tray = object.__new__(WindowsTrayIcon)
-    tray.language = "zh"
-
-    assert tray._text("open_manager") == "打开管理面板"
-    assert tray._text("exit") == "退出"
-
-
-def test_tray_defaults_to_english_text():
-    service = SimpleNamespace(config={"cli": {"language": "en"}})
-
-    assert _tray_language_from_service(service) == "en"
-
-    tray = object.__new__(WindowsTrayIcon)
-    tray.language = "en"
-
-    assert tray._text("open_manager") == "Open management panel"
-    assert tray._text("exit") == "Exit"
+def test_tray_menu_uses_the_configured_language():
+    for language, manager_text, exit_text in (
+        ("zh", "打开管理面板", "退出"),
+        ("en", "Open management panel", "Exit"),
+    ):
+        service = SimpleNamespace(config={"cli": {"language": language}})
+        assert _tray_language_from_service(service) == language
+        tray = object.__new__(WindowsTrayIcon)
+        tray.language = language
+        assert tray._text("open_manager") == manager_text
+        assert tray._text("exit") == exit_text
 
 
 def test_tray_close_and_destroy_have_distinct_responsibilities():
@@ -86,7 +77,8 @@ def test_tray_message_window_uses_toolwindow_extended_style(monkeypatch):
     assert calls[0][0] == tray_module.WS_EX_TOOLWINDOW
 
 
-def test_owned_icon_is_destroyed_after_successful_shell_notification():
+@pytest.mark.parametrize("shell_success", [True, False])
+def test_owned_icon_is_destroyed_even_when_shell_rejects_notification(monkeypatch, shell_success):
     destroyed = []
 
     class User32:
@@ -96,31 +88,7 @@ def test_owned_icon_is_destroyed_after_successful_shell_notification():
 
     class Shell32:
         def Shell_NotifyIconW(self, _operation, _data):
-            return True
-
-    tray = object.__new__(WindowsTrayIcon)
-    tray.user32 = User32()
-    tray.shell32 = Shell32()
-    tray._load_icon = lambda: (321, True)
-    tray._notification_data = lambda _hwnd, flags, icon: tray_module.NOTIFYICONDATA()
-    tray._log_callback_error = lambda *_args: None
-
-    tray._notify_with_icon(tray_module.NIM_ADD, 123)
-
-    assert destroyed == [321]
-
-
-def test_owned_icon_is_destroyed_when_shell_rejects_notification(monkeypatch):
-    destroyed = []
-
-    class User32:
-        def DestroyIcon(self, icon):
-            destroyed.append(icon)
-            return True
-
-    class Shell32:
-        def Shell_NotifyIconW(self, _operation, _data):
-            return False
+            return shell_success
 
     tray = object.__new__(WindowsTrayIcon)
     tray.user32 = User32()
@@ -136,12 +104,12 @@ def test_owned_icon_is_destroyed_when_shell_rejects_notification(monkeypatch):
         raising=False,
     )
 
-    try:
+    if shell_success:
         tray._notify_with_icon(tray_module.NIM_ADD, 123)
-    except OSError as exc:
-        assert exc.errno == 5
     else:
-        raise AssertionError("Shell failure must remain visible to the tray recovery state machine")
+        with pytest.raises(OSError) as error:
+            tray._notify_with_icon(tray_module.NIM_ADD, 123)
+        assert error.value.errno == 5
 
     assert destroyed == [321]
 
