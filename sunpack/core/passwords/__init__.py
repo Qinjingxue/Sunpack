@@ -1,4 +1,4 @@
-from sunpack.core.passwords.archive_tester import ArchivePasswordTester, PasswordManager
+from sunpack.core.passwords.archive_tester import ArchivePasswordTester
 from sunpack.core.passwords.cache import PasswordAttemptCache
 from sunpack.core.passwords.candidates import PasswordCandidate, PasswordCandidatePipeline
 from sunpack.core.passwords.fingerprint import ArchiveFingerprint, build_archive_fingerprint
@@ -36,7 +36,6 @@ __all__ = [
     "PasswordCandidate",
     "PasswordCandidatePipeline",
     "PasswordJob",
-    "PasswordManager",
     "PasswordProgressEvent",
     "PasswordResolution",
     "PasswordResolutionStatus",

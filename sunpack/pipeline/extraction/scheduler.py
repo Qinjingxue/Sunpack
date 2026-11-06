@@ -15,7 +15,6 @@ class ExtractionScheduler:
         self,
         cli_passwords: list[str] | None = None,
         builtin_passwords: list[str] | None = None,
-        max_retries: int = 3,
         process_config: dict | None = None,
         output_config: dict | None = None,
         extraction_config: dict | None = None,

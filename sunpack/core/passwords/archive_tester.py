@@ -34,11 +34,5 @@ class ArchivePasswordTester:
     def passwords(self) -> List[str]:
         return self.password_store.candidates()
 
-    def get_passwords_to_try(self) -> List[str]:
-        return self.password_store.candidates()
-
     def add_recent_password(self, pwd: str):
         self.password_store.remember_success(pwd)
-
-
-PasswordManager = ArchivePasswordTester

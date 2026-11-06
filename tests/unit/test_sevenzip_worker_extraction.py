@@ -1326,7 +1326,7 @@ def test_native_worker_queue_isolates_failed_job_and_continues(tmp_path):
 def test_extraction_scheduler_saves_process_failure_diagnostics(tmp_path):
     archive = tmp_path / "sample.bin"
     archive.write_bytes(b"not an archive")
-    scheduler = ExtractionScheduler(max_retries=1)
+    scheduler = ExtractionScheduler()
     scheduler.sevenzip_runner.worker_path = str(tmp_path / "missing_worker.exe")
 
     try:
@@ -1351,7 +1351,7 @@ def test_extraction_scheduler_classifies_malformed_worker_output_as_process_exit
     )
     archive = tmp_path / "sample.7z"
     archive.write_bytes(b"not used")
-    scheduler = ExtractionScheduler(max_retries=1)
+    scheduler = ExtractionScheduler()
     scheduler.sevenzip_runner.worker_path = str(worker)
 
     try:
@@ -1413,7 +1413,7 @@ def test_extraction_scheduler_uses_worker_for_file_range(tmp_path, monkeypatch):
             "end": len(prefix) + len(data),
         }],
     })
-    result = ExtractionScheduler(max_retries=1).extract(task, str(tmp_path / "out"))
+    result = ExtractionScheduler().extract(task, str(tmp_path / "out"))
 
     assert result.success is True
     assert (tmp_path / "out" / filename).read_text(encoding="utf-8") == "range payload"
@@ -1440,7 +1440,7 @@ def test_confirmed_truncated_file_range_open_failure_is_damaged(tmp_path):
             "end": len(prefix) + len(data),
         }],
     })
-    result = ExtractionScheduler(max_retries=1).extract(task, str(tmp_path / "out"))
+    result = ExtractionScheduler().extract(task, str(tmp_path / "out"))
 
     assert result.success is False
     assert result.failure.kind is FailureKind.DAMAGED
@@ -1454,7 +1454,7 @@ def test_confirmed_truncated_file_range_open_failure_is_damaged(tmp_path):
 def test_extraction_scheduler_saves_worker_diagnostics_on_failure(tmp_path):
     _require_worker_or_skip()
     missing = tmp_path / "missing.7z"
-    result = ExtractionScheduler(max_retries=1).extract(_task(missing), str(tmp_path / "out"))
+    result = ExtractionScheduler().extract(_task(missing), str(tmp_path / "out"))
 
     assert result.success is False
     assert result.diagnostics["result"]["failure_stage"] == "input_open"
@@ -1485,7 +1485,7 @@ def test_extraction_scheduler_uses_worker_for_concat_ranges(tmp_path, monkeypatc
             {"path": str(part_b), "start": 0},
         ],
     })
-    result = ExtractionScheduler(max_retries=1).extract(task, str(tmp_path / "out"))
+    result = ExtractionScheduler().extract(task, str(tmp_path / "out"))
 
     assert result.success is True
     assert (tmp_path / "out" / filename).read_text(encoding="utf-8") == "concat payload"

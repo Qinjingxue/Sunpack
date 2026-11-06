@@ -1,4 +1,3 @@
-import os
 import weakref
 from dataclasses import dataclass
 
@@ -17,33 +16,15 @@ class ReadStats:
     cache_hits: int
 
 
-class SharedBinaryView:
-    """Thread-safe random-access binary view with a small shared LRU cache."""
-
-    def __init__(
-        self,
-        path: str,
-        *,
-        cache_bytes: int = 64 * 1024 * 1024,
-        max_concurrent_reads: int = 1,
-    ):
-        self.path = path
-        self.size = os.path.getsize(path)
-        self.cache_bytes = max(0, int(cache_bytes or 0))
-        with lifecycle_registration((path,)):
-            self._session = get_archive_session(path)
-            self._native = self._session.analysis_view(
-                cache_bytes=self.cache_bytes,
-                max_concurrent_reads=max_concurrent_reads,
-            )
-            native = self._native
-            self._resource_lease = register_current_task_resource(
-                self,
-                (path,),
-                lambda native=native: getattr(native, "close", lambda: None)(),
-                kind=ResourceKind.NATIVE_ANALYSIS_VIEW,
-                registration_held=True,
-            )
+class _BinaryView:
+    def _register_native(self, paths, kind: ResourceKind) -> None:
+        self._resource_lease = register_current_task_resource(
+            self,
+            paths,
+            self._native.close,
+            kind=kind,
+            registration_held=True,
+        )
         self._resource_finalizer = weakref.finalize(self, self._resource_lease.close)
         self.size = int(self._native.size)
 
@@ -54,9 +35,8 @@ class SharedBinaryView:
     def close(self) -> None:
         self._resource_lease.close()
         self._resource_finalizer.detach()
-        self._session = None
 
-    def __enter__(self) -> "SharedBinaryView":
+    def __enter__(self) -> "_BinaryView":
         return self
 
     def __exit__(self, exc_type, exc, traceback) -> None:
@@ -86,7 +66,27 @@ class SharedBinaryView:
         return self._native.analyze(config, initial_prepass, signature_prepass, format_structure)
 
 
-class MultiVolumeBinaryView:
+class SharedBinaryView(_BinaryView):
+    """Thread-safe random-access binary view with a small shared LRU cache."""
+
+    def __init__(
+        self,
+        path: str,
+        *,
+        cache_bytes: int = 64 * 1024 * 1024,
+        max_concurrent_reads: int = 1,
+    ):
+        self.path = path
+        with lifecycle_registration((path,)):
+            session = get_archive_session(path)
+            self._native = session.analysis_view(
+                cache_bytes=max(0, int(cache_bytes or 0)),
+                max_concurrent_reads=max_concurrent_reads,
+            )
+            self._register_native((path,), ResourceKind.NATIVE_ANALYSIS_VIEW)
+
+
+class MultiVolumeBinaryView(_BinaryView):
     """Random-access logical view over ordered split-volume files.
 
     Archive analysis is native-only. Python owns lifecycle and structured
@@ -100,85 +100,22 @@ class MultiVolumeBinaryView:
         cache_bytes: int = 64 * 1024 * 1024,
         max_concurrent_reads: int = 1,
     ):
-        entries = _normalize_volume_entries(paths)
-        self.volumes = [entry["path"] for entry in entries]
-        if not self.volumes:
+        volumes = _volume_paths(paths)
+        if not volumes:
             raise ValueError("MultiVolumeBinaryView requires at least one volume")
-        styles = {entry["style"] for entry in entries if entry["style"]}
-        self.volume_style = next(iter(styles)) if len(styles) == 1 else ""
-        self.path = self.volumes[0]
-        self.cache_bytes = max(0, int(cache_bytes or 0))
-        with lifecycle_registration(self.volumes):
+        with lifecycle_registration(volumes):
             self._native = _NativeAnalysisMultiVolumeView(
-                self.volumes,
-                cache_bytes=self.cache_bytes,
+                volumes,
+                cache_bytes=max(0, int(cache_bytes or 0)),
                 max_concurrent_reads=max_concurrent_reads,
             )
-            native = self._native
-            self._resource_lease = register_current_task_resource(
-                self,
-                self.volumes,
-                lambda native=native: getattr(native, "close", lambda: None)(),
-                kind=ResourceKind.NATIVE_MULTI_VOLUME_VIEW,
-                registration_held=True,
-            )
-        self._resource_finalizer = weakref.finalize(self, self._resource_lease.close)
+            self._register_native(volumes, ResourceKind.NATIVE_MULTI_VOLUME_VIEW)
         self.path = str(self._native.path)
-        self.size = int(self._native.size)
-
-    @property
-    def closed(self) -> bool:
-        return self._resource_lease.closed
-
-    def close(self) -> None:
-        self._resource_lease.close()
-        self._resource_finalizer.detach()
-
-    def __enter__(self) -> "MultiVolumeBinaryView":
-        return self
-
-    def __exit__(self, exc_type, exc, traceback) -> None:
-        self.close()
-
-    def read_at(self, offset: int, size: int) -> bytes:
-        return bytes(self._native.read_at(int(offset), int(size)))
-
-    def read_tail(self, size: int) -> bytes:
-        return bytes(self._native.read_tail(int(size)))
-
-    def stats(self) -> ReadStats:
-        stats = self._native.stats()
-        return ReadStats(
-            read_bytes=int(stats.get("read_bytes", 0) or 0),
-            cache_hits=int(stats.get("cache_hits", 0) or 0),
-        )
-
-    def analyze(
-        self,
-        config,
-        *,
-        initial_prepass: dict | None,
-        signature_prepass: bool,
-        format_structure: bool,
-    ) -> dict:
-        return self._native.analyze(config, initial_prepass, signature_prepass, format_structure)
 
 
-def _normalize_volume_entries(paths) -> list[dict]:
+def _volume_paths(paths) -> list[str]:
     entries = list(paths or [])
     if entries and all(isinstance(item, dict) for item in entries):
         entries = sorted(entries, key=lambda item: int(item.get("number") or 0))
-        return [
-            {
-                "path": str(item.get("path") or ""),
-                "number": int(item.get("number") or index + 1),
-                "style": str(item.get("style") or ""),
-            }
-            for index, item in enumerate(entries)
-            if item.get("path")
-        ]
-    return [
-        {"path": str(item), "number": index + 1, "style": ""}
-        for index, item in enumerate(entries)
-        if str(item)
-    ]
+        return [str(item["path"]) for item in entries if item.get("path")]
+    return [path for item in entries if (path := str(item))]

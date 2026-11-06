@@ -84,7 +84,7 @@ class ExtractionExecutionTests(unittest.TestCase):
             archive_path = Path(tmp) / "ambiguous.zip"
             archive_path.write_bytes(b"zip")
             out_dir = Path(tmp) / "out"
-            extractor = ExtractionScheduler(max_retries=1)
+            extractor = ExtractionScheduler()
             extractor.password_resolver = FakePasswordResolver()
             extractor.metadata_scanner = FakeFailingMetadataScanner()
             calls = []
@@ -108,7 +108,7 @@ class ExtractionExecutionTests(unittest.TestCase):
             launcher_path.write_bytes(b"MZ")
             out_dir = Path(tmp) / "sample_out"
 
-            extractor = ExtractionScheduler(max_retries=1)
+            extractor = ExtractionScheduler()
             extractor.password_resolver = FakePasswordResolver()
             extractor.metadata_scanner = FakeMetadataScanner()
 
@@ -127,7 +127,7 @@ class ExtractionExecutionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             archive_path = Path(tmp) / "sample.zip"
             archive_path.write_bytes(b"zip")
-            extractor = ExtractionScheduler(max_retries=2)
+            extractor = ExtractionScheduler()
             extractor.password_resolver = FakePasswordResolver()
             extractor.metadata_scanner = FakeMetadataScanner()
             failed = _completed(returncode=8, stdout="", stderr="write error")
@@ -144,7 +144,7 @@ class ExtractionExecutionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             archive_path = Path(tmp) / "sample.zip"
             archive_path.write_bytes(b"zip")
-            extractor = ExtractionScheduler(max_retries=2)
+            extractor = ExtractionScheduler()
             extractor.password_resolver = FakePasswordResolver()
             extractor.metadata_scanner = FakeMetadataScanner()
             failed = _completed(returncode=-102, stdout="", stderr="worker connection lost")
@@ -163,7 +163,7 @@ class ExtractionExecutionTests(unittest.TestCase):
             archive_path.write_bytes(b"zip")
             out_dir = Path(tmp) / "broken"
 
-            extractor = ExtractionScheduler(max_retries=3)
+            extractor = ExtractionScheduler()
             extractor.password_resolver = FakePasswordResolver()
             extractor.metadata_scanner = FakeMetadataScanner()
 
@@ -217,7 +217,7 @@ class ExtractionExecutionTests(unittest.TestCase):
             good_path = out_dir / "good.txt"
             partial_path = out_dir / "bad.bin"
 
-            extractor = ExtractionScheduler(max_retries=1)
+            extractor = ExtractionScheduler()
             extractor.password_resolver = FakePasswordResolver()
             extractor.metadata_scanner = FakeMetadataScanner()
 
@@ -289,7 +289,7 @@ class ExtractionExecutionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             archive_path = Path(tmp) / "busy.zip"
             archive_path.write_bytes(b"zip")
-            extractor = ExtractionScheduler(max_retries=2)
+            extractor = ExtractionScheduler()
             extractor.password_resolver = FakePasswordResolver()
             extractor.metadata_scanner = FakeMetadataScanner()
             failed = _completed(returncode=-100, stdout="", stderr="7z process failed to start")
@@ -327,7 +327,7 @@ class ExtractionRetryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             archive_path = Path(tmp) / "sample.zip"
             archive_path.write_bytes(b"zip")
-            extractor = ExtractionScheduler(max_retries=2)
+            extractor = ExtractionScheduler()
             extractor.password_resolver = FakePasswordResolver()
             extractor.metadata_scanner = FakeMetadataScanner()
             calls = []

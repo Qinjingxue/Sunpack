@@ -71,7 +71,8 @@ def test_unknown_total_displays_indeterminate_once_without_zero_spam(tmp_path, m
     reporter.task_progress(task, {"type": "progress", "completed_bytes": 50, "total_bytes": 100})
     assert " 50%" in out.getvalue()
     reporter.task_finished(task, _success(tmp_path / "out"), 1)
-    assert reporter._task_rows[id(task)]["progress_known"] is True
+    assert "成功" in out.getvalue()
+    assert not reporter._task_rows
 
 
 def test_noninteractive_stdout_never_emits_escape_codes(tmp_path):

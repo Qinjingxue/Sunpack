@@ -11,7 +11,6 @@ def archive_pressure_config(passwords: list[str] | None = None) -> dict:
         "post_extract": {"archive_cleanup_mode": "k", "flatten_single_directory": False},
         "user_passwords": passwords or [],
         "builtin_passwords": [],
-        "max_retries": 1,
     }, precheck=[
         {"name": "size_range", "enabled": True, "min_bytes": 0},
         {"name": "relation_archive_accept", "enabled": True},

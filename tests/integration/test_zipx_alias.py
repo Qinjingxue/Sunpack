@@ -48,7 +48,7 @@ def test_zipx_split_alias_preserves_size_anchors_and_extracts_physical_parts(tmp
     assert group is not None
     assert group.input_paths == [str(first), str(terminal)]
 
-    extractor = ExtractionScheduler(max_retries=0)
+    extractor = ExtractionScheduler()
     output = tmp_path / "output"
     try:
         result = extractor.extract(task, str(output))

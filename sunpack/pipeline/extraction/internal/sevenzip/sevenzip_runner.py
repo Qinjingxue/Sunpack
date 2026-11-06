@@ -360,6 +360,8 @@ class _NativeWorkerProcess:
                 finally:
                     if job_id and _is_job_finished(payload):
                         self.queue_capacity.release(job_id)
+                    # The pipe can stay idle indefinitely after any event.
+                    del line, payload
         except Exception as exc:
             broken = True
             failure = f"sevenzip_worker transport/protocol failed: {exc}"

@@ -43,15 +43,25 @@ def test_reporter_keeps_display_and_lineage_without_retaining_finished_inputs(tm
         task.runtime["discovery_snapshot"] = snapshot
         task_ref, snapshot_ref = weakref.ref(task), weakref.ref(snapshot)
         reporter.tasks_discovered(depth, [task])
+        if quiet:
+            assert not reporter._task_rows
+        else:
+            row = reporter._task_rows[id(task)]
+            assert row["name"] == ("outer.zip" if depth == 1 else "inner.zip")
+            if depth == 2:
+                assert row["lineage"] == ("outer.zip",)
         reporter.task_finished(task, _outcome(root / ("outer" if depth == 1 else "inner")), depth)
-        row = reporter._task_rows[id(task)]
-        assert row["name"] == ("outer.zip" if depth == 1 else "inner.zip")
-        if depth == 2:
-            assert row["lineage"] == ("outer.zip",)
+        assert not reporter._task_rows
+        assert not reporter._last_streamed_progress
+        assert not reporter._panel_row_index
         del task, snapshot
         gc.collect()
         assert task_ref() is None and snapshot_ref() is None
-        assert row["name"] in reporter._format_task_row(row)
+    if quiet:
+        assert output.getvalue() == ""
+        assert not reporter._output_lineages and not reporter._top_level_outputs
+    else:
+        assert "inner.zip" in output.getvalue() and "outer.zip" in output.getvalue()
 
 
 def test_progress_displays_nested_archive_parent_chain_and_final_page(tmp_path, capsys):
@@ -181,6 +191,7 @@ def test_interactive_panel_updates_fixed_row_with_progress_and_colors(tmp_path, 
     reporter._last_render_at = 0.0
     reporter.task_progress(task, {"type": "progress", "completed_bytes": 50, "total_bytes": 100})
     reporter.task_status(task, "extracting")
+    finished_row = reporter._task_rows[id(task)]
     reporter.task_finished(task, _outcome(tmp_path / "large"), 1)
 
     output = stream.getvalue()
@@ -189,7 +200,7 @@ def test_interactive_panel_updates_fixed_row_with_progress_and_colors(tmp_path, 
     assert "正在解压" in output
     assert "\033[32m" in output and "完成" in output
     assert "\033[1A" in output
-    row = reporter._format_task_row(reporter._task_rows[id(task)])
+    row = reporter._format_task_row(finished_row)
     plain_row = re.sub(r"\033\[[0-9;]*m", "", row)
     assert reporting._display_width(plain_row) <= stream.terminal_columns
 
@@ -391,10 +402,11 @@ def test_resource_recovery_survives_report_lock_and_output_backpressure(tmp_path
                     await reporter.drain_progress()
             finally:
                 await broker.close()
-        row = reporter._task_rows[id(task)]
-        if interactive and finish_while_pending:
-            assert row["state"] == "complete"
-        elif not finish_while_pending:
+        if finish_while_pending:
+            assert not reporter._task_rows
+            assert "完成" in output.getvalue() if interactive else "成功" in output.getvalue()
+        else:
+            row = reporter._task_rows[id(task)]
             assert row["state"] == "extracting"
             assert not row["space_blocked"] and not row["memory_blocked"]
             assert "正在解压" in output.getvalue().splitlines()[-1]

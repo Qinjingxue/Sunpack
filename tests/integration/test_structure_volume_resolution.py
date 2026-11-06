@@ -65,7 +65,7 @@ def test_mixed_camouflaged_real_volumes_are_structure_resolved_and_extractable(m
         task = resolved[0]
         planned = ArchiveInputPlanningStage(load_config()).plan_task_to_tasks(task)
         assert len(planned) == 1
-        extractor = ExtractionScheduler(max_retries=1)
+        extractor = ExtractionScheduler()
         out_dir = tmp_path / "direct_outputs" / archive_format
         try:
             result = extractor.extract(planned[0], str(out_dir))
@@ -170,7 +170,7 @@ def test_first_dot_stem_and_loose_format_markers_resolve_real_volume_sets(
     planned = ArchiveInputPlanningStage(load_config()).plan_task_to_tasks(resolved[0])
     assert len(planned) == 1
     output = tmp_path / "output"
-    extractor = ExtractionScheduler(max_retries=0)
+    extractor = ExtractionScheduler()
     try:
         result = extractor.extract(planned[0], str(output))
     finally:
@@ -217,7 +217,7 @@ def test_context_free_numbers_preserve_encrypted_sfx_launcher_ownership(tmp_path
     assert len(tasks) == 1
     planned = ArchiveInputPlanningStage(load_config()).plan_task_to_tasks(tasks[0])
     assert len(planned) == 1
-    extractor = ExtractionScheduler(cli_passwords=["wrong", password], builtin_passwords=[], max_retries=1)
+    extractor = ExtractionScheduler(cli_passwords=["wrong", password], builtin_passwords=[])
     output = tmp_path / "output"
     try:
         result = extractor.extract(planned[0], str(output))
@@ -252,7 +252,7 @@ def test_context_free_numeric_noise_does_not_create_a_missing_7z_volume(tmp_path
     planned = ArchiveInputPlanningStage(load_config()).plan_task_to_tasks(resolved[0])
     assert len(planned) == 1
     output = tmp_path / "output"
-    extractor = ExtractionScheduler(max_retries=0)
+    extractor = ExtractionScheduler()
     try:
         result = extractor.extract(planned[0], str(output))
     finally:
@@ -344,7 +344,7 @@ def test_competing_heads_keep_direct_schemes_and_partition_declared_formats(tmp_
         planned = ArchiveInputPlanningStage(load_config()).plan_task_to_tasks(tasks[0])
         assert len(planned) == 1
         output = tmp_path / "outputs" / case.case_id
-        extractor = ExtractionScheduler(max_retries=0)
+        extractor = ExtractionScheduler()
         try:
             result = extractor.extract(planned[0], str(output))
         finally:
@@ -391,7 +391,7 @@ def test_rar_structure_overrides_false_part_marker(tmp_path, competing, sfx, mar
     planned = ArchiveInputPlanningStage(load_config()).plan_task_to_tasks(tasks[0])
     assert len(planned) == 1
     output = tmp_path / "output"
-    extractor = ExtractionScheduler(max_retries=0)
+    extractor = ExtractionScheduler()
     try:
         result = extractor.extract(planned[0], str(output))
     finally:
@@ -437,7 +437,7 @@ def test_structural_head_number_position_orders_real_opaque_members(tmp_path, ar
     planned = ArchiveInputPlanningStage(config).plan_task_to_tasks(tasks[0])
     assert len(planned) == 1
     PasswordScopeContext().annotate(planned)
-    extractor = ExtractionScheduler(password_store=PasswordStore.from_config(config), max_retries=0)
+    extractor = ExtractionScheduler(password_store=PasswordStore.from_config(config))
     output = tmp_path / "output"
     try:
         result = extractor.extract(planned[0], str(output))
@@ -950,7 +950,7 @@ def test_modern_split_zip_with_camouflaged_names_runs_full_pipeline(tmp_path, op
         f"{logical}.z01", f"{logical}.z02", f"{logical}.z03", f"{logical}.zip",
     ]
 
-    extractor = ExtractionScheduler(max_retries=0)
+    extractor = ExtractionScheduler()
     output = tmp_path / "output"
     try:
         extraction = extractor.extract(task, str(output))
@@ -1071,7 +1071,6 @@ def test_encrypted_plain_and_sfx_volume_matrix_with_shared_stem_and_noisy_suffix
     PasswordScopeContext().annotate(planned_tasks)
     extractor = ExtractionScheduler(
         password_store=PasswordStore.from_config(config),
-        max_retries=1,
         process_config={},
         extraction_config=config.get("extraction"),
     )

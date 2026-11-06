@@ -113,7 +113,7 @@ def test_carrier_anchor_rejoins_native_volumes_and_missing_parts_can_arrive(tmp_
     assert not (found.claimed_paths & (found.blocked_paths | found.residual_paths))
     planned = ArchiveInputPlanningStage(config).plan_task_to_tasks(task)
     assert len(planned) == 1
-    extractor = ExtractionScheduler(max_retries=0, password_store=PasswordStore.from_config(config))
+    extractor = ExtractionScheduler(password_store=PasswordStore.from_config(config))
     output = tmp_path / "out"
     try:
         extracted = extractor.extract(planned[0], str(output))
@@ -206,7 +206,7 @@ def test_encrypted_standalone_carrier_keeps_boundary_and_password_failures(tmp_p
     assert task.discovery_failure is None
     assert task.discovery_source == "embedded"
     planned = ArchiveInputPlanningStage(config).plan_task_to_tasks(task)
-    extractor = ExtractionScheduler(max_retries=0, password_store=PasswordStore.from_config(config))
+    extractor = ExtractionScheduler(password_store=PasswordStore.from_config(config))
     output = tmp_path / "out"
     try:
         extracted = extractor.extract(planned[0], str(output))
@@ -221,7 +221,7 @@ def test_encrypted_standalone_carrier_keeps_boundary_and_password_failures(tmp_p
     config, task = discover([])
     assert task.discovery_failure is None
     assert len([node.projection() for node in task.inputs]) == 2
-    extractor = ExtractionScheduler(max_retries=0, password_store=PasswordStore.from_config(config))
+    extractor = ExtractionScheduler(password_store=PasswordStore.from_config(config))
     sibling_output = tmp_path / "sibling-out"
     try:
         extracted = extractor.extract(task, str(sibling_output))

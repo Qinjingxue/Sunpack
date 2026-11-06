@@ -1157,9 +1157,6 @@ class WatchScheduler:
     def _scheduler_path_key(path: str) -> str:
         return case_key(os.path.abspath(path))
 
-    def _inflight_path_keys_locked(self) -> set[str]:
-        return set(self._inflight_path_counts)
-
     def _register_inflight_requests_locked(
         self,
         requests: Iterable[_ActivePipelineRequest],

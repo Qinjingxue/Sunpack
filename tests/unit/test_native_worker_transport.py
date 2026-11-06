@@ -2,6 +2,7 @@ import asyncio
 import gc
 import io
 import json
+import queue
 import subprocess
 import threading
 import weakref
@@ -374,6 +375,64 @@ def test_async_bad_chunk_cancels_only_its_job_and_retains_ownership_until_finish
         assert not any(event["type"] == "manifest_chunk" for event in callbacks)
 
     asyncio.run(run())
+
+
+def test_idle_sync_reader_releases_processed_event_and_line(monkeypatch):
+    # EOF tests cannot detect transport buffers retained during an idle wait.
+    # One blocking in-memory stream covers that lifetime without a worker or
+    # timing/RSS assumptions; a second registered job must remain live.
+    import sunpack.pipeline.extraction.internal.sevenzip.sevenzip_runner as runner_module
+
+    class Line(str):
+        pass
+
+    class Envelope(dict):
+        pass
+
+    waiting = threading.Event()
+    lines = queue.Queue()
+    references = []
+
+    class Stream:
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            waiting.set()
+            line = lines.get()
+            if line is None:
+                raise StopIteration
+            return line
+
+    def parse(line):
+        event = Envelope(type="native_event", job_id="finished", event="job_finished")
+        references.extend((weakref.ref(line), weakref.ref(event)))
+        return event
+
+    monkeypatch.setattr(runner_module, "parse_worker_transport_event", parse)
+    monkeypatch.setattr(_NativeWorkerProcess, "_start", lambda self: None)
+    worker = _NativeWorkerProcess("unused", None)
+    worker.send = lambda payload: None
+    worker._shutdown_sent = True
+    failures = []
+    for job_id in ("finished", "active"):
+        worker.submit_async("request", job_id, parsed_events=True,
+                            on_line=lambda line, event: event.get("event") == "job_finished",
+                            on_error=failures.append)
+    reader = threading.Thread(target=worker._dispatch_stdout, args=(Stream(),))
+    reader.start()
+    try:
+        assert waiting.wait(2)
+        waiting.clear()
+        lines.put(Line("worker event"))
+        assert waiting.wait(2)
+        assert len(references) == 2 and all(ref() is None for ref in references)
+        assert set(worker._async_jobs) == {"active"} and not failures
+        assert reader.is_alive()
+    finally:
+        lines.put(None)
+        reader.join(2)
+        assert not reader.is_alive()
 
 
 @pytest.mark.parametrize("outcome", ["success", "callback_error", "malformed_chunk"])

@@ -53,17 +53,13 @@ class RunReporter:
         self._completed_tasks = 0
         self._nested_tasks = 0
         self._max_depth = 0
-        self._task_lineages: dict[int, tuple[str, ...]] = {}
         self._output_lineages = PathMap()
         self._top_level_outputs = PathMap()
         self._interactive = not self.quiet and _terminal_supports_updates(self.stdout)
         self._use_color = self._interactive and os.environ.get("NO_COLOR") is None
-        self._panel_tasks: list[int] = []
         self._panel_row_index: dict[int, int] = {}
         self._task_rows: dict[int, dict[str, Any]] = {}
         self._last_streamed_progress: dict[int, int] = {}
-        # (volume_key, episode_id) -> 仍在等待该 episode 的 job_id 集合；收到 space_resumed 时移除。
-        self._space_blocked_jobs: dict[tuple[str, int], set[str]] = {}
         self._last_render_at = 0.0
         self._work_broker = work_broker
         self._request_id = request_id
@@ -81,9 +77,15 @@ class RunReporter:
     def tasks_discovered(self, depth: int, tasks: list[Any], direct: bool = False) -> None:
         depth = max(1, int(depth or 1))
         with self._lock:
+            self._total_tasks += len(tasks)
+            if depth > 1:
+                self._nested_tasks += len(tasks)
+            if tasks:
+                self._max_depth = max(self._max_depth, depth)
+            if self.quiet:
+                return
             for task in tasks:
                 parent_lineage = self._lineage_for_path(str(getattr(task, "main_path", "") or ""))
-                self._task_lineages[id(task)] = parent_lineage
                 self._last_streamed_progress.pop(id(task), None)
                 self._task_rows[id(task)] = {
                     "name": _task_name(task),
@@ -96,13 +98,6 @@ class RunReporter:
                     "total_bytes": 0,
                     "detail": "",
                 }
-            self._total_tasks += len(tasks)
-            if depth > 1:
-                self._nested_tasks += len(tasks)
-            if tasks:
-                self._max_depth = max(self._max_depth, depth)
-            if self.quiet:
-                return
             if direct and depth == 1:
                 message = self.i18n.t("report.ready_archives", count=len(tasks))
             elif depth == 1:
@@ -111,9 +106,8 @@ class RunReporter:
                 message = self.i18n.t("report.recursive_found", depth=depth, count=len(tasks))
             self._print(message)
             if self._interactive:
-                self._panel_tasks = [id(task) for task in tasks]
-                self._panel_row_index = {task_id: i for i, task_id in enumerate(self._panel_tasks)}
-                for task_id in self._panel_tasks:
+                self._panel_row_index = {id(task): i for i, task in enumerate(tasks)}
+                for task_id in self._panel_row_index:
                     self._print(self._format_task_row(self._task_rows[task_id]))
 
     def task_started(self, task: Any, depth: int) -> None:
@@ -170,7 +164,7 @@ class RunReporter:
         # Broker workers may wait for the reporter and output; the loop must not.
         with self._lock:
             row = self._task_rows.get(id(task))
-            if row is not None and not row.get("finished"):
+            if row is not None:
                 self._task_progress(task, event)
 
     async def _drain_resource_progress(self) -> None:
@@ -262,19 +256,15 @@ class RunReporter:
                         self._last_streamed_progress[task_id] = displayed_percent
                         self._print(self._format_task_row(row))
 
-    # 空间不足暂停/恢复：按 (volume_key, episode_id) 去重；space_status 是低频诊断（默认 15s），不是看门狗保活。
+    # Transport filters stale episodes; only retain the visible state here.
     def _space_progress(self, task: Any, event: str, payload: dict[str, Any]) -> None:
-        key = (str(payload.get("volume_key") or ""), int(payload.get("episode_id") or 0))
-        job_id = str(payload.get("job_id") or "")
         with self._lock:
             row = self._task_rows.get(id(task))
             if row is None:
                 return
             if event == "space_resumed":
                 row["space_blocked"] = False
-                row.pop("space_episode", None)
                 row["detail"] = ""
-                self._space_blocked_jobs.pop(key, None)
                 self._restore_progress_locked(row)
                 if self._interactive:
                     self._render_panel_locked(force=True, task_id=id(task))
@@ -283,10 +273,7 @@ class RunReporter:
                 return
 
             row["space_blocked"] = True
-            row["space_episode"] = key[1]
             self._restore_progress_locked(row)
-            if job_id:
-                self._space_blocked_jobs.setdefault(key, set()).add(job_id)
             if event == "space_status":
                 previous_detail = row.get("detail", "")
                 row["detail"] = self._space_status_detail(payload)
@@ -327,14 +314,13 @@ class RunReporter:
 
     def task_finished(self, task: Any, outcome: Any, depth: int) -> None:
         with self._lock:
-            row = self._task_rows.get(id(task))
-            if row is not None:
-                row["finished"] = True
-                row["name"] = _task_name(task)
-            depth = max(1, int(depth or 1))
             self._completed_tasks += 1
+            if self.quiet:
+                return
+            row = self._task_rows.get(id(task))
+            depth = max(1, int(depth or 1))
             name = _task_name(task)
-            parent_lineage = self._task_lineages.get(id(task), ())
+            parent_lineage = row["lineage"] if row is not None else ()
             result = getattr(outcome, "result", outcome)
             out_dir = str(getattr(result, "out_dir", "") or "")
             success = bool(getattr(outcome, "success", getattr(result, "success", False)))
@@ -345,8 +331,6 @@ class RunReporter:
                 if depth == 1:
                     self._top_level_outputs.setdefault(out_dir, out_dir)
 
-            if self.quiet:
-                return
             if self._interactive:
                 state = "partial" if partial else "complete" if success else "error"
                 error = str(getattr(result, "error", "") or "") if not success else ""
@@ -357,24 +341,32 @@ class RunReporter:
                     detail=error,
                     force=True,
                 )
-                return
-            prefix = self._tree_prefix(depth)
-            progress = f"{self._completed_tasks}/{self._total_tasks}"
-            if partial:
-                status = self.i18n.t("report.status.partial")
-            elif success:
-                status = self.i18n.t("report.status.success")
             else:
-                status = self.i18n.t("report.status.failed")
-            parent = " > ".join(parent_lineage)
-            relation = self.i18n.t("report.relation.from", parent=parent) if parent else ""
-            detail = ""
-            if self.verbose and success and out_dir:
-                detail = self.i18n.t("report.detail.output", output=out_dir)
-            elif self.verbose and not success:
-                error = str(getattr(result, "error", "") or "")
-                detail = self.i18n.t("report.detail.error", error=error) if error else ""
-            self._print(f"{prefix}[{status} {progress}] {name}{relation}{detail}")
+                prefix = self._tree_prefix(depth)
+                progress = f"{self._completed_tasks}/{self._total_tasks}"
+                if partial:
+                    status = self.i18n.t("report.status.partial")
+                elif success:
+                    status = self.i18n.t("report.status.success")
+                else:
+                    status = self.i18n.t("report.status.failed")
+                parent = " > ".join(parent_lineage)
+                relation = self.i18n.t("report.relation.from", parent=parent) if parent else ""
+                detail = ""
+                if self.verbose and success and out_dir:
+                    detail = self.i18n.t("report.detail.output", output=out_dir)
+                elif self.verbose and not success:
+                    error = str(getattr(result, "error", "") or "")
+                    detail = self.i18n.t("report.detail.error", error=error) if error else ""
+                self._print(f"{prefix}[{status} {progress}] {name}{relation}{detail}")
+            # The terminal already owns the rendered row. Keep ancestry only
+            # by output path for recursive discovery, never by completed task.
+            self._task_rows.pop(id(task), None)
+            self._last_streamed_progress.pop(id(task), None)
+            if not self._task_rows:
+                self._task_rows.clear()
+                self._last_streamed_progress.clear()
+                self._panel_row_index.clear()
 
     def relocate_outputs(self, result: DirectoryFlattenResult) -> None:
         with self._lock:
@@ -501,7 +493,7 @@ class RunReporter:
             return
         self._last_render_at = now
         # Cursor rests immediately below the panel; replace only the changed row.
-        lines_up = len(self._panel_tasks) - row_index
+        lines_up = len(self._panel_row_index) - row_index
         row = self._task_rows.get(task_id)
         text = self._format_task_row(row) if row is not None else ""
         self.stdout.write(f"\033[{lines_up}A\r\033[2K{text}\033[{lines_up}B\r")
