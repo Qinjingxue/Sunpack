@@ -194,11 +194,9 @@ fn event_value(value: &Bound<'_, PyAny>) -> PyResult<Value> {
 
 #[derive(Default)]
 struct Task {
-    group: Option<Value>,
-    group_row: Option<Record>,
+    group: Option<Arc<Value>>,
     members: HashSet<String>,
     status: Option<Record>,
-    terminal: bool,
     stamp: i64,
     expired: bool,
     blocked: bool,
@@ -208,7 +206,7 @@ struct Task {
 }
 impl Task {
     fn processing(&self) -> bool {
-        self.status.is_some() && !self.terminal && !self.blocked
+        self.status.is_some() && !self.blocked
     }
 }
 struct Retiring {
@@ -217,6 +215,7 @@ struct Retiring {
 }
 #[derive(Default)]
 struct Projection {
+    // Completion removes the live task; only routing metadata may retire later.
     tasks: HashMap<String, Task>,
     retiring: HashMap<String, Retiring>,
     owner_tasks: HashMap<String, HashSet<String>>,
@@ -393,7 +392,7 @@ impl Projection {
                         .iter()
                         .map(|m| self.aliases.get(m).unwrap_or(m).clone())
                         .filter(|id| {
-                            self.tasks.get(id).is_some_and(|t| !t.terminal)
+                            self.tasks.contains_key(id)
                                 && (explicit.is_empty() || *id == explicit)
                         })
                         .collect();
@@ -445,11 +444,8 @@ impl Projection {
                         task.owners.insert(owner.clone());
                         task.owner = owner.clone();
                     }
-                    task.group_row = Some(encode(
-                        &json!({"event":"pipeline_sources_claimed","path":group["path"],"groups":[group],"owner":task.owner}),
-                    ));
                     task.members = members;
-                    task.group = Some(group.clone());
+                    task.group = Some(Arc::new(group.clone()));
                     if processing {
                         task.stamp = (ts.as_f64().unwrap_or(0.0) * 1_000_000.0) as i64;
                         task.expired = false;
@@ -457,7 +453,6 @@ impl Projection {
                             Some(encode(&json!({"event":"processing_started","path":path,
                         "ts":ts,"owner":task.owner,"task_id":id})));
                         task.order = self.order;
-                        task.terminal = false;
                         task.blocked = false;
                     }
                     self.insert(id, task);
@@ -483,7 +478,7 @@ impl Projection {
                 if self
                     .tasks
                     .get(&id)
-                    .is_some_and(|t| !t.terminal && !t.blocked && t.owner == field(value, "owner"))
+                    .is_some_and(|t| !t.blocked && t.owner == field(value, "owner"))
                 {
                     self.remove(&id);
                 }
@@ -492,9 +487,7 @@ impl Projection {
         }
         if event == "task_retired" && field(value, "scope") == "task" {
             value["task_id"] = json!(id);
-            if self.tasks.get(&id).is_some_and(|t| !t.terminal) {
-                self.remove(&id);
-            }
+            self.remove(&id);
             return None;
         }
         if event == "blocker_cleared" {
@@ -518,8 +511,7 @@ impl Projection {
                 self.tasks
                     .iter()
                     .filter(|(_, t)| {
-                        !t.terminal
-                            && !t.processing()
+                        !t.processing()
                             && t.members.iter().any(|m| {
                                 *m == physical || crate::watch_store::is_path_under(m, &physical)
                             })
@@ -529,7 +521,7 @@ impl Projection {
             } else {
                 self.tasks
                     .get(&id)
-                    .filter(|t| !t.terminal && !t.processing())
+                    .filter(|t| !t.processing())
                     .map(|_| vec![id])
                     .unwrap_or_default()
             };
@@ -543,13 +535,12 @@ impl Projection {
                     continue;
                 }
                 if let Some(g) = task.group.as_mut() {
+                    // A queued publication may still own the previous group.
+                    let g = Arc::make_mut(g);
                     if let Some(members) = g["members"].as_array_mut() {
                         members
                             .retain(|m| m.as_str().is_some_and(|m| task.members.contains(&key(m))));
                     }
-                    task.group_row = Some(encode(
-                        &json!({"event":"pipeline_sources_claimed","path":g["path"],"groups":[g],"owner":task.owner}),
-                    ));
                 }
                 self.insert(id, task);
             }
@@ -558,8 +549,7 @@ impl Projection {
         if event == "no_tasks_found" || event == "pipeline_request_coalesced" {
             value["task_id"] = json!(id);
             if self.tasks.get(&id).is_some_and(|t| {
-                !t.terminal
-                    && (field(value, "owner").is_empty() || t.owner == field(value, "owner"))
+                (field(value, "owner").is_empty() || t.owner == field(value, "owner"))
                     && (t.group.is_none()
                         || (event == "no_tasks_found"
                             && (t.members.len() == 1
@@ -618,7 +608,7 @@ impl Projection {
                         | "failed_terminal"
                         | "partial_rejected"
                 )
-                && self.tasks.get(&id).is_none_or(|t| t.terminal)
+                && !self.tasks.contains_key(&id)
             {
                 id = self.instance_id(field(value, "owner"), &physical);
             }
@@ -646,8 +636,6 @@ impl Projection {
                 // Publish the same canonical path that the snapshot retains.
                 value["path"] = group["path"].clone();
             }
-            let record = encode(value);
-            task.status = Some(record.clone());
             task.stamp = timestamp(value);
             task.expired = false;
             task.blocked = matches!(
@@ -659,11 +647,10 @@ impl Projection {
                 task.owner = field(value, "owner").to_owned();
             }
             task.order = self.order;
-            task.terminal = matches!(
+            if matches!(
                 event.as_str(),
                 "done" | "failed_terminal" | "partial_rejected"
-            );
-            if task.terminal {
+            ) {
                 if !task.owners.is_empty() {
                     let mut members = std::mem::take(&mut task.members);
                     if let Some(group) = &task.group {
@@ -687,10 +674,11 @@ impl Projection {
                     );
                 }
                 if let Some(group) = task.group {
-                    value["group"] = group;
+                    value["group"] = Arc::unwrap_or_clone(group);
                 }
                 return Some(encode(value));
             }
+            task.status = Some(encode(value));
             self.insert(id, task);
             return None;
         }
@@ -699,7 +687,7 @@ impl Projection {
     fn updates(
         &mut self,
         mut reset: bool,
-    ) -> (Vec<(String, Option<(Record, Option<Record>)>)>, bool) {
+    ) -> (Vec<(String, Option<(Record, Option<Arc<Value>>)>)>, bool) {
         reset |= std::mem::take(&mut self.full_dirty);
         self.dirty_bytes = 0;
         let ids = if reset {
@@ -714,7 +702,7 @@ impl Projection {
                     let row = self.tasks.get(&id).and_then(|task| {
                         task.status
                             .as_ref()
-                            .map(|status| (status.clone(), task.group_row.clone()))
+                            .map(|status| (status.clone(), task.group.clone()))
                     });
                     (id, row)
                 })
@@ -884,8 +872,7 @@ fn writer(shared: Arc<Shared>, path: PathBuf) {
                     let value = if let Some((status, group)) = row {
                         let mut value: Value = serde_json::from_slice(&status)?;
                         if let Some(group) = group {
-                            let mut group: Value = serde_json::from_slice(&group)?;
-                            value["group"] = group["groups"][0].take();
+                            value["group"] = Arc::unwrap_or_clone(group);
                         }
                         Some((timestamp(&value), value))
                     } else {
@@ -1074,6 +1061,42 @@ impl NativeEventLog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Hold a writer snapshot across member retirement and completion. Existing
+    // disk tests cannot force this overlap; this checks snapshot isolation and
+    // release of both group generations without threads or disk I/O.
+    #[test]
+    fn queued_groups_survive_live_mutation_and_release_after_completion() {
+        let mut projection = Projection::default();
+        let path = "C:/nested.fake";
+        let member = "C:/opaque.002";
+        projection.apply(&mut json!({"event":"pipeline_sources_claimed","owner":"run",
+            "groups":[{"path":path,"members":[path,member]}]}));
+        projection.apply(&mut json!({"event":"suspended_missing_volume",
+            "path":path,"owner":"run","ts":1}));
+        let old = projection.updates(false).0.pop().unwrap().1.unwrap().1.unwrap();
+        let old_lifetime = Arc::downgrade(&old);
+
+        projection.apply(&mut json!({"event":"candidate_departed","path":member}));
+        let current = projection.updates(false).0.pop().unwrap().1.unwrap().1.unwrap();
+        let current_lifetime = Arc::downgrade(&current);
+        assert_eq!(old["members"], json!([path, member]));
+        assert_eq!(current["members"], json!([path]));
+
+        let row = projection.apply(&mut json!({"event":"done","path":path,
+            "owner":"run","ts":2})).unwrap();
+        let row: Value = serde_json::from_slice(&row).unwrap();
+        assert_eq!(row["group"], *current);
+        assert!(projection.tasks.is_empty());
+        projection.apply(&mut json!({"event":"pipeline_sources_released",
+            "owner":"run","path":path}));
+        assert!(projection.aliases.is_empty() && projection.retiring.is_empty());
+        drop(old);
+        drop(current);
+        assert!(old_lifetime.upgrade().is_none());
+        assert!(current_lifetime.upgrade().is_none());
+    }
+
     #[test]
     fn completed_families_leave_no_resident_history_or_aliases() {
         // Disk/GUI checks cannot see producer references. Removing this test
