@@ -43,12 +43,25 @@ def test_single_and_split_prepass_agree_on_ranges_and_cross_volume_signatures(si
 
 
 @pytest.mark.parametrize("multivolume", [False, True])
-def test_prepass_preserves_closed_view_contract(signature_paths, multivolume):
+def test_analysis_operations_preserve_closed_view_contract(signature_paths, multivolume):
     view = (AnalysisMultiVolumeView(signature_paths[1:], cache_bytes=0)
             if multivolume else AnalysisBinaryView(signature_paths[0], cache_bytes=0))
     try:
         view.signature_prepass(32, 16)
     finally:
         view.close()
-    with pytest.raises(RuntimeError, match="closed"):
-        view.signature_prepass(0, 0)
+    # Prepass alone cannot catch format-specific entry points reading a retired
+    # reader and reporting archive damage instead of a closed-view error.
+    for operation, args in (
+        (view.signature_prepass, (0, 0)),
+        (view.read_at, (0, 0)),
+        (view.read_tail, (0,)),
+        (view.stats, ()),
+        (view.locate_zip_eocd, (0,)),
+        (view.probe_zip_local_header, (0,)),
+        (view.probe_zip, (0,)),
+        (view.probe_rar, (0,)),
+        (view.probe_seven_zip, (0,)),
+    ):
+        with pytest.raises(RuntimeError, match="closed"):
+            operation(*args)

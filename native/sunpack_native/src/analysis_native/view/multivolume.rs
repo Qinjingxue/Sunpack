@@ -39,34 +39,33 @@ impl AnalysisMultiVolumeView {
             },
         )?;
         Ok(Self {
-            path: paths[0].clone(),
-            reader,
+            view: AnalysisBinaryView {
+                path: paths[0].clone(),
+                reader,
+                closed: false,
+            },
             volume_starts,
-            closed: false,
         })
     }
 
     #[getter]
     fn size(&self) -> PyResult<u64> {
-        self.ensure_open()?;
-        Ok(self.reader.len())
+        self.view.size()
     }
 
     #[getter]
     fn path(&self) -> PyResult<String> {
-        Ok(self.path.clone())
+        self.view.path()
     }
 
     #[getter]
     fn closed(&self) -> bool {
-        self.closed
+        self.view.closed()
     }
 
     fn close(&mut self) {
-        if !self.closed {
-            self.reader = ManagedReader::closed();
-            self.closed = true;
-        }
+        self.view.close();
+        self.volume_starts = Vec::new();
     }
 
     fn read_at<'py>(
@@ -75,35 +74,20 @@ impl AnalysisMultiVolumeView {
         offset: u64,
         size: usize,
     ) -> PyResult<Bound<'py, PyBytes>> {
-        let data = py.detach(|| self.read_at_bytes(offset, size))?;
-        Ok(PyBytes::new(py, &data))
+        self.view.read_at(py, offset, size)
     }
 
     fn read_tail<'py>(&self, py: Python<'py>, size: usize) -> PyResult<Bound<'py, PyBytes>> {
-        let view_size = self.reader.len();
-        let read_size = size.min(view_size as usize);
-        let offset = view_size.saturating_sub(read_size as u64);
-        let data = py.detach(|| self.read_at_bytes(offset, read_size))?;
-        Ok(PyBytes::new(py, &data))
+        self.view.read_tail(py, size)
     }
 
     fn probe_zip_local_header(&self, py: Python<'_>, offset: u64) -> PyResult<Py<PyDict>> {
-        AnalysisBinaryView {
-            path: self.path.clone(),
-            reader: self.reader.clone(),
-            closed: self.closed,
-        }
-        .probe_zip_local_header_native(py, offset)
+        self.view.probe_zip_local_header_native(py, offset)
     }
 
     #[pyo3(signature = (eocd_offset=None))]
     fn locate_zip_eocd(&self, py: Python<'_>, eocd_offset: Option<u64>) -> PyResult<Py<PyDict>> {
-        AnalysisBinaryView {
-            path: self.path.clone(),
-            reader: self.reader.clone(),
-            closed: self.closed,
-        }
-        .locate_zip_eocd_native(py, eocd_offset)
+        self.view.locate_zip_eocd_native(py, eocd_offset)
     }
 
     #[pyo3(signature = (eocd_offset))]
@@ -112,12 +96,7 @@ impl AnalysisMultiVolumeView {
         py: Python<'_>,
         eocd_offset: u64,
     ) -> PyResult<Py<PyDict>> {
-        AnalysisBinaryView {
-            path: self.path.clone(),
-            reader: self.reader.clone(),
-            closed: self.closed,
-        }
-        .probe_zip_with_disk_starts(
+        self.view.probe_zip_with_disk_starts(
             py,
             eocd_offset,
             Some(&self.volume_starts),
@@ -130,12 +109,7 @@ impl AnalysisMultiVolumeView {
         py: Python<'_>,
         start_offset: u64,
     ) -> PyResult<Py<PyDict>> {
-        AnalysisBinaryView {
-            path: self.path.clone(),
-            reader: self.reader.clone(),
-            closed: self.closed,
-        }
-        .probe_rar(py, start_offset)
+        self.view.probe_rar(py, start_offset)
     }
 
     #[pyo3(signature = (start_offset))]
@@ -144,21 +118,11 @@ impl AnalysisMultiVolumeView {
         py: Python<'_>,
         start_offset: u64,
     ) -> PyResult<Py<PyDict>> {
-        AnalysisBinaryView {
-            path: self.path.clone(),
-            reader: self.reader.clone(),
-            closed: self.closed,
-        }
-        .probe_seven_zip(py, start_offset)
+        self.view.probe_seven_zip(py, start_offset)
     }
 
     fn stats(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
-        self.ensure_open()?;
-        let stats = self.reader.stats()?;
-        let dict = PyDict::new(py);
-        dict.set_item("read_bytes", stats.read_bytes)?;
-        dict.set_item("cache_hits", stats.cache_hits)?;
-        Ok(dict.unbind())
+        self.view.stats(py)
     }
 
     #[pyo3(signature = (config, initial_prepass=None, signature_prepass=true, format_structure=true))]
@@ -170,12 +134,7 @@ impl AnalysisMultiVolumeView {
         signature_prepass: bool,
         format_structure: bool,
     ) -> PyResult<Py<PyDict>> {
-        AnalysisBinaryView {
-            path: self.path.clone(),
-            reader: self.reader.clone(),
-            closed: self.closed,
-        }
-        .analyze_report(
+        self.view.analyze_report(
             py,
             &config,
             initial_prepass.as_ref(),
@@ -192,10 +151,6 @@ impl AnalysisMultiVolumeView {
         head_bytes: usize,
         tail_bytes: usize,
     ) -> PyResult<Py<PyDict>> {
-        self.ensure_open()?;
-        let data = py
-            .detach(|| signature_prepass_native(&self.reader, head_bytes, tail_bytes))
-            .map_err(reader_error_to_py)?;
-        signature_prepass_to_python(py, data)
+        self.view.signature_prepass(py, head_bytes, tail_bytes)
     }
 }

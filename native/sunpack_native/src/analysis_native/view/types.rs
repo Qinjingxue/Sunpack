@@ -7,8 +7,6 @@ pub(crate) struct AnalysisBinaryView {
 
 #[pyclass]
 pub(crate) struct AnalysisMultiVolumeView {
-    path: String,
-    reader: ManagedReader,
+    view: AnalysisBinaryView,
     volume_starts: Vec<u64>,
-    closed: bool,
 }

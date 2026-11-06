@@ -197,6 +197,7 @@ impl AnalysisBinaryView {
         eocd_offset: u64,
         disk_starts: Option<&[u64]>,
     ) -> PyResult<Py<PyDict>> {
+        self.ensure_open()?;
         let result = PyDict::new(py);
         result.set_item("format", "zip")?;
         result.set_item("plausible", false)?;
@@ -1041,25 +1042,6 @@ fn zip_archive_start_kind(
         Ok("zip64_eocd")
     } else {
         Ok("")
-    }
-}
-
-impl AnalysisMultiVolumeView {
-    fn ensure_open(&self) -> PyResult<()> {
-        if self.closed {
-            Err(pyo3::exceptions::PyRuntimeError::new_err(
-                "analysis multi-volume view is closed",
-            ))
-        } else {
-            Ok(())
-        }
-    }
-
-    fn read_at_bytes(&self, offset: u64, size: usize) -> PyResult<Vec<u8>> {
-        self.ensure_open()?;
-        self.reader
-            .read_at(offset, size)
-            .map_err(reader_error_to_py)
     }
 }
 
