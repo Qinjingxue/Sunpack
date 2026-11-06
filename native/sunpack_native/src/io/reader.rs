@@ -2677,6 +2677,66 @@ mod tests {
     }
 
     #[test]
+    fn rar_header_walk_releases_windows_without_retaining_shared_blocks() {
+        // ZIP's directory walk does not exercise RAR's ENDARC traversal.
+        // Check both Relations' cached reader and Embedded's direct reader;
+        // dense headers must not become retained blocks or one I/O per field.
+        use crate::analysis_native::volume_anchor::{upgrade_relation_rar_end_reader, VolumeAnchor};
+        for rar5 in [false, true] {
+            let mut record = vec![0u8; 32];
+            let mut terminal;
+            if rar5 {
+                record[4..8].copy_from_slice(&[27, 2, 2, 0]);
+                let crc = crc32fast::hash(&record[4..]);
+                record[..4].copy_from_slice(&crc.to_le_bytes());
+                terminal = vec![3, 5, 0, 0];
+                let crc = crc32fast::hash(&terminal);
+                terminal.splice(..0, crc.to_le_bytes());
+            } else {
+                record[2] = 0x74;
+                record[3..5].copy_from_slice(&0x8000u16.to_le_bytes());
+                record[5..7].copy_from_slice(&32u16.to_le_bytes());
+                let crc = crc32fast::hash(&record[2..]) as u16;
+                record[..2].copy_from_slice(&crc.to_le_bytes());
+                terminal = vec![0, 0, 0x7b, 8, 0, 9, 0, 2, 0];
+                let crc = crc32fast::hash(&terminal[2..]) as u16;
+                terminal[..2].copy_from_slice(&crc.to_le_bytes());
+            }
+            let mut bytes = vec![0x77; 37];
+            bytes.extend(record.repeat(4096));
+            bytes.extend(&terminal);
+            let end = bytes.len() as u64;
+            bytes.extend(b"carrier trailing bytes");
+            for direct in [false, true] {
+                let path = temp_file("rar_header_walk_cache", &bytes);
+                let reader = ManagedReader::open(&path).unwrap();
+                let reader = if direct { reader.probe_reader() } else { reader };
+                let anchor = VolumeAnchor {
+                    path: path.to_string_lossy().into_owned(),
+                    size: bytes.len() as u64,
+                    format: "rar".into(),
+                    structure_offset: Some(37),
+                    rar_next_header_offset: Some(37),
+                    evidence: vec![if rar5 { "rar5:volume_header" } else { "rar4:volume_header" }],
+                    ..Default::default()
+                };
+                let before = THREAD_PHYSICAL_READS.with(std::cell::Cell::get);
+                let resolved = upgrade_relation_rar_end_reader(&anchor, None, &reader).unwrap();
+                let reads = THREAD_PHYSICAL_READS.with(std::cell::Cell::get) - before;
+                assert_eq!(resolved.expected_logical_size, Some(end));
+                assert_eq!(resolved.relation_has_next, Some(false));
+                assert!(resolved.error.is_empty());
+                let (_, blocks, retained) = manager()
+                    .release_resources_under_roots(&[std::fs::canonicalize(&path).unwrap()])
+                    .unwrap();
+                std::fs::remove_file(path).unwrap();
+                assert_eq!((blocks, retained), (0, 0), "rar5={rar5}, direct={direct}");
+                assert!(reads < 32, "RAR header walk issued {reads} physical reads");
+            }
+        }
+    }
+
+    #[test]
     fn probe_reads_keep_ranges_and_generation_without_retaining_shared_blocks() {
         let data = vec![0x5au8; BLOCK_SIZE * 2 + 3];
         let path = temp_file("managed_reader_probe_scope", &data);

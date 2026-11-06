@@ -199,7 +199,7 @@ class ArchiveInputPlanningStage:
                     segment_payloads = self._extractable_segment_payloads(task, [(evidence, segment, index)])
             with _phase(phase_timer, f"{phase_prefix}_batched_write"):
                 password_probe_input = (
-                    self._password_probe_input_for_segment(task, *selected_segment[:2])
+                    self._password_probe_input_for_segment(task, *selected_segment[:2], segment_payloads)
                     if selected_segment is not None
                     else self._structured_volume_source(task)
                 )
@@ -220,6 +220,7 @@ class ArchiveInputPlanningStage:
                 task,
                 evidence,
                 segment,
+                segment_payloads,
             )
             _write_plan_knowledge(
                 task,
@@ -350,8 +351,9 @@ class ArchiveInputPlanningStage:
 
     def _password_probe_input_for_segment(
         self, task: ArchiveTask, evidence: ArchiveFormatEvidence, segment: ArchiveSegment,
+        inputs: list[LogicalArchiveInput],
     ) -> ArchiveInputDescriptor | None:
-        for node in task.inputs:
+        for node in inputs:
             if node.evidence.get("start_offset") == segment.start_offset:
                 return node.descriptor
         projected = archive_input_slice(task.archive_input().to_dict(), evidence.format,

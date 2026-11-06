@@ -1011,19 +1011,17 @@ impl NativeWatchState {
             .collect()
     }
 
-    /// Entries, optionally only those with one ``status``.
-    #[pyo3(signature = (status=None, *, blocker=None))]
+    /// Entries, optionally only those waiting on one blocker.
+    #[pyo3(signature = (*, blocker=None))]
     fn entry_items(
         &self,
         py: Python<'_>,
-        status: Option<&str>,
         blocker: Option<&str>,
     ) -> PyResult<Vec<Py<PyDict>>> {
         let records: Vec<_> = self
             .lock()
             .entries
             .values()
-            .filter(|value| status.is_none_or(|status| value.status == status))
             .filter(|value| blocker.is_none_or(|blocker| value.blocks(blocker)))
             .cloned()
             .collect();

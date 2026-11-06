@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import InitVar, dataclass, field
+from dataclasses import InitVar, dataclass, field, replace
 from typing import Any
 
 from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
@@ -129,7 +129,6 @@ class ArchiveTask:
         ]))
         self._archive_input = descriptor
         if len(self.inputs) == 1 and self.inputs[0].descriptor is previous:
-            from dataclasses import replace
             self.inputs = (replace(self.inputs[0], descriptor=descriptor),)
 
     def apply_path_mapping(self, path_map: dict[str, str]) -> None:
@@ -145,9 +144,14 @@ class ArchiveTask:
 
         self.carrier_path = mapped(self.carrier_path or self.main_path)
         self.cleanup_parts = [mapped(path) for path in self.cleanup_parts]
-        self.set_archive_input(self.archive_input().with_path_mapping(mapped))
-        self.inputs = tuple(node.remap(mapped) for node in self.inputs)
-        if self.password_probe_input is not None:
+        previous = self.archive_input()
+        descriptor = previous.with_path_mapping(mapped)
+        self.inputs = tuple(replace(node, descriptor=descriptor) if node.descriptor is previous
+                            else node.remap(mapped) for node in self.inputs)
+        self.set_archive_input(descriptor)
+        if self.password_probe_input is previous:
+            self.password_probe_input = descriptor
+        elif self.password_probe_input is not None:
             self.password_probe_input = self.password_probe_input.with_path_mapping(mapped)
 
     def adopt_detection_plan(self, replacement: "ArchiveTask") -> None:

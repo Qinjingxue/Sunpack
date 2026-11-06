@@ -661,7 +661,7 @@ class SingleArchiveExtractor:
                 child_task.runtime = dict(task.runtime)
                 # Password verification must bind to the currently active
                 # logical segment.
-                write_source_password_probe_input(child_task, node.probe_input or descriptor)
+                write_source_password_probe_input(child_task, descriptor)
             discovery_failure = node.failure
             if discovery_failure is not None:
                 result = self._failed(segment_dir, self._localized_failure(discovery_failure),

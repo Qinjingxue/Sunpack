@@ -1310,6 +1310,9 @@ pub(crate) fn upgrade_relation_rar_end_reader(
     {
         return Ok(out);
     }
+    // Header walks own one transient window. Dense RAR directories reuse it;
+    // sparse payload skips never populate the process-wide physical cache.
+    let reader = reader.windowed_probe_reader();
     if out.encrypted {
         if let Some(password) = password {
             if let Some(proof) = crate::password::rar::probe_header_encrypted_terminal(
@@ -1330,6 +1333,7 @@ pub(crate) fn upgrade_relation_rar_end_reader(
             if cursor.checked_add(7).is_none_or(|end| end > reader.len()) {
                 break;
             }
+            reader.hint_probe_window(cursor);
             let mut header = reader.read_at(cursor, 7)?;
             if header.len() != 7 {
                 break;

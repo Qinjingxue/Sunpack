@@ -83,3 +83,28 @@ def test_archive_task_accepts_paired_discovery_segments():
     assert len(segments) == 1
     assert segments[0]["archive_input"]["parts"][0]["start"] == 128
     assert task.inputs[0].evidence == evidence
+
+
+def test_path_mapping_moves_each_input_once_and_preserves_the_shared_plan(tmp_path):
+    # Promotion can move a file into another source's old path. Ordinary
+    # disjoint mappings cannot expose applying that move twice to a shared node.
+    first, second, moved = (str(tmp_path / name) for name in ("first", "second", "moved"))
+    descriptor = ArchiveInputDescriptor(
+        first, open_mode="native_volumes", format_hint="rar", volume_style="rar_part",
+        parts=[
+            ArchiveInputPart(InputExtent(first, 37, 512), volume_number=1, canonical_name="a.part1.rar"),
+            ArchiveInputPart(InputExtent(second, 0, 256), volume_number=2, canonical_name="a.part2.rar"),
+        ],
+    )
+    task = ArchiveTask.from_archive_input(descriptor, discovery_source="relations")
+    task.password_probe_input = descriptor
+    identity = task.inputs[0].input_id
+
+    task.apply_path_mapping({first: second, second: moved})
+
+    assert task.inputs[0].input_id == identity
+    assert task.inputs[0].descriptor is task.archive_input()
+    assert task.password_probe_input is task.archive_input()
+    assert task.inputs[0].source_paths == (second, moved)
+    assert task.inputs[0].descriptor.primary_extent == InputExtent(second, 37, 512)
+    assert set(task.cleanup_parts) == {second, moved}

@@ -25,7 +25,6 @@ class LogicalArchiveInput:
     position: int = 1
     evidence: dict[str, Any] = field(default_factory=dict, compare=False)
     failure: FailureInfo | None = None
-    probe_input: ArchiveInputDescriptor | None = None
     password: str | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -51,8 +50,7 @@ class LogicalArchiveInput:
         return str(self.descriptor.analysis.get("volume_completeness") or "unknown")
 
     def remap(self, mapper) -> LogicalArchiveInput:
-        return replace(self, descriptor=self.descriptor.with_path_mapping(mapper),
-                       probe_input=self.probe_input.with_path_mapping(mapper) if self.probe_input else None)
+        return replace(self, descriptor=self.descriptor.with_path_mapping(mapper))
 
     def projection(self) -> dict[str, Any]:
         """Reporting boundary; no consumer should reconstruct the plan from it."""
