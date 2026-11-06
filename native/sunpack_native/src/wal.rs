@@ -97,7 +97,8 @@ pub(crate) fn decode<T: DeserializeOwned>(bytes: &[u8]) -> io::Result<T> {
     Ok(value)
 }
 
-/// Reuses one payload buffer. Only an incomplete final frame may be discarded.
+/// Reuses one input buffer; payloads spill through Spool. Only an incomplete
+/// final frame may be discarded.
 pub(crate) struct Reader<R> {
     input: BufReader<R>,
     end: u64,
@@ -109,7 +110,7 @@ impl<R: Read + Seek> Reader<R> {
     pub fn new(mut input: R, kind: Kind) -> io::Result<Self> {
         let end = input.seek(SeekFrom::End(0))?;
         input.rewind()?;
-        let mut input = BufReader::new(input);
+        let mut input = BufReader::with_capacity(end.min(BUFFER_BYTES as u64) as usize, input);
         let mut header = [0; 16];
         let available = end.min(FILE_HEADER_BYTES) as usize;
         input.read_exact(&mut header[..available])?;
@@ -125,13 +126,15 @@ impl<R: Read + Seek> Reader<R> {
         })
     }
     pub fn next(&mut self) -> io::Result<Option<u64>> {
+        // The caller consumed the previous transaction. Release its allocation
+        // or mapping before building another, including on EOF and failure.
+        self.payload = Vec::new().into();
         if self.torn || self.valid_end == self.end {
             return Ok(None);
         }
         let mut cursor = self.valid_end;
         let mut payload = Spool::default();
         let mut sequence = None;
-        let mut buffer = vec![0; BUFFER_BYTES];
         loop {
             if self.end - cursor < FRAME_HEADER_BYTES as u64 {
                 self.torn = true;
@@ -155,10 +158,17 @@ impl<R: Read + Seek> Reader<R> {
             hash.update(&header[..12]);
             let mut remaining = len;
             while remaining > 0 {
+                let buffer = self.input.fill_buf()?;
+                if buffer.is_empty() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "failed to fill whole buffer",
+                    ));
+                }
                 let take = remaining.min(buffer.len());
-                self.input.read_exact(&mut buffer[..take])?;
                 hash.update(&buffer[..take]);
                 payload.write_all(&buffer[..take])?;
+                self.input.consume(take);
                 remaining -= take;
             }
             if hash.finalize() != u32::from_le_bytes(header[12..].try_into().unwrap()) {
@@ -312,6 +322,46 @@ mod tests {
             .unwrap()
             .next()
             .is_err());
+    }
+
+    // Existing envelope tests use single-frame transactions. This covers
+    // spilled, fragmented replay followed by small records, plus transaction
+    // atomicity and payload release on EOF, a torn tail or corruption.
+    #[test]
+    fn fragmented_replay_releases_consumed_payload_and_commits_only_complete_transactions() {
+        let mut bytes = file_header(Kind::TaskWal).to_vec();
+        append_frame(&mut bytes, 1, |out| out.write_all(b"first")).unwrap();
+        let first_end = bytes.len();
+        let large = vec![0x5a; crate::io::scratch::MEMORY_BYTES + 17];
+        append_frame(&mut bytes, 2, |out| out.write_all(&large)).unwrap();
+        let large_end = bytes.len();
+        append_frame(&mut bytes, 3, |out| out.write_all(b"last")).unwrap();
+
+        let mut reader = Reader::new(Cursor::new(&bytes), Kind::TaskWal).unwrap();
+        assert_eq!(reader.next().unwrap(), Some(1));
+        assert_eq!(&*reader.payload, b"first");
+        assert_eq!(reader.next().unwrap(), Some(2));
+        assert_eq!(&*reader.payload, large.as_slice());
+        assert_eq!(reader.next().unwrap(), Some(3));
+        assert_eq!(&*reader.payload, b"last");
+        assert_eq!(reader.next().unwrap(), None);
+        assert!(reader.payload.is_empty());
+        assert!(!reader.torn);
+        assert_eq!(reader.valid_end, bytes.len() as u64);
+
+        let mut torn = Reader::new(Cursor::new(&bytes[..large_end - 1]), Kind::TaskWal).unwrap();
+        assert_eq!(torn.next().unwrap(), Some(1));
+        assert_eq!(torn.next().unwrap(), None);
+        assert!(torn.torn);
+        assert!(torn.payload.is_empty());
+        assert_eq!(torn.valid_end, first_end as u64);
+
+        bytes[large_end - 1] ^= 1;
+        let mut corrupt = Reader::new(Cursor::new(&bytes), Kind::TaskWal).unwrap();
+        assert_eq!(corrupt.next().unwrap(), Some(1));
+        assert!(corrupt.next().is_err());
+        assert!(corrupt.payload.is_empty());
+        assert_eq!(corrupt.valid_end, first_end as u64);
     }
 
     // No existing test checks checksum coverage of snapshot sequence metadata,
