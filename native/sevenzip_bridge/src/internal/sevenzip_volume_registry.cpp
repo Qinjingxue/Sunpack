@@ -11,26 +11,17 @@
 namespace sunpack::sevenzip
 {
 
-    namespace
-    {
-
-        const VolumeStatePtr &empty_volume_state() noexcept
-        {
-            static const VolumeStatePtr empty;
-            return empty;
-        }
-
-    } // namespace
-
     const VolumeStatePtr &VolumeWriterRegistry::Lease::empty_state() noexcept
     {
-        return empty_volume_state();
+        static const VolumeStatePtr empty;
+        return empty;
     }
 
     void VolumeWriterRegistry::Lease::reset() noexcept
     {
         VolumeWriterRegistry *registry = registry_;
         registry_ = nullptr;
+        created_facility_ = false;
         if (registry != nullptr && writer_)
         {
             registry->release(writer_->volume_key());
@@ -54,14 +45,15 @@ namespace sunpack::sevenzip
         {
             std::lock_guard<std::mutex> lock(mutex_);
             auto found = entries_.find(key);
+            // Publish a new volume only after its facility is fully constructed.
+            // Failed construction otherwise leaves an entry with no reap deadline.
+            Entry pending;
+            Entry &entry = found == entries_.end() ? pending : found->second;
             if (found == entries_.end())
             {
                 const bool persistent = !key.empty() && key.rfind("job:", 0) != 0;
-                Entry entry;
                 entry.state = make_volume_state(key, persistent);
-                found = entries_.emplace(key, std::move(entry)).first;
             }
-            Entry &entry = found->second;
 
             // gate 懒创建且只在这里注入 sink，已有 entry 的 gate 绝不重设；
             // 功能关闭或空 key 时必须保持 nullptr，让空间判定短路。
@@ -97,9 +89,12 @@ namespace sunpack::sevenzip
                 created = true;
             }
             ++entry.leases;
-            entry.idle_since = std::chrono::steady_clock::time_point{};
             entry.reap_deadline = std::chrono::steady_clock::time_point{};
             writer = entry.writer;
+            if (found == entries_.end())
+            {
+                entries_.emplace(key, std::move(pending));
+            }
         }
         Lease lease(this, std::move(writer));
         lease.created_facility_ = created;
@@ -108,7 +103,6 @@ namespace sunpack::sevenzip
 
     void VolumeWriterRegistry::release(const std::string &key) noexcept
     {
-        std::shared_ptr<AsyncFileWriter> retired;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             auto found = entries_.find(key);
@@ -123,20 +117,19 @@ namespace sunpack::sevenzip
             }
             if (entry.leases == 0)
             {
-                entry.idle_since = std::chrono::steady_clock::now();
+                const auto now = std::chrono::steady_clock::now();
                 if (entry.state && entry.state->persistent)
                 {
                     entry.reap_deadline = config_.idle_timeout > std::chrono::milliseconds::zero()
-                                              ? entry.idle_since + config_.idle_timeout
+                                              ? now + config_.idle_timeout
                                               : std::chrono::steady_clock::time_point{};
                 }
                 else
                 {
-                    entry.reap_deadline = entry.idle_since;
+                    entry.reap_deadline = now;
                 }
             }
         }
-        (void)retired;
     }
 
     VolumeWriterRegistry::Aggregate VolumeWriterRegistry::snapshot() const
@@ -189,8 +182,6 @@ namespace sunpack::sevenzip
                 retired.push_back(std::move(entry.writer));
                 if (entry.state && entry.state->persistent)
                 {
-                    entry.writer.reset();
-                    entry.idle_since = std::chrono::steady_clock::time_point{};
                     entry.reap_deadline = std::chrono::steady_clock::time_point{};
                     ++it;
                 }
@@ -343,7 +334,6 @@ namespace sunpack::sevenzip
         std::vector<std::shared_ptr<AsyncFileWriter>> writers;
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            stopping_ = true;
             for (auto &item : entries_)
             {
                 if (item.second.writer)

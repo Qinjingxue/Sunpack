@@ -13,6 +13,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace sunpack::sevenzip
@@ -32,19 +33,18 @@ namespace sunpack::sevenzip
             Lease &operator=(const Lease &) = delete;
 
             Lease(Lease &&other) noexcept
-                : registry_(other.registry_), writer_(std::move(other.writer_))
-            {
-                other.registry_ = nullptr;
-            }
+                : registry_(std::exchange(other.registry_, nullptr)),
+                  writer_(std::move(other.writer_)),
+                  created_facility_(std::exchange(other.created_facility_, false)) {}
 
             Lease &operator=(Lease &&other) noexcept
             {
                 if (this != &other)
                 {
                     reset();
-                    registry_ = other.registry_;
+                    registry_ = std::exchange(other.registry_, nullptr);
                     writer_ = std::move(other.writer_);
-                    other.registry_ = nullptr;
+                    created_facility_ = std::exchange(other.created_facility_, false);
                 }
                 return *this;
             }
@@ -119,7 +119,6 @@ namespace sunpack::sevenzip
             VolumeStatePtr state;
             std::shared_ptr<AsyncFileWriter> writer;
             std::size_t leases = 0;
-            std::chrono::steady_clock::time_point idle_since{};
             std::chrono::steady_clock::time_point reap_deadline{};
         };
 
@@ -132,7 +131,6 @@ namespace sunpack::sevenzip
         mutable std::mutex mutex_;
         std::unordered_map<std::string, Entry> entries_;
         std::size_t reclaimed_count_ = 0;
-        bool stopping_ = false;
     };
 
     using VolumeWriterRegistryPtr = std::shared_ptr<VolumeWriterRegistry>;

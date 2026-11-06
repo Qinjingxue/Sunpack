@@ -19,9 +19,15 @@
 // to drain real operations. Normal tests never exercise allocation failure in
 // sealing/shutdown; this detects stranded staging buffers without an OOM load.
 thread_local bool reject_cleanup_allocations = false;
+thread_local std::ptrdiff_t fail_allocation_after = -1;
 
 void* operator new(std::size_t size) {
     if (reject_cleanup_allocations) throw std::bad_alloc();
+    if (fail_allocation_after == 0) {
+        fail_allocation_after = -1;
+        throw std::bad_alloc();
+    }
+    if (fail_allocation_after > 0) --fail_allocation_after;
     if (void* result = std::malloc(size ? size : 1)) return result;
     throw std::bad_alloc();
 }
@@ -523,8 +529,14 @@ bool registry_routes_by_volume_and_releases_leases(const std::filesystem::path& 
     // Same key -> same facility; different key -> different facility.
     AsyncFileWriter* first = nullptr;
     {
-        auto lease = registry.acquire("volume-a");
-        if (!lease.valid() || lease.writer().volume_key() != "volume-a") {
+        auto original = registry.acquire("volume-a");
+        auto moved = std::move(original);
+        VolumeWriterRegistry::Lease lease;
+        lease = std::move(moved);
+        if (!lease.valid() || !lease.created_facility() ||
+            original.valid() || original.created_facility() ||
+            moved.valid() || moved.created_facility() ||
+            lease.writer().volume_key() != "volume-a") {
             std::cerr << "registry did not route volume-a\n";
             return false;
         }
@@ -609,6 +621,38 @@ bool registry_routes_by_volume_and_releases_leases(const std::filesystem::path& 
     }
     registry.shutdown();
     return true;
+}
+
+// Failure after inserting a volume used to leave an entry with no writer and
+// no reap deadline. Walk allocation failures through real construction; normal
+// success/reclamation tests cannot expose these permanently retained entries.
+bool registry_creation_failure_does_not_retain_entries() {
+    AsyncWriterConfig config;
+    config.threads_per_volume = 1;
+    config.buffer_count = 4;
+    config.space_gate_enabled = true;
+    VolumeWriterRegistry registry(std::make_shared<WriterMeters>(), config);
+    const std::string key = "job:failed";
+    for (std::ptrdiff_t point = 0;; ++point) {
+        VolumeWriterRegistry::Lease lease;
+        bool failed = false;
+        fail_allocation_after = point;
+        try {
+            lease = registry.acquire(key);
+        } catch (const std::bad_alloc&) {
+            failed = true;
+        }
+        fail_allocation_after = -1;
+        if (!failed) {
+            if (!lease.valid() || !lease.created_facility()) return false;
+            lease.reset();
+            return registry.reap_idle().size() == 1 && registry.empty();
+        }
+        if (!registry.empty() || registry.next_reap_deadline()) {
+            std::cerr << "failed facility creation retained a volume at allocation " << point << "\n";
+            return false;
+        }
+    }
 }
 
 // Ordinary extraction and facility expiry do not test pressure reclamation
@@ -764,6 +808,7 @@ int main() {
         meters_separate_volumes_but_share_the_global_sink(directory) &&
         quiescence_tracks_jobs_and_files(directory) &&
         configuration_is_snapshotted_not_reread(directory) &&
+        registry_creation_failure_does_not_retain_entries() &&
         registry_routes_by_volume_and_releases_leases(directory) &&
         registry_reclaims_aggregate_small_pools(directory) &&
         registry_reclaims_idle_facilities(directory);
