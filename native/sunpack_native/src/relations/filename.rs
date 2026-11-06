@@ -1,5 +1,6 @@
 use super::{first_dot_stem, logical_name_from_parsed, parse_volume_candidates, ParsedVolume};
 use crate::path_keys::case_key;
+use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
 pub(super) struct NumberOccurrence {
@@ -7,7 +8,7 @@ pub(super) struct NumberOccurrence {
     pub width: usize,
     pub left: String,
     pub right: String,
-    pub seven_zip_literal: bool,
+    pub ordinal: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -17,12 +18,6 @@ pub(super) struct NameFeatures {
 }
 
 impl NameFeatures {
-    pub fn has_number_channel(&self, format: &str) -> bool {
-        self.numbers
-            .iter()
-            .any(|n| !(format == "7z" && n.seven_zip_literal))
-    }
-
     pub fn parse(name: &str) -> Self {
         let lower = name.to_ascii_lowercase();
         let suffix = lower
@@ -30,6 +25,7 @@ impl NameFeatures {
             .map_or(lower.as_str(), |(_, suffix)| suffix);
         let bytes = suffix.as_bytes();
         let mut numbers = Vec::new();
+        let mut ordinals = HashMap::new();
         let mut cursor = 0;
         while cursor < bytes.len() {
             if !bytes[cursor].is_ascii_digit() {
@@ -53,19 +49,17 @@ impl NameFeatures {
                 .iter()
                 .position(|b| !b.is_ascii_alphabetic())
                 .map_or(bytes.len(), |i| cursor + i);
+            let left = &suffix[left_start..start];
+            let right = &suffix[cursor..right_end];
+            let ordinal = ordinals.entry((left, right)).or_insert(0usize);
             numbers.push(NumberOccurrence {
                 value,
                 width: cursor - start,
-                left: suffix[left_start..start].to_owned(),
-                right: suffix[cursor..right_end].to_owned(),
-                seven_zip_literal: value == 7
-                    && cursor == start + 1
-                    && bytes.get(cursor) == Some(&b'z')
-                    && (start == 0 || !bytes[start - 1].is_ascii_alphanumeric())
-                    && bytes
-                        .get(cursor + 1)
-                        .is_none_or(|b| !b.is_ascii_alphanumeric()),
+                left: left.to_owned(),
+                right: right.to_owned(),
+                ordinal: *ordinal,
             });
+            *ordinal += 1;
         }
         Self {
             numbers,
@@ -79,6 +73,58 @@ impl NameFeatures {
             .find(|p| p.family == format)
             .map(logical_name_from_parsed)
             .map(|s| case_key(&s))
+    }
+}
+
+/// Family-local fixed fields. Borrows the cached, unmodified filename facts;
+/// watch membership changes and password retries must rebuild this small view.
+/// One pass over numeric occurrences; no substring comparisons or name copies.
+pub(super) struct NameProfile<'a> {
+    fields: HashMap<(usize, &'a str, &'a str), (u32, bool, bool)>,
+}
+
+impl<'a> NameProfile<'a> {
+    pub fn new(names: impl Iterator<Item = &'a NameFeatures>) -> Self {
+        let mut fields = HashMap::new();
+        for name in names {
+            for n in &name.numbers {
+                fields
+                    .entry((n.ordinal, n.left.as_str(), n.right.as_str()))
+                    .and_modify(|(value, repeated, varied): &mut (u32, bool, bool)| {
+                        *repeated = true;
+                        *varied |= *value != n.value;
+                    })
+                    .or_insert((n.value, false, false));
+            }
+        }
+        Self { fields }
+    }
+
+    pub fn active(&self, n: &NumberOccurrence) -> bool {
+        self.active_field(n.ordinal, &n.left, &n.right)
+    }
+
+    fn active_field(&self, ordinal: usize, left: &str, right: &str) -> bool {
+        self.fields
+            .get(&(ordinal, left, right))
+            .is_none_or(|(_, repeated, varied)| !repeated || *varied)
+    }
+
+    pub fn number(&self, channel: &NumberChannel, name: &NameFeatures) -> Option<u32> {
+        let value = channel.number(name)?;
+        if let NumberChannel::Token {
+            ordinal,
+            left,
+            right,
+        } = channel
+        {
+            return self.active_field(*ordinal, left, right).then_some(value);
+        }
+        // Canonical and token channels share the same constant-field mask.
+        name.numbers
+            .iter()
+            .any(|n| n.value == value && self.active(n))
+            .then_some(value)
     }
 }
 
@@ -98,7 +144,7 @@ pub(super) enum NumberChannel {
 }
 
 impl NumberChannel {
-    pub fn number(&self, features: &NameFeatures, format: &str) -> Option<u32> {
+    pub fn number(&self, features: &NameFeatures) -> Option<u32> {
         match self {
             Self::RarPart => {
                 let mut found = features
@@ -130,31 +176,19 @@ impl NumberChannel {
                 ordinal,
                 left,
                 right,
-            } => {
-                let n = features
-                    .numbers
-                    .iter()
-                    .filter(|n| !(format == "7z" && n.seven_zip_literal))
-                    .nth(*ordinal)?;
-                (n.left == *left && n.right == *right && n.value > 0).then_some(n.value)
-            }
+            } => features.numbers.iter().find_map(|n| {
+                (n.ordinal == *ordinal && n.left == *left && n.right == *right && n.value > 0)
+                    .then_some(n.value)
+            }),
         }
     }
 
-    pub fn tokens<'a>(
-        features: &'a NameFeatures,
-        format: &'a str,
-    ) -> impl Iterator<Item = Self> + 'a {
-        features
-            .numbers
-            .iter()
-            .filter(move |n| !(format == "7z" && n.seven_zip_literal))
-            .enumerate()
-            .map(|(ordinal, n)| Self::Token {
-                ordinal,
-                left: n.left.clone(),
-                right: n.right.clone(),
-            })
+    pub fn tokens(features: &NameFeatures) -> impl Iterator<Item = Self> + '_ {
+        features.numbers.iter().map(|n| Self::Token {
+            ordinal: n.ordinal,
+            left: n.left.clone(),
+            right: n.right.clone(),
+        })
     }
 }
 

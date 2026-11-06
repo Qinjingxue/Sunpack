@@ -1,4 +1,4 @@
-use super::filename::{NameFeatures, NumberChannel};
+use super::filename::{NameFeatures, NameProfile, NumberChannel};
 use super::structural::{NumberingStyle, SfxRole, StructuralFacts, VolumeRole};
 use super::*;
 use std::collections::BTreeMap;
@@ -145,23 +145,125 @@ impl BucketView<'_> {
         mapping.slots.iter().all(|(&n, &i)| self.legal(i, n, end))
     }
 
+    fn name_terminal(&self, profile: &NameProfile<'_>) -> Option<u32> {
+        let mut terminal = None;
+        for &i in &self.indexes {
+            if self.facts[&i].has_next != Some(false) {
+                continue;
+            }
+            let mut numbers = self
+                .features
+                .get(&i)?
+                .numbers
+                .iter()
+                .filter(|n| n.value > 0 && profile.active(n));
+            let value = numbers.next()?.value;
+            if numbers.any(|n| n.value != value) || terminal.is_some_and(|old| old != value) {
+                return None;
+            }
+            terminal = Some(value);
+        }
+        terminal
+    }
+
+    /// Only raw chunks may use sparse filename labels as relative order.
+    /// Internal RAR/ZIP identities remain fixed. Work on the sparse ordered map,
+    /// never enumerate 1..largest_label or try permutations of bucket members.
+    fn finish_mapping(&self, mut mapping: VolumeAssignment) -> Option<VolumeAssignment> {
+        if !self.mapping_roles_legal(&mapping) {
+            return None;
+        }
+        if self.complete(&mapping)
+            || !(self.format == "7z" || (self.format == "zip" && !self.spanned()))
+            || mapping.unresolved.iter().any(|i| self.facts[i].owned)
+        {
+            return Some(mapping);
+        }
+        if mapping
+            .slots
+            .keys()
+            .copied()
+            .zip(1u32..)
+            .all(|(label, rank)| label == rank)
+        {
+            return Some(mapping);
+        }
+        let mut compact = BTreeMap::new();
+        for (&i, rank) in mapping.slots.values().zip(1u32..) {
+            if self.facts[&i].exact_slot.is_some_and(|slot| slot != rank) {
+                return Some(mapping);
+            }
+            compact.insert(rank, i);
+        }
+        // A raw ZIP's directory offsets are logical, while its tail facts are
+        // physical. Missing chunks must not become complete merely by renaming.
+        if self.format == "zip" {
+            let Some((&last, &i)) = compact.last_key_value() else {
+                return Some(mapping);
+            };
+            let Some(tail) = self.rows[i].anchor.as_ref() else {
+                return Some(mapping);
+            };
+            let Some(directory) = tail.zip_directory.as_ref() else {
+                return Some(mapping);
+            };
+            let prefix = compact.range(..last).try_fold(0u64, |sum, (_, &i)| {
+                let a = self.rows[i].anchor.as_ref()?;
+                sum.checked_add(a.size.checked_sub(a.structure_offset.unwrap_or(0))?)
+            });
+            let logical_end = prefix.and_then(|prefix| {
+                prefix.checked_add(
+                    tail.zip_eocd_offset?
+                        .checked_sub(tail.structure_offset.unwrap_or(0))?,
+                )
+            });
+            if !directory
+                .offset
+                .checked_add(directory.size)
+                .zip(logical_end)
+                .is_some_and(|(end, available)| end <= available)
+            {
+                return Some(mapping);
+            }
+        }
+        let labels = std::mem::replace(&mut mapping.slots, compact);
+        if !self.mapping_roles_legal(&mapping) || !self.complete(&mapping) {
+            mapping.slots = labels;
+        }
+        Some(mapping)
+    }
+
     fn evaluate(
         &self,
         fixed: &VolumeAssignment,
         structural: &VolumeAssignment,
         channel: &NumberChannel,
         generic: bool,
+        profile: &NameProfile<'_>,
     ) -> Option<VolumeAssignment> {
         let mut out = fixed.clone();
         out.unresolved.clear();
-        let terminal = self.terminal_for_assignment(fixed);
+        // Bound the candidate before inserting optional files. A terminal whose
+        // slot is inferred by this channel still excludes same-channel noise.
+        let terminal = self.terminal_for_assignment(fixed).or_else(|| {
+            self.indexes
+                .iter()
+                .filter(|i| self.facts[i].has_next == Some(false))
+                .filter_map(|i| {
+                    self.features
+                        .get(i)
+                        .and_then(|f| profile.number(channel, f))
+                })
+                .min()
+        });
         if generic {
             for (&n, &i) in &structural.slots {
                 if let Some(features) = self.features.get(&i) {
-                    // Unnumbered structural terminals do not nominate a
-                    // channel; every numbered structural anchor constrains it.
-                    if features.has_number_channel(self.format)
-                        && channel.number(features, self.format) != Some(n)
+                    // Only matching fields constrain this channel. Other
+                    // filename fields cannot override a structural identity.
+                    if profile
+                        .number(channel, features)
+                        .is_some_and(|value| value != n)
                     {
                         return None;
                     }
@@ -172,7 +274,7 @@ impl BucketView<'_> {
                 if let Some(value) = self
                     .features
                     .get(&i)
-                    .and_then(|f| channel.number(f, self.format))
+                    .and_then(|f| profile.number(channel, f))
                 {
                     if value != n {
                         return None;
@@ -183,7 +285,7 @@ impl BucketView<'_> {
         let mut inferred = 0;
         for &i in &fixed.unresolved {
             let features = self.features.get(&i)?;
-            match channel.number(features, self.format) {
+            match profile.number(channel, features) {
                 Some(n) if self.legal(i, n, terminal) => {
                     if out.slots.insert(n, i).is_some() {
                         return None;
@@ -194,17 +296,23 @@ impl BucketView<'_> {
             }
         }
         // A channel that assigns nothing is not a successful hypothesis.
-        (inferred > 0 && self.mapping_roles_legal(&out)).then_some(out)
+        if inferred == 0 {
+            return None;
+        }
+        self.finish_mapping(out)
     }
 
     fn solve_loose_numeric(
         &self,
         fixed: &VolumeAssignment,
+        profile: &NameProfile<'_>,
     ) -> Result<VolumeAssignment, RelationFailureReason> {
         if !self.loose_numeric_allowed || !fixed.slots.contains_key(&1) {
             return Err(RelationFailureReason::MissingVolume);
         }
-        let terminal = self.terminal_for_assignment(fixed);
+        let terminal = self
+            .terminal_for_assignment(fixed)
+            .or_else(|| self.name_terminal(profile));
         // This is only a weak filename bound, never a new structural fact.
         // Missing huge slot numbers remain available in the stronger tiers.
         let maximum =
@@ -215,7 +323,7 @@ impl BucketView<'_> {
             if let Some(features) = self.features.get(&i) {
                 for n in &features.numbers {
                     if n.value <= maximum
-                        && !(self.format == "7z" && n.seven_zip_literal)
+                        && profile.active(n)
                         && !fixed.slots.contains_key(&n.value)
                         && self.legal(i, n.value, terminal)
                     {
@@ -234,10 +342,8 @@ impl BucketView<'_> {
         }
         let mut out = fixed.clone();
         numeric::solve(&mut out, domains)?;
-        if !self.mapping_roles_legal(&out) {
-            return Err(RelationFailureReason::StructuralConflict);
-        }
-        Ok(out)
+        self.finish_mapping(out)
+            .ok_or(RelationFailureReason::StructuralConflict)
     }
 
     fn solve(&self) -> (VolumeAssignment, Option<RelationFailureReason>) {
@@ -259,6 +365,7 @@ impl BucketView<'_> {
             return (fixed, None);
         }
         let structural = fixed.clone();
+        let profile = NameProfile::new(self.indexes.iter().filter_map(|i| self.features.get(i)));
         let numbering_style = self
             .indexes
             .iter()
@@ -303,30 +410,57 @@ impl BucketView<'_> {
         // each by every other anchor. K does not grow with bucket size.
         let seed = structural
             .slots
-            .values()
-            .chain(fixed.unresolved.iter())
-            .find_map(|i| {
-                self.features
-                    .get(i)
-                    .filter(|f| f.has_number_channel(self.format))
+            .iter()
+            .find_map(|(&slot, i)| {
+                self.features.get(i).filter(|f| {
+                    f.numbers
+                        .iter()
+                        .any(|n| n.value == slot && profile.active(n))
+                })
+            })
+            .or_else(|| {
+                if !structural.slots.contains_key(&1) {
+                    return None;
+                }
+                fixed.unresolved.iter().find_map(|i| {
+                    self.features
+                        .get(i)
+                        .filter(|f| f.numbers.iter().any(|n| n.value > 0 && profile.active(n)))
+                })
             });
         let tokens: HashSet<_> = seed
             .into_iter()
-            .flat_map(|f| NumberChannel::tokens(f, self.format))
+            .flat_map(|f| NumberChannel::tokens(f).filter(|c| profile.number(c, f).is_some()))
             .collect();
         for (channels, generic) in [(&canonical, false), (&tokens, true)] {
             let mut mapping: Option<VolumeAssignment> = None;
+            let mut complete = false;
+            let mut ambiguous = false;
             for channel in channels {
-                let Some(candidate) = self.evaluate(&fixed, &structural, channel, generic) else {
+                let Some(candidate) =
+                    self.evaluate(&fixed, &structural, channel, generic, &profile)
+                else {
                     continue;
                 };
-                if mapping
-                    .as_ref()
-                    .is_some_and(|old| old.slots != candidate.slots)
-                {
-                    return (fixed, Some(RelationFailureReason::AmbiguousVolumeMapping));
+                let candidate_complete = self.complete(&candidate);
+                if mapping.is_some() {
+                    if complete && !candidate_complete {
+                        continue;
+                    }
+                    if !complete && candidate_complete {
+                        ambiguous = false;
+                    } else if mapping
+                        .as_ref()
+                        .is_some_and(|old| old.slots != candidate.slots)
+                    {
+                        ambiguous = true;
+                    }
                 }
+                complete = candidate_complete;
                 mapping = Some(candidate);
+            }
+            if ambiguous {
+                return (fixed, Some(RelationFailureReason::AmbiguousVolumeMapping));
             }
             if let Some(mapping) = mapping {
                 fixed = mapping;
@@ -349,7 +483,7 @@ impl BucketView<'_> {
                 None,
             );
         }
-        match self.solve_loose_numeric(&fixed) {
+        match self.solve_loose_numeric(&fixed, &profile) {
             Ok(mapping) => (mapping, None),
             Err(reason) => (fixed, Some(reason)),
         }
@@ -1104,22 +1238,7 @@ mod tests {
     }
 
     #[test]
-    fn weak_numeric_seven_zip_literal_and_zero_are_not_slots() {
-        let mut rows = vec![
-            row("same.header1", "7z", Some(1), false),
-            row("same.7z.blob0", "", None, false),
-        ];
-        // Put 7 inside the weak domain so this checks literal exclusion,
-        // independently of the filename-bound filter.
-        for suffix in ['a', 'b', 'c', 'd', 'e', 'f'] {
-            rows.push(row(&format!("same.noise{suffix}"), "", None, false));
-        }
-        let groups = resolve(&rows);
-        assert_eq!(slots(&groups[0]), vec![1]);
-    }
-
-    #[test]
-    fn seven_zip_literal_is_a_legal_loose_number_for_other_formats() {
+    fn mixed_alphanumeric_fields_are_legal_loose_numbers() {
         let rows = vec![
             row("same.header1", "zip", Some(1), false),
             row("same.7z.blob0", "", None, false),
@@ -1168,17 +1287,6 @@ mod tests {
         let groups = resolve(&rows);
         assert_eq!(slots(&groups[0]), vec![1, 2, 3]);
         assert_eq!(groups[0].reason, None);
-    }
-
-    #[test]
-    fn seven_zip_literal_is_only_excluded_for_seven_zip() {
-        let f = NameFeatures::parse("same.7z.chunk7");
-        assert_eq!(NumberChannel::tokens(&f, "7z").count(), 1);
-        assert_eq!(NumberChannel::tokens(&f, "zip").count(), 2);
-        assert_eq!(NumberChannel::tokens(&f, "rar").count(), 2);
-        assert_eq!(NameFeatures::parse("same.foo2bar.chunk2").numbers.len(), 2);
-        assert_eq!(NameFeatures::parse("name2026.chunk2").numbers.len(), 1);
-        assert_eq!(NameFeatures::parse("name2026").numbers.len(), 1);
     }
 
     #[test]

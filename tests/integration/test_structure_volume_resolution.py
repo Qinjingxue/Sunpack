@@ -81,7 +81,7 @@ def test_mixed_camouflaged_real_volumes_are_structure_resolved_and_extractable(m
 @pytest.mark.parametrize("name_style", (
     "format_number", "number_only", "extensionless_head", "invalid_number_noise",
     "bare_format_head",
-    "context_free_numbers", "monotonic_filename_tiers",
+    "context_free_numbers", "monotonic_filename_tiers", "fixed_fields_sparse_labels",
 ))
 def test_first_dot_stem_and_loose_format_markers_resolve_real_volume_sets(
     tmp_path, archive_format, name_style
@@ -106,7 +106,14 @@ def test_first_dot_stem_and_loose_format_markers_resolve_real_volume_sets(
     originals = sorted(path for path in case.archive_dir.iterdir() if path.is_file())
     for index, source in enumerate(originals, start=1):
         number = _source_volume_number(source.name, index)
-        if name_style in {"context_free_numbers", "monotonic_filename_tiers"}:
+        if name_style == "fixed_fields_sparse_labels":
+            # Independent coverage: fixed numeric fields, whole numeric runs
+            # (1 versus 10), sparse labels and same-stem tail noise must work
+            # together through native discovery and real extraction. The other
+            # naming cases use consecutive labels and cannot detect this loss.
+            label = {1: 1, 2: 3, 3: 10, 4: 11}.get(number, number * 4)
+            target_name = f"shared.build2026.7z.chunk{label:03d}.bin"
+        elif name_style in {"context_free_numbers", "monotonic_filename_tiers"}:
             if number == 1:
                 target_name = "shared.header1"
             elif name_style == "monotonic_filename_tiers" and number == 2:
@@ -139,9 +146,16 @@ def test_first_dot_stem_and_loose_format_markers_resolve_real_volume_sets(
     renamed.sort(key=lambda item: item[0])
     first_path = str(renamed[0][1])
     all_paths = [str(path) for _number, path in renamed]
+    candidate_paths = list(all_paths)
+    if name_style == "fixed_fields_sparse_labels":
+        last_label = int(renamed[-1][1].name.split("chunk")[1].split(".")[0])
+        for name in (f"shared.chunk{last_label + 1}.junk", "shared.notes"):
+            noise = case.archive_dir / name
+            noise.write_text("unrelated same-stem file", encoding="utf-8")
+            candidate_paths.append(str(noise))
     group = scheduler.resolve_volume_once(
         [first_path],
-        all_paths,
+        candidate_paths,
         format_hint=archive_format,
     )
 
@@ -163,6 +177,13 @@ def test_first_dot_stem_and_loose_format_markers_resolve_real_volume_sets(
         extractor.close()
     assert result.success is True, result.error
     assert next(output.rglob(case.marker_name)).read_text(encoding="utf-8") == case.marker_text
+    if name_style == "fixed_fields_sparse_labels":
+        # The same ordering fallback must distinguish renamed complete data
+        # from a physically absent chunk, without adding another archive build.
+        renamed[1][1].unlink()
+        remaining = [path for path in candidate_paths if Path(path).is_file()]
+        incomplete = scheduler.resolve_volume_once([first_path], remaining, format_hint=archive_format)
+        assert incomplete is None or incomplete.head_metadata.get("volume_set_incomplete") is True
 
 
 @pytest.mark.parametrize("archive_format", ("7z", "zip"))
@@ -391,9 +412,10 @@ def test_structural_head_number_position_orders_real_opaque_members(tmp_path, ar
         if number == 0:
             source.rename(case.archive_dir / "shared.exe")
             continue
-        # All opaque middle volumes have a false part99 marker. Padding can
-        # change without changing the number position learned from the head.
-        token = str(number).zfill(2 if number % 2 else 3)
+        # Keep the false shared marker while exercising sparse labels with
+        # password/SFX continuation, using the existing archive builds.
+        label = number * 2 - 1 if password or sfx else number
+        token = str(label).zfill(2 if number % 2 else 3)
         target = case.archive_dir / f"shared.part99.chunk{token}.opaque"
         source.rename(target)
         paths.append((number, target))
@@ -502,7 +524,9 @@ def test_structural_seven_zip_terminal_excludes_an_extra_numeric_tail(tmp_path):
     extra = case.archive_dir / "shared.chunk999.opaque"
     sorted(other.archive_dir.iterdir())[-1].rename(extra)
     paths.append(str(extra))
-    group = RelationsScheduler().resolve_volume_once([paths[0]], paths, format_hint="7z")
+    near_extra = case.archive_dir / f"shared.chunk{len(paths)}.junk"
+    near_extra.write_text("unrelated next-number file", encoding="utf-8")
+    group = RelationsScheduler().resolve_volume_once([paths[0]], paths + [str(near_extra)], format_hint="7z")
     assert group is not None
     assert group.input_paths == paths[:-1]
     assert group.head_metadata.get("volume_set_incomplete") is not True

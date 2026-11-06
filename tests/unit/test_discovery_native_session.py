@@ -28,14 +28,16 @@ def test_independent_file_requests_keep_full_context_and_observe_disguised_volum
     Existing session tests reuse a static snapshot. They cannot catch an early
     name/depth filter or a cross-request cache hiding late/moved/replaced parts.
     One small real split ZIP covers these faults under concurrent requests.
+    Fixed numeric fields and sparse labels also expose group-local name facts
+    accidentally retained across the missing/complete/renamed generations.
     """
     packed = BytesIO()
     with zipfile.ZipFile(packed, "w", compression=zipfile.ZIP_STORED) as archive:
         archive.writestr("payload.txt", b"split payload" * 256)
     data = packed.getvalue()
     cut = len(data) // 2
-    first = tmp_path / "family.zip.001.photo"
-    second = tmp_path / "family.zip.002.opaque"
+    first = tmp_path / "family.build2026.7z.chunk001.photo"
+    second = tmp_path / "family.build2026.7z.chunk003.opaque"
     first.write_bytes(data[:cut])
     unrelated = tmp_path / "unrelated" / "deeper" / "different-stem.photo"
     unrelated.parent.mkdir(parents=True)
@@ -61,7 +63,7 @@ def test_independent_file_requests_keep_full_context_and_observe_disguised_volum
         rows = list(pool.map(discover, range(8)))
     assert all(candidate.archive_input.part_paths() == [str(first), str(second)] for candidate, _ in rows)
 
-    renamed = second.with_name("family.zip.002.changed")
+    renamed = second.with_name("family.build2026.7z.chunk003.changed")
     second.rename(renamed)
     moved, paths = discover()
     assert second not in paths and renamed in paths
