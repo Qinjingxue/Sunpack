@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from sunpack.core.contracts.results import ArchiveCleanupResult
 from sunpack.core.support.path_keys import absolute_path_key
@@ -17,16 +17,6 @@ class ReleaseRequest:
     @property
     def should_clean(self) -> bool:
         return bool(self.cleanup_paths)
-
-
-@dataclass
-class CleanupScopeResult:
-    """What one release or sweep actually did."""
-
-    released: tuple[str, ...] = ()
-    deleted: tuple[str, ...] = ()
-    failed: tuple[ArchiveCleanupResult, ...] = field(default_factory=tuple)
-    error: str = ""
 
 
 @dataclass(frozen=True)
@@ -56,7 +46,6 @@ def cleanup_paths_for(task) -> list[str]:
 class CleanupRefTable:
     def __init__(self) -> None:
         self._counts: dict[str, int] = {}
-        self._paths: dict[str, str] = {}
         self._owned: dict[int, tuple[object, str, tuple[str, ...], bool]] = {}
         #: A released unsuccessful owner vetoes deletion until all owners leave.
         self._preserved: set[str] = set()
@@ -71,18 +60,15 @@ class CleanupRefTable:
             return
         eligible = previous[3] if previous is not None else False
         old = {absolute_path_key(path) for path in previous[2]} if previous else set()
-        new = {absolute_path_key(path): path for path in paths}
+        new = {absolute_path_key(path) for path in paths}
         # A replacement detection plan may add volumes or reject old candidates.
         # Rejected paths are released without authorizing their deletion.
-        for key in old - new.keys():
+        for key in old - new:
             self._counts[key] -= 1
             if not self._counts[key]:
                 self._counts.pop(key)
-                self._paths.pop(key, None)
                 self._preserved.discard(key)
-        for key in new.keys() - old:
-            path = new[key]
-            self._paths.setdefault(key, path)
+        for key in new - old:
             self._counts[key] = self._counts.get(key, 0) + 1
         self._owned[owner] = (task, task_key, paths, eligible)
 
@@ -129,7 +115,6 @@ class CleanupRefTable:
                     self._preserved.add(key)
                 continue
             self._counts.pop(key, None)
-            self._paths.pop(key, None)
             zeroed.append(path)
             # The last owner may delete only if no earlier owner needs a retry.
             if eligible and key not in self._preserved:
@@ -150,7 +135,6 @@ class CleanupRefTable:
 
 __all__ = [
     "CleanupRefTable",
-    "CleanupScopeResult",
     "ReleaseOutcome",
     "ReleaseRequest",
     "cleanup_paths_for",

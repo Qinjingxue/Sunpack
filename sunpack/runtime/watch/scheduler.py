@@ -957,6 +957,11 @@ class WatchScheduler:
         finally:
             self.log.close()
             with self._claim_gate, self._lock:
+                # Shutdown has joined event producers. Drop their backrefs so
+                # a retired scheduler/service does not wait for cyclic GC.
+                self._wake_callback = None
+                self._watch_handler = None
+                self._clipboard_monitor.volume_changed = None
                 self._pending.clear()
                 self._pending_by_key.clear()
                 self._active_states.clear()
@@ -1213,6 +1218,19 @@ class WatchScheduler:
                 path,
             ),
         )
+        if len(self._ready_heap) > max(64, len(self._active_states) * 2):
+            # Later deadlines can accumulate behind an unchanged live head.
+            # Compact amortized from queued entries, never reschedule candidates
+            # whose admission already popped their deadline from the heap.
+            current = {}
+            for entry in self._ready_heap:
+                _, epoch, generation, key, path = entry
+                active = self._active_states.get(path)
+                if (active is not None and active.epoch == epoch
+                        and active.generation == generation and key not in self._inflight_path_counts):
+                    current[path] = entry
+            self._ready_heap = list(current.values())
+            heapq.heapify(self._ready_heap)
 
     def _next_ready_entry_locked(self) -> tuple[float, int, int, str, str] | None:
         while self._ready_heap:

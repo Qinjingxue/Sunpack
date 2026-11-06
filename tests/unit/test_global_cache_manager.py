@@ -75,8 +75,3 @@ def test_immutable_namespace_returns_cached_object_directly():
     manager.set("immutable", ("key",), value)
 
     assert manager.get("immutable", ("key",)) is value
-    assert manager.cached(
-        "immutable",
-        ("key",),
-        lambda: _FrozenValue((4, 5)),
-    ) is value

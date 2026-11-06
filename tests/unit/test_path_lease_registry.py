@@ -4,6 +4,11 @@ from types import SimpleNamespace
 from sunpack.pipeline.coordinator.engine import _PathLeaseRegistry, _RequestRuntime
 
 
+def _owned_paths(registry):
+    return {owner: {entry.path for entry in paths.values()}
+            for owner, paths in registry._lease_paths.items()}
+
+
 def test_stop_during_family_replacement_unregisters_only_its_waiter(tmp_path):
     # Split-request integration coalesces exact watch generations; it never
     # waits in replace. Removing this loses that separate upgrade path. One
@@ -30,7 +35,7 @@ def test_stop_during_family_replacement_unregisters_only_its_waiter(tmp_path):
         token.cancel()
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(waiter, 3)
-        assert registry._owned == {"owner": {path}}
+        assert _owned_paths(registry) == {"owner": {path}}
         assert not registry._waiter_blockers and not registry._waiters_by_blocker
         assert not token._callbacks
         await registry.release("owner")
@@ -52,7 +57,7 @@ def test_conflicting_path_lease_is_woken_by_release(tmp_path):
 
         await registry.release("first")
         await asyncio.wait_for(waiting, timeout=0.1)
-        assert registry._owned == {"second": {str(path)}}
+        assert _owned_paths(registry) == {"second": {str(path)}}
 
     asyncio.run(scenario())
 
@@ -70,7 +75,7 @@ def test_replacing_path_lease_notifies_waiters_for_released_paths(tmp_path):
 
         await registry.replace("first", (second_path,))
         await asyncio.wait_for(waiting, timeout=0.1)
-        assert registry._owned == {
+        assert _owned_paths(registry) == {
             "first": {str(second_path)},
             "second": {str(first_path)},
         }
@@ -102,7 +107,7 @@ def test_resolved_family_replace_cannot_deadlock_on_partial_owners(tmp_path):
         await registry.release(winner)
         await asyncio.wait_for(loser, timeout=0.1)
 
-        assert registry._owned in (
+        assert _owned_paths(registry) in (
             {"first": {str(first_part), str(second_part)}},
             {"second": {str(first_part), str(second_part)}},
         )
@@ -128,7 +133,7 @@ def test_watch_can_coalesce_exact_resolved_family_without_waiting(tmp_path):
 
         assert owner.owner_request_id == "first"
         assert owner.owner_task is task
-        assert registry._owned == {
+        assert _owned_paths(registry) == {
             "first": {str(first_part), str(second_part)},
         }
 
@@ -160,7 +165,7 @@ def test_watch_does_not_coalesce_newer_resolved_family_version(tmp_path):
         owner = await asyncio.wait_for(waiting, timeout=0.1)
 
         assert owner is None
-        assert registry._owned == {
+        assert _owned_paths(registry) == {
             "second": {str(first_part), str(second_part)},
         }
 
@@ -239,7 +244,7 @@ def test_directory_lease_blocks_descendants_and_descendant_blocks_parent(tmp_pat
 
         await registry.release("child")
         await asyncio.wait_for(waiting_directory, timeout=0.1)
-        assert registry._owned == {"directory": {str(root)}}
+        assert _owned_paths(registry) == {"directory": {str(root)}}
 
     asyncio.run(scenario())
 
@@ -302,7 +307,6 @@ def test_release_clears_path_lease_indexes(tmp_path):
 
         await registry.release("owner")
 
-        assert not registry._owned
         assert not registry._lease_paths
         assert not registry._exact_owners
         assert not registry._entries_by_key
@@ -324,7 +328,7 @@ def test_reacquiring_owned_path_reuses_snapshotted_path_facts(tmp_path):
         second = next(iter(registry._lease_paths["owner"].values()))
 
         assert second is first
-        assert registry._owned == {"owner": {str(path)}}
+        assert _owned_paths(registry) == {"owner": {str(path)}}
 
     asyncio.run(scenario())
 
@@ -349,7 +353,7 @@ def test_watch_requests_with_different_detection_modes_do_not_coalesce(tmp_path)
         )
         assert coalesced.owner_request_id == "deep"
         await registry.release("deep")
-        assert not registry._owner_modes
+        assert not registry._owner_generations
         assert not registry._generation_owners
 
     asyncio.run(scenario())
@@ -415,7 +419,7 @@ def test_upgrade_keeps_active_sibling_and_shared_prefix_protected(tmp_path):
         upgrade = asyncio.create_task(registry.acquire("A", [first, other], lease_id="retry"))
         directory = asyncio.create_task(registry.acquire("C", [str(root)]))
         await asyncio.sleep(0)
-        assert registry._owned["A"] == {sibling}
+        assert _owned_paths(registry)["A"] == {sibling}
         assert not upgrade.done()
         assert not directory.done()
 
@@ -424,7 +428,7 @@ def test_upgrade_keeps_active_sibling_and_shared_prefix_protected(tmp_path):
         await registry.release_lease("A", "retry")
         await asyncio.sleep(0)
         assert not directory.done()
-        assert registry._owned["A"] == {sibling}
+        assert _owned_paths(registry)["A"] == {sibling}
         await registry.release_lease("A", "sibling")
         await asyncio.wait_for(directory, timeout=1)
         await registry.release("C")

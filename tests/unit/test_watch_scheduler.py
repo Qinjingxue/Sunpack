@@ -888,6 +888,47 @@ def test_watch_pop_ready_uses_heap_without_pending_mapping_scan(monkeypatch):
     assert watcher._active_states == {}
 
 
+def test_watch_ready_index_compacts_event_bursts_without_losing_live_candidates(monkeypatch):
+    # Lazy head eviction cannot cover stale entries behind an earlier live
+    # deadline. One in-memory burst also checks recreation, inflight exclusion
+    # and duplicate rescheduling without adding filesystem or timing costs.
+    watcher = _claim_scheduler_for_test()
+    paths = [os.path.abspath(name) for name in ("early.blob", "busy.002", "recreated.part", "inflight")]
+    candidates = {path: WatchCandidate(path, 10, 1.0, "file", 1) for path in paths}
+    with watcher._lock:
+        for index, path in enumerate(paths):
+            state = watcher._new_active_state_locked(last_event_at=100.0 + index, quiet_seconds=5.0)
+            watcher._store_pending_locked(path, candidates[path])
+            watcher._active_states[path] = state
+            watcher._schedule_active_locked(path, state)
+        recreated = watcher._new_active_state_locked(last_event_at=500.0, quiet_seconds=5.0)
+        watcher._active_states[paths[2]] = recreated
+        watcher._schedule_active_locked(paths[2], recreated)
+        watcher._inflight_path_counts[watcher._scheduler_path_key(paths[3])] = 1
+        watcher._active_states = _NoItemsDict(watcher._active_states)
+        watcher._pending = _NoItemsDict(watcher._pending)
+        busy = watcher._active_states[paths[1]]
+        for index in range(512):
+            busy.last_event_at = 200.0 + index
+            busy.generation += 1
+            watcher._schedule_active_locked(paths[1], busy)
+            watcher._schedule_active_locked(paths[1], busy)
+        assert len(watcher._ready_heap) <= 64
+
+    watcher.state = SimpleNamespace(
+        record_attempt=lambda *args, **kwargs: None,
+        pending_work_for_path=lambda path: None,
+        forget_path=lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(scheduler_module, "_candidate_for_event_path", lambda path, **kwargs: candidates[path])
+    monkeypatch.setattr(scheduler_module, "watch_file_is_ready", lambda path: True)
+    assert watcher._pop_ready(105.0) == [candidates[paths[0]]]
+    assert watcher._pop_ready(505.0) == [candidates[paths[2]]]
+    assert watcher._pop_ready(716.0) == [candidates[paths[1]]]
+    assert watcher._next_ready_entry_locked() is None
+    assert set(watcher._pending) == {paths[3]}
+
+
 @pytest.mark.parametrize("failure_stage", ["rename", "observation", "attempt", "log"])
 def test_watch_ready_batch_survives_one_candidate_error(tmp_path, monkeypatch, failure_stage):
     root = tmp_path / "in"
@@ -1657,6 +1698,36 @@ def test_partial_result_does_not_self_retry_but_modified_epoch_does(tmp_path, mo
 
 def _observation_version(value):
     return (value.size, value.mtime, value.file_id, value.change_usn)
+
+
+def test_closed_scheduler_releases_callback_owners_without_cyclic_gc(tmp_path):
+    # Closing native stores does not reveal callbacks retaining the scheduler,
+    # its configuration and the service. One unstarted scheduler isolates this
+    # Python lifecycle without starting watch producers or extracting fixtures.
+    import gc
+
+    class WakeOwner:
+        def wake(self):
+            pass
+
+    async def scenario():
+        owner = WakeOwner()
+        watcher = _watcher(tmp_path, wake_callback=owner.wake)
+        watcher._watch_handler = scheduler_module._WatchEventHandler(watcher)
+        await watcher.aclose()
+        owner_ref = weakref.ref(owner)
+        del owner
+        assert owner_ref() is None
+        return weakref.ref(watcher)
+
+    enabled = gc.isenabled()
+    gc.disable()
+    try:
+        assert asyncio.run(scenario())() is None
+    finally:
+        if enabled:
+            gc.enable()
+
 
 def test_cancelled_harvest_and_close_wait_for_completion_callbacks(tmp_path):
     from sunpack.runtime.watch.journal_commit import journal_stats

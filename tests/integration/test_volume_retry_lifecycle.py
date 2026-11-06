@@ -97,7 +97,8 @@ def test_real_split_archive_retry_updates_cleanup_and_avoids_lease_cycle(tmp_pat
                     token.cancel()
                     response = await asyncio.wait_for(asyncio.shield(request), 5)
                     assert response.interrupted and not token._callbacks
-                    assert registry._owned == {"holder": {parts[1]}}
+                    assert {owner: {entry.path for entry in paths.values()}
+                            for owner, paths in registry._lease_paths.items()} == {"holder": {parts[1]}}
                     assert not registry._waiter_blockers
                     assert all(Path(path).exists() for path in parts)
                     return [response]

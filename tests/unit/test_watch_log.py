@@ -216,7 +216,14 @@ def test_throttle_expiry_preserves_live_limits_and_releases_bounded_history(tmp_
     for index in range(2100):
         store.write_throttled("ignored", throttle_key=str(index), interval_seconds=300)
     assert len(store._last_throttled_write) == 2048
-    now[0] = 700.0
+    # A successful rewrite with a shorter interval is now the newest entry.
+    # Capacity alone cannot detect premature eviction of that refreshed limit.
+    now[0] = 401.0
+    store.write_throttled("ignored", throttle_key="52", interval_seconds=0.5)
+    store.write_throttled("ignored", throttle_key="2100", interval_seconds=300)
+    assert ("ignored", "52") in store._last_throttled_write
+    assert ("ignored", "53") not in store._last_throttled_write
+    now[0] = 701.0
     store.clear_expired_history()
     assert not store._last_throttled_write
     assert store.next_history_expiry is None

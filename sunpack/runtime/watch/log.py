@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 import time
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Callable
 
@@ -22,7 +23,7 @@ class WatchLogStore:
         self.path = Path(path)
         self._native = NativeEventLog(str(self.path), max(1, int(retention_days)), self.path.name.lower() == "events.json")
         self._throttle_lock = threading.Lock()
-        self._last_throttled_write: dict[tuple[str, str], tuple[float, float]] = {}
+        self._last_throttled_write: OrderedDict[tuple[str, str], tuple[float, float]] = OrderedDict()
         self._next_throttle_expiry: float | None = None
         self._wake_callback = wake_callback
 
@@ -118,9 +119,9 @@ class WatchLogStore:
             if interval > 0.0:
                 expiry = now + interval
                 self._last_throttled_write[token] = (now, expiry)
+                self._last_throttled_write.move_to_end(token)
                 if len(self._last_throttled_write) > 2048:
-                    oldest = min(self._last_throttled_write, key=lambda key: self._last_throttled_write[key][0])
-                    del self._last_throttled_write[oldest]
+                    self._last_throttled_write.popitem(last=False)
                 if self._next_throttle_expiry is None or expiry < self._next_throttle_expiry:
                     self._next_throttle_expiry = expiry
                     wake_callback = self._wake_callback

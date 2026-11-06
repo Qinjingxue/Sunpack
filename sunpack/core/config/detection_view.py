@@ -1,9 +1,5 @@
 from typing import Any
 
-def detection_config(config: dict[str, Any]) -> dict[str, Any]:
-    return config["detection"]
-
-
 def filesystem_config(config: dict[str, Any]) -> dict[str, Any]:
     return config["filesystem"]
 

@@ -5,6 +5,43 @@ import asyncio
 from sunpack.pipeline.coordinator.engine import _RequestRuntime
 
 
+def test_closed_engine_releases_callback_owners_without_cyclic_gc(monkeypatch):
+    # Resource-cache tests inspect handles, not Python owner retention after
+    # close. Disabling cyclic GC exposes that separate lifecycle failure using
+    # one worker-free engine, without RSS measurements or timing assertions.
+    import gc
+    import weakref
+    import sunpack.pipeline.coordinator.engine as engine_module
+    from tests.helpers.config_factory import make_config
+
+    async def no_worker(*args):
+        pass
+
+    monkeypatch.setattr(engine_module._PipelineServices, "start", no_worker)
+    monkeypatch.setattr(engine_module._PipelineServices, "close", no_worker)
+
+    class Observer:
+        def changed(self):
+            pass
+
+    async def scenario():
+        observer = Observer()
+        async with engine_module.PipelineEngine(make_config()) as engine:
+            engine.set_state_changed_callback(observer.changed)
+        observer_ref = weakref.ref(observer)
+        del observer
+        assert observer_ref() is None
+        return weakref.ref(engine)
+
+    enabled = gc.isenabled()
+    gc.disable()
+    try:
+        assert asyncio.run(scenario())() is None
+    finally:
+        if enabled:
+            gc.enable()
+
+
 def test_batched_jobs_finish_independent_work_and_nested_batches_before_raising():
     """Cover admission beyond the queue budget with nested and failed jobs.
 

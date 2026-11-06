@@ -97,7 +97,6 @@ class PipelineEngine:
         # A supplied broker transfers ownership from the cold CLI runtime.
         self._broker = work_broker or new_work_broker(config)
         self._services = _PipelineServices(config, self._broker)
-        self._runtime = self._services
         self._active_requests: dict[str, asyncio.Task] = {}
         self._request_runtime_factory = _RequestRuntime
         self._path_leases = _PathLeaseRegistry(self._active_requests)
@@ -325,6 +324,8 @@ class PipelineEngine:
             )
         await self._services.close(self._broker)
         await self._broker.close(graceful=graceful)
+        self._broker.set_state_changed_callback(None)
+        self._state_changed_callback = None
         self._closed = True
         self._started = False
 
@@ -420,7 +421,6 @@ class _PathLeaseRegistry:
         # Share the engine's existing registry; never retain a second history
         # of requests or completed results here.
         self._active_requests = active_requests
-        self._owned: dict[str, set[str]] = {}
         self._lease_paths: dict[str, dict[str, _LeasePath]] = {}
         self._exact_owners: dict[str, str] = {}
         self._entries_by_key: dict[str, _LeasePath] = {}
@@ -428,8 +428,9 @@ class _PathLeaseRegistry:
         self._prefix_owners: dict[str, dict[str, int]] = {}
         self._pins: dict[str, dict[object, frozenset[str]]] = {}
         self._pin_counts: dict[str, dict[str, int]] = {}
-        self._ownership_versions: dict[str, tuple[tuple[str, int, int, int, int], ...]] = {}
-        self._owner_modes: dict[str, bool] = {}
+        self._owner_generations: dict[
+            str, tuple[tuple[tuple[str, int, int, int, int], ...], bool],
+        ] = {}
         self._generation_owners: dict[
             tuple[tuple[tuple[str, int, int, int, int], ...], bool],
             str,
@@ -729,12 +730,10 @@ class _PathLeaseRegistry:
         deep_detect: bool = False,
     ) -> None:
         owner_paths = self._lease_paths.setdefault(owner, {})
-        owned = self._owned.setdefault(owner, set())
         for path in paths:
             if path.key in owner_paths:
                 continue
             owner_paths[path.key] = path
-            owned.add(path.path)
             self._exact_owners[path.key] = owner
             self._entries_by_key[path.key] = path
 
@@ -747,25 +746,20 @@ class _PathLeaseRegistry:
                     owners[owner] = owners.get(owner, 0) + 1
 
         if ownership_version:
-            self._ownership_versions[owner] = ownership_version
-            self._owner_modes[owner] = deep_detect
-            self._generation_owners[(ownership_version, deep_detect)] = owner
+            generation = (ownership_version, deep_detect)
+            self._owner_generations[owner] = generation
+            self._generation_owners[generation] = owner
 
     def _remove_owner(self, owner: str) -> bool:
         removed = self._remove_paths(owner, tuple(self._lease_paths.get(owner, {})))
-        self._lease_paths.pop(owner, None)
-        owned = self._owned.pop(owner, None)
+        paths = self._lease_paths.pop(owner, None)
         self._pins.pop(owner, None)
         self._pin_counts.pop(owner, None)
-        ownership_version = self._ownership_versions.pop(owner, ())
-        mode = self._owner_modes.pop(owner, False)
-        if (
-            ownership_version
-            and self._generation_owners.get((ownership_version, mode)) == owner
-        ):
-            self._generation_owners.pop((ownership_version, mode), None)
+        generation = self._owner_generations.pop(owner, None)
+        if generation is not None and self._generation_owners.get(generation) == owner:
+            self._generation_owners.pop(generation, None)
 
-        return owned is not None or removed or bool(ownership_version)
+        return paths is not None or removed or generation is not None
 
     def _remove_paths(self, owner: str, keys: Iterable[str]) -> bool:
         paths = self._lease_paths.get(owner, {})
@@ -775,7 +769,6 @@ class _PathLeaseRegistry:
             if path is None:
                 continue
             removed = True
-            self._owned[owner].discard(path.path)
             if self._exact_owners.get(path.key) == owner:
                 self._exact_owners.pop(path.key, None)
                 self._entries_by_key.pop(path.key, None)

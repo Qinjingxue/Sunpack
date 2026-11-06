@@ -232,24 +232,9 @@ def _memory_info(process: psutil.Process) -> tuple[int, int]:
 
 def _cache_stats() -> dict[str, Any]:
     try:
-        from sunpack.core.support.global_cache_manager import GLOBAL_CACHE
+        from sunpack.core.support.global_cache_manager import global_cache_stats
 
-        with GLOBAL_CACHE._lock:
-            namespaces = {
-                str(namespace): len(cache)
-                for namespace, cache in GLOBAL_CACHE._caches.items()
-            }
-            capacities = {
-                str(namespace): int(
-                    GLOBAL_CACHE._capacities.get(namespace, GLOBAL_CACHE.default_capacity)
-                )
-                for namespace in GLOBAL_CACHE._caches
-            }
-        return {
-            "entries": int(sum(namespaces.values())),
-            "namespaces": namespaces,
-            "capacities": capacities,
-        }
+        return global_cache_stats()
     except (ImportError, AttributeError, TypeError):
         return {}
 
