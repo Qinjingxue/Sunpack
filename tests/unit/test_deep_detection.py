@@ -135,12 +135,6 @@ def test_default_embedded_scan_skips_confirmed_pe_before_full_scan(tmp_path, mon
     path.write_bytes(make_minimal_pe())
 
     monkeypatch.setattr(
-        "sunpack.pipeline.discovery.embedded.discovery.file_identity",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("confirmed PE gate must run before file probing")
-        ),
-    )
-    monkeypatch.setattr(
         "sunpack.pipeline.discovery.embedded.discovery.scan_embedded_archives",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
             AssertionError("confirmed PE gate must reject before full scan")
@@ -157,7 +151,7 @@ def test_default_embedded_scan_skips_confirmed_pe_before_full_scan(tmp_path, mon
     )
 
 
-def test_embedded_discovery_uses_current_identity_size_not_stale_candidate_size(tmp_path, monkeypatch):
+def test_embedded_discovery_uses_native_scan_size_not_stale_candidate_size(tmp_path, monkeypatch):
     path = tmp_path / "growing.gz"
     path.write_bytes(b"x" * 48)
     candidate = _candidate(path)
@@ -170,10 +164,8 @@ def test_embedded_discovery_uses_current_identity_size_not_stale_candidate_size(
     )
     observed = {}
 
-    def fake_scan(scan_path, *, expected_size=0, identity=None):
+    def fake_scan(scan_path):
         observed["path"] = scan_path
-        observed["expected_size"] = expected_size
-        observed["identity"] = identity
         return EmbeddedScanResult(
             complete=True,
             candidates=(),
@@ -186,18 +178,13 @@ def test_embedded_discovery_uses_current_identity_size_not_stale_candidate_size(
         )
 
     monkeypatch.setattr(
-        "sunpack.pipeline.discovery.embedded.discovery.file_identity",
-        lambda scan_path: (str(scan_path), 48, 123),
-    )
-    monkeypatch.setattr(
         "sunpack.pipeline.discovery.embedded.discovery.scan_embedded_archives",
         fake_scan,
     )
 
     EmbeddedDiscovery({}).discover([candidate])
 
-    assert observed["expected_size"] == 48
-    assert observed["identity"] == (str(path), 48, 123)
+    assert observed["path"] == str(path)
 
 
 def test_truncated_embedded_7z_is_reported_as_blocked_damage(tmp_path, monkeypatch):

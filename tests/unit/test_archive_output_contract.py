@@ -44,8 +44,11 @@ def test_file_directory_collisions_share_worker_and_manifest_names(tmp_path, arc
     output = tmp_path / "out"
     completed = subprocess.run(
         [get_sevenzip_bridge_worker_path()],
-        input=json.dumps({"job_id": "collision", "archive_path": str(archive),
-                          "output_dir": str(output), "format_hint": archive_format}),
+        input=json.dumps({
+            "job_id": "collision",
+            "archive_input": ArchiveInputDescriptor.from_parts(archive_path=str(archive), format_hint=archive_format).to_dict(),
+            "output_dir": str(output),
+        }),
         capture_output=True, text=True, encoding="utf-8", timeout=15,
         creationflags=subprocess.CREATE_NO_WINDOW,
     )

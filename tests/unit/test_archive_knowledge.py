@@ -2,7 +2,7 @@
 from sunpack.core.contracts.archive_knowledge import ArchiveKnowledge
 from tests.helpers.archive_tasks import make_archive_task
 from sunpack.core.support import archive_knowledge_projection as knowledge_view
-from sunpack.core.support.archive_knowledge_writer import commit_task_knowledge
+from sunpack.core.support.archive_knowledge_writer import commit_task_knowledge, write_evidence
 
 
 def test_archive_knowledge_namespace_merge_flags_and_roundtrip():
@@ -43,6 +43,33 @@ def test_archive_knowledge_exports_live_changes_without_aliasing():
     merged.get("analysis.rows")[0]["value"] = "detached"
     assert knowledge.get("analysis.rows") == [{"value": "current"}]
     assert len(merged.get("analysis.rows")) == 2
+
+
+def test_archive_knowledge_evidence_retention_and_detached_exports():
+    # Existing roundtrips never fill the history or mix its two writers; they
+    # cannot detect lost provenance, unbounded retention, or live export aliases.
+    knowledge = ArchiveKnowledge()
+    source = {"rows": list(range(60)), "stdout": "x" * 5000}
+    write_evidence(knowledge, path="initial", value=source, source_layer="analysis")
+    initial = knowledge.to_dict()
+    assert initial["_evidence"][0]["value"]["rows"] == [*range(50), {"truncated_count": 10}]
+    assert len(initial["_evidence"][0]["value"]["stdout"]) == 4000
+    source["rows"].clear()
+    for index in range(501):
+        if index % 2:
+            knowledge.set("analysis.latest", index, source_layer="analysis")
+        else:
+            write_evidence(knowledge, path="analysis.latest", value=index,
+                           source_layer="analysis", source_module="scan", confidence=0.8)
+    evidence = knowledge.get("_evidence")
+    assert len(evidence) == 500
+    assert [item["value"] for item in evidence] == list(range(1, 501))
+    assert evidence[-1]["provenance"]["source_module"] == "scan"
+    assert evidence[-1]["provenance"]["confidence"] == 0.8
+    assert len(initial["_evidence"]) == 1
+    exported = knowledge.to_dict()
+    exported["_evidence"][-1]["provenance"].clear()
+    assert evidence[-1]["provenance"]["source_layer"] == "analysis"
 
 
 def test_archive_knowledge_commit_revision_and_current_projections(tmp_path):

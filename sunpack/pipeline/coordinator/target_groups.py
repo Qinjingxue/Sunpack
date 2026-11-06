@@ -83,7 +83,7 @@ def build_candidates(
     relations: RelationsScheduler | None = None,
 ) -> list[DiscoveryCandidate]:
     scheduler = relations or RelationsScheduler()
-    snapshot = DirectoryScanner(directory, include_raw_snapshot=True).scan()
+    snapshot = DirectoryScanner(directory).scan()
     return build_candidates_from_snapshot(snapshot, scheduler)
 
 

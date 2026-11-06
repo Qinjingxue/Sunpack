@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from itertools import chain, islice
 from typing import Any
 
 from sunpack.core.support.json_values import jsonable_value as _jsonable
@@ -123,12 +124,15 @@ class ArchiveKnowledge:
         return _jsonable(value) if isinstance(value, dict) else {}
 
     def add_evidence(self, path: str, value: Any, *, provenance: dict[str, Any] | None = None) -> "ArchiveKnowledge":
-        evidence = list(self.data.setdefault("_evidence", []))
+        evidence = self.data.get("_evidence")
+        if not isinstance(evidence, list):
+            evidence = self.data["_evidence"] = []
         item = {"path": str(path), "value": compact_evidence_value(value)}
         if provenance:
             item["provenance"] = _jsonable(provenance)
         evidence.append(item)
-        self.data["_evidence"] = evidence[-500:]
+        if len(evidence) > 500:
+            del evidence[:-500]
         return self
 
     def history(self, namespace: str = "") -> list[dict[str, Any]]:
@@ -191,7 +195,7 @@ def _deep_merge(target: dict[str, Any], source: dict[str, Any]) -> dict[str, Any
 def _merge_lists(left: list[Any], right: list[Any]) -> list[Any]:
     output: list[Any] = []
     seen: set[str] = set()
-    for item in [*left, *right]:
+    for item in chain(left, right):
         normalized = _jsonable(item)
         key = repr(normalized)
         if key in seen:
@@ -225,9 +229,8 @@ def compact_evidence_value(value: Any) -> Any:
                 output[text_key] = compact_evidence_value(item)
         return output
     if isinstance(value, (list, tuple, set)):
-        values = list(value)
-        compacted = [compact_evidence_value(item) for item in values[:50]]
-        if len(values) > 50:
-            compacted.append({"truncated_count": len(values) - 50})
+        compacted = [compact_evidence_value(item) for item in islice(value, 50)]
+        if len(value) > 50:
+            compacted.append({"truncated_count": len(value) - 50})
         return compacted
     return _jsonable(value)

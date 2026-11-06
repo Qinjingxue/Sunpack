@@ -16,10 +16,9 @@ from sunpack.pipeline.discovery.filesystem.filters.path_rule import PathRuleScan
 
 
 class DirectoryScanner:
-    def __init__(self, root_path: str, filters: list[ScanFilter] | None = None, config: dict | None = None, include_raw_snapshot: bool = False, scope: DiscoveryScope | None = None):
+    def __init__(self, root_path: str, filters: list[ScanFilter] | None = None, config: dict | None = None, scope: DiscoveryScope | None = None):
         self.root_path = Path(root_path)
         self.config = config or {}
-        self.include_raw_snapshot = include_raw_snapshot
         self._custom_filters = filters is not None
         self.scope = scope or DiscoveryScope(str(self.root_path))
         self.filters = list(filters) if filters is not None else build_filters(config)
@@ -60,7 +59,7 @@ class DirectoryScanner:
         config: dict | None = None,
     ) -> list[int]:
         scanner = cls(root_path, config=config)
-        options = scanner._native_inventory_filter_options()
+        options = scanner._native_filter_options()
         if options is None:
             return list(range(len(paths)))
         return list(_NATIVE_FILTER_INVENTORY_FILE_INDICES(
@@ -93,19 +92,13 @@ class DirectoryScanner:
         native_snapshot, raw_native_snapshot = inventory.build_directory_snapshots(scan_options)
         return DirectorySnapshot.from_native(Path(root_path), native_snapshot, raw_native_snapshot)
 
-    def _native_inventory_filter_options(self) -> dict | None:
-        return self._native_filter_options()
-
     def _scan_native(self) -> DirectorySnapshot | None:
-        options = self._native_scan_options()
+        options = self._native_filter_options()
         if options is None:
             raise RuntimeError("Native directory scan requires built-in filesystem filters only")
         native_snapshot, raw_native_snapshot = NativeDirectoryScanOptions(**options).scan_scope(self.scope.native)
         root_path = self.root_path.parent if self.root_path.is_file() else self.root_path
         return DirectorySnapshot.from_native(root_path, native_snapshot, raw_native_snapshot)
-
-    def _native_scan_options(self) -> dict | None:
-        return self._native_filter_options()
 
     def _native_filter_options(self) -> dict | None:
         if self._custom_filters:
@@ -171,11 +164,6 @@ class DirectoryScanner:
                 else apply_filter_to_entries(current, scan_filter, root_path=self.root_path)
             )
         return current
-
-    @staticmethod
-    def _under_any(path: Path, parents: list[Path]) -> bool:
-        return _under_any(path, parents)
-
 
 def apply_ordered_filters_to_entries(entries: list[FileEntry], filters: list[ScanFilter]) -> list[FileEntry]:
     if not filters:
@@ -271,16 +259,6 @@ def apply_filter_to_entries(
             continue
         kept.append(entry)
     return kept
-
-
-def _under_any(path: Path, parents: list[Path]) -> bool:
-    for parent in parents:
-        try:
-            path.relative_to(parent)
-        except ValueError:
-            continue
-        return path != parent
-    return False
 
 
 def _under_any_key(path: Path, parent_keys: set[str]) -> bool:

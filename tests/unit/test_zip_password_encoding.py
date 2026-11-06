@@ -6,6 +6,8 @@ import zlib
 
 import pytest
 
+from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
+
 from sunpack.core.passwords.verifier.zip_fast import ZipFastVerifier
 from sunpack.core.support.resources import get_sevenzip_bridge_worker_path
 
@@ -103,9 +105,8 @@ def test_worker_extracts_with_the_password_the_fast_verifier_accepts(tmp_path):
         input=json.dumps(
             {
                 "job_id": "gbk-password",
-                "archive_path": str(archive),
+                "archive_input": ArchiveInputDescriptor.from_parts(archive_path=str(archive), format_hint="zip").to_dict(),
                 "output_dir": str(out_dir),
-                "format_hint": "zip",
                 "password": PASSWORD,
             },
             ensure_ascii=False,

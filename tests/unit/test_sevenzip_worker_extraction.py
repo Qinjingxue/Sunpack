@@ -16,7 +16,7 @@ import zipfile
 
 import pytest
 
-from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
+from sunpack.core.contracts.archive_input import ArchiveInputDescriptor, ArchiveInputPart, InputExtent
 from sunpack.core.contracts.failures import FailureKind
 from tests.helpers.archive_tasks import make_archive_task, make_task_from_descriptor
 from tests.helpers.worker_events import worker_trace_item
@@ -63,7 +63,10 @@ def test_lzfse_uncompressed_blocks_stop_before_next_header(tmp_path):
     write_single_method_zip(archive, payload, packed, 99)
     output = tmp_path / "out"
     result = _invoke_worker(_require_worker_or_skip(), {
-        "job_id": "lzfse", "archive_path": str(archive), "format_hint": "zip", "output_dir": str(output)})
+        "job_id": "lzfse",
+        "archive_input": ArchiveInputDescriptor.from_parts(archive_path=str(archive), format_hint="zip").to_dict(),
+        "output_dir": str(output),
+    })
     final = _worker_result(result.stdout)
     assert result.returncode == 0 and final["status"] == "ok", result.stdout + result.stderr
     assert (output / "payload.bin").read_bytes() == payload
@@ -109,8 +112,11 @@ def test_worker_resolves_hard_link_graph_and_rejects_invalid_targets(tmp_path, t
         source.update(open_mode="concat_ranges", ranges=[
             {"path": str(archive), "start": 0}, {"path": str(second), "start": 0}])
     output = tmp_path / "out"
-    result = _invoke_worker(worker, {"job_id": "links", "archive_path": str(archive), "archive_input": source,
-                                    "output_dir": str(output), "format_hint": "tar"})
+    result = _invoke_worker(worker, {
+        "job_id": "links",
+        "archive_input": source,
+        "output_dir": str(output),
+    })
     final = _worker_result(result.stdout)
     assert result.returncode == 0, result.stdout + result.stderr
     assert final["status"] == "ok" and final["verified_manifest"]["validated"]
@@ -135,8 +141,11 @@ def test_worker_resolves_hard_link_graph_and_rejects_invalid_targets(tmp_path, t
                 item = tarfile.TarInfo(name)
                 item.type, item.linkname = tarfile.LNKTYPE, target
                 handle.addfile(item)
-        result = _invoke_worker(worker, {"job_id": "bad-link", "archive_path": str(broken),
-                                        "output_dir": str(tmp_path / f"bad-{index}"), "format_hint": "tar"})
+        result = _invoke_worker(worker, {
+            "job_id": "bad-link",
+            "archive_input": ArchiveInputDescriptor.from_parts(archive_path=str(broken), format_hint="tar").to_dict(),
+            "output_dir": str(tmp_path / f"bad-{index}"),
+        })
         final = _worker_result(result.stdout)
         assert result.returncode != 0 and not final["verified_manifest"]["validated"]
         assert not archive_state_tar_manifest_native({'entry_path': str(broken)}).archive_walk_complete
@@ -312,8 +321,9 @@ def test_worker_preserves_archived_metadata_like_7z(tmp_path, archive_type):
         expected = {name: _file_times_ns(oracle / name) for name in expected}
     output = tmp_path / "output"
     result = _invoke_worker(worker, {
-        "job_id": "file-times", "archive_path": str(archive),
-        "output_dir": str(output), "format_hint": format_hint,
+        "job_id": "file-times",
+        "archive_input": ArchiveInputDescriptor.from_parts(archive_path=str(archive), format_hint=format_hint).to_dict(),
+        "output_dir": str(output),
     })
     final = _worker_result(result.stdout)
     assert result.returncode == 0, result.stdout + result.stderr
@@ -376,7 +386,10 @@ def test_worker_preserves_partial_or_missing_file_times(tmp_path, archive_type, 
     archive_mtime_ns = 1514764800765432100
     os.utime(archive, ns=(archive_mtime_ns, archive_mtime_ns))
     input_path = archive
-    descriptor = {}
+    descriptor = ArchiveInputDescriptor.from_parts(
+        archive_path=str(input_path),
+        format_hint="gzip" if archive_type.startswith("gzip") else archive_type.split("-")[0],
+    ).to_dict()
     if layout != "file":
         data = archive.read_bytes()
         input_path = tmp_path / "payload.disguised"
@@ -400,10 +413,9 @@ def test_worker_preserves_partial_or_missing_file_times(tmp_path, archive_type, 
     output = tmp_path / "output"
     started = time.time_ns()
     result = _invoke_worker(worker, {
-        "job_id": "partial-file-times", "archive_path": str(input_path),
+        "job_id": "partial-file-times",
         "output_dir": str(output),
         "archive_input": descriptor,
-        "format_hint": "gzip" if archive_type.startswith("gzip") else archive_type.split("-")[0],
     })
     finished = time.time_ns()
     final = _worker_result(result.stdout)
@@ -464,8 +476,11 @@ def test_worker_directory_metadata_uses_allocated_paths_and_archive_order(tmp_pa
     collision.write_bytes(b"existing file")
     collision_time = _file_times_ns(collision)
     started = time.time_ns()
-    result = _invoke_worker(worker, {"job_id": "directory-paths", "archive_path": str(archive),
-                                     "output_dir": str(output), "format_hint": "zip"})
+    result = _invoke_worker(worker, {
+        "job_id": "directory-paths",
+        "archive_input": ArchiveInputDescriptor.from_parts(archive_path=str(archive), format_hint="zip").to_dict(),
+        "output_dir": str(output),
+    })
     finished = time.time_ns()
     final = _worker_result(result.stdout)
     assert result.returncode == 0, result.stdout + result.stderr
@@ -499,8 +514,9 @@ def test_worker_reports_timestamp_failure_without_losing_content(tmp_path):
         handle.writestr(directory, b"")
     output = tmp_path / "output"
     result = _invoke_worker(worker, {
-        "job_id": "timestamp-warning", "archive_path": str(archive),
-        "output_dir": str(output), "format_hint": "zip",
+        "job_id": "timestamp-warning",
+        "archive_input": ArchiveInputDescriptor.from_parts(archive_path=str(archive), format_hint="zip").to_dict(),
+        "output_dir": str(output),
     })
     final = _worker_result(result.stdout)
     assert result.returncode == 0, result.stdout + result.stderr
@@ -533,8 +549,11 @@ def test_worker_duplicate_invalid_names_report_failure_without_spinning(tmp_path
     )
     for attempt in range(3):
         result = subprocess.run(
-            [worker], input=json.dumps({"job_id": "invalid-name-regression", "archive_path": str(archive),
-                                       "output_dir": str(tmp_path / f"out-{attempt}"), "format_hint": "zip"}),
+            [worker], input=json.dumps({
+                "job_id": "invalid-name-regression",
+                "archive_input": ArchiveInputDescriptor.from_parts(archive_path=str(archive), format_hint="zip").to_dict(),
+                "output_dir": str(tmp_path / f"out-{attempt}"),
+            }),
             capture_output=True, text=True, encoding="utf-8", timeout=10,
             creationflags=subprocess.CREATE_NO_WINDOW,
         )
@@ -609,7 +628,7 @@ def test_worker_does_not_classify_unencrypted_open_failure_as_wrong_password(tmp
     archive.write_bytes(b"7z\xbc\xaf'\x1c" + b"\x00" * 26)
     payload = {
         "job_id": "unencrypted-open-failure",
-        "archive_path": str(archive),
+        "archive_input": ArchiveInputDescriptor.from_parts(archive_path=str(archive)).to_dict(),
         "output_dir": str(tmp_path / "out"),
         "password": "irrelevant",
     }
@@ -634,7 +653,7 @@ def test_native_worker_result_escapes_control_characters(tmp_path):
         zf.writestr(failed_name, "unsafe filename payload")
     payload = {
         "job_id": "control-name",
-        "archive_path": str(archive),
+        "archive_input": ArchiveInputDescriptor.from_parts(archive_path=str(archive)).to_dict(),
         "output_dir": str(tmp_path / "out"),
     }
     runner = SevenZipRunner({})
@@ -664,7 +683,7 @@ def test_native_worker_asyncio_event_controller_completes_job(tmp_path):
     out_dir = tmp_path / "async-out"
     payload = {
         "job_id": "async-event-controller",
-        "archive_path": str(archive),
+        "archive_input": ArchiveInputDescriptor.from_parts(archive_path=str(archive)).to_dict(),
         "output_dir": str(out_dir),
     }
 
@@ -828,10 +847,11 @@ def test_worker_header_encrypted_7z_tries_candidates_with_disguised_names(tmp_pa
         ])
     out = tmp_path / "out"
     result = _invoke_worker(worker, {
-            "job_id": "header-passwords", "archive_path": str(disguised),
-            "output_dir": str(out), "format_hint": "7z", "archive_input": descriptor,
-            "password_candidates": ["wrong", "secret"],
-        }, timeout=10)
+        "job_id": "header-passwords",
+        "output_dir": str(out),
+        "archive_input": descriptor,
+        "password_candidates": ["wrong", "secret"],
+    }, timeout=10)
     final = _worker_result(result.stdout)
     assert result.returncode == 0, result.stdout + result.stderr
     assert final["status"] == "ok"
@@ -950,16 +970,16 @@ def test_memory_wait_releases_execution_lanes_and_accepts_cancellation(tmp_path)
         reserve_mib = handshake["memory_reserve_bytes"] // 1024**2
         capacity(reserve_mib + 48)
         for job in ("large-1", "large-2"):
-            send({"job_id": job, "archive_path": str(archive), "format_hint": "xz", "output_dir": str(tmp_path / job)})
+            send({"job_id": job, "archive_input": ArchiveInputDescriptor.from_parts(archive_path=str(archive), format_hint="xz").to_dict(), "output_dir": str(tmp_path / job)})
         until(lambda event: sum(e.get("event") == "memory_blocked" for e in seen) == 2)
-        send({"job_id": "small", "archive_path": str(tiny), "format_hint": "zip", "output_dir": str(tmp_path / "small")})
+        send({"job_id": "small", "archive_input": ArchiveInputDescriptor.from_parts(archive_path=str(tiny), format_hint="zip").to_dict(), "output_dir": str(tmp_path / "small")})
         assert until(lambda event: event.get("job_id") == "small" and event.get("type") == "result")["status"] == "ok"
         assert (tmp_path / "small/small.txt").read_bytes() == b"small"
         send({"worker_command": "cancel", "job_id": "large-1"})
         assert until(lambda event: event.get("job_id") == "large-1" and event.get("type") == "result")["native_status"] == "cancelled"
         changed = tmp_path / "changed.blob"
         changed.write_bytes(xz)
-        send({"job_id": "changed", "archive_path": str(changed), "format_hint": "xz", "output_dir": str(tmp_path / "changed-output")})
+        send({"job_id": "changed", "archive_input": ArchiveInputDescriptor.from_parts(archive_path=str(changed), format_hint="xz").to_dict(), "output_dir": str(tmp_path / "changed-output")})
         until(lambda event: event.get("job_id") == "changed" and event.get("event") == "memory_blocked")
         # Legal XZ stream padding changes input identity while parked. Reusing
         # receipts for a changed source must require a rescan, never report CRC damage.
@@ -1123,7 +1143,7 @@ def test_worker_output_trace_includes_per_item_failure(tmp_path):
     out_dir.mkdir()
     payload = {
         "job_id": "output-trace",
-        "archive_path": str(archive),
+        "archive_input": ArchiveInputDescriptor.from_parts(archive_path=str(archive)).to_dict(),
         "output_dir": str(out_dir),
     }
 
@@ -1153,9 +1173,8 @@ def test_worker_propagates_delayed_async_file_open_failure(tmp_path):
     out_dir = tmp_path / "out"
     payload = {
         "job_id": "async-open-failure",
-        "archive_path": str(archive),
+        "archive_input": ArchiveInputDescriptor.from_parts(archive_path=str(archive), format_hint="zip").to_dict(),
         "output_dir": str(out_dir),
-        "format_hint": "zip",
     }
 
     result = _invoke_worker(worker, payload)
@@ -1181,9 +1200,8 @@ def test_worker_dry_run_reports_success_diagnostics_without_writing(tmp_path):
     dry_output = tmp_path / "dry_output"
     payload = {
         "job_id": "dry-run",
-        "archive_path": str(archive),
+        "archive_input": ArchiveInputDescriptor.from_parts(archive_path=str(archive), format_hint="7z").to_dict(),
         "output_dir": str(dry_output),
-        "format_hint": "7z",
         "dry_run": True,
     }
 
@@ -1217,12 +1235,11 @@ def test_worker_skips_output_crc_when_source_crc_is_missing(tmp_path, dry_run):
         handle.add(source, arcname=source.name)
     output_dir = tmp_path / ("dry-output" if dry_run else "out")
     result = _invoke_worker(worker, {
-            "job_id": f"{'dry-run' if dry_run else 'extract'}-no-source-crc",
-            "archive_path": str(archive),
-            "output_dir": str(output_dir),
-            "format_hint": "tar",
-            "dry_run": dry_run,
-        })
+        "job_id": f"{'dry-run' if dry_run else 'extract'}-no-source-crc",
+        "archive_input": ArchiveInputDescriptor.from_parts(archive_path=str(archive), format_hint="tar").to_dict(),
+        "output_dir": str(output_dir),
+        "dry_run": dry_run,
+    })
     worker_result = _worker_result(result.stdout)
 
     assert result.returncode == 0, result.stdout + result.stderr
@@ -1272,9 +1289,8 @@ def test_worker_applies_explicit_shift_jis_item_paths(tmp_path):
     out_dir = tmp_path / "out"
     payload = {
         "job_id": "shift-jis",
-        "archive_path": str(archive),
+        "archive_input": ArchiveInputDescriptor.from_parts(archive_path=str(archive), format_hint="zip").to_dict(),
         "output_dir": str(out_dir),
-        "format_hint": "zip",
         "codepage": "932",
     }
 
@@ -1299,8 +1315,7 @@ def test_native_worker_queue_isolates_failed_job_and_continues(tmp_path):
         bad = runner.submit_attempt(
             {
                 "job_id": "bad",
-                "archive_path": str(tmp_path / "missing.zip"),
-                "part_paths": [str(tmp_path / "missing.zip")],
+                "archive_input": ArchiveInputDescriptor.from_parts(archive_path=str(tmp_path / "missing.zip"), part_paths=[str(tmp_path / "missing.zip")]).to_dict(),
                 "output_dir": str(tmp_path / "bad"),
             },
             task=_task(tmp_path / "missing.zip"),
@@ -1308,8 +1323,7 @@ def test_native_worker_queue_isolates_failed_job_and_continues(tmp_path):
         good = runner.submit_attempt(
             {
                 "job_id": "ok",
-                "archive_path": str(archive),
-                "part_paths": [str(archive)],
+                "archive_input": ArchiveInputDescriptor.from_parts(archive_path=str(archive), part_paths=[str(archive)]).to_dict(),
                 "output_dir": str(tmp_path / "ok"),
             },
             task=_task(archive),
@@ -1513,9 +1527,8 @@ def test_worker_maps_windows_invalid_entry_names_like_the_verifier(tmp_path):
     out_dir = tmp_path / "out"
     payload = {
         "job_id": "windows-names",
-        "archive_path": str(archive),
+        "archive_input": ArchiveInputDescriptor.from_parts(archive_path=str(archive), format_hint="zip").to_dict(),
         "output_dir": str(out_dir),
-        "format_hint": "zip",
     }
 
     result = _invoke_worker(worker, payload)
@@ -1639,8 +1652,11 @@ def test_worker_password_candidates(tmp_path, subtests, layout):
                 out.mkdir()
                 (out / "user.txt").write_text("preserved", encoding="utf-8")
             request = {
-                "job_id": str(index), "archive_path": str(archive), "output_dir": str(out),
-                "format_hint": "zip", "password": "placeholder", "password_candidates": candidates,
+                "job_id": str(index),
+                "archive_input": ArchiveInputDescriptor.from_parts(archive_path=str(archive), format_hint="zip").to_dict(),
+                "output_dir": str(out),
+                "password": "placeholder",
+                "password_candidates": candidates,
             }
             if source is not None:
                 request["archive_input"] = source
@@ -1679,12 +1695,27 @@ def test_worker_password_batches_preserve_header_and_volume_modes(tmp_path, subt
                     case = create_encrypted_rar_archive(tmp_path, case_id, password="secret",
                         rar4=archive_format == "rar4", header_encrypt=encrypted_headers,
                         split=archive_format == "rar5", split_volume_size=8192)
+                descriptor = ArchiveInputDescriptor.from_parts(
+                    archive_path=str(case.entry_path),
+                    format_hint="7z" if archive_format == "7z" else "rar",
+                )
+                if archive_format == "rar5":
+                    # This fixture uses canonical .partN.rar names. Pin their
+                    # known identities instead of sending an unordered path list.
+                    paths = sorted(case.archive_dir.iterdir(), key=lambda path: (len(path.name), path.name))
+                    descriptor = ArchiveInputDescriptor(
+                        entry_path=str(case.entry_path), open_mode="native_volumes", format_hint="rar",
+                        volume_style="rar_part",
+                        parts=[ArchiveInputPart(InputExtent(str(path)), volume_number=number,
+                                                canonical_name=path.name)
+                               for number, path in enumerate(paths, 1)],
+                    )
                 out = tmp_path / (case_id + "-out")
                 result = _invoke_worker(worker, {
-                    "job_id": case_id, "archive_path": str(case.entry_path),
-                    "part_paths": [str(path) for path in sorted(case.archive_dir.iterdir())],
-                    "format_hint": "7z" if archive_format == "7z" else "rar",
-                    "output_dir": str(out), "password_candidates": ["wrong", "also-wrong", "secret"],
+                    "job_id": case_id,
+                    "archive_input": descriptor.to_dict(),
+                    "output_dir": str(out),
+                    "password_candidates": ["wrong", "also-wrong", "secret"],
                 })
                 final = _worker_result(result.stdout)
                 assert result.returncode == 0 and final["matched_index"] == 2, result.stdout + result.stderr
@@ -1695,8 +1726,7 @@ def test_worker_password_batches_preserve_header_and_volume_modes(tmp_path, subt
                     # encrypted-header password; neither path may accept it.
                     wrong = _invoke_worker(worker, {
                         "job_id": case_id + "-wrong",
-                        "archive_path": str(case.entry_path),
-                        "format_hint": "rar",
+                        "archive_input": ArchiveInputDescriptor.from_parts(archive_path=str(case.entry_path), format_hint="rar").to_dict(),
                         "output_dir": str(tmp_path / (case_id + "-wrong-out")),
                         "password_candidates": ["also-wrong"],
                     })
@@ -1709,8 +1739,7 @@ def test_worker_password_batches_preserve_header_and_volume_modes(tmp_path, subt
                     (existing / "user.txt").write_text("preserved", encoding="utf-8")
                     fallback = _invoke_worker(worker, {
                         "job_id": case_id + "-fallback",
-                        "archive_path": str(case.entry_path),
-                        "format_hint": "rar",
+                        "archive_input": ArchiveInputDescriptor.from_parts(archive_path=str(case.entry_path), format_hint="rar").to_dict(),
                         "output_dir": str(existing),
                         "password_candidates": ["wrong", "also-wrong", "secret"],
                     })

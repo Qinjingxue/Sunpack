@@ -3,11 +3,6 @@ import threading
 from collections import OrderedDict
 from typing import Any
 
-from sunpack_native import batch_file_head_facts as _native_batch_file_head_facts
-
-from sunpack.core.support.path_keys import path_key
-
-
 DEFAULT_CACHE_CAPACITY = 512
 
 
@@ -76,14 +71,6 @@ class CacheManager:
 
 
 GLOBAL_CACHE = CacheManager()
-
-
-def file_identity(path: str) -> tuple[str, int, int]:
-    norm_path = path_key(path)
-    rows = _native_batch_file_head_facts([norm_path], 0)
-    if not rows or not isinstance(rows[0], dict):
-        return norm_path, 0, 0
-    return norm_path, int(rows[0].get("size") or 0), int(rows[0].get("mtime_ns") or 0)
 
 
 def global_cache_stats() -> dict[str, Any]:

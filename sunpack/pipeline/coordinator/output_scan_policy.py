@@ -61,7 +61,6 @@ class NestedOutputScanPolicy:
         scan_dirs = logical_roots if logical_roots is not None else output_dirs
         scan_session = DiscoveryScanSession(
             config=self.config,
-            include_raw_snapshots=True,
         )
         for output_dir in scan_dirs:
             if not output_dir:

@@ -9,6 +9,8 @@ import weakref
 from types import SimpleNamespace
 
 import pytest
+
+from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
 from sunpack_native import NativeWorkerResultAccumulator, parse_worker_transport_event
 
 from sunpack.pipeline.extraction.internal.sevenzip.sevenzip_runner import (
@@ -607,7 +609,7 @@ def many_item_archive(tmp_path_factory):
 
 
 def _request(archive, job_id="many-items", origin="foreground"):
-    return json.dumps({"job_id": job_id, "origin": origin, "archive_path": str(archive), "dry_run": True, "format_hint": "zip"})
+    return json.dumps({"job_id": job_id, "origin": origin, "archive_input": ArchiveInputDescriptor.from_parts(archive_path=str(archive), format_hint="zip").to_dict(), "dry_run": True})
 
 
 def _assert_many_item_result(result):
@@ -647,15 +649,6 @@ def test_real_worker_chunks_are_bounded_by_serialized_bytes(many_item_archive):
     assert all(count > 1 for count in counts.values())
     assert len(completed.stdout.encode("utf-8")) > 4 * 1024 * 1024
     _assert_many_item_result(result)
-
-
-def test_standalone_dry_run_assembles_chunks_with_the_same_native_contract(many_item_archive):
-    from sunpack.pipeline.extraction.internal.sevenzip.sevenzip_bridge_worker import dry_run_archive
-
-    completed = dry_run_archive(str(many_item_archive), format_hint="zip")
-    assert completed.ok, completed.message
-    _assert_many_item_result(completed.result)
-    assert all(event["type"] == "progress" for event in completed.progress)
 
 
 @pytest.mark.parametrize("transport", ["sync", "async"])

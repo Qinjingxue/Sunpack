@@ -63,7 +63,7 @@ def test_filesystem_routes_native_archive_stream_and_residual_without_rescan(tmp
     split_name_path = tmp_path / "payload.7z.002"
     split_name_path.write_bytes(b"continuation bytes")
 
-    snapshot = DirectoryScanner(str(tmp_path), include_raw_snapshot=True, config=make_config()).scan()
+    snapshot = DirectoryScanner(str(tmp_path), config=make_config()).scan()
     routes = _routing_by_name(snapshot)
 
     assert routes["empty.zip"] == ("relations", "zip")
@@ -97,7 +97,7 @@ def test_filesystem_routes_by_structure_not_extension(tmp_path):
     disguised_gzip = tmp_path / "payload.random"
     disguised_gzip.write_bytes(gzip.compress(b"payload"))
 
-    snapshot = DirectoryScanner(str(tmp_path), include_raw_snapshot=True, config=make_config()).scan()
+    snapshot = DirectoryScanner(str(tmp_path), config=make_config()).scan()
     routes = _routing_by_name(snapshot)
 
     assert routes[disguised_zip.name] == ("relations", "zip")
@@ -112,7 +112,7 @@ def test_prefixed_and_suffixed_archive_carrier_stays_residual_for_embedded_scan(
     carrier = tmp_path / "carrier.data"
     carrier.write_bytes(b"invalid-prefix" + zip_buffer.getvalue() + b"invalid-suffix")
 
-    snapshot = DirectoryScanner(str(tmp_path), include_raw_snapshot=True, config=make_config()).scan()
+    snapshot = DirectoryScanner(str(tmp_path), config=make_config()).scan()
     routes = _routing_by_name(snapshot)
 
     assert routes[carrier.name][0] == "residual"

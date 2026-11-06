@@ -4,7 +4,7 @@ from contextlib import nullcontext
 from datetime import datetime, timezone
 from typing import Any, TYPE_CHECKING
 
-from sunpack.core.contracts.archive_knowledge import ArchiveKnowledge, compact_evidence_value
+from sunpack.core.contracts.archive_knowledge import ArchiveKnowledge
 from sunpack.core.support.json_values import jsonable_value as _jsonable
 
 
@@ -135,28 +135,6 @@ def write_flags(
     return knowledge
 
 
-def append_history(
-    target: ArchiveTask | ArchiveKnowledge,
-    path: str,
-    item: dict[str, Any],
-    *,
-    source_layer: str,
-    source_module: str = "",
-    max_items: int = 200,
-) -> ArchiveKnowledge:
-    knowledge = ensure_knowledge(target)
-    history = knowledge.get(path)
-    values = list(history) if isinstance(history, list) else []
-    values.append(_jsonable(item))
-    knowledge.set(
-        path,
-        values[-max_items:],
-        source_layer=source_layer,
-        source_module=source_module,
-    )
-    return knowledge
-
-
 def write_evidence(
     target: ArchiveTask | ArchiveKnowledge,
     *,
@@ -167,8 +145,6 @@ def write_evidence(
     confidence: float | None = None,
 ) -> ArchiveKnowledge:
     knowledge = ensure_knowledge(target)
-    evidence = knowledge.get("_evidence")
-    rows = list(evidence) if isinstance(evidence, list) else []
     provenance: dict[str, Any] = {
         "source_layer": source_layer,
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -177,9 +153,7 @@ def write_evidence(
         provenance["source_module"] = source_module
     if confidence is not None:
         provenance["confidence"] = float(confidence)
-    rows.append({"path": path, "value": compact_evidence_value(value), "provenance": provenance})
-    knowledge.set("_evidence", rows[-500:])
-    return knowledge
+    return knowledge.add_evidence(path, value, provenance=provenance)
 
 
 def _phase(timer: Any | None, name: str):

@@ -136,7 +136,6 @@ def test_output_scan_policy_reuses_extraction_inventory(tmp_path, monkeypatch, h
     roots = list(work.roots)
     assert roots == [str(tmp_path.resolve())]
     assert work.session is not None
-    assert work.session.include_raw_snapshots is True
     candidates = build_candidates_for_targets(roots, session=work.session, config=config)
     assert [candidate.entry_path for candidate in candidates] == [str(nested.resolve())]
 

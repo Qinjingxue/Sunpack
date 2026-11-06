@@ -370,7 +370,7 @@ def test_directory_scanner_keeps_filter_rejected_files_in_raw_snapshot(tmp_path)
     archive = tmp_path / "keep.zip"
     archive.write_bytes(b"PK\x03\x04payload")
 
-    snapshot = DirectoryScanner(str(tmp_path), include_raw_snapshot=True, config=make_config({
+    snapshot = DirectoryScanner(str(tmp_path), config=make_config({
         "filesystem": {
             "scan_filters": [
                 {'name': 'blacklist', 'enabled': True, 'extensions': [{'value': 'dll', 'regex': False}]},

@@ -34,7 +34,6 @@ from sunpack.core.analysis.embedded.result import (
 )
 from sunpack.core.passwords.directory_context import password_scope_for_path
 from sunpack.core.passwords.internal.store import PasswordStore
-from sunpack.core.support.global_cache_manager import file_identity
 from sunpack.pipeline.discovery.embedded.options import EmbeddedOptions
 
 
@@ -277,15 +276,10 @@ class EmbeddedDiscovery:
         if precomputed_scan is None:
             if not self.options.force_scan and inspect_pe_image(path):
                 return None, "embedded_executable_skipped", ()
-            identity = file_identity(path)
-            size = int(identity[1])
+            scan = scan_embedded_archives(path).to_dict()
+            size = int(scan["file_size"])
             if size <= 0:
                 return None, "missing_or_empty_file", ()
-            scan = scan_embedded_archives(
-                path,
-                expected_size=size,
-                identity=identity,
-            ).to_dict()
         else:
             scan = precomputed_scan
             size = int(scan["file_size"])

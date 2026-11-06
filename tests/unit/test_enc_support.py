@@ -117,7 +117,7 @@ def test_recovery_framing_damage_is_reported_as_damage(tmp_path):
 
 def test_discovery_is_extension_independent_and_planning_does_not_reanalyse():
     config = make_config()
-    snapshot = DirectoryScanner(str(DATA), include_raw_snapshot=True, config=config).scan()
+    snapshot = DirectoryScanner(str(DATA), config=config).scan()
     routes = {Path(path).name: (route, fmt) for path, _size, route, fmt, _mask
               in snapshot.non_relation_file_routing_rows()}
     assert routes["algorithm_0.mov"] == ("detection", "enc")

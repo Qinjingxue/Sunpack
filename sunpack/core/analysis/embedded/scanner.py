@@ -4,8 +4,9 @@ import threading
 from typing import Any
 
 from sunpack.core.analysis.embedded.result import EmbeddedCandidate, EmbeddedScanResult, SignatureHit
-from sunpack.core.support.archive_sessions import get_archive_session
-from sunpack.core.support.global_cache_manager import GLOBAL_CACHE, file_identity
+from sunpack.core.support.archive_sessions import borrow_archive_sessions
+from sunpack.core.support.global_cache_manager import GLOBAL_CACHE
+from sunpack.core.support.path_keys import absolute_path_key
 
 
 _CACHE_NAMESPACE = "embedded_archive_scan_v4"
@@ -16,27 +17,31 @@ def scan_embedded_archives(
     path: str,
     *,
     expected_size: int = 0,
-    identity: tuple[str, int, int] | None = None,
 ) -> EmbeddedScanResult:
-    """Run the canonical native full-stream embedded scan at most once per file identity."""
-    cache_key = identity or file_identity(path)
-    result = GLOBAL_CACHE.get(_CACHE_NAMESPACE, cache_key)
-    if result is None:
-        lock = _SCAN_LOCKS[hash(cache_key) % len(_SCAN_LOCKS)]
-        with lock:
-            result = GLOBAL_CACHE.get(_CACHE_NAMESPACE, cache_key)
-            if result is None:
-                session = get_archive_session(path)
-                native_result = session.scan_embedded_archives()
-                result = _normalize_native_result(
-                    native_result,
-                    expected_size,
-                )
-                GLOBAL_CACHE.set(_CACHE_NAMESPACE, cache_key, result)
+    """Reuse a scan only for the validated physical generation being borrowed."""
+    with borrow_archive_sessions((path,)) as (session,):
+        cache_key = (absolute_path_key(path),)
+        generation = session.generation_token
+        cached = GLOBAL_CACHE.get(_CACHE_NAMESPACE, cache_key)
+        if cached is None or cached[0] != generation:
+            lock = _SCAN_LOCKS[hash(cache_key) % len(_SCAN_LOCKS)]
+            with lock:
+                cached = GLOBAL_CACHE.get(_CACHE_NAMESPACE, cache_key)
+                if cached is None or cached[0] != generation:
+                    result = _normalize_native_result(session.scan_embedded_archives())
+                    # A changed path replaces obsolete results instead of
+                    # retaining each former generation until global eviction.
+                    cached = (generation, result)
+                    GLOBAL_CACHE.set(_CACHE_NAMESPACE, cache_key, cached)
+        result = cached[1]
+    if expected_size and result.file_size != int(expected_size):
+        raise ValueError(
+            f"Native scan_embedded_archives file_size mismatch: expected {expected_size}, got {result.file_size}"
+        )
     return result
 
 
-def _normalize_native_result(value: dict[str, Any], expected_size: int) -> EmbeddedScanResult:
+def _normalize_native_result(value: dict[str, Any]) -> EmbeddedScanResult:
     rows = value["candidates"]
 
     candidates = []
@@ -73,47 +78,12 @@ def _normalize_native_result(value: dict[str, Any], expected_size: int) -> Embed
             hits.append(SignatureHit(name=name, offset=offset))
 
     file_size = int(value["file_size"])
-    if expected_size and file_size != int(expected_size):
-        raise ValueError(
-            f"Native scan_embedded_archives file_size mismatch: expected {expected_size}, got {file_size}"
-        )
-
     return EmbeddedScanResult(
         complete=bool(value["complete"]),
         candidates=tuple(sorted(candidates, key=lambda item: (item.offset, item.format))),
         hits=tuple(sorted(hits, key=lambda item: (item.offset, item.name))),
         read_bytes=int(value["read_bytes"]),
         file_size=file_size,
-        logical_resolution_complete=bool(value["logical_resolution_complete"]),
-        raw_hit_count=int(value["raw_hit_count"]),
-        budget_exhausted=bool(value["budget_exhausted"]),
-    )
-
-
-def embedded_result_from_dict(value: dict[str, Any]) -> EmbeddedScanResult:
-    return EmbeddedScanResult(
-        complete=bool(value["complete"]),
-        candidates=tuple(
-            EmbeddedCandidate(
-                format=str(item["format"]),
-                offset=int(item["offset"]),
-                end_offset=None if item["end_offset"] is None else int(item["end_offset"]),
-                confidence=float(item["confidence"]),
-                validation=str(item["validation"]),
-                candidate_kind=str(item["candidate_kind"]),
-                boundary_kind=str(item["boundary_kind"]),
-                extractable=bool(item["extractable"]),
-                volume_candidate=bool(item.get("volume_candidate")),
-                stream_plan=dict(item["stream_plan"]) if item.get("stream_plan") else None,
-            )
-            for item in value["candidates"]
-        ),
-        hits=tuple(
-            SignatureHit(name=str(item["name"]), offset=int(item["offset"]))
-            for item in value["hits"]
-        ),
-        read_bytes=int(value["read_bytes"]),
-        file_size=int(value["file_size"]),
         logical_resolution_complete=bool(value["logical_resolution_complete"]),
         raw_hit_count=int(value["raw_hit_count"]),
         budget_exhausted=bool(value["budget_exhausted"]),

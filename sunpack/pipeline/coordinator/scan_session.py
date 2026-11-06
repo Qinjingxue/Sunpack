@@ -22,7 +22,6 @@ class DiscoveryScanSession:
         relations: RelationsScheduler | None = None,
         config: dict | None = None,
         *,
-        include_raw_snapshots: bool = True,
         catalog=None,
         scope: DiscoveryScope | None = None,
         scopes=(),
@@ -34,7 +33,6 @@ class DiscoveryScanSession:
         if scope is not None:
             self._scopes[path_key(scope.root)] = scope
         self.relations = relations or RelationsScheduler(self.config)
-        self.include_raw_snapshots = include_raw_snapshots
         self._snapshots: dict[str, DirectorySnapshot] = {}
         self._scan_errors: DirectoryErrorReport | None = None
 
@@ -87,7 +85,6 @@ class DiscoveryScanSession:
             self._snapshots[key] = DirectoryScanner(
                 scope.root,
                 config=self.config,
-                include_raw_snapshot=self.include_raw_snapshots,
                 scope=scope,
             ).scan()
             self.add_scan_errors(self._snapshots[key].native_snapshot.scan_errors())

@@ -58,7 +58,7 @@ def _native_options(scenario: str, config_path: Path) -> dict[str, Any]:
             "scan_filters": scan_filters,
         }
     }
-    options = DirectoryScanner(".", config=config)._native_scan_options()
+    options = DirectoryScanner(".", config=config)._native_filter_options()
     if options is None:
         raise RuntimeError("benchmark requires native-compatible filters")
     return options
