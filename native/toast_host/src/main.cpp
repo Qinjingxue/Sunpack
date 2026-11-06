@@ -24,6 +24,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -619,7 +620,7 @@ T read_little_endian(const std::uint8_t* data) {
 
 class PayloadReader {
 public:
-    explicit PayloadReader(const std::vector<std::uint8_t>& payload) : payload_(payload) {}
+    explicit PayloadReader(std::span<const std::uint8_t> payload) : payload_(payload) {}
 
     std::uint8_t byte() {
         require(1);
@@ -657,11 +658,11 @@ private:
         }
     }
 
-    const std::vector<std::uint8_t>& payload_;
+    std::span<const std::uint8_t> payload_;
     std::size_t offset_{};
 };
 
-Snapshot parse_snapshot(const std::vector<std::uint8_t>& payload) {
+Snapshot parse_snapshot(std::span<const std::uint8_t> payload) {
     PayloadReader reader(payload);
     Snapshot result;
     result.kind = static_cast<SnapshotKind>(reader.byte());
@@ -884,7 +885,6 @@ struct ToastContext {
     // Only the activation helper registers the COM callback. A presenter in
     // the resident runtime must not consume an activation that only the
     // helper forwards through the existing command pipe.
-    std::wstring diagnostic_log_path;
     std::shared_ptr<DiagnosticLog> diagnostic_log;
     std::unique_ptr<ToastPresenter> presenter;
     DWORD owner_thread = GetCurrentThreadId();
@@ -924,7 +924,7 @@ int self_test() {
     if (parse_snapshot(payload).progress_value != progress) return 3;
     for (std::size_t size = 0; size < payload.size(); ++size) {
         bool rejected = false;
-        try { parse_snapshot(std::vector<std::uint8_t>(payload.begin(), payload.begin() + size)); }
+        try { parse_snapshot(std::span<const std::uint8_t>(payload).first(size)); }
         catch (...) { rejected = true; }
         if (!rejected) return 4;
     }
@@ -1007,8 +1007,7 @@ HRESULT sunpack_toast_create(const wchar_t* executable, const wchar_t* arguments
         if (!toast_app_identity_registered(executable)) {
             register_toast_app_identity(executable);
         }
-        context->diagnostic_log_path = log_path ? log_path : L"";
-        if(!context->diagnostic_log_path.empty()) context->diagnostic_log = std::make_shared<DiagnosticLog>(context->diagnostic_log_path);
+        if (log_path && *log_path) context->diagnostic_log = std::make_shared<DiagnosticLog>(log_path);
         *output = context.release();
     });
 }
@@ -1018,7 +1017,7 @@ HRESULT sunpack_toast_show(void* raw, const std::uint8_t* data,
     return protect([&] {
         auto& context = context_on_owner_thread(raw);
         if (!data || size > kMaximumSnapshotBytes) winrt::throw_hresult(E_INVALIDARG);
-        const auto snapshot = parse_snapshot(std::vector<std::uint8_t>(data, data + size));
+        const auto snapshot = parse_snapshot(std::span<const std::uint8_t>(data, size));
         if (!context.presenter) {
             context.presenter = std::make_unique<ToastPresenter>(context.diagnostic_log);
         }
