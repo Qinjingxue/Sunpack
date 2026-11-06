@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from typing import Any
 
 from sunpack.core.contracts.discovery_scope import DiscoveryScope
-from sunpack.core.support.path_keys import normalized_path, path_key
-from sunpack_native import NativeCandidateTable, NativeHeadFactCache
+from sunpack.core.support.path_keys import path_key
+from sunpack_native import NativeCandidateTable
 
 from sunpack.core.contracts.discovery import DiscoveryCandidate
 from sunpack.core.contracts.filesystem import DirectorySnapshot
@@ -37,7 +36,6 @@ class DiscoveryScanSession:
         self.relations = relations or RelationsScheduler(self.config)
         self.include_raw_snapshots = include_raw_snapshots
         self._snapshots: dict[str, DirectorySnapshot] = {}
-        self._head_facts = NativeHeadFactCache()
         self._scan_errors: DirectoryErrorReport | None = None
 
     def add_scan_errors(self, errors: Iterable[tuple[str, str, str]]) -> None:
@@ -65,11 +63,6 @@ class DiscoveryScanSession:
         self.add_scan_errors(snapshot.native_snapshot.scan_errors())
         self._snapshots[path_key(directory)] = snapshot
         self._scopes[path_key(directory)] = DiscoveryScope(directory, recursive=True)
-
-    def prime_output_inventory(self, inventory: Any) -> None:
-        if inventory is None:
-            return
-        self._head_facts.prime_inventory(inventory._native)
 
     def is_within_scan_scope(self, path: str) -> bool:
         return not self._scopes or any(scope.contains(path) for scope in self._scopes.values())
@@ -128,25 +121,3 @@ class DiscoveryScanSession:
 
     def logical_name_for_archive(self, filename: str) -> str:
         return self.relations.logical_name_for_archive(filename)
-
-    def file_head_facts_for_paths(
-        self,
-        paths: list[str],
-        *,
-        magic_size: int = 16,
-    ) -> dict[str, dict[str, Any]]:
-        requested = [normalized_path(path) for path in paths if path]
-        rows = self._head_facts.facts_for_paths(requested, max(0, int(magic_size or 0)))
-        return {path_key(row["path"]): row for row in rows}
-
-    def file_head_facts_for_path(self, path: str, *, magic_size: int = 16) -> dict[str, Any]:
-        return self.file_head_facts_for_paths([path], magic_size=magic_size).get(path_key(path), {})
-
-    def file_identity_for_path(self, path: str) -> tuple[str, int, int]:
-        key = path_key(path)
-        facts = self.file_head_facts_for_path(path, magic_size=0)
-        size = facts.get("size")
-        mtime_ns = facts.get("mtime_ns")
-        if isinstance(size, int) and isinstance(mtime_ns, int):
-            return key, size, mtime_ns
-        return key, 0, 0

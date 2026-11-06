@@ -1698,6 +1698,12 @@ impl CacheShard {
         // Cache payloads and byte counters are removed synchronously. Only
         // obsolete LRU queue keys are compacted amortized so targeted release
         // does not turn back into a full-cache scan.
+        if self.entries.is_empty() {
+            self.hot_order.clear();
+            self.general_order.clear();
+            self.hot_stale = 0;
+            self.general_stale = 0;
+        }
         if self.hot_stale >= CACHE_ORDER_COMPACT_STALE_MIN {
             let entries = &self.entries;
             let order = &mut self.hot_order;
@@ -1718,6 +1724,13 @@ impl CacheShard {
             });
             self.general_stale = 0;
         }
+        // Targeted cleanup already runs outside the block-read hot path.
+        // Release empty allocations and shrink large sparse indexes while
+        // unrelated readers keep their entries and borrowed data.
+        crate::collections::trim_map(&mut self.entries);
+        crate::collections::trim_map(&mut self.by_identity);
+        crate::collections::trim_deque(&mut self.hot_order);
+        crate::collections::trim_deque(&mut self.general_order);
     }
 }
 
@@ -1837,6 +1850,9 @@ impl ReaderManager {
         handles
             .order
             .retain(|(identity, _generation)| !identities.contains(identity));
+        crate::collections::trim_map(&mut handles.entries);
+        crate::collections::trim_map(&mut handles.by_path);
+        crate::collections::trim_deque(&mut handles.order);
         drop(handles);
         for source in sources {
             source.close()?;
@@ -2664,8 +2680,10 @@ mod tests {
         };
         let mut count = 0;
         let before = THREAD_PHYSICAL_READS.with(std::cell::Cell::get);
-        assert!(visit_relation_directory(&path.to_string_lossy(), directory, |_, _| count += 1)
-            .unwrap());
+        assert!(
+            visit_relation_directory(&path.to_string_lossy(), directory, |_, _| count += 1)
+                .unwrap()
+        );
         let reads = THREAD_PHYSICAL_READS.with(std::cell::Cell::get) - before;
         assert_eq!(count, 4096);
         assert!(reads < 32, "directory walk issued {reads} physical reads");
@@ -2681,7 +2699,9 @@ mod tests {
         // ZIP's directory walk does not exercise RAR's ENDARC traversal.
         // Check both Relations' cached reader and Embedded's direct reader;
         // dense headers must not become retained blocks or one I/O per field.
-        use crate::analysis_native::volume_anchor::{upgrade_relation_rar_end_reader, VolumeAnchor};
+        use crate::analysis_native::volume_anchor::{
+            upgrade_relation_rar_end_reader, VolumeAnchor,
+        };
         for rar5 in [false, true] {
             let mut record = vec![0u8; 32];
             let mut terminal;
@@ -2710,14 +2730,22 @@ mod tests {
             for direct in [false, true] {
                 let path = temp_file("rar_header_walk_cache", &bytes);
                 let reader = ManagedReader::open(&path).unwrap();
-                let reader = if direct { reader.probe_reader() } else { reader };
+                let reader = if direct {
+                    reader.probe_reader()
+                } else {
+                    reader
+                };
                 let anchor = VolumeAnchor {
                     path: path.to_string_lossy().into_owned(),
                     size: bytes.len() as u64,
                     format: "rar".into(),
                     structure_offset: Some(37),
                     rar_next_header_offset: Some(37),
-                    evidence: vec![if rar5 { "rar5:volume_header" } else { "rar4:volume_header" }],
+                    evidence: vec![if rar5 {
+                        "rar5:volume_header"
+                    } else {
+                        "rar4:volume_header"
+                    }],
                     ..Default::default()
                 };
                 let before = THREAD_PHYSICAL_READS.with(std::cell::Cell::get);
@@ -3063,6 +3091,85 @@ mod tests {
         assert_eq!(&*data, b"payload");
 
         drop(reader);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn targeted_cache_cleanup_drops_peak_allocations_and_keeps_live_borrows() {
+        // Existing release tests check bytes and ownership, but cannot see a
+        // sparse shard's retained allocations. Keep this local so parallel
+        // readers cannot mask the peak-to-idle transition.
+        let path = temp_file("managed_reader_cache_peak", b"payload");
+        let source = manager().open_file(&path).unwrap();
+        let payload: Arc<[u8]> = Arc::from(&b"payload"[..]);
+        let mut shard = CacheShard {
+            entries: HashMap::new(),
+            by_identity: HashMap::new(),
+            hot_order: VecDeque::new(),
+            general_order: VecDeque::new(),
+            hot_size: 0,
+            general_size: 0,
+            hot_stale: 0,
+            general_stale: 0,
+            generation: 0,
+            hot_capacity: usize::MAX,
+            general_capacity: usize::MAX,
+        };
+        let mut keys = Vec::new();
+        for generation in 1..=1024 {
+            let mut key = BlockKey::new(&source, 0);
+            key.identity.reader_generation = generation;
+            let tier = if generation % 2 == 0 {
+                CacheTier::Hot
+            } else {
+                CacheTier::General
+            };
+            shard
+                .by_identity
+                .insert(key.identity.clone(), HashSet::from([0]));
+            shard.entries.insert(
+                key.clone(),
+                CacheEntry {
+                    data: Arc::clone(&payload),
+                    tier,
+                    generation,
+                },
+            );
+            match tier {
+                CacheTier::Hot => {
+                    shard.hot_order.push_back((key.clone(), generation));
+                    shard.hot_size += payload.len();
+                }
+                CacheTier::General => {
+                    shard.general_order.push_back((key.clone(), generation));
+                    shard.general_size += payload.len();
+                }
+            }
+            keys.push(key);
+        }
+        let live = keys.pop().unwrap();
+        for key in keys {
+            shard.remove_entry(&key, true).unwrap();
+        }
+        shard.compact_stale_orders();
+        assert_eq!(shard.entries.len(), 1);
+        assert!(shard.entries.capacity() <= 256 && shard.by_identity.capacity() <= 256);
+        assert!(shard.hot_order.capacity() <= 256 && shard.general_order.capacity() <= 256);
+        assert!(Arc::ptr_eq(&shard.entries[&live].data, &payload));
+        shard.remove_entry(&live, true).unwrap();
+        shard.compact_stale_orders();
+        assert_eq!(shard.hot_size + shard.general_size, 0);
+        assert_eq!(
+            shard.entries.capacity()
+                + shard.by_identity.capacity()
+                + shard.hot_order.capacity()
+                + shard.general_order.capacity(),
+            0
+        );
+        assert_eq!(&*payload, b"payload");
+        manager()
+            .release_resources_under_roots(&[source.identity.path.clone()])
+            .unwrap();
         let _ = std::fs::remove_file(path);
     }
 

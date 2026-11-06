@@ -109,11 +109,3 @@ def _parse_worker_json_lines(stdout: str, job_id: str) -> list[dict[str, Any]]:
         if not accumulator.accept(parsed):
             events.append(parsed)
     return events
-
-
-def _coerce_text(value: Any) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, bytes):
-        return value.decode("utf-8", errors="replace")
-    return str(value)

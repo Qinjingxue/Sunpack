@@ -265,22 +265,6 @@ def test_spilled_signature_noise_preserves_carrier_peers_concurrently(tmp_path):
         list(pool.map(scan, range(2)))
 
 
-def test_native_head_fact_cache_accepts_concurrent_reads(tmp_path):
-    path = tmp_path / "payload.bin"
-    payload = b"PK\x03\x04" + b"x" * 1024
-    path.write_bytes(payload)
-    session = DiscoveryScanSession(config=make_config({}))
-
-    def read(magic_size):
-        return session.file_head_facts_for_path(str(path), magic_size=magic_size)
-
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        rows = list(pool.map(read, [0, 16] * 32))
-
-    assert all(row["size"] == len(payload) for row in rows)
-    assert all(row["magic"].startswith(b"PK\x03\x04") for row in rows[1::2])
-
-
 def test_native_detection_batches_keep_order_during_concurrent_resolves(tmp_path):
     buffer = BytesIO()
     with tarfile.open(fileobj=buffer, mode="w", format=tarfile.USTAR_FORMAT) as archive:

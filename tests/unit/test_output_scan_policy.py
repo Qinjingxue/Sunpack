@@ -14,6 +14,7 @@ from sunpack.pipeline.coordinator.target_scan import build_candidates_for_target
 from sunpack.pipeline.extraction.output_inventory import collect_output_inventory
 from tests.helpers.config_factory import make_config
 from tests.helpers.detection_config import with_detection_pipeline
+from tests.helpers.fs_builder import make_minimal_7z
 
 
 def _config():
@@ -140,28 +141,9 @@ def test_output_scan_policy_reuses_extraction_inventory(tmp_path, monkeypatch, h
     assert [candidate.entry_path for candidate in candidates] == [str(nested.resolve())]
 
 
-def test_output_scan_policy_inventory_batch_primes_file_heads(tmp_path, monkeypatch):
-    archive = tmp_path / "nested.zip"
-    archive.write_bytes(b"PK\x03\x04" + b"x" * (1024 * 1024))
-    inventory = collect_output_inventory(str(tmp_path))
-    policy = OutputScanPolicy(_config())
-    work = policy.prepare_scan(
-        [str(tmp_path)],
-        inventories={str(tmp_path.resolve()).lower(): inventory},
-    )
-    session = work.session
-    assert session is not None
-
-    facts = session.file_head_facts_for_paths([str(archive)], magic_size=16)
-
-    row = facts[next(iter(facts))]
-    assert row["size"] == archive.stat().st_size
-    assert row["magic"].startswith(b"PK\x03\x04")
-
-
 def test_output_scan_policy_uses_worker_magic_without_reopening_files(tmp_path, monkeypatch):
     archive = tmp_path / "nested.bin"
-    payload = b"PK\x03\x04" + b"payload"
+    payload = make_minimal_7z()
     archive.write_bytes(payload)
     stat = archive.stat()
     worker_result = {
@@ -177,7 +159,7 @@ def test_output_scan_policy_uses_worker_magic_without_reopening_files(tmp_path, 
             },
             "native_rows": worker_manifest_from_rows(
                 [[0, archive.name, "", len(payload), len(payload), 0, 0, 0, 0, 1, 1,
-                  1, stat.st_mtime_ns, payload[:16].hex()]],
+                  1, stat.st_mtime_ns, payload.hex()]],
                 True, 1, 0, len(payload), True,
             ),
         },
@@ -192,6 +174,9 @@ def test_output_scan_policy_uses_worker_magic_without_reopening_files(tmp_path, 
         lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("Python snapshot rebuilding must be bypassed")),
     )
 
+    # Test the snapshot used by real discovery after the source disappears;
+    # a separate file-head cache could pass while that snapshot reopened files.
+    archive.unlink()
     policy = OutputScanPolicy(_config())
     work = policy.prepare_scan(
         [str(tmp_path)],
@@ -199,12 +184,16 @@ def test_output_scan_policy_uses_worker_magic_without_reopening_files(tmp_path, 
     )
     session = work.session
     assert session is not None
-    archive.unlink()
-    facts = session.file_head_facts_for_paths([str(archive)], magic_size=16)
-
-    row = facts[next(iter(facts))]
-    assert row["magic"] == payload[:16]
-    assert row["mtime_ns"] == stat.st_mtime_ns
+    snapshot = session.snapshot_for_directory(str(tmp_path)).native_snapshot
+    paths, is_dirs, sizes, mtimes = snapshot.materialize_columns()
+    assert paths == [str(archive)]
+    assert is_dirs == [False]
+    assert sizes == [len(payload)]
+    assert mtimes == [stat.st_mtime_ns]
+    [(path, size, anchor)] = snapshot.relation_anchor_rows()
+    assert path == str(archive) and size == len(payload)
+    assert anchor["format"] == "7z"
+    assert anchor["confidence"] == "strong"
 
 
 def test_worker_inventory_fused_snapshot_preserves_raw_entries_and_rejects_escape(tmp_path):

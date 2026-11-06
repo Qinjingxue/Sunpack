@@ -258,6 +258,11 @@ impl NativeResourceGuard {
         let state = registry();
         if let Ok(mut registry) = state.registry.lock() {
             if registry.resources.remove(&self.id).is_some() {
+                // Keep small tables reusable across short-lived probes, but
+                // do not retain a concurrent workload's peak allocation.
+                if registry.resources.capacity() > 256 {
+                    crate::collections::trim_map(&mut registry.resources);
+                }
                 state.changed.notify_all();
             }
         }
@@ -351,6 +356,9 @@ pub(crate) fn native_end_promotion(token: u64) -> PyResult<()> {
         return Err(pyo3::exceptions::PyRuntimeError::new_err(
             "unknown native promotion token",
         ));
+    }
+    if registry.promotions.capacity() > 256 {
+        crate::collections::trim_map(&mut registry.promotions);
     }
     Ok(())
 }

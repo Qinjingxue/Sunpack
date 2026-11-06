@@ -954,18 +954,6 @@ def audit_open_files(
     return _own_open_files_under(file_identities(roots, directories=True))
 
 
-def _native_resources_under(roots: Sequence[FileIdentity]) -> tuple[dict[str, Any], ...]:
-    try:
-        import sunpack_native
-
-        return tuple(
-            dict(item)
-            for item in sunpack_native.native_resource_snapshot([item.path for item in roots])
-        )
-    except Exception as exc:
-        raise ResourceLifecycleError(f"native resource audit failed: {exc}") from exc
-
-
 def _begin_native_promotion(roots: Sequence[FileIdentity]) -> int | None:
     try:
         import sunpack_native

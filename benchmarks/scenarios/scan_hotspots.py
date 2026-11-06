@@ -289,7 +289,6 @@ def install_wrappers(recorder: HotspotRecorder) -> None:
 
     recorder.wrap(scan_session.DiscoveryScanSession, "snapshot_for_directory", "session.snapshot_for_directory")
     recorder.wrap(scan_session.DiscoveryScanSession, "native_table_for_directory", "session.native_table_for_directory")
-    recorder.wrap(scan_session.DiscoveryScanSession, "file_head_facts_for_paths", "session.file_head_facts_for_paths")
 
     recorder.wrap(target_scan, "build_candidates_for_targets", "coordinator.build_candidates")
     recorder.wrap(target_scan, "build_native_table_for_targets", "coordinator.build_native_table")
@@ -309,7 +308,6 @@ def summarize_scan_session(session: Any | None) -> dict[str, Any]:
         return {}
     return {
         "snapshots": len(getattr(session, "_snapshots", {}) or {}),
-        "file_head_facts": len(getattr(session, "_head_facts", ())),
         "scan_roots": [scope.root for scope in getattr(session, "_scopes", {}).values()],
     }
 

@@ -120,7 +120,6 @@ class RequestRuntimeProfiler:
             "snapshot_from_output_inventory",
             "output_inventory_snapshot_fused",
         )
-        self._install_global_method(DiscoveryScanSession, "file_head_facts_for_paths", "output_file_head_facts")
         self._install_global_method(DiscoveryScanSession, "prime_snapshot", "output_prime_snapshot")
         self._install_global_method(OutputInventory, "from_value", "output_inventory_from_value")
         self._install_global_callable(
@@ -375,7 +374,6 @@ def _derived_timing(timings: TimingMap) -> dict[str, float]:
         "output_inventory_path_check",
         "output_inventory_filter",
         "output_inventory_snapshot_fused",
-        "output_file_head_facts",
         "output_snapshot_filter",
     ))
     planning_children = sum(total(label) for label in (

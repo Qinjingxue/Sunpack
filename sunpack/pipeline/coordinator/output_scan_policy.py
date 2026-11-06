@@ -23,7 +23,6 @@ class NestedOutputScanPolicy:
 
     def __init__(self, config: dict[str, Any]):
         self.config = config
-        self._output_scan_config = self.config
         self._scan_options = None
         self._scan_options_lock = Lock()
 
@@ -71,7 +70,7 @@ class NestedOutputScanPolicy:
                 inventories.get(case_key(os.path.abspath(output_dir))),
                 expected_root=output_dir,
             )
-            snapshot = self._snapshot_from_inventory(inventory, scan_session)
+            snapshot = self._snapshot_from_inventory(inventory)
             if snapshot is None:
                 snapshot = self._scan_output(output_dir)
             root = os.path.abspath(output_dir)
@@ -122,7 +121,6 @@ class NestedOutputScanPolicy:
     def _snapshot_from_inventory(
         self,
         inventory: OutputInventory | None,
-        scan_session: DiscoveryScanSession,
     ) -> DirectorySnapshot | None:
         if (
             inventory is None
@@ -130,7 +128,6 @@ class NestedOutputScanPolicy:
             or not inventory.stats.is_dir
         ):
             return None
-        scan_session.prime_output_inventory(inventory)
         return DirectoryScanner.snapshot_from_output_inventory(
             os.path.abspath(inventory.root),
             inventory,
@@ -140,7 +137,7 @@ class NestedOutputScanPolicy:
     def _compiled_scan_options(self):
         with self._scan_options_lock:
             if self._scan_options is None:
-                self._scan_options = DirectoryScanner.compile_scan_options(self._output_scan_config)
+                self._scan_options = DirectoryScanner.compile_scan_options(self.config)
             return self._scan_options
 
     def _scan_output(self, root: str) -> DirectorySnapshot:

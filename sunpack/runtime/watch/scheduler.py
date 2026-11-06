@@ -1244,17 +1244,6 @@ class WatchScheduler:
             return deadline, epoch, generation, key, path
         return None
 
-    def _reschedule_generation(self, path: str, epoch: int, generation: int) -> None:
-        with self._lock:
-            state = self._active_states.get(path)
-            if (
-                state is None
-                or state.epoch != epoch
-                or state.generation != generation
-            ):
-                return
-            self._schedule_active_locked(path, state)
-
     @property
     def pending_count(self) -> int:
         with self._lock:
@@ -3022,14 +3011,6 @@ def _persisted_blocker_owns_retry(state: WatchStateStore, path: str) -> bool:
         entry is not None
         and entry.status in {"failed_password", "suspended_missing_volume"}
     )
-
-
-def _password_scope_for_path(state: WatchStateStore, path: str) -> str:
-    entry = state.latest_entry_for_path(path)
-    if entry is not None and entry.blocks(BLOCKER_PASSWORD):
-        return entry.password_scope_dir
-    pending = state.pending_work_for_path(path)
-    return str(pending.password_scope_dir or "") if pending is not None else ""
 
 
 def _summary_processed_no_tasks(summary: RunSummary) -> bool:

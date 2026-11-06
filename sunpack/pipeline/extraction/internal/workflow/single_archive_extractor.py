@@ -5,7 +5,6 @@ import subprocess
 from contextlib import nullcontext
 from typing import Any, Callable
 
-from sunpack.core.support.resource_lifecycle import task_walk
 from sunpack.core.support.output_paths import OutputPathAllocator
 from sunpack.core.support.path_keys import resolved_path_key
 
@@ -836,21 +835,6 @@ class SingleArchiveExtractor:
         safe = "".join("_" if ch in '<>:"/\\|?*' or ord(ch) < 32 else ch for ch in raw)
         return safe if safe.strip(".") else f"embedded_{position:02d}"
 
-
-    @staticmethod
-    def _directory_stats(path: str) -> dict[str, int]:
-        file_count = 0
-        total_bytes = 0
-        if not os.path.isdir(path):
-            return {"file_count": 0, "total_bytes": 0}
-        for root, _dirs, files in task_walk(path):
-            for name in files:
-                file_count += 1
-                try:
-                    total_bytes += int(os.path.getsize(os.path.join(root, name)))
-                except OSError:
-                    pass
-        return {"file_count": file_count, "total_bytes": total_bytes}
 
     @staticmethod
     def _fill_success_output_counts(diagnostics: dict[str, Any], stats: dict[str, int]) -> None:

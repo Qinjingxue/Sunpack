@@ -143,7 +143,6 @@ fn sunpack_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<scan::discovery::NativeDiscoveryRoutes>()?;
     m.add_class::<scan::discovery::NativeEmbeddedBatch>()?;
     m.add_class::<scan::directory::NativeOutputInventory>()?;
-    m.add_class::<scan::directory::NativeHeadFactCache>()?;
     m.add_function(wrap_pyfunction!(
         scan::directory::rebase_output_inventory_root,
         m
