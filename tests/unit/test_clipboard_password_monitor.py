@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import threading
+import gc
+import weakref
+
+import pytest
 
 from tests.helpers.passwords import write_password_json
 
@@ -9,6 +13,39 @@ import sunpack.core.passwords.internal.clipboard as clipboard_module
 import sunpack.core.passwords.internal.clipboard_monitor as clipboard_monitor_module
 from sunpack.core.passwords.internal.clipboard_monitor import ClipboardPasswordMonitor
 from sunpack.core.passwords.internal.clipboard_monitor import _WindowsClipboardLoop
+
+
+def test_stopped_clipboard_monitor_releases_failed_loop_and_can_restart(monkeypatch):
+    # Successful shutdown tests cannot detect traceback-retained loop state.
+    # A real thread plus a weak reference covers ownership without OS windows.
+    retained = []
+
+    class Payload:
+        pass
+
+    def fail(_loop):
+        payload = Payload()
+        retained.append(weakref.ref(payload))
+        raise OSError("clipboard loop failed")
+
+    monkeypatch.setattr(_WindowsClipboardLoop, "run", fail)
+    monitor = ClipboardPasswordMonitor()
+    monitor.start()
+    try:
+        monitor.stop()
+    except OSError as exc:
+        assert str(exc) == "clipboard loop failed"
+    else:
+        pytest.fail("loop failure was not reported")
+
+    gc.collect()
+    assert retained[0]() is None
+    assert monitor._thread is None
+    assert monitor._error is None
+    monitor.stop()
+    monkeypatch.setattr(_WindowsClipboardLoop, "run", lambda _loop: None)
+    monitor.start()
+    monitor.stop()
 
 
 def test_clipboard_monitor_persists_clipboard_passwords_and_notifies(tmp_path, monkeypatch):

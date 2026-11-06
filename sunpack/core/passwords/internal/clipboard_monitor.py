@@ -65,8 +65,9 @@ class ClipboardPasswordMonitor:
             thread.join()
             self._thread = None
             self._hwnd = None
-            if self._error is not None:
-                raise self._error
+            error, self._error = self._error, None
+            if error is not None:
+                raise error
 
     def _handle_clipboard_update(self) -> None:
         passwords = read_clipboard_passwords()

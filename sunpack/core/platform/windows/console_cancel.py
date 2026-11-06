@@ -41,21 +41,28 @@ class ConsoleCancellation:
         self._stop = kernel.CreateEventW(None, True, False, None)
         if not self._stop:
             raise ctypes.WinError(ctypes.get_last_error())
-        self._main_thread = kernel.OpenThread(1, False, kernel.GetCurrentThreadId())
-        handler_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.DWORD)
-        kernel.SetConsoleCtrlHandler.argtypes = [handler_type, wintypes.BOOL]
+        try:
+            self._main_thread = kernel.OpenThread(1, False, kernel.GetCurrentThreadId())
+            handler_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.DWORD)
+            kernel.SetConsoleCtrlHandler.argtypes = [handler_type, wintypes.BOOL]
 
-        def control(kind):
-            if kind not in (0, 1):
-                return False
-            self._request_cancel()
-            if self._prompt and self._main_thread:
-                kernel.CancelSynchronousIo(self._main_thread)
-            return True
+            def control(kind):
+                if kind not in (0, 1):
+                    return False
+                self._request_cancel()
+                if self._prompt and self._main_thread:
+                    kernel.CancelSynchronousIo(self._main_thread)
+                return True
 
-        self._handler = handler_type(control)
-        kernel.SetConsoleCtrlHandler(self._handler, True)
-        self._start()
+            handler = handler_type(control)
+            if not kernel.SetConsoleCtrlHandler(handler, True):
+                raise ctypes.WinError(ctypes.get_last_error())
+            self._handler = handler
+            self._start()
+        except BaseException:
+            # A failed __enter__ never invokes __exit__ automatically.
+            self.__exit__()
+            raise
         return self
 
     def _request_cancel(self):
@@ -72,8 +79,9 @@ class ConsoleCancellation:
     def _start(self):
         if self._stop:
             self._kernel.ResetEvent(self._stop)
-            self._thread = threading.Thread(target=self._listen, name="sunpack-console-stop")
-            self._thread.start()
+            thread = threading.Thread(target=self._listen, name="sunpack-console-stop")
+            thread.start()
+            self._thread = thread
 
     def _join(self):
         if self._thread is not None:
