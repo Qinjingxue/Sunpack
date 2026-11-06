@@ -36,8 +36,9 @@ pub(crate) struct NativeResourceGuard {
 }
 
 pub(crate) struct TrackedFile {
-    file: Option<File>,
-    resource: NativeResourceGuard,
+    // Fields drop in declaration order: close the handle before unregistering it.
+    file: File,
+    _resource: NativeResourceGuard,
 }
 
 impl TrackedFile {
@@ -47,8 +48,8 @@ impl TrackedFile {
         let resource = NativeResourceGuard::register(kind, [path.to_path_buf()])?;
         let file = File::open(path)?;
         Ok(Self {
-            file: Some(file),
-            resource,
+            file,
+            _resource: resource,
         })
     }
 
@@ -97,8 +98,8 @@ impl TrackedFile {
         configure(&mut options);
         let file = options.open(path)?;
         Ok(Self {
-            file: Some(file),
-            resource,
+            file,
+            _resource: resource,
         })
     }
 
@@ -120,34 +121,14 @@ impl TrackedFile {
         #[cfg(not(windows))]
         let file = File::open(path)?;
         Ok(Self {
-            file: Some(file),
-            resource,
+            file,
+            _resource: resource,
         })
     }
 
-    fn file(&self) -> &File {
-        self.file
-            .as_ref()
-            .expect("tracked file methods cannot run after close")
-    }
-
-    fn file_mut(&mut self) -> &mut File {
-        self.file
-            .as_mut()
-            .expect("tracked file methods cannot run after close")
-    }
-
     pub(crate) fn write_shared(&self, buffer: &[u8]) -> io::Result<()> {
-        let mut file = self.file();
+        let mut file = &self.file;
         file.write_all(buffer)
-    }
-
-    pub(crate) fn close(&mut self) -> bool {
-        let closed = self.file.take().is_some();
-        if closed {
-            self.resource.release();
-        }
-        closed
     }
 }
 
@@ -155,41 +136,35 @@ impl Deref for TrackedFile {
     type Target = File;
 
     fn deref(&self) -> &Self::Target {
-        self.file()
+        &self.file
     }
 }
 
 impl DerefMut for TrackedFile {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        self.file_mut()
+        &mut self.file
     }
 }
 
 impl Read for TrackedFile {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        self.file_mut().read(buffer)
+        self.file.read(buffer)
     }
 }
 
 impl Write for TrackedFile {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        self.file_mut().write(buffer)
+        self.file.write(buffer)
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.file_mut().flush()
+        self.file.flush()
     }
 }
 
 impl Seek for TrackedFile {
     fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
-        self.file_mut().seek(position)
-    }
-}
-
-impl Drop for TrackedFile {
-    fn drop(&mut self) {
-        self.close();
+        self.file.seek(position)
     }
 }
 
@@ -199,7 +174,7 @@ pub(crate) fn read_shared_utf8_text(py: Python<'_>, path: PathBuf) -> PyResult<S
     Ok(py.detach(move || -> io::Result<String> {
         let mut file = TrackedFile::open_reader(path, "shared_text")?;
         let mut text = String::new();
-        file.file_mut().read_to_string(&mut text)?;
+        file.file.read_to_string(&mut text)?;
         if text.starts_with('\u{feff}') {
             text.drain(..3);
         }
@@ -253,8 +228,10 @@ impl NativeResourceGuard {
         );
         Ok(Self { id })
     }
+}
 
-    pub(crate) fn release(&self) {
+impl Drop for NativeResourceGuard {
+    fn drop(&mut self) {
         let state = registry();
         if let Ok(mut registry) = state.registry.lock() {
             if registry.resources.remove(&self.id).is_some() {
@@ -266,12 +243,6 @@ impl NativeResourceGuard {
                 state.changed.notify_all();
             }
         }
-    }
-}
-
-impl Drop for NativeResourceGuard {
-    fn drop(&mut self) {
-        self.release();
     }
 }
 
@@ -370,10 +341,13 @@ pub(crate) fn native_resource_snapshot(py: Python<'_>, roots: Vec<String>) -> Py
         .map(PathBuf::from)
         .map(normalized_path)
         .collect::<Vec<_>>();
-    let registry = registry().registry.lock().map_err(|_| {
-        pyo3::exceptions::PyRuntimeError::new_err("native resource registry poisoned")
-    })?;
-    resource_snapshot_to_python(py, matching_resources(&registry, &roots, false))
+    let records = {
+        let registry = registry().registry.lock().map_err(|_| {
+            pyo3::exceptions::PyRuntimeError::new_err("native resource registry poisoned")
+        })?;
+        matching_resources(&registry, &roots, false)
+    };
+    resource_snapshot_to_python(py, records)
 }
 
 #[pyfunction]
@@ -459,21 +433,4 @@ fn resource_snapshot_to_python(
         output.append(item)?;
     }
     Ok(output.unbind())
-}
-
-#[allow(dead_code)]
-pub(crate) fn snapshot_under(root: &Path) -> Vec<(u64, &'static str, Vec<PathBuf>)> {
-    let root = normalized_path(root.to_path_buf());
-    registry()
-        .registry
-        .lock()
-        .map(|registry| {
-            registry
-                .resources
-                .iter()
-                .filter(|(_, record)| overlaps(record, std::slice::from_ref(&root)))
-                .map(|(id, record)| (*id, record.kind, record.paths.clone()))
-                .collect()
-        })
-        .unwrap_or_default()
 }
