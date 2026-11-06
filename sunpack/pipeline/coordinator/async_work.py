@@ -370,8 +370,8 @@ class AsyncWorkBroker:
 
     async def close(self, *, graceful: bool = True) -> None:
         self.bind()
-        if self._closed:
-            return
+        # Closing admission does not mean workers have drained. A cancelled
+        # or concurrent close must still join them through the same idle event.
         self._closed = True
         if not graceful:
             for queue in self._queues.values():
@@ -386,7 +386,10 @@ class AsyncWorkBroker:
             self._pending_jobs = 0
         if graceful and (self._active or self.pending_jobs):
             await self._idle_event.wait()
-        self._executor.shutdown(wait=graceful, cancel_futures=not graceful)
+        # Only our pending queues are cancellable here. Dispatched wrappers
+        # must run to settle their futures and return their admission slots,
+        # even when an executor thread has not picked them up yet.
+        self._executor.shutdown(wait=graceful)
 
     def _dispatch(self) -> None:
         while self._active < self.thread_capacity and self._request_order:

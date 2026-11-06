@@ -239,11 +239,29 @@ def test_broker_cancelled_queued_work_releases_slots_across_stage_buckets(cancel
     asyncio.run(scenario())
 
 
-def test_broker_immediate_close_cancels_all_stage_buckets():
+@pytest.mark.parametrize("worker_started", [True, False])
+def test_broker_immediate_close_cancels_all_stage_buckets(monkeypatch, worker_started):
     async def scenario():
         broker = AsyncWorkBroker(thread_capacity=1, max_pending_jobs=16)
         entered = threading.Event()
         release = threading.Event()
+        submitted = []
+        submit = broker._executor.submit
+
+        def tracked_submit(operation, item):
+            future = submit(operation, item)
+            submitted.append((future, item))
+            return future
+
+        monkeypatch.setattr(broker._executor, "submit", tracked_submit)
+        if not worker_started:
+            # Hold the real executor before it takes the dispatched wrapper.
+            # Started-work coverage cannot detect cancellation of that wrapper.
+            def initialize():
+                entered.set()
+                assert release.wait(timeout=3)
+
+            monkeypatch.setattr(broker._executor, "_initializer", initialize)
 
         def operation():
             entered.set()
@@ -260,13 +278,18 @@ def test_broker_immediate_close_cancels_all_stage_buckets():
             await asyncio.sleep(0)
             assert broker.pending_jobs == 9
             await broker.close(graceful=False)
+            assert not submitted[0][0].cancelled()
             results = await asyncio.gather(*queued, return_exceptions=True)
             assert all(isinstance(result, asyncio.CancelledError) for result in results)
             assert broker.pending_jobs == 0
             assert not broker._request_order and not broker._queues
         finally:
             release.set()
-            await asyncio.wait_for(active, timeout=3)
+            # Keep a failing regression from stranding asyncio.run's cleanup.
+            for future, item in submitted:
+                if future.cancelled():
+                    item.future.cancel()
+            await asyncio.gather(active, *queued, return_exceptions=True)
             await broker.close()
         assert broker.active_jobs == 0
         assert broker._pending_slots._value == broker.max_pending_jobs
@@ -352,7 +375,8 @@ def test_broker_reports_busy_and_idle_state_changes():
     asyncio.run(scenario())
 
 
-def test_graceful_close_waits_once_for_idle_notification():
+@pytest.mark.parametrize("close_mode", ["normal", "cancel_retry", "concurrent"])
+def test_graceful_close_waits_once_for_idle_notification(close_mode):
     async def scenario():
         broker = AsyncWorkBroker(thread_capacity=1, max_pending_jobs=2)
         started = threading.Event()
@@ -381,10 +405,25 @@ def test_graceful_close_waits_once_for_idle_notification():
         assert not closing.done()
         assert wait_calls == 1
 
+        if close_mode == "cancel_retry":
+            closing.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await closing
+        original_closing = closing
+        if close_mode != "normal":
+            closing = asyncio.create_task(broker.close())
+            await asyncio.sleep(0)
+
         release.set()
         assert await active == "done"
         await asyncio.wait_for(closing, timeout=1.0)
-        assert wait_calls == 1
+        if not original_closing.cancelled():
+            await original_closing
+        try:
+            assert wait_calls == (1 if close_mode == "normal" else 2)
+            assert all(not thread.is_alive() for thread in broker._executor._threads)
+        finally:
+            broker._executor.shutdown(wait=True)
 
     asyncio.run(scenario())
 
