@@ -8,6 +8,8 @@
 
 #include <filesystem>
 
+#include <unordered_set>
+
 extern "C" __declspec(dllimport) WCHAR NTAPI RtlDowncaseUnicodeChar(WCHAR source);
 
 #endif
@@ -176,48 +178,40 @@ namespace sunpack::sevenzip
 
     std::vector<std::wstring> unique_existing_paths(const std::wstring &archive_path, const std::vector<std::wstring> &part_paths)
     {
-
-        std::vector<std::wstring> input = part_paths.empty() ? std::vector<std::wstring>{archive_path} : part_paths;
-
-        if (std::find(input.begin(), input.end(), archive_path) == input.end())
-        {
-
-            input.push_back(archive_path);
-        }
-
         std::vector<std::wstring> result;
+        result.reserve(part_paths.size() + 1);
+        std::unordered_set<std::wstring> seen;
+        seen.reserve(part_paths.size() + 1);
 
-        std::vector<std::wstring> seen;
-
-        for (const auto &path : input)
+        const auto append = [&](const std::wstring &path)
         {
-
             if (path.empty())
             {
-
-                continue;
+                return;
             }
-
-            const std::wstring key = lower_text(std::filesystem::path(path).wstring());
-
-            if (std::find(seen.begin(), seen.end(), key) != seen.end())
+            if (seen.insert(lower_text(std::filesystem::path(path).wstring())).second)
             {
-
-                continue;
+                result.push_back(path);
             }
-
-            seen.push_back(key);
-
-            result.push_back(path);
+        };
+        for (const auto &path : part_paths)
+        {
+            append(path);
         }
-
+        append(archive_path);
         return result;
     }
 
     std::vector<std::wstring> sorted_data_volume_paths(const std::vector<std::wstring> &paths)
     {
 
-        std::vector<std::wstring> volumes;
+        struct Volume
+        {
+            const std::wstring *path;
+            int number;
+        };
+        std::vector<Volume> ordered;
+        ordered.reserve(paths.size());
 
         for (const auto &path : paths)
         {
@@ -227,25 +221,24 @@ namespace sunpack::sevenzip
             if (volume_number.has_value())
             {
 
-                volumes.push_back(path);
+                ordered.push_back(Volume{&path, *volume_number});
             }
         }
 
-        std::sort(volumes.begin(), volumes.end(), [](const std::wstring &left, const std::wstring &right)
+        std::sort(ordered.begin(), ordered.end(), [](const Volume &left, const Volume &right)
                   {
-                      const int left_number = parse_volume_number(left).value_or(0);
-
-                      const int right_number = parse_volume_number(right).value_or(0);
-
-                      if (left_number != right_number)
+                      if (left.number != right.number)
                       {
-
-                          return left_number < right_number;
+                          return left.number < right.number;
                       }
-
-                      return lower_text(left) < lower_text(right);
+                      return lower_text(*left.path) < lower_text(*right.path);
                   });
-
+        std::vector<std::wstring> volumes;
+        volumes.reserve(ordered.size());
+        for (const auto &volume : ordered)
+        {
+            volumes.push_back(*volume.path);
+        }
         return volumes;
     }
 

@@ -626,8 +626,8 @@ namespace sunpack::sevenzip
                 cancel_token);
 #endif
 
-            raw_extract_callback->set_input_file(archive_path);
             CMyComPtr<IArchiveExtractCallback> extract_callback(raw_extract_callback);
+            raw_extract_callback->set_input_file(archive_path);
 
 #ifdef SUP7Z_ENABLE_PIPELINE_TIMING
             pipeline_timing->start_pipeline();

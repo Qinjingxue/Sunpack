@@ -475,7 +475,10 @@ namespace sunpack::sevenzip
 
                                   nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr))
         {
-
+            // A failed constructor does not run ~FileInStream. Keep the input
+            // handle owned while trace/prefetch setup can still allocate.
+            std::unique_ptr<void, decltype(&CloseHandle)> handle_owner(
+                handle_ == INVALID_HANDLE_VALUE ? nullptr : handle_, &CloseHandle);
             LARGE_INTEGER size{};
             if (handle_ != INVALID_HANDLE_VALUE && GetFileSizeEx(handle_, &size))
             {
@@ -520,6 +523,7 @@ namespace sunpack::sevenzip
             {
                 trace_->prefetch_enabled = prefetch_ && prefetch_->enabled();
             }
+            handle_owner.release();
         }
 
         ~FileInStream()
