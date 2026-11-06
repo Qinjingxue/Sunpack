@@ -2,11 +2,12 @@ from typing import Any, Callable
 
 from sunpack.pipeline.extraction.internal.sevenzip.metadata import ArchiveMetadataScanner
 from sunpack.core.support.output_paths import default_output_dir_for_task
-from sunpack.pipeline.extraction.internal.workflow.preflight import PreExtractInspector
 from sunpack.pipeline.extraction.internal.sevenzip.sevenzip_runner import SevenZipRunner
 from sunpack.pipeline.extraction.internal.workflow.single_archive_extractor import SingleArchiveExtractor
 from sunpack.core.contracts.extraction import ExtractionResult
+from sunpack.core.contracts.failures import FailureInfo, FailureKind
 from sunpack.core.contracts.tasks import ArchiveTask
+from sunpack.core.i18n import I18nContext
 from sunpack.core.passwords import ArchivePasswordTester, PasswordResolver, PasswordSession, PasswordStore
 
 
@@ -72,8 +73,19 @@ class ExtractionScheduler:
     def default_output_dir_for_task(self, task: ArchiveTask) -> str:
         return default_output_dir_for_task(task, self.output_config)
 
-    def inspect(self, task: ArchiveTask, out_dir: str):
-        return PreExtractInspector(self.password_resolver).inspect(task, out_dir)
+    def inspect(self, task: ArchiveTask, out_dir: str) -> ExtractionResult | None:
+        # Input admission observed an actual NotFound under the input lease.
+        # This is a departed physical member, not a structural prediction.
+        missing = task.runtime.get("missing_input_paths")
+        if not missing:
+            return None
+        key = "failure.missing_volume"
+        failure = FailureInfo(
+            FailureKind.MISSING_VOLUME, "input_admission",
+            I18nContext("en").t(key), message_key=key,
+            details={"missing_volume_confirmed": True, "missing_paths": missing},
+        )
+        return ExtractionResult(False, out_dir, error=failure.message, failure=failure)
 
     def extract(
         self,

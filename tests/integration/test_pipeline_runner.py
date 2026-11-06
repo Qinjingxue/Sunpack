@@ -306,7 +306,7 @@ def test_pipeline_runner_uses_tmp_path_and_applies_success_postprocess(tmp_path,
             original_close()
             call_order.append("close")
 
-        monkeypatch.setattr(runtime.extractor, "inspect", lambda *_args, **_kwargs: type("Preflight", (), {"skip_result": None})())
+        monkeypatch.setattr(runtime.extractor, "inspect", lambda *_args, **_kwargs: None)
         monkeypatch.setattr(runtime.extractor, "extract", fake_extract)
         monkeypatch.setattr(runtime.extractor, "extract_asyncio", fake_extract_asyncio)
         monkeypatch.setattr(runtime.extractor, "close", tracked_close)
@@ -378,7 +378,7 @@ def test_independent_jobs_do_not_treat_existing_same_name_directory_as_output(tm
         monkeypatch.setattr(
             runtime.extractor,
             "inspect",
-            lambda *_args, **_kwargs: type("Preflight", (), {"skip_result": None})(),
+            lambda *_args, **_kwargs: None,
         )
         monkeypatch.setattr(runtime.extractor, "extract", fake_extract)
         monkeypatch.setattr(runtime.extractor, "extract_asyncio", fake_extract_asyncio)
@@ -431,7 +431,7 @@ def test_output_root_preserves_tree_and_recursive_scan_uses_success_outputs(tmp_
         monkeypatch.setattr(
             runtime.extractor,
             "inspect",
-            lambda *_args, **_kwargs: type("Preflight", (), {"skip_result": None})(),
+            lambda *_args, **_kwargs: None,
         )
         monkeypatch.setattr(runtime.extractor, "extract", fake_extract)
         monkeypatch.setattr(runtime.extractor, "extract_asyncio", fake_extract_asyncio)
@@ -494,7 +494,7 @@ def test_fast_job_recurses_before_slow_sibling_finishes(tmp_path, monkeypatch):
                 monkeypatch.setattr(
                     runtime.extractor,
                     "inspect",
-                    lambda *_args, **_kwargs: type("Preflight", (), {"skip_result": None})(),
+                    lambda *_args, **_kwargs: None,
                 )
                 monkeypatch.setattr(runtime.extractor, "extract_asyncio", fake_extract_asyncio)
 

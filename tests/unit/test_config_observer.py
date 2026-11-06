@@ -51,6 +51,9 @@ def test_stopped_config_observer_releases_owners_without_cyclic_gc(tmp_path, sta
         )
         if started:
             observer.start()
+        # Stopping before the loop dispatches a queued event must cancel that
+        # handle too; otherwise the ready queue still owns the retired listener.
+        observer.notify_path_changed(str(tmp_path / "config.json"))
         owner_ref = weakref.ref(owner)
         del owner
         observer.stop()
@@ -128,9 +131,18 @@ def test_config_observer_watches_program_directory_non_recursively(tmp_path):
     assert observer._observer.join_timeout is None
 
 
-def test_config_observer_filters_files_and_debounces_event_burst(tmp_path):
+def test_config_observer_filters_files_and_debounces_event_burst(tmp_path, monkeypatch):
     async def scenario():
         emitted = asyncio.Event(); calls = []
+        loop = asyncio.get_running_loop()
+        schedule = loop.call_soon_threadsafe
+        queued = []
+
+        def record_schedule(callback, *args, **kwargs):
+            queued.append(callback.__name__)
+            return schedule(callback, *args, **kwargs)
+
+        monkeypatch.setattr(loop, "call_soon_threadsafe", record_schedule)
         observer = ConfigFileObserver(
             tmp_path,
             ("sunpack_config.json", "sunpack_advanced_config.json", "sunpack_watch_roots.txt"),
@@ -140,8 +152,11 @@ def test_config_observer_filters_files_and_debounces_event_burst(tmp_path):
         observer.start(); handler = observer._observer.handler
         handler.dispatch(FileModifiedEvent(str(tmp_path / "unrelated.txt")))
         handler.dispatch(FileCreatedEvent(str(tmp_path / "SUNPACK_CONFIG.JSON")))
-        handler.dispatch(FileModifiedEvent(str(tmp_path / "sunpack_advanced_config.json")))
+        for _ in range(256):
+            handler.dispatch(FileModifiedEvent(str(tmp_path / "sunpack_advanced_config.json")))
         handler.dispatch(FileDeletedEvent(str(tmp_path / "sunpack_watch_roots.txt")))
+        # Debouncing reloads alone still permits an event-sized ready queue.
+        assert queued == ["_schedule_emit"]
         await asyncio.wait_for(emitted.wait(), 1.0)
         observer.stop()
         return calls

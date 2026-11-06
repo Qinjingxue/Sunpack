@@ -1729,10 +1729,6 @@ class WatchScheduler:
             return False
         return case_key(os.path.abspath(path)) == case_key(self.builtin_password_file)
 
-    def enqueue_many(self, paths: Iterable[str]):
-        for path in paths:
-            self.enqueue(path)
-
     def notify_password_source_changed(self, reason: str, path: str = "") -> None:
         with self._lock:
             if self._closed:

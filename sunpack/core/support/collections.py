@@ -9,20 +9,6 @@ from typing import Any
 from sunpack.core.support.path_keys import case_key
 
 
-def dedupe_strings(values: Iterable[Any]) -> list[str]:
-    """Return non-empty string values once, preserving first-seen order."""
-
-    output: list[str] = []
-    seen: set[str] = set()
-    for value in values:
-        text = str(value)
-        if not text or text in seen:
-            continue
-        seen.add(text)
-        output.append(text)
-    return output
-
-
 def dedupe_values(values: Iterable[Any]) -> list[Any]:
     """Return values once, preserving equality semantics and first-seen order."""
 

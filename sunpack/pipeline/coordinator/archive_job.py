@@ -245,8 +245,8 @@ class ArchiveJobExecutor:
                 ))
             out_dir = output_dir_resolver(task)
             result = self.extractor.inspect(task, out_dir)
-            if result.skip_result is not None:
-                return out_dir, ArchiveJobOutcome(result.skip_result)
+            if result is not None:
+                return out_dir, ArchiveJobOutcome(result)
             return out_dir, None
 
         retried_missing_volume = False

@@ -42,7 +42,6 @@ class RunReporter:
         request_id: str = "",
     ):
         self.i18n = I18nContext(language)
-        self.language = self.i18n.language
         self.quiet = bool(quiet)
         self.verbose = bool(verbose)
         self.emit_errors = bool(emit_errors)

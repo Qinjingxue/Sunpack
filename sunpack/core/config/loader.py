@@ -228,13 +228,6 @@ def _config_file_signature(path: Path | None) -> tuple[str, int, int] | None:
     return (str(resolve_resource_path(path)), int(stat.st_mtime_ns), int(stat.st_size))
 
 
-def config_cache_token(request_cwd: str | Path | None = None) -> tuple[Any, ...]:
-    """Return the selected config files and mtimes used for cache invalidation."""
-    simple_path = _first_existing_config(SIMPLE_CONFIG_FILENAME, request_cwd)
-    advanced_path = _first_existing_config(ADVANCED_CONFIG_FILENAME, request_cwd)
-    return (_config_file_signature(simple_path), _config_file_signature(advanced_path), _override_signature())
-
-
 def _config_source_path(path: Path | None) -> str | None:
     return str(resolve_resource_path(path)) if path is not None else None
 

@@ -30,13 +30,3 @@ def advanced_config_value(path: Iterable[str]) -> Any:
             raise KeyError(f"Missing canonical advanced config field: {'.'.join(parts)}")
         current = current[part]
     return deepcopy(current)
-
-
-def advanced_named_config(path: Iterable[str], name: str) -> dict[str, Any]:
-    values = advanced_config_value(path)
-    if not isinstance(values, list):
-        raise TypeError(f"Canonical advanced config field is not a list: {'.'.join(path)}")
-    for item in values:
-        if isinstance(item, dict) and item.get("name") == name:
-            return deepcopy(item)
-    raise KeyError(f"Missing canonical advanced config module: {'.'.join(path)}[{name}]")

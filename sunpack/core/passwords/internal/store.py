@@ -63,10 +63,16 @@ class PasswordSnapshot:
         return self
 
     def scoped_passwords(self, scope_path: str):
+        for values in self.scoped_buckets(scope_path):
+            yield from values
+
+    def scoped_buckets(self, scope_path: str):
         if not scope_path or not self.scoped_index:
             return
         for key in self._scope_keys(scope_path):
-            yield from self.scoped_index.get(key, ())
+            values = self.scoped_index.get(key)
+            if values:
+                yield values
 
     def scope_signature(self, scope_path: str) -> str:
         """Fingerprint applicable buckets in O(directory depth), without copying passwords."""
@@ -142,14 +148,17 @@ class PasswordStore:
         with self._lock:
             snapshot = self.snapshot
             user, clipboard, recent = self.user_passwords, self.clipboard_passwords, tuple(self.recent_passwords)
-        scoped = tuple(snapshot.scoped_passwords(scope_path))
-        sources = ((scoped, "scope", 15), (user, "user", 20),
+        # Retain only references to the immutable buckets. Flattening every
+        # scoped password here defeats early success and duplicates large lists.
+        sources = (*((values, "scope", 15) for values in snapshot.scoped_buckets(scope_path)), (user, "user", 20),
                    (clipboard, "clipboard", 30), (snapshot.global_passwords, "builtin", 50))
         wanted = set(recent)
         eligible = set()
         if wanted:
             for values, _, _ in sources:
                 eligible.update(wanted.intersection(values))
+                if eligible == wanted:
+                    break
         seen = set()
         for value in recent:
             if value in eligible and value not in seen:

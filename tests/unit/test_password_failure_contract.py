@@ -167,7 +167,7 @@ def test_terminal_archive_jobs_report_one_start_and_finish_even_with_volume_retr
     def inspect(task, output_dir):
         assert task.discovery_failure is None
         inspected.append(task.key)
-        return SimpleNamespace(skip_result=ExtractionResult(False, output_dir, error="terminal inspection"))
+        return ExtractionResult(False, output_dir, error="terminal inspection")
 
     def retry(task, outcome):
         retries.append(task.key)

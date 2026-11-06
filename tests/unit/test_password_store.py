@@ -1,6 +1,6 @@
 import json
 from sunpack.core.passwords.internal.builtin import _parse_document
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 
 from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
 from sunpack.core.passwords.job import PasswordJob
@@ -8,7 +8,7 @@ from tests.helpers.archive_tasks import make_archive_task, make_task_from_descri
 from sunpack.core.passwords.result import PasswordResolutionStatus
 from sunpack.core.passwords.scheduler import PasswordScheduler, PasswordSearchResult, PasswordSearchStatus
 from sunpack.core.passwords import PasswordResolver, PasswordSession, PasswordStore
-from sunpack.core.passwords.internal.store import MAX_RECENT_PASSWORDS
+from sunpack.core.passwords.internal.store import MAX_RECENT_PASSWORDS, PasswordSnapshot, password_scope_key
 from sunpack.core.passwords.verifier import PasswordBatchVerification, PasswordVerifierChain
 
 
@@ -48,6 +48,30 @@ def test_password_store_orders_user_recent_builtin_and_dedupes():
         {"value": "builtin"}, {"value": "dir", "scopes": ["D:/Work"]}, {"value": "clip", "scopes": ["D:/Work"]}
     ]}))[0]
     assert store.candidates("D:/Work") == ["dir", "clip", "cli", "shared", "builtin"]
+
+
+def test_scoped_password_candidates_stop_reading_after_early_match():
+    # Ordering tests exhaust all candidates and miss eager copies. Observe a
+    # real immutable bucket so early success must leave its tail untouched.
+    visited = []
+
+    class ObservedBucket(tuple):
+        def __iter__(self):
+            for value in super().__iter__():
+                visited.append(value)
+                yield value
+
+    snapshot = PasswordSnapshot(scoped_index=MappingProxyType({
+        password_scope_key("D:/Work"): ObservedBucket(("secret", "unused", "also-unused")),
+    }))
+    store = PasswordStore.from_sources(password_snapshot=snapshot)
+    visited.clear()
+    candidates = store.candidate_values("D:/Work/Child")
+    try:
+        assert next(candidates) == ("secret", "scope", 15)
+        assert visited == ["secret"]
+    finally:
+        candidates.close()
 
 
 def test_password_store_remembers_success_at_front():

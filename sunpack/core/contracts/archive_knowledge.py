@@ -119,10 +119,6 @@ class ArchiveKnowledge:
         self._collect_flags(self.data, output)
         return _dedupe(output)
 
-    def features(self, prefix: str = "") -> dict[str, Any]:
-        value = self.get(prefix) if prefix else self.data
-        return _jsonable(value) if isinstance(value, dict) else {}
-
     def add_evidence(self, path: str, value: Any, *, provenance: dict[str, Any] | None = None) -> "ArchiveKnowledge":
         evidence = self.data.get("_evidence")
         if not isinstance(evidence, list):
@@ -147,14 +143,6 @@ class ArchiveKnowledge:
                     output.extend(str(flag) for flag in item if str(flag))
                 else:
                     self._collect_flags(item, output)
-
-
-def merge_knowledge(*payloads: Any) -> dict[str, Any]:
-    knowledge = ArchiveKnowledge()
-    for payload in payloads:
-        if payload:
-            knowledge.merge(payload)
-    return knowledge.to_dict()
 
 
 def _parts(path: str) -> list[str]:

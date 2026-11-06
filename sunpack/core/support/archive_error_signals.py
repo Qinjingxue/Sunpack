@@ -29,33 +29,6 @@ def has_archive_damage_signals(err_text: str) -> bool:
     )
 
 
-def has_transient_system_signals(err_text: str) -> bool:
-    err_lower = normalize_error_text(err_text)
-    return any(
-        marker in err_lower
-        for marker in (
-            "no space",
-            "write error",
-            "disk full",
-            "not enough space",
-            "sharing violation",
-            "access denied",
-            "permission denied",
-            "being used by another process",
-            "process cannot access the file",
-            "cannot create output directory",
-            "device is not ready",
-            "i/o error",
-            "io error",
-            "resource temporarily unavailable",
-            "too many open files",
-            "7z process failed to start",
-            "7z process timed out",
-            "7z process made no observable progress",
-        )
-    )
-
-
 def looks_like_split_archive_name(archive_name: str) -> bool:
     if not archive_name:
         return False

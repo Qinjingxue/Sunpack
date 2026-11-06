@@ -5,7 +5,6 @@ from sunpack_native import relations_logical_name
 from sunpack.core.contracts.discovery import DiscoveryCandidate
 from sunpack.core.contracts.archive_input import ArchiveInputDescriptor, ArchiveInputPart, InputExtent
 from sunpack.core.contracts.filesystem import DirectorySnapshot
-from sunpack.pipeline.discovery.filesystem.directory_scanner import DirectoryScanner
 from sunpack.pipeline.discovery.relations.scheduler import CandidateGroup, RelationsScheduler
 from sunpack.pipeline.discovery.relations.internal.archive_input import archive_input_for_group
 
@@ -76,15 +75,6 @@ def filesystem_candidate(
         size=size,
         format_reject_mask=int(reject_mask or 0),
     )
-
-
-def build_candidates(
-    directory: str,
-    relations: RelationsScheduler | None = None,
-) -> list[DiscoveryCandidate]:
-    scheduler = relations or RelationsScheduler()
-    snapshot = DirectoryScanner(directory).scan()
-    return build_candidates_from_snapshot(snapshot, scheduler)
 
 
 def build_candidates_from_snapshot(

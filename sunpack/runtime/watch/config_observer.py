@@ -59,6 +59,7 @@ class ConfigFileObserver:
         self._observer = observer_factory()
         self._handler = _ConfigEventHandler(self)
         self._loop = loop
+        self._scheduled_emit: asyncio.Handle | None = None
         self._timer: asyncio.TimerHandle | None = None
         self._lock = threading.Lock()
         self._started = False
@@ -115,6 +116,8 @@ class ConfigFileObserver:
     def stop(self) -> None:
         with self._lock:
             self._stopped = True
+            scheduled = self._scheduled_emit
+            self._scheduled_emit = None
             timer = self._timer
             self._timer = None
             self._pending_callbacks.clear()
@@ -122,6 +125,8 @@ class ConfigFileObserver:
             self._base_files.clear()
             self._files.clear()
             self._directories.clear()
+        if scheduled is not None:
+            scheduled.cancel()
         if timer is not None:
             timer.cancel()
         if self._started:
@@ -131,14 +136,18 @@ class ConfigFileObserver:
         self._watches.clear()
 
     def notify_path_changed(self, path: str) -> None:
-        callbacks = self._files.get(str(Path(path).absolute()).casefold()) if path else None
-        if not callbacks:
-            return
+        key = str(Path(path).absolute()).casefold() if path else ""
         with self._lock:
             if self._stopped:
                 return
+            callbacks = self._files.get(key)
+            if not callbacks:
+                return
             self._pending_callbacks.update(callbacks)
-            self._loop.call_soon_threadsafe(self._schedule_emit)
+            # Coalesce before crossing threads as well as before reloading.
+            # A busy loop must not retain one callback per filesystem event.
+            if self._scheduled_emit is None:
+                self._scheduled_emit = self._loop.call_soon_threadsafe(self._schedule_emit)
 
     def notify_directory_changed(self, path: str) -> None:
         directory = Path(path).resolve()
@@ -148,6 +157,7 @@ class ConfigFileObserver:
 
     def _schedule_emit(self) -> None:
         with self._lock:
+            self._scheduled_emit = None
             if self._stopped:
                 return
             if self._timer is not None:

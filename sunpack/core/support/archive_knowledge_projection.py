@@ -37,14 +37,6 @@ def inspection_prepass(task: ArchiveTask) -> dict[str, Any]:
     return _dict(get(task, "inspection.prepass", {}))
 
 
-def inspection_status(task: ArchiveTask) -> str:
-    return str(get(task, "inspection.status", "") or get(task, "inspection.summary.status", "") or "")
-
-
-def inspection_error(task: ArchiveTask) -> str:
-    return str(get(task, "inspection.error", "") or get(task, "inspection.summary.error", "") or "")
-
-
 def selected_format(task: ArchiveTask) -> str:
     descriptor = task.archive_input()
     return str(
@@ -53,10 +45,6 @@ def selected_format(task: ArchiveTask) -> str:
         or descriptor.format_hint
         or ""
     )
-
-
-def verification_summary(task: ArchiveTask) -> dict[str, Any]:
-    return _dict(get(task, "verification.summary", {}))
 
 
 def zip_runtime_facts(task: ArchiveTask) -> dict[str, Any]:

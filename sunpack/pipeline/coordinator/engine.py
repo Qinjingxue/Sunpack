@@ -8,6 +8,7 @@ import os
 import stat
 import time
 import uuid
+from collections import OrderedDict
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Iterable, TextIO
@@ -435,10 +436,10 @@ class _PathLeaseRegistry:
             tuple[tuple[tuple[str, int, int, int, int], ...], bool],
             str,
         ] = {}
-        self._completed_watch_generations: dict[
+        self._completed_watch_generations: OrderedDict[
             tuple[tuple[str, ...], bool],
             tuple[tuple[tuple[str, int, int, int, int], ...], str],
-        ] = {}
+        ] = OrderedDict()
         self._waiters_by_blocker: dict[str, set[asyncio.Future[None]]] = {}
         self._waiter_blockers: dict[
             asyncio.Future[None],
@@ -662,8 +663,7 @@ class _PathLeaseRegistry:
             self._completed_watch_generations.pop(key, None)
             return ""
         # Refresh insertion order so the bounded map behaves as a tiny LRU.
-        self._completed_watch_generations.pop(key, None)
-        self._completed_watch_generations[key] = record
+        self._completed_watch_generations.move_to_end(key)
         return output_dir
 
     def completed_watch_family_output(self, path: str, *, deep_detect: bool = False) -> str:
@@ -691,11 +691,10 @@ class _PathLeaseRegistry:
             return
         key = (tuple(row[0] for row in ownership_version), deep_detect)
         record = (ownership_version, os.path.abspath(os.path.normpath(output_dir)))
-        self._completed_watch_generations.pop(key, None)
         self._completed_watch_generations[key] = record
+        self._completed_watch_generations.move_to_end(key)
         while len(self._completed_watch_generations) > self._COMPLETED_WATCH_LIMIT:
-            oldest = next(iter(self._completed_watch_generations))
-            self._completed_watch_generations.pop(oldest, None)
+            self._completed_watch_generations.popitem(last=False)
 
     def _blocking_owners(
         self,
@@ -853,7 +852,6 @@ class _PipelineServices:
         config: dict,
         broker: AsyncWorkBroker,
     ):
-        self.config = config
         self.broker = broker
         self.output_reservations = OutputReservationRegistry()
         worker_config = _worker_config(config)

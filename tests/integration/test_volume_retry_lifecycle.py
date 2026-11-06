@@ -2,7 +2,6 @@ import asyncio
 import subprocess
 import threading
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
@@ -58,10 +57,10 @@ def test_real_split_archive_retry_updates_cleanup_and_avoids_lease_cycle(tmp_pat
                 first_inspection = False
                 if barrier is not None:
                     barrier.wait(timeout=5)
-                return SimpleNamespace(skip_result=ExtractionResult(
+                return ExtractionResult(
                     success=False, out_dir=out_dir,
                     failure=FailureInfo(FailureKind.MISSING_VOLUME, "extraction", "late volume"),
-                ))
+                )
             return original_inspect(task, out_dir, **kwargs)
 
         runtime.task_scanner.direct_file_tasks = lambda roots: [task_for(roots)]

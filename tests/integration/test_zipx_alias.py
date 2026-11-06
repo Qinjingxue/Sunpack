@@ -90,11 +90,13 @@ def test_zipx_zstd_and_unsupported_methods_keep_zip_identity(tmp_path, method):
     assert tasks[0].archive_input().format_hint == "zip"
 
     # Exercise the worker's defensive alias directly, including dot/case normalization.
+    descriptor = tasks[0].archive_input().to_dict()
+    descriptor["format_hint"] = ".ZIPX"
     output = tmp_path / "output"
     process = subprocess.run(
         [get_sevenzip_bridge_worker_path()],
         input=json.dumps({"job_id": "zipx-method", "archive_path": str(archive),
-                          "output_dir": str(output), "format_hint": ".ZIPX"}),
+                          "output_dir": str(output), "archive_input": descriptor}),
         capture_output=True, text=True, encoding="utf-8", timeout=30,
         creationflags=subprocess.CREATE_NO_WINDOW,
     )

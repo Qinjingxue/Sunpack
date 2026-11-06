@@ -18,7 +18,7 @@ from sunpack.pipeline.coordinator.engine import PipelineEngine, _PathLeaseRegist
 from sunpack.pipeline.coordinator.scan_session import DiscoveryScanSession
 from sunpack.pipeline.coordinator.task_provider import ArchiveTaskProvider
 from sunpack.pipeline.discovery.filesystem.directory_scanner import DirectoryScanner
-from sunpack.pipeline.extraction.internal.workflow.preflight import PreExtractInspector
+from sunpack.pipeline.extraction.scheduler import ExtractionScheduler
 from sunpack.pipeline.extraction.internal.sevenzip.sevenzip_runner import SevenZipRunner
 from sunpack.pipeline.postprocess.internal.cleanup import ArchiveCleanup
 from tests.helpers.config_factory import make_config
@@ -111,7 +111,7 @@ def test_copy_timestamp_finalization_does_not_repeat_completed_split(tmp_path, m
     config["post_extract"]["archive_cleanup_mode"] = cleanup
 
     async def scenario():
-        paused, resume = _pause_first(monkeypatch, PreExtractInspector, "inspect")
+        paused, resume = _pause_first(monkeypatch, ExtractionScheduler, "inspect")
         waiting = asyncio.Event()
         original_replace = _PathLeaseRegistry.replace
         original_waiter = _PathLeaseRegistry._register_waiter
@@ -212,7 +212,7 @@ def test_waiting_snapshot_is_refreshed_after_owner_cleanup_without_blocking_othe
     output = tmp_path/"output"
 
     async def scenario():
-        paused, resume = _pause_first(monkeypatch, PreExtractInspector, "inspect")
+        paused, resume = _pause_first(monkeypatch, ExtractionScheduler, "inspect")
         waiting = asyncio.Event()
         original = _PathLeaseRegistry._register_waiter
 
