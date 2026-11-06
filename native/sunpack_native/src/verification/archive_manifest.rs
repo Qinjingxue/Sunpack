@@ -134,7 +134,7 @@ impl NativeArchiveManifest {
     #[pyo3(signature = (limit=None))]
     fn expected_names(&self, limit: Option<usize>) -> PyResult<Vec<String>> {
         (0..self.entry_count(limit))
-            .map(|index| Ok(self.entries.get(index)?.path.clone()))
+            .map(|index| Ok(self.entry_view(index)?.path.to_owned()))
             .collect()
     }
 
@@ -146,10 +146,10 @@ impl NativeArchiveManifest {
         let end = offset.saturating_add(limit).min(self.entries.len());
         (offset..end)
             .map(|index| {
-                let item = self.entries.get(index)?;
+                let item = self.entry_view(index)?;
                 let row = PyDict::new(py);
-                row.set_item("path", &item.path)?;
-                row.set_item("archive_path", item.raw_path.as_ref().unwrap_or(&item.path))?;
+                row.set_item("path", item.path)?;
+                row.set_item("archive_path", item.raw_path.unwrap_or(item.path))?;
                 row.set_item("size", item.size)?;
                 row.set_item("has_crc", item.crc32.is_some())?;
                 if let Some(crc32) = item.crc32 {

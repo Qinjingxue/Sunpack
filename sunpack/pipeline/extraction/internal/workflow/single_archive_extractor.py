@@ -220,11 +220,7 @@ class SingleArchiveExtractor:
         correct_pwd = resolution.password
         test_err = resolution.error_text
         with _phase(phase_timer, f"{phase_prefix}_scan_filename_encoding"):
-            format_hint = task.archive_input().format_hint
-            filename_encoding = self.metadata_scanner.scan_for_task(
-                task, run_archive, password=correct_pwd,
-                part_paths=run_parts, format_hint=format_hint,
-            )
+            filename_encoding = self.metadata_scanner.scan_for_task(task)
             selected_codepage = filename_encoding.selected_codepage
             if filename_encoding.error:
                 # Filename detection is an optional override.  Failure or

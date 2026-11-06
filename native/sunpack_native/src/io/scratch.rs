@@ -1,7 +1,6 @@
 //! Short-lived spill storage. Memory limits select storage, never truncate data.
 use crate::io::resource_lifecycle::TrackedFile;
 use serde::{de::DeserializeOwned, Serialize};
-use std::borrow::Cow;
 use std::io::{self, BufRead, BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
 use std::marker::PhantomData;
 use std::ops::Deref;
@@ -279,22 +278,11 @@ impl<T> From<Vec<T>> for Rows<T> {
         Self::Memory(value)
     }
 }
-impl<T: DeserializeOwned + Clone> Rows<T> {
+impl<T> Rows<T> {
     pub fn len(&self) -> usize {
         match self {
             Self::Memory(rows) => rows.len(),
             Self::Disk { count, .. } => *count,
-        }
-    }
-    pub fn get(&self, index: usize) -> io::Result<Cow<'_, T>> {
-        match self {
-            Self::Memory(rows) => rows
-                .get(index)
-                .map(Cow::Borrowed)
-                .ok_or_else(|| io::Error::other("row index out of range")),
-            Self::Disk { .. } => rmp_serde::from_slice(self.serialized(index)?.unwrap())
-                .map(Cow::Owned)
-                .map_err(io::Error::other),
         }
     }
     /// Borrow a spill record for zero-copy deserialization. Resident rows need
@@ -772,9 +760,12 @@ mod tests {
                 let expected = &expected;
                 scope.spawn(move || {
                     for index in (shard..64).step_by(4).rev() {
-                        assert_eq!(rows.get(index).unwrap().as_ref(), &expected[index]);
+                        let row: (&str, u64) =
+                            rmp_serde::from_slice(rows.serialized(index).unwrap().unwrap())
+                                .unwrap();
+                        assert_eq!(row, (expected[index].0.as_str(), expected[index].1));
                     }
-                    assert!(rows.get(64).is_err());
+                    assert!(rows.serialized(64).is_err());
                 });
             }
         });

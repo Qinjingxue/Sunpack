@@ -43,16 +43,8 @@ class ArchiveMetadataScanner:
         )
         return self._scan_descriptor(descriptor)
 
-    def scan_for_task(
-        self,
-        task: ArchiveTask,
-        archive_path: str,
-        password: Optional[str] = None,
-        part_paths: list[str] | None = None,
-        format_hint: str = "",
-    ) -> ArchiveMetadataScanResult:
+    def scan_for_task(self, task: ArchiveTask) -> ArchiveMetadataScanResult:
         """Reuse native filename metadata across extraction retries for one task."""
-        del password
         descriptor = task.archive_input()
         source_generation = task.runtime.get("source_generation")
         cached = task.runtime.get(self.TASK_CACHE_KEY)

@@ -239,7 +239,7 @@ def test_task_metadata_cache_survives_scanner_instance_change(tmp_path, monkeypa
     )
     task = SimpleNamespace(runtime={}, archive_input=lambda: descriptor)
 
-    first = ArchiveMetadataScanner().scan_for_task(task, str(archive), format_hint="zip")
+    first = ArchiveMetadataScanner().scan_for_task(task)
 
     def unexpected_stat(*_args, **_kwargs):
         pytest.fail("metadata cache hit re-statted archive parts")
@@ -252,7 +252,7 @@ def test_task_metadata_cache_survives_scanner_instance_change(tmp_path, monkeypa
     second_scanner._scan_descriptor = lambda *_args, **_kwargs: pytest.fail(
         "metadata was rescanned"
     )
-    second = second_scanner.scan_for_task(task, str(archive), format_hint="zip")
+    second = second_scanner.scan_for_task(task)
     assert second.sample_count == first.sample_count
 
 

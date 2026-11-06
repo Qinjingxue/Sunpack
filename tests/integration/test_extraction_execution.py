@@ -58,18 +58,19 @@ class FakePasswordResolver:
 
 
 class FakeMetadataScanner:
-    def scan_for_task(self, task, archive, password=None, part_paths=None, format_hint=""):
+    def scan_for_task(self, task):
+        descriptor = task.archive_input()
         return ArchiveMetadataScanResult(
-            archive_path=str(archive),
-            archive_type=Path(str(archive)).suffix.lower().lstrip(".") or "unknown",
+            archive_path=descriptor.entry_path,
+            archive_type=descriptor.format_hint or "unknown",
             reasons=["test fixture keeps the default filename encoding"],
         )
 
 
 class FakeFailingMetadataScanner:
-    def scan_for_task(self, task, archive, password=None, part_paths=None, format_hint=""):
+    def scan_for_task(self, task):
         result = ArchiveMetadataScanResult(
-            archive_path=str(archive),
+            archive_path=task.archive_input().entry_path,
             archive_type="zip",
             reasons=["ambiguous filename encoding"],
         )

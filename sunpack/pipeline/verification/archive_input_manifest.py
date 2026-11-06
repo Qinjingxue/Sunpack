@@ -56,7 +56,7 @@ class ArchiveInputManifest:
     def expected_names(self) -> list[str]:
         if self.entries is None:
             return []
-        return list(self.entries.expected_names(self.retained_file_count))
+        return self.entries.expected_names()
 
 
 _EVIDENCE_CACHE_ATTRIBUTE = "_archive_input_manifest_full_cache"
