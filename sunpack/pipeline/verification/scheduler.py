@@ -111,14 +111,6 @@ class VerificationScheduler:
         phase_timer: Callable[..., Any] | None = None,
         phase_prefix: str = "verify",
     ) -> VerificationResult:
-        with _phase(phase_timer, f"{phase_prefix}_build_evidence"):
-            evidence = build_verification_evidence(
-                task,
-                extraction_result,
-                self.password_session,
-                phase_timer=phase_timer,
-                phase_prefix=f"{phase_prefix}_build_evidence",
-            )
         if not self.config.get("enabled", False):
             if not extraction_result.success:
                 password_failure = extraction_result.failure is not None and extraction_result.failure.is_password_failure
@@ -141,6 +133,14 @@ class VerificationScheduler:
                 decision_hint=DECISION_ACCEPT,
             )
             return result
+        with _phase(phase_timer, f"{phase_prefix}_build_evidence"):
+            evidence = build_verification_evidence(
+                task,
+                extraction_result,
+                self.password_session,
+                phase_timer=phase_timer,
+                phase_prefix=f"{phase_prefix}_build_evidence",
+            )
         with _phase(phase_timer, f"{phase_prefix}_pipeline"):
             result = VerificationPipeline(self.config).run(
                 evidence,

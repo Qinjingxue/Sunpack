@@ -1,7 +1,11 @@
 import zipfile
+from unittest.mock import patch
+
+import pytest
 
 from sunpack.core.config.schema import normalize_config
 from sunpack.core.contracts.extraction import ExtractionResult
+from sunpack.core.contracts.failures import FailureInfo, FailureKind
 from sunpack.core.contracts.verification import (
     CONTAINER_INTEGRITY_NONCANONICAL,
     CONTENT_INTEGRITY_VERIFIED_COMPLETE,
@@ -125,7 +129,11 @@ def test_verification_scheduler_disabled_returns_disabled_assessment(tmp_path):
         }
     }))
 
-    verification = scheduler.verify(task, result)
+    # Disabled verification must not depend on evidence construction succeeding.
+    # The normal pipeline tests only check which methods ran, not this boundary.
+    with patch("sunpack.pipeline.verification.scheduler.build_verification_evidence",
+               side_effect=AssertionError("disabled verification built evidence")):
+        verification = scheduler.verify(task, result)
 
     assert verification.assessment_status == "disabled"
     assert verification.decision_hint == "accept"
@@ -133,7 +141,11 @@ def test_verification_scheduler_disabled_returns_disabled_assessment(tmp_path):
     assert CALLS == []
 
 
-def test_verification_scheduler_disabled_routes_failed_extraction_to_failure(tmp_path):
+@pytest.mark.parametrize("failure_kind, decision", [
+    (FailureKind.DAMAGED, "fail"),
+    (FailureKind.PASSWORD_REQUIRED, "request_password"),
+])
+def test_verification_scheduler_disabled_routes_failed_extraction_to_failure(tmp_path, failure_kind, decision):
     CALLS.clear()
     task, result = _task_and_result(tmp_path)
     result = ExtractionResult(
@@ -142,6 +154,7 @@ def test_verification_scheduler_disabled_routes_failed_extraction_to_failure(tmp
         out_dir=result.out_dir,
 
         error="fatal archive damage",
+        failure=FailureInfo(failure_kind, "extraction", "extraction failed"),
     )
     scheduler = VerificationScheduler(make_config({
         "verification": {
@@ -150,10 +163,12 @@ def test_verification_scheduler_disabled_routes_failed_extraction_to_failure(tmp
         }
     }))
 
-    verification = scheduler.verify(task, result)
+    with patch("sunpack.pipeline.verification.scheduler.build_verification_evidence",
+               side_effect=AssertionError("disabled verification built evidence")):
+        verification = scheduler.verify(task, result)
 
     assert verification.assessment_status == "disabled"
-    assert verification.decision_hint == "fail"
+    assert verification.decision_hint == decision
     assert verification.completeness == 0.0
     assert CALLS == []
 
