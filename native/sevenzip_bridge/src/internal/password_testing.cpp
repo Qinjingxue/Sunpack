@@ -320,7 +320,7 @@ namespace sunpack::sevenzip
                 }
 
                 const std::wstring callback_path = canonical_names.empty() ? callback_archive_path(archive_path, part_paths) : canonical_names.front();
-                auto *raw_open_callback = new OpenCallback(password, callback_path, part_paths, canonical_names);
+                auto *raw_open_callback = new OpenCallback(password, callback_path, part_paths, canonical_names, InputPrefetchConfig{false}, native_job_cancel_token(), input_ranges);
                 CMyComPtr<IArchiveOpenCallback> open_callback(raw_open_callback);
 
                 hr = archive->Open(stream.Interface(), search_limit, open_callback.Interface());
@@ -570,7 +570,8 @@ namespace sunpack::sevenzip
 
         const std::vector<std::wstring> &canonical_names,
 
-        const std::wstring &format_hint
+        const std::wstring &format_hint,
+        const std::vector<ExtractInputRange> &part_ranges
 
     )
     {
@@ -579,7 +580,7 @@ namespace sunpack::sevenzip
 
         return test_password_batch(archive_path,
             part_paths.empty() ? std::vector<std::wstring>{archive_path} : part_paths,
-            {}, format_hint, passwords, password_count, canonical_names);
+            part_ranges, format_hint, passwords, password_count, canonical_names);
 
 #else
 

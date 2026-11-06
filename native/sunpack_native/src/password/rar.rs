@@ -56,6 +56,7 @@ pub(crate) struct RarTerminalProof {
     pub(crate) end_block_flags: u64,
     pub(crate) end_offset: Option<u64>,
     pub(crate) volume_number: Option<u32>,
+    pub(crate) main_volume: Option<(u64, Option<u32>)>,
 }
 
 fn decrypt_cbc_block<C>(cipher: &C, previous: &mut [u8; 16], encrypted: &[u8]) -> [u8; 16]
@@ -1358,9 +1359,9 @@ fn walk_rar5_encrypted_headers(
     mut block_offset: u64,
     cipher: &Aes256,
     max_blocks: usize,
-    mut password_matched: bool,
+    password_matched: bool,
 ) -> io::Result<RarTerminalProof> {
-    let incomplete = |password_matched| RarTerminalProof {
+    let mut proof = RarTerminalProof {
         password_matched,
         ..Default::default()
     };
@@ -1368,41 +1369,42 @@ fn walk_rar5_encrypted_headers(
         let Some((full, next_header_offset)) =
             read_rar5_encrypted_header(reader, block_offset, cipher)?
         else {
-            return Ok(incomplete(password_matched));
+            return Ok(proof);
         };
         let stored_crc = u32::from_le_bytes([full[0], full[1], full[2], full[3]]);
         let Some((_header_size, after_size)) = read_vint(&full, 4) else {
-            return Ok(incomplete(password_matched));
+            return Ok(proof);
         };
         if crc32(&full[4..]) != stored_crc {
-            return Ok(incomplete(password_matched));
+            return Ok(proof);
         }
         let Some((header_type, after_type)) = read_vint(&full, after_size) else {
-            return Ok(incomplete(password_matched));
+            return Ok(proof);
         };
         let Some((header_flags, mut field_cursor)) = read_vint(&full, after_type) else {
-            return Ok(incomplete(password_matched));
+            return Ok(proof);
         };
         if !matches!(header_type, 1..=5) && header_flags & 0x0004 == 0 {
-            return Ok(incomplete(password_matched));
+            return Ok(proof);
         }
-        if !password_matched {
-            // No trusted quick check: confirm the existing main-header CRC
-            // proof before any incomplete tail can report a password match.
-            if rar5_main_volume(&full, 0).is_none() {
-                return Ok(incomplete(false));
-            }
-            password_matched = true;
+        if proof.main_volume.is_none() {
+            // Retain the same decrypted main-header facts for Embedded and
+            // Relations, so neither derives the key or parses this header again.
+            let Some(main) = rar5_main_volume(&full, 0) else {
+                return Ok(proof);
+            };
+            proof.main_volume = Some(main);
+            proof.password_matched = true;
         }
         if header_flags & 0x0001 != 0 {
             let Some((_, after_extra)) = read_vint(&full, field_cursor) else {
-                return Ok(incomplete(password_matched));
+                return Ok(proof);
             };
             field_cursor = after_extra;
         }
         let data_size = if header_flags & 0x0002 != 0 {
             let Some((value, _)) = read_vint(&full, field_cursor) else {
-                return Ok(incomplete(password_matched));
+                return Ok(proof);
             };
             value
         } else {
@@ -1421,11 +1423,12 @@ fn walk_rar5_encrypted_headers(
                 end_block_flags: end_flags,
                 end_offset: Some(next),
                 volume_number: None,
+                main_volume: proof.main_volume,
             });
         }
         block_offset = next;
     }
-    Ok(incomplete(password_matched))
+    Ok(proof)
 }
 
 fn read_rar5_encrypted_header(
@@ -1595,6 +1598,7 @@ fn walk_rar4_encrypted_headers(
                 end_block_flags: u64::from(header_flags),
                 end_offset: Some(next),
                 volume_number: rar4_end_volume(full),
+                main_volume: None,
             });
         }
         block_offset = next;

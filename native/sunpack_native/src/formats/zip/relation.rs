@@ -1,5 +1,5 @@
 /// Disk-relative directory coordinates retained once with the terminal fact.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct RelationDirectory {
     pub disk: u32,
     pub cd_disk: u32,

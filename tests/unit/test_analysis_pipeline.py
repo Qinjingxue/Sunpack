@@ -47,11 +47,12 @@ def _rar5_vint(value: int) -> bytes:
             return bytes(out)
 
 
-def _rar5_block(header_type: int, flags: int = 0, data: bytes = b"") -> bytes:
+def _rar5_block(header_type: int, flags: int = 0, data: bytes = b"", *, body: bytes = b"") -> bytes:
     fields = _rar5_vint(header_type) + _rar5_vint(flags)
     if data:
         flags |= 0x0002
         fields = _rar5_vint(header_type) + _rar5_vint(flags) + _rar5_vint(len(data))
+    fields += body
     header_size = _rar5_vint(len(fields))
     header_data = header_size + fields
     return crc32(header_data).to_bytes(4, "little") + header_data + data
@@ -355,7 +356,9 @@ def test_rar_missing_main_header_marks_encrypted_unwalkable(tmp_path):
 
 def test_rar5_header_encrypted_candidate_never_uses_following_archive_as_end(tmp_path):
     encrypted = b"Rar!\x1a\x07\x01\x00" + _rar5_block(4)
-    follower = _rar5_bytes()
+    # Both main and ENDARC have a mandatory flags field beyond the common
+    # header. The shared volume parser must receive a structurally valid peer.
+    follower = b"Rar!\x1a\x07\x01\x00" + _rar5_block(1, body=b"\0") + _rar5_block(5, body=b"\0")
     carrier_size = len(b"carrier")
     body = b"carrier" + encrypted + b"\x00" * 64 + follower
     follower_start = carrier_size + len(encrypted) + 64

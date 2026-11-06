@@ -497,13 +497,13 @@ namespace sunpack::sevenzip
                 PipelinePrepareScope scope(pipeline_timing.get(), PipelinePreparePhase::CallbackSetup);
                 const std::wstring callback_path = canonical_names.empty() ? callback_archive_path(archive_path, part_paths) : canonical_names.front();
                 raw_open_callback = new OpenCallback(
-                    password, callback_path, part_paths, canonical_names, prefetch_config, cancel_token);
+                    password, callback_path, part_paths, canonical_names, prefetch_config, cancel_token, input_ranges);
                 open_callback = CMyComPtr<IArchiveOpenCallback>(raw_open_callback);
             }
 #else
             const std::wstring callback_path = canonical_names.empty() ? callback_archive_path(archive_path, part_paths) : canonical_names.front();
             auto *raw_open_callback = new OpenCallback(
-                password, callback_path, part_paths, canonical_names, prefetch_config, cancel_token);
+                password, callback_path, part_paths, canonical_names, prefetch_config, cancel_token, input_ranges);
             CMyComPtr<IArchiveOpenCallback> open_callback(raw_open_callback);
 #endif
 
@@ -950,7 +950,8 @@ namespace sunpack::sevenzip
 
         std::size_t job_buffer_budget,
 
-        std::shared_ptr<std::atomic<bool>> cancel_token
+        std::shared_ptr<std::atomic<bool>> cancel_token,
+        const std::vector<ExtractInputRange> &part_ranges
 
     )
     {
@@ -971,7 +972,7 @@ namespace sunpack::sevenzip
 
             effective_part_paths,
 
-            {},
+            part_ranges,
 
             format_hint,
 

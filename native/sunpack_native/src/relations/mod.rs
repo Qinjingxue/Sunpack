@@ -68,7 +68,7 @@ pub(crate) struct ProposalValidation {
 /// Owned by the candidate table's scan lifetime; never a process-wide cache.
 #[derive(Default)]
 pub(crate) struct RelationCache {
-    anchors: HashMap<String, VolumeAnchor>,
+    pub(crate) anchors: HashMap<String, VolumeAnchor>,
     names: HashMap<String, filename::NameFeatures>,
 }
 
@@ -192,6 +192,10 @@ impl<'a> RelationCandidateData<'a> {
 }
 
 impl NativeRelationGroup {
+    pub(crate) fn is_incomplete(&self) -> bool {
+        matches!(self, Self::Proposal(_, GroupKind::Incomplete))
+    }
+
     pub(crate) fn entry_anchor(&self) -> Option<&VolumeAnchor> {
         match self {
             Self::Ordinary(row, _) => row.anchor.as_ref(),
@@ -227,8 +231,10 @@ impl NativeRelationGroup {
                 },
             )
         } else if !data.relation_confirmed
-            && data.multivolume
-            && (data.is_split || data.structural_non_head)
+            && ((data.multivolume && (data.is_split || data.structural_non_head))
+                || self
+                    .entry_anchor()
+                    .is_some_and(|a| a.evidence.contains(&"embedded:volume_candidate")))
         {
             Some("missing_volume")
         } else {
@@ -434,6 +440,42 @@ pub(crate) fn relation_group_cached_anchors(
             );
         }
     }
+}
+
+/// Re-enter only the original same-stem buckets, borrowing this scan's raw
+/// scope and verified anchors. No directory enumeration or Embedded scan.
+pub(crate) fn resolve_embedded_volumes(
+    snapshots: &[NativeDirectorySnapshot],
+    anchors: Vec<VolumeAnchor>,
+    excluded: &HashSet<String>,
+    mut cache: RelationCache,
+) -> Vec<NativeRelationGroup> {
+    let selected: HashSet<_> = anchors.iter().map(|a| path_key(&a.path)).collect();
+    cache
+        .anchors
+        .extend(anchors.into_iter().map(|a| (path_key(&a.path), a)));
+    let mut output = Vec::new();
+    let mut remaining = selected;
+    for snapshot in snapshots {
+        let keys: HashSet<_> = snapshot
+            .rows
+            .iter()
+            .map(|&i| path_key(&snapshot.table.paths[i]))
+            .filter(|key| remaining.contains(key))
+            .collect();
+        if keys.is_empty() {
+            continue;
+        }
+        let view = snapshot.without_path_keys(excluded);
+        output.extend(build_candidate_groups_from_source(
+            RelationSource::Snapshot(&view, Some(&cache)),
+            &keys,
+            None,
+            Some(&cache),
+        ));
+        remaining.retain(|key| !keys.contains(key));
+    }
+    output
 }
 
 fn build_candidate_groups_from_source(
@@ -1074,7 +1116,9 @@ fn proposal_volume_dicts(
             }
             if let Some(end) = anchors
                 .get(&path_key(path))
-                .filter(|a| a.format == "zip" && a.anchor_roles.contains(&"terminal"))
+                .filter(|a| {
+                    (a.format == "zip" && a.anchor_roles.contains(&"terminal")) || a.format == "rar"
+                })
                 .and_then(|a| a.expected_logical_size.filter(|&end| end < a.size))
             {
                 dict.set_item("end", end)?;

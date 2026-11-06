@@ -445,7 +445,7 @@ sunpack::sevenzip::PasswordTestResult run_password_candidate_probe(
     for (const auto& password : candidates) {
         password_ptrs.push_back(password.c_str());
     }
-    if (!archive_input.ranges.empty()) {
+    if (!archive_input.ranges.empty() && archive_input.canonical_names.empty()) {
         return test_passwords_with_ranges(
             archive_input.archive_path,
             archive_input.ranges,
@@ -459,7 +459,7 @@ sunpack::sevenzip::PasswordTestResult run_password_candidate_probe(
         password_ptrs.data(),
         static_cast<int>(password_ptrs.size()),
         archive_input.canonical_names,
-        archive_input.format_hint);
+        archive_input.format_hint, archive_input.ranges);
 }
 
 sunpack::sevenzip::ExtractArchiveResult password_candidate_failure(
@@ -639,6 +639,8 @@ WorkerArchiveInput parse_archive_input_descriptor(
         std::wstring canonical_name;
         unsigned long long start = 0;
         bool has_start = false;
+        unsigned long long end = 0;
+        bool has_end = false;
     };
     const auto part_objects = descriptor.object_array_field("parts");
     std::vector<ParsedPart> structured_parts;
@@ -659,12 +661,15 @@ WorkerArchiveInput parse_archive_input_descriptor(
                     const bool has_start =
                         object.uint_field("start", &start) ||
                         object.uint_field("start_offset", &start);
+                    unsigned long long end = 0;
+                    const bool has_end = object.uint_field("end", &end);
+                    if (has_end && end < start) input.validation_error = "structured volume extent is reversed";
                     structured_parts.push_back({
                         static_cast<int>(number),
                         utf8_to_wide(path),
                         utf8_to_wide(canonical_name),
                         start,
-                        has_start,
+                        has_start, end, has_end,
                     });
                 }
             }
@@ -675,6 +680,9 @@ WorkerArchiveInput parse_archive_input_descriptor(
             return left.number < right.number;
         });
         parts.clear();
+        const bool has_ranges = std::any_of(structured_parts.begin(), structured_parts.end(),
+            [](const ParsedPart &part) { return part.start != 0 || part.has_end; });
+        if (has_ranges) input.ranges.reserve(structured_parts.size());
         for (std::size_t index = 0; index < structured_parts.size(); ++index) {
             // Volume numbers are the Relations contract, so a gap is a proven
             // missing volume rather than a malformed request.  It is reported
@@ -690,7 +698,9 @@ WorkerArchiveInput parse_archive_input_descriptor(
                 structured_parts[index].number != structured_parts[index - 1].number + 1) {
                 input.missing_volume_number = structured_parts[index - 1].number + 1;
             }
-            parts.push_back(structured_parts[index].path);
+            const auto &part = structured_parts[index];
+            if (has_ranges) input.ranges.push_back({part.path, part.start, part.end, part.has_end});
+            parts.push_back(part.path);
             input.canonical_names.push_back(structured_parts[index].canonical_name);
             input.volume_numbers.push_back(structured_parts[index].number);
         }
@@ -1235,8 +1245,8 @@ int run_request(
         return 2;
     }
     auto extract_with_password = [&](const std::wstring& selected_password) {
-        return archive_input.ranges.empty()
-            ? extract_archive_with_parts(archive_input.archive_path, archive_input.part_paths, archive_input.format_hint, selected_password, output_dir, codepage, progress, dry_run, archive_input.canonical_names, archive_input.open_mode == L"native_volumes", shared_writer, static_cast<std::size_t>(job_buffer_budget), cancel_token)
+        return archive_input.ranges.empty() || !archive_input.canonical_names.empty()
+            ? extract_archive_with_parts(archive_input.archive_path, archive_input.part_paths, archive_input.format_hint, selected_password, output_dir, codepage, progress, dry_run, archive_input.canonical_names, archive_input.open_mode == L"native_volumes", shared_writer, static_cast<std::size_t>(job_buffer_budget), cancel_token, archive_input.ranges)
             : extract_archive_with_ranges(archive_input.archive_path, archive_input.ranges, archive_input.format_hint, selected_password, output_dir, codepage, progress, dry_run, shared_writer, static_cast<std::size_t>(job_buffer_budget), cancel_token);
     };
 

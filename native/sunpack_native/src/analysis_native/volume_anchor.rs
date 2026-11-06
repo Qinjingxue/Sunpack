@@ -36,7 +36,7 @@ pub(crate) enum VolumeAnchorProbeDepth {
     Deep,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct VolumeAnchor {
     pub(crate) path: String,
     pub(crate) size: u64,
@@ -305,7 +305,7 @@ fn probe_path(
         }
     }
 
-    let prefix = complete_anchor_prefix(&prefix, &mut result, 0);
+    let prefix = complete_anchor_prefix(&prefix, &mut result, 0, None);
     let prefix = prefix.as_ref();
     let allow_embedded = result.pe_state != PeState::None;
 
@@ -348,7 +348,7 @@ fn probe_cheap_prefix(
     prefix: &[u8],
     password: Option<&str>,
 ) -> VolumeAnchor {
-    let prefix = complete_anchor_prefix(prefix, &mut result, 0);
+    let prefix = complete_anchor_prefix(prefix, &mut result, 0, None);
     let prefix = prefix.as_ref();
     // Relation is a split-volume recovery layer, not a general archive
     // detector.  The cheap pass only keeps structure that can itself seed
@@ -413,7 +413,12 @@ fn open_cheap_file(path: &str) -> std::io::Result<TrackedFile> {
     TrackedFile::open_reader(path, "volume_anchor_cheap")
 }
 
-fn read_anchor_header(out: &mut VolumeAnchor, offset: u64, len: usize) -> Option<Vec<u8>> {
+fn read_anchor_header_from(
+    out: &mut VolumeAnchor,
+    offset: u64,
+    len: usize,
+    reader: Option<&ManagedReader>,
+) -> Option<Vec<u8>> {
     if offset
         .checked_add(len as u64)
         .is_none_or(|end| end > out.size)
@@ -421,7 +426,10 @@ fn read_anchor_header(out: &mut VolumeAnchor, offset: u64, len: usize) -> Option
         out.error = "archive_header_incomplete".into();
         return None;
     }
-    match ManagedReader::open(&out.path).and_then(|r| r.read_at(offset, len)) {
+    match reader.map_or_else(
+        || ManagedReader::open(&out.path).and_then(|r| r.read_at(offset, len)),
+        |r| r.read_at(offset, len),
+    ) {
         Ok(bytes) if bytes.len() == len => {
             out.bytes_read += len as u64;
             Some(bytes)
@@ -443,6 +451,7 @@ fn complete_anchor_prefix<'a>(
     prefix: &'a [u8],
     out: &mut VolumeAnchor,
     base: u64,
+    reader: Option<&ManagedReader>,
 ) -> Cow<'a, [u8]> {
     let embedded = out.pe_state != PeState::None;
     let required = if let Some(at) = anchored_signature(prefix, RAR5, embedded) {
@@ -472,7 +481,7 @@ fn complete_anchor_prefix<'a>(
     // A continuation may merely resemble another format's leading header.
     // Failed speculative completion must not exclude that opaque volume.
     let previous_error = std::mem::take(&mut out.error);
-    let rest = read_anchor_header(out, offset, required - prefix.len());
+    let rest = read_anchor_header_from(out, offset, required - prefix.len(), reader);
     out.error = previous_error;
     let Some(rest) = rest else {
         return Cow::Borrowed(prefix);
@@ -544,6 +553,17 @@ fn probe_rar_at(
     password: Option<&str>,
     base: u64,
 ) -> bool {
+    probe_rar_at_reader(prefix, offset, out, password, base, None)
+}
+
+fn probe_rar_at_reader(
+    prefix: &[u8],
+    offset: usize,
+    out: &mut VolumeAnchor,
+    password: Option<&str>,
+    base: u64,
+    reader: Option<&ManagedReader>,
+) -> bool {
     if prefix
         .get(offset..)
         .is_some_and(|value| value.starts_with(RAR5))
@@ -564,7 +584,9 @@ fn probe_rar_at(
                 if let Some((archive_flags, number)) = rar5_decrypt_main_header_with_read(
                     &prefix[offset..],
                     password,
-                    |relative, len| read_anchor_header(out, base + offset as u64 + relative, len),
+                    |relative, len| {
+                        read_anchor_header_from(out, base + offset as u64 + relative, len, reader)
+                    },
                 ) {
                     out.needs_password = false;
                     out.wrong_password = false;
@@ -619,7 +641,9 @@ fn probe_rar_at(
                 if rar4_decrypt_header_flags_with_read(
                     &prefix[offset..],
                     password,
-                    |relative, len| read_anchor_header(out, base + offset as u64 + relative, len),
+                    |relative, len| {
+                        read_anchor_header_from(out, base + offset as u64 + relative, len, reader)
+                    },
                 )
                 .is_some()
                 {
@@ -918,7 +942,11 @@ fn probe_zip_eocd(
     out.format = "zip".to_string();
     out.confidence = "strong".to_string();
     if let Some(offset) = start_offset {
-        out.structure_offset = Some(offset as u64);
+        out.structure_offset = Some(if split_start_offset.is_some() {
+            0
+        } else {
+            offset as u64
+        });
         out.anchor_roles.push("first");
         // A local entry can also begin a later disk. Only the split marker
         // proves the physical first disk before EOCD information is known.
@@ -1166,36 +1194,112 @@ pub(crate) fn upgrade_relation_zip_carrier_tail(anchor: &VolumeAnchor) -> Volume
 /// ENDARC is a separately cached field, not a second main-header probe.
 /// Plain ENDARC records are tiny and CRC protected. Encrypted records reuse
 /// the existing password parser rather than a Python dictionary round trip.
+pub(crate) fn resolve_encrypted_relation_anchor(
+    anchor: &VolumeAnchor,
+    reader: &ManagedReader,
+    passwords: &[String],
+) -> std::io::Result<(VolumeAnchor, Option<usize>)> {
+    let rar5 = anchor.evidence.contains(&"rar5:encryption_header");
+    for (index, password) in passwords.iter().enumerate() {
+        let Some(proof) = crate::password::rar::probe_header_encrypted_terminal(
+            reader,
+            anchor.structure_offset.unwrap_or(0),
+            password,
+            usize::try_from(reader.len() / 8).unwrap_or(usize::MAX),
+        )?
+        else {
+            continue;
+        };
+        if !proof.password_matched {
+            continue;
+        }
+        if rar5 && proof.main_volume.is_none() {
+            let mut out = anchor.clone();
+            out.evidence.push("rar:password_matched_incomplete");
+            return Ok((out, None));
+        }
+        let mut out = anchor.clone();
+        out.needs_password = false;
+        out.wrong_password = false;
+        out.anchor_roles.retain(|role| *role != "encrypted_volume");
+        if let Some((flags, number)) = proof.main_volume {
+            out.multivolume = flags & 1 != 0;
+            out.standalone = !out.multivolume;
+            if out.multivolume {
+                out.internal_volume_number = Some(number.unwrap_or(0) + 1);
+                out.anchor_roles
+                    .push(if number.is_none() { "first" } else { "member" });
+                out.evidence.push("rar5:volume_header");
+            } else {
+                out.anchor_roles.push("standalone");
+                out.evidence.push("rar5:single_archive_header");
+            }
+        }
+        apply_rar_terminal_proof(&mut out, proof);
+        return Ok((out, Some(index)));
+    }
+    let mut out = anchor.clone();
+    out.wrong_password = !passwords.is_empty();
+    Ok((out, None))
+}
+
+fn apply_rar_terminal_proof(out: &mut VolumeAnchor, proof: crate::password::rar::RarTerminalProof) {
+    if proof.end_block_found {
+        let next = proof.end_block_flags & 1 != 0;
+        out.relation_has_next = Some(next);
+        out.expected_logical_size = proof.end_offset;
+        out.continuation_to_next = next;
+        merge_rar_volume(out, proof.volume_number);
+        if !next && !out.anchor_roles.contains(&"terminal") {
+            out.anchor_roles.push("terminal");
+        }
+        if !out.evidence.contains(&"relation:rar_end_checked") {
+            out.evidence.push("relation:rar_end_checked");
+        }
+    }
+}
+
 pub(crate) fn upgrade_relation_rar_end(
     anchor: &VolumeAnchor,
     password: Option<&str>,
 ) -> VolumeAnchor {
+    if anchor.relation_has_next.is_some()
+        || anchor.needs_password
+        || anchor.evidence.contains(&"relation:rar_end_checked")
+    {
+        return anchor.clone();
+    }
+    let Ok(reader) = ManagedReader::open(&anchor.path) else {
+        return anchor.clone();
+    };
+    upgrade_relation_rar_end_reader(anchor, password, &reader).unwrap_or_else(|_| anchor.clone())
+}
+
+pub(crate) fn upgrade_relation_rar_end_reader(
+    anchor: &VolumeAnchor,
+    password: Option<&str>,
+    reader: &ManagedReader,
+) -> std::io::Result<VolumeAnchor> {
     let mut out = anchor.clone();
     if out.relation_has_next.is_some()
         || out.needs_password
         || out.evidence.contains(&"relation:rar_end_checked")
     {
-        return out;
+        return Ok(out);
     }
-    let Ok(reader) = ManagedReader::open(&out.path) else {
-        return out;
-    };
     if out.encrypted {
         if let Some(password) = password {
-            if let Ok(Some(proof)) = crate::password::rar::probe_header_encrypted_terminal(
+            if let Some(proof) = crate::password::rar::probe_header_encrypted_terminal(
                 &reader,
                 out.structure_offset.unwrap_or(0),
                 password,
                 usize::try_from(reader.len() / 7).unwrap_or(usize::MAX),
-            ) {
-                if proof.end_block_found {
-                    out.relation_has_next = Some(proof.end_block_flags & 1 != 0);
-                    merge_rar_volume(&mut out, proof.volume_number);
-                }
+            )? {
+                apply_rar_terminal_proof(&mut out, proof);
             }
         }
     } else if let Some(mut cursor) = out.rar_next_header_offset {
-        let rar5 = out.evidence.contains(&"rar5:volume_header");
+        let rar5 = out.evidence.iter().any(|e| e.starts_with("rar5:"));
         let mut first_file = true;
         // Walk header spans only; data is skipped, never buffered. Start after
         // the main header whose CRC/identity the cheap probe already verified.
@@ -1203,9 +1307,7 @@ pub(crate) fn upgrade_relation_rar_end(
             if cursor.checked_add(7).is_none_or(|end| end > reader.len()) {
                 break;
             }
-            let Ok(mut header) = reader.read_at(cursor, 7) else {
-                break;
-            };
+            let mut header = reader.read_at(cursor, 7)?;
             if header.len() != 7 {
                 break;
             }
@@ -1232,9 +1334,7 @@ pub(crate) fn upgrade_relation_rar_end(
                 break;
             }
             if header_len > 7 {
-                let Ok(rest) = reader.read_at(cursor + 7, header_len - 7) else {
-                    break;
-                };
+                let rest = reader.read_at(cursor + 7, header_len - 7)?;
                 if rest.len() != header_len - 7 {
                     break;
                 }
@@ -1278,6 +1378,7 @@ pub(crate) fn upgrade_relation_rar_end(
                         break;
                     };
                     out.relation_has_next = Some(end_flags & 1 != 0);
+                    out.expected_logical_size = cursor.checked_add(header_len as u64);
                     break;
                 }
             } else {
@@ -1298,6 +1399,7 @@ pub(crate) fn upgrade_relation_rar_end(
                 }
                 if kind == 0x7b {
                     out.relation_has_next = Some(flags & 1 != 0);
+                    out.expected_logical_size = cursor.checked_add(header_len as u64);
                     merge_rar_volume(&mut out, rar4_end_volume(&header));
                     break;
                 }
@@ -1315,13 +1417,15 @@ pub(crate) fn upgrade_relation_rar_end(
         }
     }
     if let Some(next) = out.relation_has_next {
-        out.evidence.push("relation:rar_end_checked");
+        if !out.evidence.contains(&"relation:rar_end_checked") {
+            out.evidence.push("relation:rar_end_checked");
+        }
         out.continuation_to_next = next;
         if !next && !out.anchor_roles.contains(&"terminal") {
             out.anchor_roles.push("terminal");
         }
     }
-    out
+    Ok(out)
 }
 
 pub(crate) fn probe_volume_anchor_at_offset(
@@ -1330,63 +1434,71 @@ pub(crate) fn probe_volume_anchor_at_offset(
     format: &str,
     password: Option<&str>,
 ) -> VolumeAnchor {
-    let mut result = VolumeAnchor {
-        path: path.to_string(),
-        ..VolumeAnchor::default()
-    };
     let reader = match ManagedReader::open(path) {
         Ok(reader) => reader,
         Err(error) => {
-            result.error = error.to_string();
-            return result;
+            return VolumeAnchor {
+                path: path.to_string(),
+                error: error.to_string(),
+                ..VolumeAnchor::default()
+            };
         }
+    };
+    probe_volume_anchor_reader_at_offset(&reader, path, offset, format, password).unwrap_or_else(
+        |error| VolumeAnchor {
+            path: path.to_string(),
+            size: reader.len(),
+            error: error.to_string(),
+            ..VolumeAnchor::default()
+        },
+    )
+}
+
+pub(crate) fn probe_volume_anchor_reader_at_offset(
+    reader: &ManagedReader,
+    path: &str,
+    offset: u64,
+    format: &str,
+    password: Option<&str>,
+) -> std::io::Result<VolumeAnchor> {
+    let mut result = VolumeAnchor {
+        path: path.to_string(),
+        ..VolumeAnchor::default()
     };
     let size = reader.len();
     result.size = size;
     if offset >= size {
         result.error = "archive_offset_out_of_range".to_string();
-        return result;
+        return Ok(result);
     }
 
     let remaining = size - offset;
     let prefix_len = remaining.min(512) as usize;
-    let prefix = match reader.read_at(offset, prefix_len) {
-        Ok(value) => value,
-        Err(error) => {
-            result.error = error.to_string();
-            return result;
-        }
-    };
+    let prefix = reader.read_at(offset, prefix_len)?;
     result.bytes_read += prefix.len() as u64;
 
-    let prefix = complete_anchor_prefix(&prefix, &mut result, offset);
+    let prefix = complete_anchor_prefix(&prefix, &mut result, offset, Some(reader));
     let prefix = prefix.as_ref();
     let recognized = match format {
-        "rar" => probe_rar_at(&prefix, 0, &mut result, password, offset),
+        "rar" => probe_rar_at_reader(&prefix, 0, &mut result, password, offset, Some(reader)),
         "7z" => probe_seven_zip(&prefix, 0, remaining, &mut result),
         "zip" => {
             const ZIP_TAIL_MAX: u64 = 22 + 65_535;
-            let (tail, tail_start) = match read_zip_tail_for_anchor(
+            let (tail, tail_start) = read_zip_tail_for_anchor(
                 &reader,
                 offset,
                 size,
                 ZIP_TAIL_MAX,
                 &prefix,
                 &mut result.bytes_read,
-            ) {
-                Ok(value) => value,
-                Err(error) => {
-                    result.error = error.to_string();
-                    return result;
-                }
-            };
+            )?;
             probe_zip_reader(&prefix, &tail, tail_start, &mut result, &reader, offset)
         }
         _ => false,
     };
     if !recognized {
         result.error = "archive_structure_not_confirmed".to_string();
-        return result;
+        return Ok(result);
     }
 
     if offset > 0 {
@@ -1408,7 +1520,7 @@ pub(crate) fn probe_volume_anchor_at_offset(
             *expected_logical_size = expected_logical_size.saturating_add(offset);
         }
     }
-    result
+    Ok(result)
 }
 
 fn probe_standalone_stream(prefix: &[u8], out: &mut VolumeAnchor) {

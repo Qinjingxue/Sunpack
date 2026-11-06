@@ -57,13 +57,15 @@ namespace sunpack::sevenzip
             std::vector<std::wstring> part_paths = {},
             std::vector<std::wstring> canonical_names = {},
             InputPrefetchConfig volume_prefetch_config = input_prefetch_config(),
-            std::shared_ptr<std::atomic<bool>> cancel_token = native_job_cancel_token())
+            std::shared_ptr<std::atomic<bool>> cancel_token = native_job_cancel_token(),
+            const std::vector<ExtractInputRange> &part_ranges = {})
 
             : password_(std::move(password)),
 
               archive_path_(std::move(archive_path)),
 
               part_paths_(std::move(part_paths)),
+              part_ranges_(part_ranges),
 
               volume_prefetch_config_(volume_prefetch_config), cancel_token_(std::move(cancel_token))
         {
@@ -74,37 +76,40 @@ namespace sunpack::sevenzip
                 {
                     const std::wstring alias = lower_path(std::filesystem::path(canonical_names[index]).filename().wstring());
                     if (!alias.empty())
-                        volume_paths_[alias] = part_paths_[index];
+                        volume_paths_[alias] = index;
                 }
                 return;
             }
 
-            for (const auto &path : part_paths_)
+            for (std::size_t index = 0; index < part_paths_.size(); ++index)
             {
-
+                const auto &path = part_paths_[index];
                 const std::wstring name = lower_path(std::filesystem::path(path).filename().wstring());
 
                 if (!name.empty())
                 {
 
-                    volume_paths_[name] = path;
+                    volume_paths_[name] = index;
                 }
 
-                volume_paths_[lower_path(std::filesystem::path(path).wstring())] = path;
+                volume_paths_[lower_path(std::filesystem::path(path).wstring())] = index;
             }
 
             if (!archive_path_.empty())
             {
 
+                const auto found = std::find(part_paths_.begin(), part_paths_.end(), archive_path_);
+                const std::size_t index = static_cast<std::size_t>(found - part_paths_.begin());
+                if (found == part_paths_.end()) part_paths_.push_back(archive_path_);
                 const std::wstring name = lower_path(std::filesystem::path(archive_path_).filename().wstring());
 
                 if (!name.empty())
                 {
 
-                    volume_paths_[name] = archive_path_;
+                    volume_paths_[name] = index;
                 }
 
-                volume_paths_[lower_path(std::filesystem::path(archive_path_).wstring())] = archive_path_;
+                volume_paths_[lower_path(std::filesystem::path(archive_path_).wstring())] = index;
             }
         }
 
@@ -175,17 +180,22 @@ namespace sunpack::sevenzip
                 return E_FAIL;
             }
 
-            // CMyComPtr's raw-pointer constructor AddRefs, giving the object its
-            // first reference. The holder also releases it on every early return.
-            CMyComPtr<IInStream> stream_holder(
-                new FileInStream(found->second, nullptr, L"file", volume_prefetch_config_));
-            auto *stream = static_cast<FileInStream *>(stream_holder.Interface());
-
-            if (!stream->is_open())
-            {
+            const auto index = found->second;
+            const auto &path = part_paths_[index];
+            bool opened = false;
+            CMyComPtr<IInStream> stream_holder;
+            if (index < part_ranges_.size()) {
+                auto *stream = new MultiRangeInStream({part_ranges_[index]}, nullptr, volume_prefetch_config_);
+                stream_holder = CMyComPtr<IInStream>(stream);
+                opened = stream->is_open();
+            } else {
+                auto *stream = new FileInStream(path, nullptr, L"file", volume_prefetch_config_);
+                stream_holder = CMyComPtr<IInStream>(stream);
+                opened = stream->is_open();
+            }
+            if (!opened) {
                 volume_open_failed_ = true;
-                failed_volume_name_ = std::filesystem::path(found->second).filename().wstring();
-
+                failed_volume_name_ = std::filesystem::path(path).filename().wstring();
                 return E_FAIL;
             }
 
@@ -231,11 +241,12 @@ namespace sunpack::sevenzip
         std::wstring archive_path_;
 
         std::vector<std::wstring> part_paths_;
+        std::vector<ExtractInputRange> part_ranges_;
 
         const InputPrefetchConfig volume_prefetch_config_;
         std::shared_ptr<std::atomic<bool>> cancel_token_;
 
-        std::map<std::wstring, std::wstring> volume_paths_;
+        std::map<std::wstring, std::size_t> volume_paths_;
 
         bool missing_volume_requested_ = false;
         bool volume_open_failed_ = false;

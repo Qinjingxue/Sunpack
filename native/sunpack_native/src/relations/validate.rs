@@ -90,10 +90,7 @@ fn verify_seven_zip_mapping(validation: &ProposalValidation) -> std::io::Result<
     let Some(next) = first.seven_zip_next_header.as_ref() else {
         return Ok(None);
     };
-    let start = first.structure_offset.unwrap_or(0).checked_add(next.offset);
-    let Some(start) = start else {
-        return Ok(Some(false));
-    };
+    let start = next.offset;
     let Some(end) = start.checked_add(next.size) else {
         return Ok(Some(false));
     };
@@ -113,14 +110,15 @@ fn verify_seven_zip_mapping(validation: &ProposalValidation) -> std::io::Result<
         let Some(anchor) = validation.anchors.get(&path_key(&part.0)) else {
             return Ok(None);
         };
-        let Some(stop) = logical.checked_add(anchor.size) else {
+        let base = anchor.structure_offset.unwrap_or(0);
+        let Some(stop) = logical.checked_add(anchor.size.saturating_sub(base)) else {
             return Ok(Some(false));
         };
         let begin = start.max(logical);
         let finish = end.min(stop);
         if begin < finish {
             let reader = crate::io::reader::ManagedReader::open(&part.0)?.probe_reader();
-            update_relation_crc(&reader, begin - logical, finish - begin, &mut crc)?;
+            update_relation_crc(&reader, base + begin - logical, finish - begin, &mut crc)?;
             consumed += finish - begin;
         }
         logical = stop;
@@ -172,9 +170,14 @@ pub(super) fn assignment_status<'a>(
         "7z" => {
             if let Some(first) = head.filter(|a| a.format == "7z" && a.confidence == "strong") {
                 let actual = parts.clone().try_fold(0u64, |size, (_, a)| {
-                    a.and_then(|a| size.checked_add(a.size))
+                    a.and_then(|a| {
+                        size.checked_add(a.size.checked_sub(a.structure_offset.unwrap_or(0))?)
+                    })
                 });
-                match (first.expected_logical_size, actual) {
+                let expected = first
+                    .expected_logical_size
+                    .and_then(|end| end.checked_sub(first.structure_offset.unwrap_or(0)));
+                match (expected, actual) {
                     (Some(expected), Some(actual)) if actual == expected => ProposalStatus::Valid,
                     (Some(expected), Some(actual)) if actual > expected => ProposalStatus::Reject,
                     _ => ProposalStatus::Inconclusive,

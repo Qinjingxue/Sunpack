@@ -285,7 +285,11 @@ def test_split_hp_rar_group_accepts_camouflage_around_contiguous_part_token(tmp_
     _write_hex(tmp_path / second_name, PART2_HP_HEX)
     snapshot = _snapshot(tmp_path, [first_name, second_name])
 
-    groups = RelationsScheduler().build_candidate_groups(snapshot)
+    # This checks filename camouflage after decryption; an unrelated test's
+    # remembered password must not determine whether the structure is visible.
+    groups = RelationsScheduler().build_candidate_groups(
+        snapshot, path_passwords={str(tmp_path / name): "secret" for name in [first_name, second_name]},
+    )
     split_group = next(group for group in groups if group.kind == "split_archive")
 
     assert [volume.number for volume in split_group.split_volumes] == [1, 2]

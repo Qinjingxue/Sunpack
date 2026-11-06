@@ -1,3 +1,6 @@
+use crate::analysis_native::volume_anchor::{
+    probe_volume_anchor_reader_at_offset, upgrade_relation_rar_end_reader, VolumeAnchor,
+};
 #[cfg(windows)]
 use crate::io::iocp;
 use crate::io::reader::{CachedBytes, ManagedReader};
@@ -124,6 +127,7 @@ struct EmbeddedCandidate {
     extractable: bool,
     lz4_index: Option<Box<crate::formats::lz4::Index>>,
     zip_eocd_offset: Option<u64>,
+    volume_anchor: Option<Box<VolumeAnchor>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -240,6 +244,56 @@ pub(crate) struct NativeScanResult {
 }
 
 impl NativeScanResult {
+    pub(crate) fn resolved_rar_dict(
+        &self,
+        py: Python<'_>,
+        offset: u64,
+        end: u64,
+        password: Option<&str>,
+    ) -> PyResult<Py<PyDict>> {
+        self.to_py_dict_with_rar_resolution(py, Some((offset, end, password)))
+    }
+
+    /// One sparse nomination per physical input, never one VolumeAnchor per
+    /// ZIP local record. Complete peer archives retain Embedded ownership.
+    pub(crate) fn relation_anchor(&self) -> Option<VolumeAnchor> {
+        if self
+            .candidates
+            .iter()
+            .any(|c| c.boundary_kind == "exact" && c.volume_anchor.is_none())
+        {
+            return None;
+        }
+        let mut candidates = self
+            .candidates
+            .iter()
+            .filter(|c| c.volume_anchor.is_some() || (c.format == "zip" && c.end_offset.is_none()));
+        let first = candidates.next()?;
+        if candidates.any(|c| c.format != first.format || first.format != "zip") {
+            return None;
+        }
+        if let Some(anchor) = &first.volume_anchor {
+            return Some((**anchor).clone());
+        }
+        let split = first.validation == "zip_split_local_header";
+        Some(VolumeAnchor {
+            size: self.file_size,
+            format: "zip".into(),
+            confidence: if split { "strong" } else { "weak" }.into(),
+            multivolume: split,
+            continuation_to_next: split,
+            internal_volume_number: split.then_some(1),
+            structure_offset: Some(first.offset),
+            anchor_roles: if split { vec!["first"] } else { vec![] },
+            evidence: if split {
+                vec!["zip:split_marker", "zip:local_header"]
+            } else {
+                vec!["zip:local_header"]
+            },
+            ..VolumeAnchor::default()
+        })
+    }
+
     pub(crate) fn has_candidates(&self) -> bool {
         !self.candidates.is_empty()
     }
@@ -272,12 +326,29 @@ impl NativeScanResult {
     }
 
     pub(crate) fn to_py_dict(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        self.to_py_dict_with_rar_resolution(py, None)
+    }
+
+    // Project already verified facts once; never read Python rows back into
+    // Rust or clone the scan's potentially large hit/candidate collections.
+    fn to_py_dict_with_rar_resolution(
+        &self,
+        py: Python<'_>,
+        resolution: Option<(u64, u64, Option<&str>)>,
+    ) -> PyResult<Py<PyDict>> {
         let result = PyDict::new(py);
         result.set_item("complete", !self.budget_exhausted)?;
         result.set_item("signature_scan_complete", !self.budget_exhausted)?;
         result.set_item(
             "logical_resolution_complete",
-            self.logical_resolution_complete,
+            self.logical_resolution_complete
+                || resolution.is_some_and(|(offset, _, _)| {
+                    self.candidates.iter().all(|candidate| {
+                        candidate.candidate_kind != "logical_archive"
+                            || candidate.boundary_kind == "exact"
+                            || candidate.offset == offset
+                    })
+                }),
         )?;
         result.set_item("file_size", self.file_size)?;
         result.set_item("read_bytes", self.file_size)?;
@@ -303,15 +374,33 @@ impl NativeScanResult {
         result.set_item("hits", hit_rows)?;
         let rows = PyList::empty(py);
         for candidate in &self.candidates {
+            let resolved = resolution.filter(|(offset, _, _)| *offset == candidate.offset);
             let row = PyDict::new(py);
             row.set_item("format", candidate.format)?;
             row.set_item("offset", candidate.offset)?;
-            row.set_item("end_offset", candidate.end_offset)?;
+            row.set_item(
+                "end_offset",
+                resolved.map(|(_, end, _)| end).or(candidate.end_offset),
+            )?;
             row.set_item("confidence", candidate.confidence)?;
-            row.set_item("validation", candidate.validation)?;
+            if resolved.is_some() {
+                row.set_item(
+                    "validation",
+                    format!("{}_decrypted_end", candidate.validation),
+                )?;
+            } else {
+                row.set_item("validation", candidate.validation)?;
+            }
             row.set_item("candidate_kind", candidate.candidate_kind)?;
-            row.set_item("boundary_kind", candidate.boundary_kind)?;
-            row.set_item("extractable", candidate.extractable)?;
+            row.set_item(
+                "boundary_kind",
+                if resolved.is_some() {
+                    "exact"
+                } else {
+                    candidate.boundary_kind
+                },
+            )?;
+            row.set_item("extractable", resolved.is_some() || candidate.extractable)?;
             if let Some(offset) = candidate.zip_eocd_offset {
                 row.set_item("eocd_offset", offset)?;
             }
@@ -323,6 +412,9 @@ impl NativeScanResult {
             rows.append(row)?;
         }
         result.set_item("candidates", rows)?;
+        if let Some((offset, _, Some(password))) = resolution {
+            result.set_item("resolved_passwords", [(offset, password)])?;
+        }
         Ok(result.unbind())
     }
 }
@@ -1158,8 +1250,7 @@ fn validate_candidate(
     match kind {
         "zip" => validate_zip(file, file_size, offset),
         "7z" => validate_seven_zip(file, file_size, offset),
-        "rar4" => validate_rar4(file, file_size, offset),
-        "rar5" => validate_rar5(file, file_size, offset),
+        "rar4" | "rar5" => validate_rar(file, file_size, offset),
         "gzip" => validate_gzip(file, file_size, offset, suffixes),
         "bzip2" => validate_bzip2(file, file_size, offset, suffixes),
         "zstd" => validate_zstd(file, file_size, offset, suffixes),
@@ -1562,7 +1653,6 @@ fn validate_zip(
     if header.len() < 30 || &header[..4] != ZIP_LOCAL {
         return Ok(None);
     }
-    let flags = u16::from_le_bytes([header[6], header[7]]);
     let compressed_32 = u32::from_le_bytes(header[18..22].try_into().unwrap());
     let uncompressed_32 = u32::from_le_bytes(header[22..26].try_into().unwrap());
     let name_len = u16::from_le_bytes([header[26], header[27]]) as u64;
@@ -1614,13 +1704,22 @@ fn validate_zip(
         validation = "zip64_local_header_and_data_range";
         confidence = 0.99;
     }
-    let Some(data_end) = header_end.checked_add(compressed_size) else {
+    let Some(_data_end) = header_end.checked_add(compressed_size) else {
         return Ok(None);
     };
-    if flags & 0x0008 == 0 && data_end > size {
-        return Ok(None);
-    }
-    Ok(Some(candidate("zip", offset, None, confidence, validation)))
+    let split = offset >= 4 && read_at(file, offset - 4, 4)?.as_slice() == b"PK\x07\x08";
+    let root = if split { offset - 4 } else { offset };
+    Ok(Some(candidate(
+        "zip",
+        root,
+        None,
+        if split { 1.0 } else { confidence },
+        if split {
+            "zip_split_local_header"
+        } else {
+            validation
+        },
+    )))
 }
 
 fn zip_local_fixed_plausible(header: &[u8]) -> bool {
@@ -1655,13 +1754,29 @@ fn validate_seven_zip(
         return Ok(None);
     };
     if end > size {
-        return Ok(Some(logical_candidate(
+        let mut item = logical_candidate(
             "7z",
             offset,
             None,
             0.90,
             "start_header_crc_truncated_declared_range",
-        )));
+        );
+        let next = crate::formats::seven_zip::RelationNextHeader::parse(&header).unwrap();
+        item.volume_anchor = Some(Box::new(VolumeAnchor {
+            size,
+            format: "7z".into(),
+            confidence: "strong".into(),
+            multivolume: true,
+            anchor_roles: vec!["first"],
+            internal_volume_number: Some(1),
+            structure_offset: Some(offset),
+            expected_logical_size: Some(end),
+            seven_zip_next_header: Some(std::sync::Arc::new(next)),
+            continuation_to_next: true,
+            evidence: vec!["7z:start_header_crc", "7z:logical_size_exceeds_part"],
+            ..VolumeAnchor::default()
+        }));
+        return Ok(Some(item));
     }
     // A CRC-valid start header proves only a proposed range. Never let an
     // unverified proposal hide independent archives in a carrier. Stream the
@@ -1702,157 +1817,39 @@ fn seven_zip_start_header_valid(header: &[u8]) -> bool {
         && crc32(&header[12..32]) == u32::from_le_bytes(header[8..12].try_into().unwrap())
 }
 
-fn validate_rar4(
+fn validate_rar(
     file: &ManagedReader,
-    size: u64,
+    _size: u64,
     offset: u64,
-) -> std::io::Result<Option<EmbeddedCandidate>> {
-    let mut cursor = offset + RAR4.len() as u64;
-    loop {
-        let fixed = read_at(file, cursor, 7)?;
-        if fixed.len() != 7 {
-            return Ok(None);
-        }
-        let stored = u16::from_le_bytes(fixed[..2].try_into().unwrap()) as u32;
-        let header_type = fixed[2];
-        let flags = u16::from_le_bytes(fixed[3..5].try_into().unwrap());
-        let header_size = u16::from_le_bytes(fixed[5..7].try_into().unwrap()) as u64;
-        if !matches!(header_type, 0x73..=0x7b) || header_size < 7 {
-            return Ok(None);
-        }
-        let Some(header_end) = cursor.checked_add(header_size) else {
-            return Ok(None);
-        };
-        if header_end > size || header_size > usize::MAX as u64 {
-            return Ok(None);
-        }
-        let header = read_at(file, cursor, header_size as usize)?;
-        if header.len() != header_size as usize || crc32(&header[2..]) & 0xffff != stored {
-            return Ok(None);
-        }
-        if cursor == offset + RAR4.len() as u64 && header_type != 0x73 {
-            return Ok(None);
-        }
-        if cursor == offset + RAR4.len() as u64 && flags & 0x0080 != 0 {
-            return Ok(Some(logical_candidate(
-                "rar",
-                offset,
-                None,
-                1.0,
-                "rar4_header_encrypted_main_header_crc",
-            )));
-        }
-        let Some(add_size) = crate::formats::rar::rar4_data_size(&header) else {
-            return Ok(None);
-        };
-        let Some(next) = header_end.checked_add(add_size) else {
-            return Ok(None);
-        };
-        if next > size {
-            return Ok(None);
-        }
-        if header_type == 0x7b {
-            return Ok(Some(candidate(
-                "rar",
-                offset,
-                Some(next),
-                1.0,
-                "rar4_complete_block_walk",
-            )));
-        }
-        cursor = next;
+) -> io::Result<Option<EmbeddedCandidate>> {
+    let anchor = probe_volume_anchor_reader_at_offset(file, "", offset, "rar", None)?;
+    if anchor.format != "rar" || !anchor.error.is_empty() {
+        return Ok(None);
     }
-}
-
-fn validate_rar5(
-    file: &ManagedReader,
-    size: u64,
-    offset: u64,
-) -> std::io::Result<Option<EmbeddedCandidate>> {
-    let mut cursor = offset + RAR5.len() as u64;
-    loop {
-        let prefix = read_at(file, cursor, 16)?;
-        if prefix.len() < 6 {
-            return Ok(None);
-        }
-        let stored = u32::from_le_bytes(prefix[..4].try_into().unwrap());
-        let Some((header_size, size_len)) = read_vint(&prefix[4..]) else {
-            return Ok(None);
-        };
-        if size_len > 3 || header_size == 0 {
-            return Ok(None);
-        }
-        let Some(total) = 4u64
-            .checked_add(size_len as u64)
-            .and_then(|value| value.checked_add(header_size))
-        else {
-            return Ok(None);
-        };
-        let Some(header_end) = cursor.checked_add(total) else {
-            return Ok(None);
-        };
-        if header_end > size || total > usize::MAX as u64 {
-            return Ok(None);
-        }
-        let full = read_at(file, cursor, total as usize)?;
-        if full.len() != total as usize || crc32(&full[4..]) != stored {
-            return Ok(None);
-        }
-        let fields_start = 4 + size_len;
-        let Some((header_type, type_len)) = read_vint(&full[fields_start..]) else {
-            return Ok(None);
-        };
-        let flags_start = fields_start + type_len;
-        let Some((flags, flags_len)) = read_vint(&full[flags_start..]) else {
-            return Ok(None);
-        };
-        if !matches!(header_type, 1..=5) && flags & 0x0004 == 0 {
-            return Ok(None);
-        }
-        let mut field_cursor = flags_start + flags_len;
-        if flags & 0x0001 != 0 {
-            let Some((_, len)) = read_vint(&full[field_cursor..]) else {
-                return Ok(None);
-            };
-            field_cursor += len;
-        }
-        let data_size = if flags & 0x0002 != 0 {
-            let Some((value, _)) = read_vint(&full[field_cursor..]) else {
-                return Ok(None);
-            };
-            value
+    let anchor = upgrade_relation_rar_end_reader(&anchor, None, file)?;
+    if !anchor.error.is_empty() {
+        return Ok(None);
+    }
+    let validation = if anchor.needs_password {
+        if anchor.evidence.contains(&"rar5:encryption_header") {
+            "rar5_encryption_header_crc"
         } else {
-            0
-        };
-        let Some(next) = header_end.checked_add(data_size) else {
-            return Ok(None);
-        };
-        if next > size {
-            return Ok(None);
+            "rar4_header_encrypted_main_header_crc"
         }
-        if cursor == offset + RAR5.len() as u64 && header_type == 4 {
-            return Ok(Some(logical_candidate(
-                "rar",
-                offset,
-                None,
-                1.0,
-                "rar5_encryption_header_crc",
-            )));
-        }
-        if cursor == offset + RAR5.len() as u64 && header_type != 1 {
-            return Ok(None);
-        }
-        if header_type == 5 {
-            return Ok(Some(candidate(
-                "rar",
-                offset,
-                Some(next),
-                1.0,
-                "rar5_complete_block_walk",
-            )));
-        }
-        cursor = next;
+    } else if anchor.evidence.iter().any(|e| e.starts_with("rar5:")) {
+        "rar5_complete_block_walk"
+    } else {
+        "rar4_complete_block_walk"
+    };
+    let end = anchor.expected_logical_size;
+    if end.is_none() && !anchor.multivolume && !anchor.needs_password {
+        return Ok(None);
     }
+    let mut item = logical_candidate("rar", offset, end, 1.0, validation);
+    if anchor.multivolume || (anchor.needs_password && !anchor.standalone) {
+        item.volume_anchor = Some(Box::new(anchor));
+    }
+    Ok(Some(item))
 }
 
 // Owned only by this physical-order scan. Facts refer to exact parser-visited
@@ -2244,6 +2241,7 @@ fn candidate(
         extractable: exact,
         lz4_index: None,
         zip_eocd_offset: None,
+        volume_anchor: None,
     }
 }
 
@@ -2257,17 +2255,6 @@ fn logical_candidate(
     let mut item = candidate(format, offset, end, confidence, validation);
     item.candidate_kind = "logical_archive";
     item
-}
-
-fn read_vint(data: &[u8]) -> Option<(u64, usize)> {
-    let mut value = 0u64;
-    for (index, byte) in data.iter().copied().take(10).enumerate() {
-        value |= u64::from(byte & 0x7f) << (index * 7);
-        if byte & 0x80 == 0 {
-            return Some((value, index + 1));
-        }
-    }
-    None
 }
 
 #[cfg(test)]

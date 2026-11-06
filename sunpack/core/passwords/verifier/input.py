@@ -4,7 +4,7 @@ from __future__ import annotations
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field, replace
 
-from sunpack.core.contracts.archive_input import ArchiveInputDescriptor, InputExtent
+from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
 
 
 _VOLUME_CALLBACK_STYLES = frozenset({
@@ -69,7 +69,7 @@ def prepare_password_input(
         if volume_aware:
             volumes = [part.to_dict() for part in descriptor.parts]
         else:
-            ranges = [InputExtent(part.path).to_dict() for part in descriptor.parts]
+            ranges = [part.extent.to_dict() for part in descriptor.parts]
     elif descriptor.open_mode != "file":
         extents = descriptor.extents or [part.extent for part in descriptor.parts]
         # Preserve explicit boundaries; no stat/reinterpretation of Rust's plan.

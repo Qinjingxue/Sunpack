@@ -35,7 +35,7 @@ include!("header/parse.rs");
 include!("header/encoded.rs");
 /// The same checked descriptor is used to bound relation CRC reads and by
 /// the password header reader. CRC protects format metadata, never output.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct RelationNextHeader {
     pub offset: u64,
     pub size: u64,

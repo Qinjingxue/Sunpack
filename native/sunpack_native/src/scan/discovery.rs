@@ -2,7 +2,7 @@ use crate::path_keys::{case_key, path_key};
 use crate::relations::{
     build_native_candidate_groups_from_snapshot,
     build_native_candidate_groups_from_snapshot_cached, relation_group_cached_anchors,
-    NativeRelationGroup, RelationCache,
+    resolve_embedded_volumes, NativeRelationGroup, RelationCache,
 };
 use crate::scan::directory::{
     filesystem_logical_name, filesystem_route_name, DirectorySnapshotTable,
@@ -34,6 +34,8 @@ pub(crate) struct NativeCandidateTable {
     // Sparse verifier evidence; owned only for this scan, never per-file caches.
     // An empty reason preserves the extraction fallback for inconclusive proof.
     relation_failures: HashMap<String, String>,
+    // Shared physical facts; row indices survive only for this discovery scan.
+    relation_sources: Vec<NativeDirectorySnapshot>,
 }
 
 struct FileTargets {
@@ -110,6 +112,16 @@ impl FileTargets {
 }
 
 impl NativeCandidateTable {
+    fn relation_cache(&self) -> RelationCache {
+        let mut cache = RelationCache::default();
+        for row in &self.rows {
+            if let Candidate::Relation(group) = row {
+                relation_group_cached_anchors(group, &mut cache);
+            }
+        }
+        cache
+    }
+
     fn relation_groups(
         &self,
         raw: &NativeDirectorySnapshot,
@@ -191,6 +203,15 @@ pub(crate) struct NativeEmbeddedBatch {
     force_scan: bool,
     include_residual_details: bool,
     skipped_reason: &'static str,
+    pending_volumes: Vec<PendingEmbeddedVolume>,
+    excluded: HashSet<String>,
+}
+
+struct PendingEmbeddedVolume {
+    index: usize,
+    anchor: crate::analysis_native::volume_anchor::VolumeAnchor,
+    // Only encrypted standalone fallback needs the original scan diagnostics.
+    scan: Option<Arc<NativeScanResult>>,
 }
 
 impl EmbeddedOutcome {
@@ -231,7 +252,7 @@ impl NativeEmbeddedBatch {
     /// Reuse detection facts; unresolved files are scanned on demand per page.
     #[pyo3(signature = (table, offset=0, limit=256))]
     fn scan_page(
-        &self,
+        &mut self,
         py: Python<'_>,
         table: PyRef<'_, NativeCandidateTable>,
         offset: usize,
@@ -311,9 +332,196 @@ impl NativeEmbeddedBatch {
                     detail.set_item("error", error.to_string())?;
                     Ok((index, 2, "embedded_scan_io_error", Some(detail.unbind())))
                 }
-                EmbeddedOutcome::Scan(scan) => Ok((index, 1, "", Some(scan.to_py_dict(py)?))),
+                EmbeddedOutcome::Scan(scan) => {
+                    if let Some(mut anchor) = scan.relation_anchor() {
+                        anchor.path = table.summary(index)?.0;
+                        let encrypted = anchor.needs_password;
+                        self.pending_volumes.push(PendingEmbeddedVolume {
+                            index,
+                            anchor,
+                            scan: encrypted.then_some(scan),
+                        });
+                        Ok((index, 3, "embedded_volume_candidate", None))
+                    } else {
+                        // A complete peer archive keeps its original ownership.
+                        self.excluded.extend(table.path_keys(index)?);
+                        Ok((index, 1, "", Some(scan.to_py_dict(py)?)))
+                    }
+                }
             })
             .collect()
+    }
+
+    fn encrypted_volume_inputs(
+        &self,
+        table: PyRef<'_, NativeCandidateTable>,
+    ) -> PyResult<Vec<(String, u64)>> {
+        let mut requests = HashMap::new();
+        for pending in &self.pending_volumes {
+            if pending.anchor.needs_password {
+                requests.insert(
+                    pending.anchor.path.clone(),
+                    pending.anchor.structure_offset.unwrap_or(0),
+                );
+            }
+        }
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+        let selected: HashSet<_> = requests.keys().map(|path| path_key(path)).collect();
+        let cache = table.relation_cache();
+        for snapshot in &table.relation_sources {
+            let stems: HashSet<_> = snapshot
+                .rows
+                .iter()
+                .filter_map(|&row| {
+                    let path = &snapshot.table.paths[row];
+                    selected.contains(&path_key(path)).then(|| {
+                        case_key(crate::relations::first_dot_stem(
+                            Path::new(path)
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or_default(),
+                        ))
+                    })
+                })
+                .collect();
+            if stems.is_empty() {
+                continue;
+            }
+            for &row in &snapshot.rows {
+                if !snapshot.table.relation_member_eligible[row] {
+                    continue;
+                }
+                let path = &snapshot.table.paths[row];
+                let key = path_key(path);
+                if self.excluded.contains(&key) {
+                    continue;
+                }
+                let name = Path::new(path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or_default();
+                if !stems.contains(&case_key(crate::relations::first_dot_stem(name))) {
+                    continue;
+                }
+                let anchor = cache
+                    .anchors
+                    .get(&key)
+                    .or(snapshot.table.relation_anchors[row].as_deref());
+                if let Some(anchor) = anchor.filter(|a| a.needs_password) {
+                    requests
+                        .entry(path.clone())
+                        .or_insert(anchor.structure_offset.unwrap_or(0));
+                }
+            }
+        }
+        Ok(requests.into_iter().collect())
+    }
+
+    /// One directed Relations call per source scope, using native scan facts.
+    /// Status 0 is an encrypted standalone archive returned to Embedded.
+    #[pyo3(signature = (table, password_candidates=None))]
+    fn resolve_volumes(
+        &mut self,
+        py: Python<'_>,
+        mut table: PyRefMut<'_, NativeCandidateTable>,
+        password_candidates: Option<Vec<(String, Vec<String>)>>,
+    ) -> PyResult<Vec<(usize, u8, Option<Py<PyDict>>)>> {
+        use crate::analysis_native::volume_anchor::resolve_encrypted_relation_anchor;
+        if self.pending_volumes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let candidates: HashMap<_, _> = password_candidates
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(path, values)| (path_key(&path), values))
+            .collect();
+        let mut cache = table.relation_cache();
+        let pending = std::mem::take(&mut self.pending_volumes);
+        for item in &pending {
+            cache
+                .anchors
+                .insert(path_key(&item.anchor.path), item.anchor.clone());
+        }
+        for snapshot in &table.relation_sources {
+            for &row in &snapshot.rows {
+                let key = path_key(&snapshot.table.paths[row]);
+                if candidates.contains_key(&key) && !cache.anchors.contains_key(&key) {
+                    if let Some(anchor) = &snapshot.table.relation_anchors[row] {
+                        cache.anchors.insert(key, (**anchor).clone());
+                    }
+                }
+            }
+        }
+        let matched = py.detach(|| -> std::io::Result<HashMap<String, String>> {
+            let mut matched = HashMap::new();
+            for (key, values) in &candidates {
+                let Some(anchor) = cache.anchors.get_mut(key).filter(|a| a.needs_password) else {
+                    continue;
+                };
+                let reader = crate::io::reader::ManagedReader::open(&anchor.path)?.probe_reader();
+                let (resolved, index) = resolve_encrypted_relation_anchor(anchor, &reader, values)?;
+                *anchor = resolved;
+                if let Some(index) = index {
+                    matched.insert(key.clone(), values[index].clone());
+                }
+            }
+            Ok(matched)
+        })?;
+        let mut fallback = Vec::new();
+        let mut anchors = Vec::new();
+        for item in pending {
+            let key = path_key(&item.anchor.path);
+            let mut anchor = cache.anchors[&key].clone();
+            if anchor.standalone || (!anchor.multivolume && anchor.needs_password) {
+                self.excluded.insert(key.clone());
+                if let Some(scan) = item.scan {
+                    let raw = if let Some(end) = anchor.expected_logical_size {
+                        scan.resolved_rar_dict(
+                            py,
+                            anchor.structure_offset.unwrap_or(0),
+                            end,
+                            matched.get(&key).map(String::as_str),
+                        )?
+                    } else {
+                        let raw = scan.to_py_dict(py)?;
+                        let verdict = PyDict::new(py);
+                        verdict.set_item(
+                            "status",
+                            if matched.contains_key(&key)
+                                || anchor.evidence.contains(&"rar:password_matched_incomplete")
+                            {
+                                "truncated"
+                            } else if anchor.wrong_password {
+                                "wrong_password"
+                            } else {
+                                "password_required"
+                            },
+                        )?;
+                        verdict.set_item("failed_offset", anchor.structure_offset)?;
+                        raw.bind(py).set_item("rar_boundary", verdict)?;
+                        raw
+                    };
+                    fallback.push((item.index, 0, Some(raw)));
+                }
+                continue;
+            }
+            anchor.evidence.push("embedded:volume_candidate");
+            anchors.push(anchor);
+        }
+        if anchors.is_empty() {
+            return Ok(fallback);
+        }
+        let sources = &table.relation_sources;
+        let excluded = &self.excluded;
+        let groups = py.detach(|| resolve_embedded_volumes(sources, anchors, excluded, cache));
+        for group in groups {
+            let index = table.rows.len();
+            table.rows.push(Candidate::Relation(Box::new(group)));
+            fallback.push((index, 1, None));
+        }
+        Ok(fallback)
     }
 }
 
@@ -351,6 +559,8 @@ impl NativeCandidateTable {
                 .into_iter()
                 .map(|group| Candidate::Relation(Box::new(group))),
         );
+        self.relation_sources
+            .push(raw_snapshot.view(raw_snapshot.rows.clone()));
         Ok(())
     }
 
@@ -389,6 +599,8 @@ impl NativeCandidateTable {
                 }
             }
             self.retain_targets();
+            self.relation_sources
+                .push(raw_snapshot.view(raw_snapshot.rows.clone()));
         });
         Ok(())
     }
@@ -477,6 +689,7 @@ impl NativeCandidateTable {
 
     fn extend(&mut self, other: &mut NativeCandidateTable) {
         self.rows.append(&mut other.rows);
+        self.relation_sources.append(&mut other.relation_sources);
         self.relation_failures
             .extend(other.relation_failures.drain());
     }
@@ -845,6 +1058,11 @@ impl NativeCandidateTable {
             "recursive_candidate_ratio"
         };
         NativeEmbeddedBatch {
+            pending_volumes: Vec::new(),
+            excluded: routes.relation_resolved.iter().filter(|&&index| {
+                !matches!(&self.rows[index], Candidate::Relation(group) if group.is_incomplete())
+            }).chain(&routes.detection_resolved)
+                .flat_map(|&index| self.path_keys(index).unwrap_or_default()).collect(),
             scans: ids
                 .iter()
                 .filter_map(|index| routes.scans.get(index).map(|scan| (*index, scan.clone())))

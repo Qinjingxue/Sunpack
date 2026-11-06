@@ -402,7 +402,6 @@ fn refine_zip_members(rows: &mut [RelationInput], indexes: &[usize]) {
     for &i in indexes {
         let Some(a) = rows[i].anchor.as_ref().filter(|a| {
             a.format == "zip"
-                && a.internal_volume_number.is_none()
                 && a.error.is_empty()
                 && !a.standalone
                 && a.evidence.contains(&"zip:local_header")
@@ -423,14 +422,11 @@ fn refine_zip_members(rows: &mut [RelationInput], indexes: &[usize]) {
             Ok(None) => {}
         }
     }
-    if local.is_empty() {
-        return;
-    }
-    let mut matches = HashMap::<usize, Option<u32>>::new();
+    let mut matches = HashMap::<usize, Option<(u32, u64)>>::new();
     let complete = visit_relation_directory(&rows[terminal].path, directory, |record, values| {
-        // A physical continuation's leading local header has disk offset zero.
-        // Other directory entries do not nominate that physical file.
-        if values.local_offset != 0 || record.flags & 0x2000 != 0 {
+        // A scanned local header may follow carrier padding or continuation
+        // data. Directory disk offsets locate the physical disk's real base.
+        if record.flags & 0x2000 != 0 {
             return;
         }
         let Some(candidates) = local.get(record.name) else {
@@ -452,22 +448,49 @@ fn refine_zip_members(rows: &mut [RelationInput], indexes: &[usize]) {
         else {
             return;
         };
+        let anchor = rows[i].anchor.as_ref().unwrap();
+        let Some(base) = anchor
+            .structure_offset
+            .unwrap_or(0)
+            .checked_sub(values.local_offset)
+        else {
+            return;
+        };
+        if anchor
+            .internal_volume_number
+            .is_some_and(|known| known != slot)
+        {
+            return;
+        }
+        let identity = (slot, base);
         matches
             .entry(i)
             .and_modify(|old| {
-                if *old != Some(slot) {
+                if *old != Some(identity) {
                     *old = None;
                 }
             })
-            .or_insert(Some(slot));
+            .or_insert(Some(identity));
     });
     if !matches!(complete, Ok(true)) {
         return;
     }
+    // Terminal directory geometry independently locates its disk base even
+    // when that disk begins in the middle of a member's compressed bytes.
+    if directory.cd_disk == directory.disk {
+        if let Some(base) = directory
+            .end
+            .checked_sub(directory.size)
+            .and_then(|n| n.checked_sub(directory.offset))
+        {
+            rows[terminal].anchor.as_mut().unwrap().structure_offset = Some(base);
+        }
+    }
     for (i, slot) in matches {
-        if let Some(slot) = slot {
+        if let Some((slot, base)) = slot {
             let a = rows[i].anchor.as_mut().unwrap();
             a.internal_volume_number = Some(slot);
+            a.structure_offset = Some(base);
             a.confidence = "strong".into();
             a.multivolume = true;
             a.continuation_from_previous = slot > 1;

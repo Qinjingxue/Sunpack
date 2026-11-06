@@ -5,6 +5,7 @@ from sunpack.core.contracts.tasks import ArchiveTask
 from sunpack.pipeline.coordinator.scan_session import DiscoveryScanSession
 from sunpack.pipeline.discovery.embedded.discovery import EmbeddedDiscovery
 from sunpack.pipeline.discovery.embedded.options import EmbeddedOptions
+from sunpack.core.support.path_keys import path_key
 
 
 class ArchiveDiscoveryPipeline:
@@ -83,6 +84,17 @@ class ArchiveDiscoveryPipeline:
             is_recursive_scan=is_recursive_scan,
             include_details=include_details,
         )
+        replaced = embedded_result.claimed_paths | embedded_result.blocked_paths
+        if replaced:
+            result.tasks = [task for task in result.tasks if not (
+                any(path_key(path) in replaced for path in task.cleanup_parts)
+            )]
+            result.claimed_paths.difference_update(replaced)
+            result.blocked_paths.difference_update(replaced)
+            result.residual_paths.difference_update(replaced)
+            result.traces = [trace for trace in result.traces if not (
+                trace.status in {"resolved", "blocked"} and path_key(trace.entry_path) in replaced
+            )]
         result.tasks.extend(embedded_result.tasks)
         result.findings.extend(embedded_result.findings)
         result.claimed_paths.update(embedded_result.claimed_paths)

@@ -132,6 +132,10 @@ class EmbeddedDiscovery:
         result = StageResult()
         for offset in range(0, len(batch), 256):
             for index, status, reason, raw_scan in batch.scan_page(table, offset, 256):
+                if status == 3:
+                    # Rust retains the verified anchor until all peer residuals
+                    # have their normal Embedded ownership decisions.
+                    continue
                 if status == 2:
                     entry_path, format_hint = table.summary(index)
                     result.blocked_paths.update(table.path_keys(index))
@@ -154,6 +158,30 @@ class EmbeddedDiscovery:
 
                 candidate = session.project_native_candidate(table, index)
                 self._discover_into(result, candidate, raw_scan, include_details=include_details)
+
+        passwords = [
+            (path, self._password_candidates(path))
+            for path, _offset in batch.encrypted_volume_inputs(table)
+        ]
+        for index, status, raw_scan in batch.resolve_volumes(table, passwords):
+            candidate = session.project_native_candidate(table, index)
+            if status == 0:
+                self._discover_into(result, candidate, raw_scan, include_details=include_details)
+                continue
+            # A directed relation replaces only earlier decisions for its own
+            # physical inputs (a continuation may already have been blocked).
+            keys = candidate.path_keys
+            result.residual_paths.difference_update(keys)
+            result.blocked_paths.difference_update(keys)
+            reason = candidate.relation_anchor.get("relation_failure_reason")
+            if reason:
+                result.add_blocked(candidate, source="relations", reason=str(reason))
+            else:
+                result.add_resolved(ArchiveTask.from_archive_input(
+                    candidate.archive_input, discovery_source="relations",
+                    carrier_path=candidate.carrier_path, cleanup_paths=candidate.cleanup_paths,
+                    discovery_evidence=candidate.relation_anchor,
+                ), reason="Relations confirmed embedded volume anchor")
         result.validate()
         return result
 
@@ -203,7 +231,7 @@ class EmbeddedDiscovery:
             scan = precomputed_scan
             size = int(scan["file_size"])
 
-        password_by_offset: dict[int, str] = {}
+        password_by_offset: dict[int, str] = dict(scan.get("resolved_passwords") or ())
         encrypted_offsets = [
             item["offset"]
             for item in scan["candidates"]
@@ -214,7 +242,7 @@ class EmbeddedDiscovery:
         if encrypted_offsets:
             passwords = self._password_candidates(path)
             try:
-                boundary = resolve_encrypted_rar_boundaries(
+                boundary = scan.get("rar_boundary") or resolve_encrypted_rar_boundaries(
                     path,
                     encrypted_offsets,
                     passwords,
