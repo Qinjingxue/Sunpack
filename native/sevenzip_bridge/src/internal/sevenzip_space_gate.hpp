@@ -358,6 +358,21 @@ namespace sunpack::sevenzip
         // 失败后下次正数空间采样可再次试探，不受历史空间读数限制。
         bool poll(std::uint64_t free_bytes_now) noexcept;
 
+        // 诊断节流随 gate 回收，并在新 episode / 最后一个 job 退出时重置。
+        bool take_status_report(std::chrono::steady_clock::time_point now,
+                                std::chrono::milliseconds interval) noexcept
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (phase_ == VolumeSpacePhase::Ready ||
+                (last_status_at_ != std::chrono::steady_clock::time_point{} &&
+                 now - last_status_at_ < interval))
+            {
+                return false;
+            }
+            last_status_at_ = now;
+            return true;
+        }
+
         // 唤醒目录等待者并通知 IOCP 重新裁决排队请求；不改变状态。
         void wake_waiters() noexcept;
 
@@ -472,6 +487,7 @@ namespace sunpack::sevenzip
         std::uint64_t next_token_ = 1;
         unsigned long last_win32_error_ = 0;
         std::chrono::steady_clock::time_point blocked_since_{};
+        std::chrono::steady_clock::time_point last_status_at_{};
         std::uint64_t last_free_bytes_ = 0; // 最近一次成功采样值（仅诊断与展示）
         bool last_query_ok_ = true;
         unsigned long last_query_error_ = 0;
@@ -574,6 +590,10 @@ namespace sunpack::sevenzip
         affected_jobs_.erase(
             std::remove(affected_jobs_.begin(), affected_jobs_.end(), job_id),
             affected_jobs_.end());
+        if (affected_jobs_.empty())
+        {
+            last_status_at_ = {};
+        }
     }
 
     inline bool VolumeSpaceGate::report_space_failure(
@@ -595,6 +615,7 @@ namespace sunpack::sevenzip
                 probe_owner_token_ = 0;
                 blocked_event_emitted_ = false;
                 blocked_since_ = std::chrono::steady_clock::now();
+                last_status_at_ = {};
                 opened_episode = true;
 
                 // blocked 事件必须在同一把锁内生成：否则"进入 Blocked"与"事件可见"之间

@@ -1580,7 +1580,7 @@ def test_worker_manifest_protocol(subtests):
             assert "rows" not in manifest and "files" not in manifest
             assert manifest["inventory"]["complete"] and manifest["inventory"]["identity_paths"]
             native = native_worker_manifest(result)
-            assert len(native) == 1 and native.all_complete()
+            assert len(native) == 1 and native.complete
             row = native.file_page(0, 1)[0]
             assert row["path"] == path and row["magic"] == b"abc" and row["mtime_ns"] == 123
             assert row["status"] == "complete" and "output_path" not in row

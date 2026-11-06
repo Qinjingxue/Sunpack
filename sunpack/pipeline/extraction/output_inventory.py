@@ -10,7 +10,6 @@ from sunpack_native import (
     NativeWorkerManifest,
     match_output_inventory_coverage as _native_match_output_inventory_coverage,
     output_inventory_from_serialized as _native_inventory_from_serialized,
-    rebase_output_inventory_root as _native_rebase_output_inventory_root,
     scan_output_inventory as _native_scan_output_inventory,
 )
 from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import native_worker_manifest
@@ -45,13 +44,10 @@ class OutputInventory:
         self.identity_paths = bool(native.identity_paths)
 
     def file_page(self, *, offset: int = 0, limit: int = 128) -> tuple[dict[str, Any], ...]:
-        return tuple(
-            dict(item)
-            for item in self._native.file_page(
-                max(0, int(offset or 0)),
-                max(0, int(limit or 0)),
-            )
-        )
+        return tuple(self._native.file_page(
+            max(0, int(offset or 0)),
+            max(0, int(limit or 0)),
+        ))
 
     def verification_match(
         self,
@@ -65,7 +61,7 @@ class OutputInventory:
         max_issue_items: int = 20,
         names_only: bool = False,
     ) -> dict[str, Any]:
-        return dict(_native_match_output_inventory_coverage(
+        return _native_match_output_inventory_coverage(
             archive_files,
             self._native,
             bool(verify_crc),
@@ -75,7 +71,7 @@ class OutputInventory:
             max(0, int(detail_limit or 0)),
             max(0, int(max_issue_items or 0)),
             bool(names_only),
-        ))
+        )
 
     def parent_directories(self) -> tuple[str, ...]:
         return tuple(self._native.parent_directories())
@@ -85,18 +81,10 @@ class OutputInventory:
 
     def verify_stream_receipt(self, plan: dict, receipt: dict) -> dict:
         from sunpack_native import verify_stream_receipt
-        return dict(verify_stream_receipt(plan, receipt, self._native))
+        return verify_stream_receipt(plan, receipt, self._native)
 
     def all_crc_ok(self) -> bool:
         return bool(self._native.all_crc_ok())
-
-    def rebased_root(self, new_root: str) -> "OutputInventory":
-        return OutputInventory.from_native(
-            _native_rebase_output_inventory_root(
-                self._native,
-                os.path.abspath(new_root),
-            )
-        )
 
     @classmethod
     def from_value(cls, value: OutputInventory | None, *, expected_root: str = "") -> OutputInventory | None:
@@ -135,7 +123,7 @@ def _complete_worker_inventory(worker_result: dict[str, Any] | None) -> NativeWo
         or native is None
         or not inventory.get("complete")
         or int(inventory.get("file_count", -1)) != len(native)
-        or not native.all_complete()
+        or not native.complete
     ):
         return None
     return native

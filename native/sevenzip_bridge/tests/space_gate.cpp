@@ -1203,7 +1203,7 @@ void g30_positive_samples_retry_after_failure() {
           "G-30: only one resumed transition");
 }
 
-// 全部恢复后诊断节流表必须被丢弃
+// 诊断节流属于卷的当前阻塞 episode，不能被其他仍阻塞的卷延长。
 void g31_monitor_drops_episode_history_after_recovery() {
     auto log = std::make_shared<SinkLog>();
     auto gate = make_gate("job:g31", log);
@@ -1213,8 +1213,7 @@ void g31_monitor_drops_episode_history_after_recovery() {
     state->space_gate = gate;
 
     auto status_calls = std::make_shared<std::atomic<int>>(0);
-    // 诊断间隔（10 s）故意远大于测试推进的时间步长（200 ms），于是"新 episode 的第一拍
-    // 能否立刻发出诊断"等价于"节流表有没有在上一次恢复时被清掉"。
+    // 用虚拟时间检查同一 episode 的节流及新 episode 的首次诊断，无需等待 10 秒。
     VolumeSpaceMonitor monitor(
         VolumeSpaceMonitor::Options{5ms, 10s},
         [blocked] { return *blocked; },
@@ -1232,20 +1231,51 @@ void g31_monitor_drops_episode_history_after_recovery() {
     check(status_calls->load() >= 1, "G-31: episode 1 必须发出诊断");
     check(monitor.sampling(), "G-31: episode 1 必须处于采样中");
 
-    // ② 恢复：拉取返回空 → 停止采样，整个 episode 的历史被丢弃。
+    monitor.tick(now + 10ms);
+    check(status_calls->load() == 1, "G-31: 同一 episode 的重复采样必须节流");
+
+    // Provider 从未返回空：采样之间恢复后再次失败，也必须立即诊断。
+    check(gate->poll(1), "G-31: 恢复必须经过真实 probe 许可");
+    auto probe = gate->try_wait({});
+    probe.lease.report_success();
+    gate->report_space_failure(ERROR_DISK_FULL, unresolved_failed_path());
+    monitor.note_blocked();
+    monitor.tick(now + 20ms);
+    check(status_calls->load() == 2, "G-31: 新 episode 不得继承旧诊断节流");
+
+    // 一个卷持续阻塞，其他卷被 registry 回收后又以相同 key 创建。
+    // 旧实现只在 provider 全空时清理，既会残留历史，也会吞掉新对象的首次诊断。
+    for (int index = 0; index < 8; ++index) {
+        auto transient = sunpack::sevenzip::make_volume_state("job:g31-transient", false);
+        transient->space_gate = make_gate("job:g31-transient", log);
+        transient->space_gate->report_space_failure(ERROR_DISK_FULL, unresolved_failed_path());
+        blocked->push_back(transient);
+        monitor.note_blocked();
+        monitor.tick(now + 30ms + index * 10ms);
+        check(status_calls->load() == 3 + index,
+              "G-31: 持续阻塞不能保留已回收卷的诊断历史");
+        std::weak_ptr<sunpack::sevenzip::VolumeState> retired = transient;
+        blocked->pop_back();
+        transient.reset();
+        check(retired.expired(), "G-31: monitor 不得保活已退出的卷");
+    }
+
+    // 全部恢复：拉取返回空 → 停止采样。
+    check(gate->poll(1), "G-31: episode 2 recovery probe");
+    auto recovered = gate->try_wait({});
+    recovered.lease.report_success();
     blocked->clear();
-    monitor.tick(now + 100ms);
+    monitor.tick(now + 150ms);
     check(!monitor.sampling(), "G-31: 全部恢复后必须停止采样");
 
-    // ③ episode 2：同一个卷再次满盘，此刻距上一次诊断只有 200 ms（< 10 s）；
-    //    若这张节流表没有被清掉，这一拍会被节流掉，计数保持 1。
+    // 停止采样后再次满盘，也立即报告首次诊断。
     gate->report_space_failure(ERROR_DISK_FULL, unresolved_failed_path());
     blocked->push_back(state);
     monitor.note_blocked();
     monitor.tick(now + 200ms);
-    check(status_calls->load() >= 2,
-          "G-31: ★ 恢复之后必须丢弃 episode 历史（新 episode 的第一拍必须立刻可诊断）");
-    check(monitor.sampling(), "G-31: episode 2 必须重新开始采样");
+    check(status_calls->load() == 11,
+          "G-31: 新 episode 的第一拍必须立刻可诊断");
+    check(monitor.sampling(), "G-31: 再次阻塞必须重新开始采样");
 
     // Force the stale-empty/new-Blocked race even on runs without a VHD.
     VolumeSpaceMonitor *racing_ptr = nullptr;

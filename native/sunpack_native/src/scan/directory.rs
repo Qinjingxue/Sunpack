@@ -255,10 +255,16 @@ impl NativeWorkerManifest {
                 ))
             })
         };
+        let file_count = count(inventory[1], "file count")?;
+        // The immutable table owns this fact. Consumers must not repeatedly
+        // walk every row, or trust a complete summary with incomplete rows.
+        let complete = inventory[0] != 0
+            && file_count == files.len()
+            && files.iter().all(|item| item.status == 1);
         Ok(Self {
             files: Arc::new(files),
-            complete: inventory[0] != 0,
-            file_count: count(inventory[1], "file count")?,
+            complete,
+            file_count,
             dir_count: count(inventory[2], "directory count")?,
             total_size: inventory[3],
             identity_paths: inventory[4] != 0,
@@ -295,9 +301,6 @@ impl NativeWorkerManifest {
     fn __len__(&self) -> usize {
         self.files.len()
     }
-    fn all_complete(&self) -> bool {
-        self.files.iter().all(|item| item.status == 1)
-    }
     #[pyo3(signature = (offset=0, limit=128))]
     fn file_page(&self, py: Python<'_>, offset: usize, limit: usize) -> PyResult<Vec<Py<PyDict>>> {
         output_file_page(py, &self.files, offset, limit)
@@ -313,7 +316,7 @@ impl NativeWorkerManifest {
             unreadable_count: 0,
             files: Arc::clone(&self.files),
             worker_crc_available: !self.files.is_empty(),
-            worker_inventory_complete: self.complete && self.all_complete(),
+            worker_inventory_complete: self.complete,
             identity_paths: self.identity_paths,
         }
     }
@@ -356,58 +359,6 @@ impl NativeOutputInventory {
             files: Arc::clone(&self.files),
         }
     }
-}
-
-pub(crate) fn rebase_output_inventory_root_impl(
-    inventory: &NativeOutputInventory,
-    new_root: String,
-) -> NativeOutputInventory {
-    let old_root = PathBuf::from(&inventory.root);
-    let new_root_path = PathBuf::from(&new_root);
-    let mut changed = false;
-    let mut files = Vec::with_capacity(inventory.files.len());
-    for item in inventory.files.iter() {
-        let mut item = item.clone();
-        for slot in [&mut item.abs_path, &mut item.output_path] {
-            let Some(raw) = slot.as_ref() else {
-                continue;
-            };
-            let path = Path::new(raw);
-            if !path.is_absolute() {
-                continue;
-            }
-            if let Ok(relative) = path.strip_prefix(&old_root) {
-                *slot = Some(path_to_string(&new_root_path.join(relative)));
-                changed = true;
-            }
-        }
-        files.push(item);
-    }
-    NativeOutputInventory {
-        root: new_root,
-        exists: inventory.exists,
-        is_dir: inventory.is_dir,
-        file_count: inventory.file_count,
-        dir_count: inventory.dir_count,
-        total_size: inventory.total_size,
-        unreadable_count: inventory.unreadable_count,
-        files: if changed {
-            Arc::new(files)
-        } else {
-            Arc::clone(&inventory.files)
-        },
-        worker_crc_available: inventory.worker_crc_available,
-        worker_inventory_complete: inventory.worker_inventory_complete,
-        identity_paths: inventory.identity_paths,
-    }
-}
-
-#[pyfunction]
-pub(crate) fn rebase_output_inventory_root(
-    inventory: PyRef<'_, NativeOutputInventory>,
-    new_root: String,
-) -> NativeOutputInventory {
-    rebase_output_inventory_root_impl(&inventory, new_root)
 }
 
 #[pymethods]
@@ -1886,14 +1837,16 @@ pub(crate) fn worker_manifest_from_rows(
             magic: decode_hex_bytes(&row.get_item(13)?.extract::<String>()?)?,
         });
     }
-    Ok(NativeWorkerManifest {
-        files: Arc::new(files),
-        complete,
-        file_count,
-        dir_count,
-        total_size,
-        identity_paths,
-    })
+    NativeWorkerManifest::from_parts(
+        files,
+        [
+            u64::from(complete),
+            file_count as u64,
+            dir_count as u64,
+            total_size,
+            u64::from(identity_paths),
+        ],
+    )
 }
 
 pub(crate) fn scan_output_inventory_impl(output_dir: &str) -> NativeOutputInventory {

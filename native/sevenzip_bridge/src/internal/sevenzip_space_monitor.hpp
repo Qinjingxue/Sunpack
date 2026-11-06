@@ -10,8 +10,6 @@
 #include <cstdint>
 #include <functional>
 #include <mutex>
-#include <string>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -82,11 +80,9 @@ namespace sunpack::sevenzip
 
             if (states.empty())
             {
-                // 异常状态已完全消除：停止采样，并丢掉这个 episode 的全部历史 —— 诊断节流
-                // 表不随 registry 已摘除的卷 key 无界增长，下一 episode 的第一拍也立即可采样。
+                // 异常状态已完全消除：停止采样，下一 episode 的第一拍立即可采样。
                 {
                     std::lock_guard<std::mutex> lock(mutex_);
-                    last_status_at_.clear();
                     next_poll_at_ = std::chrono::steady_clock::time_point{};
                 }
                 sampling_generation_.compare_exchange_strong(
@@ -152,19 +148,10 @@ namespace sunpack::sevenzip
                                unsigned long query_error,
                                std::chrono::steady_clock::time_point now) noexcept
         {
-            if (!status_)
+            if (!status_ || !state->space_gate->take_status_report(
+                                now, options_.status_report_interval))
             {
                 return;
-            }
-            {
-                std::lock_guard<std::mutex> lock(mutex_);
-                auto &last = last_status_at_[state->key];
-                if (last != std::chrono::steady_clock::time_point{} &&
-                    now - last < options_.status_report_interval)
-                {
-                    return;
-                }
-                last = now;
             }
             const std::uint64_t pending_bytes =
                 state->counters.pending_bytes.load(std::memory_order_relaxed);
@@ -181,10 +168,9 @@ namespace sunpack::sevenzip
         Options options_;
         BlockedProvider provider_;
         StatusSink status_;
-        mutable std::mutex mutex_; // 只保护 next_poll_at_ / 诊断节流表
+        mutable std::mutex mutex_; // 只保护 next_poll_at_
         std::atomic<std::uint64_t> sampling_generation_{0};
         std::chrono::steady_clock::time_point next_poll_at_{};
-        std::unordered_map<std::string, std::chrono::steady_clock::time_point> last_status_at_;
     };
 
 }

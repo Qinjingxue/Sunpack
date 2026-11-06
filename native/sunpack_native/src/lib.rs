@@ -143,10 +143,6 @@ fn sunpack_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<scan::discovery::NativeDiscoveryRoutes>()?;
     m.add_class::<scan::discovery::NativeEmbeddedBatch>()?;
     m.add_class::<scan::directory::NativeOutputInventory>()?;
-    m.add_function(wrap_pyfunction!(
-        scan::directory::rebase_output_inventory_root,
-        m
-    )?)?;
     m.add_class::<scan::directory::NativeWorkerManifest>()?;
     m.add_class::<verification::archive_manifest::NativeArchiveManifest>()?;
     m.add_function(wrap_pyfunction!(filesystem::watch_broker_acquire, m)?)?;
