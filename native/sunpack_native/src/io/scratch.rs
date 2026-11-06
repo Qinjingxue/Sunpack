@@ -79,6 +79,10 @@ impl Default for Spool {
     }
 }
 impl Spool {
+    pub(crate) fn is_spilled(&self) -> bool {
+        self.file.is_some()
+    }
+
     /// Resident allocation, including capacity retained after previous writes.
     pub(crate) fn memory_bytes(&self) -> usize {
         self.file
@@ -204,7 +208,9 @@ impl<T: Serialize + DeserializeOwned + Clone> RowBuilder<T> {
         self.bytes = self.bytes.saturating_add(bytes);
         if self.disk.is_none() && self.bytes > MEMORY_BYTES {
             let mut disk = (Spool::default(), Spool::default());
-            for item in self.memory.drain(..) {
+            // Release the resident row allocation once ownership moves to the
+            // spool; drain would retain its high-water capacity until finish.
+            for item in std::mem::take(&mut self.memory) {
                 append_row(&mut disk, &item)?;
             }
             self.disk = Some(disk);
@@ -751,6 +757,7 @@ mod tests {
             expected.push(row);
         }
         assert!(builder.disk.is_some());
+        assert_eq!(builder.memory.capacity(), 0);
         for (index, length) in [(0, 0), (63, 200_000), (7, 30), (0, 12_000), (31, 8192)] {
             expected[index] = ("y".repeat(length), 100 + index as u64);
             builder

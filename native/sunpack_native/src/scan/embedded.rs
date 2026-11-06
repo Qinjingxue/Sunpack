@@ -23,7 +23,7 @@ use rayon::prelude::*;
 
 #[path = "hit_storage.rs"]
 mod hit_storage;
-use hit_storage::{Builder as HitBuilder, HitView};
+use hit_storage::{Builder as HitBuilder, HitBuffer, HitView};
 
 const ZIP_LOCAL: &[u8] = b"PK\x03\x04";
 const ZIP_EOCD: &[u8] = b"PK\x05\x06";
@@ -164,36 +164,6 @@ impl PackedHit {
     fn key(self) -> (u32, &'static str) {
         let value = u32::from_ne_bytes(self.0);
         (value >> 4, self.unpack(0).hit_name())
-    }
-}
-
-// Matching jobs keep only a bounded normalization horizon and encoded leaves.
-struct HitBuffer {
-    base: u64,
-    buffer: hit_storage::MatchBuffer,
-}
-impl HitBuffer {
-    fn new(base: u64, start: u64, end: u64, overlap: usize) -> Self {
-        Self {
-            base,
-            buffer: hit_storage::MatchBuffer::new(base, start, end, overlap),
-        }
-    }
-    fn push(&mut self, hit: RawHit) {
-        let relative = hit.offset() - self.base;
-        debug_assert!(relative <= HIT_OFFSET_MASK);
-        self.buffer
-            .push(PackedHit::new(relative as u32, hit.pattern));
-    }
-    fn is_empty(&self) -> bool {
-        self.buffer.is_empty()
-    }
-    #[cfg(test)]
-    fn iter(&self) -> impl Iterator<Item = RawHit> {
-        let mut hits = Vec::new();
-        self.buffer.visit(|hit| hits.push(hit));
-        hits.sort_unstable_by_key(|h| (h.offset(), h.hit_name()));
-        hits.into_iter()
     }
 }
 
@@ -589,9 +559,6 @@ fn scan_native(
             results: (!batch.results.is_empty()).then(|| {
                 hit_storage::prepare(
                     batch.results,
-                    base + carry as u64,
-                    base + sample.len() as u64,
-                    embedded_overlap(),
                     base + sample.len() as u64 == file_size,
                 )
             }),

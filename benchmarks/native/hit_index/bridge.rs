@@ -121,13 +121,7 @@ fn builder_probe(
                     batch.push(RawHit::new(h.offset, h.pattern));
                 }
 
-                prepare(
-                    batch,
-                    start,
-                    (start + chunk as u64).min(size),
-                    11,
-                    start + chunk as u64 >= size,
-                )
+                prepare(batch, start + chunk as u64 >= size)
             })
             .collect();
         stats.prepare_ns += start.elapsed().as_nanos() as u64;

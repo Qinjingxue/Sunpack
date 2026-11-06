@@ -30,7 +30,7 @@ fn benchmark_capture_batch(
     let owner = u32::try_from(start / chunk as u64).map_err(std::io::Error::other)?;
     let mut bytes = Vec::new();
     let mut count = 0;
-    batch.buffer.visit(|hit| {
+    batch.visit(|hit| {
         bytes.extend_from_slice(&hit.offset().to_le_bytes());
         bytes.push(hit.pattern);
         bytes.extend_from_slice(&[0; 3]);

@@ -8,7 +8,7 @@
 //! otherwise the directory widens to u64. This is scan-local private storage.
 //! The cost selector includes position checkpoints, type evidence and padding;
 //! GROUP is permitted only when its type masks preserve every original tuple.
-use super::{HitBuffer, PackedHit, RawHit, HIT_LOOKBEHIND, PATTERNS};
+use super::{PackedHit, RawHit, HIT_LOOKBEHIND, HIT_OFFSET_MASK, PATTERNS};
 use crate::io::scratch::{Blob, Slots, Spool, MEMORY_BYTES};
 use rayon::prelude::*;
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -1824,7 +1824,8 @@ impl MatchPart {
     }
 }
 
-pub(super) struct MatchBuffer {
+// Matching jobs keep only a bounded normalization horizon and encoded leaves.
+pub(super) struct HitBuffer {
     parts: [MatchPart; 2],
     base: u64,
     start: u64,
@@ -1833,7 +1834,7 @@ pub(super) struct MatchBuffer {
     count: usize,
     raw_count: usize,
 }
-impl MatchBuffer {
+impl HitBuffer {
     pub(super) fn new(base: u64, start: u64, end: u64, overlap: usize) -> Self {
         Self {
             parts: std::array::from_fn(|_| MatchPart::default()),
@@ -1850,7 +1851,10 @@ impl MatchBuffer {
     pub(super) fn is_empty(&self) -> bool {
         self.count == 0
     }
-    pub(super) fn push(&mut self, hit: PackedHit) {
+    pub(super) fn push(&mut self, hit: RawHit) {
+        let relative_offset = hit.offset() - self.base;
+        debug_assert!(relative_offset <= HIT_OFFSET_MASK);
+        let hit = PackedHit::new(relative_offset as u32, hit.pattern);
         let t = tag(hit);
         self.count += 1;
         self.raw_count += usize::from((t as usize) < 12);
@@ -1878,18 +1882,23 @@ impl MatchBuffer {
             }
         }
     }
+    #[cfg(test)]
+    pub(super) fn iter(&self) -> impl Iterator<Item = RawHit> {
+        let mut hits = Vec::new();
+        self.visit(|hit| hits.push(hit));
+        hits.sort_unstable_by_key(|h| (h.offset(), h.hit_name()));
+        hits.into_iter()
+    }
 }
-pub(super) fn prepare(
-    batch: HitBuffer,
-    start: u64,
-    _end: u64,
-    _overlap: usize,
-    last: bool,
-) -> Prepared {
-    debug_assert_eq!(batch.buffer.start, start);
-    let HitBuffer { base, buffer } = batch;
-    let raw_count = buffer.raw_count;
-    let parts = buffer.parts.map(|p| p.finish(last));
+pub(super) fn prepare(batch: HitBuffer, last: bool) -> Prepared {
+    let HitBuffer {
+        base,
+        start,
+        raw_count,
+        parts,
+        ..
+    } = batch;
+    let parts = parts.map(|p| p.finish(last));
     let working_bytes = parts
         .iter()
         .map(|p| {
@@ -1913,7 +1922,6 @@ pub(super) struct Builder {
     chunks: usize,
     chunk: u64,
     window: usize,
-    arena_spilled: bool,
     single: Option<Prepared>,
 }
 impl Builder {
@@ -1925,7 +1933,6 @@ impl Builder {
             chunks,
             chunk: chunk as u64,
             window,
-            arena_spilled: false,
             single: None,
         })
     }
@@ -1984,7 +1991,7 @@ impl Builder {
             Some(Slots::Memory(values)) => values.len() * 8,
             _ => 0,
         };
-        if !self.arena_spilled
+        if !self.arena.is_spilled()
             && self
                 .arena
                 .memory_bytes()
@@ -1993,7 +2000,6 @@ impl Builder {
                 > MEMORY_BYTES
         {
             self.arena.spill()?;
-            self.arena_spilled = true;
         }
         let ordinal = (batch.start / self.chunk) as usize;
         for (stream, part) in batch.parts.into_iter().enumerate() {
@@ -2084,11 +2090,10 @@ impl Builder {
                     }
                 }
                 let directory_bytes = dirs[0].memory_bytes() + dirs[1].memory_bytes();
-                if !self.arena_spilled
+                if !self.arena.is_spilled()
                     && self.arena.memory_bytes() + directory_bytes + slot_bytes > MEMORY_BYTES
                 {
                     self.arena.spill()?;
-                    self.arena_spilled = true;
                 }
                 if directory_bytes + slot_bytes + self.arena.memory_bytes() > MEMORY_BYTES {
                     for dir in &mut dirs {
@@ -2967,7 +2972,7 @@ mod tests {
                 for hit in source_hits {
                     batch.push(hit);
                 }
-                let streamed = HitStorage::single(prepare(batch, base, end, 11, true));
+                let streamed = HitStorage::single(prepare(batch, true));
                 for stream in 0..2 {
                     let expected = hits
                         .iter()
@@ -3029,13 +3034,7 @@ mod tests {
                 batch.push(hit);
             }
             builder
-                .push(prepare(
-                    batch,
-                    start,
-                    start + chunk as u64,
-                    11,
-                    ordinal + 1 == chunks,
-                ))
+                .push(prepare(batch, ordinal + 1 == chunks))
                 .unwrap();
         }
         builder.arena.spill().unwrap();
@@ -3075,13 +3074,7 @@ mod tests {
             batch.push(RawHit::new(start + 1000, 8));
             batch.push(RawHit::new(start + chunk - 1, 5));
             builder
-                .push(prepare(
-                    batch,
-                    start,
-                    start + chunk,
-                    11,
-                    ordinal + 1 == chunks,
-                ))
+                .push(prepare(batch, ordinal + 1 == chunks))
                 .unwrap();
         }
         let store = builder.finish().unwrap();
