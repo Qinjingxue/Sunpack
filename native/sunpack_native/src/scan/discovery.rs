@@ -210,7 +210,6 @@ pub(crate) struct NativeEmbeddedBatch {
 struct PendingEmbeddedVolume {
     index: usize,
     anchor: crate::analysis_native::volume_anchor::VolumeAnchor,
-    // Only encrypted standalone fallback needs the original scan diagnostics.
     scan: Option<Arc<NativeScanResult>>,
 }
 
@@ -335,11 +334,11 @@ impl NativeEmbeddedBatch {
                 EmbeddedOutcome::Scan(scan) => {
                     if let Some(mut anchor) = scan.relation_anchor() {
                         anchor.path = table.summary(index)?.0;
-                        let encrypted = anchor.needs_password;
+                        let retain_scan = anchor.needs_password || scan.has_independent_archive();
                         self.pending_volumes.push(PendingEmbeddedVolume {
                             index,
                             anchor,
-                            scan: encrypted.then_some(scan),
+                            scan: retain_scan.then_some(scan),
                         });
                         Ok((index, 3, "embedded_volume_candidate", None))
                     } else {
@@ -420,7 +419,7 @@ impl NativeEmbeddedBatch {
     }
 
     /// One directed Relations call per source scope, using native scan facts.
-    /// Status 0 is an encrypted standalone archive returned to Embedded.
+    /// Status 0 returns standalone/sibling scan facts to Embedded.
     #[pyo3(signature = (table, password_candidates=None))]
     fn resolve_volumes(
         &mut self,
@@ -485,7 +484,8 @@ impl NativeEmbeddedBatch {
                             matched.get(&key).map(String::as_str),
                         )?
                     } else {
-                        let raw = scan.to_py_dict(py)?;
+                        let raw =
+                            scan.standalone_rar_dict(py, anchor.structure_offset.unwrap_or(0))?;
                         let verdict = PyDict::new(py);
                         verdict.set_item(
                             "status",
@@ -509,13 +509,67 @@ impl NativeEmbeddedBatch {
             }
             anchor.evidence.push("embedded:volume_candidate");
             anchors.push(anchor);
+            // Project once after Relations; Python combines logical inputs
+            // sharing this carrier under the existing multi-segment task.
+            if let Some(scan) = item.scan.filter(|scan| scan.has_independent_archive()) {
+                fallback.push((item.index, 0, Some(scan.to_py_dict(py)?)));
+            }
         }
         if anchors.is_empty() {
             return Ok(fallback);
         }
         let sources = &table.relation_sources;
         let excluded = &self.excluded;
-        let groups = py.detach(|| resolve_embedded_volumes(sources, anchors, excluded, cache));
+        let mut groups = py.detach(|| resolve_embedded_volumes(sources, anchors, excluded, cache));
+        // A failed NextHeader inside a carrier can also be damaged standalone
+        // data. Require actual peers for this speculative split identity.
+        // Index only nominated stems once, rather than rescan scopes per head.
+        let stem = |path: &str| {
+            case_key(crate::relations::first_dot_stem(
+                Path::new(path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or_default(),
+            ))
+        };
+        let speculative = |group: &NativeRelationGroup| {
+            !group.candidate_data().relation_confirmed
+                && group
+                    .entry_anchor()
+                    .is_some_and(|a| a.evidence.contains(&"7z:carrier_interrupted"))
+        };
+        let mut peers: HashMap<String, HashSet<String>> = groups
+            .iter()
+            .filter(|g| speculative(g))
+            .map(|g| (stem(g.candidate_data().entry_path), HashSet::new()))
+            .collect();
+        if !peers.is_empty() {
+            for snapshot in sources {
+                for &row in &snapshot.rows {
+                    if !snapshot.table.relation_member_eligible[row] {
+                        continue;
+                    }
+                    let path = &snapshot.table.paths[row];
+                    if let Some(paths) = peers.get_mut(&stem(path)) {
+                        // Only two distinct witnesses are needed. Retaining
+                        // every peer would duplicate a large bucket's paths.
+                        if paths.len() >= 2 {
+                            continue;
+                        }
+                        let key = path_key(path);
+                        if !excluded.contains(&key) {
+                            paths.insert(key);
+                        }
+                    }
+                }
+            }
+            groups.retain(|g| {
+                !speculative(g)
+                    || peers
+                        .get(&stem(g.candidate_data().entry_path))
+                        .is_some_and(|p| p.len() > 1)
+            });
+        }
         for group in groups {
             let index = table.rows.len();
             table.rows.push(Candidate::Relation(Box::new(group)));

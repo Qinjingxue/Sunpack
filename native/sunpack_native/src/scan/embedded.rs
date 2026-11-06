@@ -251,19 +251,16 @@ impl NativeScanResult {
         end: u64,
         password: Option<&str>,
     ) -> PyResult<Py<PyDict>> {
-        self.to_py_dict_with_rar_resolution(py, Some((offset, end, password)))
+        self.to_py_dict_with_rar_resolution(py, Some((offset, end, password)), Some(offset))
+    }
+
+    pub(crate) fn standalone_rar_dict(&self, py: Python<'_>, offset: u64) -> PyResult<Py<PyDict>> {
+        self.to_py_dict_with_rar_resolution(py, None, Some(offset))
     }
 
     /// One sparse nomination per physical input, never one VolumeAnchor per
-    /// ZIP local record. Complete peer archives retain Embedded ownership.
+    /// ZIP local record. Independent complete siblings remain in the scan.
     pub(crate) fn relation_anchor(&self) -> Option<VolumeAnchor> {
-        if self
-            .candidates
-            .iter()
-            .any(|c| c.boundary_kind == "exact" && c.volume_anchor.is_none())
-        {
-            return None;
-        }
         let mut candidates = self
             .candidates
             .iter()
@@ -272,30 +269,46 @@ impl NativeScanResult {
         if candidates.any(|c| c.format != first.format || first.format != "zip") {
             return None;
         }
-        if let Some(anchor) = &first.volume_anchor {
-            return Some((**anchor).clone());
-        }
         let split = first.validation == "zip_split_local_header";
-        Some(VolumeAnchor {
-            size: self.file_size,
-            format: "zip".into(),
-            confidence: if split { "strong" } else { "weak" }.into(),
-            multivolume: split,
-            continuation_to_next: split,
-            internal_volume_number: split.then_some(1),
-            structure_offset: Some(first.offset),
-            anchor_roles: if split { vec!["first"] } else { vec![] },
-            evidence: if split {
-                vec!["zip:split_marker", "zip:local_header"]
-            } else {
-                vec!["zip:local_header"]
-            },
-            ..VolumeAnchor::default()
-        })
+        let mut anchor = first
+            .volume_anchor
+            .as_deref()
+            .cloned()
+            .unwrap_or_else(|| VolumeAnchor {
+                size: self.file_size,
+                format: "zip".into(),
+                confidence: if split { "strong" } else { "weak" }.into(),
+                multivolume: split,
+                continuation_to_next: split,
+                internal_volume_number: split.then_some(1),
+                structure_offset: Some(first.offset),
+                anchor_roles: if split { vec!["first"] } else { vec![] },
+                evidence: if split {
+                    vec!["zip:split_marker", "zip:local_header"]
+                } else {
+                    vec!["zip:local_header"]
+                },
+                ..VolumeAnchor::default()
+            });
+        anchor.carrier_limit = self
+            .candidates
+            .iter()
+            .filter(|c| {
+                c.offset > first.offset && c.boundary_kind == "exact" && c.volume_anchor.is_none()
+            })
+            .map(|c| c.offset)
+            .min();
+        Some(anchor)
     }
 
     pub(crate) fn has_candidates(&self) -> bool {
         !self.candidates.is_empty()
+    }
+
+    pub(crate) fn has_independent_archive(&self) -> bool {
+        self.candidates
+            .iter()
+            .any(|c| c.boundary_kind == "exact" && c.extractable && c.volume_anchor.is_none())
     }
 
     pub(crate) fn is_primary(&self, format: &str) -> bool {
@@ -326,7 +339,7 @@ impl NativeScanResult {
     }
 
     pub(crate) fn to_py_dict(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
-        self.to_py_dict_with_rar_resolution(py, None)
+        self.to_py_dict_with_rar_resolution(py, None, None)
     }
 
     // Project already verified facts once; never read Python rows back into
@@ -335,6 +348,7 @@ impl NativeScanResult {
         &self,
         py: Python<'_>,
         resolution: Option<(u64, u64, Option<&str>)>,
+        standalone_offset: Option<u64>,
     ) -> PyResult<Py<PyDict>> {
         let result = PyDict::new(py);
         result.set_item("complete", !self.budget_exhausted)?;
@@ -392,6 +406,12 @@ impl NativeScanResult {
                 row.set_item("validation", candidate.validation)?;
             }
             row.set_item("candidate_kind", candidate.candidate_kind)?;
+            row.set_item(
+                "volume_candidate",
+                standalone_offset != Some(candidate.offset)
+                    && (candidate.volume_anchor.is_some()
+                        || (candidate.format == "zip" && candidate.end_offset.is_none())),
+            )?;
             row.set_item(
                 "boundary_kind",
                 if resolved.is_some() {
@@ -655,6 +675,34 @@ fn scan_native(
         )
     });
     candidates.dedup_by_key(|candidate| (candidate.offset, candidate.format));
+    // A large sibling can make a split 7z's declared length fit the carrier.
+    // Retain that failed NextHeader proposal only with independent evidence
+    // that another archive interrupts its declared range. No second probe.
+    if candidates.iter().any(|c| {
+        c.format == "7z"
+            && c.volume_anchor.is_some()
+            && c.volume_anchor
+                .as_ref()
+                .and_then(|a| a.expected_logical_size)
+                .is_some_and(|end| end <= file_size)
+    }) {
+        let exact: Vec<_> = candidates
+            .iter()
+            .filter(|c| c.boundary_kind == "exact" && c.volume_anchor.is_none())
+            .map(|c| c.offset)
+            .collect();
+        candidates.retain(|c| {
+            let Some(anchor) = c.volume_anchor.as_ref().filter(|a| a.format == "7z") else {
+                return true;
+            };
+            let Some(end) = anchor.expected_logical_size.filter(|end| *end <= file_size) else {
+                return true;
+            };
+            exact
+                .get(exact.partition_point(|start| *start <= c.offset))
+                .is_some_and(|start| *start < end)
+        });
+    }
     resolve_logical_candidates(&mut candidates);
     // Only validated root evidence survives in the cached native scan. Noise,
     // inner signatures and consumed directory records have no later users.
@@ -1753,7 +1801,12 @@ fn validate_seven_zip(
     let Some(end) = next_start.checked_add(next_size) else {
         return Ok(None);
     };
-    if end > size {
+    if end <= size {
+        if let Some(complete) = validate_seven_zip_next(file, offset, next_start, end, &header)? {
+            return Ok(Some(complete));
+        }
+    }
+    if next_size > 0 {
         let mut item = logical_candidate(
             "7z",
             offset,
@@ -1773,11 +1826,28 @@ fn validate_seven_zip(
             expected_logical_size: Some(end),
             seven_zip_next_header: Some(std::sync::Arc::new(next)),
             continuation_to_next: true,
-            evidence: vec!["7z:start_header_crc", "7z:logical_size_exceeds_part"],
+            evidence: vec![
+                "7z:start_header_crc",
+                if end > size {
+                    "7z:logical_size_exceeds_part"
+                } else {
+                    "7z:carrier_interrupted"
+                },
+            ],
             ..VolumeAnchor::default()
         }));
         return Ok(Some(item));
     }
+    Ok(None)
+}
+
+fn validate_seven_zip_next(
+    file: &ManagedReader,
+    offset: u64,
+    next_start: u64,
+    end: u64,
+    header: &[u8],
+) -> io::Result<Option<EmbeddedCandidate>> {
     // A CRC-valid start header proves only a proposed range. Never let an
     // unverified proposal hide independent archives in a carrier. Stream the
     // next header so a large metadata tree does not require a large allocation.

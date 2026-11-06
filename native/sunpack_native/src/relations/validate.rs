@@ -18,6 +18,18 @@ pub(super) fn validate(validation: &mut ProposalValidation) {
         return;
     }
     let proposal = &validation.proposal;
+    if let Some((key, end)) = mapped_carrier_end(
+        &proposal.format,
+        proposal.style == "zip_spanned",
+        proposal
+            .volumes
+            .iter()
+            .map(|p| (p.1, validation.anchors.get(&path_key(&p.0)))),
+    )
+    .map(|(head, end)| (path_key(&head.path), end))
+    {
+        validation.anchors.get_mut(&key).unwrap().payload_end = Some(end);
+    }
     let anchors = &validation.anchors;
     let get = |path: &str| anchors.get(&path_key(path));
     if proposal
@@ -111,7 +123,7 @@ fn verify_seven_zip_mapping(validation: &ProposalValidation) -> std::io::Result<
             return Ok(None);
         };
         let base = anchor.structure_offset.unwrap_or(0);
-        let Some(stop) = logical.checked_add(anchor.size.saturating_sub(base)) else {
+        let Some(stop) = logical.checked_add(anchor.payload_size()) else {
             return Ok(Some(false));
         };
         let begin = start.max(logical);
@@ -124,6 +136,65 @@ fn verify_seven_zip_mapping(validation: &ProposalValidation) -> std::io::Result<
         logical = stop;
     }
     Ok(Some(consumed == next.size && crc.finalize() == next.crc))
+}
+
+/// A sibling's start is only an upper bound: padding is not archive data.
+/// Solve the one carrier extent from the already collected set geometry.
+/// This is shared by assignment and final validation, with no content reads.
+fn mapped_carrier_end<'a>(
+    format: &str,
+    spanned: bool,
+    parts: impl Iterator<Item = (u32, Option<&'a VolumeAnchor>)> + Clone,
+) -> Option<(&'a VolumeAnchor, u64)> {
+    let head = parts.clone().find(|(n, _)| *n == 1)?.1?;
+    let limit = head.carrier_limit?;
+    if head.payload_end.is_some() || format == "rar" {
+        return None;
+    }
+    let base = head.structure_offset.unwrap_or(0);
+    let length = if format == "7z" {
+        let expected = head.expected_logical_size?.checked_sub(base)?;
+        let rest = parts
+            .clone()
+            .filter(|(n, _)| *n > 1)
+            .try_fold(0u64, |sum, (_, a)| sum.checked_add(a?.payload_size()))?;
+        expected.checked_sub(rest)?
+    } else if format == "zip" && !spanned {
+        let tail = parts.clone().last()?.1?;
+        let directory = tail.zip_directory.as_ref()?;
+        let rest = parts
+            .clone()
+            .filter(|(n, _)| *n > 1)
+            .try_fold(0u64, |sum, (_, a)| {
+                let a = a?;
+                sum.checked_add(if std::ptr::eq(a, tail) {
+                    directory.end.checked_sub(a.structure_offset.unwrap_or(0))?
+                } else {
+                    a.payload_size()
+                })
+            })?;
+        directory
+            .offset
+            .checked_add(directory.size)?
+            .checked_sub(rest)?
+    } else if format == "zip" {
+        // PKZIP disks have disk-relative offsets, not a total byte length.
+        // A consistent intermediate disk size supplies the split geometry;
+        // extraction still validates the member CRCs using these extents.
+        let mut lengths = parts
+            .clone()
+            .filter(|(n, a)| *n > 1 && a.is_some_and(|a| !a.anchor_roles.contains(&"terminal")))
+            .map(|(_, a)| a.map(VolumeAnchor::payload_size));
+        let length = lengths.next()??;
+        if lengths.any(|value| value != Some(length)) {
+            return None;
+        }
+        length
+    } else {
+        return None;
+    };
+    let end = base.checked_add(length)?;
+    (length > 0 && end <= limit && end <= head.size).then_some((head, end))
 }
 
 /// Shared with filename tiers to stop as soon as a complete stronger mapping
@@ -169,9 +240,14 @@ pub(super) fn assignment_status<'a>(
         }
         "7z" => {
             if let Some(first) = head.filter(|a| a.format == "7z" && a.confidence == "strong") {
+                let mapped = mapped_carrier_end(format, spanned, parts.clone());
                 let actual = parts.clone().try_fold(0u64, |size, (_, a)| {
                     a.and_then(|a| {
-                        size.checked_add(a.size.checked_sub(a.structure_offset.unwrap_or(0))?)
+                        let end = mapped
+                            .as_ref()
+                            .filter(|(head, _)| std::ptr::eq(*head, a))
+                            .map_or(a.extent_end(), |(_, end)| *end);
+                        size.checked_add(end.checked_sub(a.structure_offset.unwrap_or(0))?)
                     })
                 });
                 let expected = first

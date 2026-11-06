@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import os
 from typing import Any
 
-from sunpack.core.support.path_keys import case_key
+from sunpack.core.support.path_keys import case_key, path_key
 from sunpack_native import inspect_pe_image, relations_logical_name
 
 from sunpack.core.contracts.archive_input import (
@@ -19,6 +19,7 @@ from sunpack.core.contracts.discovery import (
     DiscoveryFinding,
     DiscoveryTrace,
     StageResult,
+    discovery_failure,
 )
 from sunpack.core.contracts.tasks import ArchiveTask
 from sunpack.core.analysis.embedded import (
@@ -163,9 +164,11 @@ class EmbeddedDiscovery:
             (path, self._password_candidates(path))
             for path, _offset in batch.encrypted_volume_inputs(table)
         ]
+        shared_inputs = False
         for index, status, raw_scan in batch.resolve_volumes(table, passwords):
             candidate = session.project_native_candidate(table, index)
             if status == 0:
+                shared_inputs = True
                 self._discover_into(result, candidate, raw_scan, include_details=include_details)
                 continue
             # A directed relation replaces only earlier decisions for its own
@@ -182,8 +185,68 @@ class EmbeddedDiscovery:
                     carrier_path=candidate.carrier_path, cleanup_paths=candidate.cleanup_paths,
                     discovery_evidence=candidate.relation_anchor,
                 ), reason="Relations confirmed embedded volume anchor")
+        if shared_inputs and len(result.tasks) > 1:
+            self._combine_shared_inputs(result)
         result.validate()
         return result
+
+    @staticmethod
+    def _combine_shared_inputs(result: StageResult) -> None:
+        """One physical owner, independent logical inputs in the existing executor."""
+        owners: dict[str, int] = {}
+        parents: list[int] = []
+
+        def root(index):
+            while parents[index] != index:
+                parents[index] = parents[parents[index]]
+                index = parents[index]
+            return index
+
+        for index, task in enumerate(result.tasks):
+            parents.append(index)
+            for path in task.cleanup_parts:
+                key = path_key(path)
+                if key in owners:
+                    parents[root(index)] = root(owners[key])
+                owners[key] = index
+        by_root: dict[int, list[ArchiveTask]] = {}
+        for index, task in enumerate(result.tasks):
+            by_root.setdefault(root(index), []).append(task)
+        combined = []
+        for group in by_root.values():
+            if len(group) == 1:
+                combined.extend(group)
+                continue
+            primary = next((task for task in group if task.discovery_source == "relations"), group[0])
+            segments = []
+            passwords = {}
+            cleanup = list(dict.fromkeys(path for task in group for path in task.cleanup_parts))
+            for task in group:
+                passwords.update(task.runtime.get("embedded_segment_passwords", {}))
+                payloads = task.knowledge().get("source.extractable_segments", ())
+                if payloads:
+                    segments.extend((ArchiveInputDescriptor.from_dict(row["archive_input"]),
+                                     dict(row.get("segment") or {})) for row in payloads)
+                else:
+                    evidence = {}
+                    if task.discovery_failure:
+                        evidence["discovery_failure"] = task.discovery_failure.to_dict()
+                    segments.append((task.archive_input(), evidence))
+            segments.sort(key=lambda row: (case_key(row[0].entry_path),
+                                          row[0].primary_extent.start if row[0].primary_extent else 0))
+            task = ArchiveTask.from_archive_input(
+                primary.archive_input(), discovery_source="embedded",
+                carrier_path=primary.carrier_path, cleanup_paths=cleanup,
+                discovery_segments=tuple(segments),
+            )
+            if passwords:
+                task.runtime["embedded_segment_passwords"] = passwords
+            combined.append(task)
+            keys = {path_key(path) for path in cleanup}
+            result.blocked_paths.difference_update(keys)
+            result.residual_paths.difference_update(keys)
+            result.claimed_paths.update(keys)
+        result.tasks = combined
 
     def _discover_into(
         self, result: StageResult, candidate: DiscoveryCandidate, precomputed_scan=None,
@@ -232,10 +295,12 @@ class EmbeddedDiscovery:
             size = int(scan["file_size"])
 
         password_by_offset: dict[int, str] = dict(scan.get("resolved_passwords") or ())
+        pending_failures = {}
         encrypted_offsets = [
             item["offset"]
             for item in scan["candidates"]
             if item["candidate_kind"] == "logical_archive"
+            and not item.get("volume_candidate")
             and embedded_candidate_requires_password(item["format"], item["validation"])
             and item["end_offset"] is None
         ]
@@ -263,18 +328,9 @@ class EmbeddedDiscovery:
                 "truncated": "embedded_truncated",
             }.get(status)
             if blocked_reason is not None:
-                return (
-                    None,
-                    blocked_reason,
-                    _blocked_findings(
-                        path,
-                        scan,
-                        blocked_reason,
-                        failed_offset=boundary.get("failed_offset"),
-                        resolved_rows=resolved_rows,
-                    ) if include_details else (),
-                )
-            if status != "ok":
+                pending_failures = {offset: blocked_reason for offset in encrypted_offsets
+                                    if offset not in resolved_rows}
+            elif status != "ok":
                 raise OSError(str(boundary.get("error") or "Unable to resolve encrypted archive boundary"))
             rewritten = []
             for item in scan["candidates"]:
@@ -305,6 +361,7 @@ class EmbeddedDiscovery:
             item
             for item in scan["candidates"]
             if item["candidate_kind"] == "logical_archive"
+            and not item.get("volume_candidate")
             and item["boundary_kind"] != "exact"
             and item["validation"] == "start_header_crc_truncated_declared_range"
         ), None)
@@ -324,17 +381,28 @@ class EmbeddedDiscovery:
             item
             for item in scan["candidates"]
             if item["candidate_kind"] == "logical_archive"
+            and not item.get("volume_candidate")
             and item["boundary_kind"] == "exact"
             and item["extractable"]
             and item["end_offset"] is not None
         ]
         if not scan["complete"] or not physical:
+            if pending_failures:
+                reason = next(iter(pending_failures.values()))
+                return None, reason, _blocked_findings(
+                    path, scan, reason, failed_offset=boundary.get("failed_offset"),
+                    resolved_rows=resolved_rows,
+                ) if include_details else ()
             return None, "no_complete_embedded_archive", ()
 
         physical.sort(key=lambda item: (item["offset"], -item["confidence"], item["format"]))
         segments: list[tuple[ArchiveInputDescriptor, dict[str, Any]]] = []
         base_name = candidate.logical_name or relations_logical_name(os.path.basename(path), True)
-        for item in physical:
+        logical = physical
+        if pending_failures:
+            logical = sorted([*physical, *(item for item in scan["candidates"]
+                              if item["offset"] in pending_failures)], key=lambda item: item["offset"])
+        for item in logical:
             descriptor = _descriptor_for_candidate(
                 path,
                 size,
@@ -346,7 +414,11 @@ class EmbeddedDiscovery:
                 password_required=embedded_candidate_requires_password(item["format"], item["validation"]),
                 execution_analysis={"stream_plan": item["stream_plan"]} if item.get("stream_plan") else None,
             )
-            segments.append((descriptor, item))
+            evidence = item
+            if item["offset"] in pending_failures:
+                failure = discovery_failure("embedded", pending_failures[item["offset"]], path)
+                evidence = {**item, "discovery_failure": failure.to_dict()}
+            segments.append((descriptor, evidence))
 
         primary = segments[0][0]
         task = ArchiveTask.from_archive_input(

@@ -50,6 +50,10 @@ pub(crate) struct VolumeAnchor {
     pub(crate) anchor_roles: Vec<&'static str>,
     pub(crate) internal_volume_number: Option<u32>,
     pub(crate) structure_offset: Option<u64>,
+    // Physical extent, separate from the archive's declared logical length.
+    pub(crate) payload_end: Option<u64>,
+    // A verified sibling bounds this volume but does not locate padding.
+    pub(crate) carrier_limit: Option<u64>,
     pub(crate) expected_logical_size: Option<u64>,
     pub(crate) zip_eocd_offset: Option<u64>,
     pub(crate) zip_directory: Option<Arc<crate::formats::zip::RelationDirectory>>,
@@ -69,6 +73,25 @@ pub(crate) struct VolumeAnchor {
 }
 
 impl VolumeAnchor {
+    pub(crate) fn extent_end(&self) -> u64 {
+        self.payload_end.unwrap_or_else(|| {
+            if self.format == "rar"
+                || (self.format == "zip" && self.anchor_roles.contains(&"terminal"))
+            {
+                self.expected_logical_size
+                    .unwrap_or(self.size)
+                    .min(self.size)
+            } else {
+                self.size
+            }
+        })
+    }
+
+    pub(crate) fn payload_size(&self) -> u64 {
+        self.extent_end()
+            .saturating_sub(self.structure_offset.unwrap_or(0))
+    }
+
     fn into_dict(self, py: Python<'_>) -> PyResult<Py<PyDict>> {
         let out = PyDict::new(py);
         out.set_item("path", self.path)?;
@@ -145,7 +168,7 @@ pub(crate) fn probe_volume_anchor_paths_cheap(
 }
 
 /// One password-independent fact per catalog row generation. Relations may
-/// refine the cheap head with standalone or completed negative tail facts. Contention is per file,
+/// refine the cheap head with password-independent tail facts. Contention is per file,
 /// never on the catalog lock; failed reads remain retryable.
 pub(crate) type CheapAnchorCell = Arc<Mutex<Option<Arc<VolumeAnchor>>>>;
 
@@ -1416,10 +1439,14 @@ pub(crate) fn upgrade_relation_rar_end_reader(
             cursor = next;
         }
     }
+    // An unchanged plain file cannot acquire ENDARC without a new generation.
+    // Read failures return above, so only completed walks are reusable.
+    if (!out.encrypted || out.relation_has_next.is_some())
+        && !out.evidence.contains(&"relation:rar_end_checked")
+    {
+        out.evidence.push("relation:rar_end_checked");
+    }
     if let Some(next) = out.relation_has_next {
-        if !out.evidence.contains(&"relation:rar_end_checked") {
-            out.evidence.push("relation:rar_end_checked");
-        }
         out.continuation_to_next = next;
         if !next && !out.anchor_roles.contains(&"terminal") {
             out.anchor_roles.push("terminal");

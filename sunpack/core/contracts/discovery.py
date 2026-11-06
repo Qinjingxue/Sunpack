@@ -102,18 +102,13 @@ class StageResult:
 
     def add_blocked(self, candidate: DiscoveryCandidate, *, source: str, reason: str, error: str = "") -> None:
         self.blocked_paths.update(candidate.path_keys)
-        spec = _DISCOVERY_FAILURES.get(reason)
-        if spec is not None:
-            kind, message_key, action = spec
+        failure = discovery_failure(source, reason, candidate.entry_path, error)
+        if failure is not None:
             self.tasks.append(ArchiveTask.from_archive_input(
                 candidate.archive_input, discovery_source=source,
                 carrier_path=candidate.carrier_path, cleanup_paths=candidate.cleanup_paths,
                 discovery_evidence=candidate.relation_anchor, discovery_reason=reason,
-                discovery_failure=FailureInfo(
-                    kind, "embedded_boundary" if source == "embedded" else source,
-                    error, message_key=message_key, user_action=action,
-                    details={"path": candidate.entry_path, "reason": reason},
-                ),
+                discovery_failure=failure,
             ))
         self.traces.append(DiscoveryTrace(
             entry_path=candidate.entry_path,
@@ -142,6 +137,17 @@ class StageResult:
 
 
 # Project native verdicts once; presentation and recovery consume the same result.
+def discovery_failure(source: str, reason: str, path: str, error: str = "") -> FailureInfo | None:
+    spec = _DISCOVERY_FAILURES.get(reason)
+    if spec is None:
+        return None
+    kind, message_key, action = spec
+    return FailureInfo(
+        kind, "embedded_boundary" if source == "embedded" else source, error,
+        message_key=message_key, user_action=action, details={"path": path, "reason": reason},
+    )
+
+
 _DISCOVERY_FAILURES = {
     "embedded_password_required": (FailureKind.PASSWORD_REQUIRED, "failure.password_required", "request_password"),
     "embedded_wrong_password": (FailureKind.WRONG_PASSWORD, "failure.wrong_password", "request_password"),

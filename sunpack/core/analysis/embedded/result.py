@@ -54,6 +54,7 @@ class EmbeddedCandidate:
     boundary_kind: str
     extractable: bool
     stream_plan: dict[str, Any] | None = None
+    volume_candidate: bool = False
 
     @property
     def password_required(self) -> bool:
@@ -69,6 +70,7 @@ class EmbeddedCandidate:
             "candidate_kind": self.candidate_kind,
             "boundary_kind": self.boundary_kind,
             "extractable": self.extractable,
+            "volume_candidate": self.volume_candidate,
             **({"stream_plan": self.stream_plan} if self.stream_plan else {}),
         }
 

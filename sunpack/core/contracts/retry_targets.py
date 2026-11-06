@@ -75,13 +75,47 @@ def apply_password_retry(task, failure: FailureInfo | None, generation: tuple) -
     if failure is None or not generation:
         return
     previous = failure.details.get("retry_generation") or ()
+    completed = failure.details.get("retry_completed_inputs") or ()
+    if failure.contains(FailureKind.MISSING_VOLUME) and completed:
+        # New volumes may extend the family. Reuse a completed sibling only
+        # when all of its physical sources still have their original identity.
+        old = {row[0]: tuple(row) for row in previous}
+        current = {row[0]: tuple(row) for row in generation}
+        reusable = {
+            _input_key(value) for value in completed
+            if all(old.get(path_key(path)) == current.get(path_key(path))
+                   and path_key(path) in old
+                   for path in ArchiveInputDescriptor.from_dict(value).part_paths())
+        }
+        segments = task.knowledge().get("source.extractable_segments", ())
+        selected = [segment for segment in segments if _input_key(segment["archive_input"]) not in reusable]
+        if not reusable or not selected or len(selected) == len(segments):
+            return
+        from sunpack.core.support.archive_input_projection import write_source_extractable_segments
+
+        write_source_extractable_segments(task, selected)
+        task.runtime["retry_completed_inputs"] = [value for value in completed if _input_key(value) in reusable]
+        task.runtime["password_retry_segment_count"] = failure.details["segment_count"]
+        if failure.details.get("retry_output_dir"):
+            task.runtime["retry_output_dir"] = failure.details["retry_output_dir"]
+        return
     if tuple(tuple(row) for row in previous) != generation:
         return
     causes = failure.causes
     if not causes or any(not cause.details.get("retry_input") for cause in causes):
         return
-    wanted = {_input_key(cause.details["retry_input"]) for cause in causes
-              if cause.is_password_failure and not cause.contains(FailureKind.MISSING_VOLUME)}
+    retry_causes = [cause for cause in causes
+                    if cause.is_password_failure and not cause.contains(FailureKind.MISSING_VOLUME)]
+    wanted = {_input_key(cause.details["retry_input"]) for cause in retry_causes}
+    # Decrypting a RAR header proves the end for the first time. Match that
+    # pending identity by its start; do not replay already complete siblings.
+    pending_roots = {
+        (path_key(value.entry_path), value.format_hint, value.primary_extent.start):
+            _input_key(cause.details["retry_input"])
+        for cause in retry_causes if cause.stage == "embedded_boundary"
+        for value in [ArchiveInputDescriptor.from_dict(cause.details["retry_input"])]
+        if value.primary_extent is not None
+    }
     if not wanted:
         return
     segments = task.knowledge().get("source.extractable_segments", ())
@@ -89,9 +123,13 @@ def apply_password_retry(task, failure: FailureInfo | None, generation: tuple) -
     matched = set()
     for segment in segments:
         key = _input_key(segment["archive_input"])
-        if key in wanted:
+        descriptor = ArchiveInputDescriptor.from_dict(segment["archive_input"])
+        identity = (path_key(descriptor.entry_path), descriptor.format_hint,
+                    descriptor.primary_extent.start if descriptor.primary_extent else 0)
+        pending = identity in pending_roots
+        if key in wanted or pending:
             selected.append(segment)
-            matched.add(key)
+            matched.add(pending_roots[identity] if pending else key)
     if matched != wanted:
         return
     from sunpack.core.support.archive_input_projection import write_source_extractable_segments
@@ -102,6 +140,7 @@ def apply_password_retry(task, failure: FailureInfo | None, generation: tuple) -
         or cause.contains(FailureKind.MISSING_VOLUME)
     )
     task.runtime["password_retry_segment_count"] = failure.details["segment_count"]
+    task.runtime["retry_completed_inputs"] = completed
     output_dir = failure.details.get("retry_output_dir")
     if output_dir:
         task.runtime["retry_output_dir"] = output_dir
@@ -120,8 +159,12 @@ def remap_retry_failure(failure: FailureInfo, path_map: dict[str, str], generati
                 lambda path: mapping.get(path_key(path), path))
             cause = replace(cause, details={**cause.details, "retry_input": descriptor.to_dict()})
         causes.append(cause)
-    return replace(failure, causes=tuple(causes),
-                   details={**failure.details, "retry_generation": generation})
+    completed = [ArchiveInputDescriptor.from_dict(value).with_path_mapping(
+        lambda path: mapping.get(path_key(path), path)).to_dict()
+        for value in failure.details.get("retry_completed_inputs", ())]
+    return replace(failure, causes=tuple(causes), details={
+        **failure.details, "retry_generation": generation, "retry_completed_inputs": completed,
+    })
 
 
 def merge_latest_results(latest: dict[str, TargetRunResult], summary: RunSummary) -> None:

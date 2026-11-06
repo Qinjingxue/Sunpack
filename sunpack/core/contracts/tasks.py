@@ -94,7 +94,15 @@ class ArchiveTask:
 
     @property
     def all_parts(self) -> list[str]:
-        return self.archive_input().part_paths()
+        parts = self.archive_input().part_paths()
+        segments = self._knowledge.get("source.extractable_segments", ())
+        if not segments:
+            return parts
+        return list(dedupe_values([*parts, *(
+            part["path"] for segment in segments
+            for part in [*segment["archive_input"].get("parts", ()),
+                         *segment["archive_input"].get("ranges", ())]
+        )]))
 
     def archive_input(self) -> ArchiveInputDescriptor:
         return self._archive_input
@@ -127,6 +135,16 @@ class ArchiveTask:
         self.carrier_path = mapped(self.carrier_path or self.main_path)
         self.cleanup_parts = [mapped(path) for path in self.cleanup_parts]
         self.set_archive_input(self.archive_input().with_path_mapping(mapped))
+        for key in ("source.extractable_segments", "source.selected_segment"):
+            value = self._knowledge.get(key)
+            if not value:
+                continue
+            rows = value if isinstance(value, list) else [value]
+            updated = [{**row, "archive_input": ArchiveInputDescriptor.from_dict(
+                row["archive_input"]).with_path_mapping(mapped).to_dict()}
+                if row.get("archive_input") else row for row in rows]
+            self._knowledge.set(key, updated if isinstance(value, list) else updated[0],
+                                source_layer="contracts", source_module="archive_task")
 
     def adopt_detection_plan(self, replacement: "ArchiveTask") -> None:
         runtime = dict(self.runtime)

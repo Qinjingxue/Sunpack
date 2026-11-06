@@ -287,6 +287,74 @@ def test_catalog_refined_zip_facts_do_not_hide_replaced_or_missing_volumes(tmp_p
         catalog.close()
 
 
+@pytest.mark.parametrize("archive_format", ["rar", "zip", "zip_carrier"])
+def test_catalog_tail_facts_remain_generation_local(tmp_path, archive_format):
+    """Head/standalone cache cases cannot detect lost ENDARC or negative ZIP
+    tail scans. Reuse a real set across concurrent requests, then invalidate
+    one member at identical metadata while retaining an older view.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    from sunpack_native import NativeCandidateTable, NativeWatchState
+    from tests.helpers.real_archives import create_zip_multidisk_archive
+
+    options = dict(payload_size=96 * 1024, split_volume_size=40 * 1024)
+    if archive_format == "rar":
+        case = ArchiveFixtureFactory().create(tmp_path, "cached", "rar", split=True,
+                                              compression_level=0, **options)
+        marker = "relation:rar_end_checked"
+    else:
+        case = create_zip_multidisk_archive(tmp_path, "cached", **options)
+        marker = ("relation:zip_carrier_checked" if archive_format == "zip_carrier"
+                  else "relation:zip_tail_checked")
+    member = sorted(case.archive_dir.iterdir())[-1]
+    if archive_format.startswith("zip"):
+        member = case.entry_path
+    if archive_format == "zip_carrier":
+        next(path for path in case.archive_dir.iterdir() if path.suffix == ".zip").unlink()
+    data = member.read_bytes()
+    stamp = member.stat().st_mtime_ns
+    scope = DiscoveryScope(str(case.archive_dir))
+    scan_options = DirectoryScanner.compile_scan_options(make_config())
+    catalog = NativeWatchCatalog(NativeWatchState())
+
+    def snapshot():
+        return scan_options.catalog_snapshot(catalog, scope.native, str(member))
+
+    def refine(_=None):
+        filtered, raw = snapshot()
+        NativeCandidateTable().append_relations(raw, filtered)
+
+    def member_facts(view):
+        return next((facts for path, _, facts in view.relation_anchor_rows()
+                     if path == str(member)), {})
+
+    try:
+        assert not scan_options.catalog_update(catalog, scope.native)
+        catalog.remember_observation(str(member), len(data), stamp / 1e9, "member", 1)
+        refine()
+        previous = snapshot()[1]
+        assert marker in member_facts(previous)["evidence"]
+        if archive_format == "rar":
+            assert "terminal" in member_facts(previous)["anchor_roles"]
+        else:
+            assert "zip:local_header" in member_facts(previous)["evidence"]
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            list(pool.map(refine, range(8)))
+        assert marker in member_facts(snapshot()[1])["evidence"]
+        with preserve_file_times(member):
+            member.write_bytes(b"x" * len(data))
+        catalog.remember_observation(str(member), len(data), stamp / 1e9, "member", 2)
+        assert marker not in member_facts(snapshot()[1]).get("evidence", ())
+        assert marker in member_facts(previous)["evidence"]
+        with preserve_file_times(member):
+            member.write_bytes(data)
+        catalog.remember_observation(str(member), len(data), stamp / 1e9, "member", 3)
+        refine()
+        assert marker in member_facts(snapshot()[1])["evidence"]
+    finally:
+        catalog.close()
+
+
 def test_targeted_catalog_updates_preserve_original_depth_pruning_and_conflicts(tmp_path):
     """Full-root scans cannot detect incremental scope widening or stale conflict rows."""
     from sunpack_native import NativeDirectoryScanOptions, NativePathRule

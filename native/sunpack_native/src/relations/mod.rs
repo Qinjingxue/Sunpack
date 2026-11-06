@@ -996,7 +996,7 @@ fn validated_proposal_to_dict(
                     .set_item("zip_eocd_offset", logical_start + eocd - start)?;
                 break;
             }
-            logical_start = logical_start.saturating_add(anchor.size.saturating_sub(start));
+            logical_start = logical_start.saturating_add(anchor.payload_size());
         }
     }
     dict.set_item("head_metadata", metadata)?;
@@ -1069,7 +1069,7 @@ fn proposal_logical_size(
         .try_fold(0u64, |total, (path, _, _, _, _)| {
             anchors
                 .get(&path_key(path))
-                .map(|anchor| total.saturating_add(anchor.size))
+                .map(|anchor| total.saturating_add(anchor.payload_size()))
         })
 }
 
@@ -1116,10 +1116,7 @@ fn proposal_volume_dicts(
             }
             if let Some(end) = anchors
                 .get(&path_key(path))
-                .filter(|a| {
-                    (a.format == "zip" && a.anchor_roles.contains(&"terminal")) || a.format == "rar"
-                })
-                .and_then(|a| a.expected_logical_size.filter(|&end| end < a.size))
+                .and_then(|a| (a.extent_end() < a.size).then(|| a.extent_end()))
             {
                 dict.set_item("end", end)?;
             }

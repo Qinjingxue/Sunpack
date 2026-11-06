@@ -648,7 +648,10 @@ def _should_retry_missing_volume_resolution(
     result: ExtractionResult,
 ) -> bool:
     failure = result.failure
-    return bool(failure is not None and failure.contains(FailureKind.MISSING_VOLUME))
+    # The physical-family fallback replaces the entire task and clears its
+    # output. Multi-input carriers resume through the segment continuation.
+    return bool(failure is not None and not result.embedded_results
+                and failure.contains(FailureKind.MISSING_VOLUME))
 
 
 def _possible_missing_volume_failure(

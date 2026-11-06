@@ -2157,7 +2157,7 @@ class WatchScheduler:
             retry_entry = self.state.latest_entry_for_path(candidate.path)
             pending = self.state.pending_work_for_path(candidate.path)
             scope_dir = ""
-            if retry_entry is not None and retry_entry.status == "failed_password":
+            if retry_entry is not None and retry_entry.status in {"failed_password", "suspended_missing_volume"}:
                 scope_dir = retry_entry.password_scope_dir
                 failure = FailureInfo.from_dict(retry_entry.failure_payload)
                 if failure is not None and failure.details.get("retry_generation"):

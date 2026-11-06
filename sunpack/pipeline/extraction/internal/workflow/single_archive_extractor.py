@@ -691,10 +691,15 @@ class SingleArchiveExtractor:
                 # Password verification must bind to the currently active
                 # logical segment.
                 write_source_password_probe_input(child_task, descriptor.to_dict())
-            result = yield from self._extract_state_machine(
-                child_task, segment_dir, allow_embedded_segments=False,
-                phase_timer=phase_timer, phase_prefix=f"{phase_prefix}_segment_extract",
-            )
+            discovery_failure = FailureInfo.from_dict((segment.get("segment") or {}).get("discovery_failure"))
+            if discovery_failure is not None:
+                result = self._failed(segment_dir, self._localized_failure(discovery_failure),
+                                      failure=discovery_failure)
+            else:
+                result = yield from self._extract_state_machine(
+                    child_task, segment_dir, allow_embedded_segments=False,
+                    phase_timer=phase_timer, phase_prefix=f"{phase_prefix}_segment_extract",
+                )
             result.diagnostics = {
                 **dict(result.diagnostics or {}),
                 "verification_archive_input": dict(segment.get("archive_input") or {}),
@@ -775,6 +780,13 @@ class SingleArchiveExtractor:
                 segment_failures,
                 segment_count=segment_count,
             )
+            aggregate_failure = replace(aggregate_failure, details={
+                **aggregate_failure.details,
+                "retry_completed_inputs": [
+                    *task.runtime.get("retry_completed_inputs", ()),
+                    *(item["archive_input"] for item in segment_results if item["success"]),
+                ],
+            })
             generation = task.runtime.get("input_generation")
             if generation:
                 aggregate_failure = replace(aggregate_failure, details={

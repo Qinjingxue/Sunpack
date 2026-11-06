@@ -136,3 +136,50 @@ pub(crate) fn relation_local_key(
         ),
     }))
 }
+
+/// A member wholly contained on one carrier disk proves its physical end.
+/// Reuse the local/descriptor parsers; never read or inflate the payload.
+pub(crate) fn relation_member_end(
+    reader: &crate::io::reader::ManagedReader,
+    base: u64,
+    limit: u64,
+    record: &super::CentralDirectoryRecord<'_>,
+    values: &super::zip64::CentralValues,
+) -> std::io::Result<Option<u64>> {
+    let Some(start) = base.checked_add(values.local_offset) else {
+        return Ok(None);
+    };
+    if start.checked_add(30).is_none_or(|end| end > limit) {
+        return Ok(None);
+    }
+    let fixed = reader.read_cached_at(start, 30)?;
+    let Some(len) = super::relation_local_header_len(&fixed, 0) else {
+        return Ok(None);
+    };
+    let Some(end) = start
+        .checked_add(len as u64)
+        .and_then(|n| n.checked_add(values.compressed))
+        .filter(|end| *end <= limit)
+    else {
+        return Ok(None);
+    };
+    let bytes = reader.read_cached_at(start, len)?;
+    let Some(local) = super::parse_local_header(&bytes, 0) else {
+        return Ok(None);
+    };
+    if local.name != record.name || local.method != record.method || local.flags != record.flags {
+        return Ok(None);
+    }
+    if record.flags & 8 == 0 {
+        return Ok(Some(end));
+    }
+    let descriptor = reader.read_cached_at(end, (limit - end).min(24) as usize)?;
+    Ok(super::descriptor_at_impl(
+        &descriptor,
+        0,
+        record.crc32,
+        values.compressed,
+        values.uncompressed,
+    )
+    .and_then(|len| end.checked_add(len as u64)))
+}

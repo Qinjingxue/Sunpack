@@ -209,7 +209,7 @@ impl BucketView<'_> {
             };
             let prefix = compact.range(..last).try_fold(0u64, |sum, (_, &i)| {
                 let a = self.rows[i].anchor.as_ref()?;
-                sum.checked_add(a.size.checked_sub(a.structure_offset.unwrap_or(0))?)
+                sum.checked_add(a.payload_size())
             });
             let logical_end = prefix.and_then(|prefix| {
                 prefix.checked_add(

@@ -248,6 +248,7 @@ pub(super) fn collect(
                 && (a.format == "zip" || a.format.is_empty())
                 && !a.sfx
                 && !a.anchor_roles.contains(&"terminal")
+                && a.carrier_limit.is_none()
                 && !a.evidence.contains(&"relation:zip_tail_checked")
             {
                 zip.push(i);
@@ -273,22 +274,7 @@ pub(super) fn collect(
         }))
         .collect::<Vec<_>>();
     for (i, anchor) in updates {
-        // Reuse the catalog's existing per-generation fact cell. Only a ZIP
-        // proved standalone by its own head and tail is independent of bucket
-        // membership and passwords; never cache the contextual inference below.
-        if anchor.format == "zip"
-            && anchor.standalone
-            && anchor.error.is_empty()
-            && anchor.evidence.contains(&"zip:local_header")
-            && anchor.anchor_roles.contains(&"terminal")
-        {
-            if let Some(cell) = &rows[i].anchor_cell {
-                let mut cached = cell.lock().unwrap_or_else(|e| e.into_inner());
-                if cached.as_ref().is_none_or(|old| !old.standalone) {
-                    *cached = Some(Arc::new(anchor.clone()));
-                }
-            }
-        }
+        remember_tail_facts(&rows[i], &anchor);
         rows[i].anchor = Some(anchor);
     }
     for indexes in index.rows_by_stem.values() {
@@ -313,6 +299,7 @@ pub(super) fn collect(
                         && rows[i].anchor.as_ref().is_some_and(|a| {
                             !a.standalone
                                 && a.error.is_empty()
+                                && a.carrier_limit.is_none()
                                 && (a.format.is_empty() || a.format == "zip")
                         })
                 })
@@ -329,27 +316,7 @@ pub(super) fn collect(
                 })
                 .collect();
             for (i, anchor) in updates {
-                // A completed negative byte scan is generation-local, not a
-                // bucket inference. Keep just that fact in the existing cell
-                // so unrelated watch events cannot rescan an unchanged file.
-                if anchor.error.is_empty()
-                    && anchor.zip_eocd_offset.is_none()
-                    && anchor.evidence.contains(&"relation:zip_carrier_checked")
-                {
-                    if let Some(cell) = &rows[i].anchor_cell {
-                        let mut cached = cell.lock().unwrap_or_else(|e| e.into_inner());
-                        if let Some(old) = cached.as_mut() {
-                            let old = Arc::make_mut(old);
-                            for marker in
-                                ["relation:zip_tail_checked", "relation:zip_carrier_checked"]
-                            {
-                                if !old.evidence.contains(&marker) {
-                                    old.evidence.push(marker);
-                                }
-                            }
-                        }
-                    }
-                }
+                remember_tail_facts(&rows[i], &anchor);
                 rows[i].anchor = Some(anchor);
             }
         }
@@ -378,6 +345,55 @@ pub(super) fn collect(
             }
         }
     }
+}
+
+/// Only byte facts enter the existing generation cell, before any peer-based
+/// inference. Embedded offsets and decrypted headers must not replace a cheap
+/// head, and concurrent requests must never downgrade a more complete tail.
+fn remember_tail_facts(row: &RelationInput, anchor: &VolumeAnchor) {
+    let markers = [
+        "relation:rar_end_checked",
+        "relation:zip_tail_checked",
+        "relation:zip_carrier_checked",
+    ];
+    if !anchor.error.is_empty()
+        || anchor.encrypted
+        || anchor.needs_password
+        || anchor.carrier_limit.is_some()
+        || anchor.evidence.contains(&"zip:directory_member")
+        || !markers
+            .iter()
+            .any(|marker| anchor.evidence.contains(marker))
+    {
+        return;
+    }
+    let Some(cell) = &row.anchor_cell else {
+        return;
+    };
+    let mut cached = cell.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(old) = cached.as_ref() else {
+        return;
+    };
+    if old.path != anchor.path
+        || old.size != anchor.size
+        || old.structure_offset != anchor.structure_offset
+        // A tail-only ZIP must remain an opaque filesystem residual until
+        // Relations can pair it with a head, including one inside a carrier.
+        || old.format != anchor.format
+        || old.encrypted
+        || old.needs_password
+        || (old.standalone && !anchor.standalone)
+        || (old.zip_eocd_offset.is_some() && anchor.zip_eocd_offset.is_none())
+        || markers.iter().any(|marker| {
+            old.evidence.contains(marker) && !anchor.evidence.contains(marker)
+        })
+        || markers.iter().all(|marker| {
+            !anchor.evidence.contains(marker) || old.evidence.contains(marker)
+        })
+    {
+        return;
+    }
+    *cached = Some(Arc::new(anchor.clone()));
 }
 
 fn refine_zip_members(rows: &mut [RelationInput], indexes: &[usize]) {
@@ -423,7 +439,50 @@ fn refine_zip_members(rows: &mut [RelationInput], indexes: &[usize]) {
         }
     }
     let mut matches = HashMap::<usize, Option<(u32, u64)>>::new();
+    // Two-disk ZIPs may have no intermediate disk to establish split size.
+    // If all first-disk members fit, their directory lengths prove its end.
+    let carrier = indexes
+        .iter()
+        .filter_map(|&i| {
+            rows[i]
+                .anchor
+                .as_ref()
+                .filter(|a| a.carrier_limit.is_some())
+                .map(|a| (i, a))
+        })
+        .collect::<Vec<_>>();
+    let carrier = if carrier.len() == 1
+        && directory.disk == 1
+        && directory.cd_disk == directory.disk
+        && directory.offset == 0
+    {
+        let (i, a) = carrier[0];
+        crate::io::reader::ManagedReader::open(&a.path)
+            .ok()
+            .map(|reader| (i, a, reader.probe_reader()))
+    } else {
+        None
+    };
+    let mut carrier_end = Some(0u64);
+    let mut carrier_entries = 0u64;
     let complete = visit_relation_directory(&rows[terminal].path, directory, |record, values| {
+        if values.disk == 0 {
+            if let Some((_, a, reader)) = &carrier {
+                carrier_entries += 1;
+                carrier_end = carrier_end.and_then(|end| {
+                    crate::formats::zip::relation_member_end(
+                        reader,
+                        a.structure_offset.unwrap_or(0),
+                        a.carrier_limit.unwrap(),
+                        record,
+                        &values,
+                    )
+                    .ok()
+                    .flatten()
+                    .map(|next| end.max(next))
+                });
+            }
+        }
         // A scanned local header may follow carrier padding or continuation
         // data. Directory disk offsets locate the physical disk's real base.
         if record.flags & 0x2000 != 0 {
@@ -474,6 +533,14 @@ fn refine_zip_members(rows: &mut [RelationInput], indexes: &[usize]) {
     });
     if !matches!(complete, Ok(true)) {
         return;
+    }
+    let carrier_extent = carrier.and_then(|(i, _, _)| {
+        carrier_end
+            .filter(|_| carrier_entries > 0)
+            .map(|end| (i, end))
+    });
+    if let Some((i, end)) = carrier_extent {
+        rows[i].anchor.as_mut().unwrap().payload_end = Some(end);
     }
     // Terminal directory geometry independently locates its disk base even
     // when that disk begins in the middle of a member's compressed bytes.

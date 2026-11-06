@@ -53,6 +53,7 @@ def _normalize_native_result(value: dict[str, Any], expected_size: int) -> Embed
             candidate_kind=str(row["candidate_kind"]),
             boundary_kind=str(row["boundary_kind"]),
             extractable=bool(row["extractable"]),
+            volume_candidate=bool(row.get("volume_candidate")),
             stream_plan=dict(row["stream_plan"]) if row.get("stream_plan") else None,
         ))
 
@@ -102,6 +103,7 @@ def embedded_result_from_dict(value: dict[str, Any]) -> EmbeddedScanResult:
                 candidate_kind=str(item["candidate_kind"]),
                 boundary_kind=str(item["boundary_kind"]),
                 extractable=bool(item["extractable"]),
+                volume_candidate=bool(item.get("volume_candidate")),
                 stream_plan=dict(item["stream_plan"]) if item.get("stream_plan") else None,
             )
             for item in value["candidates"]
