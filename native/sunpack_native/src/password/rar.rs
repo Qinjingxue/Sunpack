@@ -1,4 +1,4 @@
-use crate::analysis_native::volume_anchor::rar5_main_volume;
+use crate::formats::rar::{rar4_end_volume, rar5_header_len, rar5_main_volume, read_vint};
 use crate::io::cancellation::Cancellation;
 use crate::io::read_fault::{FieldLocation, ReadFault};
 use crate::io::reader::ManagedReader;
@@ -19,6 +19,7 @@ use pyo3::types::{PyDict, PyList, PyTuple};
 use rayon::prelude::*;
 use sha1::{Digest, Sha1};
 use sha2::Sha256;
+use std::borrow::Cow;
 use std::io;
 use std::io::Write;
 
@@ -43,7 +44,6 @@ const RAR4_HEADER_READ_HINT: usize = 512;
 
 type HmacSha256 = Hmac<Sha256>;
 type Aes128CbcDecryptor = Decryptor<Aes128>;
-type Aes256CbcDecryptor = Decryptor<Aes256>;
 
 /// The result of walking a header-encrypted RAR stream far enough to prove
 /// whether its ENDARC record is present.  This deliberately contains no
@@ -55,6 +55,7 @@ pub(crate) struct RarTerminalProof {
     pub(crate) end_block_found: bool,
     pub(crate) end_block_flags: u64,
     pub(crate) end_offset: Option<u64>,
+    pub(crate) volume_number: Option<u32>,
 }
 
 fn decrypt_cbc_block<C>(cipher: &C, previous: &mut [u8; 16], encrypted: &[u8]) -> [u8; 16]
@@ -640,43 +641,51 @@ fn parse_rar4_block(data: &[u8], offset: usize) -> Option<Rar4Block> {
 /// In the normal RAR4 layout the Main Header remains plaintext and carries
 /// MHD_PASSWORD; the salt is immediately after that header and all following
 /// block headers are AES-CBC encrypted.
-pub(crate) fn rar4_decrypt_header_flags(data: &[u8], password: &str) -> Option<u16> {
-    let main =
-        parse_rar4_block(data, RAR4_SIGNATURE.len()).filter(|block| block.header_type == 0x73)?;
+fn decrypt_rar4_header(encrypted: &[u8], password: &str, salt_source: &[u8]) -> Option<Rar4Block> {
+    decrypt_rar4_header_with_read(encrypted, password, salt_source, |_, _| None)
+}
+
+pub(crate) fn rar4_decrypt_header_flags_with_read(
+    data: &[u8],
+    password: &str,
+    mut read: impl FnMut(u64, usize) -> Option<Vec<u8>>,
+) -> Option<u16> {
+    let main = parse_rar4_block(data, RAR4_SIGNATURE.len()).filter(|b| b.header_type == 0x73)?;
     if main.flags & RAR4_MAIN_HEADER_PASSWORD == 0 {
         return None;
     }
-    let encrypted_offset = main.next_offset.checked_add(8)?;
-    let encrypted = data.get(encrypted_offset..)?;
-    let first = decrypt_rar4_header(encrypted, password, &data[main.next_offset..])?;
+    let offset = main.next_offset.checked_add(8)?;
+    let salt = header_range(data, main.next_offset, 8, &mut read)?;
+    let first = decrypt_rar4_header_with_read(
+        data.get(offset..).unwrap_or_default(),
+        password,
+        &salt,
+        |pos, size| read((offset as u64).checked_add(pos)?, size),
+    )?;
     (0x72..=0x7b)
         .contains(&first.header_type)
         .then_some(main.flags)
 }
 
-fn decrypt_rar4_header(encrypted: &[u8], password: &str, salt_source: &[u8]) -> Option<Rar4Block> {
+fn decrypt_rar4_header_with_read(
+    encrypted: &[u8],
+    password: &str,
+    salt_source: &[u8],
+    mut read: impl FnMut(u64, usize) -> Option<Vec<u8>>,
+) -> Option<Rar4Block> {
     let salt: &[u8; 8] = salt_source.get(..8)?.try_into().ok()?;
-    if encrypted.len() < 16 {
-        return None;
-    }
     let (key, iv) = derive_rar3_key_iv(password, Some(salt))?;
-    let mut first_block = encrypted[..16].to_vec();
-    let first_plaintext = Aes128CbcDecryptor::new(&key.into(), &iv.into())
-        .decrypt_padded::<NoPadding>(&mut first_block)
-        .ok()?;
-    let header_size = u16::from_le_bytes([first_plaintext[5], first_plaintext[6]]) as usize;
-    if header_size < RAR4_MIN_HEADER_SIZE {
+    let cipher = Aes128::new_from_slice(&key).ok()?;
+    let first = header_range(encrypted, 0, 16, &mut read)?;
+    let plain = decrypt_cbc_block(&cipher, &mut iv.clone(), &first);
+    let size = u16::from_le_bytes([plain[5], plain[6]]) as usize;
+    if size < RAR4_MIN_HEADER_SIZE {
         return None;
     }
-    let decrypt_len = header_size.checked_add(15)? & !0x0f;
-    if decrypt_len > encrypted.len() {
-        return None;
-    }
-    let mut plaintext = encrypted[..decrypt_len].to_vec();
-    let decrypted = Aes128CbcDecryptor::new(&key.into(), &iv.into())
-        .decrypt_padded::<NoPadding>(&mut plaintext)
-        .ok()?;
-    parse_rar4_block(decrypted, 0)
+    let aligned = size.checked_add(15)? & !15;
+    let encrypted = header_range(encrypted, 0, aligned, &mut read)?;
+    let full = decrypt_cbc_bytes(&cipher, &iv, &encrypted);
+    parse_rar4_block(&full[..size], 0)
 }
 
 fn parse_rar4_file_probe(data: &[u8], offset: usize, block: Rar4Block) -> Option<Rar4DataProbe> {
@@ -1141,30 +1150,50 @@ fn rar5_aes_key(password: &str, header: &Rar5EncryptionHeader) -> Option<[u8; 32
 /// Returns `(archive_flags, volume_number)` parsed from the decrypted main
 /// header, or `None` when no type-4 header exists, the password does not pass
 /// the embedded password check, or the decrypted block fails CRC validation.
+#[cfg(test)]
 pub(crate) fn rar5_decrypt_main_header(data: &[u8], password: &str) -> Option<(u64, Option<u32>)> {
-    let header = find_rar5_encryption_header(data)?;
-    if header.header_end == 0 {
-        return None;
-    }
-    let key = rar5_aes_key(password, &header)?;
+    rar5_decrypt_main_header_with_read(data, password, |_, _| None)
+}
 
-    let iv_offset = header.header_end;
-    let iv: [u8; 16] = data
-        .get(iv_offset..iv_offset.checked_add(16)?)?
-        .try_into()
-        .ok()?;
-    let ct_offset = iv_offset.checked_add(16)?;
-    let available = data.len().saturating_sub(ct_offset);
-    let block_count = (available / 16).min(8);
-    if block_count == 0 {
+fn header_range<'a>(
+    data: &'a [u8],
+    offset: usize,
+    len: usize,
+    read: &mut impl FnMut(u64, usize) -> Option<Vec<u8>>,
+) -> Option<Cow<'a, [u8]>> {
+    let end = offset.checked_add(len)?;
+    if let Some(bytes) = data.get(offset..end) {
+        return Some(Cow::Borrowed(bytes));
+    }
+    let prefix = data.get(offset..).unwrap_or_default();
+    let bytes = read(offset.checked_add(prefix.len())? as u64, len - prefix.len())?;
+    if bytes.len() != len - prefix.len() {
         return None;
     }
-    let decrypt_len = block_count * 16;
-    let mut plaintext = data[ct_offset..ct_offset + decrypt_len].to_vec();
-    let decrypted = Aes256CbcDecryptor::new(&key.into(), &iv.into())
-        .decrypt_padded::<NoPadding>(&mut plaintext)
-        .ok()?;
-    rar5_main_volume(decrypted, 0)
+    let mut full = Vec::with_capacity(len);
+    full.extend_from_slice(prefix);
+    full.extend(bytes);
+    Some(Cow::Owned(full))
+}
+
+pub(crate) fn rar5_decrypt_main_header_with_read(
+    data: &[u8],
+    password: &str,
+    mut read: impl FnMut(u64, usize) -> Option<Vec<u8>>,
+) -> Option<(u64, Option<u32>)> {
+    let header = find_rar5_encryption_header(data)?;
+    let key = rar5_aes_key(password, &header)?;
+    let cipher = Aes256::new_from_slice(&key).ok()?;
+    let iv = header_range(data, header.header_end, 16, &mut read)?;
+    let iv: [u8; 16] = iv.as_ref().try_into().ok()?;
+    let offset = header.header_end.checked_add(16)?;
+    let first = header_range(data, offset, 16, &mut read)?;
+    let plain = decrypt_cbc_block(&cipher, &mut iv.clone(), &first);
+    let size = rar5_header_len(&plain)?;
+    let aligned = size.checked_add(15)? & !15;
+    let encrypted = header_range(data, offset, aligned, &mut read)?;
+    let full = decrypt_cbc_bytes(&cipher, &iv, &encrypted);
+    rar5_main_volume(&full[..size], 0)
 }
 
 /// Walk a header-encrypted RAR stream with a password that has already been
@@ -1391,6 +1420,7 @@ fn walk_rar5_encrypted_headers(
                 end_block_found: true,
                 end_block_flags: end_flags,
                 end_offset: Some(next),
+                volume_number: None,
             });
         }
         block_offset = next;
@@ -1564,6 +1594,7 @@ fn walk_rar4_encrypted_headers(
                 end_block_found: true,
                 end_block_flags: u64::from(header_flags),
                 end_offset: Some(next),
+                volume_number: rar4_end_volume(full),
             });
         }
         block_offset = next;
@@ -1602,23 +1633,6 @@ fn status_with_details(
         result.set_item("match_evidence", value)?;
     }
     Ok(result.into())
-}
-
-fn read_vint(data: &[u8], offset: usize) -> Option<(u64, usize)> {
-    let mut value = 0u64;
-    let mut shift = 0;
-    for index in offset..data.len().min(offset + 10) {
-        let byte = data[index];
-        if index == offset + 9 && (byte & 0x7E) != 0 {
-            return None;
-        }
-        value |= ((byte & 0x7F) as u64) << shift;
-        if byte & 0x80 == 0 {
-            return Some((value, index + 1));
-        }
-        shift += 7;
-    }
-    None
 }
 
 fn read_vint_bounded(data: &[u8], offset: usize, end: usize) -> Option<(u64, usize)> {
@@ -1790,6 +1804,107 @@ mod rar5_header_decryption_tests {
         assert!(proof.password_matched);
         assert!(!proof.end_block_found);
         assert_eq!(proof.end_offset, None);
+    }
+}
+
+#[cfg(test)]
+mod relation_header_tests {
+    use super::*;
+    use crate::analysis_native::volume_anchor::{
+        probe_volume_anchor_at_offset, upgrade_relation_rar_end,
+    };
+    use aes::cipher::BlockModeEncrypt;
+
+    fn vint(mut value: u64) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        while value >= 128 {
+            bytes.push((value as u8 & 127) | 128);
+            value >>= 7;
+        }
+        bytes.push(value as u8);
+        bytes
+    }
+    fn rar5_block(body: &[u8]) -> Vec<u8> {
+        let mut bytes = vint(body.len() as u64);
+        bytes.extend(body);
+        let mut full = crc32(&bytes).to_le_bytes().to_vec();
+        full.extend(bytes);
+        full
+    }
+    fn rar4_block(kind: u8, flags: u16, body: &[u8]) -> Vec<u8> {
+        let mut header = vec![0, 0, kind];
+        header.extend(flags.to_le_bytes());
+        header.extend(((7 + body.len()) as u16).to_le_bytes());
+        header.extend(body);
+        let crc = crc32(&header[2..]) as u16;
+        header[..2].copy_from_slice(&crc.to_le_bytes());
+        header
+    }
+
+    // Existing encrypted fixtures have small headers and no RAR4 ENDARC ID.
+    // This single lifecycle case covers both missing facts without extraction
+    // or payload-sized I/O, including a carrier and incomplete ciphertext.
+    #[test]
+    fn encrypted_relation_headers_keep_volume_identity_at_declared_extents() {
+        let salt = [0x73u8; 8];
+        let (key, iv) = derive_rar3_key_iv("secret", Some(&salt)).unwrap();
+        let mut end = rar4_block(0x7b, 8, &2u16.to_le_bytes());
+        end.resize(16, 0);
+        let ciphertext = cbc::Encryptor::<Aes128>::new(&key.into(), &iv.into())
+            .encrypt_padded::<NoPadding>(&mut end, 16)
+            .unwrap();
+        let mut data = vec![0x77; 37];
+        data.extend(RAR4_SIGNATURE);
+        data.extend(rar4_block(0x73, 0x91, &[0; 6]));
+        data.extend(salt);
+        data.extend(ciphertext);
+        let path = crate::test_support::temp_file("encrypted_rar4_identity", &data);
+        let anchor =
+            probe_volume_anchor_at_offset(&path.to_string_lossy(), 37, "rar", Some("secret"));
+        assert!(!anchor.needs_password, "{}", anchor.error);
+        let anchor = upgrade_relation_rar_end(&anchor, Some("secret"));
+        assert_eq!(anchor.internal_volume_number, Some(3));
+        assert_eq!(anchor.relation_has_next, Some(false));
+        std::fs::remove_file(path).unwrap();
+
+        let mut extra_body = vec![2, 1];
+        extra_body.extend(vint(600));
+        extra_body.extend(vec![b'a'; 600]);
+        let mut extra = vint(extra_body.len() as u64);
+        extra.extend(extra_body);
+        let mut main = vec![1, 1];
+        main.extend(vint(extra.len() as u64));
+        main.extend([3, 2]);
+        main.extend(extra);
+        let mut plaintext = rar5_block(&main);
+        let len = (plaintext.len() + 15) & !15;
+        plaintext.resize(len, 0);
+        let salt = [0x65u8; 16];
+        let iv = [0x76u8; 16];
+        let mut key = [0; 32];
+        pbkdf2::pbkdf2_hmac::<Sha256>(b"secret", &salt, 16, &mut key);
+        let ciphertext = cbc::Encryptor::<Aes256>::new(&key.into(), &iv.into())
+            .encrypt_padded::<NoPadding>(&mut plaintext, len)
+            .unwrap();
+        let mut encryption = vec![4, 0, 0, 0, 4];
+        encryption.extend(salt);
+        let mut data = RAR5_SIGNATURE.to_vec();
+        data.extend(rar5_block(&encryption));
+        data.extend(iv);
+        data.extend(ciphertext);
+        let path = crate::test_support::temp_file("encrypted_rar5_long_main", &data);
+        let anchor =
+            probe_volume_anchor_at_offset(&path.to_string_lossy(), 0, "rar", Some("secret"));
+        assert_eq!(anchor.internal_volume_number, Some(3), "{}", anchor.error);
+        assert!(!anchor.needs_password);
+        std::fs::remove_file(path).unwrap();
+        data.truncate(300);
+        let path = crate::test_support::temp_file("encrypted_rar5_short_main", &data);
+        let anchor =
+            probe_volume_anchor_at_offset(&path.to_string_lossy(), 0, "rar", Some("secret"));
+        assert!(anchor.needs_password);
+        assert!(!anchor.wrong_password);
+        std::fs::remove_file(path).unwrap();
     }
 }
 

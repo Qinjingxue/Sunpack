@@ -1,3 +1,16 @@
+/// Cheap fixed-header validation before a relation probe commits variable I/O.
+pub(crate) fn relation_local_header_len(data: &[u8], offset: usize) -> Option<usize> {
+    let fixed = data.get(offset..offset.checked_add(30)?)?;
+    if !fixed.starts_with(LFH_SIG)
+        || u16_le(fixed, 4) > 1000
+        || u16_le(fixed, 8) > 99
+        || u16_le(fixed, 26) == 0
+    {
+        return None;
+    }
+    Some(30 + usize::from(u16_le(fixed, 26)) + usize::from(u16_le(fixed, 28)))
+}
+
 fn parse_local_header(data: &[u8], offset: usize) -> Option<LocalHeader> {
     if offset + LOCAL_HEADER_LEN > data.len() || &data[offset..offset + 4] != LFH_SIG {
         return None;

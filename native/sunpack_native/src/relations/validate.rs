@@ -43,6 +43,31 @@ pub(super) fn validate(validation: &mut ProposalValidation) {
         proposal.style == "zip_spanned",
         proposal.volumes.iter().map(|p| (p.1, get(&p.0))),
     );
+    // A unique filename mapping is still only a hypothesis until the actual
+    // NextHeader extent agrees with the CRC stored in the already-read head.
+    if proposal.format == "7z" && validation.status == ProposalStatus::Valid {
+        match verify_seven_zip_mapping(validation) {
+            Ok(Some(true)) => {
+                if let Some(head) = validation
+                    .anchors
+                    .get_mut(&path_key(&proposal.volumes[0].0))
+                {
+                    head.evidence.push("7z:mapped_next_header_crc");
+                }
+            }
+            Ok(Some(false)) => {
+                validation.status = ProposalStatus::Reject;
+                validation.reason = Some(RelationFailureReason::StructuralConflict);
+                return;
+            }
+            Err(_) => {
+                validation.status = ProposalStatus::Inconclusive;
+                validation.reason = Some(RelationFailureReason::MissingVolume);
+                return;
+            }
+            Ok(None) => {}
+        }
+    }
     validation.reason = match validation.status {
         ProposalStatus::Valid => None,
         ProposalStatus::Inconclusive => Some(RelationFailureReason::MissingVolume),
@@ -50,6 +75,57 @@ pub(super) fn validate(validation: &mut ProposalValidation) {
         ProposalStatus::NeedsPassword => Some(RelationFailureReason::NeedsPassword),
         ProposalStatus::Unsupported => Some(RelationFailureReason::Unsupported),
     };
+}
+
+fn verify_seven_zip_mapping(validation: &ProposalValidation) -> std::io::Result<Option<bool>> {
+    use crate::formats::seven_zip::update_relation_crc;
+    let Some(first) = validation
+        .proposal
+        .volumes
+        .first()
+        .and_then(|p| validation.anchors.get(&path_key(&p.0)))
+    else {
+        return Ok(None);
+    };
+    let Some(next) = first.seven_zip_next_header.as_ref() else {
+        return Ok(None);
+    };
+    let start = first.structure_offset.unwrap_or(0).checked_add(next.offset);
+    let Some(start) = start else {
+        return Ok(Some(false));
+    };
+    let Some(end) = start.checked_add(next.size) else {
+        return Ok(Some(false));
+    };
+    let last = validation
+        .proposal
+        .volumes
+        .last()
+        .and_then(|p| validation.anchors.get(&path_key(&p.0)));
+    // The structure-only pass has already checked this exact terminal range.
+    if last.is_some_and(|a| a.evidence.contains(&"7z:next_header_crc") && a.size >= next.size) {
+        return Ok(Some(true));
+    }
+    let mut crc = crc32fast::Hasher::new();
+    let mut logical = 0u64;
+    let mut consumed = 0u64;
+    for part in &validation.proposal.volumes {
+        let Some(anchor) = validation.anchors.get(&path_key(&part.0)) else {
+            return Ok(None);
+        };
+        let Some(stop) = logical.checked_add(anchor.size) else {
+            return Ok(Some(false));
+        };
+        let begin = start.max(logical);
+        let finish = end.min(stop);
+        if begin < finish {
+            let reader = crate::io::reader::ManagedReader::open(&part.0)?.probe_reader();
+            update_relation_crc(&reader, begin - logical, finish - begin, &mut crc)?;
+            consumed += finish - begin;
+        }
+        logical = stop;
+    }
+    Ok(Some(consumed == next.size && crc.finalize() == next.crc))
 }
 
 /// Shared with filename tiers to stop as soon as a complete stronger mapping

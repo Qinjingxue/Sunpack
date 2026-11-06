@@ -136,6 +136,15 @@ impl BucketView<'_> {
         Ok(out)
     }
 
+    fn mapping_roles_legal(&self, mapping: &VolumeAssignment) -> bool {
+        let end = mapping
+            .slots
+            .iter()
+            .filter_map(|(&n, i)| (self.facts[i].has_next == Some(false)).then_some(n))
+            .min();
+        mapping.slots.iter().all(|(&n, &i)| self.legal(i, n, end))
+    }
+
     fn evaluate(
         &self,
         fixed: &VolumeAssignment,
@@ -185,7 +194,7 @@ impl BucketView<'_> {
             }
         }
         // A channel that assigns nothing is not a successful hypothesis.
-        (inferred > 0).then_some(out)
+        (inferred > 0 && self.mapping_roles_legal(&out)).then_some(out)
     }
 
     fn solve_loose_numeric(
@@ -225,6 +234,9 @@ impl BucketView<'_> {
         }
         let mut out = fixed.clone();
         numeric::solve(&mut out, domains)?;
+        if !self.mapping_roles_legal(&out) {
+            return Err(RelationFailureReason::StructuralConflict);
+        }
         Ok(out)
     }
 

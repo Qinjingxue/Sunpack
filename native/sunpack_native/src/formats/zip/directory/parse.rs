@@ -100,21 +100,21 @@ fn resolve_central_directory(
     })
 }
 
-struct CentralDirectoryRecord<'a> {
-    offset: usize,
-    end: usize,
-    flags: u16,
-    method: u16,
-    crc32: u32,
-    compressed_size: u32,
-    uncompressed_size: u32,
-    name_len: u16,
-    extra_len: u16,
-    name: &'a [u8],
-    extra: &'a [u8],
-    extra_offset: usize,
-    disk_number_start: u16,
-    local_header_offset: u32,
+pub(crate) struct CentralDirectoryRecord<'a> {
+    pub(crate) offset: usize,
+    pub(crate) end: usize,
+    pub(crate) flags: u16,
+    pub(crate) method: u16,
+    pub(crate) crc32: u32,
+    pub(crate) compressed_size: u32,
+    pub(crate) uncompressed_size: u32,
+    pub(crate) name_len: u16,
+    pub(crate) extra_len: u16,
+    pub(crate) name: &'a [u8],
+    pub(crate) extra: &'a [u8],
+    pub(crate) extra_offset: usize,
+    pub(crate) disk_number_start: u16,
+    pub(crate) local_header_offset: u32,
 }
 
 pub(crate) fn central_directory_record_len(header: &[u8]) -> Option<usize> {
@@ -128,7 +128,7 @@ pub(crate) fn central_directory_record_len(header: &[u8]) -> Option<usize> {
     )
 }
 
-fn parse_central_directory_record(
+pub(crate) fn parse_central_directory_record(
     data: &[u8],
     offset: usize,
     expected_end: usize,

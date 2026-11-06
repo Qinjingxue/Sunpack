@@ -488,7 +488,7 @@ def test_volume_retry_can_start_from_a_verified_launcher_companion(tmp_path, arc
     assert launcher not in task.all_parts
 
 
-def test_extra_numeric_tail_cannot_bypass_seven_zip_size_validation(tmp_path):
+def test_structural_seven_zip_terminal_excludes_an_extra_numeric_tail(tmp_path):
     factory = ArchiveFixtureFactory()
     case = factory.create(tmp_path, "valid", "7z", split=True,
         payload_size=MIB, split_volume_size=MIB // 4)
@@ -502,7 +502,10 @@ def test_extra_numeric_tail_cannot_bypass_seven_zip_size_validation(tmp_path):
     extra = case.archive_dir / "shared.chunk999.opaque"
     sorted(other.archive_dir.iterdir())[-1].rename(extra)
     paths.append(str(extra))
-    assert RelationsScheduler().resolve_volume_once([paths[0]], paths, format_hint="7z") is None
+    group = RelationsScheduler().resolve_volume_once([paths[0]], paths, format_hint="7z")
+    assert group is not None
+    assert group.input_paths == paths[:-1]
+    assert group.head_metadata.get("volume_set_incomplete") is not True
 
 
 @pytest.mark.parametrize("sfx_format", ["7z", "rar"])
@@ -556,7 +559,9 @@ def test_opaque_members_cannot_be_guessed_across_password_blocked_formats(tmp_pa
     all_paths = [str(path) for path in paths] + [str(rar_head)]
     group = RelationsScheduler().resolve_volume_once([str(paths[0])], all_paths, format_hint="7z")
     assert group is not None
-    assert group.input_paths == [str(paths[0])]
+    # NextHeader CRC now identifies the physical tail independently. Opaque
+    # middle volumes still cannot be assigned across the competing formats.
+    assert group.input_paths == [str(paths[0]), str(paths[-1])]
     assert group.head_metadata["volume_set_incomplete"] is True
 
 
@@ -836,7 +841,8 @@ def test_structure_resolution_rejects_current_paths_from_different_directories(
 
 @pytest.mark.skipif(get_optional_winrar() is None, reason="WinRAR is required to generate modern split ZIP")
 @pytest.mark.parametrize("opaque_competition,zipx", [(False, False), (True, False), (False, True)])
-def test_modern_split_zip_with_camouflaged_names_runs_full_pipeline(tmp_path, opaque_competition, zipx):
+@pytest.mark.parametrize("trailing_padding", [0, 100_000])
+def test_modern_split_zip_with_camouflaged_names_runs_full_pipeline(tmp_path, opaque_competition, zipx, trailing_padding):
     winrar = get_optional_winrar()
     assert winrar is not None
     source = tmp_path / "source"
@@ -878,6 +884,9 @@ def test_modern_split_zip_with_camouflaged_names_runs_full_pipeline(tmp_path, op
             name = f"shared.alpha{suffix}"
         target = mixed / name
         source_part.replace(target)
+        if source_part.suffix.lower() == ".zip" and trailing_padding:
+            with target.open("ab") as carrier:
+                carrier.write(b"x" * trailing_padding)
         renamed.append(target)
 
     if opaque_competition:

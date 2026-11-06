@@ -1,4 +1,6 @@
 mod filename_encoding;
+mod relation;
+pub(crate) use relation::*;
 pub(crate) mod zip64;
 pub(crate) use filename_encoding::analyze_zip_filename_encoding;
 

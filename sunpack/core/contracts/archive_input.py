@@ -271,6 +271,7 @@ class ArchiveInputDescriptor:
                 "role": role,
                 "width": width,
                 "start": start,
+                "end": int(value["end"]) if value.get("end") is not None else None,
             })
         normalized.sort(key=lambda item: item["number"])
         numbers = [item["number"] for item in normalized]
@@ -288,7 +289,7 @@ class ArchiveInputDescriptor:
             raise ValueError("split volumes must use one compatible naming style")
         parts = [
             ArchiveInputPart(
-                extent=InputExtent(path=item["path"], start=item["start"]),
+                extent=InputExtent(path=item["path"], start=item["start"], end=item["end"]),
                 role=item["role"],
                 volume_number=item["number"],
                 canonical_name=canonical_volume_name(

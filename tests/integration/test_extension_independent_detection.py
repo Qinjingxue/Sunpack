@@ -51,7 +51,7 @@ def test_header_encrypted_rar_is_confirmed_from_crc_valid_encryption_header(tmp_
 
 
 def test_header_encrypted_rar4_primary_uses_relations_identity(tmp_path):
-    body = bytes([0x73]) + struct.pack("<HH", 0x0080, 7)
+    body = bytes([0x73]) + struct.pack("<HH", 0x0080, 13) + bytes(6)
     main_header = struct.pack("<H", crc32(body) & 0xFFFF) + body
     path = tmp_path / "header_encrypted_rar4.rar"
     path.write_bytes(

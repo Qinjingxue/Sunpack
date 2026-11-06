@@ -1,10 +1,24 @@
-use std::borrow::Cow;
 use crate::io::scratch::{Blob, Spool};
+use std::borrow::Cow;
 use std::io::Write;
 
-enum CoderInput<'a> { Borrowed(&'a [u8]), Owned(Blob) }
-impl AsRef<[u8]> for CoderInput<'_> { fn as_ref(&self)->&[u8] { match self { Self::Borrowed(bytes)=>bytes, Self::Owned(blob)=>blob } } }
-impl From<Cow<'_,[u8]>> for CoderInput<'_> { fn from(value: Cow<'_,[u8]>)->Self { CoderInput::Owned(value.into_owned().into()) } }
+enum CoderInput<'a> {
+    Borrowed(&'a [u8]),
+    Owned(Blob),
+}
+impl AsRef<[u8]> for CoderInput<'_> {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Self::Borrowed(bytes) => bytes,
+            Self::Owned(blob) => blob,
+        }
+    }
+}
+impl From<Cow<'_, [u8]>> for CoderInput<'_> {
+    fn from(value: Cow<'_, [u8]>) -> Self {
+        CoderInput::Owned(value.into_owned().into())
+    }
+}
 
 struct SevenZipEncodedHeaderCoder {
     method_id: Vec<u8>,
@@ -38,7 +52,6 @@ impl SevenZipPasswordProbe {
         reader_len: u64,
         start: &[u8; SEVEN_Z_HEADER_SIZE],
     ) -> Result<Self, String> {
-
         if !start.starts_with(SEVEN_Z_MAGIC) || start[6] != 0 {
             return Err("7z password probe signature or version is unsupported".to_string());
         }
@@ -46,18 +59,15 @@ impl SevenZipPasswordProbe {
         if crc32(&start[12..32]) != stored_start_crc {
             return Err("7z password probe start header crc is invalid".to_string());
         }
-        let next_header_offset = u64_le(start, 12);
-        let next_header_size = usize::try_from(u64_le(start, 20))
+        let next = RelationNextHeader::parse(start)
+            .ok_or_else(|| "7z password probe next header range is invalid".to_string())?;
+        let next_header_size = usize::try_from(next.size)
             .map_err(|_| "7z password probe next header is too large".to_string())?;
         if next_header_size == 0 {
             return Err("7z password probe next header size is unsupported".to_string());
         }
-        let next_header_start = (SEVEN_Z_HEADER_SIZE as u64)
-            .checked_add(next_header_offset)
-            .ok_or_else(|| "7z password probe next header offset overflow".to_string())?;
-        let next_header_end = next_header_start
-            .checked_add(next_header_size as u64)
-            .ok_or_else(|| "7z password probe next header end overflow".to_string())?;
+        let next_header_start = next.offset;
+        let next_header_end = next.end();
         if next_header_end > reader_len {
             return Err("7z password probe next header is truncated".to_string());
         }
@@ -112,7 +122,10 @@ impl SevenZipPasswordProbe {
         })
     }
 
-    pub(crate) fn decoded_header_if_password_matches(&self, password: &str) -> Result<Option<Blob>, String> {
+    pub(crate) fn decoded_header_if_password_matches(
+        &self,
+        password: &str,
+    ) -> Result<Option<Blob>, String> {
         check_password_cancellation()?;
         let decoded = match decode_seven_zip_encoded_folder(
             &self.packed_data,
@@ -144,11 +157,13 @@ fn read_seven_zip_probe_range<R: Read + Seek>(
         .map_err(|fault| fault.into_io_error())?;
     let mut output = Spool::default();
     let mut remaining = len;
-    let mut bytes = vec![0; 64*1024];
+    let mut bytes = vec![0; 64 * 1024];
     while remaining > 0 {
         let take = remaining.min(bytes.len());
-        read_exact_field(reader, &mut bytes[..take], source_len, field, location).map_err(|fault| fault.into_io_error())?;
-        output.write_all(&bytes[..take])?; remaining -= take;
+        read_exact_field(reader, &mut bytes[..take], source_len, field, location)
+            .map_err(|fault| fault.into_io_error())?;
+        output.write_all(&bytes[..take])?;
+        remaining -= take;
     }
     output.finish()
 }
@@ -349,24 +364,43 @@ fn decode_seven_zip_encoded_coder<'a>(
         return collect_decoded(Cursor::new(data), unpack_size);
     }
     if coder.method_id.as_slice() == EncoderMethod::ID_AES256_SHA256 {
-        return decrypt_seven_zip_aes256_sha256(data.as_ref(), &coder.properties, password, unpack_size);
+        return decrypt_seven_zip_aes256_sha256(
+            data.as_ref(),
+            &coder.properties,
+            password,
+            unpack_size,
+        );
     }
     if coder.method_id.as_slice() == [0x04, 0xf7, 0x11, 0x04] {
-        if coder.properties.len() != 5 { return Err("encoded_header_decoder_unsupported_method:lz4_properties".into()); }
+        if coder.properties.len() != 5 {
+            return Err("encoded_header_decoder_unsupported_method:lz4_properties".into());
+        }
         let mut output = Spool::default();
-        crate::formats::lz4::decode_into(Cursor::new(data), &mut ExactOutput { output:&mut output, remaining:unpack_size })
-            .map_err(decode_error)?;
+        crate::formats::lz4::decode_into(
+            Cursor::new(data),
+            &mut ExactOutput {
+                output: &mut output,
+                remaining: unpack_size,
+            },
+        )
+        .map_err(decode_error)?;
         let output = output.finish().map_err(resource_error)?;
-        if output.len() as u64 != unpack_size { return Err("encoded_header_payload_crc_bad:lz4_unpack_size".into()); }
+        if output.len() as u64 != unpack_size {
+            return Err("encoded_header_payload_crc_bad:lz4_unpack_size".into());
+        }
         return Ok(output);
     }
-    if matches!(coder.method_id.as_slice(), method if method == EncoderMethod::ID_LZMA || method == EncoderMethod::ID_LZMA2) {
+    if matches!(coder.method_id.as_slice(), method if method == EncoderMethod::ID_LZMA || method == EncoderMethod::ID_LZMA2)
+    {
         return decode_lzma(data.as_ref(), coder, unpack_size);
     }
     let compressed = Cursor::new(data);
     macro_rules! decode_bcj {
         ($constructor:path) => {{
-            return collect_decoded($constructor(compressed, seven_zip_bcj_start_pos(coder)?), unpack_size);
+            return collect_decoded(
+                $constructor(compressed, seven_zip_bcj_start_pos(coder)?),
+                unpack_size,
+            );
         }};
     }
     if coder.method_id.as_slice() == EncoderMethod::ID_BCJ_X86 {
@@ -403,20 +437,44 @@ fn decode_seven_zip_encoded_coder<'a>(
     Err("encoded_header_decoder_unsupported_method".to_string())
 }
 
-fn resource_error(error: impl std::fmt::Display) -> String { format!("resource_unavailable:{error}") }
-fn decode_error(error: std::io::Error) -> String {
-    if matches!(error.kind(), std::io::ErrorKind::InvalidData | std::io::ErrorKind::UnexpectedEof) { format!("encoded_header_payload_crc_bad:{error}") } else { resource_error(error) }
+fn resource_error(error: impl std::fmt::Display) -> String {
+    format!("resource_unavailable:{error}")
 }
-struct ExactOutput<'a> { output:&'a mut Spool, remaining:u64 }
-impl Write for ExactOutput<'_> {
-    fn write(&mut self, bytes:&[u8])->std::io::Result<usize> {
-        if crate::io::cancellation::Cancellation::current().cancelled() {
-            return Err(std::io::Error::new(std::io::ErrorKind::ConnectionAborted, "password probe cancelled"));
-        }
-        if bytes.len() as u64 > self.remaining { return Err(std::io::Error::new(std::io::ErrorKind::InvalidData,"decoded size exceeds declared size")); }
-        self.output.write_all(bytes)?; self.remaining-=bytes.len() as u64; Ok(bytes.len())
+fn decode_error(error: std::io::Error) -> String {
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::InvalidData | std::io::ErrorKind::UnexpectedEof
+    ) {
+        format!("encoded_header_payload_crc_bad:{error}")
+    } else {
+        resource_error(error)
     }
-    fn flush(&mut self)->std::io::Result<()> { self.output.flush() }
+}
+struct ExactOutput<'a> {
+    output: &'a mut Spool,
+    remaining: u64,
+}
+impl Write for ExactOutput<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if crate::io::cancellation::Cancellation::current().cancelled() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "password probe cancelled",
+            ));
+        }
+        if bytes.len() as u64 > self.remaining {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "decoded size exceeds declared size",
+            ));
+        }
+        self.output.write_all(bytes)?;
+        self.remaining -= bytes.len() as u64;
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.output.flush()
+    }
 }
 // These decoders read immutable memory/mappings, not source files. Some use
 // ErrorKind::Other for invalid compressed bytes (e.g. LZMA distance overflow).
@@ -436,28 +494,49 @@ impl<R: Read> Read for DecoderReader<R> {
         })
     }
 }
-fn collect_decoded(reader:impl Read, size:u64)->Result<Blob,String> {
-    let mut output=Spool::default();
-    std::io::copy(&mut DecoderReader(reader).take(size.saturating_add(1)), &mut ExactOutput {output:&mut output, remaining:size}).map_err(decode_error)?;
-    let output=output.finish().map_err(resource_error)?;
-    if output.len() as u64 != size { return Err("encoded_header_payload_crc_bad:unpack_size".into()); }
+fn collect_decoded(reader: impl Read, size: u64) -> Result<Blob, String> {
+    let mut output = Spool::default();
+    std::io::copy(
+        &mut DecoderReader(reader).take(size.saturating_add(1)),
+        &mut ExactOutput {
+            output: &mut output,
+            remaining: size,
+        },
+    )
+    .map_err(decode_error)?;
+    let output = output.finish().map_err(resource_error)?;
+    if output.len() as u64 != size {
+        return Err("encoded_header_payload_crc_bad:unpack_size".into());
+    }
     Ok(output)
 }
-fn decrypt_seven_zip_aes256_sha256(data:&[u8], properties:&[u8], password:Option<&str>, unpack_size:u64)->Result<Blob,String> {
-    let Some(password)=password.filter(|value| !value.is_empty()) else { return Err("encoded_header_decode_password_required".into()); };
-    let password_bytes=seven_zip_password(Some(password));
-    let (key,mut iv)=seven_zip_aes_key_iv(properties,password_bytes.as_slice())?;
-    if data.len()%16!=0 || unpack_size > data.len() as u64 { return Err("encoded_header_payload_crc_bad:aes_block_size".into()); }
-    let mut output=Spool::default(); let mut remaining=unpack_size;
-    let mut buffer=vec![0;64*1024];
+fn decrypt_seven_zip_aes256_sha256(
+    data: &[u8],
+    properties: &[u8],
+    password: Option<&str>,
+    unpack_size: u64,
+) -> Result<Blob, String> {
+    let Some(password) = password.filter(|value| !value.is_empty()) else {
+        return Err("encoded_header_decode_password_required".into());
+    };
+    let password_bytes = seven_zip_password(Some(password));
+    let (key, mut iv) = seven_zip_aes_key_iv(properties, password_bytes.as_slice())?;
+    if data.len() % 16 != 0 || unpack_size > data.len() as u64 {
+        return Err("encoded_header_payload_crc_bad:aes_block_size".into());
+    }
+    let mut output = Spool::default();
+    let mut remaining = unpack_size;
+    let mut buffer = vec![0; 64 * 1024];
     for bytes in data.chunks(buffer.len()) {
         check_password_cancellation()?;
         buffer[..bytes.len()].copy_from_slice(bytes);
-        Aes256CbcDec::new(&key.into(),&iv.into()).decrypt_padded::<NoPadding>(&mut buffer[..bytes.len()])
+        Aes256CbcDec::new(&key.into(), &iv.into())
+            .decrypt_padded::<NoPadding>(&mut buffer[..bytes.len()])
             .map_err(|_| "encoded_header_decode_password_rejected".to_string())?;
-        iv.copy_from_slice(&bytes[bytes.len()-16..]);
-        let take=(remaining.min(bytes.len() as u64)) as usize;
-        output.write_all(&buffer[..take]).map_err(resource_error)?; remaining-=take as u64;
+        iv.copy_from_slice(&bytes[bytes.len() - 16..]);
+        let take = (remaining.min(bytes.len() as u64)) as usize;
+        output.write_all(&buffer[..take]).map_err(resource_error)?;
+        remaining -= take as u64;
     }
     output.finish().map_err(resource_error)
 }
@@ -473,14 +552,25 @@ fn decode_lzma(
         }
         let dict_size = u32::from_le_bytes(coder.properties[1..5].try_into().unwrap());
         let reader = LzmaReader::new_with_props(
-            compressed, unpack_size, coder.properties[0], dict_size, None,
-        ).map_err(|error| {
-            if crate::io::resource_error::is_memory_error(&error) { resource_error(error) }
-            else { format!("encoded_header_decoder_unsupported_method:{error}") }
+            compressed,
+            unpack_size,
+            coder.properties[0],
+            dict_size,
+            None,
+        )
+        .map_err(|error| {
+            if crate::io::resource_error::is_memory_error(&error) {
+                resource_error(error)
+            } else {
+                format!("encoded_header_decoder_unsupported_method:{error}")
+            }
         })?;
         return collect_decoded(reader, unpack_size);
     }
-    let dict_size = coder.properties.first().and_then(|value| lzma2_dict_size(*value))
+    let dict_size = coder
+        .properties
+        .first()
+        .and_then(|value| lzma2_dict_size(*value))
         .ok_or_else(|| "encoded_header_decoder_unsupported_method".to_string())?;
     // This folder's complete output size is known, and there is no preset
     // dictionary. No valid backward reference can exceed the bytes produced.
@@ -618,7 +708,9 @@ fn cached_seven_zip_aes_key(cycles: u32, salt: &[u8], password: &[u8]) -> Result
 fn check_password_cancellation() -> Result<(), String> {
     if crate::io::cancellation::Cancellation::current().cancelled() {
         Err("resource_unavailable:password probe cancelled".into())
-    } else { Ok(()) }
+    } else {
+        Ok(())
+    }
 }
 
 fn derive_seven_zip_aes_key(cycles: u32, salt: &[u8], password: &[u8]) -> Result<[u8; 32], String> {
@@ -638,7 +730,9 @@ fn derive_seven_zip_aes_key(cycles: u32, salt: &[u8], password: &[u8]) -> Result
     }
     let mut counter = 0u64;
     while counter < u64::from(cycles) {
-        if cancellation.cancelled() { return Err("resource_unavailable:password probe cancelled".into()); }
+        if cancellation.cancelled() {
+            return Err("resource_unavailable:password probe cancelled".into());
+        }
         let remaining = u64::from(cycles) - counter;
         let record_count = usize::try_from(remaining.min(KDF_RECORDS_PER_UPDATE as u64))
             .expect("7z KDF record count is bounded");
@@ -766,7 +860,13 @@ mod encoded_folder_graph_tests {
         let mut large_dictionary = coder;
         large_dictionary.properties[0] = 40;
         assert_eq!(
-            decode_seven_zip_encoded_coder(Cow::Borrowed(packed.as_slice()), &large_dictionary, None, 512).unwrap(),
+            decode_seven_zip_encoded_coder(
+                Cow::Borrowed(packed.as_slice()),
+                &large_dictionary,
+                None,
+                512
+            )
+            .unwrap(),
             b"test".repeat(128)
         );
     }
@@ -786,7 +886,8 @@ mod encoded_folder_graph_tests {
             num_out_streams: 1,
         };
         assert_eq!(
-            decode_seven_zip_encoded_coder(Cow::Borrowed(bytes.as_slice()), &coder, None, 4).unwrap(),
+            decode_seven_zip_encoded_coder(Cow::Borrowed(bytes.as_slice()), &coder, None, 4)
+                .unwrap(),
             b"test"
         );
         for wrong_size in [0, 3, 5, 64 * 1024 * 1024 + 1] {
@@ -799,9 +900,15 @@ mod encoded_folder_graph_tests {
             .is_err());
         }
         *bytes.last_mut().unwrap() ^= 1;
-        assert!(decode_seven_zip_encoded_coder(Cow::Borrowed(bytes.as_slice()), &coder, None, 4).is_err());
+        assert!(
+            decode_seven_zip_encoded_coder(Cow::Borrowed(bytes.as_slice()), &coder, None, 4)
+                .is_err()
+        );
         coder.properties.clear();
-        assert!(decode_seven_zip_encoded_coder(Cow::Borrowed(bytes.as_slice()), &coder, None, 4).is_err());
+        assert!(
+            decode_seven_zip_encoded_coder(Cow::Borrowed(bytes.as_slice()), &coder, None, 4)
+                .is_err()
+        );
     }
 
     fn reference_aes_key(properties: &[u8], password: &[u8]) -> [u8; 32] {
@@ -893,7 +1000,8 @@ mod encoded_folder_graph_tests {
             unpack_sizes: vec![4, 4, 4],
             expected_crc: None,
         };
-        let decoded = decode_seven_zip_encoded_folder(&[b"test".to_vec().into()], &folder, None).unwrap();
+        let decoded =
+            decode_seven_zip_encoded_folder(&[b"test".to_vec().into()], &folder, None).unwrap();
         assert_eq!(decoded, b"test");
     }
 
@@ -915,7 +1023,11 @@ mod encoded_folder_graph_tests {
             (std::io::Error::from_raw_os_error(5), true),
         ] {
             let error = collect_decoded(FailedRead(Some(error)), 1).unwrap_err();
-            assert_eq!(error.starts_with("resource_unavailable:"), resource, "{error}");
+            assert_eq!(
+                error.starts_with("resource_unavailable:"),
+                resource,
+                "{error}"
+            );
         }
     }
 

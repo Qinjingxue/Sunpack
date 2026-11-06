@@ -30,6 +30,7 @@ class SplitVolumeEntry:
     prefix: str = ""
     width: int = 3
     start: int = 0
+    end: int | None = None
 
 
 @dataclass

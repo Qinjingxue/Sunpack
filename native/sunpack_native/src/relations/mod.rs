@@ -1072,6 +1072,13 @@ fn proposal_volume_dicts(
             {
                 dict.set_item("start", start)?;
             }
+            if let Some(end) = anchors
+                .get(&path_key(path))
+                .filter(|a| a.format == "zip" && a.anchor_roles.contains(&"terminal"))
+                .and_then(|a| a.expected_logical_size.filter(|&end| end < a.size))
+            {
+                dict.set_item("end", end)?;
+            }
             Ok(dict.unbind())
         })
         .collect()
