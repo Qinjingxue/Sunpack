@@ -252,16 +252,13 @@ class RequestRuntimeProfiler:
         _wrap(scanner, "direct_file_tasks", timings, "pipeline_direct_scan")
         _wrap(scanner, "scan_targets", timings, "pipeline_nested_scan")
 
-        _wrap(planning, "plan_tasks", timings, "input_planning")
+        _wrap(planning, "plan_task_to_tasks", timings, "input_planning")
         for name, label in (
-            ("_planning_task_groups", "planning_group_tasks"),
-            ("_plan_task_group", "planning_plan_group"),
             ("_plan_task_to_tasks", "planning_plan_task"),
             ("_report_cache_key", "planning_cache_key"),
             ("_get_or_create_report", "planning_get_report"),
             ("_analyze_task", "planning_analyze_task"),
             ("_tasks_from_report", "planning_tasks_from_report"),
-            ("_record_report", "planning_record_report"),
             ("_record_planning_input", "planning_record_input"),
         ):
             _wrap(planning, name, timings, label)
@@ -297,7 +294,6 @@ class RequestRuntimeProfiler:
         _wrap(job, "execute_async", timings, "job_execute")
         for name, label in (
             ("collect_result", "job_collect_result"),
-            ("_inspect_tasks_before_extract", "job_password_preflight"),
         ):
             _wrap(job, name, timings, label)
         password_contexts = _child(job, "password_scope_context")

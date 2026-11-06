@@ -14,7 +14,6 @@ from sunpack_native import (
 
 from sunpack.core.passwords.fingerprint import build_archive_fingerprint
 from sunpack.core.passwords.internal.store import PasswordSnapshot
-from sunpack.core.support.archive_knowledge_projection import _source_input_fingerprint
 from sunpack.runtime.watch.scheduler import _password_source_signature
 from sunpack.runtime.watch.service import watch_roots_mutex_name
 
@@ -27,11 +26,6 @@ def test_fast_hash_vectors_and_concurrent_memory_identities():
     with ThreadPoolExecutor(max_workers=4) as pool:
         assert list(pool.map(fast_hash128, payloads * 4)) == expected * 4
     assert len(set(expected)) == len(payloads)
-    for data, digest in zip(payloads, expected):
-        identity = _source_input_fingerprint({"kind": "memory", "data": data})
-        assert identity["xxh128"] == digest
-        assert identity["size"] == len(data)
-        assert "sha256" not in identity
 
 
 def test_streaming_and_file_hashes_match_memory_and_release_resources(tmp_path):

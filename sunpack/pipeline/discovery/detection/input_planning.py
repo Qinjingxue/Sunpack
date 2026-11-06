@@ -1,4 +1,3 @@
-import json
 import threading
 from contextlib import nullcontext
 from dataclasses import asdict, replace
@@ -44,29 +43,15 @@ class ArchiveInputPlanningStage:
             else None
         )
 
-    def plan_tasks(self, tasks: list[ArchiveTask]) -> list[ArchiveTask]:
-        if not self.enabled or self.analyzer is None:
-            return tasks
-        groups = self._planning_task_groups(tasks)
-        expanded_tasks: list[ArchiveTask] = []
-        for group in groups:
-            for _index, task_results in self._plan_task_group(group):
-                expanded_tasks.extend(task_results)
-        return expanded_tasks
-
     def _remember_report(self, cache_key: tuple, report: ArchiveAnalysisReport) -> None:
         planning_config = self.config.get("input_planning") if isinstance(self.config.get("input_planning"), dict) else {}
         limit = max(0, int(planning_config.get("cache_size", 512)))
         if limit <= 0:
             return
         with self._report_cache_lock:
-            if len(self._report_cache) >= limit:
-                self._report_cache.pop(next(iter(self._report_cache)))
             self._report_cache[cache_key] = report
-
-    def remember_report(self, task: ArchiveTask, report: ArchiveAnalysisReport) -> None:
-        """Seed the shared cache with a coordinator-produced analysis report."""
-        self._remember_report(self._report_cache_key(task), report)
+            if len(self._report_cache) > limit:
+                self._report_cache.pop(next(iter(self._report_cache)))
 
     def clear_report_cache(self) -> None:
         """Release archive-specific reports after a completed request group."""
@@ -76,48 +61,10 @@ class ArchiveInputPlanningStage:
     def _report_cache_key(self, task: ArchiveTask) -> tuple:
         return (
             "source",
-            json.dumps(knowledge_view.source_fingerprint(task), ensure_ascii=False, sort_keys=True, default=str),
+            knowledge_view.source_fingerprint(task),
             "discovery_confirmed",
             _discovery_confirmed(task),
         )
-
-    def _planning_task_groups(self, tasks: list[ArchiveTask]) -> list[list[tuple[int, ArchiveTask]]]:
-        grouped: dict[tuple, list[tuple[int, ArchiveTask]]] = {}
-        order: list[tuple] = []
-        for index, task in enumerate(tasks):
-            try:
-                cache_key = self._report_cache_key(task)
-            except Exception:
-                cache_key = ("task", id(task))
-            if cache_key not in grouped:
-                grouped[cache_key] = []
-                order.append(cache_key)
-            grouped[cache_key].append((index, task))
-        return [grouped[key] for key in order]
-
-    def _plan_task_group(self, group: list[tuple[int, ArchiveTask]]) -> list[tuple[int, list[ArchiveTask]]]:
-        if not group:
-            return []
-        if _discovery_confirmed(group[0][1]):
-            return [
-                (index, self._plan_task_to_tasks(task)[1])
-                for index, task in group
-            ]
-        if len(group) == 1:
-            index, task = group[0]
-            _, task_results = self._plan_task_to_tasks(task)
-            return [(index, task_results)]
-        first_index, first_task = group[0]
-        report, first_results = self._plan_task_to_tasks(first_task)
-        results = [(first_index, first_results)]
-        if report is None:
-            for index, task in group[1:]:
-                results.append((index, [task]))
-            return results
-        for index, task in group[1:]:
-            task_report = replace(report, cache_hits=report.cache_hits + 1)
-            results.append((index, self._tasks_from_report(task, task_report)))
-        return results
 
     def plan_task(self, task: ArchiveTask) -> ArchiveAnalysisReport | None:
         report, _ = self._plan_task_to_tasks(task)

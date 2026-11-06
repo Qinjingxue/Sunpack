@@ -3,8 +3,6 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
-from sunpack_native import fast_hash128
-
 from sunpack.core.contracts.archive_knowledge import ArchiveKnowledge
 
 if TYPE_CHECKING:
@@ -21,12 +19,18 @@ def get(task_or_knowledge: ArchiveTask | ArchiveKnowledge, path: str, default: A
     return default if value is None else value
 
 
-def source_fingerprint(task: ArchiveTask) -> dict[str, Any]:
-    return _task_source_fingerprint(task)
-
-
-def source_selected_segment(task: ArchiveTask) -> dict[str, Any]:
-    return _dict(get(task, "source.selected_segment", {}))
+def source_fingerprint(task: ArchiveTask) -> tuple:
+    """Hashable physical layout; stat each source once, without serializing it."""
+    descriptor = task.archive_input()
+    paths = {path: _path_fingerprint(path)
+             for path in dict.fromkeys((descriptor.entry_path, *descriptor.part_paths()))}
+    return (
+        descriptor.open_mode, descriptor.format_hint, descriptor.volume_style,
+        paths[descriptor.entry_path],
+        tuple((paths[part.path], part.extent.start, part.extent.end,
+               part.role, part.volume_number, part.canonical_name) for part in descriptor.parts),
+        tuple((paths[extent.path], extent.start, extent.end) for extent in descriptor.extents),
+    )
 
 
 def inspection_prepass(task: ArchiveTask) -> dict[str, Any]:
@@ -80,58 +84,10 @@ def _format_runtime_facts_uncached(knowledge: ArchiveKnowledge, format_name: str
     }
 
 
-def _task_source_fingerprint(task: ArchiveTask) -> dict[str, Any]:
-    descriptor = task.archive_input()
-    return _source_input_fingerprint(descriptor.to_dict())
-
-
-def _source_input_fingerprint(source_input: dict[str, Any]) -> dict[str, Any]:
-    kind = str(source_input.get("kind") or source_input.get("open_mode") or "file")
-    if kind in {"bytes", "memory"}:
-        data = source_input.get("data", b"")
-        if isinstance(data, bytearray):
-            data = bytes(data)
-        if isinstance(data, bytes):
-            return {"kind": kind, "xxh128": fast_hash128(data), "size": len(data), "format_hint": source_input.get("format_hint")}
-        return {"kind": kind, "data": str(data), "format_hint": source_input.get("format_hint")}
-    if kind in {"file", ""}:
-        return {"kind": "file", **_path_fingerprint(str(source_input.get("path") or source_input.get("entry_path") or "")), "format_hint": source_input.get("format_hint") or source_input.get("format")}
-    if kind == "file_range":
-        return {
-            "kind": "file_range",
-            **_path_fingerprint(str(source_input.get("path") or source_input.get("entry_path") or "")),
-            "start": int(source_input.get("start") or 0),
-            "end": source_input.get("end"),
-            "format_hint": source_input.get("format_hint") or source_input.get("format"),
-        }
-    if kind == "concat_ranges":
-        return {
-            "kind": "concat_ranges",
-            "ranges": [
-                {**_path_fingerprint(str(item.get("path") or "")), "start": int(item.get("start") or 0), "end": item.get("end")}
-                for item in source_input.get("ranges") or []
-                if isinstance(item, dict)
-            ],
-            "format_hint": source_input.get("format_hint") or source_input.get("format"),
-        }
-    parts = source_input.get("parts")
-    return {
-        "kind": kind,
-        "parts": [
-            {**_path_fingerprint(str(item.get("path") or "")), "role": item.get("role"), "volume_number": item.get("volume_number")}
-            for item in parts or []
-            if isinstance(item, dict)
-        ],
-        "format_hint": source_input.get("format_hint") or source_input.get("format"),
-    }
-
-
-def _path_fingerprint(path: str) -> dict[str, Any]:
-    if not path:
-        return {"path": ""}
+def _path_fingerprint(path: str) -> tuple:
     candidate = Path(path)
     try:
         stat = candidate.stat()
-        return {"path": str(candidate), "size": int(stat.st_size), "mtime_ns": int(stat.st_mtime_ns)}
+        return str(candidate), stat.st_size, stat.st_mtime_ns
     except OSError:
-        return {"path": str(candidate), "missing": True}
+        return str(candidate), None, None
