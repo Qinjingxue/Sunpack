@@ -7,6 +7,7 @@ import zlib
 
 import pytest
 
+from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
 from sunpack.core.passwords.verifier.rar_fast import RarFastVerifier
 from sunpack.core.passwords.verifier.enc_fast import EncFastVerifier
 from sunpack.core.passwords.verifier.registry import PasswordVerifierChain
@@ -197,7 +198,7 @@ def _check_unusable_rar5_password_proofs(tmp_path):
             }
             scheduler = PasswordScheduler.with_fast_verifiers()
             result = scheduler.plan_for_extraction(PasswordJob(
-                archive_path=str(archive), archive_input=descriptor,
+                archive_path=str(archive), archive_input=ArchiveInputDescriptor.from_dict(descriptor, archive_path=str(archive)),
                 candidates=["wrong", "crom" if file_encryption else "U0b7258526OROQY"],
             ))
             assert result.status is PasswordSearchStatus.INCONCLUSIVE
@@ -412,7 +413,7 @@ def test_seven_zip_filter_properties_preserve_password_search_and_fallback(tmp_p
     ]
     for descriptor in descriptors:
         result = PasswordScheduler.with_fast_verifiers().plan_for_extraction(PasswordJob(
-            archive_path=descriptor["entry_path"], archive_input=descriptor,
+            archive_path=descriptor["entry_path"], archive_input=ArchiveInputDescriptor.from_dict(descriptor, archive_path=descriptor["entry_path"]),
             candidates=["wrong", "p"], batch_size=1,
         ))
         assert result.status is PasswordSearchStatus.FOUND
@@ -428,7 +429,7 @@ def test_seven_zip_filter_properties_preserve_password_search_and_fallback(tmp_p
                          + payload[32:64] + next_header)
         scheduler = PasswordScheduler.with_fast_verifiers()
         result = scheduler.plan_for_extraction(PasswordJob(
-            archive_path=str(path), archive_input={"format_hint": "7z"}, candidates=["wrong", "p"],
+            archive_path=str(path), archive_input=ArchiveInputDescriptor(str(path), format_hint="7z"), candidates=["wrong", "p"],
         ))
         assert result.status is PasswordSearchStatus.INCONCLUSIVE
         assert result.extraction_candidates == ("wrong", "p")

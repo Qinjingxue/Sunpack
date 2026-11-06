@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 import sunpack_native
 
+from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
 from sunpack.core.passwords.fingerprint import build_archive_fingerprint
 from sunpack.core.passwords.job import PasswordJob
 from sunpack.core.passwords.scheduler import PasswordScheduler
@@ -64,6 +65,8 @@ def test_password_cache_uses_each_physical_generation(tmp_path, replace, source,
         {"open_mode": "concat_ranges", "ranges": [{"path": str(part), "start": 0, "end": 4}]}
         if source == "range" else None
     )
+    if descriptor is not None:
+        descriptor = ArchiveInputDescriptor.from_dict(descriptor, archive_path=str(main))
     changed = part if source in {"split", "range"} else main
     # Physical-generation tests cannot catch an event with identical metadata.
     # Keep this in the same coarse password-cache lifecycle for all inputs.
@@ -142,7 +145,7 @@ def test_password_cache_revalidates_real_encrypted_replacement(tmp_path):
     assert old.stat().st_size == new.stat().st_size
     scheduler = PasswordScheduler.with_fast_verifiers()
     descriptor = ArchiveInputDescriptor.from_parts(archive_path=str(old), format_hint="zip")
-    job = PasswordJob(str(old), archive_input=descriptor.to_dict(), candidates=["new-password"])
+    job = PasswordJob(str(old), archive_input=descriptor, candidates=["new-password"])
     assert scheduler.plan_for_extraction(job).status == "exhausted"
     _powershell(
         f"$p={_quote(old)}; $m=[IO.File]::GetLastWriteTimeUtc($p); "

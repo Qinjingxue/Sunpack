@@ -1,5 +1,6 @@
 import pytest
 
+from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
 from sunpack.core.contracts.extraction import ExtractionResult
 from sunpack.core.contracts.failures import FailureInfo, FailureKind
 from sunpack.core.contracts.verification import (
@@ -62,7 +63,7 @@ def test_scheduler_stops_password_batch_on_unavailable_tail_without_negative_res
     run = scheduler.plan_for_extraction if planning else scheduler.run
     result = run(PasswordJob(
         archive_path=str(archive),
-        archive_input={"analysis": {"execution": {"missing_volume_evidence": "relation_missing_volume"}}} if evidence == "native-missing-proof" else None,
+        archive_input=ArchiveInputDescriptor.from_dict({"analysis": {"execution": {"missing_volume_evidence": "relation_missing_volume"}}}, archive_path=str(archive)) if evidence == "native-missing-proof" else None,
         candidates=PasswordCandidatePipeline.from_values([f"bad-{index}" for index in range(50)]),
     ))
 

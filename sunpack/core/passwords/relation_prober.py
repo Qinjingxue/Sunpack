@@ -4,6 +4,7 @@ import os
 import stat
 from threading import RLock
 
+from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
 from sunpack.core.passwords.candidates import PasswordCandidatePipeline
 from sunpack.core.passwords.fingerprint import build_archive_fingerprint
 from sunpack.core.passwords.internal.store import PasswordStore
@@ -84,7 +85,7 @@ class RelationsPasswordProber:
         *,
         scope_path: str = "",
         part_paths: list[str] | None = None,
-        archive_input: dict | None = None,
+        archive_input: ArchiveInputDescriptor | None = None,
     ) -> PasswordSearchResult | None:
         path = os.path.abspath(path)
         # Preserve NotFound so the Relations caller can invalidate the old

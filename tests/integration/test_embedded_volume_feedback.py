@@ -26,7 +26,7 @@ def _sibling_zip(*, large=False):
 
 @pytest.mark.parametrize("archive_format", ["rar", "rar4", "7z", "zip", "zip_spanned", "zip_two_disks"])
 @pytest.mark.parametrize("password", [None, "embedded-volume-password"])
-def test_carrier_anchor_rejoins_native_volumes_and_missing_parts_can_arrive(tmp_path, archive_format, password):
+def test_carrier_anchor_rejoins_native_volumes_and_missing_parts_can_arrive(tmp_path, monkeypatch, archive_format, password):
     """Only this end-to-end case begins with an unrecognized carrier head.
     Existing SFX and split tests cannot catch losing Embedded's anchor or
     ignoring per-volume ranges. One small archive also checks late arrival,
@@ -83,6 +83,20 @@ def test_carrier_anchor_rejoins_native_volumes_and_missing_parts_can_arrive(tmp_
     assert len(tasks) == 1, [(task.main_path, task.discovery_reason) for task in found.tasks]
     assert len(found.tasks) == 1
     task = tasks[0]
+    if password and archive_format in {"rar", "rar4"}:
+        # The boundary resolver already decrypted this exact head. Losing that
+        # proof repeats the expensive password search during real extraction.
+        from sunpack.core.passwords.resolver import PasswordResolver
+
+        assert task.inputs[0].password == password
+        resolve = PasswordResolver.resolve
+
+        def resolve_unproven(self, archive_path, task=None, **kwargs):
+            if task is not None and task.archive_input().format_hint == "rar":
+                pytest.fail("decrypted carrier volume repeated password planning")
+            return resolve(self, archive_path, task, **kwargs)
+
+        monkeypatch.setattr(PasswordResolver, "resolve", resolve_unproven)
     segments = [node.projection() for node in task.inputs]
     assert len(segments) == 2
     descriptor = task.archive_input()

@@ -432,7 +432,7 @@ impl NativeEmbeddedBatch {
         py: Python<'_>,
         mut table: PyRefMut<'_, NativeCandidateTable>,
         password_candidates: Option<Vec<(String, Vec<String>)>>,
-    ) -> PyResult<Vec<(usize, u8, Option<Py<PyDict>>)>> {
+    ) -> PyResult<Vec<(usize, u8, Option<Py<PyDict>>, Option<String>)>> {
         use crate::analysis_native::volume_anchor::resolve_encrypted_relation_anchor;
         if self.pending_volumes.is_empty() {
             return Ok(Vec::new());
@@ -461,45 +461,43 @@ impl NativeEmbeddedBatch {
                 }
             }
         }
-        let matched = py.detach(|| -> std::io::Result<HashMap<(String, u64), String>> {
-            let mut matched = HashMap::new();
-            for item in &mut pending {
-                let key = path_key(&item.anchor.path);
-                let Some(values) = candidates.get(&key).filter(|_| item.anchor.needs_password)
-                else {
-                    continue;
-                };
-                let reader =
-                    crate::io::reader::ManagedReader::open(&item.anchor.path)?.probe_reader();
-                let (resolved, index) =
-                    resolve_encrypted_relation_anchor(&item.anchor, &reader, values)?;
-                item.anchor = resolved;
-                if let Some(index) = index {
-                    matched.insert(
-                        (key, item.anchor.structure_offset.unwrap_or(0)),
-                        values[index].clone(),
-                    );
-                }
-            }
-            for (key, values) in &candidates {
-                if pending_keys.contains(key) {
-                    continue;
-                }
-                let Some(anchor) = cache.anchors.get_mut(key).filter(|a| a.needs_password) else {
-                    continue;
-                };
-                let reader = crate::io::reader::ManagedReader::open(&anchor.path)?.probe_reader();
-                let (resolved, index) = resolve_encrypted_relation_anchor(anchor, &reader, values)?;
-                *anchor = resolved;
-                if let Some(index) = index {
-                    matched.insert(
-                        (key.clone(), anchor.structure_offset.unwrap_or(0)),
-                        values[index].clone(),
-                    );
-                }
-            }
-            Ok(matched)
+        let encrypted: Vec<_> = pending
+            .iter_mut()
+            .map(|item| &mut item.anchor)
+            .chain(cache.anchors.iter_mut().filter_map(|(key, anchor)| {
+                (!pending_keys.contains(key)).then_some(anchor)
+            }))
+            .filter(|anchor| anchor.needs_password)
+            .filter_map(|anchor| {
+                candidates
+                    .get(&path_key(&anchor.path))
+                    .map(|values| (anchor, values))
+            })
+            .collect();
+        let cancellation = crate::io::cancellation::Cancellation::current();
+        cancellation.check()?;
+        let matched = py.detach(|| {
+            // Independent headers share the existing Rayon pool. Preserve the
+            // request's cancellation on each worker, including expensive KDFs.
+            encrypted
+                .into_par_iter()
+                .map(|(anchor, values)| {
+                    cancellation.run(|| -> io::Result<_> {
+                        let reader =
+                            crate::io::reader::ManagedReader::open(&anchor.path)?.probe_reader();
+                        let (resolved, index) =
+                            resolve_encrypted_relation_anchor(anchor, &reader, values)?;
+                        *anchor = resolved;
+                        Ok(index.map(|index| (
+                            (path_key(&anchor.path), anchor.structure_offset.unwrap_or(0)),
+                            values[index].clone(),
+                        )))
+                    })
+                })
+                .collect::<io::Result<Vec<_>>>()
+                .map(|rows| rows.into_iter().flatten().collect::<HashMap<_, _>>())
         })?;
+        cancellation.check()?;
         // Own one scan reference and one sparse resolution table per physical
         // carrier. Project its hits/candidates only after every head is resolved.
         let mut fallback_scans = BTreeMap::new();
@@ -565,6 +563,7 @@ impl NativeEmbeddedBatch {
                     index,
                     0,
                     Some(scan.to_py_dict_with_rar_resolutions(py, &resolutions)?),
+                    None,
                 ))
             })
             .collect::<PyResult<Vec<_>>>()?;
@@ -624,9 +623,17 @@ impl NativeEmbeddedBatch {
             });
         }
         for group in groups {
+            // Keep the decrypted head's password request-local. Execution uses
+            // LogicalArchiveInput's existing proof instead of deriving it again.
+            let password = group
+                .entry_anchor()
+                .and_then(|anchor| {
+                    matched.get(&(path_key(&anchor.path), anchor.structure_offset.unwrap_or(0)))
+                })
+                .cloned();
             let index = table.rows.len();
             table.rows.push(Candidate::Relation(Box::new(group)));
-            fallback.push((index, 1, None));
+            fallback.push((index, 1, None, password));
         }
         Ok(fallback)
     }

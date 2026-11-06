@@ -22,10 +22,5 @@ class PasswordJob:
     metadata: dict[str, object] = field(default_factory=dict)
     probe_input: PasswordProbeInput | None = field(default=None, repr=False, compare=False)
 
-    def __post_init__(self):
-        if isinstance(self.archive_input, dict):
-            object.__setattr__(self, "archive_input", ArchiveInputDescriptor.from_dict(
-                self.archive_input, archive_path=self.archive_path, part_paths=self.part_paths))
-
     def candidate_pipeline(self) -> Iterable[PasswordCandidate | str]:
         return self.candidates or PasswordCandidatePipeline()

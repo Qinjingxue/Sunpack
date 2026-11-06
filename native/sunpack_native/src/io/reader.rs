@@ -2643,6 +2643,40 @@ mod tests {
     }
 
     #[test]
+    fn directory_walk_releases_its_windows_without_populating_shared_blocks() {
+        // Small relation fixtures cannot expose retaining a whole directory
+        // after its walk. Check the real retained blocks, without RSS timing.
+        use crate::formats::zip::{visit_relation_directory, RelationDirectory};
+        let mut record = [0u8; 47];
+        record[..4].copy_from_slice(b"PK\x01\x02");
+        record[28..30].copy_from_slice(&1u16.to_le_bytes());
+        record[46] = b'x';
+        let bytes = record.repeat(4096);
+        let path = crate::test_support::temp_file("zip_relation_directory_cache", &bytes);
+        let directory = RelationDirectory {
+            disk: 1,
+            cd_disk: 1,
+            offset: 0,
+            size: bytes.len() as u64,
+            entries: 4096,
+            disk_entries: 4096,
+            end: bytes.len() as u64,
+        };
+        let mut count = 0;
+        let before = THREAD_PHYSICAL_READS.with(std::cell::Cell::get);
+        assert!(visit_relation_directory(&path.to_string_lossy(), directory, |_, _| count += 1)
+            .unwrap());
+        let reads = THREAD_PHYSICAL_READS.with(std::cell::Cell::get) - before;
+        assert_eq!(count, 4096);
+        assert!(reads < 32, "directory walk issued {reads} physical reads");
+        let (_, blocks, retained) = manager()
+            .release_resources_under_roots(&[std::fs::canonicalize(&path).unwrap()])
+            .unwrap();
+        assert_eq!((blocks, retained), (0, 0));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn probe_reads_keep_ranges_and_generation_without_retaining_shared_blocks() {
         let data = vec![0x5au8; BLOCK_SIZE * 2 + 3];
         let path = temp_file("managed_reader_probe_scope", &data);

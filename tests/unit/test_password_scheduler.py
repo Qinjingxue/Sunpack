@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 import sunpack.core.passwords.scheduler as password_scheduler_module
+from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
 from sunpack.core.passwords.cache import (
     MAX_CACHED_NEGATIVE_ATTEMPTS,
     MAX_CACHED_SUCCESSES,
@@ -209,7 +210,7 @@ def test_production_scheduler_uses_only_bounded_fast_verifiers(
 
     result = scheduler.plan_for_extraction(PasswordJob(
         archive_path=str(archive),
-        archive_input={"format_hint": "rar"},
+        archive_input=ArchiveInputDescriptor(str(archive), format_hint="rar"),
         candidates=PasswordCandidatePipeline.from_values(["one", "two", "three"]),
     ))
 
@@ -244,7 +245,7 @@ def test_extraction_plan_accepts_strong_fast_proof_and_caches_it(tmp_path):
 
     job = PasswordJob(
         archive_path=str(archive),
-        archive_input={"format_hint": "7z"},
+        archive_input=ArchiveInputDescriptor(str(archive), format_hint="7z"),
         candidates=candidates(),
     )
 
@@ -270,7 +271,7 @@ def test_single_enc_candidate_uses_extraction_confirmation_and_cache(tmp_path, m
     if mode != "file":
         descriptor["ranges" if mode == "concat_ranges" else "parts"] = [{"path": str(archive), "start": 2, "end": 12}]
     job = PasswordJob(
-        archive_path=str(archive), archive_input=descriptor,
+        archive_path=str(archive), archive_input=ArchiveInputDescriptor.from_dict(descriptor, archive_path=str(archive)),
         candidates=PasswordCandidatePipeline.from_values(["secret", "secret"]),
     )
     key = build_archive_fingerprint(str(archive), archive_input=descriptor).key
@@ -302,7 +303,7 @@ def test_single_enc_candidate_after_negative_cache_filtering(tmp_path):
         build_archive_fingerprint(str(archive), archive_input=descriptor).key, "bad",
     )
     result = scheduler.plan_for_extraction(PasswordJob(
-        archive_path=str(archive), archive_input=descriptor,
+        archive_path=str(archive), archive_input=ArchiveInputDescriptor.from_dict(descriptor, archive_path=str(archive)),
         candidates=PasswordCandidatePipeline.from_values(["bad", "secret"]),
     ))
     assert result.extraction_candidates == ("secret",) and result.attempts == 0
@@ -322,7 +323,7 @@ def test_single_candidate_shortcut_requires_enc_descriptor(tmp_path, descriptor,
         attempts=len(candidates), final_confirmation_required=False,
     ))
     result = PasswordScheduler(PasswordVerifierChain([fast])).plan_for_extraction(PasswordJob(
-        archive_path=str(archive), archive_input=descriptor,
+        archive_path=str(archive), archive_input=ArchiveInputDescriptor.from_dict(descriptor, archive_path=str(archive)),
         candidates=PasswordCandidatePipeline.from_values(candidates),
     ))
     assert result.password == "secret"
@@ -342,7 +343,7 @@ def test_extraction_plan_accepts_not_required_fast_result(tmp_path):
     scheduler = PasswordScheduler(PasswordVerifierChain([fast]))
     job = PasswordJob(
         archive_path=str(archive),
-        archive_input={"open_mode": "file_range", "format_hint": "zip", "parts": [{"path": str(archive), "start": 0, "end": 7}]},
+        archive_input=ArchiveInputDescriptor.from_dict({"open_mode": "file_range", "format_hint": "zip", "parts": [{"path": str(archive), "start": 0, "end": 7}]}, archive_path=str(archive)),
         candidates=PasswordCandidatePipeline.from_values(["", "secret"]),
     )
 
@@ -377,7 +378,7 @@ def test_extraction_plan_preserves_zipcrypto_candidate_evidence(tmp_path):
 
     result = scheduler.plan_for_extraction(PasswordJob(
         archive_path=str(archive),
-        archive_input={"format_hint": "zip"},
+        archive_input=ArchiveInputDescriptor(str(archive), format_hint="zip"),
         candidates=PasswordCandidatePipeline.from_values(["collision", "rejected", "secret"]),
     ))
 
@@ -402,7 +403,7 @@ def test_extraction_plan_caches_only_tested_prefix_before_weak_match(tmp_path, p
     scheduler = PasswordScheduler(PasswordVerifierChain([fast]))
     job = PasswordJob(
         archive_path=str(archive),
-        archive_input={"format_hint": "rar"},
+        archive_input=ArchiveInputDescriptor(str(archive), format_hint="rar"),
         candidates=PasswordCandidatePipeline.from_values(
             [*prefix, "collision", "secret"]
         ),

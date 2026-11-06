@@ -79,7 +79,7 @@ class RelationsGroupBuilder:
         candidates lets the next native pass decrypt the main headers and follow the
         exact unencrypted path: real multivolume state and volume numbers.
         """
-        encrypted_groups: list[tuple[list[str], list[str], dict | None]] = []
+        encrypted_groups: list[tuple[list[str], list[str], ArchiveInputDescriptor]] = []
         for group in groups:
             metadata = group.head_metadata if isinstance(group.head_metadata, dict) else {}
             if (
@@ -113,8 +113,7 @@ class RelationsGroupBuilder:
                             start=int(metadata.get("structure_offset") or 0),
                         ))],
                     )
-                archive_input = descriptor.to_dict()
-                encrypted_groups.append((sorted(proposal_paths), part_paths, archive_input))
+                encrypted_groups.append((sorted(proposal_paths), part_paths, descriptor))
         if not encrypted_groups:
             return None
 

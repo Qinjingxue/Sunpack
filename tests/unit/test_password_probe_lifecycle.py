@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 import sunpack.core.support.archive_sessions as sessions
+from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
 from sunpack.core.passwords.verifier import rar_fast, seven_zip_fast, zip_fast
 from sunpack.core.support.resource_lifecycle import (
     ResourceBusyError,
@@ -141,13 +142,13 @@ def test_cancelled_password_kdf_drains_without_cancelling_shared_input(tmp_path,
         broker = AsyncWorkBroker(thread_capacity=2, max_pending_jobs=2)
         first = asyncio.create_task(broker.run(
             'password', physical[0], scheduler.plan_for_extraction,
-            PasswordJob(physical[0], archive_input=descriptor,
+            PasswordJob(physical[0], archive_input=ArchiveInputDescriptor.from_dict(descriptor, archive_path=physical[0]),
                         candidates=[f'cancel-{index}' for index in range(32)]),
             request_id='cancelled-password', origin='watch', cancellation=cancelled,
         ))
         second = asyncio.create_task(broker.run(
             'password', physical[0], scheduler.run,
-            PasswordJob(physical[0], archive_input=descriptor, candidates=['survivor']),
+            PasswordJob(physical[0], archive_input=ArchiveInputDescriptor.from_dict(descriptor, archive_path=physical[0]), candidates=['survivor']),
             request_id='surviving-password', origin='foreground', cancellation=survivor,
         ))
         try:
@@ -288,10 +289,10 @@ def test_multibatch_password_job_releases_its_input_before_task_exit(tmp_path, m
                 raise RuntimeError("candidate source failed after a batch")
             yield str(index)
 
-    job = PasswordJob(physical[0], archive_input={
+    job = PasswordJob(physical[0], archive_input=ArchiveInputDescriptor.from_dict({
         "kind": "archive_input", "open_mode": "concat_ranges", "format_hint": "zip",
         "entry_path": physical[0], "ranges": [{"path": path, "start": 0, "end": 5} for path in physical],
-    }, candidates=candidates())
+    }, archive_path=physical[0]), candidates=candidates())
     scope = TaskResourceScope("multibatch-password-job", files=physical)
     try:
         with scope.activate():

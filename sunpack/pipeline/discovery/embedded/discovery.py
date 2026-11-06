@@ -167,7 +167,7 @@ class EmbeddedDiscovery:
             for path, _offset in batch.encrypted_volume_inputs(table)
         ]
         shared_inputs = False
-        for index, status, raw_scan in batch.resolve_volumes(table, passwords):
+        for index, status, raw_scan, password in batch.resolve_volumes(table, passwords):
             candidate = session.project_native_candidate(table, index)
             if status == 0:
                 shared_inputs = True
@@ -176,18 +176,22 @@ class EmbeddedDiscovery:
             # A directed relation replaces only earlier decisions for its own
             # physical inputs (a continuation may already have been blocked).
             keys = candidate.path_keys
-            shared_inputs = shared_inputs or bool(keys & (result.claimed_paths | result.blocked_paths))
+            shared_inputs = (shared_inputs or not keys.isdisjoint(result.claimed_paths)
+                             or not keys.isdisjoint(result.blocked_paths))
             result.residual_paths.difference_update(keys)
             result.blocked_paths.difference_update(keys)
             reason = candidate.relation_anchor.get("relation_failure_reason")
             if reason:
                 result.add_blocked(candidate, source="relations", reason=str(reason))
             else:
-                result.add_resolved(ArchiveTask.from_archive_input(
+                task = ArchiveTask.from_archive_input(
                     candidate.archive_input, discovery_source="relations",
                     carrier_path=candidate.carrier_path, cleanup_paths=candidate.cleanup_paths,
                     discovery_evidence=candidate.relation_anchor,
-                ), reason="Relations confirmed embedded volume anchor")
+                )
+                if password is not None:
+                    task.set_inputs((replace(task.inputs[0], password=password),))
+                result.add_resolved(task, reason="Relations confirmed embedded volume anchor")
         if shared_inputs and len(result.tasks) > 1:
             self._combine_shared_inputs(result)
         result.validate()

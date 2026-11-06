@@ -185,8 +185,6 @@ class ArchiveInputPlanningStage:
         )
 
     def _tasks_from_report(self, task: ArchiveTask, report: ArchiveAnalysisReport, *, phase_timer: Callable[..., Any] | None = None, phase_prefix: str = "input_planning") -> list[ArchiveTask]:
-        with _phase(phase_timer, f"{phase_prefix}_record_report"):
-            self._record_report(task, report, phase_timer=phase_timer, phase_prefix=phase_prefix, record_state=False, write_knowledge=False)
         with _phase(phase_timer, f"{phase_prefix}_extractable_segments"):
             candidates = self._extractable_segments(report)
         with _phase(phase_timer, f"{phase_prefix}_write_segments_build_payload"):
@@ -199,8 +197,6 @@ class ArchiveInputPlanningStage:
                 selected_segment = (evidence, segment, index)
                 with _phase(phase_timer, f"{phase_prefix}_write_segments_build_payload"):
                     segment_payloads = self._extractable_segment_payloads(task, [(evidence, segment, index)])
-                with _phase(phase_timer, f"{phase_prefix}_apply_selected_segment"):
-                    self._apply_selected_segment(task, evidence, segment, index=index, write_knowledge=False)
             with _phase(phase_timer, f"{phase_prefix}_batched_write"):
                 password_probe_input = (
                     self._password_probe_input_for_segment(task, *selected_segment[:2])
@@ -219,8 +215,6 @@ class ArchiveInputPlanningStage:
             return [task]
         evidence, segment, index = candidates[0]
         selected_segment = (evidence, segment, index)
-        with _phase(phase_timer, f"{phase_prefix}_apply_selected_segment"):
-            self._apply_selected_segment(task, evidence, segment, index=index, write_knowledge=False)
         with _phase(phase_timer, f"{phase_prefix}_batched_write"):
             password_probe_input = self._password_probe_input_for_segment(
                 task,
@@ -242,35 +236,6 @@ class ArchiveInputPlanningStage:
     def _structured_volume_source(task: ArchiveTask) -> ArchiveInputDescriptor | None:
         source_input = task.archive_input()
         return source_input if len(source_input.parts) > 1 else None
-
-    def _apply_selected_segment(
-        self,
-        task: ArchiveTask,
-        evidence: ArchiveFormatEvidence,
-        segment: ArchiveSegment,
-        *,
-        index: int,
-        write_knowledge: bool = True,
-    ) -> None:
-        if write_knowledge:
-            write_source_selected_segment(task, evidence, segment, index=index)
-
-    def _record_report(
-        self,
-        task: ArchiveTask,
-        report: ArchiveAnalysisReport,
-        *,
-        phase_timer: Callable[..., Any] | None = None,
-        phase_prefix: str = "input_planning",
-        record_state: bool = True,
-        write_knowledge: bool = True,
-    ) -> None:
-        if write_knowledge:
-            with _phase(phase_timer, f"{phase_prefix}_record_report_write_knowledge"):
-                _write_plan_knowledge(task, report, [], None)
-        if record_state:
-            with _phase(phase_timer, f"{phase_prefix}_record_report_state_analysis"):
-                self._record_planning_input(task, report, phase_timer=phase_timer, phase_prefix=phase_prefix)
 
     @staticmethod
     def _execution_analysis_for_report(

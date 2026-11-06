@@ -17,7 +17,9 @@ pub(crate) fn visit_relation_directory(
     directory: RelationDirectory,
     mut visit: impl FnMut(&super::CentralDirectoryRecord<'_>, super::zip64::CentralValues),
 ) -> std::io::Result<bool> {
-    let reader = crate::io::reader::ManagedReader::open(path)?;
+    // Directory walks are transient. Reuse the bounded analysis window so
+    // each record does not populate the process-wide physical block cache.
+    let reader = crate::io::reader::ManagedReader::open(path)?.windowed_probe_reader();
     let count = directory.disk_entries;
     let start = if directory.cd_disk == directory.disk {
         let Some(start) = directory.end.checked_sub(directory.size) else {
@@ -38,6 +40,7 @@ pub(crate) fn visit_relation_directory(
     }
     let mut cursor = start;
     for _ in 0..count {
+        reader.hint_probe_window(cursor);
         let fixed = reader.read_cached_at(cursor, 46)?;
         let Some(len) = super::central_directory_record_len(&fixed) else {
             return Ok(false);
