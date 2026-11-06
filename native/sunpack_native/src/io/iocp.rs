@@ -157,10 +157,9 @@ unsafe impl Sync for IocpHandles {}
 impl Drop for IocpHandles {
     fn drop(&mut self) {
         if !self.file.is_null() && self.file != INVALID_HANDLE_VALUE {
-            // The normal path drains all operations before this point.  This
-            // best-effort cancellation protects panic/error unwinding paths.
+            // PendingReads drains operations before buffers or handles can
+            // be released, including error and panic unwinding paths.
             unsafe {
-                let _ = CancelIoEx(self.file, null_mut());
                 let _ = CloseHandle(self.file);
             }
         }
@@ -283,8 +282,7 @@ fn submit_slot(handles: &IocpHandles, slot: &mut IocpSlot) -> io::Result<()> {
 }
 
 fn submit_next_slot(
-    handles: &IocpHandles,
-    pending: &mut HashMap<usize, Box<IocpSlot>>,
+    pending: &mut PendingReads<'_>,
     next_base: &mut u64,
     file_size: u64,
     chunk_bytes: usize,
@@ -299,33 +297,42 @@ fn submit_next_slot(
     *next_base = visible_end;
     configure_slot(&mut slot, base, file_size, chunk_bytes, overlap)?;
     let key = slot.key();
-    submit_slot(handles, &mut slot)?;
-    pending.insert(key, slot);
+    submit_slot(pending.handles, &mut slot)?;
+    pending.slots.insert(key, slot);
     Ok(true)
 }
 
-fn cancel_pending(handles: &IocpHandles, pending: &mut HashMap<usize, Box<IocpSlot>>) {
-    for slot in pending.values_mut() {
-        unsafe {
-            let _ = CancelIoEx(handles.file, &mut slot.overlapped);
-        }
-    }
+// Cancellation alone does not release OVERLAPPED storage: Windows may still
+// write into the buffers until each completion has been dequeued.
+struct PendingReads<'a> {
+    handles: &'a IocpHandles,
+    slots: HashMap<usize, Box<IocpSlot>>,
+}
 
-    while !pending.is_empty() {
-        let mut bytes = 0u32;
-        let mut key = 0usize;
-        let mut overlapped = null_mut();
-        let _ = unsafe {
-            GetQueuedCompletionStatus(
-                handles.port,
-                &mut bytes,
-                &mut key,
-                &mut overlapped,
-                INFINITE,
-            )
-        };
-        if !overlapped.is_null() {
-            pending.remove(&(overlapped as usize));
+impl Drop for PendingReads<'_> {
+    fn drop(&mut self) {
+        for slot in self.slots.values_mut() {
+            unsafe {
+                let _ = CancelIoEx(self.handles.file, &mut slot.overlapped);
+            }
+        }
+
+        while !self.slots.is_empty() {
+            let mut bytes = 0u32;
+            let mut key = 0usize;
+            let mut overlapped = null_mut();
+            let _ = unsafe {
+                GetQueuedCompletionStatus(
+                    self.handles.port,
+                    &mut bytes,
+                    &mut key,
+                    &mut overlapped,
+                    INFINITE,
+                )
+            };
+            if !overlapped.is_null() {
+                self.slots.remove(&(overlapped as usize));
+            }
         }
     }
 }
@@ -401,9 +408,12 @@ where
             .saturating_add(worker_count)
             .min(jobs - read_slots);
         let slot_capacity = chunk_bytes.saturating_add(overlap).min(file_size as usize);
-        let (done_tx, done_rx) = mpsc::channel::<(Vec<u8>, ScanBatch<T>)>();
+        let (done_tx, done_rx) = mpsc::channel::<(Vec<u8>, std::thread::Result<ScanBatch<T>>)>();
 
-        let mut pending = HashMap::<usize, Box<IocpSlot>>::new();
+        let mut pending = PendingReads {
+            handles: &handles,
+            slots: HashMap::new(),
+        };
         let mut completed_slots = VecDeque::<Box<IocpSlot>>::new();
         let mut ready_jobs = VecDeque::<ScanJob>::new();
         let mut available_buffers = (0..job_capacity)
@@ -419,7 +429,6 @@ where
                 break;
             }
             match submit_next_slot(
-                &handles,
                 &mut pending,
                 &mut next_base,
                 file_size,
@@ -436,12 +445,11 @@ where
             }
         }
         if let Some(error) = initial_error {
-            cancel_pending(&handles, &mut pending);
             return Err(error);
         }
 
         let mut fatal_error = None;
-        while !pending.is_empty()
+        while !pending.slots.is_empty()
             || !completed_slots.is_empty()
             || !ready_jobs.is_empty()
             || scan_jobs > 0
@@ -454,6 +462,7 @@ where
                 match done_rx.try_recv() {
                     Ok((buffer, hits)) => {
                         scan_jobs = scan_jobs.saturating_sub(1);
+                        let hits = hits.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
                         discarded_results += hits.discarded_results;
                         if let Err(error) = collect(hits.results) {
                             fatal_error = Some(error);
@@ -499,7 +508,6 @@ where
                     bytes_read: slot.bytes_read,
                 };
                 match submit_next_slot(
-                    &handles,
                     &mut pending,
                     &mut next_base,
                     file_size,
@@ -549,13 +557,18 @@ where
                 let worker_cancellation = cancellation.clone();
                 scan_jobs += 1;
                 scope.spawn(move |_| {
-                    let hits = worker_cancellation.run(|| {
-                        scan(
-                            &job.buffer[..job.bytes_read],
-                            job.leading_overlap,
-                            job.read_start,
-                        )
-                    });
+                    // Always deliver a completion, including a callback panic.
+                    // Rayon cannot propagate it while the producer still waits
+                    // for scan_jobs to reach zero inside this scope.
+                    let hits = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        worker_cancellation.run(|| {
+                            scan(
+                                &job.buffer[..job.bytes_read],
+                                job.leading_overlap,
+                                job.read_start,
+                            )
+                        })
+                    }));
                     let _ = done_tx.send((job.buffer, hits));
                     unsafe {
                         let _ = PostQueuedCompletionStatus(
@@ -571,7 +584,7 @@ where
                 break;
             }
 
-            if pending.is_empty() && scan_jobs == 0 {
+            if pending.slots.is_empty() && scan_jobs == 0 {
                 if completed_slots.is_empty() && ready_jobs.is_empty() {
                     break;
                 }
@@ -597,7 +610,7 @@ where
                 fatal_error = Some(last_error());
                 break;
             }
-            let Some(mut slot) = pending.remove(&(overlapped as usize)) else {
+            let Some(mut slot) = pending.slots.remove(&(overlapped as usize)) else {
                 fatal_error = Some(io::Error::other("unknown IOCP completion context"));
                 break;
             };
@@ -615,7 +628,6 @@ where
         }
 
         if fatal_error.is_some() {
-            cancel_pending(&handles, &mut pending);
             return Err(fatal_error.expect("IOCP fatal error should be present"));
         }
 
@@ -632,6 +644,85 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn panicking_callbacks_release_scan_resources_and_leave_pool_usable() {
+        // Cancellation and successful scans cannot detect a lost worker wake
+        // or pending reads freed during callback unwinding. Exercise both
+        // callback sites, the inline path and a surviving scan in one lifecycle.
+        let path =
+            std::env::temp_dir().join(format!("sunpack_iocp_panic_{}.bin", std::process::id(),));
+        let size = 32 * 64 * 1024;
+        std::fs::write(&path, vec![0x5a; size]).unwrap();
+        for (length, worker_panic) in [(size, true), (size, false), (1024, true)] {
+            let result = std::panic::catch_unwind(|| {
+                scan_file(
+                    &path,
+                    length as u64,
+                    64 * 1024,
+                    2,
+                    2,
+                    11,
+                    |data, carry, base| {
+                        if worker_panic && base == 0 {
+                            panic!("scan callback failed");
+                        }
+                        ScanBatch {
+                            results: data.len() - carry,
+                            discarded_results: 0,
+                        }
+                    },
+                    |_| {
+                        if !worker_panic {
+                            panic!("collect callback failed");
+                        }
+                        Ok(())
+                    },
+                )
+            });
+            let panic = match result {
+                Err(panic) => panic,
+                Ok(_) => panic!("callback panic was swallowed"),
+            };
+            assert_eq!(
+                panic.downcast_ref::<&str>().copied(),
+                Some(if worker_panic {
+                    "scan callback failed"
+                } else {
+                    "collect callback failed"
+                }),
+            );
+            // A leaked scan handle would deny this exclusive open.
+            use std::os::windows::fs::OpenOptionsExt;
+            drop(
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .share_mode(0)
+                    .open(&path)
+                    .unwrap(),
+            );
+        }
+        let mut matched = 0;
+        scan_file(
+            &path,
+            size as u64,
+            64 * 1024,
+            2,
+            2,
+            11,
+            |data, carry, _| ScanBatch {
+                results: data.len() - carry,
+                discarded_results: 0,
+            },
+            |count| {
+                matched += count;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(matched, size);
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn overlapped_offset_supports_files_above_four_gibabytes() {
