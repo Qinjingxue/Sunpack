@@ -1128,6 +1128,10 @@ def test_persistent_config_snapshot_reuses_a_source_without_mtime_checks(tmp_pat
         first = persistent_runtime.load_request_config("first")
         first["cli"]["language"] = "mutated"
         assert persistent_runtime.load_request_config("first")["cli"]["language"] == "first"
+        path, raw = persistent_runtime.load_request_config_payload("first")
+        raw["cli"]["language"] = "mutated"
+        assert path == tmp_path / "first.json"
+        assert persistent_runtime.load_request_config_payload("first")[1]["cli"]["language"] == "first"
         assert persistent_runtime.load_request_config("second")["cli"]["language"] == "second"
         await persistent_runtime.close_persistent_runtime()
 

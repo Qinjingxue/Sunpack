@@ -277,16 +277,6 @@ def _kernel32():
         wintypes.LPVOID,
     )
     kernel32.SetNamedPipeHandleState.restype = wintypes.BOOL
-    kernel32.ReadFile.argtypes = (
-        wintypes.HANDLE,
-        wintypes.LPVOID,
-        wintypes.DWORD,
-        ctypes.POINTER(wintypes.DWORD),
-        wintypes.LPVOID,
-    )
-    kernel32.ReadFile.restype = wintypes.BOOL
-    kernel32.WriteFile.argtypes = kernel32.ReadFile.argtypes
-    kernel32.WriteFile.restype = wintypes.BOOL
     kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
     kernel32.CloseHandle.restype = wintypes.BOOL
     return kernel32
@@ -972,33 +962,6 @@ def _recv_exact(connection, size: int) -> bytes:
             raise EOFError("persistent connection closed")
         chunks.extend(chunk)
     return bytes(chunks)
-
-
-def _recv_request(connection, token: bytes) -> dict[str, Any] | None:
-    build_id = _runtime_binary_build_id()
-    if (
-        _recv_exact(connection, 4) != _REQUEST_MAGIC
-        or _recv_exact(connection, len(build_id)) != build_id
-        or _recv_exact(connection, len(token)) != token
-    ):
-        return None
-    flags, cwd_size, argc = struct.unpack("!III", _recv_exact(connection, 12))
-    if cwd_size > _MAX_FIELD_BYTES:
-        return None
-    cwd = _recv_exact(connection, cwd_size).decode("utf-8", "surrogatepass")
-    argv = []
-    for _ in range(argc):
-        size = struct.unpack("!I", _recv_exact(connection, 4))[0]
-        if size > _MAX_FIELD_BYTES:
-            return None
-        argv.append(_recv_exact(connection, size).decode("utf-8", "surrogatepass"))
-    return {
-        "cwd": cwd,
-        "argv": argv,
-        "shutdown": bool(flags & 1),
-        "stdout_tty": bool(flags & 2),
-        "stdin_tty": bool(flags & 4),
-    }
 
 
 def _recv_stream(connection, input_stream=None, *, enable_cancel=True) -> dict[str, Any]:

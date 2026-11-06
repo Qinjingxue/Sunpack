@@ -181,8 +181,9 @@ def _snapshot_for(request_cwd: str | Path | None) -> _ConfigSnapshot:
         config_path, raw_payload = load_raw_config_payload(request_cwd)
         snapshot = _ConfigSnapshot(
             config_path=config_path,
-            raw_payload=copy.deepcopy(raw_payload),
-            normalized_config=copy.deepcopy(load_config(request_cwd)),
+            # Both loaders return owned payloads, already isolated from their cache.
+            raw_payload=raw_payload,
+            normalized_config=load_config(request_cwd),
         )
         _CONFIG_SNAPSHOTS[source_key] = snapshot
         if len(_CONFIG_SNAPSHOTS) > _CONFIG_SNAPSHOT_LIMIT:
