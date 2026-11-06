@@ -521,6 +521,11 @@ class _PipeRequestProtocol(asyncio.Protocol):
 
     def connection_lost(self, exc: Exception | None) -> None:
         self._closed = True
+        self._transport = None
+        # A cancelled request may still be draining native work. Its coroutine
+        # owns the parsed payload; retain no transport or partial input here.
+        self._buffer.clear()
+        self._payload = None
         self._output_queue.close()
         if self._input_waiter is not None and not self._input_waiter.done():
             self._input_waiter.set_exception(ConnectionError("persistent pipe client disconnected"))
@@ -544,15 +549,15 @@ class _PipeRequestProtocol(asyncio.Protocol):
             header_size = 4 + len(build_id) + len(self._token) + 12
             if len(self._buffer) < header_size:
                 return None
-            if bytes(self._buffer[:4]) != _REQUEST_MAGIC:
+            if self._buffer[:4] != _REQUEST_MAGIC:
                 raise ValueError("invalid persistent request magic")
             build_start = 4
             build_end = build_start + len(build_id)
-            if bytes(self._buffer[build_start:build_end]) != build_id:
+            if self._buffer[build_start:build_end] != build_id:
                 raise ValueError("invalid persistent runtime build id")
             token_start = build_end
             token_end = token_start + len(self._token)
-            if bytes(self._buffer[token_start:token_end]) != self._token:
+            if self._buffer[token_start:token_end] != self._token:
                 raise ValueError("invalid persistent request token")
             flags, cwd_size, argc = struct.unpack("!III", self._buffer[token_end:header_size])
             del self._buffer[:header_size]
@@ -572,7 +577,7 @@ class _PipeRequestProtocol(asyncio.Protocol):
             assert self._payload is not None and self._next_arg_size is not None
             if len(self._buffer) < self._next_arg_size:
                 return None
-            self._payload["cwd"] = bytes(self._buffer[:self._next_arg_size]).decode("utf-8", "surrogatepass")
+            self._payload["cwd"] = self._buffer[:self._next_arg_size].decode("utf-8", "surrogatepass")
             del self._buffer[:self._next_arg_size]
             self._next_arg_size = None
             self._stage = "argv"
@@ -589,7 +594,7 @@ class _PipeRequestProtocol(asyncio.Protocol):
             if len(self._buffer) < self._next_arg_size:
                 return None
             self._payload["argv"].append(
-                bytes(self._buffer[:self._next_arg_size]).decode("utf-8", "surrogatepass")
+                self._buffer[:self._next_arg_size].decode("utf-8", "surrogatepass")
             )
             del self._buffer[:self._next_arg_size]
             self._next_arg_size = None
@@ -626,7 +631,7 @@ class _PipeRequestProtocol(asyncio.Protocol):
                 raise ValueError("persistent input exceeds limit")
         if len(self._buffer) < self._input_size:
             return
-        text = bytes(self._buffer[:self._input_size]).decode("utf-8", "replace")
+        text = self._buffer[:self._input_size].decode("utf-8", "replace")
         del self._buffer[:self._input_size]
         self._input_size = None
         self._input_waiter = None

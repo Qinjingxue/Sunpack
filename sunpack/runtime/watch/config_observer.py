@@ -53,7 +53,7 @@ class ConfigFileObserver:
         self.callback = callback
         self._base_files = [(self.directory, self.filenames, callback), *additional_files]
         self._files = {}
-        self._directories = set()
+        self._directories = {}
         self._pending_callbacks = set()
         self.debounce_seconds = max(0.0, float(debounce_seconds))
         self._observer = observer_factory()
@@ -70,12 +70,13 @@ class ConfigFileObserver:
     def set_additional_files(self, files) -> None:
         """Replace request-source subscriptions; evicted sources release watches."""
         selected = {}
-        directories = set()
+        directories = {}
         for directory, names, notify in [*self._base_files, *files]:
             directory = Path(directory).resolve()
-            directories.add(directory)
+            callbacks = directories.setdefault(directory, set())
             for name in names:
                 selected.setdefault(str(directory / str(name)).casefold(), set()).add(notify)
+                callbacks.add(notify)
         with self._lock:
             if self._stopped:
                 return
@@ -83,15 +84,14 @@ class ConfigFileObserver:
             previous = self._directories
             # Dispatch may start inside schedule(); publish filters first.
             self._files = selected
+            self._directories = directories
         # Watchdog dispatch holds its own lock before calling our handler.
         # Never take that lock while holding the callback/timer lock.
         if started:
-            for directory in directories - previous:
+            for directory in directories.keys() - previous.keys():
                 self._watches[directory] = self._observer.schedule(self._handler, str(directory), recursive=False)
-            for directory in previous - directories:
+            for directory in previous.keys() - directories.keys():
                 self._observer.unschedule(self._watches.pop(directory))
-        with self._lock:
-            self._directories = directories
 
     def start(self) -> None:
         with self._lock:
@@ -143,17 +143,23 @@ class ConfigFileObserver:
             callbacks = self._files.get(key)
             if not callbacks:
                 return
-            self._pending_callbacks.update(callbacks)
-            # Coalesce before crossing threads as well as before reloading.
-            # A busy loop must not retain one callback per filesystem event.
-            if self._scheduled_emit is None:
-                self._scheduled_emit = self._loop.call_soon_threadsafe(self._schedule_emit)
+            self._schedule_callbacks_locked(callbacks)
 
     def notify_directory_changed(self, path: str) -> None:
         directory = Path(path).resolve()
-        for filename in tuple(self._files):
-            if Path(filename).parent == directory:
-                self.notify_path_changed(filename)
+        with self._lock:
+            if self._stopped:
+                return
+            callbacks = self._directories.get(directory)
+            if callbacks:
+                self._schedule_callbacks_locked(callbacks)
+
+    def _schedule_callbacks_locked(self, callbacks) -> None:
+        self._pending_callbacks.update(callbacks)
+        # Coalesce before crossing threads as well as before reloading.
+        # A busy loop must not retain one callback per filesystem event.
+        if self._scheduled_emit is None:
+            self._scheduled_emit = self._loop.call_soon_threadsafe(self._schedule_emit)
 
     def _schedule_emit(self) -> None:
         with self._lock:

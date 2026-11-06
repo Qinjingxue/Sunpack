@@ -112,7 +112,7 @@ class WatchRunResult:
     errors: list[str] = field(default_factory=list)
 
 
-@dataclass
+@dataclass(slots=True)
 class _ActiveCandidateState:
     last_event_at: float
     quiet_seconds: float

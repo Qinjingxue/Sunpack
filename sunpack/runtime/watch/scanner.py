@@ -13,7 +13,7 @@ from sunpack_native import (
 )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class WatchCandidate:
     path: str
     size: int

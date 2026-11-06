@@ -76,7 +76,7 @@ class NullWatchNotificationSink:
         pass
 
 
-@dataclass
+@dataclass(slots=True)
 class _TaskProgress:
     completed_bytes: int = 0
     total_bytes: int = 0

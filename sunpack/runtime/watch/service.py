@@ -450,6 +450,8 @@ class WatchService:
         self._last_idle_tick_signature = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._control_queue: asyncio.Queue[str | None] | None = None
+        self._scheduler_wakeup_lock = threading.Lock()
+        self._scheduler_wakeup_pending = False
         self._broker_acquired = False
         self._ready_event = asyncio.Event()
         self._reload_lock = asyncio.Lock()
@@ -547,6 +549,11 @@ class WatchService:
                         )
                     except asyncio.TimeoutError:
                         control_event = None
+                if control_event == CONTROL_SCHEDULER_WAKEUP:
+                    # Consume before running again: an event that arrives during
+                    # the next tick must be able to request another tick.
+                    with self._scheduler_wakeup_lock:
+                        self._scheduler_wakeup_pending = False
                 if control_event == CONTROL_SCHEDULER_WAKEUP and self.scheduler is not None:
                     # A pipeline completion wakes the service so run_once() can
                     # harvest the finished request.  Recomputing the delay here
@@ -592,6 +599,8 @@ class WatchService:
                     finally:
                         self._broker_acquired = False
                 self._stop_toast_host()
+            with self._scheduler_wakeup_lock:
+                self._scheduler_wakeup_pending = False
             self.log.write("service_stopped", state_dir=self.state_dir)
             await asyncio.to_thread(self.log.close)
             if tray_shutdown_error is not None:
@@ -897,11 +906,21 @@ class WatchService:
         return None
 
     def _wake_scheduler(self) -> None:
-        if self._loop is not None and self._control_queue is not None:
-            self._loop.call_soon_threadsafe(
-                self._control_queue.put_nowait,
-                CONTROL_SCHEDULER_WAKEUP,
-            )
+        with self._scheduler_wakeup_lock:
+            loop, queue = self._loop, self._control_queue
+            if loop is None or queue is None or self._scheduler_wakeup_pending:
+                return
+            # One wake covers all currently published scheduler state.
+            # Bound both cross-thread callbacks and queued wake tokens.
+            self._scheduler_wakeup_pending = True
+            try:
+                loop.call_soon_threadsafe(
+                    queue.put_nowait,
+                    CONTROL_SCHEDULER_WAKEUP,
+                )
+            except BaseException:
+                self._scheduler_wakeup_pending = False
+                raise
 
     def _start_config_observer(self) -> None:
         from sunpack.runtime.cli.runtime_state import server_runtime_active

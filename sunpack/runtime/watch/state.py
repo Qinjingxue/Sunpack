@@ -5,6 +5,7 @@ from dataclasses import asdict, dataclass, field, replace
 import os
 import threading
 import time
+import traceback
 import weakref
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -632,6 +633,11 @@ class WatchStateStore:
                 retirement_pending = self._retire_segments_through(boundary)
             except BaseException as exc:
                 error = exc
+                # Keep the failure and stack, not completed writer frames whose
+                # locals own the captured native snapshot and its old records.
+                traceback.clear_frames(exc.__traceback__)
+            finally:
+                del view
 
             with self._checkpoint_condition:
                 if error is None:

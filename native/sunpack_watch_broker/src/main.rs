@@ -438,7 +438,7 @@ impl JournalDispatcher {
     }
 }
 
-fn encode_path_payload(paths: &[String]) -> io::Result<Vec<u8>> {
+fn encode_path_payload<'a>(paths: impl Iterator<Item = &'a str>) -> io::Result<Vec<u8>> {
     let mut payload = Vec::new();
     for path in paths {
         let bytes = path.as_bytes();
@@ -547,15 +547,10 @@ fn handle_request(
                     )
             })
             .and_then(|page| {
-                let paths = page
-                    .changes
-                    .into_iter()
-                    .map(|(_, name)| name)
-                    .collect::<Vec<_>>();
-                payload = encode_path_payload(&paths)?;
+                payload = encode_path_payload(page.changes.iter().map(|(_, name)| name.as_str()))?;
                 let bytes = u32::try_from(payload.len())
                     .map_err(|_| io::Error::other("USN root recovery payload is too large"))?;
-                let count = u32::try_from(paths.len())
+                let count = u32::try_from(page.changes.len())
                     .map_err(|_| io::Error::other("too many USN root changes"))?;
                 Ok((
                     page.journal_id,
