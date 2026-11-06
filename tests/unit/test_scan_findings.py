@@ -5,6 +5,7 @@ from sunpack.core.contracts.archive_input import (
     InputExtent,
 )
 from sunpack.core.contracts.discovery import DiscoveryFinding, StageResult
+from sunpack.core.contracts.failures import FailureInfo, FailureKind
 from sunpack.core.contracts.tasks import ArchiveTask
 from sunpack.pipeline.coordinator.scanner import ScanOrchestrator
 
@@ -84,3 +85,12 @@ def test_scan_report_projects_multiple_embedded_findings_from_one_task(monkeypat
     assert [finding.end_offset for finding in report.findings] == [64, 160]
     assert all(finding.status == "resolved" for finding in report.findings)
     assert all(finding.extractable for finding in report.findings)
+
+    # Mixed logical blockers share a physical task, so task-level success
+    # cannot stand in for the individual input's discovery verdict.
+    from dataclasses import replace
+    task.set_inputs((task.inputs[0], replace(task.inputs[1], failure=FailureInfo(
+        FailureKind.PASSWORD_REQUIRED, "embedded_boundary", "password required"))))
+    findings = orchestrator.scan_report([path]).findings
+    assert [finding.status for finding in findings] == ["resolved", "blocked"]
+    assert [finding.extractable for finding in findings] == [True, False]

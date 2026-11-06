@@ -287,7 +287,9 @@ class EmbeddedDiscovery:
             size = int(scan["file_size"])
 
         password_by_offset: dict[int, str] = dict(scan.get("resolved_passwords") or ())
-        pending_failures = {}
+        pending_failures = {item["offset"]: item["discovery_failure_reason"]
+                            for item in scan["candidates"] if item.get("discovery_failure_reason")}
+        resolved_rows = {}
         encrypted_offsets = [
             item["offset"]
             for item in scan["candidates"]
@@ -295,11 +297,12 @@ class EmbeddedDiscovery:
             and not item.get("volume_candidate")
             and embedded_candidate_requires_password(item["format"], item["validation"])
             and item["end_offset"] is None
+            and item["offset"] not in pending_failures
         ]
         if encrypted_offsets:
             passwords = self._password_candidates(path)
             try:
-                boundary = scan.get("rar_boundary") or resolve_encrypted_rar_boundaries(
+                boundary = resolve_encrypted_rar_boundaries(
                     path,
                     encrypted_offsets,
                     passwords,
@@ -320,8 +323,8 @@ class EmbeddedDiscovery:
                 "truncated": "embedded_truncated",
             }.get(status)
             if blocked_reason is not None:
-                pending_failures = {offset: blocked_reason for offset in encrypted_offsets
-                                    if offset not in resolved_rows}
+                pending_failures.update((offset, blocked_reason) for offset in encrypted_offsets
+                                        if offset not in resolved_rows)
             elif status != "ok":
                 raise OSError(str(boundary.get("error") or "Unable to resolve encrypted archive boundary"))
             rewritten = []
@@ -382,7 +385,7 @@ class EmbeddedDiscovery:
             if pending_failures:
                 reason = next(iter(pending_failures.values()))
                 return None, reason, _blocked_findings(
-                    path, scan, reason, failed_offset=boundary.get("failed_offset"),
+                    path, scan, reason, failed_offset=next(iter(pending_failures)),
                     resolved_rows=resolved_rows,
                 ) if include_details else ()
             return None, "no_complete_embedded_archive", ()

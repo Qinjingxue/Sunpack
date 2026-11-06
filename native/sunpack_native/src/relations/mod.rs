@@ -505,23 +505,31 @@ fn resolve_shared_carrier_volumes(
     let selected = by_path.keys().cloned().collect();
     // Materialize only the active stem scopes once, independently of the
     // number of logical heads. Never scan the entire directory per segment.
-    let scopes: Vec<Vec<RelationInput>> = snapshots
+    let scopes: Vec<HashMap<String, Vec<RelationInput>>> = snapshots
         .iter()
         .map(|snapshot| {
             let view = snapshot.without_path_keys(excluded);
             let source = RelationSource::Snapshot(&view, Some(&cache));
-            RelationScopeIndex::build(&source, &selected)
-                .rows
-                .into_iter()
-                .map(|row| source.materialize(row))
-                .collect()
+            let mut buckets: HashMap<String, Vec<RelationInput>> = HashMap::new();
+            for index in RelationScopeIndex::build(&source, &selected).rows {
+                let row = source.materialize(index);
+                buckets
+                    .entry(case_key(first_dot_stem(&row.name)))
+                    .or_default()
+                    .push(row);
+            }
+            buckets
         })
         .collect();
     let mut proposals = Vec::new();
     let mut mappings = HashSet::new();
     for anchor in &anchors {
         let key = path_key(&anchor.path);
-        for scope in &scopes {
+        let stem = case_key(first_dot_stem(basename(&anchor.path)));
+        for buckets in &scopes {
+            let Some(scope) = buckets.get(&stem) else {
+                continue;
+            };
             if !scope.iter().any(|row| row.path_key == key) {
                 continue;
             }

@@ -1033,13 +1033,6 @@ impl NativeWatchState {
             .collect()
     }
 
-    fn has_entry_status(&self, status: &str) -> bool {
-        self.lock()
-            .entries
-            .values()
-            .any(|value| value.status == status)
-    }
-
     fn has_entry_blocker(&self, blocker: &str) -> bool {
         self.lock()
             .entries

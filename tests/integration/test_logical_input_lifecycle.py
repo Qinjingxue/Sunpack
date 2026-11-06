@@ -154,3 +154,13 @@ def test_each_volume_head_in_a_carrier_enters_the_input_plan(tmp_path, encrypted
         assert all(InputCheckpoint(node, (), failure=node.failure).blockers == {"missing_volume"}
                    for node in unlocked.tasks[0].inputs[:2]), [
             (node.descriptor.analysis, node.failure) for node in unlocked.tasks[0].inputs[:2]]
+
+    # A shared carrier must keep arbitration inside its own stem family even
+    # when the discovery scope also contains another active volume family.
+    other = source / "unrelated.opaque"
+    other.write_bytes(b"other-prefix" * 13 + heads[0])
+    found = ArchiveTaskProvider(make_config({"embedded_scan": {"enabled": True}})).discover_targets([str(source)])
+    assert len(found.tasks) == 2
+    assert sorted(len(task.inputs) for task in found.tasks) == [1, 3]
+    assert all(all(path == task.main_path for path in node.source_paths)
+               for task in found.tasks for node in task.inputs)

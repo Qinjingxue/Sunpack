@@ -21,11 +21,6 @@ class InputExecutionResult:
     def complete(self) -> bool:
         return self.result.success and self.verified_complete is not False
 
-    def projection(self) -> dict:
-        return {**self.input.projection(), "success": self.result.success,
-                "partial_outputs": self.result.partial_outputs,
-                "verified_complete": self.verified_complete}
-
 
 @dataclass
 class ExtractionResult:

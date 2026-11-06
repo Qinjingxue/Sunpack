@@ -187,7 +187,6 @@ class InputRecovery:
             remaining.discard(previous.input.input_id)
             node = replace(node, input_id=previous.input.input_id, position=previous.input.position)
             current = source_generation(node, generation)
-            unchanged = current == previous.generation and node.descriptor.to_dict() == previous.input.descriptor.to_dict()
             # New analysis may add advisory facts without changing readable
             # bytes. Completed output is reusable only for the exact mapping.
             if previous.complete:
@@ -195,6 +194,8 @@ class InputRecovery:
                                 and node.descriptor.parts == previous.input.descriptor.parts
                                 and node.descriptor.extents == previous.input.descriptor.extents)
                 unchanged = current == previous.generation and same_mapping
+            else:
+                unchanged = current == previous.generation and node.descriptor.to_dict() == previous.input.descriptor.to_dict()
             if unchanged and (previous.complete or not (password_changed and "password" in previous.blockers)):
                 carried.append(replace(previous, input=node))
             else:

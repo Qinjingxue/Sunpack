@@ -15,7 +15,7 @@ use crc32fast::hash as crc32;
 use memchr::memmem;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{self, BufReader, Read, Seek, SeekFrom};
 use std::sync::OnceLock;
 
@@ -243,25 +243,24 @@ pub(crate) struct NativeScanResult {
     identity_only: bool,
 }
 
+pub(crate) struct RarInputResolution<'a> {
+    pub end_offset: Option<u64>,
+    pub password: Option<&'a str>,
+    pub failure_reason: Option<&'static str>,
+}
+
 impl NativeScanResult {
-    pub(crate) fn resolved_rar_dict(
-        &self,
-        py: Python<'_>,
-        offset: u64,
-        end: u64,
-        password: Option<&str>,
-    ) -> PyResult<Py<PyDict>> {
-        self.to_py_dict_with_rar_resolution(py, Some((offset, end, password)), Some(offset))
-    }
-
-    pub(crate) fn standalone_rar_dict(&self, py: Python<'_>, offset: u64) -> PyResult<Py<PyDict>> {
-        self.to_py_dict_with_rar_resolution(py, None, Some(offset))
-    }
-
     /// A physical source may contain several independent volume inputs. ZIP
     /// local records without a volume proof still nominate only one hypothesis.
     pub(crate) fn relation_anchors(&self) -> Vec<VolumeAnchor> {
         let mut zip_hypothesis = false;
+        // Candidates are in physical order. Advance one shared boundary cursor
+        // instead of rescanning every candidate for each logical volume head.
+        let mut boundaries = self
+            .candidates
+            .iter()
+            .filter(|c| c.boundary_kind == "exact" || c.volume_anchor.is_some())
+            .peekable();
         self.candidates
             .iter()
             .filter_map(|first| {
@@ -298,15 +297,10 @@ impl NativeScanResult {
                             },
                             ..VolumeAnchor::default()
                         });
-                anchor.carrier_limit = self
-                    .candidates
-                    .iter()
-                    .filter(|c| {
-                        c.offset > first.offset
-                            && (c.boundary_kind == "exact" || c.volume_anchor.is_some())
-                    })
-                    .map(|c| c.offset)
-                    .min();
+                while boundaries.peek().is_some_and(|c| c.offset <= first.offset) {
+                    boundaries.next();
+                }
+                anchor.carrier_limit = boundaries.peek().map(|c| c.offset);
                 Some(anchor)
             })
             .collect()
@@ -350,16 +344,15 @@ impl NativeScanResult {
     }
 
     pub(crate) fn to_py_dict(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
-        self.to_py_dict_with_rar_resolution(py, None, None)
+        self.to_py_dict_with_rar_resolutions(py, &HashMap::new())
     }
 
     // Project already verified facts once; never read Python rows back into
     // Rust or clone the scan's potentially large hit/candidate collections.
-    fn to_py_dict_with_rar_resolution(
+    pub(crate) fn to_py_dict_with_rar_resolutions(
         &self,
         py: Python<'_>,
-        resolution: Option<(u64, u64, Option<&str>)>,
-        standalone_offset: Option<u64>,
+        resolutions: &HashMap<u64, RarInputResolution<'_>>,
     ) -> PyResult<Py<PyDict>> {
         let result = PyDict::new(py);
         result.set_item("complete", !self.budget_exhausted)?;
@@ -367,13 +360,14 @@ impl NativeScanResult {
         result.set_item(
             "logical_resolution_complete",
             self.logical_resolution_complete
-                || resolution.is_some_and(|(offset, _, _)| {
-                    self.candidates.iter().all(|candidate| {
+                || (!resolutions.is_empty()
+                    && self.candidates.iter().all(|candidate| {
                         candidate.candidate_kind != "logical_archive"
                             || candidate.boundary_kind == "exact"
-                            || candidate.offset == offset
-                    })
-                }),
+                            || resolutions
+                                .get(&candidate.offset)
+                                .is_some_and(|r| r.end_offset.is_some())
+                    })),
         )?;
         result.set_item("file_size", self.file_size)?;
         result.set_item("read_bytes", self.file_size)?;
@@ -398,17 +392,16 @@ impl NativeScanResult {
         }
         result.set_item("hits", hit_rows)?;
         let rows = PyList::empty(py);
+        let mut passwords = Vec::new();
         for candidate in &self.candidates {
-            let resolved = resolution.filter(|(offset, _, _)| *offset == candidate.offset);
+            let resolution = resolutions.get(&candidate.offset);
+            let resolved_end = resolution.and_then(|r| r.end_offset);
             let row = PyDict::new(py);
             row.set_item("format", candidate.format)?;
             row.set_item("offset", candidate.offset)?;
-            row.set_item(
-                "end_offset",
-                resolved.map(|(_, end, _)| end).or(candidate.end_offset),
-            )?;
+            row.set_item("end_offset", resolved_end.or(candidate.end_offset))?;
             row.set_item("confidence", candidate.confidence)?;
-            if resolved.is_some() {
+            if resolved_end.is_some() {
                 row.set_item(
                     "validation",
                     format!("{}_decrypted_end", candidate.validation),
@@ -419,19 +412,30 @@ impl NativeScanResult {
             row.set_item("candidate_kind", candidate.candidate_kind)?;
             row.set_item(
                 "volume_candidate",
-                standalone_offset != Some(candidate.offset)
+                resolution.is_none()
                     && (candidate.volume_anchor.is_some()
                         || (candidate.format == "zip" && candidate.end_offset.is_none())),
             )?;
             row.set_item(
                 "boundary_kind",
-                if resolved.is_some() {
+                if resolved_end.is_some() {
                     "exact"
                 } else {
                     candidate.boundary_kind
                 },
             )?;
-            row.set_item("extractable", resolved.is_some() || candidate.extractable)?;
+            row.set_item(
+                "extractable",
+                resolved_end.is_some() || candidate.extractable,
+            )?;
+            if let Some(resolution) = resolution {
+                if let Some(reason) = resolution.failure_reason {
+                    row.set_item("discovery_failure_reason", reason)?;
+                }
+                if let Some(password) = resolution.password {
+                    passwords.push((candidate.offset, password));
+                }
+            }
             if let Some(offset) = candidate.zip_eocd_offset {
                 row.set_item("eocd_offset", offset)?;
             }
@@ -443,8 +447,8 @@ impl NativeScanResult {
             rows.append(row)?;
         }
         result.set_item("candidates", rows)?;
-        if let Some((offset, _, Some(password))) = resolution {
-            result.set_item("resolved_passwords", [(offset, password)])?;
+        if !passwords.is_empty() {
+            result.set_item("resolved_passwords", passwords)?;
         }
         Ok(result.unbind())
     }

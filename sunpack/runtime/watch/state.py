@@ -460,10 +460,6 @@ class WatchStateStore:
         with self._state_lock:
             return [WatchStateEntry(**item) for item in self._native.entry_items()]
 
-    def has_entry_status(self, status: str) -> bool:
-        with self._state_lock:
-            return bool(self._native.has_entry_status(status))
-
     def blocked_entries(self, blocker: str) -> list[WatchStateEntry]:
         with self._state_lock:
             return [

@@ -39,12 +39,21 @@ class VerificationScheduler:
                     phase_prefix=f"{phase_prefix}_embedded_{index}",
                 )
                 item.verified_complete = bool(segment_result.success and verification.decision_hint == DECISION_ACCEPT)
-                payloads.append((item.projection(), verification))
+                payloads.append(({
+                    "input_id": item.input.input_id,
+                    "format": item.input.descriptor.format_hint,
+                    "success": segment_result.success,
+                    "partial_outputs": segment_result.partial_outputs,
+                }, verification))
                 executed.add(item.input.input_id)
             for checkpoint in task.recovery.checkpoints:
                 if checkpoint.input.input_id in executed:
                     continue
-                payloads.append(({"success": checkpoint.complete}, VerificationResult(
+                payloads.append(({
+                    "input_id": checkpoint.input.input_id,
+                    "format": checkpoint.input.descriptor.format_hint,
+                    "success": checkpoint.complete,
+                }, VerificationResult(
                     completeness=1.0 if checkpoint.complete else 0.0,
                     decision_hint=DECISION_ACCEPT if checkpoint.complete else (
                         DECISION_REQUEST_PASSWORD if "password" in checkpoint.blockers else DECISION_FAIL),

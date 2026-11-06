@@ -8,13 +8,15 @@ use crate::scan::directory::{
     filesystem_logical_name, filesystem_route_name, DirectorySnapshotTable,
     NativeDirectorySnapshot, FILE_ROUTE_DETECTION, FILE_ROUTE_RELATIONS, FILE_ROUTE_RESIDUAL,
 };
-use crate::scan::embedded::{scan_detected_path, scan_embedded_path, NativeScanResult};
+use crate::scan::embedded::{
+    scan_detected_path, scan_embedded_path, NativeScanResult, RarInputResolution,
+};
 use crate::scan::pe_overlay::{inspect_pe_image_native, PeProbe, PeState};
 use pyo3::exceptions::PyIndexError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use rayon::prelude::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
@@ -334,10 +336,10 @@ impl NativeEmbeddedBatch {
                 EmbeddedOutcome::Scan(scan) => {
                     let anchors = scan.relation_anchors();
                     if !anchors.is_empty() {
+                        let independent = scan.has_independent_archive();
                         for mut anchor in anchors {
                             anchor.path = table.summary(index)?.0;
-                            let retain_scan =
-                                anchor.needs_password || scan.has_independent_archive();
+                            let retain_scan = anchor.needs_password || independent;
                             self.pending_volumes.push(PendingEmbeddedVolume {
                                 index,
                                 anchor,
@@ -498,7 +500,9 @@ impl NativeEmbeddedBatch {
             }
             Ok(matched)
         })?;
-        let mut fallback = Vec::new();
+        // Own one scan reference and one sparse resolution table per physical
+        // carrier. Project its hits/candidates only after every head is resolved.
+        let mut fallback_scans = BTreeMap::new();
         let mut anchors = Vec::new();
         let mut projected = HashSet::new();
         let mut path_counts = HashMap::new();
@@ -516,34 +520,28 @@ impl NativeEmbeddedBatch {
                     self.excluded.insert(key.clone());
                 }
                 if let Some(scan) = item.scan {
-                    let raw = if let Some(end) = anchor.expected_logical_size {
-                        scan.resolved_rar_dict(
-                            py,
-                            anchor.structure_offset.unwrap_or(0),
-                            end,
-                            matched.get(&match_key).map(String::as_str),
-                        )?
-                    } else {
-                        let raw =
-                            scan.standalone_rar_dict(py, anchor.structure_offset.unwrap_or(0))?;
-                        let verdict = PyDict::new(py);
-                        verdict.set_item(
-                            "status",
-                            if matched.contains_key(&match_key)
-                                || anchor.evidence.contains(&"rar:password_matched_incomplete")
-                            {
-                                "truncated"
-                            } else if anchor.wrong_password {
-                                "wrong_password"
-                            } else {
-                                "password_required"
-                            },
-                        )?;
-                        verdict.set_item("failed_offset", anchor.structure_offset)?;
-                        raw.bind(py).set_item("rar_boundary", verdict)?;
-                        raw
-                    };
-                    fallback.push((item.index, 0, Some(raw)));
+                    let failure_reason = anchor.expected_logical_size.is_none().then(|| {
+                        if matched.contains_key(&match_key)
+                            || anchor.evidence.contains(&"rar:password_matched_incomplete")
+                        {
+                            "embedded_truncated"
+                        } else if anchor.wrong_password {
+                            "embedded_wrong_password"
+                        } else {
+                            "embedded_password_required"
+                        }
+                    });
+                    let (_, resolutions) = fallback_scans
+                        .entry(item.index)
+                        .or_insert_with(|| (scan, HashMap::new()));
+                    resolutions.insert(
+                        anchor.structure_offset.unwrap_or(0),
+                        RarInputResolution {
+                            end_offset: anchor.expected_logical_size,
+                            password: matched.get(&match_key).map(String::as_str),
+                            failure_reason,
+                        },
+                    );
                 }
                 continue;
             }
@@ -553,11 +551,23 @@ impl NativeEmbeddedBatch {
             // sharing this carrier under the existing multi-segment task.
             if let Some(scan) = item
                 .scan
-                .filter(|scan| scan.has_independent_archive() && projected.insert(item.index))
+                .filter(|scan| projected.insert(item.index) && scan.has_independent_archive())
             {
-                fallback.push((item.index, 0, Some(scan.to_py_dict(py)?)));
+                fallback_scans
+                    .entry(item.index)
+                    .or_insert_with(|| (scan, HashMap::new()));
             }
         }
+        let mut fallback = fallback_scans
+            .into_iter()
+            .map(|(index, (scan, resolutions))| {
+                Ok((
+                    index,
+                    0,
+                    Some(scan.to_py_dict_with_rar_resolutions(py, &resolutions)?),
+                ))
+            })
+            .collect::<PyResult<Vec<_>>>()?;
         if anchors.is_empty() {
             return Ok(fallback);
         }

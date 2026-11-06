@@ -111,6 +111,54 @@ def test_carrier_anchor_rejoins_native_volumes_and_missing_parts_can_arrive(tmp_
 
 
 @pytest.mark.parametrize("rar4", [False, True])
+def test_multiple_encrypted_standalone_inputs_share_one_scan_projection(tmp_path, monkeypatch, rar4):
+    # The existing standalone and split cases have only one encrypted head.
+    # This catches duplicate carrier projection/re-probing and loss of a
+    # sibling's independent password blocker with two tiny real archives.
+    from sunpack.pipeline.discovery.embedded.discovery import EmbeddedDiscovery
+    from sunpack.pipeline.discovery.embedded import discovery as embedded_module
+
+    secrets = ["first-private-input", "second-private-input"]
+    payloads = [create_encrypted_rar_archive(
+        tmp_path, f"private-{index}", password=secret, rar4=rar4,
+        header_encrypt=True, payload_size=4 * 1024,
+    ).entry_path.read_bytes() for index, secret in enumerate(secrets)]
+    source = tmp_path / "source"
+    source.mkdir()
+    carrier = source / "shared.opaque"
+    carrier.write_bytes(b"prefix" * 19 + payloads[0] + b"gap" * 23
+                        + payloads[1] + b"gap" * 17 + _sibling_zip())
+    projections = []
+    discover_into = EmbeddedDiscovery._discover_into
+
+    def record(self, result, candidate, *args, **kwargs):
+        projections.append(candidate.entry_path)
+        return discover_into(self, result, candidate, *args, **kwargs)
+
+    monkeypatch.setattr(EmbeddedDiscovery, "_discover_into", record)
+    if not rar4:
+        monkeypatch.setattr(embedded_module, "resolve_encrypted_rar_boundaries",
+                            lambda *args: pytest.fail("already-resolved native headers were probed again"))
+    for known in ([], secrets[:1], secrets):
+        projections.clear()
+        config = make_config({"embedded_scan": {"enabled": True}})
+        config["password_snapshot"] = write_password_json(tmp_path / "passwords.json", scopes=[
+            (secret, [str(source)]) for secret in known
+        ])
+        found = ArchiveTaskProvider(config).discover_targets([str(carrier)])
+        assert projections == [str(carrier)]
+        assert len(found.tasks) == 1
+        nodes = found.tasks[0].inputs
+        assert len(nodes) == 3 and len({node.input_id for node in nodes}) == 3
+        for index, node in enumerate(nodes[:2]):
+            if index < len(known):
+                assert node.failure is None and node.password == secrets[index]
+            else:
+                assert node.failure.kind == (FailureKind.WRONG_PASSWORD if known else FailureKind.PASSWORD_REQUIRED)
+        assert nodes[2].failure is None
+
+
+@pytest.mark.parametrize("rar4", [False, True])
 def test_encrypted_standalone_carrier_keeps_boundary_and_password_failures(tmp_path, rar4):
     """Split fixtures cannot catch an encrypted standalone RAR entering Relations.
     This also distinguishes missing passwords, wrong passwords and a decrypted
