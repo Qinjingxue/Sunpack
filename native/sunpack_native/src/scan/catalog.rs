@@ -13,7 +13,7 @@ const HAS_SIZE: u8 = 2;
 const HAS_MTIME: u8 = 4;
 const TRANSIENT: u8 = 8;
 
-#[derive(Clone)]
+#[derive(Clone, Eq, PartialEq)]
 enum FileId {
     Ntfs { bytes: [u8; 16], len: u8 },
     Other(Box<str>),
@@ -93,11 +93,11 @@ impl NativeWatchObservation {
 }
 
 impl NativeWatchObservation {
-    pub fn new(size: u64, mtime: f64, file_id: &str, change_usn: i64) -> Self {
+    fn new(size: u64, mtime: f64, file_id: FileId, change_usn: i64) -> Self {
         Self {
             size,
             mtime,
-            file_id: FileId::new(file_id),
+            file_id,
             change_usn,
             quiet_seconds: 0.0,
             cadence_seconds: 0.0,
@@ -105,10 +105,10 @@ impl NativeWatchObservation {
             last_content_event_at: None,
         }
     }
-    pub fn update(&mut self, size: u64, mtime: f64, file_id: &str, change_usn: i64) {
+    fn update(&mut self, size: u64, mtime: f64, file_id: FileId, change_usn: i64) {
         self.size = size;
         self.mtime = mtime;
-        self.file_id = FileId::new(file_id);
+        self.file_id = file_id;
         self.change_usn = change_usn;
     }
 }
@@ -132,11 +132,12 @@ impl CatalogRow {
         change_usn: i64,
         phase_boundary: bool,
     ) {
+        let file_id = FileId::new(file_id);
         let unchanged = self.observation.as_ref().is_some_and(|old| {
             old.size == size
                 && old.mtime == mtime
                 && old.change_usn == change_usn
-                && old.file_id.text() == file_id
+                && old.file_id == file_id
         });
         if !unchanged {
             self.cheap_anchor = None;

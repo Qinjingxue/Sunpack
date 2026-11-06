@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import gc
+import weakref
+
+import pytest
 
 from watchdog.events import FileCreatedEvent, FileDeletedEvent, FileModifiedEvent, FileMovedEvent
 
@@ -31,6 +35,81 @@ class FakeObserver:
         self.join_timeout = timeout
 
 
+@pytest.mark.parametrize("started", [False, True])
+def test_stopped_config_observer_releases_owners_without_cyclic_gc(tmp_path, started):
+    # Event-delivery tests miss callback retention and owner/handler cycles.
+    # One idle listener checks both lifetimes without timing or RSS sampling.
+    class Owner:
+        def changed(self):
+            pass
+
+    async def scenario():
+        owner = Owner()
+        observer = ConfigFileObserver(
+            tmp_path, ("config.json",), owner.changed,
+            observer_factory=FakeObserver, loop=asyncio.get_running_loop(),
+        )
+        if started:
+            observer.start()
+        owner_ref = weakref.ref(owner)
+        del owner
+        observer.stop()
+        assert owner_ref() is None
+        handler = observer._handler
+        observer_ref = weakref.ref(observer)
+        del observer
+        assert observer_ref() is None
+        # A saved handler must also be harmless after its listener has gone.
+        handler.dispatch(FileModifiedEvent(str(tmp_path / "config.json")))
+
+    enabled = gc.isenabled()
+    gc.disable()
+    try:
+        asyncio.run(scenario())
+    finally:
+        if enabled:
+            gc.enable()
+
+
+def test_config_observer_failed_start_stops_already_started_emitters(tmp_path, monkeypatch):
+    # A dispatcher that never starts can still own earlier native listeners.
+    # Normal shutdown tests cannot exercise this partial-start resource leak.
+    from sunpack.runtime.watch.config_observer import _ConfigEmitter
+    from sunpack_native import native_resource_snapshot
+
+    directories = [tmp_path / name for name in ("first", "second")]
+    for directory in directories:
+        directory.mkdir()
+    original = _ConfigEmitter.on_thread_start
+    starts = 0
+
+    def start(emitter):
+        nonlocal starts
+        starts += 1
+        if starts == 2:
+            raise OSError("second config listener failed")
+        original(emitter)
+
+    monkeypatch.setattr(_ConfigEmitter, "on_thread_start", start)
+
+    async def scenario():
+        observer = ConfigFileObserver(
+            directories[0], ("config.json",), lambda: None,
+            additional_files=[(directories[1], ("config.json",), lambda: None)],
+            loop=asyncio.get_running_loop(),
+        )
+        try:
+            with pytest.raises(OSError, match="second config listener failed"):
+                observer.start()
+            assert not observer._observer.emitters
+            assert not list(native_resource_snapshot([str(tmp_path)]))
+        finally:
+            observer._observer.stop()
+            observer.stop()
+
+    asyncio.run(scenario())
+
+
 def test_config_observer_watches_program_directory_non_recursively(tmp_path):
     async def scenario():
         observer = ConfigFileObserver(
@@ -59,10 +138,10 @@ def test_config_observer_filters_files_and_debounces_event_burst(tmp_path):
             observer_factory=FakeObserver, loop=asyncio.get_running_loop(),
         )
         observer.start(); handler = observer._observer.handler
-        handler.on_modified(FileModifiedEvent(str(tmp_path / "unrelated.txt")))
-        handler.on_created(FileCreatedEvent(str(tmp_path / "SUNPACK_CONFIG.JSON")))
-        handler.on_modified(FileModifiedEvent(str(tmp_path / "sunpack_advanced_config.json")))
-        handler.on_deleted(FileDeletedEvent(str(tmp_path / "sunpack_watch_roots.txt")))
+        handler.dispatch(FileModifiedEvent(str(tmp_path / "unrelated.txt")))
+        handler.dispatch(FileCreatedEvent(str(tmp_path / "SUNPACK_CONFIG.JSON")))
+        handler.dispatch(FileModifiedEvent(str(tmp_path / "sunpack_advanced_config.json")))
+        handler.dispatch(FileDeletedEvent(str(tmp_path / "sunpack_watch_roots.txt")))
         await asyncio.wait_for(emitted.wait(), 1.0)
         observer.stop()
         return calls
@@ -77,7 +156,7 @@ def test_config_observer_handles_atomic_replace_destination(tmp_path):
             observer_factory=FakeObserver, loop=asyncio.get_running_loop(),
         )
         observer.start()
-        observer._observer.handler.on_moved(FileMovedEvent(
+        observer._observer.handler.dispatch(FileMovedEvent(
             str(tmp_path / ".sunpack_config.json.tmp"), str(tmp_path / "sunpack_config.json")
         ))
         await asyncio.wait_for(emitted.wait(), 1.0)

@@ -21,7 +21,6 @@ _LOG = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class _ConfigSnapshot:
-    source_key: ConfigSourceKey
     config_path: Path
     raw_payload: dict[str, Any]
     normalized_config: dict[str, Any]
@@ -77,10 +76,7 @@ async def _reload_configuration() -> None:
         while _CONFIG_RELOAD_PENDING:
             _CONFIG_RELOAD_PENDING = False
             from sunpack.runtime.cli.runtime_state import runtime_host
-            from sunpack.runtime.watch.service import service_config_from
             try:
-                config = await asyncio.to_thread(load_config)
-                entries = await asyncio.to_thread(service_config_from, config)
                 host = runtime_host()
                 if host is not None:
                     await host.reload_watch()
@@ -184,7 +180,6 @@ def _snapshot_for(request_cwd: str | Path | None) -> _ConfigSnapshot:
         _observe_config_sources((*_CONFIG_SNAPSHOTS, source_key))
         config_path, raw_payload = load_raw_config_payload(request_cwd)
         snapshot = _ConfigSnapshot(
-            source_key=source_key,
             config_path=config_path,
             raw_payload=copy.deepcopy(raw_payload),
             normalized_config=copy.deepcopy(load_config(request_cwd)),

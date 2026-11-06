@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import threading
 import os
+import weakref
 from pathlib import Path
 from typing import Callable, Iterable
 
@@ -93,7 +94,7 @@ class ConfigFileObserver:
 
     def start(self) -> None:
         with self._lock:
-            if self._started:
+            if self._started or self._stopped:
                 return
             self._started = True
         try:
@@ -101,11 +102,14 @@ class ConfigFileObserver:
                 self._watches[directory] = self._observer.schedule(self._handler, str(directory), recursive=False)
             self._observer.start()
         except Exception:
+            # An earlier emitter may already be running when a later one fails,
+            # even though the dispatcher thread has not started yet.
+            self._observer.stop()
+            if bool(getattr(self._observer, "is_alive", lambda: False)()):
+                self._observer.join()
             with self._lock:
                 self._started = False
-            if bool(getattr(self._observer, "is_alive", lambda: False)()):
-                self._observer.stop()
-                self._observer.join()
+            self.stop()
             raise
 
     def stop(self) -> None:
@@ -114,13 +118,16 @@ class ConfigFileObserver:
             timer = self._timer
             self._timer = None
             self._pending_callbacks.clear()
+            self.callback = None
+            self._base_files.clear()
+            self._files.clear()
+            self._directories.clear()
         if timer is not None:
             timer.cancel()
-        if not self._started:
-            return
-        self._observer.stop()
-        self._observer.join()
-        self._started = False
+        if self._started:
+            self._observer.stop()
+            self._observer.join()
+            self._started = False
         self._watches.clear()
 
     def notify_path_changed(self, path: str) -> None:
@@ -160,25 +167,16 @@ class ConfigFileObserver:
 
 class _ConfigEventHandler(FileSystemEventHandler):
     def __init__(self, owner: ConfigFileObserver) -> None:
-        self.owner = owner
+        self._owner = weakref.ref(owner)
 
-    def on_created(self, event: FileSystemEvent) -> None:
-        self._handle(event)
-
-    def on_modified(self, event: FileSystemEvent) -> None:
-        if event.is_directory:
-            self.owner.notify_directory_changed(event.src_path)
-        else:
-            self._handle(event)
-
-    def on_deleted(self, event: FileSystemEvent) -> None:
-        self._handle(event)
-
-    def on_moved(self, event: FileSystemEvent) -> None:
-        self._handle(event)
-        self.owner.notify_path_changed(str(getattr(event, "dest_path", "") or ""))
-
-    def _handle(self, event: FileSystemEvent) -> None:
-        if getattr(event, "is_directory", False):
+    def on_any_event(self, event: FileSystemEvent) -> None:
+        owner = self._owner()
+        if owner is None:
             return
-        self.owner.notify_path_changed(str(getattr(event, "src_path", "") or ""))
+        if event.is_directory:
+            if event.event_type == "modified":
+                owner.notify_directory_changed(event.src_path)
+        elif event.event_type in {"created", "modified", "deleted", "moved"}:
+            owner.notify_path_changed(str(event.src_path))
+            if event.event_type == "moved":
+                owner.notify_path_changed(str(event.dest_path))
