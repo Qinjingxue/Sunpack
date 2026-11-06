@@ -123,19 +123,18 @@ def run(name, archive, hint, jobs, *, limit=768, dynamic=False, password=False, 
         peak=max(rows,key=lambda r:r['unmanaged'],default={'unmanaged':0})
         output_checks = []
         if not dry:
-            from sunpack_native import compute_directory_crc_manifest
+            from tests.helpers.native_fixture import file_inventory
             for index in range(jobs):
                 result = next(e for e in results if e['job_id'] == str(index))
-                manifest = compute_directory_crc_manifest(str(OUT / 'outputs' / label / str(index)), result['files_written'])
-                assert manifest['status'] == 'ok' and not manifest['truncated'], manifest
-                assert manifest['total_files'] == result['files_written'], manifest
+                manifest = file_inventory(OUT / 'outputs' / label / str(index))
+                assert len(manifest) == result['files_written'], manifest
                 expected = sorted((r[3], r[6]) for e in events if e.get('type') == 'manifest_chunk'
                     and e.get('job_id') == str(index) for r in e['rows'] if r[5])
-                actual = sorted((r['size'], r['crc32']) for r in manifest['files'])
+                actual = sorted((r['size'], r['crc32']) for r in manifest.values())
                 if len(expected) == len(actual): assert expected == actual, (expected, actual)
                 reference = workloads[index % len(workloads)].get('expected') if workloads else expected_output
                 if reference is not None: assert sorted(map(tuple, reference)) == actual, (reference, actual)
-                output_checks.append({'files':manifest['total_files'], 'crc_checked': reference is not None or len(expected) == len(actual)})
+                output_checks.append({'files':len(manifest), 'crc_checked': reference is not None or len(expected) == len(actual)})
         recovery_tick = next((e['_tick'] for e in events if e.get('event') == 'memory_reclaimed'), None)
         recovery = [r for r in rows if recovery_tick is not None and r['tick'] >= recovery_tick]
         recovery_baseline = next((r['unmanaged'] for r in reversed(rows)

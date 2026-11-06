@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 from sunpack_native import (
-    NativeWorkerResultAccumulator, compute_directory_crc_manifest,
+    NativeWorkerResultAccumulator,
     inspect_compression_stream_identity, parse_worker_transport_event,
 )
 from sunpack.core.analysis.engine import AnalysisEngine
@@ -20,14 +20,13 @@ from sunpack.pipeline.verification.evidence import build_verification_evidence
 from sunpack.pipeline.verification.methods.archive_test_crc import ArchiveTestCrcMethod
 from tests.helpers.archive_tasks import make_archive_task
 from tests.helpers.native_build import sevenzip_artifact
+from tests.helpers.native_fixture import file_inventory
 
 ROOT = Path(__file__).resolve().parents[2]
 
 
 def fingerprints(path):
-    manifest = compute_directory_crc_manifest(str(path), 100)
-    assert manifest["status"] == "ok" and not manifest.get("truncated"), manifest
-    return {(row["size"], row["crc32"]) for row in manifest["files"]}
+    return sorted((row["size"], row["crc32"]) for row in file_inventory(path).values())
 
 
 @pytest.fixture(scope="module")

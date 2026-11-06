@@ -247,7 +247,10 @@ class WindowsTrayIcon:
             self._ready.wait()
             if self._startup_error is not None:
                 self._thread.join()
-                raise self._startup_error
+                error = self._startup_error
+                self._startup_error = None
+                self._thread = None
+                raise error
             if not self._hwnd:
                 raise RuntimeError("Tray window exited before startup completed.")
 
@@ -291,7 +294,10 @@ class WindowsTrayIcon:
                 self.user32.TranslateMessage(ctypes.byref(msg))
                 self.user32.DispatchMessageW(ctypes.byref(msg))
         except BaseException as exc:
-            self._startup_error = exc
+            # Only startup has a waiting consumer. Runtime failures are logged;
+            # retaining their traceback would pin its locals for the service's life.
+            if not self._ready.is_set():
+                self._startup_error = exc
             self._log_callback_error(exc, None)
         finally:
             self._ready.set()

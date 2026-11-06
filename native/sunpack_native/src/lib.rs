@@ -249,10 +249,6 @@ fn sunpack_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        verification::file_crc::compute_directory_crc_manifest,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
         verification::stream_receipt::verify_stream_receipt,
         m
     )?)?;

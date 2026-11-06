@@ -1,5 +1,7 @@
 import ctypes
+import gc
 import threading
+import weakref
 from types import SimpleNamespace
 
 import pytest
@@ -118,6 +120,7 @@ def test_window_startup_failure_publishes_completion_and_windows_error(kind, mon
         owner._create_window = fail
         with pytest.raises(OSError, match="window creation denied"):
             owner.start()
+        assert owner._startup_error is None
         owner.stop()
     else:
         owner = ClipboardPasswordMonitor()
@@ -126,3 +129,41 @@ def test_window_startup_failure_publishes_completion_and_windows_error(kind, mon
         with pytest.raises(OSError, match="window creation denied"):
             owner.stop()
     assert owner._thread is None and owner._ready.is_set()
+
+
+def test_tray_runtime_failure_releases_traceback_while_owner_is_retained():
+    # Startup/shutdown tests never fail inside GetMessage after start returns.
+    # Retain the tray as the watch service does, and check that the failure's
+    # local objects are released without requiring another start or stop.
+    fail_allowed = threading.Event()
+    retained = []
+    logged = []
+
+    class Payload:
+        pass
+
+    def fail(*_):
+        fail_allowed.wait()
+        payload = Payload()
+        retained.append(weakref.ref(payload))
+        raise OSError(5, "message loop failed")
+
+    owner = WindowsTrayIcon(SimpleNamespace(config={}, log=None))
+    owner.user32 = SimpleNamespace(GetMessageW=fail, IsWindow=lambda _: False)
+    owner._create_window = lambda: 123
+    owner._allow_taskbar_created_message = lambda _: None
+    owner._ensure_icon = lambda _: None
+    owner._log_callback_error = lambda error, _: logged.append(str(error))
+    owner.start()
+    thread = owner._thread
+    try:
+        fail_allowed.set()
+        thread.join(5)
+        assert not thread.is_alive()
+        gc.collect()
+        assert logged and "message loop failed" in logged[0]
+        assert len(retained) == 1 and retained[0]() is None
+        assert owner._hwnd is None
+    finally:
+        fail_allowed.set()
+        owner.stop()
