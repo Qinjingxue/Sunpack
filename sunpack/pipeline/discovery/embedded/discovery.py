@@ -22,7 +22,6 @@ from sunpack.core.contracts.discovery import (
     discovery_failure,
 )
 from sunpack.core.contracts.tasks import ArchiveTask
-from sunpack.core.contracts.failures import FailureInfo
 from sunpack.core.contracts.input_plan import LogicalArchiveInput
 from sunpack.core.analysis.embedded import (
     resolve_encrypted_rar_boundaries,
@@ -407,13 +406,10 @@ class EmbeddedDiscovery:
                 password_required=embedded_candidate_requires_password(item["format"], item["validation"]),
                 execution_analysis={"stream_plan": item["stream_plan"]} if item.get("stream_plan") else None,
             )
-            evidence = item
-            if item["offset"] in pending_failures:
-                failure = discovery_failure("embedded", pending_failures[item["offset"]], path)
-                evidence = {**item, "discovery_failure": failure.to_dict()}
             segments.append(LogicalArchiveInput(
-                descriptor, position=len(segments) + 1, evidence=evidence,
-                failure=FailureInfo.from_dict(evidence.get("discovery_failure")),
+                descriptor, position=len(segments) + 1,
+                failure=(discovery_failure("embedded", pending_failures[item["offset"]], path)
+                         if item["offset"] in pending_failures else None),
                 password=password_by_offset.get(item["offset"]),
             ))
 

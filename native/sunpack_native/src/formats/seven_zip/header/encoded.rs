@@ -648,6 +648,22 @@ fn seven_zip_kdf_cache(
     CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::VecDeque::new()))
 }
 
+pub(crate) fn seven_zip_kdf_cache_entries() -> usize {
+    seven_zip_kdf_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .len()
+}
+
+pub(crate) fn clear_seven_zip_kdf_cache() -> usize {
+    // Idle cleanup owns the same boundary as reader/password-context cleanup.
+    // Drop entries and their backing allocation outside the cache lock.
+    let entries = std::mem::take(&mut *seven_zip_kdf_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()));
+    entries.len()
+}
+
 fn cached_seven_zip_aes_key(cycles: u32, salt: &[u8], password: &[u8]) -> Result<[u8; 32], String> {
     check_password_cancellation()?;
     if std::env::var_os("SUNPACK_DISABLE_7Z_KDF_CACHE").is_some() {
@@ -681,9 +697,7 @@ fn cached_seven_zip_aes_key(cycles: u32, salt: &[u8], password: &[u8]) -> Result
         return Ok(cached_key);
     }
     if cache.len() >= SEVEN_ZIP_KDF_CACHE_CAPACITY {
-        if let Some(mut evicted) = cache.pop_back() {
-            evicted.wipe();
-        }
+        cache.pop_back();
     }
     let parameters = SevenZipKdfCacheParameters {
         cycles,

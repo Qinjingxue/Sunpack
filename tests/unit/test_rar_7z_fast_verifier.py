@@ -526,6 +526,9 @@ def test_seven_zip_fast_verifier_matches_unicode_password_across_header_coders(
 
 
 def test_seven_zip_fast_verifier_uses_same_probe_for_embedded_range(tmp_path):
+    from sunpack_native import reader_cache_stats
+    from sunpack.core.support.runtime_cache_cleanup import clear_all_runtime_caches
+
     password = "range-secret"
     archive = _create_encrypted_header_7z(tmp_path, password, "5")
     prefix = b"carrier-prefix" * 37
@@ -552,3 +555,15 @@ def test_seven_zip_fast_verifier_uses_same_probe_for_embedded_range(tmp_path):
     assert outcome.ok is True
     assert outcome.matched_index == 1
     assert outcome.attempts == 2
+
+    # One-shot password checks cannot detect process caches omitted from idle
+    # cleanup. Reuse this real encrypted carrier to check release and reopening.
+    assert reader_cache_stats()["seven_zip_kdf_cache_entries"] > 0
+    cleared = clear_all_runtime_caches()
+    assert not cleared["errors"]
+    assert cleared["archive_sessions"]["reader"]["seven_zip_kdf_entries"] > 0
+    assert reader_cache_stats()["seven_zip_kdf_cache_entries"] == 0
+    reopened = SevenZipFastVerifier().verify_batch(
+        str(carrier), ["wrong", password], archive_input=archive_input,
+    )
+    assert reopened.ok and reopened.matched_index == 1

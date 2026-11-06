@@ -24,13 +24,7 @@ def _segment(path: str, archive_format: str, start: int, end: int, name: str):
         ],
         analysis={"segment_confidence": 1.0, "segment_source": "embedded"},
     )
-    evidence = {
-        "format": archive_format,
-        "offset": start,
-        "end_offset": end,
-        "confidence": 1.0,
-    }
-    return descriptor, evidence
+    return descriptor
 
 
 def test_scan_report_preserves_blocked_findings_without_creating_tasks(monkeypatch):
@@ -65,9 +59,9 @@ def test_scan_report_projects_multiple_embedded_findings_from_one_task(monkeypat
     first = _segment(path, "zip", 16, 64, "carrier")
     second = _segment(path, "7z", 96, 160, "carrier")
     task = ArchiveTask.from_archive_input(
-        first[0],
+        first,
         discovery_source="embedded",
-        logical_inputs=tuple(LogicalArchiveInput(descriptor, position=i, evidence=evidence) for i, (descriptor, evidence) in enumerate((first, second), 1)),
+        logical_inputs=tuple(LogicalArchiveInput(descriptor, position=i) for i, descriptor in enumerate((first, second), 1)),
     )
     orchestrator = ScanOrchestrator({})
     monkeypatch.setattr(

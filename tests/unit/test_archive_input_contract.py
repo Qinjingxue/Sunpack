@@ -71,18 +71,17 @@ def test_archive_task_accepts_paired_discovery_segments():
         ],
         analysis={"segment_confidence": 0.95},
     )
-    evidence = {"confidence": 0.95, "validation": "embedded"}
 
     task = ArchiveTask.from_archive_input(
         descriptor,
         discovery_source="embedded",
-        logical_inputs=(LogicalArchiveInput(descriptor, evidence=evidence),),
+        logical_inputs=(LogicalArchiveInput(descriptor),),
     )
 
     segments = [node.projection() for node in task.inputs]
     assert len(segments) == 1
     assert segments[0]["archive_input"]["parts"][0]["start"] == 128
-    assert task.inputs[0].evidence == evidence
+    assert segments[0]["confidence"] == 0.95
 
 
 def test_path_mapping_moves_each_input_once_and_preserves_the_shared_plan(tmp_path):

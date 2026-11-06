@@ -1,6 +1,6 @@
 import threading
 from contextlib import nullcontext
-from dataclasses import asdict, replace
+from dataclasses import replace
 from typing import Any, Callable
 from sunpack_native import archive_input_slice
 
@@ -134,40 +134,18 @@ class ArchiveInputPlanningStage:
     def _tasks_from_report(self, task: ArchiveTask, report: ArchiveAnalysisReport, *, phase_timer: Callable[..., Any] | None = None, phase_prefix: str = "input_planning") -> list[ArchiveTask]:
         with _phase(phase_timer, f"{phase_prefix}_extractable_segments"):
             candidates = self._extractable_segments(report)
-        with _phase(phase_timer, f"{phase_prefix}_write_segments_build_payload"):
-            segment_payloads = self._extractable_segment_payloads(task, candidates)
-        selected_segment = None
         if not candidates:
             password_candidate = self._password_required_embedded_segment(report)
             if password_candidate is not None:
-                evidence, segment, index = password_candidate
-                selected_segment = (evidence, segment, index)
-                with _phase(phase_timer, f"{phase_prefix}_write_segments_build_payload"):
-                    segment_payloads = self._extractable_segment_payloads(task, [(evidence, segment, index)])
-            with _phase(phase_timer, f"{phase_prefix}_batched_write"):
-                password_probe_input = (
-                    self._password_probe_input_for_segment(task, *selected_segment[:2], segment_payloads)
-                    if selected_segment is not None
-                    else self._structured_volume_source(task)
-                )
-                _write_plan_knowledge(
-                    task,
-                    report,
-                    segment_payloads,
-                    selected_segment,
-                    password_probe_input,
-                )
-            with _phase(phase_timer, f"{phase_prefix}_state_update"):
-                self._record_planning_input(task, report, phase_timer=phase_timer, phase_prefix=phase_prefix)
-            return [task]
-        evidence, segment, index = candidates[0]
-        selected_segment = (evidence, segment, index)
+                candidates = [password_candidate]
+        selected_segment = candidates[0] if candidates else None
+        with _phase(phase_timer, f"{phase_prefix}_write_segments_build_payload"):
+            segment_payloads = self._extractable_segment_payloads(task, candidates)
         with _phase(phase_timer, f"{phase_prefix}_batched_write"):
-            password_probe_input = self._password_probe_input_for_segment(
-                task,
-                evidence,
-                segment,
-                segment_payloads,
+            password_probe_input = (
+                self._password_probe_input_for_segment(task, *selected_segment, segment_payloads)
+                if selected_segment is not None
+                else self._structured_volume_source(task)
             )
             _write_plan_knowledge(
                 task,
@@ -248,8 +226,7 @@ class ArchiveInputPlanningStage:
             archive_input = self._archive_input_for_segment(task, evidence, segment)
             if archive_input is None:
                 continue
-            segment_payload = self._segment_payload(task, evidence, segment)
-            payloads.append(LogicalArchiveInput(archive_input, position=index, evidence=segment_payload))
+            payloads.append(LogicalArchiveInput(archive_input, position=index))
         return payloads
 
     @staticmethod
@@ -260,16 +237,6 @@ class ArchiveInputPlanningStage:
             return None
         evidence, segment = report.password_segment
         return evidence, segment, 0
-
-    def _segment_payload(self, task: ArchiveTask, evidence: ArchiveFormatEvidence, segment: ArchiveSegment) -> dict:
-        payload = asdict(segment)
-        payload.update({
-            "format": evidence.format,
-            "format_hint": evidence.format,
-            "path": task.main_path,
-        })
-        payload.update(_stream_execution_analysis(evidence, segment.start_offset))
-        return payload
 
     def _archive_input_for_segment(
         self,
@@ -298,10 +265,12 @@ class ArchiveInputPlanningStage:
 
     def _password_probe_input_for_segment(
         self, task: ArchiveTask, evidence: ArchiveFormatEvidence, segment: ArchiveSegment,
+        position: int,
         inputs: list[LogicalArchiveInput],
     ) -> ArchiveInputDescriptor | None:
         for node in inputs:
-            if node.evidence.get("start_offset") == segment.start_offset:
+            # The plan position survives mapping logical offsets across volumes.
+            if node.position == position:
                 return node.descriptor
         projected = archive_input_slice(task.archive_input().to_dict(), evidence.format,
                                         int(segment.start_offset), segment.end_offset, probe=True)

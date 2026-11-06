@@ -13,7 +13,7 @@ from sunpack.core.contracts.input_plan import LogicalArchiveInput
 
 def set_inputs(task, segments):
     task.set_inputs(tuple(LogicalArchiveInput(ArchiveInputDescriptor.from_dict(row["archive_input"]),
-                                            position=index, evidence=row.get("segment") or {})
+                                            position=index)
                           for index, row in enumerate(segments, start=1)))
 
 from sunpack.pipeline.extraction.internal.sevenzip.metadata import (

@@ -2343,6 +2343,10 @@ pub(crate) fn reader_cache_stats(py: Python<'_>) -> PyResult<Py<PyDict>> {
         "relation_regex_cache_entries",
         crate::relations::regex_cache_entries(),
     )?;
+    dict.set_item(
+        "seven_zip_kdf_cache_entries",
+        crate::formats::seven_zip::seven_zip_kdf_cache_entries(),
+    )?;
     Ok(dict.unbind())
 }
 
@@ -2351,12 +2355,14 @@ pub(crate) fn clear_reader_resources(py: Python<'_>) -> PyResult<Py<PyDict>> {
     let relation_regexes = crate::relations::clear_regex_caches();
     crate::password::context::clear();
     crate::analysis_native::clear_stream_structure_cache();
+    let seven_zip_kdf_entries = crate::formats::seven_zip::clear_seven_zip_kdf_cache();
     let (handles, cache_entries, cache_bytes) = manager().clear_resources()?;
     let dict = PyDict::new(py);
     dict.set_item("handles", handles)?;
     dict.set_item("cache_entries", cache_entries)?;
     dict.set_item("cache_bytes", cache_bytes)?;
     dict.set_item("relation_regexes", relation_regexes)?;
+    dict.set_item("seven_zip_kdf_entries", seven_zip_kdf_entries)?;
     Ok(dict.unbind())
 }
 

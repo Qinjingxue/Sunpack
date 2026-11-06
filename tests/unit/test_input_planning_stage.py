@@ -185,7 +185,9 @@ def test_input_planning_stage_maps_split_logical_segment_to_concat_ranges(tmp_pa
         format="7z",
         confidence=0.97,
         status="extractable",
-        segments=[ArchiveSegment(start_offset=8, end_offset=24, confidence=0.97)],
+        # Logical offset 18 maps to physical offset 8 in the second volume.
+        # Probe reuse must follow the plan identity, not compare these offsets.
+        segments=[ArchiveSegment(start_offset=18, end_offset=24, confidence=0.97)],
     )
     task = _task(part1, parts=[part1, part2, part3], volumes=volumes)
     stage = ArchiveInputPlanningStage({"input_planning": {"enabled": False}})
@@ -203,13 +205,13 @@ def test_input_planning_stage_maps_split_logical_segment_to_concat_ranges(tmp_pa
         "format_hint": "7z",
         "logical_name": "case",
         "ranges": [
-            {"path": str(part1), "start": 8, "end": 10},
-            {"path": str(part2), "start": 0, "end": 10},
+            {"path": str(part2), "start": 8, "end": 10},
             {"path": str(part3), "start": 0, "end": 4},
         ],
         "analysis": {"status": "extractable", "confidence": 0.97, "damage_flags": []},
     }
     assert task.archive_input().open_mode == "native_volumes"
+    assert task.password_probe_input is task.inputs[0].descriptor
 
 
 def test_input_planning_stage_plans_real_carrier_segments_in_offset_order(tmp_path):

@@ -23,7 +23,6 @@ class LogicalArchiveInput:
     descriptor: ArchiveInputDescriptor
     input_id: str = ""
     position: int = 1
-    evidence: dict[str, Any] = field(default_factory=dict, compare=False)
     failure: FailureInfo | None = None
     password: str | None = field(default=None, repr=False, compare=False)
 
@@ -62,7 +61,7 @@ class LogicalArchiveInput:
             "logical_name": descriptor.logical_name,
             "start_offset": extent.start if extent else 0,
             "end_offset": extent.end if extent else None,
-            "confidence": descriptor.analysis.get("segment_confidence", self.evidence.get("confidence", 0.0)),
+            "confidence": descriptor.analysis.get("segment_confidence", 0.0),
             "damage_flags": descriptor.analysis.get("damage_flags", ()),
             "archive_input": descriptor.to_dict(),
         }
