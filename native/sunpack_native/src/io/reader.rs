@@ -72,7 +72,10 @@ impl CachedSlice {
     }
 
     fn retained_bytes(&self) -> usize {
-        self.data.len()
+        match &self.data {
+            CachedBacking::Shared(data) => data.len(),
+            CachedBacking::Owned(data) => data.capacity(),
+        }
     }
 
     fn slice(&self, start: usize, len: usize) -> Self {
@@ -970,11 +973,7 @@ impl ReaderInner {
             self.cache_size = self.cache_size.saturating_sub(old.retained_bytes());
             self.order.retain(|existing| *existing != key);
         }
-        self.cache_size += self
-            .cache
-            .get(&key)
-            .map(CachedSlice::retained_bytes)
-            .unwrap_or(0);
+        self.cache_size += retained;
         self.order.push_back(key);
         while self.cache_size > capacity {
             let Some(old_key) = self.order.pop_front() else {

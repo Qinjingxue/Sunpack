@@ -52,8 +52,8 @@ impl Drop for BrokerConnection {
 }
 
 impl BrokerConnection {
-    fn transact(&mut self, request: Request) -> io::Result<Response> {
-        let (response, payload) = self.transact_payload(request)?;
+    fn transact(&mut self, request: &Request) -> io::Result<Response> {
+        let (response, payload) = self.transact_query(request, &[])?;
         if !payload.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -63,12 +63,9 @@ impl BrokerConnection {
         Ok(response)
     }
 
-    fn transact_payload(&mut self, request: Request) -> io::Result<(Response, Vec<u8>)> {
-        self.transact_query(request, &[])
-    }
     fn transact_query(
         &mut self,
-        request: Request,
+        request: &Request,
         query: &[u8],
     ) -> io::Result<(Response, Vec<u8>)> {
         let request_id = request.request_id;
@@ -142,7 +139,7 @@ pub fn broker_release() -> io::Result<()> {
         return Ok(());
     }
     if let Some(mut connection) = state.connection.take() {
-        let _ = connection.transact(Request::simple(Opcode::Release, next_request_id()));
+        let _ = connection.transact(&Request::simple(Opcode::Release, next_request_id()));
     }
     Ok(())
 }
@@ -257,6 +254,10 @@ pub fn broker_for_each_directory_change(
     let result = (|| {
         let connection = state.connection.as_mut().unwrap();
         let batch_ids = (crate::protocol::MAX_DIRECTORY_QUERY_BYTES - 8) / 16;
+        // Only the ID and cursor change between pages of this logical query.
+        let mut request = Request::simple(Opcode::ReadDirectoriesChanges, 0);
+        request.volume_guid = volume.to_owned();
+        request.current_usn = end;
         for (batch, ids) in directories.chunks(batch_ids).enumerate() {
             let mut query = Vec::with_capacity(8 + ids.len() * 16);
             query.extend_from_slice(&journal.to_le_bytes());
@@ -265,12 +266,9 @@ pub fn broker_for_each_directory_change(
             }
             let mut cursor = start;
             while cursor < end {
-                let mut request =
-                    Request::simple(Opcode::ReadDirectoriesChanges, next_request_id());
-                request.volume_guid = volume.to_owned();
+                request.request_id = next_request_id();
                 request.previous_usn = cursor;
-                request.current_usn = end;
-                let (response, payload) = connection.transact_query(request, &query)?;
+                let (response, payload) = connection.transact_query(&request, &query)?;
                 // A complete business rejection leaves the pipe framing intact.
                 // In particular, journal rollover must not release a live lease.
                 complete_rejection = response.status != Status::Ok;
@@ -338,7 +336,7 @@ fn transact_request(request: Request) -> io::Result<Response> {
         if state.connection.is_none() {
             state.connection = Some(connect_and_hello()?);
         }
-        match state.connection.as_mut().unwrap().transact(request.clone()) {
+        match state.connection.as_mut().unwrap().transact(&request) {
             Ok(response) => return Ok(response),
             Err(error) => {
                 state.connection.take();
@@ -381,7 +379,7 @@ fn connect_and_hello() -> io::Result<BrokerConnection> {
             }
             Err(error) => return Err(error),
         };
-        match connection.transact(Request::simple(Opcode::Hello, next_request_id())) {
+        match connection.transact(&Request::simple(Opcode::Hello, next_request_id())) {
             Ok(response) => {
                 // Protocol errors and explicit broker rejection are terminal.
                 ensure_ok(response)?;

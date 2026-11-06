@@ -443,6 +443,7 @@ impl StateData {
                     ..
                 } = change
                 {
+                    let output_key = path_key(output);
                     let retired: Vec<_> = self
                         .runtime
                         .range("flatten|".to_owned()..)
@@ -454,7 +455,7 @@ impl StateData {
                                 && ["root", "work"].iter().any(|field| {
                                     record[*field]
                                         .as_str()
-                                        .is_some_and(|p| path_key(p) == path_key(output))
+                                        .is_some_and(|p| path_key(p) == output_key)
                                 })
                         })
                         .map(|(runtime_key, _)| runtime_key.clone())

@@ -63,7 +63,7 @@ impl ProgressFile {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Copy, Default)]
 struct Summary {
     complete: usize,
     partial: usize,
@@ -229,7 +229,12 @@ impl NativeProgressManifest {
                 });
             }
         }
-        let summary = Summary::of(files);
+        // Summary-only manifests intentionally have no per-file outcomes.
+        let summary = if files.is_empty() {
+            Summary::default()
+        } else {
+            self.document.summary
+        };
         let file_coverage = matched_files as f64 / files.len().max(1) as f64;
         let byte_coverage = if expected_bytes > 0 {
             matched_bytes as f64 / expected_bytes as f64
@@ -255,7 +260,12 @@ impl NativeProgressManifest {
     /// Per-entry status and error-class counts over the recorded files.
     fn entry_outcome_counts<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let files = &self.document.files;
-        let summary = Summary::of(files);
+        // Summary-only manifests intentionally have no per-file outcomes.
+        let summary = if files.is_empty() {
+            Summary::default()
+        } else {
+            self.document.summary
+        };
         let mut crc = 0usize;
         let mut data = 0usize;
         let mut unexpected_end = 0usize;

@@ -2049,10 +2049,13 @@ fn stream_structure_cached<'py>(
         if ready {
             break slot;
         }
-        stream_structure_cache()
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .retain(|(key, current)| *key != identity || !Arc::ptr_eq(current, &slot));
+        {
+            let mut entries = stream_structure_cache()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            entries.retain(|(key, current)| *key != identity || !Arc::ptr_eq(current, &slot));
+            crate::collections::trim_deque(&mut entries);
+        }
         cancellation.check()?;
     };
     cancellation.check()?;
@@ -2074,6 +2077,7 @@ fn stream_structure_cached<'py>(
         };
         entries.remove(index);
     }
+    crate::collections::trim_deque(&mut entries);
     drop(entries);
     match result {
         Ok(value) => Ok(value.clone_ref(py).into_bound(py)),
@@ -2082,12 +2086,13 @@ fn stream_structure_cached<'py>(
 }
 
 pub(crate) fn clear_stream_structure_cache() -> usize {
-    let mut entries = stream_structure_cache()
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
-    let count = entries.len();
-    entries.clear();
-    count
+    // Retire the whole allocation and drop Python results outside the cache lock.
+    let retired = std::mem::take(
+        &mut *stream_structure_cache()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()),
+    );
+    retired.len()
 }
 
 pub(crate) fn release_stream_structure_cache_under_roots(roots: &[PathBuf]) -> usize {
@@ -2096,6 +2101,7 @@ pub(crate) fn release_stream_structure_cache_under_roots(roots: &[PathBuf]) -> u
         .unwrap_or_else(|error| error.into_inner());
     let before = entries.len();
     entries.retain(|(key, _)| !roots.iter().any(|root| key.path.starts_with(root)));
+    crate::collections::trim_deque(&mut entries);
     before - entries.len()
 }
 

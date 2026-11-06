@@ -192,10 +192,11 @@ pub(crate) fn verify_prepared(
             break slot;
         }
         // Do not mark the input generation retired: only this initializer stopped.
-        cache()
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .retain(|(old, current)| *old != key || !Arc::ptr_eq(current, &slot));
+        {
+            let mut entries = cache().lock().unwrap_or_else(|error| error.into_inner());
+            entries.retain(|(old, current)| *old != key || !Arc::ptr_eq(current, &slot));
+            crate::collections::trim_deque(&mut entries);
+        }
         cancellation.check()?;
     };
     cancellation.check()?;
@@ -248,6 +249,7 @@ pub(crate) fn verify_prepared(
                 .map_or(0, PasswordContext::retained_bytes),
         );
     }
+    crate::collections::trim_deque(&mut entries);
     cancellation.check()?;
     result
 }
@@ -259,23 +261,21 @@ fn input_changed() -> PyErr {
 }
 
 pub(crate) fn clear() {
-    retain(
-        &mut cache().lock().unwrap_or_else(|error| error.into_inner()),
-        |_, _| false,
-    );
+    let mut entries = cache().lock().unwrap_or_else(|error| error.into_inner());
+    retain(&mut entries, |_, _| false);
+    crate::collections::trim_deque(&mut entries);
 }
 
 pub(crate) fn release_under_roots(roots: &[PathBuf]) {
-    retain(
-        &mut cache().lock().unwrap_or_else(|error| error.into_inner()),
-        |key, _| {
-            !key.members.iter().any(|member| {
-                roots
-                    .iter()
-                    .any(|root| member.generation.path.starts_with(root))
-            })
-        },
-    );
+    let mut entries = cache().lock().unwrap_or_else(|error| error.into_inner());
+    retain(&mut entries, |key, _| {
+        !key.members.iter().any(|member| {
+            roots
+                .iter()
+                .any(|root| member.generation.path.starts_with(root))
+        })
+    });
+    crate::collections::trim_deque(&mut entries);
 }
 
 fn retire_slot(key: &InputKey, slot: &Arc<PreparedSlot>) {
