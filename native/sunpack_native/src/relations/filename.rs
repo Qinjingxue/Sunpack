@@ -177,8 +177,7 @@ impl NumberChannel {
                 left,
                 right,
             } => features.numbers.iter().find_map(|n| {
-                (n.ordinal == *ordinal && n.left == *left && n.right == *right && n.value > 0)
-                    .then_some(n.value)
+                (n.ordinal == *ordinal && n.left == *left && n.right == *right).then_some(n.value)
             }),
         }
     }

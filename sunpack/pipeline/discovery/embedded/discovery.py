@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import os
 from typing import Any
 
@@ -22,6 +22,8 @@ from sunpack.core.contracts.discovery import (
     discovery_failure,
 )
 from sunpack.core.contracts.tasks import ArchiveTask
+from sunpack.core.contracts.failures import FailureInfo
+from sunpack.core.contracts.input_plan import LogicalArchiveInput
 from sunpack.core.analysis.embedded import (
     resolve_encrypted_rar_boundaries,
     scan_embedded_archives,
@@ -174,6 +176,7 @@ class EmbeddedDiscovery:
             # A directed relation replaces only earlier decisions for its own
             # physical inputs (a continuation may already have been blocked).
             keys = candidate.path_keys
+            shared_inputs = shared_inputs or bool(keys & (result.claimed_paths | result.blocked_paths))
             result.residual_paths.difference_update(keys)
             result.blocked_paths.difference_update(keys)
             reason = candidate.relation_anchor.get("relation_failure_reason")
@@ -219,28 +222,17 @@ class EmbeddedDiscovery:
                 continue
             primary = next((task for task in group if task.discovery_source == "relations"), group[0])
             segments = []
-            passwords = {}
             cleanup = list(dict.fromkeys(path for task in group for path in task.cleanup_parts))
             for task in group:
-                passwords.update(task.runtime.get("embedded_segment_passwords", {}))
-                payloads = task.knowledge().get("source.extractable_segments", ())
-                if payloads:
-                    segments.extend((ArchiveInputDescriptor.from_dict(row["archive_input"]),
-                                     dict(row.get("segment") or {})) for row in payloads)
-                else:
-                    evidence = {}
-                    if task.discovery_failure:
-                        evidence["discovery_failure"] = task.discovery_failure.to_dict()
-                    segments.append((task.archive_input(), evidence))
-            segments.sort(key=lambda row: (case_key(row[0].entry_path),
-                                          row[0].primary_extent.start if row[0].primary_extent else 0))
+                segments.extend(task.inputs)
+            segments = list({node.input_id: node for node in segments}.values())
+            segments.sort(key=lambda node: (case_key(node.descriptor.entry_path),
+                                           node.descriptor.primary_extent.start if node.descriptor.primary_extent else 0))
             task = ArchiveTask.from_archive_input(
                 primary.archive_input(), discovery_source="embedded",
                 carrier_path=primary.carrier_path, cleanup_paths=cleanup,
-                discovery_segments=tuple(segments),
+                logical_inputs=tuple(replace(node, position=index) for index, node in enumerate(segments, 1)),
             )
-            if passwords:
-                task.runtime["embedded_segment_passwords"] = passwords
             combined.append(task)
             keys = {path_key(path) for path in cleanup}
             result.blocked_paths.difference_update(keys)
@@ -396,7 +388,7 @@ class EmbeddedDiscovery:
             return None, "no_complete_embedded_archive", ()
 
         physical.sort(key=lambda item: (item["offset"], -item["confidence"], item["format"]))
-        segments: list[tuple[ArchiveInputDescriptor, dict[str, Any]]] = []
+        segments: list[LogicalArchiveInput] = []
         base_name = candidate.logical_name or relations_logical_name(os.path.basename(path), True)
         logical = physical
         if pending_failures:
@@ -418,9 +410,13 @@ class EmbeddedDiscovery:
             if item["offset"] in pending_failures:
                 failure = discovery_failure("embedded", pending_failures[item["offset"]], path)
                 evidence = {**item, "discovery_failure": failure.to_dict()}
-            segments.append((descriptor, evidence))
+            segments.append(LogicalArchiveInput(
+                descriptor, position=len(segments) + 1, evidence=evidence,
+                failure=FailureInfo.from_dict(evidence.get("discovery_failure")),
+                password=password_by_offset.get(item["offset"]),
+            ))
 
-        primary = segments[0][0]
+        primary = segments[0].descriptor
         task = ArchiveTask.from_archive_input(
             primary,
             discovery_source="embedded",
@@ -429,13 +425,8 @@ class EmbeddedDiscovery:
             discovery_evidence={
                 "scan": embedded_scan_prepass(scan),
             },
-            discovery_segments=tuple(segments),
+            logical_inputs=tuple(segments),
         )
-        if password_by_offset:
-            task.runtime["embedded_segment_passwords"] = {
-                str(offset): password
-                for offset, password in password_by_offset.items()
-            }
         return (
             task,
             f"Validated embedded {primary.format_hint} at offset {primary.primary_extent.start if primary.primary_extent else 0}",
@@ -525,6 +516,7 @@ def _descriptor_for_candidate(
     analysis = {
         "segment_confidence": confidence,
         "segment_source": "embedded",
+        "volume_completeness": "complete" if end is not None else "unknown",
     }
     if execution_analysis:
         analysis.update(execution_analysis)

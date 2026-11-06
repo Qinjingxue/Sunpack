@@ -140,6 +140,9 @@ class WatchStateEntry:
     last_attempt_at: float = 0.0
     password_generation: int = 0
 
+    def blocks(self, blocker: str) -> bool:
+        return blocker in self.failure_payload.get("blockers", ())
+
     @property
     def fingerprint(self) -> str:
         base = f"{self.path}|{self.size}|{self.mtime:.6f}"
@@ -461,12 +464,16 @@ class WatchStateStore:
         with self._state_lock:
             return bool(self._native.has_entry_status(status))
 
-    def failed_password_entries(self) -> list[WatchStateEntry]:
+    def blocked_entries(self, blocker: str) -> list[WatchStateEntry]:
         with self._state_lock:
             return [
                 WatchStateEntry(**item)
-                for item in self._native.entry_items("failed_password")
+                for item in self._native.entry_items(blocker=blocker)
             ]
+
+    def has_blocker(self, blocker: str) -> bool:
+        with self._state_lock:
+            return bool(self._native.has_entry_blocker(blocker))
 
     def _pending_record(self, path: str) -> WatchPendingWork | None:
         raw = self._native.pending(path)
@@ -1298,7 +1305,7 @@ class WatchStateStore:
             signature = str(signature or "")
             previous = self.password_source_signature
             changed = bool(previous and previous != signature)
-            if not previous and self._native.has_entry_status("failed_password"):
+            if not previous and self._native.has_entry_blocker("password"):
                 changed = True
             next_generation = self.password_generation + (1 if changed else 0)
             if previous != signature or changed:
@@ -1311,7 +1318,7 @@ class WatchStateStore:
         with self._state_lock:
             root = Path(directory).resolve()
             result: list[WatchStateEntry] = []
-            for raw in self._native.entry_items("failed_password"):
+            for raw in self._native.entry_items(blocker="password"):
                 entry = WatchStateEntry(**raw)
                 try:
                     scope = Path(entry.password_scope_dir).resolve()
@@ -1343,6 +1350,9 @@ class WatchStateStore:
             key = _path_key(path)
             previous = self._entry_record(key)
             payload = dict(failure_payload or {})
+            if "blockers" not in payload:
+                payload["blockers"] = {"failed_password": ["password"],
+                                       "suspended_missing_volume": ["missing_volume"]}.get(status, [])
             if source_group is not None:
                 payload["source_group"] = source_group
             blockers = {str(value) for value in payload.get("blockers") or []}

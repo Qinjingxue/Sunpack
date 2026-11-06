@@ -163,7 +163,7 @@ def test_eocd_signatures_in_comments_preserve_planned_password_input(tmp_path, l
         assert zip_fast_verify_passwords(str(archive), ["wrong", password])["status"] == "match"
     task = direct_file_task(str(archive), all_parts=parts or [str(archive)])
     ArchiveInputPlanningStage(load_config()).plan_task(task)
-    descriptor = knowledge_view.source_password_probe_input(task) or task.archive_input().to_dict()
+    descriptor = (task.password_probe_input or task.archive_input()).to_dict()
     assert "zip_eocd_offset" in descriptor.get("analysis", {}), descriptor
     outcome = ZipFastVerifier().verify_batch(str(archive), ["wrong", password],
         part_paths=parts or None, archive_input=descriptor)

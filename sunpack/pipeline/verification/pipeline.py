@@ -367,7 +367,7 @@ def _aggregate_payload_coverage(
         sources=[
             {
                 "kind": "embedded_payload",
-                "segment_id": str(segment.get("segment_id") or ""),
+                "input_id": str(segment.get("input_id") or ""),
                 "format": str(segment.get("format") or ""),
                 "completeness": verification.completeness,
                 "decision_hint": verification.decision_hint,

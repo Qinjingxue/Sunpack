@@ -27,7 +27,7 @@ from sunpack.pipeline.coordinator.task_scan import ArchiveTaskScanner
 from sunpack.pipeline.coordinator.target_groups import relation_group_to_candidate
 from sunpack.core.contracts.tasks import ArchiveTask
 from sunpack.core.contracts.failures import FailureInfo, FailureKind
-from sunpack.core.contracts.retry_targets import apply_password_retry, remap_retry_failure
+from sunpack.core.contracts.retry_targets import apply_input_retry, remap_retry_failure
 from sunpack.pipeline.postprocess.internal.blocked_input import (
     BlockedInputPromotionError, NativeBlockedInputPromotion, promote_blocked_input,
 )
@@ -1546,12 +1546,13 @@ class _RequestRuntime:
                 planned = [task]
             if len(planned) != 1 or planned[0] is not task:
                 raise RuntimeError(
-                    "Archive input planning must preserve one logical ArchiveTask identity"
+                    "Archive input planning must preserve its physical ownership task"
                 )
 
             retry_failure = self.config.get("password_retry_failures", {}).get(path_key(task.main_path))
             if retry_failure is not None:
-                apply_password_retry(task, retry_failure, task.runtime.get("input_generation", ()))
+                apply_input_retry(task, retry_failure, task.runtime.get("input_generation", ()),
+                                  password_changed=self.config.get("retry_password_changed", True))
 
             ownership.remember_tasks([task])
             # Admission already confirmed the physical generation under the
@@ -1613,7 +1614,7 @@ class _RequestRuntime:
             ownership.remember_results([result])
             output_dir = (
                 result.output_dir
-                if result.outcome_kind != OutcomeKind.FAILURE or any(outcome.result.complete_embedded_results())
+                if result.outcome_kind != OutcomeKind.FAILURE or outcome.result.has_complete_inputs
                 else ""
             )
 

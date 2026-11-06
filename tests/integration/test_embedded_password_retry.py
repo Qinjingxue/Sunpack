@@ -138,7 +138,7 @@ def test_watch_restart_retries_promoted_carrier_without_replaying_siblings(
                 await watcher.drain()
                 entries = list(watcher.state.entries.values())
                 assert len(entries) == 1
-                assert entries[0].failure_payload["details"]["retry_generation"]
+                assert entries[0].failure_payload["details"]["input_recovery"]["inputs"]
                 assert Path(entries[0].path).parent == case.watch
                 root = assert_outputs(tmp_path, 2)
                 assert entries[0].failure_payload["details"]["retry_output_dir"] == str(root)

@@ -97,11 +97,9 @@ def _job_payload(
         {
             "job_id": job_id,
             "request_id": request_id,
-            "archive_path": str(archive),
-            "part_paths": [str(archive)],
+            "archive_input": {"entry_path": str(archive), "open_mode": "file", "format_hint": format_hint},
             "output_dir": str(output_dir),
             "password": "",
-            "format_hint": format_hint,
         },
         ensure_ascii=False,
         separators=(",", ":"),

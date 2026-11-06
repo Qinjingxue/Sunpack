@@ -1,8 +1,11 @@
+
+from sunpack.core.contracts.input_plan import LogicalArchiveInput
+from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
 import pytest
 
 from sunpack_native import worker_manifest_from_rows
 
-from sunpack.core.contracts.extraction import ExtractionResult
+from sunpack.core.contracts.extraction import ExtractionResult, InputExecutionResult
 from sunpack.core.contracts.filesystem import DirectorySnapshot
 from sunpack.pipeline.coordinator.output_scan_policy import (
     NestedOutputScanPolicy as OutputScanPolicy,
@@ -66,9 +69,9 @@ def test_output_scan_policy_projects_each_confirmed_embedded_segment(tmp_path):
 
         out_dir=str(carrier_dir),
 
-        embedded_results=[
-            ({"segment_id": "embedded_00_zip"}, child_one),
-            ({"segment_id": "embedded_01_tar"}, child_two),
+        input_results=[
+            InputExecutionResult(LogicalArchiveInput(ArchiveInputDescriptor("carrier", format_hint="zip")), child_one),
+            InputExecutionResult(LogicalArchiveInput(ArchiveInputDescriptor("carrier", format_hint="tar")), child_two),
         ],
     )
 

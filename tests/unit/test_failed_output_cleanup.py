@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+from sunpack.core.contracts.input_plan import LogicalArchiveInput
+from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
+
 import asyncio
 import threading
 from types import SimpleNamespace
 
 import pytest
 
-from sunpack.core.contracts.extraction import ExtractionResult
+from sunpack.core.contracts.extraction import ExtractionResult, InputExecutionResult
 from sunpack.core.contracts.failures import FailureInfo, FailureKind
 from sunpack.core.contracts.results import OutcomeKind
 from sunpack.core.contracts.run_state import RunState
@@ -84,8 +87,8 @@ def test_cleanup_preserves_failed_output_with_nonzero_payload(tmp_path):
 def test_complete_embedded_children_are_not_policy_rejected_with_failed_siblings():
     child = ExtractionResult(True, "child")
     failure = FailureInfo(
-        kind=FailureKind.EMBEDDED_SEGMENTS_FAILED,
-        stage="embedded_segments",
+        kind=FailureKind.INPUTS_FAILED,
+        stage="inputs",
         message="one encrypted child failed",
     )
     outer = ExtractionResult(
@@ -95,7 +98,7 @@ def test_complete_embedded_children_are_not_policy_rejected_with_failed_siblings
 
         failure=failure,
         partial_outputs=True,
-        embedded_results=[({"segment_id": "plain"}, child)],
+        input_results=[InputExecutionResult(LogicalArchiveInput(ArchiveInputDescriptor("carrier")), child)],
     )
 
     assert ArchiveJobOutcome(result=outer).policy_rejected_partial_output is False
@@ -130,7 +133,7 @@ def test_collect_result_records_cleanup_and_preserves_zero_byte_files(tmp_path, 
             success=False, out_dir=str(output), error="damaged",
             files_written=extraction.output_inventory.stats.file_count,
             bytes_written=extraction.output_inventory.stats.total_size,
-            embedded_results=[({}, extraction)],
+            input_results=[InputExecutionResult(task.inputs[0], extraction)],
         )
     if with_zero_file:
         def unexpected_walk(_path):

@@ -21,21 +21,12 @@ def get(task_or_knowledge: ArchiveTask | ArchiveKnowledge, path: str, default: A
     return default if value is None else value
 
 
-def source_password_probe_input(task: ArchiveTask) -> dict[str, Any]:
-    return _dict(get(task, "source.password_probe_input", {}))
-
-
 def source_fingerprint(task: ArchiveTask) -> dict[str, Any]:
     return _task_source_fingerprint(task)
 
 
 def source_selected_segment(task: ArchiveTask) -> dict[str, Any]:
     return _dict(get(task, "source.selected_segment", {}))
-
-
-def source_extractable_segments(task: ArchiveTask) -> list[dict[str, Any]]:
-    value = get(task, "source.extractable_segments", [])
-    return [dict(item) for item in value if isinstance(item, dict)] if isinstance(value, list) else []
 
 
 def inspection_prepass(task: ArchiveTask) -> dict[str, Any]:

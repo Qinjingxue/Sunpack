@@ -1,3 +1,4 @@
+from sunpack.core.contracts.input_plan import LogicalArchiveInput
 import pytest
 
 from sunpack.core.contracts.archive_input import (
@@ -75,10 +76,10 @@ def test_archive_task_accepts_paired_discovery_segments():
     task = ArchiveTask.from_archive_input(
         descriptor,
         discovery_source="embedded",
-        discovery_segments=((descriptor, evidence),),
+        logical_inputs=(LogicalArchiveInput(descriptor, evidence=evidence),),
     )
 
-    segments = task.knowledge().get("source.extractable_segments")
+    segments = [node.projection() for node in task.inputs]
     assert len(segments) == 1
     assert segments[0]["archive_input"]["parts"][0]["start"] == 128
-    assert segments[0]["segment"] == evidence
+    assert task.inputs[0].evidence == evidence

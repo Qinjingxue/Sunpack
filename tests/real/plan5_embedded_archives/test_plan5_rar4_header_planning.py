@@ -4,7 +4,7 @@ import pytest
 
 from sunpack.pipeline.coordinator.task_provider import ArchiveTaskProvider
 from sunpack.pipeline.discovery.detection.input_planning import ArchiveInputPlanningStage
-from sunpack.core.support.archive_knowledge_projection import source_extractable_segments
+
 from tests.helpers.real_archives import create_encrypted_rar_archive
 from tests.helpers.tool_config import get_optional_rar
 from tests.real.plan1_real_archives.plan1_support import plan1_config
@@ -45,7 +45,7 @@ def test_plan5_planner_plans_header_encrypted_rar4_embedded_segment(tmp_path, pl
 
     planned = ArchiveInputPlanningStage(config).plan_task_to_tasks(tasks[0])
     assert len(planned) == 1
-    segments = source_extractable_segments(planned[0])
+    segments = [node.projection() for node in planned[0].inputs]
     assert segments, "no embedded segments were planned"
 
     rar_segments = [segment for segment in segments if segment["format"] == "rar"]
@@ -62,7 +62,7 @@ def test_plan5_planner_plans_header_encrypted_rar4_embedded_segment(tmp_path, pl
         plan5_error["case_id"] = "plan5_rar4_header_planning"
         plan5_error["planned_segments"] = [
             {
-                "segment_id": segment.get("segment_id"),
+                "input_id": segment.get("input_id"),
                 "format": segment.get("format"),
                 "start_offset": segment.get("start_offset"),
                 "end_offset": segment.get("end_offset"),

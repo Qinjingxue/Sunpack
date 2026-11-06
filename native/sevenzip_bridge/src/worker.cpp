@@ -510,55 +510,6 @@ sunpack::sevenzip::ExtractArchiveResult password_candidate_failure(
     return result;
 }
 
-std::vector<sunpack::sevenzip::ExtractInputRange> parse_input_ranges(
-    const JsonObjectView& request,
-    const std::string& archive_path
-) {
-    using sunpack::sevenzip::ExtractInputRange;
-    std::vector<ExtractInputRange> ranges;
-    const std::string kind = request.string_field("kind", "file");
-    if (kind == "file_range") {
-        unsigned long long start = 0;
-        unsigned long long end = 0;
-        const bool has_start =
-            request.uint_field("start", &start) ||
-            request.uint_field("start_offset", &start);
-        const bool has_end =
-            request.uint_field("end", &end) ||
-            request.uint_field("end_offset", &end);
-        const std::string path = request.string_field("path", archive_path);
-        ExtractInputRange range;
-        range.path = utf8_to_wide(path.empty() ? archive_path : path);
-        range.start = has_start ? start : 0;
-        range.end = end;
-        range.has_end = has_end;
-        ranges.push_back(range);
-        return ranges;
-    }
-    if (kind != "concat_ranges") {
-        return ranges;
-    }
-    for (const auto object_json : request.object_array_field("ranges")) {
-        const JsonObjectView object(object_json);
-        unsigned long long start = 0;
-        unsigned long long end = 0;
-        const bool has_start =
-            object.uint_field("start", &start) ||
-            object.uint_field("start_offset", &start);
-        const bool has_end =
-            object.uint_field("end", &end) ||
-            object.uint_field("end_offset", &end);
-        const std::string path = object.string_field("path", archive_path);
-        ExtractInputRange range;
-        range.path = utf8_to_wide(path.empty() ? archive_path : path);
-        range.start = has_start ? start : 0;
-        range.end = end;
-        range.has_end = has_end;
-        ranges.push_back(range);
-    }
-    return ranges;
-}
-
 std::vector<sunpack::sevenzip::ExtractInputRange> parse_ranges_from_objects(
     const std::vector<std::string_view>& objects,
     const std::string& default_path
@@ -571,11 +522,9 @@ std::vector<sunpack::sevenzip::ExtractInputRange> parse_ranges_from_objects(
         unsigned long long start = 0;
         unsigned long long end = 0;
         const bool has_start =
-            object.uint_field("start", &start) ||
-            object.uint_field("start_offset", &start);
+            object.uint_field("start", &start);
         const bool has_end =
-            object.uint_field("end", &end) ||
-            object.uint_field("end_offset", &end);
+            object.uint_field("end", &end);
         const std::string path = object.string_field("path", default_path);
         if (path.empty() && default_path.empty()) {
             continue;
@@ -590,43 +539,18 @@ std::vector<sunpack::sevenzip::ExtractInputRange> parse_ranges_from_objects(
     return ranges;
 }
 
-WorkerArchiveInput parse_archive_input_descriptor(
-    const JsonObjectView& request,
-    const std::wstring& fallback_archive_path,
-    const std::wstring& fallback_format_hint,
-    const std::vector<std::wstring>& fallback_part_paths
-) {
+WorkerArchiveInput parse_archive_input_descriptor(const JsonObjectView& request) {
     WorkerArchiveInput input;
-    input.archive_path = fallback_archive_path;
-    input.format_hint = fallback_format_hint;
-    input.open_mode = L"file";
-    input.part_paths = fallback_part_paths;
-
     const JsonObjectView descriptor = request.object_field("archive_input");
     if (!descriptor.valid()) {
-        const std::string archive_path = request.string_field("archive_path", "");
-        input.ranges = parse_input_ranges(request, archive_path);
-        if (!input.ranges.empty()) {
-            input.open_mode = utf8_to_wide(request.string_field("kind", "concat_ranges"));
-        }
+        input.validation_error = "archive_input descriptor is required";
         return input;
     }
-
-    const std::string request_archive_path = request.string_field("archive_path", "");
-    const std::string entry_path = descriptor.string_field("entry_path", request_archive_path);
-    if (!entry_path.empty()) {
-        input.archive_path = utf8_to_wide(entry_path);
-    }
-    const std::string mode = descriptor.string_field(
-        "open_mode",
-        descriptor.string_field("kind", "file")
-    );
-    input.open_mode = utf8_to_wide(mode.empty() ? "file" : mode);
-    const std::string format_hint = descriptor.string_field(
-        "format_hint",
-        request.string_field("format_hint", "")
-    );
-    input.format_hint = utf8_to_wide(format_hint);
+    const std::string entry_path = descriptor.string_field("entry_path", "");
+    input.archive_path = utf8_to_wide(entry_path);
+    const std::string mode = descriptor.string_field("open_mode", "file");
+    input.open_mode = utf8_to_wide(mode);
+    input.format_hint = utf8_to_wide(descriptor.string_field("format_hint", ""));
 
     const JsonObjectView analysis = descriptor.object_field("analysis");
     const JsonObjectView execution_analysis = analysis.object_field("execution");
@@ -659,8 +583,7 @@ WorkerArchiveInput parse_archive_input_descriptor(
                 } else {
                     unsigned long long start = 0;
                     const bool has_start =
-                        object.uint_field("start", &start) ||
-                        object.uint_field("start_offset", &start);
+                        object.uint_field("start", &start);
                     unsigned long long end = 0;
                     const bool has_end = object.uint_field("end", &end);
                     if (has_end && end < start) input.validation_error = "structured volume extent is reversed";
@@ -676,9 +599,6 @@ WorkerArchiveInput parse_archive_input_descriptor(
         }
     }
     if (mode == "native_volumes" || mode == "sfx_with_volumes") {
-        std::sort(structured_parts.begin(), structured_parts.end(), [](const ParsedPart& left, const ParsedPart& right) {
-            return left.number < right.number;
-        });
         parts.clear();
         const bool has_ranges = std::any_of(structured_parts.begin(), structured_parts.end(),
             [](const ParsedPart &part) { return part.start != 0 || part.has_end; });
@@ -690,8 +610,9 @@ WorkerArchiveInput parse_archive_input_descriptor(
             // would shift every later byte and misreport the set as damaged.
             const bool head_ok = index != 0 || structured_parts[index].number == 1;
             const bool ordered = index == 0 || structured_parts[index].number > structured_parts[index - 1].number;
-            if (!head_ok || !ordered) {
-                input.validation_error = "structured volume sequence must be unique and start at 1";
+            if (!head_ok) input.missing_volume_number = 1;
+            if (!ordered) {
+                input.validation_error = "structured volume sequence must be ordered and unique";
                 break;
             }
             if (input.missing_volume_number == 0 && index > 0 &&
@@ -720,9 +641,7 @@ WorkerArchiveInput parse_archive_input_descriptor(
     } else if (mode == "concat_ranges") {
         const auto range_objects = descriptor.object_array_field("ranges");
         input.ranges = parse_ranges_from_objects(range_objects, entry_path);
-        if (input.ranges.empty()) {
-            input.ranges = parse_ranges_from_objects(part_objects, entry_path);
-        }
+        if (input.ranges.empty()) input.validation_error = "concat_ranges descriptor requires ranges";
     }
     return input;
 }
@@ -734,15 +653,12 @@ struct WorkerRequest {
     std::string origin = "foreground";
     std::string output_volume_key;
     std::string process_mode = "normal";
-    std::wstring archive_path;
     std::wstring output_dir;
     std::wstring password;
-    std::wstring format_hint;
     std::wstring codepage;
     bool dry_run = false;
     unsigned long long job_buffer_budget = 0;
     std::vector<std::wstring> password_candidates;
-    std::vector<std::wstring> part_paths;
     WorkerArchiveInput archive_input;
 };
 
@@ -764,10 +680,8 @@ WorkerRequest parse_worker_request(const std::string& request_json) {
         return request;
     }
 
-    request.archive_path = utf8_to_wide(json.string_field("archive_path", ""));
     request.output_dir = utf8_to_wide(json.string_field("output_dir", ""));
     request.password = utf8_to_wide(json.string_field("password", ""));
-    request.format_hint = utf8_to_wide(json.string_field("format_hint", ""));
     request.codepage = utf8_to_wide(json.string_field("codepage", ""));
     request.dry_run = json.bool_field("dry_run", false);
     json.uint_field("job_buffer_budget_bytes", &request.job_buffer_budget);
@@ -775,15 +689,7 @@ WorkerRequest parse_worker_request(const std::string& request_json) {
     for (const auto& candidate : json.string_array_field("password_candidates")) {
         request.password_candidates.push_back(utf8_to_wide(candidate));
     }
-    for (const auto& part : json.string_array_field("part_paths")) {
-        request.part_paths.push_back(utf8_to_wide(part));
-    }
-    request.archive_input = parse_archive_input_descriptor(
-        json,
-        request.archive_path,
-        request.format_hint,
-        request.part_paths
-    );
+    request.archive_input = parse_archive_input_descriptor(json);
     return request;
 }
 
@@ -1169,15 +1075,15 @@ int run_request(
         return cancelled_result(job_id);
     }
 
-    const std::wstring& archive_path = request.archive_path;
+    const std::wstring& archive_path = request.archive_input.archive_path;
     const std::wstring& output_dir = request.output_dir;
     const std::wstring& password = request.password;
-    const std::wstring& format_hint = request.format_hint;
+    const std::wstring& format_hint = request.archive_input.format_hint;
     const std::wstring& codepage = request.codepage;
     const bool dry_run = request.dry_run;
     const unsigned long long job_buffer_budget = request.job_buffer_budget;
     const std::vector<std::wstring>& password_candidates = request.password_candidates;
-    const std::vector<std::wstring>& part_paths = request.part_paths;
+    const std::vector<std::wstring>& part_paths = request.archive_input.part_paths;
     if (archive_path.empty() || (!dry_run && output_dir.empty())) {
         print_json_line(
             "{\"type\":\"result\",\"job_id\":\"" + json_escape(job_id) +

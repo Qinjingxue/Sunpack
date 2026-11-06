@@ -1,8 +1,11 @@
 from contextlib import nullcontext
+from dataclasses import replace
 from typing import Any, Callable
 
 from sunpack.core.contracts.tasks import ArchiveTask
 from sunpack.core.contracts.extraction import ExtractionResult
+from sunpack.core.contracts.input_plan import InputCheckpoint, InputRecovery, source_generation
+from sunpack.core.contracts.failures import FailureInfo, FailureKind
 from sunpack.core.passwords import PasswordSession
 from sunpack.pipeline.verification.evidence import build_verification_evidence
 from sunpack.pipeline.verification.knowledge import write_verification_result
@@ -25,16 +28,30 @@ class VerificationScheduler:
         self.password_session = password_session
 
     def verify(self, task: ArchiveTask, extraction_result: ExtractionResult, *, phase_timer: Callable[..., Any] | None = None, phase_prefix: str = "verify") -> VerificationResult:
-        embedded_results = list(extraction_result.embedded_results or [])
-        if embedded_results:
+        input_results = extraction_result.input_results
+        if input_results or task.recovery.checkpoints:
             payloads = []
-            for index, (segment, segment_result) in enumerate(embedded_results, start=1):
+            executed = set()
+            for index, item in enumerate(input_results, start=1):
+                segment_result = item.result
                 verification = self._verify_one(
                     task, segment_result, phase_timer=phase_timer,
                     phase_prefix=f"{phase_prefix}_embedded_{index}",
                 )
-                segment["verified_complete"] = bool(segment_result.success and verification.decision_hint == DECISION_ACCEPT)
-                payloads.append((segment, verification))
+                item.verified_complete = bool(segment_result.success and verification.decision_hint == DECISION_ACCEPT)
+                payloads.append((item.projection(), verification))
+                executed.add(item.input.input_id)
+            for checkpoint in task.recovery.checkpoints:
+                if checkpoint.input.input_id in executed:
+                    continue
+                payloads.append(({"success": checkpoint.complete}, VerificationResult(
+                    completeness=1.0 if checkpoint.complete else 0.0,
+                    decision_hint=DECISION_ACCEPT if checkpoint.complete else (
+                        DECISION_REQUEST_PASSWORD if "password" in checkpoint.blockers else DECISION_FAIL),
+                    output_file_count=checkpoint.files_written,
+                    output_total_bytes=checkpoint.bytes_written,
+                    output_empty=checkpoint.files_written == 0,
+                )))
             result = aggregate_payload_verifications(payloads)
         else:
             result = self._verify_one(
@@ -45,7 +62,37 @@ class VerificationScheduler:
             )
         with _phase(phase_timer, f"{phase_prefix}_write_knowledge"):
             write_verification_result(task, result, phase_timer=phase_timer, phase_prefix=f"{phase_prefix}_write_knowledge")
+        self._checkpoint_inputs(task, extraction_result, result)
         return result
+
+    @staticmethod
+    def _checkpoint_inputs(task, extraction_result, verification):
+        generation = task.runtime.get("input_generation", ())
+        if not generation:
+            return
+        generation = {row[0]: tuple(row) for row in generation}
+        checkpoints = {item.input.input_id: item for item in task.recovery.checkpoints}
+        children = extraction_result.input_results
+        current = ((item.input, item.result, bool(item.verified_complete))
+                   for item in children) if children else (
+                       (extraction_result.logical_input, extraction_result,
+                        extraction_result.success and verification.decision_hint == DECISION_ACCEPT),)
+        for node, result, complete in current:
+            if node is not None:
+                failure = result.failure
+                if failure is None and not complete:
+                    failure = FailureInfo(FailureKind.DAMAGED, "verification", "Archive verification failed")
+                checkpoints[node.input_id] = InputCheckpoint(
+                    node, source_generation(node, generation), result.out_dir, complete, failure,
+                    result.files_written, result.bytes_written,
+                )
+        recovery = InputRecovery(tuple(checkpoints.values()), extraction_result.out_dir,
+                                 task.recovery.input_count or len(task.inputs))
+        task.recovery = recovery
+        if extraction_result.failure is not None:
+            extraction_result.failure = replace(extraction_result.failure, details={
+                **extraction_result.failure.details, "input_recovery": recovery.to_dict(),
+            })
 
     def _verify_one(
         self,

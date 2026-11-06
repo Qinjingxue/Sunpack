@@ -30,8 +30,7 @@ def large_enc(tmp_path_factory, request):
 
 @pytest.mark.parametrize("capacity,executor_threads", [(1, None), (2, None), (3, None), (5, None), (9, None), (9, 3), (9, 1)])
 def test_large_enc_uses_only_granted_credits_and_matches_official_bytes(tmp_path, large_enc, capacity, executor_threads):
-    request = {"job_id": "enc", "origin": "foreground", "archive_path": str(large_enc / "large.enc"),
-               "format_hint": "enc", "output_dir": str(tmp_path / "out"), "password": "sunpack-test"}
+    request = {"job_id": "enc", "origin": "foreground", "archive_input": {"entry_path": str(large_enc / "large.enc"), "open_mode": "file", "format_hint": "enc"}, "output_dir": str(tmp_path / "out"), "password": "sunpack-test"}
     env = os.environ | {"SUNPACK_NATIVE_WORKER_THREAD_CAPACITY": str(capacity)}
     if executor_threads:
         env["RAYON_NUM_THREADS"] = str(executor_threads)
@@ -71,7 +70,7 @@ def test_parallel_enc_releases_credits_after_mac_failure_for_watch_and_cli(tmp_p
                     path = large_enc / ("damaged.bin" if index % 4 == 3 else "large.enc")
                     password = "wrong" if index % 4 == 2 else "sunpack-test"
                     request = {"job_id": job_id, "origin": "watch" if index % 2 else "foreground",
-                               "archive_path": str(path), "format_hint": "enc", "password": password,
+                               "archive_input": {"entry_path": str(path), "open_mode": "file", "format_hint": "enc"}, "password": password,
                                "output_dir": str(tmp_path / job_id)}
                     await process.submit(json.dumps(request), job_id, parsed_events=True,
                                          on_line=lambda line, event: events.append(event) or event.get("event") == "job_finished",

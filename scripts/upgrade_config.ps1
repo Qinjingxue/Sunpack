@@ -1,5 +1,6 @@
 param(
-    [Parameter(Mandatory=$true)][string]$UserConfig
+    [Parameter(Mandatory=$true)][string]$UserConfig,
+    [string]$AdvancedConfig = ''
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -58,6 +59,40 @@ function Unique-Rules($Rules) {
 
 $user = [IO.File]::ReadAllText($UserConfig) | ConvertFrom-Json
 if ($null -eq $user -or $user -isnot [pscustomobject]) { throw "Expected a JSON object: $UserConfig" }
+
+# The logical-input checkpoint replaces the former carrier continuation. Reset
+# only its native snapshot/WAL; passwords, roots, outputs and configuration stay
+# user-owned. A marker makes subsequent installations preserve current records.
+$dataDirectory = [IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($UserConfig))
+$stateDirectory = Join-Path $dataDirectory '.sunpack_watch'
+foreach ($configuration in @($AdvancedConfig, $UserConfig)) {
+    if (-not $configuration -or -not (Test-Path -LiteralPath $configuration -PathType Leaf)) { continue }
+    $settings = [IO.File]::ReadAllText($configuration) | ConvertFrom-Json
+    if ($settings.PSObject.Properties['watch'] -and $null -ne $settings.watch -and $settings.watch.PSObject.Properties['state_dir']) {
+        $configured = ([string]$settings.watch.state_dir).Trim()
+        $stateDirectory = if ($configured) { $configured } else { Join-Path $dataDirectory '.sunpack_watch' }
+    }
+}
+if ($stateDirectory -eq '~') { $stateDirectory = $env:USERPROFILE }
+elseif ($stateDirectory.StartsWith('~\') -or $stateDirectory.StartsWith('~/')) {
+    $stateDirectory = Join-Path $env:USERPROFILE $stateDirectory.Substring(2)
+}
+if (-not [IO.Path]::IsPathRooted($stateDirectory)) { $stateDirectory = Join-Path $dataDirectory $stateDirectory }
+$stateDirectory = [IO.Path]::GetFullPath($stateDirectory)
+$marker = Join-Path $stateDirectory 'logical-input-recovery'
+if (-not (Test-Path -LiteralPath $marker -PathType Leaf)) {
+    if (Test-Path -LiteralPath $stateDirectory) {
+        if ((Get-Item -LiteralPath $stateDirectory -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) {
+            throw "Refusing a reparse point for Watch recovery reset: $stateDirectory"
+        }
+        foreach ($record in Get-ChildItem -LiteralPath $stateDirectory -File -Force) {
+            if ($record.Name -notmatch '^state\.(?:snapshot|journal\.\d{20}\.wal)$') { continue }
+            if ([IO.Path]::GetFullPath($record.DirectoryName) -ne $stateDirectory) { throw 'Watch recovery reset escaped its directory' }
+            Remove-Item -LiteralPath $record.FullName -Force
+        }
+    } else { $null = New-Item -ItemType Directory -Path $stateDirectory -Force }
+    [IO.File]::WriteAllText($marker, '')
+}
 if (-not $user.PSObject.Properties['filesystem'] -or -not $user.filesystem.PSObject.Properties['scan_filters']) { exit 0 }
 $converted = [Collections.Generic.List[object]]::new()
 $pruned = [Collections.Generic.List[object]]::new()

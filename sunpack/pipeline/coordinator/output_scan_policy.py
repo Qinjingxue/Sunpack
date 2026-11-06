@@ -104,21 +104,17 @@ class NestedOutputScanPolicy:
         extraction, verification, output naming, or the authorization
         threshold itself.
         """
-        embedded_results = list(getattr(extraction_result, "embedded_results", None) or [])
+        input_results = extraction_result.input_results
         projected: list[tuple[str, OutputInventory | dict[str, Any] | None]] = []
-        for segment, child_result in extraction_result.complete_embedded_results() if embedded_results else ():
-            segment = segment if isinstance(segment, dict) else {}
-            segment_dir = str(
-                getattr(child_result, "out_dir", "")
-                or segment.get("out_dir")
-                or ""
-            ).strip()
+        for item in extraction_result.complete_input_results():
+            child_result = item.result
+            segment_dir = child_result.out_dir
             if not segment_dir:
                 continue
             child_inventory = getattr(child_result, "output_inventory", None)
             projected.append((segment_dir, child_inventory))
 
-        if embedded_results:
+        if input_results:
             return projected
 
         return [(output_dir, getattr(extraction_result, "output_inventory", None))]

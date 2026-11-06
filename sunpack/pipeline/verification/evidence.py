@@ -64,18 +64,8 @@ def build_verification_evidence(
         if password is None:
             password = knowledge_view.archive_password(task)
     with _phase(phase_timer, f"{phase_prefix}_archive_input"):
-        archive_input = task.archive_input()
+        archive_input = extraction_result.logical_input.descriptor if extraction_result.logical_input else task.archive_input()
         extraction_diagnostics = dict(extraction_result.diagnostics or {})
-        verification_input = extraction_diagnostics.get("verification_archive_input")
-        if isinstance(verification_input, dict):
-            try:
-                archive_input = ArchiveInputDescriptor.from_any(
-                    verification_input,
-                    archive_path=task.main_path,
-                    part_paths=list(task.all_parts or [task.main_path]),
-                )
-            except (TypeError, ValueError, AttributeError):
-                pass
     with _phase(phase_timer, f"{phase_prefix}_analysis_facts"):
         analysis_facts = _analysis_facts_from_task(task)
     with _phase(phase_timer, f"{phase_prefix}_diagnostics"):

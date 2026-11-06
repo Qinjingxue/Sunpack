@@ -122,11 +122,9 @@ def _job_payload(*, job_id: str, archive: Path, output: Path) -> str:
     item: dict[str, Any] = {
         "job_id": job_id,
         "request_id": job_id,
-        "archive_path": str(archive),
-        "part_paths": [str(archive)],
+        "archive_input": {"entry_path": str(archive), "open_mode": "file", "format_hint": "7z"},
         "output_dir": str(output),
         "password": "",
-        "format_hint": "7z",
     }
     return json.dumps(item, ensure_ascii=False, separators=(",", ":"))
 

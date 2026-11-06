@@ -25,7 +25,7 @@ def test_archive_embedded_in_middle_is_found_by_selected_embedded_deep_scan(tmp_
     resolved = detected[0]
     assert resolved.discovery_source == "embedded"
     assert resolved.archive_input().format_hint == archive_format
-    segment = resolved.knowledge().get("source.selected_segment")
+    segment = resolved.inputs[0].projection()
     assert segment["format"] == archive_format
     assert segment["start_offset"] == len(prefix)
 

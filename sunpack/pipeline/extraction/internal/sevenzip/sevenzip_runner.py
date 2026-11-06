@@ -1374,9 +1374,9 @@ class SevenZipRunner:
             "request_id": str(self.request_id or ""),
             "origin": "watch" if self.origin == "watch" else "foreground",
             "file_id": str(getattr(task, "key", "") or archive_path),
+            "input_id": task.inputs[0].input_id,
             "stage": "extract",
             "archive_path": archive_path,
-            "part_paths": list(part_paths or [archive_path]),
             "output_dir": out_dir,
             "output_volume_key": volume_key,
             "password": password or "",
@@ -1393,8 +1393,6 @@ class SevenZipRunner:
         if archive_input:
             descriptor_payload = archive_input.to_dict()
             job["archive_input"] = descriptor_payload
-            if descriptor_payload.get("format_hint"):
-                job["format_hint"] = descriptor_payload.get("format_hint")
         return job
 
     def _archive_input(self, task: ArchiveTask, archive_path: str, part_paths: list[str]) -> ArchiveInputDescriptor:

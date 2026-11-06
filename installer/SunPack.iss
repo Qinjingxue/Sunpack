@@ -828,6 +828,10 @@ var
   UserConfig: string;
 begin
   if ConfigBackupCaptured then Exit;
+  if FileExists(AddBackslash(ExistingApplicationDirectory) + 'sunpack_advanced_config.json') then
+    if not FileCopy(AddBackslash(ExistingApplicationDirectory) + 'sunpack_advanced_config.json',
+                    ExpandConstant('{tmp}\sunpack-advanced-backup.json'), False) then
+      RaiseException('Unable to capture SunPack Watch configuration before upgrade.');
   if InstalledDataRequiresReset then begin ConfigBackupCaptured := True; Exit; end;
   UserConfig := ExpandConstant('{commonappdata}\SunPack\sunpack_config.json');
   if FileExists(UserConfig) then
@@ -843,10 +847,10 @@ var
   Parameters: string;
   ResultCode: Integer;
 begin
-  if not FileExists(ExpandConstant('{tmp}\sunpack-user-backup.json')) then Exit;
   Parameters := '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ' +
     AddQuotes(ExpandConstant('{tmp}\SunPackInstallScripts\upgrade_config.ps1')) +
-    ' -UserConfig ' + AddQuotes(ExpandConstant('{commonappdata}\SunPack\sunpack_config.json'));
+    ' -UserConfig ' + AddQuotes(ExpandConstant('{commonappdata}\SunPack\sunpack_config.json')) +
+    ' -AdvancedConfig ' + AddQuotes(ExpandConstant('{tmp}\sunpack-advanced-backup.json'));
   if not Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
               Parameters, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
     RaiseException('Unable to start SunPack configuration field upgrade.')

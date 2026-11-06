@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 
 from sunpack.core.passwords.verifier.base import PasswordBatchVerification, PasswordVerifier
 from sunpack.core.passwords.verifier.input import PasswordProbeInput, prepare_password_input
+from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
 
 
 @dataclass
@@ -109,6 +110,8 @@ class PasswordVerifierChain:
 
 
 def _preferred_archive_format(archive_input: dict | PasswordProbeInput | None = None) -> str:
+    if isinstance(archive_input, ArchiveInputDescriptor):
+        return _normalize_archive_format(archive_input.format_hint)
     if archive_input is not None:
         hinted = _normalize_archive_format(
             str(archive_input.get("format_hint") or archive_input.get("format") or "")

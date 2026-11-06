@@ -45,6 +45,17 @@ def test_direct_file_task_preserves_explicit_zero_based_split_volumes(tmp_path):
     assert task.main_path == str(parts[0])
     assert task.all_parts == [str(part) for part in parts]
     assert task.archive_input().open_mode == "native_volumes"
+    # A complete-looking mapping can still skip bytes. Exercise the real
+    # canonical worker stream with this zero-based family too.
+    from sunpack.pipeline.extraction.scheduler import ExtractionScheduler
+
+    extractor = ExtractionScheduler(extraction_config={"quiet": True})
+    try:
+        result = extractor.extract(task, str(tmp_path / "out"))
+        assert result.success, result.error
+        assert next((tmp_path / "out").rglob(case.marker_name)).read_text(encoding="utf-8") == case.marker_text
+    finally:
+        extractor.close()
 
 
 def test_explicit_multi_volume_input_requires_structure_not_only_names(tmp_path):

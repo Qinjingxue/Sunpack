@@ -124,7 +124,14 @@ pub(super) struct CatalogRow {
 }
 
 impl CatalogRow {
-    pub fn remember_observation(&mut self, size: u64, mtime: f64, file_id: &str, change_usn: i64, phase_boundary: bool) {
+    pub fn remember_observation(
+        &mut self,
+        size: u64,
+        mtime: f64,
+        file_id: &str,
+        change_usn: i64,
+        phase_boundary: bool,
+    ) {
         let unchanged = self.observation.as_ref().is_some_and(|old| {
             old.size == size
                 && old.mtime == mtime

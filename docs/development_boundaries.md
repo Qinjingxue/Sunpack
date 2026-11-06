@@ -81,7 +81,9 @@ sunpack.runtime.watch
 
 ### core.contracts
 
-`sunpack.core.contracts` is the shared data contract layer. Discovery produces `ArchiveTask` directly through `StageResult.resolved_tasks`; `DiscoveryCandidate` is a short-lived hint and `ArchiveInputDescriptor` owns the physical input. Parts and concatenated inputs use `InputExtent` for byte ranges. `ArchiveTask` owns archive knowledge and runtime state. Extraction and verification return `ExtractionResult` and `VerificationResult`, and verification methods return the same `VerificationStep` type stored in the result. `RunState.snapshot()` produces `RunSummary`, whose counts and failures come from `TargetRunResult` entries.
+`sunpack.core.contracts` is the shared data contract layer. Discovery produces `ArchiveTask` directly through `StageResult.resolved_tasks`; `DiscoveryCandidate` is a short-lived hint. `ArchiveTask` is the scheduling, lease, and cleanup group for physical sources. Each `LogicalArchiveInput` in `inputs` represents an independently processed archive with a stable ID, canonical `ArchiveInputDescriptor`, analysis facts, and blockers. Parts and concatenated inputs use `InputExtent` for byte ranges. Extraction and verification return `ExtractionResult` and `VerificationResult`, and verification methods return the same `VerificationStep` type stored in the result. `RunState.snapshot()` produces `RunSummary`, whose counts and failures come from `TargetRunResult` entries.
+
+Files, volume sets, and carrier segments share one logical input lifecycle. Rust establishes the mapping during discovery and refines facts when passwords or members change. Execution, verification, and recursive scanning pass typed inputs and per-input results directly, without reconstructing them from diagnostic dictionaries. `InputRecovery` checkpoints each input's source generation, output location, completion, and failure; missing volumes and passwords may block the same input together. CLI and Watch share the selector that retries changed dependencies or password waiters while retaining completed siblings. Persisted checkpoints contain no passwords, reader handles, or file inventories. Shared carriers are cleaned as user-visible files after the whole group completes.
 
 ### pipeline.discovery.filesystem
 
@@ -125,7 +127,7 @@ The rule layer must not depend on processor implementation details; shared defau
 
 ### pipeline.extraction
 
-`sunpack.pipeline.extraction` is the per-archive extraction execution layer. It consumes the `ArchiveTask` fully resolved by Detection/input planning, the `source.*` inputs, and password resolution, and calls `sunpack_sevenzip_worker.exe` to extract plain files, `file_range`, or `concat_ranges` virtual inputs through `7z.dll`. It does not query Relations, scan candidates, schedule pipeline batches, or clean up after success.
+`sunpack.pipeline.extraction` consumes typed logical inputs resolved by Detection/input planning and password resolution, returning an `InputExecutionResult` per input. Single inputs retain the direct execution fast path; multiple inputs have isolated output directories. The worker accepts only canonical `archive_input`; its reader adapters still specialize for files, named volumes, and range streams. Extraction does not query Relations, scan candidates, schedule pipeline batches, or clean up after success.
 
 ### pipeline.verification
 

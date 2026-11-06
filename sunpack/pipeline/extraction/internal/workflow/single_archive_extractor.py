@@ -3,7 +3,6 @@ import os
 import sys
 import subprocess
 from contextlib import nullcontext
-from dataclasses import replace
 from typing import Any, Callable
 
 from sunpack.core.support.resource_lifecycle import task_walk
@@ -11,14 +10,14 @@ from sunpack.core.support.output_paths import OutputPathAllocator
 from sunpack.core.support.path_keys import resolved_path_key
 
 from sunpack.core.contracts.failures import FailureInfo, FailureKind
-from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
 from sunpack.core.contracts.tasks import ArchiveTask
+from sunpack.core.contracts.input_plan import LogicalArchiveInput
 from sunpack.pipeline.extraction.internal.workflow.errors import classify_extract_failure
 from sunpack.pipeline.extraction.internal.sevenzip.metadata import ArchiveMetadataScanner
 from sunpack.pipeline.extraction.internal.sevenzip.sevenzip_runner import SevenZipRunner
 from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import compact_success_worker_diagnostics, worker_result_payload
 from sunpack.pipeline.extraction.progress import build_extraction_progress_manifest, has_recoverable_partial_outputs
-from sunpack.core.contracts.extraction import ExtractionResult
+from sunpack.core.contracts.extraction import ExtractionResult, InputExecutionResult
 from sunpack.core.passwords.result import PasswordResolution, PasswordResolutionStatus
 from sunpack.core.passwords.resolver import archive_structure_requires_password, archive_structure_password_state
 from sunpack.core.support import archive_knowledge_projection as knowledge_view
@@ -74,14 +73,12 @@ class SingleArchiveExtractor:
         task: ArchiveTask,
         out_dir: str,
         *,
-        allow_embedded_segments: bool = True,
         phase_timer: Callable[..., Any] | None = None,
         phase_prefix: str = "extract",
     ) -> ExtractionResult:
         state = self._extract_state_machine(
             task,
             out_dir,
-            allow_embedded_segments=allow_embedded_segments,
             phase_timer=phase_timer,
             phase_prefix=phase_prefix,
         )
@@ -105,7 +102,6 @@ class SingleArchiveExtractor:
         request_id: str,
         file_id: str,
         cancellation,
-        allow_embedded_segments: bool = True,
         phase_timer: Callable[..., Any] | None = None,
         phase_prefix: str = "extract",
     ) -> ExtractionResult:
@@ -116,7 +112,6 @@ class SingleArchiveExtractor:
         state = self._extract_state_machine(
             task,
             out_dir,
-            allow_embedded_segments=allow_embedded_segments,
             phase_timer=phase_timer,
             phase_prefix=phase_prefix,
         )
@@ -153,26 +148,29 @@ class SingleArchiveExtractor:
         task: ArchiveTask,
         out_dir: str,
         *,
-        allow_embedded_segments: bool = True,
         phase_timer: Callable[..., Any] | None = None,
         phase_prefix: str = "extract",
     ):
-        if allow_embedded_segments:
-            with _phase(phase_timer, f"{phase_prefix}_read_extractable_segments"):
-                segments = [
-                    dict(item)
-                    for item in knowledge_view.source_extractable_segments(task)
-                    if isinstance(item, dict) and isinstance(item.get("archive_input"), dict)
-                ]
-            if segments:
-                return (yield from self._extract_embedded_segments_state_machine(
-                    task,
-                    out_dir,
-                    segments,
-                            phase_timer=phase_timer,
-                    phase_prefix=f"{phase_prefix}_embedded",
-                ))
+        inputs = task.inputs
+        if (len(inputs) == 1 and inputs[0].descriptor is task.archive_input()
+                and inputs[0].failure is None and not task.recovery.checkpoints):
+            result = yield from self._extract_one_state_machine(
+                task, out_dir, phase_timer=phase_timer, phase_prefix=phase_prefix,
+            )
+            result.logical_input = inputs[0]
+            return result
+        return (yield from self._extract_inputs_state_machine(
+            task, out_dir, inputs, phase_timer=phase_timer, phase_prefix=phase_prefix,
+        ))
 
+    def _extract_one_state_machine(
+        self, task: ArchiveTask, out_dir: str, *,
+        phase_timer: Callable[..., Any] | None = None, phase_prefix: str = "extract",
+    ):
+        node = task.inputs[0]
+        if node.password is not None:
+            task.knowledge().set("archive.password", node.password,
+                                 source_layer="analysis", source_module="input_plan")
         descriptor = task.archive_input()
         archive = descriptor.entry_path
         all_parts = descriptor.part_paths() or [archive]
@@ -200,7 +198,6 @@ class SingleArchiveExtractor:
         run_archive = descriptor.entry_path
         run_parts = descriptor.part_paths()
         run_result = None
-        test_result = None
         err = ""
         correct_pwd = None
         selected_codepage = None
@@ -222,7 +219,6 @@ class SingleArchiveExtractor:
                 },
             )
         correct_pwd = resolution.password
-        test_result = resolution.test_result
         test_err = resolution.error_text
         with _phase(phase_timer, f"{phase_prefix}_scan_filename_encoding"):
             format_hint = task.archive_input().format_hint
@@ -432,22 +428,7 @@ class SingleArchiveExtractor:
 
     @staticmethod
     def _password_archive_key(task: ArchiveTask) -> str:
-        """Keep password resolution state local to the active logical input.
-
-        Ordinary tasks retain their key. Carved/concatenated inputs use
-        their format and physical ranges; the filename is display data.
-        """
-        try:
-            descriptor = task.archive_input()
-        except Exception:
-            return task.key
-        if descriptor.open_mode not in {"file_range", "concat_ranges"}:
-            return task.key
-        extents = descriptor.extents if descriptor.open_mode == "concat_ranges" else (
-            part.extent for part in descriptor.parts
-        )
-        ranges = tuple((extent.path, extent.start, extent.end) for extent in extents)
-        return f"{task.key}#{descriptor.format_hint}:{ranges!r}"
+        return task.inputs[0].input_id
 
     def _failed(
         self,
@@ -604,18 +585,17 @@ class SingleArchiveExtractor:
         )
 
 
-    def _extract_embedded_segments_state_machine(
+    def _extract_inputs_state_machine(
         self,
         task: ArchiveTask,
         out_dir: str,
-        segments: list[dict[str, Any]],
+        inputs: tuple[LogicalArchiveInput, ...],
         *,
         phase_timer: Callable[..., Any] | None = None,
-        phase_prefix: str = "extract_embedded",
+        phase_prefix: str = "extract_inputs",
     ) -> ExtractionResult:
         archive = task.main_path
-        all_parts = list(task.all_parts or [archive])
-        self._log(self.i18n.t("extract.log.embedded_start", archive=archive, count=len(segments)))
+        self._log(self.i18n.t("extract.log.embedded_start", archive=archive, count=len(inputs)))
         try:
             with _phase(phase_timer, f"{phase_prefix}_mkdir_initial"):
                 os.makedirs(out_dir, exist_ok=True)
@@ -629,31 +609,30 @@ class SingleArchiveExtractor:
             )
 
         segment_results: list[dict[str, Any]] = []
-        embedded_results: list[tuple[dict[str, Any], ExtractionResult]] = []
+        input_results: list[InputExecutionResult] = []
         password_used = None
         selected_codepage = None
-        any_success = False
+        selected_ids = {node.input_id for node in inputs}
+        retained = [item for item in task.recovery.checkpoints if item.input.input_id not in selected_ids]
+        any_success = any(item.complete for item in retained)
         any_partial = False
-        segment_failures: list[FailureInfo] = list(task.runtime.get("password_retry_other_failures", ()))
+        segment_failures = [item.failure for item in retained if not item.complete and item.failure is not None]
         segment_paths: set[str] = set()
         segment_allocator = OutputPathAllocator()
-        segment_count = int(task.runtime.get("password_retry_segment_count", len(segments)))
+        segment_count = task.recovery.input_count or len(inputs)
+        previous = {item.input.input_id: item for item in task.recovery.checkpoints}
 
-        for position, segment in enumerate(segments, start=1):
-            segment_id = str(segment.get("segment_id") or f"embedded_{position:02d}")
-            with _phase(phase_timer, f"{phase_prefix}_segment_descriptor"):
-                descriptor = ArchiveInputDescriptor.from_any(
-                    segment.get("archive_input") if isinstance(segment.get("archive_input"), dict) else None,
-                    archive_path=archive,
-                    part_paths=all_parts,
-                    format_hint=str(segment.get("format") or ""),
-                    logical_name=str(segment.get("logical_name") or task.logical_name),
-                )
+        for node in inputs:
+            position = node.position
+            descriptor = node.descriptor
+            segment = node.projection()
+            segment_id = node.input_id
             # A single embedded payload is the logical archive represented by
             # this task (the common SFX case).  Extract it at the task output
             # root so manifest paths continue to match.  Multiple independent
             # payloads still need isolated subdirectories to avoid collisions.
-            segment_dir = (
+            checkpoint = previous.get(node.input_id)
+            segment_dir = checkpoint.output_dir if checkpoint and checkpoint.output_dir else (
                 out_dir
                 if segment_count == 1
                 else segment_allocator.next_available(
@@ -663,6 +642,10 @@ class SingleArchiveExtractor:
                 )
             )
             segment_paths.add(resolved_path_key(segment_dir))
+            if checkpoint and checkpoint.output_dir:
+                # This attempt owns one logical output. Replacing a changed or
+                # failed input must never merge old files into its new result.
+                self._cleanup_output(segment_dir, OutputCleanupEvent.EXTRACTION_ABORT)
             if "retry_created_outputs" in task.runtime:
                 # Only these new segment roots belong to this retry's rollback.
                 task.runtime["retry_created_outputs"].append(segment_dir)
@@ -673,37 +656,22 @@ class SingleArchiveExtractor:
                     descriptor, discovery_source=task.discovery_source,
                     carrier_path=task.carrier_path,
                 )
-                child_task.key = task.key
+                child_task.key = node.input_id
+                child_task.set_inputs((node,))
                 child_task.runtime = dict(task.runtime)
-                # Embedded boundary resolution may already have proven the
-                # password for this exact logical range. Keep that proof in
-                # runtime-only state so it is not serialized into manifests.
-                segment_passwords = child_task.runtime.pop("embedded_segment_passwords", None)
-                if isinstance(segment_passwords, dict):
-                    known_password = segment_passwords.get(str(segment.get("start_offset")))
-                    if isinstance(known_password, str):
-                        child_task.knowledge().set(
-                            "archive.password",
-                            known_password,
-                            source_layer="embedded",
-                            source_module="boundary_resolver",
-                        )
                 # Password verification must bind to the currently active
                 # logical segment.
-                write_source_password_probe_input(child_task, descriptor.to_dict())
-            discovery_failure = FailureInfo.from_dict((segment.get("segment") or {}).get("discovery_failure"))
+                write_source_password_probe_input(child_task, node.probe_input or descriptor)
+            discovery_failure = node.failure
             if discovery_failure is not None:
                 result = self._failed(segment_dir, self._localized_failure(discovery_failure),
                                       failure=discovery_failure)
             else:
-                result = yield from self._extract_state_machine(
-                    child_task, segment_dir, allow_embedded_segments=False,
+                result = yield from self._extract_one_state_machine(
+                    child_task, segment_dir,
                     phase_timer=phase_timer, phase_prefix=f"{phase_prefix}_segment_extract",
                 )
-            result.diagnostics = {
-                **dict(result.diagnostics or {}),
-                "verification_archive_input": dict(segment.get("archive_input") or {}),
-            }
+            result.logical_input = node
 
             if result.password_used is not None and password_used is None:
                 password_used = result.password_used
@@ -721,21 +689,17 @@ class SingleArchiveExtractor:
                     "file_count": segment_inventory.stats.file_count,
                     "total_bytes": segment_inventory.stats.total_size,
                 }
+                result.files_written = stats["file_count"]
+                result.bytes_written = stats["total_bytes"]
             segment_success = bool(result.success)
             segment_partial = bool(result.partial_outputs or stats["file_count"] > 0)
-            embedded_results.append(({
-                **dict(segment),
-                "success": segment_success,
-                "partial_outputs": segment_partial,
-            }, result))
+            input_results.append(InputExecutionResult(node, result))
             any_success = any_success or segment_success
             any_partial = any_partial or segment_partial
             if result.failure is not None:
-                segment_failures.append(replace(result.failure, details={
-                    **result.failure.details, "retry_input": descriptor.to_dict(),
-                }))
+                segment_failures.append(result.failure)
             segment_results.append({
-                "segment_id": segment_id,
+                "input_id": segment_id,
                 "index": int(segment.get("index") or position),
                 "format": segment.get("format") or "",
                 "logical_name": segment.get("logical_name") or "",
@@ -759,39 +723,27 @@ class SingleArchiveExtractor:
             # Verification and discovery consume each child's native inventory.
             # The carrier only needs counters; a second per-file table is unused.
             totals = {
-                "file_count": sum(item["files_written"] for item in segment_results),
-                "total_bytes": sum(item["bytes_written"] for item in segment_results),
+                "file_count": sum(item["files_written"] for item in segment_results) + sum(item.files_written for item in retained),
+                "total_bytes": sum(item["bytes_written"] for item in segment_results) + sum(item.bytes_written for item in retained),
             }
-        all_success = bool(segment_results) and not segment_failures and all(item.get("success") for item in segment_results)
+        all_success = bool(segment_results or retained) and not segment_failures and all(item.get("success") for item in segment_results)
         diagnostics = {
             "result": {
                 "status": "ok" if all_success else ("partial" if any_success or any_partial else "failed"),
-                "embedded_segment_count": len(segment_results),
-                "embedded_success_count": sum(1 for item in segment_results if item.get("success")),
+                "input_count": len(segment_results) + len(retained),
+                "input_success_count": sum(1 for item in segment_results if item.get("success")) + sum(item.complete for item in retained),
                 "files_written": totals["file_count"],
                 "bytes_written": totals["total_bytes"],
                 "item_count": totals["file_count"],
             },
-            "embedded_segments": segment_results,
+            "inputs": segment_results,
         }
         aggregate_failure = None
         if segment_failures:
-            aggregate_failure = self._aggregate_embedded_failure(
+            aggregate_failure = self._aggregate_input_failure(
                 segment_failures,
                 segment_count=segment_count,
             )
-            aggregate_failure = replace(aggregate_failure, details={
-                **aggregate_failure.details,
-                "retry_completed_inputs": [
-                    *task.runtime.get("retry_completed_inputs", ()),
-                    *(item["archive_input"] for item in segment_results if item["success"]),
-                ],
-            })
-            generation = task.runtime.get("input_generation")
-            if generation:
-                aggregate_failure = replace(aggregate_failure, details={
-                    **aggregate_failure.details, "retry_generation": generation,
-                })
         if any_success:
             self._log(self.i18n.t(
                 "extract.log.embedded_success" if all_success else "extract.log.embedded_failed",
@@ -812,13 +764,14 @@ class SingleArchiveExtractor:
                 partial_outputs=False,
                 files_written=totals["file_count"],
                 bytes_written=totals["total_bytes"],
-                embedded_results=embedded_results,
+                input_results=input_results,
+                retained_complete_count=sum(item.complete for item in retained),
             )
         self._log(self.i18n.t("extract.log.embedded_failed", archive=archive))
         if aggregate_failure is None:
             aggregate_failure = FailureInfo(
-                kind=FailureKind.EMBEDDED_SEGMENTS_FAILED,
-                stage="embedded_segments",
+                kind=FailureKind.INPUTS_FAILED,
+                stage="inputs",
                 message=self.i18n.t("failure.embedded_extract_failed"),
                 message_key="failure.embedded_extract_failed",
                 details={"segment_count": len(segment_results)},
@@ -831,17 +784,18 @@ class SingleArchiveExtractor:
             selected_codepage=selected_codepage,
             diagnostics={
                 **diagnostics,
-                "failure_stage": "embedded_segments",
+                "failure_stage": "inputs",
                 "failure_kind": "embedded_extraction_failed",
             },
             partial_outputs=any_partial,
         )
-        failed_result.embedded_results = embedded_results
+        failed_result.input_results = input_results
+        failed_result.retained_complete_count = sum(item.complete for item in retained)
         failed_result.files_written = totals["file_count"]
         failed_result.bytes_written = totals["total_bytes"]
         return failed_result
 
-    def _aggregate_embedded_failure(
+    def _aggregate_input_failure(
         self,
         segment_failures: list[FailureInfo],
         *,
@@ -854,8 +808,8 @@ class SingleArchiveExtractor:
         if len(segment_failures) == 1 and segment_count == 1:
             child = segment_failures[0]
             return FailureInfo(
-                kind=FailureKind.EMBEDDED_SEGMENTS_FAILED,
-                stage="embedded_segments",
+                kind=FailureKind.INPUTS_FAILED,
+                stage="inputs",
                 message=self._localized_failure(child),
                 message_key=child.message_key,
                 message_params=dict(child.message_params),
@@ -867,8 +821,8 @@ class SingleArchiveExtractor:
         password_failure = any(failure.is_password_failure for failure in segment_failures)
         message_key = "failure.embedded_wrong_password" if password_failure else "failure.embedded_extract_failed"
         return FailureInfo(
-            kind=FailureKind.EMBEDDED_SEGMENTS_FAILED,
-            stage="embedded_segments",
+            kind=FailureKind.INPUTS_FAILED,
+            stage="inputs",
             message=self.i18n.t(message_key),
             message_key=message_key,
             user_action="request_password" if password_failure else "",

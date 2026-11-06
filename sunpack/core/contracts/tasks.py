@@ -6,29 +6,39 @@ from typing import Any
 from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
 from sunpack.core.contracts.failures import FailureInfo
 from sunpack.core.contracts.archive_knowledge import ArchiveKnowledge
+from sunpack.core.contracts.input_plan import InputRecovery, LogicalArchiveInput
 from sunpack.core.support.collections import dedupe_values
 from sunpack.core.support.path_keys import normalized_path, path_key
 
 
 @dataclass
 class ArchiveTask:
+    """Request-owned physical lease/cleanup group containing logical inputs.
+
+    Input identity and recovery belong to ``inputs`` and ``recovery``. ``key``
+    and ``main_path`` identify the user-visible scheduling group only.
+    """
+
     _archive_input: InitVar[ArchiveInputDescriptor]
     carrier_path: str = ""
     cleanup_parts: list[str] = field(default_factory=list)
     key: str = ""
     initial_discovery_source: InitVar[str] = ""
     discovery_evidence: InitVar[dict[str, Any] | None] = None
-    discovery_segments: InitVar[tuple[tuple[ArchiveInputDescriptor, dict[str, Any]], ...]] = ()
+    initial_inputs: InitVar[tuple[LogicalArchiveInput, ...]] = ()
     initial_discovery_reason: InitVar[str] = ""
     runtime: dict[str, Any] = field(default_factory=dict)
     discovery_failure: FailureInfo | None = None
+    inputs: tuple[LogicalArchiveInput, ...] = field(default=(), init=False)
+    recovery: InputRecovery = field(default_factory=InputRecovery, init=False, repr=False)
+    password_probe_input: ArchiveInputDescriptor | None = field(default=None, init=False, repr=False)
 
     def __post_init__(
         self,
         _archive_input: ArchiveInputDescriptor,
         initial_discovery_source: str,
         discovery_evidence: dict[str, Any] | None,
-        discovery_segments: tuple[tuple[ArchiveInputDescriptor, dict[str, Any]], ...],
+        initial_inputs: tuple[LogicalArchiveInput, ...],
         initial_discovery_reason: str,
     ) -> None:
         descriptor = _archive_input
@@ -44,11 +54,12 @@ class ArchiveTask:
             self.key = descriptor.entry_path
         self._knowledge = ArchiveKnowledge()
         self._archive_input = descriptor
+        self.inputs = (LogicalArchiveInput(descriptor, failure=self.discovery_failure),)
         self._initialize_knowledge(
             discovery_source=str(initial_discovery_source or ""),
             discovery_reason=str(initial_discovery_reason or ""),
             discovery_evidence=dict(discovery_evidence or {}),
-            discovery_segments=tuple(discovery_segments),
+            initial_inputs=initial_inputs,
         )
 
     @classmethod
@@ -60,7 +71,7 @@ class ArchiveTask:
         carrier_path: str = "",
         cleanup_paths: list[str] | tuple[str, ...] = (),
         discovery_evidence: dict[str, Any] | None = None,
-        discovery_segments: tuple[tuple[ArchiveInputDescriptor, dict[str, Any]], ...] = (),
+        logical_inputs: tuple[LogicalArchiveInput, ...] = (),
         discovery_reason: str = "",
         discovery_failure: FailureInfo | None = None,
     ) -> "ArchiveTask":
@@ -70,7 +81,7 @@ class ArchiveTask:
             cleanup_parts=list(cleanup_paths),
             initial_discovery_source=discovery_source,
             discovery_evidence=dict(discovery_evidence or {}),
-            discovery_segments=tuple(discovery_segments),
+            initial_inputs=logical_inputs,
             initial_discovery_reason=discovery_reason,
             discovery_failure=discovery_failure,
         )
@@ -94,15 +105,11 @@ class ArchiveTask:
 
     @property
     def all_parts(self) -> list[str]:
-        parts = self.archive_input().part_paths()
-        segments = self._knowledge.get("source.extractable_segments", ())
-        if not segments:
-            return parts
-        return list(dedupe_values([*parts, *(
-            part["path"] for segment in segments
-            for part in [*segment["archive_input"].get("parts", ()),
-                         *segment["archive_input"].get("ranges", ())]
-        )]))
+        return list(dedupe_values(path for node in self.inputs for path in node.source_paths))
+
+    def set_inputs(self, inputs: tuple[LogicalArchiveInput, ...]) -> None:
+        self.inputs = inputs
+        self.cleanup_parts = list(dedupe_values([*self.cleanup_parts, *self.all_parts]))
 
     def archive_input(self) -> ArchiveInputDescriptor:
         return self._archive_input
@@ -114,12 +121,16 @@ class ArchiveTask:
         self._knowledge = ArchiveKnowledge.from_any(knowledge)
 
     def set_archive_input(self, descriptor: ArchiveInputDescriptor) -> None:
+        previous = self._archive_input
         self.cleanup_parts = list(dedupe_values([
             *descriptor.part_paths(),
             *self.cleanup_parts,
             self.carrier_path,
         ]))
         self._archive_input = descriptor
+        if len(self.inputs) == 1 and self.inputs[0].descriptor is previous:
+            from dataclasses import replace
+            self.inputs = (replace(self.inputs[0], descriptor=descriptor),)
 
     def apply_path_mapping(self, path_map: dict[str, str]) -> None:
         if not path_map:
@@ -135,16 +146,9 @@ class ArchiveTask:
         self.carrier_path = mapped(self.carrier_path or self.main_path)
         self.cleanup_parts = [mapped(path) for path in self.cleanup_parts]
         self.set_archive_input(self.archive_input().with_path_mapping(mapped))
-        for key in ("source.extractable_segments", "source.selected_segment"):
-            value = self._knowledge.get(key)
-            if not value:
-                continue
-            rows = value if isinstance(value, list) else [value]
-            updated = [{**row, "archive_input": ArchiveInputDescriptor.from_dict(
-                row["archive_input"]).with_path_mapping(mapped).to_dict()}
-                if row.get("archive_input") else row for row in rows]
-            self._knowledge.set(key, updated if isinstance(value, list) else updated[0],
-                                source_layer="contracts", source_module="archive_task")
+        self.inputs = tuple(node.remap(mapped) for node in self.inputs)
+        if self.password_probe_input is not None:
+            self.password_probe_input = self.password_probe_input.with_path_mapping(mapped)
 
     def adopt_detection_plan(self, replacement: "ArchiveTask") -> None:
         runtime = dict(self.runtime)
@@ -154,6 +158,8 @@ class ArchiveTask:
         self._knowledge = ArchiveKnowledge.from_any(replacement.knowledge())
         self._archive_input = replacement.archive_input()
         self.discovery_failure = replacement.discovery_failure
+        self.inputs = replacement.inputs
+        self.password_probe_input = replacement.password_probe_input
         self.runtime = runtime
 
     def _initialize_knowledge(
@@ -162,7 +168,7 @@ class ArchiveTask:
         discovery_source: str,
         discovery_reason: str,
         discovery_evidence: dict[str, Any],
-        discovery_segments: tuple[tuple[ArchiveInputDescriptor, dict[str, Any]], ...],
+        initial_inputs: tuple[LogicalArchiveInput, ...],
     ) -> None:
         prepass = discovery_evidence.pop("scan", None)
         self._knowledge.merge({
@@ -172,22 +178,8 @@ class ArchiveTask:
                 "evidence": dict(discovery_evidence),
             },
         }, source_layer="contracts", source_module="archive_task")
-        if discovery_segments:
-            self._knowledge.set(
-                "source.extractable_segments",
-                [
-                    _segment_payload(index, descriptor, evidence)
-                    for index, (descriptor, evidence) in enumerate(discovery_segments, start=1)
-                ],
-                source_layer="discovery",
-                source_module=discovery_source or "discovery",
-            )
-            self._knowledge.set(
-                "source.selected_segment",
-                _segment_payload(1, *discovery_segments[0]),
-                source_layer="discovery",
-                source_module=self.discovery_source or "discovery",
-            )
+        if initial_inputs:
+            self.set_inputs(initial_inputs)
         if isinstance(prepass, dict):
             self._knowledge.set(
                 "inspection.prepass",
@@ -195,27 +187,3 @@ class ArchiveTask:
                 source_layer="embedded",
                 source_module="discovery",
             )
-
-
-def _segment_payload(index: int, descriptor: ArchiveInputDescriptor, evidence: dict[str, Any]) -> dict[str, Any]:
-    extent = descriptor.primary_extent
-    start_offset = extent.start if extent is not None else int(evidence.get("offset") or 0)
-    end_offset = (
-        extent.end
-        if extent is not None and extent.end is not None
-        else evidence.get("end_offset")
-    )
-    confidence = descriptor.analysis.get("segment_confidence", evidence.get("confidence"))
-    damage_flags = descriptor.analysis.get("damage_flags") or evidence.get("damage_flags") or ()
-    return {
-        "segment_id": f"embedded_{index:02d}",
-        "index": index,
-        "format": descriptor.format_hint,
-        "start_offset": int(start_offset),
-        "end_offset": int(end_offset) if end_offset is not None else None,
-        "confidence": float(confidence or 0.0),
-        "damage_flags": [str(item) for item in damage_flags if str(item)],
-        "logical_name": descriptor.logical_name,
-        "segment": evidence,
-        "archive_input": descriptor.to_dict(),
-    }

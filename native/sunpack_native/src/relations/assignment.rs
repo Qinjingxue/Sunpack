@@ -243,17 +243,32 @@ impl BucketView<'_> {
     ) -> Option<VolumeAssignment> {
         let mut out = fixed.clone();
         out.unresolved.clear();
+        // Raw chunks may be labelled from zero (or another origin). Only a
+        // structurally proven head establishes the translation to logical #1;
+        // RAR/spanned ZIP internal volume numbers retain their exact meaning.
+        let offset = if generic && matches!(self.format, "7z" | "zip") && !self.spanned() {
+            structural
+                .slots
+                .get(&1)
+                .and_then(|i| self.features.get(i))
+                .and_then(|f| profile.number(channel, f))
+                .map_or(0, |value| 1 - i64::from(value))
+        } else {
+            0
+        };
+        let number = |features: &NameFeatures| {
+            profile
+                .number(channel, features)
+                .and_then(|value| u32::try_from(i64::from(value) + offset).ok())
+                .filter(|value| *value > 0)
+        };
         // Bound the candidate before inserting optional files. A terminal whose
         // slot is inferred by this channel still excludes same-channel noise.
         let terminal = self.terminal_for_assignment(fixed).or_else(|| {
             self.indexes
                 .iter()
                 .filter(|i| self.facts[i].has_next == Some(false))
-                .filter_map(|i| {
-                    self.features
-                        .get(i)
-                        .and_then(|f| profile.number(channel, f))
-                })
+                .filter_map(|i| self.features.get(i).and_then(number))
                 .min()
         });
         if generic {
@@ -261,21 +276,14 @@ impl BucketView<'_> {
                 if let Some(features) = self.features.get(&i) {
                     // Only matching fields constrain this channel. Other
                     // filename fields cannot override a structural identity.
-                    if profile
-                        .number(channel, features)
-                        .is_some_and(|value| value != n)
-                    {
+                    if number(features).is_some_and(|value| value != n) {
                         return None;
                     }
                 }
             }
         } else {
             for (&n, &i) in &fixed.slots {
-                if let Some(value) = self
-                    .features
-                    .get(&i)
-                    .and_then(|f| profile.number(channel, f))
-                {
+                if let Some(value) = self.features.get(&i).and_then(number) {
                     if value != n {
                         return None;
                     }
@@ -285,7 +293,7 @@ impl BucketView<'_> {
         let mut inferred = 0;
         for &i in &fixed.unresolved {
             let features = self.features.get(&i)?;
-            match profile.number(channel, features) {
+            match number(features) {
                 Some(n) if self.legal(i, n, terminal) => {
                     if out.slots.insert(n, i).is_some() {
                         return None;

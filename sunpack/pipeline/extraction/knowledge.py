@@ -104,7 +104,7 @@ def _compact_diagnostics(diagnostics: dict[str, Any]) -> dict[str, Any]:
     result = diagnostics.get("result") if isinstance(diagnostics.get("result"), dict) else {}
     if result:
         output["result"] = _compact_worker_result(result)
-    for key in ("output_trace", "segments", "embedded_segments"):
+    for key in ("output_trace", "segments", "inputs"):
         value = diagnostics.get(key)
         if isinstance(value, dict):
             output[key] = _compact_mapping(value, max_items=30)

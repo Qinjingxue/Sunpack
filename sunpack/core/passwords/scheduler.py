@@ -256,7 +256,7 @@ class PasswordScheduler:
             # The authoritative Rust descriptor identifies ENC independently of its
             # physical name. One remaining candidate needs only the worker's Open;
             # the ordinary extraction-confirmation path commits success/rejection.
-            if str((job.archive_input or {}).get("format_hint") or "").strip().lower() == "enc":
+            if job.archive_input is not None and job.archive_input.format_hint == "enc":
                 first = list(islice(candidates, 2))
                 if len(first) == 1:
                     result = PasswordSearchResult(
@@ -508,7 +508,7 @@ def _archive_failure_status(status: str, job: PasswordJob) -> PasswordSearchStat
     if status == "needs_volume_or_tail_damaged":
         # Reuse the Rust analysis already attached to this exact logical input.
         # A tail read fault alone is not proof that another volume exists.
-        execution = (job.archive_input or {}).get("analysis", {}).get("execution", {})
+        execution = job.archive_input.analysis.get("execution", {}) if job.archive_input is not None else {}
         if execution.get("missing_volume_evidence"):
             return PasswordSearchStatus.MISSING_VOLUME
     return PasswordSearchStatus(status)

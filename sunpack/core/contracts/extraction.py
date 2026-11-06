@@ -6,8 +6,25 @@ from typing import Any, Optional, TYPE_CHECKING
 from sunpack.core.contracts.failures import FailureInfo
 
 if TYPE_CHECKING:
+    from sunpack.core.contracts.input_plan import LogicalArchiveInput
     from sunpack_native import NativeProgressManifest
     from sunpack.pipeline.extraction.output_inventory import OutputInventory
+
+
+@dataclass(slots=True)
+class InputExecutionResult:
+    input: LogicalArchiveInput
+    result: ExtractionResult
+    verified_complete: bool | None = None
+
+    @property
+    def complete(self) -> bool:
+        return self.result.success and self.verified_complete is not False
+
+    def projection(self) -> dict:
+        return {**self.input.projection(), "success": self.result.success,
+                "partial_outputs": self.result.partial_outputs,
+                "verified_complete": self.verified_complete}
 
 
 @dataclass
@@ -30,11 +47,14 @@ class ExtractionResult:
     # In-process child results for carriers containing independent archives.
     # These retain native output inventories for the normal verifier without
     # expanding per-file tables into the persisted outer diagnostics.
-    embedded_results: list[tuple[dict[str, Any], "ExtractionResult"]] = field(default_factory=list)
+    logical_input: LogicalArchiveInput | None = None
+    input_results: list[InputExecutionResult] = field(default_factory=list)
+    retained_complete_count: int = 0
 
-    def complete_embedded_results(self):
+    @property
+    def has_complete_inputs(self) -> bool:
+        return bool(self.retained_complete_count or any(self.complete_input_results()))
+
+    def complete_input_results(self):
         """Independent payloads safe to retain and recursively discover."""
-        return (
-            (segment, result) for segment, result in self.embedded_results
-            if result.success and segment.get("verified_complete", True)
-        )
+        return (item for item in self.input_results if item.complete)

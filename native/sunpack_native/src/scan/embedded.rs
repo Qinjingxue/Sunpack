@@ -258,47 +258,58 @@ impl NativeScanResult {
         self.to_py_dict_with_rar_resolution(py, None, Some(offset))
     }
 
-    /// One sparse nomination per physical input, never one VolumeAnchor per
-    /// ZIP local record. Independent complete siblings remain in the scan.
-    pub(crate) fn relation_anchor(&self) -> Option<VolumeAnchor> {
-        let mut candidates = self
-            .candidates
+    /// A physical source may contain several independent volume inputs. ZIP
+    /// local records without a volume proof still nominate only one hypothesis.
+    pub(crate) fn relation_anchors(&self) -> Vec<VolumeAnchor> {
+        let mut zip_hypothesis = false;
+        self.candidates
             .iter()
-            .filter(|c| c.volume_anchor.is_some() || (c.format == "zip" && c.end_offset.is_none()));
-        let first = candidates.next()?;
-        if candidates.any(|c| c.format != first.format || first.format != "zip") {
-            return None;
-        }
-        let split = first.validation == "zip_split_local_header";
-        let mut anchor = first
-            .volume_anchor
-            .as_deref()
-            .cloned()
-            .unwrap_or_else(|| VolumeAnchor {
-                size: self.file_size,
-                format: "zip".into(),
-                confidence: if split { "strong" } else { "weak" }.into(),
-                multivolume: split,
-                continuation_to_next: split,
-                internal_volume_number: split.then_some(1),
-                structure_offset: Some(first.offset),
-                anchor_roles: if split { vec!["first"] } else { vec![] },
-                evidence: if split {
-                    vec!["zip:split_marker", "zip:local_header"]
-                } else {
-                    vec!["zip:local_header"]
-                },
-                ..VolumeAnchor::default()
-            });
-        anchor.carrier_limit = self
-            .candidates
-            .iter()
-            .filter(|c| {
-                c.offset > first.offset && c.boundary_kind == "exact" && c.volume_anchor.is_none()
+            .filter_map(|first| {
+                if first.volume_anchor.is_none() {
+                    if first.format != "zip"
+                        || first.end_offset.is_some()
+                        || (zip_hypothesis && first.validation != "zip_split_local_header")
+                    {
+                        return None;
+                    }
+                    zip_hypothesis = true;
+                } else if first.format == "zip" {
+                    zip_hypothesis = true;
+                }
+                let split = first.validation == "zip_split_local_header";
+                let mut anchor =
+                    first
+                        .volume_anchor
+                        .as_deref()
+                        .cloned()
+                        .unwrap_or_else(|| VolumeAnchor {
+                            size: self.file_size,
+                            format: "zip".into(),
+                            confidence: if split { "strong" } else { "weak" }.into(),
+                            multivolume: split,
+                            continuation_to_next: split,
+                            internal_volume_number: split.then_some(1),
+                            structure_offset: Some(first.offset),
+                            anchor_roles: if split { vec!["first"] } else { vec![] },
+                            evidence: if split {
+                                vec!["zip:split_marker", "zip:local_header"]
+                            } else {
+                                vec!["zip:local_header"]
+                            },
+                            ..VolumeAnchor::default()
+                        });
+                anchor.carrier_limit = self
+                    .candidates
+                    .iter()
+                    .filter(|c| {
+                        c.offset > first.offset
+                            && (c.boundary_kind == "exact" || c.volume_anchor.is_some())
+                    })
+                    .map(|c| c.offset)
+                    .min();
+                Some(anchor)
             })
-            .map(|c| c.offset)
-            .min();
-        Some(anchor)
+            .collect()
     }
 
     pub(crate) fn has_candidates(&self) -> bool {

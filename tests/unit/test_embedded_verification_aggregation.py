@@ -39,13 +39,13 @@ def _verification(*, decision, integrity, completeness, complete=0, failed=0):
 
 def test_all_embedded_payloads_complete_make_carrier_complete():
     result = aggregate_payload_verifications([
-        ({"segment_id": "zip", "format": "zip", "success": True}, _verification(
+        ({"input_id": "zip", "format": "zip", "success": True}, _verification(
             decision=DECISION_ACCEPT,
             integrity=CONTENT_INTEGRITY_VERIFIED_COMPLETE,
             completeness=1.0,
             complete=2,
         )),
-        ({"segment_id": "rar", "format": "rar", "success": True}, _verification(
+        ({"input_id": "rar", "format": "rar", "success": True}, _verification(
             decision=DECISION_ACCEPT,
             integrity=CONTENT_INTEGRITY_VERIFIED_COMPLETE,
             completeness=1.0,
@@ -62,14 +62,14 @@ def test_all_embedded_payloads_complete_make_carrier_complete():
 
 def test_one_damaged_embedded_payload_keeps_carrier_partial():
     result = aggregate_payload_verifications([
-        ({"segment_id": "zip", "format": "zip", "success": True}, _verification(
+        ({"input_id": "zip", "format": "zip", "success": True}, _verification(
             decision=DECISION_ACCEPT,
             integrity=CONTENT_INTEGRITY_VERIFIED_COMPLETE,
             completeness=1.0,
             complete=2,
         )),
         ({
-            "segment_id": "rar",
+            "input_id": "rar",
             "format": "rar",
             "success": False,
             "partial_outputs": True,
@@ -92,7 +92,7 @@ def test_one_damaged_embedded_payload_keeps_carrier_partial():
 def test_verifier_accept_does_not_hide_embedded_extraction_failure():
     result = aggregate_payload_verifications([
         ({
-            "segment_id": "zip",
+            "input_id": "zip",
             "format": "zip",
             "success": False,
             "partial_outputs": False,

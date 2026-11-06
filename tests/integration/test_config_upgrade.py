@@ -6,6 +6,32 @@ from sunpack.core.config.schema import normalize_config
 from sunpack.pipeline.discovery.filesystem.directory_scanner import DirectoryScanner
 
 
+def test_installer_resets_old_input_recovery_once_and_preserves_user_files(tmp_path, repo_root):
+    # Configuration migration does not exercise checkpoint/WAL retirement. One
+    # real upgrade and repeat prove old continuations cannot enter the new model
+    # and current recovery survives later installations, without any runtime shim.
+    state = tmp_path / "custom ' [watch]"
+    state.mkdir()
+    snapshot = state / "state.snapshot"
+    wal = state / "state.journal.00000000000000000001.wal"
+    kept = state / "events.json"
+    for path in (snapshot, wal, kept):
+        path.write_text("preserved or reset", encoding="utf-8")
+    user = tmp_path / "sunpack_config.json"
+    user.write_text('{"cli":{"language":"en"}}', encoding="utf-8")
+    advanced = tmp_path / "advanced.json"
+    advanced.write_text(json.dumps({"watch": {"state_dir": str(state)}}), encoding="utf-8")
+    command = ["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+               "-File", str(repo_root / "scripts/upgrade_config.ps1"), "-UserConfig", str(user),
+               "-AdvancedConfig", str(advanced)]
+    subprocess.run(command, check=True, capture_output=True)
+    assert not snapshot.exists() and not wal.exists()
+    assert kept.read_text(encoding="utf-8") == "preserved or reset"
+    snapshot.write_text("current recovery", encoding="utf-8")
+    subprocess.run(command, check=True, capture_output=True)
+    assert snapshot.read_text(encoding="utf-8") == "current recovery"
+
+
 def test_installer_unifies_path_rules_ors_switches_and_is_idempotent(tmp_path, repo_root):
     """Only the real upgrade script can catch lost rules, switch activation or repeated rewrites.
 

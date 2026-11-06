@@ -53,13 +53,14 @@ class PasswordProbeInput:
 
 def prepare_password_input(
     archive_path: str, *, part_paths: list[str] | None = None,
-    archive_input: dict | PasswordProbeInput | None = None,
+    archive_input: ArchiveInputDescriptor | dict | PasswordProbeInput | None = None,
 ) -> PasswordProbeInput:
     if isinstance(archive_input, PasswordProbeInput):
         return archive_input
     if not archive_input:
         return PasswordProbeInput(archive_input, archive_path, volume_aware=bool(part_paths), session_paths=(archive_path,))
-    descriptor = ArchiveInputDescriptor.from_dict(archive_input, archive_path=archive_path, part_paths=part_paths)
+    descriptor = (archive_input if isinstance(archive_input, ArchiveInputDescriptor) else
+                  ArchiveInputDescriptor.from_dict(archive_input, archive_path=archive_path, part_paths=part_paths))
     path = descriptor.entry_path or archive_path
     volumes = None
     volume_aware = descriptor.open_mode == "sfx_with_volumes"
@@ -79,6 +80,7 @@ def prepare_password_input(
             ranges = [extent.to_dict() for extent in extents]
     physical = volumes if volume_aware and volumes else ranges
     return PasswordProbeInput(
-        archive_input, path, ranges, volumes, descriptor.volume_style, volume_aware,
+        {"format_hint": descriptor.format_hint, "analysis": descriptor.analysis},
+        path, ranges, volumes, descriptor.volume_style, volume_aware,
         tuple(item["path"] for item in physical) if physical else (path,),
     )

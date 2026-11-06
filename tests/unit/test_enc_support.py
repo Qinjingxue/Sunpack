@@ -32,7 +32,7 @@ def _flip_byte(path: Path, offset: int) -> None:
 
 def worker(path, output, candidates=("sunpack-test",), *, origin="foreground"):
     request = {"job_id": output.name, "origin": origin, "archive_path": str(path),
-               "archive_input": {"kind": "file", "entry_path": str(path), "format_hint": "enc"},
+               "archive_input": {"kind": "archive_input", "entry_path": str(path), "format_hint": "enc"},
                "output_dir": str(output), "password_candidates": list(candidates)}
     completed = subprocess.run([str(sevenzip_artifact("sunpack_sevenzip_worker.exe"))],
                                input=json.dumps(request, ensure_ascii=False), text=True,
@@ -142,7 +142,7 @@ def test_shared_worker_interleaves_watch_cli_success_wrong_password_and_damage(t
                 path = DATA / ("bad_mac.enc" if i % 4 == 3 else f"algorithm_{i % 10}.mov")
                 candidates = ["wrong1"] if i % 4 == 2 else ["sunpack-test"]
                 request = json.dumps({"job_id": str(i), "origin": "watch" if i % 2 else "foreground",
-                                      "archive_path": str(path), "format_hint": "enc",
+                                      "archive_input": {"entry_path": str(path), "open_mode": "file", "format_hint": "enc"},
                                       "output_dir": str(tmp_path / str(i)), "password_candidates": candidates})
                 await process.submit(request, str(i), parsed_events=True,
                                      on_line=lambda line, event: events.append(event) or event.get("event") == "job_finished",

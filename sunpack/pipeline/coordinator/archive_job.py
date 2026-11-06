@@ -66,8 +66,8 @@ class ArchiveJobOutcome:
         # disposable partial files.
         if (
             self.result.failure is not None
-            and self.result.failure.contains(FailureKind.EMBEDDED_SEGMENTS_FAILED)
-            and any(self.result.complete_embedded_results())
+            and self.result.failure.contains(FailureKind.INPUTS_FAILED)
+            and self.result.has_complete_inputs
         ):
             return False
         if self.content_requirement != CONTENT_REQUIREMENT_COMPLETE:
@@ -200,7 +200,7 @@ class ArchiveJobExecutor:
         )
         preserve_output = bool(result.output_dir and (
             task.runtime.get("retry_output_dir")
-            or result.outcome_kind != OutcomeKind.FAILURE or any(outcome.result.complete_embedded_results())
+            or result.outcome_kind != OutcomeKind.FAILURE or outcome.result.has_complete_inputs
         ))
         path = outcome.planned_out_dir
         if path in self._uncommitted_outputs and not os.path.lexists(path):
@@ -425,7 +425,7 @@ class ArchiveJobExecutor:
         out_dir = res.out_dir
         inventory = OutputInventory.from_value(res.output_inventory, expected_root=out_dir) if out_dir else None
         payload_inventory = (inventory.stats.file_count, inventory.stats.total_size) if inventory is not None else None
-        if res.embedded_results:
+        if res.input_results:
             payload_inventory = (res.files_written, res.bytes_written)
         cleanup = cleanup_failed_output_if_eligible(
             out_dir,
@@ -438,7 +438,7 @@ class ArchiveJobExecutor:
         res.diagnostics = {**diagnostics, "failed_output_cleanup": cleanup.to_dict()}
 
         if res.failure is not None and (
-            task.runtime.get("retry_output_dir") or any(res.complete_embedded_results())
+            task.runtime.get("retry_output_dir") or res.has_complete_inputs
         ):
             # The path itself is the continuation signal; no output scan or
             # retained success inventories are needed across requests/restarts.
@@ -650,7 +650,7 @@ def _should_retry_missing_volume_resolution(
     failure = result.failure
     # The physical-family fallback replaces the entire task and clears its
     # output. Multi-input carriers resume through the segment continuation.
-    return bool(failure is not None and not result.embedded_results
+    return bool(failure is not None and not result.input_results
                 and failure.contains(FailureKind.MISSING_VOLUME))
 
 

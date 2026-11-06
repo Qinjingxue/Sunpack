@@ -108,9 +108,9 @@ def test_password_key_separates_top_level_ranges_and_concat_order(tmp_path):
     def key(descriptor):
         return build_archive_fingerprint(str(archive), archive_input=descriptor).key
 
-    assert key({"kind": "file_range", "start": 0, "end": 3}) != key(
-        {"kind": "file_range", "start": 3, "end": 6})
+    assert key({"open_mode": "file_range", "parts": [{"path": str(archive), "start": 0, "end": 3}]}) != key(
+        {"open_mode": "file_range", "parts": [{"path": str(archive), "start": 3, "end": 6}]})
     ranges = [{"path": str(archive), "start": 0, "end": 3},
               {"path": str(archive), "start": 3, "end": 6}]
-    assert key({"kind": "concat_ranges", "ranges": ranges}) != key(
-        {"kind": "concat_ranges", "ranges": list(reversed(ranges))})
+    assert key({"open_mode": "concat_ranges", "ranges": ranges}) != key(
+        {"open_mode": "concat_ranges", "ranges": list(reversed(ranges))})

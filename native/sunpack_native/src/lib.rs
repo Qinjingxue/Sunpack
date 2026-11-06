@@ -42,6 +42,7 @@ fn native_available() -> bool {
 
 #[pymodule]
 fn sunpack_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(io::archive_state::archive_input_slice, m)?)?;
     m.add_function(wrap_pyfunction!(native_available, m)?)?;
     m.add_function(wrap_pyfunction!(password::lists::read_password_file, m)?)?;
     m.add_function(wrap_pyfunction!(

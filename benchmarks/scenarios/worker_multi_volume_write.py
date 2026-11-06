@@ -257,12 +257,10 @@ def _job_payload(
     return json.dumps(
         {
             "job_id": job_id,
-            "archive_path": str(archive),
-            "part_paths": [str(archive)],
+            "archive_input": {"entry_path": str(archive), "open_mode": "file", "format_hint": "zip"},
             "output_dir": normalized,
             "output_volume_key": volume_key,
             "password": "",
-            "format_hint": "zip",
             "dry_run": False,
         },
         ensure_ascii=False,

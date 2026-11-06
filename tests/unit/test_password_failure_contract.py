@@ -97,8 +97,8 @@ def test_embedded_failure_retains_nested_password_cause():
         user_action="request_password",
     )
     embedded = FailureInfo(
-        kind=FailureKind.EMBEDDED_SEGMENTS_FAILED,
-        stage="embedded_segments",
+        kind=FailureKind.INPUTS_FAILED,
+        stage="inputs",
         message="segment failed",
         causes=(password,),
     )

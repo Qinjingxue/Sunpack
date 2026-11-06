@@ -299,6 +299,15 @@ struct EntryRecord {
     password_generation: i64,
 }
 
+impl EntryRecord {
+    fn blocks(&self, blocker: &str) -> bool {
+        self.failure_payload
+            .get("blockers")
+            .and_then(Value::as_array)
+            .is_some_and(|values| values.iter().any(|value| value.as_str() == Some(blocker)))
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Cursor {
@@ -1003,13 +1012,19 @@ impl NativeWatchState {
     }
 
     /// Entries, optionally only those with one ``status``.
-    #[pyo3(signature = (status=None))]
-    fn entry_items(&self, py: Python<'_>, status: Option<&str>) -> PyResult<Vec<Py<PyDict>>> {
+    #[pyo3(signature = (status=None, *, blocker=None))]
+    fn entry_items(
+        &self,
+        py: Python<'_>,
+        status: Option<&str>,
+        blocker: Option<&str>,
+    ) -> PyResult<Vec<Py<PyDict>>> {
         let records: Vec<_> = self
             .lock()
             .entries
             .values()
             .filter(|value| status.is_none_or(|status| value.status == status))
+            .filter(|value| blocker.is_none_or(|blocker| value.blocks(blocker)))
             .cloned()
             .collect();
         records
@@ -1023,6 +1038,13 @@ impl NativeWatchState {
             .entries
             .values()
             .any(|value| value.status == status)
+    }
+
+    fn has_entry_blocker(&self, blocker: &str) -> bool {
+        self.lock()
+            .entries
+            .values()
+            .any(|value| value.blocks(blocker))
     }
 
     fn has_pending(&self, path: &str) -> bool {

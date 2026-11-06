@@ -845,12 +845,18 @@ fn rar4_stored_password_matches(
 
 fn derive_rar3_key_iv(password: &str, salt: Option<&[u8; 8]>) -> Option<([u8; 16], [u8; 16])> {
     let cancellation = Cancellation::current();
-    let mut password_bytes = Vec::with_capacity(password.len() * 2 + salt.map_or(0, |_| 8));
-    for unit in password.encode_utf16() {
+    let mut password_bytes =
+        Vec::with_capacity(password.len().min(127) * 2 + salt.map_or(0, |_| 8));
+    // RAR3 stores at most 127 UTF-16 code units (also used by the worker).
+    for unit in password.encode_utf16().take(127) {
         password_bytes.extend_from_slice(&unit.to_le_bytes());
     }
     if let Some(salt) = salt {
         password_bytes.extend_from_slice(salt);
+    }
+
+    if password_bytes.len() > 64 {
+        return derive_rar3_long_key_iv(password_bytes);
     }
 
     // Batch the unchanged SHA1 byte stream, stopping immediately after each
@@ -891,6 +897,51 @@ fn derive_rar3_key_iv(password: &str, salt: Option<&[u8; 8]>) -> Option<([u8; 16
         key[src + 1] = digest[src + 2];
         key[src + 2] = digest[src + 1];
         key[src + 3] = digest[src];
+    }
+    Some((key, iv))
+}
+
+fn derive_rar3_long_key_iv(mut raw: Vec<u8>) -> Option<([u8; 16], [u8; 16])> {
+    // RAR3's original SHA1 implementation mutates complete input blocks after
+    // the first block boundary. Long passwords must retain that format quirk;
+    // batching unchanged records is valid only for raw inputs <= 64 bytes.
+    // See the bundled 7-Zip Crypto/RarAes.cpp, UpdatePswDataSha1 / CalcKey.
+    let cancellation = Cancellation::current();
+    let mut sha = Sha1::new();
+    let mut iv = [0u8; 16];
+    let mut position = 0usize;
+    for counter in 0..RAR3_KDF_ITERATIONS {
+        if counter & 63 == 0 && cancellation.cancelled() {
+            return None;
+        }
+        sha.update(&raw);
+        let mut offset = 64 - (position & 63);
+        while offset + 64 <= raw.len() {
+            let block = &mut raw[offset..offset + 64];
+            let mut words = [0u32; 80];
+            for (word, bytes) in words.iter_mut().zip(block.chunks_exact(4)) {
+                *word = u32::from_be_bytes(bytes.try_into().unwrap());
+            }
+            for i in 16..80 {
+                words[i] =
+                    (words[i - 3] ^ words[i - 8] ^ words[i - 14] ^ words[i - 16]).rotate_left(1);
+            }
+            for (bytes, word) in block.chunks_exact_mut(4).zip(&words[64..]) {
+                bytes.copy_from_slice(&word.to_le_bytes());
+            }
+            offset += 64;
+        }
+        sha.update(&counter.to_le_bytes()[..3]);
+        position += raw.len() + 3;
+        if counter % 0x4000 == 0 {
+            iv[(counter / 0x4000) as usize] = sha.clone().finalize()[19];
+        }
+    }
+    let digest = sha.finalize();
+    let mut key = [0u8; 16];
+    for (target, source) in key.chunks_exact_mut(4).zip(digest[..16].chunks_exact(4)) {
+        target.copy_from_slice(source);
+        target.reverse();
     }
     Some((key, iv))
 }
@@ -1667,8 +1718,9 @@ mod kdf_regression_tests {
     // One scalar byte-stream oracle checks all key/IV bytes for salt and UTF-16.
     #[test]
     fn rar4_batched_kdf_preserves_key_and_all_iv_checkpoints() {
-        let long = "长🔐password".repeat(70);
-        for password in ["", "secret", "密碼🔐", long.as_str()] {
+        // Longer raw inputs use RAR3's mutating SHA1 variant, covered by the
+        // real multi-head encrypted carrier lifecycle rather than this oracle.
+        for password in ["", "secret", "密碼🔐", "abcdefghijklmnopqrstuvwxyz12"] {
             for salt in [None, Some(&[0x91u8; 8])] {
                 let mut raw = password
                     .encode_utf16()

@@ -62,7 +62,7 @@ def test_worker_extracts_zip_without_7z_dll(tmp_path):
         worker,
         {
             "job_id": "embedded-backend-worker",
-            "archive_path": str(archive),
+            "archive_input": {"entry_path": str(archive), "open_mode": "file", "format_hint": "zip"},
             "output_dir": str(output_dir),
             "password": "",
             "format_hint": "",

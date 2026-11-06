@@ -81,7 +81,9 @@ sunpack.runtime.watch
 
 ### core.contracts
 
-`sunpack.core.contracts` 是共享数据契约层。Discovery 通过 `StageResult.resolved_tasks` 直接产出 `ArchiveTask`；`DiscoveryCandidate` 只保存短期线索，`ArchiveInputDescriptor` 拥有物理输入。分卷部件与拼接输入统一用 `InputExtent` 表示字节区间。`ArchiveTask` 拥有归档知识与运行时状态。解压、验证分别返回 `ExtractionResult`、`VerificationResult`，验证方法返回的 `VerificationStep` 直接保存在结果中。`RunState.snapshot()` 生成 `RunSummary`，计数与失败从 `TargetRunResult` 投影。
+`sunpack.core.contracts` 是共享数据契约层。Discovery 通过 `StageResult.resolved_tasks` 直接产出 `ArchiveTask`；`DiscoveryCandidate` 只保存短期线索。`ArchiveTask` 是物理输入的调度、lease 和清理组，`inputs` 中的 `LogicalArchiveInput` 分别代表可独立处理的归档。每个逻辑输入有稳定 ID、canonical `ArchiveInputDescriptor`、分析事实和阻塞原因；部件与拼接输入统一用 `InputExtent` 表示字节区间。解压、验证分别返回 `ExtractionResult`、`VerificationResult`，验证方法返回的 `VerificationStep` 直接保存在结果中。`RunState.snapshot()` 生成 `RunSummary`，计数与失败从 `TargetRunResult` 投影。
+
+普通文件、分卷组和载体段共用逻辑输入生命周期。Rust 首次分析确定映射，密码或成员变化时细化事实；执行、校验、递归扫描直接传递类型化输入和逐输入结果，不从诊断字典重建输入。`InputRecovery` 为每个输入保存依赖源的代次、输出位置、完成状态和失败；缺卷与缺密码可同时存在。CLI 和 Watch 使用同一个选择器，只重试依赖变化的输入或密码等待者，保留已完成的兄弟输入。持久化检查点不含密码、读取句柄或文件清单，共享载体在整组完成后按用户可见文件清理。
 
 ### pipeline.discovery.filesystem
 
@@ -125,7 +127,7 @@ sunpack.runtime.watch
 
 ### pipeline.extraction
 
-`sunpack.pipeline.extraction` 是单归档解压执行层。它消费由 Detection/input planner 完整解析的 `ArchiveTask`、`source.*` 输入和 password resolution，调用 `sunpack_sevenzip_worker.exe` 通过 `7z.dll` 解压普通文件、`file_range` 或 `concat_ranges` 虚拟输入。它不查询 Relations、不扫描候选、不调度 pipeline 批次，也不做成功后清理。
+`sunpack.pipeline.extraction` 消费 Detection/input planner 解析的类型化逻辑输入和 password resolution，逐输入返回 `InputExecutionResult`。单输入保留直接执行快路径，多输入拥有隔离的输出目录。Worker 只接收 canonical `archive_input`，底层仍可按读取模式选择文件、具名分卷或区间流适配器。它不查询 Relations、不扫描候选、不调度 pipeline 批次，也不做成功后清理。
 
 ### pipeline.verification
 

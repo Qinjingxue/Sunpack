@@ -268,7 +268,7 @@ def test_single_enc_candidate_uses_extraction_confirmation_and_cache(tmp_path, m
     scheduler = PasswordScheduler(fast)
     descriptor = {"format_hint": "enc", "open_mode": mode}
     if mode != "file":
-        descriptor["parts"] = [{"path": str(archive), "start": 2, "end": 12}]
+        descriptor["ranges" if mode == "concat_ranges" else "parts"] = [{"path": str(archive), "start": 2, "end": 12}]
     job = PasswordJob(
         archive_path=str(archive), archive_input=descriptor,
         candidates=PasswordCandidatePipeline.from_values(["secret", "secret"]),
@@ -384,7 +384,7 @@ def test_extraction_plan_preserves_zipcrypto_candidate_evidence(tmp_path):
     assert result.password is None
     assert result.extraction_candidates == ("collision", "secret")
     assert result.extraction_candidate_evidence == "zipcrypto_header_byte"
-    assert scheduler.cache.has_negative(build_archive_fingerprint(str(archive)).key, "rejected") is True
+    assert scheduler.cache.has_negative(build_archive_fingerprint(str(archive), archive_input={"format_hint": "zip"}).key, "rejected") is True
 
 
 @pytest.mark.parametrize("prefix", [[], ["proven-bad"]])

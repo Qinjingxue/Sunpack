@@ -72,8 +72,11 @@ class RunState:
                 path = result.relocate(old.output_dir)
                 failure = old.failure
                 if failure is not None and failure.details.get("retry_output_dir"):
+                    from sunpack.core.contracts.input_plan import InputRecovery
+
                     failure = replace(failure, details={
                         **failure.details, "retry_output_dir": result.relocate(failure.details["retry_output_dir"]),
+                        "input_recovery": InputRecovery.from_failure(failure).relocate_outputs(result.relocate).to_dict(),
                     })
                 self._store_target_result(slot, replace(old, output_dir=path, failure=failure)
                                           if path != old.output_dir or failure is not old.failure else old)

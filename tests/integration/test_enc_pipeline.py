@@ -46,7 +46,7 @@ def test_ordinary_recursion_authentication_and_no_extension_output(tmp_path, ori
     assert all(r.outcome_kind == OutcomeKind.COMPLETE_SUCCESS for r in response.summary.target_results)
     assert any(p.name in {"inside.txt", "source.txt"} for p in (tmp_path / "out").rglob("*"))
     assert source.exists()
-    enc_jobs = [job for job in worker_jobs if job.get("format_hint") == "enc"]
+    enc_jobs = [job for job in worker_jobs if job["archive_input"].get("format_hint") == "enc"]
     assert enc_jobs
     assert all(job["password"] == "sunpack-test" and not job.get("password_candidates") for job in enc_jobs)
 
@@ -98,7 +98,7 @@ def test_single_candidate_enc_reuses_worker_confirmation_without_host_kdf(
     response = asyncio.run(run())
     assert not response.summary.failed_tasks, response.summary.failures
     assert response.summary.success_count == count
-    enc_jobs = [job for job in worker_jobs if job.get("format_hint") == "enc"]
+    enc_jobs = [job for job in worker_jobs if job["archive_input"].get("format_hint") == "enc"]
     assert enc_jobs
     assert all(job.get("password_candidates") == ["sunpack-test"] for job in enc_jobs)
     assert source.exists()

@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from sunpack.core.support.archive_sessions import borrow_archive_sessions
+from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
 
 
 @dataclass(frozen=True)
@@ -15,61 +16,21 @@ class ArchiveFingerprint:
     part_paths: tuple[str, ...] = ()
 
 
-def _archive_input_scope(archive_input: Any) -> str:
-    """Serialize the logical input boundary for password-cache isolation."""
-    if archive_input is None:
-        return ""
-    if hasattr(archive_input, "to_dict"):
-        archive_input = archive_input.to_dict()
-    if not isinstance(archive_input, dict) or not archive_input:
-        return ""
-    mode = str(archive_input.get("open_mode") or archive_input.get("kind") or "")
-    parts = archive_input.get("parts") or []
-    ranges = archive_input.get("ranges") or []
-    has_explicit_range = (
-        mode in {"file_range", "concat_ranges"}
-        or bool(ranges)
-        or any(
-            isinstance(item, dict)
-            and (item.get("start") is not None or item.get("end") is not None
-                 or item.get("start_offset") is not None or item.get("end_offset") is not None)
-            for item in parts
-        )
-    )
-    if not has_explicit_range:
-        return ""
+def _descriptor(value: Any) -> ArchiveInputDescriptor | None:
+    if isinstance(value, ArchiveInputDescriptor):
+        return value
+    return ArchiveInputDescriptor.from_dict(value) if value else None
 
-    def range_payload(item: Any) -> dict[str, Any]:
-        if not isinstance(item, dict):
-            return {}
-        return {
-            "path": str(item.get("path") or ""),
-            "start": int(item.get("start", item.get("start_offset", 0)) or 0),
-            "end": item.get("end", item.get("end_offset")),
-        }
 
-    normalized_parts = []
-    for item in parts:
-        if not isinstance(item, dict):
-            continue
-        payload = range_payload(item)
-        payload.update({
-            "role": str(item.get("role") or ""),
-            "volume_number": item.get("volume_number"),
-            "canonical_name": str(item.get("canonical_name") or ""),
-        })
-        normalized_parts.append(payload)
-    normalized_ranges = [range_payload(item) for item in ranges]
-    return json.dumps({
-        "entry_path": str(archive_input.get("entry_path") or archive_input.get("path") or ""),
-        "open_mode": str(archive_input.get("open_mode") or archive_input.get("kind") or ""),
-        "format_hint": str(archive_input.get("format_hint") or archive_input.get("format") or ""),
-        "logical_name": str(archive_input.get("logical_name") or ""),
-        "start": int(archive_input.get("start", archive_input.get("start_offset", 0)) or 0),
-        "end": archive_input.get("end", archive_input.get("end_offset")),
-        "parts": normalized_parts,
-        "ranges": normalized_ranges,
-    }, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+def _archive_input_scope(descriptor: ArchiveInputDescriptor | None) -> str:
+    if descriptor is None:
+        return ""
+    return json.dumps((
+        descriptor.format_hint, descriptor.open_mode, descriptor.volume_style,
+        tuple((part.path, part.extent.start, part.extent.end, part.volume_number, part.canonical_name)
+              for part in descriptor.parts),
+        tuple((extent.path, extent.start, extent.end) for extent in descriptor.extents),
+    ), ensure_ascii=False, separators=(",", ":"))
 
 
 def build_archive_fingerprint(
@@ -77,14 +38,10 @@ def build_archive_fingerprint(
     part_paths: list[str] | None = None,
     archive_input: Any = None,
 ) -> ArchiveFingerprint:
-    descriptor = archive_input.to_dict() if hasattr(archive_input, "to_dict") else archive_input
+    descriptor = _descriptor(archive_input)
     source_paths = [archive_path, *(part_paths or [])]
-    if isinstance(descriptor, dict):
-        source_paths.extend(
-            str(item["path"])
-            for item in [*(descriptor.get("parts") or []), *(descriptor.get("ranges") or [])]
-            if isinstance(item, dict) and item.get("path")
-        )
+    if descriptor is not None:
+        source_paths.extend(descriptor.part_paths())
     normalized = {path: str(Path(path).resolve()) for path in dict.fromkeys(source_paths)}
     normalized_archive = normalized[archive_path]
     normalized_parts = tuple(normalized[path] for path in part_paths or [])

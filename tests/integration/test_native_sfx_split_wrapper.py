@@ -43,7 +43,7 @@ def test_input_planned_sfx_uses_rust_password_verifier(tmp_path, archive_format)
     task = direct_file_task(str(case.entry_path), all_parts=parts)
 
     ArchiveInputPlanningStage(load_config()).plan_task(task)
-    probe_input = knowledge_view.source_password_probe_input(task)
+    probe_input = task.password_probe_input.to_dict()
     outcome = FAST_VERIFIERS[archive_format]().verify_batch(
         str(case.entry_path),
         [WRONG_PASSWORD, PASSWORD],

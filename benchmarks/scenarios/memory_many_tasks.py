@@ -44,6 +44,7 @@ if str(ROOT) not in sys.path:
 
 from benchmarks.harness import BenchmarkWorkspace, render_report, report_from_payload
 from benchmarks.scenarios.extraction_format_matrix import GENERATED_FORMATS, create_corpus
+from benchmarks.scenarios.sevenzip_worker_matrix import _case_job
 from sunpack.pipeline.extraction.internal.sevenzip.sevenzip_runner import _NativeWorkerProcess
 from sunpack.core.support.resources import get_sevenzip_bridge_worker_path
 from tests.helpers.tool_config import get_7z_cli_dll_path
@@ -132,17 +133,6 @@ def _worker_sample(label: str, process: psutil.Process) -> dict:
         pass
     row.update(_mapped_memory(process))
     return row
-
-
-def _volume_paths(item: dict[str, Any]) -> list[Path]:
-    source = Path(item["path"])
-    archive_format = str(item["format"])
-    if archive_format == "7z-split":
-        return sorted(source.parent.glob(f"{source.name.rsplit('.', 1)[0]}.*"))
-    if archive_format == "rar-split":
-        prefix = source.name.split(".part", 1)[0]
-        return sorted(source.parent.glob(f"{prefix}.part*.rar"))
-    return [source]
 
 
 def _run_worker_job(
@@ -284,15 +274,7 @@ def _run_worker_phase(
             for case_index, (name, item) in enumerate(cases, 1):
                 label = f"worker-r{round_index}-{name.replace(':', '-')}"
                 output_dir = workspace.outputs / f"worker-round-{round_index}" / f"{case_index:03d}-{name.replace(':', '-')}"
-                volumes = _volume_paths(item)
-                job = {
-                    "job_id": label,
-                    "archive_path": str(volumes[0]),
-                    "part_paths": [str(path) for path in volumes],
-                    "output_dir": str(output_dir),
-                    "password": "",
-                    "format_hint": "",
-                }
+                job = _case_job(item, job_id=label, output_dir=output_dir, dll_path=dll_path)
                 outcome = _run_worker_job(worker, job, timeout_seconds=timeout_seconds)
                 sample = _worker_sample(label, worker_proc)
                 sample.update({

@@ -73,9 +73,9 @@ def test_carrier_anchor_rejoins_native_volumes_and_missing_parts_can_arrive(tmp_
     first = ArchiveTaskProvider(config).discover_targets([str(parts[0])])
     assert len(first.tasks) == 1
     assert first.tasks[0].discovery_failure is None
-    first_segments = first.tasks[0].knowledge().get("source.extractable_segments")
+    first_segments = [node.projection() for node in first.tasks[0].inputs]
     assert len(first_segments) == 2
-    assert first_segments[0]["segment"]["discovery_failure"]["kind"] == "missing_volume"
+    assert first.tasks[0].inputs[0].failure.kind == FailureKind.MISSING_VOLUME
 
     parts[1].write_bytes(missing)
     found = ArchiveTaskProvider(config).discover_targets([str(case.archive_dir)])
@@ -83,7 +83,7 @@ def test_carrier_anchor_rejoins_native_volumes_and_missing_parts_can_arrive(tmp_
     assert len(tasks) == 1, [(task.main_path, task.discovery_reason) for task in found.tasks]
     assert len(found.tasks) == 1
     task = tasks[0]
-    segments = task.knowledge().get("source.extractable_segments")
+    segments = [node.projection() for node in task.inputs]
     assert len(segments) == 2
     descriptor = task.archive_input()
     assert descriptor.open_mode == "native_volumes"
@@ -158,7 +158,7 @@ def test_encrypted_standalone_carrier_keeps_boundary_and_password_failures(tmp_p
     carrier.write_bytes(prefix + archive + suffix + _sibling_zip())
     config, task = discover([])
     assert task.discovery_failure is None
-    assert len(task.knowledge().get("source.extractable_segments")) == 2
+    assert len([node.projection() for node in task.inputs]) == 2
     extractor = ExtractionScheduler(max_retries=0, password_store=PasswordStore.from_config(config))
     sibling_output = tmp_path / "sibling-out"
     try:
@@ -241,7 +241,7 @@ def test_watch_waits_for_carrier_volume_then_extracts_on_arrival(tmp_path, monke
                 def retry_physical_family(task, outcome):
                     # This fallback discards the whole output and logical plan.
                     # A carrier must preserve siblings through its continuation.
-                    assert not outcome.result.embedded_results
+                    assert not outcome.result.input_results
                     return retry(task, outcome)
 
                 runtime._resolve_missing_volume_once = retry_physical_family

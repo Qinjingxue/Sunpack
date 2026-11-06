@@ -332,14 +332,18 @@ impl NativeEmbeddedBatch {
                     Ok((index, 2, "embedded_scan_io_error", Some(detail.unbind())))
                 }
                 EmbeddedOutcome::Scan(scan) => {
-                    if let Some(mut anchor) = scan.relation_anchor() {
-                        anchor.path = table.summary(index)?.0;
-                        let retain_scan = anchor.needs_password || scan.has_independent_archive();
-                        self.pending_volumes.push(PendingEmbeddedVolume {
-                            index,
-                            anchor,
-                            scan: retain_scan.then_some(scan),
-                        });
+                    let anchors = scan.relation_anchors();
+                    if !anchors.is_empty() {
+                        for mut anchor in anchors {
+                            anchor.path = table.summary(index)?.0;
+                            let retain_scan =
+                                anchor.needs_password || scan.has_independent_archive();
+                            self.pending_volumes.push(PendingEmbeddedVolume {
+                                index,
+                                anchor,
+                                scan: retain_scan.then(|| Arc::clone(&scan)),
+                            });
+                        }
                         Ok((index, 3, "embedded_volume_candidate", None))
                     } else {
                         // A complete peer archive keeps its original ownership.
@@ -437,25 +441,48 @@ impl NativeEmbeddedBatch {
             .map(|(path, values)| (path_key(&path), values))
             .collect();
         let mut cache = table.relation_cache();
-        let pending = std::mem::take(&mut self.pending_volumes);
-        for item in &pending {
-            cache
-                .anchors
-                .insert(path_key(&item.anchor.path), item.anchor.clone());
-        }
+        let mut pending = std::mem::take(&mut self.pending_volumes);
+        let pending_keys: HashSet<_> = pending
+            .iter()
+            .map(|item| path_key(&item.anchor.path))
+            .collect();
         for snapshot in &table.relation_sources {
             for &row in &snapshot.rows {
                 let key = path_key(&snapshot.table.paths[row]);
-                if candidates.contains_key(&key) && !cache.anchors.contains_key(&key) {
+                if candidates.contains_key(&key)
+                    && !pending_keys.contains(&key)
+                    && !cache.anchors.contains_key(&key)
+                {
                     if let Some(anchor) = &snapshot.table.relation_anchors[row] {
                         cache.anchors.insert(key, (**anchor).clone());
                     }
                 }
             }
         }
-        let matched = py.detach(|| -> std::io::Result<HashMap<String, String>> {
+        let matched = py.detach(|| -> std::io::Result<HashMap<(String, u64), String>> {
             let mut matched = HashMap::new();
+            for item in &mut pending {
+                let key = path_key(&item.anchor.path);
+                let Some(values) = candidates.get(&key).filter(|_| item.anchor.needs_password)
+                else {
+                    continue;
+                };
+                let reader =
+                    crate::io::reader::ManagedReader::open(&item.anchor.path)?.probe_reader();
+                let (resolved, index) =
+                    resolve_encrypted_relation_anchor(&item.anchor, &reader, values)?;
+                item.anchor = resolved;
+                if let Some(index) = index {
+                    matched.insert(
+                        (key, item.anchor.structure_offset.unwrap_or(0)),
+                        values[index].clone(),
+                    );
+                }
+            }
             for (key, values) in &candidates {
+                if pending_keys.contains(key) {
+                    continue;
+                }
                 let Some(anchor) = cache.anchors.get_mut(key).filter(|a| a.needs_password) else {
                     continue;
                 };
@@ -463,25 +490,38 @@ impl NativeEmbeddedBatch {
                 let (resolved, index) = resolve_encrypted_relation_anchor(anchor, &reader, values)?;
                 *anchor = resolved;
                 if let Some(index) = index {
-                    matched.insert(key.clone(), values[index].clone());
+                    matched.insert(
+                        (key.clone(), anchor.structure_offset.unwrap_or(0)),
+                        values[index].clone(),
+                    );
                 }
             }
             Ok(matched)
         })?;
         let mut fallback = Vec::new();
         let mut anchors = Vec::new();
+        let mut projected = HashSet::new();
+        let mut path_counts = HashMap::new();
+        for item in &pending {
+            *path_counts
+                .entry(path_key(&item.anchor.path))
+                .or_insert(0usize) += 1;
+        }
         for item in pending {
             let key = path_key(&item.anchor.path);
-            let mut anchor = cache.anchors[&key].clone();
+            let mut anchor = item.anchor;
+            let match_key = (key.clone(), anchor.structure_offset.unwrap_or(0));
             if anchor.standalone || (!anchor.multivolume && anchor.needs_password) {
-                self.excluded.insert(key.clone());
+                if path_counts[&key] == 1 {
+                    self.excluded.insert(key.clone());
+                }
                 if let Some(scan) = item.scan {
                     let raw = if let Some(end) = anchor.expected_logical_size {
                         scan.resolved_rar_dict(
                             py,
                             anchor.structure_offset.unwrap_or(0),
                             end,
-                            matched.get(&key).map(String::as_str),
+                            matched.get(&match_key).map(String::as_str),
                         )?
                     } else {
                         let raw =
@@ -489,7 +529,7 @@ impl NativeEmbeddedBatch {
                         let verdict = PyDict::new(py);
                         verdict.set_item(
                             "status",
-                            if matched.contains_key(&key)
+                            if matched.contains_key(&match_key)
                                 || anchor.evidence.contains(&"rar:password_matched_incomplete")
                             {
                                 "truncated"
@@ -511,7 +551,10 @@ impl NativeEmbeddedBatch {
             anchors.push(anchor);
             // Project once after Relations; Python combines logical inputs
             // sharing this carrier under the existing multi-segment task.
-            if let Some(scan) = item.scan.filter(|scan| scan.has_independent_archive()) {
+            if let Some(scan) = item
+                .scan
+                .filter(|scan| scan.has_independent_archive() && projected.insert(item.index))
+            {
                 fallback.push((item.index, 0, Some(scan.to_py_dict(py)?)));
             }
         }

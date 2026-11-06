@@ -1,3 +1,4 @@
+from sunpack.core.contracts.input_plan import LogicalArchiveInput
 from sunpack.core.contracts.archive_input import (
     ArchiveInputDescriptor,
     ArchiveInputPart,
@@ -65,7 +66,7 @@ def test_scan_report_projects_multiple_embedded_findings_from_one_task(monkeypat
     task = ArchiveTask.from_archive_input(
         first[0],
         discovery_source="embedded",
-        discovery_segments=(first, second),
+        logical_inputs=tuple(LogicalArchiveInput(descriptor, position=i, evidence=evidence) for i, (descriptor, evidence) in enumerate((first, second), 1)),
     )
     orchestrator = ScanOrchestrator({})
     monkeypatch.setattr(

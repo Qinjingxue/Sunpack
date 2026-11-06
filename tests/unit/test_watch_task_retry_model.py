@@ -173,7 +173,7 @@ def test_password_updates_retry_only_applicable_scopes(tmp_path, monkeypatch, ti
                 assert (watcher._password_retry_at is not None) == bool(expected)
                 watcher._process_password_retries(time.monotonic())
             assert set(watcher._pending) == expected
-            assert len(watcher.state.failed_password_entries()) == 2
+            assert len(watcher.state.blocked_entries("password")) == 2
             for candidate in watcher._pop_ready(time.monotonic()):
                 request = await watcher._submit_candidate(candidate)
                 assert request.password_scope_dir == str(original if candidate.path == str(inner) else sibling)

@@ -4,7 +4,7 @@ import os
 from dataclasses import replace
 
 from sunpack.core.support.path_keys import case_key, path_key
-from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
+from sunpack.core.contracts.input_plan import InputRecovery, recovery_blockers
 from sunpack.core.contracts.failures import FailureInfo, FailureKind
 from sunpack.core.contracts.results import OutcomeKind, RunSummary, TargetRunResult
 
@@ -30,7 +30,8 @@ def result_outcome(result: TargetRunResult | None) -> OutcomeKind | None:
 
 
 def failure_contains(failure: FailureInfo | None, kind: FailureKind) -> bool:
-    return failure is not None and failure.contains(kind)
+    return failure is not None and (failure.contains(kind) or (
+        kind == FailureKind.MISSING_VOLUME and "missing_volume" in recovery_blockers(failure)))
 
 
 def failure_is_password(failure: FailureInfo | None) -> bool:
@@ -39,6 +40,8 @@ def failure_is_password(failure: FailureInfo | None) -> bool:
 
 def is_password_retry_result(result: TargetRunResult) -> bool:
     failure = result.failure
+    if failure is not None and failure.details.get("input_recovery"):
+        return "password" in recovery_blockers(failure)
     return failure_is_password(failure) and not failure_contains(failure, FailureKind.MISSING_VOLUME)
 
 
@@ -56,115 +59,27 @@ def password_retry_failures(summary: RunSummary) -> dict[str, FailureInfo]:
     """Request-local continuations; Watch persists the same failure payload."""
     return {path_key(result.input_path): result.failure
             for result in password_retry_results(summary)
-            if result.failure.details.get("retry_generation")}
+            if result.failure.details.get("input_recovery")}
 
 
-def _input_key(value: dict) -> tuple:
-    descriptor = ArchiveInputDescriptor.from_dict(value)
-    extents = descriptor.extents or [part.extent for part in descriptor.parts]
-    return (descriptor.open_mode, descriptor.format_hint, descriptor.volume_style,
-            tuple((path_key(item.path), item.start, item.end) for item in extents))
-
-
-def apply_password_retry(task, failure: FailureInfo | None, generation: tuple) -> None:
-    """Narrow the canonical discovery plan only for unchanged physical inputs.
-
-    Keep unrelated failures, not successful results or native inventories. An
-    old record without a continuation follows ordinary discovery unchanged.
-    """
-    if failure is None or not generation:
+def apply_input_retry(task, failure: FailureInfo | None, generation: tuple, *, password_changed: bool = True) -> None:
+    recovery = InputRecovery.from_failure(failure)
+    if not recovery.checkpoints or not generation:
         return
-    previous = failure.details.get("retry_generation") or ()
-    completed = failure.details.get("retry_completed_inputs") or ()
-    if failure.contains(FailureKind.MISSING_VOLUME) and completed:
-        # New volumes may extend the family. Reuse a completed sibling only
-        # when all of its physical sources still have their original identity.
-        old = {row[0]: tuple(row) for row in previous}
-        current = {row[0]: tuple(row) for row in generation}
-        reusable = {
-            _input_key(value) for value in completed
-            if all(old.get(path_key(path)) == current.get(path_key(path))
-                   and path_key(path) in old
-                   for path in ArchiveInputDescriptor.from_dict(value).part_paths())
-        }
-        segments = task.knowledge().get("source.extractable_segments", ())
-        selected = [segment for segment in segments if _input_key(segment["archive_input"]) not in reusable]
-        if not reusable or not selected or len(selected) == len(segments):
-            return
-        from sunpack.core.support.archive_input_projection import write_source_extractable_segments
-
-        write_source_extractable_segments(task, selected)
-        task.runtime["retry_completed_inputs"] = [value for value in completed if _input_key(value) in reusable]
-        task.runtime["password_retry_segment_count"] = failure.details["segment_count"]
-        if failure.details.get("retry_output_dir"):
-            task.runtime["retry_output_dir"] = failure.details["retry_output_dir"]
-        return
-    if tuple(tuple(row) for row in previous) != generation:
-        return
-    causes = failure.causes
-    if not causes or any(not cause.details.get("retry_input") for cause in causes):
-        return
-    retry_causes = [cause for cause in causes
-                    if cause.is_password_failure and not cause.contains(FailureKind.MISSING_VOLUME)]
-    wanted = {_input_key(cause.details["retry_input"]) for cause in retry_causes}
-    # Decrypting a RAR header proves the end for the first time. Match that
-    # pending identity by its start; do not replay already complete siblings.
-    pending_roots = {
-        (path_key(value.entry_path), value.format_hint, value.primary_extent.start):
-            _input_key(cause.details["retry_input"])
-        for cause in retry_causes if cause.stage == "embedded_boundary"
-        for value in [ArchiveInputDescriptor.from_dict(cause.details["retry_input"])]
-        if value.primary_extent is not None
-    }
-    if not wanted:
-        return
-    segments = task.knowledge().get("source.extractable_segments", ())
-    selected = []
-    matched = set()
-    for segment in segments:
-        key = _input_key(segment["archive_input"])
-        descriptor = ArchiveInputDescriptor.from_dict(segment["archive_input"])
-        identity = (path_key(descriptor.entry_path), descriptor.format_hint,
-                    descriptor.primary_extent.start if descriptor.primary_extent else 0)
-        pending = identity in pending_roots
-        if key in wanted or pending:
-            selected.append(segment)
-            matched.add(pending_roots[identity] if pending else key)
-    if matched != wanted:
-        return
-    from sunpack.core.support.archive_input_projection import write_source_extractable_segments
-
-    write_source_extractable_segments(task, selected)
-    task.runtime["password_retry_other_failures"] = tuple(
-        cause for cause in causes if not cause.is_password_failure
-        or cause.contains(FailureKind.MISSING_VOLUME)
-    )
-    task.runtime["password_retry_segment_count"] = failure.details["segment_count"]
-    task.runtime["retry_completed_inputs"] = completed
-    output_dir = failure.details.get("retry_output_dir")
-    if output_dir:
-        task.runtime["retry_output_dir"] = output_dir
+    selected, recovery = recovery.select(task.inputs, generation, password_changed=password_changed)
+    task.set_inputs(selected)
+    task.recovery = recovery
+    if recovery.output_dir:
+        task.runtime["retry_output_dir"] = recovery.output_dir
 
 
 def remap_retry_failure(failure: FailureInfo, path_map: dict[str, str], generation: tuple) -> FailureInfo:
-    """Promotion renames the source without changing its logical ranges."""
-    if not failure.details.get("retry_generation"):
+    recovery = InputRecovery.from_failure(failure)
+    if not recovery.checkpoints:
         return failure
     mapping = {path_key(old): new for old, new in path_map.items()}
-    causes = []
-    for cause in failure.causes:
-        descriptor = cause.details.get("retry_input")
-        if descriptor:
-            descriptor = ArchiveInputDescriptor.from_dict(descriptor).with_path_mapping(
-                lambda path: mapping.get(path_key(path), path))
-            cause = replace(cause, details={**cause.details, "retry_input": descriptor.to_dict()})
-        causes.append(cause)
-    completed = [ArchiveInputDescriptor.from_dict(value).with_path_mapping(
-        lambda path: mapping.get(path_key(path), path)).to_dict()
-        for value in failure.details.get("retry_completed_inputs", ())]
-    return replace(failure, causes=tuple(causes), details={
-        **failure.details, "retry_generation": generation, "retry_completed_inputs": completed,
-    })
+    recovery = recovery.remap(lambda path: mapping.get(path_key(path), path), generation)
+    return replace(failure, details={**failure.details, "input_recovery": recovery.to_dict()})
 
 
 def merge_latest_results(latest: dict[str, TargetRunResult], summary: RunSummary) -> None:

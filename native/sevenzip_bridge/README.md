@@ -58,3 +58,9 @@ tools\sunpack_sevenzip_worker.exe
 `sunpack_sevenzip_worker.exe` must be available in the SunPack tool directory.
 Do not add a `7z.exe x` fallback to the product extraction path; failures remain
 explicit and structured.
+
+Every job supplies the canonical `archive_input` descriptor and may carry an
+`input_id` for reporting. Format, ordered parts, canonical volume names, and
+byte extents belong to that descriptor. The worker does not infer input shape
+from root-level path, format, or offset aliases. File, named-volume, and range
+stream adapters remain specialized below this shared protocol.

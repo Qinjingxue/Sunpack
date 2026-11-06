@@ -358,15 +358,9 @@ def test_password_blocked_carrier_preserves_every_archive_finding(tmp_path, monk
     result = EmbeddedDiscovery({}).discover([_candidate(path)])
 
     assert len(result.tasks) == 1
-    assert result.tasks[0].discovery_failure.kind.value == status
-    assert result.blocked_paths
-    assert [finding.format for finding in result.findings] == ["zip", "rar", "7z"]
-    assert [finding.offset for finding in result.findings] == [8, 40, 96]
-    assert [finding.end_offset for finding in result.findings] == [32, None, 144]
-    assert [finding.reason for finding in result.findings] == [
-        "embedded_carrier_blocked",
-        f"embedded_{status}",
-        "embedded_carrier_blocked",
-    ]
-    assert all(finding.status == "blocked" for finding in result.findings)
-    assert all(not finding.extractable for finding in result.findings)
+    assert result.tasks[0].discovery_failure is None
+    inputs = result.tasks[0].inputs
+    assert [node.descriptor.format_hint for node in inputs] == ["zip", "rar", "7z"]
+    assert [node.descriptor.primary_extent.start for node in inputs] == [8, 40, 96]
+    assert inputs[1].failure.kind.value == status
+    assert inputs[0].failure is None and inputs[2].failure is None

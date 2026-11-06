@@ -7,9 +7,15 @@ from sunpack_native import worker_manifest_from_rows
 from sunpack.core.contracts.failures import FailureInfo, FailureKind
 from sunpack.core.contracts.verification import ASSESSMENT_COMPLETE, CONTENT_INTEGRITY_VERIFIED_COMPLETE, DECISION_ACCEPT
 from sunpack.core.passwords.result import PasswordResolution, PasswordResolutionStatus
-from sunpack.core.support.archive_input_projection import (
-    write_source_extractable_segments,
-)
+from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
+from sunpack.core.contracts.input_plan import LogicalArchiveInput
+
+
+def set_inputs(task, segments):
+    task.set_inputs(tuple(LogicalArchiveInput(ArchiveInputDescriptor.from_dict(row["archive_input"]),
+                                            position=index, evidence=row.get("segment") or {})
+                          for index, row in enumerate(segments, start=1)))
+
 from sunpack.pipeline.extraction.internal.sevenzip.metadata import (
     ArchiveMetadataScanner,
 )
@@ -53,7 +59,7 @@ class _RecordingPasswordResolver:
 
     def resolve(self, _archive_path, task, *, archive_key, **_kwargs):
         knowledge = task.knowledge()
-        self.calls.append((archive_key, dict(knowledge.get("source.password_probe_input") or {})))
+        self.calls.append((archive_key, task.password_probe_input.to_dict()))
         return PasswordResolution(
             password="",
             status=PasswordResolutionStatus.UNENCRYPTED,
@@ -150,7 +156,7 @@ def test_embedded_password_probe_and_session_key_follow_active_segment(tmp_path)
     segments = []
     for index, (start, end) in enumerate(((7, 12), (17, 23)), start=1):
         segments.append({
-            "segment_id": f"embedded_{index:02d}",
+            "input_id": f"embedded_{index:02d}",
             "format": "zip",
             "logical_name": "case",
             "archive_input": {
@@ -162,7 +168,7 @@ def test_embedded_password_probe_and_session_key_follow_active_segment(tmp_path)
                 "parts": [{"path": str(carrier), "role": "main", "start": start, "end": end}],
             },
         })
-    write_source_extractable_segments(task, segments)
+    set_inputs(task, segments)
     resolver = _RecordingPasswordResolver()
     extractor = SingleArchiveExtractor(
         password_store=_CandidatePasswordStore(),
@@ -177,7 +183,7 @@ def test_embedded_password_probe_and_session_key_follow_active_segment(tmp_path)
     assert result.success is True
     assert task.archive_input().open_mode == "file"
     assert len({key for key, _ in resolver.calls}) == 2
-    assert all(key.startswith(f"{task.key}#zip:") for key, _ in resolver.calls)
+    assert {key for key, _ in resolver.calls} == {node.input_id for node in task.inputs}
     assert [call[1]["parts"][0]["start"] for call in resolver.calls] == [7, 17]
     assert (result.files_written, result.bytes_written) == (2, 4)
     # Multi-payload verification must consume the retained child tables, even
@@ -194,9 +200,8 @@ def test_embedded_boundary_password_is_reused_without_second_search(tmp_path):
     carrier = tmp_path / "carrier.bin"
     carrier.write_bytes(b"prefix-rar-tail")
     task = _task(carrier)
-    task.runtime["embedded_segment_passwords"] = {"7": "segment-secret"}
-    write_source_extractable_segments(task, [{
-        "segment_id": "embedded_01_rar",
+    set_inputs(task, [{
+        "input_id": "embedded_01_rar",
         "index": 1,
         "format": "rar",
         "logical_name": "case_01_rar",
@@ -212,6 +217,8 @@ def test_embedded_boundary_password_is_reused_without_second_search(tmp_path):
             "analysis": {"password_required": True},
         },
     }])
+    from dataclasses import replace
+    task.set_inputs(tuple(replace(node, password="segment-secret") for node in task.inputs))
     extractor = SingleArchiveExtractor(
         password_store=_CandidatePasswordStore(),
         password_resolver=_NeverPasswordResolver(),
@@ -239,8 +246,8 @@ def test_single_embedded_segment_exposes_logical_input_for_verification(tmp_path
         "logical_name": "payload",
         "parts": [{"path": str(carrier), "role": "main", "start": 5, "end": 8}],
     }
-    write_source_extractable_segments(task, [{
-        "segment_id": "embedded_01_zip",
+    set_inputs(task, [{
+        "input_id": "embedded_01_zip",
         "format": "zip",
         "logical_name": "payload",
         "archive_input": archive_input,
@@ -258,10 +265,11 @@ def test_single_embedded_segment_exposes_logical_input_for_verification(tmp_path
     assert result.success is True
     assert (tmp_path / "out" / "zip.txt").exists()
     assert not (tmp_path / "out" / "embedded_01_zip").exists()
-    assert len(result.embedded_results) == 1
-    segment, segment_result = result.embedded_results[0]
+    assert len(result.input_results) == 1
+    item = result.input_results[0]
+    segment, segment_result = item.input.projection(), item.result
     assert segment["archive_input"] == archive_input
-    assert segment_result.diagnostics["verification_archive_input"] == archive_input
+    assert segment_result.logical_input.descriptor.to_dict() == archive_input
     assert segment_result.diagnostics["result"]["verified_manifest"]["validated"] is True
     assert task.archive_input().open_mode == "file"
 
@@ -298,9 +306,9 @@ def test_multiple_embedded_failures_keep_aggregate_diagnosis(count):
     ]
 
     failures = failures[:count]
-    aggregate = extractor._aggregate_embedded_failure(failures, segment_count=count)
+    aggregate = extractor._aggregate_input_failure(failures, segment_count=count)
 
-    assert aggregate.kind is FailureKind.EMBEDDED_SEGMENTS_FAILED
+    assert aggregate.kind is FailureKind.INPUTS_FAILED
     assert aggregate.message_key == ("failure.damaged" if count == 1 else "failure.embedded_extract_failed")
     assert aggregate.causes == tuple(failures)
     assert aggregate.contains(FailureKind.DAMAGED)
@@ -320,7 +328,7 @@ def test_extractor_fills_success_output_counts_when_worker_omits_them(tmp_path):
         best_effort=True,
     )
 
-    result = extractor.extract(task, str(tmp_path / "out"), allow_embedded_segments=False)
+    result = extractor.extract(task, str(tmp_path / "out"))
 
     assert result.success is True
     assert result.files_written == 1

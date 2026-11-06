@@ -99,7 +99,7 @@ def _scan_result_from_task(task) -> ScanResult:
 
 
 def _findings_from_task(task) -> list[DiscoveryFinding]:
-    segments = task.knowledge().get("source.extractable_segments", [])
+    segments = [node.projection() for node in task.inputs]
     if isinstance(segments, list) and segments:
         findings: list[DiscoveryFinding] = []
         for segment in segments:

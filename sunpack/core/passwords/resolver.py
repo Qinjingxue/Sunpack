@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from typing import Any
+from dataclasses import replace
+from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
 
 from sunpack.core.support.archive_formats import canonical_format
 
@@ -19,7 +21,7 @@ def _selected_structure_format(task: Any | None) -> str:
     knowledge = _knowledge(task)
     descriptor = _archive_input_descriptor(task)
     values = (
-        knowledge.get("source.password_probe_input.format_hint"),
+        getattr(getattr(task, "password_probe_input", None), "format_hint", ""),
         knowledge.get("inspection.summary.format"),
         descriptor.format_hint if descriptor is not None else "",
     )
@@ -352,20 +354,16 @@ class PasswordResolver:
         )
 
     @staticmethod
-    def _archive_input_for_password_probe(task: Any | None) -> dict | None:
+    def _archive_input_for_password_probe(task: Any | None) -> ArchiveInputDescriptor | None:
         if task is None:
             return None
-        knowledge = _knowledge(task)
-        knowledge_input = knowledge.get("source.password_probe_input")
-        if not isinstance(knowledge_input, dict) or not knowledge_input:
-            descriptor = _archive_input_descriptor(task)
-            knowledge_input = descriptor.to_dict() if descriptor is not None else None
-        if not isinstance(knowledge_input, dict):
+        descriptor = getattr(task, "password_probe_input", None) or _archive_input_descriptor(task)
+        if descriptor is None:
             return None
         selected_format = _selected_structure_format(task)
-        if selected_format in {"zip", "rar", "7z"}:
-            return {**knowledge_input, "format_hint": selected_format}
-        return knowledge_input
+        if selected_format in {"zip", "rar", "7z"} and selected_format != descriptor.format_hint:
+            return replace(descriptor, format_hint=selected_format)
+        return descriptor
 
     def _remember(
         self,

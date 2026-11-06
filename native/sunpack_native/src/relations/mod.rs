@@ -450,6 +450,10 @@ pub(crate) fn resolve_embedded_volumes(
     excluded: &HashSet<String>,
     mut cache: RelationCache,
 ) -> Vec<NativeRelationGroup> {
+    let mut seen = HashSet::new();
+    if anchors.iter().any(|a| !seen.insert(path_key(&a.path))) {
+        return resolve_shared_carrier_volumes(snapshots, anchors, excluded, cache);
+    }
     let selected: HashSet<_> = anchors.iter().map(|a| path_key(&a.path)).collect();
     cache
         .anchors
@@ -474,6 +478,224 @@ pub(crate) fn resolve_embedded_volumes(
             Some(&cache),
         ));
         remaining.retain(|key| !keys.contains(key));
+    }
+    output
+}
+
+/// Resolve logical heads independently while retaining physical snapshot/cache
+/// sharing. Competing mappings may share a carrier, but never the same bytes.
+fn resolve_shared_carrier_volumes(
+    snapshots: &[NativeDirectorySnapshot],
+    anchors: Vec<VolumeAnchor>,
+    excluded: &HashSet<String>,
+    mut cache: RelationCache,
+) -> Vec<NativeRelationGroup> {
+    let mut by_path: HashMap<String, Vec<&VolumeAnchor>> = HashMap::new();
+    for anchor in &anchors {
+        by_path
+            .entry(path_key(&anchor.path))
+            .or_default()
+            .push(anchor);
+    }
+    for (key, values) in &by_path {
+        if values.len() == 1 {
+            cache.anchors.insert(key.clone(), values[0].clone());
+        }
+    }
+    let selected = by_path.keys().cloned().collect();
+    // Materialize only the active stem scopes once, independently of the
+    // number of logical heads. Never scan the entire directory per segment.
+    let scopes: Vec<Vec<RelationInput>> = snapshots
+        .iter()
+        .map(|snapshot| {
+            let view = snapshot.without_path_keys(excluded);
+            let source = RelationSource::Snapshot(&view, Some(&cache));
+            RelationScopeIndex::build(&source, &selected)
+                .rows
+                .into_iter()
+                .map(|row| source.materialize(row))
+                .collect()
+        })
+        .collect();
+    let mut proposals = Vec::new();
+    let mut mappings = HashSet::new();
+    for anchor in &anchors {
+        let key = path_key(&anchor.path);
+        for scope in &scopes {
+            if !scope.iter().any(|row| row.path_key == key) {
+                continue;
+            }
+            let rows: Vec<_> = scope
+                .iter()
+                .filter_map(|row| {
+                    let mut row = row.clone();
+                    if let Some(options) = by_path.get(&row.path_key) {
+                        let chosen = if row.path_key == key {
+                            anchor
+                        } else {
+                            let mut matching = options
+                                .iter()
+                                .copied()
+                                .filter(|other| other.format == anchor.format);
+                            let first = matching.next()?;
+                            // Several compatible slices have no unique assignment.
+                            if matching.next().is_some() {
+                                return None;
+                            }
+                            first
+                        };
+                        row.anchor = Some(chosen.clone());
+                        row.anchor_cell = None;
+                    }
+                    Some(row)
+                })
+                .collect();
+            for group in build_candidate_groups_from_source(
+                RelationSource::Physical(&rows),
+                &HashSet::from([key.clone()]),
+                None,
+                Some(&cache),
+            ) {
+                let NativeRelationGroup::Proposal(ref validation, _) = group else {
+                    continue;
+                };
+                if !validation
+                    .anchors
+                    .get(&key)
+                    .is_some_and(|a| a.structure_offset == anchor.structure_offset)
+                {
+                    continue;
+                }
+                if !validation
+                    .proposal
+                    .volumes
+                    .iter()
+                    .any(|part| part.1 > 0 && path_key(&part.0) == key)
+                {
+                    continue;
+                }
+                let mapping: Vec<_> = validation
+                    .proposal
+                    .volumes
+                    .iter()
+                    .map(|part| {
+                        let a = validation.anchors.get(&path_key(&part.0));
+                        (
+                            path_key(&part.0),
+                            part.1,
+                            a.and_then(|a| a.structure_offset),
+                            a.and_then(|a| a.payload_end),
+                        )
+                    })
+                    .collect();
+                if mappings.insert(mapping) {
+                    proposals.push(group);
+                }
+            }
+        }
+    }
+    // Index intervals by physical source rather than comparing every proposal
+    // pair. The usual one-head path above does not pay this allocation cost.
+    let mut intervals: HashMap<String, Vec<(u64, u64, usize)>> = HashMap::new();
+    for (index, group) in proposals.iter().enumerate() {
+        let NativeRelationGroup::Proposal(validation, _) = group else {
+            continue;
+        };
+        for part in &validation.proposal.volumes {
+            if let Some(a) = validation.anchors.get(&path_key(&part.0)) {
+                intervals.entry(path_key(&part.0)).or_default().push((
+                    a.structure_offset.unwrap_or(0),
+                    a.payload_end.or(a.carrier_limit).unwrap_or(a.size),
+                    index,
+                ));
+            }
+        }
+    }
+    let mut conflicted = HashSet::new();
+    for ranges in intervals.values_mut() {
+        ranges.sort_unstable();
+        let mut frontier: Option<(u64, usize)> = None;
+        for &(start, end, index) in ranges.iter() {
+            if let Some((stop, owner)) = frontier {
+                if start < stop && owner != index {
+                    conflicted.extend([owner, index]);
+                }
+                if end > stop {
+                    frontier = Some((end, index));
+                }
+            } else {
+                frontier = Some((end, index));
+            }
+        }
+    }
+    let mut covered = HashSet::new();
+    let mut output = Vec::new();
+    for (index, group) in proposals.into_iter().enumerate() {
+        if conflicted.contains(&index) {
+            continue;
+        }
+        if let NativeRelationGroup::Proposal(validation, _) = &group {
+            covered.extend(validation.proposal.volumes.iter().filter_map(|part| {
+                validation
+                    .anchors
+                    .get(&path_key(&part.0))
+                    .map(|a| (path_key(&a.path), a.structure_offset))
+            }));
+        }
+        output.push(group);
+    }
+    for mut anchor in anchors {
+        if covered.contains(&(path_key(&anchor.path), anchor.structure_offset)) {
+            continue;
+        }
+        let Some(number) = anchor.internal_volume_number else {
+            continue;
+        };
+        let needs_password = anchor.needs_password || anchor.wrong_password;
+        anchor.evidence.push("embedded:unresolved_volume");
+        // A proven volume is a logical input even while its family is missing
+        // or ambiguous. Keep its own blocker; do not discard the whole carrier.
+        let path = anchor.path.clone();
+        let format = anchor.format.clone();
+        let name = Path::new(&path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        let logical_name = get_logical_name(name, true);
+        let style = match format.as_str() {
+            "rar" => "rar_part",
+            "zip" => "zip_spanned",
+            _ => "numeric_suffix",
+        };
+        output.push(NativeRelationGroup::Proposal(
+            ProposalValidation {
+                status: if needs_password {
+                    ProposalStatus::NeedsPassword
+                } else {
+                    ProposalStatus::Inconclusive
+                },
+                proposal: RelationProposal {
+                    format,
+                    logical_name,
+                    style: style.into(),
+                    volumes: vec![(path.clone(), number, style.into(), 3, false)],
+                    companions: Vec::new(),
+                },
+                anchors: HashMap::from([(path_key(&path), anchor)]),
+                reason: Some(if needs_password {
+                    RelationFailureReason::NeedsPassword
+                } else {
+                    RelationFailureReason::MissingVolume
+                }),
+                unresolved: Vec::new(),
+                name_features: HashMap::new(),
+            },
+            if needs_password {
+                GroupKind::Password
+            } else {
+                GroupKind::Incomplete
+            },
+        ));
     }
     output
 }
@@ -998,6 +1220,13 @@ fn validated_proposal_to_dict(
             }
             logical_start = logical_start.saturating_add(anchor.payload_size());
         }
+    }
+    if validation
+        .anchors
+        .values()
+        .any(|anchor| anchor.evidence.contains(&"embedded:unresolved_volume"))
+    {
+        metadata.bind(py).set_item("volume_set_incomplete", true)?;
     }
     dict.set_item("head_metadata", metadata)?;
     dict.set_item("companion_paths", &proposal.companions)?;

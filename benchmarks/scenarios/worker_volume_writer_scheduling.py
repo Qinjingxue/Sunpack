@@ -227,12 +227,10 @@ def _run_configuration(
             payload = json.dumps(
                 {
                     "job_id": job.job_id,
-                    "archive_path": str(job.archive),
-                    "part_paths": [str(job.archive)],
+                    "archive_input": {"entry_path": str(job.archive), "open_mode": "file", "format_hint": "zip"},
                     "output_dir": str(job.output_dir),
                     "output_volume_key": resolve_output_volume_key(str(job.output_dir)),
                     "password": "",
-                    "format_hint": "zip",
                     "dry_run": False,
                 },
                 ensure_ascii=False,

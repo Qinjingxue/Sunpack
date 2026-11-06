@@ -28,6 +28,9 @@ def _task_with_structure(format_hint: str, structure: dict, *, path: str | None 
 def _task_with_knowledge(path: str, payload: dict, *, format_hint: str = ""):
     task = make_archive_task(path, format_hint=format_hint)
     knowledge = task.knowledge()
+    probe = (payload.get("source") or {}).get("password_probe_input")
+    if probe:
+        task.password_probe_input = ArchiveInputDescriptor.from_dict(probe)
     knowledge.merge(payload, source_layer="tests", source_module="password_store")
     task.set_knowledge(knowledge)
     return task
@@ -81,7 +84,7 @@ def test_password_resolver_falls_back_to_relations_archive_input_before_analysis
     }, archive_path="carrier.exe")
     task = make_task_from_descriptor(descriptor)
 
-    selected = PasswordResolver._archive_input_for_password_probe(task)
+    selected = PasswordResolver._archive_input_for_password_probe(task).to_dict()
 
     assert selected["open_mode"] == "file_range"
     assert selected["parts"][0]["start"] == 8192
@@ -101,7 +104,7 @@ def test_password_resolver_prefers_formal_password_probe_input():
         },
     }, format_hint="rar")
 
-    selected = PasswordResolver._archive_input_for_password_probe(task)
+    selected = PasswordResolver._archive_input_for_password_probe(task).to_dict()
 
     assert selected["open_mode"] == "file_range"
     assert selected["parts"][0]["start"] == 4096
@@ -292,20 +295,10 @@ def test_password_resolver_scopes_structure_facts_to_active_embedded_format():
         "encryption_scan_complete": True,
         "password_required": True,
     })
-    knowledge = bag.knowledge()
-    knowledge.set(
-        "source.password_probe_input",
-        {
-            "kind": "archive_input",
-            "entry_path": "carrier.bin",
-            "open_mode": "file_range",
-            "format_hint": "tar",
-            "parts": [{"path": "carrier.bin", "start": 100, "end": 200}],
-        },
-        source_layer="tests",
-        source_module="password_store",
-    )
-    bag.set_knowledge(knowledge)
+    bag.password_probe_input = ArchiveInputDescriptor.from_dict({
+        "entry_path": "carrier.bin", "open_mode": "file_range", "format_hint": "tar",
+        "parts": [{"path": "carrier.bin", "start": 100, "end": 200}],
+    })
 
     result = resolver.resolve("carrier.bin", task=bag, archive_key="carrier#tar")
 

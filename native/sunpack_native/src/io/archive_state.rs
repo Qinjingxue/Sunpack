@@ -441,12 +441,9 @@ fn source_segments(source: &Bound<'_, PyDict>) -> PyResult<Vec<Segment>> {
                 return Ok(vec![range_segment(&path, start, end)?]);
             }
         }
-        if let Some(segment) = source.get_item("segment")? {
-            let segment = segment.cast::<PyDict>()?;
-            let start = optional_u64(segment, "start")?.unwrap_or(0);
-            let end = optional_u64(segment, "end")?;
-            return Ok(vec![range_segment(&entry_path, start, end)?]);
-        }
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "file_range requires canonical parts",
+        ));
     }
     if open_mode == "concat_ranges" {
         if let Some(ranges) = source.get_item("ranges")? {
@@ -503,6 +500,88 @@ fn range_segment(path: &str, start: u64, end: Option<u64>) -> PyResult<Segment> 
         start,
         len: effective_end - start,
     })
+}
+
+/// Project an analysis range onto the canonical physical layout once. All
+/// downstream consumers use the resulting extents, including bounded sources.
+#[pyfunction]
+#[pyo3(signature = (source, format_hint, start, end=None, probe=false))]
+pub(crate) fn archive_input_slice(
+    source: &Bound<'_, PyDict>,
+    format_hint: &str,
+    start: u64,
+    end: Option<u64>,
+    probe: bool,
+) -> PyResult<Option<Py<PyDict>>> {
+    let py = source.py();
+    let segments = build_segments(source)?;
+    let total = segments
+        .iter()
+        .try_fold(0u64, |sum, part| sum.checked_add(part.len()))
+        .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("input size overflow"))?;
+    let Some(mut end) = end.or(probe.then_some(total)) else {
+        return Ok(None);
+    };
+    if start >= end || end > total {
+        return Ok(None);
+    }
+    // RAR callbacks name independent volume containers. A password probe may
+    // read the bounded head; extraction must keep the structured volume table.
+    if format_hint == "rar" && segments.len() > 1 {
+        if !probe || start == 0 {
+            return Ok(probe.then(|| source.clone().unbind()));
+        }
+        end = end.min(segments[0].len());
+        if start >= end {
+            return Ok(None);
+        }
+    } else if start == 0 && end == total {
+        return Ok(probe.then(|| source.clone().unbind()));
+    }
+    let mut cursor = 0u64;
+    let mut mapped = Vec::new();
+    for segment in segments {
+        let Segment::Range {
+            path,
+            start: base,
+            len,
+        } = segment;
+        let stop = cursor + len;
+        let begin = start.max(cursor);
+        let finish = end.min(stop);
+        if begin < finish {
+            let row = PyDict::new(py);
+            row.set_item("path", path)?;
+            row.set_item("start", base + begin - cursor)?;
+            row.set_item("end", base + finish - cursor)?;
+            mapped.push(row);
+        }
+        cursor = stop;
+        if cursor >= end {
+            break;
+        }
+    }
+    if mapped.is_empty() {
+        return Ok(None);
+    }
+    let output = PyDict::new(py);
+    output.set_item("entry_path", source.get_item("entry_path")?)?;
+    output.set_item("format_hint", format_hint)?;
+    output.set_item("logical_name", source.get_item("logical_name")?)?;
+    let single = mapped.len() == 1;
+    output.set_item(
+        "open_mode",
+        if single {
+            "file_range"
+        } else {
+            "concat_ranges"
+        },
+    )?;
+    output.set_item(
+        if single { "parts" } else { "ranges" },
+        PyList::new(py, mapped)?,
+    )?;
+    Ok(Some(output.unbind()))
 }
 
 /// A fixed directory window survives payload seeks, including reads crossing

@@ -17,7 +17,7 @@ class FailureKind(str, Enum):
     RESOURCE_UNAVAILABLE = "resource_unavailable"
     FILESYSTEM_ERROR = "filesystem_error"
     PROCESS_ERROR = "process_error"
-    EMBEDDED_SEGMENTS_FAILED = "embedded_segments_failed"
+    INPUTS_FAILED = "inputs_failed"
     UNKNOWN = "unknown"
 
 

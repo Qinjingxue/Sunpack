@@ -122,7 +122,7 @@ def test_input_planning_preserves_structured_password_probe_for_split_segment_at
 
     stage.plan_task(task)
 
-    probe = knowledge_view.source_password_probe_input(task)
+    probe = task.password_probe_input.to_dict()
     assert probe["open_mode"] == "native_volumes"
     assert [part["path"] for part in probe["parts"]] == [str(first), str(second)]
 
@@ -152,7 +152,7 @@ def test_input_planning_stage_maps_split_logical_segment_to_concat_ranges(tmp_pa
 
     stage.plan_task(task)
 
-    segments = knowledge_view.source_extractable_segments(task)
+    segments = [node.projection() for node in task.inputs]
     assert len(segments) == 1
     assert segments[0]["archive_input"] == {
         "kind": "archive_input",
@@ -195,7 +195,7 @@ def test_input_planning_stage_plans_real_carrier_segments_in_offset_order(tmp_pa
 
     stage.plan_task(task)
 
-    segments = knowledge_view.source_extractable_segments(task)
+    segments = [node.projection() for node in task.inputs]
     assert [(item["format"], item["start_offset"]) for item in segments] == [
         ("zip", first_start),
         ("zip", second_start),

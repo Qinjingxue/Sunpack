@@ -2121,7 +2121,7 @@ class WatchScheduler:
             if self._password_retry_at is None or now < self._password_retry_at:
                 return
             self._password_retry_at = None
-        for entry in self.state.failed_password_entries():
+        for entry in self.state.blocked_entries(BLOCKER_PASSWORD):
             if (self._password_failure_needs_retry(entry)
                     and os.path.exists(entry.path)):
                 self.log.write("retry_password_failure", path=entry.path)
@@ -2160,8 +2160,9 @@ class WatchScheduler:
             if retry_entry is not None and retry_entry.status in {"failed_password", "suspended_missing_volume"}:
                 scope_dir = retry_entry.password_scope_dir
                 failure = FailureInfo.from_dict(retry_entry.failure_payload)
-                if failure is not None and failure.details.get("retry_generation"):
+                if failure is not None and failure.details.get("input_recovery"):
                     run_config["password_retry_failures"] = {path_key(candidate.path): failure}
+                    run_config["retry_password_changed"] = self._password_failure_needs_retry(retry_entry)
             elif pending is not None:
                 scope_dir = str(pending.password_scope_dir or "")
             run_config["password_scope_dir"] = scope_dir or os.path.dirname(candidate.path)
@@ -2481,7 +2482,7 @@ class WatchScheduler:
                     password_generation=request.password_generation,
                 )
                 retry_password = (
-                    password and not missing
+                    password
                     and request.password_signature != self._password_signature_for_scope(scope_dir)
                 )
             if not published:
@@ -2743,7 +2744,7 @@ class WatchScheduler:
         return signature != self._password_signature_for_scope(entry.password_scope_dir)
 
     def _mark_all_password_failures_dirty(self) -> None:
-        if not self.state.has_entry_status("failed_password"):
+        if not self.state.has_blocker(BLOCKER_PASSWORD):
             return
         with self._lock:
             self._password_retry_at = time.monotonic()
@@ -3010,7 +3011,7 @@ def _persisted_blocker_owns_retry(state: WatchStateStore, path: str) -> bool:
 
 def _password_scope_for_path(state: WatchStateStore, path: str) -> str:
     entry = state.latest_entry_for_path(path)
-    if entry is not None and entry.status == "failed_password":
+    if entry is not None and entry.blocks(BLOCKER_PASSWORD):
         return entry.password_scope_dir
     pending = state.pending_work_for_path(path)
     return str(pending.password_scope_dir or "") if pending is not None else ""

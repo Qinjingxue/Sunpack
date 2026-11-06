@@ -21,7 +21,10 @@ def archive_input_for_group(group: CandidateGroup) -> ArchiveInputDescriptor | N
             format_hint=format_hint,
             logical_name=group.logical_name,
         )
-        analysis = {"zip_eocd_offset": zip_eocd} if isinstance(zip_eocd, int) else {}
+        analysis = {"volume_completeness": "missing" if metadata.get("volume_set_incomplete") else (
+            "unknown" if metadata.get("needs_password") else "complete")}
+        if isinstance(zip_eocd, int):
+            analysis["zip_eocd_offset"] = zip_eocd
         if metadata.get("volume_set_incomplete") and metadata.get("relation_failure_reason") == "missing_volume":
             # Preserve the Rust relation validator's conclusion for backend
             # failure classification, including runs with no password probe.

@@ -258,24 +258,24 @@ def _case_job(
         format_hint = "rar"
     job = {
         "job_id": job_id,
-        "archive_path": str(volumes[0]),
-        "part_paths": [str(path) for path in volumes],
         "output_dir": str(output_dir),
         "password": "",
-        "format_hint": format_hint,
     }
     if "archive_input" in case:
         job["archive_input"] = case["archive_input"]
-    elif archive_format == "rar-split":
+    elif len(volumes) > 1:
         job["archive_input"] = {
             "entry_path": str(volumes[0]),
             "open_mode": "native_volumes",
-            "format_hint": "rar",
+            "format_hint": format_hint,
+            "volume_style": "rar_part" if format_hint == "rar" else "numeric_suffix",
             "parts": [
                 {"path": str(path), "volume_number": index, "canonical_name": path.name}
                 for index, path in enumerate(volumes, start=1)
             ],
         }
+    else:
+        job["archive_input"] = {"entry_path": str(volumes[0]), "open_mode": "file", "format_hint": format_hint}
     return job
 
 
