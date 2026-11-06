@@ -1,7 +1,7 @@
 use crate::io::directory_errors::{DirectoryReadError, DirectoryReadErrors};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::UNIX_EPOCH;
 
 type PromotionResult = (
-    HashMap<String, String>,
+    Vec<(String, String)>,
     Vec<String>,
     Vec<String>,
     String,
@@ -48,7 +48,7 @@ impl NativeBlockedInputPromotion {
         py: Python<'_>,
         before_move: Option<Py<PyAny>>,
     ) -> PyResult<(Py<PyDict>, Vec<String>, Vec<String>, String, bool)> {
-        let (mapping, removed, touched, error, collision) = py.detach(|| {
+        let (residual, removed, touched, error, collision) = py.detach(|| {
             promote_input_files_with_move(
                 &self.moves,
                 &self.destination,
@@ -66,7 +66,7 @@ impl NativeBlockedInputPromotion {
             self.path_map.clone_ref(py)
         } else {
             let partial = PyDict::new(py);
-            for (source, target) in mapping {
+            for (source, target) in residual {
                 partial.set_item(source, target)?;
             }
             partial.unbind()
@@ -128,7 +128,7 @@ fn promote_input_files_with_move(
     before_move: impl FnOnce() -> io::Result<()>,
     mut move_file: impl FnMut(&Path, &Path) -> io::Result<()>,
 ) -> PromotionResult {
-    let mut mapping = HashMap::new();
+    let mut residual = Vec::new();
     let mut removed = Vec::new();
     let mut parents = HashSet::new();
     // Recheck after acquiring publication leases, before the durable intent.
@@ -137,46 +137,36 @@ fn promote_input_files_with_move(
             Ok(false) => {}
             Ok(true) => {
                 return (
-                    mapping,
+                    residual,
                     removed,
                     Vec::new(),
                     "promotion destination exists".into(),
                     true,
                 )
             }
-            Err(error) => return (mapping, removed, Vec::new(), error.to_string(), false),
+            Err(error) => return (residual, removed, Vec::new(), error.to_string(), false),
         }
         if let Some(parent) = source.parent() {
             parents.insert(parent.to_path_buf());
         }
     }
     if let Err(error) = before_move() {
-        return (mapping, removed, Vec::new(), error.to_string(), false);
+        return (residual, removed, Vec::new(), error.to_string(), false);
     }
-    for (source, target) in moves {
+    for (index, (source, target)) in moves.iter().enumerate() {
         if let Err(error) = move_file(source, target) {
             let mut message = error.to_string();
-            for (old, new) in moves.iter().rev() {
-                let old_key = normalize_path(old);
-                if mapping.contains_key(&old_key) {
-                    match move_file(new, old) {
-                        Ok(()) => {
-                            mapping.remove(&old_key);
-                        }
-                        Err(rollback) => {
-                            message.push_str(&format!(
-                                "; rollback {}: {}",
-                                new.display(),
-                                rollback
-                            ));
-                        }
-                    }
+            // Only this prefix moved. Build a residual map only on failed rollback;
+            // successful execution reuses the already published Python map.
+            for (old, new) in moves[..index].iter().rev() {
+                if let Err(rollback) = move_file(new, old) {
+                    residual.push((normalize_path(old), normalize_path(new)));
+                    message.push_str(&format!("; rollback {}: {}", new.display(), rollback));
                 }
             }
-            let collision = is_name_collision(&error) && mapping.is_empty();
-            return (mapping, removed, Vec::new(), message, collision);
+            let collision = is_name_collision(&error) && residual.is_empty();
+            return (residual, removed, Vec::new(), message, collision);
         }
-        mapping.insert(normalize_path(source), normalize_path(target));
     }
     for parent in &parents {
         // remove_dir itself atomically checks emptiness; never walk upwards.
@@ -186,7 +176,7 @@ fn promote_input_files_with_move(
     }
     let mut touched: Vec<_> = parents.iter().map(|p| normalize_path(p)).collect();
     touched.push(normalize_path(destination));
-    (mapping, removed, touched, String::new(), false)
+    (residual, removed, touched, String::new(), false)
 }
 
 fn move_input_no_replace(source: &Path, destination: &Path) -> io::Result<()> {
@@ -525,7 +515,7 @@ fn flatten_single_branch_chain_with_publisher(
 ) {
     let leaf = resume_leaf
         .map(Path::to_path_buf)
-        .or_else(|| discover_flatten_chain(root).pop());
+        .or_else(|| discover_flatten_leaf(root));
     let Some(leaf) = leaf else {
         return;
     };
@@ -593,14 +583,12 @@ fn flatten_single_branch_chain_with_publisher(
     }
 }
 
-fn discover_flatten_chain(root: &Path) -> Vec<PathBuf> {
-    let mut chain = Vec::new();
-    let mut current = root.to_path_buf();
+fn discover_flatten_leaf(root: &Path) -> Option<PathBuf> {
+    let mut current = only_child_directory(root)?;
     while let Some(child) = only_child_directory(&current) {
-        chain.push(child.clone());
         current = child;
     }
-    chain
+    Some(current)
 }
 
 fn only_child_directory(dir: &Path) -> Option<PathBuf> {
@@ -789,6 +777,64 @@ mod tests {
             assert!(first.is_file() && second.is_file());
             assert_eq!(fs::read_dir(&destination).unwrap().count(), 0);
         }
+    }
+
+    #[test]
+    fn promotion_reports_only_members_left_after_partial_rollback() {
+        // Complete rollback never exercises residual path reporting. Four tiny
+        // files cover restored, retained, failed and not-yet-attempted members.
+        let root = TestDirectory::new("promotion-partial-rollback");
+        let source = root.path().join("source");
+        let destination = root.path().join("destination");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&destination).unwrap();
+        let paths: Vec<_> = (1..=4)
+            .map(|number| source.join(format!("inner.blob.{number:03}")))
+            .collect();
+        for path in &paths {
+            fs::write(path, b"payload").unwrap();
+        }
+        let moves = plan_promotion_moves(
+            paths.iter().map(|path| normalize_path(path)).collect(),
+            &destination,
+        )
+        .unwrap();
+        let mut attempted = Vec::new();
+        let result = promote_input_files_with_move(
+            &moves,
+            &destination,
+            || Ok(()),
+            |old, new| {
+                attempted.push(old.to_path_buf());
+                if old == paths[2] {
+                    return Err(io::Error::new(io::ErrorKind::AlreadyExists, "collision"));
+                }
+                if old == moves[1].1 {
+                    return Err(io::Error::new(io::ErrorKind::PermissionDenied, "retained"));
+                }
+                rename_no_replace(old, new)
+            },
+        );
+        assert_eq!(
+            result.0,
+            vec![(normalize_path(&paths[1]), normalize_path(&moves[1].1))]
+        );
+        assert!(result.3.contains("collision") && result.3.contains("retained"));
+        assert!(
+            !result.4,
+            "partial rollback must not allow collision replanning"
+        );
+        assert_eq!(
+            attempted,
+            vec![
+                paths[0].clone(), paths[1].clone(), paths[2].clone(),
+                moves[1].1.clone(), moves[0].1.clone(),
+            ]
+        );
+        assert!(paths[0].is_file() && paths[2].is_file() && paths[3].is_file());
+        assert!(!paths[1].exists());
+        assert_eq!(fs::read(&moves[1].1).unwrap(), b"payload");
+        assert_eq!(fs::read_dir(&destination).unwrap().count(), 1);
     }
     use std::time::{SystemTime, UNIX_EPOCH};
 
