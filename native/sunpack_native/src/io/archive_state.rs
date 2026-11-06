@@ -65,8 +65,7 @@ struct SegmentReader {
     segments: Vec<Segment>,
     starts: Vec<u64>,
     total: u64,
-    file_index: Option<usize>,
-    file: Option<TrackedFile>,
+    file: Option<(usize, TrackedFile)>,
 }
 
 impl SegmentReader {
@@ -81,7 +80,6 @@ impl SegmentReader {
             segments,
             starts,
             total,
-            file_index: None,
             file: None,
         }
     }
@@ -119,16 +117,14 @@ impl SegmentReader {
             })?;
             let available = (self.segments[index].len() - within) as usize;
             let take = available.min(output.len() - written);
-            match self.segments[index].clone() {
+            match &self.segments[index] {
                 Segment::Range { path, start, .. } => {
-                    if self.file_index != Some(index) {
-                        let file = TrackedFile::open(&path, "archive_state_segment_file")?;
-                        self.file = Some(file);
-                        self.file_index = Some(index);
-                    }
-                    let file = self.file.as_mut().ok_or_else(|| {
-                        std::io::Error::other("archive state source file is unavailable")
-                    })?;
+                    let file = match &mut self.file {
+                        Some((cached, file)) if *cached == index => file,
+                        slot => &mut slot
+                            .insert((index, TrackedFile::open(path, "archive_state_segment_file")?))
+                            .1,
+                    };
                     file.seek(SeekFrom::Start(start.saturating_add(within)))?;
                     file.read_exact(&mut output[written..written + take])?;
                 }
@@ -669,7 +665,7 @@ fn zip_manifest_from_reader(
     let mut checksum_error = false;
     let mut wrong_password = false;
     let mut message = "Archive-state ZIP manifest loaded by native parser".to_string();
-    let mut payload = ZipPayloadVerifier::new();
+    let mut payload = ZipPayloadVerifier::default();
     let mut output_paths = OutputPathAllocator::default();
     while cursor.saturating_add(46) <= total.min(expected_end) && cursor < expected_end {
         let mut header = [0u8; 46];
@@ -1071,21 +1067,15 @@ enum PayloadCheck {
     WrongPassword,
 }
 
-/// Streams stored / deflated ZIP payloads through fixed buffers for CRC checks,
+/// Streams stored / deflated ZIP payloads through bounded buffers for CRC checks,
 /// decrypting ZipCrypto entries on the fly when a password is supplied.
+#[derive(Default)]
 struct ZipPayloadVerifier {
     input: Vec<u8>,
     output: Vec<u8>,
 }
 
 impl ZipPayloadVerifier {
-    fn new() -> Self {
-        Self {
-            input: vec![0u8; COPY_CHUNK_SIZE],
-            output: vec![0u8; 64 * 1024],
-        }
-    }
-
     fn verify(
         &mut self,
         reader: &mut SegmentReader,
@@ -1143,7 +1133,7 @@ impl ZipPayloadVerifier {
                 let mut crc = crc32fast::Hasher::new();
                 let mut fed = 0u64;
                 while fed < data_len {
-                    let take = ((data_len - fed) as usize).min(self.input.len());
+                    let take = (data_len - fed).min(COPY_CHUNK_SIZE as u64) as usize;
                     self.read_payload(reader, data_start + fed, take, &mut decryptor)?;
                     crc.update(&self.input[..take]);
                     fed += take as u64;
@@ -1174,6 +1164,10 @@ impl ZipPayloadVerifier {
         take: usize,
         decryptor: &mut Option<ZipCryptoDecryptor>,
     ) -> PyResult<()> {
+        if self.input.len() < take {
+            // Grow geometrically across members, bounded by COPY_CHUNK_SIZE.
+            self.input.resize(take.next_power_of_two(), 0);
+        }
         reader.read_exact_at(offset, &mut self.input[..take])?;
         if let Some(decryptor) = decryptor {
             decryptor.decrypt(&mut self.input[..take]);
@@ -1191,13 +1185,14 @@ impl ZipPayloadVerifier {
         decryptor: &mut Option<ZipCryptoDecryptor>,
     ) -> PyResult<bool> {
         use flate2::{Decompress, FlushDecompress, Status};
+        self.output.resize(64 * 1024, 0);
         let mut decompressor = Decompress::new(false);
         let mut crc = crc32fast::Hasher::new();
         let mut fed = 0u64;
         let mut pending = 0..0;
         loop {
             if pending.is_empty() && fed < length {
-                let take = ((length - fed) as usize).min(self.input.len());
+                let take = (length - fed).min(COPY_CHUNK_SIZE as u64) as usize;
                 self.read_payload(reader, start + fed, take, decryptor)?;
                 fed += take as u64;
                 pending = 0..take;

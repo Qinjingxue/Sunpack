@@ -4,6 +4,8 @@ import struct
 import zipfile
 import zlib
 
+import pytest
+
 from sunpack.core.contracts.archive_input import ArchiveInputDescriptor, ArchiveInputPart, InputExtent
 from sunpack.pipeline.extraction.output_inventory import collect_output_inventory
 from sunpack.pipeline.verification.archive_input_manifest import archive_input_manifest
@@ -22,18 +24,24 @@ def _input(path, **kwargs):
     return ArchiveInputDescriptor(entry_path=str(path), format_hint="zip", **kwargs)
 
 
-def test_zip_manifest_streams_deflate_payload_crc(tmp_path):
+@pytest.mark.parametrize("compression", [zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED])
+def test_zip_manifest_streams_payload_crc(tmp_path, compression):
+    # Exercise empty, large and small members in one walk: both payload paths
+    # must grow and reuse their buffers across chunk and member boundaries.
     payload = os.urandom(3 * 1024 * 1024) + b"z" * (2 * 1024 * 1024)
     path = tmp_path / "large.zip"
-    path.write_bytes(_zip_bytes({"dir/": b"", "dir/big.bin": payload, "small.txt": b"small"}))
+    path.write_bytes(_zip_bytes(
+        {"dir/": b"", "dir/big.bin": payload, "small.txt": b"small", "empty.txt": b""},
+        compression=compression,
+    ))
 
     manifest = archive_input_manifest(_input(path))
 
     assert manifest.ok is True
-    assert manifest.item_count == 3
-    assert manifest.file_count == 2
+    assert manifest.item_count == 4
+    assert manifest.file_count == 3
     assert manifest.total_unpacked_size == len(payload) + len(b"small")
-    assert manifest.expected_names == ["dir/big.bin", "small.txt"]
+    assert manifest.expected_names == ["dir/big.bin", "small.txt", "empty.txt"]
     first = manifest.entries.entry_page(0, 1)[0]
     assert first["has_crc"] is True
     assert first["crc32"] == zipfile.ZipFile(path).getinfo("dir/big.bin").CRC
