@@ -71,17 +71,3 @@ def test_verification_finishes_without_cleanup_or_reextraction(
     assert cleanup_calls == []
     if decision == DECISION_RETRY_EXTRACT:
         assert outcome.outcome_kind.value == "failure"
-
-
-def test_container_structure_extraction_failure_is_not_proven_content_loss():
-    # The worker reports header/recognition problems with the item_extract
-    # stage.  Container evidence alone must never be read as content loss.
-    result = ExtractionResult(
-        success=False,
-        out_dir="out",
-        error="archive headers error",
-        diagnostics={"failure_kind": "headers_error", "failure_stage": "item_extract"},
-    )
-    verification = VerificationResult(decision_hint=DECISION_FAIL)
-
-    assert archive_job._proves_content_loss(result, verification) is False

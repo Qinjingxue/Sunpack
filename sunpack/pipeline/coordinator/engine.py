@@ -9,6 +9,7 @@ import stat
 import time
 import uuid
 from collections import OrderedDict
+from contextlib import ExitStack
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Iterable, TextIO
@@ -1301,17 +1302,20 @@ class _RequestRuntime:
             )
             return replace(response, interrupted=True, interruption_cleanup_errors=errors)
         finally:
-            for request in self.source_cleanup.sweep_requests():
-                self._schedule_cleanup(request, broker=broker, cancellation=cancellation)
-            await self._drain_cleanup_tasks()
-            self._shell_updates.flush()
-            self.extractor.set_progress_callback(None)
-            await self.reporter.drain_progress()
-            # Request runners are forks: close releases no shared worker and
-            # performs no I/O. The engine owns worker shutdown. Do not queue a
-            # no-op close behind unrelated work, especially after cancellation.
-            self.extractor.close()
-            self.input_planning_stage.clear_report_cache()
+            # Even a retained cleanup traceback must not pin analysis reports
+            # or the runner's bound callback back to this request.
+            with ExitStack() as releases:
+                releases.callback(self.input_planning_stage.clear_report_cache)
+                # Fork close performs no I/O; the engine owns shared workers.
+                releases.callback(self.extractor.close)
+                try:
+                    for request in self.source_cleanup.sweep_requests():
+                        self._schedule_cleanup(request, broker=broker, cancellation=cancellation)
+                    await self._drain_cleanup_tasks()
+                    self._shell_updates.flush()
+                finally:
+                    self.extractor.set_progress_callback(None)
+                    await self.reporter.drain_progress()
 
     async def _discover_and_run(
         self,

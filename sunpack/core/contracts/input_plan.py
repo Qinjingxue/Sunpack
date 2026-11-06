@@ -192,7 +192,7 @@ class InputRecovery:
                                 and node.descriptor.extents == previous.input.descriptor.extents)
                 unchanged = current == previous.generation and same_mapping
             else:
-                unchanged = current == previous.generation and node.descriptor.to_dict() == previous.input.descriptor.to_dict()
+                unchanged = current == previous.generation and node.descriptor.same_retry_input(previous.input.descriptor)
             if unchanged and (previous.complete or not (password_changed and "password" in previous.blockers)):
                 carried.append(replace(previous, input=node))
             else:

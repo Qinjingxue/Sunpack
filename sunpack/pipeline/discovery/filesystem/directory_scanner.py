@@ -5,7 +5,6 @@ from sunpack_native import (
     NativeDirectoryScanOptions,
     filter_inventory_file_indices as _NATIVE_FILTER_INVENTORY_FILE_INDICES,
     relations_apply_split_size_anchors as _NATIVE_APPLY_SPLIT_SIZE_ANCHORS,
-    relations_size_filter_split_family_keys as _NATIVE_SPLIT_SIZE_FAMILY_KEYS,
 )
 
 from sunpack.core.contracts.filesystem import DirectorySnapshot, FileEntry
@@ -165,20 +164,6 @@ class DirectoryScanner:
             )
         return current
 
-def apply_ordered_filters_to_entries(entries: list[FileEntry], filters: list[ScanFilter]) -> list[FileEntry]:
-    if not filters:
-        return entries
-
-    current = entries
-    for scan_filter in filters:
-        current = (
-            _apply_size_filter_with_split_anchors(current, scan_filter)
-            if getattr(scan_filter, "name", "") == "size_range"
-            else apply_filter_to_entries(current, scan_filter)
-        )
-    return current
-
-
 def _apply_size_filter_with_split_anchors(
     entries: list[FileEntry],
     scan_filter: ScanFilter,
@@ -202,31 +187,6 @@ def _apply_size_filter_with_split_anchors(
         for entry, accepted in zip(entries, keep)
         if accepted
     ]
-
-
-def rejected_only_by_size_range(entry: FileEntry, filters: list[ScanFilter]) -> bool:
-    """Return whether a file was rejected solely by configured size rules."""
-    size_rejected = False
-    candidate = ScanCandidate(
-        path=entry.path,
-        kind="dir" if entry.is_dir else "file",
-        size=entry.size,
-        mtime_ns=entry.mtime_ns,
-        metadata=entry.metadata,
-    )
-    for scan_filter in filters:
-        decision = scan_filter.evaluate(candidate)
-        if not decision.reject_entry:
-            continue
-        if getattr(scan_filter, "name", "") != "size_range":
-            return False
-        size_rejected = True
-    return size_rejected
-
-
-def split_size_family_keys(path: str) -> tuple[str, ...]:
-    """Use the native relations naming authority for cheap watch prechecks."""
-    return tuple(str(value) for value in _NATIVE_SPLIT_SIZE_FAMILY_KEYS(str(path)))
 
 
 def apply_filter_to_entries(

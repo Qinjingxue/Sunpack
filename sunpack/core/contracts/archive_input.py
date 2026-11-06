@@ -15,6 +15,8 @@ ArchiveOpenMode = Literal[
     "sfx_with_volumes",
 ]
 
+_SEGMENT_PROVENANCE = frozenset({"segment_confidence", "segment_source"})
+
 
 @dataclass(frozen=True)
 class InputExtent:
@@ -119,11 +121,27 @@ class ArchiveInputDescriptor:
         analysis = {
             key: value
             for key, value in self.analysis.items()
-            if key not in {"segment_confidence", "segment_source"}
+            if key not in _SEGMENT_PROVENANCE
         }
         if analysis:
             payload["analysis"] = analysis
         return payload
+
+    def same_retry_input(self, other: "ArchiveInputDescriptor") -> bool:
+        """Compare execution facts without materializing every volume/range."""
+        return (
+            self.entry_path == other.entry_path
+            and self.open_mode == other.open_mode
+            and self.format_hint == other.format_hint
+            and self.logical_name == other.logical_name
+            and self.volume_style == other.volume_style
+            and self.parts == other.parts
+            and (self.open_mode != "concat_ranges" or self.extents == other.extents)
+            and (self.analysis == other.analysis or (
+                {key: value for key, value in self.analysis.items() if key not in _SEGMENT_PROVENANCE}
+                == {key: value for key, value in other.analysis.items() if key not in _SEGMENT_PROVENANCE}
+            ))
+        )
 
     def part_paths(self) -> list[str]:
         if self.open_mode == "concat_ranges" and self.extents:

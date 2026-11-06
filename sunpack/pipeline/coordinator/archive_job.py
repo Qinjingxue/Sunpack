@@ -21,13 +21,9 @@ from sunpack.core.contracts.verification import DECISION_ACCEPT, DECISION_ACCEPT
 
 from sunpack.core.passwords.directory_context import PasswordScopeContext
 from sunpack.pipeline.verification import VerificationResult, VerificationScheduler
-from sunpack.pipeline.verification.error_classification import classify_verification_error
 from sunpack.core.contracts.verification import (
     CONTENT_INTEGRITY_PAYLOAD_DAMAGED,
-    CONTENT_INTEGRITY_UNKNOWN,
     CONTENT_INTEGRITY_VERIFIED_PARTIAL,
-    VERIFICATION_STRENGTH_CRC,
-    VERIFICATION_STRENGTH_MANIFEST,
 )
 from sunpack.core.i18n import I18nContext
 
@@ -405,16 +401,6 @@ class ArchiveJobExecutor:
             verification = verify_and_project(self.verifier, task, result)
             return ArchiveJobOutcome(result=result, verification=verification, attempts=1)
 
-    def _must_stop_for_proven_content_loss(
-        self,
-        task: ArchiveTask,
-        result: ExtractionResult,
-        verification: VerificationResult,
-    ) -> bool:
-        if self.content_policy.allows_partial:
-            return False
-        return _proves_content_loss(result, verification)
-
     def collect_result(self, task: ArchiveTask, outcome: ArchiveJobOutcome | ExtractionResult) -> TargetRunResult:
         content_policy = self.content_policy
         if isinstance(outcome, ExtractionResult):
@@ -543,47 +529,6 @@ def _partial_result_is_acceptable(result: ExtractionResult) -> bool:
     """Reject execution/authentication failures, while allowing damaged sources to yield verified content."""
     reason = result.failure.kind.value if result.failure is not None else ""
     return not reason or reason in {"damaged", "missing_volume"}
-
-
-def _proves_content_loss(result: ExtractionResult, verification: VerificationResult) -> bool:
-    """Return true only for content evidence, never for container-structure evidence alone."""
-    failure = result.failure
-    if failure is not None and failure.contains(FailureKind.MISSING_VOLUME):
-        return True
-
-    for payload in _nested_diagnostic_payloads(result):
-        failure_kind = str(payload.get("failure_kind") or "")
-        failure_stage = str(payload.get("failure_stage") or "")
-        if not failure_kind:
-            continue
-        classified = classify_verification_error(failure_kind, failure_stage)
-        if classified.content_integrity != CONTENT_INTEGRITY_UNKNOWN:
-            return True
-
-    content_integrity = verification.content_integrity
-    strength = verification.verification_strength
-    return (
-        content_integrity
-        in {CONTENT_INTEGRITY_VERIFIED_PARTIAL, CONTENT_INTEGRITY_PAYLOAD_DAMAGED}
-        and strength
-        in {VERIFICATION_STRENGTH_MANIFEST, VERIFICATION_STRENGTH_CRC, "checksum"}
-    )
-
-
-def _nested_diagnostic_payloads(result: ExtractionResult):
-    roots: list[Any] = [result.diagnostics]
-    if result.failure is not None:
-        roots.append(result.failure.details)
-    pending = [value for value in roots if isinstance(value, dict)]
-    seen: set[int] = set()
-    while pending:
-        payload = pending.pop()
-        marker = id(payload)
-        if marker in seen:
-            continue
-        seen.add(marker)
-        yield payload
-        pending.extend(value for value in payload.values() if isinstance(value, dict))
 
 
 def _coverage_payload(verification: VerificationResult) -> dict[str, Any]:

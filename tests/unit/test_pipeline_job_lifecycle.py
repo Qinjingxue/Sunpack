@@ -2,7 +2,67 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
+
 from sunpack.pipeline.coordinator.engine import _RequestRuntime
+
+
+@pytest.mark.parametrize("failure_stage", ["cleanup", "shell", "progress", "close"])
+def test_request_finalization_releases_owners_after_cleanup_failure(monkeypatch, tmp_path, failure_stage):
+    # Successful-close coverage misses failures in the finalizer itself. Keep
+    # the failed runtime alive, like a retained traceback, and prove its cache
+    # payload and progress callback are released without waiting for GC.
+    import weakref
+    import sunpack.pipeline.coordinator.engine as engine_module
+    from tests.helpers.config_factory import make_config
+
+    class Payload:
+        pass
+
+    async def no_worker(*args):
+        pass
+
+    monkeypatch.setattr(engine_module._PipelineServices, "start", no_worker)
+    monkeypatch.setattr(engine_module._PipelineServices, "close", no_worker)
+
+    async def scenario():
+        async with engine_module.PipelineEngine(make_config()) as engine:
+            factory = engine._request_runtime_factory
+            captured = []
+
+            def configured(*args):
+                runtime = factory(*args)
+                payload = Payload()
+                captured.append((runtime, weakref.ref(payload)))
+                runtime.input_planning_stage._report_cache[("test",)] = payload
+
+                def fail():
+                    raise RuntimeError("finalization failure")
+
+                async def async_fail():
+                    fail()
+
+                async def discover(*args, **kwargs):
+                    # Fail in finalization, after the normal execution body.
+                    runtime.source_cleanup.sweep_requests = fail if failure_stage == "cleanup" else lambda: ()
+                    runtime._shell_updates.flush = fail if failure_stage == "shell" else lambda: None
+                    if failure_stage == "progress":
+                        runtime.reporter.drain_progress = async_fail
+                    if failure_stage == "close":
+                        runtime.extractor.close = fail
+
+                runtime._discover_and_run = discover
+                return runtime
+
+            engine._request_runtime_factory = configured
+            with pytest.raises(RuntimeError, match="finalization failure"):
+                await engine.run([str(tmp_path)])
+            runtime, payload = captured.pop()
+            assert runtime.extractor.sevenzip_runner.progress_callback is None
+            assert payload() is None
+            assert engine.is_idle()
+
+    asyncio.run(scenario())
 
 
 def test_closed_engine_releases_callback_owners_without_cyclic_gc(monkeypatch):
