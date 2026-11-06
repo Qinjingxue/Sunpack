@@ -396,6 +396,9 @@ fn scan_directories_page(
     let mut cursor = start_usn;
     let mut payload_bytes = 0usize;
     let mut changed = BTreeSet::new();
+    // Page-local scratch; draining results retains capacity for the next record.
+    let mut changes = Vec::new();
+    let mut name_units = Vec::new();
     let mut output = vec![0u8; JOURNAL_BUFFER_BYTES];
     while cursor < end_usn {
         let bytes_returned = read(cursor, &mut output)?;
@@ -423,7 +426,9 @@ fn scan_directories_page(
                 ));
             }
             let record = &output[offset..offset + length];
-            let changes = record_directory_changes(record, &parents, cursor, end_usn)?;
+            record_directory_changes(
+                record, &parents, cursor, end_usn, &mut changes, &mut name_units,
+            )?;
             let added: usize = changes
                 .iter()
                 .filter(|change| !changed.contains(*change))
@@ -453,7 +458,7 @@ fn scan_directories_page(
                 });
             }
             payload_bytes += added;
-            changed.extend(changes);
+            changed.extend(changes.drain(..));
             offset += length;
         }
         if returned_next <= cursor {
@@ -475,7 +480,10 @@ fn record_directory_changes(
     parents: &HashMap<[u8; FILE_ID_BYTES], u32>,
     start_usn: i64,
     end_usn: i64,
-) -> io::Result<Vec<(u32, String)>> {
+    changes: &mut Vec<(u32, String)>,
+    name_units: &mut Vec<u16>,
+) -> io::Result<()> {
+    changes.clear();
     if record.len() < 8 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -501,13 +509,12 @@ fn record_directory_changes(
     }
     let usn = i64::from_le_bytes(record[usn_offset..usn_offset + 8].try_into().unwrap());
     if usn < start_usn || usn >= end_usn {
-        return Ok(Vec::new());
+        return Ok(());
     }
     let mut file = [0u8; FILE_ID_BYTES];
     let mut parent = file;
     file[..width].copy_from_slice(&record[8..8 + width]);
     parent[..width].copy_from_slice(&record[8 + width..8 + 2 * width]);
-    let mut changes = Vec::new();
     if let Some(index) = parents.get(&file) {
         changes.push((*index, String::new()));
     }
@@ -537,11 +544,11 @@ fn record_directory_changes(
                 "invalid USN file name range",
             ));
         }
-        let units: Vec<_> = record[offset..offset + length]
+        name_units.clear();
+        name_units.extend(record[offset..offset + length]
             .chunks_exact(2)
-            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
-            .collect();
-        let name = String::from_utf16(&units)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]])));
+        let name = String::from_utf16(name_units)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid USN UTF-16"))?;
         if name.contains(['/', '\\']) || name == "." || name == ".." || name.contains('\0') {
             return Err(io::Error::new(
@@ -551,7 +558,7 @@ fn record_directory_changes(
         }
         changes.push((*index, name));
     }
-    Ok(changes)
+    Ok(())
 }
 
 fn read_change_reasons_from_volume(
@@ -836,11 +843,13 @@ mod tests {
         // Reason parsing tests never exercise parent dispatch, both rename names,
         // or nameless/unknown records. This one in-memory case covers that gap.
         let parents = HashMap::from([(11u128.to_le_bytes(), 0), (22u128.to_le_bytes(), 1)]);
+        let mut changes = Vec::new();
+        let mut name_units = Vec::new();
         for major in [2, 3] {
             let width = if major == 2 { 8 } else { 16 };
             let base = if major == 2 { 60 } else { 76 };
             let length_offset = if major == 2 { 56 } else { 72 };
-            for name in ["Old.opaque", "New.001"] {
+            for name in ["Old.opaque", "New.001", "新🔐.002"] {
                 let mut row = record(major, 22, 100, 0x1000);
                 row.resize(base, 0);
                 row[8 + width..8 + 2 * width].copy_from_slice(&11u128.to_le_bytes()[..width]);
@@ -850,22 +859,73 @@ mod tests {
                 row[length_offset + 2..length_offset + 4]
                     .copy_from_slice(&(base as u16).to_le_bytes());
                 row.extend_from_slice(&encoded);
-                assert_eq!(
-                    record_directory_changes(&row, &parents, 100, 101).unwrap(),
-                    vec![(1, String::new()), (0, name.to_owned())]
-                );
-                assert!(record_directory_changes(&row, &parents, 99, 100)
-                    .unwrap()
-                    .is_empty());
+                record_directory_changes(&row, &parents, 100, 101, &mut changes, &mut name_units).unwrap();
+                assert_eq!(changes, vec![(1, String::new()), (0, name.to_owned())]);
+                record_directory_changes(&row, &parents, 99, 100, &mut changes, &mut name_units).unwrap();
+                assert!(changes.is_empty());
+                row[base..base + 2].copy_from_slice(&0xdc00u16.to_le_bytes());
+                assert!(record_directory_changes(&row, &parents, 100, 101, &mut changes, &mut name_units).is_err());
                 row[length_offset..length_offset + 2].copy_from_slice(&1u16.to_le_bytes());
-                assert!(record_directory_changes(&row, &parents, 100, 101).is_err());
+                assert!(record_directory_changes(&row, &parents, 100, 101, &mut changes, &mut name_units).is_err());
             }
         }
         let mut nameless = record(4, 33, 100, 1);
         nameless[24..40].copy_from_slice(&11u128.to_le_bytes());
-        assert!(record_directory_changes(&nameless, &parents, 100, 101).is_err());
+        assert!(record_directory_changes(&nameless, &parents, 100, 101, &mut changes, &mut name_units).is_err());
         nameless[4..6].copy_from_slice(&5u16.to_le_bytes());
-        assert!(record_directory_changes(&nameless, &parents, 100, 101).is_err());
+        assert!(record_directory_changes(&nameless, &parents, 100, 101, &mut changes, &mut name_units).is_err());
+    }
+
+    #[test]
+    fn directory_recovery_pages_preserve_names_and_resume_whole_records() {
+        // Record-only tests cannot catch lost entries when a reused buffer is
+        // drained across journal reads or a response page ends mid-buffer.
+        let mut records = Vec::new();
+        let mut expected = BTreeSet::from([(1, String::new())]);
+        for index in 0..600 {
+            let name = format!("{index:04}-{}-新🔐.001", "x".repeat(120));
+            expected.insert((0, name.clone()));
+            for _ in 0..2 {
+                let mut row = record(2, 22, records.len() as i64 + 1, 0x1000);
+                row[16..24].copy_from_slice(&11u64.to_le_bytes());
+                let encoded: Vec<_> = name.encode_utf16().flat_map(u16::to_le_bytes).collect();
+                row[56..58].copy_from_slice(&(encoded.len() as u16).to_le_bytes());
+                row[58..60].copy_from_slice(&60u16.to_le_bytes());
+                row.extend_from_slice(&encoded);
+                let length = row.len() as u32;
+                row[..4].copy_from_slice(&length.to_le_bytes());
+                records.push(row);
+            }
+        }
+        let end_usn = records.len() as i64 + 1;
+        let mut cursor = 1;
+        let mut actual = BTreeSet::new();
+        let mut pages = 0;
+        while cursor < end_usn {
+            let page = scan_directories_page(
+                42, &[11u128.to_le_bytes(), 22u128.to_le_bytes()], cursor, end_usn,
+                |start, output| {
+                    let mut index = (start - 1) as usize;
+                    let mut used = 8;
+                    while let Some(row) = records.get(index) {
+                        if used + row.len() > output.len() { break; }
+                        output[used..used + row.len()].copy_from_slice(row);
+                        used += row.len();
+                        index += 1;
+                    }
+                    output[..8].copy_from_slice(&(index as i64 + 1).to_le_bytes());
+                    Ok(used)
+                },
+            ).unwrap();
+            assert_eq!(page.journal_id, 42);
+            assert!(page.next_usn > cursor && page.next_usn <= end_usn);
+            assert!(page.changes.iter().map(|(_, name)| 8 + name.len()).sum::<usize>() <= RECOVERY_PAGE_BYTES);
+            actual.extend(page.changes);
+            cursor = page.next_usn;
+            pages += 1;
+        }
+        assert!(pages > 1);
+        assert_eq!(actual, expected);
     }
 
     #[test]
