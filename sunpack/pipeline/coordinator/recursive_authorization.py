@@ -80,7 +80,7 @@ class RecursiveAuthorization:
                 )
                 for task in root_tasks
             ]
-            rows = list(_NATIVE_AUTHORIZE_NESTED_CANDIDATES(
+            rows = _NATIVE_AUTHORIZE_NESTED_CANDIDATES(
                 snapshot.raw_native_snapshot,
                 root,
                 candidates,
@@ -89,11 +89,10 @@ class RecursiveAuthorization:
                 float(self.config.get("authorization_bias", 0.0)),
                 float(self.config.get("minimum_authorization_score", 0.85)),
                 float(self.config.get("minimum_archive_byte_ratio", 0.1)),
-            ))
+            )
             if len(rows) != len(root_tasks):
                 raise RuntimeError("Native nested extraction authorization returned an invalid row count")
-            for task, raw_row in zip(root_tasks, rows):
-                row = dict(raw_row)
+            for task, row in zip(root_tasks, rows):
                 if row.get("allowed"):
                     allowed_ids.add(id(task))
                     continue

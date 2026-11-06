@@ -66,6 +66,7 @@ struct CandidateContext {
 }
 
 struct Evaluation {
+    stats: ScopeStats,
     byte_ratio: f64,
     project_ratio: f64,
     score: f64,
@@ -98,7 +99,7 @@ pub(crate) fn authorize_nested_candidates(
     // The frozen snapshot owns immutable Rust storage. Borrow it directly while
     // detached; neither the table nor its row view needs a copy or Python data.
     let snapshot = &*raw_snapshot;
-    let (contexts, scope_stats, root_stats) = py.detach(|| {
+    let (contexts, scope_evaluations, root_evaluation) = py.detach(|| {
         let root_key = path_key(&root);
         let mut contexts = Vec::with_capacity(candidates.len());
         let mut scopes: HashMap<String, ScopeCandidates> = HashMap::new();
@@ -128,12 +129,14 @@ pub(crate) fn authorize_nested_candidates(
                 .map(|member| path_key(Path::new(&member)))
                 .collect();
             add_candidate(&mut root_candidates, &root, &entry, &member_keys);
-            add_candidate(
-                scopes.entry(scope_key.clone()).or_default(),
-                &scope_path,
-                &entry,
-                &member_keys,
-            );
+            if scope_key != root_key {
+                add_candidate(
+                    scopes.entry(scope_key.clone()).or_default(),
+                    &scope_path,
+                    &entry,
+                    &member_keys,
+                );
+            }
             contexts.push(CandidateContext {
                 entry_path,
                 scope_path,
@@ -147,7 +150,6 @@ pub(crate) fn authorize_nested_candidates(
         let mut root_accumulator = ScopeAccumulator::new(&root_candidates);
         let mut scope_accumulators: HashMap<String, ScopeAccumulator> = scopes
             .iter()
-            .filter(|(key, _)| key.as_str() != root_key.as_str())
             .map(|(key, candidates)| (key.clone(), ScopeAccumulator::new(candidates)))
             .collect();
         // Snapshot storage stays borrowed. Only candidate members need sizes;
@@ -202,34 +204,32 @@ pub(crate) fn authorize_nested_candidates(
                 .map(|member| member_sizes.get(member.as_str()).copied().unwrap_or(0))
                 .fold(0u64, u64::saturating_add);
         }
-        let root_stats = root_accumulator.finish(&root_candidates);
-        let scope_stats: HashMap<String, ScopeStats> = scope_accumulators
+        let evaluate_scope = |stats| {
+            evaluate(
+                stats,
+                byte_ratio_exponent,
+                project_ratio_exponent,
+                authorization_bias,
+            )
+        };
+        let root_evaluation = evaluate_scope(root_accumulator.finish(&root_candidates));
+        let scope_evaluations: HashMap<String, Evaluation> = scope_accumulators
             .into_iter()
             .map(|(key, accumulator)| {
                 let candidates = scopes.get(&key).expect("scope candidates must exist");
-                (key, accumulator.finish(candidates))
+                (key, evaluate_scope(accumulator.finish(candidates)))
             })
             .collect();
-        (contexts, scope_stats, root_stats)
+        (contexts, scope_evaluations, root_evaluation)
     });
 
     contexts
         .into_iter()
         .map(|context| {
             let result = PyDict::new(py);
-            let local_stats = scope_stats.get(&context.scope_key).unwrap_or(&root_stats);
-            let local = evaluate(
-                local_stats,
-                byte_ratio_exponent,
-                project_ratio_exponent,
-                authorization_bias,
-            );
-            let root_evaluation = evaluate(
-                &root_stats,
-                byte_ratio_exponent,
-                project_ratio_exponent,
-                authorization_bias,
-            );
+            let local = scope_evaluations
+                .get(&context.scope_key)
+                .unwrap_or(&root_evaluation);
             let (authorization_score, limiting_context) = if root_evaluation.score < local.score {
                 (root_evaluation.score, "root")
             } else {
@@ -255,8 +255,8 @@ pub(crate) fn authorize_nested_candidates(
             result.set_item("limiting_context", limiting_context)?;
             result.set_item("candidate_bytes", context.candidate_bytes)?;
             result.set_item("candidate_member_count", context.member_keys.len())?;
-            set_scope_items(&result, "local", local_stats, &local)?;
-            set_scope_items(&result, "root", &root_stats, &root_evaluation)?;
+            set_scope_items(&result, "local", local)?;
+            set_scope_items(&result, "root", &root_evaluation)?;
             result.set_item("authorization_score", authorization_score)?;
             Ok(result.unbind())
         })
@@ -311,7 +311,7 @@ fn immediate_branch(path: &Path, scope: &Path, is_dir: bool) -> Option<PathBuf> 
 }
 
 fn evaluate(
-    stats: &ScopeStats,
+    stats: ScopeStats,
     byte_ratio_exponent: f64,
     project_ratio_exponent: f64,
     authorization_bias: f64,
@@ -326,6 +326,7 @@ fn evaluate(
         authorization_bias,
     );
     Evaluation {
+        stats,
         byte_ratio,
         project_ratio,
         score,
@@ -368,9 +369,9 @@ fn odds_fusion_score(
 fn set_scope_items(
     result: &Bound<'_, PyDict>,
     prefix: &str,
-    stats: &ScopeStats,
     evaluation: &Evaluation,
 ) -> PyResult<()> {
+    let stats = &evaluation.stats;
     result.set_item(format!("{prefix}_candidate_bytes"), stats.candidate_bytes)?;
     result.set_item(format!("{prefix}_total_bytes"), stats.total_bytes)?;
     result.set_item(
