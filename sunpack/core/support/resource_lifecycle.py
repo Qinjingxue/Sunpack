@@ -213,7 +213,6 @@ class ResourceRecord:
     created_thread: int
     created_from: str
     state: ResourceState = ResourceState.ACTIVE
-    released_at: float | None = None
     release_error: str = ""
 
     def overlaps(self, roots: Sequence[FileIdentity]) -> bool:
@@ -466,7 +465,6 @@ def _release_resource(resource_id: str) -> bool:
         raise
     with _CHANGED:
         record.state = ResourceState.RELEASED
-        record.released_at = time.time()
         record.release_callback = lambda: None
         _RELEASE_HISTORY.append(record.describe())
         _RESOURCES.pop(resource_id, None)
@@ -492,12 +490,11 @@ def _release_records(records: Sequence[ResourceRecord]) -> ReleaseReport:
 
 
 class TaskResourceScope:
-    def __init__(self, task_id: str, *, files: Iterable[os.PathLike[str] | str] = ()):
+    def __init__(self, task_id: str):
         task_id = str(task_id or "").strip()
         if not task_id:
             raise ValueError("TaskResourceScope requires a task_id")
         self.task_id = task_id
-        self.files = file_identities(files)
         self.state = ScopeState.ACTIVE
         self.created_at = time.time()
         self._resource_ids: dict[str, None] = {}

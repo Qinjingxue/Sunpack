@@ -38,7 +38,7 @@ def test_task_scope_releases_resources_in_reverse_creation_order(tmp_path):
     path = tmp_path / "input.bin"
     path.write_bytes(b"payload")
     released: list[str] = []
-    scope = TaskResourceScope("task-lifo", files=(path,))
+    scope = TaskResourceScope("task-lifo")
 
     with scope.activate():
         # Individual close must retire the scope's index immediately; a final
@@ -203,7 +203,7 @@ def test_promotion_fails_closed_for_another_tasks_live_resource(tmp_path):
     root.mkdir()
     path = root / "held.bin"
     path.write_bytes(b"payload")
-    scope = TaskResourceScope("other-task", files=(path,))
+    scope = TaskResourceScope("other-task")
     released = threading.Event()
     with scope.activate():
         register_current_task_resource(
@@ -258,8 +258,8 @@ def test_promotion_drains_archive_session_borrow_before_publishing_gate(tmp_path
     # second lookup waits for the full promotion barrier timeout.
     monkeypatch.setattr(archive_sessions, "lifecycle_registration", short_registration)
 
-    reader_scope = TaskResourceScope("archive-reader", files=(path,))
-    promoter_scope = TaskResourceScope("archive-promoter", files=(path,))
+    reader_scope = TaskResourceScope("archive-reader")
+    promoter_scope = TaskResourceScope("archive-promoter")
     promoter = None
     revisitor = None
     promotion_errors = []
@@ -332,7 +332,7 @@ def test_promotion_drains_archive_session_borrow_before_publishing_gate(tmp_path
 def test_promotion_waits_for_current_tasks_concurrent_operation(tmp_path):
     root = tmp_path / "output"
     root.mkdir()
-    scope = TaskResourceScope("current-task", files=(root,))
+    scope = TaskResourceScope("current-task")
     entered = threading.Event()
     release = threading.Event()
 
@@ -423,7 +423,7 @@ def test_work_broker_inherits_scope_when_request_id_is_omitted(tmp_path):
 
     async def scenario() -> None:
         broker = AsyncWorkBroker(thread_capacity=1)
-        scope = TaskResourceScope("broker-task", files=(path,))
+        scope = TaskResourceScope("broker-task")
 
         def create_handle() -> None:
             holder["handle"] = open_task_file(path, "rb")
@@ -447,7 +447,7 @@ def test_work_broker_file_operation_uses_lightweight_path_counter(tmp_path, monk
 
     async def scenario() -> None:
         broker = AsyncWorkBroker(thread_capacity=1)
-        scope = TaskResourceScope("lightweight-operation-task", files=(path,))
+        scope = TaskResourceScope("lightweight-operation-task")
 
         def slow_operation() -> None:
             operation_started.set()
@@ -486,7 +486,7 @@ def test_work_broker_reuses_file_identity_for_nested_tracked_open(tmp_path, monk
 
     async def scenario() -> None:
         broker = AsyncWorkBroker(thread_capacity=1)
-        scope = TaskResourceScope("identity-reuse-task", files=(path,))
+        scope = TaskResourceScope("identity-reuse-task")
         real_stat = lifecycle.os.stat
         stat_calls = 0
 
@@ -518,7 +518,7 @@ def test_promotion_waits_for_other_tasks_broker_file_operation(tmp_path):
 
     async def scenario() -> None:
         broker = AsyncWorkBroker(thread_capacity=1)
-        scope = TaskResourceScope("broker-operation-task", files=(path,))
+        scope = TaskResourceScope("broker-operation-task")
 
         def slow_operation() -> None:
             operation_started.set()
@@ -553,7 +553,7 @@ def test_async_scope_close_waits_for_cancelled_worker_without_blocking_loop(tmp_
 
     async def scenario() -> None:
         broker = AsyncWorkBroker(thread_capacity=1)
-        scope = TaskResourceScope("cancel-task", files=(path,))
+        scope = TaskResourceScope("cancel-task")
 
         def slow_operation() -> None:
             started.set()
@@ -578,7 +578,7 @@ def test_positive_legacy_promotion_timeout_does_not_fail_while_resource_is_live(
     root.mkdir()
     path = root / "held.bin"
     path.write_bytes(b"payload")
-    scope = TaskResourceScope("delayed-owner", files=(path,))
+    scope = TaskResourceScope("delayed-owner")
     with scope.activate():
         register_current_task_resource(
             object(), (path,), lambda: None, kind=ResourceKind.PYTHON_FILE,
@@ -604,7 +604,7 @@ def test_async_scope_close_waits_past_legacy_timeout(tmp_path):
     """An active operation must be allowed to finish even after a small legacy timeout."""
     path = tmp_path / "held.bin"
     path.write_bytes(b"payload")
-    scope = TaskResourceScope("delayed-operation", files=(path,))
+    scope = TaskResourceScope("delayed-operation")
     running = threading.Event()
     release = threading.Event()
 

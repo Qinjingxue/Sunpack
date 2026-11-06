@@ -207,10 +207,7 @@ class PipelineEngine:
             progress_callback=progress_callback,
         )
         cancellation = cancellation or CURRENT_CANCELLATION.get() or CancellationToken()
-        resource_scope = TaskResourceScope(
-            submission.request_id,
-            files=(target.path for target in submission.targets),
-        )
+        resource_scope = TaskResourceScope(submission.request_id)
         task = asyncio.current_task()
         if task is not None:
             self._active_requests[submission.request_id] = task

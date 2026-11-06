@@ -13,8 +13,6 @@ class WorkContext:
     request_id: str
     file_id: str
     stage: str
-    attempt_id: int = 0
-    origin: str = "foreground"
 
 
 CURRENT_WORK: contextvars.ContextVar[WorkContext | None] = contextvars.ContextVar(

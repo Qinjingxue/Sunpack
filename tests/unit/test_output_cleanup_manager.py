@@ -144,7 +144,7 @@ def test_cleanup_admits_unrelated_sibling_operation_in_same_request(tmp_path):
     output.mkdir()
     sibling = tmp_path / "sibling.txt"
     sibling.write_text("unrelated input", encoding="utf-8")
-    scope = TaskResourceScope("cleanup-sibling", files=(sibling,))
+    scope = TaskResourceScope("cleanup-sibling")
 
     class ConcurrentExecutor(OutputCleanupExecutor):
         @staticmethod

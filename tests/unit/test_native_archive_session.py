@@ -192,8 +192,8 @@ def test_multi_volume_view_registers_and_releases_every_member(tmp_path):
 def test_shared_session_cache_waits_for_all_task_borrowers(tmp_path):
     path = tmp_path / "shared.bin"
     path.write_bytes(b"payload")
-    first_scope = TaskResourceScope("first-borrower", files=(path,))
-    second_scope = TaskResourceScope("second-borrower", files=(path,))
+    first_scope = TaskResourceScope("first-borrower")
+    second_scope = TaskResourceScope("second-borrower")
     with first_scope.activate():
         first = get_archive_session(os.fspath(path))
     with second_scope.activate():

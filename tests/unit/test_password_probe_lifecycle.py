@@ -75,7 +75,7 @@ def test_password_probe_releases_only_its_own_borrows(tmp_path, monkeypatch, mod
     monkeypatch.setattr(module, 'prepare_password_input', lambda *a, **k: prepared)
     if mode != 'file':
         monkeypatch.setattr(module, method + '_verify_passwords_from_' + mode, probe)
-    scope = TaskResourceScope('existing-analysis-owner', files=physical)
+    scope = TaskResourceScope('existing-analysis-owner')
     try:
         with scope.activate():
             original = sessions.get_archive_session(physical[0])
@@ -176,7 +176,7 @@ def test_cancelled_password_kdf_drains_without_cancelling_shared_input(tmp_path,
             await asyncio.gather(first, second, return_exceptions=True)
             await broker.close()
 
-    scope = TaskResourceScope('password-cancellation', files=physical)
+    scope = TaskResourceScope('password-cancellation')
     try:
         with scope.activate():
             asyncio.run(scenario())
@@ -196,7 +196,7 @@ def test_concurrent_directory_probes_do_not_hold_each_others_cleanup_sources(tmp
     rendezvous = threading.Barrier(2)
 
     def request(index):
-        scope = TaskResourceScope(f'probe-request-{index}', files=(paths[index],))
+        scope = TaskResourceScope(f'probe-request-{index}')
         try:
             with scope.activate():
                 # Directory relation probing touches all encrypted candidates,
@@ -224,7 +224,7 @@ def test_concurrent_directory_probes_do_not_hold_each_others_cleanup_sources(tmp
 def test_overlapping_probes_in_one_task_remain_protected(tmp_path):
     path = tmp_path / 'input.jpg'
     path.write_text('fixture', encoding='utf-8')
-    scope = TaskResourceScope('overlapping-probes', files=(path,))
+    scope = TaskResourceScope('overlapping-probes')
     try:
         with sessions.archive_session_scope(), scope.activate():
             with sessions.borrow_archive_sessions((path,)) as first:
@@ -293,7 +293,7 @@ def test_multibatch_password_job_releases_its_input_before_task_exit(tmp_path, m
         "kind": "archive_input", "open_mode": "concat_ranges", "format_hint": "zip",
         "entry_path": physical[0], "ranges": [{"path": path, "start": 0, "end": 5} for path in physical],
     }, archive_path=physical[0]), candidates=candidates())
-    scope = TaskResourceScope("multibatch-password-job", files=physical)
+    scope = TaskResourceScope("multibatch-password-job")
     try:
         with scope.activate():
             scheduler = PasswordScheduler(PasswordVerifierChain([zip_fast.ZipFastVerifier()]))
