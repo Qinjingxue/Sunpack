@@ -1828,7 +1828,12 @@ void task_history(Application& app,const fs::path& dir) {
         return active && active->id.rfind("taskTime-",0)==0;
     },"Task timestamp find and highlight");
     assert(ui_page_call_json(app.page(),"searchTasks",R"("")")==0);
-    pump_diagnostic(app,[&]{return state(app.page(),"tasks")["total"]==100 && state(app.page(),"taskPending").is_null();},"Reset timestamp search");
+    // Reset clears paging state but retains the old rows until the query returns.
+    // Wait for the new page so its scroll reset cannot undo the paging below.
+    pump_diagnostic(app,[&]{
+        auto pages=state(app.page(),"taskPages");
+        return pages.size()==1 && pages[0]["query"]=="" && state(app.page(),"tasks")["total"]==100 && state(app.page(),"taskPending").is_null();
+    },"Reset timestamp search");
     const auto first_id=state(app.page(),"tasks")["rows"][0]["id"];
     auto* window=ui::GetContext().GetWindow(app.window());
     auto* list=dynamic_cast<ui::VirtualListWidget*>(window->Root()->FindById("taskItems"));
