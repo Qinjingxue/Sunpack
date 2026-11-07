@@ -124,10 +124,10 @@ def test_worker_extracts_with_the_password_the_fast_verifier_accepts(tmp_path):
 def test_eocd_signatures_in_comments_preserve_planned_password_input(tmp_path, layout):
     # One fixture covers logical coordinate reuse and the shared pre-planning
     # fallback. Plain encryption tests cannot find this valid-comment failure.
-    from sunpack.core.config.loader import load_config
+    from tests.helpers.config_factory import make_config
     from sunpack.pipeline.coordinator.task_scan import direct_file_task
+    from sunpack.pipeline.coordinator.task_provider import ArchiveTaskProvider
     from sunpack.pipeline.discovery.detection.input_planning import ArchiveInputPlanningStage
-    from sunpack.core.support import archive_knowledge_projection as knowledge_view
     from sunpack_native import zip_fast_verify_passwords
 
     password = "comment-secret"
@@ -162,10 +162,20 @@ def test_eocd_signatures_in_comments_preserve_planned_password_input(tmp_path, l
         archive = tmp_path / "plain.dat"
         archive.write_bytes(payload)
         assert zip_fast_verify_passwords(str(archive), ["wrong", password])["status"] == "match"
-    task = direct_file_task(str(archive), all_parts=parts or [str(archive)])
-    ArchiveInputPlanningStage(load_config()).plan_task(task)
+    config = make_config()
+    if layout == "carrier":
+        # Carrier discovery owns scanning and the canonical bounded input.
+        task, = ArchiveTaskProvider(config).discover_targets([str(archive)]).tasks
+    else:
+        task = direct_file_task(str(archive), all_parts=parts or [str(archive)])
+    ArchiveInputPlanningStage(config).plan_task(task)
     descriptor = (task.password_probe_input or task.archive_input()).to_dict()
-    assert "zip_eocd_offset" in descriptor.get("analysis", {}), descriptor
+    if layout == "carrier":
+        assert descriptor["open_mode"] == "file_range"
+        part, = descriptor["parts"]
+        assert (part["start"], part["end"]) == (len(b"carrier-prefix"), len(b"carrier-prefix") + len(payload))
+    else:
+        assert "zip_eocd_offset" in descriptor.get("analysis", {}), descriptor
     outcome = ZipFastVerifier().verify_batch(str(archive), ["wrong", password],
         part_paths=parts or None, archive_input=descriptor)
     assert outcome.status == "match", outcome

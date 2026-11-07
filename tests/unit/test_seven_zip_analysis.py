@@ -62,7 +62,9 @@ def test_damaged_seven_zip_never_reuses_guessed_embedded_end(tmp_path):
     start = 128
     path.write_bytes(b"c" * start + _seven_zip_bytes(declared_size=8192))
 
-    report, evidence = _seven_zip_evidence(path)
+    # Analysis consumes discovered roots; it must not search the carrier again.
+    prepass = scan_embedded_archives(str(path)).to_prepass()
+    report, evidence = _seven_zip_evidence(path, AnalysisRequest(initial_prepass=prepass))
 
     assert evidence.status != "extractable"
     assert evidence.segments[0].start_offset == start

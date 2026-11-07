@@ -949,6 +949,10 @@ class WatchService:
             self._queue_config_reload()
 
     def _queue_config_reload(self) -> asyncio.Task:
+        # Reject before joining the shared drain: a late request must not
+        # poison the result of an already admitted configuration change.
+        if self._stop_requested:
+            raise RuntimeError("watch service is stopping")
         self._config_reload_pending = True
         if self._config_reload_task is None:
             self._config_reload_task = self._track_configuration_task(self._drain_config_reloads())

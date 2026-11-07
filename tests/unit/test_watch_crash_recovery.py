@@ -323,7 +323,8 @@ def test_startup_blocker_reconciliation_is_targeted(tmp_path, monkeypatch):
         entry_items=lambda: [password_entry, missing_entry],
         password_generation=1,
     )
-    scheduler.config = {}
+    scheduler._user_password_signature = "configured-passwords"
+    scheduler.config = {"password_snapshot": SimpleNamespace(scope_signature=lambda scope: "current-scope")}
     calls = []
     scheduler.enqueue = lambda path, **kwargs: calls.append((path, kwargs))
 
@@ -335,6 +336,12 @@ def test_startup_blocker_reconciliation_is_targeted(tmp_path, monkeypatch):
     ]
     assert calls[0][1]["event_type"] == "startup_password_reconcile"
     assert calls[1][1]["event_type"] == "startup_missing_volume_reconcile"
+
+    # An unchanged scope must not retry just because the global generation differs.
+    password_entry.failure_payload["password_signature"] = scheduler._password_signature_for_scope(str(scope))
+    calls.clear()
+    scheduler._reconcile_persisted_blockers()
+    assert [call[0] for call in calls] == [str(missing_archive)]
 
 
 def test_departed_inflight_owner_does_not_delete_durable_pending(tmp_path):

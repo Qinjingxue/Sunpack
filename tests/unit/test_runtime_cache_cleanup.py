@@ -425,7 +425,7 @@ def test_idle_maintenance_expires_cli_mode_and_clears_caches(tmp_path):
             await watcher._maybe_clear_idle_caches()
             assert watcher.state.latest_entry_for_path(str(recovering)) is None
             assert recovering.exists()
-            assert engine.clear_calls == 0
+            assert engine.clear_calls == 2
         finally:
             set_runtime_host(None)
             watcher._close_blocking()

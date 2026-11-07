@@ -146,7 +146,7 @@ def test_terminal_archive_jobs_report_one_start_and_finish_even_with_volume_retr
     # it twice; concurrent terminal jobs cover both with no archive IO.
     import asyncio
     from types import SimpleNamespace
-    from sunpack.core.i18n import I18nContext
+    from sunpack.core.contracts.run_state import RunState
     from sunpack.pipeline.coordinator.archive_job import ArchiveJobExecutor
     from sunpack.pipeline.coordinator.async_work import AsyncWorkBroker, CancellationToken
 
@@ -155,10 +155,7 @@ def test_terminal_archive_jobs_report_one_start_and_finish_even_with_volume_retr
     for task, kind in zip(tasks, (FailureKind.DAMAGED, FailureKind.WRONG_PASSWORD, FailureKind.MISSING_VOLUME)):
         task.discovery_failure = FailureInfo(kind, "relations", kind.value)
 
-    executor = object.__new__(ArchiveJobExecutor)
-    executor.request_id = "terminal-lifecycle"
-    executor.i18n = I18nContext("en")
-    executor.progress_reporter = SimpleNamespace(
+    reporter = SimpleNamespace(
         task_started=lambda task, depth: events.append((task.key, "started", depth)),
         task_finished=lambda task, outcome, depth: events.append((task.key, "finished", depth)),
     )
@@ -176,13 +173,16 @@ def test_terminal_archive_jobs_report_one_start_and_finish_even_with_volume_retr
         assert task.discovery_failure is None
         return str(tmp_path / "out")
 
-    executor.extractor = SimpleNamespace(inspect=inspect)
+    executor = ArchiveJobExecutor(
+        RunState(), SimpleNamespace(inspect=inspect, password_session=None), make_config(),
+        progress_reporter=reporter, request_id="terminal-lifecycle",
+    )
 
     async def scenario():
         broker = AsyncWorkBroker(thread_capacity=3)
         try:
-            await asyncio.gather(*(executor._execute_one_async(
-                task, output_dir, depth=index + 1, broker=broker,
+            await asyncio.gather(*(executor.execute_async(
+                task, output_dir_resolver=output_dir, depth=index + 1, broker=broker,
                 cancellation=CancellationToken(), missing_volume_retry=retry,
             ) for index, task in enumerate(tasks)))
         finally:

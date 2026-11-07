@@ -2,6 +2,7 @@ import struct
 from binascii import crc32
 
 from sunpack.core.analysis.analyzer import ArchiveAnalyzer
+from sunpack.core.analysis import AnalysisRequest
 
 
 _SEVEN_ZIP_SIGNATURE = b"7z\xbc\xaf\x27\x1c"
@@ -79,7 +80,12 @@ def test_multivolume_7z_uses_native_parser_across_header_boundary_and_carrier_of
     split = len(carrier) + 19
     paths = _write_parts(tmp_path, logical[:split], logical[split:])
 
-    report, evidence = _evidence(paths, "7z")
+    # Supply the discovered anchor; this test exercises parsing across volumes,
+    # not the separate physical-file Embedded discovery stage.
+    report = ArchiveAnalyzer().analyze(paths, AnalysisRequest(initial_prepass={
+        "hits": [{"name": "7z", "offset": len(carrier)}],
+    }))
+    evidence = next(item for item in report.evidences if item.format == "7z")
     raw = evidence.details
 
     assert raw["error"] == ""

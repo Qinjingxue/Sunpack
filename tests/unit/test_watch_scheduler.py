@@ -218,7 +218,7 @@ def test_scan_filesystem_errors_only_log_and_do_not_replace_archive_notification
     if scan_stage == "embedded_boundary":
         assert notices[-1][0] == "failed" and run_result.failed == 1
         assert not any(event == "no_tasks_found" for event, _ in events)
-        assert any(scan_error.message in str(notice) for notice in notices)
+        assert any(payload["message"] == scan_error.message for payload in notices[-1][3])
         return
     expected = {None: "suppressed", OutcomeKind.COMPLETE_SUCCESS: "succeeded", OutcomeKind.FAILURE: "failed"}
     assert notices[-1][0] == expected[archive_outcome]
@@ -3945,7 +3945,7 @@ def test_failure_report_completion_uses_broker_and_drains_before_cancellation(tm
         settled = threading.Event()
         loop = asyncio.get_running_loop()
         loop_thread = threading.get_ident()
-        watcher = WatchScheduler.__new__(WatchScheduler)
+        watcher = RuntimeWatchScheduler.__new__(RuntimeWatchScheduler)
         watcher.pipeline_engine = SimpleNamespace(work_broker=broker)
         watcher.state = SimpleNamespace(defer_journal_waits=lambda: nullcontext([]))
 

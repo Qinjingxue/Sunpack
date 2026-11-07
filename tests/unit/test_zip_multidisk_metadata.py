@@ -8,7 +8,7 @@ from sunpack_native import (
     inspect_zip_structure_graph,
 )
 
-from sunpack.core.analysis import ArchiveAnalyzer
+from sunpack.core.analysis import AnalysisRequest, ArchiveAnalyzer
 from sunpack.core.contracts.archive_input import ArchiveInputDescriptor, InputExtent
 from sunpack.pipeline.verification.archive_input_manifest import archive_input_manifest
 
@@ -137,7 +137,14 @@ def test_zip64_bounds_are_shared_by_analysis_and_inspectors(tmp_path, layout, in
         ]
     else:
         source = str(path)
-    report = ArchiveAnalyzer().analyze(source)
+    # These offsets are the fixture's discovery facts. Keep malformed ZIP64
+    # validation in the native parser without asking Analysis to rescan carriers.
+    report = ArchiveAnalyzer().analyze(source, AnalysisRequest(initial_prepass={
+        "hits": [
+            {"name": "zip_local", "offset": len(prefix)},
+            {"name": "zip_eocd", "offset": len(payload) - len(suffix) - len(eocd)},
+        ],
+    }))
     details = [item.details for item in report.evidences if item.format == "zip"]
     if invalid_field is None:
         assert any(item.get("plausible") is True for item in details)
