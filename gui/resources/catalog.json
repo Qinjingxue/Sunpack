@@ -877,10 +877,6 @@
     "detection": {
       "zh": "格式检测",
       "en": "Format detection"
-    },
-    "input_planning": {
-      "zh": "输入规划",
-      "en": "Input planning"
     }
   },
   "fields": {
@@ -1078,19 +1074,6 @@
       "min": 1,
       "max": 8,
       "integer": true
-    },
-    "/performance/worker/job_buffer_budget_bytes": {
-      "label": {
-        "zh": "单任务缓冲上限（字节）",
-        "en": "Task buffer limit (bytes)"
-      },
-      "min": 0,
-      "max": null,
-      "integer": true,
-      "description": {
-        "zh": "0 使用工作进程默认缓冲预算；正数指定每个任务的字节上限。",
-        "en": "0 uses the worker default buffer budget; a positive value sets a per-task byte limit."
-      }
     },
     "/performance/worker/space_poll_interval_ms": {
       "label": {
@@ -1305,40 +1288,12 @@
       "min": 0,
       "max": 1
     },
-    "/input_planning/enabled": {
-      "label": {
-        "zh": "输入规划缓存",
-        "en": "Input planning cache"
-      },
-      "description": {
-        "zh": "复用已分析的输入计划",
-        "en": "Reuse input plans already analyzed"
-      }
-    },
-    "/input_planning/cache_size": {
-      "label": {
-        "zh": "缓存条数上限",
-        "en": "Cache entry limit"
-      },
-      "min": 0,
-      "max": null,
-      "integer": true
-    },
     "/analysis/max_concurrent_reads": {
       "label": {
         "zh": "并发读取数",
         "en": "Concurrent reads"
       },
       "min": 1,
-      "max": null,
-      "integer": true
-    },
-    "/analysis/shared_cache_mb": {
-      "label": {
-        "zh": "共享缓存上限（MiB）",
-        "en": "Shared cache limit (MiB)"
-      },
-      "min": 0,
       "max": null,
       "integer": true
     },

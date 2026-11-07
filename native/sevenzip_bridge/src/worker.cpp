@@ -657,7 +657,6 @@ struct WorkerRequest {
     std::wstring password;
     std::wstring codepage;
     bool dry_run = false;
-    unsigned long long job_buffer_budget = 0;
     std::vector<std::wstring> password_candidates;
     WorkerArchiveInput archive_input;
 };
@@ -684,7 +683,6 @@ WorkerRequest parse_worker_request(const std::string& request_json) {
     request.password = utf8_to_wide(json.string_field("password", ""));
     request.codepage = utf8_to_wide(json.string_field("codepage", ""));
     request.dry_run = json.bool_field("dry_run", false);
-    json.uint_field("job_buffer_budget_bytes", &request.job_buffer_budget);
 
     for (const auto& candidate : json.string_array_field("password_candidates")) {
         request.password_candidates.push_back(utf8_to_wide(candidate));
@@ -1081,7 +1079,6 @@ int run_request(
     const std::wstring& format_hint = request.archive_input.format_hint;
     const std::wstring& codepage = request.codepage;
     const bool dry_run = request.dry_run;
-    const unsigned long long job_buffer_budget = request.job_buffer_budget;
     const std::vector<std::wstring>& password_candidates = request.password_candidates;
     const std::vector<std::wstring>& part_paths = request.archive_input.part_paths;
     if (archive_path.empty() || (!dry_run && output_dir.empty())) {
@@ -1152,8 +1149,8 @@ int run_request(
     }
     auto extract_with_password = [&](const std::wstring& selected_password) {
         return archive_input.ranges.empty() || !archive_input.canonical_names.empty()
-            ? extract_archive_with_parts(archive_input.archive_path, archive_input.part_paths, archive_input.format_hint, selected_password, output_dir, codepage, progress, dry_run, archive_input.canonical_names, archive_input.open_mode == L"native_volumes", shared_writer, static_cast<std::size_t>(job_buffer_budget), cancel_token, archive_input.ranges)
-            : extract_archive_with_ranges(archive_input.archive_path, archive_input.ranges, archive_input.format_hint, selected_password, output_dir, codepage, progress, dry_run, shared_writer, static_cast<std::size_t>(job_buffer_budget), cancel_token);
+            ? extract_archive_with_parts(archive_input.archive_path, archive_input.part_paths, archive_input.format_hint, selected_password, output_dir, codepage, progress, dry_run, archive_input.canonical_names, archive_input.open_mode == L"native_volumes", shared_writer, cancel_token, archive_input.ranges)
+            : extract_archive_with_ranges(archive_input.archive_path, archive_input.ranges, archive_input.format_hint, selected_password, output_dir, codepage, progress, dry_run, shared_writer, cancel_token);
     };
 
     ExtractArchiveResult result;

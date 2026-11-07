@@ -235,8 +235,6 @@ namespace sunpack::sevenzip
 
         std::shared_ptr<AsyncFileWriter> shared_writer = nullptr,
 
-        std::size_t job_buffer_budget = 0,
-
         std::shared_ptr<std::atomic<bool>> cancel_token = nullptr
 
     )
@@ -607,7 +605,6 @@ namespace sunpack::sevenzip
                 &result.output_trace,
                 num_items,
                 shared_writer,
-                job_buffer_budget,
                 cancel_token
                 ,
                 pipeline_timing.get());
@@ -622,7 +619,6 @@ namespace sunpack::sevenzip
                 &result.output_trace,
                 num_items,
                 shared_writer,
-                job_buffer_budget,
                 cancel_token);
 #endif
 
@@ -948,8 +944,6 @@ namespace sunpack::sevenzip
 
         std::shared_ptr<AsyncFileWriter> shared_writer,
 
-        std::size_t job_buffer_budget,
-
         std::shared_ptr<std::atomic<bool>> cancel_token,
         const std::vector<ExtractInputRange> &part_ranges
 
@@ -988,7 +982,6 @@ namespace sunpack::sevenzip
             canonical_names,
             native_volume_input,
             std::move(shared_writer),
-            job_buffer_budget,
             std::move(cancel_token));
 
 #else
@@ -1047,8 +1040,6 @@ namespace sunpack::sevenzip
 
         std::shared_ptr<AsyncFileWriter> shared_writer,
 
-        std::size_t job_buffer_budget,
-
         std::shared_ptr<std::atomic<bool>> cancel_token
 
     )
@@ -1081,7 +1072,6 @@ namespace sunpack::sevenzip
             {},
             false,
             std::move(shared_writer),
-            job_buffer_budget,
             std::move(cancel_token));
 
 #else

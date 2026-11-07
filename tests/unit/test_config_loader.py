@@ -31,7 +31,7 @@ def _advanced_payload():
         "recursive_extract": "*",
         "post_extract": {"archive_cleanup_mode": "r", "flatten_single_directory": True},
         "filesystem": {"scan_filters_enabled": True, "scan_filters": []},
-        "performance": {"worker": {"writer_threads": 6, "job_buffer_budget_bytes": 33554432}},
+        "performance": {"worker": {"writer_threads": 6, "space_poll_interval_ms": 1000}},
         "verification": _verification_config(),
         "detection": {"enabled": True},
     }
@@ -63,7 +63,7 @@ def test_load_config_merges_simple_config_over_advanced_config(tmp_path, monkeyp
     assert config["recursive_extract"] == {"mode": "infinite"}
     assert config["filesystem"]["scan_filters"][0]["min_bytes"] == 2097152
     assert config["filesystem"]["scan_filters"][0]["max_bytes"] is None
-    assert config["performance"]["worker"]["job_buffer_budget_bytes"] == 33554432
+    assert config["performance"]["worker"]["space_poll_interval_ms"] == 1000
     assert config["performance"]["worker"]["writer_threads"] == 4
 
 

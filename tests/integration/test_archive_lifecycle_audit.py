@@ -54,20 +54,16 @@ def _encrypted(root, kind):
     return disguised
 
 
-def test_shared_worker_keeps_concurrent_and_reconfigured_request_budgets(tmp_path, monkeypatch):
-    """Worker-only tests cannot catch startup config leaking into request forks.
+def test_shared_worker_keeps_concurrent_request_identity_after_refresh(tmp_path, monkeypatch):
+    """Worker-only tests cannot catch engine request identity leaking across forks.
 
-    Three tiny real jobs cover concurrent origins and a later config refresh;
-    removing this leaves no check of the budget actually sent by the engine.
+    Three tiny real jobs cover concurrent origins and a later request refresh;
+    removing this leaves their shared-worker routing without end-to-end coverage.
     """
     from sunpack.pipeline.extraction.internal.sevenzip.sevenzip_runner import _AsyncNativeWorkerProcess
 
     config = _config()
-    def with_budget(budget):
-        return {**config, "performance": {"worker": {"job_buffer_budget_bytes": budget}}}
-
     paths = [tmp_path / (name + ".photo") for name in ("foreground", "watch", "refreshed")]
-    budgets = [2 * 1024 * 1024, 4 * 1024 * 1024, 8 * 1024 * 1024]
     for path in paths:
         with zipfile.ZipFile(path, "w") as archive:
             archive.writestr("payload.txt", path.stem.encode())
@@ -81,12 +77,12 @@ def test_shared_worker_keeps_concurrent_and_reconfigured_request_budgets(tmp_pat
     monkeypatch.setattr(_AsyncNativeWorkerProcess, "send", capture)
 
     async def scenario():
-        async with PipelineEngine(with_budget(1024 * 1024)) as engine:
+        async with PipelineEngine(config) as engine:
             responses = await asyncio.gather(*(
-                engine.run([str(path)], origin=origin, request_config=with_budget(budget))
-                for path, origin, budget in zip(paths, ("foreground", "watch"), budgets)
+                engine.run([str(path)], origin=origin, request_config=config)
+                for path, origin in zip(paths[:2], ("foreground", "watch"))
             ))
-            engine.reconfigure_request(with_budget(budgets[2]))
+            engine.reconfigure_request(config)
             responses.append(await engine.run([str(paths[2])]))
         for path, response in zip(paths, responses):
             result, = response.summary.target_results
@@ -95,7 +91,7 @@ def test_shared_worker_keeps_concurrent_and_reconfigured_request_budgets(tmp_pat
     asyncio.run(scenario())
     assert len(sent) == 3 and len({id(worker) for worker, _ in sent}) == 1
     jobs = {Path(job["archive_path"]): job for _, job in sent}
-    assert [jobs[path]["job_buffer_budget_bytes"] for path in paths] == budgets
+    assert all("job_buffer_budget_bytes" not in job for job in jobs.values())
     assert [jobs[path]["origin"] for path in paths] == ["foreground", "watch", "foreground"]
     assert len({job["request_id"] for job in jobs.values()}) == 3
 

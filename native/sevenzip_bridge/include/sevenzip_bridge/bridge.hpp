@@ -277,7 +277,6 @@ ExtractArchiveResult extract_archive_with_parts(
     const std::vector<std::wstring>& canonical_names = {},
     bool native_volume_input = false,
     std::shared_ptr<AsyncFileWriter> shared_writer = nullptr,
-    std::size_t job_buffer_budget = 0,
     std::shared_ptr<std::atomic<bool>> cancel_token = nullptr,
     const std::vector<ExtractInputRange>& part_ranges = {}
 );
@@ -292,7 +291,6 @@ ExtractArchiveResult extract_archive_with_ranges(
     ExtractProgressCallback progress = {},
     bool dry_run = false,
     std::shared_ptr<AsyncFileWriter> shared_writer = nullptr,
-    std::size_t job_buffer_budget = 0,
     std::shared_ptr<std::atomic<bool>> cancel_token = nullptr
 );
 

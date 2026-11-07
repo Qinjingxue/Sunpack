@@ -81,8 +81,7 @@ def test_input_planning_stage_reuses_report_for_equivalent_inputs(tmp_path):
     )
     first = _task(archive)
     second = _task(archive, logical_name="case_copy")
-    stage = ArchiveInputPlanningStage({"input_planning": {"enabled": False, "task_parallel": False}})
-    stage.enabled = True
+    stage = ArchiveInputPlanningStage()
     stage.analyzer = _FakeAnalyzer(_report(archive, evidence))
 
     tasks = [*stage.plan_task_to_tasks(first), *stage.plan_task_to_tasks(second)]
@@ -158,8 +157,7 @@ def test_input_planning_preserves_structured_password_probe_for_split_segment_at
         logical_name="case",
     )
     task.set_archive_input(descriptor)
-    stage = ArchiveInputPlanningStage({"input_planning": {"enabled": False}})
-    stage.enabled = True
+    stage = ArchiveInputPlanningStage()
     stage.analyzer = _FakeAnalyzer(_multi_report(first, [evidence]))
 
     stage.plan_task(task)
@@ -190,8 +188,7 @@ def test_input_planning_stage_maps_split_logical_segment_to_concat_ranges(tmp_pa
         segments=[ArchiveSegment(start_offset=18, end_offset=24, confidence=0.97)],
     )
     task = _task(part1, parts=[part1, part2, part3], volumes=volumes)
-    stage = ArchiveInputPlanningStage({"input_planning": {"enabled": False}})
-    stage.enabled = True
+    stage = ArchiveInputPlanningStage()
     stage.analyzer = _FakeAnalyzer(_report(part1, evidence))
 
     stage.plan_task(task)

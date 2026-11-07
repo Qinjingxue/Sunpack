@@ -713,8 +713,6 @@ namespace sunpack::sevenzip
 
             std::shared_ptr<AsyncFileWriter> shared_writer = nullptr,
 
-            std::size_t job_buffer_budget = 0,
-
             std::shared_ptr<std::atomic<bool>> cancel_token = nullptr
 #ifdef SUP7Z_ENABLE_PIPELINE_TIMING
             , PipelineTiming *pipeline_timing = nullptr
@@ -739,7 +737,7 @@ namespace sunpack::sevenzip
 
                 cancel_token_(std::move(cancel_token)),
 
-                async_job_(async_writer_ ? async_writer_->make_job(job_buffer_budget, cancel_token_
+                async_job_(async_writer_ ? async_writer_->make_job(0, cancel_token_
 #ifdef SUP7Z_ENABLE_PIPELINE_TIMING
                     , pipeline_timing_
 #endif

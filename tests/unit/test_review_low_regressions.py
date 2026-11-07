@@ -21,13 +21,22 @@ def test_verification_thresholds_preserve_explicit_zero():
     assert pipeline.partial_accept_threshold == 0
 
 
-def test_input_planning_cache_size_zero_disables_cache():
-    stage = ArchiveInputPlanningStage({
-        "input_planning": {"enabled": False, "cache_size": 0},
-    })
+def test_input_planning_report_cache_stays_bounded_and_clears():
+    """Reuse tests do not detect unbounded report retention or stale eviction.
 
-    stage._remember_report(("fixture",), SimpleNamespace())
+    One small fill checks the fixed bound, eviction order and explicit release;
+    removing it leaves those retention guarantees without direct coverage.
+    """
+    stage = ArchiveInputPlanningStage()
+    reports = [SimpleNamespace() for _ in range(513)]
+    for index, report in enumerate(reports):
+        stage._remember_report((index,), report)
 
+    assert len(stage._report_cache) == 512
+    assert (0,) not in stage._report_cache
+    assert stage._report_cache[(1,)] is reports[1]
+    assert stage._report_cache[(512,)] is reports[512]
+    stage.clear_report_cache()
     assert stage._report_cache == {}
 
 

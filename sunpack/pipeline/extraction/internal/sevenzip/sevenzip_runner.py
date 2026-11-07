@@ -1356,7 +1356,6 @@ class SevenZipRunner:
             "output_volume_key": volume_key,
             "password": password or "",
         }
-        self._apply_native_job_budget(job)
         candidates = tuple(dict.fromkeys(str(item) for item in (password_candidates or ()) if item is not None))
         if candidates:
             job["password_candidates"] = list(candidates)
@@ -1427,18 +1426,6 @@ class SevenZipRunner:
             self.close()
         except Exception:
             pass
-
-
-    def _apply_native_job_budget(self, job: dict) -> None:
-        configured = self.process_config.get("job_buffer_budget_bytes")
-        if configured is None:
-            return
-        try:
-            budget = int(configured)
-        except (TypeError, ValueError):
-            return
-        if budget > 0:
-            job["job_buffer_budget_bytes"] = budget
 
     def _emit_progress(self, task: ArchiveTask, event: dict[str, Any]) -> None:
         callback = self.progress_callback

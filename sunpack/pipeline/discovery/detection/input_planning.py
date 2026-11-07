@@ -26,31 +26,23 @@ from sunpack.core.contracts.input_plan import LogicalArchiveInput
 from sunpack.core.support import archive_knowledge_projection as knowledge_view
 
 
+_REPORT_CACHE_LIMIT = 512
+
+
 class ArchiveInputPlanningStage:
     """Turn neutral Analysis reports into main-flow archive inputs."""
     def __init__(
         self,
         config: dict[str, Any] | None = None,
     ):
-        self.config = config or {}
-        planning_config = self.config.get("input_planning") if isinstance(self.config.get("input_planning"), dict) else {}
-        self.enabled = bool(planning_config.get("enabled", True))
         self._report_cache: dict[tuple, ArchiveAnalysisReport] = {}
         self._report_cache_lock = threading.Lock()
-        self.analyzer = (
-            ArchiveAnalyzer(self.config)
-            if self.enabled
-            else None
-        )
+        self.analyzer = ArchiveAnalyzer(config or {})
 
     def _remember_report(self, cache_key: tuple, report: ArchiveAnalysisReport) -> None:
-        planning_config = self.config.get("input_planning") if isinstance(self.config.get("input_planning"), dict) else {}
-        limit = max(0, int(planning_config.get("cache_size", 512)))
-        if limit <= 0:
-            return
         with self._report_cache_lock:
             self._report_cache[cache_key] = report
-            if len(self._report_cache) > limit:
+            if len(self._report_cache) > _REPORT_CACHE_LIMIT:
                 self._report_cache.pop(next(iter(self._report_cache)))
 
     def clear_report_cache(self) -> None:
@@ -75,7 +67,7 @@ class ArchiveInputPlanningStage:
         return tasks
 
     def requires_analysis(self, task: ArchiveTask) -> bool:
-        if task.discovery_failure is not None or self.analyzer is None:
+        if task.discovery_failure is not None:
             return False
         descriptor = task.archive_input()
         # Identity confirmation does not carry stream structure.

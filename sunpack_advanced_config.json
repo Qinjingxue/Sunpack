@@ -221,7 +221,6 @@
     "persistent_server_idle_seconds": 15,
     "worker": {
       "writer_threads": 4,
-      "job_buffer_budget_bytes": 33554432,
       "space_poll_interval_ms": 1000,
       "space_status_report_interval_ms": 15000
     }
@@ -252,13 +251,8 @@
     "enabled": true,
     "recursive_candidate_ratio": 0.3
   },
-  "input_planning": {
-    "enabled": true,
-    "cache_size": 512
-  },
   "analysis": {
     "max_concurrent_reads": 1,
-    "shared_cache_mb": 64,
     "prepass": {
       "enabled": true,
       "head_bytes": 1048576,

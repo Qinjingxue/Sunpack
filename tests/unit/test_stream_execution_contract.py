@@ -42,7 +42,7 @@ def test_range_projection_uses_the_total_logical_length(tmp_path, sizes, start, 
         parts=[ArchiveInputPart(InputExtent(path), volume_number=i + 1, canonical_name=path)
                for i, path in enumerate(paths)])
     task = make_task_from_descriptor(descriptor)
-    stage = ArchiveInputPlanningStage({"input_planning": {"enabled": False}})
+    stage = ArchiveInputPlanningStage()
     segment = ArchiveSegment(start, end, .99)
     evidence = ArchiveFormatEvidence("gzip", .99, "extractable", [segment])
     projected = stage._archive_input_for_segment(task, evidence, segment)

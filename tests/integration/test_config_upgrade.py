@@ -56,14 +56,21 @@ def test_installer_promotes_controls_and_migrates_current_state_without_overwrit
         "watch": {"state_dir": str(old_state), "clipboard_monitor_enabled": False,
                   "clipboard_builtin_max_entries": 17, "toast_report_retention_days": 61},
         "passwords": {"clipboard_passwords_enabled": False},
+        "input_planning": {"enabled": False, "cache_size": 8},
+        "analysis": {"shared_cache_mb": 4},
+        "performance": {"worker": {"job_buffer_budget_bytes": 1024}},
     }), encoding="utf-8")
+    advanced_before = advanced.read_bytes()
     user = tmp_path / "sunpack_config.json"
     original = {"watch": {"state_dir": str(old_state), "clipboard_monitor_enabled": True,
                           "toast_report_max_files": 3,
                           "toast_report_max_bytes": 1024, "runtime_cache_cleanup_enabled": False},
                 "performance": {"worker": {"thread_capacity": 2, "stage_thread_capacity": 3,
                     "max_pending_stage_jobs": 4, "max_queue_jobs": 5, "space_gate_enabled": False,
-                    "memory_reserve_bytes": 1024, "writer_threads": 6}}, "unknown": "keep"}
+                    "memory_reserve_bytes": 1024, "writer_threads": 6, "job_buffer_budget_bytes": 2048}},
+                "input_planning": {"enabled": False, "cache_size": 0, "unknown": "retire whole section"},
+                "analysis": {"shared_cache_mb": 0, "max_concurrent_reads": 3, "unknown": "keep"},
+                "unknown": "keep"}
     user.write_text(json.dumps(original), encoding="utf-8")
     command = ["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
                "-File", str(repo_root / "scripts/upgrade_config.ps1"), "-UserConfig", str(user),
@@ -74,6 +81,11 @@ def test_installer_promotes_controls_and_migrates_current_state_without_overwrit
                                  "toast_report_retention_days": 61}
     assert migrated["passwords"]["clipboard_passwords_enabled"] is False
     assert migrated["performance"]["worker"] == {"writer_threads": 6}
+    assert "input_planning" not in migrated
+    assert migrated["analysis"] == {"max_concurrent_reads": 3, "unknown": "keep"}
+    # The old advanced snapshot is read-only; deployment replaces the installed
+    # template instead of migrating it through a second compatibility chain.
+    assert advanced.read_bytes() == advanced_before
     assert migrated["unknown"] == "keep"
     default = tmp_path / ".sunpack_watch"
     assert (default / "state.snapshot").read_text(encoding="utf-8") == "current recovery"

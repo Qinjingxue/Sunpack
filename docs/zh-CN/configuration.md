@@ -119,11 +119,13 @@ GUI 按 Windows 本地时区编辑时间，保存时转成 UTC。大小单位支
 
 监控输入目录仅支持 NTFS。后端启动或重载配置时，会自动从监控列表移除确认位于非 NTFS 文件系统的路径，并按 `cli.language` 弹出经典 Windows 错误窗口，列出路径、文件系统和已移除说明。无需等待弹窗确认即可继续监控其余目录；如果列表已空，服务仍可正常启动并等待添加目录。此操作不会删除目录或文件，暂时离线的路径不会因此被移除。
 
-分析只识别当前层格式。GZIP、BZIP2、XZ、Zstandard、LZ4 先解开外层流，产出的 TAR 再由正常递归流程识别和解压；不提前识别复合格式。原 `tar_*` 分析模块及全部 `max_probe_bytes` 配置已删除。普通 TAR 分析仅从偏移 0 开始，其他位置的 TAR 候选只来自统一的 embedded 扫描器。`job_buffer_budget_bytes` 为 0 时使用工作进程默认缓冲预算。`watch.event_log_retention_days` 控制 CLI 与监控共用的任务历史和事件保留天数。
+分析只识别当前层格式。GZIP、BZIP2、XZ、Zstandard、LZ4 先解开外层流，产出的 TAR 再由正常递归流程识别和解压；不提前识别复合格式。原 `tar_*` 分析模块及全部 `max_probe_bytes` 配置已删除。普通 TAR 分析仅从偏移 0 开始，其他位置的 TAR 候选只来自统一的 embedded 扫描器。`watch.event_log_retention_days` 控制 CLI 与监控共用的任务历史和事件保留天数。
 
 使用 `python sunpack.py watch add C:\Downloads` 添加监控目录，附加 `-o E:\Output` 可指定输出目录；留空时解压到各归档所在文件夹。`watch list` 可查看目录。加 `--recursive` 可递归监控子目录，每个监控根独立保存该标志。
 
 ## 自动运行参数
+
+输入规划按需执行，不再提供配置开关。报告缓存内部上限为 512 条，共享分析缓存为 64 MiB，工作进程单任务缓冲预算为 32 MiB。整个 `input_planning` 配置段、`analysis.shared_cache_mb` 和 `performance.worker.job_buffer_budget_bytes` 已从配置和 GUI 中删除。安装升级时清理普通配置中的旧覆盖值，并部署新的高级模板；运行时不保留这些参数的兼容逻辑。
 
 原生 worker 和 Python 阶段线程容量始终采用现有自动策略。队列上限固定为内部参数 4096，保留原有背压。内存预留自动计算为 128 MiB 加上每个名义 CPU 配额 16 MiB。磁盘空间不足暂停/恢复及空闲缓存维护始终开启；`watch.runtime_cache_cleanup_idle_seconds` 仍可配置，默认 10 秒，继续按事件和截止时间唤醒，不新增空闲轮询。`performance.worker.writer_threads` 仍可配置，模板默认值和原生缺失默认值均为每卷 4 个。
 

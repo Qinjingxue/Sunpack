@@ -201,9 +201,13 @@ if ($previousStateDirectory -ne $stateDirectory -and
 
 # Runtime code has no migration aliases. Remove retired public controls here;
 # installation deploys the new advanced template separately.
+if ($user.PSObject.Properties['input_planning']) {
+    $user.PSObject.Properties.Remove('input_planning'); $changed = $true
+}
 foreach ($field in @(
     @('watch', 'state_dir'), @('watch', 'runtime_cache_cleanup_enabled'),
-    @('watch', 'toast_report_max_files'), @('watch', 'toast_report_max_bytes')
+    @('watch', 'toast_report_max_files'), @('watch', 'toast_report_max_bytes'),
+    @('analysis', 'shared_cache_mb')
 )) {
     $section = $field[0]; $name = $field[1]
     if ($user.PSObject.Properties[$section] -and $null -ne $user.$section -and
@@ -214,7 +218,8 @@ foreach ($field in @(
 if ($user.PSObject.Properties['performance'] -and $null -ne $user.performance -and
     $user.performance.PSObject.Properties['worker'] -and $null -ne $user.performance.worker) {
     foreach ($name in @('thread_capacity', 'stage_thread_capacity', 'max_pending_stage_jobs',
-                       'max_queue_jobs', 'space_gate_enabled', 'memory_reserve_bytes')) {
+                       'max_queue_jobs', 'space_gate_enabled', 'memory_reserve_bytes',
+                       'job_buffer_budget_bytes')) {
         if ($user.performance.worker.PSObject.Properties[$name]) {
             $user.performance.worker.PSObject.Properties.Remove($name); $changed = $true
         }
