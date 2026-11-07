@@ -223,9 +223,6 @@ def apply_runtime_config_overrides(config: dict, args, *, base_dir: str | None =
     if getattr(args, "flatten_single_directory", None) is not None:
         overrides["flatten_single_directory"] = args.flatten_single_directory
         section("post_extract", {})["flatten_single_directory"] = args.flatten_single_directory
-    if getattr(args, "allow_partial", False):
-        overrides["content_requirement"] = "allow_partial"
-        section("extraction", {})["content_requirement"] = "allow_partial"
     apply_config_overrides(config, payload)
     return overrides
 

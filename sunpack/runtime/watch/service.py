@@ -14,7 +14,6 @@ from sunpack.core.support.path_keys import case_key, path_key
 from sunpack.core.config.loader import ADVANCED_CONFIG_FILENAME, SIMPLE_CONFIG_FILENAME, load_config
 from sunpack.core.i18n import I18nContext
 from sunpack.core.platform.windows.message_box import show_error
-from sunpack.core.contracts.content_recovery import require_complete_content
 from sunpack.runtime.watch.config_observer import ConfigFileObserver
 from sunpack.runtime.watch.log import WatchLogStore
 from sunpack.runtime.watch.scheduler import WatchScheduler, _nearest_existing_directory
@@ -707,7 +706,6 @@ class WatchService:
             return
         state_path = os.path.join(self.state_dir, SERVICE_STATE)
         run_config = deepcopy(self.config)
-        require_complete_content(run_config)
         watch_config = dict(run_config["watch"])
         watch_config["clipboard_monitor_enabled"] = bool(self.service_config.get("clipboard_monitor_enabled", True))
         run_config["watch"] = watch_config

@@ -1345,6 +1345,10 @@
         "zh": "解压结果要求",
         "en": "Required extraction result"
       },
+      "description": {
+        "zh": "允许部分恢复可能误解压下载中文件，请仅在需尽力获取损坏文件的部分内容时使用。",
+        "en": "Allowing partial recovery may extract unintended files from downloads. Use only when you need to recover partial content from damaged files."
+      },
       "options": [
         {
           "value": "complete",
@@ -1515,16 +1519,24 @@
     },
     "/verification/complete_accept_threshold": {
       "label": {
-        "zh": "完整结果最低评分",
-        "en": "Minimum complete-result score"
+        "zh": "完整判定参考阈值",
+        "en": "Complete-verification threshold"
+      },
+      "description": {
+        "zh": "用于完整度与输出质量判据，不是所有验证路径的硬门槛。",
+        "en": "Used in completeness and output-quality checks, not a hard gate for every verification path."
       },
       "min": 0,
       "max": 1
     },
     "/verification/partial_accept_threshold": {
       "label": {
-        "zh": "部分恢复最低评分",
-        "en": "Minimum partial-recovery score"
+        "zh": "部分恢复判定参考阈值",
+        "en": "Partial-verification threshold"
+      },
+      "description": {
+        "zh": "不是恢复百分比或允许部分成功的开关；接受策略由解压结果要求控制。",
+        "en": "Not a recovered percentage or permission switch; Required extraction result controls acceptance."
       },
       "min": 0,
       "max": 1

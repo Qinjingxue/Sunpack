@@ -22,7 +22,7 @@ For an installed copy, replace `python sunpack.py` with `sunpack.exe`.
 | `cli.language`                          | `zh` for Chinese or `en` for English.                                                                                        |
 | `recursive_extract`                     | `"*"` to keep processing nested archives, a positive integer for a fixed number of rounds, or `"?"` to ask after each round. |
 | `recursive_authorization.enabled`       | `true` to apply the nested archive selection policy; `false` to skip this policy.                                            |
-| `post_extract.archive_cleanup_mode`     | `"r"` to recycle the original archive after success, `"k"` to keep it, or `"d"` to delete it.                                |
+| `post_extract.archive_cleanup_mode`     | `"r"` to recycle the original archive after complete success, `"k"` to keep it, or `"d"` to delete it.                                |
 | `post_extract.flatten_single_directory` | `true` to lift the contents of a single top-level output folder.                                                             |
 | `extraction.content_requirement`        | `"complete"` to require a complete result, or `"allow_partial"` to accept partial recovery.                                  |
 
@@ -37,6 +37,19 @@ For example, add these fields to the main configuration to keep original archive
 CLI options such as `--recur`, `--cleanup`, and `--out-dir` let you set extraction behavior for one command. See the [CLI parameter reference](cli_parameters.md).
 
 Directory discovery is shallow by default. Use `--recursive` with `scan`, `inspect`, or `extract`; nested extraction continues to use `--recur`. The installer retains its atomic configuration upgrade and failure-recovery framework. Upgrading from the released v1.3.4 configuration migrates the old scan-filter fields into the current schema.
+
+## Partial success and verification thresholds
+
+`extraction.content_requirement` in `sunpack_config.json` is the single partial-success setting. The GUI's “Required extraction result” edits the same field. The default, `"complete"`, accepts only complete results; `"allow_partial"` accepts recoverable partial results identified by verification. CLI, Watch and nested extraction share it. The `-k`, `--allow-partial` and `--ap` overrides have been removed. Partial acceptance does not turn authentication, execution or independent-input failures into success, and never authorizes recycling or deleting that partial result's source archive.
+
+The same key in an older advanced configuration remains readable, with the ordinary configuration taking precedence. During an installation upgrade, a missing ordinary setting is filled from the old advanced value, or with `"complete"` if neither exists.
+
+The two advanced thresholds calculate verification recommendations; they are not additional partial-success switches:
+
+- `verification.complete_accept_threshold` (default `0.999`): the complete-acceptance branch requires completeness at least this high, a complete assessment and compatible content integrity. It also participates in the output-quality check.
+- `verification.partial_accept_threshold` (default `0.2`): a partial recommendation can use completeness at least this high and near the estimated recoverable upper bound, or output quality at least this high with confidence of at least `0.35`. Output quality is not a recovered-file or byte percentage. For example, one nonempty output file without per-file observations has a baseline quality score of `0.82` and confidence of `0.35`, which can support a partial recommendation.
+
+Explicit verification-method recommendations also have a fallback path, so these thresholds are not universal hard gates: `0.2` does not mean “recover 20% and succeed.” Verification, coverage and damage evidence still run normally. Only the terminal decision applies the ordinary partial-success setting; this does not introduce per-file damage filtering or repair.
 
 ## Scan filters
 

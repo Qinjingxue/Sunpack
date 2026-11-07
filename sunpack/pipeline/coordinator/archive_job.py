@@ -5,7 +5,7 @@ from typing import Any
 from sunpack.core.contracts.run_state import RunState
 from sunpack.core.contracts.results import OutcomeKind, TargetRunResult
 from sunpack.core.contracts.content_recovery import (
-    CONTENT_REQUIREMENT_COMPLETE,
+    ContentRecoveryDecision,
     ContentRecoveryPolicy,
 )
 from sunpack.core.contracts.tasks import ArchiveTask
@@ -17,14 +17,9 @@ from sunpack.pipeline.extraction.knowledge import write_extraction_result
 from sunpack.pipeline.extraction.scheduler import ExtractionScheduler
 from sunpack.pipeline.extraction.output_inventory import OutputInventory
 from sunpack.pipeline.postprocess.output_cleanup import DEFAULT_OUTPUT_CLEANUP_MANAGER, OutputCleanupEvent, cleanup_output_for_retry
-from sunpack.core.contracts.verification import DECISION_ACCEPT, DECISION_ACCEPT_PARTIAL
 
 from sunpack.core.passwords.directory_context import PasswordScopeContext
 from sunpack.pipeline.verification import VerificationResult, VerificationScheduler
-from sunpack.core.contracts.verification import (
-    CONTENT_INTEGRITY_PAYLOAD_DAMAGED,
-    CONTENT_INTEGRITY_VERIFIED_PARTIAL,
-)
 from sunpack.core.i18n import I18nContext
 
 
@@ -41,40 +36,15 @@ class ArchiveJobOutcome:
     verification: VerificationResult | None = None
     attempts: int = 1
     planned_out_dir: str = ""
-    content_requirement: str = CONTENT_REQUIREMENT_COMPLETE
+    content_decision: ContentRecoveryDecision = ContentRecoveryDecision()
 
     @property
     def outcome_kind(self) -> OutcomeKind:
-        if self.result.success and _verification_accepts_complete(self.verification):
-            return OutcomeKind.COMPLETE_SUCCESS
-        if (
-            self.content_requirement != CONTENT_REQUIREMENT_COMPLETE
-            and _verification_accepts_partial(self.verification)
-            and _partial_result_is_acceptable(self.result)
-        ):
-            return OutcomeKind.PARTIAL_SUCCESS
-        return OutcomeKind.FAILURE
+        return self.content_decision.outcome_kind
 
     @property
     def policy_rejected_partial_output(self) -> bool:
-        # Embedded payloads are independent logical archives.  A failed
-        # encrypted sibling does not make already verified/plain child outputs
-        # disposable partial files.
-        if (
-            self.result.failure is not None
-            and self.result.failure.contains(FailureKind.INPUTS_FAILED)
-            and self.result.has_complete_inputs
-        ):
-            return False
-        if self.content_requirement != CONTENT_REQUIREMENT_COMPLETE:
-            return False
-        verification = self.verification
-        return bool(
-            self.result.partial_outputs
-            or _verification_accepts_partial(verification)
-            or (verification.content_integrity if verification is not None else "")
-            in {CONTENT_INTEGRITY_VERIFIED_PARTIAL, CONTENT_INTEGRITY_PAYLOAD_DAMAGED}
-        )
+        return self.content_decision.rejected_partial_output
 
 
 class ArchiveJobExecutor:
@@ -194,6 +164,10 @@ class ArchiveJobExecutor:
             request_id=self.request_id,
             cancellation=cancellation,
         )
+        await broker.run(
+            "report", task.key or task.main_path, self._report_task_finished, task, outcome, depth,
+            request_id=self.request_id, cancellation=cancellation,
+        )
         preserve_output = bool(result.output_dir and (
             task.runtime.get("retry_output_dir")
             or result.outcome_kind != OutcomeKind.FAILURE or outcome.result.has_complete_inputs
@@ -280,8 +254,6 @@ class ArchiveJobExecutor:
             task.runtime["volume_retry_attempted"] = True
         if terminal is not None:
             terminal.planned_out_dir = planned_out_dir
-            await broker.run("report", file_id, self._report_task_finished, task, terminal, depth,
-                             request_id=self.request_id, cancellation=cancellation)
             return task, terminal
 
         if self.output_reservations is not None and self.output_reservations.watch_outputs is not None:
@@ -321,8 +293,6 @@ class ArchiveJobExecutor:
             if done:
                 outcome = value
                 outcome.planned_out_dir = planned_out_dir
-                await broker.run("report", file_id, self._report_task_finished, task, outcome, depth,
-                                 request_id=self.request_id, cancellation=cancellation)
                 return task, outcome
             request = value
             first = False
@@ -402,12 +372,10 @@ class ArchiveJobExecutor:
             return ArchiveJobOutcome(result=result, verification=verification, attempts=1)
 
     def collect_result(self, task: ArchiveTask, outcome: ArchiveJobOutcome | ExtractionResult) -> TargetRunResult:
-        content_policy = self.content_policy
         if isinstance(outcome, ExtractionResult):
-            outcome = ArchiveJobOutcome(outcome, content_requirement=content_policy.requirement)
-        else:
-            outcome.content_requirement = content_policy.requirement
+            outcome = ArchiveJobOutcome(outcome)
         res = outcome.result
+        outcome.content_decision = self.content_policy.decide(res, outcome.verification)
         out_dir = res.out_dir
         inventory = OutputInventory.from_value(res.output_inventory, expected_root=out_dir) if out_dir else None
         payload_inventory = (inventory.stats.file_count, inventory.stats.total_size) if inventory is not None else None
@@ -487,7 +455,7 @@ class ArchiveJobExecutor:
 
     def _failure_message(self, task: ArchiveTask, outcome: ArchiveJobOutcome) -> str:
         name = os.path.basename(task.main_path)
-        if outcome.result.success and outcome.verification is not None and not _verification_accepts(outcome.verification):
+        if outcome.result.success and outcome.verification is not None and outcome.outcome_kind == OutcomeKind.FAILURE:
             return f"{name} [{self._verification_failure_summary(outcome)}]"
         return f"{name} [{outcome.result.error}]"
 
@@ -505,30 +473,6 @@ class ArchiveJobExecutor:
             attempts=outcome.attempts,
             steps=steps,
         )
-
-
-def _verification_accepts(verification: VerificationResult | None) -> bool:
-    decision = verification.decision_hint if verification is not None else ""
-    return decision in {DECISION_ACCEPT, DECISION_ACCEPT_PARTIAL}
-
-
-def _verification_accepts_complete(verification: VerificationResult | None) -> bool:
-    if verification is None:
-        return False
-    # The verifier's decision is the contract boundary. Some extraction backends
-    # cannot provide per-file coverage, so an accepted result may legitimately
-    # carry an "unknown" assessment while still being a full success.
-    return verification.decision_hint == DECISION_ACCEPT
-
-
-def _verification_accepts_partial(verification: VerificationResult | None) -> bool:
-    return verification is not None and verification.decision_hint == DECISION_ACCEPT_PARTIAL
-
-
-def _partial_result_is_acceptable(result: ExtractionResult) -> bool:
-    """Reject execution/authentication failures, while allowing damaged sources to yield verified content."""
-    reason = result.failure.kind.value if result.failure is not None else ""
-    return not reason or reason in {"damaged", "missing_volume"}
 
 
 def _coverage_payload(verification: VerificationResult) -> dict[str, Any]:

@@ -256,7 +256,7 @@ def test_watch_service_attaches_and_releases_toast_with_watch_lifecycle(tmp_path
     )
 
     _await(service._start_scheduler())
-    assert engine_configs[0]["extraction"]["content_requirement"] == "complete"
+    assert engine_configs[0]["extraction"]["content_requirement"] == "allow_partial"
     assert service.config["extraction"]["content_requirement"] == "allow_partial"
     original_host = service.toast_host
     _await(service._start_scheduler())

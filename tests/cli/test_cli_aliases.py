@@ -46,7 +46,6 @@ def test_command_aliases_preserve_handler_inputs(parser, short, full):
     (["-a"], ["--ask-pw"]),
     (["-f"], ["--flatten"]),
     (["-F"], ["--no-flatten"]),
-    (["-k"], ["--allow-partial"]),
     (["--no-bpw"], ["--no-builtin-pw"]),
     (["--direct"], ["--direct-file"]),
 ])
@@ -72,6 +71,9 @@ def test_inspect_and_password_short_options(parser):
 
 
 @pytest.mark.parametrize("argv", [
+    ["x", ".", "-k"],
+    ["x", ".", "--allow-partial"],
+    ["x", ".", "--ap"],
     ["x", ".", "--deep"],
     ["i", ".", "--arch"],
     ["pw", "--no-bp"],
@@ -99,7 +101,7 @@ def test_aliases_work_with_command_specific_discovery(command, canonical):
 
 
 @pytest.mark.parametrize("argv, command, action", [
-    (["x", ".", "-j", "-m", "b", "-k", "-r", "*"], "extract", None),
+    (["x", ".", "-j", "-m", "b", "-r", "*"], "extract", None),
     (["s", ".", "-j", "-d"], "scan", None),
     (["w", "ls", "-j"], "watch", "list"),
     (["w", "st", "-j"], "watch", "status"),

@@ -87,7 +87,6 @@ Options:
 | `-o OUTPUT_DIR`, `--out-dir OUTPUT_DIR` | Set the output root; relative paths are resolved against the current command directory. |
 | `-f`, `--flatten` | Lift the contents of a single top-level directory after extraction. |
 | `-F`, `--no-flatten` | Keep the extracted directory structure. |
-| `-k`, `--allow-partial`, `--ap` | Accept partial recovery results as acceptable results. |
 | `--direct-file`, `--direct` | Treat every input path directly as an archive, skipping directory scanning and automatic candidate discovery. |
 
 When `--out-dir` is given, results land under "output root / the input path relative to its common root / archive name"; when it is omitted, results land next to the archive. When a nested archive is produced inside the output root, the sub-archive still computes its own output location from where it sits.

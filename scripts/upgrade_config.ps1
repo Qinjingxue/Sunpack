@@ -60,6 +60,26 @@ function Unique-Rules($Rules) {
 $user = [IO.File]::ReadAllText($UserConfig) | ConvertFrom-Json
 if ($null -eq $user -or $user -isnot [pscustomobject]) { throw "Expected a JSON object: $UserConfig" }
 
+# Expose the single content policy in the ordinary configuration. Preserve an
+# explicit user value, then the previous advanced value, then the safe default.
+$changed = $false
+if (-not $user.PSObject.Properties['extraction'] -or $null -eq $user.extraction) {
+    $user | Add-Member -NotePropertyName extraction -NotePropertyValue ([pscustomobject]@{}) -Force
+}
+if ($user.extraction -isnot [pscustomobject]) { throw 'extraction must be an object' }
+if (-not $user.extraction.PSObject.Properties['content_requirement']) {
+    $requirement = 'complete'
+    if ($AdvancedConfig -and (Test-Path -LiteralPath $AdvancedConfig -PathType Leaf)) {
+        $advanced = [IO.File]::ReadAllText($AdvancedConfig) | ConvertFrom-Json
+        if ($advanced.PSObject.Properties['extraction'] -and $null -ne $advanced.extraction -and
+            $advanced.extraction.PSObject.Properties['content_requirement']) {
+            $requirement = $advanced.extraction.content_requirement
+        }
+    }
+    $user.extraction | Add-Member -NotePropertyName content_requirement -NotePropertyValue $requirement
+    $changed = $true
+}
+
 # The logical-input checkpoint replaces the former carrier continuation. Reset
 # only its native snapshot/WAL; passwords, roots, outputs and configuration stay
 # user-owned. A marker makes subsequent installations preserve current records.
@@ -93,11 +113,12 @@ if (-not (Test-Path -LiteralPath $marker -PathType Leaf)) {
     } else { $null = New-Item -ItemType Directory -Path $stateDirectory -Force }
     [IO.File]::WriteAllText($marker, '')
 }
-if (-not $user.PSObject.Properties['filesystem'] -or -not $user.filesystem.PSObject.Properties['scan_filters']) { exit 0 }
+$hasFilters = $user.PSObject.Properties['filesystem'] -and $null -ne $user.filesystem -and $user.filesystem.PSObject.Properties['scan_filters']
+$filters = @()
+if ($hasFilters) { $filters = @($user.filesystem.scan_filters) }
 $converted = [Collections.Generic.List[object]]::new()
 $pruned = [Collections.Generic.List[object]]::new()
-$changed = $false
-foreach ($filter in @($user.filesystem.scan_filters)) {
+foreach ($filter in $filters) {
     $enabled = [bool]($filter.PSObject.Properties['enabled'] -and $filter.enabled)
     if ($filter.name -eq 'directory_prune') {
         $paths = @()
@@ -167,7 +188,7 @@ foreach ($prune in $pruned) {
     }
 }
 if (-not $changed) { exit 0 }
-$user.filesystem.scan_filters = @($converted.ToArray())
+if ($hasFilters) { $user.filesystem.scan_filters = @($converted.ToArray()) }
 
 $target = [IO.Path]::GetFullPath($UserConfig)
 $parent = [IO.Path]::GetDirectoryName($target)

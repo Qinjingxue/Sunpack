@@ -17,10 +17,25 @@ def _task(path):
 
 def _outcome(out_dir, *, success=True, partial=False, error=""):
     return SimpleNamespace(
-        success=success,
+        outcome_kind=(OutcomeKind.PARTIAL_SUCCESS if partial else OutcomeKind.COMPLETE_SUCCESS)
+        if success else OutcomeKind.FAILURE,
         result=SimpleNamespace(success=success, out_dir=str(out_dir), error=error),
         verification=SimpleNamespace(decision_hint="accept_partial" if partial else "accept"),
     )
+
+
+@pytest.mark.parametrize("kind, raw_success, expected_status", [
+    (OutcomeKind.PARTIAL_SUCCESS, False, "部分恢复"),
+    (OutcomeKind.FAILURE, True, "失败"),
+])
+def test_reporter_uses_final_policy_outcome(tmp_path, capsys, kind, raw_success, expected_status):
+    reporter = RunReporter("zh")
+    task = _task(tmp_path / "source.zip")
+    outcome = _outcome(tmp_path / "output", success=raw_success, partial=True)
+    outcome.outcome_kind = kind
+    reporter.tasks_discovered(1, [task])
+    reporter.task_finished(task, outcome, 1)
+    assert f"[{expected_status} 1/1]" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("quiet", [False, True])

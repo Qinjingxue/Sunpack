@@ -15,6 +15,9 @@
   "embedded_scan": {
     "enabled": true
   },
+  "extraction": {
+    "content_requirement": "complete"
+  },
   "post_extract": {
     "archive_cleanup_mode": "r",
     "flatten_single_directory": true

@@ -322,8 +322,9 @@ class RunReporter:
             parent_lineage = row["lineage"] if row is not None else ()
             result = getattr(outcome, "result", outcome)
             out_dir = str(getattr(result, "out_dir", "") or "")
-            success = bool(getattr(outcome, "success", getattr(result, "success", False)))
-            partial = success and getattr(getattr(outcome, "verification", None), "decision_hint", "") == "accept_partial"
+            kind = outcome.outcome_kind
+            success = kind in {OutcomeKind.COMPLETE_SUCCESS, OutcomeKind.PARTIAL_SUCCESS}
+            partial = kind == OutcomeKind.PARTIAL_SUCCESS
             if success and out_dir:
                 lineage = (*parent_lineage, name)
                 self._output_lineages[_absolute_key(out_dir)] = lineage

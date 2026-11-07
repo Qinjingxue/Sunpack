@@ -23,7 +23,7 @@ python sunpack.py config show
 | `cli.language` | `zh` 为中文，`en` 为英文。 |
 | `recursive_extract` | `"*"` 持续处理嵌套归档；正整数指定轮数；`"?"` 每轮后询问。 |
 | `recursive_authorization.enabled` | `true` 启用嵌套归档筛选策略；`false` 跳过该策略。 |
-| `post_extract.archive_cleanup_mode` | 成功后 `"r"` 移入回收站、`"k"` 保留、`"d"` 删除原归档。 |
+| `post_extract.archive_cleanup_mode` | 完整成功后 `"r"` 移入回收站、`"k"` 保留、`"d"` 删除原归档。 |
 | `post_extract.flatten_single_directory` | `true` 时提升唯一顶层输出目录中的内容。 |
 | `extraction.content_requirement` | `"complete"` 要求完整结果；`"allow_partial"` 接受部分恢复结果。 |
 
@@ -38,6 +38,19 @@ python sunpack.py config show
 CLI 的 `--recur`、`--cleanup` 和 `--out-dir` 等参数可为单次命令指定解压行为，详见 [CLI 参数说明](cli_parameters.md)。
 
 目录发现默认只扫描当前层；`scan`、`inspect`、`extract` 使用 `--recursive` 发现子目录，嵌套解压仍由 `--recur` 控制。安装器保留原子提交与失败恢复机制，从已发布的 v1.3.4 升级时会将旧扫描过滤字段迁移至当前格式。
+
+## 部分成功与校验阈值
+
+`sunpack_config.json` 中的 `extraction.content_requirement` 是唯一的部分成功开关，GUI 的“解压结果要求”也修改该字段。默认 `"complete"` 只接受完整结果；`"allow_partial"` 接受校验判定可恢复的部分结果。CLI、Watch 和嵌套解压使用同一设置，不再提供 `-k`、`--allow-partial` 或 `--ap` 覆盖参数。部分接受不会把密码、执行错误或失败的独立输入转为成功，也不会触发该部分结果原包的回收或删除。
+
+旧高级配置中的同名字段仍可读取，普通配置值优先。安装升级时，若普通配置尚无该字段，会保留旧高级配置的值；两处都没有则补入 `"complete"`。
+
+高级配置中的两个阈值属于校验建议的计算，不是另一套部分成功开关：
+
+- `verification.complete_accept_threshold`（默认 `0.999`）：完整接受分支要求完整度至少为该值，同时要求完整状态与相符的内容完整性；该值也参与输出质量判据。
+- `verification.partial_accept_threshold`（默认 `0.2`）：部分建议可以由完整度达到该值且接近预计可恢复上限，或输出质量分达到该值且置信度至少为 `0.35` 得出。输出质量分不是恢复文件数或字节数的百分比。例如只有一个非空输出文件、没有逐文件观测时，基础质量分为 `0.82`，置信度为 `0.35`，也可能得到部分建议。
+
+校验方法的显式建议还有回退路径，因此这些阈值并非所有路径都必须通过的硬门槛，不能把 `0.2` 理解为“恢复 20% 就成功”。验证、覆盖率与损坏证据仍照常计算，最终是否接受部分结果只在任务结束时按普通配置决定；这里不新增逐个坏文件的筛除或修复策略。
 
 ## 扫描过滤
 

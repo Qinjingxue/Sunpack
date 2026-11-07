@@ -1,11 +1,10 @@
 from typing import Any
 
-from sunpack.core.config.advanced_defaults import advanced_config_value
 from sunpack.core.config.schema import ConfigField
 from sunpack.core.contracts.content_recovery import CONTENT_REQUIREMENTS, CONTENT_REQUIREMENT_COMPLETE
 
 
-DEFAULT_EXTRACTION_CONFIG = advanced_config_value(("extraction",))
+DEFAULT_EXTRACTION_CONFIG = {"content_requirement": CONTENT_REQUIREMENT_COMPLETE}
 
 
 def normalize_extraction_config(value: Any) -> dict[str, Any]:

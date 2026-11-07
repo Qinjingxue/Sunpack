@@ -101,7 +101,7 @@ def test_complete_embedded_children_are_not_policy_rejected_with_failed_siblings
         input_results=[InputExecutionResult(LogicalArchiveInput(ArchiveInputDescriptor("carrier")), child)],
     )
 
-    assert ArchiveJobOutcome(result=outer).policy_rejected_partial_output is False
+    assert ContentRecoveryPolicy().decide(outer, None).rejected_partial_output is False
 
 
 @pytest.mark.parametrize("with_zero_file", [False, True])
@@ -177,6 +177,7 @@ def test_async_terminal_cleanup_yields_to_loop_and_finishes_before_watch_event(t
     runner.context, runner.i18n, runner.config = RunState(), I18nContext("en"), {}
     runner.content_policy = ContentRecoveryPolicy.from_config({})
     runner.origin, runner.request_id = origin, "cleanup-request"
+    runner.progress_reporter = None
     runner._uncommitted_outputs = {}
     semantic = []
     runner.extractor = SimpleNamespace(emit_semantic_event=lambda *a, **kw: semantic.append(kw))

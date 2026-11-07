@@ -80,7 +80,6 @@ def test_output_dir_override_is_relative_to_the_request_cwd(tmp_path):
         archive_cleanup_mode = None
         output_dir = "output"
         flatten_single_directory = None
-        allow_partial = False
 
     config = {}
 
@@ -95,7 +94,6 @@ def test_omitted_output_dir_keeps_default_beside_archive_behavior(tmp_path):
         archive_cleanup_mode = None
         output_dir = None
         flatten_single_directory = None
-        allow_partial = False
 
     config = {}
     overrides = apply_runtime_config_overrides(config, Args(), base_dir=str(tmp_path))

@@ -115,6 +115,65 @@ def test_existing_watch_success_notification_includes_postprocess_warning(tmp_pa
     assert cleanup_log["results"][0]["message"] == "postprocess failed"
 
 
+@pytest.mark.parametrize("warning_kind", [None, FailureKind.DAMAGED, FailureKind.MISSING_VOLUME])
+@pytest.mark.parametrize("nested_failure", [None, FailureKind.DAMAGED, FailureKind.MISSING_VOLUME, FailureKind.WRONG_PASSWORD])
+def test_accepted_partial_watch_result_keeps_warnings_out_of_failure_policy(
+    tmp_path, monkeypatch, warning_kind, nested_failure,
+):
+    monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
+    source = tmp_path / "archive.zip"
+    source.write_text("source")
+    output = tmp_path / "output"
+    output.mkdir()
+    nested = output / "nested.zip"
+    nested.write_text("nested")
+    warning = FailureInfo(warning_kind, "extract", "recovery warning") if warning_kind else None
+    results = [TargetRunResult(
+        str(source), OutcomeKind.PARTIAL_SUCCESS, output_dir=str(output),
+        failure=warning, error=warning.message if warning else "",
+        recovery={"out_dir": str(output)},
+    )]
+    if nested_failure:
+        failure = FailureInfo(nested_failure, "extract", "nested failure")
+        results.append(TargetRunResult(str(nested), OutcomeKind.FAILURE,
+                                       failure=failure, error=failure.message))
+    watcher = _watcher(tmp_path)
+    notices, events = [], []
+    watcher._notify = lambda *args: notices.append(args)
+    monkeypatch.setattr(watcher.log, "write", lambda event, **fields: events.append((event, fields)))
+    watcher.state.mark(str(source), source.stat().st_size, source.stat().st_mtime,
+                       status="failed_password")
+
+    async def scenario():
+        async def complete():
+            return PipelineResponse("request", RunSummary(target_results=tuple(results)),
+                                    PipelineArtifacts((str(output),)))
+        request = scheduler_module._ActivePipelineRequest(
+            "notice", WatchCandidate(str(source), source.stat().st_size, source.stat().st_mtime),
+            asyncio.create_task(complete()),
+            password_generation=watcher.state.password_generation,
+            password_signature=watcher._password_signature_for_scope(str(tmp_path)),
+        )
+        return await watcher._complete_candidate(request)
+
+    result = _await(scenario())
+    assert source.exists() and nested.exists()
+    assert watcher.state.latest_entry_for_path(str(source)) is None
+    assert all("recovery warning" not in error for error in result.errors)
+    if nested_failure:
+        assert result.failed == 1 and result.succeeded == 0
+        expected = "failed" if nested_failure == FailureKind.DAMAGED else "suppressed"
+        assert notices[-1][0] == expected
+        if nested_failure != FailureKind.DAMAGED:
+            entry = watcher.state.latest_entry_for_path(str(nested))
+            assert entry is not None
+            assert entry.status == ("suspended_missing_volume" if nested_failure == FailureKind.MISSING_VOLUME else "failed_password")
+    else:
+        assert result.succeeded == 1 and result.failed == 0
+        assert notices[-1] == ("succeeded", "notice", [str(output)])
+        assert not any(event in {"failed_terminal", "partial_rejected"} for event, _ in events)
+
+
 @pytest.mark.parametrize("archive_outcome", [None, OutcomeKind.COMPLETE_SUCCESS, OutcomeKind.FAILURE])
 @pytest.mark.parametrize("scan_stage", ["filesystem_scan", "embedded_boundary"])
 def test_scan_filesystem_errors_only_log_and_do_not_replace_archive_notifications(tmp_path, monkeypatch, archive_outcome, scan_stage):
@@ -1679,8 +1738,8 @@ def test_partial_result_does_not_self_retry_but_modified_epoch_does(tmp_path, mo
     )
     watcher.enqueue(str(archive))
     first = _await(watcher.run_once())
-    assert first.processed == first.failed == 1
-    assert first.succeeded == 0
+    assert first.processed == first.succeeded == 1
+    assert first.failed == 0
     assert (tmp_path / "out" / "sample" / "payload.bin").is_file()
     assert _await(watcher.run_once()).processed == 0
     with archive.open("ab") as stream:

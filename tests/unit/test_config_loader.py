@@ -42,16 +42,22 @@ def test_load_config_merges_simple_config_over_advanced_config(tmp_path, monkeyp
     advanced = tmp_path / "sunpack_advanced_config.json"
     payload = _advanced_payload()
     payload["runtime"] = {"process_mode": "background"}
+    payload["extraction"] = {"content_requirement": "allow_partial"}
     payload["filesystem"]["scan_filters"] = [{"name": "size_range", "enabled": True, "min_bytes": 1048576, "max_bytes": None}]
     _write_json(advanced, payload)
     _write_json(simple, {
         "cli": {"language": "zh"},
         "runtime": {"process_mode": "high"},
+        "extraction": {"content_requirement": "complete"},
         "filesystem": {"scan_filters": [{"name": "size_range", "enabled": True, "min_bytes": 2097152, "max_bytes": None}]},
         "performance": {"worker": {"memory_reserve_bytes": 134217728}},
     })
     monkeypatch.setattr(loader, "_candidate_config_paths", _layered_config_paths(simple, advanced))
     config = loader.load_config()
+    assert config["extraction"]["content_requirement"] == "complete"
+    # Older ordinary configs omit the setting; the old advanced key still works.
+    _write_json(simple, {"cli": {"language": "zh"}})
+    assert loader.load_config()["extraction"]["content_requirement"] == "allow_partial"
     assert config["cli"]["language"] == "zh"
     assert config["runtime"]["process_mode"] == "high"
     assert config["recursive_extract"] == {"mode": "infinite"}

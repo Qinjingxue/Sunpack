@@ -2421,10 +2421,12 @@ class WatchScheduler:
             str(target_output_dir or ""),
         ])
 
-        failures = summary.failures
+        # Accepted recovery can retain a failure as diagnostic evidence. Only
+        # failed outcomes may create blockers or fail the Watch request.
+        failures = list(summary.scan_failures)
         for item in results:
             failure = result_failure(item)
-            if failure is not None and failure not in failures:
+            if result_outcome(item) == OutcomeKind.FAILURE and failure is not None and failure not in failures:
                 failures.append(failure)
 
         waiting_failures: list = []
@@ -2433,7 +2435,7 @@ class WatchScheduler:
         for item in results:
             failure = result_failure(item)
             retry_path = result_path(item)
-            if failure is None or not retry_path:
+            if result_outcome(item) != OutcomeKind.FAILURE or failure is None or not retry_path:
                 continue
             missing = failure_contains(failure, FailureKind.MISSING_VOLUME)
             password = failure_is_password(failure)
@@ -2498,7 +2500,7 @@ class WatchScheduler:
 
         # A successful outer input may own unpublished nested promotion intents.
         # Hand them off to durable blockers before retiring any source record.
-        if direct_outcome == OutcomeKind.COMPLETE_SUCCESS:
+        if direct_outcome in {OutcomeKind.COMPLETE_SUCCESS, OutcomeKind.PARTIAL_SUCCESS}:
             self._retire_claimed_paths(claimed_paths, request.candidate)
 
         terminal_failures = [
@@ -2523,10 +2525,10 @@ class WatchScheduler:
             if failure in waiting_failures or failure in recorded_password_failures or failure in retired_failures:
                 continue
             outcome = result_outcome(item)
-            if outcome == OutcomeKind.COMPLETE_SUCCESS:
+            if outcome in {OutcomeKind.COMPLETE_SUCCESS, OutcomeKind.PARTIAL_SUCCESS}:
                 self.log.write("done", path=task_path, owner=request.notification_id,
                                output_dirs=[item.output_dir] if item.output_dir else [])
-            elif outcome in {OutcomeKind.FAILURE, OutcomeKind.PARTIAL_SUCCESS}:
+            elif outcome == OutcomeKind.FAILURE:
                 self.log.write("failed_terminal", path=task_path, owner=request.notification_id,
                                error_kind=failure.kind.value if failure is not None else "", error=result_error(item))
 
@@ -2535,7 +2537,7 @@ class WatchScheduler:
             terminal_errors = []
             for item in results:
                 failure = result_failure(item)
-                if failure not in terminal_failures:
+                if result_outcome(item) != OutcomeKind.FAILURE or failure not in terminal_failures:
                     continue
                 task_path = result_path(item)
                 message = result_error(item) or _failure_message(
@@ -2603,14 +2605,8 @@ class WatchScheduler:
             notify("suppressed", request.notification_id)
             return WatchRunResult(processed=1)
 
-        if direct_outcome == OutcomeKind.PARTIAL_SUCCESS:
-            error = self.i18n.t("watch.failure.partial_rejected")
-            self.log.write("partial_rejected", path=candidate.path, owner=request.notification_id, error=error)
-            notify("failed", request.notification_id, [error], [])
-            return WatchRunResult(processed=1, failed=1, errors=[error])
-
-        if direct_outcome != OutcomeKind.COMPLETE_SUCCESS:
-            error = self.i18n.t("watch.failure.no_complete_outcome")
+        if direct_outcome not in {OutcomeKind.COMPLETE_SUCCESS, OutcomeKind.PARTIAL_SUCCESS}:
+            error = self.i18n.t("watch.failure.no_accepted_outcome")
             self.log.write("failed_terminal", path=candidate.path, owner=request.notification_id, error=error, failures=[])
             notify("failed", request.notification_id, [error], [])
             return WatchRunResult(processed=1, failed=1, errors=[error])
@@ -2619,7 +2615,8 @@ class WatchScheduler:
             "done",
             path=candidate.path,
             owner=request.notification_id,
-            success_count=summary.success_count,
+            success_count=summary.success_count + summary.partial_success_count,
+            partial_success_count=summary.partial_success_count,
             output_dirs=generated_output_dirs,
         )
         cleanup_failed = [
@@ -2648,7 +2645,7 @@ class WatchScheduler:
             )
         else:
             notify("succeeded", request.notification_id, generated_output_dirs)
-        return WatchRunResult(processed=1, succeeded=summary.success_count)
+        return WatchRunResult(processed=1, succeeded=summary.success_count + summary.partial_success_count)
 
     def _notify(self, action: str, *args) -> None:
         try:

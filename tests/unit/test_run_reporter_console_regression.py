@@ -13,6 +13,7 @@ import pytest
 
 import sunpack.pipeline.coordinator.reporting as reporting
 from sunpack.pipeline.coordinator.reporting import RunReporter
+from sunpack.core.contracts.results import OutcomeKind
 
 
 def _task(path):
@@ -21,7 +22,7 @@ def _task(path):
 
 def _success(out_dir):
     return SimpleNamespace(
-        success=True,
+        outcome_kind=OutcomeKind.COMPLETE_SUCCESS,
         result=SimpleNamespace(success=True, out_dir=str(out_dir), error=""),
         verification=SimpleNamespace(decision_hint="accept"),
     )
