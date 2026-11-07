@@ -15,6 +15,7 @@ use pyo3::types::{PyBool, PyFloat, PyInt, PyIterator, PyString};
 
 use crate::io::resource_lifecycle::TrackedFile;
 use crate::io::cancellation::Cancellation;
+use crate::io::json_rows::NativeJsonArray;
 
 const TEXT_CHUNK: usize = 16 * 1024;
 const FILE_BUFFER: usize = 64 * 1024;
@@ -77,22 +78,24 @@ fn push_unicode_escape(out: &mut Vec<u8>, code: u32) {
     ]);
 }
 
-struct Writer {
-    file: BufWriter<TrackedFile>,
+struct Writer<W: Write + Send> {
+    file: W,
     cancellation: Cancellation,
     pending: Vec<u32>,
     encoded: Vec<u8>,
     attached_steps: usize,
+    pretty: bool,
 }
 
-impl Writer {
-    fn new(file: TrackedFile, cancellation: Cancellation) -> Self {
+impl<W: Write + Send> Writer<W> {
+    fn new(file: W, cancellation: Cancellation) -> Self {
         Self {
-            file: BufWriter::with_capacity(FILE_BUFFER, file),
+            file,
             cancellation,
             pending: Vec::with_capacity(TEXT_CHUNK),
             encoded: Vec::with_capacity(TEXT_CHUNK * 6),
             attached_steps: 0,
+            pretty: false,
         }
     }
 
@@ -151,9 +154,17 @@ impl Writer {
         self.text(py, value.cast::<PyString>()?, json)
     }
 
+    fn newline(&mut self, py: Python<'_>, depth: usize) -> PyResult<()> {
+        if self.pretty {
+            self.bytes(py, b"\n")?;
+            for _ in 0..depth { self.bytes(py, b"  ")?; }
+        }
+        Ok(())
+    }
+
     fn json(&mut self, py: Python<'_>, root: Bound<'_, PyAny>) -> PyResult<()> {
         enum Frame<'py> {
-            Value(Bound<'py, PyAny>),
+            Value(Bound<'py, PyAny>, usize),
             Container {
                 // Retain the owner: iterator alone need not keep a custom mapping
                 // alive, and a live pointer is required for cycle detection.
@@ -161,18 +172,25 @@ impl Writer {
                 iter: Bound<'py, PyIterator>,
                 mapping: bool,
                 first: bool,
+                depth: usize,
             },
         }
         let abc = py.import("collections.abc")?;
         let mapping_type = abc.getattr("Mapping")?;
         let sequence_type = abc.getattr("Sequence")?;
         let mut active = HashSet::new();
-        let mut stack = vec![Frame::Value(root)];
+        let mut stack = vec![Frame::Value(root, 0)];
         while let Some(frame) = stack.pop() {
             self.tick(py)?;
             match frame {
-                Frame::Value(value) => {
-                    if value.is_none() {
+                Frame::Value(value, depth) => {
+                    if let Ok(array) = value.cast::<NativeJsonArray>() {
+                        self.flush(py)?;
+                        let array = array.get();
+                        let result = py.detach(|| array.write_json(&mut self.file, &self.cancellation));
+                        self.cancellation.check()?;
+                        result?;
+                    } else if value.is_none() {
                         self.bytes(py, b"null")?;
                     } else if value.is_instance_of::<PyString>() {
                         self.string(py, &value, true)?;
@@ -211,7 +229,7 @@ impl Writer {
                                 value.try_iter()?
                             };
                             self.bytes(py, if mapping { b"{" } else { b"[" })?;
-                            stack.push(Frame::Container { owner: value, iter, mapping, first: true });
+                            stack.push(Frame::Container { owner: value, iter, mapping, first: true, depth });
                         } else {
                             // Arbitrary __str__ can allocate an unbounded diagnostic.
                             // Require callers to supply JSON scalars/containers instead.
@@ -219,10 +237,11 @@ impl Writer {
                         }
                     }
                 }
-                Frame::Container { owner, mut iter, mapping, first } => {
+                Frame::Container { owner, mut iter, mapping, first, depth } => {
                     if let Some(item) = iter.next() {
                         let item = item?;
-                        if !first { self.bytes(py, b", ")?; }
+                        if !first { self.bytes(py, if self.pretty { b"," } else { b", " })?; }
+                        self.newline(py, depth + 1)?;
                         let value = if mapping {
                             let key = item.get_item(0)?;
                             if key.is_instance_of::<PyString>() {
@@ -250,16 +269,53 @@ impl Writer {
                             self.bytes(py, b": ")?;
                             item.get_item(1)?
                         } else { item };
-                        stack.push(Frame::Container { owner, iter, mapping, first: false });
-                        stack.push(Frame::Value(value));
+                        stack.push(Frame::Container { owner, iter, mapping, first: false, depth });
+                        stack.push(Frame::Value(value, depth + 1));
                     } else {
                         active.remove(&(owner.as_ptr() as usize));
+                        if !first { self.newline(py, depth)?; }
                         self.bytes(py, if mapping { b"}" } else { b"]" })?;
                     }
                 }
             }
         }
         Ok(())
+    }
+}
+
+// Use the same encoder for CLI text streams and Watch files. Native arrays are
+// copied as encoded chunks, with no per-row Python traversal or full JSON tree.
+struct PythonTextSink {
+    output: Py<PyAny>,
+    error: Option<PyErr>,
+}
+impl Write for PythonTextSink {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let text = std::str::from_utf8(bytes).map_err(io::Error::other)?;
+        Python::attach(|py| {
+            match self.output.call_method1(py, "write", (text,)) {
+                Ok(_) => Ok(bytes.len()),
+                Err(error) => {
+                    self.error = Some(error);
+                    Err(io::Error::other("JSON output failed"))
+                }
+            }
+        })
+    }
+    fn flush(&mut self) -> io::Result<()> { Ok(()) }
+}
+
+#[pyfunction]
+#[pyo3(signature = (value, output, pretty=false))]
+pub(crate) fn stream_json(
+    py: Python<'_>, value: Bound<'_, PyAny>, output: Py<PyAny>, pretty: bool,
+) -> PyResult<()> {
+    let mut writer = Writer::new(PythonTextSink { output, error: None }, Cancellation::current());
+    writer.pretty = pretty;
+    let result = writer.json(py, value).and_then(|()| writer.flush(py));
+    match writer.file.error.take() {
+        Some(error) => Err(error),
+        None => result,
     }
 }
 
@@ -282,7 +338,7 @@ pub(crate) fn append_failure_report(
         let original_len = file.seek(io::SeekFrom::End(0))?;
         Ok((file, original_len))
     })?;
-    let mut writer = Writer::new(file, cancellation);
+    let mut writer = Writer::new(BufWriter::with_capacity(FILE_BUFFER, file), cancellation);
     let result = (|| -> PyResult<()> {
         writer.text(py, failure_header, false)?;
         writer.bytes(py, b"\n")?;
@@ -339,7 +395,7 @@ pub(crate) fn publish_failure_report(
             o.write(true).create_new(true);
         })
     })?;
-    let mut writer = Writer::new(file, cancellation);
+    let mut writer = Writer::new(BufWriter::with_capacity(FILE_BUFFER, file), cancellation);
     let result = (|| -> PyResult<()> {
         for part in header.try_iter()? { writer.string(py, &part?, false)?; }
         writer.flush(py)?;

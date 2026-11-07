@@ -6,19 +6,7 @@ import sunpack.core.support.archive_sessions as archive_sessions
 import sunpack.core.support.output_paths as output_paths
 from sunpack.pipeline.discovery.detection.input_planning import ArchiveInputPlanningStage
 
-from sunpack.pipeline.verification.pipeline import VerificationPipeline
 from sunpack.runtime.cli.cli import preprocess_sys_argv
-
-
-def test_verification_thresholds_preserve_explicit_zero():
-    pipeline = VerificationPipeline({
-        "complete_accept_threshold": 0,
-        "partial_accept_threshold": 0,
-        "methods": [],
-    })
-
-    assert pipeline.complete_accept_threshold == 0
-    assert pipeline.partial_accept_threshold == 0
 
 
 def test_input_planning_report_cache_stays_bounded_and_clears():

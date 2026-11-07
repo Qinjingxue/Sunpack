@@ -42,18 +42,21 @@ CLI options such as `--recur`, `--cleanup`, and `--out-dir` let you set extracti
 
 Directory discovery is shallow by default. Use `--recursive` with `scan`, `inspect`, or `extract`; nested extraction continues to use `--recur`. The installer retains its atomic configuration upgrade and failure-recovery framework. Upgrading from the released v1.3.4 configuration migrates the old scan-filter fields into the current schema.
 
-## Partial success and verification thresholds
+## Partial success and result verification
 
 `extraction.content_requirement` in `sunpack_config.json` is the single partial-success setting. The GUI's “Required extraction result” edits the same field. The default, `"complete"`, accepts only complete results; `"allow_partial"` accepts recoverable partial results identified by verification. CLI, Watch and nested extraction share it. The `-k`, `--allow-partial` and `--ap` overrides have been removed. Partial acceptance does not turn authentication, execution or independent-input failures into success, and never authorizes recycling or deleting that partial result's source archive.
 
 The same key in an older advanced configuration remains readable, with the ordinary configuration taking precedence. During an installation upgrade, a missing ordinary setting is filled from the old advanced value, or with `"complete"` if neither exists.
 
-The two advanced thresholds calculate verification recommendations; they are not additional partial-success switches:
+Complete acceptance retains the internal completeness condition of `0.999`, together with a complete assessment and compatible content integrity. There is no external threshold setting.
 
-- `verification.complete_accept_threshold` (default `0.999`): the complete-acceptance branch requires completeness at least this high, a complete assessment and compatible content integrity. It also participates in the output-quality check.
-- `verification.partial_accept_threshold` (default `0.2`): a partial recommendation can use completeness at least this high and near the estimated recoverable upper bound, or output quality at least this high with confidence of at least `0.35`. Output quality is not a recovered-file or byte percentage. For example, one nonempty output file without per-file observations has a baseline quality score of `0.82` and confidence of `0.35`, which can support a partial recommendation.
+When complete acceptance does not apply, at least one actual file in the output inventory supports a partial recommendation, including a zero-byte file. No minimum recovered proportion, output-quality score, confidence or estimated recoverable upper bound is required. Empty directories and records of missing files do not count as output files. Password requests and explicit failure recommendations still take precedence.
 
-Explicit verification-method recommendations also have a fallback path, so these thresholds are not universal hard gates: `0.2` does not mean “recover 20% and succeed.” Verification, coverage and damage evidence still run normally. Only the terminal decision applies the ordinary partial-success setting; this does not introduce per-file damage filtering or repair.
+Verification, coverage, quality scores and damage evidence still run normally. Only the terminal decision applies the ordinary partial-success setting; this does not introduce per-file damage filtering or repair.
+
+`manifest_size_match` compares file counts and total unpacked bytes exactly, without absolute or ratio tolerances. Shortfalls produce failure issues and excesses produce warnings; per-file name, size and CRC checks still run independently.
+
+`archive_test_crc` no longer caps missing-file, CRC-mismatch, size-mismatch or read-error details by item count. Rust encodes complete JSON streams during verification and reuses byte-based spill storage. Python retains immutable handles, while CLI and Watch reports stream the encoded data directly. Temporary storage is reclaimed when its last owning result or knowledge snapshot is released. Writing a complete report still costs disk IO proportional to its contents.
 
 ## Scan filters
 

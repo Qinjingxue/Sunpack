@@ -34,7 +34,7 @@ class ManifestSizeMatchMethod:
         expected_files = _expected_file_count(input_manifest)
         expected_size = _expected_total_size(input_manifest)
         named_count = input_manifest.retained_file_count if input_manifest.ok else 0
-        if expected_files <= 0 and expected_size <= 0:
+        if not input_manifest.ok:
             return VerificationStep(method=self.name, status="skipped")
 
         stats = output_stats_for_evidence(evidence)
@@ -68,7 +68,6 @@ class ManifestSizeMatchMethod:
                     basename_mode="unique",
                     include_observations=emit_observations,
                     detail_limit=detail_limit,
-                    max_issue_items=0,
                 )
             if name_coverage.missing_files:
                 issues.append(VerificationIssue(
@@ -80,57 +79,43 @@ class ManifestSizeMatchMethod:
                     actual=_coverage_actual(name_coverage, input_manifest),
                 ))
 
-        if expected_files > 0:
-            file_tolerance = max(
-                config["file_count_abs_tolerance"],
-                int(expected_files * config["file_count_ratio_tolerance"]),
-            )
-            lower_bound = max(0, expected_files - file_tolerance)
-            upper_bound = expected_files + file_tolerance
-            if stats.file_count < lower_bound:
-                issues.append(VerificationIssue(
-                    method=self.name,
-                    code="fail.manifest_file_count_under",
-                    message="Output file count is lower than archive manifest file count",
-                    path=evidence.output_dir,
-                    expected=expected_files,
-                    actual=stats.file_count,
-                ))
-            elif stats.file_count > upper_bound:
-                issues.append(VerificationIssue(
-                    method=self.name,
-                    code="warning.manifest_file_count_over",
-                    message="Output file count is higher than archive manifest file count",
-                    path=evidence.output_dir,
-                    expected=expected_files,
-                    actual=stats.file_count,
-                ))
+        if stats.file_count < expected_files:
+            issues.append(VerificationIssue(
+                method=self.name,
+                code="fail.manifest_file_count_under",
+                message="Output file count is lower than archive manifest file count",
+                path=evidence.output_dir,
+                expected=expected_files,
+                actual=stats.file_count,
+            ))
+        elif stats.file_count > expected_files:
+            issues.append(VerificationIssue(
+                method=self.name,
+                code="warning.manifest_file_count_over",
+                message="Output file count is higher than archive manifest file count",
+                path=evidence.output_dir,
+                expected=expected_files,
+                actual=stats.file_count,
+            ))
 
-        if expected_size > 0:
-            size_tolerance = max(
-                config["size_abs_tolerance_bytes"],
-                int(expected_size * config["size_ratio_tolerance"]),
-            )
-            lower_bound = max(0, expected_size - size_tolerance)
-            upper_bound = expected_size + size_tolerance
-            if stats.total_size < lower_bound:
-                issues.append(VerificationIssue(
-                    method=self.name,
-                    code="fail.manifest_size_under",
-                    message="Output total size is lower than archive manifest unpacked size",
-                    path=evidence.output_dir,
-                    expected=expected_size,
-                    actual=stats.total_size,
-                ))
-            elif stats.total_size > upper_bound:
-                issues.append(VerificationIssue(
-                    method=self.name,
-                    code="warning.manifest_size_over",
-                    message="Output total size is higher than archive manifest unpacked size",
-                    path=evidence.output_dir,
-                    expected=expected_size,
-                    actual=stats.total_size,
-                ))
+        if stats.total_size < expected_size:
+            issues.append(VerificationIssue(
+                method=self.name,
+                code="fail.manifest_size_under",
+                message="Output total size is lower than archive manifest unpacked size",
+                path=evidence.output_dir,
+                expected=expected_size,
+                actual=stats.total_size,
+            ))
+        elif stats.total_size > expected_size:
+            issues.append(VerificationIssue(
+                method=self.name,
+                code="warning.manifest_size_over",
+                message="Output total size is higher than archive manifest unpacked size",
+                path=evidence.output_dir,
+                expected=expected_size,
+                actual=stats.total_size,
+            ))
 
         if not issues:
             return VerificationStep(

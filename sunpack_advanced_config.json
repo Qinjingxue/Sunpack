@@ -288,8 +288,6 @@
   },
   "verification": {
     "enabled": true,
-    "complete_accept_threshold": 0.999,
-    "partial_accept_threshold": 0.2,
     "methods": [
       {
         "name": "extraction_exit_signal",
@@ -301,16 +299,11 @@
       },
       {
         "name": "manifest_size_match",
-        "enabled": true,
-        "file_count_abs_tolerance": 2,
-        "file_count_ratio_tolerance": 0.05,
-        "size_abs_tolerance_bytes": 1048576,
-        "size_ratio_tolerance": 0.02
+        "enabled": true
       },
       {
         "name": "archive_test_crc",
-        "enabled": true,
-        "max_reported_items": 20
+        "enabled": true
       }
     ]
   }

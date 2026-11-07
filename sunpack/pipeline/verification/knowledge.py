@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 from typing import Any
+from sunpack_native import NativeJsonArray
 
 from sunpack.core.contracts.tasks import ArchiveTask
 from sunpack.core.contracts.verification import VerificationResult
@@ -174,6 +175,16 @@ def _issue_counts(result: VerificationResult) -> dict[str, int]:
     }
     for issue in result.issues:
         code = str(issue.code or "").lower()
+        if isinstance(issue.actual, NativeJsonArray):
+            fields = {
+                "fail.archive_crc_mismatch": ("crc_mismatch_count",),
+                "fail.archive_output_size_mismatch": ("size_mismatch_count",),
+                "fail.archive_crc_file_missing": ("output_missing_count", "archive_crc_file_missing_count"),
+            }.get(code)
+            if fields:
+                for name in fields:
+                    counts[name] += len(issue.actual)
+                continue
         message = str(issue.message or "").lower()
         text = f"{code} {message}"
         if "crc" in text or "checksum" in text:
@@ -194,16 +205,16 @@ def _issue_counts(result: VerificationResult) -> dict[str, int]:
 def _observation_counts(result: VerificationResult) -> dict[str, int]:
     counts = {"crc_mismatch_count": 0, "size_mismatch_count": 0}
     for item in result.file_observations:
-        if item.crc_expected is not None and item.crc_actual is not None and item.crc_expected != item.crc_actual:
-            counts["crc_mismatch_count"] += 1
-        if item.expected_size is not None and item.bytes_written and int(item.bytes_written) != int(item.expected_size):
-            counts["size_mismatch_count"] += 1
+        crc_mismatch = item.crc_expected is not None and item.crc_actual is not None and item.crc_expected != item.crc_actual
+        size_mismatch = item.expected_size is not None and bool(item.bytes_written) and int(item.bytes_written) != int(item.expected_size)
         for issue in item.issues:
+            if issue.code == "fail.archive_crc_file_missing":
+                continue
             text = f"{issue.code} {issue.message}".lower()
-            if "crc" in text or "checksum" in text:
-                counts["crc_mismatch_count"] += 1
-            if "size" in text or "length" in text:
-                counts["size_mismatch_count"] += 1
+            crc_mismatch |= "crc" in text or "checksum" in text
+            size_mismatch |= "size" in text or "length" in text
+        counts["crc_mismatch_count"] += int(crc_mismatch)
+        counts["size_mismatch_count"] += int(size_mismatch)
     return counts
 
 

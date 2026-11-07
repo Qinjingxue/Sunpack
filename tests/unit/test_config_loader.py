@@ -13,7 +13,6 @@ def _write_json(path, payload):
 def _verification_config():
     return {
         "enabled": True,
-        "complete_accept_threshold": 0.999, "partial_accept_threshold": 0.2,
         "methods": [{"name": "extraction_exit_signal", "enabled": True}, {"name": "output_presence", "enabled": True}],
     }
 

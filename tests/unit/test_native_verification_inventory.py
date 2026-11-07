@@ -193,7 +193,6 @@ def test_native_crc_match_reads_only_missing_output_crc_and_not_source_crc(tmp_p
             "crc32": expected_crc,
         }],
         verify_crc=True,
-        max_issue_items=4,
     )
 
     assert result["crc_files_read"] == 1

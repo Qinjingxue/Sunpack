@@ -36,7 +36,6 @@ def coverage_from_native_inventory(
     include_observations: bool = False,
     detail_offset: int = 0,
     detail_limit: int = 128,
-    max_issue_items: int = 20,
     issues_by_path: dict[str, list[VerificationIssue]] | None = None,
 ) -> tuple[ArchiveOutputCoverage, dict[str, Any]]:
     if isinstance(archive_files, ArchiveInputManifest):
@@ -50,7 +49,6 @@ def coverage_from_native_inventory(
         include_observations=include_observations,
         detail_offset=detail_offset,
         detail_limit=detail_limit,
-        max_issue_items=max_issue_items,
     )
     coverage = dict(raw.get("coverage") or {})
     issues_by_path = issues_by_path or {}

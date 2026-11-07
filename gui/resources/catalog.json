@@ -1301,30 +1301,6 @@
         "en": "Result verification"
       }
     },
-    "/verification/complete_accept_threshold": {
-      "label": {
-        "zh": "完整判定参考阈值",
-        "en": "Complete-verification threshold"
-      },
-      "description": {
-        "zh": "用于完整度与输出质量判据，不是所有验证路径的硬门槛。",
-        "en": "Used in completeness and output-quality checks, not a hard gate for every verification path."
-      },
-      "min": 0,
-      "max": 1
-    },
-    "/verification/partial_accept_threshold": {
-      "label": {
-        "zh": "部分恢复判定参考阈值",
-        "en": "Partial-verification threshold"
-      },
-      "description": {
-        "zh": "不是恢复百分比或允许部分成功的开关；接受策略由解压结果要求控制。",
-        "en": "Not a recovered percentage or permission switch; Required extraction result controls acceptance."
-      },
-      "min": 0,
-      "max": 1
-    },
     "/verification/methods/@extraction_exit_signal/enabled": {
       "label": {
         "zh": "解压退出信号",
@@ -1343,44 +1319,6 @@
         "en": "File count and size"
       }
     },
-    "/verification/methods/@manifest_size_match/file_count_abs_tolerance": {
-      "label": {
-        "zh": "允许的文件数量差",
-        "en": "Allowed file count difference"
-      },
-      "min": 0,
-      "integer": true
-    },
-    "/verification/methods/@manifest_size_match/file_count_ratio_tolerance": {
-      "label": {
-        "zh": "允许的文件数量比例差",
-        "en": "Allowed file count ratio difference"
-      },
-      "description": {
-        "zh": "0.05 表示 5%",
-        "en": "0.05 means 5%"
-      },
-      "min": 0
-    },
-    "/verification/methods/@manifest_size_match/size_abs_tolerance_bytes": {
-      "label": {
-        "zh": "允许的大小差（字节）",
-        "en": "Allowed size difference (bytes)"
-      },
-      "min": 0,
-      "integer": true
-    },
-    "/verification/methods/@manifest_size_match/size_ratio_tolerance": {
-      "label": {
-        "zh": "允许的大小比例差",
-        "en": "Allowed size ratio difference"
-      },
-      "description": {
-        "zh": "0.02 表示 2%",
-        "en": "0.02 means 2%"
-      },
-      "min": 0
-    },
     "/verification/methods/@archive_test_crc/enabled": {
       "label": {
         "zh": "压缩包 CRC 验证",
@@ -1390,14 +1328,6 @@
         "zh": "使用压缩包校验信息检查完整性",
         "en": "Check integrity using archive checksums"
       }
-    },
-    "/verification/methods/@archive_test_crc/max_reported_items": {
-      "label": {
-        "zh": "报告项目上限",
-        "en": "Reported item limit"
-      },
-      "min": 0,
-      "integer": true
     },
     "/watch/event_log_retention_days": {
       "label": {

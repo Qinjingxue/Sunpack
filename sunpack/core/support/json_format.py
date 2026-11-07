@@ -1,6 +1,8 @@
 import json
+from io import StringIO
 from pathlib import Path
 from typing import Any
+from sunpack_native import stream_json
 
 from sunpack.core.support.resource_lifecycle import open_task_file
 
@@ -16,8 +18,9 @@ def json_safe(value: Any) -> Any:
 
 
 def to_json_text(value: Any, *, pretty: bool = True) -> str:
-    indent = 2 if pretty else None
-    return json.dumps(json_safe(value), ensure_ascii=False, indent=indent)
+    output = StringIO()
+    stream_json(json_safe(value), output, pretty=pretty)
+    return output.getvalue()
 
 
 def load_json_file(path: Path) -> Any:

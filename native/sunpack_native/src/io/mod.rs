@@ -10,6 +10,7 @@ pub(crate) mod display_wake;
 pub(crate) mod file_generation;
 #[cfg(windows)]
 pub(crate) mod iocp;
+pub(crate) mod json_rows;
 pub(crate) mod read_fault;
 pub(crate) mod reader;
 pub(crate) mod resource_error;

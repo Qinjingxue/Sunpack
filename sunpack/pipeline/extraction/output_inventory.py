@@ -58,7 +58,6 @@ class OutputInventory:
         include_observations: bool = False,
         detail_offset: int = 0,
         detail_limit: int = 128,
-        max_issue_items: int = 20,
         names_only: bool = False,
     ) -> dict[str, Any]:
         return _native_match_output_inventory_coverage(
@@ -69,7 +68,6 @@ class OutputInventory:
             bool(include_observations),
             max(0, int(detail_offset or 0)),
             max(0, int(detail_limit or 0)),
-            max(0, int(max_issue_items or 0)),
             bool(names_only),
         )
 

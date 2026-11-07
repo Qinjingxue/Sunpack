@@ -14,7 +14,10 @@ def normalize_verification_config(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError("verification must be an object")
     # Accept old settings harmlessly; they no longer affect execution.
-    retired = {"max_retries", "cleanup_failed_output", "retry_on_verification_failure"}
+    retired = {
+        "max_retries", "cleanup_failed_output", "retry_on_verification_failure",
+        "complete_accept_threshold", "partial_accept_threshold",
+    }
     unknown = set(value) - set(VERIFICATION_DEFAULTS) - retired
     if unknown:
         raise ValueError(
@@ -22,17 +25,8 @@ def normalize_verification_config(value: Any) -> dict[str, Any]:
         )
     config = {**VERIFICATION_DEFAULTS, **{key: item for key, item in value.items() if key not in retired}}
     config["enabled"] = require_boolean(config["enabled"], "verification.enabled")
-    config["complete_accept_threshold"] = min(1.0, max(0.0, _float_field(config, "complete_accept_threshold")))
-    config["partial_accept_threshold"] = min(1.0, max(0.0, _float_field(config, "partial_accept_threshold")))
     config["methods"] = _normalize_methods(config.get("methods"))
     return config
-
-
-def _float_field(config: dict[str, Any], name: str) -> float:
-    try:
-        return float(config[name])
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"verification.{name} must be a number") from exc
 
 
 def _normalize_methods(value: Any) -> list[dict[str, Any]]:
@@ -48,7 +42,14 @@ def _normalize_methods(value: Any) -> list[dict[str, Any]]:
         if not name:
             raise ValueError(f"verification.methods[{index}].name must not be empty")
         defaults = METHOD_DEFAULTS.get(name, {})
-        normalized = {**defaults, **item}
+        retired = {
+            "manifest_size_match": {
+                "file_count_abs_tolerance", "file_count_ratio_tolerance",
+                "size_abs_tolerance_bytes", "size_ratio_tolerance",
+            },
+            "archive_test_crc": {"max_reported_items"},
+        }.get(name, ())
+        normalized = {**defaults, **{key: value for key, value in item.items() if key not in retired}}
         normalized["name"] = name
         normalized["enabled"] = require_boolean(
             item.get("enabled", True),

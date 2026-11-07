@@ -42,8 +42,6 @@ class VerificationPipeline:
     def __init__(self, config: dict):
         self.config = config
         self.methods = [item for item in config["methods"] if item["enabled"]]
-        self.complete_accept_threshold = config["complete_accept_threshold"]
-        self.partial_accept_threshold = config["partial_accept_threshold"]
 
     def run(
         self,
@@ -181,12 +179,8 @@ class VerificationPipeline:
             assessment_status=assessment_status,
             content_integrity=content_integrity,
             completeness=completeness,
-            recoverable_upper_bound=recoverable_upper_bound,
             decision_hints=decision_hints,
-            complete_accept_threshold=self.complete_accept_threshold,
-            partial_accept_threshold=self.partial_accept_threshold,
-            output_quality_score=output_quality.score,
-            output_confidence=output_quality.confidence,
+            output_file_count=output_quality.file_count,
             evidence_sufficient=evidence_sufficient,
         )
         return VerificationResult(
@@ -810,12 +804,8 @@ def _decision_hint(
     assessment_status: str,
     content_integrity: str,
     completeness: float,
-    recoverable_upper_bound: float,
     decision_hints: list[str],
-    complete_accept_threshold: float,
-    partial_accept_threshold: float,
-    output_quality_score: float = 0.0,
-    output_confidence: float = 0.0,
+    output_file_count: int,
     evidence_sufficient: bool = True,
 ) -> str:
     if DECISION_REQUEST_PASSWORD in decision_hints:
@@ -826,46 +816,19 @@ def _decision_hint(
         if content_integrity in {CONTENT_INTEGRITY_VERIFIED_PARTIAL, CONTENT_INTEGRITY_PAYLOAD_DAMAGED}:
             return DECISION_RETRY_EXTRACT
         return DECISION_FAIL
-    high_output_quality = (
-        output_quality_score >= complete_accept_threshold
-        and output_confidence >= 0.5
-        and completeness >= complete_accept_threshold
-    )
-    output_partial_acceptable = output_quality_score >= partial_accept_threshold and output_confidence >= 0.35
-    if DECISION_ACCEPT_PARTIAL in decision_hints and content_integrity in {
-        CONTENT_INTEGRITY_VERIFIED_PARTIAL,
-        CONTENT_INTEGRITY_PAYLOAD_DAMAGED,
-    } and (
-        (completeness >= partial_accept_threshold and completeness >= min(0.999, recoverable_upper_bound))
-        or output_partial_acceptable
-    ):
-        return DECISION_ACCEPT_PARTIAL
     if (
         assessment_status == ASSESSMENT_COMPLETE
-        and completeness >= complete_accept_threshold
+        and completeness >= 0.999
         and content_integrity in {CONTENT_INTEGRITY_VERIFIED_COMPLETE, CONTENT_INTEGRITY_UNKNOWN}
     ):
         return DECISION_ACCEPT
-    if assessment_status == ASSESSMENT_COMPLETE and content_integrity in {
-        CONTENT_INTEGRITY_VERIFIED_PARTIAL,
-        CONTENT_INTEGRITY_PAYLOAD_DAMAGED,
-    }:
-        if high_output_quality or output_partial_acceptable:
-            return DECISION_ACCEPT_PARTIAL
-        return DECISION_RETRY_EXTRACT
-    for decision in (DECISION_RETRY_EXTRACT, DECISION_ACCEPT_PARTIAL, DECISION_ACCEPT):
+    # Presence is enough for a partial recommendation; the terminal content
+    # policy decides whether the user permits partial results.
+    if output_file_count > 0:
+        return DECISION_ACCEPT_PARTIAL
+    for decision in (DECISION_RETRY_EXTRACT, DECISION_ACCEPT):
         if decision in decision_hints:
             return decision
-    if assessment_status == ASSESSMENT_PARTIAL and content_integrity in {
-        CONTENT_INTEGRITY_VERIFIED_PARTIAL,
-        CONTENT_INTEGRITY_PAYLOAD_DAMAGED,
-    } and (
-        (completeness >= partial_accept_threshold and completeness >= min(0.999, recoverable_upper_bound))
-        or output_partial_acceptable
-    ):
-        return DECISION_ACCEPT_PARTIAL
-    if assessment_status == ASSESSMENT_PARTIAL and output_partial_acceptable:
-        return DECISION_ACCEPT_PARTIAL
     if assessment_status in {ASSESSMENT_PARTIAL, ASSESSMENT_INCONSISTENT}:
         return DECISION_RETRY_EXTRACT
     return DECISION_FAIL

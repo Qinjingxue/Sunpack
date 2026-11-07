@@ -3,6 +3,7 @@ use super::paths::{
 };
 use crate::io::reader::ManagedReader;
 use crate::io::scratch::Slots;
+use crate::io::json_rows::{JsonArrayBuilder, NativeJsonArray};
 use crate::scan::directory::{
     NativeOutputInventory, OutputFileRecord, OutputInventoryVerificationSnapshot,
 };
@@ -29,7 +30,6 @@ const CRC_BUFFER_SIZE: usize = 1024 * 1024;
     include_observations=false,
     detail_offset=0,
     detail_limit=128,
-    max_issue_items=20,
     names_only=false
 ))]
 pub(crate) fn match_output_inventory_coverage(
@@ -41,7 +41,6 @@ pub(crate) fn match_output_inventory_coverage(
     include_observations: bool,
     detail_offset: usize,
     detail_limit: usize,
-    max_issue_items: usize,
     names_only: bool,
 ) -> PyResult<Py<PyDict>> {
     // A native archive manifest is matched straight from its Rust entry table;
@@ -69,7 +68,7 @@ pub(crate) fn match_output_inventory_coverage(
             include_observations,
             detail_offset,
             detail_limit,
-            max_issue_items,
+            !names_only,
         )
     });
     match_result_to_py(py, matched?)
@@ -172,14 +171,21 @@ struct MatchObservation {
     failure_kind: &'static str,
 }
 
-#[derive(Clone)]
-struct Mismatch {
-    path: String,
+#[derive(serde::Serialize)]
+struct Mismatch<'a> {
+    path: &'a str,
     expected_crc32: u32,
     actual_crc32: u32,
 }
 
-#[derive(Clone)]
+#[derive(serde::Serialize)]
+struct SizeMismatch<'a> {
+    path: &'a str,
+    expected_size: u64,
+    actual_size: u64,
+}
+
+#[derive(Clone, serde::Serialize)]
 struct MatchError {
     path: String,
     message: String,
@@ -203,12 +209,12 @@ struct MatchResult {
     coverage: Coverage,
     mismatch_count: usize,
     size_mismatch_count: usize,
-    size_mismatches: Vec<(String, u64, u64)>,
+    size_mismatches: NativeJsonArray,
     missing_count: usize,
-    mismatches: Vec<Mismatch>,
-    missing: Vec<String>,
+    mismatches: NativeJsonArray,
+    missing: NativeJsonArray,
     observations: Vec<MatchObservation>,
-    errors: Vec<MatchError>,
+    errors: NativeJsonArray,
     detail_total: usize,
     detail_offset: usize,
     detail_count: usize,
@@ -358,7 +364,7 @@ fn match_inventory(
     include_observations: bool,
     detail_offset: usize,
     detail_limit: usize,
-    max_issue_items: usize,
+    report_issues: bool,
 ) -> MatchResult {
     match_inventory_source(
         Expected::Items(expected),
@@ -368,7 +374,7 @@ fn match_inventory(
         include_observations,
         detail_offset,
         detail_limit,
-        max_issue_items,
+        report_issues,
     )
     .unwrap()
 }
@@ -381,21 +387,21 @@ fn match_inventory_source(
     include_observations: bool,
     detail_offset: usize,
     detail_limit: usize,
-    max_issue_items: usize,
+    report_issues: bool,
 ) -> io::Result<MatchResult> {
     if !snapshot.exists {
-        return Ok(empty_status_result(
+        return empty_status_result(
             "missing",
             expected.len(),
             detail_offset,
-        ));
+        );
     }
     if !snapshot.is_dir {
-        return Ok(empty_status_result(
+        return empty_status_result(
             "not_directory",
             expected.len(),
             detail_offset,
-        ));
+        );
     }
 
     let index = OutputIndex::new(&snapshot)?;
@@ -404,13 +410,13 @@ fn match_inventory_source(
     coverage.expected_files = expected.len();
 
     let detail_end = detail_offset.saturating_add(detail_limit);
-    let mut mismatches = Vec::with_capacity(max_issue_items.min(expected.len()));
-    let mut missing = Vec::with_capacity(max_issue_items.min(expected.len()));
+    let mut mismatches = JsonArrayBuilder::default();
+    let mut missing = JsonArrayBuilder::default();
     let mut observations = Vec::with_capacity(detail_limit.min(expected.len()));
-    let mut errors = Vec::new();
+    let mut errors = JsonArrayBuilder::default();
     let mut mismatch_count = 0usize;
     let mut size_mismatch_count = 0usize;
-    let mut size_mismatches = Vec::new();
+    let mut size_mismatches = JsonArrayBuilder::default();
     let mut missing_count = 0usize;
     // Allocate once, only after a matched file actually needs a disk CRC read.
     // Worker CRC, disabled CRC, missing/failed/unwritten outputs need no buffer.
@@ -463,8 +469,8 @@ fn match_inventory_source(
         let Some((output_index, matched_by)) = matched else {
             coverage.missing_files += 1;
             missing_count += 1;
-            if missing.len() < max_issue_items {
-                missing.push(item.path.clone().into_owned());
+            if report_issues {
+                missing.push(&item.path)?;
             }
             if emit {
                 observations.push(MatchObservation {
@@ -514,13 +520,13 @@ fn match_inventory_source(
                         }
                     }
                     Err(error) => {
-                        if errors.len() < max_issue_items {
-                            errors.push(error);
+                        if report_issues {
+                            errors.push(&error)?;
                         }
                         coverage.missing_files += 1;
                         missing_count += 1;
-                        if missing.len() < max_issue_items {
-                            missing.push(item.path.clone().into_owned());
+                        if report_issues {
+                            missing.push(&item.path)?;
                         }
                         if emit {
                             observations.push(MatchObservation {
@@ -573,23 +579,23 @@ fn match_inventory_source(
         } else if verify_crc && item.has_crc && crc_ok == Some(false) {
             coverage.failed_files += 1;
             mismatch_count += 1;
-            if mismatches.len() < max_issue_items {
-                mismatches.push(Mismatch {
-                    path: item.path.clone().into_owned(),
+            if report_issues {
+                mismatches.push(&Mismatch {
+                    path: item.path.as_ref(),
                     expected_crc32: item.crc32.unwrap_or(0),
                     actual_crc32: actual_crc.unwrap_or(0),
-                });
+                })?;
             }
             ("failed", Some(0.0))
         } else if size_excess {
             coverage.failed_files += 1;
             size_mismatch_count += 1;
-            if size_mismatches.len() < max_issue_items {
-                size_mismatches.push((
-                    item.path.clone().into_owned(),
-                    item.size.unwrap_or(0),
+            if report_issues {
+                size_mismatches.push(&SizeMismatch {
+                    path: item.path.as_ref(),
+                    expected_size: item.size.unwrap_or(0),
                     actual_size,
-                ));
+                })?;
             }
             ("failed", Some(0.0))
         } else if size_incomplete {
@@ -638,12 +644,12 @@ fn match_inventory_source(
         coverage,
         mismatch_count,
         size_mismatch_count,
-        size_mismatches,
+        size_mismatches: size_mismatches.finish()?,
         missing_count,
-        mismatches,
-        missing,
+        mismatches: mismatches.finish()?,
+        missing: missing.finish()?,
         observations,
-        errors,
+        errors: errors.finish()?,
         detail_total,
         detail_offset: detail_offset.min(detail_total),
         detail_count,
@@ -658,8 +664,8 @@ fn empty_status_result(
     status: &'static str,
     detail_total: usize,
     detail_offset: usize,
-) -> MatchResult {
-    MatchResult {
+) -> io::Result<MatchResult> {
+    Ok(MatchResult {
         status,
         coverage: Coverage {
             expected_files: detail_total,
@@ -667,19 +673,19 @@ fn empty_status_result(
         },
         mismatch_count: 0,
         size_mismatch_count: 0,
-        size_mismatches: Vec::new(),
+        size_mismatches: JsonArrayBuilder::default().finish()?,
         missing_count: 0,
-        mismatches: Vec::new(),
-        missing: Vec::new(),
+        mismatches: JsonArrayBuilder::default().finish()?,
+        missing: JsonArrayBuilder::default().finish()?,
         observations: Vec::new(),
-        errors: Vec::new(),
+        errors: JsonArrayBuilder::default().finish()?,
         detail_total,
         detail_offset: detail_offset.min(detail_total),
         detail_count: 0,
         detail_truncated: false,
         used_worker_crc: false,
         crc_files_read: 0,
-    }
+    })
 }
 
 fn match_result_to_py(py: Python<'_>, matched: MatchResult) -> PyResult<Py<PyDict>> {
@@ -688,15 +694,7 @@ fn match_result_to_py(py: Python<'_>, matched: MatchResult) -> PyResult<Py<PyDic
     result.set_item("coverage", coverage_to_py(py, &matched.coverage)?)?;
     result.set_item("mismatch_count", matched.mismatch_count)?;
     result.set_item("size_mismatch_count", matched.size_mismatch_count)?;
-    let size_mismatches = PyList::empty(py);
-    for (path, expected, actual) in matched.size_mismatches {
-        let row = PyDict::new(py);
-        row.set_item("path", path)?;
-        row.set_item("expected_size", expected)?;
-        row.set_item("actual_size", actual)?;
-        size_mismatches.append(row)?;
-    }
-    result.set_item("size_mismatches", size_mismatches)?;
+    result.set_item("size_mismatches", matched.size_mismatches)?;
     result.set_item("missing_count", matched.missing_count)?;
     result.set_item("used_worker_crc", matched.used_worker_crc)?;
     result.set_item("crc_files_read", matched.crc_files_read)?;
@@ -705,21 +703,8 @@ fn match_result_to_py(py: Python<'_>, matched: MatchResult) -> PyResult<Py<PyDic
     result.set_item("detail_count", matched.detail_count)?;
     result.set_item("detail_truncated", matched.detail_truncated)?;
 
-    let mismatches = PyList::empty(py);
-    for item in matched.mismatches {
-        let row = PyDict::new(py);
-        row.set_item("path", item.path)?;
-        row.set_item("expected_crc32", item.expected_crc32)?;
-        row.set_item("actual_crc32", item.actual_crc32)?;
-        mismatches.append(row)?;
-    }
-    result.set_item("mismatches", mismatches)?;
-
-    let missing = PyList::empty(py);
-    for path in matched.missing {
-        missing.append(path)?;
-    }
-    result.set_item("missing", missing)?;
+    result.set_item("mismatches", matched.mismatches)?;
+    result.set_item("missing", matched.missing)?;
 
     let observations = PyList::empty(py);
     for item in matched.observations {
@@ -727,14 +712,7 @@ fn match_result_to_py(py: Python<'_>, matched: MatchResult) -> PyResult<Py<PyDic
     }
     result.set_item("observations", observations)?;
 
-    let errors = PyList::empty(py);
-    for item in matched.errors {
-        let row = PyDict::new(py);
-        row.set_item("path", item.path)?;
-        row.set_item("message", item.message)?;
-        errors.append(row)?;
-    }
-    result.set_item("errors", errors)?;
+    result.set_item("errors", matched.errors)?;
     result.set_item("source", "native_output_inventory")?;
     Ok(result.unbind())
 }
@@ -1072,6 +1050,12 @@ mod windows_output_name_tests {
         std::fs::remove_file(path).unwrap();
     }
 
+    fn missing_paths(result: &MatchResult) -> Vec<String> {
+        let mut encoded = Vec::new();
+        result.missing.write_json(&mut encoded, &crate::io::cancellation::Cancellation::default()).unwrap();
+        serde_json::from_slice(&encoded).unwrap()
+    }
+
     fn bug_regression_match(
         expected: &[(&str, u32)],
         actual: &[(&str, u32)],
@@ -1119,7 +1103,7 @@ mod windows_output_name_tests {
             true,
             0,
             128,
-            20,
+            true,
         )
     }
 
@@ -1148,7 +1132,7 @@ mod windows_output_name_tests {
             &[("b/readme.txt", 200)],
             BasenameMode::Any,
         );
-        assert_eq!(result.missing, vec!["a/readme.txt"]);
+        assert_eq!(missing_paths(&result), vec!["a/readme.txt"]);
         assert_eq!(result.mismatch_count, 0);
         assert_eq!(result.coverage.complete_files, 1);
     }
@@ -1182,7 +1166,7 @@ mod windows_output_name_tests {
         actual.push(expected[0]);
         let result = bug_regression_match(&expected, &actual, BasenameMode::None);
         assert_eq!(result.coverage.complete_files, 63);
-        assert_eq!(result.missing, vec![names[0].clone()]);
+        assert_eq!(missing_paths(&result), vec![names[0].clone()]);
         assert_eq!(result.mismatch_count, 0);
     }
 

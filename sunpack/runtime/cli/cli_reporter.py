@@ -1,35 +1,14 @@
-import json
 import sys
 from dataclasses import fields
+from sunpack_native import stream_json
 
 from sunpack.runtime.cli.cli_types import CliCommandResult
 from sunpack.core.support.json_format import json_safe
 
 
-_JSON_WRITE_CHARS = 64 * 1024
-
-
 def _write_json_result(payload, output):
-    chunks = []
-    buffered_chars = 0
-    encoder = json.JSONEncoder(ensure_ascii=False, indent=2)
-    for token in encoder.iterencode(json_safe(payload)):
-        token_size = len(token)
-        if token_size >= _JSON_WRITE_CHARS:
-            if chunks:
-                output.write("".join(chunks))
-                chunks.clear()
-                buffered_chars = 0
-            output.write(token)
-        else:
-            chunks.append(token)
-            buffered_chars += token_size
-            if buffered_chars >= _JSON_WRITE_CHARS:
-                output.write("".join(chunks))
-                chunks.clear()
-                buffered_chars = 0
-    chunks.append("\n")
-    output.write("".join(chunks))
+    stream_json(json_safe(payload), output, pretty=True)
+    output.write("\n")
     output.flush()
 
 

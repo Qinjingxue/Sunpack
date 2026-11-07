@@ -47,6 +47,8 @@ fn sunpack_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(native_available, m)?)?;
     m.add_function(wrap_pyfunction!(failure_report::append_failure_report, m)?)?;
     m.add_function(wrap_pyfunction!(failure_report::publish_failure_report, m)?)?;
+    m.add_function(wrap_pyfunction!(failure_report::stream_json, m)?)?;
+    m.add_class::<io::json_rows::NativeJsonArray>()?;
     m.add_function(wrap_pyfunction!(password::lists::read_password_file, m)?)?;
     m.add_function(wrap_pyfunction!(
         io::resource_lifecycle::read_shared_utf8_text,

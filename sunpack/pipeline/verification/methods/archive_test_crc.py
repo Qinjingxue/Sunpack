@@ -15,7 +15,6 @@ from sunpack.pipeline.verification.methods._output_stats import output_inventory
 from sunpack.pipeline.verification.registry import register_verification_method
 from sunpack.core.contracts.verification import (
     DECISION_RETRY_EXTRACT,
-    FileVerificationObservation,
     CONTENT_INTEGRITY_PAYLOAD_DAMAGED,
     CONTENT_INTEGRITY_UNKNOWN,
     CONTENT_INTEGRITY_VERIFIED_COMPLETE,
@@ -46,7 +45,6 @@ class ArchiveTestCrcMethod:
                 return _verified_manifest_result(self.name, archive_manifest, inventory)
             return VerificationStep(method=self.name, status="skipped")
 
-        max_reported_items = config["max_reported_items"]
         emit_observations = should_emit_file_observations(evidence, self.name)
         detail_limit = (
             min(retained, 128)
@@ -61,25 +59,31 @@ class ArchiveTestCrcMethod:
             basename_mode="unique",
             include_observations=emit_observations,
             detail_limit=detail_limit,
-            max_issue_items=max_reported_items,
         )
 
         status = str(match_result.get("status") or "")
         if status != "ok":
             return VerificationStep(method=self.name, status="skipped")
 
-        mismatches = list(match_result.get("mismatches") or [])
-        missing = list(match_result.get("missing") or [])
-        mismatch_count = int(match_result.get("mismatch_count", len(mismatches)) or 0)
-        size_mismatches = list(match_result.get("size_mismatches") or [])
+        mismatches = match_result["mismatches"]
+        missing = match_result["missing"]
+        mismatch_count = int(match_result["mismatch_count"])
+        size_mismatches = match_result["size_mismatches"]
         size_mismatch_count = int(match_result.get("size_mismatch_count", 0) or 0)
-        missing_count = int(match_result.get("missing_count", len(missing)) or 0)
+        missing_count = int(match_result["missing_count"])
         coverage = dict(match_result.get("coverage") or {})
         if mismatch_count == 0 and size_mismatch_count == 0 and missing_count == 0:
             coverage = _promote_verified_manifest_coverage(coverage, archive_manifest, inventory)
-        issue_by_path: dict[str, list[VerificationIssue]] = {}
 
         issues: list[VerificationIssue] = []
+        if match_result["errors"]:
+            issues.append(VerificationIssue(
+                method=self.name,
+                code="fail.archive_output_read_error",
+                message="Some output files could not be read for verification",
+                path=evidence.output_dir,
+                actual=match_result["errors"],
+            ))
         if size_mismatch_count:
             issue = VerificationIssue(
                 method=self.name,
@@ -90,8 +94,6 @@ class ArchiveTestCrcMethod:
                 actual=size_mismatches,
             )
             issues.append(issue)
-            for item in size_mismatches:
-                issue_by_path.setdefault(str(item.get("path") or ""), []).append(issue)
         if mismatch_count:
             issue = VerificationIssue(
                 method=self.name,
@@ -102,8 +104,6 @@ class ArchiveTestCrcMethod:
                 actual=mismatches,
             )
             issues.append(issue)
-            for item in mismatches:
-                issue_by_path.setdefault(str(item.get("path") or ""), []).append(issue)
         if missing_count:
             issue = VerificationIssue(
                 method=self.name,
@@ -114,27 +114,8 @@ class ArchiveTestCrcMethod:
                 actual=missing,
             )
             issues.append(issue)
-            for path in missing:
-                issue_by_path.setdefault(str(path), []).append(issue)
 
         observations = coverage_result.observations
-        if issue_by_path and observations:
-            observations = [
-                FileVerificationObservation(
-                    path=item.path,
-                    archive_path=item.archive_path,
-                    state=item.state,
-                    method=item.method,
-                    bytes_written=item.bytes_written,
-                    expected_size=item.expected_size,
-                    progress=item.progress,
-                    crc_expected=item.crc_expected,
-                    crc_actual=item.crc_actual,
-                    issues=list(issue_by_path.get(item.archive_path) or item.issues),
-                    details=dict(item.details),
-                )
-                for item in observations
-            ]
         completeness = _coverage_float(coverage, "completeness", 1.0)
         content_integrity = _content_integrity(
             archive_manifest,

@@ -6,6 +6,8 @@ from sunpack_native import complete_progress_manifest
 
 import sunpack.pipeline.verification.archive_input_manifest as archive_input_manifest_module
 from sunpack.core.contracts.extraction import ExtractionResult
+from sunpack.core.contracts.content_recovery import ContentRecoveryPolicy
+from sunpack.core.contracts.results import OutcomeKind
 from sunpack.pipeline.extraction.output_inventory import OutputInventory
 from sunpack.pipeline.verification import VerificationScheduler
 from tests.helpers.archive_tasks import make_archive_task
@@ -92,38 +94,46 @@ def test_manifest_named_payload_is_not_loaded_as_verification_state(tmp_path):
     assert verification.output_total_bytes == payload.stat().st_size
 
 
-def test_manifest_size_match_reports_complete_when_expected_size_matches(tmp_path):
-    task = _zip_task(tmp_path, {"a.txt": "hello"})
+@pytest.mark.parametrize("source, payload, extra, codes", [
+    ("hello", "hello", False, set()),
+    ("hello", "hell", False, {"fail.manifest_size_under"}),
+    ("hello", "hello!", False, {"warning.manifest_size_over"}),
+    ("hello", "hello", True, {"warning.manifest_file_count_over"}),
+    ("", "x", False, {"warning.manifest_size_over"}),
+])
+def test_manifest_size_match_compares_exact_counts_and_bytes(tmp_path, source, payload, extra, codes):
+    # Large-gap tests cannot detect the former absolute/ratio tolerances hiding
+    # a one-byte change or one extra empty file. One source covers all branches.
+    task = _zip_task(tmp_path, {"a.txt": source})
     out_dir = tmp_path / "out"
     out_dir.mkdir()
-    (out_dir / "a.txt").write_text("hello", encoding="utf-8")
+    (out_dir / "a.txt").write_text(payload, encoding="utf-8")
+    if extra:
+        (out_dir / "extra.txt").touch()
     result = ExtractionResult(success=True, out_dir=str(out_dir))
 
     verification = _scheduler([{"name": "manifest_size_match"}]).verify(task, result)
 
-    assert verification.decision_hint == "accept"
-    assert verification.assessment_status == "complete"
-    assert verification.completeness == 1.0
+    assert {issue.code for issue in verification.issues} == codes
+    assert verification.decision_hint == ("accept_partial" if "fail.manifest_size_under" in codes else "accept")
 
 
-def test_manifest_size_match_reports_retry_for_large_manifest_gap(tmp_path):
+@pytest.mark.parametrize("payload", ["", "x"], ids=["zero-byte-file", "tiny-file"])
+def test_manifest_size_match_reports_partial_for_large_manifest_gap(tmp_path, payload):
     task = _zip_task(tmp_path, {f"file-{index}.txt": "x" * 10 for index in range(10)})
     out_dir = tmp_path / "out"
     out_dir.mkdir()
-    (out_dir / "file-0.txt").write_text("x", encoding="utf-8")
+    (out_dir / "file-0.txt").write_text(payload, encoding="utf-8")
     result = ExtractionResult(success=True, out_dir=str(out_dir))
 
-    verification = _scheduler([{
-        "name": "manifest_size_match",
-        "file_count_abs_tolerance": 0,
-        "file_count_ratio_tolerance": 0.0,
-        "size_abs_tolerance_bytes": 0,
-        "size_ratio_tolerance": 0.0,
-    }]).verify(task, result)
+    verification = _scheduler([{"name": "manifest_size_match"}]).verify(task, result)
 
-    assert verification.decision_hint == "retry_extract"
+    assert verification.decision_hint == "accept_partial"
     assert verification.assessment_status == "partial"
     assert verification.completeness < 1.0
+    assert verification.output_file_count == 1
+    assert ContentRecoveryPolicy("allow_partial").decide(result, verification).outcome_kind == OutcomeKind.PARTIAL_SUCCESS
+    assert ContentRecoveryPolicy("complete").decide(result, verification).rejected_partial_output
     assert {issue.code for issue in verification.issues} == {
         "fail.manifest_named_files_missing",
         "fail.manifest_file_count_under",
@@ -142,7 +152,7 @@ def test_manifest_size_match_reports_missing_entries(tmp_path):
         [{"name": "manifest_size_match"}]
     ).verify(task, result)
 
-    assert verification_result.decision_hint == "retry_extract"
+    assert verification_result.decision_hint == "accept_partial"
     assert verification_result.missing_files == 2
     assert verification_result.issues[0].code == "fail.manifest_named_files_missing"
 
@@ -162,7 +172,7 @@ def test_archive_test_crc_compares_archive_state_manifest_to_output_files(tmp_pa
 
     verification = _scheduler([{"name": "archive_test_crc"}]).verify(task, result)
 
-    assert verification.decision_hint == "retry_extract"
+    assert verification.decision_hint == "accept_partial"
     assert verification.complete_files == 1
     assert verification.failed_files == 1
     assert verification.missing_files == 1

@@ -6,6 +6,9 @@ from sunpack.core.contracts.verification import (
     CONTENT_INTEGRITY_UNKNOWN,
     DECISION_ACCEPT,
     DECISION_ACCEPT_PARTIAL,
+    DECISION_FAIL,
+    DECISION_REQUEST_PASSWORD,
+    DECISION_RETRY_EXTRACT,
     ArchiveCoverage,
     FileVerificationObservation,
 )
@@ -22,24 +25,26 @@ def _evidence(output_dir):
     )
 
 
-def test_unverified_content_decision_uses_completeness_and_recoverable_output(subtests):
-    for status, completeness, upper_bound, quality, confidence, expected in (
-        (ASSESSMENT_COMPLETE, 1.0, 1.0, 1.0, 0.8, DECISION_ACCEPT),
-        (ASSESSMENT_COMPLETE, 1.0, 1.0, 0.0, 0.0, DECISION_ACCEPT),
-        (ASSESSMENT_COMPLETE, 1.0, 0.99, 0.82, 0.35, DECISION_ACCEPT),
-        ("partial", 0.0, 1.0, 0.7, 0.8, DECISION_ACCEPT_PARTIAL),
+def test_acceptance_uses_complete_evidence_or_any_output_file(subtests):
+    # Quality-score tests cannot detect an acceptance gate rejecting a tiny or
+    # zero-byte recovered file, or accepting phantom output from a method hint.
+    for status, completeness, files, hints, expected in (
+        (ASSESSMENT_COMPLETE, 1.0, 1, [], DECISION_ACCEPT),
+        (ASSESSMENT_COMPLETE, 0.999, 1, [], DECISION_ACCEPT),
+        (ASSESSMENT_COMPLETE, 0.998, 1, [], DECISION_ACCEPT_PARTIAL),
+        ("partial", 0.000001, 1, [DECISION_RETRY_EXTRACT], DECISION_ACCEPT_PARTIAL),
+        ("unusable", 0.0, 1, [], DECISION_ACCEPT_PARTIAL),
+        ("partial", 0.0, 0, [DECISION_ACCEPT_PARTIAL], DECISION_RETRY_EXTRACT),
+        ("partial", 0.1, 1, [DECISION_REQUEST_PASSWORD], DECISION_REQUEST_PASSWORD),
+        ("partial", 0.1, 1, [DECISION_FAIL], DECISION_FAIL),
     ):
-        with subtests.test(status=status, quality=quality):
+        with subtests.test(status=status, completeness=completeness, files=files, hints=hints):
             assert _decision_hint(
                 assessment_status=status,
                 content_integrity=CONTENT_INTEGRITY_UNKNOWN,
                 completeness=completeness,
-                recoverable_upper_bound=upper_bound,
-                decision_hints=[],
-                complete_accept_threshold=0.999,
-                partial_accept_threshold=0.2,
-                output_quality_score=quality,
-                output_confidence=confidence,
+                decision_hints=hints,
+                output_file_count=files,
             ) == expected
 
 
