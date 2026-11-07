@@ -188,7 +188,7 @@ class WatchToastCoordinator:
         watch = config["watch"]
         self.host = host
         self.i18n = I18nContext(config.get("cli", {}).get("language") if isinstance(config.get("cli"), dict) else None)
-        self._debounce_seconds = max(0.0, int(watch.get("toast_completion_debounce_ms", 800)) / 1000.0)
+        self._debounce_seconds = 0.8
         self._lock = threading.RLock()
         self._requests: dict[str, _RequestProgress] = {}
         self._batch = _BatchProgress()

@@ -91,7 +91,7 @@ def test_session_analysis_view_preserves_cache_budget_and_eof_semantics(tmp_path
     path = tmp_path / "analysis-view.bin"
     path.write_bytes(b"abcdefgh")
     session = get_archive_session(os.fspath(path))
-    view = session.analysis_view(cache_bytes=8, max_concurrent_reads=1)
+    view = session.analysis_view(cache_bytes=8)
 
     assert bytes(view.read_at(0, 4)) == b"abcd"
     assert bytes(view.read_at(0, 4)) == b"abcd"

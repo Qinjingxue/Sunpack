@@ -51,14 +51,13 @@ class _Host:
             ]
 
 
-def _config(*, language="en", debounce_ms=20):
-    return {
+def _coordinator(host, state_dir, *, language="en", debounce_ms=20):
+    coordinator = WatchToastCoordinator(host, {
         "cli": {"language": language},
-        "watch": {
-            "toast_completion_debounce_ms": debounce_ms,
-            "toast_report_retention_days": 30,
-        },
-    }
+        "watch": {"toast_report_retention_days": 30},
+    }, state_dir)
+    coordinator._debounce_seconds = debounce_ms / 1000.0
+    return coordinator
 
 
 def _task(path):
@@ -89,7 +88,7 @@ def test_stop_targets_only_current_batch_and_reports_cleanup_truthfully(tmp_path
     # Normal success/failure aggregation cannot cover stale activation, repeated
     # stop, or falsely claiming rollback succeeded. One batch covers all three.
     host = _Host()
-    coordinator = WatchToastCoordinator(host, _config(language=language), str(tmp_path / "state"))
+    coordinator = _coordinator(host, str(tmp_path / "state"), language=language)
     try:
         coordinator.submitted("active", str(tmp_path / "active.zip"))
         coordinator.submitted("scanning", str(tmp_path / "scanning.zip"))
@@ -129,7 +128,7 @@ def test_arrivals_during_stop_keep_controls_and_allow_finalization(tmp_path, lat
     # arrival order catches inherited stop UI and a final invisible retirement.
     # Reuse one small coordinator lifecycle, with no polling or fixed sleeps.
     host = _Host()
-    coordinator = WatchToastCoordinator(host, _config(), str(tmp_path / "state"))
+    coordinator = _coordinator(host, str(tmp_path / "state"))
     try:
         first, late = _task(tmp_path / "first.zip"), _task(tmp_path / "late.zip")
         coordinator.submitted("first", first.main_path)
@@ -157,7 +156,7 @@ def test_arrivals_during_stop_keep_controls_and_allow_finalization(tmp_path, lat
 
 def test_aggregate_progress_regresses_when_a_new_archive_joins(tmp_path):
     host = _Host()
-    coordinator = WatchToastCoordinator(host, _config(), str(tmp_path / "state"))
+    coordinator = _coordinator(host, str(tmp_path / "state"))
     first = _task(tmp_path / "first.zip")
     second = _task(tmp_path / "second.zip")
     coordinator.submitted("first", str(first.main_path))
@@ -184,8 +183,7 @@ def test_busy_batch_spools_complete_failure_details_and_releases_payloads(tmp_pa
     # A continuously active request prevents finalization. Normal drained-batch
     # tests miss retention and repeated progress scans of completed payloads.
     host = _Host()
-    config = _config(debounce_ms=60_000)
-    coordinator = WatchToastCoordinator(host, config, str(tmp_path / "state"))
+    coordinator = _coordinator(host, str(tmp_path / "state"), debounce_ms=60_000)
     active = _task(tmp_path / "active.zip")
     coordinator.submitted("active", active.main_path)
     _ready(coordinator, "active", active)
@@ -236,7 +234,7 @@ def test_busy_batch_spools_complete_failure_details_and_releases_payloads(tmp_pa
 ])
 def test_disk_full_toast_shows_recovery_hint_and_resumes(tmp_path, language, title, hint):
     host = _Host()
-    coordinator = WatchToastCoordinator(host, _config(language=language), str(tmp_path / "state"))
+    coordinator = _coordinator(host, str(tmp_path / "state"), language=language)
     task = _task(tmp_path / "first.zip")
     coordinator.submitted("first", task.main_path)
     # A full output volume can block before the first extract_started event.
@@ -266,7 +264,7 @@ def test_space_waits_are_released_for_every_request_exit(tmp_path):
     # visible pause. Check the real notification and ownership, not a side index.
     for finish in ("suppressed", "aborted", "failed", "succeeded", "interrupted", "replaced", "stop"):
         host = _Host()
-        coordinator = WatchToastCoordinator(host, _config(), str(tmp_path / "state"))
+        coordinator = _coordinator(host, str(tmp_path / "state"))
         tasks = {}
         for key in ("first", "second"):
             task = tasks[key] = _task(tmp_path / f"{key}.zip")
@@ -300,7 +298,7 @@ def test_space_waits_are_released_for_every_request_exit(tmp_path):
 
 def test_concurrent_requests_emit_one_unified_success_after_debounce(tmp_path):
     host = _Host()
-    coordinator = WatchToastCoordinator(host, _config(debounce_ms=30), str(tmp_path / "state"))
+    coordinator = _coordinator(host, str(tmp_path / "state"), debounce_ms=30)
     output_root = tmp_path / "out"
     first_output = output_root / "first"
     second_output = output_root / "second"
@@ -331,7 +329,7 @@ def test_concurrent_requests_emit_one_unified_success_after_debounce(tmp_path):
 
 def test_batch_id_is_stable_through_final_and_unique_per_batch(tmp_path):
     host = _Host()
-    coordinator = WatchToastCoordinator(host, _config(debounce_ms=0), str(tmp_path / "state"))
+    coordinator = _coordinator(host, str(tmp_path / "state"), debounce_ms=0)
 
     first = _task(tmp_path / "first.zip")
     coordinator.submitted("first", str(first.main_path))
@@ -353,7 +351,7 @@ def test_batch_id_is_stable_through_final_and_unique_per_batch(tmp_path):
 
 def test_new_ready_request_cancels_pending_finalization(tmp_path):
     host = _Host()
-    coordinator = WatchToastCoordinator(host, _config(debounce_ms=60), str(tmp_path / "state"))
+    coordinator = _coordinator(host, str(tmp_path / "state"), debounce_ms=60)
     first = _task(tmp_path / "first.zip")
     second = _task(tmp_path / "second.zip")
     coordinator.submitted("first", str(first.main_path))
@@ -376,7 +374,7 @@ def test_new_ready_request_cancels_pending_finalization(tmp_path):
 
 def test_mixed_batch_exposes_output_and_aggregate_failure_report(tmp_path):
     host = _Host()
-    coordinator = WatchToastCoordinator(host, _config(), str(tmp_path / "state"))
+    coordinator = _coordinator(host, str(tmp_path / "state"))
     output = tmp_path / "out" / "good"
     output.mkdir(parents=True)
     good = _task(tmp_path / "good.zip")
@@ -402,7 +400,7 @@ def test_mixed_batch_exposes_output_and_aggregate_failure_report(tmp_path):
 
 def test_password_or_missing_volume_suppression_never_creates_a_final_toast(tmp_path):
     host = _Host()
-    coordinator = WatchToastCoordinator(host, _config(), str(tmp_path / "state"))
+    coordinator = _coordinator(host, str(tmp_path / "state"))
     coordinator.submitted("password", str(tmp_path / "locked.rar"))
     coordinator.suppressed("password")
     time.sleep(0.04)
@@ -432,7 +430,7 @@ def test_password_or_missing_volume_suppression_never_creates_a_final_toast(tmp_
 
 def test_failure_toast_does_not_interpret_nested_scope(tmp_path):
     host = _Host()
-    coordinator = WatchToastCoordinator(host, _config(language="zh", debounce_ms=0), str(tmp_path / "state"))
+    coordinator = _coordinator(host, str(tmp_path / "state"), language="zh", debounce_ms=0)
     task = _task(tmp_path / "nested-inner.7z.001")
     coordinator.submitted("request", str(tmp_path / "outer.zip"))
     _ready(coordinator, "request", task)
@@ -457,7 +455,7 @@ def test_failure_toast_does_not_interpret_nested_scope(tmp_path):
 
 def test_extract_ready_stays_invisible_until_native_extract_started(tmp_path):
     host = _Host()
-    coordinator = WatchToastCoordinator(host, _config(debounce_ms=0), str(tmp_path / "state"))
+    coordinator = _coordinator(host, str(tmp_path / "state"), debounce_ms=0)
     task = _task(tmp_path / "archive.zip")
     coordinator.submitted("request", str(task.main_path))
 
@@ -481,7 +479,7 @@ def test_extract_ready_stays_invisible_until_native_extract_started(tmp_path):
 
 def test_invisible_failure_does_not_create_a_final_toast(tmp_path):
     host = _Host()
-    coordinator = WatchToastCoordinator(host, _config(debounce_ms=0), str(tmp_path / "state"))
+    coordinator = _coordinator(host, str(tmp_path / "state"), debounce_ms=0)
     coordinator.submitted("request", str(tmp_path / "outer.zip"))
     coordinator.failed("request", ["failure"], [{"kind": "unknown"}])
     time.sleep(0.04)
@@ -491,7 +489,7 @@ def test_invisible_failure_does_not_create_a_final_toast(tmp_path):
 
 def test_failure_toast_links_to_unique_localized_aggregate_report(tmp_path):
     host = _Host()
-    coordinator = WatchToastCoordinator(host, _config(language="zh"), str(tmp_path / "state"))
+    coordinator = _coordinator(host, str(tmp_path / "state"), language="zh")
     task = _task(tmp_path / "broken.zip")
     coordinator.submitted("broken", str(task.main_path))
     _ready(coordinator, "broken", task)
@@ -523,7 +521,7 @@ def test_overlapping_resource_waits_clear_independently(tmp_path, language, sepa
     # A batch can wait on different resources in different requests. Verify the
     # aggregate stays paused until the last reason clears, including task exit.
     host = _Host()
-    coordinator = WatchToastCoordinator(host, _config(language=language), str(tmp_path / "state"))
+    coordinator = _coordinator(host, str(tmp_path / "state"), language=language)
     tasks = {"memory": _task(tmp_path / "first.7z"), "space": _task(tmp_path / "second.zip")}
     requests = {"memory": "first", "space": "second" if separate_requests else "first"}
     if not separate_requests:
@@ -603,7 +601,7 @@ def test_stop_discards_report_spool_and_failed_storage_does_not_link_partial_rep
     # The drained success path cannot catch spool leaks on stop or misleading
     # report links after an append error. No waits or platform resources needed.
     host = _Host()
-    coordinator = WatchToastCoordinator(host, _config(debounce_ms=60_000), str(tmp_path))
+    coordinator = _coordinator(host, str(tmp_path), debounce_ms=60_000)
     task = _task(tmp_path / "failed.zip")
     coordinator.submitted("failed", task.main_path)
     _ready(coordinator, "failed", task)
@@ -628,7 +626,7 @@ def test_blocked_report_append_keeps_progress_and_stop_responsive(tmp_path, monk
     # drained timer publish incomplete diagnostics; stop delegates their cleanup.
     from concurrent.futures import ThreadPoolExecutor
 
-    coordinator = WatchToastCoordinator(_Host(), _config(debounce_ms=60_000), str(tmp_path))
+    coordinator = _coordinator(_Host(), str(tmp_path), debounce_ms=60_000)
     entered, release = threading.Event(), threading.Event()
     append = coordinator.report_store.append_failure
 
@@ -672,7 +670,7 @@ def test_finalizing_report_cannot_publish_over_new_activity(tmp_path, monkeypatc
     # activity during the disk copy and catches stale toasts/source deletion.
     from concurrent.futures import ThreadPoolExecutor
 
-    coordinator = WatchToastCoordinator(_Host(), _config(debounce_ms=60_000), str(tmp_path))
+    coordinator = _coordinator(_Host(), str(tmp_path), debounce_ms=60_000)
     first, second = _task(tmp_path / "first.zip"), _task(tmp_path / "second.zip")
     coordinator.submitted("first", first.main_path)
     _ready(coordinator, "first", first)
@@ -726,7 +724,7 @@ def test_finalizing_report_cannot_publish_over_new_activity(tmp_path, monkeypatc
 def test_serialization_failure_or_cancellation_never_links_partial_report(tmp_path, monkeypatch, cancelled):
     import asyncio
 
-    coordinator = WatchToastCoordinator(_Host(), _config(debounce_ms=60_000), str(tmp_path))
+    coordinator = _coordinator(_Host(), str(tmp_path), debounce_ms=60_000)
     task = _task(tmp_path / "failed.zip")
     coordinator.submitted("failed", task.main_path)
     _ready(coordinator, "failed", task)
@@ -756,7 +754,7 @@ def test_concurrent_failure_appends_publish_only_after_both_writers_drain(tmp_pa
     from concurrent.futures import ThreadPoolExecutor
 
     host = _Host()
-    coordinator = WatchToastCoordinator(host, _config(debounce_ms=60_000), str(tmp_path))
+    coordinator = _coordinator(host, str(tmp_path), debounce_ms=60_000)
     for request_id in ("first", "second"):
         task = _task(tmp_path / (request_id + ".zip"))
         coordinator.submitted(request_id, task.main_path)

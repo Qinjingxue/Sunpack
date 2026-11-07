@@ -76,16 +76,10 @@ class AnalysisEngine:
         return _report_from_native(report_path or view.path, native)
 
     def _build_single_view(self, path: str) -> SharedBinaryView:
-        return SharedBinaryView(
-            path,
-            max_concurrent_reads=int(self.config.get("max_concurrent_reads", 1) or 1),
-        )
+        return SharedBinaryView(path)
 
     def _build_multi_volume_view(self, paths) -> MultiVolumeBinaryView:
-        return MultiVolumeBinaryView(
-            paths,
-            max_concurrent_reads=int(self.config.get("max_concurrent_reads", 1) or 1),
-        )
+        return MultiVolumeBinaryView(paths)
 
 
 def _report_from_native(path: str, native: dict) -> ArchiveAnalysisReport:

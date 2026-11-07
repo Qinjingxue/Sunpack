@@ -3073,7 +3073,7 @@ int wmain(int argc,wchar_t** argv) {
             assert(ui_debug_key(app.window(),VK_RETURN)==0);
             pump([&]{return state(app.page(),"saveErrors").contains("/watch/clipboard_builtin_max_entries") && !state(app.page(),"saving").get<bool>();});
             assert(read_json(dir/"sunpack_config.json")["watch"]["clipboard_builtin_max_entries"]==30);
-            const std::string independent_field="/watch/toast_update_interval_ms";
+            const std::string independent_field="/watch/event_log_retention_days";
             search_setting(app,independent_field);
             auto independent=ui_widget_find_by_id(ui_page_root(app.page()),("input-"+independent_field).c_str()); assert(independent);
             ui_text_input_set_text(independent,L""); ui_widget_destroy(independent);

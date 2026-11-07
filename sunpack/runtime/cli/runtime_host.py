@@ -103,10 +103,8 @@ class RuntimeHost:
             from sunpack.core.platform.windows.toast_host import ToastManager
 
             def toast_manager_factory(run_config: dict, state_dir: str, logger) -> ToastManager:
-                watch_config = run_config["watch"]
                 return ToastManager(
                     diagnostic_log_path=str(Path(state_dir) / "toast_host_events.jsonl"),
-                    update_interval_ms=int(watch_config.get("toast_update_interval_ms", 50)),
                     logger=logger,
                 )
 

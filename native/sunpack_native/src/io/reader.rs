@@ -179,19 +179,9 @@ pub(crate) trait ByteSource: Send + Sync {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct ReaderConfig {
     pub(crate) cache_bytes: usize,
-    pub(crate) max_concurrent_reads: usize,
-}
-
-impl Default for ReaderConfig {
-    fn default() -> Self {
-        Self {
-            cache_bytes: 0,
-            max_concurrent_reads: usize::MAX,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -325,7 +315,6 @@ struct ReaderState {
     config: ReaderConfig,
     inner: Mutex<ReaderInner>,
     uncached_read_bytes: AtomicU64,
-    gate: ReadGate,
 }
 
 #[derive(Default)]
@@ -336,27 +325,12 @@ struct ReaderInner {
     stats: ReaderStats,
 }
 
-struct ReadGate {
-    limit: usize,
-    active: Mutex<usize>,
-    available: Condvar,
-}
-
-struct ReadPermit<'a> {
-    gate: Option<&'a ReadGate>,
-}
-
 impl ManagedReader {
     pub(crate) fn new(source: Arc<dyn ByteSource>, config: ReaderConfig) -> Self {
         Self {
             source,
             shared_blocks: true,
             state: Arc::new(ReaderState {
-                gate: ReadGate {
-                    limit: config.max_concurrent_reads.max(1),
-                    active: Mutex::new(0),
-                    available: Condvar::new(),
-                },
                 config,
                 inner: Mutex::new(ReaderInner::default()),
                 uncached_read_bytes: AtomicU64::new(0),
@@ -396,7 +370,7 @@ impl ManagedReader {
         reader
     }
 
-    /// One analysis borrows the same generation, budget, gate and request
+    /// One analysis borrows the same generation, budget and request
     /// cache. Its transient reads use the existing direct source path, so
     /// search/validation windows do not become process-wide retained blocks.
     pub(crate) fn probe_reader(&self) -> Self {
@@ -448,7 +422,6 @@ impl ManagedReader {
         }
         let read_len = len.min((self.len() - offset) as usize);
         if !self.uses_request_state() {
-            let _permit = self.state.gate.acquire()?;
             let result = if self.shared_blocks {
                 self.source.read_at(offset, read_len)
             } else {
@@ -477,7 +450,6 @@ impl ManagedReader {
             return Ok(Vec::new());
         }
         let read_len = len.min((self.len() - offset) as usize);
-        let _permit = self.state.gate.acquire()?;
         let data = self.source.read_direct_at(offset, read_len)?;
         self.state
             .uncached_read_bytes
@@ -524,7 +496,6 @@ impl ManagedReader {
         }
         let read_len = buffer.len().min((self.len() - offset) as usize);
         if !self.uses_request_state() {
-            let _permit = self.state.gate.acquire()?;
             let result = if self.shared_blocks {
                 self.source.read_into_at(offset, &mut buffer[..read_len])
             } else {
@@ -575,7 +546,6 @@ impl ManagedReader {
         }
         let read_len = len.min((self.len() - offset) as usize);
         if !self.uses_request_state() {
-            let _permit = self.state.gate.acquire()?;
             let slices = self.source_slices_at(offset, read_len).map_err(|error| {
                 ReadFault::physical("read_slices_at", offset, read_len, 0, self.len(), &error)
                     .into_io_error()
@@ -653,11 +623,9 @@ impl ManagedReader {
             inner.stats.read_bytes += reserved;
         }
 
-        let result = self.state.gate.acquire().and_then(|_permit| {
-            self.source_slices_at(offset, read_len).map_err(|error| {
-                ReadFault::physical("read_slices_at", offset, read_len, 0, self.len(), &error)
-                    .into_io_error()
-            })
+        let result = self.source_slices_at(offset, read_len).map_err(|error| {
+            ReadFault::physical("read_slices_at", offset, read_len, 0, self.len(), &error)
+                .into_io_error()
         });
         let count = result
             .as_ref()
@@ -688,7 +656,6 @@ impl ManagedReader {
         if !self.shared_blocks {
             return Ok(());
         }
-        let _permit = self.state.gate.acquire()?;
         self.source.prefetch(ranges)
     }
 
@@ -719,7 +686,6 @@ impl ManagedReader {
     }
 
     pub(crate) fn read_direct_into_at(&self, offset: u64, buffer: &mut [u8]) -> io::Result<usize> {
-        let _permit = self.state.gate.acquire()?;
         self.source
             .read_direct_into_at(offset, buffer)
             .map_err(|error| {
@@ -841,11 +807,10 @@ impl NativeArchiveSession {
         Ok(())
     }
 
-    #[pyo3(signature = (cache_bytes=67108864, max_concurrent_reads=1))]
+    #[pyo3(signature = (cache_bytes=67108864))]
     fn analysis_view(
         &self,
         cache_bytes: usize,
-        max_concurrent_reads: usize,
     ) -> PyResult<crate::analysis_native::AnalysisBinaryView> {
         if self.closed {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(
@@ -854,10 +819,7 @@ impl NativeArchiveSession {
         }
         Ok(crate::analysis_native::AnalysisBinaryView {
             path: self.path.clone(),
-            reader: self.reader.with_config(ReaderConfig {
-                cache_bytes,
-                max_concurrent_reads,
-            }),
+            reader: self.reader.with_config(ReaderConfig { cache_bytes }),
             closed: false,
         })
     }
@@ -974,38 +936,6 @@ impl ReaderInner {
             if let Some(old) = self.cache.remove(&old_key) {
                 self.cache_size = self.cache_size.saturating_sub(old.retained_bytes());
             }
-        }
-    }
-}
-
-impl ReadGate {
-    fn acquire(&self) -> io::Result<ReadPermit<'_>> {
-        if self.limit == usize::MAX {
-            return Ok(ReadPermit { gate: None });
-        }
-        let mut active = self
-            .active
-            .lock()
-            .map_err(|_| io::Error::other("reader gate lock poisoned"))?;
-        while *active >= self.limit {
-            active = self
-                .available
-                .wait(active)
-                .map_err(|_| io::Error::other("reader gate wait poisoned"))?;
-        }
-        *active += 1;
-        Ok(ReadPermit { gate: Some(self) })
-    }
-}
-
-impl Drop for ReadPermit<'_> {
-    fn drop(&mut self) {
-        let Some(gate) = self.gate else {
-            return;
-        };
-        if let Ok(mut active) = gate.active.lock() {
-            *active = active.saturating_sub(1);
-            gate.available.notify_one();
         }
     }
 }
@@ -2639,20 +2569,78 @@ mod tests {
     #[test]
     fn request_cache_preserves_hit_stats() {
         let path = temp_file("managed_reader_stats", b"abcdefgh");
-        let reader = ManagedReader::open_with_config(
-            &path,
-            ReaderConfig {
-                cache_bytes: 8,
-                max_concurrent_reads: 1,
-            },
-        )
-        .unwrap();
+        let reader =
+            ManagedReader::open_with_config(&path, ReaderConfig { cache_bytes: 8 }).unwrap();
         assert_eq!(reader.read_at(0, 4).unwrap(), b"abcd");
         assert_eq!(reader.read_at(0, 4).unwrap(), b"abcd");
         let stats = reader.stats().unwrap();
         assert_eq!(stats.read_bytes, 4);
         assert_eq!(stats.cache_hits, 1);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn independent_reads_enter_the_source_concurrently_with_and_without_request_cache() {
+        // Block each source read until every reader can enter. Existing block
+        // prefetch tests do not cover serializing the ManagedReader itself.
+        struct ConcurrentSource {
+            entered: std::sync::mpsc::Sender<u64>,
+            release: Arc<(Mutex<bool>, Condvar)>,
+        }
+        impl ByteSource for ConcurrentSource {
+            fn len(&self) -> u64 {
+                4
+            }
+            fn read_at(&self, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+                self.entered.send(offset).unwrap();
+                let (lock, ready) = &*self.release;
+                let mut released = lock.lock().unwrap();
+                while !*released {
+                    released = ready.wait(released).unwrap();
+                }
+                Ok(vec![offset as u8; len])
+            }
+        }
+        for cache_bytes in [0, 8] {
+            let (entered, arrivals) = std::sync::mpsc::channel();
+            let release = Arc::new((Mutex::new(false), Condvar::new()));
+            let reader = ManagedReader::new(
+                Arc::new(ConcurrentSource {
+                    entered,
+                    release: release.clone(),
+                }),
+                ReaderConfig { cache_bytes },
+            );
+            std::thread::scope(|scope| {
+                let workers = (0..4)
+                    .map(|offset| {
+                        let reader = reader.clone();
+                        scope.spawn(move || (offset, reader.read_at(offset, 1).unwrap()))
+                    })
+                    .collect::<Vec<_>>();
+                // Bound a failed overlap assertion so a reintroduced reader
+                // lock reports a failure instead of deadlocking the suite.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                let mut observed = Vec::new();
+                for _ in 0..4 {
+                    match arrivals
+                        .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                    {
+                        Ok(offset) => observed.push(offset),
+                        Err(_) => break,
+                    }
+                }
+                *release.0.lock().unwrap() = true;
+                release.1.notify_all();
+                for worker in workers {
+                    let (offset, bytes) = worker.join().unwrap();
+                    assert_eq!(bytes, [offset as u8]);
+                }
+                observed.sort_unstable();
+                assert_eq!(observed, [0, 1, 2, 3]);
+            });
+            assert_eq!(reader.stats().unwrap().read_bytes, 4);
+        }
     }
 
     #[test]
@@ -2817,7 +2805,6 @@ mod tests {
             &path,
             ReaderConfig {
                 cache_bytes: BLOCK_SIZE,
-                max_concurrent_reads: 1,
             },
         )
         .unwrap();
@@ -2939,14 +2926,8 @@ mod tests {
     #[test]
     fn probe_request_cache_reuses_direct_windows_and_survives_release() {
         let path = temp_file("managed_reader_probe_direct_request", b"abcdefgh");
-        let reader = ManagedReader::open_with_config(
-            &path,
-            ReaderConfig {
-                cache_bytes: 8,
-                max_concurrent_reads: 1,
-            },
-        )
-        .unwrap();
+        let reader =
+            ManagedReader::open_with_config(&path, ReaderConfig { cache_bytes: 8 }).unwrap();
         let probe = reader.probe_reader();
         let first = probe.read_cached_at(0, 4).unwrap();
         assert_eq!(&*probe.read_cached_at(0, 4).unwrap(), b"abcd");
@@ -2963,14 +2944,8 @@ mod tests {
     #[test]
     fn read_into_preserves_request_cache_semantics() {
         let path = temp_file("managed_reader_into_stats", b"abcdefgh");
-        let reader = ManagedReader::open_with_config(
-            &path,
-            ReaderConfig {
-                cache_bytes: 8,
-                max_concurrent_reads: 1,
-            },
-        )
-        .unwrap();
+        let reader =
+            ManagedReader::open_with_config(&path, ReaderConfig { cache_bytes: 8 }).unwrap();
         let mut buffer = [0u8; 4];
         assert_eq!(reader.read_into_at(0, &mut buffer).unwrap(), 4);
         assert_eq!(&buffer, b"abcd");
@@ -2992,7 +2967,6 @@ mod tests {
             &path,
             ReaderConfig {
                 cache_bytes: BLOCK_SIZE,
-                max_concurrent_reads: 1,
             },
         )
         .unwrap();
@@ -3025,7 +2999,6 @@ mod tests {
             &path,
             ReaderConfig {
                 cache_bytes: BLOCK_SIZE - 1,
-                max_concurrent_reads: 1,
             },
         )
         .unwrap();
@@ -3049,7 +3022,6 @@ mod tests {
             &path,
             ReaderConfig {
                 cache_bytes: BLOCK_SIZE,
-                max_concurrent_reads: 1,
             },
         )
         .unwrap();
@@ -3073,7 +3045,6 @@ mod tests {
             &path,
             ReaderConfig {
                 cache_bytes: BLOCK_SIZE,
-                max_concurrent_reads: 1,
             },
         )
         .unwrap();
@@ -3221,14 +3192,7 @@ mod tests {
             first_path.to_string_lossy().into_owned(),
             second_path.to_string_lossy().into_owned(),
         ];
-        let reader = ManagedReader::open_volumes(
-            &paths,
-            ReaderConfig {
-                cache_bytes: 16,
-                max_concurrent_reads: 1,
-            },
-        )
-        .unwrap();
+        let reader = ManagedReader::open_volumes(&paths, ReaderConfig { cache_bytes: 16 }).unwrap();
 
         let before = THREAD_REQUEST_COALESCES.with(std::cell::Cell::get);
         let first = reader.read_cached_at(2, 3).unwrap();
@@ -3431,7 +3395,10 @@ mod tests {
 
         let ranges = [(BLOCK_SIZE as u64 - 4, 8), ((BLOCK_SIZE * 2) as u64 - 4, 8)];
         reader.prefetch(&ranges).unwrap();
-        let many = ranges.iter().map(|&(offset, len)| reader.read_at(offset, len).unwrap()).collect::<Vec<_>>();
+        let many = ranges
+            .iter()
+            .map(|&(offset, len)| reader.read_at(offset, len).unwrap())
+            .collect::<Vec<_>>();
         let after = THREAD_PHYSICAL_READS.with(std::cell::Cell::get);
 
         assert_eq!(many, vec![vec![0x6b; 8], vec![0x6b; 8]]);

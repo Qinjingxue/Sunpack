@@ -110,7 +110,8 @@ def test_idle_thread_does_not_poll(monkeypatch):
 
 def test_progress_coalesces_but_terminal_bypasses_throttle():
     recorder = Recorder()
-    manager = ToastManager(presenter_factory=recorder.factory, update_interval_ms=1000)
+    manager = ToastManager(presenter_factory=recorder.factory)
+    manager._update_interval = 1.0
     manager.publish(snapshot(ToastSnapshotKind.PROGRESS, title='first'))
     try:
         manager.start()
@@ -129,7 +130,8 @@ def test_progress_coalesces_but_terminal_bypasses_throttle():
 
 def test_latest_progress_is_sent_after_throttle_deadline():
     recorder = Recorder()
-    manager = ToastManager(presenter_factory=recorder.factory, update_interval_ms=100)
+    manager = ToastManager(presenter_factory=recorder.factory)
+    manager._update_interval = 0.1
     manager.publish(snapshot(ToastSnapshotKind.PROGRESS, title='first'))
     try:
         manager.start()

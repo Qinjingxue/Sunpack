@@ -63,6 +63,7 @@ def test_installer_promotes_controls_and_migrates_current_state_without_overwrit
     advanced_before = advanced.read_bytes()
     user = tmp_path / "sunpack_config.json"
     original = {"watch": {"state_dir": str(old_state), "clipboard_monitor_enabled": True,
+                          "toast_update_interval_ms": 123, "toast_completion_debounce_ms": 456,
                           "toast_report_max_files": 3,
                           "toast_report_max_bytes": 1024, "runtime_cache_cleanup_enabled": False},
                 "performance": {"worker": {"thread_capacity": 2, "stage_thread_capacity": 3,
@@ -86,7 +87,7 @@ def test_installer_promotes_controls_and_migrates_current_state_without_overwrit
     assert migrated["performance"]["worker"] == {}
     assert "input_planning" not in migrated
     assert "detection" not in migrated
-    assert migrated["analysis"] == {"max_concurrent_reads": 3, "unknown": "keep"}
+    assert migrated["analysis"] == {"unknown": "keep"}
     # The old advanced snapshot is read-only; deployment replaces the installed
     # template instead of migrating it through a second compatibility chain.
     assert advanced.read_bytes() == advanced_before

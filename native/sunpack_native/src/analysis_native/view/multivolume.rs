@@ -1,12 +1,8 @@
 #[pymethods]
 impl AnalysisMultiVolumeView {
     #[new]
-    #[pyo3(signature = (paths, cache_bytes=67108864, max_concurrent_reads=1))]
-    fn new(
-        paths: Vec<String>,
-        cache_bytes: usize,
-        max_concurrent_reads: usize,
-    ) -> PyResult<Self> {
+    #[pyo3(signature = (paths, cache_bytes=67108864))]
+    fn new(paths: Vec<String>, cache_bytes: usize) -> PyResult<Self> {
         let paths = paths
             .into_iter()
             .filter(|path| !path.is_empty())
@@ -31,13 +27,7 @@ impl AnalysisMultiVolumeView {
                 })?;
         }
 
-        let reader = ManagedReader::open_volumes(
-            &paths,
-            ReaderConfig {
-                cache_bytes,
-                max_concurrent_reads,
-            },
-        )?;
+        let reader = ManagedReader::open_volumes(&paths, ReaderConfig { cache_bytes })?;
         Ok(Self {
             view: AnalysisBinaryView {
                 path: paths[0].clone(),
@@ -91,33 +81,18 @@ impl AnalysisMultiVolumeView {
     }
 
     #[pyo3(signature = (eocd_offset))]
-    fn probe_zip(
-        &self,
-        py: Python<'_>,
-        eocd_offset: u64,
-    ) -> PyResult<Py<PyDict>> {
-        self.view.probe_zip_with_disk_starts(
-            py,
-            eocd_offset,
-            Some(&self.volume_starts),
-        )
+    fn probe_zip(&self, py: Python<'_>, eocd_offset: u64) -> PyResult<Py<PyDict>> {
+        self.view
+            .probe_zip_with_disk_starts(py, eocd_offset, Some(&self.volume_starts))
     }
 
     #[pyo3(signature = (start_offset))]
-    fn probe_rar(
-        &self,
-        py: Python<'_>,
-        start_offset: u64,
-    ) -> PyResult<Py<PyDict>> {
+    fn probe_rar(&self, py: Python<'_>, start_offset: u64) -> PyResult<Py<PyDict>> {
         self.view.probe_rar(py, start_offset)
     }
 
     #[pyo3(signature = (start_offset))]
-    fn probe_seven_zip(
-        &self,
-        py: Python<'_>,
-        start_offset: u64,
-    ) -> PyResult<Py<PyDict>> {
+    fn probe_seven_zip(&self, py: Python<'_>, start_offset: u64) -> PyResult<Py<PyDict>> {
         self.view.probe_seven_zip(py, start_offset)
     }
 

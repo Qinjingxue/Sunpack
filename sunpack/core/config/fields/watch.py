@@ -31,8 +31,6 @@ def normalize_watch_config(value: Any) -> dict[str, Any]:
     config["clipboard_builtin_max_entries"] = max(1, _int_field(config, "clipboard_builtin_max_entries"))
     config["tray_enabled"] = require_boolean(config["tray_enabled"], "watch.tray_enabled")
     config["toast_enabled"] = require_boolean(config["toast_enabled"], "watch.toast_enabled")
-    config["toast_update_interval_ms"] = max(10, _int_field(config, "toast_update_interval_ms"))
-    config["toast_completion_debounce_ms"] = max(0, _int_field(config, "toast_completion_debounce_ms"))
     config["event_log_retention_days"] = max(1, _int_field(config, "event_log_retention_days"))
     config["toast_report_retention_days"] = max(1, _int_field(config, "toast_report_retention_days"))
     return config

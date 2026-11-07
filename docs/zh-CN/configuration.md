@@ -125,7 +125,7 @@ GUI 按 Windows 本地时区编辑时间，保存时转成 UTC。大小单位支
 
 ## 自动运行参数
 
-输入规划按需执行，不再提供配置开关。报告缓存内部上限为 512 条，共享分析缓存为 64 MiB，工作进程单任务缓冲预算为 32 MiB。整个 `input_planning` 配置段、`analysis.shared_cache_mb` 和 `performance.worker.job_buffer_budget_bytes` 已从配置和 GUI 中删除。安装升级时清理普通配置中的旧覆盖值，并部署新的高级模板；运行时不保留这些参数的兼容逻辑。
+输入规划按需执行，不再提供配置开关。报告缓存内部上限为 512 条，共享分析缓存为 64 MiB，工作进程单任务缓冲预算为 32 MiB。分析视图不设人为读取并发上限，已有独立读取可以重叠执行，保留原有缓存同步和资源生命周期保护。整个 `input_planning` 配置段、`analysis.shared_cache_mb`、`analysis.max_concurrent_reads` 和 `performance.worker.job_buffer_budget_bytes` 已从配置和 GUI 中删除。安装升级时清理普通配置中的旧覆盖值，并部署新的高级模板；运行时不保留这些参数的兼容逻辑。
 
 原生 worker 和 Python 阶段线程容量始终采用现有自动策略。队列上限固定为内部参数 4096，保留原有背压。内存预留自动计算为 128 MiB 加上每个名义 CPU 配额 16 MiB。磁盘空间不足暂停/恢复及空闲缓存维护始终开启；`watch.runtime_cache_cleanup_idle_seconds` 仍可配置，默认 10 秒，继续按事件和截止时间唤醒，不新增空闲轮询。写入线程由原生 worker 内部管理，默认每卷 4 个。
 

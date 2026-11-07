@@ -233,9 +233,7 @@
     "clipboard_builtin_max_entries": 30,
     "tray_enabled": true,
     "toast_enabled": true,
-    "toast_update_interval_ms": 50,
-    "toast_completion_debounce_ms": 800,
-    "toast_report_retention_days": 30,
+    "toast_report_retention_days": 7,
     "event_log_retention_days": 7
   },
   "passwords": {
@@ -249,7 +247,6 @@
     "recursive_candidate_ratio": 0.3
   },
   "analysis": {
-    "max_concurrent_reads": 1,
     "modules": [
       {
         "name": "zip",

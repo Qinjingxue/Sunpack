@@ -785,7 +785,6 @@ class WatchService:
         signature = (
             enabled,
             self.state_dir,
-            int(watch_config.get("toast_update_interval_ms", 50)),
         )
         if signature == self._toast_host_signature and (not enabled or self.toast_host is not None):
             return

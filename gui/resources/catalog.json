@@ -1171,22 +1171,6 @@
         "en": "Desktop notifications"
       }
     },
-    "/watch/toast_update_interval_ms": {
-      "label": {
-        "zh": "进度通知间隔（毫秒）",
-        "en": "Progress update interval (ms)"
-      },
-      "min": 10,
-      "integer": true
-    },
-    "/watch/toast_completion_debounce_ms": {
-      "label": {
-        "zh": "结果通知合并间隔（毫秒）",
-        "en": "Result merge interval (ms)"
-      },
-      "min": 0,
-      "integer": true
-    },
     "/watch/toast_report_retention_days": {
       "label": {
         "zh": "报告保留时间（天）",
@@ -1195,8 +1179,8 @@
       "min": 1,
       "integer": true,
       "description": {
-        "zh": "仅按天数保留失败报告；生成新报告时清理过期文件。普通配置值优先于高级配置。",
-        "en": "Keep failure reports by age only; expired files are removed when a new report is written. Ordinary settings override advanced settings."
+        "zh": "Toast详情失败报告的保留天数",
+        "en": "Number of days to keep Toast-details failure reports"
       }
     },
     "/passwords/clipboard_passwords_enabled": {
@@ -1205,14 +1189,14 @@
         "en": "Use clipboard passwords"
       },
       "description": {
-        "zh": "CLI 读取当前剪贴板作为密码候选；不控制 Watch 历史采集。普通配置值优先。",
-        "en": "CLI reads the current clipboard for password candidates; independent of Watch history collection. Ordinary settings take precedence."
+        "zh": "CLI 是否读取当前剪贴板作为密码候选",
+        "en": "Whether the CLI reads the current clipboard as a password candidate"
       }
     },
     "/extraction/content_requirement": {
       "label": {
-        "zh": "解压结果要求",
-        "en": "Required extraction result"
+        "zh": "解压结果完整性要求",
+        "en": "Extraction result integrity requirement"
       },
       "description": {
         "zh": "允许部分恢复可能误解压下载中文件，请仅在需尽力获取损坏文件的部分内容时使用。",
@@ -1256,15 +1240,6 @@
       },
       "min": 0,
       "max": 1
-    },
-    "/analysis/max_concurrent_reads": {
-      "label": {
-        "zh": "并发读取数",
-        "en": "Concurrent reads"
-      },
-      "min": 1,
-      "max": null,
-      "integer": true
     },
     "/analysis/modules/@zip/enabled": {
       "label": {

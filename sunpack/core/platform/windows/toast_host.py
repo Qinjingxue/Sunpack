@@ -174,10 +174,10 @@ class ToastManager:
     """Coalesce watch snapshots and own WinRT on one thread in the main process."""
 
     def __init__(self, *, library_path=None, diagnostic_log_path=None,
-                 update_interval_ms: int = 50, logger=None, presenter_factory=None):
+                 logger=None, presenter_factory=None):
         self._library_path = library_path
         self._diagnostic_log_path = diagnostic_log_path
-        self._update_interval = max(0.01, min(1.0, int(update_interval_ms) / 1000.0))
+        self._update_interval = 0.05
         self._logger = logger
         self._presenter_factory = presenter_factory or _NativeToastPresenter
         self._condition = threading.Condition()

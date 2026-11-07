@@ -740,7 +740,7 @@ def test_runtime_host_creates_toast_only_for_continuous_watch(monkeypatch, tmp_p
             if once:
                 assert self.toast_factory is None
                 return 0
-            self.toast_factory({"watch": {"toast_update_interval_ms": 123}}, str(tmp_path), None)
+            self.toast_factory(make_config(), str(tmp_path), None)
             self.ready.set()
             await self.stop.wait()
             return 0
@@ -775,7 +775,10 @@ def test_runtime_host_creates_toast_only_for_continuous_watch(monkeypatch, tmp_p
         await host.close()
 
     asyncio.run(run())
-    assert managers[0]["update_interval_ms"] == 123
+    assert managers[0] == {
+        "diagnostic_log_path": str(tmp_path / "toast_host_events.jsonl"),
+        "logger": None,
+    }
 
 
 def test_runtime_host_hands_foreground_activity_to_later_watch_services(monkeypatch):

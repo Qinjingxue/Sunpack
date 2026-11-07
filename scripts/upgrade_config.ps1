@@ -209,7 +209,8 @@ foreach ($section in @('input_planning', 'detection')) {
 foreach ($field in @(
     @('watch', 'state_dir'), @('watch', 'runtime_cache_cleanup_enabled'),
     @('watch', 'toast_report_max_files'), @('watch', 'toast_report_max_bytes'),
-    @('analysis', 'shared_cache_mb'), @('analysis', 'thresholds'), @('analysis', 'prepass')
+    @('watch', 'toast_update_interval_ms'), @('watch', 'toast_completion_debounce_ms'),
+    @('analysis', 'max_concurrent_reads'), @('analysis', 'shared_cache_mb'), @('analysis', 'thresholds'), @('analysis', 'prepass')
 )) {
     $section = $field[0]; $name = $field[1]
     if ($user.PSObject.Properties[$section] -and $null -ne $user.$section -and

@@ -62,9 +62,10 @@ raise SystemExit(main())
 
     coordinator = WatchToastCoordinator(
         SimpleNamespace(publish=snapshots.append, clear=lambda: None),
-        make_config({"watch": {"toast_completion_debounce_ms": 60_000}}),
+        make_config(),
         str(tmp_path / "reports"),
     )
+    coordinator._debounce_seconds = 60
     runtime = RuntimeHost()
     runtime._watch_service = SimpleNamespace(
         scheduler=SimpleNamespace(cancel_requests=cancel), toast_coordinator=coordinator,

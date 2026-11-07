@@ -1,19 +1,9 @@
 #[pymethods]
 impl AnalysisBinaryView {
     #[new]
-    #[pyo3(signature = (path, cache_bytes=67108864, max_concurrent_reads=1))]
-    fn new(
-        path: String,
-        cache_bytes: usize,
-        max_concurrent_reads: usize,
-    ) -> PyResult<Self> {
-        let reader = ManagedReader::open_with_config(
-            &path,
-            ReaderConfig {
-                cache_bytes,
-                max_concurrent_reads,
-            },
-        )?;
+    #[pyo3(signature = (path, cache_bytes=67108864))]
+    fn new(path: String, cache_bytes: usize) -> PyResult<Self> {
+        let reader = ManagedReader::open_with_config(&path, ReaderConfig { cache_bytes })?;
         Ok(Self {
             path,
             reader,
@@ -81,20 +71,12 @@ impl AnalysisBinaryView {
     }
 
     #[pyo3(signature = (eocd_offset))]
-    fn probe_zip(
-        &self,
-        py: Python<'_>,
-        eocd_offset: u64,
-    ) -> PyResult<Py<PyDict>> {
+    fn probe_zip(&self, py: Python<'_>, eocd_offset: u64) -> PyResult<Py<PyDict>> {
         self.probe_zip_with_disk_starts(py, eocd_offset, None)
     }
 
     #[pyo3(signature = (start_offset))]
-    fn probe_rar(
-        &self,
-        py: Python<'_>,
-        start_offset: u64,
-    ) -> PyResult<Py<PyDict>> {
+    fn probe_rar(&self, py: Python<'_>, start_offset: u64) -> PyResult<Py<PyDict>> {
         py.detach(|| self.probe_rar_native(start_offset))?
             .to_python(py)
     }
@@ -110,11 +92,7 @@ impl AnalysisBinaryView {
     }
 
     #[pyo3(signature = (start_offset=0))]
-    fn probe_tar(
-        &self,
-        py: Python<'_>,
-        start_offset: u64,
-    ) -> PyResult<Py<PyDict>> {
+    fn probe_tar(&self, py: Python<'_>, start_offset: u64) -> PyResult<Py<PyDict>> {
         let result = self.walk_tar(py, start_offset)?;
         Ok(result.unbind())
     }

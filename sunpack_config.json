@@ -7,7 +7,7 @@
   },
   "watch": {
     "event_log_retention_days": 7,
-    "toast_report_retention_days": 30,
+    "toast_report_retention_days": 7,
     "clipboard_monitor_enabled": true,
     "clipboard_builtin_max_entries": 30
   },

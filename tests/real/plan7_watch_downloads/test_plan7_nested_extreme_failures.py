@@ -159,7 +159,6 @@ def test_plan7_nested_inner_unknown_password_watch_is_password_blocked(
     outer = _nested_encrypted_outer(tmp_path)
     label = "nested-inner-password-watch"
     toast_config = plan7_watch_config(passwords=[])
-    toast_config["watch"]["toast_completion_debounce_ms"] = 0
     toast_host = _ToastHost()
     toast = WatchToastCoordinator(toast_host, toast_config, str(tmp_path / label))
     harness = start_watch(
@@ -202,7 +201,6 @@ def test_plan7_nested_inner_missing_volume_watch_suspends_promoted_input(
     outer = _nested_missing_volume_outer(tmp_path)
     label = "nested-inner-missing-volume-watch"
     toast_config = plan7_watch_config(passwords=[])
-    toast_config["watch"]["toast_completion_debounce_ms"] = 0
     toast_host = _ToastHost()
     toast = WatchToastCoordinator(toast_host, toast_config, str(tmp_path / label))
     harness = start_watch(
