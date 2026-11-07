@@ -209,7 +209,7 @@ class RuntimeHost:
             return await asyncio.to_thread(service.log.rebuild)
 
         def rebuild():
-            state_dir = Path(service_state_dir(config))
+            state_dir = Path(service_state_dir())
             try:
                 log = WatchLogStore(str(state_dir / "events.json"),
                                     retention_days=config["watch"]["event_log_retention_days"])

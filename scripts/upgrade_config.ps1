@@ -60,6 +60,13 @@ function Unique-Rules($Rules) {
 $user = [IO.File]::ReadAllText($UserConfig) | ConvertFrom-Json
 if ($null -eq $user -or $user -isnot [pscustomobject]) { throw "Expected a JSON object: $UserConfig" }
 
+# The previous advanced file is an installer snapshot, never a write target.
+$advanced = [pscustomobject]@{}
+if ($AdvancedConfig -and (Test-Path -LiteralPath $AdvancedConfig -PathType Leaf)) {
+    $advanced = [IO.File]::ReadAllText($AdvancedConfig) | ConvertFrom-Json
+    if ($null -eq $advanced -or $advanced -isnot [pscustomobject]) { throw "Expected a JSON object: $AdvancedConfig" }
+}
+
 # Expose the single content policy in the ordinary configuration. Preserve an
 # explicit user value, then the previous advanced value, then the safe default.
 $changed = $false
@@ -69,36 +76,155 @@ if (-not $user.PSObject.Properties['extraction'] -or $null -eq $user.extraction)
 if ($user.extraction -isnot [pscustomobject]) { throw 'extraction must be an object' }
 if (-not $user.extraction.PSObject.Properties['content_requirement']) {
     $requirement = 'complete'
-    if ($AdvancedConfig -and (Test-Path -LiteralPath $AdvancedConfig -PathType Leaf)) {
-        $advanced = [IO.File]::ReadAllText($AdvancedConfig) | ConvertFrom-Json
-        if ($advanced.PSObject.Properties['extraction'] -and $null -ne $advanced.extraction -and
-            $advanced.extraction.PSObject.Properties['content_requirement']) {
-            $requirement = $advanced.extraction.content_requirement
-        }
+    if ($advanced.PSObject.Properties['extraction'] -and $null -ne $advanced.extraction -and
+        $advanced.extraction.PSObject.Properties['content_requirement']) {
+        $requirement = $advanced.extraction.content_requirement
     }
     $user.extraction | Add-Member -NotePropertyName content_requirement -NotePropertyValue $requirement
     $changed = $true
 }
 
+# Promote everyday controls without replacing explicit ordinary values.
+foreach ($field in @(
+    @('watch', 'clipboard_monitor_enabled', $true),
+    @('watch', 'clipboard_builtin_max_entries', 30),
+    @('watch', 'toast_report_retention_days', 30),
+    @('passwords', 'clipboard_passwords_enabled', $true)
+)) {
+    $section = $field[0]; $name = $field[1]; $value = $field[2]
+    if (-not $user.PSObject.Properties[$section] -or $null -eq $user.$section) {
+        $user | Add-Member -NotePropertyName $section -NotePropertyValue ([pscustomobject]@{}) -Force
+    }
+    if ($user.$section -isnot [pscustomobject]) { throw "$section must be an object" }
+    if ($user.$section.PSObject.Properties[$name]) { continue }
+    if ($advanced.PSObject.Properties[$section] -and $null -ne $advanced.$section -and
+        $advanced.$section.PSObject.Properties[$name]) { $value = $advanced.$section.$name }
+    $user.$section | Add-Member -NotePropertyName $name -NotePropertyValue $value
+    $changed = $true
+}
+
+# Resolve a retired custom state path only at this installation boundary.
+$dataDirectory = [IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($UserConfig))
+$stateDirectory = Join-Path $dataDirectory '.sunpack_watch'
+$previousStateDirectory = $stateDirectory
+foreach ($settings in @($advanced, $user)) {
+    if ($settings.PSObject.Properties['watch'] -and $null -ne $settings.watch -and
+        $settings.watch.PSObject.Properties['state_dir']) {
+        $configured = ([string]$settings.watch.state_dir).Trim()
+        $previousStateDirectory = if ($configured) { $configured } else { $stateDirectory }
+    }
+}
+if ($previousStateDirectory -eq '~') { $previousStateDirectory = $env:USERPROFILE }
+elseif ($previousStateDirectory.StartsWith('~\') -or $previousStateDirectory.StartsWith('~/')) {
+    $previousStateDirectory = Join-Path $env:USERPROFILE $previousStateDirectory.Substring(2)
+}
+if (-not [IO.Path]::IsPathRooted($previousStateDirectory)) {
+    $previousStateDirectory = Join-Path $dataDirectory $previousStateDirectory
+}
+$previousStateDirectory = [IO.Path]::GetFullPath($previousStateDirectory)
+$stateDirectory = [IO.Path]::GetFullPath($stateDirectory)
+
+function Assert-PlainPath([string]$Path) {
+    for ($part = $Path; $part; $part = [IO.Path]::GetDirectoryName($part)) {
+        if ((Test-Path -LiteralPath $part) -and
+            ((Get-Item -LiteralPath $part -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            throw "Refusing a reparse point in Watch state migration: $part"
+        }
+    }
+}
+
+function Get-OwnedStateRecords([string]$Directory) {
+    foreach ($record in Get-ChildItem -LiteralPath $Directory -Force) {
+        $owned = if ($record.PSIsContainer) {
+            $record.Name -in @('events.json.store', 'bootstrap.events.json.store', 'failures')
+        } else {
+            $record.Name -match '^(?:state\.(?:snapshot|journal\.\d{20}\.wal)|catalog\.(?:snapshot|wal)\.bin|(?:bootstrap\.)?events\.json|toast_host_events\.jsonl|logical-input-recovery)$'
+        }
+        if (-not $owned) { continue }
+        Assert-PlainPath $record.FullName
+        if ($record.PSIsContainer) {
+            foreach ($child in Get-ChildItem -LiteralPath $record.FullName -Recurse -Force) {
+                Assert-PlainPath $child.FullName
+            }
+        }
+        $record
+    }
+}
+
+# Preserve current recovery and display data. Copy only SunPack-owned records,
+# never unrelated files from a custom directory, and never overwrite existing
+# default state. Leave the old directory intact for rollback/manual recovery.
+$migrationMarker = Join-Path $stateDirectory 'fixed-state-directory'
+if ($previousStateDirectory -ne $stateDirectory -and
+    (Test-Path -LiteralPath $previousStateDirectory -PathType Container)) {
+    Assert-PlainPath $previousStateDirectory
+    Assert-PlainPath $stateDirectory
+    $records = @(Get-OwnedStateRecords $previousStateDirectory)
+    # A later installer failure may restore the old configuration. If that old
+    # runtime has since changed its state, a marker alone cannot prove that the
+    # default copy is current. Compare metadata, without reading/hashing files.
+    $inventory = @(foreach ($record in $records) {
+        $files = if ($record.PSIsContainer) {
+            @(Get-ChildItem -LiteralPath $record.FullName -File -Recurse -Force)
+        } else { @($record) }
+        foreach ($file in $files) {
+            [pscustomobject]@{ path = $file.FullName.Substring($previousStateDirectory.TrimEnd('\').Length + 1)
+                              length = $file.Length; modified = $file.LastWriteTimeUtc.Ticks }
+        }
+    })
+    $receipt = [pscustomobject]@{ source = $previousStateDirectory
+                                files = @($inventory | Sort-Object path) } | ConvertTo-Json -Depth 10 -Compress
+    if (Test-Path -LiteralPath $migrationMarker -PathType Leaf) {
+        Assert-PlainPath $migrationMarker
+        if ([IO.File]::ReadAllText($migrationMarker) -cne $receipt) {
+            throw "Legacy Watch state changed after migration; refusing to select a stale copy. Preserve and reconcile both directories: $previousStateDirectory and $stateDirectory"
+        }
+    } else {
+        if ((Test-Path -LiteralPath $stateDirectory) -and
+            @(Get-ChildItem -LiteralPath $stateDirectory -Force).Count -gt 0) {
+            throw "Cannot migrate custom Watch state over existing default state: $stateDirectory. Both directories are unchanged."
+        }
+        $staging = Join-Path $dataDirectory ('.sunpack-state-' + [Guid]::NewGuid().ToString('N') + '.tmp')
+        $null = New-Item -ItemType Directory -Path $staging
+        try {
+            foreach ($record in $records) {
+                Copy-Item -LiteralPath $record.FullName -Destination $staging -Recurse
+            }
+            [IO.File]::WriteAllText((Join-Path $staging 'fixed-state-directory'), $receipt)
+            if (Test-Path -LiteralPath $stateDirectory) { Remove-Item -LiteralPath $stateDirectory }
+            [IO.Directory]::Move($staging, $stateDirectory)
+        } finally {
+            if (Test-Path -LiteralPath $staging) { Remove-Item -LiteralPath $staging -Recurse -Force }
+        }
+    }
+}
+
+# Runtime code has no migration aliases. Remove retired public controls here;
+# installation deploys the new advanced template separately.
+foreach ($field in @(
+    @('watch', 'state_dir'), @('watch', 'runtime_cache_cleanup_enabled'),
+    @('watch', 'toast_report_max_files'), @('watch', 'toast_report_max_bytes')
+)) {
+    $section = $field[0]; $name = $field[1]
+    if ($user.PSObject.Properties[$section] -and $null -ne $user.$section -and
+        $user.$section.PSObject.Properties[$name]) {
+        $user.$section.PSObject.Properties.Remove($name); $changed = $true
+    }
+}
+if ($user.PSObject.Properties['performance'] -and $null -ne $user.performance -and
+    $user.performance.PSObject.Properties['worker'] -and $null -ne $user.performance.worker) {
+    foreach ($name in @('thread_capacity', 'stage_thread_capacity', 'max_pending_stage_jobs',
+                       'max_queue_jobs', 'space_gate_enabled', 'memory_reserve_bytes')) {
+        if ($user.performance.worker.PSObject.Properties[$name]) {
+            $user.performance.worker.PSObject.Properties.Remove($name); $changed = $true
+        }
+    }
+}
+
 # The logical-input checkpoint replaces the former carrier continuation. Reset
 # only its native snapshot/WAL; passwords, roots, outputs and configuration stay
 # user-owned. A marker makes subsequent installations preserve current records.
-$dataDirectory = [IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($UserConfig))
-$stateDirectory = Join-Path $dataDirectory '.sunpack_watch'
-foreach ($configuration in @($AdvancedConfig, $UserConfig)) {
-    if (-not $configuration -or -not (Test-Path -LiteralPath $configuration -PathType Leaf)) { continue }
-    $settings = [IO.File]::ReadAllText($configuration) | ConvertFrom-Json
-    if ($settings.PSObject.Properties['watch'] -and $null -ne $settings.watch -and $settings.watch.PSObject.Properties['state_dir']) {
-        $configured = ([string]$settings.watch.state_dir).Trim()
-        $stateDirectory = if ($configured) { $configured } else { Join-Path $dataDirectory '.sunpack_watch' }
-    }
-}
-if ($stateDirectory -eq '~') { $stateDirectory = $env:USERPROFILE }
-elseif ($stateDirectory.StartsWith('~\') -or $stateDirectory.StartsWith('~/')) {
-    $stateDirectory = Join-Path $env:USERPROFILE $stateDirectory.Substring(2)
-}
-if (-not [IO.Path]::IsPathRooted($stateDirectory)) { $stateDirectory = Join-Path $dataDirectory $stateDirectory }
-$stateDirectory = [IO.Path]::GetFullPath($stateDirectory)
+Assert-PlainPath $stateDirectory
 $marker = Join-Path $stateDirectory 'logical-input-recovery'
 if (-not (Test-Path -LiteralPath $marker -PathType Leaf)) {
     if (Test-Path -LiteralPath $stateDirectory) {

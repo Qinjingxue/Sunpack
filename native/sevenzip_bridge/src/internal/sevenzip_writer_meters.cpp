@@ -5,7 +5,6 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cwchar>
-#include <optional>
 
 namespace sunpack::sevenzip
 {
@@ -13,12 +12,10 @@ namespace sunpack::sevenzip
     namespace
     {
 
-        constexpr std::size_t kDefaultThreadsPerVolume = 8;
+        constexpr std::size_t kDefaultThreadsPerVolume = 4;
         constexpr std::size_t kMaxThreadsPerVolume = 8;
         constexpr std::size_t kDefaultBufferCount = 64;
         constexpr std::size_t kMaxBufferCount = 256;
-        constexpr std::size_t kDefaultQueueLimit = 4096;
-        constexpr std::size_t kMaxQueueLimit = 1U << 20;
         constexpr unsigned long long kDefaultIdleTimeoutMs = 20000;
         constexpr unsigned long long kMaxIdleTimeoutMs = 24ULL * 60ULL * 60ULL * 1000ULL;
 
@@ -74,18 +71,6 @@ namespace sunpack::sevenzip
             return text[0] == L'1' || text[0] == L'y' || text[0] == L'Y';
         }
 
-        // 三态：nullopt 表示"未设置"，与"显式设为假"必须可区分。
-        std::optional<bool> configured_flag_value(const wchar_t *name) noexcept
-        {
-            wchar_t text[8]{};
-            const DWORD length = GetEnvironmentVariableW(name, text, static_cast<DWORD>(std::size(text)));
-            if (length == 0 || length >= std::size(text))
-            {
-                return std::nullopt;
-            }
-            return length == 1 && (text[0] == L'1' || text[0] == L'y' || text[0] == L'Y');
-        }
-
     } // namespace
 
     AsyncWriterConfig configured_async_writer_config() noexcept
@@ -98,8 +83,6 @@ namespace sunpack::sevenzip
             kMaxThreadsPerVolume);
         config.buffer_count = configured_size(
             L"SUNPACK_ASYNC_WRITER_BUFFERS", kDefaultBufferCount, 4, kMaxBufferCount);
-        config.queue_limit = configured_size(
-            L"SUNPACK_ASYNC_WRITER_QUEUE_LIMIT", kDefaultQueueLimit, 1, kMaxQueueLimit);
         config.write_through = configured_flag(L"SUNPACK_ASYNC_WRITER_WRITE_THROUGH");
         const unsigned long long idle_seconds = configured_ull(
             L"SUNPACK_ASYNC_WRITER_IDLE_SECONDS",
@@ -107,11 +90,6 @@ namespace sunpack::sevenzip
             kMaxIdleTimeoutMs / 1000ULL);
         config.idle_timeout = std::chrono::milliseconds(idle_seconds * 1000ULL);
 
-        // 环境变量未设置时保持结构体默认值，显式设置才覆盖。
-        if (const auto flag = configured_flag_value(L"SUNPACK_VOLUME_SPACE_GATE"))
-        {
-            config.space_gate_enabled = *flag;
-        }
         config.space_poll_interval = std::chrono::milliseconds(configured_size(
             L"SUNPACK_VOLUME_SPACE_POLL_MS", 1000, 50, 60000));
         config.space_status_report_interval = std::chrono::milliseconds(configured_size(

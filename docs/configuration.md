@@ -4,7 +4,7 @@
 
 Edit `sunpack_config.json` to change everyday settings. When running from source, use the file in the project root. For an installed copy, use `%ProgramData%\SunPack\sunpack_config.json`. `sunpack_advanced_config.json` supplies the remaining defaults; you only need to add fields you want to change to the main file.
 
-Objects are merged by field, and `filesystem.scan_filters` entries are merged by `name`. Other arrays are replaced as a whole. Watch reloads configuration changes automatically.
+Ordinary configuration values take precedence over the same fields in the advanced file; `SUNPACK_CONFIG_OVERRIDES` remains the final explicit override layer. Objects are merged by field, and `filesystem.scan_filters` entries are merged by `name`. Other arrays are replaced as a whole. Watch reloads configuration changes automatically.
 
 Check your changes and view the resulting configuration:
 
@@ -24,6 +24,10 @@ For an installed copy, replace `python sunpack.py` with `sunpack.exe`.
 | `recursive_authorization.enabled`       | `true` to apply the nested archive selection policy; `false` to skip this policy.                                            |
 | `post_extract.archive_cleanup_mode`     | `"r"` to recycle the original archive after complete success, `"k"` to keep it, or `"d"` to delete it.                                |
 | `post_extract.flatten_single_directory` | `true` to lift the contents of a single top-level output folder.                                                             |
+| `passwords.clipboard_passwords_enabled` | `true` (default) reads the current clipboard for CLI password candidates. |
+| `watch.clipboard_monitor_enabled` | `true` (default) lets a running Watch save clipboard password history. |
+| `watch.clipboard_builtin_max_entries` | Keep the newest 30 clipboard history entries by default, minimum 1. |
+| `watch.toast_report_retention_days` | Keep failure reports for 30 days by default, minimum 1. |
 | `extraction.content_requirement`        | `"complete"` to require a complete result, or `"allow_partial"` to accept partial recovery.                                  |
 
 For example, add these fields to the main configuration to keep original archives:
@@ -154,9 +158,21 @@ Monitored roots are stored in `sunpack_watch_roots.txt` and managed through the 
 
 Monitored input folders require NTFS. On startup or configuration reload, the backend removes confirmed non-NTFS paths from the watch list and displays a classic Windows error dialog in `cli.language`, listing the paths, filesystems, and removal result. Monitoring starts for the remaining folders without waiting for dialog acknowledgment. An empty list still allows the service to start and wait for new folders. Files and folders are not deleted, and temporarily offline paths are retained.
 
-Analysis recognizes only the current archive layer. GZIP, BZIP2, XZ, Zstandard and LZ4 streams are extracted first; a resulting TAR is discovered and extracted by the normal recursive pipeline. The former `tar_*` analysis modules and all `max_probe_bytes` settings have been removed. Ordinary TAR analysis starts at offset zero; only the canonical embedded scanner can supply TAR candidates at other offsets. An empty `watch.state_dir` still selects the default state directory. A zero `memory_reserve_bytes` or `job_buffer_budget_bytes` still selects automatic sizing or the worker default. `watch.event_log_retention_days` controls task history and event retention shared by CLI and Watch. Installer upgrades update named filters, analysis modules, and verification methods while preserving user values, module order, and unknown extensions.
+Analysis recognizes only the current archive layer. GZIP, BZIP2, XZ, Zstandard and LZ4 streams are extracted first; a resulting TAR is discovered and extracted by the normal recursive pipeline. The former `tar_*` analysis modules and all `max_probe_bytes` settings have been removed. Ordinary TAR analysis starts at offset zero; only the canonical embedded scanner can supply TAR candidates at other offsets. `job_buffer_budget_bytes` set to 0 uses the worker default buffer budget. `watch.event_log_retention_days` controls task history and event retention shared by CLI and Watch. Installer upgrades update named filters, analysis modules, and verification methods while preserving user values, module order, and unknown extensions.
 
 Add a monitored directory with `python sunpack.py watch add C:\Downloads`. Use `-o E:\Output` to choose its output directory; leaving it empty writes beside each archive. `watch list` shows the configured roots. Watch monitors files directly in each root, not its subdirectories.
+
+## Automatic runtime settings
+
+Native worker and Python stage thread capacities always use their existing automatic strategies. Queue limits are internal (4096), with existing backpressure retained. Native memory reserve is automatic: 128 MiB plus 16 MiB per nominal CPU credit. Disk-space pause/retry and idle cache maintenance are always enabled. `watch.runtime_cache_cleanup_idle_seconds` remains configurable (default 10 seconds); maintenance is event/deadline driven, not periodic idle polling. `performance.worker.writer_threads` remains configurable and both the shipped and native missing-value defaults are 4 per volume.
+
+The two clipboard switches and history limit are exposed in the ordinary configuration and remain in the advanced template. They are independent: disabling current clipboard use does not disable Watch history collection; disabling both does not erase saved history. Clipboard history is saved as plaintext in `builtin_passwords.json`.
+
+Failure reports use only `watch.toast_report_retention_days`. Count and byte limits and detail truncation have been removed. Complete details are streamed to disk during a batch. Native encoding uses fixed-size buffers and lazy failure views rather than joining error text, building copied failure trees or allocating full escaped JSON strings. Report work runs through the existing work broker, releases the GIL during encoding/I/O, and does not hold the notification-state lock while writing. Cancellation drains the writer and removes incomplete output. This bounds additional report-encoding memory, not the extraction diagnostics and native inventories already held by their owners; traversal also needs space proportional to nesting depth. Expired reports and abandoned temporary reports are cleaned when a new report is written, not by a new timer.
+
+State always lives in `.sunpack_watch` under the writable data directory (`%ProgramData%\SunPack` for installed copies). It is shared by CLI, Watch and the GUI. There is no state-directory setting or runtime directory-switch mechanism.
+
+The installer and `scripts/upgrade_config.ps1` own upgrades: ordinary clipboard/report values are preserved, missing ones are copied from the old advanced file, then filled with defaults. Retired controls are removed from the ordinary file, and installation deploys the new advanced template. Custom-state recovery/history files are copied to the fixed directory without deleting their originals; unrelated files are not copied. Conflicting existing default data, changed legacy data on a retry, or reparse points stop the migration rather than overwrite data. Runtime code does not migrate or read retired controls.
 
 Persistent passwords come only from `builtin_passwords.json`, including its `clipboard_history`. Add records with `value` to `passwords`; optional `scopes` lists absolute directories and applies to their descendants too. Omit `scopes` for global passwords. Runtime sources are explicit input (`-p`, `--pw-file`, or the password prompt) and the current clipboard.
 

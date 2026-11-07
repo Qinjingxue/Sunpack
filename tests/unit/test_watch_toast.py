@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import threading
 import time
 import weakref
@@ -8,7 +9,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from sunpack.runtime.watch.toast import WatchToastCoordinator
+from sunpack.runtime.watch.toast import WatchFailureReportStore, WatchToastCoordinator
+from sunpack.core.i18n import I18nContext
 from sunpack.core.platform.windows.toast_protocol import (
     ToastActionKind,
     ToastProgressMode,
@@ -55,8 +57,6 @@ def _config(*, language="en", debounce_ms=20):
         "watch": {
             "toast_completion_debounce_ms": debounce_ms,
             "toast_report_retention_days": 30,
-            "toast_report_max_files": 32,
-            "toast_report_max_bytes": 1024 * 1024,
         },
     }
 
@@ -180,31 +180,37 @@ def test_aggregate_progress_regresses_when_a_new_archive_joins(tmp_path):
     coordinator.stop()
 
 
-def test_busy_batch_releases_completed_requests_and_bounds_failure_details(tmp_path):
+def test_busy_batch_spools_complete_failure_details_and_releases_payloads(tmp_path):
     # A continuously active request prevents finalization. Normal drained-batch
     # tests miss retention and repeated progress scans of completed payloads.
     host = _Host()
     config = _config(debounce_ms=60_000)
-    config["watch"]["toast_report_max_bytes"] = 1024
     coordinator = WatchToastCoordinator(host, config, str(tmp_path / "state"))
     active = _task(tmp_path / "active.zip")
     coordinator.submitted("active", active.main_path)
     _ready(coordinator, "active", active)
     output = tmp_path / "output"
     output.mkdir()
+    class Payload(dict):
+        pass
+
     for index in range(40):
         key = str(index)
         task = _task(tmp_path / f"{key}.zip")
         coordinator.submitted(key, task.main_path)
         _ready(coordinator, key, task)
         if index % 2:
-            coordinator.failed(key, ["failed"], [{"message": "x" * 4096}])
+            payload = Payload(message="x" * (128 * 1024), tail=f"payload-tail-{index}")
+            reference = weakref.ref(payload)
+            coordinator.failed(key, ["failed"], [payload])
+            del payload
+            assert reference() is None
         else:
             coordinator.succeeded(key, [str(output)])
     assert set(coordinator._requests) == {"active"}
     assert coordinator._batch.succeeded == coordinator._batch.failed == 20
-    assert coordinator._batch.failure_chars <= coordinator.report_store.max_bytes // 4
-    assert len(coordinator._batch.failure_details) < coordinator._batch.failed
+    spool = coordinator._batch.failure_details
+    assert spool is not None and spool.stat().st_size > 2 * 1024 * 1024
     assert host.snapshots[-1].progress_value == pytest.approx(4001 / 4100)
     actions = host.snapshots[-1].actions
     coordinator.succeeded("active", [])
@@ -217,7 +223,9 @@ def test_busy_batch_releases_completed_requests_and_bounds_failure_details(tmp_p
     assert terminal.kind == ToastSnapshotKind.MIXED
     assert terminal.actions[0].target == str(output)
     report = Path(terminal.actions[-1].target).read_text(encoding="utf-8")
-    assert "20" in report and "omitted" in report
+    assert len(report) > 2 * 1024 * 1024
+    assert all(f"payload-tail-{index}" in report for index in range(1, 40, 2))
+    assert not spool.exists()
     assert coordinator._batch.completed == 0
     coordinator.stop()
 
@@ -557,3 +565,228 @@ def test_overlapping_resource_waits_clear_independently(tmp_path, language, sepa
         assert resumed.progress_value_text not in (label, combined)
     finally:
         coordinator.stop()
+
+
+def test_failure_reports_expire_only_by_age_on_write(tmp_path):
+    # One write crosses both former count/size limits, preserves recent reports,
+    # and removes expired reports without relying on a background timer.
+    store = WatchFailureReportStore(str(tmp_path), I18nContext("en"), retention_days=2)
+    store.directory.mkdir(parents=True)
+    recent = []
+    for index in range(18):
+        path = store.directory / f"failed-recent-{index}.txt"
+        path.write_text("x" * (128 * 1024), encoding="utf-8")
+        recent.append(path)
+    old = time.time() - 3 * 86400
+    expired = []
+    for name in ("failed-expired.txt", "failed-orphan.tmp", "batch-orphan.tmp"):
+        path = store.directory / name
+        path.write_text("old", encoding="utf-8")
+        os.utime(path, (old, old))
+        expired.append(path)
+    active = store.directory / "batch-active.tmp"
+    active.write_text("active details", encoding="utf-8")
+    os.utime(active, (old, old))
+    for name in ("failed-recent.tmp", "batch-recent.tmp", "unrelated.tmp"):
+        path = store.directory / name
+        path.write_text("keep", encoding="utf-8")
+        recent.append(path)
+    report = Path(store.write(active, 1))
+    assert "active details" in report.read_text(encoding="utf-8")
+    assert active.is_file()
+    assert all(path.is_file() for path in recent)
+    assert all(not path.exists() for path in expired)
+
+
+@pytest.mark.parametrize("storage_failure", [False, True])
+def test_stop_discards_report_spool_and_failed_storage_does_not_link_partial_report(tmp_path, monkeypatch, storage_failure):
+    # The drained success path cannot catch spool leaks on stop or misleading
+    # report links after an append error. No waits or platform resources needed.
+    host = _Host()
+    coordinator = WatchToastCoordinator(host, _config(debounce_ms=60_000), str(tmp_path))
+    task = _task(tmp_path / "failed.zip")
+    coordinator.submitted("failed", task.main_path)
+    _ready(coordinator, "failed", task)
+    if storage_failure:
+        def fail_append(path, *args):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("partial", encoding="utf-8")
+            raise OSError("disk full")
+        monkeypatch.setattr(coordinator.report_store, "append_failure", fail_append)
+    coordinator.failed("failed", ["failure"], [{"detail": "complete"}])
+    spool = coordinator._batch.failure_details
+    assert spool.is_file()
+    if storage_failure:
+        coordinator._finalize(coordinator._finalize_generation)
+        assert not _terminal_snapshots(host)[-1].actions
+    coordinator.stop()
+    assert not spool.exists()
+
+
+def test_blocked_report_append_keeps_progress_and_stop_responsive(tmp_path, monkeypatch):
+    # Pending native writes must neither own the coordinator lock nor let a
+    # drained timer publish incomplete diagnostics; stop delegates their cleanup.
+    from concurrent.futures import ThreadPoolExecutor
+
+    coordinator = WatchToastCoordinator(_Host(), _config(debounce_ms=60_000), str(tmp_path))
+    entered, release = threading.Event(), threading.Event()
+    append = coordinator.report_store.append_failure
+
+    def blocked_append(*args):
+        entered.set()
+        assert release.wait(5)
+        append(*args)
+
+    monkeypatch.setattr(coordinator.report_store, "append_failure", blocked_append)
+    first, second = _task(tmp_path / "first.zip"), _task(tmp_path / "second.zip")
+    coordinator.submitted("first", first.main_path)
+    _ready(coordinator, "first", first)
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        writing = workers.submit(coordinator.failed, "first", ["error"], [{"tail": "complete"}])
+        try:
+            assert entered.wait(2)
+            batch = coordinator._batch
+
+            def progress_and_stop():
+                coordinator._finalize(coordinator._finalize_generation)
+                assert not _terminal_snapshots(coordinator.host)
+                coordinator.submitted("second", second.main_path)
+                _ready(coordinator, "second", second)
+                coordinator.stop()
+
+            workers.submit(progress_and_stop).result(timeout=2)
+            assert coordinator.host.clear_count == 1
+        finally:
+            release.set()
+        import asyncio
+        with pytest.raises(asyncio.CancelledError):
+            writing.result(timeout=2)
+    assert batch.pending_appends == 0
+    assert not batch.failure_details.exists()
+    assert not _terminal_snapshots(coordinator.host)
+
+
+@pytest.mark.parametrize("stop", [False, True])
+def test_finalizing_report_cannot_publish_over_new_activity(tmp_path, monkeypatch, stop):
+    # The ordinary debounce tests end before publication starts. This forces
+    # activity during the disk copy and catches stale toasts/source deletion.
+    from concurrent.futures import ThreadPoolExecutor
+
+    coordinator = WatchToastCoordinator(_Host(), _config(debounce_ms=60_000), str(tmp_path))
+    first, second = _task(tmp_path / "first.zip"), _task(tmp_path / "second.zip")
+    coordinator.submitted("first", first.main_path)
+    _ready(coordinator, "first", first)
+    coordinator.failed("first", ["first-error"], [{"detail": "first-tail"}])
+    entered, release = threading.Event(), threading.Event()
+    write = coordinator.report_store.write
+
+    def blocked_write(*args):
+        entered.set()
+        assert release.wait(5)
+        return write(*args)
+
+    monkeypatch.setattr(coordinator.report_store, "write", blocked_write)
+    batch = coordinator._batch
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        publishing = workers.submit(coordinator._finalize, coordinator._finalize_generation)
+        try:
+            assert entered.wait(2)
+
+            def new_activity():
+                if stop:
+                    coordinator.stop()
+                else:
+                    coordinator.submitted("second", second.main_path)
+                    _ready(coordinator, "second", second)
+                    # Repeated drains cannot enqueue more report copies.
+                    coordinator.succeeded("second", [])
+                    coordinator._finalize(coordinator._finalize_generation)
+
+            workers.submit(new_activity).result(timeout=2)
+        finally:
+            release.set()
+        publishing.result(timeout=2)
+    assert not _terminal_snapshots(coordinator.host)
+    assert not list(coordinator.report_store.directory.glob("failed-*.txt"))
+    if stop:
+        assert not batch.failure_details.exists()
+    else:
+        assert batch.failure_details.is_file()
+        monkeypatch.setattr(coordinator.report_store, "write", write)
+        coordinator._finalize(coordinator._finalize_generation)
+        terminal = _terminal_snapshots(coordinator.host)
+        assert len(terminal) == 1 and terminal[0].kind == ToastSnapshotKind.MIXED
+        report = Path(terminal[0].actions[-1].target).read_text(encoding="utf-8")
+        assert "first-error" in report and "first-tail" in report
+        assert not batch.failure_details.exists()
+        coordinator.stop()
+
+
+@pytest.mark.parametrize("cancelled", [False, True])
+def test_serialization_failure_or_cancellation_never_links_partial_report(tmp_path, monkeypatch, cancelled):
+    import asyncio
+
+    coordinator = WatchToastCoordinator(_Host(), _config(debounce_ms=60_000), str(tmp_path))
+    task = _task(tmp_path / "failed.zip")
+    coordinator.submitted("failed", task.main_path)
+    _ready(coordinator, "failed", task)
+
+    def fail_append(path, *args):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("partial", encoding="utf-8")
+        raise asyncio.CancelledError() if cancelled else ValueError("unsupported diagnostic")
+
+    monkeypatch.setattr(coordinator.report_store, "append_failure", fail_append)
+    if cancelled:
+        with pytest.raises(asyncio.CancelledError):
+            coordinator.failed("failed", ["error"], [])
+    else:
+        coordinator.failed("failed", ["error"], [])
+    batch = coordinator._batch
+    assert batch.pending_appends == 0 and batch.report_failed
+    coordinator._finalize(coordinator._finalize_generation)
+    assert not _terminal_snapshots(coordinator.host)[-1].actions
+    assert not batch.failure_details.exists()
+    coordinator.stop()
+
+
+def test_concurrent_failure_appends_publish_only_after_both_writers_drain(tmp_path, monkeypatch):
+    # Two reserved failures contend for the spool; finalization must not infer
+    # completeness from an empty request map while either writer is still busy.
+    from concurrent.futures import ThreadPoolExecutor
+
+    host = _Host()
+    coordinator = WatchToastCoordinator(host, _config(debounce_ms=60_000), str(tmp_path))
+    for request_id in ("first", "second"):
+        task = _task(tmp_path / (request_id + ".zip"))
+        coordinator.submitted(request_id, task.main_path)
+        _ready(coordinator, request_id, task)
+    entered, release = threading.Event(), threading.Event()
+    append = coordinator.report_store.append_failure
+
+    def blocked_append(*args):
+        entered.set()
+        assert release.wait(5)
+        append(*args)
+
+    monkeypatch.setattr(coordinator.report_store, "append_failure", blocked_append)
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        first = workers.submit(coordinator.failed, "first", ["first-error"], [{"tail": "first-tail"}])
+        try:
+            assert entered.wait(2)
+            second = workers.submit(coordinator.failed, "second", ["second-error"], [{"tail": "second-tail"}])
+            with host._condition:
+                assert host._condition.wait_for(lambda: coordinator._batch.pending_appends == 2, timeout=2)
+            coordinator._finalize(coordinator._finalize_generation)
+            assert not _terminal_snapshots(host)
+        finally:
+            release.set()
+        first.result(timeout=2)
+        second.result(timeout=2)
+    coordinator._finalize(coordinator._finalize_generation)
+    final = _terminal_snapshots(host)
+    assert len(final) == 1
+    report = Path(final[0].actions[-1].target).read_text(encoding="utf-8")
+    assert all(value in report for value in ("first-error", "first-tail", "second-error", "second-tail"))
+    assert not list(coordinator.report_store.directory.glob("batch-*.tmp"))
+    coordinator.stop()

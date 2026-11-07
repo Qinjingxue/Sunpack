@@ -100,28 +100,7 @@ def _apply_native_environment(environment: dict[str, str], process_config: dict)
         if value >= minimum:
             environment[environment_key] = str(value)
 
-    thread_capacity = process_config.get("thread_capacity")
-    if thread_capacity is not None:
-        try:
-            thread_capacity = int(thread_capacity)
-        except (TypeError, ValueError):
-            thread_capacity = None
-        if thread_capacity is not None:
-            environment.pop("SUNPACK_NATIVE_WORKER_THREAD_CAPACITY", None)
-            if thread_capacity > 0:
-                environment["SUNPACK_NATIVE_WORKER_THREAD_CAPACITY"] = str(thread_capacity)
     set_int("writer_threads", "SUNPACK_ASYNC_WRITER_THREADS_PER_VOLUME")
-    set_int(
-        "memory_reserve_bytes",
-        "SUNPACK_NATIVE_MEMORY_RESERVE_BYTES",
-        minimum=0,
-    )
-    set_int("max_queue_jobs", "SUNPACK_NATIVE_MAX_QUEUE_JOBS")
-    # 空间不足自动暂停/恢复（卷级 gate）的唯一总开关。
-    space_gate = process_config.get("space_gate_enabled")
-    if space_gate is not None:
-        enabled = str(space_gate).strip().lower() not in {"0", "false", "no", "off"}
-        environment["SUNPACK_VOLUME_SPACE_GATE"] = "1" if enabled else "0"
     set_int("space_poll_interval_ms", "SUNPACK_VOLUME_SPACE_POLL_MS", minimum=50)
     set_int(
         "space_status_report_interval_ms",

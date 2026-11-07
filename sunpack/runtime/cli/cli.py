@@ -127,7 +127,7 @@ async def command_work_broker(ctx: CliContext):
     engine = current_pipeline_engine()
     broker = ctx.work_broker or (engine.work_broker if engine is not None else None)
     if broker is None and server_runtime_active():
-        broker = shared_command_work_broker(ctx.cwd)
+        broker = shared_command_work_broker()
     owned = broker is None
     if owned:
         broker = AsyncWorkBroker()

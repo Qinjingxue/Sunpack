@@ -92,5 +92,5 @@ fs::path task_directory(const Json& row);
 Json password_rows(const Json& passwords, const View& view, const std::string& language = "zh");
 Json config_fields(const Json& config, const std::string& source, const std::string& language = "zh");
 Json directory_rows(const WatchRoots& roots, const Json& config);
-fs::path log_directory(const fs::path& data_dir, const Json& config);
+fs::path log_directory(const fs::path& data_dir);
 }

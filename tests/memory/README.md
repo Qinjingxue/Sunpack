@@ -1,6 +1,6 @@
 # Watch 内存增长测试
 
-解压 worker 的预留测量使用独立测试可执行文件和 Windows Job，见 [测量说明](../../docs/worker_memory_reserve.md)。执行示例：
+解压 worker 的预留测量使用独立测试可执行文件和 Windows Job。执行示例：
 
 ```powershell
 cmake --build native/sevenzip_bridge/build-x64-ci --config Release --target sunpack_sevenzip_memory_probe sunpack_sevenzip_memory_worker --parallel 4
@@ -12,8 +12,8 @@ cmake --build native/sevenzip_bridge/build-x64-ci --config Release --target sunp
 全格式手动矩阵：`.venv/Scripts/python.exe tests/memory/worker_format_probe.py --jobs 32`。
 可用 `--corpus <目录>` 加入独立的旧 ZIP/RAR/7z 样本，`--case` 选择执行组。
 动态压力 probe 用 `--dynamic`，较快样本加 `--cpu-rate 25`，`--volumes 32` 测独立写入设施的叠加。
-当前默认预留为 `128 MiB + 16 MiB × CPU credit`；`--reserve-mib 256` 保留固定值对照。
-CPU credit 扩展与选值见 [当前测量](../../docs/worker_memory_cpu_reserve.md)，使用 `worker_credit_reserve_probe.py --credits 4 32 64 128 --all-formats --independent-volumes` 可复现。
+当前默认预留为 `128 MiB + 16 MiB × CPU credit`，不再提供固定值覆盖。
+CPU credit 扩展使用测试程序专有的处理器查询注入，不修改生产 worker 配置。使用 `worker_credit_reserve_probe.py --credits 4 32 64 128 --all-formats --independent-volumes` 可复现。
 机制、完整测量与 A/B 命令参数见 [worker 内存优化报告](../../docs/worker_memory_optimization.md)。
 
 运行长期、大量文件的 watch 内存测试：
@@ -35,7 +35,6 @@ CPU credit 扩展与选值见 [当前测量](../../docs/worker_memory_cpu_reserv
 - `SUNPACK_WATCH_MEMORY_TRACEMALLOC=1`
 - `SUNPACK_WATCH_MEMORY_CACHE_CLEANUP_IDLE_SECONDS`（默认 10）
 - `SUNPACK_WATCH_MEMORY_CACHE_CLEANUP_WAIT_SECONDS`（默认 12；设为 0 可关闭等待）
-- `SUNPACK_WATCH_MEMORY_CACHE_CLEANUP_ENABLED`（默认 1；设为 0 可运行无清理对照组）
 
 每次运行会在 pytest 的临时目录生成 `watch-memory-report.json`。报告包含每个批次的 RSS、worker RSS、watch 状态规模、队列计数，以及全局缓存、reader cache、projection cache、archive session、关系探测密码缓存、修复检查缓存和持久 worker pool 的快照。
 如果启用 cleanup 等待，还会记录 `cache_cleanup_scheduled/started/finished` 次数，以及 Native 7z 和 NTFS volume context 的条目数。

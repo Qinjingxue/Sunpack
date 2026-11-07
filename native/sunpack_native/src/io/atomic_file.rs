@@ -14,7 +14,11 @@ mod win {
             reserved: *const c_void,
         ) -> i32;
     }
-    pub(crate) fn replace(from: &std::path::Path, to: &std::path::Path) -> io::Result<()> {
+    pub(crate) fn replace_with_cancel(
+        from: &std::path::Path,
+        to: &std::path::Path,
+        cancellation: &super::super::cancellation::Cancellation,
+    ) -> io::Result<()> {
         use std::os::windows::ffi::OsStrExt;
         let from: Vec<u16> = from.as_os_str().encode_wide().chain(Some(0)).collect();
         let to: Vec<u16> = to.as_os_str().encode_wide().chain(Some(0)).collect();
@@ -25,6 +29,7 @@ mod win {
         // Retry only Windows sharing conflicts; all other errors remain
         // terminal. No arbitrary two-attempt failure under heavy I/O.
         loop {
+            cancellation.check_io()?;
             if unsafe {
                 ReplaceFileW(
                     to.as_ptr(),
@@ -43,6 +48,7 @@ mod win {
             // also reject ReplaceFile with UNABLE_TO_REMOVE_REPLACED (1175).
             // Preserve that existing fallback without masking sharing errors.
             let error = if matches!(replace_error.raw_os_error(), Some(2 | 1175)) {
+                cancellation.check_io()?;
                 if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), 1 | 8) } != 0 {
                     return Ok(());
                 }
@@ -53,6 +59,7 @@ mod win {
             if !super::sharing_conflict(&error) {
                 return Err(error);
             }
+            cancellation.check_io()?;
             // Windows has no waitable handle for another process's sharing
             // violation. Poll with a quiet interval instead of busy-spinning.
             std::thread::sleep(std::time::Duration::from_millis(50));
@@ -63,4 +70,10 @@ pub(crate) fn sharing_conflict(error: &io::Error) -> bool {
     matches!(error.raw_os_error(), Some(32 | 33))
 }
 
-pub(crate) use win::replace;
+pub(crate) use win::replace_with_cancel;
+
+// Existing transaction callers finish publication once started. Opt into
+// cancellable retries only where the owner can discard its temporary file.
+pub(crate) fn replace(from: &std::path::Path, to: &std::path::Path) -> io::Result<()> {
+    replace_with_cancel(from, to, &super::cancellation::Cancellation::default())
+}

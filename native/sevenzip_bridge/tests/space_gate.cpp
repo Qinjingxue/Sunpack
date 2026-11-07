@@ -1005,7 +1005,7 @@ void g26_registration_covers_root_directory_creation() {
 
     // SpaceJobRegistration 的 RAII 语义（含"lease 之后声明 ⇒ 先析构"的约束）。
     AsyncWriterConfig config;
-    config.space_gate_enabled = true;
+
     config.threads_per_volume = 1;
     config.buffer_count = 4;
     auto registry = std::make_shared<VolumeWriterRegistry>(
@@ -1021,20 +1021,6 @@ void g26_registration_covers_root_directory_creation() {
     check(registry->blocked_volumes().empty(),
           "G-26: 未 blocked 的卷不出现在 blocked_volumes()");
 
-    // [附加] 功能关闭时 gate 必须保持 nullptr。
-    AsyncWriterConfig off_config;
-    off_config.space_gate_enabled = false;
-    off_config.threads_per_volume = 1;
-    off_config.buffer_count = 4;
-    auto off_registry = std::make_shared<VolumeWriterRegistry>(
-        std::make_shared<sunpack::sevenzip::WriterMeters>(), off_config,
-        VolumeSpaceGate::ChangeSink{});
-    {
-        auto lease = off_registry->acquire("volume-off");
-        check(!lease.volume()->space_gate,
-              "G-26[附加]: space_gate_enabled=false 时不得创建 gate");
-    }
-    off_registry->shutdown();
     registry->shutdown();
 }
 

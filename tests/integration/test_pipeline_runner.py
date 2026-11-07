@@ -189,13 +189,12 @@ def _configure_request_runtime(engine, callback):
     engine._request_runtime_factory = configured
 
 
-def test_pipeline_runner_passes_native_worker_overrides():
+def test_pipeline_runner_passes_native_writer_configuration():
     config = normalize_config(with_detection_pipeline({
         "recursive_extract": "1",
         "performance": {
             "worker": {
-                "max_queue_jobs": 256,
-                "thread_capacity": 3,
+                "writer_threads": 3,
             },
         },
     }))
@@ -210,8 +209,7 @@ def test_pipeline_runner_passes_native_worker_overrides():
             await engine.run(["missing.zip"])
     asyncio.run(run())
 
-    assert captured["extractor"]["max_queue_jobs"] == 256
-    assert captured["extractor"]["thread_capacity"] == 3
+    assert captured["extractor"]["writer_threads"] == 3
 
 
 def test_pipeline_progress_observer_receives_extract_ready_before_native_progress(tmp_path):

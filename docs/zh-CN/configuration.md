@@ -4,7 +4,7 @@
 
 日常设置请修改 `sunpack_config.json`。源码运行时使用项目根目录中的文件；安装版使用 `%ProgramData%\SunPack\sunpack_config.json`。`sunpack_advanced_config.json` 提供其余默认值，只需把想修改的字段写进主配置。
 
-对象按字段合并，`filesystem.scan_filters` 按 `name` 合并，其余数组整体覆盖。Watch 会自动重新加载配置变更。
+普通配置的同名值优先于高级配置；`SUNPACK_CONFIG_OVERRIDES` 仍是最后一层显式覆盖。对象按字段合并，`filesystem.scan_filters` 按 `name` 合并，其余数组整体覆盖。Watch 会自动重新加载配置变更。
 
 
 修改后校验并查看最终配置：
@@ -25,6 +25,10 @@ python sunpack.py config show
 | `recursive_authorization.enabled` | `true` 启用嵌套归档筛选策略；`false` 跳过该策略。 |
 | `post_extract.archive_cleanup_mode` | 完整成功后 `"r"` 移入回收站、`"k"` 保留、`"d"` 删除原归档。 |
 | `post_extract.flatten_single_directory` | `true` 时提升唯一顶层输出目录中的内容。 |
+| `passwords.clipboard_passwords_enabled` | 默认 `true`，CLI 将当前剪贴板文本作为密码候选。 |
+| `watch.clipboard_monitor_enabled` | 默认 `true`，运行中的 Watch 保存剪贴板密码历史。 |
+| `watch.clipboard_builtin_max_entries` | 默认保留最新 30 条剪贴板历史，最小 1。 |
+| `watch.toast_report_retention_days` | 默认保留失败报告 30 天，最小 1。 |
 | `extraction.content_requirement` | `"complete"` 要求完整结果；`"allow_partial"` 接受部分恢复结果。 |
 
 例如，在主配置中加入以下字段，可保留原归档并扫描子目录：
@@ -115,9 +119,21 @@ GUI 按 Windows 本地时区编辑时间，保存时转成 UTC。大小单位支
 
 监控输入目录仅支持 NTFS。后端启动或重载配置时，会自动从监控列表移除确认位于非 NTFS 文件系统的路径，并按 `cli.language` 弹出经典 Windows 错误窗口，列出路径、文件系统和已移除说明。无需等待弹窗确认即可继续监控其余目录；如果列表已空，服务仍可正常启动并等待添加目录。此操作不会删除目录或文件，暂时离线的路径不会因此被移除。
 
-分析只识别当前层格式。GZIP、BZIP2、XZ、Zstandard、LZ4 先解开外层流，产出的 TAR 再由正常递归流程识别和解压；不提前识别复合格式。原 `tar_*` 分析模块及全部 `max_probe_bytes` 配置已删除。普通 TAR 分析仅从偏移 0 开始，其他位置的 TAR 候选只来自统一的 embedded 扫描器。`watch.state_dir` 留空仍表示默认状态目录；`memory_reserve_bytes` 和 `job_buffer_budget_bytes` 为 0 时仍使用自动值或工作进程默认值。`watch.event_log_retention_days` 控制 CLI 与监控共用的任务历史和事件保留天数。
+分析只识别当前层格式。GZIP、BZIP2、XZ、Zstandard、LZ4 先解开外层流，产出的 TAR 再由正常递归流程识别和解压；不提前识别复合格式。原 `tar_*` 分析模块及全部 `max_probe_bytes` 配置已删除。普通 TAR 分析仅从偏移 0 开始，其他位置的 TAR 候选只来自统一的 embedded 扫描器。`job_buffer_budget_bytes` 为 0 时使用工作进程默认缓冲预算。`watch.event_log_retention_days` 控制 CLI 与监控共用的任务历史和事件保留天数。
 
 使用 `python sunpack.py watch add C:\Downloads` 添加监控目录，附加 `-o E:\Output` 可指定输出目录；留空时解压到各归档所在文件夹。`watch list` 可查看目录。加 `--recursive` 可递归监控子目录，每个监控根独立保存该标志。
+
+## 自动运行参数
+
+原生 worker 和 Python 阶段线程容量始终采用现有自动策略。队列上限固定为内部参数 4096，保留原有背压。内存预留自动计算为 128 MiB 加上每个名义 CPU 配额 16 MiB。磁盘空间不足暂停/恢复及空闲缓存维护始终开启；`watch.runtime_cache_cleanup_idle_seconds` 仍可配置，默认 10 秒，继续按事件和截止时间唤醒，不新增空闲轮询。`performance.worker.writer_threads` 仍可配置，模板默认值和原生缺失默认值均为每卷 4 个。
+
+两个剪贴板开关和历史上限已复制到普通配置，高级模板中也保留。这两个开关独立：关闭当前剪贴板密码使用不等于关闭 Watch 历史采集；两者都关闭也不会删除已保存历史。历史以明文保存在 `builtin_passwords.json`。
+
+失败报告仅按 `watch.toast_report_retention_days` 保留，数量上限、字节预算及详情截断均已移除。批次详情由原生代码流式写盘，使用固定缓冲和惰性失败视图，不拼接大错误文本、不复制整棵失败树，也不生成完整转义 JSON 大字符串。报告任务复用现有工作调度，编码和 I/O 时释放 GIL，写盘不持有通知状态锁；取消会等待写入退出并清理未完成文件。这里约束的是报告编码的额外内存，不是解压流程已经持有的诊断和原生清单；遍历仍需要与嵌套深度成正比的空间。新报告写入时清理过期报告和遗留临时报告，不新增定时器。
+
+状态固定放在可写数据目录下的 `.sunpack_watch`，安装版即 `%ProgramData%\SunPack\.sunpack_watch`，CLI、Watch、GUI 共用。不再提供状态目录配置或运行时切换机制。
+
+升级只由安装器和 `scripts/upgrade_config.ps1` 处理：已有普通剪贴板/报告配置优先，缺失字段取旧高级值，再取默认值；普通配置中的已删除参数会被移除，安装器部署新的高级模板。旧自定义状态目录中的恢复和历史数据复制到固定目录，保留原文件，不复制无关内容。若固定目录已有冲突数据、重试时旧数据已变化，或路径包含重解析点，迁移会停止而不覆盖数据。运行时不迁移或读取已删除的配置。
 
 持久化密码只来自 `builtin_passwords.json`，包括其中的 `clipboard_history`。在 `passwords` 中填写 `value`，可用 `scopes` 指定一个或多个绝对目录，对其子目录也生效；省略 `scopes` 即全局生效。运行时来源包括显式输入（`-p`、`--pw-file` 或密码提示框）与当前剪贴板。
 

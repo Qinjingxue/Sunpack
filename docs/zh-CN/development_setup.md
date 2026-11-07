@@ -177,7 +177,7 @@ ctest --test-dir native\toast_host\build-x64 -C Release --output-on-failure
 Copy-Item native\toast_host\build-x64\Release\sunpack_toast.dll tools\sunpack_toast.dll -Force
 ```
 
-持续运行的 watch 按 `watch.toast_enabled` 创建 Windows 通知能力，并按配置发送进度、完成和失败通知。普通 CLI 请求以及 `watch start --once` 不创建通知能力。通知失败报告写入 `watch.state_dir` 管理的状态目录。
+持续运行的 watch 按 `watch.toast_enabled` 创建 Windows 通知能力，并按配置发送进度、完成和失败通知。普通 CLI 请求以及 `watch start --once` 不创建通知能力。通知失败报告写入可写数据目录下的 `.sunpack_watch/failures`。
 
 ## Smoke Checks
 

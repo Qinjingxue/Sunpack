@@ -137,7 +137,6 @@ def test_watch_deadline_clears_only_after_idle_window(tmp_path):
         make_config({
             "watch": {
                 "clipboard_monitor_enabled": False,
-                "runtime_cache_cleanup_enabled": True,
                 "runtime_cache_cleanup_idle_seconds": 10,
             }
         }),
@@ -162,8 +161,7 @@ def test_watch_deadline_clears_only_after_idle_window(tmp_path):
     assert engine.clear_calls == 1
 
 
-@pytest.mark.parametrize("cache_cleanup_enabled", [False, True])
-def test_ignored_log_history_expires_without_pipeline_activity(tmp_path, monkeypatch, cache_cleanup_enabled):
+def test_ignored_log_history_expires_without_pipeline_activity(tmp_path, monkeypatch):
     # Store-only expiry tests cannot catch a sleeping Watch that never schedules
     # cleanup after ignored events. Exercise real admission and next deadlines.
     import sunpack.runtime.watch.scheduler as scheduler_module
@@ -175,7 +173,7 @@ def test_ignored_log_history_expires_without_pipeline_activity(tmp_path, monkeyp
         engine = _CleanupOnlyEngine()
         watcher = WatchScheduler(
             make_config({"watch": {"clipboard_monitor_enabled": False,
-                "runtime_cache_cleanup_enabled": cache_cleanup_enabled}}),
+                "runtime_cache_cleanup_idle_seconds": 10}}),
             [str(tmp_path)], output_roots={str(tmp_path): str(tmp_path / "out")},
             state_path=str(tmp_path / "state.snapshot"),
             pipeline_engine=engine, wake_callback=lambda: wakeups.append("wake"),
@@ -224,7 +222,7 @@ def test_failed_wal_retirement_schedules_one_idle_retry(tmp_path, monkeypatch, s
         wake = Event()
         watcher = WatchScheduler(
             make_config({"watch": {"clipboard_monitor_enabled": False,
-                "runtime_cache_cleanup_enabled": False, "runtime_cache_cleanup_idle_seconds": 10}}),
+                "runtime_cache_cleanup_idle_seconds": 10}}),
             [str(tmp_path)], output_roots={str(tmp_path): str(tmp_path / "out")},
             state_path=str(tmp_path / "state.snapshot"),
             pipeline_engine=_CleanupOnlyEngine(), wake_callback=wake.set,
@@ -365,7 +363,6 @@ def test_external_activity_resets_and_rearms_idle_cleanup(tmp_path):
         make_config({
             "watch": {
                 "clipboard_monitor_enabled": False,
-                "runtime_cache_cleanup_enabled": True,
                 "runtime_cache_cleanup_idle_seconds": 10,
             }
         }),
@@ -385,7 +382,7 @@ def test_external_activity_resets_and_rearms_idle_cleanup(tmp_path):
     assert wakeups == ["wake"]
 
 
-def test_idle_maintenance_expires_cli_mode_when_cache_cleanup_is_disabled(tmp_path):
+def test_idle_maintenance_expires_cli_mode_and_clears_caches(tmp_path):
     from sunpack.runtime.cli.runtime_state import set_runtime_host
     from sunpack.runtime.watch.scanner import WatchCandidate
 
@@ -395,7 +392,6 @@ def test_idle_maintenance_expires_cli_mode_when_cache_cleanup_is_disabled(tmp_pa
             make_config({
                 "watch": {
                     "clipboard_monitor_enabled": False,
-                    "runtime_cache_cleanup_enabled": False,
                     "runtime_cache_cleanup_idle_seconds": 10,
                 }
             }),
@@ -422,7 +418,7 @@ def test_idle_maintenance_expires_cli_mode_when_cache_cleanup_is_disabled(tmp_pa
 
             assert host.process_mode == "background"
             assert host._cli_process_mode_override is None
-            assert engine.clear_calls == 0
+            assert engine.clear_calls == 1
             assert watcher.state.latest_entry_for_path(str(recovering)) is not None
             watcher.state.complete_work([str(recovering)])
             watcher._cache_cleanup_deadline = 0
@@ -444,7 +440,6 @@ def test_cleanup_gate_waits_for_foreground_activity(tmp_path):
             make_config({
                 "watch": {
                     "clipboard_monitor_enabled": False,
-                    "runtime_cache_cleanup_enabled": True,
                     "runtime_cache_cleanup_idle_seconds": 10,
                 }
             }),
@@ -475,7 +470,6 @@ def test_external_activity_waits_for_cleanup_already_in_progress(tmp_path):
             make_config({
                 "watch": {
                     "clipboard_monitor_enabled": False,
-                    "runtime_cache_cleanup_enabled": True,
                     "runtime_cache_cleanup_idle_seconds": 10,
                 }
             }),
@@ -508,7 +502,6 @@ def test_foreground_lifecycle_clears_runtime_caches_after_idle(tmp_path):
             make_config({
                 "watch": {
                     "clipboard_monitor_enabled": False,
-                    "runtime_cache_cleanup_enabled": True,
                     "runtime_cache_cleanup_idle_seconds": 10,
                 }
             }),
@@ -622,7 +615,6 @@ def test_external_activity_release_during_pending_acquire_leaves_gate_free(tmp_p
             make_config({
                 "watch": {
                     "clipboard_monitor_enabled": False,
-                    "runtime_cache_cleanup_enabled": True,
                     "runtime_cache_cleanup_idle_seconds": 10,
                 }
             }),

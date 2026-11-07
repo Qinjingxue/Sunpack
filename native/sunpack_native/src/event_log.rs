@@ -49,11 +49,26 @@ fn short_string<'py>(
         .get_item(PySlice::new(text.py(), 0, chars as isize, 1))?
         .cast_into::<PyString>()?)
 }
-fn bounded_value(
-    value: &Bound<'_, PyAny>,
+#[derive(Default)]
+struct DiagnosticTypes<'py> {
+    // Resolve only if a non-builtin container occurs, once per event traversal.
+    abc: Option<(Bound<'py, PyAny>, Bound<'py, PyAny>)>,
+}
+impl<'py> DiagnosticTypes<'py> {
+    fn get(&mut self, py: Python<'py>) -> PyResult<&(Bound<'py, PyAny>, Bound<'py, PyAny>)> {
+        if self.abc.is_none() {
+            let abc = py.import("collections.abc")?;
+            self.abc = Some((abc.getattr("Mapping")?, abc.getattr("Sequence")?));
+        }
+        Ok(self.abc.as_ref().unwrap())
+    }
+}
+fn bounded_value<'py>(
+    value: &Bound<'py, PyAny>,
     budget: &mut usize,
     depth: usize,
     truncated: &mut bool,
+    types: &mut DiagnosticTypes<'py>,
 ) -> PyResult<Value> {
     if *budget == 0 || depth == 8 {
         *truncated = true;
@@ -73,8 +88,9 @@ fn bounded_value(
     }
     if let Ok(dict) = value.cast::<PyDict>() {
         let mut result = serde_json::Map::new();
-        for (i, (key, item)) in dict.iter().enumerate() {
-            if i == 64 || *budget == 0 {
+        *truncated |= dict.len() > 64;
+        for (key, item) in dict.iter().take(64) {
+            if *budget == 0 {
                 *truncated = true;
                 break;
             }
@@ -83,19 +99,20 @@ fn bounded_value(
             *budget = budget.saturating_sub(key.len());
             result.insert(
                 key.to_owned(),
-                bounded_value(&item, budget, depth + 1, truncated)?,
+                bounded_value(&item, budget, depth + 1, truncated, types)?,
             );
         }
         return Ok(Value::Object(result));
     }
     if value.is_instance_of::<PyList>() || value.is_instance_of::<PyTuple>() {
         let mut items = Vec::new();
-        for (i, item) in value.try_iter()?.enumerate() {
-            if i == 64 || *budget == 0 {
+        *truncated |= value.len()? > 64;
+        for item in value.try_iter()?.take(64) {
+            if *budget == 0 {
                 *truncated = true;
                 break;
             }
-            items.push(bounded_value(&item?, budget, depth + 1, truncated)?);
+            items.push(bounded_value(&item?, budget, depth + 1, truncated, types)?);
         }
         return Ok(Value::Array(items));
     }
@@ -105,6 +122,45 @@ fn bounded_value(
         || value.is_instance_of::<PyFloat>()
     {
         return py_to_json(value);
+    }
+    let (mapping_type, sequence_type) = types.get(value.py())?;
+    let mapping = value.is_instance(mapping_type)?;
+    let sequence = !mapping
+        && !value.is_instance_of::<pyo3::types::PyBytes>()
+        && !value.is_instance_of::<pyo3::types::PyByteArray>()
+        && value.is_instance(sequence_type)?;
+    if mapping {
+        let mut result = serde_json::Map::new();
+        // Iterate keys directly: never collect keys/items from a large mapping.
+        *truncated |= value.len()? > 64;
+        for key in value.try_iter()?.take(64) {
+            if *budget == 0 {
+                *truncated = true;
+                break;
+            }
+            let key = key?;
+            let item = value.get_item(&key)?;
+            let short = short_string(key.cast::<PyString>()?, (*budget).min(64), truncated)?;
+            let short = short.to_str()?;
+            *budget = budget.saturating_sub(short.len());
+            result.insert(
+                short.to_owned(),
+                bounded_value(&item, budget, depth + 1, truncated, types)?,
+            );
+        }
+        return Ok(Value::Object(result));
+    }
+    if sequence {
+        let mut result = Vec::new();
+        *truncated |= value.len()? > 64;
+        for item in value.try_iter()?.take(64) {
+            if *budget == 0 {
+                *truncated = true;
+                break;
+            }
+            result.push(bounded_value(&item?, budget, depth + 1, truncated, types)?);
+        }
+        return Ok(Value::Array(result));
     }
     Ok(Value::Null)
 }
@@ -138,6 +194,7 @@ fn event_value(value: &Bound<'_, PyAny>) -> PyResult<Value> {
             | "pipeline_sources_released"
     );
     let mut budget = DIAGNOSTIC_TEXT_BYTES;
+    let mut types = DiagnosticTypes::default();
     let mut result = serde_json::Map::new();
     // Preserve identity/relations regardless of diagnostic field order/size.
     result.insert("event".into(), json!(diagnostic_text(event)));
@@ -183,7 +240,7 @@ fn event_value(value: &Bound<'_, PyAny>) -> PyResult<Value> {
         budget -= end;
         result.insert(
             key[..end].to_owned(),
-            bounded_value(&item, &mut budget, 0, &mut truncated)?,
+            bounded_value(&item, &mut budget, 0, &mut truncated, &mut types)?,
         );
     }
     if truncated {

@@ -53,7 +53,7 @@ def test_scan_flags_survive_live_edits_restart_and_split_recovery(tmp_path, monk
         encoding="utf-8",
     )
     config = plan7_watch_config(passwords=["wrong-password", PASSWORD])
-    config["watch"].update(state_dir=str(tmp_path / "state"), tray_enabled=False, toast_enabled=False)
+    config["watch"].update(tray_enabled=False, toast_enabled=False)
     monkeypatch.setattr(service_module, "watch_roots_path", lambda: roots_path)
     monkeypatch.setattr(service_module, "load_config", lambda: deepcopy(config))
     scans = []

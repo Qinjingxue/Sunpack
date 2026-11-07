@@ -28,10 +28,10 @@ def large_enc(tmp_path_factory, request):
     return root
 
 
-@pytest.mark.parametrize("capacity,executor_threads", [(1, None), (2, None), (3, None), (5, None), (9, None), (9, 3), (9, 1)])
-def test_large_enc_uses_only_granted_credits_and_matches_official_bytes(tmp_path, large_enc, capacity, executor_threads):
+@pytest.mark.parametrize("executor_threads", [None, 3, 1])
+def test_large_enc_uses_only_granted_credits_and_matches_official_bytes(tmp_path, large_enc, executor_threads):
     request = {"job_id": "enc", "origin": "foreground", "archive_input": {"entry_path": str(large_enc / "large.enc"), "open_mode": "file", "format_hint": "enc"}, "output_dir": str(tmp_path / "out"), "password": "sunpack-test"}
-    env = os.environ | {"SUNPACK_NATIVE_WORKER_THREAD_CAPACITY": str(capacity)}
+    env = os.environ.copy()
     if executor_threads:
         env["RAYON_NUM_THREADS"] = str(executor_threads)
     completed = subprocess.run([str(sevenzip_artifact("sunpack_sevenzip_worker.exe"))],
@@ -49,19 +49,21 @@ def test_large_enc_uses_only_granted_credits_and_matches_official_bytes(tmp_path
     # all of them before this first extraction progress callback.
     assert cpu["decoder_cpu_credits"] == 1
     assert cpu["current_decoder_extra_credits"] == 0
-    assert cpu["peak_decoder_extra_credits"] == min(3, capacity - 1)
+    handshake = json.loads(completed.stdout.splitlines()[0])
+    assert cpu["peak_decoder_extra_credits"] == min(3, int(handshake["thread_capacity"]) - 1)
     assert not cpu["decoder_parallel"]
 
 
-def test_parallel_enc_releases_credits_after_mac_failure_for_watch_and_cli(tmp_path, large_enc, monkeypatch):
+def test_parallel_enc_releases_credits_after_mac_failure_for_watch_and_cli(tmp_path, large_enc):
     from sunpack.pipeline.extraction.internal.sevenzip.sevenzip_runner import _AsyncNativeWorkerProcess
 
-    monkeypatch.setenv("SUNPACK_NATIVE_WORKER_THREAD_CAPACITY", "4")
     events = []
+    capacities = []
 
     async def run():
         process = _AsyncNativeWorkerProcess(str(sevenzip_artifact("sunpack_sevenzip_worker.exe")), None)
         await process.start()
+        capacities.append(int(process.handshake["thread_capacity"]))
         try:
             for wave in range(3):
                 finished = []
@@ -89,7 +91,7 @@ def test_parallel_enc_releases_credits_after_mac_failure_for_watch_and_cli(tmp_p
     cpu = [e for e in events if e.get("event") == "decoder_started"]
     assert cpu and all(e["decoder_cpu_credits"] == 1 and e["current_decoder_extra_credits"] == 0 for e in cpu)
     final_cpu = next(e for e in cpu if e["job_id"] == "16")
-    assert final_cpu["peak_decoder_extra_credits"] == 3
+    assert final_cpu["peak_decoder_extra_credits"] == min(3, capacities[0] - 1)
 
 
 @pytest.mark.parametrize("origin", ["foreground", "watch"])
@@ -115,7 +117,7 @@ def test_enc_carrier_ranges_keep_ctr_continuity_and_reject_missing_tail(tmp_path
     completed = subprocess.run([str(sevenzip_artifact("sunpack_sevenzip_worker.exe"))],
                                input=json.dumps(request), capture_output=True, text=True, encoding="utf-8",
                                timeout=30, creationflags=subprocess.CREATE_NO_WINDOW,
-                               env=os.environ | {"SUNPACK_NATIVE_WORKER_THREAD_CAPACITY": "4"})
+                               env=os.environ.copy())
     events = [event for line in completed.stdout.splitlines()
               if (event := parse_worker_transport_event(line))]
     result = next(event for event in events if event.get("type") == "result")

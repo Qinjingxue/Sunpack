@@ -268,7 +268,7 @@ uv run --locked pytest
 - Windows 通知：`%ProgramData%\SunPack\.sunpack_watch\toast_host_events.jsonl`
 - 后台 Runtime：`%ProgramData%\SunPack\runtime-*.state.events.json` 及对应 `.store` 目录
 
-显示历史清单与对应 `.store` 数据目录需一起打包，不是可逐行读取的 JSONL。若修改了 `watch.state_dir`，前三项位于自定义状态目录。提交前请删除日志中的密码、私人路径等敏感信息。
+显示历史清单与对应 `.store` 数据目录需一起打包，不是可逐行读取的 JSONL。状态目录固定为数据目录下的 `.sunpack_watch`。提交前请删除日志中的密码、私人路径等敏感信息。
 
 ## 致谢
 

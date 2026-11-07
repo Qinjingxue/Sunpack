@@ -391,16 +391,16 @@ void r8_finish_while_paused(const std::filesystem::path &directory) {
           "R-8: finish() 不得发出 space_resumed");
 }
 
-// R-11a 开关关闭 —— Data 路径
-void r11a_flag_off_data_legacy_semantics(const std::filesystem::path &directory) {
-    // gate == nullptr：功能关闭 / 无卷身份。
+// R-11a 无卷 gate —— Data 路径
+void r11a_no_volume_gate_data_failure(const std::filesystem::path &directory) {
+    // gate == nullptr：无卷身份。
     AsyncWriterConfig config;
     config.threads_per_volume = 1;
     config.buffer_count = 8;
-    config.space_gate_enabled = false;
+
     auto meters = std::make_shared<WriterMeters>();
     auto state = make_volume_state("volume:off", true);
-    check(!state->space_gate, "R-11a: space_gate_enabled=false 时 VolumeState 不得有 gate");
+    check(!state->space_gate, "R-11a: 无卷 gate 时 VolumeState 不得有 gate");
     AsyncFileWriter writer(meters, state, config);
 
     constexpr std::size_t kPayload = 1 * kMib;
@@ -416,7 +416,7 @@ void r11a_flag_off_data_legacy_semantics(const std::filesystem::path &directory)
           "R-11a: 写入必须被接受");
 
     check(wait_until([&] { return writer.snapshot_file(file).failed; }, 5s),
-          "R-11a: 关闭开关时空间错误必须走旧的永久失败路径");
+          "R-11a: 无卷 gate 时空间错误必须走旧的永久失败路径");
 
     // 四条旧副作用逐条断言（只断言"job 最终失败"是不够的）。
     const auto snapshot = writer.snapshot_file(file);
@@ -440,7 +440,7 @@ void r11a_flag_off_data_legacy_semantics(const std::filesystem::path &directory)
           "R-11a: 后续 write() 不得阻塞");
 
     check(writer.finish_job(job) != S_OK, "R-11a: finish_job 必须返回非 S_OK");
-    // 关闭开关时绝不能有任何空间事件。
+    // 无卷 gate 时绝不能有任何空间事件。
     check(writer.volume_state()->space_gate == nullptr, "R-11a: 不得创建 gate");
 }
 
@@ -449,7 +449,7 @@ void r13_abort_then_finish(const std::filesystem::path &directory) {
     AsyncWriterConfig config;
     config.threads_per_volume = 1;
     config.buffer_count = 8;
-    config.space_gate_enabled = true;
+
     auto meters = std::make_shared<WriterMeters>();
     auto log = std::make_shared<SinkLog>();
     auto registry = std::make_shared<VolumeWriterRegistry>(
@@ -530,7 +530,7 @@ void r15_space_job_registration(const std::filesystem::path &directory) {
     AsyncWriterConfig config;
     config.threads_per_volume = 1;
     config.buffer_count = 4;
-    config.space_gate_enabled = true;
+
     auto meters = std::make_shared<WriterMeters>();
     VolumeWriterRegistry registry(meters, config, VolumeSpaceGate::ChangeSink{});
 
@@ -562,7 +562,7 @@ void r16_reaped_writer_does_not_poison_gate(const std::filesystem::path &directo
     AsyncWriterConfig config;
     config.threads_per_volume = 1;
     config.buffer_count = 4;
-    config.space_gate_enabled = true;
+
     config.idle_timeout = 50ms;
     auto meters = std::make_shared<WriterMeters>();
     auto registry = std::make_shared<VolumeWriterRegistry>(
@@ -913,18 +913,18 @@ void r10_directory_retry_and_memo(const std::filesystem::path &directory) {
     }
 }
 
-// R-11b 开关关闭 —— Open / Flush 路径
-void r11b_flag_off_open_and_flush(const std::filesystem::path &directory) {
+// R-11b 无卷 gate —— Open / Flush 路径
+void r11b_no_volume_gate_open_and_flush(const std::filesystem::path &directory) {
     // ① Open 的空间类错误：标记 file/job 失败 + 置 open_attempted，并且只尝试一次。
     {
         AsyncWriterConfig config;
         config.threads_per_volume = 1;
         config.buffer_count = 4;
-        config.space_gate_enabled = false;
+
         auto meters = std::make_shared<WriterMeters>();
         auto state = make_volume_state("volume:off-open", true);
         AsyncFileWriter writer(meters, state, config);
-        check(!state->space_gate, "R-11b: 开关关闭时不得有 gate");
+        check(!state->space_gate, "R-11b: 无卷 gate 时不得有 gate");
 
         std::atomic<int> open_calls{0};
         writer.set_open_probe_for_test(
@@ -964,7 +964,7 @@ void r11b_flag_off_open_and_flush(const std::filesystem::path &directory) {
         config.threads_per_volume = 1;
         config.buffer_count = 4;
         config.write_through = true;
-        config.space_gate_enabled = false;
+
         auto meters = std::make_shared<WriterMeters>();
         auto state = make_volume_state("volume:off-flush", true);
         AsyncFileWriter writer(meters, state, config);
@@ -995,8 +995,8 @@ void r11b_flag_off_open_and_flush(const std::filesystem::path &directory) {
     }
 }
 
-// R-11c 开关关闭 —— Directory 路径
-void r11c_flag_off_directory(const std::filesystem::path &directory) {
+// R-11c 无卷 gate —— Directory 路径
+void r11c_no_volume_gate_directory(const std::filesystem::path &directory) {
     using sunpack::sevenzip::create_directories_with_space_gate;
 
     // gate == nullptr 时：只尝试一次，原样返回原始 std::error_code，绝不重试。
@@ -1311,26 +1311,32 @@ void phase_6c_default_enabled() {
     const DWORD saved_length = GetEnvironmentVariableW(kName, saved, 16);
     const bool had_value = saved_length > 0 && saved_length < 16;
 
-    // ① 未设置时必须默认开启（这就是"功能真的生效"这件事本身）。
-    SetEnvironmentVariableW(kName, nullptr);
-    const auto defaulted = sunpack::sevenzip::configured_async_writer_config();
-    check(defaulted.space_gate_enabled,
-          "Phase 6c: 未设置 SUNPACK_VOLUME_SPACE_GATE 时 space_gate_enabled 必须为 true");
+    constexpr const wchar_t *kThreads = L"SUNPACK_ASYNC_WRITER_THREADS_PER_VOLUME";
+    constexpr const wchar_t *kQueue = L"SUNPACK_ASYNC_WRITER_QUEUE_LIMIT";
+    wchar_t saved_threads[32]{}, saved_queue[32]{};
+    GetEnvironmentVariableW(kThreads, saved_threads, 32);
+    GetEnvironmentVariableW(kQueue, saved_queue, 32);
+    SetEnvironmentVariableW(kThreads, nullptr);
+    SetEnvironmentVariableW(kQueue, L"1");
+    auto defaults = sunpack::sevenzip::configured_async_writer_config();
+    check(defaults.threads_per_volume == 4 && defaults.queue_limit == 4096,
+          "Writer defaults must use four threads and internal queue capacity");
+    SetEnvironmentVariableW(kThreads, L"3");
+    check(sunpack::sevenzip::configured_async_writer_config().threads_per_volume == 3,
+          "Writer threads must remain configurable");
+    SetEnvironmentVariableW(kThreads, saved_threads[0] ? saved_threads : nullptr);
+    SetEnvironmentVariableW(kQueue, saved_queue[0] ? saved_queue : nullptr);
 
-    // ② 一键回退路径必须仍然有效（关闭时逐语义回到改动前）。
+    // Removed environment toggles cannot disable gate creation.
     SetEnvironmentVariableW(kName, L"0");
-    check(!sunpack::sevenzip::configured_async_writer_config().space_gate_enabled,
-          "Phase 6c: SUNPACK_VOLUME_SPACE_GATE=0 必须能关掉");
-
-    // ③ 显式开启（L4 / 生产排查用）。
-    SetEnvironmentVariableW(kName, L"1");
-    check(sunpack::sevenzip::configured_async_writer_config().space_gate_enabled,
-          "Phase 6c: SUNPACK_VOLUME_SPACE_GATE=1 必须开启");
-
-    // ④ 只允许一个开关：不存在第二个 feature gate。
-    check(!sunpack::sevenzip::configured_async_writer_config().write_through ||
-              true,
-          "Phase 6c: （占位）配置快照可读");
+    auto registry = std::make_shared<VolumeWriterRegistry>(
+        std::make_shared<WriterMeters>(),
+        sunpack::sevenzip::configured_async_writer_config(), VolumeSpaceGate::ChangeSink{});
+    {
+        auto lease = registry->acquire("job:always-enabled");
+        check(lease.volume()->space_gate != nullptr, "Space gates must always be created");
+    }
+    registry->shutdown();
 
     SetEnvironmentVariableW(kName, had_value ? saved : nullptr);
 
@@ -1408,9 +1414,9 @@ int main(int argc, char **argv) {
         {"R-8  finish while paused", [&] { r8_finish_while_paused(directory); }},
         {"R-9  flush space error", [&] { r9_flush_space_error(directory); }},
         {"R-10 directory retry and memo", [&] { r10_directory_retry_and_memo(directory); }},
-        {"R-11a flag off data legacy", [&] { r11a_flag_off_data_legacy_semantics(directory); }},
-        {"R-11b flag off open and flush", [&] { r11b_flag_off_open_and_flush(directory); }},
-        {"R-11c flag off directory", [&] { r11c_flag_off_directory(directory); }},
+        {"R-11a flag off data legacy", [&] { r11a_no_volume_gate_data_failure(directory); }},
+        {"R-11b flag off open and flush", [&] { r11b_no_volume_gate_open_and_flush(directory); }},
+        {"R-11c flag off directory", [&] { r11c_no_volume_gate_directory(directory); }},
         {"R-13 abort then finish", [&] { r13_abort_then_finish(directory); }},
         {"R-14 terminal records discarded", [&] { r14_terminal_records_discarded(directory); }},
         {"R-15 space job registration", [&] { r15_space_job_registration(directory); }},

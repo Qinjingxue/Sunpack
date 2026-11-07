@@ -525,20 +525,15 @@ def _job_request(job_id: str, archive: Path, output_dir: Path, volume_key: str =
 
 
 def _gate_environment() -> dict[str, str]:
-    """打开卷空间 gate。
+    """Use faster polling for tests; the production space gate is always enabled.
 
-    默认显式注入 `SUNPACK_VOLUME_SPACE_GATE=1`：必须在"功能被明确开启"这一前提下
-    验证行为，否则一旦默认值被改回 false，本文件会静默地测了个寂寞。
-
-    设 `SUNPACK_SPACE_TEST_USE_NATIVE_DEFAULT=1` 时不注入任何开关，用来验证
-    "默认开启"本身真的生效（端到端，而不是只读配置）。
+    SUNPACK_SPACE_TEST_USE_NATIVE_DEFAULT=1 also exercises default polling intervals.
     """
 
     if os.environ.get("SUNPACK_SPACE_TEST_USE_NATIVE_DEFAULT") == "1":
         return {}
 
     return {
-        "SUNPACK_VOLUME_SPACE_GATE": "1",
         "SUNPACK_VOLUME_SPACE_POLL_MS": "200",
         "SUNPACK_VOLUME_SPACE_STATUS_REPORT_MS": "1000",
     }

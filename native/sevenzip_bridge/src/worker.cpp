@@ -1380,40 +1380,6 @@ int run_request(
     return ok ? 0 : 1;
 }
 
-std::size_t configured_native_queue_capacity() noexcept {
-    const char* value = std::getenv("SUNPACK_NATIVE_MAX_QUEUE_JOBS");
-    if (!value || !*value) {
-        return 4096;
-    }
-    char* end = nullptr;
-    const unsigned long long configured = std::strtoull(value, &end, 10);
-    if (end == value || *end != '\0') {
-        return 0;
-    }
-    return (std::min)(static_cast<std::size_t>(configured), std::size_t{1'000'000});
-}
-
-std::size_t configured_native_size(
-    const char* name,
-    std::size_t fallback,
-    std::size_t minimum = 1,
-    std::size_t maximum = (std::numeric_limits<std::size_t>::max)()
-) noexcept {
-    const char* value = std::getenv(name);
-    if (!value || !*value) {
-        return fallback;
-    }
-    char* end = nullptr;
-    const unsigned long long configured = std::strtoull(value, &end, 10);
-    if (end == value || *end != '\0') {
-        return fallback;
-    }
-    const auto bounded = (std::min)(
-        configured,
-        static_cast<unsigned long long>(maximum));
-    return (std::max)(minimum, static_cast<std::size_t>(bounded));
-}
-
 sunpack::sevenzip::NativeMachineResources native_machine_resources() noexcept {
     sunpack::sevenzip::NativeMachineResources resources;
     const unsigned hardware = std::thread::hardware_concurrency();
@@ -1431,13 +1397,6 @@ std::string requested_native_process_mode() {
     const char* configured = std::getenv("SUNPACK_NATIVE_PROCESS_MODE");
     const std::string mode = configured ? std::string(configured) : "normal";
     return mode == "background" || mode == "high" ? mode : "normal";
-}
-
-sunpack::sevenzip::NativeSizingOverrides configured_native_sizing_overrides() noexcept {
-    sunpack::sevenzip::NativeSizingOverrides overrides;
-    overrides.thread_capacity = configured_native_size(
-        "SUNPACK_NATIVE_WORKER_THREAD_CAPACITY", 0, 0, 32);
-    return overrides;
 }
 
 bool apply_native_process_mode(const std::string& mode) noexcept {
@@ -1458,16 +1417,6 @@ bool apply_native_process_mode(const std::string& mode) noexcept {
 #else
     return mode != "background";
 #endif
-}
-
-std::uint64_t configured_memory_reserve_bytes(std::size_t cpu_credits) noexcept {
-    const auto configured = configured_native_size(
-        "SUNPACK_NATIVE_MEMORY_RESERVE_BYTES",
-        0,
-        0,
-        static_cast<std::size_t>((std::numeric_limits<std::int64_t>::max)()));
-    return configured != 0 ? configured
-        : sunpack::sevenzip::NativeMemoryManager::default_reserve_bytes(cpu_credits);
 }
 
 class NativeJobExecutor final {
@@ -1491,7 +1440,7 @@ public:
               writer_config_,
               space_change_sink_)),
           worker_count_((std::max)(std::size_t{1}, sizing.thread_capacity)),
-          queue_capacity_(configured_native_queue_capacity()),
+          queue_capacity_(4096),
           cpu_budget_(
               worker_count_,
               &NativeJobExecutor::on_cpu_capacity_available,
@@ -1542,7 +1491,7 @@ public:
             if (stopping_) {
                 return;
             }
-            if (queue_capacity_ != 0 && queued_job_count_locked() >= queue_capacity_) {
+            if (queued_job_count_locked() >= queue_capacity_) {
                 any_job_failed_ = true;
                 rejected_for_capacity = true;
             } else {
@@ -2270,15 +2219,11 @@ int main() {
     const bool process_mode_applied = apply_native_process_mode(requested_process_mode);
     const auto resources = native_machine_resources();
     const auto sizing = sunpack::sevenzip::derive_native_sizing_plan(
-        resources,
-        configured_native_sizing_overrides());
-    const auto memory_reserve_bytes = configured_memory_reserve_bytes(sizing.thread_capacity);
+        resources);
+    const auto memory_reserve_bytes = sunpack::sevenzip::NativeMemoryManager::default_reserve_bytes(sizing.thread_capacity);
     NativeJobExecutor executor(sizing, memory_reserve_bytes);
-    const bool sizing_overridden = sizing.thread_capacity_overridden;
     print_json_line(
-        "{\"type\":\"worker_ready\",\"sizing_mode\":\"" +
-        std::string(sizing_overridden ? "overridden" : "dynamic") +
-        "\",\"logical_processors\":" + std::to_string(resources.logical_processors) +
+        "{\"type\":\"worker_ready\",\"sizing_mode\":\"dynamic\",\"logical_processors\":" + std::to_string(resources.logical_processors) +
         ",\"thread_capacity\":" + std::to_string(sizing.thread_capacity) +
         ",\"nominal_cpu_budget\":" + std::to_string(sizing.thread_capacity) +
         ",\"memory_management\":\"commitment_replay\"" +

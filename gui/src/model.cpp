@@ -838,10 +838,7 @@ Json directory_rows(const WatchRoots& roots,const Json&) {
     }
     return rows;
 }
-fs::path log_directory(const fs::path& dir,const Json& config) {
-    if(config.contains("watch") && config["watch"].is_object() && config["watch"].contains("state_dir") && config["watch"]["state_dir"].is_string()) {
-        auto s=trim(config["watch"]["state_dir"].get<std::string>()); if(!s.empty()) return resolve_path(wide(s),dir);
-    }
+fs::path log_directory(const fs::path& dir) {
     return dir/".sunpack_watch";
 }
 }

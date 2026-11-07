@@ -83,12 +83,8 @@ def _task_source_group(task: ArchiveTask) -> dict[str, Any]:
     return group
 
 
-def new_work_broker(config: dict) -> AsyncWorkBroker:
-    worker = _worker_config(config)
-    return AsyncWorkBroker(
-        thread_capacity=int(worker.get("stage_thread_capacity", 0) or 0),
-        max_pending_jobs=int(worker.get("max_pending_stage_jobs", worker.get("max_queue_jobs", 4096)) or 4096),
-    )
+def new_work_broker() -> AsyncWorkBroker:
+    return AsyncWorkBroker()
 
 
 class PipelineEngine:
@@ -97,7 +93,7 @@ class PipelineEngine:
     def __init__(self, config: dict, *, work_broker: AsyncWorkBroker | None = None):
         self.config = config
         # A supplied broker transfers ownership from the cold CLI runtime.
-        self._broker = work_broker or new_work_broker(config)
+        self._broker = work_broker or new_work_broker()
         self._services = _PipelineServices(config, self._broker)
         self._active_requests: dict[str, asyncio.Task] = {}
         self._request_runtime_factory = _RequestRuntime
@@ -854,14 +850,12 @@ class _PipelineServices:
         self.output_reservations = OutputReservationRegistry()
         worker_config = _worker_config(config)
         self.sevenzip_runner = SevenZipRunner(worker_config)
-        self._automatic_stage_capacity = int(worker_config.get("stage_thread_capacity", 0) or 0) == 0
 
     async def start(self) -> None:
         self.sevenzip_runner.bind_event_loop(asyncio.get_running_loop())
         handshake = await self.sevenzip_runner.start_asyncio()
-        if self._automatic_stage_capacity:
-            initial_limit = int(handshake.get("initial_active_limit", 0) or handshake.get("thread_capacity", 1) or 1)
-            self.broker.configure_thread_capacity(initial_limit)
+        initial_limit = int(handshake.get("initial_active_limit", 0) or handshake.get("thread_capacity", 1) or 1)
+        self.broker.configure_thread_capacity(initial_limit)
 
     async def close(self, broker: AsyncWorkBroker) -> None:
         await self.sevenzip_runner.aclose()

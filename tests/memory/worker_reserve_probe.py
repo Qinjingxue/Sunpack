@@ -47,16 +47,16 @@ class Sandbox:
     def close(self): K.CloseHandle(self.handle)
 
 
-def run(name, archive, hint, jobs, *, limit=768, dynamic=False, password=False, dry=False, capacity=None, extra_env=None, reserve=None, expected_output=None, workloads=None, volumes=1, cpu_rate=100, trace_memory=True):
+def run(name, archive, hint, jobs, *, limit=768, dynamic=False, password=False, dry=False, capacity=None, extra_env=None, expected_output=None, workloads=None, volumes=1, cpu_rate=100, trace_memory=True):
     OUT.mkdir(parents=True, exist_ok=True)
     label = name + '-' + str(time.time_ns())
     trace = OUT / (label + '.csv')
-    configured_reserve = 0 if reserve is None else reserve * 1024**2
-    reserve = 128 + 16 * (capacity or jobs) if reserve is None else reserve
+    capacity = capacity or jobs
+    reserve = 128 + 16 * capacity
     initial_limit = reserve + 4 if dynamic else limit
     box = Sandbox(initial_limit, cpu_rate=cpu_rate, affinity=3)
-    env = os.environ | {'SUNPACK_NATIVE_WORKER_THREAD_CAPACITY': str(capacity or jobs),
-        'SUNPACK_TEST_MEMORY_TRACE': str(trace) if trace_memory else '', 'SUNPACK_NATIVE_MEMORY_RESERVE_BYTES':str(configured_reserve)} | (extra_env or {})
+    env = os.environ | {'SUNPACK_TEST_LOGICAL_PROCESSORS': str(capacity),
+        'SUNPACK_TEST_MEMORY_TRACE': str(trace) if trace_memory else ''} | (extra_env or {})
     error_file = (OUT / (label + '.stderr.txt')).open('w', encoding='utf-8')
     p = subprocess.Popen([str(WORKER)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=error_file,
         text=True, encoding='utf-8', creationflags=subprocess.CREATE_NO_WINDOW, env=env)
@@ -146,7 +146,7 @@ def run(name, archive, hint, jobs, *, limit=768, dynamic=False, password=False, 
             'private_peak_mib':max((r['private'] for r in rows),default=0)/1024**2,
             'managed_peak_mib':max((r['managed'] for r in rows),default=0)/1024**2,
             'idle_unmanaged_mib':rows[0]['unmanaged']/1024**2 if rows else 0,
-            'reserve_mib':reserve, 'automatic_reserve':configured_reserve == 0,
+            'reserve_mib':reserve, 'automatic_reserve':True,
             'recovery_unmanaged_peak_mib':max((r['unmanaged'] for r in recovery),default=0)/1024**2,
             'recovery_unmanaged_growth_mib':max((r['unmanaged']-recovery_baseline for r in recovery),default=0)/1024**2,
             'thread_resource_retries':sum(e.get('event')=='memory_thread_resource_retry' for e in events),'memory_reclaims':sum(e.get('event')=='memory_reclaimed' for e in events),
@@ -177,7 +177,6 @@ if __name__ == '__main__':
     parser.add_argument('--volumes', type=int, default=1, help='independent writer facilities on the test drive')
     parser.add_argument('--cpu-rate', type=int, default=100, help='child Job CPU rate in units of 1/100 percent')
     parser.add_argument('--limit-mib', type=int, default=768)
-    parser.add_argument('--reserve-mib', type=int, help='positive fixed override; omitted uses worker automatic reserve')
     parser.add_argument('--dynamic', action='store_true')
     parser.add_argument('--dry-run', action='store_true')
     parser.add_argument('--password')
@@ -186,5 +185,5 @@ if __name__ == '__main__':
     OUT = args.report_dir.resolve()
     assert WORKER.name == 'sunpack_sevenzip_memory_probe.exe', 'use the test probe target, never a distributed worker'
     run(args.format, args.archive.resolve(), args.format, args.jobs, limit=args.limit_mib,
-        reserve=args.reserve_mib, capacity=args.capacity, dynamic=args.dynamic,
+        capacity=args.capacity, dynamic=args.dynamic,
         password=args.password, dry=args.dry_run, volumes=args.volumes, cpu_rate=args.cpu_rate)

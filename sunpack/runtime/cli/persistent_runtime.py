@@ -144,12 +144,12 @@ def persistent_runtime_is_idle() -> bool:
     )
 
 
-def shared_command_work_broker(request_cwd=None):
+def shared_command_work_broker():
     global _WORK_BROKER
     if _ENGINE is not None:
         return _ENGINE.work_broker
     if _WORK_BROKER is None:
-        _WORK_BROKER = new_work_broker(load_request_config(request_cwd))
+        _WORK_BROKER = new_work_broker()
         _WORK_BROKER.set_state_changed_callback(_STATE_CHANGED_CALLBACK)
     return _WORK_BROKER
 

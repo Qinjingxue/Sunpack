@@ -78,7 +78,7 @@ def test_watch_configuration_survives_disconnect_and_finishes_before_stop(tmp_pa
     roots_path = tmp_path / "roots.txt"
     roots_path.write_text("\n".join(map(str, roots if action == "remove" else roots[:1])), encoding="utf-8")
     config = make_config({"watch": {
-        "state_dir": str(tmp_path / "state"), "tray_enabled": False,
+        "tray_enabled": False,
         "toast_enabled": False, "clipboard_monitor_enabled": False,
     }})
     monkeypatch.setattr(host_module, "load_config", lambda: config)
@@ -239,7 +239,7 @@ def test_watch_start_disconnect_releases_request_and_keeps_host_ownership(tmp_pa
     from tests.helpers.fake_pipeline_engine import FakePipelineEngine
 
     config = make_config({"watch": {
-        "state_dir": str(tmp_path / "state"), "tray_enabled": False,
+        "tray_enabled": False,
         "toast_enabled": False, "clipboard_monitor_enabled": False,
     }})
     engine = FakePipelineEngine(lambda _config: None)

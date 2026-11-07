@@ -1070,50 +1070,6 @@
       "min": 0,
       "max": null
     },
-    "/performance/worker/thread_capacity": {
-      "label": {
-        "zh": "工作线程数",
-        "en": "Worker threads"
-      },
-      "description": {
-        "zh": "0 为自动",
-        "en": "0 for automatic"
-      },
-      "min": 0,
-      "max": null,
-      "integer": true
-    },
-    "/performance/worker/stage_thread_capacity": {
-      "label": {
-        "zh": "阶段线程数",
-        "en": "Stage threads"
-      },
-      "description": {
-        "zh": "0 为自动",
-        "en": "0 for automatic"
-      },
-      "min": 0,
-      "max": null,
-      "integer": true
-    },
-    "/performance/worker/max_pending_stage_jobs": {
-      "label": {
-        "zh": "阶段排队上限",
-        "en": "Pending stage limit"
-      },
-      "min": 1,
-      "max": null,
-      "integer": true
-    },
-    "/performance/worker/max_queue_jobs": {
-      "label": {
-        "zh": "任务排队上限",
-        "en": "Queued task limit"
-      },
-      "min": 1,
-      "max": 1000000,
-      "integer": true
-    },
     "/performance/worker/writer_threads": {
       "label": {
         "zh": "写入线程数",
@@ -1136,16 +1092,6 @@
         "en": "0 uses the worker default buffer budget; a positive value sets a per-task byte limit."
       }
     },
-    "/performance/worker/space_gate_enabled": {
-      "label": {
-        "zh": "磁盘空间不足时暂停写入",
-        "en": "Pause writes when disk space is low"
-      },
-      "description": {
-        "zh": "控制磁盘空间门控；内存准入由内存预留单独控制。",
-        "en": "Controls the disk space gate. Memory admission is controlled separately by the memory reserve."
-      }
-    },
     "/performance/worker/space_poll_interval_ms": {
       "label": {
         "zh": "磁盘空间复查间隔（毫秒）",
@@ -1166,19 +1112,6 @@
       },
       "min": 1000,
       "max": 600000,
-      "integer": true
-    },
-    "/performance/worker/memory_reserve_bytes": {
-      "label": {
-        "zh": "内存预留（字节，0 为自动）",
-        "en": "Memory reserve (bytes, 0 = automatic)"
-      },
-      "description": {
-        "zh": "自动预留随可并行任务数量调整；正数固定使用指定字节数。",
-        "en": "Automatic reserve scales with concurrency; a positive value sets a fixed byte amount."
-      },
-      "min": 0,
-      "max": null,
       "integer": true
     },
     "/runtime/process_mode": {
@@ -1226,12 +1159,6 @@
       "min": 0,
       "integer": false
     },
-    "/watch/runtime_cache_cleanup_enabled": {
-      "label": {
-        "zh": "清理空闲缓存",
-        "en": "Clear idle cache"
-      }
-    },
     "/watch/runtime_cache_cleanup_idle_seconds": {
       "label": {
         "zh": "缓存清理等待（秒）",
@@ -1252,6 +1179,10 @@
       "label": {
         "zh": "保存剪贴板密码历史",
         "en": "Save clipboard password history"
+      },
+      "description": {
+        "zh": "Watch 将剪贴板历史明文保存到密码文件；关闭不会删除已有历史。普通配置值优先。",
+        "en": "Watch saves clipboard history as plaintext in the password file; disabling does not erase saved history. Ordinary settings take precedence."
       }
     },
     "/watch/clipboard_builtin_max_entries": {
@@ -1260,7 +1191,11 @@
         "en": "Clipboard history limit"
       },
       "min": 1,
-      "integer": true
+      "integer": true,
+      "description": {
+        "zh": "仅限制剪贴板历史条数，普通配置值优先于高级配置。",
+        "en": "Limits only clipboard history entries; ordinary settings override advanced settings."
+      }
     },
     "/watch/out_dir": {
       "label": {
@@ -1306,38 +1241,20 @@
         "en": "Report retention (days)"
       },
       "min": 1,
-      "integer": true
-    },
-    "/watch/toast_report_max_files": {
-      "label": {
-        "zh": "报告数量上限",
-        "en": "Report count limit"
-      },
-      "min": 1,
-      "integer": true
-    },
-    "/watch/toast_report_max_bytes": {
-      "label": {
-        "zh": "报告空间上限（字节）",
-        "en": "Report size limit (bytes)"
-      },
-      "min": 1024,
-      "integer": true
-    },
-    "/watch/state_dir": {
-      "label": {
-        "zh": "日志与状态目录",
-        "en": "Log and state folder"
-      },
+      "integer": true,
       "description": {
-        "zh": "留空使用数据目录下的 .sunpack_watch",
-        "en": "Leave blank to use .sunpack_watch in the data folder"
+        "zh": "仅按天数保留失败报告；生成新报告时清理过期文件。普通配置值优先于高级配置。",
+        "en": "Keep failure reports by age only; expired files are removed when a new report is written. Ordinary settings override advanced settings."
       }
     },
     "/passwords/clipboard_passwords_enabled": {
       "label": {
         "zh": "使用剪贴板密码",
         "en": "Use clipboard passwords"
+      },
+      "description": {
+        "zh": "CLI 读取当前剪贴板作为密码候选；不控制 Watch 历史采集。普通配置值优先。",
+        "en": "CLI reads the current clipboard for password candidates; independent of Watch history collection. Ordinary settings take precedence."
       }
     },
     "/extraction/content_requirement": {

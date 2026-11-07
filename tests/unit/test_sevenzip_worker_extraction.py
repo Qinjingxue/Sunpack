@@ -885,30 +885,15 @@ def test_native_worker_starts_in_neutral_working_directory(tmp_path, monkeypatch
     assert captured["cwd"] == str(tmp_path)
 
 
-def test_native_environment_zero_thread_capacity_uses_native_auto_capacity():
-    environment = {"SUNPACK_NATIVE_WORKER_THREAD_CAPACITY": "8"}
-
-    _apply_native_environment(
-        environment,
-        {
-            "thread_capacity": 0,
-        },
-    )
-
-    assert "SUNPACK_NATIVE_WORKER_THREAD_CAPACITY" not in environment
-
-
-@pytest.mark.parametrize("reserve", [0, 268435456])
-def test_native_environment_configures_memory_reserve(reserve):
-    environment = {}
-    _apply_native_environment(
-        environment,
-        {
-            "memory_reserve_bytes": reserve,
-        },
-    )
-
-    assert environment["SUNPACK_NATIVE_MEMORY_RESERVE_BYTES"] == str(reserve)
+def test_native_environment_only_maps_supported_worker_controls():
+    environment = _apply_native_environment({}, {
+        "thread_capacity": 8,
+        "memory_reserve_bytes": 268435456,
+        "max_queue_jobs": 1,
+        "space_gate_enabled": False,
+        "writer_threads": 3,
+    })
+    assert environment == {"SUNPACK_ASYNC_WRITER_THREADS_PER_VOLUME": "3"}
 
 
 def test_memory_wait_releases_execution_lanes_and_accepts_cancellation(tmp_path):
@@ -940,12 +925,9 @@ def test_memory_wait_releases_execution_lanes_and_accepts_cancellation(tmp_path)
     def capacity(mib):
         limits.JobMemoryLimit = mib * 1024**2
         assert kernel.SetInformationJobObject(handle, 9, ctypes.byref(limits), ctypes.sizeof(limits))
-    reserve_mib = 128 + 16 * 2
-    capacity(reserve_mib + 48)
     process = subprocess.Popen([str(worker)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                text=True, encoding="utf-8", creationflags=subprocess.CREATE_NO_WINDOW,
-                               env=os.environ | {"SUNPACK_NATIVE_WORKER_THREAD_CAPACITY": "2",
-                                   "SUNPACK_NATIVE_MEMORY_RESERVE_BYTES": "0"})
+                               env=os.environ.copy())
     events = queue.Queue()
     seen = []
     def read():
@@ -965,18 +947,24 @@ def test_memory_wait_releases_execution_lanes_and_accepts_cancellation(tmp_path)
                 return event
         pytest.fail("worker resource transition did not finish")
     try:
-        assert kernel.AssignProcessToJobObject(handle, int(process._handle))
         handshake = until(lambda event: event.get("type") == "worker_ready")
         reserve_mib = handshake["memory_reserve_bytes"] // 1024**2
         capacity(reserve_mib + 48)
-        for job in ("large-1", "large-2"):
+        assert kernel.AssignProcessToJobObject(handle, int(process._handle))
+        large_jobs = {f"large-{index}" for index in range(1, max(2, int(handshake["thread_capacity"])) + 1)}
+        for job in sorted(large_jobs):
             send({"job_id": job, "archive_input": ArchiveInputDescriptor.from_parts(archive_path=str(archive), format_hint="xz").to_dict(), "output_dir": str(tmp_path / job)})
-        until(lambda event: sum(e.get("event") == "memory_blocked" for e in seen) == 2)
+        until(lambda event: {e.get("job_id") for e in seen if e.get("event") == "memory_blocked"} >= large_jobs)
         send({"job_id": "small", "archive_input": ArchiveInputDescriptor.from_parts(archive_path=str(tiny), format_hint="zip").to_dict(), "output_dir": str(tmp_path / "small")})
         assert until(lambda event: event.get("job_id") == "small" and event.get("type") == "result")["status"] == "ok"
         assert (tmp_path / "small/small.txt").read_bytes() == b"small"
         send({"worker_command": "cancel", "job_id": "large-1"})
         assert until(lambda event: event.get("job_id") == "large-1" and event.get("type") == "result")["native_status"] == "cancelled"
+        extra_jobs = large_jobs - {"large-1", "large-2"}
+        for job in extra_jobs:
+            send({"worker_command": "cancel", "job_id": job})
+        if extra_jobs:
+            until(lambda event: {e.get("job_id") for e in seen if e.get("type") == "result"} >= extra_jobs)
         changed = tmp_path / "changed.blob"
         changed.write_bytes(xz)
         send({"job_id": "changed", "archive_input": ArchiveInputDescriptor.from_parts(archive_path=str(changed), format_hint="xz").to_dict(), "output_dir": str(tmp_path / "changed-output")})
@@ -1042,12 +1030,12 @@ def test_native_worker_reports_cpu_credit_sizing_plan(credits, reserve):
 
     logical_processors = max(1, int(handshake["logical_processors"]))
     assert handshake["type"] == "worker_ready"
-    capacity = min(credits, logical_processors) if credits else logical_processors
-    assert handshake["sizing_mode"] == ("overridden" if credits else "dynamic")
+    capacity = logical_processors
+    assert handshake["sizing_mode"] == "dynamic"
     assert int(handshake["thread_capacity"]) == capacity
     assert int(handshake["nominal_cpu_budget"]) == capacity
     assert handshake["memory_management"] == "commitment_replay"
-    assert int(handshake["memory_reserve_bytes"]) == (reserve or (128 + 16 * capacity) * 1024**2)
+    assert int(handshake["memory_reserve_bytes"]) == ((128 + 16 * capacity) * 1024**2)
 
 
 def test_worker_event_rejects_non_objects_and_malformed_rows():
@@ -1309,7 +1297,7 @@ def test_native_worker_queue_isolates_failed_job_and_continues(tmp_path):
     archive = tmp_path / "ok.zip"
     with zipfile.ZipFile(archive, "w") as zf:
         zf.writestr("ok.txt", "batch payload")
-    runner = SevenZipRunner({"thread_capacity": 2})
+    runner = SevenZipRunner()
     runner.worker_path = worker
     try:
         bad = runner.submit_attempt(

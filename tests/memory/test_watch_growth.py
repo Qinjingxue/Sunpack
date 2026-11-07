@@ -26,10 +26,6 @@ def _watch_memory_config() -> dict:
         **(config.get("watch") or {}),
         "clipboard_monitor_enabled": False,
         "password_retry_debounce_seconds": 0,
-        "runtime_cache_cleanup_enabled": os.environ.get(
-            "SUNPACK_WATCH_MEMORY_CACHE_CLEANUP_ENABLED",
-            "1",
-        ) != "0",
         "runtime_cache_cleanup_idle_seconds": env_float(
             "SUNPACK_WATCH_MEMORY_CACHE_CLEANUP_IDLE_SECONDS",
             10.0,
@@ -45,13 +41,6 @@ def _watch_memory_config() -> dict:
         **(config.get("post_extract") or {}),
         "archive_cleanup_mode": "keep",
         "flatten_single_directory": False,
-    }
-    config["performance"] = {
-        **(config.get("performance") or {}),
-        "worker": {
-            **((config.get("performance") or {}).get("worker") or {}),
-            "max_queue_jobs": 64,
-        },
     }
     return config
 

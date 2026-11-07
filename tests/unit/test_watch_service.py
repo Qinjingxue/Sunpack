@@ -41,7 +41,8 @@ _TEST_LOOP = asyncio.new_event_loop()
 
 
 @pytest.fixture(autouse=True)
-def _stub_watch_broker(monkeypatch):
+def _stub_watch_broker(monkeypatch, tmp_path):
+    monkeypatch.setattr(service_module, "watch_roots_path", lambda: tmp_path / "sunpack_watch_roots.txt")
     monkeypatch.setattr(service_module, "_acquire_watch_broker", lambda: None)
     monkeypatch.setattr(service_module, "_release_watch_broker", lambda: None)
 
@@ -67,7 +68,7 @@ def test_non_ntfs_roots_are_removed_on_start_and_live_reload(tmp_path, monkeypat
     roots_path = tmp_path / "roots.txt"
     roots_path.write_text(f"# keep this comment\n{good} | out | true | true | true\n{bad}\n", encoding="utf-8")
     config = make_config({"cli": {"language": language}, "watch": {
-        "state_dir": str(tmp_path / "state"), "tray_enabled": False,
+        "tray_enabled": False,
     }})
     monkeypatch.setattr(service_module, "watch_roots_path", lambda: roots_path)
     monkeypatch.setattr(service_module, "load_config", lambda: config)
@@ -141,7 +142,7 @@ def test_non_ntfs_error_dialog_cannot_block_watch_readiness(tmp_path, monkeypatc
     roots_path.write_text(str(bad), encoding="utf-8")
     monkeypatch.setattr(service_module, "watch_roots_path", lambda: roots_path)
     monkeypatch.setattr(service_module, "load_config", lambda: make_config({
-        "watch": {"state_dir": str(tmp_path / "state"), "tray_enabled": False},
+        "watch": {"tray_enabled": False},
     }))
     monkeypatch.setattr(sunpack_native, "watch_filesystem_type", lambda _path: "exFAT")
     entered, dismiss = threading.Event(), threading.Event()
@@ -201,7 +202,6 @@ def test_watch_service_attaches_and_releases_toast_with_watch_lifecycle(tmp_path
     config = make_config({
         "extraction": {"content_requirement": "allow_partial"},
         "watch": {
-            "state_dir": str(tmp_path / "state"),
             "roots": [str(tmp_path)],
             "tray_enabled": False,
             "clipboard_monitor_enabled": False,
@@ -480,7 +480,7 @@ def test_running_watch_service_applies_added_roots_once(tmp_path, monkeypatch):
     monkeypatch.setattr(
         service_module,
         "load_config",
-        lambda: make_config({"watch": {"state_dir": str(tmp_path / ".sunpack_watch"), "tray_enabled": False}}),
+        lambda: make_config({"watch": {"tray_enabled": False}}),
     )
     service = WatchService(engine_factory=lambda _config: FakePipelineEngine(FakeRunner))
     starts = []
@@ -571,7 +571,6 @@ def test_watch_service_releases_named_mutex_after_exit(tmp_path, monkeypatch):
         "load_config",
         lambda: make_config({
             "watch": {
-                "state_dir": str(state_dir),
                 "roots": [],
                 "tray_enabled": False,
                 "clipboard_monitor_enabled": False,
@@ -603,7 +602,6 @@ def test_watch_service_cleans_up_when_broker_cannot_start(tmp_path, monkeypatch)
         "load_config",
         lambda: make_config({
             "watch": {
-                "state_dir": str(state_dir),
                 "roots": [],
                 "tray_enabled": False,
                 "clipboard_monitor_enabled": False,
@@ -628,13 +626,11 @@ def test_watch_service_cleans_up_when_broker_cannot_start(tmp_path, monkeypatch)
 
 
 def test_request_stop_wakes_service_blocked_without_scheduler(tmp_path, monkeypatch):
-    state_dir = tmp_path / ".sunpack_watch"
     monkeypatch.setattr(
         service_module,
         "load_config",
         lambda: make_config({
             "watch": {
-                "state_dir": str(state_dir),
                 "roots": [],
                 "tray_enabled": False,
             }
@@ -665,7 +661,6 @@ def test_request_stop_wakes_service_blocked_without_scheduler(tmp_path, monkeypa
 
 def test_watch_service_config_observer_targets_program_files(tmp_path, monkeypatch):
     roots_path = tmp_path / "sunpack_watch_roots.txt"
-    state_dir = tmp_path / ".sunpack_watch"
     captured = {}
 
     class FakeConfigObserver:
@@ -689,7 +684,7 @@ def test_watch_service_config_observer_targets_program_files(tmp_path, monkeypat
     monkeypatch.setattr(
         service_module,
         "load_config",
-        lambda: make_config({"watch": {"state_dir": str(state_dir), "tray_enabled": False}}),
+        lambda: make_config({"watch": {"tray_enabled": False}}),
     )
     service = WatchService(engine_factory=lambda _config: FakePipelineEngine(FakeRunner))
     service._loop = _TEST_LOOP
@@ -713,8 +708,7 @@ def test_watch_service_config_observer_targets_program_files(tmp_path, monkeypat
 
 
 def test_watch_service_invalid_config_reload_preserves_running_service(tmp_path, monkeypatch):
-    state_dir = tmp_path / ".sunpack_watch"
-    initial_config = make_config({"watch": {"state_dir": str(state_dir), "tray_enabled": False}})
+    initial_config = make_config({"watch": {"tray_enabled": False}})
     monkeypatch.setattr(service_module, "load_config", lambda: initial_config)
     service = WatchService(engine_factory=lambda _config: FakePipelineEngine(FakeRunner))
     original_config = service.config
@@ -789,11 +783,10 @@ def test_watch_service_apply_failure_rolls_back_previous_config(tmp_path, monkey
         root.mkdir()
     initial = [good, bad, changed] if operation == "remove" else [good, bad]
     roots_path.write_text("# preserved\n" + "\n".join(map(str, initial)), encoding="utf-8")
-    state_dir = tmp_path / ".sunpack_watch"
     configs = iter(
         [
-            {"watch": {"state_dir": str(state_dir), "tray_enabled": False}, "revision": 1},
-            {"watch": {"state_dir": str(state_dir), "tray_enabled": False}, "revision": 2},
+            {"watch": {"tray_enabled": False}, "revision": 1},
+            {"watch": {"tray_enabled": False}, "revision": 2},
         ]
     )
     monkeypatch.setattr(service_module, "watch_roots_path", lambda: roots_path)
@@ -1023,7 +1016,7 @@ def test_watch_service_reload_detects_input_root_deep_change(tmp_path, monkeypat
     root = tmp_path / "input"
     root.mkdir()
     roots_path.write_text(str(root), encoding="utf-8")
-    config = make_config({"watch": {"state_dir": str(tmp_path / "state"), "tray_enabled": False}})
+    config = make_config({"watch": {"tray_enabled": False}})
     monkeypatch.setattr(service_module, "watch_roots_path", lambda: roots_path)
     monkeypatch.setattr(service_module, "load_config", lambda: config)
     service = WatchService(engine_factory=lambda _config: FakePipelineEngine(FakeRunner))
@@ -1044,7 +1037,6 @@ def test_watch_service_scheduler_receives_root_outputs(tmp_path, monkeypatch):
     watch_root = tmp_path / "downloads"
     watch_root.mkdir()
     roots_path.write_text(f"{watch_root} | D:\\Extracted\n", encoding="utf-8")
-    state_dir = tmp_path / ".sunpack_watch"
     captured = {}
 
     class FakeScheduler(_SchedulerLifecycle):
@@ -1056,7 +1048,7 @@ def test_watch_service_scheduler_receives_root_outputs(tmp_path, monkeypatch):
     monkeypatch.setattr(
         service_module,
         "load_config",
-        lambda: make_config({"watch": {"state_dir": str(state_dir), "tray_enabled": False, "roots": [str(tmp_path / "ignored-config-root")]}}),
+        lambda: make_config({"watch": {"tray_enabled": False, "roots": [str(tmp_path / "ignored-config-root")]}}),
     )
     monkeypatch.setattr(service_module, "WatchScheduler", FakeScheduler)
 
@@ -1074,7 +1066,6 @@ def test_watch_service_leaves_empty_root_output_for_pipeline_default(tmp_path, m
     watch_root = tmp_path / "downloads"
     watch_root.mkdir()
     roots_path.write_text(f"{watch_root}\n", encoding="utf-8")
-    state_dir = tmp_path / ".sunpack_watch"
     captured = {}
 
     class FakeScheduler(_SchedulerLifecycle):
@@ -1086,7 +1077,7 @@ def test_watch_service_leaves_empty_root_output_for_pipeline_default(tmp_path, m
     monkeypatch.setattr(
         service_module,
         "load_config",
-        lambda: make_config({"watch": {"state_dir": str(state_dir), "tray_enabled": False}}),
+        lambda: make_config({"watch": {"tray_enabled": False}}),
     )
     monkeypatch.setattr(service_module, "WatchScheduler", FakeScheduler)
 
@@ -1182,7 +1173,7 @@ def test_removing_last_root_retires_state_without_a_successor_scheduler(tmp_path
     from sunpack.runtime.watch.output_roots import WatchOutputRoots
     from sunpack_native import NativeWatchCatalog
 
-    root, folder = tmp_path / "input", tmp_path / "state"
+    root, folder = tmp_path / "input", tmp_path / ".sunpack_watch"
     root.mkdir()
     folder.mkdir()
     for index in range(128):
@@ -1205,7 +1196,7 @@ def test_removing_last_root_retires_state_without_a_successor_scheduler(tmp_path
     original_bytes = snapshot.stat().st_size
     monkeypatch.setattr(service_module, "watch_roots_path", lambda: tmp_path / "roots.txt")
     monkeypatch.setattr(service_module, "load_config", lambda: make_config({
-        "watch": {"roots": [], "state_dir": str(folder), "tray_enabled": False},
+        "watch": {"roots": [], "tray_enabled": False},
     }))
     service = WatchService(engine_factory=lambda _config: pytest.fail("no scheduler is needed"))
     _await(service._start_scheduler())
@@ -1243,7 +1234,7 @@ def test_default_watch_state_uses_program_directory_and_per_root_outputs(tmp_pat
     monkeypatch.setattr(
         service_module,
         "load_config",
-        lambda: make_config({"watch": {"state_dir": "", "tray_enabled": False}}),
+        lambda: make_config({"watch": {"tray_enabled": False}}),
     )
     captured = {}
 
@@ -1265,9 +1256,7 @@ def test_default_watch_state_uses_program_directory_and_per_root_outputs(tmp_pat
 
 
     roots_path.unlink()
-    assert service_module.service_state_dir({"watch": {"state_dir": ""}}) == service.state_dir
-    relative = make_config({"watch": {"state_dir": "runtime/state"}})
-    assert service_module.service_state_dir(relative) == str((program_dir / "runtime/state").resolve())
+    assert service_module.service_state_dir() == service.state_dir
 
 
 def test_watch_roots_add_is_serialized_across_concurrent_callers(tmp_path, monkeypatch):
@@ -1307,7 +1296,6 @@ def test_watch_service_waits_indefinitely_when_scheduler_is_idle(tmp_path, monke
         "load_config",
         lambda: make_config({
             "watch": {
-                "state_dir": str(state_dir),
                 "roots": [],
                 "tray_enabled": False,
             }
@@ -1497,7 +1485,7 @@ def test_watch_service_deduplicates_unchanged_pending_ticks(tmp_path, monkeypatc
     monkeypatch.setattr(
         service_module,
         "load_config",
-        lambda: make_config({"watch": {"state_dir": str(state_dir), "roots": [], "tray_enabled": False}}),
+        lambda: make_config({"watch": {"roots": [], "tray_enabled": False}}),
     )
     service = WatchService(engine_factory=lambda _config: FakePipelineEngine(FakeRunner))
     written = []
@@ -1585,7 +1573,6 @@ def test_watch_service_new_scheduler_inherits_foreground_activity(tmp_path, monk
         "load_config",
         lambda: make_config({
             "watch": {
-                "state_dir": str(tmp_path / "state"),
                 "roots": [str(tmp_path)],
                 "tray_enabled": False,
                 "clipboard_monitor_enabled": False,
@@ -1632,7 +1619,7 @@ def test_service_reload_lifecycle(tmp_path, monkeypatch):
     second.mkdir()
     roots_path = tmp_path / "roots.txt"
     roots_path.write_text(str(root), encoding="utf-8")
-    payload = {"watch": {"state_dir": str(tmp_path / "state"), "tray_enabled": False},
+    payload = {"watch": {"tray_enabled": False},
                "runtime": {"process_mode": "normal"}, "cli": {"language": "en"}}
     monkeypatch.setattr(service_module, "watch_roots_path", lambda: roots_path)
     monkeypatch.setattr(service_module, "load_config", lambda: make_config(payload))
@@ -1643,6 +1630,8 @@ def test_service_reload_lifecycle(tmp_path, monkeypatch):
 
     service = WatchService(engine_factory=lambda _config: FakePipelineEngine(FakeRunner),
                            config_applied_callback=on_config)
+
+    original_state_dir, original_log = service.state_dir, service.log
 
     async def start_scheduler(**kwargs):
         starts.append(service.roots[:])
@@ -1670,3 +1659,4 @@ def test_service_reload_lifecycle(tmp_path, monkeypatch):
     assert tray_events == ["start", "refresh"] and service.tray is tray
     assert _await(service.reload()) is False
     assert len(starts) == 2
+    assert service.state_dir == original_state_dir and service.log is original_log

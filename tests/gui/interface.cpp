@@ -612,7 +612,6 @@ void localized_config_search(Application& app) {
         for(auto& f:fields) {
             if(f["id"]=="/runtime/process_mode") matches(f["options"][0]["label"],f["id"]);
             if(f["id"]=="/watch/event_log_retention_days") matches(f["description"],f["id"]);
-            if(f["id"]=="/watch/state_dir") matches(f["text"],f["id"]);
             if(f["editor"]=="datetime_range") {
                 // Filtering alone misses labels that have no find target.
                 for(const auto& side:{"lower","upper"}) {
@@ -2011,9 +2010,9 @@ int wmain(int argc,wchar_t** argv) {
         caret_blink_contracts();
         text_area_wheel_boundaries();
         rendering_contracts();
-        atomic_write(dir/"sunpack_config.json",R"({"cli":{"language":"zh"},"runtime":{"process_mode":"normal"},"recursive_extract":"*","watch":{"state_dir":".sunpack_watch","out_dir":".","toast_enabled":true},"unknown":9007199254740993})");
+        atomic_write(dir/"sunpack_config.json",R"({"cli":{"language":"zh"},"runtime":{"process_mode":"normal"},"recursive_extract":"*","watch":{"out_dir":".","toast_enabled":true},"unknown":9007199254740993})");
         if(rangesOnly || acceptance) {
-            auto config=parse_json(kUiDefaultsJson); config["watch"]["state_dir"]=".sunpack_watch";
+            auto config=parse_json(kUiDefaultsJson);
             atomic_write(dir/"sunpack_config.json",config.dump());
         }
         atomic_write(dir/"builtin_passwords.json",R"({"passwords":[{"value":"  #中文  "}],"clipboard_history":["history"]})");
@@ -2831,12 +2830,13 @@ int wmain(int argc,wchar_t** argv) {
             pump([&]{return state(app.page(),"errors").contains("sunpack_config.json");});
             std::cerr<<"Invalid configuration retained\n";
             assert(!state(app.page(),"fields").empty());
-            publish_events(dir/"elsewhere"/"events.json",Json({{"event","done"},{"path",utf8((dir/"other.fake").wstring())}}).dump()+"\n");
-            atomic_write(dir/"sunpack_config.json",R"({"watch":{"state_dir":"elsewhere"}})");
+            publish_events(dir/".sunpack_watch"/"events.json",Json({{"event","done"},{"path",utf8((dir/"other.fake").wstring())}}).dump()+"\n");
+            atomic_write(dir/"sunpack_config.json",R"({"watch":{"toast_enabled":true}})");
             try { pump([&]{return state(app.page(),"tasks")["rows"][0]["name"]=="other.fake";}); }
-            catch(...) { std::cerr<<"Rebound log: "<<state(app.page(),"tasks")<<" errors="<<state(app.page(),"errors")<<" log="<<state(app.page(),"logPath")<<" fields="<<state(app.page(),"fields")<<"\n"; throw; }
+            catch(...) { std::cerr<<"Updated default log: "<<state(app.page(),"tasks")<<" errors="<<state(app.page(),"errors")<<" log="<<state(app.page(),"logPath")<<" fields="<<state(app.page(),"fields")<<"\n"; throw; }
+            assert(state(app.page(),"logPath")==utf8((dir/".sunpack_watch"/"events.json").wstring()));
             // Exercise an ordinary config containing all advanced settings.
-            auto complete=parse_json(kUiDefaultsJson); complete["watch"]["state_dir"]="elsewhere";
+            auto complete=parse_json(kUiDefaultsJson);
             atomic_write(dir/"sunpack_config.json",complete.dump());
             pump([&]{return state(app.page(),"fields").size()==expected_fields;});
             std::cerr<<"Advanced configuration loaded\n";

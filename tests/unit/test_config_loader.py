@@ -31,7 +31,7 @@ def _advanced_payload():
         "recursive_extract": "*",
         "post_extract": {"archive_cleanup_mode": "r", "flatten_single_directory": True},
         "filesystem": {"scan_filters_enabled": True, "scan_filters": []},
-        "performance": {"worker": {"memory_reserve_bytes": 268435456, "max_queue_jobs": 256}},
+        "performance": {"worker": {"writer_threads": 6, "job_buffer_budget_bytes": 33554432}},
         "verification": _verification_config(),
         "detection": {"enabled": True},
     }
@@ -50,7 +50,7 @@ def test_load_config_merges_simple_config_over_advanced_config(tmp_path, monkeyp
         "runtime": {"process_mode": "high"},
         "extraction": {"content_requirement": "complete"},
         "filesystem": {"scan_filters": [{"name": "size_range", "enabled": True, "min_bytes": 2097152, "max_bytes": None}]},
-        "performance": {"worker": {"memory_reserve_bytes": 134217728}},
+        "performance": {"worker": {"writer_threads": 4}},
     })
     monkeypatch.setattr(loader, "_candidate_config_paths", _layered_config_paths(simple, advanced))
     config = loader.load_config()
@@ -63,8 +63,37 @@ def test_load_config_merges_simple_config_over_advanced_config(tmp_path, monkeyp
     assert config["recursive_extract"] == {"mode": "infinite"}
     assert config["filesystem"]["scan_filters"][0]["min_bytes"] == 2097152
     assert config["filesystem"]["scan_filters"][0]["max_bytes"] is None
-    assert config["performance"]["worker"]["max_queue_jobs"] == 256
-    assert config["performance"]["worker"]["memory_reserve_bytes"] == 134217728
+    assert config["performance"]["worker"]["job_buffer_budget_bytes"] == 33554432
+    assert config["performance"]["worker"]["writer_threads"] == 4
+
+
+def test_everyday_clipboard_and_report_controls_override_advanced_defaults(tmp_path, monkeypatch):
+    # Exercise actual file precedence and false values together; generic merge
+    # tests do not cover the controls displayed in both settings templates.
+    simple = tmp_path / "sunpack_config.json"
+    advanced = tmp_path / "sunpack_advanced_config.json"
+    payload = _advanced_payload()
+    payload["watch"] = {"clipboard_monitor_enabled": True, "clipboard_builtin_max_entries": 30,
+                        "toast_report_retention_days": 30}
+    payload["passwords"] = {"clipboard_passwords_enabled": True}
+    ordinary = {"watch": {"clipboard_monitor_enabled": False, "clipboard_builtin_max_entries": 9,
+                          "toast_report_retention_days": 12},
+                "passwords": {"clipboard_passwords_enabled": False}}
+    _write_json(advanced, payload)
+    _write_json(simple, ordinary)
+    monkeypatch.setattr(loader, "_candidate_config_paths", _layered_config_paths(simple, advanced))
+    monkeypatch.delenv(loader.OVERRIDES_ENV_VAR, raising=False)
+    config = loader.load_config()
+    for section, values in ordinary.items():
+        for name, value in values.items():
+            assert config[section][name] == value
+    # The advanced layer remains the fallback when an ordinary key is absent.
+    _write_json(simple, {})
+    config = loader.load_config()
+    assert config["watch"]["clipboard_monitor_enabled"] is True
+    assert config["passwords"]["clipboard_passwords_enabled"] is True
+    assert config["watch"]["clipboard_builtin_max_entries"] == 30
+    assert config["watch"]["toast_report_retention_days"] == 30
 
 
 @pytest.mark.parametrize(

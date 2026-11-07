@@ -138,7 +138,6 @@ async def run():
         root = Path(sys.argv[2]) / origin
         config = make_config({
             'recursive_extract': '3', 'output': {'root': str(root)},
-            'watch': {'state_dir': str(root / 'state')},
             'user_passwords': [], 'builtin_passwords': [],
             'post_extract': {'archive_cleanup_mode': 'k', 'flatten_single_directory': False},
         })

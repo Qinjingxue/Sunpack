@@ -225,13 +225,12 @@ async def _handle_stop(ctx):
 def _handle_status(ctx):
     from sunpack.runtime.cli.runtime_state import require_runtime_host
 
-    config = load_request_config(ctx.cwd)
     _, roots = list_watch_roots()
     host_status = require_runtime_host().watch_status()
     return 0, CliCommandResult(
         command=COMMAND,
         inputs={"action": "status"},
-        summary={**host_status, "count": len(roots), "state_dir": service_state_dir(config)},
+        summary={**host_status, "count": len(roots), "state_dir": service_state_dir()},
         items=roots,
     )
 

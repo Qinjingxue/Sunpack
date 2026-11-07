@@ -20,6 +20,7 @@ from sunpack_native import fast_hash128, NativeWatchCatalog
 from sunpack.core.config.fields.watch import DEFAULT_WATCH_CONFIG
 from sunpack.pipeline.discovery.embedded.options import EmbeddedOptions
 from sunpack.core.contracts.failures import FailureInfo, FailureKind
+from sunpack.core.contracts.failure_report import FailureReportPayloads
 from sunpack.core.support.filesystem_scan_errors import filesystem_scan_failure, is_filesystem_scan_failure
 from sunpack.core.contracts.retry_targets import (
     failure_contains,
@@ -293,9 +294,6 @@ class WatchScheduler:
         self._wake_callback = wake_callback
         self.notification_sink = notification_sink or NullWatchNotificationSink()
         self._notification_error_actions: set[str] = set()
-        self.runtime_cache_cleanup_enabled = bool(
-            watch_config.get("runtime_cache_cleanup_enabled", True)
-        )
         self.runtime_cache_cleanup_idle_seconds = max(
             0.0,
             float(watch_config.get("runtime_cache_cleanup_idle_seconds", 10.0)),
@@ -1380,8 +1378,6 @@ class WatchScheduler:
             await self.pipeline_engine.work_broker.run(
                 "catalog_maintenance", "watch", self._maintain_persistent_state, request_id="watch", origin="watch",
             )
-            if not self.runtime_cache_cleanup_enabled:
-                return
             self.state.trim_idle_storage()
             self.log.write("cache_cleanup_started")
             started = time.perf_counter()
@@ -2336,7 +2332,17 @@ class WatchScheduler:
                 tickets, stage="watch_completion", file_id=request.candidate.path,
             )
         for notification in notifications:
-            self._notify(*notification)
+            if notification[0] == "failed":
+                # The bounded native encoder owns these immutable completion
+                # views until it drains. Reuse stage admission and cancellation
+                # joining; never queue fire-and-forget diagnostic graphs.
+                await self.pipeline_engine.work_broker.run(
+                    "watch_failure_report", request.candidate.path,
+                    self._notify, *notification,
+                    request_id=request.notification_id, origin="watch",
+                )
+            else:
+                self._notify(*notification)
         return result
 
     def _project_completion(self, request, response, error, notify) -> WatchRunResult:
@@ -2510,7 +2516,6 @@ class WatchScheduler:
             and failure not in recorded_password_failures
             and failure not in retired_failures
         ]
-        failed = summary.failed_tasks
 
         # Only top-level groups have processing cards. Nested outcomes still
         # contribute to the request result and durable recovery blockers above.
@@ -2533,21 +2538,20 @@ class WatchScheduler:
                                error_kind=failure.kind.value if failure is not None else "", error=result_error(item))
 
         if terminal_failures:
-            payloads = [_failure_to_dict(failure) for failure in terminal_failures]
+            payloads = FailureReportPayloads(terminal_failures)
             terminal_errors = []
             for item in results:
                 failure = result_failure(item)
                 if result_outcome(item) != OutcomeKind.FAILURE or failure not in terminal_failures:
                     continue
-                task_path = result_path(item)
                 message = result_error(item) or _failure_message(
                     failure,
                     self.i18n.t("watch.failure.extraction_failed"),
                 )
-                terminal_errors.append(
-                    f"{os.path.basename(task_path)} [{message}]" if task_path else message
-                )
-            errors = terminal_errors or failed or [
+                # The pipeline already owns its formatted failure message.
+                # Reuse it rather than copy a potentially large diagnostic.
+                terminal_errors.append(item.failure_message or message)
+            errors = terminal_errors or [
                 _failure_message(failure, self.i18n.t("watch.failure.extraction_failed"))
                 for failure in terminal_failures
             ]
@@ -2572,7 +2576,7 @@ class WatchScheduler:
 
         if recorded_password_failures:
             notify("suppressed", request.notification_id)
-            errors = failed or [
+            errors = [
                 _failure_message(failure, self.i18n.t("watch.failure.extraction_failed"))
                 for failure in recorded_password_failures
             ]
@@ -2582,6 +2586,12 @@ class WatchScheduler:
             notify("suppressed", request.notification_id)
             return WatchRunResult(processed=1)
 
+        # Keep original message objects here. RunSummary.failed_tasks formats
+        # full path/error strings, which would duplicate large diagnostics on
+        # this event loop even for a structured report that never needs them.
+        failed = [failure.message for failure in summary.scan_failures]
+        failed.extend(item.failure_message or item.error for item in results
+                      if result_outcome(item) == OutcomeKind.FAILURE)
         if failed:
             # Unstructured failures cannot participate in an automatic wait.
             error = failed[0]
@@ -3009,7 +3019,8 @@ def _persisted_blocker_owns_retry(state: WatchStateStore, path: str) -> bool:
 def _summary_processed_no_tasks(summary: RunSummary) -> bool:
     return (
         summary.success_count <= 0
-        and not summary.failed_tasks
+        and not summary.scan_failures
+        and not any(item.outcome_kind == OutcomeKind.FAILURE for item in summary.target_results)
         and not summary.processed_keys
         and not summary.recovered_outputs
     )

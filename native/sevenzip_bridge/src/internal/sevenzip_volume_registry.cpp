@@ -55,13 +55,8 @@ namespace sunpack::sevenzip
                 entry.state = make_volume_state(key, persistent);
             }
 
-            // gate 懒创建且只在这里注入 sink，已有 entry 的 gate 绝不重设；
-            // 功能关闭或空 key 时必须保持 nullptr，让空间判定短路。
-            if (!entry.state->space_gate && !key.empty() && config_.space_gate_enabled)
+            if (!entry.state->space_gate && !key.empty())
             {
-                // pending_bytes 是 gate 唯一拿不到的展示字段（gate 不认识 VolumeState，
-                // 依赖方向必须单向）。用 weak_ptr 在 sink 包装里补齐，不能捕获
-                // shared_ptr（VolumeState → gate → lambda → VolumeState = 泄漏）。
                 std::weak_ptr<VolumeState> weak_state = entry.state;
                 const VolumeSpaceChangeSink inner = sink_;
                 entry.state->space_gate = std::make_shared<VolumeSpaceGate>(

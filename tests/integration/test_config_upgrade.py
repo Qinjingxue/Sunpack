@@ -26,12 +26,82 @@ def test_installer_resets_old_input_recovery_once_and_preserves_user_files(tmp_p
                "-File", str(repo_root / "scripts/upgrade_config.ps1"), "-UserConfig", str(user),
                "-AdvancedConfig", str(advanced)]
     subprocess.run(command, check=True, capture_output=True)
-    assert not snapshot.exists() and not wal.exists()
+    default = tmp_path / ".sunpack_watch"
+    assert snapshot.exists() and wal.exists()  # Original state remains available for rollback.
+    assert not (default / snapshot.name).exists() and not (default / wal.name).exists()
     assert json.loads(user.read_text(encoding="utf-8"))["extraction"]["content_requirement"] == "allow_partial"
     assert kept.read_text(encoding="utf-8") == "preserved or reset"
+    assert (default / kept.name).read_text(encoding="utf-8") == "preserved or reset"
+    snapshot = default / snapshot.name
     snapshot.write_text("current recovery", encoding="utf-8")
     subprocess.run(command, check=True, capture_output=True)
     assert snapshot.read_text(encoding="utf-8") == "current recovery"
+
+
+def test_installer_promotes_controls_and_migrates_current_state_without_overwrite(tmp_path, repo_root):
+    # One real installer transaction covers promotion precedence, recoverable
+    # custom-state relocation, retry safety and retired-key removal. Runtime
+    # loader tests cannot catch lost on-disk values or stale migration copies.
+    old_state = tmp_path / "custom state"
+    old_state.mkdir()
+    (old_state / "logical-input-recovery").touch()
+    (old_state / "state.snapshot").write_text("current recovery", encoding="utf-8")
+    (old_state / "catalog.wal.bin").write_bytes(b"catalog")
+    display = old_state / "events.json.store"
+    display.mkdir()
+    (display / "block.data").write_bytes(b"history")
+    (old_state / "unrelated.txt").write_text("user-owned", encoding="utf-8")
+    advanced = tmp_path / "previous-advanced.json"
+    advanced.write_text(json.dumps({
+        "watch": {"state_dir": str(old_state), "clipboard_monitor_enabled": False,
+                  "clipboard_builtin_max_entries": 17, "toast_report_retention_days": 61},
+        "passwords": {"clipboard_passwords_enabled": False},
+    }), encoding="utf-8")
+    user = tmp_path / "sunpack_config.json"
+    original = {"watch": {"state_dir": str(old_state), "clipboard_monitor_enabled": True,
+                          "toast_report_max_files": 3,
+                          "toast_report_max_bytes": 1024, "runtime_cache_cleanup_enabled": False},
+                "performance": {"worker": {"thread_capacity": 2, "stage_thread_capacity": 3,
+                    "max_pending_stage_jobs": 4, "max_queue_jobs": 5, "space_gate_enabled": False,
+                    "memory_reserve_bytes": 1024, "writer_threads": 6}}, "unknown": "keep"}
+    user.write_text(json.dumps(original), encoding="utf-8")
+    command = ["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+               "-File", str(repo_root / "scripts/upgrade_config.ps1"), "-UserConfig", str(user),
+               "-AdvancedConfig", str(advanced)]
+    subprocess.run(command, check=True, capture_output=True)
+    migrated = json.loads(user.read_text(encoding="utf-8"))
+    assert migrated["watch"] == {"clipboard_monitor_enabled": True, "clipboard_builtin_max_entries": 17,
+                                 "toast_report_retention_days": 61}
+    assert migrated["passwords"]["clipboard_passwords_enabled"] is False
+    assert migrated["performance"]["worker"] == {"writer_threads": 6}
+    assert migrated["unknown"] == "keep"
+    default = tmp_path / ".sunpack_watch"
+    assert (default / "state.snapshot").read_text(encoding="utf-8") == "current recovery"
+    assert (default / "catalog.wal.bin").read_bytes() == b"catalog"
+    assert (default / "events.json.store" / "block.data").read_bytes() == b"history"
+    assert not (default / "unrelated.txt").exists()
+    assert (old_state / "unrelated.txt").exists() and (old_state / "state.snapshot").exists()
+    before = user.read_bytes(), user.stat().st_mtime_ns
+    subprocess.run(command, check=True, capture_output=True)
+    assert (user.read_bytes(), user.stat().st_mtime_ns) == before
+
+    # After a later installer rollback, the old version may write its original
+    # state again. A retry must not silently select the now-stale default copy.
+    user.write_text(json.dumps(original), encoding="utf-8")
+    (old_state / "state.snapshot").write_text("newer recovery after rollback", encoding="utf-8")
+    result = subprocess.run(command, capture_output=True)
+    assert result.returncode != 0
+    assert json.loads(user.read_text(encoding="utf-8")) == original
+    assert (default / "state.snapshot").read_text(encoding="utf-8") == "current recovery"
+    assert (old_state / "state.snapshot").read_text(encoding="utf-8") == "newer recovery after rollback"
+
+    # An existing fixed directory without our migration receipt is also never
+    # overwritten, even if it happens to have similarly named state files.
+    (default / "fixed-state-directory").unlink()
+    result = subprocess.run(command, capture_output=True)
+    assert result.returncode != 0
+    assert json.loads(user.read_text(encoding="utf-8")) == original
+    assert (default / "state.snapshot").read_text(encoding="utf-8") == "current recovery"
 
 
 def test_installer_unifies_path_rules_ors_switches_and_is_idempotent(tmp_path, repo_root):

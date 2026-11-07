@@ -321,32 +321,15 @@ bool check_cpu_budget_acquire_all_available() {
 
 bool check_native_sizing_tracks_logical_processors() {
     using namespace sunpack::sevenzip;
-    const std::size_t cases[] = {1, 2, 4, 8, 16, 32, 64, 128};
+    const std::size_t cases[] = {0, 1, 2, 4, 8, 16, 32, 64, 128};
     for (const std::size_t logical_processors : cases) {
         const NativeMachineResources resources{logical_processors};
-        const auto plan = derive_native_sizing_plan(resources, {});
-        if (plan.thread_capacity != logical_processors ||
-            plan.thread_capacity_overridden) {
+        const auto plan = derive_native_sizing_plan(resources);
+        if (plan.thread_capacity != (std::max)(std::size_t{1}, logical_processors)) {
             return false;
         }
     }
     return true;
-}
-
-bool check_native_sizing_respects_thread_override() {
-    using namespace sunpack::sevenzip;
-    const NativeMachineResources resources{32};
-    const auto automatic = derive_native_sizing_plan(resources, {});
-    if (automatic.thread_capacity != 32 ||
-        automatic.thread_capacity_overridden) {
-        return false;
-    }
-
-    NativeSizingOverrides overrides;
-    overrides.thread_capacity = 12;
-    const auto configured = derive_native_sizing_plan(resources, overrides);
-    return configured.thread_capacity == 12 &&
-        configured.thread_capacity_overridden;
 }
 
 }  // namespace
@@ -402,10 +385,7 @@ int wmain(int argc, wchar_t** argv) {
         std::cerr << "native sizing logical-processor check failed\n";
         return 13;
     }
-    if (!check_native_sizing_respects_thread_override()) {
-        std::cerr << "native sizing override check failed\n";
-        return 14;
-    }
+
 #endif
 
     (void)argc;

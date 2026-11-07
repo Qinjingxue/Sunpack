@@ -3889,3 +3889,119 @@ def test_password_file_events_publish_only_semantic_updates(tmp_path, monkeypatc
     assert not watcher.config["password_snapshot"].global_passwords
     assert watcher.next_delay_seconds() is None
     assert not path.exists()
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+def test_failure_report_completion_uses_broker_and_drains_before_cancellation(tmp_path, cancel):
+    # Toast unit tests call failed() directly. Only this scheduler boundary test
+    # detects a blocking write on the event loop or an abandoned worker that
+    # still owns diagnostic views after cancellation has returned.
+    from contextlib import nullcontext
+    from sunpack.core.support.work_context import CURRENT_CANCELLATION
+    from sunpack.pipeline.coordinator.async_work import AsyncWorkBroker
+
+    async def scenario():
+        broker = AsyncWorkBroker(thread_capacity=2)
+        started = asyncio.Event()
+        release = threading.Event()
+        cancelled = threading.Event()
+        settled = threading.Event()
+        loop = asyncio.get_running_loop()
+        loop_thread = threading.get_ident()
+        watcher = WatchScheduler.__new__(WatchScheduler)
+        watcher.pipeline_engine = SimpleNamespace(work_broker=broker)
+        watcher.state = SimpleNamespace(defer_journal_waits=lambda: nullcontext([]))
+
+        async def journal(*args, **kwargs):
+            return None
+
+        watcher._wait_for_journal = journal
+
+        def project(request, response, error, notify):
+            notify("failed", request.notification_id, ["failed"], [{"complete": "diagnostics"}])
+            return scheduler_module.WatchRunResult(processed=1, failed=1)
+
+        watcher._project_completion = project
+
+        def notify(action, *args):
+            assert action == "failed"
+            assert threading.get_ident() != loop_thread
+            token = CURRENT_CANCELLATION.get()
+            assert token is not None
+            unsubscribe = token.subscribe(cancelled.set)
+            loop.call_soon_threadsafe(started.set)
+            try:
+                assert release.wait(3), "test failed to release report writer"
+            finally:
+                unsubscribe()
+                settled.set()
+
+        watcher._notify = notify
+        response = loop.create_future()
+        response.set_result(None)
+        request = SimpleNamespace(task=response, cancellation_pending=None,
+                                  candidate=SimpleNamespace(path=str(tmp_path / "archive")),
+                                  notification_id="streaming-report")
+        completion = asyncio.create_task(watcher._complete_candidate(request))
+        try:
+            await asyncio.wait_for(started.wait(), 3)
+            # Reaching here while the writer is blocked proves loop progress.
+            assert not completion.done()
+            if cancel:
+                completion.cancel()
+                assert await asyncio.to_thread(cancelled.wait, 3)
+                assert not completion.done(), "cancel returned before its worker drained"
+            release.set()
+            if cancel:
+                with pytest.raises(asyncio.CancelledError):
+                    await completion
+            else:
+                assert (await completion).failed == 1
+            assert settled.is_set()
+        finally:
+            release.set()
+            await asyncio.gather(completion, return_exceptions=True)
+            await broker.close()
+
+    asyncio.run(scenario())
+
+
+def test_terminal_report_does_not_materialize_failure_tree_or_large_formatted_errors(tmp_path, monkeypatch):
+    # Direct native serializer tests cannot catch copies made before the writer.
+    # Guard both old eager projections at the actual scheduler completion edge.
+    monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
+    source = tmp_path / "archive"
+    source.write_text("source")
+    message = "诊断" * 100_000
+    failure = FailureInfo(FailureKind.DAMAGED, "extraction", message, details={"diagnostic": message})
+    summary = RunSummary(target_results=(TargetRunResult(
+        str(source), OutcomeKind.FAILURE, error=message, failure=failure, failure_message="",
+    ),))
+
+    def forbidden(*args):
+        raise AssertionError("Do not eagerly materialize report diagnostics")
+
+    monkeypatch.setattr(RunSummary, "failed_tasks", property(forbidden))
+    monkeypatch.setattr(FailureInfo, "to_dict", forbidden)
+    watcher = _watcher(tmp_path)
+    notifications = []
+    watcher._notify = lambda *args: notifications.append(args)
+
+    async def scenario():
+        response = asyncio.get_running_loop().create_future()
+        response.set_result(PipelineResponse("report", summary, PipelineArtifacts(())))
+        request = scheduler_module._ActivePipelineRequest(
+            "report", WatchCandidate(str(source), 6, 1.0), response,
+            password_generation=watcher.state.password_generation,
+            password_signature=watcher._password_signature_for_scope(str(tmp_path)),
+        )
+        return await watcher._complete_candidate(request)
+
+    try:
+        result = _await(scenario())
+        assert result.failed == 1 and result.errors[0] is message
+        notification = next(item for item in notifications if item[0] == "failed")
+        assert notification[2][0] is message
+        assert notification[3][0]["details"] is failure.details
+    finally:
+        watcher._close_blocking()

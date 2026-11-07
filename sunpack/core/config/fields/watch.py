@@ -19,10 +19,6 @@ def normalize_watch_config(value: Any) -> dict[str, Any]:
         0.0,
         _float_field(config, "boundary_confirmation_seconds"),
     )
-    config["runtime_cache_cleanup_enabled"] = require_boolean(
-        config["runtime_cache_cleanup_enabled"],
-        "watch.runtime_cache_cleanup_enabled",
-    )
     config["runtime_cache_cleanup_idle_seconds"] = max(
         0.0,
         _float_field(config, "runtime_cache_cleanup_idle_seconds"),
@@ -39,9 +35,6 @@ def normalize_watch_config(value: Any) -> dict[str, Any]:
     config["toast_completion_debounce_ms"] = max(0, _int_field(config, "toast_completion_debounce_ms"))
     config["event_log_retention_days"] = max(1, _int_field(config, "event_log_retention_days"))
     config["toast_report_retention_days"] = max(1, _int_field(config, "toast_report_retention_days"))
-    config["toast_report_max_files"] = max(1, _int_field(config, "toast_report_max_files"))
-    config["toast_report_max_bytes"] = max(1024, _int_field(config, "toast_report_max_bytes"))
-    config["state_dir"] = str(config["state_dir"])
     return config
 
 

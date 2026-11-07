@@ -6,7 +6,13 @@
     "process_mode": "high"
   },
   "watch": {
-    "event_log_retention_days": 7
+    "event_log_retention_days": 7,
+    "toast_report_retention_days": 30,
+    "clipboard_monitor_enabled": true,
+    "clipboard_builtin_max_entries": 30
+  },
+  "passwords": {
+    "clipboard_passwords_enabled": true
   },
   "recursive_extract": "*",
   "recursive_authorization": {

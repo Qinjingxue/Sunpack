@@ -1186,8 +1186,8 @@ void Application::work() {
             if(flags&Roots) {
                 read(Roots,"sunpack_watch_roots.txt",last_roots,roots_read,[&](const std::string& text){roots=parse_roots(text,dir); tasks_changed=dirs_changed=true;});
             }
-            auto log_dir=log_directory(dir,config);
-            if(log.path()!=log_dir/"events.json" || !log_watcher || !log_watcher->alive() || (!log_watcher->direct() && fs::is_directory(log_dir))) {
+            auto log_dir=log_directory(dir);
+            if(!log_watcher || !log_watcher->alive() || (!log_watcher->direct() && fs::is_directory(log_dir))) {
                 log_watcher.reset();
                 try {
                     log_watcher=std::make_unique<DirectoryWatcher>(log_dir,[this](const fs::path& path){

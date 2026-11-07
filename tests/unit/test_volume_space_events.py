@@ -145,20 +145,7 @@ def test_volume_key_shape_is_lowercase_without_trailing_backslash():
     assert not key.endswith("\\")
 
 
-def test_space_gate_environment_mapping():
-    environment = _apply_native_environment({}, {"space_gate_enabled": False})
-    assert environment["SUNPACK_VOLUME_SPACE_GATE"] == "0"
-
-    environment = _apply_native_environment({}, {"space_gate_enabled": True})
-    assert environment["SUNPACK_VOLUME_SPACE_GATE"] == "1"
-
-    environment = _apply_native_environment({}, {"space_gate_enabled": "off"})
-    assert environment["SUNPACK_VOLUME_SPACE_GATE"] == "0"
-
-    # 未配置时不写入：native 侧保持它自己的默认值。
-    environment = _apply_native_environment({}, {})
-    assert "SUNPACK_VOLUME_SPACE_GATE" not in environment
-
+def test_space_poll_intervals_environment_mapping():
     environment = _apply_native_environment(
         {},
         {
@@ -177,8 +164,8 @@ def test_space_gate_environment_mapping():
     assert "SUNPACK_VOLUME_SPACE_STATUS_REPORT_MS" not in environment
 
 
-def test_advanced_config_default_enables_the_space_gate():
-    """配置文件默认必须开启空间 gate：默认值被改回 false 会让功能静默失效。"""
+def test_advanced_config_only_exposes_space_poll_intervals():
+    """Space gates are unconditional; only polling intervals are configurable."""
 
     import json
     import pathlib
@@ -186,7 +173,7 @@ def test_advanced_config_default_enables_the_space_gate():
     root = pathlib.Path(__file__).resolve().parents[2]
     data = json.loads((root / "sunpack_advanced_config.json").read_text(encoding="utf-8"))
     worker = data["performance"]["worker"]
-    assert worker["space_gate_enabled"] is True
+    assert "space_gate_enabled" not in worker
     assert int(worker["space_poll_interval_ms"]) >= 50
     assert int(worker["space_status_report_interval_ms"]) >= 1000
 

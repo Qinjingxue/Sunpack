@@ -256,7 +256,10 @@ def test_log_corruption_rebuilds_through_cli_and_writer_and_retries_after_failur
     folder = path.with_name(path.name + ".store")
     (folder / "broken.index").write_bytes(b"bad")
 
-    config = make_config({"watch": {"state_dir": str(tmp_path)}})
+    from sunpack.runtime.watch import service as service_module
+
+    monkeypatch.setattr(service_module, "service_state_dir", lambda: str(tmp_path))
+    config = make_config()
     host = RuntimeHost()
     monkeypatch.setattr(runtime_state, "require_runtime_host", lambda: host)
     monkeypatch.setattr(watch, "load_request_config", lambda _: config)
@@ -359,3 +362,36 @@ def test_log_corruption_rebuilds_through_cli_and_writer_and_retries_after_failur
         host._watch_service = None
         state.close()
         log.close()
+
+
+def test_lazy_failure_payloads_remain_visible_and_bounded_in_history(tmp_path, monkeypatch):
+    # Existing bounded-log tests only pass builtin containers. Exercise the same
+    # lazy payload sent to the complete report, including deep/large diagnostics.
+    from sunpack.core.contracts.failure_report import FailureReportPayloads
+    from sunpack.core.contracts.failures import FailureInfo, FailureKind
+
+    def fail_materialization(self):
+        raise AssertionError("History must not materialize the failure tree")
+
+    monkeypatch.setattr(FailureInfo, "to_dict", fail_materialization)
+    small = FailureInfo(FailureKind.DAMAGED, "extract", "broken", details={"offset": 7})
+    huge = FailureInfo(FailureKind.DAMAGED, "extract", "错" * 2_000_000)
+    deep = small
+    for _ in range(100):
+        deep = FailureInfo(FailureKind.INPUTS_FAILED, "nested", "failed", causes=(deep,))
+    path = tmp_path / "events.json"
+    store = WatchLogStore(str(path))
+    try:
+        store.write("failure_small", failures=FailureReportPayloads([small]))
+        store.write("failure_huge", failures=FailureReportPayloads([huge] * 1000))
+        store.write("failure_deep", failures=FailureReportPayloads([deep]))
+        store.flush()
+    finally:
+        store.close()
+    rows = {row["event"]: row for row in _records(path)}
+    assert rows["failure_small"]["failures"][0]["kind"] == "damaged"
+    assert rows["failure_small"]["failures"][0]["details"] == {"offset": 7}
+    assert rows["failure_small"]["failures"][0]["causes"] == []
+    for event in ("failure_huge", "failure_deep"):
+        assert rows[event]["truncated"]
+        assert len(json.dumps(rows[event], ensure_ascii=False).encode()) < 32768

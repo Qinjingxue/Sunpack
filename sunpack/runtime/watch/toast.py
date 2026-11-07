@@ -1,22 +1,24 @@
 from __future__ import annotations
 
-import json
+import asyncio
 import os
 import threading
 import time
 import uuid
-from collections.abc import Iterable
-from dataclasses import dataclass, field
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Protocol
 
 from sunpack.core.support.path_keys import case_key
+from sunpack.core.support.work_context import CURRENT_CANCELLATION, CancellationToken
 from sunpack.core.i18n import I18nContext
 
 # native 侧的空间事件名（与 sevenzip_runner / coordinator.reporting 一致），表达等待状态而非 job 生命周期状态。
 _SPACE_EVENTS = frozenset({"space_blocked", "space_status", "space_resumed"})
-from sunpack.core.support.resource_lifecycle import task_glob, write_task_text
+from sunpack.core.support.resource_lifecycle import task_scandir
+from sunpack_native import append_failure_report, publish_failure_report
 from sunpack.core.platform.windows.toast_protocol import (
     ToastAction,
     ToastActionKind,
@@ -38,7 +40,7 @@ class WatchNotificationSink(Protocol):
         self,
         request_id: str,
         errors: list[str],
-        failure_payloads: list[dict[str, Any]],
+        failure_payloads: Sequence[Mapping[str, Any]],
     ) -> None: ...
 
     def suppressed(self, request_id: str) -> None: ...
@@ -65,7 +67,7 @@ class NullWatchNotificationSink:
         self,
         request_id: str,
         errors: list[str],
-        failure_payloads: list[dict[str, Any]],
+        failure_payloads: Sequence[Mapping[str, Any]],
     ) -> None:
         pass
 
@@ -102,10 +104,14 @@ class _BatchProgress:
     total_bytes: int = 0
     output_target: str = ""
     warnings: str = ""
-    failure_details: list[str] = field(default_factory=list)
-    failure_chars: int = 0
+    failure_details: Path | None = None
+    report_failed: bool = False
     interrupted: int = 0
     cleanup_failed: bool = False
+    cancellation: CancellationToken = field(default_factory=CancellationToken, repr=False)
+    pending_appends: int = 0
+    finalizing: bool = False
+    io_lock: Any = field(default_factory=threading.Lock, repr=False)
 
     @property
     def completed(self) -> int:
@@ -119,30 +125,26 @@ class WatchFailureReportStore:
         i18n: I18nContext,
         *,
         retention_days: int = 30,
-        max_files: int = 16,
-        max_bytes: int = 2 * 1024 * 1024,
     ):
         self.directory = Path(state_dir) / "failures"
         self.i18n = i18n
         self.retention_days = max(1, int(retention_days))
-        self.max_files = max(1, int(max_files))
-        self.max_bytes = max(1024, int(max_bytes))
 
-    def format_failure(
-        self, index: int, source_path: str, errors: list[str], payloads: list[dict[str, Any]], limit: int,
-    ) -> str:
-        def parts():
-            yield self.i18n.t("toast.report.failure", index=index, path=source_path) + "\n"
-            error = _bounded_text((str(value) + "; " for value in errors if value), limit)
-            yield self.i18n.t("toast.report.error", error=error or self.i18n.t("toast.report.unknown_error")) + "\n"
-            if payloads:
-                yield self.i18n.t("toast.report.details", details="")
-                yield from json.JSONEncoder(ensure_ascii=False, indent=2, sort_keys=True, default=str).iterencode(payloads)
-            yield "\n"
-        return _bounded_text(parts(), limit)
+    def append_failure(
+        self, path: Path, index: int, source_path: str,
+        errors: list[str], payloads: Sequence[Mapping[str, Any]],
+    ) -> None:
+        append_failure_report(
+            str(path),
+            self.i18n.t("toast.report.failure", index=index, path=source_path),
+            self.i18n.t("toast.report.error", error=""),
+            (value for value in errors if value),
+            self.i18n.t("toast.report.unknown_error"),
+            self.i18n.t("toast.report.details", details=""),
+            payloads,
+        )
 
-    def write(self, details: list[str], failed: int) -> str:
-        self.directory.mkdir(parents=True, exist_ok=True)
+    def write(self, details: Path | None, failed: int) -> str:
         now = datetime.now().astimezone()
         filename = f"failed-{now:%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:8]}.txt"
         path = self.directory / filename
@@ -153,39 +155,30 @@ class WatchFailureReportStore:
             self.i18n.t("toast.report.summary", failed=failed),
             "",
         ]
-        lines.extend(details)
-        if failed > len(details):
-            lines.append(self.i18n.t("toast.report.omitted", count=failed - len(details)))
-        write_task_text(temporary, "\n".join(lines), encoding="utf-8")
-        os.replace(temporary, path)
-        self._trim()
+        publish_failure_report(
+            str(details) if details is not None else None,
+            str(temporary), str(path), (line + "\n" for line in lines),
+        )
+        self._trim(details)
         return str(path)
 
-    def _trim(self) -> None:
+    def _trim(self, active_details: Path | None) -> None:
+        cutoff = time.time() - self.retention_days * 86400
         try:
-            files = sorted(
-                (item for item in task_glob(self.directory, "failed-*.txt") if item.is_file()),
-                key=lambda item: item.stat().st_mtime,
-                reverse=True,
-            )
+            with task_scandir(self.directory) as entries:
+                for entry in entries:
+                    path = self.directory / entry.name
+                    report = entry.name.startswith("failed-") and path.suffix in {".txt", ".tmp"}
+                    spool = entry.name.startswith("batch-") and path.suffix == ".tmp"
+                    if path == active_details or not (report or spool):
+                        continue
+                    try:
+                        if entry.is_file() and entry.stat().st_mtime < cutoff:
+                            OutputCleanupExecutor.remove_file(str(path))
+                    except OSError:
+                        continue
         except OSError:
             return
-        cutoff = time.time() - self.retention_days * 86400
-        retained_bytes = 0
-        for index, path in enumerate(files):
-            try:
-                stat = path.stat()
-                remove = (
-                    (index > 0 and stat.st_mtime < cutoff)
-                    or index >= self.max_files
-                    or (index > 0 and retained_bytes + stat.st_size > self.max_bytes)
-                )
-                if remove:
-                    OutputCleanupExecutor.remove_file(str(path))
-                else:
-                    retained_bytes += stat.st_size
-            except OSError:
-                continue
 
 
 class WatchToastCoordinator:
@@ -208,8 +201,6 @@ class WatchToastCoordinator:
             state_dir,
             self.i18n,
             retention_days=int(watch.get("toast_report_retention_days", 30)),
-            max_files=int(watch.get("toast_report_max_files", 16)),
-            max_bytes=int(watch.get("toast_report_max_bytes", 2 * 1024 * 1024)),
         )
 
     def submitted(self, request_id: str, source_path: str) -> None:
@@ -320,7 +311,7 @@ class WatchToastCoordinator:
         self,
         request_id: str,
         errors: list[str],
-        failure_payloads: list[dict[str, Any]],
+        failure_payloads: Sequence[Mapping[str, Any]],
     ) -> None:
         self._terminal(
             request_id,
@@ -352,7 +343,14 @@ class WatchToastCoordinator:
             self._closed = True
             self._cancel_finalize_locked()
             self._requests.clear()
+            batch = self._batch
             self._reset_batch_locked(clear=True)
+            cleanup = not batch.pending_appends and not batch.finalizing
+        batch.cancellation.cancel()
+        # The service calls stop on its existing worker. Never wait for an
+        # active writer: that writer owns cleanup after noticing detachment.
+        if cleanup:
+            self._discard_details(batch)
 
     def _terminal(
         self,
@@ -361,7 +359,7 @@ class WatchToastCoordinator:
         *,
         output_dirs: list[str] | None = None,
         errors: list[str] | None = None,
-        failure_payloads: list[dict[str, Any]] | None = None,
+        failure_payloads: Sequence[Mapping[str, Any]] | None = None,
     ) -> None:
         with self._lock:
             request = self._requests.pop(str(request_id), None)
@@ -386,17 +384,43 @@ class WatchToastCoordinator:
                 ).rstrip()
             else:
                 batch.failed += 1
-                # A Unicode character occupies at most four UTF-8 bytes. Retain
-                # bounded report text, never completed tasks or payload graphs.
-                remaining = self.report_store.max_bytes // 4 - batch.failure_chars
-                if remaining > 0:
-                    detail = self.report_store.format_failure(
-                        batch.failed, request.source_path, errors or [], failure_payloads or [], remaining,
-                    )
-                    batch.failure_details.append(detail)
-                    batch.failure_chars += len(detail)
+                if batch.failure_details is None:
+                    batch.failure_details = self.report_store.directory / f"batch-{self._batch_id}.tmp"
+                batch.pending_appends += 1
+                failure_index = batch.failed
+            self._cancel_finalize_locked()
             self._publish_progress_locked()
             self._schedule_finalize_if_drained_locked()
+        if outcome == "failure":
+            cancellation = CURRENT_CANCELLATION.get()
+            unsubscribe = cancellation.subscribe(batch.cancellation.cancel) if cancellation else None
+            try:
+                with batch.io_lock:
+                    with self._lock:
+                        append = not self._closed and self._batch is batch and not batch.report_failed
+                    if append:
+                        with batch.cancellation.native_scope():
+                            self.report_store.append_failure(
+                                batch.failure_details, failure_index, request.source_path,
+                                errors or [], failure_payloads or [],
+                            )
+            except BaseException as exc:
+                # Serialization errors are as unsafe to link as disk errors.
+                with self._lock:
+                    batch.report_failed = True
+                if not isinstance(exc, Exception):
+                    raise
+            finally:
+                if unsubscribe is not None:
+                    unsubscribe()
+                with self._lock:
+                    batch.pending_appends -= 1
+                    detached = self._batch is not batch or self._closed
+                    cleanup = detached and not batch.pending_appends and not batch.finalizing
+                    if not detached:
+                        self._schedule_finalize_if_drained_locked()
+                if cleanup:
+                    self._discard_details(batch)
 
     def _ensure_batch_locked(self, source_path: str) -> None:
         if not self._batch_id:
@@ -507,7 +531,8 @@ class WatchToastCoordinator:
         ))
 
     def _schedule_finalize_if_drained_locked(self) -> None:
-        if not self._batch.completed or self._has_pending_batch_requests_locked():
+        if (not self._batch.completed or self._has_pending_batch_requests_locked()
+                or self._batch.pending_appends or self._batch.finalizing):
             return
         self._cancel_finalize_locked()
         self._finalize_generation += 1
@@ -527,67 +552,98 @@ class WatchToastCoordinator:
         with self._lock:
             if self._closed or generation != self._finalize_generation:
                 return
-            if not self._batch.completed or self._has_pending_batch_requests_locked():
+            owner = self._batch
+            if (not owner.completed or self._has_pending_batch_requests_locked()
+                    or owner.pending_appends or owner.finalizing):
                 return
-            batch = self._batch
-            if batch.interrupted and not (batch.succeeded or batch.failed):
-                self.host.publish(ToastSnapshot(
-                    kind=ToastSnapshotKind.FAILURE if batch.cleanup_failed else ToastSnapshotKind.SUCCESS,
-                    batch_id=self._batch_id, title=self.i18n.t("interrupt.finished"),
-                    body=self.i18n.t("interrupt.cleanup_failed" if batch.cleanup_failed else "interrupt.cleaned"),
-                ))
-                self._reset_batch_locked(clear=False)
-                return
-            succeeded, failed = batch.succeeded, batch.failed + int(batch.cleanup_failed)
-            duration = self.i18n.format_duration(time.monotonic() - self._batch_started_at)
-            actions: list[ToastAction] = []
-            output_target = batch.output_target
-            if output_target:
-                actions.append(ToastAction(
-                    ToastActionKind.OPEN_DIRECTORY,
-                    self.i18n.t("toast.action.open_output"),
-                    output_target,
-                ))
-            if failed:
-                try:
-                    report_path = self.report_store.write(batch.failure_details, failed)
-                except OSError:
-                    report_path = ""
-                if report_path:
-                    actions.append(ToastAction(
-                        ToastActionKind.OPEN_LOG,
-                        self.i18n.t("toast.action.open_failure_log"),
-                        report_path,
-                    ))
-            if failed and succeeded:
-                kind = ToastSnapshotKind.MIXED
-                title = self.i18n.t("toast.final.mixed.title")
-                body = self.i18n.t(
-                    "toast.final.mixed.body",
-                    succeeded=succeeded,
-                    failed=failed,
-                    duration=duration,
-                )
-            elif failed:
-                kind = ToastSnapshotKind.FAILURE
-                title = self.i18n.t("toast.final.failure.title")
-                body = self.i18n.t("toast.final.failure.body", failed=failed, duration=duration)
-            else:
-                kind = ToastSnapshotKind.SUCCESS
-                title = self.i18n.t("toast.final.success.title")
-                body = self.i18n.t("toast.final.success.body", succeeded=succeeded, duration=duration)
-            if batch.warnings:
-                body += "\n" + batch.warnings
-            if batch.interrupted:
-                body += "\n" + self.i18n.t("interrupt.cleanup_failed" if batch.cleanup_failed else "interrupt.cleaned")
+            owner.finalizing = True
+            batch = replace(owner)
+            batch_id, started_at = self._batch_id, self._batch_started_at
+        report_path = ""
+        try:
+            with owner.io_lock:
+                if (batch.failed or (batch.cleanup_failed and batch.succeeded)) and not batch.report_failed:
+                    try:
+                        with owner.cancellation.native_scope():
+                            report_path = self.report_store.write(
+                                batch.failure_details, batch.failed + int(batch.cleanup_failed),
+                            )
+                    except (Exception, asyncio.CancelledError):
+                        with self._lock:
+                            owner.report_failed = True
+                with self._lock:
+                    valid = (not self._closed and self._batch is owner
+                             and generation == self._finalize_generation
+                             and not owner.pending_appends
+                             and not self._has_pending_batch_requests_locked())
+                    if valid:
+                        self._publish_final_locked(batch, batch_id, started_at, report_path)
+                        self._reset_batch_locked(clear=False)
+                if report_path and not valid:
+                    self._discard_path(Path(report_path))
+        finally:
+            with self._lock:
+                owner.finalizing = False
+                detached = self._batch is not owner or self._closed
+                cleanup = detached and not owner.pending_appends
+                if not detached:
+                    self._schedule_finalize_if_drained_locked()
+            if cleanup:
+                self._discard_details(owner)
+
+    def _publish_final_locked(
+        self, batch: _BatchProgress, batch_id: str, started_at: float, report_path: str,
+    ) -> None:
+        if batch.interrupted and not (batch.succeeded or batch.failed):
             self.host.publish(ToastSnapshot(
-                kind=kind,
-                batch_id=self._batch_id,
-                title=title,
-                body=body,
-                actions=tuple(actions[:2]),
+                kind=ToastSnapshotKind.FAILURE if batch.cleanup_failed else ToastSnapshotKind.SUCCESS,
+                batch_id=batch_id, title=self.i18n.t("interrupt.finished"),
+                body=self.i18n.t("interrupt.cleanup_failed" if batch.cleanup_failed else "interrupt.cleaned"),
             ))
-            self._reset_batch_locked(clear=False)
+            return
+        succeeded, failed = batch.succeeded, batch.failed + int(batch.cleanup_failed)
+        duration = self.i18n.format_duration(time.monotonic() - started_at)
+        actions: list[ToastAction] = []
+        output_target = batch.output_target
+        if output_target:
+            actions.append(ToastAction(
+                ToastActionKind.OPEN_DIRECTORY,
+                self.i18n.t("toast.action.open_output"),
+                output_target,
+            ))
+        if report_path:
+            actions.append(ToastAction(
+                ToastActionKind.OPEN_LOG,
+                self.i18n.t("toast.action.open_failure_log"), report_path,
+            ))
+        if failed and succeeded:
+            kind = ToastSnapshotKind.MIXED
+            title = self.i18n.t("toast.final.mixed.title")
+            body = self.i18n.t(
+                "toast.final.mixed.body",
+                succeeded=succeeded,
+                failed=failed,
+                duration=duration,
+            )
+        elif failed:
+            kind = ToastSnapshotKind.FAILURE
+            title = self.i18n.t("toast.final.failure.title")
+            body = self.i18n.t("toast.final.failure.body", failed=failed, duration=duration)
+        else:
+            kind = ToastSnapshotKind.SUCCESS
+            title = self.i18n.t("toast.final.success.title")
+            body = self.i18n.t("toast.final.success.body", succeeded=succeeded, duration=duration)
+        if batch.warnings:
+            body += "\n" + batch.warnings
+        if batch.interrupted:
+            body += "\n" + self.i18n.t("interrupt.cleanup_failed" if batch.cleanup_failed else "interrupt.cleaned")
+        self.host.publish(ToastSnapshot(
+            kind=kind,
+            batch_id=batch_id,
+            title=title,
+            body=body,
+            actions=tuple(actions[:2]),
+        ))
 
     def _reset_batch_locked(self, *, clear: bool) -> None:
         self._batch_id = ""
@@ -595,6 +651,17 @@ class WatchToastCoordinator:
         self._batch = _BatchProgress()
         if clear:
             self.host.clear()
+
+    @staticmethod
+    def _discard_path(path: Path) -> None:
+        try:
+            OutputCleanupExecutor.remove_file(str(path))
+        except OSError:
+            pass
+
+    def _discard_details(self, batch: _BatchProgress) -> None:
+        if batch.failure_details is not None:
+            self._discard_path(batch.failure_details)
 
 
 def _bounded_text(parts: Iterable[str], limit: int) -> str:

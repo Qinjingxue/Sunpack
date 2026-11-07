@@ -111,8 +111,7 @@ def test_effective_config_includes_native_worker_and_format_switch():
     }
     config["performance"] = {
         "worker": {
-            "thread_capacity": 0,
-            "memory_reserve_bytes": 268435456,
+            "writer_threads": 4,
         }
     }
 

@@ -630,7 +630,7 @@ bool registry_creation_failure_does_not_retain_entries() {
     AsyncWriterConfig config;
     config.threads_per_volume = 1;
     config.buffer_count = 4;
-    config.space_gate_enabled = true;
+
     VolumeWriterRegistry registry(std::make_shared<WriterMeters>(), config);
     const std::string key = "job:failed";
     for (std::ptrdiff_t point = 0;; ++point) {

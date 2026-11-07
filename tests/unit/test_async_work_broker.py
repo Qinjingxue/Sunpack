@@ -532,3 +532,31 @@ def test_broker_prioritizes_pipeline_work_over_background_cleanup():
             await broker.close()
 
     asyncio.run(scenario())
+
+
+def test_pipeline_broker_always_uses_automatic_capacity_and_internal_queue_limit(monkeypatch):
+    """Cover automatic stage admission and native handshake sizing together."""
+    from sunpack.pipeline.coordinator.engine import new_work_broker, _PipelineServices
+
+    monkeypatch.setattr("sunpack.pipeline.coordinator.async_work.os.cpu_count", lambda: 12)
+
+    async def scenario():
+        broker = new_work_broker()
+        assert broker.thread_capacity == 12
+        assert broker.max_pending_jobs == 4096
+        services = _PipelineServices.__new__(_PipelineServices)
+        services.broker = broker
+
+        async def handshake():
+            return {"initial_active_limit": 7, "thread_capacity": 12}
+
+        services.sevenzip_runner = SimpleNamespace(
+            bind_event_loop=lambda loop: None, start_asyncio=handshake,
+        )
+        try:
+            await services.start()
+            assert broker.thread_capacity == 7
+        finally:
+            await broker.close()
+
+    asyncio.run(scenario())

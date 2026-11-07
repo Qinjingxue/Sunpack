@@ -41,7 +41,6 @@ CONFIG_RELOAD_DEBOUNCE_SECONDS = 0.5
 class ReloadPlan:
     restart_scheduler: bool
     reconcile_tray: bool
-    state_dir_changed: bool
     runtime_process_mode_changed: bool
 
     @property
@@ -49,7 +48,6 @@ class ReloadPlan:
         return (
             self.restart_scheduler
             or self.reconcile_tray
-            or self.state_dir_changed
             or self.runtime_process_mode_changed
         )
 
@@ -77,14 +75,6 @@ def normalize_root(path: str) -> str:
     return os.path.abspath(os.path.normpath(path))
 
 
-def resolve_service_path(path: str) -> str:
-    """Resolve service metadata paths without depending on the process cwd."""
-    candidate = Path(path).expanduser()
-    if not candidate.is_absolute():
-        candidate = watch_roots_path().resolve().parent / candidate
-    return normalize_root(str(candidate))
-
-
 def existing_roots(roots: list[str]) -> list[str]:
     result = []
     seen = set()
@@ -98,11 +88,7 @@ def existing_roots(roots: list[str]) -> list[str]:
     return result
 
 
-def service_state_dir(config: dict) -> str:
-    service = config["watch"]
-    state_dir = str(service.get("state_dir") or "").strip()
-    if state_dir:
-        return resolve_service_path(state_dir)
+def service_state_dir() -> str:
     return os.path.join(normalize_root(str(watch_roots_path().resolve().parent)), ".sunpack_watch")
 
 
@@ -155,13 +141,10 @@ def _tray_signature(config: dict, service_config: dict) -> tuple[bool, str]:
 def _build_reload_plan(
     old_config: dict,
     old_service_config: dict,
-    old_state_dir: str,
     new_config: dict,
     new_service_config: dict,
-    new_state_dir: str,
 ) -> ReloadPlan:
-    state_dir_changed = new_state_dir != old_state_dir
-    restart_scheduler = state_dir_changed or (
+    restart_scheduler = (
         _config_without_tray(new_config) != _config_without_tray(old_config)
         or _service_config_without_tray(new_service_config)
         != _service_config_without_tray(old_service_config)
@@ -174,7 +157,6 @@ def _build_reload_plan(
             _tray_signature(new_config, new_service_config)
             != _tray_signature(old_config, old_service_config)
         ),
-        state_dir_changed=state_dir_changed,
         runtime_process_mode_changed=(
             str(old_runtime.get("process_mode") or "normal")
             != str(new_runtime.get("process_mode") or "normal")
@@ -437,7 +419,7 @@ class WatchService:
         self.external_activity_active = external_activity_active
         self.config = load_config()
         self.service_config = service_config_from(self.config)
-        self.state_dir = service_state_dir(self.config)
+        self.state_dir = service_state_dir()
         self.scheduler: WatchScheduler | None = None
         self.pipeline_engine = pipeline_engine
         self.config_observer: ConfigFileObserver | None = None
@@ -640,7 +622,6 @@ class WatchService:
         applied = await self._apply_configuration(
             self.config,
             new_service_config,
-            service_state_dir(self.config),
         )
         requested_changes = [*added, *updated]
         added, updated = retained_watch_root_changes(
@@ -675,7 +656,6 @@ class WatchService:
         applied = await self._apply_configuration(
             self.config,
             new_service_config,
-            service_state_dir(self.config),
         )
         return {
             "roots_path": str(roots_path),
@@ -736,7 +716,7 @@ class WatchService:
             await scheduler.start()
         except BaseException:
             if toast_coordinator is not None:
-                toast_coordinator.stop()
+                await asyncio.to_thread(toast_coordinator.stop)
             if scheduler is not None:
                 try:
                     await scheduler.aclose()
@@ -788,7 +768,7 @@ class WatchService:
             self.scheduler = None
             try:
                 if self.toast_coordinator is not None:
-                    self.toast_coordinator.stop()
+                    await asyncio.to_thread(self.toast_coordinator.stop)
             finally:
                 self.toast_coordinator = None
                 try:
@@ -983,8 +963,6 @@ class WatchService:
         try:
             new_config = load_config()
             new_service_config = service_config_from(new_config)
-            new_state_dir = service_state_dir(new_config)
-            Path(new_state_dir).mkdir(parents=True, exist_ok=True)
         except Exception as exc:
             self.log.write("config_reload_failed", error=str(exc), error_type=type(exc).__name__, phase="load")
             return False
@@ -993,7 +971,6 @@ class WatchService:
             return await self._apply_configuration(
                 new_config,
                 new_service_config,
-                new_state_dir,
             )
         except Exception:
             return False
@@ -1002,16 +979,13 @@ class WatchService:
         self,
         new_config: dict,
         new_service_config: dict,
-        new_state_dir: str,
     ) -> bool:
         await self._clean_non_ntfs_roots(new_config, new_service_config)
         plan = _build_reload_plan(
             self.config,
             self.service_config,
-            self.state_dir,
             new_config,
             new_service_config,
-            new_state_dir,
         )
         if not plan.changed:
             self.config = new_config
@@ -1020,13 +994,10 @@ class WatchService:
             self.log.write("service_reload_skipped", reason="no_semantic_change")
             return False
 
-        previous = (self.config, self.service_config, self.state_dir, self.log)
+        previous = (self.config, self.service_config)
         self.config = new_config
         self.service_config = new_service_config
-        self.state_dir = new_state_dir
         try:
-            if plan.state_dir_changed:
-                self.log = WatchLogStore(os.path.join(new_state_dir, "events.json"), retention_days=new_config["watch"]["event_log_retention_days"])
             if plan.restart_scheduler:
                 await self._start_scheduler()
             else:
@@ -1036,11 +1007,8 @@ class WatchService:
             if self.config_applied_callback is not None:
                 await self.config_applied_callback(self.config)
         except Exception as exc:
-            failed_log = self.log
-            self.config, self.service_config, self.state_dir, self.log = previous
-            failed_log.write("config_reload_failed", error=str(exc), error_type=type(exc).__name__, phase="apply")
-            if failed_log is not self.log:
-                await asyncio.to_thread(failed_log.close)
+            self.config, self.service_config = previous
+            self.log.write("config_reload_failed", error=str(exc), error_type=type(exc).__name__, phase="apply")
             try:
                 # Root edits (including cleanup) are already durable. Restore
                 # ordinary settings, but reconcile roots from the latest file
@@ -1072,8 +1040,6 @@ class WatchService:
             tray_reconciled=plan.reconcile_tray,
             runtime_process_mode_changed=plan.runtime_process_mode_changed,
         )
-        if previous[3] is not self.log:
-            await asyncio.to_thread(previous[3].close)
         return True
 
     async def _clean_non_ntfs_roots(self, config: dict, service_config: dict) -> None:
