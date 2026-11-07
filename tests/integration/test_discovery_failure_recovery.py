@@ -59,7 +59,7 @@ def nested_failures(tmp_path):
         "output": {"root": str(tmp_path / "out")},
         "embedded_scan": {"recursive_candidate_ratio": 1e-9},
         "post_extract": {"archive_cleanup_mode": "k", "flatten_single_directory": True},
-        "watch": {"clipboard_monitor_enabled": False, "password_retry_debounce_seconds": 0},
+        "watch": {"clipboard_monitor_enabled": False},
         "cli": {"quiet": True},
     })
     return SimpleNamespace(

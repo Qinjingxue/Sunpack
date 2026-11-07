@@ -28,7 +28,7 @@ def test_doctor_reports_checks_and_missing_watch_roots_as_warnings(tmp_path, mon
     monkeypatch.setattr(
         doctor,
         "load_request_config_payload",
-        lambda _cwd: (tmp_path / "sunpack_config.json", {"watch": {"toast_enabled": False}}),
+        lambda _cwd, *, refresh=False: (tmp_path / "sunpack_config.json", {"watch": {"toast_enabled": False}}),
     )
     monkeypatch.setattr(doctor, "load_request_config", lambda cwd: make_config(doctor.load_request_config_payload(cwd)[1]))
     monkeypatch.setattr(doctor, "validate_config_payload", lambda _payload: {"ok": True, "errors": []})
@@ -55,7 +55,7 @@ def test_doctor_returns_task_failed_when_a_check_fails(tmp_path, monkeypatch):
     monkeypatch.setattr(
         doctor,
         "load_request_config_payload",
-        lambda _cwd: (tmp_path / "sunpack_config.json", {"watch": {"toast_enabled": True}}),
+        lambda _cwd, *, refresh=False: (tmp_path / "sunpack_config.json", {"watch": {"toast_enabled": True}}),
     )
     monkeypatch.setattr(doctor, "load_request_config", lambda cwd: make_config(doctor.load_request_config_payload(cwd)[1]))
     monkeypatch.setattr(doctor, "validate_config_payload", lambda _payload: {"ok": True, "errors": []})

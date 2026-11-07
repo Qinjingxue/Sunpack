@@ -89,7 +89,6 @@ def test_watch_retries_real_encrypted_zip_after_password_source_update(tmp_path,
     config["watch"] = {
         **config.get("watch", {}),
         "clipboard_monitor_enabled": source == "watch_clipboard",
-        "password_retry_debounce_seconds": 0,
     }
     async def scenario():
         async with PipelineEngine(config) as engine:
@@ -223,7 +222,6 @@ def test_watch_aggregates_all_zipcrypto_fast_matches(tmp_path, monkeypatch, incl
     config["watch"] = {
         **config.get("watch", {}),
         "clipboard_monitor_enabled": False,
-        "password_retry_debounce_seconds": 0,
     }
     async def scenario():
         async with PipelineEngine(config) as engine:

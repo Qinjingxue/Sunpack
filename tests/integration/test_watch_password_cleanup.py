@@ -54,13 +54,12 @@ def test_concurrent_header_encrypted_rar_retry_cleans_single_and_disguised_volum
     config['cli']['quiet'] = True
     config['post_extract']['archive_cleanup_mode'] = 'delete'
     config['watch']['clipboard_monitor_enabled'] = False
-    config['watch']['password_retry_debounce_seconds'] = 0
 
     async def settle(watcher):
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
             await watcher.run_once()
-            if not watcher.pending_count and not watcher._inflight_requests and watcher._password_reload_at is None and watcher._password_retry_at is None:
+            if not watcher.pending_count and not watcher._inflight_requests and not watcher._password_update_pending and watcher._password_retry_at is None:
                 return
             await asyncio.sleep(0.01)
         pytest.fail('password retry/cleanup did not settle before the barrier timeout')

@@ -274,7 +274,7 @@ class RuntimeHost:
         service = self._watch_service
         scheduler = service.scheduler if service is not None else None
         if scheduler is not None:
-            scheduler.notify_password_source_changed("runtime_configuration")
+            scheduler.notify_password_snapshot_changed()
 
     async def close(self, *, exit_reason: str = "shutdown") -> None:
         self.log_event(

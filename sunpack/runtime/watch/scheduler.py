@@ -286,7 +286,8 @@ class WatchScheduler:
         self._ready_heap: list[tuple[float, int, int, str, str]] = []
         self._quiet_trackers: dict[str, AdaptiveQuietTracker] = {}
         self._closed = False
-        self._password_reload_at: float | None = None
+        self._password_reload_pending = False
+        self._password_update_pending = False
         self._password_retry_at: float | None = None
         self._observer = Observer()
         self._observer_resource = None
@@ -316,7 +317,6 @@ class WatchScheduler:
                 )
             ),
         )
-        self.password_retry_debounce_seconds = max(0.0, float(watch_config["password_retry_debounce_seconds"]))
         self._configured_user_passwords = dedupe_passwords(list(config.get("user_passwords") or []))
         self._user_password_signature = fast_hash128(json.dumps(
             self._configured_user_passwords, ensure_ascii=False, separators=(",", ":"),
@@ -385,7 +385,8 @@ class WatchScheduler:
             except BaseException:
                 self._release_observer()
                 raise
-        self._publish_password_update()
+        # Arm notifications before reading so startup cannot miss a replacement.
+        self._publish_password_update(reload=True)
         self._clipboard_monitor.start()
         self._started = True
         self._recover_persisted_work()
@@ -969,7 +970,8 @@ class WatchScheduler:
                 self._claims_by_owner.clear()
                 self._dirty_during_claim.clear()
                 self._source_probes.clear()
-                self._password_reload_at = None
+                self._password_reload_pending = False
+                self._password_update_pending = False
                 self._password_retry_at = None
 
     def _stop_blocking(self):
@@ -1015,14 +1017,17 @@ class WatchScheduler:
             await self.pipeline_engine.work_broker.run(
                 "watch_usn_checkpoint", "watch", self._recover_usn_gap, request_id="watch", origin="watch",
             )
-        now = time.monotonic()
+        # Clear before the read. In-flight events leave a dirty bit and an
+        # immediate next turn, without starving retries during continuous edits.
         with self._lock:
-            reload_due = self._password_reload_at is not None and self._password_reload_at <= now
-            if reload_due:
-                self._password_reload_at = None
-        if reload_due:
+            update_passwords = self._password_update_pending
+            reload = self._password_reload_pending
+            self._password_reload_pending = False
+            self._password_update_pending = False
+        if update_passwords:
             await self.pipeline_engine.work_broker.run(
-                "password_reload", "watch", self._publish_password_update, request_id="watch", origin="watch",
+                "password_reload", "watch", self._publish_password_update, reload,
+                request_id="watch", origin="watch",
             )
         result = await self._harvest_completed_requests()
         with self._lock:
@@ -1250,7 +1255,8 @@ class WatchScheduler:
     def next_delay_seconds(self) -> float | None:
         now = monotonic_now = time.monotonic()
         with self._lock:
-            if self._directory_pending or self._watch_rearm or self._usn_checkpoint_pending:
+            if (self._directory_pending or self._watch_rearm or self._usn_checkpoint_pending
+                    or self._password_update_pending):
                 return 0.0
             # Completion callbacks wake the service when admission space opens.
             # A full request window must not turn due candidates into polling.
@@ -1262,10 +1268,9 @@ class WatchScheduler:
                 if next_ready is None
                 else max(0.0, next_ready[0] - now)
             )
-            for deadline in (self._password_reload_at, self._password_retry_at):
-                if deadline is not None:
-                    password_delay = max(0.0, deadline - monotonic_now)
-                    delay = password_delay if delay is None else min(delay, password_delay)
+            if self._password_retry_at is not None:
+                password_delay = max(0.0, self._password_retry_at - monotonic_now)
+                delay = password_delay if delay is None else min(delay, password_delay)
             if self._cache_cleanup_deadline is not None and not self._cache_cleanup_blocked_locked():
                 cleanup_delay = max(0.0, self._cache_cleanup_deadline - monotonic_now)
                 delay = cleanup_delay if delay is None else min(delay, cleanup_delay)
@@ -1726,13 +1731,25 @@ class WatchScheduler:
         return case_key(os.path.abspath(path)) == case_key(self.builtin_password_file)
 
     def notify_password_source_changed(self, reason: str, path: str = "") -> None:
+        self._schedule_password_update(reload=True)
+
+    def notify_password_snapshot_changed(self) -> None:
+        """The runtime already loaded the source; only publish its snapshot."""
+        self._schedule_password_update(reload=False)
+
+    def _schedule_password_update(self, *, reload: bool) -> None:
         with self._lock:
             if self._closed:
                 return
-            self._password_reload_at = time.monotonic() + self.password_retry_debounce_seconds
+            self._password_reload_pending |= reload
+            self._password_update_pending = True
         self._wake_service()
 
-    def _publish_password_update(self) -> None:
+    def _publish_password_update(self, reload: bool = False) -> None:
+        if reload:
+            self._password_file_source.reload()
+        # Read/parse outside the publication gate. Completion uses the same
+        # gate below, so either this update or a late failure schedules retry.
         with self._password_source_lock:
             signature = self._refresh_password_sources()
             if signature == self._password_source_signature:
@@ -2731,7 +2748,7 @@ class WatchScheduler:
                 or bool(self.metadata_dir and _is_relative_to(normalized, self.metadata_dir)))
 
     def _refresh_password_sources(self) -> str:
-        snapshot = self._password_file_source.reload()
+        snapshot = self._password_file_source.snapshot
         self.config["user_passwords"] = self._configured_user_passwords
         self.config.pop("builtin_passwords", None)
         self.config["password_snapshot"] = snapshot
@@ -2744,10 +2761,6 @@ class WatchScheduler:
 
     def _password_failure_needs_retry(self, entry: WatchStateEntry) -> bool:
         signature = entry.failure_payload.get("password_signature")
-        if signature is None:
-            # Pre-upgrade blockers have no scoped snapshot. Their next retry
-            # records one through the normal completion path.
-            return entry.password_generation < self.state.password_generation
         return signature != self._password_signature_for_scope(entry.password_scope_dir)
 
     def _mark_all_password_failures_dirty(self) -> None:

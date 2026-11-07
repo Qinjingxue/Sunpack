@@ -685,11 +685,11 @@ def _indexed_scheduler_for_test():
     watcher._source_probes = {}
     watcher._wake_callback = None
     watcher.should_ignore_event_path = lambda path: False
-    watcher._password_reload_at = None
+    watcher._password_reload_pending = False
+    watcher._password_update_pending = False
     watcher._password_retry_at = None
     watcher._cache_cleanup_deadline = None
     watcher.log = SimpleNamespace(next_history_expiry=None, clear_expired_history=lambda: None)
-    watcher.password_retry_debounce_seconds = 0.0
     return watcher
 
 
@@ -2883,7 +2883,7 @@ def test_watch_scheduler_does_not_retry_password_inconclusive_after_password_sou
 
     watcher = _watcher(
         tmp_path,
-        config=make_config({"watch": {"clipboard_monitor_enabled": False, "password_retry_debounce_seconds": 0}}),
+        config=make_config({"watch": {"clipboard_monitor_enabled": False}}),
         roots=[str(watch_root)],
         pipeline_engine=FakePipelineEngine(InconclusiveRunner),
     )
@@ -2925,7 +2925,6 @@ def test_password_retry_bypasses_learned_quiet_for_unchanged_failed_archive(tmp_
         config=make_config({
             "watch": {
                 "clipboard_monitor_enabled": False,
-                "password_retry_debounce_seconds": 0,
             }
         }),
         pipeline_engine=FakePipelineEngine(PasswordThenSuccessRunner),
@@ -2974,7 +2973,6 @@ def test_password_retry_relearns_quiet_when_failed_archive_changed(tmp_path, mon
         config=make_config({
             "watch": {
                 "clipboard_monitor_enabled": False,
-                "password_retry_debounce_seconds": 0,
             }
         }),
         pipeline_engine=FakePipelineEngine(PasswordFailureRunner),
@@ -2999,7 +2997,7 @@ def test_password_retry_relearns_quiet_when_failed_archive_changed(tmp_path, mon
     assert _await(watcher.run_once()).failed == 1
 
 
-def test_password_retry_debounce_uses_monotonic_clock_when_wall_clock_moves_backward(tmp_path, monkeypatch):
+def test_password_retry_is_immediate_even_when_wall_clock_moves_backward(tmp_path, monkeypatch):
     monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
     wall_clock = WatchClock(1_000.0)
     wall_clock.install(monkeypatch)
@@ -3030,7 +3028,6 @@ def test_password_retry_debounce_uses_monotonic_clock_when_wall_clock_moves_back
         config=make_config({
             "watch": {
                 "clipboard_monitor_enabled": False,
-                "password_retry_debounce_seconds": 5,
             }
         }),
         roots=[str(watch_root)],
@@ -3045,18 +3042,13 @@ def test_password_retry_debounce_uses_monotonic_clock_when_wall_clock_moves_back
     _change_password_source(watcher)
     assert wakeups == [100.0]
     assert watcher.pending_count == 0
-    assert watcher.next_delay_seconds() == 5.0
+    assert watcher.next_delay_seconds() == 0.0
 
     wall_clock.value = 10.0
-    monotonic_clock["value"] = 104.9
-    assert watcher.next_delay_seconds() == pytest.approx(0.1)
-    before_debounce = _await(watcher.run_once())
-    monotonic_clock["value"] = 105.0
-    after_debounce = _await(watcher.run_once())
+    retried = _await(watcher.run_once())
 
     assert first.failed == 1
-    assert before_debounce.processed == 0
-    assert after_debounce.succeeded == 1
+    assert retried.succeeded == 1
     assert attempts["count"] == 2
 
 
@@ -3141,7 +3133,7 @@ def test_watch_scheduler_clipboard_persistence_refreshes_candidates_and_retries(
     archive_path.write_bytes(b"PK\x03\x04payload")
     watcher = _watcher(
         tmp_path,
-        config=make_config({"watch": {"clipboard_monitor_enabled": True, "password_retry_debounce_seconds": 0}}),
+        config=make_config({"watch": {"clipboard_monitor_enabled": True}}),
         roots=[str(watch_root)],
         pipeline_engine=FakePipelineEngine(ConfigAwareRunner),
     )
@@ -3192,7 +3184,7 @@ def test_watch_scheduler_retries_on_builtin_password_file_watchdog_event(tmp_pat
     archive_path.write_bytes(b"PK\x03\x04payload")
     watcher = _watcher(
         tmp_path,
-        config=make_config({"watch": {"clipboard_monitor_enabled": False, "password_retry_debounce_seconds": 0}}),
+        config=make_config({"watch": {"clipboard_monitor_enabled": False}}),
         roots=[str(watch_root)],
         pipeline_engine=FakePipelineEngine(ConfigAwareRunner),
     )
@@ -3243,7 +3235,7 @@ def test_watch_scheduler_retries_persisted_password_failure_when_config_password
     state_path = tmp_path / "state.snapshot"
     first_watcher = _watcher(
         tmp_path,
-        config=make_config({"user_passwords": ["wrong"], "watch": {"clipboard_monitor_enabled": False, "password_retry_debounce_seconds": 0}}),
+        config=make_config({"user_passwords": ["wrong"], "watch": {"clipboard_monitor_enabled": False}}),
         roots=[str(watch_root)],
         state_path=str(state_path),
         pipeline_engine=FakePipelineEngine(ConfigAwareRunner),
@@ -3253,7 +3245,7 @@ def test_watch_scheduler_retries_persisted_password_failure_when_config_password
 
     second_watcher = _watcher(
         tmp_path,
-        config=make_config({"user_passwords": ["new-secret"], "watch": {"clipboard_monitor_enabled": False, "password_retry_debounce_seconds": 0}}),
+        config=make_config({"user_passwords": ["new-secret"], "watch": {"clipboard_monitor_enabled": False}}),
         roots=[str(watch_root)],
         state_path=str(state_path),
         pipeline_engine=FakePipelineEngine(ConfigAwareRunner),
@@ -3296,7 +3288,7 @@ def test_watch_scheduler_success_hints_do_not_create_new_password_sources(tmp_pa
     teacher_archive.write_bytes(b"PK\x03\x04teacher")
     watcher = _watcher(
         tmp_path,
-        config=make_config({"watch": {"clipboard_monitor_enabled": False, "password_retry_debounce_seconds": 0}}),
+        config=make_config({"watch": {"clipboard_monitor_enabled": False}}),
         roots=[str(watch_root)],
         pipeline_engine=FakePipelineEngine(LearningRunner),
     )
@@ -3862,7 +3854,7 @@ def test_password_file_events_publish_only_semantic_updates(tmp_path, monkeypatc
     # Unique coverage: watchdog replacement/deletion and retry generations, without scheduler restart.
     _set_passwords(tmp_path, monkeypatch, ["before"])
     watcher = _watcher(tmp_path, config=make_config({"watch": {
-        "clipboard_monitor_enabled": False, "password_retry_debounce_seconds": 0,
+        "clipboard_monitor_enabled": False,
     }}))
     handler = scheduler_module._WatchEventHandler(watcher)
     path = watcher._password_file_source.path
@@ -3889,6 +3881,51 @@ def test_password_file_events_publish_only_semantic_updates(tmp_path, monkeypatc
     assert not watcher.config["password_snapshot"].global_passwords
     assert watcher.next_delay_seconds() is None
     assert not path.exists()
+
+
+def test_password_reload_coalesces_inflight_events_and_runtime_publication_does_not_reread(tmp_path, monkeypatch):
+    # Sequential semantic tests cannot expose a write during the read or a
+    # runtime-to-watch second read. One event burst covers both with no sleeps.
+    from sunpack.runtime.cli.runtime_host import RuntimeHost
+
+    _set_passwords(tmp_path, monkeypatch, ["before"])
+    watcher = _watcher(tmp_path)
+    source = watcher._password_file_source
+    path = source.path
+    read = builtin_module.read_changed_shared_utf8_text
+    reads = []
+    def read_and_edit(*args):
+        document = read(*args)
+        reads.append(args[0])
+        if len(reads) == 1:
+            write_password_json(path, ["last"])
+            for _ in range(256):
+                watcher.notify_password_source_changed("builtin_password_file")
+            # A loaded-snapshot notification must not downgrade a dirty read.
+            watcher.notify_password_snapshot_changed()
+        return document
+    monkeypatch.setattr(builtin_module, "read_changed_shared_utf8_text", read_and_edit)
+    write_password_json(path, ["first"])
+    watcher.notify_password_source_changed("builtin_password_file")
+    _await(watcher.run_once())
+    assert watcher.config["password_snapshot"].global_passwords == ("first",)
+    assert watcher.next_delay_seconds() == 0.0
+    _await(watcher.run_once())
+    assert watcher.config["password_snapshot"].global_passwords == ("last",)
+    assert len(reads) == 2
+    assert watcher.next_delay_seconds() is None
+
+    write_password_json(path, ["runtime"])
+    source.reload()
+    host = RuntimeHost.__new__(RuntimeHost)
+    host._watch_service = SimpleNamespace(scheduler=watcher)
+    for _ in range(256):
+        host.password_source_changed()
+    _await(watcher.run_once())
+    assert watcher.config["password_snapshot"] is source.snapshot
+    assert watcher.config["password_snapshot"].global_passwords == ("runtime",)
+    assert len(reads) == 3
+    assert watcher.next_delay_seconds() is None
 
 
 @pytest.mark.parametrize("cancel", [False, True])

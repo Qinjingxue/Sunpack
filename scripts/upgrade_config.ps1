@@ -208,6 +208,7 @@ foreach ($section in @('input_planning', 'detection')) {
 }
 foreach ($field in @(
     @('watch', 'state_dir'), @('watch', 'runtime_cache_cleanup_enabled'),
+    @('watch', 'password_retry_debounce_seconds'),
     @('watch', 'toast_report_max_files'), @('watch', 'toast_report_max_bytes'),
     @('watch', 'toast_update_interval_ms'), @('watch', 'toast_completion_debounce_ms'),
     @('analysis', 'max_concurrent_reads'), @('analysis', 'shared_cache_mb'), @('analysis', 'thresholds'), @('analysis', 'prepass')

@@ -664,12 +664,11 @@ def test_watch_service_config_observer_targets_program_files(tmp_path, monkeypat
     captured = {}
 
     class FakeConfigObserver:
-        def __init__(self, directory, filenames, callback, *, debounce_seconds, loop):
+        def __init__(self, directory, filenames, callback, *, loop):
             captured.update(
                 directory=directory,
                 filenames=set(filenames),
                 callback=callback,
-                debounce_seconds=debounce_seconds,
                 loop=loop,
             )
 
@@ -691,8 +690,9 @@ def test_watch_service_config_observer_targets_program_files(tmp_path, monkeypat
     service._control_queue = asyncio.Queue()
 
     service._start_config_observer()
+    requested = []
+    monkeypatch.setattr(service, "_queue_config_reload", lambda: requested.append(True))
     captured["callback"]()
-    _await(asyncio.sleep(0))
     service._stop_config_observer()
 
     assert captured["directory"] == tmp_path.resolve()
@@ -701,10 +701,10 @@ def test_watch_service_config_observer_targets_program_files(tmp_path, monkeypat
         "sunpack_advanced_config.json",
         "sunpack_watch_roots.txt",
     }
-    assert captured["debounce_seconds"] == 0.5
     assert captured["started"] is True
     assert captured["stopped"] is True
-    assert service._control_queue.get_nowait() == service_module.CONTROL_RELOAD
+    assert requested == [True]
+    assert service._control_queue.empty()
 
 
 def test_watch_service_invalid_config_reload_preserves_running_service(tmp_path, monkeypatch):
@@ -717,6 +717,8 @@ def test_watch_service_invalid_config_reload_preserves_running_service(tmp_path,
     scheduler_restarts = []
     written = []
     service.log.write = lambda event, **payload: written.append((event, payload))
+    invalidated = []
+    monkeypatch.setattr(service_module, "clear_config_cache", lambda: invalidated.append(True))
     monkeypatch.setattr(service_module, "load_config", lambda: (_ for _ in ()).throw(ValueError("invalid json")))
     async def start_scheduler():
         scheduler_restarts.append(True)
@@ -725,6 +727,7 @@ def test_watch_service_invalid_config_reload_preserves_running_service(tmp_path,
 
     _await(service._reload_config())
 
+    assert invalidated == [True]
     assert service.config is original_config
     assert service.service_config is original_service_config
     assert service.log is original_log
@@ -1660,3 +1663,54 @@ def test_service_reload_lifecycle(tmp_path, monkeypatch):
     assert _await(service.reload()) is False
     assert len(starts) == 2
     assert service.state_dir == original_state_dir and service.log is original_log
+
+
+def test_config_reload_bursts_coalesce_before_dispatch_and_during_apply(monkeypatch):
+    # Ordinary reloads must not create an event-sized control/task queue, and
+    # an edit during an awaited apply must get one subsequent read.
+    async def scenario():
+        monkeypatch.setattr(service_module, "load_config", lambda: make_config({"watch": {"tray_enabled": False}}))
+        service = WatchService(engine_factory=lambda _config: FakePipelineEngine(FakeRunner))
+        service._loop = asyncio.get_running_loop()
+        service._control_queue = asyncio.Queue()
+        entered, release = asyncio.Event(), asyncio.Event()
+        calls = []
+        async def reload():
+            calls.append(True)
+            if len(calls) == 1:
+                entered.set()
+                await release.wait()
+                return True
+            # A duplicate notification can produce a no-op after a real apply.
+            return False
+        monkeypatch.setattr(service, "_reload_config_unlocked", reload)
+        queued = []
+        schedule = service._loop.call_soon_threadsafe
+        def record(callback, *args):
+            queued.append(callback)
+            return schedule(callback, *args)
+        monkeypatch.setattr(service._loop, "call_soon_threadsafe", record)
+        for _ in range(256):
+            service.request_reload()
+        assert len(queued) == 1
+        await entered.wait()
+        task = service._config_reload_task
+        for _ in range(256):
+            service._wake_config_reload()
+        assert service._config_reload_task is task
+        assert len(service._configuration_tasks) == 1
+        assert service._control_queue.empty()
+        async def root_change():
+            calls.append("root")
+        root_task = service._start_configuration_change(root_change)
+        await asyncio.sleep(0)
+        release.set()
+        assert await task is True
+        await root_task
+        assert calls == [True, "root", True]
+        assert service._config_reload_task is None
+        service._stop_requested = True
+        service._wake_config_reload()
+        service.request_reload()
+        assert service._config_reload_task is None
+    asyncio.run(scenario())

@@ -35,7 +35,7 @@ def _config_observer():
 
 
 class ConfigFileObserver:
-    """Observe selected files in one directory and emit a debounced callback."""
+    """Observe selected files and coalesce events before immediate loop dispatch."""
 
     def __init__(
         self,
@@ -43,7 +43,6 @@ class ConfigFileObserver:
         filenames: Iterable[str],
         callback: Callable[[], None],
         *,
-        debounce_seconds: float = 0.5,
         observer_factory=_config_observer,
         loop: asyncio.AbstractEventLoop,
         additional_files=(),
@@ -55,12 +54,10 @@ class ConfigFileObserver:
         self._files = {}
         self._directories = {}
         self._pending_callbacks = set()
-        self.debounce_seconds = max(0.0, float(debounce_seconds))
         self._observer = observer_factory()
         self._handler = _ConfigEventHandler(self)
         self._loop = loop
         self._scheduled_emit: asyncio.Handle | None = None
-        self._timer: asyncio.TimerHandle | None = None
         self._lock = threading.Lock()
         self._started = False
         self._stopped = False
@@ -86,7 +83,7 @@ class ConfigFileObserver:
             self._files = selected
             self._directories = directories
         # Watchdog dispatch holds its own lock before calling our handler.
-        # Never take that lock while holding the callback/timer lock.
+        # Never take that lock while holding the callback lock.
         if started:
             for directory in directories.keys() - previous.keys():
                 self._watches[directory] = self._observer.schedule(self._handler, str(directory), recursive=False)
@@ -118,8 +115,6 @@ class ConfigFileObserver:
             self._stopped = True
             scheduled = self._scheduled_emit
             self._scheduled_emit = None
-            timer = self._timer
-            self._timer = None
             self._pending_callbacks.clear()
             self.callback = None
             self._base_files.clear()
@@ -127,8 +122,6 @@ class ConfigFileObserver:
             self._directories.clear()
         if scheduled is not None:
             scheduled.cancel()
-        if timer is not None:
-            timer.cancel()
         if self._started:
             self._observer.stop()
             self._observer.join()
@@ -156,28 +149,22 @@ class ConfigFileObserver:
 
     def _schedule_callbacks_locked(self, callbacks) -> None:
         self._pending_callbacks.update(callbacks)
-        # Coalesce before crossing threads as well as before reloading.
-        # A busy loop must not retain one callback per filesystem event.
+        # Coalesce before crossing threads: a busy loop must not retain one
+        # callback per filesystem event. No timer delays configuration updates.
         if self._scheduled_emit is None:
-            self._scheduled_emit = self._loop.call_soon_threadsafe(self._schedule_emit)
+            self._scheduled_emit = self._loop.call_soon_threadsafe(self._emit)
 
-    def _schedule_emit(self) -> None:
+    def _emit(self) -> None:
         with self._lock:
             self._scheduled_emit = None
             if self._stopped:
                 return
-            if self._timer is not None:
-                self._timer.cancel()
-            self._timer = self._loop.call_later(self.debounce_seconds, self._emit)
-
-    def _emit(self) -> None:
-        with self._lock:
-            if self._stopped:
-                return
-            self._timer = None
             callbacks = tuple(self._pending_callbacks)
             self._pending_callbacks.clear()
         for callback in callbacks:
+            # A preceding callback can stop this shared observer.
+            if self._stopped:
+                break
             callback()
 
 

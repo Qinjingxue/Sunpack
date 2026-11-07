@@ -8,7 +8,7 @@ import uuid
 from threading import RLock
 from pathlib import Path
 from types import MappingProxyType
-from sunpack_native import read_shared_utf8_text
+from sunpack_native import read_changed_shared_utf8_text, read_shared_utf8_text
 
 from sunpack.core.platform.windows.file_mutex import file_mutex
 from sunpack.core.support.resource_lifecycle import open_service_file, write_task_text
@@ -166,19 +166,30 @@ class PasswordFileSource:
         self.path = ensure_builtin_password_file()
         self.snapshot = EMPTY_PASSWORD_SNAPSHOT
         self._lock = RLock()
+        self._content_signature: str | None = None
         self.reload()
 
     def reload(self) -> PasswordSnapshot:
         with self._lock:
             # Called at startup or by the existing file-event reload chain. An
             # event is authoritative even when two writes share all timestamps.
+            signature = self._content_signature
             try:
-                updated = read_builtin_password_file(self.path, self.snapshot)
+                changed = read_changed_shared_utf8_text(self.path, signature)
+                if changed is None:
+                    return self.snapshot
+                signature, text = changed
+                updated = _parse_document(text, self.snapshot)[0]
             except FileNotFoundError:
+                signature = None
                 updated = EMPTY_PASSWORD_SNAPSHOT
             except (OSError, ValueError, UnicodeError):
+                # Cache invalid documents too, but not unexpected parser failures.
+                # Only another content change needs parsing or error logging.
+                self._content_signature = signature
                 _LOG.error("Cannot load password JSON; keeping the last valid snapshot", exc_info=True)
                 return self.snapshot
+            self._content_signature = signature
             self.snapshot = updated
             return updated
 

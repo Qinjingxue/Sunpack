@@ -168,17 +168,40 @@ impl Seek for TrackedFile {
     }
 }
 
+fn shared_utf8_text(path: PathBuf) -> io::Result<String> {
+    let mut file = TrackedFile::open_reader(path, "shared_text")?;
+    let mut text = String::new();
+    file.file.read_to_string(&mut text)?;
+    if text.starts_with('\u{feff}') {
+        text.drain(..3);
+    }
+    Ok(text)
+}
+
 /// Read one UTF-8 snapshot without blocking an atomic replacement of its path.
 #[pyfunction]
 pub(crate) fn read_shared_utf8_text(py: Python<'_>, path: PathBuf) -> PyResult<String> {
-    Ok(py.detach(move || -> io::Result<String> {
-        let mut file = TrackedFile::open_reader(path, "shared_text")?;
-        let mut text = String::new();
-        file.file.read_to_string(&mut text)?;
-        if text.starts_with('\u{feff}') {
-            text.drain(..3);
-        }
-        Ok(text)
+    Ok(py.detach(move || shared_utf8_text(path))?)
+}
+
+/// Hash the same read used for parsing, without another file pass or Python copy.
+/// Duplicate notifications do not transfer or parse the unchanged document again.
+#[pyfunction]
+#[pyo3(signature = (path, previous_signature))]
+pub(crate) fn read_changed_shared_utf8_text(
+    py: Python<'_>,
+    path: PathBuf,
+    previous_signature: Option<String>,
+) -> PyResult<Option<(String, String)>> {
+    Ok(py.detach(move || -> io::Result<Option<(String, String)>> {
+        let text = shared_utf8_text(path)?;
+        let data = text.as_bytes();
+        let signature = format!(
+            "{:016x}{:016x}",
+            crate::fast_hash_core::xxh64(data, 0),
+            crate::fast_hash_core::xxh64(data, 1),
+        );
+        Ok((previous_signature.as_ref() != Some(&signature)).then_some((signature, text)))
     })?)
 }
 

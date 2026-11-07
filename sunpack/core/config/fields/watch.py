@@ -23,7 +23,6 @@ def normalize_watch_config(value: Any) -> dict[str, Any]:
         0.0,
         _float_field(config, "runtime_cache_cleanup_idle_seconds"),
     )
-    config["password_retry_debounce_seconds"] = max(0.0, _float_field(config, "password_retry_debounce_seconds"))
     config["clipboard_monitor_enabled"] = require_boolean(
         config["clipboard_monitor_enabled"],
         "watch.clipboard_monitor_enabled",

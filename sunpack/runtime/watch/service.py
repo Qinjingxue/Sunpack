@@ -11,7 +11,7 @@ from pathlib import Path
 
 from sunpack.core.support.path_keys import case_key, path_key
 
-from sunpack.core.config.loader import ADVANCED_CONFIG_FILENAME, SIMPLE_CONFIG_FILENAME, load_config
+from sunpack.core.config.loader import ADVANCED_CONFIG_FILENAME, SIMPLE_CONFIG_FILENAME, clear_config_cache, load_config
 from sunpack.core.i18n import I18nContext
 from sunpack.core.platform.windows.message_box import show_error
 from sunpack.runtime.watch.config_observer import ConfigFileObserver
@@ -31,9 +31,7 @@ WATCH_ROOTS_FILENAME = "sunpack_watch_roots.txt"
 # Optional columns: ``<input root> | <output root> | <deep_detect> | <initial_scanned>``.
 WATCH_ROOT_OUTPUT_SEPARATOR = "|"
 CONTROL_STOP = "stop"
-CONTROL_RELOAD = "reload"
 CONTROL_SCHEDULER_WAKEUP = "scheduler_wakeup"
-CONFIG_RELOAD_DEBOUNCE_SECONDS = 0.5
 
 
 
@@ -437,6 +435,10 @@ class WatchService:
         self._ready_event = asyncio.Event()
         self._reload_lock = asyncio.Lock()
         self._configuration_tasks: set[asyncio.Task] = set()
+        self._config_reload_task: asyncio.Task | None = None
+        self._config_reload_pending = False
+        self._config_wakeup_lock = threading.Lock()
+        self._config_wakeup_pending = False
         self._startup_error: BaseException | None = None
         self.log = WatchLogStore(os.path.join(self.state_dir, "events.json"), retention_days=self.config["watch"]["event_log_retention_days"])
 
@@ -672,8 +674,20 @@ class WatchService:
             self._loop.call_soon_threadsafe(self._control_queue.put_nowait, CONTROL_STOP)
 
     def request_reload(self) -> None:
-        if self._loop is not None:
-            self._loop.call_soon_threadsafe(self._start_configuration_change, self._reload_config_unlocked)
+        with self._config_wakeup_lock:
+            if self._loop is None or self._stop_requested or self._config_wakeup_pending:
+                return
+            self._config_wakeup_pending = True
+            try:
+                self._loop.call_soon_threadsafe(self._dispatch_config_reload)
+            except BaseException:
+                self._config_wakeup_pending = False
+                raise
+
+    def _dispatch_config_reload(self) -> None:
+        with self._config_wakeup_lock:
+            self._config_wakeup_pending = False
+        self._wake_config_reload()
 
     async def _start_scheduler(self) -> None:
         await self._stop_scheduler()
@@ -854,8 +868,6 @@ class WatchService:
         if event == CONTROL_STOP:
             self._stop_requested = True
             return
-        if event == CONTROL_RELOAD:
-            self._start_configuration_change(self._reload_config_unlocked)
 
     def _should_log_scheduler_tick(self, result) -> bool:
         if result.processed or result.failed or result.errors:
@@ -911,7 +923,6 @@ class WatchService:
             directory,
             filenames,
             self._wake_config_reload,
-            debounce_seconds=CONFIG_RELOAD_DEBOUNCE_SECONDS,
             loop=self._loop or asyncio.get_running_loop(),
         )
         observer.start()
@@ -932,11 +943,44 @@ class WatchService:
         self.config_observer = None
 
     def _wake_config_reload(self) -> None:
-        if self._loop is not None and self._control_queue is not None:
-            self._loop.call_soon_threadsafe(self._control_queue.put_nowait, CONTROL_RELOAD)
+        # Observer callbacks already run on the event loop. Bypass the control
+        # queue and merge changes arriving during an apply into one reread.
+        if not self._stop_requested:
+            self._queue_config_reload()
+
+    def _queue_config_reload(self) -> asyncio.Task:
+        self._config_reload_pending = True
+        if self._config_reload_task is None:
+            self._config_reload_task = self._track_configuration_task(self._drain_config_reloads())
+            self._config_reload_task.add_done_callback(self._config_reload_finished)
+        return self._config_reload_task
+
+    def _config_reload_finished(self, task: asyncio.Task) -> None:
+        # Normally cleared by the coroutine; also cover rejection at shutdown
+        # before the operation starts under the transaction lock.
+        if self._config_reload_task is task:
+            self._config_reload_task = None
+            self._config_reload_pending = False
+
+    async def _drain_config_reloads(self) -> bool:
+        result = False
+        try:
+            while self._config_reload_pending:
+                # Release between applies so queued root transactions are not
+                # starved by continuous edits. The lock provides FIFO handoff.
+                async with self._reload_lock:
+                    if self._stop_requested:
+                        raise RuntimeError("watch service is stopping")
+                    self._config_reload_pending = False
+                    current = await self._reload_config_unlocked()
+                    result = current or result
+            return result
+        finally:
+            self._config_reload_task = None
+            self._config_reload_pending = False
 
     async def _reload_config(self) -> bool:
-        return await asyncio.shield(self._start_configuration_change(self._reload_config_unlocked))
+        return await asyncio.shield(self._queue_config_reload())
 
     def _start_configuration_change(self, operation) -> asyncio.Task:
         async def apply():
@@ -945,8 +989,11 @@ class WatchService:
                     raise RuntimeError("watch service is stopping")
                 return await operation()
 
+        return self._track_configuration_task(apply())
+
+    def _track_configuration_task(self, operation) -> asyncio.Task:
         # The service owns the transaction; a CLI only owns its shielded wait.
-        task = asyncio.create_task(apply(), name="sunpack-watch-configuration")
+        task = asyncio.create_task(operation, name="sunpack-watch-configuration")
         self._configuration_tasks.add(task)
         task.add_done_callback(self._configuration_finished)
         return task
@@ -960,6 +1007,9 @@ class WatchService:
 
     async def _reload_config_unlocked(self) -> bool:
         try:
+            # Filesystem notification is authoritative even when metadata is
+            # unchanged (for example replacement with preserved timestamps).
+            clear_config_cache()
             new_config = load_config()
             new_service_config = service_config_from(new_config)
         except Exception as exc:

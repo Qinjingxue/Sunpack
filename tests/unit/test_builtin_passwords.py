@@ -62,6 +62,15 @@ def test_file_events_keep_last_valid_snapshot_clear_deletion_and_never_restore_d
     monkeypatch.setattr(builtin, "builtin_password_path", lambda: path)
     source = builtin.PasswordFileSource()
     good = source.snapshot
+    parsed = []
+    parse = builtin._parse_document
+    def count_parse(text, *args, **kwargs):
+        parsed.append(text)
+        return parse(text, *args, **kwargs)
+    monkeypatch.setattr(builtin, "_parse_document", count_parse)
+    for _ in range(3):
+        assert source.reload() is good
+    assert parsed == []
     invalid = [
         '{"passwords":[{"value":"x","scopes":[]}]}',
         '{"passwords":[{"value":"x","scopes":["relative"]}]}',
@@ -77,9 +86,13 @@ def test_file_events_keep_last_valid_snapshot_clear_deletion_and_never_restore_d
     for text in invalid:
         path.write_text(text, encoding="utf-8")
         assert source.reload() is good
+        assert source.reload() is good
+    assert parsed == invalid  # Repeated bad notifications also parse only once.
     path.unlink()
     assert source.reload() is EMPTY_PASSWORD_SNAPSHOT
     assert not path.exists()
+    seed(path, ["secret"])
+    assert source.reload().global_passwords == ("secret",)
     seed(path)
     assert source.reload().global_passwords == ()
     assert builtin.PasswordFileSource().snapshot.global_passwords == ()

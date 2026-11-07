@@ -44,7 +44,6 @@ def _watch_config() -> dict:
     config["watch"] = {
         **(config.get("watch") or {}),
         "clipboard_monitor_enabled": False,
-        "password_retry_debounce_seconds": 0,
     }
     return config
 

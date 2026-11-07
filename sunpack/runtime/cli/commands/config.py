@@ -46,7 +46,7 @@ async def handle(args, ctx):
             validate_path_rule_config({**rule, "name": "blacklist"})
             NativePathRule(*(rule.get(field, []) for field in ("paths", "files", "extensions", "full_names")))
             return 0, CliCommandResult(command=COMMAND, inputs={"action": "validate"}, summary={"valid": True})
-        config_path, payload = load_request_config_payload(ctx.cwd)
+        config_path, payload = load_request_config_payload(ctx.cwd, refresh=True)
         item = payload
         if args.config_action == "show":
             if not args.json and not args.quiet:

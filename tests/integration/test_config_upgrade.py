@@ -54,7 +54,8 @@ def test_installer_promotes_controls_and_migrates_current_state_without_overwrit
     advanced = tmp_path / "previous-advanced.json"
     advanced.write_text(json.dumps({
         "watch": {"state_dir": str(old_state), "clipboard_monitor_enabled": False,
-                  "clipboard_builtin_max_entries": 17, "toast_report_retention_days": 61},
+                  "clipboard_builtin_max_entries": 17, "toast_report_retention_days": 61,
+                  "password_retry_debounce_seconds": 0.5},
         "passwords": {"clipboard_passwords_enabled": False},
         "input_planning": {"enabled": False, "cache_size": 8},
         "analysis": {"shared_cache_mb": 4, "thresholds": {"extractable_confidence": 0.99}},
@@ -64,7 +65,7 @@ def test_installer_promotes_controls_and_migrates_current_state_without_overwrit
     user = tmp_path / "sunpack_config.json"
     original = {"watch": {"state_dir": str(old_state), "clipboard_monitor_enabled": True,
                           "toast_update_interval_ms": 123, "toast_completion_debounce_ms": 456,
-                          "toast_report_max_files": 3,
+                          "toast_report_max_files": 3, "password_retry_debounce_seconds": 2,
                           "toast_report_max_bytes": 1024, "runtime_cache_cleanup_enabled": False},
                 "performance": {"worker": {"thread_capacity": 2, "stage_thread_capacity": 3,
                     "max_pending_stage_jobs": 4, "max_queue_jobs": 5, "space_gate_enabled": False,

@@ -43,7 +43,7 @@ def test_mixed_blockers_resume_only_the_affected_input_across_restart(tmp_path, 
     config = make_config({
         "embedded_scan": {"enabled": True},
         "user_passwords": [], "builtin_passwords": [],
-        "watch": {"clipboard_monitor_enabled": False, "password_retry_debounce_seconds": 0},
+        "watch": {"clipboard_monitor_enabled": False},
         "output": {"root": str(output)},
         "post_extract": {"archive_cleanup_mode": "d", "flatten_single_directory": False},
     })

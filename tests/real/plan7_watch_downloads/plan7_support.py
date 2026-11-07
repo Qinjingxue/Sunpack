@@ -232,7 +232,6 @@ def plan7_watch_config(passwords: list[str] | None = None) -> dict:
     config["watch"] = {
         **(config.get("watch") or {}),
         "clipboard_monitor_enabled": False,
-        "password_retry_debounce_seconds": 0,
     }
     config["user_passwords"] = [f"wrong-{index:02d}" for index in range(WRONG_PASSWORD_COUNT)]
     config["user_passwords"].extend(passwords or [PASSWORD])

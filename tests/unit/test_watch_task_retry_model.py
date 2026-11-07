@@ -68,7 +68,7 @@ def _watcher(tmp_path, monkeypatch, *, deep_detect=False, recursive=False):
     monkeypatch.setattr(scheduler_module, "validate_ntfs_watch_roots", lambda _roots: None)
     sink = _Sink()
     watcher = WatchScheduler(
-        make_config({"watch": {"clipboard_monitor_enabled": False, "password_retry_debounce_seconds": 0}}),
+        make_config({"watch": {"clipboard_monitor_enabled": False}}),
         [str(root)],
         output_roots={str(root): str(output)},
         root_entries=[WatchRootEntry(str(root), str(output), deep_detect, recursive=recursive)],
@@ -118,7 +118,7 @@ def test_password_updates_retry_only_applicable_scopes(tmp_path, monkeypatch, ti
             password_file = watcher._password_file_source.path
             scopes = [("a-old", [str(original)]), ("b-old", [str(sibling)])]
             write_password_json(password_file, ["global-old"], scopes=scopes)
-            watcher._publish_password_update()
+            watcher._publish_password_update(reload=True)
             failure = FailureInfo(FailureKind.WRONG_PASSWORD, "password_resolution", "wrong password")
 
             async def run(targets, **kwargs):
@@ -157,9 +157,10 @@ def test_password_updates_retry_only_applicable_scopes(tmp_path, monkeypatch, ti
                     pipeline_engine=FakePipelineEngine(_Runner),
                 )
                 watcher.pipeline_engine.run = run
+                watcher._publish_password_update(reload=True)
                 watcher._reconcile_persisted_blockers()
             else:
-                watcher._publish_password_update()
+                watcher._publish_password_update(reload=True)
             # Consume the update before old requests finish to expose lost or
             # unrelated completion retries, without sleeps or weaker concurrency.
             watcher._process_password_retries(time.monotonic())

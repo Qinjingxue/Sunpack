@@ -25,7 +25,6 @@ def _watch_memory_config() -> dict:
     config["watch"] = {
         **(config.get("watch") or {}),
         "clipboard_monitor_enabled": False,
-        "password_retry_debounce_seconds": 0,
         "runtime_cache_cleanup_idle_seconds": env_float(
             "SUNPACK_WATCH_MEMORY_CACHE_CLEANUP_IDLE_SECONDS",
             10.0,

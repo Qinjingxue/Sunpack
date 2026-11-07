@@ -54,6 +54,10 @@ fn sunpack_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
         io::resource_lifecycle::read_shared_utf8_text,
         m
     )?)?;
+    m.add_function(wrap_pyfunction!(
+        io::resource_lifecycle::read_changed_shared_utf8_text,
+        m
+    )?)?;
     m.add_function(wrap_pyfunction!(path_keys::path_key, m)?)?;
     m.add_function(wrap_pyfunction!(path_keys::merge_release_roots, m)?)?;
     m.add_function(wrap_pyfunction!(fast_hash::fast_hash64, m)?)?;

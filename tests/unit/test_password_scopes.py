@@ -54,6 +54,7 @@ def test_pipeline_pins_snapshot_without_reading_password_files_or_copying_tables
     def forbidden(*args, **kwargs):
         raise AssertionError("password IO in request")
     monkeypatch.setattr(builtin, "read_shared_utf8_text", forbidden)
+    monkeypatch.setattr(builtin, "read_changed_shared_utf8_text", forbidden)
     async def run():
         async with PipelineEngine(config) as engine:
             factory = engine._request_runtime_factory

@@ -48,7 +48,7 @@ def carrier_case(tmp_path):
         "recursive_extract": 3, "user_passwords": [], "builtin_passwords": [],
         "output": {"root": str(tmp_path / "out")},
         "post_extract": {"archive_cleanup_mode": "k", "flatten_single_directory": False},
-        "watch": {"clipboard_monitor_enabled": False, "password_retry_debounce_seconds": 0},
+        "watch": {"clipboard_monitor_enabled": False},
         "cli": {"quiet": True},
     })
     return SimpleNamespace(carrier=carrier, watch=watch, config=config, passwords=passwords, archives=archives)

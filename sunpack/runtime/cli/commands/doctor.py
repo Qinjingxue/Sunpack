@@ -69,7 +69,7 @@ def _check(name: str, status: str, detail: str | None = None, **extra) -> dict:
 
 def _config_check(ctx) -> tuple[dict, dict | None, bool]:
     try:
-        config_path, _ = load_request_config_payload(ctx.cwd)
+        config_path, _ = load_request_config_payload(ctx.cwd, refresh=True)
         payload = load_request_config(ctx.cwd)
         validation = validate_config_payload(payload)
     except Exception as exc:

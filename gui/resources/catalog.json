@@ -1119,14 +1119,6 @@
       "min": 0,
       "integer": false
     },
-    "/watch/password_retry_debounce_seconds": {
-      "label": {
-        "zh": "密码重试合并间隔（秒）",
-        "en": "Password retry merge interval (s)"
-      },
-      "min": 0,
-      "integer": false
-    },
     "/watch/clipboard_monitor_enabled": {
       "label": {
         "zh": "保存剪贴板密码历史",
