@@ -60,7 +60,6 @@ def handle(args, ctx):
         "displayed_items": len(items),
         "resolved_items": sum(1 for item in all_items if item["status"] == "resolved"),
         "blocked_items": sum(1 for item in all_items if item["status"] == "blocked"),
-        "residual_items": sum(1 for item in all_items if item["status"] == "residual"),
         "extractable_items": sum(1 for item in all_items if item["should_extract"]),
         "archives_only": bool(args.archives_only),
         "analyze": bool(args.analyze),
@@ -75,7 +74,6 @@ def handle(args, ctx):
                 total=summary["total_items"],
                 resolved=summary["resolved_items"],
                 blocked=summary["blocked_items"],
-                residual=summary["residual_items"],
             )
         )
         if reporter.verbose:

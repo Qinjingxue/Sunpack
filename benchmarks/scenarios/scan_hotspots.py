@@ -341,10 +341,10 @@ def run_mode(mode: str, target: str, max_depth: int | None, config: dict) -> tup
             return table, extra
 
         provider = ArchiveTaskProvider(config)
-        discovery_result = provider.discovery.discover_native(table, session, include_details=False)
+        discovery_result = provider.discovery.discover_native(table, session)
         extra["resolved_inputs"] = sum(task.discovery_failure is None for task in discovery_result.tasks)
         extra["blocked_paths"] = len(discovery_result.blocked_paths)
-        extra["residual_paths"] = len(discovery_result.residual_paths)
+        extra["diagnostic_traces"] = len(discovery_result.traces)
         extra["scan_session"] = summarize_scan_session(session)
         return discovery_result.tasks, extra
 

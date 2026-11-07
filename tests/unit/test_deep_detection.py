@@ -111,21 +111,21 @@ def test_embedded_layer_rejects_plain_data(tmp_path):
     result = EmbeddedDiscovery({}).discover([_candidate(path)])
 
     assert result.tasks == []
-    assert result.residual_paths
+    assert result.traces == []
 
 
 def test_recursive_gate_may_exclude_small_residual_candidate(tmp_path):
     large = tmp_path / "large.bin"
     small = tmp_path / "small.bin"
-    large.write_bytes(b"x" * 100)
-    small.write_bytes(b"x")
+    large.write_bytes(b"x" * 1000)
+    small.write_bytes(gzip.compress(b"small archive"))
 
     result = EmbeddedDiscovery({
         "embedded_scan": {"recursive_candidate_ratio": 0.3},
     }).discover([_candidate(large), _candidate(small)], is_recursive_scan=True)
 
     assert result.tasks == []
-    assert any(trace.entry_path == str(small) and trace.status == "residual" for trace in result.traces)
+    assert result.traces == []
 
 
 def test_default_embedded_scan_skips_confirmed_pe_before_full_scan(tmp_path, monkeypatch):
@@ -144,11 +144,7 @@ def test_default_embedded_scan_skips_confirmed_pe_before_full_scan(tmp_path, mon
     result = EmbeddedDiscovery({}).discover([_candidate(path)])
 
     assert result.tasks == []
-    assert result.residual_paths
-    assert any(
-        trace.reason == "embedded_executable_skipped" and trace.status == "residual"
-        for trace in result.traces
-    )
+    assert result.traces == []
 
 
 def test_embedded_discovery_uses_native_scan_size_not_stale_candidate_size(tmp_path, monkeypatch):
@@ -275,11 +271,7 @@ def test_truncated_7z_split_candidate_stays_residual_for_relations(tmp_path, mon
 
     assert result.tasks == []
     assert not result.blocked_paths
-    assert result.residual_paths
-    assert any(
-        trace.reason == "no_complete_embedded_archive" and trace.status == "residual"
-        for trace in result.traces
-    )
+    assert result.traces == []
 
 
 @pytest.mark.parametrize("status", ["password_required", "wrong_password"])

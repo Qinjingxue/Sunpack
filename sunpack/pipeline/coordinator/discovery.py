@@ -1,6 +1,6 @@
 """Project native discovery decisions into tasks and sparse diagnostics."""
 
-from sunpack.core.contracts.discovery import DiscoveryTrace, StageResult
+from sunpack.core.contracts.discovery import StageResult
 from sunpack.core.contracts.tasks import ArchiveTask
 from sunpack.pipeline.coordinator.scan_session import DiscoveryScanSession
 from sunpack.pipeline.discovery.embedded.discovery import EmbeddedDiscovery
@@ -19,11 +19,8 @@ class ArchiveDiscoveryPipeline:
         session: DiscoveryScanSession,
         *,
         is_recursive_scan: bool = False,
-        include_details: bool = True,
     ) -> StageResult:
-        routes = table.resolve(
-            include_residual_details=include_details,
-        )
+        routes = table.resolve()
         result = StageResult()
         for index, status in routes.relation_events:
             if status in {1, 2}:
@@ -42,14 +39,6 @@ class ArchiveDiscoveryPipeline:
                     ),
                     reason="Relations confirmed native archive identity",
                 )
-            else:
-                entry_path, format_hint = table.summary(index)
-                result.traces.append(DiscoveryTrace(
-                    entry_path=entry_path,
-                    source="relations",
-                    status="residual",
-                    format=format_hint,
-                ))
 
         for index, status in routes.detection_events:
             if status == 1:
@@ -65,21 +54,12 @@ class ArchiveDiscoveryPipeline:
                     ),
                     reason=f"Confirmed {candidate.format_hint} structure",
                 )
-            else:
-                entry_path, format_hint = table.summary(index)
-                result.traces.append(DiscoveryTrace(
-                    entry_path=entry_path,
-                    source="detection",
-                    status="residual",
-                    format=format_hint,
-                ))
 
         embedded_result = self.embedded.discover_native(
             table,
             routes,
             session,
             is_recursive_scan=is_recursive_scan,
-            include_details=include_details,
         )
         replaced = embedded_result.claimed_paths | embedded_result.blocked_paths
         if replaced:
@@ -88,7 +68,6 @@ class ArchiveDiscoveryPipeline:
             )]
             result.claimed_paths.difference_update(replaced)
             result.blocked_paths.difference_update(replaced)
-            result.residual_paths.difference_update(replaced)
             result.traces = [trace for trace in result.traces if not (
                 trace.status in {"resolved", "blocked"} and path_key(trace.entry_path) in replaced
             )]
@@ -96,7 +75,6 @@ class ArchiveDiscoveryPipeline:
         result.findings.extend(embedded_result.findings)
         result.claimed_paths.update(embedded_result.claimed_paths)
         result.blocked_paths.update(embedded_result.blocked_paths)
-        result.residual_paths.update(embedded_result.residual_paths)
         result.traces.extend(embedded_result.traces)
         result.validate()
         return result

@@ -15,8 +15,8 @@ def test_recursive_provider_discovers_each_logical_root_independently(monkeypatc
         build_calls.append(tuple(scan_roots))
         return table
 
-    def fake_discover(native_table, session, *, is_recursive_scan=False, include_details=True):
-        discover_calls.append((native_table is table, session is not None, is_recursive_scan, include_details))
+    def fake_discover(native_table, session, *, is_recursive_scan=False):
+        discover_calls.append((native_table is table, session is not None, is_recursive_scan))
         return StageResult()
 
     monkeypatch.setattr(
@@ -32,7 +32,7 @@ def test_recursive_provider_discovers_each_logical_root_independently(monkeypatc
 
     assert result.tasks == []
     assert build_calls == [("segment-a",), ("segment-b",)]
-    assert discover_calls == [(True, True, True, True), (True, True, True, True)]
+    assert discover_calls == [(True, True, True), (True, True, True)]
 
 
 def test_discover_targets_preserves_provider_failures_in_run_state(monkeypatch):

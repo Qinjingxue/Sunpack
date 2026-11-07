@@ -86,7 +86,6 @@ class StageResult:
     findings: list[DiscoveryFinding] = field(default_factory=list)
     claimed_paths: set[str] = field(default_factory=set)
     blocked_paths: set[str] = field(default_factory=set)
-    residual_paths: set[str] = field(default_factory=set)
     traces: list[DiscoveryTrace] = field(default_factory=list)
 
     def add_resolved(self, task: ArchiveTask, *, reason: str = "") -> None:
@@ -119,21 +118,9 @@ class StageResult:
             error=error,
         ))
 
-    def add_residual(self, candidate: DiscoveryCandidate, *, source: str, reason: str = "") -> None:
-        self.residual_paths.update(candidate.path_keys)
-        self.traces.append(DiscoveryTrace(
-            entry_path=candidate.entry_path,
-            source=source,
-            status="residual",
-            format=candidate.format_hint,
-            reason=reason,
-        ))
-
     def validate(self) -> None:
         if self.claimed_paths & self.blocked_paths:
             raise ValueError("discovery stage claimed a blocked physical file")
-        if self.claimed_paths & self.residual_paths or self.blocked_paths & self.residual_paths:
-            raise ValueError("discovery stage returned a physical file twice")
 
 
 # Project native verdicts once; presentation and recovery consume the same result.

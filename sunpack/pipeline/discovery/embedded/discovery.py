@@ -41,9 +41,7 @@ DEFAULT_DEEP_SCAN_SINGLE_CANDIDATE_RATIO = 0.3
 
 @dataclass(frozen=True)
 class EmbeddedScanPlan:
-    recursive: bool
     allowed_ids: frozenset[int]
-    reason: str
 
 
 class EmbeddedScanGate:
@@ -59,14 +57,12 @@ class EmbeddedScanGate:
     ) -> EmbeddedScanPlan:
         embedded_config = self.config.get("embedded_scan")
         if isinstance(embedded_config, dict) and not embedded_config.get("enabled", True):
-            return EmbeddedScanPlan(is_recursive_scan, frozenset(), "shared_embedded_scan_disabled")
+            return EmbeddedScanPlan(frozenset())
         if self.options.force_scan or not is_recursive_scan:
-            return EmbeddedScanPlan(False, frozenset(map(id, candidates)), "initial_scan_all_residuals")
+            return EmbeddedScanPlan(frozenset(map(id, candidates)))
         selected = select_single_candidate_ratio(candidates, self._recursive_candidate_ratio())
         return EmbeddedScanPlan(
-            True,
             frozenset(map(id, selected)),
-            "recursive_candidate_ratio" if selected else "recursive_candidate_ratio_selected_none",
         )
 
     def _recursive_candidate_ratio(self) -> float:
@@ -99,11 +95,6 @@ class EmbeddedDiscovery:
         plan = self.gate.plan(candidates, is_recursive_scan=is_recursive_scan)
         for candidate in candidates:
             if id(candidate) not in plan.allowed_ids:
-                result.add_residual(
-                    candidate,
-                    source="embedded",
-                    reason=plan.reason,
-                )
                 continue
 
             self._discover_into(result, candidate)
@@ -118,7 +109,6 @@ class EmbeddedDiscovery:
         session,
         *,
         is_recursive_scan: bool = False,
-        include_details: bool = True,
     ) -> StageResult:
         embedded_config = self.config.get("embedded_scan") or {}
         ratio = self.gate._recursive_candidate_ratio()
@@ -128,7 +118,6 @@ class EmbeddedDiscovery:
             force_scan=self.options.force_scan,
             enabled=embedded_config.get("enabled", True),
             recursive_ratio=ratio,
-            include_residual_details=include_details,
         )
         result = StageResult()
         for offset in range(0, len(batch), 256):
@@ -145,20 +134,9 @@ class EmbeddedDiscovery:
                         format=format_hint, reason=reason, error=raw_scan["error"],
                     ))
                     continue
-                if status == 0:
-                    entry_path, format_hint = table.summary(index)
-                    result.residual_paths.update(table.path_keys(index))
-                    result.traces.append(DiscoveryTrace(
-                        entry_path=entry_path,
-                        source="embedded",
-                        status="residual",
-                        format=format_hint,
-                        reason=reason,
-                    ))
-                    continue
 
                 candidate = session.project_native_candidate(table, index)
-                self._discover_into(result, candidate, raw_scan, include_details=include_details)
+                self._discover_into(result, candidate, raw_scan)
 
         passwords = [
             (path, self._password_candidates(path))
@@ -169,14 +147,13 @@ class EmbeddedDiscovery:
             candidate = session.project_native_candidate(table, index)
             if status == 0:
                 shared_inputs = True
-                self._discover_into(result, candidate, raw_scan, include_details=include_details)
+                self._discover_into(result, candidate, raw_scan)
                 continue
             # A directed relation replaces only earlier decisions for its own
             # physical inputs (a continuation may already have been blocked).
             keys = candidate.path_keys
             shared_inputs = (shared_inputs or not keys.isdisjoint(result.claimed_paths)
                              or not keys.isdisjoint(result.blocked_paths))
-            result.residual_paths.difference_update(keys)
             result.blocked_paths.difference_update(keys)
             reason = candidate.relation_anchor.get("relation_failure_reason")
             if reason:
@@ -238,17 +215,15 @@ class EmbeddedDiscovery:
             combined.append(task)
             keys = {path_key(path) for path in cleanup}
             result.blocked_paths.difference_update(keys)
-            result.residual_paths.difference_update(keys)
             result.claimed_paths.update(keys)
         result.tasks = combined
 
     def _discover_into(
         self, result: StageResult, candidate: DiscoveryCandidate, precomputed_scan=None,
-        *, include_details: bool = True,
     ) -> None:
         try:
             resolved, reason, findings = self._discover_candidate(
-                candidate, precomputed_scan=precomputed_scan, include_details=include_details,
+                candidate, precomputed_scan=precomputed_scan,
             )
         except OSError as exc:
             result.add_blocked(candidate, source="embedded", reason="embedded_scan_io_error", error=str(exc))
@@ -256,18 +231,14 @@ class EmbeddedDiscovery:
         if resolved is not None:
             result.add_resolved(resolved, reason=reason)
         elif reason in {"embedded_password_required", "embedded_wrong_password", "embedded_truncated"}:
-            if include_details:
-                result.findings.extend(findings)
+            result.findings.extend(findings)
             result.add_blocked(candidate, source="embedded", reason=reason)
-        elif include_details:
-            result.add_residual(candidate, source="embedded", reason=reason)
 
     def _discover_candidate(
         self,
         candidate: DiscoveryCandidate,
         *,
         precomputed_scan=None,
-        include_details: bool = True,
     ) -> tuple[ArchiveTask | None, str, tuple[DiscoveryFinding, ...]]:
         path = candidate.entry_path
         if not path:
@@ -366,7 +337,7 @@ class EmbeddedDiscovery:
                     scan,
                     "embedded_truncated",
                     failed_offset=truncated["offset"],
-                ) if include_details else (),
+                ),
             )
 
         physical = [
@@ -384,7 +355,7 @@ class EmbeddedDiscovery:
                 return None, reason, _blocked_findings(
                     path, scan, reason, failed_offset=next(iter(pending_failures)),
                     resolved_rows=resolved_rows,
-                ) if include_details else ()
+                )
             return None, "no_complete_embedded_archive", ()
 
         physical.sort(key=lambda item: (item["offset"], item["format"]))

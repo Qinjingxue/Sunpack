@@ -17,7 +17,6 @@ class FormatConfirmation:
         for candidate in candidates:
             accepted, reason = self.detector.confirm(candidate)
             if not accepted:
-                result.add_residual(candidate, source="detection")
                 continue
 
             descriptor = candidate.archive_input

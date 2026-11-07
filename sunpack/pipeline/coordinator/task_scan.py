@@ -68,7 +68,6 @@ class ArchiveTaskScanner:
             scan_roots,
             scan_session=scan_session,
             is_recursive_scan=is_recursive_scan,
-            include_details=True,
         )
         self._record_provider_failures()
         self.record_scan_errors(scan_session)
@@ -87,7 +86,6 @@ class ArchiveTaskScanner:
             scan_roots,
             scan_session=scan_session,
             is_recursive_scan=is_recursive_scan,
-            include_details=False,
         )
         self._record_provider_failures()
         self.record_scan_errors(scan_session)

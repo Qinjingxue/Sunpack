@@ -110,7 +110,7 @@ def test_carrier_anchor_rejoins_native_volumes_and_missing_parts_can_arrive(tmp_
         extent = descriptor.parts[bounded_part].extent
         assert extent.start < extent.end <= bounded_end
     assert all(part.extent.start == 0 for part in descriptor.parts[1:-1])
-    assert not (found.claimed_paths & (found.blocked_paths | found.residual_paths))
+    assert not (found.claimed_paths & found.blocked_paths)
     planned = ArchiveInputPlanningStage(config).plan_task_to_tasks(task)
     assert len(planned) == 1
     extractor = ExtractionScheduler(password_store=PasswordStore.from_config(config))

@@ -164,12 +164,17 @@ def test_native_discovery_does_not_project_negative_embedded_candidates(tmp_path
     table = build_native_table_for_targets([str(tmp_path)], session=session, config=make_config({}))
     assert len(table) == 32
 
-    routes = table.resolve(include_residual_details=False)
+    routes = table.resolve()
     assert routes.relation_events == []
     assert routes.detection_events == []
-    batch = table.scan_embedded(routes, include_residual_details=False)
+    batch = table.scan_embedded(routes)
     assert len(batch) == 32
     assert batch.scan_page(table, 0, 32) == []
+
+    from sunpack.pipeline.coordinator.task_provider import ArchiveTaskProvider
+    result = ArchiveTaskProvider(make_config({})).discover_targets([str(tmp_path)])
+    assert not result.tasks and not result.traces and not result.findings
+    assert not result.claimed_paths and not result.blocked_paths
 
 
 @pytest.mark.parametrize("phase,source_state", [
@@ -211,25 +216,24 @@ def test_native_discovery_distinguishes_departures_from_read_errors(tmp_path, ph
         path.unlink()
     try:
         if phase == "detection":
-            routes = table.resolve(include_residual_details=False)
+            routes = table.resolve()
         if source_state == "recreated":
             path.write_bytes(b"a different physical generation")
         # Detection failures must survive even an explicitly disabled fallback.
         batch = table.scan_embedded(routes, enabled=phase == "embedded")
-        row, = batch.scan_page(table, 0, 1)
+        rows = batch.scan_page(table, 0, 1)
         provider = ArchiveTaskProvider(make_config({}))
         session = DiscoveryScanSession(config=provider.config)
-        result = provider.discovery.embedded.discover_native(table, routes, session, include_details=False)
+        result = provider.discovery.embedded.discover_native(table, routes, session)
         provider._record_discovery_failures(result)
         if source_state == "departed":
-            assert row[1:] == (0, "input_departed", None)
+            assert rows == []
             assert not result.tasks and not result.blocked_paths and not provider.failed_candidate_failures
-            sparse = table.scan_embedded(routes, include_residual_details=False)
-            assert sparse.scan_page(table, 0, 1) == []
         else:
+            row, = rows
             assert row[1:3] == (2, "embedded_scan_io_error") and row[3]["error"]
             failure, = provider.failed_candidate_failures
-            assert result.blocked_paths and not result.residual_paths
+            assert result.blocked_paths
             assert failure.kind == FailureKind.FILESYSTEM_ERROR
             assert failure.details["path"] == str(path) and failure.message == row[3]["error"]
     finally:
@@ -279,7 +283,7 @@ def test_native_detection_batches_keep_order_during_concurrent_resolves(tmp_path
     table = build_native_table_for_targets([str(tmp_path)], config=make_config({}))
     cache_entries_before = reader_cache_stats()["cache_entries"]
     with ThreadPoolExecutor(max_workers=4) as pool:
-        results = list(pool.map(lambda _index: table.resolve(include_residual_details=False), range(4)))
+        results = list(pool.map(lambda _index: table.resolve(), range(4)))
 
     expected = results[0].detection_resolved
     assert len(expected) == 550

@@ -38,7 +38,6 @@ class ArchiveTaskProvider:
         *,
         scan_session: DiscoveryScanSession | None = None,
         is_recursive_scan: bool = False,
-        include_details: bool = True,
     ) -> StageResult:
         session = scan_session or DiscoveryScanSession(config=self.config)
         roots = list(dict.fromkeys(str(root) for root in scan_roots if str(root)))
@@ -54,13 +53,11 @@ class ArchiveTaskProvider:
                     table,
                     session,
                     is_recursive_scan=True,
-                    include_details=include_details,
                 )
                 result.tasks.extend(partial.tasks)
                 result.findings.extend(partial.findings)
                 result.claimed_paths.update(partial.claimed_paths)
                 result.blocked_paths.update(partial.blocked_paths)
-                result.residual_paths.update(partial.residual_paths)
                 result.traces.extend(partial.traces)
             result.validate()
         else:
@@ -73,7 +70,6 @@ class ArchiveTaskProvider:
                 table,
                 session,
                 is_recursive_scan=is_recursive_scan,
-                include_details=include_details,
             )
         for task in result.tasks:
             task.runtime["discovery_scope"] = session.scope_for(task.main_path)
@@ -95,7 +91,6 @@ class ArchiveTaskProvider:
             scan_roots,
             scan_session=scan_session,
             is_recursive_scan=is_recursive_scan,
-            include_details=False,
         )
         return self.filter_processed_tasks(
             discovered.tasks,

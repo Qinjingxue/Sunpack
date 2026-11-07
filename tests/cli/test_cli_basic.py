@@ -63,6 +63,8 @@ class CliBasicTests(unittest.TestCase):
         self.assertEqual(payload["command"], "inspect")
         self.assertIn("total_items", payload["summary"])
         self.assertGreaterEqual(payload["summary"]["total_items"], 1)
+        self.assertNotIn("residual_items", payload["summary"])
+        self.assertTrue(all(item["status"] in {"resolved", "blocked"} for item in payload["items"]))
         self.assertIn("items", payload)
         first_item = payload["items"][0]
         self.assertIn("path", first_item)

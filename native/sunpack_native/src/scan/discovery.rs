@@ -209,7 +209,7 @@ pub(crate) struct NativeDiscoveryRoutes {
 }
 
 enum EmbeddedOutcome {
-    Residual(&'static str),
+    Residual,
     Failed(Arc<io::Error>),
     Scan(Arc<NativeScanResult>),
 }
@@ -221,8 +221,6 @@ pub(crate) struct NativeEmbeddedBatch {
     selected: HashSet<usize>,
     select_all: bool,
     force_scan: bool,
-    include_residual_details: bool,
-    skipped_reason: &'static str,
     pending_volumes: Vec<PendingEmbeddedVolume>,
     excluded: HashSet<String>,
 }
@@ -245,7 +243,7 @@ impl EmbeddedOutcome {
             && std::fs::metadata(path)
                 .is_err_and(|current| current.kind() == io::ErrorKind::NotFound)
         {
-            Self::Residual("input_departed")
+            Self::Residual
         } else {
             Self::Failed(error)
         }
@@ -316,10 +314,7 @@ impl NativeEmbeddedBatch {
                                     && !self.selected.contains(&index)
                                     && !matches!(cached, Some(Err(_)))
                                 {
-                                    return self.include_residual_details.then_some((
-                                        index,
-                                        EmbeddedOutcome::Residual(self.skipped_reason),
-                                    ));
+                                    return None;
                                 }
                                 let (path, pe_state) = rows[index].embedded_source();
                                 let outcome = match cached {
@@ -334,9 +329,8 @@ impl NativeEmbeddedBatch {
                                         parallel_files,
                                     ),
                                 };
-                                (self.include_residual_details
-                                    || !matches!(outcome, EmbeddedOutcome::Residual(_)))
-                                .then_some((index, outcome))
+                                (!matches!(outcome, EmbeddedOutcome::Residual))
+                                    .then_some((index, outcome))
                             })
                             .collect::<Vec<_>>()
                     })
@@ -350,7 +344,9 @@ impl NativeEmbeddedBatch {
         outcomes
             .into_iter()
             .map(|(index, outcome)| match outcome {
-                EmbeddedOutcome::Residual(reason) => Ok((index, 0, reason, None)),
+                EmbeddedOutcome::Residual => {
+                    unreachable!("residuals are filtered before projection")
+                }
                 EmbeddedOutcome::Failed(error) => {
                     let detail = PyDict::new(py);
                     detail.set_item("error", error.to_string())?;
@@ -982,12 +978,7 @@ impl NativeCandidateTable {
         })
     }
 
-    #[pyo3(signature = (include_residual_details=true))]
-    fn resolve(
-        &self,
-        py: Python<'_>,
-        include_residual_details: bool,
-    ) -> PyResult<NativeDiscoveryRoutes> {
+    fn resolve(&self, py: Python<'_>) -> PyResult<NativeDiscoveryRoutes> {
         let cancellation = crate::io::cancellation::Cancellation::current();
         cancellation.check()?;
         let mut routes = NativeDiscoveryRoutes::default();
@@ -1020,9 +1011,6 @@ impl NativeCandidateTable {
                 routes.relation_events.push((index, 1));
             } else {
                 routes.relation_residual.push(index);
-                if include_residual_details {
-                    routes.relation_events.push((index, 3));
-                }
             }
         }
         let detection_indices = self
@@ -1105,9 +1093,6 @@ impl NativeCandidateTable {
                         routes.detection_events.push((index, 1));
                     } else {
                         routes.detection_residual.push(index);
-                        if include_residual_details {
-                            routes.detection_events.push((index, 3));
-                        }
                     }
                 }
             }
@@ -1153,7 +1138,7 @@ impl NativeCandidateTable {
         Ok(routes)
     }
 
-    #[pyo3(signature = (routes, recursive=false, force_scan=false, enabled=true, recursive_ratio=0.3, include_residual_details=true))]
+    #[pyo3(signature = (routes, recursive=false, force_scan=false, enabled=true, recursive_ratio=0.3))]
     fn scan_embedded(
         &self,
         routes: PyRef<'_, NativeDiscoveryRoutes>,
@@ -1161,7 +1146,6 @@ impl NativeCandidateTable {
         force_scan: bool,
         enabled: bool,
         recursive_ratio: f64,
-        include_residual_details: bool,
     ) -> NativeEmbeddedBatch {
         let ids = routes.embedded.clone();
         let ratio = recursive_ratio.clamp(0.0, 1.0);
@@ -1202,13 +1186,6 @@ impl NativeCandidateTable {
                 .map(|(index, _)| index)
                 .collect()
         };
-        let skipped_reason = if !enabled {
-            "shared_embedded_scan_disabled"
-        } else if !select_all && selected.is_empty() {
-            "recursive_candidate_ratio_selected_none"
-        } else {
-            "recursive_candidate_ratio"
-        };
         NativeEmbeddedBatch {
             pending_volumes: Vec::new(),
             excluded: routes.relation_resolved.iter().filter(|&&index| {
@@ -1223,8 +1200,6 @@ impl NativeCandidateTable {
             selected,
             select_all,
             force_scan,
-            include_residual_details,
-            skipped_reason,
         }
     }
 }
@@ -1236,7 +1211,7 @@ fn scan_embedded_candidate(
     parallel_files: usize,
 ) -> EmbeddedOutcome {
     if path.is_empty() {
-        return EmbeddedOutcome::Residual("missing_or_empty_file");
+        return EmbeddedOutcome::Residual;
     }
     if !force_scan {
         // Only residuals reach Embedded. Consume refined native facts; filename
@@ -1251,7 +1226,7 @@ fn scan_embedded_candidate(
             },
         };
         if is_pe {
-            return EmbeddedOutcome::Residual("embedded_executable_skipped");
+            return EmbeddedOutcome::Residual;
         }
     }
     let metadata = match std::fs::metadata(path) {
@@ -1259,11 +1234,11 @@ fn scan_embedded_candidate(
         Err(error) => return EmbeddedOutcome::read_error(path, Arc::new(error)),
     };
     if !metadata.is_file() || metadata.len() == 0 {
-        return EmbeddedOutcome::Residual("missing_or_empty_file");
+        return EmbeddedOutcome::Residual;
     }
     match scan_embedded_path(path, parallel_files) {
         Ok(scan) if scan.has_candidates() => EmbeddedOutcome::Scan(Arc::new(scan)),
-        Ok(_) => EmbeddedOutcome::Residual("no_complete_embedded_archive"),
+        Ok(_) => EmbeddedOutcome::Residual,
         Err(error) => EmbeddedOutcome::read_error(path, Arc::new(error)),
     }
 }

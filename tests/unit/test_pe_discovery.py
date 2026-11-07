@@ -56,7 +56,7 @@ def test_pe_facts_reach_native_residual_regardless_of_filename(tmp_path, filenam
     for target in [path, tmp_path]:
         ordinary = ArchiveTaskProvider(_config()).discover_targets([str(target)])
         assert ordinary.tasks == []
-        assert any(trace.reason == "embedded_executable_skipped" for trace in ordinary.traces)
+        assert ordinary.traces == []
         deep = ArchiveTaskProvider(_config(), EmbeddedOptions(force_scan=True)).discover_targets([str(target)])
         [task] = deep.tasks
         assert task.discovery_source == "embedded"
@@ -90,7 +90,7 @@ def test_python_fallback_uses_canonical_pe_policy(tmp_path, pe_offset):
     path.write_bytes(make_minimal_pe(pe_offset=pe_offset) + make_minimal_7z())
     result = EmbeddedDiscovery(_config()).discover([_candidate(path)])
     assert result.tasks == []
-    assert any(trace.reason == "embedded_executable_skipped" for trace in result.traces)
+    assert result.traces == []
     deep = EmbeddedDiscovery(_config(), EmbeddedOptions(force_scan=True)).discover([_candidate(path)])
     assert len(deep.tasks) == 1
 
@@ -129,10 +129,7 @@ def test_native_embedded_reuses_confirmed_residual_without_reopening_pe(tmp_path
     path.unlink()
     # If Candidate refinement were lost, Embedded would attempt PE I/O and
     # report an I/O error. Confirmed facts must survive in the native residual.
-    [(index, status, reason, scan)] = batch.scan_page(table)
-    assert status == 0
-    assert reason == "embedded_executable_skipped"
-    assert scan is None
+    assert batch.scan_page(table) == []
 
 
 @pytest.mark.parametrize("pe_offset", [0x80, 0x800])
