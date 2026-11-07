@@ -88,7 +88,13 @@ def test_zip_directory_numbers_override_names_and_keep_carrier_extent(tmp_path):
     duplicate = tmp_path / "shared.noise"
     duplicate.write_bytes(paths[1].read_bytes())
     group = scheduler.resolve_volume_once([str(paths[0])], [str(p) for p in [*paths, duplicate]], format_hint="zip")
-    assert group is None or group.head_metadata.get("volume_set_incomplete") is True
+    assert group is not None and group.volume_attempts
+    plan = archive_input_for_group(group).volume_attempts
+    for layout in plan.layouts:
+        slots = {slot.number: {plan.sources[i].path for i in slot.choices} for slot in layout}
+        assert slots == {1: {str(paths[0])}, 2: {str(paths[1]), str(duplicate)},
+                         3: {str(paths[2])}, 4: {str(paths[3])}}
+    assert next(source for source in plan.sources if source.path == str(paths[3])).end == len(terminal)
 
 
 def test_zip64_long_comment_retains_terminal_number(tmp_path):

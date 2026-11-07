@@ -915,6 +915,19 @@ def test_memory_wait_releases_execution_lanes_and_accepts_cancellation(tmp_path)
     xz[16] = 28  # legal 64 MiB LZMA2 dictionary; compressed payload is unchanged
     xz[12 + header_size - 4:12 + header_size] = struct.pack("<I", binascii.crc32(xz[12:12 + header_size - 4]))
     archive.write_bytes(xz)
+    head, short_tail, tail = (tmp_path / name for name in ("head.blob", "short.blob", "tail.blob"))
+    head.write_bytes(xz[:32])
+    short_tail.write_bytes(b"\0")
+    tail.write_bytes(xz[32:])
+    trial_input = ArchiveInputDescriptor.from_parts(archive_path=str(head), format_hint="xz").to_dict()
+    trial_input["volume_attempts"] = {
+        "minimum_size": len(xz),
+        "sources": [{"path": str(p), "start": 0, "end": p.stat().st_size} for p in (head, short_tail, tail)],
+        "layouts": [{"slots": [
+            {"number": 1, "canonical_name": "stream.001", "choices": [0]},
+            {"number": 2, "canonical_name": "stream.002", "choices": [1, 2]},
+        ]}],
+    }
     tiny = tmp_path / "small.zip"
     with zipfile.ZipFile(tiny, "w") as output:
         output.writestr("small.txt", b"small")
@@ -954,7 +967,8 @@ def test_memory_wait_releases_execution_lanes_and_accepts_cancellation(tmp_path)
         assert kernel.AssignProcessToJobObject(handle, int(process._handle))
         large_jobs = {f"large-{index}" for index in range(1, max(2, int(handshake["thread_capacity"])) + 1)}
         for job in sorted(large_jobs):
-            send({"job_id": job, "archive_input": ArchiveInputDescriptor.from_parts(archive_path=str(archive), format_hint="xz").to_dict(), "output_dir": str(tmp_path / job)})
+            descriptor = trial_input if job in {"large-1", "large-2"} else ArchiveInputDescriptor.from_parts(archive_path=str(archive), format_hint="xz").to_dict()
+            send({"job_id": job, "archive_input": descriptor, "output_dir": str(tmp_path / job)})
         until(lambda event: {e.get("job_id") for e in seen if e.get("event") == "memory_blocked"} >= large_jobs)
         send({"job_id": "small", "archive_input": ArchiveInputDescriptor.from_parts(archive_path=str(tiny), format_hint="zip").to_dict(), "output_dir": str(tmp_path / "small")})
         assert until(lambda event: event.get("job_id") == "small" and event.get("type") == "result")["status"] == "ok"
@@ -977,6 +991,10 @@ def test_memory_wait_releases_execution_lanes_and_accepts_cancellation(tmp_path)
         capacity(reserve_mib + 128)
         until(lambda event: {e.get("job_id") for e in seen if e.get("type") == "result"} >= {"large-2", "changed"})
         assert next(e for e in seen if e.get("type") == "result" and e.get("job_id") == "large-2")["status"] == "ok"
+        # The rejected composition is not retried when memory resumes, and
+        # the second composition retains its selection across native parking.
+        replayed = next(e for e in seen if e.get("type") == "result" and e.get("job_id") == "large-2")
+        assert replayed["volume_attempts"] == 2 and replayed["volume_selection"]["sources"] == [0, 2]
         assert next(e for e in seen if e.get("type") == "result" and e.get("job_id") == "changed")["failure_kind"] == "input_changed"
         assert next((tmp_path / "large-2").iterdir()).read_bytes() == b"memory replay" * 100
         send({"worker_command": "shutdown"})

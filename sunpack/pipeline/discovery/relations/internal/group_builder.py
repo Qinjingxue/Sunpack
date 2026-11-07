@@ -238,6 +238,7 @@ class RelationsGroupBuilder:
                 carrier_path=str(raw.get("carrier_path") or ""),
                 carrier_size=raw.get("carrier_size"),
                 format_reject_mask=int(raw.get("format_reject_mask") or 0),
+                volume_attempts=raw.get("volume_attempts"),
             )
         except (TypeError, ValueError):
             return None

@@ -85,6 +85,10 @@ sunpack.runtime.watch
 
 Files, volume sets, and carrier segments share one logical input lifecycle. Rust establishes the mapping during discovery and refines facts when passwords or members change. Execution, verification, and recursive scanning pass typed inputs and per-input results directly, without reconstructing them from diagnostic dictionaries. `InputRecovery` checkpoints each input's source generation, output location, completion, and failure; missing volumes and passwords may block the same input together. CLI and Watch share the selector that retries changed dependencies or password waiters while retaining completed siblings. Persisted checkpoints contain no passwords, reader handles, or file inventories. Shared carriers are cleaned as user-visible files after the whole group completes.
 
+Uncertain volumes belong to `ArchiveInputDescriptor.volume_attempts`: a shared source-extent pool and prioritized slot domains. Python passes and persists this plan, then commits the source indexes returned on worker success. Logical input IDs remain stable; cleanup references shrink to the selected sources. The plan contains neither an execution cursor nor expanded combinations.
+
+Unresolved ZIP compositions skip the optional archive-wide filename encoding guess, so another candidate's directory cannot override the input's encoding. The worker still handles UTF-8 flags, Unicode extra fields, and backend defaults.
+
 ### pipeline.discovery.filesystem
 
 `sunpack.pipeline.discovery.filesystem` owns explicit directory traversal, filtering, and `DirectorySnapshot` construction. It does not own the long-running Watch service. `sunpack.runtime.watch` owns OS notifications, NTFS/USN observations, and readiness tracking; it decides when a physical file is stable enough to enter the pipeline. Archive filtering and interpretation remain in pipeline discovery.
@@ -92,6 +96,10 @@ Files, volume sets, and carrier segments share one logical input lifecycle. Rust
 ### pipeline.discovery.relations
 
 `sunpack.pipeline.discovery.relations` handles relationships between files: strict volume primary files, members, SFX companions, arbitration of structural evidence, and logical names. Initial discovery must not group files directly by loose file names; after a missing volume is confirmed, only one re-search constrained by a structural anchor is allowed. External modules may only call `RelationsScheduler`, and must not depend on `sunpack.pipeline.discovery.relations.internal` directly.
+
+Rust relations reuse collected structural facts, canonical naming channels, positional number channels, and loose numeric domains. Structural numbers and head/tail roles remain hard constraints. Conflicts become alternatives, including different slices of one carrier. Contiguous layouts covering more slots come first; equal coverage preserves evidence priority. Domains prefer the head's directory, then numeric width for loose numbers, with stable path ordering. Gap filling requires a finite evidence bound; neither the largest filename number nor the Cartesian product determines allocation size.
+
+The worker lazily enumerates compositions without reusing a source, through the existing extraction, password confirmation, output cleanup, and memory replay facilities. Switching compositions destroys decoder state and clears that attempt's output. Memory withdrawal retains the current cursor; cancellation uses the existing path. Only missing volumes or structural/checksum/data failures involving variable sources or ranges advance the cursor. Known insufficient lengths are rejected before opening. Fixed-head damage, unproven passwords, input/output errors, resource failures, and unsupported methods return to the existing decision path immediately. Exhausting legal compositions produces the `volume_attempts_exhausted` missing-volume fact. Intermediate failures and manifests stay internal; success returns selected source indexes alongside the existing extraction result. Storage grows with sources, domains, and current slots, not the number of attempted combinations. There is no attempt-count limit.
 
 Publicly allowed relation capabilities include:
 

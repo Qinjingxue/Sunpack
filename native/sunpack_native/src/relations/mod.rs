@@ -15,6 +15,7 @@ use std::path::Path;
 use std::sync::{Arc, OnceLock, RwLock};
 
 mod assignment;
+mod attempts;
 mod bucket;
 mod filename;
 mod numeric;
@@ -62,6 +63,7 @@ pub(crate) struct ProposalValidation {
     reason: Option<RelationFailureReason>,
     unresolved: Vec<String>,
     name_features: HashMap<String, filename::NameFeatures>,
+    attempts: Option<attempts::VolumeAttempts>,
 }
 
 /// Owned by the candidate table's scan lifetime; never a process-wide cache.
@@ -411,6 +413,7 @@ pub(crate) fn build_native_candidate_groups_from_snapshot_cached(
         &filtered_keys,
         path_passwords,
         cached,
+        None,
     )
 }
 
@@ -475,6 +478,7 @@ pub(crate) fn resolve_embedded_volumes(
             &keys,
             None,
             Some(&cache),
+            None,
         ));
         remaining.retain(|key| !keys.contains(key));
     }
@@ -482,7 +486,7 @@ pub(crate) fn resolve_embedded_volumes(
 }
 
 /// Resolve logical heads independently while retaining physical snapshot/cache
-/// sharing. Competing mappings may share a carrier, but never the same bytes.
+/// sharing. Conflicting source extents remain speculative until execution.
 fn resolve_shared_carrier_volumes(
     snapshots: &[NativeDirectorySnapshot],
     anchors: Vec<VolumeAnchor>,
@@ -545,10 +549,8 @@ fn resolve_shared_carrier_volumes(
                                 .copied()
                                 .filter(|other| other.format == anchor.format);
                             let first = matching.next()?;
-                            // Several compatible slices have no unique assignment.
-                            if matching.next().is_some() {
-                                return None;
-                            }
+                            // The same slot's other analyzed slices become
+                            // source extents in the compact attempt plan.
                             first
                         };
                         row.anchor = Some(chosen.clone());
@@ -562,6 +564,7 @@ fn resolve_shared_carrier_volumes(
                 &HashSet::from([key.clone()]),
                 None,
                 Some(&cache),
+                Some(&by_path),
             ) {
                 let NativeRelationGroup::Proposal(ref validation, _) = group else {
                     continue;
@@ -601,46 +604,11 @@ fn resolve_shared_carrier_volumes(
             }
         }
     }
-    // Index intervals by physical source rather than comparing every proposal
-    // pair. The usual one-head path above does not pay this allocation cost.
-    let mut intervals: HashMap<String, Vec<(u64, u64, usize)>> = HashMap::new();
-    for (index, group) in proposals.iter().enumerate() {
-        let NativeRelationGroup::Proposal(validation, _) = group else {
-            continue;
-        };
-        for part in &validation.proposal.volumes {
-            if let Some(a) = validation.anchors.get(&path_key(&part.0)) {
-                intervals.entry(path_key(&part.0)).or_default().push((
-                    a.structure_offset.unwrap_or(0),
-                    a.payload_end.or(a.carrier_limit).unwrap_or(a.size),
-                    index,
-                ));
-            }
-        }
-    }
-    let mut conflicted = HashSet::new();
-    for ranges in intervals.values_mut() {
-        ranges.sort_unstable();
-        let mut frontier: Option<(u64, usize)> = None;
-        for &(start, end, index) in ranges.iter() {
-            if let Some((stop, owner)) = frontier {
-                if start < stop && owner != index {
-                    conflicted.extend([owner, index]);
-                }
-                if end > stop {
-                    frontier = Some((end, index));
-                }
-            } else {
-                frontier = Some((end, index));
-            }
-        }
-    }
+    // Alternative sources are request-owned leases. A successful input only
+    // commits its selected extents; overlapping candidates do not erase heads.
     let mut covered = HashSet::new();
     let mut output = Vec::new();
-    for (index, group) in proposals.into_iter().enumerate() {
-        if conflicted.contains(&index) {
-            continue;
-        }
+    for group in proposals {
         if let NativeRelationGroup::Proposal(validation, _) = &group {
             covered.extend(validation.proposal.volumes.iter().filter_map(|part| {
                 validation
@@ -648,6 +616,13 @@ fn resolve_shared_carrier_volumes(
                     .get(&path_key(&part.0))
                     .map(|a| (path_key(&a.path), a.structure_offset))
             }));
+            if let Some(plan) = &validation.attempts {
+                covered.extend(
+                    plan.sources
+                        .iter()
+                        .map(|source| (path_key(&source.path), Some(source.start))),
+                );
+            }
         }
         output.push(group);
     }
@@ -676,6 +651,7 @@ fn resolve_shared_carrier_volumes(
         };
         output.push(NativeRelationGroup::Proposal(
             ProposalValidation {
+                attempts: None,
                 status: if needs_password {
                     ProposalStatus::NeedsPassword
                 } else {
@@ -712,6 +688,7 @@ fn build_candidate_groups_from_source(
     filtered_keys: &HashSet<String>,
     path_passwords: Option<&[(String, String)]>,
     cached: Option<&RelationCache>,
+    alternative_anchors: Option<&HashMap<String, Vec<&VolumeAnchor>>>,
 ) -> Vec<NativeRelationGroup> {
     let scope = RelationScopeIndex::build(&source, filtered_keys);
     let mut output = Vec::new();
@@ -724,6 +701,9 @@ fn build_candidate_groups_from_source(
         structural::collect(&mut directory_rows, &name_index, path_passwords);
         let mut validations = assignment::resolve_buckets(&directory_rows, &name_index, cached);
         for validation in &mut validations {
+            if let Some(options) = alternative_anchors {
+                attempts::expand_carrier_sources(validation, options);
+            }
             validate::validate(validation);
         }
         // Arbitration considers every candidate in the active stem bucket,
@@ -751,11 +731,6 @@ fn build_candidate_groups_from_source(
         let validation_owned_paths: Vec<HashSet<String>> =
             validations.iter().map(validation_owned_paths).collect();
 
-        let conflicted = conflicting_proposal_indexes(
-            &validations,
-            &validation_owned_paths,
-            ProposalStatus::Valid,
-        );
         let password_conflicted = conflicting_proposal_indexes(
             &validations,
             &validation_owned_paths,
@@ -765,13 +740,10 @@ fn build_candidate_groups_from_source(
         let mut claimed_paths = HashSet::new();
         let mut password_paths = HashSet::new();
         for (index, validation) in validations.iter().enumerate() {
-            if validation.status != ProposalStatus::Valid || conflicted.contains(&index) {
+            if validation.status != ProposalStatus::Valid {
                 continue;
             }
             let owned = &validation_owned_paths[index];
-            if owned.iter().any(|path| claimed_paths.contains(path)) {
-                continue;
-            }
             claimed_paths.extend(owned.iter().cloned());
             if selected[index] {
                 output.push(NativeRelationGroup::Proposal(
@@ -1136,15 +1108,16 @@ fn ordinary_file_group_to_dict(
 }
 
 fn validation_relation_confirmed(validation: &ProposalValidation) -> bool {
-    validation.unresolved.is_empty()
-        && validation.proposal.volumes.iter().all(|part| part.1 > 0)
-        && !validation.reason.is_some_and(|reason| {
-            matches!(
-                reason,
-                RelationFailureReason::AmbiguousVolumeMapping
-                    | RelationFailureReason::StructuralConflict
-            )
-        })
+    validation.attempts.is_some()
+        || (validation.unresolved.is_empty()
+            && validation.proposal.volumes.iter().all(|part| part.1 > 0)
+            && !validation.reason.is_some_and(|reason| {
+                matches!(
+                    reason,
+                    RelationFailureReason::AmbiguousVolumeMapping
+                        | RelationFailureReason::StructuralConflict
+                )
+            }))
 }
 
 fn validated_proposal_to_dict(
@@ -1195,6 +1168,9 @@ fn validated_proposal_to_dict(
         .flatten();
     let dict = PyDict::new(py);
     dict.set_item("head_path", head_path)?;
+    if validation.attempts.is_some() {
+        dict.set_item("volume_attempts", attempts::to_dict(py, validation)?)?;
+    }
     dict.set_item("head_name", basename(head_path))?;
     dict.set_item("logical_name", &proposal.logical_name)?;
     dict.set_item("relation", relation_to_dict(py, &relation)?)?;
@@ -1470,6 +1446,7 @@ pub(crate) fn relations_resolve_volume_once(
             RelationSource::Physical(&rows),
             &filtered_keys,
             path_passwords.as_deref(),
+            None,
             None,
         );
         let format_hint = normalize_retry_format(format_hint);
@@ -2444,6 +2421,7 @@ mod tests {
 
     fn validation_with_owned_paths(status: ProposalStatus, paths: &[&str]) -> ProposalValidation {
         ProposalValidation {
+            attempts: None,
             status,
             reason: None,
             unresolved: Vec::new(),

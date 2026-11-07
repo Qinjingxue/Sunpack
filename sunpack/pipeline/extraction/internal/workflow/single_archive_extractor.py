@@ -156,7 +156,7 @@ class SingleArchiveExtractor:
             result = yield from self._extract_one_state_machine(
                 task, out_dir, phase_timer=phase_timer, phase_prefix=phase_prefix,
             )
-            result.logical_input = inputs[0]
+            result.logical_input = task.inputs[0]
             return result
         return (yield from self._extract_inputs_state_machine(
             task, out_dir, inputs, phase_timer=phase_timer, phase_prefix=phase_prefix,
@@ -247,6 +247,7 @@ class SingleArchiveExtractor:
                     "out_dir": out_dir,
                     "password": correct_pwd,
                     "password_candidates": list(resolution.candidate_passwords),
+                    "password_verified": bool(correct_pwd) and not resolution.requires_extraction_confirmation,
                     "selected_codepage": selected_codepage,
                     "startupinfo": startupinfo,
                     "task": task,
@@ -255,6 +256,12 @@ class SingleArchiveExtractor:
                 }
 
             if run_result.returncode == 0:
+                if descriptor.volume_attempts is not None:
+                    selection = worker_result_payload(run_result).get("volume_selection")
+                    if not isinstance(selection, dict):
+                        raise ValueError("worker omitted the successful volume composition")
+                    task.select_volumes(node, descriptor.select_volumes(selection))
+                    task.runtime.pop(self.metadata_scanner.TASK_CACHE_KEY, None)
                 selected_password = self._worker_selected_password(resolution, run_result)
                 if selected_password is not None:
                     correct_pwd = selected_password
@@ -665,6 +672,9 @@ class SingleArchiveExtractor:
                     child_task, segment_dir,
                     phase_timer=phase_timer, phase_prefix=f"{phase_prefix}_segment_extract",
                 )
+            if result.success and node.descriptor.volume_attempts is not None:
+                task.select_volumes(node, child_task.archive_input())
+                node = child_task.inputs[0]
             result.logical_input = node
 
             if result.password_used is not None and password_used is None:

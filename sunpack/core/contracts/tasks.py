@@ -131,6 +131,19 @@ class ArchiveTask:
         if len(self.inputs) == 1 and self.inputs[0].descriptor is previous:
             self.inputs = (replace(self.inputs[0], descriptor=descriptor),)
 
+    def select_volumes(self, node: LogicalArchiveInput, descriptor: ArchiveInputDescriptor) -> None:
+        """Commit the worker's winning composition; release unused candidates."""
+        rejected = {path_key(path) for path in node.source_paths}
+        self.inputs = tuple(replace(item, descriptor=descriptor) if item.input_id == node.input_id else item
+                            for item in self.inputs)
+        retained = {path_key(path) for item in self.inputs for path in item.source_paths}
+        unused = rejected - retained
+        self.cleanup_parts = [path for path in self.cleanup_parts if path_key(path) not in unused]
+        if self._archive_input is node.descriptor:
+            self._archive_input = descriptor
+        if self.password_probe_input is node.descriptor:
+            self.password_probe_input = descriptor
+
     def apply_path_mapping(self, path_map: dict[str, str]) -> None:
         if not path_map:
             return

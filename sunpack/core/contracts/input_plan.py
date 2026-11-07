@@ -37,7 +37,8 @@ class LogicalArchiveInput:
     @property
     def anchors(self) -> frozenset[tuple[str, int]]:
         descriptor = self.descriptor
-        extents = descriptor.extents or [part.extent for part in descriptor.parts]
+        extents = (descriptor.volume_attempts.sources if descriptor.volume_attempts else
+                   descriptor.extents or [part.extent for part in descriptor.parts])
         return frozenset((path_key(extent.path), extent.start) for extent in extents) or frozenset({(path_key(descriptor.entry_path), 0)})
 
     @property

@@ -354,6 +354,21 @@ public:
         return values;
     }
 
+    bool index_array_field(std::string_view key, std::vector<std::size_t>& values) const {
+        const auto raw = raw_field(key);
+        if (!raw || raw->empty() || raw->front() != '[') return false;
+        for (const auto item : json_array_values(*raw)) {
+            std::size_t value = 0;
+            if (item.empty()) return false;
+            for (const char digit : item) {
+                if (digit < '0' || digit > '9' || value > (SIZE_MAX - (digit - '0')) / 10) return false;
+                value = value * 10 + (digit - '0');
+            }
+            values.push_back(value);
+        }
+        return !values.empty();
+    }
+
 private:
     struct Field {
         std::string_view key;
@@ -422,6 +437,7 @@ private:
 };
 
 struct WorkerArchiveInput {
+    sunpack::sevenzip::VolumeAttemptPlan volume_attempts;
     std::wstring archive_path;
     std::wstring format_hint;
     std::wstring open_mode;
@@ -557,6 +573,40 @@ WorkerArchiveInput parse_archive_input_descriptor(const JsonObjectView& request)
     input.analyzed_missing_volume_evidence =
         execution_analysis.string_field("missing_volume_evidence", "");
 
+    const auto attempts = descriptor.object_field("volume_attempts");
+    if (attempts.valid()) {
+        auto& plan = input.volume_attempts;
+        attempts.uint_field("head_size_from_total", &plan.head_size_from_total);
+        attempts.uint_field("minimum_size", &plan.minimum_size);
+        plan.sources = parse_ranges_from_objects(attempts.object_array_field("sources"), "");
+        for (auto raw_layout : attempts.object_array_field("layouts")) {
+            std::vector<sunpack::sevenzip::VolumeAttemptSlot> slots;
+            unsigned long long previous = 0;
+            std::unordered_set<std::wstring> names;
+            for (auto raw_slot : JsonObjectView(raw_layout).object_array_field("slots")) {
+                const JsonObjectView slot(raw_slot);
+                unsigned long long number = 0;
+                sunpack::sevenzip::VolumeAttemptSlot parsed;
+                parsed.name = utf8_to_wide(slot.string_field("canonical_name", ""));
+                if (!slot.uint_field("number", &number) || number <= previous || number > INT_MAX ||
+                    (slots.empty() && number != 1) || parsed.name.empty() || !names.insert(parsed.name).second ||
+                    !slot.index_array_field("choices", parsed.choices) ||
+                    std::any_of(parsed.choices.begin(), parsed.choices.end(), [&](auto i) { return i >= plan.sources.size(); })) {
+                    input.validation_error = "invalid volume attempt slot"; return input;
+                }
+                parsed.number = static_cast<unsigned int>(number);
+                previous = number;
+                slots.push_back(std::move(parsed));
+            }
+            if (slots.empty()) { input.validation_error = "empty volume attempt layout"; return input; }
+            plan.layouts.push_back(std::move(slots));
+        }
+        if (plan.sources.empty() || plan.layouts.empty() ||
+            std::any_of(plan.sources.begin(), plan.sources.end(), [](const auto& source) {
+                return source.path.empty() || (source.has_end && source.end < source.start);
+            })) { input.validation_error = "invalid volume attempt sources"; return input; }
+    }
+
     struct ParsedPart {
         int number;
         std::wstring path;
@@ -657,6 +707,7 @@ struct WorkerRequest {
     std::wstring password;
     std::wstring codepage;
     bool dry_run = false;
+    bool password_verified = false;
     std::vector<std::wstring> password_candidates;
     WorkerArchiveInput archive_input;
 };
@@ -683,6 +734,7 @@ WorkerRequest parse_worker_request(const std::string& request_json) {
     request.password = utf8_to_wide(json.string_field("password", ""));
     request.codepage = utf8_to_wide(json.string_field("codepage", ""));
     request.dry_run = json.bool_field("dry_run", false);
+    request.password_verified = json.bool_field("password_verified", false);
 
     for (const auto& candidate : json.string_array_field("password_candidates")) {
         request.password_candidates.push_back(utf8_to_wide(candidate));
@@ -1051,6 +1103,64 @@ std::error_code discard_candidate_output(const std::wstring& output_dir) {
     return error;
 }
 
+void select_volume_attempt(const WorkerArchiveInput& source,
+                           const sunpack::sevenzip::VolumeAttemptCursor& cursor,
+                           WorkerArchiveInput& input) {
+    input = WorkerArchiveInput{};
+    input.open_mode = source.open_mode;
+    input.format_hint = source.format_hint;
+    const auto& slots = source.volume_attempts.layouts[cursor.layout];
+    unsigned int previous = 0;
+    for (std::size_t i = 0; i < slots.size(); ++i) {
+        const auto& range = source.volume_attempts.sources[cursor.selected[i]];
+        input.part_paths.push_back(range.path);
+        input.ranges.push_back(range);
+        input.canonical_names.push_back(slots[i].name);
+        input.volume_numbers.push_back(static_cast<int>(slots[i].number));
+        if (!input.missing_volume_number && slots[i].number != previous + 1)
+            input.missing_volume_number = static_cast<int>(previous + 1);
+        previous = slots[i].number;
+    }
+    input.archive_path = input.part_paths.front();
+    auto remaining = source.volume_attempts.minimum_size;
+    for (const auto& range : input.ranges) {
+        if (!range.has_end) { remaining = 0; break; }
+        remaining -= (std::min)(remaining, range.end - range.start);
+    }
+    if (remaining) { input.missing_volume_number = 1; return; }
+    if (source.volume_attempts.head_size_from_total) {
+        auto length = source.volume_attempts.head_size_from_total;
+        for (std::size_t i = 1; i < input.ranges.size(); ++i) {
+            const auto& range = input.ranges[i];
+            if (!range.has_end || range.end - range.start >= length) { input.missing_volume_number = 1; return; }
+            length -= range.end - range.start;
+        }
+        auto& head = input.ranges.front();
+        if (!head.has_end || length > head.end - head.start) { input.missing_volume_number = 1; return; }
+        head.end = head.start + length;
+    }
+}
+
+bool volume_composition_failure(const sunpack::sevenzip::ExtractArchiveResult& result,
+                                const sunpack::sevenzip::ExtractionReplay& replay,
+                                bool password_verified) {
+    using namespace sunpack::sevenzip;
+    if ((result.status == PasswordTestStatus::Ok && result.command_ok) ||
+        (result.wrong_password && !password_verified) || result.password_rejected ||
+        (result.encrypted && !result.password_crc_proven && !password_verified) ||
+        result.unsupported_method || result.status == PasswordTestStatus::BackendUnavailable ||
+        result.status == PasswordTestStatus::Error || result.input_trace.read_error) return false;
+    if (result.missing_volume) return true;
+    if (result.failure_stage != "archive_open" && result.failure_stage != "item_extract") return false;
+    if (result.failure_kind != "structure_recognition" && result.failure_kind != "checksum_error" &&
+        result.failure_kind != "data_error" && result.failure_kind != "headers_error" &&
+        !(password_verified && result.failure_kind == "encrypted_or_wrong_password") &&
+        result.failure_kind != "unexpected_end" && result.failure_kind != "missing_volume_or_tail") return false;
+    // Binary readers record whether a variable source/range participated.
+    // Seeks, fixed tails and failures confined to the fixed head are not proof.
+    return replay.uncertain_read.load(std::memory_order_relaxed);
+}
+
 int run_request(
     const WorkerRequest& request,
     // The job's output-volume write facility, borrowed from the registry lease held by worker_loop; null for dry runs.
@@ -1093,8 +1203,10 @@ int run_request(
     bool extract_started = false;
     auto progress_mutex = std::make_shared<std::mutex>();
     auto *cpu_job_context = sunpack::sevenzip::current_native_cpu_job_context();
-    auto progress = [job_id, last_progress_emit, coalesced_progress_events, extract_started, progress_mutex, cpu_job_context](const ExtractProgressEvent& event) mutable {
+    const bool volume_trials = !request.archive_input.volume_attempts.layouts.empty();
+    auto progress = [job_id, last_progress_emit, coalesced_progress_events, extract_started, progress_mutex, cpu_job_context, volume_trials](const ExtractProgressEvent& event) mutable {
             std::lock_guard<std::mutex> lock(*progress_mutex);
+            if (volume_trials && event.event == "item_failed") return;
             const auto now = std::chrono::steady_clock::now();
             if (!extract_started && event.completed_bytes > 0) {
                 extract_started = true;
@@ -1139,14 +1251,41 @@ int run_request(
             coalesced_progress_events = 0;
     };
 
-    const auto& archive_input = request.archive_input;
-    if (!archive_input.validation_error.empty()) {
+    if (!request.archive_input.validation_error.empty()) {
         print_json_line(
             "{\"type\":\"result\",\"job_id\":\"" + json_escape(job_id) +
             "\",\"status\":\"error\",\"category\":\"invalid_request\",\"message\":\"" +
-            json_escape(archive_input.validation_error) + "\"}");
+            json_escape(request.archive_input.validation_error) + "\"}");
         return 2;
     }
+    auto* volume_replay = current_extraction_replay;
+    WorkerArchiveInput selected_input;
+    if (volume_trials) {
+        auto& cursor = volume_replay->volumes;
+        if (!cursor.started) {
+            cursor.reserve(request.archive_input.volume_attempts);
+            std::error_code error;
+            const auto root = std::filesystem::path(win32_extended_path(output_dir));
+            cursor.output_owned = dry_run ||
+                ((!std::filesystem::exists(root, error) || std::filesystem::is_empty(root, error)) && !error);
+            if (!cursor.output_owned) {
+                print_json_line("{\"type\":\"result\",\"job_id\":\"" + json_escape(job_id) +
+                    "\",\"status\":\"failed\",\"failure_stage\":\"output_prepare\",\"failure_kind\":\"output_filesystem\","
+                    "\"message\":\"volume composition trials require an empty output directory\"}");
+                return 2;
+            }
+            if (!cursor.next(request.archive_input.volume_attempts, cancel_token.get())) {
+                if (cancel_token && cancel_token->load()) return cancelled_result(job_id);
+                print_json_line("{\"type\":\"result\",\"job_id\":\"" + json_escape(job_id) +
+                    "\",\"status\":\"failed\",\"missing_volume\":true,\"failure_stage\":\"archive_open\","
+                    "\"failure_kind\":\"missing_volume\",\"message\":\"no legal volume composition\"}");
+                return 2;
+            }
+            cursor.started = true;
+        }
+        volume_replay->volume_attempt_active = true;
+    }
+    const auto& archive_input = volume_trials ? selected_input : request.archive_input;
     auto extract_with_password = [&](const std::wstring& selected_password) {
         return archive_input.ranges.empty() || !archive_input.canonical_names.empty()
             ? extract_archive_with_parts(archive_input.archive_path, archive_input.part_paths, archive_input.format_hint, selected_password, output_dir, codepage, progress, dry_run, archive_input.canonical_names, archive_input.open_mode == L"native_volumes", shared_writer, cancel_token, archive_input.ranges)
@@ -1154,120 +1293,191 @@ int run_request(
     };
 
     ExtractArchiveResult result;
-    if (archive_input.missing_volume_number > 0) {
-        result.status = PasswordTestStatus::Damaged;
-        result.damaged = true;
-        result.missing_volume = true;
-        result.missing_volume_suspected = false;
-        result.missing_volume_evidence = "structured_volume_gap";
-        result.failure_stage = "archive_open";
-        result.failure_kind = "missing_volume";
-        result.message = "structured volume " + std::to_string(archive_input.missing_volume_number) + " is missing";
-    } else if (password_candidates.empty()) {
-        result = extract_with_password(password);
-    } else {
-        auto *replay = current_extraction_replay;
-        if (password_candidates.size() > 1 && replay && !replay->candidates_started) {
-            replay->candidates_started = true;
-            std::error_code error;
-            const auto root = std::filesystem::path(win32_extended_path(output_dir));
-            replay->candidate_output_owned = !dry_run &&
-                (!std::filesystem::exists(root, error) || std::filesystem::is_empty(root, error)) && !error;
-        }
-        // Existing outputs belong to a continuation/user. Keep the read-only
-        // diagnostic fallback there; fresh outputs can confirm by extracting.
-        const bool direct_candidates = password_candidates.size() == 1 ||
-            (replay && replay->candidate_output_owned);
-        if (!direct_candidates) {
-            const auto probe = run_password_candidate_probe(archive_input, password_candidates);
-            if (probe.status != PasswordTestStatus::Ok || probe.matched_index < 0 ||
-                static_cast<std::size_t>(probe.matched_index) >= password_candidates.size()) {
-                result = password_candidate_failure(archive_input, probe, password_candidates.size());
-            } else {
-                result = extract_with_password(password_candidates[probe.matched_index]);
-                result.password_candidate_batch = true;
-                result.password_candidate_count = static_cast<unsigned int>(password_candidates.size());
-                result.password_attempts = probe.attempts;
-                result.matched_index = probe.matched_index;
-            }
-        } else {
-            std::size_t index = replay ? replay->candidate_index : 0;
-            while (index < password_candidates.size() || (replay && replay->candidate_discard_pending)) {
-                if (replay && replay->candidate_discard_pending) {
+    for (;;) {
+        if (volume_trials) {
+            auto& cursor = volume_replay->volumes;
+            if (cursor.discard_pending) {
+                if (!dry_run) {
                     const auto error = discard_candidate_output(output_dir);
                     if (error) {
-                        result = ExtractArchiveResult{};
-                        result.backend_available = true;
                         result.status = PasswordTestStatus::Error;
                         result.failure_stage = "candidate_cleanup";
                         result.failure_kind = "output_filesystem";
                         result.message = error.message();
                         break;
                     }
-                    replay->clear_output();
-                    replay->candidate_discard_pending = false;
-                    replay->candidate_index = ++index;
-                    continue;
                 }
-                if (cancel_token && cancel_token->load(std::memory_order_acquire)) break;
-                // Confirmation shares the real extraction and its CRC receipts.
-                // Only ambiguous failures need the existing read-only probe.
-                result = extract_with_password(password_candidates[index]);
-                const bool direct_ok = result.status == PasswordTestStatus::Ok && result.command_ok;
-                // ENC authenticates the password during Open; later MAC/CRC failures are data damage.
-                if (!direct_ok && result.encrypted && result.archive_type != L"enc" &&
-                    !result.password_crc_proven &&
-                    !(cancel_token && cancel_token->load(std::memory_order_acquire)) &&
-                    result.status != PasswordTestStatus::Error && result.failure_kind != "resource_unavailable" &&
-                    !(current_native_memory_job() && current_native_memory_job()->revoked.load(std::memory_order_acquire)) &&
-                    !(current_native_memory_job() && current_native_memory_job()->denied.load(std::memory_order_acquire)) &&
-                    !(result.status == PasswordTestStatus::WrongPassword && result.operation_result == kOpWrongPassword)) {
-                    if (extraction_rejects_password(result) ||
-                        run_password_candidate_probe(archive_input, {password_candidates[index]}).status == PasswordTestStatus::WrongPassword) {
-                        result.status = PasswordTestStatus::WrongPassword;
-                        result.encrypted = true;
-                        result.wrong_password = true;
-                        result.password_rejected = true;
-                        result.password_candidates_all_rejected = true;
-                        result.failure_stage = "password_probe";
-                        result.failure_kind = "wrong_password";
-                        result.operation_result = kOpWrongPassword;
-                        result.message = "wrong password";
+                volume_replay->clear_output();
+                volume_replay->uncertain_read.store(false, std::memory_order_relaxed);
+                volume_replay->candidate_index = 0;
+                volume_replay->candidates_started = volume_replay->candidate_output_owned = volume_replay->candidate_discard_pending = false;
+                cursor.discard_pending = false;
+            }
+            select_volume_attempt(request.archive_input, cursor, selected_input);
+            volume_replay->uncertain_ranges.clear();
+            volume_replay->uncertain_paths.clear();
+            unsigned long long offset = 0;
+            bool variable_offset = false;
+            for (std::size_t i = 0; i < selected_input.ranges.size(); ++i) {
+                const auto& range = selected_input.ranges[i];
+                const auto length = range.has_end ? (std::min)(range.end - range.start, UINT64_MAX - offset) : UINT64_MAX - offset;
+                bool variable = i == 0 && request.archive_input.volume_attempts.head_size_from_total != 0;
+                bool variable_length = variable;
+                for (const auto& layout : request.archive_input.volume_attempts.layouts) {
+                    if (i >= layout.size() || layout[i].number != static_cast<unsigned int>(selected_input.volume_numbers[i])) {
+                        variable = variable_length = true; continue;
+                    }
+                    variable |= layout[i].choices.size() != 1 || layout[i].choices.front() != cursor.selected[i];
+                    for (auto choice : layout[i].choices) {
+                        const auto& source = request.archive_input.volume_attempts.sources[choice];
+                        variable_length |= !source.has_end || source.end - source.start != length;
                     }
                 }
-                result.password_candidate_direct = true;
-                result.password_candidate_count = static_cast<unsigned int>(password_candidates.size());
-                result.password_attempts = password_candidates.size() == 1 && direct_ok ? 0 : static_cast<int>(index + 1);
-                result.matched_index = direct_ok ? static_cast<int>(index) : -1;
-                result.password_candidates_all_rejected =
-                    result.password_candidates_all_rejected || result.wrong_password || result.password_rejected;
-                if (direct_ok || !result.password_candidates_all_rejected || password_candidates.size() == 1 ||
-                    (cancel_token && cancel_token->load(std::memory_order_acquire))) break;
-                result.password_candidates_all_rejected = false;
-                replay->candidate_discard_pending = true;
-            }
-            if (index == password_candidates.size()) {
-                PasswordTestResult rejected;
-                rejected.status = PasswordTestStatus::WrongPassword;
-                rejected.backend_available = true;
-                rejected.attempts = static_cast<int>(password_candidates.size());
-                rejected.message = "wrong password";
-                result = password_candidate_failure(archive_input, rejected, password_candidates.size());
+                if (variable || variable_offset)
+                    volume_replay->uncertain_ranges.emplace_back(offset, offset + length);
+                if (variable)
+                    volume_replay->uncertain_paths.insert(range.path);
+                variable_offset |= variable_length;
+                offset += length;
             }
         }
-    }
+        if (archive_input.missing_volume_number > 0) {
+            result.status = PasswordTestStatus::Damaged;
+            result.damaged = true;
+            result.missing_volume = true;
+            result.missing_volume_suspected = false;
+            result.missing_volume_evidence = "structured_volume_gap";
+            result.failure_stage = "archive_open";
+            result.failure_kind = "missing_volume";
+            result.message = "structured volume " + std::to_string(archive_input.missing_volume_number) + " is missing";
+        } else if (password_candidates.empty()) {
+            result = extract_with_password(password);
+        } else {
+            auto *replay = current_extraction_replay;
+            if (password_candidates.size() > 1 && replay && !replay->candidates_started) {
+                replay->candidates_started = true;
+                std::error_code error;
+                const auto root = std::filesystem::path(win32_extended_path(output_dir));
+                replay->candidate_output_owned = !dry_run &&
+                    (!std::filesystem::exists(root, error) || std::filesystem::is_empty(root, error)) && !error;
+            }
+            // Existing outputs belong to a continuation/user. Keep the read-only
+            // diagnostic fallback there; fresh outputs can confirm by extracting.
+            const bool direct_candidates = password_candidates.size() == 1 ||
+                (replay && replay->candidate_output_owned);
+            if (!direct_candidates) {
+                const auto probe = run_password_candidate_probe(archive_input, password_candidates);
+                if (probe.status != PasswordTestStatus::Ok || probe.matched_index < 0 ||
+                    static_cast<std::size_t>(probe.matched_index) >= password_candidates.size()) {
+                    result = password_candidate_failure(archive_input, probe, password_candidates.size());
+                } else {
+                    result = extract_with_password(password_candidates[probe.matched_index]);
+                    result.password_candidate_batch = true;
+                    result.password_candidate_count = static_cast<unsigned int>(password_candidates.size());
+                    result.password_attempts = probe.attempts;
+                    result.matched_index = probe.matched_index;
+                }
+            } else {
+                std::size_t index = replay ? replay->candidate_index : 0;
+                while (index < password_candidates.size() || (replay && replay->candidate_discard_pending)) {
+                    if (replay && replay->candidate_discard_pending) {
+                        const auto error = discard_candidate_output(output_dir);
+                        if (error) {
+                            result = ExtractArchiveResult{};
+                            result.backend_available = true;
+                            result.status = PasswordTestStatus::Error;
+                            result.failure_stage = "candidate_cleanup";
+                            result.failure_kind = "output_filesystem";
+                            result.message = error.message();
+                            break;
+                        }
+                        replay->clear_output();
+                        replay->candidate_discard_pending = false;
+                        replay->candidate_index = ++index;
+                        continue;
+                    }
+                    if (cancel_token && cancel_token->load(std::memory_order_acquire)) break;
+                    // Confirmation shares the real extraction and its CRC receipts.
+                    // Only ambiguous failures need the existing read-only probe.
+                    result = extract_with_password(password_candidates[index]);
+                    const bool direct_ok = result.status == PasswordTestStatus::Ok && result.command_ok;
+                    // ENC authenticates the password during Open; later MAC/CRC failures are data damage.
+                    if (!direct_ok && result.encrypted && result.archive_type != L"enc" &&
+                        !result.password_crc_proven &&
+                        !(cancel_token && cancel_token->load(std::memory_order_acquire)) &&
+                        result.status != PasswordTestStatus::Error && result.failure_kind != "resource_unavailable" &&
+                        !(current_native_memory_job() && current_native_memory_job()->revoked.load(std::memory_order_acquire)) &&
+                        !(current_native_memory_job() && current_native_memory_job()->denied.load(std::memory_order_acquire)) &&
+                        !(result.status == PasswordTestStatus::WrongPassword && result.operation_result == kOpWrongPassword)) {
+                        if (extraction_rejects_password(result) ||
+                            run_password_candidate_probe(archive_input, {password_candidates[index]}).status == PasswordTestStatus::WrongPassword) {
+                            result.status = PasswordTestStatus::WrongPassword;
+                            result.encrypted = true;
+                            result.wrong_password = true;
+                            result.password_rejected = true;
+                            result.password_candidates_all_rejected = true;
+                            result.failure_stage = "password_probe";
+                            result.failure_kind = "wrong_password";
+                            result.operation_result = kOpWrongPassword;
+                            result.message = "wrong password";
+                        }
+                    }
+                    result.password_candidate_direct = true;
+                    result.password_candidate_count = static_cast<unsigned int>(password_candidates.size());
+                    result.password_attempts = password_candidates.size() == 1 && direct_ok ? 0 : static_cast<int>(index + 1);
+                    result.matched_index = direct_ok ? static_cast<int>(index) : -1;
+                    result.password_candidates_all_rejected =
+                        result.password_candidates_all_rejected || result.wrong_password || result.password_rejected;
+                    if (direct_ok || !result.password_candidates_all_rejected || password_candidates.size() == 1 ||
+                        (cancel_token && cancel_token->load(std::memory_order_acquire))) break;
+                    result.password_candidates_all_rejected = false;
+                    replay->candidate_discard_pending = true;
+                }
+                if (index == password_candidates.size()) {
+                    PasswordTestResult rejected;
+                    rejected.status = PasswordTestStatus::WrongPassword;
+                    rejected.backend_available = true;
+                    rejected.attempts = static_cast<int>(password_candidates.size());
+                    rejected.message = "wrong password";
+                    result = password_candidate_failure(archive_input, rejected, password_candidates.size());
+                }
+            }
+        }
 
-    if (auto *memory = current_native_memory_job()) {
-        if ((result.failure_kind == "resource_unavailable" ||
-             (memory->denied.load(std::memory_order_acquire) && !(result.status == PasswordTestStatus::Ok && result.command_ok))) &&
-            !memory->revoked.load(std::memory_order_acquire))
-            memory->owner.retry(*memory);
-        // An interrupted attempt is internal. Never publish its provisional
-        // damage/password/output errors or a final result to the caller.
-        if (memory->revoked.load(std::memory_order_acquire) && !(result.status == PasswordTestStatus::Ok && result.command_ok)) return kMemoryRetry;
-    }
+        if (auto *memory = current_native_memory_job()) {
+            if ((result.failure_kind == "resource_unavailable" ||
+                 (memory->denied.load(std::memory_order_acquire) && !(result.status == PasswordTestStatus::Ok && result.command_ok))) &&
+                !memory->revoked.load(std::memory_order_acquire))
+                memory->owner.retry(*memory);
+            // An interrupted attempt is internal. Never publish its provisional
+            // damage/password/output errors or a final result to the caller.
+            if (memory->revoked.load(std::memory_order_acquire) && !(result.status == PasswordTestStatus::Ok && result.command_ok)) return kMemoryRetry;
+        }
 
-    if (cancel_token && cancel_token->load(std::memory_order_acquire)) return cancelled_result(job_id);
+        if (cancel_token && cancel_token->load(std::memory_order_acquire)) return cancelled_result(job_id);
+
+        if (!volume_trials || !volume_composition_failure(result, *volume_replay, request.password_verified)) break;
+        if (archive_input.missing_volume_number > 0 &&
+            std::none_of(request.archive_input.volume_attempts.layouts.begin(), request.archive_input.volume_attempts.layouts.end(),
+                [&](const auto& layout) { return std::any_of(layout.begin(), layout.end(), [&](const auto& slot) {
+                    return slot.number == static_cast<unsigned int>(archive_input.missing_volume_number);
+                }); })) break;
+        auto& cursor = volume_replay->volumes;
+        if (!cursor.next(request.archive_input.volume_attempts, cancel_token.get())) {
+            if (cancel_token && cancel_token->load()) return cancelled_result(job_id);
+            result.status = PasswordTestStatus::Damaged;
+            result.missing_volume = true;
+            result.damaged = true;
+            result.wrong_password = result.password_rejected = false;
+            result.missing_volume_suspected = false;
+            result.missing_volume_evidence = "volume_attempts_exhausted";
+            result.failure_kind = "missing_volume";
+            result.message = "no supplied volume composition completed the archive";
+            break;
+        }
+        cursor.discard_pending = true;
+        result = ExtractArchiveResult{};
+    }
 
     if (!archive_input.analyzed_missing_volume_evidence.empty()) {
         if (result.missing_volume && result.missing_volume_evidence.empty()) {
@@ -1299,6 +1509,19 @@ int run_request(
     }
 
     const bool ok = result.status == PasswordTestStatus::Ok && result.command_ok;
+    std::string volume_attempt_fields;
+    if (volume_trials) {
+        const auto& cursor = volume_replay->volumes;
+        volume_attempt_fields = ",\"volume_attempts\":" + std::to_string(cursor.attempts);
+        if (ok) {
+            volume_attempt_fields += ",\"volume_selection\":{\"layout\":" + std::to_string(cursor.layout) + ",\"sources\":[";
+            for (std::size_t i = 0; i < cursor.selected.size(); ++i) {
+                if (i) volume_attempt_fields += ',';
+                volume_attempt_fields += std::to_string(cursor.selected[i]);
+            }
+            volume_attempt_fields += "]}";
+        }
+    }
     const auto manifest_summary = verified_manifest_json(job_id, result, ok && !dry_run);
     const auto trace_chunks = (!ok || dry_run) ? emit_output_trace_chunks(job_id, result.output_trace) : 0;
     const std::string failure_fields = ok ? "" :
@@ -1360,6 +1583,7 @@ int run_request(
         ",\"files_written\":" + std::to_string(result.files_written) +
         ",\"dirs_written\":" + std::to_string(result.dirs_written) +
         ",\"bytes_written\":" + std::to_string(result.bytes_written) +
+        volume_attempt_fields +
         ",\"dry_run\":" + std::string(dry_run ? "true" : "false") +
         ",\"open_mode\":\"" + json_escape(wide_to_utf8(archive_input.open_mode)) +
         "\",\"archive_type\":\"" + json_escape(wide_to_utf8(result.archive_type)) +
@@ -1681,6 +1905,7 @@ private:
             remember(request.archive_input.archive_path);
             for (const auto &path : request.archive_input.part_paths) remember(path);
             for (const auto &range : request.archive_input.ranges) remember(range.path);
+            for (const auto &range : request.archive_input.volume_attempts.sources) remember(range.path);
         }
         bool inputs_unchanged() const {
             for (const auto &stamp : inputs) {

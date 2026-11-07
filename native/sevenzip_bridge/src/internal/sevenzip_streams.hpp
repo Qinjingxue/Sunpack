@@ -1,6 +1,7 @@
 #pragma once
 
 #include "sevenzip_paths.hpp"
+#include "extraction_replay.hpp"
 
 #ifdef SUP7Z_ENABLE_PIPELINE_TIMING
 #include "worker_pipeline_timing.hpp"
@@ -543,6 +544,8 @@ namespace sunpack::sevenzip
 
         HRESULT STDMETHODCALLTYPE Read(void *data, UInt32 size, UInt32 *processedSize) SUP7Z_NOEXCEPT override
         {
+            if (attempt_replay_) attempt_replay_->observe_volume_read(position_, size, &path_);
+
 
             if (processedSize)
             {
@@ -755,6 +758,7 @@ namespace sunpack::sevenzip
         }
 
     private:
+        ExtractionReplay* attempt_replay_ = current_extraction_replay;
 
         std::wstring path_;
 
@@ -848,6 +852,8 @@ namespace sunpack::sevenzip
 
         HRESULT STDMETHODCALLTYPE Read(void *data, UInt32 size, UInt32 *processedSize) SUP7Z_NOEXCEPT override
         {
+            if (attempt_replay_) attempt_replay_->observe_volume_read(position_, size, nullptr);
+
 
             if (processedSize)
             {
@@ -1126,6 +1132,7 @@ namespace sunpack::sevenzip
         }
 
     private:
+        ExtractionReplay* attempt_replay_ = current_extraction_replay;
         std::size_t find_part_index(UInt64 position) const
         {
 
@@ -1331,6 +1338,8 @@ namespace sunpack::sevenzip
 
         HRESULT STDMETHODCALLTYPE Read(void *data, UInt32 size, UInt32 *processedSize) SUP7Z_NOEXCEPT override
         {
+            if (attempt_replay_) attempt_replay_->observe_volume_read(position_, size, trace_ || ranges_.empty() ? nullptr : &ranges_.front().path);
+
 
             if (processedSize)
             {
@@ -1609,6 +1618,7 @@ namespace sunpack::sevenzip
         }
 
     private:
+        ExtractionReplay* attempt_replay_ = current_extraction_replay;
         std::size_t find_range_index(UInt64 position) const
         {
 

@@ -3,6 +3,9 @@ use super::*;
 /// No I/O and no Python conversions: validate the unique mapping against the
 /// head/tail/role facts that the collector already acquired.
 pub(super) fn validate(validation: &mut ProposalValidation) {
+    if validation.attempts.is_some() {
+        return;
+    }
     if validation.reason.is_some() {
         if validation.anchors.values().any(|a| !a.error.is_empty()) {
             validation.status = ProposalStatus::Reject;

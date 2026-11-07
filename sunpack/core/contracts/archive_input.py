@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import os
 from typing import Any, Literal
 
@@ -65,6 +65,60 @@ class ArchiveInputPart:
         return payload
 
 
+@dataclass(frozen=True, slots=True)
+class VolumeAttemptSlot:
+    number: int
+    canonical_name: str
+    choices: tuple[int, ...]
+
+    def to_dict(self) -> dict:
+        return {"number": self.number, "canonical_name": self.canonical_name, "choices": self.choices}
+
+
+@dataclass(frozen=True, slots=True)
+class VolumeAttemptPlan:
+    sources: tuple[InputExtent, ...]
+    layouts: tuple[tuple[VolumeAttemptSlot, ...], ...]
+    head_size_from_total: int | None = None
+    minimum_size: int | None = None
+
+    def __post_init__(self) -> None:
+        if not self.sources or not self.layouts:
+            raise ValueError("volume attempts require sources and layouts")
+        for layout in self.layouts:
+            if not layout or layout[0].number != 1:
+                raise ValueError("volume attempts require a structural head")
+            previous = 0
+            names = set()
+            for slot in layout:
+                if (slot.number <= previous or not slot.canonical_name
+                        or case_key(slot.canonical_name) in names or not slot.choices
+                        or any(i < 0 or i >= len(self.sources) for i in slot.choices)):
+                    raise ValueError("invalid volume attempt slot")
+                previous = slot.number
+                names.add(case_key(slot.canonical_name))
+
+    def to_dict(self) -> dict:
+        result = {"sources": [source.to_dict() for source in self.sources],
+                  "layouts": [{"slots": [slot.to_dict() for slot in layout]} for layout in self.layouts]}
+        if self.head_size_from_total is not None:
+            result["head_size_from_total"] = self.head_size_from_total
+        if self.minimum_size is not None:
+            result["minimum_size"] = self.minimum_size
+        return result
+
+    def remap(self, mapper) -> "VolumeAttemptPlan":
+        return VolumeAttemptPlan(tuple(InputExtent(mapper(s.path), s.start, s.end) for s in self.sources),
+                                 self.layouts, self.head_size_from_total, self.minimum_size)
+
+    @classmethod
+    def from_dict(cls, raw: dict) -> "VolumeAttemptPlan":
+        return cls(tuple(InputExtent(**source) for source in raw["sources"]),
+                   tuple(tuple(VolumeAttemptSlot(int(s["number"]), s["canonical_name"], tuple(s["choices"]))
+                               for s in layout["slots"]) for layout in raw["layouts"]),
+                   raw.get("head_size_from_total"), raw.get("minimum_size"))
+
+
 @dataclass(frozen=True)
 class ArchiveInputDescriptor:
     entry_path: str
@@ -76,6 +130,7 @@ class ArchiveInputDescriptor:
     parts: list[ArchiveInputPart] = field(default_factory=list)
     extents: list[InputExtent] = field(default_factory=list)
     analysis: dict[str, Any] = field(default_factory=dict)
+    volume_attempts: VolumeAttemptPlan | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "format_hint", str(self.format_hint or "").strip().lower().lstrip("."))
@@ -114,6 +169,8 @@ class ArchiveInputDescriptor:
             payload["logical_name"] = self.logical_name
         if self.volume_style:
             payload["volume_style"] = self.volume_style
+        if self.volume_attempts is not None:
+            payload["volume_attempts"] = self.volume_attempts.to_dict()
         if self.parts:
             payload["parts"] = [part.to_dict() for part in self.parts]
         if self.open_mode == "concat_ranges":
@@ -136,6 +193,7 @@ class ArchiveInputDescriptor:
             and self.logical_name == other.logical_name
             and self.volume_style == other.volume_style
             and self.parts == other.parts
+            and self.volume_attempts == other.volume_attempts
             and (self.open_mode != "concat_ranges" or self.extents == other.extents)
             and (self.analysis == other.analysis or (
                 {key: value for key, value in self.analysis.items() if key not in _SEGMENT_PROVENANCE}
@@ -144,11 +202,37 @@ class ArchiveInputDescriptor:
         )
 
     def part_paths(self) -> list[str]:
+        if self.volume_attempts is not None:
+            return list(dict.fromkeys(source.path for source in self.volume_attempts.sources))
         if self.open_mode == "concat_ranges" and self.extents:
             return list(dict.fromkeys(item.path for item in self.extents if item.path))
         if self.parts:
             return list(dict.fromkeys(part.path for part in self.parts if part.path))
         return [self.entry_path] if self.entry_path else []
+
+    def select_volumes(self, selection: dict) -> "ArchiveInputDescriptor":
+        plan = self.volume_attempts
+        if plan is None:
+            raise ValueError("volume selection requires an attempt plan")
+        layout = plan.layouts[int(selection["layout"])]
+        sources = tuple(int(i) for i in selection["sources"])
+        if len(sources) != len(layout) or len(set(sources)) != len(sources):
+            raise ValueError("volume selection must cover each slot once")
+        parts = []
+        for slot, source in zip(layout, sources):
+            if source not in slot.choices:
+                raise ValueError("worker selected an unplanned volume")
+            parts.append(ArchiveInputPart(plan.sources[source], "first" if slot.number == 1 else "member",
+                                          slot.number, slot.canonical_name))
+        if plan.head_size_from_total is not None:
+            # Execute the Rust extent formula, exactly as the worker did.
+            length = plan.head_size_from_total - sum(p.extent.end - p.extent.start for p in parts[1:])
+            head = parts[0].extent
+            if length <= 0 or head.end is None or head.start + length > head.end:
+                raise ValueError("invalid selected carrier extent")
+            parts[0] = replace(parts[0], extent=InputExtent(head.path, head.start, head.start + length))
+        return replace(self, parts=parts, volume_attempts=None,
+                       analysis={**self.analysis, "volume_completeness": "complete"})
 
     def with_path_mapping(self, mapper) -> "ArchiveInputDescriptor":
         parts = [
@@ -177,6 +261,7 @@ class ArchiveInputDescriptor:
             parts=parts,
             extents=extents,
             analysis=dict(self.analysis),
+            volume_attempts=self.volume_attempts.remap(mapper) if self.volume_attempts else None,
         )
 
     @property
@@ -234,6 +319,7 @@ class ArchiveInputDescriptor:
             parts=parts,
             extents=extents,
             analysis=analysis,
+            volume_attempts=VolumeAttemptPlan.from_dict(raw["volume_attempts"]) if raw.get("volume_attempts") else None,
         )
 
     @classmethod

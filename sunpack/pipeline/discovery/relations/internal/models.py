@@ -51,6 +51,7 @@ class CandidateGroup:
     carrier_path: str = ""
     carrier_size: int | None = None
     format_reject_mask: int = 0
+    volume_attempts: dict | None = None
 
     @property
     def kind(self) -> str:

@@ -30,6 +30,7 @@ def _archive_input_scope(descriptor: ArchiveInputDescriptor | None) -> str:
         tuple((part.path, part.extent.start, part.extent.end, part.volume_number, part.canonical_name)
               for part in descriptor.parts),
         tuple((extent.path, extent.start, extent.end) for extent in descriptor.extents),
+        descriptor.volume_attempts.to_dict() if descriptor.volume_attempts else None,
     ), ensure_ascii=False, separators=(",", ":"))
 
 

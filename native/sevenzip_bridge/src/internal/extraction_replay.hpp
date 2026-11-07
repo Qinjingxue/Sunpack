@@ -5,9 +5,11 @@
 #include <map>
 #include <filesystem>
 #include <unordered_map>
+#include <unordered_set>
 #include <string>
 #include <utility>
 #include <vector>
+#include "volume_attempts.hpp"
 
 namespace sunpack::sevenzip {
 // Successful IOCP completions can have holes. Coalescing intervals normally
@@ -57,6 +59,25 @@ struct ReplayFile {
     std::uint64_t mtime = 0;
 };
 struct ExtractionReplay {
+    VolumeAttemptCursor volumes;
+    bool volume_attempt_active = false;
+    // Request-owned read receipts distinguish fixed-input damage from a
+    // composition failure; decoder threads only update the atomic flag.
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> uncertain_ranges;
+    std::unordered_set<std::wstring> uncertain_paths;
+    std::atomic<bool> uncertain_read{false};
+    void observe_volume_read(std::uint64_t offset, std::uint32_t size, const std::wstring* physical = nullptr) {
+        if (!volume_attempt_active || !size || uncertain_read.load(std::memory_order_relaxed)) return;
+        bool intersects = false;
+        if (physical) intersects = uncertain_paths.find(*physical) != uncertain_paths.end();
+        else {
+            const auto range = std::upper_bound(uncertain_ranges.begin(), uncertain_ranges.end(), offset,
+                [](auto value, const auto& range) { return value < range.second; });
+            intersects = range != uncertain_ranges.end() &&
+                (range->first <= offset || range->first - offset < size);
+        }
+        if (intersects) uncertain_read.store(true, std::memory_order_relaxed);
+    }
     // Only output identity and confirmed byte intervals survive an attempt.
     // No archive handler, dictionary, output buffer or CPU credit is retained.
     std::map<std::uint32_t, ReplayFile> files;

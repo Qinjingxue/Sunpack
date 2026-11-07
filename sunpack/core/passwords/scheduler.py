@@ -335,6 +335,12 @@ class PasswordScheduler:
                         inconclusive.extend(batch[tested_count:])
                     continue
                 if verification.status in {"damaged", "needs_volume_or_tail_damaged", "missing_volume"}:
+                    if job.archive_input is not None and job.archive_input.volume_attempts is not None:
+                        # A probe of the fixed head cannot reject compositions
+                        # that have not executed. Keep the Rust password proofs
+                        # above, and hand only inconclusive passwords to fallback.
+                        inconclusive.extend(batch)
+                        continue
                     result = PasswordSearchResult(
                         password=None,
                         status=_archive_failure_status(verification.status, job),

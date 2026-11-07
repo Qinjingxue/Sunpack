@@ -85,6 +85,10 @@ sunpack.runtime.watch
 
 普通文件、分卷组和载体段共用逻辑输入生命周期。Rust 首次分析确定映射，密码或成员变化时细化事实；执行、校验、递归扫描直接传递类型化输入和逐输入结果，不从诊断字典重建输入。`InputRecovery` 为每个输入保存依赖源的代次、输出位置、完成状态和失败；缺卷与缺密码可同时存在。CLI 和 Watch 使用同一个选择器，只重试依赖变化的输入或密码等待者，保留已完成的兄弟输入。持久化检查点不含密码、读取句柄或文件清单，共享载体在整组完成后按用户可见文件清理。
 
+不确定分卷属于 `ArchiveInputDescriptor.volume_attempts`：共享源区间表加按优先级排列的卷号候选域。Python 只传递、持久化计划，并在 worker 成功后提交返回的源索引；逻辑输入 ID 保持不变，清理引用缩减到实际选中的源。计划不包含尝试游标，也不展开组合。
+
+ZIP 组合尚未确定时不执行可选的全归档文件名编码猜测，以免另一组的目录影响当前输入；worker 仍处理 UTF-8 标记、Unicode 扩展字段和后端默认编码。
+
 ### pipeline.discovery.filesystem
 
 `sunpack.pipeline.discovery.filesystem` 负责显式目录遍历、过滤和 `DirectorySnapshot` 构建，不管理长期运行的 Watch 服务。`sunpack.runtime.watch` 负责 OS 通知、NTFS/USN 观察和文件 ready 状态；它判断物理文件何时稳定到可以进入 pipeline。压缩包过滤与解释仍属于 pipeline discovery。
@@ -92,6 +96,10 @@ sunpack.runtime.watch
 ### pipeline.discovery.relations
 
 `sunpack.pipeline.discovery.relations` 负责文件关系：严格分卷主文件、成员、SFX companion、结构证据仲裁和逻辑名。初始发现不得用宽松文件名直接建组；确认缺卷后只允许执行一次由结构锚点约束的重找。外部模块只能调用 `RelationsScheduler`，不得直接依赖 `sunpack.pipeline.discovery.relations.internal`。
+
+Rust relation 层复用已采集的结构事实、规范命名通道、位置数字通道和宽松数字域。结构卷号与首尾角色是硬约束；冲突保留为候选，同一载体中的不同切片也以区间参与。连续且覆盖更多卷的布局优先，同等覆盖保留命名证据优先级，域内优先同目录，宽松数字再按位数和路径稳定排序。只补有有限证据边界的缺口，不按最大文件名数字分配稠密数组，也不生成候选笛卡尔积。
+
+worker 按计划惰性枚举不重复使用源的组合，复用现有解压、密码确认、输出清理和内存回放设施。组合切换前销毁解码对象并清理本次输出；内存撤回保留当前组合游标，取消仍走原链路。只有缺卷，或确实涉及可变源/区间的结构、校验、数据错误才推进组合。已知长度不足在打开前排除；固定头损坏、未证实密码、输入/输出错误、资源问题和不支持的方法立即交回原决策链。全部可行组合失败才输出 `volume_attempts_exhausted` 缺卷事实。中间失败和清单不发布给 Python，成功只返回最终组合索引和原有解压结果。存储随源、候选域和当前卷数增长，不随已尝试组合数增长；不设置尝试次数上限。
 
 允许公开的关系能力包括：
 

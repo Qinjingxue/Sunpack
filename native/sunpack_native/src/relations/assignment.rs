@@ -33,17 +33,17 @@ pub(super) struct VolumeAssignment {
     pub unresolved: Vec<usize>,
 }
 
-struct BucketView<'a> {
-    rows: &'a [RelationInput],
-    indexes: Vec<usize>,
-    facts: &'a HashMap<usize, StructuralFacts>,
-    features: &'a HashMap<usize, NameFeatures>,
-    format: &'a str,
-    loose_numeric_allowed: bool,
+pub(super) struct BucketView<'a> {
+    pub(super) rows: &'a [RelationInput],
+    pub(super) indexes: Vec<usize>,
+    pub(super) facts: &'a HashMap<usize, StructuralFacts>,
+    pub(super) features: &'a HashMap<usize, NameFeatures>,
+    pub(super) format: &'a str,
+    pub(super) loose_numeric_allowed: bool,
 }
 
 impl BucketView<'_> {
-    fn legal(&self, i: usize, n: u32, terminal: Option<u32>) -> bool {
+    pub(super) fn legal(&self, i: usize, n: u32, terminal: Option<u32>) -> bool {
         let f = &self.facts[&i];
         n > 0
             && (f.has_previous != Some(true) || n > 1)
@@ -89,7 +89,7 @@ impl BucketView<'_> {
             ) == ProposalStatus::Valid
     }
 
-    fn spanned(&self) -> bool {
+    pub(super) fn spanned(&self) -> bool {
         self.format == "zip"
             && self.indexes.iter().any(|i| {
                 self.rows[*i].anchor.as_ref().is_some_and(|a| {
@@ -349,36 +349,23 @@ impl BucketView<'_> {
             });
         }
         let mut out = fixed.clone();
-        numeric::solve(&mut out, domains)?;
+        if numeric::solve(&mut out, domains)? {
+            return Err(RelationFailureReason::AmbiguousVolumeMapping);
+        }
         self.finish_mapping(out)
             .ok_or(RelationFailureReason::StructuralConflict)
     }
 
-    fn solve(&self) -> (VolumeAssignment, Option<RelationFailureReason>) {
-        let mut fixed = match self.fixed() {
-            Ok(fixed) => fixed,
-            Err(reason) => {
-                // Preserve each physical member without inventing a slot for
-                // conflicts. These paths become blocked relation candidates.
-                return (
-                    VolumeAssignment {
-                        unresolved: self.indexes.clone(),
-                        ..Default::default()
-                    },
-                    Some(reason),
-                );
-            }
-        };
-        if fixed.unresolved.is_empty() {
-            return (fixed, None);
-        }
-        let structural = fixed.clone();
-        let profile = NameProfile::new(self.indexes.iter().filter_map(|i| self.features.get(i)));
+    pub(super) fn channels(
+        &self,
+        structural: &VolumeAssignment,
+        profile: &NameProfile<'_>,
+    ) -> (Vec<NumberChannel>, Vec<NumberChannel>) {
         let numbering_style = self
             .indexes
             .iter()
             .find_map(|i| self.facts[i].numbering_style);
-        let mut canonical: HashSet<_> = self
+        let mut canonical: std::collections::BTreeSet<_> = self
             .indexes
             .iter()
             .flat_map(|i| self.features.get(i))
@@ -430,16 +417,43 @@ impl BucketView<'_> {
                 if !structural.slots.contains_key(&1) {
                     return None;
                 }
-                fixed.unresolved.iter().find_map(|i| {
+                structural.unresolved.iter().find_map(|i| {
                     self.features
                         .get(i)
                         .filter(|f| f.numbers.iter().any(|n| n.value > 0 && profile.active(n)))
                 })
             });
-        let tokens: HashSet<_> = seed
+        let tokens: std::collections::BTreeSet<_> = seed
             .into_iter()
             .flat_map(|f| NumberChannel::tokens(f).filter(|c| profile.number(c, f).is_some()))
             .collect();
+        (
+            canonical.into_iter().collect(),
+            tokens.into_iter().collect(),
+        )
+    }
+
+    fn solve(&self) -> (VolumeAssignment, Option<RelationFailureReason>) {
+        let mut fixed = match self.fixed() {
+            Ok(fixed) => fixed,
+            Err(reason) => {
+                // Preserve each physical member without inventing a slot for
+                // conflicts. The attempt planner retains the competing slot domains.
+                return (
+                    VolumeAssignment {
+                        unresolved: self.indexes.clone(),
+                        ..Default::default()
+                    },
+                    Some(reason),
+                );
+            }
+        };
+        if fixed.unresolved.is_empty() {
+            return (fixed, None);
+        }
+        let structural = fixed.clone();
+        let profile = NameProfile::new(self.indexes.iter().filter_map(|i| self.features.get(i)));
+        let (canonical, tokens) = self.channels(&structural, &profile);
         for (channels, generic) in [(&canonical, false), (&tokens, true)] {
             let mut mapping: Option<VolumeAssignment> = None;
             let mut complete = false;
@@ -619,7 +633,7 @@ pub(super) fn resolve_buckets(
             let need_names = heads > 1
                 || structural_only
                     .fixed()
-                    .map_or(false, |a| !a.unresolved.is_empty());
+                    .map_or(true, |a| !a.unresolved.is_empty());
             if need_names {
                 for &i in &members {
                     features.entry(i).or_insert_with(|| {
@@ -810,6 +824,13 @@ pub(super) fn resolve_buckets(
                 } else {
                     family.clone()
                 };
+                if reason.is_some() {
+                    let candidates = attempts::build(&view, &logical);
+                    if !candidates.is_empty() {
+                        output.extend(candidates);
+                        continue;
+                    }
+                }
                 if reason.is_none() {
                     if let Some(matching) = launchers.get(&case_key(&logical)) {
                         let matching: Vec<_> = matching
@@ -839,7 +860,7 @@ pub(super) fn resolve_buckets(
     output
 }
 
-fn materialize(
+pub(super) fn materialize(
     view: &BucketView<'_>,
     assignment: VolumeAssignment,
     logical: &str,
@@ -918,6 +939,7 @@ fn materialize(
         })
         .collect();
     Some(ProposalValidation {
+        attempts: None,
         status: ProposalStatus::Inconclusive,
         proposal: RelationProposal {
             format: view.format.into(),
@@ -1005,6 +1027,27 @@ mod tests {
     }
 
     #[test]
+    fn competing_terminal_numbers_retain_each_structurally_legal_length() {
+        // Equal terminal numbers cannot detect silently clipping a longer
+        // archive to another archive's terminal. Keep both lengths, never
+        // place a terminal in an intermediate slot.
+        let rows = vec![
+            row("same.header", "rar", Some(1), false),
+            row("same.short", "rar", Some(2), true),
+            row("same.middle", "rar", Some(2), false),
+            row("same.long", "rar", Some(3), true),
+        ];
+        let groups = resolve(&rows);
+        let plan = groups[0].attempts.as_ref().unwrap();
+        assert_eq!(
+            plan.layouts.iter().map(Vec::len).collect::<Vec<_>>(),
+            vec![3, 2]
+        );
+        assert_eq!(plan.sources[plan.layouts[0][1].1[0]].path, "same.middle");
+        assert_eq!(plan.sources[plan.layouts[1][1].1[0]].path, "same.short");
+    }
+
+    #[test]
     fn repeated_seed_numbers_are_global_channels_not_a_seed_failure() {
         let rows = vec![
             row("same.build1.chunk1.bin", "7z", Some(1), false),
@@ -1049,10 +1092,10 @@ mod tests {
             row("same.build3.chunk2", "", None, false),
         ];
         let groups = resolve(&rows);
-        assert_eq!(
-            groups[0].reason,
-            Some(RelationFailureReason::AmbiguousVolumeMapping)
-        );
+        assert!(groups[0]
+            .attempts
+            .as_ref()
+            .is_some_and(|plan| !plan.layouts.is_empty()));
         assert_eq!(slots(&groups[0]), vec![1]);
     }
 
@@ -1119,7 +1162,7 @@ mod tests {
     }
 
     #[test]
-    fn loose_width_arbitration_is_unique_or_ambiguous() {
+    fn loose_width_arbitration_orders_candidates_without_discarding_them() {
         for tie in [false, true] {
             let rows = vec![
                 row("same.header1", "7z", Some(1), false),
@@ -1128,17 +1171,10 @@ mod tests {
                 row("same.c0002", "", None, false),
             ];
             let groups = resolve(&rows);
-            if tie {
-                assert_eq!(
-                    groups[0].reason,
-                    Some(RelationFailureReason::AmbiguousVolumeMapping)
-                );
-                assert_eq!(slots(&groups[0]), vec![1]);
-            } else {
-                assert_eq!(groups[0].reason, None);
-                assert_eq!(slots(&groups[0]), vec![1, 2]);
-                assert_eq!(groups[0].proposal.volumes[1].0, rows[1].path);
-            }
+            let plan = groups[0].attempts.as_ref().unwrap();
+            let (_, choices) = &plan.layouts.last().unwrap()[1];
+            assert_eq!(choices.len(), 3);
+            assert_eq!(plan.sources[choices[0]].path, rows[1].path);
         }
     }
 
@@ -1166,10 +1202,10 @@ mod tests {
             row("same.zip.003", "", None, false),
         ];
         let groups = resolve(&rows);
-        assert_eq!(
-            groups[0].reason,
-            Some(RelationFailureReason::AmbiguousVolumeMapping)
-        );
+        assert!(groups[0]
+            .attempts
+            .as_ref()
+            .is_some_and(|plan| !plan.layouts.is_empty()));
         assert_eq!(slots(&groups[0]), vec![1]);
     }
 
@@ -1208,12 +1244,15 @@ mod tests {
             row("same.build4.chunk0003", "", None, false),
         ];
         let groups = resolve(&rows);
-        assert_eq!(
-            groups[0].reason,
-            Some(RelationFailureReason::AmbiguousVolumeMapping)
-        );
-        assert_eq!(slots(&groups[0]), vec![1, 2]);
-        assert_eq!(groups[0].proposal.volumes[1].0, rows[1].path);
+        let plan = groups[0].attempts.as_ref().unwrap();
+        assert_eq!(plan.layouts[0].len(), 4);
+        for layout in &plan.layouts {
+            if let Some((_, choices)) = layout.iter().find(|(n, _)| *n == 2) {
+                assert!(choices
+                    .iter()
+                    .all(|i| plan.sources[*i].path == rows[1].path));
+            }
+        }
     }
 
     #[test]
@@ -1241,7 +1280,7 @@ mod tests {
         ];
         rows[4].anchor.as_mut().unwrap().evidence.clear();
         let groups = resolve(&rows);
-        assert_eq!(groups[0].reason, Some(RelationFailureReason::MissingVolume));
+        assert!(groups[0].attempts.is_some());
         assert!(validation_owned_paths(&groups[0]).contains(&rows[4].path));
     }
 
@@ -1369,10 +1408,8 @@ mod tests {
                     .iter()
                     .all(|g| g.reason.is_none() && slots(g) == vec![1, 2]));
             } else {
-                assert_eq!(
-                    groups[0].reason,
-                    Some(RelationFailureReason::AmbiguousVolumeMapping)
-                );
+                assert_eq!(groups.len(), 2);
+                assert!(groups.iter().all(|group| group.attempts.is_some()));
             }
         }
     }
@@ -1409,12 +1446,9 @@ mod tests {
             row("same.unassigned", "7z", None, false),
         ];
         let groups = resolve(&rows);
-        assert_eq!(groups.len(), 1);
-        assert_eq!(
-            groups[0].reason,
-            Some(RelationFailureReason::AmbiguousVolumeMapping)
-        );
-        assert!(validation_owned_paths(&groups[0]).contains("same.unassigned"));
+        assert_eq!(groups.len(), 2);
+        assert!(groups.iter().all(|group| group.attempts.is_some()
+            && validation_owned_paths(group).contains("same.unassigned")));
     }
 
     #[test]

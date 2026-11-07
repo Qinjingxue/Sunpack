@@ -78,6 +78,10 @@ class ArchiveMetadataScanner:
 
     def _scan_descriptor(self, descriptor: ArchiveInputDescriptor) -> ArchiveMetadataScanResult:
         archive_type = descriptor.format_hint
+        if descriptor.volume_attempts is not None:
+            # A speculative directory cannot supply an archive-wide encoding
+            # override. The worker still honors UTF-8 and Unicode extra fields.
+            return ArchiveMetadataScanResult(archive_path=descriptor.entry_path, archive_type=archive_type)
         if archive_type == "zip":
             return self._scan_zip(descriptor)
         if archive_type in {"7z", "rar"}:

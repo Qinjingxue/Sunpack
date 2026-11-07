@@ -5,6 +5,9 @@ from sunpack.core.contracts.archive_input import (
     ArchiveInputDescriptor,
     ArchiveInputPart,
     InputExtent,
+    VolumeAttemptPlan,
+    VolumeAttemptSlot,
+    canonical_volume_name,
 )
 from sunpack.pipeline.discovery.relations.internal.models import CandidateGroup
 
@@ -21,6 +24,21 @@ def archive_input_for_group(group: CandidateGroup) -> ArchiveInputDescriptor | N
             format_hint=format_hint,
             logical_name=group.logical_name,
         )
+        if group.volume_attempts:
+            raw = group.volume_attempts
+            width = group.split_volumes[0].width
+            plan = VolumeAttemptPlan(
+                tuple(InputExtent(**source) for source in raw["sources"]),
+                tuple(tuple(VolumeAttemptSlot(
+                    int(slot["number"]), canonical_volume_name(
+                        prefix=group.logical_name, number=int(slot["number"]),
+                        style=descriptor.volume_style, width=width, role=slot["role"]),
+                    tuple(slot["choices"]),
+                ) for slot in layout) for layout in raw["layouts"]),
+                raw.get("head_size_from_total"),
+                raw.get("minimum_size"),
+            )
+            return replace(descriptor, volume_attempts=plan, analysis={"volume_completeness": "unknown"})
         analysis = {"volume_completeness": "missing" if metadata.get("volume_set_incomplete") else (
             "unknown" if metadata.get("needs_password") else "complete")}
         if isinstance(zip_eocd, int):

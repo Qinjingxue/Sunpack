@@ -1359,6 +1359,9 @@ namespace sunpack::sevenzip
                     return writer_error;
                 }
             }
+            // A composition trial is transactional. Preserve the first receipt
+            // and unwind immediately instead of decoding unrelated later items.
+            if (opRes != kOpOk && replay_ && replay_->volume_attempt_active) return E_ABORT;
             return S_OK;
         }
 

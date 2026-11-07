@@ -929,6 +929,7 @@ class SevenZipRunner:
                     out_dir=kwargs["out_dir"],
                     password=kwargs.get("password"),
                     password_candidates=kwargs.get("password_candidates"),
+                    password_verified=bool(kwargs.get("password_verified")),
                     selected_codepage=kwargs.get("selected_codepage"),
                     task=kwargs["task"],
                     phase_timer=kwargs.get("phase_timer"),
@@ -1335,6 +1336,7 @@ class SevenZipRunner:
         task: ArchiveTask,
         phase_timer: Any | None = None,
         phase_prefix: str = "sevenzip_build_job",
+        password_verified: bool = False,
     ) -> dict:
         attempt_id = f"{str(getattr(task, 'key', '') or archive_path)}:{time.monotonic_ns()}"
         # The routing key and the request must use the same absolute path.  A failed
@@ -1354,6 +1356,7 @@ class SevenZipRunner:
             "output_dir": out_dir,
             "output_volume_key": volume_key,
             "password": password or "",
+            "password_verified": password_verified,
         }
         candidates = tuple(dict.fromkeys(str(item) for item in (password_candidates or ()) if item is not None))
         if candidates:

@@ -331,10 +331,12 @@ def test_competing_heads_keep_direct_schemes_and_partition_declared_formats(tmp_
             [str(paths[0])], all_paths, format_hint=archive_format,
         )
         if formats[0] == formats[1] and name_style != "standard":
-            assert group is None
-            continue
+            assert group is not None and group.volume_attempts
+            assert str(paths[0]) == group.entry_path
+            assert not group.head_metadata.get("relation_failure_reason")
         assert group is not None
-        assert set(group.input_paths) == {str(path) for path in paths}
+        if not group.volume_attempts:
+            assert set(group.input_paths) == {str(path) for path in paths}
         if name_style == "standard":
             assert label in group.logical_name
         assert "\0" not in group.logical_name
@@ -465,29 +467,42 @@ def test_multiple_matching_seed_numbers_resolve_the_unique_global_channel(tmp_pa
     assert group.head_metadata.get("volume_set_incomplete") is not True
 
 
-def test_distinct_global_mappings_remain_blocked_and_cannot_be_resolved(tmp_path):
+@pytest.mark.parametrize("archive_format", ["7z", "zip"])
+def test_distinct_global_mappings_are_tried_inside_worker(tmp_path, archive_format):
     case = ArchiveFixtureFactory().create(
-        tmp_path, "two_channels", "7z", split=True,
+        tmp_path, "two_channels", archive_format, split=True,
         payload_size=MIB, split_volume_size=MIB // 4,
     )
     paths = []
     for number, source in enumerate(sorted(case.archive_dir.iterdir()), start=1):
         alternative = {2: 3, 3: 2}.get(number, number)
-        target = case.archive_dir / f"shared.build{number}.chunk{alternative}.opaque"
+        target = case.archive_dir / f"shared.build{alternative}.chunk{number}.opaque"
         source.rename(target)
         paths.append(str(target))
     assert len(paths) >= 3
     scheduler = RelationsScheduler()
     groups = scheduler.build_candidate_groups(DirectoryScanner(str(case.archive_dir), config=make_config()).scan())
     group = next(group for group in groups if group.head_path == paths[0])
-    assert group.head_metadata["relation_failure_reason"] == "ambiguous_volume_mapping"
-    assert group.head_metadata["volume_set_incomplete"] is True
-    assert group.head_metadata["relation_confirmed"] is False
+    assert group.volume_attempts
+    assert not group.head_metadata.get("relation_failure_reason")
+    assert group.head_metadata["relation_confirmed"] is True
     result = ArchiveTaskProvider(make_config()).discover_targets([str(case.archive_dir)])
     assert len(result.tasks) == 1
-    assert result.tasks[0].discovery_failure.kind.value == "missing_volume"
-    assert result.blocked_paths
-    assert scheduler.resolve_volume_once([paths[0]], paths, format_hint="7z") is None
+    task = result.tasks[0]
+    assert task.discovery_failure is None
+    assert not result.blocked_paths
+    assert scheduler.resolve_volume_once([paths[0]], paths, format_hint=archive_format).volume_attempts
+    output = tmp_path / "attempt_output"
+    extractor = ExtractionScheduler()
+    try:
+        extracted = extractor.extract(task, str(output))
+    finally:
+        extractor.close()
+    assert extracted.success, extracted.error
+    assert next(output.rglob(case.marker_name)).read_text(encoding="utf-8") == case.marker_text
+    assert task.archive_input().volume_attempts is None
+    assert task.archive_input().part_paths() == paths
+    assert not any("(1)" in p.name for p in output.rglob("*"))
 
 
 @pytest.mark.parametrize("archive_format", ["7z", "zip"])
@@ -792,10 +807,10 @@ def test_structure_resolution_recomputes_a_residual_middle_gap(tmp_path):
     assert group.input_paths == [str(path) for path in renamed]
 
 
-def test_structure_resolution_rejects_ambiguous_cross_directory_heads(
+def test_structure_resolution_keeps_each_cross_directory_head_as_an_attempt_plan(
     mixed_real_volumes, tmp_path
 ):
-    """Duplicate heads in one scope must never be paired by physical proximity."""
+    """Each proven head retains identity while uncertain siblings are shared."""
     _fixture_root, _common, _cases, paths_by_format = mixed_real_volumes
     scan_root = tmp_path / "directory_scope"
     first_directory = scan_root / "first"
@@ -824,7 +839,8 @@ def test_structure_resolution_rejects_ambiguous_cross_directory_heads(
         all_paths,
         format_hint="7z",
     )
-    assert direct_group is None
+    assert direct_group is not None and direct_group.volume_attempts
+    assert direct_group.entry_path == str(first_parts[0])
 
     entries = [
         FileEntry(path=path, is_dir=False, size=path.stat().st_size, mtime_ns=path.stat().st_mtime_ns)
@@ -836,10 +852,9 @@ def test_structure_resolution_rejects_ambiguous_cross_directory_heads(
     ambiguous = [group for group in groups
                  if str(foreign_first) in group.input_paths]
     assert len(ambiguous) == 1
-    assert ambiguous[0].head_metadata["relation_failure_reason"] == "ambiguous_volume_mapping"
-    assert ambiguous[0].head_metadata["relation_confirmed"] is False
-    assert not ambiguous[0].split_volumes
-    assert all(not (group.head_metadata or {}).get("relation_confirmed") for group in groups)
+    assert ambiguous[0].volume_attempts
+    assert all(group.head_metadata["relation_confirmed"] for group in groups)
+    assert all(not group.head_metadata.get("relation_failure_reason") for group in groups)
 
 
 def test_structure_resolution_rejects_current_paths_from_different_directories(

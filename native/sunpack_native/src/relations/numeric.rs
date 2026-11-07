@@ -171,11 +171,12 @@ impl NumericSolver {
         }
     }
 
-    fn run(mut self, assignment: &mut VolumeAssignment) -> Result<(), RelationFailureReason> {
+    fn run(mut self, assignment: &mut VolumeAssignment) -> Result<bool, RelationFailureReason> {
         if self.missing {
             return Err(RelationFailureReason::MissingVolume);
         }
         let mut cursor = 0;
+        let mut alternatives = false;
         loop {
             self.propagate(assignment);
             if self.missing {
@@ -206,10 +207,11 @@ impl NumericSolver {
             if tied {
                 return Err(RelationFailureReason::AmbiguousVolumeMapping);
             }
+            alternatives |= self.slots[slot].degree > 1;
             self.claim(best.expect("active numeric slot has an edge"), assignment);
         }
         assignment.unresolved.clear();
-        Ok(())
+        Ok(alternatives)
     }
 }
 
@@ -220,7 +222,7 @@ impl NumericSolver {
 pub(super) fn solve(
     assignment: &mut VolumeAssignment,
     domains: Vec<NumericDomain>,
-) -> Result<(), RelationFailureReason> {
+) -> Result<bool, RelationFailureReason> {
     NumericSolver::new(domains).run(assignment)
 }
 
