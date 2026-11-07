@@ -167,9 +167,9 @@ def test_native_discovery_does_not_project_negative_embedded_candidates(tmp_path
     routes = table.resolve()
     assert routes.relation_events == []
     assert routes.detection_events == []
-    batch = table.scan_embedded(routes)
+    batch = table.prepare_embedded(routes)
     assert len(batch) == 32
-    assert batch.scan_page(table, 0, 32) == []
+    assert type(batch).scan_pages([(table, batch)], 0, 32) == []
 
     from sunpack.pipeline.coordinator.task_provider import ArchiveTaskProvider
     result = ArchiveTaskProvider(make_config({})).discover_targets([str(tmp_path)])
@@ -220,11 +220,11 @@ def test_native_discovery_distinguishes_departures_from_read_errors(tmp_path, ph
         if source_state == "recreated":
             path.write_bytes(b"a different physical generation")
         # Detection failures must survive even an explicitly disabled fallback.
-        batch = table.scan_embedded(routes, enabled=phase == "embedded")
-        rows = batch.scan_page(table, 0, 1)
+        batch = table.prepare_embedded(routes, enabled=phase == "embedded")
+        rows = [row for _, page in type(batch).scan_pages([(table, batch)], 0, 1) for row in page]
         provider = ArchiveTaskProvider(make_config({}))
         session = DiscoveryScanSession(config=provider.config)
-        result = provider.discovery.embedded.discover_native(table, routes, session)
+        result = provider.discovery.embedded.discover_many_native([(table, batch)], session)[0]
         provider._record_discovery_failures(result)
         if source_state == "departed":
             assert rows == []

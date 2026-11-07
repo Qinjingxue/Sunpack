@@ -125,11 +125,11 @@ def test_native_embedded_reuses_confirmed_residual_without_reopening_pe(tmp_path
     path = tmp_path / "image.jpg"
     path.write_bytes(make_minimal_pe(pe_offset=pe_offset))
     table = build_native_table_for_targets([str(path)], config=_config())
-    batch = table.scan_embedded(table.resolve())
+    batch = table.prepare_embedded(table.resolve())
     path.unlink()
     # If Candidate refinement were lost, Embedded would attempt PE I/O and
     # report an I/O error. Confirmed facts must survive in the native residual.
-    assert batch.scan_page(table) == []
+    assert type(batch).scan_pages([(table, batch)]) == []
 
 
 @pytest.mark.parametrize("pe_offset", [0x80, 0x800])

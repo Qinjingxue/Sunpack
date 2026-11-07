@@ -1,5 +1,8 @@
 import io
 import zipfile
+import gzip
+
+import pytest
 
 from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
 from sunpack.core.contracts.discovery import DiscoveryCandidate
@@ -80,3 +83,36 @@ def test_recursive_embedded_ratio_uses_individual_candidate_share(tmp_path):
     assert select_single_candidate_ratio(candidates, 0.3) == [candidates[0]]
     assert select_single_candidate_ratio(candidates, 0.05) == candidates
     assert select_single_candidate_ratio(candidates, 0) == []
+
+
+@pytest.mark.parametrize("force", [False, True])
+def test_shared_recursive_scan_keeps_root_policy_and_candidate_page_identity(tmp_path, force):
+    """Multi-root scheduling must preserve local selection and row ownership.
+
+    Single-root cases cannot catch a combined size denominator or a batch-local
+    row applied to a different table. One sparse root crosses the old raw page
+    boundary, and force mode crosses the selected-job page boundary as well.
+    """
+    from sunpack.pipeline.discovery.embedded.options import EmbeddedOptions
+
+    roots = [tmp_path / name for name in ("large", "sparse", "small")]
+    for root in roots:
+        root.mkdir()
+        (root / "zz_carrier.bin").write_bytes(b"prefix" * 64 + gzip.compress(b"payload") + b"suffix")
+    (roots[0] / "noise.bin").write_bytes(b"x" * 10000)
+    for index in range(260):
+        (roots[1] / f"noise_{index:03}.bin").write_bytes(b"x")
+    config = make_config({"embedded_scan": {"enabled": True, "recursive_candidate_ratio": 0.3}})
+    provider = ArchiveTaskProvider(config, EmbeddedOptions(force_scan=force))
+    serial = [task for root in roots for task in provider.discover_targets(
+        [str(root)], is_recursive_scan=True,
+    ).tasks]
+    shared = provider.discover_targets([str(root) for root in roots], is_recursive_scan=True)
+
+    expected = [str(root / "zz_carrier.bin") for root in (roots if force else roots[1:])]
+    assert [task.main_path for task in serial] == expected
+    assert [task.main_path for task in shared.tasks] == expected
+    assert [task.archive_input().to_dict() for task in shared.tasks] == [
+        task.archive_input().to_dict() for task in serial
+    ]
+    assert not shared.blocked_paths

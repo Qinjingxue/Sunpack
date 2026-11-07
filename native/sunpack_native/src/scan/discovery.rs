@@ -20,6 +20,7 @@ use rayon::prelude::*;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 enum Candidate {
@@ -215,11 +216,11 @@ enum EmbeddedOutcome {
 }
 
 #[pyclass(module = "sunpack_native")]
+#[derive(Default)]
 pub(crate) struct NativeEmbeddedBatch {
+    relation_cache: RelationCache,
     scans: HashMap<usize, Result<Arc<NativeScanResult>, Arc<io::Error>>>,
     ids: Vec<usize>,
-    selected: HashSet<usize>,
-    select_all: bool,
     force_scan: bool,
     pending_volumes: Vec<PendingEmbeddedVolume>,
     excluded: HashSet<String>,
@@ -229,6 +230,118 @@ struct PendingEmbeddedVolume {
     index: usize,
     anchor: crate::analysis_native::volume_anchor::VolumeAnchor,
     scan: Option<Arc<NativeScanResult>>,
+}
+
+impl NativeEmbeddedBatch {
+    fn project_outcomes(
+        &mut self,
+        py: Python<'_>,
+        table: &NativeCandidateTable,
+        outcomes: impl Iterator<Item = (usize, EmbeddedOutcome)>,
+    ) -> PyResult<Vec<(usize, u8, &'static str, Option<Py<PyDict>>)>> {
+        outcomes
+            .into_iter()
+            .map(|(index, outcome)| match outcome {
+                EmbeddedOutcome::Residual => {
+                    unreachable!("residuals are filtered before projection")
+                }
+                EmbeddedOutcome::Failed(error) => {
+                    let detail = PyDict::new(py);
+                    detail.set_item("error", error.to_string())?;
+                    Ok((index, 2, "embedded_scan_io_error", Some(detail.unbind())))
+                }
+                EmbeddedOutcome::Scan(scan) => {
+                    let anchors = scan.relation_anchors();
+                    if !anchors.is_empty() {
+                        let independent = scan.has_independent_archive();
+                        for mut anchor in anchors {
+                            anchor.path = table.summary(index)?.0;
+                            let retain_scan = anchor.needs_password || independent;
+                            self.pending_volumes.push(PendingEmbeddedVolume {
+                                index,
+                                anchor,
+                                scan: retain_scan.then(|| Arc::clone(&scan)),
+                            });
+                        }
+                        Ok((index, 3, "embedded_volume_candidate", None))
+                    } else {
+                        // A complete peer archive keeps its original ownership.
+                        self.excluded.extend(table.path_keys(index)?);
+                        Ok((index, 1, "", Some(scan.to_py_dict(py)?)))
+                    }
+                }
+            })
+            .collect()
+    }
+}
+
+fn scan_embedded_jobs(
+    py: Python<'_>,
+    groups: &[(&NativeCandidateTable, &NativeEmbeddedBatch)],
+    jobs: &[(usize, usize)],
+) -> PyResult<Vec<(usize, usize, EmbeddedOutcome)>> {
+    let cancellation = crate::io::cancellation::Cancellation::current();
+    cancellation.check()?;
+    let outcomes = py.detach(|| {
+        // File producers also own per-file validation state. Matching jobs
+        // continue to share the existing eight-thread IOCP scan pool.
+        let parallel_jobs = jobs.len().min(rayon::current_num_threads()).clamp(1, 2);
+        let parallel_files = jobs
+            .iter()
+            .filter(|&&(group, index)| {
+                let (table, batch) = groups[group];
+                let (path, pe) = table.rows[index].embedded_source();
+                !batch.scans.contains_key(&index)
+                    && !path.is_empty()
+                    && (batch.force_scan || pe != Some(PeState::Confirmed))
+            })
+            .count()
+            .min(parallel_jobs)
+            .max(1);
+        let next = AtomicUsize::new(0);
+        // A fixed number of producers draw from one work list. A large file
+        // cannot pin unrelated jobs behind its original root or candidate page.
+        // scan_embedded_path divides the IOCP byte budget by parallel_files.
+        let mut outcomes: Vec<_> = (0..parallel_jobs)
+            .into_par_iter()
+            .map(|_| {
+                cancellation.run(|| {
+                    let mut completed = Vec::new();
+                    while !cancellation.cancelled() {
+                        let position = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(&(group, index)) = jobs.get(position) else {
+                            break;
+                        };
+                        let (table, batch) = groups[group];
+                        let (path, pe) = table.rows[index].embedded_source();
+                        let outcome = match batch.scans.get(&index) {
+                            Some(Ok(scan)) => EmbeddedOutcome::Scan(Arc::clone(scan)),
+                            Some(Err(error)) => {
+                                EmbeddedOutcome::read_error(path, Arc::clone(error))
+                            }
+                            None => {
+                                scan_embedded_candidate(path, batch.force_scan, pe, parallel_files)
+                            }
+                        };
+                        if !matches!(outcome, EmbeddedOutcome::Residual) {
+                            completed.push((position, group, index, outcome));
+                        }
+                    }
+                    completed
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .flatten()
+            .collect();
+        outcomes.sort_unstable_by_key(|(position, ..)| *position);
+        outcomes
+            .into_iter()
+            .map(|(_, group, index, outcome)| (group, index, outcome))
+            .collect()
+    });
+    cancellation.check()?;
+    Ok(outcomes)
 }
 
 impl EmbeddedOutcome {
@@ -266,112 +379,43 @@ impl NativeEmbeddedBatch {
         self.ids.len()
     }
 
-    /// Reuse detection facts; unresolved files are scanned on demand per page.
-    #[pyo3(signature = (table, offset=0, limit=256))]
-    fn scan_page(
-        &mut self,
+    /// Page only selected jobs across roots, never the original candidate rows.
+    /// Root-local policy, relation ownership and password evidence stay in each batch.
+    #[staticmethod]
+    #[pyo3(signature = (groups, offset=0, limit=256))]
+    fn scan_pages(
         py: Python<'_>,
-        table: PyRef<'_, NativeCandidateTable>,
+        mut groups: Vec<(
+            PyRef<'_, NativeCandidateTable>,
+            PyRefMut<'_, NativeEmbeddedBatch>,
+        )>,
         offset: usize,
         limit: usize,
-    ) -> PyResult<Vec<(usize, u8, &'static str, Option<Py<PyDict>>)>> {
-        let cancellation = crate::io::cancellation::Cancellation::current();
-        cancellation.check()?;
-        let rows = &table.rows;
-        let outcomes = py.detach(|| {
-            let end = offset.saturating_add(limit).min(self.ids.len());
-            let ids = &self.ids[offset.min(end)..end];
-            let parallel_jobs = ids.len().min(rayon::current_num_threads()).clamp(1, 8);
-            let parallel_files = ids
-                .iter()
-                .filter(|&&index| {
-                    if self.scans.contains_key(&index)
-                        || (!self.select_all && !self.selected.contains(&index))
-                    {
-                        return false;
-                    }
-                    let (path, pe) = rows[index].embedded_source();
-                    !path.is_empty() && (self.force_scan || pe != Some(PeState::Confirmed))
-                })
-                .count()
-                .min(parallel_jobs)
-                .max(1);
-            // Split into at most eight file jobs. Per-file IOCP buffers and
-            // native metadata stay bounded, independently of machine core count.
-            ids.par_chunks(ids.len().div_ceil(parallel_jobs).max(1))
-                .map(|chunk| {
-                    cancellation.run(|| {
-                        chunk
-                            .iter()
-                            .filter_map(|&index| {
-                                if cancellation.cancelled() {
-                                    return None;
-                                }
-                                let cached = self.scans.get(&index);
-                                // Policy may skip new I/O, never erase an observed
-                                // error. Departures use the same decision as new reads.
-                                if !self.select_all
-                                    && !self.selected.contains(&index)
-                                    && !matches!(cached, Some(Err(_)))
-                                {
-                                    return None;
-                                }
-                                let (path, pe_state) = rows[index].embedded_source();
-                                let outcome = match cached {
-                                    Some(Ok(scan)) => EmbeddedOutcome::Scan(Arc::clone(scan)),
-                                    Some(Err(error)) => {
-                                        EmbeddedOutcome::read_error(path, Arc::clone(error))
-                                    }
-                                    None => scan_embedded_candidate(
-                                        path,
-                                        self.force_scan,
-                                        pe_state,
-                                        parallel_files,
-                                    ),
-                                };
-                                (!matches!(outcome, EmbeddedOutcome::Residual))
-                                    .then_some((index, outcome))
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                })
-                .collect::<Vec<_>>()
-                .into_iter()
-                .flatten()
-                .collect::<Vec<_>>()
-        });
-        cancellation.check()?;
-        outcomes
+    ) -> PyResult<Vec<(usize, Vec<(usize, u8, &'static str, Option<Py<PyDict>>)>)>> {
+        let jobs: Vec<_> = groups
+            .iter()
+            .enumerate()
+            .flat_map(|(group, (_, batch))| batch.ids.iter().map(move |&index| (group, index)))
+            .skip(offset)
+            .take(limit)
+            .collect();
+        let borrowed: Vec<_> = groups
+            .iter()
+            .map(|(table, batch)| (&**table, &**batch))
+            .collect();
+        let outcomes = scan_embedded_jobs(py, &borrowed, &jobs)?;
+        let mut by_group: BTreeMap<usize, Vec<_>> = BTreeMap::new();
+        for (group, index, outcome) in outcomes {
+            by_group.entry(group).or_default().push((index, outcome));
+        }
+        by_group
             .into_iter()
-            .map(|(index, outcome)| match outcome {
-                EmbeddedOutcome::Residual => {
-                    unreachable!("residuals are filtered before projection")
-                }
-                EmbeddedOutcome::Failed(error) => {
-                    let detail = PyDict::new(py);
-                    detail.set_item("error", error.to_string())?;
-                    Ok((index, 2, "embedded_scan_io_error", Some(detail.unbind())))
-                }
-                EmbeddedOutcome::Scan(scan) => {
-                    let anchors = scan.relation_anchors();
-                    if !anchors.is_empty() {
-                        let independent = scan.has_independent_archive();
-                        for mut anchor in anchors {
-                            anchor.path = table.summary(index)?.0;
-                            let retain_scan = anchor.needs_password || independent;
-                            self.pending_volumes.push(PendingEmbeddedVolume {
-                                index,
-                                anchor,
-                                scan: retain_scan.then(|| Arc::clone(&scan)),
-                            });
-                        }
-                        Ok((index, 3, "embedded_volume_candidate", None))
-                    } else {
-                        // A complete peer archive keeps its original ownership.
-                        self.excluded.extend(table.path_keys(index)?);
-                        Ok((index, 1, "", Some(scan.to_py_dict(py)?)))
-                    }
-                }
+            .map(|(group, outcomes)| {
+                let (table, batch) = &mut groups[group];
+                Ok((
+                    group,
+                    batch.project_outcomes(py, table, outcomes.into_iter())?,
+                ))
             })
             .collect()
     }
@@ -393,7 +437,7 @@ impl NativeEmbeddedBatch {
             return Ok(Vec::new());
         }
         let selected: HashSet<_> = requests.keys().map(|path| path_key(path)).collect();
-        let cache = table.relation_cache();
+        let cache = &self.relation_cache;
         for snapshot in &table.relation_sources {
             let stems: HashSet<_> = snapshot
                 .rows
@@ -463,7 +507,7 @@ impl NativeEmbeddedBatch {
             .into_iter()
             .map(|(path, values)| (path_key(&path), values))
             .collect();
-        let mut cache = table.relation_cache();
+        let mut cache = std::mem::take(&mut self.relation_cache);
         let mut pending = std::mem::take(&mut self.pending_volumes);
         let pending_keys: HashSet<_> = pending
             .iter()
@@ -1138,16 +1182,17 @@ impl NativeCandidateTable {
         Ok(routes)
     }
 
+    /// Finish primary projection before calling: only embedded/relation rows survive.
     #[pyo3(signature = (routes, recursive=false, force_scan=false, enabled=true, recursive_ratio=0.3))]
-    fn scan_embedded(
-        &self,
+    fn prepare_embedded(
+        &mut self,
         routes: PyRef<'_, NativeDiscoveryRoutes>,
         recursive: bool,
         force_scan: bool,
         enabled: bool,
         recursive_ratio: f64,
     ) -> NativeEmbeddedBatch {
-        let ids = routes.embedded.clone();
+        let mut ids = routes.embedded.clone();
         let ratio = recursive_ratio.clamp(0.0, 1.0);
         let sized = if enabled && recursive && !force_scan && ratio > 0.0 {
             ids.iter()
@@ -1186,19 +1231,60 @@ impl NativeCandidateTable {
                 .map(|(index, _)| index)
                 .collect()
         };
-        NativeEmbeddedBatch {
-            pending_volumes: Vec::new(),
-            excluded: routes.relation_resolved.iter().filter(|&&index| {
-                !matches!(&self.rows[index], Candidate::Relation(group) if group.is_incomplete())
-            }).chain(&routes.detection_resolved)
-                .flat_map(|&index| self.path_keys(index).unwrap_or_default()).collect(),
-            scans: ids
+        // Keep observed errors even when new I/O is disabled. The shared
+        // scheduler carries only work selected by this root's original policy.
+        ids.retain(|index| {
+            select_all
+                || selected.contains(index)
+                || matches!(routes.scans.get(index), Some(Err(_)))
+        });
+        if ids.is_empty() {
+            // This root has no remaining I/O or cached errors. Its primary
+            // decisions are already owned by Python; no recovery can use it.
+            *self = Self::default();
+            return NativeEmbeddedBatch::default();
+        }
+        let excluded = routes.relation_resolved.iter().filter(|&&index| {
+            !matches!(&self.rows[index], Candidate::Relation(group) if group.is_incomplete())
+        }).chain(&routes.detection_resolved)
+            .flat_map(|&index| self.path_keys(index).unwrap_or_default()).collect();
+        // Keep only the evidence used by volume recovery, not resolved groups
+        // and their execution metadata from every root. Raw snapshots still
+        // supply all eligible peers; primary decisions have been projected.
+        let relation_cache = self.relation_cache();
+        let mut scans = HashMap::new();
+        if ids.len() == self.rows.len() {
+            // A full deep scan already uses every row; do not duplicate its
+            // candidate storage merely to reproduce the same indices.
+            scans
+                .extend(ids.iter().filter_map(|index| {
+                    routes.scans.get(index).map(|scan| (*index, scan.clone()))
+                }));
+        } else {
+            let positions: HashMap<_, _> = ids
                 .iter()
-                .filter_map(|index| routes.scans.get(index).map(|scan| (*index, scan.clone())))
-                .collect(),
+                .enumerate()
+                .map(|(position, &index)| (index, position))
+                .collect();
+            let mut rows = Vec::with_capacity(ids.len());
+            for (index, row) in std::mem::take(&mut self.rows).into_iter().enumerate() {
+                if let Some(&position) = positions.get(&index) {
+                    let remapped = rows.len();
+                    ids[position] = remapped;
+                    if let Some(scan) = routes.scans.get(&index) {
+                        scans.insert(remapped, scan.clone());
+                    }
+                    rows.push(row);
+                }
+            }
+            self.rows = rows;
+        }
+        NativeEmbeddedBatch {
+            relation_cache,
+            pending_volumes: Vec::new(),
+            excluded,
+            scans,
             ids,
-            selected,
-            select_all,
             force_scan,
         }
     }

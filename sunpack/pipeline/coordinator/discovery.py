@@ -20,7 +20,27 @@ class ArchiveDiscoveryPipeline:
         *,
         is_recursive_scan: bool = False,
     ) -> StageResult:
-        routes = table.resolve()
+        return self.discover_many_native(
+            [table], session, is_recursive_scan=is_recursive_scan,
+        )[0]
+
+    def discover_many_native(self, tables, session, *, is_recursive_scan=False) -> list[StageResult]:
+        scans = []
+        results = []
+        for table in tables:
+            routes = table.resolve()
+            results.append(self._project_primary(table, routes, session))
+            scans.append((table, self.embedded.prepare_native(
+                table, routes, is_recursive_scan=is_recursive_scan,
+            )))
+            del routes
+        embedded = self.embedded.discover_many_native(scans, session)
+        for result, embedded_result in zip(results, embedded):
+            self._merge_embedded(result, embedded_result)
+        return results
+
+    @staticmethod
+    def _project_primary(table, routes, session) -> StageResult:
         result = StageResult()
         for index, status in routes.relation_events:
             if status in {1, 2}:
@@ -55,12 +75,10 @@ class ArchiveDiscoveryPipeline:
                     reason=f"Confirmed {candidate.format_hint} structure",
                 )
 
-        embedded_result = self.embedded.discover_native(
-            table,
-            routes,
-            session,
-            is_recursive_scan=is_recursive_scan,
-        )
+        return result
+
+    @staticmethod
+    def _merge_embedded(result, embedded_result) -> None:
         replaced = embedded_result.claimed_paths | embedded_result.blocked_paths
         if replaced:
             result.tasks = [task for task in result.tasks if not (
@@ -77,4 +95,3 @@ class ArchiveDiscoveryPipeline:
         result.blocked_paths.update(embedded_result.blocked_paths)
         result.traces.extend(embedded_result.traces)
         result.validate()
-        return result

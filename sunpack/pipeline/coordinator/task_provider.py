@@ -43,17 +43,12 @@ class ArchiveTaskProvider:
         roots = list(dict.fromkeys(str(root) for root in scan_roots if str(root)))
         if is_recursive_scan and len(roots) > 1:
             result = StageResult()
-            for root in roots:
-                table = build_native_table_for_targets(
-                    [root],
-                    session=session,
-                    config=self.config,
-                )
-                partial = self.discovery.discover_native(
-                    table,
-                    session,
-                    is_recursive_scan=True,
-                )
+            tables = (build_native_table_for_targets(
+                [root], session=session, config=self.config,
+            ) for root in roots)
+            for partial in self.discovery.discover_many_native(
+                tables, session, is_recursive_scan=True,
+            ):
                 result.tasks.extend(partial.tasks)
                 result.findings.extend(partial.findings)
                 result.claimed_paths.update(partial.claimed_paths)

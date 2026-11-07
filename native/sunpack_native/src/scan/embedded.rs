@@ -110,9 +110,9 @@ static EMBEDDED_MATCHER: OnceLock<AhoCorasick> = OnceLock::new();
 static EMBEDDED_PACKED_MATCHER: OnceLock<Option<packed::Searcher>> = OnceLock::new();
 
 const DEFAULT_IOCP_CHUNK_SIZE: usize = 2 * 1024 * 1024;
-// Sparse discovery pages should amortize reads without expanding one file's
-// eight IO/matching buffers to 16 MiB. The existing eight-file batch remains
-// within its original aggregate buffer budget (16 MiB).
+// Discovery shares one byte budget over all file producers, independent of
+// root count. Account for both read slots and outstanding matching jobs.
+const DISCOVERY_IOCP_BYTE_BUDGET: usize = 2 * 1024 * 1024;
 const MAX_DISCOVERY_IOCP_CHUNK_SIZE: usize = 512 * 1024;
 const DEFAULT_IOCP_BUFFERS: usize = 2;
 const DEFAULT_IOCP_WORKERS: usize = 4;
@@ -438,12 +438,17 @@ pub(crate) fn scan_embedded_path(
     parallel_files: usize,
 ) -> io::Result<NativeScanResult> {
     let reader = ManagedReader::open(path)?;
-    scan_embedded_archives_native_with_iocp(
-        reader,
-        (DEFAULT_IOCP_CHUNK_SIZE / parallel_files.max(1)).min(MAX_DISCOVERY_IOCP_CHUNK_SIZE),
-        DEFAULT_IOCP_BUFFERS,
-        DEFAULT_IOCP_WORKERS,
-    )
+    let parallel_files = parallel_files.clamp(1, 8);
+    let workers = (DEFAULT_IOCP_WORKERS / parallel_files).max(1);
+    // scan_file owns buffer_count read slots and buffer_count + workers jobs.
+    let slots = 2 * DEFAULT_IOCP_BUFFERS + workers;
+    let chunk_bytes = if parallel_files == 1 {
+        MAX_DISCOVERY_IOCP_CHUNK_SIZE
+    } else {
+        // Reserve room for the additional producers' readers and validators.
+        DISCOVERY_IOCP_BYTE_BUDGET / (parallel_files * slots)
+    };
+    scan_embedded_archives_native_with_iocp(reader, chunk_bytes, DEFAULT_IOCP_BUFFERS, workers)
 }
 
 pub(crate) fn scan_detected_path(

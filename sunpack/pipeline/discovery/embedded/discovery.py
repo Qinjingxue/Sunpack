@@ -7,7 +7,7 @@ import os
 from typing import Any
 
 from sunpack.core.support.path_keys import case_key, path_key
-from sunpack_native import inspect_pe_image, relations_logical_name
+from sunpack_native import NativeEmbeddedBatch, inspect_pe_image, relations_logical_name
 
 from sunpack.core.contracts.archive_input import (
     ArchiveInputDescriptor,
@@ -102,42 +102,43 @@ class EmbeddedDiscovery:
         result.validate()
         return result
 
-    def discover_native(
-        self,
-        table,
-        routes,
-        session,
-        *,
-        is_recursive_scan: bool = False,
-    ) -> StageResult:
+    def prepare_native(self, table, routes, *, is_recursive_scan=False):
         embedded_config = self.config.get("embedded_scan") or {}
-        ratio = self.gate._recursive_candidate_ratio()
-        batch = table.scan_embedded(
-            routes,
-            recursive=is_recursive_scan,
-            force_scan=self.options.force_scan,
+        return table.prepare_embedded(
+            routes, recursive=is_recursive_scan, force_scan=self.options.force_scan,
             enabled=embedded_config.get("enabled", True),
-            recursive_ratio=ratio,
+            recursive_ratio=self.gate._recursive_candidate_ratio(),
         )
-        result = StageResult()
-        for offset in range(0, len(batch), 256):
-            for index, status, reason, raw_scan in batch.scan_page(table, offset, 256):
-                if status == 3:
-                    # Rust retains the verified anchor until all peer residuals
-                    # have their normal Embedded ownership decisions.
-                    continue
-                if status == 2:
-                    entry_path, format_hint = table.summary(index)
-                    result.blocked_paths.update(table.path_keys(index))
-                    result.traces.append(DiscoveryTrace(
-                        entry_path=entry_path, source="embedded", status="blocked",
-                        format=format_hint, reason=reason, error=raw_scan["error"],
-                    ))
-                    continue
 
-                candidate = session.project_native_candidate(table, index)
-                self._discover_into(result, candidate, raw_scan)
+    def discover_many_native(self, scans, session) -> list[StageResult]:
+        results = [StageResult() for _ in scans]
+        for offset in range(0, sum(len(batch) for _, batch in scans), 256):
+            for group, rows in NativeEmbeddedBatch.scan_pages(scans, offset, 256):
+                table, _ = scans[group]
+                self._project_scan_rows(results[group], table, rows, session)
+        for (table, batch), result in zip(scans, results):
+            self._resolve_native_volumes(result, table, batch, session)
+        return results
 
+    def _project_scan_rows(self, result, table, rows, session) -> None:
+        for index, status, reason, raw_scan in rows:
+            if status == 3:
+                # Rust retains the verified anchor until all peer residuals
+                # have their normal Embedded ownership decisions.
+                continue
+            if status == 2:
+                entry_path, format_hint = table.summary(index)
+                result.blocked_paths.update(table.path_keys(index))
+                result.traces.append(DiscoveryTrace(
+                    entry_path=entry_path, source="embedded", status="blocked",
+                    format=format_hint, reason=reason, error=raw_scan["error"],
+                ))
+                continue
+
+            candidate = session.project_native_candidate(table, index)
+            self._discover_into(result, candidate, raw_scan)
+
+    def _resolve_native_volumes(self, result, table, batch, session) -> None:
         passwords = [
             (path, self._password_candidates(path))
             for path, _offset in batch.encrypted_volume_inputs(table)
@@ -170,7 +171,6 @@ class EmbeddedDiscovery:
         if shared_inputs and len(result.tasks) > 1:
             self._combine_shared_inputs(result)
         result.validate()
-        return result
 
     @staticmethod
     def _combine_shared_inputs(result: StageResult) -> None:
