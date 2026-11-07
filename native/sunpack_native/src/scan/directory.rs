@@ -1092,7 +1092,7 @@ impl NativeDirectoryScanOptions {
                 })
                 .cloned()
                 .collect();
-            populate_relation_anchors_cached(&mut raw, &cells);
+            populate_relation_anchors_cached(&mut raw, &cells, Some(&scope.root));
             NativeDirectorySnapshot::from_views(filtered, raw, DirectoryReadErrors::report(), cells)
         });
         Ok((Py::new(py, filtered)?, Py::new(py, raw)?))
@@ -1192,7 +1192,7 @@ fn scan_snapshots_with_options(
 ) -> PyResult<(Py<NativeDirectorySnapshot>, Py<NativeDirectorySnapshot>)> {
     let (filtered, raw) = py.detach(|| {
         let mut records = scan_directory_views(root_path, max_depth, options)?;
-        populate_relation_anchors(&mut records.raw);
+        populate_relation_anchors_cached(&mut records.raw, &[], Some(root_path));
         Ok::<_, PyErr>(NativeDirectorySnapshot::from_views(
             records.filtered,
             records.raw,
@@ -1349,7 +1349,7 @@ pub(crate) fn profile_directory_scan(
         )?;
         if include_relation_anchors {
             let started = Instant::now();
-            populate_relation_anchors(&mut entries.raw);
+            populate_relation_anchors_cached(&mut entries.raw, &[], Some(root_path));
             profile.file_probe_population = started.elapsed();
         }
         let snapshot_started = Instant::now();
@@ -2042,12 +2042,13 @@ fn walk_output_tree(root: &Path, current: &Path, stats: &mut OutputTreeStats) {
 }
 
 fn populate_relation_anchors(records: &mut [DirectoryEntryRecord]) {
-    populate_relation_anchors_cached(records, &[]);
+    populate_relation_anchors_cached(records, &[], None);
 }
 
 fn populate_relation_anchors_cached(
     records: &mut [DirectoryEntryRecord],
     cells: &[Option<CheapAnchorCell>],
+    root: Option<&str>,
 ) {
     let eligible_indices: Vec<usize> = records
         .iter()
@@ -2075,7 +2076,7 @@ fn populate_relation_anchors_cached(
             unknown_size_inputs.push(record.path.clone());
         }
     }
-    let mut known_anchors = probe_volume_anchor_records_cheap(&known_size_inputs).into_iter();
+    let mut known_anchors = probe_volume_anchor_records_cheap(&known_size_inputs, root).into_iter();
     let mut unknown_anchors =
         probe_volume_anchor_paths_cheap(&unknown_size_inputs, None).into_iter();
     for index in eligible_indices {

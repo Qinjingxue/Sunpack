@@ -16,7 +16,8 @@ pub(crate) struct JsonArrayBuilder {
 
 impl JsonArrayBuilder {
     pub(crate) fn push<T: Serialize>(&mut self, value: &T) -> io::Result<()> {
-        self.data.write_all(if self.count == 0 { b"[" } else { b"," })?;
+        self.data
+            .write_all(if self.count == 0 { b"[" } else { b"," })?;
         let start = self.data.len()?;
         serde_json::to_writer(&mut self.data, value).map_err(io::Error::other)?;
         self.offsets.write_all(&start.to_le_bytes())?;
@@ -26,7 +27,8 @@ impl JsonArrayBuilder {
     }
 
     pub(crate) fn finish(mut self) -> io::Result<NativeJsonArray> {
-        self.data.write_all(if self.count == 0 { b"[]" } else { b"]" })?;
+        self.data
+            .write_all(if self.count == 0 { b"[]" } else { b"]" })?;
         Ok(NativeJsonArray {
             data: self.data.finish()?,
             offsets: self.offsets.finish()?,
@@ -49,7 +51,9 @@ impl NativeJsonArray {
             cancel.check_io()?;
             let mut end = (start + 64 * 1024).min(self.data.len());
             // File sinks accept arbitrary bytes; text sinks need whole UTF-8.
-            while end < self.data.len() && self.data[end] & 0xc0 == 0x80 { end -= 1; }
+            while end < self.data.len() && self.data[end] & 0xc0 == 0x80 {
+                end -= 1;
+            }
             out.write_all(&self.data[start..end])?;
             start = end;
         }
@@ -64,13 +68,19 @@ impl NativeJsonArray {
     }
 
     fn __getitem__(&self, py: Python<'_>, index: isize) -> PyResult<Py<PyAny>> {
-        let index = if index < 0 { self.count as isize + index } else { index };
+        let index = if index < 0 {
+            self.count as isize + index
+        } else {
+            index
+        };
         if index < 0 || index as usize >= self.count {
             return Err(PyIndexError::new_err("JSON row index out of range"));
         }
         let offset = index as usize * 16;
-        let start = u64::from_le_bytes(self.offsets[offset..offset + 8].try_into().unwrap()) as usize;
-        let end = u64::from_le_bytes(self.offsets[offset + 8..offset + 16].try_into().unwrap()) as usize;
+        let start =
+            u64::from_le_bytes(self.offsets[offset..offset + 8].try_into().unwrap()) as usize;
+        let end =
+            u64::from_le_bytes(self.offsets[offset + 8..offset + 16].try_into().unwrap()) as usize;
         // Explicit UI/test row access, outside the report-writing hot path.
         let text = std::str::from_utf8(&self.data[start..end]).map_err(io::Error::other)?;
         Ok(py.import("json")?.call_method1("loads", (text,))?.unbind())

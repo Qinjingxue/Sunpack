@@ -827,8 +827,11 @@ mod tests {
         assert_eq!(
             attempted,
             vec![
-                paths[0].clone(), paths[1].clone(), paths[2].clone(),
-                moves[1].1.clone(), moves[0].1.clone(),
+                paths[0].clone(),
+                paths[1].clone(),
+                paths[2].clone(),
+                moves[1].1.clone(),
+                moves[0].1.clone(),
             ]
         );
         assert!(paths[0].is_file() && paths[2].is_file() && paths[3].is_file());

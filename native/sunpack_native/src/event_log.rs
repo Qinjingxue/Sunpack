@@ -449,8 +449,7 @@ impl Projection {
                         .iter()
                         .map(|m| self.aliases.get(m).unwrap_or(m).clone())
                         .filter(|id| {
-                            self.tasks.contains_key(id)
-                                && (explicit.is_empty() || *id == explicit)
+                            self.tasks.contains_key(id) && (explicit.is_empty() || *id == explicit)
                         })
                         .collect();
                     if !explicit.is_empty() && self.tasks.contains_key(&explicit) {
@@ -1127,21 +1126,41 @@ mod tests {
         let mut projection = Projection::default();
         let path = "C:/nested.fake";
         let member = "C:/opaque.002";
-        projection.apply(&mut json!({"event":"pipeline_sources_claimed","owner":"run",
-            "groups":[{"path":path,"members":[path,member]}]}));
+        projection.apply(
+            &mut json!({"event":"pipeline_sources_claimed","owner":"run",
+            "groups":[{"path":path,"members":[path,member]}]}),
+        );
         projection.apply(&mut json!({"event":"suspended_missing_volume",
             "path":path,"owner":"run","ts":1}));
-        let old = projection.updates(false).0.pop().unwrap().1.unwrap().1.unwrap();
+        let old = projection
+            .updates(false)
+            .0
+            .pop()
+            .unwrap()
+            .1
+            .unwrap()
+            .1
+            .unwrap();
         let old_lifetime = Arc::downgrade(&old);
 
         projection.apply(&mut json!({"event":"candidate_departed","path":member}));
-        let current = projection.updates(false).0.pop().unwrap().1.unwrap().1.unwrap();
+        let current = projection
+            .updates(false)
+            .0
+            .pop()
+            .unwrap()
+            .1
+            .unwrap()
+            .1
+            .unwrap();
         let current_lifetime = Arc::downgrade(&current);
         assert_eq!(old["members"], json!([path, member]));
         assert_eq!(current["members"], json!([path]));
 
-        let row = projection.apply(&mut json!({"event":"done","path":path,
-            "owner":"run","ts":2})).unwrap();
+        let row = projection
+            .apply(&mut json!({"event":"done","path":path,
+            "owner":"run","ts":2}))
+            .unwrap();
         let row: Value = serde_json::from_slice(&row).unwrap();
         assert_eq!(row["group"], *current);
         assert!(projection.tasks.is_empty());

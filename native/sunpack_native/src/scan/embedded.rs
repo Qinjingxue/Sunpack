@@ -110,6 +110,10 @@ static EMBEDDED_MATCHER: OnceLock<AhoCorasick> = OnceLock::new();
 static EMBEDDED_PACKED_MATCHER: OnceLock<Option<packed::Searcher>> = OnceLock::new();
 
 const DEFAULT_IOCP_CHUNK_SIZE: usize = 2 * 1024 * 1024;
+// Sparse discovery pages should amortize reads without expanding one file's
+// eight IO/matching buffers to 16 MiB. The existing eight-file batch remains
+// within its original aggregate buffer budget (16 MiB).
+const MAX_DISCOVERY_IOCP_CHUNK_SIZE: usize = 512 * 1024;
 const DEFAULT_IOCP_BUFFERS: usize = 2;
 const DEFAULT_IOCP_WORKERS: usize = 4;
 #[cfg(test)]
@@ -210,6 +214,7 @@ pub(crate) struct NativeScanResult {
     raw_hit_count: usize,
     budget_exhausted: bool,
     identity_only: bool,
+    zip_eocd_absent: bool,
 }
 
 pub(crate) struct RarInputResolution<'a> {
@@ -270,6 +275,12 @@ impl NativeScanResult {
                     boundaries.next();
                 }
                 anchor.carrier_limit = boundaries.peek().map(|c| c.offset);
+                // The full physical signature pass includes split EOCDs too.
+                // Keep only this negative byte fact, not a second hit index.
+                if anchor.format == "zip" && self.zip_eocd_absent {
+                    anchor.evidence.push("relation:zip_tail_checked");
+                    anchor.evidence.push("relation:zip_carrier_checked");
+                }
                 Some(anchor)
             })
             .collect()
@@ -429,7 +440,7 @@ pub(crate) fn scan_embedded_path(
     let reader = ManagedReader::open(path)?;
     scan_embedded_archives_native_with_iocp(
         reader,
-        DEFAULT_IOCP_CHUNK_SIZE / parallel_files.max(1),
+        (DEFAULT_IOCP_CHUNK_SIZE / parallel_files.max(1)).min(MAX_DISCOVERY_IOCP_CHUNK_SIZE),
         DEFAULT_IOCP_BUFFERS,
         DEFAULT_IOCP_WORKERS,
     )
@@ -551,14 +562,15 @@ fn scan_native(
         raw_hit_count += batch.raw_count;
         builder.push(batch)
     };
+    let saw_zip_eocd = std::sync::atomic::AtomicBool::new(false);
     let scan = |sample: &[u8], carry: usize, base: u64| {
         let batch = scan_sample_batch(sample, carry, base);
+        if batch.results.saw_zip_eocd {
+            saw_zip_eocd.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         ScanBatch {
             results: (!batch.results.is_empty()).then(|| {
-                hit_storage::prepare(
-                    batch.results,
-                    base + sample.len() as u64 == file_size,
-                )
+                hit_storage::prepare(batch.results, base + sample.len() as u64 == file_size)
             }),
             discarded_results: batch.discarded_results,
         }
@@ -713,6 +725,7 @@ fn scan_native(
         raw_hit_count,
         budget_exhausted: false,
         identity_only,
+        zip_eocd_absent: !saw_zip_eocd.load(std::sync::atomic::Ordering::Relaxed),
     })
 }
 
@@ -889,7 +902,14 @@ fn candidate_rank(candidate: &EmbeddedCandidate) -> u8 {
 
 fn resolve_logical_candidates(candidates: &mut Vec<EmbeddedCandidate>) {
     retain_outer_ranges(candidates, |item| {
-        (item.offset, if item.candidate_kind == "logical_archive" { item.end_offset.unwrap_or(item.offset) } else { item.offset })
+        (
+            item.offset,
+            if item.candidate_kind == "logical_archive" {
+                item.end_offset.unwrap_or(item.offset)
+            } else {
+                item.offset
+            },
+        )
     });
 }
 
@@ -1183,6 +1203,11 @@ fn record_raw_hit(
     // exactly once.
     if end <= carry_len {
         return;
+    }
+    // Standalone validation rejects multi-disk EOCDs below. Their presence
+    // must still prevent a negative Relations terminal proof.
+    if pattern == 1 {
+        hits.results.saw_zip_eocd = true;
     }
     let (_, _, kind) = PATTERNS[pattern];
     let absolute = base_offset + start as u64;
@@ -2304,6 +2329,42 @@ mod tests {
     use std::fs;
     use std::io::Write;
     use xz2::write::XzEncoder;
+
+    // Ordinary complete ZIPs cannot expose a negative proof hiding a split
+    // EOCD rejected by standalone validation, especially at a read boundary.
+    #[test]
+    fn zip_terminal_absence_preserves_split_headers_and_chunk_edges() {
+        for terminal in [false, true] {
+            let mut data = vec![b'x'; 128 * 1024];
+            let mut local = [0u8; 31];
+            local[..4].copy_from_slice(ZIP_LOCAL);
+            local[4] = 20;
+            local[26] = 1;
+            local[30] = b'a';
+            data[37..68].copy_from_slice(&local);
+            if terminal {
+                let offset = 64 * 1024 - 2;
+                data[offset..offset + 4].copy_from_slice(ZIP_EOCD);
+                data[offset + 4..offset + 22].fill(0);
+                data[offset + 4] = 1; // Multi-disk EOCD is not standalone.
+            }
+            let path = temp_file("zip_terminal_proof", &data);
+            let scan = scan_embedded_archives_native_with_iocp(
+                ManagedReader::open(&path).unwrap(),
+                64 * 1024,
+                2,
+                2,
+            )
+            .unwrap();
+            let anchors = scan.relation_anchors();
+            assert!(!anchors.is_empty());
+            assert_eq!(scan.zip_eocd_absent, !terminal);
+            assert!(anchors
+                .iter()
+                .all(|a| a.evidence.contains(&"relation:zip_carrier_checked") == !terminal));
+            let _ = fs::remove_file(path);
+        }
+    }
 
     fn stored_hits(hits: &[RawHit]) -> hit_storage::HitStorage {
         hit_storage::HitStorage::from_hits(hits)

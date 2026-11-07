@@ -1826,6 +1826,7 @@ impl MatchPart {
 
 // Matching jobs keep only a bounded normalization horizon and encoded leaves.
 pub(super) struct HitBuffer {
+    pub(super) saw_zip_eocd: bool,
     parts: [MatchPart; 2],
     base: u64,
     start: u64,
@@ -1837,6 +1838,7 @@ pub(super) struct HitBuffer {
 impl HitBuffer {
     pub(super) fn new(base: u64, start: u64, end: u64, overlap: usize) -> Self {
         Self {
+            saw_zip_eocd: false,
             parts: std::array::from_fn(|_| MatchPart::default()),
             base,
             start,
@@ -3033,9 +3035,7 @@ mod tests {
             for hit in source_hits {
                 batch.push(hit);
             }
-            builder
-                .push(prepare(batch, ordinal + 1 == chunks))
-                .unwrap();
+            builder.push(prepare(batch, ordinal + 1 == chunks)).unwrap();
         }
         builder.arena.spill().unwrap();
         let store = builder.finish().unwrap();
@@ -3073,9 +3073,7 @@ mod tests {
             let mut batch = HitBuffer::new(start, start, start + chunk, 11);
             batch.push(RawHit::new(start + 1000, 8));
             batch.push(RawHit::new(start + chunk - 1, 5));
-            builder
-                .push(prepare(batch, ordinal + 1 == chunks))
-                .unwrap();
+            builder.push(prepare(batch, ordinal + 1 == chunks)).unwrap();
         }
         let store = builder.finish().unwrap();
         assert!(matches!(store.dirs[0], Blob::Mapped(_)));

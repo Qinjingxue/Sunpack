@@ -6,7 +6,7 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 #[derive(Clone)]
 struct NativeResourceRecord {
@@ -38,7 +38,113 @@ pub(crate) struct NativeResourceGuard {
 pub(crate) struct TrackedFile {
     // Fields drop in declaration order: close the handle before unregistering it.
     file: File,
-    _resource: NativeResourceGuard,
+    _resource: FileResource,
+}
+
+// A batch shares only its promotion guard; file handles still close per probe.
+enum FileResource {
+    Owned { _guard: NativeResourceGuard },
+    Shared { _guard: Arc<NativeResourceGuard> },
+}
+
+pub(crate) struct NativeReadScope {
+    root: PathBuf,
+    guard: Arc<NativeResourceGuard>,
+}
+
+impl NativeReadScope {
+    pub(crate) fn new(root: &Path) -> io::Result<Self> {
+        let root = normalized_path(root.to_path_buf());
+        let guard = NativeResourceGuard::register_normalized(
+            "directory_probe_batch",
+            vec![root.clone()],
+            true,
+        )?;
+        Ok(Self {
+            root,
+            guard: Arc::new(guard),
+        })
+    }
+
+    pub(crate) fn open_reader(&self, path: &str) -> io::Result<TrackedFile> {
+        let file = open_shared_reader(Path::new(path))?;
+        // Verify the opened object, including reparse/rename races, without
+        // opening a second handle just to canonicalize every file's name.
+        if handle_path(&file).is_ok_and(|actual| actual.starts_with(&self.root)) {
+            return Ok(TrackedFile {
+                file,
+                _resource: FileResource::Shared {
+                    _guard: Arc::clone(&self.guard),
+                },
+            });
+        }
+        drop(file);
+        TrackedFile::open_reader(path, "volume_anchor_cheap")
+    }
+}
+
+#[cfg(windows)]
+fn handle_path(file: &File) -> io::Result<PathBuf> {
+    use std::os::windows::{ffi::OsStringExt, io::AsRawHandle};
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetFinalPathNameByHandleW(
+            handle: *mut std::ffi::c_void,
+            path: *mut u16,
+            len: u32,
+            flags: u32,
+        ) -> u32;
+    }
+    let mut stack = [0u16; 1024];
+    let len = unsafe {
+        GetFinalPathNameByHandleW(
+            file.as_raw_handle(),
+            stack.as_mut_ptr(),
+            stack.len() as u32,
+            0,
+        )
+    };
+    let wide = if len == 0 {
+        return Err(io::Error::last_os_error());
+    } else if (len as usize) < stack.len() {
+        std::ffi::OsString::from_wide(&stack[..len as usize])
+    } else {
+        let mut data = vec![0u16; len as usize + 1];
+        let actual = unsafe {
+            GetFinalPathNameByHandleW(
+                file.as_raw_handle(),
+                data.as_mut_ptr(),
+                data.len() as u32,
+                0,
+            )
+        };
+        if actual == 0 || actual as usize >= data.len() {
+            return Err(io::Error::last_os_error());
+        }
+        std::ffi::OsString::from_wide(&data[..actual as usize])
+    };
+    Ok(PathBuf::from(crate::path_keys::path_key(
+        &wide.to_string_lossy(),
+    )))
+}
+
+#[cfg(not(windows))]
+fn handle_path(_file: &File) -> io::Result<PathBuf> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "scoped probes require Windows",
+    ))
+}
+
+fn open_shared_reader(path: &Path) -> io::Result<File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.share_mode(0x1 | 0x2 | 0x4);
+    }
+    options.open(path)
 }
 
 impl TrackedFile {
@@ -49,7 +155,7 @@ impl TrackedFile {
         let file = File::open(path)?;
         Ok(Self {
             file,
-            _resource: resource,
+            _resource: FileResource::Owned { _guard: resource },
         })
     }
 
@@ -99,7 +205,7 @@ impl TrackedFile {
         let file = options.open(path)?;
         Ok(Self {
             file,
-            _resource: resource,
+            _resource: FileResource::Owned { _guard: resource },
         })
     }
 
@@ -107,22 +213,10 @@ impl TrackedFile {
     pub(crate) fn open_reader(path: impl AsRef<Path>, kind: &'static str) -> io::Result<Self> {
         let path = path.as_ref();
         let resource = NativeResourceGuard::register(kind, [path.to_path_buf()])?;
-        #[cfg(windows)]
-        let file = {
-            use std::os::windows::fs::OpenOptionsExt;
-            const FILE_SHARE_READ: u32 = 0x0000_0001;
-            const FILE_SHARE_WRITE: u32 = 0x0000_0002;
-            const FILE_SHARE_DELETE: u32 = 0x0000_0004;
-            std::fs::OpenOptions::new()
-                .read(true)
-                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
-                .open(path)?
-        };
-        #[cfg(not(windows))]
-        let file = File::open(path)?;
+        let file = open_shared_reader(path)?;
         Ok(Self {
             file,
-            _resource: resource,
+            _resource: FileResource::Owned { _guard: resource },
         })
     }
 
@@ -220,9 +314,18 @@ impl NativeResourceGuard {
         paths: impl IntoIterator<Item = PathBuf>,
         promotion_blocking: bool,
     ) -> io::Result<Self> {
+        let paths = paths.into_iter().map(normalized_path).collect::<Vec<_>>();
+        Self::register_normalized(kind, paths, promotion_blocking)
+    }
+
+    #[track_caller]
+    fn register_normalized(
+        kind: &'static str,
+        paths: Vec<PathBuf>,
+        promotion_blocking: bool,
+    ) -> io::Result<Self> {
         static NEXT_ID: AtomicU64 = AtomicU64::new(1);
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-        let paths = paths.into_iter().map(normalized_path).collect::<Vec<_>>();
         let mut registry = registry()
             .registry
             .lock()
@@ -456,4 +559,48 @@ fn resource_snapshot_to_python(
         output.append(item)?;
     }
     Ok(output.unbind())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // File-only guards do not cover shared batch lifetime or redirected opens.
+    // One scope checks close ordering and the existing per-file fallback.
+    #[test]
+    fn scoped_readers_keep_promotion_protection_until_handles_close() {
+        let root = crate::test_support::temp_file("read_scope", b"");
+        std::fs::remove_file(&root).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("inside.fake");
+        std::fs::write(&path, b"inside").unwrap();
+        let outside = crate::test_support::temp_file("outside_scope", b"outside");
+        let scope = NativeReadScope::new(&root).unwrap();
+        let id = scope.guard.id;
+        let mut inside = scope.open_reader(path.to_str().unwrap()).unwrap();
+        let mut fallback = scope.open_reader(outside.to_str().unwrap()).unwrap();
+        assert!(matches!(inside._resource, FileResource::Shared { .. }));
+        assert!(matches!(fallback._resource, FileResource::Owned { .. }));
+        drop(scope);
+        assert!(registry()
+            .registry
+            .lock()
+            .unwrap()
+            .resources
+            .contains_key(&id));
+        let mut data = String::new();
+        inside.read_to_string(&mut data).unwrap();
+        fallback.read_to_string(&mut data).unwrap();
+        assert_eq!(data, "insideoutside");
+        drop((inside, fallback));
+        assert!(!registry()
+            .registry
+            .lock()
+            .unwrap()
+            .resources
+            .contains_key(&id));
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(root).unwrap();
+        std::fs::remove_file(outside).unwrap();
+    }
 }

@@ -11,7 +11,7 @@ use rayon::prelude::*;
 use crate::analysis_native::structure::unified_prefilter_mask_from_head;
 use crate::formats::rar::{rar4_end_volume, rar5_header_len, rar5_main_volume, read_vint};
 use crate::io::reader::ManagedReader;
-use crate::io::resource_lifecycle::TrackedFile;
+use crate::io::resource_lifecycle::{NativeReadScope, TrackedFile};
 use crate::password::rar::{
     rar4_decrypt_header_flags_with_read, rar5_decrypt_main_header_with_read,
 };
@@ -154,19 +154,22 @@ pub(crate) type CheapAnchorCell = Arc<Mutex<Option<Arc<VolumeAnchor>>>>;
 
 pub(crate) fn probe_volume_anchor_records_cheap(
     records: &[(&str, u64, Option<&CheapAnchorCell>)],
+    root: Option<&str>,
 ) -> Vec<Arc<VolumeAnchor>> {
+    // A conflicting promotion retains the original per-file error/retry path.
+    let scope = root.and_then(|root| NativeReadScope::new(std::path::Path::new(root)).ok());
     cheap_fast_probe_pool().install(|| {
         records
             .par_iter()
             .map(|(path, size, cell)| {
                 let Some(cell) = cell else {
-                    return Arc::new(probe_path_cheap_direct(path, *size, None));
+                    return Arc::new(probe_path_cheap_direct(path, *size, None, scope.as_ref()));
                 };
                 let mut cached = cell.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(anchor) = cached.as_ref() {
                     return anchor.clone();
                 }
-                let anchor = Arc::new(probe_path_cheap_direct(path, *size, None));
+                let anchor = Arc::new(probe_path_cheap_direct(path, *size, None, scope.as_ref()));
                 if anchor.error.is_empty() {
                     *cached = Some(anchor.clone());
                 }
@@ -312,7 +315,12 @@ fn probe_cheap_prefix(
     result
 }
 
-fn probe_path_cheap_direct(path: &str, size: u64, password: Option<&str>) -> VolumeAnchor {
+fn probe_path_cheap_direct(
+    path: &str,
+    size: u64,
+    password: Option<&str>,
+    scope: Option<&NativeReadScope>,
+) -> VolumeAnchor {
     let mut result = VolumeAnchor {
         path: path.to_string(),
         size,
@@ -320,13 +328,14 @@ fn probe_path_cheap_direct(path: &str, size: u64, password: Option<&str>) -> Vol
     };
     let read_len = size.min(512) as usize;
     let mut prefix = [0u8; 512];
-    let mut file = match open_cheap_file(path) {
-        Ok(file) => file,
-        Err(error) => {
-            result.error = error.to_string();
-            return result;
-        }
-    };
+    let mut file =
+        match scope.map_or_else(|| open_cheap_file(path), |scope| scope.open_reader(path)) {
+            Ok(file) => file,
+            Err(error) => {
+                result.error = error.to_string();
+                return result;
+            }
+        };
     if let Err(error) = file.read_exact(&mut prefix[..read_len]) {
         result.error = error.to_string();
         return result;

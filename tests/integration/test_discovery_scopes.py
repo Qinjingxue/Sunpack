@@ -287,18 +287,26 @@ def test_catalog_refined_zip_facts_do_not_hide_replaced_or_missing_volumes(tmp_p
         catalog.close()
 
 
-@pytest.mark.parametrize("archive_format", ["rar", "zip", "zip_carrier"])
+@pytest.mark.parametrize("archive_format", ["rar", "zip", "zip_carrier", "pe"])
 def test_catalog_tail_facts_remain_generation_local(tmp_path, archive_format):
     """Head/standalone cache cases cannot detect lost ENDARC or negative ZIP
-    tail scans. Reuse a real set across concurrent requests, then invalidate
-    one member at identical metadata while retaining an older view.
+    tail scans or repeated PE/SFX refinement. Reuse facts across concurrent
+    requests, then invalidate one member at identical metadata while retaining
+    an older view.
     """
     from concurrent.futures import ThreadPoolExecutor
     from sunpack_native import NativeCandidateTable, NativeWatchState
     from tests.helpers.real_archives import create_zip_multidisk_archive
 
     options = dict(payload_size=96 * 1024, split_volume_size=40 * 1024)
-    if archive_format == "rar":
+    if archive_format == "pe":
+        from tests.helpers.fs_builder import make_minimal_pe
+        archive_dir = tmp_path / "cached"
+        archive_dir.mkdir()
+        member = archive_dir / "program.fake"
+        member.write_bytes(make_minimal_pe())
+        marker = "relation:sfx_checked"
+    elif archive_format == "rar":
         case = ArchiveFixtureFactory().create(tmp_path, "cached", "rar", split=True,
                                               compression_level=0, **options)
         marker = "relation:rar_end_checked"
@@ -306,14 +314,16 @@ def test_catalog_tail_facts_remain_generation_local(tmp_path, archive_format):
         case = create_zip_multidisk_archive(tmp_path, "cached", **options)
         marker = ("relation:zip_carrier_checked" if archive_format == "zip_carrier"
                   else "relation:zip_tail_checked")
-    member = sorted(case.archive_dir.iterdir())[-1]
+    if archive_format != "pe":
+        archive_dir = case.archive_dir
+        member = sorted(archive_dir.iterdir())[-1]
     if archive_format.startswith("zip"):
         member = case.entry_path
     if archive_format == "zip_carrier":
         next(path for path in case.archive_dir.iterdir() if path.suffix == ".zip").unlink()
     data = member.read_bytes()
     stamp = member.stat().st_mtime_ns
-    scope = DiscoveryScope(str(case.archive_dir))
+    scope = DiscoveryScope(str(archive_dir))
     scan_options = DirectoryScanner.compile_scan_options(make_config())
     catalog = NativeWatchCatalog(NativeWatchState())
 
@@ -336,7 +346,7 @@ def test_catalog_tail_facts_remain_generation_local(tmp_path, archive_format):
         assert marker in member_facts(previous)["evidence"]
         if archive_format == "rar":
             assert "terminal" in member_facts(previous)["anchor_roles"]
-        else:
+        elif archive_format.startswith("zip"):
             assert "zip:local_header" in member_facts(previous)["evidence"]
         with ThreadPoolExecutor(max_workers=4) as pool:
             list(pool.map(refine, range(8)))

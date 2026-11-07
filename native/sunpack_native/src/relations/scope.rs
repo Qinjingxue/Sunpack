@@ -120,22 +120,31 @@ pub(super) struct RelationScopeIndex {
 impl RelationScopeIndex {
     pub fn build(source: &RelationSource<'_>, filtered_keys: &HashSet<String>) -> Self {
         let selected: HashSet<_> = filtered_keys.iter().map(|key| CaseKey::new(key)).collect();
-        let stems: HashSet<_> = source
-            .indices()
-            .filter(|&row| selected.contains(&CaseKey::new(source.path(row))))
-            .map(|row| CaseKey::new(first_dot_stem(source.name(row))))
-            .collect();
+        let mut rows = Vec::new();
+        let mut stems = HashSet::new();
+        for row in source.indices() {
+            if selected.contains(&CaseKey::new(source.path(row))) {
+                rows.push(row);
+                stems.insert(CaseKey::new(first_dot_stem(source.name(row))));
+            }
+        }
         let active: HashSet<_> = source
             .indices()
+            // Inspect anchors only inside nominated stems. Cached anchors use
+            // full Windows path keys; unrelated rows need no such allocation.
+            .filter(|&row| stems.contains(&CaseKey::new(first_dot_stem(source.name(row)))))
             .filter(|&row| source.anchor(row).is_some_and(BucketIndex::has_seed))
             .map(|row| CaseKey::new(first_dot_stem(source.name(row))))
-            .filter(|stem| stems.contains(stem))
             .collect();
+        if active.is_empty() {
+            return Self { rows };
+        }
+        let selected_rows: HashSet<_> = rows.into_iter().collect();
         Self {
             rows: source
                 .indices()
                 .filter(|&row| {
-                    selected.contains(&CaseKey::new(source.path(row)))
+                    selected_rows.contains(&row)
                         || active.contains(&CaseKey::new(first_dot_stem(source.name(row))))
                 })
                 .collect(),

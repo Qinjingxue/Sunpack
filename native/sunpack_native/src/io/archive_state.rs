@@ -121,9 +121,14 @@ impl SegmentReader {
                 Segment::Range { path, start, .. } => {
                     let file = match &mut self.file {
                         Some((cached, file)) if *cached == index => file,
-                        slot => &mut slot
-                            .insert((index, TrackedFile::open(path, "archive_state_segment_file")?))
-                            .1,
+                        slot => {
+                            &mut slot
+                                .insert((
+                                    index,
+                                    TrackedFile::open(path, "archive_state_segment_file")?,
+                                ))
+                                .1
+                        }
                     };
                     file.seek(SeekFrom::Start(start.saturating_add(within)))?;
                     file.read_exact(&mut output[written..written + take])?;

@@ -1014,11 +1014,7 @@ impl NativeWatchState {
 
     /// Entries, optionally only those waiting on one blocker.
     #[pyo3(signature = (*, blocker=None))]
-    fn entry_items(
-        &self,
-        py: Python<'_>,
-        blocker: Option<&str>,
-    ) -> PyResult<Vec<Py<PyDict>>> {
+    fn entry_items(&self, py: Python<'_>, blocker: Option<&str>) -> PyResult<Vec<Py<PyDict>>> {
         let records: Vec<_> = self
             .lock()
             .entries

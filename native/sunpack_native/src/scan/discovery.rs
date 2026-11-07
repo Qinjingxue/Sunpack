@@ -27,6 +27,21 @@ enum Candidate {
     Relation(Box<NativeRelationGroup>),
 }
 
+impl Candidate {
+    fn embedded_source(&self) -> (&str, Option<PeState>) {
+        match self {
+            Self::File(table, row) => (
+                table.paths[*row].as_str(),
+                table.relation_anchors[*row].as_ref().map(|a| a.pe_state),
+            ),
+            Self::Relation(group) => (
+                group.candidate_data().entry_path,
+                group.entry_anchor().map(|a| a.pe_state),
+            ),
+        }
+    }
+}
+
 #[pyclass(module = "sunpack_native")]
 #[derive(Default)]
 pub(crate) struct NativeCandidateTable {
@@ -265,10 +280,24 @@ impl NativeEmbeddedBatch {
         let outcomes = py.detach(|| {
             let end = offset.saturating_add(limit).min(self.ids.len());
             let ids = &self.ids[offset.min(end)..end];
-            let parallel_files = ids.len().min(rayon::current_num_threads()).clamp(1, 8);
+            let parallel_jobs = ids.len().min(rayon::current_num_threads()).clamp(1, 8);
+            let parallel_files = ids
+                .iter()
+                .filter(|&&index| {
+                    if self.scans.contains_key(&index)
+                        || (!self.select_all && !self.selected.contains(&index))
+                    {
+                        return false;
+                    }
+                    let (path, pe) = rows[index].embedded_source();
+                    !path.is_empty() && (self.force_scan || pe != Some(PeState::Confirmed))
+                })
+                .count()
+                .min(parallel_jobs)
+                .max(1);
             // Split into at most eight file jobs. Per-file IOCP buffers and
             // native metadata stay bounded, independently of machine core count.
-            ids.par_chunks(ids.len().div_ceil(parallel_files).max(1))
+            ids.par_chunks(ids.len().div_ceil(parallel_jobs).max(1))
                 .map(|chunk| {
                     cancellation.run(|| {
                         chunk
@@ -289,16 +318,7 @@ impl NativeEmbeddedBatch {
                                         EmbeddedOutcome::Residual(self.skipped_reason),
                                     ));
                                 }
-                                let (path, pe_state) = match &rows[index] {
-                                    Candidate::File(table, row) => (
-                                        table.paths[*row].as_str(),
-                                        table.relation_anchors[*row].as_ref().map(|a| a.pe_state),
-                                    ),
-                                    Candidate::Relation(group) => (
-                                        group.candidate_data().entry_path,
-                                        group.entry_anchor().map(|a| a.pe_state),
-                                    ),
-                                };
+                                let (path, pe_state) = rows[index].embedded_source();
                                 let outcome = match cached {
                                     Some(Ok(scan)) => EmbeddedOutcome::Scan(Arc::clone(scan)),
                                     Some(Err(error)) => {
@@ -464,9 +484,12 @@ impl NativeEmbeddedBatch {
         let encrypted: Vec<_> = pending
             .iter_mut()
             .map(|item| &mut item.anchor)
-            .chain(cache.anchors.iter_mut().filter_map(|(key, anchor)| {
-                (!pending_keys.contains(key)).then_some(anchor)
-            }))
+            .chain(
+                cache
+                    .anchors
+                    .iter_mut()
+                    .filter_map(|(key, anchor)| (!pending_keys.contains(key)).then_some(anchor)),
+            )
             .filter(|anchor| anchor.needs_password)
             .filter_map(|anchor| {
                 candidates
@@ -488,10 +511,12 @@ impl NativeEmbeddedBatch {
                         let (resolved, index) =
                             resolve_encrypted_relation_anchor(anchor, &reader, values)?;
                         *anchor = resolved;
-                        Ok(index.map(|index| (
-                            (path_key(&anchor.path), anchor.structure_offset.unwrap_or(0)),
-                            values[index].clone(),
-                        )))
+                        Ok(index.map(|index| {
+                            (
+                                (path_key(&anchor.path), anchor.structure_offset.unwrap_or(0)),
+                                values[index].clone(),
+                            )
+                        }))
                     })
                 })
                 .collect::<io::Result<Vec<_>>>()

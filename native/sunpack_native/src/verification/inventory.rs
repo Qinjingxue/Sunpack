@@ -1,9 +1,9 @@
 use super::paths::{
     clean_relative_archive_path, unsafe_archive_path, windows_output_relative_path,
 };
+use crate::io::json_rows::{JsonArrayBuilder, NativeJsonArray};
 use crate::io::reader::ManagedReader;
 use crate::io::scratch::Slots;
-use crate::io::json_rows::{JsonArrayBuilder, NativeJsonArray};
 use crate::scan::directory::{
     NativeOutputInventory, OutputFileRecord, OutputInventoryVerificationSnapshot,
 };
@@ -390,18 +390,10 @@ fn match_inventory_source(
     report_issues: bool,
 ) -> io::Result<MatchResult> {
     if !snapshot.exists {
-        return empty_status_result(
-            "missing",
-            expected.len(),
-            detail_offset,
-        );
+        return empty_status_result("missing", expected.len(), detail_offset);
     }
     if !snapshot.is_dir {
-        return empty_status_result(
-            "not_directory",
-            expected.len(),
-            detail_offset,
-        );
+        return empty_status_result("not_directory", expected.len(), detail_offset);
     }
 
     let index = OutputIndex::new(&snapshot)?;
@@ -1052,7 +1044,13 @@ mod windows_output_name_tests {
 
     fn missing_paths(result: &MatchResult) -> Vec<String> {
         let mut encoded = Vec::new();
-        result.missing.write_json(&mut encoded, &crate::io::cancellation::Cancellation::default()).unwrap();
+        result
+            .missing
+            .write_json(
+                &mut encoded,
+                &crate::io::cancellation::Cancellation::default(),
+            )
+            .unwrap();
         serde_json::from_slice(&encoded).unwrap()
     }
 

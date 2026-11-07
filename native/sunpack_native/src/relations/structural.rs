@@ -220,6 +220,7 @@ pub(super) fn collect(
         if let Some(anchor) = rows[i].anchor.as_mut() {
             anchor.evidence.push("relation:sfx_checked");
         }
+        remember_tail_facts(&rows[i], rows[i].anchor.as_ref().unwrap());
     }
     let mut rar = Vec::new();
     let mut zip = Vec::new();
@@ -352,6 +353,7 @@ pub(super) fn collect(
 /// head, and concurrent requests must never downgrade a more complete tail.
 fn remember_tail_facts(row: &RelationInput, anchor: &VolumeAnchor) {
     let markers = [
+        "relation:sfx_checked",
         "relation:rar_end_checked",
         "relation:zip_tail_checked",
         "relation:zip_carrier_checked",
